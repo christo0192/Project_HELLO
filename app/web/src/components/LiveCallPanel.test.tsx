@@ -6,7 +6,8 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { LiveCallPanel } from './LiveCallPanel';
+import { LiveCallPanel, toAssessment, type AssessmentRow } from './LiveCallPanel';
+import { Scorecard } from './Scorecard';
 
 /**
  * What the mocked client serves, and every `on()` registration, so a test can
@@ -146,5 +147,30 @@ describe('LiveCallPanel', () => {
       <LiveCallPanel candidateId="candidate-1" candidateName="Jane Doe" />,
     );
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('LiveCallPanel toAssessment (WEB-R2-3)', () => {
+  const row = (recommendation: string | null): AssessmentRow =>
+    ({
+      session_id: 's-1',
+      candidate_id: 'candidate-1',
+      overall_score: 40,
+      recommendation,
+      summary: '',
+      raw: null,
+    }) as unknown as AssessmentRow;
+
+  it('keeps a stored NULL verdict NULL: no "Borderline", which Ashby would contradict with no tag', () => {
+    const assessment = toAssessment(row(null));
+    expect(assessment.recommendation).toBeNull();
+    render(<Scorecard assessment={assessment} />);
+    expect(screen.queryByText('Borderline')).not.toBeInTheDocument();
+    expect(screen.getByText('Overall score')).toBeInTheDocument();
+  });
+
+  it('CONTROL: a stored hold still reads Borderline', () => {
+    render(<Scorecard assessment={toAssessment(row('hold'))} />);
+    expect(screen.getByText('Borderline')).toBeInTheDocument();
   });
 });

@@ -28,7 +28,7 @@ interface TranscriptTurn {
   created_at: string;
 }
 
-interface AssessmentRow {
+export interface AssessmentRow {
   session_id: string;
   candidate_id: string;
   english?: Assessment["english"];
@@ -37,13 +37,21 @@ interface AssessmentRow {
   motivation?: Assessment["motivation"];
   role_fit: Assessment["role_fit"];
   overall_score: number | string;
-  recommendation: string;
+  /** NULL is how a result with no verdict (`human_review`) is stored. */
+  recommendation: string | null;
   summary: string;
   raw: Partial<Assessment> | null;
 }
 
-/** Map an assessments row (jsonb columns) to the shape <Scorecard> expects. */
-function toAssessment(row: AssessmentRow): Assessment {
+/**
+ * Map an assessments row (jsonb columns) to the shape <Scorecard> expects.
+ *
+ * The verdict passes through as stored. A NULL one stays NULL: the scorecard
+ * then shows no verdict pill (or "Needs human review" for a role scorecard),
+ * never "Borderline", which is also an Ashby tag and would contradict Ashby,
+ * where a result with no verdict gets no Christy tag.
+ */
+export function toAssessment(row: AssessmentRow): Assessment {
   const raw = row.raw ?? {};
   return {
     english: row.english ?? raw.english,
@@ -52,7 +60,8 @@ function toAssessment(row: AssessmentRow): Assessment {
     motivation: row.motivation ?? raw.motivation,
     role_fit: row.role_fit ?? raw.role_fit,
     overall_score: Number(row.overall_score),
-    recommendation: (row.recommendation as Recommendation) ?? "hold",
+    // Typed as Recommendation for <Scorecard>, which reads it as unknown.
+    recommendation: row.recommendation as Recommendation,
     summary: row.summary ?? raw.summary ?? "",
     resume_conflicts: raw.resume_conflicts ?? [],
     raw,

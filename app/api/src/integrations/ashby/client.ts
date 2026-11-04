@@ -24,6 +24,7 @@ import {
   type AshbyOperation,
   type AshbyEnvelope,
   type AshbyResult,
+  type AshbyCallOptions,
   type ApplicationListParams,
   type ApplicationHistoryParams,
   type CandidateTagListParams,
@@ -453,9 +454,14 @@ export class AshbyClient {
 
   // ── Typed endpoint helpers (verified fields named; rest via `extra`) ──────
 
-  async applicationInfo<T = OpaqueRecord>(applicationId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
+  /** `options.deadlineAt` is internal (see {@link AshbyCallOptions}), never sent. */
+  async applicationInfo<T = OpaqueRecord>(
+    applicationId: string,
+    extra?: OpaqueRecord,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
     validateId('application.info', 'applicationId', applicationId);
-    return this.request<T>('application.info', { applicationId, ...(extra ?? {}) });
+    return this.request<T>('application.info', { applicationId, ...(extra ?? {}) }, { deadlineAt: options.deadlineAt });
   }
 
   async applicationList<T = OpaqueRecord[]>(params: ApplicationListParams = {}): Promise<AshbyResult<T>> {
@@ -509,9 +515,13 @@ export class AshbyClient {
    * carry optional documented fields (e.g. `externalMappingId`) but can never
    * override the validated `id`.
    */
-  async candidateInfo<T = OpaqueRecord>(candidateId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
+  async candidateInfo<T = OpaqueRecord>(
+    candidateId: string,
+    extra?: OpaqueRecord,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
     const id = validateId('candidate.info', 'candidateId', candidateId);
-    return this.request<T>('candidate.info', { ...(extra ?? {}), id });
+    return this.request<T>('candidate.info', { ...(extra ?? {}), id }, { deadlineAt: options.deadlineAt });
   }
 
   /**
@@ -590,7 +600,8 @@ export class AshbyClient {
   /**
    * One page of the tenant's candidate tags. `includeArchived: false` is sent
    * explicitly because Ashby documents no default for it. The endpoint's limit
-   * is 100, not the 500 the other list helpers allow.
+   * is 100, not the 500 the other list helpers allow. `deadlineAt` is internal
+   * and never part of the body.
    */
   async candidateTagList<T = OpaqueRecord[]>(params: CandidateTagListParams = {}): Promise<AshbyResult<T>> {
     const body: OpaqueRecord = { includeArchived: false };
@@ -600,7 +611,7 @@ export class AshbyClient {
       if (limit === 0) throw new AshbyError('invalid_request', { code: 'invalid_limit', operation: 'candidateTag.list' });
       body.limit = limit;
     }
-    return this.request<T>('candidateTag.list', body);
+    return this.request<T>('candidateTag.list', body, { deadlineAt: params.deadlineAt });
   }
 
   /**
@@ -612,21 +623,29 @@ export class AshbyClient {
    * for a repeat, so a retried add after a lost response can only meet a tag the
    * lane wanted there anyway.
    */
-  async candidateAddTag<T = OpaqueRecord>(candidateId: string, tagId: string): Promise<AshbyResult<T>> {
+  async candidateAddTag<T = OpaqueRecord>(
+    candidateId: string,
+    tagId: string,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
     const body: OpaqueRecord = {
       candidateId: validateId('candidate.addTag', 'candidateId', candidateId),
       tagId: validateId('candidate.addTag', 'tagId', tagId),
     };
-    return this.request<T>('candidate.addTag', body, { idempotent: true });
+    return this.request<T>('candidate.addTag', body, { idempotent: true, deadlineAt: options.deadlineAt });
   }
 
   /** Remove one tag from a candidate. Same body and retry reasoning as {@link candidateAddTag}. */
-  async candidateRemoveTag<T = OpaqueRecord>(candidateId: string, tagId: string): Promise<AshbyResult<T>> {
+  async candidateRemoveTag<T = OpaqueRecord>(
+    candidateId: string,
+    tagId: string,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
     const body: OpaqueRecord = {
       candidateId: validateId('candidate.removeTag', 'candidateId', candidateId),
       tagId: validateId('candidate.removeTag', 'tagId', tagId),
     };
-    return this.request<T>('candidate.removeTag', body, { idempotent: true });
+    return this.request<T>('candidate.removeTag', body, { idempotent: true, deadlineAt: options.deadlineAt });
   }
 
   // ── Cursor pagination helper (page/item caps + loop detection) ────────────

@@ -101,10 +101,38 @@ describe('recommendation labels', () => {
     ["'The hold threshold cannot be above the advance threshold.'", true],
     ["context: 'Recommended to advance'", true],
     ["{ label: 'On hold', value: 1 }", true],
+    // The retired copy itself, as it stood in the source before the rename
+    // (string concatenations included), so the scan is pinned to real text.
+    [
+      "'Scores run from 0 to 100. At or above advance is a recommendation to advance; at or above ' +\n  'hold is hold; below is reject.'",
+      true,
+    ],
+    [
+      "? 'The server rejected those values. Check the numbers and that hold is not above ' +\n            'advance.'",
+      true,
+    ],
+    ['hint="Default 45. Cannot be above advance."', true],
+    ["['Bot qualified', 'The automated scorecard recommended advancing this candidate.'],", true],
+    [
+      "'The scorecard put the candidate on hold, or could not produce a recommendation at all. These need a human: they are neither qualified nor rejected.',",
+      true,
+    ],
+    ["{ label: 'Needs review', value: count(derived?.needsReview), tone: 'warning', context: 'On hold or no verdict', loading },", true],
+    // What stays.
     ["label: 'Advance rate'", false],
     ["'Hold released. The screening will run'", false],
     ["subject_request_hold: 'On hold: data request'", false],
     ['errors.hold_threshold = x', false],
+    // The new copy that replaced the retired lines above.
+    [
+      "'Scores run from 0 to 100. At or above the Select score the recommendation is Select; at or ' +\n  'above the Borderline score it is Borderline; below that it is Reject.'",
+      false,
+    ],
+    ["'that the Borderline score is ' +\n            'not above the Select score.'", false],
+    ['hint="Default 45. Cannot be above the Select score."', false],
+    ["'The automated scorecard recommended Select for this candidate.'", false],
+    ["'The scorecard marked the candidate Borderline, or could not produce a recommendation at all.'", false],
+    ["context: 'Borderline or no verdict'", false],
   ])('the scan catches %j: %s', (sample, caught) => {
     let text = sample;
     for (const kept of KEPT_PHRASES) text = text.split(kept).join('');
@@ -128,14 +156,20 @@ function productionSources(): Map<string, string> {
 
 /**
  * The old verdict words, retired from display: a bare 'Advance' or 'Hold' label,
- * the same as JSX text, and the phrases the rename replaced.
+ * the same as JSX text, and the phrases the rename replaced, lower-case verdict
+ * phrasing included ("above advance", "hold is hold", "on hold").
  */
 const RETIRED_PATTERNS: readonly RegExp[] = [
   /(['"`])(Advance|Hold)\1/,
   />\s*(Advance|Hold)\s*</,
   /\b(advance|hold) threshold\b/i,
   /\brecommended to advance\b/i,
-  /\bOn hold(['"`])/,
+  /\brecommended advancing\b/i,
+  /\brecommendation to advance\b/i,
+  /\babove (advance|hold)\b/i,
+  /\b(advance|hold) is not above\b/i,
+  /\bis hold\b/i,
+  /\bon hold\b/i,
 ];
 
 /**

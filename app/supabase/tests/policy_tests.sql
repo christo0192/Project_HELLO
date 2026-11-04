@@ -23427,6 +23427,34 @@ begin
           = 'ashby:recommendation_tag:' || v_l1::text || ':' || v_a2::text,
     coalesce(v_res::text, 'null'));
 
+  -- The age anchor (R2-TS-3). A month-old operation never retried answers its
+  -- creation; after a manual Retry it answers the Retry, so the tag lane's 7-day
+  -- wait starts again. v_op2 is the only tag operation due.
+  update screening_v2.ashby_operations
+     set created_at = now() - interval '30 days'
+   where id = v_op2;
+  v_res := screening_v2.claim_ashby_operation('recommendation_tag', 'pol134-w', 30);
+  v_lease := (v_res->>'lease_token')::uuid;
+  perform _policy_tests.assert('0134: a never-retried operation''s age anchor is its creation',
+    v_res->>'status' = 'claimed' and (v_res->>'id')::uuid = v_op2
+      and (v_res->>'age_anchor')::timestamptz = now() - interval '30 days'
+      and (v_res->>'age_anchor')::timestamptz = (v_res->>'created_at')::timestamptz,
+    coalesce(v_res::text, 'null'));
+  v_res := screening_v2.fail_ashby_operation(v_op2, v_lease, 'ashby_tag_transient', false);
+  v_res := screening_v2.retry_ashby_operation(v_op2, c_actor);
+  perform _policy_tests.assert('0134: fixture: the failed tag operation is retried by hand',
+    v_res->>'status' = 'ok', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.claim_ashby_operation('recommendation_tag', 'pol134-w', 30);
+  v_lease := (v_res->>'lease_token')::uuid;
+  perform _policy_tests.assert('0134: after a manual Retry the age anchor is the Retry, not the creation',
+    v_res->>'status' = 'claimed' and (v_res->>'id')::uuid = v_op2
+      and (v_res->>'age_anchor')::timestamptz
+          = (select max(e.created_at) from screening_v2.audit_events e
+              where e.action = 'ashby_operation_retry' and e.target_id = v_op2::text)
+      and (v_res->>'age_anchor')::timestamptz > (v_res->>'created_at')::timestamptz,
+    coalesce(v_res::text, 'null'));
+  v_res := screening_v2.complete_ashby_operation(v_op2, v_lease, 'christy_tag_reject', null, c_actor);
+
   -- A verdict-less revision still gets an operation: its job is the removal.
   v_a2 := _policy_tests.p134_assess(v_s1, v_cand, null, c_t0 + interval '2 hours');
   v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s1, c_actor);
@@ -23462,10 +23490,11 @@ begin
   perform _policy_tests.assert('0134: a terminal link is blocked_terminal',
     v_res->>'status' = 'blocked_terminal', coalesce(v_res::text, 'null'));
 
-  -- The other lanes' claims still work and still answer created_at.
+  -- The other lanes' claims still work and still answer created_at and age_anchor.
   v_res := screening_v2.claim_ashby_operation('invite_delivery', 'pol134-w', 30);
   perform _policy_tests.assert('0134: invite_delivery is still claimable, and its gate still reads the mapping',
-    v_res->>'status' = 'claimed' and v_res ? 'created_at', coalesce(v_res::text, 'null'));
+    v_res->>'status' = 'claimed' and v_res ? 'created_at' and v_res ? 'age_anchor',
+    coalesce(v_res::text, 'null'));
   v_res := screening_v2.claim_ashby_operation('scorecard_write', 'pol134-w', 30);
   perform _policy_tests.assert('0134: scorecard_write is still claimable',
     v_res->>'status' = 'claimed', coalesce(v_res::text, 'null'));

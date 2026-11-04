@@ -52,7 +52,10 @@ verdict tag lane (`recommendation-tags.ts`, runbook
 maximum. The two write helpers send a body of exactly `{candidateId, tagId}`, with
 no `extra`, because the endpoints set additionalProperties false. They pass
 `{ idempotent: true }`, which is safe only because the one caller reads
-`candidate.info` before it writes. None of the three is a probe read.
+`candidate.info` before it writes. None of the three is a probe read. These three,
+`candidateInfo` and `applicationInfo` also take an internal `deadlineAt` (never
+sent to Ashby): the lane passes its run's deadline, so a call's timeout, retries and
+`Retry-After` waits all end before the operation's lease does.
 
 `job.list` (read; needs the `jobsRead` permission) is the job directory behind
 the Mission Control "Add mapping" picker (`GET …/mission-control/jobs`). The

@@ -45,6 +45,9 @@ class FakeTenant {
   christyCountsAfterWrite: number[] = [];
   failStatus: number | null = null;
   denyList = false;
+  /** How long each call takes, on the simulation's clock (`onCall` moves it). */
+  latencyMs = 0;
+  onCall: (latencyMs: number) => void = () => {};
 
   private json(status: number, body: unknown) {
     const text = JSON.stringify(body);
@@ -66,6 +69,7 @@ class FakeTenant {
   transport = async (req: { url: string; body: string }) => {
     const route = new URL(req.url).pathname;
     const body = JSON.parse(req.body) as Record<string, string>;
+    this.onCall(this.latencyMs);
     if (this.failStatus !== null) return this.json(this.failStatus, {});
     switch (route) {
       case '/candidate.info':
@@ -109,6 +113,8 @@ interface SimOp {
   anchor: string | null;
   errorCode: string | null;
   lease: string | null;
+  /** When the claim's lease runs out. 0035 defer refuses after it; fail and complete do not look. */
+  leaseExpiresAt: number;
   scheduledAt: number;
   createdAt: number;
 }
@@ -173,7 +179,7 @@ class SimDb {
     if (this.ops.some((o) => o.key === key)) return { status: 'duplicate' };
     this.ops.push({
       id: `op-${++this.seq}`, type: 'recommendation_tag', key, linkId, sessionId,
-      state: 'pending', anchor: null, errorCode: null, lease: null,
+      state: 'pending', anchor: null, errorCode: null, lease: null, leaseExpiresAt: 0,
       scheduledAt: this.clock, createdAt: this.clock,
     });
     return { status: 'inserted' };
@@ -197,7 +203,7 @@ class SimDb {
       enqueueRecommendationTag: async (linkId, sessionId) =>
         // The production store's gate, against the in-memory outbox.
         recommendationTagsEnabled() ? this.enqueueTag(linkId, sessionId) : { status: 'disabled' },
-      claimOperation: async (type) => {
+      claimOperation: async (type, _owner, leaseSeconds) => {
         const next = this.ops
           .filter((o) => o.type === type && o.state === 'pending' && o.scheduledAt <= this.clock
             && !this.links.get(o.linkId)?.terminal)
@@ -205,6 +211,7 @@ class SimDb {
         if (!next) return null;
         next.state = 'running';
         next.lease = `lease-${next.id}`;
+        next.leaseExpiresAt = this.clock + leaseSeconds * 1000;
         const claim: OperationClaimRow = {
           id: next.id,
           operationType: next.type as OperationClaimRow['operationType'],
@@ -260,7 +267,8 @@ class SimDb {
       },
       deferOperation: async (id, lease, code, seconds) => {
         const o = op(id, lease);
-        if (!o) return 'not_owned';
+        // 0035: `lease_expires_at > p_now`, so a run that overran its lease is refused.
+        if (!o || this.clock >= o.leaseExpiresAt) return 'not_owned';
         o.errorCode = code;
         o.state = 'pending';
         o.scheduledAt = this.clock + seconds * 1000;
@@ -273,6 +281,8 @@ class SimDb {
 function world() {
   const tenant = new FakeTenant();
   const db = new SimDb();
+  // A slow tenant spends the simulation's time, which is the clock the lease runs on.
+  tenant.onCall = (latencyMs) => { db.clock += latencyMs; };
   const client = createAshbyClient({
     apiKey: 'SYNTHETIC_KEY',
     transport: tenant.transport,
@@ -588,6 +598,37 @@ describe('the flow on a fake tenant', () => {
     await w.drain();
     expect(w.db.tagOps()[0]).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_select' });
     expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.select]);
+  });
+
+  it('a slow Ashby: the run stops under its lease and waits, never stranded in running (R2-TS-1)', async () => {
+    const w = world();
+    w.db.addLink('link-1', 'app-1', CAND);
+    await w.complete('link-1', 'session-1', 'advance');
+    // A 30 s lease leaves a 15 s run. candidate.info takes 20 s, so the catalogue
+    // read would start past the deadline: the run defers, 20 s into a 30 s lease.
+    w.tenant.latencyMs = 20_000;
+    await w.drain();
+    expect(w.db.tagOps()[0]).toMatchObject({ state: 'pending', errorCode: 'ashby_tag_transient' });
+    expect(w.tenant.writes).toEqual([]);
+    w.tenant.latencyMs = 0;
+    w.db.clock += 300_000;
+    await w.drain();
+    expect(w.db.tagOps()[0]).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_select' });
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.select]);
+  });
+
+  it('a run that overran its lease anyway is put back to pending by a retryable fail, not stranded', async () => {
+    const w = world();
+    w.db.addLink('link-1', 'app-1', CAND);
+    await w.complete('link-1', 'session-1', 'advance');
+    // candidate.info alone takes 40 s, past the 30 s lease: the defer is refused.
+    w.tenant.latencyMs = 40_000;
+    const r = await w.tick();
+    expect(r.recommendationTag).toMatchObject({ claimed: true, committed: false, staleLease: false, code: 'ashby_tag_transient' });
+    expect(w.db.tagOps()[0]).toMatchObject({ state: 'pending', errorCode: 'ashby_tag_transient' });
+    w.tenant.latencyMs = 0;
+    await w.drain();
+    expect(w.db.tagOps()[0]).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_select' });
   });
 
   it('a key without tag permission waits an hour at a time, then fails after seven days', async () => {

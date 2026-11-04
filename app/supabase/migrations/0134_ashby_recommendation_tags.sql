@@ -31,7 +31,10 @@
 -- Fail fast rather than queue (the 0109 precedent): the CHECK swap below takes
 -- ACCESS EXCLUSIVE on ashby_operations, which the worker claims from on every
 -- poll tick and every enqueue and webhook writes to. A long-held lock should
--- fail this deploy (it retries cleanly), not stall the outbox behind it.
+-- fail this deploy, not stall the outbox behind it. Nothing re-runs it by
+-- itself: the migrate job fails, the app deploys after it are skipped, and the
+-- old API keeps working on the old database. Once the lock holder is gone,
+-- re-run the Deploy (Fly) workflow, or dispatch it with service=api.
 -- LOCAL: scoped to this migration's transaction, so it can never persist on a
 -- pooled connection and change lock behaviour for anything after it.
 set local lock_timeout = '10s';
@@ -131,9 +134,15 @@ grant execute on function screening_v2.enqueue_ashby_operation(uuid, text, text,
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 3. claim_ashby_operation: the 0059 body VERBATIM (the 0032 terminal gate and
---    the 0035 invite gate stay) plus the new type and `created_at` in the
---    answer, which the tag lane's age limit reads
+--    the 0035 invite gate stay) plus the new type, and `created_at` and
+--    `age_anchor` in the answer, which the tag lane's age limit reads
 -- ═══════════════════════════════════════════════════════════════════════
+--
+-- `age_anchor` is the later of created_at and the newest `ashby_operation_retry`
+-- audit row for this operation. Every manual Retry writes one (0032
+-- retry_ashby_operation; 0035 reopen_ashby_invite_delivery too), audit_events is
+-- append-only, and its (action, created_at) index keeps the lookup to the few
+-- retry rows. It runs only after a row is claimed, never on an empty poll.
 
 create or replace function screening_v2.claim_ashby_operation(
   p_operation_type text,
@@ -219,7 +228,16 @@ begin
     'max_attempts', v_op.max_attempts,
     'marker', v_op.marker,
     'source_session_id', v_op.source_session_id,
-    'created_at', v_op.created_at
+    'created_at', v_op.created_at,
+    -- The tag lane's 7-day wait counts from here: creation, or this operation's
+    -- newest manual Retry (retry_ashby_operation audits every one), so a Retry
+    -- after the limit gets a fresh week. GREATEST skips a NULL.
+    'age_anchor', greatest(v_op.created_at, (
+      select max(e.created_at)
+        from screening_v2.audit_events e
+       where e.action = 'ashby_operation_retry'
+         and e.target_type = 'ashby_operation'
+         and e.target_id = v_op.id::text))
   );
 end;
 $$;
@@ -342,6 +360,12 @@ comment on function screening_v2.enqueue_ashby_recommendation_tag is
 --
 -- `no_assessment` means no result at all, so the target is "no tag".
 -- Codes, counts and opaque ids only: never a name, an email or a phone.
+--
+-- Performance: both reads below scan their table (external_candidate_id has no
+-- index, and the assessments session indexes are partial since 0088). Fine at
+-- today's size; if it grows, a later migration can add a partial index on
+-- ashby_application_links(external_candidate_id) and one on
+-- assessments(session_id, created_at desc).
 
 create or replace function screening_v2.ashby_candidate_tag_verdict(
   p_application_link_id   uuid,

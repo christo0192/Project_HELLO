@@ -280,6 +280,18 @@ describe('CandidateScorecard field parity vs the legacy Scorecard', () => {
       expect(screen.getByText(RECOMMENDATION_LABELS[recommendation])).toBeInTheDocument();
     },
   );
+
+  it('shows no verdict for a stored NULL, never "Borderline" (WEB-R2-3)', () => {
+    render(<CandidateScorecard assessment={{ ...MINIMAL, recommendation: null as never }} />);
+    expect(screen.queryByText(RECOMMENDATION_LABELS.hold)).not.toBeInTheDocument();
+    expect(screen.queryByText('Recommendation:')).not.toBeInTheDocument();
+  });
+
+  it('shows a value it does not know plainly, as the legacy card does, not as "Borderline"', () => {
+    render(<CandidateScorecard assessment={{ ...MINIMAL, recommendation: 'needs_panel' as never }} />);
+    expect(screen.getByText('Needs panel')).toBeInTheDocument();
+    expect(screen.queryByText(RECOMMENDATION_LABELS.hold)).not.toBeInTheDocument();
+  });
 });
 
 describe('CandidateScorecard layout defects', () => {

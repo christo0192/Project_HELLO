@@ -163,6 +163,16 @@ const OPERATION_LABELS: Record<string, string> = {
   stage_move: 'Stage move',
   recommendation_tag: 'Christy tag',
 };
+/**
+ * A failed operation's Retry button, named for WHICH retry. The rest lower-case
+ * the row label ("Retry stage move"); Christy is a name, so it keeps its capital.
+ */
+const OPERATION_RETRY_NAMES: Record<string, string> = {
+  recommendation_tag: 'Retry Christy tag',
+};
+function retryName(operationType: string, label: string): string {
+  return OPERATION_RETRY_NAMES[operationType] ?? `Retry ${label.toLowerCase()}`;
+}
 const OPERATION_STATE_LABELS: Record<string, string> = {
   pending: 'Pending',
   running: 'In progress',
@@ -1246,7 +1256,7 @@ export function AshbyMissionControlPage() {
                             className={TOUCH}
                             disabled={busy}
                             // Starts with the visible word; says WHICH retry.
-                            aria-label={`Retry ${type.toLowerCase()}`}
+                            aria-label={retryName(op.type, type)}
                             onClick={() => run(() => api.retryAshbyOperation(op.id))}
                           >
                             Retry

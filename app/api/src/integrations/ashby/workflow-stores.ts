@@ -359,6 +359,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         marker: typeof row?.marker === 'string' ? row.marker : null,
         sourceSessionId: typeof row?.source_session_id === 'string' ? row.source_session_id : null,
         createdAt: typeof row?.created_at === 'string' ? row.created_at : null,
+        ageAnchor: typeof row?.age_anchor === 'string' ? row.age_anchor : null,
       };
     },
     async readIngestion(

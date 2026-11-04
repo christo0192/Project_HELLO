@@ -174,6 +174,13 @@ export interface OperationClaimRow {
    * a defer refunds the attempt, so without it a deferred row never ends.
    */
   createdAt?: string | null;
+  /**
+   * Where the tag lane's age limit counts from (0134): `created_at`, or the
+   * newest manual Retry of this operation when there is one, so a Retry after
+   * the limit gets a fresh wait. Null when unknown; the lane then uses
+   * `createdAt`.
+   */
+  ageAnchor?: string | null;
 }
 
 /** The tag lane's link read (0134): the link's Ashby ids and nothing else. */

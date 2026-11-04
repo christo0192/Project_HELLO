@@ -176,6 +176,20 @@ export interface CandidateTagListParams {
   cursor?: string;
   /** Page size, 1..100 (the endpoint's documented maximum). */
   limit?: number;
+  /** Internal wall-clock deadline (epoch ms); never sent to Ashby. */
+  deadlineAt?: number;
+}
+
+/**
+ * Per-call options for a typed helper whose second argument is already taken.
+ * Internal only, never part of the request body.
+ */
+export interface AshbyCallOptions {
+  /**
+   * Wall-clock deadline (epoch ms): it shortens the call's timeout, its retries
+   * and any Retry-After wait, and past it the call fails as a `timeout`.
+   */
+  deadlineAt?: number;
 }
 
 export interface FeedbackSubmitRequest {

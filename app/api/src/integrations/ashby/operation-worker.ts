@@ -67,7 +67,13 @@ import type { ProbeFeedbackForm } from './probe.js';
 import { materializeInvite, type MaterializationStore, type MaterializationMapping } from './materialize.js';
 import type { EmailProviderState } from './invite-delivery.js';
 import { isAshbyError } from './errors.js';
-import { executeRecommendationTag, type RecommendationTagAdapter } from './recommendation-tags.js';
+import {
+  deferRecommendationTag,
+  executeRecommendationTag,
+  TAG_TRANSIENT_DEFER_SECONDS,
+  TAG_VERDICT_UNREADABLE,
+  type RecommendationTagAdapter,
+} from './recommendation-tags.js';
 import {
   BROWSER_SCREENING_RETIRED,
   legacyBrowserScreeningEnabled,
@@ -201,6 +207,10 @@ export function channelForOperationKey(
 export async function runClaimedAshbyOperation(
   deps: OperationWorkerDeps,
 ): Promise<OperationRunOutcome> {
+  // The tag lane's deadline counts from here. Read BEFORE the claim: the lease
+  // starts at or after this instant, so the deadline errs early, never late.
+  // Only that lane reads the clock here; the others are untouched.
+  const claimedAtMs = deps.recommendationTag ? (deps.nowMs ? deps.nowMs() : Date.now()) : undefined;
   let claim: OperationClaimRow | null;
   try {
     claim = await deps.stores.claimOperation(
@@ -243,7 +253,8 @@ export async function runClaimedAshbyOperation(
 
     // Everything after the scorecard branch is invite code, so this lane returns
     // here. The executor classifies its own errors: it must not reach this
-    // function's catch, which makes a timeout terminal.
+    // function's catch, which makes a timeout terminal. It gets the claim time
+    // and the lease, so it can finish (or wait) before the lease runs out.
     if (claim.operationType === 'recommendation_tag') {
       if (!deps.recommendationTag) {
         const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'recommendation_tag_sink_unavailable', false);
@@ -254,6 +265,8 @@ export async function runClaimedAshbyOperation(
         adapter: deps.recommendationTag,
         nowMs: deps.nowMs,
         onEvent: deps.onEvent,
+        claimedAtMs,
+        leaseSeconds: deps.leaseSeconds,
       });
     }
 
@@ -498,6 +511,26 @@ export async function runClaimedAshbyOperation(
       code: result.delivery,
     };
   } catch (error) {
+    // The tag executor settles every error itself, so what reaches here for a
+    // tag is a database error BEFORE it: the link read, or the write recording
+    // link_missing or terminal_cancel. Failing that retryable below reschedules
+    // with no backoff and no refund, so one brownout would spend every attempt
+    // in about 25 s. The tag waits instead, as its own link read does.
+    if (claim.operationType === 'recommendation_tag') {
+      try {
+        return await deferRecommendationTag(
+          claim,
+          { stores: deps.stores, nowMs: deps.nowMs, onEvent: deps.onEvent },
+          TAG_VERDICT_UNREADABLE,
+          TAG_TRANSIENT_DEFER_SECONDS,
+        );
+      } catch {
+        return {
+          claimed: true, operationType: claim.operationType, committed: false,
+          staleLease: false, code: TAG_VERDICT_UNREADABLE,
+        };
+      }
+    }
     // Preserve only the Ashby client's already-sanitized taxonomy. A provider
     // success:false is permanent unless the client explicitly classified it
     // retriable; retrying the identical invalid scorecard five times obscured

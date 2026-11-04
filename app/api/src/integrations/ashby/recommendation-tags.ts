@@ -35,6 +35,13 @@
  * everything WAITS (a defer refunds the attempt), and age ends a wait, so a hot
  * retry can never burn the attempts in seconds.
  *
+ * THE RUN HAS A DEADLINE under its lease. A defer is refused once the lease has
+ * run out (0035), and nothing reclaims a `running` row, so a slow run that then
+ * waited would be stranded for good. Every Ashby call is cut off at the
+ * deadline and none starts close to it, so the run reaches its defer with the
+ * lease still live. Should a defer be refused anyway, a retryable fail (which
+ * does not check the lease's expiry) puts the row back to pending.
+ *
  * LOGS AND EVENTS ARE METADATA ONLY: no tag id, candidate id or name, and no
  * title beyond the fixed constants below.
  */
@@ -48,7 +55,7 @@ import type {
   RuntimeWorkflowStores,
 } from './orchestration.js';
 import type { OperationRunOutcome } from './operation-worker.js';
-import type { AshbyResult, CandidateTagListParams } from './types.js';
+import type { AshbyCallOptions, AshbyResult, CandidateTagListParams } from './types.js';
 
 /** The exact titles the admin created in Ashby. Compared after a trim, case-sensitive. */
 export const CHRISTY_VERDICT_TAG_TITLES = {
@@ -73,6 +80,58 @@ export const TAG_CONFIG_FAULT_DEFER_SECONDS = 3600;
 export const TAG_TRANSIENT_DEFER_SECONDS = 300;
 /** A defer refunds the attempt, so age is what ends a row that keeps deferring. */
 export const TAG_DEFER_AGE_LIMIT_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * The run stops this long before its lease ends, so its defer (0035 refuses an
+ * expired lease) still lands. A lease under 30 s keeps half of itself instead,
+ * so the deadline is never at or before the start.
+ */
+export const TAG_LEASE_MARGIN_MS = 15_000;
+/** No Ashby call starts with less than this left (a third of a shorter run). */
+export const TAG_MIN_CALL_MS = 5_000;
+
+/** Too little of the run's time is left to start an Ashby call. The lane waits. */
+export class TagRunOutOfTime extends Error {
+  constructor() {
+    super('tag_run_out_of_time');
+  }
+}
+
+/**
+ * The run's time, spent one Ashby call at a time. `beforeCall` is called right
+ * before each call: it throws {@link TagRunOutOfTime} when too little is left,
+ * and otherwise answers the options that cut that call off at the deadline.
+ */
+export interface TagCallBudget {
+  beforeCall(): AshbyCallOptions;
+}
+
+/**
+ * The budget for a run claimed at `claimedAtMs` (on `nowMs`'s clock) with a
+ * lease of `leaseSeconds`, or undefined when either is unknown. The client
+ * keeps time on the wall clock, so each call is handed the time LEFT, carried
+ * across to `Date.now()`: the two clocks are then never compared.
+ */
+export function tagCallBudget(
+  nowMs: () => number,
+  claimedAtMs: number | undefined,
+  leaseSeconds: number | undefined,
+): TagCallBudget | undefined {
+  if (typeof claimedAtMs !== 'number' || !Number.isFinite(claimedAtMs)) return undefined;
+  if (typeof leaseSeconds !== 'number' || !Number.isFinite(leaseSeconds) || leaseSeconds <= 0) return undefined;
+  // The claim RPC clamps the lease to 900 s.
+  const leaseMs = Math.min(leaseSeconds, 900) * 1000;
+  const runMs = leaseMs - Math.min(TAG_LEASE_MARGIN_MS, leaseMs / 2);
+  const deadlineMs = claimedAtMs + runMs;
+  const minCallMs = Math.min(TAG_MIN_CALL_MS, runMs / 3);
+  return {
+    beforeCall() {
+      const left = deadlineMs - nowMs();
+      if (left < minCallMs) throw new TagRunOutOfTime();
+      return { deadlineAt: Date.now() + left };
+    },
+  };
+}
 
 /** The link or the candidate's verdict could not be read from the database. */
 export const TAG_VERDICT_UNREADABLE = 'ashby_tag_verdict_unreadable';
@@ -117,7 +176,11 @@ export type ChristyTagResolution =
   | { status: 'truncated' };
 
 export interface ChristyTagResolver {
-  resolve(title: ChristyTagTitle, options?: { fresh?: boolean }): Promise<ChristyTagResolution>;
+  /**
+   * `budget` is the run's time: each catalogue page is a call against it, so a
+   * slow walk stops (throwing {@link TagRunOutOfTime}) rather than run past it.
+   */
+  resolve(title: ChristyTagTitle, options?: { fresh?: boolean; budget?: TagCallBudget }): Promise<ChristyTagResolution>;
   /** Drop the cached catalogue, so the next resolve reads Ashby again. */
   invalidate?(): void;
 }
@@ -129,16 +192,19 @@ type TagCatalogue = ReadonlyMap<string, ReadonlySet<string>>;
  * the walk did not reach the end: a truthy `moreDataAvailable` with no usable
  * cursor, a repeated cursor, the page cap, or a result that is not a list.
  * An Ashby page may be empty while more data follows, so an empty page continues.
- * A provider error propagates to the lane's own classification.
+ * A provider error, or the budget running out, propagates to the lane's own
+ * classification.
  */
-async function readTagCatalogue(reader: TagCatalogueReader): Promise<TagCatalogue | null> {
+async function readTagCatalogue(reader: TagCatalogueReader, budget?: TagCallBudget): Promise<TagCatalogue | null> {
   const catalogue = new Map<string, Set<string>>();
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
   for (let page = 0; page < MAX_TAG_LIST_PAGES; page++) {
+    const call = budget?.beforeCall();
     const res = await reader.candidateTagList({
       ...(cursor !== undefined ? { cursor } : {}),
       limit: TAG_LIST_PAGE_SIZE,
+      ...(call?.deadlineAt !== undefined ? { deadlineAt: call.deadlineAt } : {}),
     });
     if (!Array.isArray(res.results)) return null;
     for (const item of res.results as unknown[]) {
@@ -182,7 +248,7 @@ export function createChristyTagResolver(
         !options.fresh && cached && nowMs() - cached.at < CHRISTY_TAG_CACHE_MS ? cached.catalogue : null;
       const fromCache = catalogue !== null;
       if (!catalogue) {
-        catalogue = await readTagCatalogue(reader);
+        catalogue = await readTagCatalogue(reader, options.budget);
         if (!catalogue) return { status: 'truncated' };
         cached = { at: nowMs(), catalogue };
       }
@@ -199,12 +265,15 @@ export function createChristyTagResolver(
 
 // ── Lane executor ───────────────────────────────────────────────────────────
 
-/** The client surface the lane uses. `AshbyClient` satisfies it. */
+/**
+ * The client surface the lane uses. `AshbyClient` satisfies it. The lane sends
+ * no `extra` fields; `options` carries the run's deadline.
+ */
 export interface RecommendationTagClient {
-  applicationInfo(applicationId: string): Promise<AshbyResult<unknown>>;
-  candidateInfo(candidateId: string): Promise<AshbyResult<unknown>>;
-  candidateAddTag(candidateId: string, tagId: string): Promise<unknown>;
-  candidateRemoveTag(candidateId: string, tagId: string): Promise<unknown>;
+  applicationInfo(applicationId: string, extra?: undefined, options?: AshbyCallOptions): Promise<AshbyResult<unknown>>;
+  candidateInfo(candidateId: string, extra?: undefined, options?: AshbyCallOptions): Promise<AshbyResult<unknown>>;
+  candidateAddTag(candidateId: string, tagId: string, options?: AshbyCallOptions): Promise<unknown>;
+  candidateRemoveTag(candidateId: string, tagId: string, options?: AshbyCallOptions): Promise<unknown>;
 }
 
 export interface RecommendationTagAdapter {
@@ -212,7 +281,14 @@ export interface RecommendationTagAdapter {
   resolver: ChristyTagResolver;
 }
 
-export interface RecommendationTagDeps {
+/** What settling a claimed tag operation needs: the three outbox writes, a clock and the observer. */
+export interface RecommendationTagSettleDeps {
+  stores: Pick<RuntimeWorkflowStores, 'completeOperation' | 'failOperation' | 'deferOperation'>;
+  nowMs?: () => number;
+  onEvent?: (event: { kind: string; operationType: string; code?: string }) => void;
+}
+
+export interface RecommendationTagDeps extends RecommendationTagSettleDeps {
   stores: Pick<
     RuntimeWorkflowStores,
     | 'completeOperation'
@@ -223,8 +299,93 @@ export interface RecommendationTagDeps {
     | 'bindLinkExternalCandidateId'
   >;
   adapter: RecommendationTagAdapter;
-  nowMs?: () => number;
-  onEvent?: (event: { kind: string; operationType: string; code?: string }) => void;
+  /**
+   * When the operation was claimed (on `nowMs`'s clock, read just BEFORE the
+   * claim call, so the deadline errs early) and the lease it was claimed with.
+   * Together they set the run's deadline ({@link tagCallBudget}). Either one
+   * absent: no deadline.
+   */
+  claimedAtMs?: number;
+  leaseSeconds?: number;
+}
+
+/**
+ * Where the age limit counts from: the newest manual Retry (0134 claim
+ * `age_anchor`), else creation. NaN when neither can be read.
+ */
+function waitStartedMs(claim: OperationClaimRow): number {
+  for (const value of [claim.ageAnchor, claim.createdAt]) {
+    const ms = typeof value === 'string' ? Date.parse(value) : Number.NaN;
+    if (Number.isFinite(ms)) return ms;
+  }
+  return Number.NaN;
+}
+
+/** The lane's three ways to end a run. Shared by the executor and the worker's preamble. */
+function tagSettlers(claim: OperationClaimRow, deps: RecommendationTagSettleDeps) {
+  const { stores } = deps;
+  const nowMs = deps.nowMs ?? (() => Date.now());
+
+  const emit = (kind: string, code: string): void => {
+    if (!deps.onEvent) return;
+    try { deps.onEvent({ kind, operationType: claim.operationType, code }); } catch { /* never break */ }
+  };
+  const outcome = (committed: boolean, staleLease: boolean, code: string): OperationRunOutcome => ({
+    claimed: true, operationType: claim.operationType, committed, staleLease, code,
+  });
+
+  const fail = async (code: string, retryable: boolean): Promise<OperationRunOutcome> => {
+    const r = await stores.failOperation(claim.id, claim.leaseToken, code, retryable);
+    emit(retryable ? 'retry' : 'blocked', code);
+    return outcome(false, r === 'not_owned', code);
+  };
+  const complete = async (anchor: string): Promise<OperationRunOutcome> => {
+    // Marker null: a tag has no content marker, and complete keeps it null.
+    const r = await stores.completeOperation(claim.id, claim.leaseToken, anchor, null);
+    emit('christy_tag', r === 'ok' ? anchor : 'stale_lease');
+    return outcome(r === 'ok', r !== 'ok', anchor);
+  };
+  /**
+   * A wait, not a failure: the attempt is refunded. That same refund means a wait
+   * never ends by itself, so an operation whose wait began more than the limit
+   * ago (its creation, or its newest manual Retry) fails with the code it was
+   * waiting on. An unknown age keeps waiting.
+   *
+   * The one defer helper. 0035 defer refuses a lease that has run out, while
+   * fail checks only the token and the state, and nothing reclaims a `running`
+   * row. So a refused defer falls back to a retryable fail, which puts the row
+   * back to pending (spending the attempt the defer would have refunded). Only a
+   * fail refused too means the lease is really gone.
+   */
+  const defer = async (code: string, seconds: number): Promise<OperationRunOutcome> => {
+    const startedMs = waitStartedMs(claim);
+    if (Number.isFinite(startedMs) && nowMs() - startedMs > TAG_DEFER_AGE_LIMIT_MS) {
+      return fail(code, false);
+    }
+    const r = await stores.deferOperation(claim.id, claim.leaseToken, code, seconds);
+    if (r !== 'not_owned') {
+      emit('deferred', code);
+      return outcome(false, false, code);
+    }
+    emit('defer_refused', code);
+    return fail(code, true);
+  };
+
+  return { emit, outcome, fail, complete, defer };
+}
+
+/**
+ * Defer a claimed tag operation: the worker's preamble uses it, so a database
+ * blip before the executor waits like one inside it instead of failing hot.
+ * Same age limit and the same not_owned fallback as the executor's own waits.
+ */
+export function deferRecommendationTag(
+  claim: OperationClaimRow,
+  deps: RecommendationTagSettleDeps,
+  code: string,
+  seconds: number,
+): Promise<OperationRunOutcome> {
+  return tagSettlers(claim, deps).defer(code, seconds);
 }
 
 interface CandidateChristyTag {
@@ -338,45 +499,48 @@ export async function executeRecommendationTag(
 ): Promise<OperationRunOutcome> {
   const { stores, adapter } = deps;
   const nowMs = deps.nowMs ?? (() => Date.now());
+  const { outcome, fail, complete, defer } = tagSettlers(claim, deps);
 
-  const emit = (kind: string, code: string): void => {
-    if (!deps.onEvent) return;
-    try { deps.onEvent({ kind, operationType: claim.operationType, code }); } catch { /* never break */ }
-  };
-  const outcome = (committed: boolean, staleLease: boolean, code: string): OperationRunOutcome => ({
-    claimed: true, operationType: claim.operationType, committed, staleLease, code,
-  });
-
-  const fail = async (code: string, retryable: boolean): Promise<OperationRunOutcome> => {
-    const r = await stores.failOperation(claim.id, claim.leaseToken, code, retryable);
-    emit(retryable ? 'retry' : 'blocked', code);
-    return outcome(false, r === 'not_owned', code);
-  };
-  const complete = async (anchor: string): Promise<OperationRunOutcome> => {
-    // Marker null: a tag has no content marker, and complete keeps it null.
-    const r = await stores.completeOperation(claim.id, claim.leaseToken, anchor, null);
-    emit('christy_tag', r === 'ok' ? anchor : 'stale_lease');
-    return outcome(r === 'ok', r !== 'ok', anchor);
+  // Every Ashby call goes through here, so each one is checked against the
+  // run's deadline and cut off at it. With no deadline the calls are as before.
+  const budget = tagCallBudget(nowMs, deps.claimedAtMs, deps.leaseSeconds);
+  const ashby = {
+    applicationInfo: async (applicationId: string) => {
+      const o = budget?.beforeCall();
+      return o ? adapter.client.applicationInfo(applicationId, undefined, o) : adapter.client.applicationInfo(applicationId);
+    },
+    candidateInfo: async (candidateId: string) => {
+      const o = budget?.beforeCall();
+      return o ? adapter.client.candidateInfo(candidateId, undefined, o) : adapter.client.candidateInfo(candidateId);
+    },
+    addTag: async (candidateId: string, tagId: string) => {
+      const o = budget?.beforeCall();
+      return o ? adapter.client.candidateAddTag(candidateId, tagId, o) : adapter.client.candidateAddTag(candidateId, tagId);
+    },
+    removeTag: async (candidateId: string, tagId: string) => {
+      const o = budget?.beforeCall();
+      return o ? adapter.client.candidateRemoveTag(candidateId, tagId, o) : adapter.client.candidateRemoveTag(candidateId, tagId);
+    },
+    resolve: (title: ChristyTagTitle, fresh: boolean) =>
+      budget || fresh
+        ? adapter.resolver.resolve(title, { ...(fresh ? { fresh: true } : {}), ...(budget ? { budget } : {}) })
+        : adapter.resolver.resolve(title),
   };
   /**
-   * A wait, not a failure: the attempt is refunded. That same refund means a wait
-   * never ends by itself, so an operation older than the limit fails with the
-   * code it was waiting on. An unknown age keeps waiting.
+   * A failed tag write may mean the cached id is dead (the admin deleted or
+   * archived the tag), whatever Ashby answered: drop the cache, so the next
+   * resolve reads the catalogue. A run out of time wrote nothing.
    */
-  const defer = async (code: string, seconds: number): Promise<OperationRunOutcome> => {
-    const createdMs = claim.createdAt ? Date.parse(claim.createdAt) : Number.NaN;
-    if (Number.isFinite(createdMs) && nowMs() - createdMs > TAG_DEFER_AGE_LIMIT_MS) {
-      return fail(code, false);
-    }
-    const r = await stores.deferOperation(claim.id, claim.leaseToken, code, seconds);
-    emit('deferred', code);
-    return outcome(false, r === 'not_owned', code);
+  const writeFailed = (error: unknown): void => {
+    if (!(error instanceof TagRunOutOfTime)) adapter.resolver.invalidate?.();
   };
   /**
    * Every error that escapes the run waits. A hot retryable fail would spend all
    * five attempts in about 25 s and end in a row Mission Control cannot retry.
    */
   const settleFault = async (error: unknown): Promise<OperationRunOutcome> => {
+    // The deadline stopped the run while its lease is live: wait, as for a slow Ashby.
+    if (error instanceof TagRunOutOfTime) return defer('ashby_tag_transient', TAG_TRANSIENT_DEFER_SECONDS);
     const fault = classifyTagError(error);
     if (fault === 'permission') return defer('ashby_tag_permission_denied', TAG_CONFIG_FAULT_DEFER_SECONDS);
     if (fault === 'transient') return defer('ashby_tag_transient', TAG_TRANSIENT_DEFER_SECONDS);
@@ -397,7 +561,7 @@ export async function executeRecommendationTag(
     // (b) The candidate. Older links have no stored id; application.info has it.
     let candidateId = link.externalCandidateId;
     if (!candidateId && link.externalApplicationId) {
-      const info = await adapter.client.applicationInfo(link.externalApplicationId);
+      const info = await ashby.applicationInfo(link.externalApplicationId);
       candidateId = extractApplicationInfo(info.results).candidateId ?? null;
       if (candidateId) {
         // Compare-and-set, best effort: the tag does not depend on the bind.
@@ -427,7 +591,7 @@ export async function executeRecommendationTag(
 
     // (d) What the candidate carries now. A repeat ends here, with no write.
     const readChristyTags = async (): Promise<CandidateChristyTag[]> =>
-      christyTagsOf((await adapter.client.candidateInfo(candidate)).results);
+      christyTagsOf((await ashby.candidateInfo(candidate)).results);
     let tags = await readChristyTags();
     if (desiredStateHolds(tags, targetTitle)) return await complete(anchor);
 
@@ -435,8 +599,8 @@ export async function executeRecommendationTag(
     // tag stays until the new one can go on.
     let keepId = findTarget(tags, targetTitle)?.id ?? null;
     if (targetTitle && !keepId) {
-      let resolved = await adapter.resolver.resolve(targetTitle);
-      if (resolved.status === 'not_found') resolved = await adapter.resolver.resolve(targetTitle, { fresh: true });
+      let resolved = await ashby.resolve(targetTitle, false);
+      if (resolved.status === 'not_found') resolved = await ashby.resolve(targetTitle, true);
       let retried = false;
       for (;;) {
         if (resolved.status === 'not_found') return await defer('ashby_tag_not_found', TAG_CONFIG_FAULT_DEFER_SECONDS);
@@ -444,8 +608,19 @@ export async function executeRecommendationTag(
         if (resolved.status === 'truncated') return await defer('ashby_tag_transient', TAG_TRANSIENT_DEFER_SECONDS);
         let refused: AshbyError | null = null;
         let after: CandidateChristyTag[];
+        let answer: unknown;
         try {
-          const answer = await adapter.client.candidateAddTag(candidate, resolved.tagId);
+          answer = await ashby.addTag(candidate, resolved.tagId);
+        } catch (error) {
+          writeFailed(error);
+          // Ashby documents nothing about a repeated add, and a recruiter can
+          // edit tags between our read and our write: look before deciding.
+          if (!refusedWrite(error)) throw error;
+          refused = error;
+        }
+        if (refused) {
+          after = await readChristyTags();
+        } else {
           // A freshly read id is trusted. A cached one is checked: the admin may
           // have renamed or archived that tag since the catalogue was read.
           if (!resolved.cached) {
@@ -453,12 +628,6 @@ export async function executeRecommendationTag(
             break;
           }
           after = christyTagsInWriteAnswer(answer) ?? (await readChristyTags());
-        } catch (error) {
-          // Ashby documents nothing about a repeated add, and a recruiter can
-          // edit tags between our read and our write: look before deciding.
-          if (!refusedWrite(error)) throw error;
-          refused = error;
-          after = await readChristyTags();
         }
         const on = findTarget(after, targetTitle);
         if (on) {
@@ -472,7 +641,7 @@ export async function executeRecommendationTag(
         if (retried) return await fail(writeRejectedCode(refused), false);
         retried = true;
         tags = after;
-        resolved = await adapter.resolver.resolve(targetTitle, { fresh: true });
+        resolved = await ashby.resolve(targetTitle, true);
       }
     }
 
@@ -481,10 +650,10 @@ export async function executeRecommendationTag(
     for (const tag of tags) {
       if (tag.id === keepId) continue;
       try {
-        await adapter.client.candidateRemoveTag(candidate, tag.id);
+        await ashby.removeTag(candidate, tag.id);
       } catch (error) {
+        writeFailed(error);
         if (!refusedWrite(error)) throw error;
-        adapter.resolver.invalidate?.();
         // A remove refused because the tag is already gone is a remove done.
         const after = await readChristyTags();
         if (after.some((t) => t.id === tag.id)) return await fail(writeRejectedCode(error), false);
@@ -502,8 +671,9 @@ export async function executeRecommendationTag(
       for (const tag of settled) {
         if (tag.id === kept?.id) continue;
         try {
-          await adapter.client.candidateRemoveTag(candidate, tag.id);
+          await ashby.removeTag(candidate, tag.id);
         } catch (error) {
+          writeFailed(error);
           if (!refusedWrite(error)) throw error;
         }
       }

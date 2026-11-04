@@ -18,13 +18,16 @@ import {
   TAG_DEFER_AGE_LIMIT_MS,
   TAG_TRANSIENT_DEFER_SECONDS,
   TAG_VERDICT_UNREADABLE,
+  TagRunOutOfTime,
   christyTagForVerdict,
   createChristyTagResolver,
   executeRecommendationTag,
   recommendationTagsEnabled,
+  tagCallBudget,
   type RecommendationTagClient,
   type RecommendationTagDeps,
 } from '../integrations/ashby/recommendation-tags.js';
+import type { AshbyCallOptions } from '../integrations/ashby/types.js';
 import {
   REFUSED_OPERATION_TYPES,
   runAshbyOperationPass,
@@ -52,7 +55,7 @@ function res(status: number, body: string): AshbyTransportResponse {
 }
 const okEnvelope = (results: unknown = {}) => res(200, JSON.stringify({ success: true, results }));
 
-function clientWith(steps: Array<AshbyTransportResponse | Error>) {
+function clientWith(steps: Array<AshbyTransportResponse | Error>, sleep: (ms: number) => Promise<void> = async () => {}) {
   const calls: AshbyTransportRequest[] = [];
   let i = 0;
   const transport: AshbyTransport = async (req) => {
@@ -66,7 +69,7 @@ function clientWith(steps: Array<AshbyTransportResponse | Error>) {
     apiKey: 'synthetic-key',
     transport,
     random: () => 0.5,
-    sleep: async () => {},
+    sleep,
   });
   return { client, calls };
 }
@@ -145,6 +148,34 @@ describe('AshbyClient tag helpers', () => {
     const { client, calls } = clientWith([okEnvelope([])]);
     await client.candidateTagList({ cursor: 'opaque==', limit: 50 });
     expect(JSON.parse(calls[0].body)).toEqual({ includeArchived: false, cursor: 'opaque==', limit: 50 });
+  });
+
+  it.each([
+    ['candidateAddTag', (c: AshbyClient, o: AshbyCallOptions) => c.candidateAddTag(CAND, 'tag-1', o)],
+    ['candidateRemoveTag', (c: AshbyClient, o: AshbyCallOptions) => c.candidateRemoveTag(CAND, 'tag-1', o)],
+    ['candidateInfo', (c: AshbyClient, o: AshbyCallOptions) => c.candidateInfo(CAND, undefined, o)],
+    ['applicationInfo', (c: AshbyClient, o: AshbyCallOptions) => c.applicationInfo('app-1', undefined, o)],
+    ['candidateTagList', (c: AshbyClient, o: AshbyCallOptions) => c.candidateTagList({ deadlineAt: o.deadlineAt })],
+  ] as const)('%s honours a deadline: past it nothing is sent, and it never reaches the body', async (_name, call) => {
+    const past = clientWith([okEnvelope()]);
+    await expect(call(past.client, { deadlineAt: Date.now() - 1 })).rejects.toMatchObject({ category: 'timeout' });
+    expect(past.calls).toHaveLength(0);
+
+    const future = clientWith([okEnvelope()]);
+    await call(future.client, { deadlineAt: Date.now() + 60_000 });
+    expect(future.calls).toHaveLength(1);
+    expect(future.calls[0].body).not.toContain('deadline');
+  });
+
+  it('a deadline shortens a Retry-After wait on a tag write', async () => {
+    const sleeps: number[] = [];
+    const rateLimited: AshbyTransportResponse = {
+      status: 429, ok: false, headers: { get: (h: string) => (h === 'retry-after' ? '30' : null) }, text: async () => '{}',
+    };
+    const { client } = clientWith([rateLimited, okEnvelope()], async (ms) => { sleeps.push(ms); });
+    await client.candidateAddTag(CAND, 'tag-1', { deadlineAt: Date.now() + 2_000 });
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeLessThanOrEqual(2_000);
   });
 
   it('candidateTagList bounds limit to 1..100', async () => {
@@ -429,6 +460,8 @@ function harness(opts: {
   client?: Partial<RecommendationTagClient>;
   stores?: Partial<RecommendationTagDeps['stores']>;
   listTags?: ReturnType<typeof vi.fn>;
+  /** The run's clock, claim time and lease. Default: a frozen clock and no deadline. */
+  run?: Pick<RecommendationTagDeps, 'nowMs' | 'claimedAtMs' | 'leaseSeconds'>;
 } = {}) {
   const calls: string[] = [];
   const ashby = new FakeCandidate(opts.tags ?? [], [...CATALOGUE, ...(opts.known ?? [])] as FakeTag[]);
@@ -440,7 +473,7 @@ function harness(opts: {
     ...opts.client,
   };
   const candidateTagList = opts.listTags ?? vi.fn(async () => ({ results: opts.catalogue ?? CATALOGUE, moreDataAvailable: false }));
-  const resolver = createChristyTagResolver({ candidateTagList: candidateTagList as never }, () => NOW);
+  const resolver = createChristyTagResolver({ candidateTagList: candidateTagList as never }, opts.run?.nowMs ?? (() => NOW));
   const stores = {
     completeOperation: vi.fn(async () => 'ok' as const),
     failOperation: vi.fn(async () => ({ outcome: 'retry' as const })),
@@ -459,6 +492,7 @@ function harness(opts: {
         adapter: { client, resolver },
         nowMs: () => NOW,
         onEvent: (e) => events.push(e),
+        ...opts.run,
       },
     );
   return { ashby, client, stores, calls, run, events, candidateTagList, resolver };
@@ -974,8 +1008,14 @@ describe('executeRecommendationTag: everything else waits', () => {
     expect(await h.run()).toMatchObject({ committed: false, staleLease: true });
   });
 
-  it('a lost lease on defer and on fail reports stale', async () => {
-    const d = harness({ catalogue: [], stores: { deferOperation: vi.fn(async () => 'not_owned' as const) } });
+  it('a defer refused AND the fallback fail refused reports stale; a refused fail reports stale', async () => {
+    const d = harness({
+      catalogue: [],
+      stores: {
+        deferOperation: vi.fn(async () => 'not_owned' as const),
+        failOperation: vi.fn(async () => 'not_owned' as const),
+      },
+    });
     expect(await d.run()).toMatchObject({ staleLease: true });
     const f = harness({
       link: { externalCandidateId: null, externalApplicationId: null },
@@ -1001,6 +1041,252 @@ describe('executeRecommendationTag: everything else waits', () => {
     for (const secret of [CAND, 'tag-select', 'tag-reject', 'link-1', 'session-1', 'Christy:']) {
       expect(text).not.toContain(secret);
     }
+  });
+});
+
+// ── The run's deadline under its lease (R2-TS-1, R2-DEPLOY-1) ───────────────
+
+describe('tagCallBudget', () => {
+  it.each([
+    ['no claim time', undefined, 60],
+    ['no lease', NOW, undefined],
+    ['a zero lease', NOW, 0],
+    ['a negative lease', NOW, -5],
+    ['a claim time that is not a number', Number.NaN, 60],
+  ])('%s: no deadline', (_label, claimedAtMs, leaseSeconds) => {
+    expect(tagCallBudget(() => NOW, claimedAtMs, leaseSeconds)).toBeUndefined();
+  });
+
+  it('a 60 s lease runs 45 s, and no call starts with under 5 s left', () => {
+    let now = NOW;
+    const budget = tagCallBudget(() => now, NOW, 60)!;
+    now = NOW + 40_000; // 5 s left: a call may start, cut off at the deadline
+    const before = Date.now();
+    const { deadlineAt } = budget.beforeCall();
+    expect(deadlineAt).toBeGreaterThanOrEqual(before + 5_000);
+    expect(deadlineAt).toBeLessThanOrEqual(Date.now() + 5_000);
+    now += 1;
+    expect(() => budget.beforeCall()).toThrow(TagRunOutOfTime);
+  });
+
+  it('a lease under 30 s keeps half of itself, so the deadline is never at or before the start', () => {
+    let now = NOW;
+    const budget = tagCallBudget(() => now, NOW, 10)!; // a 5 s run; a call needs a third of it
+    expect(() => budget.beforeCall()).not.toThrow();
+    now = NOW + 3_333;
+    expect(() => budget.beforeCall()).not.toThrow();
+    now = NOW + 3_334;
+    expect(() => budget.beforeCall()).toThrow(TagRunOutOfTime);
+  });
+
+  it('counts a lease over 900 s as 900 s, as the claim RPC clamps it', () => {
+    let now = NOW + 880_000;
+    const budget = tagCallBudget(() => now, NOW, 5_000)!;
+    expect(() => budget.beforeCall()).not.toThrow();
+    now += 1;
+    expect(() => budget.beforeCall()).toThrow(TagRunOutOfTime);
+  });
+
+  it('the resolver spends it one catalogue page at a time, and running out mid-walk caches nothing', async () => {
+    let now = NOW;
+    type Page = { results: unknown[]; moreDataAvailable: boolean; nextCursor?: string };
+    const candidateTagList = vi.fn(async (_params?: { cursor?: string; limit?: number; deadlineAt?: number }): Promise<Page> => {
+      now += 20_000;
+      return { results: [], moreDataAvailable: true, nextCursor: `c${candidateTagList.mock.calls.length}` };
+    });
+    const resolver = createChristyTagResolver({ candidateTagList }, () => now);
+    const budget = tagCallBudget(() => now, NOW, 60)!;
+    await expect(resolver.resolve('Christy: Select', { budget })).rejects.toBeInstanceOf(TagRunOutOfTime);
+    // Pages start with 45, 25 and 5 s left; the fourth would start with none.
+    expect(candidateTagList).toHaveBeenCalledTimes(3);
+    for (const [params] of candidateTagList.mock.calls) expect(params?.deadlineAt).toEqual(expect.any(Number));
+    candidateTagList.mockImplementation(async () => ({ results: [SELECT], moreDataAvailable: false }));
+    expect(await resolver.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select', cached: false });
+  });
+});
+
+/**
+ * The outbox as 0031 and 0035 really behave: defer refuses a lease that has run
+ * out (`lease_expires_at > p_now`), while fail and complete check only the token
+ * and the state. Nothing reclaims a `running` row.
+ */
+function leasedOutbox(clock: { now: number }, leaseSeconds: number) {
+  const expiresAt = clock.now + leaseSeconds * 1000;
+  const row: { state: 'running' | 'pending' | 'failed' | 'succeeded'; deferredAt: number | null } = {
+    state: 'running',
+    deferredAt: null,
+  };
+  const stores = {
+    deferOperation: vi.fn(async () => {
+      if (row.state !== 'running' || clock.now >= expiresAt) return 'not_owned' as const;
+      row.state = 'pending';
+      row.deferredAt = clock.now;
+      return 'ok' as const;
+    }),
+    failOperation: vi.fn(async (_id: string, _lease: string, _code: string, retryable: boolean) => {
+      if (row.state !== 'running') return 'not_owned' as const;
+      row.state = retryable ? 'pending' : 'failed';
+      return { outcome: retryable ? ('retry' as const) : ('failed' as const) };
+    }),
+    completeOperation: vi.fn(async () => {
+      if (row.state !== 'running') return 'not_owned' as const;
+      row.state = 'succeeded';
+      return 'ok' as const;
+    }),
+  };
+  return { row, stores, expiresAt };
+}
+
+/**
+ * An Ashby that takes `costMs` of the run's clock per call and honours the
+ * deadline it is handed as the real client does: it gives up AT it, as a timeout.
+ */
+function slowAshby(h: ReturnType<typeof harness>, clock: { now: number }, costMs: number, failAdd?: AshbyError) {
+  const spend = async (options?: AshbyCallOptions): Promise<void> => {
+    const allowed = options?.deadlineAt !== undefined ? options.deadlineAt - Date.now() : Number.POSITIVE_INFINITY;
+    if (allowed < costMs) {
+      clock.now += Math.max(0, allowed);
+      throw new AshbyError('timeout', { code: 'deadline_exceeded' });
+    }
+    clock.now += costMs;
+  };
+  h.client.candidateInfo = vi.fn(async (_c: string, _e?: undefined, o?: AshbyCallOptions) => {
+    await spend(o);
+    return h.ashby.answer();
+  });
+  h.client.candidateAddTag = vi.fn(async (_c: string, tagId: string, o?: AshbyCallOptions) => {
+    await spend(o);
+    if (failAdd) throw failAdd;
+    h.ashby.add(tagId);
+    return h.ashby.answer();
+  });
+  h.candidateTagList.mockImplementation(async (params?: { deadlineAt?: number }) => {
+    await spend(params);
+    return { results: CATALOGUE, moreDataAvailable: false };
+  });
+}
+
+describe('executeRecommendationTag: the run ends under its lease (R2-TS-1)', () => {
+  it('a slow Ashby: the run stops before its deadline, and its defer lands while the lease is live', async () => {
+    const clock = { now: NOW };
+    const outbox = leasedOutbox(clock, 60);
+    const h = harness({ stores: outbox.stores, run: { nowMs: () => clock.now, claimedAtMs: NOW, leaseSeconds: 60 } });
+    slowAshby(h, clock, 14_000);
+    // candidate.info ends at 14 s, the catalogue at 28 s, the add at 42 s. The
+    // settle read would start with 3 s left of the 45 s run: it waits instead.
+    expect(await h.run()).toEqual({
+      claimed: true, operationType: 'recommendation_tag', committed: false, staleLease: false, code: 'ashby_tag_transient',
+    });
+    expect(outbox.row).toEqual({ state: 'pending', deferredAt: NOW + 42_000 });
+    expect(outbox.row.deferredAt!).toBeLessThan(outbox.expiresAt);
+    expect(outbox.stores.failOperation).not.toHaveBeenCalled();
+    expect(h.client.candidateInfo).toHaveBeenCalledTimes(1);
+    // The add is on; the next run only confirms it.
+    expect(h.ashby.christyIds()).toEqual(['tag-select']);
+    // Every call was handed the deadline.
+    expect((h.client.candidateInfo as ReturnType<typeof vi.fn>).mock.calls[0][2]).toEqual({ deadlineAt: expect.any(Number) });
+    expect((h.client.candidateAddTag as ReturnType<typeof vi.fn>).mock.calls[0][2]).toEqual({ deadlineAt: expect.any(Number) });
+    expect(h.candidateTagList.mock.calls[0][0]).toMatchObject({ deadlineAt: expect.any(Number) });
+  });
+
+  it('a call cut off at the deadline is a timeout: the run waits, the lease still live', async () => {
+    const clock = { now: NOW };
+    const outbox = leasedOutbox(clock, 60);
+    const h = harness({ stores: outbox.stores, run: { nowMs: () => clock.now, claimedAtMs: NOW, leaseSeconds: 60 } });
+    slowAshby(h, clock, 25_000, transientError());
+    // candidate.info ends at 25 s; the catalogue read starts with 20 s left and
+    // is cut off at the 45 s deadline (less the few real milliseconds the test
+    // itself takes, which the hand-over to the wall clock carries too).
+    expect(await h.run()).toMatchObject({ committed: false, staleLease: false, code: 'ashby_tag_transient' });
+    expect(outbox.row.state).toBe('pending');
+    expect(outbox.row.deferredAt!).toBeGreaterThan(NOW + 44_000);
+    expect(outbox.row.deferredAt!).toBeLessThanOrEqual(NOW + 45_000);
+    expect(h.client.candidateAddTag).not.toHaveBeenCalled();
+    expect(outbox.stores.failOperation).not.toHaveBeenCalled();
+  });
+
+  it('CONTROL: with no deadline the same Ashby overruns the lease; the refused defer falls back to a retryable fail', async () => {
+    const clock = { now: NOW };
+    const outbox = leasedOutbox(clock, 60);
+    const h = harness({ stores: outbox.stores, run: { nowMs: () => clock.now } });
+    slowAshby(h, clock, 25_000, transientError());
+    // info 25 s, catalogue 50 s, the add fails at 75 s: past the 60 s lease.
+    const r = await h.run();
+    expect(outbox.stores.deferOperation).toHaveBeenCalledTimes(1);
+    await expect(outbox.stores.deferOperation.mock.results[0].value).resolves.toBe('not_owned');
+    expect(outbox.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_transient', true);
+    // Back to pending, not stranded in `running`, and not reported stale.
+    expect(outbox.row.state).toBe('pending');
+    expect(r).toMatchObject({ committed: false, staleLease: false, code: 'ashby_tag_transient' });
+    expect(h.events.map((e) => e.kind)).toEqual(['defer_refused', 'retry']);
+  });
+
+  it('a defer refused for any reason falls back to a retryable fail with the same code', async () => {
+    const h = harness({
+      catalogue: [],
+      stores: { deferOperation: vi.fn(async () => 'not_owned' as const) },
+    });
+    expect(await h.run()).toMatchObject({ committed: false, staleLease: false, code: 'ashby_tag_not_found' });
+    expect(h.stores.failOperation).toHaveBeenCalledTimes(1);
+    expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_not_found', true);
+  });
+
+  it('a defer that succeeds never touches fail', async () => {
+    const h = harness({ catalogue: [] });
+    await h.run();
+    expect(h.stores.deferOperation).toHaveBeenCalledTimes(1);
+    expect(h.stores.failOperation).not.toHaveBeenCalled();
+    expect(h.events.map((e) => e.kind)).toEqual(['deferred']);
+  });
+});
+
+describe('executeRecommendationTag: the age limit counts from the newest manual Retry (R2-TS-3)', () => {
+  const old = new Date(NOW - TAG_DEFER_AGE_LIMIT_MS - 1).toISOString();
+  const recent = new Date(NOW - 60_000).toISOString();
+
+  it('an old operation Retried since waits again: its age counts from the Retry', async () => {
+    const h = harness({ catalogue: [], claim: { createdAt: old, ageAnchor: recent } });
+    await h.run();
+    expect(h.stores.deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_not_found', TAG_CONFIG_FAULT_DEFER_SECONDS);
+    expect(h.stores.failOperation).not.toHaveBeenCalled();
+  });
+
+  it('a Retry longer ago than the limit ends the wait like an old creation', async () => {
+    const h = harness({ catalogue: [], claim: { createdAt: old, ageAnchor: old } });
+    await h.run();
+    expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_not_found', false);
+    expect(h.stores.deferOperation).not.toHaveBeenCalled();
+  });
+
+  it.each([null, undefined, 'not-a-date'])('an unreadable anchor (%s) falls back to the creation time', async (ageAnchor) => {
+    const h = harness({ catalogue: [], claim: { createdAt: old, ageAnchor } });
+    await h.run();
+    expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_not_found', false);
+  });
+});
+
+describe('executeRecommendationTag: any failed write drops the tag-id cache (R2-TS-5)', () => {
+  it.each([
+    ['HTTP 404 on the add', { client: { candidateAddTag: vi.fn(async () => { throw http(404); }) } }],
+    ['HTTP 422 on the remove', { tags: [SELECT], src: source({ recommendation: null }), client: { candidateRemoveTag: vi.fn(async () => { throw http(422); }) } }],
+    ['a 5xx on the add', { client: { candidateAddTag: vi.fn(async () => { throw transientError(); }) } }],
+    ['a logical failure on the remove', { tags: [SELECT], src: source({ recommendation: null }), client: { candidateRemoveTag: vi.fn(async () => { throw logical('nope'); }) } }],
+  ])('%s: the next resolve reads the catalogue again', async (_label, over) => {
+    const h = harness(over as never);
+    await h.resolver.resolve('Christy: Select'); // the cache is warm
+    const reads = h.candidateTagList.mock.calls.length;
+    await h.run();
+    await h.resolver.resolve('Christy: Reject');
+    expect(h.candidateTagList).toHaveBeenCalledTimes(reads + 1);
+  });
+
+  it('CONTROL: a failed read keeps the cache', async () => {
+    const h = harness({ client: { candidateInfo: vi.fn(async () => { throw http(404); }) } });
+    await h.resolver.resolve('Christy: Select');
+    const reads = h.candidateTagList.mock.calls.length;
+    await h.run();
+    await h.resolver.resolve('Christy: Reject');
+    expect(h.candidateTagList).toHaveBeenCalledTimes(reads);
   });
 });
 
@@ -1066,8 +1352,120 @@ describe('runClaimedAshbyOperation: the tag lane', () => {
       recommendationTag: a,
     }));
     expect(claimOperation.mock.calls[0]).toEqual(['recommendation_tag', 'w1', 30]);
-    expect(a.client.candidateAddTag).toHaveBeenCalledWith(CAND, 'tag-select');
+    // The worker hands the run its deadline, and every call carries it.
+    expect(a.client.candidateAddTag).toHaveBeenCalledWith(CAND, 'tag-select', { deadlineAt: expect.any(Number) });
+    expect(a.client.candidateInfo).toHaveBeenCalledWith(CAND, undefined, { deadlineAt: expect.any(Number) });
     expect(r).toMatchObject({ committed: true, code: 'christy_tag_select' });
+  });
+
+  it('the deadline counts from BEFORE the claim, on the worker clock, with the worker lease', async () => {
+    // A 30 s lease leaves a 15 s run. The claim RPC takes 4 s and candidate.info
+    // 7 s: 11 s in, 4 s are left, under the 5 s a call needs. Counted from the
+    // claim's answer instead, 8 s would be left and the run would go on to write.
+    let now = NOW;
+    const claimOperation = vi.fn(async () => { now += 4_000; return claim; });
+    const a = adapter();
+    (a.client.candidateInfo as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      now += 7_000;
+      return { results: { id: CAND, tags: [] }, moreDataAvailable: false };
+    });
+    const deferOperation = vi.fn(async () => 'ok' as const);
+    const r = await runClaimedAshbyOperation(workerDeps({
+      stores: workerStores({ claimOperation: claimOperation as never, deferOperation }),
+      recommendationTag: a,
+      nowMs: () => now,
+    }));
+    expect(r).toMatchObject({ code: 'ashby_tag_transient', staleLease: false });
+    expect(deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_transient', TAG_TRANSIENT_DEFER_SECONDS);
+    expect(a.client.candidateAddTag).not.toHaveBeenCalled();
+  });
+
+  it('a database error before the executor defers the tag: no hot retryable fail (R2-TS-2)', async () => {
+    const a = adapter();
+    const failOperation = vi.fn(async () => ({ outcome: 'retry' as const }));
+    const deferOperation = vi.fn(async () => 'ok' as const);
+    const events: Array<{ kind: string; code?: string }> = [];
+    const r = await runClaimedAshbyOperation(workerDeps({
+      stores: workerStores({
+        failOperation,
+        deferOperation,
+        readLink: async () => { throw new Error('ashby_link_read_error'); },
+      }),
+      recommendationTag: a,
+      onEvent: (e) => events.push(e),
+    }));
+    expect(r).toEqual({
+      claimed: true, operationType: 'recommendation_tag', committed: false, staleLease: false, code: TAG_VERDICT_UNREADABLE,
+    });
+    expect(deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', TAG_VERDICT_UNREADABLE, TAG_TRANSIENT_DEFER_SECONDS);
+    expect(failOperation).not.toHaveBeenCalled();
+    expect(a.client.candidateInfo).not.toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'deferred', code: TAG_VERDICT_UNREADABLE }));
+  });
+
+  it('a failed terminal write before the executor defers the tag too', async () => {
+    const deferOperation = vi.fn(async () => 'ok' as const);
+    const r = await runClaimedAshbyOperation(workerDeps({
+      stores: workerStores({
+        deferOperation,
+        readLink: async () => ({ ...link, terminalState: 'withdrawn' }),
+        failOperation: async () => { throw new Error('ashby_operation_fail_error'); },
+      }),
+      recommendationTag: adapter(),
+    }));
+    expect(r).toMatchObject({ code: TAG_VERDICT_UNREADABLE });
+    expect(deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', TAG_VERDICT_UNREADABLE, TAG_TRANSIENT_DEFER_SECONDS);
+  });
+
+  it('the preamble defer has the same fallback: a refused defer becomes a retryable fail', async () => {
+    const failOperation = vi.fn(async () => ({ outcome: 'retry' as const }));
+    const r = await runClaimedAshbyOperation(workerDeps({
+      stores: workerStores({
+        failOperation,
+        deferOperation: async () => 'not_owned',
+        readLink: async () => { throw new Error('ashby_link_read_error'); },
+      }),
+      recommendationTag: adapter(),
+    }));
+    expect(r).toMatchObject({ code: TAG_VERDICT_UNREADABLE, staleLease: false });
+    expect(failOperation).toHaveBeenCalledWith('op-1', 'lease-1', TAG_VERDICT_UNREADABLE, true);
+  });
+
+  it('the preamble defer keeps the age limit', async () => {
+    const failOperation = vi.fn(async () => ({ outcome: 'failed' as const }));
+    const deferOperation = vi.fn(async () => 'ok' as const);
+    await runClaimedAshbyOperation(workerDeps({
+      stores: workerStores({
+        claimOperation: async () => ({ ...claim, createdAt: new Date(NOW - TAG_DEFER_AGE_LIMIT_MS - 1).toISOString() }),
+        failOperation,
+        deferOperation,
+        readLink: async () => { throw new Error('ashby_link_read_error'); },
+      }),
+      recommendationTag: adapter(),
+      nowMs: () => NOW,
+    }));
+    expect(failOperation).toHaveBeenCalledWith('op-1', 'lease-1', TAG_VERDICT_UNREADABLE, false);
+    expect(deferOperation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['invite_delivery', undefined],
+    ['scorecard_write', { submit: async () => ({}), dashboardOrigin: 'https://dashboard.example.test' }],
+  ] as const)('CONTROL: %s keeps its hot retryable fail on the same database error', async (operationType, scorecard) => {
+    const failOperation = vi.fn(async () => ({ outcome: 'retry' as const }));
+    const deferOperation = vi.fn(async () => 'ok' as const);
+    const r = await runClaimedAshbyOperation(workerDeps({
+      stores: workerStores({
+        claimOperation: async () => ({ ...claim, operationType }),
+        failOperation,
+        deferOperation,
+        readLink: async () => { throw new Error('ashby_link_read_error'); },
+      }),
+      ...(scorecard ? { scorecard } : {}),
+    }));
+    expect(r).toMatchObject({ code: 'operation_error' });
+    expect(failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'operation_error', true);
+    expect(deferOperation).not.toHaveBeenCalled();
   });
 
   it('a terminal link fails terminal_cancel with no Ashby call', async () => {

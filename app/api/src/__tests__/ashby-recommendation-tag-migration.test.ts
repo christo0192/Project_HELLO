@@ -6,8 +6,8 @@
  *
  *   - enqueue_ashby_operation is 0031 VERBATIM except the one allowlist line;
  *   - claim_ashby_operation is 0059 VERBATIM except the allowlist line and the
- *     created_at key, so neither the 0032 terminal gate nor the 0035 invite gate
- *     can silently go;
+ *     created_at and age_anchor keys, so neither the 0032 terminal gate nor the
+ *     0035 invite gate can silently go;
  *   - revoke, grant and the schema-cache reload are all there;
  *   - the candidate verdict is read-only and candidate-wide by construction;
  *   - scripts/verify-prod-function-drift.sh checks are well-formed and
@@ -82,6 +82,23 @@ function driftChecks(): Array<{ signature: string; needle: string }> {
 const OLD_ALLOWLIST = "not in ('invite_delivery','scorecard_write','stage_move') then";
 const NEW_ALLOWLIST = "not in ('invite_delivery','scorecard_write','stage_move','recommendation_tag') then";
 
+/** The end of the claim's answer in 0059, and in 0134: two extra keys, created_at and age_anchor. */
+const CLAIM_TAIL_0059 = "'source_session_id', v_op.source_session_id\n";
+const CLAIM_TAIL_0134 = [
+  "'source_session_id', v_op.source_session_id,",
+  "    'created_at', v_op.created_at,",
+  "    -- The tag lane's 7-day wait counts from here: creation, or this operation's",
+  '    -- newest manual Retry (retry_ashby_operation audits every one), so a Retry',
+  '    -- after the limit gets a fresh week. GREATEST skips a NULL.',
+  "    'age_anchor', greatest(v_op.created_at, (",
+  '      select max(e.created_at)',
+  '        from screening_v2.audit_events e',
+  "       where e.action = 'ashby_operation_retry'",
+  "         and e.target_type = 'ashby_operation'",
+  '         and e.target_id = v_op.id::text))',
+  '',
+].join('\n');
+
 describe('0134 — the redeclared functions change only what they must', () => {
   it('enqueue_ashby_operation: undoing the one allowlist change gives back 0031 byte for byte', () => {
     const now = declaration(M0134, 'enqueue_ashby_operation');
@@ -92,14 +109,25 @@ describe('0134 — the redeclared functions change only what they must', () => {
   it('claim_ashby_operation: undoing the two changes gives back 0059 byte for byte', () => {
     const now = declaration(M0134, 'claim_ashby_operation');
     expect(now).toContain(NEW_ALLOWLIST);
-    expect(now).toContain("'source_session_id', v_op.source_session_id,\n    'created_at', v_op.created_at\n");
+    expect(now).toContain(CLAIM_TAIL_0134);
     const restored = now
       .replace(NEW_ALLOWLIST, OLD_ALLOWLIST)
-      .replace(
-        "'source_session_id', v_op.source_session_id,\n    'created_at', v_op.created_at\n",
-        "'source_session_id', v_op.source_session_id\n",
-      );
+      .replace(CLAIM_TAIL_0134, CLAIM_TAIL_0059);
     expect(restored).toBe(declaration(M0059, 'claim_ashby_operation'));
+  });
+
+  it('claim answers age_anchor: creation or the newest manual Retry, read-only, after the claim (R2-TS-3)', () => {
+    const now = stripComments(declaration(M0134, 'claim_ashby_operation'));
+    // The only read of audit_events, and it is a read: the claim writes no audit row.
+    expect(now.match(/screening_v2\.audit_events/g)).toHaveLength(1);
+    expect(now).not.toMatch(/insert into screening_v2\.audit_events/);
+    // Exactly the retry action, of this operation.
+    expect(now).toMatch(/where e\.action = 'ashby_operation_retry'\s+and e\.target_type = 'ashby_operation'\s+and e\.target_id = v_op\.id::text\)\)/);
+    // It is in the answer, so it runs only when a row was claimed.
+    expect(now.indexOf("'age_anchor'")).toBeGreaterThan(now.indexOf("return jsonb_build_object('status', 'empty');"));
+    // retry_ashby_operation (0032) and reopen_ashby_invite_delivery (0035) audit exactly this.
+    expect(read('0032_ashby_runtime_activation.sql')).toContain("'ashby_operation_retry', 'ashby_operation', p_operation_id::text, 'success'");
+    expect(read('0035_ashby_invite_prerequisites.sql')).toContain("'ashby_operation_retry', 'ashby_operation', p_operation_id::text, 'success'");
   });
 
   it('claim keeps the 0032 terminal gate, the dependency gate and the 0035 invite gate', () => {
