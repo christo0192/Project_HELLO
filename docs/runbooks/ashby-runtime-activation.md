@@ -176,7 +176,7 @@ file whatever its database age.
 | `RESUME_SCANNER_DB_DIR` | `/var/lib/clamav` | — | Database directory; owned by the runtime user, mode 0700. |
 | `RESUME_SCANNER_MAX_DB_AGE_HOURS` | `24` | 1–168 | Maximum `daily` age without upstream proof. Deliberately far stricter than ClamAV's own 7-day warning. Malformed ⇒ default. |
 | `RESUME_SCANNER_TIMEOUT_MS` | `120000` | 30–300 s | Per-binary bound; queue wait is separately bounded by the same value. |
-| `AV_UPDATER_INTERVAL_MS` | `3600000` | 15 min–12 h | Refresh cadence. 24 opportunities inside the 24 h ceiling. |
+| `AV_UPDATER_INTERVAL_MS` | `3600000` | 15 min–12 h | How often this machine checks for a new database and reads the upstream record. ClamAV publishes about once a day, so this does not buy 24 hours of slack on the ceiling. Keep a full cycle, including run time, under half of the 3-hour evidence window. |
 | `AV_UPDATER_TIMEOUT_MS` | `600000` | 60 s–30 min | Hard wall-clock bound per attempt; covers a cold ~113 MB download. |
 
 ### The cold-start window is fail-closed, on purpose
@@ -217,16 +217,21 @@ same record freshclam trusts when deciding whether to download, so a forged answ
 already stops updates. Databases remain signed either way.
 
 How long a database that is genuinely behind can still be accepted past the ceiling:
-about 2.5 hours normally, about 4.5 hours if lookups are failing, and up to 15 hours
-if the publisher's record has stopped being regenerated. The evidence never moves
-backwards, so a stale resolver cannot reopen a gate that a newer version closed.
+about 2.5 hours normally, about 4.5 hours if lookups are failing, and up to about 16
+hours if the publisher's record has stopped being regenerated or a resolver serves
+stale answers. If the publisher itself rolls back to a lower version, a machine on
+that version is accepted, up to the 7-day limit. An answer with a lower
+version is ignored unless its record is newer, so a stale resolver cannot reopen a
+gate that a newer version closed, and one bad answer does not jam the evidence.
 
 | Signal | Meaning |
 |---|---|
 | Health warning `scanner_upstream_late` | This path is in use: past the ceiling, and still the newest published. Each scan also logs `signatures_upstream_confirmed`. |
-| Health warning `scanner_upstream_unverified` | No usable lookup in the last 3 hours. Scanning is fine today, but **a late release would stop ingestion at 24 h**. Fix this first. |
-| Log `upstream_lookup_failed`, `upstream_lookup_timeout`, `upstream_record_invalid` | The DNS read failed. The ceiling then applies as normal. |
-| Log `upstream_evidence_refused` | The status file is not a regular file owned by the runtime user, or is writable by others. |
+| Health warning `scanner_upstream_unverified` | The status file holds no usable evidence. Scanning is fine today, but **a late release would stop ingestion at 24 h**. Fix this first. |
+| Log `upstream_lookup_failed`, `upstream_lookup_timeout`, `upstream_record_invalid` | The DNS read failed. The last good evidence stays usable for up to 3 hours, and the ceiling applies after that. |
+| Log `upstream_record_stale` | The record is over 12 hours old or dated more than an hour ahead, so it was not used. If it persists, ClamAV has stopped regenerating it. |
+| Log `upstream_answer_regressed` | An answer with a lower version and no newer record time was ignored. A resolver is serving stale data, or an earlier answer was wrong. |
+| Log `upstream_evidence_refused` | The status file is not a regular file owned by the runtime user, is writable by others, or cannot be examined. The gate refuses it, and `scanner_upstream_unverified` does not cover this case. |
 | Log `status_write_failed` | The supervisor could not write the status file, so the API has no evidence. |
 
 Nothing pages on these warnings. They appear on the health endpoint only.
@@ -264,7 +269,8 @@ Expected once a machine has completed its first update:
 }
 ```
 
-`signatureAgeSec` should normally sit well under `AV_UPDATER_INTERVAL_MS / 1000`.
+`signatureAgeSec` normally runs up to about 24 h, because ClamAV publishes `daily`
+about once a day. A large value is not by itself a fault.
 The first authenticated health read also performs a cached real EICAR binary
 proof and can take one scan budget. `ready: false` with `signatures_missing` in
 the first minute after a deploy is expected; `capability_timeout`,
@@ -296,7 +302,7 @@ Rollback is configuration-only; nothing here has a migration or a data footprint
 
 | Symptom | Action |
 |---|---|
-| Ingestion blocked with `signatures_stale` | First compare the local version with the published one (see above). If this machine is current, look for `upstream_lookup_*` in the logs: the proof is failing. If it is behind, the updater is the problem. Raising `RESUME_SCANNER_MAX_DB_AGE_HOURS` (bounded 1–168, **never above 168**) is an incident measure, not a setting. Set by `fly secrets` it overrides `fly.toml`, so remove it afterwards, but only once `/tmp/av-updater-status.json` shows an `upstream` block. Removing it restarts the machine and re-downloads about 113 MB, so space it from any deploy. |
+| Ingestion blocked with `signatures_stale` | First compare the local version with the published one (see above). If this machine is behind, the updater is the problem. If it is current, the evidence is failing: read `/tmp/av-updater-status.json`, then the log signals in the table above, or the database is past the 7-day limit, which no evidence extends. Raising `RESUME_SCANNER_MAX_DB_AGE_HOURS` (bounded 1–168, **never above 168**) is an incident measure, not a setting. Set by `fly secrets` it overrides `fly.toml`, so remove it afterwards, but only once `/tmp/av-updater-status.json` shows an `upstream` block. Removing it restarts the machine and re-downloads about 113 MB, so space it from any deploy. |
 | Updater failing persistently (CDN rate limit / egress block) | Leave it fail-closed. Resume ingestion pauses; every other surface is unaffected. Do **not** disable the freshness check. |
 | The whole scanner change must be reverted | `fly deploy` the previous image. `RESUME_SCANNER=test` is **not** a valid production rollback: the test scanner is not anti-malware evidence and health reports it `ready: false` with reason `test_scanner`. |
 | Ingestion must stop entirely | Pause the mappings (§6), or `ASHBY_RUNTIME_ENABLED=false`. |
@@ -476,9 +482,9 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 | Jobs accumulate, no imports | Runtime flags off, or the mapping is paused/drifted | Check health booleans; check mapping status. |
 | Resume ingestion always `failed_review` with an allowlist reason | `ASHBY_RESUME_HOSTS` empty or wrong | Set the EXACT presigned host. No wildcards. |
 | Resume ingestion always `failed_review` and health shows `scanner.ready: false` with `signatures_missing` | The machine has not completed its first signature update (normal for ~30–60 s after a deploy), or the updater cannot reach the CDN | Wait one interval and re-check. If it persists, check egress to `database.clamav.net`; the scanner stays fail-closed until it succeeds (§5a). |
-| Health shows `scanner_signatures_stale` | `daily` is past `RESUME_SCANNER_MAX_DB_AGE_HOURS` and could not be proven the newest published: this machine is behind, or the upstream lookup is failing | Compare local and published versions (§5a). Behind: investigate egress and rate limiting, remembering that freshclam exits 0 on a cool-down, so a clean updater status proves nothing. Lookup failing: fix DNS egress. Do **not** widen the ceiling as a permanent fix; ingestion refusing to run on dead signatures is the intended behaviour. |
+| Health shows `scanner_signatures_stale` | `daily` is past `RESUME_SCANNER_MAX_DB_AGE_HOURS` and could not be shown to be the newest published: this machine is behind, the upstream evidence is failing, or it is past the 7-day limit | Compare local and published versions (§5a). Behind: investigate egress and rate limiting, remembering that freshclam exits 0 on a cool-down, so a clean updater status proves nothing. Evidence failing: check the log signals in §5a; for lookup failures, fix DNS egress. Do **not** widen the ceiling as a permanent fix; ingestion refusing to run on dead signatures is the intended behaviour. |
 | Health warns `scanner_upstream_late` | ClamAV has not published a newer `daily`; this machine holds the newest one | Ingestion continues for up to 7 days of silence from the publisher, and stops after that. Nothing pages on this warning, so look at ClamAV's status if it lasts more than a day or two. |
-| Health warns `scanner_upstream_unverified` | The supervisor has no usable DNS lookup of what ClamAV has published | Fix before the next late release. Check `upstream_lookup_*`, `upstream_evidence_refused` and `status_write_failed` in the logs (§5a). |
+| Health warns `scanner_upstream_unverified` | The status file holds no usable evidence of what ClamAV has published | Fix before the next late release. Check the log signals in §5a. |
 | Health shows `scanner_test_scanner` in production | `RESUME_SCANNER` is not `clamav` | The development scanner is not anti-malware evidence. Set `RESUME_SCANNER=clamav` and redeploy. |
 | Ingestion stuck at `failed_review` and refusing to requeue | Requeue ceiling (5) reached — 0032 returns `retry_exhausted` | Investigate the underlying fetch/scan/parse failure; this is a deliberate stop, not a bug. |
 | `no_progress_runs` climbing on a checkpoint | A full resync is permanently larger than `item_cap` | Raise `maxItems`/`maxPages` for that stream, or investigate why the stream will not drain. **Do not** "fix" it by advancing a partial cursor — that skips applications permanently. |

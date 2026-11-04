@@ -33,6 +33,7 @@ import {
 } from '../lib/clamav-signatures.js';
 import {
   CLAMAV_UPDATE_INFO_HOST,
+  UPSTREAM_LOOKUP_TIMEOUT_MS,
   lookupUpstreamRecord,
   parseAvUpdaterStatus,
   parseUpstreamUpdateInfo,
@@ -104,6 +105,23 @@ async function dbDir(opts: {
 const SOFT_SEC = 24 * 3600;
 const HARD_SEC = UPSTREAM_CONFIRMED_MAX_DB_AGE_HOURS * 3600;
 
+describe('the limits themselves', () => {
+  // The boundary tests below move with whatever these constants say. Changing a
+  // limit is a decision, so it has to change a test, and the docs that state it.
+  it('holds a confirmed database for at most 7 days', () => {
+    expect(UPSTREAM_CONFIRMED_MAX_DB_AGE_HOURS).toBe(168);
+  });
+
+  it('counts a lookup for 3 hours and a DNS record for 12', () => {
+    expect(UPSTREAM_EVIDENCE_MAX_AGE_SEC).toBe(3 * 3600);
+    expect(UPSTREAM_RECORD_MAX_AGE_SEC).toBe(12 * 3600);
+  });
+
+  it('bounds a lookup at 10 seconds', () => {
+    expect(UPSTREAM_LOOKUP_TIMEOUT_MS).toBe(10_000);
+  });
+});
+
 async function stateWith(
   evidence: AvUpstreamEvidence | null,
   opts: { builtAt?: number; version?: number; now?: number } = {},
@@ -129,6 +147,25 @@ describe('a late upstream release, proven', () => {
       maxAgeSec: HARD_SEC,
     });
     expect(state.ageSec).toBeGreaterThan(SOFT_SEC);
+  });
+
+  it('compares the version from the file it will load, on the production layout', async () => {
+    // ScriptedUpdates leaves a newer daily.cld beside an older daily.cvd.
+    const dir = await dbDir({ builtAt: BUILT_AT - 48 * HOUR_MS, version: LOCAL_DAILY - 3 });
+    await writeFile(join(dir, 'daily.cld'), cvdHeader(BUILT_AT, LOCAL_DAILY));
+    const state = await readSignatureState(
+      { dbDir: dir, maxAgeSec: SOFT_SEC, upstream: async () => CONFIRMING }, NOW,
+    );
+    expect(state).toMatchObject({ fresh: true, upstreamConfirmed: true });
+  });
+
+  it('allows for small clock differences, in both directions', async () => {
+    const read = Date.parse(CONFIRMING.checked_at);
+    const recordAhead = new Date(read + 30 * 60_000).toISOString();
+    expect((await stateWith({ ...CONFIRMING, record_at: recordAhead })).fresh).toBe(true);
+    const checkedAhead = new Date(NOW + 30 * 60_000).toISOString();
+    expect((await stateWith({ ...CONFIRMING, checked_at: checkedAhead, record_at: checkedAhead })).fresh)
+      .toBe(true);
   });
 
   it('stays fresh when local is ahead of a lagging DNS record', async () => {
@@ -193,6 +230,18 @@ describe('without proof the 24 h ceiling still holds', () => {
     expect(await stateWith({ ...CONFIRMING, record_at: future })).toMatchObject(stale);
   });
 
+  it('refuses a DNS record just past the clock allowance', async () => {
+    const past = new Date(Date.parse(CONFIRMING.checked_at) + HOUR_MS + 1000).toISOString();
+    expect(await stateWith({ ...CONFIRMING, record_at: past })).toMatchObject(stale);
+  });
+
+  it.each([
+    ['checked_at', { checked_at: 'garbage' }],
+    ['record_at', { record_at: 'garbage' }],
+  ])('refuses an unparseable %s', async (_label, over) => {
+    expect(await stateWith({ ...CONFIRMING, ...over })).toMatchObject(stale);
+  });
+
   it('refuses evidence stamped in the future', async () => {
     const future = new Date(NOW + 2 * HOUR_MS).toISOString();
     expect(await stateWith({ ...CONFIRMING, checked_at: future, record_at: future }))
@@ -217,7 +266,9 @@ describe('without proof the 24 h ceiling still holds', () => {
 
   it('a successful freshclam exit is not proof: a cool-down status document still refuses', async () => {
     // freshclam exits 0 on a CDN cool-down, so this document is exactly what a
-    // rate-limited machine publishes. It carries no comparison, so no pass.
+    // rate-limited machine publishes. It carries no comparison, so no pass. This
+    // goes through the gate's own default path on purpose: it has to fail if the
+    // gate ever starts reading the updater's success counters as evidence.
     const coolDown = JSON.stringify({
       version: 1,
       started_at: '2026-11-03T11:33:23.393Z',
@@ -230,12 +281,13 @@ describe('without proof the 24 h ceiling still holds', () => {
       last_exit_code: 0,
       last_reason: null,
     });
-    const fs = ownFile(coolDown);
     const dir = await dbDir();
+    const statusPath = join(dir, 'status.json');
+    await writeFile(statusPath, coolDown, { mode: 0o644 });
     const state = await readSignatureState({
       dbDir: dir,
       maxAgeSec: SOFT_SEC,
-      upstream: () => readAvUpstreamEvidence('/tmp/status.json', fs, 1000),
+      source: { AV_UPDATER_STATUS_FILE: statusPath } as NodeJS.ProcessEnv,
     }, NOW);
     expect(state).toMatchObject(stale);
   });
@@ -295,11 +347,14 @@ describe('lookupUpstreamRecord', () => {
     expect(CLAMAV_UPDATE_INFO_HOST).toBe('current.cvd.clamav.net');
   });
 
-  it('takes the HIGHEST version when several records answer, the stricter reading', async () => {
+  it.each([
+    ['last', ['28170', '28174']],
+    ['first', ['28174', '28170']],
+  ])('takes the HIGHEST version when several records answer, wherever it comes (%s)', async (_label, order) => {
     const resolveTxt = async () => [
-      ['1.4.6:63:28170:1793782800:1:90:49192:339'],
+      [`1.4.6:63:${order[0]}:1793782800:1:90:49192:339`],
       ['not a record'],
-      ['1.4.6:63:28174:1793782800:1:90:49192:339'],
+      [`1.4.6:63:${order[1]}:1793782800:1:90:49192:339`],
     ];
     const record = await lookupUpstreamRecord({ resolveTxt });
     expect(record?.daily_version).toBe(28174);
@@ -414,6 +469,18 @@ describe('readAvUpstreamEvidence', () => {
     } finally { logs.restore(); }
   });
 
+  it('says so when the file cannot be examined for any reason but absence', async () => {
+    const fs = {
+      lstat: async () => { throw Object.assign(new Error('nope'), { code: 'EACCES' }); },
+      readFile: async () => doc,
+    };
+    const logs = captureLogs();
+    try {
+      await expect(readAvUpstreamEvidence('/tmp/s.json', fs, 1000)).resolves.toBeNull();
+      expect(logs.lines.join('\n')).toContain('"error_type":"upstream_evidence_refused"');
+    } finally { logs.restore(); }
+  });
+
   it('says so when it refuses a file, or the refusal would look like a lookup problem', async () => {
     const logs = captureLogs();
     try {
@@ -475,6 +542,143 @@ describe('startAvUpdater upstream evidence', () => {
     });
   }
 
+  function ticking(iso: string) {
+    let at = Date.parse(iso);
+    return {
+      now: () => new Date(at),
+      advance: (ms: number) => { at += ms; },
+      iso: () => new Date(at).toISOString(),
+    };
+  }
+
+  it('stamps the read time of each lookup, so re-reading the same version keeps it alive', async () => {
+    // The incident path: the publisher stays on one version for hours. If a repeat
+    // answer did not refresh the read time, the proof would expire and stop ingestion.
+    const c = ticking('2026-11-04T09:00:30.000Z');
+    const handle = updater({ now: c.now, upstreamLookup: async () => RECORD });
+    try {
+      c.advance(5 * 60_000);
+      await handle.runNow();
+      expect(handle.status?.().upstream?.checked_at).toBe(c.iso());
+      c.advance(HOUR_MS);
+      await handle.runNow();
+      expect(handle.status?.().upstream?.checked_at).toBe(c.iso());
+    } finally { handle.stop(); }
+  });
+
+  it.each([
+    ['returns null', async () => null],
+    ['throws', async () => { throw new Error('boom'); }],
+  ])('does not refresh the read time when the lookup %s, or the proof would never expire', async (_label, next) => {
+    const c = ticking('2026-11-04T09:30:00.000Z');
+    let call = 0;
+    const handle = updater({
+      now: c.now,
+      upstreamLookup: async () => {
+        call += 1;
+        return call === 1 ? RECORD : next();
+      },
+    });
+    try {
+      await handle.runNow();
+      const firstRead = handle.status?.().upstream?.checked_at;
+      expect(firstRead).toBe('2026-11-04T09:30:00.000Z');
+      c.advance(HOUR_MS);
+      await handle.runNow();
+      expect(handle.status?.().upstream?.checked_at).toBe(firstRead);
+    } finally { handle.stop(); }
+  });
+
+  it('does not admit a record too old to count, and says so', async () => {
+    // The publisher's record has frozen. Admitting it would keep refreshing the
+    // read time on evidence the gate refuses anyway.
+    const c = ticking('2026-11-04T09:30:00.000Z');
+    const frozen = {
+      ...RECORD,
+      record_at: new Date(c.now().getTime() - UPSTREAM_RECORD_MAX_AGE_SEC * 1000 - 1000).toISOString(),
+    };
+    const logs = captureLogs();
+    const handle = updater({ now: c.now, upstreamLookup: async () => frozen });
+    try {
+      await handle.runNow();
+      expect(handle.status?.()).not.toHaveProperty('upstream');
+      expect(logs.lines.join('\n')).toContain('"error_type":"upstream_record_stale"');
+    } finally {
+      handle.stop();
+      logs.restore();
+    }
+  });
+
+  it('does not admit a record dated in the future, which could never be replaced', async () => {
+    const c = ticking('2026-11-04T09:30:00.000Z');
+    const future = { ...RECORD, record_at: new Date(c.now().getTime() + 2 * HOUR_MS).toISOString() };
+    const logs = captureLogs();
+    const handle = updater({ now: c.now, upstreamLookup: async () => future });
+    try {
+      await handle.runNow();
+      expect(handle.status?.()).not.toHaveProperty('upstream');
+      expect(logs.lines.join('\n')).toContain('"error_type":"upstream_record_stale"');
+    } finally {
+      handle.stop();
+      logs.restore();
+    }
+  });
+
+  it.each([
+    ['a record too old to count', (nowMs: number) => ({
+      daily_version: 28174,
+      record_at: new Date(nowMs - UPSTREAM_RECORD_MAX_AGE_SEC * 1000 - 1000).toISOString(),
+    })],
+    ['a record dated too far ahead', (nowMs: number) => ({
+      daily_version: 28174,
+      record_at: new Date(nowMs + 2 * HOUR_MS).toISOString(),
+    })],
+    ['a lower version with no newer record', () => ({
+      daily_version: 28170,
+      record_at: RECORD.record_at,
+    })],
+  ])('leaves held evidence exactly as it was when it rejects %s', async (_label, rejected) => {
+    const c = ticking('2026-11-04T09:30:00.000Z');
+    let call = 0;
+    const handle = updater({
+      now: c.now,
+      upstreamLookup: async () => {
+        call += 1;
+        return call === 1 ? RECORD : rejected(c.now().getTime());
+      },
+    });
+    const logs = captureLogs();
+    try {
+      await handle.runNow();
+      const held = handle.status?.().upstream;
+      expect(held?.checked_at).toBe('2026-11-04T09:30:00.000Z');
+      c.advance(HOUR_MS);
+      await handle.runNow();
+      expect(handle.status?.().upstream).toEqual(held);
+    } finally {
+      handle.stop();
+      logs.restore();
+    }
+  });
+
+  it('recovers from one bad answer: a lower version with a newer record replaces it', async () => {
+    // Machines run for weeks. One too-high answer, or a publisher rollback, must
+    // not switch off late-release tolerance until someone restarts the machine.
+    const c = ticking('2026-11-04T09:30:00.000Z');
+    const answers = [
+      { daily_version: 99999, record_at: '2026-11-04T09:00:00.000Z' },
+      { daily_version: 28173, record_at: '2026-11-04T10:00:00.000Z' },
+    ];
+    const handle = updater({ now: c.now, upstreamLookup: async () => answers.shift() ?? null });
+    try {
+      await handle.runNow();
+      expect(handle.status?.().upstream?.daily_version).toBe(99999);
+      c.advance(HOUR_MS);
+      await handle.runNow();
+      expect(handle.status?.().upstream?.daily_version).toBe(28173);
+    } finally { handle.stop(); }
+  });
+
   it('publishes the record stamped with when it was read', async () => {
     const writes: AvUpdaterStatus[] = [];
     const handle = updater({
@@ -526,12 +730,17 @@ describe('startAvUpdater upstream evidence', () => {
       { ...RECORD, daily_version: 28174 },
       { ...RECORD, daily_version: 28173 },
     ];
+    const logs = captureLogs();
     const handle = updater({ upstreamLookup: async () => answers.shift() ?? null });
     try {
       await handle.runNow();
       await handle.runNow();
       expect(handle.status?.().upstream?.daily_version).toBe(28174);
-    } finally { handle.stop(); }
+      expect(logs.lines.join('\n')).toContain('"error_type":"upstream_answer_regressed"');
+    } finally {
+      handle.stop();
+      logs.restore();
+    }
   });
 
   it('a newer version replaces what it saw', async () => {
@@ -567,6 +776,7 @@ describe('startAvUpdater upstream evidence', () => {
       setTimer: () => 0,
       clearTimer: () => undefined,
       runOnce: async () => ({ ok: true }),
+      now: clock('2026-11-04T09:33:55.144Z'),
     });
     try {
       await handle.runNow();
@@ -590,6 +800,7 @@ describe('startAvUpdater upstream evidence', () => {
       setTimer: () => 0,
       clearTimer: () => undefined,
       runOnce: async () => ({ ok: true }),
+      now: clock('2026-11-04T09:33:55.144Z'),
     });
     try {
       await handle.runNow();
@@ -610,17 +821,17 @@ describe('startAvUpdater upstream evidence', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  6. End to end across the seam, and the surfaces downstream of the verdict
+//  6. The default evidence path, and the surfaces downstream of the verdict
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('the default evidence reader', () => {
   // POSIX ownership and mode bits: Windows reports 0666 for every file.
-  it.skipIf(process.platform === 'win32')('reads the status file the supervisor writes', async () => {
+  it.skipIf(process.platform === 'win32')('reads a status file produced by the real writer', async () => {
     const db = await dbDir();
     const statusDir = await mkdtemp(join(tmpdir(), 'av-status-'));
     dirs.push(statusDir);
     const path = join(statusDir, 'status.json');
-    await writeFile(path, JSON.stringify({ ...BASE_STATUS, upstream: CONFIRMING }), { mode: 0o644 });
+    await writeAvUpdaterStatusFile(path, { ...BASE_STATUS, upstream: CONFIRMING });
     const state = await readSignatureState({
       dbDir: db,
       source: { AV_UPDATER_STATUS_FILE: path } as NodeJS.ProcessEnv,
@@ -653,7 +864,7 @@ describe('downstream of an upstream-confirmed verdict', () => {
       .resolves.toMatchObject({ action: 'proceed' });
   });
 
-  it.skipIf(process.platform === 'win32')('the scanner runs the real scan and says what it relied on', async () => {
+  it.skipIf(process.platform === 'win32')('the scanner goes on to scan (binary stubbed) and logs what it relied on', async () => {
     const lines: string[] = [];
     // `info` lines go straight to stdout (lib/logger.ts defaultWrite).
     const spy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
@@ -710,10 +921,10 @@ describe('downstream of an upstream-confirmed verdict', () => {
     };
     const unverified = (status: AvUpdaterStatus | null) =>
       withScannerUpdaterHealth(READY, status, NOW).warnings ?? [];
-    const checked = (ageSec: number): AvUpdaterStatus => ({
-      ...BASE_STATUS,
-      upstream: { ...CONFIRMING, checked_at: new Date(NOW - ageSec * 1000).toISOString() },
-    });
+    const checked = (ageSec: number): AvUpdaterStatus => {
+      const at = new Date(NOW - ageSec * 1000).toISOString();
+      return { ...BASE_STATUS, upstream: { ...CONFIRMING, checked_at: at, record_at: at } };
+    };
 
     it('warns when no lookup has ever succeeded, while the scanner is still healthy', () => {
       expect(unverified(BASE_STATUS)).toContain('scanner_upstream_unverified');
@@ -731,6 +942,35 @@ describe('downstream of an upstream-confirmed verdict', () => {
 
     it('is a published warning code', () => {
       expect(SCANNER_WARNING_REASONS).toContain('scanner_upstream_unverified');
+    });
+
+    // The warning exists to say the gate would refuse this evidence. So they must
+    // agree on every case, or ingestion can stop with no warning beforehand.
+    it.each([
+      ['usable evidence', CONFIRMING],
+      ['a lookup too old to count', {
+        ...CONFIRMING,
+        checked_at: new Date(NOW - UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000 - 1000).toISOString(),
+        record_at: new Date(NOW - UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000 - 1000).toISOString(),
+      }],
+      ['a frozen record, read just now', {
+        ...CONFIRMING,
+        checked_at: new Date(NOW - 5 * 60_000).toISOString(),
+        record_at: new Date(NOW - 5 * 60_000 - UPSTREAM_RECORD_MAX_AGE_SEC * 1000 - 1000).toISOString(),
+      }],
+      ['a record dated after the read', {
+        ...CONFIRMING,
+        record_at: new Date(Date.parse(CONFIRMING.checked_at) + 2 * HOUR_MS).toISOString(),
+      }],
+      ['a read stamped in the future', {
+        ...CONFIRMING,
+        checked_at: new Date(NOW + 2 * HOUR_MS).toISOString(),
+        record_at: new Date(NOW + 2 * HOUR_MS).toISOString(),
+      }],
+    ])('agrees with the gate on %s', async (_label, evidence) => {
+      const gate = await stateWith(evidence);
+      const warned = unverified({ ...BASE_STATUS, upstream: evidence }).includes('scanner_upstream_unverified');
+      expect(warned).toBe(!gate.fresh);
     });
   });
 

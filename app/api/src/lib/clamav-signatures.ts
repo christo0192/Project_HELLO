@@ -67,8 +67,11 @@ import { join } from 'node:path';
 import {
   readAvUpstreamEvidence,
   resolveAvUpdaterStatusFile,
+  upstreamEvidenceUsable,
   type AvUpstreamEvidence,
 } from './av-updater.js';
+
+export { UPSTREAM_EVIDENCE_MAX_AGE_SEC, UPSTREAM_RECORD_MAX_AGE_SEC } from './av-updater.js';
 
 // Keep the env names visible to the env-contract checker, which scans for
 // `process.env.<VAR>` literals. Functional reads go through the injectable
@@ -100,23 +103,6 @@ export const DEFAULT_MAX_DB_AGE_HOURS = 24;
  * look at, and no evidence extends it.
  */
 export const UPSTREAM_CONFIRMED_MAX_DB_AGE_HOURS = 168;
-
-/**
- * How old a lookup may be and still count. The updater looks about hourly, so
- * this survives one missed lookup outright. The third lookup after a good one
- * lands just after this expires, because each cycle also includes its own run time.
- */
-export const UPSTREAM_EVIDENCE_MAX_AGE_SEC = 3 * 3600;
-
-/**
- * How old the DNS record may have been when it was read. A record that has
- * stopped being regenerated says nothing about today's releases. Matches
- * freshclam's own `DNS_WARNING_THRESHOLD_HOURS`.
- */
-export const UPSTREAM_RECORD_MAX_AGE_SEC = 12 * 3600;
-
-/** Allowance for publisher and host clocks when reading the evidence's instants. */
-const UPSTREAM_CLOCK_SKEW_MS = 3_600_000;
 
 /** Bounds applied to `RESUME_SCANNER_MAX_DB_AGE_HOURS`. */
 export const MAX_DB_AGE_HOURS_BOUNDS = { def: DEFAULT_MAX_DB_AGE_HOURS, min: 1, max: 168 } as const;
@@ -309,16 +295,7 @@ function upstreamConfirmsLocal(
   evidence: AvUpstreamEvidence,
   nowMs: number,
 ): boolean {
-  const checkedAtMs = Date.parse(evidence.checked_at);
-  const recordAtMs = Date.parse(evidence.record_at);
-  if (!Number.isFinite(checkedAtMs) || !Number.isFinite(recordAtMs)) return false;
-  // The read has to be recent…
-  if (nowMs - checkedAtMs > UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000) return false;
-  if (checkedAtMs - nowMs > UPSTREAM_CLOCK_SKEW_MS) return false;
-  // …and what it read has to have been current at the time.
-  if (checkedAtMs - recordAtMs > UPSTREAM_RECORD_MAX_AGE_SEC * 1000) return false;
-  if (recordAtMs - checkedAtMs > UPSTREAM_CLOCK_SKEW_MS) return false;
-  return localVersion >= evidence.daily_version;
+  return upstreamEvidenceUsable(evidence, nowMs) && localVersion >= evidence.daily_version;
 }
 
 async function readUpstreamEvidence(opts: SignatureReaderOptions): Promise<AvUpstreamEvidence | null> {

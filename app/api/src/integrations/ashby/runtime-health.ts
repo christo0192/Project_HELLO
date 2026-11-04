@@ -36,7 +36,6 @@ import { ASHBY_SIGNAL_QUEUE, ASHBY_IMPORT_QUEUE } from './signal-worker.js';
 import { ASHBY_INGESTION_QUEUE, ASHBY_PROFILE_QUEUE } from './runtime-workers.js';
 import { DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import {
-  UPSTREAM_EVIDENCE_MAX_AGE_SEC,
   defaultSignatureFreshnessReader,
   type SignatureFreshnessReader,
 } from '../../lib/clamav-signatures.js';
@@ -48,6 +47,7 @@ import {
   AV_UPDATER_HEALTH,
   avUpdaterFailing,
   readAvUpdaterStatusFile,
+  upstreamEvidenceUsable,
   resolveAvUpdaterStatusFile,
   type AvUpdaterStatus,
 } from '../../lib/av-updater.js';
@@ -671,10 +671,13 @@ export type ScannerWarningReason = (typeof SCANNER_WARNING_REASONS)[number];
 /** Reads the supervisor's updater status; null when there is none. */
 export type ScannerUpdaterStatusReader = () => Promise<AvUpdaterStatus | null>;
 
-/** Whether the supervisor currently holds no upstream evidence that would count. */
+/**
+ * Whether the status document holds no usable upstream evidence. Same rule as the
+ * gate for the evidence itself. It does not repeat the gate's file ownership check,
+ * which logs `upstream_evidence_refused` when it refuses.
+ */
 function upstreamUnverified(status: AvUpdaterStatus, nowMs: number): boolean {
-  if (!status.upstream) return true;
-  return nowMs - Date.parse(status.upstream.checked_at) > UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000;
+  return !status.upstream || !upstreamEvidenceUsable(status.upstream, nowMs);
 }
 
 /**

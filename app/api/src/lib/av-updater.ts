@@ -473,6 +473,73 @@ export const UPSTREAM_LOOKUP_TIMEOUT_MS = 10_000;
 const UPSTREAM_RESOLVER_OPTIONS = { timeout: 3_000, tries: 2 } as const;
 
 /**
+ * How old a lookup may be and still count. The updater looks about hourly, so
+ * this survives one missed lookup outright. The third lookup after a good one
+ * lands just after this expires, because each cycle also includes its own run time.
+ */
+export const UPSTREAM_EVIDENCE_MAX_AGE_SEC = 3 * 3600;
+
+/**
+ * How old the DNS record may have been when it was read. A record that has
+ * stopped being regenerated says nothing about today's releases. Matches
+ * freshclam's own `DNS_WARNING_THRESHOLD_HOURS`.
+ */
+export const UPSTREAM_RECORD_MAX_AGE_SEC = 12 * 3600;
+
+/** Allowance for publisher and host clocks when reading the evidence's instants. */
+const UPSTREAM_CLOCK_SKEW_MS = 3_600_000;
+
+/**
+ * Whether this evidence can be relied on at all, whatever versions it holds. The
+ * one definition, shared by the gate, the health warning and the updater's own
+ * intake: when they each had their own idea, the gate could refuse evidence that
+ * health called fine, and ingestion stopped with no warning beforehand.
+ */
+export function upstreamEvidenceUsable(evidence: AvUpstreamEvidence, nowMs: number): boolean {
+  const checkedAtMs = Date.parse(evidence.checked_at);
+  const recordAtMs = Date.parse(evidence.record_at);
+  if (!Number.isFinite(checkedAtMs) || !Number.isFinite(recordAtMs)) return false;
+  // The read has to be recent…
+  if (nowMs - checkedAtMs > UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000) return false;
+  if (checkedAtMs - nowMs > UPSTREAM_CLOCK_SKEW_MS) return false;
+  // …and what it read has to have been current at the time.
+  if (checkedAtMs - recordAtMs > UPSTREAM_RECORD_MAX_AGE_SEC * 1000) return false;
+  if (recordAtMs - checkedAtMs > UPSTREAM_CLOCK_SKEW_MS) return false;
+  return true;
+}
+
+/**
+ * Why a fresh answer should not replace the evidence held, or null if it should.
+ *
+ * A lower version is ignored, so a serve-stale resolver cannot reopen a gate that
+ * a newer version closed. But it is taken when its record is newer: machines run
+ * for weeks, and one too-high answer or a publisher rollback must not switch off
+ * late-release tolerance until someone restarts the machine. A serve-stale answer
+ * carries an older record time, so it is still ignored. A record dated more than
+ * the clock allowance ahead is not admitted at all, or nothing genuine could ever
+ * replace it.
+ *
+ * What this cannot tell apart: a publisher that really rolls back to a lower
+ * version looks like recovery from a bad answer, so the gate reopens for a machine
+ * holding that version, up to the hard limit. Only the publisher can produce that.
+ */
+function upstreamAnswerRejection(
+  held: AvUpstreamEvidence | null,
+  answer: AvUpstreamEvidence,
+  nowMs: number,
+): 'upstream_record_stale' | 'upstream_answer_regressed' | null {
+  if (!upstreamEvidenceUsable(answer, nowMs)) return 'upstream_record_stale';
+  if (
+    held !== null
+    && answer.daily_version < held.daily_version
+    && Date.parse(answer.record_at) <= Date.parse(held.record_at)
+  ) {
+    return 'upstream_answer_regressed';
+  }
+  return null;
+}
+
+/**
  * Parse an update-info TXT record, for example:
  *
  *   1.4.6:63:28173:1793782800:1:90:49192:339
@@ -506,8 +573,9 @@ export interface UpstreamLookupOptions {
  *
  * DNS only, on purpose: ClamAV asks clients to check DNS first and rate-limits
  * its CDN hard, so a fallback to fetching the database header could itself
- * trigger the cool-down. A failed lookup means no new evidence, and the
- * ceiling then applies exactly as it did before this evidence existed.
+ * trigger the cool-down. A failed lookup means no new evidence: the last good
+ * one stays usable for up to its 3 hours, and after that the ceiling applies
+ * exactly as it did before this evidence existed.
  */
 export async function lookupUpstreamRecord(
   opts: UpstreamLookupOptions = {},
@@ -567,29 +635,30 @@ const realEvidenceFs: AvEvidenceFs = {
  * Everything else in this document is observability, but this block can extend
  * how long a database is accepted, so the file has to earn it: a regular file,
  * not a symlink, owned by this user, and writable by nobody else. The supervisor
- * and the API run as the same unprivileged user. A refusal is logged, because
- * it would otherwise look like a failed lookup. An absent file is normal before
- * the first attempt settles, so that says nothing.
+ * and the API run as the same unprivileged user. A refusal, or a file that cannot
+ * be examined, is logged, because it would otherwise look like a failed lookup. An
+ * absent file is normal before the first attempt settles, so that says nothing.
  */
 export async function readAvUpstreamEvidence(
   path: string,
   fs: AvEvidenceFs = realEvidenceFs,
   uid: number | undefined = process.getuid?.(),
 ): Promise<AvUpstreamEvidence | null> {
+  const refuse = (): null => {
+    updaterLogger.warn('unknown_event', {
+      error_category: 'av_updater',
+      error_type: 'upstream_evidence_refused',
+    });
+    return null;
+  };
   try {
     const st = await fs.lstat(path);
     const trusted = st.isFile()
       && (st.mode & 0o022) === 0
       && (uid === undefined || st.uid === uid);
-    if (!trusted) {
-      updaterLogger.warn('unknown_event', {
-        error_category: 'av_updater',
-        error_type: 'upstream_evidence_refused',
-      });
-      return null;
-    }
-  } catch {
-    return null;
+    if (!trusted) return refuse();
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? null : refuse();
   }
   const status = await readAvUpdaterStatusFile(path, fs);
   return status?.upstream ?? null;
@@ -664,9 +733,8 @@ export interface StartUpdaterOptions extends RunUpdateOptions {
    * Reads what the publisher has released, after every attempt and whatever
    * its outcome: whether this machine is current does not depend on whether
    * this attempt downloaded anything. A lookup that fails keeps the last good
-   * evidence, which then ages out on the reader's own clock. So does an answer
-   * older than what was already seen: the evidence never moves backwards, or a
-   * serve-stale resolver could reopen a gate that a newer version had closed.
+   * evidence, which then ages out on the reader's own clock. See
+   * `upstreamAnswerRejection` for the answers that are not taken.
    */
   upstreamLookup?: () => Promise<AvUpstreamRecord | null>;
 }
@@ -777,8 +845,18 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
         if (opts.upstreamLookup) {
           try {
             const record = await opts.upstreamLookup();
-            if (record && record.daily_version >= (upstream?.daily_version ?? 0)) {
-              upstream = { ...record, checked_at: now().toISOString() };
+            if (record) {
+              const stamp = now();
+              const answer: AvUpstreamEvidence = { ...record, checked_at: stamp.toISOString() };
+              const rejection = upstreamAnswerRejection(upstream, answer, stamp.getTime());
+              if (rejection) {
+                updaterLogger.warn('unknown_event', {
+                  error_category: 'av_updater',
+                  error_type: rejection,
+                });
+              } else {
+                upstream = answer;
+              }
             }
           } catch { /* no new evidence; the last good one ages out by itself */ }
         }
