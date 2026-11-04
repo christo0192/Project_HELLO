@@ -35,10 +35,12 @@
 #
 # 0134 (M027) re-declares enqueue_ashby_operation (0031 verbatim) and
 # claim_ashby_operation (0059 verbatim), each with `recommendation_tag` added to
-# the type allowlist. No earlier body contains that token. It also adds two RPCs
-# no earlier migration declares, enqueue_ashby_recommendation_tag and
-# backfill_ashby_recommendation_tags; a missing function fails the regprocedure
-# cast, so the check fails closed.
+# the type allowlist. No earlier body contains that token. It also adds three
+# RPCs no earlier migration declares: enqueue_ashby_recommendation_tag,
+# ashby_candidate_tag_verdict and backfill_ashby_recommendation_tags; a missing
+# function fails the regprocedure cast, so the check fails closed. The verdict's
+# token `no_assessment` is its own answer, and the backfill's token
+# `ashby_candidate_tag_verdict` is the call only its candidate-wide body makes.
 #
 # It issues SELECTs only (pg_get_functiondef). No PII is queried or printed.
 #
@@ -68,7 +70,8 @@ CHECKS=(
   "screening_v2.enqueue_ashby_operation(uuid,text,text,uuid,text,uuid)|recommendation_tag"
   "screening_v2.claim_ashby_operation(text,text,integer,timestamptz)|recommendation_tag"
   "screening_v2.enqueue_ashby_recommendation_tag(uuid,uuid,uuid,timestamptz)|enqueue_ashby_operation"
-  "screening_v2.backfill_ashby_recommendation_tags(boolean,timestamptz)|enqueue_ashby_recommendation_tag"
+  "screening_v2.ashby_candidate_tag_verdict(uuid,text)|no_assessment"
+  "screening_v2.backfill_ashby_recommendation_tags(boolean,timestamptz)|ashby_candidate_tag_verdict"
 )
 
 if [ -n "${SUPABASE_DB_URL:-}" ]; then

@@ -4,6 +4,7 @@
  * pipeline card say a failure the same way. `humanizeEnum` covers a code
  * that is not listed here.
  */
+import { humanizeEnum } from './humanize';
 
 /** A failed Ashby operation's sanitized error code, in words. */
 export const ASHBY_ERROR_CODE_LABELS: Readonly<Record<string, string>> = {
@@ -21,6 +22,23 @@ export const ASHBY_ERROR_CODE_LABELS: Readonly<Record<string, string>> = {
   ashby_tag_ambiguous: 'More than one active Christy tag with this title in Ashby',
   ashby_tag_transient: 'Ashby was unavailable; the tag will retry',
   ashby_tag_write_rejected: 'Ashby refused the tag change',
+  ashby_tag_verdict_unreadable: 'Christy verdict could not be read; the tag will retry',
+  ashby_tag_contended: 'Christy tags changed during the update; the tag will re-check',
   candidate_id_missing: 'Ashby candidate id not found',
   recommendation_tag_sink_unavailable: 'Christy tag writer not configured',
 };
+
+/**
+ * One error code in words. Some codes carry a sanitized suffix from Ashby
+ * (`ashby_tag_write_rejected:<endpoint code>`), so a code with no label of its
+ * own is looked up by the part before its first `:`. The exact code stays one
+ * hover away (`title`) on every surface that shows this.
+ */
+export function ashbyErrorCodeLabel(code: string | null | undefined): string {
+  if (!code) return '';
+  const exact = ASHBY_ERROR_CODE_LABELS[code];
+  if (exact) return exact;
+  const colon = code.indexOf(':');
+  const prefixed = colon > 0 ? ASHBY_ERROR_CODE_LABELS[code.slice(0, colon)] : undefined;
+  return prefixed ?? humanizeEnum(code);
+}

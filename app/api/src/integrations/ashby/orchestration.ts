@@ -176,18 +176,25 @@ export interface OperationClaimRow {
   createdAt?: string | null;
 }
 
-/**
- * What the tag lane reads at run time for one link (0134). `recommendation` is
- * the RAW `assessments.recommendation` column: never `ScorecardSource` or
- * `NormalizedScorecard`, both of which coerce a missing verdict to `hold`.
- */
-export interface RecommendationTagSource {
+/** The tag lane's link read (0134): the link's Ashby ids and nothing else. */
+export interface RecommendationTagLink {
   externalCandidateId: string | null;
   externalApplicationId: string | null;
+}
+
+/**
+ * The candidate's authoritative verdict at run time (0134
+ * `ashby_candidate_tag_verdict`): the newest assessment on any of the
+ * candidate's Ashby links, not the one the operation was enqueued for.
+ * `recommendation` is the RAW `assessments.recommendation` column: never
+ * `ScorecardSource` or `NormalizedScorecard`, both of which coerce a missing
+ * verdict to `hold`.
+ */
+export interface RecommendationTagSource {
+  /** `no_assessment`: no result on any of the candidate's links, so no tag. */
+  status: 'ok' | 'no_assessment';
   recommendation: unknown;
   evidenceGrade: 'decision' | 'insufficient' | null;
-  /** Is this operation the newest `recommendation_tag` row on the link? */
-  isNewestTagOperation(operationId: string): boolean;
 }
 
 /** Durable persistence for the workflow (0029/0031 tables + RPCs). */
@@ -413,12 +420,20 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
    */
   enqueueRecommendationTag?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
   /**
-   * Read the tag lane's run-time facts, or null when the link, the session or
-   * the assessment cannot be read. Optional so existing fakes compile.
+   * The tag lane's link read: the link's Ashby candidate and application ids,
+   * or null when the link cannot be read. Optional so existing fakes compile.
+   */
+  readRecommendationTagLink?(applicationLinkId: string): Promise<RecommendationTagLink | null>;
+  /**
+   * The candidate's authoritative verdict, decided now across every link of
+   * the candidate (0134 `ashby_candidate_tag_verdict`), or null when it cannot
+   * be read. `externalCandidateId` is the link's stored Ashby candidate id, or
+   * the one the lane resolved from `application.info`. Optional so existing
+   * fakes compile.
    */
   readRecommendationTagSource?(
     applicationLinkId: string,
-    sourceSessionId?: string | null,
+    externalCandidateId: string | null,
   ): Promise<RecommendationTagSource | null>;
   /**
    * CAS a manual invite_delivery operation from `running` to

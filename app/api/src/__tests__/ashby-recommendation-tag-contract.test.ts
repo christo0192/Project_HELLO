@@ -30,6 +30,7 @@ import { runClaimedAshbyOperation } from '../integrations/ashby/operation-worker
 import { createChristyTagResolver } from '../integrations/ashby/recommendation-tags.js';
 import type {
   OperationClaimRow,
+  RecommendationTagLink,
   RecommendationTagSource,
   RuntimeWorkflowStores,
   WorkflowLinkRow,
@@ -64,6 +65,29 @@ function candidate(tags: unknown[]) {
     applicationIds: [APP_ID],
     fileHandles: [],
     profileUrl: 'https://app.ashbyhq.com/candidates/synthetic',
+  };
+}
+
+/**
+ * The candidate's tag routes, with state: a write changes what the next
+ * `candidate.info` answers, as in the tenant, and every write answers the
+ * documented Candidate. The lane reads once more after its writes, so a static
+ * answer would read as someone else having changed the tags.
+ */
+function candidateRoutes(initial: Array<ReturnType<typeof tag>>): Routes {
+  let tags = [...initial];
+  const known = [SELECT, BORDERLINE, REJECT, OTHER, ...initial];
+  return {
+    '/candidate.info': () => success(candidate(tags)),
+    '/candidate.addTag': (body) => {
+      const added = known.find((t) => t.id === body.tagId);
+      if (added && !tags.some((t) => t.id === added.id)) tags = [...tags, added];
+      return success(candidate(tags));
+    },
+    '/candidate.removeTag': (body) => {
+      tags = tags.filter((t) => t.id !== body.tagId);
+      return success(candidate(tags));
+    },
   };
 }
 
@@ -115,13 +139,18 @@ const link: WorkflowLinkRow = {
   lifecycle: 'writeback_pending', terminalState: null,
 };
 
-async function run(routes: Routes, source: Partial<RecommendationTagSource> = {}) {
+async function run(
+  routes: Routes,
+  source: Partial<RecommendationTagSource> = {},
+  tagLink: RecommendationTagLink = { externalCandidateId: CAND_ID, externalApplicationId: APP_ID },
+) {
   const t = tenant(routes);
   const record = {
     complete: [] as unknown[][],
     fail: [] as unknown[][],
     defer: [] as unknown[][],
     bound: [] as unknown[][],
+    verdictAsked: [] as unknown[][],
   };
   const stores: RuntimeWorkflowStores = {
     findLinkByApplicationId: async () => null,
@@ -137,14 +166,11 @@ async function run(routes: Routes, source: Partial<RecommendationTagSource> = {}
     readLink: async () => link,
     markWritebackPending: async () => ({ status: 'ok' }),
     bindLinkExternalCandidateId: async (...args) => { record.bound.push(args); },
-    readRecommendationTagSource: async () => ({
-      externalCandidateId: CAND_ID,
-      externalApplicationId: APP_ID,
-      recommendation: 'advance',
-      evidenceGrade: 'decision',
-      isNewestTagOperation: () => true,
-      ...source,
-    }),
+    readRecommendationTagLink: async () => tagLink,
+    readRecommendationTagSource: async (...args) => {
+      record.verdictAsked.push(args);
+      return { status: 'ok', recommendation: 'advance', evidenceGrade: 'decision', ...source };
+    },
   };
   const result = await runClaimedAshbyOperation({
     stores,
@@ -163,13 +189,14 @@ async function run(routes: Routes, source: Partial<RecommendationTagSource> = {}
 const catalogue = (results: unknown[]) => () => success(results, { moreDataAvailable: false, syncToken: 'sync-last-page' });
 
 describe('the documented happy path', () => {
-  it('reads the candidate, reads the catalogue, adds exactly the documented body', async () => {
+  it('reads the candidate, reads the catalogue, adds exactly the documented body, then looks again', async () => {
     const r = await run({
-      '/candidate.info': () => success(candidate([OTHER])),
+      ...candidateRoutes([OTHER]),
       '/candidateTag.list': catalogue([OTHER, SELECT, BORDERLINE, REJECT]),
-      '/candidate.addTag': () => success(candidate([OTHER, SELECT])),
     });
-    expect(r.requests.map((q) => q.path)).toEqual(['/candidate.info', '/candidateTag.list', '/candidate.addTag']);
+    expect(r.requests.map((q) => q.path)).toEqual([
+      '/candidate.info', '/candidateTag.list', '/candidate.addTag', '/candidate.info',
+    ]);
     // candidate.info names its identifier `id` on the wire.
     expect(r.requests[0].body).toEqual({ id: CAND_ID });
     expect(r.requests[1].body).toEqual({ includeArchived: false, limit: 100 });
@@ -178,32 +205,32 @@ describe('the documented happy path', () => {
     expect(r.result).toMatchObject({ committed: true, code: 'christy_tag_select' });
   });
 
+  it('asks for the candidate-wide verdict with the link and the Ashby candidate id', async () => {
+    const r = await run({ ...candidateRoutes([SELECT]) });
+    expect(r.record.verdictAsked).toEqual([['link-1', CAND_ID]]);
+  });
+
   it('a verdict change adds first, then removes only the old Christy tag', async () => {
     const r = await run(
-      {
-        '/candidate.info': () => success(candidate([OTHER, SELECT])),
-        '/candidateTag.list': catalogue([OTHER, SELECT, BORDERLINE, REJECT]),
-        '/candidate.addTag': () => success(candidate([OTHER, SELECT, REJECT])),
-        '/candidate.removeTag': () => success(candidate([OTHER, REJECT])),
-      },
+      { ...candidateRoutes([OTHER, SELECT]), '/candidateTag.list': catalogue([OTHER, SELECT, BORDERLINE, REJECT]) },
       { recommendation: 'reject' },
     );
     expect(r.requests.map((q) => q.path)).toEqual([
-      '/candidate.info', '/candidateTag.list', '/candidate.addTag', '/candidate.removeTag',
+      '/candidate.info', '/candidateTag.list', '/candidate.addTag', '/candidate.removeTag', '/candidate.info',
     ]);
     expect(r.requests[2].body).toEqual({ candidateId: CAND_ID, tagId: TAG_REJECT });
     expect(r.requests[3].body).toEqual({ candidateId: CAND_ID, tagId: TAG_SELECT });
+    expect(r.result).toMatchObject({ committed: true, code: 'christy_tag_reject' });
   });
 
   it('walks a documented multi-page list, empty page included, passing the cursor back unchanged', async () => {
     const r = await run({
-      '/candidate.info': () => success(candidate([])),
+      ...candidateRoutes([]),
       '/candidateTag.list': (body) => {
         if (body.cursor === undefined) return success([OTHER], { moreDataAvailable: true, nextCursor: 'opaque/1==' });
         if (body.cursor === 'opaque/1==') return success([], { moreDataAvailable: true, nextCursor: 'opaque/2==' });
         return success([SELECT], { moreDataAvailable: false, syncToken: 'sync-last-page' });
       },
-      '/candidate.addTag': () => success(candidate([SELECT])),
     });
     expect(r.requests.filter((q) => q.path === '/candidateTag.list').map((q) => q.body.cursor))
       .toEqual([undefined, 'opaque/1==', 'opaque/2==']);
@@ -217,19 +244,37 @@ describe('the documented happy path', () => {
   });
 
   it('a newest result with no verdict removes the Christy tag and leaves the other', async () => {
-    const r = await run(
-      {
-        '/candidate.info': () => success(candidate([OTHER, BORDERLINE])),
-        '/candidate.removeTag': () => success(candidate([OTHER])),
-      },
-      { recommendation: null },
-    );
-    expect(r.requests.map((q) => q.path)).toEqual(['/candidate.info', '/candidate.removeTag']);
+    const r = await run({ ...candidateRoutes([OTHER, BORDERLINE]) }, { recommendation: null });
+    expect(r.requests.map((q) => q.path)).toEqual(['/candidate.info', '/candidate.removeTag', '/candidate.info']);
     expect(r.requests[1].body).toEqual({ candidateId: CAND_ID, tagId: TAG_BORDERLINE });
     expect(r.result).toMatchObject({ code: 'christy_tag_none' });
   });
 
-  it('a link with no stored candidate id reads it from a documented application.info', async () => {
+  it('no result on any of the candidate\'s links is no tag', async () => {
+    const r = await run({ ...candidateRoutes([REJECT]) }, { status: 'no_assessment', recommendation: null, evidenceGrade: null });
+    expect(r.requests[1].body).toEqual({ candidateId: CAND_ID, tagId: TAG_REJECT });
+    expect(r.result).toMatchObject({ committed: true, code: 'christy_tag_none' });
+  });
+
+  it('an untagged Candidate answered WITHOUT the tags key reads as no tags', async () => {
+    // Live Ashby has already been seen leaving out a key the docs mark required
+    // (ashby-candidate-info-contract.test.ts, resumeFileHandle). Pinned here.
+    const untagged: Record<string, unknown> = { ...candidate([]) };
+    delete untagged.tags;
+    let tagged = false;
+    const r = await run({
+      '/candidate.info': () => success(tagged ? candidate([SELECT]) : untagged),
+      '/candidateTag.list': catalogue([SELECT]),
+      '/candidate.addTag': () => { tagged = true; return success(candidate([SELECT])); },
+    });
+    expect('tags' in untagged).toBe(false);
+    expect(r.requests.map((q) => q.path)).toEqual([
+      '/candidate.info', '/candidateTag.list', '/candidate.addTag', '/candidate.info',
+    ]);
+    expect(r.result).toMatchObject({ committed: true, code: 'christy_tag_select' });
+  });
+
+  it('a link with no stored candidate id reads it from a documented application.info, then asks for the verdict with it', async () => {
     const r = await run(
       {
         '/application.info': () => success({
@@ -241,10 +286,12 @@ describe('the documented happy path', () => {
         }),
         '/candidate.info': () => success(candidate([SELECT])),
       },
-      { externalCandidateId: null },
+      {},
+      { externalCandidateId: null, externalApplicationId: APP_ID },
     );
     expect(r.requests[0].body).toEqual({ applicationId: APP_ID });
     expect(r.record.bound).toEqual([['link-1', CAND_ID]]);
+    expect(r.record.verdictAsked).toEqual([['link-1', CAND_ID]]);
     expect(r.result).toMatchObject({ committed: true });
   });
 });
@@ -276,13 +323,16 @@ describe('the documented failures', () => {
     expect(r.record.defer).toEqual([['op-1', 'lease-1', 'ashby_tag_permission_denied', 3600]]);
   });
 
-  it('a message-only refusal on a write re-reads, then fails with the plain code', async () => {
+  it('a message-only refusal on a write re-reads, tries once more with a fresh id, then fails with the plain code', async () => {
     const r = await run({
       '/candidate.info': () => success(candidate([])),
       '/candidateTag.list': catalogue([SELECT]),
       '/candidate.addTag': () => json(200, { success: false, errors: [{ message: 'Synthetic Person cannot take this tag', parameter: 'tagId' }] }),
     });
-    expect(r.requests.filter((q) => q.path === '/candidate.info')).toHaveLength(2);
+    expect(r.requests.map((q) => q.path)).toEqual([
+      '/candidate.info', '/candidateTag.list', '/candidate.addTag', '/candidate.info',
+      '/candidateTag.list', '/candidate.addTag', '/candidate.info',
+    ]);
     expect(r.record.fail).toEqual([['op-1', 'lease-1', 'ashby_tag_write_rejected', false]]);
     expect(JSON.stringify(r.record)).not.toContain('Synthetic Person');
   });
@@ -314,10 +364,10 @@ describe('the documented failures', () => {
 describe('what leaves the process', () => {
   it('sends HTTP Basic to the fixed origin, and the client log carries metadata only', async () => {
     const r = await run({
-      '/candidate.info': () => success(candidate([])),
+      ...candidateRoutes([]),
       '/candidateTag.list': catalogue([SELECT]),
-      '/candidate.addTag': () => success(candidate([SELECT])),
     });
+    expect(r.result).toMatchObject({ committed: true });
     for (const q of r.requests) {
       expect(q.raw.url.startsWith('https://api.ashbyhq.com/')).toBe(true);
       expect(q.raw.headers.authorization).toMatch(/^Basic /);

@@ -14,8 +14,10 @@ import {
   CHRISTY_TAG_CACHE_MS,
   CHRISTY_VERDICT_TAG_TITLES,
   TAG_CONFIG_FAULT_DEFER_SECONDS,
+  TAG_CONTENDED,
   TAG_DEFER_AGE_LIMIT_MS,
   TAG_TRANSIENT_DEFER_SECONDS,
+  TAG_VERDICT_UNREADABLE,
   christyTagForVerdict,
   createChristyTagResolver,
   executeRecommendationTag,
@@ -30,6 +32,7 @@ import {
 } from '../integrations/ashby/operation-worker.js';
 import type {
   OperationClaimRow,
+  RecommendationTagLink,
   RecommendationTagSource,
   RuntimeWorkflowStores,
   WorkflowLinkRow,
@@ -216,7 +219,7 @@ describe('createChristyTagResolver', () => {
       { results: [SELECT], moreDataAvailable: false },
     );
     const r = createChristyTagResolver({ candidateTagList });
-    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select' });
+    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select', cached: false });
     expect(candidateTagList.mock.calls.map((c) => c[0]?.cursor)).toEqual([undefined, 'c1']);
     expect(candidateTagList.mock.calls[0][0]?.limit).toBe(100);
   });
@@ -228,7 +231,7 @@ describe('createChristyTagResolver', () => {
         { results: [REJECT] },
       ),
     });
-    expect(await r.resolve('Christy: Reject')).toEqual({ status: 'found', tagId: 'tag-reject' });
+    expect(await r.resolve('Christy: Reject')).toEqual({ status: 'found', tagId: 'tag-reject', cached: false });
   });
 
   it('fails closed as truncated when more data is promised with no cursor', async () => {
@@ -269,7 +272,7 @@ describe('createChristyTagResolver', () => {
     const r = createChristyTagResolver({
       candidateTagList: pages({ results: [{ id: 'old', title: 'Christy: Select', isArchived: true }, SELECT] }),
     });
-    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select' });
+    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select', cached: false });
   });
 
   it('two active matches are ambiguous', async () => {
@@ -286,14 +289,14 @@ describe('createChristyTagResolver', () => {
         { results: [SELECT] },
       ),
     });
-    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select' });
+    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select', cached: false });
   });
 
   it('trims, then matches exactly and case-sensitively', async () => {
     const trimmed = createChristyTagResolver({
       candidateTagList: pages({ results: [{ id: 'spaced', title: '  Christy: Reject ', isArchived: false }] }),
     });
-    expect(await trimmed.resolve('Christy: Reject')).toEqual({ status: 'found', tagId: 'spaced' });
+    expect(await trimmed.resolve('Christy: Reject')).toEqual({ status: 'found', tagId: 'spaced', cached: false });
 
     const near = createChristyTagResolver({
       candidateTagList: pages({
@@ -307,17 +310,17 @@ describe('createChristyTagResolver', () => {
     expect(await near.resolve('Christy: Reject')).toEqual({ status: 'not_found' });
   });
 
-  it('caches a complete read for five minutes, then reads again', async () => {
+  it('caches a complete read for five minutes, then reads again, and says which answer was cached', async () => {
     let now = NOW;
     const candidateTagList = pages({ results: CATALOGUE });
     const r = createChristyTagResolver({ candidateTagList }, () => now);
-    await r.resolve('Christy: Select');
-    await r.resolve('Christy: Reject');
+    expect(await r.resolve('Christy: Select')).toMatchObject({ cached: false });
+    expect(await r.resolve('Christy: Reject')).toMatchObject({ cached: true });
     now += CHRISTY_TAG_CACHE_MS - 1;
-    await r.resolve('Christy: Borderline');
+    expect(await r.resolve('Christy: Borderline')).toMatchObject({ cached: true });
     expect(candidateTagList).toHaveBeenCalledTimes(1);
     now += 1;
-    await r.resolve('Christy: Select');
+    expect(await r.resolve('Christy: Select')).toMatchObject({ cached: false });
     expect(candidateTagList).toHaveBeenCalledTimes(2);
   });
 
@@ -325,8 +328,17 @@ describe('createChristyTagResolver', () => {
     const candidateTagList = pages({ results: [] }, { results: [SELECT] });
     const r = createChristyTagResolver({ candidateTagList });
     expect(await r.resolve('Christy: Select')).toEqual({ status: 'not_found' });
-    expect(await r.resolve('Christy: Select', { fresh: true })).toEqual({ status: 'found', tagId: 'tag-select' });
-    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select' });
+    expect(await r.resolve('Christy: Select', { fresh: true })).toEqual({ status: 'found', tagId: 'tag-select', cached: false });
+    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select', cached: true });
+    expect(candidateTagList).toHaveBeenCalledTimes(2);
+  });
+
+  it('invalidate drops the cache: the next resolve reads Ashby again', async () => {
+    const candidateTagList = pages({ results: [SELECT] });
+    const r = createChristyTagResolver({ candidateTagList });
+    await r.resolve('Christy: Select');
+    r.invalidate?.();
+    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select', cached: false });
     expect(candidateTagList).toHaveBeenCalledTimes(2);
   });
 
@@ -339,7 +351,7 @@ describe('createChristyTagResolver', () => {
     const r = createChristyTagResolver({ candidateTagList });
     await expect(r.resolve('Christy: Select')).rejects.toBeInstanceOf(AshbyError);
     expect(await r.resolve('Christy: Select')).toEqual({ status: 'truncated' });
-    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select' });
+    expect(await r.resolve('Christy: Select')).toEqual({ status: 'found', tagId: 'tag-select', cached: false });
     expect(candidateTagList).toHaveBeenCalledTimes(3);
   });
 
@@ -366,19 +378,51 @@ const claim: OperationClaimRow = {
   createdAt: new Date(NOW - 60_000).toISOString(),
 };
 
+type FakeTag = { id: string; title: string; isArchived: boolean };
+
+/** The candidate's verdict as the 0134 RPC answers it. */
 function source(over: Partial<RecommendationTagSource> = {}): RecommendationTagSource {
-  return {
-    externalCandidateId: CAND,
-    externalApplicationId: 'app-1',
-    recommendation: 'advance',
-    evidenceGrade: 'decision',
-    isNewestTagOperation: () => true,
-    ...over,
-  };
+  return { status: 'ok', recommendation: 'advance', evidenceGrade: 'decision', ...over };
+}
+
+const LINK: RecommendationTagLink = { externalCandidateId: CAND, externalApplicationId: 'app-1' };
+
+/**
+ * One candidate in Ashby, with real state: a write changes what the next
+ * `candidate.info` reads, as it does in the tenant. A write answers the
+ * Candidate, as documented. `known` names what an id is when it is added.
+ */
+class FakeCandidate {
+  tags: FakeTag[];
+  private readonly known = new Map<string, FakeTag>();
+
+  constructor(initial: FakeTag[], known: FakeTag[]) {
+    this.tags = [...initial];
+    for (const t of [...known, ...initial]) this.known.set(t.id, t);
+  }
+
+  add(tagId: string): void {
+    if (this.tags.some((t) => t.id === tagId)) return;
+    this.tags.push(this.known.get(tagId) ?? { id: tagId, title: 'Unknown', isArchived: false });
+  }
+
+  remove(tagId: string): void {
+    this.tags = this.tags.filter((t) => t.id !== tagId);
+  }
+
+  answer() {
+    return { results: { id: CAND, tags: [...this.tags] }, moreDataAvailable: false };
+  }
+
+  christyIds(): string[] {
+    return this.tags.filter((t) => t.title.startsWith('Christy: ')).map((t) => t.id).sort();
+  }
 }
 
 function harness(opts: {
-  tags?: unknown;
+  tags?: FakeTag[];
+  known?: FakeTag[];
+  link?: RecommendationTagLink | null;
   src?: RecommendationTagSource | null;
   catalogue?: unknown[];
   claim?: Partial<OperationClaimRow>;
@@ -387,18 +431,21 @@ function harness(opts: {
   listTags?: ReturnType<typeof vi.fn>;
 } = {}) {
   const calls: string[] = [];
+  const ashby = new FakeCandidate(opts.tags ?? [], [...CATALOGUE, ...(opts.known ?? [])] as FakeTag[]);
   const client: RecommendationTagClient = {
     applicationInfo: vi.fn(async () => ({ results: { id: 'app-1', candidate: { id: CAND } }, moreDataAvailable: false })),
-    candidateInfo: vi.fn(async () => ({ results: { id: CAND, tags: opts.tags ?? [] }, moreDataAvailable: false })),
-    candidateAddTag: vi.fn(async (_c: string, tagId: string) => { calls.push(`add:${tagId}`); }),
-    candidateRemoveTag: vi.fn(async (_c: string, tagId: string) => { calls.push(`remove:${tagId}`); }),
+    candidateInfo: vi.fn(async () => ashby.answer()),
+    candidateAddTag: vi.fn(async (_c: string, tagId: string) => { calls.push(`add:${tagId}`); ashby.add(tagId); return ashby.answer(); }),
+    candidateRemoveTag: vi.fn(async (_c: string, tagId: string) => { calls.push(`remove:${tagId}`); ashby.remove(tagId); return ashby.answer(); }),
     ...opts.client,
   };
   const candidateTagList = opts.listTags ?? vi.fn(async () => ({ results: opts.catalogue ?? CATALOGUE, moreDataAvailable: false }));
+  const resolver = createChristyTagResolver({ candidateTagList: candidateTagList as never }, () => NOW);
   const stores = {
     completeOperation: vi.fn(async () => 'ok' as const),
     failOperation: vi.fn(async () => ({ outcome: 'retry' as const })),
     deferOperation: vi.fn(async () => 'ok' as const),
+    readRecommendationTagLink: vi.fn(async () => (opts.link === undefined ? LINK : opts.link)),
     readRecommendationTagSource: vi.fn(async () => (opts.src === undefined ? source() : opts.src)),
     bindLinkExternalCandidateId: vi.fn(async () => {}),
     ...opts.stores,
@@ -409,18 +456,19 @@ function harness(opts: {
       { ...claim, ...opts.claim },
       {
         stores: stores as unknown as RecommendationTagDeps['stores'],
-        adapter: { client, resolver: createChristyTagResolver({ candidateTagList: candidateTagList as never }, () => NOW) },
+        adapter: { client, resolver },
         nowMs: () => NOW,
         onEvent: (e) => events.push(e),
       },
     );
-  return { client, stores, calls, run, events, candidateTagList };
+  return { ashby, client, stores, calls, run, events, candidateTagList, resolver };
 }
 
 const http = (status: number) => new AshbyError('http_client_error', { httpStatus: status });
 const logical = (...endpointCodes: string[]) => new AshbyError('logical_failure', { httpStatus: 200, endpointCodes });
+const transientError = () => new AshbyError('http_server_error', { httpStatus: 503 });
 
-describe('executeRecommendationTag: applying a verdict', () => {
+describe('executeRecommendationTag: applying the verdict', () => {
   it.each([
     ['advance', 'tag-select', 'christy_tag_select'],
     ['hold', 'tag-borderline', 'christy_tag_borderline'],
@@ -429,6 +477,7 @@ describe('executeRecommendationTag: applying a verdict', () => {
     const h = harness({ src: source({ recommendation }) });
     const r = await h.run();
     expect(h.calls).toEqual([`add:${tagId}`]);
+    expect(h.ashby.christyIds()).toEqual([tagId]);
     expect(h.stores.completeOperation).toHaveBeenCalledWith('op-1', 'lease-1', anchor, null);
     expect(r).toEqual({ claimed: true, operationType: 'recommendation_tag', committed: true, staleLease: false, code: anchor });
   });
@@ -439,31 +488,35 @@ describe('executeRecommendationTag: applying a verdict', () => {
     expect(h.calls).toEqual(['add:tag-reject']);
   });
 
-  it('a repeat makes no writes and reads no catalogue', async () => {
+  it('a repeat makes no writes, reads no catalogue and reads the candidate once', async () => {
     const h = harness({ tags: [SELECT] });
     const r = await h.run();
     expect(h.calls).toEqual([]);
     expect(h.candidateTagList).not.toHaveBeenCalled();
+    expect(h.client.candidateInfo).toHaveBeenCalledTimes(1);
     expect(r).toMatchObject({ committed: true, code: 'christy_tag_select' });
   });
 
-  it('a verdict change adds the new tag BEFORE it removes the old one', async () => {
+  it('a verdict change adds the new tag BEFORE it removes the old one, then looks again', async () => {
     const h = harness({ tags: [SELECT], src: source({ recommendation: 'reject' }) });
-    await h.run();
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_reject' });
     expect(h.calls).toEqual(['add:tag-reject', 'remove:tag-select']);
+    expect(h.client.candidateInfo).toHaveBeenCalledTimes(2);
   });
 
   it('removes every other Christy tag on a candidate carrying several', async () => {
     const h = harness({ tags: [SELECT, BORDERLINE, REJECT], src: source({ recommendation: 'hold' }) });
     await h.run();
     expect(h.calls).toEqual(['remove:tag-select', 'remove:tag-reject']);
+    expect(h.ashby.christyIds()).toEqual(['tag-borderline']);
   });
 
   it.each([
-    ['human_review stored as NULL', { recommendation: null }],
-    ['insufficient evidence over a verdict', { recommendation: 'advance', evidenceGrade: 'insufficient' as const }],
-  ])('%s removes what is there and adds nothing', async (_label, over) => {
-    const h = harness({ tags: [SELECT], src: source(over) });
+    ['human_review stored as NULL', source({ recommendation: null })],
+    ['insufficient evidence over a verdict', source({ recommendation: 'advance', evidenceGrade: 'insufficient' })],
+    ['no result on any of the candidate\'s links', { status: 'no_assessment' as const, recommendation: null, evidenceGrade: null }],
+  ])('%s removes what is there and adds nothing', async (_label, src) => {
+    const h = harness({ tags: [SELECT], src });
     const r = await h.run();
     expect(h.calls).toEqual(['remove:tag-select']);
     expect(h.candidateTagList).not.toHaveBeenCalled();
@@ -488,6 +541,7 @@ describe('executeRecommendationTag: applying a verdict', () => {
     const h = harness({ tags, src: source({ recommendation: null }) });
     await h.run();
     expect(h.calls).toEqual(['remove:tag-select']);
+    expect(h.ashby.tags.map((t) => t.id)).toEqual(['tag-vip', 'near-1', 'near-2', 'near-3']);
   });
 
   it('a target tag that was since archived does not count: the active one goes on, the old one off', async () => {
@@ -497,91 +551,104 @@ describe('executeRecommendationTag: applying a verdict', () => {
   });
 
   it('resumes after a partial run: a remove that failed is the only write left', async () => {
-    const removes = vi.fn().mockRejectedValueOnce(new AshbyError('http_server_error', { httpStatus: 503 }));
-    const first = harness({ tags: [SELECT], src: source({ recommendation: 'reject' }), client: { candidateRemoveTag: removes } });
+    const first = harness({ tags: [SELECT], src: source({ recommendation: 'reject' }) });
+    (first.client.candidateRemoveTag as ReturnType<typeof vi.fn>).mockRejectedValueOnce(transientError());
     const r1 = await first.run();
     expect(first.client.candidateAddTag).toHaveBeenCalledTimes(1);
     expect(r1).toMatchObject({ code: 'ashby_tag_transient', committed: false });
 
-    const second = harness({ tags: [SELECT, REJECT], src: source({ recommendation: 'reject' }) });
+    const second = harness({ tags: first.ashby.tags, src: source({ recommendation: 'reject' }) });
     const r2 = await second.run();
     expect(second.calls).toEqual(['remove:tag-select']);
     expect(r2).toMatchObject({ committed: true, code: 'christy_tag_reject' });
   });
 });
 
-describe('executeRecommendationTag: source and candidate', () => {
-  it('an operation that is not the newest completes as superseded with no Ashby call', async () => {
-    const h = harness({ src: source({ isNewestTagOperation: () => false }) });
-    const r = await h.run();
-    expect(r).toMatchObject({ committed: true, code: 'christy_tag_superseded' });
-    expect(h.stores.completeOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'christy_tag_superseded', null);
-    expect(h.client.candidateInfo).not.toHaveBeenCalled();
-    expect(h.client.applicationInfo).not.toHaveBeenCalled();
-  });
-
-  it('passes the operation session to the store and asks about this operation', async () => {
-    const isNewest = vi.fn(() => true);
-    const h = harness({ src: source({ isNewestTagOperation: isNewest }) });
+describe('executeRecommendationTag: the link, the candidate and the verdict', () => {
+  it('reads the link, then asks for the candidate-wide verdict with the Ashby candidate id', async () => {
+    const h = harness();
     await h.run();
-    expect(h.stores.readRecommendationTagSource).toHaveBeenCalledWith('link-1', 'session-1');
-    expect(isNewest).toHaveBeenCalledWith('op-1');
+    expect(h.stores.readRecommendationTagLink).toHaveBeenCalledWith('link-1');
+    // Never the operation's own session: the verdict is the candidate's newest.
+    expect(h.stores.readRecommendationTagSource).toHaveBeenCalledWith('link-1', CAND);
   });
 
-  it('an unreadable source fails retryable assessment_missing', async () => {
-    const h = harness({ src: null });
-    expect(await h.run()).toMatchObject({ committed: false, code: 'assessment_missing' });
-    expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'assessment_missing', true);
-  });
-
-  it('a throwing source read also fails retryable assessment_missing', async () => {
-    const h = harness({ stores: { readRecommendationTagSource: vi.fn(async () => { throw new Error('db'); }) } });
-    await h.run();
-    expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'assessment_missing', true);
-  });
-
-  it('falls back to application.info and binds the id it found', async () => {
-    const h = harness({ src: source({ externalCandidateId: null }) });
+  it('a link with no stored id resolves it from application.info, binds it, THEN reads the verdict with it', async () => {
+    const h = harness({ link: { externalCandidateId: null, externalApplicationId: 'app-1' } });
     await h.run();
     expect(h.client.applicationInfo).toHaveBeenCalledWith('app-1');
     expect(h.stores.bindLinkExternalCandidateId).toHaveBeenCalledWith('link-1', CAND);
-    expect(h.client.candidateInfo).toHaveBeenCalledWith(CAND);
+    expect(h.stores.readRecommendationTagSource).toHaveBeenCalledWith('link-1', CAND);
+    const bound = (h.stores.bindLinkExternalCandidateId as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const read = (h.stores.readRecommendationTagSource as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(bound).toBeLessThan(read);
     expect(h.calls).toEqual(['add:tag-select']);
   });
 
   it('a failed bind does not stop the tag', async () => {
     const h = harness({
-      src: source({ externalCandidateId: null }),
+      link: { externalCandidateId: null, externalApplicationId: 'app-1' },
       stores: { bindLinkExternalCandidateId: vi.fn(async () => { throw new Error('db'); }) },
     });
     expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
-    expect(h.calls).toEqual(['add:tag-select']);
   });
 
-  it('no candidate id anywhere fails non-retryable candidate_id_missing', async () => {
+  it('no candidate id anywhere fails non-retryable candidate_id_missing, before any verdict read', async () => {
     const h = harness({
-      src: source({ externalCandidateId: null }),
+      link: { externalCandidateId: null, externalApplicationId: 'app-1' },
       client: { applicationInfo: vi.fn(async () => ({ results: { id: 'app-1' }, moreDataAvailable: false })) },
     });
     await h.run();
     expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'candidate_id_missing', false);
     expect(h.stores.bindLinkExternalCandidateId).not.toHaveBeenCalled();
+    expect(h.stores.readRecommendationTagSource).not.toHaveBeenCalled();
   });
 
   it('no stored id and no application id fails the same way, with no Ashby call', async () => {
-    const h = harness({ src: source({ externalCandidateId: null, externalApplicationId: null }) });
+    const h = harness({ link: { externalCandidateId: null, externalApplicationId: null } });
     await h.run();
     expect(h.client.applicationInfo).not.toHaveBeenCalled();
     expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'candidate_id_missing', false);
   });
 
-  it('a candidate with no readable tags list writes nothing and fails attempt-bounded', async () => {
-    const h = harness({
-      client: { candidateInfo: vi.fn(async () => ({ results: { id: CAND }, moreDataAvailable: false })) },
-    });
-    expect(await h.run()).toMatchObject({ committed: false, code: 'operation_error' });
+  it.each([
+    ['the link read answers null', { readRecommendationTagLink: vi.fn(async () => null) }],
+    ['the link read throws', { readRecommendationTagLink: vi.fn(async () => { throw new Error('db'); }) }],
+    ['the verdict read answers null', { readRecommendationTagSource: vi.fn(async () => null) }],
+    ['the verdict read throws', { readRecommendationTagSource: vi.fn(async () => { throw new Error('db'); }) }],
+  ])('%s: waits five minutes, writes nothing, spends no attempt', async (_label, stores) => {
+    const h = harness({ stores });
+    expect(await h.run()).toMatchObject({ committed: false, code: TAG_VERDICT_UNREADABLE });
+    expect(h.stores.deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', TAG_VERDICT_UNREADABLE, TAG_TRANSIENT_DEFER_SECONDS);
+    expect(h.stores.failOperation).not.toHaveBeenCalled();
+    expect(h.client.candidateInfo).not.toHaveBeenCalled();
+  });
+
+  it('a candidate.info with no tags key reads as no tags: Ashby marks it required, so it is left out when empty', async () => {
+    const h = harness();
+    (h.client.candidateInfo as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ results: { id: CAND }, moreDataAvailable: false });
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
+    expect(h.calls).toEqual(['add:tag-select']);
+  });
+
+  it('no tags key and no verdict: nothing to do, no write', async () => {
+    const h = harness({ src: source({ recommendation: null }) });
+    (h.client.candidateInfo as ReturnType<typeof vi.fn>).mockResolvedValue({ results: { id: CAND }, moreDataAvailable: false });
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_none' });
     expect(h.calls).toEqual([]);
-    expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'operation_error', true);
+  });
+
+  it.each([
+    ['tags is not a list', { id: CAND, tags: 'none' }],
+    ['tags is null', { id: CAND, tags: null }],
+    ['the candidate is a list', [{ id: CAND }]],
+    ['the candidate is missing', null],
+  ])('%s: malformed, so it waits five minutes and writes nothing', async (_label, results) => {
+    const h = harness({ client: { candidateInfo: vi.fn(async () => ({ results, moreDataAvailable: false })) } });
+    expect(await h.run()).toMatchObject({ committed: false, code: 'operation_error' });
+    expect(h.stores.deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'operation_error', TAG_TRANSIENT_DEFER_SECONDS);
+    expect(h.calls).toEqual([]);
+    expect(h.stores.failOperation).not.toHaveBeenCalled();
   });
 });
 
@@ -642,19 +709,16 @@ describe('executeRecommendationTag: config faults write nothing', () => {
   });
 
   it('a permission fault on the write does not spend a re-read', async () => {
-    const candidateInfo = vi.fn(async () => ({ results: { id: CAND, tags: [] }, moreDataAvailable: false }));
-    const h = harness({
-      client: { candidateInfo, candidateAddTag: vi.fn(async () => { throw logical('missing_endpoint_permission'); }) },
-    });
+    const h = harness({ client: { candidateAddTag: vi.fn(async () => { throw logical('missing_endpoint_permission'); }) } });
     await h.run();
-    expect(candidateInfo).toHaveBeenCalledTimes(1);
+    expect(h.client.candidateInfo).toHaveBeenCalledTimes(1);
   });
 });
 
 describe('executeRecommendationTag: transient faults', () => {
   it.each([
     ['429', new AshbyError('rate_limited', { httpStatus: 429 })],
-    ['5xx', new AshbyError('http_server_error', { httpStatus: 503 })],
+    ['5xx', transientError()],
     ['timeout, not retriable as the client says', new AshbyError('timeout', { retriable: false })],
     ['network', new AshbyError('network', {})],
     ['retry_exhausted', new AshbyError('retry_exhausted', { retriable: false })],
@@ -672,7 +736,7 @@ describe('executeRecommendationTag: transient faults', () => {
 
   it('applies to the application.info fallback', async () => {
     const h = harness({
-      src: source({ externalCandidateId: null }),
+      link: { externalCandidateId: null, externalApplicationId: 'app-1' },
       client: { applicationInfo: vi.fn(async () => { throw new AshbyError('network', {}); }) },
     });
     expect(await h.run()).toMatchObject({ code: 'ashby_tag_transient' });
@@ -686,6 +750,8 @@ describe('executeRecommendationTag: the age limit ends a wait', () => {
     ['transient', { client: { candidateInfo: vi.fn(async () => { throw new AshbyError('network', {}); }) } }, 'ashby_tag_transient'],
     ['permission', { client: { candidateInfo: vi.fn(async () => { throw http(403); }) } }, 'ashby_tag_permission_denied'],
     ['not found', { catalogue: [] }, 'ashby_tag_not_found'],
+    ['an unknown error', { client: { candidateInfo: vi.fn(async () => { throw new TypeError('boom'); }) } }, 'operation_error'],
+    ['an unreadable verdict', { src: null }, TAG_VERDICT_UNREADABLE],
   ])('%s older than 7 days fails non-retryable with the same code', async (_label, over, code) => {
     const h = harness({ ...over, claim: { createdAt: old } } as never);
     expect(await h.run()).toMatchObject({ committed: false, code });
@@ -711,34 +777,55 @@ describe('executeRecommendationTag: the age limit ends a wait', () => {
   });
 });
 
-describe('executeRecommendationTag: a logical failure on a write looks before it fails', () => {
-  it('add refused, tag is there after all: completes', async () => {
-    const candidateInfo = vi
-      .fn()
-      .mockResolvedValueOnce({ results: { tags: [] }, moreDataAvailable: false })
-      .mockResolvedValueOnce({ results: { tags: [SELECT] }, moreDataAvailable: false });
-    const h = harness({ client: { candidateInfo, candidateAddTag: vi.fn(async () => { throw logical('already_tagged'); }) } });
+describe('executeRecommendationTag: a refused write looks before it fails (TAG-3)', () => {
+  it('add refused, but the target is on after all, with the stale tag still there: removes it and completes', async () => {
+    // A send-phase timeout that Ashby applied, then a refused retry; or a recruiter
+    // adding the tag by hand between our read and our write.
+    const h = harness({ tags: [BORDERLINE] });
+    h.client.candidateAddTag = vi.fn(async (_c: string, tagId: string) => { h.ashby.add(tagId); throw logical('already_tagged'); });
     expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
-    expect(candidateInfo).toHaveBeenCalledTimes(2);
+    expect(h.calls).toEqual(['remove:tag-borderline']);
+    expect(h.ashby.christyIds()).toEqual(['tag-select']);
     expect(h.stores.failOperation).not.toHaveBeenCalled();
   });
 
-  it('remove refused, tag is gone after all: completes', async () => {
-    const candidateInfo = vi
-      .fn()
-      .mockResolvedValueOnce({ results: { tags: [SELECT] }, moreDataAvailable: false })
-      .mockResolvedValueOnce({ results: { tags: [] }, moreDataAvailable: false });
-    const h = harness({
-      src: source({ recommendation: null }),
-      client: { candidateInfo, candidateRemoveTag: vi.fn(async () => { throw logical('tag_not_present'); }) },
+  it('a remove refused because the tag is already gone counts as done, and the next stale tag still comes off', async () => {
+    const h = harness({ tags: [SELECT, BORDERLINE, REJECT], src: source({ recommendation: 'hold' }) });
+    const remove = h.client.candidateRemoveTag;
+    h.client.candidateRemoveTag = vi.fn(async (c: string, tagId: string) => {
+      if (tagId === 'tag-select') { h.ashby.remove(tagId); throw logical('tag_not_present'); }
+      return remove(c, tagId);
     });
-    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_none' });
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_borderline' });
+    expect(h.ashby.christyIds()).toEqual(['tag-borderline']);
+    expect(h.calls).toEqual(['remove:tag-reject']);
   });
 
-  it('refused and not there: fails non-retryable with the sanitized endpoint code', async () => {
-    const h = harness({ client: { candidateAddTag: vi.fn(async () => { throw logical('Tag_Refused'); }) } });
+  it('a remove refused while the tag is still there fails non-retryable with the sanitized endpoint code', async () => {
+    const h = harness({ tags: [SELECT], src: source({ recommendation: 'reject' }), client: { candidateRemoveTag: vi.fn(async () => { throw logical('Tag_Refused'); }) } });
     expect(await h.run()).toMatchObject({ committed: false, code: 'ashby_tag_write_rejected:tag_refused' });
     expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_write_rejected:tag_refused', false);
+    // The new tag is on: the candidate is never left without the tag it should have.
+    expect(h.ashby.christyIds()).toEqual(['tag-reject', 'tag-select']);
+  });
+
+  it('add refused and not on: one more try with a freshly read id, then it fails, removing nothing', async () => {
+    const h = harness({ tags: [REJECT], client: { candidateAddTag: vi.fn(async () => { throw logical('Tag_Refused'); }) } });
+    expect(await h.run()).toMatchObject({ committed: false, code: 'ashby_tag_write_rejected:tag_refused' });
+    expect(h.client.candidateAddTag).toHaveBeenCalledTimes(2);
+    expect(h.candidateTagList).toHaveBeenCalledTimes(2);
+    expect(h.client.candidateRemoveTag).not.toHaveBeenCalled();
+    expect(h.ashby.christyIds()).toEqual(['tag-reject']);
+  });
+
+  it('add refused once, then the retry with the fresh catalogue goes on: completes', async () => {
+    const h = harness({ tags: [REJECT] });
+    const add = h.client.candidateAddTag;
+    (h.client as { candidateAddTag: unknown }).candidateAddTag = vi.fn()
+      .mockRejectedValueOnce(logical('try_again'))
+      .mockImplementation(add);
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
+    expect(h.ashby.christyIds()).toEqual(['tag-select']);
   });
 
   it('no code, or one that would not fit the column, gives the plain code', async () => {
@@ -751,40 +838,135 @@ describe('executeRecommendationTag: a logical failure on a write looks before it
     }
   });
 
-  it('new tag on but the old one will not come off: not the desired state, so it fails', async () => {
-    const candidateInfo = vi
-      .fn()
-      .mockResolvedValueOnce({ results: { tags: [SELECT] }, moreDataAvailable: false })
-      .mockResolvedValueOnce({ results: { tags: [SELECT, REJECT] }, moreDataAvailable: false });
-    const h = harness({
-      src: source({ recommendation: 'reject' }),
-      client: { candidateInfo, candidateRemoveTag: vi.fn(async () => { throw logical(); }) },
-    });
-    expect(await h.run()).toMatchObject({ committed: false, code: 'ashby_tag_write_rejected' });
-  });
-
   it('a transient failure on the re-read defers instead', async () => {
-    const candidateInfo = vi
-      .fn()
+    const h = harness({ client: { candidateAddTag: vi.fn(async () => { throw logical(); }) } });
+    (h.client.candidateInfo as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({ results: { tags: [] }, moreDataAvailable: false })
       .mockRejectedValueOnce(new AshbyError('network', {}));
-    const h = harness({ client: { candidateInfo, candidateAddTag: vi.fn(async () => { throw logical(); }) } });
     expect(await h.run()).toMatchObject({ code: 'ashby_tag_transient' });
   });
 });
 
-describe('executeRecommendationTag: everything else', () => {
+describe('executeRecommendationTag: a cached tag id the admin changed (TAG-5)', () => {
+  /** A resolver whose cache holds the id the first catalogue read returned. */
+  async function warm(h: ReturnType<typeof harness>) {
+    await h.resolver.resolve('Christy: Select');
+    expect(h.candidateTagList).toHaveBeenCalledTimes(1);
+  }
+
+  it('renamed: the add lands under the new title, so a fresh id goes on and the right tag is there', async () => {
+    const renamed = { id: 'tag-select-old', title: 'Old Select', isArchived: false };
+    const fresh = { id: 'tag-select-new', title: 'Christy: Select', isArchived: false };
+    const listTags = vi.fn()
+      .mockResolvedValueOnce({ results: [{ ...renamed, title: 'Christy: Select' }], moreDataAvailable: false })
+      .mockResolvedValueOnce({ results: [fresh], moreDataAvailable: false });
+    const h = harness({ tags: [REJECT], listTags, known: [renamed, fresh] });
+    await warm(h);
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
+    expect(h.calls).toEqual(['add:tag-select-old', 'add:tag-select-new', 'remove:tag-reject']);
+    expect(h.ashby.christyIds()).toEqual(['tag-select-new']);
+    // The documented residual: the renamed tag stays. It is not a Christy title.
+    expect(h.ashby.tags.map((t) => t.id)).toContain('tag-select-old');
+    expect(h.candidateTagList).toHaveBeenCalledTimes(2);
+  });
+
+  it('archived: the add is refused, the fresh read finds no active tag, so it waits an hour and the old tag stays', async () => {
+    const listTags = vi.fn()
+      .mockResolvedValueOnce({ results: [SELECT], moreDataAvailable: false })
+      .mockResolvedValue({ results: [], moreDataAvailable: false });
+    const h = harness({ tags: [REJECT], listTags, client: { candidateAddTag: vi.fn(async () => { throw logical('tag_archived'); }) } });
+    await warm(h);
+    expect(await h.run()).toMatchObject({ committed: false, code: 'ashby_tag_not_found' });
+    expect(h.stores.deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'ashby_tag_not_found', TAG_CONFIG_FAULT_DEFER_SECONDS);
+    expect(h.client.candidateRemoveTag).not.toHaveBeenCalled();
+    expect(h.ashby.christyIds()).toEqual(['tag-reject']);
+  });
+
+  it('a refused write drops the cache, so the next run reads the catalogue again', async () => {
+    const h = harness({ tags: [SELECT], src: source({ recommendation: 'reject' }), client: { candidateRemoveTag: vi.fn(async () => { throw logical(); }) } });
+    await h.run();
+    const reads = h.candidateTagList.mock.calls.length;
+    await h.resolver.resolve('Christy: Reject');
+    expect(h.candidateTagList).toHaveBeenCalledTimes(reads + 1);
+  });
+
+  it('a cached id that is right is checked through the add answer: no extra read', async () => {
+    const h = harness();
+    await warm(h);
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
+    // The first read, then the settle read; the add's own answer did the check.
+    expect(h.client.candidateInfo).toHaveBeenCalledTimes(2);
+  });
+
+  it('a cached id whose add answer carries no tags is checked by one read', async () => {
+    const h = harness();
+    const add = h.client.candidateAddTag;
+    h.client.candidateAddTag = vi.fn(async (c: string, t: string) => { await add(c, t); return { results: {} }; });
+    await warm(h);
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
+    expect(h.client.candidateInfo).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('executeRecommendationTag: it looks again after writing (convergence)', () => {
+  it('a Christy tag another writer added meanwhile is removed, and the operation waits to re-check', async () => {
+    const h = harness();
+    const add = h.client.candidateAddTag;
+    h.client.candidateAddTag = vi.fn(async (c: string, t: string) => {
+      const answer = await add(c, t);
+      h.ashby.add('tag-reject'); // a second worker, a different verdict, at the same moment
+      return answer;
+    });
+    expect(await h.run()).toMatchObject({ committed: false, code: TAG_CONTENDED });
+    expect(h.stores.deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', TAG_CONTENDED, TAG_TRANSIENT_DEFER_SECONDS);
+    expect(h.calls).toEqual(['add:tag-select', 'remove:tag-reject']);
+    expect(h.ashby.christyIds()).toEqual(['tag-select']);
+
+    // The re-check: one tag, the right one, no write.
+    const again = harness({ tags: h.ashby.tags });
+    expect(await again.run()).toMatchObject({ committed: true, code: 'christy_tag_select' });
+    expect(again.calls).toEqual([]);
+  });
+
+  it('its own tag gone by the re-check: it writes nothing more and waits; the next run decides afresh', async () => {
+    const h = harness();
+    const add = h.client.candidateAddTag;
+    h.client.candidateAddTag = vi.fn(async (c: string, t: string) => {
+      const answer = await add(c, t);
+      h.ashby.remove('tag-select'); // another worker with a newer verdict took it off
+      return answer;
+    });
+    expect(await h.run()).toMatchObject({ committed: false, code: TAG_CONTENDED });
+    expect(h.calls).toEqual(['add:tag-select']);
+    expect(h.client.candidateRemoveTag).not.toHaveBeenCalled();
+  });
+
+  it('a refusal in the leftover pass only waits', async () => {
+    const h = harness();
+    const add = h.client.candidateAddTag;
+    h.client.candidateAddTag = vi.fn(async (c: string, t: string) => {
+      const answer = await add(c, t);
+      h.ashby.add('tag-reject');
+      return answer;
+    });
+    h.client.candidateRemoveTag = vi.fn(async () => { throw logical('nope'); });
+    expect(await h.run()).toMatchObject({ committed: false, code: TAG_CONTENDED });
+    expect(h.stores.failOperation).not.toHaveBeenCalled();
+  });
+});
+
+describe('executeRecommendationTag: everything else waits', () => {
   it.each([
     ['a plain error', new TypeError('boom')],
     ['HTTP 404', http(404)],
     ['a malformed response', new AshbyError('malformed_response', {})],
     ['a client-side refusal', new AshbyError('invalid_request', { code: 'invalid_id' })],
     ['a logical failure on a read', logical('candidate_not_found')],
-  ])('%s fails retryable operation_error, attempt-bounded', async (_label, error) => {
+  ])('%s defers five minutes as operation_error: no hot retry burns the attempts', async (_label, error) => {
     const h = harness({ client: { candidateInfo: vi.fn(async () => { throw error; }) } });
     expect(await h.run()).toMatchObject({ committed: false, code: 'operation_error' });
-    expect(h.stores.failOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'operation_error', true);
-    expect(h.stores.deferOperation).not.toHaveBeenCalled();
+    expect(h.stores.deferOperation).toHaveBeenCalledWith('op-1', 'lease-1', 'operation_error', TAG_TRANSIENT_DEFER_SECONDS);
+    expect(h.stores.failOperation).not.toHaveBeenCalled();
   });
 
   it('a lost lease on complete reports stale, not committed', async () => {
@@ -795,7 +977,10 @@ describe('executeRecommendationTag: everything else', () => {
   it('a lost lease on defer and on fail reports stale', async () => {
     const d = harness({ catalogue: [], stores: { deferOperation: vi.fn(async () => 'not_owned' as const) } });
     expect(await d.run()).toMatchObject({ staleLease: true });
-    const f = harness({ src: null, stores: { failOperation: vi.fn(async () => 'not_owned' as const) } });
+    const f = harness({
+      link: { externalCandidateId: null, externalApplicationId: null },
+      stores: { failOperation: vi.fn(async () => 'not_owned' as const) },
+    });
     expect(await f.run()).toMatchObject({ staleLease: true });
   });
 
@@ -803,7 +988,7 @@ describe('executeRecommendationTag: everything else', () => {
     const down = vi.fn(async () => { throw new Error('db down'); });
     const h = harness({
       client: { candidateInfo: vi.fn(async () => { throw new TypeError('boom'); }) },
-      stores: { failOperation: down },
+      stores: { failOperation: down, deferOperation: down },
     });
     await expect(h.run()).resolves.toMatchObject({ claimed: true, committed: false, code: 'operation_error' });
   });
@@ -841,6 +1026,7 @@ function workerStores(over: Partial<RuntimeWorkflowStores> = {}): RuntimeWorkflo
     readIngestion: async () => ({ state: 'ready', attempts: 0 }),
     readLink: async () => link,
     markWritebackPending: async () => ({ status: 'ok' }),
+    readRecommendationTagLink: async () => LINK,
     readRecommendationTagSource: async () => source(),
     ...over,
   };
@@ -857,12 +1043,13 @@ const workerDeps = (over: Partial<Parameters<typeof runClaimedAshbyOperation>[0]
   ...over,
 });
 
-function adapter(tags: unknown[] = []) {
+function adapter(tags: FakeTag[] = []) {
+  const ashby = new FakeCandidate(tags, CATALOGUE as FakeTag[]);
   const client: RecommendationTagClient = {
     applicationInfo: vi.fn(async () => ({ results: {}, moreDataAvailable: false })),
-    candidateInfo: vi.fn(async () => ({ results: { tags }, moreDataAvailable: false })),
-    candidateAddTag: vi.fn(async () => undefined),
-    candidateRemoveTag: vi.fn(async () => undefined),
+    candidateInfo: vi.fn(async () => ashby.answer()),
+    candidateAddTag: vi.fn(async (_c: string, tagId: string) => { ashby.add(tagId); return ashby.answer(); }),
+    candidateRemoveTag: vi.fn(async (_c: string, tagId: string) => { ashby.remove(tagId); return ashby.answer(); }),
   };
   const resolver = createChristyTagResolver({
     candidateTagList: async () => ({ results: CATALOGUE, moreDataAvailable: false }),

@@ -20,6 +20,7 @@ import type {
   AshbyCandidateProfileResult,
   AshbyIntakeType,
   AshbyProfileOutcome,
+  RecommendationTagLink,
   RecommendationTagSource,
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
@@ -418,58 +419,50 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       return { ...source, evidenceGrade };
     },
     /**
-     * The tag lane's run-time read. The verdict comes from the RAW column and
-     * nowhere else: `scorecardSourceFromAssessmentRow` and `buildScorecard` both
-     * turn a missing verdict into `hold`, which would tag a candidate Borderline
-     * for a result that has no verdict at all. Any read failure answers null,
-     * which the lane fails as a retryable `assessment_missing`.
+     * The tag lane's link read: the two Ashby ids, nothing else. Any read
+     * failure answers null, which the lane treats as a wait, not a failure.
      */
-    async readRecommendationTagSource(
-      applicationLinkId,
-      sourceSessionId = null,
-    ): Promise<RecommendationTagSource | null> {
-      const { data: link, error: linkError } = await client
+    async readRecommendationTagLink(applicationLinkId): Promise<RecommendationTagLink | null> {
+      const { data, error } = await client
         .from('ashby_application_links')
-        .select('external_application_id, external_candidate_id, session_id')
+        .select('external_application_id, external_candidate_id')
         .eq('provider', 'ashby')
         .eq('id', applicationLinkId)
         .maybeSingle();
-      const sessionId = sourceSessionId ?? (typeof link?.session_id === 'string' ? link.session_id : null);
-      if (linkError || !link || !sessionId) return null;
-      const { data: assessment, error: assessmentError } = await client
-        .from('assessments')
-        .select('id, recommendation')
-        .eq('session_id', sessionId)
-        .order('created_at', { ascending: false })
-        .order('id', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (assessmentError || !assessment) return null;
-      const row = assessment as unknown as { id: unknown; recommendation: unknown };
-      let evidenceGrade: 'decision' | 'insufficient' | null;
-      try {
-        evidenceGrade = await readAssessmentEvidenceGrade(client, String(row.id));
-      } catch {
-        return null;
-      }
-      const { data: newest, error: newestError } = await client
-        .from('ashby_operations')
-        .select('id')
-        .eq('provider', 'ashby')
-        .eq('application_link_id', applicationLinkId)
-        .eq('operation_type', 'recommendation_tag')
-        .order('created_at', { ascending: false })
-        .order('id', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (newestError || !newest) return null;
-      const newestId = String((newest as { id: unknown }).id);
+      if (error || !data) return null;
+      const r = data as unknown as Record<string, unknown>;
+      const nonEmpty = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
       return {
-        externalCandidateId: typeof link.external_candidate_id === 'string' ? link.external_candidate_id : null,
-        externalApplicationId: typeof link.external_application_id === 'string' ? link.external_application_id : null,
-        recommendation: row.recommendation,
-        evidenceGrade,
-        isNewestTagOperation: (operationId) => operationId === newestId,
+        externalCandidateId: nonEmpty(r.external_candidate_id),
+        externalApplicationId: nonEmpty(r.external_application_id),
+      };
+    },
+    /**
+     * The candidate's authoritative verdict, decided by the 0134 RPC across every
+     * link of the candidate. The verdict is the RAW column and nothing else:
+     * `scorecardSourceFromAssessmentRow` and `buildScorecard` both turn a missing
+     * verdict into `hold`, which would tag a candidate Borderline for a result
+     * that has no verdict at all. Any read failure, or an answer that is neither
+     * `ok` nor `no_assessment`, is null: the lane waits and reads again.
+     */
+    async readRecommendationTagSource(
+      applicationLinkId,
+      externalCandidateId,
+    ): Promise<RecommendationTagSource | null> {
+      const { data, error } = await client.rpc('ashby_candidate_tag_verdict', {
+        p_application_link_id: applicationLinkId,
+        p_external_candidate_id: externalCandidateId,
+      });
+      if (error || !data || typeof data !== 'object') return null;
+      const r = data as Record<string, unknown>;
+      if (r.status === 'no_assessment') {
+        return { status: 'no_assessment', recommendation: null, evidenceGrade: null };
+      }
+      if (r.status !== 'ok') return null;
+      return {
+        status: 'ok',
+        recommendation: r.recommendation ?? null,
+        evidenceGrade: parseEvidenceGrade(r.evidence_grade),
       };
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {

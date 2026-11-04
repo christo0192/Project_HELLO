@@ -12,6 +12,13 @@
 -- The worker's lane order (invite, scorecard, tag) still runs the scorecard
 -- first in the normal case.
 --
+-- WHICH VERDICT. A tag is candidate-wide, so an operation does not apply the
+-- verdict of the session it was enqueued for. Every run asks
+-- `ashby_candidate_tag_verdict` for the candidate's authoritative verdict, the
+-- newest assessment on any of the candidate's Ashby links, and applies that.
+-- Claim order, defers, retries, the backfill and two workers at once therefore
+-- all converge on the same tag: the newest verdict wins.
+--
 -- Additive and forward-only. complete, fail, defer, retry and cancel carry no
 -- type check and need no change. `phone-screening-structural.test.ts` still
 -- bars the phone lane from this table; the policy suite's I15 keeps the same
@@ -20,6 +27,14 @@
 -- Backfill: `backfill_ashby_recommendation_tags` is SHIPPED, NOT RUN. Nothing in
 -- this migration enqueues a past candidate. The owner runs it by hand, dry run
 -- first, after testing (docs/runbooks/ashby-runtime-activation.md section 11).
+
+-- Fail fast rather than queue (the 0109 precedent): the CHECK swap below takes
+-- ACCESS EXCLUSIVE on ashby_operations, which the worker claims from on every
+-- poll tick and every enqueue and webhook writes to. A long-held lock should
+-- fail this deploy (it retries cleanly), not stall the outbox behind it.
+-- LOCAL: scoped to this migration's transaction, so it can never persist on a
+-- pooled connection and change lock behaviour for anything after it.
+set local lock_timeout = '10s';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 1. The operation type CHECK (the 0032 chk_ashby_operations_state pattern)
@@ -225,7 +240,8 @@ grant execute on function screening_v2.claim_ashby_operation(text, text, integer
 --
 -- The verdict is deliberately NOT read or checked here. A newest result with no
 -- verdict (or insufficient evidence) still needs an operation, because the
--- worker has to take a stale tag off. The worker reads the verdict at run time.
+-- worker has to take a stale tag off. The worker reads the candidate's verdict
+-- at run time (section 5), so the operation is a trigger, not a decision.
 
 create or replace function screening_v2.enqueue_ashby_recommendation_tag(
   p_application_link_id uuid,
@@ -307,22 +323,135 @@ comment on function screening_v2.enqueue_ashby_recommendation_tag is
   'only; codes and opaque ids only.';
 
 -- ═══════════════════════════════════════════════════════════════════════
--- 5. backfill_ashby_recommendation_tags: the owner's tool. NOT RUN HERE.
+-- 5. ashby_candidate_tag_verdict: the candidate's authoritative verdict
+-- ═══════════════════════════════════════════════════════════════════════
+--
+-- A tag is candidate-wide, so the newest verdict has to win across every link
+-- the candidate has, and it is decided when an operation RUNS, not when it was
+-- enqueued. Every run recomputes this answer. So a deferred, retried or
+-- concurrent older operation applies the newest verdict too, and a result that
+-- never got an operation of its own (kill switch off, a failed enqueue, a
+-- paused mapping) is honoured by any later operation of the same candidate.
+--
+-- The candidate's links: the operation's own link (whatever its state; the
+-- claim and the worker already gate it), plus every OTHER non-terminal Ashby
+-- link with the same Ashby candidate id (when one is given) or the same
+-- non-null internal candidate. Their sessions: each link's session_id, plus
+-- every phone engagement's session (one engagement per re-screen cycle). The
+-- answer is the newest assessment on any of those sessions.
+--
+-- `no_assessment` means no result at all, so the target is "no tag".
+-- Codes, counts and opaque ids only: never a name, an email or a phone.
+
+create or replace function screening_v2.ashby_candidate_tag_verdict(
+  p_application_link_id   uuid,
+  p_external_candidate_id text default null
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_link       screening_v2.ashby_application_links%rowtype;
+  v_links      uuid[];
+  v_sessions   uuid[];
+  v_assessment record;
+begin
+  if p_application_link_id is null then
+    return jsonb_build_object('status', 'invalid_request');
+  end if;
+
+  select * into v_link from screening_v2.ashby_application_links
+   where id = p_application_link_id and provider = 'ashby';
+  if not found then return jsonb_build_object('status', 'not_found'); end if;
+
+  select coalesce(array_agg(l.id), '{}'::uuid[]) into v_links
+    from screening_v2.ashby_application_links l
+   where l.id = v_link.id
+      or (l.provider = 'ashby'
+          and l.terminal_state is null
+          and ((p_external_candidate_id is not null
+                and l.external_candidate_id = p_external_candidate_id)
+               or (v_link.candidate_id is not null
+                   and l.candidate_id = v_link.candidate_id)));
+
+  select coalesce(array_agg(s.session_id), '{}'::uuid[]) into v_sessions
+    from (
+      select l.session_id
+        from screening_v2.ashby_application_links l
+       where l.id = any(v_links) and l.session_id is not null
+      union
+      select e.session_id
+        from screening_v2.phone_engagements e
+       where e.application_link_id = any(v_links) and e.session_id is not null
+    ) s;
+
+  select a.id, a.recommendation, a.evidence_grade, a.created_at
+    into v_assessment
+    from screening_v2.assessments a
+   where a.session_id = any(v_sessions)
+   order by a.created_at desc, a.id desc
+   limit 1;
+  if not found then
+    return jsonb_build_object(
+      'status', 'no_assessment',
+      'link_count', cardinality(v_links),
+      'session_count', cardinality(v_sessions));
+  end if;
+
+  return jsonb_build_object(
+    'status', 'ok',
+    'assessment_id', v_assessment.id,
+    'recommendation', v_assessment.recommendation,
+    'evidence_grade', v_assessment.evidence_grade,
+    'assessment_created_at', v_assessment.created_at,
+    'link_count', cardinality(v_links),
+    'session_count', cardinality(v_sessions));
+end;
+$$;
+
+revoke all on function screening_v2.ashby_candidate_tag_verdict(uuid, text)
+  from public, anon, authenticated;
+grant execute on function screening_v2.ashby_candidate_tag_verdict(uuid, text)
+  to service_role;
+
+comment on function screening_v2.ashby_candidate_tag_verdict is
+  'The Christy tag lane''s authoritative verdict for a candidate, read at run time: '
+  'the newest assessment on the operation''s link and on every other non-terminal '
+  'Ashby link of the same Ashby candidate id or internal candidate, over each '
+  'link''s session and its phone engagements'' sessions. Returns the RAW '
+  'recommendation and evidence grade, or no_assessment. Read-only, service-role '
+  'only; codes, counts and opaque ids only.';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 6. backfill_ashby_recommendation_tags: the owner's tool. NOT RUN HERE.
 -- ═══════════════════════════════════════════════════════════════════════
 --
 -- Eligible: an Ashby link with a SUCCEEDED scorecard_write, non-terminal, whose
 -- mapping is enabled. The session is the link's newest succeeded scorecard's
 -- coalesce(source_session_id, link.session_id).
 --
--- ORDER. A tag is candidate-wide, so for a candidate in two jobs the operation
--- that runs LAST decides the tag, and the newest verdict must win. Links are
--- processed oldest scorecard first. Everything in this call shares one
--- transaction, so the operations would all get the same `scheduled_at` and the
--- claim's tie-break (`order by scheduled_at, id`) would be a random uuid order:
--- each inserted row is therefore scheduled one millisecond after the last.
+-- A link that already has ANY recommendation_tag operation is skipped
+-- (`skipped_has_tag_op`): the live lane owns it.
 --
--- A dry run writes nothing. A real run is safe to repeat (the key is idempotent).
--- Counts only: no candidate data is read beyond the verdict, none is returned.
+-- ORDER DOES NOT MATTER. Each operation recomputes the candidate's newest
+-- verdict when it runs (section 5), so whichever runs last, the newest verdict
+-- wins. Nothing here sequences the rows.
+--
+-- The dry run predicts the real run. It mirrors each refusal
+-- enqueue_ashby_recommendation_tag would give (`skipped_session_not_owned`,
+-- `skipped_no_assessment`), and counts verdicts with the very function the
+-- worker runs, on the link's stored Ashby candidate id. One gap: a link with no
+-- stored id is counted on its own link and internal candidate only, while the
+-- worker first resolves the id from Ashby, so a sibling in another job can
+-- still change the tag the real run applies to it.
+--
+-- A dry run writes nothing. A real run is safe to repeat: every link it
+-- enqueued has a tag operation the next time, and is skipped.
+-- Counts only: the Ashby candidate id is read to compute the verdict and is
+-- never returned.
 
 create or replace function screening_v2.backfill_ashby_recommendation_tags(
   p_dry_run boolean     default true,
@@ -335,20 +464,23 @@ set search_path = pg_catalog, screening_v2
 as $$
 declare
   c_actor constant uuid := '00000000-0000-4000-8000-000000000001';
-  v_row                      record;
-  v_status                   text;
-  v_result                   jsonb;
-  v_eligible                 integer := 0;
-  v_advance                  integer := 0;
-  v_hold                     integer := 0;
-  v_reject                   integer := 0;
-  v_none                     integer := 0;
-  v_evidence_insufficient    integer := 0;
-  v_skipped_terminal         integer := 0;
-  v_skipped_mapping_inactive integer := 0;
-  v_skipped_no_session       integer := 0;
-  v_inserted                 integer := 0;
-  v_enqueue                  jsonb := '{}'::jsonb;
+  v_row                       record;
+  v_verdict                   jsonb;
+  v_status                    text;
+  v_result                    jsonb;
+  v_eligible                  integer := 0;
+  v_advance                   integer := 0;
+  v_hold                      integer := 0;
+  v_reject                    integer := 0;
+  v_none                      integer := 0;
+  v_evidence_insufficient     integer := 0;
+  v_skipped_terminal          integer := 0;
+  v_skipped_mapping_inactive  integer := 0;
+  v_skipped_has_tag_op        integer := 0;
+  v_skipped_no_session        integer := 0;
+  v_skipped_session_not_owned integer := 0;
+  v_skipped_no_assessment     integer := 0;
+  v_enqueue                   jsonb := '{}'::jsonb;
 begin
   if p_dry_run is null or p_now is null then
     return jsonb_build_object('status', 'invalid_request');
@@ -357,13 +489,13 @@ begin
   for v_row in
     select l.id as link_id,
            l.terminal_state,
+           l.session_id as link_session_id,
+           l.external_candidate_id,
            m.status as mapping_status,
-           coalesce(s.source_session_id, l.session_id) as session_id,
-           a.recommendation,
-           a.evidence_grade
+           coalesce(s.source_session_id, l.session_id) as session_id
       from (
         select distinct on (o.application_link_id)
-               o.application_link_id, o.source_session_id, o.created_at, o.id
+               o.application_link_id, o.source_session_id
           from screening_v2.ashby_operations o
          where o.provider = 'ashby'
            and o.operation_type = 'scorecard_write'
@@ -373,14 +505,6 @@ begin
       join screening_v2.ashby_application_links l
         on l.id = s.application_link_id and l.provider = 'ashby'
       left join screening_v2.ashby_job_mappings m on m.id = l.job_mapping_id
-      left join lateral (
-        select x.recommendation, x.evidence_grade
-          from screening_v2.assessments x
-         where x.session_id = coalesce(s.source_session_id, l.session_id)
-         order by x.created_at desc, x.id desc
-         limit 1
-      ) a on true
-     order by s.created_at asc, s.id asc
   loop
     if v_row.terminal_state is not null then
       v_skipped_terminal := v_skipped_terminal + 1;
@@ -390,19 +514,50 @@ begin
       v_skipped_mapping_inactive := v_skipped_mapping_inactive + 1;
       continue;
     end if;
+    -- The live lane owns a link that already has a tag operation.
+    if exists (
+      select 1 from screening_v2.ashby_operations t
+       where t.application_link_id = v_row.link_id
+         and t.operation_type = 'recommendation_tag'
+    ) then
+      v_skipped_has_tag_op := v_skipped_has_tag_op + 1;
+      continue;
+    end if;
     if v_row.session_id is null then
       v_skipped_no_session := v_skipped_no_session + 1;
       continue;
     end if;
+    -- enqueue_ashby_recommendation_tag's own refusals, mirrored, so a dry run
+    -- never counts a link the real run would be refused for.
+    if v_row.link_session_id is distinct from v_row.session_id
+       and not exists (
+         select 1 from screening_v2.phone_engagements e
+          where e.application_link_id = v_row.link_id
+            and e.session_id = v_row.session_id
+       ) then
+      v_skipped_session_not_owned := v_skipped_session_not_owned + 1;
+      continue;
+    end if;
+    if not exists (
+      select 1 from screening_v2.assessments a
+       where a.session_id = v_row.session_id
+    ) then
+      v_skipped_no_assessment := v_skipped_no_assessment + 1;
+      continue;
+    end if;
 
     v_eligible := v_eligible + 1;
-    case v_row.recommendation
+    -- The verdict the worker will apply: the candidate's newest, not this
+    -- session's.
+    v_verdict := screening_v2.ashby_candidate_tag_verdict(
+      v_row.link_id, v_row.external_candidate_id);
+    case v_verdict->>'recommendation'
       when 'advance' then v_advance := v_advance + 1;
       when 'hold'    then v_hold := v_hold + 1;
       when 'reject'  then v_reject := v_reject + 1;
       else v_none := v_none + 1;
     end case;
-    if v_row.evidence_grade = 'insufficient' then
+    if v_verdict->>'evidence_grade' = 'insufficient' then
       v_evidence_insufficient := v_evidence_insufficient + 1;
     end if;
 
@@ -412,12 +567,6 @@ begin
       v_status := coalesce(v_result->>'status', 'unknown_status');
       v_enqueue := v_enqueue || jsonb_build_object(
         v_status, coalesce((v_enqueue->>v_status)::integer, 0) + 1);
-      if v_status = 'inserted' then
-        v_inserted := v_inserted + 1;
-        update screening_v2.ashby_operations
-           set scheduled_at = p_now + (v_inserted * interval '1 millisecond')
-         where id = (v_result->>'id')::uuid;
-      end if;
     end if;
   end loop;
 
@@ -430,7 +579,10 @@ begin
     'evidence_insufficient', v_evidence_insufficient,
     'skipped_terminal', v_skipped_terminal,
     'skipped_mapping_inactive', v_skipped_mapping_inactive,
-    'skipped_no_session', v_skipped_no_session
+    'skipped_has_tag_op', v_skipped_has_tag_op,
+    'skipped_no_session', v_skipped_no_session,
+    'skipped_session_not_owned', v_skipped_session_not_owned,
+    'skipped_no_assessment', v_skipped_no_assessment
   ) || case when p_dry_run then '{}'::jsonb
             else jsonb_build_object('enqueue', v_enqueue) end;
 end;
@@ -443,8 +595,9 @@ grant execute on function screening_v2.backfill_ashby_recommendation_tags(boolea
 
 comment on function screening_v2.backfill_ashby_recommendation_tags is
   'Owner tool, run by hand after testing: enqueue a recommendation_tag operation for '
-  'every eligible link that already has a succeeded scorecard, oldest scorecard first '
-  'so the newest verdict wins on a candidate in two jobs. p_dry_run (default true) '
-  'writes nothing. Repeat-safe. Returns counts only. Service-role only.';
+  'every eligible link that already has a succeeded scorecard and no tag operation '
+  'yet. Order does not matter: each operation applies the candidate''s newest verdict '
+  'when it runs. The dry run (p_dry_run, default true) writes nothing and mirrors the '
+  'enqueue refusals. Repeat-safe. Returns counts only. Service-role only.';
 
 notify pgrst, 'reload schema';

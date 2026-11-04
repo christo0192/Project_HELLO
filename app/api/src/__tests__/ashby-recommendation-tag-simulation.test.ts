@@ -7,8 +7,11 @@
  * The tenant keeps real state (a tag catalogue, a tag set per candidate), so what
  * is asserted is what a recruiter would see in Ashby. The outbox mirrors the 0134
  * rules the lane depends on: per-revision keys, `order by scheduled_at, id`,
- * defer rescheduling, and terminal links not being claimable. Those rules are
- * proven against real Postgres in policy_tests.sql section 0134.
+ * defer rescheduling, terminal links not being claimable, and the candidate-wide
+ * verdict (`ashby_candidate_tag_verdict`: the newest assessment over the link and
+ * every non-terminal link with the same Ashby candidate id, across the sessions
+ * each link owns). Those rules are proven against real Postgres in
+ * policy_tests.sql section 0134.
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -113,8 +116,11 @@ interface SimOp {
 interface SimLink {
   id: string;
   applicationId: string;
+  /** The Ashby candidate id, as `external_candidate_id`. */
   candidateId: string | null;
   terminal: 'withdrawn' | null;
+  /** The sessions the link owns: its session_id and its phone cycles'. */
+  sessions: Set<string>;
 }
 
 /** The in-memory outbox and tables. */
@@ -126,7 +132,12 @@ class SimDb {
   ops: SimOp[] = [];
 
   addLink(id: string, applicationId: string, candidateId: string | null) {
-    this.links.set(id, { id, applicationId, candidateId, terminal: null });
+    this.links.set(id, { id, applicationId, candidateId, terminal: null, sessions: new Set() });
+  }
+
+  /** The link owns this session (its session_id, or a phone cycle's). */
+  own(linkId: string, sessionId: string) {
+    this.links.get(linkId)?.sessions.add(sessionId);
   }
 
   /** One assessment revision lands. Time moves, so the newest is unambiguous. */
@@ -135,15 +146,28 @@ class SimDb {
     this.assessments.push({ id: `assessment-${++this.seq}`, sessionId, recommendation, grade, at: this.clock });
   }
 
-  private newest(sessionId: string) {
-    return this.assessments.filter((a) => a.sessionId === sessionId).sort((a, b) => b.at - a.at)[0];
+  private newestOf(sessionIds: ReadonlySet<string>): SimDb['assessments'][number] | undefined {
+    return this.assessments
+      .filter((a) => sessionIds.has(a.sessionId))
+      .sort((a, b) => b.at - a.at || b.id.localeCompare(a.id, 'en', { numeric: true }))[0];
+  }
+
+  /** `ashby_candidate_tag_verdict`, in memory. */
+  candidateVerdict(linkId: string, externalCandidateId: string | null) {
+    const own = this.links.get(linkId);
+    if (!own) return null;
+    const links = [...this.links.values()].filter((l) =>
+      l.id === linkId || (!l.terminal && externalCandidateId !== null && l.candidateId === externalCandidateId));
+    const sessions = new Set(links.flatMap((l) => [...l.sessions]));
+    return this.newestOf(sessions) ?? 'no_assessment';
   }
 
   enqueueTag(linkId: string, sessionId: string): { status: string } {
     const link = this.links.get(linkId);
     if (!link) return { status: 'not_found' };
     if (link.terminal) return { status: 'blocked_terminal' };
-    const a = this.newest(sessionId);
+    if (!link.sessions.has(sessionId)) return { status: 'session_mismatch' };
+    const a = this.newestOf(new Set([sessionId]));
     if (!a) return { status: 'assessment_missing' };
     const key = `ashby:recommendation_tag:${linkId}:${a.id}`;
     if (this.ops.some((o) => o.key === key)) return { status: 'duplicate' };
@@ -209,18 +233,15 @@ class SimDb {
         const l = this.links.get(id);
         if (l && !l.candidateId) l.candidateId = candidateId;
       },
-      readRecommendationTagSource: async (linkId, sessionId) => {
+      readRecommendationTagLink: async (linkId) => {
         const l = this.links.get(linkId);
-        const a = sessionId ? this.newest(sessionId) : undefined;
-        if (!l || !a) return null;
-        const newestOp = this.tagOps(linkId).sort((x, y) => y.createdAt - x.createdAt || y.id.localeCompare(x.id, 'en', { numeric: true }))[0];
-        return {
-          externalCandidateId: l.candidateId,
-          externalApplicationId: l.applicationId,
-          recommendation: a.recommendation,
-          evidenceGrade: a.grade,
-          isNewestTagOperation: (id) => id === newestOp?.id,
-        };
+        return l ? { externalCandidateId: l.candidateId, externalApplicationId: l.applicationId } : null;
+      },
+      readRecommendationTagSource: async (linkId, externalCandidateId) => {
+        const v = this.candidateVerdict(linkId, externalCandidateId);
+        if (v === null) return null;
+        if (v === 'no_assessment') return { status: 'no_assessment', recommendation: null, evidenceGrade: null };
+        return { status: 'ok', recommendation: v.recommendation, evidenceGrade: v.grade };
       },
       completeOperation: async (id, lease, anchor) => {
         const o = op(id, lease);
@@ -283,8 +304,9 @@ function world() {
     }
     throw new Error('the queue did not drain');
   };
-  /** An assessment lands and the real observer runs. */
+  /** An assessment lands on a session the link owns, and the real observer runs. */
   const complete = async (linkId: string, sessionId: string, recommendation: string | null, grade: 'decision' | 'insufficient' | null = 'decision') => {
+    db.own(linkId, sessionId);
     db.assess(sessionId, recommendation, grade);
     return observeAshbyCompletion(
       sessionId,
@@ -292,7 +314,7 @@ function world() {
       { evidenceGrade: grade },
     );
   };
-  return { tenant, db, tick, drain, complete };
+  return { tenant, db, stores, tick, drain, complete };
 }
 
 const CAND = 'cand-1';
@@ -339,14 +361,14 @@ describe('the flow on a fake tenant', () => {
     expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.borderline]);
   });
 
-  it('two results before the lane runs: the older operation is superseded, with no Ashby write', async () => {
+  it('two results before the lane runs: both operations apply the newest verdict, and Ashby is written once', async () => {
     const w = world();
     w.db.addLink('link-1', 'app-1', CAND);
     await w.complete('link-1', 'session-1', 'advance');
     await w.complete('link-1', 'session-2', 'reject');
     await w.drain();
     const [older, newer] = w.db.tagOps();
-    expect(older).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_superseded' });
+    expect(older).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_reject' });
     expect(newer).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_reject' });
     expect(w.tenant.writes).toEqual([`add:${CAND}:tag-reject`]);
   });
@@ -407,34 +429,131 @@ describe('the flow on a fake tenant', () => {
     expect(w.db.links.get('link-1')?.candidateId).toBe(CAND);
   });
 
-  it('backfill order: a candidate in two jobs ends on the newest verdict', async () => {
+  it.each(['older job first', 'newer job first'])(
+    'backfill, %s: a candidate in two jobs ends on the newest verdict, whatever the order',
+    async (order) => {
+      const w = world();
+      w.db.addLink('link-old', 'app-old', CAND);
+      w.db.own('link-old', 'session-old');
+      w.db.addLink('link-new', 'app-new', CAND);
+      w.db.own('link-new', 'session-new');
+      w.db.assess('session-old', 'reject');
+      w.db.assess('session-new', 'advance');
+      expect(w.db.enqueueTag('link-old', 'session-old').status).toBe('inserted');
+      expect(w.db.enqueueTag('link-new', 'session-new').status).toBe('inserted');
+      const [oldOp, newOp] = w.db.tagOps();
+      oldOp.scheduledAt = w.db.clock + (order === 'older job first' ? 1 : 2);
+      newOp.scheduledAt = w.db.clock + (order === 'older job first' ? 2 : 1);
+      w.db.clock += 10;
+      await w.drain();
+      expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.select]);
+      // Whichever runs first applies the newest verdict; the other finds it there.
+      expect(w.tenant.writes).toEqual([`add:${CAND}:tag-select`]);
+    },
+  );
+
+  it('a backfill after live operations keeps the newest verdict (TAG-1)', async () => {
     const w = world();
+    // Job 1 was screened before the deploy: a verdict, no operation.
     w.db.addLink('link-old', 'app-old', CAND);
+    w.db.own('link-old', 'session-old');
+    w.db.assess('session-old', 'advance');
+    // Job 2 after it: the live lane tags it.
     w.db.addLink('link-new', 'app-new', CAND);
-    w.db.assess('session-old', 'reject');
-    w.db.assess('session-new', 'advance');
-    // The backfill walks oldest scorecard first and schedules each insert one
-    // millisecond after the last. Ids are made to sort the WRONG way round, so
-    // only `scheduled_at` can give the right answer.
-    expect(w.db.enqueueTag('link-old', 'session-old').status).toBe('inserted');
-    expect(w.db.enqueueTag('link-new', 'session-new').status).toBe('inserted');
-    const [oldOp, newOp] = w.db.tagOps();
-    [oldOp.id, newOp.id] = [newOp.id, oldOp.id];
-    oldOp.scheduledAt = w.db.clock + 1;
-    newOp.scheduledAt = w.db.clock + 2;
-    w.db.clock += 10;
+    await w.complete('link-new', 'session-new', 'reject');
     await w.drain();
-    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.select]);
-    expect(w.tenant.writes).toEqual([
-      `add:${CAND}:tag-reject`,
-      `add:${CAND}:tag-select`,
-      `remove:${CAND}:tag-reject`,
-    ]);
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.reject]);
+    // The backfill enqueues job 1 afterwards, so its operation runs last.
+    expect(w.db.enqueueTag('link-old', 'session-old').status).toBe('inserted');
+    await w.drain();
+    expect(w.db.tagOps('link-old')[0]).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_reject' });
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.reject]);
+    expect(w.tenant.writes).toEqual([`add:${CAND}:tag-reject`]);
+  });
+
+  it('an older cycle\'s operation that runs last still applies the newest cycle\'s result (TAG-1, re-screen)', async () => {
+    const w = world();
+    w.db.addLink('link-1', 'app-1', CAND);
+    // Cycle 1 before the deploy: advance, no operation.
+    w.db.own('link-1', 'session-1');
+    w.db.assess('session-1', 'advance');
+    // Cycle 2 after it, graded insufficient: its live operation leaves no tag.
+    await w.complete('link-1', 'session-2', 'advance', 'insufficient');
+    await w.drain();
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([]);
+    // An operation for cycle 1 enqueued afterwards (as the old backfill did) runs last.
+    expect(w.db.enqueueTag('link-1', 'session-1').status).toBe('inserted');
+    await w.drain();
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([]);
+    expect(w.tenant.writes).toEqual([]);
+  });
+
+  it('an older job\'s operation that was deferred and runs after the newer one keeps the newest verdict (TAG-2)', async () => {
+    const w = world();
+    w.db.addLink('link-a', 'app-a', CAND);
+    w.db.addLink('link-b', 'app-b', CAND);
+    await w.complete('link-a', 'session-a', 'advance');
+    w.tenant.failStatus = 503;
+    await w.drain();
+    expect(w.db.tagOps('link-a')[0]).toMatchObject({ state: 'pending', errorCode: 'ashby_tag_transient' });
+    w.tenant.failStatus = null;
+    await w.complete('link-b', 'session-b', 'reject');
+    await w.drain();
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.reject]);
+    w.db.clock += 300_000;
+    await w.drain(); // job A's older operation runs last
+    expect(w.db.tagOps('link-a')[0]).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_reject' });
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.reject]);
+    expect(w.tenant.writes).toEqual([`add:${CAND}:tag-reject`]);
+  });
+
+  it('a withdrawn job\'s newer result stops counting for the candidate\'s other job', async () => {
+    const w = world();
+    w.db.addLink('link-a', 'app-a', CAND);
+    w.db.addLink('link-b', 'app-b', CAND);
+    await w.complete('link-a', 'session-a', 'hold');
+    await w.complete('link-b', 'session-b', 'reject');
+    w.db.links.get('link-b')!.terminal = 'withdrawn';
+    await w.drain();
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.borderline]);
+  });
+
+  it('two workers at once, with a new verdict landing between their reads, converge on one tag: the newest (TAG-2)', async () => {
+    const w = world();
+    w.db.addLink('link-a', 'app-a', CAND);
+    w.db.addLink('link-b', 'app-b', CAND);
+    await w.complete('link-a', 'session-a', 'advance');
+    await w.complete('link-b', 'session-b', 'hold');
+    // The first verdict read sees hold; a rescore (reject) lands right after it,
+    // so the second worker reads reject. Two targets, written at the same time.
+    // The in-memory read decides when it is CALLED, so the rescore lands
+    // synchronously after the first call, before the second worker's call. It
+    // gets no operation of its own: only the two racing operations can fix it.
+    const read = w.stores.readRecommendationTagSource!;
+    let reads = 0;
+    w.stores.readRecommendationTagSource = (linkId, externalCandidateId) => {
+      const answer = read(linkId, externalCandidateId);
+      if (++reads === 1) w.db.assess('session-a', 'reject');
+      return answer;
+    };
+    const [one, two] = await Promise.all([w.tick(), w.tick()]);
+    expect(one.recommendationTag.claimed && two.recommendationTag.claimed).toBe(true);
+    // The two targets really differed, so at least one worker saw the other's tag.
+    expect(reads).toBe(2);
+    expect([one.recommendationTag, two.recommendationTag]).toContainEqual(
+      expect.objectContaining({ code: 'ashby_tag_contended' }),
+    );
+    // Whatever the interleaving, whoever saw the tags change waits and re-checks.
+    w.db.clock += 300_000;
+    await w.drain();
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.reject]);
+    expect(w.db.tagOps().map((o) => o.state)).toEqual(['succeeded', 'succeeded']);
   });
 
   it('a backfill re-run is idempotent', async () => {
     const w = world();
     w.db.addLink('link-1', 'app-1', CAND);
+    w.db.own('link-1', 'session-1');
     w.db.assess('session-1', 'advance');
     expect(w.db.enqueueTag('link-1', 'session-1').status).toBe('inserted');
     await w.drain();
@@ -515,6 +634,24 @@ describe('the kill switch', () => {
     await w.drain();
     expect(w.db.tagOps()[0]).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_select' });
     expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.select]);
+  });
+
+  it('a newer result that got no operation while the switch was off is applied by the pending one (TAG-4)', async () => {
+    vi.stubEnv('ASHBY_RECOMMENDATION_TAGS_ENABLED', 'true');
+    const w = world();
+    w.db.addLink('link-1', 'app-1', CAND);
+    await w.complete('link-1', 'session-1', 'advance');
+    expect(w.db.tagOps()).toHaveLength(1);
+
+    vi.stubEnv('ASHBY_RECOMMENDATION_TAGS_ENABLED', 'false');
+    await w.complete('link-1', 'session-2', 'reject'); // the re-screen: no operation
+    expect(w.db.tagOps()).toHaveLength(1);
+
+    vi.stubEnv('ASHBY_RECOMMENDATION_TAGS_ENABLED', 'true');
+    await w.drain();
+    expect(w.db.tagOps()[0]).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_reject' });
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.reject]);
+    expect(w.tenant.writes).toEqual([`add:${CAND}:tag-reject`]);
   });
 
   it('the real runtime wires the lane behind the switch and reports its claim', () => {

@@ -714,22 +714,40 @@ scorecard first in the normal case.
 The completion observer enqueues one operation per assessment revision (key
 `ashby:recommendation_tag:<link>:<assessment>`), on both the normal and the
 insufficient-evidence path. A terminal link, or a mapping that is not `enabled`,
-gets no operation. The lane then reads the verdict at run time from the raw
-`assessments.recommendation` column, reads the candidate's tags with
-`candidate.info`, and writes the difference: add first, then remove, so a candidate
-is never without a tag it should have. A repeat writes nothing. An operation that
-is no longer the newest on its link completes as `christy_tag_superseded` with no
-Ashby call.
+gets no operation.
+
+**An operation is a trigger, not a decision.** When it runs, the lane:
+
+1. resolves the Ashby candidate id (the link's, else `application.info`, which it
+   then stores on the link);
+2. asks the database for the candidate's verdict **now**
+   (`screening_v2.ashby_candidate_tag_verdict`): the newest assessment on the
+   operation's link and on every other non-terminal Ashby link of the same
+   candidate, over each link's session and every phone re-screen cycle's session.
+   The verdict is the raw `assessments.recommendation` column and the evidence
+   grade; no result at all means no tag;
+3. reads the candidate's tags with `candidate.info`;
+4. writes the difference: add first, then remove, so a candidate is never without a
+   tag it should have;
+5. reads the tags once more, and completes only when exactly the right Christy tag
+   is there. A leftover (another worker, or a recruiter, changed the tags meanwhile)
+   is removed and the operation waits 5 minutes (`ashby_tag_contended`) to re-check.
+
+A repeat finds the right tag already there and writes nothing.
 
 The result is on the operation, in `external_anchor`: `christy_tag_select`,
-`christy_tag_borderline`, `christy_tag_reject`, `christy_tag_none` or
-`christy_tag_superseded`. Mission Control lists these operations as "Christy tag",
-with a working Retry button.
+`christy_tag_borderline`, `christy_tag_reject` or `christy_tag_none`. Mission
+Control lists these operations as "Christy tag", with a Retry button for a failed
+one.
 
 ### Failure codes
 
-A wait refunds the attempt, so it ends by age: older than **7 days**, the operation
-fails with the same code. Retry it from Mission Control once the cause is fixed.
+Almost every problem is a **wait**: the operation is rescheduled and the attempt is
+refunded, so it cannot burn its attempts in seconds. Because of that refund a wait
+ends by age: older than **7 days**, the operation fails with the code it was waiting
+on. Retry works for those age-limited failures and for the ones below that fail
+outright; it is refused only for an operation that used up all its attempts, which
+this lane almost never does, because it waits instead of retrying hot.
 
 | Code | Means | Behaviour | What to do |
 |---|---|---|---|
@@ -737,10 +755,23 @@ fails with the same code. Retry it from Mission Control once the cause is fixed.
 | `ashby_tag_not_found` | No active tag has that exact title, even after a fresh read | Waits 1 hour, writes nothing, the old tag stays | Create or un-archive the tag, or fix its title. |
 | `ashby_tag_ambiguous` | Two active tags have that title | Waits 1 hour, writes nothing | Archive the duplicate. |
 | `ashby_tag_transient` | 429, 5xx, timeout, network, or a tag list that could not be read to its end | Waits 5 minutes | Nothing, unless it persists. |
-| `ashby_tag_write_rejected[:code]` | Ashby refused a tag write, and a re-read shows the desired state does not hold | Fails, no retry | Look at the candidate in Ashby, then retry. |
+| `ashby_tag_contended` | The tags changed while the operation was writing them | Waits 5 minutes, then re-checks | Nothing, unless it persists. |
+| `ashby_tag_verdict_unreadable` | The link or the candidate's verdict could not be read from the database | Waits 5 minutes | Check the database is reachable. |
+| `operation_error` | Anything else, including a `candidate.info` answer in an unexpected shape | Waits 5 minutes | Check the logs (metadata only). |
+| `ashby_tag_write_rejected[:code]` | Ashby refused a tag write, a re-read shows it did not happen, and one more try with a freshly read tag id failed too | Fails, no retry | Look at the candidate in Ashby, then retry. |
 | `candidate_id_missing` | The link has no candidate id and `application.info` gave none | Fails, no retry | Check the application still exists in Ashby. |
-| `assessment_missing` | The verdict could not be read | Retries, up to the attempt limit | Check the database is reachable. |
-| `operation_error` | Anything else | Retries, up to the attempt limit | Check the logs (metadata only). |
+
+A refused write is looked at before it counts: a remove refused because the tag is
+already gone is a remove done, and an add refused because the tag is already on is
+an add done.
+
+The lane remembers the tag catalogue for 5 minutes. If the admin renames or archives
+a Christy tag inside that window, an add with the remembered id is checked against
+the candidate's tags and retried once with a fresh id. One residual remains: a tag
+renamed within those 5 minutes can be attached once under its NEW title (the add
+succeeds; the lane then puts the right tag on too). That needs an admin rename
+during a write, it is visible in Ashby, and the lane never removes the renamed tag
+because it no longer has a Christy title.
 
 A `running` operation has no reclaim: a worker crash between claim and completion
 strands the row, for tags as for every other operation type.
@@ -750,7 +781,16 @@ strands the row, for tags as for every other operation type.
 A tag is candidate-wide: the Ashby API has no job or application parameter, and a
 pipeline filter shows every active candidate with the tag on their profile. So the
 **newest verdict wins**, across jobs too. A candidate rejected for one job and
-selected for another carries only the tag of whichever result came last, under both
+selected for another carries only the tag of whichever result came last (the newest
+assessment), under both jobs.
+
+Because every operation applies the candidate's newest verdict when it runs, **the
+order operations run in does not matter**. An older job's operation that was
+deferred, retried, or enqueued later by the backfill applies the same newest
+verdict as the newer job's, and two workers at once settle on the same tag. A
+result that never got an operation of its own (for example while the kill switch
+was off) is still applied by the next operation that runs for that candidate. A
+withdrawn or deleted application's results stop counting for the candidate's other
 jobs.
 
 ### The tag and the Ashby 1-4 rating can look inconsistent
@@ -765,36 +805,58 @@ tags make visible, not a fault.
 
 Nothing enqueues past candidates automatically. Migration 0134 ships
 `screening_v2.backfill_ashby_recommendation_tags`, which takes every Ashby link with
-a succeeded `scorecard_write`, non-terminal, on an `enabled` mapping. The session is
-that link's newest succeeded scorecard's. It works oldest scorecard first, so that
-for a candidate in two jobs the newest verdict wins. It answers counts only.
+a succeeded `scorecard_write`, non-terminal, on an `enabled` mapping, and enqueues
+one tag operation for it. The session is that link's newest succeeded scorecard's.
+A link that already has any tag operation is skipped: the live lane owns it. Order
+does not matter, because each operation applies the candidate's newest verdict when
+it runs (see "One candidate, several jobs"). It answers counts only.
 
-Run these from `app/`, in an operator shell that has run `supabase link`.
+Run these from `app/` (the folder `scripts/verify-prod-function-drift.sh` runs
+from), in an operator shell that has run `supabase link`. The CLI is pinned to the
+drift script's version.
 
 1. **Dry run.** Writes nothing.
 
    ```bash
-   supabase db query --linked "select screening_v2.backfill_ashby_recommendation_tags(true);"
+   npx --yes supabase@2.118.0 db query --linked "select screening_v2.backfill_ashby_recommendation_tags(true);"
    ```
 
-   Read `total_eligible`, `verdicts` (raw values: `advance`, `hold`, `reject`,
-   `none`), `evidence_insufficient` (how many of those get no tag despite a raw
-   verdict) and the three `skipped_*` counts.
+   The dry run applies the same checks as the real run, so its numbers are what the
+   real run will do:
+
+   | Field | Means |
+   |---|---|
+   | `total_eligible` | Links that would get an operation. |
+   | `verdicts` | Those links by the verdict the lane will apply: the candidate's newest, across all its jobs, in raw values (`advance`, `hold`, `reject`, `none`). |
+   | `evidence_insufficient` | How many of those get no tag despite a raw verdict. |
+   | `skipped_terminal` | Withdrawn, deleted or manually cancelled applications. |
+   | `skipped_mapping_inactive` | The job's mapping is not `enabled`. |
+   | `skipped_has_tag_op` | The link already has a tag operation; the live lane owns it. |
+   | `skipped_no_session` | Neither the scorecard nor the link names a session. |
+   | `skipped_session_not_owned` | The scorecard's session is no longer the link's or one of its phone cycles'. |
+   | `skipped_no_assessment` | The scorecard's session has no assessment. |
+
+   One small gap: for a link with no stored Ashby candidate id, the dry run counts
+   the verdict from that link alone (and from links of the same internal candidate),
+   while the real run first reads the id from Ashby, so another job of the same
+   person can still change which tag it applies.
 
 2. **Run it**, only once the owner has seen those numbers and said go.
 
    ```bash
-   supabase db query --linked "select screening_v2.backfill_ashby_recommendation_tags(false);"
+   npx --yes supabase@2.118.0 db query --linked "select screening_v2.backfill_ashby_recommendation_tags(false);"
    ```
 
-   `enqueue` counts the answers: `inserted`, and on a re-run `duplicate`. Re-running
-   is safe. The lane drains one operation per poll tick (about 12 a minute at the
-   default 5 s), so a large backfill takes a while and shares the tenant's rate limit.
+   It answers the same counts plus `enqueue`, which should be `inserted` equal to
+   `total_eligible` and nothing else. Re-running is safe: every link it enqueued now
+   has a tag operation and is skipped. The lane drains one operation per poll tick
+   (about 12 a minute at the default 5 s), so a large backfill takes a while and
+   shares the tenant's rate limit.
 
 3. **Check it** in Mission Control, or by count:
 
    ```bash
-   supabase db query --linked "select state, external_anchor, error_code, count(*) from screening_v2.ashby_operations where operation_type = 'recommendation_tag' group by 1, 2, 3 order by 1, 2, 3;"
+   npx --yes supabase@2.118.0 db query --linked "select state, external_anchor, error_code, count(*) from screening_v2.ashby_operations where operation_type = 'recommendation_tag' group by 1, 2, 3 order by 1, 2, 3;"
    ```
 
 ### Kill switch and rollback
@@ -808,9 +870,17 @@ fly secrets set ASHBY_RECOMMENDATION_TAGS_ENABLED=false -a project-hello-api
 
 Off: no new operation is enqueued and the lane does not run. Pending operations wait,
 and turning it back on (`fly secrets unset ASHBY_RECOMMENDATION_TAGS_ENABLED -a
-project-hello-api`) resumes them. Results that landed while it was off get no
-operation of their own; the backfill picks up the ones with a scorecard. Scorecards
-and invites are unaffected.
+project-hello-api`) resumes them. Scorecards and invites are unaffected.
+
+Turning it back on does **not** create operations for results that landed while it
+was off. Such a result is still applied by the next operation that runs for that
+candidate (a pending one, a later screening, or the backfill), because every
+operation applies the candidate's newest verdict. The backfill only reaches a link
+that has no tag operation yet, so a candidate whose every link already had a
+finished tag operation before the switch went off keeps its old tag until its next
+result. For one such link, enqueue it by hand with the session of its newest result:
+`select screening_v2.enqueue_ashby_recommendation_tag('<link id>', '<session id>',
+'00000000-0000-4000-8000-000000000001');`.
 
 Tags already on candidates stay when the switch goes off. There is no bulk removal
 tool: remove them in Ashby by archiving the three tags, or by hand.

@@ -9,9 +9,12 @@
  *     created_at key, so neither the 0032 terminal gate nor the 0035 invite gate
  *     can silently go;
  *   - revoke, grant and the schema-cache reload are all there;
+ *   - the candidate verdict is read-only and candidate-wide by construction;
  *   - scripts/verify-prod-function-drift.sh checks are well-formed and
  *     DISCRIMINATING (the token is in the 0134 body and in no earlier one);
- *   - the backfill is shipped, never run, and returns no candidate data.
+ *   - the backfill is shipped, never run, mirrors the enqueue, counts the
+ *     worker's own verdict, and returns no candidate data;
+ *   - the hot-table lock waits at most 10 s (the 0109 precedent).
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -66,14 +69,14 @@ function regprocedureArgs(decl: string): string {
 }
 
 /** The `CHECKS=( ... )` entries: `<regprocedure>|<token>`, one per line. */
-function driftChecks(): Array<{ signature: string; token: string }> {
+function driftChecks(): Array<{ signature: string; needle: string }> {
   const block = /CHECKS=\(\n([\s\S]*?)\n\)/.exec(DRIFT_SCRIPT);
   if (!block) throw new Error('CHECKS array not found');
   return block[1]
     .split('\n')
     .map((line) => /^\s*"([^"|]+)\|([^"]+)"\s*$/.exec(line))
     .filter((m): m is RegExpExecArray => m !== null)
-    .map((m) => ({ signature: m[1], token: m[2] }));
+    .map((m) => ({ signature: m[1], needle: m[2] }));
 }
 
 const OLD_ALLOWLIST = "not in ('invite_delivery','scorecard_write','stage_move') then";
@@ -132,6 +135,14 @@ describe('0134 — the type CHECK', () => {
   it('re-creates no audit constraint: the generic ashby_operation_* actions cover it', () => {
     expect(CODE).not.toContain('chk_audit_action');
   });
+
+  it('fails fast on a contended lock: lock_timeout is set, LOCAL, before the first ALTER (the 0109 form)', () => {
+    const timeout = CODE.indexOf("set local lock_timeout = '10s';");
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThan(CODE.indexOf('alter table screening_v2.ashby_operations'));
+    expect(read('0109_ashby_mapping_archive.sql')).toContain("set local lock_timeout = '10s';");
+    expect(CODE).not.toMatch(/\bset lock_timeout\b/);
+  });
 });
 
 describe('0134 — enqueue_ashby_recommendation_tag', () => {
@@ -172,6 +183,53 @@ describe('0134 — enqueue_ashby_recommendation_tag', () => {
   });
 });
 
+describe('0134 — ashby_candidate_tag_verdict, the candidate-wide verdict', () => {
+  const fn = stripComments(declaration(M0134, 'ashby_candidate_tag_verdict'));
+
+  it('is a STABLE read: it writes nothing', () => {
+    expect(fn).toMatch(/\nlanguage plpgsql\nstable\nsecurity definer\n/);
+    expect(fn).not.toMatch(/\b(insert into|update screening_v2|delete from|perform)\b/);
+  });
+
+  it('takes the own link whatever its state, and other links only when non-terminal and Ashby', () => {
+    expect(fn).toMatch(
+      /where l\.id = v_link\.id\s+or \(l\.provider = 'ashby'\s+and l\.terminal_state is null\s+and \(/,
+    );
+  });
+
+  it('joins siblings by the given Ashby candidate id, or by the non-null internal candidate', () => {
+    expect(fn).toMatch(/p_external_candidate_id is not null\s+and l\.external_candidate_id = p_external_candidate_id/);
+    expect(fn).toMatch(/v_link\.candidate_id is not null\s+and l\.candidate_id = v_link\.candidate_id/);
+  });
+
+  it("reads each link's session and every phone cycle's session", () => {
+    expect(fn).toMatch(/where l\.id = any\(v_links\) and l\.session_id is not null/);
+    expect(fn).toMatch(/from screening_v2\.phone_engagements e\s+where e\.application_link_id = any\(v_links\) and e\.session_id is not null/);
+  });
+
+  it('answers the newest assessment over those sessions, the raw verdict and grade', () => {
+    expect(fn).toMatch(/where a\.session_id = any\(v_sessions\)\s+order by a\.created_at desc, a\.id desc\s+limit 1/);
+    expect(fn).toContain("'recommendation', v_assessment.recommendation");
+    expect(fn).toContain("'evidence_grade', v_assessment.evidence_grade");
+    for (const status of ['invalid_request', 'not_found', 'no_assessment', 'ok']) {
+      expect(fn).toContain(`'status', '${status}'`);
+    }
+  });
+
+  it('returns codes, counts and opaque ids only: no candidate table, no contact column', () => {
+    expect(fn).not.toContain('screening_v2.candidates');
+    expect(fn).not.toMatch(/\b(email|phone_e164|phone_raw|name)\b/);
+    // Every answer is one `jsonb_build_object(...);`. Its keys, the status aside.
+    const answers = [...fn.matchAll(/jsonb_build_object\(([\s\S]*?)\);/g)].map((m) => m[1]);
+    expect(answers).toHaveLength(4);
+    const keys = answers.flatMap((a) =>
+      [...a.replace(/'status', '[a-z_]+'/, '').matchAll(/'([a-z_]+)',/g)].map((k) => k[1]));
+    expect(new Set(keys)).toEqual(new Set([
+      'link_count', 'session_count', 'assessment_id', 'recommendation', 'evidence_grade', 'assessment_created_at',
+    ]));
+  });
+});
+
 describe('0134 — backfill_ashby_recommendation_tags', () => {
   const fn = stripComments(declaration(M0134, 'backfill_ashby_recommendation_tags'));
 
@@ -184,9 +242,35 @@ describe('0134 — backfill_ashby_recommendation_tags', () => {
     expect(fn.slice(0, gate)).not.toMatch(/\b(insert into|update screening_v2)\b/);
   });
 
-  it('walks links oldest scorecard first and schedules each insert after the last', () => {
-    expect(fn).toContain('order by s.created_at asc, s.id asc');
-    expect(fn).toContain("set scheduled_at = p_now + (v_inserted * interval '1 millisecond')");
+  it('does not sequence the rows: each operation decides the candidate verdict when it runs', () => {
+    expect(fn).not.toContain('scheduled_at');
+    expect(fn).not.toContain('millisecond');
+    expect(fn).not.toMatch(/order by s\.created_at/);
+  });
+
+  it('skips a link that already has ANY tag operation', () => {
+    expect(fn).toMatch(
+      /where t\.application_link_id = v_row\.link_id\s+and t\.operation_type = 'recommendation_tag'\s+\) then\s+v_skipped_has_tag_op := v_skipped_has_tag_op \+ 1;/,
+    );
+  });
+
+  it("mirrors enqueue_ashby_recommendation_tag's refusals, so the dry run predicts the real run", () => {
+    const enqueue = stripComments(declaration(M0134, 'enqueue_ashby_recommendation_tag'));
+    expect(enqueue).toContain('v_link.session_id is distinct from p_session_id');
+    expect(fn).toMatch(
+      /v_row\.link_session_id is distinct from v_row\.session_id\s+and not exists \(\s+select 1 from screening_v2\.phone_engagements e\s+where e\.application_link_id = v_row\.link_id\s+and e\.session_id = v_row\.session_id/,
+    );
+    expect(fn).toMatch(/v_skipped_session_not_owned := v_skipped_session_not_owned \+ 1;/);
+    expect(fn).toMatch(/select 1 from screening_v2\.assessments a\s+where a\.session_id = v_row\.session_id/);
+    expect(fn).toMatch(/v_skipped_no_assessment := v_skipped_no_assessment \+ 1;/);
+  });
+
+  it('counts the verdict the worker will apply: the candidate-wide one, on the stored Ashby id', () => {
+    expect(fn).toMatch(/v_verdict := screening_v2\.ashby_candidate_tag_verdict\(\s+v_row\.link_id, v_row\.external_candidate_id\);/);
+    expect(fn).toContain("case v_verdict->>'recommendation'");
+    expect(fn).toContain("if v_verdict->>'evidence_grade' = 'insufficient' then");
+    // The verdict is counted before the dry-run gate, so both runs count the same.
+    expect(fn.indexOf('ashby_candidate_tag_verdict(')).toBeLessThan(fn.indexOf('if not p_dry_run then'));
   });
 
   it('takes the session from the newest SUCCEEDED scorecard', () => {
@@ -197,15 +281,22 @@ describe('0134 — backfill_ashby_recommendation_tags', () => {
   });
 
   it('reports every documented count', () => {
-    for (const key of ['total_eligible', 'verdicts', 'skipped_terminal', 'skipped_mapping_inactive', 'skipped_no_session', 'enqueue']) {
+    for (const key of [
+      'total_eligible', 'verdicts', 'evidence_insufficient', 'skipped_terminal', 'skipped_mapping_inactive',
+      'skipped_has_tag_op', 'skipped_no_session', 'skipped_session_not_owned', 'skipped_no_assessment', 'enqueue',
+    ]) {
       expect(fn).toContain(`'${key}'`);
     }
     expect(fn).toMatch(/'advance', v_advance, 'hold', v_hold, 'reject', v_reject, 'none', v_none/);
   });
 
-  it('never touches a candidate table or a contact column', () => {
+  it('never touches a candidate table or a contact column; the Ashby id only feeds the verdict', () => {
     expect(fn).not.toContain('screening_v2.candidates');
-    expect(fn).not.toMatch(/\b(email|phone_e164|phone_raw|external_candidate_id|external_application_id)\b/);
+    expect(fn).not.toMatch(/\b(email|phone_e164|phone_raw|external_application_id)\b/);
+    // Read once in the scan, used once: the verdict call. Never returned.
+    expect(fn.match(/\bexternal_candidate_id\b/g)).toHaveLength(2);
+    const answer = fn.slice(fn.lastIndexOf('return jsonb_build_object('));
+    expect(answer).not.toContain('external_candidate_id');
   });
 
   it('is shipped, never run: the migration does not call it', () => {
@@ -220,6 +311,7 @@ describe('0134 — security posture', () => {
       'enqueue_ashby_operation',
       'claim_ashby_operation',
       'enqueue_ashby_recommendation_tag',
+      'ashby_candidate_tag_verdict',
       'backfill_ashby_recommendation_tags',
     ]) {
       const fn = declaration(CODE, name);
@@ -233,6 +325,7 @@ describe('0134 — security posture', () => {
       'enqueue_ashby_operation(uuid, text, text, uuid, text, uuid)',
       'claim_ashby_operation(text, text, integer, timestamptz)',
       'enqueue_ashby_recommendation_tag(uuid, uuid, uuid, timestamptz)',
+      'ashby_candidate_tag_verdict(uuid, text)',
       'backfill_ashby_recommendation_tags(boolean, timestamptz)',
     ];
     for (const sig of sigs) {
@@ -252,31 +345,38 @@ describe('verify-prod-function-drift.sh covers the functions 0134 declares', () 
     {
       name: 'enqueue_ashby_operation',
       signature: 'screening_v2.enqueue_ashby_operation(uuid,text,text,uuid,text,uuid)',
-      token: 'recommendation_tag',
+      needle: 'recommendation_tag',
       isNew: false,
     },
     {
       name: 'claim_ashby_operation',
       signature: 'screening_v2.claim_ashby_operation(text,text,integer,timestamptz)',
-      token: 'recommendation_tag',
+      needle: 'recommendation_tag',
       isNew: false,
     },
     {
       name: 'enqueue_ashby_recommendation_tag',
       signature: 'screening_v2.enqueue_ashby_recommendation_tag(uuid,uuid,uuid,timestamptz)',
-      token: 'enqueue_ashby_operation',
+      needle: 'enqueue_ashby_operation',
+      isNew: true,
+    },
+    {
+      name: 'ashby_candidate_tag_verdict',
+      signature: 'screening_v2.ashby_candidate_tag_verdict(uuid,text)',
+      needle: 'no_assessment',
       isNew: true,
     },
     {
       name: 'backfill_ashby_recommendation_tags',
       signature: 'screening_v2.backfill_ashby_recommendation_tags(boolean,timestamptz)',
-      token: 'enqueue_ashby_recommendation_tag',
+      // Only the candidate-wide body calls the verdict function.
+      needle: 'ashby_candidate_tag_verdict',
       isNew: true,
     },
   ];
 
-  it.each(CHECKS)('$name: the check is listed verbatim', ({ signature, token }) => {
-    expect(driftChecks()).toContainEqual({ signature, token });
+  it.each(CHECKS)('$name: the check is listed verbatim', ({ signature, needle }) => {
+    expect(driftChecks()).toContainEqual({ signature, needle });
   });
 
   it.each(CHECKS)('$name: the signature is the one the 0134 header declares', ({ name, signature }) => {
@@ -285,15 +385,15 @@ describe('verify-prod-function-drift.sh covers the functions 0134 declares', () 
     expect(signature).toBe(`screening_v2.${name}${regprocedureArgs(decl)}`);
   });
 
-  it.each(CHECKS)('$name: the token is in the 0134 body, outside comments', ({ name, token }) => {
+  it.each(CHECKS)('$name: the token is in the 0134 body, outside comments', ({ name, needle }) => {
     const [decl] = declarations(M0134, name);
-    expect(stripComments(decl)).toContain(token);
+    expect(stripComments(decl)).toContain(needle);
   });
 
   it.each(CHECKS)(
     '$name: no earlier declaration carries the token, so a prod without 0134 fails',
     { timeout: 60_000 },
-    ({ name, token, isNew }) => {
+    ({ name, needle, isNew }) => {
       const earlier: Array<{ file: string; body: string }> = [];
       for (const file of readdirSync(migrations).sort()) {
         const number = /^(\d{4})_.*\.sql$/.exec(file);
@@ -306,7 +406,7 @@ describe('verify-prod-function-drift.sh covers the functions 0134 declares', () 
         expect(earlier.length).toBeGreaterThan(0);
       }
       for (const { file, body } of earlier) {
-        expect(body, `${file} must not mention ${token}`).not.toContain(token);
+        expect(body, `${file} must not mention ${needle}`).not.toContain(needle);
       }
     },
   );

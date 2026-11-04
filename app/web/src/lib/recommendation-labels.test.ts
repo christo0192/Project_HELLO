@@ -74,10 +74,77 @@ describe('recommendation labels', () => {
     );
   });
 
+  // The two scans walk all of src: a generous timeout, as a full parallel run is slow.
   it('no production file spells the retired verdict words as a label', () => {
-    const offenders = walk('src')
-      .filter((file) => /\.tsx?$/.test(file) && !/\.test\.tsx?$/.test(file))
-      .filter((file) => /(['"`])(Advance|Hold)\1/.test(readFileSync(resolve(ROOT, file), 'utf8')));
+    const offenders: string[] = [];
+    for (const [file, source] of productionSources()) {
+      // The phrases that stay are removed first, so only a retired use is left.
+      let text = source;
+      for (const kept of KEPT_PHRASES) text = text.split(kept).join('');
+      for (const pattern of RETIRED_PATTERNS) {
+        if (pattern.test(text)) offenders.push(`${file}: ${pattern}`);
+      }
+    }
     expect(offenders).toEqual([]);
+  }, 30_000);
+
+  it('every kept phrase is still in use, so the allow-list cannot hide a retired word', () => {
+    const all = [...productionSources().values()].join('\n');
+    for (const kept of KEPT_PHRASES) expect(all, kept).toContain(kept);
+  }, 30_000);
+
+  it.each([
+    ["label: 'Advance'", true],
+    ['<span>Hold</span>', true],
+    ['<td>\n  Advance\n</td>', true],
+    ['label="Advance threshold"', true],
+    ["'The hold threshold cannot be above the advance threshold.'", true],
+    ["context: 'Recommended to advance'", true],
+    ["{ label: 'On hold', value: 1 }", true],
+    ["label: 'Advance rate'", false],
+    ["'Hold released. The screening will run'", false],
+    ["subject_request_hold: 'On hold: data request'", false],
+    ['errors.hold_threshold = x', false],
+  ])('the scan catches %j: %s', (sample, caught) => {
+    let text = sample;
+    for (const kept of KEPT_PHRASES) text = text.split(kept).join('');
+    expect(RETIRED_PATTERNS.some((p) => p.test(text))).toBe(caught);
   });
 });
+
+let sources: Map<string, string> | null = null;
+
+/** Every production .ts/.tsx file under src, read once for both scans. */
+function productionSources(): Map<string, string> {
+  if (!sources) {
+    sources = new Map(
+      walk('src')
+        .filter((file) => /\.tsx?$/.test(file) && !/\.test\.tsx?$/.test(file))
+        .map((file) => [file, readFileSync(resolve(ROOT, file), 'utf8')]),
+    );
+  }
+  return sources;
+}
+
+/**
+ * The old verdict words, retired from display: a bare 'Advance' or 'Hold' label,
+ * the same as JSX text, and the phrases the rename replaced.
+ */
+const RETIRED_PATTERNS: readonly RegExp[] = [
+  /(['"`])(Advance|Hold)\1/,
+  />\s*(Advance|Hold)\s*</,
+  /\b(advance|hold) threshold\b/i,
+  /\brecommended to advance\b/i,
+  /\bOn hold(['"`])/,
+];
+
+/**
+ * Phrases that use the same words and STAY (owner decision): the team-decision
+ * metric, an R1/hold release, and the data-request hold. Explicit, so a new use
+ * of the words is a decision someone makes here, not one the scan waves through.
+ */
+const KEPT_PHRASES: readonly string[] = [
+  'Advance rate',
+  'Hold released',
+  'On hold: data request',
+];

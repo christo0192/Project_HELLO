@@ -17,13 +17,23 @@
  * which cannot be retracted, and a tag has no dependency on a scorecard (see
  * migration 0134).
  *
- * THE RUN. Read the verdict at run time, read the candidate's tags, write the
- * difference: add first, then remove, so a candidate is never without a tag it
- * should have. A repeat makes no writes, which is what makes `{ idempotent: true }`
- * on the client's tag writes safe.
+ * WHICH VERDICT. An operation is a trigger, not a decision. Every run asks the
+ * database for the candidate's authoritative verdict NOW: the newest assessment
+ * on any of the candidate's Ashby links (0134 `ashby_candidate_tag_verdict`).
+ * So claim order, defers, retries, the backfill and two workers at once all
+ * converge on the newest verdict, and a result that never got an operation
+ * (kill switch off, a failed enqueue) is honoured by any later one.
+ *
+ * THE RUN. Resolve the candidate, read the verdict, read the candidate's tags,
+ * write the difference: add first, then remove, so a candidate is never without
+ * a tag it should have. Then look once more and complete only when the desired
+ * state holds. A repeat makes no writes, which is what makes
+ * `{ idempotent: true }` on the client's tag writes safe.
  *
  * THE ERRORS ARE CLASSIFIED HERE, not in the worker's catch, which copies
- * `error.retriable` and so makes a timeout or `retry_exhausted` terminal.
+ * `error.retriable` and so makes a timeout or `retry_exhausted` terminal. Almost
+ * everything WAITS (a defer refunds the attempt), and age ends a wait, so a hot
+ * retry can never burn the attempts in seconds.
  *
  * LOGS AND EVENTS ARE METADATA ONLY: no tag id, candidate id or name, and no
  * title beyond the fixed constants below.
@@ -31,7 +41,12 @@
 
 import { isAshbyError, type AshbyError } from './errors.js';
 import { extractApplicationInfo } from './extractors.js';
-import type { OperationClaimRow, RuntimeWorkflowStores } from './orchestration.js';
+import type {
+  OperationClaimRow,
+  RecommendationTagLink,
+  RecommendationTagSource,
+  RuntimeWorkflowStores,
+} from './orchestration.js';
 import type { OperationRunOutcome } from './operation-worker.js';
 import type { AshbyResult, CandidateTagListParams } from './types.js';
 
@@ -58,6 +73,11 @@ export const TAG_CONFIG_FAULT_DEFER_SECONDS = 3600;
 export const TAG_TRANSIENT_DEFER_SECONDS = 300;
 /** A defer refunds the attempt, so age is what ends a row that keeps deferring. */
 export const TAG_DEFER_AGE_LIMIT_MS = 7 * 24 * 60 * 60_000;
+
+/** The link or the candidate's verdict could not be read from the database. */
+export const TAG_VERDICT_UNREADABLE = 'ashby_tag_verdict_unreadable';
+/** The tags changed under the run (another worker, a recruiter); the next run re-checks. */
+export const TAG_CONTENDED = 'ashby_tag_contended';
 
 /** Kill switch. Exactly `'true'` is on. */
 export function recommendationTagsEnabled(): boolean {
@@ -89,7 +109,8 @@ export interface TagCatalogueReader {
 }
 
 export type ChristyTagResolution =
-  | { status: 'found'; tagId: string }
+  /** `cached`: the id came from a catalogue read up to five minutes old. */
+  | { status: 'found'; tagId: string; cached: boolean }
   | { status: 'not_found' }
   | { status: 'ambiguous' }
   /** The catalogue could not be read to its end, so "not found" cannot be said. */
@@ -97,6 +118,8 @@ export type ChristyTagResolution =
 
 export interface ChristyTagResolver {
   resolve(title: ChristyTagTitle, options?: { fresh?: boolean }): Promise<ChristyTagResolution>;
+  /** Drop the cached catalogue, so the next resolve reads Ashby again. */
+  invalidate?(): void;
 }
 
 type TagCatalogue = ReadonlyMap<string, ReadonlySet<string>>;
@@ -145,7 +168,8 @@ async function readTagCatalogue(reader: TagCatalogueReader): Promise<TagCatalogu
 /**
  * Resolve a title to its one active tag id. A complete read is cached for
  * {@link CHRISTY_TAG_CACHE_MS}; a failed or truncated one never is. `fresh`
- * bypasses the cache and refreshes it. More than one active match fails closed.
+ * bypasses the cache and refreshes it, and `invalidate` drops it. More than one
+ * active match fails closed.
  */
 export function createChristyTagResolver(
   reader: TagCatalogueReader,
@@ -156,6 +180,7 @@ export function createChristyTagResolver(
     async resolve(title, options = {}) {
       let catalogue: TagCatalogue | null =
         !options.fresh && cached && nowMs() - cached.at < CHRISTY_TAG_CACHE_MS ? cached.catalogue : null;
+      const fromCache = catalogue !== null;
       if (!catalogue) {
         catalogue = await readTagCatalogue(reader);
         if (!catalogue) return { status: 'truncated' };
@@ -164,7 +189,10 @@ export function createChristyTagResolver(
       const ids = catalogue.get(title);
       if (!ids || ids.size === 0) return { status: 'not_found' };
       if (ids.size > 1) return { status: 'ambiguous' };
-      return { status: 'found', tagId: [...ids][0] };
+      return { status: 'found', tagId: [...ids][0], cached: fromCache };
+    },
+    invalidate() {
+      cached = null;
     },
   };
 }
@@ -190,6 +218,7 @@ export interface RecommendationTagDeps {
     | 'completeOperation'
     | 'failOperation'
     | 'deferOperation'
+    | 'readRecommendationTagLink'
     | 'readRecommendationTagSource'
     | 'bindLinkExternalCandidateId'
   >;
@@ -204,18 +233,17 @@ interface CandidateChristyTag {
   isArchived: boolean;
 }
 
-/**
- * The Christy tags on a candidate. Everything else in `tags` is dropped here, so
- * no later step can touch another tag. A result with no `tags` list throws: the
- * lane must not read that as "no tags" and write from it.
- */
-function christyTagsOf(results: unknown): CandidateChristyTag[] {
-  const tags = results !== null && typeof results === 'object'
-    ? (results as { tags?: unknown }).tags
-    : undefined;
-  if (!Array.isArray(tags)) throw new Error('candidate_tags_unreadable');
+/** A candidate answer Ashby sent in a shape the lane will not write from. */
+class MalformedTagAnswer extends Error {
+  constructor() {
+    super('candidate_tags_malformed');
+  }
+}
+
+/** Keep the three Christy titles; drop every other tag, so no later step can touch one. */
+function christyOnly(tags: readonly unknown[]): CandidateChristyTag[] {
   const out: CandidateChristyTag[] = [];
-  for (const item of tags as unknown[]) {
+  for (const item of tags) {
     if (item === null || typeof item !== 'object') continue;
     const { id, title, isArchived } = item as Record<string, unknown>;
     if (typeof id !== 'string' || id.length === 0 || typeof title !== 'string') continue;
@@ -223,6 +251,33 @@ function christyTagsOf(results: unknown): CandidateChristyTag[] {
     if (CHRISTY_TITLES.has(trimmed)) out.push({ id, title: trimmed, isArchived: isArchived === true });
   }
   return out;
+}
+
+/**
+ * The Christy tags in a `candidate.info` answer. Ashby marks `tags` required, so
+ * a candidate with the key left out most plausibly has none: that reads as an
+ * empty list. A `tags` that is there but not a list, or an answer that is not a
+ * Candidate at all, is malformed, and the lane waits rather than write from it.
+ */
+function christyTagsOf(results: unknown): CandidateChristyTag[] {
+  if (results === null || typeof results !== 'object' || Array.isArray(results)) throw new MalformedTagAnswer();
+  if (!('tags' in results)) return [];
+  const tags = (results as { tags?: unknown }).tags;
+  if (!Array.isArray(tags)) throw new MalformedTagAnswer();
+  return christyOnly(tags);
+}
+
+/**
+ * The Christy tags in a tag write's answer (documented as the Candidate), or
+ * null when the answer carries no tag list to trust: the caller reads instead.
+ */
+function christyTagsInWriteAnswer(answer: unknown): CandidateChristyTag[] | null {
+  const results = answer !== null && typeof answer === 'object'
+    ? (answer as { results?: unknown }).results
+    : undefined;
+  if (results === null || typeof results !== 'object') return null;
+  const tags = (results as { tags?: unknown }).tags;
+  return Array.isArray(tags) ? christyOnly(tags) : null;
 }
 
 /** The tag that already satisfies the target. An archived one does not. */
@@ -258,10 +313,15 @@ export function classifyTagError(error: unknown): TagFault {
   }
 }
 
+/** A logical failure on a tag WRITE: Ashby answered, and said no. Anything else is not one. */
+function refusedWrite(error: unknown): error is AshbyError {
+  return isAshbyError(error) && classifyTagError(error) === 'logical';
+}
+
 /** `ashby_tag_write_rejected`, plus the endpoint's code when it fits the column. */
-function writeRejectedCode(error: AshbyError): string {
+function writeRejectedCode(error: AshbyError | null): string {
   const base = 'ashby_tag_write_rejected';
-  for (const raw of error.endpointCodes) {
+  for (const raw of error?.endpointCodes ?? []) {
     const candidate = `${base}:${raw.toLowerCase()}`;
     if (/^[a-z0-9_.:-]{1,64}$/.test(candidate)) return candidate;
   }
@@ -312,33 +372,35 @@ export async function executeRecommendationTag(
     emit('deferred', code);
     return outcome(false, r === 'not_owned', code);
   };
+  /**
+   * Every error that escapes the run waits. A hot retryable fail would spend all
+   * five attempts in about 25 s and end in a row Mission Control cannot retry.
+   */
   const settleFault = async (error: unknown): Promise<OperationRunOutcome> => {
     const fault = classifyTagError(error);
     if (fault === 'permission') return defer('ashby_tag_permission_denied', TAG_CONFIG_FAULT_DEFER_SECONDS);
     if (fault === 'transient') return defer('ashby_tag_transient', TAG_TRANSIENT_DEFER_SECONDS);
-    return fail('operation_error', true);
+    // Unknown, a malformed answer, or a logical failure on a read.
+    return defer('operation_error', TAG_TRANSIENT_DEFER_SECONDS);
   };
 
   try {
-    // (a) Read the verdict at run time, so a rescore after enqueue is honoured.
-    let source: Awaited<ReturnType<NonNullable<RecommendationTagDeps['stores']['readRecommendationTagSource']>>> = null;
+    // (a) The link's Ashby ids.
+    let link: RecommendationTagLink | null = null;
     try {
-      source = (await stores.readRecommendationTagSource?.(claim.applicationLinkId, claim.sourceSessionId ?? null)) ?? null;
+      link = (await stores.readRecommendationTagLink?.(claim.applicationLinkId)) ?? null;
     } catch {
-      source = null;
+      link = null;
     }
-    if (!source) return await fail('assessment_missing', true);
+    if (!link) return await defer(TAG_VERDICT_UNREADABLE, TAG_TRANSIENT_DEFER_SECONDS);
 
-    // (b) A newer result has its own operation, which decides the tag.
-    if (!source.isNewestTagOperation(claim.id)) return await complete('christy_tag_superseded');
-
-    // (c) The candidate. Older links have no stored id; application.info has it.
-    let candidateId = source.externalCandidateId;
-    if (!candidateId && source.externalApplicationId) {
-      const info = await adapter.client.applicationInfo(source.externalApplicationId);
+    // (b) The candidate. Older links have no stored id; application.info has it.
+    let candidateId = link.externalCandidateId;
+    if (!candidateId && link.externalApplicationId) {
+      const info = await adapter.client.applicationInfo(link.externalApplicationId);
       candidateId = extractApplicationInfo(info.results).candidateId ?? null;
       if (candidateId) {
-        // Compare-and-set, best effort: the tag does not depend on the backfill.
+        // Compare-and-set, best effort: the tag does not depend on the bind.
         try {
           await stores.bindLinkExternalCandidateId?.(claim.applicationLinkId, candidateId);
         } catch { /* the next run reads application.info again */ }
@@ -347,51 +409,108 @@ export async function executeRecommendationTag(
     if (!candidateId) return await fail('candidate_id_missing', false);
     const candidate = candidateId;
 
-    // (d) What the candidate carries now.
+    // (c) The candidate's verdict, decided now across all its links, with the
+    // id just resolved, so a sibling in another job is found even when this
+    // link had no stored id.
+    let source: RecommendationTagSource | null = null;
+    try {
+      source = (await stores.readRecommendationTagSource?.(claim.applicationLinkId, candidate)) ?? null;
+    } catch {
+      source = null;
+    }
+    if (!source) return await defer(TAG_VERDICT_UNREADABLE, TAG_TRANSIENT_DEFER_SECONDS);
+    const target = source.status === 'ok'
+      ? christyTagForVerdict({ recommendation: source.recommendation, evidenceGrade: source.evidenceGrade })
+      : null;
+    const targetTitle = target ? CHRISTY_VERDICT_TAG_TITLES[target] : null;
+    const anchor = `christy_tag_${target ?? 'none'}`;
+
+    // (d) What the candidate carries now. A repeat ends here, with no write.
     const readChristyTags = async (): Promise<CandidateChristyTag[]> =>
       christyTagsOf((await adapter.client.candidateInfo(candidate)).results);
-    const present = await readChristyTags();
+    let tags = await readChristyTags();
+    if (desiredStateHolds(tags, targetTitle)) return await complete(anchor);
 
-    // (e) What it should carry. A missing or ambiguous tag writes NOTHING: the
-    // old tag stays until the new one can go on.
-    const target = christyTagForVerdict({
-      recommendation: source.recommendation,
-      evidenceGrade: source.evidenceGrade,
-    });
-    const targetTitle = target ? CHRISTY_VERDICT_TAG_TITLES[target] : null;
-    const alreadyThere = findTarget(present, targetTitle);
-    let keepId = alreadyThere?.id ?? null;
+    // (e) Put the target on. A missing or ambiguous tag writes NOTHING: the old
+    // tag stays until the new one can go on.
+    let keepId = findTarget(tags, targetTitle)?.id ?? null;
     if (targetTitle && !keepId) {
       let resolved = await adapter.resolver.resolve(targetTitle);
-      if (resolved.status === 'not_found') {
+      if (resolved.status === 'not_found') resolved = await adapter.resolver.resolve(targetTitle, { fresh: true });
+      let retried = false;
+      for (;;) {
+        if (resolved.status === 'not_found') return await defer('ashby_tag_not_found', TAG_CONFIG_FAULT_DEFER_SECONDS);
+        if (resolved.status === 'ambiguous') return await defer('ashby_tag_ambiguous', TAG_CONFIG_FAULT_DEFER_SECONDS);
+        if (resolved.status === 'truncated') return await defer('ashby_tag_transient', TAG_TRANSIENT_DEFER_SECONDS);
+        let refused: AshbyError | null = null;
+        let after: CandidateChristyTag[];
+        try {
+          const answer = await adapter.client.candidateAddTag(candidate, resolved.tagId);
+          // A freshly read id is trusted. A cached one is checked: the admin may
+          // have renamed or archived that tag since the catalogue was read.
+          if (!resolved.cached) {
+            keepId = resolved.tagId;
+            break;
+          }
+          after = christyTagsInWriteAnswer(answer) ?? (await readChristyTags());
+        } catch (error) {
+          // Ashby documents nothing about a repeated add, and a recruiter can
+          // edit tags between our read and our write: look before deciding.
+          if (!refusedWrite(error)) throw error;
+          refused = error;
+          after = await readChristyTags();
+        }
+        const on = findTarget(after, targetTitle);
+        if (on) {
+          keepId = on.id;
+          tags = after;
+          break;
+        }
+        // Not on. The cached id was stale, or Ashby refused it: drop the cache
+        // and try once more with an id from a fresh catalogue read.
+        adapter.resolver.invalidate?.();
+        if (retried) return await fail(writeRejectedCode(refused), false);
+        retried = true;
+        tags = after;
         resolved = await adapter.resolver.resolve(targetTitle, { fresh: true });
       }
-      if (resolved.status === 'not_found') return await defer('ashby_tag_not_found', TAG_CONFIG_FAULT_DEFER_SECONDS);
-      if (resolved.status === 'ambiguous') return await defer('ashby_tag_ambiguous', TAG_CONFIG_FAULT_DEFER_SECONDS);
-      if (resolved.status === 'truncated') return await defer('ashby_tag_transient', TAG_TRANSIENT_DEFER_SECONDS);
-      keepId = resolved.tagId;
     }
 
-    // (f) Add before remove. With no target this removes every Christy tag: a
-    // newer result has no verdict, so an old verdict must not stay on show.
-    const anchor = `christy_tag_${target ?? 'none'}`;
-    try {
-      if (keepId && !alreadyThere) await adapter.client.candidateAddTag(candidate, keepId);
-      for (const tag of present) {
-        if (tag.id !== keepId) await adapter.client.candidateRemoveTag(candidate, tag.id);
+    // (f) Take every other Christy tag off. With no target this removes them all:
+    // the newest result has no verdict, so an old verdict must not stay on show.
+    for (const tag of tags) {
+      if (tag.id === keepId) continue;
+      try {
+        await adapter.client.candidateRemoveTag(candidate, tag.id);
+      } catch (error) {
+        if (!refusedWrite(error)) throw error;
+        adapter.resolver.invalidate?.();
+        // A remove refused because the tag is already gone is a remove done.
+        const after = await readChristyTags();
+        if (after.some((t) => t.id === tag.id)) return await fail(writeRejectedCode(error), false);
       }
-    } catch (error) {
-      if (!isAshbyError(error) || classifyTagError(error) !== 'logical') throw error;
-      // Ashby documents nothing about a repeated add or remove, and a recruiter
-      // can edit tags between our read and our write. So look before calling it
-      // a failure. Any error from this read is classified below as usual.
-      const after = await readChristyTags();
-      if (desiredStateHolds(after, targetTitle)) return await complete(anchor);
-      return await fail(writeRejectedCode(error), false);
     }
 
-    // (g) Done. A repeat of this operation finds nothing to write.
-    return await complete(anchor);
+    // (g) Look once more: another worker or a recruiter may have changed the
+    // tags since our read. Complete only when the desired state holds.
+    const settled = await readChristyTags();
+    if (desiredStateHolds(settled, targetTitle)) return await complete(anchor);
+    const kept = findTarget(settled, targetTitle);
+    if (targetTitle === null || kept) {
+      // One pass over the leftovers. The next run confirms, so a refusal here
+      // only waits.
+      for (const tag of settled) {
+        if (tag.id === kept?.id) continue;
+        try {
+          await adapter.client.candidateRemoveTag(candidate, tag.id);
+        } catch (error) {
+          if (!refusedWrite(error)) throw error;
+        }
+      }
+    }
+    // Our target is gone, or leftovers were just removed: the next run reads the
+    // newest verdict again and decides from what is really there.
+    return await defer(TAG_CONTENDED, TAG_TRANSIENT_DEFER_SECONDS);
   } catch (error) {
     try {
       return await settleFault(error);

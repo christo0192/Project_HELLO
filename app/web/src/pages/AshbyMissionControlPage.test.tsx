@@ -208,6 +208,22 @@ describe('AshbyMissionControlPage', () => {
     expect(text).not.toMatch(/bearer|presigned|invite_token|resume_url|https?:\/\//i);
   });
 
+  it('words a suffixed error code by its prefix, with the exact code on hover', async () => {
+    // The tag lane appends Ashby's sanitized endpoint code to its refusal.
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{
+        ...WORKFLOWS.workflows[0],
+        operations: [{ id: 'op9', type: 'recommendation_tag', state: 'failed', errorCode: 'ashby_tag_write_rejected:tag_refused' }],
+      }],
+    });
+    renderPage();
+    const row = await screen.findByText(/^Christy tag: Failed/);
+    expect(row).toHaveTextContent('Christy tag: Failed (Ashby refused the tag change)');
+    expect(row).toHaveAttribute('title', 'recommendation_tag: failed (ashby_tag_write_rejected:tag_refused)');
+    expect(screen.queryByText(/tag_refused\)?$/)).toBeNull();
+  });
+
   it('pauses an enabled mapping and reloads', async () => {
     renderPage();
     await screen.findByText('Account Executive');

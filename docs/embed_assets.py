@@ -115,8 +115,8 @@ def render_scorecard(a, meta):
     reco = (a.get("recommendation") or "hold").lower()
 
     score_col = "var(--ok)" if overall >= 75 else "var(--warn)" if overall >= 50 else "var(--danger)"
-    reco_map = {"advance": ("Advance", "var(--ok)", "rgba(34,211,165,.14)"),
-                "hold": ("Hold", "var(--warn)", "rgba(245,183,78,.14)"),
+    reco_map = {"advance": ("Select", "var(--ok)", "rgba(34,211,165,.14)"),
+                "hold": ("Borderline", "var(--warn)", "rgba(245,183,78,.14)"),
                 "reject": ("Reject", "var(--danger)", "rgba(255,107,107,.14)")}
     rlabel, rfg, rbg = reco_map.get(reco, reco_map["hold"])
 
