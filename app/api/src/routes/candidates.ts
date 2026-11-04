@@ -28,6 +28,7 @@ import {
   type SessionRecordedFacts,
 } from '../lib/attempt-leg-timing.js';
 import { createLogger } from '../lib/logger.js';
+import { chunkIds, mapChunks, POSTGREST_MAX_ROWS, readAllPages } from '../lib/id-batches.js';
 import { projectIntakeType } from '../integrations/ashby/candidate-workflow.js';
 import type { AshbyIntakeType } from '../integrations/ashby/orchestration.js';
 
@@ -307,9 +308,95 @@ async function withoutR1Assessments(
 }
 
 /**
- * Reduce an assessments result set (ordered created_at DESC) to the latest
- * assessment per candidate. Single pass, no N+1 — the caller fetches all
- * assessments for the candidate set in one query.
+ * Hard ceiling on candidate pages for one list or summary read: 50 pages of
+ * POSTGREST_MAX_ROWS is 50,000 candidates. Beyond it the read reports an error
+ * rather than a silently short list.
+ */
+const CANDIDATE_MAX_PAGES = 50;
+
+/**
+ * Hard ceiling on assessment pages per batch of ID_BATCH_SIZE candidates:
+ * 10 pages of POSTGREST_MAX_ROWS is 10,000 assessment rows, a hundred per
+ * candidate. Revisions, rescores and R1 practice rounds add rows, so a batch
+ * may pass one page; it may not pass this.
+ */
+const ASSESSMENT_MAX_PAGES = 10;
+
+/** `query_failed` covers an error answer and a thrown client fault alike: readAllPages turns a throw into an error. */
+type AssessmentReadFailure = 'query_failed' | 'page_bound';
+
+/** The rows with each `id` once, keeping the first occurrence and the order. */
+function uniqueById<T extends { id: string }>(rows: readonly T[]): T[] {
+  const seen = new Set<string>();
+  return rows.filter((r) => (seen.has(r.id) ? false : (seen.add(r.id), true)));
+}
+
+function logAssessmentReadFailure(errorType: AssessmentReadFailure): void {
+  candidateLogger.error('db_error', {
+    error_category: 'candidate_assessments_read',
+    error_type: errorType,
+  });
+}
+
+/**
+ * Every assessment row for these candidates, newest first per candidate, read
+ * in batches of ID_BATCH_SIZE ids (lib/id-batches.ts says why).
+ *
+ * Each batch is paged past PostgREST's row cap (`created_at` DESC, `id`
+ * breaking ties), so a batch with many revisions or R1 rounds is read in
+ * full rather than truncated or refused.
+ *
+ * FAIL CLOSED, like the R1 lookup above. `null` when any batch errors, throws
+ * or passes ASSESSMENT_MAX_PAGES, and both routes then answer 503. Never "no
+ * assessments": before M026 one oversized read failed above about 390
+ * candidates, the error was dropped, and the list and the dashboard showed
+ * every candidate as never assessed, with HTTP 200. The first failure stops
+ * new batches, so the 503 does not wait for every other batch to fail too.
+ *
+ * Each candidate's rows all come back in ONE batch, newest first, so
+ * concatenating the batches keeps `latestAssessmentByCandidate`'s "first seen
+ * is latest" rule true.
+ */
+async function loadAssessmentRows(candidateIds: readonly string[]): Promise<LatestAssessmentRow[] | null> {
+  if (candidateIds.length === 0) return [];
+  try {
+    const batches = await mapChunks(
+      chunkIds(candidateIds),
+      async (chunk): Promise<LatestAssessmentRow[] | AssessmentReadFailure> => {
+        // `readAllPages` reads an absent list as an empty page: PostgREST
+        // answers `data: null` only together with an error, which is the one
+        // failure signal (as in the R1 lookup above).
+        const read = await readAllPages<LatestAssessmentRow>((from, to) => supabase
+          .from('assessments')
+          .select('candidate_id, session_id, overall_score, recommendation, created_at')
+          .in('candidate_id', chunk)
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: true })
+          .range(from, to), ASSESSMENT_MAX_PAGES);
+        if (read.ok) return read.rows;
+        return read.error instanceof Error && read.error.message === 'page_bound_exceeded' ? 'page_bound' : 'query_failed';
+      },
+      { stopWhen: (b) => typeof b === 'string' },
+    );
+    const failure = batches.find((b): b is AssessmentReadFailure => typeof b === 'string');
+    if (failure) {
+      logAssessmentReadFailure(failure);
+      return null;
+    }
+    return (batches as LatestAssessmentRow[][]).flat();
+  } catch {
+    // Unreachable today (readAllPages never rejects); kept so a future change
+    // cannot turn a throw into a hung request. The thrown value is never logged:
+    // it can carry a driver message or a URL.
+    logAssessmentReadFailure('query_failed');
+    return null;
+  }
+}
+
+/**
+ * Reduce an assessments result set (ordered created_at DESC per candidate) to
+ * the latest assessment per candidate. Single pass, no N+1 — the caller reads
+ * the candidate set's assessments in id batches (`loadAssessmentRows`).
  */
 function latestAssessmentByCandidate(
   rows: Array<{
@@ -482,8 +569,8 @@ export type AshbyJobStatus = 'enabled' | 'paused' | 'drift';
 const JOB_MAPPING_BATCH = 100;
 
 /** PostgREST caps a response at 1,000 rows; the links read pages through it. */
-const LINK_PAGE_SIZE = 1000;
-/** Hard ceiling on link pages per list request (10,000 links). */
+const LINK_PAGE_SIZE = POSTGREST_MAX_ROWS;
+/** Hard ceiling on link pages per batch of candidate ids (10,000 links). */
 const LINK_MAX_PAGES = 10;
 
 /**
@@ -510,44 +597,44 @@ function jobMappingByCandidate(rows: RawLinkRow[] | null): Map<string, string> {
 // enriched with the latest assessment recommendation + score (nullable),
 // suppressed to null while the candidate is under a decision-use block.
 candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQuerySchema), async (req, res, next) => {
-  let q = supabase
-    .from('candidates')
-    .select(
-      'id,name,email,phone_e164,phone_valid,skills,experience_years,status,role_id,created_at,decision_use_blocked_at,resume_id',
-    )
-    .order('created_at', { ascending: false });
-
-  if (req.query.role_id) q = q.eq('role_id', req.query.role_id as string);
-  if (req.authUser?.appRole === 'interviewer') {
-    q = q.eq('owner_id', req.authUser.id);
-  }
-
-  const { data, error } = await q;
-  if (error) return next(error);
-
-  const rows = (data ?? []) as Array<Record<string, unknown> & {
+  // Paged past PostgREST's row cap, which would otherwise drop every candidate
+  // past the newest 1000 without an error. `id` breaks created_at ties so the
+  // pages neither overlap nor skip.
+  const page = await readAllPages<Record<string, unknown> & {
     id: string;
     decision_use_blocked_at: string | null;
-  }>;
+  }>((from, to) => {
+    let q = supabase
+      .from('candidates')
+      .select(
+        'id,name,email,phone_e164,phone_valid,skills,experience_years,status,role_id,created_at,decision_use_blocked_at,resume_id',
+      )
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: true });
+    if (req.query.role_id) q = q.eq('role_id', req.query.role_id as string);
+    if (req.authUser?.appRole === 'interviewer') q = q.eq('owner_id', req.authUser.id);
+    return q.range(from, to);
+  }, CANDIDATE_MAX_PAGES);
+  if (!page.ok) return next(page.error);
+  // Pages are separate requests, so a candidate created between two of them
+  // shifts the newest-first order by one and repeats a row. Keep the first copy.
+  const rows = uniqueById(page.rows);
 
-  // One query for all latest assessments across the returned candidate set.
+  // The latest assessment per candidate, read in id batches. A failed read is
+  // a 503, never a list of candidates who all look unassessed.
   let latest = new Map<string, LatestAssessment>();
   const ids = rows.map((r) => r.id);
   if (ids.length > 0) {
-    const { data: assessments } = await supabase
-      .from('assessments')
-      .select('candidate_id, session_id, overall_score, recommendation, created_at')
-      .in('candidate_id', ids)
-      .order('created_at', { ascending: false });
-    const phoneOnly = await withoutR1Assessments(assessments as LatestAssessmentRow[] | null);
+    const assessments = await loadAssessmentRows(ids);
+    if (assessments === null) return res.status(503).json({ error: 'service_unavailable' });
+    const phoneOnly = await withoutR1Assessments(assessments);
     if (phoneOnly === null) return res.status(503).json({ error: 'service_unavailable' });
     latest = latestAssessmentByCandidate(phoneOnly.rows);
   }
 
-  // ONE additional bounded query for the whole page — an `in (...)` over the
-  // same candidate set the assessments query already uses, with the ingestion
-  // state embedded. Not a per-row lookup: a list of 50 candidates issues one
-  // extra query, not 50.
+  // One bounded query per batch of ID_BATCH_SIZE candidates — an `in (...)`
+  // over the same candidate set the assessments read uses, with the ingestion
+  // state embedded. Not a per-row lookup: 500 candidates issue five reads.
   //
   // A failure here degrades to `null` rather than failing the list: the
   // resume-review column is strictly additive diagnostic information, and the
@@ -572,27 +659,36 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   const loadResumeReview = async (): Promise<void> => {
     if (ids.length === 0) return;
     try {
-      // Page through the links so the PostgREST row cap cannot silently
-      // truncate the read. Rows stay `updated_at` DESC across pages.
-      const links: RawLinkRow[] = [];
-      let linkFailed = false;
-      let complete = false;
-      for (let page = 0; page < LINK_MAX_PAGES; page += 1) {
-        const from = page * LINK_PAGE_SIZE;
-        const { data: batch, error: linkErr } = await supabase
-          .from('ashby_application_links')
-          .select('candidate_id, updated_at, job_mapping_id, intake_type, ashby_resume_ingestions ( state )')
-          .eq('provider', 'ashby')
-          .in('candidate_id', ids)
-          .order('updated_at', { ascending: false })
-          .order('candidate_id', { ascending: true })
-          .limit(1, { foreignTable: 'ashby_resume_ingestions' })
-          .range(from, from + LINK_PAGE_SIZE - 1);
-        if (linkErr) { linkFailed = true; break; }
-        const got = (batch ?? []) as RawLinkRow[];
-        links.push(...got);
-        if (got.length < LINK_PAGE_SIZE) { complete = true; break; }
-      }
+      // One read per batch of candidate ids, each paged so the PostgREST row
+      // cap cannot silently truncate it. A candidate's links all land in one
+      // batch, still `updated_at` DESC, so "first seen is newest" holds after
+      // the batches are concatenated.
+      const perBatch = await mapChunks(chunkIds(ids), async (chunk) => {
+        const got: RawLinkRow[] = [];
+        for (let page = 0; page < LINK_MAX_PAGES; page += 1) {
+          const from = page * LINK_PAGE_SIZE;
+          const { data: batch, error: linkErr } = await supabase
+            .from('ashby_application_links')
+            .select('candidate_id, updated_at, job_mapping_id, intake_type, ashby_resume_ingestions ( state )')
+            .eq('provider', 'ashby')
+            .in('candidate_id', chunk)
+            .order('updated_at', { ascending: false })
+            .order('candidate_id', { ascending: true })
+            .limit(1, { foreignTable: 'ashby_resume_ingestions' })
+            .range(from, from + LINK_PAGE_SIZE - 1);
+          if (linkErr) return { rows: got, failed: true, complete: false };
+          const rowsOnPage = (batch ?? []) as RawLinkRow[];
+          got.push(...rowsOnPage);
+          if (rowsOnPage.length < LINK_PAGE_SIZE) return { rows: got, failed: false, complete: true };
+        }
+        return { rows: got, failed: false, complete: false };
+      }, { stopWhen: (b) => b.failed });
+      // The first failed batch stopped new ones (stopWhen): the read is
+      // additive, so waiting for every other batch's retries buys nothing.
+      // Unstarted slots are `undefined` and count as failed here.
+      const links = perBatch.flatMap((b) => b?.rows ?? []);
+      const linkFailed = perBatch.some((b) => !b || b.failed);
+      const complete = perBatch.every((b) => b?.complete === true);
       if (linkFailed && links.length === 0) return;
       linkFacts = resumeReviewByCandidate(links);
       if (linkFailed || !complete) return;
@@ -670,21 +766,22 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
 });
 
 // Aggregate pipeline assessment metrics — viewer and above, owner-scoped for
-// interviewers. Truthful and efficient (two bounded queries, no N+1):
+// interviewers. Truthful and efficient (paged and batched reads, no N+1):
 //   - average_score: mean of each candidate's latest assessment score across
 //     the assessed, non-suppressed cohort; null when none.
 //   - recommendation_distribution: deterministic per-recommendation counts.
 // Decision-use-blocked candidates are excluded (their automated
-// recommendations are suppressed everywhere).
+// recommendations are suppressed everywhere). Every candidate is counted,
+// past PostgREST's row cap; a failed assessments read is a 503, never zeros.
 candidatesRouter.get('/summary', requireRole('viewer'), async (req, res, next) => {
-  let cq = supabase.from('candidates').select('id, decision_use_blocked_at');
-  if (req.authUser?.appRole === 'interviewer') {
-    cq = cq.eq('owner_id', req.authUser.id);
-  }
-  const { data: candidates, error } = await cq;
-  if (error) return next(error);
+  const page = await readAllPages<{ id: string; decision_use_blocked_at: string | null }>((from, to) => {
+    let cq = supabase.from('candidates').select('id, decision_use_blocked_at').order('id', { ascending: true });
+    if (req.authUser?.appRole === 'interviewer') cq = cq.eq('owner_id', req.authUser.id);
+    return cq.range(from, to);
+  }, CANDIDATE_MAX_PAGES);
+  if (!page.ok) return next(page.error);
 
-  const eligibleIds = ((candidates ?? []) as Array<{ id: string; decision_use_blocked_at: string | null }>)
+  const eligibleIds = uniqueById(page.rows)
     .filter((c) => c.decision_use_blocked_at == null)
     .map((c) => c.id);
 
@@ -693,12 +790,9 @@ candidatesRouter.get('/summary', requireRole('viewer'), async (req, res, next) =
   let scoreCount = 0;
 
   if (eligibleIds.length > 0) {
-    const { data: assessments } = await supabase
-      .from('assessments')
-      .select('candidate_id, session_id, overall_score, recommendation, created_at')
-      .in('candidate_id', eligibleIds)
-      .order('created_at', { ascending: false });
-    const phoneOnly = await withoutR1Assessments(assessments as LatestAssessmentRow[] | null);
+    const assessments = await loadAssessmentRows(eligibleIds);
+    if (assessments === null) return res.status(503).json({ error: 'service_unavailable' });
+    const phoneOnly = await withoutR1Assessments(assessments);
     if (phoneOnly === null) return res.status(503).json({ error: 'service_unavailable' });
     const latest = latestAssessmentByCandidate(phoneOnly.rows);
     for (const { overall_score, recommendation } of latest.values()) {

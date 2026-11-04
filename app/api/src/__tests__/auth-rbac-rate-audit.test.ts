@@ -108,6 +108,7 @@ function chainable(value: any): any {
   fn.in = () => chainable(value);
   fn.order = () => chainable(value);
   fn.limit = () => chainable(value);
+  fn.range = () => chainable(value); // the candidates reads page past PostgREST's row cap (M026)
   fn.select = () => chainable(value);
   fn.insert = () => chainable(value);
   fn.update = () => chainable(value);

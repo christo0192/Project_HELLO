@@ -2073,7 +2073,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '503':
-          description: The R1 session lookup that keeps R1 assessments out of the phone latest-assessment columns could not be completed (error service_unavailable). The list is never returned unfiltered.
+          description: The assessments read, or the R1 session lookup that keeps R1 assessments out of the phone latest-assessment columns, could not be completed (error service_unavailable). The list is never returned with recommendations missing or unfiltered.
           content:
             application/json:
               schema:
@@ -2092,7 +2092,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CandidatesSummary'
         '503':
-          description: The R1 session lookup that keeps R1 assessments out of the phone aggregate could not be completed (error service_unavailable). The aggregate is never computed unfiltered.
+          description: The assessments read, or the R1 session lookup that keeps R1 assessments out of the phone aggregate, could not be completed (error service_unavailable). The aggregate is never computed from a partial or unfiltered set.
           content:
             application/json:
               schema:

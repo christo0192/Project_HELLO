@@ -31,6 +31,7 @@
  */
 
 import { supabase } from './supabase.js';
+import { mapChunks } from './id-batches.js';
 
 /** At most this many candidate ids per `in (...)` query. */
 export const PHONE_PROGRESS_CHUNK_SIZE = 100;
@@ -321,9 +322,17 @@ export function chunkIds(ids: readonly string[], size = PHONE_PROGRESS_CHUNK_SIZ
   return out;
 }
 
-async function loadChunk(chunk: string[]): Promise<Map<string, PhoneProgress>> {
-  const unknown = (): Map<string, PhoneProgress> =>
-    new Map(chunk.map((id) => [id, { ...PHONE_PROGRESS_UNKNOWN }]));
+/** One chunk's progress, and whether its read failed (which stops new chunks). */
+interface ChunkResult {
+  map: Map<string, PhoneProgress>;
+  failed: boolean;
+}
+
+async function loadChunk(chunk: string[]): Promise<ChunkResult> {
+  const unknown = (): ChunkResult => ({
+    map: new Map(chunk.map((id) => [id, { ...PHONE_PROGRESS_UNKNOWN }])),
+    failed: true,
+  });
   try {
     const { data, error } = await supabase
       .from('phone_engagements')
@@ -336,7 +345,7 @@ async function loadChunk(chunk: string[]): Promise<Map<string, PhoneProgress>> {
     const reduced = reducePhoneProgress(data as RawEngagementRow[]);
     const out = new Map<string, PhoneProgress>();
     for (const id of chunk) out.set(id, reduced.get(id) ?? { ...NEVER_ENGAGED });
-    return out;
+    return { map: out, failed: false };
   } catch {
     return unknown();
   }
@@ -356,11 +365,17 @@ export async function loadPhoneProgress(candidateIds: readonly string[]): Promis
   const out = new Map<string, PhoneProgress>();
   if (ids.length === 0) return out;
   try {
-    const results = await Promise.all(chunkIds(ids).map((chunk) => loadChunk(chunk)));
-    for (const m of results) for (const [id, p] of m) out.set(id, p);
+    // Bounded like every other id-batch read on the list route (M026): at
+    // 5,000 candidates an unbounded Promise.all would put 50 reads in flight
+    // at once for one request. The first failed chunk stops new ones, so an
+    // outage degrades in one retry cycle (~7 s), not one per four chunks.
+    const results = await mapChunks(chunkIds(ids), (chunk) => loadChunk(chunk), { stopWhen: (r) => r.failed });
+    for (const r of results) if (r) for (const [id, p] of r.map) out.set(id, p);
   } catch {
-    for (const id of ids) out.set(id, { ...PHONE_PROGRESS_UNKNOWN });
+    // mapChunks only rejects if a chunk throws, and loadChunk never does.
   }
+  // Every requested id is present: a chunk never started reads as unknown.
+  for (const id of ids) if (!out.has(id)) out.set(id, { ...PHONE_PROGRESS_UNKNOWN });
   return out;
 }
 
