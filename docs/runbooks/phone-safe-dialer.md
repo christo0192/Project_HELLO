@@ -471,7 +471,7 @@ and under `phone_max_daily_dials()`.
 Two things ship with the flag and are what make it safe:
 
 * **The fleet daily cap** (`phone_max_daily_dials()`, 50/IST-day in 0094,
-  250/IST-day since 0132). The
+  250/IST-day in 0132, 500/IST-day since 0135). The
   allowlist's real value was bounding blast radius; this bounds it by volume
   instead of by hand. `phone_max_concurrent()` bounds *simultaneity* — ten at a
   time, all day, is thousands of calls. Raising the cap is a migration, on

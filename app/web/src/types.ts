@@ -2291,7 +2291,11 @@ export interface PhoneDueStarvation {
  * change `ready` or the degradation verdict; they warn hours before the 24 h
  * signature ceiling turns resume ingestion off.
  */
-export type ScannerWarningReason = 'scanner_updater_failing' | 'scanner_signatures_aging';
+export type ScannerWarningReason =
+  | 'scanner_updater_failing'
+  | 'scanner_signatures_aging'
+  | 'scanner_upstream_late'
+  | 'scanner_upstream_unverified';
 
 /** 0114 (C10c). The signature updater block on the Ashby health `scanner`. */
 export interface ScannerUpdaterState {

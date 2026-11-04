@@ -70,7 +70,8 @@ describe('migration 0132: the ceiling', () => {
   it('returns 250, and the previous declaration (0094) returned 50', () => {
     expect(capIn(M0132)).toBe(250);
     const declaring = allFiles().filter((f) => capIn(read(f)) !== null);
-    expect(declaring).toEqual(['0094_phone_dial_scope_fleet_cap_suppressions.sql', FILE]);
+    // Later cap migrations follow (0135 raised it to 500; phone-0135-daily-cap.test.ts).
+    expect(declaring.slice(0, 2)).toEqual(['0094_phone_dial_scope_fleet_cap_suppressions.sql', FILE]);
     expect(capIn(read(declaring[0]))).toBe(50);
   });
 
@@ -89,19 +90,13 @@ describe('migration 0132: the ceiling', () => {
     expect(CODE).not.toMatch(/grant [^;]*phone_max_daily_dials[^;]* to (public|anon|authenticated)/);
   });
 
-  it('is the value the real-Postgres suite asserts as shipped (A1)', () => {
+  it('is no longer the shipped value: A1 and the drift check moved on with 0135', () => {
+    // What production must run is pinned once, for the newest cap file, in
+    // phone-0135-daily-cap.test.ts. Pinning 250 here too would contradict it.
     const assert = readRepo('../../../supabase/tests/phone_dial_scope_fleet_cap_assert.sql');
-    expect(assert).toContain('if screening_v2.phone_max_daily_dials() <> 250 then');
-    expect(assert).not.toContain('if screening_v2.phone_max_daily_dials() <> 50 then');
-  });
-
-  it('is checked against the LIVE body after every production migration', () => {
+    expect(assert).not.toContain('if screening_v2.phone_max_daily_dials() <> 250 then');
     const drift = readRepo('../../../../scripts/verify-prod-function-drift.sh');
-    expect(drift).toContain('  "screening_v2.phone_max_daily_dials()|select 250"\n');
-    // No earlier declaration carries the token, so a prod still on 0094 fails the check.
-    for (const f of allFiles().filter((x) => x < FILE)) {
-      expect(read(f), `${f} must not contain the drift token`).not.toContain('select 250');
-    }
+    expect(drift).not.toContain('"screening_v2.phone_max_daily_dials()|select 250"');
   });
 });
 

@@ -23,7 +23,7 @@
 | Limit | Value | Source |
 |---|---|---|
 | Concurrent calls (fleet) | **10** | `phone_max_concurrent()` |
-| New dials per day (fleet) | **250** since 0132, 2026-11-03 (was 50) (first attempts + same-day retries; scheduled callbacks are counted but never refused; reconnects not counted) | `phone_max_daily_dials()`, `admit_phone_attempt` (0114) |
+| New dials per day (fleet) | **500** since 0135, 2026-11-04 (250 from 0132, 2026-11-03; 50 before that) (first attempts + same-day retries; scheduled callbacks are counted but never refused; reconnects not counted) | `phone_max_daily_dials()`, `admit_phone_attempt` (0114) |
 | Dials per candidate engagement per IST day | **2** (`ist_day_seq` 1–2, DB CHECK + unique index) | `admit_phone_attempt` (0114), 0095 |
 | Gap between the 2 same-day dials | **5 hours** from the first dial's admission | `phone_same_day_retry_delay()` (0095). Verified live: 11:46 → 16:46 |
 | Same phone number across two applications | One first/retry dial per number per day | Guard B in `admit_phone_attempt` (0114) |

@@ -35,6 +35,7 @@ import { join } from 'node:path';
 
 import {
   loadAvUpdaterConfig,
+  lookupUpstreamRecord,
   resolveAvUpdaterStatusFile,
   startAvUpdater,
   writeAvUpdaterStatusFile,
@@ -98,12 +99,15 @@ export interface SupervisorHandle {
  * 0114 (C10c). The API is a SEPARATE process, so the updater's state reaches
  * `/health` through a small status file this supervisor rewrites atomically
  * after every attempt (`AV_UPDATER_STATUS_FILE`). Counts, instants, an exit
- * status and a closed reason code only.
+ * status, a closed reason code and the upstream evidence. That evidence decides
+ * whether a database past the ceiling is accepted, and this file is its only way
+ * across, so a failed write is logged.
  */
 export function supervisorUpdaterOptions(
   cfg: ReturnType<typeof loadAvUpdaterConfig>,
   source: NodeJS.ProcessEnv,
   writeStatus: (path: string, status: AvUpdaterStatus) => Promise<boolean> = writeAvUpdaterStatusFile,
+  upstreamLookup: StartUpdaterOptions['upstreamLookup'] = lookupUpstreamRecord,
 ): StartUpdaterOptions {
   const statusFile = resolveAvUpdaterStatusFile(source);
   return {
@@ -113,8 +117,14 @@ export function supervisorUpdaterOptions(
     // freshclam's exit 1 ("up to date") is a success only if the database on
     // disk is fresh NOW: decided by evidence, not by the exit status.
     isFresh: async (): Promise<boolean> => (await readSignatureState({ source })).fresh,
+    upstreamLookup,
     onStatus: async (status): Promise<void> => {
-      await writeStatus(statusFile, status);
+      if (!(await writeStatus(statusFile, status))) {
+        supervisorLogger.warn('unknown_event', {
+          error_category: 'av_updater',
+          error_type: 'status_write_failed',
+        });
+      }
     },
     // A machine with NO usable database cannot scan at all, and a lost
     // cold-start download used to cost a full steady-state hour of that.

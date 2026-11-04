@@ -290,7 +290,11 @@ const SCANNER_WARNING_LABELS: Record<string, string> = {
   scanner_updater_failing:
     'Virus-definition updates keep failing. Résumé scanning will stop if this continues.',
   scanner_signatures_aging:
-    'Virus definitions are getting old. Résumé scanning stops when they reach 24 hours.',
+    'Virus definitions are getting old. Résumé scanning stops at 24 hours unless they are still the newest published.',
+  scanner_upstream_late:
+    'ClamAV is late publishing new virus definitions. Résumé scanning continues on the newest available set, for up to 7 days.',
+  scanner_upstream_unverified:
+    'Cannot confirm what ClamAV has published. If a release runs late, résumé scanning will stop at 24 hours.',
 };
 
 /** Label for a WARNING-ONLY scanner code (0114, C10c); unknown → the code. */
