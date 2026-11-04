@@ -9234,14 +9234,16 @@ end;
 $$;
 
 -- ── I15: the phone substrate cannot move a stage, email or score ──────
--- Widening ashby_operations.operation_type would put dialing inside the
--- machinery that performs stage moves and scorecard writes. It is the
--- single line whose change would give this feature that blast radius.
+-- Widening ashby_operations.operation_type for phone would put dialing inside
+-- the machinery that performs stage moves and scorecard writes. It is the
+-- single line whose change would give this feature that blast radius. 0134
+-- added `recommendation_tag`, a candidate tag write that is not a phone type,
+-- so the exact text moved; the rule did not.
 select _policy_tests.assert(
-  '0042: chk_ashby_operations_type is NOT widened by the phone substrate',
+  '0042: chk_ashby_operations_type is NOT widened by the phone substrate (0134 added only recommendation_tag)',
   (select pg_get_constraintdef(oid) from pg_constraint
     where conname = 'chk_ashby_operations_type')
-    = 'CHECK ((operation_type = ANY (ARRAY[''invite_delivery''::text, ''scorecard_write''::text, ''stage_move''::text])))',
+    = 'CHECK ((operation_type = ANY (ARRAY[''invite_delivery''::text, ''scorecard_write''::text, ''stage_move''::text, ''recommendation_tag''::text])))',
   'phone must ride a queue NAME (phone.dial), never an Ashby operation type');
 
 select _policy_tests.assert(
@@ -23166,6 +23168,487 @@ select _policy_tests.assert(
   (select count(*) from screening_v2.email_allowlist) = 3,
   'the 0133 block must clean up its synthetic allowlist rows');
 -- ==== 0133 END ====
+
+-- ==== 0134 BEGIN — Christy verdict tags: the recommendation_tag operation ====
+-- Executes the real 0134 RPCs against the fully migrated schema. Fixtures are
+-- tagged `pol134-*` and torn down at the end of the block; audit_events is
+-- append-only, so its rows stay.
+--
+-- SNAPSHOT RULE (as the 0133 block): every RPC that WRITES is called in its own
+-- statement (`v := ...`) BEFORE the assertion that reads the rows.
+--
+-- The backfill scans every link in the database, including anything an earlier
+-- section left behind, so its counts are asserted as a DELTA from a baseline
+-- taken before this block's fixtures exist.
+
+select _policy_tests.assert(
+  '0134: the operation type CHECK admits exactly the four types and is validated',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_ashby_operations_type')
+    = 'CHECK ((operation_type = ANY (ARRAY[''invite_delivery''::text, ''scorecard_write''::text, ''stage_move''::text, ''recommendation_tag''::text])))'
+  and (select convalidated from pg_constraint where conname = 'chk_ashby_operations_type'),
+  'a NOT VALID constraint leaves old rows unchecked; a fifth type is a new decision');
+
+select _policy_tests.assert(
+  '0134: all four functions are definer, pinned search_path and service-role only',
+  (select count(*)
+     from pg_proc p
+    where p.oid in (
+            'screening_v2.enqueue_ashby_operation(uuid,text,text,uuid,text,uuid)'::regprocedure,
+            'screening_v2.claim_ashby_operation(text,text,integer,timestamptz)'::regprocedure,
+            'screening_v2.enqueue_ashby_recommendation_tag(uuid,uuid,uuid,timestamptz)'::regprocedure,
+            'screening_v2.backfill_ashby_recommendation_tags(boolean,timestamptz)'::regprocedure)
+      and p.prosecdef
+      and 'search_path=pg_catalog, screening_v2' = any(p.proconfig)
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 4,
+  'an outbox RPC reachable from a browser role could write to Ashby');
+
+create or replace function _policy_tests.p134_mapping(p_tag text, p_status text default 'enabled')
+returns uuid language plpgsql as $p134m$
+declare v_id uuid;
+begin
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values (p_tag || '-job', (select id from screening_v2.roles order by id limit 1),
+          '00000000-0000-4000-8000-0000000000ad', p_tag || '-ai', p_tag || '-ta',
+          p_status, 'manual')
+  returning id into v_id;
+  return v_id;
+end;
+$p134m$;
+
+create or replace function _policy_tests.p134_link(p_tag text, p_map uuid, p_session uuid default null)
+returns uuid language plpgsql as $p134l$
+declare v_id uuid;
+begin
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, session_id)
+  values (p_tag || '-app', p_tag || '-job', p_map, p_session)
+  returning id into v_id;
+  return v_id;
+end;
+$p134l$;
+
+create or replace function _policy_tests.p134_session(p_cand uuid)
+returns uuid language plpgsql as $p134s$
+declare v_id uuid;
+begin
+  insert into screening_v2.call_sessions (candidate_id, role_id, mode, provider, status)
+  values (p_cand, (select id from screening_v2.roles order by id limit 1),
+          'live', 'livekit', 'created')
+  returning id into v_id;
+  return v_id;
+end;
+$p134s$;
+
+create or replace function _policy_tests.p134_assess(
+  p_session uuid, p_cand uuid, p_reco text, p_at timestamptz, p_insufficient boolean default false
+)
+returns uuid language plpgsql as $p134a$
+declare v_id uuid;
+begin
+  insert into screening_v2.assessments
+    (session_id, candidate_id, source, provenance, recommendation, created_at,
+     evidence_grade, evidence_reason)
+  values (p_session, p_cand, 'browser', _policy_tests.valid_provenance_json(), p_reco, p_at,
+          case when p_insufficient then 'insufficient' end,
+          case when p_insufficient then 'evidence_read_failed' end)
+  returning id into v_id;
+  return v_id;
+end;
+$p134a$;
+
+create or replace function _policy_tests.p134_scorecard(
+  p_link uuid, p_key text, p_session uuid, p_at timestamptz, p_state text default 'succeeded'
+)
+returns void language sql as $p134c$
+  insert into screening_v2.ashby_operations
+    (application_link_id, operation_type, operation_key, state, source_session_id, created_at)
+  values (p_link, 'scorecard_write', p_key, p_state, p_session, p_at);
+$p134c$;
+
+create or replace function _policy_tests.p134_tag_ops(p_link uuid)
+returns integer language sql as $p134o$
+  select count(*)::integer from screening_v2.ashby_operations
+   where application_link_id = p_link and operation_type = 'recommendation_tag';
+$p134o$;
+
+-- ── 0134-1: enqueue statuses, operation shape and idempotency per revision ──
+do $$
+declare
+  c_actor constant uuid := '01340000-0000-4000-a000-0000000000aa';
+  c_t0    constant timestamptz := '2026-11-01T00:00:00Z';
+  v_cand uuid; v_map uuid; v_paused uuid; v_res jsonb;
+  v_s1 uuid; v_s2 uuid; v_s3 uuid; v_s4 uuid; v_s5 uuid;
+  v_l1 uuid; v_l3 uuid; v_l4 uuid; v_l5 uuid;
+  v_a1 uuid; v_a2 uuid; v_op1 uuid; v_op2 uuid; v_op4 uuid; v_lease uuid;
+  v_row screening_v2.ashby_operations%rowtype;
+begin
+  insert into screening_v2.candidates (role_id, name, email)
+  values ((select id from screening_v2.roles order by id limit 1),
+          'pol134 candidate', 'pol134@example.invalid')
+  returning id into v_cand;
+
+  v_map := _policy_tests.p134_mapping('pol134-a');
+  v_paused := _policy_tests.p134_mapping('pol134-paused', 'paused');
+  v_s1 := _policy_tests.p134_session(v_cand);
+  v_s2 := _policy_tests.p134_session(v_cand);
+  v_l1 := _policy_tests.p134_link('pol134-l1', v_map, v_s1);
+
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(null, v_s1, c_actor);
+  perform _policy_tests.assert('0134: a null link is invalid_request',
+    v_res->>'status' = 'invalid_request', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, null, c_actor);
+  perform _policy_tests.assert('0134: a null session is invalid_request',
+    v_res->>'status' = 'invalid_request', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s1, null);
+  perform _policy_tests.assert('0134: a null actor is invalid_request',
+    v_res->>'status' = 'invalid_request', coalesce(v_res::text, 'null'));
+
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(gen_random_uuid(), v_s1, c_actor);
+  perform _policy_tests.assert('0134: an unknown link is not_found',
+    v_res->>'status' = 'not_found', coalesce(v_res::text, 'null'));
+
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s2, c_actor);
+  perform _policy_tests.assert('0134: a session the link does not own is session_mismatch',
+    v_res->>'status' = 'session_mismatch', coalesce(v_res::text, 'null'));
+
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s1, c_actor);
+  perform _policy_tests.assert('0134: a session with no assessment is assessment_missing',
+    v_res->>'status' = 'assessment_missing', coalesce(v_res::text, 'null'));
+
+  -- A paused mapping creates no outbound operation, whatever else is true.
+  v_s4 := _policy_tests.p134_session(v_cand);
+  v_a2 := _policy_tests.p134_assess(v_s4, v_cand, 'advance', c_t0);
+  v_l4 := _policy_tests.p134_link('pol134-l4', v_paused, v_s4);
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l4, v_s4, c_actor);
+  perform _policy_tests.assert('0134: a paused mapping is mapping_inactive and writes nothing',
+    v_res->>'status' = 'mapping_inactive' and _policy_tests.p134_tag_ops(v_l4) = 0,
+    coalesce(v_res::text, 'null'));
+
+  -- inserted: the operation's whole shape.
+  v_a1 := _policy_tests.p134_assess(v_s1, v_cand, 'advance', c_t0);
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s1, c_actor);
+  v_op1 := (v_res->>'id')::uuid;
+  select * into v_row from screening_v2.ashby_operations where id = v_op1;
+  perform _policy_tests.assert('0134: a first enqueue is inserted, pending, with no dependency',
+    v_res->>'status' = 'inserted' and v_row.state = 'pending'
+      and v_row.operation_type = 'recommendation_tag'
+      and v_row.depends_on_operation_id is null,
+    coalesce(v_res::text, 'null'));
+  perform _policy_tests.assert('0134: source_session_id is set to the enqueued session',
+    v_row.source_session_id = v_s1, coalesce(v_row.source_session_id::text, 'null'));
+  perform _policy_tests.assert('0134: the marker is NULL, so uq_ashby_operations_marker cannot collide',
+    v_row.marker is null, coalesce(v_row.marker, 'null'));
+  perform _policy_tests.assert('0134: the key names the link and the assessment revision',
+    v_row.operation_key = 'ashby:recommendation_tag:' || v_l1::text || ':' || v_a1::text,
+    v_row.operation_key);
+
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s1, c_actor);
+  perform _policy_tests.assert('0134: re-running the same revision is duplicate, same operation',
+    v_res->>'status' = 'duplicate' and (v_res->>'id')::uuid = v_op1
+      and _policy_tests.p134_tag_ops(v_l1) = 1,
+    coalesce(v_res::text, 'null'));
+
+  -- A scorecard with a marker on the same link does not collide with the tag.
+  v_res := screening_v2.enqueue_ashby_operation(v_l1, 'scorecard_write', 'pol134-score', null, repeat('b', 16), c_actor);
+  perform _policy_tests.assert('0134: scorecard_write still enqueues beside a tag operation',
+    v_res->>'status' = 'inserted', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.enqueue_ashby_operation(v_l1, 'invite_delivery', 'pol134-invite', null, null, c_actor);
+  perform _policy_tests.assert('0134: invite_delivery still enqueues',
+    v_res->>'status' = 'inserted', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.enqueue_ashby_operation(v_l1, 'stage_move', 'pol134-stage', null, null, c_actor);
+  perform _policy_tests.assert('0134: stage_move still enqueues',
+    v_res->>'status' = 'inserted', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.enqueue_ashby_operation(v_l1, 'recommendation_tag', 'pol134-direct', null, null, c_actor);
+  perform _policy_tests.assert('0134: enqueue_ashby_operation accepts recommendation_tag',
+    v_res->>'status' = 'inserted', coalesce(v_res::text, 'null'));
+  delete from screening_v2.ashby_operations where id = (v_res->>'id')::uuid;
+  v_res := screening_v2.enqueue_ashby_operation(v_l1, 'not_a_type', 'pol134-bad', null, null, c_actor);
+  perform _policy_tests.assert('0134: an unknown type is still refused by enqueue',
+    v_res->>'status' = 'invalid_operation_type', coalesce(v_res::text, 'null'));
+
+  -- Claim: the type is accepted, and the answer carries created_at. This is the
+  -- only tag operation pending, so the claim cannot pick up another.
+  v_res := screening_v2.claim_ashby_operation('recommendation_tag', 'pol134-w', 30);
+  v_lease := (v_res->>'lease_token')::uuid;
+  perform _policy_tests.assert('0134: claim accepts recommendation_tag and returns the operation',
+    v_res->>'status' = 'claimed' and (v_res->>'id')::uuid = v_op1
+      and v_res->>'operation_type' = 'recommendation_tag'
+      and (v_res->>'source_session_id')::uuid = v_s1,
+    coalesce(v_res::text, 'null'));
+  perform _policy_tests.assert('0134: claim returns created_at',
+    (v_res->>'created_at')::timestamptz
+      = (select created_at from screening_v2.ashby_operations where id = v_op1),
+    coalesce(v_res->>'created_at', 'null'));
+
+  -- A defer refunds the attempt and hides the row until it is due again.
+  v_res := screening_v2.defer_ashby_operation(v_op1, v_lease, 'ashby_tag_transient', 300);
+  perform _policy_tests.assert('0134: a tag operation defers, refunding the attempt',
+    v_res->>'status' = 'ok'
+      and (select attempts from screening_v2.ashby_operations where id = v_op1) = 0
+      and (select error_code from screening_v2.ashby_operations where id = v_op1) = 'ashby_tag_transient',
+    coalesce(v_res::text, 'null'));
+  v_res := screening_v2.claim_ashby_operation('recommendation_tag', 'pol134-w', 30);
+  perform _policy_tests.assert('0134: a deferred tag operation is not claimable until due',
+    v_res->>'status' = 'empty', coalesce(v_res::text, 'null'));
+
+  update screening_v2.ashby_operations set scheduled_at = now() where id = v_op1;
+  v_res := screening_v2.claim_ashby_operation('recommendation_tag', 'pol134-w', 30);
+  v_lease := (v_res->>'lease_token')::uuid;
+  v_res := screening_v2.complete_ashby_operation(v_op1, v_lease, 'christy_tag_select', null, c_actor);
+  perform _policy_tests.assert('0134: complete records the anchor and leaves the marker NULL',
+    v_res->>'status' = 'ok'
+      and (select external_anchor from screening_v2.ashby_operations where id = v_op1) = 'christy_tag_select'
+      and (select marker from screening_v2.ashby_operations where id = v_op1) is null,
+    coalesce(v_res::text, 'null'));
+
+  -- A new assessment revision gets its own operation, even after success.
+  v_a2 := _policy_tests.p134_assess(v_s1, v_cand, 'reject', c_t0 + interval '1 hour');
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s1, c_actor);
+  v_op2 := (v_res->>'id')::uuid;
+  perform _policy_tests.assert('0134: a new assessment revision gets a second operation',
+    v_res->>'status' = 'inserted' and v_op2 <> v_op1
+      and _policy_tests.p134_tag_ops(v_l1) = 2
+      and (select operation_key from screening_v2.ashby_operations where id = v_op2)
+          = 'ashby:recommendation_tag:' || v_l1::text || ':' || v_a2::text,
+    coalesce(v_res::text, 'null'));
+
+  -- A verdict-less revision still gets an operation: its job is the removal.
+  v_a2 := _policy_tests.p134_assess(v_s1, v_cand, null, c_t0 + interval '2 hours');
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l1, v_s1, c_actor);
+  perform _policy_tests.assert('0134: a revision with no verdict still enqueues, so a stale tag can come off',
+    v_res->>'status' = 'inserted', coalesce(v_res::text, 'null'));
+
+  -- A phone cycle's session: owned through the engagement, not the link column.
+  v_s3 := _policy_tests.p134_session(v_cand);
+  v_l3 := _policy_tests.p134_link('pol134-l3', v_map);
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, session_id, state)
+  values (v_l3, v_cand, (select id from screening_v2.roles order by id limit 1), v_s3, 'pending_prereqs');
+  perform _policy_tests.p134_assess(v_s3, v_cand, 'hold', c_t0);
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l3, v_s3, c_actor);
+  perform _policy_tests.assert('0134: a session owned through phone_engagements is accepted',
+    v_res->>'status' = 'inserted'
+      and (select source_session_id from screening_v2.ashby_operations
+            where id = (v_res->>'id')::uuid) = v_s3,
+    coalesce(v_res::text, 'null'));
+
+  -- Terminal: cancellation sweeps a pending tag, and nothing new is admitted.
+  v_s5 := _policy_tests.p134_session(v_cand);
+  v_l5 := _policy_tests.p134_link('pol134-l5', v_map, v_s5);
+  perform _policy_tests.p134_assess(v_s5, v_cand, 'advance', c_t0);
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l5, v_s5, c_actor);
+  v_op4 := (v_res->>'id')::uuid;
+  v_res := screening_v2.cancel_ashby_application(v_l5, 'withdrawn', 'pol134', c_actor, 'recruiter');
+  perform _policy_tests.assert('0134: terminal cancellation cancels a pending tag operation',
+    v_res->>'status' = 'ok'
+      and (select state from screening_v2.ashby_operations where id = v_op4) = 'cancelled',
+    coalesce(v_res::text, 'null'));
+  v_res := screening_v2.enqueue_ashby_recommendation_tag(v_l5, v_s5, c_actor);
+  perform _policy_tests.assert('0134: a terminal link is blocked_terminal',
+    v_res->>'status' = 'blocked_terminal', coalesce(v_res::text, 'null'));
+
+  -- The other lanes' claims still work and still answer created_at.
+  v_res := screening_v2.claim_ashby_operation('invite_delivery', 'pol134-w', 30);
+  perform _policy_tests.assert('0134: invite_delivery is still claimable, and its gate still reads the mapping',
+    v_res->>'status' = 'claimed' and v_res ? 'created_at', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.claim_ashby_operation('scorecard_write', 'pol134-w', 30);
+  perform _policy_tests.assert('0134: scorecard_write is still claimable',
+    v_res->>'status' = 'claimed', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.claim_ashby_operation('stage_move', 'pol134-w', 30);
+  perform _policy_tests.assert('0134: stage_move is still claimable',
+    v_res->>'status' = 'claimed', coalesce(v_res::text, 'null'));
+  v_res := screening_v2.claim_ashby_operation('not_a_type', 'pol134-w', 30);
+  perform _policy_tests.assert('0134: an unknown type is still refused by claim',
+    v_res->>'status' = 'invalid_operation_type', coalesce(v_res::text, 'null'));
+
+  -- Teardown. Engagements first; the link delete cascades its operations.
+  delete from screening_v2.phone_engagements where application_link_id = v_l3;
+  delete from screening_v2.ashby_application_links
+   where id in (v_l1, v_l3, v_l4, v_l5);
+  delete from screening_v2.ashby_job_mappings where id in (v_map, v_paused);
+  delete from screening_v2.call_sessions where candidate_id = v_cand;
+  delete from screening_v2.candidates where id = v_cand;
+end;
+$$;
+
+-- ── 0134-2: the backfill. Dry run writes nothing; a real run enqueues only
+--    eligible links, oldest scorecard first, and is idempotent ──────────────
+do $$
+declare
+  c_t0 constant timestamptz := '2026-10-01T00:00:00Z';
+  v_cand uuid; v_map uuid; v_paused uuid; v_base jsonb; v_res jsonb; v_res2 jsonb;
+  v_sa uuid; v_sb uuid; v_sh uuid; v_sx uuid; v_si uuid; v_st uuid; v_sp uuid; v_sf uuid;
+  v_sc_old uuid; v_sc_new uuid;
+  v_la uuid; v_lb uuid; v_lh uuid; v_lx uuid; v_li uuid; v_lt uuid; v_lp uuid; v_ln uuid;
+  v_lf uuid; v_lc uuid;
+  v_ops_before bigint; v_audit_before bigint; v_ops_after bigint; v_at_a timestamptz; v_at_b timestamptz;
+  v_bad text := '';
+begin
+  v_base := screening_v2.backfill_ashby_recommendation_tags();
+  perform _policy_tests.assert('0134: the backfill defaults to a dry run',
+    (v_base->>'dry_run')::boolean and not v_base ? 'enqueue', coalesce(v_base::text, 'null'));
+  v_res := screening_v2.backfill_ashby_recommendation_tags(null);
+  perform _policy_tests.assert('0134: a null dry-run flag is refused, never read as a real run',
+    v_res->>'status' = 'invalid_request', coalesce(v_res::text, 'null'));
+
+  insert into screening_v2.candidates (role_id, name, email)
+  values ((select id from screening_v2.roles order by id limit 1),
+          'pol134 backfill', 'pol134b@example.invalid')
+  returning id into v_cand;
+  v_map := _policy_tests.p134_mapping('pol134-b');
+  v_paused := _policy_tests.p134_mapping('pol134-b-paused', 'paused');
+
+  -- Advance: the OLDEST scorecard of the two a candidate-wide order depends on.
+  v_sa := _policy_tests.p134_session(v_cand);
+  v_la := _policy_tests.p134_link('pol134-la', v_map, v_sa);
+  perform _policy_tests.p134_assess(v_sa, v_cand, 'advance', c_t0);
+  perform _policy_tests.p134_scorecard(v_la, 'pol134-sc-a', v_sa, c_t0);
+
+  -- Reject, newer scorecard, NULL source: the session comes from the link.
+  v_sb := _policy_tests.p134_session(v_cand);
+  v_lb := _policy_tests.p134_link('pol134-lb', v_map, v_sb);
+  perform _policy_tests.p134_assess(v_sb, v_cand, 'reject', c_t0);
+  perform _policy_tests.p134_scorecard(v_lb, 'pol134-sc-b', null, c_t0 + interval '1 day');
+
+  -- Hold, then no verdict, then insufficient evidence.
+  v_sh := _policy_tests.p134_session(v_cand);
+  v_lh := _policy_tests.p134_link('pol134-lh', v_map, v_sh);
+  perform _policy_tests.p134_assess(v_sh, v_cand, 'hold', c_t0);
+  perform _policy_tests.p134_scorecard(v_lh, 'pol134-sc-h', v_sh, c_t0);
+  v_sx := _policy_tests.p134_session(v_cand);
+  v_lx := _policy_tests.p134_link('pol134-lx', v_map, v_sx);
+  perform _policy_tests.p134_assess(v_sx, v_cand, null, c_t0);
+  perform _policy_tests.p134_scorecard(v_lx, 'pol134-sc-x', v_sx, c_t0);
+  v_si := _policy_tests.p134_session(v_cand);
+  v_li := _policy_tests.p134_link('pol134-li', v_map, v_si);
+  perform _policy_tests.p134_assess(v_si, v_cand, 'advance', c_t0, true);
+  perform _policy_tests.p134_scorecard(v_li, 'pol134-sc-i', v_si, c_t0);
+
+  -- Two scorecards on one link: the NEWEST succeeded one names the session.
+  v_sc_old := _policy_tests.p134_session(v_cand);
+  v_sc_new := _policy_tests.p134_session(v_cand);
+  v_lc := _policy_tests.p134_link('pol134-lc', v_map, v_sc_old);
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, session_id, state)
+  values (v_lc, v_cand, (select id from screening_v2.roles order by id limit 1), v_sc_new, 'pending_prereqs');
+  perform _policy_tests.p134_assess(v_sc_old, v_cand, 'hold', c_t0);
+  perform _policy_tests.p134_assess(v_sc_new, v_cand, 'advance', c_t0);
+  perform _policy_tests.p134_scorecard(v_lc, 'pol134-sc-c1', null, c_t0);
+  perform _policy_tests.p134_scorecard(v_lc, 'pol134-sc-c2', v_sc_new, c_t0 + interval '2 days');
+
+  -- Skips: terminal, paused mapping, no session; and a FAILED scorecard, which
+  -- makes a link no candidate at all.
+  v_st := _policy_tests.p134_session(v_cand);
+  v_lt := _policy_tests.p134_link('pol134-lt', v_map, v_st);
+  perform _policy_tests.p134_assess(v_st, v_cand, 'advance', c_t0);
+  perform _policy_tests.p134_scorecard(v_lt, 'pol134-sc-t', v_st, c_t0);
+  v_res := screening_v2.cancel_ashby_application(v_lt, 'withdrawn', 'pol134', gen_random_uuid(), 'recruiter');
+  v_sp := _policy_tests.p134_session(v_cand);
+  v_lp := _policy_tests.p134_link('pol134-lp', v_paused, v_sp);
+  perform _policy_tests.p134_assess(v_sp, v_cand, 'advance', c_t0);
+  perform _policy_tests.p134_scorecard(v_lp, 'pol134-sc-p', v_sp, c_t0);
+  v_ln := _policy_tests.p134_link('pol134-ln', v_map);
+  perform _policy_tests.p134_scorecard(v_ln, 'pol134-sc-n', null, c_t0);
+  v_sf := _policy_tests.p134_session(v_cand);
+  v_lf := _policy_tests.p134_link('pol134-lf', v_map, v_sf);
+  perform _policy_tests.p134_assess(v_sf, v_cand, 'advance', c_t0);
+  perform _policy_tests.p134_scorecard(v_lf, 'pol134-sc-f', v_sf, c_t0, 'failed');
+
+  -- ── Dry run ──────────────────────────────────────────────────────────
+  select count(*) into v_ops_before from screening_v2.ashby_operations;
+  select count(*) into v_audit_before from screening_v2.audit_events;
+  v_res := screening_v2.backfill_ashby_recommendation_tags(true);
+  select count(*) into v_ops_after from screening_v2.ashby_operations;
+
+  if (v_res->>'total_eligible')::int - (v_base->>'total_eligible')::int <> 6 then
+    v_bad := v_bad || ' eligible'; end if;
+  if (v_res->'verdicts'->>'advance')::int - (v_base->'verdicts'->>'advance')::int <> 3 then
+    v_bad := v_bad || ' advance'; end if;
+  if (v_res->'verdicts'->>'hold')::int - (v_base->'verdicts'->>'hold')::int <> 1 then
+    v_bad := v_bad || ' hold'; end if;
+  if (v_res->'verdicts'->>'reject')::int - (v_base->'verdicts'->>'reject')::int <> 1 then
+    v_bad := v_bad || ' reject'; end if;
+  if (v_res->'verdicts'->>'none')::int - (v_base->'verdicts'->>'none')::int <> 1 then
+    v_bad := v_bad || ' none'; end if;
+  if (v_res->>'evidence_insufficient')::int - (v_base->>'evidence_insufficient')::int <> 1 then
+    v_bad := v_bad || ' insufficient'; end if;
+  if (v_res->>'skipped_terminal')::int - (v_base->>'skipped_terminal')::int <> 1 then
+    v_bad := v_bad || ' terminal'; end if;
+  if (v_res->>'skipped_mapping_inactive')::int - (v_base->>'skipped_mapping_inactive')::int <> 1 then
+    v_bad := v_bad || ' mapping'; end if;
+  if (v_res->>'skipped_no_session')::int - (v_base->>'skipped_no_session')::int <> 1 then
+    v_bad := v_bad || ' no_session'; end if;
+  perform _policy_tests.assert('0134: the dry run counts eligible links, raw verdicts and every skip',
+    v_bad = '', v_bad || ' base=' || v_base::text || ' now=' || v_res::text);
+  perform _policy_tests.assert('0134: the dry run writes no operation and no audit row',
+    v_ops_after = v_ops_before
+      and (select count(*) from screening_v2.audit_events) = v_audit_before
+      and not v_res ? 'enqueue',
+    'ops ' || v_ops_before || ' -> ' || v_ops_after);
+  perform _policy_tests.assert('0134: the answer carries counts only, no id of any kind',
+    v_res::text !~ '[0-9a-f]{8}-[0-9a-f]{4}-', v_res::text);
+
+  -- ── Real run ─────────────────────────────────────────────────────────
+  v_res := screening_v2.backfill_ashby_recommendation_tags(false);
+  perform _policy_tests.assert('0134: a real run enqueues every eligible link',
+    (v_res->'enqueue'->>'inserted')::int >= 6
+      and _policy_tests.p134_tag_ops(v_la) = 1 and _policy_tests.p134_tag_ops(v_lb) = 1
+      and _policy_tests.p134_tag_ops(v_lh) = 1 and _policy_tests.p134_tag_ops(v_lx) = 1
+      and _policy_tests.p134_tag_ops(v_li) = 1 and _policy_tests.p134_tag_ops(v_lc) = 1,
+    v_res::text);
+  perform _policy_tests.assert('0134: terminal, paused, sessionless and failed-scorecard links get nothing',
+    _policy_tests.p134_tag_ops(v_lt) = 0 and _policy_tests.p134_tag_ops(v_lp) = 0
+      and _policy_tests.p134_tag_ops(v_ln) = 0 and _policy_tests.p134_tag_ops(v_lf) = 0,
+    v_res::text);
+  perform _policy_tests.assert('0134: the newest succeeded scorecard names the session',
+    (select source_session_id from screening_v2.ashby_operations
+      where application_link_id = v_lc and operation_type = 'recommendation_tag') = v_sc_new,
+    'a link with two scorecards must take the newer cycle');
+  perform _policy_tests.assert('0134: a NULL scorecard source falls back to the link session',
+    (select source_session_id from screening_v2.ashby_operations
+      where application_link_id = v_lb and operation_type = 'recommendation_tag') = v_sb,
+    'coalesce(source_session_id, link.session_id)');
+
+  select scheduled_at into v_at_a from screening_v2.ashby_operations
+   where application_link_id = v_la and operation_type = 'recommendation_tag';
+  select scheduled_at into v_at_b from screening_v2.ashby_operations
+   where application_link_id = v_lb and operation_type = 'recommendation_tag';
+  perform _policy_tests.assert('0134: operations are scheduled oldest scorecard first, so the newest verdict wins',
+    v_at_a < v_at_b, v_at_a::text || ' / ' || v_at_b::text);
+
+  select count(*) into v_ops_before from screening_v2.ashby_operations;
+  v_res2 := screening_v2.backfill_ashby_recommendation_tags(false);
+  select count(*) into v_ops_after from screening_v2.ashby_operations;
+  perform _policy_tests.assert('0134: re-running the backfill inserts nothing',
+    v_ops_after = v_ops_before and not (v_res2->'enqueue') ? 'inserted'
+      and (v_res2->'enqueue'->>'duplicate')::int >= 6,
+    v_res2::text);
+
+  -- Teardown. The real run may also have enqueued a link an earlier section
+  -- left behind, so every tag operation goes.
+  delete from screening_v2.ashby_operations where operation_type = 'recommendation_tag';
+  delete from screening_v2.phone_engagements where application_link_id = v_lc;
+  delete from screening_v2.ashby_application_links
+   where id in (v_la, v_lb, v_lh, v_lx, v_li, v_lc, v_lt, v_lp, v_ln, v_lf);
+  delete from screening_v2.ashby_job_mappings where id in (v_map, v_paused);
+  delete from screening_v2.call_sessions where candidate_id = v_cand;
+  delete from screening_v2.candidates where id = v_cand;
+end;
+$$;
+
+drop function _policy_tests.p134_tag_ops(uuid);
+drop function _policy_tests.p134_scorecard(uuid, text, uuid, timestamptz, text);
+drop function _policy_tests.p134_assess(uuid, uuid, text, timestamptz, boolean);
+drop function _policy_tests.p134_session(uuid);
+drop function _policy_tests.p134_link(text, uuid, uuid);
+drop function _policy_tests.p134_mapping(text, text);
+-- ==== 0134 END ====
 
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays

@@ -91,6 +91,12 @@ describe('FunnelSection', () => {
     expect(screen.getByText('parse_bad_output')).toBeInTheDocument();
   });
 
+  it('words the on_hold drop bucket as Borderline', async () => {
+    render(<FunnelSection />);
+    expect(await screen.findByText('Borderline')).toBeInTheDocument();
+    expect(screen.queryByText('On hold')).not.toBeInTheDocument();
+  });
+
   it('shows a truthful empty state when the rollup has no data', async () => {
     api.getFunnelSummary.mockResolvedValue(EMPTY_SUMMARY);
     render(<FunnelSection />);

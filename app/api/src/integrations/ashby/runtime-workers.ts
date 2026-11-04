@@ -72,6 +72,7 @@ import {
 } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { LEGACY_INVITE_SKIPPED_EVENT, runAshbyOperationPass } from './operation-worker.js';
+import { createChristyTagResolver, recommendationTagsEnabled } from './recommendation-tags.js';
 import { probeFeedbackFormDefinition, type FormDefinitionReader, type ProbeFeedbackForm } from './probe.js';
 
 /**
@@ -2316,6 +2317,10 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     },
   });
 
+  // One resolver for the scheduler's life, so its five-minute tag catalogue cache
+  // is shared across ticks.
+  const christyTagResolver = createChristyTagResolver(runtime.client);
+
   const scheduler = createAshbyScheduler({
     ...(options.scheduler ?? {}),
     loops: [
@@ -2347,6 +2352,11 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
               readFormDefinition: (formDefinitionId, fresh) =>
                 readFormDefinitionCached(formDefinitionId, runtime.client, undefined, fresh === true),
             },
+            // Kill switch: off means this lane is not run at all. Pending tag
+            // operations wait and resume when the switch comes back on.
+            ...(recommendationTagsEnabled()
+              ? { recommendationTag: { client: runtime.client, resolver: christyTagResolver } }
+              : {}),
             resolveMappingForLink: runtime.resolveMappingForLink,
             reissuePathFor,
             email: { providerApproved: false, domainVerified: false },
@@ -2374,7 +2384,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
               });
             },
           });
-          return r.invite.claimed || r.scorecard.claimed;
+          return r.invite.claimed || r.scorecard.claimed || r.recommendationTag.claimed;
         },
       },
       {

@@ -554,17 +554,17 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                     label: 'Bot qualified',
                     value: count(t?.qualified),
                     tone: 'success',
-                    context: 'Recommended to advance',
+                    context: 'Recommended: Select',
                     loading,
                   },
                   {
                     label: 'Bot disqualified',
                     value: count(t?.disqualified),
                     tone: 'danger',
-                    context: 'Recommended to reject',
+                    context: 'Recommended: Reject',
                     loading,
                   },
-                  { label: 'Needs review', value: count(derived?.needsReview), tone: 'warning', context: 'On hold or no verdict', loading },
+                  { label: 'Needs review', value: count(derived?.needsReview), tone: 'warning', context: 'Borderline or no verdict', loading },
                 ]}
                 className={ROW}
               />
@@ -741,11 +741,11 @@ function MetricNotes({
       'The call was answered but produced no usable answer to a screening question. This bucket is broader than a bad line: it also holds people who declined consent, opted out, hung up during the intro, and answering machines. Check the call outcomes before concluding it is a telephony problem. It is calculated by subtraction, and is shown as 0 rather than a negative number if the two underlying counts ever disagree.',
     ],
     ['Never reached', 'We dialled and never reached a person across every attempt.'],
-    ['Bot qualified', 'The automated scorecard recommended advancing this candidate.'],
+    ['Bot qualified', 'The automated scorecard recommended Select for this candidate.'],
     ['Bot disqualified', 'The automated scorecard recommended rejecting this candidate.'],
     [
       'Needs review',
-      'The scorecard put the candidate on hold, or could not produce a recommendation at all. These need a human: they are neither qualified nor rejected.',
+      'The scorecard marked the candidate Borderline, or could not produce a recommendation at all. These need a human: they are neither qualified nor rejected.',
     ],
     [
       'Advanced',

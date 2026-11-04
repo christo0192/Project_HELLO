@@ -23,6 +23,7 @@ import {
 import { CandidateShell } from '../CandidateShell';
 import type { Assessment } from '../../../types';
 import { humanizeEnum } from '../../../lib/humanize';
+import { RECOMMENDATION_LABELS } from '../../../lib/recommendation-labels';
 
 /** Deliberately maximal: every optional branch of `Assessment` is present. */
 const FULL: Assessment = {
@@ -271,6 +272,14 @@ describe('CandidateScorecard field parity vs the legacy Scorecard', () => {
     render(<CandidateScorecard assessment={FULL} />);
     expect(screen.getByText('36')).toBeInTheDocument();
   });
+
+  it.each(['advance', 'hold', 'reject'] as const)(
+    'words %s with the shared recommendation label',
+    (recommendation) => {
+      render(<CandidateScorecard assessment={{ ...MINIMAL, recommendation }} />);
+      expect(screen.getByText(RECOMMENDATION_LABELS[recommendation])).toBeInTheDocument();
+    },
+  );
 });
 
 describe('CandidateScorecard layout defects', () => {

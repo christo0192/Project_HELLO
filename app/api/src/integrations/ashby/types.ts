@@ -76,7 +76,10 @@ export type AshbyOperation =
   | 'applicationFeedback.list'
   | 'applicationFeedbackRequest.create'
   | 'applicationFeedback.submit'
-  | 'application.changeStage';
+  | 'application.changeStage'
+  | 'candidateTag.list'
+  | 'candidate.addTag'
+  | 'candidate.removeTag';
 
 export interface AshbyOperationSpec {
   /** Fixed request path appended to the allowlisted base origin. */
@@ -110,6 +113,13 @@ export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpe
   'applicationFeedbackRequest.create': { path: '/applicationFeedbackRequest.create', mutation: true },
   'applicationFeedback.submit':        { path: '/applicationFeedback.submit',        mutation: true },
   'application.changeStage':           { path: '/application.changeStage',           mutation: true },
+  // Tag CATALOGUE (id, title, isArchived; permission `hiringProcessMetadataRead`).
+  // The verdict-tag lane resolves its three titles here. Not a probe read.
+  'candidateTag.list':                 { path: '/candidateTag.list',                 mutation: false },
+  // Candidate-wide tag writes (permission `candidatesWrite`). The lane only ever
+  // sends the three Christy tags and reads candidate.info before it writes.
+  'candidate.addTag':                  { path: '/candidate.addTag',                  mutation: true },
+  'candidate.removeTag':               { path: '/candidate.removeTag',               mutation: true },
 } as const;
 
 // ── Narrow, extension-friendly request shapes ───────────────────────────────
@@ -158,6 +168,14 @@ export interface ApplicationHistoryParams {
   limit?: number;
   /** Internal wall-clock deadline; never sent to Ashby. */
   deadlineAt?: number;
+}
+
+/** `candidateTag.list` paging. `includeArchived: false` is sent by the helper. */
+export interface CandidateTagListParams {
+  /** Opaque cursor from a prior page. */
+  cursor?: string;
+  /** Page size, 1..100 (the endpoint's documented maximum). */
+  limit?: number;
 }
 
 export interface FeedbackSubmitRequest {

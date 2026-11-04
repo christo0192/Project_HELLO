@@ -95,11 +95,13 @@ describe('0114 registration', () => {
     // reads (phone-0132-daily-cap.test.ts pins that).
     // 0133_dexity_access_domain.sql (company domain switch) redefines only the dashboard
     // access-allowlist RPCs — no phone body — so, like the R1 lane, it is exempt by exact name.
+    // 0134_ashby_recommendation_tags.sql (Christy verdict tags) redefines only Ashby outbox RPCs
+    // (enqueue/claim_ashby_operation plus two new ones) — no phone body — so it is exempt by exact name too.
     const after = files.slice(files.indexOf('0114_phone_outcome_integrity.sql') + 1);
     expect(
-      after.every((f) => /_r1_|_phone_recording_integrity\.sql$|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$/.test(f)),
+      after.every((f) => /_r1_|_phone_recording_integrity\.sql$|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$/.test(f)),
     ).toBe(true);
-    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$/.test(f));
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$/.test(f));
     expect(nonR1[nonR1.length - 2]).toMatch(/_phone_recording_integrity\.sql$/);
     expect(nonR1[nonR1.length - 1]).toMatch(/_ashby_phone_parsing_intake\.sql$/);
   });

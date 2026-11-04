@@ -45,6 +45,7 @@ import type { Assessment, Recommendation } from '../../types';
 import { Meter, SurfaceCard, Tag } from '../design/candidate';
 import { cx } from '../design/cx';
 import { humanizeEnum } from '../../lib/humanize';
+import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
 
 /** Fixed rubric weights — the same values the legacy card printed. */
 export const SECTION_WEIGHTS = {
@@ -54,11 +55,7 @@ export const SECTION_WEIGHTS = {
   role_fit: '20%',
 } as const;
 
-const RECOMMENDATION_LABEL: Record<Recommendation, string> = {
-  advance: 'Advance',
-  hold: 'Hold',
-  reject: 'Reject',
-};
+const RECOMMENDATION_LABEL: Readonly<Record<Recommendation, string>> = RECOMMENDATION_LABELS;
 
 const RECOMMENDATION_TONE: Record<Recommendation, 'positive' | 'caution' | 'negative'> = {
   advance: 'positive',

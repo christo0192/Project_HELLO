@@ -15,4 +15,12 @@ export const ASHBY_ERROR_CODE_LABELS: Readonly<Record<string, string>> = {
   // C3 (0114): the worker refused to write a scorecard whose interview
   // evidence was insufficient. Non-retryable by design.
   evidence_insufficient: 'Held: not enough interview evidence',
+  // M027 (0134): the Christy verdict tag lane. None of these touches a scorecard.
+  ashby_tag_permission_denied: 'Ashby API key lacks permission for tags',
+  ashby_tag_not_found: 'Christy tag not found in Ashby',
+  ashby_tag_ambiguous: 'More than one active Christy tag with this title in Ashby',
+  ashby_tag_transient: 'Ashby was unavailable; the tag will retry',
+  ashby_tag_write_rejected: 'Ashby refused the tag change',
+  candidate_id_missing: 'Ashby candidate id not found',
+  recommendation_tag_sink_unavailable: 'Christy tag writer not configured',
 };

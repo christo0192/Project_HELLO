@@ -111,6 +111,12 @@ primary_region = "sin"
   # provider writes remain independently gated by ASHBY_RUNTIME_ENABLED and the
   # enabled tenant mapping.
   ASHBY_RESCREEN_SCORECARD_ENABLED = "true"
+  # Christy verdict tags (0134): ON. KILL SWITCH, no deploy needed (a Fly secret
+  # overrides [env]):
+  #   fly secrets set ASHBY_RECOMMENDATION_TAGS_ENABLED=false -a project-hello-api
+  # Off: nothing new is enqueued and the lane stops; pending operations wait. See
+  # docs/runbooks/ashby-runtime-activation.md section 11.
+  ASHBY_RECOMMENDATION_TAGS_ENABLED = "true"
   # Empty ⇒ the resume-download SSRF allowlist stays DISABLED (fail-closed).
   ASHBY_RESUME_HOSTS = ""
   ASHBY_SIGNAL_POLL_MS = "5000"

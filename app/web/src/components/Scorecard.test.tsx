@@ -127,7 +127,7 @@ describe('Scorecard (legacy v1)', () => {
 
   it('renders the recommendation', () => {
     render(<Scorecard assessment={baseAssessment} />);
-    expect(screen.getByText('Advance')).toBeInTheDocument();
+    expect(screen.getByText('Select')).toBeInTheDocument();
   });
 
   it('renders each dimension as a heading with its weight as a data label', () => {
@@ -198,7 +198,7 @@ describe('Scorecard (legacy v1)', () => {
     const { rerender } = render(
       <Scorecard assessment={{ ...baseAssessment, overall_score: 55, recommendation: 'hold' }} />,
     );
-    expect(screen.getByText('Hold')).toBeInTheDocument();
+    expect(screen.getByText('Borderline')).toBeInTheDocument();
     rerender(<Scorecard assessment={{ ...baseAssessment, overall_score: 35, recommendation: 'reject' }} />);
     expect(screen.getByText('Reject')).toBeInTheDocument();
   });
@@ -249,7 +249,7 @@ describe('Scorecard (role scorecard v2)', () => {
     expect(screen.getByText('86')).toBeInTheDocument();
     expect(screen.getByText('Overall score')).toBeInTheDocument();
     expect(screen.getByText('3.14')).toBeInTheDocument();
-    expect(screen.getByText('Advance')).toBeInTheDocument();
+    expect(screen.getByText('Select')).toBeInTheDocument();
     expect(
       screen.getByText('Specific answers on scaling; motivation consistent with the resume.'),
     ).toBeInTheDocument();
@@ -336,10 +336,10 @@ describe('Scorecard (partial and malformed rows never throw)', () => {
     expect(screen.getByText('This assessment carries no dimension scores.')).toBeInTheDocument();
   });
 
-  it('shows an unknown recommendation plainly instead of inventing "Hold"', () => {
+  it('shows an unknown recommendation plainly instead of inventing "Borderline"', () => {
     render(<Scorecard assessment={{ ...baseAssessment, recommendation: 'needs_panel' } as unknown as Assessment} />);
     expect(screen.getByText('Needs panel')).toBeInTheDocument();
-    expect(screen.queryByText('Hold')).not.toBeInTheDocument();
+    expect(screen.queryByText('Borderline')).not.toBeInTheDocument();
   });
 
   it('leaves out a missing reading instead of drawing it as zero', () => {

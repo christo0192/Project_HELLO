@@ -391,7 +391,7 @@ describe('SessionDetailPage', () => {
     renderPage();
     expect(await screen.findByText('Scorecard')).toBeInTheDocument();
     expect(screen.getByText('78')).toBeInTheDocument();
-    expect(screen.getByText('Advance')).toBeInTheDocument();
+    expect(screen.getByText('Select')).toBeInTheDocument();
   });
 
   it('renders a role-scorecard (v2) assessment instead of crashing', async () => {

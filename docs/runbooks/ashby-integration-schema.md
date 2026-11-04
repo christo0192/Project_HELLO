@@ -42,6 +42,10 @@ revoked; no anon/authenticated/public policy):
 - **Scorecard-before-stage.** A `stage_move` operation carrying a
   `depends_on_operation_id` cannot become `running`/`succeeded` until its
   dependency (`scorecard_write`) has succeeded (trigger).
+- **Operation types.** `invite_delivery`, `scorecard_write`, `stage_move` and,
+  from 0134, `recommendation_tag`, which keeps one Christy verdict tag on the
+  Ashby candidate. A `recommendation_tag` has no dependency on a scorecard and a
+  NULL marker (see `ashby-runtime-activation.md` §11).
 - **Terminal blocks write-back.** Once an application link is
   `withdrawn`/`deleted`/`manual_stage_cancel`, creating any new operation is
   rejected (trigger). Terminal markers are modeled without deciding local

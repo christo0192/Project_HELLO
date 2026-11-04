@@ -15,6 +15,10 @@ title equals the metric's name** (`Profile relevance`, `Communication`,
 `Night-shift fit`, `Compensation fit`, `Stability`, …). Adding a metric in the
 dashboard then needs a form field and **no code change**.
 
+The Christy verdict tag on the candidate is a separate operation,
+`recommendation_tag`, with no dependency on the scorecard: a tag failure can never
+resend or disturb a scorecard (see `ashby-runtime-activation.md` §11).
+
 How a v2 `scorecard_write` runs (`operation-worker.ts`):
 
 1. `readScorecardSource` maps the v2 assessment row (`schema_version = 2`,

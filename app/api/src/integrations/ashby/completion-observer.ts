@@ -17,8 +17,11 @@
  *
  * WHAT IT DOES. It parks the Ashby application link as `writeback_pending`
  * and, when the approved sink is configured, asks the durable store to enqueue
- * exactly one scorecard-write operation. The operation worker owns the only
- * provider mutation. No stage move, auto-reject, or email is ever enqueued.
+ * exactly one scorecard-write operation. It then asks for the Christy verdict
+ * tag operation (0134), on both the normal and the insufficient-evidence path:
+ * the second has no scorecard, but a stale tag from an earlier result still has
+ * to come off. The operation worker owns every provider mutation. No stage move,
+ * auto-reject, or email is ever enqueued.
  *
  * FAILURE POSTURE. The observer is best-effort with respect to scoring: a
  * failure here must never lose a completed assessment, which is the primary
@@ -57,6 +60,7 @@ export const EVIDENCE_INSUFFICIENT_REVIEW_REASON = 'evidence_insufficient_review
 export interface CompletionStore {
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
   enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
+  enqueueRecommendationTag?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
 }
 
 /** Resolve the Ashby application link bound to a screening session, if any. */
@@ -91,6 +95,25 @@ export type CompletionObserverOutcome =
   | { status: 'error' };
 
 /**
+ * Ask for the Christy verdict tag operation. Its own try/catch: a tag problem
+ * can never change the observer's outcome or touch the scorecard path.
+ */
+async function enqueueTagBestEffort(
+  stores: CompletionStore,
+  applicationLinkId: string,
+  sessionId: string,
+): Promise<void> {
+  try {
+    await stores.enqueueRecommendationTag?.(applicationLinkId, sessionId);
+  } catch {
+    logger.warn('unknown_event', {
+      error_category: 'ashby_completion_observer',
+      error_type: 'recommendation_tag_enqueue_failed',
+    });
+  }
+}
+
+/**
  * Park a completed Ashby-linked screening as `writeback_pending`.
  *
  * Never throws: the caller is the assessment path, and a bookkeeping failure
@@ -116,6 +139,7 @@ export async function observeAshbyCompletion(
     if (options.evidenceGrade === 'insufficient') {
       const held = await deps.stores.markWritebackPending(link.id, EVIDENCE_INSUFFICIENT_REVIEW_REASON);
       if (held.status === 'ok' || held.status === 'already_pending') {
+        await enqueueTagBestEffort(deps.stores, link.id, sessionId);
         return { status: 'held_insufficient_evidence', applicationLinkId: link.id };
       }
       if (held.status === 'blocked_terminal') return { status: 'blocked_terminal' };
@@ -126,7 +150,13 @@ export async function observeAshbyCompletion(
     if (result.status === 'ok' || result.status === 'already_pending') {
       // Optional keeps legacy/test stores compatible. Production enqueues only
       // after the assessment row exists and dedupes by deterministic marker.
-      await deps.stores.enqueueScorecardWrite?.(link.id, sessionId);
+      // A scorecard throw still reaches the catch below, as it always has; the
+      // `finally` only means the tag is still attempted first.
+      try {
+        await deps.stores.enqueueScorecardWrite?.(link.id, sessionId);
+      } finally {
+        await enqueueTagBestEffort(deps.stores, link.id, sessionId);
+      }
     }
     if (result.status === 'ok') return { status: 'parked', applicationLinkId: link.id };
     if (result.status === 'already_pending') {

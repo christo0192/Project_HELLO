@@ -273,7 +273,7 @@ describe('CandidateScorecardV2', () => {
     expect(screen.getAllByText('63').length).toBeGreaterThan(0);
     expect(screen.getByText('3.50')).toBeInTheDocument();
     expect(screen.getByText(/of 4 on the rubric/)).toBeInTheDocument();
-    expect(screen.getByText('Hold')).toBeInTheDocument();
+    expect(screen.getByText('Borderline')).toBeInTheDocument();
   });
 
   it('shows "Insufficient evidence" and withholds the overall when NO metric was scored', () => {
@@ -302,7 +302,7 @@ describe('CandidateScorecardV2', () => {
     expect(screen.queryByText('Not scored')).not.toBeInTheDocument();
     expect(screen.getAllByText('50').length).toBeGreaterThan(0);
     expect(screen.getByText('3.00')).toBeInTheDocument();
-    expect(screen.getByText('Hold')).toBeInTheDocument();
+    expect(screen.getByText('Borderline')).toBeInTheDocument();
     // It is flagged PROVISIONAL, and the caveat names the scored/total split
     // (2 of 3 here), not the no-evidence message.
     expect(screen.getByText(/Provisional: scored from 2 of 3 metrics/)).toBeInTheDocument();

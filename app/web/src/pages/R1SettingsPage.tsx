@@ -103,8 +103,8 @@ const PAGE_DESCRIPTION =
 const SWITCHES_DESCRIPTION =
   'R1 takes sends only when it is enabled here and R1_ENABLED is true on the API.';
 const SCORING_DESCRIPTION =
-  'Scores run from 0 to 100. At or above advance is a recommendation to advance; at or above ' +
-  'hold is hold; below is reject.';
+  'Scores run from 0 to 100. At or above the Select score the recommendation is Select; at or ' +
+  'above the Borderline score it is Borderline; below that it is Reject.';
 const AUTO_STATUS_DESCRIPTION =
   'Off until calibration is signed off. When on, R1 advances candidates itself and rejects ' +
   'after a 24-hour window HR can cancel.';
@@ -278,8 +278,8 @@ export function R1SettingsPage() {
           ? 'There are not enough interview machines registered for that many interviews at ' +
             'once. Nothing was changed.'
           : e instanceof ApiError && e.status === 400
-          ? 'The server rejected those values. Check the numbers and that hold is not above ' +
-            'advance.'
+          ? 'The server rejected those values. Check the numbers and that the Borderline score is ' +
+            'not above the Select score.'
           : e instanceof ApiError && e.status === 403
             ? 'Only an admin can change R1 settings.'
             : 'The settings could not be saved. Nothing was changed; try again.',
@@ -493,7 +493,7 @@ export function R1SettingsPage() {
           <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field
               id="r1-advance-threshold"
-              label="Advance threshold"
+              label="Score for Select"
               hint="Default 65."
               error={errors.advance_threshold}
             >
@@ -511,8 +511,8 @@ export function R1SettingsPage() {
             </Field>
             <Field
               id="r1-hold-threshold"
-              label="Hold threshold"
-              hint="Default 45. Cannot be above advance."
+              label="Score for Borderline"
+              hint="Default 45. Cannot be above the Select score."
               error={errors.hold_threshold}
             >
               {({ id, describedBy, invalid }) => (

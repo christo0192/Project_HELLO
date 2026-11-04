@@ -79,8 +79,8 @@ describe(`${N} registration`, () => {
     // 0133_dexity_access_domain.sql (company domain switch) redefines only the dashboard
     // access-allowlist RPCs — no phone body — so, like the R1 lane, it is exempt by exact name.
     const after = files.slice(files.indexOf(base) + 1);
-    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$/.test(f))).toBe(true);
-    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$/.test(f));
+    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$/.test(f))).toBe(true);
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$/.test(f));
     expect(nonR1[nonR1.length - 2]).toBe(base);
     expect(nonR1[nonR1.length - 1]).toMatch(/^0130_ashby_phone_parsing_intake\.sql$/);
   });

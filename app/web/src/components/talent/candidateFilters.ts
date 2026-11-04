@@ -39,6 +39,7 @@ import type { Candidate } from '../../types';
 import { candidateStatusKey, candidateStatusLabel } from './status';
 import { INTAKE_TYPE_ORDER, RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
 import type { AshbyJobState } from '../../lib/mapped-roles';
+import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
 
 /**
  * Canonical funnel order for the candidate display-status vocabulary. The
@@ -84,16 +85,12 @@ export const RECOMMENDATION_ORDER = ['advance', 'hold', 'reject'] as const;
 export type RecommendationKey = (typeof RECOMMENDATION_ORDER)[number];
 const RECOMMENDATION_SET = new Set<string>(RECOMMENDATION_ORDER);
 
-const RECOMMENDATION_LABELS: Record<string, string> = {
-  advance: 'Advance',
-  hold: 'Hold',
-  reject: 'Reject',
-};
+const RECOMMENDATION_WORDS: Readonly<Record<string, string>> = RECOMMENDATION_LABELS;
 
 /** Human label for a recommendation (fallback: the raw value). */
 export function recommendationLabel(rec: string | null | undefined): string {
   if (!rec) return 'Unassessed';
-  return RECOMMENDATION_LABELS[rec] ?? rec;
+  return RECOMMENDATION_WORDS[rec] ?? rec;
 }
 
 const RESUME_REVIEW_SET = new Set<string>(RESUME_REVIEW_ORDER);
