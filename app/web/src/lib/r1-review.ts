@@ -158,10 +158,19 @@ export function cuedRow(turns: readonly PlacedTurn[], sec: number): number | nul
   return activeTurnAt(turns.map((turn) => turn.startSec), sec);
 }
 
-/** The recording's length; a turn past it stretches the scale rather than fall off the end. */
-export function reviewDurationSec(attempt: R1ReviewAttempt, turns: readonly PlacedTurn[]): number {
-  const recorded = typeof attempt.recording.duration_ms === 'number' ? attempt.recording.duration_ms / 1000 : 0;
-  return Math.max(recorded, ...turns.map((turn) => turn.startSec ?? 0), 0);
+/**
+ * The recording's length; a turn past it stretches the scale rather than fall off the end. With no stored
+ * length the last turn's start is only how far the scale is known to reach, and a note pinned after it was
+ * pinned to playing media, so it reaches further. A stored length needs no help from a note.
+ */
+export function reviewDurationSec(
+  attempt: R1ReviewAttempt,
+  turns: readonly PlacedTurn[],
+  notes: readonly { sec: number | null }[] = [],
+): number {
+  const stored = attempt.recording.duration_ms;
+  const pinned = typeof stored === 'number' ? [] : notes.map((note) => note.sec ?? 0);
+  return Math.max(typeof stored === 'number' ? stored / 1000 : 0, ...turns.map((turn) => turn.startSec ?? 0), ...pinned, 0);
 }
 
 /* ── Phases ───────────────────────────────────────────────────────── */

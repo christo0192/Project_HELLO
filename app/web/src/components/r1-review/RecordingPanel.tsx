@@ -1,6 +1,7 @@
 /**
  * Recording: the video, its transport and the call strip on the left, the transcript and the notes on
- * the right. One attempt each: the page keys this by session, so another attempt starts clean.
+ * the right. One attempt each: the page keys this by session, so another attempt starts clean. The page
+ * holds what must not go with an attempt: the side tab, and the words of a note not yet saved.
  *
  * ONE POSITION. The player, the strip, the clock and the transcript all follow it:
  *   1. The player reports the position (every frame while playing). The strip, the clock and "Add note at"
@@ -29,7 +30,10 @@
  *
  * NOTES are a reviewer's own words at a moment (`ReviewNotes`). A note moves the position like the strip
  * does, and starts nothing: where a turn plays from its lead-in, a note goes to exactly where it was
- * pinned. Pressing a note's tick also opens it, so a flag on the strip always leads to its words.
+ * pinned.
+ *
+ * A MOMENT ALWAYS LEADS TO ITS WORDS. A note's tick opens Notes. A quote, an evidence box or a logged tick
+ * names a row, so it opens Transcript: the lit row must never sit behind the notes the reader left open.
  */
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent } from 'react';
@@ -68,7 +72,7 @@ import type { PhaseSegment, PlacedTurn, R1SpeakerKind, RolePlayMark } from '../.
 import type { R1ReviewAssessment, R1ReviewAttempt, R1ReviewEvent } from '../../lib/r1-types';
 import { PlayerControls } from './PlayerControls';
 import { ReviewNotes } from './ReviewNotes';
-import type { NoteCue } from './ReviewNotes';
+import type { NoteCue, NoteDraft } from './ReviewNotes';
 import { ReviewTranscript } from './ReviewTranscript';
 import { useRoundNotes } from './useRoundNotes';
 
@@ -100,6 +104,11 @@ export interface RecordingPanelProps {
   /** The person reading. Null when that could not be read. */
   reviewerId: string | null;
   mayAddNotes: boolean;
+  /** Which of Transcript and Notes is open. */
+  sideTab: string;
+  onSideTab: (id: string) => void;
+  /** The words of unsaved notes, by session. Written here on every change, so typing renders nothing above. */
+  noteDrafts: Map<string, NoteDraft>;
   onNeedRefresh: () => void;
 }
 
@@ -156,6 +165,9 @@ export function RecordingPanel({
   tabPress,
   reviewerId,
   mayAddNotes,
+  sideTab,
+  onSideTab,
+  noteDrafts,
   onNeedRefresh,
 }: RecordingPanelProps) {
   const summary = attempt.recording;
@@ -165,18 +177,21 @@ export function RecordingPanel({
   const turns = useMemo(() => placeTurns(attempt, candidateName, assessment), [attempt, candidateName, assessment]);
   const starts = useMemo(() => turns.map((turn) => turn.startSec), [turns]);
 
+  const { state: roundNotes, retry: readNotesAgain, add: keepNote } = useRoundNotes(roundId);
+  const notes = useMemo(
+    () => (roundNotes.status === 'ready' ? attemptNotes(roundNotes.notes, attempt.session_id) : null),
+    [roundNotes, attempt.session_id],
+  );
+
   const [mediaSec, setMediaSec] = useState<number | null>(null);
-  const durationSec = Math.max(mediaSec ?? 0, reviewDurationSec(attempt, turns));
+  const durationSec = Math.max(mediaSec ?? 0, reviewDurationSec(attempt, turns, notes ?? []));
 
   const [activeRow, setActiveRow] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   const [rate, setRate] = useState(1);
-  const [sideTab, setSideTab] = useState('transcript');
   const [noteCue, setNoteCue] = useState<NoteCue | null>(null);
-
-  const { state: roundNotes, retry: readNotesAgain, add: keepNote } = useRoundNotes(roundId);
 
   const playerRef = useRef<R1RecordingPlayerHandle>(null);
   const stripRef = useRef<CallStripHandle>(null);
@@ -261,7 +276,8 @@ export function RecordingPanel({
   /** Move the position without starting anything. With no link yet, nothing is minted. */
   const moveTo = useCallback(
     (sec: number) => {
-      // No known length is no upper limit: the media stops at its own end.
+      // The scale reaches every turn and note, so each lands where it says. No scale is no upper limit: the
+      // media stops at its own end.
       const target = Math.min(durationSec > 0 ? durationSec : Number.POSITIVE_INFINITY, Math.max(0, sec));
       heldStartRef.current = null;
       if (playerRef.current?.hasUrl) playerRef.current.seek(target);
@@ -282,8 +298,9 @@ export function RecordingPanel({
       }
       if (sec !== null) showPosition(sec);
       showRow(row ?? (sec === null ? null : cuedRow(turns, sec)));
+      if (row !== null) onSideTab('transcript');
     },
-    [showPosition, showRow, summary, turns],
+    [onSideTab, showPosition, showRow, summary, turns],
   );
 
   const cueNonce = cue?.nonce ?? null;
@@ -401,10 +418,6 @@ export function RecordingPanel({
     [assessment, attempt.session_id, turns],
   );
   const logged = useMemo(() => eventMarks(events, attempt.session_id, turns), [events, attempt.session_id, turns]);
-  const notes = useMemo(
-    () => (roundNotes.status === 'ready' ? attemptNotes(roundNotes.notes, attempt.session_id) : null),
-    [roundNotes, attempt.session_id],
-  );
   const noteMoments = useMemo<CallStripMoment[]>(
     () =>
       (notes ?? []).flatMap((note) =>
@@ -433,15 +446,17 @@ export function RecordingPanel({
       const note = notes?.find((item) => `n${item.id}` === key);
       if (note && note.sec !== null) {
         moveTo(note.sec);
-        setSideTab('notes');
+        onSideTab('notes');
         noteCueNonceRef.current += 1;
         setNoteCue({ id: note.id, nonce: noteCueNonceRef.current });
         return;
       }
       const row = evidence.find((mark) => `q${mark.number}` === key)?.row ?? logged.find((mark) => mark.key === key)?.row ?? null;
-      if (row !== null) playRow(row);
+      if (row === null) return;
+      playRow(row);
+      onSideTab('transcript');
     },
-    [evidence, logged, moveTo, notes, playRow],
+    [evidence, logged, moveTo, notes, onSideTab, playRow],
   );
 
   const addNote = useCallback(
@@ -450,6 +465,14 @@ export function RecordingPanel({
       keepNote(await api.addNote(candidateId, text, sec === null ? anchor : { ...anchor, media_ms: noteMediaMs(sec) }));
     },
     [attempt.session_id, candidateId, keepNote, roundId],
+  );
+
+  const keepDraft = useCallback(
+    (draft: NoteDraft | null) => {
+      if (draft) noteDrafts.set(attempt.session_id, draft);
+      else noteDrafts.delete(attempt.session_id);
+    },
+    [attempt.session_id, noteDrafts],
   );
 
   return (
@@ -538,7 +561,7 @@ export function RecordingPanel({
         <Tabs
           ariaLabel="Transcript and notes"
           selectedId={sideTab}
-          onSelect={setSideTab}
+          onSelect={onSideTab}
           className="absolute inset-0 flex flex-col pt-3 min-[1180px]:pt-0"
           listClassName="shrink-0 px-4"
           panelClassName="relative min-h-0 flex-1"
@@ -569,6 +592,8 @@ export function RecordingPanel({
                   positionSec={playable ? playheadSec : null}
                   clockRef={noteClockRef}
                   cue={noteCue}
+                  keptDraft={noteDrafts.get(attempt.session_id) ?? null}
+                  onDraft={keepDraft}
                   onSeek={moveTo}
                   onAdd={addNote}
                   onRetry={readNotesAgain}

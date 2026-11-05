@@ -3,7 +3,13 @@
  *
  * Notes are human words, so nothing here is labelled AI, and they reach no AI (the API fences that). A
  * note is append-only: there is no edit and no delete, so a save must never run twice. A second press
- * while one is on its way does nothing, and a failed save keeps the words for Try again.
+ * while one is on its way does nothing, and a failed save keeps the words for Try again. The box takes
+ * no typing while a save runs, because words added then could not be added to the note afterwards.
+ *
+ * THE DRAFT outlives this panel, which goes with its attempt: the page keeps what is in the box
+ * (`keptDraft`, `onDraft`), so moving to another attempt loses nothing and the box comes back with its
+ * attempt, without taking focus from wherever the reader went. Words on their way are out of its keeping,
+ * or the box could reopen and offer the same note a second time; a failed save puts them back.
  *
  * THE MOMENT. "Add note at 7:42" follows the playhead, written straight to the DOM by the panel as the
  * clock is, so a playing video costs no render. Pressing it pins that second: the call can play on while
@@ -14,8 +20,8 @@
  * selected and copied. It moves the position and starts nothing: with no link yet it only cues, and the
  * first play starts from there.
  *
- * THE AUTHOR. No staff name may be shown here: emails stay with admins, and no other name is held, so a
- * note says You or a short id (`noteAuthor`).
+ * THE AUTHOR. HELLO's tables hold no staff name, and an email belongs to the admin allowlist screen alone
+ * (0016), so a note says You or a short id (`noteAuthor`).
  *
  * The rows scroll in their own box, by that box's scroll position, so the page behind never jumps.
  */
@@ -32,10 +38,12 @@ const NOTE_MAX_CHARS = 2000;
 
 const plural = (count: number) => `${count} note${count === 1 ? '' : 's'}`;
 
-interface Draft {
+export interface NoteDraft {
   /** The second the reader pressed. Null: this attempt has nothing to play. */
   sec: number | null;
   text: string;
+  /** The last save of these words failed. */
+  failed?: boolean;
 }
 
 /** A note to bring into view. `nonce` tells a second press on one tick from a re-render. */
@@ -57,6 +65,10 @@ export interface ReviewNotesProps {
   /** The panel writes the playhead's clock here. */
   clockRef: Ref<HTMLSpanElement>;
   cue: NoteCue | null;
+  /** What was left in this attempt's box. Read as the panel opens. */
+  keptDraft: NoteDraft | null;
+  /** The box changed, closed, or its words are on their way: what the page should keep now. */
+  onDraft: (draft: NoteDraft | null) => void;
   onSeek: (sec: number) => void;
   /** Rejects when the note was not saved. */
   onAdd: (text: string, sec: number | null) => Promise<void>;
@@ -111,15 +123,16 @@ export function ReviewNotes({
   positionSec,
   clockRef,
   cue,
+  keptDraft,
+  onDraft,
   onSeek,
   onAdd,
   onRetry,
   className,
 }: ReviewNotesProps) {
   const headingId = useId();
-  const [draft, setDraft] = useState<Draft | null>(null);
+  const [draft, setDraft] = useState<NoteDraft | null>(keptDraft);
   const [saving, setSaving] = useState(false);
-  const [saveFailed, setSaveFailed] = useState(false);
   const [announcement, setAnnouncement] = useState('');
   const savingRef = useRef(false);
   const boxRef = useRef<HTMLTextAreaElement>(null);
@@ -127,9 +140,13 @@ export function ReviewNotes({
   const scrollerRef = useRef<HTMLDivElement>(null);
   const backToAddRef = useRef(false);
 
-  // The box takes focus as it opens; the button gets it back when the box goes.
+  // The box takes focus as it opens; the button gets it back when the box goes. A box that came back
+  // with its attempt was not opened by the reader, so it leaves their focus where it is.
   const open = draft !== null;
+  const wasOpenRef = useRef(open);
   useLayoutEffect(() => {
+    if (wasOpenRef.current === open) return;
+    wasOpenRef.current = open;
     if (open) {
       boxRef.current?.focus({ preventScroll: true });
     } else if (backToAddRef.current) {
@@ -145,10 +162,14 @@ export function ReviewNotes({
     if (row) scroller.scrollTop = Math.max(0, row.offsetTop - scroller.clientHeight / 3);
   }, [cue]);
 
+  const changeDraft = (next: NoteDraft) => {
+    setDraft(next);
+    onDraft(next);
+  };
+
   const close = () => {
     backToAddRef.current = true;
     setDraft(null);
-    setSaveFailed(false);
   };
 
   const save = async () => {
@@ -156,13 +177,14 @@ export function ReviewNotes({
     if (!draft || !text || savingRef.current) return;
     savingRef.current = true;
     setSaving(true);
-    setSaveFailed(false);
+    setDraft({ ...draft, failed: false });
+    onDraft(null);
     try {
       await onAdd(text, draft.sec);
       setAnnouncement(draft.sec === null ? 'Note added.' : `Note added at ${clockText(draft.sec)}.`);
       close();
     } catch {
-      setSaveFailed(true);
+      changeDraft({ ...draft, failed: true });
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -188,7 +210,7 @@ export function ReviewNotes({
             size="sm"
             onClick={() => {
               setAnnouncement('');
-              setDraft({ sec: positionSec ? positionSec() : null, text: '' });
+              changeDraft({ sec: positionSec ? positionSec() : null, text: '' });
             }}
           >
             {/* One flex item: the button spaces its children apart. */}
@@ -220,11 +242,12 @@ export function ReviewNotes({
                   aria-describedby={describedBy}
                   value={draft.text}
                   maxLength={NOTE_MAX_CHARS}
-                  onChange={(event) => setDraft({ ...draft, text: event.target.value })}
+                  readOnly={saving}
+                  onChange={(event) => changeDraft({ ...draft, text: event.target.value })}
                 />
               )}
             </Field>
-            {saveFailed && (
+            {draft.failed && (
               <InlineNotice tone="danger" role="alert" action={<RetryButton onRetry={() => void save()} />}>
                 This note was not saved. Your words are still here.
               </InlineNotice>
@@ -233,7 +256,15 @@ export function ReviewNotes({
               <Button type="submit" size="sm" loading={saving} disabled={!draft.text.trim()}>
                 Save note
               </Button>
-              <Button variant="ghost" size="sm" disabled={saving} onClick={close}>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={saving}
+                onClick={() => {
+                  close();
+                  onDraft(null);
+                }}
+              >
                 Cancel
               </Button>
             </div>

@@ -164,6 +164,68 @@ describe('GET /api/notes', () => {
     const res = await request(makeApp(makeUser('admin'))).get('/api/notes').set(AUTH);
     expect(res.status).toBe(400);
   });
+
+  describe('past the bound', () => {
+    /** The order and the bound as the database applies them: a later `.order` only breaks a tie. */
+    function ordered(rows: Array<Record<string, string>>) {
+      const orders: Array<[string, boolean]> = [];
+      let bound = rows.length;
+      const compare = (a: Record<string, string>, b: Record<string, string>) => {
+        for (const [column, ascending] of orders) {
+          const gap = a[column].localeCompare(b[column]);
+          if (gap !== 0) return ascending ? gap : -gap;
+        }
+        return 0;
+      };
+      const query: any = {
+        select: () => query,
+        eq: () => query,
+        order: (column: string, { ascending }: { ascending: boolean }) => { orders.push([column, ascending]); return query; },
+        limit: (count: number) => { bound = count; return query; },
+        then: (resolve: (v: unknown) => unknown) => Promise.resolve({ data: [...rows].sort(compare).slice(0, bound), error: null }).then(resolve),
+      };
+      return query;
+    }
+    const notes = (count: number) => Array.from({ length: count }, (_, index) => ({
+      ...NOTE_ROW, id: `note-${String(index).padStart(3, '0')}`, created_at: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+    }));
+    const read = async (rows: Array<Record<string, string>>, query = '') => {
+      mockFrom
+        .mockReturnValueOnce(chainable({ data: { owner_id: null }, error: null }))
+        .mockReturnValueOnce(ordered(rows));
+      return request(makeApp(makeUser('admin'))).get(`/api/notes?candidate_id=${CANDIDATE_ID}${query}`).set(AUTH);
+    };
+
+    it('keeps the newest, so a note just added is on the list', async () => {
+      const res = await read(notes(130));
+      expect(res.body.notes).toHaveLength(100);
+      expect(res.body.notes.at(-1).id).toBe('note-129');
+    });
+
+    it('hands them back oldest first, as the page prints them', async () => {
+      const res = await read(notes(130));
+      const ids = res.body.notes.map((note: { id: string }) => note.id);
+      expect(ids[0]).toBe('note-030');
+      expect(ids).toEqual([...ids].sort());
+    });
+
+    it('answers a short list whole, in the same order', async () => {
+      const res = await read(notes(3));
+      expect(res.body.notes.map((note: { id: string }) => note.id)).toEqual(['note-000', 'note-001', 'note-002']);
+    });
+
+    it('takes the newest of a smaller limit too', async () => {
+      const res = await read(notes(10), '&limit=2');
+      expect(res.body.notes.map((note: { id: string }) => note.id)).toEqual(['note-008', 'note-009']);
+    });
+
+    it('cuts two notes of one instant the same way every time, by id', async () => {
+      const at = '2026-01-01T00:00:00.000Z';
+      const rows = [{ ...NOTE_ROW, id: 'note-a', created_at: at }, { ...NOTE_ROW, id: 'note-b', created_at: at }];
+      const res = await read(rows, '&limit=1');
+      expect(res.body.notes.map((note: { id: string }) => note.id)).toEqual(['note-b']);
+    });
+  });
 });
 
 describe('POST /api/notes', () => {

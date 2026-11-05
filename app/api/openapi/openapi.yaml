@@ -5039,7 +5039,7 @@ paths:
         - bearerAuth: []
       responses:
         '200':
-          description: Bounded note list, oldest first.
+          description: Bounded note list. Past the bound the newest notes are the ones kept, oldest of them first.
           content:
             application/json:
               schema:
@@ -7094,7 +7094,7 @@ paths:
             maximum: 100
       responses:
         '200':
-          description: Bounded note list.
+          description: Bounded note list. Past the bound the newest notes are the ones kept, oldest of them first.
           content:
             application/json:
               schema:

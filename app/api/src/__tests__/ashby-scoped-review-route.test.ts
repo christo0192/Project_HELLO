@@ -242,6 +242,35 @@ describe('GET …/:applicationLinkId/notes', () => {
     expect(res.body.notes).toHaveLength(1);
   });
 
+  it('keeps the newest past the bound, and hands them back oldest first', async () => {
+    const rows = Array.from({ length: 130 }, (_, index) => ({
+      id: `n${String(index).padStart(3, '0')}`, candidate_id: CANDIDATE_ID, author_id: RECRUITER_ID, note: 'looks strong',
+      created_at: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+    }));
+    // The order and the bound as the database applies them: newest first, then the first hundred.
+    const orders: Array<{ column: string; ascending: boolean }> = [];
+    let bound = rows.length;
+    const query: any = {
+      select: () => query,
+      eq: () => query,
+      order: (column: string, { ascending }: { ascending: boolean }) => { orders.push({ column, ascending }); return query; },
+      limit: (count: number) => { bound = count; return query; },
+      then: (resolve: (v: unknown) => unknown) => {
+        const sorted = [...rows].sort((a, b) => a.created_at.localeCompare(b.created_at) * (orders[0].ascending ? 1 : -1));
+        return Promise.resolve({ data: sorted.slice(0, bound), error: null }).then(resolve);
+      },
+    };
+    const scoped = mockFrom.getMockImplementation();
+    mockFrom.mockImplementation((table: string) => (table === 'recruiter_notes' ? query : scoped(table)));
+
+    const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}/notes`).set(AUTH);
+    expect(res.status).toBe(200);
+    expect(orders[0]).toEqual({ column: 'created_at', ascending: false });
+    expect(res.body.notes).toHaveLength(100);
+    expect(res.body.notes[0].id).toBe('n030');
+    expect(res.body.notes.at(-1).id).toBe('n129');
+  });
+
   it('applies the same ownership denial and the same 404', async () => {
     wireSupabase({ ownerId: OTHER_RECRUITER_ID });
     const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}/notes`).set(AUTH);

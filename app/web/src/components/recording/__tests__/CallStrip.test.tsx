@@ -122,6 +122,49 @@ describe('a reviewer\'s note', () => {
     expect(screen.getByRole('button', { name: /^Need 1/ }).querySelector('[data-note-flag]')).toBeNull();
   });
 
+  it('keeps its own row inside a dense cluster, so no box can cover it', () => {
+    // 25 minutes on the strip: these four are under 2 px apart, and quotes alone fill the lanes.
+    const { container, props } = strip({
+      durationSec: 1500,
+      moments: [
+        { key: 'q1', sec: 125, kind: 'evidence', number: 1, label: 'Evidence 1, Objection handling, 2:05' },
+        { key: 'q2', sec: 126, kind: 'evidence', number: 2, label: 'Evidence 2, Objection handling, 2:06' },
+        { key: 'n1', sec: 128, kind: 'note', label: 'Note, 2:08' },
+        { key: 'q3', sec: 130, kind: 'evidence', number: 3, label: 'Evidence 3, Objection handling, 2:10' },
+      ],
+    });
+    const flag = screen.getByRole('button', { name: 'Note, 2:08' });
+    const row = flag.parentElement as HTMLElement;
+    expect(row).toHaveAttribute('data-moment-row', 'Notes');
+    expect(within(row).getAllByRole('button')).toEqual([flag]);
+    expect(container.querySelectorAll('[data-moment-row="Moments"] button')).toHaveLength(3);
+    fireEvent.click(flag);
+    expect(props.onMoment).toHaveBeenCalledWith('n1');
+  });
+
+  it('adds no Notes row to a strip with no notes, and no Moments row to one with only notes', () => {
+    const { container, unmount } = strip();
+    expect(container.querySelector('[data-moment-row="Notes"]')).toBeNull();
+    expect(screen.queryByText('Notes')).toBeNull();
+    unmount();
+    const only = strip(noted);
+    expect(only.container.querySelector('[data-moment-row="Moments"]')).toBeNull();
+    expect(screen.getByText('Notes')).toBeInTheDocument();
+  });
+
+  it('stacks notes that sit close together, each in a lane of the row', () => {
+    const { container } = strip({
+      durationSec: 1500,
+      moments: [
+        { key: 'n1', sec: 120, kind: 'note', label: 'Note, 2:00' },
+        { key: 'n2', sec: 121, kind: 'note', label: 'Note, 2:01' },
+      ],
+    });
+    const tops = [...container.querySelectorAll<HTMLElement>('[data-moment-row="Notes"] button')].map((flag) => flag.style.top);
+    expect(new Set(tops).size).toBe(2);
+    expect((container.querySelector('[data-moment-row="Notes"]') as HTMLElement).style.height).toBe('40px');
+  });
+
   it('survives forced colours: a flag is fills, so each carries the mark', () => {
     const { container } = strip(noted);
     const flag = container.querySelector('[data-note-flag]') as HTMLElement;

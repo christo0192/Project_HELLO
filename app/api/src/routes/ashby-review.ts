@@ -155,7 +155,8 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
  *
  * Read-only append-only recruiter notes for the linked candidate. The scoped
  * experience never writes a note — adding one stays on the normal candidate
- * page, which is unchanged.
+ * page, which is unchanged. As GET /api/notes: past the bound the newest notes
+ * are the ones kept, handed back oldest first.
  */
 ashbyReviewRouter.get('/:applicationLinkId/notes', requireRole('viewer'), async (req, res, next) => {
   try {
@@ -167,11 +168,12 @@ ashbyReviewRouter.get('/:applicationLinkId/notes', requireRole('viewer'), async 
       .from('recruiter_notes')
       .select('id, candidate_id, author_id, note, created_at')
       .eq('candidate_id', candidateId)
-      .order('created_at', { ascending: true })
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
       .limit(NOTE_LIMIT);
     if (error) return next(new Error('failed to list notes'));
 
-    res.json({ notes: data ?? [] });
+    res.json({ notes: [...(data ?? [])].reverse() });
   } catch (error) {
     next(error);
   }

@@ -70,6 +70,16 @@ describe('NotesList bounding', () => {
     expect(region).toHaveAttribute('tabindex', '0');
     expect(screen.getByText('note 5')).toBeInTheDocument();
   });
+
+  it('says so when the read has reached its bound: older notes may lie behind it', () => {
+    render(<NotesList notes={notesOf(100)} />);
+    expect(screen.getByText('Showing the newest 100 notes.')).toBeInTheDocument();
+  });
+
+  it('says nothing under the bound, where every note is on the list', () => {
+    render(<NotesList notes={notesOf(99)} />);
+    expect(screen.queryByText(/Showing the newest/)).toBeNull();
+  });
 });
 
 /**

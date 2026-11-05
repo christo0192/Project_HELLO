@@ -230,6 +230,16 @@ describe('the length of a call', () => {
   it('is nothing to draw when neither a length nor a timed turn exists', () => {
     expect(reviewDurationSec(attempt({ recording: recording({ duration_ms: null }) }), [])).toBe(0);
   });
+
+  it('reaches a note past the last turn when no length is stored: the note was pinned to playing media', () => {
+    const unknown = attempt({ recording: recording({ duration_ms: null }) });
+    expect(reviewDurationSec(unknown, [placed(400, 'closing')], [{ sec: 430 }, { sec: null }])).toBe(430);
+    expect(reviewDurationSec(unknown, [placed(400, 'closing')], [{ sec: 100 }])).toBe(400);
+  });
+
+  it('takes no length from a note when one is stored', () => {
+    expect(reviewDurationSec(attempt(), [placed(10, 'opening')], [{ sec: 9000 }])).toBe(600);
+  });
 });
 
 describe('the phase ribbon', () => {

@@ -1653,6 +1653,228 @@ describe('Recording: notes', () => {
     await userEvent.click(tab('Recording'));
     expect(notesTab()).toHaveAttribute('aria-selected', 'true');
   });
+
+  it('takes no typing while a save is on its way, so no word is lost after it', async () => {
+    let finish: (value: unknown) => void = () => undefined;
+    mockApi.addNote.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    await opened(review(), '?tab=recording');
+    await openNotes();
+    await userEvent.click(await addButton());
+    await userEvent.type(textbox(), 'First thought');
+    await userEvent.click(save());
+    await waitFor(() => expect(textbox()).toHaveAttribute('readOnly'));
+    await userEvent.type(textbox(), ' and a second one');
+    expect(textbox()).toHaveValue('First thought');
+    expect(mockApi.addNote).toHaveBeenCalledWith(CANDIDATE, 'First thought', expect.anything());
+    await act(async () => { finish(note({ id: 'n9', note: 'First thought' })); });
+    expect(await within(notesRegion()).findByText('First thought')).toBeInTheDocument();
+  });
+
+  it('gives the box back for typing when a save fails', async () => {
+    mockApi.addNote.mockRejectedValueOnce(new TestApiError('service_unavailable', 503));
+    await opened(review(), '?tab=recording');
+    await openNotes();
+    await userEvent.click(await addButton());
+    await userEvent.type(textbox(), 'Keep me');
+    await userEvent.click(save());
+    await within(notesRegion()).findByRole('alert');
+    expect(textbox()).not.toHaveAttribute('readOnly');
+    await userEvent.type(textbox(), ' and more');
+    expect(textbox()).toHaveValue('Keep me and more');
+  });
+
+  describe('a moment that names a row, with Notes left open', () => {
+    const transcriptShown = () => {
+      expect(tab('Transcript')).toHaveAttribute('aria-selected', 'true');
+      expect(screen.getByRole('region', { name: 'Transcript' })).toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: 'Notes' })).not.toBeInTheDocument();
+    };
+
+    it('brings the transcript back for a quote on Overview, so the lit row is in view', async () => {
+      await opened(review(), '?tab=recording');
+      await openNotes();
+      await userEvent.click(tab('Overview'));
+      await userEvent.click(screen.getByRole('button', { name: /What made you look at it now/ }));
+      await waitFor(() => expect(lit()).toEqual(['3']));
+      transcriptShown();
+    });
+
+    it('brings it back for an evidence box on the strip', async () => {
+      await opened(review(), '?tab=recording');
+      await openNotes();
+      await userEvent.click(screen.getByRole('button', { name: /^Evidence 1,/ }));
+      await waitFor(() => expect(lit()).toEqual(['3']));
+      transcriptShown();
+    });
+
+    it('brings it back for a logged tick on the strip', async () => {
+      await opened(review(), '?tab=recording');
+      await openNotes();
+      await userEvent.click(screen.getByRole('button', { name: /^Need 1 revealed/ }));
+      await waitFor(() => expect(lit()).toEqual(['4']));
+      transcriptShown();
+    });
+
+    it('stays on Notes for a note\'s own flag', async () => {
+      seeded([note()]);
+      await opened(review(), '?tab=recording');
+      await openNotes();
+      await userEvent.click(await screen.findByRole('button', { name: 'Note, 3:20' }));
+      expect(notesTab()).toHaveAttribute('aria-selected', 'true');
+    });
+
+    it('keeps the words in the box, one tab away', async () => {
+      await opened(review(), '?tab=recording');
+      await openNotes();
+      await userEvent.click(await addButton());
+      await userEvent.type(textbox(), 'Half a thought');
+      await userEvent.click(screen.getByRole('button', { name: /^Evidence 1,/ }));
+      transcriptShown();
+      await openNotes();
+      expect(textbox()).toHaveValue('Half a thought');
+    });
+  });
+
+  describe('moving between attempts', () => {
+    const second = () => attempt({ session_id: 's2', attempt_number: 2, turns: [turn(0, 2, 'bot', 'opening', 'Welcome back.')] });
+    const two = () => review({ attempts: [attempt(), second()] });
+    const goTo = (name: string) => userEvent.click(within(screen.getByRole('group', { name: 'Attempt' })).getByRole('button', { name }));
+    const FIRST = 'Attempt 1 (counted)';
+    const RETAKE = 'Attempt 2 (retake)';
+
+    /** The first attempt, with a note half written at 3:20. */
+    async function writing(words: string) {
+      await opened(two(), '?tab=recording&attempt=1&t=200');
+      await openNotes();
+      await userEvent.click(await addButton());
+      await userEvent.type(textbox(), words);
+    }
+
+    it('brings an unsaved note back with its attempt, at the second it was pinned', async () => {
+      await writing('A long thought.');
+      await goTo(RETAKE);
+      expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
+      expect(await addButton()).toBeInTheDocument();
+      await goTo(FIRST);
+      expect(textbox()).toHaveValue('A long thought.');
+      expect(within(notesRegion()).getByLabelText('Note at 3:20')).toBe(textbox());
+      await userEvent.click(save());
+      await waitFor(() => expect(mockApi.addNote).toHaveBeenCalledWith(CANDIDATE, 'A long thought.', { round_id: ROUND, session_id: 's1', media_ms: 200_000 }));
+    });
+
+    it('keeps each attempt\'s draft apart', async () => {
+      await writing('On the first.');
+      await goTo(RETAKE);
+      await userEvent.click(await addButton());
+      await userEvent.type(textbox(), 'On the retake.');
+      await goTo(FIRST);
+      expect(textbox()).toHaveValue('On the first.');
+      await goTo(RETAKE);
+      expect(textbox()).toHaveValue('On the retake.');
+    });
+
+    it('keeps the words when a quote from the other attempt is what moved the page', async () => {
+      await opened(review({ attempts: [second(), attempt()] }), '?tab=recording&attempt=1');
+      await openNotes();
+      await userEvent.click(await addButton());
+      await userEvent.type(textbox(), 'Before the quote.');
+      await userEvent.click(tab('Overview'));
+      await userEvent.click(screen.getByRole('button', { name: /What made you look at it now/ }));
+      await waitFor(() => expect(lit()).toEqual(['3']));
+      await goTo('Attempt 2 (counted)');
+      await openNotes();
+      expect(textbox()).toHaveValue('Before the quote.');
+    });
+
+    it('leaves the reader\'s focus alone when the box comes back', async () => {
+      await writing('Words.');
+      await goTo(RETAKE);
+      await goTo(FIRST);
+      expect(textbox()).not.toHaveFocus();
+      expect(within(screen.getByRole('group', { name: 'Attempt' })).getByRole('button', { name: FIRST })).toHaveFocus();
+    });
+
+    it('stays on Notes, for someone comparing what was written on each', async () => {
+      seeded([note(), note({ id: 'n2', session_id: 's2', note: 'On the retake.', media_ms: 1000 })]);
+      await opened(two(), '?tab=recording&attempt=1');
+      await openNotes();
+      await goTo(RETAKE);
+      expect(notesTab()).toHaveAttribute('aria-selected', 'true');
+      expect(await within(notesRegion()).findByText('On the retake.')).toBeInTheDocument();
+    });
+
+    it('forgets a draft the reader cancelled', async () => {
+      await writing('Never mind.');
+      await userEvent.click(within(notesRegion()).getByRole('button', { name: 'Cancel' }));
+      await goTo(RETAKE);
+      await goTo(FIRST);
+      expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
+    });
+
+    it('forgets a draft once it is saved', async () => {
+      await writing('Saved.');
+      await userEvent.click(save());
+      expect(await within(notesRegion()).findByText('Saved.')).toBeInTheDocument();
+      await goTo(RETAKE);
+      await goTo(FIRST);
+      expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
+    });
+
+    it('never offers words on their way a second time: an append-only note cannot be taken back', async () => {
+      let finish: (value: unknown) => void = () => undefined;
+      mockApi.addNote.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+      await writing('Once only.');
+      await userEvent.click(save());
+      await goTo(RETAKE);
+      await goTo(FIRST);
+      expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
+      expect(mockApi.addNote).toHaveBeenCalledTimes(1);
+      await act(async () => { finish(note({ note: 'Once only.' })); });
+    });
+
+    it('gives the words back, and says so, when that save fails after the reader has moved on', async () => {
+      let fail: (reason: unknown) => void = () => undefined;
+      mockApi.addNote.mockReturnValue(new Promise((_resolve, reject) => { fail = reject; }));
+      await writing('Not lost.');
+      await userEvent.click(save());
+      await goTo(RETAKE);
+      await act(async () => { fail(new TestApiError('service_unavailable', 503)); });
+      await goTo(FIRST);
+      expect(textbox()).toHaveValue('Not lost.');
+      expect(within(notesRegion()).getByRole('alert')).toHaveTextContent('This note was not saved. Your words are still here.');
+    });
+  });
+
+  describe('a recording with no stored length', () => {
+    const unknownLength = () => review({ attempts: [attempt({ recording: recording({ duration_ms: null }) })] });
+
+    it('goes to a note pinned past the last turn, before the media has loaded', async () => {
+      seeded([note({ media_ms: 430_000 })]);
+      await opened(unknownLength(), '?tab=recording');
+      await openNotes();
+      await userEvent.click(await within(notesRegion()).findByRole('button', { name: /^Go to 7:10/ }));
+      expect(screen.getByTestId('position')).toHaveTextContent('7:10');
+      expect(mockApi.getR1Recording).not.toHaveBeenCalled();
+    });
+
+    it('plays from there', async () => {
+      seeded([note({ media_ms: 430_000 })]);
+      await opened(unknownLength(), '?tab=recording');
+      await openNotes();
+      await userEvent.click(await within(notesRegion()).findByRole('button', { name: /^Go to 7:10/ }));
+      const { el, state } = await pressPlay();
+      fireEvent.canPlay(el);
+      await waitFor(() => expect(state.sets).toContain(430));
+    });
+
+    it('draws the scale out to the note, so its flag sits on the strip and not past it', async () => {
+      seeded([note({ media_ms: 430_000 }), note({ id: 'n2', media_ms: 415_000 })]);
+      await opened(unknownLength(), '?tab=recording');
+      const flag = await screen.findByRole('button', { name: 'Note, 6:55' });
+      expect(parseFloat(flag.style.left)).toBeCloseTo((415 / 430) * 100, 3);
+      expect(screen.getByRole('slider', { name: 'Position in the recording' })).toHaveAttribute('aria-valuemax', '430');
+    });
+  });
 });
 
 describe('Recording: following', () => {

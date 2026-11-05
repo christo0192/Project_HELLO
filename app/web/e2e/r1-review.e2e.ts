@@ -377,6 +377,37 @@ test.describe('notes at a moment', () => {
     expect(inPanel).toBe(true);
   });
 
+  test('a flag on a quote\'s own second stays pressable: notes have their own row on the strip', async ({ app, page }) => {
+    stored(app, { media_ms: 318_000, note: 'Right on the quote.' });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await page.getByRole('button', { name: 'Note, 5:18' }).click();
+    await expect(page.getByRole('tab', { name: 'Notes' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('position')).toHaveText('5:18');
+  });
+
+  test('a quote pressed with Notes left open shows its turn beside the video', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await openNotes(page);
+    await page.getByRole('tab', { name: 'Overview' }).click();
+    await page.getByRole('button', { name: /What made you start looking at this now/ }).click();
+    await expect(page.getByRole('tab', { name: 'Transcript' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('[data-turn-row="9"]')).toBeVisible();
+    await expect(page.locator('[data-turn-row="9"]')).toHaveAttribute('aria-current', 'true');
+  });
+
+  test('an unsaved note waits on its attempt while the reader looks at another', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording&t=${R1_REVIEW_SEEK_SEC}`);
+    await openNotes(page);
+    await notes(page).getByRole('button', { name: 'Add note at 1:10' }).click();
+    await page.keyboard.type('Half a thought.');
+    const attempts = page.getByRole('group', { name: 'Attempt', exact: true });
+    await attempts.getByRole('button', { name: /^Attempt 2/ }).click();
+    await expect(notes(page).getByRole('textbox')).toHaveCount(0);
+    await attempts.getByRole('button', { name: /^Attempt 1/ }).click();
+    await expect(notes(page).getByRole('textbox', { name: 'Note at 1:10' })).toHaveValue('Half a thought.');
+    expect(posts(app)).toHaveLength(0);
+  });
+
   test('the arrow keys move the tabs and leave the recording where it is', async ({ app, page }) => {
     await app.goto(`${ADDRESS}?tab=recording&t=${R1_REVIEW_SEEK_SEC}`);
     await page.getByRole('tab', { name: 'Transcript' }).focus();

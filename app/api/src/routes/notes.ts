@@ -93,7 +93,10 @@ async function noteAnchorState(
   return attempt.data ? 'ok' : 'invalid';
 }
 
-/** GET /api/notes?candidate_id=&limit= — viewer read only, ownership-scoped. */
+/**
+ * GET /api/notes?candidate_id=&limit= — viewer read only, ownership-scoped. Past the bound the newest
+ * notes are the ones kept, handed back oldest first, so a note just added is never the one left out.
+ */
 notesRouter.get(
   '/',
   requireRole('viewer'),
@@ -110,11 +113,12 @@ notesRouter.get(
         .from('recruiter_notes')
         .select(NOTE_COLUMNS)
         .eq('candidate_id', candidateId)
-        .order('created_at', { ascending: true })
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
         .limit(limit);
       if (error) return next(new Error('failed to list notes'));
 
-      const body: NoteListResponse = { notes: (data ?? []) as NoteResponse[] };
+      const body: NoteListResponse = { notes: [...((data ?? []) as NoteResponse[])].reverse() };
       res.json(body);
     } catch (error) {
       next(error);

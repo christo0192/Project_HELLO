@@ -5,8 +5,9 @@
  *   - the candidate's turns are grease-pencil orange, the AI voices warm grey, in a row each;
  *   - a turn is a TICK at its start. A talk BAR needs a stored end time: drawing start-to-next-start
  *     would show every silence as talk, so a turn with no end stays a tick;
- *   - an evidence quote is a numbered ink box, a logged moment a plain ink tick, and a reviewer's note
- *     a small ink flag;
+ *   - an evidence quote is a numbered ink box and a logged moment a plain ink tick, in the Moments row;
+ *   - a reviewer's note is a small ink flag in a Notes row of its own: quotes can fill every lane of
+ *     Moments, and a flag drawn under a box could not be pressed;
  *   - a band is a dashed "pencil" outline with its word: part of the recording is not firm;
  *   - the playhead is an ink line.
  *
@@ -105,6 +106,19 @@ const PHASE_LABEL_MIN_PERCENT = 12;
 
 const percent = (value: number) => `${value}%`;
 
+interface MomentRow {
+  label: string;
+  moments: readonly CallStripMoment[];
+  lanes: readonly number[];
+  heightPx: number;
+}
+
+function momentRow(label: string, unsorted: readonly CallStripMoment[], durationSec: number): MomentRow {
+  const moments = [...unsorted].sort((a, b) => a.sec - b.sec);
+  const lanes = assignLanes(moments.map((moment) => moment.sec), durationSec, MOMENT_GAP_PX);
+  return { label, moments, lanes, heightPx: (Math.max(-1, ...lanes) + 1) * LANE_PX };
+}
+
 export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function CallStrip(
   {
     durationSec,
@@ -171,12 +185,14 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
     onSeek(Math.min(durationSec, Math.max(0, target)));
   };
 
-  const sortedMoments = useMemo(() => [...moments].sort((a, b) => a.sec - b.sec), [moments]);
-  const lanes = useMemo(
-    () => assignLanes(sortedMoments.map((moment) => moment.sec), durationSec, MOMENT_GAP_PX),
-    [sortedMoments, durationSec],
+  const momentRows = useMemo(
+    () =>
+      [
+        momentRow('Moments', moments.filter((moment) => moment.kind !== 'note'), durationSec),
+        momentRow('Notes', moments.filter((moment) => moment.kind === 'note'), durationSec),
+      ].filter((row) => row.moments.length > 0),
+    [moments, durationSec],
   );
-  const laneCount = lanes.length > 0 ? Math.max(...lanes) + 1 : 0;
   const rowLabel = 'form-label flex items-center truncate';
 
   return (
@@ -197,11 +213,11 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
                 <span className="truncate">{speaker.label}</span>
               </div>
             ))}
-          {laneCount > 0 && (
-            <div className={rowLabel} style={{ height: laneCount * LANE_PX }}>
-              Moments
+          {momentRows.map((row) => (
+            <div key={row.label} className={rowLabel} style={{ height: row.heightPx }}>
+              {row.label}
             </div>
-          )}
+          ))}
           {bands.length > 0 && <div className={cx(rowLabel, 'h-5')}>Recording</div>}
           {markers.length > 0 && <div className={cx(rowLabel, 'h-5')}>{markersLabel}</div>}
           {/* In the axis row's empty cell: the toggle costs the strip no height of its own. */}
@@ -282,16 +298,16 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
               </div>
             ))}
 
-          {laneCount > 0 && (
-            <div className="pointer-events-none relative" style={{ height: laneCount * LANE_PX }}>
-              {sortedMoments.map((moment, index) => (
+          {momentRows.map((row) => (
+            <div key={row.label} data-moment-row={row.label} className="pointer-events-none relative" style={{ height: row.heightPx }}>
+              {row.moments.map((moment, index) => (
                 <button
                   key={moment.key}
                   type="button"
                   aria-label={moment.label}
                   title={moment.label}
                   onClick={() => onMoment?.(moment.key)}
-                  style={{ left: percent(along(moment.sec, durationSec)), top: lanes[index] * LANE_PX + 2 }}
+                  style={{ left: percent(along(moment.sec, durationSec)), top: row.lanes[index] * LANE_PX + 2 }}
                   className={cx(
                     'pointer-events-auto absolute flex h-4 -translate-x-1/2 items-center justify-center rounded-evidence font-mono text-meta leading-none text-ink',
                     'focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--ink)]',
@@ -313,7 +329,7 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
                 </button>
               ))}
             </div>
-          )}
+          ))}
 
           {bands.length > 0 && (
             <div className="pointer-events-none relative h-5">
