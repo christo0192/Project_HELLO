@@ -525,6 +525,14 @@ describe('OBS-01 Non-finite and out-of-range numeric fields', () => {
     expect(JSON.parse(lines[0])).not.toHaveProperty('duration_sec');
   });
 
+  it('drops paused_sec outside the same bounds as duration_sec', () => {
+    const { lines, log } = makeLog();
+    log.info('unknown_event', { paused_sec: -1 });
+    log.info('unknown_event', { paused_sec: 1_000_001 });
+    expect(JSON.parse(lines[0])).not.toHaveProperty('paused_sec');
+    expect(JSON.parse(lines[1])).not.toHaveProperty('paused_sec');
+  });
+
   it('allows valid port 8787', () => {
     const { lines, log } = makeLog();
     log.info('startup_listen', { port: 8787 });
@@ -547,6 +555,12 @@ describe('OBS-01 Non-finite and out-of-range numeric fields', () => {
     const { lines, log } = makeLog();
     log.info('session_complete', { duration_sec: 0 });
     expect(JSON.parse(lines[0]).duration_sec).toBe(0);
+  });
+
+  it('allows paused_sec: 2.243', () => {
+    const { lines, log } = makeLog();
+    log.info('unknown_event', { paused_sec: 2.243 });
+    expect(JSON.parse(lines[0]).paused_sec).toBe(2.243);
   });
 
   it('allows duration_sec: 86400 (1 day)', () => {

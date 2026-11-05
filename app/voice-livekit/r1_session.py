@@ -1568,8 +1568,9 @@ class _SpeechSlot:
     # R1 cut this speech itself (``_interrupt_session``: a generation hung past its deadline), so
     # an ``interrupted`` item of it was not cut by the candidate (voice barge-in, reviewed fix).
     cut_by_r1: bool = False
-    # What the audio output reported for this speech (``_on_playback_finished``): when its latest
-    # playback finished (wall-clock seconds, None until one has), and the audio played so far.
+    # What the audio output reported for this speech (``_on_playback_finished``): when the audio of
+    # its latest playback stopped (wall-clock seconds, None until one has), and the audio played so
+    # far.
     finished_at: float | None = None
     played_seconds: float = 0.0
 
@@ -4894,10 +4895,11 @@ class R1Interview:
 
     @staticmethod
     def _bot_turn_end(item: Any, slot: _SpeechSlot | None) -> int | None:
-        """Epoch ms the bot finished this row: the audio output's own report, else the SDK's metric.
+        """Epoch ms the bot's audio stopped on this row: its playback's, else the SDK's metric.
 
-        ``metrics["stopped_speaking_at"]`` is taken just after the playout, a moment before it on
-        a line that was cut.  Otherwise None: never the row-write time.
+        A line cut while paused stopped at the pause, not when the cut came (``PlaybackMeter``).
+        ``metrics["stopped_speaking_at"]`` is taken just after the playout and knows nothing of a
+        pause, so it only stands in.  Otherwise None: never the row-write time.
         """
         anchor = None if slot is None else _epoch_ms(slot.finished_at)
         if anchor is None:
@@ -5175,7 +5177,12 @@ class R1Interview:
 
     def _on_agent_state_changed(self, event: Any) -> None:
         self._agent_state = str(getattr(event, "new_state", "") or "")
-        if self._agent_state == "speaking":
+        if self._agent_state == "listening":
+            # Every other way back here waits for the playout, so a playback still open was paused,
+            # and the event comes straight after the pause (``test_r1_sdk_contract`` pins both).
+            self._playback.paused(time.time())
+        elif self._agent_state == "speaking":
+            self._playback.resumed(time.time())
             created = getattr(event, "created_at", None)
             self._claim_current_speech_slot(
                 created if isinstance(created, (int, float)) and not isinstance(created, bool) else None
@@ -5232,6 +5239,7 @@ class R1Interview:
             error_type="r1_playback_silence",
             error_category="cut" if playback.interrupted else "full",
             duration_sec=round(playback.silence_seconds, 3),
+            paused_sec=round(playback.paused_seconds, 3),
             option_count=playback.resumes,
             turn_index=None if slot is None else slot.index,
             phase=None if slot is None else slot.phase,

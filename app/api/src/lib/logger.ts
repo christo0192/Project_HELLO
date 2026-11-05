@@ -61,6 +61,7 @@ export type AllowedMeta = Partial<{
   turn_index: number;
   speaker: string;
   duration_sec: number;
+  paused_sec: number;
   // Phone objective-guard observability (string) — FIX C (2026-09-06)
   rejection_reason: string;
   phase: string;
@@ -77,7 +78,7 @@ const KEY_TYPE_STRING = new Set<string>([
 
 /** Keys whose runtime value must be a number. */
 const KEY_TYPE_NUMBER = new Set<string>([
-  'status', 'http_status', 'port', 'turn_index', 'duration_sec',
+  'status', 'http_status', 'port', 'turn_index', 'duration_sec', 'paused_sec',
 ]);
 
 /** Union: all allowlisted metadata keys. */
@@ -270,6 +271,7 @@ function validateNumericField(key: string, val: number): number | null {
     case 'turn_index':
       return Number.isInteger(val) && val >= 0 ? val : null;
     case 'duration_sec':
+    case 'paused_sec':
       return val >= 0 && val <= 1_000_000 ? val : null;
     default:
       return val;

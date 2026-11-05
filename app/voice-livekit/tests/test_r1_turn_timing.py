@@ -100,6 +100,79 @@ class TestPlaybackMeter(unittest.TestCase):
         self.assertEqual(playback.resumes, 0)
         self.assertEqual(playback.silence_seconds, 0.0)
 
+    def test_a_line_paused_and_then_cut_stopped_at_the_pause_not_at_the_report(self) -> None:
+        meter = PlaybackMeter()
+        meter.started(T0)
+        meter.paused(T0 + 0.5)
+        playback = meter.finished(0.75, interrupted=True, now=T0 + 3.0)
+        self.assertEqual(playback.finished_at, T0 + 0.5)
+        self.assertEqual(playback.paused_seconds, 2.5)
+        self.assertEqual(playback.silence_seconds, 0.0)
+        self.assertEqual(playback.played_seconds, 0.75)
+        self.assertEqual(playback.resumes, 0)
+
+    def test_a_pause_that_came_back_is_counted_and_moves_no_end(self) -> None:
+        meter = PlaybackMeter()
+        meter.started(T0)
+        meter.paused(T0 + 1.0)
+        meter.resumed(T0 + 3.0)
+        meter.started(T0 + 3.0)
+        playback = meter.finished(3.0, interrupted=False, now=T0 + 6.5)
+        self.assertEqual(playback.finished_at, T0 + 6.5)
+        self.assertEqual(playback.paused_seconds, 2.0)
+        self.assertAlmostEqual(playback.silence_seconds, 1.5)
+        self.assertEqual(playback.resumes, 1)
+
+    def test_a_line_cut_after_it_came_back_was_playing_until_the_cut(self) -> None:
+        meter = PlaybackMeter()
+        meter.started(T0)
+        meter.paused(T0 + 1.0)
+        meter.resumed(T0 + 2.0)
+        playback = meter.finished(2.0, interrupted=True, now=T0 + 4.0)
+        self.assertEqual(playback.finished_at, T0 + 4.0)
+        self.assertEqual(playback.paused_seconds, 1.0)
+        self.assertAlmostEqual(playback.silence_seconds, 1.0)
+
+    def test_pauses_add_up_and_a_repeated_report_keeps_the_moment_the_audio_stopped(self) -> None:
+        meter = PlaybackMeter()
+        meter.started(T0)
+        meter.paused(T0 + 1.0)
+        meter.paused(T0 + 1.5)
+        meter.resumed(T0 + 2.0)
+        meter.paused(T0 + 3.0)
+        playback = meter.finished(1.0, interrupted=True, now=T0 + 5.0)
+        self.assertEqual(playback.finished_at, T0 + 3.0)
+        self.assertEqual(playback.paused_seconds, 3.0)
+        self.assertAlmostEqual(playback.silence_seconds, 1.0)
+
+    def test_a_line_that_ran_out_while_paused_ended_when_it_ran_out(self) -> None:
+        """Nothing was left to hold back: the queued tail played, and the room reports no cut."""
+        meter = PlaybackMeter()
+        meter.started(T0)
+        meter.paused(T0 + 1.0)
+        playback = meter.finished(1.2, interrupted=False, now=T0 + 1.2)
+        self.assertEqual(playback.finished_at, T0 + 1.2)
+        self.assertAlmostEqual(playback.paused_seconds, 0.2)
+
+    def test_a_pause_with_no_playback_open_belongs_to_nothing(self) -> None:
+        """The agent goes back to listening after every line: that is no pause of the next one."""
+        meter = PlaybackMeter()
+        meter.paused(T0)
+        meter.started(T0 + 2.0)
+        playback = meter.finished(1.0, interrupted=True, now=T0 + 3.0)
+        self.assertEqual(playback.finished_at, T0 + 3.0)
+        self.assertEqual(playback.paused_seconds, 0.0)
+
+    def test_a_pause_never_reaches_the_next_playback(self) -> None:
+        meter = PlaybackMeter()
+        meter.started(T0)
+        meter.paused(T0 + 1.0)
+        meter.finished(1.0, interrupted=True, now=T0 + 2.0)
+        meter.started(T0 + 10.0)
+        playback = meter.finished(1.0, interrupted=True, now=T0 + 11.0)
+        self.assertEqual(playback.finished_at, T0 + 11.0)
+        self.assertEqual(playback.paused_seconds, 0.0)
+
     def test_an_unusable_report_is_read_as_no_report(self) -> None:
         for bad in (None, "soon", True, float("nan"), float("inf")):
             with self.subTest(created_at=bad):
@@ -254,6 +327,11 @@ class TimingCase(R1TestCase):
                 SimpleNamespace(playback_position=position, interrupted=interrupted),
             )
 
+    def agent_goes(self, state: str, at: float) -> None:
+        """The agent's state changes: to ``listening`` when a voice pauses the line, and back."""
+        with mock.patch("r1_session.time.time", return_value=T0 + at):
+            self.session.emit("agent_state_changed", SimpleNamespace(new_state=state))
+
     def deliver(self, handle: FakeSpeechHandle, *, interrupted: bool = False, metrics=None) -> int:
         """The SDK reports the delivered line (after its playout), then the speech ends."""
         message = FakeChatMessage(handle.text, interrupted=interrupted)
@@ -311,6 +389,37 @@ class TestBotRows(TimingCase):
         self.assertEqual(self.kwargs[index]["played_ms"], 1_500)
         self.assertEqual(self.kwargs[index]["ended_at_ms"], T0_MS + 2_000)
         self.assertIs(self.kwargs[index]["interrupted"], True)
+
+    async def test_a_line_the_candidates_voice_paused_and_then_cut_ends_where_the_audio_stopped(self) -> None:
+        """The room reports the cut only after their barge-in: the row must not cover it."""
+        handle = self.begin()
+        self.output.emit("playback_started", SimpleNamespace(created_at=T0))
+        self.agent_goes("listening", 0.51)
+        self.playback_ends(3.0, 0.76, interrupted=True)
+        index = self.deliver(handle, interrupted=True)
+        await self.flush()
+        self.assertEqual(self.kwargs[index]["ended_at_ms"], T0_MS + 510)
+        self.assertEqual(self.kwargs[index]["played_ms"], 760)
+        self.assertIs(self.kwargs[index]["interrupted"], True)
+
+    async def test_a_paused_line_that_came_back_ends_when_it_finished(self) -> None:
+        handle = self.begin()
+        self.output.emit("playback_started", SimpleNamespace(created_at=T0))
+        self.agent_goes("listening", 1.0)
+        self.agent_goes("speaking", 3.0)
+        self.output.emit("playback_started", SimpleNamespace(created_at=T0 + 3.0))
+        self.playback_ends(6.0, 3.0)
+        index = self.deliver(handle)
+        await self.flush()
+        self.assertEqual(self.kwargs[index]["ended_at_ms"], T0_MS + 6_000)
+
+    async def test_the_agent_listening_again_after_a_line_moves_no_end(self) -> None:
+        handle = self.begin()
+        self.playback(0.0, 2.0, 2.0)
+        self.agent_goes("listening", 2.1)
+        index = self.deliver(handle)
+        await self.flush()
+        self.assertEqual(self.kwargs[index]["ended_at_ms"], T0_MS + 2_000)
 
     async def test_the_playback_report_wins_over_the_sdks_metric(self) -> None:
         handle = self.begin()
@@ -476,6 +585,7 @@ class TestPlaybackLine(TimingCase):
         entry = self.line(lines)
         self.assertEqual(entry["duration_sec"], 2.5)
         self.assertEqual(entry["error_category"], "full")
+        self.assertEqual(entry["paused_sec"], 0.0)
         self.assertEqual(entry["option_count"], 0)
         self.assertEqual(entry["schema"], "learner")
         self.assertEqual(entry["phase"], "icebreaker")
@@ -491,6 +601,33 @@ class TestPlaybackLine(TimingCase):
         self.assertEqual(entry["error_category"], "cut")
         self.assertEqual(entry["option_count"], 1)
         self.assertEqual(entry["duration_sec"], 3.0)
+
+    async def test_a_barge_in_is_its_own_number_and_never_reads_as_a_fragment_wait(self) -> None:
+        """A line paused and then cut never counts a resume, so the hold must show by itself."""
+        with capture_r1_logs() as lines:
+            self.begin()
+            self.output.emit("playback_started", SimpleNamespace(created_at=T0))
+            self.agent_goes("listening", 0.51)
+            self.playback_ends(2.75, 0.76, interrupted=True)
+        entry = self.line(lines)
+        self.assertEqual(entry["error_category"], "cut")
+        self.assertEqual(entry["option_count"], 0)
+        self.assertEqual(entry["paused_sec"], 2.24)
+        self.assertEqual(entry["duration_sec"], 0.0)
+
+    async def test_a_hold_that_came_back_leaves_only_the_real_gap_in_the_silence(self) -> None:
+        with capture_r1_logs() as lines:
+            self.begin()
+            self.output.emit("playback_started", SimpleNamespace(created_at=T0))
+            self.agent_goes("listening", 1.0)
+            self.agent_goes("speaking", 3.0)
+            self.output.emit("playback_started", SimpleNamespace(created_at=T0 + 3.0))
+            self.playback_ends(6.5, 3.0)
+        entry = self.line(lines)
+        self.assertEqual(entry["error_category"], "full")
+        self.assertEqual(entry["option_count"], 1)
+        self.assertEqual(entry["paused_sec"], 2.0)
+        self.assertEqual(entry["duration_sec"], 1.5)
 
     async def test_every_playback_gets_its_own_line(self) -> None:
         with capture_r1_logs() as lines:
@@ -529,7 +666,7 @@ class TestPlaybackLine(TimingCase):
         self.assertLessEqual(
             set(entry),
             {"timestamp", "level", "component", "event", "correlationId", "error_type", "error_category",
-             "duration_sec", "option_count", "turn_index", "phase", "schema"},
+             "duration_sec", "paused_sec", "option_count", "turn_index", "phase", "schema"},
         )
         blob = json.dumps(lines)
         for secret in (poison, "Zanzibarella", SESSION_ID, ROOM_NAME):

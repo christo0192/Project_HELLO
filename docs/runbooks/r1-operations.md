@@ -2746,20 +2746,26 @@ has no click-to-seek.
 
 #### Turn timing facts and the playback line (0136)
 
-For new interviews the worker stores three extra facts on each `transcript_turns` row: `turn_ended_at_ms` (AI row: its
-playback finished; candidate row: the voice-activity end of speech, back-dated by the SDK to the last voiced moment),
+For new interviews the worker stores three extra facts on each `transcript_turns` row: `turn_ended_at_ms` (AI row: when
+its audio stopped; candidate row: the voice-activity end of speech, back-dated by the SDK to the last voiced moment),
 `ai_voice` (`interviewer` or `learner`) and `ai_played_ms` (audio that played; less than the line's length if it was cut).
+The candidate's voice only pauses a line, and the cut comes later, when their speech is transcribed: a line paused and
+then cut ends at the pause, not at the cut, so it never covers their barge-in. Do not work an AI end out from the start
+plus `ai_played_ms`: on a paused line that runs about 0.25 s over, because what the pause dropped still counts as played.
 All are nullable and a missing value is normal: older interviews have none, and a candidate row has no end when it closed
 while they were still speaking or had no start. The phone lane never writes them. A write these extras make fail is
 logged as `r1_turn_timing_dropped` (`error_category` = the exception type) and made again without them, so the row
 survives; one of these means the migration is missing or a value is wrong, not that a turn was lost.
 
 Each AI playback logs one `r1_playback_silence` line, recording on or off: `duration_sec` = seconds of silence inside
-that playback (finish, less the first frame, less the audio played), `error_category` = `full` or `cut`, `option_count` =
-times it was paused and resumed, `turn_index` and `phase` = its transcript row, `schema` = the voice. It has numbers and
-fixed labels only. Read it this way: about 0.1-0.25 s on a line that played straight through is the room reporting the
-end a little late, not a pause. A larger number with `option_count` 0 is the wait before a later speech fragment or the
-thinking filler's wait. With `option_count` above 0 it includes a pause the candidate's voice caused.
+that playback that nothing explains (finish, less the first frame, less the audio played, less `paused_sec`),
+`paused_sec` = seconds the candidate's voice held the line, whether it came back or was cut, `error_category` = `full` or
+`cut`, `option_count` = times it came back after a pause (a line paused and then cut never counts), `turn_index` and
+`phase` = its transcript row, `schema` = the voice. It has numbers and fixed labels only. Read it this way: about
+0.1-0.25 s on a line that played straight through is the room reporting the end a little late, not a pause. A larger
+`duration_sec` is the wait before a later speech fragment or the thinking filler's wait, on `full` and `cut` lines alike:
+a barge-in sits in `paused_sec`, never here, so size that wait from `duration_sec` alone. On a paused line it reads about
+0.25 s low, because the audio played is over by that much.
 `r1_playback_watch_unavailable` means the session had no audio output to follow, so there are no such lines and AI rows
 fall back to the SDK's `stopped_speaking_at` with no `ai_played_ms`.
 

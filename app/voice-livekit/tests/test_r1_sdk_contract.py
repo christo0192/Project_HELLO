@@ -628,6 +628,41 @@ class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
             source = inspect.getsource(task)
             self.assertLess(source.index("stopped_speaking_at = time.time()"), source.index("_conversation_item_added(msg)"))
 
+    def test_a_voice_pauses_a_line_first_and_the_cut_is_reported_later(self) -> None:
+        """How an AI row finds where its audio stopped (0136).
+
+        A voice barge-in only pauses the line, and says so by leaving ``speaking``.  The room reports
+        the line finished at the cut, which comes when the speech is transcribed, so that report is
+        no end.  Every other way back to ``listening`` waits for the playout, so a playback still
+        open then was paused.  A pause that comes to nothing goes back through ``speaking``; a cut
+        does not, and it ends the speech before it lets the audio go.
+        """
+        from livekit.agents.voice import generation
+
+        pause = inspect.getsource(AgentActivity._interrupt_by_audio_activity)
+        self.assertLess(
+            pause.index("audio_output.pause()"), pause.index('self._session._update_agent_state("listening")')
+        )
+        self.assertLess(pause.index("if self._pause_enabled():"), pause.index("self._current_speech.interrupt()"))
+
+        resume = inspect.getsource(AgentActivity._start_false_interruption_timer)
+        self.assertLess(
+            resume.index("self._session._update_agent_state("), resume.index("audio_output.resume()")
+        )
+
+        cut = inspect.getsource(AgentActivity._cancel_speech_pause)
+        self.assertNotIn("_update_agent_state", cut)
+        self.assertLess(cut.index("self._paused_speech.handle.interrupt()"), cut.index("_wait_for_generation()"))
+        self.assertLess(cut.index("_wait_for_generation()"), cut.index("self._session.output.audio.resume()"))
+        self.assertIn("audio_output.clear_buffer()", inspect.getsource(generation.forward_generation))
+
+        for task in (AgentActivity._tts_task_impl, AgentActivity._pipeline_reply_task_impl):
+            source = inspect.getsource(task)
+            self.assertLess(
+                source.index("stopped_speaking_at = time.time()"),
+                source.rindex('self._session._update_agent_state("listening")'),
+            )
+
     def test_the_camera_symbols_the_picture_capture_relies_on(self) -> None:
         import r1_recorder
 
@@ -745,7 +780,8 @@ class _RecordingWriter:
 class TestR1PlaybackOnTheRealOutput(unittest.IsolatedAsyncioTestCase):
     """The room's own audio output, under the recorder's tap, reporting one line with a gap in it."""
 
-    async def test_a_gap_inside_a_line_reaches_the_row_and_the_log_line(self) -> None:
+    async def _line_on_the_real_output(self) -> SimpleNamespace:
+        """An interview following the room's output under the tap, with one speech started on it."""
         import r1_recorder
         import r1_session
         from livekit.agents.voice.room_io._output import _ParticipantAudioOutput
@@ -785,39 +821,85 @@ class TestR1PlaybackOnTheRealOutput(unittest.IsolatedAsyncioTestCase):
         session.current_speech = handle
         session.emit("agent_state_changed", AgentStateChangedEvent(old_state="listening", new_state="speaking"))
 
-        def audio(seconds: float) -> rtc.AudioFrame:
-            samples = int(24000 * seconds)
-            return rtc.AudioFrame(
-                data=bytes(samples * 2), sample_rate=24000, num_channels=1, samples_per_channel=samples
-            )
-
         logged: list = []
         previous = r1_session._log._writer
         r1_session._log._writer = lambda raw: logged.append(json.loads(raw))
         self.addCleanup(setattr, r1_session._log, "_writer", previous)
+        return SimpleNamespace(
+            tap=tap, session=session, interview=interview, handle=handle, rows=rows, logged=logged
+        )
+
+    @staticmethod
+    def _audio(seconds: float) -> rtc.AudioFrame:
+        samples = int(24000 * seconds)
+        return rtc.AudioFrame(
+            data=bytes(samples * 2), sample_rate=24000, num_channels=1, samples_per_channel=samples
+        )
+
+    async def _delivered_row(self, line: SimpleNamespace, *, interrupted: bool) -> dict:
+        item = ChatContext().add_message(
+            role="assistant", content="a line with a gap in it", interrupted=interrupted
+        )
+        line.handle._item_added([item])
+        line.session.emit("conversation_item_added", ConversationItemAddedEvent(item=item))
+        line.session.current_speech = None
+        await line.interview._drain_background()
+        (row,) = line.rows.values()
+        return row
+
+    def _silence_line(self, line: SimpleNamespace) -> dict:
+        lines = [entry for entry in line.logged if entry.get("error_type") == "r1_playback_silence"]
+        self.assertEqual(len(lines), 1, line.logged)
+        return lines[0]
+
+    async def test_a_line_a_voice_paused_and_then_cut_ends_where_the_audio_stopped(self) -> None:
+        """The order ``_interrupt_by_audio_activity`` and then ``_cancel_speech_pause`` run it in."""
+        line = await self._line_on_the_real_output()
+        await line.tap.capture_frame(self._audio(2.0))
+        line.tap.flush()
+        await asyncio.sleep(0.5)
+
+        line.tap.pause()
+        line.session.emit(
+            "agent_state_changed", AgentStateChangedEvent(old_state="speaking", new_state="listening")
+        )
+        stopped = time.time()
+        await asyncio.sleep(1.0)  # the candidate talks on: the final comes when they have finished
+
+        line.tap.clear_buffer()
+        await line.tap.wait_for_playout()
+        line.tap.resume()
+
+        entry = self._silence_line(line)
+        self.assertEqual(entry["error_category"], "cut")
+        self.assertEqual(entry["option_count"], 0)
+        self.assertGreater(entry["paused_sec"], 0.9)
+        self.assertLess(entry["paused_sec"], 1.3)
+        self.assertLess(entry["duration_sec"], 0.3)
+
+        row = await self._delivered_row(line, interrupted=True)
+        self.assertAlmostEqual(row["ended_at_ms"], stopped * 1000, delta=20)
+        self.assertLess(row["played_ms"], 1000)  # (over by what the pause dropped: never the end)
+
+    async def test_a_gap_inside_a_line_reaches_the_row_and_the_log_line(self) -> None:
+        line = await self._line_on_the_real_output()
 
         before = time.time()
-        await tap.capture_frame(audio(0.2))
+        await line.tap.capture_frame(self._audio(0.2))
         await asyncio.sleep(0.6)  # the wait before a later fragment: nothing is playing
-        await tap.capture_frame(audio(0.2))
-        tap.flush()
-        await tap.wait_for_playout()
+        await line.tap.capture_frame(self._audio(0.2))
+        line.tap.flush()
+        await line.tap.wait_for_playout()
         after = time.time()
 
-        lines = [line for line in logged if line.get("error_type") == "r1_playback_silence"]
-        self.assertEqual(len(lines), 1, logged)
-        self.assertGreater(lines[0]["duration_sec"], 0.3)
-        self.assertLess(lines[0]["duration_sec"], 1.0)
-        self.assertEqual(lines[0]["schema"], "learner")
-        self.assertEqual(lines[0]["error_category"], "full")
+        entry = self._silence_line(line)
+        self.assertGreater(entry["duration_sec"], 0.3)
+        self.assertLess(entry["duration_sec"], 1.0)
+        self.assertEqual(entry["paused_sec"], 0.0)
+        self.assertEqual(entry["schema"], "learner")
+        self.assertEqual(entry["error_category"], "full")
 
-        item = ChatContext().add_message(role="assistant", content="a line with a gap in it")
-        handle._item_added([item])
-        session.emit("conversation_item_added", ConversationItemAddedEvent(item=item))
-        session.current_speech = None
-        await interview._drain_background()
-
-        (row,) = rows.values()
+        row = await self._delivered_row(line, interrupted=False)
         self.assertEqual(row["voice"], "learner")
         self.assertEqual(row["played_ms"], 400)
         self.assertGreaterEqual(row["ended_at_ms"], int(before * 1000))

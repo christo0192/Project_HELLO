@@ -312,6 +312,16 @@ class TestKeyTypeEnforcement(unittest.TestCase):
         log._emit("info", "startup_listen", {"port": "abc"})
         self.assertNotIn("port", json.loads(lines[0]))
 
+    def test_paused_sec_is_a_bounded_measurement(self) -> None:
+        for good in (0, 2.243, 1_000_000):
+            lines: list[str] = []
+            make_logger(lines)._emit("info", "unknown_event", {"paused_sec": good})
+            self.assertEqual(json.loads(lines[0])["paused_sec"], good)
+        for bad in (-1, 1_000_001, float("nan"), float("inf"), True, "2.2"):
+            lines = []
+            make_logger(lines)._emit("info", "unknown_event", {"paused_sec": bad})
+            self.assertNotIn("paused_sec", json.loads(lines[0]), bad)
+
     def test_rejects_number_in_string_key(self) -> None:
         lines: list[str] = []
         log = make_logger(lines)
