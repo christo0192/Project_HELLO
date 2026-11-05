@@ -2594,6 +2594,12 @@ Recording happens only when ALL of these say yes; with any lock off an R1 interv
 | Worker capability: `R1_RECORDING=on`, `R1_VIDEO_RECORDING=on`, optional `R1_VIDEO_X264_PRESET` (`ultrafast`/`superfast`/`veryfast`) | Fly secrets on `project-hello-voice`; must be ABSENT from `fly.toml` and `fly.phone.toml` (validator) | anything but exactly `on`: no recorder; `R1_VIDEO_RECORDING` not `on`: audio only |
 | Operational switch: `r1_settings.recording_mode` `off` / `audio` / `av` | DB, admin `PUT /api/admin/r1/settings` or SQL | `off` (default), instant, no deploy |
 
+`R1_RECORDER_KEEP_PAUSES` (Fly secret on `project-hello-voice`, default on, absent from `fly.toml`) is not a lock: it
+keeps the silence inside one AI playback (the thinking filler's wait, a slow second speech call) in the file, so the AI
+voice sits where its transcript row says, in the MP4 and the OGG alike. Rollback, in a zero-live window:
+`fly secrets set R1_RECORDER_KEEP_PAUSES=0 -a project-hello-voice` (the SDK's own tap: that silence is dropped and the
+line lands late by it). It applies to new recordings only; stored ones never change, and the phone lane does not use it.
+
 Plus the candidate's live consent containing `video_audio_recording` (checked on every worker call). Effective mode
 = min(worker capability, `recording_mode`) with `off < audio < av`; the encoder self-test can lower it at run
 time (no `libx264`: audio; no `aac` or no encoder: OGG only). API knobs (optional, out of range = config `invalid`):

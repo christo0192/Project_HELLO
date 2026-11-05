@@ -417,6 +417,36 @@ class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
         self.assertIn("self.__recording_io.recording", inspect.getsource(rio.RecorderAudioInput.__anext__))
         self.assertIn("self.__recording_io.recording", inspect.getsource(rio.RecorderAudioOutput.capture_frame))
 
+    def test_the_output_tap_puts_back_every_interval_in_its_pause_list(self) -> None:
+        """``r1_recorder``'s keep-pauses tap subclasses ``RecorderAudioOutput`` and adds the silence inside
+        a playback to the SDK's private list of pause intervals, so the SDK's own code places it (in
+        wall-clock order, positions measured back from the end of the playback).  The list's mangled name,
+        the arithmetic and the write are a fact about 1.6.4.
+        """
+        from types import SimpleNamespace
+
+        from livekit.agents.voice.recorder_io import recorder_io as rio
+
+        built = inspect.getsource(rio.RecorderIO.record_output)
+        self.assertIn("self._out_record = RecorderAudioOutput(", built)
+        self.assertEqual(
+            list(inspect.signature(rio.RecorderAudioOutput.__init__).parameters),
+            ["self", "recording_io", "audio_output", "write_fnc"],
+        )
+        self.assertIn(
+            "self.__pause_wall_times: list[tuple[float, float]] = []",
+            inspect.getsource(rio.RecorderAudioOutput.__init__),
+        )
+        finished = inspect.getsource(rio.RecorderAudioOutput.on_playback_finished)
+        self.assertIn("for pause_start, pause_end in self.__pause_wall_times:", finished)
+        self.assertIn("playback_start_time = finish_time - playback_position - total_pause_duration", finished)
+        self.assertIn("position = (pause_start - playback_start_time) - accumulated_pause", finished)
+        self.assertIn("self.__write(buf)", finished)
+        self.assertIn("finish_time = self.__current_pause_start or time.time()", finished)
+        tap = rio.RecorderAudioOutput(recording_io=SimpleNamespace(recording=False), write_fnc=lambda _buf: None)
+        self.assertEqual(tap._RecorderAudioOutput__pause_wall_times, [])
+        self.assertIs(tap.recorder_io, tap._RecorderAudioOutput__recording_io)
+
     def test_the_first_input_chunk_is_padded_once_with_silence_the_mixer_can_recognise(self) -> None:
         """What the tee's trim of a chunk that is ahead of the clock relies on (review round 1).
 
