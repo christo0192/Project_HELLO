@@ -43,7 +43,7 @@ export function ProportionBar({
       <span className="w-28 shrink-0 truncate text-ink-secondary">{label}</span>
       <span aria-hidden="true" className="h-1.5 flex-1 overflow-hidden rounded-full bg-ink/[0.06]">
         <span
-          className={cx('block h-full rounded-full', fills[tone])}
+          className={cx('data-fill block h-full rounded-full', fills[tone])}
           style={{ width: `${pct}%` }}
         />
       </span>

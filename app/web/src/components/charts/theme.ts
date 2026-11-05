@@ -27,8 +27,8 @@ function token(name: string): string {
  * index.css, so a chart cannot drift from the page around it.
  *
  * The categorical cycle is ink steps, not hues: a series is told apart by its
- * printed label and its marker shape (series.ts), and an outcome is not coloured
- * good or bad. Neighbours in the cycle are at least 1.5:1 from each other and
+ * printed label, its dash and its marker shape (series.ts), and an outcome is not
+ * coloured good or bad. Neighbours in the cycle are at least 1.5:1 from each other and
  * every step is at least 3:1 on paper. The voice hue never appears here: orange
  * means the candidate's voice and nothing else.
  */

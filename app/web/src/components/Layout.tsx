@@ -29,9 +29,12 @@
  * - Lazy route chunks suspend inside `<Suspense>` with a small loading
  *   fallback (route components are React.lazy in App.tsx). A route appears at
  *   once: nothing rises in.
+ * - The page is keyed on the path, so it never outlives its URL. A route such
+ *   as `/candidates/:id` reuses one component for every id, and a read still in
+ *   flight would otherwise land on the next person's page.
  */
 
-import { Suspense, useEffect, useRef, useState } from 'react';
+import { Fragment, Suspense, useEffect, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth, type MembershipRole } from '../lib/auth';
@@ -380,7 +383,9 @@ export function Layout() {
           <div className="mx-auto max-w-page px-4 py-6 sm:p-6">
             <ErrorBoundary resetKey={location.pathname}>
               <Suspense fallback={<LoadingPanel />}>
-                <Outlet />
+                <Fragment key={location.pathname}>
+                  <Outlet />
+                </Fragment>
               </Suspense>
             </ErrorBoundary>
           </div>

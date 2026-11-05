@@ -124,7 +124,7 @@ export function Meter({
         )}
       >
         <div
-          className="h-full rounded-full"
+          className="data-fill h-full rounded-full"
           style={{ width: `${pct}%`, backgroundColor: bandFill[band] }}
         />
       </div>

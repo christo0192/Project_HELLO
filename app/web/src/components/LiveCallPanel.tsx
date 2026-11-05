@@ -346,7 +346,7 @@ export function LiveCallPanel({
                     className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
                       isBot
                         ? "rounded-tl-sm bg-gray-100 text-gray-800"
-                        : "rounded-tr-sm bg-accent-600 text-white"
+                        : "rounded-tr-sm border border-line-strong bg-surface text-ink"
                     }`}
                   >
                     {presented.text}

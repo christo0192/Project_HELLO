@@ -218,5 +218,5 @@ export function BarList({
 
 /** The fill is printed at its share. Nothing grows in. */
 function Fill({ pct, className }: { pct: number; className: string }) {
-  return <span className={cx('block h-full rounded-chip', className)} style={{ width: `${pct}%` }} />;
+  return <span className={cx('data-fill block h-full rounded-chip', className)} style={{ width: `${pct}%` }} />;
 }

@@ -178,6 +178,19 @@ describe('LineChart truthfulness', () => {
     expect(new Set(lines.map((line) => line.symbol)).size).toBe(2);
   });
 
+  it('dashes the second line, because a marker is hidden on a dense series', () => {
+    // Two series that mean opposite things, at 30 days: past 20 points the chart
+    // shows no markers, so the dash is what still tells the lines apart.
+    const days = Array.from({ length: 30 }, (_, i) => ({ label: `${i + 1} Sep`, value: i }));
+    const { lines } = buildLineSeries(
+      [{ name: 'One', data: days }, { name: 'Two', data: days }],
+      { colors: ['#000000', '#111111'] },
+    );
+    expect(lines.every((line) => line.showSymbol === false)).toBe(true);
+    expect(lines[0].lineStyle?.type).toBe('solid');
+    expect(lines[1].lineStyle?.type).toEqual([6, 4]);
+  });
+
   it('draws no area under a line: a wash would be a gradient by another name', () => {
     const { lines } = buildLineSeries([{ name: 'One', data: [{ label: '1 Sep', value: 1 }] }], { colors: ['#000000'] });
     expect(lines[0].areaStyle).toBeUndefined();
@@ -219,6 +232,31 @@ describe('LineChart truthfulness', () => {
     expect(screen.getByRole('cell', { name: '40%' })).toBeInTheDocument();
     expect(screen.getByRole('cell', { name: 'No data' })).toBeInTheDocument();
     expect(table.textContent).not.toContain('0%No');
+  });
+
+  it('prints each line\'s own dash and marker in the legend', () => {
+    // The legend used to draw the same bar for both, so a reader could not learn
+    // which line was which without hovering for the tooltip.
+    allowEchartsInitWarnings();
+    const { container } = render(
+      <LineChart
+        title="Screening outcomes"
+        unit="%"
+        series={[
+          { name: 'Qualified', data: [{ label: '1 Sep', value: 40 }] },
+          { name: 'Disqualified', data: [{ label: '1 Sep', value: 10 }] },
+        ]}
+        height={120}
+        renderer="svg"
+      />,
+    );
+    const keys = [...container.querySelectorAll('[data-series-key]')];
+    expect(keys).toHaveLength(2);
+    const [solid, dashed] = keys.map((key) => key.querySelector('line')!);
+    expect(solid.getAttribute('stroke-dasharray')).toBeNull();
+    expect(dashed.getAttribute('stroke-dasharray')).toBe('6 4');
+    expect(keys[0].querySelector('circle')).not.toBeNull();
+    expect(keys[1].querySelector('rect')).not.toBeNull();
   });
 });
 

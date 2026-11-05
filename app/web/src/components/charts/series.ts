@@ -80,6 +80,24 @@ export function unionLabels(series: LineChartSeries[]): string[] {
 const MARKERS = ['circle', 'rect', 'triangle', 'diamond'] as const;
 
 /**
+ * Dash per series, in cycle order; `null` is a solid line. The cycle is ink
+ * steps, so two lines that mean opposite things differ only by a grey. A marker
+ * cannot settle that alone, because markers are hidden past 20 points; a dash
+ * holds at any density.
+ */
+const DASHES: ReadonlyArray<readonly number[] | null> = [null, [6, 4], [2, 3], [8, 3, 2, 3]];
+
+export interface SeriesStroke {
+  marker: (typeof MARKERS)[number];
+  dash: readonly number[] | null;
+}
+
+/** How series `index` is drawn. The line and its legend key both read this. */
+export function seriesStroke(index: number): SeriesStroke {
+  return { marker: MARKERS[index % MARKERS.length], dash: DASHES[index % DASHES.length] };
+}
+
+/**
  * The ECharts line series for `series`, on the union of their labels.
  *
  * Exported so the two truthfulness rules are asserted directly rather than
@@ -96,6 +114,7 @@ export function buildLineSeries(
   const lines: LineSeriesOption[] = series.map((s, index) => {
     const byLabel = new Map(s.data.map((d) => [d.label, d.value]));
     const color = s.color ?? colors[index % colors.length];
+    const { marker, dash } = seriesStroke(index);
     return {
       type: 'line',
       name: s.name,
@@ -103,8 +122,8 @@ export function buildLineSeries(
       data: labels.map((label) => byLabel.get(label) ?? null),
       smooth: false,
       connectNulls: false,
-      // The cycle is ink steps, so a shape tells two lines apart without hue.
-      symbol: MARKERS[index % MARKERS.length],
+      // The cycle is ink steps, so a shape and a dash tell lines apart without hue.
+      symbol: marker,
       // At 5px plus a 1.5px border markers merge into a solid band once
       // points are closer than ~8px, which a 90-day half-width chart
       // reaches well before its end.
@@ -112,7 +131,7 @@ export function buildLineSeries(
       // Hiding markers is only safe when consecutive points are
       // consecutive periods; `discrete` says they may not be.
       showSymbol: discrete || labels.length <= 20,
-      lineStyle: { width: 2, color },
+      lineStyle: { width: 2, color, type: dash ? [...dash] : 'solid' },
       itemStyle: { color, borderColor: surface, borderWidth: 1.5 },
       emphasis: { focus: 'series' },
     };

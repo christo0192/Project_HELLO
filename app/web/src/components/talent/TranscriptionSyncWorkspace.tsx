@@ -695,7 +695,7 @@ export function TranscriptionSyncWorkspace({
             <button
               type="button"
               onClick={() => setLegsRefreshKey((k) => k + 1)}
-              className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline"
+              className="textlink text-xs font-medium text-[var(--c-accent)]"
             >
               Retry
             </button>

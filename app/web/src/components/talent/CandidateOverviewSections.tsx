@@ -46,7 +46,7 @@ import { sessionModeLabel } from '../../lib/session-mode';
 
 /** The quiet inline action style shared by every row link/button here. */
 const ROW_ACTION =
-  'rounded-sm text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] disabled:cursor-wait disabled:opacity-60';
+  'textlink rounded-sm text-xs font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] disabled:cursor-wait disabled:opacity-60';
 
 /** One label/value row inside the profile definition list. */
 export function Field({ label, children }: { label: string; children: ReactNode }) {

@@ -15,9 +15,10 @@
  *   - axe structural compliance
  */
 
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Layout, pageTitleFor } from './Layout';
 
@@ -75,6 +76,54 @@ function sidebarInert(): boolean {
 
 beforeEach(() => {
   setAuth();
+});
+
+describe('a page never outlives its URL', () => {
+  /** A record page with no stale guard, which is what most routed pages are. */
+  function RecordPage({ reads }: { reads: Record<string, Promise<string>> }) {
+    const { id } = useParams<{ id: string }>();
+    const [name, setName] = useState('Loading');
+    useEffect(() => {
+      void reads[id ?? ''].then(setName);
+    }, [id, reads]);
+    return (
+      <>
+        <p data-testid="record-name">{name}</p>
+        <Link to="/candidates/second">Open the second record</Link>
+      </>
+    );
+  }
+
+  it('drops a read still in flight when the path changes under the same route', async () => {
+    // One route serves every id, so without a key on the path the page stays
+    // mounted: the first read then lands late and puts one person's record
+    // under the other person's URL.
+    let finishFirst: (name: string) => void = () => {};
+    const reads = {
+      first: new Promise<string>((resolve) => {
+        finishFirst = resolve;
+      }),
+      second: Promise.resolve('Second person'),
+    };
+    render(
+      <MemoryRouter initialEntries={['/candidates/first']}>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/candidates/:id" element={<RecordPage reads={reads} />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(screen.getByRole('link', { name: 'Open the second record' }));
+    expect(await screen.findByText('Second person')).toBeInTheDocument();
+
+    await act(async () => {
+      finishFirst('First person');
+      await reads.first;
+    });
+    expect(screen.getByTestId('record-name')).toHaveTextContent('Second person');
+  });
 });
 
 describe('Layout shell', () => {

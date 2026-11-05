@@ -188,6 +188,17 @@
     color: var(--ink-3);
   }
 
+  /* An action written as words. The accent is ink, so hue cannot say "link":
+     the underline is printed at rest, in the control tone, and darkens on hover. */
+  .textlink {
+    text-decoration-line: underline;
+    text-decoration-color: var(--control);
+    text-underline-offset: 3px;
+  }
+  .textlink:hover {
+    text-decoration-color: var(--ink);
+  }
+
   /* ── Skeleton ───────────────────────────────────────────────────────
      A flat block that breathes, so a slow read does not look stuck. No sweep:
      the loading words live in the surrounding `role="status"`. */
@@ -366,7 +377,13 @@
   }
 
   /* Selection. `aria-current` is the nav's paper tab; `aria-pressed` and
-     `aria-selected` are the ink fills of segments and tabs. */
+     `aria-selected` are the ink fills of segments and tabs.
+
+     `forced-color-adjust: none` is needed: forced text is drawn on a `Canvas`
+     backplate, which would put `HighlightText` in a white box on the fill. It
+     also inherits, so every child keeps its author colours, and the second rule
+     hands them the selection's instead: a name in carbon ink measured 1.16:1 on
+     `Highlight`, and a status badge kept its paper fill. */
   [aria-current='page'],
   [aria-pressed='true'],
   [aria-selected='true'] {
@@ -374,6 +391,31 @@
     background-color: Highlight;
     color: HighlightText;
     border-color: Highlight;
+  }
+  [aria-current='page'] *,
+  [aria-pressed='true'] *,
+  [aria-selected='true'] * {
+    background-color: transparent !important;
+    color: HighlightText !important;
+    border-color: HighlightText !important;
+  }
+
+  /* The tab row's rule is an inset line, which forcing drops. */
+  [role='tablist'] {
+    border-bottom: 1px solid CanvasText;
+  }
+
+  /* A fill that is the data: a bar, a meter, a legend swatch. `!important`
+     because several are inline styles, and those would be forced to nothing.
+     Every fill takes one colour here, so the edge keeps neighbours apart and the
+     printed label names each one. */
+  .data-fill {
+    background-color: CanvasText !important;
+    border-color: Canvas !important;
+  }
+  [aria-pressed='true'] .data-fill {
+    background-color: HighlightText !important;
+    border-color: Highlight !important;
   }
 
   [role='switch'] {

@@ -209,6 +209,56 @@ describe('the voice hue', () => {
     });
     expect(offenders).toEqual([]);
   });
+
+  it('marks only the on-a-call stage in the pipeline', () => {
+    const page = stripJsComments(read('src/pages/CandidatesPage.tsx'));
+    expect(page.match(/^\s*\w+: "voice",$/gm)?.map((line) => line.trim())).toEqual(['screening: "voice",']);
+    expect(stripJsComments(read('src/components/talent/RolePipelinePanel.tsx'))).not.toMatch(/voice/);
+  });
+});
+
+describe('text links: the accent is ink, so hue cannot say "link"', () => {
+  it('prints the underline at rest, in the control tone', () => {
+    const rule = /\.textlink \{([^}]*)\}/.exec(stripCssComments(indexCss));
+    expect(rule).not.toBeNull();
+    expect(rule![1]).toMatch(/text-decoration-line: underline/);
+    expect(rule![1]).toMatch(/text-decoration-color: var\(--control\)/);
+    expect(rule![1]).toMatch(/text-underline-offset: 3px/);
+  });
+
+  it('leaves no action link that is underlined only on hover', () => {
+    // A name in a list keeps the hover underline, as the mock draws it: its place
+    // in the row says what it is. These are the actions.
+    const actions = [
+      'src/components/talent/CandidateOverviewSections.tsx',
+      'src/components/talent/RecordingPlayer.tsx',
+      'src/components/talent/RecordingCard.tsx',
+      'src/components/talent/TranscriptionSyncWorkspace.tsx',
+    ];
+    for (const rel of actions) {
+      const code = stripJsComments(read(rel));
+      expect(code, rel).toContain('textlink');
+      expect(code, rel).not.toMatch(/hover:underline/);
+    }
+  });
+});
+
+describe('crimson means a fault on our side', () => {
+  it('never colours an AI judgement about a candidate', () => {
+    const card = stripJsComments(read('src/components/talent/CandidateScorecard.tsx'));
+    expect(card).not.toMatch(/tone="negative"|: 'negative'/);
+    const legacy = stripJsComments(read('src/components/Scorecard.tsx'));
+    expect(legacy).not.toMatch(/label="Red flags"[^\n]*tone="danger"/);
+    expect(legacy).not.toMatch(/high: 'danger'/);
+  });
+});
+
+describe('an ink fill is a primary action, so a transcript turn never takes one', () => {
+  it.each(['src/pages/ScreeningPage.tsx', 'src/components/LiveCallPanel.tsx'])('%s', (rel) => {
+    const code = stripJsComments(read(rel));
+    expect(code).not.toMatch(/bg-info px-4 py-2\.5|rounded-tr-sm bg-accent-600/);
+    expect(code).toMatch(/border border-line-strong bg-surface[^"]*text-ink/);
+  });
 });
 
 describe('surfaces: opaque, flat, printed', () => {
@@ -331,6 +381,40 @@ describe('shell and accessibility', () => {
       expect(block, selector).toContain(selector);
     }
     expect(block).toMatch(/Highlight/);
+  });
+
+  it('hands a selection\'s colours to its children, which keep their own otherwise', () => {
+    // `forced-color-adjust: none` has to stay, or forced text gets a Canvas
+    // backplate on the fill. It inherits, so without the second rule a selected
+    // chip held its name at 1.16:1 on Highlight.
+    const css = stripCssComments(indexCss);
+    const block = css.slice(css.indexOf('@media (forced-colors: active)'));
+    const selection = /\[aria-current='page'\],[^{]*\{([^}]*)\}/.exec(block);
+    expect(selection).not.toBeNull();
+    expect(selection![1]).toMatch(/forced-color-adjust: none/);
+    expect(selection![1]).toMatch(/color: HighlightText/);
+    const children = /\[aria-current='page'\] \*,[^{]*\{([^}]*)\}/.exec(block);
+    expect(children).not.toBeNull();
+    expect(children![1]).toMatch(/color: HighlightText !important/);
+    expect(children![1]).toMatch(/background-color: transparent !important/);
+  });
+
+  it('keeps every data fill and every filled button visible under forced colours', () => {
+    const css = stripCssComments(indexCss);
+    expect(css.slice(css.indexOf('@media (forced-colors: active)'))).toMatch(/\.data-fill \{/);
+    for (const rel of [
+      'src/components/talent/PipelineBar.tsx',
+      'src/components/charts/BarList.tsx',
+      'src/components/design/ProportionBar.tsx',
+      'src/components/design/Meter.tsx',
+      'src/components/Scorecard.tsx',
+    ]) {
+      expect(read(rel), rel).toContain('data-fill');
+    }
+    const button = stripJsComments(read('src/components/design/Button.tsx'));
+    for (const fill of ['bg-info', 'bg-error', 'bg-[var(--go)]']) {
+      expect(button).toContain(`border border-transparent ${fill}`);
+    }
   });
 });
 

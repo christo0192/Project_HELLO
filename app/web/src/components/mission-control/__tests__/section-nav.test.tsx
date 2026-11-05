@@ -123,6 +123,18 @@ describe('MissionControlSections', () => {
     expect(container.querySelectorAll('[role="tab"]').length).toBe(3);
   });
 
+  it('never lets a tab past the row, which would reserve a vertical scrollbar', () => {
+    // jsdom has no layout, so the classes that keep the row exact are pinned;
+    // e2e/logsheet.e2e.ts measures the real box.
+    renderNav();
+    const tablist = screen.getByRole('tablist', { name: 'Mission Control sections' });
+    expect(tablist.className).toContain('overflow-y-hidden');
+    expect(tablist.className.split(/\s+/)).not.toContain('border-b');
+    for (const tab of screen.getAllByRole('tab')) {
+      expect(tab.className.split(/\s+/)).not.toContain('-mb-px');
+    }
+  });
+
   it('renders nothing when there are no sections', () => {
     const { container } = render(
       <MissionControlSections sections={[]} ariaLabel="empty" />,

@@ -365,7 +365,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           <a
             href={url!}
             download
-            className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline"
+            className="textlink text-xs font-medium text-[var(--c-accent)]"
             aria-label={labelledAction('Download file', label)}
           >
             Download file
@@ -374,7 +374,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
             type="button"
             onClick={refreshUrl}
             aria-label={labelledAction('Refresh link', label)}
-            className="text-xs font-medium text-[var(--c-ink-secondary)] underline-offset-2 hover:text-[var(--c-ink)] hover:underline"
+            className="textlink text-xs font-medium text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)]"
           >
             Refresh link
           </button>

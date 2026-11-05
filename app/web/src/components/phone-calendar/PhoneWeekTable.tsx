@@ -161,7 +161,7 @@ export function PhoneWeekTable({
                   scope="col"
                   className={cx(
                     'whitespace-nowrap border-l border-glass-ring !px-2.5',
-                    isToday && '!bg-surface',
+                    isToday && '!bg-surface-secondary',
                   )}
                 >
                   {/*
@@ -207,7 +207,7 @@ export function PhoneWeekTable({
                       key={date}
                       className={cx(
                         'border-l !px-1.5 !py-1.5 !align-top',
-                        date === today && 'bg-surface',
+                        date === today && 'bg-surface-secondary',
                       )}
                     >
                       {inCell.length > 0 && (

@@ -35,29 +35,45 @@
  * and count as text.
  *
  * Accessibility: the bar track is decorative (`aria-hidden`) and the legend
- * carries the meaning as real text. Adjacent segments get a hairline divider,
- * because two buckets can legitimately share a tone and would otherwise read
- * as one block to a sighted user — the swatch colour is the only thing
- * linking legend to bar, and it is not injective.
+ * carries the meaning as real text. The swatch is the only thing linking legend
+ * to bar, so every tone draws differently (pinned in PipelineBar.test.tsx). A
+ * status list has more keys than there are tones, though, so two buckets can
+ * still share one: each segment after the first is set off by a 2px paper gap,
+ * or they would read as one block.
  */
 import { useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 export type PipelineTone =
-  "accent" | "positive" | "caution" | "negative" | "neutral";
+  "accent" | "positive" | "caution" | "negative" | "neutral" | "voice";
 
 /**
- * Fill per tone: ink steps, each clear of the 3:1 a meaningful graphic needs
- * against the track (WCAG 1.4.11). A stage is named in the legend, so its fill
- * only has to differ from its neighbours; an outcome is not coloured good or bad.
+ * Fill per tone, on the ramp the approved mock draws. The bar is an outlined box
+ * and a bucket darkens as people move through it, so "nobody dialled yet", the
+ * usually-largest bucket, is the lightest block and not a heavy one. The outline
+ * is the 3:1 boundary (WCAG 1.4.11), the gap between segments keeps neighbours
+ * apart, and an outcome is not coloured good or bad.
+ *
+ * `voice` is the one hue on the ramp. Orange means the candidate's voice, so it
+ * marks the on-a-call stage and nothing else.
  */
 const FILL: Record<PipelineTone, string> = {
-  accent: "var(--c-ink)",
-  positive: "var(--c-ink-secondary)",
+  neutral: "var(--c-border)",
   caution: "var(--c-control-border)",
-  negative: "var(--c-ink)",
-  neutral: "var(--c-ink-muted)",
+  voice: "var(--voice-mark)",
+  negative: "var(--c-ink-muted)",
+  accent: "var(--c-ink-secondary)",
+  positive: "var(--c-ink)",
 };
+
+/**
+ * The legend's key: a printed box, so even the lightest fill has an edge.
+ * `data-fill` goes on real fills only (see `fillClass`): a hollow key says there
+ * is nothing to draw, and must stay hollow under forced colours.
+ */
+const SWATCH_CLASS =
+  "h-2.5 w-3 shrink-0 rounded-sm border border-[var(--c-control-border)]";
+const fillClass = `data-fill ${SWATCH_CLASS}`;
 
 export interface PipelineSegment {
   key: string;
@@ -198,8 +214,8 @@ export function PipelineBar({
           <span
             aria-hidden="true"
             data-pipeline-track=""
-            className="flex h-2.5 w-full overflow-hidden rounded-chip"
-            style={{ backgroundColor: "var(--c-border-light)" }}
+            // A real border, not an inset shadow: forced colours keep borders.
+            className="flex h-4 w-full overflow-hidden rounded-control border border-[var(--c-control-border)] bg-[var(--c-surface)] p-0.5"
           >
             {drawn.map((s, i) => (
               <span
@@ -213,15 +229,17 @@ export function PipelineBar({
                 }
                 // `shrink-0`: flex children default to shrinking, which is how an
                 // over-sum used to renormalise into a believable full bar.
-                className="block h-full shrink-0 transition-opacity duration-hover motion-reduce:transition-none"
+                // `min-w-1`: one person in hundreds is still a mark on the bar.
+                className="data-fill block h-full min-w-1 shrink-0 transition-opacity duration-hover motion-reduce:transition-none"
                 style={{
                   opacity: active && active.key !== s.key ? 0.45 : 1,
                   width: `${(s.value / denominator) * 100}%`,
                   backgroundColor: FILL[s.tone],
-                  // Hairline between neighbours: two buckets may share a tone
-                  // (new/queued, screened/advanced) and would read as one block.
-                  boxShadow:
-                    i > 0 ? "inset 1px 0 0 0 var(--c-surface)" : undefined,
+                  // The gap sits inside the segment, so its width stays exact,
+                  // and it is a border so forced colours keep it. Two buckets
+                  // may share a tone and would otherwise read as one block.
+                  borderLeft:
+                    i > 0 ? "2px solid var(--c-surface)" : undefined,
                 }}
               />
             ))}
@@ -239,7 +257,7 @@ export function PipelineBar({
               }}
             >
               <span
-                className="h-2 w-2 shrink-0 rounded-full"
+                className={fillClass}
                 style={{ backgroundColor: FILL[activeSegment.tone] }}
               />
               <span>{activeSegment.label}</span>
@@ -263,15 +281,14 @@ export function PipelineBar({
             <>
               <span
                 aria-hidden="true"
-                className="h-2 w-2 shrink-0 rounded-full"
+                className={s.unavailable ? SWATCH_CLASS : fillClass}
                 style={{
-                  backgroundColor: s.unavailable
-                    ? "var(--c-border)"
-                    : FILL[s.tone],
+                  // Hollow when unmeasured: a filled key would claim a block.
+                  backgroundColor: s.unavailable ? undefined : FILL[s.tone],
                   // A ring in the pill's own text colour when pressed. The
                   // selected pill is filled with `--c-accent`, against which
-                  // the accent swatch scores 1.00:1 — it disappeared exactly
-                  // when the recruiter clicked it to find its block in the bar.
+                  // an ink swatch scores 1.00:1 — it disappeared exactly when
+                  // the recruiter clicked it to find its block in the bar.
                   boxShadow: isOn
                     ? "0 0 0 1.5px var(--c-data-label-inside)"
                     : undefined,
@@ -338,7 +355,7 @@ export function PipelineBar({
         {remainder > 0 && (
           <DiscrepancyEntry
             interactive={interactive}
-            swatch="var(--c-border-light)"
+            swatch="var(--c-surface)"
             label="Unaccounted"
             value={remainder}
             valueKey="__remainder"
@@ -429,7 +446,7 @@ function DiscrepancyEntry({
     <>
       <span
         aria-hidden="true"
-        className="h-2 w-2 shrink-0 rounded-full"
+        className={SWATCH_CLASS}
         style={{ backgroundColor: swatch }}
       />
       <span className="text-[var(--c-ink-secondary)]">{label}</span>

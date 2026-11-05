@@ -39,7 +39,9 @@ Four pull requests. This record ships with the first.
 - **The calling state is not in the sidebar yet.** Its only read, `GET /api/phone/health`, is limited to interviewers and above, and `GET /api/status` does not carry it. Showing it would mean a 403 on every route for a viewer, or a new read. A safe read needs its own change.
 - **The "Resume calling" green stays.** It is the owner's request of 2026-09-29, it paints exactly one button, and no later decision reversed it.
 - **`GlassPanel` and `.glass*` keep their names.** They are opaque now. Renaming them would touch nearly every page in a PR whose point is that pages re-skin without edits.
-- **Reject and the Rejected status lost their crimson.** Crimson means a fault on our side, and a verdict is not a fault.
+- **Reject and the Rejected status lost their crimson.** Crimson means a fault on our side, and a verdict is not a fault. Red flags and a high signal lost it for the same reason: they are AI judgements about a candidate, and on Review the hue would anchor the reviewer.
+- **The pipeline bar follows the mock.** Mapping every tone straight onto ink collapsed its stages, so it is an outlined bar with the lightest bucket first, and the on-a-call stage takes the voice mark the encoding table allows.
+- **Two lines on one chart differ by a dash as well as a grey.** The opposite outcomes on the Dashboard overlap for 30 days, and markers are hidden past 20 points.
 
 ## Sources
 

@@ -33,16 +33,19 @@
  * ── SELECTED AND FOCUSED ARE TWO DIFFERENT LOOKS ──────────────────────
  * Both used to be a 2px #4E6BA6 ring, so a keyboard operator could not tell
  * the chip they were ON from the chip that was OPEN. Now:
- *   selected — the accent tint fill and a 1px accent ring hugging the edge
- *              (#4E6BA6 on white is ~5.3:1, over the 3:1 a state boundary
- *              needs). The tint alone is too faint to carry the state; the
- *              ring does, and the fill is what survives the focus ring.
- *   focused  — a 2px accent ring standing 2px OFF the chip on a white gap
+ *   selected — the shaded field and a 1px ink ring hugging the edge. The field
+ *              alone is too faint to carry the state; the ring does, and the
+ *              fill is what survives the focus ring.
+ *   focused  — a 2px ink ring standing 2px OFF the chip on a paper gap
  *              (`ring-offset-2`), the same detached ring every `Button` in
  *              the app wears. A focused, selected chip therefore shows the
  *              tint AND the detached ring, and reads as both.
  *
-
+ * ── A CALL THAT WILL HAPPEN IS THE BOX ON THE GRID ────────────────────
+ * On paper a chip has no fill to separate it from its cell, so the edge is what
+ * makes it read as a control: a live chip has a 3:1 edge and fills on hover. A
+ * withdrawn one has neither at rest, and only shows an edge on hover.
+ *
  * ── TOUCH TARGET ──────────────────────────────────────────────────────
  * `min-h-[44px]` keeps the control at the 44×44 CSS-pixel floor on touch
  * (WCAG 2.5.5), which a text-sized chip would otherwise miss by half. The
@@ -88,7 +91,7 @@ export function PhoneAppointmentButton({
   const day = showDate && date ? `${formatIstDayLabel(date)} · ` : '';
   /*
     A cancelled or superseded slot will never dial. It stays on the calendar
-    (hiding it would hide history), but it steps back: no lift, quieter name,
+    (hiding it would hide history), but it steps back: no box, quieter name,
     so the calls that will happen are what the eye lands on. The badge still
     says which it is in words.
   */
@@ -151,15 +154,17 @@ export function PhoneAppointmentButton({
       aria-label={appointmentAccessibleName(appointment)}
       className={cx(
         shared,
-        'flex flex-col items-start gap-1 rounded-control px-2 py-1.5',
+        // Every state keeps the 1px edge, so selecting a chip never moves its
+        // text. A transparent edge still draws under forced colours.
+        'flex flex-col items-start gap-1 rounded-control border px-2 py-1.5',
         // One fill per state, never two fill classes on one element: which of
         // two `bg-*` utilities wins is decided by stylesheet order, not by the
         // order they are written here.
         selected
-          ? selectedLook
+          ? cx(selectedLook, 'border-transparent')
           : withdrawn
-            ? 'bg-surface border border-line hover:bg-surface-secondary'
-            : 'bg-surface',
+            ? 'border-transparent hover:border-line-strong'
+            : 'border-[var(--control)] bg-surface hover:bg-surface-secondary',
       )}
     >
       <span aria-hidden="true" className="text-meta font-medium tabular-nums text-ink-tertiary">

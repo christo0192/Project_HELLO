@@ -419,7 +419,7 @@ export function AskHelloButton({
           // leaves the white label alone. There is no shortage of signal
           // either way: the label itself changes to "Asking Hello…", the glyph
           // changes, Cancel appears, and the live region narrates the phase.
-          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control border border-transparent px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
             idle ? 'ask-hello--idle cursor-not-allowed' : ''
           }${running ? ' cursor-progress' : ''}`}
         >

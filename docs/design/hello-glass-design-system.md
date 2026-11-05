@@ -61,14 +61,14 @@ The `--c-*` names in `src/styles/candidate-palette.css` map the same way and hol
 
 | Mark | Means | And nothing else |
 |---|---|---|
-| Orange (`--voice`, `--voice-mark`) | The candidate's voice | Never buttons, links, verdicts or warnings |
+| Orange (`--voice`, `--voice-mark`) | The candidate's voice: strip segments, the speaker label, the on-a-call stage of the pipeline | Never buttons, links, verdicts or warnings |
 | Highlighter wash (`--wash`) | Words cited as evidence | Never the only marker |
 | Dashed pencil outline | Not firm: Provisional, Insufficient evidence, a week still filling in | |
 | 1px diagonal hatch | The consent gate | |
 | Crimson (`--danger`) | Faults on our side, plus Halt all calling (filled) | |
 | Ink fill | The one primary action on a screen, plus pressed or selected states | |
 
-Verdicts are ink, never coloured: a Reject is not a fault, and a Select is not a success. Selection outcomes are not coloured good or bad.
+Verdicts are ink, never coloured: a Reject is not a fault, and a Select is not a success. Selection outcomes are not coloured good or bad. The same holds for every AI judgement about a candidate: a red flag or a high signal is ink, with the group label and the word carrying the meaning.
 
 ### Contrast
 
@@ -128,7 +128,7 @@ No label is uppercase, on any surface, including the exported report. The only u
 - **Panels:** `GlassPanel` and `.glass` are printed boxes on the sheet: paper, a 1px `--rule-2` edge, radius 4. `level="sunken"` is a shaded `--field` with no edge. Boxes never nest.
 - **Shadows** exist on floating layers only: dialogs, drawers, menus, the combobox list, chart tooltips (`--shadow-pop`, `.glass-modal`).
 - **Radii:** sheet 8, boxes and controls 4, chips 3, evidence boxes and highlights 2. Dots and toggles stay round. No arbitrary `rounded-[…]`.
-- **Edges are real borders**, not inset shadows, because Windows contrast themes keep borders and drop shadows.
+- **Edges are real borders**, not inset shadows, because Windows contrast themes keep borders and drop shadows. The one exception is the rule under a tab row: the row scrolls sideways, so a tab overlapping a border by 1px would reserve a vertical scrollbar. That rule is an inset line, and the forced-colours block gives the row a border.
 - **Spacing:** 4px base; sheet padding 24; control height 36, or 28 for small controls.
 
 ## 5. Shell
@@ -136,6 +136,8 @@ No label is uppercase, on any surface, including the exported report. The only u
 - A 232px sidebar on the desk, sticky on desktop: the IK logo on its own white plate (never inverted), the HELLO wordmark, a scope line, the grouped nav, and the signed-in user with sign-out at the foot.
 - The active nav item is a paper tab with a 3:1 `--control` edge, shown statically.
 - A skip link to `#main-content`. A 2px ink focus ring on every control. A forced-colours rule in `index.css` for every state drawn with a fill.
+- Under forced colours a selection is `Highlight` with `HighlightText` on everything inside it, a filled button keeps an edge through its transparent border, and a data fill (`.data-fill`: bars, meters, legend swatches) is `CanvasText`.
+- The page is keyed on the path, so a read still in flight cannot land on the next record.
 - The calling state is not in the shell yet. Its only read, `GET /api/phone/health`, is limited to interviewers and above, so a viewer would get a 403 on every route. It needs a read that is safe for every role.
 
 ## 6. Primitives (`src/components/design`)
@@ -157,10 +159,14 @@ Rules:
 9. **A strip, not a card wall.** Related figures share ONE box and are separated by rules inside it, never a grid of identical cards. A block earns its own box only when it is a separate task.
 10. **Danger stays quiet until the confirmation.** One `primary` per surface; everything else `secondary` or `ghost`. A destructive action on a row or beside other actions is `danger-quiet`; the filled `danger` appears only on the confirmation step itself, and on Halt all calling.
 11. **Loading, failed and empty are three different states.** A block shows its empty copy only after its read succeeded. While loading it shows its frame at its final size. When its read fails it names what is missing, says what to do and offers a Retry (`RetryButton`, which keeps focus in the panel) that re-runs that read alone; a failed figure is a dash and never a 0. It never prints a raw API code: words come from `lib/api-error-copy.ts`, and `ErrorPanel` replaces any machine text it is handed. A failure stays in the panels that needed that read. Only an identity failure (`/api/me`) may take the whole page. A failed write is not a failed read: it says what did not happen, and has no Retry that reloads a list.
+12. **An action written as words is underlined at rest** (`.textlink`: a `--control` underline, offset 3px, darkening on hover). The accent is ink, so hue cannot say "link". A name in a list keeps the hover underline: its place in the row says what it is.
+13. **A control on paper needs an edge.** With no fill to separate it from its cell, a calendar chip takes a `--control` edge and a hover fill; a withdrawn one has neither at rest, so the calls that will happen lead.
 
 ## 7. Charts (`src/components/charts/theme.ts`)
 
-Every chart colour comes from the tokens, in one place: `chartPalette()` reads the computed custom properties. The categorical cycle is ink steps, not hues, so a series is told apart by its printed label and its marker shape, and an outcome is not coloured good or bad. The voice hue never appears in a chart. Lines are straight, bars start from zero, and a chart is printed, not drawn in: `animation: false` at every setting.
+Every chart colour comes from the tokens, in one place: `chartPalette()` reads the computed custom properties. The categorical cycle is ink steps, not hues, so a series is told apart by its printed label, its dash and its marker shape, and an outcome is not coloured good or bad. Markers are hidden past 20 points, so the dash is what holds on a dense series, and the legend prints each line's own dash and marker. The voice hue never appears in a chart. Lines are straight, bars start from zero, and a chart is printed, not drawn in: `animation: false` at every setting.
+
+`PipelineBar` is an outlined box on the ramp the mock draws: `--rule-2` for the lightest bucket (nobody dialled yet, or Reject on the recommendation bar), then `--control`, `--ink-3`, `--ink-2` and `--ink`, with `--voice-mark` for the on-a-call stage alone. Every tone draws differently, because the swatch is the only link from legend to bar, and a 2px paper gap sets each segment off.
 
 ## 8. Motion
 

@@ -21,9 +21,11 @@ const base =
 
 const variants: Record<ButtonVariant, string> = {
   /* The ink fill: the one primary action on a screen. Paper on ink is 16.80:1,
-     and hover steps to graphite, 9.27:1. */
+     and hover steps to graphite, 9.27:1. Every filled variant carries a
+     transparent border: forced colours drop the fill and draw the border, so
+     the button keeps an edge instead of reading as plain text. */
   primary:
-    'bg-info text-surface hover:bg-ink-secondary active:bg-ink-secondary',
+    'border border-transparent bg-info text-surface hover:bg-ink-secondary active:bg-ink-secondary',
   /* A real border, not an inset shadow: forced colours keep borders and drop
      shadows, and `--control` clears the 3:1 a control boundary needs. */
   secondary:
@@ -33,7 +35,7 @@ const variants: Record<ButtonVariant, string> = {
   /* Filled crimson: Halt all calling and a confirmation step, nothing else.
      Paper on `--danger` is 7.38:1. */
   danger:
-    'bg-error text-surface hover:bg-error/90 active:bg-error/90',
+    'border border-transparent bg-error text-surface hover:bg-error/90 active:bg-error/90',
   /* GREEN, for "Resume calling" only. The owner asked on 2026-09-29 for the
      resume button to read as green, so `--go` / `--go-strong` exist for this
      one action. White on `--go` is 5.23:1 and on `--go-strong` 6.14:1, both
@@ -41,7 +43,7 @@ const variants: Record<ButtonVariant, string> = {
      never a `brightness()` filter, which dims the white label along with the
      fill and so LOWERS contrast. Contrast is pinned in global-palette.test.ts. */
   go:
-    'bg-[var(--go)] text-white hover:bg-[var(--go-strong)] active:bg-[var(--go-strong)]',
+    'border border-transparent bg-[var(--go)] text-white hover:bg-[var(--go-strong)] active:bg-[var(--go-strong)]',
   /* A destructive action that is not the point of its surface: "Archive"
      beside "Edit". Crimson text and a crimson edge; the filled `danger` is
      kept for the confirmation step itself. */

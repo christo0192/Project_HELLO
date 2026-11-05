@@ -126,7 +126,7 @@ export function MissionControlSections({
       <div
         role="tablist"
         aria-label={ariaLabel}
-        className="flex max-w-full gap-6 overflow-x-auto border-b border-line-strong"
+        className="flex max-w-full gap-6 overflow-x-auto overflow-y-hidden shadow-[inset_0_-1px_0_var(--line-strong)]"
       >
         {sections.map((section, index) => {
           const selected = index === activeIndex;
@@ -142,7 +142,9 @@ export function MissionControlSections({
               onClick={() => activate(index)}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
-                '-mb-px h-9 shrink-0 whitespace-nowrap border-b-2 text-sm font-medium transition-colors duration-hover ease-out',
+                // The row's rule is an inset line, not a border the tabs overlap:
+                // a tab past the box would reserve a scrollbar (see talent/Tabs).
+                'h-9 shrink-0 whitespace-nowrap border-b-2 text-sm font-medium transition-colors duration-hover ease-out',
                 // Inset: the tab row scrolls and would clip a ring drawn outside.
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-info',
                 selected ? 'border-[var(--ink)] text-ink' : 'border-transparent text-ink-secondary hover:text-ink',

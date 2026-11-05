@@ -22,12 +22,12 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 const buttonStyles: Record<ButtonVariant, string> = {
   primary:
-    "bg-accent-600 text-white hover:bg-accent-700 focus-visible:ring-accent-500",
+    "border border-transparent bg-accent-600 text-white hover:bg-accent-700 focus-visible:ring-accent-500",
   secondary:
     "bg-surface text-gray-700 border border-gray-300 hover:bg-gray-50 focus-visible:ring-accent-500",
   ghost: "text-gray-600 hover:bg-gray-100 focus-visible:ring-accent-500",
   danger:
-    "bg-red-600 text-white hover:bg-red-700 focus-visible:ring-red-500",
+    "border border-transparent bg-red-600 text-white hover:bg-red-700 focus-visible:ring-red-500",
 };
 
 export function Button({

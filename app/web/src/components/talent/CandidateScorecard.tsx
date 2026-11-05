@@ -66,11 +66,16 @@ const RECOMMENDATION_TONE: Record<Recommendation, 'neutral'> = {
 
 const OVERALL_THRESHOLDS = { fair: 0.5, strong: 0.75 };
 
-const SIGNAL_TONE: Record<string, 'positive' | 'caution' | 'negative'> = {
+/**
+ * An AI judgement about a candidate is never crimson: that hue means a fault on
+ * our side, and on a judgement it would anchor the reviewer. `accent` is the
+ * heaviest ink edge, and the word says the rest.
+ */
+const SIGNAL_TONE: Record<string, 'positive' | 'caution' | 'accent'> = {
   none: 'positive',
   low: 'positive',
   moderate: 'caution',
-  high: 'negative',
+  high: 'accent',
 };
 
 export type HeadingLevel = 2 | 3 | 4;
@@ -185,7 +190,7 @@ function TagGroup({
   label: string;
   srPrefix: string;
   items: string[];
-  tone: 'positive' | 'caution' | 'negative';
+  tone: 'positive' | 'caution' | 'accent';
   /**
    * `block` stacks each item as a full-width rounded rectangle for LONG items
    * (gaps, red flags) that wrap to two or three lines; the default lays SHORT
@@ -488,7 +493,7 @@ export function CandidateScorecard({
                 label="Red flags"
                 srPrefix="Red flag:"
                 items={role_fit.red_flags}
-                tone="negative"
+                tone="accent"
                 block
               />
             </SurfaceCard>
@@ -568,7 +573,7 @@ export function CandidateScorecardRoleFit({
             label="Red flags"
             srPrefix="Red flag:"
             items={role_fit.red_flags ?? []}
-            tone="negative"
+            tone="accent"
             block
           />
         </SurfaceCard>

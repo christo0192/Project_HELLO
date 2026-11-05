@@ -335,6 +335,21 @@ describe('CandidateScorecard layout defects', () => {
     }
   });
 
+  it('keeps red flags and a high signal in ink: crimson means a fault on our side', () => {
+    const assessment: Assessment = {
+      ...FULL,
+      role_fit: { ...FULL.role_fit, red_flags: ['Ended the call early'] },
+      communication: {
+        ...FULL.communication!,
+        filler_usage: { level: 'high', examples: [], impact_score: 3, notes: '' },
+      },
+    };
+    const { container } = render(<CandidateScorecard assessment={assessment} />);
+    expect(screen.getByText('Ended the call early').className).not.toContain('--c-negative');
+    expect(screen.getByText('High').className).not.toContain('--c-negative');
+    expect(container.querySelector('[class*="ring-[var(--c-negative)]"]')).toBeNull();
+  });
+
   it('splits the read-once narrative out of the scored card on request', () => {
     const { container, rerender } = render(
       <CandidateScorecard assessment={FULL} narrative="none" />,

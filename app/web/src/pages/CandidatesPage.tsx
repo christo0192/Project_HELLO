@@ -163,14 +163,15 @@ const RECOMMENDATION_TONE: Record<string, StatusTone> = {
 const STATUS_BAR_TONE: Record<string, PipelineTone> = {
   new: "neutral",
   queued: "caution",
-  screening: "accent",
+  // On a call: the one stage that takes the voice hue.
+  screening: "voice",
   screened: "positive",
-  advanced: "positive",
+  advanced: "accent",
   rejected: "negative",
-  consent_declined: "negative",
-  // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Five tones
-  // cannot be injective over thirteen keys, so the most this can promise is
-  // that neighbours in that order differ; the legend text names each one.
+  consent_declined: "neutral",
+  // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Six tones cannot
+  // be injective over thirteen keys, so the most this can promise is that
+  // neighbours in that order differ; the legend text names each one.
   abandoned_no_answer: "caution",
   phone_failed: "negative",
   screening_abandoned: "caution",
@@ -179,10 +180,15 @@ const STATUS_BAR_TONE: Record<string, PipelineTone> = {
   phone_cancelled: "neutral",
 };
 
+/**
+ * A verdict is a position on the ink ramp, never a hue, and the two ends sit as
+ * far apart as the ramp allows: ink, control and the light step, as the approved
+ * recommendation bar draws them.
+ */
 const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
   advance: "positive",
   hold: "caution",
-  reject: "negative",
+  reject: "neutral",
 };
 
 /**
@@ -1062,7 +1068,7 @@ export function CandidatesPage() {
             <button
               type="button"
               onClick={clearFilters}
-              className="rounded px-1.5 py-0.5 font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+              className="textlink rounded px-1.5 py-0.5 font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
             >
               Clear all
             </button>

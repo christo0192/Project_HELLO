@@ -64,11 +64,12 @@ const WEIGHT = {
   role_fit: '20%',
 } as const;
 
+/** An AI judgement about a candidate stays in ink: crimson means our fault. */
 const SIGNAL_TONE: Record<string, StatusTone> = {
   none: 'success',
   low: 'success',
   moderate: 'warning',
-  high: 'danger',
+  high: 'warning',
 };
 
 /** A 0–10 reading with its bar. Renders nothing when there is no number to show. */
@@ -84,7 +85,7 @@ function ScoreBar({ label, value }: { label: string; value: unknown }) {
         <span className="font-semibold tabular-nums text-ink">{`${shown}/10`}</span>
       </div>
       <div aria-hidden="true" className="mt-1.5 h-1 overflow-hidden rounded-full bg-ink/[0.07]">
-        <div className="h-full rounded-full bg-info" style={{ width: `${safe * 10}%` }} />
+        <div className="data-fill h-full rounded-full bg-info" style={{ width: `${safe * 10}%` }} />
       </div>
     </div>
   );
@@ -345,7 +346,7 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
               <ChipGroup label="Matched skills" items={strings(roleFit.matched_skills)} tone="success" />
               <ChipGroup label="Gaps" items={strings(roleFit.gaps)} tone="warning" />
-              <ChipGroup label="Red flags" items={strings(roleFit.red_flags)} tone="danger" />
+              <ChipGroup label="Red flags" items={strings(roleFit.red_flags)} tone="warning" />
             </div>
             <Prose>{text(roleFit.notes)}</Prose>
           </Dimension>

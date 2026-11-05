@@ -13,6 +13,11 @@
  *
  * Presentation: printed tabs on a rule. The selected tab carries a 2px ink
  * underline and full ink, shown statically; nothing slides.
+ *
+ * The rule is an inset line on the row, not a border the tabs overlap with a
+ * negative margin: this row scrolls sideways, so `overflow-x` makes the other
+ * axis scroll too, and a tab 1px past the box reserves a classic Windows
+ * scrollbar. Forced colours drop the line, so index.css gives the row a border.
  */
 
 import { useId, useState } from 'react';
@@ -105,7 +110,7 @@ export function Tabs({
       <div
         role="tablist"
         aria-label={ariaLabel}
-        className="flex max-w-full gap-6 overflow-x-auto border-b border-[var(--c-border)]"
+        className="flex max-w-full gap-6 overflow-x-auto overflow-y-hidden shadow-[inset_0_-1px_0_var(--c-border)]"
       >
         {items.map((item, index) => {
           const selected = index === activeIndex;
@@ -121,7 +126,7 @@ export function Tabs({
               onClick={() => setActiveIndex(index)}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
-                '-mb-px h-9 shrink-0 border-b-2 text-sm font-medium',
+                'h-9 shrink-0 border-b-2 text-sm font-medium',
                 'transition-colors duration-hover ease-out',
                 // Inset: the tab row scrolls and would clip a ring drawn outside.
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--c-accent)]',
