@@ -631,6 +631,31 @@ describe('a clicked turn lights at once and holds through the lead-in', () => {
       expect(lit()).toEqual(['2']);
     });
 
+    it('lights on a click that lands the moment the row becomes clickable, before that render has settled', async () => {
+      // React runs a render's passive effects in a later task, so a click queued behind that render lands
+      // between the two. A mutation observer is a microtask: this click lands there every time.
+      const watcher = new MutationObserver(() => {
+        const row = document.querySelector<HTMLButtonElement>('button[aria-label^="Turn 2:"]');
+        if (!row) return;
+        watcher.disconnect();
+        row.click();
+      });
+      watcher.observe(document.body, { childList: true, subtree: true });
+      onTestFinished(() => watcher.disconnect());
+
+      renderWorkspace();
+      expect(await screen.findByText(/^Now playing turn 2/)).toBeInTheDocument();
+      expect(lit()).toEqual(['2']);
+
+      // Without the hold, the lead-in would light the row before the one that was clicked.
+      const video = await mediaOnScreen();
+      const state = drive(video);
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+    });
+
     it('follows the latest of two clicks made before the recording is loaded', async () => {
       renderWorkspace();
       await loadButton();
@@ -953,8 +978,8 @@ describe('when the R1 summary cannot be had', () => {
     expect(await screen.findByText(POINTER)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
     expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
-    // The transcript is still there, untimed.
-    expect(screen.getByText('Welcome to the role-play.')).toBeInTheDocument();
+    // The transcript is still there, untimed. The pointer shows before it arrives, so wait for it.
+    expect(await screen.findByText('Welcome to the role-play.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Turn 1:/ })).not.toBeInTheDocument();
   });
 
