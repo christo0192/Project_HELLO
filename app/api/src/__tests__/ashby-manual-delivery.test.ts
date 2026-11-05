@@ -48,6 +48,7 @@ function recorder(status = 'ok'): Recorder {
   rec.store = {
     roleInterviewKind: async () => ({ interviewKind: null }),
     listMappings: async () => [],
+    listMappedJobIds: async () => [],
     listWorkflows: async () => [],
     setMappingStatus: async () => ({ status: 'ok' }),
     cancelApplication: async () => ({ status: 'ok' }),
