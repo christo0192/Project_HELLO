@@ -171,6 +171,7 @@ const PAGE_TITLES: Array<[RegExp, string]> = [
   [/^\/dashboard/, 'Dashboard'],
   [/^\/candidates\/[^/]+/, 'Candidate'],
   [/^\/candidates/, 'Candidates'],
+  [/^\/interviews\//, 'R1 review'],
   [/^\/sessions\//, 'Session'],
   [/^\/screening\//, 'Screening'],
   [/^\/roles/, 'Agents'],

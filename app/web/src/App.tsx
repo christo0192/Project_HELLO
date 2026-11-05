@@ -74,6 +74,7 @@ const MissionControlPage = lazyPage(
   'MissionControlPage',
 );
 const R1SettingsPage = lazyPage(() => import('./pages/R1SettingsPage'), 'R1SettingsPage');
+const R1ReviewPage = lazyPage(() => import('./pages/R1ReviewPage'), 'R1ReviewPage');
 const PhoneCalendarPage = lazyPage(
   () => import('./pages/PhoneCalendarPage'),
   'PhoneCalendarPage',
@@ -163,6 +164,8 @@ export default function App() {
             <Route path="/roles" element={<RolesPage />} />
             <Route path="/candidates" element={<CandidatesPage />} />
             <Route path="/candidates/:id" element={<CandidateDetailPage />} />
+            {/* Every staff role: the API answers by the rule of the R1 video. */}
+            <Route path="/interviews/:roundId" element={<R1ReviewPage />} />
             <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
             <Route path="/screening/:sessionId" element={<ScreeningPage />} />
             {/*

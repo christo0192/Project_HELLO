@@ -87,14 +87,20 @@ export const RADII = {
 
 export const EXPECTED_ROUTES = [
   '/login', '/candidate/join', '/privacy-notice', '/status', '/appeal',
-  '/dashboard', '/roles', '/candidates', '/candidates/:id',
+  '/dashboard', '/roles', '/candidates', '/candidates/:id', '/interviews/:roundId',
   '/sessions/:sessionId', '/screening/:sessionId', '/phone-calendar',
   '/admin', '/admin/r1', '/mission-control', '/ashby-mission-control',
   '/ashby/review/:applicationLinkId', '/mfa/*',
 ];
 
-/** The only file that may print Plex Mono: a position in a recording. */
-export const MONO_ALLOWED = ['src/components/talent/SeekableTranscript.tsx'];
+/** The only files that may print Plex Mono: a position in a recording. */
+export const MONO_ALLOWED = [
+  'src/components/talent/SeekableTranscript.tsx',
+  'src/components/recording/CallStrip.tsx',
+  'src/components/r1-review/OverviewPanel.tsx',
+  'src/components/r1-review/PlayerControls.tsx',
+  'src/components/r1-review/ReviewTranscript.tsx',
+];
 /** A hard-stop gradient is the only way to paint a WebKit range fill. */
 export const GRADIENT_ALLOWED = ['src/components/design/Slider.tsx'];
 /** Google's logo is Google's colours; an exported report cannot read the app's tokens. */
@@ -122,6 +128,7 @@ export const VERDICT_FILES = [
   'src/components/talent/HeaderScore.tsx',
   'src/components/talent/CandidateScorecard.tsx',
   'src/components/Scorecard.tsx',
+  'src/components/r1-review/VerdictBlock.tsx',
 ];
 export const TYPE_SCALE_PX = [12, 13, 14, 16, 20, 24, 30];
 export const SKELETON_RADII = [2, 3, 4, 8];

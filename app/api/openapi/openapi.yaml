@@ -107,6 +107,25 @@ paths:
         '403': { description: Not allowed to read this candidate's recordings (access_denied). }
         '404': { description: The round exists but the session is not one of its attempts (not_found). }
         '503': { description: 'The store could not confirm the object (r1_recording_unavailable) or a read failed (service_unavailable).' }
+  /api/interview-rounds/{id}/review:
+    get:
+      tags: [r1]
+      operationId: getR1Review
+      summary: One R1 round as a reviewer sees it (viewer+; an interviewer must own the candidate)
+      description: 'Read rule = the rule of the R1 video: admin and viewer any candidate, interviewer only a candidate they own (uniform 403 plus an rbac.access_denied audit for anyone else, also when the round does not exist). This is where viewers read R1 transcripts; the phone transcript route stays admin-only. Answers round, candidate (name, role title, skills, experience and parsed resume facts; no contact detail), attempts[] (persona, session times, recording summary, turns[] with turn_started_at_ms and the 0136 facts turn_ended_at_ms, ai_voice and ai_played_ms, each null when not known), assessment, events[] (r1_admin_log, each with its turn_index), phone_screening (one line of context with its evidence_grade and scoring_status, or null) and rubric. The assessment projects metric_results (with structured evidence[{turn_index, quote}]) and from raw only the gate, administration_quality, agreement and thresholds. While an appeal blocks decision use the round''s recommendation, overall, status_write and pending_reject_until are null, scores_withheld is true, and assessment and phone_screening are null. An attempt made at or before a withdrawal or decline of consent has consent_withdrawn and transcript_hidden true, turns empty, a recording summary of deleted with reason consent_withdrawn, and no evidence quotes or rationales in the assessment; a consent superseded by a newer notice is not a withdrawal. An attempt whose session has not ended has in_progress true and turns empty. is_staff_dry_run marks a staff dry run. The answer never contains a key, URL, ETag, digest or consent proof: a recording is minted separately by GET /api/interview-rounds/{id}/recording. Cache-Control: no-store. Audited as resource.read (fail-open).'
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200': { description: 'The review: round, candidate, attempts with their turns, assessment, events, phone_screening and rubric.' }
+        '400': { description: Malformed round id (invalid_id). }
+        '403': { description: Not allowed to read this candidate's interviews (access_denied). }
+        '404': { description: No such round (not_found). }
+        '503': { description: 'A read the page depends on failed (service_unavailable): never a partial answer.' }
   /api/admin/r1/recording-health:
     get:
       tags: [r1]

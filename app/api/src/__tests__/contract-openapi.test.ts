@@ -755,7 +755,9 @@ describe('OpenAPI document integrity', () => {
     // GET /api/admin/r1/recording-health (inline bodies, no new schema). 169 + 2 = 171.
     // 0133 adds ONE admin path: POST /api/admin/allowlist/{id}/handover (records handover
     // for a person who returns on the new company domain as a new login). 171 + 1 = 172.
-    expect(Object.keys(paths).length).toBe(172);
+    // The R1 review page adds ONE staff path: GET /api/interview-rounds/{id}/review (inline bodies,
+    // no new schema). 172 + 1 = 173.
+    expect(Object.keys(paths).length).toBe(173);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

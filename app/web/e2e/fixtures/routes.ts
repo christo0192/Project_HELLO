@@ -13,6 +13,7 @@ import {
   DIALED_CANDIDATE_ID,
   LEGACY_CANDIDATE_ID,
   LEGACY_SESSION_ID,
+  R1_ROUND_ID,
   SCOPED_REVIEW_LINK_ID,
   STAR_CANDIDATE_ID,
   V2_SESSION_ID,
@@ -77,6 +78,11 @@ export const ROUTES: RouteCase[] = [
   { name: 'candidate-detail-dialed', path: `/candidates/${DIALED_CANDIDATE_ID}`, heading: 'Vikram Pillai', landmark: 'Call interrupted' },
   { name: 'candidate-detail-abandoned', path: `/candidates/${ABANDONED_CANDIDATE_ID}`, heading: 'Lucía Fernández', landmark: 'Abandoned: no answer' },
   { name: 'candidate-detail-legacy', path: `/candidates/${LEGACY_CANDIDATE_ID}?tab=overview`, heading: 'Rohan Deshpande', landmark: 'Moved to technical round.' },
+  // The R1 review: each tab is its own address, so each is checked and captured.
+  { name: 'r1-review-overview', path: `/interviews/${R1_ROUND_ID}?tab=overview`, heading: /Sales Program Advisor role-play/, landmark: 'Check before trusting it' },
+  { name: 'r1-review-briefing', path: `/interviews/${R1_ROUND_ID}?tab=briefing`, heading: /Sales Program Advisor role-play/, landmark: 'What the candidate saw' },
+  { name: 'r1-review-resume', path: `/interviews/${R1_ROUND_ID}?tab=resume`, heading: /Sales Program Advisor role-play/, landmark: 'Four years of inbound education sales.' },
+  { name: 'r1-review-recording', path: `/interviews/${R1_ROUND_ID}?tab=recording`, heading: /Sales Program Advisor role-play/, landmark: 'Hide speakers' },
   // Named by whose screening it is (the candidate's name), never by the
   // session id. Legacy (v1) and role-scorecard (v2) assessments both render:
   // the landmark proves the scorecard itself arrived, not just the shell.

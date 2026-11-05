@@ -24,6 +24,7 @@
  */
 import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
+import { Link } from 'react-router-dom';
 import { api, ApiError } from '../../api';
 import { CandidateButton, Tag } from '../design/candidate';
 import { R1RecordingRow } from './R1RecordingRow';
@@ -227,6 +228,12 @@ export function R1RoundsPanel({
                 {r1StatusLabel(round.status)}
               </Tag>
               <span className="text-label text-ink-secondary">{attemptsLabel(round)}</span>
+              <Link
+                to={`/interviews/${round.id}`}
+                className="text-label text-ink underline underline-offset-2 hover:text-ink-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+              >
+                Open R1 review
+              </Link>
             </div>
 
             {round.status === 'invited' && (
