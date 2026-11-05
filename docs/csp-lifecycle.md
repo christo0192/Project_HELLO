@@ -55,7 +55,7 @@ host is that single origin.
 The value is validated like every other input: each entry must be an exact canonical
 `https://host` origin (no path, query, credentials, wildcard or other scheme), and a bad
 value stops the dev/preview server rather than changing the policy. **Production serves no
-CSP header today** (`vercel.json` has rewrites only; this plugin is dev/preview only), so a
+CSP header today** (`vercel.json` sets no CSP, only asset caching; this plugin is dev/preview only), so a
 presigned recording plays in production regardless; the variable keeps dev and preview
 clean and, when a Vercel header is added or the mode is flipped to enforce, that header's
 `media-src` must include this origin or recordings stop playing.
