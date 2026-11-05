@@ -2601,9 +2601,13 @@ voice sits where its transcript row says, in the MP4 and the OGG alike. Rollback
 line lands late by it). It applies to new recordings only; stored ones never change, and the phone lane does not use it.
 
 To check it on a call: `r1_rec_started` says which tap made the recording (`schema` = `keep_pauses` or `sdk_tap`), and
-`r1_rec_silence_kept` says how much it kept (`duration_sec` = seconds, `option_count` = stretches; 0 is a normal line with
-no such silence; no line at all means the SDK's tap ran). A long silence inside an AI line with seconds on that line was
-in the call, not a fault of the file. These are log lines only: nothing on the recording row says which tap made it.
+`r1_rec_silence_kept` says how much it kept over the whole call (`duration_sec` = seconds, `option_count` = stretches; 0
+is normal for a call with no such silence; no log line at all means the SDK's tap ran). The number counts only silence
+with AI audio after it in the same AI line, so any seconds there are a real pause inside a line. The quiet after a line's
+last audio is left out: the room often reports a line finished 0.1-0.25 s late, and a line can be cut while waiting for
+its next fragment. That quiet is still in the file, which is why the voice stays on its row. Gaps under 50 ms are jitter
+and are not stretches. A long silence inside an AI line with seconds in this number was in the call, not a fault of the
+file. These are log lines only: nothing on the recording row says which tap made it.
 
 Plus the candidate's live consent containing `video_audio_recording` (checked on every worker call). Effective mode
 = min(worker capability, `recording_mode`) with `off < audio < av`; the encoder self-test can lower it at run

@@ -906,9 +906,11 @@ class _Replay:
         self.mixer: TeeMixer | None = None
         self.chunks: list[tuple[list, list]] = []
 
-    async def run(self, script, *, until: float, mic: bool = True, io_cls: type | None = None) -> "_Replay":
+    async def run(
+        self, script, *, until: float, mic: bool = True, io_cls: type | None = None, wall_at: float = 1000.0
+    ) -> "_Replay":
         source, sink = _Source(), _Sink()
-        wall = _Wall(1000.0)
+        wall = _Wall(wall_at)
         session = SimpleNamespace(input=SimpleNamespace(audio=source), output=SimpleNamespace(audio=sink))
         rec = (io_cls or r1_recorder.recorder_io_class())(agent_session=session, sample_rate=RATE)
         rec.tee_clock = wall.time
@@ -973,6 +975,19 @@ class _Replay:
         """Length in seconds of what each agent write handed to the recorder, silence included."""
         return [round(sum(f.duration for f in output), 3) for _input, output in self.chunks if output]
 
+    def agent_layout(self) -> list[list[tuple[str, float]]]:
+        """Each agent write as runs of ``("voice" | "quiet", seconds)``, in the order it was laid out."""
+        writes: list[list[tuple[str, float]]] = []
+        for _input, output in self.chunks:
+            runs: list[tuple[str, float]] = []
+            for f in output:
+                kind = "voice" if np.frombuffer(f.data, dtype=np.int16).any() else "quiet"
+                seconds = runs.pop()[1] if runs and runs[-1][0] == kind else 0.0
+                runs.append((kind, seconds + f.duration))
+            if runs:
+                writes.append(runs)
+        return writes
+
     @staticmethod
     def bursts(pcm: np.ndarray, *, level: int = AGENT_LEVEL, quiet: float = 0.3) -> list[tuple[float, float]]:
         """``(start, end)`` in seconds of each run of 10 ms windows louder than ``level``."""
@@ -1014,6 +1029,12 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
         for (start, end), (want_start, want_end) in zip(got, expected):
             self.assertLess(abs(start - want_start), delta, f"agent audio at {got}, expected {expected}")
             self.assertLess(abs(end - want_end), delta, f"agent audio at {got}, expected {expected}")
+
+    def assert_write(self, runs: list[tuple[str, float]], expected: list[tuple[str, float]]) -> None:
+        """A write's layout to the sample or so: closer than ``assert_bursts``, which cannot see 40 ms."""
+        self.assertEqual([kind for kind, _seconds in runs], [kind for kind, _seconds in expected], runs)
+        for (_kind, seconds), (_same, want) in zip(runs, expected):
+            self.assertAlmostEqual(seconds, want, delta=0.002, msg=f"{runs}, expected {expected}")
 
     async def replay(self, script, *, until: float, **kwargs) -> _Replay:
         return await _Replay(self.dir, f"call-{len(os.listdir(self.dir))}").run(script, until=until, **kwargs)
@@ -1168,6 +1189,65 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
         call = await self.replay(script, until=4.0)
         self.assert_bursts(call.mp4(), [(2.0, 3.0)])
 
+    async def test_a_fragment_after_a_first_frame_held_by_a_pause_is_measured_from_the_pause(self) -> None:
+        # Paused at 1.0 s, handed over at 1.5 s, played from 2.0 s: the audio runs out at 3.0 s, not 3.5 s, and a
+        # sink that never reports leaves nothing else to say so.  The rest arrives at 4.0 s.
+        script = [(1.0, "pause"), _hand_over(1.5, 1.0), (2.0, "resume"), _hand_over(4.0, 1.0), _finish(5.0, 2.0)]
+        call = await self.replay(script, until=6.0)
+        for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
+            with self.subTest(path=name):
+                self.assert_bursts(pcm, [(2.0, 3.0), (4.0, 5.0)])
+
+    # -- the end of a line: the SDK measures every silence back from it
+
+    async def test_a_finish_just_after_the_audio_ran_out_leaves_every_word_before_its_pause(self) -> None:
+        # The room reports the end 40 ms after the audio ran out, under the slack.  Left out of the sums, that
+        # moves the silence 40 ms earlier in the audio: the last 40 ms of the first fragment would play after it.
+        call = await self.replay(
+            [_hand_over(1.0, 1.0), _started(1.0), _hand_over(4.0, 1.0), _finish(5.04, 2.0)], until=6.0
+        )
+        (write,) = call.agent_layout()
+        self.assert_write(write, [("voice", 1.0), ("quiet", 2.0), ("voice", 1.0), ("quiet", 0.04)])
+
+    async def test_the_same_when_the_line_finishes_paused(self) -> None:
+        # A paused line ends, for the SDK, when the pause began: 40 ms after the audio ran out, here.
+        call = await self.replay(
+            [_hand_over(1.0, 1.0), _started(1.0), _hand_over(4.0, 1.0), (5.04, "pause"), _finish(6.0, 2.0, True)],
+            until=7.0,
+        )
+        (write,) = call.agent_layout()
+        self.assert_write(write, [("voice", 1.0), ("quiet", 2.0), ("voice", 1.0), ("quiet", 1.0)])
+
+    async def test_nothing_of_a_line_lands_after_the_quiet_at_its_end(self) -> None:
+        # On a clock the size of the real one the SDK's sums are off by a hair, and the room's own count of what
+        # it played can be a hair over the tap's.  A quiet placed by position then splits the last frame, and leaves
+        # the line's last sample alone after it, where it reads as a second burst.
+        lines = [(round(1.0 + 3.0 * index, 6), round(0.5 + 0.06 * index, 6)) for index in range(12)]
+        script = [
+            event
+            for at, seconds in lines
+            for event in (_hand_over(at, seconds), _started(at), _finish(round(at + seconds + 0.12, 6), seconds + 1e-9))
+        ]
+        call = await self.replay(script, until=38.0, wall_at=1_778_000_000.123457)
+        writes = call.agent_layout()
+        self.assertEqual(len(writes), len(lines))
+        for write, (_at, seconds) in zip(writes, lines):
+            self.assert_write(write, [("voice", seconds), ("quiet", 0.12)])
+
+    async def test_a_line_cut_while_paused_with_audio_queued_ends_where_the_pause_began(self) -> None:
+        # 2 s handed over at 1.0 s, paused at 2.0 s and cut at 4.0 s: 1 s played, and the rest never will.  The
+        # clock reads 3.0 s, but that audio is no end: the line ended at the pause, and the SDK knows it.
+        script = [_hand_over(1.0, 2.0), _started(1.0), (2.0, "pause"), _finish(4.0, 1.0, True)]
+        await self.assert_chunks_are_stock(script, until=5.0)
+        call = await self.replay(script, until=5.0)
+        self.assert_bursts(call.mp4(), [(1.0, 2.0)])
+
+    async def test_a_finish_under_the_slack_on_a_line_with_no_pause_stays_the_stock_write(self) -> None:
+        script = [_hand_over(1.0, 1.0), _started(1.0), _finish(2.04, 1.0)]
+        await self.assert_chunks_are_stock(script, until=3.0)
+        call = await self.replay(script, until=3.0)
+        self.assertEqual(call.rec.kept_silence(), (0.0, 0))
+
     # -- the clock is the room's from the first played frame: the row is anchored there
 
     async def test_a_stall_before_the_first_played_frame_moves_the_line_with_it(self) -> None:
@@ -1246,6 +1326,32 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
         seconds, stretches = call.rec.kept_silence()
         self.assertAlmostEqual(seconds, 2.0, delta=0.01)
         self.assertEqual(stretches, 2)
+        self.assert_bursts(call.mp4(), [(1.0, 1.5), (2.5, 3.0), (4.0, 5.0), (7.3, 8.3)])
+
+    async def test_the_quiet_after_a_lines_last_audio_stays_in_the_file_and_out_of_the_number(self) -> None:
+        # Nothing played after it, so it is no pause in the line: an operator reading the number must not
+        # find these there, however many lines of a call have one.
+        for label, script, voice in (
+            ("the room reports the end late", [_hand_over(1.0, 1.0), _started(1.0), _finish(2.2, 1.0)], (1.0, 2.0)),
+            ("cut while waiting for the next fragment", [_hand_over(1.0, 0.5), _finish(2.5, 0.5, True)], (1.0, 1.5)),
+            ("cut while paused", [_hand_over(1.0, 0.5), (2.0, "pause"), _finish(3.0, 0.5, True)], (1.0, 1.5)),
+            (
+                "cut while paused, after a stall the first report took back",
+                [_hand_over(1.0, 0.06), _hand_over(1.3, 0.44), _started(1.32), (2.5, "pause"), _finish(3.0, 0.5, True)],
+                (1.32, 1.82),
+            ),
+        ):
+            with self.subTest(label):
+                call = await self.replay(script, until=4.0)
+                self.assert_bursts(call.mp4(), [voice])
+                self.assertEqual(call.rec.kept_silence(), (0.0, 0))
+
+    async def test_a_late_end_adds_nothing_to_the_pause_before_it(self) -> None:
+        call = await self.replay([_hand_over(1.0, 0.5), _hand_over(3.5, 1.0), _finish(4.7, 1.5)], until=6.0)
+        self.assert_bursts(call.mp4(), [(1.0, 1.5), (3.5, 4.5)])
+        seconds, stretches = call.rec.kept_silence()
+        self.assertAlmostEqual(seconds, 2.0, delta=0.01)
+        self.assertEqual(stretches, 1)
 
     async def test_silence_in_a_line_the_close_cut_off_is_not_counted(self) -> None:
         source, sink = _Source(), _Sink()
@@ -1280,6 +1386,30 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
         for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
             with self.subTest(path=name):
                 self.assert_bursts(pcm, [(1.0, 1.5), (3.5, 4.5), (10.0, 11.0), (15.0, 15.5), (16.0, 16.5)])
+
+    async def test_a_later_line_keeps_its_pause_too(self) -> None:
+        # The first report restarts the clock from what THIS line handed over.  Counted from the whole call, the
+        # audio would seem to run on past the pause: it would vanish, and the line land late, as before the fix.
+        script = [
+            _hand_over(1.0, 3.0), _started(1.0), _finish(4.0, 3.0),
+            _hand_over(6.0, 0.5), _started(6.0), _hand_over(8.5, 1.0), _finish(9.5, 1.5),
+        ]
+        call = await self.replay(script, until=11.0)
+        for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
+            with self.subTest(path=name):
+                self.assert_bursts(pcm, [(1.0, 4.0), (6.0, 6.5), (8.5, 9.5)])
+        self.assertEqual(call.agent_seconds(), [3.0, 3.5])
+
+    async def test_a_line_that_finished_paused_leaves_no_pause_on_the_next_line(self) -> None:
+        # No resume comes between the two, so nothing but the end of the first line clears the pause.
+        script = [
+            _hand_over(1.0, 0.5), (2.0, "pause"), _finish(3.0, 0.5, True),
+            _hand_over(5.0, 0.5), _hand_over(7.0, 0.5), _finish(7.5, 1.0),
+        ]
+        call = await self.replay(script, until=9.0)
+        for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
+            with self.subTest(path=name):
+                self.assert_bursts(pcm, [(1.0, 1.5), (5.0, 5.5), (7.0, 7.5)])
 
     async def test_the_timeline_stays_on_the_clock_so_the_picture_stays_with_the_sound(self) -> None:
         """The picture is stamped with the clock.  With no microphone the agent's write alone makes up the
@@ -1397,7 +1527,9 @@ class TestAStallAtTheStartOfALineOnTheRealRoomOutput(unittest.IsolatedAsyncioTes
                 self.assertEqual(len(got), 1, f"anchor {anchor:.2f}, agent audio at {got}")
                 self.assertLess(abs(got[0][0] - anchor), 0.2, f"anchor {anchor:.2f}, agent audio at {got}")
                 self.assertAlmostEqual(got[0][1] - got[0][0], 2.0, delta=0.2)
-        self.assertEqual(replay.rec.kept_silence(), (0.0, 0))
+        # The stall was not kept.  Not exactly zero: on a real clock a late frame can be a real, small gap (the
+        # mocked replays pin the zero, and the one burst above says there is no silence inside the voice).
+        self.assertLess(replay.rec.kept_silence()[0], self.STALL / 2)
 
     async def test_a_stall_after_the_line_was_handed_over(self) -> None:
         async def hand_over(tap_out) -> None:

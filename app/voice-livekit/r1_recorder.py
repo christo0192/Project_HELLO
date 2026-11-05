@@ -119,6 +119,8 @@ GAP_SLACK_SECONDS = 0.25
 # Silence inside one agent playback shorter than this is jitter in how frames reach the tap, not a pause
 # (the room output plays in 50 ms frames).  It stays in the reckoning, so jitter cannot add up past this.
 PLAYOUT_GAP_SLACK_SECONDS = 0.05
+# On a line with a silence in it, the time after the last audio is reckoned down to this (see ``_PlayoutOutput``).
+PLAYOUT_TAIL_SECONDS = 0.001
 # Peak amplitude (16-bit LSBs) of what counts as silence at the front of a chunk that is ahead of the
 # clock: the SDK's silence frame, once resampled, carries +-1 LSB of dither (measured), never more.
 SILENCE_LEVEL = 2
@@ -1026,13 +1028,18 @@ def _build_recorder_io_class() -> type:
 
         ``_playout_end`` is when the audio handed over so far finishes playing, on the wall clock.
         A frame that arrives after it plays at once, so the room played silence from ``_playout_end``
-        until then; so did the time from the last audio to the end of the playback (a line cut while
-        waiting for its next fragment).  An explicit pause holds what is queued, so it moves
-        ``_playout_end`` on by its length.  Each stretch of silence goes on the SDK's own list of pause
-        intervals, in wall-clock order, and the SDK's code places it: the line is written with its
-        silence in place, and both readers of that one write (the stock OGG and ``TeeMixer``) get
-        every frame at its real playout time.  With no silence the list stays as it was, and the write
-        is byte for byte the stock one.
+        until then.  An explicit pause holds what is queued, so it moves ``_playout_end`` on by its
+        length.  Each stretch of silence goes on the SDK's own list of pause intervals, in wall-clock
+        order, and the SDK's code places it: the line is written with its silence in place, and both
+        readers of that one write (the stock OGG and ``TeeMixer``) get every frame at its real playout
+        time.
+
+        A playback can also outlast its audio: the room reports most lines finished a little late, and
+        a line can be cut while waiting for its next fragment.  The SDK measures every silence back
+        from where the line ended, so the tap ends it on the last audio, as for a line that finishes
+        paused, and the SDK writes the time since as trailing silence, after every sample.  That quiet
+        is in the file but it is no pause in the line: only silence with audio after it counts as kept
+        (``kept_silence``).  A line with neither is byte for byte the stock write.
 
         This tap sees a frame when it is handed over; the room's own task takes it later, and that is
         the moment the row is anchored at (``on_playback_started``).  A stall of the event loop between
@@ -1049,7 +1056,8 @@ def _build_recorder_io_class() -> type:
             self._handed_over = 0.0  # seconds of this playback's audio given to the room so far
             self._playing = False  # the room has reported this playback's first played frame
             self._silences: list[tuple[float, float]] = []  # this playback's entries on the SDK's list
-            self.silence_kept_seconds = 0.0  # the whole call, as written
+            self._silences_before_audio = 0  # how many of them have audio after them, so far
+            self.silence_kept_seconds = 0.0  # the whole call, as written: silence with audio after it
             self.silences_kept = 0
 
         def _keep_silence_until(self, now: float) -> None:
@@ -1059,6 +1067,18 @@ def _build_recorder_io_class() -> type:
                 self._silences.append((end, now))
                 self._playout_end = now
 
+        def _end_on_the_last_audio(self) -> None:
+            """Have the SDK end this line when its audio ran out, not when the room said so.
+
+            On a line with a silence in it the end has to add up: the jitter the slack forgives elsewhere
+            would move that silence earlier in the audio, and the end of a word would play after it.
+            """
+            end = self._playout_end
+            ended = time.time() if self._paused_at is None else self._paused_at
+            slack = PLAYOUT_TAIL_SECONDS if self._silences else PLAYOUT_GAP_SLACK_SECONDS
+            if end is not None and ended - end > slack:
+                self._RecorderAudioOutput__current_pause_start = end
+
         def on_playback_started(self, *, created_at: float) -> None:
             if not self._playing:
                 self._playing = True
@@ -1066,6 +1086,7 @@ def _build_recorder_io_class() -> type:
                     for silence in self._silences:  # (the SDK's own pauses stay: they held the audio)
                         self._RecorderAudioOutput__pause_wall_times.remove(silence)
                     self._silences.clear()
+                    self._silences_before_audio = 0
                     self._playout_end = created_at + self._handed_over
             super().on_playback_started(created_at=created_at)
 
@@ -1079,6 +1100,7 @@ def _build_recorder_io_class() -> type:
                 self._keep_silence_until(time.time())
             self._playout_end += frame.duration
             self._handed_over += frame.duration
+            self._silences_before_audio = len(self._silences)
 
         def pause(self) -> None:
             if self._paused_at is None and self.recorder_io.recording:
@@ -1101,8 +1123,8 @@ def _build_recorder_io_class() -> type:
             synchronized_transcript: str | None = None,
         ) -> None:
             recording = self.recorder_io.recording
-            if recording and self._paused_at is None:
-                self._keep_silence_until(time.time())
+            if recording:
+                self._end_on_the_last_audio()
             written = recording and self.has_pending_data  # (the SDK writes the line only then)
             super().on_playback_finished(
                 playback_position=playback_position,
@@ -1110,8 +1132,9 @@ def _build_recorder_io_class() -> type:
                 synchronized_transcript=synchronized_transcript,
             )
             if written:
-                self.silence_kept_seconds += sum(end - start for start, end in self._silences)
-                self.silences_kept += len(self._silences)
+                kept = self._silences[: self._silences_before_audio]
+                self.silence_kept_seconds += sum(end - start for start, end in kept)
+                self.silences_kept += len(kept)
             self._playout_end = None
             self._paused_at = None
             self._handed_over = 0.0
@@ -1157,7 +1180,7 @@ def _build_recorder_io_class() -> type:
             return self._out_record
 
         def kept_silence(self) -> tuple[float, int] | None:
-            """Seconds and stretches of silence put back in this call; ``None`` on the SDK's own tap."""
+            """Seconds and stretches of silence kept inside this call's lines; ``None`` on the SDK's own tap."""
             out = self._out_record
             return (out.silence_kept_seconds, out.silences_kept) if isinstance(out, _PlayoutOutput) else None
 

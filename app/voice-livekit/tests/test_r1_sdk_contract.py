@@ -420,8 +420,9 @@ class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
     def test_the_output_tap_puts_back_every_interval_in_its_pause_list(self) -> None:
         """``r1_recorder``'s keep-pauses tap subclasses ``RecorderAudioOutput`` and adds the silence inside
         a playback to the SDK's private list of pause intervals, so the SDK's own code places it (in
-        wall-clock order, positions measured back from the end of the playback).  The list's mangled name,
-        the arithmetic and the write are a fact about 1.6.4.
+        wall-clock order, positions measured back from the end of the playback).  It also ends a line on its
+        last audio by setting the pause start, which the SDK reads as the end of the line, writing the time
+        since after every sample.  The mangled names, the arithmetic and the write are a fact about 1.6.4.
         """
         from types import SimpleNamespace
 
@@ -443,8 +444,11 @@ class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
         self.assertIn("position = (pause_start - playback_start_time) - accumulated_pause", finished)
         self.assertIn("self.__write(buf)", finished)
         self.assertIn("finish_time = self.__current_pause_start or time.time()", finished)
+        self.assertIn("trailing_silence_duration = max(0.0, time.time() - finish_time)", finished)
+        self.assertIn("_create_silence_frame(trailing_silence_duration, sample_rate, num_channels)", finished)
         tap = rio.RecorderAudioOutput(recording_io=SimpleNamespace(recording=False), write_fnc=lambda _buf: None)
         self.assertEqual(tap._RecorderAudioOutput__pause_wall_times, [])
+        self.assertIsNone(tap._RecorderAudioOutput__current_pause_start)
         self.assertIs(tap.recorder_io, tap._RecorderAudioOutput__recording_io)
 
     def test_the_room_reports_the_first_played_frame_up_the_chain_and_again_after_a_resume(self) -> None:
