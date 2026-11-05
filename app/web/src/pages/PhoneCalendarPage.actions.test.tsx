@@ -734,19 +734,61 @@ describe('the way from a call to the person', () => {
     expect(link!.getAttribute('href')).toMatch(/^\/candidates\/.+/);
   });
 
-  it('says what happens next on a missed call', async () => {
-    apiFns.getPhoneCalendar.mockResolvedValue(calendarResponse({ appointments: [appointment({ status: 'missed' })] }));
+  it('says a missed call comes round again by itself', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({ appointments: [appointment({ status: 'missed', engagement_state: 'eligible' })] }),
+    );
     renderPage();
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
-    expect(await screen.findByText(/This slot passed without a call/)).toBeInTheDocument();
+    expect(await screen.findByText(/will be called again without a booking/)).toBeInTheDocument();
+    expect(screen.queryByText(/nothing will dial/)).not.toBeInTheDocument();
   });
 
-  it('booking searches by email as well as name', async () => {
+  it('offers no booking on a missed call whose screening has ended', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({
+        appointments: [
+          appointment({ status: 'missed', engagement_state: 'cancelled', cancel_reason: 'engagement_cancelled' }),
+        ],
+      }),
+    );
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
+    const note = await screen.findByText(/This slot passed without a call/);
+    expect(note).toHaveTextContent(/This screening has ended/);
+    expect(note).not.toHaveTextContent(/book/i);
+  });
+
+  it('booking searches by email without printing one', async () => {
+    apiFns.listCandidates.mockResolvedValue([
+      { ...PHONE_BOOKING_CANDIDATES[0], email: 'asha.rao@example.com' },
+      { ...PHONE_BOOKING_CANDIDATES[0], id: 'cand-2', name: 'Dev Nair', email: 'dev.nair@example.com' },
+    ]);
     renderPage();
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
     await userEvent.click(await screen.findByRole('button', { name: /^Candidate/ }));
-    expect(screen.getByRole('combobox', { name: 'Search by name or email' })).toHaveFocus();
+    const search = screen.getByRole('combobox', { name: 'Search by name or email' });
+    expect(search).toHaveFocus();
+    await userEvent.type(search, 'dev.nair@example');
+    const list = screen.getByRole('listbox', { name: 'Candidates' });
+    expect(within(list).getByRole('option', { name: /Dev Nair/ })).toBeInTheDocument();
+    expect(within(list).queryByRole('option', { name: /Asha Rao/ })).not.toBeInTheDocument();
+    expect(list.textContent).not.toMatch(/@/);
+  });
+
+  it('says the candidate list did not load, and Try again reads it again', async () => {
+    apiFns.listCandidates.mockRejectedValueOnce(new MockApiError('service_unavailable', 503));
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
+    const panel = await screen.findByRole('region', { name: 'Book a phone screening' });
+    expect(await within(panel).findByRole('alert')).toHaveTextContent(/The candidate list couldn't load\./);
+    await userEvent.click(within(panel).getByRole('button', { name: 'Try again' }));
+    expect(await within(panel).findByRole('button', { name: /^Candidate/ })).toBeInTheDocument();
+    expect(within(panel).queryByRole('alert')).not.toBeInTheDocument();
+    expect(apiFns.listCandidates).toHaveBeenCalledTimes(2);
   });
 });

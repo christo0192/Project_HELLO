@@ -727,7 +727,7 @@ export function CandidatesPage() {
   const ordered = useMemo(
     () =>
       orderCandidates(visible, view, {
-        keepArrivals: filters.resumeReview.length > 0 || filters.query !== "",
+        keepArrivals: filters.arriving || filters.resumeReview.length > 0 || filters.query !== "",
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [visible, view.sort, view.dir, filterKey],
@@ -1229,6 +1229,12 @@ export function CandidatesPage() {
                 onRemove={() => toggleResumeReview(r)}
               />
             ))}
+            {filters.arriving && (
+              <FilterChip
+                label="Arriving from Ashby"
+                onRemove={() => applyFilters({ arriving: false })}
+              />
+            )}
             {filters.assessed && (
               <FilterChip
                 label="Assessed"
@@ -1293,7 +1299,7 @@ export function CandidatesPage() {
             {/* Arrivals, in one line, so the rows below start at a named person.
                 A shell that sits here for hours is a stuck one, so the age is
                 the oldest row's, and the link shows every one of them. */}
-            {arrivals.length > 0 && oldestArrival && filters.resumeReview.length === 0 && (
+            {arrivals.length > 0 && oldestArrival && !filters.arriving && filters.resumeReview.length === 0 && (
               <p
                 data-arrivals=""
                 className="flex flex-wrap items-baseline gap-x-2 border-b border-[var(--c-border)] py-2 text-label text-[var(--c-ink-secondary)]"
@@ -1305,7 +1311,7 @@ export function CandidatesPage() {
                 </span>
                 <button
                   type="button"
-                  onClick={() => applyFilters({ resumeReview: ["processing"] })}
+                  onClick={() => applyFilters({ arriving: true })}
                   className="textlink rounded-evidence font-medium text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
                 >
                   Show them
@@ -1334,9 +1340,12 @@ export function CandidatesPage() {
                     1366px it fits its panel, which e2e pins, and below that (a
                     390px phone) it keeps these widths and scrolls sideways
                     INSIDE the table's own container, never the page.
-                      - Exp., Status, Recommendation and Next action never wrap
-                        ("7 / yr" and a badge broken over two lines were the
-                        review's complaint).
+                      - Exp., Recommendation and Next action never wrap ("7 / yr"
+                        over two lines was the review's complaint).
+                      - Status is capped at the width the budget has left. Most
+                        labels fit on a line; the longest real one, "Abandoned:
+                        dropped before screening", breaks inside its badge rather
+                        than pushing Next action into a sideways scroll.
                       - Agent and Role may wrap, to two lines at most, at a
                         minimum width that fits a two-word title per line.
                       - Email and Skills truncate with the full value in
@@ -1431,12 +1440,12 @@ export function CandidatesPage() {
                               ? `${c.experience_years} yr`
                               : "—"}
                           </Td>
-                          <Td className="whitespace-nowrap">
+                          <Td>
                             {/* Stacked, not wrapped: a status and a resume badge
                                 side by side would force the column wide, and a
                                 flex-wrap broke them at arbitrary points. */}
-                            <div className="flex flex-col items-start gap-1">
-                              <StatusBadge tone={ds.tone}>
+                            <div className="flex max-w-[11rem] flex-col items-start gap-1">
+                              <StatusBadge tone={ds.tone} wrap>
                                 <span title={ds.title}>{ds.label}</span>
                                 {/* The tooltip's phone facts (reason, count,
                                     last dial) for screen-reader users, who never

@@ -358,6 +358,101 @@ describe('Combobox on a toolbar or in a short list', () => {
     expect(button).toHaveFocus();
   });
 
+  describe('what a native select did, on a short list', () => {
+    const THREE = [
+      { value: 'viewer', label: 'Viewer' },
+      { value: 'interviewer', label: 'Interviewer' },
+      { value: 'admin', label: 'Admin' },
+      { value: 'intern', label: 'Intern', disabled: true },
+      { value: 'inspector', label: 'Inspector' },
+    ];
+
+    function Short({ onChange, searchable = false }: { onChange: (value: string) => void; searchable?: boolean }) {
+      return (
+        <Combobox
+          id="native"
+          aria-label="Role"
+          searchable={searchable}
+          value="viewer"
+          onChange={onChange}
+          options={THREE}
+          placeholder="Role"
+          searchLabel="Roles"
+          listLabel="Roles"
+        />
+      );
+    }
+
+    it('Space picks the active option', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('{ArrowDown} ');
+      expect(onChange).toHaveBeenCalledWith('interviewer');
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    });
+
+    it('a letter moves to the next option starting with it, past a disabled one, and wraps', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('i{Enter}');
+      expect(onChange).toHaveBeenLastCalledWith('interviewer');
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('ii{Enter}');
+      expect(onChange).toHaveBeenLastCalledWith('inspector');
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('iii{Enter}');
+      expect(onChange).toHaveBeenLastCalledWith('interviewer');
+    });
+
+    it('a letter nothing starts with leaves the active option where it was', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('z{Enter}');
+      expect(onChange).toHaveBeenCalledWith('viewer');
+    });
+
+    it('with a search box, Space and letters are still typing', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} searchable />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('i n');
+      expect(screen.getByRole('combobox', { name: 'Roles' })).toHaveValue('i n');
+      expect(onChange).not.toHaveBeenCalled();
+    });
+  });
+
+  it('searches keywords and never prints them', async () => {
+    const user = userEvent.setup();
+    render(
+      <Combobox
+        id="kw"
+        aria-label="Candidate"
+        value=""
+        onChange={() => {}}
+        options={[
+          { value: '1', label: 'Asha', keywords: 'asha@example.com' },
+          { value: '2', label: 'Dev', keywords: 'dev@example.com' },
+        ]}
+        placeholder="Candidate"
+        searchLabel="Search"
+        listLabel="Candidates"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /^Candidate/ }));
+    expect(document.body.textContent).not.toContain('example.com');
+    await user.keyboard('dev@');
+    expect(screen.getByRole('option', { name: /Dev/ })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Asha/ })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('example.com');
+  });
+
   it('floats over the page on a toolbar, so opening it moves nothing', async () => {
     const user = userEvent.setup();
     render(

@@ -27,16 +27,38 @@ describe('ConfirmButton focus', () => {
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
 
-  it('closes on Escape and does not write', async () => {
+  it('closes on Escape straight after opening, with focus still on the trigger', async () => {
     const user = userEvent.setup();
     const onConfirm = vi.fn();
     render(<ConfirmButton label="Apply" summary="Apply it?" onConfirm={onConfirm} />);
-    await user.click(screen.getByRole('button', { name: 'Apply' }));
-    screen.getByRole('button', { name: 'Confirm' }).focus();
+    screen.getByRole('button', { name: 'Apply' }).focus();
+    await user.keyboard('{Enter}');
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeInTheDocument();
     await user.keyboard('{Escape}');
     expect(screen.queryByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Apply' })).toHaveFocus();
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it('closes on Escape from inside the well too, and hands focus back', async () => {
+    const user = userEvent.setup();
+    render(<ConfirmButton label="Apply" summary="Apply it?" onConfirm={() => {}} />);
+    screen.getByRole('button', { name: 'Apply' }).focus();
+    await user.keyboard('{Enter}');
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Confirm' })).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Apply' })).toHaveFocus();
+  });
+
+  it('leaves the well open on Escape while the write is in flight', async () => {
+    const user = userEvent.setup();
+    render(<ConfirmButton label="Apply" summary="Apply it?" onConfirm={() => new Promise(() => {})} />);
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.keyboard('{Escape}');
+    expect(screen.getByText('Apply it?')).toBeInTheDocument();
   });
 
   it('leaves focus alone when the caller has already moved it to the outcome', async () => {

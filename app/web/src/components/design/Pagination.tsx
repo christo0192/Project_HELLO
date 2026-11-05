@@ -128,13 +128,13 @@ export function Pagination({ state, noun, hidePageSize = false, className }: Pag
           <div className="flex items-center gap-2 text-xs text-ink-tertiary">
             {/* Visible "Rows", accessible name "Rows per page": the visible
                 text is a prefix of the name (WCAG 2.5.3 label-in-name). */}
-            <span id={`-label`}>
+            <span id={`${sizeId}-label`}>
               Rows<span className="sr-only"> per page</span>
             </span>
             {/* Upward: the pager is the foot of the page. */}
             <Combobox
               id={sizeId}
-              labelId={`-label`}
+              labelId={`${sizeId}-label`}
               size="sm"
               searchable={false}
               floating="up"

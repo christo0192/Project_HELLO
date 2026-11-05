@@ -1747,13 +1747,16 @@ describe('Unsaved scorecard edits', () => {
     ],
   };
 
-  async function editWithAChangedWeight() {
-    mockApi.listRoles.mockResolvedValue([mockRole]);
+  const SECOND_AGENT = { ...mockRole, id: 'role-2', title: 'Data Analyst' };
+
+  async function editWithAChangedWeight(roles = [mockRole]) {
+    mockApi.listRoles.mockResolvedValue(roles);
+    mockApi.getRoleScorecard.mockClear();
     mockApi.getRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
     mockApi.listScorecardMetrics.mockResolvedValue([]);
     mockApi.updateRole?.mockClear?.();
     render(<RolesPage />);
-    await userEvent.click(await screen.findByRole('button', { name: /^edit/i }));
+    await userEvent.click((await screen.findAllByRole('button', { name: /^edit/i }))[0]);
     const weight = await screen.findByLabelText('Weight for Clarity');
     fireEvent.change(weight, { target: { value: '60' } });
   }
@@ -1779,6 +1782,69 @@ describe('Unsaved scorecard edits', () => {
     await editWithAChangedWeight();
     await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/not saved/);
+  });
+
+  it("asks before another agent's Edit throws them away, and Keep editing keeps them", async () => {
+    await editWithAChangedWeight([mockRole, SECOND_AGENT]);
+    const otherEdit = screen.getAllByRole('button', { name: /^edit/i })[1];
+    await userEvent.click(otherEdit);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/scorecard below has changes that are not saved/);
+    // The list is far below the form, so the question takes focus or it goes unseen.
+    expect(screen.getByRole('button', { name: 'Keep editing' })).toHaveFocus();
+    expect(screen.getByLabelText('Weight for Clarity')).toHaveValue(60);
+    expect(screen.getByLabelText('Job role')).toHaveValue(mockRole.title);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Keep editing' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Weight for Clarity')).toHaveValue(60);
+    expect(screen.getByLabelText('Job role')).toHaveValue(mockRole.title);
+    expect(otherEdit).toHaveFocus();
+    expect(mockApi.getRoleScorecard).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the other agent on Discard, with nothing left to ask', async () => {
+    await editWithAChangedWeight([mockRole, SECOND_AGENT]);
+    const otherEdit = screen.getAllByRole('button', { name: /^edit/i })[1];
+    await userEvent.click(otherEdit);
+    await userEvent.click(await screen.findByRole('button', { name: 'Discard scorecard changes' }));
+    await waitFor(() => expect(screen.getByLabelText('Job role')).toHaveValue('Data Analyst'));
+    expect(mockApi.getRoleScorecard).toHaveBeenLastCalledWith('role-2');
+    expect(await screen.findByLabelText('Weight for Clarity')).toHaveValue(100);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(otherEdit).toHaveFocus();
+  });
+
+  it("does not ask when the row's Edit is the agent already open", async () => {
+    await editWithAChangedWeight([mockRole, SECOND_AGENT]);
+    await userEvent.click(screen.getAllByRole('button', { name: /^edit/i })[0]);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Weight for Clarity')).toHaveValue(60);
+  });
+
+  it("opens another agent straight away when the card is as it was saved", async () => {
+    mockApi.listRoles.mockResolvedValue([mockRole, SECOND_AGENT]);
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    render(<RolesPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /^edit/i }))[0]);
+    await screen.findByLabelText('Weight for Clarity');
+    await userEvent.click(screen.getAllByRole('button', { name: /^edit/i })[1]);
+    await waitFor(() => expect(screen.getByLabelText('Job role')).toHaveValue('Data Analyst'));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it.each(['Cancel', 'Save changes'])('takes the question down once Save scorecard has kept the edits (%s)', async (leaving) => {
+    await editWithAChangedWeight();
+    fireEvent.change(screen.getByLabelText('Weight for Clarity'), { target: { value: '100' } });
+    fireEvent.change(screen.getByLabelText('Instruction for this agent'), { target: { value: 'Listen closely' } });
+    mockApi.putRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
+    await userEvent.click(screen.getByRole('button', { name: leaving }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/not saved/);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Save scorecard' }));
+    expect(await screen.findByText('Scorecard saved as a new version.')).toBeInTheDocument();
+    expect(screen.queryByText(/changes that are not saved/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Discard scorecard changes' })).not.toBeInTheDocument();
   });
 
   it('says nothing when the card is as it was saved', async () => {

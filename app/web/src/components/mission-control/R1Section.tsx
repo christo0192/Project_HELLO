@@ -85,7 +85,7 @@ export function R1Section() {
     setUsage(empty());
     setSettings(empty());
     const message = (e: unknown) =>
-      e instanceof ApiError || e instanceof Error ? plainErrorText(e.message) : 'Could not load';
+      e instanceof ApiError || e instanceof Error ? plainErrorText(e.message) : "Couldn't load";
     const usageDone = api
       .getR1Usage()
       .then((data) => setUsage({ data, error: null }))
@@ -114,11 +114,11 @@ export function R1Section() {
 
   const dash = (source: Source<unknown>, item: MetricItem): MetricItem =>
     source.error
-      ? { ...item, value: '—', unit: undefined, context: 'Could not load', title: source.error }
+      ? { ...item, value: '—', unit: undefined, context: "Couldn't load", title: source.error }
       : { ...item, loading: loading && source.data === null };
 
   const statusItem: MetricItem = settings.error
-    ? { label: 'R1 status', value: '—', context: 'Could not load', title: settings.error }
+    ? { label: 'R1 status', value: '—', context: "Couldn't load", title: settings.error }
     : {
         label: 'R1 status',
         value: run ? (

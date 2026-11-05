@@ -552,6 +552,24 @@ function PaginationHarness({
 }
 
 describe('usePagination + Pagination', () => {
+  it('gives each pager on a page its own Rows label', () => {
+    render(
+      <>
+        <PaginationHarness />
+        <PaginationHarness />
+      </>,
+    );
+    const pickers = screen.getAllByRole('button', { name: /^Rows per page/ });
+    expect(pickers).toHaveLength(2);
+    const labels = pickers.map((picker) => picker.getAttribute('aria-labelledby')!.split(' ')[0]);
+    expect(new Set(labels).size).toBe(2);
+    for (const [index, id] of labels.entries()) {
+      const label = document.getElementById(id);
+      expect(label).toHaveTextContent('Rows per page');
+      expect(label?.closest('nav')).toBe(pickers[index].closest('nav'));
+    }
+  });
+
   it('slices 34 rows into 4 pages of 10 and reports the visible range', () => {
     render(<PaginationHarness />);
     expect(screen.getByTestId('page')).toHaveTextContent('1');

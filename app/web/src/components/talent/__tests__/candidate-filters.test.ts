@@ -17,6 +17,7 @@ import {
   DEFAULT_CANDIDATE_VIEW,
   applyCandidateListView,
   formatWaiting,
+  isInFlightShell,
   orderCandidates,
   parseCandidateListView,
 } from '../candidateFilters';
@@ -52,6 +53,7 @@ describe('parseCandidateFilters', () => {
       recommendations: ['advance'],
       resumeReview: [],
       intakeType: [],
+      arriving: false,
       assessed: true,
       roleId: 'r1',
       jobState: null,
@@ -87,6 +89,7 @@ describe('buildCandidateSearch / candidatesHref', () => {
       recommendations: ['advance', 'reject'],
       resumeReview: [],
       intakeType: [],
+      arriving: false,
       assessed: true,
       roleId: 'r9',
       jobState: null,
@@ -282,6 +285,7 @@ describe('resume-review facet', () => {
       recommendations: ['advance'],
       resumeReview: ['processing', 'cancelled'],
       intakeType: [],
+      arriving: false,
       assessed: true,
       roleId: 'r9',
       jobState: null,
@@ -582,6 +586,47 @@ describe('orderCandidates', () => {
   it('counts a settled candidate as not waiting', () => {
     const rows = [row('done', { status: 'rejected' }), row('old', { created_at: '2026-09-01T00:00:00.000Z' }), row('new')];
     expect(ids(orderCandidates(rows, { sort: 'waiting', dir: 'desc' }))).toEqual(['old', 'new', 'done']);
+  });
+});
+
+describe('shells still being read', () => {
+  const named = cand({ name: 'Asha' });
+  const resumeShell = cand({ name: null, resume_review: 'processing' });
+  // The API forces a phone intake's resume review to null, so it can never be
+  // reached through `resume_review`.
+  const phoneShell = cand({ name: null, resume_review: null, intake_type: 'phone_parsing' });
+
+  it('counts a nameless phone intake as well as a resume being read', () => {
+    expect(isInFlightShell(resumeShell)).toBe(true);
+    expect(isInFlightShell(phoneShell)).toBe(true);
+    expect(isInFlightShell({ ...phoneShell, name: '   ' })).toBe(true);
+  });
+
+  it('counts nobody with a name, and no quiet nameless row', () => {
+    expect(isInFlightShell(named)).toBe(false);
+    expect(isInFlightShell({ ...phoneShell, name: 'Asha' })).toBe(false);
+    expect(isInFlightShell(cand({ name: null, resume_review: 'ready' }))).toBe(false);
+    expect(isInFlightShell(cand({ name: null, resume_review: null, intake_type: 'resume_parsing' }))).toBe(false);
+  });
+
+  it('puts both kinds after the named rows', () => {
+    const rows = [phoneShell, resumeShell, named];
+    expect(orderCandidates(rows, DEFAULT_CANDIDATE_VIEW)).toEqual([named, phoneShell, resumeShell]);
+  });
+
+  it('round-trips through the URL, and adds nothing when off', () => {
+    expect(parseCandidateFilters(new URLSearchParams('arriving=1')).arriving).toBe(true);
+    expect(parseCandidateFilters(new URLSearchParams('arriving=0')).arriving).toBe(false);
+    expect(candidatesHref({ arriving: true })).toBe('/candidates?arriving=1');
+    expect(candidatesHref()).toBe('/candidates');
+    expect(hasActiveFilters(f({ arriving: true }))).toBe(true);
+  });
+
+  it('selects both kinds and nobody else', () => {
+    const arriving = f({ arriving: true });
+    expect(matchesCandidateFilters(resumeShell, arriving)).toBe(true);
+    expect(matchesCandidateFilters(phoneShell, arriving)).toBe(true);
+    expect(matchesCandidateFilters(named, arriving)).toBe(false);
   });
 });
 

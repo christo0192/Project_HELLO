@@ -140,11 +140,13 @@ export function CandidateDetailPage() {
           params.set("tab", next === "overview" ? "overview" : "review");
           return params;
         },
-        // Switching tabs is not a navigation: Back leaves the candidate.
-        { replace: true },
+        // Switching tabs is not a navigation: Back leaves the candidate. A
+        // replace drops router state unless it is handed on, and the list's
+        // address travels in that state.
+        { replace: true, state: location.state },
       );
     },
-    [setSearchParams],
+    [setSearchParams, location.state],
   );
 
   // "Call candidate" in the header drives the phone card's confirmation. The
@@ -900,7 +902,7 @@ function PhoneCycleCard({
       setConfirming(false);
       setMessage(result.status === "already_requested"
         ? "A phone screening is already queued or in progress."
-        : "Phone screening requested. It will run in the next open calling window, if a line is free.");
+        : "Phone screening requested. It will be called in an open calling window when capacity allows. No time is promised.");
       load();
     } catch (e) {
       if (e instanceof ApiError && duplicateHoldErrorMessage(e.message)) {
@@ -924,7 +926,7 @@ function PhoneCycleCard({
     try {
       const result = await api.releaseCandidatePhoneDuplicateHold(candidateId);
       setMessage(result.prerequisite_status === "eligible" || result.prerequisite_status === "scheduled_next_window"
-        ? "Hold released. The screening will run in the next open calling window, if a line is free."
+        ? "Hold released. The screening will be called in an open calling window when capacity allows. No time is promised."
         : "Hold released. The screening is still waiting on another prerequisite before it can be called.");
       load();
     } catch (e) {
@@ -946,7 +948,7 @@ function PhoneCycleCard({
       const result = await api.requestPhoneRescreen(candidateId, { request_id: requestId, reason: chosen });
       setMessage(result.status === "already_requested"
         ? "That re-screen request was already accepted."
-        : `Re-screen cycle ${result.cycle_number ?? ""} requested. It will run in the next open calling window, if a line is free.`);
+        : `Re-screen cycle ${result.cycle_number ?? ""} requested. It will be called in an open calling window when capacity allows. No time is promised.`);
       load();
     } catch (e) {
       setMessage(e instanceof ApiError ? e.message : "The re-screen request could not be created.");

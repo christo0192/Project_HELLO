@@ -69,6 +69,7 @@ import {
   engagementStateTerm,
   isAttemptInFlight,
   isLiveAppointment,
+  missedAppointmentNote,
 } from './phoneVocabulary';
 
 export interface PhoneAppointmentDetailProps {
@@ -171,8 +172,7 @@ export function PhoneAppointmentDetail({
 
       {appointment.status === 'missed' && (
         <p className="mt-4 text-sm leading-6 text-ink">
-          This slot passed without a call, and nothing will dial for it now. To try again, open
-          the candidate and book a new time.
+          {missedAppointmentNote(appointment.engagement_state)}
         </p>
       )}
 

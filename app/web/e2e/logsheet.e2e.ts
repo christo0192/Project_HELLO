@@ -167,6 +167,41 @@ test.describe('the sheet at both desk sizes', () => {
       expect(box.scrolled).toBeLessThanOrEqual(box.panel);
     });
 
+    test(`at ${viewport.width} the longest status label still fits the Candidates panel`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      // "Abandoned: dropped before screening", the widest label `status.ts` has.
+      Object.assign(app.db.candidates[0], { status: 'screening', phone_state: 'failed', phone_state_reason: 'screening_abandoned' });
+      await openRoute(app, routeNamed('candidates'));
+      await expect(page.getByRole('table').getByText('Abandoned: dropped before screening')).toBeVisible();
+      const box = await page.getByRole('table').evaluate((table) => {
+        const scroller = table.parentElement!;
+        return { table: table.scrollWidth, panel: scroller.clientWidth, scrolled: scroller.scrollWidth };
+      });
+      expect(box.table, 'the table against its panel').toBeLessThanOrEqual(box.panel);
+      expect(box.scrolled).toBeLessThanOrEqual(box.panel);
+    });
+
+    test(`at ${viewport.width} the phone filter band keeps its height when the week lands`, async ({ page }) => {
+      await page.setViewportSize(viewport);
+      // Held until the first measure is taken, so nothing here depends on a timer.
+      let release = () => {};
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      await page.route(/\/api\/phone\/calendar\?/, async (route) => {
+        await held;
+        await route.fallback();
+      });
+      await page.goto('/phone-calendar');
+      await expect(page.getByText('Loading the phone calendar…')).toBeVisible();
+      const toolbar = page.locator('[data-phone-toolbar]');
+      const loading = (await toolbar.boundingBox())!;
+
+      release();
+      await expect(page.getByRole('group', { name: 'Engagement' })).toBeVisible();
+      await expect(page.getByRole('table').first()).toBeVisible();
+      const loaded = (await toolbar.boundingBox())!;
+      expect(loaded.height, 'the band, loading against loaded').toBe(loading.height);
+    });
+
     test(`at ${viewport.width} no page scrolls sideways`, async ({ app, page }) => {
       test.setTimeout(120_000);
       await page.setViewportSize(viewport);
@@ -221,6 +256,29 @@ test.describe('the sheet at both desk sizes', () => {
     await page.getByRole('link', { name: /Back to candidates/ }).click();
     await expect(page).toHaveURL(/page=2/);
     await expect(page.getByRole('navigation', { name: 'candidates pagination' })).toContainText(/11–20/);
+  });
+
+  test('a page number survives a change of tab on the candidate', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates'));
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect(page).toHaveURL(/page=2/);
+    await page.getByRole('table').getByRole('link').first().click();
+    for (const name of ['Overview', 'Review']) {
+      await page.getByRole('tab', { name }).click();
+      await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'true');
+    }
+    await page.getByRole('link', { name: /Back to candidates/ }).click();
+    await expect(page).toHaveURL(/page=2/);
+    await expect(page.getByRole('navigation', { name: 'candidates pagination' })).toContainText(/11–20/);
+  });
+
+  test('the audit log names what the database stores in plain words', async ({ app, page }) => {
+    await openRoute(app, routeNamed('mission-control-audit'));
+    const table = page.getByRole('table');
+    for (const label of ['Access entry added', 'Session status changed', 'Quota policy changed', 'Maintenance mode changed']) {
+      await expect(table.getByText(label).first()).toBeVisible();
+    }
+    await expect(table.getByText(/^Admin /)).toHaveCount(0);
   });
 
   test('a verdict is a circle and a word, in ink, with no hue', async ({ app, page }) => {

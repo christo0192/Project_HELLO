@@ -14,6 +14,13 @@
  * switch is a sunken segmented pair, the facets are quiet pills, and the one
  * filled accent on the page belongs to the page's primary action.
  *
+ * ── ONE HEIGHT, LOADING OR LOADED ─────────────────────────────────────
+ * The filters are two lines at a desk, the agent and appointments above the
+ * engagements, whatever a week holds. While rows are on their way the same
+ * markup is drawn invisibly around one placeholder pill per group, so what is
+ * held is the band's real height at any width or pointer rather than a figure
+ * that has to be kept in step with it. e2e pins that in a real browser.
+ *
  * Every toggle carries `aria-pressed`, so its on/off state is announced and
  * is never conveyed by fill colour alone. Controls are the 36px control height
  * with a mouse and 44px on a touch screen: at 44 the band took 270px of the
@@ -73,6 +80,9 @@ export interface PhoneFilterBarProps {
   /** While rows are on their way, hold the band's height so the grid does not jump. */
   reserveFilters?: boolean;
 }
+
+/** What the held band draws in place of the week's facets. Never seen. */
+const HELD_FACETS: PhoneFacet[] = [{ value: 'scheduled', count: 0, active: false }];
 
 /** The one label style in this toolbar: sentence case, 13px, tertiary ink. */
 const legendClass = 'text-label font-medium text-ink-tertiary';
@@ -216,9 +226,16 @@ export function PhoneFilterBar({
   reserveFilters = false,
 }: PhoneFilterBarProps) {
   const anyActive = hasActivePhoneFilters(filters);
+  const holding = !showFilters && reserveFilters;
+  const engagements = holding ? HELD_FACETS : stateFacets;
 
   return (
-    <GlassPanel level="ruled" padding="none" className="mb-4 divide-y divide-[var(--glass-ring)]">
+    <GlassPanel
+      level="ruled"
+      padding="none"
+      className="mb-4 divide-y divide-[var(--glass-ring)]"
+      data-phone-toolbar=""
+    >
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3 py-2.5">
         <div className="min-w-0">{header}</div>
         <fieldset className="min-w-0">
@@ -245,35 +262,43 @@ export function PhoneFilterBar({
         </fieldset>
       </div>
 
-      {!showFilters && reserveFilters && <div aria-hidden="true" className="min-h-[4.75rem]" />}
-      {showFilters && (
-      <div className="flex flex-col gap-3 py-3 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-6">
-        <AgentPicker agents={agents} value={filters.agent} onChange={onAgentChange} />
-
-        <FacetGroup
-          legend="Appointment"
-          facets={statusFacets}
-          dimension="status"
-          labelFor={(v) => appointmentStatusTerm(v).label}
-          onToggle={onToggle}
-        />
-        <FacetGroup
-          legend="Engagement"
-          facets={stateFacets}
-          dimension="state"
-          labelFor={(v) => engagementStateTerm(v).label}
-          onToggle={onToggle}
-        />
-        {anyActive && (
-          <Button
-            variant="ghost"
-            onClick={onClear}
-            className="self-start sm:ml-auto sm:self-end"
-          >
-            Clear filters
-          </Button>
-        )}
-      </div>
+      {(showFilters || holding) && (
+        <div aria-hidden={holding || undefined} className={cx('flex flex-col gap-3 py-3', holding && 'invisible')}>
+          <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-6">
+            <AgentPicker
+              agents={holding ? { status: 'loading' } : agents}
+              value={filters.agent}
+              onChange={onAgentChange}
+            />
+            <FacetGroup
+              legend="Appointment"
+              facets={holding ? HELD_FACETS : statusFacets}
+              dimension="status"
+              labelFor={(v) => appointmentStatusTerm(v).label}
+              onToggle={onToggle}
+            />
+          </div>
+          {(engagements.length > 0 || anyActive) && (
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-x-6">
+              <FacetGroup
+                legend="Engagement"
+                facets={engagements}
+                dimension="state"
+                labelFor={(v) => engagementStateTerm(v).label}
+                onToggle={onToggle}
+              />
+              {anyActive && !holding && (
+                <Button
+                  variant="ghost"
+                  onClick={onClear}
+                  className="self-start sm:ml-auto sm:self-end"
+                >
+                  Clear filters
+                </Button>
+              )}
+            </div>
+          )}
+        </div>
       )}
     </GlassPanel>
   );

@@ -19,8 +19,9 @@
 
 import { useEffect, useId, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type { Candidate, PhoneCandidateAppointmentCreateInput, PhoneSlot } from '../../types';
-import { Combobox, GlassPanel, SectionHeader } from '../design';
+import { Combobox, ErrorPanel, GlassPanel, SectionHeader } from '../design';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
 import { formatIstLongDayLabel, formatIstTimeRange, type IstDate } from '../../lib/ist-datetime';
 import { candidateDisplayStatus } from '../talent/status';
@@ -45,20 +46,25 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
 
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [candidateError, setCandidateError] = useState<string | null>(null);
+  /** Bumped by Try again, which runs the read below once more. */
+  const [candidateRead, setCandidateRead] = useState(0);
   const [candidateId, setCandidateId] = useState('');
   const [slotDate, setSlotDate] = useState<IstDate>(today);
   const [slot, setSlot] = useState<PhoneSlot | null>(null);
 
-  // One candidate read per opening: the panel mounts when it opens, so
-  // closing and reopening it is also the retry after a failed read.
+  // One candidate read per opening (the panel mounts when it opens), and one
+  // more for each Try again.
   useEffect(() => {
     let live = true;
+    setCandidateError(null);
     api
       .listCandidates()
       .then((rows) => { if (live) setCandidates(rows); })
-      .catch((error: ApiError) => { if (live) setCandidateError(error.message); });
+      .catch((error: ApiError) => {
+        if (live) setCandidateError(`The candidate list couldn't load. ${plainErrorText(error.message)}`);
+      });
     return () => { live = false; };
-  }, []);
+  }, [candidateRead]);
 
   const selected = candidates?.find((candidate) => candidate.id === candidateId);
   const ready = selected !== undefined && slot !== null;
@@ -85,13 +91,12 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
             Candidate
           </label>
           {candidateError ? (
-            <p
-              id={candidateHintId}
-              role="status"
-              className="mt-1.5 rounded-control bg-error-soft px-3.5 py-2.5 text-sm text-ink"
-            >
-              Candidate list unavailable. Close and reopen to retry.
-            </p>
+            <ErrorPanel
+              compact
+              className="mt-1.5"
+              message={candidateError}
+              onRetry={() => setCandidateRead((read) => read + 1)}
+            />
           ) : candidates === null ? (
             <p id={candidateHintId} role="status" className="mt-1.5 text-sm text-ink-tertiary">
               Loading candidates…
@@ -102,8 +107,9 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
             </p>
           ) : (
             // Searches name and email: hundreds of people in API order was a list
-            // nobody could find anyone in. Never a phone number, which this page
-            // keeps out of the DOM altogether.
+            // nobody could find anyone in. The email is a search term and is
+            // never printed: this page keeps contact details out of the DOM, and
+            // the booking list is open on calendars that get shared on a call.
             <Combobox
               id={candidateFieldId}
               labelId={`${candidateFieldId}-label`}
@@ -113,9 +119,8 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
               options={candidates.map((candidate) => ({
                 value: candidate.id,
                 label: candidate.name ?? 'Candidate',
-                description: [candidateDisplayStatus(candidate).label, candidate.email]
-                  .filter(Boolean)
-                  .join(' · '),
+                description: candidateDisplayStatus(candidate).label,
+                keywords: candidate.email ?? undefined,
               }))}
               placeholder="Select a candidate"
               searchLabel="Search by name or email"

@@ -3,11 +3,14 @@
  * Covers: only-bounded-fields rendering (metadata/emails never reach the
  * DOM), bounded pagination, loading/error/retry, empty state, axe.
  */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { AdminAuditRow } from '../../../types';
 import { missionApi, apiFns } from './apiMock';
 import { AuditSection } from '../AuditSection';
+import { AUDIT_ACTION_LABELS, auditActionLabel } from '../statusMeta';
 
 vi.mock('../../../api', () => ({
   api: missionApi.api,
@@ -51,12 +54,12 @@ describe('AuditSection', () => {
     expect(screen.queryByText('unauthorized')).not.toBeInTheDocument();
     apiFns.listAdminAudit.mockResolvedValue({ audit: [ROW] });
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
-    expect(await screen.findByText('Admin maintenance toggle')).toBeInTheDocument();
+    expect(await screen.findByText('Maintenance mode changed')).toBeInTheDocument();
   });
 
   it('renders only the bounded redacted fields', async () => {
     renderAudit();
-    await screen.findByText('Admin maintenance toggle');
+    await screen.findByText('Maintenance mode changed');
     expect(screen.getByText('Recruiter')).toBeInTheDocument();
     expect(screen.getByText('System')).toBeInTheDocument();
     expect(screen.getByText('Success')).toBeInTheDocument();
@@ -65,6 +68,39 @@ describe('AuditSection', () => {
       screen.queryByText('actor-user-0000-0000-000000000001'),
     ).not.toBeInTheDocument();
     expect(screen.getByText(/^actor-user-/)).toBeInTheDocument();
+  });
+
+  it.each([
+    ['admin_allowlist_add', 'allowlist_entry', 'Access entry added'],
+    ['admin_allowlist_update', 'allowlist_entry', 'Access entry changed'],
+    ['allowlist_linked', 'allowlist_entry', 'Access entry linked to a sign-in'],
+    ['admin_member_update', 'membership', 'Member access changed'],
+    ['admin_member_update', 'allowlist_entry', 'Records handed over'],
+    ['admin_session_override', 'session', 'Session status changed'],
+    ['admin_session_override', 'phone_control', 'Calling halt changed'],
+    ['admin_session_override', 'recording_finalize_control', 'Admin override'],
+    ['admin_maintenance_toggle', 'config', 'Maintenance mode changed'],
+    ['quota_override', 'quota_policy', 'Quota policy changed'],
+  ])('names %s on %s in plain words', (action, target, label) => {
+    expect(auditActionLabel(action, target)).toBe(label);
+  });
+
+  it('keys every label on a value the database can store', () => {
+    const sql = readFileSync(
+      resolve(process.cwd(), '../supabase/migrations/0114_phone_outcome_integrity.sql'),
+      'utf8',
+    );
+    const stored = sql.slice(
+      sql.indexOf('add constraint chk_audit_action'),
+      sql.indexOf('validate constraint chk_audit_action'),
+    );
+    expect(stored).toContain("'resource_generate'");
+    for (const action of Object.keys(AUDIT_ACTION_LABELS)) expect(stored).toContain(`'${action}'`);
+  });
+
+  it('keeps the stored action one hover away', async () => {
+    renderAudit();
+    expect(await screen.findByText('Maintenance mode changed')).toHaveAttribute('title', 'admin_maintenance_toggle');
   });
 
   it('never renders arbitrary metadata, IPs, tokens or emails — even if the payload contains them', async () => {
@@ -82,7 +118,7 @@ describe('AuditSection', () => {
     } as AdminAuditRow;
     apiFns.listAdminAudit.mockResolvedValue({ audit: [leaky] });
     renderAudit();
-    await screen.findByText('Admin maintenance toggle');
+    await screen.findByText('Maintenance mode changed');
     expect(screen.queryByText('top-secret-reason')).not.toBeInTheDocument();
     expect(screen.queryByText(/10\.0\.0\./)).not.toBeInTheDocument();
     expect(screen.queryByText('trace-abc')).not.toBeInTheDocument();
@@ -135,7 +171,7 @@ describe('AuditSection', () => {
 
   it('has no axe violations', async () => {
     const { container } = renderAudit();
-    await screen.findByText('Admin maintenance toggle');
+    await screen.findByText('Maintenance mode changed');
     await expect(container).toHaveNoViolations();
   });
 });

@@ -543,6 +543,19 @@ describe('no sensitive identifiers', () => {
     expect(text).not.toMatch(/https?:\/\//);
   });
 
+  it('keeps every email out of the open booking list', async () => {
+    apiFns.listCandidates.mockResolvedValue([
+      { ...PHONE_BOOKING_CANDIDATES[0], email: 'asha.rao@example.com' },
+    ]);
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Candidate/ }));
+    await screen.findByRole('option', { name: /Asha Rao/ });
+    expect(document.body.textContent).not.toMatch(/\S+@\S+\.\S+/);
+    expect(document.body.innerHTML).not.toContain('asha.rao@example.com');
+  });
+
   it('renders no sensitive value in any DOM ATTRIBUTE either', async () => {
     // The body-text scan cannot see ids, aria-controls or href values.
     renderPage();

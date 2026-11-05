@@ -778,16 +778,24 @@ describe('CandidatesPage table columns', () => {
     expect(next.querySelector('[title]')).toHaveAttribute('title', 'Screening in progress');
   });
 
-  it('never wraps the experience, status, recommendation or next-action cells', async () => {
+  it('never wraps the experience, recommendation or next-action cells', async () => {
     renderPage();
     await screen.findByText('Jane Doe');
     const table = screen.getByRole('table');
     const headers = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent ?? '');
     const cells = rowOf('Screened Sam').querySelectorAll('td');
-    for (const column of ['Exp.', 'Status', 'Recommendation', 'Waiting', 'Next action']) {
+    for (const column of ['Exp.', 'Recommendation', 'Waiting', 'Next action']) {
       const at = headers.findIndex((header) => header.startsWith(column));
       expect(cells[at].className, column).toContain('whitespace-nowrap');
     }
+  });
+
+  it('lets a long status break inside its badge, so the column keeps to its budget', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const badge = within(rowOf('Screened Sam')).getByText('Screened').closest('[data-status-badge]');
+    expect(badge?.className).not.toContain('whitespace-nowrap');
+    expect(badge?.parentElement?.className).toContain('max-w-[11rem]');
   });
 
   it('truncates email and skills only with the full value in title', async () => {

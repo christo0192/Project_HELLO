@@ -798,7 +798,12 @@ describe('CandidateDetailPage', () => {
     expect(screen.getByRole('dialog', { name: 'Confirm phone screening' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Confirm call' }));
     await waitFor(() => expect(mockApi.requestCandidatePhoneCall).toHaveBeenCalledWith('candidate-1'));
-    expect(await screen.findByRole('status')).toHaveTextContent(/Phone screening requested/);
+    const told = await screen.findByRole('status');
+    expect(told).toHaveTextContent(/Phone screening requested/);
+    // A halt or a spent daily cap can hold the call in an open window with a free
+    // line, so the words give conditions it needs and never ones that guarantee it.
+    expect(told).toHaveTextContent(/in an open calling window when capacity allows\. No time is promised\./);
+    expect(told).not.toHaveTextContent(/if a line is free/);
   });
 
   describe('the way back to the list', () => {
@@ -817,6 +822,18 @@ describe('CandidateDetailPage', () => {
       expect(await screen.findByRole('link', { name: /Back to candidates/ })).toHaveAttribute(
         'href',
         '/candidates?status=screened&page=3',
+      );
+    });
+
+    it('survives a change of tab', async () => {
+      renderFrom({ listSearch: '?status=new&page=2' });
+      await userEvent.click(await screen.findByRole('tab', { name: 'Overview' }));
+      await waitFor(() => expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true'));
+      await userEvent.click(screen.getByRole('tab', { name: 'Review' }));
+      await waitFor(() => expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'true'));
+      expect(screen.getByRole('link', { name: /Back to candidates/ })).toHaveAttribute(
+        'href',
+        '/candidates?status=new&page=2',
       );
     });
 

@@ -350,7 +350,7 @@ describe('R1Section (Mission Control)', () => {
     await waitFor(() => {
       expect(within(tile('R1 allowance used')).getByText('Not available')).toBeInTheDocument();
     });
-    expect(within(tile('R1 allowance used')).getByText('Could not load')).toBeInTheDocument();
+    expect(within(tile('R1 allowance used')).getByText("Couldn't load")).toBeInTheDocument();
     // The settings tile still shows what it could read.
     expect(within(tile('R1 status')).getByText('On')).toBeInTheDocument();
     const alerts = await screen.findAllByRole('alert');

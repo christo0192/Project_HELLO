@@ -21,6 +21,10 @@
  * - `intake` is a comma-separated subset of the intake types the list API
  *   returns (resume_parsing | phone_parsing). Mirrors `resume` exactly:
  *   client-side, additive, and a row with no intake type never matches it.
+ * - `arriving=1` is the shells still being read (`isInFlightShell`). Its own key
+ *   because they span two others: a resume shell is `resume=processing`, a phone
+ *   shell has a null resume review, and the filters here narrow, so no mix of
+ *   `resume` and `intake` can select both. Client-side and additive.
  * - `role` is a role id, applied server-side via `listCandidates(roleId)`.
  * - `ashby` is `active` | `paused`: scope to roles whose Ashby job mapping is
  *   Live (enabled) or Paused in Ashby Live Jobs. Applied client-side from the
@@ -111,6 +115,8 @@ export interface CandidateFilters {
   resumeReview: string[];
   /** Selected intake types (empty = all). Additive, like `resumeReview`. */
   intakeType: string[];
+  /** When true, restrict to shells still being read. Additive, like `resumeReview`. */
+  arriving: boolean;
   /** When true, restrict to candidates with a latest assessment score. */
   assessed: boolean;
   /** Selected role id, or null for all roles. */
@@ -144,6 +150,7 @@ export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
   recommendations: [],
   resumeReview: [],
   intakeType: [],
+  arriving: false,
   assessed: false,
   roleId: null,
   jobState: null,
@@ -189,6 +196,7 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
     recommendations: [...recommendations],
     resumeReview: [...resumeReview],
     intakeType: [...intakeType],
+    arriving: params.get('arriving') === '1',
     assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
     jobState: rawAshby === 'active' || rawAshby === 'paused' ? rawAshby : null,
@@ -220,6 +228,7 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
       INTAKE_TYPE_ORDER.filter((t) => filters.intakeType.includes(t)).join(','),
     );
   }
+  if (filters.arriving) params.set('arriving', '1');
   if (filters.assessed) params.set('assessed', '1');
   if (filters.roleId) params.set('role', filters.roleId);
   if (filters.jobState) params.set('ashby', filters.jobState);
@@ -275,6 +284,7 @@ export function matchesCandidateFilters(candidate: Candidate, filters: Candidate
   ) {
     return false;
   }
+  if (filters.arriving && !isInFlightShell(candidate)) return false;
   if (filters.assessed && candidate.latest_score == null) return false;
   return true;
 }
@@ -346,12 +356,14 @@ export function formatWaiting(since: string, now: number): string {
 }
 
 /**
- * A shell still being read: no name yet, and its resume in progress. These arrive
- * in batches and would otherwise fill page 1 with identical rows for as long as
- * an import takes.
+ * A shell still being read: no name yet, and either its resume in progress or a
+ * phone intake, which has no resume (the API gives it a null resume review) and
+ * stays nameless until the Ashby profile is read. These arrive in batches and
+ * would otherwise fill page 1 with identical rows for as long as an import takes.
  */
 export function isInFlightShell(candidate: Candidate): boolean {
-  return !candidate.name?.trim() && candidate.resume_review === 'processing';
+  if (candidate.name?.trim()) return false;
+  return candidate.resume_review === 'processing' || candidate.intake_type === 'phone_parsing';
 }
 
 /**
@@ -395,6 +407,7 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
     filters.recommendations.length > 0 ||
     filters.resumeReview.length > 0 ||
     filters.intakeType.length > 0 ||
+    filters.arriving ||
     filters.assessed ||
     filters.roleId !== null ||
     filters.jobState !== null ||

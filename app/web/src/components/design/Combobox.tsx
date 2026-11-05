@@ -23,7 +23,9 @@
  *
  * `searchable={false}` is for a short fixed list, where a search box is noise.
  * The field stays, off screen and read-only: focus and
- * `aria-activedescendant` live on it, so the keyboard contract does not change.
+ * `aria-activedescendant` live on it, so the keyboard contract below still holds,
+ * and it gains what a native select gives such a list: Space picks the active
+ * option, and a typed letter moves to the next option starting with it.
  *
  * THE KEYBOARD CONTRACT (WAI-ARIA APG, "combobox with listbox popup"):
  *   - The trigger is a button (`aria-haspopup="listbox"`, `aria-expanded`).
@@ -55,6 +57,8 @@ export interface ComboboxOption {
   label: string;
   /** A quieter second line — also searched. */
   description?: string;
+  /** Searched and never shown, for what must stay off the screen (an email). */
+  keywords?: string;
   /** Listed but not choosable (e.g. a job that is already mapped). */
   disabled?: boolean;
   /** A short tag at the end of the row, e.g. "Mapped". */
@@ -165,7 +169,7 @@ export function Combobox({
   const filtered = useMemo(() => {
     const q = fold(query.trim());
     if (!q) return options;
-    return options.filter((o) => fold(`${o.label} ${o.description ?? ''}`).includes(q));
+    return options.filter((o) => fold(`${o.label} ${o.description ?? ''} ${o.keywords ?? ''}`).includes(q));
   }, [options, query]);
 
   const enabledIndexes = useMemo(
@@ -289,6 +293,13 @@ export function Combobox({
     setActive(next);
   }
 
+  /** The next option after the active one that starts with `letter`, wrapping round. */
+  function jumpTo(letter: string) {
+    const wanted = fold(letter);
+    const matches = enabledIndexes.filter((i) => fold(filtered[i].label).startsWith(wanted));
+    if (matches.length > 0) setActive(matches.find((i) => i > active) ?? matches[0]);
+  }
+
   function onSearchKey(e: ReactKeyboardEvent<HTMLInputElement>) {
     // An IME composition owns the keyboard until it commits: Enter there
     // confirms the characters, it must not pick an option.
@@ -311,6 +322,15 @@ export function Combobox({
         close(false);
         break;
       default:
+        // With a search box these keys are typing. Without one, nothing else
+        // would hear them.
+        if (searchable) break;
+        if (e.key === ' ') {
+          e.preventDefault();
+          if (active >= 0) pick(active);
+        } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          jumpTo(e.key);
+        }
         break;
     }
   }

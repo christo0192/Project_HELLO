@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { MouseEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { questionTag, sectionHeading } from "../types";
@@ -154,6 +155,16 @@ export function RolesPage() {
    */
   const [writeError, setWriteError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Role | "new" | null>(null);
+  /**
+   * The open form's scorecard has edits that are not saved. Opening another agent
+   * remounts the form, so a row's Edit has to ask first, and the question is held
+   * here because the rows sit outside the form.
+   */
+  const [scorecardDirty, setScorecardDirty] = useState(false);
+  /** The agent whose Edit is waiting on that question. */
+  const [nextEdit, setNextEdit] = useState<Role | null>(null);
+  /** The Edit that was pressed, for focus: the question's own buttons go when it is answered. */
+  const nextEditTrigger = useRef<HTMLElement | null>(null);
   const [scorebarOpen, setScorebarOpen] = useState(false);
   // Focus returns HERE on close, and the caller owns it — `SlideOver` explains
   // why `document.activeElement` is not good enough.
@@ -184,6 +195,27 @@ export function RolesPage() {
   }, [readRoles]);
 
   useEffect(load, [load]);
+
+  const scorecardChanged = useCallback((dirty: boolean) => {
+    setScorecardDirty(dirty);
+    // Saved, or discarded: there is nothing left to ask about.
+    if (!dirty) setNextEdit(null);
+  }, []);
+
+  /** Open an agent from its row, unless that would drop unsaved scorecard edits. */
+  const editRole = (role: Role, trigger: HTMLElement) => {
+    if (!scorecardDirty) {
+      setEditing(role);
+    } else if (editing === "new" || editing?.id !== role.id) {
+      nextEditTrigger.current = trigger;
+      setNextEdit(role);
+    }
+  };
+
+  const closeForm = () => {
+    setEditing(null);
+    scorecardChanged(false);
+  };
 
   /** The role currently being removed, so only its button says so. */
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -362,11 +394,22 @@ export function RolesPage() {
         <RoleForm
           key={editing === "new" ? "new" : editing.id}
           role={editing === "new" ? null : editing}
-          onCancel={() => setEditing(null)}
+          onCancel={closeForm}
           onSaved={() => {
-            setEditing(null);
+            closeForm();
             setWriteError(null);
             load();
+          }}
+          onScorecardDirtyChange={scorecardChanged}
+          scorecardDirty={scorecardDirty}
+          nextEdit={nextEdit}
+          onKeepThisEdit={() => {
+            setNextEdit(null);
+            nextEditTrigger.current?.focus();
+          }}
+          onOpenNextEdit={(next) => {
+            setEditing(next);
+            nextEditTrigger.current?.focus();
           }}
         />
       )}
@@ -462,7 +505,7 @@ export function RolesPage() {
                     anyDeleting={deletingId !== null}
                     reactivating={reactivatingId === role.id}
                     anyReactivating={reactivatingId !== null}
-                    onEdit={() => setEditing(role)}
+                    onEdit={(event) => editRole(role, event.currentTarget)}
                     onDelete={() => void removeRole(role)}
                     onReactivate={() => void reactivateRole(role)}
                   />
@@ -520,7 +563,7 @@ function RoleRow({
   reactivating?: boolean;
   /** Some row's reactivation is in flight; every Reactivate refuses meanwhile. */
   anyReactivating?: boolean;
-  onEdit: () => void;
+  onEdit: (event: MouseEvent<HTMLElement>) => void;
   onDelete: () => void;
   /** Inactive rows only: put the archived agent back into service. */
   onReactivate?: () => void;
@@ -691,10 +734,21 @@ function RoleForm({
   role,
   onCancel,
   onSaved,
+  scorecardDirty,
+  onScorecardDirtyChange,
+  nextEdit,
+  onKeepThisEdit,
+  onOpenNextEdit,
 }: {
   role: Role | null;
   onCancel: () => void;
   onSaved: () => void;
+  scorecardDirty: boolean;
+  onScorecardDirtyChange: (dirty: boolean) => void;
+  /** Another agent's Edit, waiting on the question below. */
+  nextEdit: Role | null;
+  onKeepThisEdit: () => void;
+  onOpenNextEdit: (next: Role) => void;
 }) {
   const [title, setTitle] = useState(role?.title ?? "");
   const [agentName, setAgentName] = useState(role?.agent_name ?? "");
@@ -723,12 +777,29 @@ function RoleForm({
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   /**
-   * The scorecard panel below the form saves on its own, and Save changes and
-   * Cancel both close it. Edits there are held back behind a question, because
-   * this form used to drop them without a word.
+   * The scorecard panel below the form saves on its own, and Save changes, Cancel
+   * and another agent's Edit all close it. Edits there are held back behind a
+   * question, because this form used to drop them without a word.
    */
-  const [scorecardDirty, setScorecardDirty] = useState(false);
   const [leaving, setLeaving] = useState<null | "save" | "cancel">(null);
+  const asking = leaving !== null || nextEdit !== null;
+  const scorecardChanged = useCallback(
+    (dirty: boolean) => {
+      onScorecardDirtyChange(dirty);
+      // Save scorecard answers the question, so the question goes with it.
+      if (!dirty) setLeaving(null);
+    },
+    [onScorecardDirtyChange],
+  );
+  /**
+   * The question is beside Save, and a row's Edit is far down the page under the
+   * scorecard, so it takes focus there or it would be asked off screen.
+   */
+  const keepEditingRef = useRef<HTMLButtonElement | null>(null);
+  const saveRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (nextEdit) keepEditingRef.current?.focus();
+  }, [nextEdit]);
   /** Set after Ask Hello fills the form; cleared once the role is saved. */
   const [draftNote, setDraftNote] = useState<string | null>(null);
   /**
@@ -1250,13 +1321,23 @@ function RoleForm({
           </InlineNotice>
         )}
 
-        {leaving && (
+        {asking && (
           <InlineNotice
             tone="warning"
             role="alert"
             action={
               <span className="flex flex-wrap gap-2">
-                <Button type="button" variant="secondary" size="sm" onClick={() => setLeaving(null)}>
+                <Button
+                  ref={keepEditingRef}
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    setLeaving(null);
+                    if (nextEdit) onKeepThisEdit();
+                    else saveRef.current?.focus();
+                  }}
+                >
                   Keep editing
                 </Button>
                 <Button
@@ -1265,10 +1346,11 @@ function RoleForm({
                   size="sm"
                   onClick={() => {
                     const going = leaving;
-                    setLeaving(null);
-                    setScorecardDirty(false);
+                    const next = nextEdit;
+                    scorecardChanged(false);
                     if (going === "save") void submit();
-                    else onCancel();
+                    else if (going === "cancel") onCancel();
+                    else if (next) onOpenNextEdit(next);
                   }}
                 >
                   Discard scorecard changes
@@ -1281,7 +1363,7 @@ function RoleForm({
         )}
 
         <div className="flex flex-wrap gap-2 pt-1">
-          <Button type="submit" variant="primary" loading={saving}>
+          <Button ref={saveRef} type="submit" variant="primary" loading={saving}>
             {role ? "Save changes" : "Create agent"}
           </Button>
           <Button
@@ -1303,7 +1385,7 @@ function RoleForm({
         unsaved role has no id to attach a scorecard version to. Save the role
         first, reopen it, then configure the scorecard here.
       */}
-      {role && <RoleScorecardEditor roleId={role.id} onDirtyChange={setScorecardDirty} />}
+      {role && <RoleScorecardEditor roleId={role.id} onDirtyChange={scorecardChanged} />}
     </div>
   );
 }

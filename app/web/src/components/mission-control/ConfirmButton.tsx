@@ -101,7 +101,16 @@ export function ConfirmButton({
     // trigger stay IN that row and the confirmation panel (`basis-full
     // order-last`) drop to its own full-width line beneath it, so opening the
     // confirmation never reshuffles the buttons around it.
-    <div className={cx(quiet && 'contents', className)}>
+    <div
+      className={cx(quiet && 'contents', className)}
+      // Escape means Cancel, but not mid-write: the answer is still coming. Here
+      // and not on the well, because opening the well leaves focus on the trigger.
+      onKeyDown={(event) => {
+        if (!confirming || event.key !== 'Escape' || busy) return;
+        event.stopPropagation();
+        close();
+      }}
+    >
       <Button
         ref={triggerRef}
         size={triggerSize ?? (quiet ? 'md' : 'lg')}
@@ -117,12 +126,6 @@ export function ConfirmButton({
       {confirming && (
         <div
           id={confirmId}
-          // Escape means Cancel, but not mid-write: the answer is still coming.
-          onKeyDown={(event) => {
-            if (event.key !== 'Escape' || busy) return;
-            event.stopPropagation();
-            close();
-          }}
           className={cx(
             'glass-sunken rounded-control p-4',
             quiet ? 'order-last w-full basis-full' : 'mt-3',

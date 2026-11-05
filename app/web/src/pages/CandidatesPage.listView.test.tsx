@@ -213,13 +213,20 @@ describe('arrivals', () => {
     expect(names()).toEqual(['Person 2', 'Person 4', 'Reading resume · 3 min', 'Reading resume · 5 min']);
   });
 
-  it('links to the filter that shows them', async () => {
+  it('links to the filter that shows every one of them, phone intakes included', async () => {
     const user = userEvent.setup();
-    mockApi.listCandidates.mockResolvedValue([shell(1, 3), row(2)]);
+    mockApi.listCandidates.mockResolvedValue([
+      shell(1, 3),
+      shell(2, 6, { resume_review: null, intake_type: 'phone_parsing' }),
+      row(3),
+    ]);
     renderPage();
     await user.click(await screen.findByRole('button', { name: 'Show them' }));
-    await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('?resume=processing'));
-    expect(screen.queryByText(/Arriving from Ashby/)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('?arriving=1'));
+    expect(screen.queryByText(/Arriving from Ashby:/)).not.toBeInTheDocument();
+    expect(names()).toEqual(['Reading resume · 3 min', 'Reading Ashby profile · 6 min']);
+    await user.click(screen.getByRole('button', { name: 'Remove filter Arriving from Ashby' }));
+    await waitFor(() => expect(screen.getByTestId('search')).toBeEmptyDOMElement());
   });
 
   it('counts only the rows under it, so a filter that hides them hides the line', async () => {
@@ -242,6 +249,18 @@ describe('arrivals', () => {
     ]);
     renderPage();
     expect(await screen.findByRole('link', { name: 'Reading Ashby profile · 6 min' })).toBeInTheDocument();
+  });
+
+  it('counts a phone-intake batch, with its null resume review, and starts at a named person', async () => {
+    mockApi.listCandidates.mockResolvedValue([
+      shell(1, 8, { resume_review: null, intake_type: 'phone_parsing' }),
+      shell(2, 9, { resume_review: null, intake_type: 'phone_parsing' }),
+      row(3),
+    ]);
+    renderPage();
+    await screen.findByText('Person 3');
+    expect(screen.getByText(/Arriving from Ashby: 2 candidates being read, oldest 9 min\./)).toBeInTheDocument();
+    expect(names()).toEqual(['Person 3', 'Reading Ashby profile · 8 min', 'Reading Ashby profile · 9 min']);
   });
 });
 

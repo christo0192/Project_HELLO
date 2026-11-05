@@ -31,28 +31,9 @@ import {
   Tr,
 } from '../design';
 import { humanizeEnum } from '../../lib/humanize';
-import { formatDateTime, shortId } from './statusMeta';
+import { auditActionLabel, formatDateTime, shortId } from './statusMeta';
 
 const PAGE_SIZE = 50 as const;
-
-/**
- * The words for the actions people ask about. Anything else falls back to its
- * own words through `humanizeEnum`, and the stored value stays one hover away
- * for anyone quoting the log.
- */
-const ACTION_LABELS: Readonly<Record<string, string>> = {
-  'allowlist.add': 'Access entry added',
-  'allowlist.update': 'Access entry changed',
-  'allowlist.handover': 'Records handed over',
-  'session.override': 'Session status changed',
-  'quota.create': 'Quota policy created',
-  'quota.update': 'Quota policy changed',
-  'maintenance.update': 'Maintenance mode changed',
-};
-
-function actionLabel(action: string): string {
-  return ACTION_LABELS[action] ?? humanizeEnum(action.replace(/\./g, ' '));
-}
 
 export function AuditSection() {
   const [audit, setAudit] = useState<AdminAuditRow[] | null>(null);
@@ -138,7 +119,7 @@ export function AuditSection() {
                 <Tr key={row.id}>
                   <Td>
                     <span title={row.action} className="text-sm text-ink">
-                      {actionLabel(row.action)}
+                      {auditActionLabel(row.action, row.target_type)}
                     </span>
                   </Td>
                   <Td>
