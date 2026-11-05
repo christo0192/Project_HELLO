@@ -19,7 +19,9 @@
  * truthful note plus the candidate's latest screening scorecard, never an R1
  * one (from the viewer-visible candidate detail) instead of an error. With an
  * R1 session selected that scorecard is not this session's, so it is labelled
- * as the phone screening and the note points at the R1 card for the result.
+ * as the phone screening, the phone conflicts, role fit and summary (which have
+ * no such label) wait for the phone session, and the note points at the R1 card
+ * for the result, or at the candidate page from a host with no R1 card.
  *
  * Sync logic:
  *   1. Click a timed turn → if URL not loaded, mint it, queue the offset, wait
@@ -103,6 +105,10 @@ import { sessionModeLabel } from '../../lib/session-mode';
 /** What the Review tab calls an R1 session (it is not a phone screening). */
 const R1_SESSION_LABEL = 'R1 role-play';
 
+/** Where an R1 recording is when this host cannot play it or has no R1 card of its own. */
+const R1_RECORDING_ON_CANDIDATE_PAGE =
+  'The recording for this R1 session is on the candidate page, under R1 interview.';
+
 /** An R1 session's attempt summary, read from the candidate's rounds. */
 type R1SessionRecording =
   | { sessionId: string; status: 'loading' }
@@ -135,7 +141,8 @@ export interface TranscriptionSyncWorkspaceProps {
    * M013 S02: the candidate whose phone legs to list (`/phone-attempts`
    * filtered to the selected session). A host that omits it — the scoped
    * Ashby page, whose reduced API adapter may not offer the route — keeps the
-   * single session player.
+   * single session player. Its Overview tab has no R1 card either, so an R1
+   * pointer names the candidate page instead.
    */
   candidateId?: string;
   /**
@@ -678,7 +685,7 @@ export function TranscriptionSyncWorkspace({
               </p>
             ) : (
               <p className="text-[13px] text-[var(--c-ink-secondary)]">
-                The recording for this R1 session is on the candidate page, under R1 interview.
+                {R1_RECORDING_ON_CANDIDATE_PAGE}
               </p>
             )}
           </div>
@@ -790,11 +797,14 @@ export function TranscriptionSyncWorkspace({
       </p>
       {isR1 && (
         <p className="mt-2 max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          {/* Nothing alongside is this role-play's. While an appeal blocks decision use its result
+          {/* Nothing alongside is this role-play's. A host without a candidate id (the scoped Ashby
+              page) has no R1 card on its Overview tab. While an appeal blocks decision use the result
               is withheld on the R1 card too, so only the recording is pointed at. */}
-          {blocked
-            ? 'This role-play’s recording is on the Overview tab, under R1 interview.'
-            : 'This role-play’s result and recording are on the Overview tab, under R1 interview.'}
+          {!candidateId
+            ? R1_RECORDING_ON_CANDIDATE_PAGE
+            : blocked
+              ? 'This role-play’s recording is on the Overview tab, under R1 interview.'
+              : 'This role-play’s result and recording are on the Overview tab, under R1 interview.'}
         </p>
       )}
     </SurfaceCard>
@@ -862,7 +872,9 @@ export function TranscriptionSyncWorkspace({
           }
           emptyText={permissionDenied && isR1 ? 'No phone screening scorecard yet.' : undefined}
         />,
-        scorecardAssessment,
+        // Only the block above names the phone screening. The conflicts, role fit and summary would
+        // read as this role-play's, so a non-admin gets them by picking the phone session.
+        permissionDenied && isR1 ? null : scorecardAssessment,
       )}
     </div>
   );

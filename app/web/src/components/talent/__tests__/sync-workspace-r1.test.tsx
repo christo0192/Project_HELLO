@@ -549,6 +549,16 @@ describe('a person who cannot read the transcript', () => {
     expect(screen.getByText('Scorecards are suppressed while an appeal is under review.')).toBeInTheDocument();
   });
 
+  it.each([false, true])('a host with no R1 card (the scoped Ashby page) points at the candidate page, not at its own Overview tab (blocked: %s)', async (blocked) => {
+    mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    renderWorkspace({ candidateId: undefined, blocked });
+    // The transcript pane says the same while the load is out, so wait for the denied pane itself.
+    expect(await screen.findByText(/require admin access/i)).toBeInTheDocument();
+    expect(screen.getByText('The recording for this R1 session is on the candidate page, under R1 interview.')).toBeInTheDocument();
+    expect(screen.queryByText(/Overview tab/)).not.toBeInTheDocument();
+    expect(mockApi.listR1Rounds).not.toHaveBeenCalled();
+  });
+
   it('a phone session\'s denied pane keeps its words and says nothing about the Overview tab', async () => {
     mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
     renderWorkspace({ sessions: [PHONE_SESSION] });
@@ -598,6 +608,28 @@ describe('the "Latest scorecard" fallback never shows an R1 assessment', () => {
     // The attempt may well be scored; its result is on the R1 card the denied pane points at.
     expect(screen.queryByText(/No scorecard for this session/)).not.toBeInTheDocument();
     expect(screen.getByText('No phone screening scorecard yet.')).toBeInTheDocument();
+  });
+
+  it('a non-admin with an R1 session selected sees only the labelled scorecard: the phone conflicts, role fit and summary wait for the phone session', async () => {
+    const narrated: Assessment = {
+      ...PHONE_ASSESSMENT,
+      summary: 'A phone screening summary.',
+      role_fit: { score: 8, matched_skills: ['SQL'], gaps: [], red_flags: [], notes: 'A phone role-fit note.' },
+      resume_conflicts: [{ topic: 'Employment dates', resume_says: 'Two years', candidate_said: 'One year', resolved: false, note: '' }],
+    };
+    const headings = () => screen.getAllByRole('heading').map((h) => h.textContent ?? '');
+    renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION], assessments: [R1_ASSESSMENT, narrated] });
+    expect(await screen.findByText('Latest phone screening scorecard')).toBeInTheDocument();
+    expect(headings().filter((h) => /^(Resume conflicts|Role fit|Summary)/.test(h))).toEqual([]);
+    expect(screen.queryByText('A phone screening summary.')).not.toBeInTheDocument();
+    expect(screen.queryByText('A phone role-fit note.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Employment dates')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'phone-session' } });
+    expect(await screen.findByText('A phone screening summary.')).toBeInTheDocument();
+    expect(screen.getByText('A phone role-fit note.')).toBeInTheDocument();
+    expect(screen.getByText('Employment dates')).toBeInTheDocument();
+    expect(screen.getByText('Latest scorecard')).toBeInTheDocument();
   });
 
   it('no completed session yet: the empty state falls back to the phone scorecard, never the R1 one', () => {

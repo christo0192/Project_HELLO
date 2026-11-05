@@ -238,6 +238,50 @@ describe('TranscriptionSyncWorkspace', () => {
     expect(setCurrentTime).toHaveBeenCalledWith(5);
   });
 
+  // The other side of the R1 rule in sync-workspace-r1.test.tsx: an R1 row lights at its start, while a
+  // phone row keeps the quarter-second lead it has always had.
+  it.each([
+    ['no candidate id (the scoped host)', undefined],
+    ['a candidate whose session lists no calls', 'c1'],
+  ])('the session player lights a phone row a quarter-second early: %s', async (_host, candidateId) => {
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [], next_cursor: null });
+    mockApi.getSession.mockResolvedValue({
+      session: SESSION_COMPLETED_LIVE,
+      transcript: [
+        { speaker: 'bot' as const, text: 'Hello!', start_offset_sec: 0 },
+        { speaker: 'candidate' as const, text: 'Answer.', start_offset_sec: 5 },
+      ],
+      assessment: null,
+    });
+    mockRecordingApi.getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
+    render(
+      <TranscriptionSyncWorkspace
+        sessions={[SESSION_COMPLETED_LIVE]}
+        assessments={NO_ASSESSMENTS}
+        blocked={false}
+        candidateId={candidateId}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: /load recording/i }));
+    await waitFor(() => expect(document.querySelector('audio')).not.toBeNull());
+    const audio = document.querySelector('audio')!;
+    let playhead = 0;
+    Object.defineProperty(audio, 'currentTime', { configurable: true, get: () => playhead });
+    const playheadAt = (sec: number) => {
+      playhead = sec;
+      fireEvent.timeUpdate(audio);
+    };
+    const turn = (n: number) => screen.getByRole('button', { name: new RegExp(`^Turn ${n}:`) });
+
+    playheadAt(4.7);
+    await waitFor(() => expect(turn(1)).toHaveAttribute('aria-current', 'true'));
+    expect(turn(2)).not.toHaveAttribute('aria-current');
+
+    playheadAt(4.8);
+    await waitFor(() => expect(turn(2)).toHaveAttribute('aria-current', 'true'));
+    expect(turn(1)).not.toHaveAttribute('aria-current');
+  });
+
   it('has no axe violations', async () => {
     mockApi.getSession.mockResolvedValue({
       session: SESSION_COMPLETED_LIVE,
