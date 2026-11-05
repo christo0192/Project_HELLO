@@ -39,6 +39,7 @@ function chainable(value: any): any {
   fn.single = () => chainable(value);
   fn.is = () => chainable(value);
   fn.in = () => chainable(value);
+  fn.range = () => chainable(value);
   fn.insert = () => chainable(value);
   fn.update = () => chainable(value);
   return fn;
@@ -112,10 +113,11 @@ describe('GET /api/notifications — recruiter boundary', () => {
   });
 
   it('interviewer sees intents ONLY for candidates they own', async () => {
-    // from() call order: notification_intents (q builder) then candidates (owned ids).
+    // from() call order: candidates (owned ids, paged), then notification_intents
+    // once per batch of 100 owned ids. scale-guard.test.ts covers many batches.
     mockFrom
-      .mockReturnValueOnce(chainable({ data: [INTENT], error: null }))
-      .mockReturnValueOnce(chainable({ data: [{ id: CANDIDATE_A }], error: null }));
+      .mockReturnValueOnce(chainable({ data: [{ id: CANDIDATE_A }], error: null }))
+      .mockReturnValueOnce(chainable({ data: [INTENT], error: null }));
     const res = await request(makeApp(makeUser('interviewer')))
       .get('/api/notifications')
       .set(AUTH);

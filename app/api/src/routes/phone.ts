@@ -373,10 +373,11 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         return;
       }
       try {
-        // THREE bounded queries, whatever the row count: the appointments, then
-        // their engagements in one `in()`, then those engagements' candidates in
-        // one `in()`. Resolving a candidate per appointment would be the N+1
-        // this shape makes impossible.
+        // Appointments are one read. Their engagements, then those engagements'
+        // candidates, are read in batches of PHONE_READ_ID_BATCH ids, and any
+        // failed batch fails the whole read: never a partial calendar. Reads stay
+        // bounded by the page size; resolving a candidate per appointment would
+        // be the N+1 this shape makes impossible.
         const rows = await readStore().listAppointmentsByStart({
           fromIso: from,
           toIso: to,

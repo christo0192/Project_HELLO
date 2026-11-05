@@ -357,6 +357,61 @@ test.describe('key states', () => {
     }
     app.expectHealthy();
   });
+
+  test('Ashby Live Jobs says when a list is cut, and when a row could not be read', async ({ app, page }, testInfo) => {
+    const [first] = app.db.ashby.workflows;
+    app.db.ashby.mappingsTruncated = true;
+    app.db.ashby.workflowsTruncated = true;
+    app.db.ashby.workflows = [
+      { ...first, lifecycle: 'ready', terminalState: null, sessionId: 'session-unread', sessionStatus: null, heldForEvidence: false },
+      { ...first, applicationLinkId: 'link-unread', externalApplicationId: 'app_unread', lifecycle: 'writeback_pending', terminalState: null, sessionStatus: 'completed', heldForEvidence: null },
+    ];
+    await app.goto('/ashby-mission-control');
+
+    await expect(page.getByText('Newest 2', { exact: true })).toBeVisible();
+    await expect(page.getByText(/^In the newest 2 applications: .*Older applications are not shown or counted\.$/)).toBeVisible();
+    await expect(page.getByText(/^In the newest \d+ mappings: .*Older mappings are not shown or counted\.$/)).toBeVisible();
+    await expect(page.getByText('Session status unknown', { exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Open session' })).toBeVisible();
+    await expect(page.getByRole('button', { name: /invite link/ })).toHaveCount(0);
+    await expect(page.getByText('Evidence hold unknown', { exact: true })).toBeVisible();
+    await expect(page.getByText(/1 with a session status that could not be read and 1 with an evidence hold that could not be read\./)).toBeVisible();
+    await expect(page.getByText('Held for evidence', { exact: true })).toHaveCount(0);
+    await auditA11y(page, testInfo, 'ashby-cut-and-unknown', { strict: true });
+    app.expectHealthy();
+  });
+
+  test('Ashby Add mapping does not offer a job mapped past the cut of the list as free', async ({ app, page }) => {
+    const pastTheCut = app.db.ashby.jobs.find((job) => job.title === 'Site Reliability Engineer')!;
+    app.db.ashby.mappingsTruncated = true;
+    app.db.ashby.mappedJobIds = [...app.db.ashby.mappings.map((m) => m.externalJobId), pastTheCut.id];
+    await app.goto('/ashby-mission-control');
+    await page.getByRole('button', { name: 'Add mapping', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Add job mapping' });
+    await expect(dialog).toBeVisible();
+    await app.settle();
+    await dialog.getByLabel('Ashby job').first().click();
+    const mapped = page.getByRole('listbox').first().getByRole('group', { name: 'Already mapped' });
+    await expect(mapped.getByRole('option', { name: /^Site Reliability Engineer .*Mapped$/ })).toHaveAttribute('aria-disabled', 'true');
+    app.expectHealthy();
+  });
+
+  test('Mission Control Sessions never calls a cut page a total, and says the table holds fewer', async ({ app, page }, testInfo) => {
+    const [first] = app.db.adminSessions;
+    app.db.adminSessions = Array.from({ length: 100 }, (_, i) => ({
+      ...first,
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      status: i < 34 ? 'failed' : 'waiting',
+    }));
+    app.db.adminSessionsTruncated = true;
+    await app.goto('/mission-control');
+    await page.getByRole('tab', { name: 'Sessions' }).click();
+
+    await expect(page.getByText('The 100 most recently updated · 34 terminal', { exact: true })).toBeVisible();
+    await expect(page.getByText(/hold the 50 most recently updated\. Older sessions cannot be overridden from here\./)).toBeVisible();
+    await auditA11y(page, testInfo, 'mission-control-sessions-cut', { strict: true });
+    app.expectHealthy();
+  });
 });
 
 /**
