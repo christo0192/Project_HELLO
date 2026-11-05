@@ -99,6 +99,7 @@ export const MONO_ALLOWED = [
   'src/components/recording/CallStrip.tsx',
   'src/components/r1-review/OverviewPanel.tsx',
   'src/components/r1-review/PlayerControls.tsx',
+  'src/components/r1-review/ReviewNotes.tsx',
   'src/components/r1-review/ReviewTranscript.tsx',
 ];
 /** A hard-stop gradient is the only way to paint a WebKit range fill. */

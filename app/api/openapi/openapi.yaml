@@ -7109,6 +7109,7 @@ paths:
       tags: [notes]
       operationId: createNote
       summary: Append a bounded note (interviewer+/admin, ownership).
+      description: 'A note can name a moment (0137): round_id, session_id (needs round_id) and media_ms (needs session_id), milliseconds into that attempt''s recording. The attempt must be one of the round''s and the round the candidate''s, or the answer is 400 invalid_note_anchor, the same for a round that does not exist. Notes are human words: they reach no AI.'
       requestBody:
         required: true
         content:
@@ -7123,13 +7124,52 @@ paths:
               schema:
                 $ref: '#/components/schemas/NoteResponse'
         '400':
-          description: Bounded body rejected.
+          description: 'Bounded body rejected, or the round or attempt named is not this candidate''s (invalid_note_anchor).'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
           description: Non-owner denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/notes/rounds/{roundId}:
+    get:
+      tags: [notes]
+      operationId: listRoundNotes
+      summary: Every note on one R1 round, oldest first (viewer read-only, ownership-scoped).
+      description: 'The rule of GET /api/notes: admin and viewer any candidate, an interviewer only a candidate they own. A missing round answers an interviewer the same 403 as someone else''s. The list is read to its end, never truncated: a list past the page bound fails. A note on the candidate alone is not here: GET /api/notes has every note. Cache-Control: no-store.'
+      parameters:
+        - name: roundId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The round's notes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteListResponse'
+        '400':
+          description: Malformed round id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Not allowed to read this candidate's notes, or an interviewer asking for a round that does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: No such round (round_not_found), to someone who sees every candidate.
           content:
             application/json:
               schema:
@@ -12771,6 +12811,18 @@ components:
         created_at:
           type: string
           format: date-time
+        round_id:
+          type: string
+          format: uuid
+          nullable: true
+        session_id:
+          type: string
+          format: uuid
+          nullable: true
+        media_ms:
+          type: integer
+          minimum: 0
+          nullable: true
       additionalProperties: false
 
     NoteListResponse:
@@ -12794,6 +12846,16 @@ components:
           type: string
           minLength: 1
           maxLength: 2000
+        round_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        media_ms:
+          type: integer
+          minimum: 0
+          maximum: 86400000
       additionalProperties: false
 
     NoteStatusUpdateRequest:

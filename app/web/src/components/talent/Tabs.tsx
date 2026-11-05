@@ -53,6 +53,13 @@ export interface TabsProps {
    */
   onTabClick?: (id: string) => void;
   className?: string;
+  /** Added to the row of tabs, for a host that insets its content. */
+  listClassName?: string;
+  /**
+   * Replaces the panels' spacing, for tabs inside a tighter box than a page. Keep `display` out of it: a
+   * class like `flex` beats the `hidden` attribute, and a closed panel would stay on screen.
+   */
+  panelClassName?: string;
 }
 
 export function Tabs({
@@ -63,6 +70,8 @@ export function Tabs({
   onSelect,
   onTabClick,
   className,
+  listClassName,
+  panelClassName = 'pt-6',
 }: TabsProps) {
   const rawId = useId();
   const baseId = rawId.replace(/:/g, '-');
@@ -127,7 +136,7 @@ export function Tabs({
       <div
         role="tablist"
         aria-label={ariaLabel}
-        className="flex max-w-full gap-6 overflow-x-auto overflow-y-hidden shadow-[inset_0_-1px_0_var(--c-border)]"
+        className={cx('flex max-w-full gap-6 overflow-x-auto overflow-y-hidden shadow-[inset_0_-1px_0_var(--c-border)]', listClassName)}
       >
         {items.map((item, index) => {
           const selected = index === activeIndex;
@@ -170,7 +179,7 @@ export function Tabs({
           id={panelId(index)}
           aria-labelledby={tabId(index)}
           hidden={index !== activeIndex}
-          className="pt-6"
+          className={panelClassName}
         >
           {item.panel}
         </div>

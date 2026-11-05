@@ -1173,6 +1173,17 @@ export interface Note {
   author_id: string;
   note: string;
   created_at: string;
+  /** 0137: the round, attempt and time a note is tied to. The scoped Ashby read does not send them. */
+  round_id?: string | null;
+  session_id?: string | null;
+  media_ms?: number | null;
+}
+
+/** Where a new note belongs. Each field needs the one before it. */
+export interface NoteAnchor {
+  round_id: string;
+  session_id?: string;
+  media_ms?: number;
 }
 
 export interface NoteListResponse {

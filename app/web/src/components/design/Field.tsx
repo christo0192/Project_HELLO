@@ -78,7 +78,12 @@ export function TextField({ className, size = 'md', ...rest }: TextFieldProps) {
   );
 }
 
-export function TextArea({ className, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+export interface TextAreaProps extends TextareaHTMLAttributes<HTMLTextAreaElement> {
+  /** Reaches the native `<textarea>`, as `SelectField`'s does, for a caller that moves focus onto it. */
+  ref?: Ref<HTMLTextAreaElement>;
+}
+
+export function TextArea({ className, ...rest }: TextAreaProps) {
   return <textarea className={cx(controlClass, 'min-h-24 resize-y py-2', className)} {...rest} />;
 }
 

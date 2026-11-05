@@ -24008,6 +24008,154 @@ $$;
 
 drop function _policy_tests.p136_insert(uuid, integer, text, bigint, bigint, text, integer);
 
+-- ── 0137: recruiter notes tied to a moment ──────────────────────────────
+select _policy_tests.assert(
+  '0137: the three moment columns are nullable with no default',
+  (
+    select count(*) = 3
+      from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'recruiter_notes'
+       and column_name in ('round_id', 'session_id', 'media_ms')
+       and is_nullable = 'YES'
+       and column_default is null
+  ),
+  'additive only: every note written so far must stay valid with NULL in all three'
+);
+
+select _policy_tests.assert(
+  '0137: the moment CHECKs exist and are validated',
+  (
+    select count(*) = 2
+      from pg_constraint
+     where conrelid = 'screening_v2.recruiter_notes'::regclass
+       and conname in ('chk_recruiter_notes_session_needs_round', 'chk_recruiter_notes_media_ms')
+       and contype = 'c'
+       and convalidated
+  ),
+  'a time needs an attempt and an attempt needs a round'
+);
+
+select _policy_tests.assert(
+  '0137: a note names no round or session by foreign key',
+  (
+    select count(*) = 1
+      from pg_constraint
+     where conrelid = 'screening_v2.recruiter_notes'::regclass
+       and contype = 'f'
+       and confrelid = 'screening_v2.candidates'::regclass
+  )
+  and (
+    select count(*) = 1
+      from pg_constraint
+     where conrelid = 'screening_v2.recruiter_notes'::regclass
+       and contype = 'f'
+  ),
+  'the 0015 guard would refuse the UPDATE or DELETE such a key fires, so a note would block the delete of what it names'
+);
+
+-- Returns 'accepted', or the name of the CHECK that refused the row.
+create or replace function _policy_tests.p137_insert(
+  p_candidate uuid, p_round uuid, p_session uuid, p_media integer
+) returns text language plpgsql as $$
+declare
+  v_constraint text;
+begin
+  insert into screening_v2.recruiter_notes (candidate_id, author_id, note, round_id, session_id, media_ms)
+  values (p_candidate, gen_random_uuid(), 'pol137 note', p_round, p_session, p_media);
+  return 'accepted';
+exception when check_violation then
+  get stacked diagnostics v_constraint = constraint_name;
+  return v_constraint;
+end;
+$$;
+
+do $$
+declare
+  c_round constant text := 'chk_recruiter_notes_session_needs_round';
+  c_media constant text := 'chk_recruiter_notes_media_ms';
+  v_cand  uuid;
+  v_sid   uuid;
+  v_rid   uuid := gen_random_uuid();
+  v_note  uuid;
+  v_res   text;
+  v_row   screening_v2.recruiter_notes%rowtype;
+  v_case  record;
+  v_refused boolean;
+begin
+  insert into screening_v2.candidates (role_id, name, email)
+  values ((select id from screening_v2.roles order by id limit 1),
+          'pol137 candidate', 'pol137@example.com')
+  returning id into v_cand;
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+  values (v_cand, 'live', 'created') returning id into v_sid;
+
+  -- A note with all three is stored as written.
+  v_res := _policy_tests.p137_insert(v_cand, v_rid, v_sid, 462000);
+  select * into v_row from screening_v2.recruiter_notes where candidate_id = v_cand and media_ms = 462000;
+  perform _policy_tests.assert('0137: a note with a round, an attempt and a time is accepted and stored',
+    v_res = 'accepted' and v_row.round_id = v_rid and v_row.session_id = v_sid,
+    coalesce(v_res, 'null'));
+  v_note := v_row.id;
+
+  for v_case in
+    select * from (values
+      ('a candidate note, all NULL',   false, false, null::integer, 'accepted'),
+      ('a note on a round alone',      true,  false, null,          'accepted'),
+      ('a note on an attempt, no time', true, true,  null,          'accepted'),
+      ('a note at the very start',     true,  true,  0,             'accepted'),
+      ('a note at exactly a day',      true,  true,  86400000,      'accepted'),
+      ('an attempt with no round',     false, true,  null,          c_round),
+      ('a time with no attempt',       true,  false, 5,             c_media),
+      ('a time with nothing else',     false, false, 5,             c_media),
+      ('a negative time',              true,  true,  -1,            c_media),
+      ('a time past a day',            true,  true,  86400001,      c_media)
+    ) as t(name, has_round, has_session, media, expected)
+  loop
+    v_res := _policy_tests.p137_insert(
+      v_cand,
+      case when v_case.has_round then v_rid end,
+      case when v_case.has_session then v_sid end,
+      v_case.media);
+    perform _policy_tests.assert(
+      '0137: ' || v_case.name || ' is ' || case when v_case.expected = 'accepted' then 'accepted' else 'refused' end,
+      v_res = v_case.expected,
+      'expected ' || v_case.expected || ', got ' || coalesce(v_res, 'null'));
+  end loop;
+
+  -- The moment does not loosen 0015: an anchored note cannot be edited or removed.
+  v_refused := false;
+  begin
+    update screening_v2.recruiter_notes set media_ms = 0 where id = v_note;
+  exception when sqlstate 'P0001' then
+    v_refused := true;
+  end;
+  perform _policy_tests.assert('0137: an anchored note is still append-only (UPDATE)', v_refused,
+    'the 0015 guard must refuse an UPDATE of a note with a moment');
+  v_refused := false;
+  begin
+    delete from screening_v2.recruiter_notes where id = v_note;
+  exception when sqlstate 'P0001' then
+    v_refused := true;
+  end;
+  perform _policy_tests.assert('0137: an anchored note is still append-only (DELETE)', v_refused,
+    'the 0015 guard must refuse a DELETE of a note with a moment while the candidate stands');
+
+  -- A note never blocks the delete of what it names, and stays when it goes.
+  delete from screening_v2.call_sessions where id = v_sid;
+  perform _policy_tests.assert('0137: a session can go while a note names it, and the note stays',
+    exists (select 1 from screening_v2.recruiter_notes where id = v_note),
+    'a note must neither block nor follow the delete of its session');
+
+  delete from screening_v2.candidates where id = v_cand;
+  perform _policy_tests.assert('0137: a candidate erasure still takes their anchored notes',
+    not exists (select 1 from screening_v2.recruiter_notes where candidate_id = v_cand),
+    'the 0015 cascade must still clear every note of an erased candidate');
+end;
+$$;
+
+drop function _policy_tests.p137_insert(uuid, uuid, uuid, integer);
+
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
 -- the last phone assertion before the verdict.

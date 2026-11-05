@@ -180,15 +180,14 @@ export function ReviewTranscript({ turns, activeRow, onSeek, visible, emptyText,
       <div role="status" aria-live="polite" className="sr-only">
         {announcement}
       </div>
+      {/* The tab above says what this is, so the name is only for assistive technology. */}
+      <h2 id={headingId} className="sr-only">
+        Transcript
+      </h2>
       <div className="space-y-2 border-b border-line px-4 pb-3">
-        <div className="flex items-baseline justify-between gap-3">
-          <h2 id={headingId} className="text-section text-ink">
-            Transcript
-          </h2>
-          <span className="text-meta tabular-nums text-ink-tertiary">
-            {narrowed ? `${shown.length} of ${turns.length} turns` : `${turns.length} turns`}
-          </span>
-        </div>
+        <p className="text-meta tabular-nums text-ink-tertiary">
+          {narrowed ? `${shown.length} of ${turns.length} turns` : `${turns.length} turns`}
+        </p>
         <div className="flex items-center gap-2">
           <TextField
             type="search"

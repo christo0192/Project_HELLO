@@ -241,6 +241,8 @@ export function R1ReviewPage() {
   const candidateName = candidateDisplayName(body.candidate.name);
   const labels = attemptLabels(body.attempts);
   const mayCancelRejection = me !== null && canActOnRound(body.round, me.role, me.userId);
+  // The API's own rule for a note. An interviewer who reached this page owns the candidate: nobody else gets it.
+  const mayAddNotes = me !== null && me.role !== 'viewer';
 
   return (
     <CandidateShell variant="inset">
@@ -297,6 +299,7 @@ export function R1ReviewPage() {
                 <RecordingPanel
                   key={attempt.session_id}
                   roundId={body.round.id}
+                  candidateId={body.round.candidate_id}
                   attempt={attempt}
                   attemptLabel={labels[body.attempts.indexOf(attempt)]}
                   candidateName={candidateName}
@@ -305,6 +308,8 @@ export function R1ReviewPage() {
                   active={tab === 'recording'}
                   cue={cue}
                   tabPress={tabPress}
+                  reviewerId={me?.userId ?? null}
+                  mayAddNotes={mayAddNotes}
                   onNeedRefresh={reread}
                 />
               ) : (

@@ -5,7 +5,8 @@
  *   - the candidate's turns are grease-pencil orange, the AI voices warm grey, in a row each;
  *   - a turn is a TICK at its start. A talk BAR needs a stored end time: drawing start-to-next-start
  *     would show every silence as talk, so a turn with no end stays a tick;
- *   - an evidence quote is a numbered ink box, and a logged moment a plain ink tick;
+ *   - an evidence quote is a numbered ink box, a logged moment a plain ink tick, and a reviewer's note
+ *     a small ink flag;
  *   - a band is a dashed "pencil" outline with its word: part of the recording is not firm;
  *   - the playhead is an ink line.
  *
@@ -58,7 +59,7 @@ export interface CallStripMarker {
 export interface CallStripMoment {
   key: string;
   sec: number;
-  kind: 'evidence' | 'event';
+  kind: 'evidence' | 'event' | 'note';
   /** The evidence number printed in the box. */
   number?: number;
   /** The button's accessible name, and its tooltip. */
@@ -301,6 +302,11 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
                 >
                   {moment.kind === 'evidence' ? (
                     moment.number
+                  ) : moment.kind === 'note' ? (
+                    <span data-note-flag="" aria-hidden="true" className="relative h-2.5 w-2">
+                      <span data-mark="" className="absolute inset-y-0 left-0 w-px bg-ink" />
+                      <span data-mark="" className="absolute left-0 top-0 h-1.5 w-2 bg-ink" />
+                    </span>
                   ) : (
                     <span data-mark="" aria-hidden="true" className="h-2.5 w-px bg-ink" />
                   )}

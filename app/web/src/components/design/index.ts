@@ -32,7 +32,7 @@ export type { ButtonProps, ButtonVariant, ButtonSize } from './Button';
 export { Switch } from './Switch';
 export type { SwitchProps } from './Switch';
 export { Field, TextField, TextArea, SelectField, controlClass } from './Field';
-export type { FieldProps, TextFieldProps, SelectFieldProps } from './Field';
+export type { FieldProps, TextFieldProps, TextAreaProps, SelectFieldProps } from './Field';
 export { SegmentedControl } from './SegmentedControl';
 export type { SegmentedControlProps, SegmentedOption } from './SegmentedControl';
 export { Slider } from './Slider';

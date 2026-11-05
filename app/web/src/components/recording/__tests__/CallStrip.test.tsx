@@ -93,6 +93,48 @@ describe('what it draws', () => {
   });
 });
 
+describe('a reviewer\'s note', () => {
+  const noted = { moments: [{ key: 'nabc', sec: 150, kind: 'note' as const, label: 'Note, 2:30' }] };
+
+  it('is a button with a name, at its place on the scale', () => {
+    strip(noted);
+    const flag = screen.getByRole('button', { name: 'Note, 2:30' });
+    expect(flag.style.left).toBe('25%');
+    expect(flag).toHaveAttribute('title', 'Note, 2:30');
+  });
+
+  it('says its key when pressed', () => {
+    const { props } = strip(noted);
+    fireEvent.click(screen.getByRole('button', { name: 'Note, 2:30' }));
+    expect(props.onMoment).toHaveBeenCalledWith('nabc');
+  });
+
+  it('is drawn apart from a quote and a logged moment, so a mark means one thing', () => {
+    const { container } = strip({
+      moments: [
+        { key: 'q1', sec: 60, kind: 'evidence', number: 1, label: 'Evidence 1, Objection handling, 1:00' },
+        { key: 'e1', sec: 300, kind: 'event', label: 'Need 1 revealed, 5:00' },
+        { key: 'n1', sec: 450, kind: 'note', label: 'Note, 7:30' },
+      ],
+    });
+    expect(container.querySelectorAll('[data-note-flag]')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Note, 7:30' }).querySelector('[data-note-flag]')).not.toBeNull();
+    expect(screen.getByRole('button', { name: /^Need 1/ }).querySelector('[data-note-flag]')).toBeNull();
+  });
+
+  it('survives forced colours: a flag is fills, so each carries the mark', () => {
+    const { container } = strip(noted);
+    const flag = container.querySelector('[data-note-flag]') as HTMLElement;
+    expect(flag.querySelectorAll('[data-mark]').length).toBeGreaterThan(0);
+  });
+
+  it('uses no colour of its own: orange is the candidate\'s, and the wash is for quotes', () => {
+    const { container } = strip(noted);
+    const flag = container.querySelector('[data-note-flag]') as HTMLElement;
+    expect(flag.outerHTML).not.toMatch(/voice|wash|danger/);
+  });
+});
+
 describe('hiding the speakers', () => {
   it('collapses the speaker rows and keeps the ribbon and the moments', () => {
     const { container } = strip();

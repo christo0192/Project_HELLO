@@ -1,10 +1,10 @@
 /**
- * Recording: the video, its transport and the call strip on the left, the transcript on the right.
- * One attempt each: the page keys this by session, so another attempt starts clean.
+ * Recording: the video, its transport and the call strip on the left, the transcript and the notes on
+ * the right. One attempt each: the page keys this by session, so another attempt starts clean.
  *
  * ONE POSITION. The player, the strip, the clock and the transcript all follow it:
- *   1. The player reports the position (every frame while playing). The strip and the clock are written
- *      straight to the DOM, and the transcript renders only when the active row changes.
+ *   1. The player reports the position (every frame while playing). The strip, the clock and "Add note at"
+ *      are written straight to the DOM, and the transcript renders only when the active row changes.
  *   2. The active row is the highlight rule on `TranscriptionSyncWorkspace`: the last turn in start-time
  *      order at or before the playhead (`activeTurnAt`, no tolerance).
  *   3. A click lands `R1_SEEK_LEAD_SEC` before its turn, where rule 2 would light the row before. So the
@@ -22,18 +22,25 @@
  * KEYS work while focus is inside this panel, so a single-letter shortcut never fires from elsewhere
  * on the page (WCAG 2.1.4). A field keeps its own keys, and Space on a button stays that button's. So
  * focus is brought in: a press on the tab lands on Play (the arrow keys stay with the tabs, and Tab
- * walks in from there), and the panel takes it from a click anywhere that is not a control.
+ * walks in from there), and the panel takes it from a click anywhere that is not a control. The tabs
+ * inside this panel are the same: an arrow on Transcript or Notes moves the tab and skips nothing.
  *
  * THE PICTURE plays and pauses on a click, as native controls did. Play does the same from the keyboard.
+ *
+ * NOTES are a reviewer's own words at a moment (`ReviewNotes`). A note moves the position like the strip
+ * does, and starts nothing: where a turn plays from its lead-in, a note goes to exactly where it was
+ * pinned. Pressing a note's tick also opens it, so a flag on the strip always leads to its words.
  */
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent } from 'react';
+import { api } from '../../api';
 import { Button, EmptyPanel, InlineNotice } from '../design';
 import { CallStrip } from '../recording/CallStrip';
 import type { CallStripHandle, CallStripMoment, CallStripSpeaker } from '../recording/CallStrip';
 import { R1RecordingPlayer } from '../r1/R1RecordingPlayer';
 import type { R1RecordingPlayerHandle } from '../r1/R1RecordingPlayer';
 import { activeTurnAt } from '../talent/sessionLegs';
+import { Tabs } from '../talent/Tabs';
 import {
   clockText,
   inSeekLead,
@@ -45,10 +52,12 @@ import {
 import {
   R1_INTERVIEWER_LABEL,
   R1_PLAYBACK_RATES,
+  attemptNotes,
   cuedRow,
   eventMarks,
   evidenceMarks,
   learnerLabel,
+  noteMediaMs,
   phaseSegments,
   placeTurns,
   recordingBands,
@@ -58,7 +67,10 @@ import {
 import type { PhaseSegment, PlacedTurn, R1SpeakerKind, RolePlayMark } from '../../lib/r1-review';
 import type { R1ReviewAssessment, R1ReviewAttempt, R1ReviewEvent } from '../../lib/r1-types';
 import { PlayerControls } from './PlayerControls';
+import { ReviewNotes } from './ReviewNotes';
+import type { NoteCue } from './ReviewNotes';
 import { ReviewTranscript } from './ReviewTranscript';
+import { useRoundNotes } from './useRoundNotes';
 
 const ARROW_STEP_SEC = 5;
 const SKIP_STEP_SEC = 15;
@@ -74,6 +86,7 @@ export interface ReviewCue {
 
 export interface RecordingPanelProps {
   roundId: string;
+  candidateId: string;
   attempt: R1ReviewAttempt;
   /** "Attempt 1 (counted)": names the media for assistive technology. */
   attemptLabel: string;
@@ -84,6 +97,9 @@ export interface RecordingPanelProps {
   cue: ReviewCue | null;
   /** Counts presses on the Recording tab: each brings focus in here. */
   tabPress: number;
+  /** The person reading. Null when that could not be read. */
+  reviewerId: string | null;
+  mayAddNotes: boolean;
   onNeedRefresh: () => void;
 }
 
@@ -110,16 +126,18 @@ function stripSentence(
   marks: readonly RolePlayMark[],
   quotes: number,
   moments: number,
+  notes: number,
 ): string {
   const talk = speakers.map((speaker) => `${speaker.label} took ${plural(speaker.turns.length, 'turn')}`).join(', ');
   const stages = phases.map((phase) => `${phase.label} from ${clockText(phase.startSec)}`).join(', ');
   const lines = marks.map((mark) => `${mark.detail} at ${clockText(mark.sec)}`).join(', ');
+  const counted = notes > 0 ? `, ${plural(moments, 'logged moment')} and ${plural(notes, 'note')}` : ` and ${plural(moments, 'logged moment')}`;
   return [
     `The recording runs ${clockText(durationSec)}.`,
     talk && `${talk}.`,
     stages && `Phases: ${stages}.`,
     lines && `${lines}.`,
-    `${plural(quotes, 'evidence quote')} and ${plural(moments, 'logged moment')} are marked. The transcript beside it has every turn.`,
+    `${plural(quotes, 'evidence quote')}${counted} are marked. The transcript beside it has every turn.`,
   ]
     .filter(Boolean)
     .join(' ');
@@ -127,6 +145,7 @@ function stripSentence(
 
 export function RecordingPanel({
   roundId,
+  candidateId,
   attempt,
   attemptLabel,
   candidateName,
@@ -135,6 +154,8 @@ export function RecordingPanel({
   active,
   cue,
   tabPress,
+  reviewerId,
+  mayAddNotes,
   onNeedRefresh,
 }: RecordingPanelProps) {
   const summary = attempt.recording;
@@ -152,10 +173,15 @@ export function RecordingPanel({
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   const [rate, setRate] = useState(1);
+  const [sideTab, setSideTab] = useState('transcript');
+  const [noteCue, setNoteCue] = useState<NoteCue | null>(null);
+
+  const { state: roundNotes, retry: readNotesAgain, add: keepNote } = useRoundNotes(roundId);
 
   const playerRef = useRef<R1RecordingPlayerHandle>(null);
   const stripRef = useRef<CallStripHandle>(null);
   const clockRef = useRef<HTMLSpanElement>(null);
+  const noteClockRef = useRef<HTMLSpanElement>(null);
   const playButtonRef = useRef<HTMLButtonElement>(null);
   const positionRef = useRef(0);
   const activeRowRef = useRef<number | null>(null);
@@ -171,8 +197,12 @@ export function RecordingPanel({
     positionRef.current = sec;
     stripRef.current?.movePlayhead(sec);
     const text = clockText(sec);
-    if (clockRef.current && clockRef.current.textContent !== text) clockRef.current.textContent = text;
+    for (const clock of [clockRef.current, noteClockRef.current]) {
+      if (clock && clock.textContent !== text) clock.textContent = text;
+    }
   }, []);
+
+  const playheadSec = useCallback(() => positionRef.current, []);
 
   const dropHold = useCallback(() => {
     if (heldStartRef.current === null) return;
@@ -328,6 +358,8 @@ export function RecordingPanel({
     if (event.ctrlKey || event.metaKey || event.altKey || !playable) return;
     const target = event.target as HTMLElement;
     if (target.closest('input, select, textarea, [contenteditable="true"]')) return;
+    // The arrows on a tab are the tab's own: one press must not also skip the recording.
+    if (event.key.startsWith('Arrow') && target.closest('[role="tab"]')) return;
     const step = R1_PLAYBACK_RATES.indexOf(rate as (typeof R1_PLAYBACK_RATES)[number]);
     switch (event.key.toLowerCase()) {
       case ' ':
@@ -369,6 +401,17 @@ export function RecordingPanel({
     [assessment, attempt.session_id, turns],
   );
   const logged = useMemo(() => eventMarks(events, attempt.session_id, turns), [events, attempt.session_id, turns]);
+  const notes = useMemo(
+    () => (roundNotes.status === 'ready' ? attemptNotes(roundNotes.notes, attempt.session_id) : null),
+    [roundNotes, attempt.session_id],
+  );
+  const noteMoments = useMemo<CallStripMoment[]>(
+    () =>
+      (notes ?? []).flatMap((note) =>
+        note.sec === null ? [] : [{ key: `n${note.id}`, sec: note.sec, kind: 'note' as const, label: `Note, ${clockText(note.sec)}` }],
+      ),
+    [notes],
+  );
   const moments = useMemo<CallStripMoment[]>(
     () => [
       ...evidence.flatMap((mark) =>
@@ -379,16 +422,34 @@ export function RecordingPanel({
       ...logged.flatMap((mark) =>
         mark.startSec === null ? [] : [{ key: mark.key, sec: mark.startSec, kind: 'event' as const, label: `${mark.label}, ${clockText(mark.startSec)}` }],
       ),
+      ...noteMoments,
     ],
-    [evidence, logged],
+    [evidence, logged, noteMoments],
   );
 
+  const noteCueNonceRef = useRef(0);
   const onMoment = useCallback(
     (key: string) => {
+      const note = notes?.find((item) => `n${item.id}` === key);
+      if (note && note.sec !== null) {
+        moveTo(note.sec);
+        setSideTab('notes');
+        noteCueNonceRef.current += 1;
+        setNoteCue({ id: note.id, nonce: noteCueNonceRef.current });
+        return;
+      }
       const row = evidence.find((mark) => `q${mark.number}` === key)?.row ?? logged.find((mark) => mark.key === key)?.row ?? null;
       if (row !== null) playRow(row);
     },
-    [evidence, logged, playRow],
+    [evidence, logged, moveTo, notes, playRow],
+  );
+
+  const addNote = useCallback(
+    async (text: string, sec: number | null) => {
+      const anchor = { round_id: roundId, session_id: attempt.session_id };
+      keepNote(await api.addNote(candidateId, text, sec === null ? anchor : { ...anchor, media_ms: noteMediaMs(sec) }));
+    },
+    [attempt.session_id, candidateId, keepNote, roundId],
   );
 
   return (
@@ -445,7 +506,7 @@ export function RecordingPanel({
                 markersLabel="Role-play clock"
                 moments={moments}
                 bands={recordingBands(summary, durationSec)}
-                textAlternative={stripSentence(durationSec, speakers, segments, markers, evidence.length, logged.length)}
+                textAlternative={stripSentence(durationSec, speakers, segments, markers, evidence.length, logged.length, noteMoments.length)}
                 onSeek={moveTo}
                 onMoment={onMoment}
                 className="border-t border-line pt-3"
@@ -474,13 +535,48 @@ export function RecordingPanel({
 
       {/* The rows scroll in a box as tall as the left column, and never shorter than the window allows. */}
       <div className="relative min-h-[28rem] min-w-0 border-t border-line pt-3 min-[1180px]:min-h-[calc(100vh-15rem)] min-[1180px]:border-l min-[1180px]:border-t-0 min-[1180px]:pt-0">
-        <ReviewTranscript
-          turns={turns}
-          activeRow={activeRow}
-          onSeek={playRow}
-          visible={active}
-          emptyText={attempt.in_progress ? 'The transcript appears here once the interview ends.' : undefined}
-          className="absolute inset-0 pt-3 min-[1180px]:pt-0"
+        <Tabs
+          ariaLabel="Transcript and notes"
+          selectedId={sideTab}
+          onSelect={setSideTab}
+          className="absolute inset-0 flex flex-col pt-3 min-[1180px]:pt-0"
+          listClassName="shrink-0 px-4"
+          panelClassName="relative min-h-0 flex-1"
+          items={[
+            {
+              id: 'transcript',
+              label: 'Transcript',
+              panel: (
+                <ReviewTranscript
+                  turns={turns}
+                  activeRow={activeRow}
+                  onSeek={playRow}
+                  visible={active && sideTab === 'transcript'}
+                  emptyText={attempt.in_progress ? 'The transcript appears here once the interview ends.' : undefined}
+                  className="absolute inset-0 pt-3"
+                />
+              ),
+            },
+            {
+              id: 'notes',
+              label: 'Notes',
+              panel: (
+                <ReviewNotes
+                  notes={notes}
+                  failed={roundNotes.status === 'failed'}
+                  reviewerId={reviewerId}
+                  mayAdd={mayAddNotes}
+                  positionSec={playable ? playheadSec : null}
+                  clockRef={noteClockRef}
+                  cue={noteCue}
+                  onSeek={moveTo}
+                  onAdd={addNote}
+                  onRetry={readNotesAgain}
+                  className="absolute inset-0 pt-3"
+                />
+              ),
+            },
+          ]}
         />
       </div>
     </div>
