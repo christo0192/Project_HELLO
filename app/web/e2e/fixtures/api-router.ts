@@ -381,7 +381,7 @@ const ROUTES: Array<[string, string, Handler]> = [
   }],
   ['GET', '/api/admin/sessions', ({ query }, db) => {
     const status = query.get('status');
-    return ok({ sessions: status ? db.adminSessions.filter((s) => s.status === status) : db.adminSessions });
+    return ok({ sessions: status ? db.adminSessions.filter((s) => s.status === status) : db.adminSessions, truncated: db.adminSessionsTruncated === true });
   }],
   ['GET', '/api/admin/quotas', (_r, db) => ok({ policies: db.quotas })],
   ['POST', '/api/admin/quotas', () => ok({ ok: true, id: mintId(), created: true })],
@@ -434,7 +434,12 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', '/api/admin/r1/usage', () => ok(R1_USAGE)],
 
   // ── Ashby Mission Control ──────────────────────────────────────────
-  ['GET', `${ASHBY}/mappings`, (_r, db) => ok({ ok: true, mappings: db.ashby.mappings, truncated: db.ashby.mappingsTruncated === true })],
+  ['GET', `${ASHBY}/mappings`, (_r, db) => ok({
+    ok: true,
+    mappings: db.ashby.mappings,
+    truncated: db.ashby.mappingsTruncated === true,
+    ...(db.ashby.mappedJobIds ? { mappedJobIds: db.ashby.mappedJobIds } : {}),
+  })],
   ['POST', `${ASHBY}/mappings`, ({ body }, db) => {
     const id = mintId();
     db.ashby.mappings.push({ id, externalJobId: String(body?.external_job_id ?? ''), status: 'paused', statusReason: null, deliveryMode: String(body?.delivery_mode ?? 'email'), hasAiStage: true, hasTaStage: true, label: (body?.label as string | null) ?? null, roleId: String(body?.role_id ?? ''), updatedAt: nowIso() });

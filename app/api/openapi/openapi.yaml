@@ -8543,6 +8543,11 @@ components:
         truncated:
           type: boolean
           description: True when older live mappings exist past this page, which has no offset.
+        mappedJobIds:
+          type: array
+          description: Only on a cut list. The Ashby job id of every live mapping, including those past this page, so a caller can tell a mapped job from a free one.
+          items:
+            type: string
       additionalProperties: false
 
     AshbyBacklogPreview:
@@ -12444,6 +12449,9 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AdminSessionRow'
+        truncated:
+          type: boolean
+          description: True when more sessions exist past this page.
       additionalProperties: false
 
     QuotaPolicyRow:

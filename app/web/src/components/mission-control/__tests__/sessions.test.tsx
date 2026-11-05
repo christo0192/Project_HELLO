@@ -3,7 +3,7 @@
  * Covers: filter, response-confirmed updates (no optimism), terminal-state
  * locking (no resurrection), stable 400/409 copy, no PII, axe.
  */
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { missionApi, apiFns } from './apiMock';
@@ -67,6 +67,42 @@ describe('SessionsSection', () => {
       screen.queryByText('cand-1111-2222-3333-4444'),
     ).not.toBeInTheDocument();
     expect(screen.queryByText(/@example\.com/)).not.toBeInTheDocument();
+  });
+
+  it('calls a short list a total, and adds nothing about a cut', async () => {
+    apiFns.listAdminSessions.mockResolvedValue({ sessions: SESSIONS, truncated: false });
+    renderSessions();
+    expect(await screen.findByText('3 total · 1 terminal')).toBeInTheDocument();
+    expect(screen.queryByText(/most recently updated/)).not.toBeInTheDocument();
+  });
+
+  it('never calls a cut page a total, and says the table holds fewer still', async () => {
+    // GET /api/admin/sessions answers at most 100 rows and no total: at 5,000
+    // sessions, "100 total" would be false.
+    const page = Array.from({ length: 100 }, (_, i) => ({
+      ...SESSIONS[0],
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      status: i < 34 ? 'failed' : 'waiting',
+    }));
+    apiFns.listAdminSessions.mockResolvedValue({ sessions: page, truncated: true });
+    renderSessions();
+    expect(await screen.findByText('The 100 most recently updated · 34 terminal')).toBeInTheDocument();
+    expect(screen.queryByText(/\btotal\b/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/hold the 50 most recently updated\. Older sessions cannot be overridden from here\./),
+    ).toBeInTheDocument();
+    expect(within(screen.getByLabelText('Session')).getAllByRole('option')).toHaveLength(50);
+  });
+
+  it('says the table bound when a whole list of more than 50 does not fit it', async () => {
+    const page = Array.from({ length: 60 }, (_, i) => ({
+      ...SESSIONS[0],
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+    }));
+    apiFns.listAdminSessions.mockResolvedValue({ sessions: page, truncated: false });
+    renderSessions();
+    expect(await screen.findByText('60 total · 0 terminal')).toBeInTheDocument();
+    expect(screen.getByText(/hold the 50 most recently updated/)).toBeInTheDocument();
   });
 
   it('filters by status via the select', async () => {

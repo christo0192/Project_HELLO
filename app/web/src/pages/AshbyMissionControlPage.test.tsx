@@ -489,12 +489,12 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     expect(screen.getByText(/\b1 with an evidence hold that could not be read\b/)).toBeInTheDocument();
   });
 
-  it('says a session status is unknown when the row names a session whose status did not come back', async () => {
+  it('says a session status is unknown on every row that names a session whose status did not come back', async () => {
     listAshbyWorkflows.mockResolvedValue({
       ok: true,
       workflows: [
         { ...WORKFLOWS.workflows[0], lifecycle: 'ready', sessionId: 'sess-1', sessionStatus: null },
-        // Same read outcome, nothing to warn about: already parked, or closed.
+        // Parked or closed, the unread status still decides the row's actions.
         { ...WORKFLOWS.workflows[0], applicationLinkId: 'l2', externalApplicationId: 'app_2', lifecycle: 'writeback_pending', sessionId: 'sess-2', sessionStatus: null },
         { ...WORKFLOWS.workflows[0], applicationLinkId: 'l3', externalApplicationId: 'app_3', lifecycle: 'ready', terminalState: 'withdrawn', sessionId: 'sess-3', sessionStatus: null },
         // No session yet is not "unknown".
@@ -502,10 +502,73 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
       ],
     });
     renderPage();
-    expect(await screen.findByText('Session status unknown')).toBeInTheDocument();
-    expect(screen.getAllByText('Session status unknown')).toHaveLength(1);
+    expect(await screen.findAllByText('Session status unknown')).toHaveLength(3);
     expect(screen.queryByText('Not queued for write-back')).toBeNull();
-    expect(screen.getByText(/\b1 with a session status that could not be read\b/)).toBeInTheDocument();
+    expect(screen.getByText(/\b3 with a session status that could not be read\b/)).toBeInTheDocument();
+  });
+
+  describe('a row whose session status did not come back', () => {
+    const rowOf = (externalApplicationId: string): HTMLElement =>
+      screen.getByText(externalApplicationId).closest('li') as HTMLElement;
+    const unread = (over: Record<string, unknown>) => ({
+      ...WORKFLOWS.workflows[0],
+      operations: [],
+      sessionId: 'sess-1',
+      sessionStatus: null,
+      ...over,
+    });
+
+    it('parked: keeps the review link a read status gives it, and offers no invite anywhere', async () => {
+      listAshbyWorkflows.mockResolvedValue({
+        ok: true,
+        workflows: [
+          unread({ lifecycle: 'writeback_pending' }),
+          { ...unread({ lifecycle: 'writeback_pending', sessionStatus: 'completed' }), applicationLinkId: 'l2', externalApplicationId: 'app_2' },
+        ],
+      });
+      renderPage();
+      await screen.findByText('app_1');
+      for (const id of ['app_1', 'app_2']) {
+        expect(within(rowOf(id)).getByRole('link', { name: 'Review screening' })).toHaveAttribute('href', '/sessions/sess-1');
+        expect(within(rowOf(id)).queryByRole('button', { name: /invite link/ })).toBeNull();
+      }
+      // Reissuing revokes live invites whatever the session did, so it is not on the menu while unknown.
+      await userEvent.click(within(rowOf('app_1')).getByRole('button', { name: 'More actions for app_1' }));
+      expect(screen.getByRole('menuitem', { name: 'Cancel screening' })).toBeInTheDocument();
+      expect(screen.queryByRole('menuitem', { name: /invite link/ })).toBeNull();
+    });
+
+    it('open and not parked: links to the session page, which can read the status, and offers no invite', async () => {
+      listAshbyWorkflows.mockResolvedValue({ ok: true, workflows: [unread({ lifecycle: 'ready' })] });
+      renderPage();
+      await screen.findByText('app_1');
+      const row = rowOf('app_1');
+      expect(within(row).getByRole('link', { name: 'Open session' })).toHaveAttribute('href', '/sessions/sess-1');
+      expect(within(row).queryByRole('link', { name: 'Review screening' })).toBeNull();
+      expect(within(row).queryByRole('button', { name: /invite link/ })).toBeNull();
+    });
+
+    it('closed: links to the session, with no menu, as a closed row has none', async () => {
+      listAshbyWorkflows.mockResolvedValue({
+        ok: true,
+        workflows: [unread({ lifecycle: 'cancelled', terminalState: 'withdrawn' })],
+      });
+      renderPage();
+      await screen.findByText('app_1');
+      const row = rowOf('app_1');
+      expect(within(row).getByRole('link', { name: 'Open session' })).toBeInTheDocument();
+      expect(within(row).queryByRole('button', { name: /More actions/ })).toBeNull();
+    });
+
+    it('a status that did come back keeps the invite: only the unknown state takes it away', async () => {
+      listAshbyWorkflows.mockResolvedValue({ ok: true, workflows: [unread({ lifecycle: 'ready', sessionStatus: 'expired' })] });
+      renderPage();
+      await screen.findByText('app_1');
+      const row = rowOf('app_1');
+      expect(within(row).getByRole('button', { name: 'Get invite link' })).toBeInTheDocument();
+      expect(within(row).queryByRole('link')).toBeNull();
+      expect(screen.queryByText('Session status unknown')).toBeNull();
+    });
   });
 
   it('says plainly when the workflow list is only the newest rows, in the count and the summary', async () => {
@@ -1322,6 +1385,40 @@ describe('Adding a job mapping', () => {
       { name: `${FREE_JOB} Mapped` },
     );
     expect(taken).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('a job mapped past the cut of the mapping list is not offered as free', async () => {
+    // job_3 is mapped, by a mapping older than the newest page the list holds.
+    listAshbyMappings.mockResolvedValue({ ...MAPPINGS, truncated: true, mappedJobIds: ['job_1', 'job_2', 'job_3'] });
+    await openDialog();
+    const list = await openPicker(JOB_PICKER);
+    const taken = within(within(list).getByRole('group', { name: 'Already mapped' })).getByRole(
+      'option',
+      { name: `${FREE_JOB} Mapped` },
+    );
+    expect(taken).toHaveAttribute('aria-disabled', 'true');
+    // Held for the picker only: job ids still reach no markup.
+    expect(document.body.innerHTML).not.toContain('job_3');
+  });
+
+  it('409 conflict on a cut list: the refreshed picker really marks the job, so the same save cannot be repeated', async () => {
+    createAshbyMapping.mockRejectedValue(new ApiError('conflict', 409));
+    // Mapped past the cut by someone else: the page only learns it from the refresh.
+    listAshbyMappings
+      .mockResolvedValueOnce({ ...MAPPINGS, truncated: true, mappedJobIds: ['job_1', 'job_2'] })
+      .mockResolvedValue({ ...MAPPINGS, truncated: true, mappedJobIds: ['job_1', 'job_2', 'job_3'] });
+    const dialog = await openDialog();
+    await chooseAndSave(FREE_JOB);
+    await waitFor(() =>
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        'This job was just mapped by someone else. The list has been refreshed.',
+      ),
+    );
+    const list = await openPicker(JOB_PICKER);
+    expect(within(within(list).getByRole('group', { name: 'Already mapped' })).getByRole(
+      'option',
+      { name: `${FREE_JOB} Mapped` },
+    )).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('409 archived — says the mapping was deleted meanwhile, and refreshes', async () => {

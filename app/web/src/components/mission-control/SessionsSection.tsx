@@ -54,6 +54,8 @@ const NO_SESSIONS: AdminSessionRow[] = [];
 
 export function SessionsSection() {
   const [sessions, setSessions] = useState<AdminSessionRow[] | null>(null);
+  /** The API left sessions out of this page, so its length is not a total. */
+  const [truncated, setTruncated] = useState(false);
   const [filter, setFilter] = useState<string>('all');
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -79,6 +81,7 @@ export function SessionsSection() {
       .then((r) => {
         if (gen !== loadGen.current) return;
         setSessions(r.sessions);
+        setTruncated(r.truncated === true);
         setSelectedId((prev) =>
           prev && r.sessions.some((s) => s.id === prev)
             ? prev
@@ -155,7 +158,7 @@ export function SessionsSection() {
         title="Sessions"
         meta={
           <span className="text-[13px] tabular-nums text-ink-tertiary">
-            {sessions.length} total · {terminalCount} terminal
+            {truncated ? `The ${sessions.length} most recently updated` : `${sessions.length} total`} · {terminalCount} terminal
           </span>
         }
         description="Opaque identifiers only — no candidate PII. Terminal sessions are immutable."
@@ -262,6 +265,12 @@ export function SessionsSection() {
                 </TBody>
               </Table>
               <Pagination state={paged} noun="sessions" />
+              {sessions.length > bounded.length && (
+                <p className="mt-2 text-[13px] text-ink-tertiary">
+                  This table and the override list hold the {bounded.length} most recently updated.
+                  Older sessions cannot be overridden from here.
+                </p>
+              )}
             </>
           )}
         </RevealItem>

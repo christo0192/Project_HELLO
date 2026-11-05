@@ -1414,6 +1414,8 @@ export interface AdminSessionRow {
 
 export interface AdminSessionListResponse {
   sessions: AdminSessionRow[];
+  /** More sessions exist past this page, so its length is no total. Absent on older APIs. */
+  truncated?: boolean;
 }
 
 export interface QuotaPolicy {
@@ -1767,6 +1769,8 @@ export interface AshbyMcMappingsResponse {
   mappings: AshbyMcMapping[];
   /** Older live mappings exist past this page, which has no offset. Absent on older APIs. */
   truncated?: boolean;
+  /** Only on a cut list: the job of every live mapping, including those past the page. */
+  mappedJobIds?: string[];
 }
 
 export interface AshbyMcWorkflowsResponse {

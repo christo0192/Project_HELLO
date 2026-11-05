@@ -33,7 +33,7 @@ import {
 } from './scorecard-v2-adapter.js';
 import { parseEvidenceGrade, readAssessmentEvidenceGrade } from '../../lib/scorecards/evidence.js';
 import { toCandidateColumns } from '../../lib/candidate-phone.js';
-import { chunkIds, mapChunks, POSTGREST_MAX_ROWS } from '../../lib/id-batches.js';
+import { chunkIds, mapChunks, POSTGREST_MAX_ROWS, readAllPages } from '../../lib/id-batches.js';
 import { recommendationTagsEnabled } from './recommendation-tags.js';
 
 /**
@@ -901,6 +901,12 @@ export interface MissionControlStore {
   roleInterviewKind(roleId: string): Promise<{ interviewKind: string | null } | null>;
   /** Live (non-archived) mappings only — an archived mapping is "deleted". */
   listMappings(limit: number): Promise<MissionControlMapping[]>;
+  /**
+   * The Ashby job id of EVERY live mapping, paged past the row cap. What a cut
+   * `listMappings` page cannot answer: is this job already mapped? Throws when
+   * it cannot read them all.
+   */
+  listMappedJobIds(): Promise<string[]>;
   listWorkflows(limit: number): Promise<MissionControlWorkflow[]>;
   /**
    * Create/update a mapping. Always lands `paused`; never enables.
@@ -1115,6 +1121,12 @@ function heldOf(map: Map<string, boolean | null>, linkId: string): boolean | nul
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Hard ceiling on pages of live mappings' job ids: 20 pages of POSTGREST_MAX_ROWS
+ * is 20,000 mappings. Past it the read fails rather than leaving jobs out.
+ */
+const MAPPED_JOB_IDS_MAX_PAGES = 20;
+
 /** SQLSTATE unique_violation, as PostgREST reports it on `error.code`. */
 const PG_UNIQUE_VIOLATION = '23505';
 
@@ -1162,6 +1174,19 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         roleId: typeof r.role_id === 'string' && UUID_RE.test(r.role_id) ? r.role_id : null,
         updatedAt: String(r.updated_at),
       }));
+    },
+    async listMappedJobIds(): Promise<string[]> {
+      const read = await readAllPages<{ external_job_id?: unknown }>((from, to) => client
+        .from('ashby_job_mappings')
+        .select('external_job_id')
+        .eq('provider', 'ashby')
+        .is('archived_at', null)
+        .order('id', { ascending: true })
+        .range(from, to), MAPPED_JOB_IDS_MAX_PAGES);
+      if (!read.ok) throw new Error('ashby_mc_mapped_job_ids_error');
+      return [...new Set(read.rows
+        .map((r) => r.external_job_id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0))];
     },
     async listWorkflows(limit): Promise<MissionControlWorkflow[]> {
       const { data, error } = await client

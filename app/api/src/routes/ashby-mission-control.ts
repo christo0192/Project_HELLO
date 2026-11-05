@@ -15,7 +15,8 @@
  *                                    failed_review/cancelled/withdrawn/delivery/
  *                                    writeback states
  *                                    (both newest first, one page of at most
- *                                    MAX_LIMIT; `truncated` says older rows exist)
+ *                                    MAX_LIMIT; `truncated` says older rows exist,
+ *                                    and a cut /mappings adds `mappedJobIds`)
  *   POST /mappings/:id/pause       — admin: pause a mapping
  *   POST /mappings/:id/resume      — admin: resume (enable) a complete, non-drift mapping
  *   POST /mappings/:id/archive     — admin: "delete" a PAUSED mapping by archiving
@@ -315,8 +316,13 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   router.get('/mappings', requireRole('interviewer'), async (req: Request, res: Response) => {
     try {
       const { rows: mappings, truncated } = await readListPage((n) => store().listMappings(n), req.query.limit);
+      // The Add-mapping picker reads this list to tell a mapped job from a free
+      // one. A cut list cannot say: a job mapped past the cut would be offered
+      // as free and refused on save, again and again. So a cut list also names
+      // every live mapping's job. If that read fails, the list fails with it.
+      const mappedJobIds = truncated ? await store().listMappedJobIds() : undefined;
       await recordAudit(req, 'resource.list', 200, { metadata: { resource: 'ashby_mapping', count: mappings.length, truncated } });
-      res.json({ ok: true, mappings, truncated });
+      res.json({ ok: true, mappings, truncated, ...(mappedJobIds ? { mappedJobIds } : {}) });
     } catch {
       res.status(500).json({ ok: false, error: 'mission_control_read_error' });
     }

@@ -26,13 +26,22 @@
  * Every GET route of the app is either driven here (DRIVEN_ROUTES) or named
  * with the reason it is not (NOT_DRIVEN), and the suite ends by walking the
  * app's router stack: a new GET route fails CI until someone decides which.
+ *
+ * A read in a POST handler, a background loop or a route named in NOT_DRIVEN is
+ * out of the walker's reach. So the suite also scans the API's source: an `.in()`
+ * over a variable list fails CI unless it is a batch, or is named in
+ * BOUNDED_LISTS with the reason it stays small.
  */
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import express, { type Express } from 'express';
 import request from 'supertest';
 import { createApp } from '../app.js';
 import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
-import { ID_BATCH_SIZE, POSTGREST_MAX_ROWS } from '../lib/id-batches.js';
+import { ID_BATCH_CONCURRENCY, ID_BATCH_SIZE, POSTGREST_MAX_ROWS } from '../lib/id-batches.js';
 import { scaleDb as engine, UNDICI_OVERFLOW_ERROR, type RecordedQuery, type Row } from './support/scale-db.js';
 import {
   CALENDAR_FROM, CALENDAR_TO, FAILURES_FROM, FUNNEL_FROM, FUNNEL_TO, SCALE_ADMIN_ID, SCALE_INTERVIEWER_ID,
@@ -102,6 +111,10 @@ function expectNoSilentLimit(reportsCut: readonly string[] = []): void {
 
 beforeEach(() => {
   engine.reset({ overflowAt: ID_BATCH_SIZE });
+  // Rows a read's ORDER BY leaves tied come back in a different order per read,
+  // as Postgres may answer them, so a paged read with no total order skips and
+  // repeats rows here too.
+  engine.scrambleTies = true;
   vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -142,6 +155,21 @@ describe('the guard itself', () => {
     const q = from('candidates').select('id');
     expect(() => (q.textSearch as () => void)()).toThrow(/not modelled/);
     expect(engine.unsupported).toEqual(['candidates.textSearch']);
+  });
+
+  it('answers each page of an unordered read in its own order, so paging one skips and repeats rows', async () => {
+    engine.tables.candidates = Array.from({ length: POSTGREST_MAX_ROWS * 2 }, (_, i) => ({ id: scaleIds.candidate(i) }));
+    const readBoth = async (order: boolean): Promise<Set<unknown>> => {
+      const seen = new Set<unknown>();
+      for (const first of [0, POSTGREST_MAX_ROWS]) {
+        const q = from('candidates').select('id');
+        const paged = (order ? (q.order as (c: string) => Chain)('id') : q).range as (a: number, b: number) => PromiseLike<{ data: Row[] }>;
+        for (const row of (await paged(first, first + POSTGREST_MAX_ROWS - 1)).data) seen.add(row.id);
+      }
+      return seen;
+    };
+    expect((await readBoth(false)).size).toBeLessThan(POSTGREST_MAX_ROWS * 2);
+    expect((await readBoth(true)).size).toBe(POSTGREST_MAX_ROWS * 2);
   });
 
   describe('a read that stops itself at the row cap', () => {
@@ -273,6 +301,39 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
       expect(res.status).toBeGreaterThanOrEqual(500);
       expect(res.body.intents).toBeUndefined();
     });
+
+    it('as interviewer: starts no new batch once one has failed', async () => {
+      engine.failWhen = (q) => q.table === 'notification_intents';
+      const res = await get('/api/notifications', interviewer);
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      // In production each failed batch costs about 8 s of postgrest-js retries.
+      expect(ws.owned.size).toBeGreaterThan(ID_BATCH_SIZE * ID_BATCH_CONCURRENCY);
+      expect(engine.queries.filter((q) => q.table === 'notification_intents').length).toBeLessThanOrEqual(ID_BATCH_CONCURRENCY);
+    });
+  });
+
+  describe('GET /api/admin/sessions', () => {
+    it('one page, most recently updated first, and it says more sessions exist', async () => {
+      const res = await get('/api/admin/sessions', admin);
+      expect(res.status).toBe(200);
+      const rows = res.body.sessions as Row[];
+      expect(rows).toHaveLength(100);
+      expect(res.body.truncated).toBe(true);
+      expect(new Set(rows.map((s) => s.id)).size).toBe(100);
+      expect(rows[0].id).toBe(scaleIds.session(n - 1));
+      expectNoSilentLimit();
+    });
+
+    it('a status filter pages the same way, and an empty answer is not called cut', async () => {
+      const completed = await get('/api/admin/sessions?status=completed', admin);
+      expect(completed.status).toBe(200);
+      expect(completed.body.sessions).toHaveLength(100);
+      expect(completed.body.truncated).toBe(true);
+      expect((completed.body.sessions as Row[]).every((s) => s.status === 'completed')).toBe(true);
+      const cancelled = await get('/api/admin/sessions?status=cancelled', admin);
+      expect(cancelled.body).toEqual({ sessions: [], truncated: false });
+      expectNoSilentLimit();
+    });
   });
 
   describe('GET the funnel summary over a year', () => {
@@ -348,20 +409,61 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
       expectNoSilentLimit();
     });
 
+    it('workflows when one batch of session statuses fails: only that batch is unknown, and the list stands', async () => {
+      engine.failWhen = (q) => q.table === 'call_sessions' && (q.inValues ?? []).includes(scaleIds.session(n - 1));
+      const res = await get('/api/integrations/ashby/mission-control/workflows?limit=200', interviewer);
+      expect(res.status).toBe(200);
+      const rows = res.body.workflows as Row[];
+      expect(rows).toHaveLength(200);
+      rows.forEach((row, at) => {
+        const i = Number(String(row.applicationLinkId).slice(-12));
+        expect(row.sessionId, `link ${i}`).toBe(scaleIds.session(i));
+        expect(row.sessionStatus, `link ${i}`).toBe(at < ID_BATCH_SIZE ? null : i % 3 === 0 ? 'completed' : 'expired');
+        expect(row.heldForEvidence, `link ${i}`).toBe(ws.heldForEvidence(i));
+      });
+      expectNoSilentLimit();
+    });
+
     it('mappings at the default page: cut, and it says so', async () => {
       const res = await get('/api/integrations/ashby/mission-control/mappings', interviewer);
       expect(res.status).toBe(200);
       expect(res.body.mappings).toHaveLength(50);
       expect(res.body.truncated).toBe(true);
+      expect(new Set(res.body.mappedJobIds as string[]).size).toBe(ws.mappings);
       expectNoSilentLimit();
     });
 
-    it('mappings as the page asks, at the largest page: every live one, or a stated cut', async () => {
+    it('mappings as the page asks, at the largest page: every live one, or a stated cut naming every mapped job', async () => {
       const res = await get('/api/integrations/ashby/mission-control/mappings?limit=200', interviewer);
       expect(res.status).toBe(200);
       expect(res.body.mappings).toHaveLength(Math.min(ws.mappings, 200));
       expect(res.body.truncated).toBe(ws.mappings > 200);
+      if (ws.mappings > 200) {
+        expect(new Set(res.body.mappedJobIds as string[])).toEqual(new Set(Array.from({ length: ws.mappings }, (_, m) => `job_${m}`)));
+      } else {
+        expect(res.body).not.toHaveProperty('mappedJobIds');
+      }
       expectNoSilentLimit();
+    });
+
+    it('a cut mapping list names every live job past the row cap too, and no deleted one', async () => {
+      const table = engine.tables.ashby_job_mappings;
+      for (let m = ws.mappings; m < POSTGREST_MAX_ROWS + 5; m += 1) {
+        table.push({ ...table[0], id: scaleIds.mapping(m), external_job_id: `job_${m}` });
+      }
+      table.push({ ...table[0], id: scaleIds.mapping(999_999), external_job_id: 'job_deleted', archived_at: scaleIso(0) });
+      const res = await get('/api/integrations/ashby/mission-control/mappings?limit=200', interviewer);
+      expect(res.status).toBe(200);
+      expect(new Set(res.body.mappedJobIds as string[]).size).toBe(POSTGREST_MAX_ROWS + 5);
+      expect(res.body.mappedJobIds).not.toContain('job_deleted');
+      expectNoSilentLimit();
+    });
+
+    it('fails the cut mapping list, never one that offers a mapped job as free, when the job read fails', async () => {
+      engine.failWhen = (q) => q.table === 'ashby_job_mappings' && q.range !== null;
+      const res = await get('/api/integrations/ashby/mission-control/mappings', interviewer);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ ok: false, error: 'mission_control_read_error' });
     });
   });
 
@@ -457,9 +559,16 @@ describe('GET /api/export/:candidateId/csv for a candidate with a long history',
   const SESSIONS = 15;
   const TURNS = 80;
   const candidate = scaleIds.candidate(7);
+  // Another owner's candidate, whose rows sit in the same tables.
+  const someoneElse = scaleIds.candidate(8);
+  const theirSessions = [900, 901, 902].map((s) => scaleIds.session(s));
+  const theirAssessments = [900, 901, 902].map((s) => scaleIds.assessment(s));
 
   beforeEach(() => {
-    engine.tables.candidates = [{ id: candidate, owner_id: SCALE_INTERVIEWER_ID, status: 'screened' }];
+    engine.tables.candidates = [
+      { id: candidate, owner_id: SCALE_INTERVIEWER_ID, status: 'screened' },
+      { id: someoneElse, owner_id: SCALE_ADMIN_ID, status: 'screened' },
+    ];
     engine.tables.assessments = [];
     engine.tables.call_sessions = [];
     engine.tables.transcript_turns = [];
@@ -477,9 +586,27 @@ describe('GET /api/export/:candidateId/csv for a candidate with a long history',
         });
       }
     }
+    theirSessions.forEach((session, s) => {
+      engine.tables.call_sessions.push({ id: session, candidate_id: someoneElse, created_at: scaleIso(s) });
+      engine.tables.assessments.push({
+        id: theirAssessments[s], candidate_id: someoneElse, session_id: session, overall_score: 11,
+        recommendation: 'reject', created_at: scaleIso(s, 30), schema_version: 1,
+      });
+      engine.tables.transcript_turns.push({ session_id: session, turn_index: 0, speaker: 'candidate', text: `their turn ${s}`, created_at: scaleIso(s) });
+    });
   });
 
   const rowsOf = (csv: string, type: string) => csv.split('\r\n').filter((l) => l.startsWith(`${type},`));
+
+  it.each([['admin', admin], ['the owning interviewer', interviewer]] as const)('as %s: nothing of any other candidate', async (_who, user) => {
+    const res = await get(`/api/export/${candidate}/csv`, user);
+    expect(res.status).toBe(200);
+    expect(rowsOf(res.text, 'scorecard')).toHaveLength(SESSIONS);
+    expect(rowsOf(res.text, 'transcript')).toHaveLength(SESSIONS * TURNS);
+    for (const foreign of [someoneElse, ...theirSessions, ...theirAssessments, 'their turn']) {
+      expect(res.text).not.toContain(foreign);
+    }
+  });
 
   it.each([['admin', admin], ['the owning interviewer', interviewer]] as const)('as %s: every scorecard and every transcript turn, in order', async (_who, user) => {
     const res = await get(`/api/export/${candidate}/csv`, user);
@@ -526,6 +653,13 @@ describe('GET /api/export/:candidateId/csv for a candidate with a long history',
     expect(res.text).not.toContain('scorecard,');
   });
 
+  it('fails the export, rather than sending scorecards with no transcript, when the session read fails', async () => {
+    engine.failWhen = (q) => q.table === 'call_sessions';
+    const res = await get(`/api/export/${candidate}/csv`, admin);
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.text).not.toContain('scorecard,');
+  });
+
   it('fails the export when the scorecard read fails', async () => {
     engine.failWhen = (q) => q.table === 'assessments';
     const res = await get(`/api/export/${candidate}/csv`, admin);
@@ -539,6 +673,7 @@ describe('GET /api/export/:candidateId/csv for a candidate with a long history',
 const DRIVEN_ROUTES = [
   '/api/admin/funnel/failures',
   '/api/admin/funnel/summary',
+  '/api/admin/sessions',
   '/api/candidates',
   '/api/candidates/summary',
   '/api/export/:candidateId/csv',
@@ -567,11 +702,10 @@ const NOT_DRIVEN: Record<string, string> = {
   '/api/admin/audit': CLIENT_PAGED,
   '/api/admin/funnel/candidates': CLIENT_PAGED,
   '/api/admin/members': STAFF_SIZED,
-  '/api/admin/quotas': CLIENT_PAGED,
+  '/api/admin/quotas': STAFF_SIZED,
   '/api/admin/r1/recording-health': COUNTS_ONLY,
   '/api/admin/r1/settings': ONE_RECORD,
   '/api/admin/r1/usage': ONE_RECORD,
-  '/api/admin/sessions': CLIENT_PAGED,
   '/api/appeals': ONE_CANDIDATE,
   '/api/candidate-consent/template': ONE_RECORD,
   '/api/candidates/:id': ONE_CANDIDATE,
@@ -691,5 +825,136 @@ describe('the inventory of GET routes', () => {
       return ![...requested].some((path) => pattern.test(path));
     });
     expect(undriven).toEqual([]);
+  });
+});
+
+// ── The source scan: what the router walk cannot see ──────────────────────────
+
+const UPPER_CASE_CONSTANT = /^[A-Z][A-Z0-9_]*$/;
+
+const unwrapped = (node: ts.Expression): ts.Expression =>
+  ts.isAsExpression(node) || ts.isParenthesizedExpression(node) ? unwrapped(node.expression) : node;
+
+/** `ids.slice(at, at + 100)`, or the same with a named batch size: never past ID_BATCH_SIZE. */
+function isBatchSlice(node: ts.CallExpression, file: ts.SourceFile): boolean {
+  if (!ts.isPropertyAccessExpression(node.expression) || node.expression.name.text !== 'slice') return false;
+  const [start, end] = node.arguments;
+  if (!start || !end || !ts.isBinaryExpression(end) || end.operatorToken.kind !== ts.SyntaxKind.PlusToken) return false;
+  if (end.left.getText(file) !== start.getText(file)) return false;
+  if (ts.isNumericLiteral(end.right)) return Number(end.right.text) <= ID_BATCH_SIZE;
+  return ts.isIdentifier(end.right) && UPPER_CASE_CONSTANT.test(end.right.text);
+}
+
+/** Safe by its shape: a batch from chunkIds, a batch slice, or a list fixed in the code. */
+function isBatchOrFixedList(value: ts.Expression, file: ts.SourceFile): boolean {
+  const node = unwrapped(value);
+  if (ts.isStringLiteralLike(node)) return true;
+  if (ts.isIdentifier(node)) return node.text === 'chunk' || UPPER_CASE_CONSTANT.test(node.text);
+  if (ts.isCallExpression(node)) return isBatchSlice(node, file);
+  if (!ts.isArrayLiteralExpression(node)) return false;
+  return node.elements.every((element) => (ts.isSpreadElement(element)
+    ? isBatchOrFixedList(element.expression, file)
+    : ts.isStringLiteralLike(element)));
+}
+
+/**
+ * The value list of every PostgREST `in` filter in this source that is not safe
+ * by its shape: `.in(column, values)`, `.filter(column, 'in', values)`,
+ * `.not(column, 'in', values)` and `in.(${values})` in a filter string.
+ * Parsed, not grepped, so a comment or a string cannot pass for a read, and a
+ * read cannot hide across lines.
+ */
+function variableListReads(source: string): string[] {
+  const file = ts.createSourceFile('source.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const found: string[] = [];
+  const check = (values: ts.Expression | undefined): void => {
+    if (values && !isBatchOrFixedList(values, file)) found.push(unwrapped(values).getText(file));
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const method = node.expression.name.text;
+      const [, second, third] = node.arguments;
+      if (method === 'in') check(second);
+      else if ((method === 'filter' || method === 'not') && second && ts.isStringLiteralLike(second) && second.text === 'in') check(third);
+    }
+    if (ts.isTemplateExpression(node)) {
+      let before = node.head.text;
+      for (const span of node.templateSpans) {
+        if (/\bin\.\($/.test(before)) check(span.expression);
+        before = span.literal.text;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found.sort();
+}
+
+/**
+ * Every read over a variable list that is not batched, and why that list stays
+ * far under the ~390 ids where undici refuses it. `sites` is how many reads in
+ * the file use that list, so a new read cannot slip in under an old name.
+ *
+ * Add a read here only with a reason that holds at 5,000 candidates. If its list
+ * grows with the workspace, read it through chunkIds (lib/id-batches.ts) instead.
+ */
+const BOUNDED_LISTS: ReadonlyArray<{ file: string; values: string; sites: number; why: string }> = [
+  { file: 'integrations/ashby/runtime-health.ts', values: 'names', sites: 5, why: 'a copy of the constant ASHBY_QUEUE_NAMES' },
+  { file: 'lib/attempt-consent-stage.ts', values: 'ids', sites: 2, why: "one candidate's call legs, and past the limit the read fails closed to unknown" },
+  { file: 'lib/dsar.ts', values: 'sessionIds', sites: 1, why: "one data subject's sessions" },
+  { file: 'lib/phone-runtime/read.ts', values: 'ids', sites: 1, why: 'one due pass, at most PHONE_RUNTIME_MAX_ROWS (200) candidates' },
+  { file: 'lib/r1/recording/summary.ts', values: 'roundIds', sites: 2, why: "one candidate's R1 rounds" },
+  { file: 'lib/recording/sweeper.ts', values: 'sessionIds', sites: 1, why: 'one pass, at most ATTEMPT_LINK_PASS_LIMIT (10) attempts' },
+  { file: 'routes/candidates.ts', values: 'engagementIds', sites: 2, why: "one candidate's engagements: their rescreen cycles" },
+  { file: 'routes/candidates.ts', values: 'ids', sites: 1, why: "one candidate's sessions" },
+  { file: 'routes/candidates.ts', values: 'list', sites: 2, why: "one candidate's sessions, in a filter string" },
+  { file: 'routes/candidates.ts', values: 'sessionIds', sites: 3, why: "one candidate's sessions, or the sessions of one page of their attempts" },
+  { file: 'routes/scorecards.ts', values: 'libIds', sites: 1, why: 'one request body, at most SCORECARD_MAX_METRICS (20)' },
+];
+
+function apiSourceFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) return entry.name === '__tests__' ? [] : apiSourceFiles(path);
+    return entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts') && !entry.name.endsWith('.d.ts') ? [path] : [];
+  });
+}
+
+describe('the scan of the API source for reads over a variable list', { timeout: TEST_TIMEOUT_MS }, () => {
+  it('finds them on any path and across lines, and passes batches and fixed lists', () => {
+    const source = [
+      "await db.from('t').select('id').in('candidate_id', allIds);",
+      "const later = q",
+      "  .in(",
+      "    'id',",
+      "    ownedIds as string[],",
+      "  );",
+      "await db.from('t').select('id').or(`a.in.(${list}),b.eq.1`);",
+      "await db.from('t').select('id').not('x', 'in', excluded);",
+      "await db.from('t').select('id').in('w', ids.slice(0, 5000)).in('v', ids.slice(at, at + 5000)).in('u', [...allIds]);",
+      // None of these is a read over a variable list.
+      "// .in('id', inAComment)",
+      "const text = \".in('id', inAString)\";",
+      "await db.from('t').select('id').in('id', chunk).in('status', ['a', 'b']).in('state', [...LIVE_STATES]);",
+      "await db.from('t').select('id').in('kind', KINDS as never).in('y', ids.slice(at, at + 100)).in('z', ids.slice(at, at + BATCH));",
+      "await db.from('t').select('id').not('x', 'in', '(a,b)').or(`a.eq.${value}`);",
+    ].join('\n');
+    expect(variableListReads(source)).toEqual([
+      '[...allIds]', 'allIds', 'excluded', 'ids.slice(0, 5000)', 'ids.slice(at, at + 5000)', 'list', 'ownedIds',
+    ]);
+  });
+
+  it('every one is a batch, a fixed list, or named in BOUNDED_LISTS, and nothing there has gone stale', () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const sites: Record<string, number> = {};
+    for (const path of apiSourceFiles(root)) {
+      const name = relative(root, path).split(sep).join('/');
+      for (const values of variableListReads(readFileSync(path, 'utf8'))) {
+        const key = `${name}: ${values}`;
+        sites[key] = (sites[key] ?? 0) + 1;
+      }
+    }
+    const named = Object.fromEntries(BOUNDED_LISTS.map((b) => [`${b.file}: ${b.values}`, b.sites]));
+    expect(sites, 'a new read over a variable list: read it through chunkIds (lib/id-batches.ts), or add it to BOUNDED_LISTS with the reason it stays small').toEqual(named);
   });
 });

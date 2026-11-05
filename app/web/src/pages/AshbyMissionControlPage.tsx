@@ -356,6 +356,11 @@ export function AshbyMissionControlPage() {
   const [workflows, setWorkflows] = useState<AshbyMcWorkflow[]>([]);
   /** The API left older rows out of the list. See `newestOnly`. */
   const [mappingsTruncated, setMappingsTruncated] = useState(false);
+  /**
+   * On a cut list, the job of EVERY live mapping, including those past the cut.
+   * Held for the picker, like the other job ids on this page, and never rendered.
+   */
+  const [mappedJobIds, setMappedJobIds] = useState<readonly string[]>([]);
   const [workflowsTruncated, setWorkflowsTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -437,6 +442,7 @@ export function AshbyMissionControlPage() {
       const [m, w] = await Promise.all([api.listAshbyMappings(), api.listAshbyWorkflows()]);
       setMappings(m.mappings);
       setMappingsTruncated(m.truncated === true);
+      setMappedJobIds(m.mappedJobIds ?? []);
       setWorkflows(w.workflows);
       setWorkflowsTruncated(w.truncated === true);
       setError(null);
@@ -560,17 +566,18 @@ export function AshbyMissionControlPage() {
    * The picker: OPEN jobs only, in the API's title order, each named by the
    * shared rule. A job that is already mapped stays LISTED but disabled —
    * dropping it would read as "Ashby has no such job" to an admin looking
-   * for it.
+   * for it. A cut mapping list comes with `mappedJobIds`, so a job mapped past
+   * the cut is not offered as free, to be refused on save.
    */
   const jobOptions = useMemo(() => {
     const open = (jobs ?? []).filter((job) => job.status === 'Open');
-    const mapped = new Set(mappings.map((m) => m.externalJobId));
+    const mapped = new Set([...mappings.map((m) => m.externalJobId), ...mappedJobIds]);
     return open.map((job) => ({
       job,
       label: jobNames?.get(job.id)?.name ?? 'Untitled job',
       mapped: mapped.has(job.id),
     }));
-  }, [jobs, jobNames, mappings]);
+  }, [jobs, jobNames, mappings, mappedJobIds]);
 
   /**
    * The picker's rows. `value` is the POSITION (see `draft`) — the combobox
@@ -1148,6 +1155,14 @@ export function AshbyMissionControlPage() {
         // A finished screening's row offers its review first; reissuing an
         // invite after a completed call is the rare case, so it waits in More.
         const reviewable = Boolean(w.sessionId) && w.sessionStatus === 'completed';
+        // A status that did not come back may be `completed`. Reissuing revokes
+        // the session's live invites and issues a new link, and the database
+        // does not ask whether the screening finished, so no invite is offered
+        // on a guess. The session page can read the status, so the row links
+        // there. A parked row has finished its screening, so it keeps its words.
+        const statusUnknown = sessionStatusUnreadable(w);
+        const opensSession = reviewable || statusUnknown;
+        const sessionLinkLabel = reviewable || w.lifecycle === 'writeback_pending' ? 'Review screening' : 'Open session';
         const inviteLabel = w.operations.some(
           (op) => op.type === 'invite_delivery' && op.state === 'succeeded',
         )
@@ -1184,7 +1199,7 @@ export function AshbyMissionControlPage() {
                 onSelect: (trigger) => openCancelDialog(w, trigger),
               },
             ];
-        const hasActions = reviewable || !terminal;
+        const hasActions = opensSession || !terminal;
         return (
           <li
             key={w.applicationLinkId}
@@ -1238,9 +1253,9 @@ export function AshbyMissionControlPage() {
                 )}
                 {/* The API's fail-closed answers. Without these, a read that
                     failed looks exactly like a row with nothing wrong. */}
-                {sessionStatusUnreadable(w) && (
+                {statusUnknown && (
                   <StatusBadge tone="neutral">
-                    <span title="The screening session's status could not be read just now, so this row cannot say whether its scorecard is queued for Ashby. Reload the page to check again.">
+                    <span title="The screening session's status could not be read just now, so this row cannot say whether the screening finished, and offers no invite. Reload the page to check again.">
                       Session status unknown
                     </span>
                   </StatusBadge>
@@ -1310,12 +1325,12 @@ export function AshbyMissionControlPage() {
               // line, and on a 360px phone that line is wider than the
               // screen. Same rule on the mapping rows.
               <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end" data-testid="row-actions">
-                {reviewable ? (
+                {opensSession ? (
                   <Link
                     to={`/sessions/${encodeURIComponent(w.sessionId ?? '')}`}
                     className={buttonClass('secondary', 'md', TOUCH)}
                   >
-                    Review screening
+                    {sessionLinkLabel}
                   </Link>
                 ) : (
                   legacyInvitesEnabled && (
@@ -2330,11 +2345,13 @@ function notQueuedForWriteback(w: AshbyMcWorkflow): boolean {
 
 /**
  * The row names a session whose status did not come back (the API read them in
- * batches, and a failed batch leaves its rows null), on a workflow where that
- * status decides `notQueuedForWriteback`: the warning may be hiding here.
+ * batches, and a failed batch leaves its rows null). That status decides the
+ * row's review link and invite action on every row, and `notQueuedForWriteback`
+ * on an open one, so this holds whatever the row's lifecycle. A deleted session
+ * cannot land here: its link's `session_id` goes null with it (0029).
  */
 function sessionStatusUnreadable(w: AshbyMcWorkflow): boolean {
-  return Boolean(w.sessionId) && w.sessionStatus == null && w.terminalState == null && w.lifecycle !== 'writeback_pending';
+  return Boolean(w.sessionId) && w.sessionStatus == null;
 }
 
 /**

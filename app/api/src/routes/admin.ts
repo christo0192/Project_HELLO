@@ -91,6 +91,11 @@ adminRouter.get('/audit', validateQuery(adminAuditListQuerySchema), async (req, 
  * id, opaque candidate_id/role_id, status, created_at, started_at, ended_at.
  * No candidate name/email/phone/resume/transcript/recording/object key/
  * model/provider/raw error.
+ *
+ * One page, most recently updated first. It reads one row past the page and
+ * answers `truncated`: a page that stops at its limit reads as the whole list,
+ * and at 5,000 sessions "100" must not pass for the total. `id` breaks a tie on
+ * `updated_at`, so consecutive offsets neither skip nor repeat a row.
  */
 adminRouter.get('/sessions', validateQuery(adminSessionListQuerySchema), async (req, res, next) => {
   try {
@@ -99,14 +104,16 @@ adminRouter.get('/sessions', validateQuery(adminSessionListQuerySchema), async (
     let q = supabase
       .from('call_sessions')
       .select('id, candidate_id, role_id, status, updated_at, started_at, ended_at')
-      .order('updated_at', { ascending: false });
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: true });
     if (req.query.status) {
       q = q.eq('status', req.query.status as string);
     }
-    const { data, error } = await q.range(offset, offset + limit - 1);
+    const { data, error } = await q.range(offset, offset + limit);
     if (error) return next(new Error('failed to list sessions'));
 
-    const sessions = (data ?? []).map((r) => {
+    const rows = data ?? [];
+    const sessions = rows.slice(0, limit).map((r) => {
       const row = r as typeof r & { created_at?: string | null };
       return {
         id: row.id,
@@ -118,7 +125,7 @@ adminRouter.get('/sessions', validateQuery(adminSessionListQuerySchema), async (
         ended_at: row.ended_at,
       };
     });
-    res.json({ sessions });
+    res.json({ sessions, truncated: rows.length > limit });
   } catch (error) {
     next(error);
   }

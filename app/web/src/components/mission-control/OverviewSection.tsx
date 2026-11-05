@@ -28,7 +28,7 @@ import { api, ApiError } from '../../api';
 import type {
   AdminAllowlistEntry,
   AdminAuditRow,
-  AdminSessionRow,
+  AdminSessionListResponse,
   PublicStatus,
   QuotaPolicy,
 } from '../../types';
@@ -50,9 +50,6 @@ import {
   maintenanceMeta,
 } from './statusMeta';
 
-/** GET /api/admin/sessions answers one page of at most this many, and no total. */
-const ADMIN_SESSIONS_PAGE = 100;
-
 interface SourceState<T> {
   data: T | null;
   error: string | null;
@@ -64,7 +61,7 @@ function initialState<T>(): SourceState<T> {
 
 export function OverviewSection() {
   const [status, setStatus] = useState<SourceState<PublicStatus>>(initialState);
-  const [sessions, setSessions] = useState<SourceState<AdminSessionRow[]>>(
+  const [sessions, setSessions] = useState<SourceState<AdminSessionListResponse>>(
     initialState,
   );
   const [allowlist, setAllowlist] = useState<SourceState<AdminAllowlistEntry[]>>(
@@ -96,7 +93,7 @@ export function OverviewSection() {
       .then(settle(setStatus).ok, settle(setStatus).fail);
     api
       .listAdminSessions()
-      .then((r) => settle(setSessions).ok(r.sessions), settle(setSessions).fail);
+      .then(settle(setSessions).ok, settle(setSessions).fail);
     api
       .listAdminAllowlist()
       .then(
@@ -118,7 +115,7 @@ export function OverviewSection() {
   useEffect(load, [load]);
 
   const statusData = status.data;
-  const sessionsData = sessions.data ?? [];
+  const sessionsData = sessions.data?.sessions ?? [];
   const allowlistData = allowlist.data ?? [];
   const quotasData = quotas.data ?? [];
   const auditData = audit.data ?? [];
@@ -126,9 +123,10 @@ export function OverviewSection() {
   const activeNow = sessionsData.filter((s) =>
     ['created', 'waiting', 'in_progress'].includes(s.status),
   ).length;
-  // A full page may be all there is, or only the front of a longer list: the
-  // figures below then cover that page and say so, like the audit figure.
-  const sessionsPageFull = sessionsData.length >= ADMIN_SESSIONS_PAGE;
+  // The API left sessions out of its one page: the figures below then cover that
+  // page and say so, like the audit figure.
+  const sessionsCut = sessions.data?.truncated === true;
+  const newestSessions = `${sessionsData.length} most recently updated`;
   const linkedAccess = allowlistData.filter(
     (e) => e.active && e.linked_user_id != null,
   ).length;
@@ -198,12 +196,12 @@ export function OverviewSection() {
             figure(sessions, {
               label: 'Sessions',
               value: sessionsData.length,
-              context: sessionsPageFull ? `The ${ADMIN_SESSIONS_PAGE} most recently updated` : 'In the admin session view',
+              context: sessionsCut ? `The ${newestSessions}` : 'In the admin session view',
             }),
             figure(sessions, {
               label: 'Active sessions',
               value: activeNow,
-              context: sessionsPageFull ? `Within the ${ADMIN_SESSIONS_PAGE} most recently updated` : 'Created, waiting or in progress',
+              context: sessionsCut ? `Within the ${newestSessions}` : 'Created, waiting or in progress',
             }),
             figure(allowlist, {
               label: 'Linked access',
@@ -231,8 +229,8 @@ export function OverviewSection() {
         <ChartCard
           title="Session status mix"
           description={
-            sessionsPageFull
-              ? `The ${ADMIN_SESSIONS_PAGE} most recently updated sessions, largest first.`
+            sessionsCut
+              ? `The ${newestSessions} sessions, largest first.`
               : `${sessionsData.length} sessions in the admin view, largest first.`
           }
         >
@@ -254,8 +252,8 @@ export function OverviewSection() {
         <ChartCard
           title="Session activity"
           description={
-            sessionsPageFull
-              ? `Sessions created per day, last 14 days, within the ${ADMIN_SESSIONS_PAGE} most recently updated.`
+            sessionsCut
+              ? `Sessions created per day, last 14 days, within the ${newestSessions}.`
               : 'Sessions created per day, last 14 days.'
           }
         >
