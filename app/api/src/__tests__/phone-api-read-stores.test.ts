@@ -12,6 +12,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  PHONE_READ_ID_BATCH,
   PHONE_READ_MAX_ROWS,
   boundedRowLimit,
   createPhoneReadStore,
@@ -253,8 +254,26 @@ describe('batched id reads are one round trip, never N+1', () => {
     const { client, queries } = fakeClient([{ data: [] }]);
     const ids = Array.from({ length: PHONE_READ_MAX_ROWS + 200 }, (_, i) => `e${i}`);
     await createPhoneReadStore(client as never).listEngagementsByIds(ids);
-    expect((queries[0].filters.find((f) => f.op === 'in')!.args[1] as string[]))
-      .toHaveLength(PHONE_READ_MAX_ROWS);
+    const sent = queries.map((q) => q.filters.find((f) => f.op === 'in')!.args[1] as string[]);
+    expect(sent.flat()).toEqual(ids.slice(0, PHONE_READ_MAX_ROWS));
+  });
+
+  it('sends a long id list in reads of at most PHONE_READ_ID_BATCH ids (M026)', async () => {
+    // One `.in()` over ~390 uuids fails in Node's fetch (UND_ERR_HEADERS_OVERFLOW).
+    const { client, queries } = fakeClient([]);
+    const store = createPhoneReadStore(client as never);
+    const ids = Array.from({ length: PHONE_READ_ID_BATCH * 2 + 1 }, (_, i) => `c${i}`);
+    await store.listCandidatesByIds(ids);
+    await store.listEngagementsByIds(ids);
+    const sizes = queries.map((q) => (q.filters.find((f) => f.op === 'in')!.args[1] as string[]).length);
+    expect(sizes).toEqual([PHONE_READ_ID_BATCH, PHONE_READ_ID_BATCH, 1, PHONE_READ_ID_BATCH, PHONE_READ_ID_BATCH, 1]);
+    expect(queries.map((q) => q.filters.find((f) => f.op === 'limit')!.args[0])).toEqual(sizes);
+  });
+
+  it('fails the whole read, never a partial list, when one batch fails', async () => {
+    const { client } = fakeClient([{ data: [] }, { data: null, error: { message: 'boom' } }]);
+    const ids = Array.from({ length: PHONE_READ_ID_BATCH + 1 }, (_, i) => `e${i}`);
+    await expect(createPhoneReadStore(client as never).listEngagementsByIds(ids)).rejects.toThrow('phone_engagement_read_error');
   });
 });
 

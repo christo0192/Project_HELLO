@@ -20,8 +20,9 @@
  *
  * ── EVERY READ IS BOUNDED ─────────────────────────────────────────────
  * Each query carries an explicit `.limit()` and either a half-open range or an
- * `.in()` over a caller-bounded id list. An empty id list performs NO query at
- * all rather than issuing `in.()`, which PostgREST would answer with every row.
+ * `.in()` over a caller-bounded id list, sent in batches of
+ * PHONE_READ_ID_BATCH ids. An empty id list performs NO query at all rather
+ * than issuing `in.()`, which PostgREST would answer with every row.
  *
  * ── ERRORS ARE SANITIZED, ALWAYS ──────────────────────────────────────
  * A PostgREST error carries the failing statement and sometimes row values.
@@ -322,9 +323,24 @@ function mapCandidate(row: Row): PhoneCandidateRow {
 }
 
 /**
+ * At most this many ids in one `.in()` read. M026: the response echoes the GET
+ * URL in a header, and past about 390 uuids Node's fetch rejects it
+ * (UND_ERR_HEADERS_OVERFLOW). The same size as lib/id-batches.ts's
+ * ID_BATCH_SIZE, restated because this module imports nothing outside itself.
+ */
+export const PHONE_READ_ID_BATCH = 100;
+
+/** Split into chunks of at most PHONE_READ_ID_BATCH (the last may be shorter). */
+function idBatches(ids: readonly string[]): string[][] {
+  const out: string[][] = [];
+  for (let i = 0; i < ids.length; i += PHONE_READ_ID_BATCH) out.push(ids.slice(i, i + PHONE_READ_ID_BATCH));
+  return out;
+}
+
+/**
  * Unique, non-empty ids in input order. Bounded by the same ceiling every read
- * uses, so a caller that somehow assembled a huge list still issues one bounded
- * query rather than a URL PostgREST would refuse.
+ * uses, so a caller that somehow assembled a huge list still issues a bounded
+ * number of bounded queries rather than a URL PostgREST would refuse.
  */
 function uniqueIds(ids: readonly string[]): string[] {
   const out: string[] = [];
@@ -406,13 +422,18 @@ export function createPhoneReadStore(client: SupabaseClient): PhoneReadStore {
       // An empty `.in()` is a query PostgREST answers with EVERY row. Not
       // issuing it is the control; clamping the result afterwards would not be.
       if (wanted.length === 0) return [];
-      const { data, error } = await client
-        .from('phone_engagements')
-        .select(ENGAGEMENT_COLUMNS)
-        .in('id', wanted)
-        .limit(wanted.length);
-      if (error) throw new Error('phone_engagement_read_error');
-      return rows(data).map(mapEngagement);
+      // A calendar page names up to 200 engagements: one read per batch, and
+      // any failed batch fails the whole read (never a partial list).
+      const batches = await Promise.all(idBatches(wanted).map(async (chunk) => {
+        const { data, error } = await client
+          .from('phone_engagements')
+          .select(ENGAGEMENT_COLUMNS)
+          .in('id', chunk)
+          .limit(chunk.length);
+        if (error) throw new Error('phone_engagement_read_error');
+        return rows(data).map(mapEngagement);
+      }));
+      return batches.flat();
     },
 
     async getEngagement(id: string): Promise<PhoneEngagementRow | null> {
@@ -429,13 +450,17 @@ export function createPhoneReadStore(client: SupabaseClient): PhoneReadStore {
     async listCandidatesByIds(ids): Promise<readonly PhoneCandidateRow[]> {
       const wanted = uniqueIds(ids);
       if (wanted.length === 0) return [];
-      const { data, error } = await client
-        .from('candidates')
-        .select(CANDIDATE_COLUMNS)
-        .in('id', wanted)
-        .limit(wanted.length);
-      if (error) throw new Error('phone_candidate_read_error');
-      return rows(data).map(mapCandidate);
+      // In batches, like listEngagementsByIds; any failed batch fails the read.
+      const batches = await Promise.all(idBatches(wanted).map(async (chunk) => {
+        const { data, error } = await client
+          .from('candidates')
+          .select(CANDIDATE_COLUMNS)
+          .in('id', chunk)
+          .limit(chunk.length);
+        if (error) throw new Error('phone_candidate_read_error');
+        return rows(data).map(mapCandidate);
+      }));
+      return batches.flat();
     },
 
     async listAttemptsForEngagement(input): Promise<readonly PhoneAttemptRow[]> {

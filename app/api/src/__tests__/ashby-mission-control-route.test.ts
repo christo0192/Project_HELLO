@@ -24,6 +24,7 @@ function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore
     listMappings: async () => [
       { id: UUID, externalJobId: 'job_1', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'both', hasAiStage: true, hasTaStage: false, label: null, roleId: ROLE_UUID, updatedAt: '2026-08-13T00:00:00Z' },
     ],
+    listMappedJobIds: async () => ['job_1'],
     listWorkflows: async () => [
       { applicationLinkId: UUID, externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op_1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], sessionStatus: 'in_progress', updatedAt: '2026-08-13T00:00:00Z' },
     ],
@@ -98,6 +99,68 @@ describe('reads — interviewer+ only', () => {
     expect(w.status).toBe(200);
     expect(w.body.workflows[0]).toMatchObject({ intakeType: 'phone_parsing', profileOutcome: 'number_placeholder' });
     expect(JSON.stringify(w.body)).not.toMatch(/token|email|bearer|\+91/i);
+  });
+
+  describe('a list longer than its page says so', () => {
+    const base = fakeStore();
+    /** A store holding `held` rows of each list, answering at most `limit` as the real one does. */
+    const holding = (held: number) => {
+      const listMappings = vi.fn(async (limit: number) => {
+        const [row] = await base.listMappings(1);
+        return Array.from({ length: Math.min(held, limit) }, (_, i) => ({ ...row, id: `m${i}` }));
+      });
+      const listWorkflows = vi.fn(async (limit: number) => {
+        const [row] = await base.listWorkflows(1);
+        return Array.from({ length: Math.min(held, limit) }, (_, i) => ({ ...row, applicationLinkId: `l${i}` }));
+      });
+      return { listMappings, listWorkflows };
+    };
+
+    it.each(['mappings', 'workflows'] as const)('%s: cut at the default page, with truncated: true', async (list) => {
+      const store = holding(51);
+      const res = await request(appWith('interviewer', fakeStore(store))).get(`/mc/${list}`);
+      expect(res.status).toBe(200);
+      expect(res.body[list]).toHaveLength(50);
+      expect(res.body.truncated).toBe(true);
+    });
+
+    it.each(['mappings', 'workflows'] as const)('%s: exactly a full page is the whole list, with truncated: false', async (list) => {
+      const store = holding(50);
+      const res = await request(appWith('interviewer', fakeStore(store))).get(`/mc/${list}`);
+      expect(res.body[list]).toHaveLength(50);
+      expect(res.body.truncated).toBe(false);
+    });
+
+    it.each(['mappings', 'workflows'] as const)('%s: the largest page is still capped, and still says so', async (list) => {
+      const store = holding(5000);
+      const res = await request(appWith('interviewer', fakeStore(store))).get(`/mc/${list}?limit=99999`);
+      expect(res.body[list]).toHaveLength(200);
+      expect(res.body.truncated).toBe(true);
+      // One row past the page, and no more: the store does the work for 201 rows.
+      expect(store[list === 'mappings' ? 'listMappings' : 'listWorkflows']).toHaveBeenCalledWith(201);
+    });
+
+    it('a cut mapping list names the job of every live mapping, so a mapped job past the cut cannot read as free', async () => {
+      const listMappedJobIds = vi.fn(async () => ['job_1', 'job_past_the_cut']);
+      const res = await request(appWith('interviewer', fakeStore({ ...holding(51), listMappedJobIds }))).get('/mc/mappings');
+      expect(res.status).toBe(200);
+      expect(res.body.mappedJobIds).toEqual(['job_1', 'job_past_the_cut']);
+    });
+
+    it('a whole mapping list needs no such read, and sends no such field', async () => {
+      const listMappedJobIds = vi.fn(async () => ['job_1']);
+      const res = await request(appWith('interviewer', fakeStore({ ...holding(50), listMappedJobIds }))).get('/mc/mappings');
+      expect(res.status).toBe(200);
+      expect(res.body).not.toHaveProperty('mappedJobIds');
+      expect(listMappedJobIds).not.toHaveBeenCalled();
+    });
+
+    it('fails the cut list, never a list that cannot tell a mapped job from a free one', async () => {
+      const listMappedJobIds = vi.fn(async () => { throw new Error('boom'); });
+      const res = await request(appWith('interviewer', fakeStore({ ...holding(51), listMappedJobIds }))).get('/mc/mappings');
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ ok: false, error: 'mission_control_read_error' });
+    });
   });
 
   it('fails closed for a viewer and for an unauthenticated caller', async () => {

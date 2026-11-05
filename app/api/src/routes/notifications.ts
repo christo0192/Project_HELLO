@@ -15,12 +15,75 @@
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireInterviewer } from '../lib/rbac.js';
+import { chunkIds, mapChunks, readAllPages } from '../lib/id-batches.js';
 import type {
   NotificationIntentListResponse,
   NotificationIntentResponse,
 } from '../schemas/notifications.js';
 
 export const notificationsRouter = Router();
+
+/** The list is the newest this many intents. */
+const INTENT_LIMIT = 100;
+
+/**
+ * Hard ceiling on pages of the interviewer's own candidates: 50 pages of
+ * POSTGREST_MAX_ROWS is 50,000. Past it the request fails rather than
+ * silently leaving out the candidates it could not read.
+ */
+const OWNED_MAX_PAGES = 50;
+
+const INTENT_COLUMNS = 'id, kind, candidate_id, consent_verified, created_at';
+
+interface IntentRow {
+  id: string;
+  kind: NotificationIntentResponse['kind'];
+  candidate_id: string | null;
+  consent_verified: boolean | null;
+  created_at: string;
+}
+
+/** Newest first; `id` breaks a tie on `created_at` so the order is total. */
+function newestFirst(a: IntentRow, b: IntentRow): number {
+  if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * The newest INTENT_LIMIT intents for these candidates, or null when any read
+ * failed.
+ *
+ * M026: one `.in('candidate_id', ids)` over every candidate the interviewer
+ * owns failed past about 390 ids (lib/id-batches.ts says why). So the ids are
+ * read in batches of ID_BATCH_SIZE, each batch answers its own newest
+ * INTENT_LIMIT (the overall newest INTENT_LIMIT are always among them), and
+ * the batches are merged, sorted newest first and cut to INTENT_LIMIT. The
+ * first failed batch stops new ones and fails the request: a partial list
+ * would read as "no notifications" for the candidates it left out.
+ */
+async function newestIntentsFor(candidateIds: readonly string[]): Promise<IntentRow[] | null> {
+  const batches = await mapChunks(
+    chunkIds(candidateIds),
+    async (chunk): Promise<IntentRow[] | null> => {
+      try {
+        const { data, error } = await supabase
+          .from('notification_intents')
+          .select(INTENT_COLUMNS)
+          .in('candidate_id', chunk)
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: true })
+          .limit(INTENT_LIMIT);
+        if (error) return null;
+        return (Array.isArray(data) ? data : []) as IntentRow[];
+      } catch {
+        return null;
+      }
+    },
+    { stopWhen: (rows) => rows === null },
+  );
+  if (batches.some((rows) => !rows)) return null;
+  return (batches as IntentRow[][]).flat().sort(newestFirst).slice(0, INTENT_LIMIT);
+}
 
 /**
  * GET /api/notifications
@@ -31,30 +94,39 @@ export const notificationsRouter = Router();
 notificationsRouter.get('/', requireInterviewer, async (req, res, next) => {
   try {
     const user = req.authUser!;
-    let q = supabase
-      .from('notification_intents')
-      .select('id, kind, candidate_id, consent_verified, created_at')
-      .order('created_at', { ascending: false })
-      .limit(100);
+    let data: IntentRow[];
 
     if (user.appRole === 'interviewer') {
-      const { data: owned, error: ownedErr } = await supabase
+      // Every candidate the interviewer owns, paged past PostgREST's row cap
+      // (which would otherwise drop owners' candidates past the first 1000
+      // without an error). `id` gives the pages a total order.
+      const owned = await readAllPages<{ id: string }>((from, to) => supabase
         .from('candidates')
         .select('id')
-        .eq('owner_id', user.id);
-      if (ownedErr) return next(new Error('failed to load candidate scope'));
-      const ids = (owned ?? []).map((r) => r.id as string);
+        .eq('owner_id', user.id)
+        .order('id', { ascending: true })
+        .range(from, to), OWNED_MAX_PAGES);
+      if (!owned.ok) return next(new Error('failed to load candidate scope'));
+      const ids = [...new Set(owned.rows.map((r) => r.id))];
       if (ids.length === 0) {
         const empty: NotificationIntentListResponse = { intents: [] };
         return res.json(empty);
       }
-      q = q.in('candidate_id', ids);
+      const newest = await newestIntentsFor(ids);
+      if (!newest) return next(new Error('failed to list notification intents'));
+      data = newest;
+    } else {
+      const { data: rows, error } = await supabase
+        .from('notification_intents')
+        .select(INTENT_COLUMNS)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: true })
+        .limit(INTENT_LIMIT);
+      if (error) return next(new Error('failed to list notification intents'));
+      data = (rows ?? []) as IntentRow[];
     }
 
-    const { data, error } = await q;
-    if (error) return next(new Error('failed to list notification intents'));
-
-    const intents: NotificationIntentResponse[] = (data ?? []).map((i) => ({
+    const intents: NotificationIntentResponse[] = data.map((i) => ({
       id: i.id,
       kind: i.kind,
       candidate_id: i.candidate_id,

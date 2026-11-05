@@ -14,6 +14,7 @@
  */
 
 import { createLogger } from '../logger.js';
+import { chunkIds, readAllPages } from '../id-batches.js';
 
 // The event-name union is closed and unknown names rewrite to 'unknown_event',
 // so the distinguishing detail travels in `error_category` — the same shape
@@ -50,6 +51,20 @@ export const FUNNEL_COUNT_FIELDS = [
 
 /** Defence in depth: a hand-crafted from/to cannot pull the whole history. */
 export const FUNNEL_MAX_SPAN_DAYS = 400;
+
+/**
+ * Hard ceiling on rollup pages for one summary: 50 pages of POSTGREST_MAX_ROWS
+ * is 50,000 (day, role) rows, 125 roles over the longest window. Past it the
+ * summary is an error rather than totals over part of the window.
+ */
+const FUNNEL_MAX_PAGES = 50;
+
+/**
+ * Hard ceiling on mapping pages for the HR probe: 10 pages of
+ * POSTGREST_MAX_ROWS is 10,000 Ashby jobs. Past it the probe answers `false`
+ * with a warn line, like any other probe it could not finish.
+ */
+const HR_PROBE_MAX_PAGES = 10;
 
 /** YYYY-MM-DD `days` before today (UTC). */
 export function funnelDayOffset(days: number): string {
@@ -175,17 +190,33 @@ export async function loadFunnelSummary(
   const minFrom = funnelDayBefore(to, FUNNEL_MAX_SPAN_DAYS);
   const from = requestedFrom < minFrom ? minFrom : requestedFrom;
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // The rollup holds one row per (day, role), so a long window over many
+  // roles passes PostgREST's 1000-row cap, which truncates WITHOUT an error
+  // (M026): the totals would quietly drop the latest days. Paged until a short
+  // page; past FUNNEL_MAX_PAGES the read is an error, never a partial sum.
+  //
+  // In (cohort_day, role_id) order, which uq_funnel_stage_daily_grain makes a
+  // total order (nulls not distinct) and can serve. NOT by `id`: every refresh
+  // deletes and reinserts the trailing window, so its ids are new each pass, and
+  // a refresh committing between two page reads would reorder the day on the
+  // page boundary, counting some rows twice and others not at all. The grain key
+  // survives a refresh, so a row keeps its place. What can still move a row is a
+  // refresh adding a (day, role) BEFORE the boundary, and new keys land on the
+  // newest days, at the end of this order; the next load corrects it.
   const run = async (columns: string): Promise<{ data: unknown; error: unknown }> => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let q: any = supabase
-      .from('funnel_stage_daily')
-      .select(columns)
-      .gte('cohort_day', from)
-      .lte('cohort_day', to)
-      .order('cohort_day', { ascending: true });
-    if (input.roleId) q = q.eq('role_id', input.roleId);
-    return q;
+    const read = await readAllPages<Record<string, unknown>>((first, last) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let q: any = supabase
+        .from('funnel_stage_daily')
+        .select(columns)
+        .gte('cohort_day', from)
+        .lte('cohort_day', to)
+        .order('cohort_day', { ascending: true })
+        .order('role_id', { ascending: true });
+      if (input.roleId) q = q.eq('role_id', input.roleId);
+      return q.range(first, last);
+    }, FUNNEL_MAX_PAGES);
+    return read.ok ? { data: read.rows, error: null } : { data: null, error: read.error };
   };
 
   // ── The two facts the UI must not infer, started BEFORE the main read ──
@@ -225,48 +256,55 @@ export async function loadFunnelSummary(
       // conservative `false`, and the HR band is "not configured" forever with
       // nothing but a warn line to show for it. Two queries built from filters
       // this codebase already proves in production is the cheaper bet.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let mq: any = supabase
-        .from('ashby_job_mappings')
-        .select('id')
-        .not('ai_screening_stage_id', 'is', null)
-        .not('reference_check_stage_id', 'is', null)
-        // Bounded. Only a false NEGATIVE is possible past this limit, and only
-        // if every synced link in the org lives on a fully-wired mapping beyond
-        // the first 200 — at which point the band under-reports rather than
-        // over-claims, which is the direction this code always errs in.
-        .limit(200);
-      // Scoped to the filtered role: several mappings legitimately share one
-      // role, so one wired job must not arm the band for candidates who all
-      // arrived through an unwired one.
-      if (input.roleId) mq = mq.eq('role_id', input.roleId);
-      const { data: mapRows, error: mapErr } = await mq;
-      if (mapErr) {
+      //
+      // EVERY wired mapping, paged in id order. A link synced on any of them
+      // makes the answer true, so a partial list of mappings would say "Not
+      // tracked yet" over a dashboard whose HR tracking is on.
+      const mapRead = await readAllPages<{ id?: string }>((first, last) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let mq: any = supabase
+          .from('ashby_job_mappings')
+          .select('id')
+          .not('ai_screening_stage_id', 'is', null)
+          .not('reference_check_stage_id', 'is', null)
+          .order('id', { ascending: true });
+        // Scoped to the filtered role: several mappings legitimately share one
+        // role, so one wired job must not arm the band for candidates who all
+        // arrived through an unwired one.
+        if (input.roleId) mq = mq.eq('role_id', input.roleId);
+        return mq.range(first, last);
+      }, HR_PROBE_MAX_PAGES);
+      if (!mapRead.ok) {
         // Distinguishable from "nothing observed": a broken probe must be
         // visible, not silently indistinguishable from an unconfigured tenant.
         logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
         return false;
       }
-      const mappingIds = (Array.isArray(mapRows) ? mapRows : [])
-        .map((m) => (m as { id?: string }).id)
+      const mappingIds = mapRead.rows
+        .map((m) => m.id)
         .filter((id): id is string => typeof id === 'string');
       // No mapping names both stages ⇒ no HR decision is expressible at all.
       // Skip the second round-trip rather than send `in.()`, which PostgREST
       // rejects as malformed rather than treating as an empty set.
       if (mappingIds.length === 0) return false;
 
-      const { data: linkRows, error: linkErr } = await supabase
-        .from('ashby_application_links')
-        .select('id')
-        .in('job_mapping_id', mappingIds)
-        .not('stage_synced_at', 'is', null)
-        .not('external_stage_id', 'is', null)
-        .limit(1);
-      if (linkErr) {
-        logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
-        return false;
+      // In batches of ID_BATCH_SIZE mapping ids (lib/id-batches.ts says why),
+      // stopping at the first batch that finds a synced link.
+      for (const chunk of chunkIds(mappingIds)) {
+        const { data: linkRows, error: linkErr } = await supabase
+          .from('ashby_application_links')
+          .select('id')
+          .in('job_mapping_id', chunk)
+          .not('stage_synced_at', 'is', null)
+          .not('external_stage_id', 'is', null)
+          .limit(1);
+        if (linkErr) {
+          logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
+          return false;
+        }
+        if (Array.isArray(linkRows) && linkRows.length > 0) return true;
       }
-      return Array.isArray(linkRows) && linkRows.length > 0;
+      return false;
     } catch {
       // A THROW here is a programming error (wrong column, client API change),
       // not a configuration state. Without this log it disappears into a

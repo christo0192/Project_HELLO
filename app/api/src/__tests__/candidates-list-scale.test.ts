@@ -18,16 +18,24 @@
  * PostgREST also caps any response at 1000 rows (`max_rows`), silently, so a
  * read of every candidate must page past it.
  *
- * The mock below is a small query engine with both real limits built in: an
- * `.in()` over more than OVERFLOW_AT values fails exactly as undici does, and
- * no response carries more than ROW_CAP rows. Every query is recorded, and a
- * test can fail chosen queries, act between page reads, or shuffle rows that
- * the requested order leaves tied.
+ * The supabase mock is the shared query engine in support/scale-db.ts, with
+ * both real limits built in: an `.in()` over more than the measured
+ * production limit fails exactly as undici does, and no response carries more
+ * than 1000 rows. Every query is recorded, and a test can fail chosen queries,
+ * act between page reads, or shuffle rows that the requested order leaves
+ * tied. scale-guard.test.ts drives the other workspace-wide reads through the
+ * same engine at the stricter batch size.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../app.js';
 import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
+import { scaleDb as engine, PRODUCTION_OVERFLOW_AT, type Row } from './support/scale-db.js';
+
+vi.mock('../lib/supabase.js', async () => {
+  const { scaleDb } = await import('./support/scale-db.js');
+  return { supabase: scaleDb.client, RESUME_BUCKET: 'resumes_v2' };
+});
 
 const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTAwMSIsImFhbCI6ImFhbDIifQ.signature';
 const AUTH = 'Bearer ' + JWT;
@@ -45,104 +53,9 @@ const interviewer: AuthUser = { ...admin, id: 'user-int-0000-0000-000000000002',
 const ROLE_A = '10000000-0000-4000-8000-00000000000a';
 const ROLE_B = '10000000-0000-4000-8000-00000000000b';
 
-/** Measured in production: 353 ids passed, 400 failed. */
-const OVERFLOW_AT = 390;
-/** PostgREST `max_rows` (app/supabase/config.toml). */
-const ROW_CAP = 1000;
-
-type Row = Record<string, unknown>;
-interface Query { table: string; eqs: Array<[string, unknown]>; inValues: unknown[] | null; range: [number, number] | null }
-
-const db: Record<string, Row[]> = {};
-const queries: Query[] = [];
-let failWhen: ((q: Query) => boolean) | null = null;
-let throwWhen: ((q: Query) => boolean) | null = null;
-let beforeExecute: ((q: Query) => void) | null = null;
-let scrambleTies = false;
-let seedCounter = 0;
-/** When > 0, every read resolves after this many ms, so concurrency can be observed. */
-let delayMs = 0;
-const inFlight: Record<string, number> = {};
-const peak: Record<string, number> = {};
-
-const OVERFLOW_ERROR = {
-  message: 'TypeError: fetch failed',
-  details: 'TypeError: fetch failed Caused by: HeadersOverflowError: Headers Overflow Error (UND_ERR_HEADERS_OVERFLOW)',
-  hint: '',
-  code: '',
-};
-
-vi.mock('../lib/supabase.js', () => ({
-  supabase: { from: (table: string) => query(table) },
-  RESUME_BUCKET: 'resumes_v2',
-}));
-
-/** A small deterministic PRNG, so a scrambled run is reproducible. */
-function prng(seed: number): () => number {
-  let s = seed >>> 0;
-  return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 2 ** 32; };
-}
-
-function query(table: string): Record<string, unknown> {
-  const q: Query = { table, eqs: [], inValues: null, range: null };
-  const filters: Array<(r: Row) => boolean> = [];
-  const orders: Array<{ column: string; ascending: boolean }> = [];
-  const c: Record<string, unknown> = {};
-  const self = () => c;
-  for (const m of ['select', 'limit', 'neq', 'gt', 'gte', 'lt', 'lte', 'single', 'maybeSingle']) c[m] = self;
-  c.eq = (column: string, value: unknown) => { q.eqs.push([column, value]); filters.push((r) => r[column] === value); return c; };
-  c.is = (column: string, value: unknown) => { filters.push((r) => (value === null ? r[column] == null : r[column] === value)); return c; };
-  c.not = (column: string, op: string, value: unknown) => {
-    if (op === 'is' && value === null) filters.push((r) => r[column] != null);
-    return c;
-  };
-  c.in = (column: string, values: unknown[]) => {
-    q.inValues = values;
-    const set = new Set(values);
-    filters.push((r) => set.has(r[column]));
-    return c;
-  };
-  c.order = (column: string, opts?: { ascending?: boolean }) => { orders.push({ column, ascending: opts?.ascending !== false }); return c; };
-  c.range = (from: number, to: number) => { q.range = [from, to]; return c; };
-  const execute = () => {
-    queries.push(q);
-    if (throwWhen?.(q)) throw new Error('driver-detail postgres://10.0.0.5 user@example.com');
-    beforeExecute?.(q);
-    if ((q.inValues?.length ?? 0) > OVERFLOW_AT) return { data: null, error: OVERFLOW_ERROR, status: 0 };
-    if (failWhen?.(q)) return { data: null, error: { message: 'boom', details: '', hint: '', code: 'XX000' }, status: 500 };
-    let rows = (db[table] ?? []).filter((r) => filters.every((f) => f(r)));
-    if (scrambleTies) {
-      const rand = prng(++seedCounter);
-      rows = rows.map((r) => [rand(), r] as const).sort((a, b) => a[0] - b[0]).map(([, r]) => r);
-    }
-    rows = [...rows].sort((a, b) => {
-      for (const o of orders) {
-        const x = String(a[o.column] ?? '');
-        const y = String(b[o.column] ?? '');
-        if (x !== y) return (x < y ? -1 : 1) * (o.ascending ? 1 : -1);
-      }
-      return 0;
-    });
-    if (q.range) rows = rows.slice(q.range[0], q.range[1] + 1);
-    return { data: rows.slice(0, ROW_CAP), error: null, status: 200 };
-  };
-  c.then = (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) => {
-    if (delayMs > 0) {
-      inFlight[table] = (inFlight[table] ?? 0) + 1;
-      peak[table] = Math.max(peak[table] ?? 0, inFlight[table]);
-      return new Promise((r) => setTimeout(r, delayMs))
-        .then(() => execute())
-        .finally(() => { inFlight[table] -= 1; })
-        .then(resolve, reject);
-    }
-    try {
-      return Promise.resolve(execute()).then(resolve, reject);
-    } catch (error) {
-      return Promise.reject(error).then(resolve, reject);
-    }
-  };
-  return c;
-}
+const db = engine.tables;
+const queries = engine.queries;
+const peak = engine.peak;
 
 function appFor(user: AuthUser) {
   return createApp({
@@ -217,16 +130,9 @@ async function observed<T>(fn: () => Promise<T>): Promise<{ result: T; unhandled
 const get = (path: string, user: AuthUser = admin) => request(appFor(user)).get(path).set('Authorization', AUTH).timeout(5000);
 
 beforeEach(() => {
-  for (const k of Object.keys(db)) delete db[k];
-  queries.length = 0;
-  failWhen = null;
-  throwWhen = null;
-  beforeExecute = null;
-  scrambleTies = false;
-  seedCounter = 0;
-  delayMs = 0;
-  for (const k of Object.keys(inFlight)) delete inFlight[k];
-  for (const k of Object.keys(peak)) delete peak[k];
+  // The production limit, not the guard's stricter one: these cases reproduce
+  // what happened on 2026-11-04.
+  engine.reset({ overflowAt: PRODUCTION_OVERFLOW_AT });
 });
 
 afterEach(() => {
@@ -281,7 +187,7 @@ describe('GET /api/candidates at workspace scale', () => {
 
   it('pages in a total order: ties on created_at are broken by id, with no overlap or gap', async () => {
     seed(1250, { sameCreatedAt: true });
-    scrambleTies = true;
+    engine.scrambleTies = true;
     const res = await get('/api/candidates');
     const ids = (res.body as Row[]).map((c) => c.id as string);
     expect(ids).toHaveLength(1250);
@@ -291,10 +197,10 @@ describe('GET /api/candidates at workspace scale', () => {
 
   it('does not repeat a candidate created between two page reads', async () => {
     seed(1500);
-    beforeExecute = (q) => {
+    engine.beforeExecute = (q) => {
       if (q.table === 'candidates' && q.range?.[0] === 1000) {
         db.candidates!.push({ ...db.candidates![0], id: cid(9999), name: 'New arrival', created_at: iso(99_999) });
-        beforeExecute = null;
+        engine.beforeExecute = null;
       }
     };
     const res = await get('/api/candidates');
@@ -354,7 +260,7 @@ describe('GET /api/candidates at workspace scale', () => {
 
   it('answers 503 and logs a sanitised line when one assessments batch of six fails', async () => {
     seed(529);
-    failWhen = (q) => q.table === 'assessments' && (q.inValues ?? []).includes(cid(250));
+    engine.failWhen = (q) => q.table === 'assessments' && (q.inValues ?? []).includes(cid(250));
     const { result: res, unhandled, logged } = await observed(() => get('/api/candidates'));
     expect(unhandled).toEqual([]);
     expect(res.status).toBe(503);
@@ -367,7 +273,7 @@ describe('GET /api/candidates at workspace scale', () => {
 
   it('stops starting new assessments batches after the first failure', async () => {
     seed(1250); // 13 batches, 4 at a time
-    failWhen = (q) => q.table === 'assessments';
+    engine.failWhen = (q) => q.table === 'assessments';
     const res = await get('/api/candidates');
     expect(res.status).toBe(503);
     expect(queries.filter((q) => q.table === 'assessments').length).toBeLessThanOrEqual(4);
@@ -375,7 +281,7 @@ describe('GET /api/candidates at workspace scale', () => {
 
   it('answers 503 (never a hang) when the assessments builder throws, and logs only a category', async () => {
     seed(50);
-    throwWhen = (q) => q.table === 'assessments';
+    engine.throwWhen = (q) => q.table === 'assessments';
     const { result: res, unhandled, logged } = await observed(() => get('/api/candidates'));
     expect(unhandled).toEqual([]);
     expect(res.status).toBe(503);
@@ -388,7 +294,7 @@ describe('GET /api/candidates at workspace scale', () => {
   it('keeps every batched read on the list at most 4 in flight, phone progress included', async () => {
     vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
     seed(1250);
-    delayMs = 3;
+    engine.delayMs = 3;
     const res = await get('/api/candidates');
     expect(res.status).toBe(200);
     expect(peak.assessments).toBeLessThanOrEqual(4);
@@ -400,8 +306,8 @@ describe('GET /api/candidates at workspace scale', () => {
   it('stops the additive reads at their first failed batch, and still answers 200', async () => {
     vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
     seed(1250); // 13 batches each
-    delayMs = 2;
-    failWhen = (q) => q.table === 'ashby_application_links' || q.table === 'phone_engagements';
+    engine.delayMs = 2;
+    engine.failWhen = (q) => q.table === 'ashby_application_links' || q.table === 'phone_engagements';
     const res = await get('/api/candidates');
     expect(res.status).toBe(200);
     expect(queries.filter((q) => q.table === 'ashby_application_links').length).toBeLessThanOrEqual(4);
@@ -424,7 +330,7 @@ describe('GET /api/candidates at workspace scale', () => {
   it('keeps the other batches\' Ashby state when one links batch fails, and drops what it cannot stand behind', async () => {
     seed(529);
     db.candidates![0].resume_id = 'resume-0';
-    failWhen = (q) => q.table === 'ashby_application_links' && (q.inValues ?? []).includes(cid(0));
+    engine.failWhen = (q) => q.table === 'ashby_application_links' && (q.inValues ?? []).includes(cid(0));
     const res = await get('/api/candidates');
     expect(res.status).toBe(200);
     const body = res.body as Row[];
@@ -438,7 +344,7 @@ describe('GET /api/candidates at workspace scale', () => {
 
   it('fails the request, never returns a partial list, when a later candidates page fails', async () => {
     seed(1250);
-    failWhen = (q) => q.table === 'candidates' && (q.range?.[0] ?? 0) >= 1000;
+    engine.failWhen = (q) => q.table === 'candidates' && (q.range?.[0] ?? 0) >= 1000;
     const res = await get('/api/candidates');
     expect(res.status).toBeGreaterThanOrEqual(500);
     expect(Array.isArray(res.body)).toBe(false);
@@ -446,7 +352,7 @@ describe('GET /api/candidates at workspace scale', () => {
 
   it('fails the request (never hangs) when the candidates builder throws', async () => {
     seed(10);
-    throwWhen = (q) => q.table === 'candidates';
+    engine.throwWhen = (q) => q.table === 'candidates';
     const { result: res, unhandled } = await observed(() => get('/api/candidates'));
     expect(unhandled).toEqual([]);
     expect(res.status).toBeGreaterThanOrEqual(500);
@@ -475,7 +381,7 @@ describe('GET /api/candidates/summary at workspace scale', () => {
 
   it('covers every candidate past the 1000-row cap, in a total order', async () => {
     const { assessed } = seed(1250);
-    scrambleTies = true; // the summary pages by id alone: any unpinned order would overlap or skip
+    engine.scrambleTies = true; // the summary pages by id alone: any unpinned order would overlap or skip
     const res = await get('/api/candidates/summary');
     expect(res.status).toBe(200);
     expect(res.body.assessed_count).toBe(assessed.length);
@@ -494,7 +400,7 @@ describe('GET /api/candidates/summary at workspace scale', () => {
 
   it('answers 503 instead of "no assessments" when one assessments batch fails', async () => {
     seed(529);
-    failWhen = (q) => q.table === 'assessments' && (q.inValues ?? []).includes(cid(400));
+    engine.failWhen = (q) => q.table === 'assessments' && (q.inValues ?? []).includes(cid(400));
     const res = await get('/api/candidates/summary');
     expect(res.status).toBe(503);
     expect(res.body).toEqual({ error: 'service_unavailable' });
@@ -502,7 +408,7 @@ describe('GET /api/candidates/summary at workspace scale', () => {
 
   it('fails the request, never counts a partial set, when a later candidates page fails', async () => {
     seed(1250);
-    failWhen = (q) => q.table === 'candidates' && (q.range?.[0] ?? 0) >= 1000;
+    engine.failWhen = (q) => q.table === 'candidates' && (q.range?.[0] ?? 0) >= 1000;
     const res = await get('/api/candidates/summary');
     expect(res.status).toBeGreaterThanOrEqual(500);
     expect(res.body.assessed_count).toBeUndefined();
