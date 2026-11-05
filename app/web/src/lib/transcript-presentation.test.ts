@@ -17,7 +17,7 @@ describe('presentTranscriptTurn', () => {
 
   it('leaves ordinary bot and candidate dialogue unchanged', () => {
     expect(presentTranscriptTurn('bot', 'Hello')).toEqual({
-      text: 'Hello', label: 'Bot', plannedEvidence: false,
+      text: 'Hello', label: 'Christy (AI)', plannedEvidence: false,
     });
     expect(presentTranscriptTurn('candidate', '[planned question] literal candidate text')).toEqual({
       text: '[planned question] literal candidate text',

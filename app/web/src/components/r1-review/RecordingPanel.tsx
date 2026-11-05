@@ -327,7 +327,8 @@ export function RecordingPanel({
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.ctrlKey || event.metaKey || event.altKey || !playable) return;
     const target = event.target as HTMLElement;
-    if (target.closest('input, select, textarea, [contenteditable="true"]')) return;
+    // The speed list has its own arrow keys and letters.
+    if (target.closest('input, select, textarea, [contenteditable="true"], [aria-haspopup="listbox"], [role="listbox"]')) return;
     const step = R1_PLAYBACK_RATES.indexOf(rate as (typeof R1_PLAYBACK_RATES)[number]);
     switch (event.key.toLowerCase()) {
       case ' ':

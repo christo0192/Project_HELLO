@@ -171,7 +171,8 @@ test.describe('playing', () => {
 
     await page.keyboard.press(']');
     expect(await video.evaluate((el: HTMLVideoElement) => el.playbackRate)).toBe(1.25);
-    await page.getByRole('combobox', { name: 'Speed' }).selectOption('2');
+    await page.getByRole('button', { name: /^Speed/ }).click();
+    await page.getByRole('option', { name: '2x', exact: true }).click();
     expect(await video.evaluate((el: HTMLVideoElement) => el.playbackRate)).toBe(2);
   });
 

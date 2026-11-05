@@ -5,7 +5,7 @@
  * reports every frame renders nothing here.
  */
 import type { Ref } from 'react';
-import { Button, SelectField, Slider, cx } from '../design';
+import { Button, Combobox, Slider, cx } from '../design';
 import { clockText } from '../../lib/r1-recording';
 import { R1_PLAYBACK_RATES } from '../../lib/r1-review';
 
@@ -120,13 +120,21 @@ export function PlayerControls({
           onValueChange={(value) => onVolume(value / 100)}
           className="w-20"
         />
-        <SelectField size="sm" aria-label="Speed" value={String(rate)} onChange={(event) => onRate(Number(event.target.value))} className="w-20">
-          {R1_PLAYBACK_RATES.map((option) => (
-            <option key={option} value={String(option)}>
-              {option}x
-            </option>
-          ))}
-        </SelectField>
+        {/* Upward: the controls sit at the foot of the picture. */}
+        <Combobox
+          id="r1-playback-speed"
+          aria-label="Speed"
+          size="sm"
+          searchable={false}
+          floating="up"
+          value={String(rate)}
+          onChange={(next) => onRate(Number(next))}
+          options={R1_PLAYBACK_RATES.map((option) => ({ value: String(option), label: `${option}x` }))}
+          placeholder={`${rate}x`}
+          searchLabel="Speed"
+          listLabel="Speed"
+          className="w-20"
+        />
       </span>
     </div>
   );
