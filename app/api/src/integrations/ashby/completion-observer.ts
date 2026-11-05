@@ -19,8 +19,9 @@
  * and, when the approved sink is configured, asks the durable store to enqueue
  * exactly one scorecard-write operation. It then asks for the Christy verdict
  * tag operation (0134), on both the normal and the insufficient-evidence path:
- * the second has no scorecard, but a stale tag from an earlier result still has
- * to come off. The operation worker owns every provider mutation. No stage move,
+ * the second has no scorecard, but its raw verdict is still tagged with that
+ * lean (M028), and one with no verdict still takes a stale tag off. The
+ * operation worker owns every provider mutation. No stage move,
  * auto-reject, or email is ever enqueued.
  *
  * FAILURE POSTURE. The observer is best-effort with respect to scoring: a
@@ -49,7 +50,9 @@ export const NO_RESULT_SINK_REASON = 'no_verified_result_sink';
 /**
  * C3 (0114 §4): the park reason for an INSUFFICIENT-evidence screening. The
  * link is parked `writeback_pending` for a human, and NO scorecard write is
- * enqueued — a thin or infra-killed interview never reaches Ashby on its own.
+ * enqueued — a thin or infra-killed interview's scorecard never reaches Ashby
+ * on its own. Only its Christy tag does: since M028 the tag follows the raw
+ * verdict's lean whatever the evidence grade.
  * (`mark_ashby_writeback_pending` answers `already_pending` without persisting
  * a new reason, so Mission Control derives "held for evidence" by a JOIN on
  * the assessment's grade, never from this string.)

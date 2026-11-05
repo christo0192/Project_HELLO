@@ -197,17 +197,13 @@ describe('christyTagForVerdict', () => {
     ['hold', 'borderline'],
     ['reject', 'reject'],
   ] as const)('%s -> %s', (recommendation, tag) => {
-    expect(christyTagForVerdict({ recommendation, evidenceGrade: 'decision' })).toBe(tag);
-    expect(christyTagForVerdict({ recommendation, evidenceGrade: null })).toBe(tag);
+    expect(christyTagForVerdict({ recommendation })).toBe(tag);
   });
 
   it.each([null, undefined, 'human_review', '', 'Advance', 'select', 1])('no verdict: %s -> null', (recommendation) => {
     expect(christyTagForVerdict({ recommendation })).toBeNull();
   });
 
-  it.each(['advance', 'hold', 'reject'])('insufficient evidence wins over %s', (recommendation) => {
-    expect(christyTagForVerdict({ recommendation, evidenceGrade: 'insufficient' })).toBeNull();
-  });
 
   it('pins the exact titles the admin created', () => {
     expect(CHRISTY_VERDICT_TAG_TITLES).toEqual({
@@ -547,7 +543,7 @@ describe('executeRecommendationTag: applying the verdict', () => {
 
   it.each([
     ['human_review stored as NULL', source({ recommendation: null })],
-    ['insufficient evidence over a verdict', source({ recommendation: 'advance', evidenceGrade: 'insufficient' })],
+    ['human_review stored as NULL, graded insufficient', source({ recommendation: null, evidenceGrade: 'insufficient' })],
     ['no result on any of the candidate\'s links', { status: 'no_assessment' as const, recommendation: null, evidenceGrade: null }],
   ])('%s removes what is there and adds nothing', async (_label, src) => {
     const h = harness({ tags: [SELECT], src });
@@ -555,6 +551,23 @@ describe('executeRecommendationTag: applying the verdict', () => {
     expect(h.calls).toEqual(['remove:tag-select']);
     expect(h.candidateTagList).not.toHaveBeenCalled();
     expect(r).toMatchObject({ committed: true, code: 'christy_tag_none' });
+  });
+
+  // M028 owner decision: thin evidence does not suppress the tag.
+  it.each([
+    ['advance', 'christy_tag_select', 'add:tag-select'],
+    ['hold', 'christy_tag_borderline', 'add:tag-borderline'],
+    ['reject', 'christy_tag_reject', 'add:tag-reject'],
+  ] as const)('verdict %s graded insufficient is still tagged with that lean', async (recommendation, code, add) => {
+    const h = harness({ src: source({ recommendation, evidenceGrade: 'insufficient' }) });
+    expect(await h.run()).toMatchObject({ committed: true, code });
+    expect(h.calls).toEqual([add]);
+  });
+
+  it('a lean graded insufficient replaces an older tag', async () => {
+    const h = harness({ tags: [SELECT], src: source({ recommendation: 'reject', evidenceGrade: 'insufficient' }) });
+    expect(await h.run()).toMatchObject({ committed: true, code: 'christy_tag_reject' });
+    expect(h.calls).toEqual(['add:tag-reject', 'remove:tag-select']);
   });
 
   it('no verdict and no tag: no writes, completes as none', async () => {

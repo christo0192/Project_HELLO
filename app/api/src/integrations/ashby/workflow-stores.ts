@@ -838,8 +838,9 @@ export interface MissionControlWorkflow {
    * C3 (0114 §4): true when this workflow is parked `writeback_pending`, has no
    * scorecard write, and its NEWEST assessment (across the link's own session
    * and its phone cycles' sessions) is graded `insufficient` — the interview
-   * is held for a human, and nothing will reach Ashby until someone acts
-   * (typically "Rescreen recommended"). Derived by a JOIN on the assessment's
+   * is held for a human, and no scorecard will reach Ashby until someone acts
+   * (typically "Rescreen recommended"). The Christy tag still follows the raw
+   * verdict's lean (M028). Derived by a JOIN on the assessment's
    * grade, never from the park's audit reason (which `already_pending` does
    * not persist). `false` when not held; `null` when it could not be read —
    * a diagnostic, never a reason to fail the list.
