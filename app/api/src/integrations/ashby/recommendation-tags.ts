@@ -6,8 +6,13 @@
  *     `Christy: Reject`. A provisional verdict (scoring_status
  *     `incomplete_evidence` with a non-null recommendation) IS tagged, Reject
  *     included.
- *   - No verdict (NULL, which is how `human_review` is stored) or
- *     `evidence_grade = 'insufficient'` gets NO tag.
+ *   - No verdict (NULL, which is how `human_review` is stored) or no assessment
+ *     gets NO tag.
+ *   - Evidence graded `insufficient` does NOT suppress the tag (owner decision
+ *     2026-11-05, M028): a thin call that still carries a raw verdict is
+ *     tagged with that lean, so the team can find it in Ashby. HELLO keeps
+ *     showing it as held for insufficient evidence, and its scorecard is still
+ *     not written to Ashby.
  *   - The newest verdict wins, and a candidate carries at most one Christy tag.
  *     Tags are candidate-wide, not per application.
  *   - The lane touches those three titles and no other tag, and never creates a
@@ -148,12 +153,13 @@ export function recommendationTagsEnabled(): boolean {
  * `assessments.recommendation` column, never `ScorecardSource.recommendation` or
  * `NormalizedScorecard.recommendation`: those coerce a missing verdict to `hold`,
  * which would tag it Borderline.
+ *
+ * The evidence grade is deliberately not an input: since M028 a verdict graded
+ * `insufficient` is tagged with its lean like any other.
  */
 export function christyTagForVerdict(input: {
   recommendation: unknown;
-  evidenceGrade?: string | null;
 }): ChristyVerdictTag | null {
-  if (input.evidenceGrade === 'insufficient') return null;
   if (input.recommendation === 'advance') return 'select';
   if (input.recommendation === 'hold') return 'borderline';
   if (input.recommendation === 'reject') return 'reject';
@@ -584,7 +590,7 @@ export async function executeRecommendationTag(
     }
     if (!source) return await defer(TAG_VERDICT_UNREADABLE, TAG_TRANSIENT_DEFER_SECONDS);
     const target = source.status === 'ok'
-      ? christyTagForVerdict({ recommendation: source.recommendation, evidenceGrade: source.evidenceGrade })
+      ? christyTagForVerdict({ recommendation: source.recommendation })
       : null;
     const targetTitle = target ? CHRISTY_VERDICT_TAG_TITLES[target] : null;
     const anchor = `christy_tag_${target ?? 'none'}`;

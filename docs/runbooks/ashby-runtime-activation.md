@@ -749,11 +749,29 @@ concluded, so the team can filter on it in Ashby.
 | `advance` (shown as Select) | `Christy: Select` |
 | `hold` (shown as Borderline) | `Christy: Borderline` |
 | `reject` | `Christy: Reject` |
-| none (`human_review`, stored as NULL), or evidence graded `insufficient` | no tag, and any Christy tag already there comes off |
+| none (`human_review`, stored as NULL), or no assessment at all | no tag, and any Christy tag already there comes off |
 
 A provisional verdict (`scoring_status = 'incomplete_evidence'` with a verdict) IS
 tagged, Reject included. R1 verdicts do not reach this pipeline: it follows the
 phone-screen assessment only.
+
+**Thin evidence still gets its lean (owner decision 2026-11-05, M028).** A result
+graded `insufficient` that carries a raw verdict is tagged with that verdict, the
+same as any other. The evidence grade does not change the tag; only a missing verdict
+does. HELLO still shows the result as held for insufficient evidence with a re-screen
+recommended, and its scorecard is still not written to Ashby. So on a thin call the
+Ashby tag shows Christy's lean, while the HELLO card says to re-screen.
+- The tag follows the stored verdict only, never the evidence reason. A call graded
+  `no_candidate_speech` normally stores no verdict: the scorer marks every metric
+  insufficient, giving `human_review`, stored as NULL. So it gets no tag. If such a
+  call did store a verdict (a v1-scored row from before 0089, or a model that scored
+  any metric), it is tagged with that verdict. The re-tag preview below counts such
+  rows by `evidence_reason`.
+- A call cut short after even a little speech can carry a lean, often Reject, and is
+  tagged with it, as the owner chose ("whatever she is tagging").
+
+Before M028, insufficient evidence suppressed the tag. "Re-tagging after M028" below
+runs the lane once for results that the old rule left untagged.
 
 **The tags are not created by the code.** The Ashby admin creates the three tags
 with exactly those titles. The match trims spaces, then is exact and
@@ -906,6 +924,72 @@ npx --yes supabase@2.118.0 db query --linked "select screening_v2.enqueue_ashby_
 
 It runs on the next poll and shows in Mission Control as "Christy tag".
 
+#### Re-tagging after M028
+
+The old rule left every thin result with a lean untagged, and two groups of them are
+reached by nothing else:
+- links whose tag operation already ran and completed as `christy_tag_none`;
+- links whose only results are thin. They never got a scorecard (C3 holds it), so the
+  backfill, which takes only links with a succeeded `scorecard_write`, skips them
+  without counting them anywhere. Their screenings ran before 0134 went live, so they
+  have no tag operation either.
+
+So this step selects by the result itself, not by tag history. It takes every
+non-terminal Ashby link on an `enabled` mapping (the same gate as the live lane and
+the backfill) that has an assessment graded `insufficient` with a raw verdict on its
+own session or one of its phone cycles' sessions.
+
+Run it **only after the M028 deploy is live**. Before that, the old code would apply
+"no tag" again and use up the key. Save each statement to a file and run it from
+`app/` as in the backfill below, with
+`npx --yes supabase@2.118.0 db query --linked -f <file>`.
+
+1. **Preview.** Writes nothing. Each row is a lean, a grade and an evidence reason,
+   from the candidate's newest result across all their jobs, the one the lane will
+   apply. `insufficient` rows with a lean are the new tags. A `decision` row means a
+   later full screening already decided that candidate and tagged them, so the run
+   changes nothing for it. A `no_candidate_speech` row with a lean is a call where
+   the candidate never spoke that will be tagged with that lean. Check whether that
+   is wanted before step 2.
+
+   ```sql
+   select t.v->>'recommendation' as lean, t.v->>'evidence_grade' as grade, a.evidence_reason as reason, count(*) as links
+     from (select screening_v2.ashby_candidate_tag_verdict(l.id, l.external_candidate_id) as v
+             from screening_v2.ashby_application_links l
+             join screening_v2.ashby_job_mappings m on m.id = l.job_mapping_id and m.status = 'enabled'
+            where l.provider = 'ashby' and l.terminal_state is null
+              and exists (select 1 from screening_v2.assessments a
+                           where a.evidence_grade = 'insufficient' and a.recommendation is not null
+                             and (a.session_id = l.session_id
+                                  or a.session_id in (select e.session_id from screening_v2.phone_engagements e
+                                                       where e.application_link_id = l.id and e.session_id is not null)))) t
+     left join screening_v2.assessments a on a.id = (t.v->>'assessment_id')::uuid
+    group by 1, 2, 3 order by 1, 2, 3;
+   ```
+
+2. **Run the lane once** for those links, with one trigger each. Re-running is safe:
+   a link already triggered answers `duplicate`. If step 2 ran before the deploy was
+   live, change the key suffix (for example `m028-retag-2`) and run it again.
+
+   ```sql
+   select r->>'status' as status, count(*)
+     from (select screening_v2.enqueue_ashby_operation(l.id, 'recommendation_tag',
+                    'ashby:recommendation_tag:' || l.id || ':m028-retag', null, null,
+                    '00000000-0000-4000-8000-000000000001') as r
+             from screening_v2.ashby_application_links l
+             join screening_v2.ashby_job_mappings m on m.id = l.job_mapping_id and m.status = 'enabled'
+            where l.provider = 'ashby' and l.terminal_state is null
+              and exists (select 1 from screening_v2.assessments a
+                           where a.evidence_grade = 'insufficient' and a.recommendation is not null
+                             and (a.session_id = l.session_id
+                                  or a.session_id in (select e.session_id from screening_v2.phone_engagements e
+                                                       where e.application_link_id = l.id and e.session_id is not null)))) t
+    group by 1;
+   ```
+
+   It should answer only `inserted`, as many as the preview's total. Check the result
+   with the count in the backfill's step 3.
+
 #### A stored candidate id after an Ashby merge
 
 The lane uses the Ashby candidate id stored on the link and asks
@@ -963,7 +1047,7 @@ drift script's version.
    |---|---|
    | `total_eligible` | Links that would get an operation. |
    | `verdicts` | Those links by the verdict the lane will apply: the candidate's newest, across all its jobs, in raw values (`advance`, `hold`, `reject`, `none`). |
-   | `evidence_insufficient` | Links whose newest result is graded insufficient: no tag, with or without a raw verdict. One with no raw verdict is also in `verdicts.none`, so do not add the two. |
+   | `evidence_insufficient` | Eligible links whose newest result is graded insufficient. Informational since M028: each still gets the tag its raw verdict maps to in `verdicts` (no tag only when that is `none`). Before M028 these got no tag. Links whose only results are thin are not eligible at all (no scorecard), so they are not counted here or in any `skipped_*` field; "Re-tagging after M028" covers them. |
    | `skipped_terminal` | Withdrawn, deleted or manually cancelled applications. |
    | `skipped_mapping_inactive` | The job's mapping is not `enabled`. |
    | `skipped_has_tag_op` | The link already has a tag operation; the live lane owns it. |
