@@ -36,6 +36,9 @@
  *      hold ends sooner if the playhead leaves the lead-in (a scrub), playback
  *      ends, the media is dropped (the click then failed: no row stays lit) or
  *      the transcript changes. A click the player ignores lights nothing.
+ *      While a seek is queued (`seekQueued`), held or not, the media's own
+ *      reports do not count: a re-mint reloads it at 0, and the old file can run
+ *      out first, so the lit row stays and is not announced again.
  *   4. Selecting a new session resets everything; stale loads are discarded.
  *
  * R1 sessions (a session that belongs to an R1 round): the recording is the R1
@@ -455,10 +458,11 @@ export function TranscriptionSyncWorkspace({
         setActiveLegTurn(found);
         return;
       }
+      // A queued seek has not moved the media yet, so this position says nothing about where it will be.
+      if (r1PlayerRef.current?.seekQueued) return;
       const heldStart = heldTurnStartRef.current;
       if (heldStart !== null) {
-        // A queued click has not moved the media yet, so this position says nothing about it.
-        if (r1PlayerRef.current?.seekQueued || inSeekLead(heldStart, currentTime)) return;
+        if (inSeekLead(heldStart, currentTime)) return;
         heldTurnStartRef.current = null;
       }
       // R1 lights a row at its start; a phone row keeps its early tolerance.
@@ -469,6 +473,8 @@ export function TranscriptionSyncWorkspace({
 
   const handleR1Ended = useCallback(
     (sec: number) => {
+      // The old file ran out while its link was being replaced: the seek is still on its way.
+      if (r1PlayerRef.current?.seekQueued) return;
       heldTurnStartRef.current = null;
       handleTimeUpdate(sec);
     },

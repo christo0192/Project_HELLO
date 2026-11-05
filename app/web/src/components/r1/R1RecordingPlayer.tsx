@@ -80,7 +80,10 @@ export interface R1RecordingPlayerHandle {
   pause(): void;
   readonly currentTime: number;
   readonly hasUrl: boolean;
-  /** A `playFrom` is waiting for a link or for metadata, so the position reported now is not where it will land. */
+  /**
+   * A position is waiting for a link or for metadata (a `playFrom`, or the place a re-mint saved), so the
+   * position reported now is not where the media will land.
+   */
   readonly seekQueued: boolean;
 }
 
@@ -512,7 +515,8 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
           return true;
         }
         if (refreshIfStale({ time: offsetSec, play: true })) return true;
-        if (metaRef.current) applyQueued();
+        // Never on an element a re-mint is about to replace: the seek would go with it.
+        if (metaRef.current && !inflightRef.current) applyQueued();
         // Otherwise the metadata handler applies it as soon as it loads.
         return true;
       },
@@ -555,7 +559,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
           return mintedRef.current !== null && phaseRef.current === 'media';
         },
         get seekQueued() {
-          return pendingSeekRef.current !== null;
+          return pendingSeekRef.current !== null || restoreRef.current !== null;
         },
       }),
       [mint, playFrom, refreshIfStale, seekElements],

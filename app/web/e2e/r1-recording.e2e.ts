@@ -244,6 +244,55 @@ test.describe('the link expires, or was bad to begin with', () => {
     app.expectHealthy();
   });
 
+  test('a double-click on an aged link: one more mint, the row stays lit through the reload, and playback lands on it', async ({ app, page }) => {
+    await app.goto(REVIEW);
+    const panel = page.getByRole('tabpanel', { name: 'Review' });
+    await panel.getByRole('combobox').selectOption(R1_SESSION_ATTEMPT_1);
+    await panel.getByRole('button', { name: 'Load recording, R1 role-play' }).click();
+    const video = panel.locator('video');
+    await expect.poll(() => duration(video)).toBeGreaterThan(R1_REC_LENGTH_SEC - 5);
+    const firstLink = (await video.getAttribute('src'))!;
+    await video.evaluate((el: HTMLMediaElement) => {
+      el.currentTime = 30;
+    });
+    const late = panel.getByRole('button', { name: /Turn 2:/ });
+    await expect(panel.getByRole('button', { name: /Turn 1:/ })).toHaveAttribute('aria-current', 'true');
+
+    // The link is past its age, and the mint that replaces it is a new link, slow enough for the second
+    // click to land inside it.
+    app.db.r1.mints[R1_SESSION_ATTEMPT_1] = [
+      { url: firstLink.replace('data:audio/wav;', 'data:audio/wav;v=2;'), content_type: 'video/webm', expires_in_sec: 300 },
+    ];
+    await page.route(/\/api\/interview-rounds\/[^/]+\/recording/, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await route.fallback();
+    });
+    await page.evaluate(() => {
+      const now = performance.now.bind(performance);
+      performance.now = () => now() + 300_000;
+    });
+
+    // The reload is over in a moment: only a watcher sees a row blink or the wrong one light.
+    await panel.evaluate((root) => {
+      const trail: string[] = [];
+      new MutationObserver(() => {
+        const row = root.querySelector('[aria-current="true"]')?.getAttribute('aria-label') ?? 'none';
+        const name = /^Turn (\d+)/.exec(row)?.[1] ?? row;
+        if (trail.at(-1) !== name) trail.push(name);
+        root.setAttribute('data-row-trail', trail.join(' '));
+      }).observe(root, { subtree: true, attributes: true, attributeFilter: ['aria-current'] });
+    });
+
+    await late.dblclick();
+    await expect(video).toHaveAttribute('src', /v=2/);
+    await expect.poll(() => position(video), { timeout: 10_000 }).toBeGreaterThanOrEqual(R1_TURN_LATE_SEC);
+    expect(await position(video)).toBeLessThan(R1_TURN_LATE_SEC + 15);
+    await expect(late).toHaveAttribute('aria-current', 'true');
+    expect(await panel.getAttribute('data-row-trail')).toBe('2');
+    expect(mints(app)).toHaveLength(2);
+    app.expectHealthy();
+  });
+
   test('an error before metadata (a bad first link): the error block at once, no automatic retry; Try again works', async ({ app, page }, testInfo) => {
     await app.goto(OVERVIEW);
     // First mint: undecodable. Second: the playable default (`null`).

@@ -650,6 +650,42 @@ describe('playFrom / playFromTurn', () => {
     expect(state.sets).toEqual([30]);
   });
 
+  it('during a re-mint: waits for the new link, and the latest offset wins', async () => {
+    const r = renderPlayer();
+    const { el, state } = await loadIt(r);
+    mockApi.getR1Recording.mockResolvedValueOnce(minted({ url: URL_TWO }));
+    setNow(1_000 + 290_000);
+
+    act(() => {
+      r.ref.current!.playFrom(10);
+      r.ref.current!.playFrom(20);
+    });
+    expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2);
+    expect(state.sets).toEqual([]);
+    expect(r.ref.current!.seekQueued).toBe(true);
+
+    await waitFor(() => expect(el).toHaveAttribute('src', URL_TWO));
+    expect(r.ref.current!.seekQueued).toBe(true);
+    fireEvent.loadedMetadata(el);
+    expect(state.sets).toEqual([20]);
+    expect(r.ref.current!.seekQueued).toBe(false);
+  });
+
+  it('the place a re-mint saved counts as queued until it is put back', async () => {
+    mockApi.getR1Recording.mockResolvedValueOnce(minted()).mockResolvedValueOnce(minted({ url: URL_TWO }));
+    const r = renderPlayer();
+    const { el, state } = await loadIt(r);
+    state.currentTime = 100;
+    expect(r.ref.current!.seekQueued).toBe(false);
+
+    failWith(el, 2);
+    await waitFor(() => expect(el).toHaveAttribute('src', URL_TWO));
+    expect(r.ref.current!.seekQueued).toBe(true);
+    fireEvent.loadedMetadata(el);
+    expect(state.sets.at(-1)).toBe(100);
+    expect(r.ref.current!.seekQueued).toBe(false);
+  });
+
   it('with the link loaded: seeks and plays at once', async () => {
     const r = renderPlayer();
     const { state } = await loadIt(r);

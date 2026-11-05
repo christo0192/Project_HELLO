@@ -99,7 +99,7 @@ function rounds(over: Partial<R1RecordingSummary> = {}): { rounds: R1Round[] } {
 }
 
 function drive(el: HTMLMediaElement) {
-  const state = { currentTime: 0, paused: true, sets: [] as number[], play: vi.fn(), pause: vi.fn() };
+  const state = { currentTime: 0, paused: true, sets: [] as number[], reloads: 0, play: vi.fn(), pause: vi.fn() };
   state.play.mockImplementation(() => {
     state.paused = false;
     return Promise.resolve();
@@ -115,8 +115,24 @@ function drive(el: HTMLMediaElement) {
   Object.defineProperty(el, 'paused', { configurable: true, get: () => state.paused });
   el.play = state.play as unknown as HTMLMediaElement['play'];
   el.pause = state.pause as unknown as HTMLMediaElement['pause'];
+  // A real element reloading for a new link stops with no `pause` event, jumps to 0 and reports that in a
+  // queued task. The mock's link never changes, so the player's reload is `load()` here. An element whose
+  // `src` was taken away is being let go: it stays quiet here on purpose, so that a test of a dropped hold
+  // proves `onMediaDropped` ended it, not a report at 0.
+  el.load = () => {
+    if (!el.hasAttribute('src')) return;
+    state.paused = true;
+    state.currentTime = 0;
+    setTimeout(() => {
+      fireEvent.timeUpdate(el);
+      state.reloads += 1;
+    });
+  };
   return state;
 }
+
+/** The mint has answered, and the driven element has reloaded and reported position 0. */
+const reloaded = (state: ReturnType<typeof drive>) => waitFor(() => expect(state.reloads).toBe(1));
 
 function renderWorkspace(props: Partial<React.ComponentProps<typeof TranscriptionSyncWorkspace>> = {}) {
   return render(
@@ -523,6 +539,12 @@ describe('a clicked turn lights at once and holds through the lead-in', () => {
     return { video, state, at };
   }
 
+  /** Past the age at which the next click replaces the link (300 s, replaced 15 s early). */
+  function ageTheLink() {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 300_000);
+    onTestFinished(() => clock.mockRestore());
+  }
+
   describe('the row that lights', () => {
     it('is the clicked row at start - 0.25 s, never the row before it', async () => {
       renderWorkspace();
@@ -627,20 +649,116 @@ describe('a clicked turn lights at once and holds through the lead-in', () => {
       renderWorkspace();
       const { video, state, at } = await loaded();
       at(30);
-      const clock = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 300_000);
-      onTestFinished(() => clock.mockRestore());
+      ageTheLink();
 
       fireEvent.click(turn(2));
       expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2);
       expect(state.sets).toEqual([]);
       at(30.5);
       expect(lit()).toEqual(['2']);
-      await act(async () => undefined);
-      at(31);
+
+      await reloaded(state);
       expect(lit()).toEqual(['2']);
 
       fireEvent.loadedMetadata(video);
       expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('holds through a double-click on an aged link, and playback lands on the row', async () => {
+      renderWorkspace();
+      const { video, state, at } = await loaded();
+      at(30);
+      ageTheLink();
+
+      fireEvent.click(turn(2));
+      fireEvent.click(turn(2));
+      expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2);
+      await reloaded(state);
+      expect(lit()).toEqual(['2']);
+
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+      // Landed, so the hold is an ordinary one again: a scrub away ends it.
+      at(30);
+      expect(lit()).toEqual(['1']);
+    });
+
+    it('follows a second row clicked while the link is being replaced', async () => {
+      renderWorkspace();
+      const { video, state, at } = await loaded();
+      at(30);
+      ageTheLink();
+
+      fireEvent.click(turn(1));
+      fireEvent.click(turn(2));
+      expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2);
+      await reloaded(state);
+      expect(lit()).toEqual(['2']);
+
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('holds through a media error inside the lead-in, and the position comes back', async () => {
+      renderWorkspace();
+      const { video, state, at } = await loaded();
+      fireEvent.click(turn(2));
+      at(124.8);
+      state.sets.length = 0;
+
+      fireEvent.error(video);
+      expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2);
+      await reloaded(state);
+      expect(lit()).toEqual(['2']);
+
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.8]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+      at(30);
+      expect(lit()).toEqual(['1']);
+    });
+
+    it('holds when the old file ends while the link is being replaced', async () => {
+      renderWorkspace();
+      const { video, state, at } = await loaded();
+      at(590);
+      ageTheLink();
+
+      fireEvent.click(turn(1));
+      state.currentTime = 600;
+      fireEvent.ended(video);
+      expect(lit()).toEqual(['1']);
+
+      await reloaded(state);
+      expect(lit()).toEqual(['1']);
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([4.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['1']);
+    });
+
+    it('stays lit through a re-mint with no click behind it, and is not announced again', async () => {
+      renderWorkspace();
+      const { video, state, at } = await loaded();
+      at(130);
+      expect(lit()).toEqual(['2']);
+      const announced = screen.getByText(/^Now playing turn 2/);
+
+      fireEvent.error(video);
+      await reloaded(state);
+      expect(lit()).toEqual(['2']);
+      // A live region that blanks and refills is read out again.
+      expect(announced).toHaveTextContent(/^Now playing turn 2/);
+
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([130]);
       fireEvent.timeUpdate(video);
       expect(lit()).toEqual(['2']);
     });
@@ -781,6 +899,16 @@ describe('a clicked turn lights at once and holds through the lead-in', () => {
       expect(lit()).toEqual([]);
     });
 
+    it('nor left announced as playing, by a click whose mint fails', async () => {
+      mockApi.getR1Recording.mockRejectedValue(Object.assign(new Error('boom'), { status: 500 }));
+      renderWorkspace();
+      await loadButton();
+      fireEvent.click(turn(2));
+      expect(screen.getByText(/^Now playing turn 2/)).toBeInTheDocument();
+      expect(await screen.findByRole('alert')).toBeInTheDocument();
+      await waitFor(() => expect(screen.queryByText(/^Now playing/)).not.toBeInTheDocument());
+    });
+
     it('by a click whose mint finds the recording deleted', async () => {
       mockApi.getR1Recording.mockResolvedValue(recording({ state: 'deleted', reason: 'retention' }));
       renderWorkspace();
@@ -802,12 +930,13 @@ describe('a clicked turn lights at once and holds through the lead-in', () => {
 
     it('when the media is lost inside the lead-in, after the seek has landed', async () => {
       renderWorkspace();
-      const { video, at } = await loaded();
+      const { video, state, at } = await loaded();
       fireEvent.click(turn(2));
       at(124.8);
       fireEvent.error(video);
-      await waitFor(() => expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2));
-      await act(async () => undefined);
+      await reloaded(state);
+      // The new link loaded, so this second error is the one that gives up, not a bad first link.
+      fireEvent.loadedMetadata(video);
       fireEvent.error(video);
       expect(await screen.findByRole('alert')).toBeInTheDocument();
       expect(lit()).toEqual([]);

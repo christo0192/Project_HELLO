@@ -67,6 +67,15 @@ describe('SeekableTranscript', () => {
     expect(buttons[2]).not.toHaveAttribute('aria-current');
   });
 
+  it('announces the active turn, and clears that when no turn is active', () => {
+    const props = { transcript: TIMED, onSeek: vi.fn(), recordingReady: true };
+    const { rerender } = render(<SeekableTranscript {...props} activeTurnIndex={1} />);
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent(/^Now playing turn 2/);
+    rerender(<SeekableTranscript {...props} activeTurnIndex={null} />);
+    expect(status).toBeEmptyDOMElement();
+  });
+
   it('labels a turn by rounding down, the same rule as the player clock (clockText)', () => {
     render(
       <SeekableTranscript
