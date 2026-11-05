@@ -10,7 +10,7 @@ import { projectRecordingContext } from '../lib/r1/recording/context.js';
 import { toCanonicalUuid } from '../lib/r1/recording/keys.js';
 import { withRecordingAttempts } from '../lib/r1/recording/summary.js';
 import { parseR1QueueQuery, readR1Queue } from '../lib/r1/queue.js';
-import { readR1Review } from '../lib/r1/review.js';
+import { STAFF_LOCALE, readR1Review } from '../lib/r1/review.js';
 
 export const r1Router = Router();
 export const r1InternalRouter = Router();
@@ -71,14 +71,16 @@ r1Router.post('/candidates/:id/interview-rounds', requireRole('interviewer'), as
 r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (req, res, next) => { try {
   if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
   const candidate = await candidateAccess(req, res, req.params.id, false); if (!candidate) return;
-  const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
+  const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,consent_locale,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
   if (error) throw error;
+  // A staff dry run promises no decision use, so the page must be able to tell it from the candidate's own.
+  const marked = (data ?? []).map(({ consent_locale, ...round }) => ({ ...round, is_staff_dry_run: consent_locale === STAFF_LOCALE }));
   // While an appeal blocks decision use the result is withheld at read time, as the phone list does
   // (latest_recommendation / latest_score in routes/candidates.ts); the stored round is untouched.
   // status_write and pending_reject_until go with them: each gives the verdict away (0115 allows
   // pending_reject_until only on a reject). `scores_withheld` tells a reader that the nulls mean
   // withheld, not unscored, even if its copy of the candidate predates the appeal.
-  const rounds = candidate.decision_use_blocked_at != null ? (data ?? []).map((round) => ({ ...round, recommendation: null, overall: null, status_write: null, pending_reject_until: null, scores_withheld: true })) : (data ?? []);
+  const rounds = candidate.decision_use_blocked_at != null ? marked.map((round) => ({ ...round, recommendation: null, overall: null, status_write: null, pending_reject_until: null, scores_withheld: true })) : marked;
   res.json({ rounds: await withRecordingAttempts(supabase as never, rounds) });
 } catch (e) { next(e); } });
 

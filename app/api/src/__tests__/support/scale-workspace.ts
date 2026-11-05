@@ -223,6 +223,9 @@ export function seedScaleWorkspace(tables: Record<string, Row[]>, n: number): Sc
   };
 }
 
+/** Past any clock this suite runs on: the views read a link's expiry against the real time. */
+const LINK_ALIVE_UNTIL = '2099-01-01T00:00:00.000Z';
+
 export interface ScaleRounds {
   /** Round ids by the view they sit in, in sent order. */
   toReview: string[];
@@ -253,7 +256,7 @@ export function seedScaleRounds(tables: Record<string, Row[]>, n: number): Scale
     const blocked = i % 100 === 4;
     if (blocked) candidate.decision_use_blocked_at = scaleIso(i);
     t('interview_rounds').push({
-      id, candidate_id: candidate.id, status, status_write: statusWrite, expires_at: scaleIso(i, 3600), attempts_allowed: 2,
+      id, candidate_id: candidate.id, status, status_write: statusWrite, expires_at: LINK_ALIVE_UNTIL, attempts_allowed: 2,
       attempts_counted: status === 'completed' ? 1 : 0, recommendation: status === 'completed' ? 'hold' : null, overall: status === 'completed' ? 58 : null,
       pending_reject_until: null, consent_locale: dryRun ? 'en-IN-x-staff' : 'en-IN', created_at: scaleIso(i), created_by: SCALE_ADMIN_ID,
     });

@@ -19,6 +19,7 @@ import {
   reviewAttemptFrom,
   reviewDurationSec,
   reviewStage,
+  roundStatusWord,
   attemptParam,
   reviewTabFrom,
   rolePlayMarks,
@@ -351,6 +352,36 @@ describe('the needs a learner held back', () => {
   });
 });
 
+describe('roundStatusWord', () => {
+  const alive = '2026-11-06T00:00:00Z';
+  const lapsed = '2026-11-02T11:59:59Z';
+  const nobody = [{ in_progress: false }];
+  const someone = [{ in_progress: true }];
+
+  it('says a link is out while it lasts', () => {
+    expect(roundStatusWord({ status: 'invited', expires_at: alive }, [], NOW)).toBe('Link sent');
+  });
+
+  it('tells an interview running from a link nobody is on', () => {
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive }, someone, NOW)).toBe('In progress');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive }, nobody, NOW)).toBe('Link open');
+  });
+
+  it('says a lapsed link has expired, so nobody waits on it', () => {
+    expect(roundStatusWord({ status: 'invited', expires_at: lapsed }, [], NOW)).toBe('Expired');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: lapsed }, nobody, NOW)).toBe('Expired');
+  });
+
+  it('does not call an interview that outlasted its link expired', () => {
+    expect(roundStatusWord({ status: 'in_progress', expires_at: lapsed }, someone, NOW)).toBe('In progress');
+  });
+
+  it('takes a round that has ended at its word', () => {
+    expect(roundStatusWord({ status: 'completed', expires_at: lapsed }, nobody, NOW)).toBe('Completed');
+    expect(roundStatusWord({ status: 'cancelled', expires_at: lapsed }, someone, NOW)).toBe('Cancelled');
+  });
+});
+
 describe('where the round stands', () => {
   it('is withheld first: an appeal outranks everything', () => {
     expect(reviewStage(review({ round: { ...review().round, scores_withheld: true }, assessment: null }), NOW)).toBe('withheld');
@@ -409,6 +440,25 @@ describe('where the round stands', () => {
     const ended = attempt({ session_status: 'failed', counted: false, outcome: 'provider_error' });
     expect(reviewStage(review({ assessment: null, attempts: [ended], round }), NOW)).toBe('link_open');
     expect(reviewStage(review({ assessment: null, attempts: [ended, attempt({ session_id: 's2', session_status: 'in_progress', in_progress: true })], round }), NOW)).toBe('in_progress');
+  });
+
+  describe('once the link has lapsed', () => {
+    const lapsed = { expires_at: new Date(NOW - 1).toISOString() };
+
+    it('has ended, whatever the status still says: nobody can get in', () => {
+      const ended = attempt({ session_status: 'failed', counted: false, outcome: 'provider_error' });
+      expect(reviewStage(review({ assessment: null, attempts: [], round: { ...review().round, ...lapsed, status: 'invited' } }), NOW)).toBe('closed');
+      expect(reviewStage(review({ assessment: null, attempts: [ended], round: { ...review().round, ...lapsed, status: 'in_progress' } }), NOW)).toBe('closed');
+    });
+
+    it('still shows the interview that outlasted it', () => {
+      const running = attempt({ session_status: 'in_progress', in_progress: true });
+      expect(reviewStage(review({ assessment: null, attempts: [running], round: { ...review().round, ...lapsed, status: 'in_progress' } }), NOW)).toBe('in_progress');
+    });
+
+    it('keeps the result of a retake nobody took', () => {
+      expect(reviewStage(review({ round: { ...review().round, ...lapsed, status: 'invited' } }), NOW)).toBe('scored');
+    });
   });
 
   it('has ended unscored when the round closed with nothing to score', () => {

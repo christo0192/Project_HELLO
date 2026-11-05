@@ -5,17 +5,26 @@
  * every candidate, an interviewer only a candidate they own. It is a filter on the join, not a check on
  * the rows that came back, so a page and its total only ever count what this person may see.
  *
- * THE VIEWS come from `status` and `status_write`. R1 has no human-feedback record yet, so "Reviewed"
- * cannot mean that a person watched the interview. It means a status outcome has settled:
+ * THE VIEWS come from `status`, `status_write` and the link's expiry. R1 has no human-feedback record
+ * yet, so "Reviewed" cannot mean that a person watched the interview. It means a status outcome has
+ * settled:
  *
- *   in-progress  status is invited or in_progress. A retake re-opens a round, so one can carry an older
- *                result here.
- *   reviewed     status is completed or expired, and status_write is advanced, rejected (the candidate's
- *                status was written) or pending_reject_cancelled (HR overrode the rejection).
+ *   in-progress  status is invited or in_progress and the link has not lapsed. A retake re-opens a round,
+ *                so one can carry an older result here.
+ *   reviewed     completed or expired, and status_write is advanced, rejected (the candidate's status was
+ *                written) or pending_reject_cancelled (HR overrode the rejection).
  *   to-review    every other finished round: completed with any other status_write or none yet (scoring
- *                has not finished), or expired with one, which is a scored round whose retake lapsed. An
- *                expired round with no status_write never produced a result: its link lapsed unused.
- *   all          every round, cancelled ones and unused lapsed links included.
+ *                has not finished), or expired with a counted attempt, which is a round whose retake
+ *                lapsed. An expired round with nothing counted never produced a result: its link lapsed
+ *                with nobody getting through an interview.
+ *   all          every round, cancelled ones and links that lapsed with nothing counted included.
+ *
+ * EXPIRED is what the candidate routes read (`effectiveRoundStatus`): the status, or an invited or
+ * in_progress round past `expires_at`. The stored status cannot be left to say it. Only
+ * `r1_sweep_expired_rounds` writes `expired`, no job calls it yet, and it leaves a lapsed in_progress
+ * round as it is. An interview that outlasts its link reads the same way until its attempt settles
+ * (the worker's residency cap is 36 minutes): out of In progress, and in All, where its row still says
+ * it is running.
  *
  * So while auto-status is off (`flag_off`, `hold_flag`, `human_review`) a finished round stays in To
  * review until the feedback record exists. Lingering there is the safe direction: a round wrongly
@@ -67,17 +76,26 @@ const MAX_PAGES = 2;
 const SETTLED_WRITES = ['advanced', 'rejected', 'pending_reject_cancelled'] as const;
 const SETTLED_LIST = SETTLED_WRITES.join(',');
 
-/** `not.in` on a NULL is NULL, so the unwritten completed round needs its own branch. */
-const TO_REVIEW_FILTER =
-  `and(status.eq.completed,or(status_write.is.null,status_write.not.in.(${SETTLED_LIST}))),`
-  + `and(status.eq.expired,status_write.not.in.(${SETTLED_LIST}))`;
+/** The statuses a round has while its link can still be used. */
+const OPEN_STATUSES = ['invited', 'in_progress'] as const;
+const OPEN_LIST = OPEN_STATUSES.join(',');
+
+/** `not.in` on a NULL is NULL, so the unwritten round needs its own branch. */
+const UNSETTLED = `or(status_write.is.null,status_write.not.in.(${SETTLED_LIST}))`;
+
+/** A round that is over because its time ran out, stored as such or not: `effectiveRoundStatus` in SQL. */
+const expiredBranches = (nowIso: string): string =>
+  `status.eq.expired,and(status.in.(${OPEN_LIST}),expires_at.lte.${nowIso})`;
+
+const toReviewFilter = (nowIso: string): string =>
+  `and(status.eq.completed,${UNSETTLED}),and(attempts_counted.gt.0,${UNSETTLED},or(${expiredBranches(nowIso)}))`;
 
 const ROUND_COLUMNS =
   'id,candidate_id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,'
   + 'pending_reject_until,consent_locale,created_at';
 const CANDIDATE_EMBED = 'candidates!inner(name,decision_use_blocked_at)';
 const ATTEMPT_COLUMNS = 'session_id,round_id,attempt_number,counted,outcome,created_at';
-const SESSION_COLUMNS = 'id,interview_round_id,status,ended_at';
+const SESSION_COLUMNS = 'id,interview_round_id,status,started_at,ended_at';
 
 type Row = Record<string, unknown>;
 
@@ -93,7 +111,10 @@ export interface R1QueueQuery {
 
 export interface R1QueueAttempt extends R1AttemptSummary {
   in_progress: boolean;
+  session_status: string | null;
+  started_at: string | null;
   ended_at: string | null;
+  consent_withdrawn: boolean;
 }
 
 export interface R1QueueRound {
@@ -179,16 +200,17 @@ function namePattern(search: string): string | null {
 }
 
 /** The rounds this person may see in this view: a page of them, or only how many there are. */
-function roundsRead(db: R1DbClient, actor: R1StaffActor, query: R1QueueQuery) {
+function roundsRead(db: R1DbClient, actor: R1StaffActor, query: R1QueueQuery, nowMs: number) {
+  const nowIso = new Date(nowMs).toISOString();
   const filtered = (columns: string, options: { count: 'exact'; head?: boolean }) => {
     let read = db.from('interview_rounds').select(columns, options);
     if (!seesEveryCandidate(actor)) read = read.eq('candidates.owner_id', actor.id);
     if (!query.includeDryRuns) read = read.neq('consent_locale', STAFF_LOCALE);
     const pattern = namePattern(query.search);
     if (pattern !== null) read = read.ilike('candidates.name', pattern);
-    if (query.view === 'in-progress') read = read.in('status', ['invited', 'in_progress']);
-    if (query.view === 'to-review') read = read.or(TO_REVIEW_FILTER);
-    if (query.view === 'reviewed') read = read.in('status', ['completed', 'expired']).in('status_write', [...SETTLED_WRITES]);
+    if (query.view === 'in-progress') read = read.in('status', [...OPEN_STATUSES]).gt('expires_at', nowIso);
+    if (query.view === 'to-review') read = read.or(toReviewFilter(nowIso));
+    if (query.view === 'reviewed') read = read.or(`status.eq.completed,${expiredBranches(nowIso)}`).in('status_write', [...SETTLED_WRITES]);
     if (query.view === 'to-review' || query.view === 'reviewed') read = read.is('candidates.decision_use_blocked_at', null);
     return read;
   };
@@ -212,8 +234,8 @@ interface RoundsWindow {
  * view is not an error. PostgREST refuses a counted read past the end outright (PGRST103, 416), so the
  * total then needs a read of its own. Null when a read failed.
  */
-async function readRoundsWindow(db: R1DbClient, actor: R1StaffActor, query: R1QueueQuery): Promise<RoundsWindow | null> {
-  const reads = roundsRead(db, actor, query);
+async function readRoundsWindow(db: R1DbClient, actor: R1StaffActor, query: R1QueueQuery, nowMs: number): Promise<RoundsWindow | null> {
+  const reads = roundsRead(db, actor, query, nowMs);
   const readPage = (page: number) => {
     const from = (page - 1) * query.pageSize;
     return reads.page(from, from + query.pageSize - 1);
@@ -273,7 +295,7 @@ export async function readR1Queue(
 ): Promise<R1QueueResult> {
   if (!actor.active) return { kind: 'forbidden' };
   try {
-    const window = await readRoundsWindow(db, actor, query);
+    const window = await readRoundsWindow(db, actor, query, nowMs);
     if (window === null) return UNAVAILABLE;
     const roundIds = window.rows.map((round) => String(round.id));
 
@@ -308,7 +330,10 @@ export async function readR1Queue(
         counted: row.counted === true,
         outcome: text(row.outcome),
         in_progress: LIVE_SESSION_STATES.has(session?.status),
+        session_status: text(session?.status),
+        started_at: text(session?.started_at),
         ended_at: text(session?.ended_at),
+        consent_withdrawn: withdrawn,
         recording: withdrawn ? withdrawnSummary(summary) : summary,
       });
     }

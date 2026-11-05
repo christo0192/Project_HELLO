@@ -1507,7 +1507,7 @@ function r1QueueRound(n: number, name: string, over: Partial<R1QueueRound>): R1Q
     candidate_id: uid('c', 100 + n),
     candidate_name: name,
     status: 'completed',
-    expires_at: ago((10 - n) * DAY - 3 * DAY),
+    expires_at: completed ? ago((10 - n) * DAY - 3 * DAY) : iso(FROZEN_NOW_MS + 1 * DAY),
     attempts_allowed: 2,
     attempts_counted: completed ? 1 : 0,
     recommendation: null,
@@ -1518,7 +1518,7 @@ function r1QueueRound(n: number, name: string, over: Partial<R1QueueRound>): R1Q
     is_staff_dry_run: false,
     created_at: ago((10 - n) * DAY),
     attempts: completed
-      ? [{ session_id: uid('3', 950 + n), attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, ended_at: ago((9 - n) * DAY), recording: r1Recording({}) }]
+      ? [{ session_id: uid('3', 950 + n), attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, session_status: 'completed', started_at: null, ended_at: ago((9 - n) * DAY), consent_withdrawn: false, recording: r1Recording({}) }]
       : [],
     ...over,
   };
@@ -1531,7 +1531,7 @@ const R1_QUEUE: R1QueueRound[] = [
   r1QueueRound(2, 'Arjun Rao', { status_write: 'human_review' }),
   r1QueueRound(3, 'Isha Kulkarni', { recommendation: 'advance', overall: 81, status_write: 'advanced' }),
   r1QueueRound(4, 'Meera Iyer', { status: 'invited' }),
-  r1QueueRound(5, 'Wei Zhang', { status: 'in_progress', attempts: [{ session_id: uid('3', 960), attempt_number: 1, counted: false, outcome: null, in_progress: true, ended_at: null, recording: r1Recording({ state: 'recording' }) }] }),
+  r1QueueRound(5, 'Wei Zhang', { status: 'in_progress', attempts: [{ session_id: uid('3', 960), attempt_number: 1, counted: false, outcome: null, in_progress: true, session_status: 'in_progress', started_at: ago(10 * 60_000), ended_at: null, consent_withdrawn: false, recording: r1Recording({ state: 'recording' }) }] }),
   r1QueueRound(6, 'Tanvi Joshi', { scores_withheld: true, is_staff_dry_run: false }),
   r1QueueRound(7, 'Omar Haddad', { recommendation: 'hold', overall: 49, status_write: 'hold_flag', is_staff_dry_run: true }),
 ];

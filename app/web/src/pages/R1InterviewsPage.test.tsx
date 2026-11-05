@@ -19,12 +19,12 @@ vi.mock('../api', () => ({
 }));
 
 const attempt = (over: Partial<R1QueueAttempt> = {}): R1QueueAttempt => ({
-  session_id: 'session-1', attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, ended_at: '2026-11-02T10:30:00.000Z',
-  recording: { state: 'ready' }, ...over,
+  session_id: 'session-1', attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, session_status: 'completed', started_at: null,
+  ended_at: '2026-11-02T10:30:00.000Z', consent_withdrawn: false, recording: { state: 'ready' }, ...over,
 });
 
 const round = (over: Partial<R1QueueRound> = {}): R1QueueRound => ({
-  id: 'round-1', candidate_id: 'cand-1', candidate_name: 'Ava Example', status: 'completed', expires_at: '2026-11-04T10:00:00.000Z',
+  id: 'round-1', candidate_id: 'cand-1', candidate_name: 'Ava Example', status: 'completed', expires_at: '2099-01-01T00:00:00.000Z',
   attempts_allowed: 2, attempts_counted: 1, recommendation: 'hold', overall: 58, status_write: 'hold_flag', pending_reject_until: null,
   scores_withheld: false, is_staff_dry_run: false, created_at: '2026-11-01T10:00:00.000Z', attempts: [attempt()], ...over,
 });
@@ -147,12 +147,32 @@ describe('a row', () => {
     expect(row).toHaveTextContent('Link open');
   });
 
-  it('names the recording of the latest attempt, and has no chip for a link nobody used', async () => {
-    const retake = round({ attempts: [attempt(), attempt({ session_id: 'session-2', attempt_number: 2, recording: { state: 'failed' } })] });
+  it('reads a lapsed link as expired, not as one to wait on', async () => {
+    const lapsed = round({ status: 'in_progress', expires_at: '2026-11-04T10:00:00.000Z', recommendation: null, overall: null, status_write: null, attempts: [attempt({ counted: false })] });
+    mockApi.listR1Queue.mockResolvedValue(answer({ view: 'all', sort: 'newest', rounds: [lapsed] }));
+    open('?view=all');
+    const row = (await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')!;
+    expect(row).toHaveTextContent('Expired');
+    expect(row).not.toHaveTextContent('Link open');
+  });
+
+  it('says a round that will never be scored is not scored, not that scoring is on its way', async () => {
+    const withdrawn = attempt({ consent_withdrawn: true, ended_at: new Date().toISOString(), recording: { state: 'deleted', reason: 'consent_withdrawn' } });
+    mockApi.listR1Queue.mockResolvedValue(answer({ rounds: [round({ recommendation: null, overall: null, status_write: null, attempts: [withdrawn] })] }));
+    open();
+    const row = (await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')!;
+    expect(row).toHaveTextContent('Not scored');
+    expect(row).not.toHaveTextContent('Not scored yet');
+  });
+
+  it('names a recording that exists over a retake that left none, and has no chip for a link nobody used', async () => {
+    const retake = round({ attempts: [attempt(), attempt({ session_id: 'session-2', attempt_number: 2, counted: false, recording: { state: 'none' } })] });
     const unused = round({ id: 'round-2', candidate_name: 'Bela Example', status: 'invited', recommendation: null, overall: null, status_write: null, attempts: [] });
     mockApi.listR1Queue.mockResolvedValue(answer({ total: 2, rounds: [retake, unused] }));
     open();
-    expect((await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')).toHaveTextContent('Unavailable');
+    const row = (await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')!;
+    expect(row).toHaveTextContent('Ready');
+    expect(row).not.toHaveTextContent('No recording');
     expect(screen.getByRole('link', { name: 'Bela Example' }).closest('tr')).not.toHaveTextContent('No recording');
   });
 });

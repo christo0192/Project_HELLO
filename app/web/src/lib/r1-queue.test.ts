@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { queuePageFrom, queueSortFrom, queueSummary, queueViewFrom, r1ResultWords } from './r1-queue';
-import type { R1QueueRound } from './r1-types';
+import { queuePageFrom, queueRecordingWords, queueSortFrom, queueSummary, queueViewFrom, r1ResultWords } from './r1-queue';
+import { R1_SCORE_WAIT_MS } from './r1-review';
+import type { R1QueueAttempt, R1QueueRound, R1RecordingState } from './r1-types';
+
+const NOW = Date.parse('2026-11-02T12:00:00Z');
+const ago = (ms: number): string => new Date(NOW - ms).toISOString();
+
+function attempt(over: Partial<R1QueueAttempt> = {}): R1QueueAttempt {
+  return {
+    session_id: 's1', attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, session_status: 'completed', started_at: null,
+    ended_at: ago(60_000), consent_withdrawn: false, recording: { state: 'ready' }, ...over,
+  };
+}
 
 function row(over: Partial<R1QueueRound> = {}): R1QueueRound {
   return {
@@ -41,22 +52,78 @@ describe('queueSummary', () => {
 
 describe('r1ResultWords', () => {
   it('gives a verdict for a scored round', () => {
-    expect(r1ResultWords(row())).toEqual({ kind: 'verdict', verdict: { word: 'Borderline', mark: 'half', overall: 58 } });
+    expect(r1ResultWords(row(), NOW)).toEqual({ kind: 'verdict', verdict: { word: 'Borderline', mark: 'half', overall: 58 } });
   });
 
   it('says it is withheld before anything else, and never a score', () => {
-    expect(r1ResultWords(row({ scores_withheld: true }))).toEqual({ kind: 'text', text: 'Scorecards are suppressed while an appeal is under review.' });
+    expect(r1ResultWords(row({ scores_withheld: true }), NOW)).toEqual({ kind: 'text', text: 'Scorecards are suppressed while an appeal is under review.' });
   });
 
   it('says a round the scorer would not score was not scored', () => {
-    expect(r1ResultWords(row({ recommendation: null, overall: null, status_write: 'human_review' }))).toEqual({ kind: 'text', text: 'Not scored' });
+    expect(r1ResultWords(row({ recommendation: null, overall: null, status_write: 'human_review' }), NOW)).toEqual({ kind: 'text', text: 'Not scored' });
   });
 
-  it('says scoring has not finished on a finished round with no result yet', () => {
-    expect(r1ResultWords(row({ recommendation: null, overall: null, status_write: null }))).toEqual({ kind: 'text', text: 'Not scored yet' });
+  it('prints no figure the checks refused', () => {
+    expect(r1ResultWords(row({ recommendation: null, overall: 42, status_write: 'human_review' }), NOW)).toEqual({ kind: 'text', text: 'Not scored' });
+  });
+
+  describe('a finished round with no result', () => {
+    const unscored = (attempts: R1QueueAttempt[]) => row({ recommendation: null, overall: null, status_write: null, attempts });
+
+    it('is waiting for its score while one can still arrive', () => {
+      expect(r1ResultWords(unscored([attempt()]), NOW)).toEqual({ kind: 'text', text: 'Not scored yet' });
+      expect(r1ResultWords(unscored([attempt({ ended_at: ago(R1_SCORE_WAIT_MS - 1) })]), NOW)).toEqual({ kind: 'text', text: 'Not scored yet' });
+    });
+
+    it('stops waiting when the review page does', () => {
+      expect(r1ResultWords(unscored([attempt({ ended_at: ago(R1_SCORE_WAIT_MS) })]), NOW)).toEqual({ kind: 'text', text: 'Not scored' });
+    });
+
+    it('never promises a score once consent is withdrawn, which stops the scoring', () => {
+      expect(r1ResultWords(unscored([attempt({ consent_withdrawn: true })]), NOW)).toEqual({ kind: 'text', text: 'Not scored' });
+    });
+
+    it('has no job for an attempt that failed uncounted', () => {
+      expect(r1ResultWords(unscored([attempt({ session_status: 'failed', counted: false })]), NOW)).toEqual({ kind: 'text', text: 'Not scored' });
+    });
+
+    it('is not waiting on nothing', () => {
+      expect(r1ResultWords(unscored([]), NOW)).toEqual({ kind: 'text', text: 'Not scored' });
+    });
   });
 
   it.each(['invited', 'in_progress', 'cancelled', 'expired'] as const)('has nothing to say for a %s round with no result', (status) => {
-    expect(r1ResultWords(row({ status, recommendation: null, overall: null, status_write: null }))).toEqual({ kind: 'text', text: 'No result' });
+    expect(r1ResultWords(row({ status, recommendation: null, overall: null, status_write: null }), NOW)).toEqual({ kind: 'text', text: 'No result' });
+  });
+});
+
+describe('queueRecordingWords', () => {
+  const states = (...list: R1RecordingState[]) => ({
+    attempts: list.map((state, index) => attempt({ session_id: `s${index}`, recording: { state } })),
+  });
+
+  it('has nothing to say before an attempt', () => {
+    expect(queueRecordingWords({ attempts: [] })).toBeNull();
+  });
+
+  it('does not let a retake that left nothing hide the recording that exists', () => {
+    expect(queueRecordingWords(states('ready', 'none'))).toBe('Ready');
+  });
+
+  it('names a recording to watch over a later one that cannot be', () => {
+    expect(queueRecordingWords(states('ready', 'failed'))).toBe('Ready');
+    expect(queueRecordingWords(states('partial', 'deleted'))).toBe('Partial');
+  });
+
+  it('takes the latest of two to watch', () => {
+    expect(queueRecordingWords(states('ready', 'partial'))).toBe('Partial');
+  });
+
+  it('says what became of a recording when none can be watched', () => {
+    expect(queueRecordingWords(states('failed', 'none'))).toBe('Unavailable');
+  });
+
+  it('says there is none when no attempt left one', () => {
+    expect(queueRecordingWords(states('none', 'none'))).toBe('No recording');
   });
 });

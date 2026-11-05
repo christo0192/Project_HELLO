@@ -270,6 +270,8 @@ export interface R1Round {
   scores_withheld?: boolean;
   /** What the scorer did with the round (`human_review`: it would not score it). Null while withheld. */
   status_write?: string | null;
+  /** On the staff notice, which promises no decision use. Absent from an older API. */
+  is_staff_dry_run?: boolean;
   created_at: string;
   created_by?: string;
   /** One entry per attempt, each with its recording summary. Absent from an older API. */
@@ -300,7 +302,11 @@ export interface R1QueueQuery {
 export interface R1QueueAttempt extends R1AttemptSummary {
   /** The interview has not ended. */
   in_progress: boolean;
+  session_status: string | null;
+  started_at: string | null;
   ended_at: string | null;
+  /** Consent was withdrawn or declined after this attempt, which stops its scoring. */
+  consent_withdrawn: boolean;
 }
 
 /** One row. While `scores_withheld` is true the result fields are null: withheld, not unscored. */

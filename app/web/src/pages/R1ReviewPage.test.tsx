@@ -85,7 +85,7 @@ const assessment = (over: Partial<R1ReviewAssessment> = {}): R1ReviewAssessment 
 
 const review = (over: Partial<R1ReviewResponse> = {}): R1ReviewResponse => ({
   round: {
-    id: ROUND, candidate_id: CANDIDATE, status: 'completed', expires_at: '2026-11-06T00:00:00.000Z', attempts_allowed: 2, attempts_counted: 1,
+    id: ROUND, candidate_id: CANDIDATE, status: 'completed', expires_at: '2099-01-01T00:00:00.000Z', attempts_allowed: 2, attempts_counted: 1,
     recommendation: 'hold', overall: 58, status_write: null, pending_reject_until: null, scores_withheld: false, is_staff_dry_run: false,
     created_at: '2026-11-01T00:00:00.000Z', created_by: 'user-1',
   },
@@ -489,6 +489,16 @@ describe('Overview, in every other state', () => {
     expect(chips).toHaveTextContent('Link open');
     expect(chips).not.toHaveTextContent('In progress');
     noResult();
+  });
+
+  it('a link past its expiry: nobody is told to wait on it, whatever the stored status says', async () => {
+    const lapsed = waiting();
+    await opened({ ...lapsed, round: { ...lapsed.round, expires_at: '2026-11-04T00:00:00.000Z' } });
+    expect(panel('Overview')).toHaveTextContent('This round ended without a scored interview.');
+    expect(panel('Overview')).not.toHaveTextContent(/Link valid until/);
+    const chips = screen.getByRole('list', { name: 'About this interview' });
+    expect(chips).toHaveTextContent('Expired');
+    expect(chips).not.toHaveTextContent('Link open');
   });
 
   it('an attempt that ended uncounted: Check again sees a new start, because the page does not poll', async () => {

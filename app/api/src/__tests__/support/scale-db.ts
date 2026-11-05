@@ -213,7 +213,10 @@ function leafTest(row: Row, column: string, op: string, value: string): boolean 
   if (actual === null || actual === undefined) return null;
   if (op === 'eq') return String(actual) === value;
   if (op === 'neq') return String(actual) !== value;
-  return splitTopLevel(value.slice(1, -1)).includes(String(actual));
+  if (op === 'in') return splitTopLevel(value.slice(1, -1)).includes(String(actual));
+  // Every value in the grammar is text: a number column still compares as a number.
+  const c = compareNonNull(actual, typeof actual === 'number' ? Number(value) : value);
+  return op === 'gt' ? c > 0 : op === 'gte' ? c >= 0 : op === 'lt' ? c < 0 : c <= 0;
 }
 
 /** One item of PostgREST's logic grammar: `and(...)`, `or(...)` or `column[.not].op.value`. */
@@ -223,7 +226,7 @@ function logicItem(item: string): (r: Row) => boolean {
     const items = splitTopLevel(group[2]).map(logicItem);
     return group[1] === 'and' ? (r) => items.every((f) => f(r)) : (r) => items.some((f) => f(r));
   }
-  const leaf = /^([\w.]+?)\.(not\.)?(eq|neq|is|in)\.(.*)$/.exec(item);
+  const leaf = /^([\w.]+?)\.(not\.)?(eq|neq|is|in|gte|gt|lte|lt)\.(.*)$/.exec(item);
   if (!leaf) throw new Error(`scale-db: .or() item ${item} is not modelled`);
   const [, column, negated, op, value] = leaf;
   return (r) => {

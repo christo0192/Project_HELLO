@@ -76,19 +76,28 @@ export const R1_RESULT_WITHHELD = 'Scorecards are suppressed while an appeal is 
 /**
  * The line under the phone score in the candidate header, from the newest round with a result (the
  * rounds arrive newest first). Null when there is none, or while the result is withheld.
+ *
+ * A result is a recommendation. Only a valid gated score carries one (0122): `overall` alone is the
+ * figure of an interview that failed its checks, which the review page calls not scored. A staff dry
+ * run promises no decision use, so its result is never the candidate's.
  */
 export function r1ResultLine(rounds: readonly R1Round[]): string | null {
-  const round = rounds.find((item) => item.recommendation !== null || item.overall !== null);
-  if (!round || round.scores_withheld === true) return null;
-  const words = [
-    round.recommendation ? R1_RECOMMENDATION_LABEL[round.recommendation] : null,
-    round.overall === null ? null : String(Math.round(round.overall)),
-  ];
-  return `R1 role-play: ${words.filter(Boolean).join(' ')} (AI)`;
+  const round = rounds.find((item) => item.recommendation !== null && item.is_staff_dry_run !== true);
+  if (!round?.recommendation || round.scores_withheld === true) return null;
+  const figure = round.overall === null ? '' : ` ${Math.round(round.overall)}`;
+  return `R1 role-play: ${R1_RECOMMENDATION_LABEL[round.recommendation]}${figure} (AI)`;
 }
 
 export function isLiveRound(round: Pick<R1Round, 'status'>): boolean {
   return round.status === 'invited' || round.status === 'in_progress';
+}
+
+/**
+ * Whether a live round's link has passed its expiry. The stored status does not catch up (no job writes
+ * `expired` yet), so this is what the candidate's own page and the queue's views go by.
+ */
+export function linkLapsed(round: Pick<R1Round, 'status'> & { expires_at: string | null }, nowMs: number): boolean {
+  return isLiveRound(round) && round.expires_at !== null && Date.parse(round.expires_at) <= nowMs;
 }
 
 /** Reissue replaces the link, which only exists while nothing has started. */

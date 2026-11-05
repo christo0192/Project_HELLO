@@ -369,8 +369,10 @@ ends: cancel and expiry refund it from the month that booked it, exactly once
 round, so deleting an attempt row by retention cannot cause a second charge).
 `r1_sweep_expired_rounds` also releases the hold or uncounted charge of a round
 that is still `in_progress` (or already terminal) with a lapsed link, without
-changing its status. The sweep is scheduled by the PR-8 `r1.sweep` job; capacity
-decisions never depend on it, because the snapshot already ignores lapsed links.
+changing its status. **No job calls this function yet:** the `r1.sweep` job handles
+recordings only, so a lapsed link keeps its stored status. Nothing waits on it:
+capacity decisions read the snapshot, which already ignores lapsed links, and the
+candidate routes and the R1 queue read a lapsed round as expired.
 
 **Worker contract for counting (PR-4 and PR-8).** The no-show derivation treats a
 round with `charged_attempt_number > attempts_counted` and no live session as a

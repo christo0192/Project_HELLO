@@ -418,10 +418,12 @@ const ROUTES: Array<[string, string, Handler]> = [
     const size = Number(query.get('page_size') ?? 25);
     const settled = (write: string | null) => write === 'advanced' || write === 'rejected' || write === 'pending_reject_cancelled';
     const inView = (round: Dataset['r1']['queue'][number]) => {
-      const live = round.status === 'invited' || round.status === 'in_progress';
-      if (view === 'in-progress') return live;
+      const open = round.status === 'invited' || round.status === 'in_progress';
+      const lapsed = open && Date.parse(round.expires_at ?? '') <= FROZEN_NOW_MS;
+      if (view === 'in-progress') return open && !lapsed;
       if (view === 'all') return true;
-      if (round.scores_withheld || round.status !== 'completed') return false;
+      const finished = round.status === 'completed' || ((round.status === 'expired' || lapsed) && round.attempts_counted > 0);
+      if (round.scores_withheld || !finished) return false;
       return view === 'reviewed' ? settled(round.status_write) : !settled(round.status_write);
     };
     const rows = db.r1.queue

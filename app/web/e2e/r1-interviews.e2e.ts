@@ -106,6 +106,22 @@ test.describe('the queue', () => {
     app.expectHealthy();
   });
 
+  test('a lapsed link leaves In progress and reads Expired, and a lapsed retake comes back to To review', async ({ app, page }) => {
+    const lapsed = new Date(Date.parse(app.db.r1.queue[0].created_at)).toISOString();
+    const byName = (name: string) => app.db.r1.queue.find((round) => round.candidate_name === name)!;
+    Object.assign(byName('Meera Iyer'), { expires_at: lapsed });
+    Object.assign(byName('Wei Zhang'), { status: 'invited', attempts_counted: 1, recommendation: 'hold', overall: 58, status_write: 'hold_flag', expires_at: lapsed, attempts: [] });
+
+    await app.goto('/interviews?view=in-progress');
+    await expect(page.getByTestId('queue-summary')).toHaveText('0 interviews in progress');
+    await page.getByRole('button', { name: 'To review' }).click();
+    await expect(page.getByRole('row').filter({ hasText: 'Wei Zhang' })).toContainText('Expired');
+    await expect(page.getByRole('link', { name: 'Meera Iyer' })).toHaveCount(0);
+    await page.getByRole('button', { name: 'All' }).click();
+    await expect(page.getByRole('row').filter({ hasText: 'Meera Iyer' })).toContainText('Expired');
+    app.expectHealthy();
+  });
+
   test('a staff dry run shows only when asked for, and is marked', async ({ app, page }) => {
     await app.goto('/interviews?view=all');
     await expect(page.getByRole('link', { name: 'Tanvi Joshi' })).toBeVisible();

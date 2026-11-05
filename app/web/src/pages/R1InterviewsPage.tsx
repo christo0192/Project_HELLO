@@ -36,19 +36,19 @@ import { VerdictMark } from '../components/r1-review/VerdictBlock';
 import { CandidateShell } from '../components/talent/CandidateShell';
 import { candidateDisplayName } from '../components/talent/ResumeReviewBadge';
 import { formatDate, formatDateTime, formatRelative } from '../lib/datetime';
-import { attemptsLabel, r1StatusLabel } from '../lib/r1';
-import { r1RecordingStateCopy } from '../lib/r1-recording';
+import { attemptsLabel } from '../lib/r1';
 import {
   R1_QUEUE_SORT_OPTIONS,
   R1_QUEUE_VIEW_OPTIONS,
   defaultQueueSort,
   queuePageFrom,
+  queueRecordingWords,
   queueSortFrom,
   queueSummary,
   queueViewFrom,
   r1ResultWords,
 } from '../lib/r1-queue';
-import { roundIsRunning } from '../lib/r1-review';
+import { roundStatusWord } from '../lib/r1-review';
 import type { R1QueueResponse, R1QueueRound, R1QueueSort, R1QueueView } from '../lib/r1-types';
 
 /** How long the typing must stop before a search goes to the API. */
@@ -76,8 +76,8 @@ function messageOf(error: unknown): string {
 
 const RESULT_CELL = 'inline-flex items-center gap-2 whitespace-nowrap';
 
-function ResultCell({ round }: { round: R1QueueRound }) {
-  const result = r1ResultWords(round);
+function ResultCell({ round, nowMs }: { round: R1QueueRound; nowMs: number }) {
+  const result = r1ResultWords(round, nowMs);
   if (result.kind === 'text') return <span className="text-label text-ink-secondary">{result.text}</span>;
   const { word, mark, overall } = result.verdict;
   return (
@@ -89,10 +89,6 @@ function ResultCell({ round }: { round: R1QueueRound }) {
   );
 }
 
-function statusWord(round: R1QueueRound): string {
-  return round.status === 'in_progress' && !roundIsRunning(round.attempts) ? 'Link open' : r1StatusLabel(round.status);
-}
-
 /** The last attempt to end, for "Ended 2 days ago". */
 function lastEnded(round: R1QueueRound): string | null {
   return round.attempts.reduce<string | null>((latest, attempt) => {
@@ -101,14 +97,11 @@ function lastEnded(round: R1QueueRound): string | null {
   }, null);
 }
 
-function recordingWords(round: R1QueueRound): string | null {
-  const latest = round.attempts[round.attempts.length - 1];
-  return latest ? r1RecordingStateCopy(latest.recording).tag : null;
-}
-
 function QueueRow({ round }: { round: R1QueueRound }) {
   const name = candidateDisplayName(round.candidate_name);
-  const recording = recordingWords(round);
+  const nowMs = Date.now();
+  const status = roundStatusWord(round, round.attempts, nowMs);
+  const recording = queueRecordingWords(round);
   const ended = lastEnded(round);
   const pending = round.pending_reject_until;
   return (
@@ -123,13 +116,13 @@ function QueueRow({ round }: { round: R1QueueRound }) {
         {round.is_staff_dry_run && <span className="ml-2"><Tag>Staff dry run</Tag></span>}
         {/* The columns this width has no room for, in one line. */}
         <p className="mt-0.5 text-meta text-ink-tertiary md:hidden">
-          {[statusWord(round), attemptsLabel(round), recording ? `Recording: ${recording}` : null].filter(Boolean).join(' · ')}
+          {[status, attemptsLabel(round), recording ? `Recording: ${recording}` : null].filter(Boolean).join(' · ')}
         </p>
         {pending && <p className="text-meta text-ink-tertiary md:hidden">Rejection pending until {formatDateTime(pending)}</p>}
       </Td>
-      <Td className="py-2.5"><ResultCell round={round} /></Td>
+      <Td className="py-2.5"><ResultCell round={round} nowMs={nowMs} /></Td>
       <Td className="hidden py-2.5 md:table-cell">
-        <span className="text-label">{statusWord(round)}</span>
+        <span className="text-label">{status}</span>
         {pending && <p className="text-meta text-ink-tertiary">Rejection pending until {formatDateTime(pending)}</p>}
       </Td>
       <Td className="hidden whitespace-nowrap py-2.5 text-label text-ink-secondary md:table-cell">{attemptsLabel(round)}</Td>

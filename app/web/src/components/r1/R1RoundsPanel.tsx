@@ -6,6 +6,9 @@
  * the scorer has written one. Until scoring ships (PR-5) the recommendation
  * and score are null, and the row says so in words instead of leaving a gap.
  * While an appeal blocks decision use the result reads as withheld instead.
+ * The result stays on the row through a retake, which re-opens the round.
+ * A score with no recommendation is not a result: only a valid gated score
+ * carries one (0122), so that figure never prints here.
  *
  * Row actions (an admin, or the interviewer who created the round: the API's own
  * rule, so nobody is offered a button that can only answer 403):
@@ -203,9 +206,15 @@ export function R1RoundsPanel({
     <ul aria-label="R1 rounds" className="divide-y divide-line">
       {rounds.map((round) => {
         const live = round.status === 'invited' || round.status === 'in_progress';
-        const scored = round.recommendation !== null || round.overall !== null;
+        const notScored =
+          round.recommendation === null &&
+          (round.status_write === 'human_review' || round.overall !== null);
         const withheld = decisionBlocked || round.scores_withheld === true;
-        const showsResult = round.status === 'completed' || round.status === 'in_progress';
+        const showsResult =
+          round.recommendation !== null ||
+          notScored ||
+          round.status === 'completed' ||
+          round.status === 'in_progress';
         const active = pending?.roundId === round.id ? pending : null;
         const headingId = `r1-round-${uid}-${round.id}`;
         // One recording chip per attempt, in attempt order (the API sends them that way). An older
@@ -226,6 +235,7 @@ export function R1RoundsPanel({
               <Tag tone={r1StatusTone(round.status)} srPrefix="Status:">
                 {r1StatusLabel(round.status)}
               </Tag>
+              {round.is_staff_dry_run === true && <Tag>Staff dry run</Tag>}
               <span className="text-label text-ink-secondary">{attemptsLabel(round)}</span>
               <Link
                 to={`/interviews/${round.id}`}
@@ -245,15 +255,10 @@ export function R1RoundsPanel({
               <p className="mt-1 text-label text-ink-secondary">
                 {withheld ? (
                   R1_RESULT_WITHHELD
-                ) : scored ? (
-                  <>
-                    {round.recommendation
-                      ? `AI recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}`
-                      : null}
-                    {round.recommendation && round.overall !== null ? ' · ' : null}
-                    {round.overall !== null ? `Overall ${round.overall} of 100` : null}
-                  </>
-                ) : round.status_write === 'human_review' ? (
+                ) : round.recommendation !== null ? (
+                  `AI recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}` +
+                  (round.overall !== null ? ` · Overall ${round.overall} of 100` : '')
+                ) : notScored ? (
                   'AI result: not scored. Open the R1 review for the reason.'
                 ) : (
                   'No results yet. The scorecard and recommendation will appear here once R1 ' +

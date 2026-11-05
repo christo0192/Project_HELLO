@@ -15,6 +15,7 @@ vi.mock('../lib/supabase.js', async () => {
   return { supabase: scaleDb.client, RESUME_BUCKET: 'resumes_v2' };
 });
 
+import { parseR1QueueQuery, readR1Queue } from '../lib/r1/queue.js';
 import { r1Router } from '../routes/r1.js';
 import { scaleDb as engine, type Row } from './support/scale-db.js';
 
@@ -26,13 +27,16 @@ const roundId = (i: number): string => `20000000-0000-4000-8000-${pad(i)}`;
 const sessionId = (i: number, start = 0): string => `30000000-0000-4000-8000-${pad(i * 10 + start)}`;
 /** Round i was sent i days after 2026-10-01. */
 const sentAt = (i: number): string => new Date(Date.UTC(2026, 9, 1 + i)).toISOString();
+/** The views read a link's expiry against the real clock. */
+const LINK_ALIVE = '2099-01-01T00:00:00.000Z';
+const LINK_LAPSED = '2026-10-04T00:00:00.000Z';
 
 function addRound(i: number, over: Row = {}, candidateOver: Row = {}): void {
   (engine.tables.candidates ??= []).push({
     id: candidateId(i), owner_id: OWNER, name: `Candidate ${i}`, email: `c${i}@example.com`, decision_use_blocked_at: null, ...candidateOver,
   });
   (engine.tables.interview_rounds ??= []).push({
-    id: roundId(i), candidate_id: candidateId(i), status: 'completed', expires_at: sentAt(i + 3), attempts_allowed: 2, attempts_counted: 1,
+    id: roundId(i), candidate_id: candidateId(i), status: 'completed', expires_at: LINK_ALIVE, attempts_allowed: 2, attempts_counted: 1,
     recommendation: 'hold', overall: 58, status_write: 'hold_flag', pending_reject_until: null, consent_locale: 'en-IN',
     created_at: sentAt(i), created_by: OWNER, link_token_digest: 'd'.repeat(64), status_write_audit: { secret: 'SECRET-AUDIT' }, ...over,
   });
@@ -109,6 +113,70 @@ describe('the views', () => {
     expect(rowIds((await list('?view=to-review')).body)).toEqual([roundId(0)]);
     expect(rowIds((await list('?view=reviewed')).body)).toEqual([roundId(2)]);
     expect((await list('?view=all')).body.total).toBe(3);
+  });
+
+  describe('a link that has lapsed, whatever the status still says', () => {
+    const IN_VIEW = ['to-review', 'in-progress', 'reviewed'] as const;
+
+    /** Which of the three views hold each round. */
+    async function viewsOf(): Promise<Record<string, unknown[]>> {
+      const seen: Record<string, unknown[]> = {};
+      for (const view of IN_VIEW) seen[view] = rowIds((await list(`?view=${view}&sort=oldest`)).body);
+      return seen;
+    }
+
+    it('leaves In progress when nothing was counted, and stays only in All', async () => {
+      addRound(0, { status: 'invited', status_write: null, attempts_counted: 0, recommendation: null, overall: null, expires_at: LINK_LAPSED });
+      addRound(1, { status: 'in_progress', status_write: null, attempts_counted: 0, recommendation: null, overall: null, expires_at: LINK_LAPSED });
+      addAttempt(1, 0, { counted: false, outcome: 'provider_error' }, { status: 'failed' }, null);
+      expect(await viewsOf()).toEqual({ 'to-review': [], 'in-progress': [], reviewed: [] });
+      expect((await list('?view=all')).body.total).toBe(2);
+    });
+
+    it.each(['invited', 'in_progress'])('brings a scored round whose retake lapsed back to To review, from %s', async (status) => {
+      addRound(0, { status, status_write: 'hold_flag', expires_at: LINK_LAPSED });
+      expect(await viewsOf()).toEqual({ 'to-review': [roundId(0)], 'in-progress': [], reviewed: [] });
+    });
+
+    it('brings back a round that was never scored, as it was before the retake', async () => {
+      addRound(0, { status: 'invited', status_write: null, recommendation: null, overall: null, expires_at: LINK_LAPSED });
+      expect(await viewsOf()).toEqual({ 'to-review': [roundId(0)], 'in-progress': [], reviewed: [] });
+    });
+
+    it('puts a settled round whose retake lapsed in Reviewed', async () => {
+      addRound(0, { status: 'invited', status_write: 'advanced', expires_at: LINK_LAPSED });
+      expect(await viewsOf()).toEqual({ 'to-review': [], 'in-progress': [], reviewed: [roundId(0)] });
+    });
+
+    it('keeps a round with a live link in In progress, with its older result', async () => {
+      addRound(0, { status: 'invited', status_write: 'hold_flag' });
+      expect(await viewsOf()).toEqual({ 'to-review': [], 'in-progress': [roundId(0)], reviewed: [] });
+    });
+
+    it('gives nothing away for a blocked candidate, once the link has lapsed too', async () => {
+      addRound(0, { status: 'invited', status_write: 'hold_flag', expires_at: LINK_LAPSED }, { decision_use_blocked_at: '2026-11-03T00:00:00Z' });
+      expect(await viewsOf()).toEqual({ 'to-review': [], 'in-progress': [], reviewed: [] });
+      expect((await list('?view=all')).body.total).toBe(1);
+    });
+
+    it('leaves an interview that outlasted its link in All, where its attempt says it is running', async () => {
+      addRound(0, { status: 'in_progress', status_write: null, attempts_counted: 0, recommendation: null, overall: null, expires_at: LINK_LAPSED });
+      addAttempt(0, 0, { counted: false, outcome: null }, { status: 'in_progress', ended_at: null });
+      expect(await viewsOf()).toEqual({ 'to-review': [], 'in-progress': [], reviewed: [] });
+      expect((await list('?view=all')).body.rounds[0].attempts[0].in_progress).toBe(true);
+    });
+
+    it('takes the instant of expiry as lapsed, as the candidate routes do', async () => {
+      addRound(0, { status: 'invited', status_write: null, attempts_counted: 0, expires_at: LINK_LAPSED });
+      const actor = { id: OWNER, appRole: 'admin', active: true } as const;
+      const inProgress = parseR1QueueQuery({ view: 'in-progress' })!;
+      const at = async (ms: number) => {
+        const result = await readR1Queue(engine.client as never, actor, inProgress, ms);
+        return result.kind === 'ok' ? result.body.total : null;
+      };
+      expect(await at(Date.parse(LINK_LAPSED) - 1)).toBe(1);
+      expect(await at(Date.parse(LINK_LAPSED))).toBe(0);
+    });
   });
 
   it('Reviewed is the rounds a status write settled, newest first', async () => {
@@ -288,7 +356,9 @@ describe('a row', () => {
       scores_withheld: false, is_staff_dry_run: false, created_at: sentAt(0),
     });
     expect(row.attempts.map((attempt: Row) => attempt.session_id)).toEqual([sessionId(0, 0), sessionId(0, 1)]);
-    expect(row.attempts[0]).toMatchObject({ attempt_number: 1, counted: true, outcome: 'complete', ended_at: sentAt(1), in_progress: false, recording: { state: 'none' } });
+    expect(row.attempts[0]).toMatchObject({
+      attempt_number: 1, counted: true, outcome: 'complete', session_status: 'completed', ended_at: sentAt(1), in_progress: false, consent_withdrawn: false, recording: { state: 'none' },
+    });
     expect(row.attempts[1].recording).toMatchObject({ state: 'partial', has_video: true, duration_ms: 1_500_000 });
   });
 
@@ -324,6 +394,15 @@ describe('a row', () => {
     engine.tables.interview_round_consents = [{ round_id: roundId(0), withdrawn_at: sentAt(5), proof: { decision: 'withdrawn' } }];
     const { body } = await list();
     expect(body.rounds[0].attempts[0].recording).toMatchObject({ state: 'deleted', reason: 'consent_withdrawn', duration_ms: null });
+    expect(body.rounds[0].attempts[0].consent_withdrawn).toBe(true);
+  });
+
+  it('says consent was withdrawn for an attempt that left no recording, which has nothing else to show it', async () => {
+    addRound(0);
+    addAttempt(0, 0, {}, {}, null);
+    engine.tables.interview_round_consents = [{ round_id: roundId(0), withdrawn_at: sentAt(5), proof: { decision: 'withdrawn' } }];
+    const { body } = await list();
+    expect(body.rounds[0].attempts[0]).toMatchObject({ consent_withdrawn: true, recording: { state: 'none' } });
   });
 
   it('leaves a recording alone when a consent was only superseded', async () => {
@@ -351,6 +430,23 @@ describe('while an appeal blocks decision use', () => {
     expect((await list('?view=reviewed')).body.total).toBe(0);
     expect((await list('?view=all')).body.total).toBe(3);
     expect(rowIds((await list('?view=in-progress')).body)).toEqual([roundId(2)]);
+  });
+});
+
+describe('GET /api/candidates/:id/interview-rounds', () => {
+  const rounds = async (i: number) => (await request(appFor('admin')).get(`/api/candidates/${candidateId(i)}/interview-rounds`)).body.rounds as Row[];
+
+  it('marks a staff dry run, and keeps the notice it was given to itself', async () => {
+    addRound(0, { consent_locale: 'en-IN-x-staff' });
+    addRound(1);
+    expect((await rounds(0))[0]).toMatchObject({ id: roundId(0), is_staff_dry_run: true });
+    expect((await rounds(1))[0]).toMatchObject({ id: roundId(1), is_staff_dry_run: false });
+    expect((await rounds(0))[0]).not.toHaveProperty('consent_locale');
+  });
+
+  it('still marks it while an appeal withholds the result', async () => {
+    addRound(0, { consent_locale: 'en-IN-x-staff' }, { decision_use_blocked_at: '2026-11-03T00:00:00Z' });
+    expect((await rounds(0))[0]).toMatchObject({ recommendation: null, scores_withheld: true, is_staff_dry_run: true });
   });
 });
 

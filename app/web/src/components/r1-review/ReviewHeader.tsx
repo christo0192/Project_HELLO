@@ -17,8 +17,7 @@ import { api } from '../../api';
 import { plainErrorText } from '../../lib/api-error-copy';
 import { formatDateTime, formatRelative } from '../../lib/datetime';
 import { r1RecordingStateCopy, attemptLabels } from '../../lib/r1-recording';
-import { r1StatusLabel } from '../../lib/r1';
-import { roundIsRunning } from '../../lib/r1-review';
+import { roundStatusWord } from '../../lib/r1-review';
 import type { R1ReviewAttempt, R1ReviewResponse } from '../../lib/r1-types';
 
 const nameLink =
@@ -53,7 +52,7 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   const label = attempt ? labels[attempts.indexOf(attempt)] : null;
   const recording = attempt ? r1RecordingStateCopy(attempt.recording) : null;
   const keptUntil = recording?.facts.find((fact) => fact.startsWith('Kept until'));
-  const statusWord = round.status === 'in_progress' && !roundIsRunning(attempts) ? 'Link open' : r1StatusLabel(round.status);
+  const statusWord = roundStatusWord(round, attempts, Date.now());
 
   const [cancelledRound, setCancelledRound] = useState<string | null>(null);
   const pending = round.status_write === 'pending_reject' && round.pending_reject_until !== null && cancelledRound !== round.id;

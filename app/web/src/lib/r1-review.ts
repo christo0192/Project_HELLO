@@ -19,6 +19,7 @@
 import { activeTurnAt } from '../components/talent/sessionLegs';
 import { isEvidenceInsufficient } from './evidence-hold';
 import { RECOMMENDATION_LABELS } from './recommendation-labels';
+import { linkLapsed, r1StatusLabel } from './r1';
 import { r1RecordingStateCopy, turnMediaSec, viewState } from './r1-recording';
 import type {
   R1RecordingSummary,
@@ -416,7 +417,11 @@ export const R1_SCORE_WAIT_MS = 24 * 60 * 60 * 1000;
  * when the attempt counted (0126); and none is promised once consent is withdrawn, which stops the
  * scoring of the interview.
  */
-function scoreCanArrive(attempt: R1ReviewAttempt, roundCreatedAt: string, nowMs: number): boolean {
+export function scoreCanArrive(
+  attempt: Pick<R1ReviewAttempt, 'consent_withdrawn' | 'session_status' | 'counted' | 'started_at' | 'ended_at'>,
+  roundCreatedAt: string,
+  nowMs: number,
+): boolean {
   if (attempt.consent_withdrawn) return false;
   if (attempt.session_status !== 'completed' && !(attempt.session_status === 'failed' && attempt.counted)) return false;
   return nowMs - Date.parse(attempt.ended_at ?? attempt.started_at ?? roundCreatedAt) < R1_SCORE_WAIT_MS;
@@ -430,15 +435,32 @@ export function roundIsRunning(attempts: readonly Pick<R1ReviewAttempt, 'in_prog
   return attempts.some((attempt) => attempt.in_progress);
 }
 
+/**
+ * Where a round stands, in a word, on a queue row and on the review. A link past its expiry is expired
+ * whatever is stored, though the interview that outlasted it runs on. An in_progress round with nobody
+ * in it is an open link.
+ */
+export function roundStatusWord(
+  round: Pick<R1ReviewRound, 'status'> & { expires_at: string | null },
+  attempts: readonly Pick<R1ReviewAttempt, 'in_progress'>[],
+  nowMs: number,
+): string {
+  const running = roundIsRunning(attempts);
+  if (!running && linkLapsed(round, nowMs)) return r1StatusLabel('expired');
+  return round.status === 'in_progress' && !running ? 'Link open' : r1StatusLabel(round.status);
+}
+
 export function reviewStage(review: Pick<R1ReviewResponse, 'round' | 'attempts' | 'assessment'>, nowMs: number): R1ReviewStage {
   const { round, attempts, assessment } = review;
   if (round.scores_withheld) return 'withheld';
   // The round is what carries a usable result: only a valid gated score reaches it (0122).
   if (assessment) return notScored(assessment) || !round.recommendation ? 'not_scored' : 'scored';
   if (attempts.some((attempt) => scoreCanArrive(attempt, round.created_at, nowMs))) return 'scoring';
+  const running = roundIsRunning(attempts);
   if (round.status === 'completed' || round.status === 'expired' || round.status === 'cancelled') return 'closed';
+  if (!running && linkLapsed(round, nowMs)) return 'closed';
   if (round.status !== 'in_progress') return 'invited';
-  return roundIsRunning(attempts) ? 'in_progress' : 'link_open';
+  return running ? 'in_progress' : 'link_open';
 }
 
 export function notScoredSentence(assessment: R1ReviewAssessment): string {

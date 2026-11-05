@@ -546,6 +546,55 @@ describe('the rounds panel', () => {
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
   });
 
+  it('prints no figure the checks refused: a score with no recommendation is not a result', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'completed', attempts_counted: 1, overall: 42, status_write: 'human_review' })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI result: not scored. Open the R1 review for the reason.')).toBeInTheDocument();
+    expect(screen.queryByText(/42/)).not.toBeInTheDocument();
+  });
+
+  it('says not scored for a figure whose status write has not landed yet', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'completed', attempts_counted: 1, overall: 42 })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI result: not scored. Open the R1 review for the reason.')).toBeInTheDocument();
+    expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the result on the row after a retake re-opens the round', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'invited', attempts_counted: 1, recommendation: 'hold', overall: 58 })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI recommendation: Borderline · Overall 58 of 100')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'R1 rounds' })).getByRole('listitem')).toHaveTextContent('Status: Link sent');
+  });
+
+  it('says nothing about results on a link nobody has used', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'invited' })] });
+    renderSection();
+    await screen.findByRole('list', { name: 'R1 rounds' });
+    expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/AI re/)).not.toBeInTheDocument();
+  });
+
+  it('marks a staff dry run, and only that', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [
+        round({ id: 'dry', status: 'completed', attempts_counted: 1, is_staff_dry_run: true }),
+        round({ id: 'real', status: 'completed', attempts_counted: 1, is_staff_dry_run: false }),
+      ],
+    });
+    renderSection();
+    const list = await screen.findByRole('list', { name: 'R1 rounds' });
+    const [dry, real] = within(list).getAllByRole('listitem');
+    expect(dry).toHaveTextContent('Staff dry run');
+    expect(real).not.toHaveTextContent('Staff dry run');
+  });
+
   describe('while an appeal blocks decision use', () => {
     const WITHHELD = 'Scorecards are suppressed while an appeal is under review.';
 
