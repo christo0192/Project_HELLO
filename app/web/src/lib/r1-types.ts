@@ -62,6 +62,180 @@ export interface R1AttemptSummary {
   recording: R1RecordingSummary;
 }
 
+/* ── The review page: `GET /api/interview-rounds/:id/review` ──────────── */
+
+/** `transcript_turns.phase` (0116). Null on a turn from before phases, or one the worker did not tag. */
+export type R1TurnPhase =
+  | 'opening'
+  | 'icebreaker'
+  | 'transition'
+  | 'roleplay'
+  | 'aside'
+  | 'roleplay_exit'
+  | 'wrapup'
+  | 'closing';
+
+export interface R1ReviewTurn {
+  turn_index: number;
+  speaker: 'bot' | 'candidate';
+  text: string;
+  /** Epoch ms, worker clock. Null: the turn was saved without a time. */
+  turn_started_at_ms: number | null;
+  /**
+   * 0136. Epoch ms, same clock. Null on an older turn, and whenever the end was not known. Not exact on a
+   * cut AI line: it is the latest the audio can have stopped, so it can run late by the line's silence.
+   */
+  turn_ended_at_ms?: number | null;
+  /** 0136. Which voice spoke an AI turn. Null on an older turn, or one the worker could not tie to a voice. */
+  ai_voice?: 'interviewer' | 'learner' | null;
+  /** 0136. Audio played for an AI turn. Never a way to work out its end. */
+  ai_played_ms?: number | null;
+  is_gate: boolean;
+  phase: R1TurnPhase | null;
+  interrupted: boolean;
+}
+
+export interface R1ReviewAttempt extends R1AttemptSummary {
+  persona_id: string;
+  persona_label: string | null;
+  /** Null when the worker's log does not name the learner: the page says "AI learner". */
+  learner_name: string | null;
+  session_status: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  /** Consent was withdrawn or declined after this attempt: its recording is gone and its transcript hidden. */
+  consent_withdrawn: boolean;
+  transcript_hidden: boolean;
+  /** The interview has not ended: `turns` stays empty until it has. */
+  in_progress: boolean;
+  turns: R1ReviewTurn[];
+}
+
+export interface R1ReviewEvidence {
+  turn_index: number;
+  quote: string;
+}
+
+export interface R1ReviewMetric {
+  metric_id: string;
+  name: string | null;
+  weight_bps: number | null;
+  /** 1-4. Null: insufficient evidence. */
+  score: number | null;
+  evidence_status: string | null;
+  rationale: string | null;
+  evidence: R1ReviewEvidence[];
+}
+
+export interface R1ReviewAssessment {
+  id: string;
+  /** The attempt this was scored from: evidence turns belong to that attempt. */
+  session_id: string;
+  recommendation: R1Recommendation | null;
+  /** `human_review` is stored as NULL in the column, so it is only here. */
+  raw_recommendation: string | null;
+  overall_score: number | null;
+  scoring_status: string | null;
+  score_scale_max: number | null;
+  created_at: string | null;
+  metric_results: R1ReviewMetric[];
+  r1: {
+    outcome: string | null;
+    valid: boolean | null;
+    code: string | null;
+    gate: { passed?: boolean; failures?: string[] } | null;
+    administration_quality: { status?: string; failures?: string[] } | null;
+    agreement: { runs_agree?: boolean; disagreement?: number | null } | null;
+    thresholds: { advance?: number; hold?: number } | null;
+  };
+}
+
+export interface R1ReviewEvent {
+  session_id: string;
+  event_type: string;
+  turn_index: number | null;
+  family_id: string | null;
+  need: string | null;
+  kind: string | null;
+  created_at: string | null;
+}
+
+export interface R1ReviewResumeRole {
+  title?: string;
+  employer?: string;
+  period?: string;
+  highlights?: string[];
+}
+
+export interface R1ReviewResume {
+  summary?: string;
+  current_role?: string;
+  recent_role?: R1ReviewResumeRole;
+  prior_roles?: R1ReviewResumeRole[];
+  career_highlights?: string[];
+  education?: string[];
+  certifications?: string[];
+}
+
+export interface R1ReviewRubricMetric {
+  key: string;
+  name: string;
+  weight_bps: number;
+  levels: Record<string, string>;
+}
+
+export interface R1ReviewRound {
+  id: string;
+  candidate_id: string;
+  status: R1RoundStatus;
+  expires_at: string;
+  attempts_allowed: number;
+  attempts_counted: number;
+  recommendation: R1Recommendation | null;
+  overall: number | null;
+  status_write: string | null;
+  pending_reject_until: string | null;
+  /** True while an appeal blocks decision use: the nulls mean withheld, not unscored. */
+  scores_withheld: boolean;
+  is_staff_dry_run: boolean;
+  created_at: string;
+  created_by: string;
+}
+
+export interface R1ReviewResponse {
+  round: R1ReviewRound;
+  candidate: {
+    id: string;
+    name: string | null;
+    role_title: string | null;
+    skills: string[];
+    experience_years: number | null;
+    resume: R1ReviewResume | null;
+  };
+  /** In the order they started. A restart shares its `attempt_number`, so `session_id` tells them apart. */
+  attempts: R1ReviewAttempt[];
+  assessment: R1ReviewAssessment | null;
+  events: R1ReviewEvent[];
+  /** The candidate's newest phone assessment: one line of context. Null when there is none to show. */
+  phone_screening: {
+    recommendation: string | null;
+    overall_score: number | null;
+    created_at: string | null;
+    /** `insufficient`: the score is held. */
+    evidence_grade: string | null;
+    /** `incomplete_evidence`: the score is provisional. */
+    scoring_status: string | null;
+  } | null;
+  rubric: R1ReviewRubricMetric[];
+}
+
+/** 200 body of `POST /api/interview-rounds/:id/cancel-pending-reject`. */
+export interface R1CancelPendingRejectResponse {
+  ok: true;
+  /** The override monitor switched auto-status off: more than 10% of the last 20 were overridden. */
+  auto_status_disabled: boolean;
+}
+
 /**
  * 200 body of `GET /api/interview-rounds/:id/recording?session_id=`: the summary, and (only for a
  * ready or partial recording) short-lived URLs. A single recording has `url`; a recovered pair has

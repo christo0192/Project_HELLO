@@ -214,6 +214,7 @@ describe('Layout shell', () => {
 
   it('titles the top bar "R1 settings" on /admin/r1, not "HELLO"', () => {
     expect(pageTitleFor('/admin/r1')).toBe('R1 settings');
+    expect(pageTitleFor('/interviews/20000000-0000-4000-8000-000000000001')).toBe('R1 review');
     // Unrelated admin-looking paths keep their own titles.
     expect(pageTitleFor('/mission-control')).toBe('Mission Control');
     expect(pageTitleFor('/admin')).toBe('HELLO');

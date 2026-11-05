@@ -394,14 +394,19 @@ export function r1MediaErrorMessage(unsupported: boolean): string {
 
 /**
  * "Attempt 1 (counted)", "Attempt 2 (retake)", "Attempt 3 (not counted)". The attempts arrive ordered
- * by attempt number; the second COUNTED attempt is the retake (a round allows one).
+ * by attempt number; the second COUNTED attempt is the retake (a round allows one). A restart keeps
+ * its attempt's number (0119), so a second start that would read the same says which start it was.
  */
 export function attemptLabels(attempts: readonly Pick<R1AttemptSummary, 'attempt_number' | 'counted'>[]): string[] {
   let counted = 0;
+  const starts = new Map<string, number>();
   return attempts.map((attempt) => {
-    if (!attempt.counted) return `Attempt ${attempt.attempt_number} (not counted)`;
-    counted += 1;
-    return `Attempt ${attempt.attempt_number} (${counted === 1 ? 'counted' : 'retake'})`;
+    if (attempt.counted) counted += 1;
+    const kind = !attempt.counted ? 'not counted' : counted === 1 ? 'counted' : 'retake';
+    const label = `Attempt ${attempt.attempt_number} (${kind})`;
+    const start = (starts.get(label) ?? 0) + 1;
+    starts.set(label, start);
+    return start === 1 ? label : `Attempt ${attempt.attempt_number} (${kind}, start ${start})`;
   });
 }
 

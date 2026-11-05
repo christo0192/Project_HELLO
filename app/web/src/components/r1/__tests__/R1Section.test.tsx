@@ -110,7 +110,8 @@ describe('who sees what', () => {
     renderSection('viewer');
     expect(await screen.findByRole('list', { name: 'R1 rounds' })).toBeInTheDocument();
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
-    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    // The one link reads: it opens the review, which a viewer may read.
+    expect(screen.getAllByRole('link').map((link) => link.textContent)).toEqual(['Open R1 review']);
   });
 
   it('renders nothing when the API says the candidate is not theirs (403)', async () => {
@@ -495,6 +496,13 @@ describe('what Send R1 does beside existing rounds', () => {
 });
 
 describe('the rounds panel', () => {
+  it('links each round to its review, for every role', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ id: 'round-9' })] });
+    renderSection('viewer');
+    const link = await screen.findByRole('link', { name: 'Open R1 review' });
+    expect(link).toHaveAttribute('href', '/interviews/round-9');
+  });
+
   it('lists status, sent time, attempts and expiry', async () => {
     api.listR1Rounds.mockResolvedValue({ rounds: [round()] });
     renderSection();

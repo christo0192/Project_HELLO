@@ -27,6 +27,16 @@ describe('R1 api client', () => {
     expect(request).toHaveBeenCalledWith('/api/interview-rounds/availability');
   });
 
+  it('reads a review by the round, encoding the id', async () => {
+    await api.getR1Review('round 1/../x');
+    expect(request).toHaveBeenCalledWith('/api/interview-rounds/round%201%2F..%2Fx/review');
+  });
+
+  it('cancels a pending reject with a POST and no body', async () => {
+    await api.cancelR1PendingReject('round-1');
+    expect(request).toHaveBeenCalledWith('/api/interview-rounds/round-1/cancel-pending-reject', { method: 'POST' });
+  });
+
   it('lists a candidate’s rounds, encoding the id', async () => {
     await api.listR1Rounds('cand 1/../x');
     expect(request).toHaveBeenCalledWith('/api/candidates/cand%201%2F..%2Fx/interview-rounds');

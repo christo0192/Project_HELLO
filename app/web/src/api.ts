@@ -115,9 +115,11 @@ import type {
 } from './types';
 import type {
   R1AvailabilityResponse,
+  R1CancelPendingRejectResponse,
   R1OkResponse,
   R1RecordingPlayback,
   R1ReissueResponse,
+  R1ReviewResponse,
   R1RoundsResponse,
   R1SendInput,
   R1SendResponse,
@@ -293,6 +295,14 @@ export const api = {
   getR1Recording: (roundId: string, sessionId: string) =>
     request<R1RecordingPlayback>(
       `/api/interview-rounds/${encodeURIComponent(roundId)}/recording?session_id=${encodeURIComponent(sessionId)}`,
+    ),
+  // One round as a reviewer sees it. Carries no link: a recording is minted by `getR1Recording`.
+  getR1Review: (roundId: string) =>
+    request<R1ReviewResponse>(`/api/interview-rounds/${encodeURIComponent(roundId)}/review`),
+  cancelR1PendingReject: (roundId: string) =>
+    request<R1CancelPendingRejectResponse>(
+      `/api/interview-rounds/${encodeURIComponent(roundId)}/cancel-pending-reject`,
+      { method: 'POST' },
     ),
   getR1Settings: () => request<R1SettingsResponse>('/api/admin/r1/settings'),
   updateR1Settings: (patch: R1SettingsPatch) =>

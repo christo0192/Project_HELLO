@@ -37,7 +37,7 @@ import type {
   ScorecardMetricTemplate,
 } from '../../src/types';
 import type { R1RecordingPlayback, R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
-import { ADMIN_USER_ID, PHONE_WINDOW, R1_CANDIDATE_ID, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
+import { ADMIN_USER_ID, PHONE_WINDOW, R1_CANDIDATE_ID, R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
 import { FROZEN_NOW_MS } from './env';
 
 export interface MockRequest {
@@ -424,6 +424,11 @@ const ROUTES: Array<[string, string, Handler]> = [
     const queue = db.r1.mints[sessionId];
     const queued = queue && queue.length > 0 ? (queue.length > 1 ? queue.shift()! : queue[0]) : null;
     return ok({ ...summary, ...(queued ?? r1PlayableMint(summary.has_video)) } satisfies R1RecordingPlayback);
+  }],
+  ['GET', '/api/interview-rounds/:id/review', ({ params }, db) => (params.id === R1_ROUND_ID ? ok(db.r1.review) : notFound('round'))],
+  ['POST', '/api/interview-rounds/:id/cancel-pending-reject', (_r, db) => {
+    db.r1.review.round = { ...db.r1.review.round, status_write: 'pending_reject_cancelled', pending_reject_until: null };
+    return ok({ ok: true, auto_status_disabled: false });
   }],
   ['POST', '/api/candidates/:id/interview-rounds', () => created({ id: mintId(), status: 'invited', expires_at: new Date(FROZEN_NOW_MS + 72 * 3_600_000).toISOString(), join_url: R1_JOIN_URL })],
   ['POST', '/api/interview-rounds/:id/cancel', () => ok({ ok: true })],

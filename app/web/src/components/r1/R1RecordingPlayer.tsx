@@ -33,6 +33,11 @@
  * A host that acts on a click before the seek lands needs three more facts: whether the click was taken
  * (`playFrom` and `playFromTurn` answer false when it is ignored), whether it is still waiting for the
  * media (`seekQueued`), and when no position will follow (`onMediaDropped`, `onEnded`).
+ *
+ * `controls="custom"` is for a host that draws its own transport (the R1 review page). The lifecycle
+ * above is the same; what changes is the surface: a 16:9 box with no native controls and no Load
+ * button, where the first `playFrom` mints the link. The speed and volume are the host's to set, and
+ * they outlive a fresh link, because loading a source resets both.
  */
 import {
   forwardRef,
@@ -45,6 +50,7 @@ import {
 } from 'react';
 import type { SyntheticEvent } from 'react';
 import { api } from '../../api';
+import { cx } from '../design/cx';
 import { CandidateButton, Tag } from '../design/candidate';
 import {
   driftExceeds,
@@ -79,7 +85,14 @@ export interface R1RecordingPlayerHandle {
   seek(offsetSec: number): void;
   play(): void;
   pause(): void;
+  /** Speed for this recording, kept across a fresh link. Before there is media it waits for it. */
+  setRate(rate: number): void;
+  /** Volume from 0 to 1, kept across a fresh link. */
+  setVolume(volume: number): void;
+  setMuted(muted: boolean): void;
   readonly currentTime: number;
+  /** The media's own word, for a host with a button: an element dropped or reloaded sends no pause. */
+  readonly paused: boolean;
   readonly hasUrl: boolean;
   /**
    * A position is waiting for a link or for metadata (a `playFrom`, or the place a re-mint saved), so the
@@ -97,6 +110,10 @@ export interface R1RecordingPlayerProps {
   label: string;
   /** False pauses the media (a hidden tab keeps its panel mounted). Default true. */
   active?: boolean;
+  /** `custom`: the host draws the transport (see the file header). Default `native`. */
+  controls?: 'native' | 'custom';
+  /** The media's own length in seconds, once metadata is there and it is a number. */
+  onDuration?: (sec: number) => void;
   onTimeUpdate?: (sec: number) => void;
   onPlayState?: (playing: boolean) => void;
   /** Playback reached the end of the file, at this position. */
@@ -202,7 +219,8 @@ function browserCanPlay(contentType: string | null, video: boolean): boolean {
 
 export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1RecordingPlayerProps>(
   function R1RecordingPlayer(props, ref) {
-    const { roundId, sessionId, summary, label, active = true } = props;
+    const { roundId, sessionId, summary, label, active = true, controls = 'native' } = props;
+    const custom = controls === 'custom';
 
     const [phase, setPhase] = useState<Phase>('idle');
     const [minted, setMinted] = useState<Minted | null>(null);
@@ -235,6 +253,10 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
     const cbRef = useRef(props);
     /** The animation frame the position loop has asked for; null = the loop is not running. */
     const frameRef = useRef<number | null>(null);
+    /** What the host set; null = leave the media's own value. A new source resets the media's. */
+    const rateRef = useRef<number | null>(null);
+    const volumeRef = useRef<number | null>(null);
+    const mutedRef = useRef<boolean | null>(null);
 
     // Latest props for the handlers below (assigned during render on purpose: they are read only
     // from event handlers and promise callbacks, never during render).
@@ -469,6 +491,18 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
 
     /* ── Seeking ───────────────────────────────────────────────────── */
 
+    /** Put the host's speed and volume on the media. The picture of a recovered pair stays muted. */
+    const applyHostSettings = useCallback(() => {
+      const master = masterRef.current;
+      const follower = followerRef.current;
+      if (rateRef.current !== null) {
+        if (master) master.playbackRate = rateRef.current;
+        if (follower) follower.playbackRate = rateRef.current;
+      }
+      if (master && volumeRef.current !== null) master.volume = volumeRef.current;
+      if (master && mutedRef.current !== null) master.muted = mutedRef.current;
+    }, []);
+
     const seekElements = useCallback((sec: number) => {
       const target = Math.max(0, sec);
       const master = masterRef.current;
@@ -556,8 +590,23 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
           masterRef.current?.pause();
           followerRef.current?.pause();
         },
+        setRate(rate: number) {
+          rateRef.current = rate;
+          applyHostSettings();
+        },
+        setVolume(volume: number) {
+          volumeRef.current = Math.min(1, Math.max(0, volume));
+          applyHostSettings();
+        },
+        setMuted(muted: boolean) {
+          mutedRef.current = muted;
+          applyHostSettings();
+        },
         get currentTime() {
           return masterRef.current?.currentTime ?? 0;
+        },
+        get paused() {
+          return masterRef.current?.paused ?? true;
         },
         get hasUrl() {
           return mintedRef.current !== null && phaseRef.current === 'media';
@@ -566,7 +615,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
           return pendingSeekRef.current !== null || restoreRef.current !== null;
         },
       }),
-      [mint, playFrom, refreshIfStale, seekElements],
+      [applyHostSettings, mint, playFrom, refreshIfStale, seekElements],
     );
 
     /* ── Media events ──────────────────────────────────────────────── */
@@ -584,8 +633,11 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
 
     const onLoadedMetadata = useCallback(() => {
       metaRef.current = true;
+      applyHostSettings();
+      const length = masterRef.current?.duration;
+      if (typeof length === 'number' && Number.isFinite(length) && length > 0) cbRef.current.onDuration?.(length);
       applyQueued();
-    }, [applyQueued]);
+    }, [applyHostSettings, applyQueued]);
 
     const onMediaError = useCallback(() => {
       const el = masterRef.current;
@@ -729,6 +781,151 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
     const hasPicture = sources !== null && (sources.kind === 'split' || sources.video);
     const mediaName = `${hasPicture ? 'Interview recording' : 'Interview audio recording'}, ${label}`;
 
+    const videoClass = custom
+      ? 'absolute inset-0 h-full w-full'
+      : 'block w-full max-w-[640px] rounded-lg bg-[var(--c-ink)]';
+    const audioClass = custom ? 'hidden' : 'block h-10 w-full max-w-[640px]';
+
+    const media = (
+      <>
+        {showMedia && sources.kind === 'single' && sources.video && (
+          <video
+            ref={attachMaster}
+            src={sources.url}
+            controls={!custom}
+            preload="metadata"
+            playsInline
+            controlsList="nodownload"
+            aria-label={mediaName}
+            style={custom ? undefined : aspect}
+            className={videoClass}
+            onLoadedMetadata={onLoadedMetadata}
+            onError={onMediaError}
+            onTimeUpdate={onTimeUpdate}
+            onPlay={onPlay}
+            onPause={onPause}
+            onEnded={onEnded}
+            onSeeking={onSeeking}
+          />
+        )}
+
+        {showMedia && sources.kind === 'single' && !sources.video && (
+          <audio
+            ref={attachMaster}
+            src={sources.url}
+            controls={!custom}
+            preload="metadata"
+            controlsList="nodownload"
+            aria-label={mediaName}
+            className={audioClass}
+            onLoadedMetadata={onLoadedMetadata}
+            onError={onMediaError}
+            onTimeUpdate={onTimeUpdate}
+            onPlay={onPlay}
+            onPause={onPause}
+            onEnded={onEnded}
+            onSeeking={onSeeking}
+          />
+        )}
+
+        {showMedia && sources.kind === 'split' && (
+          <div className={custom ? 'contents' : 'space-y-2'}>
+            {/* The picture only: muted, no controls, and not announced (the audio is the recording
+                for assistive technology). A failed picture leaves the audio playing. */}
+            {!followerFailed && (
+              <video
+                ref={attachFollower}
+                src={sources.videoUrl}
+                muted
+                playsInline
+                preload="metadata"
+                aria-hidden="true"
+                style={custom ? undefined : aspect}
+                className={videoClass}
+                onLoadedMetadata={() => {
+                  const master = masterRef.current;
+                  const follower = followerRef.current;
+                  if (master && follower && master.currentTime > 0) follower.currentTime = master.currentTime;
+                  applyHostSettings();
+                }}
+                onError={() => setFollowerFailed(true)}
+              />
+            )}
+            <audio
+              ref={attachMaster}
+              src={sources.audioUrl}
+              controls={!custom}
+              preload="metadata"
+              controlsList="nodownload"
+              aria-label={mediaName}
+              className={audioClass}
+              onLoadedMetadata={onLoadedMetadata}
+              onError={onMediaError}
+              onTimeUpdate={onTimeUpdate}
+              onPlay={onPlay}
+              onPause={onPause}
+              onEnded={onEnded}
+              onSeeking={onSeeking}
+              onSeeked={onSeeked}
+              onRateChange={onRateChange}
+              onWaiting={onWaiting}
+              onPlaying={onPlaying}
+            />
+            <p
+              role="note"
+              className={custom ? 'absolute bottom-2 left-3 right-3 text-label text-surface' : 'text-label text-ink-secondary'}
+            >
+              Recovered recording: audio and video may drift.
+              {followerFailed ? ' The picture could not be loaded; the audio is playing.' : ''}
+            </p>
+          </div>
+        )}
+
+        {refreshing && showMedia && (
+          <p role="status" className="sr-only">
+            Refreshing the recording link.
+          </p>
+        )}
+      </>
+    );
+
+    if (custom) {
+      // A file with no picture is never a black box. Before the mint, the list's word is what we know.
+      const audioOnly = sources ? !hasPicture : effective.has_video === false;
+      return (
+        <div
+          data-r1-recording-state={view}
+          data-session={sessionId}
+          style={aspect}
+          className={cx(
+            'relative w-full overflow-hidden rounded-card text-sm',
+            audioOnly ? 'border border-line-strong bg-surface-secondary text-ink-secondary' : 'bg-ink text-surface',
+          )}
+        >
+          {media}
+          {phase !== 'error' && (audioOnly || !showMedia) && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 p-6 text-center">
+              {audioOnly && <p className="font-medium">Audio only</p>}
+              {phase === 'loading' && <p role="status">Loading recording…</p>}
+              {phase !== 'loading' && !showMedia && (
+                <p>{copy.action === 'load' ? 'Recording loads when you press play. The link expires.' : copy.detail}</p>
+              )}
+            </div>
+          )}
+          {phase === 'error' && errorInfo && (
+            <div role="alert" className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
+              <p>{errorInfo.message}</p>
+              {errorInfo.retryable && (
+                <CandidateButton variant="secondary" size="md" onClick={retry} aria-label={`Try again, ${label}`}>
+                  Try again
+                </CandidateButton>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     return (
       <div className="space-y-2 text-sm" data-r1-recording-state={view}>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -765,100 +962,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
           </div>
         )}
 
-        {showMedia && sources.kind === 'single' && sources.video && (
-          <video
-            ref={attachMaster}
-            src={sources.url}
-            controls
-            preload="metadata"
-            playsInline
-            controlsList="nodownload"
-            aria-label={mediaName}
-            style={aspect}
-            className="block w-full max-w-[640px] rounded-lg bg-[var(--c-ink)]"
-            onLoadedMetadata={onLoadedMetadata}
-            onError={onMediaError}
-            onTimeUpdate={onTimeUpdate}
-            onPlay={onPlay}
-            onPause={onPause}
-            onEnded={onEnded}
-            onSeeking={onSeeking}
-          />
-        )}
-
-        {showMedia && sources.kind === 'single' && !sources.video && (
-          <audio
-            ref={attachMaster}
-            src={sources.url}
-            controls
-            preload="metadata"
-            controlsList="nodownload"
-            aria-label={mediaName}
-            className="block h-10 w-full max-w-[640px]"
-            onLoadedMetadata={onLoadedMetadata}
-            onError={onMediaError}
-            onTimeUpdate={onTimeUpdate}
-            onPlay={onPlay}
-            onPause={onPause}
-            onEnded={onEnded}
-            onSeeking={onSeeking}
-          />
-        )}
-
-        {showMedia && sources.kind === 'split' && (
-          <div className="space-y-2">
-            {/* The picture only: muted, no controls, and not announced (the audio is the recording
-                for assistive technology). A failed picture leaves the audio playing. */}
-            {!followerFailed && (
-              <video
-                ref={attachFollower}
-                src={sources.videoUrl}
-                muted
-                playsInline
-                preload="metadata"
-                aria-hidden="true"
-                style={aspect}
-                className="block w-full max-w-[640px] rounded-lg bg-[var(--c-ink)]"
-                onLoadedMetadata={() => {
-                  const master = masterRef.current;
-                  const follower = followerRef.current;
-                  if (master && follower && master.currentTime > 0) follower.currentTime = master.currentTime;
-                }}
-                onError={() => setFollowerFailed(true)}
-              />
-            )}
-            <audio
-              ref={attachMaster}
-              src={sources.audioUrl}
-              controls
-              preload="metadata"
-              controlsList="nodownload"
-              aria-label={mediaName}
-              className="block h-10 w-full max-w-[640px]"
-              onLoadedMetadata={onLoadedMetadata}
-              onError={onMediaError}
-              onTimeUpdate={onTimeUpdate}
-              onPlay={onPlay}
-              onPause={onPause}
-              onEnded={onEnded}
-              onSeeking={onSeeking}
-              onSeeked={onSeeked}
-              onRateChange={onRateChange}
-              onWaiting={onWaiting}
-              onPlaying={onPlaying}
-            />
-            <p role="note" className="text-label text-ink-secondary">
-              Recovered recording: audio and video may drift.
-              {followerFailed ? ' The picture could not be loaded; the audio is playing.' : ''}
-            </p>
-          </div>
-        )}
-
-        {refreshing && showMedia && (
-          <p role="status" className="sr-only">
-            Refreshing the recording link.
-          </p>
-        )}
+        {media}
 
         {phase !== 'loading' && phase !== 'media' && phase !== 'error' && copy.action === 'load' && (
           <CandidateButton

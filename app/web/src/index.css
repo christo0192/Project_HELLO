@@ -368,6 +368,12 @@
    system-colour equivalent here. Panels and the sheet are real borders, so
    they survive; these rules make the states as visible as the surfaces. */
 @media (forced-colors: active) {
+  /* The marks of a call strip or a ruler are fills, which forcing would drop. */
+  [data-mark] {
+    forced-color-adjust: none;
+    background-color: CanvasText;
+  }
+
   .sheet,
   .glass,
   .glass-strong,
