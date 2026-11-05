@@ -355,4 +355,3 @@ describe('GaugeChart', () => {
     expect(screen.getByRole('cell', { name: '78%' })).toBeInTheDocument();
   });
 });
-

@@ -18,4 +18,3 @@ export function chartStubs() {
   stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
   allowEchartsInitWarnings();
 }
-
