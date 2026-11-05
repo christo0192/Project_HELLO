@@ -16,6 +16,15 @@
  * the bottom of a dialog on a phone. The list therefore opens IN FLOW,
  * attached to its trigger like one control, and pushes what follows down.
  *
+ * `floating` IS THE EXCEPTION, for a page toolbar and nothing else. A filter on
+ * a page is not inside a scrolling panel, and a list opening in flow there
+ * pushes the table it filters down the page, so there it floats over the page.
+ * Never pass it inside a `Dialog`, a `SlideOver` or a `Table`.
+ *
+ * `searchable={false}` is for a short fixed list, where a search box is noise.
+ * The field stays, off screen and read-only: focus and
+ * `aria-activedescendant` live on it, so the keyboard contract does not change.
+ *
  * THE KEYBOARD CONTRACT (WAI-ARIA APG, "combobox with listbox popup"):
  *   - The trigger is a button (`aria-haspopup="listbox"`, `aria-expanded`).
  *     Enter / Space / ArrowDown open it; focus moves into the search field.
@@ -59,6 +68,8 @@ export interface ComboboxProps {
   id: string;
   /** Id of that visible label; the trigger is named "label + current value". */
   labelId?: string;
+  /** The label where none is printed, as in a table row. Also "label + current value". */
+  'aria-label'?: string;
   value: string;
   onChange: (value: string) => void;
   options: ComboboxOption[];
@@ -77,6 +88,12 @@ export interface ComboboxProps {
   loading?: boolean;
   /** Decorative glyph in the trigger's leading tile. */
   icon?: ReactNode;
+  /** Trigger height: `sm` 28, `md` 36 (the control height), `lg` 40 for a dialog form. */
+  size?: 'sm' | 'md' | 'lg';
+  /** False for a short fixed list: no visible search box. See the header. */
+  searchable?: boolean;
+  /** Floats over the page instead of opening in flow; `'up'` above the trigger. See the header. */
+  floating?: boolean | 'up';
   'aria-describedby'?: string;
   /** Reaches the trigger button (e.g. to move focus onto it after a retry). */
   ref?: Ref<HTMLButtonElement>;
@@ -88,9 +105,17 @@ function fold(text: string): string {
   return text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
 }
 
+/** The control heights with a mouse; 44px on a touch screen. */
+const TRIGGER_SIZE = {
+  sm: 'min-h-7 px-2.5 py-0.5 [@media(pointer:coarse)]:min-h-11',
+  md: 'min-h-9 px-3 py-1 [@media(pointer:coarse)]:min-h-11',
+  lg: 'min-h-10 px-3 py-1.5 [@media(pointer:coarse)]:min-h-11',
+} as const;
+
 export function Combobox({
   id,
   labelId,
+  'aria-label': ariaLabel,
   value,
   onChange,
   options,
@@ -102,6 +127,9 @@ export function Combobox({
   disabled = false,
   loading = false,
   icon,
+  size = 'lg',
+  searchable = true,
+  floating = false,
   'aria-describedby': describedBy,
   ref,
   className,
@@ -340,7 +368,8 @@ export function Combobox({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listboxId : undefined}
-        aria-labelledby={labelId ? `${labelId} ${valueId}` : undefined}
+        aria-label={ariaLabel ? `${ariaLabel} ${selected?.label ?? placeholder}` : undefined}
+        aria-labelledby={labelId && !ariaLabel ? `${labelId} ${valueId}` : undefined}
         aria-describedby={describedBy}
         aria-busy={loading || undefined}
         onClick={() => (open ? close(true) : openList())}
@@ -353,9 +382,10 @@ export function Combobox({
         }}
         onKeyDown={onTriggerKey}
         className={cx(
-          // 40px, the same height as the form's text inputs: one control
-          // vocabulary per form. A selected option with a description grows.
-          'group flex min-h-10 w-full min-w-0 items-center gap-3 px-3 py-1.5 text-left',
+          // One control vocabulary per form. A selected option with a
+          // description grows.
+          'group flex w-full min-w-0 items-center gap-3 text-left',
+          TRIGGER_SIZE[size],
           'border bg-surface transition-[background-color,border-color] duration-hover ease-out',
           // Keyboard focus is the design system's 2px ring with offset — the
           // same as every button — so it is never mistaken for "open".
@@ -363,7 +393,11 @@ export function Combobox({
           'disabled:cursor-not-allowed disabled:bg-surface-secondary disabled:text-ink-tertiary',
           // A real border, so it survives forced colours. Open, it turns ink to
           // match the panel it now heads.
-          open ? 'rounded-t-control border-[var(--ink)]' : 'rounded-control border-[var(--control)]',
+          !open
+            ? 'rounded-control border-[var(--control)]'
+            : floating === 'up'
+              ? 'rounded-b-control border-[var(--ink)]'
+              : 'rounded-t-control border-[var(--ink)]',
         )}
       >
         {icon && (
@@ -415,10 +449,15 @@ export function Combobox({
           onMouseDown={(e) => {
             if (e.target !== searchRef.current) e.preventDefault();
           }}
-          className="combobox-panel -mt-px overflow-hidden rounded-b-control border border-[var(--ink)] bg-surface shadow-pop"
+          className={cx(
+            'combobox-panel overflow-hidden border border-[var(--ink)] bg-surface shadow-pop',
+            !floating && '-mt-px rounded-b-control',
+            floating === true && 'absolute left-0 top-full z-30 -mt-px w-full min-w-[12rem] rounded-b-control',
+            floating === 'up' && 'absolute bottom-full left-0 z-30 -mb-px w-full rounded-t-control',
+          )}
         >
-          <div className="flex items-center gap-2 border-b border-ink/[0.08] px-3">
-            <SearchIcon className="h-4 w-4 shrink-0 text-ink-tertiary" />
+          <div className={cx(searchable && 'flex items-center gap-2 border-b border-ink/[0.08] px-3')}>
+            {searchable && <SearchIcon className="h-4 w-4 shrink-0 text-ink-tertiary" />}
             <input
               ref={searchRef}
               id={searchId}
@@ -430,6 +469,7 @@ export function Combobox({
               aria-activedescendant={active >= 0 ? optionId(active) : undefined}
               aria-label={searchLabel}
               placeholder={searchLabel}
+              readOnly={!searchable}
               autoComplete="off"
               spellCheck={false}
               value={query}
@@ -441,11 +481,17 @@ export function Combobox({
                 if (pressing.current) return;
                 if (!rootRef.current?.contains(e.relatedTarget as Node | null)) close(false);
               }}
-              className="h-11 min-w-0 flex-1 bg-transparent text-sm text-ink placeholder:text-ink-tertiary focus:outline-none"
+              className={
+                searchable
+                  ? 'h-11 min-w-0 flex-1 bg-transparent text-sm text-ink placeholder:text-ink-tertiary focus:outline-none'
+                  : 'sr-only'
+              }
             />
-            <span className="shrink-0 text-xs tabular-nums text-ink-tertiary" aria-hidden="true">
-              {countText}
-            </span>
+            {searchable && (
+              <span className="shrink-0 text-xs tabular-nums text-ink-tertiary" aria-hidden="true">
+                {countText}
+              </span>
+            )}
           </div>
 
           {/* No matches: said OUTSIDE the listbox. A listbox may only own
@@ -507,9 +553,11 @@ export function Combobox({
       {/* The result count for a screen reader. ALWAYS mounted (a live region
           announces reliably only if it exists before its text changes) and
           DEBOUNCED, so typing "sales" is one announcement, not five. */}
-      <p role="status" className="sr-only">
-        {announcement}
-      </p>
+      {searchable && (
+        <p aria-live="polite" aria-atomic="true" className="sr-only">
+          {announcement}
+        </p>
+      )}
     </div>
   );
 }

@@ -6,6 +6,7 @@
  * last-linked-admin protection (no bypass), no optimistic success, no full
  * email in any log surface, and axe.
  */
+import { optionsOf, pickOption } from '../../design/__tests__/helpers';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -157,7 +158,7 @@ describe('AccessSection', () => {
       screen.getByLabelText('Company email'),
       'recruiter@interviewkickstart.com',
     );
-    await userEvent.selectOptions(screen.getByLabelText('Role'), 'interviewer');
+    await pickOption(userEvent.setup(), /^Role Viewer/, 'Interviewer');
     fireEvent.click(screen.getByRole('button', { name: 'Add entry' }));
     fireEvent.click(screen.getByRole('button', { name: 'Add access entry' }));
     await waitFor(() => {
@@ -209,10 +210,10 @@ describe('AccessSection', () => {
     const row = screen
       .getByText('christo.b@interviewkickstart.com')
       .closest('tr') as HTMLElement;
-    await userEvent.selectOptions(within(row).getByLabelText(/Role for christo/), 'viewer');
+    await pickOption(userEvent.setup(), /^Role for christo/, 'Viewer');
     fireEvent.click(within(row).getByRole('button', { name: 'Save' }));
     expect(
-      screen.getByText(/role interviewer → viewer/),
+      screen.getByText(/role Interviewer → Viewer/),
     ).toBeInTheDocument();
     expect(apiFns.updateAdminAllowlistEntry).not.toHaveBeenCalled();
 
@@ -239,7 +240,7 @@ describe('AccessSection', () => {
     const row = screen
       .getByText('christo.b@interviewkickstart.com')
       .closest('tr') as HTMLElement;
-    await userEvent.selectOptions(within(row).getByLabelText(/Role for christo/), 'viewer');
+    await pickOption(userEvent.setup(), /^Role for christo/, 'Viewer');
     fireEvent.click(within(row).getByRole('button', { name: 'Save' }));
     fireEvent.click(screen.getByRole('button', { name: 'Confirm change' }));
 
@@ -258,7 +259,7 @@ describe('AccessSection', () => {
     const row = screen
       .getByText('christo.b@interviewkickstart.com')
       .closest('tr') as HTMLElement;
-    await userEvent.selectOptions(within(row).getByLabelText(/Role for christo/), 'admin');
+    await pickOption(userEvent.setup(), /^Role for christo/, 'Admin');
     fireEvent.click(within(row).getByRole('button', { name: 'Save' }));
     fireEvent.click(screen.getByRole('button', { name: 'Confirm change' }));
     expect(
@@ -273,7 +274,7 @@ describe('AccessSection', () => {
       .getByText('Admin@InterviewKickstart.com')
       .closest('tr') as HTMLElement;
     expect(within(row).getByText(/Your own entry/)).toBeInTheDocument();
-    expect(within(row).getByLabelText(/Role for Admin@InterviewKickstart.com/)).toBeDisabled();
+    expect(within(row).getByRole('button', { name: /^Role for Admin@InterviewKickstart\.com/ })).toBeDisabled();
     expect(within(row).getByLabelText(/Active for Admin@InterviewKickstart.com/)).toBeDisabled();
     expect(within(row).getByRole('button', { name: 'Save' })).toBeDisabled();
     // No hidden workaround: the entry id never reaches updateAdminAllowlistEntry.
@@ -293,7 +294,7 @@ describe('AccessSection', () => {
       .getByText('solo@interviewkickstart.com')
       .closest('tr') as HTMLElement;
     expect(within(row).getByText(/Last linked active admin/)).toBeInTheDocument();
-    expect(within(row).getByLabelText(/Role for solo@interviewkickstart.com/)).toBeDisabled();
+    expect(within(row).getByRole('button', { name: /^Role for solo@interviewkickstart\.com/ })).toBeDisabled();
     expect(within(row).getByLabelText(/Active for solo@interviewkickstart.com/)).toBeDisabled();
     expect(within(row).getByRole('button', { name: 'Save' })).toBeDisabled();
     expect(apiFns.updateAdminAllowlistEntry).not.toHaveBeenCalled();
@@ -359,8 +360,8 @@ describe('AccessSection — dexity.com domain switch (0133)', () => {
     const { container } = renderAccess();
     await screen.findByText("Hand over a person's records");
     fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
-    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e3');
-    await userEvent.selectOptions(screen.getByLabelText('To (new login)'), 'e4');
+    await pickOption(userEvent.setup(), /^From \(old login\)/, /viewer\.one/);
+    await pickOption(userEvent.setup(), /^To \(new login\)/, /second\.admin/);
     fireEvent.click(screen.getByRole('button', { name: 'Hand over' }));
     expect(screen.getByRole('button', { name: 'Hand over records' })).toBeInTheDocument();
     await expect(container).toHaveNoViolations();
@@ -381,23 +382,18 @@ describe('AccessSection — dexity.com domain switch (0133)', () => {
     await screen.findByText("Hand over a person's records");
     fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
 
-    const fromOptions = within(screen.getByLabelText('From (old login)'))
-      .getAllByRole('option')
-      .map((o) => o.textContent);
+    const fromOptions = await optionsOf(userEvent.setup(), /^From \(old login\)/);
     // e2 has never signed in (pending) — it owns nothing and is not offered.
     expect(fromOptions).toEqual([
-      'Choose a person',
       'Admin@InterviewKickstart.com',
       'viewer.one@interviewkickstart.com (disabled)',
       'second.admin@interviewkickstart.com',
     ]);
 
-    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e4');
-    const toOptions = within(screen.getByLabelText('To (new login)'))
-      .getAllByRole('option')
-      .map((o) => o.textContent);
+    await pickOption(userEvent.setup(), /^From \(old login\)/, /second\.admin/);
+    const toOptions = await optionsOf(userEvent.setup(), /^To \(new login\)/);
     // Disabled e3 and the chosen source e4 are excluded.
-    expect(toOptions).toEqual(['Choose a person', 'Admin@InterviewKickstart.com']);
+    expect(toOptions).toEqual(['Admin@InterviewKickstart.com']);
   });
 
   it('hands over only after explicit confirmation and reports the counts', async () => {
@@ -407,8 +403,8 @@ describe('AccessSection — dexity.com domain switch (0133)', () => {
     const trigger = screen.getByRole('button', { name: 'Hand over' });
     expect(trigger).toBeDisabled();
 
-    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e3');
-    await userEvent.selectOptions(screen.getByLabelText('To (new login)'), 'e4');
+    await pickOption(userEvent.setup(), /^From \(old login\)/, /viewer\.one/);
+    await pickOption(userEvent.setup(), /^To \(new login\)/, /second\.admin/);
     fireEvent.click(screen.getByRole('button', { name: 'Hand over' }));
     expect(apiFns.handoverAdminAllowlistRecords).not.toHaveBeenCalled();
 
@@ -432,8 +428,8 @@ describe('AccessSection — dexity.com domain switch (0133)', () => {
     renderAccess();
     await screen.findByText("Hand over a person's records");
     fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
-    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e3');
-    await userEvent.selectOptions(screen.getByLabelText('To (new login)'), 'e4');
+    await pickOption(userEvent.setup(), /^From \(old login\)/, /viewer\.one/);
+    await pickOption(userEvent.setup(), /^To \(new login\)/, /second\.admin/);
     fireEvent.click(screen.getByRole('button', { name: 'Hand over' }));
     fireEvent.click(screen.getByRole('button', { name: 'Hand over records' }));
     expect(

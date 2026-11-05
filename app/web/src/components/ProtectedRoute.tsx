@@ -21,7 +21,7 @@
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth, type MembershipRole } from '../lib/auth';
 import { sanitizeReturnTo } from '../lib/return-to';
-import { LoadingPanel } from './design';
+import { ErrorPanel, LoadingPanel } from './design';
 
 interface ProtectedRouteProps {
   /**
@@ -33,7 +33,7 @@ interface ProtectedRouteProps {
 }
 
 export function ProtectedRoute({ requireRole }: ProtectedRouteProps = {}) {
-  const { isLoading, isAuthenticated, role, isRoleLoading } = useAuth();
+  const { isLoading, isAuthenticated, role, isRoleLoading, roleCheckFailed, retryRoleCheck } = useAuth();
   const location = useLocation();
 
   // Still checking session — no data rendered
@@ -70,8 +70,23 @@ export function ProtectedRoute({ requireRole }: ProtectedRouteProps = {}) {
     );
   }
 
-  // Role resolved to null — /api/me denied or failed (revoked allowlist
-  // entry, inactive account, stale session). Fail closed.
+  // The check itself failed: a blip, not an answer. Still fail closed, with no
+  // data on screen, but in place and with a Retry: a redirect to "Access denied"
+  // stuck for someone who was never denied, and reloading did not clear it.
+  if (role === null && roleCheckFailed) {
+    return (
+      <div className="app-ground flex min-h-screen items-center justify-center px-4">
+        <ErrorPanel
+          className="sheet w-full max-w-md"
+          message="We couldn't check your access."
+          onRetry={() => void retryRoleCheck()}
+        />
+      </div>
+    );
+  }
+
+  // Role resolved to null: /api/me said no (revoked allowlist entry, inactive
+  // account, stale session). Fail closed.
   if (role === null) {
     return <Navigate to="/unauthorized" replace />;
   }

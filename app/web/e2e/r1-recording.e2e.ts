@@ -15,6 +15,7 @@
  */
 import type { Locator } from '@playwright/test';
 import { auditA11y } from './fixtures/axe';
+import { pickSession } from './fixtures/flows';
 import {
   R1_CANDIDATE_ID,
   R1_REC_LENGTH_SEC,
@@ -99,8 +100,9 @@ test.describe('Review tab (admin): click a transcript turn to seek', () => {
   test('the R1 session plays through the R1 player, never the legacy one, and a click lands on the turn', async ({ app, page }, testInfo) => {
     await app.goto(REVIEW);
     const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await panel.getByRole('combobox').selectOption(R1_SESSION_ATTEMPT_1);
+    await panel.getByRole('button', { name: /^Session/ }).click();
     await expect(panel.getByRole('option', { name: /R1 role-play/ })).toHaveCount(2);
+    await panel.getByRole('option', { name: /R1 role-play · 10m 0s/ }).click();
 
     // The R1 player, not the legacy "Recording loads on request" row.
     const load = panel.getByRole('button', { name: 'Load recording, R1 role-play' });
@@ -156,7 +158,7 @@ test.describe('Review tab (admin): click a transcript turn to seek', () => {
   test('the highlight follows the playhead: a row lights at its own start, on frames while playing', async ({ app, page }) => {
     await app.goto(REVIEW);
     const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await panel.getByRole('combobox').selectOption(R1_SESSION_ATTEMPT_1);
+    await pickSession(panel, /R1 role-play · 10m 0s/);
     await panel.getByRole('button', { name: 'Load recording, R1 role-play' }).click();
     const video = panel.locator('video');
     await expect.poll(() => duration(video)).toBeGreaterThan(R1_REC_LENGTH_SEC - 5);
@@ -247,7 +249,7 @@ test.describe('the link expires, or was bad to begin with', () => {
   test('a double-click on an aged link: one more mint, the row stays lit through the reload, and playback lands on it', async ({ app, page }) => {
     await app.goto(REVIEW);
     const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await panel.getByRole('combobox').selectOption(R1_SESSION_ATTEMPT_1);
+    await pickSession(panel, /R1 role-play · 10m 0s/);
     await panel.getByRole('button', { name: 'Load recording, R1 role-play' }).click();
     const video = panel.locator('video');
     await expect.poll(() => duration(video)).toBeGreaterThan(R1_REC_LENGTH_SEC - 5);

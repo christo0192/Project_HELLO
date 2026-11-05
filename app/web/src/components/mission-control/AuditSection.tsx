@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type { AdminAuditRow } from '../../types';
 import {
   Button,
@@ -29,9 +30,29 @@ import {
   Th,
   Tr,
 } from '../design';
+import { humanizeEnum } from '../../lib/humanize';
 import { formatDateTime, shortId } from './statusMeta';
 
 const PAGE_SIZE = 50 as const;
+
+/**
+ * The words for the actions people ask about. Anything else falls back to its
+ * own words through `humanizeEnum`, and the stored value stays one hover away
+ * for anyone quoting the log.
+ */
+const ACTION_LABELS: Readonly<Record<string, string>> = {
+  'allowlist.add': 'Access entry added',
+  'allowlist.update': 'Access entry changed',
+  'allowlist.handover': 'Records handed over',
+  'session.override': 'Session status changed',
+  'quota.create': 'Quota policy created',
+  'quota.update': 'Quota policy changed',
+  'maintenance.update': 'Maintenance mode changed',
+};
+
+function actionLabel(action: string): string {
+  return ACTION_LABELS[action] ?? humanizeEnum(action.replace(/\./g, ' '));
+}
 
 export function AuditSection() {
   const [audit, setAudit] = useState<AdminAuditRow[] | null>(null);
@@ -50,7 +71,9 @@ export function AuditSection() {
         setAudit(r.audit);
         setOffset(nextOffset);
       })
-      .catch((e: ApiError) => { if (gen === loadGen.current) setLoadError(e.message); });
+      .catch((e: ApiError) => {
+        if (gen === loadGen.current) setLoadError(`The audit log couldn't load. ${plainErrorText(e.message)}`);
+      });
   }, []);
 
   useEffect(() => {
@@ -100,7 +123,7 @@ export function AuditSection() {
         />
       ) : (
         <div>
-          <Table caption="Recent audit events — action, result, actor, target and time" maxHeight="34rem">
+          <Table bare flush caption="Recent audit events — action, result, actor, target and time" maxHeight="34rem">
             <THead>
               <Tr>
                 <Th>Action</Th>
@@ -114,8 +137,8 @@ export function AuditSection() {
               {audit.map((row) => (
                 <Tr key={row.id}>
                   <Td>
-                    <span className="inline-block rounded-md bg-surface-tertiary px-1.5 py-0.5 text-xs text-ink">
-                      {row.action}
+                    <span title={row.action} className="text-sm text-ink">
+                      {actionLabel(row.action)}
                     </span>
                   </Td>
                   <Td>
@@ -128,17 +151,17 @@ export function AuditSection() {
                             : 'neutral'
                       }
                     >
-                      {row.result}
+                      <span title={row.result}>{humanizeEnum(row.result)}</span>
                     </StatusBadge>
                   </Td>
                   <Td>
-                    <p className="text-xs text-ink">{row.actor_type}</p>
+                    <p className="text-xs text-ink">{humanizeEnum(row.actor_type)}</p>
                     <p className="text-xs text-ink-tertiary">
                       {shortId(row.actor_id)}
                     </p>
                   </Td>
                   <Td>
-                    <p className="text-xs text-ink">{row.target_type}</p>
+                    <p className="text-xs text-ink">{humanizeEnum(row.target_type)}</p>
                     <p className="text-xs text-ink-tertiary">
                       {shortId(row.target_id)}
                     </p>

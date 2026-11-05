@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -2831,5 +2831,29 @@ describe('AshbyMissionControlPage — invite actions follow the legacy lane swit
       .getAllByRole('menuitem')
       .map((item) => item.textContent);
     expect(names).toEqual(['Get invite link', 'Cancel screening']);
+  });
+});
+
+describe('A failed read is not an empty list', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+  });
+
+  it('says it could not load, with a Retry, and never that no jobs are mapped', async () => {
+    listAshbyMappings.mockRejectedValueOnce(new Error('boom'));
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    renderPage();
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Ashby jobs and applications couldn't load/);
+    expect(screen.queryByText('No jobs are mapped yet.')).not.toBeInTheDocument();
+    expect(screen.queryByText('No applications yet.')).not.toBeInTheDocument();
+    // There is nothing to add a mapping to until the list is known.
+    expect(screen.queryByRole('button', { name: 'Add mapping' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByRole('button', { name: 'Add mapping' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

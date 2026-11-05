@@ -97,7 +97,7 @@ describe('TranscriptionSyncWorkspace', () => {
         blocked={false}
       />,
     );
-    expect(screen.getByRole('combobox')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
     expect(screen.getAllByRole('option')).toHaveLength(2);
   });
 
@@ -438,8 +438,8 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     );
     await screen.findByText(/no transcript lines/i);
     expect(mockApi.getCandidatePhoneAttempts).not.toHaveBeenCalled();
-    // A browser session keeps its own length in the picker.
-    expect(screen.getByRole('option')).toHaveTextContent('5m 0s');
+    // A browser session keeps its own length in the session line.
+    expect(document.querySelector('[data-session-text]')).toHaveTextContent('5m 0s');
   });
 
   it('shows every leg in order with its window, recorded length and truthful notes', async () => {
@@ -467,16 +467,16 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
   it('the picker shows the recorded total across the calls, never duration_sec', async () => {
     renderPhone();
     await screen.findByRole('list', { name: 'Calls in this session' });
-    const option = screen.getByRole('option');
-    expect(option).toHaveTextContent('Recorded 1m 11s across 2 calls');
-    expect(option).not.toHaveTextContent('1m 15s');
+    const line = document.querySelector('[data-session-text]');
+    expect(line).toHaveTextContent('Recorded 1m 11s across 2 calls');
+    expect(line).not.toHaveTextContent('1m 15s');
   });
 
   it('a phone session with no recorded facts shows no length rather than duration_sec', async () => {
     const bare: Session = { ...SESSION_PHONE, recorded_total_sec: null, recorded_legs: null };
     renderPhone({ session: bare });
     await screen.findByRole('list', { name: 'Calls in this session' });
-    expect(screen.getByRole('option')).not.toHaveTextContent(/1m 15s|Recorded/);
+    expect(document.querySelector('[data-session-text]')).not.toHaveTextContent(/1m 15s|Recorded/);
   });
 
   it('mints nothing on load; each leg has its own player named after the leg', async () => {
@@ -578,8 +578,8 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     expect(row).not.toHaveTextContent(/may end a few seconds|end not observed/);
     // T08b: the same consent tag as the call-attempt list.
     expect(within(row).getByText('Recorded before consent')).toBeInTheDocument();
-    expect(screen.getByRole('option')).toHaveTextContent('Recorded 33s');
-    expect(screen.getByRole('option')).not.toHaveTextContent('across');
+    expect(document.querySelector('[data-session-text]')).toHaveTextContent('Recorded 33s');
+    expect(document.querySelector('[data-session-text]')).not.toHaveTextContent('across');
   });
 
   it('T08b: tags a withdrawn consent and an in-call callback request on their legs only', async () => {

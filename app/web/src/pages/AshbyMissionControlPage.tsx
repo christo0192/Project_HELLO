@@ -17,7 +17,9 @@ import {
   cx,
   Dialog,
   EmptyPanel,
+  ErrorPanel,
   GlassPanel,
+  RetryButton,
   InlineNotice,
   LoadingPanel,
   PageHeader,
@@ -32,6 +34,7 @@ import type { ComboboxOption, StatusTone } from '../components/design';
 // the index is shared with work in flight elsewhere.
 import { OverflowMenu } from '../components/design/OverflowMenu';
 import type { OverflowMenuItem } from '../components/design/OverflowMenu';
+import { apiErrorCopy } from '../lib/api-error-copy';
 import { humanizeEnum } from '../lib/humanize';
 // A failed operation's sanitized code, in words (a `:suffix` falls back to its prefix).
 import { ashbyErrorCodeLabel } from '../lib/ashby-labels';
@@ -363,6 +366,11 @@ export function AshbyMissionControlPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  /** The lists could not be read. Empty arrays then mean nothing at all. */
+  const [readFailed, setReadFailed] = useState(false);
+  const [readError, setReadError] = useState('');
+  /** True once a read has succeeded: a later failure keeps those rows on screen. */
+  const [everRead, setEverRead] = useState(false);
   /**
    * The one-time invite link for a single application, held in COMPONENT STATE
    * ONLY. It is never written to localStorage/sessionStorage, never put in the
@@ -444,12 +452,23 @@ export function AshbyMissionControlPage() {
       setWorkflows(w.workflows);
       setWorkflowsTruncated(w.truncated === true);
       setError(null);
+      setReadFailed(false);
+      setEverRead(true);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : 'Failed to load Ashby Live Jobs');
+      // A failed read is not a failed write: it says what is missing and has a
+      // Retry, and it never reads as "no jobs are mapped".
+      setReadFailed(true);
+      setReadError(e instanceof ApiError ? apiErrorCopy(e) : 'Try again in a moment.');
     } finally {
       setLoaded(true);
     }
   }, []);
+
+  const retryRead = useCallback(() => {
+    setReadFailed(false);
+    if (!everRead) setLoaded(false);
+    void load();
+  }, [everRead, load]);
 
   useEffect(() => {
     void load();
@@ -1402,6 +1421,16 @@ export function AshbyMissionControlPage() {
       />
 
       {!loaded && <LoadingPanel />}
+      {readFailed && everRead && (
+        <InlineNotice
+          tone="danger"
+          role="alert"
+          className="mt-6"
+          action={<RetryButton onRetry={retryRead} />}
+        >
+          These lists couldn't refresh, so they may be out of date. {readError}
+        </InlineNotice>
+      )}
       {error && (
         <InlineNotice tone="danger" role="alert" className="mt-6">
           {error}
@@ -1420,8 +1449,15 @@ export function AshbyMissionControlPage() {
         )}
       </div>
 
+      {readFailed && !everRead ? (
+        <ErrorPanel
+          className="mt-6"
+          message={`Ashby jobs and applications couldn't load. ${readError}`}
+          onRetry={retryRead}
+        />
+      ) : (
       <div className="mt-6 flex flex-col gap-6">
-          <GlassPanel>
+          <GlassPanel level="ruled">
             <SectionHeader
               level={2}
               title="Job mappings"
@@ -1627,7 +1663,7 @@ export function AshbyMissionControlPage() {
             )}
           </GlassPanel>
 
-          <GlassPanel>
+          <GlassPanel level="ruled">
             <SectionHeader
               level={2}
               title="Application workflows"
@@ -1656,6 +1692,7 @@ export function AshbyMissionControlPage() {
             )}
           </GlassPanel>
       </div>
+      )}
 
       {/* At the page root, on purpose: any transformed ancestor would become the
           containing block for this `position: fixed` overlay. */}

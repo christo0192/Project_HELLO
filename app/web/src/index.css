@@ -167,6 +167,10 @@
     background-color: var(--field);
     border-radius: var(--radius-card);
   }
+  /* A section of the sheet: no box, one printed rule across the top. */
+  .sheet-section {
+    border-top: 1px solid var(--rule-2);
+  }
   /* Modal material (Dialog, SlideOver, menus). The one surface in front of the
      page, so the one place a shadow is allowed. */
   .glass-modal {

@@ -118,6 +118,43 @@ async function pick(triggerName: RegExp, optionName: string | RegExp): Promise<v
   await userEvent.click(within(list).getByRole('option', { name: optionName }));
 }
 
+describe('RoleScorecardEditor as a printed list', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
+    api.listScorecardMetrics.mockResolvedValue(LIBRARY);
+    api.putRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
+  });
+
+  it('prints no machine key, and keeps it one hover away', async () => {
+    const { container } = render(<RoleScorecardEditor roleId="r1" />);
+    await screen.findAllByLabelText(/Weight for /);
+    const [first] = SCORECARD.metrics;
+    expect(screen.queryByText(first.key)).not.toBeInTheDocument();
+    expect(screen.getByText(first.name)).toHaveAttribute('title', first.key);
+    expect(container.querySelector('[data-metric-row] .glass-sunken')).toBeNull();
+  });
+
+  it('draws rows split by rules, not a box per metric', async () => {
+    const { container } = render(<RoleScorecardEditor roleId="r1" />);
+    await screen.findAllByLabelText(/Weight for /);
+    expect(container.querySelector('[data-metric-row]')).not.toHaveClass('glass-sunken');
+    expect(container.querySelector('[data-scorecard-metrics]')).toHaveClass('divide-y');
+  });
+
+  it('tells its form when the card differs from the saved one, and when it stops', async () => {
+    const onDirtyChange = vi.fn();
+    render(<RoleScorecardEditor roleId="r1" onDirtyChange={onDirtyChange} />);
+    const [box] = await screen.findAllByLabelText(/Weight for /);
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    const was = (box as HTMLInputElement).value;
+    fireEvent.change(box, { target: { value: '5' } });
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+    fireEvent.change(box, { target: { value: was } });
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false));
+  });
+});
+
 describe('RoleScorecardEditor', () => {
   beforeEach(() => {
     // MUST come first. Without it these hoisted `vi.fn()`s keep their call

@@ -18,7 +18,7 @@ describe('TranscriptList', () => {
     );
     expect(screen.getByText('Welcome to the screening.')).toBeInTheDocument();
     expect(screen.getByText('Thank you!')).toBeInTheDocument();
-    expect(screen.getAllByText('Bot')).toHaveLength(1);
+    expect(screen.getAllByText('Christy (AI)')).toHaveLength(1);
     expect(screen.getByText('Candidate')).toBeInTheDocument();
   });
 

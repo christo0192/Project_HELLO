@@ -50,7 +50,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import {
   candidateMatchesJobState,
@@ -61,11 +61,12 @@ import {
   shouldResetRoleFilter,
 } from "../lib/mapped-roles";
 import type { Candidate, Role } from "../types";
-import type { CandidateFilters } from "../components/talent";
+import type { CandidateFilters, CandidateListView, CandidateSortKey } from "../components/talent";
 import { CandidateButton, CandidateInput } from "../components/design/candidate";
 import {
   Button,
   buttonClass,
+  Combobox,
   EmptyPanel,
   ErrorPanel,
   Field,
@@ -73,8 +74,8 @@ import {
   InlineNotice,
   LoadingPanel,
   Pagination,
+  RetryButton,
   SegmentedControl,
-  SelectField,
   StatusBadge,
   Table,
   TBody,
@@ -108,7 +109,16 @@ import {
   parseCandidateFilters,
   recommendationLabel,
   RECOMMENDATION_ORDER,
+  applyCandidateListView,
   candidateDisplayName,
+  candidateListName,
+  candidateWaitingSince,
+  DEFAULT_CANDIDATE_VIEW,
+  EMPTY_CANDIDATE_FILTERS,
+  formatWaiting,
+  isInFlightShell,
+  orderCandidates,
+  parseCandidateListView,
   ResumeReviewBadge,
   resumeReviewLabel,
   RESUME_REVIEW_ORDER,
@@ -118,21 +128,22 @@ import {
   INTAKE_TYPE_ORDER,
   intakeTypeLabel,
 } from "../components/talent/ResumeReviewBadge";
-import type { StatusTone } from "../components/design/StatusBadge";
 import type { PipelineTone } from "../components/talent";
 import { apiErrorCopy } from "../lib/api-error-copy";
+import { formatDateTime } from "../lib/datetime";
 import { roleAgentName } from "../lib/role-label";
+import { VerdictMark } from "../components/session/VerdictMark";
 
 /**
  * Filter pill. Multi-select toggles, so these stay `button`s carrying
  * `aria-pressed` rather than becoming a `SegmentedControl` (which is a
- * single-choice radio group). The 44px minimum target is kept: `min-h-11`
- * is what the scope integration test reads, and it is also the reason the
- * pill is taller than the 32px chips elsewhere in the shell.
+ * single-choice radio group). 36px with a mouse, the control height, because
+ * the rows of pills are what pushed the list off the first screen; 44px on a
+ * touch screen, which the scope integration test reads.
  */
 const FILTER_PILL_CLASS = (selected: boolean) =>
   [
-    "inline-flex min-h-11 items-center gap-1.5 rounded-control px-3 text-label font-medium transition-colors duration-hover",
+    "inline-flex min-h-9 items-center gap-1.5 rounded-control px-3 text-label font-medium transition-colors duration-hover [@media(pointer:coarse)]:min-h-11",
     // The offset is what shows on a selected chip: its fill and its ring are both ink.
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
     selected
@@ -143,12 +154,6 @@ const FILTER_PILL_CLASS = (selected: boolean) =>
 /** The live count inside a pill. Never the tone colour on the tone's fill. */
 const PILL_COUNT_CLASS = (selected: boolean) =>
   selected ? "tabular-nums" : "tabular-nums text-[var(--c-ink-secondary)]";
-
-const RECOMMENDATION_TONE: Record<string, StatusTone> = {
-  advance: "success",
-  hold: "warning",
-  reject: "neutral",
-};
 
 /**
  * Bar colour per status. Deliberately NOT the `StatusBadge` tone map: a badge
@@ -217,7 +222,7 @@ function AgentCell({ role }: { role: Role | undefined }) {
  * single FK and a row is one Ashby APPLICATION, so a person who applied to two
  * roles is two rows carrying one role each. Rendering a list here would imply
  * a many-to-many the data cannot express, and would make the row's
- * "Review & decide" ambiguous about which application it decides.
+ * "Review" ambiguous about which application it reviews.
  *
  * Three distinct states, deliberately not collapsed into one:
  *   - no role on the candidate          → "No role"
@@ -265,7 +270,7 @@ function SkillsCell({ skills }: { skills: string[] }) {
   const more = skills.length - shown.length;
   return (
     <span
-      className="flex w-[7.5rem] items-baseline gap-1.5 text-label"
+      className="flex w-[6.5rem] items-baseline gap-1.5 text-label"
       title={skills.join(", ")}
     >
       <span className="min-w-0 truncate text-[var(--c-ink)]">{shown.join(", ")}</span>
@@ -277,21 +282,58 @@ function SkillsCell({ skills }: { skills: string[] }) {
 }
 
 /**
- * Twelve-pixel cell padding instead of the table's default sixteen, with the
- * outer edges kept at sixteen so the first column still lines up with the
- * filter panel above. Eight columns at sixteen a side spent 256px on gutters,
- * which is exactly what pushed the next-action column off a 1440px screen.
- * A descendant selector, so it wins over the cell's own padding without
- * touching the shared `Table`.
+ * Ten-pixel cell padding instead of the table's default sixteen, and none on the
+ * outer edges, so the first column starts on the sheet's own margin with the
+ * filters above it. Nine columns at sixteen a side spent 288px on gutters, which
+ * is what pushed the table past its panel at 1366. A descendant selector, so it
+ * wins over the cell's own padding without touching the shared `Table`.
  */
 const TABLE_DENSITY =
-  "[&_td]:px-3 [&_th]:px-3 [&_td:first-child]:pl-4 [&_th:first-child]:pl-4 [&_td:last-child]:pr-4 [&_th:last-child]:pr-4";
+  "[&_td]:px-2.5 [&_th]:px-2.5 [&_td:first-child]:pl-0 [&_th:first-child]:pl-0 [&_td:last-child]:pr-0 [&_th:last-child]:pr-0";
+
+/**
+ * A column the list can be ordered by. The button is the header's text, and
+ * `aria-sort` sits on the header cell, where a screen reader looks for it.
+ */
+function SortHeader({
+  label,
+  sortKey,
+  description,
+  view,
+  onSort,
+  className,
+}: {
+  label: string;
+  sortKey: CandidateSortKey;
+  /** What the order is by, for a reader who cannot see the column. */
+  description: string;
+  view: CandidateListView;
+  onSort: (key: CandidateSortKey) => void;
+  className?: string;
+}) {
+  const active = view.sort === sortKey;
+  return (
+    <Th aria-sort={active ? (view.dir === "asc" ? "ascending" : "descending") : "none"} className={className}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className="form-label inline-flex items-center gap-1 rounded-evidence hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+      >
+        {label}
+        <span className="sr-only">, {description}</span>
+        <span aria-hidden="true" className="w-2 text-center">
+          {active ? (view.dir === "asc" ? "↑" : "↓") : ""}
+        </span>
+      </button>
+    </Th>
+  );
+}
 
 /**
  * The next step as something to CLICK when there is one, and a dash when
  * there is not.
  *
- * An actionable step ("Start screening", "Review & decide") is a link styled
+ * An actionable step ("Start screening", "Review") is a link styled
  * as a secondary button, to the page where the step happens: the Review tab
  * for a decision, the candidate's Overview (where the call and invite live)
  * for a screening. Every other state is waiting on the system ("Queued for
@@ -300,20 +342,23 @@ const TABLE_DENSITY =
  * around the few buttons that matter. The words stay for screen readers and
  * on hover.
  *
- * The link's accessible name carries the candidate ("Review & decide, Meera
- * Iyer"): a column of identical "Review & decide" links is ambiguous out of
- * the row's context, which is how a screen reader's links list presents it.
+ * The link's accessible name carries the candidate ("Review, Meera Iyer"): a
+ * column of identical "Review" links is ambiguous out of the row's context,
+ * which is how a screen reader's links list presents it.
  */
 function NextActionCell({
   candidateId,
   candidateName,
   status,
   next,
+  listSearch,
 }: {
   candidateId: string;
   candidateName: string;
   status: string | null | undefined;
   next: { label: string; emphasis: boolean };
+  /** The list's address, so the record's Back link can return to it. */
+  listSearch: string;
 }) {
   if (next.emphasis) {
     // `status` is the DISPLAY key (candidateStatusKey), the same one the
@@ -322,9 +367,10 @@ function NextActionCell({
     return (
       <Link
         to={`/candidates/${candidateId}${isReview ? "?tab=review" : ""}`}
+        state={{ listSearch }}
         // The compact size with a 36px floor (`min-h-9`, the design
         // system's control minimum): the md size's wider padding alone would
-        // push this column, and so the table, past a 1440px layout.
+        // push this column, and so the table, past its panel.
         className={buttonClass("secondary", "sm", "min-h-9")}
       >
         <span>{next.label}</span>
@@ -342,9 +388,21 @@ function NextActionCell({
 
 export function CandidatesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { search: listSearch } = useLocation();
   const filters = parseCandidateFilters(searchParams);
   const filterKey = buildCandidateSearch(filters).toString();
   const { roleId } = filters;
+  const view = parseCandidateListView(searchParams);
+  // Read through a ref: the filter callbacks below are memoised on the filters
+  // alone, and a stale closure would put back the size the reader just changed.
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  /**
+   * A filter's URL. A new filter is a new list, so the page goes back to 1; the
+   * rows per page and the sort are the reader's own and carry over.
+   */
+  const searchFor = (next: CandidateFilters): URLSearchParams =>
+    applyCandidateListView(buildCandidateSearch(next), { ...viewRef.current, page: 1 });
 
   /**
    * The search box. `draft` is what is typed; the URL (`filters.query`) is
@@ -369,7 +427,7 @@ export function CandidatesPage() {
     if (next === filters.query) return;
     const t = window.setTimeout(() => {
       committed.current = next;
-      setSearchParams(buildCandidateSearch({ ...filters, query: next }), { replace: true });
+      setSearchParams(searchFor({ ...filters, query: next }), { replace: true });
     }, SEARCH_COMMIT_MS);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -438,7 +496,7 @@ export function CandidatesPage() {
         setEverLoaded(true);
       })
       .catch((e: unknown) => {
-        if (gen === loadGen.current) setError(`The candidate list did not load. ${apiErrorCopy(e)}`);
+        if (gen === loadGen.current) setError(`The candidate list couldn't load. ${apiErrorCopy(e)}`);
       });
   }, []);
 
@@ -455,7 +513,10 @@ export function CandidatesPage() {
   const [rolesLoaded, setRolesLoaded] = useState(false);
   /** True once the roles request has settled either way (success or failure). */
   const [rolesSettled, setRolesSettled] = useState(false);
-  useEffect(() => {
+  /** The Role and Agent columns show a dash for "we do not know"; this says why. */
+  const [rolesFailed, setRolesFailed] = useState(false);
+  const loadRoles = useCallback(() => {
+    setRolesFailed(false);
     api
       .listRoles()
       .then((rows) => {
@@ -471,8 +532,10 @@ export function CandidatesPage() {
       .catch(() => {
         setRoles([]);
         setRolesSettled(true);
+        setRolesFailed(true);
       });
   }, []);
+  useEffect(loadRoles, [loadRoles]);
 
   useEffect(() => {
     loadCandidates(roleId);
@@ -483,7 +546,7 @@ export function CandidatesPage() {
   // role) is dropped.
   const applyFilters = useCallback(
     (next: Partial<CandidateFilters>) => {
-      setSearchParams(buildCandidateSearch({ ...filters, ...next }));
+      setSearchParams(searchFor({ ...filters, ...next }));
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [filterKey, setSearchParams],
@@ -566,7 +629,7 @@ export function CandidatesPage() {
     filters.jobState !== null && rolesSettled && rawCandidates !== null && rawCandidates.length > 0 && !statusesAvailable;
   useEffect(() => {
     if (!dropUnusableScope) return;
-    setSearchParams(buildCandidateSearch({ ...filters, jobState: null }), { replace: true });
+    setSearchParams(searchFor({ ...filters, jobState: null }), { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dropUnusableScope, filterKey, setSearchParams]);
   /** Roles in the scope: feeds the Pipeline-by-role panel (a role-level funnel). */
@@ -597,20 +660,21 @@ export function CandidatesPage() {
   const resetRole = shouldResetRoleFilter(roleId, rolesLoaded, roleOptions);
   useEffect(() => {
     if (!resetRole) return;
-    setSearchParams(buildCandidateSearch({ ...filters, roleId: null }), { replace: true });
+    setSearchParams(searchFor({ ...filters, roleId: null }), { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resetRole, filterKey, setSearchParams]);
 
   const clearFilters = useCallback(() => {
-    setSearchParams(new URLSearchParams());
-  }, [setSearchParams]);
+    setSearchParams(searchFor(EMPTY_CANDIDATE_FILTERS));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, setSearchParams]);
 
   /** Clear the search now (no debounce) and keep the cursor in the box. */
   const clearSearch = useCallback(() => {
     setDraft("");
     committed.current = "";
     if (filters.query) {
-      setSearchParams(buildCandidateSearch({ ...filters, query: "" }), { replace: true });
+      setSearchParams(searchFor({ ...filters, query: "" }), { replace: true });
     }
     searchInputRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -656,7 +720,58 @@ export function CandidatesPage() {
     return () => window.clearTimeout(t);
   }, [searchResultCount]);
 
-  const page = usePagination(visible, 10, filterKey);
+  /**
+   * The order the view asks for. Asking for the arrivals, by filter or search, is
+   * asking to see them where the API put them.
+   */
+  const ordered = useMemo(
+    () =>
+      orderCandidates(visible, view, {
+        keepArrivals: filters.resumeReview.length > 0 || filters.query !== "",
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [visible, view.sort, view.dir, filterKey],
+  );
+
+  /**
+   * The page and its size live in the URL, with REPLACE: a page is a place in
+   * one list, not a step to go Back through, and Back from a candidate returns
+   * here. A new page starts at the top of the table.
+   */
+  const tableTopRef = useRef<HTMLDivElement | null>(null);
+  const page = usePagination(ordered, 10, undefined, {
+    page: view.page,
+    pageSize: view.size,
+    onChange: (next) => {
+      setSearchParams(
+        applyCandidateListView(buildCandidateSearch(filters), { ...view, page: next.page, size: next.pageSize }),
+        { replace: true },
+      );
+      tableTopRef.current?.scrollIntoView?.({ block: "start" });
+    },
+  });
+
+  /** One press orders the column, the next flips it, the third hands it back. */
+  const toggleSort = (key: CandidateSortKey) => {
+    const next: Pick<CandidateListView, "sort" | "dir"> =
+      view.sort !== key
+        ? { sort: key, dir: "desc" }
+        : view.dir === "desc"
+          ? { sort: key, dir: "asc" }
+          : { sort: null, dir: DEFAULT_CANDIDATE_VIEW.dir };
+    setSearchParams(applyCandidateListView(buildCandidateSearch(filters), { ...view, ...next, page: 1 }), {
+      replace: true,
+    });
+  };
+
+  // One reading of the clock per render: every row's age is measured from it.
+  const now = Date.now();
+  /** Shells being read among these rows: the line above the table says how many. */
+  const arrivals = useMemo(() => visible.filter(isInFlightShell), [visible]);
+  const oldestArrival = arrivals.reduce<string | null>(
+    (oldest, c) => (oldest === null || c.created_at < oldest ? c.created_at : oldest),
+    null,
+  );
 
   // From the EFFECTIVE scope, so an unusable `?ashby=` never leaves a chip-less row.
   const active = hasActiveFilters({ ...filters, jobState });
@@ -741,10 +856,8 @@ export function CandidatesPage() {
     intakeTypeCounts.size > 0 || filters.intakeType.length > 0;
 
   /**
-   * The list panel (search box + live region + rows) stays mounted across
-   * reloads once a list has loaded, and when a role-scoped load is empty but
-   * a `?q=` is set, so the box can always be cleared and the live region is
-   * never torn down.
+   * The list panel stays mounted across reloads once a list has loaded, so a
+   * reload does not tear it down and the page does not jump.
    */
   const showListPanel =
     !error &&
@@ -753,13 +866,12 @@ export function CandidatesPage() {
   return (
     <CandidateShell variant="inset">
       <CandidateHeader
-        eyebrow="Talent workspace"
         title="Candidates"
-        description="Upload resumes, review parsed profiles, and move candidates through screening."
         actions={
+          // Secondary: candidates arrive from Ashby, so this is the rare path and
+          // the page's filled action, if any, is not this one.
           <Button
-            size="lg"
-            variant="primary"
+            variant="secondary"
             aria-expanded={uploadOpen}
             aria-controls={uploadPanelId}
             // No focus move: the panel is directly below this button.
@@ -786,7 +898,7 @@ export function CandidatesPage() {
 
       {/* Filter bar — one panel, so the whole filter contract reads as a
           single control surface rather than four stacked rows. */}
-      <GlassPanel as="section" aria-label="Filters" padding="sm" className="mt-6">
+      <GlassPanel level="ruled" as="section" aria-label="Filters" padding="sm" className="mt-1">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-section text-[var(--c-ink)]">
             All candidates
@@ -799,6 +911,53 @@ export function CandidatesPage() {
             )}
           </h2>
           <div className="flex w-full flex-wrap items-center gap-3 sm:w-auto">
+            {/* SEARCH. Not a <form>: Enter submits nothing, the list follows the
+                typing. `type="search"` gives the searchbox role; the browser's
+                own cancel glyph is hidden in favour of one real, labelled
+                button that every engine shows. */}
+            <div role="search" aria-label="Candidates" className="relative w-full sm:w-64">
+              <label htmlFor="candidate-search" className="sr-only">
+                Search candidates
+              </label>
+              <CandidateInput
+                id="candidate-search"
+                ref={searchInputRef}
+                type="search"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape" && draft) {
+                    e.preventDefault();
+                    clearSearch();
+                  }
+                }}
+                placeholder={phoneSearchable ? "Name, email or phone" : "Name or email"}
+                aria-describedby="candidate-search-hint"
+                maxLength={CANDIDATE_QUERY_MAX}
+                autoComplete="off"
+                spellCheck={false}
+                enterKeyHint="search"
+                className="w-full pr-11 [@media(pointer:fine)]:min-h-9 [@media(pointer:fine)]:py-1.5 [&::-webkit-search-cancel-button]:appearance-none"
+              />
+              <span id="candidate-search-hint" className="sr-only">
+                {phoneSearchable
+                  ? "Matches name, email or phone. Results update as you type."
+                  : "Matches name or email. Results update as you type."}
+              </span>
+              {draft && (
+                <button
+                  type="button"
+                  onClick={clearSearch}
+                  aria-label="Clear search"
+                  className="absolute inset-y-0 right-0 inline-flex min-w-11 items-center justify-center rounded-control text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                >
+                  <span aria-hidden="true">×</span>
+                </button>
+              )}
+            </div>
+            <p role="status" data-search-status="" className="sr-only">
+              {searchAnnouncement}
+            </p>
             {jobStateCounts && (
               <SegmentedControl
                 ariaLabel="Filter by Ashby job status"
@@ -812,28 +971,38 @@ export function CandidatesPage() {
               />
             )}
             {roleOptions.length > 0 && (
-              <div className="w-full sm:w-56">
-                <label htmlFor="role-filter" className="sr-only">
-                  Filter by role
-                </label>
-                <SelectField
-                  id="role-filter"
-                  value={roleId ?? ""}
-                  onChange={(e) => setRole(e.target.value)}
-                  aria-label="Filter by role"
-                  className="w-full"
-                >
-                  <option value="">All roles</option>
-                  {roleOptions.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))}
-                </SelectField>
-              </div>
+              <Combobox
+                id="role-filter"
+                aria-label="Filter by role"
+                size="md"
+                floating
+                value={roleId ?? ""}
+                onChange={setRole}
+                options={[
+                  { value: "", label: "All roles" },
+                  ...roleOptions.map((option) => ({ value: option.id, label: option.label })),
+                ]}
+                placeholder="All roles"
+                searchLabel="Search roles"
+                listLabel="Roles"
+                noun={["role", "roles"]}
+                className="w-full sm:w-56"
+              />
             )}
           </div>
         </div>
+
+        {rolesFailed && (
+          <InlineNotice
+            tone="warning"
+            role="alert"
+            className="mt-3"
+            action={<RetryButton onRetry={loadRoles} />}
+          >
+            Roles couldn't load, so the Agent and Role columns show a dash and the role filter is
+            missing.
+          </InlineNotice>
+        )}
 
         {/* A failed phone read reports dial_count null, and the status then
             falls back to the stored value: an abandoned candidate reads
@@ -1120,57 +1289,29 @@ export function CandidatesPage() {
             candidates, even when a search matches none, so it can always be
             cleared. */}
         {showListPanel && (
-          <GlassPanel as="section" aria-label="Candidate list" padding="sm">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              {/* SEARCH. Not a <form>: Enter submits nothing, the list follows the
-                  typing. `type="search"` gives the searchbox role; the browser's
-                  own cancel glyph is hidden in favour of one real, labelled
-                  button that every engine shows. */}
-              <div role="search" aria-label="Candidates" className="relative w-full sm:w-72">
-                <label htmlFor="candidate-search" className="sr-only">
-                  Search candidates
-                </label>
-                <CandidateInput
-                  id="candidate-search"
-                  ref={searchInputRef}
-                  type="search"
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Escape" && draft) {
-                      e.preventDefault();
-                      clearSearch();
-                    }
-                  }}
-                  placeholder={phoneSearchable ? "Name, email or phone" : "Name or email"}
-                  aria-describedby="candidate-search-hint"
-                  maxLength={CANDIDATE_QUERY_MAX}
-                  autoComplete="off"
-                  spellCheck={false}
-                  enterKeyHint="search"
-                  className="w-full pr-11 [&::-webkit-search-cancel-button]:appearance-none"
-                />
-                <span id="candidate-search-hint" className="sr-only">
-                  {phoneSearchable
-                    ? "Matches name, email or phone. Results update as you type."
-                    : "Matches name or email. Results update as you type."}
+          <GlassPanel level="ruled" as="section" aria-label="Candidate list" padding="none">
+            {/* Arrivals, in one line, so the rows below start at a named person.
+                A shell that sits here for hours is a stuck one, so the age is
+                the oldest row's, and the link shows every one of them. */}
+            {arrivals.length > 0 && oldestArrival && filters.resumeReview.length === 0 && (
+              <p
+                data-arrivals=""
+                className="flex flex-wrap items-baseline gap-x-2 border-b border-[var(--c-border)] py-2 text-label text-[var(--c-ink-secondary)]"
+              >
+                <span>
+                  Arriving from Ashby: {arrivals.length}{" "}
+                  {arrivals.length === 1 ? "candidate" : "candidates"} being read, oldest{" "}
+                  {formatWaiting(oldestArrival, now)}.
                 </span>
-                {draft && (
-                  <button
-                    type="button"
-                    onClick={clearSearch}
-                    aria-label="Clear search"
-                    className="absolute inset-y-0 right-0 inline-flex min-w-11 items-center justify-center rounded-control text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
-                  >
-                    <span aria-hidden="true">×</span>
-                  </button>
-                )}
-              </div>
-            </div>
-
-          <p role="status" className="sr-only">
-            {searchAnnouncement}
-          </p>
+                <button
+                  type="button"
+                  onClick={() => applyFilters({ resumeReview: ["processing"] })}
+                  className="textlink rounded-evidence font-medium text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                >
+                  Show them
+                </button>
+              </p>
+            )}
 
           {/* The list API stops at PostgREST's 1,000-row cap; a search over a
               capped list would silently miss the older rows. */}
@@ -1186,13 +1327,13 @@ export function CandidatesPage() {
             )}
 
             {visible.length > 0 && (
-              <div className="-mx-4 mt-3">
+              <div ref={tableTopRef} className="scroll-mt-4">
                 {/* COLUMN WIDTHS. Every cell states the width it needs, so the
                     table's own min-content width is a real layout rather than
-                    whatever the browser squeezes out of eight auto columns: at
-                    1440px it fits the column exactly, and below that (a 390px
-                    phone) it keeps these widths and scrolls sideways INSIDE the
-                    table's own container, never the page.
+                    whatever the browser squeezes out of nine auto columns: at
+                    1366px it fits its panel, which e2e pins, and below that (a
+                    390px phone) it keeps these widths and scrolls sideways
+                    INSIDE the table's own container, never the page.
                       - Exp., Status, Recommendation and Next action never wrap
                         ("7 / yr" and a badge broken over two lines were the
                         review's complaint).
@@ -1210,7 +1351,21 @@ export function CandidatesPage() {
                       <Th>Skills</Th>
                       <Th className="whitespace-nowrap text-right">Exp.</Th>
                       <Th>Status</Th>
-                      <Th>Recommendation</Th>
+                      <SortHeader
+                        label="Recommendation"
+                        sortKey="score"
+                        description="by score"
+                        view={view}
+                        onSort={toggleSort}
+                      />
+                      <SortHeader
+                        label="Waiting"
+                        sortKey="waiting"
+                        description="since added, for candidates still in progress"
+                        view={view}
+                        onSort={toggleSort}
+                        className="whitespace-nowrap"
+                      />
                       <Th className="whitespace-nowrap">Next action</Th>
                     </Tr>
                   </THead>
@@ -1221,19 +1376,21 @@ export function CandidatesPage() {
                       const ds = candidateDisplayStatus(c);
                       const next = candidateNextAction(ds.key);
                       const role = c.role_id ? roleById.get(c.role_id) : undefined;
-                      const displayName = candidateDisplayName(c.name);
+                      const displayName = candidateListName(c, now);
+                      const waitingSince = candidateWaitingSince(c);
                       return (
                         <Tr key={c.id}>
                           <Td className="py-2">
                             <Link
                               to={`/candidates/${c.id}`}
+                              state={{ listSearch }}
                               className="font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
                             >
                               {displayName}
                             </Link>
                             {c.email && (
                               <p
-                                className="w-[10rem] truncate text-label text-[var(--c-ink-secondary)]"
+                                className="w-[9.5rem] truncate text-label text-[var(--c-ink-secondary)]"
                                 title={c.email}
                               >
                                 {c.email}
@@ -1243,7 +1400,7 @@ export function CandidatesPage() {
                           {/* The role's AGENT, left of the role itself. Looked up
                               from the same roles list — no extra request — and
                               "—" whenever there is no agent name to show. */}
-                          <Td className="min-w-[7.5rem]">
+                          <Td className="min-w-[6.5rem]">
                             <AgentCell role={role} />
                           </Td>
                           {/* ONE role per row, because that is what the row IS.
@@ -1253,13 +1410,13 @@ export function CandidatesPage() {
                               roles is two rows carrying one role each — not one
                               row carrying two. Rendering a list here would imply
                               a many-to-many the data cannot express, and would
-                              make the row's "Review & decide" ambiguous about
-                              which application it decides.
+                              make the row's "Review" ambiguous about which
+                              application it reviews.
 
                               A role the roles list does not carry (filtered by
                               scope, or deleted) falls back to a neutral marker
                               rather than a blank cell or a raw uuid. */}
-                          <Td className="min-w-[8.5rem]">
+                          <Td className="min-w-[7.5rem]">
                             <RoleCell
                               roleId={c.role_id}
                               title={role?.title}
@@ -1297,28 +1454,24 @@ export function CandidatesPage() {
                           </Td>
                           <Td className="whitespace-nowrap">
                             {c.latest_recommendation ? (
-                              <span className="inline-flex items-center gap-1.5">
-                                <StatusBadge
-                                  tone={RECOMMENDATION_TONE[c.latest_recommendation] ?? "neutral"}
-                                >
-                                  {recommendationLabel(c.latest_recommendation)}
-                                </StatusBadge>
-                                {c.latest_score != null && (
-                                  <span className="text-xs tabular-nums text-[var(--c-ink-secondary)]">
-                                    {c.latest_score}
-                                  </span>
-                                )}
-                              </span>
+                              <VerdictMark recommendation={c.latest_recommendation} score={c.latest_score} />
                             ) : (
                               <span className="text-[var(--c-ink-secondary)]">—</span>
                             )}
                           </Td>
+                          <Td
+                            className="whitespace-nowrap tabular-nums text-[var(--c-ink-secondary)]"
+                            title={waitingSince ? `Added ${formatDateTime(waitingSince)}` : undefined}
+                          >
+                            {waitingSince ? formatWaiting(waitingSince, now) : "—"}
+                          </Td>
                           <Td className="whitespace-nowrap">
                             <NextActionCell
                               candidateId={c.id}
-                              candidateName={displayName}
+                              candidateName={candidateDisplayName(c.name)}
                               status={ds.key}
                               next={next}
+                              listSearch={listSearch}
                             />
                           </Td>
                         </Tr>
@@ -1326,7 +1479,7 @@ export function CandidatesPage() {
                     })}
                   </TBody>
                 </Table>
-                <div className="px-3"><Pagination state={page} noun="candidates" /></div>
+                <Pagination state={page} noun="candidates" className="px-0" />
               </div>
             )}
           </GlassPanel>
@@ -1441,6 +1594,7 @@ function UploadPanel({
 
   return (
     <GlassPanel
+      level="ruled"
       as="section"
       id={id}
       ref={panelRef}
@@ -1448,7 +1602,7 @@ function UploadPanel({
       tabIndex={-1}
       hidden={!open}
       aria-labelledby={headingId}
-      className="mt-6 focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--c-accent)]"
+      className="mt-4 pb-4 focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--c-accent)]"
     >
       <h2
         id={headingId}
@@ -1479,21 +1633,20 @@ function UploadPanel({
           )}
         </Field>
         <Field label="Role (optional)" id="resume-role">
-          {({ id: selectId }) => (
-            <SelectField
+          {({ id: selectId, labelId }) => (
+            <Combobox
               id={selectId}
+              labelId={labelId}
+              size="md"
               value={roleId}
-              onChange={(e) => setRoleId(e.target.value)}
+              onChange={setRoleId}
               disabled={uploading}
-              className="w-full"
-            >
-              <option value="">No role</option>
-              {roles.map((r) => (
-                <option key={r.id} value={r.id}>
-                  {r.title}
-                </option>
-              ))}
-            </SelectField>
+              options={[{ value: "", label: "No role" }, ...roles.map((r) => ({ value: r.id, label: r.title }))]}
+              placeholder="No role"
+              searchLabel="Search roles"
+              listLabel="Roles"
+              noun={["role", "roles"]}
+            />
           )}
         </Field>
       </div>

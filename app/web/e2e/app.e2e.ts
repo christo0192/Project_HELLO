@@ -292,12 +292,15 @@ test.describe('key states', () => {
 
     for (const path of ['/dashboard', '/candidates']) {
       await app.goto(path);
-      const filter = page.getByLabel('Filter by role').first();
+      const filter = page.getByRole('button', { name: /^Filter by role/ }).first();
       await expect(filter).toBeVisible();
-      await expect(filter.locator('option')).toHaveText(['All roles', ...MAPPED]);
+      await filter.click();
+      const options = page.getByRole('listbox').first().getByRole('option');
+      await expect(options).toHaveText(['All roles', ...MAPPED]);
       for (const title of UNMAPPED) {
-        await expect(filter.locator('option', { hasText: title })).toHaveCount(0);
+        await expect(options.filter({ hasText: title })).toHaveCount(0);
       }
+      await page.keyboard.press('Escape');
     }
     expect(mappingsReads(), 'the role filters read the flag off /api/roles, not the mappings list').toEqual([]);
     app.expectHealthy();
@@ -309,25 +312,31 @@ test.describe('key states', () => {
     await app.goto('/candidates');
     const scope = page.getByRole('group', { name: 'Filter by Ashby job status' });
     await expect(scope).toBeVisible();
-    const roleFilter = page.getByLabel('Filter by role').first();
+    const roleFilter = page.getByRole('button', { name: /^Filter by role/ }).first();
+    const expectRoles = async (names: string[]) => {
+      await roleFilter.click();
+      await expect(page.getByRole('listbox').first().getByRole('option')).toHaveText(names);
+      await page.keyboard.press('Escape');
+    };
 
     await scope.getByRole('button', { name: /^Active/ }).click();
     await expect(page).toHaveURL(/ashby=active/);
     // The role control keeps listing every mapped role: the scope and the
     // role intersect, the scope never narrows the dropdown.
     const allMapped = ['All roles', 'Data Analyst', 'Frontend Engineer', 'Senior Backend Engineer'];
-    await expect(roleFilter.locator('option')).toHaveText(allMapped);
+    await expectRoles(allMapped);
     await expect(page.getByText('Ashby jobs: Active').first()).toBeVisible();
 
     await scope.getByRole('button', { name: /^Paused/ }).click();
     await expect(page).toHaveURL(/ashby=paused/);
-    await expect(roleFilter.locator('option')).toHaveText(allMapped);
+    await expectRoles(allMapped);
     // The router commits the URL a beat before React re-renders; act on the
     // settled UI, as a person would.
     await expect(scope.getByRole('button', { name: /^Paused/ })).toHaveAttribute('aria-pressed', 'true');
 
     // A role is kept when a segment is chosen, and the URL carries both.
-    await roleFilter.selectOption({ label: 'Data Analyst' });
+    await roleFilter.click();
+    await page.getByRole('listbox').first().getByRole('option', { name: 'Data Analyst' }).click();
     await expect(page).toHaveURL(/role=/);
     await expect(page).toHaveURL(/ashby=paused/);
     await scope.getByRole('button', { name: /^Active/ }).click();
@@ -340,12 +349,7 @@ test.describe('key states', () => {
 
     await scope.getByRole('button', { name: /^All/ }).click();
     await expect(page).not.toHaveURL(/ashby=/);
-    await expect(roleFilter.locator('option')).toHaveText([
-      'All roles',
-      'Data Analyst',
-      'Frontend Engineer',
-      'Senior Backend Engineer',
-    ]);
+    await expectRoles(['All roles', 'Data Analyst', 'Frontend Engineer', 'Senior Backend Engineer']);
     app.expectHealthy();
   });
 
@@ -407,7 +411,7 @@ test.describe('key states', () => {
     await app.goto('/mission-control');
     await page.getByRole('tab', { name: 'Sessions' }).click();
 
-    await expect(page.getByText('The 100 most recently updated · 34 terminal', { exact: true })).toBeVisible();
+    await expect(page.getByText('The 100 most recently updated · 34 finished', { exact: true })).toBeVisible();
     await expect(page.getByText(/hold the 50 most recently updated\. Older sessions cannot be overridden from here\./)).toBeVisible();
     await auditA11y(page, testInfo, 'mission-control-sessions-cut', { strict: true });
     app.expectHealthy();
@@ -586,7 +590,7 @@ test.describe('a failed read stays where it happened', () => {
     await app.goto('/candidates');
 
     const alert = page.getByRole('alert');
-    await expect(alert).toContainText('The candidate list did not load.');
+    await expect(alert).toContainText("The candidate list couldn't load.");
     await expect(page.locator('body')).not.toContainText('service_unavailable');
     await expect(page.getByText('No candidates yet')).toHaveCount(0);
     await auditA11y(page, testInfo, 'candidates-list-503', { strict: true });
@@ -595,6 +599,40 @@ test.describe('a failed read stays where it happened', () => {
     await alert.getByRole('button', { name: 'Try again' }).click();
     await expect(page.getByRole('table').first()).toBeVisible();
     await expect(page.getByRole('alert')).toHaveCount(0);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Ashby Live Jobs: a 500 says it could not load, and never that no jobs are mapped', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/integrations/ashby/mission-control/mappings**', 500, { error: 'internal_error' });
+    await app.goto('/ashby-mission-control');
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText("Ashby jobs and applications couldn't load.");
+    await expect(page.getByText('No jobs are mapped yet.')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Add mapping', exact: true })).toHaveCount(0);
+    await auditA11y(page, testInfo, 'ashby-read-500', { strict: true });
+
+    await heal();
+    await alert.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.getByRole('button', { name: 'Add mapping', exact: true })).toBeVisible();
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Mission Control: a failed read names its block and offers a Retry', async ({ app, page }) => {
+    const heal = await failRead(page, '/api/admin/audit**', 500, { error: 'internal_error' });
+    await app.goto('/mission-control#audit');
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText("The audit log couldn't load.");
+    await expect(page.locator('body')).not.toContainText('internal_error');
+
+    await heal();
+    await alert.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.getByRole('table')).toBeVisible();
 
     forgetFailedResponses(app);
     app.expectHealthy();

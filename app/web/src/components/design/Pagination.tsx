@@ -2,12 +2,15 @@
  * Pagination — bounded page navigation for tables and lists.
  *
  * `usePagination` slices any array; `Pagination` renders the range text,
- * a page-size select and previous/next controls inside a `nav` landmark.
+ * a page-size picker and previous/next controls inside a `nav` landmark.
  * The range line is `role="status"` so page changes are announced.
+ *
+ * A list whose place must survive a trip to a record and back hands the page
+ * and size to the URL through `control` (see `PaginationControl`).
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Button } from './Button';
-import { SelectField } from './Field';
+import { Combobox } from './Combobox';
 import { cx } from './cx';
 
 export const PAGE_SIZES = [10, 25, 50] as const;
@@ -26,14 +29,28 @@ export interface PaginationState<T> {
   setPageSize: (size: PageSize) => void;
 }
 
+/** Page and size held by the caller, usually the URL. */
+export interface PaginationControl {
+  page: number;
+  pageSize: PageSize;
+  onChange: (next: { page: number; pageSize: PageSize }) => void;
+}
+
 export function usePagination<T>(
   rows: ReadonlyArray<T>,
   initialSize: PageSize = 10,
   /** Changes here (a filter key) return the user to page 1. */
   resetKey?: string,
+  control?: PaginationControl,
 ): PaginationState<T> {
-  const [page, setPageState] = useState(1);
-  const [pageSize, setPageSizeState] = useState<PageSize>(initialSize);
+  const [ownPage, setOwnPage] = useState(1);
+  const [ownSize, setOwnSize] = useState<PageSize>(initialSize);
+  const page = control ? control.page : ownPage;
+  const pageSize = control ? control.pageSize : ownSize;
+  const setPageState = (next: number) => {
+    if (control) control.onChange({ page: next, pageSize });
+    else setOwnPage(next);
+  };
   const total = rows.length;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
 
@@ -41,14 +58,17 @@ export function usePagination<T>(
   useEffect(() => {
     if (lastKey.current !== resetKey) {
       lastKey.current = resetKey;
-      setPageState(1);
+      // A controlled page resets with the URL that changed the key.
+      if (!control) setOwnPage(1);
     }
-  }, [resetKey]);
+  }, [resetKey, control]);
 
   // Clamp when the data shrinks under the current page (filter, refresh).
+  // Not a controlled page: rows that are still loading are not a reason to
+  // rewrite the URL, and `safePage` below already bounds what is shown.
   useEffect(() => {
-    if (page > pageCount) setPageState(pageCount);
-  }, [page, pageCount]);
+    if (!control && page > pageCount) setOwnPage(pageCount);
+  }, [control, page, pageCount]);
 
   const safePage = Math.min(page, pageCount);
   const items = useMemo(
@@ -71,8 +91,12 @@ export function usePagination<T>(
     // effect above bound it against the rows actually rendered.
     setPage: (next) => setPageState(Math.max(1, next)),
     setPageSize: (size) => {
-      setPageSizeState(size);
-      setPageState(1);
+      if (control) {
+        control.onChange({ page: 1, pageSize: size });
+      } else {
+        setOwnSize(size);
+        setOwnPage(1);
+      }
     },
   };
 }
@@ -88,6 +112,7 @@ export interface PaginationProps {
 
 export function Pagination({ state, noun, hidePageSize = false, className }: PaginationProps) {
   const { page, pageSize, pageCount, total, from, to, setPage, setPageSize } = state;
+  const sizeId = `page-size-${useId().replace(/:/g, '-')}`;
   if (total === 0) return null;
   return (
     <nav
@@ -100,25 +125,28 @@ export function Pagination({ state, noun, hidePageSize = false, className }: Pag
       </p>
       <div className="flex items-center gap-2">
         {!hidePageSize && (
-          <label className="flex items-center gap-2 text-xs text-ink-tertiary">
-            {/* Visible "Rows", accessible name "Rows per page" — the visible
+          <div className="flex items-center gap-2 text-xs text-ink-tertiary">
+            {/* Visible "Rows", accessible name "Rows per page": the visible
                 text is a prefix of the name (WCAG 2.5.3 label-in-name). */}
-            <span>
+            <span id={`-label`}>
               Rows<span className="sr-only"> per page</span>
             </span>
-            <SelectField
+            {/* Upward: the pager is the foot of the page. */}
+            <Combobox
+              id={sizeId}
+              labelId={`-label`}
               size="sm"
-              value={pageSize}
-              onChange={(event) => setPageSize(Number(event.target.value) as PageSize)}
+              searchable={false}
+              floating="up"
+              value={String(pageSize)}
+              onChange={(next) => setPageSize(Number(next) as PageSize)}
+              options={PAGE_SIZES.map((size) => ({ value: String(size), label: String(size) }))}
+              placeholder={String(pageSize)}
+              searchLabel="Rows per page"
+              listLabel="Rows per page"
               className="w-[4.75rem]"
-            >
-              {PAGE_SIZES.map((size) => (
-                <option key={size} value={size}>
-                  {size}
-                </option>
-              ))}
-            </SelectField>
-          </label>
+            />
+          </div>
         )}
         <div className="flex items-center gap-1">
           <Button size="sm" variant="secondary" onClick={() => setPage(page - 1)} disabled={page <= 1} aria-label="Previous page">

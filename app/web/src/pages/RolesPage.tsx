@@ -175,7 +175,7 @@ export function RolesPage() {
     return api
       .listRoles()
       .then(setRoles)
-      .catch((e: ApiError) => setError(e.message));
+      .catch((e: ApiError) => setError(`Agents couldn't load. ${plainErrorText(e.message)}`));
   }, []);
 
   const load = useCallback(() => {
@@ -315,7 +315,6 @@ export function RolesPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Talent workspace"
         title="Agents"
         // NOT "the questions Gopu will ask". Each role now names its own
         // agent, and one hard-coded name in the page header contradicts every
@@ -407,7 +406,7 @@ export function RolesPage() {
         // 3×2 wall of identical cards, each repeating the same pill,
         // chips and button pair, with the description cut mid-sentence. A
         // role is scanned, compared and acted on, which is a list's job.
-            <GlassPanel>
+            <GlassPanel level="ruled">
               <SectionHeader
                 id={ROLES_LIST_HEADING}
                 title="All agents"
@@ -723,6 +722,13 @@ function RoleForm({
   );
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  /**
+   * The scorecard panel below the form saves on its own, and Save changes and
+   * Cancel both close it. Edits there are held back behind a question, because
+   * this form used to drop them without a word.
+   */
+  const [scorecardDirty, setScorecardDirty] = useState(false);
+  const [leaving, setLeaving] = useState<null | "save" | "cancel">(null);
   /** Set after Ask Hello fills the form; cleared once the role is saved. */
   const [draftNote, setDraftNote] = useState<string | null>(null);
   /**
@@ -830,8 +836,13 @@ function RoleForm({
     setQuestions((prev) => prev.filter((_, i) => i !== idx));
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (scorecardDirty) setLeaving("save");
+    else void submit();
+  }
+
+  async function submit() {
     setFormError(null);
 
     if (!title.trim()) {
@@ -903,7 +914,7 @@ function RoleForm({
 
   return (
     <div className="space-y-6">
-    <GlassPanel padding="lg">
+    <GlassPanel level="ruled">
       <SectionHeader
         title={role ? "Edit agent" : "New agent"}
         description="The job role, focus and questions below drive the screening conversation."
@@ -1173,25 +1184,17 @@ function RoleForm({
                             ? `Rephrasing question ${idx + 1}…`
                             : `Rephrase question ${idx + 1}`
                         }
-                        // The Ask Hello pill, verbatim. Both buttons on this
-                        // form ask a model for words; looking alike is the
-                        // point. NO `opacity-*` in this list — see
-                        // `AskHelloButton` for the measurement: fading the
-                        // pill fades the white label with it and drops it
-                        // under 4.5:1, and the faded state here is exactly
-                        // the one the operator is waiting on.
-                        className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control border border-transparent px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+                        // Quiet, one per question: seven filled pills outweighed
+                        // Save, which is the one filled action on this form. NO
+                        // `opacity-*`: the state a reader waits on is the one a
+                        // fade would make hardest to read.
+                        className={`inline-flex min-h-9 items-center rounded-control border px-3 text-label font-medium transition-colors duration-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
                           rephrasingIdx !== null || !q.question.trim()
-                            ? 'ask-hello--idle cursor-not-allowed'
-                            : ''
+                            ? 'cursor-not-allowed border-line-strong bg-surface-secondary text-ink-tertiary'
+                            : 'border-[var(--control)] bg-surface text-ink hover:bg-surface-secondary'
                         }${rephrasingIdx === idx ? ' cursor-progress' : ''}`}
                       >
-                        <span aria-hidden="true" className="relative">
-                          {rephrasingIdx === idx ? '◐' : '✦'}
-                        </span>
-                        <span className="relative">
-                          {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
-                        </span>
+                        {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
                       </button>
                       <Button
                         type="button"
@@ -1247,11 +1250,48 @@ function RoleForm({
           </InlineNotice>
         )}
 
+        {leaving && (
+          <InlineNotice
+            tone="warning"
+            role="alert"
+            action={
+              <span className="flex flex-wrap gap-2">
+                <Button type="button" variant="secondary" size="sm" onClick={() => setLeaving(null)}>
+                  Keep editing
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    const going = leaving;
+                    setLeaving(null);
+                    setScorecardDirty(false);
+                    if (going === "save") void submit();
+                    else onCancel();
+                  }}
+                >
+                  Discard scorecard changes
+                </Button>
+              </span>
+            }
+          >
+            The scorecard below has changes that are not saved. Save scorecard keeps them.
+          </InlineNotice>
+        )}
+
         <div className="flex flex-wrap gap-2 pt-1">
           <Button type="submit" variant="primary" loading={saving}>
             {role ? "Save changes" : "Create agent"}
           </Button>
-          <Button type="button" variant="secondary" onClick={onCancel}>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => {
+              if (scorecardDirty) setLeaving("cancel");
+              else onCancel();
+            }}
+          >
             Cancel
           </Button>
         </div>
@@ -1263,7 +1303,7 @@ function RoleForm({
         unsaved role has no id to attach a scorecard version to. Save the role
         first, reopen it, then configure the scorecard here.
       */}
-      {role && <RoleScorecardEditor roleId={role.id} />}
+      {role && <RoleScorecardEditor roleId={role.id} onDirtyChange={setScorecardDirty} />}
     </div>
   );
 }

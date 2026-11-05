@@ -6,9 +6,14 @@
  * optimistically: the caller awaits `onConfirm` (which performs the real
  * API call) and only then renders success/error feedback from the actual
  * response.
+ *
+ * Focus returns to the trigger whenever the well closes (Confirm, Cancel or
+ * Escape). The well's own buttons unmount at that moment, and without this a
+ * keyboard user lands on `<body>` at the top of the page. A trigger the write
+ * has just disabled cannot take focus, so the well's owner is left to it.
  */
 
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Button, buttonClass, cx } from '../design';
 import type { ButtonVariant } from '../design';
@@ -43,7 +48,7 @@ export interface ConfirmButtonProps {
    * siblings) and `lg` otherwise; pass `lg` for a quiet trigger on a
    * touch-first surface (the 44px target rule).
    */
-  triggerSize?: 'md' | 'lg';
+  triggerSize?: 'sm' | 'md' | 'lg';
 }
 
 export function ConfirmButton({
@@ -62,6 +67,22 @@ export function ConfirmButton({
   const confirmId = `confirm-${rawId.replace(/:/g, '-')}`;
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  /** Set by a close that took focus out of the well, so the effect can hand it back. */
+  const returnFocus = useRef(false);
+
+  function close() {
+    returnFocus.current = true;
+    setConfirming(false);
+  }
+
+  useEffect(() => {
+    if (confirming || !returnFocus.current) return;
+    returnFocus.current = false;
+    // Only when focus went down with the well. A caller that moved it to the
+    // outcome, as the phone calendar does, has already said where it belongs.
+    if (document.activeElement === document.body) triggerRef.current?.focus();
+  }, [confirming]);
 
   async function run() {
     setBusy(true);
@@ -71,7 +92,7 @@ export function ConfirmButton({
       // The caller owns error feedback; never leave an unhandled rejection.
     } finally {
       setBusy(false);
-      setConfirming(false);
+      close();
     }
   }
 
@@ -82,6 +103,7 @@ export function ConfirmButton({
     // confirmation never reshuffles the buttons around it.
     <div className={cx(quiet && 'contents', className)}>
       <Button
+        ref={triggerRef}
         size={triggerSize ?? (quiet ? 'md' : 'lg')}
         variant={quiet && variant === 'danger' ? 'danger-quiet' : toButtonVariant(variant)}
         onClick={() => setConfirming((open) => !open)}
@@ -95,6 +117,12 @@ export function ConfirmButton({
       {confirming && (
         <div
           id={confirmId}
+          // Escape means Cancel, but not mid-write: the answer is still coming.
+          onKeyDown={(event) => {
+            if (event.key !== 'Escape' || busy) return;
+            event.stopPropagation();
+            close();
+          }}
           className={cx(
             'glass-sunken rounded-control p-4',
             quiet ? 'order-last w-full basis-full' : 'mt-3',
@@ -110,7 +138,7 @@ export function ConfirmButton({
             >
               {busy ? 'Applying…' : confirmLabel}
             </Button>
-            <Button size="lg" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>
+            <Button size="lg" variant="secondary" onClick={close} disabled={busy}>
               {cancelLabel}
             </Button>
           </div>

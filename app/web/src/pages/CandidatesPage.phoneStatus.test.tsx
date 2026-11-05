@@ -154,7 +154,7 @@ describe('CandidatesPage phone status', () => {
     expect(badge).toHaveAttribute('title', expect.stringContaining('No answer after every attempt'));
     // The tooltip's facts reach a screen reader too (sr-only, beside the badge).
     expect(
-      within(row).getByText(/^, No answer after every attempt · Phone reached 5 times/, { selector: '.sr-only' }),
+      within(row).getByText(/^, No answer after every attempt · Phone rang 5 times/, { selector: '.sr-only' }),
     ).toBeInTheDocument();
     // Its next action restates the outcome; it is not a "Queued" row.
     expect(within(row).getByText('No answer after every attempt', { selector: '.sr-only' })).toBeInTheDocument();
@@ -168,7 +168,7 @@ describe('CandidatesPage phone status', () => {
     expect(within(row).getByText('Screened')).toBeInTheDocument();
     expect(within(row).queryByText(/Phone screen failed|dialed/)).toBeNull();
     // The review link still goes to the Review tab.
-    expect(within(row).getByRole('link', { name: /Review & decide/ })).toHaveAttribute(
+    expect(within(row).getByRole('link', { name: /^Review\b/ })).toHaveAttribute(
       'href',
       '/candidates/c-screened?tab=review',
     );

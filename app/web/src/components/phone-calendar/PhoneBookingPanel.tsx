@@ -20,7 +20,7 @@
 import { useEffect, useId, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { Candidate, PhoneCandidateAppointmentCreateInput, PhoneSlot } from '../../types';
-import { GlassPanel, SectionHeader, SelectField } from '../design';
+import { Combobox, GlassPanel, SectionHeader } from '../design';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
 import { formatIstLongDayLabel, formatIstTimeRange, type IstDate } from '../../lib/ist-datetime';
 import { candidateDisplayStatus } from '../talent/status';
@@ -64,7 +64,7 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
   const ready = selected !== undefined && slot !== null;
 
   return (
-    <GlassPanel as="section" id={id} aria-label="Book a phone screening" padding="md">
+    <GlassPanel level="ruled" as="section" id={id} aria-label="Book a phone screening" padding="md" className="pb-5">
       {/* The close square never wraps under the heading; see PhoneCloseButton. */}
       <div className="flex items-start gap-3">
         <SectionHeader
@@ -79,6 +79,7 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
         <div className="min-w-0">
           <label
             htmlFor={candidateFieldId}
+            id={`${candidateFieldId}-label`}
             className="block text-label font-medium text-ink-secondary"
           >
             Candidate
@@ -100,19 +101,29 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
               No candidates are available.
             </p>
           ) : (
-            <SelectField
+            // Searches name and email: hundreds of people in API order was a list
+            // nobody could find anyone in. Never a phone number, which this page
+            // keeps out of the DOM altogether.
+            <Combobox
               id={candidateFieldId}
+              labelId={`${candidateFieldId}-label`}
+              size="md"
               value={candidateId}
-              onChange={(event) => { setCandidateId(event.target.value); setSlot(null); }}
-              className="mt-1.5 min-h-[44px]"
-            >
-              <option value="">Select a candidate</option>
-              {candidates.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.name ?? 'Candidate'} · {candidateDisplayStatus(candidate).label}
-                </option>
-              ))}
-            </SelectField>
+              onChange={(next) => { setCandidateId(next); setSlot(null); }}
+              options={candidates.map((candidate) => ({
+                value: candidate.id,
+                label: candidate.name ?? 'Candidate',
+                description: [candidateDisplayStatus(candidate).label, candidate.email]
+                  .filter(Boolean)
+                  .join(' · '),
+              }))}
+              placeholder="Select a candidate"
+              searchLabel="Search by name or email"
+              listLabel="Candidates"
+              noun={['candidate', 'candidates']}
+              noMatchText={(q) => `No candidate matches “${q}”.`}
+              className="mt-1.5"
+            />
           )}
         </div>
 

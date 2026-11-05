@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { supabase } from "../lib/supabase";
 import { cx } from "../components/design/cx";
@@ -16,13 +16,12 @@ import type {
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { R1Section } from "../components/r1/R1Section";
-import { StatusBadge } from "../components/design";
+import { Combobox, StatusBadge } from "../components/design";
 import {
   CandidateButton,
   CandidateErrorState,
   CandidateInput,
   CandidateLoadingState,
-  CandidateSelect,
   SurfaceCard,
   Tag,
 } from "../components/design/candidate";
@@ -124,6 +123,7 @@ export function CandidateDetailPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
   // The tab a bare link lands on, decided ONCE per load. Re-deciding on a
   // silent refresh would yank the reader from Overview to Review the moment a
   // live call finishes under them.
@@ -355,10 +355,17 @@ export function CandidateDetailPage() {
     );
   }
 
+  // The list hands over the address it was on, so Back returns to the same page
+  // of the same filter. Only a query string is taken from router state.
+  const listSearch = (location.state as { listSearch?: unknown } | null)?.listSearch;
+  const backToList = typeof listSearch === "string" && listSearch.startsWith("?")
+    ? `/candidates${listSearch}`
+    : "/candidates";
+
   return (
     <CandidateShell variant="inset">
       <Link
-        to="/candidates"
+        to={backToList}
         className="mb-3 inline-flex min-h-11 items-center gap-1 text-sm text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         ← Back to candidates
@@ -719,9 +726,9 @@ function OverviewTab({
  * every picker.
  */
 const SLOT_ADVISORY_NEW =
-  "Choose an IST slot. Availability is advisory; normal admission gates still decide whether a call can start.";
+  "Choose an IST slot. Availability is advisory; a call still needs an open calling window and a free line.";
 const SLOT_ADVISORY_EXISTING =
-  "Choose an IST slot. Availability is advisory; the normal admission gates still decide whether a call can start.";
+  "Choose an IST slot. Availability is advisory; a call still needs an open calling window and a free line.";
 
 function cycleLabel(cycle: PhoneScreeningCycle): string {
   return cycle.cycle_number == null ? "Screening cycle" : `Screening cycle ${cycle.cycle_number}`;
@@ -767,7 +774,9 @@ function PhoneCycleCard({
   const headingId = useId();
   const [data, setData] = useState<PhoneScreeningsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [reason, setReason] = useState<PhoneRescreenReason>("candidate_requested");
+  // Starts empty on purpose: a preselected reason recorded every hasty re-screen
+  // as "Candidate requested another screen".
+  const [reason, setReason] = useState<PhoneRescreenReason | "">("");
   const [confirming, setConfirming] = useState(false);
   const confirmTriggerRef = useRef<HTMLButtonElement | null>(null);
   const confirmDialogRef = useRef<HTMLDivElement | null>(null);
@@ -891,7 +900,7 @@ function PhoneCycleCard({
       setConfirming(false);
       setMessage(result.status === "already_requested"
         ? "A phone screening is already queued or in progress."
-        : "Phone screening requested. It will run only when all call gates permit it.");
+        : "Phone screening requested. It will run in the next open calling window, if a line is free.");
       load();
     } catch (e) {
       if (e instanceof ApiError && duplicateHoldErrorMessage(e.message)) {
@@ -915,7 +924,7 @@ function PhoneCycleCard({
     try {
       const result = await api.releaseCandidatePhoneDuplicateHold(candidateId);
       setMessage(result.prerequisite_status === "eligible" || result.prerequisite_status === "scheduled_next_window"
-        ? "Hold released. The screening will run only when all call gates permit it."
+        ? "Hold released. The screening will run in the next open calling window, if a line is free."
         : "Hold released. The screening is still waiting on another prerequisite before it can be called.");
       load();
     } catch (e) {
@@ -928,14 +937,16 @@ function PhoneCycleCard({
   }
 
   async function requestRescreen(override?: PhoneRescreenReason) {
+    const chosen = override ?? reason;
+    if (!chosen) return;
     setRequesting(true);
     setMessage(null);
     try {
       const requestId = `ui-${crypto.randomUUID()}`;
-      const result = await api.requestPhoneRescreen(candidateId, { request_id: requestId, reason: override ?? reason });
+      const result = await api.requestPhoneRescreen(candidateId, { request_id: requestId, reason: chosen });
       setMessage(result.status === "already_requested"
         ? "That re-screen request was already accepted."
-        : `Re-screen cycle ${result.cycle_number ?? ""} requested. It will run only when all call gates permit it.`);
+        : `Re-screen cycle ${result.cycle_number ?? ""} requested. It will run in the next open calling window, if a line is free.`);
       load();
     } catch (e) {
       setMessage(e instanceof ApiError ? e.message : "The re-screen request could not be created.");
@@ -963,7 +974,7 @@ function PhoneCycleCard({
         });
         setMessage(result.prereqs_pending
           ? "Appointment booked, but prerequisites are still pending; no dial is promised until admission re-checks them."
-          : "Appointment booked. The call will still pass through normal admission gates.");
+          : "Appointment booked. The call still needs an open calling window and a free line.");
       }
       setSelectedSlot(null);
       // Close only on success: a failed save must keep the dialog open with
@@ -1054,7 +1065,7 @@ function PhoneCycleCard({
         Phone screening cycles
       </h2>
       <p className="mt-0.5 text-label text-ink-tertiary">
-        A request never dials on its own. Every call still passes the admission gates.
+        A request never dials on its own. Every call still needs an open calling window and a free line.
       </p>
       {error ? (
         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1205,29 +1216,38 @@ function PhoneCycleCard({
             <SurfaceCard level="sunken" className="mt-4 p-3">
               <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
                 <div className="min-w-0">
-                  <label htmlFor={`${headingId}-reason`} className="block text-label font-medium text-ink-secondary">
+                  <label
+                    id={`${headingId}-reason-label`}
+                    htmlFor={`${headingId}-reason`}
+                    className="block text-label font-medium text-ink-secondary"
+                  >
                     Reason for new cycle
                   </label>
-                  <CandidateSelect
+                  <Combobox
                     id={`${headingId}-reason`}
+                    labelId={`${headingId}-reason-label`}
+                    size="md"
+                    searchable={false}
                     value={reason}
-                    onChange={(event) => setReason(event.target.value as PhoneRescreenReason)}
-                    className="mt-1 block w-full"
-                  >
-                    {RESCREEN_REASONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-                  </CandidateSelect>
+                    onChange={(value) => setReason(value as PhoneRescreenReason)}
+                    options={RESCREEN_REASONS.map((item) => ({ value: item.value, label: item.label }))}
+                    placeholder="Choose a reason"
+                    searchLabel="Reason for new cycle"
+                    listLabel="Reasons for a new cycle"
+                    className="mt-1"
+                  />
                 </div>
                 {/* Secondary: the page header owns the one filled action
                     (after a completed cycle that is "Review screening"), so a
                     second filled button here would compete with it. */}
-                <CandidateButton variant="secondary" onClick={() => void requestRescreen()} loading={requesting}>
+                <CandidateButton variant="secondary" onClick={() => void requestRescreen()} loading={requesting} disabled={!reason}>
                   Request re-screen
                 </CandidateButton>
               </div>
             </SurfaceCard>
             </>
           ) : current?.terminal_at ? (
-            <p className="mt-3 text-sm text-ink-secondary">This cycle is terminal; no new cycle can be started from its current state.</p>
+            <p className="mt-3 text-sm text-ink-secondary">This screening cycle has finished, and no new cycle can be started from it.</p>
           ) : null}
 
           {(!current || current.terminal_at === null) && (
@@ -1481,27 +1501,33 @@ function AppealsSection({
             same labels, same call. */}
         <div className="mt-3 grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_8rem_auto] sm:items-end">
           <div className="min-w-0">
-            <label htmlFor="appeal-session" className="block text-label font-medium text-ink-secondary">
+            <label
+              id="appeal-session-label"
+              htmlFor="appeal-session"
+              className="block text-label font-medium text-ink-secondary"
+            >
               Session
             </label>
-            <CandidateSelect
+            {/* Named by when it happened and how it ended, never by a uuid
+                prefix (the option VALUE is still the id). */}
+            <Combobox
               id="appeal-session"
+              labelId="appeal-session-label"
+              size="md"
+              searchable={sessions.length > 6}
               value={selectedSession}
-              onChange={(e) => setSelectedSession(e.target.value)}
-              className="mt-1 block w-full"
-            >
-              {/* Named by when it happened and how it ended, never by a uuid
-                  prefix (the option VALUE is still the id). */}
-              {sessions.length === 0 ? (
-                <option value="">No sessions</option>
-              ) : (
-                sessions.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {formatDateTime(s.created_at)} · {sessionStatusLabel(s.status)}
-                  </option>
-                ))
-              )}
-            </CandidateSelect>
+              onChange={setSelectedSession}
+              options={sessions.map((s) => ({
+                value: s.id,
+                label: `${formatDateTime(s.created_at)} · ${sessionStatusLabel(s.status)}`,
+              }))}
+              placeholder="No sessions"
+              searchLabel="Search sessions"
+              listLabel="Sessions"
+              noun={['session', 'sessions']}
+              disabled={sessions.length === 0}
+              className="mt-1"
+            />
           </div>
           <div className="min-w-0">
             <label htmlFor="appeal-expiry" className="block text-label font-medium text-ink-secondary">

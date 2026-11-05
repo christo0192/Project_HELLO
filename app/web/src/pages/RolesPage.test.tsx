@@ -9,7 +9,7 @@
  *   - Keyboard and focus management
  */
 
-import { render as rtlRender, screen, waitFor, act, within } from '@testing-library/react';
+import { fireEvent, render as rtlRender, screen, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -23,6 +23,9 @@ import { ApiError } from '../api';
 // exists at all. Default to a NON-admin here so every pre-existing test sees
 // exactly the header it always saw; the admin-only tests opt in explicitly.
 let mockAuth: { role: string | null };
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 vi.mock('../lib/auth', () => ({
   useAuth: () => mockAuth,
@@ -193,7 +196,7 @@ describe('RolesPage', () => {
   it('shows error state on API failure', async () => {
     mockApi.listRoles.mockRejectedValue({ message: 'API error' });
     render(<RolesPage />);
-    expect(await screen.findByText('API error')).toBeInTheDocument();
+    expect(await screen.findByText(/Agents couldn't load\. API error/)).toBeInTheDocument();
     // Retry button should be available
     expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
   });
@@ -1734,5 +1737,63 @@ describe('Scorebar — the metric library moved here from Mission Control', () =
     render(<RolesPage />);
     await screen.findByRole('button', { name: 'Scorebar' });
     expect(mockApi.listScorecardMetrics).not.toHaveBeenCalled();
+  });
+});
+
+describe('Unsaved scorecard edits', () => {
+  const SCORECARD = {
+    metrics: [
+      { id: 'm1', libraryMetricId: 'l1', key: 'clarity', name: 'Clarity', instruction: 'Listen', rubric: { 1: 'a', 2: 'b', 3: 'c', 4: 'd' }, weightBps: 10000, displayOrder: 0 },
+    ],
+  };
+
+  async function editWithAChangedWeight() {
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.updateRole?.mockClear?.();
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /^edit/i }));
+    const weight = await screen.findByLabelText('Weight for Clarity');
+    fireEvent.change(weight, { target: { value: '60' } });
+  }
+
+  it('asks before Cancel throws the edits away', async () => {
+    await editWithAChangedWeight();
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/scorecard below has changes that are not saved/);
+    // Keep editing leaves everything where it was.
+    await userEvent.click(screen.getByRole('button', { name: 'Keep editing' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Weight for Clarity')).toHaveValue(60);
+  });
+
+  it('leaves on Discard', async () => {
+    await editWithAChangedWeight();
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Discard scorecard changes' }));
+    await waitFor(() => expect(screen.queryByLabelText('Weight for Clarity')).not.toBeInTheDocument());
+  });
+
+  it('asks before Save changes closes the panel too', async () => {
+    await editWithAChangedWeight();
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/not saved/);
+  });
+
+  it('says nothing when the card is as it was saved', async () => {
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /^edit/i }));
+    await screen.findByLabelText('Weight for Clarity');
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByLabelText('Weight for Clarity')).not.toBeInTheDocument());
+  });
+
+  it('keeps every Rephrase quiet, so Save is the one filled action', () => {
+    const source = readFileSync(resolve(__dirname, 'RolesPage.tsx'), 'utf8');
+    expect(source).not.toMatch(/ask-hello/);
   });
 });

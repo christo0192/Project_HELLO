@@ -498,12 +498,8 @@ export function PhoneCalendarPage() {
   if (!canRead) {
     return (
       <div>
-        <PageHeader
-          eyebrow="Operations"
-          title="Phone calendar"
-          description="Internal phone screening schedule."
-        />
-        <GlassPanel padding="sm" className="mt-6">
+        <PageHeader title="Phone calendar" description="Internal phone screening schedule." />
+        <GlassPanel level="ruled" padding="sm" className="mt-6">
           <EmptyPanel
             title="Not available to your role"
             hint="The phone screening calendar is available to interviewers and admins. Nothing about the schedule has been loaded for this account."
@@ -559,7 +555,6 @@ export function PhoneCalendarPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Operations"
         title="Phone calendar"
         description="Phone screenings in India Standard Time. Calls go out only within the approved calling window."
         actions={
@@ -637,6 +632,7 @@ export function PhoneCalendarPage() {
             />
           }
           showFilters={ready}
+          reserveFilters={!loadError && data === null}
           statusFacets={statusFacets}
           stateFacets={stateFacets}
           filters={filters}
@@ -697,21 +693,21 @@ export function PhoneCalendarPage() {
             )}
 
             {appointments.length === 0 ? (
-              <GlassPanel padding="sm">
+              <GlassPanel level="ruled" padding="sm">
                 <EmptyPanel
                   title="No phone screenings this week"
                   hint={`Nothing is scheduled between ${weekLabel} IST.`}
                 />
               </GlassPanel>
             ) : agentRows.length === 0 ? (
-              <GlassPanel padding="sm">
+              <GlassPanel level="ruled" padding="sm">
                 <EmptyPanel
                   title="No calls for this agent this week"
                   hint={otherAgentsHint(appointments, weekLabel)}
                 />
               </GlassPanel>
             ) : visible.length === 0 ? (
-              <GlassPanel padding="sm">
+              <GlassPanel level="ruled" padding="sm">
                 <EmptyPanel
                   title="No appointments match these filters"
                   hint={`This week has ${agentRows.length} ${

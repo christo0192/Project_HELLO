@@ -43,6 +43,13 @@ Four pull requests. This record ships with the first.
 - **The pipeline bar follows the mock.** Mapping every tone straight onto ink collapsed its stages, so it is an outlined bar with the lightest bucket first, and the on-a-call stage takes the voice mark the encoding table allows.
 - **Two lines on one chart differ by a dash as well as a grey.** The opposite outcomes on the Dashboard overlap for 30 days, and markers are hidden past 20 points.
 
+## What PR 4 decided on the way
+
+- **Sections are ruled, not boxed.** `GlassPanel level="ruled"` is the default for a block on these pages. The week grid keeps its frame: a timetable is a printed grid.
+- **"Waiting" is time since a candidate was added,** for a candidate still in progress. The list payload carries no screened time, and the Candidates read is the one that broke at scale.
+- **Shells being read sort after named candidates,** with one summary line above the table. None is left out, so a stuck one stays in the list and in the counts.
+- **The booking picker searches name and email, not phone.** The phone calendar keeps every phone number out of the DOM.
+
 ## Sources
 
 The directions, the comparison and the judges' scores live in the project's planning folder under `M026/directions/`. The root-cause analysis behind the redesign is `M026/M026-RCA.md`. The owner's decisions are dated in `DECISIONS.md`.

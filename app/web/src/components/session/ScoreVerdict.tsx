@@ -6,34 +6,15 @@
  * `ScoreVerdict` is the top of the card: the overall figure, the
  * recommendation, and the model's summary. A recruiter opening a screening
  * wants the verdict before the evidence, so it comes first and carries the
- * page's one hero number. The figure stays in ink: the recommendation pill
- * carries the tone (dot + tint + words), so colour is never the only signal
- * and the number reads as a fact rather than a traffic light.
+ * page's one hero number. The figure stays in ink, and so does the verdict: the
+ * circle and the word carry it, so colour is never a signal at all and the number
+ * reads as a fact rather than a traffic light.
  */
 
 import type { ReactNode } from 'react';
 import { cx } from '../design/cx';
-import type { StatusTone } from '../design';
-import { finiteNumber, recommendationMeta } from './scorecard-read';
-
-/* The token pairs of `StatusBadge`, one step larger: this chip sits beside a
-   30px figure and is the verdict, not a row annotation. The exception is
-   `danger`: a verdict stays in ink, so even that tone has no crimson here. */
-export const PILL_TONE: Record<StatusTone, string> = {
-  neutral: 'bg-surface-secondary text-ink-secondary',
-  info: 'bg-info-soft text-ink-secondary',
-  success: 'bg-success-soft text-success-text',
-  warning: 'bg-warning-soft text-warning-text',
-  danger: 'bg-surface-secondary text-ink',
-};
-
-export const PILL_DOT: Record<StatusTone, string> = {
-  neutral: 'bg-ink-muted',
-  info: 'bg-info',
-  success: 'bg-success',
-  warning: 'bg-warning',
-  danger: 'bg-ink',
-};
+import { finiteNumber } from './scorecard-read';
+import { VerdictMark } from './VerdictMark';
 
 export interface ScoreVerdictProps {
   /** Overall score, 0–100. Anything that is not a finite number reads "Not scored", never 0. */
@@ -47,7 +28,6 @@ export interface ScoreVerdictProps {
 }
 
 export function ScoreVerdict({ overall, recommendation, summary, detail, children }: ScoreVerdictProps) {
-  const reco = recommendationMeta(recommendation);
   const n = finiteNumber(overall);
   const score = n == null ? null : Math.round(n);
   const text = typeof summary === 'string' ? summary.trim() : '';
@@ -71,18 +51,7 @@ export function ScoreVerdict({ overall, recommendation, summary, detail, childre
             {detail}
           </p>
         </div>
-        {reco && (
-          <span
-            data-recommendation={reco.tone}
-            className={cx(
-              'inline-flex items-center gap-2 whitespace-nowrap rounded-chip px-3 py-1 text-label font-semibold',
-              PILL_TONE[reco.tone],
-            )}
-          >
-            <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', PILL_DOT[reco.tone])} />
-            {reco.label}
-          </span>
-        )}
+        <VerdictMark recommendation={recommendation} size="lg" />
       </div>
       {text && (
         <>

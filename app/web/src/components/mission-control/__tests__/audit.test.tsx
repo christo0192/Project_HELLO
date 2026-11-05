@@ -51,15 +51,15 @@ describe('AuditSection', () => {
     expect(screen.queryByText('unauthorized')).not.toBeInTheDocument();
     apiFns.listAdminAudit.mockResolvedValue({ audit: [ROW] });
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
-    expect(await screen.findByText('admin_maintenance_toggle')).toBeInTheDocument();
+    expect(await screen.findByText('Admin maintenance toggle')).toBeInTheDocument();
   });
 
   it('renders only the bounded redacted fields', async () => {
     renderAudit();
-    await screen.findByText('admin_maintenance_toggle');
-    expect(screen.getByText('recruiter')).toBeInTheDocument();
-    expect(screen.getByText('system')).toBeInTheDocument();
-    expect(screen.getByText('success')).toBeInTheDocument();
+    await screen.findByText('Admin maintenance toggle');
+    expect(screen.getByText('Recruiter')).toBeInTheDocument();
+    expect(screen.getByText('System')).toBeInTheDocument();
+    expect(screen.getByText('Success')).toBeInTheDocument();
     // Ids are short/opaque — the full actor id is never rendered.
     expect(
       screen.queryByText('actor-user-0000-0000-000000000001'),
@@ -82,7 +82,7 @@ describe('AuditSection', () => {
     } as AdminAuditRow;
     apiFns.listAdminAudit.mockResolvedValue({ audit: [leaky] });
     renderAudit();
-    await screen.findByText('admin_maintenance_toggle');
+    await screen.findByText('Admin maintenance toggle');
     expect(screen.queryByText('top-secret-reason')).not.toBeInTheDocument();
     expect(screen.queryByText(/10\.0\.0\./)).not.toBeInTheDocument();
     expect(screen.queryByText('trace-abc')).not.toBeInTheDocument();
@@ -135,7 +135,7 @@ describe('AuditSection', () => {
 
   it('has no axe violations', async () => {
     const { container } = renderAudit();
-    await screen.findByText('admin_maintenance_toggle');
+    await screen.findByText('Admin maintenance toggle');
     await expect(container).toHaveNoViolations();
   });
 });

@@ -52,6 +52,30 @@ export function candidateDisplayName(name: string | null | undefined): string {
   return trimmed || CANDIDATE_SHELL_TITLE;
 }
 
+/**
+ * What a nameless row says in a list: how it came in, and how long it has been
+ * there, so a row that is working can be told from one that is stuck. The record
+ * itself keeps `CANDIDATE_SHELL_TITLE`. A named candidate reads their name.
+ */
+export function candidateListName(
+  candidate: {
+    name: string | null | undefined;
+    resume_review?: ResumeReview | null;
+    intake_type?: IntakeType | null;
+    created_at: string;
+  },
+  now: number,
+): string {
+  const trimmed = typeof candidate.name === 'string' ? candidate.name.trim() : '';
+  if (trimmed) return trimmed;
+  const minutes = Math.max(0, Math.floor((now - Date.parse(candidate.created_at)) / 60_000));
+  const age = Number.isFinite(minutes) ? ` · ${minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h`}` : '';
+  if (candidate.intake_type === 'phone_parsing') return `Reading Ashby profile${age}`;
+  if (candidate.resume_review === 'processing') return `Reading resume${age}`;
+  if (candidate.resume_review === 'ready') return 'Name not found in resume';
+  return CANDIDATE_SHELL_TITLE;
+}
+
 /** Canonical order for resume-review facets (matches the ingestion journey). */
 export const RESUME_REVIEW_ORDER = [
   'processing',

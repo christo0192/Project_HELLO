@@ -9,9 +9,9 @@
  *   - quota policy state           ← GET /api/admin/quotas
  *   - recent audit volume          ← GET /api/admin/audit (bounded page)
  *
- * Deliberately absent: provider health, uptime, SLO, deployment status,
- * queue depth and cost. No API exposes them, so the page names them once,
- * in one quiet line, instead of estimating. Audit volume is presented with
+ * Deliberately absent: provider health, uptime, SLO, deployment status and
+ * cost. Nothing here reads them, so the page names them once, in one quiet line,
+ * instead of estimating. Audit volume is presented with
  * its bounded-page caveat, never a fabricated total. A source that fails to
  * load shows "—", never a zero it did not measure.
  *
@@ -60,6 +60,11 @@ function initialState<T>(): SourceState<T> {
   return { data: null, error: null };
 }
 
+/** Not answered yet, either way. */
+function pending(source: SourceState<unknown>): boolean {
+  return source.data === null && source.error === null;
+}
+
 export function OverviewSection() {
   const [status, setStatus] = useState<SourceState<PublicStatus>>(initialState);
   const [sessions, setSessions] = useState<SourceState<AdminSessionListResponse>>(
@@ -74,10 +79,8 @@ export function OverviewSection() {
   const [audit, setAudit] = useState<SourceState<AdminAuditRow[]>>(
     initialState,
   );
-  const [loading, setLoading] = useState(true);
 
   const load = useCallback(() => {
-    setLoading(true);
     setStatus(initialState());
     setSessions(initialState());
     setAllowlist(initialState());
@@ -109,8 +112,7 @@ export function OverviewSection() {
       );
     api
       .listAdminAudit(50, 0)
-      .then((r) => settle(setAudit).ok(r.audit), settle(setAudit).fail)
-      .finally(() => setLoading(false));
+      .then((r) => settle(setAudit).ok(r.audit), settle(setAudit).fail);
   }, []);
 
   useEffect(load, [load]);
@@ -138,19 +140,21 @@ export function OverviewSection() {
 
   /**
    * One figure per source, honest about each source on its own: still
-   * loading, failed ("—", never a zero it did not measure), or loaded.
+   * loading, failed ("—", never a zero it did not measure), or loaded. Each read
+   * answers for itself: with one flag for the page, a read that finished first
+   * ended the loading state for the others, and they read "0" until they landed.
    */
   const figure = (
     source: SourceState<unknown>,
     item: Omit<MetricItem, 'value'> & { value: number },
   ): MetricItem => {
     if (source.error) {
-      return { ...item, value: '—', context: 'Could not load', title: source.error };
+      return { ...item, value: '—', context: "Couldn't load", title: source.error };
     }
     return {
       ...item,
       value: item.value.toLocaleString(),
-      loading: loading && source.data === null,
+      loading: pending(source),
     };
   };
 
@@ -174,8 +178,9 @@ export function OverviewSection() {
         }
       />
 
-      <GlassPanel padding="none" className="overflow-hidden">
+      <GlassPanel level="ruled" padding="none" className="overflow-hidden border-b border-line-strong">
         <MetricStrip
+          className="-mx-4"
           label="Operations at a glance"
           hideLabel
           columns={6}
@@ -228,6 +233,7 @@ export function OverviewSection() {
           edge; `ChartCard` fills the row and its body takes the slack. */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <ChartCard
+          ruled
           title="Session status mix"
           description={
             sessionsCut
@@ -243,7 +249,7 @@ export function OverviewSection() {
               data={sessionStatusCounts(sessionsData)}
               categoryHeader="Status"
               valueHeader="Sessions"
-              isLoading={loading && sessions.data === null}
+              isLoading={pending(sessions)}
               emptyTitle="No sessions yet"
               emptyHint="Sessions will appear here once screening starts."
             />
@@ -251,6 +257,7 @@ export function OverviewSection() {
         </ChartCard>
 
         <ChartCard
+          ruled
           title="Session activity"
           description={
             sessionsCut
@@ -265,7 +272,7 @@ export function OverviewSection() {
               title="Sessions created per day"
               data={countPerDay(sessionsData)}
               unit="sessions"
-              isLoading={loading && sessions.data === null}
+              isLoading={pending(sessions)}
               height={200}
             />
           )}
@@ -275,6 +282,7 @@ export function OverviewSection() {
       {/* Access + quotas summary (no emails anywhere in Overview) */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <ChartCard
+          ruled
           title="Access entries"
           description="Allowlist state. No email addresses are shown here."
         >
@@ -300,13 +308,14 @@ export function OverviewSection() {
               valueHeader="Entries"
               total={allowlistData.length}
               scale="total"
-              isLoading={loading && allowlist.data === null}
+              isLoading={pending(allowlist)}
               emptyTitle="No access entries yet"
             />
           )}
         </ChartCard>
 
         <ChartCard
+          ruled
           title="Quota policy state"
           description="Enabled policies enforce session limits; disabled ones do not."
           meta={
@@ -333,7 +342,7 @@ export function OverviewSection() {
               total={quotasData.length}
               scale="total"
               showShare={false}
-              isLoading={loading && quotas.data === null}
+              isLoading={pending(quotas)}
               emptyTitle="No quota policies configured"
               emptyHint="Quota enforcement is off."
             />
@@ -353,7 +362,7 @@ export function OverviewSection() {
             {index < NOT_AVAILABLE.length - 2 ? ', ' : index === NOT_AVAILABLE.length - 2 ? ' and ' : '. '}
           </span>
         ))}
-        No API exposes them, so Mission Control does not estimate them.
+        Mission Control reads none of them, so it does not estimate them.
       </p>
     </div>
   );
@@ -363,7 +372,6 @@ const NOT_AVAILABLE: ReadonlyArray<{ label: string; note: string }> = [
   { label: 'Provider health', note: 'No infrastructure-health API is exposed.' },
   { label: 'Uptime / SLO', note: 'No uptime or SLO measurement is exposed.' },
   { label: 'Deployment status', note: 'No deployment or rollout API is exposed.' },
-  { label: 'Queue depth', note: 'No queue-health endpoint is exposed.' },
   {
     label: 'Cost',
     note: 'Quota units are abstract; no cost or currency data is exposed.',

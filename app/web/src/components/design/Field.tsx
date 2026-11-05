@@ -29,7 +29,7 @@ export interface FieldProps {
   hint?: ReactNode;
   error?: ReactNode;
   /** Render the control; receives the ids to wire up. */
-  children: (ids: { id: string; describedBy?: string; invalid: boolean }) => ReactNode;
+  children: (ids: { id: string; labelId: string; describedBy?: string; invalid: boolean }) => ReactNode;
   id?: string;
   className?: string;
   /** Places the label after the control (checkbox-like layouts). */
@@ -41,16 +41,17 @@ export function Field({ label, hint, error, children, id, className, inline }: F
   const controlId = id ?? `field-${rawId.replace(/:/g, '-')}`;
   const hintId = `${controlId}-hint`;
   const errorId = `${controlId}-error`;
+  const labelId = `${controlId}-label`;
   const describedBy = [hint ? hintId : null, error ? errorId : null].filter(Boolean).join(' ') || undefined;
   return (
     <div className={cx(inline ? 'flex items-center gap-3' : 'flex flex-col gap-1.5', className)}>
       {/* A form label: 12px at Plex's condensed width, sentence case. Hints and
           errors are the meta size with a prose line height (12/20): they can
           run to two lines, where 16px leading crowds. */}
-      <label htmlFor={controlId} className="form-label">
+      <label id={labelId} htmlFor={controlId} className="form-label">
         {label}
       </label>
-      {children({ id: controlId, describedBy, invalid: Boolean(error) })}
+      {children({ id: controlId, labelId, describedBy, invalid: Boolean(error) })}
       {hint && !error && (
         <p id={hintId} className="text-xs leading-5 text-ink-tertiary">
           {hint}

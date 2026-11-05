@@ -24,7 +24,7 @@ import { Navigate, useLocation } from 'react-router-dom';
 import { useAuth, COMPANY_EMAIL_DOMAINS_LABEL, isCompanyEmail } from '../lib/auth';
 import { rememberReturnTo, sanitizeReturnTo } from '../lib/return-to';
 import { Brand } from '../components/navigation';
-import { Button, Field, GlassPanel, InlineNotice, TextField } from '../components/design';
+import { Button, Field, InlineNotice, TextField } from '../components/design';
 
 function getSsoProviders(): string[] {
   const raw = import.meta.env.VITE_SSO_PROVIDERS;
@@ -123,11 +123,10 @@ export function LoginPage() {
   return (
     <div className="app-ground flex min-h-screen items-center justify-center px-4 py-10">
       <main className="w-full max-w-sm">
-        <GlassPanel level="strong" padding="lg">
-          <div className="flex justify-center">
-            <Brand />
-          </div>
-          <h1 className="mt-6 text-section text-ink">
+        {/* One sheet on the desk, like the app behind it. */}
+        <div className="sheet p-6 sm:p-8">
+          <Brand />
+          <h1 className="mt-6 border-t border-line-strong pt-5 text-section text-ink">
             Recruiter sign-in
           </h1>
 
@@ -185,9 +184,9 @@ export function LoginPage() {
           {ssoProviders.includes('google') && (
             <>
               <div className="my-5 flex items-center gap-3">
-                <span aria-hidden="true" className="h-px flex-1 bg-ink/[0.08]" />
+                <span aria-hidden="true" className="h-px flex-1 bg-[var(--rule)]" />
                 <span className="text-xs text-ink-tertiary">or continue with</span>
-                <span aria-hidden="true" className="h-px flex-1 bg-ink/[0.08]" />
+                <span aria-hidden="true" className="h-px flex-1 bg-[var(--rule)]" />
               </div>
 
               <Button
@@ -204,7 +203,7 @@ export function LoginPage() {
             </>
           )}
 
-          <div className="mt-6 space-y-1.5 text-center">
+          <div className="mt-6 space-y-1.5 border-t border-line-strong pt-4">
             <p className="text-xs leading-5 text-ink-tertiary">
               Company-only access: sign in with your{' '}
               <span className="font-medium text-ink-secondary">
@@ -217,7 +216,7 @@ export function LoginPage() {
               available.
             </p>
           </div>
-        </GlassPanel>
+        </div>
       </main>
     </div>
   );

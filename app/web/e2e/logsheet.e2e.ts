@@ -9,8 +9,8 @@
  */
 
 import type { Locator, Page } from '@playwright/test';
-import { SEEK_CANDIDATE_ID, SEEK_NORMAL_SESSION_ID } from './fixtures/data';
-import { KEY_STATES, openRoute } from './fixtures/flows';
+import { SEEK_CANDIDATE_ID } from './fixtures/data';
+import { KEY_STATES, openRoute, pickSession } from './fixtures/flows';
 import { expect, test, type AppHarness } from './fixtures/harness';
 import { ROUTES } from './fixtures/routes';
 
@@ -145,12 +145,95 @@ async function playTurn(app: AppHarness, page: Page): Promise<Locator> {
   await app.goto(`/candidates/${SEEK_CANDIDATE_ID}`);
   await page.getByRole('tab', { name: 'Review' }).click();
   const panel = page.getByRole('tabpanel', { name: 'Review' });
-  await panel.getByRole('combobox').selectOption(SEEK_NORMAL_SESSION_ID);
+  await pickSession(panel, /Recorded 2m 0s/);
   const turn = panel.getByRole('group', { name: 'Call 1 of 2 · first call' }).getByRole('button', { name: /Turn 2:/ });
   await turn.click();
   await expect(turn).toHaveAttribute('aria-current', 'true');
   return turn;
 }
+
+const VIEWPORTS = [{ width: 1440, height: 900 }, { width: 1366, height: 768 }];
+
+test.describe('the sheet at both desk sizes', () => {
+  for (const viewport of VIEWPORTS) {
+    test(`at ${viewport.width} the Candidates table fits its panel, with no sideways scroll`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      await openRoute(app, routeNamed('candidates'));
+      const box = await page.getByRole('table').evaluate((table) => {
+        const scroller = table.parentElement!;
+        return { table: table.scrollWidth, panel: scroller.clientWidth, scrolled: scroller.scrollWidth };
+      });
+      expect(box.table, 'the table against its panel').toBeLessThanOrEqual(box.panel);
+      expect(box.scrolled).toBeLessThanOrEqual(box.panel);
+    });
+
+    test(`at ${viewport.width} no page scrolls sideways`, async ({ app, page }) => {
+      test.setTimeout(120_000);
+      await page.setViewportSize(viewport);
+      for (const name of [
+        'candidates',
+        'roles',
+        'phone-calendar',
+        'mission-control',
+        'mission-control-sessions',
+        'mission-control-access',
+        'mission-control-audit',
+        'ashby-mission-control',
+        'session-v2',
+      ]) {
+        await openRoute(app, routeNamed(name));
+        const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+        expect(overflow, name).toBeLessThanOrEqual(0);
+      }
+    });
+  }
+
+  test('at 1366 Mission Control Sessions shows every column inside its own column', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openRoute(app, routeNamed('mission-control-sessions'));
+    const box = await page.getByRole('table').evaluate((table) => ({
+      table: table.scrollWidth,
+      panel: table.parentElement!.clientWidth,
+    }));
+    expect(box.table).toBeLessThanOrEqual(box.panel);
+  });
+
+  test('a toolbar picker floats, so opening it moves nothing', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates'));
+    const table = page.getByRole('table');
+    const before = (await table.boundingBox())!;
+    await page.getByRole('button', { name: /^Filter by role/ }).click();
+    await expect(page.getByRole('listbox').first()).toBeVisible();
+    expect((await table.boundingBox())!.y).toBe(before.y);
+  });
+
+  test('the first Candidates row is on the first screen at 1366x768', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openRoute(app, routeNamed('candidates'));
+    await expect(page.getByRole('table').getByRole('row').nth(1)).toBeInViewport();
+  });
+
+  test('a page number survives a trip to a candidate and back', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates'));
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect(page).toHaveURL(/page=2/);
+    await page.getByRole('table').getByRole('link').first().click();
+    await page.getByRole('link', { name: /Back to candidates/ }).click();
+    await expect(page).toHaveURL(/page=2/);
+    await expect(page.getByRole('navigation', { name: 'candidates pagination' })).toContainText(/11–20/);
+  });
+
+  test('a verdict is a circle and a word, in ink, with no hue', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates'));
+    const mark = page.locator('tbody [data-verdict-mark]').first();
+    await expect(mark).toBeVisible();
+    const [ink, stroke] = await Promise.all([
+      tokenColour(page, '--ink'),
+      mark.evaluate((el) => getComputedStyle(el.querySelector('circle')!).stroke),
+    ]);
+    expect(stroke).toBe(ink);
+  });
+});
 
 test.describe('tab rows', () => {
   for (const name of ['candidate-detail', 'mission-control', 'ashby-scoped-review']) {
@@ -248,10 +331,10 @@ test.describe('forced colours', () => {
   });
 
   test('a filled button keeps an edge, and a data fill stays drawn', async ({ app, page }) => {
-    await openRoute(app, routeNamed('candidates'));
+    await openRoute(app, routeNamed('mission-control'));
     await page.emulateMedia({ forcedColors: 'active' });
     const canvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
-    const primary = page.getByRole('button', { name: 'Upload resume' }).first();
+    const primary = page.getByRole('button', { name: 'Halt all calling' }).first();
     const edge = await primary.evaluate((el) => {
       const style = getComputedStyle(el);
       return { width: style.borderTopWidth, colour: style.borderTopColor };
@@ -259,6 +342,8 @@ test.describe('forced colours', () => {
     expect(edge.width).toBe('1px');
     expect(ratio(edge.colour, canvas), `${edge.colour} on ${canvas}`).toBeGreaterThanOrEqual(3);
 
+    await openRoute(app, routeNamed('candidates'));
+    await page.emulateMedia({ forcedColors: 'active' });
     const fill = await page
       .locator('[data-pipeline-segment]')
       .first()

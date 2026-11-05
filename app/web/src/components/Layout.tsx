@@ -84,7 +84,7 @@ type Status = 'checking' | 'online' | 'maintenance' | 'offline';
 
 const STATUS_LABEL: Record<Status, string> = {
   checking: 'Checking…',
-  online: 'API online',
+  online: 'Online',
   maintenance: 'Maintenance',
   offline: 'API offline',
 };
@@ -95,6 +95,24 @@ const STATUS_DOT: Record<Status, string> = {
   maintenance: 'bg-ink-muted',
   offline: 'bg-error',
 };
+
+/**
+ * The tab's title by route. Thirty routes shared one, so a person with five tabs
+ * open, or a screen reader arriving on a page, could not tell them apart. Never
+ * a candidate's name: a tab title reaches browser history and screen shares.
+ */
+const ROUTE_TITLES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^\/dashboard/, 'Dashboard'],
+  [/^\/candidates\/./, 'Candidate'],
+  [/^\/candidates/, 'Candidates'],
+  [/^\/roles/, 'Agents'],
+  [/^\/phone-calendar/, 'Phone calendar'],
+  [/^\/ashby-mission-control/, 'Ashby Live Jobs'],
+  [/^\/mission-control/, 'Mission Control'],
+  [/^\/admin\/r1/, 'R1 settings'],
+  [/^\/sessions\//, 'Screening'],
+  [/^\/screening\//, 'Screening'],
+];
 
 const ROLE_LABEL: Record<MembershipRole, string> = {
   admin: 'Admin',
@@ -126,6 +144,11 @@ export function Layout() {
   const { user, signOut, isAuthenticated, role } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+
+  useEffect(() => {
+    const title = ROUTE_TITLES.find(([path]) => path.test(location.pathname))?.[1];
+    document.title = title ? `${title} · HELLO` : 'HELLO';
+  }, [location.pathname]);
 
   const [status, setStatus] = useState<Status>('checking');
   const [drawerOpen, setDrawerOpen] = useState(false);

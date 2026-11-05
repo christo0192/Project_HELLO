@@ -255,6 +255,27 @@ describe('AuthProvider', () => {
     expect(getMe).toHaveBeenCalled();
   });
 
+  it.each([
+    [500, true],
+    [503, true],
+    [undefined, true],
+    [401, false],
+    [403, false],
+  ])('a /api/me answer of %s sets roleCheckFailed to %s, and fails closed either way', async (status, failed) => {
+    mockSupabase.auth.getSession = vi.fn().mockResolvedValue({ data: { session: mockSession }, error: null });
+    getMe.mockRejectedValue(Object.assign(new Error('nope'), { status }));
+    function Probe() {
+      const { roleCheckFailed, role, isLoading } = useAuth();
+      return <div data-testid="check">{isLoading ? 'loading' : `${role ?? 'null'}:${roleCheckFailed}`}</div>;
+    }
+    render(
+      <AuthProvider>
+        <Probe />
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent(`null:${failed}`));
+  });
+
   it('does not re-gate the page when the session is re-announced on tab focus', async () => {
     // Supabase re-emits SIGNED_IN / TOKEN_REFRESHED when a tab regains focus.
     // Those events used to flip isRoleLoading, which made ProtectedRoute swap

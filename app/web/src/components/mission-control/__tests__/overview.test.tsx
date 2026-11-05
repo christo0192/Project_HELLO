@@ -168,8 +168,7 @@ describe('OverviewSection', () => {
     expect(screen.getByText('Provider health')).toBeInTheDocument();
     expect(screen.getByText('Uptime / SLO')).toBeInTheDocument();
     expect(screen.getByText('Deployment status')).toBeInTheDocument();
-    expect(screen.getByText('Queue depth')).toBeInTheDocument();
-    expect(screen.getByText('Cost')).toBeInTheDocument();
+        expect(screen.getByText('Cost')).toBeInTheDocument();
     // No invented numbers: no % uptime, no SLO, no $ amounts anywhere.
     expect(screen.queryByText(/% uptime|99\.\d+%/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/\$/)).not.toBeInTheDocument();
@@ -177,7 +176,7 @@ describe('OverviewSection', () => {
     // Named once, in one line: five "Not available" pills gave five missing
     // signals the weight of five present ones.
     expect(screen.queryByText('Not available')).not.toBeInTheDocument();
-    expect(screen.getByText(/No API exposes them/)).toBeInTheDocument();
+    expect(screen.getByText(/does not estimate them/)).toBeInTheDocument();
   });
 
   it('shows the headline figures as one strip, not a card each', async () => {
@@ -236,7 +235,7 @@ describe('OverviewSection', () => {
     // did not measure (it used to print "Sessions 0").
     const sessions = figureCell('Sessions');
     expect(within(sessions).getByText('—')).toBeInTheDocument();
-    expect(within(sessions).getByText('Could not load')).toBeInTheDocument();
+    expect(within(sessions).getByText("Couldn't load")).toBeInTheDocument();
     expect(within(sessions).queryByText('0')).not.toBeInTheDocument();
   });
 

@@ -90,12 +90,8 @@ export function MissionControlPage() {
   if (me.role !== 'admin') {
     return (
       <div>
-        <PageHeader
-          eyebrow="Operations"
-          title="Mission Control"
-          description="Operational controls for the workspace."
-        />
-        <GlassPanel className="mt-6">
+        <PageHeader title="Mission Control" description="Operational controls for the workspace." />
+        <GlassPanel level="ruled" className="mt-6">
           <EmptyPanel
             title="Admin access required"
             hint="Mission Control is available to admin operators only. Ask an admin to add you to the access list, or use the Talent Workspace for your daily work."
@@ -108,9 +104,8 @@ export function MissionControlPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Operations"
         title="Mission Control"
-        description="Every control here writes through the audited admin API. Nothing is estimated."
+        description="Every change here is recorded in the audit log."
         actions={
           /*
             The global operator halt: red to halt, green to resume an operator

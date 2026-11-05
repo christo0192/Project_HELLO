@@ -11,9 +11,11 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type { QuotaPolicy } from '../../types';
 import {
   Button,
+  Combobox,
   EmptyPanel,
   ErrorPanel,
   Field,
@@ -22,7 +24,6 @@ import {
   LoadingPanel,
   Pagination,
   SectionHeader,
-  SelectField,
   StatusBadge,
   Switch,
   TextField,
@@ -95,7 +96,7 @@ export function QuotasSection() {
     api
       .listAdminQuotas()
       .then((r) => setPolicies(r.policies))
-      .catch((e: ApiError) => setLoadError(e.message));
+      .catch((e: ApiError) => setLoadError(`Quota policies couldn't load. ${plainErrorText(e.message)}`));
   }, []);
 
   useEffect(load, [load]);
@@ -273,9 +274,9 @@ export function QuotasSection() {
         />
       ) : (
         <div>
-          <div className="space-y-3">
+          <div className="border-b border-line-strong">
             {page.items.map((policy) => (
-                <GlassPanel key={policy.id} padding="sm" data-policy-row={policy.id}>
+                <GlassPanel key={policy.id} level="ruled" padding="sm" className="pb-4" data-policy-row={policy.id}>
                   <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium text-ink">
@@ -311,6 +312,7 @@ export function QuotasSection() {
                       <ConfirmButton
                         label={policy.enabled ? 'Disable' : 'Enable'}
                         variant="secondary"
+                        triggerSize="sm"
                         confirmLabel={`Confirm ${policy.enabled ? 'disable' : 'enable'}`}
                         summary={
                           <span>
@@ -325,6 +327,7 @@ export function QuotasSection() {
                         <ConfirmButton
                           label="Save changes"
                           variant="primary"
+                          triggerSize="sm"
                           confirmLabel="Confirm update"
                           summary={
                             <span>
@@ -358,7 +361,7 @@ export function QuotasSection() {
       )}
 
       {/* Create */}
-      <GlassPanel>
+      <GlassPanel level="ruled">
         <SectionHeader
           level={3}
           title="Create policy"
@@ -366,17 +369,22 @@ export function QuotasSection() {
         />
         <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <Field label="Scope" id="quota-scope">
-            {({ id }) => (
-              <SelectField
+            {({ id, labelId }) => (
+              <Combobox
                 id={id}
+                labelId={labelId}
+                size="md"
+                searchable={false}
                 value={draft.scope}
-                onChange={(e) =>
-                  setDraftField('scope', e.target.value as CreateDraft['scope'])
-                }
-              >
-                <option value="global">Global — all sessions</option>
-                <option value="candidate">Candidate — one person</option>
-              </SelectField>
+                onChange={(value) => setDraftField('scope', value as CreateDraft['scope'])}
+                options={[
+                  { value: 'global', label: 'Global — all sessions' },
+                  { value: 'candidate', label: 'Candidate — one person' },
+                ]}
+                placeholder="Scope"
+                searchLabel="Scope"
+                listLabel="Scopes"
+              />
             )}
           </Field>
           {draft.scope === 'candidate' && (

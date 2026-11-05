@@ -41,6 +41,7 @@ export {
   RESUME_REVIEW_ORDER,
   CANDIDATE_SHELL_TITLE,
   candidateDisplayName,
+  candidateListName,
   isBadgedResumeReview,
   resumeReviewLabel,
 } from './ResumeReviewBadge';
@@ -69,6 +70,13 @@ export {
   PHONE_OUTCOME_STATUS_KEYS,
   RECOMMENDATION_ORDER,
   EMPTY_CANDIDATE_FILTERS,
+  DEFAULT_CANDIDATE_VIEW,
+  applyCandidateListView,
+  candidateWaitingSince,
+  formatWaiting,
+  isInFlightShell,
+  orderCandidates,
+  parseCandidateListView,
   normalizeStatus,
   recommendationLabel,
   parseCandidateFilters,
@@ -90,6 +98,8 @@ export {
 } from './candidateSearch';
 export type {
   CandidateFilters,
+  CandidateListView,
+  CandidateSortKey,
   CandidateStatusKey,
   RecommendationKey,
 } from './candidateFilters';

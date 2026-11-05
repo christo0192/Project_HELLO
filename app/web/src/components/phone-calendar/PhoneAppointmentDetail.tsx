@@ -32,6 +32,7 @@
  */
 
 import { useState, type ReactNode } from 'react';
+import { Link } from 'react-router-dom';
 import type {
   PhoneAppointmentCancelInput,
   PhoneAppointmentPatchInput,
@@ -44,7 +45,7 @@ import {
   Field,
   GlassPanel,
   SectionHeader,
-  SelectField,
+  Combobox,
   StatusBadge,
   cx,
 } from '../design';
@@ -168,6 +169,13 @@ export function PhoneAppointmentDetail({
         )}
       </dl>
 
+      {appointment.status === 'missed' && (
+        <p className="mt-4 text-sm leading-6 text-ink">
+          This slot passed without a call, and nothing will dial for it now. To try again, open
+          the candidate and book a new time.
+        </p>
+      )}
+
       {appointment.source === 'candidate_voice' && appointment.confirmed_at && (
         <p className="mt-4 rounded-control bg-success-soft px-3.5 py-2.5 text-sm leading-6 text-ink">
           Candidate confirmed this callback on {formatIstDateTime(appointment.confirmed_at)}. The
@@ -251,21 +259,19 @@ export function PhoneAppointmentDetail({
                 label="Cancellation reason"
                 className="max-w-xs"
               >
-                {({ id }) => (
-                  <SelectField
+                {({ id, labelId }) => (
+                  <Combobox
                     id={id}
+                    labelId={labelId}
+                    size="md"
+                    searchable={false}
                     value={reason}
-                    onChange={(e) =>
-                      setReason(e.target.value as PhoneOperatorCancelReason)
-                    }
-                    className="min-h-[44px]"
-                  >
-                    {OPERATOR_CANCEL_REASONS.map((r) => (
-                      <option key={r.value} value={r.value}>
-                        {r.label}
-                      </option>
-                    ))}
-                  </SelectField>
+                    onChange={(value) => setReason(value as PhoneOperatorCancelReason)}
+                    options={OPERATOR_CANCEL_REASONS.map((r) => ({ value: r.value, label: r.label }))}
+                    placeholder="Choose a reason"
+                    searchLabel="Cancellation reason"
+                    listLabel="Cancellation reasons"
+                  />
                 )}
               </Field>
               {/* Quiet until the confirmation step: red text, filled red
@@ -318,7 +324,19 @@ export function PhoneAppointmentDetail({
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
           <h2 className="text-section text-ink">
-            {who.primary}
+            {/* The chip's own id is the appointment's, so the way to the person
+                is here. Without it, recovering a missed call took five clicks
+                and a search. */}
+            {appointment.candidate?.id ? (
+              <Link
+                to={`/candidates/${appointment.candidate.id}`}
+                className="textlink rounded-evidence focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+              >
+                {who.primary}
+              </Link>
+            ) : (
+              who.primary
+            )}
           </h2>
           {who.reference && (
             <span className="text-label tabular-nums text-ink-tertiary">
@@ -360,7 +378,7 @@ export function PhoneAppointmentDetail({
   }
 
   return (
-    <GlassPanel as="section" aria-label="Selected appointment" padding="sm">
+    <GlassPanel level="ruled" as="section" aria-label="Selected appointment" padding="sm">
       {heading}
       <div className="mt-4">{summary}</div>
       {changeControls}

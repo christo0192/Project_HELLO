@@ -15,9 +15,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type { AdminSessionRow } from '../../types';
 import {
   Button,
+  Combobox,
   EmptyPanel,
   ErrorPanel,
   GlassPanel,
@@ -25,7 +27,6 @@ import {
   LoadingPanel,
   Pagination,
   SectionHeader,
-  SelectField,
   StatusBadge,
   TBody,
   THead,
@@ -36,6 +37,7 @@ import {
   Tr,
   usePagination,
 } from '../design';
+import { formatDayTime } from '../charts/dates';
 import { ConfirmButton } from './ConfirmButton';
 import { sessionStatusLabel, sessionStatusTone } from '../talent';
 import {
@@ -86,7 +88,9 @@ export function SessionsSection() {
             : (r.sessions[0]?.id ?? ''),
         );
       })
-      .catch((e: ApiError) => { if (gen === loadGen.current) setLoadError(e.message); });
+      .catch((e: ApiError) => {
+        if (gen === loadGen.current) setLoadError(`Sessions couldn't load. ${plainErrorText(e.message)}`);
+      });
   }, []);
 
   useEffect(() => {
@@ -156,10 +160,10 @@ export function SessionsSection() {
         title="Sessions"
         meta={
           <span className="text-label tabular-nums text-ink-tertiary">
-            {truncated ? `The ${sessions.length} most recently updated` : `${sessions.length} total`} · {terminalCount} terminal
+            {truncated ? `The ${sessions.length} most recently updated` : `${sessions.length} total`} · {terminalCount} finished
           </span>
         }
-        description="Opaque identifiers only — no candidate PII. Terminal sessions are immutable."
+        description="Listed by reference, with no candidate details. Finished sessions can't be changed."
         actions={
           <Button size="sm" variant="secondary" onClick={() => load()}>
             Refresh
@@ -174,27 +178,34 @@ export function SessionsSection() {
       )}
 
       <div className="flex flex-wrap items-center gap-2.5">
-        <label htmlFor="session-filter" className="text-label font-medium text-ink-secondary">
+        <label
+          id="session-filter-label"
+          htmlFor="session-filter"
+          className="text-label font-medium text-ink-secondary"
+        >
           Status filter
         </label>
         <div className="w-56">
-          <SelectField
+          <Combobox
             id="session-filter"
-            size="sm"
+            labelId="session-filter-label"
+            size="md"
+            floating
             value={filter}
-            onChange={(e) => changeFilter(e.target.value)}
-          >
-            <option value="all">All statuses</option>
-            {SESSION_FILTER_STATUSES.map((status) => (
-              <option key={status} value={status}>
-                {sessionStatusLabel(status)}
-              </option>
-            ))}
-          </SelectField>
+            onChange={changeFilter}
+            options={[
+              { value: 'all', label: 'All statuses' },
+              ...SESSION_FILTER_STATUSES.map((status) => ({ value: status, label: sessionStatusLabel(status) })),
+            ]}
+            placeholder="All statuses"
+            searchLabel="Search statuses"
+            listLabel="Session statuses"
+            noun={['status', 'statuses']}
+          />
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <div className="min-w-0">
           {sessions.length === 0 ? (
             <EmptyPanel
@@ -207,7 +218,7 @@ export function SessionsSection() {
             />
           ) : (
             <>
-              <Table caption="Admin session list — id, status, candidate, created, started, ended">
+              <Table bare flush className="[&_td]:px-2.5 [&_th]:px-2.5" caption="Admin session list — id, status, candidate, created, started, ended">
                 <THead>
                   <Tr>
                     <Th className="w-10">
@@ -249,15 +260,17 @@ export function SessionsSection() {
                       <Td className="whitespace-nowrap text-xs text-ink-secondary">
                         {shortId(session.candidate_id)}
                       </Td>
-                      <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
-                        {formatDateTime(session.created_at)}
-                      </Td>
-                      <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
-                        {formatDateTime(session.started_at)}
-                      </Td>
-                      <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
-                        {formatDateTime(session.ended_at)}
-                      </Td>
+                      {/* Short dates, with the full one a hover away: three
+                          long ones ran the table past its column at 1440. */}
+                      {[session.created_at, session.started_at, session.ended_at].map((at, i) => (
+                        <Td
+                          key={i}
+                          title={at ? formatDateTime(at) : undefined}
+                          className="whitespace-nowrap tabular-nums text-ink-secondary"
+                        >
+                          {at ? formatDayTime(at) : '—'}
+                        </Td>
+                      ))}
                     </Tr>
                   ))}
                 </TBody>
@@ -274,11 +287,11 @@ export function SessionsSection() {
         </div>
 
         <div>
-          <GlassPanel className="lg:sticky lg:top-20">
+          <GlassPanel level="ruled" className="lg:sticky lg:top-6">
             <SectionHeader
               level={3}
               title="Override session status"
-              description="Bounded CAS override with a required audit reason — terminal states (failed, cancelled, expired, deleted) cannot be changed, so no resurrection is offered."
+              description="Every change needs a reason and is recorded in the audit log. Finished sessions (failed, cancelled, expired, deleted) can't be changed."
             />
 
             {sessions.length === 0 ? (
@@ -298,51 +311,55 @@ export function SessionsSection() {
 
                 <div className="flex flex-col gap-1.5">
                   <label
+                    id="override-session-label"
                     htmlFor="override-session"
                     className="text-label font-medium text-ink-secondary"
                   >
                     Session
                   </label>
-                  <SelectField
+                  <Combobox
                     id="override-session"
+                    labelId="override-session-label"
+                    size="md"
                     value={selectedId}
                     disabled={terminal}
-                    onChange={(e) => setSelectedId(e.target.value)}
-                  >
-                    {bounded.map((session) => (
-                      <option key={session.id} value={session.id}>
-                        {shortId(session.id)} — {session.status}
-                        {isTerminalSessionStatus(session.status)
-                          ? ' (terminal — locked)'
-                          : ''}
-                      </option>
-                    ))}
-                  </SelectField>
+                    onChange={setSelectedId}
+                    options={bounded.map((session) => ({
+                      value: session.id,
+                      label: `${shortId(session.id)} — ${session.status}${
+                        isTerminalSessionStatus(session.status) ? ' (finished, locked)' : ''
+                      }`,
+                    }))}
+                    placeholder="Choose a session"
+                    searchLabel="Search sessions"
+                    listLabel="Sessions"
+                    noun={['session', 'sessions']}
+                  />
                 </div>
 
                 <div className="flex flex-col gap-1.5">
                   <label
+                    id="override-target-label"
                     htmlFor="override-target"
                     className="text-label font-medium text-ink-secondary"
                   >
                     Target status
                   </label>
-                  <SelectField
+                  <Combobox
                     id="override-target"
+                    labelId="override-target-label"
+                    size="md"
+                    searchable={false}
                     value={targetStatus}
                     disabled={terminal}
-                    onChange={(e) =>
-                      setTargetStatus(
-                        e.target.value as (typeof OVERRIDE_TARGET_STATUSES)[number],
-                      )
+                    onChange={(value) =>
+                      setTargetStatus(value as (typeof OVERRIDE_TARGET_STATUSES)[number])
                     }
-                  >
-                    {OVERRIDE_TARGET_STATUSES.map((status) => (
-                      <option key={status} value={status}>
-                        {status}
-                      </option>
-                    ))}
-                  </SelectField>
+                    options={OVERRIDE_TARGET_STATUSES.map((status) => ({ value: status, label: status }))}
+                    placeholder="Target status"
+                    searchLabel="Target status"
+                    listLabel="Target statuses"
+                  />
                 </div>
 
                 <div className="flex flex-col gap-1.5">
@@ -364,8 +381,8 @@ export function SessionsSection() {
 
                 {terminal && selected ? (
                   <InlineNotice tone="warning">
-                    This session is in a terminal state (
-                    {sessionStatusLabel(selected.status)}) and cannot be changed.
+                    This session has finished (
+                    {sessionStatusLabel(selected.status)}) and can't be changed.
                   </InlineNotice>
                 ) : (
                   <ConfirmButton

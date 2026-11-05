@@ -117,6 +117,7 @@ export const KEYFRAMES_ALLOWED = ['skeleton-pulse', 'slide-over-in', 'dialog-in'
 /** Where an AI verdict about a candidate is drawn. */
 export const VERDICT_FILES = [
   'src/components/session/ScoreVerdict.tsx',
+  'src/components/session/VerdictMark.tsx',
   'src/components/session/scorecard-read.ts',
   'src/components/talent/HeaderScore.tsx',
   'src/components/talent/CandidateScorecard.tsx',

@@ -260,7 +260,7 @@ describe('Layout shell', () => {
 
   it('shows the API online status', async () => {
     renderLayout();
-    expect(await screen.findByText('API online')).toBeInTheDocument();
+    expect(await screen.findByText('Online')).toBeInTheDocument();
   });
 
   it('shows maintenance state from /api/status', async () => {
@@ -324,6 +324,19 @@ describe('Layout shell', () => {
     await user.click(screen.getByRole('button', { name: 'Open navigation menu' }));
     await user.click(screen.getByRole('link', { name: /^Agents$/ }));
     await waitFor(() => expect(announcer?.textContent).toBe('Agents'));
+  });
+});
+
+describe('Layout: the tab title', () => {
+  it.each([
+    ['/candidates', 'Candidates · HELLO'],
+    ['/candidates/some-id', 'Candidate · HELLO'],
+    ['/roles', 'Agents · HELLO'],
+    ['/mission-control', 'Mission Control · HELLO'],
+    ['/ashby-mission-control', 'Ashby Live Jobs · HELLO'],
+  ])('names %s, and never a person', async (path, title) => {
+    renderLayout(path);
+    await waitFor(() => expect(document.title).toBe(title));
   });
 });
 

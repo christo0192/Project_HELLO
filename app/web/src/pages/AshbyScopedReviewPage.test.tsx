@@ -158,7 +158,9 @@ describe('scoped review shell', () => {
     renderPage();
     await screen.findByText('Jane Doe');
     expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Review']);
-    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+    // Ashby's Detailed report link lands on the evidence, with the verdict above it.
+    expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('region', { name: 'Latest screening score' })).toBeInTheDocument();
   });
 
   it('renders the existing Review workspace content on the Review tab', async () => {
@@ -296,6 +298,7 @@ describe('Ashby pipeline card in the scoped review Overview', () => {
       },
     });
     renderPage();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Overview' }));
     // Wait for the resolved card, not the identically-headed loading state.
     expect(await screen.findByText('Writing results back to Ashby')).toBeInTheDocument();
     expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalledWith(LINK_ID);

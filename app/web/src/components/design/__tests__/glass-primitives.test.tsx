@@ -32,7 +32,7 @@ import {
   StatusBadge,
 } from '..';
 import type { PageSize, SegmentedOption } from '..';
-import { stubMatchMedia } from './helpers';
+import { optionsOf, pickOption, stubMatchMedia } from './helpers';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -600,17 +600,17 @@ describe('usePagination + Pagination', () => {
     await user.click(screen.getByRole('button', { name: 'Next page' }));
     expect(screen.getByTestId('page')).toHaveTextContent('2');
 
-    await user.selectOptions(screen.getByLabelText('Rows per page'), '25');
+    await pickOption(user, /^Rows per page/, '25');
     expect(screen.getByTestId('page-size')).toHaveTextContent('25');
     expect(screen.getByTestId('page')).toHaveTextContent('1');
     expect(screen.getByTestId('page-count')).toHaveTextContent('2');
     expect(screen.getAllByRole('listitem')).toHaveLength(25);
   });
 
-  it('offers every documented page size', () => {
+  it('offers every documented page size', async () => {
+    const user = userEvent.setup();
     render(<PaginationHarness />);
-    const select = screen.getByLabelText<HTMLSelectElement>('Rows per page');
-    expect(Array.from(select.options).map((o) => Number(o.value))).toEqual([...PAGE_SIZES]);
+    expect((await optionsOf(user, /^Rows per page/)).map(Number)).toEqual([...PAGE_SIZES]);
   });
 
   it('clamps the current page when the row set shrinks', async () => {
@@ -637,7 +637,7 @@ describe('usePagination + Pagination', () => {
 
   it('hides the page-size select when asked (server-side paging)', () => {
     render(<PaginationHarness hidePageSize />);
-    expect(screen.queryByLabelText('Rows per page')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Rows per page/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Next page' })).toBeInTheDocument();
   });
 
@@ -933,7 +933,7 @@ describe('composite accessibility', () => {
     expect(screen.getByRole('switch', { name: 'Auto-invite' })).toBeInTheDocument();
     expect(screen.getByRole('group', { name: 'Candidate filter' })).toBeInTheDocument();
     expect(screen.getByLabelText('Search')).toBeInTheDocument();
-    expect(screen.getByLabelText('Rows per page')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Rows per page/ })).toBeInTheDocument();
     await expect(container).toHaveNoViolations();
   });
 
@@ -941,5 +941,66 @@ describe('composite accessibility', () => {
     stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
     const { container } = render(<Composite />);
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('usePagination, driven by the URL', () => {
+  function Controlled({ onChange }: { onChange: (next: { page: number; pageSize: PageSize }) => void }) {
+    const [view, setView] = useState<{ page: number; pageSize: PageSize }>({ page: 2, pageSize: 10 });
+    const rows = useMemo(() => Array.from({ length: 34 }, (_, i) => i), []);
+    const state = usePagination(rows, 10, undefined, {
+      ...view,
+      onChange: (next) => {
+        setView(next);
+        onChange(next);
+      },
+    });
+    return (
+      <>
+        <span data-testid="range">{`${state.from}-${state.to}`}</span>
+        <Pagination state={state} noun="rows" />
+      </>
+    );
+  }
+
+  it('starts on the page it was given and reports every move', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<Controlled onChange={onChange} />);
+    expect(screen.getByTestId('range')).toHaveTextContent('11-20');
+    await user.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(onChange).toHaveBeenLastCalledWith({ page: 3, pageSize: 10 });
+    expect(screen.getByTestId('range')).toHaveTextContent('21-30');
+  });
+
+  it('a new page size goes back to page 1', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<Controlled onChange={onChange} />);
+    await pickOption(user, /^Rows per page/, '25');
+    expect(onChange).toHaveBeenLastCalledWith({ page: 1, pageSize: 25 });
+  });
+
+  it('pulls a page past the end back to the last one', () => {
+    function Past() {
+      const state = usePagination([1, 2, 3], 10, undefined, { page: 9, pageSize: 10, onChange: () => {} });
+      return <span data-testid="at">{state.page}</span>;
+    }
+    render(<Past />);
+    expect(screen.getByTestId('at')).toHaveTextContent('1');
+  });
+});
+
+describe('GlassPanel, ruled', () => {
+  it('is a printed section: one rule above it and no box', () => {
+    render(
+      <GlassPanel level="ruled" data-testid="section">
+        Words
+      </GlassPanel>,
+    );
+    const section = screen.getByTestId('section');
+    expect(section).toHaveClass('sheet-section');
+    expect(section).not.toHaveClass('glass');
+    expect(section.className).not.toMatch(/\bp-\d/);
   });
 });

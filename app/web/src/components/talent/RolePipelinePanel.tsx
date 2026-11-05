@@ -280,7 +280,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
   if (populated.length === 0 && failedRoles === 0) return null;
 
   return (
-    <GlassPanel as="section" aria-labelledby={headingId} padding="sm" className="mt-6">
+    <GlassPanel level="ruled" as="section" aria-labelledby={headingId} padding="none" className="mt-4 py-1">
       {/* A DISCLOSURE, closed by default (owner request 2026-09-22). Expanded,
           this panel is ~290px for one role and over 1100px for six, which put
           the candidate table — the page's subject — below the fold and made
@@ -305,7 +305,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
             aria-expanded={open}
             aria-controls={bodyId}
             onClick={() => setOpen((o) => !o)}
-            className="inline-flex min-h-11 items-center rounded-control px-3 text-label font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+            className="textlink inline-flex min-h-9 items-center rounded-control text-label font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] [@media(pointer:coarse)]:min-h-11"
           >
             {open ? 'Hide' : `Show ${populated.length} ${populated.length === 1 ? 'role' : 'roles'}`}
           </button>

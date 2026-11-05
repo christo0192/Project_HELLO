@@ -190,12 +190,13 @@ export function R1Section() {
         </InlineNotice>
       )}
 
-      <GlassPanel padding="none" className="overflow-hidden">
-        <MetricStrip label="R1 at a glance" hideLabel columns={4} items={items} />
+      <GlassPanel level="ruled" padding="none" className="overflow-hidden border-b border-line-strong">
+        <MetricStrip className="-mx-4" label="R1 at a glance" hideLabel columns={4} items={items} />
       </GlassPanel>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <ChartCard
+          ruled
           title="R1 allowance"
           description={
             u
@@ -245,6 +246,7 @@ export function R1Section() {
         </ChartCard>
 
         <ChartCard
+          ruled
           title="Where the pool’s minutes went"
           description="Estimated from our own records for the month, before the 15% safety margin."
         >

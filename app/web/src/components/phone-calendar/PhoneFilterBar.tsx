@@ -15,8 +15,9 @@
  * filled accent on the page belongs to the page's primary action.
  *
  * Every toggle carries `aria-pressed`, so its on/off state is announced and
- * is never conveyed by fill colour alone; the agent picker is a native,
- * labelled `<select>`. Every control is at least 44px tall for touch.
+ * is never conveyed by fill colour alone. Controls are the 36px control height
+ * with a mouse and 44px on a touch screen: at 44 the band took 270px of the
+ * first screen, about three hours of the day.
  *
  * Zero-count facets are hidden, except an active one; see `phoneFacets` for
  * why that exception exists.
@@ -30,7 +31,7 @@ import type {
   PhoneCalendarView,
   PhoneFacet,
 } from './phoneCalendarFilters';
-import { Button, GlassPanel, SelectField, cx } from '../design';
+import { Button, Combobox, GlassPanel, cx } from '../design';
 import { appointmentStatusTerm, engagementStateTerm } from './phoneVocabulary';
 
 /**
@@ -69,6 +70,8 @@ export interface PhoneFilterBarProps {
    * keyboard user, and the filter band waits.
    */
   showFilters?: boolean;
+  /** While rows are on their way, hold the band's height so the grid does not jump. */
+  reserveFilters?: boolean;
 }
 
 /** The one label style in this toolbar: sentence case, 13px, tertiary ink. */
@@ -80,7 +83,7 @@ const legendClass = 'text-label font-medium text-ink-tertiary';
  */
 function pillClass(active: boolean): string {
   return cx(
-    'inline-flex min-h-[44px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-control px-3.5 text-label font-medium',
+    'inline-flex min-h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-control px-3 text-label font-medium [@media(pointer:coarse)]:min-h-11',
     'transition-[color,background-color,box-shadow] duration-hover ease-soft',
     'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
     active
@@ -92,7 +95,7 @@ function pillClass(active: boolean): string {
 /** One half of the view switch: a printed segment, an ink fill when on. */
 function segmentClass(active: boolean): string {
   return cx(
-    'inline-flex min-h-[44px] items-center rounded-evidence px-4 text-label font-medium',
+    'inline-flex min-h-8 items-center rounded-evidence px-3.5 text-label font-medium [@media(pointer:coarse)]:min-h-10',
     'transition-colors duration-hover ease-out',
     'focus:outline-none focus-visible:ring-2 focus-visible:ring-inset',
     active
@@ -126,29 +129,31 @@ function AgentPicker({
   const loading = agents.status === 'loading';
   return (
     <div className="flex min-w-0 flex-col">
-      <label htmlFor={id} className={legendClass}>
+      <label id={`${id}-label`} htmlFor={id} className={legendClass}>
         Agent
       </label>
-      <SelectField
+      <Combobox
         id={id}
+        labelId={`${id}-label`}
+        size="md"
+        floating
         value={loading ? '' : (value ?? '')}
         disabled={loading}
-        onChange={(event) => onChange(event.target.value === '' ? null : event.target.value)}
-        className="mt-2 min-h-[44px] sm:w-56"
-      >
-        {agents.status === 'loading' ? (
-          <option value="">Loading agents…</option>
-        ) : (
-          <>
-            <option value="">All agents</option>
-            {agents.options.map((option) => (
-              <option key={option.id} value={option.id}>
-                {option.label}
-              </option>
-            ))}
-          </>
-        )}
-      </SelectField>
+        onChange={(next) => onChange(next === '' ? null : next)}
+        options={
+          agents.status === 'loading'
+            ? []
+            : [
+                { value: '', label: 'All agents' },
+                ...agents.options.map((option) => ({ value: option.id, label: option.label })),
+              ]
+        }
+        placeholder={loading ? 'Loading agents…' : 'All agents'}
+        searchLabel="Search agents"
+        listLabel="Agents"
+        noun={['agent', 'agents']}
+        className="mt-1 sm:w-56"
+      />
     </div>
   );
 }
@@ -176,7 +181,7 @@ function FacetGroup({
         The row bleeds to the panel edge so the cut-off pill reads as "more",
         and it is an ordinary scroll box — its pills are the focus stops.
       */}
-      <div className="mt-2 flex gap-2 max-sm:-mx-4 max-sm:overflow-x-auto max-sm:px-4 max-sm:pb-1 sm:flex-wrap">
+      <div className="mt-1 flex gap-1.5 max-sm:-mx-4 max-sm:overflow-x-auto max-sm:px-4 max-sm:pb-1 sm:flex-wrap">
         {facets.map((facet) => (
           <button
             key={facet.value}
@@ -208,12 +213,13 @@ export function PhoneFilterBar({
   onClear,
   header,
   showFilters = true,
+  reserveFilters = false,
 }: PhoneFilterBarProps) {
   const anyActive = hasActivePhoneFilters(filters);
 
   return (
-    <GlassPanel padding="none" className="mb-5 divide-y divide-[var(--glass-ring)]">
-      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3 px-4 py-3 sm:px-5">
+    <GlassPanel level="ruled" padding="none" className="mb-4 divide-y divide-[var(--glass-ring)]">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3 py-2.5">
         <div className="min-w-0">{header}</div>
         <fieldset className="min-w-0">
           {/* The two options name themselves; the legend is for the group. */}
@@ -239,8 +245,9 @@ export function PhoneFilterBar({
         </fieldset>
       </div>
 
+      {!showFilters && reserveFilters && <div aria-hidden="true" className="min-h-[4.75rem]" />}
       {showFilters && (
-      <div className="flex flex-col gap-4 px-4 py-4 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-8 sm:px-5">
+      <div className="flex flex-col gap-3 py-3 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-6">
         <AgentPicker agents={agents} value={filters.agent} onChange={onAgentChange} />
 
         <FacetGroup
@@ -259,7 +266,6 @@ export function PhoneFilterBar({
         />
         {anyActive && (
           <Button
-            size="lg"
             variant="ghost"
             onClick={onClear}
             className="self-start sm:ml-auto sm:self-end"

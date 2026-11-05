@@ -147,21 +147,21 @@ export function PhoneSlotPicker({
               the tooltip): the same caveat is repeated by every host well. */}
           <p
             className="mt-1 truncate text-xs text-ink-tertiary"
-            title={`Capacity below is an advisory projection, not a reservation. The fleet limit is applied when the call is dialled, not when it is booked, so booking a slot does not guarantee dial capacity at that time. ${
+            title={`Capacity below is an advisory projection, not a reservation. The calling limit is applied when the call is dialled, not when it is booked, so booking a slot does not guarantee dial capacity at that time. ${
               data.max_concurrent === null
-                ? 'The fleet limit is currently unknown.'
-                : `The fleet limit is ${data.max_concurrent} concurrent ${
+                ? 'The calling limit is currently unknown.'
+                : `The calling limit is ${data.max_concurrent} concurrent ${
                     data.max_concurrent === 1 ? 'call' : 'calls'
                   }.`
             }`}
           >
             Capacity below is an <strong className="font-semibold">advisory
-            projection</strong>, not a reservation. The fleet limit is applied
+            projection</strong>, not a reservation. The calling limit is applied
             when the call is dialled, not when it is booked, so booking a slot
             does not guarantee dial capacity at that time.{' '}
             {data.max_concurrent === null
-              ? 'The fleet limit is currently unknown.'
-              : `The fleet limit is ${data.max_concurrent} concurrent ${
+              ? 'The calling limit is currently unknown.'
+              : `The calling limit is ${data.max_concurrent} concurrent ${
                   data.max_concurrent === 1 ? 'call' : 'calls'
                 }.`}
           </p>
@@ -234,7 +234,7 @@ export function PhoneSlotPicker({
                           {' · '}
                           {slot.booked} booked
                           {data.max_concurrent === null
-                            ? ' · fleet limit unknown'
+                            ? ' · calling limit unknown'
                             : ` · ${slot.remaining} projected free`}
                         </span>
                       </span>
