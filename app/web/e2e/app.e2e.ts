@@ -208,6 +208,44 @@ test.describe('harness self-checks', () => {
     ).toEqual([]);
     app.expectHealthy();
   });
+
+  test('a hard load asks the API for the role without first asking Supabase for the user', async ({ app, page }) => {
+    await app.goto('/mission-control');
+    await expect(page.getByRole('link', { name: 'Ashby Live Jobs' })).toBeVisible();
+
+    // The real supabase-js is running, so this catches any path to the retired
+    // MFA factor list (GET /auth/v1/user), not only the one call a unit test mocks.
+    const paths = app.calls.map((c) => new URL(c.url).pathname);
+    expect(paths).toContain('/api/me');
+    expect(paths.filter((path) => path === '/auth/v1/user')).toEqual([]);
+    app.expectHealthy();
+  });
+
+  test('a session revoked on the server signs out on a hard load, through the 401 from /api/me', async ({ app, page }) => {
+    // The retired factor list also cleared a session Supabase said was gone. The
+    // real guarantee is this one: the API validates the token on every request,
+    // and the real api-client turns its 401 into a sign-out.
+    await page.route(`${MOCK_API_ORIGIN}/api/me`, async (route) => {
+      if (route.request().method() === 'OPTIONS') return route.fallback();
+      await route.fulfill({
+        status: 401,
+        headers: { 'access-control-allow-origin': '*' },
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Invalid or expired token' }),
+      });
+    });
+
+    await page.goto('/dashboard');
+
+    await expect(page).toHaveURL(/\/login/);
+    const sessionKeys = await page.evaluate(() =>
+      Object.keys(localStorage).filter((key) => /^sb-.*-auth-token$/.test(key)),
+    );
+    expect(sessionKeys, 'the local session must be gone').toEqual([]);
+    // The browser logs the 401 itself; that is this test's expected state.
+    app.consoleErrors.length = 0;
+    expect(app.unmocked).toEqual([]);
+  });
 });
 
 test.describe('key states', () => {

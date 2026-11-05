@@ -13,6 +13,8 @@
  * machine matches the next.
  */
 
+import { enGbDateTimeFormat } from '../../lib/datetime';
+
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const YMD = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -39,7 +41,7 @@ interface Parts {
 }
 
 function partsOf(date: Date, timeZone?: string): Parts {
-  const fmt = new Intl.DateTimeFormat('en-GB', {
+  const fmt = enGbDateTimeFormat({
     timeZone,
     year: 'numeric',
     month: 'numeric',

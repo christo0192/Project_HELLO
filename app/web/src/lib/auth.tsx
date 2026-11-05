@@ -21,7 +21,9 @@
  * `needsMfa` is retained as a constant `false` so consumers keep compiling.
  * Reinstating MFA means restoring the gate here AND in the API's
  * verifyToken()/resolveFullAuth() together, plus re-enabling enrollment in
- * Supabase config.
+ * Supabase config, plus loading the enrolled factors into `factors` again
+ * (no path loads them today: that call cost every hard load 110-500 ms before
+ * GET /api/me for a value nothing read).
  *
  * ── Role resolution ──────────────────────────────────────────────────
  * `isRoleLoading` is true while GET /api/me is in flight. ProtectedRoute
@@ -72,7 +74,10 @@ export interface AuthState {
   needsMfa: boolean;
   /** True if the user has a valid session (single factor — ADR-0011). */
   isAuthenticated: boolean;
-  /** Enrolled MFA factors. Always empty in practice — enrollment disabled. */
+  /**
+   * Always empty — MFA was removed in ADR-0011 and the factors are not loaded.
+   * Retained, like `needsMfa`, so the unrouted MFA pages keep compiling.
+   */
   factors: MfaFactor[];
   /**
    * Authoritative role from GET /api/me (server-held allowlist role).
@@ -104,7 +109,7 @@ export interface AuthState {
     error: AuthError | null;
     verified: boolean;
   }>;
-  /** Refresh the AAL, factors, and authoritative role after MFA verification. */
+  /** Refresh the AAL and the authoritative role. */
   refreshSession: () => Promise<void>;
 }
 
@@ -172,6 +177,10 @@ async function getAalLevel(): Promise<AAL> {
 
 /* ── Helper: list verified TOTP factors ──────────────────────────── */
 
+/** Stable, so the context value does not change identity on its account. */
+const NO_FACTORS: MfaFactor[] = [];
+
+/** A network call (GET /auth/v1/user). Only the retained MFA challenge may use it. */
 async function getVerifiedTotpFactors(): Promise<MfaFactor[]> {
   try {
     const { data, error } = await supabase.auth.mfa.listFactors();
@@ -191,7 +200,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [aal, setAal] = useState<AAL>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [factors, setFactors] = useState<MfaFactor[]>([]);
   const [role, setRole] = useState<MembershipRole | null>(null);
   const [isRoleLoading, setIsRoleLoading] = useState(false);
   const subscriptionRef = useRef<{ unsubscribe: () => void } | null>(null);
@@ -250,7 +258,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  /* ── Refresh session, AAL, factors, and authoritative role ─────── */
+  /* ── Refresh session, AAL, and authoritative role ──────────────── */
   const refreshSession = useCallback(async () => {
     const {
       data: { session: currentSession },
@@ -262,12 +270,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAal(level);
 
     if (currentSession) {
-      const verifiedFactors = await getVerifiedTotpFactors();
-      setFactors(verifiedFactors);
       // ADR-0011: role resolves for any valid session, not only aal2.
       await refreshRole();
     } else {
-      setFactors([]);
       setRole(null);
     }
   }, [refreshRole]);
@@ -322,7 +327,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setSession(null);
     setUser(null);
     setAal(null);
-    setFactors([]);
     setRole(null);
     setIsLoading(false);
 
@@ -424,9 +428,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const level = await getAalLevel();
         if (!cancelled) setAal(level);
 
-        const verifiedFactors = await getVerifiedTotpFactors();
-        if (!cancelled) setFactors(verifiedFactors);
-
         // ADR-0011: role resolves for any valid session, not only aal2.
         if (!cancelled) setIsRoleLoading(true);
         try {
@@ -471,7 +472,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (_event === 'SIGNED_OUT') {
         setAal(null);
-        setFactors([]);
         setRole(null);
         roleUserIdRef.current = null;
         setIsRoleLoading(false);
@@ -496,9 +496,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         } else {
           refreshRole();
         }
-        getVerifiedTotpFactors().then((verifiedFactors) => {
-          setFactors(verifiedFactors);
-        });
       } else {
         setRole(null);
         setIsRoleLoading(false);
@@ -519,7 +516,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isLoading,
       needsMfa,
       isAuthenticated,
-      factors,
+      factors: NO_FACTORS,
       role,
       isRoleLoading,
       signIn,
@@ -536,7 +533,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isLoading,
       needsMfa,
       isAuthenticated,
-      factors,
       role,
       isRoleLoading,
       signIn,

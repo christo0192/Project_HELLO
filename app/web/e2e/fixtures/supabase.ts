@@ -11,13 +11,14 @@
  * WHAT THE APP ACTUALLY CALLS on a restored session (see src/lib/auth.tsx):
  *   - `getSession()`                         → localStorage only, no network
  *   - `mfa.getAuthenticatorAssuranceLevel()` → decodes the JWT's `aal` claim
- *   - `mfa.listFactors()`                    → `GET /auth/v1/user`
  *   - token refresh                          → only inside the 90 s expiry
  *                                              margin, which the far-future
  *                                              `exp` + frozen clock never reach
  * plus, from the candidate page's live-call panel, PostgREST reads and a
  * Realtime websocket. Every other Supabase path falls through to the harness's
- * loud "unmocked" handler.
+ * loud "unmocked" handler. That includes `GET /auth/v1/user`, on purpose: it is
+ * the retired `mfa.listFactors()`, and answering it would hide a call that puts
+ * 110-500 ms back in front of `GET /api/me`.
  */
 
 import type { Page, WebSocketRoute } from '@playwright/test';
@@ -66,7 +67,7 @@ export const ACCESS_TOKEN = `${b64url({ alg: 'none', typ: 'JWT' })}.${b64url(CLA
 const created = new Date(FROZEN_NOW_MS - 120 * 86_400_000).toISOString();
 const lastSignIn = new Date(FROZEN_NOW_MS - 3_600_000).toISOString();
 
-/** The GoTrue user object (`GET /auth/v1/user`, and embedded in the session). */
+/** The GoTrue user object, embedded in the session. */
 export const AUTH_USER = {
   id: ADMIN_USER_ID,
   aud: 'authenticated',
@@ -124,7 +125,6 @@ export interface SupabaseReply {
 export function supabaseReply(method: string, url: URL): SupabaseReply | null {
   const path = url.pathname;
 
-  if (path === '/auth/v1/user' && method === 'GET') return { status: 200, json: AUTH_USER };
   if (path === '/auth/v1/token' && method === 'POST') {
     // Only reachable if a test deliberately expires the session.
     return { status: 200, json: { ...PERSISTED_SESSION, user: AUTH_USER } };
