@@ -39,6 +39,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
 } from 'react';
@@ -309,9 +310,12 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
       cbRef.current.onMediaDropped?.();
     }, [releaseMedia]);
 
+    // Both starts-over below run in the commit, not after it. A passive effect waits for the paint, so a
+    // click on the recording that commit shows could arrive first, and the reset would throw that click away.
+
     // A different recording (another attempt, another round): start over.
     const identityRef = useRef(`${roundId}\n${sessionId}`);
-    useEffect(() => {
+    useLayoutEffect(() => {
       const identity = `${roundId}\n${sessionId}`;
       if (identityRef.current === identity) return;
       identityRef.current = identity;
@@ -322,7 +326,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
     // answer, and any link, belong to the old state. Start over from the list.
     const listedState = viewState(summary);
     const listedRef = useRef(listedState);
-    useEffect(() => {
+    useLayoutEffect(() => {
       if (listedRef.current === listedState) return;
       listedRef.current = listedState;
       reset();

@@ -656,6 +656,39 @@ describe('a clicked turn lights at once and holds through the lead-in', () => {
       expect(lit()).toEqual(['2']);
     });
 
+    it.each([
+      ['already had their times', {}],
+      ['get their times in that answer', { started_at_ms: null }],
+    ])('keeps a click made the moment Check again answers ready, when the rows %s', async (_rows, over) => {
+      mockApi.listR1Rounds = vi.fn().mockResolvedValue(rounds({ state: 'processing', ...over }));
+      renderWorkspace();
+      const checkAgain = await screen.findByRole('button', { name: /check again/i });
+      mockApi.listR1Rounds.mockResolvedValue(rounds());
+
+      // The answer's commit is the first to show Load, and the player starts over because of that commit.
+      // This click lands right behind it, so a start-over that came later would throw the click away.
+      const watcher = new MutationObserver(() => {
+        const row = document.querySelector<HTMLButtonElement>('button[aria-label^="Turn 2:"]');
+        if (!row || !document.querySelector('button[aria-label^="Load recording"]')) return;
+        watcher.disconnect();
+        row.click();
+      });
+      watcher.observe(document.body, { childList: true, subtree: true });
+      onTestFinished(() => watcher.disconnect());
+
+      fireEvent.click(checkAgain);
+      expect(await screen.findByText(/^Now playing turn 2/)).toBeInTheDocument();
+      expect(lit()).toEqual(['2']);
+
+      const video = await mediaOnScreen();
+      const state = drive(video);
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+      expect(mockApi.getR1Recording).toHaveBeenCalledTimes(1);
+    });
+
     it('follows the latest of two clicks made before the recording is loaded', async () => {
       renderWorkspace();
       await loadButton();
@@ -976,11 +1009,11 @@ describe('when the R1 summary cannot be had', () => {
     mockApi.listR1Rounds = undefined;
     renderWorkspace();
     expect(await screen.findByText(POINTER)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
-    expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
     // The transcript is still there, untimed. The pointer shows before it arrives, so wait for it.
     expect(await screen.findByText('Welcome to the role-play.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Turn 1:/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
+    expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
   });
 
   it('a host without a candidate id (the scoped Ashby page) gets the pointer and no read', async () => {
