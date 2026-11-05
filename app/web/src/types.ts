@@ -1712,7 +1712,8 @@ export interface AshbyMcWorkflow {
   sessionId?: string | null;
   /**
    * C3 (0114): parked for a human because the newest assessment's interview
-   * evidence is insufficient — nothing reaches Ashby until someone acts.
+   * evidence is insufficient — no scorecard reaches Ashby until someone acts.
+   * The Christy tag still follows the raw verdict's lean (M028).
    * null when the server could not read it; absent on older APIs.
    */
   heldForEvidence?: boolean | null;

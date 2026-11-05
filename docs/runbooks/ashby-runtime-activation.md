@@ -761,9 +761,14 @@ same as any other. The evidence grade does not change the tag; only a missing ve
 does. HELLO still shows the result as held for insufficient evidence with a re-screen
 recommended, and its scorecard is still not written to Ashby. So on a thin call the
 Ashby tag shows Christy's lean, while the HELLO card says to re-screen.
-- A call graded `no_candidate_speech` has no verdict, so it gets no tag.
+- The tag follows the stored verdict only, never the evidence reason. A call graded
+  `no_candidate_speech` normally stores no verdict: the scorer marks every metric
+  insufficient, giving `human_review`, stored as NULL. So it gets no tag. If such a
+  call did store a verdict (a v1-scored row from before 0089, or a model that scored
+  any metric), it is tagged with that verdict. The re-tag preview below counts such
+  rows by `evidence_reason`.
 - A call cut short after even a little speech can carry a lean, often Reject, and is
-  tagged with it, as the owner chose.
+  tagged with it, as the owner chose ("whatever she is tagging").
 
 Before M028, insufficient evidence suppressed the tag. "Re-tagging after M028" below
 runs the lane once for results that the old rule left untagged.
@@ -939,13 +944,16 @@ Run it **only after the M028 deploy is live**. Before that, the old code would a
 `app/` as in the backfill below, with
 `npx --yes supabase@2.118.0 db query --linked -f <file>`.
 
-1. **Preview.** Writes nothing. Each row is a lean and a grade, from the candidate's
-   newest result across all their jobs, the one the lane will apply. `insufficient`
-   rows are the new tags. A `decision` row means a later full screening already
-   decided that candidate and tagged them, so the run changes nothing for it.
+1. **Preview.** Writes nothing. Each row is a lean, a grade and an evidence reason,
+   from the candidate's newest result across all their jobs, the one the lane will
+   apply. `insufficient` rows with a lean are the new tags. A `decision` row means a
+   later full screening already decided that candidate and tagged them, so the run
+   changes nothing for it. A `no_candidate_speech` row with a lean is a call where
+   the candidate never spoke that will be tagged with that lean. Check whether that
+   is wanted before step 2.
 
    ```sql
-   select v->>'recommendation' as lean, v->>'evidence_grade' as grade, count(*) as links
+   select t.v->>'recommendation' as lean, t.v->>'evidence_grade' as grade, a.evidence_reason as reason, count(*) as links
      from (select screening_v2.ashby_candidate_tag_verdict(l.id, l.external_candidate_id) as v
              from screening_v2.ashby_application_links l
              join screening_v2.ashby_job_mappings m on m.id = l.job_mapping_id and m.status = 'enabled'
@@ -955,7 +963,8 @@ Run it **only after the M028 deploy is live**. Before that, the old code would a
                              and (a.session_id = l.session_id
                                   or a.session_id in (select e.session_id from screening_v2.phone_engagements e
                                                        where e.application_link_id = l.id and e.session_id is not null)))) t
-    group by 1, 2 order by 1, 2;
+     left join screening_v2.assessments a on a.id = (t.v->>'assessment_id')::uuid
+    group by 1, 2, 3 order by 1, 2, 3;
    ```
 
 2. **Run the lane once** for those links, with one trigger each. Re-running is safe:
