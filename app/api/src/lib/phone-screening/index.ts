@@ -224,7 +224,7 @@ export type {
   PhoneReadStore,
 } from './read-ports.js';
 
-export { createPhoneReadStore, boundedRowLimit, PHONE_READ_MAX_ROWS } from './read-stores.js';
+export { createPhoneReadStore, boundedRowLimit, PHONE_READ_MAX_ROWS, PHONE_READ_ID_BATCH } from './read-stores.js';
 
 export {
   PHONE_SLOT_REFUSALS,

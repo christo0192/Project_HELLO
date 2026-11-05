@@ -24,8 +24,24 @@ import { requireInterviewer } from '../lib/rbac.js';
 import { validateBody, validateParams } from '../lib/validation.js';
 import { exportCandidateParamSchema, exportReportAuditBodySchema } from '../schemas/export.js';
 import { CSV_BOM, toCsv, csvFilename } from '../lib/export-csv.js';
+import { chunkIds, readAllPages } from '../lib/id-batches.js';
 
 export const exportRouter = Router();
+
+/**
+ * Hard ceiling on pages per read for one candidate: 20 pages of
+ * POSTGREST_MAX_ROWS is 20,000 rows. Past it the export fails rather than
+ * leaving rows out.
+ */
+const EXPORT_MAX_PAGES = 20;
+
+interface TranscriptTurnRow {
+  session_id: string;
+  turn_index: number;
+  speaker: string;
+  text: string;
+  created_at: string | null;
+}
 
 const EXPORT_COLUMNS = [
   'record_type',
@@ -145,15 +161,22 @@ exportRouter.get(
       // silently dropped; v1 rows leave those DB columns null (metric_results /
       // weighted_score_5) or defaulted (scoring_status='complete'), so the v2
       // cells are gated on schema_version to keep v1 rows unchanged.
-      const { data: assessments } = await supabase
+      //
+      // Every read below is paged past PostgREST's 1000-row cap, which
+      // truncates WITHOUT an error (M026), and a failed read fails the export:
+      // a CSV missing its scorecards or transcript would read as complete.
+      const assessmentsRead = await readAllPages<Record<string, unknown>>((from, to) => supabase
         .from('assessments')
         .select(
           'id, session_id, english, tone, communication, motivation, role_fit, overall_score, recommendation, created_at, schema_version, weighted_score_5, scoring_status, metric_results',
         )
         .eq('candidate_id', candidateId)
-        .order('created_at', { ascending: true });
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true })
+        .range(from, to), EXPORT_MAX_PAGES);
+      if (!assessmentsRead.ok) return next(new Error('failed to export candidate'));
 
-      const rows: Array<Record<string, unknown>> = (assessments ?? []).map((a) => {
+      const rows: Array<Record<string, unknown>> = assessmentsRead.rows.map((a) => {
         const isV2 = Number(a.schema_version) === 2;
         return {
           record_type: 'scorecard',
@@ -191,23 +214,38 @@ exportRouter.get(
 
       // Transcript rows — bounded text, opaque session id, speaker allowlist
       // (bot|candidate enforced by DB CHECK). Deterministic order.
-      const { data: sessions } = await supabase
+      const sessionsRead = await readAllPages<{ id: string; created_at: string }>((from, to) => supabase
         .from('call_sessions')
         .select('id, created_at')
         .eq('candidate_id', candidateId)
-        .order('created_at', { ascending: true });
-      const sessionIds = (sessions ?? []).map((s) => s.id as string);
-      const sessionCreated = new Map((sessions ?? []).map((s) => [s.id as string, s.created_at as string]));
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true })
+        .range(from, to), EXPORT_MAX_PAGES);
+      if (!sessionsRead.ok) return next(new Error('failed to export candidate'));
+      const sessions = sessionsRead.rows;
+      const sessionIds = sessions.map((s) => s.id);
+      const sessionCreated = new Map(sessions.map((s) => [s.id, s.created_at]));
 
       if (sessionIds.length > 0) {
-        const { data: turns } = await supabase
-          .from('transcript_turns')
-          .select('session_id, turn_index, speaker, text, created_at')
-          .in('session_id', sessionIds)
-          .order('session_id', { ascending: true })
-          .order('turn_index', { ascending: true });
+        // In batches of ID_BATCH_SIZE sessions, each paged in the unique
+        // (session_id, turn_index) order, then put back in that one order.
+        const turns: TranscriptTurnRow[] = [];
+        for (const chunk of chunkIds(sessionIds)) {
+          const turnsRead = await readAllPages<TranscriptTurnRow>((from, to) => supabase
+            .from('transcript_turns')
+            .select('session_id, turn_index, speaker, text, created_at')
+            .in('session_id', chunk)
+            .order('session_id', { ascending: true })
+            .order('turn_index', { ascending: true })
+            .range(from, to), EXPORT_MAX_PAGES);
+          if (!turnsRead.ok) return next(new Error('failed to export candidate'));
+          turns.push(...turnsRead.rows);
+        }
+        turns.sort((a, b) => (a.session_id === b.session_id
+          ? a.turn_index - b.turn_index
+          : a.session_id < b.session_id ? -1 : 1));
 
-        for (const t of turns ?? []) {
+        for (const t of turns) {
           rows.push({
             record_type: 'transcript',
             candidate_id: candidateId,
@@ -224,7 +262,7 @@ exportRouter.get(
             role_fit: '',
             overall_score: '',
             recommendation: '',
-            created_at: sessionCreated.get(t.session_id as string) ?? t.created_at ?? '',
+            created_at: sessionCreated.get(t.session_id) ?? t.created_at ?? '',
             // Scorecard-only columns are empty on transcript rows.
             schema_version: '',
             weighted_score_5: '',

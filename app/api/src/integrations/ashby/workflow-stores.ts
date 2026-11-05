@@ -33,6 +33,7 @@ import {
 } from './scorecard-v2-adapter.js';
 import { parseEvidenceGrade, readAssessmentEvidenceGrade } from '../../lib/scorecards/evidence.js';
 import { toCandidateColumns } from '../../lib/candidate-phone.js';
+import { chunkIds, mapChunks, POSTGREST_MAX_ROWS } from '../../lib/id-batches.js';
 import { recommendationTagsEnabled } from './recommendation-tags.js';
 
 /**
@@ -1034,12 +1035,18 @@ async function readHeldForEvidence(
       if (typeof r.session_id === 'string' && r.session_id.length > 0) set.add(r.session_id);
       sessionsByLink.set(String(r.id), set);
     }
-    const { data: engagements, error: engagementError } = await client
-      .from('phone_engagements')
-      .select('application_link_id, session_id')
-      .in('application_link_id', linkIds);
-    if (engagementError) throw new Error('held_for_evidence_read_error');
-    for (const e of ((engagements ?? []) as Array<{ application_link_id?: unknown; session_id?: unknown }>)) {
+    // Both reads go in id batches (a page holds up to 200 links, and each
+    // link can add sessions), and any failed batch, or one that may have been
+    // truncated at the row cap, makes every link unreadable (`null`) rather
+    // than quietly "not held".
+    const engagements = await readInIdBatches<{ application_link_id?: unknown; session_id?: unknown }>(
+      linkIds,
+      (chunk) => client
+        .from('phone_engagements')
+        .select('application_link_id, session_id')
+        .in('application_link_id', chunk),
+    );
+    for (const e of engagements) {
       if (typeof e.application_link_id !== 'string' || typeof e.session_id !== 'string') continue;
       sessionsByLink.get(e.application_link_id)?.add(e.session_id);
     }
@@ -1048,15 +1055,18 @@ async function readHeldForEvidence(
       for (const id of linkIds) out.set(id, false);
       return out;
     }
-    const { data: assessments, error: assessmentError } = await client
-      .from('assessments')
-      .select('session_id, evidence_grade, created_at')
-      .in('session_id', sessionIds)
-      .order('created_at', { ascending: false });
-    if (assessmentError) throw new Error('held_for_evidence_read_error');
+    // A session's rows all land in one batch, still newest first.
+    const assessments = await readInIdBatches<{ session_id?: unknown; evidence_grade?: unknown; created_at?: unknown }>(
+      sessionIds,
+      (chunk) => client
+        .from('assessments')
+        .select('session_id, evidence_grade, created_at')
+        .in('session_id', chunk)
+        .order('created_at', { ascending: false }),
+    );
     // Newest first, so the first row seen per session is that session's latest.
     const latestBySession = new Map<string, { grade: string | null; createdAt: string }>();
-    for (const a of ((assessments ?? []) as Array<{ session_id?: unknown; evidence_grade?: unknown; created_at?: unknown }>)) {
+    for (const a of assessments) {
       if (typeof a.session_id !== 'string' || latestBySession.has(a.session_id)) continue;
       latestBySession.set(a.session_id, {
         grade: parseEvidenceGrade(a.evidence_grade),
@@ -1075,6 +1085,26 @@ async function readHeldForEvidence(
     for (const id of linkIds) out.set(id, null);
   }
   return out;
+}
+
+/**
+ * The rows of one `.in()` read over `ids`, in batches of ID_BATCH_SIZE
+ * (lib/id-batches.ts says why), in batch order. Throws when a batch errors, or
+ * answers a full POSTGREST_MAX_ROWS page, which may have been cut short without
+ * an error; the first failure stops new batches.
+ */
+async function readInIdBatches<T>(
+  ids: readonly string[],
+  read: (chunk: string[]) => PromiseLike<{ data: unknown; error: unknown }>,
+): Promise<T[]> {
+  const batches = await mapChunks(chunkIds(ids), async (chunk) => {
+    const { data, error } = await read(chunk);
+    if (error) throw new Error('held_for_evidence_read_error');
+    const rows = (Array.isArray(data) ? data : []) as T[];
+    if (rows.length >= POSTGREST_MAX_ROWS) throw new Error('held_for_evidence_read_truncated');
+    return rows;
+  });
+  return (batches as T[][]).flat();
 }
 
 /** A link that was not examined is not held (`false`); an unreadable one is `null`. */
@@ -1156,24 +1186,26 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
       const sessionIds = [...new Set(
         rows.map((r) => r.session_id).filter((v): v is string => typeof v === 'string' && v.length > 0),
       )];
+      // In batches of ID_BATCH_SIZE: a 200-row page names up to 200 sessions
+      // (lib/id-batches.ts says why one `.in()` over them all is unsafe). A
+      // failed batch leaves only its own sessions null.
       const sessionStatus = new Map<string, string>();
-      if (sessionIds.length > 0) {
+      await mapChunks(chunkIds(sessionIds), async (chunk) => {
         try {
           const { data: sessions, error: sessErr } = await client
             .from('call_sessions')
             .select('id, status')
-            .in('id', sessionIds);
-          if (!sessErr) {
-            for (const s of ((sessions ?? []) as Array<{ id?: unknown; status?: unknown }>)) {
-              if (typeof s.id === 'string' && typeof s.status === 'string') {
-                sessionStatus.set(s.id, s.status);
-              }
+            .in('id', chunk);
+          if (sessErr) return;
+          for (const s of ((sessions ?? []) as Array<{ id?: unknown; status?: unknown }>)) {
+            if (typeof s.id === 'string' && typeof s.status === 'string') {
+              sessionStatus.set(s.id, s.status);
             }
           }
         } catch {
-          // Diagnostic only — leave every sessionStatus null.
+          // Diagnostic only — leave this batch's sessionStatus null.
         }
-      }
+      });
 
       const heldForEvidence = await readHeldForEvidence(client, rows);
 

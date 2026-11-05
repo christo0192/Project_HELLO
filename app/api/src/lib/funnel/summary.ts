@@ -14,6 +14,7 @@
  */
 
 import { createLogger } from '../logger.js';
+import { chunkIds, readAllPages } from '../id-batches.js';
 
 // The event-name union is closed and unknown names rewrite to 'unknown_event',
 // so the distinguishing detail travels in `error_category` — the same shape
@@ -50,6 +51,13 @@ export const FUNNEL_COUNT_FIELDS = [
 
 /** Defence in depth: a hand-crafted from/to cannot pull the whole history. */
 export const FUNNEL_MAX_SPAN_DAYS = 400;
+
+/**
+ * Hard ceiling on rollup pages for one summary: 50 pages of POSTGREST_MAX_ROWS
+ * is 50,000 (day, role) rows, 125 roles over the longest window. Past it the
+ * summary is an error rather than totals over part of the window.
+ */
+const FUNNEL_MAX_PAGES = 50;
 
 /** YYYY-MM-DD `days` before today (UTC). */
 export function funnelDayOffset(days: number): string {
@@ -175,17 +183,25 @@ export async function loadFunnelSummary(
   const minFrom = funnelDayBefore(to, FUNNEL_MAX_SPAN_DAYS);
   const from = requestedFrom < minFrom ? minFrom : requestedFrom;
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // The rollup holds one row per (day, role), so a long window over many
+  // roles passes PostgREST's 1000-row cap, which truncates WITHOUT an error
+  // (M026): the totals would quietly drop the latest days. Paged in a total
+  // order (`id` breaks the day's ties) until a short page; past
+  // FUNNEL_MAX_PAGES the read is an error, never a partial sum.
   const run = async (columns: string): Promise<{ data: unknown; error: unknown }> => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let q: any = supabase
-      .from('funnel_stage_daily')
-      .select(columns)
-      .gte('cohort_day', from)
-      .lte('cohort_day', to)
-      .order('cohort_day', { ascending: true });
-    if (input.roleId) q = q.eq('role_id', input.roleId);
-    return q;
+    const read = await readAllPages<Record<string, unknown>>((first, last) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let q: any = supabase
+        .from('funnel_stage_daily')
+        .select(columns)
+        .gte('cohort_day', from)
+        .lte('cohort_day', to)
+        .order('cohort_day', { ascending: true })
+        .order('id', { ascending: true });
+      if (input.roleId) q = q.eq('role_id', input.roleId);
+      return q.range(first, last);
+    }, FUNNEL_MAX_PAGES);
+    return read.ok ? { data: read.rows, error: null } : { data: null, error: read.error };
   };
 
   // ── The two facts the UI must not infer, started BEFORE the main read ──
@@ -255,18 +271,23 @@ export async function loadFunnelSummary(
       // rejects as malformed rather than treating as an empty set.
       if (mappingIds.length === 0) return false;
 
-      const { data: linkRows, error: linkErr } = await supabase
-        .from('ashby_application_links')
-        .select('id')
-        .in('job_mapping_id', mappingIds)
-        .not('stage_synced_at', 'is', null)
-        .not('external_stage_id', 'is', null)
-        .limit(1);
-      if (linkErr) {
-        logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
-        return false;
+      // In batches of ID_BATCH_SIZE mapping ids (lib/id-batches.ts says why),
+      // stopping at the first batch that finds a synced link.
+      for (const chunk of chunkIds(mappingIds)) {
+        const { data: linkRows, error: linkErr } = await supabase
+          .from('ashby_application_links')
+          .select('id')
+          .in('job_mapping_id', chunk)
+          .not('stage_synced_at', 'is', null)
+          .not('external_stage_id', 'is', null)
+          .limit(1);
+        if (linkErr) {
+          logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
+          return false;
+        }
+        if (Array.isArray(linkRows) && linkRows.length > 0) return true;
       }
-      return Array.isArray(linkRows) && linkRows.length > 0;
+      return false;
     } catch {
       // A THROW here is a programming error (wrong column, client API change),
       // not a configuration state. Without this log it disappears into a

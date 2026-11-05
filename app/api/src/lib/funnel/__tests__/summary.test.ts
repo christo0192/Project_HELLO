@@ -69,6 +69,7 @@ function makeReader(handlers: Partial<Record<Kind, Handler>>) {
       in: chain('in'),
       order: chain('order'),
       limit: chain('limit'),
+      range: chain('range'),
       // Thenable: `await q` resolves through here, exactly as PostgREST does.
       then: (
         resolve: (r: Result) => unknown,
@@ -565,5 +566,41 @@ describe('loadFunnelSummary — figures', () => {
     const { reader } = healthy({ window: () => ok([row({ role_id: 'role-a' })]) });
     const out = await loadFunnelSummary(reader, { omitTimings: true });
     expect(out.series[0]).toMatchObject({ role_id: null });
+  });
+});
+
+describe('loadFunnelSummary — past the PostgREST row cap (M026)', () => {
+  it('pages the window read until a short page, so a year over many roles is summed in full', async () => {
+    // PostgREST answers at most 1000 rows and cuts the rest WITHOUT an error.
+    const full = Array.from({ length: 1000 }, () => row({ entered_parse: 1 }));
+    const { reader, calls } = healthy({
+      window: (_q, nth) => ok(nth === 1 ? full : [row({ entered_parse: 1 }), row({ entered_parse: 1 })]),
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.totals.entered_parse).toBe(1002);
+    const pages = calls.filter((c) => kindOfCall(c) === 'window');
+    expect(pages.map((c) => c.ops.find((op) => op[0] === 'range'))).toEqual([['range', 0, 999], ['range', 1000, 1999]]);
+    // A total order, so consecutive pages neither overlap nor skip.
+    expect(pages[0].ops).toContainEqual(['order', 'id', { ascending: true }]);
+  });
+
+  it('fails the summary, never totals over part of the window, when a later page fails', async () => {
+    const full = Array.from({ length: 1000 }, () => row({ entered_parse: 1 }));
+    const { reader } = healthy({ window: (_q, nth) => (nth === 1 ? ok(full) : fail('XX000')) });
+    await expect(loadFunnelSummary(reader)).rejects.toThrow('failed to load funnel summary');
+  });
+
+  it('asks the HR probe about at most 100 mappings per read', async () => {
+    // One `.in()` over ~390 uuids fails in Node's fetch (UND_ERR_HEADERS_OVERFLOW).
+    const { reader, calls } = healthy({
+      mappings: () => ok(Array.from({ length: 200 }, (_, i) => ({ id: `map-${i}` }))),
+      links: (_q, nth) => ok(nth === 1 ? [] : [{ id: 'link-1' }]),
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.meta.hr_tracking_configured).toBe(true);
+    const sizes = calls
+      .filter((c) => c.table === 'ashby_application_links')
+      .map((c) => (c.ops.find((op) => op[0] === 'in')![2] as string[]).length);
+    expect(sizes).toEqual([100, 100]);
   });
 });
