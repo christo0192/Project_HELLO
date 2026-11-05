@@ -9,7 +9,8 @@ What it records, and where it goes (binding contract C1-C11, ``IMPLEMENTER-RULES
   interview goes on.  In ``av`` mode the recorder also subscribes to the candidate's camera
   itself (the session connects audio-only), decimates it to 15 fps and hands the pictures to the
   same child, which puts them on a constant-rate clock next to the audio.  A watchdog gives the
-  picture up (never the audio) when the machine is struggling.
+  picture up (never the audio) when the machine is struggling.  Both spools get the silence inside
+  one agent playback, which the stock tap drops (``_PlayoutOutput``, ``R1_RECORDER_KEEP_PAUSES``).
 * One uploader thread talks to the API (``/api/internal/r1/recording/{prepare,part-url,
   object-url,complete}``) and PUTs to the presigned URLs it returns: 5 MiB parts cut from the
   growing MP4, and the whole OGG every ``checkpoint_interval_sec``.  When the encoder is lost after
@@ -115,6 +116,11 @@ PREFIX_MIN_BYTES_PER_SECOND = 256 * 1024
 PREFIX_MAX_ROUNDS = 8
 # A tee gap smaller than this is rounding, not a rejoin gap (see ``TeeMixer``).
 GAP_SLACK_SECONDS = 0.25
+# Silence inside one agent playback shorter than this is jitter in how frames reach the tap, not a pause
+# (the room output plays in 50 ms frames).  It stays in the reckoning, so jitter cannot add up past this.
+PLAYOUT_GAP_SLACK_SECONDS = 0.05
+# On a line with a silence in it, the time after the last audio is reckoned down to this (see ``_PlayoutOutput``).
+PLAYOUT_TAIL_SECONDS = 0.001
 # Peak amplitude (16-bit LSBs) of what counts as silence at the front of a chunk that is ahead of the
 # clock: the SDK's silence frame, once resampled, carries +-1 LSB of dither (measured), never more.
 SILENCE_LEVEL = 2
@@ -225,6 +231,15 @@ def x264_preset(env: Mapping[str, str] | None = None) -> str:
     """``R1_VIDEO_X264_PRESET``: ``ultrafast``, ``superfast`` or ``veryfast``; anything else is the default."""
     raw = os.environ.get("R1_VIDEO_X264_PRESET") if env is None else env.get("R1_VIDEO_X264_PRESET")
     return raw if raw in PRESETS else DEFAULT_PRESET
+
+
+def keep_pauses_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """``R1_RECORDER_KEEP_PAUSES`` (default on): silence inside one agent playback stays in the recording.
+
+    "0", "off", "false" or "no" is the rollback: the SDK's own output tap, exactly as before.
+    """
+    raw = os.environ.get("R1_RECORDER_KEEP_PAUSES") if env is None else env.get("R1_RECORDER_KEEP_PAUSES")
+    return (raw or "1").strip().lower() not in ("0", "off", "false", "no")
 
 
 # ---------------------------------------------------------------------------- spool
@@ -959,7 +974,9 @@ class TeeMixer:
         agent = self._channels[1].convert(output_frames, flush=bool(output_frames))
         count = max(len(candidate), len(agent))
         # The shorter channel is right-aligned (silence in front), as the SDK does: an agent
-        # line is queued when its playback FINISHES, so its end is the end of the chunk.
+        # line is queued when its playback FINISHES, so its end is the end of the chunk.  It comes
+        # with the silence inside its playback in place (``_PlayoutOutput``), so its first frame
+        # lands on its real playout time as well.
         if len(candidate) < count:
             candidate = np.concatenate((np.zeros(count - len(candidate), dtype=np.int16), candidate))
         if len(agent) < count:
@@ -998,7 +1015,132 @@ def recorder_io_class() -> type:
 
 
 def _build_recorder_io_class() -> type:
-    from livekit.agents.voice.recorder_io.recorder_io import RecorderIO
+    from livekit.agents.voice.recorder_io.recorder_io import RecorderAudioOutput, RecorderIO
+
+    class _PlayoutOutput(RecorderAudioOutput):
+        """The SDK's output tap, with the silence inside one playback kept.
+
+        The SDK writes a whole agent line when its playback finishes, lined up with that end, and
+        puts back only explicit pause and resume times.  Frames reach this tap with no back-pressure
+        (a TTS may hand a second over at once), so a stretch where the next frame was simply late (the
+        thinking filler's wait, a slow second speech call) left no trace, and the start of the line
+        landed late in the file by that much.
+
+        ``_playout_end`` is when the audio handed over so far finishes playing, on the wall clock.
+        A frame that arrives after it plays at once, so the room played silence from ``_playout_end``
+        until then.  An explicit pause holds what is queued, so it moves ``_playout_end`` on by its
+        length.  Each stretch of silence goes on the SDK's own list of pause intervals, in wall-clock
+        order, and the SDK's code places it: the line is written with its silence in place, and both
+        readers of that one write (the stock OGG and ``TeeMixer``) get every frame at its real playout
+        time.
+
+        A playback can also outlast its audio: the room reports most lines finished a little late, and
+        a line can be cut while waiting for its next fragment.  The SDK measures every silence back
+        from where the line ended, so the tap ends it on the last audio, as for a line that finishes
+        paused, and the SDK writes the time since as trailing silence, after every sample.  That quiet
+        is in the file but it is no pause in the line: only silence with audio after it counts as kept
+        (``kept_silence``).  On a live room most lines carry that small quiet tail, so the write can
+        differ from the stock one even when no pause was kept.
+
+        This tap sees a frame when it is handed over; the room's own task takes it later, and that is
+        the moment the row is anchored at (``on_playback_started``).  A stall of the event loop between
+        the two is no silence: nothing had played yet.  So the first report of a playback restarts the
+        clock from the real first frame, and takes back what the clock made of the wait.  Only that
+        report: the room repeats it after every resume.  A sink that never reports leaves the clock on
+        the hand-over.
+        """
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._playout_end: float | None = None
+            self._paused_at: float | None = None
+            self._handed_over = 0.0  # seconds of this playback's audio given to the room so far
+            self._playing = False  # the room has reported this playback's first played frame
+            self._silences: list[tuple[float, float]] = []  # this playback's entries on the SDK's list
+            self._silences_before_audio = 0  # how many of them have audio after them, so far
+            self.silence_kept_seconds = 0.0  # the whole call, as written: silence with audio after it
+            self.silences_kept = 0
+
+        def _keep_silence_until(self, now: float) -> None:
+            end = self._playout_end
+            if end is not None and now - end > PLAYOUT_GAP_SLACK_SECONDS:
+                self._RecorderAudioOutput__pause_wall_times.append((end, now))
+                self._silences.append((end, now))
+                self._playout_end = now
+
+        def _end_on_the_last_audio(self) -> None:
+            """Have the SDK end this line when its audio ran out, not when the room said so.
+
+            On a line with a silence in it the end has to add up: the jitter the slack forgives elsewhere
+            would move that silence earlier in the audio, and the end of a word would play after it.
+            """
+            end = self._playout_end
+            ended = time.time() if self._paused_at is None else self._paused_at
+            slack = PLAYOUT_TAIL_SECONDS if self._silences else PLAYOUT_GAP_SLACK_SECONDS
+            if end is not None and ended - end > slack:
+                self._RecorderAudioOutput__current_pause_start = end
+
+        def on_playback_started(self, *, created_at: float) -> None:
+            if not self._playing:
+                self._playing = True
+                if self.recorder_io.recording:
+                    for silence in self._silences:  # (the SDK's own pauses stay: they held the audio)
+                        self._RecorderAudioOutput__pause_wall_times.remove(silence)
+                    self._silences.clear()
+                    self._silences_before_audio = 0
+                    self._playout_end = created_at + self._handed_over
+            super().on_playback_started(created_at=created_at)
+
+        async def capture_frame(self, frame: Any) -> None:
+            await super().capture_frame(frame)
+            if not self.recorder_io.recording:
+                return
+            if self._playout_end is None:
+                self._playout_end = self._paused_at if self._paused_at is not None else time.time()
+            elif self._paused_at is None:
+                self._keep_silence_until(time.time())
+            self._playout_end += frame.duration
+            self._handed_over += frame.duration
+            self._silences_before_audio = len(self._silences)
+
+        def pause(self) -> None:
+            if self._paused_at is None and self.recorder_io.recording:
+                self._paused_at = time.time()
+                self._keep_silence_until(self._paused_at)
+            super().pause()
+
+        def resume(self) -> None:
+            if self._paused_at is not None and self.recorder_io.recording:
+                if self._playout_end is not None:
+                    self._playout_end += time.time() - self._paused_at
+                self._paused_at = None
+            super().resume()
+
+        def on_playback_finished(
+            self,
+            *,
+            playback_position: float,
+            interrupted: bool,
+            synchronized_transcript: str | None = None,
+        ) -> None:
+            recording = self.recorder_io.recording
+            if recording:
+                self._end_on_the_last_audio()
+            written = recording and self.has_pending_data  # (the SDK writes the line only then)
+            super().on_playback_finished(
+                playback_position=playback_position,
+                interrupted=interrupted,
+                synchronized_transcript=synchronized_transcript,
+            )
+            if written:
+                kept = self._silences[: self._silences_before_audio]
+                self.silence_kept_seconds += sum(end - start for start, end in kept)
+                self.silences_kept += len(kept)
+            self._playout_end = None
+            self._paused_at = None
+            self._handed_over = 0.0
+            self._playing = False
+            self._silences = []
 
     class _TeeQueue(queue.Queue):
         """A ``queue.Queue`` that also hands every item to the tee, stamped with the clock.
@@ -1031,6 +1173,17 @@ def _build_recorder_io_class() -> type:
         @property
         def recording(self) -> bool:  # type: ignore[override]
             return bool(self._started) and not self._capture_closed
+
+        def record_output(self, audio_output: Any) -> Any:
+            if not keep_pauses_enabled():
+                return super().record_output(audio_output)
+            self._out_record = _PlayoutOutput(recording_io=self, audio_output=audio_output, write_fnc=self._write_cb)
+            return self._out_record
+
+        def kept_silence(self) -> tuple[float, int] | None:
+            """Seconds and stretches of silence kept inside this call's lines; ``None`` on the SDK's own tap."""
+            out = self._out_record
+            return (out.silence_kept_seconds, out.silences_kept) if isinstance(out, _PlayoutOutput) else None
 
         def close_capture(self) -> None:
             """Neither tap accumulates audio from now on (the interview is over)."""
@@ -2141,6 +2294,7 @@ class R1Recorder:
             "unknown_event",
             error_type="r1_rec_started",
             error_category=MODE_AV if self._video else MODE_AUDIO,
+            schema="keep_pauses" if keep_pauses_enabled() else "sdk_tap",  # which tap made this recording
         )
 
     def _decide_video(self) -> bool:
@@ -2581,6 +2735,14 @@ class R1Recorder:
                 error_type="r1_rec_finished",
                 error_category=layout,
                 duration_sec=int((self._media_ms() or 0) // 1000),
+            )
+        kept = self._io.kept_silence()
+        if kept is not None:
+            _log.info(
+                "unknown_event",
+                error_type="r1_rec_silence_kept",
+                duration_sec=round(kept[0], 1),
+                option_count=kept[1],
             )
         await self._teardown_child()
         self._worker.halt()

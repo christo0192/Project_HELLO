@@ -345,7 +345,7 @@ ok(!hasEnvKey(phoneCfg, "BROWSER_WORKER_ONE_JOB"), "fly.phone.toml must NOT set 
 // at the reviewed enable step, never [env]: a fly.toml value would ship with the next deploy of an
 // image that has not passed the rehearsals, and `fly secrets unset` could no longer turn it off
 // without a deploy. Absent = no RecorderIO, no spool, no encoder, no recording call.
-for (const key of ["R1_RECORDING", "R1_VIDEO_RECORDING", "R1_VIDEO_X264_PRESET"]) {
+for (const key of ["R1_RECORDING", "R1_VIDEO_RECORDING", "R1_VIDEO_X264_PRESET", "R1_RECORDER_KEEP_PAUSES"]) {
   ok(!hasEnvKey(browser, key), `fly.toml must leave ${key} absent: R1 recording is switched on only by a Fly secret at the reviewed enable step (a fly.toml value would ship it with a deploy and defeat the instant rollback)`);
 }
 // R1 voices and the STT trial (owner decision 2026-10-30). Like R1_RECORDING these are Fly SECRETS,
