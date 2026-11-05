@@ -9848,6 +9848,17 @@ components:
           type: integer
           nullable: true
           description: M013 S02. GET /api/screening/{id} only. The turn's own epoch-ms start (worker clock), so the review UI can place a phone turn on its leg's recording (CandidatePhoneAttempt.recording_started_at_ms). null for legacy rows without timing.
+        ended_at_ms:
+          type: integer
+          description: 0136, R1 only. GET /api/screening/{id} only. The turn's own epoch-ms end on the same clock as started_at_ms (AI turn, its playback finished; candidate turn, the voice-activity end of speech). Absent for phone and older R1 turns and for any turn whose end was not known.
+        ai_voice:
+          type: string
+          enum: [interviewer, learner]
+          description: 0136, R1 only. GET /api/screening/{id} only. The voice that spoke this AI turn. Absent otherwise.
+        ai_played_ms:
+          type: integer
+          minimum: 0
+          description: 0136, R1 only. GET /api/screening/{id} only. Milliseconds of audio that played for this AI turn, less than the line's length when it was cut. Absent otherwise.
         is_gate:
           type: boolean
           description: 0067 — true for a pre-consent (gate) turn (the greeting/consent exchange). Shown in the recruiter transcript but excluded from scoring. Absent/legacy rows are false.

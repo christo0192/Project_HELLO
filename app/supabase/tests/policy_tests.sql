@@ -23891,6 +23891,36 @@ drop function _policy_tests.p134_link(text, uuid, uuid);
 drop function _policy_tests.p134_mapping(text, text);
 -- ==== 0134 END ====
 
+-- ── 0136: R1 turn timing facts ──────────────────────────────────────────
+select _policy_tests.assert(
+  '0136: the three turn timing columns are nullable with no default',
+  (
+    select count(*) = 3
+      from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'transcript_turns'
+       and column_name in ('turn_ended_at_ms', 'ai_voice', 'ai_played_ms')
+       and is_nullable = 'YES'
+       and column_default is null
+  ),
+  'additive only: an existing row must stay valid with NULL in all three'
+);
+
+select _policy_tests.assert(
+  '0136: the turn timing CHECKs exist and are validated',
+  (
+    select count(*) = 3
+      from pg_constraint
+     where conrelid = 'screening_v2.transcript_turns'::regclass
+       and conname in ('chk_transcript_turns_turn_ended_at_ms',
+                       'chk_transcript_turns_ai_voice',
+                       'chk_transcript_turns_ai_played_ms')
+       and contype = 'c'
+       and convalidated
+  ),
+  'each turn timing column must be guarded by a validated CHECK'
+);
+
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
 -- the last phone assertion before the verdict.

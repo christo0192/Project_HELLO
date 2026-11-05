@@ -2744,6 +2744,28 @@ audio and video may drift." A `combined` recording is gap-padded on the wall clo
 flash within 20 ms before and after a 20 s gap). A salvaged recording (`worker_lost`) has no start time, so it plays but
 has no click-to-seek.
 
+#### Turn timing facts and the playback line (0136)
+
+For new interviews the worker stores three extra facts on each `transcript_turns` row: `turn_ended_at_ms` (AI row: its
+playback finished; candidate row: the voice-activity end of speech, back-dated by the SDK to the last voiced moment),
+`ai_voice` (`interviewer` or `learner`) and `ai_played_ms` (audio that played; less than the line's length if it was cut).
+All are nullable and a missing value is normal: older interviews have none, and a candidate row has no end when it closed
+while they were still speaking or had no start. The phone lane never writes them. A write these extras make fail is
+logged as `r1_turn_timing_dropped` (`error_category` = the exception type) and made again without them, so the row
+survives; one of these means the migration is missing or a value is wrong, not that a turn was lost.
+
+Each AI playback logs one `r1_playback_silence` line, recording on or off: `duration_sec` = seconds of silence inside
+that playback (finish, less the first frame, less the audio played), `error_category` = `full` or `cut`, `option_count` =
+times it was paused and resumed, `turn_index` and `phase` = its transcript row, `schema` = the voice. It has numbers and
+fixed labels only. Read it this way: about 0.1-0.25 s on a line that played straight through is the room reporting the
+end a little late, not a pause. A larger number with `option_count` 0 is the wait before a later speech fragment or the
+thinking filler's wait. With `option_count` above 0 it includes a pause the candidate's voice caused.
+`r1_playback_watch_unavailable` means the session had no audio output to follow, so there are no such lines and AI rows
+fall back to the SDK's `stopped_speaking_at` with no `ai_played_ms`.
+
+The worker change needs migration 0136 first, which the deploy applies before any app. Deploy it when no R1 interview is
+live, as for any R1 worker change.
+
 Worker log codes (component `r1`, `error_type`; values are never a URL, key or id): `r1_rec_started` (`error_category` =
 mode, `schema` = output tap), `r1_rec_finished` (`error_category` = layout), `r1_rec_silence_kept` (`duration_sec` and
 `option_count`, as above), `r1_rec_degraded` (`error_category` = reason), `r1_rec_discarded` (consent withdrawn,

@@ -208,6 +208,7 @@ from r1_guard import FALLBACK_REPLY, StreamGuard
 from r1_latency import (
     GATE_PHASE,
     LatencyTracker,
+    PlaybackMeter,
     count_words,
     endpoint_max_delay_sec,
     interrupt_min_words,
@@ -1567,6 +1568,10 @@ class _SpeechSlot:
     # R1 cut this speech itself (``_interrupt_session``: a generation hung past its deadline), so
     # an ``interrupted`` item of it was not cut by the candidate (voice barge-in, reviewed fix).
     cut_by_r1: bool = False
+    # What the audio output reported for this speech (``_on_playback_finished``): when its latest
+    # playback finished (wall-clock seconds, None until one has), and the audio played so far.
+    finished_at: float | None = None
+    played_seconds: float = 0.0
 
 
 @dataclass
@@ -1616,6 +1621,9 @@ class _CandidateRow:
     # written, nothing the candidate said up to here belongs to a later row (``_anchor_floor``,
     # ``_commit_floor``).
     last_final_at: float | None = None
+    # Epoch milliseconds the candidate stopped speaking this turn (``turn_ended_at_ms``), fixed when
+    # the row closes (``_candidate_turn_end``), or None when that is not known.
+    ended_at_ms: int | None = None
 
 
 # The recording's turn anchor (``transcript_turns.turn_started_at_ms``, migration 0026) must lie in
@@ -1730,6 +1738,9 @@ class R1Interview:
         # Wall-clock seconds of the latest ``user_state_changed -> speaking`` events (oldest first):
         # the anchors of the candidate's rows (``_candidate_turn_anchor``).
         self._user_speaking_at: deque[float] = deque(maxlen=_USER_SPEECH_ANCHORS_KEPT)
+        # ``created_at`` of the latest ``user_state_changed`` leaving ``speaking``: the end of a
+        # candidate's row (``_candidate_turn_end``).
+        self._user_stopped_at: Any = None
         # Two walls (wall-clock seconds, the same clock; each only ever raised) for a candidate
         # row's anchor.  ``_anchor_floor`` is the one its burst of speaking events may not be walked
         # back across: the latest of the last final of every candidate row already written (its
@@ -1819,6 +1830,7 @@ class R1Interview:
         # line and transcript label.
         self._voices: dict[str, str] = {}
         self._voice_unbound_logged = False
+        self._playback = PlaybackMeter()
         self._guard_trips: list[dict[str, Any]] = []
         self._logged_moves: set[str] = set()
         self._skip_failure_reset = False
@@ -4579,10 +4591,19 @@ class R1Interview:
         *,
         interrupted: bool = False,
         started_at_ms: int | None = None,
+        ended_at_ms: int | None = None,
+        voice: str | None = None,
+        played_ms: int | None = None,
     ) -> None:
         """Queue one transcript row; a slow or failing write never stalls the interview."""
+        facts = {
+            "started_at_ms": started_at_ms,
+            "ended_at_ms": ended_at_ms,
+            "voice": voice,
+            "played_ms": played_ms,
+        }
         task = asyncio.ensure_future(
-            self._save_turn_bounded(index, speaker, text, phase, interrupted, started_at_ms)
+            self._save_turn_bounded(index, speaker, text, phase, interrupted, facts)
         )
         self._turn_writes.add(task)
         task.add_done_callback(self._turn_writes.discard)
@@ -4594,11 +4615,11 @@ class R1Interview:
         text: str,
         phase: str,
         interrupted: bool,
-        started_at_ms: int | None = None,
+        facts: Mapping[str, Any],
     ) -> None:
-        # The anchor is passed only when the SDK gave one, so a writer that predates it (and a
-        # row with no anchor) is called exactly as before.
-        extra: dict[str, Any] = {} if started_at_ms is None else {"started_at_ms": started_at_ms}
+        # A fact is passed only when there is one, so a writer that predates it (and a row with
+        # none) is called exactly as before.
+        extra = {name: value for name, value in facts.items() if value is not None}
         try:
             await asyncio.wait_for(
                 self.writer.save_turn(index, speaker, text, phase, interrupted=interrupted, **extra),
@@ -4684,9 +4705,27 @@ class R1Interview:
         """
         row, self._open_row = self._open_row, None
         if row is not None:
+            row.ended_at_ms = self._candidate_turn_end(row)
             # The row is over: speech heard up to its last final is its own, never a later row's.
             self._raise_anchor_floor(row.last_final_at, commit=True)
         return row
+
+    def _candidate_turn_end(self, row: _CandidateRow) -> int | None:
+        """Epoch ms the candidate stopped speaking this row, or None when that is not known.
+
+        It is the VAD's end of speech: ``user_state_changed`` leaving ``speaking``, whose
+        ``created_at`` the SDK back-dates by the silence the VAD waited out, so it is when they
+        stopped and not when the VAD noticed (``tests/test_r1_sdk_contract.py`` pins this, and that
+        only ``turn_detection="stt"``, which R1 never asks for, would skip the back-dating).
+
+        Not when they are still speaking (the row was closed under them: the end is still to come),
+        and not when the row has no start or the latest end is older than it: that end is the
+        previous answer's.
+        """
+        if self._user_state == "speaking" or row.started_at_ms is None:
+            return None
+        ended = _epoch_ms(self._user_stopped_at)
+        return ended if ended is not None and ended >= row.started_at_ms else None
 
     def _write_candidate_row(self, row: _CandidateRow | None, phase: str | None = None) -> None:
         """Write a closed candidate row once, in ``phase`` if given, else in its spoken phase."""
@@ -4698,6 +4737,7 @@ class R1Interview:
             " ".join(row.parts),
             phase or row.phase,
             started_at_ms=row.started_at_ms,
+            ended_at_ms=row.ended_at_ms,
         )
 
     def _candidate_turn_anchor(self, event: Any) -> int | None:
@@ -4850,6 +4890,19 @@ class R1Interview:
         anchor = _epoch_ms(started)
         if anchor is None and slot is not None:
             anchor = _epoch_ms(slot.started_at)
+        return anchor
+
+    @staticmethod
+    def _bot_turn_end(item: Any, slot: _SpeechSlot | None) -> int | None:
+        """Epoch ms the bot finished this row: the audio output's own report, else the SDK's metric.
+
+        ``metrics["stopped_speaking_at"]`` is taken just after the playout, a moment before it on
+        a line that was cut.  Otherwise None: never the row-write time.
+        """
+        anchor = None if slot is None else _epoch_ms(slot.finished_at)
+        if anchor is None:
+            metrics = getattr(item, "metrics", None)
+            anchor = _epoch_ms(metrics.get("stopped_speaking_at") if isinstance(metrics, Mapping) else None)
         return anchor
 
     def _on_speech_done(self, handle: Any) -> None:
@@ -5014,7 +5067,8 @@ class R1Interview:
                 and not slot.cut_by_r1
             )
         self._note_wrapup_answer(phase, slot, interrupted)
-        self._remember_bot_turn(index, phase, text, slot)
+        voice = self._remember_bot_turn(index, phase, text, slot)
+        played = slot is not None and slot.finished_at is not None
         self._write_turn(
             index,
             "bot",
@@ -5022,6 +5076,9 @@ class R1Interview:
             phase,
             interrupted=interrupted,
             started_at_ms=self._bot_turn_anchor(item, slot),
+            ended_at_ms=self._bot_turn_end(item, slot),
+            voice=voice,
+            played_ms=round(slot.played_seconds * 1000) if played else None,
         )
         self._record_learner_speech(slot, text, interrupted)
 
@@ -5049,13 +5106,16 @@ class R1Interview:
 
     def _remember_bot_turn(
         self, index: int, phase: str, text: str, slot: _SpeechSlot | None
-    ) -> None:
+    ) -> str | None:
         """Add a delivered bot line, with its voice, to the history the context filter reads.
 
-        The label is the voice the speech was bound to, which is the voice its audio used.
+        The label is the voice the speech was bound to, which is the voice its audio used.  Returns
+        that voice, or None for a speech nobody tagged: its label is the phase's guess, which is
+        good enough for the model's context and not a fact to store.
         """
         handle_id = None if slot is None else getattr(slot.handle, "id", None)
-        voice = self._voices.pop(str(handle_id), None) if handle_id is not None else None
+        bound = self._voices.pop(str(handle_id), None) if handle_id is not None else None
+        voice = bound
         if voice is None:
             # A speech nobody tagged is an LLM reply: the learner's in role-play, else Christy's.
             voice = LEARNER if phase == ROLEPLAY_PHASE else INTERVIEWER
@@ -5065,6 +5125,7 @@ class R1Interview:
         if slot is not None and slot.source == "say":
             entry["scripted"] = True  # a reviewed line (``select_context`` may leave it out)
         self._history.append(entry)
+        return bound
 
     def _record_learner_speech(
         self, slot: _SpeechSlot | None, text: str, interrupted: bool
@@ -5130,7 +5191,55 @@ class R1Interview:
             return
         self._latency.first_audio()
 
+    def _watch_playback(self) -> None:
+        """Follow the agent's playbacks on the session's audio output, which exists from now on.
+
+        Before the recorder wraps that output: its tap keeps it next in the chain, so the events
+        come here with or without a recording, and nothing about the recording changes.
+        """
+        output = getattr(getattr(self.session, "output", None), "audio", None)
+        on = getattr(output, "on", None)
+        if not callable(on):
+            _log.warn("unknown_event", error_type="r1_playback_watch_unavailable")
+            return
+        on("playback_started", self._on_playback_started)
+        on("playback_finished", self._on_playback_finished)
+
+    def _on_playback_started(self, event: Any) -> None:
+        self._playback.started(getattr(event, "created_at", None))
+
+    def _on_playback_finished(self, event: Any) -> None:
+        """Credit a finished playback to its speech and log the silence inside it.
+
+        It reports before the speech's item does, so the row written then has it.  The line is
+        numbers and fixed labels only; ``turn_index`` is what ties it to its transcript row.
+        """
+        playback = self._playback.finished(
+            getattr(event, "playback_position", None),
+            interrupted=bool(getattr(event, "interrupted", False)),
+            now=time.time(),
+        )
+        if playback is None:
+            return
+        speech_id = getattr(getattr(self.session, "current_speech", None), "id", None)
+        slot = self._speeches.get(speech_id)
+        if slot is not None:
+            slot.finished_at = playback.finished_at
+            slot.played_seconds += playback.played_seconds
+        voice = self._voices.get(str(speech_id))
+        _log.info(
+            "unknown_event",
+            error_type="r1_playback_silence",
+            error_category="cut" if playback.interrupted else "full",
+            duration_sec=round(playback.silence_seconds, 3),
+            option_count=playback.resumes,
+            turn_index=None if slot is None else slot.index,
+            phase=None if slot is None else slot.phase,
+            schema=voice,
+        )
+
     def _on_user_state_changed(self, event: Any) -> None:
+        stopped_speaking = self._user_state == "speaking"
         self._user_state = str(getattr(event, "new_state", "") or "")
         self._candidate_activity_at = self._clock()
         self._latency.note_user_state(self._user_state)
@@ -5143,9 +5252,12 @@ class R1Interview:
             self._dropped_turn_start = None  # new speech: what a fragment dropped stays dropped
             if self._user_turn_started is None:
                 self._user_turn_started = self._clock()
-        elif self._fragment_unjudged:
-            # The final came first (Sarvam ends the speech right after it): judge it now.
-            self._judge_fragment()
+        else:
+            if stopped_speaking:
+                self._user_stopped_at = getattr(event, "created_at", None)
+            if self._fragment_unjudged:
+                # The final came first (Sarvam ends the speech right after it): judge it now.
+                self._judge_fragment()
         self._refresh_quiet()
 
     def _refresh_quiet(self) -> None:
@@ -6218,6 +6330,7 @@ class R1Interview:
             self._enter(R1Phase.OPENING)
             self._schedule_forced_close()
             await self._start()
+            self._watch_playback()
             # Capture begins before the opening line, so the first thing the candidate hears is
             # in the recording.  Never blocks and never raises (bounded, logged, skipped).
             await self._start_recorder()

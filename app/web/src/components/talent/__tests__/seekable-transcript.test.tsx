@@ -24,7 +24,42 @@ const MIXED: TranscriptLine[] = [
   { speaker: 'candidate', text: 'Hi!', start_offset_sec: null },
 ];
 
+/** 0136: a new R1 interview's rows, beside a turn with no end (older R1, phone, or simply not known). */
+const NEW_R1_AND_NO_END: TranscriptLine[] = [
+  {
+    speaker: 'bot',
+    text: 'Welcome!',
+    start_offset_sec: 0.0,
+    started_at_ms: 1_700_000_000_000,
+    ended_at_ms: 1_700_000_002_500,
+    ai_voice: 'interviewer',
+    ai_played_ms: 2_300,
+  },
+  { speaker: 'candidate', text: 'Hi!', start_offset_sec: 3.5, started_at_ms: 1_700_000_003_500 },
+  { speaker: 'bot', text: 'Tell me more.', start_offset_sec: null, started_at_ms: null },
+];
+
 describe('SeekableTranscript', () => {
+  it('renders a turn with no end time like any other, beside a turn that has one', () => {
+    const onSeek = vi.fn();
+    render(
+      <SeekableTranscript
+        transcript={NEW_R1_AND_NO_END}
+        activeTurnIndex={null}
+        onSeek={onSeek}
+        recordingReady={true}
+      />,
+    );
+    for (const line of NEW_R1_AND_NO_END) {
+      expect(screen.getByText(line.text)).toBeInTheDocument();
+    }
+    // Timed turns still seek by their start, with or without an end; the untimed one stays plain.
+    const buttons = screen.getAllByRole('button');
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[1]);
+    expect(onSeek).toHaveBeenCalledWith(3.5, 1);
+  });
+
   it('renders timed turns as buttons (always, even without recordingReady)', () => {
     render(
       <SeekableTranscript

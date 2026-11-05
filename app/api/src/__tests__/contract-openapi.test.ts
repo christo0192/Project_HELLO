@@ -1705,6 +1705,64 @@ describe('live handler shapes match documented schemas', () => {
     expect(res.body.transcript.every((t: { start_offset_sec: unknown }) => t.start_offset_sec === null)).toBe(true);
   });
 
+  it('GET /api/screening/{id} carries the 0136 R1 turn facts a row holds, and only those', async () => {
+    configureTables({
+      call_sessions: ok({ ...mockSessionRow, recording_egress_started_at_ms: null }),
+      transcript_turns: ok([
+        {
+          speaker: 'bot', text: 'New AI row.', turn_started_at_ms: 1700000005000, is_gate: false,
+          turn_ended_at_ms: 1700000007500, ai_voice: 'learner', ai_played_ms: 2300,
+        },
+        {
+          speaker: 'candidate', text: 'New candidate row.', turn_started_at_ms: 1700000008000, is_gate: false,
+          turn_ended_at_ms: '1700000009000', ai_voice: null, ai_played_ms: null,
+        },
+      ]),
+      assessments: ok(mockAssessmentRecord),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
+    expect(res.body.transcript).toEqual([
+      {
+        speaker: 'bot', text: 'New AI row.', start_offset_sec: null, is_gate: false,
+        started_at_ms: 1700000005000, ended_at_ms: 1700000007500, ai_voice: 'learner', ai_played_ms: 2300,
+      },
+      {
+        speaker: 'candidate', text: 'New candidate row.', start_offset_sec: null, is_gate: false,
+        started_at_ms: 1700000008000, ended_at_ms: 1700000009000,
+      },
+    ]);
+  });
+
+  it('GET /api/screening/{id} keeps the exact old shape for a turn with no end: phone, older R1, untimed', async () => {
+    const oldShape = {
+      speaker: 'bot', text: 'No end.', start_offset_sec: null, is_gate: false, started_at_ms: 1700000005000,
+    };
+    configureTables({
+      call_sessions: ok({ ...mockSessionRow, recording_egress_started_at_ms: null }),
+      transcript_turns: ok([
+        // A phone row or an older R1 row: the 0136 columns are NULL.
+        {
+          speaker: 'bot', text: 'No end.', turn_started_at_ms: 1700000005000, is_gate: false,
+          turn_ended_at_ms: null, ai_voice: null, ai_played_ms: null,
+        },
+        // Nothing the columns' CHECKs would refuse is passed on, whatever a row holds.
+        {
+          speaker: 'bot', text: 'No end.', turn_started_at_ms: 1700000005000, is_gate: false,
+          turn_ended_at_ms: 1.5, ai_voice: 'christy', ai_played_ms: -1,
+        },
+      ]),
+      assessments: ok(mockAssessmentRecord),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
+    expect(res.body.transcript).toEqual([oldShape, oldShape]);
+  });
+
   it('POST /api/assess/{sessionId} → Assessment (injected runner)', async () => {
     injectAssessmentRunner(async () => mockAssessmentCamel);
     const app = createContractApp();

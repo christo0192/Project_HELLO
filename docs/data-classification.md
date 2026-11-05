@@ -112,6 +112,9 @@
 | `created_at` | Public | Timestamp |
 | `phase` | Internal | R1 conversation phase label |
 | `interrupted` | Internal | Whether the turn was interrupted |
+| `turn_ended_at_ms` | Internal | R1 only (0136). Epoch ms the turn ended: a timing fact, no candidate speech |
+| `ai_voice` | Internal | R1 only (0136). `interviewer` or `learner`: which AI voice spoke a bot row |
+| `ai_played_ms` | Internal | R1 only (0136). Milliseconds of audio played for a bot row |
 
 ### R1 interview-round tables
 

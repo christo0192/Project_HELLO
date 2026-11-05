@@ -22,6 +22,10 @@ _log = StructuredLogger("r1")
 
 # ``transcript_turns.turn_started_at_ms`` accepts 0 < ms < this (migration 0026's CHECK).
 TURN_ANCHOR_LIMIT_MS = 4_102_444_800_000
+# ``ai_voice`` and ``ai_played_ms`` accept these (migration 0136's CHECKs).  The voices are
+# ``r1_tts.INTERVIEWER`` and ``r1_tts.LEARNER``; a line longer than a day is no line.
+AI_VOICES = frozenset({"interviewer", "learner"})
+AI_PLAYED_LIMIT_MS = 86_400_000
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,36 @@ OUTCOME_DISPOSITIONS: dict[str, TerminalDisposition] = {
     "configuration_failed": TerminalDisposition("room_create_error"),
     "context_failed": TerminalDisposition("worker_crash"),
 }
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _timing_columns(
+    speaker: str,
+    started_at_ms: int | None,
+    ended_at_ms: int | None,
+    voice: str | None,
+    played_ms: int | None,
+) -> dict[str, Any]:
+    """The 0136 columns this turn can carry: only values their CHECKs accept, the rest left out.
+
+    An end before the turn's own start, and an AI fact on a candidate row, are never written.
+    """
+    columns: dict[str, Any] = {}
+    if (
+        _is_int(ended_at_ms)
+        and 0 < ended_at_ms < TURN_ANCHOR_LIMIT_MS
+        and not (_is_int(started_at_ms) and ended_at_ms < started_at_ms)
+    ):
+        columns["turn_ended_at_ms"] = ended_at_ms
+    if speaker == "bot":
+        if isinstance(voice, str) and voice in AI_VOICES:
+            columns["ai_voice"] = voice
+        if _is_int(played_ms) and 0 <= played_ms <= AI_PLAYED_LIMIT_MS:
+            columns["ai_played_ms"] = played_ms
+    return columns
 
 
 def _http_status(error: BaseException) -> int | None:
@@ -84,6 +118,9 @@ class R1TurnWriter:
         *,
         interrupted: bool = False,
         started_at_ms: int | None = None,
+        ended_at_ms: int | None = None,
+        voice: str | None = None,
+        played_ms: int | None = None,
     ) -> None:
         """Persist only non-empty R1 turns with the additive phase/interrupted fields.
 
@@ -91,6 +128,11 @@ class R1TurnWriter:
         clock (``turn_started_at_ms``, migration 0026), written only when it lies in the
         column's CHECK window; it is what the recording player seeks by.  A turn with no
         anchor is written without the column, exactly as before.
+
+        ``ended_at_ms``, ``voice`` and ``played_ms`` are migration 0136's timing facts: when the
+        turn ended on the same clock, which voice spoke an AI line and how long it played.  They
+        only describe the row, so they can never cost it: a write they make fail is logged by type
+        and made again without them.
         """
         if not text.strip():
             return
@@ -116,9 +158,26 @@ class R1TurnWriter:
                 and 0 < started_at_ms < TURN_ANCHOR_LIMIT_MS
             ):
                 row["turn_started_at_ms"] = started_at_ms
-            result = table.insert(row).execute()
-            if getattr(result, "error", None):
-                raise persistence.LifecycleError("r1_turn_write_failed")
+
+            def insert(fields: dict[str, Any]) -> None:
+                result = table.insert(fields).execute()
+                if getattr(result, "error", None):
+                    raise persistence.LifecycleError("r1_turn_write_failed")
+
+            timing = _timing_columns(speaker, started_at_ms, ended_at_ms, voice, played_ms)
+            if not timing:
+                insert(row)
+                return
+            try:
+                insert({**row, **timing})
+            except Exception as exc:  # noqa: BLE001 - the transcript row is what gets scored
+                _log.warn(
+                    "unknown_event",
+                    error_type="r1_turn_timing_dropped",
+                    error_category=type(exc).__name__,
+                    turn_index=turn_index,
+                )
+                insert(row)
 
         await asyncio.to_thread(write_turn)
 

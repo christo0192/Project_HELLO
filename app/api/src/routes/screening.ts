@@ -116,6 +116,24 @@ export function deriveStartOffsetSec(
 }
 
 /**
+ * The 0136 facts a turn row holds. A key is present only when the row stores a
+ * valid value, so a phone or older R1 turn keeps its exact old shape and a
+ * reader can tell "not known" by absence.
+ */
+function r1TurnFacts(
+  row: Record<string, unknown>,
+): Pick<TranscriptTurn, 'ended_at_ms' | 'ai_voice' | 'ai_played_ms'> {
+  const facts: Pick<TranscriptTurn, 'ended_at_ms' | 'ai_voice' | 'ai_played_ms'> = {};
+  const endedAtMs = validateEpochMsAnchor(row.turn_ended_at_ms);
+  if (endedAtMs !== null) facts.ended_at_ms = endedAtMs;
+  if (row.ai_voice === 'interviewer' || row.ai_voice === 'learner') facts.ai_voice = row.ai_voice;
+  if (Number.isSafeInteger(row.ai_played_ms) && (row.ai_played_ms as number) >= 0) {
+    facts.ai_played_ms = row.ai_played_ms as number;
+  }
+  return facts;
+}
+
+/**
  * Fetch transcript turns with start_offset_sec derived from the two
  * absolute epoch-ms anchors when both are present.
  *
@@ -136,6 +154,9 @@ export function deriveStartOffsetSec(
  * `start_offset_sec` is always null; without the absolute start no phone
  * turn could seek. Only the read route asks for it: the simulation `/turn`
  * path feeds this array to the model and keeps the exact old shape.
+ *
+ * 0136: the read route also gets the R1 facts (`r1TurnFacts`) under the same
+ * flag, so the `/turn` path never passes them on.
  */
 async function getTranscript(
   sessionId: string,
@@ -148,7 +169,7 @@ async function getTranscript(
       // it selects all rows and additionally reads `is_gate` so the UI can tag
       // them later. This is deliberately the mirror of the scorer, which
       // EXCLUDES `is_gate = true`. Additive only; no filter is applied here.
-      .select('speaker,text,turn_started_at_ms,is_gate')
+      .select('speaker,text,turn_started_at_ms,is_gate,turn_ended_at_ms,ai_voice,ai_played_ms')
       .eq('session_id', sessionId)
       .order('turn_index', { ascending: true }),
     supabase
@@ -176,7 +197,10 @@ async function getTranscript(
       // turns from the scored assessment turns. Absent/legacy rows read false.
       is_gate: t.is_gate === true,
     };
-    if (withTurnStart) turn.started_at_ms = validateEpochMsAnchor(t.turn_started_at_ms);
+    if (withTurnStart) {
+      turn.started_at_ms = validateEpochMsAnchor(t.turn_started_at_ms);
+      Object.assign(turn, r1TurnFacts(t));
+    }
     return turn;
   });
 }
