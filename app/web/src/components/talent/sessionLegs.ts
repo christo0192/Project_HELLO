@@ -435,12 +435,15 @@ export interface HeadlineCallFacts {
  * legs; `duration_sec` is never used for it, because it leaves out a dropped
  * leg whose end was never observed and so contradicts the recordings. Other
  * modes keep `duration_sec`. null when no session has a known positive
- * length, so the header shows no figure rather than a zero.
+ * length, so the header shows no figure rather than a zero. An R1 role-play
+ * session is not a screening call and never stands for one, however long it
+ * ran.
  */
 export function headlineCallFacts(sessions: readonly Session[]): HeadlineCallFacts | null {
   let best: HeadlineCallFacts | null = null;
   let bestLength = 0;
   for (const session of sessions) {
+    if (session.interview_round_id != null) continue;
     let facts: HeadlineCallFacts;
     if (session.mode === 'live') {
       const recorded = positiveOrNull(session.recorded_total_sec);
@@ -471,12 +474,38 @@ export function headlineCallFacts(sessions: readonly Session[]): HeadlineCallFac
   return best;
 }
 
-/** The latest turn at or before the playhead, within one group. */
-export function activeTurnIn(turns: readonly LegTurn[], currentTime: number, toleranceSec = 0.25): number | null {
+/** How far ahead of its start a phone turn lights. R1 has no tolerance: its clock is per frame. */
+export const PHONE_HIGHLIGHT_TOLERANCE_SEC = 0.25;
+
+/**
+ * The turn being spoken at the playhead: the last one in START-TIME order whose start is at or before
+ * `currentTime` (plus any tolerance), as a row index. List order plays no part, because a turn's index
+ * can disagree with its time: an R1 candidate row reserves its index at the first transcript, while
+ * its start is the earlier voice activity. A turn with no time is skipped. When starts tie (several
+ * turns clamped to 0) the later row wins. For turns already in order this is the last matching row.
+ */
+export function activeTurnAt(
+  starts: readonly (number | null | undefined)[],
+  currentTime: number,
+  toleranceSec = 0,
+): number | null {
   let active: number | null = null;
-  for (let i = 0; i < turns.length; i++) {
-    const offset = turns[i].turn.start_offset_sec;
-    if (offset != null && offset <= currentTime + toleranceSec) active = i;
+  let activeStart = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i];
+    if (start != null && start <= currentTime + toleranceSec && start >= activeStart) {
+      active = i;
+      activeStart = start;
+    }
   }
   return active;
+}
+
+/** The playing turn within one phone leg's group. */
+export function activeTurnIn(
+  turns: readonly LegTurn[],
+  currentTime: number,
+  toleranceSec = PHONE_HIGHLIGHT_TOLERANCE_SEC,
+): number | null {
+  return activeTurnAt(turns.map((t) => t.turn.start_offset_sec), currentTime, toleranceSec);
 }

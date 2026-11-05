@@ -55,6 +55,7 @@ import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFa
 import { IntakeBadge } from "../components/talent/ResumeReviewBadge";
 import { ExportReportButton } from "../components/talent/ExportReportButton";
 import { headlineCallFacts } from "../components/talent/sessionLegs";
+import { latestScreeningAssessment } from "../lib/latest-screening-assessment";
 import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
 import {
   DUPLICATE_HOLD_NOTICE,
@@ -289,10 +290,11 @@ export function CandidateDetailPage() {
   const decisionBlocked = candidate.decision_use_blocked_at != null;
   // The list's derivation (stored status + phone progress from GET /:id), so
   // the header, the Overview field and the list row say the same words.
-  // C3: the NEWEST assessment (the API orders by created_at desc) was graded
+  // C3: the NEWEST phone assessment (the API orders by created_at desc; an R1
+  // role-play result says nothing about the phone screen) was graded
   // `insufficient` — held from Ashby and from the status, so the phone card
   // recommends a re-screen. Never while an appeal blocks decision use.
-  const latestAssessment = assessments[0] ?? null;
+  const latestAssessment = latestScreeningAssessment(assessments, sessions);
   const rescreenRecommended = !decisionBlocked && isEvidenceInsufficient(latestAssessment);
   // An "Abandoned: dropped before screening" cycle (0125) says WHY in its
   // detail line: the held assessment's evidence reason, in words.
@@ -674,6 +676,7 @@ function OverviewTab({
           role={phoneRole}
           userId={viewerId || null}
           active={r1Active}
+          decisionBlocked={candidate.decision_use_blocked_at != null}
         />
 
         {/* Call attempts and screening sessions: side by side from `xl`, where

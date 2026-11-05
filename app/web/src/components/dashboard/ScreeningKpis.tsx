@@ -35,6 +35,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { apiErrorCopy } from '../../lib/api-error-copy';
 import type { FunnelDailyRow, FunnelSummaryResponse, Role } from '../../types';
 import { ErrorPanel, GlassPanel, InlineNotice, SectionHeader, controlClass, cx } from '../design';
 import { MetricStrip } from '../design/MetricStrip';
@@ -129,11 +130,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
         setData(null);
         return;
       }
-      setError(
-        err instanceof ApiError
-          ? err.message
-          : 'Could not load screening metrics.',
-      );
+      setError(apiErrorCopy(err));
       setData(null);
     } finally {
       if (seq === requestSeq.current) setLoading(false);
@@ -361,7 +358,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   const advanceRate = data?.conversions?.hr_advance_rate;
 
   return (
-    <section className={cx('mt-8', className)} aria-labelledby="screening-kpis-heading">
+    <section className={cx('mt-8', className)} aria-labelledby="screening-kpis-heading" tabIndex={-1}>
       <div className="flex flex-wrap items-end justify-between gap-3">
         <SectionHeader
           id="screening-kpis-heading"

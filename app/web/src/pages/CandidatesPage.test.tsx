@@ -12,6 +12,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { CandidatesPage } from './CandidatesPage';
 import { mockCandidate, mockRole } from '../test/helpers';
+import { ApiError } from '../lib/api-client';
+import { API_ERROR_COPY } from '../lib/api-error-copy';
 import { EMPTY_FUNNEL_TOTALS } from '../test/funnel';
 
 const mockApi = {
@@ -107,6 +109,34 @@ describe('CandidatesPage', () => {
     mockApi.listRoles.mockResolvedValue([mockRole]);
     mockApi.listCandidates.mockResolvedValue(CANDIDATES);
     mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
+  });
+
+  it('says a failed list load in plain words, and its Retry reloads the list', async () => {
+    mockApi.listCandidates.mockRejectedValueOnce(
+      new ApiError('service_unavailable', 503, 'service_unavailable'),
+    );
+    renderPage();
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('The candidate list did not load.');
+    expect(alert).toHaveTextContent(API_ERROR_COPY.service_unavailable);
+    expect(document.body).not.toHaveTextContent('service_unavailable');
+    // Not the empty state: nobody knows yet whether the list is empty.
+    expect(screen.queryByText('No candidates yet')).not.toBeInTheDocument();
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByRole('link', { name: 'Screened Sam' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(mockApi.listCandidates).toHaveBeenCalledTimes(2);
+  });
+
+  it('never prints an unknown code from a failed list load', async () => {
+    mockApi.listCandidates.mockRejectedValue(new ApiError('some_future_code', 500, 'some_future_code'));
+    renderPage();
+    const alert = await screen.findByRole('alert');
+    expect(alert).not.toHaveTextContent('some_future_code');
+    expect(alert).toHaveTextContent(/something went wrong/i);
   });
 
   it('shows loading state initially', () => {

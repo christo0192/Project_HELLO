@@ -355,7 +355,8 @@ describe('R1Section (Mission Control)', () => {
     // The settings tile still shows what it could read.
     expect(within(tile('R1 status')).getByText('On')).toBeInTheDocument();
     const alerts = await screen.findAllByRole('alert');
-    expect(alerts.some((a) => /R1 allowance: boom/.test(a.textContent ?? ''))).toBe(true);
+    expect(alerts.some((a) => /R1 allowance: Something went wrong/.test(a.textContent ?? ''))).toBe(true);
+    expect(document.body).not.toHaveTextContent('boom');
 
     fireEvent.click(screen.getAllByRole('button', { name: 'Try again' })[0]!);
     await waitFor(() => {

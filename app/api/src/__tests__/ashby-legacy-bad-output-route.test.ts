@@ -37,6 +37,7 @@ function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore
   return {
     roleInterviewKind: async () => ({ interviewKind: null }),
     listMappings: async () => [],
+    listMappedJobIds: async () => [],
     listWorkflows: async () => [],
     setMappingStatus: async () => ({ status: 'ok' }),
     cancelApplication: async () => ({ status: 'ok' }),

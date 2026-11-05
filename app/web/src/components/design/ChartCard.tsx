@@ -22,6 +22,8 @@ export interface ChartCardProps {
   level?: 2 | 3;
   /** One quiet line under the body (a caveat, a total). */
   footer?: ReactNode;
+  /** `-1` lets a Retry inside park focus on the card (see `RetryButton`). */
+  tabIndex?: number;
 }
 
 /**
@@ -42,9 +44,15 @@ export function ChartCard({
   meta,
   level = 2,
   footer,
+  tabIndex,
 }: ChartCardProps) {
   return (
-    <GlassPanel as="section" aria-label={title} className={cx('flex h-full flex-col', className)}>
+    <GlassPanel
+      as="section"
+      aria-label={title}
+      tabIndex={tabIndex}
+      className={cx('flex h-full flex-col', className)}
+    >
       <SectionHeader
         title={title}
         description={description}

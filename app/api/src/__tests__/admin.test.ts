@@ -421,6 +421,30 @@ describe('GET /api/admin/sessions (OPS-01)', () => {
     expect(body).not.toContain('boom');
   });
 
+  describe('a list longer than its page says so', () => {
+    const rows = (count: number) => Array.from({ length: count }, (_, i) => ({
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      candidate_id: null, role_id: null, status: 'completed', updated_at: '2026-01-01T00:00:00.000Z', started_at: null, ended_at: null,
+    }));
+    const list = (data: unknown[]) => {
+      mockFrom.mockReturnValue(chainable({ data, error: null }));
+      return request(makeApp(makeUser('admin'))).get('/api/admin/sessions').set(AUTH);
+    };
+
+    it('one row past the page: cut to the page, with truncated: true', async () => {
+      const res = await list(rows(101));
+      expect(res.status).toBe(200);
+      expect(res.body.sessions).toHaveLength(100);
+      expect(res.body.truncated).toBe(true);
+    });
+
+    it('exactly a full page is the whole list, with truncated: false', async () => {
+      const res = await list(rows(100));
+      expect(res.body.sessions).toHaveLength(100);
+      expect(res.body.truncated).toBe(false);
+    });
+  });
+
   it('applies the strict status filter', async () => {
     mockFrom.mockReturnValue(chainable({ data: [], error: null }));
     await request(makeApp(makeUser('admin'))).get('/api/admin/sessions?status=completed').set(AUTH);

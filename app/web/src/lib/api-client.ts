@@ -28,10 +28,18 @@ const BASE_URL = import.meta.env.VITE_API_BASE ?? 'http://localhost:8787';
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  /**
+   * The machine code the API sent, or null when it sent none. For deciding
+   * what to do and for looking up copy (api-error-copy.ts), never for printing.
+   * `message` still holds what it always did, because phoneErrors.ts, lib/r1.ts
+   * and others read their codes from it.
+   */
+  code: string | null;
+  constructor(message: string, status: number, code: string | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -60,14 +68,29 @@ function errorMessageFromBody(data: unknown, fallback: string): string {
   return fallback;
 }
 
+/** A bare `error` that reads as a code, or the envelope's `error.type`. A sentence is not a code. */
+function errorCodeFromBody(data: unknown): string | null {
+  if (!data || typeof data !== 'object') return null;
+  const { error } = data as { error?: unknown };
+  if (typeof error === 'string') return /^\S+$/.test(error) ? error : null;
+  if (error && typeof error === 'object') {
+    const { type } = error as { type?: unknown };
+    if (typeof type === 'string' && type.trim()) return type;
+  }
+  return null;
+}
+
 async function parseError(res: Response): Promise<never> {
   let message = `${res.status} ${res.statusText}`;
+  let code: string | null = null;
   try {
-    message = errorMessageFromBody(await res.json(), message);
+    const data: unknown = await res.json();
+    message = errorMessageFromBody(data, message);
+    code = errorCodeFromBody(data);
   } catch {
     // ignore non-JSON error bodies
   }
-  throw new ApiError(message, res.status);
+  throw new ApiError(message, res.status, code);
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

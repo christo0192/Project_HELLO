@@ -94,7 +94,7 @@ export function LineChart({
 
   let body: ReactNode;
   if (isLoading) {
-    body = <ChartSkeleton />;
+    body = <ChartSkeleton height={height} />;
   } else if (error) {
     body = <ChartError message={error} onRetry={onRetry} />;
   } else if (labels.length === 0) {

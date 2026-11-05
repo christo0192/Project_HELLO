@@ -35,6 +35,7 @@ import { AskHelloButton } from "../components/roles/AskHelloButton";
 // re-exports AccessSection and friends, and pulling it in would drag the whole
 // Mission Control graph into the Roles chunk for one panel.
 import { ScorebarSection } from "../components/mission-control/ScorebarSection";
+import { plainErrorText } from "../lib/api-error-copy";
 import { useAuth } from "../lib/auth";
 import { agentLabel, agentWithRoleLabel, roleAgentName } from "../lib/role-label";
 
@@ -109,6 +110,35 @@ function rolesSummary(roles: Role[]): string {
   return `${roles.length} ${roles.length === 1 ? "agent" : "agents"}, ${active === 0 ? "none" : active} active`;
 }
 
+/**
+ * NOT "could not". `routes/roles.ts` answers 500 when only the audit record
+ * failed, after the write committed and without undoing it, and the client cannot
+ * tell that 500 from one where nothing happened. Saying it failed would send the
+ * operator to do it again, as `phone_audit_write_failed` in phoneErrors.ts explains.
+ */
+const WRITE_OUTCOME_UNKNOWN =
+  "The server reported an error, but the change may have been applied. Check the list to see whether it took effect before trying again.";
+
+/**
+ * What a failed write says: what did not happen, then why. A 409 is the server's
+ * own sentence, which already names what to do about it.
+ */
+function writeFailure(lead: string, e: unknown): string {
+  if (!(e instanceof ApiError)) return lead;
+  if (e.status >= 500) return WRITE_OUTCOME_UNKNOWN;
+  const reason = plainErrorText(e.message);
+  return e.status === 409 ? reason : `${lead} ${reason}`;
+}
+
+/**
+ * Whether a failed write leaves the cards behind what is true: a 5xx may have
+ * committed, and a 404 means the agent is already gone. Anything else was refused
+ * and changed nothing.
+ */
+function listMayBeStale(e: unknown): boolean {
+  return e instanceof ApiError && (e.status === 404 || e.status >= 500);
+}
+
 type StatusFilter = "all" | "active" | "inactive";
 
 function parseStatusFilter(raw: string | null): StatusFilter {
@@ -118,6 +148,13 @@ function parseStatusFilter(raw: string | null): StatusFilter {
 export function RolesPage() {
   const [roles, setRoles] = useState<Role[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * A failed delete or reactivate, kept apart from a failed read, and no read
+   * clears it: the operator checks this message against the list a read brings
+   * back. The next write replaces it, and the row's own button is how a write is
+   * tried again.
+   */
+  const [writeError, setWriteError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Role | "new" | null>(null);
   const [scorebarOpen, setScorebarOpen] = useState(false);
   // Focus returns HERE on close, and the caller owns it — `SlideOver` explains
@@ -131,14 +168,22 @@ export function RolesPage() {
   const { role: viewerRole } = useAuth();
   const canEditMetrics = viewerRole === "admin";
 
-  const load = useCallback(() => {
+  /**
+   * Reads the list and leaves what is on screen until the answer lands, so after
+   * a failed write the operator keeps their place, their page and their focus.
+   */
+  const readRoles = useCallback(() => {
     setError(null);
-    setRoles(null);
-    api
+    return api
       .listRoles()
       .then(setRoles)
       .catch((e: ApiError) => setError(e.message));
   }, []);
+
+  const load = useCallback(() => {
+    setRoles(null);
+    void readRoles();
+  }, [readRoles]);
 
   useEffect(load, [load]);
 
@@ -180,7 +225,7 @@ export function RolesPage() {
         return;
       }
       setRemovalNote(null);
-      setError(null);
+      setWriteError(null);
       setDeletingId(role.id);
       try {
         const result = await api.deleteRole(role.id);
@@ -193,12 +238,15 @@ export function RolesPage() {
       } catch (e) {
         // A 409 (mapped to an Ashby job) arrives here with the server's own
         // sentence, which names what to do about it.
-        setError(e instanceof ApiError ? e.message : "Could not remove the agent.");
+        setWriteError(writeFailure("Could not remove the agent.", e));
+        // Awaited, so the row stays busy until the list is true: pressing a
+        // card that is already gone would only earn a 404.
+        if (listMayBeStale(e)) await readRoles();
       } finally {
         setDeletingId(null);
       }
     },
-    [deletingId, reactivatingId, load],
+    [deletingId, reactivatingId, load, readRoles],
   );
 
   /**
@@ -214,19 +262,20 @@ export function RolesPage() {
       if (reactivatingId || deletingId) return;
       const name = agentWithRoleLabel(role);
       setRemovalNote(null);
-      setError(null);
+      setWriteError(null);
       setReactivatingId(role.id);
       try {
         await api.updateRole(role.id, { is_active: true });
         setRemovalNote(`"${name}" is active again.`);
         load();
       } catch (e) {
-        setError(e instanceof ApiError ? e.message : "Could not reactivate the agent.");
+        setWriteError(writeFailure("Could not reactivate the agent.", e));
+        if (listMayBeStale(e)) await readRoles();
       } finally {
         setReactivatingId(null);
       }
     },
-    [reactivatingId, deletingId, load],
+    [reactivatingId, deletingId, load, readRoles],
   );
 
   // The status filter lives in the URL (?status=active|inactive) so it survives
@@ -319,12 +368,19 @@ export function RolesPage() {
           onCancel={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
+            setWriteError(null);
             load();
           }}
         />
       )}
 
       {error && <ErrorPanel message={error} onRetry={load} />}
+
+      {writeError && (
+        <InlineNotice tone="danger" role="alert" className="mt-1">
+          {writeError}
+        </InlineNotice>
+      )}
 
       {removalNote && (
         // `role="status"`, so the outcome is ANNOUNCED. Deleted and archived

@@ -8,6 +8,7 @@ import type { CandidatePhoneAttempt, Session, TranscriptLine } from '../../../ty
 import {
   LEGACY_RECORDING_LAG_MS,
   LEG_TAIL_NOTE,
+  activeTurnAt,
   activeTurnIn,
   groupTurnsByLeg,
   headlineCallFacts,
@@ -222,6 +223,15 @@ describe('sessionLegs', () => {
     expect(activeTurnIn(groups[0].turns, 9)).toBe(1);
   });
 
+  it('a phone leg keeps its quarter-second tolerance', () => {
+    const groups = groupTurnsByLeg([turn('a', T0 + 312_000), turn('b', T0 + 320_000)], [A, B], null, 'leg');
+    // Turn a sits at 1 s and turn b at 9 s of this leg's file.
+    expect(activeTurnIn(groups[0].turns, 0.74)).toBeNull();
+    expect(activeTurnIn(groups[0].turns, 0.75)).toBe(0);
+    expect(activeTurnIn(groups[0].turns, 8.74)).toBe(0);
+    expect(activeTurnIn(groups[0].turns, 8.75)).toBe(1);
+  });
+
   it('labels a leg without audio in the call-list words', () => {
     expect(legNoAudioLabel('recording_failed')).toBe('Recording unavailable (capture failed)');
     expect(legNoAudioLabel(undefined)).toBe('No recording available');
@@ -312,6 +322,22 @@ describe('sessionLegs', () => {
   describe('headlineCallFacts', () => {
     const base: Session = { id: 's', candidate_id: 'c', role_id: null, status: 'completed', created_at: null };
 
+    it('an R1 session never stands for the phone call, however long it ran', () => {
+      const facts = headlineCallFacts([
+        { ...base, id: 'r1', mode: 'browser', interview_round_id: 'round-1', duration_sec: 1200, candidate_words: 2400 },
+        { ...base, id: 'phone', mode: 'live', recorded_total_sec: 300, recorded_legs: 1, candidate_words: 450 },
+      ]);
+      expect(facts).toEqual({
+        sessionId: 'phone', callSeconds: null, recordedSeconds: 300, recordedCalls: 1, recordedUnknownCalls: null, candidateWords: 450,
+      });
+    });
+
+    it('a candidate whose only session is R1 has no call figures at all', () => {
+      expect(
+        headlineCallFacts([{ ...base, id: 'r1', mode: 'browser', interview_round_id: 'round-1', duration_sec: 1200, candidate_words: 2400 }]),
+      ).toBeNull();
+    });
+
     it('a phone session with an unobserved leg: recorded across its calls, no call length', () => {
       // 0125 stored duration_sec 75 for the 9f60523d shape; it must not show.
       const facts = headlineCallFacts([
@@ -353,5 +379,82 @@ describe('sessionLegs', () => {
       });
       expect(headlineCallFacts([])).toBeNull();
     });
+  });
+});
+
+/**
+ * The highlight rule: the last turn in START-TIME order at or before the playhead. The real R1 data
+ * this has to survive: rows whose index was reserved at the first transcript but whose start is the
+ * earlier voice-activity time, held "Okay"s merged into the next question, and turns with no time.
+ */
+describe('activeTurnAt', () => {
+  it('nothing is active before the first start, and the last start at or before t is', () => {
+    const starts = [5, 10, 70];
+    expect(activeTurnAt(starts, 0)).toBeNull();
+    expect(activeTurnAt(starts, 4.999)).toBeNull();
+    expect(activeTurnAt(starts, 5)).toBe(0);
+    expect(activeTurnAt(starts, 9.999)).toBe(0);
+    expect(activeTurnAt(starts, 10)).toBe(1);
+    expect(activeTurnAt(starts, 69.75)).toBe(1);
+    expect(activeTurnAt(starts, 70)).toBe(2);
+    expect(activeTurnAt(starts, 9000)).toBe(2);
+  });
+
+  it('has no early tolerance unless the caller asks for one', () => {
+    expect(activeTurnAt([10], 9.8)).toBeNull();
+    expect(activeTurnAt([10], 9.8, 0.25)).toBe(0);
+    expect(activeTurnAt([10], 9.74, 0.25)).toBeNull();
+  });
+
+  it('out-of-order indices: every row lights at its own start, none is hidden behind a later index', () => {
+    // A candidate started speaking at 20 s, the bot line began at 21 s and took its index first; the
+    // candidate's row got the next index at its first transcript. The old rule (last matching index)
+    // never lit the bot row: at 21 s the candidate row, later in the list, still matched.
+    const starts = [21, 20, 40];
+    expect(activeTurnAt(starts, 19.9)).toBeNull();
+    expect(activeTurnAt(starts, 20)).toBe(1);
+    expect(activeTurnAt(starts, 20.9)).toBe(1);
+    expect(activeTurnAt(starts, 21)).toBe(0);
+    expect(activeTurnAt(starts, 39.9)).toBe(0);
+    expect(activeTurnAt(starts, 40)).toBe(2);
+  });
+
+  it('a merged acknowledgement lights at its anchor and does not hide the line it was said over', () => {
+    // The learner's line starts at 30 s. The candidate's "Okay" began a moment before it (29.5 s) and
+    // was held, then merged into their next question ("Okay What is the fee?"), in the row after hers.
+    const starts = [12, 30, 29.5, 45];
+    expect(activeTurnAt(starts, 29.4)).toBe(0);
+    expect(activeTurnAt(starts, 29.5)).toBe(2);
+    expect(activeTurnAt(starts, 30)).toBe(1);
+    expect(activeTurnAt(starts, 44.9)).toBe(1);
+    expect(activeTurnAt(starts, 45)).toBe(3);
+  });
+
+  it('a turn with no time is skipped and does not break the order around it', () => {
+    const starts = [5, null, 70, undefined, 90];
+    expect(activeTurnAt(starts, 6)).toBe(0);
+    expect(activeTurnAt(starts, 71)).toBe(2);
+    expect(activeTurnAt(starts, 91)).toBe(4);
+    expect(activeTurnAt([null, null], 10)).toBeNull();
+    expect(activeTurnAt([], 10)).toBeNull();
+  });
+
+  it('turns that share a start (clamped to 0 before the recording began): the later row wins', () => {
+    expect(activeTurnAt([0, 0, 9], 0)).toBe(1);
+    expect(activeTurnAt([0, 0, 9], 8)).toBe(1);
+  });
+
+  it('for ordered turns, with the phone tolerance, it answers exactly what the old rule answered', () => {
+    const oldRule = (starts: readonly (number | null)[], t: number, tolerance: number) => {
+      let active: number | null = null;
+      starts.forEach((s, i) => {
+        if (s != null && s <= t + tolerance) active = i;
+      });
+      return active;
+    };
+    const starts = [0, 0, 1.5, null, 1.5, 3.25, 7, null, 7.1, 12];
+    for (let t = 0; t <= 14; t += 0.05) {
+      expect(activeTurnAt(starts, t, 0.25), `t=${t}`).toBe(oldRule(starts, t, 0.25));
+    }
   });
 });

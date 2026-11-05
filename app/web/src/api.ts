@@ -630,7 +630,9 @@ export const api = {
   // ── Ashby Mission Control ────────────────────────────────────────
   // `limit=200` — the route's maximum. Its default is 50, and the Add-mapping
   // picker marks a job "already mapped" only if its mapping is in this list;
-  // a mapping past a short page would read as free and 409 on save.
+  // a mapping past a short page would read as free and 409 on save. Past 200
+  // the answer has `truncated`, for the page to say so, and `mappedJobIds`, for
+  // the picker to know every mapped job.
   listAshbyMappings: () =>
     request<AshbyMcMappingsResponse>('/api/integrations/ashby/mission-control/mappings?limit=200'),
   listAshbyWorkflows: () =>

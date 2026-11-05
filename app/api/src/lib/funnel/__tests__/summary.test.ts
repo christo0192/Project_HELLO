@@ -69,6 +69,7 @@ function makeReader(handlers: Partial<Record<Kind, Handler>>) {
       in: chain('in'),
       order: chain('order'),
       limit: chain('limit'),
+      range: chain('range'),
       // Thenable: `await q` resolves through here, exactly as PostgREST does.
       then: (
         resolve: (r: Result) => unknown,
@@ -565,5 +566,74 @@ describe('loadFunnelSummary — figures', () => {
     const { reader } = healthy({ window: () => ok([row({ role_id: 'role-a' })]) });
     const out = await loadFunnelSummary(reader, { omitTimings: true });
     expect(out.series[0]).toMatchObject({ role_id: null });
+  });
+});
+
+describe('loadFunnelSummary — past the PostgREST row cap (M026)', () => {
+  it('pages the window read until a short page, so a year over many roles is summed in full', async () => {
+    // PostgREST answers at most 1000 rows and cuts the rest WITHOUT an error.
+    const full = Array.from({ length: 1000 }, () => row({ entered_parse: 1 }));
+    const { reader, calls } = healthy({
+      window: (_q, nth) => ok(nth === 1 ? full : [row({ entered_parse: 1 }), row({ entered_parse: 1 })]),
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.totals.entered_parse).toBe(1002);
+    const pages = calls.filter((c) => kindOfCall(c) === 'window');
+    expect(pages.map((c) => c.ops.find((op) => op[0] === 'range'))).toEqual([['range', 0, 999], ['range', 1000, 1999]]);
+    // A total order that survives a refresh, so consecutive pages neither
+    // overlap nor skip. Never `id`: each refresh regenerates it (0090).
+    expect(pages[0].ops).toContainEqual(['order', 'cohort_day', { ascending: true }]);
+    expect(pages[0].ops).toContainEqual(['order', 'role_id', { ascending: true }]);
+    expect(pages[0].ops.map(([op, col]) => `${op}:${col}`)).not.toContain('order:id');
+  });
+
+  it('fails the summary, never totals over part of the window, when a later page fails', async () => {
+    const full = Array.from({ length: 1000 }, () => row({ entered_parse: 1 }));
+    const { reader } = healthy({ window: (_q, nth) => (nth === 1 ? ok(full) : fail('XX000')) });
+    await expect(loadFunnelSummary(reader)).rejects.toThrow('failed to load funnel summary');
+  });
+
+  it('asks the HR probe about at most 100 mappings per read', async () => {
+    // One `.in()` over ~390 uuids fails in Node's fetch (UND_ERR_HEADERS_OVERFLOW).
+    const { reader, calls } = healthy({
+      mappings: () => ok(Array.from({ length: 200 }, (_, i) => ({ id: `map-${i}` }))),
+      links: (_q, nth) => ok(nth === 1 ? [] : [{ id: 'link-1' }]),
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.meta.hr_tracking_configured).toBe(true);
+    const sizes = calls
+      .filter((c) => c.table === 'ashby_application_links')
+      .map((c) => (c.ops.find((op) => op[0] === 'in')![2] as string[]).length);
+    expect(sizes).toEqual([100, 100]);
+  });
+
+  it('asks the HR probe about every wired mapping, past any fixed bound, in a stable order', async () => {
+    // The only synced link sits on the last mapping of the second page. A
+    // bounded list of mappings would answer "Not tracked yet" here.
+    const firstPage = Array.from({ length: 1000 }, (_, i) => ({ id: `map-${i}` }));
+    const lastId = 'map-1004';
+    const { reader, calls } = healthy({
+      mappings: (_q, nth) => ok(nth === 1 ? firstPage : Array.from({ length: 5 }, (_, i) => ({ id: `map-${1000 + i}` }))),
+      links: (q) => {
+        const asked = q.ops.find((op) => op[0] === 'in')![2] as string[];
+        return ok(asked.includes(lastId) ? [{ id: 'link-1' }] : []);
+      },
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.meta.hr_tracking_configured).toBe(true);
+    const pages = calls.filter((c) => c.table === 'ashby_job_mappings');
+    expect(pages.map((c) => c.ops.find((op) => op[0] === 'range'))).toEqual([['range', 0, 999], ['range', 1000, 1999]]);
+    expect(pages[0].ops).toContainEqual(['order', 'id', { ascending: true }]);
+    expect(pages[0].ops.map(([op]) => op)).not.toContain('limit');
+  });
+
+  it('answers "not configured", never a guess from part of the list, when a later mapping page fails', async () => {
+    const firstPage = Array.from({ length: 1000 }, (_, i) => ({ id: `map-${i}` }));
+    const { reader, calls } = healthy({
+      mappings: (_q, nth) => (nth === 1 ? ok(firstPage) : fail('XX000')),
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.meta.hr_tracking_configured).toBe(false);
+    expect(calls.find((c) => c.table === 'ashby_application_links')).toBeUndefined();
   });
 });

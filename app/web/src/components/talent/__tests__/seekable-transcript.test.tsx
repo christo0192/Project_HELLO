@@ -5,6 +5,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { SeekableTranscript } from '../SeekableTranscript';
+import { clockText } from '../../../lib/r1-recording';
 import type { TranscriptLine } from '../../../types';
 
 const TIMED: TranscriptLine[] = [
@@ -37,7 +38,7 @@ describe('SeekableTranscript', () => {
     expect(screen.getAllByRole('button')).toHaveLength(3);
   });
 
-  it('calls onSeek with the correct offset when a timed turn is clicked', () => {
+  it('calls onSeek with the correct offset and row when a timed turn is clicked', () => {
     const onSeek = vi.fn();
     render(
       <SeekableTranscript
@@ -48,7 +49,7 @@ describe('SeekableTranscript', () => {
       />,
     );
     fireEvent.click(screen.getAllByRole('button')[1]); // candidate turn, offset 3.5
-    expect(onSeek).toHaveBeenCalledWith(3.5);
+    expect(onSeek).toHaveBeenCalledWith(3.5, 1);
   });
 
   it('highlights the active turn with aria-current="true"', () => {
@@ -64,6 +65,28 @@ describe('SeekableTranscript', () => {
     expect(buttons[0]).not.toHaveAttribute('aria-current');
     expect(buttons[1]).toHaveAttribute('aria-current', 'true');
     expect(buttons[2]).not.toHaveAttribute('aria-current');
+  });
+
+  it('announces the active turn, and clears that when no turn is active', () => {
+    const props = { transcript: TIMED, onSeek: vi.fn(), recordingReady: true };
+    const { rerender } = render(<SeekableTranscript {...props} activeTurnIndex={1} />);
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent(/^Now playing turn 2/);
+    rerender(<SeekableTranscript {...props} activeTurnIndex={null} />);
+    expect(status).toBeEmptyDOMElement();
+  });
+
+  it('labels a turn by rounding down, the same rule as the player clock (clockText)', () => {
+    render(
+      <SeekableTranscript
+        transcript={[{ speaker: 'bot', text: 'Late in a second.', start_offset_sec: 65.9 }]}
+        activeTurnIndex={null}
+        onSeek={vi.fn()}
+        recordingReady={true}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /At 1:05\./ })).toHaveTextContent(clockText(65.9));
+    expect(clockText(65.9)).toBe('1:05');
   });
 
   it('marks the active turn with a tint and a leading dot, never a side stripe', () => {

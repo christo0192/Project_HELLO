@@ -16,14 +16,30 @@
  *
  * Access: `GET /api/screening/:id` is admin-only. For non-admin reviewers the
  * transcript/recording load returns 403; we degrade gracefully — showing a
- * truthful note plus the candidate's latest scorecard (from the viewer-visible
- * candidate detail) instead of an error.
+ * truthful note plus the candidate's latest screening scorecard, never an R1
+ * one (from the viewer-visible candidate detail) instead of an error. With an
+ * R1 session selected that scorecard is not this session's, so it is labelled
+ * as the phone screening, the phone conflicts, role fit and summary (which have
+ * no such label) wait for the phone session, and the note points at the R1 card
+ * for the result, or at the candidate page from a host with no R1 card.
  *
  * Sync logic:
  *   1. Click a timed turn → if URL not loaded, mint it, queue the offset, wait
  *      for readiness, then seek + play (latest offset wins on rapid clicks).
- *   2. audio timeupdate → nearest turn by start_offset_sec → highlight.
- *   3. Selecting a new session resets everything; stale loads are discarded.
+ *   2. Playhead → the last turn in start-time order at or before it → highlight
+ *      (`activeTurnAt`). A phone player reports on `timeupdate`; the R1 player
+ *      every animation frame while playing. Either way this renders only when
+ *      the active turn changes.
+ *   3. R1 only: a click lands `R1_SEEK_LEAD_SEC` before the turn, where rule 2
+ *      would light the row before it. So the clicked row lights at once and
+ *      holds until the playhead reaches its start, then rule 2 is back. The
+ *      hold ends sooner if the playhead leaves the lead-in (a scrub), playback
+ *      ends, the media is dropped (the click then failed: no row stays lit) or
+ *      the transcript changes. A click the player ignores lights nothing.
+ *      While a seek is queued (`seekQueued`), held or not, the media's own
+ *      reports do not count: a re-mint reloads it at 0, and the old file can run
+ *      out first, so the lit row stays and is not announced again.
+ *   4. Selecting a new session resets everything; stale loads are discarded.
  *
  * R1 sessions (a session that belongs to an R1 round): the recording is the R1
  * attempt's own, played by `R1RecordingPlayer` in the same slot, and the legacy
@@ -75,6 +91,8 @@ import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
 import { SessionLegRow } from './SessionLegRow';
 import {
+  PHONE_HIGHLIGHT_TOLERANCE_SEC,
+  activeTurnAt,
   activeTurnIn,
   groupTurnsByLeg,
   legPlayable,
@@ -88,12 +106,17 @@ import {
   sessionStatusTone,
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
-import { turnMediaSec } from '../../lib/r1-recording';
+import { latestScreeningAssessment } from '../../lib/latest-screening-assessment';
+import { inSeekLead, turnMediaSec } from '../../lib/r1-recording';
 import type { R1RecordingSummary } from '../../lib/r1-types';
 import { sessionModeLabel } from '../../lib/session-mode';
 
 /** What the Review tab calls an R1 session (it is not a phone screening). */
 const R1_SESSION_LABEL = 'R1 role-play';
+
+/** Where an R1 recording is when this host cannot play it or has no R1 card of its own. */
+const R1_RECORDING_ON_CANDIDATE_PAGE =
+  'The recording for this R1 session is on the candidate page, under R1 interview.';
 
 /** An R1 session's attempt summary, read from the candidate's rounds. */
 type R1SessionRecording =
@@ -127,7 +150,8 @@ export interface TranscriptionSyncWorkspaceProps {
    * M013 S02: the candidate whose phone legs to list (`/phone-attempts`
    * filtered to the selected session). A host that omits it — the scoped
    * Ashby page, whose reduced API adapter may not offer the route — keeps the
-   * single session player.
+   * single session player. Its Overview tab has no R1 card either, so an R1
+   * pointer names the candidate page instead.
    */
   candidateId?: string;
   /**
@@ -165,21 +189,6 @@ function roleFitHasContent(rf: RoleFitScore | null | undefined): boolean {
   );
 }
 
-function findActiveTurnIndex(
-  turns: TranscriptLine[],
-  currentTime: number,
-  toleranceSec = 0.25,
-): number | null {
-  let active: number | null = null;
-  for (let i = 0; i < turns.length; i++) {
-    const offset = turns[i].start_offset_sec;
-    if (offset != null && offset <= currentTime + toleranceSec) {
-      active = i;
-    }
-  }
-  return active;
-}
-
 export function TranscriptionSyncWorkspace({
   sessions,
   assessments,
@@ -203,6 +212,21 @@ export function TranscriptionSyncWorkspace({
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [activeTurnIndex, setActiveTurnIndex] = useState<number | null>(null);
+  // What the state holds, readable without a render: the R1 player reports every frame, and only a
+  // change of turn may cost one.
+  const activeTurnRef = useRef<number | null>(null);
+  const showActiveTurn = useCallback((next: number | null) => {
+    if (activeTurnRef.current === next) return;
+    activeTurnRef.current = next;
+    setActiveTurnIndex(next);
+  }, []);
+  // The start of the R1 row a click lit, while that row holds the highlight (file header, rule 3).
+  const heldTurnStartRef = useRef<number | null>(null);
+  const dropHeldTurn = useCallback(() => {
+    if (heldTurnStartRef.current === null) return;
+    heldTurnStartRef.current = null;
+    showActiveTurn(null);
+  }, [showActiveTurn]);
 
   // refreshKey counter for retry — changing it re-triggers the effect
   const [refreshKey, setRefreshKey] = useState(0);
@@ -229,7 +253,7 @@ export function TranscriptionSyncWorkspace({
     setTranscript([]);
     setSessionAssessment(null);
     setLoadedSession(null);
-    setActiveTurnIndex(null);
+    showActiveTurn(null);
 
     api
       .getSession(sessionId)
@@ -256,7 +280,7 @@ export function TranscriptionSyncWorkspace({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [showActiveTurn]);
 
   // If the sessions prop changes (candidate reload) and the selected session
   // is no longer completable, fall back to the first available one so the
@@ -277,11 +301,11 @@ export function TranscriptionSyncWorkspace({
       setTranscript([]);
       setTranscriptError(null);
       setPermissionDenied(false);
-      setActiveTurnIndex(null);
+      showActiveTurn(null);
       return;
     }
     return loadTranscript(selectedSessionId);
-  }, [selectedSessionId, refreshKey, loadTranscript]);
+  }, [selectedSessionId, refreshKey, loadTranscript, showActiveTurn]);
 
   /* ── R1 recording: THIS session's attempt, from the rounds list ─── */
 
@@ -345,6 +369,13 @@ export function TranscriptionSyncWorkspace({
           })),
     [isR1, transcript, r1Summary],
   );
+  const turnStarts = useMemo(
+    () => displayTranscript.map((turn) => turn.start_offset_sec),
+    [displayTranscript],
+  );
+
+  // A hold belongs to the rows it was clicked on: another session or a reload ends it.
+  useEffect(dropHeldTurn, [turnStarts, dropHeldTurn]);
 
   /* ── Phone legs (M013 S02) ─────────────────────────────────── */
 
@@ -427,24 +458,43 @@ export function TranscriptionSyncWorkspace({
         setActiveLegTurn(found);
         return;
       }
-      setActiveTurnIndex(findActiveTurnIndex(displayTranscript, currentTime));
+      // A queued seek has not moved the media yet, so this position says nothing about where it will be.
+      if (r1PlayerRef.current?.seekQueued) return;
+      const heldStart = heldTurnStartRef.current;
+      if (heldStart !== null) {
+        if (inSeekLead(heldStart, currentTime)) return;
+        heldTurnStartRef.current = null;
+      }
+      // R1 lights a row at its start; a phone row keeps its early tolerance.
+      showActiveTurn(activeTurnAt(turnStarts, currentTime, isR1 ? 0 : PHONE_HIGHLIGHT_TOLERANCE_SEC));
     },
-    [displayTranscript, legsMode, legGroups],
+    [isR1, turnStarts, legsMode, legGroups, showActiveTurn],
+  );
+
+  const handleR1Ended = useCallback(
+    (sec: number) => {
+      // The old file ran out while its link was being replaced: the seek is still on its way.
+      if (r1PlayerRef.current?.seekQueued) return;
+      heldTurnStartRef.current = null;
+      handleTimeUpdate(sec);
+    },
+    [handleTimeUpdate],
   );
 
   // click-to-play contract — RecordingPlayer owns mint/wait/seek/play.
   const handleSeek = useCallback(
-    (offsetSec: number) => {
+    (offsetSec: number, rowIndex: number) => {
       if (isR1) {
-        // The clicked row carries the offset the turn was placed at; find the turn it came from and
-        // seek by ITS own start time, so the lead-in and the anchor are applied in one place.
-        const turn = displayTranscript.find((t) => t.start_offset_sec === offsetSec);
-        if (typeof turn?.started_at_ms === 'number') r1PlayerRef.current?.playFromTurn(turn.started_at_ms);
+        // Seek by the clicked turn's OWN start time, so the lead-in and the anchor are applied in one place.
+        const startedAtMs = displayTranscript[rowIndex]?.started_at_ms;
+        if (typeof startedAtMs !== 'number' || !r1PlayerRef.current?.playFromTurn(startedAtMs)) return;
+        heldTurnStartRef.current = offsetSec;
+        showActiveTurn(rowIndex);
         return;
       }
       playerRef.current?.playFrom(offsetSec);
     },
-    [isR1, displayTranscript],
+    [isR1, displayTranscript, showActiveTurn],
   );
 
   /** A leg's playhead moved: highlight within that leg's group only. */
@@ -487,8 +537,10 @@ export function TranscriptionSyncWorkspace({
   }, []);
 
   // The scorecard shown is the selected session's own assessment when
-  // available; for non-admins it falls back to the candidate's latest.
-  const scorecardAssessment = sessionAssessment ?? (permissionDenied ? assessments[0] ?? null : null);
+  // available; for non-admins it falls back to the candidate's latest SCREENING
+  // (the header's rule): "Latest scorecard" is never an R1 role-play result.
+  const latestScreening = latestScreeningAssessment(assessments, sessions);
+  const scorecardAssessment = sessionAssessment ?? (permissionDenied ? latestScreening : null);
 
   const contextSession = loadedSession ?? selectedSession;
   const turnCount = transcript.length;
@@ -575,10 +627,10 @@ export function TranscriptionSyncWorkspace({
           </>,
           <ScorecardBlock
             blocked={blocked}
-            assessment={assessments[0] ?? null}
-            heading={assessments.length > 0 ? 'Latest scorecard' : undefined}
+            assessment={latestScreening}
+            heading={latestScreening ? 'Latest scorecard' : undefined}
           />,
-          assessments[0] ?? null,
+          latestScreening,
         )}
       </div>
     );
@@ -662,6 +714,8 @@ export function TranscriptionSyncWorkspace({
                 label={R1_SESSION_LABEL}
                 active={active}
                 onTimeUpdate={handleTimeUpdate}
+                onEnded={handleR1Ended}
+                onMediaDropped={dropHeldTurn}
                 onNeedRefresh={() => setR1RefreshKey((k) => k + 1)}
               />
             ) : r1Supported && r1Rec?.status !== 'unavailable' ? (
@@ -670,7 +724,7 @@ export function TranscriptionSyncWorkspace({
               </p>
             ) : (
               <p className="text-[13px] text-[var(--c-ink-secondary)]">
-                The recording for this R1 session is on the candidate page, under R1 interview.
+                {R1_RECORDING_ON_CANDIDATE_PAGE}
               </p>
             )}
           </div>
@@ -778,11 +832,18 @@ export function TranscriptionSyncWorkspace({
       </h2>
       <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
         Detailed transcript playback and recording review require admin
-        access. The session scorecard is shown alongside.
+        access.{isR1 ? null : ' The session scorecard is shown alongside.'}
       </p>
       {isR1 && (
         <p className="mt-2 max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          The recording is on the Overview tab.
+          {/* Nothing alongside is this role-play's. A host without a candidate id (the scoped Ashby
+              page) has no R1 card on its Overview tab. While an appeal blocks decision use the result
+              is withheld on the R1 card too, so only the recording is pointed at. */}
+          {!candidateId
+            ? R1_RECORDING_ON_CANDIDATE_PAGE
+            : blocked
+              ? 'This role-play’s recording is on the Overview tab, under R1 interview.'
+              : 'This role-play’s result and recording are on the Overview tab, under R1 interview.'}
         </p>
       )}
     </SurfaceCard>
@@ -843,11 +904,16 @@ export function TranscriptionSyncWorkspace({
             sessionAssessment
               ? 'Scorecard for this session'
               : permissionDenied && scorecardAssessment
-                ? 'Latest scorecard'
+                ? isR1
+                  ? 'Latest phone screening scorecard'
+                  : 'Latest scorecard'
                 : undefined
           }
+          emptyText={permissionDenied && isR1 ? 'No phone screening scorecard yet.' : undefined}
         />,
-        scorecardAssessment,
+        // Only the block above names the phone screening. The conflicts, role fit and summary would
+        // read as this role-play's, so a non-admin gets them by picking the phone session.
+        permissionDenied && isR1 ? null : scorecardAssessment,
       )}
     </div>
   );
@@ -859,10 +925,13 @@ function ScorecardBlock({
   blocked,
   assessment,
   heading,
+  emptyText = 'No scorecard for this session yet. One is generated when a screening completes.',
 }: {
   blocked: boolean;
   assessment: Assessment | null;
   heading?: string;
+  /** What to say when there is no assessment to show. */
+  emptyText?: string;
 }) {
   const headingId = useId();
   // v2 (role-scorecard) assessments render the metric-based card; everything
@@ -891,8 +960,7 @@ function ScorecardBlock({
         <CandidateScorecard assessment={assessment} narrative="none" roleFit="none" />
       ) : (
         <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          No scorecard for this session yet. One is generated when a screening
-          completes.
+          {emptyText}
         </p>
       )}
     </section>

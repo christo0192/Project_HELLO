@@ -194,6 +194,40 @@ describe('R1 recruiter routes', () => {
     expect((await request(appFor('viewer', OTHER, tables).app).post(`/api/interview-rounds/${ROUND}/cancel`)).status).toBe(403);
   });
 
+  describe('GET /candidates/:id/interview-rounds while an appeal blocks decision use', () => {
+    const scoredRound = { id: ROUND, candidate_id: CANDIDATE, created_by: OWNER, status: 'completed', attempts_allowed: 2, attempts_counted: 1, recommendation: 'reject', overall: 31, status_write: 'pending_reject', pending_reject_until: '2026-10-07T00:00:00.000Z', created_at: '2026-10-05T00:00:00.000Z', version: 1 };
+
+    it('shows the scores when decision use is not blocked', async () => {
+      const tables = baseTables();
+      tables.interview_rounds.push({ ...scoredRound });
+      const response = await request(appFor('viewer', OTHER, tables).app).get(`/api/candidates/${CANDIDATE}/interview-rounds`);
+      expect(response.status).toBe(200);
+      expect(response.body.rounds[0]).toMatchObject({ recommendation: 'reject', overall: 31, status_write: 'pending_reject', pending_reject_until: '2026-10-07T00:00:00.000Z' });
+      expect(response.body.rounds[0]).not.toHaveProperty('scores_withheld');
+    });
+
+    it.each(['admin', 'interviewer', 'viewer'] as const)('withholds the result and every field that gives it away for %s, as the phone list does, and keeps the round', async (role) => {
+      const tables = baseTables();
+      tables.candidates[0].decision_use_blocked_at = '2026-10-06T00:00:00.000Z';
+      tables.interview_rounds.push({ ...scoredRound });
+      const response = await request(appFor(role, OWNER, tables).app).get(`/api/candidates/${CANDIDATE}/interview-rounds`);
+      expect(response.status).toBe(200);
+      expect(response.body.rounds).toHaveLength(1);
+      // Null, not absent: the web reads both scores, and the rest of the round still shows.
+      expect(response.body.rounds[0]).toMatchObject({ id: ROUND, status: 'completed', attempts_counted: 1, recommendation: null, overall: null, status_write: null, pending_reject_until: null, scores_withheld: true });
+      // The stored row is not rewritten: this is a read-time rule, lifted when the appeal closes.
+      expect(tables.interview_rounds[0]).toMatchObject({ recommendation: 'reject', overall: 31, status_write: 'pending_reject', pending_reject_until: '2026-10-07T00:00:00.000Z' });
+    });
+
+    it('says the result is withheld on a round that has none yet, so the flag does not reveal which rounds were scored', async () => {
+      const tables = baseTables();
+      tables.candidates[0].decision_use_blocked_at = '2026-10-06T00:00:00.000Z';
+      tables.interview_rounds.push({ ...scoredRound, recommendation: null, overall: null, status_write: null, pending_reject_until: null });
+      const response = await request(appFor('viewer', OTHER, tables).app).get(`/api/candidates/${CANDIDATE}/interview-rounds`);
+      expect(response.body.rounds[0]).toMatchObject({ recommendation: null, overall: null, scores_withheld: true });
+    });
+  });
+
   it('reissues a different digest and grants only an unspent counted retake', async () => {
     const tables = baseTables();
     tables.interview_rounds.push({ id: ROUND, candidate_id: CANDIDATE, created_by: OWNER, status: 'completed', attempts_allowed: 2, attempts_counted: 1, version: 4, link_token_digest: 'a'.repeat(64) });

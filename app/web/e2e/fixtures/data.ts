@@ -1517,6 +1517,8 @@ export interface Dataset {
   allowlist: AdminAllowlistEntry[];
   members: AdminMember[];
   adminSessions: AdminSessionRow[];
+  /** The API's `truncated` on the session list: more rows exist past the page. */
+  adminSessionsTruncated?: boolean;
   audit: AdminAuditRow[];
   quotas: QuotaPolicy[];
   appointments: PhoneCalendarAppointment[];
@@ -1525,6 +1527,11 @@ export interface Dataset {
     jobs: AshbyJob[];
     withheld: number;
     workflows: AshbyMcWorkflow[];
+    /** The API's `truncated` on the two lists: older rows exist past the page. */
+    mappingsTruncated?: boolean;
+    workflowsTruncated?: boolean;
+    /** The API's `mappedJobIds`: on a cut mapping list, every live mapping's job. */
+    mappedJobIds?: string[];
     feedbackForm: AshbyFeedbackForm;
     bindingPreview: AshbyScorecardBindingPreviewResponse;
   };

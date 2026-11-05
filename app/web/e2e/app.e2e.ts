@@ -23,7 +23,7 @@ import { auditA11y } from './fixtures/axe';
 import { MOCK_API_ORIGIN, MOCK_SUPABASE_ORIGIN } from './fixtures/env';
 import { KEY_STATES, openRoute, revealAddMetric } from './fixtures/flows';
 import { horizontalOverflow } from './fixtures/layout';
-import { expect, test } from './fixtures/harness';
+import { CORS_HEADERS, expect, test } from './fixtures/harness';
 import { ERROR_BOUNDARY_TEXT, ROUTES } from './fixtures/routes';
 import { REALTIME_PATH } from './fixtures/supabase';
 
@@ -355,6 +355,281 @@ test.describe('key states', () => {
     for (const status of ['Live', 'Paused', 'Out of sync']) {
       await expect(page.getByText(status, { exact: true }).first()).toBeVisible();
     }
+    app.expectHealthy();
+  });
+
+  test('Ashby Live Jobs says when a list is cut, and when a row could not be read', async ({ app, page }, testInfo) => {
+    const [first] = app.db.ashby.workflows;
+    app.db.ashby.mappingsTruncated = true;
+    app.db.ashby.workflowsTruncated = true;
+    app.db.ashby.workflows = [
+      { ...first, lifecycle: 'ready', terminalState: null, sessionId: 'session-unread', sessionStatus: null, heldForEvidence: false },
+      { ...first, applicationLinkId: 'link-unread', externalApplicationId: 'app_unread', lifecycle: 'writeback_pending', terminalState: null, sessionStatus: 'completed', heldForEvidence: null },
+    ];
+    await app.goto('/ashby-mission-control');
+
+    await expect(page.getByText('Newest 2', { exact: true })).toBeVisible();
+    await expect(page.getByText(/^In the newest 2 applications: .*Older applications are not shown or counted\.$/)).toBeVisible();
+    await expect(page.getByText(/^In the newest \d+ mappings: .*Older mappings are not shown or counted\.$/)).toBeVisible();
+    await expect(page.getByText('Session status unknown', { exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Open session' })).toBeVisible();
+    await expect(page.getByRole('button', { name: /invite link/ })).toHaveCount(0);
+    await expect(page.getByText('Evidence hold unknown', { exact: true })).toBeVisible();
+    await expect(page.getByText(/1 with a session status that could not be read and 1 with an evidence hold that could not be read\./)).toBeVisible();
+    await expect(page.getByText('Held for evidence', { exact: true })).toHaveCount(0);
+    await auditA11y(page, testInfo, 'ashby-cut-and-unknown', { strict: true });
+    app.expectHealthy();
+  });
+
+  test('Ashby Add mapping does not offer a job mapped past the cut of the list as free', async ({ app, page }) => {
+    const pastTheCut = app.db.ashby.jobs.find((job) => job.title === 'Site Reliability Engineer')!;
+    app.db.ashby.mappingsTruncated = true;
+    app.db.ashby.mappedJobIds = [...app.db.ashby.mappings.map((m) => m.externalJobId), pastTheCut.id];
+    await app.goto('/ashby-mission-control');
+    await page.getByRole('button', { name: 'Add mapping', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Add job mapping' });
+    await expect(dialog).toBeVisible();
+    await app.settle();
+    await dialog.getByLabel('Ashby job').first().click();
+    const mapped = page.getByRole('listbox').first().getByRole('group', { name: 'Already mapped' });
+    await expect(mapped.getByRole('option', { name: /^Site Reliability Engineer .*Mapped$/ })).toHaveAttribute('aria-disabled', 'true');
+    app.expectHealthy();
+  });
+
+  test('Mission Control Sessions never calls a cut page a total, and says the table holds fewer', async ({ app, page }, testInfo) => {
+    const [first] = app.db.adminSessions;
+    app.db.adminSessions = Array.from({ length: 100 }, (_, i) => ({
+      ...first,
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      status: i < 34 ? 'failed' : 'waiting',
+    }));
+    app.db.adminSessionsTruncated = true;
+    await app.goto('/mission-control');
+    await page.getByRole('tab', { name: 'Sessions' }).click();
+
+    await expect(page.getByText('The 100 most recently updated · 34 terminal', { exact: true })).toBeVisible();
+    await expect(page.getByText(/hold the 50 most recently updated\. Older sessions cannot be overridden from here\./)).toBeVisible();
+    await auditA11y(page, testInfo, 'mission-control-sessions-cut', { strict: true });
+    app.expectHealthy();
+  });
+});
+
+/**
+ * Failed reads, in a real browser: what #396's fail-closed 503 looks like on
+ * screen. Each read is answered by a route registered after the harness's, so
+ * it wins for GET and falls back for the CORS preflight the harness answers.
+ */
+test.describe('a failed read stays where it happened', () => {
+  async function failRead(page: Page, path: string, status: number, body: unknown) {
+    const url = `${MOCK_API_ORIGIN}${path}`;
+    await page.route(url, (route) =>
+      route.request().method() === 'GET'
+        ? route.fulfill({ status, headers: CORS_HEADERS(route), contentType: 'application/json', body: JSON.stringify(body) })
+        : route.fallback(),
+    );
+    return () => page.unroute(url);
+  }
+
+  /** Chromium logs every non-2xx itself. Clear only that; anything else still fails the test. */
+  function forgetFailedResponses(app: { consoleErrors: string[] }) {
+    const others = app.consoleErrors.filter((e) => !/Failed to load resource: the server responded with a status of \d+/.test(e));
+    app.consoleErrors.splice(0, app.consoleErrors.length, ...others);
+  }
+
+  const reads = (app: { calls: { method: string; url: string }[] }, path: string) =>
+    app.calls.filter((c) => c.method === 'GET' && new URL(c.url).pathname === path).length;
+
+  test('Dashboard: a list 503 leaves the other panels, in plain words, with a Retry for the list alone', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/candidates', 503, { error: 'service_unavailable' });
+    await app.goto('/dashboard');
+
+    await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeVisible();
+    const pipeline = page.getByRole('group', { name: 'Pipeline' });
+    await expect(pipeline.getByRole('alert')).toContainText('The candidate list did not load.');
+    await expect(pipeline.getByText('Could not load')).toHaveCount(4);
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByText('No candidates yet')).toHaveCount(0);
+
+    // Fed by something else, and still there with their data.
+    await expect(page.getByRole('link', { name: /average assessment score/i })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Screening performance' })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Phone schedule' }).getByRole('group', { name: 'Appointments' })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Action queue' })).toBeVisible();
+    for (const name of ['Pipeline by stage', 'Candidates added', 'Recent candidates']) {
+      await expect(page.getByRole('region', { name }).getByRole('button', { name: 'Try again' })).toBeVisible();
+    }
+    await auditA11y(page, testInfo, 'dashboard-list-503', { strict: true });
+
+    const others = ['/api/me', '/api/candidates/summary', '/api/notifications', '/api/phone/calendar'].map((p) => [p, reads(app, p)] as const);
+    await heal();
+    // By keyboard: the button unmounts, and focus must not fall to the body.
+    await pipeline.getByRole('button', { name: 'Try again' }).press('Enter');
+    await expect(pipeline).toBeFocused();
+
+    await expect(pipeline.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await expect(pipeline).toBeFocused();
+    await expect(page.getByRole('table', { name: 'Pipeline by stage data' })).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    for (const [p, before] of others) expect(reads(app, p), `${p} must not be read again`).toBe(before);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Dashboard: a summary 503 stays in Assessments, whose Retry reloads only the summary', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/candidates/summary', 503, { error: 'service_unavailable' });
+    await app.goto('/dashboard');
+
+    const panel = page.getByRole('region', { name: 'Assessments' });
+    await expect(panel.getByRole('alert')).toContainText('could not complete this');
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await auditA11y(page, testInfo, 'dashboard-summary-503', { strict: true });
+
+    const listReads = reads(app, '/api/candidates');
+    await heal();
+    await panel.getByRole('button', { name: 'Try again' }).click();
+
+    await expect(panel.getByRole('link', { name: /average assessment score/i })).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(reads(app, '/api/candidates')).toBe(listReads);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Dashboard: a phone calendar failure stays in its panel, whose Retry reloads only the schedule', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/phone/calendar**', 500, { error: 'phone_read_error' });
+    await app.goto('/dashboard');
+
+    const panel = page.getByRole('region', { name: 'Phone schedule' });
+    await expect(panel.getByRole('alert')).toContainText('Phone data could not be read');
+    await expect(page.locator('body')).not.toContainText('phone_read_error');
+    await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await auditA11y(page, testInfo, 'dashboard-phone-500', { strict: true });
+
+    const listReads = reads(app, '/api/candidates');
+    await heal();
+    await panel.getByRole('button', { name: 'Try again' }).press('Enter');
+    await expect(panel).toBeFocused();
+
+    await expect(panel.getByRole('group', { name: 'Appointments' })).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(reads(app, '/api/candidates')).toBe(listReads);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Dashboard: a failed /api/me is the only failure that takes the whole page', async ({ app, page }) => {
+    await app.goto('/dashboard');
+    // After boot: this is the page's own read, not the sign-in's role check.
+    const heal = await failRead(page, '/api/me', 503, { error: 'service_unavailable' });
+    await page.getByRole('button', { name: 'Refresh' }).click();
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText('could not complete this');
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toHaveCount(0);
+
+    await heal();
+    await alert.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeVisible();
+    await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Dashboard: nothing moves when a slow list lands, and the queue never shows a nameless link', async ({ app, page }) => {
+    let release = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(`${MOCK_API_ORIGIN}/api/candidates`, async (route) => {
+      if (route.request().method() === 'GET') await held;
+      await route.fallback();
+    });
+    // Not `app.goto`: it waits for the page to settle, which this list holds off.
+    await page.goto('/dashboard');
+
+    const hero = page.getByRole('group', { name: 'Pipeline' });
+    const stage = page.getByRole('region', { name: 'Pipeline by stage' });
+    const below = page.getByRole('heading', { name: 'Screening performance' });
+    const queue = page.getByRole('region', { name: 'Action queue' });
+    await expect(page.getByRole('link', { name: /average assessment score/i })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Phone schedule' }).getByRole('group', { name: 'Appointments' })).toBeVisible();
+    await expect(below).toBeVisible();
+    await expect(queue.getByText('Loading name').first()).toBeAttached();
+    await expect(queue.getByRole('link', { name: /^Open candidate/ })).toHaveCount(0);
+    await page.evaluate(() => document.fonts.ready);
+
+    const frame = async () => ({
+      hero: (await hero.boundingBox())?.height ?? 0,
+      stage: (await stage.boundingBox())?.height ?? 0,
+      below: (await below.boundingBox())?.y ?? 0,
+    });
+    const before = await frame();
+    release();
+    await expect(hero.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await expect(page.getByRole('table', { name: 'Pipeline by stage data' })).toBeVisible();
+    const after = await frame();
+
+    // The harness has as many stages as the panel reserves; 2 px is rounding.
+    for (const key of ['hero', 'stage', 'below'] as const) {
+      expect(Math.abs(after[key] - before[key]), `${key}: ${before[key]} -> ${after[key]}`).toBeLessThanOrEqual(2);
+    }
+    await expect(queue.getByText('Loading name')).toHaveCount(0);
+    app.expectHealthy();
+  });
+
+  test('Candidates: a list 503 reads in plain words with a Retry', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/candidates', 503, { error: 'service_unavailable' });
+    await app.goto('/candidates');
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText('The candidate list did not load.');
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByText('No candidates yet')).toHaveCount(0);
+    await auditA11y(page, testInfo, 'candidates-list-503', { strict: true });
+
+    await heal();
+    await alert.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.getByRole('table').first()).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Agents: a delete answered 500 after it committed claims no failure, and the card goes', async ({ app, page }, testInfo) => {
+    const { id, title, agent_name: agent } = app.db.roles[0];
+    const remove = page.getByRole('button', { name: `Delete agent ${agent} (${title})`, exact: true });
+    const url = `${MOCK_API_ORIGIN}/api/roles/${id}`;
+    // What routes/roles.ts does when the audit record fails: the row is gone, the answer is a 500.
+    await page.route(url, (route) => {
+      if (route.request().method() !== 'DELETE') return route.fallback();
+      app.db.roles = app.db.roles.filter((role) => role.id !== id);
+      return route.fulfill({
+        status: 500,
+        headers: CORS_HEADERS(route),
+        contentType: 'application/json',
+        body: JSON.stringify({ error: { type: 'internal_error', message: 'Internal server error' } }),
+      });
+    });
+    page.on('dialog', (dialog) => void dialog.accept());
+    await app.goto('/roles');
+
+    const listReads = reads(app, '/api/roles');
+    await remove.click();
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText('the change may have been applied');
+    await expect(alert).not.toContainText('Could not');
+    await expect(remove).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText('Internal server error');
+    expect(reads(app, '/api/roles')).toBe(listReads + 1);
+    await auditA11y(page, testInfo, 'roles-delete-500-after-commit', { strict: true });
+
+    forgetFailedResponses(app);
     app.expectHealthy();
   });
 });

@@ -24,8 +24,15 @@ import type {
 
 /* ── Constants ────────────────────────────────────────────────────── */
 
-/** A seek lands this far BEFORE the turn, so the first word is not clipped (VAD starts late). */
-export const R1_SEEK_LEAD_SEC = 1.0;
+/**
+ * A seek lands this far BEFORE the turn, so the first word is not clipped. It is small on purpose: the
+ * voice-activity start is already back-dated by the worker's SDK, and a longer lead plays the previous
+ * speaker and lights the previous row (owner decision, 2026-11-05).
+ */
+export const R1_SEEK_LEAD_SEC = 0.25;
+
+/** How far short of its target a landed seek may read (rounding, the media's own time base). */
+const SEEK_LANDING_SLACK_SEC = 0.1;
 
 /** A link is replaced this many seconds before it expires, when the person next plays or seeks. */
 export const R1_REMINT_GUARD_SEC = 15;
@@ -117,6 +124,14 @@ export function turnOffsetSec(
   return media === null ? null : Math.max(0, media - R1_SEEK_LEAD_SEC);
 }
 
+/**
+ * Whether the playhead is in the lead-in of a turn starting at `startSec`: at or after where a click on
+ * that turn lands, and not yet at the turn. It has reached the turn at `startSec` exactly.
+ */
+export function inSeekLead(startSec: number, playheadSec: number): boolean {
+  return playheadSec < startSec && playheadSec >= startSec - R1_SEEK_LEAD_SEC - SEEK_LANDING_SLACK_SEC;
+}
+
 /* ── Link expiry ──────────────────────────────────────────────────── */
 
 /**
@@ -188,9 +203,12 @@ export function playbackSources(
 
 /* ── Words ────────────────────────────────────────────────────────── */
 
-/** "m:ss" into the recording. */
+/**
+ * "m:ss" into the recording: the one rule for the player clock and the transcript labels. It rounds
+ * down, so a label is never ahead of the playhead that lights its row.
+ */
 export function clockText(totalSec: number): string {
-  const total = Math.max(0, Math.round(totalSec));
+  const total = Math.max(0, Math.floor(totalSec));
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 }
 

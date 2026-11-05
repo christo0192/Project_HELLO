@@ -26,6 +26,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type { R1SettingsResponse, R1UsageResponse } from '../../lib/r1-types';
 import {
   Button,
@@ -84,7 +85,7 @@ export function R1Section() {
     setUsage(empty());
     setSettings(empty());
     const message = (e: unknown) =>
-      e instanceof ApiError || e instanceof Error ? e.message : 'Could not load';
+      e instanceof ApiError || e instanceof Error ? plainErrorText(e.message) : 'Could not load';
     const usageDone = api
       .getR1Usage()
       .then((data) => setUsage({ data, error: null }))
