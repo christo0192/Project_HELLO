@@ -341,6 +341,88 @@ describe('AuthProvider', () => {
     expect(screen.getByTestId('role')).toHaveTextContent('admin');
   });
 
+  describe('retired MFA factor list (ADR-0011)', () => {
+    /** A factor list that never answers: anything still waiting on it hangs. */
+    const neverAnswers = () => new Promise(() => {});
+
+    it('a hard load reaches /api/me without asking Supabase for factors', async () => {
+      mockSupabase.auth.getSession = vi
+        .fn()
+        .mockResolvedValue({ data: { session: mockSession }, error: null });
+      mockSupabase.auth.mfa.listFactors = vi.fn(neverAnswers);
+
+      renderWithProvider();
+
+      await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('admin'));
+      expect(getMe).toHaveBeenCalledTimes(1);
+      expect(mockSupabase.auth.mfa.listFactors).not.toHaveBeenCalled();
+      // AAL needs no network and stays tracked for observability.
+      expect(screen.getByTestId('aal')).toHaveTextContent('aal1');
+    });
+
+    it('a password sign-in reaches /api/me without asking Supabase for factors', async () => {
+      renderWithProvider();
+      await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('absent'));
+
+      mockSupabase.auth.mfa.listFactors = vi.fn(neverAnswers);
+      mockSupabase.auth.signInWithPassword = vi.fn().mockResolvedValue({
+        data: { session: mockSession, user: mockSession.user },
+        error: null,
+      });
+      mockSupabase.auth.getSession = vi
+        .fn()
+        .mockResolvedValue({ data: { session: mockSession }, error: null });
+
+      await userEvent.click(screen.getByTestId('sign-in-btn'));
+
+      await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('admin'));
+      expect(mockSupabase.auth.mfa.listFactors).not.toHaveBeenCalled();
+    });
+
+    it('a re-announced session on tab focus does not ask Supabase for factors', async () => {
+      let handler: ((event: string, session: unknown) => void) | null = null;
+      mockSupabase.auth.onAuthStateChange = vi.fn((cb: (event: string, session: unknown) => void) => {
+        handler = cb;
+        return { data: { subscription: { unsubscribe: vi.fn() } } };
+      });
+      mockSupabase.auth.getSession = vi
+        .fn()
+        .mockResolvedValue({ data: { session: mockSession }, error: null });
+      mockSupabase.auth.mfa.listFactors = vi.fn(neverAnswers);
+
+      renderWithProvider();
+      await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('admin'));
+
+      await act(async () => {
+        handler!('SIGNED_IN', mockSession);
+      });
+
+      expect(mockSupabase.auth.mfa.listFactors).not.toHaveBeenCalled();
+    });
+
+    it('a session revoked on the server still signs out on boot, through the 401 from /api/me', async () => {
+      // listFactors called GET /auth/v1/user, and supabase-js clears its local
+      // session when that says session_not_found. That was never the guarantee:
+      // the API validates the token on every request and a 401 reaches here.
+      // This pins the provider's half only: api-client.test.ts pins 401 -> event,
+      // and app.e2e.ts drives the whole chain with the real client.
+      mockSupabase.auth.getSession = vi
+        .fn()
+        .mockResolvedValue({ data: { session: mockSession }, error: null });
+      getMe.mockImplementation(async () => {
+        window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+        throw Object.assign(new Error('unauthorized'), { status: 401 });
+      });
+
+      renderWithProvider();
+
+      await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('absent'));
+      expect(screen.getByTestId('authenticated')).toHaveTextContent('no');
+      expect(screen.getByTestId('role')).toHaveTextContent('null');
+      expect(mockSupabase.auth.signOut).toHaveBeenCalled();
+    });
+  });
+
   it('fails closed (role null) when /api/me cannot be loaded', async () => {
     mockSupabase.auth.getSession = vi
       .fn()

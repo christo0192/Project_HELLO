@@ -50,6 +50,51 @@ const DEFAULT_DATE_OPTS: Intl.DateTimeFormatOptions = {
   day: 'numeric',
 };
 
+/**
+ * Building an Intl formatter costs far more than using one, and these run per
+ * row and per counting pass: one new formatter per call was 66% of Dashboard JS
+ * self time at 2,000 candidates (M026 RCA). So there is one per option set.
+ * Option sets are literals in the code, so this stays a handful of entries.
+ */
+const enGbFormatters = new Map<string, Intl.DateTimeFormat>();
+
+/**
+ * A formatter with no explicit `timeZone` pins the zone it was built in, and a
+ * laptop can cross zones with the tab open. A cheap signal for that move: the
+ * zone's offset in January and in July. Asking Intl for the zone name would
+ * build the very formatter this cache avoids. Two zones that agree on both
+ * offsets are treated as one, so only a move between them keeps the old rules,
+ * and those differ only in the weeks around a daylight-saving change.
+ */
+const ZONE_PROBES = [new Date(Date.UTC(2026, 0, 15)), new Date(Date.UTC(2026, 6, 15))];
+const readZone = (): string => ZONE_PROBES.map((probe) => probe.getTimezoneOffset()).join('/');
+let enGbFormattersZone = readZone();
+
+/** The same options in any key order are one set; an undefined option is an absent one. */
+function optionsKey(options: Intl.DateTimeFormatOptions): string {
+  return JSON.stringify(
+    Object.entries(options)
+      .filter(([, value]) => value !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : 1)),
+  );
+}
+
+/** The shared en-GB formatter for these options. Throws as the constructor does on bad options. */
+export function enGbDateTimeFormat(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const zone = readZone();
+  if (zone !== enGbFormattersZone) {
+    enGbFormatters.clear();
+    enGbFormattersZone = zone;
+  }
+  const key = optionsKey(options);
+  let formatter = enGbFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-GB', options);
+    enGbFormatters.set(key, formatter);
+  }
+  return formatter;
+}
+
 /** Localized date + time, or "Not available". Timezone-aware (viewer local). */
 export function formatDateTime(
   value: DateInput,
@@ -67,7 +112,7 @@ export function formatDateTime(
     // short month is three letters, and the charts' fixed month table says
     // "Sep". One spelling per page, whichever formatter drew it.
     const clock: Intl.DateTimeFormatOptions = opts.hour ? { hourCycle: opts.hourCycle ?? 'h23' } : {};
-    return new Intl.DateTimeFormat('en-GB', { ...opts, ...clock })
+    return enGbDateTimeFormat({ ...opts, ...clock })
       .formatToParts(date)
       .map((part) => (part.type === 'month' && part.value === 'Sept' ? 'Sep' : part.value))
       .join('');

@@ -1241,9 +1241,10 @@ export function AshbyMissionControlPage() {
                   </StatusBadge>
                 )}
                 {/* C3: parked for a human because the newest scorecard's
-                    interview evidence was too thin to publish. Nothing
+                    interview evidence was too thin to publish. No scorecard
                     reaches Ashby until someone acts — usually a re-screen
-                    from the candidate page. */}
+                    from the candidate page. The Christy tag still follows
+                    the raw verdict's lean (M028). */}
                 {w.heldForEvidence === true && (
                   <StatusBadge tone="warning">
                     <span title="The newest scorecard was graded insufficient interview evidence, so it is held for review and will not be written to Ashby. A re-screen is recommended.">

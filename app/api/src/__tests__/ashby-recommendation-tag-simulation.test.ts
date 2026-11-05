@@ -394,15 +394,28 @@ describe('the flow on a fake tenant', () => {
     expect(w.db.tagOps().at(-1)).toMatchObject({ anchor: 'christy_tag_none' });
   });
 
-  it('a newer insufficient-evidence result takes the old tag off too', async () => {
+  it('a newer insufficient-evidence result with no verdict takes the old tag off too', async () => {
     const w = world();
     w.db.addLink('link-1', 'app-1', CAND);
     await w.complete('link-1', 'session-1', 'advance');
     await w.drain();
-    const outcome = await w.complete('link-1', 'session-2', 'advance', 'insufficient');
+    const outcome = await w.complete('link-1', 'session-2', null, 'insufficient');
     expect(outcome.status).toBe('held_insufficient_evidence');
     await w.drain();
     expect(w.tenant.christyTitlesOn(CAND)).toEqual([]);
+  });
+
+  it('a newer insufficient-evidence result with a verdict swaps to that lean (M028)', async () => {
+    const w = world();
+    w.db.addLink('link-1', 'app-1', CAND);
+    await w.complete('link-1', 'session-1', 'advance');
+    await w.drain();
+    const outcome = await w.complete('link-1', 'session-2', 'reject', 'insufficient');
+    // The scorecard is still held from Ashby; only the tag follows the lean.
+    expect(outcome.status).toBe('held_insufficient_evidence');
+    await w.drain();
+    expect(w.tenant.christyTitlesOn(CAND)).toEqual([TITLES.reject]);
+    expect(w.db.tagOps().at(-1)).toMatchObject({ state: 'succeeded', anchor: 'christy_tag_reject' });
   });
 
   it('a provisional Reject is tagged Reject', async () => {
@@ -487,8 +500,9 @@ describe('the flow on a fake tenant', () => {
     // Cycle 1 before the deploy: advance, no operation.
     w.db.own('link-1', 'session-1');
     w.db.assess('session-1', 'advance');
-    // Cycle 2 after it, graded insufficient: its live operation leaves no tag.
-    await w.complete('link-1', 'session-2', 'advance', 'insufficient');
+    // Cycle 2 after it, graded insufficient with no verdict: its live operation
+    // leaves no tag.
+    await w.complete('link-1', 'session-2', null, 'insufficient');
     await w.drain();
     expect(w.tenant.christyTitlesOn(CAND)).toEqual([]);
     // An operation for cycle 1 enqueued afterwards (as the old backfill did) runs last.
