@@ -63,7 +63,8 @@ describe('AccessSection', () => {
       new missionApi.ApiError('unauthorized', 403),
     );
     renderAccess();
-    expect(await screen.findByText('unauthorized')).toBeInTheDocument();
+    expect(await screen.findByText(/your session has ended/i)).toBeInTheDocument();
+    expect(screen.queryByText('unauthorized')).not.toBeInTheDocument();
     apiFns.listAdminAllowlist.mockResolvedValue({ entries: ENTRIES });
     apiFns.getMe.mockResolvedValue(ME);
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));

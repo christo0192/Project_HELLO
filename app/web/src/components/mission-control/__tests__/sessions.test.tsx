@@ -43,7 +43,8 @@ describe('SessionsSection', () => {
   it('shows an error state with a retry action', async () => {
     apiFns.listAdminSessions.mockRejectedValue(new missionApi.ApiError('unauthorized', 403));
     renderSessions();
-    expect(await screen.findByText('unauthorized')).toBeInTheDocument();
+    expect(await screen.findByText(/your session has ended/i)).toBeInTheDocument();
+    expect(screen.queryByText('unauthorized')).not.toBeInTheDocument();
     apiFns.listAdminSessions.mockResolvedValue({ sessions: SESSIONS });
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
     expect(await screen.findByText('Sessions')).toBeInTheDocument();

@@ -174,7 +174,8 @@ describe('every candidate surface mounts one scope root', () => {
   it('Candidates list — error', async () => {
     mockApi.listCandidates.mockRejectedValue(new MockApiError('boom', 500));
     const { container } = renderCandidates();
-    expect(await screen.findByText('boom')).toBeInTheDocument();
+    expect(await screen.findByText(/The candidate list did not load/)).toBeInTheDocument();
+    expect(screen.queryByText('boom')).not.toBeInTheDocument();
     expectSingleScopeRoot(container);
   });
 

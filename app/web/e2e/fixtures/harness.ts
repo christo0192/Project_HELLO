@@ -65,7 +65,7 @@ export interface AppHarness {
   expectHealthy(): void;
 }
 
-const CORS_HEADERS = (route: Route): Record<string, string> => {
+export const CORS_HEADERS = (route: Route): Record<string, string> => {
   const req = route.request().headers();
   return {
     'access-control-allow-origin': req['origin'] ?? '*',

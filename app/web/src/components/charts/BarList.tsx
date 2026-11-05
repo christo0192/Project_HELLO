@@ -80,12 +80,21 @@ export interface BarListProps {
   /** Appended to each link's name, e.g. "View these candidates." */
   linkHint?: string;
   isLoading?: boolean;
+  /**
+   * Rows the loading state draws, each as tall as a real row. The count is the
+   * data's, so a caller that knows its usual size passes it here and the panel
+   * does not grow under the reader when the data lands.
+   */
+  loadingRows?: number;
   error?: string | null;
   onRetry?: () => void;
   emptyTitle?: string;
   emptyHint?: string;
   className?: string;
 }
+
+/** The loading rows' bar lengths, repeated as far as `loadingRows` asks. */
+const LOADING_WIDTHS = [0.8, 0.55, 0.35];
 
 export function BarList({
   title,
@@ -98,6 +107,7 @@ export function BarList({
   scale = 'peak',
   linkHint,
   isLoading = false,
+  loadingRows = LOADING_WIDTHS.length,
   error = null,
   onRetry,
   emptyTitle = 'Nothing to show yet',
@@ -106,11 +116,17 @@ export function BarList({
 }: BarListProps) {
   if (isLoading) {
     return (
-      <div className={cx('space-y-3 py-1', className)} role="status" aria-label={`Loading ${title}`}>
-        {[0.8, 0.55, 0.35].map((w) => (
-          <div key={w} className="flex items-center gap-3">
+      <div className={className} role="status" aria-label={`Loading ${title}`}>
+        {/* A real row's height: the link's target plus the cell's 1px padding. */}
+        {Array.from({ length: loadingRows }, (_, i) => (
+          <div key={i} className="flex min-h-[46px] items-center gap-3 sm:min-h-[34px]">
             <Skeleton width="6.5rem" height={12} />
-            <Skeleton className="flex-1" height={6} radius={999} style={{ maxWidth: `${w * 100}%` }} />
+            <Skeleton
+              className="flex-1"
+              height={6}
+              radius={999}
+              style={{ maxWidth: `${LOADING_WIDTHS[i % LOADING_WIDTHS.length] * 100}%` }}
+            />
           </div>
         ))}
       </div>

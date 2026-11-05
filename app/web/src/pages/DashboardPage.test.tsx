@@ -9,13 +9,15 @@
  *
  * Charts run under jsdom with the same stubs as the chart-lib suite.
  */
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { ThemeProvider } from '../lib/theme';
 import { DashboardPage } from './DashboardPage';
 import { candidatesHref } from '../components/talent';
+import { ApiError } from '../lib/api-client';
+import { API_ERROR_COPY } from '../lib/api-error-copy';
 import {
   stubMatchMedia,
   stubResizeObserver,
@@ -183,19 +185,357 @@ describe('DashboardPage', () => {
     expect(getPhoneCalendar).not.toHaveBeenCalled();
   });
 
-  it('shows a loading state until the core data loads', () => {
+  it('shows a loading state until it knows who is asking', () => {
     getMe.mockReturnValue(new Promise(() => {}));
     renderDashboard();
     expect(screen.getByText('Loading dashboard…')).toBeInTheDocument();
   });
 
-  it('shows an error state with retry on candidate failure', async () => {
-    listCandidates.mockRejectedValueOnce({ message: 'API unavailable' });
-    renderDashboard();
-    expect(await screen.findByText('API unavailable')).toBeInTheDocument();
-    listCandidates.mockResolvedValue(CANDIDATES);
-    fireEvent.click(screen.getByRole('button', { name: /try again/i }));
-    expect(await screen.findByText('Recent candidates')).toBeInTheDocument();
+  describe('a read that fails stays in its own panels', () => {
+    const LIST_503 = new ApiError('service_unavailable', 503, 'service_unavailable');
+    const soon = new Date(Date.now() + 2 * 3_600_000).toISOString();
+    const SCHEDULED = {
+      ...PHONE_CALENDAR,
+      count: 1,
+      appointments: [
+        { id: 'a1', engagement_id: 'e1', starts_at: soon, ends_at: soon, ist_date: '2026-06-05', ist_start: null, ist_end: null, status: 'scheduled', source: 'recruiter', confirmed_at: null, cancel_reason: null, version: 1, created_at: soon, updated_at: soon, engagement_state: null, role_id: null, candidate: { id: 'c1', name: 'Jane Doe' } },
+      ],
+    };
+    const region = (name: string) => screen.getByRole('region', { name });
+    const pipeline = () => screen.getByRole('group', { name: 'Pipeline' });
+
+    beforeEach(() => {
+      listNotificationIntents.mockResolvedValue({ intents: INTENTS });
+      getPhoneCalendar.mockResolvedValue(SCHEDULED);
+    });
+
+    /** Everything fed by something other than the list, with its data on screen. */
+    async function expectTheOtherPanelsKeepTheirData() {
+      expect(
+        await within(region('Assessments')).findByRole('link', { name: /average assessment score 64/i }),
+      ).toBeInTheDocument();
+      expect(await within(region('Action queue')).findByText('Screening ready for review')).toBeInTheDocument();
+      expect(
+        await within(region('Phone schedule')).findByRole('list', { name: 'Next phone appointments' }),
+      ).toHaveTextContent('Jane Doe');
+      expect(screen.getByRole('heading', { name: 'Screening performance' })).toBeInTheDocument();
+    }
+
+    it('a list 503 leaves the other panels with their data, in plain words', async () => {
+      listCandidates.mockRejectedValue(LIST_503);
+      renderDashboard();
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent('The candidate list did not load.');
+      expect(alert).toHaveTextContent(API_ERROR_COPY.service_unavailable);
+      expect(document.body).not.toHaveTextContent('service_unavailable');
+
+      expect(screen.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeInTheDocument();
+      await expectTheOtherPanelsKeepTheirData();
+      expect(getScreeningFunnel).toHaveBeenCalledTimes(1);
+    });
+
+    it('says the figures are unknown, never zero and never empty', async () => {
+      listCandidates.mockRejectedValue(LIST_503);
+      renderDashboard();
+      await screen.findByRole('alert');
+
+      expect(within(pipeline()).getAllByText('Not available')).toHaveLength(4);
+      expect(within(pipeline()).getAllByText('Could not load')).toHaveLength(4);
+      // Not drill-downs into a number nobody read, and not "Candidates: 0".
+      expect(within(pipeline()).queryByRole('link')).not.toBeInTheDocument();
+      expect(screen.queryByText('No candidates yet')).not.toBeInTheDocument();
+      expect(screen.queryByText(/of \d+ decided/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/% complete/)).not.toBeInTheDocument();
+    });
+
+    it('marks each panel that needs the list, and announces the failure once', async () => {
+      listCandidates.mockRejectedValue(LIST_503);
+      renderDashboard();
+      await screen.findByRole('alert');
+
+      for (const name of ['Pipeline by stage', 'Candidates added', 'Recent candidates']) {
+        const panel = region(name);
+        expect(within(panel).getByText(/candidate list did not load/i)).toBeInTheDocument();
+        expect(within(panel).getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+      }
+      expect(screen.getAllByRole('alert')).toHaveLength(1);
+    });
+
+    it.each(['Pipeline', 'Pipeline by stage', 'Candidates added', 'Recent candidates'])(
+      'Retry in %s reloads only the list',
+      async (name) => {
+        listCandidates.mockRejectedValueOnce(LIST_503);
+        renderDashboard();
+        await screen.findByRole('alert');
+        await expectTheOtherPanelsKeepTheirData();
+
+        const panel = name === 'Pipeline' ? pipeline() : region(name);
+        listCandidates.mockResolvedValue(CANDIDATES);
+        fireEvent.click(within(panel).getByRole('button', { name: 'Try again' }));
+
+        expect(await screen.findByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.getByRole('table', { name: 'Pipeline by stage data' })).toBeInTheDocument();
+        expect(listCandidates).toHaveBeenCalledTimes(2);
+        for (const other of [getMe, getCandidatesSummary, listNotificationIntents, getPhoneCalendar, getScreeningFunnel]) {
+          expect(other).toHaveBeenCalledTimes(1);
+        }
+        await expectTheOtherPanelsKeepTheirData();
+      },
+    );
+
+    it('keeps the other panels on screen while the list retries', async () => {
+      listCandidates.mockRejectedValueOnce(LIST_503);
+      renderDashboard();
+      await screen.findByRole('alert');
+      await expectTheOtherPanelsKeepTheirData();
+
+      listCandidates.mockReturnValue(new Promise(() => {}));
+      fireEvent.click(within(pipeline()).getByRole('button', { name: 'Try again' }));
+
+      expect(screen.queryByText('Loading dashboard…')).not.toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      await expectTheOtherPanelsKeepTheirData();
+      expect(within(pipeline()).getAllByText('Loading')).toHaveLength(4);
+    });
+
+    it('shows the other panels as soon as they load, before a slow list answers', async () => {
+      listCandidates.mockReturnValue(new Promise(() => {}));
+      renderDashboard();
+
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+      await expectTheOtherPanelsKeepTheirData();
+      expect(screen.queryByText('Loading dashboard…')).not.toBeInTheDocument();
+      expect(within(pipeline()).getAllByText('Loading')).toHaveLength(4);
+      expect(screen.queryByText('No candidates yet')).not.toBeInTheDocument();
+    });
+
+    it('does not call a queued candidate "no longer available" when only the list failed', async () => {
+      listCandidates.mockRejectedValue(LIST_503);
+      renderDashboard();
+      await screen.findByRole('alert');
+      const queue = region('Action queue');
+      expect(await within(queue).findByText('Screening ready for review')).toBeInTheDocument();
+      expect(within(queue).queryByText('Candidate no longer available')).not.toBeInTheDocument();
+      // The row still goes where it went, and says why it has no name.
+      const links = within(queue).getAllByRole('link', { name: 'Open candidate (name not loaded)' });
+      expect(links.map((a) => a.getAttribute('href'))).toEqual(['/candidates/c1', '/candidates/c2']);
+      expect(within(queue).getByText('Workspace-wide')).toBeInTheDocument();
+      expect(within(queue).queryByText('Loading name')).not.toBeInTheDocument();
+    });
+
+    it('holds a queued name open while the list loads, then fills it in', async () => {
+      let land: (rows: typeof CANDIDATES) => void = () => {};
+      listCandidates.mockReturnValue(new Promise((resolve) => { land = resolve; }));
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+      const queue = region('Action queue');
+      expect(await within(queue).findByText('Screening ready for review')).toBeInTheDocument();
+
+      // On every load, so not five identical links nobody can tell apart, and
+      // no link to a candidate who may turn out to be gone.
+      expect(within(queue).getAllByText('Loading name')).toHaveLength(2);
+      expect(within(queue).queryByRole('link')).not.toBeInTheDocument();
+      expect(within(queue).getByText('Workspace-wide')).toBeInTheDocument();
+
+      land(CANDIDATES);
+
+      expect(await within(queue).findByRole('link', { name: 'Jane Doe' })).toHaveAttribute('href', '/candidates/c1');
+      expect(within(queue).queryByText('Loading name')).not.toBeInTheDocument();
+    });
+
+    it('settles a queued name as "no longer available" once the list lands without them', async () => {
+      let land: (rows: typeof CANDIDATES) => void = () => {};
+      listCandidates.mockReturnValue(new Promise((resolve) => { land = resolve; }));
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+      const queue = region('Action queue');
+      await within(queue).findAllByText('Loading name');
+
+      land(CANDIDATES.slice(1));
+
+      expect(await within(queue).findByText('Candidate no longer available')).toBeInTheDocument();
+      expect(within(queue).getByRole('link', { name: 'Bob Smith' })).toBeInTheDocument();
+    });
+
+    it('still says "no longer available" when the list loaded without them', async () => {
+      listCandidates.mockResolvedValue(CANDIDATES.slice(1));
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+      const queue = region('Action queue');
+      expect(await within(queue).findByText('Candidate no longer available')).toBeInTheDocument();
+      expect(within(queue).queryByRole('link', { name: /^Open candidate/ })).not.toBeInTheDocument();
+    });
+
+    it('a summary failure stays in the Assessments panel, whose Retry reloads only the summary', async () => {
+      getCandidatesSummary.mockRejectedValueOnce(LIST_503);
+      renderDashboard();
+
+      const panel = await screen.findByRole('region', { name: 'Assessments' });
+      const alert = await within(panel).findByRole('alert');
+      expect(alert).toHaveTextContent(API_ERROR_COPY.service_unavailable);
+      expect(document.body).not.toHaveTextContent('service_unavailable');
+      // Everything else is fine, and is not told otherwise.
+      expect(screen.getAllByRole('alert')).toHaveLength(1);
+      expect(await screen.findByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+      expect(await within(region('Action queue')).findByText('Screening ready for review')).toBeInTheDocument();
+
+      fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+      expect(await within(panel).findByRole('link', { name: /average assessment score 64/i })).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(getCandidatesSummary).toHaveBeenCalledTimes(2);
+      for (const other of [getMe, listCandidates, listNotificationIntents, getPhoneCalendar, getScreeningFunnel]) {
+        expect(other).toHaveBeenCalledTimes(1);
+      }
+      // It never went back to the page-level spinner on the way.
+      expect(screen.getByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+    });
+
+    it('a notifications failure stays in the queue, whose Retry reloads only the queue', async () => {
+      listNotificationIntents.mockRejectedValueOnce(new ApiError('Internal server error', 500, 'internal_error'));
+      renderDashboard();
+
+      const panel = await screen.findByRole('region', { name: 'Action queue' });
+      const alert = await within(panel).findByRole('alert');
+      expect(alert).toHaveTextContent(API_ERROR_COPY.internal_error);
+      expect(document.body).not.toHaveTextContent('Internal server error');
+
+      fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+      expect(await within(panel).findByText('Screening ready for review')).toBeInTheDocument();
+      expect(listNotificationIntents).toHaveBeenCalledTimes(2);
+      for (const other of [getMe, listCandidates, getCandidatesSummary, getPhoneCalendar]) {
+        expect(other).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it('a phone schedule failure stays in its panel, whose Retry reloads only the schedule', async () => {
+      getPhoneCalendar.mockRejectedValueOnce(new ApiError('phone_read_error', 500, 'phone_read_error'));
+      renderDashboard();
+
+      const panel = await screen.findByRole('region', { name: 'Phone schedule' });
+      const alert = await within(panel).findByRole('alert');
+      expect(alert).toHaveTextContent(API_ERROR_COPY.phone_read_error);
+      expect(document.body).not.toHaveTextContent('phone_read_error');
+      expect(await screen.findByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+
+      fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+      expect(await within(panel).findByRole('list', { name: 'Next phone appointments' })).toHaveTextContent('Jane Doe');
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(getPhoneCalendar).toHaveBeenCalledTimes(2);
+      for (const other of [getMe, listCandidates, getCandidatesSummary, listNotificationIntents, getScreeningFunnel]) {
+        expect(other).toHaveBeenCalledTimes(1);
+      }
+      // It never left the page for the loading panel on the way.
+      expect(screen.getByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+    });
+
+    describe('Try again leaves focus on its panel, not the body', () => {
+      const failList = () => listCandidates.mockRejectedValueOnce(LIST_503);
+      it.each<[string, () => void]>([
+        ['Pipeline', failList],
+        ['Pipeline by stage', failList],
+        ['Candidates added', failList],
+        ['Recent candidates', failList],
+        ['Assessments', () => getCandidatesSummary.mockRejectedValueOnce(LIST_503)],
+        ['Action queue', () => listNotificationIntents.mockRejectedValueOnce(LIST_503)],
+        ['Phone schedule', () => getPhoneCalendar.mockRejectedValueOnce(LIST_503)],
+        ['Screening performance', () => getScreeningFunnel.mockRejectedValueOnce(LIST_503)],
+      ])('%s', async (name, fail) => {
+        fail();
+        renderDashboard();
+        await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+        const panel = name === 'Pipeline' ? pipeline() : region(name);
+
+        fireEvent.click(await within(panel).findByRole('button', { name: 'Try again' }));
+
+        // At once, while the read is out: the pressed button is already gone.
+        expect(within(panel).queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+        expect(panel).toHaveFocus();
+        // And still there when it lands.
+        await waitFor(() => expect(screen.getByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument());
+        await expectTheOtherPanelsKeepTheirData();
+        expect(panel).toHaveFocus();
+      });
+    });
+
+    it('a failed /api/me is still the full page: without identity nothing can be gated', async () => {
+      getMe.mockRejectedValueOnce(LIST_503);
+      renderDashboard();
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent(API_ERROR_COPY.service_unavailable);
+      expect(document.body).not.toHaveTextContent('service_unavailable');
+      expect(screen.queryByRole('heading', { name: 'Dashboard' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: 'Assessments' })).not.toBeInTheDocument();
+      // A role-gated read was never attempted without a role.
+      expect(listNotificationIntents).not.toHaveBeenCalled();
+      expect(getPhoneCalendar).not.toHaveBeenCalled();
+
+      fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+      expect(await screen.findByRole('heading', { name: 'Dashboard', level: 1 })).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(getMe).toHaveBeenCalledTimes(2);
+      await expectTheOtherPanelsKeepTheirData();
+    });
+
+    it('shows one full-page error, not two, when /api/me and the list both fail', async () => {
+      getMe.mockRejectedValueOnce(LIST_503);
+      listCandidates.mockRejectedValueOnce(LIST_503);
+      renderDashboard();
+      expect(await screen.findAllByRole('alert')).toHaveLength(1);
+      expect(screen.queryByRole('heading', { name: 'Dashboard' })).not.toBeInTheDocument();
+    });
+
+    it('never lets a slow, stale list failure overwrite a newer answer', async () => {
+      let rejectFirst: (reason: unknown) => void = () => {};
+      listCandidates.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectFirst = reject; }));
+      listCandidates.mockResolvedValue(CANDIDATES);
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      expect(await screen.findByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+
+      rejectFirst(LIST_503);
+      // Let the rejected promise's handlers run, then look again.
+      await waitFor(() => expect(listCandidates).toHaveBeenCalledTimes(2));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+    });
+
+    it('never lets a slow, stale list success overwrite a newer failure', async () => {
+      let resolveFirst: (candidates: typeof CANDIDATES) => void = () => {};
+      listCandidates.mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve; }));
+      listCandidates.mockRejectedValueOnce(LIST_503);
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      await within(await screen.findByRole('group', { name: 'Pipeline' })).findByRole('alert');
+
+      // Inside `act`, so a bad landing would render before the assertions below.
+      await act(async () => {
+        resolveFirst(CANDIDATES);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(within(pipeline()).getByRole('alert')).toHaveTextContent('The candidate list did not load.');
+      expect(within(pipeline()).getAllByText('Not available')).toHaveLength(4);
+      expect(within(pipeline()).queryByRole('link')).not.toBeInTheDocument();
+    });
+
+    it('has no axe violations with the list failed', async () => {
+      listCandidates.mockRejectedValue(LIST_503);
+      const { container } = renderDashboard();
+      await screen.findByRole('alert');
+      await expectTheOtherPanelsKeepTheirData();
+      await expect(container).toHaveNoViolations();
+    });
   });
 
   it('renders KPI drill-down links for every stage (any role)', async () => {

@@ -91,6 +91,14 @@ describe('BarList', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Could not load');
   });
 
+  it('draws the loading rows it is asked for, each with its own bar', () => {
+    const { unmount } = render(wrap(<BarList title="Stages" data={[]} isLoading />));
+    expect(document.querySelectorAll('.skeleton')).toHaveLength(6);
+    unmount();
+    render(wrap(<BarList title="Stages" data={[]} isLoading loadingRows={8} />));
+    expect(document.querySelectorAll('.skeleton')).toHaveLength(16);
+  });
+
   it('has no axe violations', async () => {
     const { container } = render(wrap(<BarList title="Stages" data={STAGES} linkHint="View these candidates." />));
     await expect(container).toHaveNoViolations();

@@ -46,6 +46,11 @@ describe('Skeleton family', () => {
     render(<ChartSkeleton bars={8} />);
     expect(document.querySelectorAll('.skeleton').length).toBeGreaterThanOrEqual(8);
   });
+
+  it('holds a ChartSkeleton open at the height of the chart it stands in for', () => {
+    const { container } = render(<ChartSkeleton height={200} />);
+    expect(container.firstElementChild).toHaveStyle({ minHeight: '200px' });
+  });
 });
 
 describe('Table primitives', () => {

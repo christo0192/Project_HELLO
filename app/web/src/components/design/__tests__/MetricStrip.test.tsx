@@ -76,6 +76,22 @@ describe('MetricStrip', () => {
     expect(screen.queryByText('0')).not.toBeInTheDocument();
   });
 
+  it('holds a loading figure at its final height without showing its context', () => {
+    // The line can quote what has not been read yet: "Of 0 access entries".
+    render(
+      <MetricStrip
+        label="Reach"
+        items={[{ label: 'Allowed', value: '0', context: 'Of 0 access entries', loading: true }]}
+      />,
+    );
+    expect(screen.getByText('Of 0 access entries')).toHaveClass('invisible');
+  });
+
+  it('shows the context once the figure is in', () => {
+    render(<MetricStrip label="Reach" items={[{ label: 'Allowed', value: '4', context: 'Of 9 entries' }]} />);
+    expect(screen.getByText('Of 9 entries')).not.toHaveClass('invisible');
+  });
+
   it('uses sentence case and tabular figures, never an uppercase eyebrow', () => {
     stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
     const { container } = render(
