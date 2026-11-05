@@ -179,19 +179,14 @@ export function SeekableTranscript({
             const presented = presentTranscriptTurn(turn.speaker, turn.text);
             const speaker = presented.label;
             // Speaker is legible without colour: the label is always written
-            // out. The tint only makes the alternation scannable: the bot
-            // tint is the page ground, the candidate tint the card fill.
+            // out. The candidate's label takes the voice ink, the one place
+            // that hue is text; the interviewer's stays graphite.
             //
-            // THE ACTIVE TURN is marked by a stronger tint (the hairline
-            // token, a step darker than the hover tint) PLUS a leading
-            // "playing" dot and an accent timestamp, so it never depends on a
-            // one-step fill difference alone. It used to carry a 2px accent
-            // rule down its left edge: a side-stripe, which the design system
-            // bans outright.
-            const speakerTint =
-              turn.speaker === 'bot'
-                ? 'bg-[var(--c-bg)]'
-                : 'bg-[var(--c-surface)]';
+            // THE ACTIVE TURN is a shaded printed field PLUS a leading "playing"
+            // dot and an ink timestamp, so it never depends on a one-step fill
+            // difference alone.
+            const speakerInk =
+              turn.speaker === 'bot' ? 'text-[var(--c-ink-secondary)]' : 'font-semibold text-voice';
 
             if (timed) {
               return (
@@ -203,15 +198,13 @@ export function SeekableTranscript({
                     aria-current={active ? 'true' : undefined}
                     aria-label={`Turn ${numberOf(index)}: ${speaker}. At ${approximateTiming ? 'about ' : ''}${clockText(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(
-                      'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors duration-150 ease-out',
+                      'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors duration-hover ease-out',
                       'focus:outline-none focus:ring-2 focus:ring-[var(--c-accent)] focus:ring-inset',
-                      active
-                        ? 'bg-[var(--c-border)]'
-                        : cx(speakerTint, 'hover:bg-[var(--c-border-light)]'),
+                      active ? 'bg-[var(--c-border-light)]' : 'hover:bg-[var(--c-border-light)]',
                     )}
                   >
                     <span className="flex items-baseline justify-between gap-2">
-                      <span className="flex items-center gap-1.5 text-xs font-medium text-[var(--c-ink-secondary)]">
+                      <span className={cx('flex items-center gap-1.5 text-xs font-medium', speakerInk)}>
                         {active && (
                           <span
                             aria-hidden="true"
@@ -223,7 +216,7 @@ export function SeekableTranscript({
                       </span>
                       <span
                         className={cx(
-                          'text-xs tabular-nums',
+                          'font-mono text-xs',
                           // Ink, not the accent: accent on the active tint
                           // is ~4:1, short of AA for 12px text.
                           active
@@ -247,7 +240,7 @@ export function SeekableTranscript({
             return (
               <li key={index}>
                 <div
-                  className={cx('min-h-[44px] rounded-md px-3 py-2.5', speakerTint)}
+                  className="min-h-[44px] rounded-md px-3 py-2.5"
                   aria-label={
                     shown
                       ? `Turn ${numberOf(index)}: ${speaker}. ${shown.spoken}.${unseekableReason ? ` ${unseekableReason}` : ''}`
@@ -255,13 +248,13 @@ export function SeekableTranscript({
                   }
                 >
                   <span className="flex items-baseline justify-between gap-2">
-                    <span className="text-xs font-medium text-[var(--c-ink-secondary)]">
+                    <span className={cx('text-xs font-medium', speakerInk)}>
                       {speaker}
                     </span>
                     {shown ? (
                       <span
                         data-turn-time="not-seekable"
-                        className="text-xs tabular-nums text-[var(--c-ink-secondary)]"
+                        className="font-mono text-xs text-[var(--c-ink-secondary)]"
                       >
                         {shown.text}
                       </span>

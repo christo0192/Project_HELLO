@@ -18,7 +18,7 @@
  *                                 to candidate names from the same load (no N+1).
  *   - Recent candidates         ← GET /api/candidates (already newest-first).
  *
- * STRUCTURE. The page used to be five bands of identical glass cards (18 of
+ * STRUCTURE. The page used to be five bands of identical cards (18 of
  * them), three charts and two donuts: 4,000px on a laptop, 15,000px on a
  * phone. It now reads top to bottom as the work does:
  *
@@ -28,7 +28,7 @@
  *   3. the screening scoreboard (its own component, one report panel);
  *   4. the things to act on: recent candidates, queued work, phone calls.
  *
- * Surface language: the glass system (docs/design/hello-glass-design-system.md).
+ * Surface language: Logsheet (docs/design/hello-glass-design-system.md).
  * One `GlassPanel` per logical group, hairlines inside, no card per number.
  *
  * FAILURE STAYS WHERE IT HAPPENED. Only `/api/me` can take the whole page: the
@@ -120,7 +120,7 @@ const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
 const RECOMMENDATION_TONE: Record<string, BarTone> = {
   advance: 'success',
   hold: 'warning',
-  reject: 'danger',
+  reject: 'neutral',
 };
 
 /**
@@ -132,7 +132,7 @@ const STAGE_ROWS_WHILE_LOADING = 8;
 
 /** A name that opens its record: ink, the accent on hover, never a brand utility. */
 const nameLinkClass =
-  'rounded-sm font-medium text-ink underline-offset-4 transition-colors duration-150 ease-out hover:text-info hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
+  'rounded-sm font-medium text-ink underline-offset-4 transition-colors duration-hover ease-out hover:text-info hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
 
 /**
  * Runs one read and keeps only the newest call's outcome, so a slow earlier
@@ -530,7 +530,7 @@ function CompletionMeta({ completionPct }: { completionPct: number }) {
   const r = 6;
   const c = 2 * Math.PI * r;
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full bg-ink/[0.05] py-0.5 pl-1 pr-2 text-meta font-medium tabular-nums text-ink-secondary">
+    <span className="inline-flex items-center gap-1.5 rounded-chip bg-surface-secondary py-0.5 pl-1 pr-2 text-meta font-medium tabular-nums text-ink-secondary">
       <svg aria-hidden="true" viewBox="0 0 16 16" className="h-4 w-4 -rotate-90">
         <circle cx="8" cy="8" r={r} fill="none" strokeWidth="2.5" className="stroke-ink/[0.1]" />
         <circle
@@ -591,11 +591,11 @@ function AssessmentsPanel({
                 ? `Average assessment score ${summary.average_score} across ${summary.assessed_count} assessed candidates. View them.`
                 : 'View assessed candidates.'
             }
-            className="group -mx-2 block rounded-[12px] px-2 py-1.5 transition-colors duration-150 ease-out hover:bg-ink/[0.025] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--info)]"
+            className="group -mx-2 block rounded-control px-2 py-1.5 transition-colors duration-hover ease-out hover:bg-ink/[0.025] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--info)]"
           >
             <p className="text-label font-medium text-ink-secondary">Average score</p>
             {hasAvg ? (
-              <p className="mt-1 text-2xl font-semibold leading-8 tracking-[-0.02em] tabular-nums text-ink">
+              <p className="mt-1 text-2xl font-semibold leading-8 tabular-nums text-ink">
                 {summary.average_score}
                 <span className="ml-1 text-label font-normal tracking-normal text-ink-tertiary">
                   / 100 across {summary.assessed_count} assessed

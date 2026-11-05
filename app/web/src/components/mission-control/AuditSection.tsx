@@ -114,7 +114,7 @@ export function AuditSection() {
               {audit.map((row) => (
                 <Tr key={row.id}>
                   <Td>
-                    <span className="inline-block rounded-md bg-surface-tertiary px-1.5 py-0.5 font-mono text-xs text-ink">
+                    <span className="inline-block rounded-md bg-surface-tertiary px-1.5 py-0.5 text-xs text-ink">
                       {row.action}
                     </span>
                   </Td>
@@ -133,13 +133,13 @@ export function AuditSection() {
                   </Td>
                   <Td>
                     <p className="text-xs text-ink">{row.actor_type}</p>
-                    <p className="font-mono text-xs text-ink-tertiary">
+                    <p className="text-xs text-ink-tertiary">
                       {shortId(row.actor_id)}
                     </p>
                   </Td>
                   <Td>
                     <p className="text-xs text-ink">{row.target_type}</p>
-                    <p className="font-mono text-xs text-ink-tertiary">
+                    <p className="text-xs text-ink-tertiary">
                       {shortId(row.target_id)}
                     </p>
                   </Td>

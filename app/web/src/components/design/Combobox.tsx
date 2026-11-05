@@ -356,24 +356,21 @@ export function Combobox({
           // 40px, the same height as the form's text inputs: one control
           // vocabulary per form. A selected option with a description grows.
           'group flex min-h-10 w-full min-w-0 items-center gap-3 px-3 py-1.5 text-left',
-          'bg-white transition-[background-color,box-shadow] duration-200 ease-soft',
+          'border bg-surface transition-[background-color,border-color] duration-hover ease-out',
           // Keyboard focus is the design system's 2px ring with offset — the
           // same as every button — so it is never mistaken for "open".
           'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
-          'disabled:cursor-not-allowed disabled:bg-ink/[0.04] disabled:text-ink-tertiary',
-          // The border lives in ONE branch each: two arbitrary shadows on the
-          // same element resolve by stylesheet order, not class order, and the
-          // grey one won — the open trigger did not match its blue panel.
-          open
-            ? 'rounded-t-control shadow-[inset_0_0_0_1.5px_var(--info)]'
-            : 'rounded-control shadow-[inset_0_0_0_1px_var(--ink-muted)]',
+          'disabled:cursor-not-allowed disabled:bg-surface-secondary disabled:text-ink-tertiary',
+          // A real border, so it survives forced colours. Open, it turns ink to
+          // match the panel it now heads.
+          open ? 'rounded-t-control border-[var(--ink)]' : 'rounded-control border-[var(--control)]',
         )}
       >
         {icon && (
           <span
             aria-hidden="true"
             className={cx(
-              'flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] transition-colors duration-200',
+              'flex h-8 w-8 shrink-0 items-center justify-center rounded-control transition-colors duration-hover',
               selected ? 'bg-info/[0.12] text-info' : 'bg-ink/[0.05] text-ink-tertiary',
             )}
           >
@@ -401,7 +398,7 @@ export function Combobox({
         ) : (
           <ChevronIcon
             className={cx(
-              'h-4 w-4 shrink-0 text-ink-tertiary transition-transform duration-200 ease-soft',
+              'h-4 w-4 shrink-0 text-ink-tertiary transition-transform duration-150 ease-soft',
               'group-disabled:opacity-40',
               open && 'rotate-180 text-info',
             )}
@@ -418,7 +415,7 @@ export function Combobox({
           onMouseDown={(e) => {
             if (e.target !== searchRef.current) e.preventDefault();
           }}
-          className="combobox-panel -mt-px overflow-hidden rounded-b-control bg-white shadow-[inset_0_0_0_1.5px_var(--info),0_14px_30px_-18px_rgba(15,23,42,0.35)]"
+          className="combobox-panel -mt-px overflow-hidden rounded-b-control border border-[var(--ink)] bg-surface shadow-pop"
         >
           <div className="flex items-center gap-2 border-b border-ink/[0.08] px-3">
             <SearchIcon className="h-4 w-4 shrink-0 text-ink-tertiary" />
@@ -546,7 +543,7 @@ function ComboboxRow({
       onMouseMove={onHover}
       onClick={onPick}
       className={cx(
-        'flex min-h-11 items-center gap-3 rounded-[10px] px-2.5 py-2 transition-[background-color,box-shadow] duration-150',
+        'flex min-h-11 items-center gap-3 rounded-control px-2.5 py-2 transition-[background-color,box-shadow] duration-hover',
         option.disabled ? 'cursor-not-allowed' : 'cursor-pointer',
         // The ACTIVE option is the only focus indicator inside the list
         // (focus stays in the search field), so it needs a 3:1 cue — a 2px
@@ -572,7 +569,7 @@ function ComboboxRow({
         )}
       </span>
       {option.tag && (
-        <span className="shrink-0 rounded-full bg-ink/[0.06] px-2 py-0.5 text-meta font-medium text-ink-secondary">
+        <span className="shrink-0 rounded-chip bg-surface-secondary px-2 py-0.5 text-meta font-medium text-ink-secondary">
           {option.tag}
         </span>
       )}
@@ -600,7 +597,7 @@ function Highlight({ text, query }: { text: string; query: string }) {
   return (
     <>
       {text.slice(0, at)}
-      <mark className="rounded-[3px] bg-info/[0.14] px-px text-ink">{text.slice(at, end)}</mark>
+      <mark className="rounded-evidence bg-surface-tertiary px-px text-ink">{text.slice(at, end)}</mark>
       {text.slice(end)}
     </>
   );

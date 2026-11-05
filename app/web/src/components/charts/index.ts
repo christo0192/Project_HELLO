@@ -4,8 +4,6 @@ export { chartPalette, chartTheme } from './theme';
 export type { ChartPalette, ChartTheme } from './theme';
 export { ChartDataTable } from './accessibility';
 export type { ChartDataTableProps } from './accessibility';
-export { ChartReveal } from './reveal';
-export type { ChartRevealProps } from './reveal';
 export { LegendHoverProvider, useLegendHover } from './legend-hover';
 export { ChartEmpty, ChartError } from './states';
 export type { ChartEmptyProps, ChartErrorProps } from './states';

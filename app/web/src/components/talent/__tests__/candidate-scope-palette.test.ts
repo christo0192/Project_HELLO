@@ -4,9 +4,9 @@
  * Four independent layers, each with its own negative control, so a
  * regression has to defeat all four to ship:
  *
- *   1. The exact authoritative literals are pinned, and the `.dark`
- *      block is asserted byte-equal to the light block — the source is
- *      light-only and fixed, so a dark "variant" is a bug, not a feature.
+ *   1. Every `--c-*` name is pinned to its Logsheet token, and the file
+ *      holds no colour of its own, so the palette has one source and a dark
+ *      "variant" cannot appear here.
  *   2. A mechanical source scan: no stock Tailwind palette utility, no
  *      IK brand/accent utility, no raw colour literal and no `dark:`
  *      variant may appear anywhere in candidate-scoped source. The file
@@ -101,7 +101,8 @@ function read(rel: string): string {
 }
 
 /** Declarations of a top-level rule whose selector is exactly `selector`. */
-function ruleDeclarations(css: string, selector: string): Record<string, string> {
+function ruleDeclarations(rawCss: string, selector: string): Record<string, string> {
+  const css = rawCss.replace(/\r\n/g, '\n');
   const start = css.indexOf(`\n${selector} {\n`);
   expect(start, `rule "${selector}" not found`).toBeGreaterThan(-1);
   const bodyStart = css.indexOf('{', start) + 1;
@@ -116,105 +117,65 @@ function ruleDeclarations(css: string, selector: string): Record<string, string>
 }
 
 /**
- * The authoritative values, transcribed from the owner-supplied palette
- * screenshots of 2026-08-21. These literals are the contract: if the file
- * drifts from them, this test is the thing that says so.
+ * The mapping onto Logsheet. These pairs are the contract: if the file drifts
+ * from them, this test is the thing that says so. The hex values themselves
+ * live once, in src/index.css, and are pinned by logsheet-tokens.test.ts.
  */
-const AUTHORITATIVE_TOKENS: Record<string, string> = {
-  '--c-bg': '#f4f6fb',
-  '--c-surface': '#ffffff',
-  '--c-border': '#dbe1ec',
-  '--c-border-light': '#eaeef6',
-  '--c-ink': '#0f172a',
-  '--c-ink-secondary': '#334155',
-  '--c-ink-muted': '#6b7391',
-  '--c-accent': '#4E6BA6',
-  '--c-accent-light': '#eaeef6',
-  '--c-positive': '#398AA2',
-  '--c-positive-light': '#eaf2f4',
-  '--c-negative': '#b45a72',
-  '--c-negative-light': '#f7edf0',
-  '--c-caution': '#a16207',
-  '--c-caution-light': '#fff8eb',
-  '--c-cat-1': '#4E6BA6',
-  '--c-cat-2': '#398AA2',
-  '--c-cat-3': '#1E7590',
-  '--c-cat-4': '#D8B5BE',
-  '--c-cat-5': '#938FB8',
-  '--c-cat-6': '#7BA7C7',
-  '--c-cat-7': '#A9CAD6',
-  '--c-cat-8': '#C4A6B8',
-  '--c-cat-9': '#6B8E9F',
-  '--c-cat-10': '#B5C8D8',
-  '--c-cat-11': '#8FB0A8',
-  '--c-cat-12': '#D0B8A0',
-  '--c-cat-other': '#cbd5e1',
-  '--c-gridline': '#f1f5f9',
-  '--c-data-label-outside': '#475569',
-  '--c-data-label-inside': '#ffffff',
-  '--c-over-threshold': '#b45a72',
+const TOKEN_MAP: Record<string, string> = {
+  '--c-bg': 'var(--desk)',
+  '--c-surface': 'var(--paper)',
+  '--c-border': 'var(--rule-2)',
+  '--c-border-light': 'var(--field)',
+  '--c-ink': 'var(--ink)',
+  '--c-ink-secondary': 'var(--ink-2)',
+  '--c-ink-muted': 'var(--ink-3)',
+  '--c-accent': 'var(--ink)',
+  '--c-accent-light': 'var(--field)',
+  '--c-positive': 'var(--ink-2)',
+  '--c-positive-light': 'var(--field)',
+  '--c-negative': 'var(--danger)',
+  '--c-negative-light': 'var(--paper)',
+  '--c-caution': 'var(--ink-2)',
+  '--c-caution-light': 'var(--field)',
+  '--c-data-label-inside': 'var(--paper)',
+  '--c-control-border': 'var(--control)',
 };
 
 const paletteCss = readFileSync(PALETTE, 'utf8');
 const lightRule = ruleDeclarations(paletteCss, '.candidate-scope');
-const darkRule = ruleDeclarations(paletteCss, '.dark .candidate-scope');
+const rootRule = (() => {
+  const css = readFileSync(resolve(ROOT, 'src/index.css'), 'utf8').replace(/\r\n/g, '\n');
+  const body = /:root \{\n([\s\S]*?)\n {2}\}/.exec(css);
+  expect(body, ':root block not found').not.toBeNull();
+  const out: Record<string, string> = {};
+  for (const m of body![1].matchAll(/^\s*(--[\w-]+):\s*(#[0-9a-fA-F]{6})\s*;/gm)) out[m[1]] = m[2];
+  return out;
+})();
 
 /* ── 1. Exact literals, and no dark variant ───────────────────────── */
 
 describe('candidate palette tokens', () => {
-  it('pins every authoritative literal exactly', () => {
-    for (const [name, value] of Object.entries(AUTHORITATIVE_TOKENS)) {
+  it('maps every name onto its Logsheet token exactly', () => {
+    for (const [name, value] of Object.entries(TOKEN_MAP)) {
       expect(lightRule[name], `${name} drifted`).toBe(value);
     }
   });
 
-  it('declares no literal colour outside the authoritative set', () => {
-    const approved = new Set(
-      Object.values(AUTHORITATIVE_TOKENS).map((v) => v.toLowerCase()),
-    );
-    const literals = paletteCss.match(/#[0-9a-fA-F]{3,8}\b/g) ?? [];
-    expect(literals.length).toBeGreaterThan(0);
-    for (const literal of literals) {
-      expect(approved.has(literal.toLowerCase()), `${literal} is not approved`).toBe(
-        true,
-      );
-    }
+  it('holds no colour of its own: every value is a token', () => {
+    expect(paletteCss).not.toMatch(/#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(/);
   });
 
-  it('renders the SAME fixed values under a .dark ancestor', () => {
-    expect(darkRule).toEqual(lightRule);
-    expect(Object.keys(darkRule).length).toBeGreaterThan(
-      Object.keys(AUTHORITATIVE_TOKENS).length,
-    );
+  it('defines no dark variant', () => {
+    expect(paletteCss).not.toMatch(/^\s*\.dark\b/m);
   });
 
   it('forces a light colour-scheme so native controls do not go dark', () => {
     expect(lightRule['color-scheme']).toBe('light');
-    expect(darkRule['color-scheme']).toBe('light');
   });
 
-  it('re-points every inherited app token at the candidate palette', () => {
-    for (const name of [
-      '--surface',
-      '--surface-secondary',
-      '--surface-tertiary',
-      '--ink',
-      '--ink-secondary',
-      '--ink-tertiary',
-      '--line',
-      '--line-strong',
-      '--success',
-      '--success-soft',
-      '--warning',
-      '--warning-soft',
-      '--error',
-      '--error-soft',
-      '--info',
-      '--info-soft',
-    ]) {
-      expect(lightRule[name], `${name} is not re-pointed`).toMatch(
-        /^var\(--c-[\w-]+\)$/,
-      );
+  it('leaves the app-wide semantic names alone: they are already Logsheet', () => {
+    for (const name of ['--surface', '--ink', '--ink-secondary', '--ink-tertiary', '--line', '--info']) {
+      expect(lightRule[name], `${name} is re-pointed`).toBeUndefined();
     }
   });
 });
@@ -263,12 +224,9 @@ describe('candidate-scope source guard', () => {
   /**
    * The semantic tone colours may fill, ring and border. They may NOT be text.
    *
-   * `--c-negative` and `--c-positive` have no ground in this palette that
-   * clears 4.5:1 for normal text: rose reaches only 3.94:1 on its own tint and
-   * 4.52:1 on the card, teal only 3.47:1 and 3.94:1. Rather than allow one and
-   * ban the other — a distinction no author will remember at the point of
-   * writing a className — neither is a text colour anywhere in candidate
-   * scope. Tone is carried by tint, ring and border; the label is always ink.
+   * Tone is carried by tint, ring and border; the label is always ink. A tone
+   * written as a text colour is how a status starts reading as a traffic light,
+   * so neither is a text colour anywhere in candidate scope.
    *
    * SCOPE: this reads `text-[var(--c-…)]` utilities only. A colour applied
    * through an inline `style` — the 36px overall score is the one such site —
@@ -361,76 +319,56 @@ export function contrastRatio(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-/** Resolve a token name (following one level of `var(--c-…)` aliasing). */
+/** Resolve a `--c-*` name to the hex its Logsheet token declares. */
 function token(name: string): string {
   const raw = lightRule[name];
   expect(raw, `${name} is not declared`).toBeTruthy();
-  const alias = /^var\((--c-[\w-]+)\)$/.exec(raw);
-  return alias ? lightRule[alias[1]] : raw;
+  const alias = /^var\((--[\w-]+)\)$/.exec(raw);
+  expect(alias, `${name} should be a token`).not.toBeNull();
+  const hex = rootRule[alias![1]];
+  expect(hex, `${alias![1]} is not a hex in index.css`).toBeTruthy();
+  return hex;
 }
 
 /** [foreground, background, minimum ratio, what it is]. */
 const CONTRAST_PAIRS: Array<[string, string, number, string]> = [
   // Body text, 4.5:1 (WCAG 1.4.3).
   ['--c-ink', '--c-surface', 4.5, 'primary text on a card'],
-  ['--c-ink', '--c-bg', 4.5, 'primary text on the page ground'],
-  ['--c-ink', '--c-border-light', 4.5, 'primary text in a sunken block'],
+  ['--c-ink', '--c-bg', 4.5, 'primary text on the desk'],
+  ['--c-ink', '--c-border-light', 4.5, 'primary text in a shaded field'],
   ['--c-ink-secondary', '--c-surface', 4.5, 'secondary text on a card'],
-  ['--c-ink-secondary', '--c-bg', 4.5, 'secondary text on the page ground'],
-  ['--c-ink-secondary', '--c-border-light', 4.5, 'secondary text in a sunken block'],
-  ['--c-ink-muted', '--c-surface', 4.5, 'muted text — cards only'],
-  ['--c-accent', '--c-surface', 4.5, 'links and accents on a card'],
-  ['--c-accent', '--c-bg', 4.5, 'links and accents on the page ground'],
+  ['--c-ink-secondary', '--c-bg', 4.5, 'secondary text on the desk'],
+  ['--c-ink-secondary', '--c-border-light', 4.5, 'secondary text in a shaded field'],
+  ['--c-ink-secondary', '--c-border', 4.5, 'label on a disabled candidate button'],
+  ['--c-ink-muted', '--c-surface', 4.5, 'muted text on a card'],
+  ['--c-ink-muted', '--c-bg', 4.5, 'muted text on the desk'],
+  ['--c-ink-muted', '--c-border-light', 4.5, 'muted text in a shaded field'],
+  ['--c-accent', '--c-surface', 4.5, 'links on a card'],
+  ['--c-accent', '--c-bg', 4.5, 'links on the desk'],
   ['--c-data-label-inside', '--c-accent', 4.5, 'label on a primary button'],
+  ['--c-data-label-inside', '--c-negative', 4.5, 'label on a filled fault'],
   ['--c-caution', '--c-caution-light', 4.5, 'caution badge text'],
-  ['--c-data-label-outside', '--c-surface', 4.5, 'outside chart data label'],
-  // Every tinted ground a candidate component actually paints text on. The
-  // label ink is the secondary ink on ALL of them (see Tag, and the error
-  // state) — enumerated rather than sampled, because axe cannot check
-  // contrast under jsdom and this list is therefore the only guard there is.
-  ['--c-ink-secondary', '--c-accent-light', 4.5, 'tag label on the accent tint'],
-  ['--c-ink-secondary', '--c-positive-light', 4.5, 'tag label on the positive tint'],
-  ['--c-ink-secondary', '--c-caution-light', 4.5, 'tag label on the caution tint'],
-  ['--c-ink-secondary', '--c-negative-light', 4.5, 'error-state message on the rose tint'],
-  ['--c-accent', '--c-accent-light', 4.5, 'selected filter toggle on its own tint'],
-  // Aliases the inherited utilities resolve through.
-  ['--success', '--success-soft', 4.5, 'success badge text'],
-  ['--error', '--error-soft', 4.5, 'error badge text'],
-  ['--warning', '--warning-soft', 4.5, 'warning badge text'],
-  ['--info', '--info-soft', 4.5, 'info badge text'],
-  ['--ink-tertiary', '--c-bg', 4.5, 'inherited tertiary ink on the page ground'],
-  // LARGE text, 3:1 (WCAG 1.4.3 — the overall score is 36px bold, painted
-  // through an inline `style` rather than a utility, so the source ban below
-  // cannot see it and this list is what covers it).
-  ['--c-positive', '--c-surface', 3, 'overall score, strong band (36px bold)'],
-  ['--c-caution', '--c-surface', 3, 'overall score, fair band (36px bold)'],
-  ['--c-negative', '--c-surface', 3, 'overall score, low band (36px bold)'],
+  ['--c-negative', '--c-negative-light', 4.5, 'fault text on its ground'],
+  ['--c-negative', '--c-surface', 4.5, 'fault text on a card'],
   // Non-text UI, 3:1 (WCAG 1.4.11).
-  ['--c-negative', '--c-bg', 3, 'error-state border vs the page ground'],
-  ['--c-positive', '--c-border-light', 3, 'strong meter fill vs its track'],
-  ['--c-caution', '--c-border-light', 3, 'fair meter fill vs its track'],
-  ['--c-negative', '--c-border-light', 3, 'low meter fill vs its track'],
+  ['--c-negative', '--c-bg', 3, 'error-state border vs the desk'],
+  ['--c-ink', '--c-border-light', 3, 'strong meter fill vs its track'],
+  ['--c-ink-secondary', '--c-border-light', 3, 'fair meter fill vs its track'],
+  ['--c-ink-muted', '--c-border-light', 3, 'low meter fill vs its track'],
+  ['--c-control-border', '--c-border-light', 3, 'pipeline fill vs its track'],
   ['--c-control-border', '--c-surface', 3, 'input/select/button boundary'],
-  ['--c-positive', '--c-surface', 3, 'positive tag ring vs the card'],
-  ['--c-negative', '--c-surface', 3, 'negative tag ring vs the card'],
+  ['--c-control-border', '--c-bg', 3, 'control boundary on the desk'],
   ['--c-accent', '--c-surface', 3, 'focus ring vs the card'],
 ];
 
 /**
- * Pairings this design DELIBERATELY does not use, with the sub-threshold
- * number that is the reason.
- *
- * A rule kept only in a comment is a rule that gets broken: painting the
- * error message in `--c-negative` on `--c-negative-light` is exactly what
- * `CandidateErrorState` did until this was pinned, while `Tag` — carrying the
- * same rule as prose — obeyed it. Asserting the REJECTED number keeps the ban
- * checkable, and the tone-as-text source guard in §2 keeps it enforced.
+ * A pairing this design DELIBERATELY does not use, with the sub-threshold
+ * number that is the reason. A rule kept only in a comment is a rule that gets
+ * broken; asserting the rejected number keeps the ban checkable.
  */
 const REJECTED_TEXT_PAIRS: Array<[string, string, string]> = [
-  ['--c-negative', '--c-negative-light', 'rose on its own tint'],
-  ['--c-positive', '--c-positive-light', 'teal on its own tint'],
-  ['--c-ink-muted', '--c-bg', 'muted ink on the page ground'],
   ['--c-border', '--c-surface', 'the hairline as a control boundary'],
+  ['--c-control-border', '--c-surface', 'the control edge as small text'],
 ];
 
 describe('candidate palette contrast (WCAG 2.1)', () => {
@@ -445,9 +383,7 @@ describe('candidate palette contrast (WCAG 2.1)', () => {
   it.each(REJECTED_TEXT_PAIRS)(
     'REJECTED: %s on %s is below AA for normal text (%s)',
     (fg, bg) => {
-      // Each of these is why the corresponding pairing moved. If one ever
-      // clears 4.5 the palette changed underneath us and the re-pairing
-      // decisions in docs/design/candidate-experience.md must be revisited.
+      // If one ever clears 4.5 the palette changed underneath us.
       expect(contrastRatio(token(fg), token(bg))).toBeLessThan(4.5);
     },
   );
@@ -497,7 +433,7 @@ describe('frozen shared files', () => {
     }
   });
 
-  it('the app-wide token file is left untouched apart from one import', () => {
+  it('the app-wide token file imports the palette and nothing else', () => {
     const indexCss = read('src/index.css');
     const imports = indexCss.match(/^@import .+$/gm) ?? [];
     expect(imports).toEqual(["@import './styles/candidate-palette.css';"]);
@@ -562,7 +498,7 @@ describe('axe cannot check contrast under jsdom', () => {
     const result = await axe.run(document.body, { runOnly: ['color-contrast'] });
     document.body.innerHTML = '';
 
-    // The pair really is below AA — the same number REJECTED_TEXT_PAIRS pins.
+    // The pair really is below AA.
     expect(contrastRatio('#b45a72', '#f7edf0')).toBeLessThan(4.5);
     // …and axe still finds nothing to fail on.
     expect(result.violations).toHaveLength(0);

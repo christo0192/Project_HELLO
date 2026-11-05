@@ -27,7 +27,7 @@ export function LevelPips({ level, className }: { level: ScoreValue; className?:
         <span
           key={step}
           className={cx(
-            'h-[5px] w-[11px] rounded-full transition-colors duration-200',
+            'h-[5px] w-[11px] rounded-full transition-colors duration-hover',
             step <= level ? 'bg-info' : 'bg-ink/[0.12]',
           )}
         />
@@ -53,7 +53,7 @@ export function LevelHeading({
         {/* The space between the two spans is REAL text: without it the
             accessible name (and a label lookup) reads "1Poor". */}
         <span className="text-xs font-medium tabular-nums text-ink-tertiary">{level}</span>{' '}
-        <span className="text-[13px] font-semibold text-ink">{SCORE_LABELS[level]}</span>
+        <span className="text-label font-semibold text-ink">{SCORE_LABELS[level]}</span>
       </span>
       <LevelPips level={level} />
     </>
@@ -83,14 +83,14 @@ export function RubricScale({
     <ol
       aria-label="Rubric, 1 Poor to 4 Excellent"
       className={cx(
-        'grid grid-cols-1 gap-px overflow-hidden rounded-[14px] bg-ink/[0.08] sm:grid-cols-2',
+        'grid grid-cols-1 gap-px overflow-hidden rounded-control bg-ink/[0.08] sm:grid-cols-2',
         className,
       )}
     >
       {RUBRIC_LEVELS.map((level) => (
-        <li key={level} className="flex flex-col gap-1.5 bg-white/80 px-3.5 py-3">
+        <li key={level} className="flex flex-col gap-1.5 bg-surface px-3.5 py-3">
           <LevelHeading level={level} />
-          <p className="text-[13px] leading-5 text-ink-secondary">
+          <p className="text-label leading-5 text-ink-secondary">
             {rubric?.[level]?.trim() || (
               <span className="italic text-ink-tertiary">Not described</span>
             )}

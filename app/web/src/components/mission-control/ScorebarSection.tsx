@@ -414,7 +414,7 @@ export function ScorebarSection() {
       {/* A toolbar, not a second header: the drawer's own title and
           description already say what this library is. */}
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-[13px] font-medium tabular-nums text-ink-secondary">
+        <p className="text-label font-medium tabular-nums text-ink-secondary">
           {metrics.length} metric{metrics.length === 1 ? '' : 's'}
         </p>
         <Button
@@ -461,12 +461,12 @@ export function ScorebarSection() {
         <section
           id="new-metric-panel"
           aria-labelledby="new-metric-title"
-          className="disclosure-body glass-sunken rounded-[18px] p-4 sm:p-5"
+          className="disclosure-body glass-sunken rounded-control p-4 sm:p-5"
         >
-          <h3 id="new-metric-title" className="text-[15px] font-semibold tracking-[-0.01em] text-ink">
+          <h3 id="new-metric-title" className="text-section text-ink">
             Add a metric
           </h3>
-          <p className="mt-1 max-w-prose text-[13px] leading-5 text-ink-secondary">
+          <p className="mt-1 max-w-prose text-label leading-5 text-ink-secondary">
             Name it, tell the scorer what to look for, and describe what each of the four levels
             looks like.
           </p>
@@ -515,7 +515,7 @@ export function ScorebarSection() {
           <ul
             role="list"
             aria-busy={refreshing || undefined}
-            className="overflow-hidden rounded-[18px] bg-white/80 shadow-[0_0_0_1px_var(--glass-ring-strong)]"
+            className="overflow-hidden rounded-control bg-surface border border-line-strong"
           >
             {page.items.map((metric) => (
               <MetricRow
@@ -620,17 +620,17 @@ function MetricRow({
           aria-describedby={metric.description ? descId : undefined}
           onClick={onToggle}
           className={cx(
-            'flex w-full min-w-0 items-start gap-3 px-4 py-3.5 text-left transition-colors duration-150',
+            'flex w-full min-w-0 items-start gap-3 px-4 py-3.5 text-left transition-colors duration-hover',
             'hover:bg-ink/[0.025] focus:outline-none focus-visible:bg-info/[0.06] focus-visible:shadow-[inset_0_0_0_2px_var(--info)]',
             open && 'bg-ink/[0.02]',
           )}
         >
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="flex min-w-0 items-center gap-2">
-              <span className="truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
+              <span className="truncate text-section text-ink">
                 {metric.name}
               </span>
-              <span className="shrink-0 rounded-full bg-ink/[0.06] px-1.5 py-px text-meta font-medium tabular-nums text-ink-secondary">
+              <span className="shrink-0 rounded-chip bg-surface-secondary px-1.5 py-px text-meta font-medium tabular-nums text-ink-secondary">
                 v{metric.version}
               </span>
             </span>
@@ -639,7 +639,7 @@ function MetricRow({
               // repeat it underneath.
               <span
                 id={descId}
-                className={cx('mt-0.5 text-[13px] leading-5 text-ink-secondary', !open && 'line-clamp-2')}
+                className={cx('mt-0.5 text-label leading-5 text-ink-secondary', !open && 'line-clamp-2')}
               >
                 {metric.description}
               </span>
@@ -654,7 +654,7 @@ function MetricRow({
             strokeLinejoin="round"
             aria-hidden="true"
             className={cx(
-              'mt-1 h-4 w-4 shrink-0 text-ink-tertiary transition-transform duration-200 ease-soft',
+              'mt-1 h-4 w-4 shrink-0 text-ink-tertiary transition-transform duration-150 ease-soft',
               open && 'rotate-180',
             )}
           >
@@ -672,7 +672,7 @@ function MetricRow({
 }
 
 /** Sub-headings inside an open metric: at least as strong as the text under them. */
-const DETAIL_HEADING = 'text-[13px] font-semibold text-ink';
+const DETAIL_HEADING = 'text-label font-semibold text-ink';
 
 /** The open metric, read-only: its instruction and rubric. */
 function MetricDetails({ metric, actions }: { metric: ScorecardMetricTemplate; actions: ReactNode }) {
@@ -680,7 +680,7 @@ function MetricDetails({ metric, actions }: { metric: ScorecardMetricTemplate; a
     <div className="flex flex-col gap-4">
       <section>
         <h4 className={DETAIL_HEADING}>Scoring instruction</h4>
-        <p className="mt-1.5 rounded-[12px] bg-ink/[0.035] px-3.5 py-3 text-[13px] leading-6 text-ink-secondary">
+        <p className="mt-1.5 rounded-control bg-ink/[0.035] px-3.5 py-3 text-label leading-6 text-ink-secondary">
           {metric.default_instruction}
         </p>
       </section>
@@ -763,7 +763,7 @@ function MetricFields({
       {instructionAction && <div className="flex justify-end">{instructionAction}</div>}
 
       <div className="flex flex-col gap-1.5">
-        <label htmlFor={`${idPrefix}-instruction`} className="text-[13px] font-medium text-ink">
+        <label htmlFor={`${idPrefix}-instruction`} className="text-label font-medium text-ink">
           Scoring instruction
         </label>
         <textarea
@@ -793,12 +793,12 @@ function MetricFields({
       </div>
 
       <fieldset className="flex min-w-0 flex-col gap-1.5">
-        <legend className="text-[13px] font-medium text-ink">Rubric</legend>
+        <legend className="text-label font-medium text-ink">Rubric</legend>
         <p className="text-xs leading-5 text-ink-tertiary">
           Describe what an answer at each level looks like. The levels are Ashby&apos;s four-point
           Score.
         </p>
-        <div className="mt-1 grid grid-cols-1 gap-px overflow-hidden rounded-[14px] bg-ink-muted/40 shadow-[0_0_0_1px_var(--ink-muted)] sm:grid-cols-2">
+        <div className="mt-1 grid grid-cols-1 gap-px overflow-hidden rounded-control bg-ink-muted/40 shadow-[0_0_0_1px_var(--ink-muted)] sm:grid-cols-2">
           {RUBRIC_LEVELS.map((level) => {
             const field: DraftField = `rubric-${level}`;
             const id = `${idPrefix}-${field}`;
@@ -807,7 +807,7 @@ function MetricFields({
               <div
                 key={level}
                 className={cx(
-                  'flex flex-col gap-2 bg-white px-3.5 py-3 transition-shadow duration-150',
+                  'flex flex-col gap-2 bg-surface px-3.5 py-3 transition-shadow duration-hover',
                   // An invalid cell stays RED while focused — focus is exactly
                   // when the admin is looking at what is wrong with it.
                   error
@@ -825,7 +825,7 @@ function MetricFields({
                   placeholder={`What ${withArticle(SCORE_LABELS[level].toLowerCase())} answer looks like`}
                   aria-invalid={error ? true : undefined}
                   aria-describedby={error ? errorId(field) : undefined}
-                  className="w-full resize-none bg-transparent text-[13px] leading-5 text-ink placeholder:text-ink-tertiary focus:outline-none"
+                  className="w-full resize-none bg-transparent text-label leading-5 text-ink placeholder:text-ink-tertiary focus:outline-none"
                 />
                 {(error || nearLimit(draft.rubric[level], SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH)) && (
                   <div className="flex items-start justify-between gap-2">
@@ -895,7 +895,7 @@ function TextInput({
   return (
     <div className={cx('flex min-w-0 flex-col gap-1.5', className)}>
       <div className="flex items-baseline justify-between gap-2">
-        <label htmlFor={id} className="text-[13px] font-medium text-ink">
+        <label htmlFor={id} className="text-label font-medium text-ink">
           {label}
         </label>
         {optional && <span className="text-xs text-ink-tertiary">Optional</span>}

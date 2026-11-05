@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react';
 import type { EChartsOption } from 'echarts';
 import type { ECharts as EChartsInstance } from 'echarts/core';
-import { useReducedMotion } from '../../lib/motion';
-import { useTheme } from '../../lib/theme';
 import { cx } from '../design/cx';
 import { echarts } from './echarts';
 import { chartTheme } from './theme';
@@ -19,7 +17,7 @@ export interface EChartProps {
 }
 
 /**
- * Merges the theme/reduced-motion base option with the caller's option.
+ * Merges the token base option with the caller's option.
  * Tooltip is merged shallowly so component-level triggers (axis/item) keep
  * the themed background/border from `chartTheme`.
  */
@@ -52,22 +50,17 @@ export function EChart({
   renderer = 'canvas',
   onChartReady,
 }: EChartProps) {
-  const reducedMotion = useReducedMotion();
-  const { theme } = useTheme();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const instanceRef = useRef<EChartsInstance | null>(null);
   const readyRef = useRef(onChartReady);
   readyRef.current = onChartReady;
 
-  const themed = useMemo(() => {
-    const { base } = chartTheme(theme, reducedMotion);
-    return mergeThemedOption(base, option);
-  }, [option, theme, reducedMotion]);
+  const themed = useMemo(() => mergeThemedOption(chartTheme().base, option), [option]);
 
   // Init ONCE per renderer. Callers build `option` as a fresh literal on
   // every render, so keying the init effect on the option would dispose and
   // rebuild the canvas on every parent re-render (the dashboard renders ~6×
-  // while its fetches land) and replay the entrance animation each time.
+  // while its fetches land).
   const themedRef = useRef(themed);
   themedRef.current = themed;
   useEffect(() => {

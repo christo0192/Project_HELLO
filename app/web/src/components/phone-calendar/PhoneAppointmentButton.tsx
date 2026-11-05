@@ -96,7 +96,7 @@ export function PhoneAppointmentButton({
 
   const shared = cx(
     'w-full min-h-[44px] text-left',
-    'transition-[box-shadow,background-color] duration-200 ease-soft',
+    'transition-[box-shadow,background-color] duration-hover ease-soft',
     // Detached from the chip by a white gap, so focus never looks like the
     // hugging 1px ring that means "selected" (see the header comment).
     'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500',
@@ -115,8 +115,8 @@ export function PhoneAppointmentButton({
         aria-label={appointmentAccessibleName(appointment)}
         className={cx(
           shared,
-          'flex items-center gap-3 rounded-[10px] px-3 py-2',
-          selected ? selectedLook : 'hover:bg-white/70',
+          'flex items-center gap-3 rounded-control px-3 py-2',
+          selected ? selectedLook : 'hover:bg-surface-secondary',
         )}
       >
         <span
@@ -151,15 +151,15 @@ export function PhoneAppointmentButton({
       aria-label={appointmentAccessibleName(appointment)}
       className={cx(
         shared,
-        'flex flex-col items-start gap-1 rounded-[10px] px-2 py-1.5',
+        'flex flex-col items-start gap-1 rounded-control px-2 py-1.5',
         // One fill per state, never two fill classes on one element: which of
         // two `bg-*` utilities wins is decided by stylesheet order, not by the
         // order they are written here.
         selected
           ? selectedLook
           : withdrawn
-            ? 'bg-white/55 shadow-[inset_0_0_0_1px_var(--glass-ring)] hover:bg-white hover:shadow-card-hover'
-            : 'bg-white shadow-pill hover:shadow-card-hover',
+            ? 'bg-surface border border-line hover:bg-surface-secondary'
+            : 'bg-surface',
       )}
     >
       <span aria-hidden="true" className="text-meta font-medium tabular-nums text-ink-tertiary">

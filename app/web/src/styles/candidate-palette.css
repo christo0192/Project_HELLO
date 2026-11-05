@@ -1,195 +1,49 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   Candidate experience palette — the SOLE source of colour for the
-   candidate-scoped surfaces (Candidates list, Candidate Detail
-   Overview/Review, Ashby-scoped Overview/Review).
+   Candidate-scope palette: the `--c-*` names, mapped onto Logsheet.
 
-   Values are the HR-approved "IK Hiring Dashboard" palette, verified from
-   the owner-supplied screenshots of 2026-08-21 and transcribed in
-   /tmp/hr-candidate-palette.md. The source is explicitly LIGHT-ONLY and
-   fixed: there is no dark variant of this palette, so `.dark
-   .candidate-scope` repeats the SAME values rather than inventing one.
-   A test pins every literal below and asserts the two blocks are equal.
+   Candidate-scoped surfaces (Candidates list, Candidate Detail
+   Overview/Review, Ashby-scoped Overview/Review, and the candidate-facing
+   join, consent and R1 pages) take their colour from these names. Every value
+   is a token from src/index.css: this file holds no colour of its own, so the
+   palette has one source and the voice hue cannot be restated here.
 
-   Containment: every value lives on the `.candidate-scope` element, so
-   only that subtree can resolve it. Nothing here can reach Mission
-   Control, Login, Session Detail, Screening or the live-call surfaces.
-   No global token, no Tailwind theme key and no shared primitive is
-   changed to make this work.
+   Containment: every name lives on the `.candidate-scope` element, so only
+   that subtree can resolve it.
    ═══════════════════════════════════════════════════════════════════════ */
 
 .candidate-scope {
   color-scheme: light;
 
   /* ── Surfaces ─────────────────────────────────────────────────── */
-  --c-bg: #f4f6fb;
-  --c-surface: #ffffff;
-  --c-border: #dbe1ec;
-  --c-border-light: #eaeef6;
+  --c-bg: var(--desk);
+  --c-surface: var(--paper);
+  --c-border: var(--rule-2);
+  --c-border-light: var(--field);
 
   /* ── Text ─────────────────────────────────────────────────────── */
-  --c-ink: #0f172a;
-  --c-ink-secondary: #334155;
-  --c-ink-muted: #6b7391;
+  --c-ink: var(--ink);
+  --c-ink-secondary: var(--ink-2);
+  --c-ink-muted: var(--ink-3);
 
-  /* ── Accent and semantic ──────────────────────────────────────── */
-  --c-accent: #4E6BA6;
-  --c-accent-light: #eaeef6;
-  --c-positive: #398AA2;
-  --c-positive-light: #eaf2f4;
-  --c-negative: #b45a72;
-  --c-negative-light: #f7edf0;
-  --c-caution: #a16207;
-  --c-caution-light: #fff8eb;
+  /* ── Accent and tones ─────────────────────────────────────────────
+     The accent is ink, and a status is a word, not a traffic light: only a
+     fault keeps a hue. `*-light` are the grounds those tones sit on. */
+  --c-accent: var(--ink);
+  --c-accent-light: var(--field);
+  --c-positive: var(--ink-2);
+  --c-positive-light: var(--field);
+  --c-negative: var(--danger);
+  --c-negative-light: var(--paper);
+  --c-caution: var(--ink-2);
+  --c-caution-light: var(--field);
 
-  /* ── Categorical cycle ────────────────────────────────────────── */
-  --c-cat-1: #4E6BA6;
-  --c-cat-2: #398AA2;
-  --c-cat-3: #1E7590;
-  --c-cat-4: #D8B5BE;
-  --c-cat-5: #938FB8;
-  --c-cat-6: #7BA7C7;
-  --c-cat-7: #A9CAD6;
-  --c-cat-8: #C4A6B8;
-  --c-cat-9: #6B8E9F;
-  --c-cat-10: #B5C8D8;
-  --c-cat-11: #8FB0A8;
-  --c-cat-12: #D0B8A0;
-  --c-cat-other: #cbd5e1;
-
-  /* ── Chart support ────────────────────────────────────────────── */
-  --c-gridline: #f1f5f9;
-  --c-data-label-outside: #475569;
-  --c-data-label-inside: #ffffff;
-  --c-over-threshold: #b45a72;
+  /* The label on an ink or danger fill. */
+  --c-data-label-inside: var(--paper);
 
   /* Boundary of an interactive control. A decorative hairline is allowed to
      be faint, but a border that is the only thing identifying an input,
-     select or secondary button must clear WCAG 1.4.11's 3:1 — the approved
-     hairline is 1.31:1 on white, the muted ink is 4.68:1. */
-  --c-control-border: var(--c-ink-muted);
-
-  /* ── Aliases: the app's semantic token names, re-pointed at the
-        candidate palette. Existing `bg-surface` / `text-ink` /
-        `border-line` utilities therefore resolve to approved values
-        inside this subtree and are unchanged everywhere else. ───── */
-  --surface: var(--c-surface);
-  --surface-secondary: var(--c-bg);
-  --surface-tertiary: var(--c-border-light);
-  --ink: var(--c-ink);
-  --ink-secondary: var(--c-ink-secondary);
-  /* The approved muted grey reaches 4.68:1 on the white card surface but
-     only 4.33:1 on the page ground, so the inherited `text-ink-tertiary`
-     utility — which appears on both — is mapped to the secondary ink.
-     `--c-ink-muted` is still used directly, but only on `--c-surface`. */
-  --ink-tertiary: var(--c-ink-secondary);
-  --line: var(--c-border);
-  --line-strong: var(--c-border);
-  /* `StatusBadge` paints `text-success` on `bg-success-soft`; the approved
-     teal on its own tint is 3.47:1, so the success INK is the deeper
-     approved cyan (4.62:1 on the same tint). The teal itself is unchanged
-     and still fills the meters, where 3.39:1 clears the 3:1 non-text bar. */
-  --success: var(--c-cat-3);
-  --success-soft: var(--c-positive-light);
-  --warning: var(--c-caution);
-  --warning-soft: var(--c-caution-light);
-  /* The approved rose has no darker sibling in the palette, so rose text on
-     the rose tint caps at 3.94:1 and cannot reach AA. The error GROUND is
-     therefore the card surface (4.52:1) rather than the tint; hue survives
-     in the badge dot and ring, and the tint is still used for larger
-     non-text blocks via `--c-negative-light`. */
-  --error: var(--c-negative);
-  --error-soft: var(--c-surface);
-  --info: var(--c-accent);
-  --info-soft: var(--c-accent-light);
-}
-
-/* The app theme toggle puts `.dark` on the document root. The candidate
-   palette is fixed and light-only, so it is repeated verbatim here: an
-   ancestor (or same-element) `.dark` must not change a single value. */
-.dark .candidate-scope {
-  color-scheme: light;
-
-  /* ── Surfaces ─────────────────────────────────────────────────── */
-  --c-bg: #f4f6fb;
-  --c-surface: #ffffff;
-  --c-border: #dbe1ec;
-  --c-border-light: #eaeef6;
-
-  /* ── Text ─────────────────────────────────────────────────────── */
-  --c-ink: #0f172a;
-  --c-ink-secondary: #334155;
-  --c-ink-muted: #6b7391;
-
-  /* ── Accent and semantic ──────────────────────────────────────── */
-  --c-accent: #4E6BA6;
-  --c-accent-light: #eaeef6;
-  --c-positive: #398AA2;
-  --c-positive-light: #eaf2f4;
-  --c-negative: #b45a72;
-  --c-negative-light: #f7edf0;
-  --c-caution: #a16207;
-  --c-caution-light: #fff8eb;
-
-  /* ── Categorical cycle ────────────────────────────────────────── */
-  --c-cat-1: #4E6BA6;
-  --c-cat-2: #398AA2;
-  --c-cat-3: #1E7590;
-  --c-cat-4: #D8B5BE;
-  --c-cat-5: #938FB8;
-  --c-cat-6: #7BA7C7;
-  --c-cat-7: #A9CAD6;
-  --c-cat-8: #C4A6B8;
-  --c-cat-9: #6B8E9F;
-  --c-cat-10: #B5C8D8;
-  --c-cat-11: #8FB0A8;
-  --c-cat-12: #D0B8A0;
-  --c-cat-other: #cbd5e1;
-
-  /* ── Chart support ────────────────────────────────────────────── */
-  --c-gridline: #f1f5f9;
-  --c-data-label-outside: #475569;
-  --c-data-label-inside: #ffffff;
-  --c-over-threshold: #b45a72;
-
-  /* Boundary of an interactive control. A decorative hairline is allowed to
-     be faint, but a border that is the only thing identifying an input,
-     select or secondary button must clear WCAG 1.4.11's 3:1 — the approved
-     hairline is 1.31:1 on white, the muted ink is 4.68:1. */
-  --c-control-border: var(--c-ink-muted);
-
-  /* ── Aliases: the app's semantic token names, re-pointed at the
-        candidate palette. Existing `bg-surface` / `text-ink` /
-        `border-line` utilities therefore resolve to approved values
-        inside this subtree and are unchanged everywhere else. ───── */
-  --surface: var(--c-surface);
-  --surface-secondary: var(--c-bg);
-  --surface-tertiary: var(--c-border-light);
-  --ink: var(--c-ink);
-  --ink-secondary: var(--c-ink-secondary);
-  /* The approved muted grey reaches 4.68:1 on the white card surface but
-     only 4.33:1 on the page ground, so the inherited `text-ink-tertiary`
-     utility — which appears on both — is mapped to the secondary ink.
-     `--c-ink-muted` is still used directly, but only on `--c-surface`. */
-  --ink-tertiary: var(--c-ink-secondary);
-  --line: var(--c-border);
-  --line-strong: var(--c-border);
-  /* `StatusBadge` paints `text-success` on `bg-success-soft`; the approved
-     teal on its own tint is 3.47:1, so the success INK is the deeper
-     approved cyan (4.62:1 on the same tint). The teal itself is unchanged
-     and still fills the meters, where 3.39:1 clears the 3:1 non-text bar. */
-  --success: var(--c-cat-3);
-  --success-soft: var(--c-positive-light);
-  --warning: var(--c-caution);
-  --warning-soft: var(--c-caution-light);
-  /* The approved rose has no darker sibling in the palette, so rose text on
-     the rose tint caps at 3.94:1 and cannot reach AA. The error GROUND is
-     therefore the card surface (4.52:1) rather than the tint; hue survives
-     in the badge dot and ring, and the tint is still used for larger
-     non-text blocks via `--c-negative-light`. */
-  --error: var(--c-negative);
-  --error-soft: var(--c-surface);
-  --info: var(--c-accent);
-  --info-soft: var(--c-accent-light);
+     select or secondary button must clear WCAG 1.4.11's 3:1. */
+  --c-control-border: var(--control);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -199,16 +53,11 @@
    primitives they render) are shared with the interview/session surfaces
    and are frozen by the acceptance contract, yet they are mounted inside
    the Candidate Detail Overview and therefore inside `.candidate-scope`.
-   Editing them would breach scope on out-of-scope pages; leaving them
-   alone would put IK-cyan and stock-Tailwind greys next to the approved
-   palette.
 
-   So their palette utilities are re-pointed HERE, in the one file that is
-   allowed to name colours, and only inside `.candidate-scope`. The two
-   descendant classes outrank the single-class utility, so no `!important`
-   is needed and nothing outside the subtree is affected. Hover states use
-   a brightness filter rather than a new colour, so the literal set below
-   stays exactly the approved palette.
+   So their palette utilities are re-pointed HERE, and only inside
+   `.candidate-scope`. The two descendant classes outrank the single-class
+   utility, so no `!important` is needed and nothing outside the subtree is
+   affected.
 
    `candidate-scope-palette.test.ts` re-derives the utility list from those
    three files and fails if any utility they use is not covered here.
@@ -236,20 +85,20 @@
 .candidate-scope .text-white { color: var(--c-data-label-inside); }
 
 .candidate-scope .bg-accent-600 { background-color: var(--c-accent); }
-.candidate-scope .hover\:bg-accent-700:hover { background-color: var(--c-accent); filter: brightness(0.92); }
+.candidate-scope .hover\:bg-accent-700:hover { background-color: var(--c-ink-secondary); }
 .candidate-scope .text-accent-600 { color: var(--c-accent); }
-.candidate-scope .hover\:text-accent-700:hover { color: var(--c-accent); filter: brightness(0.92); }
+.candidate-scope .hover\:text-accent-700:hover { color: var(--c-ink-secondary); }
 .candidate-scope .focus-visible\:ring-accent-500:focus-visible { --tw-ring-color: var(--c-accent); }
 
 .candidate-scope .bg-red-50 { background-color: var(--c-negative-light); }
 .candidate-scope .bg-red-400,
 .candidate-scope .bg-red-500,
 .candidate-scope .bg-red-600 { background-color: var(--c-negative); }
-.candidate-scope .hover\:bg-red-700:hover { background-color: var(--c-negative); filter: brightness(0.92); }
+.candidate-scope .hover\:bg-red-700:hover { background-color: var(--c-negative); }
 .candidate-scope .text-red-600,
 .candidate-scope .text-red-700 { color: var(--c-negative); }
-.candidate-scope .border-red-200 { border-color: var(--c-negative-light); }
-.candidate-scope .ring-red-200 { --tw-ring-color: var(--c-negative-light); }
+.candidate-scope .border-red-200 { border-color: var(--c-negative); }
+.candidate-scope .ring-red-200 { --tw-ring-color: var(--c-negative); }
 .candidate-scope .focus-visible\:ring-red-500:focus-visible { --tw-ring-color: var(--c-negative); }
 
 /* The remaining `ui.tsx` variants reachable from the embedded components

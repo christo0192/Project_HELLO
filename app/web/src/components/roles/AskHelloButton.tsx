@@ -409,9 +409,8 @@ export function AskHelloButton({
           data-ask-hello=""
           // NO `opacity-60` HERE, and that is the whole point of this class
           // list. CSS opacity composites the entire subtree, so fading the
-          // button fades the LABEL with it: white 14px semibold on the
-          // gradient measures 7.0-8.3:1, but at .6 over a white page it
-          // collapses to 2.82-3.05:1, and 2.39-2.53:1 under the sheen. That is
+          // button fades the LABEL with it: at .6 over the page it collapses to
+          // about 2.8:1. That is
           // a WCAG AA failure (14px semibold is not "large text", so the bar
           // is 4.5:1) and it landed in the ONE state this whole feature exists
           // to make legible — a ten-minute wait.
@@ -420,11 +419,10 @@ export function AskHelloButton({
           // leaves the white label alone. There is no shortage of signal
           // either way: the label itself changes to "Asking Hello…", the glyph
           // changes, Cancel appears, and the live region narrates the phase.
-          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
             idle ? 'ask-hello--idle cursor-not-allowed' : ''
           }${running ? ' cursor-progress' : ''}`}
         >
-          <span aria-hidden="true" className="ask-hello__sheen" />
           <span aria-hidden="true" className="relative">
             {running ? '◐' : '✦'}
           </span>
@@ -435,7 +433,7 @@ export function AskHelloButton({
           <button
             type="button"
             onClick={cancel}
-            className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-ink-secondary underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info"
+            className="inline-flex min-h-11 items-center rounded-control px-3 text-label font-medium text-ink-secondary underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info"
           >
             Cancel
           </button>

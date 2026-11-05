@@ -14,8 +14,6 @@ import {
   PAGE_SIZES,
   PageHeader,
   Pagination,
-  RevealGroup,
-  RevealItem,
   SectionHeader,
   SegmentedControl,
   SlideOver,
@@ -406,11 +404,9 @@ export function RolesPage() {
 
       {roles && roles.length > 0 && (
         // ONE SURFACE, ROWS SPLIT BY HAIRLINES (design rule 9). This was a
-        // 3×2 wall of identical glass cards, each repeating the same pill,
+        // 3×2 wall of identical cards, each repeating the same pill,
         // chips and button pair, with the description cut mid-sentence. A
         // role is scanned, compared and acted on, which is a list's job.
-        <RevealGroup>
-          <RevealItem>
             <GlassPanel>
               <SectionHeader
                 id={ROLES_LIST_HEADING}
@@ -485,8 +481,6 @@ export function RolesPage() {
                 />
               )}
             </GlassPanel>
-          </RevealItem>
-        </RevealGroup>
       )}
     </div>
   );
@@ -1138,7 +1132,7 @@ function RoleForm({
                 <div className="glass-sunken space-y-3 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <span
-                      className="font-mono text-meta text-ink-tertiary"
+                      className="text-meta text-ink-tertiary"
                       // The id is still worth having when there is no topic —
                       // it is what an older role has — but it is a poor tag
                       // for a human, so the topic wins when one exists.
@@ -1186,13 +1180,12 @@ function RoleForm({
                         // pill fades the white label with it and drops it
                         // under 4.5:1, and the faded state here is exactly
                         // the one the operator is waiting on.
-                        className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+                        className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
                           rephrasingIdx !== null || !q.question.trim()
                             ? 'ask-hello--idle cursor-not-allowed'
                             : ''
                         }${rephrasingIdx === idx ? ' cursor-progress' : ''}`}
                       >
-                        <span aria-hidden="true" className="ask-hello__sheen" />
                         <span aria-hidden="true" className="relative">
                           {rephrasingIdx === idx ? '◐' : '✦'}
                         </span>

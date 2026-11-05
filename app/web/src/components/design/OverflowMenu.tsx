@@ -406,7 +406,7 @@ export function OverflowMenu({
         // The modal material — opaque, hairline, pop shadow — at a menu's
         // radius. Floating over glass, translucency would read as grey.
         'glass-modal z-50 flex w-max min-w-[13rem] max-w-[min(20rem,calc(100vw-1rem))] flex-col',
-        'overflow-y-auto overscroll-contain rounded-[14px] p-1.5 outline-none',
+        'overflow-y-auto overscroll-contain rounded-control p-1.5 outline-none',
         // Same short unfold as the combobox list (index.css), and the same
         // reduced-motion reset.
         'combobox-panel',
@@ -439,8 +439,8 @@ export function OverflowMenu({
                 }
               }}
               className={cx(
-                'flex min-h-10 flex-col justify-center rounded-[10px] px-2.5 py-2 text-left text-sm outline-none',
-                'transition-[background-color,box-shadow] duration-150 ease-soft',
+                'flex min-h-10 flex-col justify-center rounded-control px-2.5 py-2 text-left text-sm outline-none',
+                'transition-[background-color,box-shadow] duration-hover ease-soft',
                 '[@media(pointer:coarse)]:min-h-11',
                 item.disabled
                   ? 'cursor-not-allowed text-ink-tertiary'
@@ -496,7 +496,7 @@ export function OverflowMenu({
         className={buttonClass(
           'secondary',
           'md',
-          cx('gap-1.5 pr-3 aria-expanded:bg-white [@media(pointer:coarse)]:h-11', className),
+          cx('gap-1.5 pr-3 aria-expanded:bg-surface-secondary [@media(pointer:coarse)]:h-11', className),
         )}
       >
         {triggerText}
@@ -509,7 +509,7 @@ export function OverflowMenu({
           strokeLinejoin="round"
           aria-hidden="true"
           className={cx(
-            'h-4 w-4 text-ink-tertiary transition-transform duration-200 ease-soft',
+            'h-4 w-4 text-ink-tertiary transition-transform duration-150 ease-soft',
             open && 'rotate-180',
           )}
         >

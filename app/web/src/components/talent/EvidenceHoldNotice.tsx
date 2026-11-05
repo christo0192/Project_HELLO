@@ -32,7 +32,7 @@ export function EvidenceHoldNotice({ assessment, action }: EvidenceHoldNoticePro
       role="note"
       aria-label="Not enough interview evidence"
       data-evidence-hold=""
-      className="mb-4 rounded-[14px] border border-glass-ring px-3.5 py-3 text-sm"
+      className="mb-4 rounded-control border border-glass-ring px-3.5 py-3 text-sm"
     >
       <p className="font-medium text-warning-text">Not enough interview evidence to decide</p>
       <p className="mt-1 max-w-prose leading-6 text-ink-secondary">

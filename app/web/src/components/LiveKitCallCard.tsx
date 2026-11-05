@@ -70,7 +70,7 @@ export function LiveKitCallCard({
               id="candidate-invite-url"
               readOnly
               value={inviteUrl}
-              className={cx(controlClass, 'min-w-0 flex-1 font-mono text-xs')}
+              className={cx(controlClass, 'min-w-0 flex-1 text-xs')}
             />
             <Button onClick={copyInvite}>Copy invite</Button>
           </div>

@@ -54,10 +54,6 @@ const RANGE_OPTIONS = [
 
 type RangeDays = (typeof RANGE_OPTIONS)[number]['days'];
 
-/** Series colours: the approved success and error values, matching the dots. */
-const QUALIFIED_COLOUR = '#398AA2';
-const DISQUALIFIED_COLOUR = '#B45A72';
-
 /** YYYY-MM-DD `days` before today (UTC), matching the server's own helper. */
 function dayOffset(days: number): string {
   return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
@@ -383,7 +379,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
               </select>
             </label>
           )}
-          <div role="group" aria-label="Time range" className="glass-sunken inline-flex rounded-[12px] p-1">
+          <div role="group" aria-label="Time range" className="inline-flex gap-0.5 rounded-control border border-[var(--control)] bg-surface p-0.5">
             {RANGE_OPTIONS.map((opt) => (
               <button
                 key={opt.days}
@@ -393,11 +389,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 className={cx(
                   // 44px on a phone: this panel is glanced at on a phone more
                   // than anything else here. 36px once there is a pointer.
-                  'min-h-11 rounded-[9px] px-3 text-label font-medium transition-[background-color,color,box-shadow] duration-150 ease-out sm:min-h-9',
-                  'focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
+                  'min-h-11 rounded-evidence px-3 text-label font-medium transition-colors duration-hover ease-out sm:min-h-[30px]',
+                  'focus:outline-none focus-visible:ring-2 focus-visible:ring-inset',
                   rangeDays === opt.days
-                    ? 'bg-white text-ink shadow-pill'
-                    : 'text-ink-secondary hover:text-ink',
+                    ? 'bg-info text-surface focus-visible:ring-surface'
+                    : 'text-ink-secondary hover:bg-surface-secondary hover:text-ink focus-visible:ring-info',
                 )}
               >
                 {opt.label}
@@ -557,7 +553,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                   {
                     label: 'Bot disqualified',
                     value: count(t?.disqualified),
-                    tone: 'danger',
+                    tone: 'neutral',
                     context: 'Recommended: Reject',
                     loading,
                   },
@@ -638,7 +634,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
           </GlassPanel>
 
           <GlassPanel as="section" aria-labelledby="screening-trends-heading">
-            <h3 id="screening-trends-heading" className="text-[15px] font-semibold tracking-[-0.01em] text-ink">
+            <h3 id="screening-trends-heading" className="text-section text-ink">
               By day
             </h3>
             <p className="mt-0.5 text-label text-ink-tertiary">
@@ -663,8 +659,8 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 <LineChart
                   title="Screening outcomes"
                   series={[
-                    { name: 'Bot qualified', data: qualifiedSeries, color: QUALIFIED_COLOUR },
-                    { name: 'Bot disqualified', data: disqualifiedSeries, color: DISQUALIFIED_COLOUR },
+                    { name: 'Bot qualified', data: qualifiedSeries },
+                    { name: 'Bot disqualified', data: disqualifiedSeries },
                   ]}
                   unit="%"
                   isLoading={loading}
@@ -771,7 +767,7 @@ function MetricNotes({
       <summary
         className={cx(
           'flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-4 text-label font-medium text-ink sm:px-5',
-          'transition-colors duration-150 ease-out hover:bg-ink/[0.025] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--info)]',
+          'transition-colors duration-hover ease-out hover:bg-ink/[0.025] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--info)]',
           '[&::-webkit-details-marker]:hidden',
         )}
       >
@@ -784,7 +780,7 @@ function MetricNotes({
           strokeWidth={2}
           strokeLinecap="round"
           strokeLinejoin="round"
-          className="h-4 w-4 shrink-0 text-ink-tertiary transition-transform duration-200 ease-out group-open:rotate-180"
+          className="h-4 w-4 shrink-0 text-ink-tertiary transition-transform duration-150 ease-out group-open:rotate-180"
         >
           <path d="m6 9 6 6 6-6" />
         </svg>

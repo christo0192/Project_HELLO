@@ -12,7 +12,6 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { ThemeProvider } from '../../lib/theme';
 import { ScreeningKpis } from './ScreeningKpis';
 import { buildRateSeries } from './rates';
 import {
@@ -115,10 +114,7 @@ async function cardText(label: string): Promise<string> {
 
 function renderKpis() {
   return render(
-    <ThemeProvider>
-      <ScreeningKpis />
-    </ThemeProvider>,
-  );
+      <ScreeningKpis />,  );
 }
 
 describe('ScreeningKpis', () => {
@@ -506,15 +502,12 @@ describe('ScreeningKpis', () => {
 
   it('hides the role filter when no role is mapped (no lonely "All roles")', async () => {
     render(
-      <ThemeProvider>
-        <ScreeningKpis
+      <ScreeningKpis
           roles={[
             { id: 'r1', title: 'Sales Program Advisor', has_ashby_mapping: false },
             { id: 'r2', title: 'Customer Support', has_ashby_mapping: false },
           ] as any[]}
-        />
-      </ThemeProvider>,
-    );
+        />,    );
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalled());
     // The range control renders in the same row, so the row is there.
     await screen.findByRole('button', { name: '7 days' });
@@ -544,10 +537,7 @@ describe('ScreeningKpis', () => {
       { id: 'r2', title: 'Customer Support', has_ashby_mapping: true },
     ] as any[];
     const view = render(
-      <ThemeProvider>
-        <ScreeningKpis roles={roles} />
-      </ThemeProvider>,
-    );
+      <ScreeningKpis roles={roles} />,    );
     const select = (await screen.findByRole('combobox', { name: 'Filter by role' })) as HTMLSelectElement;
     await screen.findByRole('option', { name: 'Sales Program Advisor' });
     fireEvent.change(select, { target: { value: 'r1' } });
@@ -559,10 +549,7 @@ describe('ScreeningKpis', () => {
     // r1 loses its mapping (the caller's roles changed): the filter must not
     // keep filtering on a role it can no longer show.
     view.rerender(
-      <ThemeProvider>
-        <ScreeningKpis roles={[{ ...roles[0], has_ashby_mapping: false }, roles[1]]} />
-      </ThemeProvider>,
-    );
+      <ScreeningKpis roles={[{ ...roles[0], has_ashby_mapping: false }, roles[1]]} />,    );
     await waitFor(() => expect(select.value).toBe(''));
     await waitFor(() => expect(getScreeningFunnel.mock.calls.length).toBeGreaterThan(before));
     expect(getScreeningFunnel.mock.calls.at(-1)![0].role_id).toBeUndefined();

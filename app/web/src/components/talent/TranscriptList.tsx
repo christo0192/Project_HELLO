@@ -67,21 +67,23 @@ export function TranscriptList({
               key={index}
               className={cx('flex flex-col', isBot ? 'items-start' : 'items-end')}
             >
-              {/* Speaker label in sentence case at the meta step. It was an
-                  uppercase, letter-spaced eyebrow, which the design system
-                  bans; the words are what identify the speaker. */}
-              <span className="mb-0.5 px-1 text-xs font-medium text-ink-tertiary">
+              {/* Speaker label in sentence case at the meta step: the words identify
+                  the speaker, and the candidate's label takes the voice ink. */}
+              <span
+                className={cx(
+                  'mb-0.5 px-1 text-xs',
+                  isBot ? 'font-medium text-ink-tertiary' : 'font-semibold text-voice',
+                )}
+              >
                 {presented.label}
                 {line.is_gate === true ? ' · consent' : ''}
               </span>
               <div
                 className={cx(
-                  'max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed sm:max-w-[75%]',
-                  // The accent fill for the candidate (white on #4e6ba6 is
-                  // 5.6:1), not the retired IK brand scale.
-                  isBot
-                    ? 'rounded-tl-sm bg-surface-tertiary text-ink'
-                    : 'rounded-tr-sm bg-info text-white',
+                  'max-w-[85%] whitespace-pre-wrap rounded-control px-3.5 py-2 text-sm leading-relaxed sm:max-w-[75%]',
+                  // Paper for the candidate's words, a shaded field for the
+                  // interviewer's: an ink fill means a primary action here.
+                  isBot ? 'bg-surface-secondary text-ink' : 'border border-line-strong bg-surface text-ink',
                 )}
               >
                 {presented.text}

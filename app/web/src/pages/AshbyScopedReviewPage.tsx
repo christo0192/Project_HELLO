@@ -177,7 +177,7 @@ function ScopedOverviewTab({
   applicationLinkId: string;
 }) {
   return (
-    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3 lg:items-start">
+    <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3 lg:items-start">
       <CandidateProfileCard candidate={candidate} />
       <div className="space-y-4 sm:space-y-6 lg:col-span-2">
         {/* The SAME read-only card as the normal Overview, read through the
@@ -218,10 +218,10 @@ function ScopedNotesCard({ applicationLinkId }: { applicationLinkId: string }) {
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         Notes
       </h2>
-      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+      <p className="mb-3 mt-0.5 text-label text-ink-tertiary">
         Recruiter notes, appended in order.
       </p>
       <SurfaceCard level="sunken" className="p-3">

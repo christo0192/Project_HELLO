@@ -14,9 +14,8 @@ import type { ReactNode } from 'react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { MemoryRouter } from 'react-router-dom';
-import { ThemeProvider } from '../lib/theme';
 import { missionApi, apiFns } from '../components/mission-control/__tests__/apiMock';
-import { chartStubs, forceDarkMode, forceLightMode } from '../components/mission-control/__tests__/renderHelpers';
+import { chartStubs } from '../components/mission-control/__tests__/renderHelpers';
 import { MissionControlPage } from './MissionControlPage';
 
 vi.mock('../api', () => ({
@@ -70,7 +69,7 @@ const PAUSED_HEALTH = {
 function wrap(ui: ReactNode) {
   return (
     <MemoryRouter initialEntries={['/mission-control']}>
-      <ThemeProvider>{ui}</ThemeProvider>
+      {ui}
     </MemoryRouter>
   );
 }
@@ -83,7 +82,6 @@ describe('MissionControlPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chartStubs();
-    forceLightMode();
     apiFns.getMe.mockResolvedValue(ADMIN_ME);
     apiFns.status.mockResolvedValue(OK_STATUS);
     apiFns.listAdminSessions.mockResolvedValue({ sessions: [] });
@@ -246,16 +244,7 @@ describe('MissionControlPage', () => {
     });
   });
 
-  it('renders under dark mode + reduced motion with no axe violations', async () => {
-    forceDarkMode();
-    const { container } = renderPage();
-    await screen.findByRole('tablist', { name: 'Mission Control sections' });
-    await screen.findByRole('button', { name: 'Halt all calling' });
-    expect(screen.getByRole('tab', { name: 'Overview' })).toBeInTheDocument();
-    await expect(container).toHaveNoViolations();
-  });
-
-  it('has no axe violations in light mode', async () => {
+  it('has no axe violations', async () => {
     const { container } = renderPage();
     await screen.findByRole('tablist', { name: 'Mission Control sections' });
     await screen.findByRole('button', { name: 'Halt all calling' });
@@ -289,7 +278,6 @@ describe('Mission Control header', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chartStubs();
-    forceLightMode();
     authState.role = 'admin';
     apiFns.getMe.mockResolvedValue(ADMIN_ME);
     apiFns.status.mockResolvedValue(OK_STATUS);
@@ -304,9 +292,7 @@ describe('Mission Control header', () => {
   const renderAdmin = () =>
     render(
       <MemoryRouter>
-        <ThemeProvider>
           <MissionControlPage />
-        </ThemeProvider>
       </MemoryRouter>,
     );
 

@@ -22,7 +22,7 @@ export interface LineChartDatum {
 export interface LineChartSeries {
   name: string;
   data: LineChartDatum[];
-  /** An approved palette value; defaults to the categorical cycle. */
+  /** A token value from `chartPalette`; defaults to the categorical cycle. */
   color?: string;
 }
 
@@ -76,6 +76,9 @@ export function unionLabels(series: LineChartSeries[]): string[] {
   return out;
 }
 
+/** Marker per series, in cycle order. */
+const MARKERS = ['circle', 'rect', 'triangle', 'diamond'] as const;
+
 /**
  * The ECharts line series for `series`, on the union of their labels.
  *
@@ -86,10 +89,9 @@ export function unionLabels(series: LineChartSeries[]): string[] {
  */
 export function buildLineSeries(
   series: LineChartSeries[],
-  { discrete = false, colors }: { discrete?: boolean; colors: string[] },
+  { discrete = false, colors, surface = 'transparent' }: { discrete?: boolean; colors: string[]; surface?: string },
 ): { labels: string[]; lines: LineSeriesOption[] } {
   const labels = unionLabels(series);
-  const multi = series.length > 1;
   const dense = labels.length > 45;
   const lines: LineSeriesOption[] = series.map((s, index) => {
     const byLabel = new Map(s.data.map((d) => [d.label, d.value]));
@@ -101,7 +103,8 @@ export function buildLineSeries(
       data: labels.map((label) => byLabel.get(label) ?? null),
       smooth: false,
       connectNulls: false,
-      symbol: 'circle',
+      // The cycle is ink steps, so a shape tells two lines apart without hue.
+      symbol: MARKERS[index % MARKERS.length],
       // At 5px plus a 1.5px border markers merge into a solid band once
       // points are closer than ~8px, which a 90-day half-width chart
       // reaches well before its end.
@@ -110,24 +113,7 @@ export function buildLineSeries(
       // consecutive periods; `discrete` says they may not be.
       showSymbol: discrete || labels.length <= 20,
       lineStyle: { width: 2, color },
-      itemStyle: { color, borderColor: '#ffffff', borderWidth: 1.5 },
-      // A wash under a single line reads as depth; under two it muddies
-      // both, so multi-series charts draw lines only.
-      areaStyle: multi
-        ? undefined
-        : {
-            color: {
-              type: 'linear',
-              x: 0,
-              y: 0,
-              x2: 0,
-              y2: 1,
-              colorStops: [
-                { offset: 0, color: 'rgba(78, 107, 166, 0.2)' },
-                { offset: 1, color: 'rgba(78, 107, 166, 0)' },
-              ],
-            },
-          },
+      itemStyle: { color, borderColor: surface, borderWidth: 1.5 },
       emphasis: { focus: 'series' },
     };
   });

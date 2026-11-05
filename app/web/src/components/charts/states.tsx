@@ -12,7 +12,7 @@ export function ChartError({ message, onRetry }: ChartErrorProps) {
   return (
     <div
       role="alert"
-      className="flex h-full min-h-40 flex-col items-center justify-center gap-3 rounded-xl border border-error/30 bg-error-soft px-4 text-center"
+      className="flex h-full min-h-40 flex-col items-center justify-center gap-3 rounded-xl border border-error bg-error-soft px-4 text-center"
     >
       <p className="max-w-md text-sm text-error">{message}</p>
       {onRetry && (

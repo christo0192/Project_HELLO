@@ -292,7 +292,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
         <h2
           id={headingId}
-          className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]"
+          className="text-section text-[var(--c-ink)]"
         >
           Pipeline by role
         </h2>
@@ -305,7 +305,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
             aria-expanded={open}
             aria-controls={bodyId}
             onClick={() => setOpen((o) => !o)}
-            className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+            className="inline-flex min-h-11 items-center rounded-control px-3 text-label font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
           >
             {open ? 'Hide' : `Show ${populated.length} ${populated.length === 1 ? 'role' : 'roles'}`}
           </button>
@@ -333,7 +333,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
           target with no controller — inert markup no one can reach. */}
       {populated.length > 0 && (
       <div id={bodyId} hidden={!open}>
-      <p className="mt-1 text-[13px] leading-5 text-[var(--c-ink-secondary)]">
+      <p className="mt-1 text-label leading-5 text-[var(--c-ink-secondary)]">
         Each bar is one role&rsquo;s candidates, split by how far they got &mdash; the parts add up
         to the role&rsquo;s total, so nobody is counted twice. The line under each bar reads the
         other way: how many REACHED each stage. &ldquo;Selected&rdquo; is not tracked yet, because
@@ -350,7 +350,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
               <h3 className="text-sm font-medium text-[var(--c-ink)]">
                 {agentWithRoleLabel(role)}
               </h3>
-              <span className="text-[13px] tabular-nums text-[var(--c-ink-secondary)]">
+              <span className="text-label tabular-nums text-[var(--c-ink-secondary)]">
                 {totals.candidates_total.toLocaleString()} in pipeline
               </span>
             </div>

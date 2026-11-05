@@ -348,7 +348,7 @@ export function SessionDetailPage() {
                 <DetailRow label="Candidate words">{words.toLocaleString('en-IN')}</DetailRow>
               )}
               <DetailRow label="Reference">
-                <span title={session.id} className="font-mono text-label text-ink-secondary">
+                <span title={session.id} className="text-label text-ink-secondary">
                   {shortId(session.id)}
                 </span>
               </DetailRow>

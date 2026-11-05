@@ -24,12 +24,6 @@ export default defineConfig({
           ) {
             return 'charts-vendor';
           }
-          if (
-            id.includes('node_modules/motion') ||
-            id.includes('node_modules/framer-motion')
-          ) {
-            return 'motion-vendor';
-          }
         },
       },
     },

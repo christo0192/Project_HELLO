@@ -261,7 +261,7 @@ export function PhoneAttemptHistory({
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         {title}
       </h2>
       <p className="mb-3 mt-0.5 text-label text-ink-tertiary">{description}</p>
@@ -477,7 +477,7 @@ export function CandidateProfileCard({
   const phoneParsing = candidate.intake_type === 'phone_parsing';
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         Profile
       </h2>
       <p className="mb-4 mt-0.5 text-label text-ink-tertiary">
@@ -620,7 +620,7 @@ export function SessionsSummary({
   const headingId = useId();
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
-      <h2 id={headingId} className="mb-3 text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="mb-3 text-section text-ink">
         Screening sessions
       </h2>
       {sessions.length === 0 ? (

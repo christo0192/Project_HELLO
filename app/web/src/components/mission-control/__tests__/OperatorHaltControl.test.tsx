@@ -204,7 +204,7 @@ describe('reading the switch', () => {
     render(<OperatorHaltControl />);
     const button = await screen.findByRole('button', { name: 'Halt all calling' });
 
-    expect(button).toHaveClass('bg-error', 'text-white');
+    expect(button).toHaveClass('bg-error', 'text-surface');
     expect(button).not.toHaveClass(GO_FILL);
     expect(button).toHaveAttribute('aria-haspopup', 'dialog');
     expect(screen.getByText('Calling: on')).toBeInTheDocument();

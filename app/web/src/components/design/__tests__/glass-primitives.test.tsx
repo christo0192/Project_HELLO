@@ -1,8 +1,8 @@
 /**
- * Glass design primitives: GlassPanel, SectionHeader, Button, Switch,
+ * Design primitives: GlassPanel, SectionHeader, Button, Switch,
  * Field/TextField/SelectField/TextArea, SegmentedControl,
  * Pagination/usePagination, ScrollArea, InlineNotice/EmptyPanel/ErrorPanel/
- * LoadingPanel, Reveal wrappers and StatusBadge — semantics, keyboard,
+ * LoadingPanel and StatusBadge — semantics, keyboard,
  * state and axe.
  */
 import { createRef, useMemo, useState } from 'react';
@@ -29,9 +29,6 @@ import {
   ErrorPanel,
   RetryButton,
   LoadingPanel,
-  RevealGroup,
-  RevealItem,
-  PageTransition,
   StatusBadge,
 } from '..';
 import type { PageSize, SegmentedOption } from '..';
@@ -50,7 +47,6 @@ describe('GlassPanel', () => {
     expect(panel.tagName).toBe('DIV');
     expect(panel).toHaveClass('glass');
     expect(panel).toHaveClass('p-5');
-    expect(panel).not.toHaveClass('glass-interactive');
     expect(panel).toHaveTextContent('body');
   });
 
@@ -74,15 +70,14 @@ describe('GlassPanel', () => {
     expect(panel).toHaveClass('p-6');
   });
 
-  it('renders as another element, adds the interactive lift and forwards props', () => {
+  it('renders as another element and forwards props', () => {
     render(
-      <GlassPanel as="section" interactive aria-label="Service state" className="mt-2">
+      <GlassPanel as="section" aria-label="Service state" className="mt-2">
         contents
       </GlassPanel>,
     );
     const panel = screen.getByRole('region', { name: 'Service state' });
     expect(panel.tagName).toBe('SECTION');
-    expect(panel).toHaveClass('glass-interactive');
     expect(panel).toHaveClass('mt-2');
   });
 });
@@ -121,7 +116,8 @@ describe('buttonClass', () => {
   it('defaults to the secondary variant at medium size', () => {
     const cls = buttonClass();
     expect(cls).toContain('rounded-control');
-    expect(cls).toContain('bg-white/70');
+    expect(cls).toContain('bg-surface');
+    expect(cls).toContain('border-[var(--control)]');
     expect(cls).toContain('h-9');
   });
 
@@ -432,8 +428,8 @@ describe('Field / TextField / SelectField / TextArea', () => {
         </Field>
       </>,
     );
-    expect(screen.getByLabelText('Small text')).toHaveClass('h-8');
-    expect(screen.getByLabelText('Small select')).toHaveClass('h-8');
+    expect(screen.getByLabelText('Small text')).toHaveClass('h-7');
+    expect(screen.getByLabelText('Small select')).toHaveClass('h-7');
   });
 });
 
@@ -518,7 +514,7 @@ describe('SegmentedControl', () => {
     );
     const group = screen.getByRole('group', { name: 'Size probe' });
     expect(group).toHaveClass('w-full');
-    expect(within(group).getByRole('button', { name: 'A' })).toHaveClass('h-7');
+    expect(within(group).getByRole('button', { name: 'A' })).toHaveClass('h-6');
   });
 });
 
@@ -836,48 +832,6 @@ describe('LoadingPanel', () => {
   });
 });
 
-/* ── Reveal wrappers ─────────────────────────────────────────────── */
-
-describe('Reveal wrappers', () => {
-  function Tree() {
-    return (
-      <PageTransition className="page">
-        <RevealGroup as="ul" className="group">
-          <RevealItem as="li">first</RevealItem>
-          <RevealItem as="li">second</RevealItem>
-        </RevealGroup>
-      </PageTransition>
-    );
-  }
-
-  it('renders children with the requested elements', () => {
-    render(<Tree />);
-    const list = screen.getByRole('list');
-    expect(list).toHaveClass('group');
-    expect(within(list).getAllByRole('listitem')).toHaveLength(2);
-    expect(screen.getByText('first')).toBeInTheDocument();
-    expect(screen.getByText('second')).toBeInTheDocument();
-  });
-
-  it('still renders every child under reduced motion', () => {
-    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
-    render(<Tree />);
-    expect(within(screen.getByRole('list')).getAllByRole('listitem')).toHaveLength(2);
-    expect(screen.getByText('second')).toBeInTheDocument();
-  });
-
-  it('defaults RevealGroup/RevealItem to div wrappers', () => {
-    render(
-      <RevealGroup className="grid">
-        <RevealItem className="cell">cell</RevealItem>
-      </RevealGroup>,
-    );
-    const cell = screen.getByText('cell');
-    expect(cell.tagName).toBe('DIV');
-    expect(cell.parentElement).toHaveClass('grid');
-  });
-});
-
 /* ── StatusBadge ─────────────────────────────────────────────────── */
 
 describe('StatusBadge', () => {
@@ -960,10 +914,10 @@ function Composite() {
         <LoadingPanel compact />
         <GlassPanel level="sunken" padding="none">
           <ScrollArea maxHeight="12rem" label="Recent activity">
-            <RevealGroup as="ul">
-              <RevealItem as="li">Ada advanced</RevealItem>
-              <RevealItem as="li">Grace scheduled</RevealItem>
-            </RevealGroup>
+            <ul>
+              <li>Ada advanced</li>
+              <li>Grace scheduled</li>
+            </ul>
           </ScrollArea>
         </GlassPanel>
         <EmptyPanel title="No archived candidates" hint="They will appear here." compact />

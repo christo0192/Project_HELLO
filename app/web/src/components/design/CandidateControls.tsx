@@ -162,7 +162,7 @@ export function CandidateSelect({
   ...rest
 }: SelectHTMLAttributes<HTMLSelectElement>) {
   return (
-    <select className={cx(fieldBase, 'pr-8', className)} {...rest}>
+    <select className={cx(fieldBase, 'control-select pr-8', className)} {...rest}>
       {children}
     </select>
   );

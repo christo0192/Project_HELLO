@@ -20,10 +20,10 @@ export function NotFoundPage() {
             <Brand />
           </div>
           <p className="mt-6 text-stat text-ink-tertiary">404</p>
-          <h1 className="mt-1 text-[15px] font-semibold tracking-[-0.01em] text-ink">
+          <h1 className="mt-1 text-section text-ink">
             Page not found
           </h1>
-          <p className="mt-1.5 text-[13px] leading-5 text-ink-tertiary">
+          <p className="mt-1.5 text-label leading-5 text-ink-tertiary">
             The page you're looking for doesn't exist or has moved.
           </p>
           <div className="mt-6 flex flex-col gap-2">

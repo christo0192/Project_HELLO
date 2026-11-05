@@ -57,26 +57,14 @@ export const SECTION_WEIGHTS = {
 
 const RECOMMENDATION_LABEL: Readonly<Record<Recommendation, string>> = RECOMMENDATION_LABELS;
 
-const RECOMMENDATION_TONE: Record<Recommendation, 'positive' | 'caution' | 'negative'> = {
-  advance: 'positive',
-  hold: 'caution',
-  reject: 'negative',
+/** A verdict stays in ink: the Tag carries the word, not a good-or-bad hue. */
+const RECOMMENDATION_TONE: Record<Recommendation, 'neutral'> = {
+  advance: 'neutral',
+  hold: 'neutral',
+  reject: 'neutral',
 };
-
-/** Same thresholds the legacy card used for its score colour. */
-function overallTone(score: number): 'positive' | 'caution' | 'negative' {
-  if (score >= 75) return 'positive';
-  if (score >= 50) return 'caution';
-  return 'negative';
-}
 
 const OVERALL_THRESHOLDS = { fair: 0.5, strong: 0.75 };
-
-const OVERALL_FILL: Record<'positive' | 'caution' | 'negative', string> = {
-  positive: 'var(--c-positive)',
-  caution: 'var(--c-caution)',
-  negative: 'var(--c-negative)',
-};
 
 const SIGNAL_TONE: Record<string, 'positive' | 'caution' | 'negative'> = {
   none: 'positive',
@@ -95,7 +83,7 @@ export type HeadingLevel = 2 | 3 | 4;
 export type ScorecardNarrative = 'inline' | 'none';
 
 const CARD_TITLE =
-  'text-[15px] font-semibold tracking-tight text-[var(--c-ink)]';
+  'text-section text-[var(--c-ink)]';
 
 function Heading({
   level,
@@ -166,7 +154,7 @@ function Group({
         {weight && (
           <span className="text-xs text-[var(--c-ink-secondary)]">
             Weight{' '}
-            <span className="font-mono tabular-nums text-[var(--c-ink-secondary)]">
+            <span className="tabular-nums text-[var(--c-ink-secondary)]">
               {weight}
             </span>
           </span>
@@ -281,7 +269,7 @@ function WeightItem({ label, weight }: { label: string; weight: string }) {
   return (
     <div className="flex items-center gap-1.5">
       <dt className="text-[var(--c-ink-secondary)]">{label}</dt>
-      <dd className="font-mono tabular-nums text-[var(--c-ink)]">{weight}</dd>
+      <dd className="tabular-nums text-[var(--c-ink)]">{weight}</dd>
     </div>
   );
 }
@@ -341,10 +329,7 @@ export function CandidateScorecard({
       <SurfaceCard as="section" label="Overall assessment" className="p-4 sm:p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-baseline gap-2">
-            <span
-              className="font-mono text-[2.25rem] font-bold leading-none tabular-nums"
-              style={{ color: OVERALL_FILL[overallTone(overall_score)] }}
-            >
+            <span className="text-stat tabular-nums text-[var(--c-ink)]">
               {roundedOverall}
             </span>
             <span className="text-sm text-[var(--c-ink-secondary)]">/ 100</span>
@@ -558,7 +543,7 @@ export function CandidateScorecardRoleFit({
         {!supplementary && (
           <span className="text-xs text-[var(--c-ink-secondary)]">
             Weight{' '}
-            <span className="font-mono tabular-nums text-[var(--c-ink-secondary)]">
+            <span className="tabular-nums text-[var(--c-ink-secondary)]">
               {SECTION_WEIGHTS.role_fit}
             </span>
           </span>
@@ -646,7 +631,7 @@ export function CandidateScorecardNarrative({
           >
             Resume conflicts
             <Tag tone="caution" srPrefix="Count:">
-              <span className="font-mono tabular-nums">{conflicts.length}</span>
+              <span className="tabular-nums">{conflicts.length}</span>
             </Tag>
           </Heading>
           <ul className="space-y-3">

@@ -24,8 +24,6 @@ import {
   InlineNotice,
   LoadingPanel,
   Pagination,
-  RevealGroup,
-  RevealItem,
   SectionHeader,
   SelectField,
   StatusBadge,
@@ -157,7 +155,7 @@ export function SessionsSection() {
         level={2}
         title="Sessions"
         meta={
-          <span className="text-[13px] tabular-nums text-ink-tertiary">
+          <span className="text-label tabular-nums text-ink-tertiary">
             {truncated ? `The ${sessions.length} most recently updated` : `${sessions.length} total`} · {terminalCount} terminal
           </span>
         }
@@ -176,7 +174,7 @@ export function SessionsSection() {
       )}
 
       <div className="flex flex-wrap items-center gap-2.5">
-        <label htmlFor="session-filter" className="text-[13px] font-medium text-ink-secondary">
+        <label htmlFor="session-filter" className="text-label font-medium text-ink-secondary">
           Status filter
         </label>
         <div className="w-56">
@@ -196,8 +194,8 @@ export function SessionsSection() {
         </div>
       </div>
 
-      <RevealGroup className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
-        <RevealItem className="min-w-0">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+        <div className="min-w-0">
           {sessions.length === 0 ? (
             <EmptyPanel
               title="No sessions found"
@@ -240,7 +238,7 @@ export function SessionsSection() {
                           className="h-4 w-4 cursor-pointer accent-info"
                         />
                       </Td>
-                      <Td className="whitespace-nowrap font-mono text-xs text-ink-secondary">
+                      <Td className="whitespace-nowrap text-xs text-ink-secondary">
                         {shortId(session.id)}
                       </Td>
                       <Td>
@@ -248,7 +246,7 @@ export function SessionsSection() {
                           {sessionStatusLabel(session.status)}
                         </StatusBadge>
                       </Td>
-                      <Td className="whitespace-nowrap font-mono text-xs text-ink-secondary">
+                      <Td className="whitespace-nowrap text-xs text-ink-secondary">
                         {shortId(session.candidate_id)}
                       </Td>
                       <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
@@ -273,9 +271,9 @@ export function SessionsSection() {
               )}
             </>
           )}
-        </RevealItem>
+        </div>
 
-        <RevealItem>
+        <div>
           <GlassPanel className="lg:sticky lg:top-20">
             <SectionHeader
               level={3}
@@ -289,7 +287,7 @@ export function SessionsSection() {
               <div className="mt-4 space-y-3.5">
                 {selected && (
                   <div className="glass-sunken flex flex-wrap items-center justify-between gap-2 px-3 py-2.5">
-                    <span className="font-mono text-xs text-ink-secondary">
+                    <span className="text-xs text-ink-secondary">
                       {shortId(selected.id)}
                     </span>
                     <StatusBadge tone={sessionStatusTone(selected.status)}>
@@ -301,7 +299,7 @@ export function SessionsSection() {
                 <div className="flex flex-col gap-1.5">
                   <label
                     htmlFor="override-session"
-                    className="text-[13px] font-medium text-ink-secondary"
+                    className="text-label font-medium text-ink-secondary"
                   >
                     Session
                   </label>
@@ -325,7 +323,7 @@ export function SessionsSection() {
                 <div className="flex flex-col gap-1.5">
                   <label
                     htmlFor="override-target"
-                    className="text-[13px] font-medium text-ink-secondary"
+                    className="text-label font-medium text-ink-secondary"
                   >
                     Target status
                   </label>
@@ -350,7 +348,7 @@ export function SessionsSection() {
                 <div className="flex flex-col gap-1.5">
                   <label
                     htmlFor="override-reason"
-                    className="text-[13px] font-medium text-ink-secondary"
+                    className="text-label font-medium text-ink-secondary"
                   >
                     Reason (required)
                   </label>
@@ -387,8 +385,8 @@ export function SessionsSection() {
               </div>
             )}
           </GlassPanel>
-        </RevealItem>
-      </RevealGroup>
+        </div>
+      </div>
     </div>
   );
 }

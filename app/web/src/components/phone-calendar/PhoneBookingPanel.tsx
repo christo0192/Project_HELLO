@@ -87,7 +87,7 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
             <p
               id={candidateHintId}
               role="status"
-              className="mt-1.5 rounded-[14px] bg-error-soft px-3.5 py-2.5 text-sm text-ink"
+              className="mt-1.5 rounded-control bg-error-soft px-3.5 py-2.5 text-sm text-ink"
             >
               Candidate list unavailable. Close and reopen to retry.
             </p>

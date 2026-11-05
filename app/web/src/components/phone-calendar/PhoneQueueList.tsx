@@ -25,7 +25,7 @@
  */
 
 import type { PhoneCalendarAppointment } from '../../types';
-import { GlassPanel, RevealGroup, RevealItem, ScrollArea } from '../design';
+import { GlassPanel, ScrollArea } from '../design';
 import { formatIstLongDayLabel, type IstDate } from '../../lib/ist-datetime';
 import { PhoneAppointmentButton } from './PhoneAppointmentButton';
 import { groupByIstDay } from './phoneGrid';
@@ -63,7 +63,7 @@ export function PhoneQueueList({
                   appointments scroll. The backdrop is opaque enough that the
                   rows passing underneath never show through the label.
                 */}
-                <h3 className="sticky top-0 z-10 mb-1 flex flex-wrap items-baseline gap-x-2 rounded-[10px] bg-white/85 px-3 py-1.5 text-label font-semibold text-ink backdrop-blur-sm">
+                <h3 className="sticky top-0 z-10 mb-1 flex flex-wrap items-baseline gap-x-2 rounded-control bg-surface px-3 py-1.5 text-label font-semibold text-ink">
                   {heading}
                   {group.date === today && (
                     <span className="text-meta font-medium text-info">Today</span>
@@ -74,9 +74,9 @@ export function PhoneQueueList({
                       : `${group.items.length} appointments`}
                   </span>
                 </h3>
-                <RevealGroup as="ul" className="flex flex-col divide-y divide-[var(--glass-ring)]">
+                <ul className="flex flex-col divide-y divide-[var(--glass-ring)]">
                   {group.items.map((appt) => (
-                    <RevealItem as="li" key={appt.id} className="py-1">
+                    <li key={appt.id} className="py-1">
                       <PhoneAppointmentButton
                         appointment={appt}
                         selected={appt.id === selectedId}
@@ -84,9 +84,9 @@ export function PhoneQueueList({
                         showDate={group.date === null}
                         layout="row"
                       />
-                    </RevealItem>
+                    </li>
                   ))}
-                </RevealGroup>
+                </ul>
               </section>
             );
           })}

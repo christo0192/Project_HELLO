@@ -3,13 +3,13 @@
  * Covers: KPIs derived from real data, maintenance state, charts with
  * sr-only data tables, the not-available panel (no fabricated health/SLO/
  * deployment/queue/cost claims), no emails on this surface, per-source
- * errors with retry, dark + reduced-motion render, axe.
+ * errors with retry, axe.
  */
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { missionApi, apiFns } from './apiMock';
 import { OverviewSection } from '../OverviewSection';
-import { wrapTheme, chartStubs, forceDarkMode, forceLightMode } from './renderHelpers';
+import { chartStubs } from './renderHelpers';
 
 vi.mock('../../../api', () => ({
   api: missionApi.api,
@@ -50,7 +50,7 @@ const AUDIT = [
 ];
 
 function renderOverview() {
-  return render(wrapTheme(<OverviewSection />));
+  return render(<OverviewSection />);
 }
 
 /**
@@ -69,7 +69,6 @@ describe('OverviewSection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chartStubs();
-    forceLightMode();
     apiFns.status.mockResolvedValue(STATUS);
     apiFns.listAdminSessions.mockResolvedValue({ sessions: SESSIONS });
     apiFns.listAdminAllowlist.mockResolvedValue({ entries: ENTRIES });
@@ -261,15 +260,7 @@ describe('OverviewSection', () => {
     });
   });
 
-  it('renders under dark mode + reduced motion', async () => {
-    forceDarkMode();
-    const { container } = renderOverview();
-    await screen.findByText('Service state');
-    expect(screen.getByText('Operational')).toBeInTheDocument();
-    await expect(container).toHaveNoViolations();
-  });
-
-  it('has no axe violations in light mode', async () => {
+  it('has no axe violations', async () => {
     const { container } = renderOverview();
     await screen.findByText('Service state');
     await expect(container).toHaveNoViolations();

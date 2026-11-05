@@ -22,12 +22,12 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 const buttonStyles: Record<ButtonVariant, string> = {
   primary:
-    "bg-accent-600 text-white hover:bg-accent-700 focus-visible:ring-accent-500 shadow-sm",
+    "bg-accent-600 text-white hover:bg-accent-700 focus-visible:ring-accent-500",
   secondary:
-    "bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 focus-visible:ring-accent-500",
+    "bg-surface text-gray-700 border border-gray-300 hover:bg-gray-50 focus-visible:ring-accent-500",
   ghost: "text-gray-600 hover:bg-gray-100 focus-visible:ring-accent-500",
   danger:
-    "bg-red-600 text-white hover:bg-red-700 focus-visible:ring-red-500 shadow-sm",
+    "bg-red-600 text-white hover:bg-red-700 focus-visible:ring-red-500",
 };
 
 export function Button({
@@ -94,7 +94,7 @@ export function Card({
   return (
     <div
       className={cx(
-        "rounded-xl border border-gray-200 bg-white shadow-card",
+        "rounded-xl border border-gray-200 bg-surface",
         className,
       )}
       {...rest}
@@ -124,7 +124,7 @@ export function Label({
 }
 
 const fieldBase =
-  "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500 disabled:bg-gray-50";
+  "w-full rounded-lg border border-gray-300 bg-surface px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500 disabled:bg-gray-50";
 
 export function Input({
   className,

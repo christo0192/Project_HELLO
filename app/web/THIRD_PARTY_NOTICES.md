@@ -4,14 +4,6 @@ This document lists the third-party software and adapted open-source
 patterns used by the HELLO web application, together with the licenses
 that govern their use.
 
-## Motion — MIT License
-
-Motion for React (package `motion`, v12) is used for page/list/number
-transitions, chart reveals and reduced-motion gating.
-
-- Project: https://motion.dev
-- License: MIT — Copyright (c) 2024 Motion B.V. (Framer)
-
 ## Apache ECharts — Apache License 2.0
 
 ECharts (package `echarts`, v6) is used for dashboard visualizations via a
@@ -30,21 +22,15 @@ used by `src/components/charts/EChart.tsx`.
 
 ## bklit-ui — MIT License (patterns adapted)
 
-Small chart interaction/entrance patterns were adapted from the MIT-covered
+A small chart interaction pattern was adapted from the MIT-covered
 `packages/ui/src/charts/` directory of bklit-ui
 (https://github.com/bklit/bklit-ui). Adapted files and the patterns they
 borrow:
 
 - `src/components/charts/legend-hover.tsx` — adapted from
   `chart-legend-hover.tsx` (legend hover index contract).
-- `src/components/charts/reveal.tsx` — entrance concept from
-  `chart-reveal-clip.tsx` / `animation.ts` (left-to-right clip reveal,
-  implemented natively as a CSS `clip-path: inset()` animation).
-- `src/lib/motion.ts` — emphasized ease + clip-reveal timing constants from
-  `animation.ts` / `motion-utils.ts`.
-- `src/components/design/Skeleton.tsx` and `src/index.css` — deterministic
-  skeleton / shimmer-sweep visual concept from `loading-sweep.tsx`
-  (implemented natively in CSS; bar heights are deterministic, never random).
+- `src/components/design/Skeleton.tsx` — deterministic chart-skeleton bar
+  heights from `loading-sweep.tsx` (implemented natively; never random).
 
 No source is copied verbatim; each adaptation is marked with a scoped
 comment in the file. Nothing is taken from the proprietary
@@ -79,4 +65,4 @@ Jakubantalik/transitions.dev was evaluated and found to carry **no license**
 license grant in the README). Consistent with the project policy, **zero
 code and zero CSS** are copied from transitions.dev; its patterns were used
 as conceptual inspiration only, and all animations are implemented natively
-with Motion and CSS in this repository. No attribution is owed.
+with CSS in this repository. No attribution is owed.

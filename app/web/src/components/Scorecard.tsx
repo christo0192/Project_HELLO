@@ -163,11 +163,11 @@ function PartGrid({ cells }: { cells: PartCell[] }) {
   const halves = cells.filter((c) => !c.wide);
   const stretch = halves.length % 2 === 1 ? halves[halves.length - 1].key : null;
   return (
-    <div className="grid grid-cols-1 gap-px overflow-hidden rounded-[14px] bg-ink/[0.07] sm:grid-cols-2">
+    <div className="grid grid-cols-1 gap-px overflow-hidden rounded-control bg-ink/[0.07] sm:grid-cols-2">
       {cells.map((c) => (
         <div
           key={c.key}
-          className={cx('bg-white/70 px-4 py-3.5', (c.wide || c.key === stretch) && 'sm:col-span-2')}
+          className={cx('bg-surface px-4 py-3.5', (c.wide || c.key === stretch) && 'sm:col-span-2')}
         >
           {c.node}
         </div>
@@ -364,7 +364,7 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
           >
             <div className="flex items-center gap-2 self-start">
               <h3 className="text-sm font-semibold text-ink">Resume conflicts</h3>
-              <span className="rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium tabular-nums text-warning-text">
+              <span className="rounded-chip bg-warning-soft px-2 py-0.5 text-xs font-medium tabular-nums text-warning-text">
                 {conflicts.length}
               </span>
             </div>

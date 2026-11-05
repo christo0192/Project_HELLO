@@ -1,5 +1,6 @@
 /**
- * ScrollArea — a bounded, fade-masked vertical scroll region.
+ * ScrollArea: a bounded vertical scroll region. No fade mask: a mask clips the
+ * focus ring and the first and last rows.
  *
  * Focusable and labelled (`role="region"`, `tabIndex=0`) so keyboard users
  * can scroll it — the axe rule `scrollable-region-focusable` requires it.
@@ -25,7 +26,7 @@ export function ScrollArea({ maxHeight, label, className, children, ref, ...rest
       aria-label={label}
       tabIndex={0}
       className={cx(
-        'scroll-fade overflow-y-auto overscroll-contain py-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
+        'overflow-y-auto overscroll-contain py-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-info',
         className,
       )}
       style={{ maxHeight }}

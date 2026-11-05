@@ -1,15 +1,12 @@
 /**
- * SegmentedControl — a row of exclusive options with a sliding pill.
+ * SegmentedControl: a row of exclusive options, printed as one control.
  *
  * Semantics: `role="group"` of toggle buttons carrying `aria-pressed`, so
- * filters read correctly to assistive technology. The pill is a shared
- * `layoutId` element so it glides between options (spring, collapses under
- * reduced motion). Horizontal scroll on narrow viewports.
+ * filters read correctly to assistive technology. The selected option is an
+ * ink fill, shown statically: nothing slides. Horizontal scroll on narrow
+ * viewports.
  */
-import { LayoutGroup, motion } from 'motion/react';
-import { useId } from 'react';
 import type { ReactNode } from 'react';
-import { useSelectionTransition } from '../../lib/motion';
 import { cx } from './cx';
 
 export interface SegmentedOption<T extends string> {
@@ -38,64 +35,49 @@ export function SegmentedControl<T extends string>({
   size = 'md',
   className,
 }: SegmentedControlProps<T>) {
-  const groupId = useId();
-  const transition = useSelectionTransition();
   return (
-    <LayoutGroup id={groupId}>
-      <div
-        role="group"
-        aria-label={ariaLabel}
-        className={cx(
-          'glass-sunken inline-flex max-w-full items-center gap-0.5 overflow-x-auto p-1',
-          className,
-        )}
-      >
-        {options.map((option) => {
-          const selected = option.value === value;
-          return (
-            <button
-              key={option.value}
-              type="button"
-              aria-pressed={selected}
-              disabled={option.disabled}
-              onClick={() => onChange(option.value)}
-              className={cx(
-                'relative shrink-0 whitespace-nowrap rounded-[10px] font-medium transition-colors duration-200 ease-soft',
-                'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-1',
-                'disabled:cursor-not-allowed disabled:opacity-40',
-                // Type scale: meta (12/16) for the compact control, label
-                // (13/20) otherwise; medium weight either way.
-                // md segments meet the 36px control rule on their own, not
-                // only with the track's padding around them.
-                size === 'sm' ? 'h-7 px-2.5 text-meta' : 'h-9 px-3 text-label',
-                selected ? 'text-ink' : 'text-ink-secondary hover:text-ink',
+    <div
+      role="group"
+      aria-label={ariaLabel}
+      className={cx(
+        'inline-flex max-w-full items-center gap-0.5 overflow-x-auto rounded-control border border-[var(--control)] bg-surface p-0.5',
+        className,
+      )}
+    >
+      {options.map((option) => {
+        const selected = option.value === value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            aria-pressed={selected}
+            disabled={option.disabled}
+            onClick={() => onChange(option.value)}
+            className={cx(
+              'shrink-0 whitespace-nowrap rounded-evidence font-medium transition-colors duration-hover ease-out',
+              // Inset, because the track scrolls and would clip a ring drawn
+              // outside it; paper on the ink fill, ink everywhere else.
+              'focus:outline-none focus-visible:ring-2 focus-visible:ring-inset',
+              selected ? 'focus-visible:ring-surface' : 'focus-visible:ring-info',
+              'disabled:cursor-not-allowed disabled:opacity-40',
+              // Type scale: meta (12/16) for the compact control, label
+              // (13/20) otherwise; medium weight either way. The md track, with
+              // its edge and padding, comes to the 36px control height.
+              size === 'sm' ? 'h-6 px-2.5 text-meta' : 'h-[30px] px-3 text-label',
+              selected ? 'bg-info text-surface' : 'text-ink-secondary hover:bg-surface-secondary hover:text-ink',
+            )}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              {option.label}
+              {option.count != null && (
+                <span className={cx('tabular-nums', selected ? 'text-surface' : 'text-ink-tertiary')}>
+                  {option.count}
+                </span>
               )}
-            >
-              {selected && (
-                <motion.span
-                  layoutId="segment-pill"
-                  aria-hidden="true"
-                  transition={transition}
-                  className="absolute inset-0 rounded-[10px] bg-white shadow-pill"
-                />
-              )}
-              <span className="relative z-10 inline-flex items-center gap-1.5">
-                {option.label}
-                {option.count != null && (
-                  <span
-                    className={cx(
-                      'tabular-nums',
-                      'text-ink-tertiary',
-                    )}
-                  >
-                    {option.count}
-                  </span>
-                )}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-    </LayoutGroup>
+            </span>
+          </button>
+        );
+      })}
+    </div>
   );
 }

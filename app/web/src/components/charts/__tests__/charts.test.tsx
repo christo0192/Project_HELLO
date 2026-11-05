@@ -8,9 +8,7 @@
  * has no layout (clientWidth 0) — allowed via allowEchartsInitWarnings().
  */
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import type { ReactNode } from 'react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ThemeProvider } from '../../../lib/theme';
 import {
   LineChart,
   buildLineSeries,
@@ -18,7 +16,6 @@ import {
   GaugeChart,
   EChart,
   ChartDataTable,
-  ChartReveal,
   LegendHoverProvider,
   useLegendHover,
   type EChartsOption,
@@ -41,10 +38,6 @@ const radarData = [
   { indicator: 'Problem solving', value: 74 },
 ];
 
-function wrap(ui: ReactNode) {
-  return <ThemeProvider>{ui}</ThemeProvider>;
-}
-
 describe('chart test environment', () => {
   beforeEach(() => {
     stubResizeObserver();
@@ -62,7 +55,7 @@ describe('chart test environment', () => {
       yAxis: { type: 'value' },
       series: [{ type: 'line', data: [1] }],
     };
-    render(wrap(<EChart option={option} ariaLabel="Sessions over time" height={120} renderer="svg" />));
+    render(<EChart option={option} ariaLabel="Sessions over time" height={120} renderer="svg" />);
     expect(screen.getByRole('img', { name: 'Sessions over time' })).toBeInTheDocument();
     // The canvas wrapper is hidden from AT — data lives in the sr-only table.
     const hidden = screen.getByRole('img', { name: 'Sessions over time' }).firstChild;
@@ -96,7 +89,7 @@ describe('LineChart', () => {
   });
 
   it('shows a skeleton while loading', () => {
-    render(wrap(<LineChart title="Sessions" data={[]} isLoading height={120} />));
+    render(<LineChart title="Sessions" data={[]} isLoading height={120} />);
     expect(document.querySelector('.skeleton')).toBeInTheDocument();
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
   });
@@ -104,7 +97,6 @@ describe('LineChart', () => {
   it('shows an error state with retry', () => {
     const onRetry = vi.fn();
     render(
-      wrap(
         <LineChart
           title="Sessions"
           data={[]}
@@ -112,7 +104,6 @@ describe('LineChart', () => {
           onRetry={onRetry}
           height={120}
         />,
-      ),
     );
     expect(screen.getByRole('alert')).toHaveTextContent('Failed to load sessions');
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
@@ -120,14 +111,13 @@ describe('LineChart', () => {
   });
 
   it('shows an empty state with no data', () => {
-    render(wrap(<LineChart title="Sessions" data={[]} height={120} />));
+    render(<LineChart title="Sessions" data={[]} height={120} />);
     expect(screen.getByText('No sessions yet')).toBeInTheDocument();
   });
 
   it('renders the chart with an sr-only data table when data exists', async () => {
     allowEchartsInitWarnings();
-    const { container } = render(
-      wrap(<LineChart title="Sessions over time" data={lineData} height={120} renderer="svg" />),
+    const { container } = render(<LineChart title="Sessions over time" data={lineData} height={120} renderer="svg" />,
     );
     expect(screen.getByRole('img', { name: 'Sessions over time' })).toBeInTheDocument();
     const table = screen.getByRole('table', { name: 'Sessions over time data' });
@@ -138,22 +128,19 @@ describe('LineChart', () => {
     await expect(container).toHaveNoViolations();
   });
 
-  it('gates animation under reduced motion (reported via chart ready)', async () => {
+  it('never animates a chart in (reported via chart ready)', async () => {
     allowEchartsInitWarnings();
-    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
     let optionAnimation: unknown = 'unset';
     render(
-      wrap(
         <EChart
           option={{ xAxis: { type: 'category', data: ['a'] }, yAxis: { type: 'value' }, series: [{ type: 'line', data: [1] }] }}
-          ariaLabel="Reduced chart"
+          ariaLabel="Printed chart"
           height={120}
           renderer="svg"
           onChartReady={(instance) => {
             optionAnimation = instance.getOption().animation;
           }}
         />,
-      ),
     );
     await waitFor(() => expect(optionAnimation).toBe(false));
   });
@@ -180,6 +167,22 @@ describe('LineChart truthfulness', () => {
     expect(lines.every((line) => line.smooth === false)).toBe(true);
   });
 
+  it('tells two series apart by marker shape, because the cycle has no hue', () => {
+    const { lines } = buildLineSeries(
+      [
+        { name: 'One', data: [{ label: '1 Sep', value: 1 }] },
+        { name: 'Two', data: [{ label: '1 Sep', value: 2 }] },
+      ],
+      { colors: ['#000000', '#111111'] },
+    );
+    expect(new Set(lines.map((line) => line.symbol)).size).toBe(2);
+  });
+
+  it('draws no area under a line: a wash would be a gradient by another name', () => {
+    const { lines } = buildLineSeries([{ name: 'One', data: [{ label: '1 Sep', value: 1 }] }], { colors: ['#000000'] });
+    expect(lines[0].areaStyle).toBeUndefined();
+  });
+
   it('leaves a gap, not a zero, for a day one series does not have', () => {
     const { labels, lines } = buildLineSeries(
       [
@@ -198,7 +201,6 @@ describe('LineChart truthfulness', () => {
   it('pairs a multi-series chart with one table column per series', () => {
     allowEchartsInitWarnings();
     render(
-      wrap(
         <LineChart
           title="Screening outcomes"
           unit="%"
@@ -209,7 +211,6 @@ describe('LineChart truthfulness', () => {
           height={120}
           renderer="svg"
         />,
-      ),
     );
     const table = screen.getByRole('table', { name: 'Screening outcomes data' });
     expect(screen.getByRole('columnheader', { name: 'Qualified' })).toBeInTheDocument();
@@ -265,14 +266,13 @@ describe('RadarChart', () => {
   });
 
   it('shows empty state before an assessment exists', () => {
-    render(wrap(<RadarChart title="Scorecard" data={[]} height={120} />));
+    render(<RadarChart title="Scorecard" data={[]} height={120} />);
     expect(screen.getByText('No assessment yet')).toBeInTheDocument();
   });
 
   it('renders the radar with an sr-only table', () => {
     allowEchartsInitWarnings();
-    render(
-      wrap(<RadarChart title="Skill scorecard" data={radarData} height={120} renderer="svg" />),
+    render(<RadarChart title="Skill scorecard" data={radarData} height={120} renderer="svg" />,
     );
     expect(screen.getByRole('img', { name: 'Skill scorecard' })).toBeInTheDocument();
     const table = screen.getByRole('table', { name: 'Skill scorecard data' });
@@ -293,14 +293,13 @@ describe('GaugeChart', () => {
   });
 
   it('shows a disabled state when the quota limit is zero', () => {
-    render(wrap(<GaugeChart title="Quota" value={10} max={0} height={120} />));
+    render(<GaugeChart title="Quota" value={10} max={0} height={120} />);
     expect(screen.getByText('Quota disabled')).toBeInTheDocument();
   });
 
   it('renders gauge data into the sr-only table', () => {
     allowEchartsInitWarnings();
     render(
-      wrap(
         <GaugeChart
           title="Quota utilization"
           value={78}
@@ -310,7 +309,6 @@ describe('GaugeChart', () => {
           height={120}
           renderer="svg"
         />,
-      ),
     );
     expect(screen.getByRole('img', { name: /Quota utilization/ })).toBeInTheDocument();
     const table = screen.getByRole('table', { name: 'Quota utilization data' });
@@ -320,24 +318,3 @@ describe('GaugeChart', () => {
   });
 });
 
-describe('ChartReveal', () => {
-  beforeEach(() => {
-    stubMatchMedia(false);
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('skips the reveal entirely under reduced motion', () => {
-    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
-    const { container } = render(<ChartReveal>content</ChartReveal>);
-    expect(container.textContent).toBe('content');
-    expect(container.querySelector('[style*="clip-path"]')).toBeNull();
-  });
-
-  it('renders children without a production-only motion component dependency', () => {
-    const { container } = render(<ChartReveal>content</ChartReveal>);
-    expect(container.textContent).toBe('content');
-    expect(container.querySelector('[style*="clip-path"]')).toBeNull();
-  });
-});

@@ -1,12 +1,9 @@
 import type { ReactNode } from 'react';
 import type { EChartsOption } from 'echarts';
-import { useReducedMotion } from '../../lib/motion';
-import { useTheme } from '../../lib/theme';
 import { cx } from '../design/cx';
 import { ChartSkeleton } from '../design/Skeleton';
 import { ChartDataTable } from './accessibility';
 import { EChart } from './EChart';
-import { ChartReveal } from './reveal';
 import { ChartEmpty, ChartError } from './states';
 import { chartTheme } from './theme';
 import { buildLineSeries } from './series';
@@ -81,13 +78,11 @@ export function LineChart({
   emptyHint = 'Sessions will appear here once screening starts.',
   renderer = 'canvas',
 }: LineChartProps) {
-  const { theme } = useTheme();
-  const reduced = useReducedMotion();
-  const { palette, base } = chartTheme(theme, reduced);
+  const { palette, base } = chartTheme();
 
   const series: LineChartSeries[] = seriesProp ?? [{ name: title, data }];
   const multi = series.length > 1;
-  const { labels, lines } = buildLineSeries(series, { discrete, colors: palette.colors });
+  const { labels, lines } = buildLineSeries(series, { discrete, colors: palette.colors, surface: palette.surface });
   const isPercent = unit === '%';
   const formatValue = (v: number | null | undefined) =>
     v == null ? 'No data' : isPercent ? `${v}%` : v.toLocaleString();
@@ -162,9 +157,7 @@ export function LineChart({
             ))}
           </ul>
         )}
-        <ChartReveal epoch={labels.length}>
-          <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
-        </ChartReveal>
+        <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
       </>
     );
   }

@@ -368,7 +368,7 @@ function OperatorHaltPanel() {
         role="status"
         aria-live="polite"
         className={cx(
-          'max-w-sm text-[13px] leading-5 sm:text-right',
+          'max-w-sm text-label leading-5 sm:text-right',
           announcement?.tone === 'error' ? 'text-error-text' : 'text-ink-secondary',
         )}
       >
@@ -423,7 +423,7 @@ interface HaltStateProps {
 /** The neutral state text and the one control that state offers. */
 function HaltState({ phase, busy, focusRef, onHalt, onResume, onRetry }: HaltStateProps) {
   const row = 'flex flex-wrap items-center gap-2 sm:justify-end';
-  const stateText = 'text-[13px] font-medium leading-5 text-ink';
+  const stateText = 'text-label font-medium leading-5 text-ink';
 
   switch (phase.kind) {
     case 'loading':
@@ -431,7 +431,7 @@ function HaltState({ phase, busy, focusRef, onHalt, onResume, onRetry }: HaltSta
         <p
           ref={focusRef}
           tabIndex={-1}
-          className="inline-flex h-11 items-center gap-2 rounded text-[13px] text-ink-secondary"
+          className="inline-flex h-11 items-center gap-2 rounded text-label text-ink-secondary"
         >
           <ButtonSpinner className="h-4 w-4 text-ink-tertiary" />
           Checking calling status…
@@ -452,7 +452,7 @@ function HaltState({ phase, busy, focusRef, onHalt, onResume, onRetry }: HaltSta
               Retry
             </button>
           </div>
-          <p className="max-w-sm text-[13px] leading-5 text-ink-tertiary sm:text-right">{phase.detail}</p>
+          <p className="max-w-sm text-label leading-5 text-ink-tertiary sm:text-right">{phase.detail}</p>
         </>
       );
 
@@ -504,7 +504,7 @@ function HaltState({ phase, busy, focusRef, onHalt, onResume, onRetry }: HaltSta
           className="flex max-w-sm flex-col items-start gap-1 rounded sm:items-end"
         >
           <p className={cx(stateText, 'inline-flex min-h-11 items-center')}>{haltStateLine(phase)}</p>
-          <p className="text-[13px] leading-5 text-ink-secondary sm:text-right">
+          <p className="text-label leading-5 text-ink-secondary sm:text-right">
             {lockedHaltNote(phase.reason)}
           </p>
         </div>

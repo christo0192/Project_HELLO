@@ -1,18 +1,15 @@
 /**
  * Explicit-confirmation mutation trigger for writable admin surfaces.
  *
- * Flow: idle trigger button → an inline `glass-sunken` well that rises in
- * and summarises the EXACT change → "Confirm" runs `onConfirm` (busy +
+ * Flow: idle trigger button → an inline `glass-sunken` well that summarises the EXACT change → "Confirm" runs `onConfirm` (busy +
  * disabled while pending) → returns to idle. Nothing is applied
  * optimistically: the caller awaits `onConfirm` (which performs the real
  * API call) and only then renders success/error feedback from the actual
  * response.
  */
 
-import { motion } from 'motion/react';
 import { useId, useState } from 'react';
 import type { ReactNode } from 'react';
-import { usePanelVariants } from '../../lib/motion';
 import { Button, buttonClass, cx } from '../design';
 import type { ButtonVariant } from '../design';
 import type { MissionButtonVariant } from './buttonStyles';
@@ -65,7 +62,6 @@ export function ConfirmButton({
   const confirmId = `confirm-${rawId.replace(/:/g, '-')}`;
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
-  const panelVariants = usePanelVariants();
 
   async function run() {
     setBusy(true);
@@ -97,13 +93,10 @@ export function ConfirmButton({
       </Button>
 
       {confirming && (
-        <motion.div
+        <div
           id={confirmId}
-          variants={panelVariants}
-          initial="initial"
-          animate="enter"
           className={cx(
-            'glass-sunken rounded-[14px] p-4',
+            'glass-sunken rounded-control p-4',
             quiet ? 'order-last w-full basis-full' : 'mt-3',
           )}
         >
@@ -121,7 +114,7 @@ export function ConfirmButton({
               {cancelLabel}
             </Button>
           </div>
-        </motion.div>
+        </div>
       )}
     </div>
   );

@@ -1,9 +1,10 @@
 /**
- * Switch — a macOS-style toggle (`role="switch"`).
+ * Switch: a toggle (`role="switch"`).
  *
  * The knob slides with a CSS transition (no motion import, so the control
- * is safe inside candidate-scoped files) and the track uses the accent when
- * on. Always paired with a visible label via `aria-labelledby` or `label`.
+ * is safe inside candidate-scoped files) and the track is an ink fill when on.
+ * The track has a real border, so its edge survives forced colours. Always
+ * paired with a visible label via `aria-labelledby` or `label`.
  */
 import { useId } from 'react';
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
@@ -50,13 +51,11 @@ export function Switch({
       disabled={disabled}
       onClick={() => onCheckedChange(!checked)}
       className={cx(
-        'relative inline-flex shrink-0 items-center rounded-full p-0.5 transition-colors duration-200 ease-soft',
-        'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary',
+        'relative inline-flex shrink-0 items-center rounded-full border p-px transition-colors duration-hover ease-out',
+        'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
         'disabled:cursor-not-allowed disabled:opacity-50',
         track,
-        checked
-          ? 'bg-info shadow-[inset_0_1px_2px_rgba(15,23,42,0.18)]'
-          : 'bg-ink/[0.14] shadow-[inset_0_1px_2px_rgba(15,23,42,0.12)]',
+        checked ? 'border-transparent bg-info' : 'border-[var(--control)] bg-surface',
         !label && className,
       )}
       {...rest}
@@ -64,7 +63,8 @@ export function Switch({
       <span
         aria-hidden="true"
         className={cx(
-          'block rounded-full bg-white shadow-[0_1px_2px_rgba(15,23,42,0.2),0_0_0_0.5px_rgba(15,23,42,0.06)] transition-transform duration-200 ease-soft',
+          'block rounded-full transition-transform duration-150 ease-out',
+          checked ? 'bg-surface' : 'bg-ink-muted',
           knob,
           checked ? travel : 'translate-x-0',
         )}
@@ -81,7 +81,7 @@ export function Switch({
           {label}
         </span>
         {description && (
-          <span id={descId} className="mt-0.5 block text-[13px] leading-5 text-ink-tertiary">
+          <span id={descId} className="mt-0.5 block text-label leading-5 text-ink-tertiary">
             {description}
           </span>
         )}

@@ -3,105 +3,93 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Project HELLO HR-approved light-first design tokens. The supplied palette is
-   the application chrome as well as the candidate experience; the `.dark`
-   class is kept only as a compatibility marker for old route tests and maps to
-   the same values rather than inventing an unapproved dark theme.
+/* Project HELLO design tokens: Logsheet (docs/design/hello-glass-design-system.md),
+   approved by the owner and the stakeholder on 2026-11-05.
 
-   Surface language (docs/design/hello-glass-design-system.md): frosted glass
-   panels on a softly lit ground. Every colour is a palette value or an
-   alpha of white / the ink; depth comes from translucency and shadow, never
-   from thick borders or coloured accent bars. */
+   The world is a taped interview and its log sheet: one sheet of paper on a
+   desk, typed in carbon ink, ruled like a form. These primitives are the whole
+   palette. Every semantic name below them points at one, so a page re-skins
+   without knowing any of this, and a hue changes in exactly one place.
+
+   Light only. Production has only ever rendered one theme; no direction defines
+   a dark one, so the path is retired rather than kept as an unreachable branch. */
 @layer base {
-  :root,
-  .dark {
+  :root {
     color-scheme: light;
-    --surface: #ffffff;
-    --surface-secondary: #f4f6fb;
-    --surface-tertiary: #eaeef6;
-    --ink: #0f172a;
-    --ink-secondary: #334155;
-    --ink-muted: #6b7391;
-    /* Small muted text: the approved muted grey is 4.33:1 on the page ground,
-       so small text takes this text-only derivative (≥4.5:1 on ground, glass
-       and white). The spec value stays for dots, hairlines and ≥18px figures. */
-    --ink-tertiary: #5f6785;
-    --line: #dbe1ec;
-    --line-strong: #dbe1ec;
-    --success: #398AA2;
-    --success-text: #2f7488;
-    --success-soft: #eaf2f4;
-    --warning: #a16207;
-    --warning-text: #955b06;
-    --warning-soft: #fff8eb;
-    --error: #b45a72;
-    --error-text: #9f4d63;
-    --error-soft: #f7edf0;
-    --info: #4e6ba6;
-    --info-soft: #eaeef6;
-    /* "Go" green — the fill of the "Resume calling" button and nothing else.
-       Added at the owner's request of 2026-09-29 ("resume button must read as
-       green"): no approved token was green (`--success` is teal, hue ~193°,
-       and read as blue). A FILL for white text only: white on --go 5.23:1,
-       on --go-strong (hover/press) 6.14:1. Hue ~146°. */
+
+    /* ── The palette ─────────────────────────────────────────────────── */
+    --desk: #e9e7e0;       /* frame and sidebar: the desk the sheet lies on */
+    --paper: #fbfaf6;      /* the sheet: every working surface, opaque */
+    --field: #f2f0ea;      /* a shaded printed field */
+    --rule: #e2dfd7;       /* printed row rules (decorative) */
+    --rule-2: #cfcbc1;     /* sheet edge, box edges */
+    --control: #827d74;    /* control borders, 3:1 on desk, paper and field */
+    --ink: #1b1915;        /* carbon ink: names, words, figures, the primary fill */
+    --ink-2: #48443d;      /* graphite: body text */
+    --ink-3: #66615a;      /* labels, meta, turn numbers */
+    /* THE VOICE PAIR. The candidate's voice and nothing else: never a button,
+       a link, a verdict or a warning. The only two declarations of this hue,
+       so the stakeholder's pick changes it here and nowhere else. */
+    --voice: #a8460c;      /* as text: safe on every ground */
+    --voice-mark: #cf5a12; /* as a mark: strip segments, swatches */
+    --wash: #fde0c5;       /* highlighter swipe: words cited as evidence */
+    --ai: #8c877e;         /* the interviewer's segments on the call strip */
+    --danger: #a01c3c;     /* faults on our side, and Halt all calling (filled) */
+    --plate: #ffffff;      /* the IK logo's own plate, never inverted */
+
+    /* rgb triples for alpha-capable Tailwind tokens (same values as above). */
+    --ink-rgb: 27 25 21;
+    --ink-muted-rgb: 130 125 116;
+    --info-rgb: 27 25 21;
+    --danger-rgb: 160 28 60;
+
+    /* ── Semantic names, mapped ──────────────────────────────────────── */
+    --surface: var(--paper);
+    --surface-secondary: var(--field);
+    --surface-tertiary: var(--desk);
+    --ink-secondary: var(--ink-2);
+    --ink-tertiary: var(--ink-3);
+    /* Dots, control edges and figures of 18px and up. Not small text. */
+    --ink-muted: var(--control);
+    --line: var(--rule);
+    --line-strong: var(--rule-2);
+
+    /* Status carries a word, so its tone needs no traffic light: only a fault
+       on our side gets a hue. `--info` is the accent's old name; the primary
+       fill, selection and focus are all ink now. */
+    --info: var(--ink);
+    --info-soft: var(--field);
+    --success: var(--ink-2);
+    --success-text: var(--ink-2);
+    --success-soft: var(--field);
+    --warning: var(--ink-2);
+    --warning-text: var(--ink);
+    --warning-soft: var(--field);
+    --error: var(--danger);
+    --error-text: var(--danger);
+    --error-soft: var(--paper);
+    /* "Go" green: the fill of the "Resume calling" button and nothing else.
+       The owner's request of 2026-09-29 ("resume button must read as green");
+       Logsheet keeps it because no later decision reversed it. A FILL for white
+       text only: white on --go 5.23:1, on --go-strong (hover/press) 6.14:1. */
     --go: #2f7a4f;
     --go-strong: #2a6e47;
-    /* rgb triples for alpha-capable Tailwind tokens (same values as above). */
-    --ink-rgb: 15 23 42;
-    --ink-muted-rgb: 107 115 145;
-    --info-rgb: 78 107 166;
 
-    /* Legacy brand utilities now resolve to the approved accent family. */
-    --brand-50: #f4f6fb;
-    --brand-100: #eaeef6;
-    --brand-200: #dbe1ec;
-    --brand-300: #b5c8d8;
-    --brand-400: #7ba7c7;
-    --brand-500: #4e6ba6;
-    --brand-600: #4e6ba6;
-    --brand-700: #1e7590;
-    --brand-800: #334155;
-    --brand-900: #0f172a;
-    --brand-950: #0f172a;
+    /* The panel material's old names, kept so every page re-skins unedited. */
+    --glass-ring: var(--rule);
+    --glass-ring-strong: var(--rule-2);
 
-    --chart-cyan: #398aa2;
-    --chart-navy: #4e6ba6;
-    --chart-slate: #6b8e9f;
-    --chart-green: #8fb0a8;
-    --chart-amber: #a16207;
-    --chart-red: #b45a72;
-    --chart-violet: #938fb8;
+    /* Floating layers only: dialogs, menus, the combobox list, chart tooltips. */
+    --shadow-pop: 0 1px 2px rgb(var(--ink-rgb) / 0.08), 0 12px 28px -12px rgb(var(--ink-rgb) / 0.28);
 
-    /* Glass material */
-    --glass-bg: rgba(255, 255, 255, 0.66);
-    --glass-bg-strong: rgba(255, 255, 255, 0.82);
-    --glass-rail: rgba(255, 255, 255, 0.58);
-    --glass-sunken: rgba(15, 23, 42, 0.035);
-    --glass-ring: rgba(15, 23, 42, 0.07);
-    --glass-ring-strong: rgba(15, 23, 42, 0.12);
-    --glass-highlight: rgba(255, 255, 255, 0.85);
-    --glass-blur: 18px;
-    --shadow-glass:
-      0 1px 1px rgba(15, 23, 42, 0.03),
-      0 2px 6px -2px rgba(15, 23, 42, 0.05),
-      0 12px 32px -16px rgba(15, 23, 42, 0.16);
-    --shadow-glass-hover:
-      0 2px 3px rgba(15, 23, 42, 0.04),
-      0 6px 14px -6px rgba(15, 23, 42, 0.08),
-      0 24px 48px -20px rgba(15, 23, 42, 0.22);
-    --shadow-pop:
-      0 1px 2px rgba(15, 23, 42, 0.06),
-      0 10px 30px -10px rgba(15, 23, 42, 0.25);
-    --radius-card: 20px;
-    --radius-control: 12px;
-    --radius-pill: 999px;
+    /* One tight family, like a printed form. */
+    --radius-sheet: 8px;
+    --radius-card: 4px;
+    --radius-control: 4px;
+    --radius-chip: 3px;
+    --radius-evidence: 2px;
 
-    --duration-fast: 120ms;
-    --duration-base: 200ms;
-    --duration-slow: 320ms;
     --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
-    --ease-emphasized: cubic-bezier(0.85, 0, 0.15, 1);
-    --ease-out-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   html,
@@ -113,38 +101,38 @@
   /* IBM Plex Sans, self-hosted (src/main.tsx). Same stack as Tailwind's
      `fontFamily.sans`, so preflight's `html` rule and this one agree.
 
-     No `font-feature-settings`. The old `'cv11', 'ss01'` are Inter's
-     character variants; on a system stack they switch on whatever those
-     slots happen to mean in the local face, which is how the pager's "10"
-     came out with an odd alternate zero (M007 review). Plex's default
-     glyphs are the design, and its figures are already tabular (every
-     digit one width); `tabular-nums` stays on tables, figures and counts so
-     the intent survives a change of face. */
+     No `font-feature-settings`. The old `'cv11', 'ss01'` are Inter's character
+     variants; on a system stack they switch on whatever those slots happen to
+     mean in the local face. `font-variant-numeric` is a different property:
+     every figure in a log sheet lines up, so tabular figures are the default. */
   body {
     margin: 0;
-    background-color: var(--surface-secondary);
+    background-color: var(--desk);
     color: var(--ink);
     font-family: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, -apple-system,
       'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
     font-kerning: normal;
+    font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
   }
 
+  /* The fallback ring for anything that does not draw its own. No radius here:
+     a focus style that reshapes the element it sits on moves its corners on
+     every Tab press. */
   :focus-visible {
-    outline: 2px solid var(--info);
+    outline: 2px solid var(--ink);
     outline-offset: 2px;
-    border-radius: 6px;
   }
 
   ::selection {
-    background-color: var(--surface-tertiary);
+    background-color: var(--rule-2);
   }
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgba(15, 23, 42, 0.18) transparent;
+    scrollbar-color: var(--control) transparent;
   }
 
   .tabular-nums {
@@ -153,157 +141,68 @@
 }
 
 @layer components {
-  /* ── Ground ─────────────────────────────────────────────────────────
-     A fixed, softly lit backdrop. Palette tints only (accent-light,
-     positive-light, negative-light) so the glass has something to
-     refract without introducing a hue. */
+  /* ── The desk and the sheet ─────────────────────────────────────────
+     One opaque sheet lying on the desk: a 1px edge, no shadow, no blur. The
+     shell insets it 8px from the window (Layout.tsx). */
   .app-ground {
-    position: relative;
-    isolation: isolate;
-    background-color: var(--surface-secondary);
+    background-color: var(--desk);
   }
-  .app-ground::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    z-index: -1;
-    pointer-events: none;
-    background:
-      radial-gradient(64rem 40rem at 6% -12%, rgba(78, 107, 166, 0.24), transparent 62%),
-      radial-gradient(52rem 34rem at 102% -4%, rgba(57, 138, 162, 0.2), transparent 64%),
-      radial-gradient(40rem 30rem at 28% 58%, rgba(147, 143, 184, 0.14), transparent 60%),
-      radial-gradient(48rem 36rem at 88% 108%, rgba(216, 181, 190, 0.26), transparent 62%),
-      linear-gradient(180deg, #f6f7fc 0%, var(--surface-secondary) 55%);
+  .sheet {
+    background-color: var(--paper);
+    border: 1px solid var(--rule-2);
+    border-radius: var(--radius-sheet);
   }
 
-  /* ── Glass materials ───────────────────────────────────────────────── */
+  /* ── Panels ─────────────────────────────────────────────────────────
+     `.glass*` is the old name of the panel primitive, kept so pages re-skin
+     unedited. There is no glass: a panel is a printed box on the sheet, opaque,
+     flat, edged with a 1px rule. */
   .glass,
-  .glass-strong,
-  .glass-rail {
-    background-color: var(--glass-bg);
-    border: 1px solid var(--glass-ring);
-    box-shadow: var(--shadow-glass), inset 0 1px 0 var(--glass-highlight);
-    border-radius: var(--radius-card);
-  }
   .glass-strong {
-    background-color: var(--glass-bg-strong);
-  }
-  .glass-rail {
-    background-color: var(--glass-rail);
-    border: 0;
-    border-radius: 0;
-    box-shadow: inset -1px 0 0 var(--glass-ring);
+    background-color: var(--paper);
+    border: 1px solid var(--rule-2);
+    border-radius: var(--radius-card);
   }
   .glass-sunken {
-    background-color: var(--glass-sunken);
-    border-radius: 14px;
-  }
-  /* Modal material (Dialog, SlideOver). NOT the panel glass: a modal sits on
-     a backdrop dimmed with ink, and 66–82% white over that dimmed ground
-     reads as a muddy grey — and pulls small tertiary text under 4.5:1 (axe,
-     Playwright, 2026-09-30). A modal is the one surface in front: opaque,
-     with the hairline and the pop shadow. */
-  .glass-modal {
-    /* Opaque: even 3% translucency let the page's red pills bleed through. */
-    background-color: var(--surface);
-    border: 1px solid var(--glass-ring);
-    box-shadow: var(--shadow-pop), inset 0 1px 0 var(--glass-highlight);
+    background-color: var(--field);
     border-radius: var(--radius-card);
   }
-  .glass-interactive {
-    transition:
-      transform var(--duration-base) var(--ease-out-soft),
-      box-shadow var(--duration-base) var(--ease-out-soft),
-      background-color var(--duration-base) var(--ease-out-soft);
-  }
-  .glass-interactive:hover {
-    transform: translateY(-2px);
-    box-shadow: var(--shadow-glass-hover), inset 0 1px 0 var(--glass-highlight);
-    background-color: var(--glass-bg-strong);
+  /* Modal material (Dialog, SlideOver, menus). The one surface in front of the
+     page, so the one place a shadow is allowed. */
+  .glass-modal {
+    background-color: var(--paper);
+    border: 1px solid var(--rule-2);
+    box-shadow: var(--shadow-pop);
+    border-radius: var(--radius-sheet);
   }
   .hairline {
-    border-color: var(--glass-ring);
+    border-color: var(--rule);
   }
 
-  @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-    .glass,
-    .glass-strong,
-    .glass-rail {
-      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
-      backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
-    }
-  }
-  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-    .glass,
-    .glass-strong { background-color: rgba(255, 255, 255, 0.94); }
-    .glass-rail { background-color: rgba(255, 255, 255, 0.92); }
-  }
-  @media (prefers-reduced-transparency: reduce) {
-    .glass,
-    .glass-strong,
-    .glass-rail {
-      -webkit-backdrop-filter: none;
-      backdrop-filter: none;
-      background-color: var(--surface);
-    }
-    .app-ground::before { background: var(--surface-secondary); }
+  /* 12px labels printed on a form: Plex at its condensed width. */
+  .form-label {
+    font-size: 0.75rem;
+    line-height: 1rem;
+    font-weight: 500;
+    font-stretch: 87.5%;
+    color: var(--ink-3);
   }
 
-  /* ── Motion-free reveal (usable inside candidate-scoped files) ───── */
-  .fade-up {
-    animation: fade-up 0.45s var(--ease-out-soft) both;
-  }
-  .fade-up-stagger > * {
-    animation: fade-up 0.45s var(--ease-out-soft) both;
-  }
-  .fade-up-stagger > :nth-child(2) { animation-delay: 40ms; }
-  .fade-up-stagger > :nth-child(3) { animation-delay: 80ms; }
-  .fade-up-stagger > :nth-child(4) { animation-delay: 120ms; }
-  .fade-up-stagger > :nth-child(5) { animation-delay: 160ms; }
-  .fade-up-stagger > :nth-child(6) { animation-delay: 200ms; }
-  .fade-up-stagger > :nth-child(n + 7) { animation-delay: 240ms; }
-
-  /* ── Table rows: opacity-only stagger (transforms on <tr> are unreliable) ── */
-  .rows-reveal > tr {
-    animation: fade-in 0.35s var(--ease-out-soft) both;
-  }
-  .rows-reveal > tr:nth-child(2) { animation-delay: 30ms; }
-  .rows-reveal > tr:nth-child(3) { animation-delay: 60ms; }
-  .rows-reveal > tr:nth-child(4) { animation-delay: 90ms; }
-  .rows-reveal > tr:nth-child(5) { animation-delay: 120ms; }
-  .rows-reveal > tr:nth-child(6) { animation-delay: 150ms; }
-  .rows-reveal > tr:nth-child(7) { animation-delay: 180ms; }
-  .rows-reveal > tr:nth-child(8) { animation-delay: 210ms; }
-  .rows-reveal > tr:nth-child(n + 9) { animation-delay: 240ms; }
-
-  /* ── Skeleton shimmer ─────────────────────────────────────────────── */
+  /* ── Skeleton ───────────────────────────────────────────────────────
+     A flat block that breathes, so a slow read does not look stuck. No sweep:
+     the loading words live in the surrounding `role="status"`. */
   .skeleton {
-    position: relative;
     display: inline-block;
-    overflow: hidden;
-    background-color: var(--surface-tertiary);
-    border-radius: 0.375rem;
-  }
-
-  .skeleton::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    transform: translateX(-100%);
-    background: linear-gradient(
-      90deg,
-      transparent,
-      color-mix(in srgb, var(--surface) 62%, transparent),
-      transparent
-    );
-    animation: skeleton-sweep 1.5s var(--ease-standard) infinite;
+    background-color: var(--rule);
+    border-radius: var(--radius-chip);
+    animation: skeleton-pulse 1.6s var(--ease-standard) infinite alternate;
   }
 
   /* ── Native control resets (select chevron, checkbox) ─────────────── */
   .control-select {
     appearance: none;
     -webkit-appearance: none;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%235f6785' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2366615a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
     background-repeat: no-repeat;
     background-position: right 0.65rem center;
     background-size: 16px 16px;
@@ -317,220 +216,51 @@
   select.control-select {
     padding-right: 2.25rem;
   }
-
-  /* ── Scroll fade masks ────────────────────────────────────────────── */
-  .scroll-fade {
-    -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
-    mask-image: linear-gradient(180deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
-  }
 }
 
-@keyframes skeleton-sweep {
-  0% { transform: translateX(-100%); }
-  55% { transform: translateX(100%); }
-  100% { transform: translateX(100%); }
-}
-
-@keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-@keyframes fade-up {
-  from { opacity: 0; transform: translateY(8px); }
-  /* `transform: none`, NOT `translateY(0)`. These animations run with
-     `animation-fill-mode: both`, so the final keyframe's declarations are
-     retained forever — and a retained `translateY(0)` is still a transform,
-     which makes the element a CONTAINING BLOCK for any `position: fixed`
-     descendant (CSS Transforms L1 §3). A modal rendered anywhere inside a
-     `.fade-up` / `.fade-up-stagger` subtree would then size and centre itself
-     against that element instead of the viewport — appearing thousands of
-     pixels down a tall column, while the body scroll lock prevents scrolling
-     to it. `none` is visually identical and carries no containing block. */
-  to { opacity: 1; transform: none; }
+@keyframes skeleton-pulse {
+  from { opacity: 1; }
+  to { opacity: 0.55; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    /* Zeroing the DURATION alone does not collapse a staggered reveal: with
-       `animation-fill-mode: both`, each `.fade-up-stagger > *:nth-child(n)`
-       still holds at `opacity: 0` for its whole DELAY (up to 240ms here, and
-       `.rows-reveal` the same). The motion is gone but the sequenced pop-in
-       remains — which is the part a motion-sensitive reader asked not to see. */
+    /* Zeroing the DURATION alone would leave any delayed animation holding its
+       first keyframe for the whole delay. */
     animation-delay: 0s !important;
     transition-duration: 0.01ms !important;
     transition-delay: 0s !important;
     scroll-behavior: auto !important;
   }
-  .glass-interactive:hover { transform: none; }
 }
 
-/* Compatibility bridge for pages still carrying stock Tailwind utility
-   names. Candidate-scoped selectors are more specific and retain their exact
-   palette values while the remaining routes converge on the same tokens.
+/* ── "Ask Hello": the role-drafting button ───────────────────────────────
+   A flat fill. The button is the progress bar in words, not in paint: its label
+   and its live region carry every fact, so nothing here needs to move.
 
-   Two groups, kept apart on purpose. NEUTRALS map to the ink and ground
-   tokens. TINTS map to a tone's soft ground and are paired only with that
-   tone's `*-text` ink. The legacy greys can still land on a tint in old
-   markup; each resolves to an ink that clears AA there (tertiary ink is the
-   weakest: 4.80:1 on the info tint, 4.87 on error, 4.91 on success, 5.28 on
-   warning), so no grey here can wash out on colour. */
-
-/* Neutrals: ink, ground, hairline. */
-body .text-gray-400,
-body .text-gray-500 { color: var(--ink-tertiary); }
-body .text-gray-600,
-body .text-gray-700,
-body .text-gray-800 { color: var(--ink-secondary); }
-body .text-gray-900 { color: var(--ink); }
-body .bg-gray-50,
-body .bg-gray-100 { background-color: var(--surface-secondary); }
-body .bg-gray-200 { background-color: var(--line); }
-body .border-gray-200,
-body .border-gray-300 { border-color: var(--line); }
-
-/* Tints, each with its own tone ink. Blue and indigo are the info tone (they
-   used to fall through to the teal success tint, which read as the wrong
-   state). */
-body .bg-blue-50,
-body .bg-indigo-50 { background-color: var(--info-soft); }
-body .text-blue-600,
-body .text-blue-700,
-body .text-indigo-600,
-body .text-indigo-700 { color: var(--info); }
-body .bg-emerald-50 { background-color: var(--success-soft); }
-body .text-emerald-600,
-body .text-emerald-700 { color: var(--success-text); }
-body .bg-amber-50 { background-color: var(--warning-soft); }
-body .text-amber-600,
-body .text-amber-700 { color: var(--warning-text); }
-body .bg-red-50 { background-color: var(--error-soft); }
-body .text-red-600,
-body .text-red-700 { color: var(--error-text); }
-
-
-/* ── "Ask Hello" — the animated gradient on the role-drafting button ─────
-   Decorative only: the button's label and its live region carry every fact.
-
-   THE STOPS ARE MEASURED, AND TWO EARLIER SETS FAILED.
-
-   First failure: white semibold on the old teal (#398AA2) was 3.94:1 — under
-   the 4.5:1 this text size needs — and the sheen sweeping over it dropped that
-   to 2.55:1 AT THE SHEEN ALPHA IN FORCE THEN, which was 0.28. (At today's
-   0.14 the same stop computes to 3.17:1; quoting the figure without the alpha
-   made it look wrong when re-derived against the current value.) The label was
-   legible, then wasn't, then was, twenty times a minute: a contrast failure
-   that ANIMATES, which reads as a rendering glitch.
-
-   Second failure, and the instructive one: the stops below were re-measured
-   and pass, but the BUTTON carried `opacity-60` while idle or running. CSS
-   opacity composites the whole subtree, so it faded the white label along with
-   the fill, and everything measured here was beside the point:
-
-     stop      opacity 1            opacity .6 over white
-     #3B5488   7.47:1 / 5.25:1      2.90:1 / 2.42:1
-     #2B5F72   7.04:1 / 5.03:1      2.82:1 / 2.39:1
-     #574189   8.32:1 / 5.72:1      3.05:1 / 2.53:1
-                     (base / under the 0.14 sheen)
-
-   Worse than the animation bug it replaced, and it applied for the entire ten
-   minutes the button spends saying "Asking Hello…" — the one state the whole
-   feature exists to make legible. The fade is gone; unavailability is a flat
-   measured fill (below) that leaves the label at full strength.
-
-   Sampled every 5% along all three ramps, the worst point anywhere on the
-   running button is 5.02:1 under the sheen — at #2d5e74, the sampled point
-   nearest the true minimum, which is the #2b5f72 stop itself at 5.03:1. The
-   sheen's 0.14 alpha is what keeps that above 4.5:1 rather than merely above
-   3:1.
-
-   Two layers: a slow hue drift so the button is never flat, and a faster
-   sheen. The sheen is its own layer rather than a background-position trick on
-   the button, so it composites without repainting the text under it. */
+   Unavailable is a flat fill too, never a fade: CSS opacity composites the
+   whole subtree, so fading the button faded its white label with it (2.82:1
+   for the ten minutes it spends saying "Asking Hello…"). Measured from the
+   tokens in ask-hello-contrast.test.ts. */
 .ask-hello {
-  background-image: linear-gradient(
-    110deg,
-    #3b5488 0%,
-    #2b5f72 28%,
-    #574189 55%,
-    #2b5f72 78%,
-    #3b5488 100%
-  );
-  background-size: 300% 100%;
-  animation: ask-hello-drift 9s linear infinite;
-  box-shadow: 0 1px 2px rgb(15 23 42 / 0.18), inset 0 0 0 1px rgb(255 255 255 / 0.08);
+  background-color: var(--ink);
 }
-
-/* NOT AVAILABLE YET — no job role to draft from.
-   A flat desaturated fill rather than a fade: #556070 is 6.38:1 against the
-   white label, so "you cannot press this" costs nothing in legibility. The
-   animation stops too, because a button that glows and cannot be pressed is
-   an invitation with no door. */
 .ask-hello--idle {
-  background-image: none;
-  background-color: #556070;
-  animation: none;
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
-}
-.ask-hello--idle .ask-hello__sheen {
-  display: none;
+  background-color: var(--ink-3);
 }
 
 /* `:not(:focus-visible)` is the whole point of this selector, not decoration.
-   `.ask-hello:hover:not([aria-disabled='true'])` is specificity (0,3,0) —
-   `:not()` contributes its argument — and Tailwind's
-   `.focus-visible\:ring-2:focus-visible` is (0,2,0). Specificity beats source
-   order, so a button that was BOTH hovered and focus-visible had its entire
-   ring box-shadow replaced by this glow: the 2px indicator vanished, leaving
-   something visually identical to the unfocused hover state. Reachable by any
-   keyboard user whose pointer happens to rest over the button — click into
-   "Job role", then Tab. */
+   `.ask-hello:hover:not([aria-disabled='true'])` is specificity (0,3,0) and
+   Tailwind's `.focus-visible\:ring-2:focus-visible` is (0,2,0), so a rule here
+   that set box-shadow would erase the ring on a button both hovered and
+   focused. This rule sets a colour and stays clear of the ring regardless. */
 .ask-hello:hover:not([aria-disabled='true']):not(:focus-visible) {
-  box-shadow: 0 2px 10px rgb(59 84 136 / 0.45), inset 0 0 0 1px rgb(255 255 255 / 0.14);
-}
-.ask-hello__sheen {
-  position: absolute;
-  inset: 0;
-  background-image: linear-gradient(
-    100deg,
-    transparent 35%,
-    rgb(255 255 255 / 0.14) 50%,
-    transparent 65%
-  );
-  background-size: 220% 100%;
-  animation: ask-hello-sheen 2.8s ease-in-out infinite;
-  pointer-events: none;
-}
-@keyframes ask-hello-drift {
-  to { background-position: -300% 0; }
-}
-@keyframes ask-hello-sheen {
-  0%   { background-position: 140% 0; }
-  60%  { background-position: -40% 0; }
-  100% { background-position: -40% 0; }
+  background-color: var(--ink-2);
 }
 
-/* A looping gradient behind a control someone is WAITING on is exactly the
-   motion this rule exists for. The button keeps its colour and every label.
-   At `background-position: 0 0` with a 300% background, the visible third of
-   the ramp runs from #3b5488 to about the #2b5f72 stop — a floor of 7.04:1,
-   because the sheen is `opacity: 0` here and the 0.14 reduction never
-   applies. (An earlier version of this comment claimed position 0 showed only
-   the #3b5488 stop. It does not; the conclusion happened to survive.) */
-@media (prefers-reduced-motion: reduce) {
-  .ask-hello {
-    animation: none;
-    background-position: 0 0;
-  }
-  .ask-hello__sheen {
-    animation: none;
-    opacity: 0;
-  }
-}
-
-/* SlideOver — the drawer travels in from the right edge.
+/* SlideOver: the drawer travels in from the right edge.
    `transform` and `opacity` only: both are compositor-driven, so opening the
    drawer over a long roles list does not relayout the page behind the
    backdrop. */
@@ -553,12 +283,11 @@ body .text-red-700 { color: var(--error-text); }
   animation: slide-over-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* Dialog — the centred panel settles in: a short fade and a slight scale,
+/* Dialog: the centred panel settles in, with a short fade and a slight scale,
    again `transform` and `opacity` only. Shorter than the drawer because it
    travels no distance. The final keyframe is `transform: none`, not
-   `scale(1)`, for the reason `fade-up` gives above: under `both` fill mode a
-   retained transform makes the panel a containing block for any
-   `position: fixed` descendant. */
+   `scale(1)`: under `both` fill mode a retained transform makes the panel a
+   containing block for any `position: fixed` descendant. */
 @keyframes dialog-in {
   from {
     transform: scale(0.97);
@@ -574,11 +303,11 @@ body .text-red-700 { color: var(--error-text); }
   animation: dialog-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* The drawer and the dialog still APPEAR — only the motion is dropped, and
+/* The drawer and the dialog still APPEAR: only the motion is dropped, and
    the animation is removed rather than merely paused. `animation: none` alone
    would be wrong here: the `both` fill mode holds the FIRST keyframe, which
    would park the panel off-target (2rem aside, or scaled down) at
-   `opacity: 0` — an invisible modal for exactly the users this rule exists to
+   `opacity: 0`, an invisible modal for exactly the users this rule exists to
    serve. The two resets below are what actually put it in place. */
 @media (prefers-reduced-motion: reduce) {
   .slide-over-panel,
@@ -589,8 +318,8 @@ body .text-red-700 { color: var(--error-text); }
   }
 }
 
-/* Combobox — the list unfolds from its trigger: a short drop and fade, no
-   height animation (animating height reflows everything under it every
+/* Combobox: the list unfolds from its trigger, with a short drop and fade and
+   no height animation (animating height reflows everything under it every
    frame). Same `transform: none` end state and the same reduced-motion reset
    as the panels above, for the same reasons. */
 @keyframes combobox-in {
@@ -619,5 +348,55 @@ body .text-red-700 { color: var(--error-text); }
     animation: none;
     transform: none;
     opacity: 1;
+  }
+}
+
+/* ── Windows contrast themes ─────────────────────────────────────────────
+   Forced colours keep borders and text but drop backgrounds and box-shadows,
+   so any state drawn with a fill or a shadow vanishes. Each of those gets a
+   system-colour equivalent here. Panels and the sheet are real borders, so
+   they survive; these rules make the states as visible as the surfaces. */
+@media (forced-colors: active) {
+  .sheet,
+  .glass,
+  .glass-strong,
+  .glass-modal,
+  .glass-sunken {
+    border: 1px solid CanvasText;
+  }
+
+  /* Selection. `aria-current` is the nav's paper tab; `aria-pressed` and
+     `aria-selected` are the ink fills of segments and tabs. */
+  [aria-current='page'],
+  [aria-pressed='true'],
+  [aria-selected='true'] {
+    forced-color-adjust: none;
+    background-color: Highlight;
+    color: HighlightText;
+    border-color: Highlight;
+  }
+
+  [role='switch'] {
+    forced-color-adjust: none;
+    background-color: Canvas;
+    border: 1px solid CanvasText;
+  }
+  [role='switch'] > span {
+    background-color: CanvasText;
+  }
+  [role='switch'][aria-checked='true'] {
+    background-color: Highlight;
+    border-color: Highlight;
+  }
+  [role='switch'][aria-checked='true'] > span {
+    background-color: HighlightText;
+  }
+
+  .skeleton {
+    border: 1px solid CanvasText;
+  }
+
+  :focus-visible {
+    outline: 2px solid Highlight;
   }
 }

@@ -15,11 +15,13 @@ import type {
 import { cx } from './cx';
 
 export const controlClass = cx(
-  'w-full rounded-control bg-white/80 px-3 text-sm text-ink placeholder:text-ink-tertiary',
-  // Control boundary must clear WCAG 1.4.11 (3:1): the muted ink is 4.68:1 on white.
-  'shadow-[inset_0_0_0_1px_var(--ink-muted)] transition-[box-shadow,background-color] duration-200 ease-soft',
-  'hover:bg-white focus:bg-white focus:outline-none focus:shadow-[inset_0_0_0_1.5px_var(--info)]',
-  'disabled:cursor-not-allowed disabled:bg-ink/[0.04] disabled:text-ink-tertiary',
+  'w-full rounded-control border border-[var(--control)] bg-surface px-3 text-sm text-ink placeholder:text-ink-tertiary',
+  // A real border, so it survives forced colours; `--control` clears WCAG
+  // 1.4.11's 3:1 on paper and on a shaded field. Focus thickens it to a 2px ink
+  // edge, the same weight as the ring on every other control.
+  'transition-[border-color,background-color] duration-hover ease-out',
+  'hover:bg-surface-secondary focus:bg-surface focus:outline-none focus:border-[var(--ink)] focus:shadow-[0_0_0_1px_var(--ink)]',
+  'disabled:cursor-not-allowed disabled:bg-surface-secondary disabled:text-ink-tertiary',
 );
 
 export interface FieldProps {
@@ -42,10 +44,10 @@ export function Field({ label, hint, error, children, id, className, inline }: F
   const describedBy = [hint ? hintId : null, error ? errorId : null].filter(Boolean).join(' ') || undefined;
   return (
     <div className={cx(inline ? 'flex items-center gap-3' : 'flex flex-col gap-1.5', className)}>
-      {/* Label step (13/20, medium, secondary ink), sentence case. Hints and
+      {/* A form label: 12px at Plex's condensed width, sentence case. Hints and
           errors are the meta size with a prose line height (12/20): they can
           run to two lines, where 16px leading crowds. */}
-      <label htmlFor={controlId} className="text-label font-medium text-ink-secondary">
+      <label htmlFor={controlId} className="form-label">
         {label}
       </label>
       {children({ id: controlId, describedBy, invalid: Boolean(error) })}
@@ -70,7 +72,7 @@ export interface TextFieldProps extends Omit<InputHTMLAttributes<HTMLInputElemen
 export function TextField({ className, size = 'md', ...rest }: TextFieldProps) {
   return (
     <input
-      className={cx(controlClass, size === 'sm' ? 'h-8 text-label' : 'h-9', className)}
+      className={cx(controlClass, size === 'sm' ? 'h-7 text-label' : 'h-9', className)}
       {...rest}
     />
   );
@@ -94,7 +96,7 @@ export interface SelectFieldProps extends Omit<SelectHTMLAttributes<HTMLSelectEl
 export function SelectField({ className, size = 'md', children, ...rest }: SelectFieldProps) {
   return (
     <select
-      className={cx(controlClass, 'control-select', size === 'sm' ? 'h-8 text-label' : 'h-9', className)}
+      className={cx(controlClass, 'control-select', size === 'sm' ? 'h-7 text-label' : 'h-9', className)}
       {...rest}
     >
       {children}

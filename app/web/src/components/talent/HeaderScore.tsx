@@ -72,7 +72,7 @@ export function HeaderScore({ assessments, sessions, className }: HeaderScorePro
           <span
             data-recommendation={reco.tone}
             className={cx(
-              'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-label font-semibold',
+              'inline-flex items-center gap-1.5 whitespace-nowrap rounded-chip px-2.5 py-0.5 text-label font-semibold',
               PILL_TONE[reco.tone],
             )}
           >
@@ -96,7 +96,7 @@ export function HeaderScore({ assessments, sessions, className }: HeaderScorePro
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 sm:justify-end">
         {score == null ? (
-          <p className="text-[15px] font-semibold leading-8 text-ink-secondary">Not scored</p>
+          <p className="text-section leading-8 text-ink-secondary">Not scored</p>
         ) : (
           <p className={cx('flex items-baseline gap-1.5', held ? 'text-ink-secondary' : 'text-ink')}>
             <span className="text-stat leading-none tabular-nums">{score}</span>

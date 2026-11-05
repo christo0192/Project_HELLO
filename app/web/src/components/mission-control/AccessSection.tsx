@@ -387,7 +387,7 @@ export function AccessSection() {
 
       <HandoverPanel entries={entries} onHandover={handoverRecords} />
 
-      <p className="text-[13px] leading-5 text-ink-tertiary">
+      <p className="text-label leading-5 text-ink-tertiary">
         Self-modification and removal of the last linked active admin are
         rejected by the server (409) — this surface never attempts to bypass
         those guards.

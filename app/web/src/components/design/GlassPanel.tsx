@@ -1,13 +1,11 @@
 /**
- * GlassPanel — the shell's card material.
+ * GlassPanel: the panel primitive. The name is historical; there is no glass.
  *
- * A frosted, translucent surface floating on the lit ground. Depth comes
- * from blur + shadow, so panels never nest: inside a panel use
- * `level="sunken"` wells (a tinted, borderless block) or plain rows.
+ * A printed box on the sheet: opaque paper, a 1px rule for an edge, no shadow,
+ * no blur. Boxes never nest: inside a panel use `level="sunken"` wells (a
+ * shaded field with no edge) or plain ruled rows.
  *
- * No motion import here on purpose — candidate-scoped files may render it.
- * Hover lift for `interactive` panels is CSS (`.glass-interactive`) and
- * collapses under `prefers-reduced-motion`.
+ * No motion import here on purpose: candidate-scoped files may render it.
  */
 import type { ElementType, HTMLAttributes, ReactNode, Ref } from 'react';
 import { cx } from './cx';
@@ -39,8 +37,6 @@ export interface GlassPanelProps extends HTMLAttributes<HTMLElement> {
   as?: ElementType;
   level?: GlassLevel;
   padding?: GlassPadding;
-  /** Lifts on hover (links, drill-down cards). */
-  interactive?: boolean;
   children: ReactNode;
 }
 
@@ -48,7 +44,6 @@ export function GlassPanel({
   as,
   level = 'raised',
   padding = 'md',
-  interactive = false,
   className,
   children,
   ...rest
@@ -56,12 +51,7 @@ export function GlassPanel({
   const Component = (as ?? 'div') as ElementType;
   return (
     <Component
-      className={cx(
-        levelClass[level],
-        paddingClass[padding],
-        interactive && 'glass-interactive',
-        className,
-      )}
+      className={cx(levelClass[level], paddingClass[padding], className)}
       {...rest}
     >
       {children}

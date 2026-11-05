@@ -4,15 +4,15 @@ import { cx } from './cx';
 export type StatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
 
 /*
- * Hue lives in the dot and the tint; the label is small text and therefore
- * uses the text-only derivatives (≥ 4.5:1 on the tint) or the ink.
+ * The word carries the status. A tone is a shaded field and a dot in ink; only
+ * a fault on our side takes a hue, as crimson text inside a crimson edge.
  */
 const toneStyles: Record<StatusTone, string> = {
-  neutral: 'bg-ink/[0.05] text-ink-secondary',
+  neutral: 'bg-surface-secondary text-ink-secondary',
   info: 'bg-info-soft text-ink-secondary',
   success: 'bg-success-soft text-success-text',
   warning: 'bg-warning-soft text-warning-text',
-  danger: 'bg-error-soft text-error-text',
+  danger: 'bg-error-soft text-error-text ring-1 ring-inset ring-error',
 };
 
 const dotStyles: Record<StatusTone, string> = {
@@ -32,7 +32,7 @@ export interface StatusBadgeProps {
 }
 
 /**
- * Small semantic status pill — restrained, text-first. Meta step of the type
+ * Small semantic status chip: restrained, text-first. Meta step of the type
  * scale (12/16, medium), sentence case, tabular figures so a count inside a
  * badge ("Quota 92%") holds its width as it changes.
  */
@@ -46,7 +46,7 @@ export function StatusBadge({
     <span
       data-status-badge={tone}
       className={cx(
-        'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-meta font-medium tabular-nums',
+        'inline-flex items-center gap-1.5 whitespace-nowrap rounded-chip px-2 py-0.5 text-meta font-medium tabular-nums',
         toneStyles[tone],
         className,
       )}

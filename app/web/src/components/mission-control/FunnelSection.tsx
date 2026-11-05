@@ -221,7 +221,7 @@ export function FunnelSection() {
                   <Tr key={`${g.stage}:${g.code}`}>
                     <Td className="text-ink">{g.stage}</Td>
                     <Td>
-                      <span className="inline-block rounded-md bg-surface-tertiary px-1.5 py-0.5 font-mono text-xs text-ink">
+                      <span className="inline-block rounded-md bg-surface-tertiary px-1.5 py-0.5 text-xs text-ink">
                         {g.code}
                       </span>
                     </Td>

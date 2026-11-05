@@ -1,11 +1,9 @@
 /**
  * Design primitives: Skeleton, Table, PageHeader, StatusBadge,
- * ChartCard, ThemeToggle — rendering, semantics, axe.
+ * ChartCard — rendering, semantics, axe.
  */
 import { render, screen } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { ThemeProvider } from '../../../lib/theme';
 import {
   Skeleton,
   SkeletonText,
@@ -19,13 +17,10 @@ import {
   PageHeader,
   StatusBadge,
   ChartCard,
-  ThemeToggle,
 } from '..';
-import { stubMatchMedia } from './helpers';
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  document.documentElement.classList.remove('dark');
 });
 
 describe('Skeleton family', () => {
@@ -118,22 +113,3 @@ describe('ChartCard', () => {
   });
 });
 
-describe('ThemeToggle', () => {
-  it('toggles between light and dark and persists', async () => {
-    stubMatchMedia(false);
-    const user = userEvent.setup();
-    render(
-      <ThemeProvider>
-        <ThemeToggle />
-      </ThemeProvider>,
-    );
-    const button = screen.getByRole('button', { name: 'Switch to dark theme' });
-    await user.click(button);
-    expect(document.documentElement.classList.contains('dark')).toBe(true);
-    expect(
-      screen.getByRole('button', { name: 'Switch to light theme' }),
-    ).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Switch to light theme' }));
-    expect(document.documentElement.classList.contains('dark')).toBe(false);
-  });
-});

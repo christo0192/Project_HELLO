@@ -142,7 +142,7 @@ function Banner({
     <div
       role="status"
       className={cx(
-        'flex items-start gap-3 rounded-[14px] px-3.5 py-2.5 text-sm leading-6 text-ink',
+        'flex items-start gap-3 rounded-control px-3.5 py-2.5 text-sm leading-6 text-ink',
         tint,
         className,
       )}
@@ -606,7 +606,7 @@ export function PhoneCalendarPage() {
         className={
           message
             ? cx(
-                'mt-5 rounded-[14px] px-3.5 py-2.5 text-sm leading-6 text-ink',
+                'mt-5 rounded-control px-3.5 py-2.5 text-sm leading-6 text-ink',
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
                 message.tone === 'ok' ? 'bg-success-soft' : 'bg-error-soft',
               )

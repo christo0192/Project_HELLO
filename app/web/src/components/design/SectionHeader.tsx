@@ -2,10 +2,10 @@
  * SectionHeader — the one heading row used inside panels and above
  * tables: title (h2/h3), one-sentence description, optional actions.
  *
- * Type: the title sits on the SECTION step of the scale (15/20, 600,
- * -0.01em) at both levels. `level` is document outline, not size: an h2 on
- * the ground and an h3 inside a panel read at the same weight, and the page
- * title (28/34) is the only step above them. The description is the label
+ * Type: the title sits on the SECTION step of the scale (16/24, 600) at both
+ * levels. `level` is document outline, not size: an h2 on the sheet and an h3
+ * inside a panel read at the same weight, and the page title (24/32) is the
+ * only step above them. The description is the label
  * step (13/20) in tertiary ink; `meta` (a count, a badge) sits on the title's
  * baseline in tabular figures so "24" and "240" do not jitter as data loads.
  *

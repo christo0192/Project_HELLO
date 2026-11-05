@@ -40,28 +40,22 @@
  * as one block to a sighted user — the swatch colour is the only thing
  * linking legend to bar, and it is not injective.
  */
-import { motion } from "motion/react";
 import { useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { useReducedMotion } from "../../lib/motion";
 
 export type PipelineTone =
   "accent" | "positive" | "caution" | "negative" | "neutral";
 
-/** Fill per tone, in the candidate-surface palette (`--c-*`, candidate-palette.css). */
+/**
+ * Fill per tone: ink steps, each clear of the 3:1 a meaningful graphic needs
+ * against the track (WCAG 1.4.11). A stage is named in the legend, so its fill
+ * only has to differ from its neighbours; an outcome is not coloured good or bad.
+ */
 const FILL: Record<PipelineTone, string> = {
-  accent: "var(--c-accent)",
-  positive: "var(--c-positive)",
-  caution: "var(--c-caution)",
-  negative: "var(--c-negative)",
-  // MEASURED, after two wrong guesses in opposite directions.
-  // `--c-ink-secondary` (#334155) is an ink token: 8.90:1 on the track, so
-  // "nobody dialled yet" drew as the heaviest block and read as a full worked
-  // pipeline. `--c-border` (#dbe1ec) overshot the other way at 1.13:1 —
-  // one step from the empty track itself, and identical to the `unavailable`
-  // swatch, so the usually-dominant bucket became invisible.
-  // `--c-ink-muted` is 4.03:1 on the track and 4.68:1 on the surface: clear of
-  // the 3:1 floor a meaningful graphic needs (WCAG 1.4.11), without shouting.
+  accent: "var(--c-ink)",
+  positive: "var(--c-ink-secondary)",
+  caution: "var(--c-control-border)",
+  negative: "var(--c-ink)",
   neutral: "var(--c-ink-muted)",
 };
 
@@ -101,11 +95,11 @@ export interface PipelineBarProps {
 /** 44px minimum target, matching the filter pills this legend replaced. */
 const TOGGLE_CLASS = (selected: boolean) =>
   [
-    "inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium transition-colors duration-200",
+    "inline-flex min-h-11 items-center gap-1.5 rounded-control px-3 text-label font-medium transition-colors duration-hover",
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]",
     selected
-      ? "bg-[var(--c-accent)] text-[var(--c-data-label-inside)] shadow-pill"
-      : "bg-[var(--c-surface)] text-[var(--c-ink-secondary)] shadow-[inset_0_0_0_1px_var(--c-border)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]",
+      ? "bg-[var(--c-accent)] text-[var(--c-data-label-inside)]"
+      : "bg-[var(--c-surface)] text-[var(--c-ink-secondary)] border border-[var(--c-control-border)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]",
   ].join(" ");
 
 /** "16%", "4.5%", or "<1%" for a real but tiny share. Same basis as the width. */
@@ -146,7 +140,6 @@ export function PipelineBar({
   const selected = new Set(selectedKeys ?? []);
   const interactive = typeof onToggle === "function";
 
-  const reduced = useReducedMotion();
   const wrapRef = useRef<HTMLDivElement>(null);
   const tipRef = useRef<HTMLSpanElement>(null);
   const [active, setActive] = useState<ActiveSegment | null>(null);
@@ -205,7 +198,7 @@ export function PipelineBar({
           <span
             aria-hidden="true"
             data-pipeline-track=""
-            className="flex h-2.5 w-full overflow-hidden rounded-full"
+            className="flex h-2.5 w-full overflow-hidden rounded-chip"
             style={{ backgroundColor: "var(--c-border-light)" }}
           >
             {drawn.map((s, i) => (
@@ -220,7 +213,7 @@ export function PipelineBar({
                 }
                 // `shrink-0`: flex children default to shrinking, which is how an
                 // over-sum used to renormalise into a believable full bar.
-                className="block h-full shrink-0 transition-opacity duration-150 first:rounded-l-full motion-reduce:transition-none"
+                className="block h-full shrink-0 transition-opacity duration-hover motion-reduce:transition-none"
                 style={{
                   opacity: active && active.key !== s.key ? 0.45 : 1,
                   width: `${(s.value / denominator) * 100}%`,
@@ -229,32 +222,16 @@ export function PipelineBar({
                   // (new/queued, screened/advanced) and would read as one block.
                   boxShadow:
                     i > 0 ? "inset 1px 0 0 0 var(--c-surface)" : undefined,
-                  // Only cap the right edge when the bar genuinely ends here; a
-                  // rounded cap over an unaccounted gap reads as complete.
-                  borderTopRightRadius:
-                    remainder === 0 && i === drawn.length - 1
-                      ? 9999
-                      : undefined,
-                  borderBottomRightRadius:
-                    remainder === 0 && i === drawn.length - 1
-                      ? 9999
-                      : undefined,
                 }}
               />
             ))}
           </span>
           {activeSegment && (
-            <motion.span
+            <span
               ref={tipRef}
               aria-hidden="true"
               data-pipeline-tooltip=""
-              initial={reduced ? false : { opacity: 0, y: 2 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{
-                duration: reduced ? 0 : 0.12,
-                ease: [0.22, 1, 0.36, 1],
-              }}
-              className="glass-strong pointer-events-none absolute bottom-full z-10 mb-2 flex -translate-x-1/2 items-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium text-[var(--c-ink)]"
+              className="glass-modal pointer-events-none absolute bottom-full z-10 mb-2 flex -translate-x-1/2 items-center gap-1.5 whitespace-nowrap rounded-control px-2.5 py-1.5 text-xs font-medium text-[var(--c-ink)]"
               // Hidden until measured so the first frame never flashes at 0.
               style={{
                 left: tipLeft ?? 0,
@@ -274,7 +251,7 @@ export function PipelineBar({
               <span className="tabular-nums text-[var(--c-ink-secondary)]">
                 {formatShare(activeSegment.value, denominator)}
               </span>
-            </motion.span>
+            </span>
           )}
         </div>
       )}
@@ -349,7 +326,7 @@ export function PipelineBar({
               {...legendHover(s.key)}
               className={
                 interactive
-                  ? "inline-flex min-h-11 items-center gap-1.5 px-3 text-[13px]"
+                  ? "inline-flex min-h-11 items-center gap-1.5 px-3 text-label"
                   : "inline-flex items-center gap-1.5"
               }
             >
@@ -419,7 +396,7 @@ function LegendShell({
   children: ReactNode;
 }) {
   const className =
-    "mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[13px]";
+    "mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-label";
   if (interactive) {
     return (
       <div role="group" aria-label={label} className={className}>
@@ -465,7 +442,7 @@ function DiscrepancyEntry({
     </>
   );
   const cls = interactive
-    ? "inline-flex min-h-11 items-center gap-1.5 px-3 text-[13px]"
+    ? "inline-flex min-h-11 items-center gap-1.5 px-3 text-label"
     : "inline-flex items-center gap-1.5";
   return interactive ? (
     <span className={cls}>{body}</span>

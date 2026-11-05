@@ -21,7 +21,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { missionApi, apiFns } from './apiMock';
 import { R1Section } from '../R1Section';
-import { wrapTheme, chartStubs, forceDarkMode, forceLightMode } from './renderHelpers';
+import { chartStubs } from './renderHelpers';
 
 vi.mock('../../../api', () => ({
   api: missionApi.api,
@@ -75,7 +75,7 @@ const SETTINGS = {
 function renderSection() {
   return render(
     <MemoryRouter>
-      {wrapTheme(<R1Section />)}
+      <R1Section />
     </MemoryRouter>,
   );
 }
@@ -91,7 +91,6 @@ describe('R1Section (Mission Control)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chartStubs();
-    forceLightMode();
     apiFns.getR1Usage.mockResolvedValue(USAGE);
     apiFns.getR1Settings.mockResolvedValue(SETTINGS);
   });
@@ -463,13 +462,6 @@ describe('R1Section (Mission Control)', () => {
   });
 
   it('has no axe violations in light mode', async () => {
-    const { container } = renderSection();
-    await screen.findByRole('table', { name: 'R1 allowance data' });
-    await expect(container).toHaveNoViolations();
-  });
-
-  it('renders in dark mode with no axe violations', async () => {
-    forceDarkMode();
     const { container } = renderSection();
     await screen.findByRole('table', { name: 'R1 allowance data' });
     await expect(container).toHaveNoViolations();

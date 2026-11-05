@@ -214,7 +214,7 @@ export function MetricAskHello({ idPrefix, draft, onApply, resetKey = 0 }: Metri
     // to the LEFT of the button rather than squeezing it under.
     <div className="w-full min-w-0 space-y-2">
       <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
-        <div className="min-w-0 flex-1 text-[13px] leading-5">
+        <div className="min-w-0 flex-1 text-label leading-5">
           {/* Mounted from the first render, so it announces reliably. The
               ONLY place the busy state is put into words — on screen and to
               a screen reader alike — because the button's name and label
@@ -241,11 +241,10 @@ export function MetricAskHello({ idPrefix, draft, onApply, resetKey = 0 }: Metri
           data-ask-hello=""
           // The Ask Hello pill, verbatim — NO `opacity-*` anywhere in this
           // component (ask-hello-contrast.test.ts reads this class list).
-          className={`ask-hello relative inline-flex min-h-11 shrink-0 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+          className={`ask-hello relative inline-flex min-h-11 shrink-0 items-center gap-2 overflow-hidden rounded-control px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
             drafting ? 'cursor-progress' : !nameReady ? 'ask-hello--idle cursor-not-allowed' : ''
           }`}
         >
-          <span aria-hidden="true" className="ask-hello__sheen" />
           <span aria-hidden="true" className="relative">
             {drafting ? '◐' : '✦'}
           </span>

@@ -29,7 +29,6 @@
  * its own (advance / hold / reject), in which case the caller passes a tone.
  * Colour is never the only signal: the label is always printed.
  */
-import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { cx } from '../design/cx';
 import { Skeleton } from '../design/Skeleton';
@@ -180,7 +179,7 @@ export function BarList({
                       <Link
                         to={row.href}
                         aria-label={name}
-                        className="flex min-h-11 items-center rounded-md text-ink-secondary underline-offset-4 transition-colors duration-150 ease-out hover:text-ink hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info sm:min-h-8"
+                        className="flex min-h-11 items-center rounded-md text-ink-secondary underline-offset-4 transition-colors duration-hover ease-out hover:text-ink hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info sm:min-h-8"
                       >
                         <span className="truncate">{row.label}</span>
                       </Link>
@@ -196,10 +195,10 @@ export function BarList({
                       'h-2 min-w-0 flex-1',
                       // Only a whole-scaled bar has a track: there a full
                       // track does mean "all of them".
-                      scale === 'total' && 'overflow-hidden rounded-[3px] bg-ink/[0.06]',
+                      scale === 'total' && 'overflow-hidden rounded-chip bg-ink/[0.06]',
                     )}
                   >
-                    <GrowFill pct={pct} className={FILL[row.tone ?? 'info']} />
+                    <Fill pct={pct} className={FILL[row.tone ?? 'info']} />
                   </span>
                 </div>
               </th>
@@ -217,26 +216,7 @@ export function BarList({
   );
 }
 
-/**
- * The fill is sized to its share from the first frame and only its SCALE
- * animates (transform, not width: no layout work per frame). It grows from
- * the left once, 240ms ease-out, and the global reduced-motion rule collapses
- * the transition to nothing.
- */
-function GrowFill({ pct, className }: { pct: number; className: string }) {
-  const [drawn, setDrawn] = useState(false);
-  useEffect(() => {
-    const frame = requestAnimationFrame(() => setDrawn(true));
-    return () => cancelAnimationFrame(frame);
-  }, []);
-  return (
-    <span
-      className={cx(
-        'block h-full origin-left rounded-[3px] transition-transform duration-[240ms] ease-out',
-        drawn ? 'scale-x-100' : 'scale-x-0',
-        className,
-      )}
-      style={{ width: `${pct}%` }}
-    />
-  );
+/** The fill is printed at its share. Nothing grows in. */
+function Fill({ pct, className }: { pct: number; className: string }) {
+  return <span className={cx('block h-full rounded-chip', className)} style={{ width: `${pct}%` }} />;
 }

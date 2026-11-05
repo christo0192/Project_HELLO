@@ -1,30 +1,28 @@
 /**
  * Notices and empty/error panels.
  *
- * `InlineNotice` — a one-line status or alert with a tone dot (small text
- * always uses the ink; hue lives in the dot and tint).
- * `EmptyPanel` / `ErrorPanel` — quiet, centred states that sit inside a
- * glass panel without adding another card.
+ * `InlineNotice`: a one-line status or alert with a tone dot. Small text is
+ * always ink, and a notice appears at once: it is news, not an entrance.
+ * `EmptyPanel` / `ErrorPanel`: quiet, centred states that sit inside a panel
+ * without adding another card. Only a fault carries a hue, on its edge and dot.
  *
  * Type: messages are body (14/20); an empty state's title is body-medium and
  * its hint the label step (13/20, tertiary). Centred copy wraps with
  * `text-pretty` so a two-line hint never strands one word on its last line.
  */
-import { motion } from 'motion/react';
 import type { ReactNode } from 'react';
 import { plainErrorText } from '../../lib/api-error-copy';
-import { usePanelVariants } from '../../lib/motion';
 import { Button } from './Button';
 import { cx } from './cx';
 
 export type NoticeTone = 'info' | 'success' | 'warning' | 'danger' | 'neutral';
 
 const toneTint: Record<NoticeTone, string> = {
-  info: 'bg-info-soft',
-  success: 'bg-success-soft',
-  warning: 'bg-warning-soft',
-  danger: 'bg-error-soft',
-  neutral: 'bg-ink/[0.04]',
+  info: 'border-line-strong bg-info-soft',
+  success: 'border-line-strong bg-success-soft',
+  warning: 'border-line-strong bg-warning-soft',
+  danger: 'border-error bg-error-soft',
+  neutral: 'border-line-strong bg-surface-secondary',
 };
 
 const toneDot: Record<NoticeTone, string> = {
@@ -52,15 +50,11 @@ export interface InlineNoticeProps {
 }
 
 export function InlineNotice({ tone = 'info', children, role = 'status', action, className }: InlineNoticeProps) {
-  const variants = usePanelVariants();
   return (
-    <motion.div
-      variants={variants}
-      initial="initial"
-      animate="enter"
+    <div
       role={role === 'none' ? undefined : role}
       className={cx(
-        'flex flex-wrap items-center gap-3 rounded-[14px] px-3.5 py-2.5 text-sm text-ink',
+        'flex flex-wrap items-center gap-3 rounded-control border px-3.5 py-2.5 text-sm text-ink',
         toneTint[tone],
         className,
       )}
@@ -76,7 +70,7 @@ export function InlineNotice({ tone = 'info', children, role = 'status', action,
         <span className="min-w-0 flex-1">{children}</span>
       </span>
       {action}
-    </motion.div>
+    </div>
   );
 }
 
@@ -100,7 +94,7 @@ export function EmptyPanel({ title, hint, action, icon, compact = false, classNa
       )}
     >
       {icon && (
-        <span aria-hidden="true" className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-white text-ink-tertiary shadow-pill">
+        <span aria-hidden="true" className="mb-3 flex h-10 w-10 items-center justify-center rounded-control bg-surface text-ink-tertiary">
           {icon}
         </span>
       )}
@@ -169,7 +163,7 @@ export function ErrorPanel({
     <div
       role={role === 'none' ? undefined : role}
       className={cx(
-        'flex flex-col items-center justify-center rounded-[14px] bg-error-soft text-center',
+        'flex flex-col items-center justify-center rounded-control border border-error bg-error-soft text-center',
         compact ? 'px-4 py-8' : 'px-6 py-12',
         className,
       )}

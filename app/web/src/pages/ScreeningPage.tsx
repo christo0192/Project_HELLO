@@ -200,7 +200,7 @@ function Bubble({ speaker, text }: TranscriptLine) {
           className={
             isBot
               ? "glass-sunken px-4 py-2.5 text-left text-sm leading-relaxed text-ink"
-              : "rounded-[18px] bg-info px-4 py-2.5 text-left text-sm leading-relaxed text-white"
+              : "rounded-control bg-info px-4 py-2.5 text-left text-sm leading-relaxed text-white"
           }
         >
           {text}

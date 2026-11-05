@@ -213,11 +213,12 @@ describe('palette — every colour utility resolves to a real token', () => {
     for (const m of colorsBlock.matchAll(/^\s{8}'?([a-z0-9-]+)'?:\s*'(?:var|rgb)\(/gm)) {
       tokens.add(m[1]);
     }
-    // Nested numeric scales: brand.50 … brand.950, accent.*
+    // Nested numeric scales: brand.50 … brand.950 and accent.*, which share the
+    // `accentScale` declared at the top of the config.
+    const scale = config.slice(config.indexOf('const accentScale = {'));
+    const block = scale.slice(0, scale.indexOf('}'));
     for (const family of ['brand', 'accent']) {
-      const start = colorsBlock.indexOf(`${family}: {`);
-      if (start === -1) continue;
-      const block = colorsBlock.slice(start, colorsBlock.indexOf('}', start));
+      if (!colorsBlock.includes(`${family}: accentScale`)) continue;
       for (const m of block.matchAll(/^\s+(\d+):/gm)) tokens.add(`${family}-${m[1]}`);
     }
     // Utilities that are not theme colours but are valid Tailwind colours.
