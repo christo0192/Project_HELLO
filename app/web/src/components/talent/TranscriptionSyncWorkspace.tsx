@@ -60,7 +60,7 @@
  * session recording player is kept and turns seek it as before.
  */
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import { readScorecardAssessmentV2, isAssessmentV2 } from '../../types';
 import type {
@@ -374,8 +374,10 @@ export function TranscriptionSyncWorkspace({
     [displayTranscript],
   );
 
-  // A hold belongs to the rows it was clicked on: another session or a reload ends it.
-  useEffect(dropHeldTurn, [turnStarts, dropHeldTurn]);
+  // A hold belongs to the rows it was clicked on: another session or a reload ends it. In the commit, not
+  // after it: a passive effect waits for the paint, so the first click on new rows can arrive before it,
+  // and the rows that click landed on would then end its hold.
+  useLayoutEffect(dropHeldTurn, [turnStarts, dropHeldTurn]);
 
   /* ── Phone legs (M013 S02) ─────────────────────────────────── */
 
