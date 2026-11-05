@@ -225,9 +225,13 @@ test.describe('the strip and the transcript answer the reader', () => {
   test('a phase and a role-play mark answer the pointer, so their tooltips can show', async ({ app, page }) => {
     await app.goto(`${ADDRESS}?tab=recording`);
     for (const selector of ['[data-phase]', '[data-marker]']) {
-      const onTop = await page.locator(selector).first().evaluate((el) => {
-        const box = el.getBoundingClientRect();
-        return document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) === el;
+      // The widest, because on a phone the shortest phases are drawn wider than they last and overlap a
+      // neighbour. What matters here is that the rail under them does not take the pointer.
+      const onTop = await page.locator(selector).evaluateAll((els) => {
+        const widest = els.reduce((a, b) => (b.getBoundingClientRect().width > a.getBoundingClientRect().width ? b : a));
+        widest.scrollIntoView({ block: 'center' });
+        const box = widest.getBoundingClientRect();
+        return document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) === widest;
       });
       expect(onTop, selector).toBe(true);
     }

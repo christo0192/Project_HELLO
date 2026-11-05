@@ -39,7 +39,6 @@
 
 import type { R1DbClient } from '../../services/r1-assessment.js';
 import { readAllPages, type PageResult } from '../id-batches.js';
-import { validateEpochMsAnchor } from '../recording-egress.js';
 import { seesEveryCandidate, type R1StaffActor } from './recording/access.js';
 import { withdrawalCutoffs } from './recording/erase.js';
 import { RECORDINGS_TABLE, type R1RecordingRow } from './recording/service.js';
@@ -185,6 +184,12 @@ function num(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** A stored instant, or null. R1 code stays off the egress module (r1-room-isolation), so it checks its own. */
+function epochMs(value: unknown): number | null {
+  const n = num(value);
+  return n !== null && Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
 const texts = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim() !== '') : [];
 
@@ -297,7 +302,7 @@ function turnOf(row: Row): R1ReviewTurn {
     speaker: String(row.speaker),
     text: typeof row.text === 'string' ? row.text : '',
     turn_started_at_ms: num(row.turn_started_at_ms),
-    turn_ended_at_ms: validateEpochMsAnchor(row.turn_ended_at_ms),
+    turn_ended_at_ms: epochMs(row.turn_ended_at_ms),
     ai_voice: row.ai_voice === 'interviewer' || row.ai_voice === 'learner' ? row.ai_voice : null,
     ai_played_ms: Number.isSafeInteger(row.ai_played_ms) && (row.ai_played_ms as number) >= 0 ? (row.ai_played_ms as number) : null,
     is_gate: row.is_gate === true,
