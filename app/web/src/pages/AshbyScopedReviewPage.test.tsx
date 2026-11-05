@@ -163,6 +163,29 @@ describe('scoped review shell', () => {
     expect(screen.getByRole('region', { name: 'Latest screening score' })).toBeInTheDocument();
   });
 
+  describe('during an appeal', () => {
+    const blocked = {
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, decision_use_blocked_at: '2026-01-02T00:00:00.000Z' },
+    };
+
+    it('shows no score and no verdict anywhere on the page', async () => {
+      mockApi.getAshbyScopedReview.mockResolvedValue(blocked);
+      const { container } = renderPage();
+      await screen.findByText('Jane Doe');
+      await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('session-1'));
+      await screen.findByText('Welcome to the screening.');
+      expect(screen.queryByRole('region', { name: 'Latest screening score' })).toBeNull();
+      expect(container.querySelector('[data-recommendation]')).toBeNull();
+    });
+
+    it('prints that verdict mark when no appeal holds it back, so the check above can fail', async () => {
+      const { container } = renderPage();
+      await screen.findByText('Jane Doe');
+      expect(container.querySelector('[data-recommendation]')).not.toBeNull();
+    });
+  });
+
   it('renders the existing Review workspace content on the Review tab', async () => {
     renderPage();
     await screen.findByText('Jane Doe');

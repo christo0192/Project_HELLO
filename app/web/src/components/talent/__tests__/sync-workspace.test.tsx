@@ -141,6 +141,36 @@ describe('TranscriptionSyncWorkspace', () => {
     expect(await screen.findByText('Retried!')).toBeInTheDocument();
   });
 
+  describe('the scorecard block before it has an answer', () => {
+    const NO_SCORECARD = /No scorecard for this session yet/;
+
+    it('says it is loading while the read runs, never that there is no scorecard', async () => {
+      mockApi.getSession.mockReturnValue(new Promise(() => {}));
+      render(
+        <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={[ASSESSMENT]} blocked={false} />,
+      );
+      expect(await screen.findByText('Loading the scorecard…')).toBeInTheDocument();
+      expect(screen.queryByText(NO_SCORECARD)).not.toBeInTheDocument();
+    });
+
+    it('says it could not load when the read fails, never that there is no scorecard', async () => {
+      mockApi.getSession.mockRejectedValue({ message: 'transcript unavailable' });
+      render(
+        <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={[ASSESSMENT]} blocked={false} />,
+      );
+      expect(await screen.findByText("This scorecard couldn't load. Try again from the transcript.")).toBeInTheDocument();
+      expect(screen.queryByText(NO_SCORECARD)).not.toBeInTheDocument();
+    });
+
+    it('says there is none only once the read has answered with none', async () => {
+      render(
+        <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={NO_ASSESSMENTS} blocked={false} />,
+      );
+      expect(await screen.findByText(NO_SCORECARD)).toBeInTheDocument();
+      expect(screen.queryByText('Loading the scorecard…')).not.toBeInTheDocument();
+    });
+  });
+
   it('falls back to a permission note + latest scorecard for non-admins (403)', async () => {
     mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
     render(

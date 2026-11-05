@@ -38,7 +38,7 @@ import type {
   PhoneCalendarView,
   PhoneFacet,
 } from './phoneCalendarFilters';
-import { Button, Combobox, GlassPanel, cx } from '../design';
+import { Button, Combobox, GlassPanel, RetryButton, cx } from '../design';
 import { appointmentStatusTerm, engagementStateTerm } from './phoneVocabulary';
 
 /**
@@ -46,15 +46,16 @@ import { appointmentStatusTerm, engagementStateTerm } from './phoneVocabulary';
  *
  *   `loading`     — the roles read is in flight: a disabled picker holds the
  *                   place, so the toolbar does not jump when it settles.
- *   `unavailable` — the roles read failed. No picker and no error wall: the
- *                   calendar is whole without it. `requested` is true only
- *                   when the URL asked for an agent, which is the one case
- *                   worth a word — the view is wider than the link asked for.
+ *   `unavailable` — the roles read failed. No picker and no error wall, since
+ *                   the calendar is whole without it, but one line and a
+ *                   Retry where the picker was. `requested` is true when the
+ *                   URL asked for an agent: the view is then wider than the
+ *                   link asked for, and the line says so.
  *   `ready`       — one option per role the operator can see.
  */
 export type PhoneAgentChoices =
   | { status: 'loading' }
-  | { status: 'unavailable'; requested: boolean }
+  | { status: 'unavailable'; requested: boolean; onRetry: () => void }
   | { status: 'ready'; options: PhoneAgentOption[] };
 
 export interface PhoneFilterBarProps {
@@ -127,11 +128,16 @@ function AgentPicker({
   const id = `phone-agent-${rawId.replace(/:/g, '-')}`;
 
   if (agents.status === 'unavailable') {
-    return agents.requested ? (
-      <p className="max-w-xs self-end text-label text-ink-tertiary">
-        Agents could not be loaded, so calls for every agent are shown.
-      </p>
-    ) : null;
+    return (
+      <div className="flex max-w-xs flex-col items-start gap-1.5 self-end">
+        <p className="text-label text-ink-tertiary">
+          {agents.requested
+            ? "Agents couldn't load, so calls for every agent are shown."
+            : "Agents couldn't load, so the agent filter is missing."}
+        </p>
+        <RetryButton onRetry={agents.onRetry} />
+      </div>
+    );
   }
   // An operator who can see no role has nothing to choose between.
   if (agents.status === 'ready' && agents.options.length === 0) return null;

@@ -92,12 +92,27 @@ describe('page and size in the URL', () => {
     await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('?status=new&size=25'));
   });
 
+  // Exact, not `toHaveTextContent`: that is a substring match, and the page this
+  // has to drop would sit after the part it matches.
+  const searchIs = (search: string) =>
+    waitFor(() => expect(screen.getByTestId('search').textContent).toBe(search));
+
   it('keeps the size and drops the page when a filter changes', async () => {
     const user = userEvent.setup();
-    renderPage('/candidates?size=25&page=1');
-    await screen.findByText('Person 0');
+    mockApi.listCandidates.mockResolvedValue(Array.from({ length: 60 }, (_, i) => row(i)));
+    renderPage('/candidates?size=25&page=2');
+    await screen.findByText('Person 25');
     await user.click(within(screen.getByRole('group', { name: 'Filter by status' })).getByRole('button', { name: /^New/ }));
-    await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('?status=new&size=25'));
+    await searchIs('?status=new&size=25');
+  });
+
+  it('keeps the size and drops the page when the sort changes', async () => {
+    const user = userEvent.setup();
+    mockApi.listCandidates.mockResolvedValue(Array.from({ length: 60 }, (_, i) => row(i)));
+    renderPage('/candidates?size=25&page=2');
+    await screen.findByText('Person 25');
+    await user.click(within(screen.getByRole('columnheader', { name: /^Recommendation/ })).getByRole('button'));
+    await searchIs('?sort=score&size=25');
   });
 
   it('keeps a size chosen on this page when a filter changes next', async () => {
@@ -124,6 +139,18 @@ describe('the way back', () => {
     await userEvent.setup().click(link);
     await waitFor(() =>
       expect(screen.getByTestId('state').textContent).toBe(JSON.stringify({ listSearch: '?status=new&page=2' })),
+    );
+  });
+
+  it('hands the Review button it too: that is the main way into a screened candidate', async () => {
+    mockApi.listCandidates.mockResolvedValue([row(1, { status: 'screened' })]);
+    renderPage('/candidates?status=screened&sort=score');
+    const link = await screen.findByRole('link', { name: /^Review\s*, Person 1$/ });
+    await userEvent.setup().click(link);
+    await waitFor(() =>
+      expect(screen.getByTestId('state').textContent).toBe(
+        JSON.stringify({ listSearch: '?status=screened&sort=score' }),
+      ),
     );
   });
 });

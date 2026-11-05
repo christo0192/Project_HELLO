@@ -147,7 +147,7 @@ describe('axe — no WCAG A/AA violations', () => {
 
     apiFns.listRoles.mockRejectedValue(new Error('roles_read_error'));
     const failed = renderPage(`?week=2026-08-24&agent=${ROLE_DATA}`);
-    await screen.findByText(/Agents could not be loaded/);
+    await screen.findByText(/Agents couldn't load/);
     await expect(failed.container).toHaveNoViolations();
   });
 

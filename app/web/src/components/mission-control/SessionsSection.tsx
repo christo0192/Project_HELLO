@@ -160,10 +160,10 @@ export function SessionsSection() {
         title="Sessions"
         meta={
           <span className="text-label tabular-nums text-ink-tertiary">
-            {truncated ? `The ${sessions.length} most recently updated` : `${sessions.length} total`} · {terminalCount} finished
+            {truncated ? `The ${sessions.length} most recently updated` : `${sessions.length} total`} · {terminalCount} closed
           </span>
         }
-        description="Listed by reference, with no candidate details. Finished sessions can't be changed."
+        description="Listed by reference, with no candidate details. Closed sessions can't be changed."
         actions={
           <Button size="sm" variant="secondary" onClick={() => load()}>
             Refresh
@@ -291,7 +291,7 @@ export function SessionsSection() {
             <SectionHeader
               level={3}
               title="Override session status"
-              description="Every change needs a reason and is recorded in the audit log. Finished sessions (failed, cancelled, expired, deleted) can't be changed."
+              description="Every change needs a reason and is recorded in the audit log. Closed sessions (failed, cancelled, expired, deleted) can't be changed."
             />
 
             {sessions.length === 0 ? (
@@ -327,7 +327,7 @@ export function SessionsSection() {
                     options={bounded.map((session) => ({
                       value: session.id,
                       label: `${shortId(session.id)} — ${session.status}${
-                        isTerminalSessionStatus(session.status) ? ' (finished, locked)' : ''
+                        isTerminalSessionStatus(session.status) ? ' (closed, locked)' : ''
                       }`,
                     }))}
                     placeholder="Choose a session"
@@ -381,7 +381,7 @@ export function SessionsSection() {
 
                 {terminal && selected ? (
                   <InlineNotice tone="warning">
-                    This session has finished (
+                    This session is closed (
                     {sessionStatusLabel(selected.status)}) and can't be changed.
                   </InlineNotice>
                 ) : (

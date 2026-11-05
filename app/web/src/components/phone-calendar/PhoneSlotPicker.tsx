@@ -29,7 +29,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { PhoneSlot, PhoneSlotsResponse } from '../../types';
-import { Field, TextField, cx } from '../design';
+import { ErrorPanel, Field, TextField, cx } from '../design';
 import { formatIstTimeRange, isIstDate } from '../../lib/ist-datetime';
 import type { IstDate } from '../../lib/ist-datetime';
 import { slotRefusalLabel } from './phoneVocabulary';
@@ -57,6 +57,8 @@ export function PhoneSlotPicker({
 }: PhoneSlotPickerProps) {
   const [data, setData] = useState<PhoneSlotsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Bumped by Try again: a failed read has no other way back but changing the date. */
+  const [attempt, setAttempt] = useState(0);
 
   const dateFieldId = `${idPrefix}-date`;
   const groupLabelId = `${idPrefix}-slots-label`;
@@ -75,13 +77,13 @@ export function PhoneSlotPicker({
         if (live) setData(res);
       })
       .catch((e: ApiError) => {
-        if (live) setError(phoneErrorMessage(e));
+        if (live) setError(`Slots couldn't load. ${phoneErrorMessage(e)}`);
       });
     return () => {
       live = false;
       controller.abort();
     };
-  }, [date]);
+  }, [date, attempt]);
 
   const select = useCallback(
     (slot: PhoneSlot) => {
@@ -121,11 +123,7 @@ export function PhoneSlotPicker({
         )}
       </Field>
 
-      {error && (
-        <p role="status" className="rounded-control bg-error-soft px-3.5 py-2.5 text-sm text-ink">
-          {error}
-        </p>
-      )}
+      {error && <ErrorPanel compact message={error} onRetry={() => setAttempt((n) => n + 1)} />}
 
       {!error && data === null && (
         <p className="text-sm text-ink-tertiary">Loading slots…</p>

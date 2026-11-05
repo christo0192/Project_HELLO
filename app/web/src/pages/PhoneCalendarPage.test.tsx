@@ -884,11 +884,12 @@ describe('agent filter', () => {
     await waitFor(() =>
       expect(screen.queryByRole('button', { name: /^Agent/ })).not.toBeInTheDocument(),
     );
-    // Every call, every other filter, no error wall, and no retry loop.
+    // Every call, every other filter, no error wall, and no retry loop: one line
+    // says what is missing, and only a press reads again.
     expect(shownRefs()).toHaveLength(5);
     expect(screen.getByRole('group', { name: 'Appointment' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
-    expect(screen.queryByText(/could not be loaded/)).not.toBeInTheDocument();
+    expect(await screen.findByText("Agents couldn't load, so the agent filter is missing.")).toBeInTheDocument();
+    expect(apiFns.listRoles).toHaveBeenCalledTimes(1);
     expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(1);
 
     // The calendar still works: a filter still narrows.
@@ -900,10 +901,32 @@ describe('agent filter', () => {
     apiFns.listRoles.mockRejectedValue(new MockApiError('roles_read_error', 500));
     renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
     expect(
-      await screen.findByText('Agents could not be loaded, so calls for every agent are shown.'),
+      await screen.findByText("Agents couldn't load, so calls for every agent are shown."),
     ).toBeInTheDocument();
     expect(shownRefs()).toHaveLength(5);
     expect(screen.queryByRole('combobox', { name: 'Agent' })).not.toBeInTheDocument();
+  });
+
+  it('brings the picker back from Try again, and applies a deep-linked agent then', async () => {
+    apiFns.listRoles.mockRejectedValueOnce(new MockApiError('roles_read_error', 500));
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
+    await screen.findByText("Agents couldn't load, so calls for every agent are shown.");
+    expect(shownRefs()).toHaveLength(5);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await agentPicker();
+    expect(screen.queryByText(/Agents couldn't load/)).not.toBeInTheDocument();
+    expect(apiFns.listRoles).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']));
+    expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(1);
+  });
+
+  it('names the access check when /api/me fails, with a Retry', async () => {
+    apiFns.getMe.mockRejectedValueOnce(new MockApiError('Internal server error', 500));
+    renderWithUrl(WEEK_QS);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^We couldn't check your access\./);
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await screen.findByRole('table');
   });
 
   it('shows no picker to an operator who can see no role', async () => {

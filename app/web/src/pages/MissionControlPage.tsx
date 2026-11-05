@@ -22,6 +22,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api';
+import { plainErrorText } from '../lib/api-error-copy';
 import type { MeResponse } from '../types';
 import {
   EmptyPanel,
@@ -68,7 +69,7 @@ export function MissionControlPage() {
     api
       .getMe()
       .then(setMe)
-      .catch((e: ApiError) => setLoadError(e.message));
+      .catch((e: ApiError) => setLoadError(`We couldn't check your access. ${plainErrorText(e.message)}`));
   }, []);
 
   useEffect(load, [load]);

@@ -411,9 +411,45 @@ test.describe('key states', () => {
     await app.goto('/mission-control');
     await page.getByRole('tab', { name: 'Sessions' }).click();
 
-    await expect(page.getByText('The 100 most recently updated · 34 finished', { exact: true })).toBeVisible();
+    await expect(page.getByText('The 100 most recently updated · 34 closed', { exact: true })).toBeVisible();
     await expect(page.getByText(/hold the 50 most recently updated\. Older sessions cannot be overridden from here\./)).toBeVisible();
     await auditA11y(page, testInfo, 'mission-control-sessions-cut', { strict: true });
+    app.expectHealthy();
+  });
+});
+
+/**
+ * A halt raised while a recruiter is on a page that says calls go out in the
+ * window. The read is answered as the failed reads below are, by a route
+ * registered after the harness's.
+ */
+test.describe('a calling halt is said outside Mission Control', () => {
+  test('on the pages a recruiter works from, with no Halt button there', async ({ app, page }, testInfo) => {
+    await page.route(`${MOCK_API_ORIGIN}/api/phone/health`, (route) =>
+      route.request().method() === 'GET'
+        ? route.fulfill({
+            status: 200,
+            headers: CORS_HEADERS(route),
+            contentType: 'application/json',
+            body: JSON.stringify({
+              ok: true,
+              enabled: true,
+              status: 'ok',
+              reasons: ['admission_halted'],
+              admission: { control_present: true, halted: true, halt_reason: 'operator_pause' },
+            }),
+          })
+        : route.fallback(),
+    );
+    const line = page.getByRole('status').filter({ hasText: 'Calling halted — operator pause' });
+
+    await app.goto('/phone-calendar');
+    await expect(line).toBeVisible();
+    await expect(page.getByRole('button', { name: /halt all calling/i })).toHaveCount(0);
+    await auditA11y(page, testInfo, 'shell-calling-halted', { strict: true });
+
+    await app.goto('/candidates');
+    await expect(line).toBeVisible();
     app.expectHealthy();
   });
 });

@@ -238,7 +238,9 @@ export function OverviewSection() {
           description={
             sessionsCut
               ? `The ${newestSessions} sessions, largest first.`
-              : `${sessionsData.length} sessions in the admin view, largest first.`
+              : sessions.data
+                ? `${sessionsData.length} sessions in the admin view, largest first.`
+                : 'Sessions in the admin view, largest first.'
           }
         >
           {sessions.error ? (

@@ -1347,9 +1347,18 @@ function RoleForm({
                   onClick={() => {
                     const going = leaving;
                     const next = nextEdit;
+                    if (going === "save") {
+                      // Only the question goes. This form closes when the save
+                      // lands, and that clears the flag; a save that fails or is
+                      // refused leaves the edits on screen, still unsaved, so
+                      // the next way out has to ask again.
+                      setLeaving(null);
+                      if (next) onKeepThisEdit();
+                      void submit();
+                      return;
+                    }
                     scorecardChanged(false);
-                    if (going === "save") void submit();
-                    else if (going === "cancel") onCancel();
+                    if (going === "cancel") onCancel();
                     else if (next) onOpenNextEdit(next);
                   }}
                 >

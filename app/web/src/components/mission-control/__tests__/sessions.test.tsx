@@ -74,7 +74,7 @@ describe('SessionsSection', () => {
   it('calls a short list a total, and adds nothing about a cut', async () => {
     apiFns.listAdminSessions.mockResolvedValue({ sessions: SESSIONS, truncated: false });
     renderSessions();
-    expect(await screen.findByText('3 total · 1 finished')).toBeInTheDocument();
+    expect(await screen.findByText('3 total · 1 closed')).toBeInTheDocument();
     expect(screen.queryByText(/most recently updated/)).not.toBeInTheDocument();
   });
 
@@ -88,7 +88,7 @@ describe('SessionsSection', () => {
     }));
     apiFns.listAdminSessions.mockResolvedValue({ sessions: page, truncated: true });
     renderSessions();
-    expect(await screen.findByText('The 100 most recently updated · 34 finished')).toBeInTheDocument();
+    expect(await screen.findByText('The 100 most recently updated · 34 closed')).toBeInTheDocument();
     expect(screen.queryByText(/\btotal\b/)).not.toBeInTheDocument();
     expect(
       screen.getByText(/hold the 50 most recently updated\. Older sessions cannot be overridden from here\./),
@@ -103,7 +103,7 @@ describe('SessionsSection', () => {
     }));
     apiFns.listAdminSessions.mockResolvedValue({ sessions: page, truncated: false });
     renderSessions();
-    expect(await screen.findByText('60 total · 0 finished')).toBeInTheDocument();
+    expect(await screen.findByText('60 total · 0 closed')).toBeInTheDocument();
     expect(screen.getByText(/hold the 50 most recently updated/)).toBeInTheDocument();
   });
 
@@ -166,14 +166,24 @@ describe('SessionsSection', () => {
     renderSessions();
     await screen.findByText('Override session status');
 
-    await pickOption(userEvent.setup(), /^Session/, /finished, locked/);
+    await pickOption(userEvent.setup(), /^Session/, /closed, locked/);
     expect(
-      screen.getByText(/has finished \(Failed\) and can't be changed/i),
+      screen.getByText(/is closed \(Failed\) and can't be changed/i),
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^Session/ })).toBeDisabled();
     expect(screen.getByRole('button', { name: /^Target status/ })).toBeDisabled();
     expect(screen.getByLabelText('Reason (required)')).toBeDisabled();
     expect(screen.queryByRole('button', { name: 'Apply override' })).not.toBeInTheDocument();
+  });
+
+  it('keeps a Completed session out of the closed count, and open to an override', async () => {
+    renderSessions();
+    await screen.findByText('Override session status');
+    expect(screen.getByText('3 total · 1 closed')).toBeInTheDocument();
+    await pickOption(userEvent.setup(), /^Session/, /— completed$/);
+    expect(screen.queryByText(/is closed/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Reason (required)')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Apply override' })).toBeInTheDocument();
   });
 
   it('maps a 409 resurrection rejection to stable copy', async () => {

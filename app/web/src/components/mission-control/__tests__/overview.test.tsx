@@ -239,6 +239,52 @@ describe('OverviewSection', () => {
     expect(within(sessions).queryByText('0')).not.toBeInTheDocument();
   });
 
+  describe('a source that has not answered', () => {
+    const neverAnswers = () => new Promise<never>(() => {});
+    /** The other sources are in, so anything still loading is that source's own doing. */
+    const othersIn = () =>
+      waitFor(() => expect(within(figureCell('Linked access')).getByText('1')).toBeInTheDocument(), {
+        timeout: 10_000,
+      });
+
+    it('prints no session count while the read is out', async () => {
+      apiFns.listAdminSessions.mockReturnValue(neverAnswers());
+      renderOverview();
+      await othersIn();
+      for (const label of ['Sessions', 'Active sessions']) {
+        expect(within(figureCell(label)).getByText('Loading')).toBeInTheDocument();
+        expect(within(figureCell(label)).queryByText('0')).not.toBeInTheDocument();
+      }
+      expect(screen.getByText('Sessions in the admin view, largest first.')).toBeInTheDocument();
+      expect(screen.queryByText(/^0 sessions/)).not.toBeInTheDocument();
+      expect(screen.queryByText('No sessions yet')).not.toBeInTheDocument();
+    });
+
+    it('prints no session count once the read has failed', async () => {
+      apiFns.listAdminSessions.mockRejectedValue(new missionApi.ApiError('sessions down', 500));
+      renderOverview();
+      await screen.findByText(/Session status mix: sessions down/);
+      expect(screen.getByText('Sessions in the admin view, largest first.')).toBeInTheDocument();
+      expect(screen.queryByText(/^0 sessions/)).not.toBeInTheDocument();
+    });
+
+    it('keeps the count once the read has answered', async () => {
+      renderOverview();
+      expect(await screen.findByText('3 sessions in the admin view, largest first.')).toBeInTheDocument();
+    });
+
+    it('says nothing about quotas until their read answers, while the rest fill in', async () => {
+      apiFns.listAdminQuotas.mockReturnValue(neverAnswers());
+      renderOverview();
+      await othersIn();
+      expect(within(figureCell('Sessions')).getByText('3')).toBeInTheDocument();
+      expect(within(figureCell('Quota policies enabled')).getByText('Loading')).toBeInTheDocument();
+      expect(within(figureCell('Quota policies enabled')).queryByText('0')).not.toBeInTheDocument();
+      expect(screen.queryByText('No quota policies configured')).not.toBeInTheDocument();
+      expect(screen.queryByText('Quota enforcement is off.')).not.toBeInTheDocument();
+    });
+  });
+
   it('never prints a raw code beside a source label', async () => {
     apiFns.listAdminSessions.mockRejectedValue(new missionApi.ApiError('service_unavailable', 503));
     renderOverview();

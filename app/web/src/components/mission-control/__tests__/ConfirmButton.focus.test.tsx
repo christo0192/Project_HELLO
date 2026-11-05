@@ -55,8 +55,13 @@ describe('ConfirmButton focus', () => {
   it('leaves the well open on Escape while the write is in flight', async () => {
     const user = userEvent.setup();
     render(<ConfirmButton label="Apply" summary="Apply it?" onConfirm={() => new Promise(() => {})} />);
-    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    const trigger = screen.getByRole('button', { name: 'Apply' });
+    await user.click(trigger);
     await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    // Loading disables Confirm, and a disabled button sends no key at all. The
+    // trigger stays enabled mid-write, so the press has to start there to reach
+    // the guard.
+    trigger.focus();
     await user.keyboard('{Escape}');
     expect(screen.getByText('Apply it?')).toBeInTheDocument();
   });

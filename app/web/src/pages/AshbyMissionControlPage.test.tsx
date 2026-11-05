@@ -317,6 +317,20 @@ describe('AshbyMissionControlPage', () => {
     expect(await screen.findByRole('alert')).toBeInTheDocument();
   });
 
+  it('keeps the rows when a later read fails, says they may be stale, and Retry clears it', async () => {
+    renderPage();
+    await screen.findByText('Account Executive');
+    listAshbyMappings.mockRejectedValueOnce(new ApiError('service_unavailable', 503));
+    await userEvent.click(screen.getAllByRole('button', { name: 'Pause' })[0]);
+    expect(await screen.findByText(/These lists couldn't refresh, so they may be out of date\./)).toBeInTheDocument();
+    expect(screen.getByText('Account Executive')).toBeInTheDocument();
+    expect(screen.queryByText("Ashby jobs and applications couldn't load.", { exact: false })).toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByText(/couldn't refresh/)).toBeNull());
+    expect(listAshbyMappings).toHaveBeenCalledTimes(3); // first read, the failed one, Retry
+  });
+
   it('shows the bounded preview and requires a second explicit admin confirmation', async () => {
     renderPage();
     await screen.findByText('Account Executive');

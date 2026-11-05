@@ -140,7 +140,7 @@ No label is uppercase, on any surface, including the exported report. The only u
 - Under forced colours a selection, including the transcript turn being played, is `Highlight` with `HighlightText` on everything inside it. The option the arrow keys are on is a `Highlight` outline, a filled button keeps an edge through its transparent border, and a data fill (`.data-fill`: bars, meters, legend swatches) is `CanvasText`.
 - A canvas keeps its author colours in every theme, so a chart and its legend key stay on paper (`.chart-paper`, `[data-series-key]`) and the logo stays on its white plate. Without that, a dark contrast theme puts carbon ink on black.
 - The page is keyed on the path, so a read still in flight cannot land on the next record.
-- The calling state is not in the shell yet. Its only read, `GET /api/phone/health`, is limited to interviewers and above, so a viewer would get a 403 on every route. It needs a read that is safe for every role.
+- A calling halt is in the shell for admins and interviewers, the two roles `GET /api/phone/health` answers: "Calling halted — operator pause", in crimson below the nav, or under the top bar on a narrow screen. A viewer's shell asks nothing, so there is no 403 on their routes. The rest of the calling state (window, on a call, queued) still needs a read that is safe for every role.
 
 ## 6. Primitives (`src/components/design`)
 

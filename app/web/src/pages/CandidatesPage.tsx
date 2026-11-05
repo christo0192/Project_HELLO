@@ -1008,10 +1008,15 @@ export function CandidatesPage() {
             falls back to the stored value: an abandoned candidate reads
             "Queued". Said once, so that is never silent. */}
         {phoneProgressUnknown && (
-          <InlineNotice tone="warning" role="none" className="mt-3">
-            Phone progress could not be loaded for some candidates. Their status shows the stored
+          <InlineNotice
+            tone="warning"
+            role="none"
+            className="mt-3"
+            action={<RetryButton onRetry={() => loadCandidates(roleId)} />}
+          >
+            Phone progress couldn't load for some candidates. Their status shows the stored
             value, so a finished phone outcome (such as “Abandoned: no answer”) may read as
-            “Queued”. Reload the page to try again.
+            “Queued”.
           </InlineNotice>
         )}
 

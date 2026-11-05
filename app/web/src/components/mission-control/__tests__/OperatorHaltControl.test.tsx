@@ -27,6 +27,7 @@ import {
   HALT_REASON_LABELS,
   RECHECK_MIN_INTERVAL_MS,
   haltFailureMessage,
+  haltShellLine,
   haltStateLine,
   haltSuccessMessage,
   haltViewFrom,
@@ -803,6 +804,14 @@ describe('copy', () => {
     expect(haltStateLine({ kind: 'locked', reason: 'legal_hold' })).toBe('Calling: halted — legal hold');
     expect(haltStateLine({ kind: 'locked', reason: null })).toBe('Calling: halted — unrecognised reason');
     expect(haltStateLine({ kind: 'unavailable', detail: 'x' })).toBe('Calling status unavailable');
+  });
+
+  it('gives the shell a line only for a halt in force', () => {
+    expect(haltShellLine({ kind: 'paused' })).toBe('Calling halted — operator pause');
+    expect(haltShellLine({ kind: 'locked', reason: 'legal_hold' })).toBe('Calling halted — legal hold');
+    expect(haltShellLine({ kind: 'locked', reason: null })).toBe('Calling halted — unrecognised reason');
+    expect(haltShellLine({ kind: 'live' })).toBeNull();
+    expect(haltShellLine({ kind: 'unavailable', detail: 'x' })).toBeNull();
   });
 
   it('says where a locked halt is cleared without claiming the server enforces it', () => {

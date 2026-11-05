@@ -49,6 +49,8 @@ Four pull requests. This record ships with the first.
 - **"Waiting" is time since a candidate was added,** for a candidate still in progress. The list payload carries no screened time, and the Candidates read is the one that broke at scale.
 - **Shells being read sort after named candidates,** with one summary line above the table. None is left out, so a stuck one stays in the list and in the counts.
 - **The booking picker searches name and email, not phone.** The phone calendar keeps every phone number out of the DOM.
+- **A calling halt is in the shell, for the roles that can read it.** The foundation's note above held for a line shown to everyone. The RCA asks for admins and interviewers, whom `GET /api/phone/health` answers, so "Calling halted" needed no new read and a viewer's shell asks nothing. The direction's fuller line (window, on a call, queued) still waits for a read that is safe for every role.
+- **"Closed", not "finished", for sessions that can't be changed.** Those are failed, cancelled, expired and deleted. A Completed session is finished in plain words and can still be overridden, so the RCA's example, "Finished sessions can't be changed", read false beside it.
 
 ## Sources
 

@@ -1858,6 +1858,69 @@ describe('Unsaved scorecard edits', () => {
     await waitFor(() => expect(screen.queryByLabelText('Weight for Clarity')).not.toBeInTheDocument());
   });
 
+  describe('Discard, then a save that does not land', () => {
+    /** The save is refused: the form stays open with the edit still on it. */
+    async function discardIntoAFailedSave() {
+      await editWithAChangedWeight([mockRole, SECOND_AGENT]);
+      mockApi.updateRole.mockRejectedValueOnce(new ApiError('Internal server error', 500));
+      await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+      await userEvent.click(await screen.findByRole('button', { name: 'Discard scorecard changes' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent('Internal server error');
+      expect(screen.getByLabelText('Weight for Clarity')).toHaveValue(60);
+      expect(screen.queryByRole('button', { name: 'Discard scorecard changes' })).not.toBeInTheDocument();
+    }
+
+    it.each(['Cancel', 'Save changes'])('%s asks again, because the edit is still unsaved', async (leaving) => {
+      await discardIntoAFailedSave();
+      fireEvent.change(screen.getByLabelText('Weight for Clarity'), { target: { value: '70' } });
+      await userEvent.click(screen.getByRole('button', { name: leaving }));
+      expect(await screen.findByRole('button', { name: 'Discard scorecard changes' })).toBeInTheDocument();
+      expect(screen.getByLabelText('Weight for Clarity')).toHaveValue(70);
+      expect(mockApi.updateRole).toHaveBeenCalledTimes(1);
+    });
+
+    it("another agent's Edit asks again", async () => {
+      await discardIntoAFailedSave();
+      await userEvent.click(screen.getAllByRole('button', { name: /^edit/i })[1]);
+      expect(await screen.findByRole('button', { name: 'Discard scorecard changes' })).toBeInTheDocument();
+      expect(screen.getByLabelText('Job role')).toHaveValue(mockRole.title);
+    });
+
+    it('a form the page refuses asks again too, with no save sent', async () => {
+      await editWithAChangedWeight();
+      fireEvent.change(screen.getByLabelText('Job role'), { target: { value: '' } });
+      await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+      await userEvent.click(await screen.findByRole('button', { name: 'Discard scorecard changes' }));
+      expect(await screen.findByText('Job role is required.')).toBeInTheDocument();
+      expect(mockApi.updateRole).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(await screen.findByRole('button', { name: 'Discard scorecard changes' })).toBeInTheDocument();
+      expect(screen.getByLabelText('Weight for Clarity')).toHaveValue(60);
+    });
+
+    it('drops an Edit that was waiting, so the failed save is not followed by the old question', async () => {
+      await editWithAChangedWeight([mockRole, SECOND_AGENT]);
+      mockApi.updateRole.mockRejectedValueOnce(new ApiError('Internal server error', 500));
+      await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+      await userEvent.click(screen.getAllByRole('button', { name: /^edit/i })[1]);
+      await userEvent.click(await screen.findByRole('button', { name: 'Discard scorecard changes' }));
+      expect(await screen.findByText('Internal server error')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Discard scorecard changes' })).not.toBeInTheDocument();
+      expect(screen.getByLabelText('Job role')).toHaveValue(mockRole.title);
+    });
+
+    it('a save that lands closes the form, with nothing left to ask', async () => {
+      await editWithAChangedWeight([mockRole, SECOND_AGENT]);
+      mockApi.updateRole.mockResolvedValueOnce(mockRole);
+      await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+      await userEvent.click(await screen.findByRole('button', { name: 'Discard scorecard changes' }));
+      await waitFor(() => expect(screen.queryByLabelText('Weight for Clarity')).not.toBeInTheDocument());
+      await userEvent.click((await screen.findAllByRole('button', { name: /^edit/i }))[1]);
+      await waitFor(() => expect(screen.getByLabelText('Job role')).toHaveValue('Data Analyst'));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+  });
+
   it('keeps every Rephrase quiet, so Save is the one filled action', () => {
     const source = readFileSync(resolve(__dirname, 'RolesPage.tsx'), 'utf8');
     expect(source).not.toMatch(/ask-hello/);
