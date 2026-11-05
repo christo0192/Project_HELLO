@@ -136,7 +136,7 @@ describe('CandidatesPage', () => {
     renderPage();
     const alert = await screen.findByRole('alert');
     expect(alert).not.toHaveTextContent('some_future_code');
-    expect(alert).toHaveTextContent(/could not be loaded/i);
+    expect(alert).toHaveTextContent(/something went wrong/i);
   });
 
   it('shows loading state initially', () => {

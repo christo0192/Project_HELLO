@@ -89,7 +89,7 @@ describe('loading and access', () => {
     const user = userEvent.setup();
     renderPage();
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/could not be read/i);
+    expect(alert).toHaveTextContent(/could not complete this/i);
     expect(alert).not.toHaveTextContent('service_unavailable');
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     await loaded();

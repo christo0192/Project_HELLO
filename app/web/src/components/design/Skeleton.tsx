@@ -53,6 +53,8 @@ export function SkeletonText({ lines = 3, gap = 8, className }: SkeletonTextProp
 export interface ChartSkeletonProps {
   className?: string;
   bars?: number;
+  /** The chart's own height in px, so the card does not grow when it arrives. */
+  height?: number;
 }
 
 /**
@@ -61,11 +63,12 @@ export interface ChartSkeletonProps {
  * (MIT, Copyright (c) 2026 uixmat) — see THIRD_PARTY_NOTICES.md. Implemented
  * natively, no source copied.
  */
-export function ChartSkeleton({ className, bars = 12 }: ChartSkeletonProps) {
+export function ChartSkeleton({ className, bars = 12, height }: ChartSkeletonProps) {
   return (
     <div
       aria-hidden="true"
       className={cx('flex min-h-44 w-full flex-col justify-between gap-5', className)}
+      style={height ? { minHeight: height } : undefined}
     >
       <div className="flex w-full flex-col gap-2">
         <Skeleton height={14} width="34%" />

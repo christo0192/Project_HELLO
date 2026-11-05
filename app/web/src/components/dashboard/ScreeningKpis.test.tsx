@@ -940,7 +940,7 @@ describe('ScreeningKpis', () => {
     renderKpis();
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(/Screening metrics unavailable/i);
-    expect(alert).toHaveTextContent(/could not be read/i);
+    expect(alert).toHaveTextContent(/could not complete this/i);
     expect(alert).not.toHaveTextContent('service_unavailable');
   });
 

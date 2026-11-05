@@ -407,9 +407,12 @@ test.describe('a failed read stays where it happened', () => {
 
     const others = ['/api/me', '/api/candidates/summary', '/api/notifications', '/api/phone/calendar'].map((p) => [p, reads(app, p)] as const);
     await heal();
-    await pipeline.getByRole('button', { name: 'Try again' }).click();
+    // By keyboard: the button unmounts, and focus must not fall to the body.
+    await pipeline.getByRole('button', { name: 'Try again' }).press('Enter');
+    await expect(pipeline).toBeFocused();
 
     await expect(pipeline.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await expect(pipeline).toBeFocused();
     await expect(page.getByRole('table', { name: 'Pipeline by stage data' })).toBeVisible();
     await expect(page.getByRole('alert')).toHaveCount(0);
     for (const [p, before] of others) expect(reads(app, p), `${p} must not be read again`).toBe(before);
@@ -423,7 +426,7 @@ test.describe('a failed read stays where it happened', () => {
     await app.goto('/dashboard');
 
     const panel = page.getByRole('region', { name: 'Assessments' });
-    await expect(panel.getByRole('alert')).toContainText('could not be read');
+    await expect(panel.getByRole('alert')).toContainText('could not complete this');
     await expect(page.locator('body')).not.toContainText('service_unavailable');
     await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
     await auditA11y(page, testInfo, 'dashboard-summary-503', { strict: true });
@@ -440,6 +443,29 @@ test.describe('a failed read stays where it happened', () => {
     app.expectHealthy();
   });
 
+  test('Dashboard: a phone calendar failure stays in its panel, whose Retry reloads only the schedule', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/phone/calendar**', 500, { error: 'phone_read_error' });
+    await app.goto('/dashboard');
+
+    const panel = page.getByRole('region', { name: 'Phone schedule' });
+    await expect(panel.getByRole('alert')).toContainText('Phone data could not be read');
+    await expect(page.locator('body')).not.toContainText('phone_read_error');
+    await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await auditA11y(page, testInfo, 'dashboard-phone-500', { strict: true });
+
+    const listReads = reads(app, '/api/candidates');
+    await heal();
+    await panel.getByRole('button', { name: 'Try again' }).press('Enter');
+    await expect(panel).toBeFocused();
+
+    await expect(panel.getByRole('group', { name: 'Appointments' })).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(reads(app, '/api/candidates')).toBe(listReads);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
   test('Dashboard: a failed /api/me is the only failure that takes the whole page', async ({ app, page }) => {
     await app.goto('/dashboard');
     // After boot: this is the page's own read, not the sign-in's role check.
@@ -447,7 +473,7 @@ test.describe('a failed read stays where it happened', () => {
     await page.getByRole('button', { name: 'Refresh' }).click();
 
     const alert = page.getByRole('alert');
-    await expect(alert).toContainText('could not be read');
+    await expect(alert).toContainText('could not complete this');
     await expect(page.locator('body')).not.toContainText('service_unavailable');
     await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toHaveCount(0);
 
@@ -457,6 +483,46 @@ test.describe('a failed read stays where it happened', () => {
     await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
 
     forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Dashboard: nothing moves when a slow list lands, and the queue never shows a nameless link', async ({ app, page }) => {
+    let release = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(`${MOCK_API_ORIGIN}/api/candidates`, async (route) => {
+      if (route.request().method() === 'GET') await held;
+      await route.fallback();
+    });
+    // Not `app.goto`: it waits for the page to settle, which this list holds off.
+    await page.goto('/dashboard');
+
+    const hero = page.getByRole('group', { name: 'Pipeline' });
+    const stage = page.getByRole('region', { name: 'Pipeline by stage' });
+    const below = page.getByRole('heading', { name: 'Screening performance' });
+    const queue = page.getByRole('region', { name: 'Action queue' });
+    await expect(page.getByRole('link', { name: /average assessment score/i })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Phone schedule' }).getByRole('group', { name: 'Appointments' })).toBeVisible();
+    await expect(below).toBeVisible();
+    await expect(queue.getByText('Loading name').first()).toBeAttached();
+    await expect(queue.getByRole('link', { name: /^Open candidate/ })).toHaveCount(0);
+    await page.evaluate(() => document.fonts.ready);
+
+    const frame = async () => ({
+      hero: (await hero.boundingBox())?.height ?? 0,
+      stage: (await stage.boundingBox())?.height ?? 0,
+      below: (await below.boundingBox())?.y ?? 0,
+    });
+    const before = await frame();
+    release();
+    await expect(hero.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await expect(page.getByRole('table', { name: 'Pipeline by stage data' })).toBeVisible();
+    const after = await frame();
+
+    // The harness has as many stages as the panel reserves; 2 px is rounding.
+    for (const key of ['hero', 'stage', 'below'] as const) {
+      expect(Math.abs(after[key] - before[key]), `${key}: ${before[key]} -> ${after[key]}`).toBeLessThanOrEqual(2);
+    }
+    await expect(queue.getByText('Loading name')).toHaveCount(0);
     app.expectHealthy();
   });
 

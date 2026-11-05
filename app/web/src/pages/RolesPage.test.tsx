@@ -885,8 +885,21 @@ describe('The status filter — All / Active / Inactive', () => {
     mockApi.updateRole.mockRejectedValue(new ApiError('Role not found', 404));
     render(<RolesPage />);
     await userEvent.setup().click(await screen.findByRole('button', { name: 'Reactivate agent Role number 2' }));
-    expect(await screen.findByText('Role not found')).toBeInTheDocument();
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not reactivate the agent. Role not found',
+    );
     expect(screen.queryByText(/is active again/)).toBeNull();
+  });
+
+  it('a reactivation the server failed says so, and not that anything did not load', async () => {
+    mockApi.listRoles.mockResolvedValue([role(2, { is_active: false })]);
+    mockApi.updateRole.mockRejectedValue(new ApiError('Internal server error', 500));
+    render(<RolesPage />);
+    await userEvent.setup().click(await screen.findByRole('button', { name: 'Reactivate agent Role number 2' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Could not reactivate the agent. Something went wrong on the server.');
+    expect(alert).not.toHaveTextContent(/loaded|Internal server error/);
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
   });
 
   it('is reachable by keyboard and has no axe violations, filtered or not', async () => {
@@ -1277,7 +1290,50 @@ describe('Removing a role', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }),
     );
-    expect(await screen.findByText(/Ashby Mission Control/)).toBeInTheDocument();
+    // Its own sentence, untouched: it already says what to do.
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /^This role is mapped to an Ashby job\. Remove the mapping in Ashby Mission Control first\.$/,
+    );
+  });
+
+  it('says a failed delete failed, and not that anything did not load', async () => {
+    mockApi.deleteRole.mockRejectedValue(new ApiError('Internal server error', 500));
+    render(<RolesPage />);
+    const remove = await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` });
+    await userEvent.click(remove);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Could not remove the agent. Something went wrong on the server.');
+    expect(alert).not.toHaveTextContent(/loaded|Internal server error/);
+    // A list Retry would succeed and clear this with the delete still undone.
+    // The way to try again is the row's own button, which is still there.
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+    expect(mockApi.listRoles).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: `Delete agent ${mockRole.title}` })).toBeEnabled();
+  });
+
+  it('clears a failed delete when the next try starts, and says what that one did', async () => {
+    mockApi.deleteRole.mockRejectedValueOnce(new ApiError('Internal server error', 500));
+    mockApi.deleteRole.mockResolvedValueOnce({ outcome: 'deleted' });
+    render(<RolesPage />);
+    const name = `Delete agent ${mockRole.title}`;
+    await userEvent.click(await screen.findByRole('button', { name }));
+    await screen.findByRole('alert');
+
+    await userEvent.click(screen.getByRole('button', { name }));
+
+    expect(await screen.findByText(/was deleted/)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps a failed list read as the panel with a Retry that reloads it', async () => {
+    mockApi.listRoles.mockRejectedValueOnce(new ApiError('Internal server error', 500));
+    render(<RolesPage />);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Something went wrong on the server.');
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('names the ROLE, not just "Delete"', async () => {

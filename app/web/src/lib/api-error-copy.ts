@@ -14,6 +14,11 @@
  *   - The status outranks the body. A 429 is a pacing limit on this account and
  *     never reads as an outage; a 403 is a role fact, not a fault.
  *
+ * NEUTRAL ABOUT THE ACTION. This copy says what went wrong, never what was being
+ * attempted: these codes answer writes as well as reads, and a failed delete must
+ * not read as "this could not be loaded" above a list that did load. A page that
+ * knows what it was doing says that part itself ("Could not remove the agent.").
+ *
  * It takes anything thrown and reads it by shape rather than `instanceof`: a
  * bug's TypeError lands here too, and it keeps this module free of the API
  * client, so the design system's ErrorPanel can use it.
@@ -25,14 +30,14 @@ const RATE_LIMITED =
   'Too many requests in a short time. Wait a moment and try again. This is a limit on your account, not a fault in HELLO.';
 const UNREACHABLE = 'The server could not be reached. Check your connection and try again.';
 const SERVER_FAILED =
-  'Something went wrong on the server, so this could not be loaded. Try again. If it keeps happening, contact an administrator.';
-const MAINTENANCE = 'HELLO is under maintenance, so this could not be loaded. Try again once maintenance ends.';
+  'Something went wrong on the server. Try again. If it keeps happening, contact an administrator.';
+const MAINTENANCE = 'HELLO is under maintenance. Try again once maintenance ends.';
 const REQUEST_REFUSED =
   'The request was not accepted. Refresh the page and try again. If it keeps happening, contact an administrator.';
 
 /** For an unmapped code, and for anything thrown that is not an API error at all. */
 export const GENERIC_ERROR_COPY =
-  'Something went wrong, so this could not be loaded. Try again. If it keeps happening, contact an administrator.';
+  'Something went wrong. Try again. If it keeps happening, contact an administrator.';
 
 /**
  * Keyed by code. The API's error envelope also carries a developer's message
@@ -41,8 +46,9 @@ export const GENERIC_ERROR_COPY =
  */
 export const API_ERROR_COPY: Readonly<Record<string, string>> = {
   // GET /api/candidates and /summary when a batched assessments read fails
-  // (fail closed, routes/candidates.ts). The rows exist; this load did not get them.
-  service_unavailable: 'The data could not be read just now. This is usually brief, so try again in a moment.',
+  // (fail closed, routes/candidates.ts): the rows exist, this load did not get
+  // them. Also a write's answer (POST /api/screening/start), so it names neither.
+  service_unavailable: 'HELLO could not complete this just now. This is usually brief, so try again in a moment.',
 
   // lib/maintenance.ts
   maintenance_mode: MAINTENANCE,
@@ -76,7 +82,7 @@ export const API_ERROR_COPY: Readonly<Record<string, string>> = {
 
   // Phone reads a page outside the calendar can hit (the Dashboard's schedule).
   phone_read_error: 'Phone data could not be read just now. Try again in a moment.',
-  phone_screening_disabled: 'Phone screening is turned off, so this could not be loaded.',
+  phone_screening_disabled: 'Phone screening is turned off.',
 };
 
 /**

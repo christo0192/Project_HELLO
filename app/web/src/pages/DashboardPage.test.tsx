@@ -318,10 +318,45 @@ describe('DashboardPage', () => {
       const queue = region('Action queue');
       expect(await within(queue).findByText('Screening ready for review')).toBeInTheDocument();
       expect(within(queue).queryByText('Candidate no longer available')).not.toBeInTheDocument();
-      // The row still goes where it went; only the name is unknown.
-      const links = within(queue).getAllByRole('link', { name: 'Open candidate' });
+      // The row still goes where it went, and says why it has no name.
+      const links = within(queue).getAllByRole('link', { name: 'Open candidate (name not loaded)' });
       expect(links.map((a) => a.getAttribute('href'))).toEqual(['/candidates/c1', '/candidates/c2']);
       expect(within(queue).getByText('Workspace-wide')).toBeInTheDocument();
+      expect(within(queue).queryByText('Loading name')).not.toBeInTheDocument();
+    });
+
+    it('holds a queued name open while the list loads, then fills it in', async () => {
+      let land: (rows: typeof CANDIDATES) => void = () => {};
+      listCandidates.mockReturnValue(new Promise((resolve) => { land = resolve; }));
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+      const queue = region('Action queue');
+      expect(await within(queue).findByText('Screening ready for review')).toBeInTheDocument();
+
+      // On every load, so not five identical links nobody can tell apart, and
+      // no link to a candidate who may turn out to be gone.
+      expect(within(queue).getAllByText('Loading name')).toHaveLength(2);
+      expect(within(queue).queryByRole('link')).not.toBeInTheDocument();
+      expect(within(queue).getByText('Workspace-wide')).toBeInTheDocument();
+
+      land(CANDIDATES);
+
+      expect(await within(queue).findByRole('link', { name: 'Jane Doe' })).toHaveAttribute('href', '/candidates/c1');
+      expect(within(queue).queryByText('Loading name')).not.toBeInTheDocument();
+    });
+
+    it('settles a queued name as "no longer available" once the list lands without them', async () => {
+      let land: (rows: typeof CANDIDATES) => void = () => {};
+      listCandidates.mockReturnValue(new Promise((resolve) => { land = resolve; }));
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+      const queue = region('Action queue');
+      await within(queue).findAllByText('Loading name');
+
+      land(CANDIDATES.slice(1));
+
+      expect(await within(queue).findByText('Candidate no longer available')).toBeInTheDocument();
+      expect(within(queue).getByRole('link', { name: 'Bob Smith' })).toBeInTheDocument();
     });
 
     it('still says "no longer available" when the list loaded without them', async () => {
@@ -330,7 +365,7 @@ describe('DashboardPage', () => {
       await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
       const queue = region('Action queue');
       expect(await within(queue).findByText('Candidate no longer available')).toBeInTheDocument();
-      expect(within(queue).queryByRole('link', { name: 'Open candidate' })).not.toBeInTheDocument();
+      expect(within(queue).queryByRole('link', { name: /^Open candidate/ })).not.toBeInTheDocument();
     });
 
     it('a summary failure stays in the Assessments panel, whose Retry reloads only the summary', async () => {
@@ -374,6 +409,57 @@ describe('DashboardPage', () => {
       for (const other of [getMe, listCandidates, getCandidatesSummary, getPhoneCalendar]) {
         expect(other).toHaveBeenCalledTimes(1);
       }
+    });
+
+    it('a phone schedule failure stays in its panel, whose Retry reloads only the schedule', async () => {
+      getPhoneCalendar.mockRejectedValueOnce(new ApiError('phone_read_error', 500, 'phone_read_error'));
+      renderDashboard();
+
+      const panel = await screen.findByRole('region', { name: 'Phone schedule' });
+      const alert = await within(panel).findByRole('alert');
+      expect(alert).toHaveTextContent(API_ERROR_COPY.phone_read_error);
+      expect(document.body).not.toHaveTextContent('phone_read_error');
+      expect(await screen.findByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+
+      fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+      expect(await within(panel).findByRole('list', { name: 'Next phone appointments' })).toHaveTextContent('Jane Doe');
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(getPhoneCalendar).toHaveBeenCalledTimes(2);
+      for (const other of [getMe, listCandidates, getCandidatesSummary, listNotificationIntents, getScreeningFunnel]) {
+        expect(other).toHaveBeenCalledTimes(1);
+      }
+      // It never left the page for the loading panel on the way.
+      expect(screen.getByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+    });
+
+    describe('Try again leaves focus on its panel, not the body', () => {
+      const failList = () => listCandidates.mockRejectedValueOnce(LIST_503);
+      it.each<[string, () => void]>([
+        ['Pipeline', failList],
+        ['Pipeline by stage', failList],
+        ['Candidates added', failList],
+        ['Recent candidates', failList],
+        ['Assessments', () => getCandidatesSummary.mockRejectedValueOnce(LIST_503)],
+        ['Action queue', () => listNotificationIntents.mockRejectedValueOnce(LIST_503)],
+        ['Phone schedule', () => getPhoneCalendar.mockRejectedValueOnce(LIST_503)],
+        ['Screening performance', () => getScreeningFunnel.mockRejectedValueOnce(LIST_503)],
+      ])('%s', async (name, fail) => {
+        fail();
+        renderDashboard();
+        await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+        const panel = name === 'Pipeline' ? pipeline() : region(name);
+
+        fireEvent.click(await within(panel).findByRole('button', { name: 'Try again' }));
+
+        // At once, while the read is out: the pressed button is already gone.
+        expect(within(panel).queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+        expect(panel).toHaveFocus();
+        // And still there when it lands.
+        await waitFor(() => expect(screen.getByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument());
+        await expectTheOtherPanelsKeepTheirData();
+        expect(panel).toHaveFocus();
+      });
     });
 
     it('a failed /api/me is still the full page: without identity nothing can be gated', async () => {

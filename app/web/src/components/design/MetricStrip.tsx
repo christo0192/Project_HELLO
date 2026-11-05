@@ -84,6 +84,8 @@ export interface MetricStripProps {
    */
   bleed?: boolean;
   className?: string;
+  /** `-1` lets a Retry inside park focus on the strip (see `RetryButton`). */
+  tabIndex?: number;
 }
 
 const DOT: Record<MetricTone, string> = {
@@ -155,6 +157,7 @@ export function MetricStrip({
   children,
   bleed = false,
   className,
+  tabIndex,
 }: MetricStripProps) {
   const uid = useId().replace(/:/g, '');
   const headingId = `metric-strip-${uid}`;
@@ -189,6 +192,7 @@ export function MetricStrip({
       role="group"
       aria-labelledby={headingId}
       aria-describedby={descId}
+      tabIndex={tabIndex}
       className={cx(
         layout === 'aside' && 'lg:grid lg:grid-cols-[9rem_minmax(0,1fr)] lg:gap-x-5',
         className,
@@ -314,7 +318,8 @@ function MetricBody({
               width={SKELETON[size].width}
               height={SKELETON[size].height}
               radius={8}
-              className="inline-block align-middle"
+              // `align-top`: middle-aligned, it stretched the line box by a pixel or two.
+              className="inline-block align-top"
             />
             <span className="sr-only">Loading</span>
           </>
@@ -334,8 +339,13 @@ function MetricBody({
           </>
         )}
       </Def>
-      {item.context && !item.loading && (
-        <Def id={contextId} className="mt-0.5 text-meta text-ink-tertiary">
+      {/* Kept while loading so the cell is already its final height, and hidden
+          because a context can quote what has not been read ("Of 0 entries"). */}
+      {item.context && (
+        <Def
+          id={contextId}
+          className={cx('mt-0.5 text-meta text-ink-tertiary', item.loading && 'invisible')}
+        >
           {item.context}
         </Def>
       )}

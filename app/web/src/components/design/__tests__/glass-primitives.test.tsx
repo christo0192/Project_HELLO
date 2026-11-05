@@ -27,6 +27,7 @@ import {
   InlineNotice,
   EmptyPanel,
   ErrorPanel,
+  RetryButton,
   LoadingPanel,
   RevealGroup,
   RevealItem,
@@ -742,19 +743,64 @@ describe('ErrorPanel', () => {
   });
 });
 
+describe('a Retry that unmounts itself', () => {
+  /** The panel outlives its error state, as every panel with a Retry does. */
+  function Panel({ takesFocus = true }: { takesFocus?: boolean }) {
+    const [failed, setFailed] = useState(true);
+    return (
+      <div tabIndex={-1} data-testid="page">
+        <section aria-label="Assessments" tabIndex={takesFocus ? -1 : undefined}>
+          {failed ? <ErrorPanel message="Broken." onRetry={() => setFailed(false)} /> : <p>Back</p>}
+        </section>
+      </div>
+    );
+  }
+
+  it('leaves focus on the panel around it, not on the body', async () => {
+    const user = userEvent.setup();
+    render(<Panel />);
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(screen.getByText('Back')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Assessments' })).toHaveFocus();
+  });
+
+  it('falls back to the nearest ancestor that takes focus, as the page main does', async () => {
+    const user = userEvent.setup();
+    render(<Panel takesFocus={false} />);
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(screen.getByTestId('page')).toHaveFocus();
+  });
+
+  it('does not scroll: the reader is already there', () => {
+    render(<Panel />);
+    const panel = screen.getByRole('region', { name: 'Assessments' });
+    const focus = vi.spyOn(panel, 'focus');
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+  });
+
+  it('still retries with nothing to park on', async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn();
+    render(<RetryButton onRetry={onRetry} />);
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('ErrorPanel never prints a raw code', () => {
   it('translates a code a caller passed straight through from the API', () => {
     render(<ErrorPanel message="service_unavailable" />);
     const alert = screen.getByRole('alert');
     expect(alert).not.toHaveTextContent('service_unavailable');
-    expect(alert).toHaveTextContent(/could not be read/i);
+    expect(alert).toHaveTextContent(/could not complete this/i);
   });
 
   it('never prints an unknown code either', () => {
     render(<ErrorPanel message="some_future_code" />);
     const alert = screen.getByRole('alert');
     expect(alert).not.toHaveTextContent('some_future_code');
-    expect(alert).toHaveTextContent(/could not be loaded/i);
+    expect(alert).toHaveTextContent(/something went wrong/i);
   });
 
   it('leaves a caller’s own node alone', () => {

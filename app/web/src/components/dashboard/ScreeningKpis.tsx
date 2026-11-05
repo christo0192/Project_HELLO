@@ -358,7 +358,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   const advanceRate = data?.conversions?.hr_advance_rate;
 
   return (
-    <section className={cx('mt-8', className)} aria-labelledby="screening-kpis-heading">
+    <section className={cx('mt-8', className)} aria-labelledby="screening-kpis-heading" tabIndex={-1}>
       <div className="flex flex-wrap items-end justify-between gap-3">
         <SectionHeader
           id="screening-kpis-heading"

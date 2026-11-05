@@ -36,6 +36,9 @@
  * the panels it feeds, with a Retry that re-runs that read alone. The list is
  * the slowest read and answers 503 when an assessments batch fails (#396); this
  * page used to wait for it, then throw away the panels that had already loaded.
+ *
+ * Each panel takes focus by script (`tabIndex={-1}`), so a Retry inside it can
+ * park focus there as it unmounts (see `RetryButton`).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -53,8 +56,10 @@ import {
   InlineNotice,
   LoadingPanel,
   PageHeader,
+  RetryButton,
   ScrollArea,
   SectionHeader,
+  Skeleton,
   StatusBadge,
 } from '../components/design';
 import type { StatusTone } from '../components/design';
@@ -118,6 +123,13 @@ const RECOMMENDATION_TONE: Record<string, BarTone> = {
   reject: 'danger',
 };
 
+/**
+ * Rows the stage panel holds open while the list loads. An estimate: only
+ * statuses somebody is in are drawn, so the real count is the data's, and each
+ * row it differs by moves what is below by one row when the list lands.
+ */
+const STAGE_ROWS_WHILE_LOADING = 8;
+
 /** A name that opens its record: ink, the accent on hover, never a brand utility. */
 const nameLinkClass =
   'rounded-sm font-medium text-ink underline-offset-4 transition-colors duration-150 ease-out hover:text-info hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
@@ -180,6 +192,14 @@ export function DashboardPage() {
     readIntents(api.listNotificationIntents(), (r) => setIntents(r.intents), setIntentsError);
   }, [readIntents]);
 
+  const loadPhoneSchedule = useCallback(() => {
+    setPhoneScheduleError(null);
+    setPhoneSchedule(null);
+    const from = istDayStartUtcIso(istToday());
+    const to = istDayStartUtcIso(addIstDays(istToday(), 7));
+    readPhoneSchedule(api.getPhoneCalendar(from, to), setPhoneSchedule, setPhoneScheduleError);
+  }, [readPhoneSchedule]);
+
   const load = useCallback(() => {
     setMeError(null);
     setMe(null);
@@ -202,16 +222,14 @@ export function DashboardPage() {
           // The dashboard only asks for the schedule after the authoritative
           // role response says this account may read it. Viewers therefore
           // never make a phone-calendar request, even transiently.
-          const from = istDayStartUtcIso(istToday());
-          const to = istDayStartUtcIso(addIstDays(istToday(), 7));
-          readPhoneSchedule(api.getPhoneCalendar(from, to), setPhoneSchedule, setPhoneScheduleError);
+          loadPhoneSchedule();
         }
       },
       setMeError,
     );
 
     loadList();
-  }, [loadIntents, loadList, loadSummary, readMe, readPhoneSchedule]);
+  }, [loadIntents, loadList, loadPhoneSchedule, loadSummary, readMe]);
 
   useEffect(load, [load]);
 
@@ -236,6 +254,7 @@ export function DashboardPage() {
   }
 
   const figures = candidates ? pipelineFigures(candidates) : null;
+  const listLoading = candidates === null && !listError;
   const intakeTrend = candidates ? countPerDay(candidates) : [];
   // A failed phone read leaves those candidates on their stored status, which
   // moves them between the figures below ("In screening" grows, completion's
@@ -317,6 +336,9 @@ export function DashboardPage() {
           hideLabel
           headingLevel={2}
           size="hero"
+          tabIndex={-1}
+          // Inset: the panel clips anything outside it.
+          className="focus-visible:outline-offset-[-2px]"
           items={[
             heroFigure('Candidates', figures?.total, 'In the pipeline', candidatesHref()),
             heroFigure(
@@ -344,11 +366,7 @@ export function DashboardPage() {
               <InlineNotice
                 tone="danger"
                 role="alert"
-                action={
-                  <Button variant="secondary" size="sm" onClick={loadList}>
-                    Try again
-                  </Button>
-                }
+                action={<RetryButton onRetry={loadList} />}
               >
                 The candidate list did not load. {listError}
               </InlineNotice>
@@ -363,12 +381,22 @@ export function DashboardPage() {
       <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
         <ChartCard
           title="Pipeline by stage"
-          meta={figures ? <CompletionMeta completionPct={figures.completionPct} /> : undefined}
+          tabIndex={-1}
+          // Both lines hold their place while the list loads.
+          meta={
+            figures ? (
+              <CompletionMeta completionPct={figures.completionPct} />
+            ) : listLoading ? (
+              <Skeleton width="6.5rem" height={22} radius={999} className="align-middle" />
+            ) : undefined
+          }
           // Each stage is a link to exactly those candidates.
           description={
-            figures
-              ? `${figures.decided} of ${figures.considered} decided (advanced or rejected).`
-              : undefined
+            figures ? (
+              `${figures.decided} of ${figures.considered} decided (advanced or rejected).`
+            ) : listLoading ? (
+              <Skeleton width="15rem" height={12} className="max-w-full align-middle" />
+            ) : undefined
           }
         >
           {/* Stage order, not size order: the pipeline is a sequence the
@@ -378,6 +406,7 @@ export function DashboardPage() {
               title="Pipeline by stage"
               data={stages}
               isLoading={candidates === null}
+              loadingRows={STAGE_ROWS_WHILE_LOADING}
               order="none"
               categoryHeader="Stage"
               valueHeader="Candidates"
@@ -388,7 +417,7 @@ export function DashboardPage() {
           )}
         </ChartCard>
 
-        <ChartCard title="Candidates added" description="Per day, last 14 days, all roles.">
+        <ChartCard title="Candidates added" description="Per day, last 14 days, all roles." tabIndex={-1}>
           {listFailed ?? (
             <LineChart
               title="Candidates added per day"
@@ -421,17 +450,29 @@ export function DashboardPage() {
       <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
         <RecentCandidates
           candidates={candidates}
-          unavailable={listFailed ?? <LoadingPanel compact label="Loading candidates…" />}
+          unavailable={
+            listFailed ?? (
+              // The height of a full list, so the panels under it stay put.
+              <div className="grid min-h-80 place-items-center">
+                <LoadingPanel compact label="Loading candidates…" />
+              </div>
+            )
+          }
         />
         <ActionQueue
           intents={intents}
           intentsError={intentsError}
           onRetry={loadIntents}
           candidates={candidates}
+          listFailed={listError !== null}
           viewer={me.role === 'viewer'}
         />
         {me.role !== 'viewer' && (
-          <PhoneScheduleCard data={phoneSchedule} error={phoneScheduleError} />
+          <PhoneScheduleCard
+            data={phoneSchedule}
+            error={phoneScheduleError}
+            onRetry={loadPhoneSchedule}
+          />
         )}
       </div>
     </div>
@@ -535,6 +576,7 @@ function AssessmentsPanel({
     <ChartCard
       title="Assessments"
       description="The latest assessment of each candidate."
+      tabIndex={-1}
     >
       {error ? (
         <ErrorPanel compact className="min-h-40" message={error} onRetry={onRetry} />
@@ -605,7 +647,7 @@ function RecentCandidates({
   const recent = candidates?.slice(0, RECENT_LIMIT) ?? [];
 
   return (
-    <GlassPanel as="section" aria-label="Recent candidates" className="h-full">
+    <GlassPanel as="section" aria-label="Recent candidates" tabIndex={-1} className="h-full">
       <SectionHeader
         title="Recent candidates"
         meta={
@@ -677,6 +719,7 @@ function ActionQueue({
   intentsError,
   onRetry,
   candidates,
+  listFailed,
   viewer,
 }: {
   intents: NotificationIntent[] | null;
@@ -684,6 +727,8 @@ function ActionQueue({
   onRetry: () => void;
   /** Names only: null until the list is read, and the queue does not wait for it. */
   candidates: Candidate[] | null;
+  /** The list is not coming: a row without a name stays that way until a Retry. */
+  listFailed: boolean;
   viewer: boolean;
 }) {
   const candidateById = useMemo(
@@ -712,11 +757,18 @@ function ActionQueue({
                     {candidate.name || 'Unnamed candidate'}
                   </Link>
                 ) : intent.candidate_id && candidates === null ? (
-                  // The list that would name them has not loaded. That says
+                  // The list that would name them has not been read. That says
                   // nothing about the candidate, who may well still exist.
-                  <Link to={`/candidates/${intent.candidate_id}`} className={nameLinkClass}>
-                    Open candidate
-                  </Link>
+                  listFailed ? (
+                    <Link to={`/candidates/${intent.candidate_id}`} className={nameLinkClass}>
+                      Open candidate (name not loaded)
+                    </Link>
+                  ) : (
+                    <>
+                      <Skeleton width="8rem" height={12} className="align-middle" />
+                      <span className="sr-only">Loading name</span>
+                    </>
+                  )
                 ) : (
                   <span className="text-ink-secondary">
                     {intent.candidate_id ? 'Candidate no longer available' : 'Workspace-wide'}
@@ -744,7 +796,7 @@ function ActionQueue({
   );
 
   return (
-    <GlassPanel as="section" aria-label="Action queue" className="h-full">
+    <GlassPanel as="section" aria-label="Action queue" tabIndex={-1} className="h-full">
       <SectionHeader title="Prioritized work" className="mb-2" />
       {viewer ? (
         <p className="py-6 text-center text-sm text-ink-tertiary">
@@ -772,9 +824,11 @@ function ActionQueue({
 function PhoneScheduleCard({
   data,
   error,
+  onRetry,
 }: {
   data: PhoneCalendarResponse | null;
   error: string | null;
+  onRetry: () => void;
 }) {
   const appointments = data?.appointments ?? [];
   const live = appointments.filter((appointment) => isLiveAppointment(appointment.status));
@@ -795,7 +849,7 @@ function PhoneScheduleCard({
   const atLeast = (n: number, floor: boolean) => (floor ? `${n}+` : String(n));
 
   return (
-    <GlassPanel as="section" aria-labelledby="phone-schedule-heading" className="h-full">
+    <GlassPanel as="section" aria-labelledby="phone-schedule-heading" tabIndex={-1} className="h-full">
       <SectionHeader
         id="phone-schedule-heading"
         title="Phone schedule"
@@ -809,9 +863,7 @@ function PhoneScheduleCard({
       />
 
       {error ? (
-        <InlineNotice tone="warning">
-          Phone schedule unavailable. Open the phone calendar to retry.
-        </InlineNotice>
+        <ErrorPanel compact message={error} onRetry={onRetry} />
       ) : data === null ? (
         <LoadingPanel compact label="Loading schedule…" />
       ) : !data.enabled ? (

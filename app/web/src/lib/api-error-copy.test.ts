@@ -43,8 +43,16 @@ describe('every mapped code', () => {
 
   it('says what to do about the 503 the list and summary answer', () => {
     const message = apiErrorCopy(new ApiError('service_unavailable', 503, 'service_unavailable'));
-    expect(message).toMatch(/could not be read/i);
+    expect(message).toMatch(/could not complete this/i);
     expect(message).toMatch(/try again/i);
+  });
+
+  it('says what went wrong, never what was being attempted: a write gets this copy too', () => {
+    // Only a code that can only answer a read may say so.
+    const { phone_read_error: _readOnly, ...shared } = API_ERROR_COPY;
+    for (const copy of [GENERIC_ERROR_COPY, ...Object.values(shared)]) {
+      expect(copy).not.toMatch(/\b(load|loaded|loading|read|saved|deleted)\b/i);
+    }
   });
 });
 
@@ -80,7 +88,7 @@ describe('the mapped set is an allowlist', () => {
   });
 
   it('reads as a plain sentence that says what to do', () => {
-    expect(GENERIC_ERROR_COPY).toMatch(/could not be loaded/i);
+    expect(GENERIC_ERROR_COPY).toMatch(/something went wrong/i);
     expect(GENERIC_ERROR_COPY).toMatch(/try again/i);
     expect(GENERIC_ERROR_COPY).not.toMatch(SNAKE_CASE);
   });
