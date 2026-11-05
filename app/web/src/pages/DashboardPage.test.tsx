@@ -9,7 +9,7 @@
  *
  * Charts run under jsdom with the same stubs as the chart-lib suite.
  */
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
@@ -507,6 +507,26 @@ describe('DashboardPage', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
       expect(screen.getByRole('link', { name: 'Candidates: 4' })).toBeInTheDocument();
+    });
+
+    it('never lets a slow, stale list success overwrite a newer failure', async () => {
+      let resolveFirst: (candidates: typeof CANDIDATES) => void = () => {};
+      listCandidates.mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve; }));
+      listCandidates.mockRejectedValueOnce(LIST_503);
+      renderDashboard();
+      await screen.findByRole('heading', { name: 'Dashboard', level: 1 });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      await within(await screen.findByRole('group', { name: 'Pipeline' })).findByRole('alert');
+
+      // Inside `act`, so a bad landing would render before the assertions below.
+      await act(async () => {
+        resolveFirst(CANDIDATES);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(within(pipeline()).getByRole('alert')).toHaveTextContent('The candidate list did not load.');
+      expect(within(pipeline()).getAllByText('Not available')).toHaveLength(4);
+      expect(within(pipeline()).queryByRole('link')).not.toBeInTheDocument();
     });
 
     it('has no axe violations with the list failed', async () => {

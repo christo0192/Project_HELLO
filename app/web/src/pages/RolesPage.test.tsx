@@ -880,25 +880,32 @@ describe('The status filter — All / Active / Inactive', () => {
     await waitFor(() => expect(screen.queryByRole('button', { name: /^Reactivate agent/ })).toBeNull());
   });
 
-  it('a refused reactivation shows the server message and claims nothing', async () => {
-    mockApi.listRoles.mockResolvedValue([role(2, { is_active: false })]);
+  it('a 404 on reactivation says so, and the re-read takes the removed agent off the page', async () => {
+    mockApi.listRoles
+      .mockResolvedValueOnce([role(1), role(2, { is_active: false })])
+      .mockResolvedValue([role(1)]);
     mockApi.updateRole.mockRejectedValue(new ApiError('Role not found', 404));
     render(<RolesPage />);
     await userEvent.setup().click(await screen.findByRole('button', { name: 'Reactivate agent Role number 2' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Could not reactivate the agent. Role not found',
-    );
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Role number 2' })).toBeNull());
+    expect(await titles()).toEqual(['Role number 1']);
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not reactivate the agent. Role not found');
     expect(screen.queryByText(/is active again/)).toBeNull();
   });
 
-  it('a reactivation the server failed says so, and not that anything did not load', async () => {
-    mockApi.listRoles.mockResolvedValue([role(2, { is_active: false })]);
+  it('a reactivation answered 500 after it committed claims no failure, and the card comes back Active', async () => {
+    mockApi.listRoles
+      .mockResolvedValueOnce([role(2, { is_active: false })])
+      .mockResolvedValue([role(2)]);
     mockApi.updateRole.mockRejectedValue(new ApiError('Internal server error', 500));
     render(<RolesPage />);
     await userEvent.setup().click(await screen.findByRole('button', { name: 'Reactivate agent Role number 2' }));
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Could not reactivate the agent. Something went wrong on the server.');
-    expect(alert).not.toHaveTextContent(/loaded|Internal server error/);
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^Reactivate agent/ })).toBeNull());
+    expect(screen.getByText('Active', { selector: 'p' })).toBeInTheDocument();
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('the change may have been applied');
+    expect(alert).not.toHaveTextContent(/could not|loaded|Internal server error/i);
+    expect(screen.queryByText(/is active again/)).toBeNull();
     expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
   });
 
@@ -1294,22 +1301,91 @@ describe('Removing a role', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(
       /^This role is mapped to an Ashby job\. Remove the mapping in Ashby Mission Control first\.$/,
     );
+    // Refused, so nothing changed and there is nothing to re-read.
+    expect(mockApi.listRoles).toHaveBeenCalledTimes(1);
   });
 
-  it('says a failed delete failed, and not that anything did not load', async () => {
+  it('a delete answered 500 after it committed claims no failure, and the card goes', async () => {
+    // roles.ts: the row is gone and only the audit record failed, so "could not
+    // remove" would be false above a card that was no longer real.
+    mockApi.listRoles.mockResolvedValueOnce([mockRole]).mockResolvedValue([]);
     mockApi.deleteRole.mockRejectedValue(new ApiError('Internal server error', 500));
     render(<RolesPage />);
-    const remove = await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` });
-    await userEvent.click(remove);
+    await userEvent.click(await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }));
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Could not remove the agent. Something went wrong on the server.');
-    expect(alert).not.toHaveTextContent(/loaded|Internal server error/);
-    // A list Retry would succeed and clear this with the delete still undone.
-    // The way to try again is the row's own button, which is still there.
+    expect(await screen.findByText('No agents yet')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Delete agent/ })).toBeNull();
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('the change may have been applied');
+    expect(alert).not.toHaveTextContent(/could not|loaded|Internal server error/i);
     expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
-    expect(mockApi.listRoles).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('button', { name: `Delete agent ${mockRole.title}` })).toBeEnabled();
+  });
+
+  it('a 500 that changed nothing leaves the card, the place and the focus, ready to press again', async () => {
+    let landList: (roles: unknown[]) => void = () => {};
+    mockApi.listRoles
+      .mockResolvedValueOnce([mockRole])
+      .mockReturnValueOnce(new Promise((resolve) => { landList = resolve; }));
+    mockApi.deleteRole.mockRejectedValue(new ApiError('Internal server error', 500));
+    render(<RolesPage />);
+    const name = `Delete agent ${mockRole.title}`;
+    await userEvent.click(await screen.findByRole('button', { name }));
+
+    // Held open: an instant answer batches with a reload's empty list into one
+    // render, and the loading panel that takes focus away would never show.
+    await waitFor(() => expect(mockApi.listRoles).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('Loading agents…')).toBeNull();
+    expect(await screen.findByRole('button', { name: `Deleting agent ${mockRole.title}…` })).toHaveFocus();
+
+    await act(async () => landList([mockRole]));
+    const remove = await screen.findByRole('button', { name });
+    expect(remove).toHaveFocus();
+    expect(remove).toHaveAttribute('aria-disabled', 'false');
+    expect(screen.getByRole('alert')).toHaveTextContent('the change may have been applied');
+  });
+
+  it('a 404 says so, and the re-read takes the card another admin removed off the page', async () => {
+    mockApi.listRoles.mockResolvedValueOnce([mockRole]).mockResolvedValue([]);
+    mockApi.deleteRole.mockRejectedValue(new ApiError('Role not found', 404));
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }));
+
+    expect(await screen.findByText('No agents yet')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not remove the agent. Role not found');
+  });
+
+  it('keeps the row busy until the re-read lands, so a stale card cannot be pressed again', async () => {
+    let landList: (roles: unknown[]) => void = () => {};
+    mockApi.listRoles
+      .mockResolvedValueOnce([mockRole])
+      .mockReturnValueOnce(new Promise((resolve) => { landList = resolve; }));
+    mockApi.deleteRole.mockRejectedValue(new ApiError('Internal server error', 500));
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }));
+
+    const busy = await screen.findByRole('button', { name: `Deleting agent ${mockRole.title}…` });
+    await waitFor(() => expect(mockApi.listRoles).toHaveBeenCalledTimes(2));
+    await userEvent.click(busy);
+    expect(mockApi.deleteRole).toHaveBeenCalledTimes(1);
+
+    await act(async () => landList([]));
+    expect(await screen.findByText('No agents yet')).toBeInTheDocument();
+  });
+
+  it('a failed re-read offers its own Retry, which keeps the write’s message', async () => {
+    mockApi.listRoles
+      .mockResolvedValueOnce([mockRole])
+      .mockRejectedValueOnce(new ApiError('service_unavailable', 503, 'service_unavailable'))
+      .mockResolvedValue([]);
+    mockApi.deleteRole.mockRejectedValue(new ApiError('Internal server error', 500));
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }));
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByText('No agents yet')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('the change may have been applied');
+    expect(mockApi.listRoles).toHaveBeenCalledTimes(3);
   });
 
   it('clears a failed delete when the next try starts, and says what that one did', async () => {
@@ -1320,9 +1396,24 @@ describe('Removing a role', () => {
     await userEvent.click(await screen.findByRole('button', { name }));
     await screen.findByRole('alert');
 
-    await userEvent.click(screen.getByRole('button', { name }));
+    await userEvent.click(await screen.findByRole('button', { name }));
 
     expect(await screen.findByText(/was deleted/)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('clears a failed delete once a save brings the list up to date', async () => {
+    mockApi.updateRole.mockResolvedValue(mockRole);
+    mockApi.deleteRole.mockRejectedValue(new ApiError('Mapped to an Ashby job.', 409));
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }));
+    await screen.findByRole('alert');
+
+    await user.click(await screen.findByRole('button', { name: 'Edit' }));
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    await waitFor(() => expect(mockApi.listRoles).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('alert')).toBeNull();
   });
 

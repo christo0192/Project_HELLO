@@ -117,16 +117,18 @@ describe('the status outranks the body', () => {
     expect(message).not.toMatch(/outage|degraded|unavailable|down\b/i);
   });
 
-  it('states a 403 as a role fact', () => {
-    const message = apiErrorCopy(new ApiError('Insufficient permissions', 403, 'authorization_error'));
+  // Bodies that disagree with the status, as the 429 above: one mapped to other
+  // copy and one unmapped. A body that maps to the same sentence proves nothing.
+  it.each(['internal_error', 'some_future_code'])('states a 403 as a role fact, even with a body of %s', (code) => {
+    const message = apiErrorCopy(new ApiError(code, 403, code));
     expect(message).toMatch(/your role/i);
-    expect(message).not.toContain('Insufficient permissions');
+    expect(message).not.toContain(code);
   });
 
-  it('asks for a new sign-in on a 401', () => {
-    expect(apiErrorCopy(new ApiError('Authentication required', 401, 'authentication_error'))).toMatch(
-      /sign in again/i,
-    );
+  it.each(['internal_error', 'some_future_code'])('asks for a new sign-in on a 401, even with a body of %s', (code) => {
+    const message = apiErrorCopy(new ApiError(code, 401, code));
+    expect(message).toMatch(/sign in again/i);
+    expect(message).not.toContain(code);
   });
 
   it('describes a failed fetch as unreachable and never prints the API origin', () => {

@@ -544,4 +544,37 @@ test.describe('a failed read stays where it happened', () => {
     forgetFailedResponses(app);
     app.expectHealthy();
   });
+
+  test('Agents: a delete answered 500 after it committed claims no failure, and the card goes', async ({ app, page }, testInfo) => {
+    const { id, title, agent_name: agent } = app.db.roles[0];
+    const remove = page.getByRole('button', { name: `Delete agent ${agent} (${title})`, exact: true });
+    const url = `${MOCK_API_ORIGIN}/api/roles/${id}`;
+    // What routes/roles.ts does when the audit record fails: the row is gone, the answer is a 500.
+    await page.route(url, (route) => {
+      if (route.request().method() !== 'DELETE') return route.fallback();
+      app.db.roles = app.db.roles.filter((role) => role.id !== id);
+      return route.fulfill({
+        status: 500,
+        headers: CORS_HEADERS(route),
+        contentType: 'application/json',
+        body: JSON.stringify({ error: { type: 'internal_error', message: 'Internal server error' } }),
+      });
+    });
+    page.on('dialog', (dialog) => void dialog.accept());
+    await app.goto('/roles');
+
+    const listReads = reads(app, '/api/roles');
+    await remove.click();
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText('the change may have been applied');
+    await expect(alert).not.toContainText('Could not');
+    await expect(remove).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText('Internal server error');
+    expect(reads(app, '/api/roles')).toBe(listReads + 1);
+    await auditA11y(page, testInfo, 'roles-delete-500-after-commit', { strict: true });
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
 });
