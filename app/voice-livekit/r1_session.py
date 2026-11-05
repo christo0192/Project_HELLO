@@ -4897,7 +4897,8 @@ class R1Interview:
     def _bot_turn_end(item: Any, slot: _SpeechSlot | None) -> int | None:
         """Epoch ms the bot's audio stopped on this row: its playback's, else the SDK's metric.
 
-        A line cut while paused stopped at the pause, not when the cut came (``PlaybackMeter``).
+        A line cut while paused stopped at the pause at the latest, not when the cut came, and may
+        have gone quiet before it: a cut line's end is not exact (``PlaybackMeter``).
         ``metrics["stopped_speaking_at"]`` is taken just after the playout and knows nothing of a
         pause, so it only stands in.  Otherwise None: never the row-write time.
         """

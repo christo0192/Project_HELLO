@@ -23921,6 +23921,93 @@ select _policy_tests.assert(
   'each turn timing column must be guarded by a validated CHECK'
 );
 
+-- Behaviour, on real rows. A wrong CHECK would fail nothing else: the worker retries a refused row
+-- without its facts, so every AI row would silently lose them, and no backfill can bring them back.
+-- Returns 'accepted', or the name of the CHECK that refused the row.
+create or replace function _policy_tests.p136_insert(
+  p_session uuid, p_index integer, p_speaker text, p_started bigint,
+  p_ended bigint, p_voice text, p_played integer
+) returns text language plpgsql as $$
+declare
+  v_constraint text;
+begin
+  insert into screening_v2.transcript_turns
+    (session_id, turn_index, speaker, text, turn_started_at_ms, turn_ended_at_ms, ai_voice, ai_played_ms)
+  values (p_session, p_index, p_speaker, 'pol136 turn', p_started, p_ended, p_voice, p_played);
+  return 'accepted';
+exception when check_violation then
+  get stacked diagnostics v_constraint = constraint_name;
+  return v_constraint;
+end;
+$$;
+
+do $$
+declare
+  c_start constant bigint := 1760000000000;
+  c_limit constant bigint := 4102444800000;
+  c_end   constant text := 'chk_transcript_turns_turn_ended_at_ms';
+  c_voice constant text := 'chk_transcript_turns_ai_voice';
+  c_time  constant text := 'chk_transcript_turns_ai_played_ms';
+  v_cand  uuid;
+  v_sid   uuid;
+  v_res   text;
+  v_row   screening_v2.transcript_turns%rowtype;
+  v_case  record;
+  v_index integer := 0;
+begin
+  insert into screening_v2.candidates (role_id, name, email)
+  values ((select id from screening_v2.roles order by id limit 1),
+          'pol136 candidate', 'pol136@example.com')
+  returning id into v_cand;
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+  values (v_cand, 'live', 'created') returning id into v_sid;
+
+  -- A row with all three facts is stored as written.
+  v_res := _policy_tests.p136_insert(v_sid, 0, 'bot', c_start, c_start + 2500, 'learner', 2300);
+  select * into v_row from screening_v2.transcript_turns where session_id = v_sid and turn_index = 0;
+  perform _policy_tests.assert('0136: a bot row with all three facts is accepted and stored',
+    v_res = 'accepted' and v_row.turn_ended_at_ms = c_start + 2500
+      and v_row.ai_voice = 'learner' and v_row.ai_played_ms = 2300,
+    coalesce(v_res, 'null'));
+
+  for v_case in
+    select * from (values
+      ('the other voice',                  'bot',       c_start, c_start + 1, 'interviewer', 0,        'accepted'),
+      ('an end equal to the start',        'bot',       c_start, c_start,     'learner',     0,        'accepted'),
+      ('an end with no start',             'bot',       null,    c_start,     'learner',     2300,     'accepted'),
+      ('a line of exactly a day',          'bot',       c_start, c_start + 1, 'learner',     86400000, 'accepted'),
+      ('a bot row with no voice or time',  'bot',       c_start, c_start + 1, null,          null,     'accepted'),
+      ('a candidate row with only an end', 'candidate', c_start, c_start + 1, null,          null,     'accepted'),
+      ('a phone or older row, all NULL',   'bot',       c_start, null,        null,          null,     'accepted'),
+      ('an end before the start',          'bot',       c_start, c_start - 1, 'learner',     2300,     c_end),
+      ('an end of zero',                   'bot',       null,    0,           'learner',     2300,     c_end),
+      ('an end at the anchor limit',       'bot',       null,    c_limit,     'learner',     2300,     c_end),
+      ('a voice on a candidate row',       'candidate', c_start, c_start + 1, 'learner',     null,     c_voice),
+      ('an unknown voice',                 'bot',       c_start, c_start + 1, 'christy',     2300,     c_voice),
+      ('played time on a candidate row',   'candidate', c_start, c_start + 1, null,          2300,     c_time),
+      ('a negative played time',           'bot',       c_start, c_start + 1, 'learner',     -1,       c_time),
+      ('a played time over a day',         'bot',       c_start, c_start + 1, 'learner',     86400001, c_time)
+    ) as t(name, speaker, started, ended, voice, played, expected)
+  loop
+    v_index := v_index + 1;
+    v_res := _policy_tests.p136_insert(
+      v_sid, v_index, v_case.speaker, v_case.started, v_case.ended, v_case.voice, v_case.played);
+    perform _policy_tests.assert(
+      '0136: ' || v_case.name || ' is ' || case when v_case.expected = 'accepted' then 'accepted' else 'refused' end,
+      v_res = v_case.expected,
+      'expected ' || v_case.expected || ', got ' || coalesce(v_res, 'null'));
+  end loop;
+
+  delete from screening_v2.call_sessions where candidate_id = v_cand;
+  perform _policy_tests.assert('0136: the turns go with their session through the cascade',
+    not exists (select 1 from screening_v2.transcript_turns where session_id = v_sid),
+    'a deleted session must take its transcript_turns rows with it');
+  delete from screening_v2.candidates where id = v_cand;
+end;
+$$;
+
+drop function _policy_tests.p136_insert(uuid, integer, text, bigint, bigint, text, integer);
+
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
 -- the last phone assertion before the verdict.

@@ -8,9 +8,14 @@
 --
 -- WHAT. Three nullable columns, no default:
 --   * turn_ended_at_ms  epoch ms on the worker's clock, the same clock as turn_started_at_ms. AI row:
---                       when its audio stopped, which on a line the candidate's voice paused and that
---                       was then cut is the pause, not the cut reported seconds later. Candidate row:
---                       the voice-activity end of speech.
+--                       when its audio stopped. On a cut line (interrupted) that is not exact: it is
+--                       the pause, or the cut when nothing paused the line, which is the latest the
+--                       audio can have stopped. If the line was in a silent gap by then, waiting for
+--                       its next fragment, the audio stopped earlier, so the end runs late by that
+--                       silence (the log's r1_playback_silence duration_sec shows it) and a timeline
+--                       must not treat it as exact. The row cannot say how late: start plus
+--                       ai_played_ms would read seconds early on a gap mid-line. Candidate row: the
+--                       voice-activity end of speech.
 --   * ai_voice          the worker's voice role, 'interviewer' (Christy) or 'learner'. Bot rows only.
 --   * ai_played_ms      milliseconds of audio that played. Less than the line's length if it was cut,
 --                       and about 250 ms over on a line that was paused (what the pause dropped still
@@ -20,7 +25,7 @@
 -- older interview simply has no end times. There is no backfill, because nothing recorded these facts
 -- at the time. The R1 worker writes them from R1TurnWriter; the phone writer and the phone turn RPCs
 -- do not name them, and no function is redeclared here, so the phone lane is unchanged. None of them
--- holds candidate speech, and DSAR export and erasure follow the row.
+-- holds candidate speech, and the rows go with their session through the cascade.
 --
 -- The CHECKs add no scan cost that matters: this is 0116's NOT VALID then VALIDATE on a small table,
 -- and every existing row passes on NULL. May run while calls are live. Forward-only.
@@ -56,10 +61,11 @@ alter table screening_v2.transcript_turns
   validate constraint chk_transcript_turns_ai_played_ms;
 
 comment on column screening_v2.transcript_turns.turn_ended_at_ms is
-  'R1 only. Epoch ms the turn ended, on the same worker clock as turn_started_at_ms: when an AI row''s '
-  'audio stopped (a line paused by the candidate''s voice and then cut ends at the pause), a candidate '
-  'row''s voice-activity end of speech. NULL for phone rows, older R1 rows and any turn whose end was '
-  'not known.';
+  'R1 only. Epoch ms the turn ended, on the same worker clock as turn_started_at_ms. AI row: when its '
+  'audio stopped. On a cut line (interrupted) it is the pause, or the cut when nothing paused the line: '
+  'the latest the audio can have stopped, so it can run late by the silence in that line and is not '
+  'exact. Candidate row: the voice-activity end of speech. NULL for phone rows, older R1 rows and any '
+  'turn whose end was not known.';
 comment on column screening_v2.transcript_turns.ai_voice is
   'R1 only. The voice that spoke this AI row: interviewer (Christy) or learner. NULL for candidate '
   'rows, phone rows, older R1 rows and a speech the worker could not tie to a voice.';

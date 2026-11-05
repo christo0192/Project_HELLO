@@ -111,6 +111,25 @@ class TestPlaybackMeter(unittest.TestCase):
         self.assertEqual(playback.played_seconds, 0.75)
         self.assertEqual(playback.resumes, 0)
 
+    def test_a_line_paused_in_a_silent_gap_ends_late_by_the_gap_and_the_silence_says_so(self) -> None:
+        """The limit of a cut line's end (0136): 0.3 s played, 1.2 s of nothing, then the pause."""
+        meter = PlaybackMeter()
+        meter.started(T0)
+        meter.paused(T0 + 1.5)
+        playback = meter.finished(0.3, interrupted=True, now=T0 + 2.5)
+        self.assertEqual(playback.finished_at, T0 + 1.5)  # the audio stopped at T0 + 0.3
+        self.assertAlmostEqual(playback.silence_seconds, 1.2)
+        self.assertEqual(playback.paused_seconds, 1.0)
+
+    def test_r1_cutting_a_quiet_line_with_no_pause_ends_it_at_the_cut(self) -> None:
+        """The same limit on R1's own cut: the filler goes out at 4 s, the deadline cuts it at 12 s."""
+        meter = PlaybackMeter()
+        meter.started(T0 + 4.0)
+        playback = meter.finished(1.0, interrupted=True, now=T0 + 12.0)
+        self.assertEqual(playback.finished_at, T0 + 12.0)  # the audio stopped at T0 + 5.0
+        self.assertAlmostEqual(playback.silence_seconds, 7.0)
+        self.assertEqual(playback.paused_seconds, 0.0)
+
     def test_a_pause_that_came_back_is_counted_and_moves_no_end(self) -> None:
         meter = PlaybackMeter()
         meter.started(T0)

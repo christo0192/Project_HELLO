@@ -1,7 +1,9 @@
 /**
- * 0136: R1 turn timing columns, read from the migration's text. The columns' behaviour on real
- * Postgres is asserted in app/supabase/tests/policy_tests.sql (section "0136"); no Postgres is
- * available here. These pin what makes the migration safe to apply while phone calls are live:
+ * 0136: R1 turn timing columns, read from the migration's text. No Postgres is available here, so
+ * this file only reads text and cannot show that a CHECK accepts or refuses a row: that runs on real
+ * Postgres in app/supabase/tests/policy_tests.sql (section "0136"), row by row, for each of the three
+ * CHECKs and for the cascade. These pin what makes the migration safe to apply while phone calls are
+ * live:
  *
  *   1. it is additive: three nullable columns with no default, on one table, and nothing else;
  *   2. no existing row is written, so no backfill and no rewrite of candidate data;

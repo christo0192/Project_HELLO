@@ -498,7 +498,7 @@ class LatencyTracker:
 class Playback:
     """One finished agent playback: seconds and a count, never text or an identifier."""
 
-    finished_at: float  # wall clock, when its audio stopped
+    finished_at: float  # wall clock, when its audio stopped (a cut one: at the latest, see below)
     played_seconds: float  # the audio that played (the room's ``playback_position``)
     silence_seconds: float  # wall time inside the playback that nothing accounts for
     paused_seconds: float  # wall time the candidate's voice held it
@@ -519,6 +519,12 @@ class PlaybackMeter:
     report, and everything since is ``paused_seconds``, kept out of the silence.  The room also
     counts what the pause dropped from its queue as played, about 0.25 s: start plus played is no
     end either, and the silence of a paused line reads that much low.
+
+    So the end of a cut line is the LATEST its audio can have stopped, not when it did.  Nothing here
+    sees the frames: a line waiting for its next fragment when it was paused, or when R1 cut it with
+    no pause at all (the filler, then ``TURN_DEADLINE_SECONDS``), had already gone quiet, and its end
+    runs late by that silence.  ``silence_seconds`` is the most that can be.  Start plus played cannot
+    correct it, because a gap mid-line would then read seconds early.
 
     The audio output plays one playback at a time, so one meter serves the whole session.  The room
     reports ``playback_started`` again after every resume: only the first is the first frame, and

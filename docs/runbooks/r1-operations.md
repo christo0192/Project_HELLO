@@ -2750,8 +2750,18 @@ For new interviews the worker stores three extra facts on each `transcript_turns
 its audio stopped; candidate row: the voice-activity end of speech, back-dated by the SDK to the last voiced moment),
 `ai_voice` (`interviewer` or `learner`) and `ai_played_ms` (audio that played; less than the line's length if it was cut).
 The candidate's voice only pauses a line, and the cut comes later, when their speech is transcribed: a line paused and
-then cut ends at the pause, not at the cut, so it never covers their barge-in. Do not work an AI end out from the start
-plus `ai_played_ms`: on a paused line that runs about 0.25 s over, because what the pause dropped still counts as played.
+then cut ends at the pause, not at the cut. Do not work an AI end out from the start plus `ai_played_ms`: on a paused
+line that runs about 0.25 s over, because what the pause dropped still counts as played, and a gap mid-line reads seconds
+early.
+
+**A cut line's end is not exact.** It is the latest the audio can have stopped, not when it did. If the line was in a
+silent gap when it was paused (the first fragment had played, the next had not arrived), or when R1 cut it with no pause
+(the filler at 4 s, the cut at 12 s), the row ends late by that silence, and a pause comes about 0.8 s into the
+candidate's speech, so that bar can overlap it. The row cannot show how much, but that playback's `r1_playback_silence`
+`duration_sec` is the most it can be. A cut line has `transcript_turns.interrupted = true`, which
+`GET /api/screening/{id}` does not return today: a timeline must read that column or end an AI bar at the next turn's
+start, and never draw this end as the moment the voice stopped.
+
 All are nullable and a missing value is normal: older interviews have none, and a candidate row has no end when it closed
 while they were still speaking or had no start. The phone lane never writes them. A write these extras make fail is
 logged as `r1_turn_timing_dropped` (`error_category` = the exception type) and made again without them, so the row
@@ -2769,8 +2779,9 @@ a barge-in sits in `paused_sec`, never here, so size that wait from `duration_se
 `r1_playback_watch_unavailable` means the session had no audio output to follow, so there are no such lines and AI rows
 fall back to the SDK's `stopped_speaking_at` with no `ai_played_ms`.
 
-The worker change needs migration 0136 first, which the deploy applies before any app. Deploy it when no R1 interview is
-live, as for any R1 worker change.
+The worker change needs migration 0136 first, which the deploy applies before any app. So does the API's read: on a
+database without it, `GET /api/screening/{id}` answers 500 rather than an empty transcript. Deploy it when no R1 interview
+is live, as for any R1 worker change.
 
 Worker log codes (component `r1`, `error_type`; values are never a URL, key or id): `r1_rec_started` (`error_category` =
 mode, `schema` = output tap), `r1_rec_finished` (`error_category` = layout), `r1_rec_silence_kept` (`duration_sec` and

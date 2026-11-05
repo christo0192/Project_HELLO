@@ -42,10 +42,11 @@ export interface TranscriptTurn {
    *  Only `GET /api/screening/:id` sets it. */
   started_at_ms?: number | null;
   /** 0136, R1 only: the turn's own epoch-ms end on the same clock (AI: when
-   *  its audio stopped, the pause on a line paused and then cut; candidate: the
-   *  voice-activity end of speech). Absent when not stored: phone and older R1
-   *  turns, and any turn whose end was not known. Only `GET /api/screening/:id`
-   *  sets it. */
+   *  its audio stopped; candidate: the voice-activity end of speech). On a cut
+   *  line it is the pause, or the cut when nothing paused it: the latest the
+   *  audio can have stopped, so it can run late by the silence in that line and
+   *  is not exact. Absent when not stored: phone and older R1 turns, and any
+   *  turn whose end was not known. Only `GET /api/screening/:id` sets it. */
   ended_at_ms?: number;
   /** 0136, R1 only: the voice that spoke this AI turn. Absent otherwise. */
   ai_voice?: 'interviewer' | 'learner';

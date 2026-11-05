@@ -2928,6 +2928,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: The transcript could not be read, which is never reported as an empty transcript.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 
   # ── Assess ─────────────────────────────────────────────────────────
   /api/assess/{sessionId}:
@@ -9850,7 +9856,7 @@ components:
           description: M013 S02. GET /api/screening/{id} only. The turn's own epoch-ms start (worker clock), so the review UI can place a phone turn on its leg's recording (CandidatePhoneAttempt.recording_started_at_ms). null for legacy rows without timing.
         ended_at_ms:
           type: integer
-          description: 0136, R1 only. GET /api/screening/{id} only. The turn's own epoch-ms end on the same clock as started_at_ms (AI turn, when its audio stopped, which on a line the candidate's voice paused and that was then cut is the pause; candidate turn, the voice-activity end of speech). Absent for phone and older R1 turns and for any turn whose end was not known.
+          description: 0136, R1 only. GET /api/screening/{id} only. The turn's own epoch-ms end on the same clock as started_at_ms. AI turn, when its audio stopped; on a line that was cut it is the pause, or the cut when nothing paused it, which is the latest the audio can have stopped, so it can run late by the silence in that line and is not exact. Candidate turn, the voice-activity end of speech. Absent for phone and older R1 turns and for any turn whose end was not known.
         ai_voice:
           type: string
           enum: [interviewer, learner]

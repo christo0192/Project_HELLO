@@ -484,7 +484,9 @@ export interface TranscriptLine {
   /**
    * 0136, R1 only. The turn's own epoch-ms end on the same clock. Absent on
    * phone and older R1 turns and whenever the end was not known, so a reader
-   * must always handle a turn without it.
+   * must always handle a turn without it. Not exact on a cut AI line: it is the
+   * latest the audio can have stopped, and can run late by the silence in that
+   * line, so a timeline must not draw it as the moment the voice stopped.
    */
   ended_at_ms?: number;
   /** 0136, R1 only. The voice that spoke this AI turn. Absent otherwise. */

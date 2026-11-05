@@ -881,6 +881,37 @@ class TestR1PlaybackOnTheRealOutput(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(row["ended_at_ms"], stopped * 1000, delta=20)
         self.assertLess(row["played_ms"], 1000)  # (over by what the pause dropped: never the end)
 
+    async def test_a_line_cut_in_a_silent_gap_ends_late_by_the_gap(self) -> None:
+        """The limit 0136 states: a cut line's end is the latest the audio can have stopped.
+
+        The first fragment has played and the next has not arrived when the candidate's voice pauses
+        the line.  The row keeps the pause, past the audio, and only the log line shows how far.
+        """
+        line = await self._line_on_the_real_output()
+        await line.tap.capture_frame(self._audio(0.3))
+        await asyncio.sleep(1.2)  # the wait before a later fragment: nothing is playing
+
+        line.tap.pause()
+        line.session.emit(
+            "agent_state_changed", AgentStateChangedEvent(old_state="speaking", new_state="listening")
+        )
+        stopped = time.time()
+        await asyncio.sleep(0.2)
+
+        line.tap.clear_buffer()
+        line.tap.flush()
+        await line.tap.wait_for_playout()
+        line.tap.resume()
+
+        entry = self._silence_line(line)
+        self.assertEqual(entry["error_category"], "cut")
+        self.assertGreater(entry["duration_sec"], 0.8)
+        self.assertLess(entry["duration_sec"], 1.4)
+
+        row = await self._delivered_row(line, interrupted=True)
+        self.assertAlmostEqual(row["ended_at_ms"], stopped * 1000, delta=20)
+        self.assertLess(row["played_ms"], 500)
+
     async def test_a_gap_inside_a_line_reaches_the_row_and_the_log_line(self) -> None:
         line = await self._line_on_the_real_output()
 
