@@ -21,8 +21,6 @@ import {
   InlineNotice,
   LoadingPanel,
   PageHeader,
-  RevealGroup,
-  RevealItem,
   ScrollArea,
   SectionHeader,
   Combobox,
@@ -190,7 +188,7 @@ const WORKFLOW_SCROLL_AFTER = 6;
  * the length of the read instead of falling to `<body>`.
  */
 const PICKER_NOTE =
-  'flex flex-col gap-2 rounded-[14px] focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
+  'flex flex-col gap-2 rounded-control focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
 /** The page-level confirmations after a save, a delete or a cancel. */
 const MAPPING_ADDED = "Mapping added. It's paused — use Resume to turn it on.";
 const MAPPING_DELETED = 'Mapping deleted.';
@@ -1216,7 +1214,7 @@ export function AshbyMissionControlPage() {
                     else workflowAnchors.current.delete(w.applicationLinkId);
                   }}
                   tabIndex={-1}
-                  className="rounded-sm font-mono text-label font-medium text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+                  className="rounded-sm text-label font-medium text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
                 >
                   {w.externalApplicationId}
                 </span>
@@ -1375,7 +1373,7 @@ export function AshbyMissionControlPage() {
                     readOnly
                     value={invite.joinUrl}
                     onFocus={(e) => e.currentTarget.select()}
-                    className="font-mono"
+                    className="tabular-nums"
                   />
                   <Button className={cx('shrink-0', TOUCH)} onClick={() => void copyInvite()}>
                     {copied ? 'Copied' : 'Copy'}
@@ -1422,8 +1420,7 @@ export function AshbyMissionControlPage() {
         )}
       </div>
 
-      <RevealGroup className="mt-6 flex flex-col gap-6">
-        <RevealItem>
+      <div className="mt-6 flex flex-col gap-6">
           <GlassPanel>
             <SectionHeader
               level={2}
@@ -1629,9 +1626,7 @@ export function AshbyMissionControlPage() {
               </ul>
             )}
           </GlassPanel>
-        </RevealItem>
 
-        <RevealItem>
           <GlassPanel>
             <SectionHeader
               level={2}
@@ -1660,13 +1655,10 @@ export function AshbyMissionControlPage() {
               <div className="mt-1">{workflowRows}</div>
             )}
           </GlassPanel>
-        </RevealItem>
-      </RevealGroup>
+      </div>
 
-      {/* OUTSIDE the RevealGroup, at the page root, on purpose: a revealed
-          item can carry a transform while it animates, and a transformed
-          ancestor is the containing block for a `position: fixed` overlay —
-          the dialog would centre on the panel instead of the viewport. */}
+      {/* At the page root, on purpose: any transformed ancestor would become the
+          containing block for this `position: fixed` overlay. */}
       <Dialog
         open={dialogOpen}
         onClose={closeDialog}
@@ -1975,7 +1967,7 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
               className="border-t border-glass-ring pt-3 first:border-0 first:pt-0 [&+li]:mt-3"
             >
               <p className="text-sm font-medium text-ink">{f.title ?? 'Untitled form'}</p>
-              <p className="font-mono text-label text-ink-secondary">form id: {f.formDefinitionId}</p>
+              <p className="text-label text-ink-secondary">form id: {f.formDefinitionId}</p>
               {(f.stageTitle || f.stageId) && (
                 <p className="text-label text-ink-tertiary">
                   stage: {f.stageTitle ?? 'untitled'}
@@ -2004,7 +1996,7 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
                       <ul className="mt-1 space-y-1">
                         {sec.fields.map((field) => (
                           <li key={field.id} className="text-label text-ink-secondary">
-                            <span className="font-mono">{field.id}</span>
+                            <span className="tabular-nums">{field.id}</span>
                             {' — '}
                             {field.title ?? 'untitled'}
                             {field.path ? ` [${field.path}]` : ''}
@@ -2116,7 +2108,7 @@ function jobsErrorCopy(err: unknown): { message: string; retryable: boolean } {
 function MappingPreview({ jobName, roleName }: { jobName: string | null; roleName: string | null }) {
   if (!jobName || !roleName) return null;
   return (
-    <p className="rounded-[12px] bg-ink/[0.035] px-3.5 py-2.5 text-label text-ink-secondary">
+    <p className="rounded-control bg-ink/[0.035] px-3.5 py-2.5 text-label text-ink-secondary">
       Applicants for <span className="font-medium text-ink">{jobName}</span> will be screened with
       the <span className="font-medium text-ink">{roleName}</span> role&apos;s questions and
       scorecard.
@@ -2525,7 +2517,7 @@ function ScorecardBindingPreviewPanel({
       />
       <p className="mt-2 text-label text-ink-secondary">
         {preview.formTitle ?? 'Untitled form'}{' '}
-        <span className="font-mono text-ink-tertiary">form id: {preview.formDefinitionId}</span>
+        <span className="text-ink-tertiary">form id: {preview.formDefinitionId}</span>
       </p>
 
       {/* The FIRST notice, above the verdict and every other notice, on every
@@ -2575,7 +2567,7 @@ function ScorecardBindingPreviewPanel({
           <li key={f.name} className="text-label text-ink-secondary">
             {FIXED_FIELD_LABEL[f.name]}
             {' — '}
-            <span className="font-mono">[{f.path}]</span>
+            <span className="tabular-nums">[{f.path}]</span>
             {f.status === 'present' && ' · present'}
             {f.status === 'missing' && (
               preview.schemaAvailable ? (
@@ -2607,7 +2599,7 @@ function ScorecardBindingPreviewPanel({
                   {m.status === 'bound' ? (
                     <>
                       {' → '}
-                      <span className="font-mono">[{m.fieldPath}]</span>
+                      <span className="tabular-nums">[{m.fieldPath}]</span>
                       {m.scale ? ` · ${m.scale.min}–${m.scale.max} scale` : ''}
                       {' · '}{METRIC_STATUS_COPY.bound}
                     </>

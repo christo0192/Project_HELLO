@@ -21,8 +21,6 @@ import {
   InlineNotice,
   LoadingPanel,
   Pagination,
-  RevealGroup,
-  RevealItem,
   SectionHeader,
   SelectField,
   StatusBadge,
@@ -251,7 +249,7 @@ export function QuotasSection() {
         title="Quota policies"
         description="Abstract cost units only — never currency or provider price; policies are disabled by default and enforcement engages only once enabled."
         meta={
-          <span className="text-[13px] tabular-nums text-ink-tertiary">
+          <span className="text-label tabular-nums text-ink-tertiary">
             {enabledCount} of {policies.length} enabled
           </span>
         }
@@ -275,17 +273,16 @@ export function QuotasSection() {
         />
       ) : (
         <div>
-          <RevealGroup className="space-y-3">
+          <div className="space-y-3">
             {page.items.map((policy) => (
-              <RevealItem key={policy.id}>
-                <GlassPanel padding="sm" data-policy-row={policy.id}>
+                <GlassPanel key={policy.id} padding="sm" data-policy-row={policy.id}>
                   <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium text-ink">
                         {policy.scope === 'global' ? 'Global' : 'Candidate'}
                       </p>
                       {policy.scope === 'candidate' && (
-                        <p className="font-mono text-xs text-ink-tertiary">
+                        <p className="text-xs text-ink-tertiary">
                           {shortId(policy.scope_id)}
                         </p>
                       )}
@@ -293,7 +290,7 @@ export function QuotasSection() {
                         {policyLimits(policy).map((limit) => (
                           <span
                             key={limit}
-                            className="rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs text-ink-secondary"
+                            className="rounded-chip bg-surface-secondary px-2 py-0.5 text-xs text-ink-secondary"
                           >
                             {limit}
                           </span>
@@ -354,9 +351,8 @@ export function QuotasSection() {
                     />
                   )}
                 </GlassPanel>
-              </RevealItem>
             ))}
-          </RevealGroup>
+          </div>
           <Pagination state={page} noun="policies" />
         </div>
       )}
@@ -442,7 +438,7 @@ export function QuotasSection() {
           </Field>
         </div>
 
-        <div className="glass-sunken mt-4 rounded-[14px] p-4">
+        <div className="glass-sunken mt-4 rounded-control p-4">
           <Switch
             checked={draft.enabled}
             onCheckedChange={(next) => setDraftField('enabled', next)}
@@ -487,7 +483,7 @@ function EditForm({
   onCancel: () => void;
 }) {
   return (
-    <div className="glass-sunken mt-3 rounded-[14px] p-4">
+    <div className="glass-sunken mt-3 rounded-control p-4">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Field label="Max sessions">
           {({ id }) => (

@@ -16,15 +16,15 @@ import { cx } from '../design/cx';
 import type { StatusTone } from '../design';
 import { finiteNumber, recommendationMeta } from './scorecard-read';
 
-/* Same token pairs as `StatusBadge` (hue in the dot and tint, small text in
-   the `*-text` tokens or ink), one step larger: this pill sits beside a
-   32px figure and is the verdict, not a row annotation. */
+/* The token pairs of `StatusBadge`, one step larger: this chip sits beside a
+   30px figure and is the verdict, not a row annotation. The exception is
+   `danger`: a verdict stays in ink, so even that tone has no crimson here. */
 export const PILL_TONE: Record<StatusTone, string> = {
-  neutral: 'bg-ink/[0.05] text-ink-secondary',
+  neutral: 'bg-surface-secondary text-ink-secondary',
   info: 'bg-info-soft text-ink-secondary',
   success: 'bg-success-soft text-success-text',
   warning: 'bg-warning-soft text-warning-text',
-  danger: 'bg-error-soft text-error-text',
+  danger: 'bg-surface-secondary text-ink',
 };
 
 export const PILL_DOT: Record<StatusTone, string> = {
@@ -32,7 +32,7 @@ export const PILL_DOT: Record<StatusTone, string> = {
   info: 'bg-info',
   success: 'bg-success',
   warning: 'bg-warning',
-  danger: 'bg-error',
+  danger: 'bg-ink',
 };
 
 export interface ScoreVerdictProps {
@@ -57,7 +57,7 @@ export function ScoreVerdict({ overall, recommendation, summary, detail, childre
       <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
         <div className="min-w-0">
           {score == null ? (
-            <p className="text-[15px] font-semibold leading-8 text-ink">Not scored</p>
+            <p className="text-section leading-8 text-ink">Not scored</p>
           ) : (
             <p className="flex items-baseline gap-1.5">
               <span className="text-stat leading-none tabular-nums text-ink">
@@ -75,7 +75,7 @@ export function ScoreVerdict({ overall, recommendation, summary, detail, childre
           <span
             data-recommendation={reco.tone}
             className={cx(
-              'inline-flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-1 text-label font-semibold',
+              'inline-flex items-center gap-2 whitespace-nowrap rounded-chip px-3 py-1 text-label font-semibold',
               PILL_TONE[reco.tone],
             )}
           >

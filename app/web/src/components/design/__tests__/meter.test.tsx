@@ -87,7 +87,9 @@ describe('Meter', () => {
   it('renders figures in a monospace, tabular face', () => {
     render(<Meter label="Score" value={3} />);
     const figure = screen.getByText('3/10');
-    expect(figure.className).toContain('font-mono');
+    // Plex Mono is for positions in a recording; a score is tabular sans.
+    expect(figure.className).toContain('tabular-nums');
+    expect(figure.className).not.toContain('font-mono');
     expect(figure.className).toContain('tabular-nums');
   });
 

@@ -19,7 +19,7 @@ export interface PageHeaderProps {
  * place a page gets to say what it is for. Keep the copy to one or two short
  * sentences at the call site rather than clamping it here.
  *
- * Type follows the shared scale: title 28/34 semibold with tight tracking,
+ * Type follows the shared scale: title 24/32 semibold,
  * description at body size (14/20) in secondary ink, eyebrow as a quiet
  * sentence-case label, never uppercase.
  */

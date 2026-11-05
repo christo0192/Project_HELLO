@@ -38,11 +38,9 @@ export interface TagProps {
   /** Screen-reader-only classification, e.g. "Gap:" before the skill name. */
   srPrefix?: string;
   /**
-   * A tinted, ringed CHIP for a SHORT label by default (`inline-flex`,
-   * fully-rounded, single line). Set `block` for a LONG, wrapping item (a gap or
-   * a red flag): the same tint + ring, but a block-level rounded RECTANGLE with
-   * room to breathe and normal wrapping — a fully-rounded pill with `py-0.5`
-   * cramps and overflows once its text wraps to two or three lines.
+   * A tinted, ringed CHIP for a SHORT label by default (`inline-flex`, single
+   * line). Set `block` for a LONG, wrapping item (a gap or a red flag): the same
+   * tint + ring, as a block-level box with room to breathe and normal wrapping.
    */
   block?: boolean;
   className?: string;
@@ -57,8 +55,8 @@ export function Tag({ tone = 'neutral', srPrefix, block = false, className, chil
         // can carry a count or a year: "5 yrs", "2024").
         'text-meta font-medium tabular-nums ring-1 ring-inset',
         block
-          ? 'block rounded-lg px-2.5 py-1.5 leading-snug'
-          : 'inline-flex items-center rounded-full px-2.5 py-0.5',
+          ? 'block rounded-control px-2.5 py-1.5 leading-snug'
+          : 'inline-flex items-center rounded-chip px-2.5 py-0.5',
         toneStyles[tone],
         className,
       )}

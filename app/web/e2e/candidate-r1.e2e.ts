@@ -383,6 +383,43 @@ test.describe('the full interview', () => {
     r1.expectHealthy();
   });
 
+  for (const colorScheme of ['light', 'dark'] as const) {
+    test(`a pressed control shows keyboard focus in a ${colorScheme} contrast theme`, async ({ r1 }) => {
+      await reachLive(r1);
+      const { page } = r1;
+      // One theme per test, set before the focus: switching palette on an open page
+      // leaves a system colour stale in computed style for up to two frames.
+      await page.emulateMedia({ colorScheme, forcedColors: 'active' });
+      await page.getByRole('button', { name: 'Mute microphone' }).click();
+      const pressed = page.getByRole('button', { name: 'Unmute microphone' });
+      await expect(pressed).toHaveAttribute('aria-pressed', 'true');
+      await pressed.focus();
+      await page.keyboard.press('Shift+Tab');
+      await page.keyboard.press('Tab');
+      await expect(pressed).toBeFocused();
+      const readCue = () =>
+        pressed.evaluate((el) => {
+          const style = getComputedStyle(el);
+          return {
+            line: style.outlineStyle,
+            width: style.outlineWidth,
+            offset: style.outlineOffset,
+            colour: style.outlineColor,
+            canvasText: getComputedStyle(document.body).color,
+          };
+        });
+      // Polled: computed style can lag a forced-colours change by a frame or two (CI once read the
+      // default 3px; 20 local repeats read 2px). A real fault never settles, so this still fails.
+      // Outside the control, so it sits on Canvas: only CanvasText is sure to show there.
+      await expect
+        .poll(readCue)
+        .toMatchObject({ line: 'solid', width: '2px', offset: '2px' });
+      const cue = await readCue();
+      expect(cue.colour).toBe(cue.canvasText);
+      r1.expectHealthy();
+    });
+  }
+
   test('leaving asks first, then leaves the room and keeps the nonce for a rejoin', async ({ r1 }) => {
     await reachLive(r1);
     const { page } = r1;

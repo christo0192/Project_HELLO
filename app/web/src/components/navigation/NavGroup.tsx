@@ -17,7 +17,7 @@ export interface NavGroupProps {
 export function NavGroup({ label, children }: NavGroupProps) {
   return (
     <div role="group" aria-label={label} className="mt-6 first:mt-0">
-      <p className="mb-1.5 px-3 text-xs font-medium text-ink-tertiary">{label}</p>
+      <p className="mb-1.5 px-2.5 text-meta text-ink-tertiary">{label}</p>
       <div className="space-y-0.5">{children}</div>
     </div>
   );

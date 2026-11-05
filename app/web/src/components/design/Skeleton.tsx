@@ -11,14 +11,14 @@ export interface SkeletonProps extends HTMLAttributes<HTMLSpanElement> {
 }
 
 /**
- * Neutral shimmer placeholder. `aria-hidden` — the loading state itself must
- * be announced by the surrounding component (e.g. `role="status"`), never by
- * the shimmer visual.
+ * Flat placeholder block. `aria-hidden`: the loading state itself must be
+ * announced by the surrounding component (e.g. `role="status"`), never by the
+ * block.
  */
 export function Skeleton({
   width,
   height = 12,
-  radius = 6,
+  radius = 3,
   className,
   style,
   ...rest
@@ -39,7 +39,7 @@ export interface SkeletonTextProps {
   className?: string;
 }
 
-/** A stack of shimmer text lines; the last line is shorter. */
+/** A stack of placeholder text lines; the last line is shorter. */
 export function SkeletonText({ lines = 3, gap = 8, className }: SkeletonTextProps) {
   return (
     <span aria-hidden="true" className={cx('flex w-full flex-col', className)} style={{ gap }}>
@@ -79,7 +79,7 @@ export function ChartSkeleton({ className, bars = 12, height }: ChartSkeletonPro
           <Skeleton
             key={index}
             width="100%"
-            radius={4}
+            radius={2}
             height={18 + ((index * 37) % 56)}
           />
         ))}

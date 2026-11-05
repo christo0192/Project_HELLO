@@ -117,7 +117,7 @@ export function PhoneWeekTable({
 
   const detailRow = (
     <tr className="align-top">
-      <td colSpan={weekDates.length + 1} className="border-b border-glass-ring bg-white/75 p-0">
+      <td colSpan={weekDates.length + 1} className="border-b border-glass-ring bg-surface p-0">
         {detail}
       </td>
     </tr>
@@ -161,7 +161,7 @@ export function PhoneWeekTable({
                   scope="col"
                   className={cx(
                     'whitespace-nowrap border-l border-glass-ring !px-2.5',
-                    isToday && '!bg-white',
+                    isToday && '!bg-surface-secondary',
                   )}
                 >
                   {/*
@@ -207,7 +207,7 @@ export function PhoneWeekTable({
                       key={date}
                       className={cx(
                         'border-l !px-1.5 !py-1.5 !align-top',
-                        date === today && 'bg-white/45',
+                        date === today && 'bg-surface-secondary',
                       )}
                     >
                       {inCell.length > 0 && (

@@ -606,7 +606,7 @@ export function TranscriptionSyncWorkspace({
         {frame(
           <>
             <SurfaceCard className="p-4 sm:p-5">
-              <h2 className="mb-1 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]">
+              <h2 className="mb-1 text-section text-[var(--c-ink)]">
                 Review workspace
               </h2>
               <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
@@ -651,7 +651,7 @@ export function TranscriptionSyncWorkspace({
       <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <h2
           id={transcriptHeadingId}
-          className="text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
+          className="text-section text-[var(--c-ink)]"
         >
           Transcript
         </h2>
@@ -665,7 +665,7 @@ export function TranscriptionSyncWorkspace({
         className="mb-3 border-b border-[var(--c-border-light)] pb-3"
       >
         {selectedSessionId && legsLoading && (
-          <p className="text-[13px] text-[var(--c-ink-secondary)]">Loading the calls in this session…</p>
+          <p className="text-label text-[var(--c-ink-secondary)]">Loading the calls in this session…</p>
         )}
         {selectedSessionId && legsMode && (
           /* Every leg of the session, in order, even when it completed. */
@@ -689,13 +689,13 @@ export function TranscriptionSyncWorkspace({
         )}
         {selectedSessionId && legsFailed && (
           <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1" role="alert">
-            <p className="text-[13px] text-[var(--c-ink-secondary)]">
+            <p className="text-label text-[var(--c-ink-secondary)]">
               The calls in this session could not be listed. The session recording is below.
             </p>
             <button
               type="button"
               onClick={() => setLegsRefreshKey((k) => k + 1)}
-              className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline"
+              className="textlink text-xs font-medium text-[var(--c-accent)]"
             >
               Retry
             </button>
@@ -721,11 +721,11 @@ export function TranscriptionSyncWorkspace({
                 onNeedRefresh={() => setR1RefreshKey((k) => k + 1)}
               />
             ) : r1Supported && r1Rec?.status !== 'unavailable' ? (
-              <p role="status" className="text-[13px] text-[var(--c-ink-secondary)]">
+              <p role="status" className="text-label text-[var(--c-ink-secondary)]">
                 Loading recording details…
               </p>
             ) : (
-              <p className="text-[13px] text-[var(--c-ink-secondary)]">
+              <p className="text-label text-[var(--c-ink-secondary)]">
                 {R1_RECORDING_ON_CANDIDATE_PAGE}
               </p>
             )}
@@ -765,7 +765,7 @@ export function TranscriptionSyncWorkspace({
         role="region"
         aria-label="Transcript"
         tabIndex={0}
-        className="scroll-fade max-h-[36rem] overflow-y-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+        className="max-h-[36rem] overflow-y-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         {legsMode && !transcriptLoading && legGroups.length > 0 ? (
           /* Turns grouped by the call they were spoken in. */
@@ -777,7 +777,7 @@ export function TranscriptionSyncWorkspace({
                 <div key={key} role="group" aria-labelledby={headingId} className="mb-4 last:mb-0">
                   <h3
                     id={headingId}
-                    className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--c-ink-secondary)]"
+                    className="mb-1 text-xs font-semibold text-[var(--c-ink-secondary)]"
                   >
                     {leg && group.legIndex !== null
                       ? legTitle(group.legIndex, legs.length)
@@ -829,7 +829,7 @@ export function TranscriptionSyncWorkspace({
 
   const deniedPane = (
     <SurfaceCard className="p-4 sm:p-5">
-      <h2 className="mb-1 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]">
+      <h2 className="mb-1 text-section text-[var(--c-ink)]">
         Transcript &amp; recording
       </h2>
       <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
@@ -946,7 +946,7 @@ function ScorecardBlock({
     <section aria-labelledby={headingId}>
       <h2
         id={headingId}
-        className="mb-3 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
+        className="mb-3 text-section text-[var(--c-ink)]"
       >
         {heading ?? 'Scorecard'}
       </h2>

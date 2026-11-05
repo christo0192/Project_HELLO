@@ -545,7 +545,7 @@ export function R1SettingsPage() {
             role="group"
             tabIndex={-1}
             aria-labelledby={`r1-confirm-${uid}`}
-            className="glass-sunken rounded-[14px] p-4 outline-none focus-visible:ring-2 focus-visible:ring-info"
+            className="glass-sunken rounded-control p-4 outline-none focus-visible:ring-2 focus-visible:ring-info"
           >
             <h2 id={`r1-confirm-${uid}`} className="text-label font-medium text-ink">
               Confirm these changes

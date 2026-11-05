@@ -7,8 +7,8 @@
  *
  *   - Value redundancy: the number is ALWAYS rendered as text in tabular
  *     figures, and the band ("Low" / "Fair" / "Strong") is ALWAYS rendered
- *     as a word. Colour is the third signal, never the first, so the meter
- *     survives greyscale and colour-vision deficiency.
+ *     as a word. The fill is ink and steps in weight, never in hue: a score
+ *     is a reading, not a traffic light.
  *   - Semantics: `role="meter"` with aria-valuenow/min/max, an
  *     aria-valuetext that spells out value and band, and an accessible
  *     name taken from the visible label.
@@ -65,9 +65,9 @@ export const BAND_LABEL: Record<MeterBand, string> = {
 };
 
 const bandFill: Record<MeterBand, string> = {
-  low: 'var(--c-negative)',
-  fair: 'var(--c-caution)',
-  strong: 'var(--c-positive)',
+  low: 'var(--c-ink-muted)',
+  fair: 'var(--c-ink-secondary)',
+  strong: 'var(--c-ink)',
 };
 
 /** Clamp to the scale and drop NaN, exactly as the legacy MetricBar did. */
@@ -101,7 +101,7 @@ export function Meter({
           {label}
         </span>
         <span className="font-medium text-[var(--c-ink)]">
-          <span className="font-mono tabular-nums">
+          <span className="tabular-nums">
             {safe}/{max}
           </span>
           <span aria-hidden="true" className="mx-1.5 text-[var(--c-ink-secondary)]">
@@ -124,10 +124,7 @@ export function Meter({
         )}
       >
         <div
-          // The fill GROWS into place: a width transition, not a keyframe
-          // animation, so it costs no motion budget and collapses to 0.01ms
-          // under the global `prefers-reduced-motion` rule in index.css.
-          className="h-full rounded-full transition-[width] duration-700 ease-out"
+          className="data-fill h-full rounded-full"
           style={{ width: `${pct}%`, backgroundColor: bandFill[band] }}
         />
       </div>

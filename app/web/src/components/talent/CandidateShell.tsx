@@ -7,17 +7,11 @@
  * outside this subtree can. Mission Control, Login, Session Detail and the
  * live-call surfaces are unreachable by construction, not by convention.
  *
- * The palette is fixed and light-only, so the shell renders identically
- * under the app's `.dark` root class — `.dark .candidate-scope` repeats
- * the same values (src/styles/candidate-palette.css).
- *
  * The shell also carries the shared page rhythm so the three candidate
  * surfaces read as one system rather than three pages that agree.
  *
- * The ground itself is transparent: `--c-bg` is still declared here (every
- * descendant that asks for it resolves it), but the shell no longer paints
- * an opaque rectangle over the app's lit ground, so the glass surfaces
- * inside it float on the same material as the rest of the shell.
+ * The ground itself is transparent: inside the app the shell sits on the
+ * sheet, so it paints nothing of its own.
  */
 
 import type { ElementType, ReactNode } from 'react';

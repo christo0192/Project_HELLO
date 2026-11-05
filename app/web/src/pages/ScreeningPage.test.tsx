@@ -120,6 +120,20 @@ describe('ScreeningPage', () => {
     expect(screen.getByText('Tell me about your experience.')).toBeInTheDocument();
   });
 
+  it('prints a candidate turn on paper: an ink fill means a primary action', async () => {
+    mockApi.getSession.mockResolvedValue({
+      session: { id: 's1', status: 'in_progress' },
+      transcript: mockTranscript,
+      assessment: null,
+    });
+    renderScreeningPage();
+
+    const classes = (await screen.findByText('Thank you!')).className.split(/\s+/);
+    expect(classes).toEqual(expect.arrayContaining(['bg-surface', 'border-line-strong', 'text-ink']));
+    expect(classes).not.toContain('bg-info');
+    expect(classes).not.toContain('text-white');
+  });
+
   it('shows composer with textarea and send button', async () => {
     mockApi.getSession.mockResolvedValue({
       session: { id: 's1', status: 'in_progress' },

@@ -2,7 +2,7 @@
  * MetricStrip — a group of related figures on ONE surface, divided by
  * hairlines, instead of a card per number.
  *
- * The dashboard used to give every figure its own glass card: eighteen of
+ * The dashboard used to give every figure its own card: eighteen of
  * them in five identical bands, 4,000px of page on a laptop and 15,000px on
  * a phone. A card says "this stands alone"; these figures do not. They are
  * read together (dialled, then reached, then the rate between them), so they
@@ -30,7 +30,6 @@ import { useId } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { cx } from './cx';
-import { RollingNumber } from './RollingNumber';
 import { Skeleton } from './Skeleton';
 
 export type MetricTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
@@ -99,8 +98,8 @@ const DOT: Record<MetricTone, string> = {
 const FIGURE: Record<MetricStripSize, string> = {
   // The scale's hero step (30/36, -0.02em): one size for every page's lead figure.
   hero: 'text-stat',
-  default: 'text-2xl leading-8 tracking-[-0.02em]',
-  compact: 'text-xl leading-7 tracking-[-0.015em]',
+  default: 'text-2xl leading-8',
+  compact: 'text-xl leading-7',
 };
 
 const CELL_PAD: Record<MetricStripSize, string> = {
@@ -224,7 +223,7 @@ export function MetricStrip({
                       // the figure is its description, not dropped.
                       aria-describedby={item.context && !item.loading ? `${headingId}-c${i}` : undefined}
                       className={cx(
-                        'group/metric transition-colors duration-150 ease-out',
+                        'group/metric transition-colors duration-hover ease-out',
                         SUBGRID,
                         'hover:bg-ink/[0.025] focus:outline-none focus-visible:bg-info/[0.06] focus-visible:shadow-[inset_0_0_0_2px_var(--info)]',
                         pad,
@@ -282,22 +281,15 @@ function MetricBody({
 }) {
   const Term = asTerms ? 'dt' : 'p';
   const Def = asTerms ? 'dd' : 'p';
-  const figure =
-    typeof item.value === 'string' ? (
-      <RollingNumber text={item.value} />
-    ) : typeof item.value === 'number' ? (
-      <RollingNumber text={item.value.toLocaleString()} />
-    ) : (
-      item.value
-    );
+  const figure = typeof item.value === 'number' ? item.value.toLocaleString() : item.value;
 
   return (
     <>
       {/* `items-start` + a nudged dot: a wrapped label keeps its dot on the
           first line instead of floating between the two. */}
-      <Term className="flex min-w-0 items-start gap-1.5 self-start text-label font-medium leading-5 text-ink-secondary">
+      <Term className="form-label flex min-w-0 items-start gap-1.5 self-start">
         {item.tone && (
-          <span aria-hidden="true" className={cx('mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full', DOT[item.tone])} />
+          <span aria-hidden="true" className={cx('mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full', DOT[item.tone])} />
         )}
         {/* Wraps rather than truncates: a clipped label is a figure with
             half a name. */}
@@ -317,7 +309,7 @@ function MetricBody({
             <Skeleton
               width={SKELETON[size].width}
               height={SKELETON[size].height}
-              radius={8}
+              radius={3}
               // `align-top`: middle-aligned, it stretched the line box by a pixel or two.
               className="inline-block align-top"
             />
@@ -364,7 +356,7 @@ function ChevronIcon() {
       strokeWidth={2}
       strokeLinecap="round"
       strokeLinejoin="round"
-      className="ml-auto mt-[3px] h-3.5 w-3.5 shrink-0 text-ink-tertiary opacity-0 transition-opacity duration-150 ease-out group-hover/metric:opacity-100 group-focus-visible/metric:opacity-100"
+      className="ml-auto mt-px h-3.5 w-3.5 shrink-0 text-ink-tertiary opacity-0 transition-opacity duration-150 ease-out group-hover/metric:opacity-100 group-focus-visible/metric:opacity-100"
     >
       <path d="m9 6 6 6-6 6" />
     </svg>

@@ -38,8 +38,8 @@ jobs:
         run: node scripts/validate-livekit-r1-sfu.mjs && node scripts/validate-livekit-r1-sfu.test.mjs && node infra/livekit-r1/entrypoint.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
-      - name: Validate approved HR design system
-        run: node scripts/validate-hr-design-system.mjs
+      - name: Validate the Logsheet design system
+        run: node scripts/validate-hr-design-system.mjs && node scripts/validate-hr-design-system.test.mjs
       # ── PR106 — Canary-1 arming lives on the never-merged activation branch
       #    `canary1/arm`, which flips CANARY1_ARMED to true. The in-suite pin
       #    (phone-canary1-structural.test.ts §9) CANNOT catch a merge of that

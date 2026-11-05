@@ -46,7 +46,7 @@ import { sessionModeLabel } from '../../lib/session-mode';
 
 /** The quiet inline action style shared by every row link/button here. */
 const ROW_ACTION =
-  'rounded-sm text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] disabled:cursor-wait disabled:opacity-60';
+  'textlink rounded-sm text-xs font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] disabled:cursor-wait disabled:opacity-60';
 
 /** One label/value row inside the profile definition list. */
 export function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -261,7 +261,7 @@ export function PhoneAttemptHistory({
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         {title}
       </h2>
       <p className="mb-3 mt-0.5 text-label text-ink-tertiary">{description}</p>
@@ -477,7 +477,7 @@ export function CandidateProfileCard({
   const phoneParsing = candidate.intake_type === 'phone_parsing';
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         Profile
       </h2>
       <p className="mb-4 mt-0.5 text-label text-ink-tertiary">
@@ -620,7 +620,7 @@ export function SessionsSummary({
   const headingId = useId();
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
-      <h2 id={headingId} className="mb-3 text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="mb-3 text-section text-ink">
         Screening sessions
       </h2>
       {sessions.length === 0 ? (

@@ -94,7 +94,7 @@ export function Pagination({ state, noun, hidePageSize = false, className }: Pag
       aria-label={`${noun} pagination`}
       className={cx('flex flex-wrap items-center justify-between gap-3 px-1 pt-3', className)}
     >
-      <p role="status" className="text-[13px] tabular-nums text-ink-tertiary">
+      <p role="status" className="text-label tabular-nums text-ink-tertiary">
         Showing <span className="font-medium text-ink-secondary">{from}–{to}</span> of{' '}
         <span className="font-medium text-ink-secondary">{total}</span> {noun}
       </p>
@@ -124,7 +124,7 @@ export function Pagination({ state, noun, hidePageSize = false, className }: Pag
           <Button size="sm" variant="secondary" onClick={() => setPage(page - 1)} disabled={page <= 1} aria-label="Previous page">
             <ChevronIcon direction="left" />
           </Button>
-          <span className="min-w-[4.5rem] text-center text-[13px] tabular-nums text-ink-secondary" aria-hidden="true">
+          <span className="min-w-[4.5rem] text-center text-label tabular-nums text-ink-secondary" aria-hidden="true">
             {page} / {pageCount}
           </span>
           <Button size="sm" variant="secondary" onClick={() => setPage(page + 1)} disabled={page >= pageCount} aria-label="Next page">

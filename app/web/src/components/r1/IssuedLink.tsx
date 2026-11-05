@@ -88,7 +88,7 @@ export function IssuedLink({ url, expiresAt, kind, onDismiss }: IssuedLinkProps)
             autoComplete="off"
             spellCheck={false}
             aria-describedby={warningId}
-            className="w-full font-mono text-xs"
+            className="w-full text-xs"
           />
         </div>
         <CandidateButton variant="secondary" onClick={() => void copyLink()}>

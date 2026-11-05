@@ -10,18 +10,16 @@
  *   - Role gating: non-admins never see either Mission Control
  *   - API health status display (online / maintenance / offline)
  *   - Auth state: user email + role chip + sign-out
- *   - Theme toggle presence (requires ThemeProvider)
  *   - Mobile drawer: toggle aria-expanded/controls, inert when closed,
  *     backdrop, Escape close + focus return, close on nav, scroll lock
- *   - Reduced-motion route fade static render
  *   - axe structural compliance
  */
 
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ThemeProvider } from '../lib/theme';
 import { Layout, pageTitleFor } from './Layout';
 
 vi.mock('../api', () => ({
@@ -63,11 +61,9 @@ function setAuth(overrides: Partial<MockAuth> = {}) {
 
 function renderLayout(initialEntry = '/dashboard') {
   return render(
-    <ThemeProvider>
-      <MemoryRouter initialEntries={[initialEntry]}>
-        <Layout />
-      </MemoryRouter>
-    </ThemeProvider>,
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <Layout />
+    </MemoryRouter>,
   );
 }
 
@@ -80,6 +76,54 @@ function sidebarInert(): boolean {
 
 beforeEach(() => {
   setAuth();
+});
+
+describe('a page never outlives its URL', () => {
+  /** A record page with no stale guard, which is what most routed pages are. */
+  function RecordPage({ reads }: { reads: Record<string, Promise<string>> }) {
+    const { id } = useParams<{ id: string }>();
+    const [name, setName] = useState('Loading');
+    useEffect(() => {
+      void reads[id ?? ''].then(setName);
+    }, [id, reads]);
+    return (
+      <>
+        <p data-testid="record-name">{name}</p>
+        <Link to="/candidates/second">Open the second record</Link>
+      </>
+    );
+  }
+
+  it('drops a read still in flight when the path changes under the same route', async () => {
+    // One route serves every id, so without a key on the path the page stays
+    // mounted: the first read then lands late and puts one person's record
+    // under the other person's URL.
+    let finishFirst: (name: string) => void = () => {};
+    const reads = {
+      first: new Promise<string>((resolve) => {
+        finishFirst = resolve;
+      }),
+      second: Promise.resolve('Second person'),
+    };
+    render(
+      <MemoryRouter initialEntries={['/candidates/first']}>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/candidates/:id" element={<RecordPage reads={reads} />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(screen.getByRole('link', { name: 'Open the second record' }));
+    expect(await screen.findByText('Second person')).toBeInTheDocument();
+
+    await act(async () => {
+      finishFirst('First person');
+      await reads.first;
+    });
+    expect(screen.getByTestId('record-name')).toHaveTextContent('Second person');
+  });
 });
 
 describe('Layout shell', () => {
@@ -229,11 +273,9 @@ describe('Layout shell', () => {
       });
     const { Layout: LayoutAgain } = await import('./Layout');
     render(
-      <ThemeProvider>
-        <MemoryRouter initialEntries={['/candidates']}>
-          <LayoutAgain />
-        </MemoryRouter>
-      </ThemeProvider>,
+      <MemoryRouter initialEntries={['/candidates']}>
+        <LayoutAgain />
+      </MemoryRouter>,
     );
     expect(await screen.findByText('Maintenance')).toBeInTheDocument();
     (apiMock.api as any).status = () =>
@@ -282,6 +324,41 @@ describe('Layout shell', () => {
     await user.click(screen.getByRole('button', { name: 'Open navigation menu' }));
     await user.click(screen.getByRole('link', { name: /^Agents$/ }));
     await waitFor(() => expect(announcer?.textContent).toBe('Agents'));
+  });
+});
+
+describe('Layout: the desk and the sheet', () => {
+  it('lays the page on one opaque sheet, inset 8px from the window', () => {
+    renderLayout();
+    const main = document.querySelector('main#main-content');
+    expect(main).toHaveClass('sheet', 'm-2');
+  });
+
+  it('sets a 232px sidebar on the desk that stays on screen at any scroll', () => {
+    renderLayout();
+    const aside = document.getElementById('app-sidebar');
+    expect(aside).toHaveClass('w-[232px]', 'bg-surface-tertiary', 'lg:sticky', 'lg:top-0', 'lg:h-screen');
+  });
+
+  it('keeps the drawer motion to the slide-over duration, with no overshoot', () => {
+    renderLayout();
+    const aside = document.getElementById('app-sidebar');
+    expect(aside?.className).toContain('duration-[220ms]');
+    expect(aside?.className).not.toMatch(/cubic-bezier/);
+  });
+
+  it('names the sign-out control though it is an icon', () => {
+    renderLayout();
+    expect(screen.getByRole('button', { name: 'Sign out' }).querySelector('svg')).toBeInTheDocument();
+  });
+
+  // The calling state's only read is GET /api/phone/health, limited to
+  // interviewers and above: a viewer would get a 403 on every route. It stays
+  // out of the shell until a read exists that is safe for every role.
+  it.each(['admin', 'interviewer', 'viewer'] as const)('shows no calling state to %s', (role) => {
+    setAuth({ role });
+    renderLayout();
+    expect(screen.queryByText(/calling/i)).not.toBeInTheDocument();
   });
 });
 

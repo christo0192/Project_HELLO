@@ -1,8 +1,8 @@
 /**
  * Button — the shell's action control.
  *
- * Six variants, three sizes, press feedback via a CSS scale transition
- * (collapses under reduced motion through the global media rule). Pure CSS
+ * Six variants, three sizes, press feedback at 0.97 via a CSS scale transition
+ * (removed under reduced motion). Pure CSS
  * on purpose: buttons are the hottest primitive in the app and a motion
  * element per button made typed-input tests measurably slower in jsdom.
  * `buttonClass()` is exported so router `<Link>`s can wear the same clothes
@@ -15,44 +15,44 @@ export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'dang
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const base =
-  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-control font-medium transition-[color,background-color,box-shadow,transform] duration-200 ease-soft active:scale-[0.97] ' +
-  'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary ' +
+  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-control font-medium transition-[color,background-color,border-color,transform] duration-hover ease-out active:scale-[0.97] motion-reduce:active:scale-100 ' +
+  'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface ' +
   'disabled:cursor-not-allowed disabled:opacity-50';
 
 const variants: Record<ButtonVariant, string> = {
+  /* The ink fill: the one primary action on a screen. Paper on ink is 16.80:1,
+     and hover steps to graphite, 9.27:1. Every filled variant carries a
+     transparent border: forced colours drop the fill and draw the border, so
+     the button keeps an edge instead of reading as plain text. */
   primary:
-    'bg-info text-white shadow-pill hover:bg-[#465f96] active:bg-[#3f568a]',
+    'border border-transparent bg-info text-surface hover:bg-ink-secondary active:bg-ink-secondary',
+  /* A real border, not an inset shadow: forced colours keep borders and drop
+     shadows, and `--control` clears the 3:1 a control boundary needs. */
   secondary:
-    'bg-white/70 text-ink shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] hover:bg-white hover:shadow-[inset_0_0_0_1px_var(--glass-ring-strong),0_1px_2px_rgba(15,23,42,0.06)]',
+    'border border-[var(--control)] bg-surface text-ink hover:bg-surface-secondary',
   ghost:
     'text-ink-secondary hover:bg-ink/[0.05] hover:text-ink',
+  /* Filled crimson: Halt all calling and a confirmation step, nothing else.
+     Paper on `--danger` is 7.38:1. */
   danger:
-    'bg-error text-white shadow-pill hover:bg-[#a54e66] active:bg-[#98475e]',
+    'border border-transparent bg-error text-surface hover:bg-error/90 active:bg-error/90',
   /* GREEN, for "Resume calling" only. The owner asked on 2026-09-29 for the
-     resume button to read as green; no approved token was green (the
-     `--success` family is teal-cyan, hue ~193°, and read as blue), so
-     `--go` / `--go-strong` were added to the palette for this one action.
-     White on `--go` is 5.23:1 and on `--go-strong` 6.14:1, both over the
-     4.5:1 a 14px label needs. Hover and press change the FILL only — never a
-     `brightness()` filter, which dims the white label along with the fill and
-     so LOWERS contrast — and `background-color` is already in the base
-     transition, so the hover eases instead of snapping. Contrast is pinned
-     in global-palette.test.ts. */
+     resume button to read as green, so `--go` / `--go-strong` exist for this
+     one action. White on `--go` is 5.23:1 and on `--go-strong` 6.14:1, both
+     over the 4.5:1 a 14px label needs. Hover and press change the FILL only:
+     never a `brightness()` filter, which dims the white label along with the
+     fill and so LOWERS contrast. Contrast is pinned in global-palette.test.ts. */
   go:
-    'bg-[var(--go)] text-white shadow-pill hover:bg-[var(--go-strong)] active:bg-[var(--go-strong)]',
-  /* A destructive action that is not the point of its surface — "Archive"
-     beside "Edit". Red text on the glass, filling only on hover; the filled
-     `danger` is kept for the confirmation step itself. The text token, not
-     the fill, because small text never uses `--error` directly (design
-     system rule 4). */
-  // The outline is the full `--error` (≈4.9:1 on white): a control boundary
-  // must clear 3:1 (design system rule 5), which a faint tint did not.
+    'border border-transparent bg-[var(--go)] text-white hover:bg-[var(--go-strong)] active:bg-[var(--go-strong)]',
+  /* A destructive action that is not the point of its surface: "Archive"
+     beside "Edit". Crimson text and a crimson edge; the filled `danger` is
+     kept for the confirmation step itself. */
   'danger-quiet':
-    'bg-white/70 text-error-text shadow-[inset_0_0_0_1px_var(--error)] hover:bg-error-soft',
+    'border border-error bg-surface text-error-text hover:bg-surface-secondary',
 };
 
 const sizes: Record<ButtonSize, string> = {
-  sm: 'h-8 px-3 text-[13px]',
+  sm: 'h-7 px-2.5 text-label',
   md: 'h-9 px-4 text-sm',
   /* Write controls and touch surfaces: WCAG 2.5.5 target size. The literal
      `min-h-[44px]` class is what the phone-calendar a11y gate looks for. */

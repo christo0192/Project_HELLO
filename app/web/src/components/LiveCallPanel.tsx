@@ -263,19 +263,19 @@ export function LiveCallPanel({
       <div className="flex items-center justify-between gap-3 border-b border-gray-200 bg-gray-50/60 px-4 py-3">
         <h2 className="text-sm font-semibold text-gray-900">Live call</h2>
         {isLive ? (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-red-50 px-2.5 py-0.5 text-xs font-semibold text-red-700 ring-1 ring-inset ring-red-200">
+          <span className="inline-flex items-center gap-1.5 rounded-chip bg-gray-100 px-2.5 py-0.5 text-xs font-semibold text-gray-800">
             <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current opacity-75" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
             </span>
             Live
           </span>
         ) : isCompleted ? (
-          <span className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
+          <span className="inline-flex items-center rounded-chip bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
             Call ended
           </span>
         ) : status ? (
-          <span className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
+          <span className="inline-flex items-center rounded-chip bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
             {status}
           </span>
         ) : null}
@@ -296,7 +296,7 @@ export function LiveCallPanel({
             </p>
           </div>
           {assessment ? (
-            <span className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
+            <span className="inline-flex items-center rounded-chip bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
               Scorecard ready
             </span>
           ) : (
@@ -346,7 +346,7 @@ export function LiveCallPanel({
                     className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
                       isBot
                         ? "rounded-tl-sm bg-gray-100 text-gray-800"
-                        : "rounded-tr-sm bg-accent-600 text-white"
+                        : "rounded-tr-sm border border-line-strong bg-surface text-ink"
                     }`}
                   >
                     {presented.text}

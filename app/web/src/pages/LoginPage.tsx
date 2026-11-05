@@ -127,7 +127,7 @@ export function LoginPage() {
           <div className="flex justify-center">
             <Brand />
           </div>
-          <h1 className="mt-6 text-[15px] font-semibold tracking-[-0.01em] text-ink">
+          <h1 className="mt-6 text-section text-ink">
             Recruiter sign-in
           </h1>
 

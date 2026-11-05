@@ -46,10 +46,10 @@ export function StatusPage() {
     <div className="app-ground flex min-h-screen items-center justify-center px-4 py-10">
       <main className="w-full max-w-md">
         <GlassPanel level="strong" padding="lg">
-          <h1 className="text-[15px] font-semibold tracking-[-0.01em] text-ink">
+          <h1 className="text-section text-ink">
             Service status
           </h1>
-          <p className="mt-0.5 text-[13px] leading-5 text-ink-tertiary">
+          <p className="mt-0.5 text-label leading-5 text-ink-tertiary">
             Current operational status of the screening service.
           </p>
 
@@ -66,7 +66,7 @@ export function StatusPage() {
           )}
 
           {status && (
-            <div role="status" className="glass-sunken mt-5 rounded-[14px] px-4 py-4">
+            <div role="status" className="glass-sunken mt-5 rounded-control px-4 py-4">
               <StatusBadge tone={tone} className="px-2.5 py-1">
                 {headline}
               </StatusBadge>

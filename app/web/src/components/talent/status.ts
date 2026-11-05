@@ -71,7 +71,6 @@ export function candidateStatusTone(status: string | null | undefined): StatusTo
     case 'screening':
     case 'queued':
       return 'warning';
-    case 'rejected':
     case 'abandoned_no_answer':
     case 'phone_failed':
     case 'screening_abandoned':
@@ -80,7 +79,8 @@ export function candidateStatusTone(status: string | null | undefined): StatusTo
     case 'new':
       return 'info';
     default:
-      // consent_declined, opted_out, phone_cancelled and anything unknown.
+      // rejected, consent_declined, opted_out, phone_cancelled and anything
+      // unknown. An outcome is not coloured good or bad; crimson is for faults.
       return 'neutral';
   }
 }

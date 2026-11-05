@@ -397,7 +397,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
           // footer total already hides itself there.
           metrics.length === 0 ? undefined : (
           <span
-            className={`text-[13px] font-medium tabular-nums ${complete ? 'text-ink-tertiary' : 'text-error-text'}`}
+            className={`text-label font-medium tabular-nums ${complete ? 'text-ink-tertiary' : 'text-error-text'}`}
             data-weight-total-bps={total}
             data-weight-delta-bps={delta}
             // The live region is PERMANENT, not toggled on when the total goes
@@ -441,7 +441,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
               <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
                 <div className="min-w-0">
                   <p className="text-sm font-medium text-ink">{m.name}</p>
-                  <p className="font-mono text-xs text-ink-tertiary">{m.key}</p>
+                  <p className="text-xs text-ink-tertiary">{m.key}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   <Button
@@ -493,7 +493,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
               <div className="flex items-center gap-3">
                 <span
                   aria-hidden="true"
-                  className="w-20 shrink-0 text-[13px] font-medium text-ink-secondary"
+                  className="w-20 shrink-0 text-label font-medium text-ink-secondary"
                 >
                   Weight
                 </span>
@@ -512,7 +512,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
                     type="number"
                     inputMode="decimal"
                     size="sm"
-                    className="text-right font-mono tabular-nums"
+                    className="text-right tabular-nums"
                     // 0 is ALLOWED to be typed even though the server rejects
                     // it: blocking the keystroke would make clearing a field to
                     // retype it impossible. `everyWeightIsPositive` catches it
@@ -576,7 +576,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
                   </div>
                   <span
                     id={`metric-${m.id}-weight-unit`}
-                    className="text-[13px] text-ink-tertiary"
+                    className="text-label text-ink-tertiary"
                     data-metric-weight-bps={m.weightBps}
                   >
                     %
@@ -591,7 +591,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
       {/* Attach + save */}
       <div className="mt-4 flex flex-col gap-3 border-t border-ink/10 pt-4 sm:flex-row sm:items-end sm:justify-between">
         {libraryForbidden ? (
-          <p className="max-w-prose text-[13px] leading-5 text-ink-tertiary">
+          <p className="max-w-prose text-label leading-5 text-ink-tertiary">
             Adding metrics from the library requires an admin. You can still adjust the
             weights, instructions and order of the metrics already attached.
           </p>
@@ -603,7 +603,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
             <label
               id="scorecard-add-metric-label"
               htmlFor="scorecard-add-metric"
-              className="text-[13px] font-medium text-ink-secondary"
+              className="text-label font-medium text-ink-secondary"
             >
               Add a metric
             </label>
@@ -669,7 +669,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
         <div className="flex flex-wrap items-center justify-end gap-3">
           {metrics.length > 0 && (
             <span
-              className={`text-[13px] font-medium tabular-nums ${
+              className={`text-label font-medium tabular-nums ${
                 complete ? 'text-ink-tertiary' : 'text-error-text'
               }`}
               data-weight-total-footer={total}

@@ -1,12 +1,9 @@
 import type { ReactNode } from 'react';
 import type { EChartsOption } from 'echarts';
-import { useReducedMotion } from '../../lib/motion';
-import { useTheme } from '../../lib/theme';
 import { cx } from '../design/cx';
 import { ChartSkeleton } from '../design/Skeleton';
 import { ChartDataTable } from './accessibility';
 import { EChart } from './EChart';
-import { ChartReveal } from './reveal';
 import { ChartEmpty, ChartError } from './states';
 import { chartTheme } from './theme';
 
@@ -48,9 +45,7 @@ export function RadarChart({
   height = 260,
   renderer = 'canvas',
 }: RadarChartProps) {
-  const { theme } = useTheme();
-  const reduced = useReducedMotion();
-  const { palette, base } = chartTheme(theme, reduced);
+  const { palette, base } = chartTheme();
 
   let body: ReactNode;
   if (isLoading) {
@@ -69,12 +64,10 @@ export function RadarChart({
         indicator: data.map((d) => ({ name: d.indicator, max })),
         radius: '62%',
         splitNumber: 4,
-        axisName: { color: palette.subtext, fontSize: 11 },
+        axisName: { color: palette.subtext, fontSize: 12 },
         axisLine: { lineStyle: { color: palette.splitLine } },
         splitLine: { lineStyle: { color: palette.splitLine } },
-        splitArea: {
-          areaStyle: { color: ['transparent', `${palette.splitLine}33`] },
-        },
+        splitArea: { show: false },
       },
       series: [
         {
@@ -93,9 +86,7 @@ export function RadarChart({
       ],
     };
     body = (
-      <ChartReveal epoch={data.length} className="h-full">
-        <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
-      </ChartReveal>
+      <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
     );
   }
 

@@ -105,7 +105,7 @@ function NoticeBody({ source }: { source: string }) {
       blocks.push(
         <h2
           key={`h2-${blocks.length}`}
-          className="mt-6 text-[15px] font-semibold tracking-[-0.01em] text-ink first:mt-0"
+          className="mt-6 text-section text-ink first:mt-0"
         >
           {text.slice(3)}
         </h2>,

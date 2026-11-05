@@ -11,14 +11,13 @@
  *   - lazy chunks resolve (React.lazy + Suspense) inside the app shell
  *
  * Heavy pages are module-mocked (route-target assertion, not page logic);
- * page logic has its own suites. Charts require ThemeProvider, which the
+ * page logic has its own suites.
  * real main.tsx mounts — mirrored here.
  */
 
 import { render, screen } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ReactNode } from 'react';
-import { ThemeProvider } from './lib/theme';
 import App from './App';
 
 // ── Mocks ──────────────────────────────────────────────────────────────
@@ -80,11 +79,7 @@ vi.mock('./pages/PhoneCalendarPage', () => ({
 function renderApp(initialEntry = '/dashboard') {
   // App owns its <BrowserRouter>; drive the URL through the history API.
   window.history.pushState({}, '', initialEntry);
-  return render(
-    <ThemeProvider>
-      <App />
-    </ThemeProvider>,
-  );
+  return render(<App />);
 }
 
 function authedAdmin() {

@@ -132,11 +132,12 @@ import { roleAgentName } from "../lib/role-label";
  */
 const FILTER_PILL_CLASS = (selected: boolean) =>
   [
-    "inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-label font-medium transition-colors duration-200",
-    "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]",
+    "inline-flex min-h-11 items-center gap-1.5 rounded-control px-3 text-label font-medium transition-colors duration-hover",
+    // The offset is what shows on a selected chip: its fill and its ring are both ink.
+    "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
     selected
-      ? "bg-[var(--c-accent)] text-[var(--c-data-label-inside)] shadow-pill"
-      : "bg-[var(--c-surface)] text-[var(--c-ink-secondary)] shadow-[inset_0_0_0_1px_var(--c-border)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]",
+      ? "bg-[var(--c-accent)] text-[var(--c-data-label-inside)]"
+      : "bg-[var(--c-surface)] text-[var(--c-ink-secondary)] border border-[var(--c-control-border)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]",
   ].join(" ");
 
 /** The live count inside a pill. Never the tone colour on the tone's fill. */
@@ -146,7 +147,7 @@ const PILL_COUNT_CLASS = (selected: boolean) =>
 const RECOMMENDATION_TONE: Record<string, StatusTone> = {
   advance: "success",
   hold: "warning",
-  reject: "danger",
+  reject: "neutral",
 };
 
 /**
@@ -163,14 +164,15 @@ const RECOMMENDATION_TONE: Record<string, StatusTone> = {
 const STATUS_BAR_TONE: Record<string, PipelineTone> = {
   new: "neutral",
   queued: "caution",
-  screening: "accent",
+  // On a call: the one stage that takes the voice hue.
+  screening: "voice",
   screened: "positive",
-  advanced: "positive",
+  advanced: "accent",
   rejected: "negative",
-  consent_declined: "negative",
-  // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Five tones
-  // cannot be injective over thirteen keys, so the most this can promise is
-  // that neighbours in that order differ; the legend text names each one.
+  consent_declined: "neutral",
+  // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Six tones cannot
+  // be injective over thirteen keys, so the most this can promise is that
+  // neighbours in that order differ; the legend text names each one.
   abandoned_no_answer: "caution",
   phone_failed: "negative",
   screening_abandoned: "caution",
@@ -179,10 +181,15 @@ const STATUS_BAR_TONE: Record<string, PipelineTone> = {
   phone_cancelled: "neutral",
 };
 
+/**
+ * A verdict is a position on the ink ramp, never a hue, and the two ends sit as
+ * far apart as the ramp allows: ink, control and the light step, as the approved
+ * recommendation bar draws them.
+ */
 const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
   advance: "positive",
   hold: "caution",
-  reject: "negative",
+  reject: "neutral",
 };
 
 /**
@@ -781,7 +788,7 @@ export function CandidatesPage() {
           single control surface rather than four stacked rows. */}
       <GlassPanel as="section" aria-label="Filters" padding="sm" className="mt-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]">
+          <h2 className="text-section text-[var(--c-ink)]">
             All candidates
             {candidates && (
               <span className="ml-2 font-normal text-[var(--c-ink-secondary)]">
@@ -1062,7 +1069,7 @@ export function CandidatesPage() {
             <button
               type="button"
               onClick={clearFilters}
-              className="rounded px-1.5 py-0.5 font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+              className="textlink rounded px-1.5 py-0.5 font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
             >
               Clear all
             </button>
@@ -1207,9 +1214,7 @@ export function CandidatesPage() {
                       <Th className="whitespace-nowrap">Next action</Th>
                     </Tr>
                   </THead>
-                  {/* Rows reveal in sequence; the class collapses under
-                      prefers-reduced-motion with the rest of the shell. */}
-                  <TBody className="fade-up-stagger">
+                  <TBody>
                     {page.items.map((c) => {
                       // ONE derivation per row: badge, tooltip, next action and
                       // the review link all read the same display status.
@@ -1373,13 +1378,13 @@ function FilterChip({
   onRemove: () => void;
 }) {
   return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-[var(--c-border-light)] px-2 py-0.5 text-xs text-[var(--c-ink-secondary)]">
+    <span className="inline-flex items-center gap-1 rounded-chip bg-[var(--c-border-light)] px-2 py-0.5 text-xs text-[var(--c-ink-secondary)]">
       {label}
       <button
         type="button"
         onClick={onRemove}
         aria-label={`Remove filter ${label}`}
-        className="rounded-full px-1 text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+        className="rounded-evidence px-1 text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         ×
       </button>
@@ -1447,7 +1452,7 @@ function UploadPanel({
     >
       <h2
         id={headingId}
-        className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]"
+        className="text-section text-[var(--c-ink)]"
       >
         Upload a resume
       </h2>

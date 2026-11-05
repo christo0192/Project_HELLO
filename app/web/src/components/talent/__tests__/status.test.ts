@@ -43,12 +43,13 @@ describe('candidateStatusLabel', () => {
 });
 
 describe('candidateStatusTone', () => {
-  it('maps screened/advanced to success, screening/queued to warning, rejected to danger, new to info', () => {
+  it('maps screened/advanced to success, screening/queued to warning, rejected to neutral, new to info', () => {
     expect(candidateStatusTone('screened')).toBe('success');
     expect(candidateStatusTone('advanced')).toBe('success');
     expect(candidateStatusTone('screening')).toBe('warning');
     expect(candidateStatusTone('queued')).toBe('warning');
-    expect(candidateStatusTone('rejected')).toBe('danger');
+    // An outcome is not coloured good or bad; crimson is a fault on our side.
+    expect(candidateStatusTone('rejected')).toBe('neutral');
     expect(candidateStatusTone('new')).toBe('info');
     expect(candidateStatusTone('mystery')).toBe('neutral');
   });

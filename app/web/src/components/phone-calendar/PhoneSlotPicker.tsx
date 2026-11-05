@@ -122,7 +122,7 @@ export function PhoneSlotPicker({
       </Field>
 
       {error && (
-        <p role="status" className="rounded-[14px] bg-error-soft px-3.5 py-2.5 text-sm text-ink">
+        <p role="status" className="rounded-control bg-error-soft px-3.5 py-2.5 text-sm text-ink">
           {error}
         </p>
       )}
@@ -132,7 +132,7 @@ export function PhoneSlotPicker({
       )}
 
       {!error && data && !data.enabled && (
-        <p role="status" className="rounded-[14px] bg-warning-soft px-3.5 py-2.5 text-sm text-ink">
+        <p role="status" className="rounded-control bg-warning-soft px-3.5 py-2.5 text-sm text-ink">
           Phone screening is turned off, so no slots can be offered.
         </p>
       )}
@@ -169,7 +169,7 @@ export function PhoneSlotPicker({
           {data.occupancy_truncated && (
             <p
               role="status"
-              className="mt-2 rounded-[14px] bg-warning-soft px-3.5 py-2.5 text-xs leading-5 text-ink"
+              className="mt-2 rounded-control bg-warning-soft px-3.5 py-2.5 text-xs leading-5 text-ink"
             >
               This day held more appointments than the projection could count,
               so the booked counts below are a lower bound and the remaining
@@ -201,13 +201,13 @@ export function PhoneSlotPicker({
                       title={blocked ? refusalText : undefined}
                       className={cx(
                         'flex min-h-[44px] items-start gap-2 rounded-control px-3 py-2 text-sm',
-                        'transition-[box-shadow,background-color] duration-200 ease-soft',
-                        'focus-within:ring-2 focus-within:ring-info focus-within:ring-offset-2 focus-within:ring-offset-surface-secondary',
+                        'transition-[box-shadow,background-color] duration-hover ease-soft',
+                        'focus-within:ring-2 focus-within:ring-info focus-within:ring-offset-2 focus-within:ring-offset-surface',
                         blocked
                           ? 'cursor-not-allowed bg-ink/[0.04] text-ink-tertiary'
                           : chosen
-                            ? 'cursor-pointer bg-white text-ink shadow-pill ring-2 ring-info'
-                            : 'cursor-pointer bg-white/70 text-ink shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] hover:bg-white',
+                            ? 'cursor-pointer bg-surface text-ink ring-2 ring-info'
+                            : 'cursor-pointer bg-surface text-ink border border-[var(--control)] hover:bg-surface-secondary',
                       )}
                     >
                       <input

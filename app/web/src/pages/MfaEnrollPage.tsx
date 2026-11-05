@@ -110,11 +110,11 @@ export function MfaEnrollPage() {
                 Setup key
               </p>
               {secret ? (
-                <code className="block break-all rounded bg-white px-3 py-2 text-sm font-mono text-gray-800 select-all">
+                <code className="block break-all rounded bg-surface px-3 py-2 text-sm text-gray-800 select-all">
                   {secret}
                 </code>
               ) : totpUri ? (
-                <code className="block break-all rounded bg-white px-3 py-2 text-sm font-mono text-gray-800 select-all">
+                <code className="block break-all rounded bg-surface px-3 py-2 text-sm text-gray-800 select-all">
                   {totpUri}
                 </code>
               ) : (

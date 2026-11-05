@@ -27,7 +27,7 @@ vi.mock('../../../api', () => ({
   },
   ApiError: class extends Error {},
 }));
-import { PipelineBar, formatShare } from '../PipelineBar';
+import { PipelineBar, formatShare, type PipelineTone } from '../PipelineBar';
 import { RolePipelinePanel, segmentsFor } from '../RolePipelinePanel';
 
 /** One populated role, purely so `StageTotals` renders and can be read. */
@@ -245,11 +245,11 @@ describe('PipelineBar', () => {
     expect(document.querySelector('[data-segment-value="__remainder"]')).toBeNull();
   });
 
-  it('paints the neutral bucket in a MEASURED mid tone, not a border token', () => {
-    // This value has been wrong in both directions: `--c-ink-secondary` at
-    // 8.90:1 made the usually-dominant "not dialled" bucket the heaviest block
-    // on the bar, and `--c-border` at 1.13:1 made it invisible against its own
-    // track. `--c-ink-muted` is 4.03:1 on the track, clear of the 3:1 floor.
+  it('paints the neutral bucket light, inside an outline that gives it a 3:1 edge', () => {
+    // This value has been wrong in both directions: an ink step made the
+    // usually-dominant "not dialled" bucket the heaviest block on the bar, and a
+    // light step with no outline made it vanish into its own track. The approved
+    // mock takes the light step and prints an edge round the bar.
     const { container } = render(
       <PipelineBar
         label="t"
@@ -258,7 +258,61 @@ describe('PipelineBar', () => {
       />,
     );
     const fill = container.querySelector<HTMLElement>('[data-pipeline-track] > span');
-    expect(fill?.style.backgroundColor).toBe('var(--c-ink-muted)');
+    expect(fill?.style.backgroundColor).toBe('var(--c-border)');
+    const track = container.querySelector('[data-pipeline-track]');
+    expect(track?.className).toContain('border-[var(--c-control-border)]');
+    expect(track?.className).toContain('bg-[var(--c-surface)]');
+  });
+
+  it('DRAWS EVERY TONE DIFFERENTLY, because the swatch is the only link to the bar', () => {
+    // Screening and Rejected once shared a fill, and so did their swatches.
+    const tones: PipelineTone[] = ['neutral', 'caution', 'voice', 'negative', 'accent', 'positive'];
+    const { container } = render(
+      <PipelineBar
+        label="t"
+        segments={tones.map((tone) => ({ key: tone, label: tone, value: 1, tone }))}
+      />,
+    );
+    const fills = [...container.querySelectorAll<HTMLElement>('[data-pipeline-segment]')].map(
+      (segment) => segment.style.backgroundColor,
+    );
+    expect(fills).toHaveLength(tones.length);
+    expect(fills.every(Boolean)).toBe(true);
+    expect(new Set(fills).size).toBe(tones.length);
+  });
+
+  it('gives the voice hue to the voice tone alone', () => {
+    const { container } = render(
+      <PipelineBar label="t" segments={[{ key: 'v', label: 'On a call', value: 1, tone: 'voice' }]} />,
+    );
+    expect(container.querySelector<HTMLElement>('[data-pipeline-segment]')?.style.backgroundColor).toBe(
+      'var(--voice-mark)',
+    );
+  });
+
+  it('leaves an unmeasured key hollow, so it cannot be read as a block of the bar', () => {
+    const { container } = render(
+      <PipelineBar
+        label="t"
+        total={4}
+        segments={[
+          ...SEGMENTS,
+          { key: 'u', label: 'Selected', value: 0, tone: 'positive', unavailable: 'Not tracked yet' },
+        ]}
+      />,
+    );
+    const legend = within(container).getByText('Selected').parentElement!;
+    const swatch = legend.querySelector<HTMLElement>('[aria-hidden="true"]')!;
+    expect(swatch.style.backgroundColor).toBe('');
+    expect(swatch.className).not.toContain('data-fill');
+  });
+
+  it('sets a later segment off with a real border, so forced colours keep the gap', () => {
+    const { container } = render(<PipelineBar label="t" total={4} segments={SEGMENTS} />);
+    const [first, second] = container.querySelectorAll<HTMLElement>('[data-pipeline-segment]');
+    expect(first.getAttribute('style')).not.toContain('border-left');
+    expect(second.getAttribute('style')).toContain('border-left: 2px solid');
+    expect(second.getAttribute('style')).not.toContain('box-shadow');
   });
 
   it('exposes the legend as a named list, since the bar is decorative', () => {

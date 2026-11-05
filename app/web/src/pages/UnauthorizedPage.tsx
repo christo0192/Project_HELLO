@@ -16,10 +16,10 @@ export function UnauthorizedPage() {
             <Brand />
           </div>
           <p className="mt-6 text-stat text-ink-tertiary">403</p>
-          <h1 className="mt-1 text-[15px] font-semibold tracking-[-0.01em] text-ink">
+          <h1 className="mt-1 text-section text-ink">
             Access denied
           </h1>
-          <p className="mt-1.5 text-[13px] leading-5 text-ink-tertiary">
+          <p className="mt-1.5 text-label leading-5 text-ink-tertiary">
             You do not have permission to access this resource.
           </p>
           <Button

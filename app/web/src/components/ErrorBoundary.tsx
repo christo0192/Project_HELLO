@@ -38,7 +38,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     return (
       <div
         role="alert"
-        className="rounded-xl border border-error/30 bg-error-soft p-8 text-center shadow-card"
+        className="rounded-xl border border-error/30 bg-error-soft p-8 text-center"
       >
         <p className="text-sm font-semibold text-error">
           Something went wrong loading this page.

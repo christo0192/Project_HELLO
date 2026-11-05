@@ -253,10 +253,6 @@ describe('R1 live view fits the window and bounds its captions', () => {
     expect(block![1]).toMatch(/\.candidate-aura \{[^}]*width: 104px/);
     expect(block![1]).toMatch(/\.r1-live__selfview\.r1-selfview \{[^}]*width: 168px/);
   });
-
-  it('clips the decorative blobs of the R1 shell, which would add blank scroll', () => {
-    expect(css).toMatch(/\.r1-shell \{ overflow: clip; \}/);
-  });
 });
 
 describe('R1 publishes the plan camera budget and nothing else', () => {

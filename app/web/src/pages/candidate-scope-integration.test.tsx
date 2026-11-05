@@ -6,10 +6,6 @@
  * the only place the approved tokens are declared: no scope class means no
  * palette, and a scope class in the wrong place means the palette leaks.
  *
- * The palette is light-only and fixed, so each surface is also rendered
- * inside a `.dark` document and asserted to declare no dark-mode variant of
- * anything.
- *
  * Finally: the Ashby-scoped shell must not have GAINED anything from the
  * redesign. Restyling a read-only surface is the classic way to smuggle a
  * link or a button onto it, so its affordance count is asserted directly.
@@ -17,7 +13,7 @@
 
 import { render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CandidatesPage } from './CandidatesPage';
 import { CandidateDetailPage } from './CandidateDetailPage';
 import { AshbyScopedReviewPage } from './AshbyScopedReviewPage';
@@ -111,10 +107,6 @@ beforeEach(() => {
   mockApi.getAshbyScopedReview.mockResolvedValue(mockCandidateDetail);
   mockApi.listAshbyScopedReviewNotes.mockResolvedValue({ notes: [] });
   mockApi.getAshbyScopedReviewWorkflow.mockResolvedValue({ ok: true, workflow: null });
-});
-
-afterEach(() => {
-  document.documentElement.classList.remove('dark');
 });
 
 function renderCandidates() {
@@ -221,22 +213,6 @@ describe('every candidate surface mounts one scope root', () => {
   });
 });
 
-describe('the fixed light palette survives a .dark ancestor', () => {
-  it.each([
-    ['Candidates list', renderCandidates, 'Jane Doe'],
-    ['Candidate Detail', renderDetail, 'Jane Doe'],
-    ['Ashby-scoped review', renderScoped, 'Jane Doe'],
-  ])('%s declares no dark-mode variant', async (_label, renderFn, text) => {
-    document.documentElement.classList.add('dark');
-    const { container } = renderFn();
-    await screen.findAllByText(text);
-    const scope = expectSingleScopeRoot(container);
-    expect(document.documentElement).toHaveClass('dark');
-    // Nothing inside the scope may switch on the app theme.
-    expect(scope.outerHTML).not.toMatch(/\bdark:/);
-  });
-});
-
 describe('the redesign adds no affordance to the read-only scoped shell', () => {
   it('keeps the Overview free of controls beyond the two tabs', async () => {
     const { container } = renderScoped();
@@ -340,12 +316,6 @@ describe('Candidates list at a 390px viewport', () => {
     await expect(container).toHaveNoViolations();
   });
 
-  it('has no axe violations under a .dark document', async () => {
-    document.documentElement.classList.add('dark');
-    const { container } = renderCandidates();
-    await screen.findByText('Jane Doe');
-    await expect(container).toHaveNoViolations();
-  });
 });
 
 describe('Candidate Detail accessibility after the restyle', () => {
@@ -358,13 +328,4 @@ describe('Candidate Detail accessibility after the restyle', () => {
     await expect(container).toHaveNoViolations();
   });
 
-  it('has no axe violations under a .dark document', async () => {
-    document.documentElement.classList.add('dark');
-    const { container } = renderDetail();
-    await screen.findByRole('heading', { name: 'Jane Doe' });
-    await waitFor(() =>
-      expect(mockApi.getCandidateAshbyWorkflow).toHaveBeenCalled(),
-    );
-    await expect(container).toHaveNoViolations();
-  });
 });

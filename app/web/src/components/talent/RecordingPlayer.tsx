@@ -291,7 +291,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       return (
         <div className={cx(row, className)}>
           <h3 className="sr-only">{label ?? 'Recording'}</h3>
-          <p className="text-[13px] text-[var(--c-ink-secondary)]">
+          <p className="text-label text-[var(--c-ink-secondary)]">
             Recording loads on request; the link expires automatically.
           </p>
           <CandidateButton
@@ -311,7 +311,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       return (
         <div className={cx('flex items-center gap-3', className)}>
           <div className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-[var(--c-accent)] border-t-transparent" />
-          <p className="text-[13px] text-[var(--c-ink-secondary)]">Loading recording…</p>
+          <p className="text-label text-[var(--c-ink-secondary)]">Loading recording…</p>
         </div>
       );
     }
@@ -321,7 +321,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       return (
         <div className={cx(row, className)} role="alert">
           <h3 className="sr-only">{label ?? 'Recording'}</h3>
-          <p className="text-[13px] text-[var(--c-ink-secondary)]">{error}</p>
+          <p className="text-label text-[var(--c-ink-secondary)]">{error}</p>
           <CandidateButton
             variant="secondary"
             className="shrink-0"
@@ -365,7 +365,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           <a
             href={url!}
             download
-            className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline"
+            className="textlink text-xs font-medium text-[var(--c-accent)]"
             aria-label={labelledAction('Download file', label)}
           >
             Download file
@@ -374,7 +374,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
             type="button"
             onClick={refreshUrl}
             aria-label={labelledAction('Refresh link', label)}
-            className="text-xs font-medium text-[var(--c-ink-secondary)] underline-offset-2 hover:text-[var(--c-ink)] hover:underline"
+            className="textlink text-xs font-medium text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)]"
           >
             Refresh link
           </button>

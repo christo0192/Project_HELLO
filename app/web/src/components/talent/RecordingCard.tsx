@@ -114,14 +114,14 @@ export function RecordingCard({
             <a
               href={url}
               download
-              className="text-meta font-medium text-info underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+              className="textlink text-meta font-medium text-info focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
             >
               Download file
             </a>
             <button
               type="button"
               onClick={fetchUrl}
-              className="text-meta font-medium text-ink-secondary underline-offset-2 hover:text-ink hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+              className="textlink text-meta font-medium text-ink-secondary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
             >
               Refresh link
             </button>

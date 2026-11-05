@@ -245,7 +245,7 @@ export function PhoneSlotDialog({
       <div
         aria-hidden="true"
         onClick={() => { if (!saving) onClose(); }}
-        className="absolute inset-0 cursor-default bg-ink/40 backdrop-blur-sm"
+        className="absolute inset-0 cursor-default bg-ink/40"
       />
       <div
         ref={panelRef}
@@ -255,11 +255,11 @@ export function PhoneSlotDialog({
         aria-describedby={descId}
         tabIndex={-1}
         className={cx(
-          'glass relative z-10 w-full max-w-lg rounded-2xl p-5 shadow-xl outline-none',
+          'glass-modal relative z-10 w-full max-w-lg p-5 outline-none',
           'max-h-[85vh] overflow-y-auto',
         )}
       >
-        <h2 id={titleId} className="text-[15px] font-semibold text-ink">
+        <h2 id={titleId} className="text-section text-ink">
           {title}
         </h2>
         <p id={descId} className="mt-1 text-xs text-ink-tertiary">{advisory}</p>

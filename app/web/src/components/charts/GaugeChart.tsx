@@ -1,11 +1,8 @@
 import type { EChartsOption } from 'echarts';
-import { useReducedMotion } from '../../lib/motion';
-import { useTheme } from '../../lib/theme';
 import { cx } from '../design/cx';
 import { ChartSkeleton } from '../design/Skeleton';
 import { ChartDataTable } from './accessibility';
 import { EChart } from './EChart';
-import { ChartReveal } from './reveal';
 import { ChartEmpty, ChartError } from './states';
 import { chartTheme } from './theme';
 
@@ -26,8 +23,8 @@ export interface GaugeChartProps {
 }
 
 /**
- * Quota-utilization gauge. The arc turns amber only when utilization crosses
- * the 85% threshold (restrained, semantic warning use). Pairs the canvas
+ * Quota-utilization gauge. The arc steps to full ink when utilization crosses
+ * the 85% threshold; the printed figure carries the reading. Pairs the canvas
  * with an sr-only data table (no Canvas keyboard claims — see EChart).
  */
 export function GaugeChart({
@@ -44,11 +41,9 @@ export function GaugeChart({
   height = 240,
   renderer = 'canvas',
 }: GaugeChartProps) {
-  const { theme } = useTheme();
-  const reduced = useReducedMotion();
-  const { palette, base } = chartTheme(theme, reduced);
+  const { palette, base } = chartTheme();
   const ratio = max > 0 ? value / max : 0;
-  const arcColor = ratio >= 0.85 ? palette.colors[3] : palette.colors[0];
+  const arcColor = ratio >= 0.85 ? palette.colors[0] : palette.colors[1];
 
   let body: React.ReactNode;
   if (isLoading) {
@@ -83,21 +78,18 @@ export function GaugeChart({
             fontSize: 12,
           },
           detail: {
-            valueAnimation: !reduced,
             offsetCenter: [0, '0%'],
             formatter: (current: number) => `${Math.round(current)}${unit}`,
             color: palette.text,
             fontSize: 24,
-            fontWeight: 700,
+            fontWeight: 600,
           },
           data: [{ value, name: sublabel }],
         },
       ],
     };
     body = (
-      <ChartReveal epoch={Math.round(value)} className="h-full">
-        <EChart option={option} ariaLabel={`${title}: ${Math.round(value)}${unit} of ${max}`} height={height} renderer={renderer} />
-      </ChartReveal>
+      <EChart option={option} ariaLabel={`${title}: ${Math.round(value)}${unit} of ${max}`} height={height} renderer={renderer} />
     );
   }
 

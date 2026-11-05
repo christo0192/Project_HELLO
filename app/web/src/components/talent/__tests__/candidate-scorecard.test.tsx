@@ -9,12 +9,11 @@
  *
  * The rest asserts the specific defects in the owner-supplied screenshot
  * are fixed and stay fixed: no orphan Role fit cell, prose out of narrow
- * columns, exactly two card levels, a gapless heading outline, and the
- * fixed light palette under a `.dark` ancestor.
+ * columns, exactly two card levels, and a gapless heading outline.
  */
 
 import { render, screen, within } from '@testing-library/react';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { Scorecard } from '../../Scorecard';
 import {
   CandidateScorecard,
@@ -336,6 +335,21 @@ describe('CandidateScorecard layout defects', () => {
     }
   });
 
+  it('keeps red flags and a high signal in ink: crimson means a fault on our side', () => {
+    const assessment: Assessment = {
+      ...FULL,
+      role_fit: { ...FULL.role_fit, red_flags: ['Ended the call early'] },
+      communication: {
+        ...FULL.communication!,
+        filler_usage: { level: 'high', examples: [], impact_score: 3, notes: '' },
+      },
+    };
+    const { container } = render(<CandidateScorecard assessment={assessment} />);
+    expect(screen.getByText('Ended the call early').className).not.toContain('--c-negative');
+    expect(screen.getByText('High').className).not.toContain('--c-negative');
+    expect(container.querySelector('[class*="ring-[var(--c-negative)]"]')).toBeNull();
+  });
+
   it('splits the read-once narrative out of the scored card on request', () => {
     const { container, rerender } = render(
       <CandidateScorecard assessment={FULL} narrative="none" />,
@@ -409,10 +423,6 @@ describe('CandidateScorecard layout defects', () => {
 });
 
 describe('CandidateScorecard accessibility', () => {
-  afterEach(() => {
-    document.documentElement.classList.remove('dark');
-  });
-
   it('has no axe violations with a full assessment', async () => {
     const { container } = render(
       <CandidateShell>
@@ -432,24 +442,6 @@ describe('CandidateScorecard accessibility', () => {
         <CandidateScorecard assessment={MINIMAL} />
       </CandidateShell>,
     );
-    await expect(container).toHaveNoViolations();
-  });
-
-  it('keeps the fixed light palette under a .dark ancestor', async () => {
-    document.documentElement.classList.add('dark');
-    const { container } = render(
-      <CandidateShell>
-        <h1>Candidate</h1>
-        <h2>Scorecard</h2>
-        <CandidateScorecard assessment={FULL} />
-      </CandidateShell>,
-    );
-    // The scope boundary is present inside the dark document, and the card
-    // itself declares no dark-mode variant of any kind.
-    const scope = container.querySelector('.candidate-scope')!;
-    expect(scope).toBeInTheDocument();
-    expect(document.documentElement).toHaveClass('dark');
-    expect(container.innerHTML).not.toMatch(/\bdark:/);
     await expect(container).toHaveNoViolations();
   });
 
@@ -492,28 +484,16 @@ describe('CandidateScorecard accessibility', () => {
   });
 
   /**
-   * The motion budget, restated for the glass redesign.
-   *
-   * The meter fill now GROWS into place — a CSS `transition-[width]`, which
-   * is what the design system asks a meter to do. That is deliberately not
-   * the thing this test guards. What it guards is that the candidate scope
-   * still runs no JS motion library and starts no keyframe animation: a
-   * `transition` collapses to 0.01ms under the global reduced-motion rule
-   * in index.css and repaints nothing on its own, while an `animate-*`
-   * keyframe runs unprompted and is budgeted by name in
-   * candidate-scope-palette.test.ts §6.
-   *
-   * Both halves are asserted, so weakening one does not silently pass: the
-   * width transition must be PRESENT (or the fill stopped growing and this
-   * test is measuring nothing), and no keyframe may appear.
+   * The motion budget: a meter is printed at its reading. Nothing grows in, by
+   * transition or by keyframe.
    */
-  it('grows the meter fill by transition only — no keyframe animation', () => {
+  it('prints the meter fill at its value, with no transition or keyframe', () => {
     const { container } = render(<CandidateScorecard assessment={FULL} />);
     const fills = [...container.querySelectorAll('[role="meter"] > *')];
     expect(fills.length).toBeGreaterThan(0);
     for (const el of fills) {
-      expect(el.className).toMatch(/\btransition-\[width\]/);
-      expect(el.className).not.toMatch(/\banimate-/);
+      expect(el.className).not.toMatch(/transition-/);
+      expect(el.className).not.toMatch(/animate-/);
     }
   });
 });

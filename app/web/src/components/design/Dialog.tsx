@@ -83,7 +83,7 @@ export function Dialog({
         onClick={() => {
           if (!busy) onClose();
         }}
-        className="absolute inset-0 cursor-default bg-ink/40 backdrop-blur-sm"
+        className="absolute inset-0 cursor-default bg-ink/40"
       />
       <div
         ref={panelRef}
@@ -93,8 +93,7 @@ export function Dialog({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cx(
-          // `glass-modal` (index.css): near-white, because translucent glass
-          // over the dimmed backdrop reads grey and fails small-text contrast.
+          // `glass-modal` (index.css): the one surface in front of the page.
           'dialog-panel glass-modal relative z-10 flex max-h-full w-full min-w-0 max-w-lg flex-col',
           // No `shadow-xl`: it overrode the modal material's own pop shadow,
           // so Dialog and SlideOver would have cast different shadows.
@@ -105,12 +104,12 @@ export function Dialog({
           <div className="min-w-0 pt-1">
             <h2
               id={titleId}
-              className="break-words text-[17px] font-semibold leading-6 tracking-[-0.01em] text-ink"
+              className="break-words text-section leading-6 text-ink"
             >
               {title}
             </h2>
             {description && (
-              <p id={descId} className="mt-1 text-[13px] leading-5 text-ink-secondary">
+              <p id={descId} className="mt-1 text-label text-ink-secondary">
                 {description}
               </p>
             )}
@@ -125,7 +124,7 @@ export function Dialog({
             // An icon, so the NAME is spelled out: "Close" is what a screen
             // reader says and what every test and caller looks it up by.
             aria-label="Close"
-            className="-mr-1.5 -mt-1 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-ink-tertiary transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info disabled:cursor-not-allowed disabled:opacity-50"
+            className="-mr-1.5 -mt-1 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-control text-ink-tertiary transition-colors duration-hover hover:bg-ink/[0.06] hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info disabled:cursor-not-allowed disabled:opacity-50"
           >
             <svg
               viewBox="0 0 24 24"

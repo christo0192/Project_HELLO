@@ -1,16 +1,13 @@
 import type { ReactNode } from 'react';
 import type { EChartsOption } from 'echarts';
-import { useReducedMotion } from '../../lib/motion';
-import { useTheme } from '../../lib/theme';
 import { cx } from '../design/cx';
 import { ChartSkeleton } from '../design/Skeleton';
 import { ChartDataTable } from './accessibility';
 import { EChart } from './EChart';
-import { ChartReveal } from './reveal';
 import { ChartEmpty, ChartError } from './states';
 import { chartTheme } from './theme';
-import { buildLineSeries } from './series';
-import type { LineChartDatum, LineChartSeries } from './series';
+import { buildLineSeries, seriesStroke } from './series';
+import type { LineChartDatum, LineChartSeries, SeriesStroke } from './series';
 
 export type { LineChartDatum, LineChartSeries } from './series';
 
@@ -52,6 +49,33 @@ export interface LineChartProps {
 }
 
 /**
+ * The legend's sample of a series: its dash and its marker, drawn as on the
+ * chart, so a reader can learn which line is which without the tooltip.
+ */
+function SeriesKey({ stroke, color }: { stroke: SeriesStroke; color: string }) {
+  const marks = {
+    circle: <circle cx="14" cy="4" r="3" fill={color} />,
+    rect: <rect x="11" y="1" width="6" height="6" fill={color} />,
+    triangle: <polygon points="14,0.5 17.5,7 10.5,7" fill={color} />,
+    diamond: <polygon points="14,0 18,4 14,8 10,4" fill={color} />,
+  };
+  return (
+    <svg width="28" height="8" viewBox="0 0 28 8" className="shrink-0" data-series-key="">
+      <line
+        x1="0"
+        y1="4"
+        x2="28"
+        y2="4"
+        stroke={color}
+        strokeWidth="2"
+        strokeDasharray={stroke.dash?.join(' ')}
+      />
+      {marks[stroke.marker]}
+    </svg>
+  );
+}
+
+/**
  * Line chart for counts and rates over days, with an inside dataZoom for
  * dense series. Always pairs the canvas with an sr-only data table (no
  * canvas keyboard claims, see EChart).
@@ -81,13 +105,11 @@ export function LineChart({
   emptyHint = 'Sessions will appear here once screening starts.',
   renderer = 'canvas',
 }: LineChartProps) {
-  const { theme } = useTheme();
-  const reduced = useReducedMotion();
-  const { palette, base } = chartTheme(theme, reduced);
+  const { palette, base } = chartTheme();
 
   const series: LineChartSeries[] = seriesProp ?? [{ name: title, data }];
   const multi = series.length > 1;
-  const { labels, lines } = buildLineSeries(series, { discrete, colors: palette.colors });
+  const { labels, lines } = buildLineSeries(series, { discrete, colors: palette.colors, surface: palette.surface });
   const isPercent = unit === '%';
   const formatValue = (v: number | null | undefined) =>
     v == null ? 'No data' : isPercent ? `${v}%` : v.toLocaleString();
@@ -153,18 +175,16 @@ export function LineChart({
           <ul className="mb-2 flex flex-wrap gap-x-4 gap-y-1" aria-hidden="true">
             {series.map((s, index) => (
               <li key={s.name} className="flex items-center gap-1.5 text-xs text-ink-secondary">
-                <span
-                  className="h-0.5 w-3 rounded-full"
-                  style={{ backgroundColor: s.color ?? palette.colors[index % palette.colors.length] }}
+                <SeriesKey
+                  stroke={seriesStroke(index)}
+                  color={s.color ?? palette.colors[index % palette.colors.length]}
                 />
                 {s.name}
               </li>
             ))}
           </ul>
         )}
-        <ChartReveal epoch={labels.length}>
-          <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
-        </ChartReveal>
+        <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
       </>
     );
   }

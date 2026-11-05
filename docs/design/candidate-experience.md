@@ -9,70 +9,54 @@ app is affected, by construction rather than by convention — see
 
 ## 1. The palette
 
-`app/web/src/styles/candidate-palette.css` is the **only** file in the
-candidate experience allowed to name a colour. Values are the HR-approved
-"IK Hiring Dashboard" palette, transcribed from the owner-supplied
-screenshots of 2026-08-21.
+`app/web/src/styles/candidate-palette.css` maps the `--c-*` names onto the
+Logsheet tokens in `src/index.css`
+([hello-glass-design-system.md](hello-glass-design-system.md)). It holds no colour
+of its own, so the palette has one source.
 
-| Role | Token | Value |
+| Role | Token | Maps to |
 |---|---|---|
-| Page ground | `--c-bg` | `#f4f6fb` |
-| Card / surface | `--c-surface` | `#ffffff` |
-| Border | `--c-border` | `#dbe1ec` |
-| Border light / sunken fill | `--c-border-light` | `#eaeef6` |
-| Primary text | `--c-ink` | `#0f172a` |
-| Secondary text | `--c-ink-secondary` | `#334155` |
-| Muted text (cards only) | `--c-ink-muted` | `#6b7391` |
-| Accent | `--c-accent` / `--c-accent-light` | `#4E6BA6` / `#eaeef6` |
-| Positive | `--c-positive` / `--c-positive-light` | `#398AA2` / `#eaf2f4` |
-| Negative | `--c-negative` / `--c-negative-light` | `#b45a72` / `#f7edf0` |
-| Caution | `--c-caution` / `--c-caution-light` | `#a16207` / `#fff8eb` |
-| Categorical 1–12 + overflow | `--c-cat-1` … `--c-cat-12`, `--c-cat-other` | see the file |
-| Chart support | `--c-gridline`, `--c-data-label-outside`, `--c-data-label-inside`, `--c-over-threshold` | see the file |
-| Control boundary | `--c-control-border` | `var(--c-ink-muted)` |
+| Page ground | `--c-bg` | `--desk` |
+| Card / surface | `--c-surface` | `--paper` |
+| Border | `--c-border` | `--rule-2` |
+| Shaded field | `--c-border-light` | `--field` |
+| Primary text | `--c-ink` | `--ink` |
+| Secondary text | `--c-ink-secondary` | `--ink-2` |
+| Muted text | `--c-ink-muted` | `--ink-3` |
+| Accent | `--c-accent` / `--c-accent-light` | `--ink` / `--field` |
+| Positive | `--c-positive` / `--c-positive-light` | `--ink-2` / `--field` |
+| Caution | `--c-caution` / `--c-caution-light` | `--ink-2` / `--field` |
+| Negative | `--c-negative` / `--c-negative-light` | `--danger` / `--paper` |
+| Label on a fill | `--c-data-label-inside` | `--paper` |
+| Control boundary | `--c-control-border` | `--control` |
 
-**The palette is light-only and fixed.** The source says so explicitly, so
-`.dark .candidate-scope` repeats the same values rather than inventing a
-dark variant, and `.candidate-scope` sets `color-scheme: light` so native
-controls do not flip. A test asserts the two blocks are equal.
+**The palette is light-only.** `.candidate-scope` sets `color-scheme: light` so
+native controls do not flip, and no dark variant exists.
 
 ### Contrast decisions
 
-The palette is fixed, so where a pair could not reach WCAG AA the *pairing*
-changed, never the value. Four such decisions, each with a test:
+Every pair the candidate surfaces paint is computed by
+`candidate-scope-palette.test.ts`. Two rules carry over from the old palette:
 
-| Pair | Raw ratio | What changed |
-|---|---|---|
-| Muted ink on the page ground | 4.33:1 | The inherited `text-ink-tertiary` utility maps to `--c-ink-secondary` inside the scope; `--c-ink-muted` is used only on `--c-surface` (4.68:1). |
-| Teal on its own tint (success badge) | 3.47:1 | The success **ink** is the deeper approved cyan `--c-cat-3` (4.62:1). The teal itself still fills meters, where 3.39:1 clears the 3:1 non-text bar. |
-| Rose on its own tint (error badge) | 3.94:1 | The approved rose has no darker sibling, so the error **ground** is the card surface (4.52:1). Hue survives in the badge dot and ring. |
-| Approved hairline as a control boundary | 1.31:1 | Inputs, selects, secondary buttons and filter toggles use `--c-control-border` (4.68:1). Decorative card hairlines keep `--c-border`. |
-| Rose message on the rose tint (`CandidateErrorState`) | 3.94:1 | Tone stays in the border and the fill; the message takes the secondary ink (9.04:1). Same rule `Tag` already applied — it was written down before it was enforced, and one component broke it. |
+- `Tag` labels are always `--c-ink-secondary`; tone is carried by the tint, the
+  ring, a visible group label and an `srPrefix`. Nothing in the candidate
+  experience is distinguishable by hue alone.
+- `--c-negative` and `--c-positive` are banned outright as text utilities
+  anywhere in candidate scope by a source guard. Tone fills, rings and borders;
+  ink writes.
 
-`Tag` labels are always `--c-ink-secondary` (≥8.9:1 on every tint); tone is
-carried by the tint, the ring, a visible group label and an `srPrefix`.
-Nothing in the candidate experience is distinguishable by hue alone.
-
-The rule is now **enforced, not just written**: `--c-negative` and
-`--c-positive` are banned outright as text colours anywhere in candidate
-scope by a source guard, because neither has any ground in this fixed palette
-that clears 4.5:1 for normal text. Tone fills, rings and borders; ink writes.
+Verdicts are ink: a score, a meter and a recommendation take no hue. Crimson
+means a fault on our side.
 
 ---
 
 ## 2. Containment
 
 `CandidateShell` puts `.candidate-scope` on exactly one element per surface
-and every token is declared **on that element**. Descendants resolve them;
-nothing else can. There is no Tailwind theme key, no global token value and
-no shared primitive changed to make this work — `tailwind.config.js`,
-`components/ui.tsx` and `components/Scorecard.tsx` are byte-identical to
-`main`, and `src/index.css` gains exactly one `@import` line.
-
-The shell also re-points the app's inherited semantic tokens (`--surface`,
-`--ink`, `--line`, `--success`, …) at the candidate palette, so existing
-`bg-surface` / `text-ink` / `border-line` utilities resolve to approved
-values inside the subtree and are untouched everywhere else.
+and every `--c-*` name is declared **on that element**. Descendants resolve
+them; nothing else can. The app's semantic tokens (`--surface`, `--ink`,
+`--line`, …) are already Logsheet at `:root`, so `bg-surface`, `text-ink` and
+`border-line` resolve the same inside the subtree as outside it.
 
 `variant="inset"` cancels and re-applies `Layout`'s content padding so the
 candidate ground reaches the column edges without doubling padding;
@@ -86,9 +70,7 @@ render) are shared with the interview surfaces and frozen by the acceptance
 contract, yet they mount inside the Candidate Detail Overview. Their
 palette utilities are re-pointed by an explicitly enumerated compatibility
 block at the bottom of `candidate-palette.css`, scoped to
-`.candidate-scope` so nothing outside is affected. Hover states use a
-brightness filter rather than a new colour, so the file's literal set stays
-exactly the approved palette. A test re-derives the utility list from those
+`.candidate-scope` so nothing outside is affected. A test re-derives the utility list from those
 three source files and fails if the block falls behind.
 
 ---
@@ -97,7 +79,7 @@ three source files and fails if the block falls behind.
 
 | Primitive | Contract |
 |---|---|
-| `SurfaceCard` | Two levels — `base` (bordered white card) and `sunken` (tinted well inside a card). A third nesting level is reported and clamped; `MAX_SURFACE_DEPTH` is 2. |
+| `SurfaceCard` | Two levels — `base` (a printed box on the sheet) and `sunken` (a shaded field inside a box). A third nesting level is reported and clamped; `MAX_SURFACE_DEPTH` is 2. |
 | `Meter` | `role="meter"` with `aria-valuenow/min/max`, `aria-valuetext`, and an accessible name from its visible label. Always renders the number in monospace tabular figures **and** the band word (`Low` / `Fair` / `Strong`). Colour is the third signal. 8px track (12px for the overall score). |
 | `Tag` | Tone as tint + ring, label as high-contrast ink, plus an optional screen-reader classification prefix. |
 | `CandidateButton` / `CandidateInput` / `CandidateSelect` / `CandidateLabel` / states | Token-only stand-ins for the frozen `components/ui` primitives, same props and copy, 44px minimum targets. |
@@ -217,7 +199,7 @@ capability under jsdom, that test fails and tells us.
 
 Verified mechanically, on every run:
 
-- exact palette literals, and `.dark` equality
+- every `--c-*` name pinned to its Logsheet token, and no colour of its own in the file
 - WCAG 2.1 arithmetic over every rendered pair, **plus** the rejected pairings
   asserted to be below AA, so each re-pairing decision stays falsifiable
 - the two tone colours never appearing as a text utility in candidate source
@@ -226,7 +208,7 @@ Verified mechanically, on every run:
 - zero stock-Tailwind / brand / raw-literal / `dark:` colour sources in candidate-scoped code
 - compatibility coverage for every utility the frozen embedded components use
 - WCAG 2.1 contrast arithmetic over the pairs the design actually uses, with a failing weak-pair control and the published 21:1 / 1:1 reference values
-- axe on the scorecard, the Candidates list, Candidate Detail and the scoped review, each also inside a `.dark` document
+- axe on the scorecard, the Candidates list, Candidate Detail and the scoped review
 - meter semantics, two-level card depth (a third level throws), field parity, layout placement, prose measure, 44px targets
 - the scoped route gaining no link, button or field
 

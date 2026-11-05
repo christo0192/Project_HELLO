@@ -220,7 +220,7 @@ export function AdminDashboardPage() {
               const draft = memberDrafts[m.user_id];
               return (
                 <li key={m.user_id} className="flex flex-wrap items-center gap-3 py-3 text-sm">
-                  <span className="w-40 truncate font-mono text-xs text-gray-500" title={m.user_id}>
+                  <span className="w-40 truncate text-xs text-gray-500" title={m.user_id}>
                     {m.user_id.slice(0, 13)}…
                   </span>
                   <select
@@ -296,7 +296,7 @@ export function AdminDashboardPage() {
               <ul className="mt-3 max-h-40 divide-y divide-gray-100 overflow-y-auto">
                 {sessions.slice(0, 8).map((s) => (
                   <li key={s.id} className="py-1.5 text-xs text-gray-600">
-                    <span className="font-mono">{s.id.slice(0, 13)}…</span>
+                    <span className="tabular-nums">{s.id.slice(0, 13)}…</span>
                     <span className="mx-2 rounded bg-gray-100 px-1.5 py-0.5">{s.status}</span>
                     <span className="text-gray-400">
                       {new Date(s.created_at).toLocaleDateString()}
@@ -489,7 +489,7 @@ function QuotaPoliciesSection({
         <ul className="mb-4 divide-y divide-gray-100">
           {policies.map((p) => (
             <li key={p.id} className="flex flex-wrap items-center gap-3 py-2 text-sm">
-              <span className="font-mono text-xs text-gray-500">{p.id.slice(0, 8)}…</span>
+              <span className="text-xs text-gray-500">{p.id.slice(0, 8)}…</span>
               <span className="rounded bg-gray-100 px-1.5 py-0.5 text-xs">{p.scope}</span>
               <span className="text-xs text-gray-600">
                 max_sessions: {p.max_sessions ?? '∞'} · max_cost_units:{' '}

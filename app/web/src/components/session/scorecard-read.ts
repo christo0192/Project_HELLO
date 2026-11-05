@@ -36,7 +36,8 @@ export function finiteNumber(value: unknown): number | null {
 const RECOMMENDATION: Record<string, { label: string; tone: StatusTone }> = {
   advance: { label: RECOMMENDATION_LABELS.advance, tone: 'success' },
   hold: { label: RECOMMENDATION_LABELS.hold, tone: 'warning' },
-  reject: { label: RECOMMENDATION_LABELS.reject, tone: 'danger' },
+  // A verdict is ink, never a traffic light: crimson means a fault on our side.
+  reject: { label: RECOMMENDATION_LABELS.reject, tone: 'neutral' },
   human_review: { label: 'Needs human review', tone: 'warning' },
 };
 

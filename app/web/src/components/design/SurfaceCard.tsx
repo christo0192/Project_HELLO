@@ -10,12 +10,11 @@
  * mistake still stops CI, while a production page keeps rendering rather
  * than blanking over a visual-hierarchy rule. See the guard below.
  *
- *   level="base"    frosted glass panel floating on the lit ground
- *   level="sunken"  tinted well with no border — a block INSIDE a card
+ *   level="base"    a printed box on the sheet, edged with a 1px rule
+ *   level="sunken"  a shaded field with no edge — a block INSIDE a card
  *
- * Depth is material: one glass panel per logical block, `glass-sunken` wells
- * inside it, never glass inside glass — which is exactly what the depth
- * clamp below enforces mechanically.
+ * One box per logical block, `glass-sunken` wells inside it, never a box inside
+ * a box, which is exactly what the depth clamp below enforces mechanically.
  *
  * Any colour this component adds on top comes only from `--c-*`, which
  * resolve solely under `.candidate-scope` (see
@@ -34,11 +33,9 @@ const SurfaceDepthContext = createContext(0);
 export const MAX_SURFACE_DEPTH = 2;
 
 const levelStyles: Record<SurfaceLevel, string> = {
-  // The glass material itself. `glass` and `glass-sunken` are the app's own
-  // surface utilities (src/index.css) — they carry the translucency, the
-  // hairline ring and the radius, and they collapse to opaque fills under
-  // `prefers-reduced-transparency` or a missing `backdrop-filter`. Neither
-  // is a colour word, so the candidate-scope source guard is unaffected.
+  // The panel material. `glass` and `glass-sunken` are the app's own surface
+  // utilities (src/index.css). Neither is a colour word, so the candidate-scope
+  // source guard is unaffected.
   base: 'glass rounded-card',
   sunken: 'glass-sunken',
 };

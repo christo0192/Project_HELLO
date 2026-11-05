@@ -4,119 +4,76 @@
   min-height: 100%;
   overflow-x: clip;
   color: var(--c-ink);
-  background:
-    radial-gradient(circle at 12% 8%, rgb(169 202 214 / 0.38), transparent 32%),
-    radial-gradient(circle at 90% 18%, rgb(147 143 184 / 0.24), transparent 28%),
-    linear-gradient(145deg, var(--c-bg) 0%, var(--c-border-light) 52%, var(--c-negative-light) 100%);
+  background: var(--c-bg);
 }
 
-/* Quiet ambient motion gives the invite a sense of depth without competing
-   with consent or readiness. These are decorative only and never carry state. */
-.candidate-experience::before,
-.candidate-experience::after {
-  position: absolute;
-  z-index: 0;
-  display: block;
-  width: min(38vw, 460px);
-  aspect-ratio: 1;
-  border-radius: 50%;
-  content: '';
-  pointer-events: none;
-  filter: blur(2px);
-  opacity: .34;
-}
-.candidate-experience::before {
-  top: -14rem;
-  left: -9rem;
-  background: radial-gradient(circle, rgb(169 202 214 / .62), rgb(169 202 214 / 0) 70%);
-  animation: candidate-ambient-drift 18s ease-in-out infinite alternate;
-}
-.candidate-experience::after {
-  right: -11rem;
-  bottom: -16rem;
-  background: radial-gradient(circle, rgb(147 143 184 / .42), rgb(147 143 184 / 0) 68%);
-  animation: candidate-ambient-drift-reverse 22s ease-in-out infinite alternate;
-}
 .candidate-shell__inner { position: relative; z-index: 1; }
-
-@keyframes candidate-ambient-drift {
-  from { transform: translate3d(0, 0, 0) scale(1); }
-  to { transform: translate3d(5rem, 3rem, 0) scale(1.12); }
-}
-@keyframes candidate-ambient-drift-reverse {
-  from { transform: translate3d(0, 0, 0) scale(1.08); }
-  to { transform: translate3d(-4rem, -3rem, 0) scale(.94); }
-}
 
 .candidate-experience * { box-sizing: border-box; }
 .candidate-glass-card {
   width: min(100%, 700px);
-  border: 1px solid rgb(255 255 255 / 0.72);
-  border-radius: 28px;
-  background: rgb(255 255 255 / 0.72);
-  box-shadow: 0 24px 70px rgb(52 65 88 / 0.14), inset 0 1px rgb(255 255 255 / 0.8);
-  backdrop-filter: blur(22px) saturate(130%);
-}
-@supports not (backdrop-filter: blur(1px)) {
-  .candidate-glass-card { background: #fff; }
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sheet);
+  background: var(--c-surface);
 }
 .candidate-shell { min-height: 100vh; padding: 28px 20px 36px; }
 .candidate-shell__inner { width: min(100%, 1120px); margin: 0 auto; }
 .candidate-status-card { margin: 100px auto 0; padding: 30px; }
-.candidate-status-card h1 { margin: 8px 0 12px; font-size: clamp(30px, 5vw, 48px); letter-spacing: -.045em; line-height: 1.06; }
+.candidate-status-card h1 { margin: 8px 0 12px; font-size: 30px; font-weight: 600; letter-spacing: -.01em; line-height: 36px; }
 .candidate-brand { display: flex; align-items: center; gap: 12px; color: var(--c-ink); }
-.candidate-brand img { width: 42px; height: 42px; object-fit: contain; border-radius: 13px; background: #fff; padding: 5px; box-shadow: 0 5px 16px rgb(52 65 88 / 0.12); }
-.candidate-brand b { font-size: 15px; letter-spacing: -0.02em; }
+.candidate-brand img { width: 42px; height: 42px; object-fit: contain; border: 1px solid var(--c-border); border-radius: var(--radius-control); background: var(--plate); padding: 5px; }
+.candidate-brand b { font-size: 16px; font-weight: 600; }
 .candidate-brand span { display: block; color: var(--c-ink-muted); font-size: 12px; line-height: 16px; margin-top: 2px; }
 /* The step / state label above each heading ("Step 2 of 4 · Consent",
    "Live interview"). Sentence case at the label step of the type scale: no
    uppercase, no open tracking. The accent carries it, not the letter-spacing. */
 .candidate-eyebrow { color: var(--c-accent); font-size: 13px; line-height: 20px; font-weight: 600; }
 .candidate-muted { color: var(--c-ink-secondary); line-height: 1.6; }
-.candidate-field-label { display: block; margin: 25px 0 8px; color: var(--c-ink-secondary); font-size: 13px; font-weight: 700; }
-.candidate-select { width: 100%; min-height: 52px; padding: 0 16px; border: 1px solid var(--c-control-border); border-radius: 15px; background: rgb(255 255 255 / .76); color: var(--c-ink); font: inherit; }
-.candidate-select:focus-visible { outline: 3px solid rgb(78 107 166 / .32); outline-offset: 2px; }
-.candidate-meter-card { margin-top: 16px; padding: 22px; border-radius: 22px; background: rgb(244 246 251 / .78); text-align: center; }
-.candidate-instruction { margin: 0; font-size: 15px; font-weight: 650; }
+.candidate-field-label { display: block; margin: 25px 0 8px; color: var(--c-ink-muted); font-size: 12px; line-height: 16px; font-weight: 500; font-stretch: 87.5%; }
+.candidate-select { width: 100%; min-height: 52px; padding: 0 16px; border: 1px solid var(--c-control-border); border-radius: var(--radius-control); background: var(--c-surface); color: var(--c-ink); font: inherit; }
+.candidate-select:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
+.candidate-meter-card { margin-top: 16px; padding: 22px; border-radius: var(--radius-card); background: var(--c-border-light); text-align: center; }
+.candidate-instruction { margin: 0; font-size: 16px; font-weight: 600; }
 .candidate-level-meter { display: flex; align-items: end; justify-content: center; gap: 5px; height: 54px; margin: 20px auto 12px; }
 /* Every bar is laid out at full height once; the level is drawn with
    `scaleY` from the baseline (28px and 38px resting, 48px lit). The meter
    re-renders on every audio frame, and a `height` transition re-ran layout for
    all 18 bars each time; a transform stays on the compositor. */
-.candidate-level-meter i { width: 9px; height: 48px; border-radius: 5px; background: var(--c-border); transform: scaleY(.5834); transform-origin: 50% 100%; transition: transform 80ms ease-out, background-color 80ms ease-out; }
+.candidate-level-meter i { width: 9px; height: 48px; border-radius: var(--radius-evidence); background: var(--c-border); transform: scaleY(.5834); transform-origin: 50% 100%; transition: transform 80ms ease-out, background-color 80ms ease-out; }
 .candidate-level-meter i:nth-child(3n) { transform: scaleY(.7917); }
 .candidate-level-meter i[data-on="true"] { transform: none; background: var(--c-positive); }
 .candidate-meter-status { margin: 0; color: var(--c-ink-muted); font-size: 12px; }
 .candidate-check-list { display: grid; gap: 8px; margin: 20px 0; }
-.candidate-check-list > div { display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--c-border); border-radius: 15px; background: rgb(255 255 255 / .56); font-size: 13px; }
+.candidate-check-list > div { display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--c-border); border-radius: var(--radius-control); background: var(--c-surface); font-size: 13px; }
 .candidate-check-list span { color: var(--c-ink-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .candidate-check-list em { color: var(--c-ink-muted); font-size: 12px; font-style: normal; }
-.candidate-check-list [data-state="active"] { border-color: var(--c-accent); box-shadow: 0 0 0 3px rgb(78 107 166 / .12); }
-.candidate-check-list [data-state="passed"] em { color: var(--c-positive); font-weight: 700; }
+.candidate-check-list [data-state="active"] { border-color: var(--c-accent); }
+.candidate-check-list [data-state="passed"] em { color: var(--c-positive); font-weight: 600; }
 .candidate-check-list [data-state="failed"] em, .candidate-error { color: var(--c-negative); }
-.candidate-primary-cta { width: 100%; min-height: 52px; margin-top: 8px; border: 0; border-radius: 16px; background: var(--c-accent); color: var(--c-data-label-inside); font-weight: 750; box-shadow: 0 10px 22px rgb(78 107 166 / .22); }
-.candidate-primary-cta:hover:not(:disabled) { filter: brightness(.94); }
-.candidate-primary-cta:disabled { cursor: not-allowed; background: var(--c-border); color: var(--c-ink-muted); box-shadow: none; filter: none; opacity: 1; }
+.candidate-primary-cta { width: 100%; min-height: 52px; margin-top: 8px; border: 1px solid transparent; border-radius: var(--radius-control); background: var(--c-accent); color: var(--c-data-label-inside); font-weight: 600; transition: background-color 120ms ease-out, transform 120ms ease-out; }
+.candidate-primary-cta:hover:not(:disabled) { background: var(--c-ink-secondary); }
+.candidate-primary-cta:active:not(:disabled) { transform: scale(.97); }
+.candidate-primary-cta:disabled { cursor: not-allowed; background: var(--c-border); color: var(--c-ink-secondary); opacity: 1; }
 .candidate-primary-cta:focus-visible,
 .candidate-interview__controls button:focus-visible,
-.candidate-back:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
+.candidate-back:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
 .candidate-fallback-cta { max-width: 700px; margin: 100px auto 0; display: flex; }
-.candidate-back { border: 0; background: transparent; color: var(--c-accent); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+.candidate-back { border: 0; background: transparent; color: var(--c-accent); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
 .candidate-privacy-note { margin: 16px 0 0; color: var(--c-ink-muted); font-size: 12px; line-height: 16px; text-align: center; }
 .candidate-error { margin: 14px 0; font-size: 13px; line-height: 1.5; }
 .candidate-consent { padding: 34px; }
-.candidate-consent h1, .candidate-readiness h1 { margin: 8px 0; font-size: clamp(28px, 5vw, 42px); letter-spacing: -.045em; line-height: 1.06; }
-.candidate-consent__summary { margin: 20px 0; padding: 14px 16px; border-radius: 16px; background: rgb(234 238 246 / .8); color: var(--c-ink-secondary); font-size: 14px; line-height: 1.55; }
-.candidate-consent__all { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; border: 1px solid var(--c-accent); border-radius: 16px; background: rgb(78 107 166 / .07); font-weight: 750; }
+.candidate-consent h1, .candidate-readiness h1 { margin: 8px 0; font-size: 24px; font-weight: 600; letter-spacing: -.01em; line-height: 32px; }
+.candidate-consent__summary { margin: 20px 0; padding: 14px 16px; border-radius: var(--radius-card); background: var(--c-border-light); color: var(--c-ink-secondary); font-size: 14px; line-height: 1.55; }
+.candidate-consent__all { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; border: 1px solid var(--c-control-border); border-radius: var(--radius-control); background: var(--c-border-light); font-weight: 600; }
 .candidate-consent__all input, .candidate-consent__item input { width: 20px; height: 20px; margin-top: 1px; accent-color: var(--c-accent); flex: 0 0 auto; }
 .candidate-consent__items { display: grid; gap: 9px; margin: 12px 0 18px; }
 .candidate-consent__item { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--c-border); color: var(--c-ink-secondary); font-size: 13px; line-height: 1.45; }
 .candidate-consent__details { margin: 12px 0 20px; color: var(--c-ink-secondary); font-size: 12px; line-height: 1.6; }
-.candidate-consent__details summary { cursor: pointer; color: var(--c-accent); font-weight: 700; }
+.candidate-consent__details summary { cursor: pointer; color: var(--c-accent); font-weight: 600; }
 .candidate-landing { padding: 42px; }
-.candidate-role { margin: 18px 0 24px; font-size: clamp(32px, 6vw, 58px); letter-spacing: -.055em; line-height: 1.02; }
+.candidate-role { margin: 18px 0 24px; font-size: 30px; font-weight: 600; letter-spacing: -.01em; line-height: 36px; }
 .candidate-landing__meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0 32px; }
-.candidate-pill { padding: 8px 12px; border-radius: 999px; background: rgb(255 255 255 / .7); color: var(--c-ink-secondary); font-size: 12px; }
+.candidate-pill { padding: 8px 12px; border-radius: var(--radius-chip); background: var(--c-border-light); color: var(--c-ink-secondary); font-size: 12px; }
 .candidate-readiness { margin: 24px auto 0; padding: 32px; }
 .candidate-interview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); align-items: stretch; gap: 20px; width: min(100%, 1180px); margin: 32px auto 0; }
 .candidate-interview__stage { display: grid; min-height: min(720px, calc(100vh - 190px)); place-items: center; align-content: center; padding: 34px; }
@@ -124,37 +81,28 @@
 .candidate-interview__stage .candidate-eyebrow { margin: 0; }
 .candidate-interview__stage .candidate-role { width: min(100%, 780px); text-align: center; }
 .candidate-interview__captions { display: flex; min-height: min(720px, calc(100vh - 190px)); flex-direction: column; padding: 28px; }
-.candidate-interview__captions h2 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+.candidate-interview__captions h2 { margin: 0; font-size: 16px; font-weight: 600; }
 .candidate-caption-list { flex: 1; overflow: auto; margin-top: 18px; padding-right: 4px; }
 .candidate-caption { margin: 0 0 18px; color: var(--c-ink-secondary); font-size: 16px; line-height: 1.55; }
 /* Who is speaking ("Interviewer" / "Speaking"): a sentence-case label at the
    meta step, not a 10px uppercase tracked tag. */
 .candidate-caption small { display: block; margin-bottom: 2px; color: var(--c-accent); font-size: 12px; line-height: 16px; font-weight: 600; }
 .candidate-aura { --speech-level: 0; position: relative; display: grid; width: min(70vw, 440px); aspect-ratio: 1; place-items: center; }
-.candidate-aura__halo { position: absolute; border-radius: 50%; pointer-events: none; transform: scale(calc(1 + var(--speech-level) * .05)); transition: transform 260ms ease-out, opacity 320ms ease-out; }
-.candidate-aura__halo--outer { width: 100%; height: 100%; border: 1px solid rgb(78 107 166 / calc(.07 + var(--speech-level) * .1)); box-shadow: 0 0 65px rgb(78 107 166 / calc(.04 + var(--speech-level) * .1)); opacity: calc(.2 + var(--speech-level) * .32); }
-.candidate-aura__halo--middle { width: 78%; height: 78%; border: 1px solid rgb(57 138 162 / calc(.09 + var(--speech-level) * .12)); transform: scale(calc(1 + var(--speech-level) * .06)); opacity: calc(.24 + var(--speech-level) * .34); }
-.candidate-aura__halo--inner { width: 60%; height: 60%; background: radial-gradient(circle, rgb(169 202 214 / calc(.1 + var(--speech-level) * .18)), transparent 70%); transform: scale(calc(1 + var(--speech-level) * .08)); opacity: calc(.3 + var(--speech-level) * .35); }
-.candidate-aura__bubble { z-index: 1; position: absolute; width: 46%; aspect-ratio: 1.06; border-radius: 43% 57% 52% 48% / 52% 43% 57% 48%; background: radial-gradient(circle at 26% 24%, rgb(169 202 214 / .82), transparent 34%), radial-gradient(circle at 76% 25%, rgb(147 143 184 / .7), transparent 38%), radial-gradient(circle at 74% 78%, rgb(57 138 162 / .78), transparent 44%), radial-gradient(circle at 25% 78%, rgb(216 181 190 / .64), transparent 42%), conic-gradient(from 145deg, rgb(57 138 162 / .68), rgb(169 202 214 / .72), rgb(147 143 184 / .62), rgb(216 181 190 / .58), rgb(57 138 162 / .68)); box-shadow: 0 18px 55px rgb(78 107 166 / .16), inset 10px -8px 22px rgb(255 255 255 / .26); opacity: calc(.68 + var(--speech-level) * .2); transform: scale(calc(.94 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg)); transition: transform 280ms ease-out, opacity 360ms ease-out, border-radius 700ms ease-in-out; animation: candidate-bubble-idle 10s ease-in-out infinite alternate; }
-.candidate-aura[data-speaking="true"] .candidate-aura__bubble { animation: candidate-bubble-speaking 2.8s ease-in-out infinite alternate; }
-@keyframes candidate-bubble-idle {
-  from { border-radius: 43% 57% 52% 48% / 52% 43% 57% 48%; transform: scale(calc(.94 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg)); }
-  to { border-radius: 51% 49% 45% 55% / 44% 55% 45% 56%; transform: scale(calc(.97 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg + 2deg)); }
-}
-@keyframes candidate-bubble-speaking {
-  from { border-radius: 43% 57% 52% 48% / 52% 43% 57% 48%; transform: scale(calc(.97 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg)); }
-  to { border-radius: 48% 52% 55% 45% / 48% 50% 50% 52%; transform: scale(calc(1.02 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg - 2deg)); }
-}
-.candidate-aura__logo-plate { z-index: 2; display: grid; width: 126px; height: 126px; place-items: center; border: 1px solid rgb(255 255 255 / .9); border-radius: 36px; background: rgb(255 255 255 / .82); box-shadow: 0 18px 45px rgb(52 65 88 / .18), 0 0 calc(18px + var(--speech-level) * 42px) rgb(78 107 166 / calc(.10 + var(--speech-level) * .28)); }
+.candidate-aura__halo { position: absolute; border-radius: 50%; pointer-events: none; transform: scale(calc(1 + var(--speech-level) * .05)); transition: transform 260ms ease-out; }
+.candidate-aura__halo--outer { width: 100%; height: 100%; border: 1px solid var(--c-border); }
+.candidate-aura__halo--middle { width: 78%; height: 78%; border: 1px solid var(--c-border); transform: scale(calc(1 + var(--speech-level) * .06)); }
+.candidate-aura__halo--inner { width: 60%; height: 60%; background: var(--c-border-light); transform: scale(calc(1 + var(--speech-level) * .08)); }
+.candidate-aura__bubble { z-index: 1; position: absolute; width: 62%; aspect-ratio: 1; border: 1px solid var(--c-control-border); border-radius: 50%; background: transparent; transform: scale(calc(.94 + var(--speech-level) * .08)); transition: transform 280ms ease-out; }
+.candidate-aura[data-speaking="true"] .candidate-aura__bubble { border-color: var(--c-ink); }
+.candidate-aura__logo-plate { z-index: 2; display: grid; width: 126px; height: 126px; place-items: center; border: 1px solid var(--c-border); border-radius: var(--radius-sheet); background: var(--plate); }
 .candidate-aura__logo-plate img { width: 88px; height: 88px; object-fit: contain; }
-.candidate-aura__status { position: absolute; bottom: 7%; color: var(--c-ink-muted); font-size: 12px; font-weight: 700; }
+.candidate-aura__status { z-index: 2; position: absolute; bottom: 7%; padding: 0 6px; background: var(--c-surface); color: var(--c-ink-muted); font-size: 12px; font-weight: 600; }
 .candidate-interview__controls { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 20px; }
-.candidate-interview__controls button { min-height: 44px; border: 1px solid var(--c-control-border); border-radius: 14px; padding: 0 16px; background: rgb(255 255 255 / .72); color: var(--c-ink-secondary); font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
+.candidate-interview__controls button { min-height: 44px; border: 1px solid var(--c-control-border); border-radius: var(--radius-control); padding: 0 16px; background: var(--c-surface); color: var(--c-ink-secondary); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
 .candidate-interview__controls button:hover { background: var(--c-border-light); }
-.candidate-interview__controls button[aria-pressed="true"] { border-color: var(--c-accent); background: var(--c-accent-light); color: var(--c-accent); }
+.candidate-interview__controls button[aria-pressed="true"] { border-color: var(--c-accent); background: var(--c-accent); color: var(--c-data-label-inside); }
 @media (prefers-reduced-motion: reduce) {
-  .candidate-experience::before,
-  .candidate-experience::after,
+  .candidate-primary-cta:active:not(:disabled) { transform: none; }
   .candidate-aura__bubble,
   .candidate-aura__halo,
   .candidate-level-meter i { animation: none; transition: none; }
@@ -170,8 +118,17 @@
   .candidate-interview__captions { min-height: 30vh; }
   .candidate-caption { font-size: 14px; }
 }
-@media (prefers-reduced-transparency: reduce), (forced-colors: active) {
-  .candidate-glass-card, .candidate-meter-card, .candidate-interview__controls button { background: #fff; backdrop-filter: none; }
-  .candidate-aura__halo { border-color: currentColor; box-shadow: none; }
-  .candidate-aura__bubble { background: Canvas; border: 1px solid currentColor; box-shadow: none; opacity: 1; }
+@media (forced-colors: active) {
+  .candidate-glass-card, .candidate-meter-card, .candidate-interview__controls button { background: Canvas; border: 1px solid CanvasText; }
+  .candidate-aura__halo { border-color: currentColor; }
+  .candidate-aura__bubble { background: Canvas; border: 1px solid currentColor; opacity: 1; }
+  /* The logo's own white plate, in every theme. */
+  .candidate-brand img, .candidate-aura__logo-plate { forced-color-adjust: none; }
+  /* A pressed control outranks index.css's selection fill, so it keeps its own, and
+     HighlightText need not show on that. Its outline stays outside, on Canvas: left
+     in ink, nothing forces it, and it measured 1.2:1 on a dark theme's Canvas. */
+  .candidate-interview__controls button[aria-pressed="true"]:focus-visible {
+    outline: 2px solid CanvasText !important;
+    outline-offset: 2px !important;
+  }
 }

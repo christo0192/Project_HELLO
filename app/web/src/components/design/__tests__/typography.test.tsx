@@ -65,10 +65,10 @@ describe('typeface', () => {
 
   it('bundles the fonts from the app entry, never from a CDN (CSP font-src self)', () => {
     const main = read('src/main.tsx');
-    expect(main).toMatch(/import '@fontsource-variable\/ibm-plex-sans';/);
+    expect(main).toMatch(/import '@fontsource-variable\/ibm-plex-sans\/wdth\.css';/);
     expect(main).toMatch(/import '@fontsource\/ibm-plex-mono\/400\.css';/);
     // The fonts load before the app stylesheet so its rules can name them.
-    expect(main.indexOf("'@fontsource-variable/ibm-plex-sans'")).toBeLessThan(main.indexOf("'./index.css'"));
+    expect(main.indexOf("'@fontsource-variable/ibm-plex-sans/wdth.css'")).toBeLessThan(main.indexOf("'./index.css'"));
     for (const file of ['src/main.tsx', 'src/index.css', 'index.html']) {
       expect(read(file), `${file} reaches a font CDN`).not.toMatch(/fonts\.(googleapis|gstatic)\.com|cdn\.jsdelivr|unpkg\.com/);
     }
@@ -80,9 +80,9 @@ describe('typeface', () => {
 describe('type scale tokens', () => {
   it.each([
     // [token, size, line height, weight, tracking]
-    ['title', '1.75rem', '2.125rem', '600', '-0.02em'],
-    ['stat', '1.875rem', '2.25rem', '600', '-0.02em'],
-    ['section', '0.9375rem', '1.25rem', '600', '-0.01em'],
+    ['title', '1.5rem', '2rem', '600', '-0.01em'],
+    ['stat', '1.875rem', '2.25rem', '600', '-0.01em'],
+    ['section', '1rem', '1.5rem', '600', undefined],
     ['label', '0.8125rem', '1.25rem', undefined, undefined],
     ['meta', '0.75rem', '1rem', undefined, undefined],
   ])('text-%s is %s / %s', async (token, size, lineHeight, weight, tracking) => {
@@ -127,7 +127,7 @@ describe('primitives on the scale', () => {
     expect(heading.parentElement?.children).toHaveLength(1);
   });
 
-  it('Table: tabular figures across the table; header cells on the meta step', () => {
+  it('Table: tabular figures across the table; header cells are form labels', () => {
     render(
       <Table caption="Scores">
         <THead>
@@ -143,7 +143,7 @@ describe('primitives on the scale', () => {
       </Table>,
     );
     expect(screen.getByRole('table', { name: 'Scores' })).toHaveClass('tabular-nums', 'text-sm');
-    expect(screen.getByRole('columnheader', { name: 'Score' })).toHaveClass('text-meta', 'font-medium');
+    expect(screen.getByRole('columnheader', { name: 'Score' })).toHaveClass('form-label');
   });
 
   it('StatusBadge and Tag: meta step, medium, tabular figures', () => {

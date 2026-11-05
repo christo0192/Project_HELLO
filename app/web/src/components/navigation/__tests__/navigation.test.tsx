@@ -35,6 +35,12 @@ describe('Brand', () => {
     expect(screen.getByText('HELLO')).toBeInTheDocument();
     expect(screen.getByText('Recruiting workspace')).toBeInTheDocument();
   });
+
+  it('gives the logo its own white plate, not a surface token', () => {
+    render(<Brand />);
+    const img = document.querySelector('img[src="/ik-logo.png"]');
+    expect(img?.parentElement).toHaveClass('bg-plate');
+  });
 });
 
 describe('NavGroup', () => {
@@ -82,6 +88,15 @@ describe('NavLinkItem', () => {
     expect(screen.getByRole('link', { name: 'Candidates' })).not.toHaveAttribute(
       'aria-current',
     );
+  });
+
+  it('draws the active item as a paper tab with a 3:1 edge, and the rest flat', () => {
+    renderItem();
+    const active = screen.getByRole('link', { name: 'Dashboard' });
+    expect(active).toHaveClass('bg-surface', 'border-[var(--control)]');
+    const other = screen.getByRole('link', { name: 'Candidates' });
+    expect(other).toHaveClass('border-transparent');
+    expect(other).not.toHaveClass('bg-surface');
   });
 
   it('invokes onNavigate when clicked', async () => {

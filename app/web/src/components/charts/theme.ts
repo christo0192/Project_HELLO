@@ -1,5 +1,4 @@
 import type { EChartsOption } from 'echarts';
-import type { Theme } from '../../lib/theme';
 
 export interface ChartPalette {
   colors: string[];
@@ -7,40 +6,59 @@ export interface ChartPalette {
   subtext: string;
   axisLine: string;
   splitLine: string;
+  /** The paper behind a chart: marker rims, slice borders. */
+  surface: string;
   tooltipBg: string;
   tooltipBorder: string;
 }
 
 /**
- * Categorical chart palette derived from the approved HR screenshot cycle.
- * The `theme` argument remains for API compatibility; all application charts
- * intentionally render the single approved light-first palette.
+ * A token's resolved value. The canvas cannot read `var(--x)`, so a chart takes
+ * the computed value; a custom property's computed value has any `var()` in it
+ * already substituted, so the semantic names resolve too.
  */
-export function chartPalette(_theme: Theme): ChartPalette {
+function token(name: string): string {
+  if (typeof document === 'undefined') return '';
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+/**
+ * THE ONE PLACE CHARTS GET A COLOUR. Everything here is read from the tokens in
+ * index.css, so a chart cannot drift from the page around it.
+ *
+ * The categorical cycle is ink steps, not hues: a series is told apart by its
+ * printed label, its dash and its marker shape (series.ts), and an outcome is not
+ * coloured good or bad. Neighbours in the cycle are at least 1.5:1 from each other and
+ * every step is at least 3:1 on paper. The voice hue never appears here: orange
+ * means the candidate's voice and nothing else.
+ */
+export function chartPalette(): ChartPalette {
   return {
-    colors: ['#4E6BA6', '#398AA2', '#1E7590', '#D8B5BE', '#938FB8', '#7BA7C7', '#A9CAD6', '#C4A6B8', '#6B8E9F', '#B5C8D8', '#8FB0A8', '#D0B8A0'],
-    text: '#0f172a',
-    subtext: '#5f6785',
-    axisLine: '#dbe1ec',
-    splitLine: '#f1f5f9',
-    tooltipBg: '#ffffff',
-    tooltipBorder: '#dbe1ec',
+    colors: [token('--ink'), token('--ink-3'), token('--ai'), token('--ink-2'), token('--control')],
+    text: token('--ink'),
+    subtext: token('--ink-3'),
+    axisLine: token('--rule-2'),
+    splitLine: token('--rule'),
+    surface: token('--paper'),
+    tooltipBg: token('--paper'),
+    tooltipBorder: token('--rule-2'),
   };
 }
 
 export interface ChartTheme {
   palette: ChartPalette;
-  /** Base option keys merged into every chart (theme + reduced motion). */
+  /** Base option keys merged into every chart. */
   base: EChartsOption;
 }
 
-/** Build the theme-aware base option for a resolved theme + motion state. */
-export function chartTheme(theme: Theme, reducedMotion: boolean): ChartTheme {
-  const palette = chartPalette(theme);
+/**
+ * The base option for every chart. No entrance at any setting, so there is
+ * nothing for reduced motion to switch off: a chart is printed, not drawn in.
+ */
+export function chartTheme(): ChartTheme {
+  const palette = chartPalette();
   const base: EChartsOption = {
-    animation: !reducedMotion,
-    animationDuration: 600,
-    animationEasing: 'cubicOut',
+    animation: false,
     color: palette.colors,
     textStyle: {
       color: palette.text,
@@ -49,13 +67,14 @@ export function chartTheme(theme: Theme, reducedMotion: boolean): ChartTheme {
       fontSize: 12,
     },
     tooltip: {
-      backgroundColor: 'rgba(255, 255, 255, 0.86)',
-      borderColor: 'rgba(15, 23, 42, 0.08)',
+      backgroundColor: palette.tooltipBg,
+      borderColor: palette.tooltipBorder,
       borderWidth: 1,
       textStyle: { color: palette.text, fontSize: 12 },
       padding: [8, 12],
-      extraCssText:
-        'border-radius: 12px; box-shadow: 0 1px 2px rgba(15,23,42,0.06), 0 10px 30px -10px rgba(15,23,42,0.25); backdrop-filter: blur(12px) saturate(1.3); -webkit-backdrop-filter: blur(12px) saturate(1.3);',
+      // A tooltip is a floating layer, so the one shadow token applies. ECharts
+      // renders it as HTML, so the custom properties resolve.
+      extraCssText: 'border-radius: var(--radius-control); box-shadow: var(--shadow-pop);',
     },
   };
   return { palette, base };

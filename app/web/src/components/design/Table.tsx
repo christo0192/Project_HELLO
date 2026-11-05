@@ -8,20 +8,21 @@ import { cx } from './cx';
 export interface TableProps extends HTMLAttributes<HTMLTableElement> {
   /** Screen-reader-only caption describing the table. */
   caption?: string;
-  /** Render without the glass container (already inside a panel). */
+  /** Render without the panel container (already inside a panel). */
   bare?: boolean;
   /** Sticky header inside a bounded scroll container. */
   maxHeight?: string;
 }
 
 /**
- * Semantic table primitive inside a glass container. Wraps the table in a
+ * Semantic table primitive inside a panel. Wraps the table in a
  * horizontal-scroll region so narrow viewports never clip content (WCAG
  * 1.4.10 reflow friendly); pass `maxHeight` for a sticky-header scroll.
  *
- * Type: body cells are 14/20 in the ink; header cells are the meta step
- * (12/16, medium, tertiary ink) so the data, not the labels, carries the
- * weight. The whole table sets TABULAR figures: counts, scores, dates and
+ * Type: body cells are 14/20 in the ink; header cells are form labels (12/16,
+ * condensed, tertiary ink) so the data, not the labels, carries the weight.
+ * No zebra and no header band: rows are ruled. The whole table sets TABULAR
+ * figures: counts, scores, dates and
  * times line up column-wise, and a number that updates in place keeps its
  * width. (IBM Plex already draws every digit one width; the utility keeps
  * the column aligned under any fallback face, where "11" and "88" differ.)
@@ -67,18 +68,13 @@ export function THead({
   );
 }
 
-/**
- * Rows reveal with a short CSS stagger (`.rows-reveal`, index.css) on mount
- * and whenever new rows mount (pagination, filters). Pure CSS so typing into
- * a filter never re-runs an animation engine; collapses under reduced motion.
- */
 export function TBody({
   className,
   children,
   ...rest
 }: HTMLAttributes<HTMLTableSectionElement>) {
   return (
-    <tbody className={cx('rows-reveal [&>tr:last-child>td]:border-b-0', className)} {...rest}>
+    <tbody className={cx('[&>tr:last-child>td]:border-b-0', className)} {...rest}>
       {children}
     </tbody>
   );
@@ -90,7 +86,7 @@ export function TFoot({
   ...rest
 }: HTMLAttributes<HTMLTableSectionElement>) {
   return (
-    <tfoot className={cx('bg-white/40', className)} {...rest}>
+    <tfoot className={cx('bg-surface-secondary', className)} {...rest}>
       {children}
     </tfoot>
   );
@@ -103,7 +99,7 @@ export function Tr({
 }: HTMLAttributes<HTMLTableRowElement>) {
   return (
     <tr
-      className={cx('group/row transition-colors duration-150 hover:bg-white/60', className)}
+      className={cx('group/row transition-colors duration-hover hover:bg-surface-secondary', className)}
       {...rest}
     >
       {children}
@@ -120,7 +116,7 @@ export function Th({
     <th
       scope={rest.scope ?? 'col'}
       className={cx(
-        'h-10 border-b border-glass-ring bg-white/80 px-4 text-left text-meta font-medium text-ink-tertiary first:rounded-tl-card last:rounded-tr-card',
+        'form-label h-10 border-b border-line-strong bg-surface px-4 text-left first:rounded-tl-card last:rounded-tr-card',
         className,
       )}
       {...rest}

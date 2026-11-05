@@ -80,22 +80,24 @@ const legendClass = 'text-label font-medium text-ink-tertiary';
  */
 function pillClass(active: boolean): string {
   return cx(
-    'inline-flex min-h-[44px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3.5 text-label font-medium',
-    'transition-[color,background-color,box-shadow] duration-200 ease-soft',
-    'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary',
+    'inline-flex min-h-[44px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-control px-3.5 text-label font-medium',
+    'transition-[color,background-color,box-shadow] duration-hover ease-soft',
+    'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
     active
-      ? 'bg-info text-white shadow-pill'
-      : 'bg-white/70 text-ink-secondary shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] hover:bg-white hover:text-ink',
+      ? 'bg-info text-surface'
+      : 'bg-surface text-ink-secondary border border-[var(--control)] hover:bg-surface-secondary hover:text-ink',
   );
 }
 
-/** One half of the view switch: a segment in a sunken well, lifted when on. */
+/** One half of the view switch: a printed segment, an ink fill when on. */
 function segmentClass(active: boolean): string {
   return cx(
-    'inline-flex min-h-[44px] items-center rounded-[10px] px-4 text-label font-medium',
-    'transition-[color,background-color,box-shadow] duration-200 ease-soft',
-    'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-1',
-    active ? 'bg-white text-ink shadow-pill' : 'text-ink-secondary hover:text-ink',
+    'inline-flex min-h-[44px] items-center rounded-evidence px-4 text-label font-medium',
+    'transition-colors duration-hover ease-out',
+    'focus:outline-none focus-visible:ring-2 focus-visible:ring-inset',
+    active
+      ? 'bg-info text-surface focus-visible:ring-surface'
+      : 'text-ink-secondary hover:bg-surface-secondary hover:text-ink focus-visible:ring-info',
   );
 }
 
@@ -216,7 +218,7 @@ export function PhoneFilterBar({
         <fieldset className="min-w-0">
           {/* The two options name themselves; the legend is for the group. */}
           <legend className="sr-only">View</legend>
-          <div className="glass-sunken inline-flex gap-1 rounded-control p-1">
+          <div className="inline-flex gap-0.5 rounded-control border border-[var(--control)] bg-surface p-0.5">
             <button
               type="button"
               aria-pressed={view === 'week'}

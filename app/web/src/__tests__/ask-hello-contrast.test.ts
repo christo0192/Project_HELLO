@@ -6,8 +6,8 @@
  * one before it:
  *
  *   1. `opacity-60` composited the whole subtree, so the white label faded
- *      with the fill: 2.82:1, and 2.39:1 under the sheen — for the entire ten
- *      minutes the button spends saying "Asking Hello…".
+ *      with the fill: 2.82:1 for the entire ten minutes the button spends
+ *      saying "Asking Hello…".
  *   2. the focus ring used `var(--c-accent)`, which is declared only under
  *      `.candidate-scope`. The Roles page does not apply that class, so the
  *      custom property was invalid at computed-value time and Tailwind's
@@ -113,20 +113,6 @@ function contrast(a: string, b: string): number {
   return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
 }
 
-const toRgb = (hex: string) => {
-  const h = hex.replace('#', '');
-  return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
-};
-const toHex = (rgb: number[]) =>
-  '#' + rgb.map((c) => Math.round(c).toString(16).padStart(2, '0')).join('');
-
-/** Two colours mixed, rounded to 8 bits the way compositing does. */
-const mix = (a: string, b: string, t: number) =>
-  toHex(toRgb(a).map((c, i) => Math.round(c * (1 - t) + toRgb(b)[i] * t)));
-
-/** `over` painted on `under` at `alpha`. */
-const over = (under: string, colour: string, alpha: number) => mix(under, colour, alpha);
-
 /**
  * The body of a rule whose selector is EXACTLY `selector`, at a line start.
  *
@@ -171,77 +157,22 @@ function ruleBody(selector: string): string {
   return ruleBodies(selector).join('\n');
 }
 
-/**
- * The `.ask-hello` gradient stops, read from the CSS rather than restated.
- *
- * `\d+%` could not read `28.0%`, which is ordinary CSS — so replacing one
- * stop with a pale colour AND a decimal position dropped it from this list
- * entirely. Four stops remained, the scaffolding test's `>= 3` still passed,
- * the ramp was sampled only between the stops that WERE read, and the stop
- * actually painted sat at 2.42:1. A parser that silently drops what it
- * cannot read is the failure mode this file has now had three times, so the
- * count is checked against the raw colours as well as widened.
- */
-function gradientStops(): string[] {
-  // SCOPED TO THE GRADIENT DECLARATION. The cross-check used to count
-  // `#[0-9a-f]{6}` across the whole rule body, which meant it could not see a
-  // stop written in ANY other colour syntax: `#fff 28%` and
-  // `rgb(245 245 245) 28%` were each dropped from `stops` while `rawColours`
-  // fell by the same one, so `stops.length === rawColours` still held. Four
-  // dark stops remained, `>= 3` still passed, the ramp was sampled without
-  // the pale stop in it — and the shipped label sat at 1.0:1. Counting had to
-  // move off the read form and onto EVERY colour token, inside the
-  // declaration that actually paints.
-  //
-  // Reading to the `;` rather than to a `)` on purpose: a nested `rgb(...)`
-  // would end a lazy paren match early and hide the very thing being counted.
-  const declaration = ruleBody('.ask-hello').match(
-    /background-image:\s*linear-gradient\(([\s\S]*?);/,
-  );
-  if (!declaration) throw new Error('no linear-gradient declaration on .ask-hello');
-  const body = declaration[1];
-  const stops = [...body.matchAll(/#([0-9a-f]{6})\s+[\d.]+%/gi)].map((m) => `#${m[1]}`);
-  // Any colour token at all — short hex, functional notation, or a bare
-  // keyword like `white`. The contrast maths below only knows 6-digit hex, so
-  // anything else is an unreadable stop and must fail LOUDLY, not silently.
-  const colourTokens = [
-    ...body.matchAll(/#[0-9a-f]{3,8}\b|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(|\b(?:white|black|transparent|currentcolor)\b/gi),
-  ].length;
-  if (stops.length !== colourTokens) {
-    throw new Error(
-      `gradient parser read ${stops.length} of ${colourTokens} colour tokens — ` +
-        'a stop is in a syntax this file cannot evaluate. Use 6-digit hex.',
-    );
-  }
-  return stops;
+/** A palette token's hex, read from the stylesheet rather than restated. */
+function tokenHex(name: string): string {
+  const m = CSS.match(new RegExp(`${name}:\\s*(#[0-9a-f]{6})\\s*;`, 'i'));
+  if (!m) throw new Error(`${name} is not declared as a 6-digit hex`);
+  return m[1];
 }
 
 /**
- * The sheen's HEAVIEST white stop.
- *
- * The maximum, not the first: a second, brighter stop added anywhere in that
- * gradient darkens the label further, and reading only the first would miss
- * it. The worst case is what the contrast bar has to clear.
+ * The fill a rule paints, resolved to a hex. Throws rather than returning
+ * nothing: a parser that silently drops what it cannot read is the failure mode
+ * this file has had three times.
  */
-function sheenAlpha(): number {
-  // PERCENTAGE ALPHA COUNTS. `rgb(255 255 255 / 65%)` is valid CSS and the
-  // old pattern wanted `)` where the `%` sits, so the stop was skipped and
-  // `Math.max` happily returned the 0.14 beside it while the button painted
-  // 0.65 — a label at 1.75:1 with this file green. As with the gradient, the
-  // number of alphas READ is checked against the number PRESENT, so the next
-  // syntax this regex cannot parse fails loudly instead of quietly.
-  const body = ruleBody('.ask-hello__sheen');
-  const alphas = [...body.matchAll(/rgb\(255 255 255 \/ ([\d.]+)(%?)\)/g)].map((m) =>
-    m[2] === '%' ? Number(m[1]) / 100 : Number(m[1]),
-  );
-  const present = [...body.matchAll(/rgb\(255 255 255 \//g)].length;
-  if (alphas.length === 0) throw new Error('could not read the sheen alpha');
-  if (alphas.length !== present) {
-    throw new Error(
-      `sheen parser read ${alphas.length} of ${present} white stops — one is being dropped`,
-    );
-  }
-  return Math.max(...alphas);
+function fillOf(selector: string): string {
+  const m = ruleBody(selector).match(/background-color:\s*var\((--[\w-]+)\)/);
+  if (!m) throw new Error(`${selector} paints no token fill`);
+  return tokenHex(m[1]);
 }
 
 /**
@@ -277,84 +208,39 @@ function askHelloRules(): Array<{ selector: string; body: string }> {
   }));
 }
 
-/**
- * The bodies of every at-rule with this prelude, brace-matched.
- *
- * `indexOf`/`slice` cannot read a nested block, and both hand-rolled parsers
- * in this file's history failed OPEN rather than loudly. This one throws when
- * it finds nothing and when the braces do not balance.
- */
-function atRuleBlocks(prelude: string): string[] {
-  const out: string[] = [];
-  let i = CSS.indexOf(prelude);
-  while (i !== -1) {
-    const open = CSS.indexOf('{', i);
-    if (open === -1) break;
-    let depth = 0;
-    let j = open;
-    for (; j < CSS.length; j += 1) {
-      if (CSS[j] === '{') depth += 1;
-      else if (CSS[j] === '}') {
-        depth -= 1;
-        if (depth === 0) break;
-      }
-    }
-    if (depth !== 0) throw new Error(`unbalanced braces after ${prelude}`);
-    out.push(CSS.slice(open + 1, j));
-    i = CSS.indexOf(prelude, j);
-  }
-  if (out.length === 0) throw new Error(`no ${prelude} block`);
-  return out;
-}
-
 const WHITE = '#ffffff';
 /** 14px semibold is not WCAG "large text", so the bar is 4.5:1, not 3:1. */
 const TEXT_BAR = 4.5;
 
 describe('Ask Hello — label contrast, from the stylesheet', () => {
-  it('reads the gradient and the sheen out of the CSS at all', () => {
-    // Without this, a renamed class or a reformatted gradient would leave
-    // every assertion below sweeping an empty array and passing.
-    const stops = gradientStops();
-    expect(stops.length).toBeGreaterThanOrEqual(3);
-    expect(new Set(stops).size).toBeGreaterThanOrEqual(3);
-    expect(sheenAlpha()).toBeGreaterThan(0);
+  it('reads the fills out of the CSS at all', () => {
+    // Without this, a renamed class would leave every assertion below passing.
+    expect(fillOf('.ask-hello')).toMatch(/^#[0-9a-f]{6}$/i);
+    expect(fillOf('.ask-hello--idle')).toMatch(/^#[0-9a-f]{6}$/i);
   });
 
-  it('CLEARS 4.5:1 EVERYWHERE ALONG THE RAMP, under the sheen', () => {
-    // Sampled between stops, not just at them: the minimum sits partway along
-    // a ramp, and checking only the declared colours would miss it.
-    const stops = gradientStops();
-    const alpha = sheenAlpha();
-    let worst = Infinity;
-    let worstAt = '';
-    for (let i = 0; i < stops.length - 1; i += 1) {
-      for (let step = 0; step <= 200; step += 1) {
-        const fill = mix(stops[i], stops[i + 1], step / 200);
-        const ratio = contrast(over(fill, WHITE, alpha), WHITE);
-        if (ratio < worst) {
-          worst = ratio;
-          worstAt = fill;
-        }
-      }
-    }
-    expect(worst, `worst point on the running button is ${worstAt}`).toBeGreaterThanOrEqual(
-      TEXT_BAR,
-    );
-  });
-
-  it('CLEARS 4.5:1 with no sheen — the reduced-motion state', () => {
-    const stops = gradientStops();
-    const worst = Math.min(...stops.map((s) => contrast(s, WHITE)));
-    expect(worst).toBeGreaterThanOrEqual(TEXT_BAR);
+  it('CLEARS 4.5:1 on the fill', () => {
+    expect(contrast(fillOf('.ask-hello'), WHITE)).toBeGreaterThanOrEqual(TEXT_BAR);
   });
 
   it('CLEARS 4.5:1 on the idle fill', () => {
     // The flat colour that replaced `opacity-60`. Fading the button faded the
     // LABEL with it, which is how defect 1 happened.
-    const m = ruleBody('.ask-hello--idle').match(/background-color:\s*(#[0-9a-f]{6})/i);
-    expect(m, 'the idle fill should be a flat declared colour').not.toBeNull();
-    expect(contrast(m![1], WHITE)).toBeGreaterThanOrEqual(TEXT_BAR);
+    expect(contrast(fillOf('.ask-hello--idle'), WHITE)).toBeGreaterThanOrEqual(TEXT_BAR);
+  });
+
+  it('CLEARS 4.5:1 on hover', () => {
+    const hover = CSS.match(/\.ask-hello:hover[^{]*\{[^}]*background-color:\s*var\((--[\w-]+)\)/);
+    expect(hover, 'the hover rule should change the fill').not.toBeNull();
+    expect(contrast(tokenHex(hover![1]), WHITE)).toBeGreaterThanOrEqual(TEXT_BAR);
+  });
+
+  it('paints no gradient and runs no animation: the label carries the progress', () => {
+    for (const { selector, body } of askHelloRules()) {
+      expect(body, `${selector} paints a gradient`).not.toMatch(/gradient\(/);
+      expect(body, `${selector} animates`).not.toMatch(/(?:^|[;{\s])animation\s*:/);
+    }
+    expect(BUTTON).not.toContain('ask-hello__sheen');
   });
 
   it('applies NO opacity to the button — that is what broke it the first time', () => {
@@ -376,7 +262,7 @@ describe('Ask Hello — label contrast, from the stylesheet', () => {
     // reduced-motion rule hides the decorative sheen outright and must stay
     // legal, so the bar is "strictly between 0 and 1", not "absent".
     const rules = askHelloRules();
-    expect(rules.length, 'the rule scanner must find the stylesheet').toBeGreaterThanOrEqual(5);
+    expect(rules.length, 'the rule scanner must find the stylesheet').toBeGreaterThanOrEqual(3);
     for (const { selector, body } of rules) {
       const fade = body.match(/(?:^|[;{\s])opacity\s*:\s*([\d.]+)/);
       if (fade) {
@@ -410,19 +296,6 @@ describe('Ask Hello — label contrast, from the stylesheet', () => {
     }
   });
 
-  it('KEEPS THE MOTION ESCAPE HATCH — a looping gradient behind a ten-minute wait', () => {
-    // Deleting the whole `@media (prefers-reduced-motion: reduce)` block for
-    // `.ask-hello` passed every test here AND the palette suite, which only
-    // asserts that index.css contains SOME reduced-motion at-rule — and
-    // another one, unrelated to this button, already satisfied it. Pinned by
-    // selector now: this is a vestibular-safety regression, not a style one.
-    const block = atRuleBlocks('@media (prefers-reduced-motion: reduce)').find((b) =>
-      b.includes('.ask-hello'),
-    );
-    expect(block, 'no reduced-motion block covers .ask-hello').toBeTruthy();
-    expect(block!).toMatch(/\.ask-hello\s*\{[^}]*animation:\s*none/);
-    expect(block!).toMatch(/\.ask-hello__sheen\s*\{[^}]*animation:\s*none/);
-  });
 });
 
 describe('Ask Hello — the focus indicator survives hover', () => {
@@ -638,7 +511,7 @@ describe('Ask Hello — the class list, where two of the three defects lived', (
 });
 
 /**
- * THE SCOREBAR'S ASK HELLO wears the same pill, so it carries the same three
+ * THE SCOREBAR'S ASK HELLO wears the same fill, so it carries the same three
  * risks — and this file only ever read `AskHelloButton.tsx`. The stylesheet
  * maths above covers every `.ask-hello` element; what it cannot see is a
  * utility in THIS component's class list, which is exactly where defects 1

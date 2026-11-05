@@ -169,7 +169,7 @@ export function PhoneAppointmentDetail({
       </dl>
 
       {appointment.source === 'candidate_voice' && appointment.confirmed_at && (
-        <p className="mt-4 rounded-[14px] bg-success-soft px-3.5 py-2.5 text-sm leading-6 text-ink">
+        <p className="mt-4 rounded-control bg-success-soft px-3.5 py-2.5 text-sm leading-6 text-ink">
           Candidate confirmed this callback on {formatIstDateTime(appointment.confirmed_at)}. The
           ten-minute reservation is rechecked again when the callback becomes due.
         </p>
@@ -186,7 +186,7 @@ export function PhoneAppointmentDetail({
         {inFlight ? (
           <p
             role="status"
-            className="mt-3 rounded-[14px] bg-warning-soft px-3.5 py-2.5 text-sm leading-6 text-ink"
+            className="mt-3 rounded-control bg-warning-soft px-3.5 py-2.5 text-sm leading-6 text-ink"
           >
             A call attempt is in progress for this engagement. Rescheduling
             and cancelling are refused while a call is live.

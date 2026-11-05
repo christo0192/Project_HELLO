@@ -173,6 +173,19 @@ describe('Scorecard (legacy v1)', () => {
     expect(screen.getByText('Red flags')).toBeInTheDocument();
   });
 
+  it('keeps a red flag in ink: crimson means a fault on our side', () => {
+    const { container } = render(
+      <Scorecard
+        assessment={{
+          ...baseAssessment,
+          role_fit: { ...baseAssessment.role_fit, red_flags: ['Ended the call early'] },
+        }}
+      />,
+    );
+    expect(screen.getByText('Ended the call early')).toBeInTheDocument();
+    expect(container.querySelector('[data-status-badge="danger"]')).toBeNull();
+  });
+
   it('renders the conflict section when conflicts exist', () => {
     const assessmentWithConflicts: Assessment = {
       ...baseAssessment,

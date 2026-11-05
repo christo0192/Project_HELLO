@@ -13,7 +13,6 @@ import { act, render, screen, fireEvent, waitFor, within } from '@testing-librar
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
-import { ThemeProvider } from '../lib/theme';
 import { DashboardPage } from './DashboardPage';
 import { candidatesHref } from '../components/talent';
 import { ApiError } from '../lib/api-client';
@@ -140,12 +139,10 @@ function CandidatesProbe() {
 function wrap(ui: ReactNode) {
   return (
     <MemoryRouter initialEntries={['/dashboard']}>
-      <ThemeProvider>
         <Routes>
           <Route path="/dashboard" element={ui} />
           <Route path="/candidates" element={<CandidatesProbe />} />
         </Routes>
-      </ThemeProvider>
     </MemoryRouter>
   );
 }
@@ -891,12 +888,11 @@ describe('DashboardPage', () => {
     await expect(container).toHaveNoViolations();
   });
 
-  it('renders under dark + reduced motion without crashing', async () => {
-    stubMatchMedia(true);
+  it('renders under reduced motion without crashing', async () => {
+    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
     listNotificationIntents.mockResolvedValue({ intents: INTENTS });
     renderDashboard();
     expect(await screen.findByText('Recent candidates')).toBeInTheDocument();
-    expect(document.documentElement.classList.contains('dark')).toBe(true);
     expect(
       screen.getByRole('table', { name: 'Pipeline by stage data' }),
     ).toBeInTheDocument();

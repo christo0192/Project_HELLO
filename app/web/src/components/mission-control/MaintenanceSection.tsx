@@ -105,11 +105,11 @@ export function MaintenanceSection() {
 
       <GlassPanel>
         <SectionHeader level={3} title="Current state" />
-        <div className="glass-sunken mt-3 flex flex-wrap items-center gap-3 rounded-[14px] p-4">
+        <div className="glass-sunken mt-3 flex flex-wrap items-center gap-3 rounded-control p-4">
           <StatusBadge tone={meta.tone}>{meta.label}</StatusBadge>
           <p className="text-sm text-ink-secondary">{meta.detail}</p>
         </div>
-        <p className="mt-3 text-[13px] text-ink-tertiary">
+        <p className="mt-3 text-label text-ink-tertiary">
           Status updated {formatUpdatedAt(status.updated_at)} · last change{' '}
           {formatUpdatedAt(status.maintenance?.updated_at)}
         </p>
@@ -122,7 +122,7 @@ export function MaintenanceSection() {
           description="A reason is required for both enabling and disabling — it is written to the audit log."
         />
 
-        <div className="glass-sunken mt-4 rounded-[14px] p-4">
+        <div className="glass-sunken mt-4 rounded-control p-4">
           <Switch
             checked={enabled}
             onCheckedChange={setEnabled}

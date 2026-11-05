@@ -601,10 +601,6 @@ function OverviewTab({
 }) {
   const liveCallRelevant = useLiveCallRelevant(candidate.id, sessions);
   return (
-    // `fade-up-stagger` is the CSS-only reveal: candidate-scoped source may
-    // not import a motion library, and this collapses with every other
-    // animation under the global reduced-motion rule in index.css.
-    //
     // Two columns, not one short card beside a six-card stack. The slim left
     // rail holds who the person is (profile) and the notes; the wide column
     // holds the acting surfaces and the evidence behind them, top to bottom:
@@ -612,7 +608,7 @@ function OverviewTab({
     // the Ashby pipeline, appeals. Below `lg` it is one stack with the wide
     // column first. The rail is deliberately NOT sticky: notes grow, and a
     // sticky box taller than the viewport cannot be scrolled to its end.
-    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
+    <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
       <div className="order-2 space-y-4 lg:order-1 lg:col-span-4">
         <CandidateProfileCard candidate={candidate} className="p-4 sm:p-5" />
 
@@ -1054,7 +1050,7 @@ function PhoneCycleCard({
   return (
     <>
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         Phone screening cycles
       </h2>
       <p className="mt-0.5 text-label text-ink-tertiary">
@@ -1342,7 +1338,7 @@ function NotesSection({ candidateId }: { candidateId: string }) {
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         Notes
       </h2>
       <p className="mb-3 mt-0.5 text-label text-ink-tertiary">
@@ -1427,7 +1423,7 @@ function AppealsSection({
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="text-section text-ink">
         Appeals
       </h2>
       <p className="mb-3 mt-0.5 text-label text-ink-tertiary">
