@@ -92,6 +92,7 @@ Rules:
 8. Candidate-scoped files (see `candidate-scope-palette.test.ts`) may not import `motion` or write raw colours — use the primitives and `.fade-up`.
 9. **A strip, not a card wall.** Related figures share ONE `GlassPanel` and are separated by hairlines inside it (`divide-y divide-[var(--glass-ring)]`, or `gap-px` on a ring-coloured ground as `RubricScale` does), never a grid of identical cards. A block earns its own panel only when it is a separate task. The 18-card dashboard wall is the anti-reference.
 10. **Danger stays quiet until the confirmation.** One `primary` per surface; everything else `secondary` or `ghost`. A destructive action on a row or beside other actions is `danger-quiet`; the filled `danger` appears only on the confirmation step itself (the dialog's confirm button). A filled red button on every row is banned.
+11. **Loading, failed and empty are three different states.** A block shows its empty copy only after its read succeeded. While loading it shows its frame at its final size. When its read fails it names what is missing, says what to do and offers a Retry that re-runs that read alone; a failed figure is a dash and never a 0. It never prints a raw API code: words come from `lib/api-error-copy.ts`, and `ErrorPanel` replaces any machine text it is handed. A failure stays in the panels that needed that read. Only an identity failure (`/api/me`) may take the whole page.
 
 ## 5. Motion (`src/lib/motion.ts`)
 

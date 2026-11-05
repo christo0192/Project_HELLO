@@ -120,6 +120,7 @@ import {
 } from "../components/talent/ResumeReviewBadge";
 import type { StatusTone } from "../components/design/StatusBadge";
 import type { PipelineTone } from "../components/talent";
+import { apiErrorCopy } from "../lib/api-error-copy";
 import { roleAgentName } from "../lib/role-label";
 
 /**
@@ -429,7 +430,9 @@ export function CandidatesPage() {
         setCandidates(rows);
         setEverLoaded(true);
       })
-      .catch((e: ApiError) => { if (gen === loadGen.current) setError(e.message); });
+      .catch((e: unknown) => {
+        if (gen === loadGen.current) setError(`The candidate list did not load. ${apiErrorCopy(e)}`);
+      });
   }, []);
 
   /**

@@ -6,7 +6,7 @@
  * state and axe.
  */
 import { createRef, useMemo, useState } from 'react';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
@@ -739,6 +739,38 @@ describe('ErrorPanel', () => {
     rerender(<ErrorPanel message="Broken." onRetry={() => {}} retryLabel="Reload" compact />);
     expect(screen.getByRole('button', { name: 'Reload' })).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveClass('py-8');
+  });
+});
+
+describe('ErrorPanel never prints a raw code', () => {
+  it('translates a code a caller passed straight through from the API', () => {
+    render(<ErrorPanel message="service_unavailable" />);
+    const alert = screen.getByRole('alert');
+    expect(alert).not.toHaveTextContent('service_unavailable');
+    expect(alert).toHaveTextContent(/could not be read/i);
+  });
+
+  it('never prints an unknown code either', () => {
+    render(<ErrorPanel message="some_future_code" />);
+    const alert = screen.getByRole('alert');
+    expect(alert).not.toHaveTextContent('some_future_code');
+    expect(alert).toHaveTextContent(/could not be loaded/i);
+  });
+
+  it('leaves a caller’s own node alone', () => {
+    render(<ErrorPanel message={<strong>some_future_code</strong>} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('some_future_code');
+  });
+});
+
+describe('ErrorPanel role', () => {
+  it('can leave the announcing to a neighbour, so one failure is not read out four times', () => {
+    const onRetry = vi.fn();
+    render(<ErrorPanel role="none" message="Not available." onRetry={onRetry} />);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByText('Not available.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -30,11 +30,18 @@
  *
  * Surface language: the glass system (docs/design/hello-glass-design-system.md).
  * One `GlassPanel` per logical group, hairlines inside, no card per number.
+ *
+ * FAILURE STAYS WHERE IT HAPPENED. Only `/api/me` can take the whole page: the
+ * role decides which reads and panels exist at all. Every other read fails in
+ * the panels it feeds, with a Retry that re-runs that read alone. The list is
+ * the slowest read and answers 503 when an assessments batch fails (#396); this
+ * page used to wait for it, then throw away the panels that had already loaded.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { api, ApiError } from '../api';
+import { api } from '../api';
 import type { Candidate, CandidatesSummary, MeResponse, NotificationIntent } from '../types';
 import {
   Button,
@@ -52,6 +59,7 @@ import {
 } from '../components/design';
 import type { StatusTone } from '../components/design';
 import { MetricStrip } from '../components/design/MetricStrip';
+import type { MetricItem } from '../components/design/MetricStrip';
 import { BarList, LineChart } from '../components/charts';
 import type { BarListDatum, BarTone } from '../components/charts';
 import { countPerDay, formatDay, formatDayTime } from '../components/charts/dates';
@@ -71,6 +79,7 @@ import {
   appointmentStatusTerm,
   isLiveAppointment,
 } from '../components/phone-calendar/phoneVocabulary';
+import { apiErrorCopy } from '../lib/api-error-copy';
 import { humanizeEnum } from '../lib/humanize';
 import { addIstDays, IST_TIME_ZONE, istDayStartUtcIso, istToday } from '../lib/ist-datetime';
 import type { PhoneCalendarResponse } from '../types';
@@ -113,64 +122,96 @@ const RECOMMENDATION_TONE: Record<string, BarTone> = {
 const nameLinkClass =
   'rounded-sm font-medium text-ink underline-offset-4 transition-colors duration-150 ease-out hover:text-info hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
 
+/**
+ * Runs one read and keeps only the newest call's outcome, so a slow earlier
+ * answer can never overwrite a retry's. A failure arrives as plain copy.
+ */
+function useLatestRead() {
+  const generation = useRef(0);
+  return useCallback(
+    <T,>(read: Promise<T>, onData: (data: T) => void, onError: (copy: string) => void) => {
+      const current = ++generation.current;
+      read
+        .then((data) => {
+          if (current === generation.current) onData(data);
+        })
+        .catch((e: unknown) => {
+          if (current === generation.current) onError(apiErrorCopy(e));
+        });
+    },
+    [],
+  );
+}
+
 export function DashboardPage() {
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
   const [me, setMe] = useState<MeResponse | null>(null);
+  const [meError, setMeError] = useState<string | null>(null);
   const [intents, setIntents] = useState<NotificationIntent[] | null>(null);
+  const [intentsError, setIntentsError] = useState<string | null>(null);
   const [summary, setSummary] = useState<CandidatesSummary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [phoneSchedule, setPhoneSchedule] = useState<PhoneCalendarResponse | null>(null);
   const [phoneScheduleError, setPhoneScheduleError] = useState<string | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [intentsError, setIntentsError] = useState<string | null>(null);
+
+  const readList = useLatestRead();
+  const readMe = useLatestRead();
+  const readIntents = useLatestRead();
+  const readSummary = useLatestRead();
+  const readPhoneSchedule = useLatestRead();
+
+  const loadList = useCallback(() => {
+    setListError(null);
+    setCandidates(null);
+    readList(api.listCandidates(), setCandidates, setListError);
+  }, [readList]);
+
+  // Aggregate assessment metrics (viewer+, owner-scoped server-side).
+  const loadSummary = useCallback(() => {
+    setSummaryError(null);
+    setSummary(null);
+    readSummary(api.getCandidatesSummary(), setSummary, setSummaryError);
+  }, [readSummary]);
+
+  const loadIntents = useCallback(() => {
+    setIntentsError(null);
+    setIntents(null);
+    readIntents(api.listNotificationIntents(), (r) => setIntents(r.intents), setIntentsError);
+  }, [readIntents]);
 
   const load = useCallback(() => {
-    setLoadError(null);
-    setCandidates(null);
+    setMeError(null);
     setMe(null);
     setIntents(null);
-    setSummary(null);
-    setSummaryError(null);
+    setIntentsError(null);
     setPhoneSchedule(null);
     setPhoneScheduleError(null);
-    setIntentsError(null);
 
-    // Aggregate assessment metrics (viewer+, owner-scoped server-side).
-    api
-      .getCandidatesSummary()
-      .then(setSummary)
-      .catch((e: ApiError) => setSummaryError(e.message));
+    loadSummary();
 
-    api
-      .getMe()
-      .then((nextMe) => {
+    readMe(
+      api.getMe(),
+      (nextMe) => {
         setMe(nextMe);
         // Intent data is role-gated; only fetch what the caller can read so
         // the page never makes a doomed 403 call.
         if (nextMe.role !== 'viewer') {
-          api
-            .listNotificationIntents()
-            .then((r) => setIntents(r.intents))
-            .catch((e: ApiError) => setIntentsError(e.message));
+          loadIntents();
 
           // The dashboard only asks for the schedule after the authoritative
           // role response says this account may read it. Viewers therefore
           // never make a phone-calendar request, even transiently.
           const from = istDayStartUtcIso(istToday());
           const to = istDayStartUtcIso(addIstDays(istToday(), 7));
-          api
-            .getPhoneCalendar(from, to)
-            .then(setPhoneSchedule)
-            .catch((e: ApiError) => setPhoneScheduleError(e.message));
+          readPhoneSchedule(api.getPhoneCalendar(from, to), setPhoneSchedule, setPhoneScheduleError);
         }
-      })
-      .catch((e: ApiError) => setLoadError(e.message));
+      },
+      setMeError,
+    );
 
-    api
-      .listCandidates()
-      .then(setCandidates)
-      .catch((e: ApiError) => setLoadError(e.message));
-  }, []);
+    loadList();
+  }, [loadIntents, loadList, loadSummary, readMe, readPhoneSchedule]);
 
   useEffect(load, [load]);
 
@@ -187,33 +228,48 @@ export function DashboardPage() {
     [candidates],
   );
 
-  if (loadError) {
-    return <ErrorPanel message={loadError} onRetry={load} />;
+  if (meError) {
+    return <ErrorPanel message={meError} onRetry={load} />;
   }
-  if (!candidates || !me) {
+  if (!me) {
     return <LoadingPanel label="Loading dashboard…" />;
   }
 
-  // Display keys, so "In screening" (queued + screening) stops counting a
-  // candidate whose phone cycle already ended with no answer or failed.
-  const byStatus = (statuses: string[]) =>
-    candidates.filter((c) => statuses.includes(candidateStatusKey(c))).length;
-
-  const total = candidates.length;
-  const awaiting = byStatus(['new']);
-  const inScreening = byStatus(['queued', 'screening']);
-  const awaitingDecision = byStatus(['screened']);
-  const decided = byStatus(['advanced', 'rejected']);
-  const considered = candidates.filter(
-    (c) => !COMPLETION_EXCLUDED.has(candidateStatusKey(c)),
-  ).length;
-  const completionPct = considered > 0 ? Math.round((decided / considered) * 100) : 0;
-
-  const intakeTrend = countPerDay(candidates);
+  const figures = candidates ? pipelineFigures(candidates) : null;
+  const intakeTrend = candidates ? countPerDay(candidates) : [];
   // A failed phone read leaves those candidates on their stored status, which
   // moves them between the figures below ("In screening" grows, completion's
   // denominator shifts). Said once, never silently.
-  const phoneProgressUnknown = anyPhoneProgressUnknown(candidates);
+  const phoneProgressUnknown = candidates !== null && anyPhoneProgressUnknown(candidates);
+
+  /**
+   * One hero figure in each state of the list. Unread is never a 0: a skeleton
+   * while it loads, a dash and why once it failed, and no link either way, since
+   * neither is a number anyone can drill into.
+   */
+  const heroFigure = (
+    label: string,
+    value: number | undefined,
+    context: string,
+    href: string,
+  ): MetricItem =>
+    value !== undefined
+      ? { label, value: value.toLocaleString(), context, href }
+      : listError
+        ? { label, value: '—', context: 'Could not load' }
+        : { label, value: '', context, loading: true };
+
+  // The hero's notice says what happened, and is the one announcement. Each
+  // other panel that needs the list says so quietly, with the same Retry.
+  const listFailed = listError ? (
+    <ErrorPanel
+      compact
+      role="none"
+      className="h-full min-h-40"
+      message="Not available because the candidate list did not load."
+      onRetry={loadList}
+    />
+  ) : null;
 
   return (
     <div className="pb-4">
@@ -262,32 +318,43 @@ export function DashboardPage() {
           headingLevel={2}
           size="hero"
           items={[
-            {
-              label: 'Candidates',
-              value: total.toLocaleString(),
-              context: 'In the pipeline',
-              href: candidatesHref(),
-            },
-            {
-              label: 'Awaiting screening',
-              value: awaiting.toLocaleString(),
-              context: 'New, not yet screened',
-              href: candidatesHref({ statuses: ['new'] }),
-            },
-            {
-              label: 'In screening',
-              value: inScreening.toLocaleString(),
-              context: 'Queued or on a call',
-              href: candidatesHref({ statuses: ['queued', 'screening'] }),
-            },
-            {
-              label: 'Awaiting decision',
-              value: awaitingDecision.toLocaleString(),
-              context: 'Screened, ready to review',
-              href: candidatesHref({ statuses: ['screened'] }),
-            },
+            heroFigure('Candidates', figures?.total, 'In the pipeline', candidatesHref()),
+            heroFigure(
+              'Awaiting screening',
+              figures?.awaiting,
+              'New, not yet screened',
+              candidatesHref({ statuses: ['new'] }),
+            ),
+            heroFigure(
+              'In screening',
+              figures?.inScreening,
+              'Queued or on a call',
+              candidatesHref({ statuses: ['queued', 'screening'] }),
+            ),
+            heroFigure(
+              'Awaiting decision',
+              figures?.awaitingDecision,
+              'Screened, ready to review',
+              candidatesHref({ statuses: ['screened'] }),
+            ),
           ]}
-        />
+        >
+          {listError && (
+            <div className="border-t border-glass-ring p-3">
+              <InlineNotice
+                tone="danger"
+                role="alert"
+                action={
+                  <Button variant="secondary" size="sm" onClick={loadList}>
+                    Try again
+                  </Button>
+                }
+              >
+                The candidate list did not load. {listError}
+              </InlineNotice>
+            </div>
+          )}
+        </MetricStrip>
       </GlassPanel>
 
       {/* Peers in a row share one bottom edge: the grid stretches each
@@ -296,37 +363,46 @@ export function DashboardPage() {
       <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
         <ChartCard
           title="Pipeline by stage"
-          meta={<CompletionMeta completionPct={completionPct} />}
+          meta={figures ? <CompletionMeta completionPct={figures.completionPct} /> : undefined}
           // Each stage is a link to exactly those candidates.
-          description={`${decided} of ${considered} decided (advanced or rejected).`}
+          description={
+            figures
+              ? `${figures.decided} of ${figures.considered} decided (advanced or rejected).`
+              : undefined
+          }
         >
           {/* Stage order, not size order: the pipeline is a sequence the
               reader already knows, and ranking it would scramble it. */}
-          <BarList
-            title="Pipeline by stage"
-            data={stages}
-            order="none"
-            categoryHeader="Stage"
-            valueHeader="Candidates"
-            linkHint="View these candidates."
-            emptyTitle="No candidates"
-            emptyHint="Stages will appear here once candidates are added."
-          />
+          {listFailed ?? (
+            <BarList
+              title="Pipeline by stage"
+              data={stages}
+              isLoading={candidates === null}
+              order="none"
+              categoryHeader="Stage"
+              valueHeader="Candidates"
+              linkHint="View these candidates."
+              emptyTitle="No candidates"
+              emptyHint="Stages will appear here once candidates are added."
+            />
+          )}
         </ChartCard>
 
         <ChartCard title="Candidates added" description="Per day, last 14 days, all roles.">
-          <LineChart
-            title="Candidates added per day"
-            data={intakeTrend}
-            unit="candidates"
-            isLoading={false}
-            height={200}
-            emptyTitle="No candidates yet"
-            emptyHint="New candidates will appear here as they are added."
-          />
+          {listFailed ?? (
+            <LineChart
+              title="Candidates added per day"
+              data={intakeTrend}
+              unit="candidates"
+              isLoading={candidates === null}
+              height={200}
+              emptyTitle="No candidates yet"
+              emptyHint="New candidates will appear here as they are added."
+            />
+          )}
         </ChartCard>
 
-        <AssessmentsPanel summary={summary} error={summaryError} onRetry={load} />
+        <AssessmentsPanel summary={summary} error={summaryError} onRetry={loadSummary} />
       </div>
 
       {/* Screening scoreboard (0098 + /api/funnel/summary). Placed directly
@@ -343,10 +419,14 @@ export function DashboardPage() {
 
       {/* The same equal-height row as the charts above. */}
       <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
-        <RecentCandidates candidates={candidates} />
+        <RecentCandidates
+          candidates={candidates}
+          unavailable={listFailed ?? <LoadingPanel compact label="Loading candidates…" />}
+        />
         <ActionQueue
           intents={intents}
           intentsError={intentsError}
+          onRetry={loadIntents}
           candidates={candidates}
           viewer={me.role === 'viewer'}
         />
@@ -356,6 +436,28 @@ export function DashboardPage() {
       </div>
     </div>
   );
+}
+
+/** The figures the hero and the stage panel read off the list. */
+function pipelineFigures(candidates: Candidate[]) {
+  // Display keys, so "In screening" (queued + screening) stops counting a
+  // candidate whose phone cycle already ended with no answer or failed.
+  const byStatus = (statuses: string[]) =>
+    candidates.filter((c) => statuses.includes(candidateStatusKey(c))).length;
+
+  const decided = byStatus(['advanced', 'rejected']);
+  const considered = candidates.filter(
+    (c) => !COMPLETION_EXCLUDED.has(candidateStatusKey(c)),
+  ).length;
+  return {
+    total: candidates.length,
+    awaiting: byStatus(['new']),
+    inScreening: byStatus(['queued', 'screening']),
+    awaitingDecision: byStatus(['screened']),
+    decided,
+    considered,
+    completionPct: considered > 0 ? Math.round((decided / considered) * 100) : 0,
+  };
 }
 
 function ArrowIcon() {
@@ -491,20 +593,28 @@ function AssessmentsPanel({
 
 const RECENT_LIMIT = 5;
 
-function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
-  const recent = candidates.slice(0, RECENT_LIMIT);
+function RecentCandidates({
+  candidates,
+  unavailable,
+}: {
+  candidates: Candidate[] | null;
+  /** Shown until the list has been read: its loading or failed state, never "No candidates yet". */
+  unavailable: ReactNode;
+}) {
+  const count = candidates?.length ?? 0;
+  const recent = candidates?.slice(0, RECENT_LIMIT) ?? [];
 
   return (
     <GlassPanel as="section" aria-label="Recent candidates" className="h-full">
       <SectionHeader
         title="Recent candidates"
         meta={
-          candidates.length > 0 ? (
-            <span className="text-label tabular-nums text-ink-tertiary">{candidates.length} total</span>
+          count > 0 ? (
+            <span className="text-label tabular-nums text-ink-tertiary">{count} total</span>
           ) : undefined
         }
         actions={
-          candidates.length > recent.length ? (
+          count > recent.length ? (
             <Link to="/candidates" className={buttonClass('ghost', 'md')}>
               View all
             </Link>
@@ -512,7 +622,9 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
         }
         className="mb-2"
       />
-      {candidates.length === 0 ? (
+      {candidates === null ? (
+        unavailable
+      ) : count === 0 ? (
         <EmptyPanel
           compact
           title="No candidates yet"
@@ -563,16 +675,19 @@ const QUEUE_SCROLL_AFTER = 5;
 function ActionQueue({
   intents,
   intentsError,
+  onRetry,
   candidates,
   viewer,
 }: {
   intents: NotificationIntent[] | null;
   intentsError: string | null;
-  candidates: Candidate[];
+  onRetry: () => void;
+  /** Names only: null until the list is read, and the queue does not wait for it. */
+  candidates: Candidate[] | null;
   viewer: boolean;
 }) {
   const candidateById = useMemo(
-    () => new Map(candidates.map((candidate) => [candidate.id, candidate])),
+    () => new Map((candidates ?? []).map((candidate) => [candidate.id, candidate])),
     [candidates],
   );
 
@@ -595,6 +710,12 @@ function ActionQueue({
                 {candidate ? (
                   <Link to={`/candidates/${candidate.id}`} className={nameLinkClass}>
                     {candidate.name || 'Unnamed candidate'}
+                  </Link>
+                ) : intent.candidate_id && candidates === null ? (
+                  // The list that would name them has not loaded. That says
+                  // nothing about the candidate, who may well still exist.
+                  <Link to={`/candidates/${intent.candidate_id}`} className={nameLinkClass}>
+                    Open candidate
                   </Link>
                 ) : (
                   <span className="text-ink-secondary">
@@ -632,7 +753,7 @@ function ActionQueue({
       ) : intents === null && !intentsError ? (
         <LoadingPanel compact label="Loading action items…" />
       ) : intentsError ? (
-        <ErrorPanel compact message={intentsError} />
+        <ErrorPanel compact message={intentsError} onRetry={onRetry} />
       ) : shown.length === 0 ? (
         <EmptyPanel compact title="You're all caught up. No pending items." />
       ) : shown.length > QUEUE_SCROLL_AFTER ? (

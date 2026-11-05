@@ -23,7 +23,7 @@ import { auditA11y } from './fixtures/axe';
 import { MOCK_API_ORIGIN, MOCK_SUPABASE_ORIGIN } from './fixtures/env';
 import { KEY_STATES, openRoute, revealAddMetric } from './fixtures/flows';
 import { horizontalOverflow } from './fixtures/layout';
-import { expect, test } from './fixtures/harness';
+import { CORS_HEADERS, expect, test } from './fixtures/harness';
 import { ERROR_BOUNDARY_TEXT, ROUTES } from './fixtures/routes';
 import { REALTIME_PATH } from './fixtures/supabase';
 
@@ -355,6 +355,127 @@ test.describe('key states', () => {
     for (const status of ['Live', 'Paused', 'Out of sync']) {
       await expect(page.getByText(status, { exact: true }).first()).toBeVisible();
     }
+    app.expectHealthy();
+  });
+});
+
+/**
+ * Failed reads, in a real browser: what #396's fail-closed 503 looks like on
+ * screen. Each read is answered by a route registered after the harness's, so
+ * it wins for GET and falls back for the CORS preflight the harness answers.
+ */
+test.describe('a failed read stays where it happened', () => {
+  async function failRead(page: Page, path: string, status: number, body: unknown) {
+    const url = `${MOCK_API_ORIGIN}${path}`;
+    await page.route(url, (route) =>
+      route.request().method() === 'GET'
+        ? route.fulfill({ status, headers: CORS_HEADERS(route), contentType: 'application/json', body: JSON.stringify(body) })
+        : route.fallback(),
+    );
+    return () => page.unroute(url);
+  }
+
+  /** Chromium logs every non-2xx itself. Clear only that; anything else still fails the test. */
+  function forgetFailedResponses(app: { consoleErrors: string[] }) {
+    const others = app.consoleErrors.filter((e) => !/Failed to load resource: the server responded with a status of \d+/.test(e));
+    app.consoleErrors.splice(0, app.consoleErrors.length, ...others);
+  }
+
+  const reads = (app: { calls: { method: string; url: string }[] }, path: string) =>
+    app.calls.filter((c) => c.method === 'GET' && new URL(c.url).pathname === path).length;
+
+  test('Dashboard: a list 503 leaves the other panels, in plain words, with a Retry for the list alone', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/candidates', 503, { error: 'service_unavailable' });
+    await app.goto('/dashboard');
+
+    await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeVisible();
+    const pipeline = page.getByRole('group', { name: 'Pipeline' });
+    await expect(pipeline.getByRole('alert')).toContainText('The candidate list did not load.');
+    await expect(pipeline.getByText('Could not load')).toHaveCount(4);
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByText('No candidates yet')).toHaveCount(0);
+
+    // Fed by something else, and still there with their data.
+    await expect(page.getByRole('link', { name: /average assessment score/i })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Screening performance' })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Phone schedule' }).getByRole('group', { name: 'Appointments' })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Action queue' })).toBeVisible();
+    for (const name of ['Pipeline by stage', 'Candidates added', 'Recent candidates']) {
+      await expect(page.getByRole('region', { name }).getByRole('button', { name: 'Try again' })).toBeVisible();
+    }
+    await auditA11y(page, testInfo, 'dashboard-list-503', { strict: true });
+
+    const others = ['/api/me', '/api/candidates/summary', '/api/notifications', '/api/phone/calendar'].map((p) => [p, reads(app, p)] as const);
+    await heal();
+    await pipeline.getByRole('button', { name: 'Try again' }).click();
+
+    await expect(pipeline.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await expect(page.getByRole('table', { name: 'Pipeline by stage data' })).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    for (const [p, before] of others) expect(reads(app, p), `${p} must not be read again`).toBe(before);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Dashboard: a summary 503 stays in Assessments, whose Retry reloads only the summary', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/candidates/summary', 503, { error: 'service_unavailable' });
+    await app.goto('/dashboard');
+
+    const panel = page.getByRole('region', { name: 'Assessments' });
+    await expect(panel.getByRole('alert')).toContainText('could not be read');
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+    await auditA11y(page, testInfo, 'dashboard-summary-503', { strict: true });
+
+    const listReads = reads(app, '/api/candidates');
+    await heal();
+    await panel.getByRole('button', { name: 'Try again' }).click();
+
+    await expect(panel.getByRole('link', { name: /average assessment score/i })).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(reads(app, '/api/candidates')).toBe(listReads);
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Dashboard: a failed /api/me is the only failure that takes the whole page', async ({ app, page }) => {
+    await app.goto('/dashboard');
+    // After boot: this is the page's own read, not the sign-in's role check.
+    const heal = await failRead(page, '/api/me', 503, { error: 'service_unavailable' });
+    await page.getByRole('button', { name: 'Refresh' }).click();
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText('could not be read');
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toHaveCount(0);
+
+    await heal();
+    await alert.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeVisible();
+    await expect(page.getByRole('link', { name: /^Candidates: \d+/ })).toBeVisible();
+
+    forgetFailedResponses(app);
+    app.expectHealthy();
+  });
+
+  test('Candidates: a list 503 reads in plain words with a Retry', async ({ app, page }, testInfo) => {
+    const heal = await failRead(page, '/api/candidates', 503, { error: 'service_unavailable' });
+    await app.goto('/candidates');
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText('The candidate list did not load.');
+    await expect(page.locator('body')).not.toContainText('service_unavailable');
+    await expect(page.getByText('No candidates yet')).toHaveCount(0);
+    await auditA11y(page, testInfo, 'candidates-list-503', { strict: true });
+
+    await heal();
+    await alert.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.getByRole('table').first()).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+
+    forgetFailedResponses(app);
     app.expectHealthy();
   });
 });

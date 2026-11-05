@@ -205,6 +205,56 @@ describe('apiClient', () => {
     }
   });
 
+  describe('the code on ApiError', () => {
+    async function failWith(body: unknown, status = 503, statusText = 'Service Unavailable') {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status,
+        statusText,
+        json: () => (body === undefined ? Promise.reject(new Error('not json')) : Promise.resolve(body)),
+      });
+      return (await apiClient.request('/api/candidates').catch((e: unknown) => e)) as ApiError;
+    }
+
+    it('exposes a bare error string as the code, and keeps it as the message', async () => {
+      const err = await failWith({ error: 'service_unavailable' });
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.code).toBe('service_unavailable');
+      // What every existing caller reads, phoneErrors.ts and lib/r1.ts included.
+      expect(err.message).toBe('service_unavailable');
+      expect(err.status).toBe(503);
+    });
+
+    it('reads the nested envelope: the type is the code, the message stays the message', async () => {
+      const err = await failWith({ error: { type: 'internal_error', message: 'Internal server error' } }, 500);
+      expect(err.code).toBe('internal_error');
+      expect(err.message).toBe('Internal server error');
+    });
+
+    it('does not call a sentence a code', async () => {
+      const err = await failWith({ error: 'No permission' }, 403);
+      expect(err.code).toBeNull();
+      expect(err.message).toBe('No permission');
+    });
+
+    it('has no code when the API sent none', async () => {
+      expect((await failWith({ message: 'Bad gateway' }, 502)).code).toBeNull();
+      expect((await failWith(undefined, 502, 'Bad Gateway')).code).toBeNull();
+    });
+
+    it('has no code on a transport failure', async () => {
+      globalThis.fetch = vi.fn().mockRejectedValue(new Error('Failed to fetch'));
+      const err = (await apiClient.request('/api/roles').catch((e: unknown) => e)) as ApiError;
+      expect(err.status).toBe(0);
+      expect(err.code).toBeNull();
+    });
+
+    it('stays optional for code that builds its own error', () => {
+      expect(new ApiError('x', 500).code).toBeNull();
+      expect(new ApiError('x', 500, 'y').code).toBe('y');
+    });
+  });
+
   it('passes through Content-Type for JSON body', async () => {
     mockAuth.getSessionResult = Promise.resolve({
       data: { session: { access_token: 'tok' } },

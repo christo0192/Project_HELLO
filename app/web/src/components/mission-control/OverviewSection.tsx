@@ -25,6 +25,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type {
   AdminAllowlistEntry,
   AdminAuditRow,
@@ -85,7 +86,7 @@ export function OverviewSection() {
 
     const settle = <T,>(setter: (s: SourceState<T>) => void) => ({
       ok: (data: T) => setter({ data, error: null }),
-      fail: (e: ApiError) => setter({ data: null, error: e.message }),
+      fail: (e: ApiError) => setter({ data: null, error: plainErrorText(e.message) }),
     });
 
     api

@@ -12,6 +12,7 @@
  */
 import { motion } from 'motion/react';
 import type { ReactNode } from 'react';
+import { plainErrorText } from '../../lib/api-error-copy';
 import { usePanelVariants } from '../../lib/motion';
 import { Button } from './Button';
 import { cx } from './cx';
@@ -111,17 +112,33 @@ export function EmptyPanel({ title, hint, action, icon, compact = false, classNa
 }
 
 export interface ErrorPanelProps {
+  /**
+   * Text goes through `plainErrorText`: most callers pass an API error's message
+   * straight in, and a raw code must not reach the page from any of them.
+   */
   message: ReactNode;
   onRetry?: () => void;
   retryLabel?: string;
   compact?: boolean;
   className?: string;
+  /**
+   * `'none'` when several panels show one failure and a neighbour already
+   * announces it: four alerts for one failed read is four interruptions.
+   */
+  role?: 'alert' | 'none';
 }
 
-export function ErrorPanel({ message, onRetry, retryLabel = 'Try again', compact = false, className }: ErrorPanelProps) {
+export function ErrorPanel({
+  message,
+  onRetry,
+  retryLabel = 'Try again',
+  compact = false,
+  className,
+  role = 'alert',
+}: ErrorPanelProps) {
   return (
     <div
-      role="alert"
+      role={role === 'none' ? undefined : role}
       className={cx(
         'flex flex-col items-center justify-center rounded-[14px] bg-error-soft text-center',
         compact ? 'px-4 py-8' : 'px-6 py-12',
@@ -129,7 +146,9 @@ export function ErrorPanel({ message, onRetry, retryLabel = 'Try again', compact
       )}
     >
       <span aria-hidden="true" className="mb-3 h-2 w-2 rounded-full bg-error" />
-      <p className="max-w-md text-pretty text-sm text-ink">{message}</p>
+      <p className="max-w-md text-pretty text-sm text-ink">
+        {typeof message === 'string' ? plainErrorText(message) : message}
+      </p>
       {onRetry && (
         <Button variant="secondary" size="sm" onClick={onRetry} className="mt-4">
           {retryLabel}

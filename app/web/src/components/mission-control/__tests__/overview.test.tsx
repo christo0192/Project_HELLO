@@ -207,6 +207,14 @@ describe('OverviewSection', () => {
     expect(within(sessions).queryByText('0')).not.toBeInTheDocument();
   });
 
+  it('never prints a raw code beside a source label', async () => {
+    apiFns.listAdminSessions.mockRejectedValue(new missionApi.ApiError('service_unavailable', 503));
+    renderOverview();
+    expect(await screen.findByText(/Session status mix: The data could not be read/)).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent('service_unavailable');
+    expect(figureCell('Sessions').querySelector('[title="service_unavailable"]')).toBeNull();
+  });
+
   it('recovers via the per-source retry', async () => {
     apiFns.listAdminSessions.mockRejectedValueOnce(new missionApi.ApiError('sessions down', 500));
     renderOverview();

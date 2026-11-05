@@ -107,7 +107,8 @@ describe('MissionControlPage', () => {
   it('shows an error state with retry when access cannot be checked', async () => {
     apiFns.getMe.mockRejectedValue(new missionApi.ApiError('unauthorized', 403));
     renderPage();
-    expect(await screen.findByText('unauthorized')).toBeInTheDocument();
+    expect(await screen.findByText(/your session has ended/i)).toBeInTheDocument();
+    expect(screen.queryByText('unauthorized')).not.toBeInTheDocument();
     apiFns.getMe.mockResolvedValue(ADMIN_ME);
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
     expect(await screen.findByRole('tablist', { name: 'Mission Control sections' })).toBeInTheDocument();

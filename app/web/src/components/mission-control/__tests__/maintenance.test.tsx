@@ -142,7 +142,8 @@ describe('MaintenanceSection', () => {
   it('shows an error state with retry when status fails', async () => {
     apiFns.status.mockRejectedValue(new missionApi.ApiError('down', 500));
     renderMaintenance();
-    expect(await screen.findByText('down')).toBeInTheDocument();
+    expect(await screen.findByText(/could not be loaded/i)).toBeInTheDocument();
+    expect(screen.queryByText('down')).not.toBeInTheDocument();
     apiFns.status.mockResolvedValue(OK_STATUS);
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
     expect(await screen.findByText('Current state')).toBeInTheDocument();

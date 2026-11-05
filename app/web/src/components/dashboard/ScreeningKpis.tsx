@@ -35,6 +35,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { apiErrorCopy } from '../../lib/api-error-copy';
 import type { FunnelDailyRow, FunnelSummaryResponse, Role } from '../../types';
 import { ErrorPanel, GlassPanel, InlineNotice, SectionHeader, controlClass, cx } from '../design';
 import { MetricStrip } from '../design/MetricStrip';
@@ -129,11 +130,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
         setData(null);
         return;
       }
-      setError(
-        err instanceof ApiError
-          ? err.message
-          : 'Could not load screening metrics.',
-      );
+      setError(apiErrorCopy(err));
       setData(null);
     } finally {
       if (seq === requestSeq.current) setLoading(false);

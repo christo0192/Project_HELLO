@@ -935,6 +935,15 @@ describe('ScreeningKpis', () => {
     expect(await cardText('Advance rate')).toContain('—');
   });
 
+  it('says a failed read in plain words, never the raw code', async () => {
+    getScreeningFunnel.mockRejectedValue(new FakeApiError('service_unavailable', 503));
+    renderKpis();
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/Screening metrics unavailable/i);
+    expect(alert).toHaveTextContent(/could not be read/i);
+    expect(alert).not.toHaveTextContent('service_unavailable');
+  });
+
   it('degrades to a retryable error instead of a blank panel', async () => {
     getScreeningFunnel.mockRejectedValue(new FakeApiError('boom', 500));
     renderKpis();

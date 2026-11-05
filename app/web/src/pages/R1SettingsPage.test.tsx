@@ -88,7 +88,9 @@ describe('loading and access', () => {
     api.getR1Settings.mockRejectedValueOnce(new ApiError('service_unavailable', 503));
     const user = userEvent.setup();
     renderPage();
-    expect(await screen.findByRole('alert')).toHaveTextContent('service_unavailable');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/could not be read/i);
+    expect(alert).not.toHaveTextContent('service_unavailable');
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     await loaded();
   });
