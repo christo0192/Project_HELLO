@@ -41,6 +41,11 @@
  * `stage_move` operations are filtered out entirely. This lane shows the
  * invite and scorecard legs only; stage movement is neither shown nor
  * controllable here.
+ *
+ * A delivered `scorecard_write` also says WHEN the session it came from was
+ * created (`sessionCreatedAt`), so a page can tell whether the write belongs to
+ * the session on screen. That is a time and not an id: the candidate read
+ * already lists it beside that session, so it adds nothing a viewer lacks.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -77,6 +82,13 @@ export interface CandidateAshbyWorkflowOperation {
   state: string;
   /** Sanitized stable code from 0029's CHECK, or null. Never a provider body. */
   errorCode: string | null;
+  /** When this leg last changed; for a succeeded `scorecard_write`, when it reached Ashby. */
+  updatedAt: string | null;
+  /**
+   * A succeeded `scorecard_write` only: when the session it came from was created. Absent when that
+   * read failed or there is no such session, which a page must read as "not known to be this one".
+   */
+  sessionCreatedAt?: string;
 }
 
 export interface CandidateAshbyWorkflowView {
@@ -119,6 +131,7 @@ interface RawOperation {
   state?: unknown;
   error_code?: unknown;
   updated_at?: unknown;
+  source_session_id?: unknown;
 }
 export interface RawCandidateWorkflowRow {
   lifecycle?: unknown;
@@ -140,6 +153,31 @@ function isReportedType(value: unknown): value is CandidateWorkflowOperationType
   return (CANDIDATE_WORKFLOW_OPERATION_TYPES as readonly string[]).includes(value as string);
 }
 
+/** The latest row of each reported leg: `updated_at` wins, ties resolved by input order. */
+function latestOperations(row: RawCandidateWorkflowRow) {
+  const latest = new Map<CandidateWorkflowOperationType, { raw: RawOperation; state: string; at: string }>();
+  for (const raw of asArray(row.ashby_operations)) {
+    if (!isReportedType(raw.operation_type)) continue;
+    if (typeof raw.state !== 'string') continue;
+    const at = typeof raw.updated_at === 'string' ? raw.updated_at : '';
+    const existing = latest.get(raw.operation_type);
+    if (existing && existing.at >= at) continue;
+    latest.set(raw.operation_type, { raw, state: raw.state, at });
+  }
+  return latest;
+}
+
+/**
+ * The session a delivered scorecard came from: the write's own, else the link's, as 0134 reads it.
+ * null when no scorecard reached Ashby. Stays inside the API: only its time is ever emitted.
+ */
+export function deliveredScorecardSessionId(row: RawCandidateWorkflowRow): string | null {
+  const write = latestOperations(row).get('scorecard_write');
+  if (write?.state !== 'succeeded') return null;
+  const source = write.raw.source_session_id ?? row.session_id;
+  return typeof source === 'string' && source.length > 0 ? source : null;
+}
+
 /**
  * Pure row → view projection. Exported so the sanitization contract can be
  * tested without a database.
@@ -151,23 +189,21 @@ function isReportedType(value: unknown): value is CandidateWorkflowOperationType
 export function projectCandidateWorkflow(
   row: RawCandidateWorkflowRow,
   sessionStatus: string | null,
+  scorecardSessionCreatedAt: string | null = null,
 ): CandidateAshbyWorkflowView {
-  const latestByType = new Map<CandidateWorkflowOperationType, { op: CandidateAshbyWorkflowOperation; at: string }>();
-  for (const raw of asArray(row.ashby_operations)) {
-    if (!isReportedType(raw.operation_type)) continue;
-    if (typeof raw.state !== 'string') continue;
-    const at = typeof raw.updated_at === 'string' ? raw.updated_at : '';
-    const existing = latestByType.get(raw.operation_type);
-    if (existing && existing.at >= at) continue;
-    latestByType.set(raw.operation_type, {
-      at,
-      op: {
-        type: raw.operation_type,
-        state: raw.state,
-        errorCode: typeof raw.error_code === 'string' ? raw.error_code : null,
-      },
-    });
-  }
+  const latest = latestOperations(row);
+  const project = (type: CandidateWorkflowOperationType): CandidateAshbyWorkflowOperation | null => {
+    const leg = latest.get(type);
+    if (!leg) return null;
+    const delivered = type === 'scorecard_write' && leg.state === 'succeeded';
+    return {
+      type,
+      state: leg.state,
+      errorCode: typeof leg.raw.error_code === 'string' ? leg.raw.error_code : null,
+      updatedAt: leg.at.length > 0 ? leg.at : null,
+      ...(delivered && scorecardSessionCreatedAt ? { sessionCreatedAt: scorecardSessionCreatedAt } : {}),
+    };
+  };
 
   const ingestion = asArray(row.ashby_resume_ingestions)[0];
 
@@ -175,7 +211,7 @@ export function projectCandidateWorkflow(
     lifecycle: typeof row.lifecycle === 'string' ? row.lifecycle : 'imported',
     terminalState: typeof row.terminal_state === 'string' ? row.terminal_state : null,
     ingestionState: typeof ingestion?.state === 'string' ? ingestion.state : null,
-    operations: CANDIDATE_WORKFLOW_OPERATION_TYPES.map((t) => latestByType.get(t)?.op).filter(
+    operations: CANDIDATE_WORKFLOW_OPERATION_TYPES.map(project).filter(
       (o): o is CandidateAshbyWorkflowOperation => o != null,
     ),
     sessionStatus,
@@ -211,7 +247,7 @@ export function createCandidateWorkflowStore(client: SupabaseClient): CandidateA
   const SELECT =
     'lifecycle, terminal_state, session_id, updated_at, intake_type, profile_outcome, ' +
     'ashby_resume_ingestions ( state ), ' +
-    'ashby_operations ( operation_type, state, error_code, updated_at )';
+    'ashby_operations ( operation_type, state, error_code, updated_at, source_session_id )';
   const OPERATION_LIMIT = 20;
 
   /** Session status is a strictly additive diagnostic — a failure degrades to null. */
@@ -226,6 +262,23 @@ export function createCandidateWorkflowStore(client: SupabaseClient): CandidateA
       if (error) return null;
       const status = (data as { status?: unknown } | null)?.status;
       return typeof status === 'string' ? status : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Also additive: with no time a page shows no "sent" note, which claims nothing. */
+  async function readSessionCreatedAt(sessionId: string | null): Promise<string | null> {
+    if (sessionId === null) return null;
+    try {
+      const { data, error } = await client
+        .from('call_sessions')
+        .select('created_at')
+        .eq('id', sessionId)
+        .maybeSingle();
+      if (error) return null;
+      const createdAt = (data as { created_at?: unknown } | null)?.created_at;
+      return typeof createdAt === 'string' && createdAt.length > 0 ? createdAt : null;
     } catch {
       return null;
     }
@@ -253,7 +306,11 @@ export function createCandidateWorkflowStore(client: SupabaseClient): CandidateA
 
     const row = ((data ?? []) as RawCandidateWorkflowRow[])[0];
     if (!row) return null;
-    return projectCandidateWorkflow(row, await readSessionStatus(row.session_id));
+    const [sessionStatus, scorecardSessionCreatedAt] = await Promise.all([
+      readSessionStatus(row.session_id),
+      readSessionCreatedAt(deliveredScorecardSessionId(row)),
+    ]);
+    return projectCandidateWorkflow(row, sessionStatus, scorecardSessionCreatedAt);
   }
 
   return {

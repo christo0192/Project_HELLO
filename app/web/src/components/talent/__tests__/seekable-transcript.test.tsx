@@ -5,7 +5,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { SeekableTranscript } from '../SeekableTranscript';
-import { clockText } from '../../../lib/r1-recording';
+import { timecode } from '../../recording/callStripGeometry';
 import type { TranscriptLine } from '../../../types';
 
 const TIMED: TranscriptLine[] = [
@@ -60,6 +60,15 @@ describe('SeekableTranscript', () => {
     expect(onSeek).toHaveBeenCalledWith(3.5, 1);
   });
 
+  it('prints the fold\'s ≈ in the consent row\'s margin, as every other row of an estimated call does', () => {
+    const fold = { firstIndex: 0, lastIndex: 1, line: 'Consent given at ≈00:03', showLabel: 'Show 2 turns', atSec: 0, turnsLabel: 'T1–2', onShow: vi.fn() };
+    const props = { transcript: TIMED, activeTurnIndex: null, onSeek: vi.fn(), recordingReady: true };
+    const { rerender } = render(<SeekableTranscript {...props} consent={{ ...fold, approximate: true }} />);
+    expect(document.querySelector('[data-consent-line]')).toHaveTextContent(/^≈00:00T1–2/);
+    rerender(<SeekableTranscript {...props} consent={{ ...fold, approximate: false }} />);
+    expect(document.querySelector('[data-consent-line]')).toHaveTextContent(/^00:00T1–2/);
+  });
+
   it('renders timed turns as buttons (always, even without recordingReady)', () => {
     render(
       <SeekableTranscript
@@ -111,7 +120,7 @@ describe('SeekableTranscript', () => {
     expect(status).toBeEmptyDOMElement();
   });
 
-  it('labels a turn by rounding down, the same rule as the player clock (clockText)', () => {
+  it('labels a turn by rounding down, the same rule as the player clock (timecode)', () => {
     render(
       <SeekableTranscript
         transcript={[{ speaker: 'bot', text: 'Late in a second.', start_offset_sec: 65.9 }]}
@@ -120,8 +129,8 @@ describe('SeekableTranscript', () => {
         recordingReady={true}
       />,
     );
-    expect(screen.getByRole('button', { name: /At 1:05\./ })).toHaveTextContent(clockText(65.9));
-    expect(clockText(65.9)).toBe('1:05');
+    expect(screen.getByRole('button', { name: /At 01:05\./ })).toHaveTextContent(timecode(65.9));
+    expect(timecode(65.9)).toBe('01:05');
   });
 
   it('marks the active turn with a tint and a leading dot, never a side stripe', () => {
@@ -183,9 +192,9 @@ describe('SeekableTranscript', () => {
     );
     expect(screen.queryByRole('button')).toBeNull();
     expect(screen.queryByText(/no timing data/i)).toBeNull();
-    expect(screen.getByText('0:02')).toBeInTheDocument();
-    expect(screen.getByText('1:05')).toBeInTheDocument();
-    expect(screen.getByLabelText(/Turn 1: .*0:02 into the call.*Recording failed for this call/)).toBeInTheDocument();
+    expect(screen.getByText('00:02')).toBeInTheDocument();
+    expect(screen.getByText('01:05')).toBeInTheDocument();
+    expect(screen.getByLabelText(/Turn 1: .*00:02 into the call.*Recording failed for this call/)).toBeInTheDocument();
     // Every turn has a time, so the "saved without timing" banner stays away.
     expect(screen.queryByText(/saved without timing/i)).toBeNull();
   });

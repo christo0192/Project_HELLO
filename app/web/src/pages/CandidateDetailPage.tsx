@@ -4,8 +4,10 @@ import { Link, useLocation, useParams, useSearchParams } from "react-router-dom"
 import { api, ApiError } from "../api";
 import { supabase } from "../lib/supabase";
 import { cx } from "../components/design/cx";
+import { buttonClass } from "../components/design/Button";
 import type {
   AppealRow,
+  AshbyCandidateWorkflow,
   CandidateDetail,
   MeResponse,
   Note,
@@ -92,10 +94,15 @@ import type { PhoneSlot } from "../types";
  * primary action for the candidate's state, chosen from what the page
  * already offers rather than invented:
  *   - a screening to read   → "Review screening" opens the Review tab
+ *   - reading it, on Review → "Open in Ashby to decide", when there is an Ashby
+ *                             link and no appeal blocks decision use
  *   - nothing screened yet  → "Call candidate" opens the phone card's own
  *                             confirmation step (same request, same gates)
  *   - otherwise             → no primary; the status says what is happening
  * Export is the secondary beside it.
+ *
+ * On the Review tab the header is compact, because the log header below it
+ * carries the role and the length, and the reasoning pane carries the score.
  *
  * The latest screening score sits top right of the header (HeaderScore).
  *
@@ -107,6 +114,12 @@ import type { PhoneSlot } from "../types";
  */
 
 type CandidateTab = "overview" | "review";
+
+/** Only ever a link into Ashby's own app, whatever a payload says. */
+function ashbyDecisionUrl(workflow: AshbyCandidateWorkflow | null | undefined): string | null {
+  const url = workflow?.ashbyProfileUrl;
+  return typeof url === "string" && url.startsWith("https://app.ashbyhq.com/") ? url : null;
+}
 
 /** Something to review: an assessment, or a completed session (transcript, recording). */
 function hasReviewable(d: Pick<CandidateDetail, "assessments" | "sessions"> | null): boolean {
@@ -256,6 +269,28 @@ export function CandidateDetailPage() {
     };
   }, [roleId]);
 
+  // The candidate's Ashby workflow, for the Review tab's log header and its one
+  // action. `null` only when the read says there is no Ashby link. `undefined`
+  // while it is unknown, reading or failed: the page then offers no Ashby action,
+  // and the log header must not say "Not linked". Guarded as `listRoles` is above.
+  const [ashbyWorkflow, setAshbyWorkflow] = useState<AshbyCandidateWorkflow | null | undefined>(undefined);
+  useEffect(() => {
+    let live = true;
+    if (!id) return;
+    setAshbyWorkflow(undefined);
+    Promise.resolve()
+      .then(() => (typeof api.getCandidateAshbyWorkflow === "function" ? api.getCandidateAshbyWorkflow(id) : null))
+      .then((result) => {
+        if (live) setAshbyWorkflow(result ? (result.workflow ?? null) : undefined);
+      })
+      .catch(() => {
+        if (live) setAshbyWorkflow(undefined);
+      });
+    return () => {
+      live = false;
+    };
+  }, [id]);
+
   // ONE attempt list for the page, shared by the Overview rail and the Review
   // tab's call recordings. Each copy is mounted only while its tab is open
   // (one player at a time), so self-loading copies would refetch on every tab
@@ -323,11 +358,35 @@ export function CandidateDetailPage() {
    * says there is nothing yet, which is not worth a primary action.
    */
   const reviewable = hasReviewable(detail);
+  // The compact header goes with the workspace, which needs a completed session.
+  const reviewing = tab === "review" && sessions.some((session) => session.status === "completed");
+  const ashbyUrl = ashbyDecisionUrl(ashbyWorkflow);
 
   let primaryAction: ReactNode = null;
   if (reviewable) {
-    // Hidden while the Review tab is open: there it would do nothing.
-    if (tab !== "review") {
+    if (tab === "review") {
+      // While an appeal blocks decision use, the page invites no decision.
+      if (ashbyUrl && !decisionBlocked) {
+        primaryAction = (
+          <>
+            <p className="text-right text-label leading-[1.125rem] text-ink-secondary">
+              The decision is made in Ashby.
+              <br />
+              This page is the evidence.
+            </p>
+            <a
+              href={ashbyUrl}
+              target="_blank"
+              rel="noreferrer"
+              className={buttonClass("primary", "md")}
+            >
+              Open in Ashby to decide
+              <span className="sr-only"> (opens in a new tab)</span>
+            </a>
+          </>
+        );
+      }
+    } else {
       primaryAction = (
         <CandidateButton
           variant="primary"
@@ -365,15 +424,19 @@ export function CandidateDetailPage() {
     : "/candidates";
 
   return (
-    <CandidateShell variant="inset">
+    <CandidateShell variant="inset" className={cx(reviewing && "min-[1180px]:pt-3")}>
       <Link
         to={backToList}
-        className="mb-3 inline-flex min-h-11 items-center gap-1 text-sm text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+        className={cx(
+          "inline-flex items-center gap-1 text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]",
+          reviewing ? "min-h-6 text-meta" : "mb-3 min-h-11 text-sm",
+        )}
       >
         ← Back to candidates
       </Link>
 
       <CandidateHeader
+        compact={reviewing}
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
         // Directly under the name, above the tabs: where the candidate is
@@ -397,14 +460,17 @@ export function CandidateDetailPage() {
                 its own detail; nothing on an API without the field. */}
             <IntakeBadge value={candidate.intake_type} />
             <CandidateHeadlineFacts
-              roleTitle={roleTitle}
-              callSeconds={headline?.callSeconds ?? null}
-              recordedSeconds={headline?.recordedSeconds ?? null}
-              recordedCalls={headline?.recordedCalls ?? null}
-              recordedUnknownCalls={headline?.recordedUnknownCalls ?? null}
+              // On Review the log header prints the role and the length.
+              roleTitle={reviewing ? null : roleTitle}
+              callSeconds={reviewing ? null : (headline?.callSeconds ?? null)}
+              recordedSeconds={reviewing ? null : (headline?.recordedSeconds ?? null)}
+              recordedCalls={reviewing ? null : (headline?.recordedCalls ?? null)}
+              recordedUnknownCalls={reviewing ? null : (headline?.recordedUnknownCalls ?? null)}
               // From THE SAME session as the length, or the two figures
-              // describe different calls while sitting side by side.
-              candidateWords={headline?.candidateWords ?? null}
+              // describe different calls while sitting side by side. On Review
+              // the log header describes the SELECTED session, which need not be
+              // the longest, so this figure goes with the length it belongs to.
+              candidateWords={reviewing ? null : (headline?.candidateWords ?? null)}
             />
           </div>
         }
@@ -415,9 +481,10 @@ export function CandidateDetailPage() {
           </>
         }
         // The score is the page's most important number: top right, under
-        // the actions, hidden while an appeal blocks decision use.
+        // the actions, hidden while an appeal blocks decision use. On Review the
+        // reasoning pane carries it, against the session it belongs to.
         aside={
-          decisionBlocked ? undefined : (
+          decisionBlocked || reviewing ? undefined : (
             <HeaderScore assessments={assessments} sessions={sessions} />
           )
         }
@@ -425,7 +492,7 @@ export function CandidateDetailPage() {
 
       {decisionBlocked && <DecisionBlockedBanner />}
 
-      <div ref={tabsRef} className="mt-6">
+      <div ref={tabsRef} className={reviewing ? "mt-0" : "mt-6"}>
         <Tabs
           ariaLabel="Candidate sections"
           selectedId={tab}
@@ -444,6 +511,10 @@ export function CandidateDetailPage() {
                   // Both tab panels stay mounted: an R1 recording must not keep playing
                   // behind the other tab.
                   active={tab === "review"}
+                  candidateName={candidate.name}
+                  roleTitle={roleTitle}
+                  ashbyWorkflow={ashbyWorkflow}
+                  resumeFacts={candidate.parsed}
                   // Mounted only while Review is the open tab (and the Overview
                   // copy only while Overview is): one player on the page at a
                   // time, and switching tabs unmounts the <audio>, so nothing

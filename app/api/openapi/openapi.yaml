@@ -9260,6 +9260,15 @@ components:
           type: string
           nullable: true
           description: Sanitized stable code only (`^[a-z0-9_.:-]{1,64}$` per the 0029 CHECK). Free-text error_detail is never exposed here.
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: When this leg last changed; for a succeeded scorecard_write, when the scorecard reached Ashby. Null when the row carries no usable timestamp, never a fabricated one. Optional so an older API stays valid.
+        sessionCreatedAt:
+          type: string
+          format: date-time
+          description: A succeeded scorecard_write only, when the session it came from was created, so a page can tell whether the write belongs to the session on screen. A time and never a session id; the candidate read already lists it beside that session. Absent when it could not be read.
       additionalProperties: false
 
     AshbyCandidateWorkflow:

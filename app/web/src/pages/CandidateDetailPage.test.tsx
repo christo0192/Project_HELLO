@@ -247,9 +247,9 @@ describe('CandidateDetailPage', () => {
       candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 450 }],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
 
-    expect(await screen.findByText('Sales Advisor')).toBeInTheDocument();
+    expect(await screen.findByText('Sales Advisor', { ignore: 'dd' })).toBeInTheDocument();
     expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain('7m 14s');
     // Labelled for WHAT IT MEASURES. `duration_sec` is wall clock from session
     // start to finalize — bot speech, candidate speech, ring and silence — so
@@ -271,7 +271,7 @@ describe('CandidateDetailPage', () => {
       ...mockCandidateDetail,
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 480, candidate_words: 12 }],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText(/Profile/);
     const words = document.querySelector('[data-candidate-words]');
     expect(words?.textContent).toContain('12');
@@ -289,12 +289,27 @@ describe('CandidateDetailPage', () => {
         { ...mockCandidateDetail.sessions[0], id: 's-old', duration_sec: 434, candidate_words: 450 },
       ],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText(/Profile/);
     expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain('7m 14s');
     // ...and the words come from THE SAME session, or the two figures
     // describe different calls while sitting side by side.
     expect(document.querySelector('[data-candidate-words]')?.textContent).toContain('450');
+  });
+
+  it('on Review the header drops the word count: it is the longest call, and the sheet shows another', async () => {
+    // The log header describes the SELECTED session, so the longest call's words beside it would
+    // read as the wrong call's.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [
+        { ...mockCandidateDetail.sessions[0], id: 's-new', duration_sec: 9, candidate_words: 3 },
+        { ...mockCandidateDetail.sessions[0], id: 's-old', duration_sec: 434, candidate_words: 450 },
+      ],
+    });
+    renderDetailPage('candidate-1', '?tab=review');
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-words]')).toBeNull();
   });
 
   it('shows no call badge at all when nothing completed', async () => {
@@ -320,11 +335,11 @@ describe('CandidateDetailPage', () => {
       candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 450 }],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
 
     // The role arrives on its own request, AFTER the name renders — waiting on
     // the heading alone would assert against a half-filled header.
-    await screen.findByText('Sales Advisor');
+    await screen.findByText('Sales Advisor', { ignore: 'dd' });
     const heading = screen.getByRole('heading', { level: 1, name: 'Jane Doe' });
     const role = document.querySelector('[data-candidate-role-title]');
     const length = document.querySelector('[data-candidate-call-length]');
@@ -351,7 +366,7 @@ describe('CandidateDetailPage', () => {
       ...mockCandidateDetail,
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: null }],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText(/Profile/);
     // The call still happened, so its length is still shown...
     expect(document.querySelector('[data-candidate-call-length]')).not.toBeNull();
@@ -366,7 +381,7 @@ describe('CandidateDetailPage', () => {
       ...mockCandidateDetail,
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 0 }],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText(/Profile/);
     const words = document.querySelector('[data-candidate-words]');
     expect(words?.textContent).toContain('0');
@@ -423,8 +438,8 @@ describe('CandidateDetailPage', () => {
       ...mockCandidateDetail,
       candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
     });
-    renderDetailPage();
-    await screen.findByText('Sales Advisor');
+    renderDetailPage('candidate-1', '?tab=overview');
+    await screen.findByText('Sales Advisor', { ignore: 'dd' });
     expect(document.querySelector('[data-candidate-role-title]')?.textContent).toContain('Role:');
   });
 
@@ -584,7 +599,8 @@ describe('CandidateDetailPage', () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     expect(screen.getAllByText('Abandoned: dropped before screening').length).toBeGreaterThanOrEqual(2);
-    expect(screen.queryByText('Screening')).toBeNull();
+    // Not the log header's "Screening" label: the status.
+    expect(screen.queryByText('Screening', { ignore: 'dt' })).toBeNull();
     expect(screen.queryByText('Queued')).toBeNull();
     expect(screen.queryByText('Phone screen failed')).toBeNull();
     // The detail line says WHY, from the held assessment's evidence reason.
@@ -608,7 +624,7 @@ describe('CandidateDetailPage', () => {
         candidate_words: 4,
       }],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText(/Profile/);
     expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe(
       'Recorded 1m 11s across 2 calls',
@@ -631,7 +647,7 @@ describe('CandidateDetailPage', () => {
         connected_total_sec: 34.6,
       }],
     });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText(/Profile/);
     expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe('Recorded 33s');
     expect(document.querySelector('[data-candidate-call-length]')?.textContent).toBe('35s on the call');
@@ -1093,10 +1109,13 @@ describe('CandidateDetailPage', () => {
     await screen.findByText('Jane Doe');
     fireEvent.click(reviewTab());
     expect(await screen.findByText('Scorecard for this session')).toBeInTheDocument();
-    // The figure is on the Review scorecard AND, as the latest screening, in the header.
+    // The figure is on the Review scorecard. The header's copy steps aside while Review is open, because
+    // the reasoning pane carries it against the session it belongs to, and comes back on the Overview.
     const review = screen.getByRole('tabpanel', { name: 'Review' });
     expect(within(review).getByText('78')).toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: 'Latest screening score' })).getByText('78')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Latest screening score' })).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
+    expect(within(await screen.findByRole('region', { name: 'Latest screening score' })).getByText('78')).toBeInTheDocument();
   });
 
   it('opens on Review by default when there is something to review, Overview when there is not', async () => {
@@ -1115,7 +1134,7 @@ describe('CandidateDetailPage', () => {
   });
 
   it('shows the latest screening score in the header with its recommendation, never 0', async () => {
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText('Jane Doe');
     const score = screen.getByRole('region', { name: 'Latest screening score' });
     expect(within(score).getByText('78')).toBeInTheDocument();
@@ -1126,7 +1145,7 @@ describe('CandidateDetailPage', () => {
 
   it('shows "Not scored" in the header when the candidate has no assessment', async () => {
     mockApi.getCandidate.mockResolvedValue({ ...mockCandidateDetail, assessments: [] });
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText('Jane Doe');
     const score = screen.getByRole('region', { name: 'Latest screening score' });
     expect(within(score).getByText('Not scored')).toBeInTheDocument();
@@ -1517,6 +1536,88 @@ describe('Ashby pipeline card on the Overview', () => {
     );
   });
 
+  describe('"Open in Ashby to decide"', () => {
+    const ASHBY_URL = 'https://app.ashbyhq.com/candidates/00000000-0000-4000-8000-000000000001';
+    const linkedTo = (ashbyProfileUrl: string) => ({
+      ok: true,
+      workflow: {
+        lifecycle: 'completed',
+        terminalState: null,
+        ingestionState: null,
+        operations: [],
+        sessionStatus: 'completed',
+        updatedAt: null,
+        ashbyProfileUrl,
+      },
+    });
+    /** The workflow has landed once the log header prints its lifecycle. */
+    const workflowShown = () =>
+      waitFor(() => expect(screen.getByText('In Ashby').parentElement).toHaveTextContent('Screening complete'));
+    const live = { ...mockCandidateDetail, sessions: [{ ...mockCandidateDetail.sessions[0], mode: 'live' }] };
+
+    beforeEach(() => {
+      mockApi.listRoles.mockResolvedValue([]);
+      mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });
+      mockApi.getCandidatePhoneScreenings.mockResolvedValue({ ok: true, enabled: true, cycles: [], current_cycle: null });
+      mockApi.getSession.mockResolvedValue(mockSessionDetail);
+    });
+
+    it('is the one primary action, beside the sentence, with a link into Ashby', async () => {
+      mockApi.getCandidate.mockResolvedValue(live);
+      mockApi.getCandidateAshbyWorkflow.mockResolvedValue(linkedTo(ASHBY_URL));
+      renderDetailPage('candidate-1', '?tab=review');
+      await workflowShown();
+      expect(await screen.findByRole('link', { name: /^Open in Ashby to decide/ })).toHaveAttribute('href', ASHBY_URL);
+      expect(screen.getByText(/The decision is made in Ashby\./)).toBeInTheDocument();
+    });
+
+    it('is withheld while an appeal blocks decision use, link or no link', async () => {
+      mockApi.getCandidate.mockResolvedValue({
+        ...live,
+        candidate: { ...live.candidate, decision_use_blocked_at: '2026-01-02T00:00:00.000Z' },
+      });
+      mockApi.getCandidateAshbyWorkflow.mockResolvedValue(linkedTo(ASHBY_URL));
+      renderDetailPage('candidate-1', '?tab=review');
+      await workflowShown();
+      expect(screen.queryByRole('link', { name: /^Open in Ashby to decide/ })).toBeNull();
+      expect(screen.queryByText(/The decision is made in Ashby\./)).toBeNull();
+    });
+
+    it.each([
+      'javascript:alert(1)',
+      'https://example.com/candidates/1',
+      'https://app.ashbyhq.com.example.com/candidates/1',
+      'http://app.ashbyhq.com/candidates/1',
+    ])('never links to %s', async (url) => {
+      mockApi.getCandidate.mockResolvedValue(live);
+      mockApi.getCandidateAshbyWorkflow.mockResolvedValue(linkedTo(url));
+      renderDetailPage('candidate-1', '?tab=review');
+      await workflowShown();
+      expect(screen.queryByRole('link', { name: /^Open in Ashby to decide/ })).toBeNull();
+    });
+  });
+
+  describe('the log header on a phone session', () => {
+    const live = { ...mockCandidateDetail, sessions: [{ ...mockCandidateDetail.sessions[0], mode: 'live' }] };
+
+    it('says "Not linked" only when the read says there is no link', async () => {
+      mockApi.getCandidate.mockResolvedValue(live);
+      mockApi.getCandidateAshbyWorkflow.mockResolvedValue({ ok: true, workflow: null });
+      renderDetailPage('candidate-1', '?tab=review');
+      await waitFor(() => expect(screen.getByText('In Ashby').parentElement).toHaveTextContent('Not linked'));
+    });
+
+    it('never says "Not linked" for a read that failed', async () => {
+      mockApi.getCandidate.mockResolvedValue(live);
+      mockApi.getCandidateAshbyWorkflow.mockRejectedValue(new Error('Internal server error'));
+      renderDetailPage('candidate-1', '?tab=review');
+      const cell = (await screen.findByText('In Ashby')).parentElement!;
+      await waitFor(() => expect(mockApi.getCandidateAshbyWorkflow).toHaveBeenCalled());
+      expect(cell).toHaveTextContent('Not available');
+      expect(cell).not.toHaveTextContent('Not linked');
+    });
+  });
+
   it('renders the read-only card for an Ashby-linked candidate, with no new controls', async () => {
     mockApi.getCandidateAshbyWorkflow.mockResolvedValue({
       ok: true,
@@ -1530,12 +1631,13 @@ describe('Ashby pipeline card on the Overview', () => {
       },
     });
     renderDetailPage("candidate-1", "?tab=overview");
-    // Wait for the resolved card, not the identically-headed loading state.
-    expect(await screen.findByText('Ready to screen')).toBeInTheDocument();
-    expect(screen.getByText('Ashby screening pipeline')).toBeInTheDocument();
-    expect(screen.getByText('Screening invite')).toBeInTheDocument();
+    // Wait for the resolved card, not the identically-headed loading state. The hidden Review tab's
+    // log header says the same words, so the card is looked for inside its own region.
+    const region = await screen.findByRole('region', { name: 'Ashby screening pipeline' });
+    expect(await within(region).findByText('Ready to screen')).toBeInTheDocument();
+    expect(within(region).getByText('Ashby screening pipeline')).toBeInTheDocument();
+    expect(within(region).getByText('Screening invite')).toBeInTheDocument();
     // The card region itself contributes no control of any kind.
-    const region = screen.getByRole('region', { name: 'Ashby screening pipeline' });
     expect(within(region).queryAllByRole('button')).toHaveLength(0);
     expect(within(region).queryAllByRole('link')).toHaveLength(0);
     expect(region.querySelectorAll('button, a, input, select, textarea')).toHaveLength(0);

@@ -148,6 +148,24 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof Transcriptio
 
 const loadButton = () => screen.findByRole('button', { name: /^load recording/i });
 
+/** Legal approved the consent line for the phone Review screen only. */
+describe('the consent line on an R1 session', () => {
+  it('stays off, even when the gate turns are timed on the recording', async () => {
+    const gate: TranscriptLine[] = [
+      { speaker: 'bot', text: 'Do you consent?', start_offset_sec: null, started_at_ms: START + 5_000, is_gate: true },
+      { speaker: 'candidate', text: 'Yes, I consent.', start_offset_sec: null, started_at_ms: START + 9_000, is_gate: true },
+      { speaker: 'bot', text: 'Let us begin.', start_offset_sec: null, started_at_ms: START + 12_000 },
+    ];
+    mockApi.getSession.mockResolvedValue({ session: R1_SESSION, transcript: gate, assessment: null });
+    renderWorkspace();
+    // Timed, so a phone session would fold these turns here.
+    expect(await screen.findByRole('button', { name: /^Turn 2:/ })).toBeInTheDocument();
+    expect(screen.getByText('Yes, I consent.')).toBeInTheDocument();
+    expect(document.querySelector('[data-consent-line]')).toBeNull();
+    expect(screen.queryByText(/Consent given/)).toBeNull();
+  });
+});
+
 /** The rows lit right now, by turn number. */
 const lit = () =>
   screen
@@ -170,7 +188,7 @@ beforeEach(() => {
 
 /** Open the session picker and take the session that is not selected. */
 function switchSession(scope: Pick<typeof screen, 'getByRole' | 'getAllByRole'>): void {
-  fireEvent.click(scope.getByRole('button', { name: /^Session/ }));
+  fireEvent.click(scope.getByRole('button', { name: /^Screening/ }));
   const other = scope.getAllByRole('option').find((option) => option.getAttribute('aria-selected') === 'false');
   fireEvent.click(other as HTMLElement);
 }
@@ -198,7 +216,7 @@ describe('an R1 session on the Review tab', () => {
   it('names the session "R1 role-play" in the selector, not "Live voice"', async () => {
     renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION] });
     await loadButton();
-    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Screening/ }));
     const options = screen.getAllByRole('option').map((o) => o.textContent ?? '');
     expect(options.some((text) => text.includes('R1 role-play'))).toBe(true);
     expect(options.filter((text) => text.includes('R1 role-play'))).toHaveLength(1);
@@ -208,9 +226,9 @@ describe('an R1 session on the Review tab', () => {
   it('shows each turn at its place in the recording, and leaves a turn with no time untimed', async () => {
     renderWorkspace();
     await loadButton();
-    const first = await screen.findByRole('button', { name: /Turn 1: .*At 0:05\./ });
+    const first = await screen.findByRole('button', { name: /Turn 1: .*At 00:05\./ });
     expect(first).toHaveTextContent('0:05');
-    expect(screen.getByRole('button', { name: /Turn 2: .*At 2:05\./ })).toHaveTextContent('2:05');
+    expect(screen.getByRole('button', { name: /Turn 2: .*At 02:05\./ })).toHaveTextContent('02:05');
     const untimed = screen.getByLabelText(/Turn 3: .*Timing data not available\./);
     expect(untimed.tagName).not.toBe('BUTTON');
     expect(within(untimed).getByText('no timing data')).toBeInTheDocument();
@@ -1187,7 +1205,7 @@ describe('the "Latest scorecard" fallback never shows an R1 assessment', () => {
     renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION], assessments: [R1_ASSESSMENT, PHONE_ASSESSMENT] });
     expect(await screen.findByText('Scorecard for this session')).toBeInTheDocument();
     expect(screen.getByText('91')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Screening/ }));
     expect(screen.getAllByRole('option').filter((o) => /R1 role-play/.test(o.textContent ?? ''))).toHaveLength(1);
   });
 });
@@ -1209,7 +1227,7 @@ describe('phone sessions are unchanged', () => {
     expect(mockApi.getR1Recording).not.toHaveBeenCalled();
   });
 
-  it('a click lights nothing by itself: the row waits for the playhead, a quarter-second early as ever', async () => {
+  it('a press lights its row at once, and the playhead then keeps its quarter-second lead', async () => {
     mockApi.getSession.mockResolvedValue({
       session: PHONE_SESSION,
       transcript: [
@@ -1233,7 +1251,7 @@ describe('phone sessions are unchanged', () => {
     at(8);
     expect(lit()).toEqual(['1']);
     fireEvent.click(screen.getByRole('button', { name: /Turn 2:/ }));
-    expect(lit()).toEqual(['1']);
+    expect(lit()).toEqual(['2']);
     at(11.7);
     expect(lit()).toEqual(['1']);
     at(11.8);
