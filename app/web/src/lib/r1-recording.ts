@@ -31,6 +31,9 @@ import type {
  */
 export const R1_SEEK_LEAD_SEC = 0.25;
 
+/** How far short of its target a landed seek may read (rounding, the media's own time base). */
+const SEEK_LANDING_SLACK_SEC = 0.1;
+
 /** A link is replaced this many seconds before it expires, when the person next plays or seeks. */
 export const R1_REMINT_GUARD_SEC = 15;
 
@@ -119,6 +122,14 @@ export function turnOffsetSec(
 ): number | null {
   const media = turnMediaSec(turnStartedAtMs, summary);
   return media === null ? null : Math.max(0, media - R1_SEEK_LEAD_SEC);
+}
+
+/**
+ * Whether the playhead is in the lead-in of a turn starting at `startSec`: at or after where a click on
+ * that turn lands, and not yet at the turn. It has reached the turn at `startSec` exactly.
+ */
+export function inSeekLead(startSec: number, playheadSec: number): boolean {
+  return playheadSec < startSec && playheadSec >= startSec - R1_SEEK_LEAD_SEC - SEEK_LANDING_SLACK_SEC;
 }
 
 /* ── Link expiry ──────────────────────────────────────────────────── */

@@ -13,6 +13,7 @@ import {
   clockText,
   driftExceeds,
   durationWords,
+  inSeekLead,
   isMintStale,
   isPlayableState,
   isSafeMediaUrl,
@@ -35,6 +36,26 @@ const START = 1_790_000_000_000; // epoch ms of media t=0
 function summary(over: Partial<R1RecordingSummary> = {}): R1RecordingSummary {
   return { state: 'ready', started_at_ms: START, ...over };
 }
+
+describe('inSeekLead', () => {
+  it('holds from where a click lands up to, but not including, the turn', () => {
+    expect(inSeekLead(125, 124.75)).toBe(true);
+    expect(inSeekLead(125, 124.999)).toBe(true);
+    expect(inSeekLead(125, 125)).toBe(false);
+    expect(inSeekLead(125, 125.001)).toBe(false);
+  });
+
+  it('allows for a position that reads a little short of where it was sent', () => {
+    expect(inSeekLead(125, 124.7)).toBe(true);
+    expect(inSeekLead(125, 124.6)).toBe(false);
+    expect(inSeekLead(125, 30)).toBe(false);
+  });
+
+  it('covers a clamped seek: a turn in the first quarter of a second is reached from 0', () => {
+    expect(inSeekLead(0.1, 0)).toBe(true);
+    expect(inSeekLead(0, 0)).toBe(false);
+  });
+});
 
 describe('turnMediaSec / turnOffsetSec (contract C7/C8)', () => {
   it('pins the lead-in at a quarter of a second (owner decision)', () => {

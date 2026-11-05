@@ -114,6 +114,15 @@ test.describe('Review tab (admin): click a transcript turn to seek', () => {
     await expect(panel.getByText('no timing data')).toHaveCount(1);
     expect(mints(app)).toHaveLength(0);
 
+    // The lead-in sits inside the previous turn, and lasts a quarter of a second: only a watcher on the
+    // row itself can tell whether it ever lit.
+    const previous = panel.getByRole('button', { name: /Turn 1:/ });
+    await previous.evaluate((row) => {
+      new MutationObserver(() => {
+        if (row.hasAttribute('aria-current')) row.setAttribute('data-was-lit', '');
+      }).observe(row, { attributes: true, attributeFilter: ['aria-current'] });
+    });
+
     await late.click();
     const video = panel.locator('video');
     await expect(video).toHaveCount(1);
@@ -121,6 +130,11 @@ test.describe('Review tab (admin): click a transcript turn to seek', () => {
     const target = R1_TURN_LATE_SEC - 0.25;
     await expect.poll(() => position(video), { timeout: 10_000 }).toBeGreaterThanOrEqual(target - 1);
     expect(await position(video)).toBeLessThan(target + 15);
+
+    // The clicked row is lit through the lead-in; the row before it never was.
+    await expect(late).toHaveAttribute('aria-current', 'true');
+    await expect.poll(() => position(video), { timeout: 10_000 }).toBeGreaterThanOrEqual(R1_TURN_LATE_SEC);
+    await expect(previous).not.toHaveAttribute('data-was-lit', /.*/);
 
     // An earlier turn seeks backwards in the same, already loaded, file: no second mint. It lands a
     // quarter of a second early, not a full second (read at the seek: the file keeps playing after it).

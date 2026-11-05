@@ -38,7 +38,7 @@ describe('SeekableTranscript', () => {
     expect(screen.getAllByRole('button')).toHaveLength(3);
   });
 
-  it('calls onSeek with the correct offset when a timed turn is clicked', () => {
+  it('calls onSeek with the correct offset and row when a timed turn is clicked', () => {
     const onSeek = vi.fn();
     render(
       <SeekableTranscript
@@ -49,7 +49,7 @@ describe('SeekableTranscript', () => {
       />,
     );
     fireEvent.click(screen.getAllByRole('button')[1]); // candidate turn, offset 3.5
-    expect(onSeek).toHaveBeenCalledWith(3.5);
+    expect(onSeek).toHaveBeenCalledWith(3.5, 1);
   });
 
   it('highlights the active turn with aria-current="true"', () => {

@@ -29,6 +29,10 @@
  * loop reads `currentTime` every frame. `timeupdate` (about every 250 ms) reports only when that loop
  * cannot: a paused element (a seek) or a hidden tab (no frames run there). The loop runs only while
  * someone is listening, and stops on pause, on end, on a dropped element and on unmount.
+ *
+ * A host that acts on a click before the seek lands needs three more facts: whether the click was taken
+ * (`playFrom` and `playFromTurn` answer false when it is ignored), whether it is still waiting for the
+ * media (`seekQueued`), and when no position will follow (`onMediaDropped`, `onEnded`).
  */
 import {
   forwardRef,
@@ -63,15 +67,21 @@ export interface R1RecordingPlayerHandle {
   /**
    * Play from a recording-relative offset. Owns the whole click-to-play lifecycle: with no link yet it
    * mints one, waits for metadata, then seeks and plays. The latest offset wins on rapid clicks.
+   * False: ignored, because there is nothing to play.
    */
-  playFrom(offsetSec: number): void;
-  /** `playFrom` for a transcript turn: applies the anchor and the lead-in. A turn that cannot be placed is ignored. */
-  playFromTurn(turnStartedAtMs: number): void;
+  playFrom(offsetSec: number): boolean;
+  /**
+   * `playFrom` for a transcript turn: applies the anchor and the lead-in. False: ignored, because the
+   * turn cannot be placed or there is nothing to play.
+   */
+  playFromTurn(turnStartedAtMs: number): boolean;
   seek(offsetSec: number): void;
   play(): void;
   pause(): void;
   readonly currentTime: number;
   readonly hasUrl: boolean;
+  /** A `playFrom` is waiting for a link or for metadata, so the position reported now is not where it will land. */
+  readonly seekQueued: boolean;
 }
 
 export interface R1RecordingPlayerProps {
@@ -85,6 +95,10 @@ export interface R1RecordingPlayerProps {
   active?: boolean;
   onTimeUpdate?: (sec: number) => void;
   onPlayState?: (playing: boolean) => void;
+  /** Playback reached the end of the file, at this position. */
+  onEnded?: (sec: number) => void;
+  /** The media is gone (a failed mint, a failed file, a state without a file, a reset), and any queued seek with it. */
+  onMediaDropped?: () => void;
   /** The mint answered with a different state than the list showed (for example deleted since). */
   onStateChange?: (state: R1RecordingState) => void;
   /** "Check again": the host should re-read the rounds. */
@@ -289,6 +303,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
       setRefreshing(false);
       setFollowerFailed(false);
       setPhase('idle');
+      cbRef.current.onMediaDropped?.();
     }, [releaseMedia]);
 
     // A different recording (another attempt, another round): start over.
@@ -381,6 +396,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
         setErrorInfo(null);
         setPhase('blocked');
       }
+      cbRef.current.onMediaDropped?.();
     }, []);
 
     const mint = useCallback(
@@ -419,6 +435,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
                 retryable: r1RecordingErrorRetryable(status, code),
               });
               setPhase('error');
+              cbRef.current.onMediaDropped?.();
             },
           )
           .finally(() => {
@@ -485,18 +502,19 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
     }, [seekElements]);
 
     const playFrom = useCallback(
-      (offsetSec: number) => {
-        if (!Number.isFinite(offsetSec)) return;
+      (offsetSec: number): boolean => {
+        if (!Number.isFinite(offsetSec)) return false;
         // Only a recording that has a file can be played; the list's word is what we know.
-        if (!isPlayableState(viewState(summaryRef.current))) return;
+        if (!isPlayableState(viewState(summaryRef.current))) return false;
         pendingSeekRef.current = Math.max(0, offsetSec);
         if (!mintedRef.current) {
           void mint();
-          return;
+          return true;
         }
-        if (refreshIfStale({ time: offsetSec, play: true })) return;
+        if (refreshIfStale({ time: offsetSec, play: true })) return true;
         if (metaRef.current) applyQueued();
         // Otherwise the metadata handler applies it as soon as it loads.
+        return true;
       },
       [applyQueued, mint, refreshIfStale],
     );
@@ -512,7 +530,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
         playFrom,
         playFromTurn(turnStartedAtMs: number) {
           const offset = turnOffsetSec(turnStartedAtMs, summaryRef.current);
-          if (offset !== null) playFrom(offset);
+          return offset !== null && playFrom(offset);
         },
         seek(offsetSec: number) {
           const el = masterRef.current;
@@ -535,6 +553,9 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
         },
         get hasUrl() {
           return mintedRef.current !== null && phaseRef.current === 'media';
+        },
+        get seekQueued() {
+          return pendingSeekRef.current !== null;
         },
       }),
       [mint, playFrom, refreshIfStale, seekElements],
@@ -577,6 +598,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
         setMinted(null);
         setErrorInfo({ message: r1MediaErrorMessage(unsupported), retryable: !unsupported });
         setPhase('error');
+        cbRef.current.onMediaDropped?.();
         return;
       }
 
@@ -595,6 +617,7 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
       setMinted(null);
       setErrorInfo({ message: r1MediaErrorMessage(false), retryable: true });
       setPhase('error');
+      cbRef.current.onMediaDropped?.();
     }, [mint, releaseMedia]);
 
     const onTimeUpdate = useCallback((event: SyntheticEvent<HTMLMediaElement>) => {
@@ -632,11 +655,15 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
       followerRef.current?.pause();
     }, [stopPositionLoop]);
 
-    const onEnded = useCallback(() => {
-      stopPositionLoop();
-      cbRef.current.onPlayState?.(false);
-      followerRef.current?.pause();
-    }, [stopPositionLoop]);
+    const onEnded = useCallback(
+      (event: SyntheticEvent<HTMLMediaElement>) => {
+        stopPositionLoop();
+        cbRef.current.onPlayState?.(false);
+        cbRef.current.onEnded?.(event.currentTarget.currentTime);
+        followerRef.current?.pause();
+      },
+      [stopPositionLoop],
+    );
 
     /** The picture follows the sound: after any seek it is put where the audio is. */
     const syncFollower = useCallback((el: HTMLMediaElement) => {

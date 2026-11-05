@@ -30,7 +30,13 @@
  *      (`activeTurnAt`). A phone player reports on `timeupdate`; the R1 player
  *      every animation frame while playing. Either way this renders only when
  *      the active turn changes.
- *   3. Selecting a new session resets everything; stale loads are discarded.
+ *   3. R1 only: a click lands `R1_SEEK_LEAD_SEC` before the turn, where rule 2
+ *      would light the row before it. So the clicked row lights at once and
+ *      holds until the playhead reaches its start, then rule 2 is back. The
+ *      hold ends sooner if the playhead leaves the lead-in (a scrub), playback
+ *      ends, the media is dropped (the click then failed: no row stays lit) or
+ *      the transcript changes. A click the player ignores lights nothing.
+ *   4. Selecting a new session resets everything; stale loads are discarded.
  *
  * R1 sessions (a session that belongs to an R1 round): the recording is the R1
  * attempt's own, played by `R1RecordingPlayer` in the same slot, and the legacy
@@ -98,7 +104,7 @@ import {
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
 import { latestScreeningAssessment } from '../../lib/latest-screening-assessment';
-import { turnMediaSec } from '../../lib/r1-recording';
+import { inSeekLead, turnMediaSec } from '../../lib/r1-recording';
 import type { R1RecordingSummary } from '../../lib/r1-types';
 import { sessionModeLabel } from '../../lib/session-mode';
 
@@ -211,6 +217,13 @@ export function TranscriptionSyncWorkspace({
     activeTurnRef.current = next;
     setActiveTurnIndex(next);
   }, []);
+  // The start of the R1 row a click lit, while that row holds the highlight (file header, rule 3).
+  const heldTurnStartRef = useRef<number | null>(null);
+  const dropHeldTurn = useCallback(() => {
+    if (heldTurnStartRef.current === null) return;
+    heldTurnStartRef.current = null;
+    showActiveTurn(null);
+  }, [showActiveTurn]);
 
   // refreshKey counter for retry — changing it re-triggers the effect
   const [refreshKey, setRefreshKey] = useState(0);
@@ -358,6 +371,9 @@ export function TranscriptionSyncWorkspace({
     [displayTranscript],
   );
 
+  // A hold belongs to the rows it was clicked on: another session or a reload ends it.
+  useEffect(dropHeldTurn, [turnStarts, dropHeldTurn]);
+
   /* ── Phone legs (M013 S02) ─────────────────────────────────── */
 
   const legsEnabled =
@@ -439,25 +455,40 @@ export function TranscriptionSyncWorkspace({
         setActiveLegTurn(found);
         return;
       }
+      const heldStart = heldTurnStartRef.current;
+      if (heldStart !== null) {
+        // A queued click has not moved the media yet, so this position says nothing about it.
+        if (r1PlayerRef.current?.seekQueued || inSeekLead(heldStart, currentTime)) return;
+        heldTurnStartRef.current = null;
+      }
       // R1 lights a row at its start; a phone row keeps its early tolerance.
       showActiveTurn(activeTurnAt(turnStarts, currentTime, isR1 ? 0 : PHONE_HIGHLIGHT_TOLERANCE_SEC));
     },
     [isR1, turnStarts, legsMode, legGroups, showActiveTurn],
   );
 
+  const handleR1Ended = useCallback(
+    (sec: number) => {
+      heldTurnStartRef.current = null;
+      handleTimeUpdate(sec);
+    },
+    [handleTimeUpdate],
+  );
+
   // click-to-play contract — RecordingPlayer owns mint/wait/seek/play.
   const handleSeek = useCallback(
-    (offsetSec: number) => {
+    (offsetSec: number, rowIndex: number) => {
       if (isR1) {
-        // The clicked row carries the offset the turn was placed at; find the turn it came from and
-        // seek by ITS own start time, so the lead-in and the anchor are applied in one place.
-        const turn = displayTranscript.find((t) => t.start_offset_sec === offsetSec);
-        if (typeof turn?.started_at_ms === 'number') r1PlayerRef.current?.playFromTurn(turn.started_at_ms);
+        // Seek by the clicked turn's OWN start time, so the lead-in and the anchor are applied in one place.
+        const startedAtMs = displayTranscript[rowIndex]?.started_at_ms;
+        if (typeof startedAtMs !== 'number' || !r1PlayerRef.current?.playFromTurn(startedAtMs)) return;
+        heldTurnStartRef.current = offsetSec;
+        showActiveTurn(rowIndex);
         return;
       }
       playerRef.current?.playFrom(offsetSec);
     },
-    [isR1, displayTranscript],
+    [isR1, displayTranscript, showActiveTurn],
   );
 
   /** A leg's playhead moved: highlight within that leg's group only. */
@@ -677,6 +708,8 @@ export function TranscriptionSyncWorkspace({
                 label={R1_SESSION_LABEL}
                 active={active}
                 onTimeUpdate={handleTimeUpdate}
+                onEnded={handleR1Ended}
+                onMediaDropped={dropHeldTurn}
                 onNeedRefresh={() => setR1RefreshKey((k) => k + 1)}
               />
             ) : r1Supported && r1Rec?.status !== 'unavailable' ? (

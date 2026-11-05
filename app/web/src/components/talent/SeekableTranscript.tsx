@@ -3,8 +3,8 @@
  *
  * - Timed turns (start_offset_sec != null) are ALWAYS rendered as real
  *   <button> elements, even before the recording is loaded. Clicking a
- *   timed turn calls onSeek(offsetSec) — the parent workspace handles
- *   minting the URL and queuing the seek if needed.
+ *   timed turn calls onSeek(offsetSec, rowIndex) — the parent workspace
+ *   handles minting the URL and queuing the seek if needed.
  * - Untimed turns (start_offset_sec == null) are rendered non-interactive
  *   with a clear "no timing data" label.
  * - The active turn receives aria-current="true", a stronger tint with a
@@ -30,7 +30,8 @@ export interface TurnTime {
 export interface SeekableTranscriptProps {
   transcript: TranscriptLine[];
   activeTurnIndex: number | null;
-  onSeek: (offsetSec: number) => void;
+  /** `rowIndex` is the clicked row's place in `transcript`: two rows can share an offset. */
+  onSeek: (offsetSec: number, rowIndex: number) => void;
   recordingReady: boolean;
   isLoading?: boolean;
   error?: string | null;
@@ -195,7 +196,7 @@ export function SeekableTranscript({
                   <button
                     type="button"
                     ref={active ? activeRef : undefined}
-                    onClick={() => onSeek(turn.start_offset_sec!)}
+                    onClick={() => onSeek(turn.start_offset_sec!, index)}
                     aria-current={active ? 'true' : undefined}
                     aria-label={`Turn ${numberOf(index)}: ${speaker}. At ${approximateTiming ? 'about ' : ''}${clockText(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(

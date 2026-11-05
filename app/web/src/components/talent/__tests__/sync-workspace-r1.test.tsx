@@ -2,11 +2,12 @@
  * TranscriptionSyncWorkspace, R1 branch: a session that belongs to an R1 round plays through
  * R1RecordingPlayer, never through the legacy RecordingPlayer (and never calls the legacy download),
  * its turns are placed on the recording from the attempt's anchor, a click seeks with the turn's own
- * time, and a turn with no time stays untimed. Phone sessions are untouched.
+ * time and lights its row through the lead-in, and a turn with no time stays untimed. Phone sessions
+ * are untouched.
  */
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Profiler } from 'react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { TranscriptionSyncWorkspace } from '../TranscriptionSyncWorkspace';
 import type { Assessment, Session, TranscriptLine } from '../../../types';
 import type { R1RecordingSummary, R1Round } from '../../../lib/r1-types';
@@ -130,6 +131,13 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof Transcriptio
 }
 
 const loadButton = () => screen.findByRole('button', { name: /^load recording/i });
+
+/** The rows lit right now, by turn number. */
+const lit = () =>
+  screen
+    .queryAllByRole('button', { name: /^Turn/ })
+    .filter((b) => b.getAttribute('aria-current') === 'true')
+    .map((b) => /^Turn (\d+)/.exec(b.getAttribute('aria-label') ?? '')?.[1]);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -280,11 +288,6 @@ describe('an R1 session on the Review tab', () => {
     const state = drive(video);
     fireEvent.loadedMetadata(video);
 
-    const lit = () =>
-      screen
-        .queryAllByRole('button', { name: /^Turn/ })
-        .filter((b) => b.getAttribute('aria-current') === 'true')
-        .map((b) => /^Turn (\d+)/.exec(b.getAttribute('aria-label') ?? '')?.[1]);
     const at = (t: number) => {
       state.currentTime = t;
       fireEvent.timeUpdate(video);
@@ -382,6 +385,31 @@ describe('an R1 session on the Review tab', () => {
       expect(commits).toBeGreaterThan(settled);
     });
 
+    it('a click holds its row through the lead-in on frames, and those frames render nothing', async () => {
+      let commits = 0;
+      const { state } = await playingVideo(() => {
+        commits += 1;
+      });
+      state.currentTime = 30;
+      runFrame();
+      expect(lit()).toEqual(['1']);
+
+      fireEvent.click(screen.getByRole('button', { name: /Turn 2:/ }));
+      expect(lit()).toEqual(['2']);
+      await act(async () => undefined);
+      const settled = commits;
+      for (let t = 124.75; t < 125; t += 0.016) {
+        state.currentTime = t;
+        runFrame();
+        expect(lit()).toEqual(['2']);
+      }
+      // Reaching the start hands over to the row the rule picks, which is the same row: no render.
+      state.currentTime = 125.01;
+      runFrame();
+      expect(lit()).toEqual(['2']);
+      expect(commits).toBe(settled);
+    });
+
     it('the loop stops on pause and when the workspace unmounts', async () => {
       const { video, state } = await playingVideo();
       expect(frames.size).toBe(1);
@@ -472,6 +500,318 @@ describe('an R1 session on the Review tab', () => {
     expect(screen.queryByRole('button', { name: /load recording/i })).toBeInTheDocument();
     // The phone session shows the LEGACY player (no "Attempt"/R1 naming).
     expect(screen.getByText('Recording loads on request; the link expires automatically.')).toBeInTheDocument();
+  });
+});
+
+describe('a clicked turn lights at once and holds through the lead-in', () => {
+  const turn = (n: number) => screen.getByRole('button', { name: new RegExp(`^Turn ${n}:`) });
+  const mediaOnScreen = async () => {
+    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+    return document.querySelector('video') as HTMLVideoElement;
+  };
+
+  /** A loaded, paused recording with the playhead in the test's hands. */
+  async function loaded() {
+    fireEvent.click(await loadButton());
+    const video = await mediaOnScreen();
+    const state = drive(video);
+    fireEvent.loadedMetadata(video);
+    const at = (sec: number) => {
+      state.currentTime = sec;
+      fireEvent.timeUpdate(video);
+    };
+    return { video, state, at };
+  }
+
+  describe('the row that lights', () => {
+    it('is the clicked row at start - 0.25 s, never the row before it', async () => {
+      renderWorkspace();
+      const { state, at } = await loaded();
+      at(30);
+      expect(lit()).toEqual(['1']);
+
+      fireEvent.click(turn(2));
+      expect(state.sets).toEqual([124.75]);
+      expect(lit()).toEqual(['2']);
+      at(124.75);
+      expect(lit()).toEqual(['2']);
+      at(124.9);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('does not blink off when there is no earlier turn to fall back to', async () => {
+      renderWorkspace();
+      const { state, at } = await loaded();
+      fireEvent.click(turn(1));
+      expect(state.sets).toEqual([4.75]);
+      expect(lit()).toEqual(['1']);
+      at(4.75);
+      expect(lit()).toEqual(['1']);
+    });
+
+    it('is the clicked row when two turns share a start', async () => {
+      mockApi.getSession.mockResolvedValue({
+        session: R1_SESSION,
+        transcript: [
+          { speaker: 'bot', text: 'One.', start_offset_sec: null, started_at_ms: START + 5_000 },
+          { speaker: 'candidate', text: 'Two.', start_offset_sec: null, started_at_ms: START + 5_000 },
+        ] satisfies TranscriptLine[],
+        assessment: null,
+      });
+      renderWorkspace();
+      const { at } = await loaded();
+      fireEvent.click(turn(1));
+      expect(lit()).toEqual(['1']);
+      at(4.75);
+      expect(lit()).toEqual(['1']);
+      fireEvent.click(turn(2));
+      expect(lit()).toEqual(['2']);
+      at(4.75);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('is the clicked row when an earlier-starting turn sits below it', async () => {
+      mockApi.getSession.mockResolvedValue({
+        session: R1_SESSION,
+        transcript: [
+          { speaker: 'bot', text: 'Hello there.', start_offset_sec: null, started_at_ms: START + 12_000 },
+          { speaker: 'bot', text: 'Tell me about the course.', start_offset_sec: null, started_at_ms: START + 30_000 },
+          { speaker: 'candidate', text: 'Okay What is the fee?', start_offset_sec: null, started_at_ms: START + 29_500 },
+        ] satisfies TranscriptLine[],
+        assessment: null,
+      });
+      renderWorkspace();
+      const { at } = await loaded();
+      fireEvent.click(turn(2));
+      at(29.75);
+      expect(lit()).toEqual(['2']);
+      at(30);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('lights on a click before the recording is loaded, and holds through the mint and the metadata', async () => {
+      renderWorkspace();
+      await loadButton();
+      fireEvent.click(turn(2));
+      expect(lit()).toEqual(['2']);
+
+      const video = await mediaOnScreen();
+      const state = drive(video);
+      // The element sits at 0 until the queued seek is applied: that says nothing about the click.
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+      state.currentTime = 125;
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('follows the latest of two clicks made before the recording is loaded', async () => {
+      renderWorkspace();
+      await loadButton();
+      fireEvent.click(turn(1));
+      fireEvent.click(turn(2));
+      expect(lit()).toEqual(['2']);
+      const video = await mediaOnScreen();
+      const state = drive(video);
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('holds while a stale link is replaced, though the old file keeps reporting its own position', async () => {
+      renderWorkspace();
+      const { video, state, at } = await loaded();
+      at(30);
+      const clock = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 300_000);
+      onTestFinished(() => clock.mockRestore());
+
+      fireEvent.click(turn(2));
+      expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2);
+      expect(state.sets).toEqual([]);
+      at(30.5);
+      expect(lit()).toEqual(['2']);
+      await act(async () => undefined);
+      at(31);
+      expect(lit()).toEqual(['2']);
+
+      fireEvent.loadedMetadata(video);
+      expect(state.sets).toEqual([124.75]);
+      fireEvent.timeUpdate(video);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('holds on a click while paused when playing does not start, and a paused scrub still releases it', async () => {
+      renderWorkspace();
+      const { state, at } = await loaded();
+      state.play.mockRejectedValue(new Error('NotAllowedError'));
+      at(30);
+      fireEvent.click(turn(2));
+      expect(state.paused).toBe(true);
+      expect(lit()).toEqual(['2']);
+      at(124.75);
+      expect(lit()).toEqual(['2']);
+      at(30);
+      expect(lit()).toEqual(['1']);
+    });
+  });
+
+  describe('the hold ends', () => {
+    it('when the playhead reaches the row, and the next row can then light', async () => {
+      renderWorkspace();
+      const { at } = await loaded();
+      fireEvent.click(turn(1));
+      at(4.8);
+      expect(lit()).toEqual(['1']);
+      at(5);
+      expect(lit()).toEqual(['1']);
+      at(125);
+      expect(lit()).toEqual(['2']);
+    });
+
+    it('for good at the start: a scrub back into the lead-in goes by the rule again', async () => {
+      renderWorkspace();
+      const { at } = await loaded();
+      fireEvent.click(turn(2));
+      at(125);
+      expect(lit()).toEqual(['2']);
+      at(124.9);
+      expect(lit()).toEqual(['1']);
+    });
+
+    it.each([
+      ['back to an earlier turn', 30, ['1']],
+      ['back to before any turn', 2, []],
+      ['just short of the lead-in', 124.5, ['1']],
+      ['forward past the turn', 400, ['2']],
+    ])('when the reviewer scrubs %s', async (_where, sec, rows) => {
+      renderWorkspace();
+      const { at } = await loaded();
+      fireEvent.click(turn(2));
+      at(124.75);
+      expect(lit()).toEqual(['2']);
+      at(sec);
+      expect(lit()).toEqual(rows);
+    });
+
+    it('for good when the reviewer scrubs away: coming back to the lead-in goes by the rule', async () => {
+      renderWorkspace();
+      const { at } = await loaded();
+      fireEvent.click(turn(2));
+      at(30);
+      at(124.9);
+      expect(lit()).toEqual(['1']);
+    });
+
+    it('when playback ends inside the lead-in', async () => {
+      renderWorkspace();
+      const { video, state } = await loaded();
+      fireEvent.click(turn(2));
+      expect(lit()).toEqual(['2']);
+      state.currentTime = 124.9;
+      fireEvent.ended(video);
+      expect(lit()).toEqual(['1']);
+    });
+
+    it('when the session changes, and it does not follow the reviewer to the next one', async () => {
+      const other: Session = { ...R1_SESSION, id: 'r1-session-2', created_at: '2026-10-03T10:00:00.000Z' };
+      const listed = rounds();
+      listed.rounds[0].attempts?.push({
+        session_id: other.id,
+        attempt_number: 2,
+        counted: true,
+        outcome: 'completed',
+        recording: recording(),
+      });
+      mockApi.listR1Rounds = vi.fn().mockResolvedValue(listed);
+      mockApi.getSession.mockImplementation((id: string) =>
+        Promise.resolve({ session: id === other.id ? other : R1_SESSION, transcript: TURNS, assessment: null }),
+      );
+      renderWorkspace({ sessions: [R1_SESSION, other] });
+      await loaded();
+      fireEvent.click(turn(2));
+      expect(lit()).toEqual(['2']);
+
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: other.id } });
+      const { at } = await loaded();
+      expect(lit()).toEqual([]);
+      at(124.9);
+      expect(lit()).toEqual(['1']);
+    });
+  });
+
+  describe('no row is left lit', () => {
+    it('by a turn the player ignores because there is nothing to play', async () => {
+      mockApi.listR1Rounds = vi.fn().mockResolvedValue(rounds({ state: 'processing' }));
+      renderWorkspace();
+      fireEvent.click(await screen.findByRole('button', { name: /Turn 2:/ }));
+      expect(mockApi.getR1Recording).not.toHaveBeenCalled();
+      expect(lit()).toEqual([]);
+    });
+
+    it('by a turn the player cannot place: the row the playhead lit stays, and the playhead still moves it', async () => {
+      // The mint has the last word on the anchor, so a timed row can be one the player will not place.
+      mockApi.getR1Recording.mockResolvedValue({
+        ...recording({ started_at_ms: null }),
+        url: LINK,
+        content_type: 'video/mp4',
+        expires_in_sec: 300,
+      });
+      renderWorkspace();
+      const { state, at } = await loaded();
+      at(30);
+      fireEvent.click(turn(2));
+      expect(state.sets).toEqual([]);
+      expect(lit()).toEqual(['1']);
+      at(2);
+      expect(lit()).toEqual([]);
+    });
+
+    it('by a click whose mint fails', async () => {
+      mockApi.getR1Recording.mockRejectedValue(Object.assign(new Error('boom'), { status: 500 }));
+      renderWorkspace();
+      await loadButton();
+      fireEvent.click(turn(2));
+      expect(lit()).toEqual(['2']);
+      expect(await screen.findByRole('alert')).toBeInTheDocument();
+      expect(lit()).toEqual([]);
+    });
+
+    it('by a click whose mint finds the recording deleted', async () => {
+      mockApi.getR1Recording.mockResolvedValue(recording({ state: 'deleted', reason: 'retention' }));
+      renderWorkspace();
+      await loadButton();
+      fireEvent.click(turn(2));
+      expect(lit()).toEqual(['2']);
+      expect(await screen.findByText(/This recording was deleted/)).toBeInTheDocument();
+      expect(lit()).toEqual([]);
+    });
+
+    it('by a click on a first link that cannot be played', async () => {
+      renderWorkspace();
+      await loadButton();
+      fireEvent.click(turn(2));
+      fireEvent.error(await mediaOnScreen());
+      expect(await screen.findByRole('alert')).toBeInTheDocument();
+      expect(lit()).toEqual([]);
+    });
+
+    it('when the media is lost inside the lead-in, after the seek has landed', async () => {
+      renderWorkspace();
+      const { video, at } = await loaded();
+      fireEvent.click(turn(2));
+      at(124.8);
+      fireEvent.error(video);
+      await waitFor(() => expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2));
+      await act(async () => undefined);
+      fireEvent.error(video);
+      expect(await screen.findByRole('alert')).toBeInTheDocument();
+      expect(lit()).toEqual([]);
+    });
   });
 });
 
@@ -670,6 +1010,40 @@ describe('phone sessions are unchanged', () => {
     fireEvent.click(screen.getByRole('button', { name: /Turn 1:/ }));
     await waitFor(() => expect(mockApi.getRecordingDownloadUrl).toHaveBeenCalledWith('phone-session'));
     expect(mockApi.getR1Recording).not.toHaveBeenCalled();
+  });
+
+  it('a click lights nothing by itself: the row waits for the playhead, a quarter-second early as ever', async () => {
+    mockApi.getSession.mockResolvedValue({
+      session: PHONE_SESSION,
+      transcript: [
+        { speaker: 'bot', text: 'Hello caller', start_offset_sec: 5 },
+        { speaker: 'candidate', text: 'Hi there', start_offset_sec: 12 },
+      ],
+      assessment: null,
+    });
+    mockApi.getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
+    renderWorkspace({ sessions: [PHONE_SESSION] });
+    fireEvent.click(await screen.findByRole('button', { name: /^load recording/i }));
+    await waitFor(() => expect(document.querySelector('audio')).not.toBeNull());
+    const audio = document.querySelector('audio') as HTMLAudioElement;
+    let playhead = 0;
+    Object.defineProperty(audio, 'currentTime', { configurable: true, get: () => playhead, set: () => undefined });
+    const at = (sec: number) => {
+      playhead = sec;
+      fireEvent.timeUpdate(audio);
+    };
+
+    at(8);
+    expect(lit()).toEqual(['1']);
+    fireEvent.click(screen.getByRole('button', { name: /Turn 2:/ }));
+    expect(lit()).toEqual(['1']);
+    at(11.7);
+    expect(lit()).toEqual(['1']);
+    at(11.8);
+    expect(lit()).toEqual(['2']);
+    // No hold either: a move away is the rule's at once.
+    at(8);
+    expect(lit()).toEqual(['1']);
   });
 
   it('a simulation session (no round id) is not mistaken for R1', async () => {
