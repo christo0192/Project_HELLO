@@ -465,6 +465,11 @@ describe('check before trusting it', () => {
     expect(trustChecks(assessment(), attempt())).toEqual([]);
   });
 
+  it.each(['no_candidate_speech', 'scoring_failed', 'r1_scorecard_mismatch'])('leaves %s to the headline, which already says it', (code) => {
+    const checks = trustChecks(assessment({ r1: { ...assessment().r1, gate: { passed: false, failures: [code] } } }), attempt());
+    expect(checks).toEqual([]);
+  });
+
   it('names gate failures in plain words, once each, and never prints a code', () => {
     const checks = trustChecks(
       assessment({ r1: { ...assessment().r1, gate: { passed: false, failures: ['roleplay_too_short', 'family_missing:f2', 'brand_new_code'] }, administration_quality: { status: 'review', failures: ['roleplay_too_short'] } } }),

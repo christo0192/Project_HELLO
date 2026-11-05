@@ -196,7 +196,7 @@ describe('loading and failing', () => {
     expect(mockApi.getR1Review).toHaveBeenCalledTimes(2);
   });
 
-  it.each([[403, 'access_denied'], [404, 'not_found']])('shows one generic state for a %i, with nothing to retry', async (status, code) => {
+  it.each([[400, 'invalid_id'], [403, 'access_denied'], [404, 'not_found']])('shows one generic state for a %i, with nothing to retry', async (status, code) => {
     mockApi.getR1Review.mockRejectedValue(new TestApiError(code, status));
     open();
     expect(await screen.findByText('This interview is not available.')).toBeInTheDocument();

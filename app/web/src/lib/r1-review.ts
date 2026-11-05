@@ -487,6 +487,9 @@ const CHECK_WORDS: Readonly<Record<string, string>> = {
 
 const OTHER_CHECK = 'Another check did not pass.';
 
+/** A placeholder row's only failure: the "Not scored" headline already says it. */
+const HEADLINE_CODES: ReadonlySet<string> = new Set(['no_candidate_speech', 'scoring_failed', 'r1_scorecard_mismatch']);
+
 /** "family_missing:f2" -> its plain sentence. The family is detail a reviewer cannot act on. */
 function checkWords(code: string): string {
   return CHECK_WORDS[code.split(':')[0]] ?? OTHER_CHECK;
@@ -511,7 +514,9 @@ export function trustChecks(assessment: R1ReviewAssessment | null, attempt: R1Re
   };
   if (assessment) {
     const { gate, administration_quality: quality, agreement } = assessment.r1;
-    for (const code of [...(gate?.failures ?? []), ...(quality?.failures ?? [])]) add(checkWords(code));
+    for (const code of [...(gate?.failures ?? []), ...(quality?.failures ?? [])]) {
+      if (!HEADLINE_CODES.has(code)) add(checkWords(code));
+    }
     if (agreement?.runs_agree === false) add(CHECK_WORDS.runs_disagree);
   }
   if (attempt) add(recordingCheck(attempt.recording));

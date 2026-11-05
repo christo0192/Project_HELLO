@@ -526,6 +526,20 @@ describe('the rounds list gains attempts[]', () => {
     expect(fake.ops.filter((o) => o.table === 'interview_round_recordings')).toHaveLength(1);
   });
 
+  it('lists two starts of one attempt number oldest first, the order the review page labels them by', async () => {
+    const older = fixtureId('c', 1);
+    const newer = fixtureId('c', 2);
+    const tables: Tables = {
+      interview_round_attempts: [
+        { session_id: newer, round_id: ROUND, attempt_number: 1, counted: false, outcome: 'candidate_left', created_at: '2026-11-01T10:05:00.000Z' },
+        { session_id: older, round_id: ROUND, attempt_number: 1, counted: false, outcome: 'candidate_left', created_at: '2026-11-01T10:00:00.000Z' },
+      ],
+      interview_round_recordings: [],
+    };
+    const result = await withRecordingAttempts(db(tables).client as never, [{ id: ROUND, status: 'in_progress' }], FIXTURE_NOW_MS);
+    expect((result[0] as any).attempts.map((a: any) => a.session_id)).toEqual([older, newer]);
+  });
+
   it('reads only the columns a summary needs: no key, hash, ETag, bucket, prefix or upload id is ever selected', async () => {
     const fake = db({ interview_round_attempts: [], interview_round_recordings: [recordingRow(1, { upload_id: 'secret-upload' })] });
     const selected: Array<[string, string]> = [];

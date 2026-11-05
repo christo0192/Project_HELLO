@@ -71,6 +71,17 @@ test.describe('a look at each tab', () => {
     await expect(page.locator('[data-turn-tick]')).toHaveCount(turns.length);
   });
 
+  test('three attempts wrap inside the header, so a phone never scrolls sideways', async ({ app, page }) => {
+    const { review } = app.db.r1;
+    const [scored] = review.attempts;
+    const start = (session: string, attempt: number, counted: boolean) => ({ ...scored, session_id: session, attempt_number: attempt, counted, turns: [] });
+    app.db.r1.review = { ...review, attempts: [start('11111111-1111-4111-8111-111111111111', 1, false), { ...scored, counted: true }, start('22222222-2222-4222-8222-222222222222', 2, true)] };
+    await page.setViewportSize({ width: 390, height: 844 });
+    await app.goto(ADDRESS);
+    await expect(page.getByRole('group', { name: 'Attempt' }).getByRole('button')).toHaveCount(3);
+    await noSideways(app);
+  });
+
   test('stacks the transcript under the strip below 1180 px', async ({ app, page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'set by width');
     await page.setViewportSize({ width: 1100, height: 800 });

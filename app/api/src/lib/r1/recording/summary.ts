@@ -216,7 +216,9 @@ export async function withRecordingAttempts<T extends { id?: unknown }>(
       .from('interview_round_attempts')
       .select('session_id,round_id,attempt_number,counted,outcome')
       .in('round_id', roundIds)
-      .order('attempt_number', { ascending: true });
+      .order('attempt_number', { ascending: true })
+      // A restart shares its number (0119), and the page labels starts by this order.
+      .order('created_at', { ascending: true });
     const recordingsResult = await db.from(RECORDINGS_TABLE).select(SUMMARY_COLUMNS).in('round_id', roundIds);
     if (attemptsResult.error || recordingsResult.error) throw new Error('r1_attempts_read_error');
 

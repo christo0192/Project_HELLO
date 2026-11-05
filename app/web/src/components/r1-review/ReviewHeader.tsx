@@ -99,9 +99,10 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
         {candidate.role_title && <Chip>{candidate.role_title}</Chip>}
         {attempts.length === 1 && label && <Chip>{label}</Chip>}
         {attempts.length > 1 && attempt && (
-          <li>
+          <li className="min-w-0 max-w-full">
             <SegmentedControl
               size="sm"
+              className="flex-wrap"
               ariaLabel="Attempt"
               value={attempt.session_id}
               onChange={onSelectAttempt}

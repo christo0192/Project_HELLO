@@ -92,7 +92,8 @@ export function R1ReviewPage() {
       .catch((error: unknown) => {
         if (!live) return;
         const status = statusOf(error);
-        if (status === 403 || status === 404) setLoad({ status: 'unavailable' });
+        // 400 is an address that can never work, so a Try again would only fail the same way.
+        if (status === 400 || status === 403 || status === 404) setLoad({ status: 'unavailable' });
         // A re-read that fails leaves the page as it was, and says so.
         else setLoad((current) => (current.status === 'ready' ? { ...current, stale: true } : { status: 'error', message: messageOf(error) }));
       });
