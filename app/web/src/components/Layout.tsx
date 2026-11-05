@@ -240,8 +240,10 @@ export function Layout() {
 
         {/* A scroller clips at its padding box, and a link's focus ring reaches
             4px past the link. `-mx-1 px-1` keeps the links where they were and
-            moves the clip 4px out, so the ring keeps its sides. */}
-        <nav className="-mx-1 flex-1 overflow-y-auto px-1 py-1" aria-label="Main navigation">
+            moves the clip 4px out, so the ring keeps its sides. Focus scrolling
+            sets a link's own box against the edge, so `scroll-py-1` stops it
+            4px short and the ring keeps its top and bottom in a short window. */}
+        <nav className="-mx-1 flex-1 scroll-py-1 overflow-y-auto px-1 py-1" aria-label="Main navigation">
           <NavGroup label="Workspace">
             <NavLinkItem
               to="/dashboard"

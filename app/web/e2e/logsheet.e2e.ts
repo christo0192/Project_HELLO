@@ -11,7 +11,7 @@
 import type { Locator, Page } from '@playwright/test';
 import { SEEK_CANDIDATE_ID, SEEK_NORMAL_SESSION_ID } from './fixtures/data';
 import { KEY_STATES, openRoute } from './fixtures/flows';
-import { expect, test } from './fixtures/harness';
+import { expect, test, type AppHarness } from './fixtures/harness';
 import { ROUTES } from './fixtures/routes';
 
 const routeNamed = (name: string) => {
@@ -108,6 +108,50 @@ function expectReadable(pairs: Ink[]): void {
   }
 }
 
+/** Keyboard focus: `.focus()` alone is not `:focus-visible` after a pointer click. */
+async function tabTo(page: Page, subject: Locator): Promise<void> {
+  await subject.focus();
+  await page.keyboard.press('Shift+Tab');
+  await page.keyboard.press('Tab');
+  await expect(subject).toBeFocused();
+}
+
+/** How many pixels of a screenshot of `subject` are exactly `colour`. */
+async function pixelsOf(page: Page, subject: Locator, colour: string): Promise<number> {
+  const png = (await subject.screenshot()).toString('base64');
+  return page.evaluate(
+    async ({ data, rgb }) => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${data}`;
+      await image.decode();
+      const canvas = document.createElement('canvas');
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext('2d')!;
+      context.drawImage(image, 0, 0);
+      const pixels = context.getImageData(0, 0, image.width, image.height).data;
+      let count = 0;
+      for (let at = 0; at < pixels.length; at += 4) {
+        if (pixels[at] === rgb[0] && pixels[at + 1] === rgb[1] && pixels[at + 2] === rgb[2]) count += 1;
+      }
+      return count;
+    },
+    { data: png, rgb: parseRgb(colour) },
+  );
+}
+
+/** Open the Review tab and start a transcript turn, which marks it `aria-current`. */
+async function playTurn(app: AppHarness, page: Page): Promise<Locator> {
+  await app.goto(`/candidates/${SEEK_CANDIDATE_ID}`);
+  await page.getByRole('tab', { name: 'Review' }).click();
+  const panel = page.getByRole('tabpanel', { name: 'Review' });
+  await panel.getByRole('combobox').selectOption(SEEK_NORMAL_SESSION_ID);
+  const turn = panel.getByRole('group', { name: 'Call 1 of 2 · first call' }).getByRole('button', { name: /Turn 2:/ });
+  await turn.click();
+  await expect(turn).toHaveAttribute('aria-current', 'true');
+  return turn;
+}
+
 test.describe('tab rows', () => {
   for (const name of ['candidate-detail', 'mission-control', 'ashby-scoped-review']) {
     for (const viewport of [{ width: 1440, height: 900 }, { width: 1366, height: 768 }]) {
@@ -127,43 +171,54 @@ test.describe('tab rows', () => {
 });
 
 test.describe('focus', () => {
-  test('every nav link keeps its whole ring inside the scrolling nav', async ({ app, page }) => {
-    await page.setViewportSize({ width: 1366, height: 768 });
-    await openRoute(app, routeNamed('dashboard'));
-    const links = await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link').all();
-    expect(links.length).toBeGreaterThan(0);
-    await page.keyboard.press('Tab'); // the skip link
-    for (const link of links) {
-      await page.keyboard.press('Tab');
-      await expect(link).toBeFocused();
-      const room = await link.evaluate((el) => {
-        // The nav is the scroller, so it clips at its own box. It has no border.
-        const clip = el.closest('nav')!.getBoundingClientRect();
-        const box = el.getBoundingClientRect();
-        const spreads = [...getComputedStyle(el).boxShadow.matchAll(/(\d+)px(?:,|$)/g)].map((m) => Number(m[1]));
-        const reach = Math.max(...spreads);
-        return {
-          reach,
-          left: box.left - reach - clip.left,
-          right: clip.right - box.right - reach,
-          top: box.top - reach - clip.top,
-          bottom: clip.bottom - box.bottom - reach,
-        };
-      });
-      expect(room.reach, 'the ring').toBeGreaterThanOrEqual(2);
-      for (const side of ['left', 'right', 'top', 'bottom'] as const) {
-        expect(room[side], `room on the ${side}`).toBeGreaterThanOrEqual(0);
+  // The short window scrolls the nav, and focus scrolling sets a link's box against
+  // the edge. Each direction meets the other edge, so the walk goes down and back.
+  for (const viewport of [{ width: 1366, height: 768 }, { width: 1100, height: 380 }]) {
+    test(`at ${viewport.width}x${viewport.height} every nav link keeps its whole ring inside the nav`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      await openRoute(app, routeNamed('dashboard'));
+      const nav = page.getByRole('navigation', { name: 'Main navigation' });
+      const links = await nav.getByRole('link').all();
+      expect(links.length).toBeGreaterThan(0);
+      if (viewport.height < 400) {
+        expect(await nav.evaluate((el) => el.scrollHeight > el.clientHeight), 'the nav scrolls here').toBe(true);
       }
-    }
-  });
+      await page.keyboard.press('Tab'); // the skip link
+      const walks = [
+        { key: 'Tab', stops: links },
+        { key: 'Shift+Tab', stops: [...links].reverse().slice(1) },
+      ];
+      for (const { key, stops } of walks) {
+        for (const link of stops) {
+          await page.keyboard.press(key);
+          await expect(link).toBeFocused();
+          const room = await link.evaluate((el) => {
+            // The nav is the scroller, so it clips at its own box. It has no border.
+            const clip = el.closest('nav')!.getBoundingClientRect();
+            const box = el.getBoundingClientRect();
+            const spreads = [...getComputedStyle(el).boxShadow.matchAll(/(\d+)px(?:,|$)/g)].map((m) => Number(m[1]));
+            const reach = Math.max(...spreads);
+            return {
+              reach,
+              left: box.left - reach - clip.left,
+              right: clip.right - box.right - reach,
+              top: box.top - reach - clip.top,
+              bottom: clip.bottom - box.bottom - reach,
+            };
+          });
+          expect(room.reach, 'the ring').toBeGreaterThanOrEqual(2);
+          for (const side of ['left', 'right', 'top', 'bottom'] as const) {
+            expect(room[side], `${key}: room on the ${side}`).toBeGreaterThanOrEqual(0);
+          }
+        }
+      }
+    });
+  }
 
   test('a selected filter chip shows a ring against its own ink fill', async ({ app, page }) => {
     await openRoute(app, routeNamed('candidates-filtered'));
     const chip = page.getByLabel('Filter by status').locator('[aria-pressed="true"]').first();
-    await chip.focus();
-    await page.keyboard.press('Shift+Tab');
-    await page.keyboard.press('Tab');
-    await expect(chip).toBeFocused();
+    await tabTo(page, chip);
     const { fill, shadow } = await chip.evaluate((el) => ({
       fill: getComputedStyle(el).backgroundColor,
       shadow: getComputedStyle(el).boxShadow,
@@ -229,13 +284,7 @@ test.describe('forced colours', () => {
   });
 
   test('the transcript turn being played reads as a selection, its dot still drawn', async ({ app, page }) => {
-    await app.goto(`/candidates/${SEEK_CANDIDATE_ID}`);
-    await page.getByRole('tab', { name: 'Review' }).click();
-    const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await panel.getByRole('combobox').selectOption(SEEK_NORMAL_SESSION_ID);
-    const turn = panel.getByRole('group', { name: 'Call 1 of 2 · first call' }).getByRole('button', { name: /Turn 2:/ });
-    await turn.click();
-    await expect(turn).toHaveAttribute('aria-current', 'true');
+    const turn = await playTurn(app, page);
     await page.emulateMedia({ forcedColors: 'active' });
     expectReadable(await inks(turn));
     const [canvas, fill] = [await canvasOf(page), await fillOf(turn)];
@@ -257,4 +306,87 @@ test.describe('forced colours', () => {
     }
     expect(await fillOf(page.locator('.bg-plate').first())).toBe('rgb(255, 255, 255)');
   });
+
+  test('in a dark theme the completion ring keeps its arc', async ({ app, page }) => {
+    await openRoute(app, routeNamed('dashboard'));
+    await page.emulateMedia({ colorScheme: 'dark', forcedColors: 'active' });
+    const ring = page.getByText(/% complete/).locator('svg');
+    await expect(ring).toBeVisible();
+    const arc = await ring.locator('circle').last().evaluate((el) => getComputedStyle(el).stroke);
+    const ground = await fillOf(ring);
+    expect(ratio(arc, ground), `${arc} on ${ground}`).toBeGreaterThanOrEqual(3);
+  });
+
+  /**
+   * `forced-color-adjust: none` on a selection stops the browser forcing its focus
+   * outline too, so computed style alone can pass a line nobody sees: the pixels
+   * have to change as well.
+   */
+  const SELECTIONS: { name: string; open: (app: AppHarness, page: Page) => Promise<Locator> }[] = [
+    {
+      name: 'a selected tab',
+      open: async (app, page) => {
+        await openRoute(app, routeNamed('mission-control'));
+        return page.getByRole('tab', { selected: true }).first();
+      },
+    },
+    {
+      name: 'a pressed segment',
+      open: async (app, page) => {
+        await openRoute(app, routeNamed('roles'));
+        return page.getByRole('group', { name: 'Filter agents by status' }).locator('[aria-pressed="true"]');
+      },
+    },
+    {
+      name: 'the current nav item',
+      open: async (app, page) => {
+        await openRoute(app, routeNamed('dashboard'));
+        return page.getByRole('navigation', { name: 'Main navigation' }).locator('[aria-current="page"]');
+      },
+    },
+    { name: 'the transcript turn being played', open: playTurn },
+  ];
+
+  for (const colorScheme of ['light', 'dark'] as const) {
+    for (const { name, open } of SELECTIONS) {
+      test(`in a ${colorScheme} theme, keyboard focus shows on ${name}`, async ({ app, page }) => {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        const subject = await open(app, page);
+        await page.emulateMedia({ colorScheme, forcedColors: 'active' });
+        await tabTo(page, subject);
+
+        const cue = await subject.evaluate((el) => {
+          const style = getComputedStyle(el);
+          return {
+            line: style.outlineStyle,
+            width: parseFloat(style.outlineWidth),
+            offset: parseFloat(style.outlineOffset),
+            colour: style.outlineColor,
+            fill: style.backgroundColor,
+          };
+        });
+        expect(cue.line).toBe('solid');
+        expect(cue.width).toBeGreaterThanOrEqual(2);
+        expect(cue.colour, 'a transparent outline').not.toBe('rgba(0, 0, 0, 0)');
+        // Drawn on the fill: the rows these sit in scroll, and would clip it outside.
+        expect(cue.offset, 'the outline is inset').toBeLessThanOrEqual(-cue.width);
+        expect(ratio(cue.colour, cue.fill), `${cue.colour} on ${cue.fill}`).toBeGreaterThanOrEqual(3);
+        expectReadable(await inks(subject));
+        // The outline ends 4px in, so anything closer than that runs under it.
+        const room = await subject.evaluate((el) => {
+          const contents = document.createRange();
+          contents.selectNodeContents(el);
+          const [edge, words] = [el.getBoundingClientRect(), contents.getBoundingClientRect()];
+          return Math.min(words.left - edge.left, edge.right - words.right, words.top - edge.top, edge.bottom - words.bottom);
+        });
+        expect(room, 'room between the edge and the words').toBeGreaterThanOrEqual(4);
+
+        const box = (await subject.boundingBox())!;
+        const focused = await pixelsOf(page, subject, cue.colour);
+        await subject.evaluate((el) => (el as HTMLElement).blur());
+        const resting = await pixelsOf(page, subject, cue.colour);
+        expect(focused - resting, 'pixels the outline adds').toBeGreaterThan(box.width + box.height);
+      });
+    }
+  }
 });

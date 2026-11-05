@@ -404,6 +404,8 @@ describe('shell and accessibility', () => {
     expect(paper![1]).toMatch(/background-color: var\(--paper\)/);
     expect(block).toMatch(/\.bg-plate \{\s*forced-color-adjust: none/);
     expect(read('src/components/charts/EChart.tsx')).toContain('chart-paper');
+    // An SVG keeps its author stroke under forcing too: the arc was 1.2:1 on black.
+    expect(read('src/pages/DashboardPage.tsx')).toMatch(/className="chart-paper [^"]*-rotate-90/);
     expect(read('src/components/charts/LineChart.tsx')).toContain('data-series-key');
     expect(stripCssComments(read('src/styles/candidate-experience.css'))).toMatch(
       /@media \(forced-colors: active\) \{[^@]*\.candidate-brand img, \.candidate-aura__logo-plate \{ forced-color-adjust: none; \}/,
@@ -443,6 +445,28 @@ describe('shell and accessibility', () => {
     expect(children).not.toBeNull();
     expect(children![1]).toMatch(/color: HighlightText !important/);
     expect(children![1]).toMatch(/background-color: transparent !important/);
+  });
+
+  it('draws focus on a selection itself, because `forced-color-adjust: none` keeps the outline transparent', () => {
+    // The rule has to reach all four states, or a focused selection falls back to
+    // `focus:outline-none` and a ring shadow in its author colour.
+    const css = stripCssComments(indexCss);
+    const block = css.slice(css.indexOf('@media (forced-colors: active)'));
+    const focus = /\[aria-current='page'\]:focus-visible,[^{]*\{([^}]*)\}/.exec(block);
+    expect(focus).not.toBeNull();
+    for (const selector of ['[aria-current=\'true\']', '[aria-pressed=\'true\']', '[aria-selected=\'true\']']) {
+      expect(focus![0], selector).toContain(`${selector}:focus-visible`);
+    }
+    // Tailwind prints `focus:outline-none` after this file at the same specificity.
+    expect(focus![1]).toMatch(/outline: 2px solid HighlightText !important/);
+    expect(focus![1]).toMatch(/outline-offset: -4px !important/);
+    expect(focus![1]).toMatch(/box-shadow: none !important/);
+    // This control keeps its own fill, so HighlightText is not sure to show on it.
+    const candidate = stripCssComments(read('src/styles/candidate-experience.css'));
+    const pressed = /@media \(forced-colors: active\) \{[^@]*\.candidate-interview__controls button\[aria-pressed="true"\]:focus-visible \{([^}]*)\}/.exec(candidate);
+    expect(pressed).not.toBeNull();
+    expect(pressed![1]).toMatch(/outline: 2px solid CanvasText !important/);
+    expect(pressed![1]).toMatch(/outline-offset: 2px !important/);
   });
 
   it('keeps every data fill and every filled button visible under forced colours', () => {

@@ -383,6 +383,37 @@ test.describe('the full interview', () => {
     r1.expectHealthy();
   });
 
+  test('a pressed control shows keyboard focus in light and dark contrast themes', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await page.getByRole('button', { name: 'Mute microphone' }).click();
+    const pressed = page.getByRole('button', { name: 'Unmute microphone' });
+    await expect(pressed).toHaveAttribute('aria-pressed', 'true');
+    await pressed.focus();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    await expect(pressed).toBeFocused();
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ colorScheme, forcedColors: 'active' });
+      const cue = await pressed.evaluate((el) => {
+        const style = getComputedStyle(el);
+        return {
+          line: style.outlineStyle,
+          width: style.outlineWidth,
+          offset: style.outlineOffset,
+          colour: style.outlineColor,
+          canvasText: getComputedStyle(document.body).color,
+        };
+      });
+      expect(cue.line).toBe('solid');
+      expect(cue.width).toBe('2px');
+      // Outside the control, so it sits on Canvas: only CanvasText is sure to show there.
+      expect(cue.offset).toBe('2px');
+      expect(cue.colour, colorScheme).toBe(cue.canvasText);
+    }
+    r1.expectHealthy();
+  });
+
   test('leaving asks first, then leaves the room and keeps the nonce for a rejoin', async ({ r1 }) => {
     await reachLive(r1);
     const { page } = r1;

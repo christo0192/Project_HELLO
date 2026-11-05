@@ -407,6 +407,23 @@
     background-color: HighlightText !important;
   }
 
+  /* Focus on a selection. `forced-color-adjust: none` stops the browser forcing
+     the outline as well, so `focus:outline-none` leaves a transparent one, and the
+     ring shadow forcing would have dropped keeps its author colour: ink measured
+     1.16:1 on a light theme's `Highlight`, paper 1.4:1 on a dark one's. So the
+     selection draws its own, in its text colour. Inset because tab rows and
+     segment tracks scroll and would clip it, and 2px in so fill shows either side.
+     `!important` because Tailwind prints its `focus:` variants after this file, at
+     the same specificity. */
+  [aria-current='page']:focus-visible,
+  [aria-current='true']:focus-visible,
+  [aria-pressed='true']:focus-visible,
+  [aria-selected='true']:focus-visible {
+    outline: 2px solid HighlightText !important;
+    outline-offset: -4px !important;
+    box-shadow: none !important;
+  }
+
   /* The option the arrow keys are on. Focus stays in the search field, so this
      is the only cue in the list, and its ring is a shadow. An outline survives. */
   [role='option'][data-active='true'] {
@@ -423,9 +440,10 @@
     outline-offset: -2px;
   }
 
-  /* A canvas keeps its author colours whatever the theme: on the black `Canvas`
-     of a dark contrast theme, a series in carbon ink measured 1.2:1. So a chart
-     and its legend key keep the paper they were drawn for. */
+  /* A canvas keeps its author colours whatever the theme, and so does an SVG
+     stroke: on the black `Canvas` of a dark contrast theme, a series in carbon ink
+     measured 1.2:1. So a chart, its legend key and the Dashboard's completion ring
+     keep the paper they were drawn for. */
   .chart-paper,
   [data-series-key] {
     forced-color-adjust: none;
@@ -440,6 +458,12 @@
   /* The tab row's rule is an inset line, which forcing drops. */
   [role='tablist'] {
     border-bottom: 1px solid CanvasText;
+  }
+
+  /* A tab has no padding, because at rest it is a word over a rule. Here the
+     selected one is a filled box, and its focus outline would cross the word. */
+  [role='tab'] {
+    padding-inline: 0.5rem;
   }
 
   /* A fill that is the data: a bar, a meter, a legend swatch. `!important`

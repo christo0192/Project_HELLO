@@ -124,4 +124,11 @@
   .candidate-aura__bubble { background: Canvas; border: 1px solid currentColor; opacity: 1; }
   /* The logo's own white plate, in every theme. */
   .candidate-brand img, .candidate-aura__logo-plate { forced-color-adjust: none; }
+  /* A pressed control outranks index.css's selection fill, so it keeps its own, and
+     HighlightText need not show on that. Its outline stays outside, on Canvas: left
+     in ink, nothing forces it, and it measured 1.2:1 on a dark theme's Canvas. */
+  .candidate-interview__controls button[aria-pressed="true"]:focus-visible {
+    outline: 2px solid CanvasText !important;
+    outline-offset: 2px !important;
+  }
 }

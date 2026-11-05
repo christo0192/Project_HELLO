@@ -531,7 +531,7 @@ function CompletionMeta({ completionPct }: { completionPct: number }) {
   const c = 2 * Math.PI * r;
   return (
     <span className="inline-flex items-center gap-1.5 rounded-chip bg-surface-secondary py-0.5 pl-1 pr-2 text-meta font-medium tabular-nums text-ink-secondary">
-      <svg aria-hidden="true" viewBox="0 0 16 16" className="h-4 w-4 -rotate-90">
+      <svg aria-hidden="true" viewBox="0 0 16 16" className="chart-paper h-4 w-4 -rotate-90 rounded-full">
         <circle cx="8" cy="8" r={r} fill="none" strokeWidth="2.5" className="stroke-ink/[0.1]" />
         <circle
           cx="8"
