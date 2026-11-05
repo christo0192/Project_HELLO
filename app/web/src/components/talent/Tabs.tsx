@@ -29,6 +29,8 @@ export interface TabItem {
   id: string;
   label: string;
   panel: ReactNode;
+  /** Cannot be selected, and the arrow keys step over it. The page says why. */
+  disabled?: boolean;
 }
 
 export interface TabsProps {
@@ -76,6 +78,15 @@ export function Tabs({
     onSelect?.(items[index].id);
   }
 
+  /** The first enabled tab after `from`, going `direction`, wrapping. */
+  function nextEnabled(from: number, direction: 1 | -1): number {
+    for (let step = 1; step <= count; step += 1) {
+      const index = (from + direction * step + count * 2) % count;
+      if (!items[index].disabled) return index;
+    }
+    return from;
+  }
+
   function selectAndFocus(index: number) {
     const next = (index + count) % count;
     setActiveIndex(next);
@@ -86,19 +97,19 @@ export function Tabs({
     switch (event.key) {
       case 'ArrowRight':
         event.preventDefault();
-        selectAndFocus(index + 1);
+        selectAndFocus(nextEnabled(index, 1));
         break;
       case 'ArrowLeft':
         event.preventDefault();
-        selectAndFocus(index - 1);
+        selectAndFocus(nextEnabled(index, -1));
         break;
       case 'Home':
         event.preventDefault();
-        selectAndFocus(0);
+        selectAndFocus(nextEnabled(-1, 1));
         break;
       case 'End':
         event.preventDefault();
-        selectAndFocus(count - 1);
+        selectAndFocus(nextEnabled(count, -1));
         break;
       default:
         break;
@@ -123,6 +134,7 @@ export function Tabs({
               aria-selected={selected}
               aria-controls={panelId(index)}
               tabIndex={selected ? 0 : -1}
+              disabled={item.disabled}
               onClick={() => setActiveIndex(index)}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
@@ -132,7 +144,8 @@ export function Tabs({
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--c-accent)]',
                 selected
                   ? 'border-[var(--c-ink)] text-[var(--c-ink)]'
-                  : 'border-transparent text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)]',
+                  : 'border-transparent text-[var(--c-ink-secondary)] enabled:hover:text-[var(--c-ink)]',
+                'disabled:cursor-not-allowed disabled:text-[var(--c-ink-muted)]',
               )}
             >
               {item.label}

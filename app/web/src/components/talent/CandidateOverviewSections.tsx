@@ -558,7 +558,7 @@ export function CandidateProfileCard({
   );
 }
 
-function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
+export function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
   if (!facts) return null;
   const recent = facts.recent_role;
   const recentLabel = recent

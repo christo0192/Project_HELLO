@@ -1447,3 +1447,156 @@ describe('accessibility (axe, every state)', () => {
     expect(screen.getByRole('button', { name: 'Load recording, Attempt 2 (retake)' })).toBeInTheDocument();
   });
 });
+
+/* ── A host that draws its own controls ───────────────────────────── */
+
+describe('a host that draws its own controls', () => {
+  const custom = (over: Partial<R1RecordingPlayerProps> = {}) => renderPlayer({ controls: 'custom', ...over });
+
+  /** The first play: mint, then the media element, driven, with metadata loaded. */
+  async function firstPlay(r: Rendered, selector = 'video') {
+    act(() => {
+      r.ref.current!.playFrom(0);
+    });
+    await waitFor(() => expect(mediaEl(r.view, selector)).not.toBeNull());
+    const el = mediaEl(r.view, selector)!;
+    const state = drive(el);
+    fireEvent.loadedMetadata(el);
+    return { el, state };
+  }
+
+  it('offers no native controls and no Load button, and mints nothing until the first play', () => {
+    const r = custom();
+    expect(screen.queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
+    expect(mediaEl(r.view)).toBeNull();
+    expect(mockApi.getR1Recording).not.toHaveBeenCalled();
+    expect(r.view.container).toHaveTextContent('Recording loads when you press play. The link expires.');
+  });
+
+  it('mints on the first play and keeps nodownload on the media', async () => {
+    const r = custom();
+    const { el, state } = await firstPlay(r);
+    expect(mockApi.getR1Recording).toHaveBeenCalledTimes(1);
+    expect(el).not.toHaveAttribute('controls');
+    expect(el).toHaveAttribute('controlslist', 'nodownload');
+    expect(state.play).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports the length of the media once metadata is there, and ignores one that is not a number', async () => {
+    const onDuration = vi.fn();
+    const r = custom({ onDuration });
+    act(() => {
+      r.ref.current!.playFrom(0);
+    });
+    await waitFor(() => expect(mediaEl(r.view, 'video')).not.toBeNull());
+    const el = mediaEl(r.view, 'video')!;
+    drive(el);
+    Object.defineProperty(el, 'duration', { configurable: true, get: () => Number.POSITIVE_INFINITY });
+    fireEvent.loadedMetadata(el);
+    expect(onDuration).not.toHaveBeenCalled();
+    Object.defineProperty(el, 'duration', { configurable: true, get: () => 423 });
+    fireEvent.loadedMetadata(el);
+    expect(onDuration).toHaveBeenCalledWith(423);
+  });
+
+  it('sets the speed and the volume on the media', async () => {
+    const r = custom();
+    const { el } = await firstPlay(r);
+    act(() => {
+      r.ref.current!.setRate(1.5);
+      r.ref.current!.setVolume(0.4);
+      r.ref.current!.setMuted(true);
+    });
+    expect(el.playbackRate).toBe(1.5);
+    expect(el.volume).toBe(0.4);
+    expect(el.muted).toBe(true);
+  });
+
+  it('applies a speed chosen before the media exists, as soon as it does', async () => {
+    const r = custom();
+    act(() => r.ref.current!.setRate(2));
+    const { el } = await firstPlay(r);
+    expect(el.playbackRate).toBe(2);
+  });
+
+  it('keeps the speed and volume on a fresh link: loading a source resets them', async () => {
+    const r = custom();
+    const { el } = await firstPlay(r);
+    act(() => {
+      r.ref.current!.setRate(1.25);
+      r.ref.current!.setVolume(0.5);
+    });
+    // What the browser does when a new source loads.
+    el.playbackRate = 1;
+    el.volume = 1;
+    fireEvent.loadedMetadata(el);
+    expect(el.playbackRate).toBe(1.25);
+    expect(el.volume).toBe(0.5);
+  });
+
+  it('gives a recovered pair the same speed on both halves, and leaves the picture muted', async () => {
+    mockApi.getR1Recording.mockResolvedValue(minted({ mode: 'split', url: undefined, video_url: URL_ONE, audio_url: URL_TWO }));
+    const r = custom({ summary: listed({ mode: 'split' }) });
+    const { el: audio } = await firstPlay(r, 'audio');
+    const video = mediaEl(r.view, 'video')!;
+    act(() => r.ref.current!.setRate(1.5));
+    expect(audio.playbackRate).toBe(1.5);
+    expect(video.playbackRate).toBe(1.5);
+    expect(video.muted).toBe(true);
+    expect(audio).not.toHaveAttribute('controls');
+  });
+
+  it('says an audio-only recording is one, instead of drawing a black box', async () => {
+    mockApi.getR1Recording.mockResolvedValue(minted({ has_video: false, content_type: 'audio/ogg' }));
+    const r = custom({ summary: listed({ has_video: false }) });
+    await firstPlay(r, 'audio');
+    expect(r.view.container).toHaveTextContent('Audio only');
+    expect(mediaEl(r.view, 'video')).toBeNull();
+  });
+
+  it('shows a failed link with Try again, in plain words', async () => {
+    mockApi.getR1Recording.mockRejectedValueOnce(new TestApiError('service_unavailable', 503));
+    const r = custom();
+    act(() => {
+      r.ref.current!.playFrom(0);
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load the recording. Try again.');
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
+  });
+
+  it('never prints the signed link', async () => {
+    const r = custom();
+    await firstPlay(r);
+    expect(r.view.container.textContent).not.toContain(SIG_ONE);
+    for (const node of r.view.container.querySelectorAll('*')) {
+      for (const attribute of node.attributes) {
+        if (attribute.name !== 'src') expect(attribute.value).not.toContain(SIG_ONE);
+      }
+    }
+  });
+
+  it('leaves the native player as it was', () => {
+    renderPlayer();
+    expect(loadButton()).toBeInTheDocument();
+  });
+});
+
+describe('starting over happens in the commit, not after the paint', () => {
+  it('keeps a play made in the commit that shows a new attempt', async () => {
+    const r = renderPlayer({ controls: 'custom' });
+    // A mutation observer is a microtask: this lands between the commit and any passive effect.
+    const box = r.view.container.firstElementChild as HTMLElement;
+    const watcher = new MutationObserver(() => {
+      watcher.disconnect();
+      r.ref.current!.playFrom(12);
+    });
+    watcher.observe(box, { attributes: true, attributeFilter: ['data-session'] });
+    r.rerender({ sessionId: 'session-2' });
+    await waitFor(() => expect(mockApi.getR1Recording).toHaveBeenCalledWith('round-1', 'session-2'));
+    await waitFor(() => expect(mediaEl(r.view, 'video')).not.toBeNull());
+    const el = mediaEl(r.view, 'video')!;
+    const state = drive(el);
+    fireEvent.loadedMetadata(el);
+    expect(state.sets).toEqual([12]);
+  });
+});

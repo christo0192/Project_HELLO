@@ -5,9 +5,10 @@ import { generateInviteToken, hashInviteToken } from '../lib/invite-token.js';
 import { getR1Config } from '../lib/r1/config.js';
 import { env } from '../lib/env.js';
 import { requireRole } from '../lib/rbac.js';
-import { recordAudit } from '../lib/audit.js';
+import { auditAccessDenied, recordAudit } from '../lib/audit.js';
 import { projectRecordingContext } from '../lib/r1/recording/context.js';
 import { withRecordingAttempts } from '../lib/r1/recording/summary.js';
+import { readR1Review } from '../lib/r1/review.js';
 
 export const r1Router = Router();
 export const r1InternalRouter = Router();
@@ -77,6 +78,26 @@ r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (r
   // withheld, not unscored, even if its copy of the candidate predates the appeal.
   const rounds = candidate.decision_use_blocked_at != null ? (data ?? []).map((round) => ({ ...round, recommendation: null, overall: null, status_write: null, pending_reject_until: null, scores_withheld: true })) : (data ?? []);
   res.json({ rounds: await withRecordingAttempts(supabase as never, rounds) });
+} catch (e) { next(e); } });
+
+/**
+ * One round as a reviewer sees it (lib/r1/review.ts). Viewer and above, by the rule of the R1 video,
+ * so this is where viewers gain R1 transcripts; the phone transcript route stays admin-only. It
+ * carries a transcript, so it is never cached. A read event: the audit fails open.
+ */
+r1Router.get('/interview-rounds/:id/review', requireRole('viewer'), async (req, res, next) => { try {
+  res.setHeader('Cache-Control', 'no-store');
+  if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+  const actor = req.authUser!;
+  const result = await readR1Review(supabase as never, { id: actor.id, appRole: actor.appRole, active: actor.active }, req.params.id);
+  if (result.kind === 'forbidden') {
+    await auditAccessDenied(req, 'r1_review_access_denied').catch(() => undefined);
+    return res.status(403).json({ error: 'access_denied' });
+  }
+  if (result.kind === 'not_found') return res.status(404).json({ error: 'not_found' });
+  if (result.kind === 'unavailable') return res.status(503).json({ error: 'service_unavailable' });
+  await recordAudit(req, 'resource.read', 200, { metadata: { resource: 'r1_review', round_id: req.params.id, requested_by: actor.id, role: actor.appRole, scores_withheld: result.scoresWithheld, consent_withdrawn: result.consentWithdrawn } }).catch(() => undefined);
+  res.json(result.body);
 } catch (e) { next(e); } });
 
 for (const action of ['cancel', 'reissue', 'grant-retake'] as const) r1Router.post(`/interview-rounds/:id/${action}`, requireRole('interviewer'), async (req, res, next) => { try {

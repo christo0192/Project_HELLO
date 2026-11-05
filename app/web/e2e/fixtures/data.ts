@@ -65,7 +65,7 @@ import type {
   SessionDetail,
   TranscriptLine,
 } from '../../src/types';
-import type { R1RecordingPlayback, R1Round } from '../../src/lib/r1-types';
+import type { R1RecordingPlayback, R1ReviewResponse, R1ReviewTurn, R1Round } from '../../src/lib/r1-types';
 import { FROZEN_NOW_MS } from './env';
 
 /* ── Time + id helpers ────────────────────────────────────────────────── */
@@ -1495,6 +1495,173 @@ const R1_ROUNDS: R1Round[] = [
   },
 ];
 
+
+/**
+ * The R1 review (`GET /api/interview-rounds/:id/review`). The interview is invented and long enough to
+ * show the role-play clock's two marks. The media the mint serves is `R1_REC_LENGTH_SEC` long, so a
+ * spec that really seeks uses a turn inside it (`R1_REVIEW_SEEK_SEC`).
+ */
+export const R1_REVIEW_LENGTH_SEC = 1660;
+export const R1_REVIEW_SEEK_SEC = 70;
+const R1_ROLEPLAY_START_SEC = 300;
+
+const R1_REVIEW_LINES: ReadonlyArray<[number, 'bot' | 'candidate', R1ReviewTurn['phase'], string]> = [
+  [5, 'bot', 'opening', 'Hello Naveen, I am Christy, the AI interviewer for this round. Thank you for joining.'],
+  [24, 'candidate', 'opening', 'Thank you. Happy to be here.'],
+  [32, 'bot', 'icebreaker', 'To start, tell me a little about the work you do today.'],
+  [R1_REVIEW_SEEK_SEC, 'candidate', 'icebreaker', 'I look after inbound enquiries for an education company, and I enjoy working out what people really need.'],
+  [118, 'bot', 'icebreaker', 'What do you find hardest about that work?'],
+  [141, 'candidate', 'icebreaker', 'Knowing when to stop talking, mostly. I am getting better at it.'],
+  [205, 'bot', 'transition', 'In a moment you will speak to a prospective learner as the Program Advisor. Shall we start, or do you have any questions first?'],
+  [262, 'candidate', 'transition', 'I am ready, thank you.'],
+  [R1_ROLEPLAY_START_SEC, 'bot', 'roleplay', 'Hi, I filled in your form about the Data Science course. I am just exploring options.'],
+  [318, 'candidate', 'roleplay', 'Thanks for calling back. What made you start looking at this now?'],
+  [344, 'bot', 'roleplay', 'Things at work feel a bit uncertain, and I have been in the same spot for a while.'],
+  [372, 'candidate', 'roleplay', 'That sounds stressful. What would need to change for this to feel worth it to you?'],
+  [430, 'bot', 'roleplay', 'I would want something with real structure. I tried a free course and gave up.'],
+  [468, 'candidate', 'roleplay', 'That makes sense. The live classes and mock interviews are what keep people going.'],
+  [560, 'bot', 'roleplay', 'Nine thousand dollars is a lot. I was thinking closer to seven.'],
+  [596, 'candidate', 'roleplay', 'I understand. Before we talk numbers, can I ask what a new role would mean for you?'],
+  [705, 'bot', 'roleplay', 'It would mean not worrying about next year.'],
+  [742, 'candidate', 'roleplay', 'Then the question is whether six months of structure is worth that peace of mind.'],
+  [905, 'bot', 'roleplay', 'I need to talk to my husband before I decide.'],
+  [938, 'candidate', 'roleplay', 'Of course. Would Thursday evening work for a call with both of you?'],
+  [1120, 'bot', 'roleplay', 'Thursday could work, but I am still not sure about the price.'],
+  [1168, 'candidate', 'roleplay', 'If you enrol before the deadline there is a discount tied to the payment plan.'],
+  [1410, 'bot', 'roleplay', 'All right, let us talk on Thursday.'],
+  [R1_ROLEPLAY_START_SEC + 1200, 'bot', 'roleplay_exit', 'Let us pause the role-play here. Thank you.'],
+  [1540, 'bot', 'wrapup', 'Before we finish, do you have any questions about the role or the next steps?'],
+  [1562, 'candidate', 'wrapup', 'No, that was clear. Thank you.'],
+  [1610, 'bot', 'closing', 'Thank you, Naveen. The team will review this interview.'],
+];
+
+/** A cut AI line: its stored end is not exact, so the strip keeps it a tick. */
+export const R1_REVIEW_CUT_TURN = 16;
+
+const R1_REVIEW_TURNS: R1ReviewTurn[] = R1_REVIEW_LINES.map(([sec, speaker, phase, text], index) => ({
+  turn_index: index,
+  speaker,
+  text,
+  turn_started_at_ms: R1_REC_START_MS + sec * 1000,
+  // About the length of the line, as the worker would store it.
+  turn_ended_at_ms: R1_REC_START_MS + (sec + Math.max(2, Math.round(text.length * 0.07))) * 1000,
+  ai_voice: speaker === 'candidate' ? null : phase === 'roleplay' ? 'learner' : 'interviewer',
+  is_gate: false,
+  phase,
+  interrupted: index === R1_REVIEW_CUT_TURN,
+}));
+
+const R1_METRIC_ROWS: ReadonlyArray<[string, number, number | null, string, Array<[number, string]>]> = [
+  ['Probing & discovery', 2500, 3, 'Asked open questions before any price, and linked the pitch to the need that came out.', [[9, 'What made you start looking at this now'], [11, 'What would need to change']]],
+  ['Objection handling', 2500, 2, 'Moved the price objection to a question about value, but left it open.', [[15, 'Before we talk numbers']]],
+  ['Urgency & close', 1500, 3, 'Asked for a dated next step that included the decision-maker.', [[19, 'Would Thursday evening work']]],
+  ['Negotiation & discount discipline', 1500, null, 'No discount was traded for a commitment, so this could not be judged.', []],
+  ['Communication & rapport', 2000, 3, 'Clear and polite throughout; it referred back to what the learner said.', [[3, 'I look after inbound enquiries']]],
+];
+
+const R1_RUBRIC_LEVELS = { 1: 'Well below what the role needs.', 2: 'Some of it, with gaps.', 3: 'What the role needs.', 4: 'Beyond what the role needs.' };
+
+const R1_REVIEW: R1ReviewResponse = {
+  round: {
+    id: R1_ROUND_ID,
+    candidate_id: R1_CANDIDATE_ID,
+    status: 'completed',
+    expires_at: iso(FROZEN_NOW_MS - 1 * DAY),
+    attempts_allowed: 2,
+    attempts_counted: 2,
+    recommendation: 'hold',
+    overall: 58,
+    status_write: null,
+    pending_reject_until: null,
+    scores_withheld: false,
+    is_staff_dry_run: false,
+    created_at: ago(5 * DAY),
+    created_by: ADMIN_USER_ID,
+  },
+  candidate: {
+    id: R1_CANDIDATE_ID,
+    name: 'Naveen Kapoor',
+    role_title: 'Sales Program Advisor',
+    skills: ['Consultative selling', 'CRM hygiene'],
+    experience_years: 4,
+    resume: {
+      summary: 'Four years of inbound education sales.',
+      recent_role: { title: 'Admissions counsellor', employer: 'Example Learning', period: '2023 to now' },
+      education: ['BA Economics'],
+    },
+  },
+  attempts: [
+    {
+      session_id: R1_SESSION_ATTEMPT_1,
+      attempt_number: 1,
+      counted: true,
+      outcome: 'complete',
+      recording: r1Recording({ duration_ms: R1_REVIEW_LENGTH_SEC * 1000 }),
+      persona_id: 'p1_career_switcher',
+      persona_label: 'Career switcher',
+      learner_name: 'Priya Nair',
+      session_status: 'completed',
+      started_at: iso(R1_REC_START_MS),
+      ended_at: iso(R1_REC_START_MS + R1_REVIEW_LENGTH_SEC * 1000),
+      consent_withdrawn: false,
+      transcript_hidden: false,
+      turns: R1_REVIEW_TURNS,
+    },
+    {
+      session_id: R1_SESSION_ATTEMPT_2,
+      attempt_number: 2,
+      counted: true,
+      outcome: 'complete',
+      recording: r1Recording({ has_video: false, reason: 'video_unavailable', started_at_ms: R1_REC_START_MS + DAY, duration_ms: 90_000 }),
+      persona_id: 'p2_recent_grad',
+      persona_label: 'Recent graduate',
+      learner_name: null,
+      session_status: 'completed',
+      started_at: iso(R1_REC_START_MS + DAY),
+      ended_at: iso(R1_REC_START_MS + DAY + 90_000),
+      consent_withdrawn: false,
+      transcript_hidden: false,
+      turns: [{ turn_index: 0, speaker: 'bot', text: 'Thanks for the retake. Where shall we start?', turn_started_at_ms: R1_REC_START_MS + DAY + 4_000, is_gate: false, phase: 'opening', interrupted: false }],
+    },
+  ],
+  assessment: {
+    id: uid('a', 901),
+    session_id: R1_SESSION_ATTEMPT_1,
+    recommendation: 'hold',
+    raw_recommendation: 'hold',
+    overall_score: 58,
+    scoring_status: 'incomplete_evidence',
+    score_scale_max: 4,
+    created_at: iso(R1_REC_START_MS + 2_000_000),
+    metric_results: R1_METRIC_ROWS.map(([name, weight, score, rationale, evidence], index) => ({
+      metric_id: `r1_metric_${index}`,
+      name,
+      weight_bps: weight,
+      score,
+      evidence_status: score === null ? 'insufficient_evidence' : 'scored',
+      rationale,
+      evidence: evidence.map(([turn_index, quote]) => ({ turn_index, quote })),
+    })),
+    r1: {
+      outcome: 'scored',
+      valid: true,
+      code: null,
+      gate: { passed: true, failures: [] },
+      administration_quality: { status: 'ok', failures: [] },
+      agreement: { runs_agree: false, disagreement: 0.8 },
+      thresholds: { advance: 65, hold: 45 },
+    },
+  },
+  events: [
+    { session_id: R1_SESSION_ATTEMPT_1, event_type: 'need_revealed', turn_index: 10, family_id: null, need: 'H1', kind: null, created_at: null },
+    { session_id: R1_SESSION_ATTEMPT_1, event_type: 'need_revealed', turn_index: 12, family_id: null, need: 'H2', kind: null, created_at: null },
+    { session_id: R1_SESSION_ATTEMPT_1, event_type: 'family_delivered', turn_index: 14, family_id: 'F1', need: null, kind: null, created_at: null },
+    { session_id: R1_SESSION_ATTEMPT_1, event_type: 'discount_detected', turn_index: 21, family_id: null, need: null, kind: null, created_at: null },
+  ],
+  phone_screening: { recommendation: 'advance', overall_score: 71, created_at: ago(9 * DAY) },
+  rubric: R1_METRIC_ROWS.map(([name, weight], index) => ({ key: `r1_metric_${index}`, name, weight_bps: weight, levels: R1_RUBRIC_LEVELS })),
+};
+
 /* ── The dataset ──────────────────────────────────────────────────────── */
 
 export interface Dataset {
@@ -1545,6 +1712,8 @@ export interface Dataset {
   r1: {
     rounds: R1Round[];
     mints: Record<string, Array<Partial<R1RecordingPlayback> | null>>;
+    /** The review of `R1_ROUND_ID`. Change it to reach any state of the page. */
+    review: R1ReviewResponse;
   };
 }
 
@@ -1570,7 +1739,7 @@ export function createDataset(): Dataset {
     quotas: QUOTAS,
     appointments: APPOINTMENTS,
     ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW },
-    r1: { rounds: R1_ROUNDS, mints: {} },
+    r1: { rounds: R1_ROUNDS, mints: {}, review: R1_REVIEW },
   });
   return {
     ...d,
