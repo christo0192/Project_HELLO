@@ -13,6 +13,7 @@
  *   · capacity is stated as advisory, and booking is never described as
  *     guaranteeing a dial.
  */
+import { optionsOf, pickOption } from '../components/design/__tests__/helpers';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -81,8 +82,8 @@ beforeEach(() => {
 async function openBookingForm() {
   await screen.findByRole('table');
   await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
-  await screen.findByLabelText('Candidate');
-  await userEvent.selectOptions(screen.getByLabelText('Candidate'), 'cand-1');
+  await screen.findByRole('button', { name: /^Candidate/ });
+  await pickOption(userEvent.setup(), /^Candidate/, /./);
   const radios = await screen.findAllByRole('radio');
   await userEvent.click(radios[0]);
 }
@@ -170,9 +171,8 @@ describe('booking', () => {
     renderPage();
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
-    await screen.findByLabelText('Candidate');
+    await screen.findByRole('button', { name: 'Candidate Select a candidate' });
 
-    expect(screen.getByRole('combobox', { name: 'Candidate' })).toHaveValue('');
     expect(screen.getByRole('button', { name: 'Book' })).toBeDisabled();
     expect(apiFns.scheduleCandidatePhoneAppointment).not.toHaveBeenCalled();
   });
@@ -218,10 +218,8 @@ describe('cancel', () => {
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
 
-    await userEvent.selectOptions(
-      await screen.findByLabelText('Cancellation reason'),
-      'candidate_request',
-    );
+    await screen.findByRole('button', { name: /^Cancellation reason/ });
+    await pickOption(userEvent.setup(), /^Cancellation reason/, /candidate/i);
     await userEvent.click(screen.getByRole('button', { name: 'Cancel appointment' }));
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel it' }));
 
@@ -237,20 +235,17 @@ describe('cancel', () => {
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
 
-    const select = await screen.findByLabelText('Cancellation reason');
-    const values = within(select)
-      .getAllByRole('option')
-      .map((o) => (o as HTMLOptionElement).value);
-    expect(values.sort()).toEqual([
-      'candidate_request',
-      'emergency_stop',
-      'engagement_cancelled',
-      'hr_cancelled',
+    await screen.findByRole('button', { name: /^Cancellation reason/ });
+    // Superseded and an expired deferral are written only by the substrate:
+    // offering either would let an operator write an audit trail that
+    // misdescribes what happened.
+    const labels = await optionsOf(userEvent.setup(), /^Cancellation reason/);
+    expect(labels.sort()).toEqual([
+      'Candidate asked to cancel',
+      'Emergency stop',
+      'Engagement cancelled',
+      'HR cancelled',
     ]);
-    // Written only by the substrate — offering either would let an operator
-    // write an audit trail that misdescribes what happened.
-    expect(values).not.toContain('superseded');
-    expect(values).not.toContain('system_deferral_expired');
   });
 
   it('reports an idempotent repeat as "nothing changed", not as a failure', async () => {
@@ -417,7 +412,7 @@ describe('capacity semantics', () => {
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
 
-    expect(await screen.findByText(/fleet limit is currently unknown/i)).toBeInTheDocument();
+    expect(await screen.findByText(/calling limit is currently unknown/i)).toBeInTheDocument();
     // "0 concurrent calls" would say the fleet can make no calls at all — a
     // different, and false, statement.
     const text = document.body.textContent ?? '';
@@ -607,7 +602,7 @@ describe('a refusal does not throw away the operator input', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Confirm' }));
 
     await screen.findByText(/outside the approved calling window/i);
-    expect(screen.getByLabelText('Candidate')).toHaveValue('cand-1');
+    expect(screen.getByRole('button', { name: /^Candidate/ })).not.toHaveAccessibleName('Candidate Select a candidate');
     expect((await screen.findAllByRole('radio'))[0]).toBeChecked();
   });
 
@@ -617,9 +612,7 @@ describe('a refusal does not throw away the operator input', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Book' }));
     await userEvent.click(await screen.findByRole('button', { name: 'Confirm' }));
 
-    await waitFor(() =>
-      expect(screen.getByLabelText('Candidate')).toHaveValue(''),
-    );
+    await screen.findByRole('button', { name: 'Candidate Select a candidate' });
   });
 
   it('keeps the chosen slot when a reschedule is refused', async () => {
@@ -727,5 +720,75 @@ describe('stored cancel reasons read as English', () => {
     await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
 
     expect(await screen.findByText('Superseded by a reschedule')).toBeInTheDocument();
+  });
+});
+
+describe('the way from a call to the person', () => {
+  it('links the name in the detail to the candidate', async () => {
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
+    const region = await screen.findByRole('region', { name: 'Selected appointment' });
+    const link = within(region).getByRole('heading', { level: 2 }).querySelector('a');
+    expect(link).not.toBeNull();
+    expect(link!.getAttribute('href')).toMatch(/^\/candidates\/.+/);
+  });
+
+  it('says a missed call comes round again by itself', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({ appointments: [appointment({ status: 'missed', engagement_state: 'eligible' })] }),
+    );
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
+    expect(await screen.findByText(/will be called again without a booking/)).toBeInTheDocument();
+    expect(screen.queryByText(/nothing will dial/)).not.toBeInTheDocument();
+  });
+
+  it('offers no booking on a missed call whose screening has ended', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({
+        appointments: [
+          appointment({ status: 'missed', engagement_state: 'cancelled', cancel_reason: 'engagement_cancelled' }),
+        ],
+      }),
+    );
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
+    const note = await screen.findByText(/This slot passed without a call/);
+    expect(note).toHaveTextContent(/This screening has ended/);
+    expect(note).not.toHaveTextContent(/book/i);
+  });
+
+  it('booking searches by email without printing one', async () => {
+    apiFns.listCandidates.mockResolvedValue([
+      { ...PHONE_BOOKING_CANDIDATES[0], email: 'asha.rao@example.com' },
+      { ...PHONE_BOOKING_CANDIDATES[0], id: 'cand-2', name: 'Dev Nair', email: 'dev.nair@example.com' },
+    ]);
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Candidate/ }));
+    const search = screen.getByRole('combobox', { name: 'Search by name or email' });
+    expect(search).toHaveFocus();
+    await userEvent.type(search, 'dev.nair@example');
+    const list = screen.getByRole('listbox', { name: 'Candidates' });
+    expect(within(list).getByRole('option', { name: /Dev Nair/ })).toBeInTheDocument();
+    expect(within(list).queryByRole('option', { name: /Asha Rao/ })).not.toBeInTheDocument();
+    expect(list.textContent).not.toMatch(/@/);
+  });
+
+  it('says the candidate list did not load, and Try again reads it again', async () => {
+    apiFns.listCandidates.mockRejectedValueOnce(new MockApiError('service_unavailable', 503));
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
+    const panel = await screen.findByRole('region', { name: 'Book a phone screening' });
+    expect(await within(panel).findByRole('alert')).toHaveTextContent(/The candidate list couldn't load\./);
+    await userEvent.click(within(panel).getByRole('button', { name: 'Try again' }));
+    expect(await within(panel).findByRole('button', { name: /^Candidate/ })).toBeInTheDocument();
+    expect(within(panel).queryByRole('alert')).not.toBeInTheDocument();
+    expect(apiFns.listCandidates).toHaveBeenCalledTimes(2);
   });
 });

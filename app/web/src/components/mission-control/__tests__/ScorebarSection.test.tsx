@@ -205,6 +205,16 @@ describe('ScorebarSection', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'New metric' })).toHaveFocus());
   });
 
+  it('names the block when the first read fails, in words, with a retry', async () => {
+    api.listScorecardMetrics.mockRejectedValueOnce(new Error('service_unavailable'));
+    render(<ScorebarSection />);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/^Scorecard metrics couldn't load\./);
+    expect(alert).not.toHaveTextContent('service_unavailable');
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  });
+
   it('shows EVERY problem at once and focuses the first', async () => {
     render(<ScorebarSection />);
     const user = userEvent.setup();

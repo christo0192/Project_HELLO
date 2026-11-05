@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type { FunnelSummaryResponse, FunnelFailuresResponse } from '../../types';
 import {
   Button,
@@ -61,7 +62,7 @@ export function FunnelSection() {
         setFailures(f);
       })
       .catch((e: ApiError) => {
-        if (gen === loadGen.current) setLoadError(e.message);
+        if (gen === loadGen.current) setLoadError(`The funnel couldn't load. ${plainErrorText(e.message)}`);
       });
   }, []);
 
@@ -88,7 +89,10 @@ export function FunnelSection() {
 
   const t = summary.totals;
   const c = summary.conversions;
-  const stages: Array<{ label: string; value: number; conv: number | null }> = [
+  // The reference-check step is HR's, and until that tracking is wired a 0 here
+  // would read as nobody getting there. Unknown is a dash, as on the Dashboard.
+  const untracked = summary.meta?.hr_tracking_configured === false;
+  const stages: Array<{ label: string; value: number; conv: number | null; untracked?: boolean }> = [
     { label: 'Entered parser', value: t.entered_parse, conv: null },
     { label: 'Parsed OK', value: t.parsed_ok, conv: t.entered_parse > 0 ? t.parsed_ok / t.entered_parse : null },
     { label: 'Dialed', value: t.dialed, conv: c.parse_to_dial },
@@ -97,7 +101,7 @@ export function FunnelSection() {
     { label: 'Answered ≥1', value: t.answered_ge1, conv: c.consent_to_answered },
     { label: 'Scored', value: t.scored, conv: c.answered_to_scored },
     { label: 'Qualified', value: t.qualified, conv: c.scored_to_qualified },
-    { label: 'Reached reference check', value: t.reached_reference_check, conv: c.qualified_to_reference_check },
+    { label: 'Reached reference check', value: t.reached_reference_check, conv: c.qualified_to_reference_check, untracked },
   ];
 
   const dropBuckets: Array<{ label: string; value: number }> = [
@@ -145,21 +149,21 @@ export function FunnelSection() {
       ) : (
         <>
           {/* Stat strip */}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 border-y border-line-strong py-3 sm:grid-cols-4">
             {[
               { k: 'Total call minutes', v: String(totalMinutes) },
               { k: 'Avg mins / connect', v: String(avgMinsPerConnect) },
               { k: 'Attempts', v: String(t.attempts_total) },
               { k: 'Connects', v: String(t.connects_total) },
             ].map((s) => (
-              <div key={s.k} className="rounded-control bg-surface-tertiary px-3 py-2">
-                <p className="text-xs text-ink-tertiary">{s.k}</p>
+              <div key={s.k}>
+                <p className="form-label">{s.k}</p>
                 <p className="tabular-nums text-lg font-semibold text-ink">{s.v}</p>
               </div>
             ))}
           </div>
 
-          <Table caption="Funnel stages with step-to-step conversion" maxHeight="30rem">
+          <Table bare flush caption="Funnel stages with step-to-step conversion" maxHeight="30rem">
             <THead>
               <Tr>
                 <Th>Stage</Th>
@@ -171,9 +175,11 @@ export function FunnelSection() {
               {stages.map((s) => (
                 <Tr key={s.label}>
                   <Td className="text-ink">{s.label}</Td>
-                  <Td className="tabular-nums text-ink">{s.value}</Td>
+                  <Td className="tabular-nums text-ink">{s.untracked ? '—' : s.value}</Td>
                   <Td>
-                    {s.conv == null ? (
+                    {s.untracked ? (
+                      <span className="text-ink-tertiary">Not tracked yet</span>
+                    ) : s.conv == null ? (
                       <span className="text-ink-tertiary">—</span>
                     ) : (
                       <StatusBadge tone={convTone(s.conv)}>{pct(s.conv)}</StatusBadge>
@@ -185,10 +191,10 @@ export function FunnelSection() {
           </Table>
 
           {/* Disqualification / drop buckets */}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 border-y border-line-strong py-3 sm:grid-cols-3">
             {dropBuckets.map((b) => (
-              <div key={b.label} className="rounded-control bg-surface-tertiary px-3 py-2">
-                <p className="text-xs text-ink-tertiary">{b.label}</p>
+              <div key={b.label}>
+                <p className="form-label">{b.label}</p>
                 <p className="tabular-nums text-base font-semibold text-ink">{b.value}</p>
               </div>
             ))}
@@ -208,7 +214,7 @@ export function FunnelSection() {
           {failures.groups.length === 0 ? (
             <EmptyPanel title="No failures recorded" hint="Nothing has failed in the fetched window." />
           ) : (
-            <Table caption="Failure taxonomy — stage, code, count" maxHeight="24rem">
+            <Table bare flush caption="Failure taxonomy — stage, code, count" maxHeight="24rem">
               <THead>
                 <Tr>
                   <Th>Stage</Th>

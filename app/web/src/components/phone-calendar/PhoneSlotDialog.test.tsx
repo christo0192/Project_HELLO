@@ -347,6 +347,22 @@ describe('PhoneSlotDialog', () => {
     expect(screen.getByRole('button', { name: /Book slot/ })).toBeDisabled();
   });
 
+  it('says the slots could not load, and Try again reads the same date again', async () => {
+    const answer = await getPhoneSlots();
+    getPhoneSlots.mockClear();
+    getPhoneSlots.mockRejectedValueOnce(new Error('down'));
+    mountThenOpen();
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/^Slots couldn't load\./);
+
+    getPhoneSlots.mockResolvedValue(answer);
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByRole('radio')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(getPhoneSlots).toHaveBeenCalledTimes(2);
+    expect(getPhoneSlots.mock.calls.map(([date]) => date)).toEqual([DATE, DATE]);
+  });
+
   it('cancels without confirming', async () => {
     const h = mountThenOpen();
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));

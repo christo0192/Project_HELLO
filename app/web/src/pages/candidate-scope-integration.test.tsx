@@ -11,7 +11,7 @@
  * link or a button onto it, so its affordance count is asserted directly.
  */
 
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CandidatesPage } from './CandidatesPage';
@@ -166,7 +166,7 @@ describe('every candidate surface mounts one scope root', () => {
   it('Candidates list — error', async () => {
     mockApi.listCandidates.mockRejectedValue(new MockApiError('boom', 500));
     const { container } = renderCandidates();
-    expect(await screen.findByText(/The candidate list did not load/)).toBeInTheDocument();
+    expect(await screen.findByText(/The candidate list couldn't load/)).toBeInTheDocument();
     expect(screen.queryByText('boom')).not.toBeInTheDocument();
     expectSingleScopeRoot(container);
   });
@@ -217,6 +217,7 @@ describe('the redesign adds no affordance to the read-only scoped shell', () => 
   it('keeps the Overview free of controls beyond the two tabs', async () => {
     const { container } = renderScoped();
     await screen.findByRole('heading', { name: 'Jane Doe' });
+    fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
 
     // The tablist itself, plus the Overview panel — which must contribute
     // nothing. (The hidden Review panel stays mounted and keeps its
@@ -251,6 +252,7 @@ describe('the redesign adds no affordance to the read-only scoped shell', () => 
       },
     });
     renderScoped();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Overview' }));
     const region = await screen.findByRole('region', {
       name: 'Ashby screening pipeline',
     });
@@ -281,7 +283,7 @@ describe('Candidates list at a 390px viewport', () => {
       { id: 'role-1', title: 'Advisor', jd: '', required_skills: [], screening_template: [], is_active: true, created_at: '' },
     ]);
     renderCandidates();
-    const roleFilter = await screen.findByLabelText('Filter by role');
+    const roleFilter = await screen.findByRole('button', { name: /^Filter by role/ });
     expect(roleFilter.parentElement!.className).toContain('w-full');
     expect(roleFilter.parentElement!.className).toContain('sm:w-56');
   });
@@ -293,9 +295,7 @@ describe('Candidates list at a 390px viewport', () => {
     renderCandidates();
     // Tailwind emits `w-full` after `w-auto`, so a base `w-full` would make
     // every caller override inert. The width is stated where it is wanted.
-    expect((await screen.findByLabelText('Filter by role')).className).toContain(
-      'w-full',
-    );
+    expect((await screen.findByRole('button', { name: /^Filter by role/ })).className).toContain('w-full');
   });
 
   it('gives every filter toggle a 44px minimum target', async () => {
@@ -304,7 +304,8 @@ describe('Candidates list at a 390px viewport', () => {
     const toggles = within(group).getAllByRole('button');
     expect(toggles.length).toBeGreaterThan(0);
     for (const toggle of toggles) {
-      expect(toggle.className).toContain('min-h-11');
+      // 36px with a mouse, 44px on a touch screen.
+    expect(toggle.className).toContain('[@media(pointer:coarse)]:min-h-11');
       // State is announced, not merely coloured.
       expect(toggle).toHaveAttribute('aria-pressed');
     }

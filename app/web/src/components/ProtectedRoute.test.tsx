@@ -12,7 +12,7 @@
  *   - requireRole gate still enforced
  */
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { describe, it, expect, vi } from 'vitest';
 import { ProtectedRoute } from './ProtectedRoute';
@@ -174,6 +174,28 @@ describe('ProtectedRoute', () => {
   });
 
   // ── Stale session / revoked allowlist entry fails closed ─────────
+  describe('a check that failed is not a denial', () => {
+    it('stays in place with a Retry, renders no data, and never says denied', async () => {
+      mockAuth.isLoading = false;
+      mockAuth.isAuthenticated = true;
+      mockAuth.session = { access_token: 'tok' } as any;
+      mockAuth.isRoleLoading = false;
+      mockAuth.role = null;
+      (mockAuth as any).roleCheckFailed = true;
+      const retry = vi.fn().mockResolvedValue(undefined);
+      (mockAuth as any).retryRoleCheck = retry;
+
+      renderProtectedRoute();
+
+      expect(await screen.findByRole('alert')).toHaveTextContent("We couldn't check your access.");
+      expect(screen.queryByTestId('protected-content')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('unauthorized-page')).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+      expect(retry).toHaveBeenCalledTimes(1);
+      (mockAuth as any).roleCheckFailed = false;
+    });
+  });
+
   describe('stale session fails closed', () => {
     it('redirects to /unauthorized when the role resolved to null (revoked/denied)', async () => {
       mockAuth.isLoading = false;

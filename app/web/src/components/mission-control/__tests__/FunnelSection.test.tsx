@@ -5,7 +5,7 @@
  * and "Recompute" triggers the refresh RPC then reloads.
  */
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { FunnelSummaryResponse, FunnelFailuresResponse } from '../../../types';
@@ -95,6 +95,41 @@ describe('FunnelSection', () => {
     render(<FunnelSection />);
     expect(await screen.findByText('Borderline')).toBeInTheDocument();
     expect(screen.queryByText('On hold')).not.toBeInTheDocument();
+  });
+
+  describe('the reference check, which is HR tracking', () => {
+    const META = {
+      schema_current: true,
+      rollup_refreshed_at: '2026-09-09T10:00:00Z',
+      rollup_freshness_known: true,
+      refresh_window_days: 30,
+    };
+    const stepRow = async () =>
+      (await screen.findByText('Reached reference check')).closest('tr') as HTMLElement;
+
+    it('reads as not tracked until HR tracking is on, never as a 0 or a red 0%', async () => {
+      api.getFunnelSummary.mockResolvedValue({
+        ...SUMMARY,
+        meta: { ...META, hr_tracking_configured: false },
+        totals: { ...SUMMARY.totals, reached_reference_check: 0 },
+        conversions: { ...SUMMARY.conversions, qualified_to_reference_check: 0 },
+      });
+      render(<FunnelSection />);
+      const row = within(await stepRow());
+      expect(row.getByText('—')).toBeInTheDocument();
+      expect(row.getByText('Not tracked yet')).toBeInTheDocument();
+      expect(row.queryByText('0')).not.toBeInTheDocument();
+      expect(row.queryByText('0%')).not.toBeInTheDocument();
+    });
+
+    it('shows the real step once HR tracking is on', async () => {
+      api.getFunnelSummary.mockResolvedValue({ ...SUMMARY, meta: { ...META, hr_tracking_configured: true } });
+      render(<FunnelSection />);
+      const row = within(await stepRow());
+      expect(row.getByText('1')).toBeInTheDocument();
+      expect(row.getByText('100%')).toBeInTheDocument();
+      expect(row.queryByText('Not tracked yet')).not.toBeInTheDocument();
+    });
   });
 
   it('shows a truthful empty state when the rollup has no data', async () => {

@@ -5,6 +5,7 @@
  * The network trap in `src/test/setup.ts` fails any un-mocked request, so
  * "no unmocked network" is structural here rather than asserted.
  */
+import { optionsOf, pickOption } from '../components/design/__tests__/helpers';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -542,6 +543,19 @@ describe('no sensitive identifiers', () => {
     expect(text).not.toMatch(/https?:\/\//);
   });
 
+  it('keeps every email out of the open booking list', async () => {
+    apiFns.listCandidates.mockResolvedValue([
+      { ...PHONE_BOOKING_CANDIDATES[0], email: 'asha.rao@example.com' },
+    ]);
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Candidate/ }));
+    await screen.findByRole('option', { name: /Asha Rao/ });
+    expect(document.body.textContent).not.toMatch(/\S+@\S+\.\S+/);
+    expect(document.body.innerHTML).not.toContain('asha.rao@example.com');
+  });
+
   it('renders no sensitive value in any DOM ATTRIBUTE either', async () => {
     // The body-text scan cannot see ids, aria-controls or href values.
     renderPage();
@@ -662,11 +676,14 @@ describe('agent filter', () => {
   const url = () => new URLSearchParams(screen.getByTestId('url').textContent ?? '');
 
   /** The Agent picker, once the roles have loaded and it is usable. */
-  async function agentPicker(): Promise<HTMLSelectElement> {
-    const select = (await screen.findByRole('combobox', { name: 'Agent' })) as HTMLSelectElement;
-    await waitFor(() => expect(select).toBeEnabled());
-    return select;
+  async function agentPicker(): Promise<HTMLElement> {
+    const button = await screen.findByRole('button', { name: /^Agent/ });
+    await waitFor(() => expect(button).toBeEnabled());
+    return button;
   }
+
+  const AGENT = /^Agent/;
+  const pickAgent = (name: string) => pickOption(userEvent.setup(), AGENT, (text) => text === name);
 
   const shownRefs = () =>
     screen
@@ -684,7 +701,7 @@ describe('agent filter', () => {
   it('offers every agent the operator can see, by agent name else title, sorted', async () => {
     renderWithUrl(WEEK_QS);
     const select = await agentPicker();
-    expect([...select.options].map((o) => o.textContent)).toEqual([
+    expect(await optionsOf(userEvent.setup(), AGENT)).toEqual([
       'All agents',
       'Data Analyst',
       // Same title, blank agent name: told apart, never two identical options.
@@ -692,14 +709,8 @@ describe('agent filter', () => {
       // The agent name, not the role title `Sales Advisor`.
       'Zara',
     ]);
-    expect([...select.options].map((o) => o.value)).toEqual([
-      '',
-      ROLE_DATA,
-      ROLE_DATA_TWIN,
-      ROLE_SALES,
-    ]);
     // Every role is offered, including one with no call this week.
-    expect(select.value).toBe('');
+    expect(select).toHaveAccessibleName('Agent All agents');
     expect(screen.queryByText('Sales Advisor')).not.toBeInTheDocument();
   });
 
@@ -721,11 +732,11 @@ describe('agent filter', () => {
     expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002', 'ATS-2001', 'ATS-2002', 'ATS-3001']);
 
     const before = totalApiCalls();
-    await userEvent.selectOptions(select, 'Zara');
+    await pickAgent('Zara');
 
     await waitFor(() => expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']));
     expect(screen.getByRole('table')).toBeInTheDocument();
-    expect(select.value).toBe(ROLE_SALES);
+    expect(select).toHaveAccessibleName('Agent Zara');
     expect(url().get('agent')).toBe(ROLE_SALES);
     // Client-side, like every other filter: one read per week, still.
     expect(totalApiCalls()).toBe(before);
@@ -751,11 +762,11 @@ describe('agent filter', () => {
   it('keeps the chip counts to the selected agent, as the other filters do', async () => {
     renderWithUrl(WEEK_QS);
     await screen.findByRole('table');
-    const select = await agentPicker();
+    await agentPicker();
     expect(chip('Appointment', /^Missed/)).toHaveTextContent(/^Missed\s*2$/);
     expect(chip('Appointment', /^Fulfilled/)).toHaveTextContent(/^Fulfilled\s*1$/);
 
-    await userEvent.selectOptions(select, 'Zara');
+    await pickAgent('Zara');
     await waitFor(() => expect(chip('Appointment', /^Missed/)).toHaveTextContent(/^Missed\s*1$/));
     expect(chip('Appointment', /^Scheduled/)).toHaveTextContent(/^Scheduled\s*1$/);
     // Zara has no fulfilled call, so that chip is not offered at all.
@@ -773,7 +784,7 @@ describe('agent filter', () => {
     renderWithUrl(WEEK_QS);
     await screen.findByRole('table');
     const select = await agentPicker();
-    await userEvent.selectOptions(select, 'Data Analyst · 2');
+    await pickAgent('Data Analyst · 2');
 
     expect(await screen.findByText('No calls for this agent this week')).toBeInTheDocument();
     // Four calls belong to other agents; the fifth has NO role and is nobody's,
@@ -785,12 +796,13 @@ describe('agent filter', () => {
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
     expect(screen.queryByText('No appointments match these filters')).not.toBeInTheDocument();
     // The control doing the filtering is still on screen, and still says so.
-    expect(select.value).toBe(ROLE_DATA_TWIN);
+    expect(select).toHaveAccessibleName('Agent Data Analyst · 2');
+    expect(url().get('agent')).toBe(ROLE_DATA_TWIN);
 
     // Clearing the filters brings every agent back.
     await userEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
     await waitFor(() => expect(shownRefs()).toHaveLength(5));
-    expect(select.value).toBe('');
+    expect(select).toHaveAccessibleName('Agent All agents');
     expect(url().has('agent')).toBe(false);
   });
 
@@ -824,9 +836,9 @@ describe('agent filter', () => {
 
   it('switches back to every agent with "All agents"', async () => {
     renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
-    const select = await agentPicker();
+    await agentPicker();
     await waitFor(() => expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']));
-    await userEvent.selectOptions(select, 'All agents');
+    await pickAgent('All agents');
     await waitFor(() => expect(shownRefs()).toHaveLength(5));
     expect(url().has('agent')).toBe(false);
   });
@@ -836,7 +848,7 @@ describe('agent filter', () => {
     const select = await agentPicker();
     // The week, not an empty grid filtered by something no control shows.
     await waitFor(() => expect(shownRefs()).toHaveLength(5));
-    expect(select.value).toBe('');
+    expect(select).toHaveAccessibleName('Agent All agents');
     expect(screen.queryByText('No calls for this agent this week')).not.toBeInTheDocument();
 
     // The stale id leaves the URL at the operator's next click.
@@ -849,7 +861,7 @@ describe('agent filter', () => {
     renderWithUrl(`${WEEK_QS}&agent=${encodeURIComponent('Zara')}`);
     const select = await agentPicker();
     await waitFor(() => expect(shownRefs()).toHaveLength(5));
-    expect(select.value).toBe('');
+    expect(select).toHaveAccessibleName('Agent All agents');
   });
 
   it('applies a deep-linked agent while the roles are still loading', async () => {
@@ -859,7 +871,7 @@ describe('agent filter', () => {
     renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
     await screen.findByRole('table');
     expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']);
-    const select = screen.getByRole('combobox', { name: 'Agent' });
+    const select = screen.getByRole('button', { name: /^Agent/ });
     expect(select).toBeDisabled();
     expect(select).toHaveTextContent('Loading agents…');
   });
@@ -870,13 +882,14 @@ describe('agent filter', () => {
     await screen.findByRole('table');
     await waitFor(() => expect(apiFns.listRoles).toHaveBeenCalledTimes(1));
     await waitFor(() =>
-      expect(screen.queryByRole('combobox', { name: 'Agent' })).not.toBeInTheDocument(),
+      expect(screen.queryByRole('button', { name: /^Agent/ })).not.toBeInTheDocument(),
     );
-    // Every call, every other filter, no error wall, and no retry loop.
+    // Every call, every other filter, no error wall, and no retry loop: one line
+    // says what is missing, and only a press reads again.
     expect(shownRefs()).toHaveLength(5);
     expect(screen.getByRole('group', { name: 'Appointment' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
-    expect(screen.queryByText(/could not be loaded/)).not.toBeInTheDocument();
+    expect(await screen.findByText("Agents couldn't load, so the agent filter is missing.")).toBeInTheDocument();
+    expect(apiFns.listRoles).toHaveBeenCalledTimes(1);
     expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(1);
 
     // The calendar still works: a filter still narrows.
@@ -888,10 +901,32 @@ describe('agent filter', () => {
     apiFns.listRoles.mockRejectedValue(new MockApiError('roles_read_error', 500));
     renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
     expect(
-      await screen.findByText('Agents could not be loaded, so calls for every agent are shown.'),
+      await screen.findByText("Agents couldn't load, so calls for every agent are shown."),
     ).toBeInTheDocument();
     expect(shownRefs()).toHaveLength(5);
     expect(screen.queryByRole('combobox', { name: 'Agent' })).not.toBeInTheDocument();
+  });
+
+  it('brings the picker back from Try again, and applies a deep-linked agent then', async () => {
+    apiFns.listRoles.mockRejectedValueOnce(new MockApiError('roles_read_error', 500));
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
+    await screen.findByText("Agents couldn't load, so calls for every agent are shown.");
+    expect(shownRefs()).toHaveLength(5);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await agentPicker();
+    expect(screen.queryByText(/Agents couldn't load/)).not.toBeInTheDocument();
+    expect(apiFns.listRoles).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']));
+    expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(1);
+  });
+
+  it('names the access check when /api/me fails, with a Retry', async () => {
+    apiFns.getMe.mockRejectedValueOnce(new MockApiError('Internal server error', 500));
+    renderWithUrl(WEEK_QS);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^We couldn't check your access\./);
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await screen.findByRole('table');
   });
 
   it('shows no picker to an operator who can see no role', async () => {
@@ -900,7 +935,7 @@ describe('agent filter', () => {
     await screen.findByRole('table');
     await waitFor(() => expect(apiFns.listRoles).toHaveBeenCalledTimes(1));
     await waitFor(() =>
-      expect(screen.queryByRole('combobox', { name: 'Agent' })).not.toBeInTheDocument(),
+      expect(screen.queryByRole('button', { name: /^Agent/ })).not.toBeInTheDocument(),
     );
     expect(shownRefs()).toHaveLength(5);
   });
@@ -908,8 +943,8 @@ describe('agent filter', () => {
   it('gives an interviewer the picker too — reading is not writing', async () => {
     apiFns.getMe.mockResolvedValue(INTERVIEWER_ME);
     renderWithUrl(WEEK_QS);
-    const select = await agentPicker();
-    await userEvent.selectOptions(select, 'Data Analyst');
+    await agentPicker();
+    await pickAgent('Data Analyst');
     await waitFor(() => expect(shownRefs()).toEqual(['ATS-2001', 'ATS-2002']));
   });
 

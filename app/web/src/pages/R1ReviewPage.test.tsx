@@ -147,6 +147,11 @@ function drive(el: HTMLMediaElement): Driven {
 }
 
 /** Press play and get the driven element, with metadata loaded. */
+async function chooseSpeed(label: string) {
+  await userEvent.click(screen.getByRole('button', { name: /^Speed/, expanded: false }));
+  await userEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: label }));
+}
+
 async function pressPlay() {
   fireEvent.click(screen.getByRole('button', { name: 'Play' }));
   const el = await waitFor(() => {
@@ -822,9 +827,10 @@ describe('Recording: the controls', () => {
   it('offers the speeds from 0.75x to 2x, and applies one', async () => {
     await recordingTab();
     const { el } = await pressPlay();
-    const speed = screen.getByRole('combobox', { name: 'Speed' });
-    expect(within(speed).getAllByRole('option').map((o) => o.textContent)).toEqual(['0.75x', '1x', '1.25x', '1.5x', '1.75x', '2x']);
-    await userEvent.selectOptions(speed, '1.5');
+    await userEvent.click(screen.getByRole('button', { name: /^Speed/, expanded: false }));
+    expect(within(screen.getByRole('listbox')).getAllByRole('option').map((o) => o.textContent)).toEqual(['0.75x', '1x', '1.25x', '1.5x', '1.75x', '2x']);
+    await userEvent.keyboard('{Escape}');
+    await chooseSpeed('1.5x');
     expect(el.playbackRate).toBe(1.5);
   });
 
@@ -840,7 +846,7 @@ describe('Recording: the controls', () => {
 
   it('puts a speed, a volume and a mute chosen before the first play on the media', async () => {
     await recordingTab();
-    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Speed' }), '1.5');
+    await chooseSpeed('1.5x');
     fireEvent.change(screen.getByRole('slider', { name: 'Volume' }), { target: { value: '40' } });
     fireEvent.click(screen.getByRole('button', { name: 'Mute' }));
     const { el } = await pressPlay();
@@ -852,7 +858,7 @@ describe('Recording: the controls', () => {
   it('keeps them on the fresh link a re-mint brings: a new source resets the media', async () => {
     await recordingTab();
     const { el } = await pressPlay();
-    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Speed' }), '1.25');
+    await chooseSpeed('1.25x');
     fireEvent.change(screen.getByRole('slider', { name: 'Volume' }), { target: { value: '60' } });
     fireEvent.click(screen.getByRole('button', { name: 'Mute' }));
 
@@ -1071,6 +1077,16 @@ describe('Recording: the keyboard', () => {
     expect(el.playbackRate).toBe(0.75);
     fireEvent.keyDown(inside(), { key: '[' });
     expect(el.playbackRate).toBe(0.75);
+  });
+
+  it('leaves its keys to the speed list: arrows there move the list, not the recording', async () => {
+    await opened(review(), '?tab=recording');
+    const { el, state } = await pressPlay();
+    moveTo(el, state, 100);
+    fireEvent.keyDown(screen.getByRole('button', { name: /^Speed/ }), { key: 'ArrowRight' });
+    fireEvent.keyDown(screen.getByRole('button', { name: /^Speed/ }), { key: 'k' });
+    expect(state.currentTime).toBe(100);
+    expect(state.paused).toBe(false);
   });
 
   it('takes no key from the transcript search, or with a modifier held', async () => {

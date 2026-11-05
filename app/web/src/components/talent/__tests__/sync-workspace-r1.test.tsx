@@ -167,6 +167,14 @@ beforeEach(() => {
   mockApi.getR1Recording.mockResolvedValue({ ...recording(), url: LINK, content_type: 'video/mp4', expires_in_sec: 300 });
 });
 
+
+/** Open the session picker and take the session that is not selected. */
+function switchSession(scope: Pick<typeof screen, 'getByRole' | 'getAllByRole'>): void {
+  fireEvent.click(scope.getByRole('button', { name: /^Session/ }));
+  const other = scope.getAllByRole('option').find((option) => option.getAttribute('aria-selected') === 'false');
+  fireEvent.click(other as HTMLElement);
+}
+
 describe('an R1 session on the Review tab', () => {
   it('plays through the R1 player and never touches the legacy recording player or its download', async () => {
     renderWorkspace();
@@ -190,6 +198,7 @@ describe('an R1 session on the Review tab', () => {
   it('names the session "R1 role-play" in the selector, not "Live voice"', async () => {
     renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION] });
     await loadButton();
+    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
     const options = screen.getAllByRole('option').map((o) => o.textContent ?? '');
     expect(options.some((text) => text.includes('R1 role-play'))).toBe(true);
     expect(options.filter((text) => text.includes('R1 role-play'))).toHaveLength(1);
@@ -452,7 +461,7 @@ describe('an R1 session on the Review tab', () => {
       fireEvent.play(video);
       expect(frames.size).toBe(1);
       mockApi.getSession.mockResolvedValue({ session: PHONE_SESSION, transcript: [], assessment: null });
-      fireEvent.change(within(view.container).getByRole('combobox'), { target: { value: 'phone-session' } });
+      switchSession(within(view.container));
       await screen.findByText(/no transcript lines/i);
       expect(frames.size).toBe(0);
     });
@@ -511,7 +520,7 @@ describe('an R1 session on the Review tab', () => {
       transcript: [{ speaker: 'bot', text: 'Phone hello', start_offset_sec: 3 }],
       assessment: null,
     });
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'phone-session' } });
+    switchSession(screen);
     expect(await screen.findByText('Phone hello')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /load recording/i })).toBeInTheDocument();
     // The phone session shows the LEGACY player (no "Attempt"/R1 naming).
@@ -912,7 +921,7 @@ describe('a clicked turn lights at once and holds through the lead-in', () => {
       fireEvent.click(turn(2));
       expect(lit()).toEqual(['2']);
 
-      fireEvent.change(screen.getByRole('combobox'), { target: { value: other.id } });
+      switchSession(screen);
       const { at } = await loaded();
       expect(lit()).toEqual([]);
       at(124.9);
@@ -1152,7 +1161,7 @@ describe('the "Latest scorecard" fallback never shows an R1 assessment', () => {
     expect(screen.queryByText('A phone role-fit note.')).not.toBeInTheDocument();
     expect(screen.queryByText('Employment dates')).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'phone-session' } });
+    switchSession(screen);
     expect(await screen.findByText('A phone screening summary.')).toBeInTheDocument();
     expect(screen.getByText('A phone role-fit note.')).toBeInTheDocument();
     expect(screen.getByText('Employment dates')).toBeInTheDocument();
@@ -1178,6 +1187,7 @@ describe('the "Latest scorecard" fallback never shows an R1 assessment', () => {
     renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION], assessments: [R1_ASSESSMENT, PHONE_ASSESSMENT] });
     expect(await screen.findByText('Scorecard for this session')).toBeInTheDocument();
     expect(screen.getByText('91')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
     expect(screen.getAllByRole('option').filter((o) => /R1 role-play/.test(o.textContent ?? ''))).toHaveLength(1);
   });
 });

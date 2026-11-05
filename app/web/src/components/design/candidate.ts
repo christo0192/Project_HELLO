@@ -29,7 +29,6 @@ export {
   CandidateSpinner,
   CandidateLabel,
   CandidateInput,
-  CandidateSelect,
   CandidateLoadingState,
   CandidateErrorState,
   CandidateEmptyState,

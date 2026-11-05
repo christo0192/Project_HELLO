@@ -12,6 +12,11 @@ export interface TableProps extends HTMLAttributes<HTMLTableElement> {
   bare?: boolean;
   /** Sticky header inside a bounded scroll container. */
   maxHeight?: string;
+  /**
+   * No gutter on the outer edges, so a bare table on the sheet starts on the
+   * sheet's own margin with the heading above it.
+   */
+  flush?: boolean;
 }
 
 /**
@@ -27,7 +32,7 @@ export interface TableProps extends HTMLAttributes<HTMLTableElement> {
  * width. (IBM Plex already draws every digit one width; the utility keeps
  * the column aligned under any fallback face, where "11" and "88" differ.)
  */
-export function Table({ caption, className, children, bare = false, maxHeight, ...rest }: TableProps) {
+export function Table({ caption, className, children, bare = false, flush = false, maxHeight, ...rest }: TableProps) {
   return (
     <div
       // A bounded table is a scroll region: give keyboard users a focus stop
@@ -46,7 +51,11 @@ export function Table({ caption, className, children, bare = false, maxHeight, .
       style={maxHeight ? { maxHeight } : undefined}
     >
       <table
-        className={cx('w-full min-w-full border-separate border-spacing-0 text-sm tabular-nums', className)}
+        className={cx(
+          'w-full min-w-full border-separate border-spacing-0 text-sm tabular-nums',
+          flush && '[&_td:first-child]:pl-0 [&_td:last-child]:pr-0 [&_th:first-child]:pl-0 [&_th:last-child]:pr-0',
+          className,
+        )}
         {...rest}
       >
         {caption ? <caption className="sr-only">{caption}</caption> : null}

@@ -29,6 +29,8 @@ export interface StatusBadgeProps {
   className?: string;
   /** Hide the tone dot for data chips that carry no status meaning. */
   dot?: boolean;
+  /** Break a long label over two lines, for a column with a width budget. The dot stays on the first. */
+  wrap?: boolean;
 }
 
 /**
@@ -41,17 +43,25 @@ export function StatusBadge({
   children,
   className,
   dot = true,
+  wrap = false,
 }: StatusBadgeProps) {
   return (
     <span
       data-status-badge={tone}
       className={cx(
-        'inline-flex items-center gap-1.5 whitespace-nowrap rounded-chip px-2 py-0.5 text-meta font-medium tabular-nums',
+        'inline-flex gap-1.5 rounded-chip px-2 py-0.5 text-meta font-medium tabular-nums',
+        wrap ? 'items-start' : 'items-center whitespace-nowrap',
         toneStyles[tone],
         className,
       )}
     >
-      {dot && <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', dotStyles[tone])} />}
+      {dot && (
+        <span
+          aria-hidden="true"
+          // Centred on a 16px line: (16 - 6) / 2.
+          className={cx('h-1.5 w-1.5 shrink-0 rounded-full', wrap && 'mt-[5px]', dotStyles[tone])}
+        />
+      )}
       {children}
     </span>
   );

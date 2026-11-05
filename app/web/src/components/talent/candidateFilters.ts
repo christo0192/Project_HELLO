@@ -21,6 +21,10 @@
  * - `intake` is a comma-separated subset of the intake types the list API
  *   returns (resume_parsing | phone_parsing). Mirrors `resume` exactly:
  *   client-side, additive, and a row with no intake type never matches it.
+ * - `arriving=1` is the shells still being read (`isInFlightShell`). Its own key
+ *   because they span two others: a resume shell is `resume=processing`, a phone
+ *   shell has a null resume review, and the filters here narrow, so no mix of
+ *   `resume` and `intake` can select both. Client-side and additive.
  * - `role` is a role id, applied server-side via `listCandidates(roleId)`.
  * - `ashby` is `active` | `paused`: scope to roles whose Ashby job mapping is
  *   Live (enabled) or Paused in Ashby Live Jobs. Applied client-side from the
@@ -38,6 +42,8 @@
 import type { Candidate } from '../../types';
 import { candidateStatusKey, candidateStatusLabel } from './status';
 import { INTAKE_TYPE_ORDER, RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
+import { PAGE_SIZES } from '../design/Pagination';
+import type { PageSize } from '../design/Pagination';
 import type { AshbyJobState } from '../../lib/mapped-roles';
 import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
 
@@ -109,6 +115,8 @@ export interface CandidateFilters {
   resumeReview: string[];
   /** Selected intake types (empty = all). Additive, like `resumeReview`. */
   intakeType: string[];
+  /** When true, restrict to shells still being read. Additive, like `resumeReview`. */
+  arriving: boolean;
   /** When true, restrict to candidates with a latest assessment score. */
   assessed: boolean;
   /** Selected role id, or null for all roles. */
@@ -142,6 +150,7 @@ export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
   recommendations: [],
   resumeReview: [],
   intakeType: [],
+  arriving: false,
   assessed: false,
   roleId: null,
   jobState: null,
@@ -187,6 +196,7 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
     recommendations: [...recommendations],
     resumeReview: [...resumeReview],
     intakeType: [...intakeType],
+    arriving: params.get('arriving') === '1',
     assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
     jobState: rawAshby === 'active' || rawAshby === 'paused' ? rawAshby : null,
@@ -218,6 +228,7 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
       INTAKE_TYPE_ORDER.filter((t) => filters.intakeType.includes(t)).join(','),
     );
   }
+  if (filters.arriving) params.set('arriving', '1');
   if (filters.assessed) params.set('assessed', '1');
   if (filters.roleId) params.set('role', filters.roleId);
   if (filters.jobState) params.set('ashby', filters.jobState);
@@ -273,8 +284,120 @@ export function matchesCandidateFilters(candidate: Candidate, filters: Candidate
   ) {
     return false;
   }
+  if (filters.arriving && !isInFlightShell(candidate)) return false;
   if (filters.assessed && candidate.latest_score == null) return false;
   return true;
+}
+
+/**
+ * Where the reader is in the list: page, rows per page and sort.
+ *
+ * Kept apart from `CandidateFilters` because it answers a different question,
+ * and because a change of filter must drop the page and keep the rest. It goes in
+ * the same URL, so a trip to a candidate and back lands on the same rows. The
+ * defaults print nothing, so every existing href stays byte-identical.
+ */
+export type CandidateSortKey = 'score' | 'waiting';
+
+export interface CandidateListView {
+  page: number;
+  size: PageSize;
+  sort: CandidateSortKey | null;
+  dir: 'asc' | 'desc';
+}
+
+export const DEFAULT_CANDIDATE_VIEW: CandidateListView = { page: 1, size: 10, sort: null, dir: 'desc' };
+
+export function parseCandidateListView(params: URLSearchParams): CandidateListView {
+  const page = Number(params.get('page'));
+  const size = Number(params.get('size'));
+  const rawSort = params.get('sort');
+  const sort = rawSort === 'score' || rawSort === 'waiting' ? rawSort : null;
+  return {
+    page: Number.isInteger(page) && page > 0 ? page : 1,
+    size: (PAGE_SIZES as readonly number[]).includes(size) ? (size as PageSize) : 10,
+    sort,
+    dir: sort !== null && params.get('dir') === 'asc' ? 'asc' : 'desc',
+  };
+}
+
+/** Add the view to a filter search. LAST, so a filter href is unchanged by it. */
+export function applyCandidateListView(params: URLSearchParams, view: CandidateListView): URLSearchParams {
+  const next = new URLSearchParams(params);
+  if (view.sort) {
+    next.set('sort', view.sort);
+    if (view.dir === 'asc') next.set('dir', 'asc');
+  }
+  if (view.size !== 10) next.set('size', String(view.size));
+  if (view.page > 1) next.set('page', String(view.page));
+  return next;
+}
+
+/** Statuses a person or the system still has to act on. Anything else is not waiting. */
+const WAITING_STATUSES: ReadonlySet<string> = new Set(['new', 'queued', 'screening', 'screened']);
+
+/**
+ * When a candidate started waiting: the moment they were added, while their
+ * status still needs someone to act. The list payload carries no screened time,
+ * so this is time in the pipeline and not time since the call.
+ */
+export function candidateWaitingSince(candidate: Candidate): string | null {
+  if (!WAITING_STATUSES.has(candidateStatusKey(candidate))) return null;
+  return Number.isFinite(Date.parse(candidate.created_at)) ? candidate.created_at : null;
+}
+
+/** "22 min", "5 h", "6 d". Under a minute reads "Just now", never a bare 0. */
+export function formatWaiting(since: string, now: number): string {
+  const minutes = Math.floor((now - Date.parse(since)) / 60_000);
+  if (minutes < 1) return 'Just now';
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 24 ? `${hours} h` : `${Math.floor(hours / 24)} d`;
+}
+
+/**
+ * A shell still being read: no name yet, and either its resume in progress or a
+ * phone intake, which has no resume (the API gives it a null resume review) and
+ * stays nameless until the Ashby profile is read. These arrive in batches and
+ * would otherwise fill page 1 with identical rows for as long as an import takes.
+ */
+export function isInFlightShell(candidate: Candidate): boolean {
+  if (candidate.name?.trim()) return false;
+  return candidate.resume_review === 'processing' || candidate.intake_type === 'phone_parsing';
+}
+
+/**
+ * The rows in the order the view asks for.
+ *
+ * With no sort chosen the API's order stands, except that shells being read go
+ * after the named candidates: page 1 starts at someone, and the summary row above
+ * the table says how many are arriving. Nothing is left out, so a shell that is
+ * stuck is still in the list and still counted.
+ *
+ * A sort puts rows with nothing to sort by last in either direction, because a
+ * candidate with no score is not the lowest or the highest.
+ */
+export function orderCandidates(
+  rows: ReadonlyArray<Candidate>,
+  view: Pick<CandidateListView, 'sort' | 'dir'>,
+  { keepArrivals = false }: { keepArrivals?: boolean } = {},
+): Candidate[] {
+  if (view.sort === null) {
+    if (keepArrivals) return [...rows];
+    return [...rows.filter((c) => !isInFlightShell(c)), ...rows.filter(isInFlightShell)];
+  }
+  const keyOf = (c: Candidate): number | null => {
+    if (view.sort === 'score') return c.latest_score ?? null;
+    const since = candidateWaitingSince(c);
+    // Longest wait first is the natural "descending".
+    return since === null ? null : -Date.parse(since);
+  };
+  const direction = view.dir === 'asc' ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const [x, y] = [keyOf(a), keyOf(b)];
+    if (x === null || y === null) return x === y ? 0 : x === null ? 1 : -1;
+    return (x - y) * direction;
+  });
 }
 
 /** True when any filter is active. */
@@ -284,6 +407,7 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
     filters.recommendations.length > 0 ||
     filters.resumeReview.length > 0 ||
     filters.intakeType.length > 0 ||
+    filters.arriving ||
     filters.assessed ||
     filters.roleId !== null ||
     filters.jobState !== null ||
@@ -310,7 +434,7 @@ export function candidateNextAction(status: string | null | undefined): {
     case 'screening':
       return { label: 'Screening in progress', emphasis: false };
     case 'screened':
-      return { label: 'Review & decide', emphasis: true };
+      return { label: 'Review', emphasis: true };
     case 'advanced':
       return { label: 'Advanced', emphasis: false };
     case 'rejected':

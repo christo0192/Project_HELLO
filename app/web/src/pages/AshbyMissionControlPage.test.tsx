@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -315,6 +315,20 @@ describe('AshbyMissionControlPage', () => {
     listAshbyMappings.mockRejectedValue({ message: 'boom' });
     renderPage();
     expect(await screen.findByRole('alert')).toBeInTheDocument();
+  });
+
+  it('keeps the rows when a later read fails, says they may be stale, and Retry clears it', async () => {
+    renderPage();
+    await screen.findByText('Account Executive');
+    listAshbyMappings.mockRejectedValueOnce(new ApiError('service_unavailable', 503));
+    await userEvent.click(screen.getAllByRole('button', { name: 'Pause' })[0]);
+    expect(await screen.findByText(/These lists couldn't refresh, so they may be out of date\./)).toBeInTheDocument();
+    expect(screen.getByText('Account Executive')).toBeInTheDocument();
+    expect(screen.queryByText("Ashby jobs and applications couldn't load.", { exact: false })).toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByText(/couldn't refresh/)).toBeNull());
+    expect(listAshbyMappings).toHaveBeenCalledTimes(3); // first read, the failed one, Retry
   });
 
   it('shows the bounded preview and requires a second explicit admin confirmation', async () => {
@@ -2831,5 +2845,29 @@ describe('AshbyMissionControlPage — invite actions follow the legacy lane swit
       .getAllByRole('menuitem')
       .map((item) => item.textContent);
     expect(names).toEqual(['Get invite link', 'Cancel screening']);
+  });
+});
+
+describe('A failed read is not an empty list', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+  });
+
+  it('says it could not load, with a Retry, and never that no jobs are mapped', async () => {
+    listAshbyMappings.mockRejectedValueOnce(new Error('boom'));
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    renderPage();
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Ashby jobs and applications couldn't load/);
+    expect(screen.queryByText('No jobs are mapped yet.')).not.toBeInTheDocument();
+    expect(screen.queryByText('No applications yet.')).not.toBeInTheDocument();
+    // There is nothing to add a mapping to until the list is known.
+    expect(screen.queryByRole('button', { name: 'Add mapping' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByRole('button', { name: 'Add mapping' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

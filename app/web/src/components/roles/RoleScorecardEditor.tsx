@@ -32,6 +32,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import {
   SCORECARD_MAX_INSTRUCTION_LENGTH,
   SCORECARD_MAX_METRICS,
@@ -107,8 +108,21 @@ function isTypedPercent(raw: string): boolean {
   return Number.isFinite(pct) && pct >= 0 && pct <= 100;
 }
 
-export function RoleScorecardEditor({ roleId }: { roleId: string }) {
+/** What Save would write, so "changed" means changed and not merely touched. */
+function snapshot(metrics: EditorMetric[]): string {
+  return JSON.stringify(metrics.map((m) => [m.libraryMetricId, m.instruction, m.weightBps, m.displayOrder]));
+}
+
+export function RoleScorecardEditor({
+  roleId,
+  onDirtyChange,
+}: {
+  roleId: string;
+  /** Told whenever the card differs from the saved one. The form's Save and Cancel leave this panel. */
+  onDirtyChange?: (dirty: boolean) => void;
+}) {
   const [metrics, setMetrics] = useState<EditorMetric[] | null>(null);
+  const savedRef = useRef<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [library, setLibrary] = useState<ScorecardMetricTemplate[] | null>(null);
   const [libraryForbidden, setLibraryForbidden] = useState(false);
@@ -156,9 +170,11 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
         const sorted = [...(r.scorecard?.metrics ?? [])].sort(
           (a, b) => a.displayOrder - b.displayOrder,
         );
-        setMetrics(sorted.map(fromRoleMetric));
+        const loaded = sorted.map(fromRoleMetric);
+        savedRef.current = snapshot(loaded);
+        setMetrics(loaded);
       })
-      .catch((e: ApiError) => setLoadError(e.message));
+      .catch((e: ApiError) => setLoadError(`The scorecard couldn't load. ${plainErrorText(e.message)}`));
   }, [roleId]);
 
   const loadLibrary = useCallback(() => {
@@ -188,6 +204,11 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
     loadLibrary();
   }, [load, loadLibrary]);
 
+  const dirty = metrics !== null && savedRef.current !== null && snapshot(metrics) !== savedRef.current;
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
   /**
    * "Try again" for the library. Its button unmounts the moment the read
    * starts (the picker shows "Loading…"), so focus is parked on the picker's
@@ -211,7 +232,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
 
   if (loadError) {
     return (
-      <GlassPanel>
+      <GlassPanel level="ruled">
         <SectionHeader level={3} title="Scorecard" />
         <InlineNotice tone="danger" role="alert" className="mt-4"           // `() => load()`, not `load`: as a bare handler React hands it the
           // MouseEvent, which lands in `keepMessage` and is truthy — a retry
@@ -228,7 +249,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
   }
   if (!metrics) {
     return (
-      <GlassPanel>
+      <GlassPanel level="ruled">
         <SectionHeader level={3} title="Scorecard" />
         <p className="mt-3 text-sm text-ink-tertiary">Loading scorecard…</p>
       </GlassPanel>
@@ -381,7 +402,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
   }
 
   return (
-    <GlassPanel>
+    <GlassPanel level="ruled">
       <SectionHeader
         level={3}
         title="Scorecard"
@@ -435,13 +456,17 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
           No metrics attached yet. This agent uses the legacy scoring until a scorecard is saved.
         </p>
       ) : (
-        <ul className="mt-4 space-y-3" data-scorecard-metrics>
+        // ONE LIST, ROWS SPLIT BY PRINTED RULES. A boxed card per metric, each
+        // headed by its machine key, is the Scorebar pattern the owner called
+        // very bad. The key stays one hover away for anyone quoting it.
+        <ul className="mt-3 divide-y divide-glass-ring border-y border-line-strong" data-scorecard-metrics>
           {metrics.map((m, index) => (
-            <li key={m.id} className="glass-sunken space-y-3 p-4" data-metric-row={m.id}>
+            <li key={m.id} className="space-y-3 py-4" data-metric-row={m.id}>
               <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
                 <div className="min-w-0">
-                  <p className="text-sm font-medium text-ink">{m.name}</p>
-                  <p className="text-xs text-ink-tertiary">{m.key}</p>
+                  <p className="text-sm font-medium text-ink" title={m.key}>
+                    {m.name}
+                  </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   <Button

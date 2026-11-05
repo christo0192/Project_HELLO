@@ -48,8 +48,8 @@ export function PhoneQueueList({
   const groups = groupByIstDay(appointments, weekDates);
 
   return (
-    <GlassPanel padding="none" className="overflow-hidden">
-      <ScrollArea maxHeight="40rem" label="Queue" className="px-2 sm:px-3">
+    <GlassPanel level="ruled" padding="none" className="overflow-hidden">
+      <ScrollArea maxHeight="40rem" label="Queue">
         <div>
           {groups.map((group) => {
             const heading =

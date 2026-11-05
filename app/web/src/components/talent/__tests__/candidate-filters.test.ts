@@ -14,6 +14,12 @@ import {
   normalizeCandidateQuery,
   CANDIDATE_QUERY_MAX,
   EMPTY_CANDIDATE_FILTERS,
+  DEFAULT_CANDIDATE_VIEW,
+  applyCandidateListView,
+  formatWaiting,
+  isInFlightShell,
+  orderCandidates,
+  parseCandidateListView,
 } from '../candidateFilters';
 
 function cand(partial: Partial<Candidate>): Candidate {
@@ -47,6 +53,7 @@ describe('parseCandidateFilters', () => {
       recommendations: ['advance'],
       resumeReview: [],
       intakeType: [],
+      arriving: false,
       assessed: true,
       roleId: 'r1',
       jobState: null,
@@ -82,6 +89,7 @@ describe('buildCandidateSearch / candidatesHref', () => {
       recommendations: ['advance', 'reject'],
       resumeReview: [],
       intakeType: [],
+      arriving: false,
       assessed: true,
       roleId: 'r9',
       jobState: null,
@@ -241,7 +249,7 @@ describe('candidateFunnel / candidateNextAction', () => {
 
   it('maps statuses to an actionable next step', () => {
     expect(candidateNextAction('new')).toEqual({ label: 'Start screening', emphasis: true });
-    expect(candidateNextAction('screened')).toEqual({ label: 'Review & decide', emphasis: true });
+    expect(candidateNextAction('screened')).toEqual({ label: 'Review', emphasis: true });
     expect(candidateNextAction('anything-else').label).toBe('Open profile');
   });
 });
@@ -277,6 +285,7 @@ describe('resume-review facet', () => {
       recommendations: ['advance'],
       resumeReview: ['processing', 'cancelled'],
       intakeType: [],
+      arriving: false,
       assessed: true,
       roleId: 'r9',
       jobState: null,
@@ -532,5 +541,103 @@ describe('screening_abandoned display key (M013 S02, 0125)', () => {
       { status: 'wrong_number', label: 'Wrong number', value: 1 },
     ]);
     expect(candidateNextAction('screening_abandoned')).toEqual({ label: 'Dropped before screening', emphasis: false });
+  });
+});
+
+describe('the list view in the URL', () => {
+  const view = (qs: string) => parseCandidateListView(new URLSearchParams(qs));
+
+  it('prints nothing for the defaults, so an existing href is unchanged', () => {
+    const filters = new URLSearchParams('status=screened');
+    expect(applyCandidateListView(filters, DEFAULT_CANDIDATE_VIEW).toString()).toBe('status=screened');
+  });
+
+  it('reads back what it wrote', () => {
+    const written = applyCandidateListView(new URLSearchParams(), { page: 3, size: 25, sort: 'score', dir: 'asc' });
+    expect(view(written.toString())).toEqual({ page: 3, size: 25, sort: 'score', dir: 'asc' });
+  });
+
+  it.each(['page=0', 'page=-1', 'page=1.5', 'page=x', 'size=7', 'sort=name', 'dir=asc'])('drops %s', (qs) => {
+    expect(view(qs)).toEqual(DEFAULT_CANDIDATE_VIEW);
+  });
+});
+
+describe('orderCandidates', () => {
+  const row = (id: string, over: Partial<Candidate> = {}) =>
+    ({ id, name: id, status: 'screened', created_at: '2026-10-01T00:00:00.000Z', ...over }) as Candidate;
+  const ids = (rows: Candidate[]) => rows.map((r) => r.id);
+
+  it('leaves the API order alone, with shells being read after the named', () => {
+    const shell = row('shell', { name: null, resume_review: 'processing' });
+    expect(ids(orderCandidates([shell, row('a'), row('b')], DEFAULT_CANDIDATE_VIEW))).toEqual(['a', 'b', 'shell']);
+  });
+
+  it('keeps a shell that has stopped being read where the API put it', () => {
+    const stuck = row('stuck', { name: null, resume_review: 'needs_review' });
+    expect(ids(orderCandidates([stuck, row('a')], DEFAULT_CANDIDATE_VIEW))).toEqual(['stuck', 'a']);
+  });
+
+  it('puts a row with nothing to sort by last, in either direction', () => {
+    const rows = [row('none'), row('low', { latest_score: 10 }), row('high', { latest_score: 90 })];
+    expect(ids(orderCandidates(rows, { sort: 'score', dir: 'desc' }))).toEqual(['high', 'low', 'none']);
+    expect(ids(orderCandidates(rows, { sort: 'score', dir: 'asc' }))).toEqual(['low', 'high', 'none']);
+  });
+
+  it('counts a settled candidate as not waiting', () => {
+    const rows = [row('done', { status: 'rejected' }), row('old', { created_at: '2026-09-01T00:00:00.000Z' }), row('new')];
+    expect(ids(orderCandidates(rows, { sort: 'waiting', dir: 'desc' }))).toEqual(['old', 'new', 'done']);
+  });
+});
+
+describe('shells still being read', () => {
+  const named = cand({ name: 'Asha' });
+  const resumeShell = cand({ name: null, resume_review: 'processing' });
+  // The API forces a phone intake's resume review to null, so it can never be
+  // reached through `resume_review`.
+  const phoneShell = cand({ name: null, resume_review: null, intake_type: 'phone_parsing' });
+
+  it('counts a nameless phone intake as well as a resume being read', () => {
+    expect(isInFlightShell(resumeShell)).toBe(true);
+    expect(isInFlightShell(phoneShell)).toBe(true);
+    expect(isInFlightShell({ ...phoneShell, name: '   ' })).toBe(true);
+  });
+
+  it('counts nobody with a name, and no quiet nameless row', () => {
+    expect(isInFlightShell(named)).toBe(false);
+    expect(isInFlightShell({ ...phoneShell, name: 'Asha' })).toBe(false);
+    expect(isInFlightShell(cand({ name: null, resume_review: 'ready' }))).toBe(false);
+    expect(isInFlightShell(cand({ name: null, resume_review: null, intake_type: 'resume_parsing' }))).toBe(false);
+  });
+
+  it('puts both kinds after the named rows', () => {
+    const rows = [phoneShell, resumeShell, named];
+    expect(orderCandidates(rows, DEFAULT_CANDIDATE_VIEW)).toEqual([named, phoneShell, resumeShell]);
+  });
+
+  it('round-trips through the URL, and adds nothing when off', () => {
+    expect(parseCandidateFilters(new URLSearchParams('arriving=1')).arriving).toBe(true);
+    expect(parseCandidateFilters(new URLSearchParams('arriving=0')).arriving).toBe(false);
+    expect(candidatesHref({ arriving: true })).toBe('/candidates?arriving=1');
+    expect(candidatesHref()).toBe('/candidates');
+    expect(hasActiveFilters(f({ arriving: true }))).toBe(true);
+  });
+
+  it('selects both kinds and nobody else', () => {
+    const arriving = f({ arriving: true });
+    expect(matchesCandidateFilters(resumeShell, arriving)).toBe(true);
+    expect(matchesCandidateFilters(phoneShell, arriving)).toBe(true);
+    expect(matchesCandidateFilters(named, arriving)).toBe(false);
+  });
+});
+
+describe('formatWaiting', () => {
+  const at = Date.parse('2026-11-05T12:00:00.000Z');
+  it.each([
+    ['2026-11-05T11:59:40.000Z', 'Just now'],
+    ['2026-11-05T11:38:00.000Z', '22 min'],
+    ['2026-11-05T07:00:00.000Z', '5 h'],
+    ['2026-10-30T12:00:00.000Z', '6 d'],
+  ])('reads %s as %s', (since, words) => {
+    expect(formatWaiting(since, at)).toBe(words);
   });
 });

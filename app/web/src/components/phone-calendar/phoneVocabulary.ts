@@ -124,6 +124,33 @@ export function isLiveAppointment(status: string): boolean {
   return LIVE_APPOINTMENT_STATUSES.has(status as PhoneAppointmentStatus);
 }
 
+/**
+ * What follows a Missed appointment, read from the engagement as it stands now.
+ *
+ * The expiry sweep (`expire_phone_appointments`, 0114) sends a `scheduled`
+ * engagement back to `eligible` due at once, so the ordinary dial loop calls the
+ * candidate again with no booking. It leaves a terminal engagement alone, and
+ * one still on `pending_prereqs` is not touched either. Telling an operator a
+ * booking is needed, when a call is already coming, is how a candidate gets
+ * dialled after being told to expect nothing.
+ */
+export function missedAppointmentNote(state: string | null): string {
+  const passed = 'This slot passed without a call.';
+  if (isTerminalEngagementState(state)) return `${passed} This screening has ended, so no call follows.`;
+  if (isAttemptInFlight(state)) return `${passed} A call for this screening is in progress now.`;
+  switch (state) {
+    case 'eligible':
+    case 'awaiting_retry':
+      return `${passed} The candidate is back in the calling queue and will be called again without a booking, in an open calling window when capacity allows. To fix a time instead, open the candidate and book one.`;
+    case 'scheduled':
+      return `${passed} Another time is already booked for this screening.`;
+    case 'pending_prereqs':
+      return `${passed} Nothing dials until this screening's prerequisites are met.`;
+    default:
+      return `${passed} Open the candidate to see where this screening stands.`;
+  }
+}
+
 /** The operator cancel reasons, in the order they are offered. */
 export const OPERATOR_CANCEL_REASONS: ReadonlyArray<{
   value: PhoneOperatorCancelReason;

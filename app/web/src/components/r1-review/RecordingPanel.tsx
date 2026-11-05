@@ -374,7 +374,8 @@ export function RecordingPanel({
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.ctrlKey || event.metaKey || event.altKey || !playable) return;
     const target = event.target as HTMLElement;
-    if (target.closest('input, select, textarea, [contenteditable="true"]')) return;
+    // The speed list has its own arrow keys and letters.
+    if (target.closest('input, select, textarea, [contenteditable="true"], [aria-haspopup="listbox"], [role="listbox"]')) return;
     // The arrows on a tab are the tab's own: one press must not also skip the recording.
     if (event.key.startsWith('Arrow') && target.closest('[role="tab"]')) return;
     const step = R1_PLAYBACK_RATES.indexOf(rate as (typeof R1_PLAYBACK_RATES)[number]);

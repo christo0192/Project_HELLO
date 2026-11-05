@@ -71,10 +71,9 @@ import type {
   Session,
   TranscriptLine,
 } from '../../types';
-import { StatusBadge } from '../design';
+import { Combobox, StatusBadge } from '../design';
 import {
   CandidateErrorState,
-  CandidateSelect,
   SurfaceCard,
 } from '../design/candidate';
 import {
@@ -113,6 +112,22 @@ import { sessionModeLabel } from '../../lib/session-mode';
 
 /** What the Review tab calls an R1 session (it is not a phone screening). */
 const R1_SESSION_LABEL = 'R1 role-play';
+
+/**
+ * A session in the picker: named by WHEN and WHAT KIND, never by a uuid prefix,
+ * so two on one day are told apart by their time and length. A phone session
+ * reads its RECORDED total across its calls, never `duration_sec` (which leaves
+ * out a dropped call whose end was not observed).
+ */
+function sessionPickerLabel(s: Session): string {
+  return [
+    formatDateTime(s.created_at),
+    s.interview_round_id != null ? R1_SESSION_LABEL : sessionModeLabel(s.mode),
+    sessionLengthLabel(s),
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
 
 /** Where an R1 recording is when this host cannot play it or has no R1 card of its own. */
 const R1_RECORDING_ON_CANDIDATE_PAGE =
@@ -534,8 +549,8 @@ export function TranscriptionSyncWorkspace({
     setRefreshKey((k) => k + 1);
   }, []);
 
-  const handleSessionChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
-    setSelectedSessionId(e.target.value || null);
+  const handleSessionChange = useCallback((id: string) => {
+    setSelectedSessionId(id || null);
   }, []);
 
   // The scorecard shown is the selected session's own assessment when
@@ -855,38 +870,34 @@ export function TranscriptionSyncWorkspace({
     <div className="space-y-4 sm:space-y-6">
       {/* Session selector + context */}
       <SurfaceCard className="flex flex-col items-start gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-        {/* `min-w-0` + a full-width select below `sm`: a native select sizes
-            to its longest option, which at 390px ran past the card edge. */}
         <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
-          <label
-            htmlFor="sync-session-select"
-            className="text-sm font-medium text-[var(--c-ink)]"
-          >
+          <span id="sync-session-label" className="text-sm font-medium text-[var(--c-ink)]">
             Session
-          </label>
-          <CandidateSelect
-            id="sync-session-select"
-            value={selectedSessionId ?? ''}
-            onChange={handleSessionChange}
-            className="w-full min-w-0 max-w-full sm:w-auto"
-          >
-            {/* Named by WHEN and WHAT KIND, never by a uuid prefix: two
-                sessions on one day are told apart by their time and length. */}
-            {selectableSessions.map((s) => (
-              <option key={s.id} value={s.id}>
-                {/* M013 S02: a phone session reads its RECORDED total across
-                    its calls, never `duration_sec` (which leaves out a
-                    dropped call whose end was not observed). */}
-                {[
-                  formatDateTime(s.created_at),
-                  s.interview_round_id != null ? R1_SESSION_LABEL : sessionModeLabel(s.mode),
-                  sessionLengthLabel(s),
-                ]
-                  .filter(Boolean)
-                  .join(' · ')}
-              </option>
-            ))}
-          </CandidateSelect>
+          </span>
+          {/* One session has nothing to choose between, so it is a line of
+              text. Two or more are a picker: never the operating system's
+              list, which is the control the owner screenshotted. */}
+          {selectableSessions.length === 1 ? (
+            <span data-session-text="" className="text-sm text-[var(--c-ink)]">
+              {sessionPickerLabel(selectableSessions[0])}
+            </span>
+          ) : (
+            <Combobox
+              id="sync-session-select"
+              labelId="sync-session-label"
+              size="md"
+              floating
+              searchable={selectableSessions.length > 6}
+              value={selectedSessionId ?? ''}
+              onChange={handleSessionChange}
+              options={selectableSessions.map((s) => ({ value: s.id, label: sessionPickerLabel(s) }))}
+              placeholder="Choose a session"
+              searchLabel="Search sessions"
+              listLabel="Sessions"
+              noun={['session', 'sessions']}
+              className="w-full min-w-0 max-w-full sm:w-96"
+            />
+          )}
         </div>
         {/* Only the status: date, kind and length are already the selected
             option's own words, one control to the left. */}
@@ -911,7 +922,17 @@ export function TranscriptionSyncWorkspace({
                   : 'Latest scorecard'
                 : undefined
           }
-          emptyText={permissionDenied && isR1 ? 'No phone screening scorecard yet.' : undefined}
+          // Empty copy only after the read succeeded: while it runs or when it
+          // fails, "no scorecard" is a false statement beside a real score.
+          emptyText={
+            transcriptLoading
+              ? 'Loading the scorecard…'
+              : transcriptError
+                ? "This scorecard couldn't load. Try again from the transcript."
+                : permissionDenied && isR1
+                  ? 'No phone screening scorecard yet.'
+                  : undefined
+          }
         />,
         // Only the block above names the phone screening. The conflicts, role fit and summary would
         // read as this role-play's, so a non-admin gets them by picking the phone session.

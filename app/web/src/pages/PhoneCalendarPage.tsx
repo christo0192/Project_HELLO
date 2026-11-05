@@ -35,7 +35,7 @@
  * parallel with the calendar read: the API's own role scoping decides which
  * agents an operator can pick, and every one of them is offered, not only
  * those with a call this week. That read is optional — if it fails the
- * picker is simply absent and the calendar is untouched.
+ * picker gives way to a line and a Retry, and the calendar is untouched.
  *
  * ── NOTHING IS APPLIED OPTIMISTICALLY ─────────────────────────────────
  * Every mutation awaits the real API call and is followed by a re-read. The
@@ -55,6 +55,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
+import { plainErrorText } from '../lib/api-error-copy';
 import type {
   MeResponse,
   PhoneAppointmentCancelInput,
@@ -195,6 +196,8 @@ export function PhoneCalendarPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const [rolesState, setRolesState] = useState<RolesState>({ status: 'loading' });
+  /** Bumped by the Agent picker's Try again. */
+  const [rolesAttempt, setRolesAttempt] = useState(0);
   const [bookingOpen, setBookingOpen] = useState(false);
   /**
    * Whether phone screening was ON at the last calendar read that answered.
@@ -281,14 +284,20 @@ export function PhoneCalendarPage() {
     api
       .getMe()
       .then(setMe)
-      .catch((e: ApiError) => setMeError(e.message));
+      .catch((e: ApiError) => setMeError(`We couldn't check your access. ${plainErrorText(e.message)}`));
   }, []);
 
   useEffect(loadMe, [loadMe]);
 
+  const retryRoles = useCallback(() => {
+    setRolesState({ status: 'loading' });
+    setRolesAttempt((n) => n + 1);
+  }, []);
+
   // The Agent picker's names. Issued alongside the calendar read (both effects
   // run on the commit that first makes `canRead` true), never by a viewer, and
-  // never allowed to break the page: a failure only removes the picker.
+  // never allowed to break the page: a failure only swaps the picker for a line
+  // and a Retry.
   useEffect(() => {
     if (!canRead) return;
     let live = true;
@@ -303,7 +312,7 @@ export function PhoneCalendarPage() {
     return () => {
       live = false;
     };
-  }, [canRead]);
+  }, [canRead, rolesAttempt]);
 
   useEffect(() => {
     // A viewer never asks the phone API anything.
@@ -498,12 +507,8 @@ export function PhoneCalendarPage() {
   if (!canRead) {
     return (
       <div>
-        <PageHeader
-          eyebrow="Operations"
-          title="Phone calendar"
-          description="Internal phone screening schedule."
-        />
-        <GlassPanel padding="sm" className="mt-6">
+        <PageHeader title="Phone calendar" description="Internal phone screening schedule." />
+        <GlassPanel level="ruled" padding="sm" className="mt-6">
           <EmptyPanel
             title="Not available to your role"
             hint="The phone screening calendar is available to interviewers and admins. Nothing about the schedule has been loaded for this account."
@@ -521,7 +526,7 @@ export function PhoneCalendarPage() {
     rolesState.status === 'ready'
       ? { status: 'ready', options: agentOptions }
       : rolesState.status === 'failed'
-        ? { status: 'unavailable', requested: parsedFilters.agent !== null }
+        ? { status: 'unavailable', requested: parsedFilters.agent !== null, onRetry: retryRoles }
         : { status: 'loading' };
 
   const ready = !loadError && data !== null && data.enabled;
@@ -559,7 +564,6 @@ export function PhoneCalendarPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Operations"
         title="Phone calendar"
         description="Phone screenings in India Standard Time. Calls go out only within the approved calling window."
         actions={
@@ -637,6 +641,7 @@ export function PhoneCalendarPage() {
             />
           }
           showFilters={ready}
+          reserveFilters={!loadError && data === null}
           statusFacets={statusFacets}
           stateFacets={stateFacets}
           filters={filters}
@@ -697,21 +702,21 @@ export function PhoneCalendarPage() {
             )}
 
             {appointments.length === 0 ? (
-              <GlassPanel padding="sm">
+              <GlassPanel level="ruled" padding="sm">
                 <EmptyPanel
                   title="No phone screenings this week"
                   hint={`Nothing is scheduled between ${weekLabel} IST.`}
                 />
               </GlassPanel>
             ) : agentRows.length === 0 ? (
-              <GlassPanel padding="sm">
+              <GlassPanel level="ruled" padding="sm">
                 <EmptyPanel
                   title="No calls for this agent this week"
                   hint={otherAgentsHint(appointments, weekLabel)}
                 />
               </GlassPanel>
             ) : visible.length === 0 ? (
-              <GlassPanel padding="sm">
+              <GlassPanel level="ruled" padding="sm">
                 <EmptyPanel
                   title="No appointments match these filters"
                   hint={`This week has ${agentRows.length} ${
