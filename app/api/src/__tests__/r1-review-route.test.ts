@@ -15,6 +15,7 @@ vi.mock('../lib/supabase.js', () => ({ supabase: { from: mocks.from, rpc: mocks.
 import { r1Router } from '../routes/r1.js';
 import { getAuditSink, setAuditSink, type AuditEntry } from '../lib/audit.js';
 import { POSTGREST_MAX_ROWS } from '../lib/id-batches.js';
+import { readR1Review } from '../lib/r1/review.js';
 
 const CANDIDATE = '10000000-0000-4000-8000-000000000001';
 const ROUND = '20000000-0000-4000-8000-000000000001';
@@ -25,19 +26,34 @@ const PHONE_SESSION = '30000000-0000-4000-8000-000000000099';
 const OWNER = '40000000-0000-4000-8000-000000000001';
 const OTHER = '50000000-0000-4000-8000-000000000001';
 const ROLE = '70000000-0000-4000-8000-000000000001';
+/** Letters in it, so another case is another spelling: ROUND has none. */
+const LETTERED_ROUND = 'abcdef00-0000-4000-8000-00000000abcd';
 
 type Row = Record<string, any>;
 type Tables = Record<string, Row[]>;
 
 const failing = new Set<string>();
+/** One read of a table whose other reads must still answer, as `call_sessions is:interview_round_id`. */
+const failingReads = new Set<string>();
+/** Each read that ran, with the columns it filtered on. */
+let reads: Array<{ table: string; asked: string[] }> = [];
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** As Postgres compares a uuid column: by value, so any spelling of an id matches. */
+const sameValue = (actual: unknown, expected: unknown): boolean =>
+  actual === expected
+  || (typeof actual === 'string' && typeof expected === 'string' && UUID_SHAPE.test(actual) && actual.toLowerCase() === expected.toLowerCase());
 
 /** A small PostgREST double: filters, order and `.range()` as the read uses them, a 1000-row cap. */
 function query(table: string, tables: Tables) {
   const filters: Array<(row: Row) => boolean> = [];
+  const asked: string[] = [];
   let window: [number, number] | null = null;
   const orders: Array<[string, boolean]> = [];
   const read = () => {
-    if (failing.has(table)) return { data: null, error: { message: 'boom' } };
+    reads.push({ table, asked });
+    if (failing.has(table) || asked.some((what) => failingReads.has(`${table} ${what}`))) return { data: null, error: { message: 'boom' } };
     let rows = (tables[table] ?? []).filter((row) => filters.every((f) => f(row)));
     for (const [key, ascending] of [...orders].reverse()) {
       rows = [...rows].sort((a, b) => (a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : 0) * (ascending ? 1 : -1));
@@ -47,10 +63,10 @@ function query(table: string, tables: Tables) {
   };
   const q: any = {
     select: () => q,
-    eq: (key: string, expected: unknown) => { filters.push((row) => row[key] === expected); return q; },
-    is: (key: string, expected: unknown) => { filters.push((row) => row[key] === expected); return q; },
+    eq: (key: string, expected: unknown) => { asked.push(`eq:${key}`); filters.push((row) => sameValue(row[key], expected)); return q; },
+    is: (key: string, expected: unknown) => { asked.push(`is:${key}`); filters.push((row) => row[key] === expected); return q; },
     not: (key: string, _op: string, expected: unknown) => { filters.push((row) => row[key] !== expected); return q; },
-    in: (key: string, expected: unknown[]) => { filters.push((row) => expected.includes(row[key])); return q; },
+    in: (key: string, expected: unknown[]) => { asked.push(`in:${key}`); filters.push((row) => expected.some((value) => sameValue(row[key], value))); return q; },
     order: (key: string, options?: { ascending?: boolean }) => { orders.push([key, options?.ascending !== false]); return q; },
     limit: (n: number) => { window = [0, n - 1]; return q; },
     range: (from: number, to: number) => { window = [from, to]; return q; },
@@ -158,6 +174,8 @@ let audits: AuditEntry[];
 const previousSink = getAuditSink();
 beforeEach(() => {
   failing.clear();
+  failingReads.clear();
+  reads = [];
   audits = [];
   setAuditSink(async (entry) => { audits.push(entry); });
 });
@@ -286,6 +304,18 @@ describe('what the answer carries', () => {
     expect(body.attempts.map((a: Row) => a.learner_name)).toEqual(['Priya Nair', 'Ananya Rao']);
   });
 
+  it('orders a restart after the start it replaced, whatever order the rows come in: they share a number', async () => {
+    const tables = tablesFor();
+    const [scored] = tables.interview_round_attempts;
+    tables.interview_round_attempts = [
+      { ...scored, created_at: '2026-11-02T10:05:00Z' },
+      { ...scored, session_id: SESSION_2, counted: false, outcome: 'provider_error', created_at: '2026-11-02T10:00:00Z' },
+    ];
+    tables.call_sessions.push({ id: SESSION_2, candidate_id: CANDIDATE, interview_round_id: ROUND, status: 'failed', started_at: '2026-11-02T10:00:00Z', ended_at: '2026-11-02T10:01:00Z' });
+    const { body } = await review(appFor('admin', OWNER, tables));
+    expect(body.attempts.map((a: Row) => [a.session_id, a.attempt_number])).toEqual([[SESSION_2, 1], [SESSION_1, 1]]);
+  });
+
   it('carries the assessment: structured evidence and the gate, administration and agreement facts', async () => {
     const { body } = await review(appFor('viewer', OTHER));
     expect(body.assessment).toEqual({
@@ -324,6 +354,27 @@ describe('what the answer carries', () => {
     ]);
   });
 
+  it('reads the log by session, the index it has, and not by round, which has none', async () => {
+    await review(appFor('admin'));
+    const logReads = reads.filter((read) => read.table === 'r1_admin_log');
+    expect(logReads).toHaveLength(1);
+    expect(logReads[0].asked).toEqual(['in:session_id']);
+  });
+
+  it('carries only the log of this round', async () => {
+    const tables = tablesFor();
+    tables.r1_admin_log.push({ id: 'l9', session_id: SESSION_2, round_id: 'another-round', event_type: 'guard_hit', turn_index: 0, family_id: null, created_at: '2026-11-02T10:29:02Z', payload: {} });
+    const { body } = await review(appFor('admin', OWNER, tables));
+    expect(body.events.map((event: Row) => event.event_type)).toEqual(['need_revealed', 'family_delivered']);
+  });
+
+  it('asks for no log when no attempt has started', async () => {
+    const { body, status } = await review(appFor('admin', OWNER, tablesFor({ interview_round_attempts: [] })));
+    expect(status).toBe(200);
+    expect(body.events).toEqual([]);
+    expect(reads.filter((read) => read.table === 'r1_admin_log')).toEqual([]);
+  });
+
   it('carries the phone screening beside it, and never takes an R1 assessment for one', async () => {
     const { body } = await review(appFor('admin'));
     expect(body.phone_screening).toEqual({ recommendation: 'advance', overall_score: 71, created_at: '2026-10-30T10:20:00Z', evidence_grade: null, scoring_status: null });
@@ -335,7 +386,7 @@ describe('what the answer carries', () => {
     expect((await review(appFor('admin', OWNER, tables))).body.phone_screening).toMatchObject({ evidence_grade: 'insufficient', scoring_status: 'incomplete_evidence' });
   });
 
-  it('still answers when the phone context cannot be read: it is one line of context', async () => {
+  it('has no phone line for a candidate with no phone assessment', async () => {
     const tables = tablesFor();
     tables.assessments = tables.assessments.filter((a) => a.session_id !== PHONE_SESSION);
     const { body, status } = await review(appFor('admin', OWNER, tables));
@@ -389,6 +440,27 @@ describe('a read that fails', () => {
   it('answers 503 rather than "not scored" when the assessment cannot be read', async () => {
     failing.add('assessments');
     expect((await review(appFor('admin'))).status).toBe(503);
+  });
+
+  it.each([
+    ['the phone sessions', 'call_sessions is:interview_round_id'],
+    ['the phone assessment', 'assessments in:session_id'],
+  ])('still answers when %s cannot be read: it is one line of context', async (_what, read) => {
+    failingReads.add(read);
+    const { body, status } = await review(appFor('admin'));
+    expect(status).toBe(200);
+    expect(body.phone_screening).toBeNull();
+    // The review itself is whole: this is the one line going, and not the page.
+    expect(body.attempts[0].turns).toHaveLength(2);
+    expect(body.assessment.id).toBe(ASSESSMENT);
+  });
+
+  it('still answers when the role title cannot be read', async () => {
+    failing.add('roles');
+    const { body, status } = await review(appFor('admin'));
+    expect(status).toBe(200);
+    expect(body.candidate.role_title).toBeNull();
+    expect(body.candidate.name).toBe('Ava Example');
   });
 });
 
@@ -492,6 +564,42 @@ describe('after consent is withdrawn', () => {
     tables.interview_round_recordings = [];
     expect((await review(appFor('admin', OWNER, tables))).body.attempts[0].recording.state).toBe('none');
   });
+
+  describe('whatever case the id is typed in', () => {
+    const lettered = () => {
+      const tables = withdrawn();
+      tables.interview_rounds[0].id = LETTERED_ROUND;
+      for (const table of ['interview_round_attempts', 'interview_round_recordings', 'r1_admin_log', 'interview_round_consents']) {
+        for (const row of tables[table]) row.round_id = LETTERED_ROUND;
+      }
+      tables.call_sessions[0].interview_round_id = LETTERED_ROUND;
+      return tables;
+    };
+
+    it.each([
+      ['lower', LETTERED_ROUND],
+      ['upper', LETTERED_ROUND.toUpperCase()],
+    ])('hides the same things for an id in %s case', async (_case, id) => {
+      const res = await review(appFor('viewer', OTHER, lettered()), id);
+      expect(res.status).toBe(200);
+      const [attempt] = res.body.attempts;
+      expect(attempt).toMatchObject({ consent_withdrawn: true, transcript_hidden: true, turns: [] });
+      expect(attempt.recording).toMatchObject({ state: 'deleted', reason: 'consent_withdrawn' });
+      expect(res.body.assessment.metric_results.map((m: Row) => m.rationale)).toEqual([null, null]);
+      expect(JSON.stringify(res.body)).not.toContain('Tell me about your goals');
+    });
+
+    it('audits the read under the id as it is stored', async () => {
+      await review(appFor('viewer', OTHER, lettered()), LETTERED_ROUND.toUpperCase());
+      expect(audits.find((a) => a.event === 'resource.read')?.metadata).toMatchObject({ round_id: expect.stringMatching(/^abcdef00-/), consent_withdrawn: true });
+    });
+
+    it('does not lean on the route: the read itself goes by the stored id', async () => {
+      appFor('viewer', OTHER, lettered());
+      const result = await readR1Review({ from: mocks.from } as never, { id: OTHER, appRole: 'viewer', active: true }, LETTERED_ROUND.toUpperCase());
+      expect(result).toMatchObject({ kind: 'ok', consentWithdrawn: true });
+    });
+  });
 });
 
 describe('while the interview runs', () => {
@@ -553,6 +661,13 @@ describe('the audit of a read', () => {
       role: 'viewer', scores_withheld: false, consent_withdrawn: false,
     });
     expect(JSON.stringify(audits)).not.toContain('Tell me about your goals');
+  });
+
+  it('records that consent was withdrawn on a read of such a round', async () => {
+    const tables = tablesFor();
+    tables.interview_round_consents = [{ id: 'c1', round_id: ROUND, granted_at: '2026-11-02T09:59:00Z', withdrawn_at: '2026-11-03T00:00:00Z', proof: { decision: 'withdrawn' } }];
+    await review(appFor('viewer', OTHER, tables));
+    expect(audits.find((a) => a.event === 'resource.read')?.metadata).toMatchObject({ consent_withdrawn: true });
   });
 
   it('still answers when the audit cannot be written: a read fails open', async () => {

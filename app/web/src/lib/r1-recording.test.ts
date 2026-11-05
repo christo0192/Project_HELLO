@@ -434,6 +434,16 @@ describe('attempt labels', () => {
     ).toEqual(['Attempt 1 (not counted)', 'Attempt 2 (counted)']);
   });
 
+  it('tells two starts apart when a restart would read the same', () => {
+    expect(
+      attemptLabels([
+        { attempt_number: 1, counted: false },
+        { attempt_number: 1, counted: false },
+        { attempt_number: 1, counted: true },
+      ]),
+    ).toEqual(['Attempt 1 (not counted)', 'Attempt 1 (not counted, start 2)', 'Attempt 1 (counted)']);
+  });
+
   it('is empty for no attempts', () => {
     expect(attemptLabels([])).toEqual([]);
   });

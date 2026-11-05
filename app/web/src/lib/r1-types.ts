@@ -212,6 +212,7 @@ export interface R1ReviewResponse {
     experience_years: number | null;
     resume: R1ReviewResume | null;
   };
+  /** In the order they started. A restart shares its `attempt_number`, so `session_id` tells them apart. */
   attempts: R1ReviewAttempt[];
   assessment: R1ReviewAssessment | null;
   events: R1ReviewEvent[];

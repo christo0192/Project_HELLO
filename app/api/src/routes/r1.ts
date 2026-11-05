@@ -7,6 +7,7 @@ import { env } from '../lib/env.js';
 import { requireRole } from '../lib/rbac.js';
 import { auditAccessDenied, recordAudit } from '../lib/audit.js';
 import { projectRecordingContext } from '../lib/r1/recording/context.js';
+import { toCanonicalUuid } from '../lib/r1/recording/keys.js';
 import { withRecordingAttempts } from '../lib/r1/recording/summary.js';
 import { readR1Review } from '../lib/r1/review.js';
 
@@ -87,16 +88,17 @@ r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (r
  */
 r1Router.get('/interview-rounds/:id/review', requireRole('viewer'), async (req, res, next) => { try {
   res.setHeader('Cache-Control', 'no-store');
-  if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+  const roundId = toCanonicalUuid(req.params.id);
+  if (!roundId) return res.status(400).json({ error: 'invalid_id' });
   const actor = req.authUser!;
-  const result = await readR1Review(supabase as never, { id: actor.id, appRole: actor.appRole, active: actor.active }, req.params.id);
+  const result = await readR1Review(supabase as never, { id: actor.id, appRole: actor.appRole, active: actor.active }, roundId);
   if (result.kind === 'forbidden') {
     await auditAccessDenied(req, 'r1_review_access_denied').catch(() => undefined);
     return res.status(403).json({ error: 'access_denied' });
   }
   if (result.kind === 'not_found') return res.status(404).json({ error: 'not_found' });
   if (result.kind === 'unavailable') return res.status(503).json({ error: 'service_unavailable' });
-  await recordAudit(req, 'resource.read', 200, { metadata: { resource: 'r1_review', round_id: req.params.id, requested_by: actor.id, role: actor.appRole, scores_withheld: result.scoresWithheld, consent_withdrawn: result.consentWithdrawn } }).catch(() => undefined);
+  await recordAudit(req, 'resource.read', 200, { metadata: { resource: 'r1_review', round_id: roundId, requested_by: actor.id, role: actor.appRole, scores_withheld: result.scoresWithheld, consent_withdrawn: result.consentWithdrawn } }).catch(() => undefined);
   res.json(result.body);
 } catch (e) { next(e); } });
 

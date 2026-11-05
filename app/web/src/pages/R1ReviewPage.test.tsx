@@ -8,7 +8,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import type {
   R1RecordingSummary,
   R1ReviewAssessment,
@@ -447,6 +447,45 @@ describe('Overview, in every other state', () => {
     noResult();
   });
 
+  it('in progress: the header says so too', async () => {
+    await opened(live());
+    expect(screen.getByRole('list', { name: 'About this interview' })).toHaveTextContent('In progress');
+  });
+
+  const waiting = (over: Partial<R1ReviewAttempt> = {}) => review({
+    assessment: null,
+    attempts: [attempt({ counted: false, outcome: 'provider_error', session_status: 'failed', ended_at: new Date(Date.now() - 60_000).toISOString(), ...over })],
+    round: { ...review().round, status: 'in_progress', attempts_counted: 0, recommendation: null, overall: null },
+  });
+
+  it('an attempt that ended uncounted: nobody is in it, and the link is still open', async () => {
+    await opened(waiting());
+    expect(panel('Overview')).toHaveTextContent('No interview is running.');
+    expect(panel('Overview')).toHaveTextContent(/Link valid until/);
+    expect(panel('Overview')).not.toHaveTextContent('in progress');
+    const chips = screen.getByRole('list', { name: 'About this interview' });
+    expect(chips).toHaveTextContent('Link open');
+    expect(chips).not.toHaveTextContent('In progress');
+    noResult();
+  });
+
+  it('an attempt that ended uncounted: Check again sees a new start, because the page does not poll', async () => {
+    await opened(waiting());
+    mockApi.getR1Review.mockResolvedValue(live());
+    await userEvent.click(within(panel('Overview')).getByRole('button', { name: 'Check again' }));
+    expect(await within(panel('Overview')).findByText(/The interview is in progress/)).toBeInTheDocument();
+  });
+
+  it('a withdrawal in the opening reads no differently: nothing says an interview is running', async () => {
+    await opened(waiting({
+      outcome: 'candidate_left', consent_withdrawn: true, transcript_hidden: true, turns: [],
+      recording: recording({ state: 'deleted', reason: 'consent_withdrawn', started_at_ms: null, duration_ms: null, mode: null, has_video: null, retention_until: null }),
+    }));
+    expect(screen.getByText('The transcript is hidden.')).toBeInTheDocument();
+    expect(panel('Overview')).toHaveTextContent('No interview is running.');
+    expect(panel('Overview')).not.toHaveTextContent('in progress');
+  });
+
   it('in progress: no transcript yet, and it says why rather than that none was saved', async () => {
     await opened(live(), '?tab=recording');
     expect(panel('Recording')).toHaveTextContent('The transcript appears here once the interview ends.');
@@ -471,6 +510,42 @@ describe('Overview, in every other state', () => {
     await userEvent.click(within(panel('Overview')).getByRole('button', { name: 'Check again' }));
     expect(await screen.findByRole('region', { name: 'AI recommendation' })).toBeInTheDocument();
     expect(mockApi.getR1Review).toHaveBeenCalledTimes(2);
+  });
+
+  const stale = 'This page could not be refreshed, so it may be out of date.';
+
+  it('a Check again that fails says so, keeps the page, and offers another try', async () => {
+    await opened(scoring());
+    mockApi.getR1Review.mockRejectedValueOnce(new TestApiError('service_unavailable', 503));
+    await userEvent.click(within(panel('Overview')).getByRole('button', { name: 'Check again' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(stale);
+    expect(alert).not.toHaveTextContent('service_unavailable');
+    expect(panel('Overview')).toHaveTextContent('Scoring in progress.');
+
+    mockApi.getR1Review.mockResolvedValue(review());
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByRole('region', { name: 'AI recommendation' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('a second failure is news again: the notice comes back rather than sit there unchanged', async () => {
+    await opened(scoring());
+    mockApi.getR1Review.mockRejectedValue(new TestApiError('service_unavailable', 503));
+    await userEvent.click(within(panel('Overview')).getByRole('button', { name: 'Check again' }));
+    const first = await screen.findByRole('alert');
+    await userEvent.click(within(first).getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(mockApi.getR1Review).toHaveBeenCalledTimes(3));
+    const second = await screen.findByRole('alert');
+    expect(second).toHaveTextContent(stale);
+    expect(second).not.toBe(first);
+  });
+
+  it('a Check again that finds the round gone says so, rather than warn about an old page', async () => {
+    await opened(scoring());
+    mockApi.getR1Review.mockRejectedValue(new TestApiError('not_found', 404));
+    await userEvent.click(within(panel('Overview')).getByRole('button', { name: 'Check again' }));
+    expect(await screen.findByText('This interview is not available.')).toBeInTheDocument();
   });
 
   it('a round whose consent was withdrawn never says a score is coming', async () => {
@@ -567,6 +642,17 @@ describe('a pending rejection', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(mockApi.getR1Review).toHaveBeenCalledTimes(2);
     expect(screen.getByRole('list', { name: 'About this interview' })).not.toHaveTextContent(/Rejection pending/);
+  });
+
+  it('shows a cancel that worked even when the re-read after it fails', async () => {
+    await opened(pending());
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel rejection' }));
+    mockApi.getR1Review.mockRejectedValue(new TestApiError('service_unavailable', 503));
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Cancel the rejection' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('This page could not be refreshed, so it may be out of date.');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('list', { name: 'About this interview' })).not.toHaveTextContent(/Rejection pending/);
+    expect(screen.queryByRole('button', { name: 'Cancel rejection' })).not.toBeInTheDocument();
   });
 
   it('says so in plain words when it was no longer pending, and refreshes', async () => {
@@ -745,6 +831,36 @@ describe('Recording: the controls', () => {
     expect(screen.getByRole('button', { name: 'Unmute' })).toBeInTheDocument();
     fireEvent.change(screen.getByRole('slider', { name: 'Volume' }), { target: { value: '40' } });
     expect(el.volume).toBeCloseTo(0.4);
+  });
+
+  it('puts a speed, a volume and a mute chosen before the first play on the media', async () => {
+    await recordingTab();
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Speed' }), '1.5');
+    fireEvent.change(screen.getByRole('slider', { name: 'Volume' }), { target: { value: '40' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Mute' }));
+    const { el } = await pressPlay();
+    expect(el.playbackRate).toBe(1.5);
+    expect(el.volume).toBeCloseTo(0.4);
+    expect(el.muted).toBe(true);
+  });
+
+  it('keeps them on the fresh link a re-mint brings: a new source resets the media', async () => {
+    await recordingTab();
+    const { el } = await pressPlay();
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Speed' }), '1.25');
+    fireEvent.change(screen.getByRole('slider', { name: 'Volume' }), { target: { value: '60' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Mute' }));
+
+    mockApi.getR1Recording.mockResolvedValue({ ...recording(), url: 'https://media.example.com/r1.mp4?sig=fresh', content_type: 'video/mp4', expires_in_sec: 300 });
+    fireEvent.error(el);
+    await waitFor(() => expect(el.getAttribute('src')).toContain('sig=fresh'));
+    el.playbackRate = 1;
+    el.volume = 1;
+    el.muted = false;
+    fireEvent.loadedMetadata(el);
+    expect(el.playbackRate).toBe(1.25);
+    expect(el.volume).toBeCloseTo(0.6);
+    expect(el.muted).toBe(true);
   });
 
   it('keeps nodownload on the video', async () => {
@@ -1000,6 +1116,36 @@ describe('Recording: seeking from the transcript', () => {
     // Past the start the rule is back, and the row after can take over.
     moveTo(el, state, 200);
     expect(lit()).toEqual(['4']);
+  });
+
+  it('keeps a click that lands the moment new rows commit, before that render has settled', async () => {
+    const pending = { ...review().round, recommendation: 'reject' as const, status_write: 'pending_reject' as const, pending_reject_until: '2026-11-06T10:00:00.000Z' };
+    await opened(review({ round: pending }), '?tab=recording');
+    const { el, state } = await pressPlay();
+
+    // A re-read brings a row the page did not have.
+    mockApi.getR1Review.mockResolvedValue(review({ attempts: [attempt({ turns: [...TURNS, turn(6, 500, 'bot', 'closing', 'Goodbye for now.')] })] }));
+
+    // React runs a render's passive effects in a later task, so a click queued behind that render lands
+    // between the two. A mutation observer is a microtask: this click lands there every time.
+    const watcher = new MutationObserver(() => {
+      const row = document.querySelector<HTMLButtonElement>('button[aria-label^="Play from 8:20"]');
+      if (!row) return;
+      watcher.disconnect();
+      row.click();
+    });
+    watcher.observe(document.body, { childList: true, subtree: true });
+    onTestFinished(() => watcher.disconnect());
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel rejection' }));
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Cancel the rejection' }));
+    await screen.findByText('Goodbye for now.');
+    await waitFor(() => expect(state.sets.at(-1)).toBe(499.75));
+
+    // The lead-in: by the highlight rule this position belongs to the row before, so only a hold that
+    // survived the commit keeps the clicked row lit.
+    moveTo(el, state, 499.75);
+    expect(lit()).toEqual(['6']);
   });
 
   it('ends the hold on a scrub out of the lead-in', async () => {
@@ -1354,12 +1500,65 @@ describe('a hidden tab', () => {
   it('pauses the recording, and keeps the place', async () => {
     await opened(review(), '?tab=recording');
     const { el, state } = await pressPlay();
-    fireEvent.play(el);
+    // The position first: once `play` starts the frame loop only a frame reports it, and the click below
+    // can pause the media before one runs.
     moveTo(el, state, 100);
+    fireEvent.play(el);
     await userEvent.click(tab('Overview'));
     expect(state.paused).toBe(true);
     await userEvent.click(tab('Recording'));
     expect(screen.getByTestId('position')).toHaveTextContent('1:40');
+  });
+});
+
+describe('a restart: two attempts with one number', () => {
+  const failedStart = () => attempt({
+    session_id: 's0', counted: false, outcome: 'provider_error', session_status: 'failed',
+    turns: [turn(0, 2, 'bot', 'opening', 'A line from the failed start.')],
+  });
+  const orders: Array<[string, () => R1ReviewAttempt[]]> = [
+    ['the failed start first', () => [failedStart(), attempt()]],
+    ['the scored run first', () => [attempt(), failedStart()]],
+  ];
+  const switcher = () => screen.getByRole('group', { name: 'Attempt' });
+  const transcript = () => within(panel('Recording'));
+
+  it.each(orders)('takes a quote to the run it came from, with %s', async (_order, attempts) => {
+    await opened(review({ attempts: attempts() }));
+    await userEvent.click(screen.getByRole('button', { name: /What made you look at it now/ }));
+    expect(await transcript().findByText('Hi, I saw your course.')).toBeInTheDocument();
+    expect(transcript().queryByText('A line from the failed start.')).not.toBeInTheDocument();
+    expect(lit()).toEqual(['3']);
+    expect(address).toContain('t=125');
+  });
+
+  it('puts the place in the list in the address, not the number they share', async () => {
+    await opened(review({ attempts: [failedStart(), attempt()] }));
+    await userEvent.click(screen.getByRole('button', { name: /What made you look at it now/ }));
+    expect(address).toContain('attempt=2');
+  });
+
+  it.each(orders)('reaches each from the switcher, with %s', async (_order, attempts) => {
+    await opened(review({ attempts: attempts() }), '?tab=recording');
+    await userEvent.click(within(switcher()).getByRole('button', { name: 'Attempt 1 (not counted)' }));
+    expect(await transcript().findByText('A line from the failed start.')).toBeInTheDocument();
+    await userEvent.click(within(switcher()).getByRole('button', { name: 'Attempt 1 (counted)' }));
+    expect(await transcript().findByText('Hi, I saw your course.')).toBeInTheDocument();
+    expect(transcript().queryByText('A line from the failed start.')).not.toBeInTheDocument();
+  });
+
+  it('marks one of them as chosen, and gives React no duplicate key', async () => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    await opened(review({ attempts: [failedStart(), attempt()] }));
+    const pressed = within(switcher()).getAllByRole('button').filter((button) => button.getAttribute('aria-pressed') === 'true');
+    expect(pressed.map((button) => button.textContent)).toEqual(['Attempt 1 (counted)']);
+    expect(logged.mock.calls.flat().join(' ')).not.toContain('same key');
+  });
+
+  it('opens the address it wrote: the place survives a reload', async () => {
+    await opened(review({ attempts: [failedStart(), attempt()] }), '?tab=recording&attempt=1');
+    expect(transcript().getByText('A line from the failed start.')).toBeInTheDocument();
   });
 });
 

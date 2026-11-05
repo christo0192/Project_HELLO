@@ -48,16 +48,29 @@ export function cueSecFrom(value: string | null): number | null {
   return Number.isFinite(sec) ? sec : null;
 }
 
-/** The attempt named in `?attempt=`, else the one that was scored, else the latest. */
+/**
+ * The attempt named in `?attempt=`, else the one that was scored, else the latest.
+ *
+ * The number is the attempt's place in the list, from 1, and not its `attempt_number`: a restart keeps
+ * the number of the attempt it replaces (0119), so two attempts can share one. The list runs in the
+ * order they started, so a place stays put as attempts are added. Inside the page an attempt is its
+ * session; this is only how the address says which.
+ */
 export function reviewAttemptFrom(
   value: string | null,
   attempts: readonly R1ReviewAttempt[],
   assessment: Pick<R1ReviewAssessment, 'session_id'> | null,
 ): R1ReviewAttempt | null {
-  const named = attempts.find((attempt) => String(attempt.attempt_number) === value);
+  const named = value !== null && /^[1-9]\d*$/.test(value) ? attempts[Number(value) - 1] : undefined;
   if (named) return named;
   const scored = attempts.find((attempt) => attempt.session_id === assessment?.session_id);
   return scored ?? attempts[attempts.length - 1] ?? null;
+}
+
+/** What `?attempt=` says for an attempt. Null: this session is not in the list. */
+export function attemptParam(attempts: readonly Pick<R1ReviewAttempt, 'session_id'>[], sessionId: string): string | null {
+  const index = attempts.findIndex((attempt) => attempt.session_id === sessionId);
+  return index < 0 ? null : String(index + 1);
 }
 
 /* ── The player ───────────────────────────────────────────────────── */
@@ -358,7 +371,7 @@ export function neededReveals(events: readonly R1ReviewEvent[], sessionId: strin
 
 /* ── Where the round stands ───────────────────────────────────────── */
 
-export type R1ReviewStage = 'withheld' | 'scored' | 'not_scored' | 'scoring' | 'invited' | 'in_progress' | 'closed';
+export type R1ReviewStage = 'withheld' | 'scored' | 'not_scored' | 'scoring' | 'invited' | 'in_progress' | 'link_open' | 'closed';
 
 const notScored = (assessment: R1ReviewAssessment): boolean =>
   assessment.raw_recommendation === 'human_review' || assessment.recommendation === null;
@@ -381,6 +394,14 @@ function scoreCanArrive(attempt: R1ReviewAttempt, roundCreatedAt: string, nowMs:
   return nowMs - Date.parse(attempt.ended_at ?? attempt.started_at ?? roundCreatedAt) < R1_SCORE_WAIT_MS;
 }
 
+/**
+ * Whether anyone is in an interview now. The round's own status cannot say: an attempt that ended
+ * uncounted leaves it `in_progress` until the link lapses (`r1_settle_attempt`), with nobody in it.
+ */
+export function roundIsRunning(attempts: readonly Pick<R1ReviewAttempt, 'in_progress'>[]): boolean {
+  return attempts.some((attempt) => attempt.in_progress);
+}
+
 export function reviewStage(review: Pick<R1ReviewResponse, 'round' | 'attempts' | 'assessment'>, nowMs: number): R1ReviewStage {
   const { round, attempts, assessment } = review;
   if (round.scores_withheld) return 'withheld';
@@ -388,7 +409,8 @@ export function reviewStage(review: Pick<R1ReviewResponse, 'round' | 'attempts' 
   if (assessment) return notScored(assessment) || !round.recommendation ? 'not_scored' : 'scored';
   if (attempts.some((attempt) => scoreCanArrive(attempt, round.created_at, nowMs))) return 'scoring';
   if (round.status === 'completed' || round.status === 'expired' || round.status === 'cancelled') return 'closed';
-  return round.status === 'in_progress' ? 'in_progress' : 'invited';
+  if (round.status !== 'in_progress') return 'invited';
+  return roundIsRunning(attempts) ? 'in_progress' : 'link_open';
 }
 
 export function notScoredSentence(assessment: R1ReviewAssessment): string {

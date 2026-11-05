@@ -17,6 +17,7 @@ import {
   reviewAttemptFrom,
   reviewDurationSec,
   reviewStage,
+  attemptParam,
   reviewTabFrom,
   rolePlayMarks,
   trustChecks,
@@ -95,6 +96,29 @@ describe('reading the address', () => {
     expect(reviewAttemptFrom(null, attempts, null)?.session_id).toBe('s2');
     expect(reviewAttemptFrom('9', attempts, null)?.session_id).toBe('s2');
     expect(reviewAttemptFrom(null, [], null)).toBeNull();
+  });
+
+  describe('a restart, which shares its attempt number', () => {
+    const attempts = [
+      attempt({ session_id: 'failed-start', attempt_number: 1, counted: false }),
+      attempt({ session_id: 'scored-run', attempt_number: 1 }),
+      attempt({ session_id: 'retake', attempt_number: 2 }),
+    ];
+
+    it('reads the address as a place in the list, so each attempt can be reached', () => {
+      expect(['1', '2', '3'].map((place) => reviewAttemptFrom(place, attempts, null)?.session_id)).toEqual(['failed-start', 'scored-run', 'retake']);
+    });
+
+    it('writes the place back: an attempt and its address go both ways', () => {
+      expect(attempts.map((item) => attemptParam(attempts, item.session_id))).toEqual(['1', '2', '3']);
+      expect(attemptParam(attempts, 'not-here')).toBeNull();
+    });
+
+    it('takes nothing but a place in the list', () => {
+      for (const bad of ['0', '-1', '1.5', '1e0', ' 1', 'abc', '']) {
+        expect(reviewAttemptFrom(bad, attempts, assessment({ session_id: 'scored-run' }))?.session_id).toBe('scored-run');
+      }
+    });
   });
 });
 
@@ -375,7 +399,14 @@ describe('where the round stands', () => {
 
   it('is invited or in progress before that', () => {
     expect(reviewStage(review({ assessment: null, attempts: [], round: { ...review().round, status: 'invited' } }), NOW)).toBe('invited');
-    expect(reviewStage(review({ assessment: null, attempts: [attempt({ session_status: 'in_progress' })], round: { ...review().round, status: 'in_progress' } }), NOW)).toBe('in_progress');
+    expect(reviewStage(review({ assessment: null, attempts: [attempt({ session_status: 'in_progress', in_progress: true })], round: { ...review().round, status: 'in_progress' } }), NOW)).toBe('in_progress');
+  });
+
+  it('is not in progress with nobody in it: an uncounted attempt leaves the round waiting on its link', () => {
+    const round = { ...review().round, status: 'in_progress' as const };
+    const ended = attempt({ session_status: 'failed', counted: false, outcome: 'provider_error' });
+    expect(reviewStage(review({ assessment: null, attempts: [ended], round }), NOW)).toBe('link_open');
+    expect(reviewStage(review({ assessment: null, attempts: [ended, attempt({ session_id: 's2', session_status: 'in_progress', in_progress: true })], round }), NOW)).toBe('in_progress');
   });
 
   it('has ended unscored when the round closed with nothing to score', () => {

@@ -6,7 +6,8 @@
  *
  * A pending rejection can be cancelled from here, after a confirmation, by an admin or the interviewer
  * who sent the round: the API's own rule, so nobody is offered a button that can only answer 403.
- * Cancelling is the safe direction, and it is an audited override.
+ * Cancelling is the safe direction, and it is an audited override. Once the API has said yes the
+ * chip and the button go, whether or not the re-read that follows can get through.
  */
 import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -18,6 +19,7 @@ import { plainErrorText } from '../../lib/api-error-copy';
 import { formatDateTime, formatRelative } from '../../lib/datetime';
 import { r1RecordingStateCopy, attemptLabels } from '../../lib/r1-recording';
 import { r1StatusLabel } from '../../lib/r1';
+import { roundIsRunning } from '../../lib/r1-review';
 import type { R1ReviewAttempt, R1ReviewResponse } from '../../lib/r1-types';
 
 const nameLink =
@@ -42,7 +44,7 @@ export interface ReviewHeaderProps {
   candidateName: string;
   attempt: R1ReviewAttempt | null;
   mayCancelRejection: boolean;
-  onSelectAttempt: (attemptNumber: number) => void;
+  onSelectAttempt: (sessionId: string) => void;
   onChanged: () => void;
 }
 
@@ -52,7 +54,10 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   const label = attempt ? labels[attempts.indexOf(attempt)] : null;
   const recording = attempt ? r1RecordingStateCopy(attempt.recording) : null;
   const keptUntil = recording?.facts.find((fact) => fact.startsWith('Kept until'));
-  const pending = round.status_write === 'pending_reject' && round.pending_reject_until !== null;
+  const statusWord = round.status === 'in_progress' && !roundIsRunning(attempts) ? 'Link open' : r1StatusLabel(round.status);
+
+  const [cancelledRound, setCancelledRound] = useState<string | null>(null);
+  const pending = round.status_write === 'pending_reject' && round.pending_reject_until !== null && cancelledRound !== round.id;
 
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -64,6 +69,7 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
     setError(null);
     try {
       await api.cancelR1PendingReject(round.id);
+      setCancelledRound(round.id);
       setConfirming(false);
       onChanged();
     } catch (failure) {
@@ -88,7 +94,7 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
       </h1>
 
       <ul aria-label="About this interview" className="mt-3 flex flex-wrap items-center gap-2">
-        {round.status !== 'completed' && <Chip>{r1StatusLabel(round.status)}</Chip>}
+        {round.status !== 'completed' && <Chip>{statusWord}</Chip>}
         {attempt?.ended_at && <Chip>Ended {formatRelative(attempt.ended_at)}</Chip>}
         {candidate.role_title && <Chip>{candidate.role_title}</Chip>}
         {attempts.length === 1 && label && <Chip>{label}</Chip>}
@@ -97,9 +103,9 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
             <SegmentedControl
               size="sm"
               ariaLabel="Attempt"
-              value={String(attempt.attempt_number)}
-              onChange={(value) => onSelectAttempt(Number(value))}
-              options={attempts.map((item, index) => ({ value: String(item.attempt_number), label: labels[index] }))}
+              value={attempt.session_id}
+              onChange={onSelectAttempt}
+              options={attempts.map((item, index) => ({ value: item.session_id, label: labels[index] }))}
             />
           </li>
         )}

@@ -32,7 +32,8 @@ import { VerdictBlock } from './VerdictBlock';
 
 /** Where a seek chip or a quote points. */
 export interface TurnTarget {
-  attemptNumber: number;
+  /** The attempt, by session: a restart shares its `attempt_number`. */
+  sessionId: string;
   row: number;
   sec: number | null;
 }
@@ -226,6 +227,10 @@ export function OverviewPanel({ review, attempt, candidateName, onOpenTurn, onCh
       </StateLine>
     );
   }
+  // An attempt ended without counting, so the round waits on its link with nobody in it.
+  if (stage === 'link_open') {
+    return <StateLine onCheckAgain={onCheckAgain}>No interview is running. Link valid until {formatDateTime(round.expires_at)}.</StateLine>;
+  }
   if (stage === 'scoring') {
     return <StateLine onCheckAgain={onCheckAgain}>Scoring in progress. The result appears here once it is ready.</StateLine>;
   }
@@ -249,7 +254,7 @@ export function OverviewPanel({ review, attempt, candidateName, onOpenTurn, onCh
   // A placeholder row repeats one operator's sentence five times, and scores nothing.
   const showMetrics = stage === 'scored' || assessment.r1.outcome === 'scored';
   const open = (row: number | null, sec: number | null) => {
-    if (scored && row !== null) onOpenTurn({ attemptNumber: scored.attempt_number, row, sec });
+    if (scored && row !== null) onOpenTurn({ sessionId: scored.session_id, row, sec });
   };
 
   return (

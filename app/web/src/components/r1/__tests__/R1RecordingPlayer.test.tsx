@@ -1534,6 +1534,31 @@ describe('a host that draws its own controls', () => {
     expect(el.volume).toBe(0.5);
   });
 
+  it('puts what was set before the first load on the media, and again on the link a re-mint brings', async () => {
+    mockApi.getR1Recording.mockResolvedValueOnce(minted()).mockResolvedValueOnce(minted({ url: URL_TWO }));
+    const r = custom();
+    act(() => {
+      r.ref.current!.setRate(1.75);
+      r.ref.current!.setVolume(0.3);
+      r.ref.current!.setMuted(true);
+    });
+    const { el } = await firstPlay(r);
+    expect(el.playbackRate).toBe(1.75);
+    expect(el.volume).toBe(0.3);
+    expect(el.muted).toBe(true);
+
+    failWith(el, 2);
+    await waitFor(() => expect(el).toHaveAttribute('src', URL_TWO));
+    // What the browser does when the new source loads.
+    el.playbackRate = 1;
+    el.volume = 1;
+    el.muted = false;
+    fireEvent.loadedMetadata(el);
+    expect(el.playbackRate).toBe(1.75);
+    expect(el.volume).toBe(0.3);
+    expect(el.muted).toBe(true);
+  });
+
   it('gives a recovered pair the same speed on both halves, and leaves the picture muted', async () => {
     mockApi.getR1Recording.mockResolvedValue(minted({ mode: 'split', url: undefined, video_url: URL_ONE, audio_url: URL_TWO }));
     const r = custom({ summary: listed({ mode: 'split' }) });

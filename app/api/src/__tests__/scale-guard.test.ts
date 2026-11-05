@@ -906,6 +906,7 @@ const BOUNDED_LISTS: ReadonlyArray<{ file: string; values: string; sites: number
   { file: 'lib/phone-runtime/read.ts', values: 'ids', sites: 1, why: 'one due pass, at most PHONE_RUNTIME_MAX_ROWS (200) candidates' },
   { file: 'lib/r1/recording/summary.ts', values: 'roundIds', sites: 2, why: "one candidate's R1 rounds" },
   { file: 'lib/r1/review.ts', values: 'phoneSessionIds', sites: 1, why: "one candidate's phone sessions" },
+  { file: 'lib/r1/review.ts', values: 'sessionIds', sites: 1, why: "one round's attempts: a few starts, so the log uses its session index" },
   { file: 'lib/recording/sweeper.ts', values: 'sessionIds', sites: 1, why: 'one pass, at most ATTEMPT_LINK_PASS_LIMIT (10) attempts' },
   { file: 'routes/candidates.ts', values: 'engagementIds', sites: 2, why: "one candidate's engagements: their rescreen cycles" },
   { file: 'routes/candidates.ts', values: 'ids', sites: 1, why: "one candidate's sessions" },

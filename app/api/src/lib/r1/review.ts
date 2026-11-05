@@ -29,8 +29,12 @@
  * recording" or "not scored" about something that exists. Only the role title and the one line of
  * phone context are optional.
  *
- * SCALE. Everything here is one round or one candidate. Reads are keyed by the round or the session;
- * the transcript and the log page past PostgREST's row cap.
+ * SCALE. Everything here is one round or one candidate. Reads are keyed by the round or the session,
+ * and the log by the session on purpose: its only index is (session_id, created_at), and it grows with
+ * every interview in the workspace. The transcript and the log page past PostgREST's row cap.
+ *
+ * ATTEMPTS come back in the order they started. A restart keeps the number of the attempt it replaces
+ * (0119), so `attempt_number` alone neither orders them nor tells them apart: `session_id` does that.
  */
 
 import type { R1DbClient } from '../../services/r1-assessment.js';
@@ -396,20 +400,19 @@ export async function readR1Review(
       return { kind: 'forbidden' };
     }
 
-    const [attemptsRead, recordingsRead, sessionsRead, cutoffs, logRead] = await Promise.all([
-      db.from('interview_round_attempts').select(ATTEMPT_COLUMNS).eq('round_id', roundId).order('attempt_number', { ascending: true }),
-      db.from(RECORDINGS_TABLE).select(SUMMARY_COLUMNS).eq('round_id', roundId),
-      db.from('call_sessions').select(SESSION_COLUMNS).eq('interview_round_id', roundId),
-      withdrawalCutoffs(db, [roundId]),
-      readAllPages<Row>(
-        (from, to) => db.from('r1_admin_log').select(LOG_COLUMNS).eq('round_id', roundId)
-          .order('created_at', { ascending: true }).order('id', { ascending: true }).range(from, to) as unknown as PageResult,
-        MAX_PAGES,
-      ),
+    // The stored spelling from here on: Postgres matches an id in any case, and `withdrawalCutoffs` is
+    // keyed by what is stored, so the caller's spelling must never decide what counts as withdrawn.
+    const storedRoundId = String(round.id);
+    const [attemptsRead, recordingsRead, sessionsRead, cutoffs] = await Promise.all([
+      db.from('interview_round_attempts').select(ATTEMPT_COLUMNS).eq('round_id', storedRoundId)
+        .order('attempt_number', { ascending: true }).order('created_at', { ascending: true }),
+      db.from(RECORDINGS_TABLE).select(SUMMARY_COLUMNS).eq('round_id', storedRoundId),
+      db.from('call_sessions').select(SESSION_COLUMNS).eq('interview_round_id', storedRoundId),
+      withdrawalCutoffs(db, [storedRoundId]),
     ]);
-    if (attemptsRead.error || recordingsRead.error || sessionsRead.error || !logRead.ok) return UNAVAILABLE;
+    if (attemptsRead.error || recordingsRead.error || sessionsRead.error) return UNAVAILABLE;
 
-    const cutoff = cutoffs.get(roundId);
+    const cutoff = cutoffs.get(storedRoundId);
     const withdrawnFor = (createdAt: unknown): boolean => {
       if (cutoff === undefined) return false;
       const at = Date.parse(String(createdAt));
@@ -422,15 +425,25 @@ export async function readR1Review(
     const liveFor = (sessionId: unknown): boolean => LIVE_SESSION_STATES.has(sessions.get(String(sessionId))?.status);
 
     const attemptRows = (Array.isArray(attemptsRead.data) ? attemptsRead.data : []) as Row[];
-    const turnsRead = await Promise.all(attemptRows.map((attempt) =>
-      withdrawnFor(attempt.created_at) || liveFor(attempt.session_id)
-        ? null
+    const sessionIds = attemptRows.map((attempt) => String(attempt.session_id));
+    const [logRead, turnsRead] = await Promise.all([
+      sessionIds.length === 0
+        ? { ok: true as const, rows: [] as Row[] }
         : readAllPages<Row>(
-            (from, to) => db.from('transcript_turns').select(TURN_COLUMNS).eq('session_id', String(attempt.session_id))
-              .order('turn_index', { ascending: true }).range(from, to) as unknown as PageResult,
+            (from, to) => db.from('r1_admin_log').select(LOG_COLUMNS).in('session_id', sessionIds)
+              .order('created_at', { ascending: true }).order('id', { ascending: true }).range(from, to) as unknown as PageResult,
             MAX_PAGES,
-          )));
-    if (turnsRead.some((read) => read !== null && !read.ok)) return UNAVAILABLE;
+          ),
+      Promise.all(attemptRows.map((attempt) =>
+        withdrawnFor(attempt.created_at) || liveFor(attempt.session_id)
+          ? null
+          : readAllPages<Row>(
+              (from, to) => db.from('transcript_turns').select(TURN_COLUMNS).eq('session_id', String(attempt.session_id))
+                .order('turn_index', { ascending: true }).range(from, to) as unknown as PageResult,
+              MAX_PAGES,
+            ))),
+    ]);
+    if (!logRead.ok || turnsRead.some((read) => read !== null && !read.ok)) return UNAVAILABLE;
 
     const recordings = new Map<string, R1RecordingRow>();
     for (const row of (Array.isArray(recordingsRead.data) ? recordingsRead.data : []) as R1RecordingRow[]) {

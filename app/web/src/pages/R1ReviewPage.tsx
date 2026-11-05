@@ -3,14 +3,16 @@
  *
  *   /interviews/:roundId?tab=overview|briefing|resume|recording&attempt=n&t=sec
  *
- * The id is an opaque UUID, so the address carries no personal data. The whole page comes from one
- * read (`GET /api/interview-rounds/:id/review`); a recording's link is minted separately, by the first
- * play. All four panels stay mounted, so a place in the recording survives a look at the scorecard,
- * and a hidden panel pauses the media.
+ * The id is an opaque UUID, so the address carries no personal data. `attempt=n` is the attempt's
+ * place in the list, from 1: a restart shares its `attempt_number`, so inside the page an attempt is
+ * its session. The whole page comes from one read (`GET /api/interview-rounds/:id/review`); a
+ * recording's link is minted separately, by the first play. All four panels stay mounted, so a place
+ * in the recording survives a look at the scorecard, and a hidden panel pauses the media.
  *
  * Who may read what is the API's decision, and this page shows what it answers. A 403 and a 404 read
  * the same: one plain "not available", which says nothing about whether the round exists. Anything
- * else is an error with Retry. A re-read keeps the page on screen until its answer is in.
+ * else is an error with Retry. A re-read keeps the page on screen until its answer is in, and one
+ * that fails says so with a way to try again: an unchanged page must not read as "nothing new".
  *
  * Copy. The appeal banner and every recording sentence are the existing ones. Consent, recording,
  * opt-out, appeal and jurisdiction wording is not written here. The two wordings Legal approved on
@@ -20,7 +22,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { EmptyPanel, ErrorPanel, InlineNotice, Skeleton, SkeletonText } from '../components/design';
+import { EmptyPanel, ErrorPanel, InlineNotice, RetryButton, Skeleton, SkeletonText } from '../components/design';
 import { BriefingPanel } from '../components/r1-review/BriefingPanel';
 import { OverviewPanel } from '../components/r1-review/OverviewPanel';
 import type { TurnTarget } from '../components/r1-review/OverviewPanel';
@@ -34,13 +36,14 @@ import { candidateDisplayName } from '../components/talent/ResumeReviewBadge';
 import { Tabs } from '../components/talent/Tabs';
 import { canActOnRound } from '../lib/r1';
 import { attemptLabels, r1RecordingStateCopy } from '../lib/r1-recording';
-import { cueSecFrom, reviewAttemptFrom, reviewTabFrom } from '../lib/r1-review';
+import { attemptParam, cueSecFrom, reviewAttemptFrom, reviewTabFrom } from '../lib/r1-review';
 import type { R1ReviewResponse } from '../lib/r1-types';
 import type { MeResponse } from '../types';
 
 type Load =
   | { status: 'loading' }
-  | { status: 'ready'; review: R1ReviewResponse }
+  /** `stale`: the last re-read failed, so this may no longer be how the round stands. */
+  | { status: 'ready'; review: R1ReviewResponse; stale: boolean }
   | { status: 'error'; message: string }
   | { status: 'unavailable' };
 
@@ -84,14 +87,14 @@ export function R1ReviewPage() {
     Promise.resolve()
       .then(() => api.getR1Review(roundId))
       .then((review) => {
-        if (live) setLoad({ status: 'ready', review });
+        if (live) setLoad({ status: 'ready', review, stale: false });
       })
       .catch((error: unknown) => {
         if (!live) return;
         const status = statusOf(error);
         if (status === 403 || status === 404) setLoad({ status: 'unavailable' });
-        // A re-read that fails leaves the page as it was.
-        else setLoad((current) => (current.status === 'ready' ? current : { status: 'error', message: messageOf(error) }));
+        // A re-read that fails leaves the page as it was, and says so.
+        else setLoad((current) => (current.status === 'ready' ? { ...current, stale: true } : { status: 'error', message: messageOf(error) }));
       });
     return () => {
       live = false;
@@ -112,7 +115,11 @@ export function R1ReviewPage() {
     };
   }, []);
 
-  const reread = useCallback(() => setReadKey((key) => key + 1), []);
+  const reread = useCallback(() => {
+    // Last time's notice goes first, so a second failure is news again.
+    setLoad((current) => (current.status === 'ready' && current.stale ? { ...current, stale: false } : current));
+    setReadKey((key) => key + 1);
+  }, []);
 
   const [tabPress, setTabPress] = useState(0);
   const onTabClick = useCallback((id: string) => {
@@ -153,30 +160,34 @@ export function R1ReviewPage() {
   );
 
   const selectAttempt = useCallback(
-    (attemptNumber: number) => {
+    (sessionId: string) => {
+      const place = attemptParam(attempts ?? [], sessionId);
+      if (place === null) return;
       setCue(null);
       setSearchParams(
         (previous) => {
           const params = new URLSearchParams(previous);
-          params.set('attempt', String(attemptNumber));
+          params.set('attempt', place);
           params.delete('t');
           return params;
         },
         { replace: true },
       );
     },
-    [setSearchParams],
+    [attempts, setSearchParams],
   );
 
   const openTurn = useCallback(
-    ({ attemptNumber, row, sec }: TurnTarget) => {
+    ({ sessionId, row, sec }: TurnTarget) => {
+      const place = attemptParam(attempts ?? [], sessionId);
+      if (place === null) return;
       nonceRef.current += 1;
       setCue({ sec, row, nonce: nonceRef.current });
       setSearchParams(
         (previous) => {
           const params = new URLSearchParams(previous);
           params.set('tab', 'recording');
-          params.set('attempt', String(attemptNumber));
+          params.set('attempt', place);
           if (sec === null) params.delete('t');
           else params.set('t', String(sec));
           return params;
@@ -184,7 +195,7 @@ export function R1ReviewPage() {
         { replace: true },
       );
     },
-    [setSearchParams],
+    [attempts, setSearchParams],
   );
 
   if (load.status === 'loading') {
@@ -241,6 +252,11 @@ export function R1ReviewPage() {
         onChanged={reread}
       />
 
+      {load.stale && (
+        <InlineNotice tone="warning" role="alert" className="mt-3" action={<RetryButton onRetry={reread} />}>
+          This page could not be refreshed, so it may be out of date.
+        </InlineNotice>
+      )}
       {body.round.is_staff_dry_run && (
         <p role="note" className="mt-3 rounded-control border border-dashed border-ink-secondary px-3 py-2 text-sm font-medium text-ink">
           Not used for any decision
