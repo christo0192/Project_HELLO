@@ -169,7 +169,7 @@ describe('TranscriptionSyncWorkspace', () => {
       render(
         <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={[ASSESSMENT]} blocked={false} />,
       );
-      expect(await screen.findByText("This scorecard couldn't load. Try again from the transcript.")).toBeInTheDocument();
+      expect(await screen.findByText("This scorecard couldn't load. Press Retry on the transcript.")).toBeInTheDocument();
       expect(screen.queryByText(NO_SCORECARD)).not.toBeInTheDocument();
     });
 

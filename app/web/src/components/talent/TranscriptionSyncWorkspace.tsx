@@ -1078,8 +1078,8 @@ export function TranscriptionSyncWorkspace({
   // At 1180px and up the page does not scroll and the panes do, so the workspace is as tall as what is
   // left of the window. What is left depends on the header above it, which wraps with the candidate's
   // facts, so it is measured. A hidden tab measures nothing, and is measured again when it shows. Nothing
-  // scrolls while hidden either, so a cue made then (the scoped page always opens on Overview, and Review
-  // cues there unseen) reaches the transcript only when the tab shows.
+  // scrolls while hidden either, so a cue made while another tab is open reaches the transcript only when
+  // this one shows.
   const rootShownRef = useRef(false);
   useLayoutEffect(() => {
     const root = rootRef.current;
@@ -1201,7 +1201,7 @@ export function TranscriptionSyncWorkspace({
           <Combobox
             id="sync-session-select"
             labelId={sessionLabelId}
-            size="sm"
+            compact
             floating
             searchable={options.length > 6}
             value={selectedSessionId ?? ''}
@@ -1545,13 +1545,11 @@ export function TranscriptionSyncWorkspace({
           // Empty copy only after the read succeeded: while it runs or when it
           // fails, "no scorecard" is a false statement beside a real score.
           emptyText={
-            transcriptLoading
-              ? 'Loading the scorecard…'
-              : transcriptError
-                ? "This scorecard couldn't load. Try again from the transcript."
-                : permissionDenied && isR1
-                  ? 'No phone screening scorecard yet.'
-                  : undefined
+            transcriptError
+              ? "This scorecard couldn't load. Press Retry on the transcript."
+              : permissionDenied && isR1
+                ? 'No phone screening scorecard yet.'
+                : undefined
           }
           holdNotice={false}
         />

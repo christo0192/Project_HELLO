@@ -100,19 +100,40 @@ test.describe('Review, the log header', () => {
   });
 });
 
+async function allFiveRowsFit(panel: Locator): Promise<void> {
+  const pane = panel.getByRole('region', { name: 'AI recommendation' });
+  const rows = pane.locator('[data-rubric-row]');
+  await expect(rows).toHaveCount(5);
+  const paneBox = (await pane.boundingBox())!;
+  for (const row of await rows.all()) {
+    const box = (await row.boundingBox())!;
+    expect(box.y + box.height, 'a rubric row is below the fold').toBeLessThanOrEqual(paneBox.y + paneBox.height);
+    expect((await row.locator('h4').boundingBox())!.height, 'a metric name wrapped').toBeLessThan(26);
+  }
+}
+
 test.describe('Review, the rubric', () => {
   test('all five rows are on screen when Review opens at 1440x900, each on one line', async ({ app, page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
+    await allFiveRowsFit(await openReview(app, page));
+  });
+
+  test('a second session keeps them there: the picker in the log header stays one line', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target');
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const read = app.db.candidateDetail;
+    app.db.candidateDetail = (id) => {
+      const detail = read(id);
+      if (detail && id === STAR_CANDIDATE_ID) {
+        detail.sessions = [...detail.sessions, { ...detail.sessions[0], id: '33333333-3333-4333-8333-333333333333', created_at: '2026-01-05T10:00:00.000Z' }];
+      }
+      return detail;
+    };
     const panel = await openReview(app, page);
-    const pane = panel.getByRole('region', { name: 'AI recommendation' });
-    const rows = pane.locator('[data-rubric-row]');
-    await expect(rows).toHaveCount(5);
-    const paneBox = (await pane.boundingBox())!;
-    for (const row of await rows.all()) {
-      const box = (await row.boundingBox())!;
-      expect(box.y + box.height, 'a rubric row is below the fold').toBeLessThanOrEqual(paneBox.y + paneBox.height);
-      expect((await row.locator('h4').boundingBox())!.height, 'a metric name wrapped').toBeLessThan(26);
-    }
+    const picker = panel.locator('#sync-session-select');
+    await expect(picker).toBeVisible();
+    expect((await picker.boundingBox())!.height, 'the picker wrapped').toBeLessThanOrEqual(26);
+    await allFiveRowsFit(panel);
   });
 
   test('metric names stay on one line at 1366x768', async ({ app, page }) => {

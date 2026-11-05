@@ -86,7 +86,7 @@ export interface SeekableTranscriptProps {
   turnTimes?: readonly (TurnTime | null | undefined)[];
   /** Why timed-but-not-seekable turns cannot start playback; read by AT. */
   unseekableReason?: string | null;
-  /** What to call each speaker. Defaults to "Bot" and "Candidate". */
+  /** What to call each speaker. Defaults to the AI speaker label and "Candidate". */
   speakers?: { bot: string; candidate: string };
   /**
    * Per-row time to print, in seconds along the whole call. A row's seek offset is into its own
