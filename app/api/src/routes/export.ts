@@ -228,7 +228,13 @@ exportRouter.get(
 
       if (sessionIds.length > 0) {
         // In batches of ID_BATCH_SIZE sessions, each paged in the unique
-        // (session_id, turn_index) order, then put back in that one order.
+        // (session_id, turn_index) order, then merged into the export's order:
+        // session created_at, session id on a tie, then turn_index. The sessions
+        // read above already returned that session order, compared by Postgres
+        // at full timestamp precision, so a turn sorts by its session's position
+        // in that read.
+        const sessionPosition = new Map(sessionIds.map((id, i) => [id, i]));
+        const positionOf = (sessionId: string) => sessionPosition.get(sessionId) ?? sessionIds.length;
         const turns: TranscriptTurnRow[] = [];
         for (const chunk of chunkIds(sessionIds)) {
           const turnsRead = await readAllPages<TranscriptTurnRow>((from, to) => supabase
@@ -241,9 +247,7 @@ exportRouter.get(
           if (!turnsRead.ok) return next(new Error('failed to export candidate'));
           turns.push(...turnsRead.rows);
         }
-        turns.sort((a, b) => (a.session_id === b.session_id
-          ? a.turn_index - b.turn_index
-          : a.session_id < b.session_id ? -1 : 1));
+        turns.sort((a, b) => positionOf(a.session_id) - positionOf(b.session_id) || a.turn_index - b.turn_index);
 
         for (const t of turns) {
           rows.push({

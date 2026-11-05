@@ -32,7 +32,7 @@
  *   - /api/roles: grows with roles, not candidates, and already reads its
  *     mappings in batches of 100.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../app.js';
 import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
@@ -58,6 +58,16 @@ const interviewer: AuthUser = { ...admin, id: SCALE_INTERVIEWER_ID, email: 'inte
 
 const SIZES = [1200, 5000] as const;
 
+/**
+ * Explicit limits, so a busy CI runner cannot turn the guard flaky: vitest's
+ * defaults are 5 s a test and 10 s a hook, and the 5,000-candidate cases work
+ * through about 40k rows. A route that really hangs still fails, at the request
+ * limit, which sits below the test limit so it reports as what it is.
+ */
+const TEST_TIMEOUT_MS = 60_000;
+const HOOK_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 45_000;
+
 function appFor(user: AuthUser) {
   return createApp({
     nodeEnv: 'test',
@@ -68,7 +78,7 @@ function appFor(user: AuthUser) {
 }
 
 const get = (path: string, user: AuthUser) =>
-  request(appFor(user)).get(path).set('Authorization', `Bearer ${JWT}`).timeout(15_000);
+  request(appFor(user)).get(path).set('Authorization', `Bearer ${JWT}`).timeout(REQUEST_TIMEOUT_MS);
 
 const label = (q: RecordedQuery): string =>
   `${q.table}: ${q.inValues ? `in(${q.inValues.length} values)` : 'no in()'}, matched ${q.matched}, returned ${q.returned}`;
@@ -85,12 +95,12 @@ beforeEach(() => {
   vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
-});
+}, HOOK_TIMEOUT_MS);
 
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-});
+}, HOOK_TIMEOUT_MS);
 
 /** The slice of a PostgREST builder the guard's self-checks call. */
 interface Chain extends PromiseLike<{ data: unknown; error: unknown }> {
@@ -125,11 +135,18 @@ describe('the guard itself', () => {
   });
 });
 
-describe.each(SIZES)('a workspace of %i candidates', (n) => {
+describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS }, (n) => {
   let ws: ScaleWorkspace;
+  // Built once for the block. Each case gets its own copy after the top-level
+  // beforeEach's engine.reset(), so nothing one case does reaches the next.
+  let snapshot: Record<string, Row[]>;
+  beforeAll(() => {
+    snapshot = {};
+    ws = seedScaleWorkspace(snapshot, n);
+  }, HOOK_TIMEOUT_MS);
   beforeEach(() => {
-    ws = seedScaleWorkspace(engine.tables, n);
-  });
+    Object.assign(engine.tables, structuredClone(snapshot));
+  }, HOOK_TIMEOUT_MS);
 
   describe('GET /api/candidates', () => {
     it('as admin: every candidate, with every score, resume state and dial count', async () => {
@@ -280,10 +297,19 @@ describe.each(SIZES)('a workspace of %i candidates', (n) => {
       }
       expectNoSilentLimit();
     });
+
+    it.each(['phone_engagements', 'candidates'])('fails the request, never a partial calendar, when one batch of %s fails', async (table) => {
+      let batches = 0;
+      engine.failWhen = (q) => q.table === table && (batches += 1) === 2;
+      const res = await get(`/api/phone/calendar?from=${CALENDAR_FROM}&to=${CALENDAR_TO}`, interviewer);
+      expect(batches, 'the calendar read this table in at least two batches').toBeGreaterThanOrEqual(2);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ ok: false, error: 'phone_read_error' });
+    });
   });
 });
 
-describe('GET Mission Control workflows when an evidence read reaches the row cap', () => {
+describe('GET Mission Control workflows when an evidence read reaches the row cap', { timeout: TEST_TIMEOUT_MS }, () => {
   it('reports every hold as unreadable (null), never as "not held", and keeps the list', async () => {
     seedScaleWorkspace(engine.tables, 1200);
     // Link 1199 is on the newest page and parked; give its session 1000 rescores.
@@ -308,7 +334,7 @@ describe('GET Mission Control workflows when an evidence read reaches the row ca
   });
 });
 
-describe('GET /api/export/:candidateId/csv for a candidate with a long history', () => {
+describe('GET /api/export/:candidateId/csv for a candidate with a long history', { timeout: TEST_TIMEOUT_MS }, () => {
   // Fifteen screening sessions of 80 turns: 1,200 transcript rows, past the row cap.
   const SESSIONS = 15;
   const TURNS = 80;
@@ -347,6 +373,31 @@ describe('GET /api/export/:candidateId/csv for a candidate with a long history',
     expect(turns[0]).toContain('s0 t0');
     expect(turns[TURNS - 1]).toContain(`s0 t${TURNS - 1}`);
     expect(turns.at(-1)).toContain(`s${SESSIONS - 1} t${TURNS - 1}`);
+    expectNoSilentLimit();
+  });
+
+  it('orders the transcript by session created_at, not session uuid, across id batches, with the id breaking a tie', async () => {
+    // Two id batches of sessions. A higher uuid is an OLDER session, so uuid
+    // order is the reverse of created_at order; sessions 0 and 1 share a created_at.
+    const count = ID_BATCH_SIZE + 20;
+    engine.tables.call_sessions = [];
+    engine.tables.transcript_turns = [];
+    for (let s = 0; s < count; s += 1) {
+      const session = scaleIds.session(s);
+      engine.tables.call_sessions.push({ id: session, candidate_id: candidate, created_at: scaleIso(count - Math.max(s, 1)) });
+      for (let k = 1; k >= 0; k -= 1) {
+        engine.tables.transcript_turns.push({ session_id: session, turn_index: k, speaker: 'bot', text: `s${s} t${k}`, created_at: scaleIso(s, k) });
+      }
+    }
+
+    const res = await get(`/api/export/${candidate}/csv`, admin);
+    expect(res.status).toBe(200);
+    const sessionAndTurn = rowsOf(res.text, 'transcript').map((line) => {
+      const cells = line.split(',');
+      return `${cells[3]} turn ${cells[5]}`;
+    });
+    const oldestFirst = [...Array.from({ length: count - 2 }, (_, i) => count - 1 - i), 0, 1];
+    expect(sessionAndTurn).toEqual(oldestFirst.flatMap((s) => [`${scaleIds.session(s)} turn 0`, `${scaleIds.session(s)} turn 1`]));
     expectNoSilentLimit();
   });
 
