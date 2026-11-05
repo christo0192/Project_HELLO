@@ -6,6 +6,7 @@ import {
   formatDateTime,
   formatDate,
   formatRelative,
+  type DateInput,
 } from './datetime';
 
 describe('toValidDate / isValidDate', () => {
@@ -101,7 +102,7 @@ describe('formatRelative', () => {
 describe('month spelling', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("writes September as Sep, never the en-GB/en-IN Sept of current ICU", () => {
+  it("writes September as Sep, never the en-GB/en-IN Sept of current ICU", async () => {
     const parts: Intl.DateTimeFormatPart[] = [
       { type: 'day', value: '16' },
       { type: 'literal', value: ' ' },
@@ -113,7 +114,160 @@ describe('month spelling', () => {
     vi.spyOn(Intl, 'DateTimeFormat').mockImplementation(function () {
       return { formatToParts: () => parts } as unknown as Intl.DateTimeFormat;
     });
-    expect(formatDate('2026-09-16T10:00:00Z')).toBe('16 Sep 2026');
+    // A fresh module: an earlier test's cached formatter must not answer for the mock.
+    vi.resetModules();
+    const fresh = await import('./datetime');
+    expect(fresh.formatDate('2026-09-16T10:00:00Z')).toBe('16 Sep 2026');
+  });
+});
+
+describe('formatter cache (M026: 66% of Dashboard JS self time at 2,000 candidates)', () => {
+  /**
+   * The implementation before the cache, verbatim: a new formatter per call.
+   * Every cached output must equal it byte for byte.
+   */
+  function uncached(value: DateInput, opts: Intl.DateTimeFormatOptions): string {
+    const date = toValidDate(value);
+    if (!date) return NOT_AVAILABLE;
+    try {
+      const clock: Intl.DateTimeFormatOptions = opts.hour ? { hourCycle: opts.hourCycle ?? 'h23' } : {};
+      return new Intl.DateTimeFormat('en-GB', { ...opts, ...clock })
+        .formatToParts(date)
+        .map((part) => (part.type === 'month' && part.value === 'Sept' ? 'Sep' : part.value))
+        .join('');
+    } catch {
+      return NOT_AVAILABLE;
+    }
+  }
+
+  const INPUTS: DateInput[] = [
+    '2026-09-16T15:44:00Z',
+    '2026-09-30T23:59:59+05:30',
+    '2026-01-01T00:00:00Z',
+    '2025-12-31T18:30:00Z',
+    '2024-02-29T12:00:00-08:00',
+    '2026-03-08T10:00:00Z',
+    '2026-11-01T08:30:00Z',
+    1_792_000_000_000,
+    0,
+    new Date('2026-06-15T04:05:06Z'),
+    new Date(Number.NaN),
+    null,
+    undefined,
+    '',
+    '   ',
+    'not-a-date',
+  ];
+
+  const OPTIONS: Intl.DateTimeFormatOptions[] = [
+    { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' },
+    { year: 'numeric', month: 'short', day: 'numeric' },
+    { day: 'numeric', month: 'short' },
+    { month: 'long', year: 'numeric' },
+    { hour: '2-digit', minute: '2-digit' },
+    { hour: 'numeric', minute: '2-digit', hourCycle: 'h12' },
+    { hour: 'numeric', minute: '2-digit', hour12: true },
+    { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: false },
+    { weekday: 'short', day: '2-digit', month: 'short' },
+    { dateStyle: 'medium' },
+    { dateStyle: 'medium', timeStyle: 'short' },
+    { timeZone: 'UTC', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' },
+    { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' },
+    { timeZone: 'America/Los_Angeles', dateStyle: 'full', timeStyle: 'long' },
+    // These throw: dateStyle cannot mix with a field, and the value is unknown.
+    { dateStyle: 'medium', hour: 'numeric' },
+    { month: 'bogus' as unknown as 'short' },
+    { timeZone: 'Not/AZone' },
+  ];
+
+  it('returns byte-identical output for every input and option set, cold and warm', () => {
+    for (const opts of OPTIONS) {
+      for (const value of INPUTS) {
+        const expected = uncached(value, opts);
+        expect(formatDateTime(value, opts)).toBe(expected);
+        expect(formatDateTime(value, opts)).toBe(expected);
+      }
+    }
+  });
+
+  it('keeps the defaults byte-identical too', () => {
+    for (const value of INPUTS) {
+      expect(formatDateTime(value)).toBe(
+        uncached(value, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
+      );
+      expect(formatDate(value)).toBe(uncached(value, { year: 'numeric', month: 'short', day: 'numeric' }));
+    }
+  });
+
+  /** A fresh module (empty cache) and a count of the formatters it builds. */
+  async function freshWithCounter() {
+    const Real = Intl.DateTimeFormat;
+    const constructed = vi
+      .spyOn(Intl, 'DateTimeFormat')
+      .mockImplementation(function (locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions) {
+        return new Real(locales, options);
+      } as unknown as typeof Intl.DateTimeFormat);
+    vi.resetModules();
+    const fresh = await import('./datetime');
+    return { fresh, constructed };
+  }
+
+  it('builds one formatter per option set, however many rows it formats', async () => {
+    const { fresh, constructed } = await freshWithCounter();
+    for (let row = 0; row < 500; row += 1) fresh.formatDateTime(`2026-09-16T10:${String(row % 60).padStart(2, '0')}:00Z`);
+    expect(constructed).toHaveBeenCalledTimes(1);
+
+    for (let row = 0; row < 500; row += 1) fresh.formatDate('2026-09-16T10:00:00Z');
+    expect(constructed).toHaveBeenCalledTimes(2);
+
+    // Back to the first set: still two.
+    fresh.formatDateTime('2026-09-16T10:00:00Z');
+    expect(constructed).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats the same options as one set whatever their key order, and an undefined option as absent', async () => {
+    const { fresh, constructed } = await freshWithCounter();
+    fresh.formatDateTime('2026-09-16T10:00:00Z', { day: 'numeric', month: 'short' });
+    fresh.formatDateTime('2026-09-16T10:00:00Z', { month: 'short', day: 'numeric' });
+    fresh.formatDateTime('2026-09-16T10:00:00Z', { month: 'short', day: 'numeric', timeZone: undefined });
+    expect(constructed).toHaveBeenCalledTimes(1);
+  });
+
+  it('never shares a formatter across different values of one option', async () => {
+    const { fresh, constructed } = await freshWithCounter();
+    const utc = fresh.formatDateTime('2026-09-16T20:00:00Z', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit' });
+    const ist = fresh.formatDateTime('2026-09-16T20:00:00Z', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    expect(constructed).toHaveBeenCalledTimes(2);
+    expect(utc).toBe('20:00');
+    expect(ist).toBe('01:30');
+  });
+
+  it('does not cache a failure: an invalid option set stays "Not available" and harms nothing else', async () => {
+    const { fresh } = await freshWithCounter();
+    const bad = { month: 'bogus' as unknown as 'short' };
+    expect(fresh.formatDateTime('2026-09-16T10:00:00Z', bad)).toBe(NOT_AVAILABLE);
+    expect(fresh.formatDateTime('2026-09-16T10:00:00Z', bad)).toBe(NOT_AVAILABLE);
+    expect(fresh.formatDateTime('2026-09-16T10:00:00Z', { month: 'short' })).toBe('Sep');
+  });
+
+  it('builds again when the viewer\'s time zone changes, so no label keeps the old zone', async () => {
+    // A formatter with no explicit timeZone pins the zone it was built in, and
+    // a laptop can cross zones with the tab open. Date picks that up, so the
+    // cache must too.
+    const { fresh, constructed } = await freshWithCounter();
+    fresh.formatDateTime('2026-09-16T10:00:00Z');
+    fresh.formatDateTime('2026-09-16T10:00:00Z');
+    expect(constructed).toHaveBeenCalledTimes(1);
+
+    const moved = vi.spyOn(Date.prototype, 'getTimezoneOffset').mockReturnValue(480);
+    fresh.formatDateTime('2026-09-16T10:00:00Z');
+    fresh.formatDateTime('2026-09-16T10:00:00Z');
+    expect(constructed).toHaveBeenCalledTimes(2);
+    moved.mockRestore();
   });
 });
 
