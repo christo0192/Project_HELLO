@@ -7,7 +7,9 @@
  *     would show every silence as talk, so a turn with no end stays a tick;
  *   - an evidence quote is a numbered ink box and a logged moment a plain ink tick, in the Moments row;
  *   - a reviewer's note is a small ink flag in a Notes row of its own: quotes can fill every lane of
- *     Moments, and a flag drawn under a box could not be pressed;
+ *     Moments, and a flag drawn under a box could not be pressed. The row is one lane high however close
+ *     the notes sit, because reviewers pin them close and lanes would push the strip off the first
+ *     screen. Crowded flags overlap: each is still a tab stop, and a row in the Notes list;
  *   - a band is a dashed "pencil" outline with its word: part of the recording is not firm;
  *   - the playhead is an ink line.
  *
@@ -113,9 +115,9 @@ interface MomentRow {
   heightPx: number;
 }
 
-function momentRow(label: string, unsorted: readonly CallStripMoment[], durationSec: number): MomentRow {
+function momentRow(label: string, unsorted: readonly CallStripMoment[], lanesOf: (secs: number[]) => number[]): MomentRow {
   const moments = [...unsorted].sort((a, b) => a.sec - b.sec);
-  const lanes = assignLanes(moments.map((moment) => moment.sec), durationSec, MOMENT_GAP_PX);
+  const lanes = lanesOf(moments.map((moment) => moment.sec));
   return { label, moments, lanes, heightPx: (Math.max(-1, ...lanes) + 1) * LANE_PX };
 }
 
@@ -188,8 +190,8 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
   const momentRows = useMemo(
     () =>
       [
-        momentRow('Moments', moments.filter((moment) => moment.kind !== 'note'), durationSec),
-        momentRow('Notes', moments.filter((moment) => moment.kind === 'note'), durationSec),
+        momentRow('Moments', moments.filter((moment) => moment.kind !== 'note'), (secs) => assignLanes(secs, durationSec, MOMENT_GAP_PX)),
+        momentRow('Notes', moments.filter((moment) => moment.kind === 'note'), (secs) => secs.map(() => 0)),
       ].filter((row) => row.moments.length > 0),
     [moments, durationSec],
   );
@@ -314,6 +316,8 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
                     moment.kind === 'evidence'
                       ? 'min-w-4 border border-ink bg-surface px-0.5 hover:bg-ink hover:text-surface'
                       : 'w-3 hover:bg-surface-secondary',
+                    // Flags can overlap: the one under the pointer or the focus comes to the front.
+                    moment.kind === 'note' && 'hover:z-10 focus-visible:z-10',
                   )}
                 >
                   {moment.kind === 'evidence' ? (

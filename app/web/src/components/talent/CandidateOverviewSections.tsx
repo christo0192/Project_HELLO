@@ -71,8 +71,6 @@ const SESSION_ROWS_BEFORE_SCROLL = 5;
 /** Attempt rows are tall (outcome, figures, notes, player); bound the list sooner. */
 const ATTEMPT_ROWS_BEFORE_SCROLL = 4;
 const NOTE_ROWS_BEFORE_SCROLL = 4;
-/** The notes reads' bound (GET /api/notes and the Ashby scoped read): past it they answer the newest. */
-const NOTE_LIST_BOUND = 100;
 
 /** One attempt's inline audio: what the open row is showing. */
 type AttemptAudio =
@@ -690,26 +688,18 @@ export function NotesList({ notes, error = null }: NotesListProps) {
   if (error) return <p className="text-sm text-error-text">{error}</p>;
   if (notes === null) return <p className="text-sm text-ink-tertiary">Loading notes…</p>;
   if (notes.length === 0) return <p className="text-sm text-ink-secondary">No notes yet.</p>;
-  return (
-    <>
-      {boundList(
-        notes.length > NOTE_ROWS_BEFORE_SCROLL,
-        'Note history',
-        '16rem',
-        <ul className="divide-y divide-line">
-          {notes.map((n) => (
-            <li key={n.id} className="py-2 text-sm">
-              <p className="whitespace-pre-wrap text-ink">{n.note}</p>
-              <p className="mt-0.5 text-meta text-ink-tertiary">{formatDateTime(n.created_at)}</p>
-            </li>
-          ))}
-        </ul>,
-      )}
-      {/* True at exactly the bound too: these are the newest, whether or not any lie behind them. */}
-      {notes.length >= NOTE_LIST_BOUND && (
-        <p className="mt-2 text-meta text-ink-tertiary">Showing the newest {NOTE_LIST_BOUND} notes.</p>
-      )}
-    </>
+  return boundList(
+    notes.length > NOTE_ROWS_BEFORE_SCROLL,
+    'Note history',
+    '16rem',
+    <ul className="divide-y divide-line">
+      {notes.map((n) => (
+        <li key={n.id} className="py-2 text-sm">
+          <p className="whitespace-pre-wrap text-ink">{n.note}</p>
+          <p className="mt-0.5 text-meta text-ink-tertiary">{formatDateTime(n.created_at)}</p>
+        </li>
+      ))}
+    </ul>,
   );
 }
 

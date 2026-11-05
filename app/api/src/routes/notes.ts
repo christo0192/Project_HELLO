@@ -29,6 +29,7 @@ import {
   candidateIdParamSchema,
   roundIdParamSchema,
   CANDIDATE_STATUS_TRANSITIONS,
+  NOTE_READ_MAX_PAGES,
   type CandidateStatus,
   type NoteListResponse,
   type NoteResponse,
@@ -39,8 +40,16 @@ export const notesRouter = Router();
 
 const NOTE_COLUMNS = 'id, candidate_id, author_id, note, created_at, round_id, session_id, media_ms';
 
-/** The most pages of one round's notes: 5,000 notes on one interview. Past that the read fails, never truncates. */
-const MAX_ROUND_NOTE_PAGES = 5;
+/** A candidate's notes, or one round's of them, oldest first and read to the end. On 0015's index. */
+function readNotes(candidateId: string, roundId?: string) {
+  return readAllPages<NoteResponse>((from, to) => {
+    const query = supabase.from('recruiter_notes').select(NOTE_COLUMNS).eq('candidate_id', candidateId);
+    return (roundId === undefined ? query : query.eq('round_id', roundId))
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .range(from, to) as unknown as PageResult;
+  }, NOTE_READ_MAX_PAGES);
+}
 
 function forbiddenBody(): { error: { type: string; message: string } } {
   return { error: { type: 'authorization_error', message: 'Insufficient permissions' } };
@@ -94,8 +103,9 @@ async function noteAnchorState(
 }
 
 /**
- * GET /api/notes?candidate_id=&limit= — viewer read only, ownership-scoped. Past the bound the newest
- * notes are the ones kept, handed back oldest first, so a note just added is never the one left out.
+ * GET /api/notes?candidate_id=&limit= — viewer read only, ownership-scoped. Every note on the candidate,
+ * oldest first: a note with no round is read nowhere else, so however many moment notes follow it, it
+ * stays on this list. With `limit`, the newest that many, still oldest first.
  */
 notesRouter.get(
   '/',
@@ -108,14 +118,20 @@ notesRouter.get(
       if (scope === 'not_found') return res.status(404).json({ error: 'candidate_not_found' });
       if (scope === 'forbidden') return res.status(403).json(forbiddenBody());
 
-      const limit = Number(req.query.limit ?? 100);
+      if (req.query.limit === undefined) {
+        const read = await readNotes(candidateId);
+        if (!read.ok) return next(new Error('failed to list notes'));
+        const every: NoteListResponse = { notes: read.rows };
+        return res.json(every);
+      }
+
       const { data, error } = await supabase
         .from('recruiter_notes')
         .select(NOTE_COLUMNS)
         .eq('candidate_id', candidateId)
         .order('created_at', { ascending: false })
         .order('id', { ascending: false })
-        .limit(limit);
+        .limit(Number(req.query.limit));
       if (error) return next(new Error('failed to list notes'));
 
       const body: NoteListResponse = { notes: [...((data ?? []) as NoteResponse[])].reverse() };
@@ -130,7 +146,7 @@ notesRouter.get(
  * GET /api/notes/rounds/:roundId — every note on one round, oldest first. The rule of /api/notes:
  * viewer and admin any candidate, an interviewer the candidates they own. As the R1 review does, a
  * missing round answers an interviewer the same 403 as someone else's, so an id tells them nothing.
- * Read through the candidate, on 0015's index, and paged, so a long list is never cut short.
+ * Read through the candidate and paged, so a long list is never cut short.
  */
 notesRouter.get(
   '/rounds/:roundId',
@@ -155,18 +171,7 @@ notesRouter.get(
       if (scope === 'not_found') return res.status(404).json({ error: 'round_not_found' });
       if (scope === 'forbidden') return res.status(403).json(forbiddenBody());
 
-      const read = await readAllPages<NoteResponse>(
-        (from, to) =>
-          supabase
-            .from('recruiter_notes')
-            .select(NOTE_COLUMNS)
-            .eq('candidate_id', round.candidate_id)
-            .eq('round_id', round.id)
-            .order('created_at', { ascending: true })
-            .order('id', { ascending: true })
-            .range(from, to) as unknown as PageResult,
-        MAX_ROUND_NOTE_PAGES,
-      );
+      const read = await readNotes(round.candidate_id, round.id);
       if (!read.ok) return next(new Error('failed to list notes'));
 
       const body: NoteListResponse = { notes: read.rows };

@@ -38,7 +38,7 @@ function chainable(value: unknown): any {
   const fn: any = function () { return chainable(value); };
   fn.then = (resolve: (v: any) => any) => Promise.resolve(value).then(resolve);
   fn.catch = (reject: (e: unknown) => unknown) => Promise.resolve(value).catch(reject);
-  for (const m of ['eq', 'order', 'limit', 'select', 'is', 'in']) fn[m] = () => chainable(value);
+  for (const m of ['eq', 'order', 'limit', 'range', 'select', 'is', 'in']) fn[m] = () => chainable(value);
   fn.maybeSingle = () => chainable(value);
   fn.single = () => chainable(value);
   return fn;
@@ -242,33 +242,46 @@ describe('GET …/:applicationLinkId/notes', () => {
     expect(res.body.notes).toHaveLength(1);
   });
 
-  it('keeps the newest past the bound, and hands them back oldest first', async () => {
-    const rows = Array.from({ length: 130 }, (_, index) => ({
-      id: `n${String(index).padStart(3, '0')}`, candidate_id: CANDIDATE_ID, author_id: RECRUITER_ID, note: 'looks strong',
+  describe('a long list', () => {
+    /** The order and the pages as the database applies them, a fresh query each read. */
+    function stored(rows: Array<{ id: string; created_at: string }>) {
+      const scoped = mockFrom.getMockImplementation();
+      mockFrom.mockImplementation((table: string) => {
+        if (table !== 'recruiter_notes') return scoped(table);
+        const orders: Array<{ column: string; ascending: boolean }> = [];
+        const query: any = {
+          select: () => query,
+          eq: () => query,
+          order: (column: string, { ascending }: { ascending: boolean }) => { orders.push({ column, ascending }); return query; },
+          range: (from: number, to: number) => {
+            const sorted = [...rows].sort((a, b) => a.created_at.localeCompare(b.created_at) * (orders[0].ascending ? 1 : -1));
+            return Promise.resolve({ data: sorted.slice(from, to + 1), error: null });
+          },
+        };
+        return query;
+      });
+    }
+    const notes = (count: number) => Array.from({ length: count }, (_, index) => ({
+      id: `n${String(index).padStart(4, '0')}`, candidate_id: CANDIDATE_ID, author_id: RECRUITER_ID, note: 'looks strong',
       created_at: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
     }));
-    // The order and the bound as the database applies them: newest first, then the first hundred.
-    const orders: Array<{ column: string; ascending: boolean }> = [];
-    let bound = rows.length;
-    const query: any = {
-      select: () => query,
-      eq: () => query,
-      order: (column: string, { ascending }: { ascending: boolean }) => { orders.push({ column, ascending }); return query; },
-      limit: (count: number) => { bound = count; return query; },
-      then: (resolve: (v: unknown) => unknown) => {
-        const sorted = [...rows].sort((a, b) => a.created_at.localeCompare(b.created_at) * (orders[0].ascending ? 1 : -1));
-        return Promise.resolve({ data: sorted.slice(0, bound), error: null }).then(resolve);
-      },
-    };
-    const scoped = mockFrom.getMockImplementation();
-    mockFrom.mockImplementation((table: string) => (table === 'recruiter_notes' ? query : scoped(table)));
+    const read = () => request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}/notes`).set(AUTH);
 
-    const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}/notes`).set(AUTH);
-    expect(res.status).toBe(200);
-    expect(orders[0]).toEqual({ column: 'created_at', ascending: false });
-    expect(res.body.notes).toHaveLength(100);
-    expect(res.body.notes[0].id).toBe('n030');
-    expect(res.body.notes.at(-1).id).toBe('n129');
+    it('answers every note, oldest first: an older one must never drop out of reach', async () => {
+      stored(notes(130));
+      const res = await read();
+      expect(res.status).toBe(200);
+      expect(res.body.notes).toHaveLength(130);
+      expect(res.body.notes[0].id).toBe('n0000');
+      expect(res.body.notes.at(-1).id).toBe('n0129');
+    });
+
+    it('reads past the row cap', async () => {
+      stored(notes(1203));
+      const res = await read();
+      expect(res.body.notes).toHaveLength(1203);
+      expect(res.body.notes.at(-1).id).toBe('n1202');
+    });
   });
 
   it('applies the same ownership denial and the same 404', async () => {

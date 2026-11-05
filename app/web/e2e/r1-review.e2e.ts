@@ -310,6 +310,40 @@ test.describe('notes at a moment', () => {
   const openNotes = (page: Page) => page.getByRole('tab', { name: 'Notes' }).click();
   const posts = (app: AppHarness) => app.calls.filter((c) => c.method === 'POST' && new URL(c.url).pathname === '/api/notes');
 
+  test('notes pinned close together leave the strip on the first screen', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'the first-screen rule is for the 1440x900 layout');
+    // Seconds apart, so every flag would want a lane of its own: this is how a reviewer pins them. The
+    // fixture's quotes already fill the three lanes of Moments, so this is the strip at its tallest.
+    for (let index = 0; index < 8; index += 1) stored(app, { media_ms: 60_000 + index * 5000, note: `Close note ${index}.` });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await expect(page.locator('[data-note-flag]')).toHaveCount(8);
+    const strip = page.locator('[data-call-strip]');
+    expect(await page.locator('[data-moment-row="Moments"]').evaluate((row) => row.getBoundingClientRect().height)).toBe(60);
+    expect(await strip.evaluate((el) => el.getBoundingClientRect().bottom)).toBeLessThanOrEqual(900);
+    await expect(strip.getByRole('button', { name: 'Hide speakers' })).toBeInViewport({ ratio: 1 });
+    await look(page, 'notes-close-together', testInfo.project.name);
+  });
+
+  test('every crowded flag is still reached by the keyboard, and comes to the front as it is', async ({ app, page }) => {
+    for (let index = 0; index < 3; index += 1) stored(app, { media_ms: 60_000 + index * 1000, note: `Close note ${index}.` });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await page.getByRole('button', { name: 'Note, 1:00' }).focus();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('button', { name: 'Note, 1:01' })).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('button', { name: 'Note, 1:02' })).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    const flag = page.getByRole('button', { name: 'Note, 1:01' });
+    const onTop = await flag.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      return el.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2));
+    });
+    expect(onTop).toBe(true);
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('position')).toHaveText('1:01');
+    await expect(page.getByRole('tab', { name: 'Notes' })).toHaveAttribute('aria-selected', 'true');
+  });
+
   test('the tab reads, fits and passes axe', async ({ app, page }, testInfo) => {
     stored(app, {});
     stored(app, { author_id: COLLEAGUE_ID, media_ms: 30_000, note: 'Warm opening.\nGood rapport.' });

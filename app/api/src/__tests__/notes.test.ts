@@ -36,6 +36,7 @@ function chainable(value: any): any {
   fn.eq = () => chainable(value);
   fn.order = () => chainable(value);
   fn.limit = () => chainable(value);
+  fn.range = () => chainable(value);
   fn.select = () => chainable(value);
   fn.maybeSingle = () => chainable(value);
   fn.single = () => chainable(value);
@@ -165,58 +166,77 @@ describe('GET /api/notes', () => {
     expect(res.status).toBe(400);
   });
 
-  describe('past the bound', () => {
-    /** The order and the bound as the database applies them: a later `.order` only breaks a tie. */
-    function ordered(rows: Array<Record<string, string>>) {
+  describe('a long list', () => {
+    type Stored = Record<string, string | null>;
+    /** The order, the bound and the pages as the database applies them: a later `.order` only breaks a tie. */
+    function ordered(rows: Stored[]) {
       const orders: Array<[string, boolean]> = [];
       let bound = rows.length;
-      const compare = (a: Record<string, string>, b: Record<string, string>) => {
+      const compare = (a: Stored, b: Stored) => {
         for (const [column, ascending] of orders) {
-          const gap = a[column].localeCompare(b[column]);
+          const gap = String(a[column]).localeCompare(String(b[column]));
           if (gap !== 0) return ascending ? gap : -gap;
         }
         return 0;
       };
+      const answer = () => [...rows].sort(compare).slice(0, bound);
       const query: any = {
         select: () => query,
         eq: () => query,
         order: (column: string, { ascending }: { ascending: boolean }) => { orders.push([column, ascending]); return query; },
         limit: (count: number) => { bound = count; return query; },
-        then: (resolve: (v: unknown) => unknown) => Promise.resolve({ data: [...rows].sort(compare).slice(0, bound), error: null }).then(resolve),
+        range: (from: number, to: number) => Promise.resolve({ data: answer().slice(from, to + 1), error: null }),
+        then: (resolve: (v: unknown) => unknown) => Promise.resolve({ data: answer(), error: null }).then(resolve),
       };
       return query;
     }
     const notes = (count: number) => Array.from({ length: count }, (_, index) => ({
-      ...NOTE_ROW, id: `note-${String(index).padStart(3, '0')}`, created_at: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+      ...NOTE_ROW, id: `note-${String(index).padStart(4, '0')}`, created_at: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
     }));
-    const read = async (rows: Array<Record<string, string>>, query = '') => {
-      mockFrom
-        .mockReturnValueOnce(chainable({ data: { owner_id: null }, error: null }))
-        .mockReturnValueOnce(ordered(rows));
+    /** Each read gets a fresh query, as the real client does. */
+    const read = async (rows: Stored[], query = '') => {
+      mockFrom.mockImplementation((name: string) => (name === 'candidates' ? chainable({ data: { owner_id: null }, error: null }) : ordered(rows)));
       return request(makeApp(makeUser('admin'))).get(`/api/notes?candidate_id=${CANDIDATE_ID}${query}`).set(AUTH);
     };
 
-    it('keeps the newest, so a note just added is on the list', async () => {
-      const res = await read(notes(130));
-      expect(res.body.notes).toHaveLength(100);
-      expect(res.body.notes.at(-1).id).toBe('note-129');
+    it('keeps a note with no round on the list, however many moment notes follow it', async () => {
+      const onTheCandidate = notes(5).map((note) => ({ ...note, round_id: null }));
+      const atAMoment = notes(105).slice(5).map((note) => ({ ...note, round_id: '00000000-0000-4000-8000-0000000000b1' }));
+      const res = await read([...onTheCandidate, ...atAMoment]);
+      expect(res.body.notes).toHaveLength(105);
+      expect(res.body.notes.slice(0, 5).map((note: { id: string }) => note.id)).toEqual(onTheCandidate.map((note) => note.id));
+      expect(res.body.notes.at(-1).id).toBe('note-0104');
     });
 
     it('hands them back oldest first, as the page prints them', async () => {
       const res = await read(notes(130));
       const ids = res.body.notes.map((note: { id: string }) => note.id);
-      expect(ids[0]).toBe('note-030');
+      expect(ids[0]).toBe('note-0000');
       expect(ids).toEqual([...ids].sort());
     });
 
-    it('answers a short list whole, in the same order', async () => {
-      const res = await read(notes(3));
-      expect(res.body.notes.map((note: { id: string }) => note.id)).toEqual(['note-000', 'note-001', 'note-002']);
+    it('reads past the row cap: the list is never cut short', async () => {
+      const res = await read(notes(1203));
+      expect(res.body.notes).toHaveLength(1203);
+      expect(res.body.notes.at(-1).id).toBe('note-1202');
     });
 
-    it('takes the newest of a smaller limit too', async () => {
+    it('fails rather than answer part of the list', async () => {
+      mockFrom.mockImplementation((name: string) => (name === 'candidates' ? chainable({ data: { owner_id: null }, error: null }) : table([], new Error('read failed'))));
+      const res = await request(makeApp(makeUser('admin'))).get(`/api/notes?candidate_id=${CANDIDATE_ID}`).set(AUTH);
+      expect(res.status).toBe(500);
+      expect(res.body.notes).toBeUndefined();
+    });
+
+    it('takes the newest of a limit, still oldest first', async () => {
       const res = await read(notes(10), '&limit=2');
-      expect(res.body.notes.map((note: { id: string }) => note.id)).toEqual(['note-008', 'note-009']);
+      expect(res.body.notes.map((note: { id: string }) => note.id)).toEqual(['note-0008', 'note-0009']);
+    });
+
+    it('still takes a limit of the old bound', async () => {
+      const res = await read(notes(130), '&limit=100');
+      expect(res.body.notes).toHaveLength(100);
+      expect(res.body.notes.at(-1).id).toBe('note-0129');
     });
 
     it('cuts two notes of one instant the same way every time, by id', async () => {

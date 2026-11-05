@@ -5034,12 +5034,12 @@ paths:
       tags: [ashby]
       operationId: listAshbyScopedReviewNotes
       summary: Read-only recruiter notes for the linked candidate
-      description: Read-only, bounded list of the linked candidate's append-only recruiter notes. Same server-side link resolution, role and ownership rules as the review payload; the scoped experience never adds a note.
+      description: 'Read-only list of the linked candidate''s append-only recruiter notes, oldest first and read to its end: a list past the page bound fails rather than answer part of it. Same server-side link resolution, role and ownership rules as the review payload; the scoped experience never adds a note.'
       security:
         - bearerAuth: []
       responses:
         '200':
-          description: Bounded note list. Past the bound the newest notes are the ones kept, oldest of them first.
+          description: Every note on the linked candidate, oldest first.
           content:
             application/json:
               schema:
@@ -7088,13 +7088,14 @@ paths:
         - name: limit
           in: query
           required: false
+          description: Answer only the newest this many notes. Left out, every note is answered.
           schema:
             type: integer
             minimum: 1
             maximum: 100
       responses:
         '200':
-          description: Bounded note list. Past the bound the newest notes are the ones kept, oldest of them first.
+          description: 'Every note on the candidate, oldest first and read to its end: a list past the page bound fails rather than answer part of it. With limit, the newest that many, oldest of them first.'
           content:
             application/json:
               schema:
@@ -7141,7 +7142,7 @@ paths:
       tags: [notes]
       operationId: listRoundNotes
       summary: Every note on one R1 round, oldest first (viewer read-only, ownership-scoped).
-      description: 'The rule of GET /api/notes: admin and viewer any candidate, an interviewer only a candidate they own. A missing round answers an interviewer the same 403 as someone else''s. The list is read to its end, never truncated: a list past the page bound fails. A note on the candidate alone is not here: GET /api/notes has every note. Cache-Control: no-store.'
+      description: 'The rule of GET /api/notes: admin and viewer any candidate, an interviewer only a candidate they own. A missing round answers an interviewer the same 403 as someone else''s. The list is read to its end, never truncated: a list past the page bound fails. A note on the candidate alone is not here: GET /api/notes with no limit answers every note. Cache-Control: no-store.'
       parameters:
         - name: roundId
           in: path

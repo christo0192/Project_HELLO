@@ -24,9 +24,11 @@
 import { Router, type Request } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireRole } from '../lib/rbac.js';
+import { readAllPages, type PageResult } from '../lib/id-batches.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
 import { loadCandidatePhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
 import { uuidSchema } from '../schemas/common.js';
+import { NOTE_READ_MAX_PAGES } from '../schemas/notes.js';
 import {
   createCandidateWorkflowStore,
   type CandidateAshbyWorkflowStore,
@@ -38,9 +40,6 @@ export const ashbyReviewRouter = Router();
 
 /** The single indistinguishable failure body for every unresolvable link. */
 const NOT_FOUND = { error: 'application_link_not_found' } as const;
-
-/** Bounded note page size — matches the recruiter notes list default. */
-const NOTE_LIMIT = 100;
 
 /**
  * Resolve `:applicationLinkId` to the linked candidate id, re-applying the
@@ -155,8 +154,8 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
  *
  * Read-only append-only recruiter notes for the linked candidate. The scoped
  * experience never writes a note — adding one stays on the normal candidate
- * page, which is unchanged. As GET /api/notes: past the bound the newest notes
- * are the ones kept, handed back oldest first.
+ * page, which is unchanged. As GET /api/notes: every note, oldest first, read
+ * to the end, because a note with no round is read nowhere else.
  */
 ashbyReviewRouter.get('/:applicationLinkId/notes', requireRole('viewer'), async (req, res, next) => {
   try {
@@ -164,16 +163,20 @@ ashbyReviewRouter.get('/:applicationLinkId/notes', requireRole('viewer'), async 
     if (candidateId === 'error') return next(new Error('failed to resolve review link'));
     if (!candidateId) return res.status(404).json(NOT_FOUND);
 
-    const { data, error } = await supabase
-      .from('recruiter_notes')
-      .select('id, candidate_id, author_id, note, created_at')
-      .eq('candidate_id', candidateId)
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
-      .limit(NOTE_LIMIT);
-    if (error) return next(new Error('failed to list notes'));
+    const read = await readAllPages(
+      (from, to) =>
+        supabase
+          .from('recruiter_notes')
+          .select('id, candidate_id, author_id, note, created_at')
+          .eq('candidate_id', candidateId)
+          .order('created_at', { ascending: true })
+          .order('id', { ascending: true })
+          .range(from, to) as unknown as PageResult,
+      NOTE_READ_MAX_PAGES,
+    );
+    if (!read.ok) return next(new Error('failed to list notes'));
 
-    res.json({ notes: [...(data ?? [])].reverse() });
+    res.json({ notes: read.rows });
   } catch (error) {
     next(error);
   }

@@ -1,7 +1,8 @@
 /**
  * Recording: the video, its transport and the call strip on the left, the transcript and the notes on
  * the right. One attempt each: the page keys this by session, so another attempt starts clean. The page
- * holds what must not go with an attempt: the side tab, and the words of a note not yet saved.
+ * holds what must not go with an attempt: the side tab, and the `NoteKeeper` with the words of a note
+ * not yet saved and any save on its way.
  *
  * ONE POSITION. The player, the strip, the clock and the transcript all follow it:
  *   1. The player reports the position (every frame while playing). The strip, the clock and "Add note at"
@@ -70,9 +71,10 @@ import {
 } from '../../lib/r1-review';
 import type { PhaseSegment, PlacedTurn, R1SpeakerKind, RolePlayMark } from '../../lib/r1-review';
 import type { R1ReviewAssessment, R1ReviewAttempt, R1ReviewEvent } from '../../lib/r1-types';
+import type { NoteKeeper } from './noteKeeper';
 import { PlayerControls } from './PlayerControls';
 import { ReviewNotes } from './ReviewNotes';
-import type { NoteCue, NoteDraft } from './ReviewNotes';
+import type { NoteCue } from './ReviewNotes';
 import { ReviewTranscript } from './ReviewTranscript';
 import { useRoundNotes } from './useRoundNotes';
 
@@ -107,8 +109,7 @@ export interface RecordingPanelProps {
   /** Which of Transcript and Notes is open. */
   sideTab: string;
   onSideTab: (id: string) => void;
-  /** The words of unsaved notes, by session. Written here on every change, so typing renders nothing above. */
-  noteDrafts: Map<string, NoteDraft>;
+  noteKeeper: NoteKeeper;
   onNeedRefresh: () => void;
 }
 
@@ -167,7 +168,7 @@ export function RecordingPanel({
   mayAddNotes,
   sideTab,
   onSideTab,
-  noteDrafts,
+  noteKeeper,
   onNeedRefresh,
 }: RecordingPanelProps) {
   const summary = attempt.recording;
@@ -177,7 +178,7 @@ export function RecordingPanel({
   const turns = useMemo(() => placeTurns(attempt, candidateName, assessment), [attempt, candidateName, assessment]);
   const starts = useMemo(() => turns.map((turn) => turn.startSec), [turns]);
 
-  const { state: roundNotes, retry: readNotesAgain, add: keepNote } = useRoundNotes(roundId);
+  const { state: roundNotes, retry: readNotesAgain } = useRoundNotes(roundId, noteKeeper);
   const notes = useMemo(
     () => (roundNotes.status === 'ready' ? attemptNotes(roundNotes.notes, attempt.session_id) : null),
     [roundNotes, attempt.session_id],
@@ -460,20 +461,12 @@ export function RecordingPanel({
     [evidence, logged, moveTo, notes, onSideTab, playRow],
   );
 
-  const addNote = useCallback(
-    async (text: string, sec: number | null) => {
+  const sendNote = useCallback(
+    (text: string, sec: number | null) => {
       const anchor = { round_id: roundId, session_id: attempt.session_id };
-      keepNote(await api.addNote(candidateId, text, sec === null ? anchor : { ...anchor, media_ms: noteMediaMs(sec) }));
+      return api.addNote(candidateId, text, sec === null ? anchor : { ...anchor, media_ms: noteMediaMs(sec) });
     },
-    [attempt.session_id, candidateId, keepNote, roundId],
-  );
-
-  const keepDraft = useCallback(
-    (draft: NoteDraft | null) => {
-      if (draft) noteDrafts.set(attempt.session_id, draft);
-      else noteDrafts.delete(attempt.session_id);
-    },
-    [attempt.session_id, noteDrafts],
+    [attempt.session_id, candidateId, roundId],
   );
 
   return (
@@ -593,10 +586,10 @@ export function RecordingPanel({
                   positionSec={playable ? playheadSec : null}
                   clockRef={noteClockRef}
                   cue={noteCue}
-                  keptDraft={noteDrafts.get(attempt.session_id) ?? null}
-                  onDraft={keepDraft}
+                  sessionId={attempt.session_id}
+                  keeper={noteKeeper}
                   onSeek={moveTo}
-                  onAdd={addNote}
+                  onSend={sendNote}
                   onRetry={readNotesAgain}
                   className="absolute inset-0 pt-3"
                 />

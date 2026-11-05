@@ -1836,28 +1836,110 @@ describe('Recording: notes', () => {
       expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
     });
 
-    it('never offers words on their way a second time: an append-only note cannot be taken back', async () => {
-      let finish: (value: unknown) => void = () => undefined;
-      mockApi.addNote.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
-      await writing('Once only.');
-      await userEvent.click(save());
-      await goTo(RETAKE);
-      await goTo(FIRST);
-      expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
-      expect(mockApi.addNote).toHaveBeenCalledTimes(1);
-      await act(async () => { finish(note({ note: 'Once only.' })); });
+    describe('with a save still on its way', () => {
+      /** A save that stays out until the test ends it, pressed on the first attempt. */
+      async function saving(words: string) {
+        const out: { finish: (value: unknown) => void; fail: (reason: unknown) => void } = { finish: () => undefined, fail: () => undefined };
+        mockApi.addNote.mockReturnValueOnce(new Promise((resolve, reject) => { out.finish = resolve; out.fail = reject; }));
+        await writing(words);
+        await userEvent.click(save());
+        return out;
+      }
+      const saved = (words: string) => note({ id: 'n9', note: words });
+      const rows = () => within(notesRegion()).queryAllByText(/^Saved here\.$/);
+
+      it('shows the box the reader comes back to as saving, and never offers the words a second time', async () => {
+        const out = await saving('Once only.');
+        await goTo(RETAKE);
+        await goTo(FIRST);
+        expect(textbox()).toHaveValue('Once only.');
+        expect(textbox()).toHaveAttribute('readOnly');
+        expect(save()).toBeDisabled();
+        expect(within(notesRegion()).getByRole('button', { name: 'Cancel' })).toBeDisabled();
+        fireEvent.submit(save().closest('form') as HTMLFormElement);
+        expect(mockApi.addNote).toHaveBeenCalledTimes(1);
+        await act(async () => { out.finish(saved('Once only.')); });
+      });
+
+      it('gives the words back, and says so, when that save fails after the reader has moved on', async () => {
+        const out = await saving('Not lost.');
+        await goTo(RETAKE);
+        await act(async () => { out.fail(new TestApiError('service_unavailable', 503)); });
+        await goTo(FIRST);
+        expect(textbox()).toHaveValue('Not lost.');
+        expect(within(notesRegion()).getByRole('alert')).toHaveTextContent('This note was not saved. Your words are still here.');
+      });
+
+      it('says so on the box the reader is back at, when the save fails after they return', async () => {
+        const out = await saving('Not lost.');
+        await goTo(RETAKE);
+        await goTo(FIRST);
+        await act(async () => { out.fail(new TestApiError('service_unavailable', 503)); });
+        expect(textbox()).toHaveValue('Not lost.');
+        expect(textbox()).not.toHaveAttribute('readOnly');
+        const alert = within(notesRegion()).getByRole('alert');
+        expect(alert).toHaveTextContent('This note was not saved. Your words are still here.');
+        await userEvent.click(within(alert).getByRole('button', { name: /try again/i }));
+        expect(await within(notesRegion()).findByText('Not lost.')).toBeInTheDocument();
+        expect(mockApi.addNote).toHaveBeenCalledTimes(2);
+        expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
+      });
+
+      it('lists the note, flags it and says so, when the save lands after the reader is back and the read has answered', async () => {
+        const out = await saving('Saved here.');
+        await goTo(RETAKE);
+        await goTo(FIRST);
+        await within(notesRegion()).findByText('0 notes');
+        await act(async () => { out.finish(saved('Saved here.')); });
+        expect(rows()).toHaveLength(1);
+        expect(within(notesRegion()).getByText('1 note')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Note, 3:20' })).toBeInTheDocument();
+        expect(screen.getByText('Note added at 3:20.')).toBeInTheDocument();
+        expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
+      });
+
+      it('leaves the reader\'s focus where it went when that save lands', async () => {
+        const out = await saving('Saved here.');
+        await goTo(RETAKE);
+        await goTo(FIRST);
+        await act(async () => { out.finish(saved('Saved here.')); });
+        expect(within(screen.getByRole('group', { name: 'Attempt' })).getByRole('button', { name: FIRST })).toHaveFocus();
+      });
+
+      it('lists the note on the attempt it was written on, and only there, when it lands while the reader is away', async () => {
+        const out = await saving('Saved here.');
+        await goTo(RETAKE);
+        await act(async () => { out.finish(saved('Saved here.')); });
+        expect(rows()).toHaveLength(0);
+        await goTo(FIRST);
+        expect(await within(notesRegion()).findByText('Saved here.')).toBeInTheDocument();
+        expect(within(notesRegion()).queryByRole('textbox')).not.toBeInTheDocument();
+      });
+
+      it('counts a note once when the read that follows it has it too', async () => {
+        const out = await saving('Saved here.');
+        await goTo(RETAKE);
+        await act(async () => { out.finish(saved('Saved here.')); });
+        seeded([saved('Saved here.')]);
+        await goTo(FIRST);
+        await within(notesRegion()).findByText('Saved here.');
+        expect(rows()).toHaveLength(1);
+        expect(within(notesRegion()).getByText('1 note')).toBeInTheDocument();
+      });
     });
 
-    it('gives the words back, and says so, when that save fails after the reader has moved on', async () => {
-      let fail: (reason: unknown) => void = () => undefined;
-      mockApi.addNote.mockReturnValue(new Promise((_resolve, reject) => { fail = reject; }));
-      await writing('Not lost.');
-      await userEvent.click(save());
+    it('keeps a note saved while the read is still out, though the read answers without it', async () => {
+      await writing('Saved here.');
       await goTo(RETAKE);
-      await act(async () => { fail(new TestApiError('service_unavailable', 503)); });
+      let answer: (value: unknown) => void = () => undefined;
+      mockApi.listRoundNotes.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
       await goTo(FIRST);
-      expect(textbox()).toHaveValue('Not lost.');
-      expect(within(notesRegion()).getByRole('alert')).toHaveTextContent('This note was not saved. Your words are still here.');
+      expect(within(notesRegion()).getByText('Loading notes…')).toBeInTheDocument();
+      await userEvent.click(save());
+      await screen.findByText('Note added at 3:20.');
+      await act(async () => { answer({ notes: [] }); });
+      expect(await within(notesRegion()).findByText('Saved here.')).toBeInTheDocument();
+      expect(within(notesRegion()).getByText('1 note')).toBeInTheDocument();
     });
   });
 

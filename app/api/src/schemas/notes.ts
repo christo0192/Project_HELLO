@@ -37,6 +37,9 @@ export const CANDIDATE_STATUS_TRANSITIONS: Record<CandidateStatus, readonly Cand
 /** The longest time a note can point at, as 0137's CHECK: a day, far past any interview. */
 export const NOTE_MEDIA_MS_MAX = 86_400_000;
 
+/** The most pages of one list of notes: 5,000 notes. Past that the read fails, never truncates. */
+export const NOTE_READ_MAX_PAGES = 5;
+
 /**
  * POST /api/notes body — append-only note on a candidate (DB bound: 1..2000).
  *
@@ -68,7 +71,7 @@ export const noteCreateSchema = z
 
 export type NoteCreateInput = z.infer<typeof noteCreateSchema>;
 
-/** GET /api/notes query — candidate scoping + bounded page. */
+/** GET /api/notes query — candidate scoping, and `limit` to answer only the newest notes. */
 export const noteListQuerySchema = z
   .object({
     candidate_id: uuidSchema,

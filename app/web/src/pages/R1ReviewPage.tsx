@@ -24,13 +24,13 @@ import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { EmptyPanel, ErrorPanel, InlineNotice, RetryButton, Skeleton, SkeletonText } from '../components/design';
 import { BriefingPanel } from '../components/r1-review/BriefingPanel';
+import { createNoteKeeper } from '../components/r1-review/noteKeeper';
 import { OverviewPanel } from '../components/r1-review/OverviewPanel';
 import type { TurnTarget } from '../components/r1-review/OverviewPanel';
 import { RecordingPanel } from '../components/r1-review/RecordingPanel';
 import type { ReviewCue } from '../components/r1-review/RecordingPanel';
 import { ResumePanel } from '../components/r1-review/ResumePanel';
 import { ReviewHeader } from '../components/r1-review/ReviewHeader';
-import type { NoteDraft } from '../components/r1-review/ReviewNotes';
 import { DecisionBlockedBanner } from '../components/talent/CandidateOverviewSections';
 import { CandidateShell } from '../components/talent/CandidateShell';
 import { candidateDisplayName } from '../components/talent/ResumeReviewBadge';
@@ -130,7 +130,7 @@ export function R1ReviewPage() {
 
   // Above the key on RecordingPanel: another attempt starts clean, but these must not go with the old one.
   const [sideTab, setSideTab] = useState('transcript');
-  const [noteDrafts] = useState(() => new Map<string, NoteDraft>());
+  const [noteKeeper] = useState(createNoteKeeper);
 
   const [cue, setCue] = useState<ReviewCue | null>(() => {
     const sec = cueSecFrom(searchParams.get('t'));
@@ -317,7 +317,7 @@ export function R1ReviewPage() {
                   mayAddNotes={mayAddNotes}
                   sideTab={sideTab}
                   onSideTab={setSideTab}
-                  noteDrafts={noteDrafts}
+                  noteKeeper={noteKeeper}
                   onNeedRefresh={reread}
                 />
               ) : (

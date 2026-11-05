@@ -152,17 +152,37 @@ describe('a reviewer\'s note', () => {
     expect(screen.getByText('Notes')).toBeInTheDocument();
   });
 
-  it('stacks notes that sit close together, each in a lane of the row', () => {
-    const { container } = strip({
+  describe('close together', () => {
+    const close = {
       durationSec: 1500,
-      moments: [
-        { key: 'n1', sec: 120, kind: 'note', label: 'Note, 2:00' },
-        { key: 'n2', sec: 121, kind: 'note', label: 'Note, 2:01' },
-      ],
+      moments: [121, 120, 122, 123].map((sec) => ({ key: `n${sec}`, sec, kind: 'note' as const, label: `Note, ${sec}` })),
+    };
+
+    it('stays one lane high, so notes never push the strip off the first screen', () => {
+      const { container } = strip(close);
+      const tops = [...container.querySelectorAll<HTMLElement>('[data-moment-row="Notes"] button')].map((flag) => flag.style.top);
+      expect(new Set(tops).size).toBe(1);
+      expect((container.querySelector('[data-moment-row="Notes"]') as HTMLElement).style.height).toBe('20px');
     });
-    const tops = [...container.querySelectorAll<HTMLElement>('[data-moment-row="Notes"] button')].map((flag) => flag.style.top);
-    expect(new Set(tops).size).toBe(2);
-    expect((container.querySelector('[data-moment-row="Notes"]') as HTMLElement).style.height).toBe('40px');
+
+    it('keeps every flag a button of its own, in time order, for the keyboard', () => {
+      const { container, props } = strip(close);
+      const flags = [...container.querySelectorAll<HTMLElement>('[data-moment-row="Notes"] button')];
+      expect(flags.map((flag) => flag.getAttribute('aria-label'))).toEqual(['Note, 120', 'Note, 121', 'Note, 122', 'Note, 123']);
+      fireEvent.click(flags[0]);
+      expect(props.onMoment).toHaveBeenCalledWith('n120');
+    });
+
+    it('still stacks the moments, which have lanes to spare', () => {
+      const { container } = strip({
+        durationSec: 1500,
+        moments: [
+          { key: 'q1', sec: 120, kind: 'evidence', number: 1, label: 'Evidence 1, Objection handling, 2:00' },
+          { key: 'q2', sec: 121, kind: 'evidence', number: 2, label: 'Evidence 2, Objection handling, 2:01' },
+        ],
+      });
+      expect((container.querySelector('[data-moment-row="Moments"]') as HTMLElement).style.height).toBe('40px');
+    });
   });
 
   it('survives forced colours: a flag is fills, so each carries the mark', () => {

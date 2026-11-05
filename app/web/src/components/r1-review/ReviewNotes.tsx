@@ -6,10 +6,10 @@
  * while one is on its way does nothing, and a failed save keeps the words for Try again. The box takes
  * no typing while a save runs, because words added then could not be added to the note afterwards.
  *
- * THE DRAFT outlives this panel, which goes with its attempt: the page keeps what is in the box
- * (`keptDraft`, `onDraft`), so moving to another attempt loses nothing and the box comes back with its
- * attempt, without taking focus from wherever the reader went. Words on their way are out of its keeping,
- * or the box could reopen and offer the same note a second time; a failed save puts them back.
+ * THE DRAFT outlives this panel, which goes with its attempt. The words, a save on its way and how it
+ * ended are the page's `NoteKeeper`, and this panel follows them. So moving to another attempt loses
+ * nothing: the box comes back with its attempt, without taking focus from wherever the reader went, and
+ * a save pressed before the move shows here as running, then as saved or failed.
  *
  * THE MOMENT. "Add note at 7:42" follows the playhead, written straight to the DOM by the panel as the
  * clock is, so a playing video costs no render. Pressing it pins that second: the call can play on while
@@ -25,26 +25,20 @@
  *
  * The rows scroll in their own box, by that box's scroll position, so the page behind never jumps.
  */
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { Ref } from 'react';
 import { Button, Field, InlineNotice, RetryButton, TextArea, cx } from '../design';
 import { formatDateTime } from '../../lib/datetime';
 import { clockText } from '../../lib/r1-recording';
 import { noteAuthor } from '../../lib/r1-review';
 import type { AttemptNote } from '../../lib/r1-review';
+import type { Note } from '../../types';
+import type { NoteKeeper } from './noteKeeper';
 
 /** The API's bound on a note (0015). */
 const NOTE_MAX_CHARS = 2000;
 
 const plural = (count: number) => `${count} note${count === 1 ? '' : 's'}`;
-
-export interface NoteDraft {
-  /** The second the reader pressed. Null: this attempt has nothing to play. */
-  sec: number | null;
-  text: string;
-  /** The last save of these words failed. */
-  failed?: boolean;
-}
 
 /** A note to bring into view. `nonce` tells a second press on one tick from a re-render. */
 export interface NoteCue {
@@ -65,13 +59,12 @@ export interface ReviewNotesProps {
   /** The panel writes the playhead's clock here. */
   clockRef: Ref<HTMLSpanElement>;
   cue: NoteCue | null;
-  /** What was left in this attempt's box. Read as the panel opens. */
-  keptDraft: NoteDraft | null;
-  /** The box changed, closed, or its words are on their way: what the page should keep now. */
-  onDraft: (draft: NoteDraft | null) => void;
+  /** The attempt whose box this is, in the page's keeper. */
+  sessionId: string;
+  keeper: NoteKeeper;
   onSeek: (sec: number) => void;
-  /** Rejects when the note was not saved. */
-  onAdd: (text: string, sec: number | null) => Promise<void>;
+  /** Sends a note. Rejects when it was not saved. */
+  onSend: (text: string, sec: number | null) => Promise<Note>;
   onRetry: () => void;
   className?: string;
 }
@@ -123,37 +116,36 @@ export function ReviewNotes({
   positionSec,
   clockRef,
   cue,
-  keptDraft,
-  onDraft,
+  sessionId,
+  keeper,
   onSeek,
-  onAdd,
+  onSend,
   onRetry,
   className,
 }: ReviewNotesProps) {
   const headingId = useId();
-  const [draft, setDraft] = useState<NoteDraft | null>(keptDraft);
-  const [saving, setSaving] = useState(false);
+  const draft = useSyncExternalStore(keeper.subscribe, () => keeper.draft(sessionId));
+  const saving = draft?.saving === true;
   const [announcement, setAnnouncement] = useState('');
-  const savingRef = useRef(false);
   const boxRef = useRef<HTMLTextAreaElement>(null);
   const addRef = useRef<HTMLButtonElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const backToAddRef = useRef(false);
 
-  // The box takes focus as it opens; the button gets it back when the box goes. A box that came back
-  // with its attempt was not opened by the reader, so it leaves their focus where it is.
-  const open = draft !== null;
-  const wasOpenRef = useRef(open);
+  // The box takes focus as it opens. A box that came back with its attempt was not opened by the reader,
+  // so it leaves their focus where it is. When the box goes, focus that went with it lands on the button;
+  // focus the reader took elsewhere while a save ran stays there.
+  const lastDraftRef = useRef(draft);
   useLayoutEffect(() => {
-    if (wasOpenRef.current === open) return;
-    wasOpenRef.current = open;
-    if (open) {
+    const last = lastDraftRef.current;
+    lastDraftRef.current = draft;
+    if ((last === null) === (draft === null)) return;
+    if (draft) {
       boxRef.current?.focus({ preventScroll: true });
-    } else if (backToAddRef.current) {
-      backToAddRef.current = false;
-      addRef.current?.focus({ preventScroll: true });
+      return;
     }
-  }, [open]);
+    if (last?.saving) setAnnouncement(last.sec === null ? 'Note added.' : `Note added at ${clockText(last.sec)}.`);
+    if (document.activeElement === document.body) addRef.current?.focus({ preventScroll: true });
+  }, [draft]);
 
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
@@ -162,34 +154,7 @@ export function ReviewNotes({
     if (row) scroller.scrollTop = Math.max(0, row.offsetTop - scroller.clientHeight / 3);
   }, [cue]);
 
-  const changeDraft = (next: NoteDraft) => {
-    setDraft(next);
-    onDraft(next);
-  };
-
-  const close = () => {
-    backToAddRef.current = true;
-    setDraft(null);
-  };
-
-  const save = async () => {
-    const text = draft?.text.trim();
-    if (!draft || !text || savingRef.current) return;
-    savingRef.current = true;
-    setSaving(true);
-    setDraft({ ...draft, failed: false });
-    onDraft(null);
-    try {
-      await onAdd(text, draft.sec);
-      setAnnouncement(draft.sec === null ? 'Note added.' : `Note added at ${clockText(draft.sec)}.`);
-      close();
-    } catch {
-      changeDraft({ ...draft, failed: true });
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
-  };
+  const save = () => void keeper.save(sessionId, onSend);
 
   const seek = positionSec ? onSeek : null;
 
@@ -210,7 +175,7 @@ export function ReviewNotes({
             size="sm"
             onClick={() => {
               setAnnouncement('');
-              changeDraft({ sec: positionSec ? positionSec() : null, text: '' });
+              keeper.setDraft(sessionId, { sec: positionSec ? positionSec() : null, text: '' });
             }}
           >
             {/* One flex item: the button spaces its children apart. */}
@@ -231,7 +196,7 @@ export function ReviewNotes({
             className="space-y-2"
             onSubmit={(event) => {
               event.preventDefault();
-              void save();
+              save();
             }}
           >
             <Field label={draft.sec === null ? 'Note' : `Note at ${clockText(draft.sec)}`}>
@@ -243,12 +208,12 @@ export function ReviewNotes({
                   value={draft.text}
                   maxLength={NOTE_MAX_CHARS}
                   readOnly={saving}
-                  onChange={(event) => changeDraft({ ...draft, text: event.target.value })}
+                  onChange={(event) => keeper.setDraft(sessionId, { ...draft, text: event.target.value })}
                 />
               )}
             </Field>
             {draft.failed && (
-              <InlineNotice tone="danger" role="alert" action={<RetryButton onRetry={() => void save()} />}>
+              <InlineNotice tone="danger" role="alert" action={<RetryButton onRetry={save} />}>
                 This note was not saved. Your words are still here.
               </InlineNotice>
             )}
@@ -260,10 +225,7 @@ export function ReviewNotes({
                 variant="ghost"
                 size="sm"
                 disabled={saving}
-                onClick={() => {
-                  close();
-                  onDraft(null);
-                }}
+                onClick={() => keeper.setDraft(sessionId, null)}
               >
                 Cancel
               </Button>
