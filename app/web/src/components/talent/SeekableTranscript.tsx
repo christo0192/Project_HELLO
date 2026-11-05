@@ -3,8 +3,8 @@
  *
  * - Timed turns (start_offset_sec != null) are ALWAYS rendered as real
  *   <button> elements, even before the recording is loaded. Clicking a
- *   timed turn calls onSeek(offsetSec) — the parent workspace handles
- *   minting the URL and queuing the seek if needed.
+ *   timed turn calls onSeek(offsetSec, rowIndex) — the parent workspace
+ *   handles minting the URL and queuing the seek if needed.
  * - Untimed turns (start_offset_sec == null) are rendered non-interactive
  *   with a clear "no timing data" label.
  * - The active turn receives aria-current="true", a stronger tint with a
@@ -19,6 +19,7 @@ import { cx } from '../design/cx';
 import { SkeletonText } from '../design/Skeleton';
 import { presentTranscriptTurn } from '../../lib/transcript-presentation';
 import { formatIstTime } from '../../lib/ist-datetime';
+import { clockText } from '../../lib/r1-recording';
 
 /** A turn's time when it cannot seek: seconds into its call, or a clock time. */
 export interface TurnTime {
@@ -29,7 +30,8 @@ export interface TurnTime {
 export interface SeekableTranscriptProps {
   transcript: TranscriptLine[];
   activeTurnIndex: number | null;
-  onSeek: (offsetSec: number) => void;
+  /** `rowIndex` is the clicked row's place in `transcript`: two rows can share an offset. */
+  onSeek: (offsetSec: number, rowIndex: number) => void;
   recordingReady: boolean;
   isLoading?: boolean;
   error?: string | null;
@@ -60,12 +62,6 @@ const prefersReducedMotion = (): boolean =>
   typeof window.matchMedia === 'function' &&
   window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-function formatOffset(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
 function hasTiming(t: TranscriptLine): boolean {
   return t.start_offset_sec != null;
 }
@@ -74,7 +70,7 @@ function hasTiming(t: TranscriptLine): boolean {
 function displayTime(time: TurnTime | null | undefined): { text: string; spoken: string } | null {
   if (!time) return null;
   if (typeof time.sec === 'number' && Number.isFinite(time.sec)) {
-    const text = formatOffset(time.sec);
+    const text = clockText(time.sec);
     return { text, spoken: `${text} into the call` };
   }
   if (typeof time.atMs === 'number' && Number.isFinite(time.atMs)) {
@@ -115,12 +111,15 @@ export function SeekableTranscript({
     }
   }, [activeTurnIndex]);
 
-  // Announce active turn change
+  // Announce active turn change, and take it back when no turn is active: a row can light before its
+  // media exists (an R1 click), so a failed load must not leave "Now playing" behind.
   useEffect(() => {
     if (activeTurnIndex != null && transcript[activeTurnIndex]) {
       const t = transcript[activeTurnIndex];
       const presented = presentTranscriptTurn(t.speaker, t.text);
       setAnnouncement(`Now playing turn ${turnNumbers?.[activeTurnIndex] ?? activeTurnIndex + 1}: ${presented.label}`);
+    } else {
+      setAnnouncement('');
     }
   }, [activeTurnIndex, transcript, turnNumbers]);
 
@@ -200,9 +199,9 @@ export function SeekableTranscript({
                   <button
                     type="button"
                     ref={active ? activeRef : undefined}
-                    onClick={() => onSeek(turn.start_offset_sec!)}
+                    onClick={() => onSeek(turn.start_offset_sec!, index)}
                     aria-current={active ? 'true' : undefined}
-                    aria-label={`Turn ${numberOf(index)}: ${speaker}. At ${approximateTiming ? 'about ' : ''}${formatOffset(turn.start_offset_sec!)}. Click to play from here.`}
+                    aria-label={`Turn ${numberOf(index)}: ${speaker}. At ${approximateTiming ? 'about ' : ''}${clockText(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(
                       'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors duration-150 ease-out',
                       'focus:outline-none focus:ring-2 focus:ring-[var(--c-accent)] focus:ring-inset',
@@ -233,7 +232,7 @@ export function SeekableTranscript({
                         )}
                       >
                         {approx}
-                        {formatOffset(turn.start_offset_sec!)}
+                        {clockText(turn.start_offset_sec!)}
                       </span>
                     </span>
                     <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-[var(--c-ink)]">

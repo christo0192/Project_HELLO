@@ -529,6 +529,92 @@ describe('the rounds panel', () => {
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
   });
 
+  describe('while an appeal blocks decision use', () => {
+    const WITHHELD = 'Scorecards are suppressed while an appeal is under review.';
+
+    const renderBlocked = () =>
+      render(
+        <MemoryRouter>
+          <R1Section candidateId="cand-1" candidateName="Ava Rao" role="admin" userId="user-1" decisionBlocked />
+        </MemoryRouter>,
+      );
+
+    it('a round whose scores the API nulled reads as withheld, not as "no results yet"', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: null, overall: null })],
+      });
+      renderBlocked();
+      expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    });
+
+    it('never prints a score, even from an API that has not started nulling them yet', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'reject', overall: 31 })],
+      });
+      renderBlocked();
+      expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
+      expect(screen.queryByText(/Recommendation:/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/of 100/)).not.toBeInTheDocument();
+    });
+
+    it('says nothing about scores for a round that has none to withhold', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'expired' })] });
+      renderBlocked();
+      await screen.findByRole('list', { name: 'R1 rounds' });
+      expect(screen.queryByText(WITHHELD)).not.toBeInTheDocument();
+    });
+
+    it('has no axe violations', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'completed', attempts_counted: 1 })],
+      });
+      const { container } = renderBlocked();
+      await screen.findByText(WITHHELD);
+      await expect(container).toHaveNoViolations();
+    });
+  });
+
+  describe('an appeal opened after the page loaded', () => {
+    const WITHHELD = 'Scorecards are suppressed while an appeal is under review.';
+    const withheld = { recommendation: null, overall: null, scores_withheld: true };
+
+    it('the round itself says so: withheld, with no decisionBlocked prop', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'completed', attempts_counted: 1, ...withheld })],
+      });
+      renderSection();
+      expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    });
+
+    it('a re-read after an action turns the shown result into withheld, not into "no results yet"', async () => {
+      const scored = round({ status: 'completed', attempts_counted: 1, recommendation: 'reject', overall: 31 });
+      api.listR1Rounds.mockResolvedValueOnce({ rounds: [scored] });
+      api.listR1Rounds.mockResolvedValue({ rounds: [{ ...scored, ...withheld }] });
+      const user = userEvent.setup();
+      renderSection();
+      expect(await screen.findByText('Recommendation: Reject · Overall 31 of 100')).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Grant retake' }));
+      const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
+      await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
+
+      expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/of 100/)).not.toBeInTheDocument();
+    });
+  });
+
+  it('without an appeal the withheld line never shows', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58.5 })],
+    });
+    renderSection();
+    await screen.findByText('Recommendation: Borderline · Overall 58.5 of 100');
+    expect(screen.queryByText(/suppressed while an appeal/)).not.toBeInTheDocument();
+  });
+
   it('shows no results line for a round that never started', async () => {
     api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'expired' })] });
     renderSection();

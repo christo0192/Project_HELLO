@@ -85,10 +85,12 @@ export interface R1Round {
   expires_at: string;
   attempts_allowed: number;
   attempts_counted: number;
-  /** Null until the scorer has produced a gated result (PR-5). */
+  /** Null until the scorer has produced a gated result (PR-5), and while an appeal blocks decision use. */
   recommendation: R1Recommendation | null;
-  /** 0-100, null until scored. */
+  /** 0-100, null until scored, and while an appeal blocks decision use. */
   overall: number | null;
+  /** True while an appeal blocks decision use: the nulls above mean withheld, not unscored. Absent otherwise. */
+  scores_withheld?: boolean;
   created_at: string;
   created_by?: string;
   /** One entry per attempt, each with its recording summary. Absent from an older API. */

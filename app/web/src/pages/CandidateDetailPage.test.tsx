@@ -909,6 +909,67 @@ describe('CandidateDetailPage', () => {
     ));
   });
 
+  describe('C3: the re-screen hint reads the newest PHONE scorecard, never an R1 one', () => {
+    const terminalCycle = {
+      cycle_number: 1, state: 'completed', state_reason: null, version: 2,
+      no_answer_attempts: 0, no_answer_limit: 3, reconnects_used: 0, provider_failures: 0,
+      next_eligible_at: null, last_attempt_at: null, terminal_at: '2026-08-27T10:00:00Z',
+      created_at: '2026-08-27T09:00:00Z', updated_at: '2026-08-27T10:00:00Z',
+      has_session: true, has_assessment: true, appointment: null,
+    };
+    const r1Session = {
+      ...mockCandidateDetail.sessions[0], id: 'session-r1', mode: 'browser', interview_round_id: 'round-1',
+      created_at: '2026-08-28T10:00:00Z',
+    };
+    const phoneRow = { ...mockCandidateDetail.assessments[0], id: 'a-phone', session_id: mockCandidateDetail.sessions[0].id };
+    const r1Row = { ...mockCandidateDetail.assessments[0], id: 'a-r1', session_id: 'session-r1' };
+    const held = { evidence_grade: 'insufficient', evidence_reason: 'infra_interrupted', evidence_answered: 1, evidence_planned: 5 };
+
+    beforeEach(() => {
+      mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+        ok: true, enabled: true, current_cycle: 1, cycles: [terminalCycle],
+      });
+    });
+
+    it('a held R1 row newer than a fine phone row recommends nothing', async () => {
+      mockApi.getCandidate.mockResolvedValue({
+        ...mockCandidateDetail,
+        sessions: [r1Session, ...mockCandidateDetail.sessions],
+        assessments: [{ ...r1Row, ...held }, phoneRow],
+      });
+      renderDetailPage("candidate-1", "?tab=overview");
+      await screen.findByRole('button', { name: 'Request re-screen' });
+      expect(screen.queryByRole('button', { name: 'Rescreen recommended' })).toBeNull();
+    });
+
+    it('a fine R1 row newer than a held phone row still recommends the re-screen', async () => {
+      mockApi.getCandidate.mockResolvedValue({
+        ...mockCandidateDetail,
+        sessions: [r1Session, ...mockCandidateDetail.sessions],
+        assessments: [r1Row, { ...phoneRow, ...held }],
+      });
+      renderDetailPage("candidate-1", "?tab=overview");
+      expect(await screen.findByRole('button', { name: 'Rescreen recommended' })).toBeInTheDocument();
+    });
+  });
+
+  it('the R1 card reads as withheld while an appeal blocks decision use, and the API nulls are not read as "no score"', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, decision_use_blocked_at: '2026-01-02T00:00:00.000Z' },
+    });
+    mockApi.listR1Rounds.mockResolvedValueOnce({
+      rounds: [{
+        id: 'round-1', status: 'completed', expires_at: '2026-10-09T10:00:00.000Z', attempts_allowed: 2,
+        attempts_counted: 1, recommendation: null, overall: null, created_at: '2026-10-06T10:00:00.000Z', created_by: 'user-1',
+      }],
+    });
+    renderDetailPage("candidate-1", "?tab=overview");
+    const card = await screen.findByRole('list', { name: 'R1 rounds' });
+    expect(within(card).getByText('Scorecards are suppressed while an appeal is under review.')).toBeInTheDocument();
+    expect(within(card).queryByText(/No results yet/)).toBeNull();
+  });
+
   describe('C8: a same-role duplicate-application hold', () => {
     const heldCycle = {
       cycle_number: 1, state: 'pending_prereqs', state_reason: 'duplicate_application', version: 2,

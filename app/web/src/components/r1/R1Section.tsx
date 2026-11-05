@@ -53,6 +53,8 @@ export interface R1SectionProps {
    * not keep playing behind another tab. Default true.
    */
   active?: boolean;
+  /** An appeal blocks decision use: a round's result reads as withheld. Default false. */
+  decisionBlocked?: boolean;
 }
 
 type RoundsState =
@@ -60,7 +62,14 @@ type RoundsState =
   | { status: 'error'; message: string; forbidden: boolean }
   | { status: 'ready'; rounds: R1Round[] };
 
-export function R1Section({ candidateId, candidateName, role, userId, active = true }: R1SectionProps) {
+export function R1Section({
+  candidateId,
+  candidateName,
+  role,
+  userId,
+  active = true,
+  decisionBlocked = false,
+}: R1SectionProps) {
   const headingId = useId();
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   const canManage = role === 'admin' || role === 'interviewer';
@@ -242,6 +251,7 @@ export function R1Section({ candidateId, candidateName, role, userId, active = t
                 onMessage={setMessage}
                 onSettled={settle}
                 active={active}
+                decisionBlocked={decisionBlocked}
               />
             </div>
           ) : (

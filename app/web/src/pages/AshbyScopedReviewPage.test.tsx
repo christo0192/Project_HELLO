@@ -169,6 +169,23 @@ describe('scoped review shell', () => {
     expect(await screen.findByText('Welcome to the screening.')).toBeInTheDocument();
   });
 
+  it('a viewer with an R1 session is told the candidate page holds its recording: this shell has no R1 card', async () => {
+    mockApi.getSession.mockRejectedValue(new MockApiError('forbidden', 403));
+    mockApi.getAshbyScopedReview.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], status: 'completed', interview_round_id: 'round-1' }],
+    });
+    renderPage();
+    await screen.findByText('Jane Doe');
+    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    // The transcript pane says the same while the load is out, so wait for the denied pane itself.
+    expect(await screen.findByText(/require admin access/i)).toBeInTheDocument();
+    expect(
+      screen.getByText('The recording for this R1 session is on the candidate page, under R1 interview.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Overview tab/)).toBeNull();
+  });
+
   it('reads notes through the scoped endpoint only', async () => {
     mockApi.listAshbyScopedReviewNotes.mockResolvedValue({
       notes: [{ id: 'n1', candidate_id: 'c1', author_id: 'u1', note: 'Solid answers', created_at: '2026-08-01T00:00:00Z' }],
