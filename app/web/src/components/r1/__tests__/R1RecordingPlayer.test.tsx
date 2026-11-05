@@ -8,7 +8,7 @@
  * and fires the media events the browser would.
  */
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { StrictMode, createRef } from 'react';
 import type { R1RecordingPlayback, R1RecordingSummary } from '../../../lib/r1-types';
 import { R1RecordingPlayer } from '../R1RecordingPlayer';
@@ -677,12 +677,12 @@ describe('playFrom / playFromTurn', () => {
     expect(mockApi.getR1Recording).toHaveBeenCalledTimes(1);
   });
 
-  it('playFromTurn applies the anchor and the one-second lead-in', async () => {
+  it('playFromTurn applies the anchor and the quarter-second lead-in', async () => {
     const r = renderPlayer();
     const { state } = await loadIt(r);
     state.sets.length = 0;
     act(() => r.ref.current!.playFromTurn(START + 125_000));
-    expect(state.sets).toEqual([124]);
+    expect(state.sets).toEqual([124.75]);
   });
 
   it('playFromTurn uses the mint answer\'s anchor when the list had none', async () => {
@@ -691,7 +691,7 @@ describe('playFrom / playFromTurn', () => {
     const { state } = await loadIt(r);
     state.sets.length = 0;
     act(() => r.ref.current!.playFromTurn(START + 70_000));
-    expect(state.sets).toEqual([59]);
+    expect(state.sets).toEqual([59.75]);
   });
 
   it('playFromTurn with no anchor does nothing (an untimed turn stays untimed)', async () => {
@@ -949,6 +949,173 @@ describe('events to the host', () => {
     const r = renderPlayer();
     await loadIt(r);
     expect(r.props.onStateChange).not.toHaveBeenCalled();
+  });
+});
+
+/* ── The animation-frame clock ────────────────────────────────────── */
+
+describe('the position is reported every frame while playing', () => {
+  let frames: Map<number, FrameRequestCallback>;
+  let hidden = false;
+
+  /** Run the frames that are due now; the callbacks may ask for the next one. */
+  const runFrame = () => {
+    const due = [...frames.values()];
+    frames.clear();
+    for (const callback of due) callback(0);
+  };
+
+  beforeEach(() => {
+    frames = new Map();
+    let id = 0;
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      id += 1;
+      frames.set(id, callback);
+      return id;
+    });
+    vi.stubGlobal('cancelAnimationFrame', (handle: number) => {
+      frames.delete(handle);
+    });
+    hidden = false;
+    vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  async function playing(over: Partial<R1RecordingPlayerProps> = {}) {
+    const r = renderPlayer(over);
+    const { el, state } = await loadIt(r);
+    state.paused = false;
+    fireEvent.play(el);
+    return { r, el, state };
+  }
+
+  it('reads currentTime each frame, with no timeupdate at all', async () => {
+    const { r, state } = await playing();
+    expect(frames.size).toBe(1);
+    state.currentTime = 10.016;
+    runFrame();
+    expect(r.props.onTimeUpdate).toHaveBeenLastCalledWith(10.016);
+    state.currentTime = 10.032;
+    runFrame();
+    expect(r.props.onTimeUpdate).toHaveBeenLastCalledWith(10.032);
+    expect(r.props.onTimeUpdate).toHaveBeenCalledTimes(2);
+    // One frame at a time, never a pile of them.
+    expect(frames.size).toBe(1);
+  });
+
+  it('ignores timeupdate while the frames are running in a visible tab', async () => {
+    const { r, el, state } = await playing();
+    state.currentTime = 20;
+    fireEvent.timeUpdate(el);
+    expect(r.props.onTimeUpdate).not.toHaveBeenCalled();
+  });
+
+  it('a second play event does not start a second loop', async () => {
+    const { el } = await playing();
+    fireEvent.play(el);
+    fireEvent.play(el);
+    expect(frames.size).toBe(1);
+  });
+
+  it('stops on pause: no frame is left, and timeupdate reports a seek while paused', async () => {
+    const { r, el, state } = await playing();
+    state.paused = true;
+    fireEvent.pause(el);
+    expect(frames.size).toBe(0);
+    vi.mocked(r.props.onTimeUpdate!).mockClear();
+    state.currentTime = 33;
+    fireEvent.timeUpdate(el);
+    expect(r.props.onTimeUpdate).toHaveBeenCalledExactlyOnceWith(33);
+  });
+
+  it('play after pause starts it again', async () => {
+    const { r, el, state } = await playing();
+    state.paused = true;
+    fireEvent.pause(el);
+    state.paused = false;
+    fireEvent.play(el);
+    expect(frames.size).toBe(1);
+    state.currentTime = 41;
+    runFrame();
+    expect(r.props.onTimeUpdate).toHaveBeenLastCalledWith(41);
+  });
+
+  it('stops at the end of the recording', async () => {
+    const { el } = await playing();
+    fireEvent.ended(el);
+    expect(frames.size).toBe(0);
+  });
+
+  it('a frame that finds the element paused reports nothing and stops (no pause event came)', async () => {
+    const { r, state } = await playing();
+    state.paused = true;
+    runFrame();
+    expect(r.props.onTimeUpdate).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+
+  it('stops on unmount, and a frame already queued cannot report afterwards', async () => {
+    const { r, state } = await playing();
+    const queued = [...frames.values()];
+    r.view.unmount();
+    expect(frames.size).toBe(0);
+    state.currentTime = 50;
+    for (const callback of queued) callback(0);
+    expect(r.props.onTimeUpdate).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+
+  it('stops when the player is reset for another recording', async () => {
+    const { r } = await playing();
+    r.rerender({ sessionId: 'session-2' });
+    expect(frames.size).toBe(0);
+  });
+
+  it('a hidden tab runs no frames, so timeupdate reports there, and the frames take over on return', async () => {
+    const { r, el, state } = await playing();
+    hidden = true;
+    state.currentTime = 60;
+    fireEvent.timeUpdate(el);
+    expect(r.props.onTimeUpdate).toHaveBeenLastCalledWith(60);
+    hidden = false;
+    state.currentTime = 61;
+    runFrame();
+    expect(r.props.onTimeUpdate).toHaveBeenLastCalledWith(61);
+    expect(frames.size).toBe(1);
+  });
+
+  it('a split recording runs one loop, on the audio it follows', async () => {
+    mockApi.getR1Recording.mockResolvedValue({
+      ...listed({ state: 'partial', reason: 'crash_recovered', mode: 'split' }),
+      video_url: URL_ONE,
+      audio_url: URL_TWO,
+      expires_in_sec: 300,
+    });
+    const r = renderPlayer({ summary: listed({ state: 'partial', reason: 'crash_recovered', mode: 'split' }) });
+    fireEvent.click(loadButton());
+    await waitFor(() => expect(r.view.container.querySelector('audio[controls]')).not.toBeNull());
+    const audio = r.view.container.querySelector('audio')!;
+    const video = r.view.container.querySelector('video')!;
+    const a = drive(audio);
+    drive(video, { currentTime: 999 });
+    fireEvent.loadedMetadata(audio);
+    a.paused = false;
+    fireEvent.play(audio);
+    expect(frames.size).toBe(1);
+    a.currentTime = 7;
+    runFrame();
+    expect(r.props.onTimeUpdate).toHaveBeenLastCalledWith(7);
+  });
+
+  it('runs no loop at all when nobody is listening (the Overview row has no transcript)', async () => {
+    const r = renderPlayer({ onTimeUpdate: undefined });
+    const { el, state } = await loadIt(r);
+    state.paused = false;
+    fireEvent.play(el);
+    expect(frames.size).toBe(0);
   });
 });
 

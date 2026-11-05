@@ -67,9 +67,13 @@ r1Router.post('/candidates/:id/interview-rounds', requireRole('interviewer'), as
 
 r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (req, res, next) => { try {
   if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
-  if (!(await candidateAccess(req, res, req.params.id, false))) return;
+  const candidate = await candidateAccess(req, res, req.params.id, false); if (!candidate) return;
   const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
-  if (error) throw error; res.json({ rounds: await withRecordingAttempts(supabase as never, data ?? []) });
+  if (error) throw error;
+  // While an appeal blocks decision use the result is withheld at read time, as the phone list does
+  // (latest_recommendation / latest_score in routes/candidates.ts); the stored round is untouched.
+  const rounds = candidate.decision_use_blocked_at != null ? (data ?? []).map((round) => ({ ...round, recommendation: null, overall: null })) : (data ?? []);
+  res.json({ rounds: await withRecordingAttempts(supabase as never, rounds) });
 } catch (e) { next(e); } });
 
 for (const action of ['cancel', 'reissue', 'grant-retake'] as const) r1Router.post(`/interview-rounds/:id/${action}`, requireRole('interviewer'), async (req, res, next) => { try {

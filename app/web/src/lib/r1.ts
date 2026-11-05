@@ -70,6 +70,9 @@ export function r1StatusTone(status: string): R1Tone {
 export const R1_RECOMMENDATION_LABEL: Readonly<Record<R1Recommendation, string>> =
   RECOMMENDATION_LABELS;
 
+/** A round's result while an appeal blocks decision use: the Review tab's own sentence, not new copy. */
+export const R1_RESULT_WITHHELD = 'Scorecards are suppressed while an appeal is under review.';
+
 export function isLiveRound(round: Pick<R1Round, 'status'>): boolean {
   return round.status === 'invited' || round.status === 'in_progress';
 }

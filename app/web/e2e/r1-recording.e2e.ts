@@ -8,9 +8,10 @@
  * click lands). Decoding a real H.264 + AAC file and seeking it accurately is checked by hand
  * (R1-REC E4), not here.
  *
- * Covers: Overview Load (video and audio-only), the Review tab's transcript click-to-seek (admin),
- * an expired link mid-view (exactly two mints, position restored), a bad first link (no automatic
- * retry), every state without a player, and a viewer (row and Load, denied transcript).
+ * Covers: Overview Load (video and audio-only), the Review tab's transcript click-to-seek and
+ * highlight (admin), an expired link mid-view (exactly two mints, position restored), a bad first link
+ * (no automatic retry), every state without a player, an appeal (scores withheld), and a viewer (row
+ * and Load, denied transcript).
  */
 import type { Locator } from '@playwright/test';
 import { auditA11y } from './fixtures/axe';
@@ -19,6 +20,7 @@ import {
   R1_REC_LENGTH_SEC,
   R1_SESSION_ATTEMPT_1,
   R1_SESSION_ATTEMPT_2,
+  R1_TURN_EARLY_SEC,
   R1_TURN_LATE_SEC,
 } from './fixtures/data';
 import { horizontalOverflow } from './fixtures/layout';
@@ -115,20 +117,72 @@ test.describe('Review tab (admin): click a transcript turn to seek', () => {
     await late.click();
     const video = panel.locator('video');
     await expect(video).toHaveCount(1);
-    // Seeks to the turn less the one-second lead-in (same tolerance as transcript-seek.e2e.ts).
-    const target = R1_TURN_LATE_SEC - 1;
+    // Seeks to the turn less the quarter-second lead-in (same tolerance as transcript-seek.e2e.ts).
+    const target = R1_TURN_LATE_SEC - 0.25;
     await expect.poll(() => position(video), { timeout: 10_000 }).toBeGreaterThanOrEqual(target - 1);
     expect(await position(video)).toBeLessThan(target + 15);
 
-    // An earlier turn seeks backwards in the same, already loaded, file: no second mint.
+    // An earlier turn seeks backwards in the same, already loaded, file: no second mint. It lands a
+    // quarter of a second early, not a full second (read at the seek: the file keeps playing after it).
+    await video.evaluate((el: HTMLMediaElement) => {
+      el.addEventListener('seeked', () => el.setAttribute('data-landed-at', String(el.currentTime)), { once: true });
+    });
     await panel.getByRole('button', { name: /Turn 1:/ }).click();
-    await expect.poll(() => position(video), { timeout: 10_000 }).toBeLessThan(10);
+    await expect.poll(() => video.getAttribute('data-landed-at'), { timeout: 10_000 }).not.toBeNull();
+    expect(Math.abs(Number(await video.getAttribute('data-landed-at')) - (R1_TURN_EARLY_SEC - 0.25))).toBeLessThan(0.2);
     expect(mints(app)).toHaveLength(1);
 
     // No legacy download was ever asked for an R1 session.
     expect(app.calls.filter((c) => /\/api\/recordings\//.test(c.url))).toEqual([]);
 
     await noSideways(app, testInfo.project.name);
+    app.expectHealthy();
+  });
+
+  test('the highlight follows the playhead: a row lights at its own start, on frames while playing', async ({ app, page }) => {
+    await app.goto(REVIEW);
+    const panel = page.getByRole('tabpanel', { name: 'Review' });
+    await panel.getByRole('combobox').selectOption(R1_SESSION_ATTEMPT_1);
+    await panel.getByRole('button', { name: 'Load recording, R1 role-play' }).click();
+    const video = panel.locator('video');
+    await expect.poll(() => duration(video)).toBeGreaterThan(R1_REC_LENGTH_SEC - 5);
+    const early = panel.getByRole('button', { name: /Turn 1:/ });
+    const late = panel.getByRole('button', { name: /Turn 2:/ });
+    const seekPaused = async (sec: number) => {
+      await video.evaluate((el: HTMLMediaElement, t: number) => {
+        el.currentTime = t;
+      }, sec);
+      await expect.poll(() => position(video)).toBeCloseTo(sec, 1);
+    };
+
+    // Paused: `timeupdate` after each seek is the clock. No early tolerance: 0.1 s short of the start
+    // lights nothing new, and the start itself does.
+    await seekPaused(R1_TURN_EARLY_SEC - 0.1);
+    await expect(early).not.toHaveAttribute('aria-current', /.*/);
+    await seekPaused(R1_TURN_EARLY_SEC);
+    await expect(early).toHaveAttribute('aria-current', 'true');
+    await seekPaused(R1_TURN_LATE_SEC - 0.1);
+    await expect(early).toHaveAttribute('aria-current', 'true');
+    await expect(late).not.toHaveAttribute('aria-current', /.*/);
+
+    // Playing (muted autoplay is always allowed): the frames cross the next start on their own.
+    await video.evaluate(async (el: HTMLMediaElement) => {
+      el.muted = true;
+      await el.play();
+    });
+    await expect(late).toHaveAttribute('aria-current', 'true');
+    await expect(early).not.toHaveAttribute('aria-current', /.*/);
+    expect(await position(video)).toBeGreaterThanOrEqual(R1_TURN_LATE_SEC);
+
+    // Paused again: a seek back still moves the highlight.
+    await video.evaluate((el: HTMLMediaElement) => el.pause());
+    await seekPaused(R1_TURN_EARLY_SEC + 1);
+    await expect(early).toHaveAttribute('aria-current', 'true');
+    await expect(late).not.toHaveAttribute('aria-current', /.*/);
+
+    // The turn with no time is unclickable and never lit.
+    await expect(panel.getByText('no timing data')).toHaveCount(1);
+    await expect(panel.locator('[aria-current="true"]')).toHaveCount(1);
     app.expectHealthy();
   });
 
@@ -289,6 +343,24 @@ test.describe('a viewer', () => {
     // The 403 is the point of the test, and the browser logs it; nothing else may be logged.
     const others = app.consoleErrors.filter((e) => !/status of 403/.test(e));
     app.consoleErrors.splice(0, app.consoleErrors.length, ...others);
+    app.expectHealthy();
+  });
+});
+
+test.describe('while an appeal blocks decision use', () => {
+  test('the R1 card reads as withheld, not as "no results yet", and the recording row stays', async ({ app, page }, testInfo) => {
+    const detail = app.db.candidateDetail;
+    app.db.candidateDetail = (id) => {
+      const found = detail(id);
+      return found && { ...found, candidate: { ...found.candidate, decision_use_blocked_at: '2026-10-05T00:00:00.000Z' } };
+    };
+    await app.goto(OVERVIEW);
+    const rounds = page.getByRole('list', { name: 'R1 rounds' });
+    await expect(rounds.getByText('Scorecards are suppressed while an appeal is under review.')).toBeVisible();
+    await expect(rounds.getByText(/No results yet/)).toHaveCount(0);
+    await expect(page.getByRole('group', { name: 'Attempt 1 (counted)' })).toBeVisible();
+    await noSideways(app, testInfo.project.name);
+    await auditA11y(page, testInfo, 'r1-recording-appeal', { strict: true });
     app.expectHealthy();
   });
 });

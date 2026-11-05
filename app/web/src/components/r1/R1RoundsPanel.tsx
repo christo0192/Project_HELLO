@@ -5,6 +5,7 @@
  * its expiry while it can still be used, attempts used, and the result once
  * the scorer has written one. Until scoring ships (PR-5) the recommendation
  * and score are null, and the row says so in words instead of leaving a gap.
+ * While an appeal blocks decision use the result reads as withheld instead.
  *
  * Row actions (an admin, or the interviewer who created the round: the API's own
  * rule, so nobody is offered a button that can only answer 403):
@@ -31,6 +32,7 @@ import { formatDateTime } from '../../lib/datetime';
 import {
   R1_LINK_VALID_HOURS,
   R1_RECOMMENDATION_LABEL,
+  R1_RESULT_WITHHELD,
   attemptsLabel,
   canActOnRound,
   canCancel,
@@ -101,6 +103,11 @@ export interface R1RoundsPanelProps {
    * Default true.
    */
   active?: boolean;
+  /**
+   * An appeal blocks decision use. The API nulls the scores, which must not read as "no results yet":
+   * every round that would show a result says it is withheld, and no score prints even if one arrives.
+   */
+  decisionBlocked?: boolean;
 }
 
 export function R1RoundsPanel({
@@ -112,6 +119,7 @@ export function R1RoundsPanel({
   onMessage,
   onSettled,
   active: recordingsActive = true,
+  decisionBlocked = false,
 }: R1RoundsPanelProps) {
   const uid = useId().replace(/:/g, '');
   const [pending, setPending] = useState<Pending | null>(null);
@@ -226,7 +234,9 @@ export function R1RoundsPanel({
 
             {showsResult && (
               <p className="mt-1 text-label text-ink-secondary">
-                {scored ? (
+                {decisionBlocked ? (
+                  R1_RESULT_WITHHELD
+                ) : scored ? (
                   <>
                     {round.recommendation
                       ? `Recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}`

@@ -24,6 +24,11 @@
  *
  * A hidden tab keeps the panel mounted, so `active={false}` pauses (position and link survive).
  * Renders inside `.candidate-scope` (`--c-*` tokens only, no motion import).
+ *
+ * The position (`onTimeUpdate`, for a host that follows it): while the media plays, an animation-frame
+ * loop reads `currentTime` every frame. `timeupdate` (about every 250 ms) reports only when that loop
+ * cannot: a paused element (a seek) or a hidden tab (no frames run there). The loop runs only while
+ * someone is listening, and stops on pause, on end, on a dropped element and on unmount.
  */
 import {
   forwardRef,
@@ -210,6 +215,8 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
     const lastFollowerRef = useRef<HTMLMediaElement | null>(null);
     const activeRef = useRef(active);
     const cbRef = useRef(props);
+    /** The animation frame the position loop has asked for; null = the loop is not running. */
+    const frameRef = useRef<number | null>(null);
 
     // Latest props for the handlers below (assigned during render on purpose: they are read only
     // from event handlers and promise callbacks, never during render).
@@ -221,13 +228,35 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
     phaseRef.current = phase;
     mintedRef.current = minted;
 
+    /* ── The position loop ─────────────────────────────────────────── */
+
+    const stopPositionLoop = useCallback(() => {
+      if (frameRef.current === null) return;
+      cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }, []);
+
+    const startPositionLoop = useCallback(() => {
+      if (frameRef.current !== null || !cbRef.current.onTimeUpdate) return;
+      const tick = () => {
+        frameRef.current = null;
+        const el = masterRef.current;
+        // Also ends the loop when no pause event came: a reloading element is paused silently.
+        if (!mountedRef.current || !el || el.paused || el.ended) return;
+        cbRef.current.onTimeUpdate?.(el.currentTime);
+        frameRef.current = requestAnimationFrame(tick);
+      };
+      frameRef.current = requestAnimationFrame(tick);
+    }, []);
+
     /* ── Lifecycle ─────────────────────────────────────────────────── */
 
     /** Stop both elements' downloads (the player is about to drop them). */
     const releaseMedia = useCallback(() => {
+      stopPositionLoop();
       release(masterRef.current);
       release(followerRef.current);
-    }, []);
+    }, [stopPositionLoop]);
 
     useEffect(() => {
       mountedRef.current = true;
@@ -235,11 +264,12 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
         mountedRef.current = false;
         genRef.current += 1;
         inflightRef.current = null;
+        stopPositionLoop();
         // Unmount: the refs are already null, so use the elements remembered from the last render.
         release(lastMasterRef.current);
         release(lastFollowerRef.current);
       };
-    }, []);
+    }, [stopPositionLoop]);
 
     /** Back to "nothing loaded": a stale answer can no longer land, nothing is queued. */
     const reset = useCallback(() => {
@@ -570,7 +600,10 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
     const onTimeUpdate = useCallback((event: SyntheticEvent<HTMLMediaElement>) => {
       const el = event.currentTarget;
       lastTimeRef.current = el.currentTime;
-      cbRef.current.onTimeUpdate?.(el.currentTime);
+      // While playing in a visible tab the position loop reports; this is the fallback for the rest.
+      if (frameRef.current === null || el.paused || document.hidden) {
+        cbRef.current.onTimeUpdate?.(el.currentTime);
+      }
       const follower = followerRef.current;
       if (follower && follower !== el && !el.paused && driftExceeds(el.currentTime, follower.currentTime)) {
         try {
@@ -585,22 +618,25 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
       (event: SyntheticEvent<HTMLMediaElement>) => {
         const el = event.currentTarget;
         cbRef.current.onPlayState?.(true);
+        startPositionLoop();
         followerRef.current?.play().catch(noop);
         // The person pressed the native Play on a link that is about to expire.
         refreshIfStale({ time: el.currentTime, play: true });
       },
-      [refreshIfStale],
+      [refreshIfStale, startPositionLoop],
     );
 
     const onPause = useCallback(() => {
+      stopPositionLoop();
       cbRef.current.onPlayState?.(false);
       followerRef.current?.pause();
-    }, []);
+    }, [stopPositionLoop]);
 
     const onEnded = useCallback(() => {
+      stopPositionLoop();
       cbRef.current.onPlayState?.(false);
       followerRef.current?.pause();
-    }, []);
+    }, [stopPositionLoop]);
 
     /** The picture follows the sound: after any seek it is put where the audio is. */
     const syncFollower = useCallback((el: HTMLMediaElement) => {

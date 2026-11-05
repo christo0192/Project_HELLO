@@ -79,6 +79,13 @@ describe('HeaderScore', () => {
     expect(within(region()).queryByText('91')).not.toBeInTheDocument();
   });
 
+  it('skips an R1 row even when this page has no session for it (raw.r1 marks every R1 row)', () => {
+    const r1 = assessment({ session_id: 'r1-s', overall_score: 91, raw: { r1: { outcome: 'scored' } } as never });
+    const phone = assessment({ session_id: 'p-s', overall_score: 70 });
+    expect(latestScreeningAssessment([r1, phone], [])).toBe(phone);
+    expect(latestScreeningAssessment([r1], [])).toBeNull();
+  });
+
   it('is Not scored when every assessment is an R1 round', () => {
     const r1 = assessment({ session_id: 'r1-s', overall_score: 91 });
     render(

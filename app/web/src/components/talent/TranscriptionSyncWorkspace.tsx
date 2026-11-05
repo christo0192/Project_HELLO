@@ -16,13 +16,16 @@
  *
  * Access: `GET /api/screening/:id` is admin-only. For non-admin reviewers the
  * transcript/recording load returns 403; we degrade gracefully — showing a
- * truthful note plus the candidate's latest scorecard (from the viewer-visible
- * candidate detail) instead of an error.
+ * truthful note plus the candidate's latest screening scorecard, never an R1
+ * one (from the viewer-visible candidate detail) instead of an error.
  *
  * Sync logic:
  *   1. Click a timed turn → if URL not loaded, mint it, queue the offset, wait
  *      for readiness, then seek + play (latest offset wins on rapid clicks).
- *   2. audio timeupdate → nearest turn by start_offset_sec → highlight.
+ *   2. Playhead → the last turn in start-time order at or before it → highlight
+ *      (`activeTurnAt`). A phone player reports on `timeupdate`; the R1 player
+ *      every animation frame while playing. Either way this renders only when
+ *      the active turn changes.
  *   3. Selecting a new session resets everything; stale loads are discarded.
  *
  * R1 sessions (a session that belongs to an R1 round): the recording is the R1
@@ -75,6 +78,8 @@ import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
 import { SessionLegRow } from './SessionLegRow';
 import {
+  PHONE_HIGHLIGHT_TOLERANCE_SEC,
+  activeTurnAt,
   activeTurnIn,
   groupTurnsByLeg,
   legPlayable,
@@ -88,6 +93,7 @@ import {
   sessionStatusTone,
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
+import { latestScreeningAssessment } from '../../lib/latest-screening-assessment';
 import { turnMediaSec } from '../../lib/r1-recording';
 import type { R1RecordingSummary } from '../../lib/r1-types';
 import { sessionModeLabel } from '../../lib/session-mode';
@@ -165,21 +171,6 @@ function roleFitHasContent(rf: RoleFitScore | null | undefined): boolean {
   );
 }
 
-function findActiveTurnIndex(
-  turns: TranscriptLine[],
-  currentTime: number,
-  toleranceSec = 0.25,
-): number | null {
-  let active: number | null = null;
-  for (let i = 0; i < turns.length; i++) {
-    const offset = turns[i].start_offset_sec;
-    if (offset != null && offset <= currentTime + toleranceSec) {
-      active = i;
-    }
-  }
-  return active;
-}
-
 export function TranscriptionSyncWorkspace({
   sessions,
   assessments,
@@ -203,6 +194,14 @@ export function TranscriptionSyncWorkspace({
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [activeTurnIndex, setActiveTurnIndex] = useState<number | null>(null);
+  // What the state holds, readable without a render: the R1 player reports every frame, and only a
+  // change of turn may cost one.
+  const activeTurnRef = useRef<number | null>(null);
+  const showActiveTurn = useCallback((next: number | null) => {
+    if (activeTurnRef.current === next) return;
+    activeTurnRef.current = next;
+    setActiveTurnIndex(next);
+  }, []);
 
   // refreshKey counter for retry — changing it re-triggers the effect
   const [refreshKey, setRefreshKey] = useState(0);
@@ -229,7 +228,7 @@ export function TranscriptionSyncWorkspace({
     setTranscript([]);
     setSessionAssessment(null);
     setLoadedSession(null);
-    setActiveTurnIndex(null);
+    showActiveTurn(null);
 
     api
       .getSession(sessionId)
@@ -256,7 +255,7 @@ export function TranscriptionSyncWorkspace({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [showActiveTurn]);
 
   // If the sessions prop changes (candidate reload) and the selected session
   // is no longer completable, fall back to the first available one so the
@@ -277,11 +276,11 @@ export function TranscriptionSyncWorkspace({
       setTranscript([]);
       setTranscriptError(null);
       setPermissionDenied(false);
-      setActiveTurnIndex(null);
+      showActiveTurn(null);
       return;
     }
     return loadTranscript(selectedSessionId);
-  }, [selectedSessionId, refreshKey, loadTranscript]);
+  }, [selectedSessionId, refreshKey, loadTranscript, showActiveTurn]);
 
   /* ── R1 recording: THIS session's attempt, from the rounds list ─── */
 
@@ -344,6 +343,10 @@ export function TranscriptionSyncWorkspace({
             start_offset_sec: r1Summary ? turnMediaSec(turn.started_at_ms, r1Summary) : null,
           })),
     [isR1, transcript, r1Summary],
+  );
+  const turnStarts = useMemo(
+    () => displayTranscript.map((turn) => turn.start_offset_sec),
+    [displayTranscript],
   );
 
   /* ── Phone legs (M013 S02) ─────────────────────────────────── */
@@ -427,9 +430,10 @@ export function TranscriptionSyncWorkspace({
         setActiveLegTurn(found);
         return;
       }
-      setActiveTurnIndex(findActiveTurnIndex(displayTranscript, currentTime));
+      // R1 lights a row at its start; a phone row keeps its early tolerance.
+      showActiveTurn(activeTurnAt(turnStarts, currentTime, isR1 ? 0 : PHONE_HIGHLIGHT_TOLERANCE_SEC));
     },
-    [displayTranscript, legsMode, legGroups],
+    [isR1, turnStarts, legsMode, legGroups, showActiveTurn],
   );
 
   // click-to-play contract — RecordingPlayer owns mint/wait/seek/play.
@@ -487,8 +491,10 @@ export function TranscriptionSyncWorkspace({
   }, []);
 
   // The scorecard shown is the selected session's own assessment when
-  // available; for non-admins it falls back to the candidate's latest.
-  const scorecardAssessment = sessionAssessment ?? (permissionDenied ? assessments[0] ?? null : null);
+  // available; for non-admins it falls back to the candidate's latest SCREENING
+  // (the header's rule): "Latest scorecard" is never an R1 role-play result.
+  const latestScreening = latestScreeningAssessment(assessments, sessions);
+  const scorecardAssessment = sessionAssessment ?? (permissionDenied ? latestScreening : null);
 
   const contextSession = loadedSession ?? selectedSession;
   const turnCount = transcript.length;
@@ -575,10 +581,10 @@ export function TranscriptionSyncWorkspace({
           </>,
           <ScorecardBlock
             blocked={blocked}
-            assessment={assessments[0] ?? null}
-            heading={assessments.length > 0 ? 'Latest scorecard' : undefined}
+            assessment={latestScreening}
+            heading={latestScreening ? 'Latest scorecard' : undefined}
           />,
-          assessments[0] ?? null,
+          latestScreening,
         )}
       </div>
     );

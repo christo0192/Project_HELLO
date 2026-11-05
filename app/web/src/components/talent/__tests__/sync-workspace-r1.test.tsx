@@ -4,10 +4,11 @@
  * its turns are placed on the recording from the attempt's anchor, a click seeks with the turn's own
  * time, and a turn with no time stays untimed. Phone sessions are untouched.
  */
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { Profiler } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TranscriptionSyncWorkspace } from '../TranscriptionSyncWorkspace';
-import type { Session, TranscriptLine } from '../../../types';
+import type { Assessment, Session, TranscriptLine } from '../../../types';
 import type { R1RecordingSummary, R1Round } from '../../../lib/r1-types';
 
 const mockApi = vi.hoisted(() => ({
@@ -192,7 +193,7 @@ describe('an R1 session on the Review tab', () => {
     expect(await screen.findByRole('button', { name: /Turn 1:/ })).toBeInTheDocument();
   });
 
-  it('a click on a turn mints the recording and seeks to the turn less the one-second lead-in', async () => {
+  it('a click on a turn mints the recording and seeks to the turn less the quarter-second lead-in', async () => {
     renderWorkspace();
     await loadButton();
     fireEvent.click(await screen.findByRole('button', { name: /Turn 2:/ }));
@@ -201,7 +202,7 @@ describe('an R1 session on the Review tab', () => {
     const video = document.querySelector('video') as HTMLVideoElement;
     const state = drive(video);
     fireEvent.loadedMetadata(video);
-    expect(state.sets).toEqual([124]);
+    expect(state.sets).toEqual([124.75]);
     expect(state.play).toHaveBeenCalled();
     expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
   });
@@ -215,12 +216,12 @@ describe('an R1 session on the Review tab', () => {
     const video = document.querySelector('video') as HTMLVideoElement;
     const state = drive(video);
     fireEvent.loadedMetadata(video);
-    expect(state.sets).toEqual([124]);
+    expect(state.sets).toEqual([124.75]);
     expect(mockApi.getR1Recording).toHaveBeenCalledTimes(1);
 
     state.sets.length = 0;
     fireEvent.click(screen.getByRole('button', { name: /Turn 1:/ }));
-    expect(state.sets).toEqual([4]);
+    expect(state.sets).toEqual([4.75]);
   });
 
   it('highlights the turn that is playing', async () => {
@@ -235,6 +236,182 @@ describe('an R1 session on the Review tab', () => {
     fireEvent.timeUpdate(video);
     await waitFor(() => expect(screen.getByRole('button', { name: /Turn 2:/ })).toHaveAttribute('aria-current', 'true'));
     expect(screen.getByRole('button', { name: /Turn 1:/ })).not.toHaveAttribute('aria-current');
+  });
+
+  it('does not light a turn before its start: R1 has no early tolerance', async () => {
+    renderWorkspace();
+    await loadButton();
+    fireEvent.click(screen.getByRole('button', { name: /^Load recording/ }));
+    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+    const video = document.querySelector('video') as HTMLVideoElement;
+    const state = drive(video);
+    fireEvent.loadedMetadata(video);
+    state.currentTime = 124.9;
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Turn 1:/ })).toHaveAttribute('aria-current', 'true'));
+    expect(screen.getByRole('button', { name: /Turn 2:/ })).not.toHaveAttribute('aria-current');
+    state.currentTime = 125;
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Turn 2:/ })).toHaveAttribute('aria-current', 'true'));
+  });
+
+  it('out-of-order turns, a merged acknowledgement and untimed turns: each row lights at its own start', async () => {
+    // Real-shape data: every turn has `start_offset_sec` NULL and carries `started_at_ms`, two have
+    // neither. Row 2 (the learner, index first) starts AFTER row 3, whose index was reserved at its
+    // first transcript but whose start is the earlier voice activity: the candidate's held "Okay",
+    // merged into their next question.
+    mockApi.getSession.mockResolvedValue({
+      session: R1_SESSION,
+      transcript: [
+        { speaker: 'bot', text: 'Hello there.', start_offset_sec: null, started_at_ms: START + 12_000 },
+        { speaker: 'bot', text: 'Tell me about the course.', start_offset_sec: null, started_at_ms: START + 30_000 },
+        { speaker: 'candidate', text: 'Okay What is the fee?', start_offset_sec: null, started_at_ms: START + 29_500 },
+        { speaker: 'candidate', text: 'Saved with no time.', start_offset_sec: null, started_at_ms: null },
+        { speaker: 'bot', text: 'It is nine thousand.', start_offset_sec: null, started_at_ms: START + 45_000 },
+        { speaker: 'bot', text: 'Also with no time.', start_offset_sec: null, started_at_ms: null },
+      ] satisfies TranscriptLine[],
+      assessment: null,
+    });
+    renderWorkspace();
+    await loadButton();
+    fireEvent.click(screen.getByRole('button', { name: /^Load recording/ }));
+    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+    const video = document.querySelector('video') as HTMLVideoElement;
+    const state = drive(video);
+    fireEvent.loadedMetadata(video);
+
+    const lit = () =>
+      screen
+        .queryAllByRole('button', { name: /^Turn/ })
+        .filter((b) => b.getAttribute('aria-current') === 'true')
+        .map((b) => /^Turn (\d+)/.exec(b.getAttribute('aria-label') ?? '')?.[1]);
+    const at = (t: number) => {
+      state.currentTime = t;
+      fireEvent.timeUpdate(video);
+    };
+
+    at(5);
+    await waitFor(() => expect(lit()).toEqual([]));
+    at(12);
+    await waitFor(() => expect(lit()).toEqual(['1']));
+    at(29.5);
+    await waitFor(() => expect(lit()).toEqual(['3']));
+    at(30);
+    await waitFor(() => expect(lit()).toEqual(['2']));
+    at(44.9);
+    await waitFor(() => expect(lit()).toEqual(['2']));
+    at(45);
+    await waitFor(() => expect(lit()).toEqual(['5']));
+    // The untimed rows stay unclickable and never light.
+    expect(screen.getByLabelText(/Turn 4: .*Timing data not available\./).tagName).not.toBe('BUTTON');
+    expect(screen.getByLabelText(/Turn 6: .*Timing data not available\./).tagName).not.toBe('BUTTON');
+  });
+
+  describe('driven by animation frames while playing', () => {
+    let frames: Map<number, FrameRequestCallback>;
+    const runFrame = () => {
+      const due = [...frames.values()];
+      frames.clear();
+      act(() => {
+        for (const callback of due) callback(0);
+      });
+    };
+
+    beforeEach(() => {
+      frames = new Map();
+      let id = 0;
+      vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+        id += 1;
+        frames.set(id, callback);
+        return id;
+      });
+      vi.stubGlobal('cancelAnimationFrame', (handle: number) => {
+        frames.delete(handle);
+      });
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    async function playingVideo(onCommit?: () => void) {
+      render(
+        <Profiler id="workspace" onRender={() => onCommit?.()}>
+          <TranscriptionSyncWorkspace sessions={[R1_SESSION]} assessments={[]} blocked={false} candidateId="c1" />
+        </Profiler>,
+      );
+      fireEvent.click(await loadButton());
+      await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+      const video = document.querySelector('video') as HTMLVideoElement;
+      const state = drive(video);
+      fireEvent.loadedMetadata(video);
+      state.paused = false;
+      fireEvent.play(video);
+      return { video, state };
+    }
+
+    it('the highlight moves on a frame, with no timeupdate at all', async () => {
+      const { state } = await playingVideo();
+      state.currentTime = 6;
+      runFrame();
+      expect(screen.getByRole('button', { name: /Turn 1:/ })).toHaveAttribute('aria-current', 'true');
+      state.currentTime = 125;
+      runFrame();
+      expect(screen.getByRole('button', { name: /Turn 2:/ })).toHaveAttribute('aria-current', 'true');
+      expect(screen.getByRole('button', { name: /Turn 1:/ })).not.toHaveAttribute('aria-current');
+    });
+
+    it('renders only when the active turn changes, not on every frame', async () => {
+      let commits = 0;
+      const { state } = await playingVideo(() => {
+        commits += 1;
+      });
+      state.currentTime = 6;
+      runFrame();
+      expect(screen.getByRole('button', { name: /Turn 1:/ })).toHaveAttribute('aria-current', 'true');
+      // SeekableTranscript's own announcement effect commits once more after the change; let it settle.
+      await act(async () => undefined);
+      const settled = commits;
+      for (let t = 6.016; t < 7; t += 0.016) {
+        state.currentTime = t;
+        runFrame();
+      }
+      expect(commits).toBe(settled);
+      state.currentTime = 125;
+      runFrame();
+      expect(commits).toBeGreaterThan(settled);
+    });
+
+    it('the loop stops on pause and when the workspace unmounts', async () => {
+      const { video, state } = await playingVideo();
+      expect(frames.size).toBe(1);
+      state.paused = true;
+      fireEvent.pause(video);
+      expect(frames.size).toBe(0);
+      state.paused = false;
+      fireEvent.play(video);
+      expect(frames.size).toBe(1);
+      cleanup();
+      expect(frames.size).toBe(0);
+    });
+
+    it('a session change drops the loop with its player', async () => {
+      const view = render(
+        <TranscriptionSyncWorkspace sessions={[R1_SESSION, PHONE_SESSION]} assessments={[]} blocked={false} candidateId="c1" />,
+      );
+      fireEvent.click(await loadButton());
+      await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+      const video = document.querySelector('video') as HTMLVideoElement;
+      const state = drive(video);
+      fireEvent.loadedMetadata(video);
+      state.paused = false;
+      fireEvent.play(video);
+      expect(frames.size).toBe(1);
+      mockApi.getSession.mockResolvedValue({ session: PHONE_SESSION, transcript: [], assessment: null });
+      fireEvent.change(within(view.container).getByRole('combobox'), { target: { value: 'phone-session' } });
+      await screen.findByText(/no transcript lines/i);
+      expect(frames.size).toBe(0);
+    });
   });
 
   it('a recording that is still processing: turns are timed but there is nothing to play', async () => {
@@ -365,6 +542,59 @@ describe('a person who cannot read the transcript', () => {
     renderWorkspace({ sessions: [PHONE_SESSION] });
     expect(await screen.findByText(/require admin access/i)).toBeInTheDocument();
     expect(screen.queryByText('The recording is on the Overview tab.')).not.toBeInTheDocument();
+  });
+});
+
+describe('the "Latest scorecard" fallback never shows an R1 assessment', () => {
+  // Newest first, as the API orders them: the R1 result, then the phone screen.
+  const SCORECARD: Pick<Assessment, 'summary' | 'tone' | 'role_fit' | 'raw'> = {
+    summary: 'A summary.',
+    tone: { clarity: 8, confidence: 7, professionalism: 9, sentiment: 'positive', notes: '' },
+    role_fit: { score: 8, matched_skills: [], gaps: [], red_flags: [], notes: '' },
+    raw: null,
+  };
+  const R1_ASSESSMENT: Assessment = { ...SCORECARD, id: 'a-r1', session_id: 'r1-session', overall_score: 91, recommendation: 'reject' };
+  const PHONE_ASSESSMENT: Assessment = { ...SCORECARD, id: 'a-phone', session_id: 'phone-session', overall_score: 62, recommendation: 'advance' };
+
+  beforeEach(() => {
+    mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+  });
+
+  it('a non-admin, with an R1 session selected, gets the newest PHONE scorecard', async () => {
+    renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION], assessments: [R1_ASSESSMENT, PHONE_ASSESSMENT] });
+    expect(await screen.findByText('Latest scorecard')).toBeInTheDocument();
+    expect(screen.getByText('62')).toBeInTheDocument();
+    expect(screen.queryByText('91')).not.toBeInTheDocument();
+  });
+
+  it('a non-admin whose only assessment is R1 gets no scorecard and no "Latest scorecard" heading', async () => {
+    renderWorkspace({ sessions: [R1_SESSION], assessments: [R1_ASSESSMENT] });
+    expect(await screen.findByText(/require admin access/i)).toBeInTheDocument();
+    expect(screen.queryByText('Latest scorecard')).not.toBeInTheDocument();
+    expect(screen.queryByText('91')).not.toBeInTheDocument();
+    expect(screen.getByText(/No scorecard for this session yet/)).toBeInTheDocument();
+  });
+
+  it('no completed session yet: the empty state falls back to the phone scorecard, never the R1 one', () => {
+    const open = (s: Session): Session => ({ ...s, status: 'in_progress' });
+    renderWorkspace({ sessions: [open(R1_SESSION), open(PHONE_SESSION)], assessments: [R1_ASSESSMENT, PHONE_ASSESSMENT] });
+    expect(screen.getByText('Latest scorecard')).toBeInTheDocument();
+    expect(screen.getByText('62')).toBeInTheDocument();
+    expect(screen.queryByText('91')).not.toBeInTheDocument();
+  });
+
+  it('no completed session and only an R1 assessment: no scorecard and no "Latest scorecard" heading', () => {
+    renderWorkspace({ sessions: [{ ...R1_SESSION, status: 'in_progress' }], assessments: [R1_ASSESSMENT] });
+    expect(screen.queryByText('Latest scorecard')).not.toBeInTheDocument();
+    expect(screen.queryByText('91')).not.toBeInTheDocument();
+  });
+
+  it('an admin still reads the selected R1 session\'s own scorecard: R1 stays in the picker for now', async () => {
+    mockApi.getSession.mockResolvedValue({ session: R1_SESSION, transcript: TURNS, assessment: R1_ASSESSMENT });
+    renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION], assessments: [R1_ASSESSMENT, PHONE_ASSESSMENT] });
+    expect(await screen.findByText('Scorecard for this session')).toBeInTheDocument();
+    expect(screen.getByText('91')).toBeInTheDocument();
+    expect(screen.getAllByRole('option').filter((o) => /R1 role-play/.test(o.textContent ?? ''))).toHaveLength(1);
   });
 });
 

@@ -37,24 +37,24 @@ function summary(over: Partial<R1RecordingSummary> = {}): R1RecordingSummary {
 }
 
 describe('turnMediaSec / turnOffsetSec (contract C7/C8)', () => {
-  it('pins the lead-in at one second', () => {
-    expect(R1_SEEK_LEAD_SEC).toBe(1.0);
+  it('pins the lead-in at a quarter of a second (owner decision)', () => {
+    expect(R1_SEEK_LEAD_SEC).toBe(0.25);
   });
 
-  it('places a turn at (turn - started_at_ms) seconds, and seeks one second before it', () => {
+  it('places a turn at (turn - started_at_ms) seconds, and seeks a quarter of a second before it', () => {
     expect(turnMediaSec(START + 125_000, summary())).toBe(125);
-    expect(turnOffsetSec(START + 125_000, summary())).toBe(124);
+    expect(turnOffsetSec(START + 125_000, summary())).toBe(124.75);
   });
 
   it('keeps millisecond precision', () => {
     expect(turnMediaSec(START + 12_345, summary())).toBeCloseTo(12.345, 6);
-    expect(turnOffsetSec(START + 12_345, summary())).toBeCloseTo(11.345, 6);
+    expect(turnOffsetSec(START + 12_345, summary())).toBeCloseTo(12.095, 6);
   });
 
-  it('clamps the lead-in at 0 for a turn in the first second', () => {
-    expect(turnOffsetSec(START + 400, summary())).toBe(0);
-    expect(turnOffsetSec(START + 1_000, summary())).toBe(0);
-    expect(turnOffsetSec(START + 1_001, summary())).toBeCloseTo(0.001, 6);
+  it('clamps the lead-in at 0 for a turn in the first quarter of a second', () => {
+    expect(turnOffsetSec(START + 100, summary())).toBe(0);
+    expect(turnOffsetSec(START + 250, summary())).toBe(0);
+    expect(turnOffsetSec(START + 251, summary())).toBeCloseTo(0.001, 6);
   });
 
   it('clamps a turn before the recording began to 0 (still seekable, never negative)', () => {
@@ -78,19 +78,19 @@ describe('turnMediaSec / turnOffsetSec (contract C7/C8)', () => {
   });
 
   it('accepts numeric strings (a bigint column can arrive as text) and rejects others', () => {
-    expect(turnOffsetSec(String(START + 65_000), summary({ started_at_ms: String(START) as unknown as number }))).toBe(64);
+    expect(turnOffsetSec(String(START + 65_000), summary({ started_at_ms: String(START) as unknown as number }))).toBe(64.75);
     expect(turnOffsetSec(`${START + 65_000}abc`, summary())).toBeNull();
   });
 
   it('adds timeline_offset_ms when the API publishes one (default 0)', () => {
-    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: 400 }))).toBeCloseTo(59.4, 6);
-    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: -400 }))).toBeCloseTo(58.6, 6);
-    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: null }))).toBe(59);
-    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: 'x' as unknown as number }))).toBe(59);
+    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: 400 }))).toBeCloseTo(60.15, 6);
+    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: -400 }))).toBeCloseTo(59.35, 6);
+    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: null }))).toBe(59.75);
+    expect(turnOffsetSec(START + 60_000, summary({ timeline_offset_ms: 'x' as unknown as number }))).toBe(59.75);
   });
 
   it('does not clamp a turn after the end (the browser clamps the seek)', () => {
-    expect(turnOffsetSec(START + 9_999_000, summary({ duration_ms: 60_000 }))).toBe(9_998);
+    expect(turnOffsetSec(START + 9_999_000, summary({ duration_ms: 60_000 }))).toBe(9_998.75);
   });
 });
 
@@ -225,9 +225,11 @@ describe('playbackSources', () => {
 });
 
 describe('words for time', () => {
-  it('clockText is m:ss', () => {
+  it('clockText is m:ss and rounds down, the one rule for the player clock and the transcript labels', () => {
     expect(clockText(0)).toBe('0:00');
     expect(clockText(65.4)).toBe('1:05');
+    expect(clockText(65.9)).toBe('1:05');
+    expect(clockText(59.999)).toBe('0:59');
     expect(clockText(3599)).toBe('59:59');
     expect(clockText(-3)).toBe('0:00');
   });

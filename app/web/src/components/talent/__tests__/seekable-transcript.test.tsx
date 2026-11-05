@@ -5,6 +5,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { SeekableTranscript } from '../SeekableTranscript';
+import { clockText } from '../../../lib/r1-recording';
 import type { TranscriptLine } from '../../../types';
 
 const TIMED: TranscriptLine[] = [
@@ -64,6 +65,19 @@ describe('SeekableTranscript', () => {
     expect(buttons[0]).not.toHaveAttribute('aria-current');
     expect(buttons[1]).toHaveAttribute('aria-current', 'true');
     expect(buttons[2]).not.toHaveAttribute('aria-current');
+  });
+
+  it('labels a turn by rounding down, the same rule as the player clock (clockText)', () => {
+    render(
+      <SeekableTranscript
+        transcript={[{ speaker: 'bot', text: 'Late in a second.', start_offset_sec: 65.9 }]}
+        activeTurnIndex={null}
+        onSeek={vi.fn()}
+        recordingReady={true}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /At 1:05\./ })).toHaveTextContent(clockText(65.9));
+    expect(clockText(65.9)).toBe('1:05');
   });
 
   it('marks the active turn with a tint and a leading dot, never a side stripe', () => {

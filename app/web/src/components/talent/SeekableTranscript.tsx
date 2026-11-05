@@ -19,6 +19,7 @@ import { cx } from '../design/cx';
 import { SkeletonText } from '../design/Skeleton';
 import { presentTranscriptTurn } from '../../lib/transcript-presentation';
 import { formatIstTime } from '../../lib/ist-datetime';
+import { clockText } from '../../lib/r1-recording';
 
 /** A turn's time when it cannot seek: seconds into its call, or a clock time. */
 export interface TurnTime {
@@ -60,12 +61,6 @@ const prefersReducedMotion = (): boolean =>
   typeof window.matchMedia === 'function' &&
   window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-function formatOffset(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
 function hasTiming(t: TranscriptLine): boolean {
   return t.start_offset_sec != null;
 }
@@ -74,7 +69,7 @@ function hasTiming(t: TranscriptLine): boolean {
 function displayTime(time: TurnTime | null | undefined): { text: string; spoken: string } | null {
   if (!time) return null;
   if (typeof time.sec === 'number' && Number.isFinite(time.sec)) {
-    const text = formatOffset(time.sec);
+    const text = clockText(time.sec);
     return { text, spoken: `${text} into the call` };
   }
   if (typeof time.atMs === 'number' && Number.isFinite(time.atMs)) {
@@ -202,7 +197,7 @@ export function SeekableTranscript({
                     ref={active ? activeRef : undefined}
                     onClick={() => onSeek(turn.start_offset_sec!)}
                     aria-current={active ? 'true' : undefined}
-                    aria-label={`Turn ${numberOf(index)}: ${speaker}. At ${approximateTiming ? 'about ' : ''}${formatOffset(turn.start_offset_sec!)}. Click to play from here.`}
+                    aria-label={`Turn ${numberOf(index)}: ${speaker}. At ${approximateTiming ? 'about ' : ''}${clockText(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(
                       'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors duration-150 ease-out',
                       'focus:outline-none focus:ring-2 focus:ring-[var(--c-accent)] focus:ring-inset',
@@ -233,7 +228,7 @@ export function SeekableTranscript({
                         )}
                       >
                         {approx}
-                        {formatOffset(turn.start_offset_sec!)}
+                        {clockText(turn.start_offset_sec!)}
                       </span>
                     </span>
                     <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-[var(--c-ink)]">
