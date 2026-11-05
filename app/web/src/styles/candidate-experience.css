@@ -50,7 +50,7 @@
 .candidate-check-list [data-state="active"] { border-color: var(--c-accent); }
 .candidate-check-list [data-state="passed"] em { color: var(--c-positive); font-weight: 600; }
 .candidate-check-list [data-state="failed"] em, .candidate-error { color: var(--c-negative); }
-.candidate-primary-cta { width: 100%; min-height: 52px; margin-top: 8px; border: 0; border-radius: var(--radius-control); background: var(--c-accent); color: var(--c-data-label-inside); font-weight: 600; transition: background-color 120ms ease-out, transform 120ms ease-out; }
+.candidate-primary-cta { width: 100%; min-height: 52px; margin-top: 8px; border: 1px solid transparent; border-radius: var(--radius-control); background: var(--c-accent); color: var(--c-data-label-inside); font-weight: 600; transition: background-color 120ms ease-out, transform 120ms ease-out; }
 .candidate-primary-cta:hover:not(:disabled) { background: var(--c-ink-secondary); }
 .candidate-primary-cta:active:not(:disabled) { transform: scale(.97); }
 .candidate-primary-cta:disabled { cursor: not-allowed; background: var(--c-border); color: var(--c-ink-secondary); opacity: 1; }
@@ -122,4 +122,6 @@
   .candidate-glass-card, .candidate-meter-card, .candidate-interview__controls button { background: Canvas; border: 1px solid CanvasText; }
   .candidate-aura__halo { border-color: currentColor; }
   .candidate-aura__bubble { background: Canvas; border: 1px solid currentColor; opacity: 1; }
+  /* The logo's own white plate, in every theme. */
+  .candidate-brand img, .candidate-aura__logo-plate { forced-color-adjust: none; }
 }

@@ -101,7 +101,7 @@
 /* The role-play clock (outside the phase label's live region) and the "I'm ready" button. */
 .r1-timer { margin: 0; padding: 4px 14px; border-radius: var(--radius-chip); background: var(--c-accent-light); color: var(--c-ink); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .r1-ready { display: grid; justify-items: center; gap: 4px; width: min(100%, 520px); }
-.r1-ready__button { width: 100%; min-height: 44px; padding: 0 18px; border: 0; border-radius: var(--radius-control); background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+.r1-ready__button { width: 100%; min-height: 44px; padding: 0 18px; border: 1px solid transparent; border-radius: var(--radius-control); background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
 .r1-ready__button:hover:not([aria-disabled="true"]) { background: var(--c-ink-secondary); }
 .r1-ready__button[aria-disabled="true"] { cursor: not-allowed; background: var(--c-border); color: var(--c-ink-secondary); }
 .r1-ready__button:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
@@ -118,7 +118,7 @@
 .r1-captions__list { flex: 1 1 auto; min-height: 0; margin-top: 0; padding-right: 8px; overflow-y: auto; overflow-anchor: none; overscroll-behavior: contain; }
 .r1-captions__content { display: flow-root; }
 .r1-captions__list:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
-.r1-captions__jump { position: absolute; right: 14px; bottom: 10px; min-height: 40px; padding: 0 16px; border: 0; border-radius: var(--radius-control); background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 13px; font-weight: 600; box-shadow: var(--shadow-pop); cursor: pointer; }
+.r1-captions__jump { position: absolute; right: 14px; bottom: 10px; min-height: 40px; padding: 0 16px; border: 1px solid transparent; border-radius: var(--radius-control); background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 13px; font-weight: 600; box-shadow: var(--shadow-pop); cursor: pointer; }
 .r1-captions__jump:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
 
 /* Desktop: the live view fits the window (the shell is a 100dvh column, see R1Shell `fill`).

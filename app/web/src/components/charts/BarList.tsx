@@ -123,7 +123,6 @@ export function BarList({
             <Skeleton
               className="flex-1"
               height={6}
-              radius={999}
               style={{ maxWidth: `${LOADING_WIDTHS[i % LOADING_WIDTHS.length] * 100}%` }}
             />
           </div>

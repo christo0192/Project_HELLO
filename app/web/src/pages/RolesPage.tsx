@@ -1180,7 +1180,7 @@ function RoleForm({
                         // pill fades the white label with it and drops it
                         // under 4.5:1, and the faded state here is exactly
                         // the one the operator is waiting on.
-                        className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+                        className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control border border-transparent px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
                           rephrasingIdx !== null || !q.question.trim()
                             ? 'ask-hello--idle cursor-not-allowed'
                             : ''

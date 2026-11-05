@@ -98,7 +98,7 @@ export function EChart({
   }, [themed]);
 
   return (
-    <div role="img" aria-label={ariaLabel} className={cx('w-full', className)} style={{ height }}>
+    <div role="img" aria-label={ariaLabel} className={cx('chart-paper w-full', className)} style={{ height }}>
       <div ref={containerRef} aria-hidden="true" className="h-full w-full" />
     </div>
   );

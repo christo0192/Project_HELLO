@@ -35,15 +35,21 @@ cd app/web && npm run lint && npm run test:typecheck && npm test && npm run buil
 
 The validator is intentionally offline. It checks every palette anchor at its
 approved value, computes the declared contrast pairs, refuses any alternate dark
-surface, keeps the voice hue to one pair of tokens, refuses blur, gradients, a
-fixed ground, resting shadows, entrance motion and off-scale type, and verifies
-every routed surface remains present. Its test seeds one fault per rule and
-fails if the gate does not name it, so the gate cannot pass vacuously.
+surface, keeps the voice hue to one pair of tokens and verdicts in ink, refuses
+raw colours and stock Tailwind hues, refuses blur, gradients, a fixed ground,
+resting shadows, entrance motion and radii or type off the scale in every
+stylesheet and in source, and verifies every routed surface remains present. Its
+test seeds one fault per rule and fails if the gate does not name it, so the gate
+cannot pass vacuously.
 
-CI does not run Playwright. Browser checks (axe, keyboard navigation, focus
-return, reduced motion, loading/error/empty states, narrow layouts) run from
-`app/web`: `npx --no-install playwright test --config e2e/playwright.config.ts
---project=desktop --workers=1 <spec>`.
+The Web E2E workflow (`.github/workflows/web-e2e.yml`) runs the whole Playwright
+suite, on both the desktop and the mobile project with no tolerated failures, on
+any pull request that touches `app/web`. It is path-filtered, so it is not a
+required check: read its result before merging. Browser checks (axe, keyboard
+navigation, focus return, reduced motion, loading/error/empty states, narrow
+layouts) also run locally from `app/web`: `npx --no-install playwright test
+--config e2e/playwright.config.ts --project=desktop --workers=1 <spec>`, and
+again with `--project=mobile`, because the workflow runs both.
 
 ## Release acceptance
 

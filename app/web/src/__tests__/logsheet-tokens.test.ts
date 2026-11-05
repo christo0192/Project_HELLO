@@ -377,10 +377,56 @@ describe('shell and accessibility', () => {
     const start = css.indexOf('@media (forced-colors: active)');
     expect(start).toBeGreaterThan(-1);
     const block = css.slice(start);
-    for (const selector of ['[role=\'switch\']', '[aria-current=\'page\']', '[aria-pressed=\'true\']', '[aria-selected=\'true\']', '.glass']) {
+    for (const selector of [
+      '[role=\'switch\']',
+      '[aria-current=\'page\']',
+      '[aria-current=\'true\']',
+      '[aria-pressed=\'true\']',
+      '[aria-selected=\'true\']',
+      '[role=\'option\'][data-active=\'true\']',
+      '[aria-invalid=\'true\']',
+      '.glass',
+    ]) {
       expect(block, selector).toContain(selector);
     }
     expect(block).toMatch(/Highlight/);
+    expect(read('src/components/design/Combobox.tsx')).toContain('data-active=');
+  });
+
+  it('leaves a chart, its legend key and every logo plate on their own ground', () => {
+    // The colours inside a canvas are not forced, so a dark theme would put carbon
+    // ink on black. forced-color-adjust inherits, which keeps a tooltip on paper too.
+    const css = stripCssComments(indexCss);
+    const block = css.slice(css.indexOf('@media (forced-colors: active)'));
+    const paper = /\.chart-paper,\s*\[data-series-key\] \{([^}]*)\}/.exec(block);
+    expect(paper).not.toBeNull();
+    expect(paper![1]).toMatch(/forced-color-adjust: none/);
+    expect(paper![1]).toMatch(/background-color: var\(--paper\)/);
+    expect(block).toMatch(/\.bg-plate \{\s*forced-color-adjust: none/);
+    expect(read('src/components/charts/EChart.tsx')).toContain('chart-paper');
+    expect(read('src/components/charts/LineChart.tsx')).toContain('data-series-key');
+    expect(stripCssComments(read('src/styles/candidate-experience.css'))).toMatch(
+      /@media \(forced-colors: active\) \{[^@]*\.candidate-brand img, \.candidate-aura__logo-plate \{ forced-color-adjust: none; \}/,
+    );
+  });
+
+  it('gives every filled button a transparent border, the edge forced colours can paint', () => {
+    for (const rel of [
+      'src/components/roles/AskHelloButton.tsx',
+      'src/components/mission-control/MetricAskHello.tsx',
+      'src/pages/RolesPage.tsx',
+    ]) {
+      expect(read(rel), rel).toMatch(/`ask-hello [^`]*border border-transparent/);
+    }
+    for (const [rel, selector] of [
+      ['src/styles/candidate-experience.css', '.candidate-primary-cta'],
+      ['src/styles/candidate-r1.css', '.r1-ready__button'],
+      ['src/styles/candidate-r1.css', '.r1-captions__jump'],
+    ]) {
+      const rule = new RegExp(`^${selector.replace('.', '\\.')} \\{([^}]*)\\}`, 'm').exec(read(rel));
+      expect(rule, selector).not.toBeNull();
+      expect(rule![1], selector).toContain('border: 1px solid transparent');
+    }
   });
 
   it('hands a selection\'s colours to its children, which keep their own otherwise', () => {

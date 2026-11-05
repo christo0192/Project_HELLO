@@ -126,7 +126,7 @@ No label is uppercase, on any surface, including the exported report. The only u
 
 - **The sheet:** one opaque page on the desk, inset 8px from the window, with a 1px `--rule-2` edge, radius 8, no shadow (`.sheet`).
 - **Panels:** `GlassPanel` and `.glass` are printed boxes on the sheet: paper, a 1px `--rule-2` edge, radius 4. `level="sunken"` is a shaded `--field` with no edge. Boxes never nest.
-- **Shadows** exist on floating layers only: dialogs, drawers, menus, the combobox list, chart tooltips (`--shadow-pop`, `.glass-modal`).
+- **Shadows** exist on floating layers only: dialogs, drawers, menus, the combobox list, chart tooltips, the skip link and the captions' jump button (`--shadow-pop`, `.glass-modal`). A zero-blur ring or inset line is a printed edge, not a shadow.
 - **Radii:** sheet 8, boxes and controls 4, chips 3, evidence boxes and highlights 2. Dots and toggles stay round. No arbitrary `rounded-[…]`.
 - **Edges are real borders**, not inset shadows, because Windows contrast themes keep borders and drop shadows. The one exception is the rule under a tab row: the row scrolls sideways, so a tab overlapping a border by 1px would reserve a vertical scrollbar. That rule is an inset line, and the forced-colours block gives the row a border.
 - **Spacing:** 4px base; sheet padding 24; control height 36, or 28 for small controls.
@@ -135,8 +135,9 @@ No label is uppercase, on any surface, including the exported report. The only u
 
 - A 232px sidebar on the desk, sticky on desktop: the IK logo on its own white plate (never inverted), the HELLO wordmark, a scope line, the grouped nav, and the signed-in user with sign-out at the foot.
 - The active nav item is a paper tab with a 3:1 `--control` edge, shown statically.
-- A skip link to `#main-content`. A 2px ink focus ring on every control. A forced-colours rule in `index.css` for every state drawn with a fill.
-- Under forced colours a selection is `Highlight` with `HighlightText` on everything inside it, a filled button keeps an edge through its transparent border, and a data fill (`.data-fill`: bars, meters, legend swatches) is `CanvasText`.
+- A skip link to `#main-content`. A 2px ink focus ring on every control; a ring on an ink fill takes a paper offset or goes inset, and a scroller leaves it room. A forced-colours rule in `index.css` for every state drawn with a fill or a shadow.
+- Under forced colours a selection, including the transcript turn being played, is `Highlight` with `HighlightText` on everything inside it. The option the arrow keys are on is a `Highlight` outline, a filled button keeps an edge through its transparent border, and a data fill (`.data-fill`: bars, meters, legend swatches) is `CanvasText`.
+- A canvas keeps its author colours in every theme, so a chart and its legend key stay on paper (`.chart-paper`, `[data-series-key]`) and the logo stays on its white plate. Without that, a dark contrast theme puts carbon ink on black.
 - The page is keyed on the path, so a read still in flight cannot land on the next record.
 - The calling state is not in the shell yet. Its only read, `GET /api/phone/health`, is limited to interviewers and above, so a viewer would get a 403 on every route. It needs a read that is safe for every role.
 

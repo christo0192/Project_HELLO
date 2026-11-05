@@ -387,7 +387,7 @@ export function DashboardPage() {
             figures ? (
               <CompletionMeta completionPct={figures.completionPct} />
             ) : listLoading ? (
-              <Skeleton width="6.5rem" height={22} radius={999} className="align-middle" />
+              <Skeleton width="6.5rem" height={22} className="align-middle" />
             ) : undefined
           }
           // Each stage is a link to exactly those candidates.

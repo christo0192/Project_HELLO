@@ -537,6 +537,8 @@ function ComboboxRow({
       role="option"
       aria-selected={selected}
       aria-disabled={option.disabled || undefined}
+      // The hook for the forced-colours rule, which drops the ring below.
+      data-active={(active && !option.disabled) || undefined}
       // Keep focus in the search field: a mousedown would otherwise blur it
       // and close the list before the click lands.
       onMouseDown={(e) => e.preventDefault()}

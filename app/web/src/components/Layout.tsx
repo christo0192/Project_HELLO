@@ -238,7 +238,10 @@ export function Layout() {
           </button>
         </div>
 
-        <nav className="flex-1 overflow-y-auto" aria-label="Main navigation">
+        {/* A scroller clips at its padding box, and a link's focus ring reaches
+            4px past the link. `-mx-1 px-1` keeps the links where they were and
+            moves the clip 4px out, so the ring keeps its sides. */}
+        <nav className="-mx-1 flex-1 overflow-y-auto px-1 py-1" aria-label="Main navigation">
           <NavGroup label="Workspace">
             <NavLinkItem
               to="/dashboard"

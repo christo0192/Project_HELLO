@@ -241,7 +241,7 @@ export function MetricAskHello({ idPrefix, draft, onApply, resetKey = 0 }: Metri
           data-ask-hello=""
           // The Ask Hello pill, verbatim — NO `opacity-*` anywhere in this
           // component (ask-hello-contrast.test.ts reads this class list).
-          className={`ask-hello relative inline-flex min-h-11 shrink-0 items-center gap-2 overflow-hidden rounded-control px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+          className={`ask-hello relative inline-flex min-h-11 shrink-0 items-center gap-2 overflow-hidden rounded-control border border-transparent px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
             drafting ? 'cursor-progress' : !nameReady ? 'ask-hello--idle cursor-not-allowed' : ''
           }`}
         >

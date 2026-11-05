@@ -13,11 +13,16 @@
  *
  *   contrast             every declared pair, computed from the tokens
  *   one voice            the orange lives in one pair of tokens, in one file
- *   surfaces             no blur, gradient or fixed ground; shadows float
- *   radii                sheet 8, box and control 4, chip 3, evidence 2
- *   motion               no reveal, count-up or motion library; overlays kept
+ *   raw colour           no hex, rgb or hsl outside the tokens; no stock Tailwind hue
+ *   verdicts             a verdict stays in ink: no crimson, no voice
+ *   surfaces             no blur, gradient or fixed ground; shadows float, in the
+ *                        stylesheets and in source
+ *   radii                sheet 8, box and control 4, chip 3, evidence 2, everywhere
+ *   motion               no entrance, reveal, count-up or motion library, in any
+ *                        stylesheet or in source; overlays kept
  *   shell                skip link, forced-colours rule, 2px ink focus ring
- *   type                 width axis, scale, weights, mono allow-list, no tracking
+ *   type                 width axis, scale, weights, mono allow-list, no tracking,
+ *                        no uppercase, in the stylesheets and in source
  */
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -92,6 +97,37 @@ export const EXPECTED_ROUTES = [
 export const MONO_ALLOWED = ['src/components/talent/SeekableTranscript.tsx'];
 /** A hard-stop gradient is the only way to paint a WebKit range fill. */
 export const GRADIENT_ALLOWED = ['src/components/design/Slider.tsx'];
+/** Google's logo is Google's colours; an exported report cannot read the app's tokens. */
+export const RAW_COLOUR_ALLOWED = ['src/pages/LoginPage.tsx', 'src/lib/candidate-report/reportStyles.ts'];
+/** The floating layers: the only selectors that may carry a shadow, per stylesheet. */
+export const SHADOW_ALLOWED = {
+  'src/index.css': ['.glass-modal'],
+  'src/styles/candidate-r1.css': ['.r1-captions__jump'],
+};
+/** The floating layers that take `shadow-pop` as a utility: the drawer, the list, the skip link. */
+export const SHADOW_POP_ALLOWED = [
+  'src/components/Layout.tsx',
+  'src/components/design/Combobox.tsx',
+  'src/components/navigation/SkipLink.tsx',
+];
+/** A swatch's zero-blur ring, which needs a value from JS. */
+export const INLINE_SHADOW_ALLOWED = ['src/components/talent/PipelineBar.tsx'];
+/** The animations that may exist: a loading pulse and the overlays. */
+export const KEYFRAMES_ALLOWED = ['skeleton-pulse', 'slide-over-in', 'dialog-in', 'combobox-in'];
+/** Where an AI verdict about a candidate is drawn. */
+export const VERDICT_FILES = [
+  'src/components/session/ScoreVerdict.tsx',
+  'src/components/session/scorecard-read.ts',
+  'src/components/talent/HeaderScore.tsx',
+  'src/components/talent/CandidateScorecard.tsx',
+  'src/components/Scorecard.tsx',
+];
+export const TYPE_SCALE_PX = [12, 13, 14, 16, 20, 24, 30];
+export const SKELETON_RADII = [2, 3, 4, 8];
+/** Tailwind's stock scales that index.css has no token for. */
+const STOCK_HUES = 'orange|yellow|lime|green|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose|slate|zinc|neutral|stone';
+/** Stock scales tailwind.config.js points at the tokens, so legacy markup re-skins. */
+const REPOINTED_SCALES = ['gray: neutralScale', 'emerald: accentScale', 'amber: accentScale', 'red: dangerScale'];
 
 const stripCss = (css) => css.replace(/\/\*[\s\S]*?\*\//g, '');
 const stripJs = (code) =>
@@ -108,6 +144,25 @@ function luminance(hex) {
 export function contrast(a, b) {
   const [x, y] = [luminance(a), luminance(b)];
   return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+
+/**
+ * Every shadow utility in `code` that would rest on the page. A zero-blur ring or
+ * inset line is a printed edge, not an elevation, and `shadow-none` is nothing.
+ */
+function restingShadows(code, floating) {
+  const printed = /^shadow-\[(?:inset_)?-?[\d.]+(?:px)?_-?[\d.]+(?:px)?_0(?:px)?_[^\]]+\]$/;
+  const bare = /['"`][^'"`\n]*(?<![\w-])shadow(?![\w-])[^'"`\n]*['"`]/.test(code) ? ['shadow'] : [];
+  return [...bare, ...[...code.matchAll(/(?<![\w-])shadow-[^\s'"`]+/g)].map(([utility]) => utility)]
+    .filter((utility) => utility !== 'shadow-none' && !printed.test(utility))
+    .filter((utility) => !(floating && utility === 'shadow-pop'));
+}
+
+/** A font-size in px, or NaN when it is not a px or rem length. */
+function fontPx(value) {
+  const hit = /^([\d.]+)(px|rem)$/.exec(value.trim());
+  if (!hit) return NaN;
+  return hit[2] === 'rem' ? Number(hit[1]) * 16 : Number(hit[1]);
 }
 
 /** A token's literal value in the stylesheet, lower-cased, or null. */
@@ -171,6 +226,25 @@ export function checkDesignSystem({ css, stylesheets, app, tailwind, main, packa
   if (restated.length) errors.push(`the voice hue is restated in ${restated.join(', ')}`);
   if (/voice/.test(stripJs(button))) errors.push('Button.tsx uses the voice hue, which is never a button');
 
+  // ── Raw colour ────────────────────────────────────────────────────────
+  const rawInSource = offenders(/#[0-9a-fA-F]{3,8}\b|\b(?:rgb|hsl)a?\(/, RAW_COLOUR_ALLOWED);
+  if (rawInSource.length) errors.push(`raw colours in ${rawInSource.join(', ')}`);
+  for (const [rel, text] of Object.entries(stylesheets)) {
+    if (rel !== 'src/index.css' && /#[0-9a-fA-F]{3,8}\b/.test(stripCss(text))) errors.push(`raw colours in ${rel}`);
+  }
+  const stockHues = offenders(
+    new RegExp(`\\b(?:bg|text|border|ring|fill|stroke|from|to|via|divide|outline|decoration|accent|caret|placeholder|shadow)-(?:${STOCK_HUES})-\\d`),
+  );
+  if (stockHues.length) errors.push(`stock hue utilities in ${stockHues.join(', ')}`);
+  for (const scale of REPOINTED_SCALES) {
+    if (!tailwind.includes(scale)) errors.push(`tailwind.config.js no longer re-points the stock scale ${scale.split(':')[0]}`);
+  }
+
+  // ── Verdicts stay in ink ──────────────────────────────────────────────
+  const hued = /\b(?:bg|text|border|ring|fill|stroke|outline|decoration)-(?:error|danger|red-\d|voice|wash)|var\(--(?:danger|error|voice|wash)|tone:\s*'danger'/;
+  const verdicts = VERDICT_FILES.filter((rel) => hued.test(stripJs(sources[rel] ?? '')));
+  if (verdicts.length) errors.push(`a verdict takes a hue in ${verdicts.join(', ')}`);
+
   // ── Surfaces ──────────────────────────────────────────────────────────
   for (const [rel, text] of Object.entries(stylesheets)) {
     const plain = stripCss(text);
@@ -182,10 +256,22 @@ export function checkDesignSystem({ css, stylesheets, app, tailwind, main, packa
   if (blurred.length) errors.push(`blur or gradient utilities in ${blurred.join(', ')}`);
   const gradients = offenders(/(?:radial|linear|conic)-gradient\(/, GRADIENT_ALLOWED);
   if (gradients.length) errors.push(`gradients in ${gradients.join(', ')}`);
-  const shadowed = [...plainCss.matchAll(/([^{}]+)\{[^{}]*box-shadow:[^{}]*\}/g)].map((m) => m[1].trim());
-  if (shadowed.join() !== '.glass-modal') {
-    errors.push(`only the modal material may carry a shadow in index.css, found: ${shadowed.join(', ') || 'none'}`);
+  for (const [rel, text] of Object.entries(stylesheets)) {
+    const shadowed = [...stripCss(text).matchAll(/([^{}]+)\{[^{}]*box-shadow:(?!\s*none)[^{}]*\}/g)].map((m) => m[1].trim());
+    const allowed = SHADOW_ALLOWED[rel] ?? [];
+    if (shadowed.join() !== allowed.join()) {
+      errors.push(`only floating layers may carry a shadow in ${rel}, found: ${shadowed.join(', ') || 'none'}`);
+    }
+    if (/drop-shadow\(/.test(stripCss(text))) errors.push(`${rel} uses a drop shadow`);
   }
+  for (const [rel, text] of code) {
+    const resting = restingShadows(text, SHADOW_POP_ALLOWED.includes(rel));
+    if (resting.length) errors.push(`resting shadow utilities in ${rel}: ${[...new Set(resting)].join(', ')}`);
+  }
+  const dropped = offenders(/\bdrop-shadow\b/);
+  if (dropped.length) errors.push(`resting shadow utilities in ${dropped.join(', ')}`);
+  const inlineShadows = offenders(/\bboxShadow\s*:/, INLINE_SHADOW_ALLOWED);
+  if (inlineShadows.length) errors.push(`inline shadows in ${inlineShadows.join(', ')}`);
 
   // ── Radii ─────────────────────────────────────────────────────────────
   for (const [name, value] of Object.entries(RADII)) {
@@ -193,12 +279,33 @@ export function checkDesignSystem({ css, stylesheets, app, tailwind, main, packa
   }
   const arbitraryRadii = offenders(/rounded-\[\d/);
   if (arbitraryRadii.length) errors.push(`arbitrary radii in ${arbitraryRadii.join(', ')}`);
+  for (const [rel, text] of Object.entries(stylesheets)) {
+    const off = [...stripCss(text).matchAll(/border(?:-[a-z]+)*-radius:\s*([^;}]+)/g)]
+      .map((m) => m[1].trim())
+      .filter((value) => !/^var\(--radius-(?:sheet|card|control|chip|evidence)\)$/.test(value) && !['50%', '0'].includes(value));
+    if (off.length) errors.push(`${rel} has radii off the scale: ${[...new Set(off)].join(', ')}`);
+  }
+  const roundSkeletons = code
+    .filter(([, text]) => [...text.matchAll(/\bradius=\{(\d+)\}/g)].some((m) => !SKELETON_RADII.includes(Number(m[1]))))
+    .map(([rel]) => rel);
+  if (roundSkeletons.length) errors.push(`radii off the scale in ${roundSkeletons.join(', ')}`);
 
   // ── Motion ────────────────────────────────────────────────────────────
   const reveals = offenders(
     /RevealGroup|RevealItem|PageTransition\b(?!Event)|RollingNumber|useCountUp|fade-up|rows-reveal|glass-interactive|ChartReveal|layoutId/,
   );
   if (reveals.length) errors.push(`entrance, reveal or count-up motion in ${reveals.join(', ')}`);
+  const animated = offenders(/\banimate-(?!spin\b|ping\b|none\b)[a-z]/);
+  if (animated.length) errors.push(`entrance motion utilities in ${animated.join(', ')}`);
+  for (const [rel, text] of Object.entries(stylesheets)) {
+    const plain = stripCss(text);
+    const allowed = rel === 'src/index.css' ? KEYFRAMES_ALLOWED : [];
+    const off = [
+      ...[...plain.matchAll(/@keyframes\s+([\w-]+)/g)].map((m) => m[1]),
+      ...[...plain.matchAll(/\banimation(?:-name)?:\s*([\w-]+)/g)].map((m) => m[1]),
+    ].filter((name) => name !== 'none' && !allowed.includes(name));
+    if (off.length) errors.push(`${rel} declares entrance motion: ${[...new Set(off)].join(', ')}`);
+  }
   const motionUsers = offenders(/from ['"]motion/);
   if (motionUsers.length) errors.push(`the motion library is imported by ${motionUsers.join(', ')}`);
   if (/"motion":/.test(packageJson)) errors.push('package.json still depends on motion');
@@ -238,13 +345,29 @@ export function checkDesignSystem({ css, stylesheets, app, tailwind, main, packa
     const offWeights = weights.filter((weight) => ![400, 500, 600].includes(weight));
     if (offWeights.length) errors.push(`${rel} uses weights ${[...new Set(offWeights)].join(', ')}`);
     if (/text-transform:\s*uppercase/.test(plain)) errors.push(`${rel} uppercases text`);
+    const offSizes = [...plain.matchAll(/font-size:\s*([^;}]+)/g)]
+      .map((m) => m[1].trim())
+      .filter((value) => value !== 'inherit' && !TYPE_SCALE_PX.includes(fontPx(value)));
+    if (offSizes.length) errors.push(`${rel} has sizes off the type scale: ${[...new Set(offSizes)].join(', ')}`);
   }
   const offScale = offenders(/\btext-\[\d/);
   if (offScale.length) errors.push(`arbitrary text sizes in ${offScale.join(', ')}`);
+  const oversized = code
+    .filter(
+      ([, text]) =>
+        /\btext-[4-9]xl\b/.test(text) ||
+        [...text.matchAll(/\bfontSize:\s*(\d+)/g)].some((m) => !TYPE_SCALE_PX.includes(Number(m[1]))),
+    )
+    .map(([rel]) => rel);
+  if (oversized.length) errors.push(`sizes off the type scale in ${oversized.join(', ')}`);
   const heavy = offenders(/\bfont-(?:bold|extrabold|black|light|thin)\b/);
   if (heavy.length) errors.push(`weights off the scale in ${heavy.join(', ')}`);
   const tracked = offenders(/tracking-tight|tracking-\[-/);
   if (tracked.length) errors.push(`negative tracking below 24px in ${tracked.join(', ')}`);
+  const open = offenders(/\btracking-(?:wide|wider|widest|\[\.|\[\d)/);
+  if (open.length) errors.push(`open tracking in ${open.join(', ')}`);
+  const shouting = offenders(/(?<![\w-])uppercase(?![\w-])/);
+  if (shouting.length) errors.push(`uppercase utilities in ${shouting.join(', ')}`);
   const mono = offenders(/\bfont-mono\b/, MONO_ALLOWED);
   if (mono.length) errors.push(`Plex Mono outside a recording position in ${mono.join(', ')}`);
 

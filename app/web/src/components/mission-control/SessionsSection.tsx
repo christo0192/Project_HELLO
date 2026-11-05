@@ -264,7 +264,7 @@ export function SessionsSection() {
               </Table>
               <Pagination state={paged} noun="sessions" />
               {sessions.length > bounded.length && (
-                <p className="mt-2 text-[13px] text-ink-tertiary">
+                <p className="mt-2 text-label text-ink-tertiary">
                   This table and the override list hold the {bounded.length} most recently updated.
                   Older sessions cannot be overridden from here.
                 </p>

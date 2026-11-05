@@ -376,8 +376,9 @@
     border: 1px solid CanvasText;
   }
 
-  /* Selection. `aria-current` is the nav's paper tab; `aria-pressed` and
-     `aria-selected` are the ink fills of segments and tabs.
+  /* Selection. `aria-current` is the nav's paper tab (`page`) and the transcript
+     turn being played (`true`); `aria-pressed` and `aria-selected` are the ink
+     fills of segments and tabs.
 
      `forced-color-adjust: none` is needed: forced text is drawn on a `Canvas`
      backplate, which would put `HighlightText` in a white box on the fill. It
@@ -385,6 +386,7 @@
      hands them the selection's instead: a name in carbon ink measured 1.16:1 on
      `Highlight`, and a status badge kept its paper fill. */
   [aria-current='page'],
+  [aria-current='true'],
   [aria-pressed='true'],
   [aria-selected='true'] {
     forced-color-adjust: none;
@@ -393,11 +395,46 @@
     border-color: Highlight;
   }
   [aria-current='page'] *,
+  [aria-current='true'] *,
   [aria-pressed='true'] *,
   [aria-selected='true'] * {
     background-color: transparent !important;
     color: HighlightText !important;
     border-color: HighlightText !important;
+  }
+  /* The rule above would clear the turn's "playing" dot along with the rest. */
+  [aria-current='true'] [data-active-turn-marker] {
+    background-color: HighlightText !important;
+  }
+
+  /* The option the arrow keys are on. Focus stays in the search field, so this
+     is the only cue in the list, and its ring is a shadow. An outline survives. */
+  [role='option'][data-active='true'] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  [role='option'][data-active='true'][aria-selected='true'] {
+    outline-color: HighlightText;
+  }
+
+  /* An invalid field's red ring is a shadow too. */
+  [aria-invalid='true'] {
+    outline: 2px solid CanvasText;
+    outline-offset: -2px;
+  }
+
+  /* A canvas keeps its author colours whatever the theme: on the black `Canvas`
+     of a dark contrast theme, a series in carbon ink measured 1.2:1. So a chart
+     and its legend key keep the paper they were drawn for. */
+  .chart-paper,
+  [data-series-key] {
+    forced-color-adjust: none;
+    background-color: var(--paper);
+  }
+
+  /* The logo's own white plate, in every theme. */
+  .bg-plate {
+    forced-color-adjust: none;
   }
 
   /* The tab row's rule is an inset line, which forcing drops. */

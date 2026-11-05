@@ -16,14 +16,15 @@ import { cx } from '../design/cx';
 import type { StatusTone } from '../design';
 import { finiteNumber, recommendationMeta } from './scorecard-read';
 
-/* Same token pairs as `StatusBadge`, one step larger: this chip sits beside a
-   30px figure and is the verdict, not a row annotation. */
+/* The token pairs of `StatusBadge`, one step larger: this chip sits beside a
+   30px figure and is the verdict, not a row annotation. The exception is
+   `danger`: a verdict stays in ink, so even that tone has no crimson here. */
 export const PILL_TONE: Record<StatusTone, string> = {
   neutral: 'bg-surface-secondary text-ink-secondary',
   info: 'bg-info-soft text-ink-secondary',
   success: 'bg-success-soft text-success-text',
   warning: 'bg-warning-soft text-warning-text',
-  danger: 'bg-error-soft text-error-text',
+  danger: 'bg-surface-secondary text-ink',
 };
 
 export const PILL_DOT: Record<StatusTone, string> = {
@@ -31,7 +32,7 @@ export const PILL_DOT: Record<StatusTone, string> = {
   info: 'bg-info',
   success: 'bg-success',
   warning: 'bg-warning',
-  danger: 'bg-error',
+  danger: 'bg-ink',
 };
 
 export interface ScoreVerdictProps {

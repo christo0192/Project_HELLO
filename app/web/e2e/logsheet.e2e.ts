@@ -1,14 +1,15 @@
 /**
- * Logsheet rendering checks that jsdom cannot make: real layout boxes and
- * forced colours. Both defects below were invisible to the unit suite and to
- * the screenshot run, because Playwright hides scrollbars and captures with the
- * default colour scheme.
+ * Logsheet rendering checks that jsdom cannot make: real layout boxes, focus
+ * rings and forced colours. The defects below were invisible to the unit suite
+ * and to the screenshot run, because Playwright hides scrollbars, captures with
+ * the default colour scheme and never presses Tab.
  *
  * Selectors are roles and accessible names where the element has one, as in
  * fixtures/flows.ts; a pressed chip and a bar segment use their data hooks.
  */
 
-import type { Locator } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
+import { SEEK_CANDIDATE_ID, SEEK_NORMAL_SESSION_ID } from './fixtures/data';
 import { KEY_STATES, openRoute } from './fixtures/flows';
 import { expect, test } from './fixtures/harness';
 import { ROUTES } from './fixtures/routes';
@@ -38,6 +39,25 @@ const ratio = (a: string, b: string): number => {
   const [x, y] = [luminance(parseRgb(a)), luminance(parseRgb(b))];
   return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
 };
+
+/** The page's `Canvas`: the body is the one fill forcing always replaces. */
+const canvasOf = (page: Page): Promise<string> =>
+  page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+
+const fillOf = (subject: Locator): Promise<string> =>
+  subject.evaluate((el) => getComputedStyle(el).backgroundColor);
+
+/** A token's colour with nothing forcing it, as a canvas draws it. */
+const tokenColour = (page: Page, name: string): Promise<string> =>
+  page.evaluate((token) => {
+    const probe = document.createElement('span');
+    probe.style.forcedColorAdjust = 'none';
+    probe.style.color = `var(${token})`;
+    document.body.append(probe);
+    const colour = getComputedStyle(probe).color;
+    probe.remove();
+    return colour;
+  }, name);
 
 interface Ink {
   ink: string;
@@ -106,6 +126,56 @@ test.describe('tab rows', () => {
   }
 });
 
+test.describe('focus', () => {
+  test('every nav link keeps its whole ring inside the scrolling nav', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openRoute(app, routeNamed('dashboard'));
+    const links = await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link').all();
+    expect(links.length).toBeGreaterThan(0);
+    await page.keyboard.press('Tab'); // the skip link
+    for (const link of links) {
+      await page.keyboard.press('Tab');
+      await expect(link).toBeFocused();
+      const room = await link.evaluate((el) => {
+        // The nav is the scroller, so it clips at its own box. It has no border.
+        const clip = el.closest('nav')!.getBoundingClientRect();
+        const box = el.getBoundingClientRect();
+        const spreads = [...getComputedStyle(el).boxShadow.matchAll(/(\d+)px(?:,|$)/g)].map((m) => Number(m[1]));
+        const reach = Math.max(...spreads);
+        return {
+          reach,
+          left: box.left - reach - clip.left,
+          right: clip.right - box.right - reach,
+          top: box.top - reach - clip.top,
+          bottom: clip.bottom - box.bottom - reach,
+        };
+      });
+      expect(room.reach, 'the ring').toBeGreaterThanOrEqual(2);
+      for (const side of ['left', 'right', 'top', 'bottom'] as const) {
+        expect(room[side], `room on the ${side}`).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  test('a selected filter chip shows a ring against its own ink fill', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates-filtered'));
+    const chip = page.getByLabel('Filter by status').locator('[aria-pressed="true"]').first();
+    await chip.focus();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    await expect(chip).toBeFocused();
+    const { fill, shadow } = await chip.evaluate((el) => ({
+      fill: getComputedStyle(el).backgroundColor,
+      shadow: getComputedStyle(el).boxShadow,
+    }));
+    const rings = [...shadow.matchAll(/(rgba?\([^)]*\)) 0px 0px 0px (\d+)px/g)]
+      .filter((ring) => Number(ring[2]) > 0)
+      .map((ring) => ring[1]);
+    expect(rings.length, shadow).toBeGreaterThan(0);
+    expect(Math.max(...rings.map((ring) => ratio(ring, fill))), shadow).toBeGreaterThanOrEqual(3);
+  });
+});
+
 test.describe('forced colours', () => {
   test('a selected phone chip keeps its words readable', async ({ app, page }) => {
     await KEY_STATES.find((state) => state.name === 'phone-calendar-appointment-detail')!.run(app);
@@ -140,5 +210,51 @@ test.describe('forced colours', () => {
       .evaluate((el) => getComputedStyle(el).backgroundColor);
     expect(fill).not.toBe('rgba(0, 0, 0, 0)');
     expect(ratio(fill, canvas), `${fill} on ${canvas}`).toBeGreaterThanOrEqual(3);
+  });
+
+  test('the option the arrow keys are on keeps a mark when its shadow goes', async ({ app, page }) => {
+    const listbox = await KEY_STATES.find((state) => state.name === 'ashby-add-mapping-job-picker')!.run(app);
+    await page.keyboard.press('ArrowDown');
+    await page.emulateMedia({ forcedColors: 'active' });
+    const option = listbox.locator('[role="option"][data-active="true"]');
+    await expect(option).toHaveCount(1);
+    const cue = await option.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return { width: style.outlineWidth, line: style.outlineStyle, colour: style.outlineColor };
+    });
+    expect(cue.line).toBe('solid');
+    expect(cue.width).toBe('2px');
+    const canvas = await canvasOf(page);
+    expect(ratio(cue.colour, canvas), `${cue.colour} on ${canvas}`).toBeGreaterThanOrEqual(3);
+  });
+
+  test('the transcript turn being played reads as a selection, its dot still drawn', async ({ app, page }) => {
+    await app.goto(`/candidates/${SEEK_CANDIDATE_ID}`);
+    await page.getByRole('tab', { name: 'Review' }).click();
+    const panel = page.getByRole('tabpanel', { name: 'Review' });
+    await panel.getByRole('combobox').selectOption(SEEK_NORMAL_SESSION_ID);
+    const turn = panel.getByRole('group', { name: 'Call 1 of 2 · first call' }).getByRole('button', { name: /Turn 2:/ });
+    await turn.click();
+    await expect(turn).toHaveAttribute('aria-current', 'true');
+    await page.emulateMedia({ forcedColors: 'active' });
+    expectReadable(await inks(turn));
+    const [canvas, fill] = [await canvasOf(page), await fillOf(turn)];
+    expect(ratio(fill, canvas), `${fill} on ${canvas}`).toBeGreaterThanOrEqual(3);
+    const dot = await fillOf(turn.locator('[data-active-turn-marker]'));
+    expect(ratio(dot, fill), `${dot} on ${fill}`).toBeGreaterThanOrEqual(3);
+  });
+
+  test('in a dark theme a chart, its legend key and the logo keep their own ground', async ({ app, page }) => {
+    await openRoute(app, routeNamed('dashboard'));
+    await page.emulateMedia({ colorScheme: 'dark', forcedColors: 'active' });
+    const canvas = await canvasOf(page);
+    expect(ratio(canvas, 'rgb(0, 0, 0)'), `${canvas} is not a dark theme`).toBeLessThan(1.5);
+    const ink = await tokenColour(page, '--ink');
+    for (const drawn of [page.locator('.chart-paper').first(), page.locator('[data-series-key]').first()]) {
+      await expect(drawn).toBeVisible();
+      const ground = await fillOf(drawn);
+      expect(ratio(ink, ground), `${ink} on ${ground}`).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(await fillOf(page.locator('.bg-plate').first())).toBe('rgb(255, 255, 255)');
   });
 });
