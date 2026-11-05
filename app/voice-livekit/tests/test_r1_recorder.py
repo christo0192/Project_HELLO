@@ -7,8 +7,7 @@ What is proven here, and how:
   lock-step chunk to the tee, and the mixer turns it into one continuous 48 kHz mono timeline with
   wall-clock gap padding (a rejoin gap must not shift later audio behind the clock);
 * the silence inside one agent playback stays where it was, in the MP4 and the OGG alike, so the voice
-  sits where its transcript row says; with no such silence, or ``R1_RECORDER_KEEP_PAUSES=0``, every
-  write is byte for byte the stock one;
+  sits where its transcript row says; with ``R1_RECORDER_KEEP_PAUSES=0`` every write is the stock one;
 * the uploader: uniform parts cut from a growing file, one request in flight, retry with a fresh
   presigned URL, the bytes kept until a 200, the OGG checkpoint cadence, and the worker's reaction to
   every API answer (discard, stop, retry);

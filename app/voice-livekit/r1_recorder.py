@@ -1039,7 +1039,8 @@ def _build_recorder_io_class() -> type:
         from where the line ended, so the tap ends it on the last audio, as for a line that finishes
         paused, and the SDK writes the time since as trailing silence, after every sample.  That quiet
         is in the file but it is no pause in the line: only silence with audio after it counts as kept
-        (``kept_silence``).  A line with neither is byte for byte the stock write.
+        (``kept_silence``).  On a live room most lines carry that small quiet tail, so the write can
+        differ from the stock one even when no pause was kept.
 
         This tap sees a frame when it is handed over; the room's own task takes it later, and that is
         the moment the row is anchored at (``on_playback_started``).  A stall of the event loop between
