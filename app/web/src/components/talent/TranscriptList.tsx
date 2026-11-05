@@ -4,6 +4,9 @@
  * The API returns transcript turns as `{ speaker: 'bot' | 'candidate', text }`
  * — there are NO timestamps in the contract, so none are fabricated here.
  * Each turn is rendered with an explicit speaker label for AT users.
+ *
+ * The same form as Review: rows on a log sheet, the speaker in a printed column
+ * and the words beside it. Not chat bubbles: this is the record of a call.
  */
 
 import type { TranscriptLine } from '../../types';
@@ -58,34 +61,25 @@ export function TranscriptList({
     );
   } else {
     body = (
-      <ul className="space-y-3">
+      <ul className="divide-y divide-glass-ring">
         {transcript.map((line, index) => {
           const isBot = line.speaker === 'bot';
           const presented = presentTranscriptTurn(line.speaker, line.text);
           return (
-            <li
-              key={index}
-              className={cx('flex flex-col', isBot ? 'items-start' : 'items-end')}
-            >
+            <li key={index} className="grid grid-cols-[6.5rem_minmax(0,1fr)] gap-x-3 py-2.5">
               {/* Speaker label in sentence case at the meta step: the words identify
                   the speaker, and the candidate's label takes the voice ink. */}
               <span
                 className={cx(
-                  'mb-0.5 px-1 text-xs',
+                  'pt-0.5 text-xs',
                   isBot ? 'font-medium text-ink-tertiary' : 'font-semibold text-voice',
                 )}
               >
                 {presented.label}
                 {line.is_gate === true ? ' · consent' : ''}
               </span>
-              <div
-                className={cx(
-                  'max-w-[85%] whitespace-pre-wrap rounded-control px-3.5 py-2 text-sm leading-relaxed sm:max-w-[75%]',
-                  // Paper for the candidate's words, a shaded field for the
-                  // interviewer's: an ink fill means a primary action here.
-                  isBot ? 'bg-surface-secondary text-ink' : 'border border-line-strong bg-surface text-ink',
-                )}
-              >
+              {/* The candidate's words are carbon ink, the interviewer's graphite. */}
+              <div className={cx('whitespace-pre-wrap text-sm leading-relaxed', isBot ? 'text-ink-secondary' : 'text-ink')}>
                 {presented.text}
               </div>
             </li>

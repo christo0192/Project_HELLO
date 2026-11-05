@@ -199,7 +199,7 @@ export interface CandidateDisplayStatus {
  * so it is NOT the per-cycle no-answer counter of the dialing SOP.
  */
 function dialCountPhrase(dials: number): string {
-  return `Phone reached ${dials} ${dials === 1 ? 'time' : 'times'} (all cycles, incl. reconnects)`;
+  return `Phone rang ${dials} ${dials === 1 ? 'time' : 'times'} (all cycles, incl. reconnects)`;
 }
 
 /**

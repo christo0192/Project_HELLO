@@ -24,6 +24,8 @@ export interface ChartCardProps {
   footer?: ReactNode;
   /** `-1` lets a Retry inside park focus on the card (see `RetryButton`). */
   tabIndex?: number;
+  /** A section of the sheet, under one rule, instead of a box. */
+  ruled?: boolean;
 }
 
 /**
@@ -45,10 +47,12 @@ export function ChartCard({
   level = 2,
   footer,
   tabIndex,
+  ruled = false,
 }: ChartCardProps) {
   return (
     <GlassPanel
       as="section"
+      level={ruled ? 'ruled' : 'raised'}
       aria-label={title}
       tabIndex={tabIndex}
       className={cx('flex h-full flex-col', className)}

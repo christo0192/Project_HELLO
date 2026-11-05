@@ -97,7 +97,7 @@ describe('TranscriptionSyncWorkspace', () => {
         blocked={false}
       />,
     );
-    expect(screen.getByRole('combobox')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
     expect(screen.getAllByRole('option')).toHaveLength(2);
   });
 
@@ -139,6 +139,36 @@ describe('TranscriptionSyncWorkspace', () => {
     fireEvent.click(retryBtn);
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Retried!')).toBeInTheDocument();
+  });
+
+  describe('the scorecard block before it has an answer', () => {
+    const NO_SCORECARD = /No scorecard for this session yet/;
+
+    it('says it is loading while the read runs, never that there is no scorecard', async () => {
+      mockApi.getSession.mockReturnValue(new Promise(() => {}));
+      render(
+        <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={[ASSESSMENT]} blocked={false} />,
+      );
+      expect(await screen.findByText('Loading the scorecard…')).toBeInTheDocument();
+      expect(screen.queryByText(NO_SCORECARD)).not.toBeInTheDocument();
+    });
+
+    it('says it could not load when the read fails, never that there is no scorecard', async () => {
+      mockApi.getSession.mockRejectedValue({ message: 'transcript unavailable' });
+      render(
+        <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={[ASSESSMENT]} blocked={false} />,
+      );
+      expect(await screen.findByText("This scorecard couldn't load. Try again from the transcript.")).toBeInTheDocument();
+      expect(screen.queryByText(NO_SCORECARD)).not.toBeInTheDocument();
+    });
+
+    it('says there is none only once the read has answered with none', async () => {
+      render(
+        <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={NO_ASSESSMENTS} blocked={false} />,
+      );
+      expect(await screen.findByText(NO_SCORECARD)).toBeInTheDocument();
+      expect(screen.queryByText('Loading the scorecard…')).not.toBeInTheDocument();
+    });
   });
 
   it('falls back to a permission note + latest scorecard for non-admins (403)', async () => {
@@ -438,8 +468,8 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     );
     await screen.findByText(/no transcript lines/i);
     expect(mockApi.getCandidatePhoneAttempts).not.toHaveBeenCalled();
-    // A browser session keeps its own length in the picker.
-    expect(screen.getByRole('option')).toHaveTextContent('5m 0s');
+    // A browser session keeps its own length in the session line.
+    expect(document.querySelector('[data-session-text]')).toHaveTextContent('5m 0s');
   });
 
   it('shows every leg in order with its window, recorded length and truthful notes', async () => {
@@ -467,16 +497,16 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
   it('the picker shows the recorded total across the calls, never duration_sec', async () => {
     renderPhone();
     await screen.findByRole('list', { name: 'Calls in this session' });
-    const option = screen.getByRole('option');
-    expect(option).toHaveTextContent('Recorded 1m 11s across 2 calls');
-    expect(option).not.toHaveTextContent('1m 15s');
+    const line = document.querySelector('[data-session-text]');
+    expect(line).toHaveTextContent('Recorded 1m 11s across 2 calls');
+    expect(line).not.toHaveTextContent('1m 15s');
   });
 
   it('a phone session with no recorded facts shows no length rather than duration_sec', async () => {
     const bare: Session = { ...SESSION_PHONE, recorded_total_sec: null, recorded_legs: null };
     renderPhone({ session: bare });
     await screen.findByRole('list', { name: 'Calls in this session' });
-    expect(screen.getByRole('option')).not.toHaveTextContent(/1m 15s|Recorded/);
+    expect(document.querySelector('[data-session-text]')).not.toHaveTextContent(/1m 15s|Recorded/);
   });
 
   it('mints nothing on load; each leg has its own player named after the leg', async () => {
@@ -578,8 +608,8 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     expect(row).not.toHaveTextContent(/may end a few seconds|end not observed/);
     // T08b: the same consent tag as the call-attempt list.
     expect(within(row).getByText('Recorded before consent')).toBeInTheDocument();
-    expect(screen.getByRole('option')).toHaveTextContent('Recorded 33s');
-    expect(screen.getByRole('option')).not.toHaveTextContent('across');
+    expect(document.querySelector('[data-session-text]')).toHaveTextContent('Recorded 33s');
+    expect(document.querySelector('[data-session-text]')).not.toHaveTextContent('across');
   });
 
   it('T08b: tags a withdrawn consent and an in-call callback request on their legs only', async () => {

@@ -158,7 +158,32 @@ describe('scoped review shell', () => {
     renderPage();
     await screen.findByText('Jane Doe');
     expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Review']);
-    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+    // Ashby's Detailed report link lands on the evidence, with the verdict above it.
+    expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('region', { name: 'Latest screening score' })).toBeInTheDocument();
+  });
+
+  describe('during an appeal', () => {
+    const blocked = {
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, decision_use_blocked_at: '2026-01-02T00:00:00.000Z' },
+    };
+
+    it('shows no score and no verdict anywhere on the page', async () => {
+      mockApi.getAshbyScopedReview.mockResolvedValue(blocked);
+      const { container } = renderPage();
+      await screen.findByText('Jane Doe');
+      await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('session-1'));
+      await screen.findByText('Welcome to the screening.');
+      expect(screen.queryByRole('region', { name: 'Latest screening score' })).toBeNull();
+      expect(container.querySelector('[data-recommendation]')).toBeNull();
+    });
+
+    it('prints that verdict mark when no appeal holds it back, so the check above can fail', async () => {
+      const { container } = renderPage();
+      await screen.findByText('Jane Doe');
+      expect(container.querySelector('[data-recommendation]')).not.toBeNull();
+    });
   });
 
   it('renders the existing Review workspace content on the Review tab', async () => {
@@ -296,6 +321,7 @@ describe('Ashby pipeline card in the scoped review Overview', () => {
       },
     });
     renderPage();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Overview' }));
     // Wait for the resolved card, not the identically-headed loading state.
     expect(await screen.findByText('Writing results back to Ashby')).toBeInTheDocument();
     expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalledWith(LINK_ID);

@@ -51,6 +51,7 @@ import { unknownLengthWords } from '../components/talent/sessionLegs';
 import { Scorecard } from '../components/Scorecard';
 import { BackIcon } from '../components/session/BackIcon';
 import { formatSessionWhen } from '../components/session/format';
+import { plainErrorText } from '../lib/api-error-copy';
 import { shortId } from '../lib/humanize';
 import { sessionModeLabel } from '../lib/session-mode';
 
@@ -231,7 +232,7 @@ export function SessionDetailPage() {
       })
       .catch((e: ApiError) => {
         if (current !== generation.current) return;
-        setError(e?.message || 'Failed to load the session.');
+        setError(`This screening couldn't load. ${plainErrorText(e?.message ?? '')}`);
       });
   }, [sessionId]);
 
@@ -269,9 +270,11 @@ export function SessionDetailPage() {
         }
       />
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
+      {/* One sheet, split by one rule: the verdict and its evidence on the left,
+          the call on the right. */}
+      <div className="grid grid-cols-1 gap-6 border-t border-line-strong lg:grid-cols-12 lg:items-start lg:gap-0">
         {/* Scorecard: the verdict first, then the evidence it rests on. */}
-        <GlassPanel className="lg:col-span-7">
+        <GlassPanel level="ruled" className="border-t-0 lg:col-span-7 lg:pr-6">
           <SectionHeader title="Scorecard" />
           <div className="mt-5">
             {assessment ? (
@@ -290,10 +293,10 @@ export function SessionDetailPage() {
           </div>
         </GlassPanel>
 
-        <div className="space-y-6 lg:col-span-5">
+        <div className="space-y-6 lg:col-span-5 lg:border-l lg:border-line-strong lg:pl-6">
           {/* Details + recording: one surface, one logical group (the call).
               The recording section brings its own hairline above it. */}
-          <GlassPanel>
+          <GlassPanel level="ruled" className="border-t-0">
             <SectionHeader title="Details" />
             <dl className="mt-2 divide-y divide-glass-ring">
               <DetailRow label="Status">
@@ -379,7 +382,7 @@ export function SessionDetailPage() {
             </div>
           </GlassPanel>
 
-          <GlassPanel>
+          <GlassPanel level="ruled">
             <SectionHeader
               title={gateOnlyTranscript ? 'Pre-interview gate transcript' : 'Transcript'}
               description={`${transcript.length} speaker turn${transcript.length === 1 ? '' : 's'}`}

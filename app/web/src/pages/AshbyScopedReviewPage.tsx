@@ -42,6 +42,7 @@ import {
   CandidateProfileCard,
   CandidateShell,
   DecisionBlockedBanner,
+  HeaderScore,
   NotesList,
   SessionsSummary,
   Tabs,
@@ -115,6 +116,10 @@ export function AshbyScopedReviewPage() {
         eyebrow="Candidate review"
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
+        // Ashby's Detailed report link lands here, so the verdict is on the first
+        // screen, in the same words as the card. Hidden while decision use is
+        // blocked, as on the main page.
+        aside={decisionBlocked ? undefined : <HeaderScore assessments={assessments} sessions={sessions} />}
         actions={
           // The scoped payload carries the same phone-progress fields as
           // GET /api/candidates/:id, through the same helper, so the words
@@ -136,6 +141,7 @@ export function AshbyScopedReviewPage() {
       <div className="mt-4">
         <Tabs
           ariaLabel="Candidate sections"
+          defaultIndex={1}
           items={[
             {
               id: 'overview',

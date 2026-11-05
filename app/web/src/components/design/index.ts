@@ -38,7 +38,7 @@ export type { SegmentedControlProps, SegmentedOption } from './SegmentedControl'
 export { Slider } from './Slider';
 export type { SliderProps } from './Slider';
 export { Pagination, usePagination, PAGE_SIZES } from './Pagination';
-export type { PaginationProps, PaginationState, PageSize } from './Pagination';
+export type { PaginationControl, PaginationProps, PaginationState, PageSize } from './Pagination';
 export { ScrollArea } from './ScrollArea';
 export type { ScrollAreaProps } from './ScrollArea';
 export { InlineNotice, EmptyPanel, ErrorPanel, LoadingPanel, RetryButton } from './Notice';

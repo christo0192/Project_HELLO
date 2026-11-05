@@ -27,6 +27,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import {
   SCORECARD_MAX_INSTRUCTION_LENGTH,
   SCORECARD_MAX_NAME_LENGTH,
@@ -195,7 +196,7 @@ export function ScorebarSection() {
       setMetrics(rows);
       return rows;
     } catch (e) {
-      setLoadError(e instanceof ApiError ? e.message : 'Failed to load scorecard metrics.');
+      setLoadError(`Scorecard metrics couldn't load. ${plainErrorText(e instanceof Error ? e.message : '')}`);
       return null;
     } finally {
       setRefreshing(false);

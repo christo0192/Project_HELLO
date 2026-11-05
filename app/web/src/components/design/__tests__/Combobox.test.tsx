@@ -13,6 +13,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { Combobox } from '../Combobox';
 import type { ComboboxOption } from '../Combobox';
 import { Dialog } from '../Dialog';
+import { pickOption } from './helpers';
 
 const OPTIONS: ComboboxOption[] = [
   { value: '0', label: 'Account Executive', description: 'Opened 2 Jul 2026' },
@@ -94,7 +95,7 @@ describe('Combobox', () => {
     expect(options).toHaveLength(1);
     expect(options[0]).toHaveTextContent('Career Coach');
     // The count is announced once typing settles (debounced), not per key.
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('1 job'));
+    await waitFor(() => expect(document.querySelector('[aria-live="polite"]')).toHaveTextContent('1 job'));
 
     await user.clear(screen.getByRole('combobox'));
     await user.keyboard('aug 2026'); // matches the description only
@@ -113,7 +114,7 @@ describe('Combobox', () => {
     // axe `aria-required-children`: no stray paragraph inside the listbox.
     expect(list).toBeEmptyDOMElement();
     expect(screen.getByText('Nothing matches “zzz”.')).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Nothing matches “zzz”.'));
+    await waitFor(() => expect(document.querySelector('[aria-live="polite"]')).toHaveTextContent('Nothing matches “zzz”.'));
   });
 
   it('a click on the list itself (not an option) keeps it open', async () => {
@@ -301,5 +302,215 @@ describe('Combobox', () => {
       <Combobox id="x" value="" onChange={() => {}} options={OPTIONS} placeholder="p" searchLabel="Search" listLabel="List" disabled />,
     );
     expect(screen.getByRole('button')).toBeDisabled();
+  });
+});
+
+describe('Combobox on a toolbar or in a short list', () => {
+  const SHORT: ComboboxOption[] = [
+    { value: 'viewer', label: 'Viewer' },
+    { value: 'interviewer', label: 'Interviewer' },
+    { value: 'admin', label: 'Admin' },
+  ];
+
+  it('takes its name from aria-label, and keeps the value in it, where no label is printed', () => {
+    render(
+      <Combobox
+        id="row-role"
+        aria-label="Role for a.person@example.com"
+        value="admin"
+        onChange={() => {}}
+        options={SHORT}
+        placeholder="Role"
+        searchLabel="Search roles"
+        listLabel="Roles"
+      />,
+    );
+    expect(screen.getByRole('button', { name: /^Role for a\.person@example\.com/ })).toHaveAccessibleName(
+      'Role for a.person@example.com Admin',
+    );
+  });
+
+  it('a short list hides the search box, and the keyboard contract still holds', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <Combobox
+        id="short"
+        aria-label="Role"
+        searchable={false}
+        value="viewer"
+        onChange={onChange}
+        options={SHORT}
+        placeholder="Role"
+        searchLabel="Roles"
+        listLabel="Roles"
+      />,
+    );
+    const button = screen.getByRole('button', { name: /^Role/ });
+    await user.click(button);
+    const field = screen.getByRole('combobox', { name: 'Roles' });
+    expect(field).toHaveFocus();
+    // Off the screen, not gone: focus and `aria-activedescendant` still live on it.
+    expect(field).toHaveClass('sr-only');
+    expect(field).toHaveAttribute('readonly');
+    await user.keyboard('{ArrowDown}{Enter}');
+    expect(onChange).toHaveBeenCalledWith('interviewer');
+    expect(button).toHaveFocus();
+  });
+
+  describe('what a native select did, on a short list', () => {
+    const THREE = [
+      { value: 'viewer', label: 'Viewer' },
+      { value: 'interviewer', label: 'Interviewer' },
+      { value: 'admin', label: 'Admin' },
+      { value: 'intern', label: 'Intern', disabled: true },
+      { value: 'inspector', label: 'Inspector' },
+    ];
+
+    function Short({ onChange, searchable = false }: { onChange: (value: string) => void; searchable?: boolean }) {
+      return (
+        <Combobox
+          id="native"
+          aria-label="Role"
+          searchable={searchable}
+          value="viewer"
+          onChange={onChange}
+          options={THREE}
+          placeholder="Role"
+          searchLabel="Roles"
+          listLabel="Roles"
+        />
+      );
+    }
+
+    it('Space picks the active option', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('{ArrowDown} ');
+      expect(onChange).toHaveBeenCalledWith('interviewer');
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    });
+
+    it('a letter moves to the next option starting with it, past a disabled one, and wraps', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('i{Enter}');
+      expect(onChange).toHaveBeenLastCalledWith('interviewer');
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('ii{Enter}');
+      expect(onChange).toHaveBeenLastCalledWith('inspector');
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('iii{Enter}');
+      expect(onChange).toHaveBeenLastCalledWith('interviewer');
+    });
+
+    it('a letter nothing starts with leaves the active option where it was', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('z{Enter}');
+      expect(onChange).toHaveBeenCalledWith('viewer');
+    });
+
+    it('with a search box, Space and letters are still typing', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(<Short onChange={onChange} searchable />);
+      await user.click(screen.getByRole('button', { name: /^Role/ }));
+      await user.keyboard('i n');
+      expect(screen.getByRole('combobox', { name: 'Roles' })).toHaveValue('i n');
+      expect(onChange).not.toHaveBeenCalled();
+    });
+  });
+
+  it('searches keywords and never prints them', async () => {
+    const user = userEvent.setup();
+    render(
+      <Combobox
+        id="kw"
+        aria-label="Candidate"
+        value=""
+        onChange={() => {}}
+        options={[
+          { value: '1', label: 'Asha', keywords: 'asha@example.com' },
+          { value: '2', label: 'Dev', keywords: 'dev@example.com' },
+        ]}
+        placeholder="Candidate"
+        searchLabel="Search"
+        listLabel="Candidates"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /^Candidate/ }));
+    expect(document.body.textContent).not.toContain('example.com');
+    await user.keyboard('dev@');
+    expect(screen.getByRole('option', { name: /Dev/ })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Asha/ })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('example.com');
+  });
+
+  it('floats over the page on a toolbar, so opening it moves nothing', async () => {
+    const user = userEvent.setup();
+    render(
+      <Combobox
+        id="float"
+        aria-label="Role"
+        floating
+        value=""
+        onChange={() => {}}
+        options={SHORT}
+        placeholder="All roles"
+        searchLabel="Search roles"
+        listLabel="Roles"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /^Role/ }));
+    const panel = screen.getByRole('listbox', { name: 'Roles' }).closest('.combobox-panel');
+    expect(panel).toHaveClass('absolute');
+    expect(panel).toHaveClass('top-full');
+  });
+
+  it('floats upward at the foot of a page', async () => {
+    const user = userEvent.setup();
+    render(
+      <Combobox
+        id="float-up"
+        aria-label="Rows"
+        floating="up"
+        value="10"
+        onChange={() => {}}
+        options={[{ value: '10', label: '10' }, { value: '25', label: '25' }]}
+        placeholder="Rows"
+        searchLabel="Rows"
+        listLabel="Rows"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /^Rows/ }));
+    expect(screen.getByRole('listbox', { name: 'Rows' }).closest('.combobox-panel')).toHaveClass('bottom-full');
+  });
+
+  it('sets the control height the rest of the form uses', () => {
+    const { rerender } = render(
+      <Combobox id="h" aria-label="Role" size="md" value="" onChange={() => {}} options={SHORT} placeholder="Role" searchLabel="s" listLabel="l" />,
+    );
+    expect(screen.getByRole('button', { name: /^Role/ })).toHaveClass('min-h-9');
+    rerender(
+      <Combobox id="h" aria-label="Role" size="sm" value="" onChange={() => {}} options={SHORT} placeholder="Role" searchLabel="s" listLabel="l" />,
+    );
+    expect(screen.getByRole('button', { name: /^Role/ })).toHaveClass('min-h-7');
+  });
+});
+
+describe('pickOption, the helper page tests drive the picker with', () => {
+  it('opens the picker named by the label and chooses by the option name', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<Harness onChange={onChange} />);
+    await pickOption(user, /Ashby job/, 'Career Coach');
+    expect(onChange).toHaveBeenCalledWith('2');
   });
 });

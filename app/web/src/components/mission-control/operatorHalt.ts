@@ -115,6 +115,18 @@ export function haltStateLine(view: HaltView): string {
 }
 
 /**
+ * The app shell's line while a halt is in force, and null when none is: the
+ * shell has no button to stand beside, so it says "halted" for every reason and
+ * leaves the "paused" nuance to Mission Control. A view that cannot describe the
+ * switch is null too, because the shell claims only a halt it read.
+ */
+export function haltShellLine(view: HaltView): string | null {
+  if (view.kind === 'paused') return `Calling halted — ${haltReasonLabel(OPERATOR_PAUSE)}`;
+  if (view.kind === 'locked') return `Calling halted — ${haltReasonLabel(view.reason)}`;
+  return null;
+}
+
+/**
  * Why a locked halt offers no button. It names where the halt IS cleared
  * without claiming the server enforces that: `/halt/clear` accepts any reason
  * that names the halt in force; only this control declines to send one.

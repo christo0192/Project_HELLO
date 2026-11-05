@@ -168,8 +168,7 @@ describe('OverviewSection', () => {
     expect(screen.getByText('Provider health')).toBeInTheDocument();
     expect(screen.getByText('Uptime / SLO')).toBeInTheDocument();
     expect(screen.getByText('Deployment status')).toBeInTheDocument();
-    expect(screen.getByText('Queue depth')).toBeInTheDocument();
-    expect(screen.getByText('Cost')).toBeInTheDocument();
+        expect(screen.getByText('Cost')).toBeInTheDocument();
     // No invented numbers: no % uptime, no SLO, no $ amounts anywhere.
     expect(screen.queryByText(/% uptime|99\.\d+%/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/\$/)).not.toBeInTheDocument();
@@ -177,7 +176,7 @@ describe('OverviewSection', () => {
     // Named once, in one line: five "Not available" pills gave five missing
     // signals the weight of five present ones.
     expect(screen.queryByText('Not available')).not.toBeInTheDocument();
-    expect(screen.getByText(/No API exposes them/)).toBeInTheDocument();
+    expect(screen.getByText(/does not estimate them/)).toBeInTheDocument();
   });
 
   it('shows the headline figures as one strip, not a card each', async () => {
@@ -236,8 +235,54 @@ describe('OverviewSection', () => {
     // did not measure (it used to print "Sessions 0").
     const sessions = figureCell('Sessions');
     expect(within(sessions).getByText('—')).toBeInTheDocument();
-    expect(within(sessions).getByText('Could not load')).toBeInTheDocument();
+    expect(within(sessions).getByText("Couldn't load")).toBeInTheDocument();
     expect(within(sessions).queryByText('0')).not.toBeInTheDocument();
+  });
+
+  describe('a source that has not answered', () => {
+    const neverAnswers = () => new Promise<never>(() => {});
+    /** The other sources are in, so anything still loading is that source's own doing. */
+    const othersIn = () =>
+      waitFor(() => expect(within(figureCell('Linked access')).getByText('1')).toBeInTheDocument(), {
+        timeout: 10_000,
+      });
+
+    it('prints no session count while the read is out', async () => {
+      apiFns.listAdminSessions.mockReturnValue(neverAnswers());
+      renderOverview();
+      await othersIn();
+      for (const label of ['Sessions', 'Active sessions']) {
+        expect(within(figureCell(label)).getByText('Loading')).toBeInTheDocument();
+        expect(within(figureCell(label)).queryByText('0')).not.toBeInTheDocument();
+      }
+      expect(screen.getByText('Sessions in the admin view, largest first.')).toBeInTheDocument();
+      expect(screen.queryByText(/^0 sessions/)).not.toBeInTheDocument();
+      expect(screen.queryByText('No sessions yet')).not.toBeInTheDocument();
+    });
+
+    it('prints no session count once the read has failed', async () => {
+      apiFns.listAdminSessions.mockRejectedValue(new missionApi.ApiError('sessions down', 500));
+      renderOverview();
+      await screen.findByText(/Session status mix: sessions down/);
+      expect(screen.getByText('Sessions in the admin view, largest first.')).toBeInTheDocument();
+      expect(screen.queryByText(/^0 sessions/)).not.toBeInTheDocument();
+    });
+
+    it('keeps the count once the read has answered', async () => {
+      renderOverview();
+      expect(await screen.findByText('3 sessions in the admin view, largest first.')).toBeInTheDocument();
+    });
+
+    it('says nothing about quotas until their read answers, while the rest fill in', async () => {
+      apiFns.listAdminQuotas.mockReturnValue(neverAnswers());
+      renderOverview();
+      await othersIn();
+      expect(within(figureCell('Sessions')).getByText('3')).toBeInTheDocument();
+      expect(within(figureCell('Quota policies enabled')).getByText('Loading')).toBeInTheDocument();
+      expect(within(figureCell('Quota policies enabled')).queryByText('0')).not.toBeInTheDocument();
+      expect(screen.queryByText('No quota policies configured')).not.toBeInTheDocument();
+      expect(screen.queryByText('Quota enforcement is off.')).not.toBeInTheDocument();
+    });
   });
 
   it('never prints a raw code beside a source label', async () => {

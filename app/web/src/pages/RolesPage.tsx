@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { MouseEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { questionTag, sectionHeading } from "../types";
@@ -154,6 +155,16 @@ export function RolesPage() {
    */
   const [writeError, setWriteError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Role | "new" | null>(null);
+  /**
+   * The open form's scorecard has edits that are not saved. Opening another agent
+   * remounts the form, so a row's Edit has to ask first, and the question is held
+   * here because the rows sit outside the form.
+   */
+  const [scorecardDirty, setScorecardDirty] = useState(false);
+  /** The agent whose Edit is waiting on that question. */
+  const [nextEdit, setNextEdit] = useState<Role | null>(null);
+  /** The Edit that was pressed, for focus: the question's own buttons go when it is answered. */
+  const nextEditTrigger = useRef<HTMLElement | null>(null);
   const [scorebarOpen, setScorebarOpen] = useState(false);
   // Focus returns HERE on close, and the caller owns it — `SlideOver` explains
   // why `document.activeElement` is not good enough.
@@ -175,7 +186,7 @@ export function RolesPage() {
     return api
       .listRoles()
       .then(setRoles)
-      .catch((e: ApiError) => setError(e.message));
+      .catch((e: ApiError) => setError(`Agents couldn't load. ${plainErrorText(e.message)}`));
   }, []);
 
   const load = useCallback(() => {
@@ -184,6 +195,27 @@ export function RolesPage() {
   }, [readRoles]);
 
   useEffect(load, [load]);
+
+  const scorecardChanged = useCallback((dirty: boolean) => {
+    setScorecardDirty(dirty);
+    // Saved, or discarded: there is nothing left to ask about.
+    if (!dirty) setNextEdit(null);
+  }, []);
+
+  /** Open an agent from its row, unless that would drop unsaved scorecard edits. */
+  const editRole = (role: Role, trigger: HTMLElement) => {
+    if (!scorecardDirty) {
+      setEditing(role);
+    } else if (editing === "new" || editing?.id !== role.id) {
+      nextEditTrigger.current = trigger;
+      setNextEdit(role);
+    }
+  };
+
+  const closeForm = () => {
+    setEditing(null);
+    scorecardChanged(false);
+  };
 
   /** The role currently being removed, so only its button says so. */
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -315,7 +347,6 @@ export function RolesPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Talent workspace"
         title="Agents"
         // NOT "the questions Gopu will ask". Each role now names its own
         // agent, and one hard-coded name in the page header contradicts every
@@ -363,11 +394,22 @@ export function RolesPage() {
         <RoleForm
           key={editing === "new" ? "new" : editing.id}
           role={editing === "new" ? null : editing}
-          onCancel={() => setEditing(null)}
+          onCancel={closeForm}
           onSaved={() => {
-            setEditing(null);
+            closeForm();
             setWriteError(null);
             load();
+          }}
+          onScorecardDirtyChange={scorecardChanged}
+          scorecardDirty={scorecardDirty}
+          nextEdit={nextEdit}
+          onKeepThisEdit={() => {
+            setNextEdit(null);
+            nextEditTrigger.current?.focus();
+          }}
+          onOpenNextEdit={(next) => {
+            setEditing(next);
+            nextEditTrigger.current?.focus();
           }}
         />
       )}
@@ -407,7 +449,7 @@ export function RolesPage() {
         // 3×2 wall of identical cards, each repeating the same pill,
         // chips and button pair, with the description cut mid-sentence. A
         // role is scanned, compared and acted on, which is a list's job.
-            <GlassPanel>
+            <GlassPanel level="ruled">
               <SectionHeader
                 id={ROLES_LIST_HEADING}
                 title="All agents"
@@ -463,7 +505,7 @@ export function RolesPage() {
                     anyDeleting={deletingId !== null}
                     reactivating={reactivatingId === role.id}
                     anyReactivating={reactivatingId !== null}
-                    onEdit={() => setEditing(role)}
+                    onEdit={(event) => editRole(role, event.currentTarget)}
                     onDelete={() => void removeRole(role)}
                     onReactivate={() => void reactivateRole(role)}
                   />
@@ -521,7 +563,7 @@ function RoleRow({
   reactivating?: boolean;
   /** Some row's reactivation is in flight; every Reactivate refuses meanwhile. */
   anyReactivating?: boolean;
-  onEdit: () => void;
+  onEdit: (event: MouseEvent<HTMLElement>) => void;
   onDelete: () => void;
   /** Inactive rows only: put the archived agent back into service. */
   onReactivate?: () => void;
@@ -692,10 +734,21 @@ function RoleForm({
   role,
   onCancel,
   onSaved,
+  scorecardDirty,
+  onScorecardDirtyChange,
+  nextEdit,
+  onKeepThisEdit,
+  onOpenNextEdit,
 }: {
   role: Role | null;
   onCancel: () => void;
   onSaved: () => void;
+  scorecardDirty: boolean;
+  onScorecardDirtyChange: (dirty: boolean) => void;
+  /** Another agent's Edit, waiting on the question below. */
+  nextEdit: Role | null;
+  onKeepThisEdit: () => void;
+  onOpenNextEdit: (next: Role) => void;
 }) {
   const [title, setTitle] = useState(role?.title ?? "");
   const [agentName, setAgentName] = useState(role?.agent_name ?? "");
@@ -723,6 +776,30 @@ function RoleForm({
   );
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  /**
+   * The scorecard panel below the form saves on its own, and Save changes, Cancel
+   * and another agent's Edit all close it. Edits there are held back behind a
+   * question, because this form used to drop them without a word.
+   */
+  const [leaving, setLeaving] = useState<null | "save" | "cancel">(null);
+  const asking = leaving !== null || nextEdit !== null;
+  const scorecardChanged = useCallback(
+    (dirty: boolean) => {
+      onScorecardDirtyChange(dirty);
+      // Save scorecard answers the question, so the question goes with it.
+      if (!dirty) setLeaving(null);
+    },
+    [onScorecardDirtyChange],
+  );
+  /**
+   * The question is beside Save, and a row's Edit is far down the page under the
+   * scorecard, so it takes focus there or it would be asked off screen.
+   */
+  const keepEditingRef = useRef<HTMLButtonElement | null>(null);
+  const saveRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (nextEdit) keepEditingRef.current?.focus();
+  }, [nextEdit]);
   /** Set after Ask Hello fills the form; cleared once the role is saved. */
   const [draftNote, setDraftNote] = useState<string | null>(null);
   /**
@@ -830,8 +907,13 @@ function RoleForm({
     setQuestions((prev) => prev.filter((_, i) => i !== idx));
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (scorecardDirty) setLeaving("save");
+    else void submit();
+  }
+
+  async function submit() {
     setFormError(null);
 
     if (!title.trim()) {
@@ -903,7 +985,7 @@ function RoleForm({
 
   return (
     <div className="space-y-6">
-    <GlassPanel padding="lg">
+    <GlassPanel level="ruled">
       <SectionHeader
         title={role ? "Edit agent" : "New agent"}
         description="The job role, focus and questions below drive the screening conversation."
@@ -1173,25 +1255,17 @@ function RoleForm({
                             ? `Rephrasing question ${idx + 1}…`
                             : `Rephrase question ${idx + 1}`
                         }
-                        // The Ask Hello pill, verbatim. Both buttons on this
-                        // form ask a model for words; looking alike is the
-                        // point. NO `opacity-*` in this list — see
-                        // `AskHelloButton` for the measurement: fading the
-                        // pill fades the white label with it and drops it
-                        // under 4.5:1, and the faded state here is exactly
-                        // the one the operator is waiting on.
-                        className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-control border border-transparent px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+                        // Quiet, one per question: seven filled pills outweighed
+                        // Save, which is the one filled action on this form. NO
+                        // `opacity-*`: the state a reader waits on is the one a
+                        // fade would make hardest to read.
+                        className={`inline-flex min-h-9 items-center rounded-control border px-3 text-label font-medium transition-colors duration-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
                           rephrasingIdx !== null || !q.question.trim()
-                            ? 'ask-hello--idle cursor-not-allowed'
-                            : ''
+                            ? 'cursor-not-allowed border-line-strong bg-surface-secondary text-ink-tertiary'
+                            : 'border-[var(--control)] bg-surface text-ink hover:bg-surface-secondary'
                         }${rephrasingIdx === idx ? ' cursor-progress' : ''}`}
                       >
-                        <span aria-hidden="true" className="relative">
-                          {rephrasingIdx === idx ? '◐' : '✦'}
-                        </span>
-                        <span className="relative">
-                          {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
-                        </span>
+                        {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
                       </button>
                       <Button
                         type="button"
@@ -1247,11 +1321,68 @@ function RoleForm({
           </InlineNotice>
         )}
 
+        {asking && (
+          <InlineNotice
+            tone="warning"
+            role="alert"
+            action={
+              <span className="flex flex-wrap gap-2">
+                <Button
+                  ref={keepEditingRef}
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    setLeaving(null);
+                    if (nextEdit) onKeepThisEdit();
+                    else saveRef.current?.focus();
+                  }}
+                >
+                  Keep editing
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    const going = leaving;
+                    const next = nextEdit;
+                    if (going === "save") {
+                      // Only the question goes. This form closes when the save
+                      // lands, and that clears the flag; a save that fails or is
+                      // refused leaves the edits on screen, still unsaved, so
+                      // the next way out has to ask again.
+                      setLeaving(null);
+                      if (next) onKeepThisEdit();
+                      void submit();
+                      return;
+                    }
+                    scorecardChanged(false);
+                    if (going === "cancel") onCancel();
+                    else if (next) onOpenNextEdit(next);
+                  }}
+                >
+                  Discard scorecard changes
+                </Button>
+              </span>
+            }
+          >
+            The scorecard below has changes that are not saved. Save scorecard keeps them.
+          </InlineNotice>
+        )}
+
         <div className="flex flex-wrap gap-2 pt-1">
-          <Button type="submit" variant="primary" loading={saving}>
+          <Button ref={saveRef} type="submit" variant="primary" loading={saving}>
             {role ? "Save changes" : "Create agent"}
           </Button>
-          <Button type="button" variant="secondary" onClick={onCancel}>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => {
+              if (scorecardDirty) setLeaving("cancel");
+              else onCancel();
+            }}
+          >
             Cancel
           </Button>
         </div>
@@ -1263,7 +1394,7 @@ function RoleForm({
         unsaved role has no id to attach a scorecard version to. Save the role
         first, reopen it, then configure the scorecard here.
       */}
-      {role && <RoleScorecardEditor roleId={role.id} />}
+      {role && <RoleScorecardEditor roleId={role.id} onDirtyChange={scorecardChanged} />}
     </div>
   );
 }

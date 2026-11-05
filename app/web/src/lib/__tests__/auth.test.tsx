@@ -255,6 +255,104 @@ describe('AuthProvider', () => {
     expect(getMe).toHaveBeenCalled();
   });
 
+  it.each([
+    [500, true],
+    [503, true],
+    [undefined, true],
+    [401, false],
+    [403, false],
+  ])('a /api/me answer of %s sets roleCheckFailed to %s, and fails closed either way', async (status, failed) => {
+    mockSupabase.auth.getSession = vi.fn().mockResolvedValue({ data: { session: mockSession }, error: null });
+    getMe.mockRejectedValue(Object.assign(new Error('nope'), { status }));
+    function Probe() {
+      const { roleCheckFailed, role, isLoading } = useAuth();
+      return <div data-testid="check">{isLoading ? 'loading' : `${role ?? 'null'}:${roleCheckFailed}`}</div>;
+    }
+    render(
+      <AuthProvider>
+        <Probe />
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent(`null:${failed}`));
+  });
+
+  describe('the access check at sign-in and on Retry', () => {
+    /** The same read of the flags ProtectedRoute makes, and the Retry it offers. */
+    function Probe() {
+      const { roleCheckFailed, role, isLoading, isRoleLoading, retryRoleCheck } = useAuth();
+      return (
+        <>
+          <div data-testid="check">
+            {isLoading || isRoleLoading ? 'loading' : `${role ?? 'null'}:${roleCheckFailed}`}
+          </div>
+          <button onClick={() => void retryRoleCheck()}>Retry</button>
+        </>
+      );
+    }
+
+    /** Boots signed out and hands back the provider's auth-state handler. */
+    async function bootSignedOut() {
+      let handler: ((event: string, session: unknown) => void) | null = null;
+      mockSupabase.auth.onAuthStateChange = vi.fn((cb: (event: string, session: unknown) => void) => {
+        handler = cb;
+        return { data: { subscription: { unsubscribe: vi.fn() } } };
+      });
+      render(
+        <AuthProvider>
+          <Probe />
+        </AuthProvider>,
+      );
+      await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent('null:false'));
+      return (event: string) => act(async () => handler!(event, mockSession));
+    }
+
+    /** Boots on a session whose access check fails, which is what a Retry is for. */
+    async function bootOnAFailedCheck() {
+      mockSupabase.auth.getSession = vi.fn().mockResolvedValue({ data: { session: mockSession }, error: null });
+      getMe.mockRejectedValueOnce(Object.assign(new Error('down'), { status: 503 }));
+      render(
+        <AuthProvider>
+          <Probe />
+        </AuthProvider>,
+      );
+      await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent('null:true'));
+    }
+
+    it.each([
+      [500, true],
+      [503, true],
+      [undefined, true],
+      [401, false],
+      [403, false],
+    ])('a sign-in that meets a %s sets roleCheckFailed to %s', async (status, failed) => {
+      const announce = await bootSignedOut();
+      getMe.mockRejectedValue(Object.assign(new Error('nope'), { status }));
+      await announce('SIGNED_IN');
+      await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent(`null:${failed}`));
+    });
+
+    it('a Retry that gets through clears the flag', async () => {
+      await bootOnAFailedCheck();
+      await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent('admin:false'));
+    });
+
+    it('a Retry that fails again keeps the flag, so the page keeps its Retry', async () => {
+      await bootOnAFailedCheck();
+      getMe.mockRejectedValueOnce(Object.assign(new Error('down'), { status: 503 }));
+      await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      await waitFor(() => expect(getMe).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent('null:true'));
+    });
+
+    it('a Retry the API refuses turns the blip into a real no', async () => {
+      await bootOnAFailedCheck();
+      getMe.mockRejectedValueOnce(Object.assign(new Error('forbidden'), { status: 403 }));
+      await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      await waitFor(() => expect(screen.getByTestId('check')).toHaveTextContent('null:false'));
+    });
+  });
+
   it('does not re-gate the page when the session is re-announced on tab focus', async () => {
     // Supabase re-emits SIGNED_IN / TOKEN_REFRESHED when a tab regains focus.
     // Those events used to flip isRoleLoading, which made ProtectedRoute swap

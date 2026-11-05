@@ -103,5 +103,5 @@ export const ROUTES: RouteCase[] = [
   { name: 'admin-r1-settings', path: '/admin/r1', heading: 'R1 settings', landmark: 'Monthly allowance' },
   { name: 'admin-redirect', path: '/admin', heading: 'Mission Control', landmark: 'Session status mix', finalPath: /\/mission-control$/ },
   { name: 'ashby-mission-control', path: '/ashby-mission-control', heading: 'Ashby Live Jobs', landmark: 'Application workflows' },
-  { name: 'ashby-scoped-review', path: `/ashby/review/${SCOPED_REVIEW_LINK_ID}`, heading: 'Meera Iyer', landmark: 'Ashby screening pipeline' },
+  { name: 'ashby-scoped-review', path: `/ashby/review/${SCOPED_REVIEW_LINK_ID}`, heading: 'Meera Iyer', landmark: /^Latest screening/ },
 ];

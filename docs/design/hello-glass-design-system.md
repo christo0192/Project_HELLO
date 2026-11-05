@@ -125,11 +125,12 @@ No label is uppercase, on any surface, including the exported report. The only u
 ## 4. Surfaces
 
 - **The sheet:** one opaque page on the desk, inset 8px from the window, with a 1px `--rule-2` edge, radius 8, no shadow (`.sheet`).
-- **Panels:** `GlassPanel` and `.glass` are printed boxes on the sheet: paper, a 1px `--rule-2` edge, radius 4. `level="sunken"` is a shaded `--field` with no edge. Boxes never nest.
+- **Sections:** `GlassPanel level="ruled"` (`.sheet-section`) is a section of the sheet: no box, one 1px `--rule-2` rule across the top. This is the default for a block on a page. A page reads as one sheet ruled into sections, as on a form.
+- **Panels:** `GlassPanel` and `.glass` are printed boxes on the sheet: paper, a 1px `--rule-2` edge, radius 4. A block earns a box only when it is a separate task. `level="sunken"` is a shaded `--field` with no edge. Boxes never nest.
 - **Shadows** exist on floating layers only: dialogs, drawers, menus, the combobox list, chart tooltips, the skip link and the captions' jump button (`--shadow-pop`, `.glass-modal`). A zero-blur ring or inset line is a printed edge, not a shadow.
 - **Radii:** sheet 8, boxes and controls 4, chips 3, evidence boxes and highlights 2. Dots and toggles stay round. No arbitrary `rounded-[…]`.
 - **Edges are real borders**, not inset shadows, because Windows contrast themes keep borders and drop shadows. The one exception is the rule under a tab row: the row scrolls sideways, so a tab overlapping a border by 1px would reserve a vertical scrollbar. That rule is an inset line, and the forced-colours block gives the row a border.
-- **Spacing:** 4px base; sheet padding 24; control height 36, or 28 for small controls.
+- **Spacing:** 4px base; sheet padding 24; control height 36, or 28 for small controls. A coarse pointer takes 44 (`[@media(pointer:coarse)]:min-h-11`).
 
 ## 5. Shell
 
@@ -139,13 +140,14 @@ No label is uppercase, on any surface, including the exported report. The only u
 - Under forced colours a selection, including the transcript turn being played, is `Highlight` with `HighlightText` on everything inside it. The option the arrow keys are on is a `Highlight` outline, a filled button keeps an edge through its transparent border, and a data fill (`.data-fill`: bars, meters, legend swatches) is `CanvasText`.
 - A canvas keeps its author colours in every theme, so a chart and its legend key stay on paper (`.chart-paper`, `[data-series-key]`) and the logo stays on its white plate. Without that, a dark contrast theme puts carbon ink on black.
 - The page is keyed on the path, so a read still in flight cannot land on the next record.
-- The calling state is not in the shell yet. Its only read, `GET /api/phone/health`, is limited to interviewers and above, so a viewer would get a 403 on every route. It needs a read that is safe for every role.
+- A calling halt is in the shell for admins and interviewers, the two roles `GET /api/phone/health` answers: "Calling halted — operator pause", in crimson below the nav, or under the top bar on a narrow screen. A viewer's shell asks nothing, so there is no 403 on their routes. The rest of the calling state (window, on a call, queued) still needs a read that is safe for every role.
 
 ## 6. Primitives (`src/components/design`)
 
-`GlassPanel` · `SectionHeader` · `Button` (`primary | secondary | ghost | danger | danger-quiet | go`, `sm | md | lg`) · `Switch` · `TextField` · `SelectField` · `Combobox` · `Field` · `SegmentedControl` · `Pagination` + `usePagination` · `ScrollArea` · `InlineNotice` · `EmptyPanel` · `ErrorPanel` · `Dialog` / `SlideOver` (on `useModal`) · `MetricStrip`, `ChartCard`, `Table`, `StatusBadge`, `PageHeader`.
+`GlassPanel` (`raised | strong | sunken | ruled`) · `SectionHeader` · `Button` (`primary | secondary | ghost | danger | danger-quiet | go`, `sm | md | lg`) · `Switch` · `TextField` · `SelectField` · `Combobox` · `Field` · `SegmentedControl` · `Pagination` + `usePagination` · `ScrollArea` · `InlineNotice` · `EmptyPanel` · `ErrorPanel` · `Dialog` / `SlideOver` (on `useModal`) · `MetricStrip`, `ChartCard` (`ruled`), `Table` (`flush`), `StatusBadge`, `PageHeader`, and `VerdictMark` in `src/components/session`.
 
-- **`Combobox`:** the picker for any list an admin must search or read a second line of (jobs, roles, library metrics). Opens INLINE; APG "combobox with listbox popup" keyboard contract; Escape closes the list, not the modal around it; option values are never rendered. Use `SelectField` only for short, fixed, self-explanatory choices.
+- **`Combobox`:** every picker on a recruiter or admin screen, because a native select opens the operating system's list. Opens INLINE; APG "combobox with listbox popup" keyboard contract; Escape closes the list, not the modal around it; option values are never rendered. `searchable={false}` drops the search box for a short fixed list. `floating` is for a page toolbar only, so opening it moves nothing below; `floating="up"` at the foot of a page. Never float one inside a `Dialog`, a `SlideOver` or a `Table`, which clip it. `no-native-select.test.ts` fails on a new `<select>`. `SelectField` stays for the pages a candidate opens on their own device.
+- **`VerdictMark`:** every AI verdict: a circle in ink beside the word, full for Select, half for Borderline, empty for Reject, with the score after it. The word is the name; the circle is decoration.
 - **`danger-quiet`:** a destructive action that is not the point of its surface ("Archive" beside "Edit"). The filled `danger` is for the confirmation step itself.
 
 Rules:
@@ -163,13 +165,51 @@ Rules:
 12. **An action written as words is underlined at rest** (`.textlink`: a `--control` underline, offset 3px, darkening on hover). The accent is ink, so hue cannot say "link". A name in a list keeps the hover underline: its place in the row says what it is.
 13. **A control on paper needs an edge.** With no fill to separate it from its cell, a calendar chip takes a `--control` edge and a hover fill; a withdrawn one has neither at rest, so the calls that will happen lead.
 
-## 7. Charts (`src/components/charts/theme.ts`)
+## 7. What each screen is for
+
+Each screen answers one question and leads with one element.
+
+| Screen | The question | It leads with |
+|---|---|---|
+| Dashboard | Who needs me today? | The review queue |
+| Candidates | Where is this person, and who is next? | The list, with its filters above it |
+| Review | Should this person move on, and why? | The call, drawn to scale, beside the scorecard |
+| Session detail | What happened on this call? | The scorecard, with the call's record beside it |
+| Agents | What does each agent ask, and how is it scored? | The list of agents |
+| Phone calendar | What is next, and what did we miss? | The week |
+| Ashby Live Jobs | Which jobs are live, and what is stuck? | The job mappings |
+| Mission Control | Is anything off, and can I stop it? | Halt all calling, and the figures |
+
+Halt all calling lives in Mission Control and nowhere else. It is filled there, and no recruiter screen carries it.
+
+## 8. Words
+
+**Voice.** Copy says what the reader can do or must know. It never names an API, an HTTP code, a table, a PII class or a guard. A failure names the block, in the form "The audit log couldn't load", and says what to do.
+
+**Glossary.**
+
+| Say | Not | Meaning |
+|---|---|---|
+| Select, Borderline, Reject | Advance, Hold | The AI recommendation. The stored values stay `advance`, `hold`, `reject` |
+| AI recommendation | Decision, verdict | What the AI suggests. A person decides in Ashby |
+| Review | Review & decide | The action on a screened candidate. HELLO records no decision |
+| Christy (AI) | Bot, a bare first name | The AI interviewer on the record. Consent text keeps its own wording |
+| Agent | Role, where the agent is meant | What screens candidates for one job |
+| Phone rang | Phone reached | A call that rang, whether or not anyone answered |
+| Finished | Terminal | A session or cycle that can't change |
+| Calling limit | Fleet limit | How many calls can run at once |
+| Open calling window, free line | Call gates, admission gates | What a call waits for |
+| Viewer, Interviewer, Admin | viewer, interviewer, admin | The access roles |
+
+Status labels keep the stored words: that is the owner's decision, and they are not merged into headline states. Consent, recording, opt-out, appeal and jurisdiction wording changes only with Legal.
+
+## 9. Charts (`src/components/charts/theme.ts`)
 
 Every chart colour comes from the tokens, in one place: `chartPalette()` reads the computed custom properties. The categorical cycle is ink steps, not hues, so a series is told apart by its printed label, its dash and its marker shape, and an outcome is not coloured good or bad. Markers are hidden past 20 points, so the dash is what holds on a dense series, and the legend prints each line's own dash and marker. The voice hue never appears in a chart. Lines are straight, bars start from zero, and a chart is printed, not drawn in: `animation: false` at every setting.
 
 `PipelineBar` is an outlined box on the ramp the mock draws: `--rule-2` for the lightest bucket (nobody dialled yet, or Reject on the recommendation bar), then `--control`, `--ink-3`, `--ink-2` and `--ink`, with `--voice-mark` for the on-a-call stage alone. Every tone draws differently, because the swatch is the only link from legend to bar, and a 2px paper gap sets each segment off.
 
-## 8. Motion
+## 10. Motion
 
 - No entrance, no reveal and no count-up anywhere.
 - Hover changes colour in 120ms (`duration-hover`). Press scales to 0.97. Chevrons rotate in 150ms.
@@ -177,12 +217,12 @@ Every chart colour comes from the tokens, in one place: `chartPalette()` reads t
 - `prefers-reduced-motion` removes all of it, including the press scale.
 - There is no motion library. Everything left is CSS.
 
-## 9. Dark mode
+## 11. Dark mode
 
 Retired. `main.tsx` forced the light theme in production, so no user could ever reach a dark app, and no direction defines one. `lib/theme.tsx`, `ThemeToggle`, every `.dark` rule and the Tailwind class strategy are gone.
 
 The one exception is the **exported candidate report**. It is a standalone file a reader opens in their own browser, so it does follow `prefers-color-scheme`. Its dark block maps every Logsheet token to a warm dark counterpart, and `reportStyles.test.ts` checks every text pair for AA in both schemes.
 
-## 10. Accessibility contract
+## 12. Accessibility contract
 
 WAI-ARIA tabs for section navigation (roving tabindex, arrow keys); `role="switch"` for booleans; `aria-pressed` on segmented filters; `nav[aria-label]` for pagination; scroll regions are focusable and labelled; all text pairs clear WCAG AA against every ground they sit on (computed, and verified in Playwright with axe at reduced motion).

@@ -19,6 +19,40 @@ import type {
   PublicStatus,
 } from '../../types';
 import type { StatusTone } from '../design/StatusBadge';
+import { humanizeEnum } from '../../lib/humanize';
+
+/* ── Audit actions ────────────────────────────────────────────────────── */
+
+/**
+ * The words for the actions people ask about, keyed on what `audit_events.action`
+ * stores: `chk_audit_action` is a closed list of underscored values, and a test
+ * holds these keys to it. Anything else falls back to its own words through
+ * `humanizeEnum`, and the stored value stays one hover away for anyone quoting
+ * the log.
+ */
+export const AUDIT_ACTION_LABELS: Readonly<Record<string, string>> = {
+  admin_allowlist_add: 'Access entry added',
+  admin_allowlist_update: 'Access entry changed',
+  allowlist_linked: 'Access entry linked to a sign-in',
+  admin_member_update: 'Member access changed',
+  admin_session_override: 'Admin override',
+  admin_maintenance_toggle: 'Maintenance mode changed',
+  quota_override: 'Quota policy changed',
+};
+
+/**
+ * Two stored actions cover more than one thing, and the row's target tells them
+ * apart: the override also records the calling halt (0042), and the member update
+ * also records a handover of records (0133).
+ */
+const AUDIT_TARGET_ACTION_LABELS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  admin_session_override: { session: 'Session status changed', phone_control: 'Calling halt changed' },
+  admin_member_update: { allowlist_entry: 'Records handed over' },
+};
+
+export function auditActionLabel(action: string, targetType: string): string {
+  return AUDIT_TARGET_ACTION_LABELS[action]?.[targetType] ?? AUDIT_ACTION_LABELS[action] ?? humanizeEnum(action);
+}
 
 /* ── Allowlist entry state ───────────────────────────────────────────── */
 

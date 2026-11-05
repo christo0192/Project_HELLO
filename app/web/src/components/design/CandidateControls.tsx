@@ -16,7 +16,6 @@ import type {
   InputHTMLAttributes,
   ReactNode,
   Ref,
-  SelectHTMLAttributes,
 } from 'react';
 import { cx } from './cx';
 import { buttonClass, ButtonSpinner } from './Button';
@@ -154,18 +153,6 @@ export function CandidateInput({
   ref?: Ref<HTMLInputElement>;
 }) {
   return <input ref={ref} className={cx(fieldBase, className)} {...rest} />;
-}
-
-export function CandidateSelect({
-  className,
-  children,
-  ...rest
-}: SelectHTMLAttributes<HTMLSelectElement>) {
-  return (
-    <select className={cx(fieldBase, 'control-select pr-8', className)} {...rest}>
-      {children}
-    </select>
-  );
 }
 
 /* ── States ──────────────────────────────────────────────────────── */

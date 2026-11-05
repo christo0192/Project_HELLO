@@ -212,7 +212,7 @@ export function R1SettingsPage() {
     if (load.forbidden) {
       return (
         <div>
-          <PageHeader eyebrow="Operations" title="R1 settings" />
+          <PageHeader title="R1 settings" />
           <GlassPanel className="mt-6">
             <p className="text-sm text-ink">
               Admin access required. R1 settings are available to admin operators only.
@@ -357,7 +357,6 @@ export function R1SettingsPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Operations"
         title="R1 settings"
         description={PAGE_DESCRIPTION}
         actions={

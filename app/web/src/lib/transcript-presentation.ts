@@ -1,9 +1,15 @@
+/**
+ * The AI interviewer on the record. A name and an explicit AI marker: "Bot" read
+ * like a chat log, and a bare first name would read as a person speaking.
+ */
+export const AI_SPEAKER_LABEL = 'Christy (AI)';
+
 const PLANNED_QUESTION_PREFIX = '[planned question] ';
 const INTERRUPTED_QUESTION_PREFIX = '[interrupted question] ';
 
 export interface TranscriptPresentation {
   text: string;
-  label: 'Bot' | 'Candidate' | 'Interrupted question';
+  label: typeof AI_SPEAKER_LABEL | 'Candidate' | 'Interrupted question';
   plannedEvidence: boolean;
 }
 
@@ -30,7 +36,7 @@ export function presentTranscriptTurn(
   }
   return {
     text,
-    label: speaker === 'bot' ? 'Bot' : 'Candidate',
+    label: speaker === 'bot' ? AI_SPEAKER_LABEL : 'Candidate',
     plannedEvidence: false,
   };
 }

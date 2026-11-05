@@ -2,6 +2,8 @@
  * Shared test stubs for theme / motion / chart tests (jsdom gaps).
  * Excluded from coverage via the vitest config test-excludes.
  */
+import { screen, within } from '@testing-library/react';
+import type { UserEvent } from '@testing-library/user-event';
 import { vi } from 'vitest';
 
 type MediaListener = (event: { matches: boolean; media: string }) => void;
@@ -78,4 +80,30 @@ export function stubCanvasContext(): void {
 /** ECharts warns when the jsdom container has no layout (clientWidth 0). */
 export function allowEchartsInitWarnings(): void {
   (globalThis as any).__allowConsole(/width or height/);
+}
+
+/**
+ * Choose an option in a `Combobox`, the way a person does: open the trigger
+ * named `name`, press the option. `name` matches the trigger's accessible name,
+ * which is its label followed by its current value.
+ */
+export async function pickOption(
+  user: UserEvent,
+  name: string | RegExp,
+  option: string | RegExp | ((accessibleName: string) => boolean),
+): Promise<void> {
+  await user.click(screen.getByRole('button', { name, expanded: false }));
+  // An option's name runs on into its second line, so a string names its start.
+  const named = typeof option === 'string' ? (text: string) => text.startsWith(option) : option;
+  await user.click(within(screen.getByRole('listbox')).getByRole('option', { name: named }));
+}
+
+/** The option names a `Combobox` offers, read by opening it and closing it again. */
+export async function optionsOf(user: UserEvent, name: string | RegExp): Promise<string[]> {
+  await user.click(screen.getByRole('button', { name, expanded: false }));
+  const labels = within(screen.getByRole('listbox'))
+    .getAllByRole('option')
+    .map((option) => option.textContent ?? '');
+  await user.keyboard('{Escape}');
+  return labels;
 }

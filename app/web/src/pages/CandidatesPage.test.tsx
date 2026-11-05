@@ -10,6 +10,8 @@ import { render, screen, fireEvent, within, waitFor } from '@testing-library/rea
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ReactNode } from 'react';
+import userEvent from '@testing-library/user-event';
+import { optionsOf, pickOption } from '../components/design/__tests__/helpers';
 import { CandidatesPage } from './CandidatesPage';
 import { mockCandidate, mockRole } from '../test/helpers';
 import { ApiError } from '../lib/api-client';
@@ -118,7 +120,7 @@ describe('CandidatesPage', () => {
     renderPage();
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('The candidate list did not load.');
+    expect(alert).toHaveTextContent("The candidate list couldn't load.");
     expect(alert).toHaveTextContent(API_ERROR_COPY.service_unavailable);
     expect(document.body).not.toHaveTextContent('service_unavailable');
     // Not the empty state: nobody knows yet whether the list is empty.
@@ -203,10 +205,16 @@ describe('CandidatesPage', () => {
     expect(screen.getAllByText('Senior Frontend Engineer').length).toBeGreaterThanOrEqual(1);
   });
 
-  it('renders the role filter select', async () => {
+  /** The role filter's option names, read by opening it. */
+  async function roleFilterOptions(): Promise<string[]> {
+    const user = userEvent.setup();
+    await screen.findByRole('button', { name: /^Filter by role/ });
+    return optionsOf(user, /^Filter by role/);
+  }
+
+  it('renders the role filter', async () => {
     renderPage();
-    expect(await screen.findByLabelText('Filter by role')).toBeInTheDocument();
-    expect(screen.getByText('All roles')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Filter by role All roles' })).toBeInTheDocument();
   });
 
   // ── Role filter: mapped roles only (M008) ─────────────────────────────
@@ -224,26 +232,22 @@ describe('CandidatesPage', () => {
       { ...mockRole, id: 'role-5', title: 'Unmapped Role', has_ashby_mapping: false },
     ]);
     renderPage();
-    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
-    await within(select).findByRole('option', { name: 'Paused Role' });
-    const options = Array.from(select.options);
-    expect(options.map((o) => o.textContent)).toEqual([
+    expect(await roleFilterOptions()).toEqual([
       'All roles',
       'Backend Engineer',
       'Drifted Role',
       'Paused Role',
       'Senior Frontend Engineer',
     ]);
-    expect(options.map((o) => o.value)).toEqual(['', 'role-2', 'role-4', 'role-3', 'role-1']);
-    expect(within(select).queryByRole('option', { name: 'Unmapped Role' })).not.toBeInTheDocument();
+    // An option's value is the role id: the choice reaches the API as one.
+    await pickOption(userEvent.setup(), /^Filter by role/, 'Paused Role');
+    await waitFor(() => expect(mockApi.listCandidates).toHaveBeenLastCalledWith('role-3'));
   });
 
   it('makes NO mappings request: the flag comes with the roles', async () => {
     mockApi.listRoles.mockResolvedValue([{ ...mockRole, has_ashby_mapping: true }]);
     renderPage();
-    await within(await screen.findByLabelText('Filter by role')).findByRole('option', {
-      name: 'Senior Frontend Engineer',
-    });
+    await screen.findByRole('button', { name: /^Filter by role/ });
     expect(mockApi.listAshbyMappings).not.toHaveBeenCalled();
   });
 
@@ -255,18 +259,16 @@ describe('CandidatesPage', () => {
       { ...mockRole, id: 'r4', title: 'Support', has_ashby_mapping: true },
     ]);
     renderPage();
-    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
-    await within(select).findByRole('option', { name: 'Support' });
-    expect(Array.from(select.options).map((o) => [o.textContent, o.value])).toEqual([
-      ['All roles', ''],
-      ['Sales Program Advisor — Gopu', 'r1'],
-      ['Sales Program Advisor — Meera', 'r2'],
-      ['Support', 'r3'],
-      ['Support · 2', 'r4'],
+    expect(await roleFilterOptions()).toEqual([
+      'All roles',
+      'Sales Program Advisor — Gopu',
+      'Sales Program Advisor — Meera',
+      'Support',
+      'Support · 2',
     ]);
 
     // Picking an option still filters on the role ID.
-    fireEvent.change(select, { target: { value: 'r4' } });
+    await pickOption(userEvent.setup(), /^Filter by role/, 'Support · 2');
     await waitFor(() => expect(mockApi.listCandidates).toHaveBeenLastCalledWith('r4'));
   });
 
@@ -276,13 +278,7 @@ describe('CandidatesPage', () => {
       { ...mockRole, id: 'role-2', title: 'Backend Engineer' },
     ]);
     renderPage();
-    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
-    await within(select).findByRole('option', { name: 'Backend Engineer' });
-    expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
-      'All roles',
-      'Backend Engineer',
-      'Senior Frontend Engineer',
-    ]);
+    expect(await roleFilterOptions()).toEqual(['All roles', 'Backend Engineer', 'Senior Frontend Engineer']);
   });
 
   it('hides the role filter when no role is mapped (no lonely "All roles")', async () => {
@@ -291,8 +287,7 @@ describe('CandidatesPage', () => {
     // The roles have loaded once the Role column resolves the title.
     const table = await screen.findByRole('table');
     await within(table).findAllByText('Senior Frontend Engineer');
-    expect(screen.queryByLabelText('Filter by role')).not.toBeInTheDocument();
-    expect(screen.queryByText('All roles')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Filter by role/ })).not.toBeInTheDocument();
   });
 
   it('falls back to "All roles" when the URL selects a role the server flags unmapped', async () => {
@@ -301,9 +296,8 @@ describe('CandidatesPage', () => {
       { ...mockRole, id: 'role-2', title: 'Backend Engineer', has_ashby_mapping: false },
     ]);
     renderPage('/candidates?role=role-2&status=screened', withLocation());
-    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
     await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('?status=screened'));
-    expect(select.value).toBe('');
+    expect(await screen.findByRole('button', { name: 'Filter by role All roles' })).toBeInTheDocument();
     // The list re-reads unscoped; the other filters survive.
     await waitFor(() => expect(mockApi.listCandidates).toHaveBeenLastCalledWith(undefined));
     expect(screen.queryByText('Role: Backend Engineer')).not.toBeInTheDocument();
@@ -315,9 +309,7 @@ describe('CandidatesPage', () => {
       { ...mockRole, id: 'role-2', title: 'Backend Engineer', has_ashby_mapping: true },
     ]);
     renderPage('/candidates?role=role-2', withLocation());
-    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
-    await within(select).findByRole('option', { name: 'Backend Engineer' });
-    expect(select.value).toBe('role-2');
+    expect(await screen.findByRole('button', { name: 'Filter by role Backend Engineer' })).toBeInTheDocument();
     expect(screen.getByTestId('location').textContent).toBe('?role=role-2');
     expect(mockApi.listCandidates).toHaveBeenLastCalledWith('role-2');
   });
@@ -328,9 +320,7 @@ describe('CandidatesPage', () => {
       { ...mockRole, id: 'role-2', title: 'Backend Engineer' },
     ]);
     renderPage('/candidates?role=role-2', withLocation());
-    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
-    await within(select).findByRole('option', { name: 'Backend Engineer' });
-    expect(select.value).toBe('role-2');
+    expect(await screen.findByRole('button', { name: 'Filter by role Backend Engineer' })).toBeInTheDocument();
     expect(screen.getByTestId('location').textContent).toBe('?role=role-2');
   });
 
@@ -764,7 +754,7 @@ describe('CandidatesPage table columns', () => {
     // A decision opens the Review tab directly; a screening opens the
     // candidate, where the call and invite controls live.
     const review = within(rowOf('Screened Sam')).getByRole('link', {
-      name: /^Review & decide\s*, Screened Sam$/,
+      name: /^Review\s*, Screened Sam$/,
     });
     expect(review).toHaveAttribute('href', '/candidates/c-screened?tab=review');
     const start = within(rowOf('Jane Doe')).getByRole('link', {
@@ -788,15 +778,24 @@ describe('CandidatesPage table columns', () => {
     expect(next.querySelector('[title]')).toHaveAttribute('title', 'Screening in progress');
   });
 
-  it('never wraps the experience, status, recommendation or next-action cells', async () => {
+  it('never wraps the experience, recommendation or next-action cells', async () => {
     renderPage();
     await screen.findByText('Jane Doe');
     const table = screen.getByRole('table');
-    const headers = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent);
+    const headers = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent ?? '');
     const cells = rowOf('Screened Sam').querySelectorAll('td');
-    for (const column of ['Exp.', 'Status', 'Recommendation', 'Next action']) {
-      expect(cells[headers.indexOf(column)].className, column).toContain('whitespace-nowrap');
+    for (const column of ['Exp.', 'Recommendation', 'Waiting', 'Next action']) {
+      const at = headers.findIndex((header) => header.startsWith(column));
+      expect(cells[at].className, column).toContain('whitespace-nowrap');
     }
+  });
+
+  it('lets a long status break inside its badge, so the column keeps to its budget', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const badge = within(rowOf('Screened Sam')).getByText('Screened').closest('[data-status-badge]');
+    expect(badge?.className).not.toContain('whitespace-nowrap');
+    expect(badge?.parentElement?.className).toContain('max-w-[11rem]');
   });
 
   it('truncates email and skills only with the full value in title', async () => {

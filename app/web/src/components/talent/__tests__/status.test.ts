@@ -313,7 +313,7 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
     expect(ds.key).toBe('abandoned_no_answer');
     // No "(dialed N)" on a terminal phone key: the count is in detail/title.
     expect(ds.label).toBe('Abandoned: no answer');
-    expect(ds.detail).toContain('Phone reached 5 times');
+    expect(ds.detail).toContain('Phone rang 5 times');
     expect(ds.tone).toBe('danger');
     expect(candidateStatusKey({ status: 'queued', phone_state: 'abandoned_no_answer' })).toBe(
       'abandoned_no_answer',
@@ -392,7 +392,7 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
     expect(ds.title).not.toContain('Phone:');
     expect(ds.title).not.toContain('Phone cycle');
     expect(ds.title).toContain('No answer after every attempt');
-    expect(ds.title).toContain('Phone reached 5 times (all cycles, incl. reconnects)');
+    expect(ds.title).toContain('Phone rang 5 times (all cycles, incl. reconnects)');
     expect(ds.title).toMatch(/Last dialed .*2026/);
     expect(candidateDisplayStatus({ status: 'new' }).title).toBe('Status: new');
   });
@@ -405,7 +405,7 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
       phone_state_reason: 'no_answer_budget_exhausted',
       last_dialed_at: '2026-10-01T09:30:00Z',
     });
-    expect(ds.detail).toMatch(/^No answer after every attempt · Phone reached 5 times .* · Last dialed .*2026/);
+    expect(ds.detail).toMatch(/^No answer after every attempt · Phone rang 5 times .* · Last dialed .*2026/);
     expect(ds.detail).not.toContain('Status:');
     expect(candidateDisplayStatus({ status: 'new' }).detail).toBe('');
     expect(
@@ -513,10 +513,10 @@ describe('candidateDisplayStatus: failed/screening_abandoned', () => {
   it('does not repeat the badge in the detail line, and says the evidence reason when known', () => {
     const plain = candidateDisplayStatus({ status: 'screening', ...abandoned });
     expect(plain.detail).not.toContain('Abandoned');
-    expect(plain.detail).toContain('Phone reached 2 times');
+    expect(plain.detail).toContain('Phone rang 2 times');
 
     const silent = candidateDisplayStatus({ status: 'screening', ...abandoned, evidence_reason: 'no_candidate_speech' });
-    expect(silent.detail).toMatch(/^No screening question was answered · Phone reached 2 times/);
+    expect(silent.detail).toMatch(/^No screening question was answered · Phone rang 2 times/);
     expect(silent.title).toContain('No screening question was answered');
 
     const ours = candidateDisplayStatus({ status: 'screening', ...abandoned, evidence_reason: 'infra_interrupted' });

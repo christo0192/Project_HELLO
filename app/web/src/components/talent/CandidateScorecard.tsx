@@ -43,6 +43,7 @@ import { useId } from 'react';
 import type { ReactNode } from 'react';
 import type { Assessment, Recommendation } from '../../types';
 import { Meter, SurfaceCard, Tag } from '../design/candidate';
+import { VerdictMark } from '../session/VerdictMark';
 import { cx } from '../design/cx';
 import { humanizeEnum } from '../../lib/humanize';
 import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
@@ -56,13 +57,6 @@ export const SECTION_WEIGHTS = {
 } as const;
 
 const RECOMMENDATION_LABEL: Readonly<Record<Recommendation, string>> = RECOMMENDATION_LABELS;
-
-/** A verdict stays in ink: the Tag carries the word, not a good-or-bad hue. */
-const RECOMMENDATION_TONE: Record<Recommendation, 'neutral'> = {
-  advance: 'neutral',
-  hold: 'neutral',
-  reject: 'neutral',
-};
 
 const OVERALL_THRESHOLDS = { fair: 0.5, strong: 0.75 };
 
@@ -322,7 +316,6 @@ export function CandidateScorecard({
     : typeof recommendation === 'string' && recommendation.trim()
       ? humanizeEnum(recommendation)
       : null;
-  const recoTone = known ? RECOMMENDATION_TONE[recommendation] : 'neutral';
   const roundedOverall = Math.round(overall_score);
 
   const hasSignalBlocks =
@@ -340,9 +333,10 @@ export function CandidateScorecard({
             <span className="text-sm text-[var(--c-ink-secondary)]">/ 100</span>
           </div>
           {recoLabel && (
-            <Tag tone={recoTone} srPrefix="Recommendation:" className="px-3 py-1 text-sm">
-              {recoLabel}
-            </Tag>
+            <span>
+              <span className="sr-only">Recommendation: </span>
+              <VerdictMark recommendation={recommendation} size="lg" />
+            </span>
           )}
         </div>
 
