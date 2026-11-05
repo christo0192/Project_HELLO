@@ -13,7 +13,10 @@
  *      response is cut at `rowCap` rows, and the cut is recorded.
  *
  * Every query is recorded (`queries`), with whether it overflowed or was
- * truncated, so a test can assert that no read hit either limit. A test can
+ * truncated, so a test can assert that no read hit either limit. A read that
+ * caps ITSELF at the row cap never trips the cut, and is just as partial:
+ * `.limit(1000)`, or one `.range(0, 999)` with no next page, answers 1000 of
+ * 5,000 rows. `selfCaps()` names those. A test can
  * also fail chosen queries (`failWhen`), make the builder throw (`throwWhen`),
  * act between page reads (`beforeExecute`), shuffle rows the requested order
  * leaves tied (`scrambleTies`), and delay every read to observe concurrency
@@ -98,6 +101,11 @@ export interface ScaleDb {
   overflows(): RecordedQuery[];
   /** The queries the row cap cut. */
   truncations(): RecordedQuery[];
+  /**
+   * The reads that stopped at exactly the row cap by their own `.limit()` or
+   * `.range()`, with more rows matched and no next page ever read.
+   */
+  selfCaps(): RecordedQuery[];
   /** Empty every table and log, clear every control, and apply `options`. */
   reset(options?: ScaleDbOptions): void;
 }
@@ -163,6 +171,12 @@ const isForeign = (opts: unknown): boolean => {
   return !!o && (o.foreignTable !== undefined || o.referencedTable !== undefined);
 };
 
+/** Two pages of one read: the same table, equality filters and id list. */
+const sameRead = (a: RecordedQuery, b: RecordedQuery): boolean =>
+  a.table === b.table
+  && JSON.stringify(a.eqs) === JSON.stringify(b.eqs)
+  && JSON.stringify(a.inValues) === JSON.stringify(b.inValues);
+
 export function createScaleDb(options: ScaleDbOptions = {}): ScaleDb {
   let seedCounter = 0;
 
@@ -188,6 +202,14 @@ export function createScaleDb(options: ScaleDbOptions = {}): ScaleDb {
     },
     overflows: () => engine.queries.filter((q) => q.overflowed),
     truncations: () => engine.queries.filter((q) => q.truncated),
+    selfCaps: () => engine.queries.filter((q, i) => {
+      if (q.op !== 'select' || q.truncated || q.returned !== engine.rowCap) return false;
+      const first = q.range?.[0] ?? 0;
+      if (q.matched <= first + q.returned) return false;
+      if (!q.range) return true;
+      const nextFrom = q.range[1] + 1;
+      return !engine.queries.some((later, j) => j > i && later.range?.[0] === nextFrom && sameRead(later, q));
+    }),
     reset(next: ScaleDbOptions = {}) {
       for (const k of Object.keys(engine.tables)) delete engine.tables[k];
       engine.queries.length = 0;

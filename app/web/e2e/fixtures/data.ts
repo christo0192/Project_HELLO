@@ -1525,6 +1525,9 @@ export interface Dataset {
     jobs: AshbyJob[];
     withheld: number;
     workflows: AshbyMcWorkflow[];
+    /** The API's `truncated` on the two lists: older rows exist past the page. */
+    mappingsTruncated?: boolean;
+    workflowsTruncated?: boolean;
     feedbackForm: AshbyFeedbackForm;
     bindingPreview: AshbyScorecardBindingPreviewResponse;
   };

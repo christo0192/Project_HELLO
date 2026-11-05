@@ -14,6 +14,8 @@
  *   GET  /workflows                — application workflows incl. pending/expired/
  *                                    failed_review/cancelled/withdrawn/delivery/
  *                                    writeback states
+ *                                    (both newest first, one page of at most
+ *                                    MAX_LIMIT; `truncated` says older rows exist)
  *   POST /mappings/:id/pause       — admin: pause a mapping
  *   POST /mappings/:id/resume      — admin: resume (enable) a complete, non-drift mapping
  *   POST /mappings/:id/archive     — admin: "delete" a PAUSED mapping by archiving
@@ -89,6 +91,21 @@ const DEFAULT_LIMIT = 50;
 function boundedLimit(raw: unknown): number {
   const n = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : DEFAULT_LIMIT;
   return Math.min(MAX_LIMIT, Math.max(1, n));
+}
+
+/**
+ * One page of a Mission Control list, and whether older rows were left out.
+ * Asks the store for one row past the page, because a list that stops at its
+ * limit reads as the whole list: the page counts and summarizes what it is
+ * given, and a failed write-back older than the page would simply not exist.
+ */
+async function readListPage<T>(
+  read: (limit: number) => Promise<T[]>,
+  rawLimit: unknown,
+): Promise<{ rows: T[]; truncated: boolean }> {
+  const limit = boundedLimit(rawLimit);
+  const rows = await read(limit + 1);
+  return { rows: rows.slice(0, limit), truncated: rows.length > limit };
 }
 
 /**
@@ -297,9 +314,9 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // ── Reads (interviewer+) ──────────────────────────────────────────────────
   router.get('/mappings', requireRole('interviewer'), async (req: Request, res: Response) => {
     try {
-      const mappings = await store().listMappings(boundedLimit(req.query.limit));
-      await recordAudit(req, 'resource.list', 200, { metadata: { resource: 'ashby_mapping', count: mappings.length } });
-      res.json({ ok: true, mappings });
+      const { rows: mappings, truncated } = await readListPage((n) => store().listMappings(n), req.query.limit);
+      await recordAudit(req, 'resource.list', 200, { metadata: { resource: 'ashby_mapping', count: mappings.length, truncated } });
+      res.json({ ok: true, mappings, truncated });
     } catch {
       res.status(500).json({ ok: false, error: 'mission_control_read_error' });
     }
@@ -307,9 +324,9 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
 
   router.get('/workflows', requireRole('interviewer'), async (req: Request, res: Response) => {
     try {
-      const workflows = await store().listWorkflows(boundedLimit(req.query.limit));
-      await recordAudit(req, 'resource.list', 200, { metadata: { resource: 'ashby_workflow', count: workflows.length } });
-      res.json({ ok: true, workflows });
+      const { rows: workflows, truncated } = await readListPage((n) => store().listWorkflows(n), req.query.limit);
+      await recordAudit(req, 'resource.list', 200, { metadata: { resource: 'ashby_workflow', count: workflows.length, truncated } });
+      res.json({ ok: true, workflows, truncated });
     } catch {
       res.status(500).json({ ok: false, error: 'mission_control_read_error' });
     }

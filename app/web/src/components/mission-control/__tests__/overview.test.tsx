@@ -109,6 +109,29 @@ describe('OverviewSection', () => {
     }, KPI_TIMEOUT);
   });
 
+  it('says the session figures cover one page when that page is full', async () => {
+    // GET /api/admin/sessions answers at most 100 rows and no total, so at 5,000
+    // sessions "100" must not read as the size of the workspace.
+    const full = Array.from({ length: 100 }, (_, i) => ({ ...SESSIONS[0], id: `s-${i}` }));
+    apiFns.listAdminSessions.mockResolvedValue({ sessions: full });
+    renderOverview();
+    await waitFor(() => {
+      expect(within(figureCell('Sessions')).getByText('100')).toBeInTheDocument();
+    }, { timeout: 10_000 });
+    expect(within(figureCell('Sessions')).getByText('The 100 most recently updated')).toBeInTheDocument();
+    expect(within(figureCell('Active sessions')).getByText('Within the 100 most recently updated')).toBeInTheDocument();
+    expect(screen.getByText('The 100 most recently updated sessions, largest first.')).toBeInTheDocument();
+  });
+
+  it('claims no cut on a session page that is not full', async () => {
+    renderOverview();
+    await waitFor(() => {
+      expect(within(figureCell('Sessions')).getByText('3')).toBeInTheDocument();
+    }, { timeout: 10_000 });
+    expect(within(figureCell('Sessions')).getByText('In the admin session view')).toBeInTheDocument();
+    expect(screen.queryByText(/most recently updated/)).toBeNull();
+  });
+
   it('renders the maintenance state from /api/status', async () => {
     renderOverview();
     await screen.findByText('Service state');

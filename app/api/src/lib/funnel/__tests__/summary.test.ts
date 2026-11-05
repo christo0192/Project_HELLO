@@ -580,8 +580,11 @@ describe('loadFunnelSummary — past the PostgREST row cap (M026)', () => {
     expect(out.totals.entered_parse).toBe(1002);
     const pages = calls.filter((c) => kindOfCall(c) === 'window');
     expect(pages.map((c) => c.ops.find((op) => op[0] === 'range'))).toEqual([['range', 0, 999], ['range', 1000, 1999]]);
-    // A total order, so consecutive pages neither overlap nor skip.
-    expect(pages[0].ops).toContainEqual(['order', 'id', { ascending: true }]);
+    // A total order that survives a refresh, so consecutive pages neither
+    // overlap nor skip. Never `id`: each refresh regenerates it (0090).
+    expect(pages[0].ops).toContainEqual(['order', 'cohort_day', { ascending: true }]);
+    expect(pages[0].ops).toContainEqual(['order', 'role_id', { ascending: true }]);
+    expect(pages[0].ops.map(([op, col]) => `${op}:${col}`)).not.toContain('order:id');
   });
 
   it('fails the summary, never totals over part of the window, when a later page fails', async () => {
@@ -602,5 +605,35 @@ describe('loadFunnelSummary — past the PostgREST row cap (M026)', () => {
       .filter((c) => c.table === 'ashby_application_links')
       .map((c) => (c.ops.find((op) => op[0] === 'in')![2] as string[]).length);
     expect(sizes).toEqual([100, 100]);
+  });
+
+  it('asks the HR probe about every wired mapping, past any fixed bound, in a stable order', async () => {
+    // The only synced link sits on the last mapping of the second page. A
+    // bounded list of mappings would answer "Not tracked yet" here.
+    const firstPage = Array.from({ length: 1000 }, (_, i) => ({ id: `map-${i}` }));
+    const lastId = 'map-1004';
+    const { reader, calls } = healthy({
+      mappings: (_q, nth) => ok(nth === 1 ? firstPage : Array.from({ length: 5 }, (_, i) => ({ id: `map-${1000 + i}` }))),
+      links: (q) => {
+        const asked = q.ops.find((op) => op[0] === 'in')![2] as string[];
+        return ok(asked.includes(lastId) ? [{ id: 'link-1' }] : []);
+      },
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.meta.hr_tracking_configured).toBe(true);
+    const pages = calls.filter((c) => c.table === 'ashby_job_mappings');
+    expect(pages.map((c) => c.ops.find((op) => op[0] === 'range'))).toEqual([['range', 0, 999], ['range', 1000, 1999]]);
+    expect(pages[0].ops).toContainEqual(['order', 'id', { ascending: true }]);
+    expect(pages[0].ops.map(([op]) => op)).not.toContain('limit');
+  });
+
+  it('answers "not configured", never a guess from part of the list, when a later mapping page fails', async () => {
+    const firstPage = Array.from({ length: 1000 }, (_, i) => ({ id: `map-${i}` }));
+    const { reader, calls } = healthy({
+      mappings: (_q, nth) => (nth === 1 ? ok(firstPage) : fail('XX000')),
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.meta.hr_tracking_configured).toBe(false);
+    expect(calls.find((c) => c.table === 'ashby_application_links')).toBeUndefined();
   });
 });

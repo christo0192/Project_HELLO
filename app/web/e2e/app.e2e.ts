@@ -319,4 +319,25 @@ test.describe('key states', () => {
     }
     app.expectHealthy();
   });
+
+  test('Ashby Live Jobs says when a list is cut, and when a row could not be read', async ({ app, page }, testInfo) => {
+    const [first] = app.db.ashby.workflows;
+    app.db.ashby.mappingsTruncated = true;
+    app.db.ashby.workflowsTruncated = true;
+    app.db.ashby.workflows = [
+      { ...first, lifecycle: 'ready', terminalState: null, sessionId: 'session-unread', sessionStatus: null, heldForEvidence: false },
+      { ...first, applicationLinkId: 'link-unread', externalApplicationId: 'app_unread', lifecycle: 'writeback_pending', terminalState: null, sessionStatus: 'completed', heldForEvidence: null },
+    ];
+    await app.goto('/ashby-mission-control');
+
+    await expect(page.getByText('Newest 2', { exact: true })).toBeVisible();
+    await expect(page.getByText(/^In the newest 2 applications: .*Older applications are not shown or counted\.$/)).toBeVisible();
+    await expect(page.getByText(/^In the newest \d+ mappings: .*Older mappings are not shown or counted\.$/)).toBeVisible();
+    await expect(page.getByText('Session status unknown', { exact: true })).toBeVisible();
+    await expect(page.getByText('Evidence hold unknown', { exact: true })).toBeVisible();
+    await expect(page.getByText(/1 with a session status that could not be read and 1 with an evidence hold that could not be read\./)).toBeVisible();
+    await expect(page.getByText('Held for evidence', { exact: true })).toHaveCount(0);
+    await auditA11y(page, testInfo, 'ashby-cut-and-unknown', { strict: true });
+    app.expectHealthy();
+  });
 });

@@ -1704,7 +1704,8 @@ export interface AshbyMcWorkflow {
   ingestionState: string | null;
   operations: AshbyMcWorkflowOperation[];
   /**
-   * Screening-session status, or null when no session exists yet. A `completed`
+   * Screening-session status, or null when no session exists yet (`sessionId`
+   * is null too) or when it could not be read (`sessionId` is set). A `completed`
    * session on a non-terminal workflow whose lifecycle is not
    * `writeback_pending` is a screening whose completion park did not land.
    */
@@ -1764,11 +1765,15 @@ export interface AshbyCandidateWorkflowResponse {
 export interface AshbyMcMappingsResponse {
   ok: boolean;
   mappings: AshbyMcMapping[];
+  /** Older live mappings exist past this page, which has no offset. Absent on older APIs. */
+  truncated?: boolean;
 }
 
 export interface AshbyMcWorkflowsResponse {
   ok: boolean;
   workflows: AshbyMcWorkflow[];
+  /** Older workflows exist past this page, which has no offset. Absent on older APIs. */
+  truncated?: boolean;
 }
 
 /**

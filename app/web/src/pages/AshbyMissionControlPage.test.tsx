@@ -461,16 +461,97 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     expect(screen.getByText(/\b1 held for interview evidence\b/)).toBeInTheDocument();
   });
 
-  it('C3: no evidence badge when not held, unreadable (null) or absent', async () => {
+  it('C3: no evidence badge at all when not held, or when an older API sends nothing', async () => {
+    const parked = { ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed' };
     listAshbyWorkflows.mockResolvedValue({
       ok: true,
       workflows: [
-        { ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed', heldForEvidence: false },
+        { ...parked, heldForEvidence: false },
+        { ...parked, applicationLinkId: 'l2', externalApplicationId: 'app_2' },
       ],
     });
     renderPage();
-    expect(await screen.findByText('app_1')).toBeInTheDocument();
+    expect(await screen.findByText('app_2')).toBeInTheDocument();
     expect(screen.queryByText('Held for evidence')).toBeNull();
+    expect(screen.queryByText('Evidence hold unknown')).toBeNull();
+  });
+
+  it('C3: an unreadable hold (null) says it is unknown, never reads as not held, and is counted', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [
+        { ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed', heldForEvidence: null },
+      ],
+    });
+    renderPage();
+    expect(await screen.findByText('Evidence hold unknown')).toBeInTheDocument();
+    expect(screen.queryByText('Held for evidence')).toBeNull();
+    expect(screen.getByText(/\b1 with an evidence hold that could not be read\b/)).toBeInTheDocument();
+  });
+
+  it('says a session status is unknown when the row names a session whose status did not come back', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [
+        { ...WORKFLOWS.workflows[0], lifecycle: 'ready', sessionId: 'sess-1', sessionStatus: null },
+        // Same read outcome, nothing to warn about: already parked, or closed.
+        { ...WORKFLOWS.workflows[0], applicationLinkId: 'l2', externalApplicationId: 'app_2', lifecycle: 'writeback_pending', sessionId: 'sess-2', sessionStatus: null },
+        { ...WORKFLOWS.workflows[0], applicationLinkId: 'l3', externalApplicationId: 'app_3', lifecycle: 'ready', terminalState: 'withdrawn', sessionId: 'sess-3', sessionStatus: null },
+        // No session yet is not "unknown".
+        { ...WORKFLOWS.workflows[0], applicationLinkId: 'l4', externalApplicationId: 'app_4', lifecycle: 'ready', sessionId: null, sessionStatus: null },
+      ],
+    });
+    renderPage();
+    expect(await screen.findByText('Session status unknown')).toBeInTheDocument();
+    expect(screen.getAllByText('Session status unknown')).toHaveLength(1);
+    expect(screen.queryByText('Not queued for write-back')).toBeNull();
+    expect(screen.getByText(/\b1 with a session status that could not be read\b/)).toBeInTheDocument();
+  });
+
+  it('says plainly when the workflow list is only the newest rows, in the count and the summary', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      truncated: true,
+      workflows: [
+        WORKFLOWS.workflows[0],
+        { ...WORKFLOWS.workflows[0], applicationLinkId: 'l2', externalApplicationId: 'app_2', operations: [] },
+      ],
+    });
+    renderPage();
+    expect(await screen.findByText('Newest 2')).toBeInTheDocument();
+    expect(
+      screen.getByText(/^In the newest 2 applications: .*1 with a failed operation.* Older applications are not shown or counted\.$/),
+    ).toBeInTheDocument();
+  });
+
+  it('says so even when the cut list has nothing to flag', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      truncated: true,
+      workflows: [
+        { ...WORKFLOWS.workflows[0], ingestionState: 'ready', operations: [] },
+        { ...WORKFLOWS.workflows[0], applicationLinkId: 'l2', externalApplicationId: 'app_2', ingestionState: 'ready', operations: [] },
+      ],
+    });
+    renderPage();
+    expect(
+      await screen.findByText('Showing the newest 2 applications. Older applications are not shown or counted.'),
+    ).toBeInTheDocument();
+  });
+
+  it('says plainly when the mapping list is only the newest rows', async () => {
+    listAshbyMappings.mockResolvedValue({ ...MAPPINGS, truncated: true });
+    renderPage();
+    expect(await screen.findByText(`Newest ${MAPPINGS.mappings.length}`)).toBeInTheDocument();
+    expect(screen.getByText(/^In the newest \d+ mappings: .* Older mappings are not shown or counted\.$/)).toBeInTheDocument();
+  });
+
+  it('claims no cut when the API reports none, or does not report at all', async () => {
+    listAshbyWorkflows.mockResolvedValue({ ...WORKFLOWS, truncated: false });
+    renderPage();
+    expect(await screen.findByText('app_1')).toBeInTheDocument();
+    expect(screen.queryByText(/^Newest \d/)).toBeNull();
+    expect(screen.queryByText(/not shown or counted/)).toBeNull();
   });
 
   it('M017: says "Intake: Phone parsing" and the check outcome, in place of a resume import', async () => {

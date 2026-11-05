@@ -18,21 +18,17 @@
  *
  * Each route must answer correctly with complete data, or fail closed with an
  * explicit error. Never silently partial: `expectNoSilentLimit` fails a test
- * whose route sent an oversized `.in()` or had a response cut by the row cap,
- * even when the route itself answered 200.
+ * whose route sent an oversized `.in()`, had a response cut by the row cap, or
+ * stopped its own read at exactly the row cap with more rows left, even when
+ * the route itself answered 200. A route that bounds a list on purpose answers
+ * with a `truncated` flag, and its test asserts the flag.
  *
- * Reads that are NOT driven here, and why:
- *   - per-candidate reads (/:id, phone attempts and cycles, notes, appeals,
- *     Ashby review): bounded by one candidate's history, not the workspace
- *     (the CSV export is the exception below: its transcript can pass 1000 rows);
- *   - client-paged lists (/api/admin/audit, /sessions, /quotas,
- *     /funnel/candidates): each request is one explicit `.range()` page;
- *   - /api/phone/calendar/slots: one IST day, capped at 400 live appointments
- *     with an explicit `occupancy_truncated` flag, and no id-list read;
- *   - /api/roles: grows with roles, not candidates, and already reads its
- *     mappings in batches of 100.
+ * Every GET route of the app is either driven here (DRIVEN_ROUTES) or named
+ * with the reason it is not (NOT_DRIVEN), and the suite ends by walking the
+ * app's router stack: a new GET route fails CI until someone decides which.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import express, { type Express } from 'express';
 import request from 'supertest';
 import { createApp } from '../app.js';
 import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
@@ -77,17 +73,31 @@ function appFor(user: AuthUser) {
   });
 }
 
-const get = (path: string, user: AuthUser) =>
-  request(appFor(user)).get(path).set('Authorization', `Bearer ${JWT}`).timeout(REQUEST_TIMEOUT_MS);
+/** Every path this suite really requested, for the inventory at the end. */
+const requested = new Set<string>();
+
+const get = (path: string, user: AuthUser) => {
+  requested.add(path.split('?')[0]);
+  return request(appFor(user)).get(path).set('Authorization', `Bearer ${JWT}`).timeout(REQUEST_TIMEOUT_MS);
+};
 
 const label = (q: RecordedQuery): string =>
   `${q.table}: ${q.inValues ? `in(${q.inValues.length} values)` : 'no in()'}, matched ${q.matched}, returned ${q.returned}`;
 
-/** The guard: no read went past the id batch size, none was cut by the row cap, the double modelled every call. */
-function expectNoSilentLimit(): void {
+/**
+ * The guard: no read went past the id batch size, none was cut by the row cap,
+ * none stopped itself at the row cap with rows left, the double modelled every
+ * call. `reportsCut` names the tables whose route states such a stop in its own
+ * answer; the test must assert that flag.
+ */
+function expectNoSilentLimit(reportsCut: readonly string[] = []): void {
   expect(engine.unsupported, 'builder methods the test double does not model').toEqual([]);
   expect(engine.overflows().map(label), `reads over more than ${ID_BATCH_SIZE} ids (undici refuses past ~390)`).toEqual([]);
   expect(engine.truncations().map(label), `reads cut at ${POSTGREST_MAX_ROWS} rows with no error`).toEqual([]);
+  expect(
+    engine.selfCaps().filter((q) => !reportsCut.includes(q.table)).map(label),
+    `reads that stop at exactly ${POSTGREST_MAX_ROWS} rows with more matched and no next page`,
+  ).toEqual([]);
 }
 
 beforeEach(() => {
@@ -132,6 +142,43 @@ describe('the guard itself', () => {
     const q = from('candidates').select('id');
     expect(() => (q.textSearch as () => void)()).toThrow(/not modelled/);
     expect(engine.unsupported).toEqual(['candidates.textSearch']);
+  });
+
+  describe('a read that stops itself at the row cap', () => {
+    const page = (first: number) => (from('candidates').select('id').range as (a: number, b: number) => PromiseLike<unknown>)(first, first + POSTGREST_MAX_ROWS - 1);
+
+    beforeEach(() => {
+      engine.tables.candidates = Array.from({ length: POSTGREST_MAX_ROWS * 2 + 5 }, (_, i) => ({ id: scaleIds.candidate(i) }));
+    });
+
+    it('is recorded for .limit(1000), which the row cap itself never cuts', async () => {
+      await (from('candidates').select('id').limit as (n: number) => PromiseLike<unknown>)(POSTGREST_MAX_ROWS);
+      expect(engine.truncations()).toEqual([]);
+      expect(engine.selfCaps()).toHaveLength(1);
+    });
+
+    it('is recorded for one .range(0, 999) that never reads the next page', async () => {
+      await page(0);
+      expect(engine.truncations()).toEqual([]);
+      expect(engine.selfCaps()).toHaveLength(1);
+    });
+
+    it('is recorded when paging stops early, naming the last page read', async () => {
+      await page(0);
+      await page(POSTGREST_MAX_ROWS);
+      expect(engine.selfCaps().map((q) => q.range)).toEqual([[POSTGREST_MAX_ROWS, POSTGREST_MAX_ROWS * 2 - 1]]);
+    });
+
+    it('is not recorded for a read paged to its short last page', async () => {
+      for (const first of [0, POSTGREST_MAX_ROWS, POSTGREST_MAX_ROWS * 2]) await page(first);
+      expect(engine.selfCaps()).toEqual([]);
+    });
+
+    it('is not recorded when the page holds everything that matched', async () => {
+      engine.tables.candidates.length = POSTGREST_MAX_ROWS;
+      await (from('candidates').select('id').limit as (n: number) => PromiseLike<unknown>)(POSTGREST_MAX_ROWS);
+      expect(engine.selfCaps()).toEqual([]);
+    });
   });
 });
 
@@ -243,6 +290,25 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
       expect(res.body.meta.hr_tracking_configured).toBe(true);
       expectNoSilentLimit();
     });
+
+    it('a rollup refresh committing between two page reads moves no total', async () => {
+      // Each row its own count, so a row read twice and a row never read cannot cancel out.
+      const rows = engine.tables.funnel_stage_daily;
+      let want = 0;
+      rows.forEach((r, k) => { r.entered_parse = k + 1; want += k + 1; });
+      let refreshes = 0;
+      engine.beforeExecute = (q) => {
+        if (q.table !== 'funnel_stage_daily' || !q.range || q.range[0] === 0) return;
+        // refresh_funnel_rollup deletes and reinserts: the same rows, all with new ids.
+        refreshes += 1;
+        rows.forEach((r, k) => { r.id = scaleIds.rollup(1_000_000 * refreshes + rows.length - k); });
+      };
+      const res = await get(`/api/funnel/summary${query}`, interviewer);
+      expect(res.status).toBe(200);
+      expect(refreshes, 'the summary read past one page').toBeGreaterThan(0);
+      expect(res.body.totals.entered_parse).toBe(want);
+      expectNoSilentLimit();
+    });
   });
 
   describe('GET /api/admin/funnel/failures', () => {
@@ -257,16 +323,23 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
         expect(res.body.truncated).toBe(false);
         expect(counted).toBe(ws.failures);
       }
-      expectNoSilentLimit();
+      // The route stops its own read at 1000 and reports it in `truncated`, asserted above.
+      expectNoSilentLimit(['v_funnel_failures']);
     });
   });
 
-  describe('GET Ashby Mission Control lists (largest page)', () => {
-    it('workflows: every row of the page has its session status and evidence hold', async () => {
-      const res = await get('/api/integrations/ashby/mission-control/workflows?limit=200', interviewer);
+  describe('GET Ashby Mission Control lists: one page, and a stated cut', () => {
+    // The page calls /workflows with no limit, so 50 is what an operator sees.
+    it.each([
+      ['as the page asks, with no limit', '', 50],
+      ['at the largest page', '?limit=200', 200],
+    ])('workflows %s: the newest rows, each with its session status and evidence hold, and truncated', async (_how, query, size) => {
+      const res = await get(`/api/integrations/ashby/mission-control/workflows${query}`, interviewer);
       expect(res.status).toBe(200);
       const rows = res.body.workflows as Row[];
-      expect(rows).toHaveLength(200);
+      expect(rows).toHaveLength(size);
+      expect(res.body.truncated).toBe(true);
+      expect(rows[0].applicationLinkId).toBe(scaleIds.link(n - 1));
       for (const row of rows) {
         const i = Number(String(row.applicationLinkId).slice(-12));
         expect(row.sessionStatus, `link ${i}`).toBe(i % 3 === 0 ? 'completed' : 'expired');
@@ -275,10 +348,19 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
       expectNoSilentLimit();
     });
 
-    it('mappings: the newest live mappings, up to the page size', async () => {
+    it('mappings at the default page: cut, and it says so', async () => {
+      const res = await get('/api/integrations/ashby/mission-control/mappings', interviewer);
+      expect(res.status).toBe(200);
+      expect(res.body.mappings).toHaveLength(50);
+      expect(res.body.truncated).toBe(true);
+      expectNoSilentLimit();
+    });
+
+    it('mappings as the page asks, at the largest page: every live one, or a stated cut', async () => {
       const res = await get('/api/integrations/ashby/mission-control/mappings?limit=200', interviewer);
       expect(res.status).toBe(200);
       expect(res.body.mappings).toHaveLength(Math.min(ws.mappings, 200));
+      expect(res.body.truncated).toBe(ws.mappings > 200);
       expectNoSilentLimit();
     });
   });
@@ -306,6 +388,42 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
       expect(res.status).toBe(500);
       expect(res.body).toEqual({ ok: false, error: 'phone_read_error' });
     });
+  });
+});
+
+describe('GET the funnel summary when HR tracking was observed on one late mapping only', { timeout: TEST_TIMEOUT_MS }, () => {
+  const summary = () => get(`/api/funnel/summary?from=${FUNNEL_FROM}&to=${FUNNEL_TO}`, interviewer);
+  let ws: ScaleWorkspace;
+
+  beforeEach(() => {
+    ws = seedScaleWorkspace(engine.tables, 5000);
+    for (const link of engine.tables.ashby_application_links) {
+      link.stage_synced_at = null;
+      link.external_stage_id = null;
+    }
+  });
+
+  it('finds it past the 200th mapping, so the dashboard never says "Not tracked yet" over live tracking', async () => {
+    const late = 230;
+    expect(ws.mappings).toBeGreaterThan(late);
+    const link = engine.tables.ashby_application_links.find((l) => l.job_mapping_id === scaleIds.mapping(late))!;
+    link.stage_synced_at = scaleIso(late);
+    link.external_stage_id = `stage_ref_${late}`;
+    const res = await summary();
+    expect(res.status).toBe(200);
+    expect(res.body.meta.hr_tracking_configured).toBe(true);
+    expectNoSilentLimit();
+  });
+
+  it('answers false only after asking about every mapping', async () => {
+    const res = await summary();
+    expect(res.status).toBe(200);
+    expect(res.body.meta.hr_tracking_configured).toBe(false);
+    const asked = engine.queries
+      .filter((q) => q.table === 'ashby_application_links')
+      .flatMap((q) => q.inValues ?? []);
+    expect(new Set(asked).size).toBe(ws.mappings);
+    expectNoSilentLimit();
   });
 });
 
@@ -412,5 +530,166 @@ describe('GET /api/export/:candidateId/csv for a candidate with a long history',
     engine.failWhen = (q) => q.table === 'assessments';
     const res = await get(`/api/export/${candidate}/csv`, admin);
     expect(res.status).toBeGreaterThanOrEqual(500);
+  });
+});
+
+// ── The inventory: a new GET route cannot skip the guard unnoticed ────────────
+
+/** Routes above, each of which reads over a list that grows with the workspace. */
+const DRIVEN_ROUTES = [
+  '/api/admin/funnel/failures',
+  '/api/admin/funnel/summary',
+  '/api/candidates',
+  '/api/candidates/summary',
+  '/api/export/:candidateId/csv',
+  '/api/funnel/summary',
+  '/api/integrations/ashby/mission-control/mappings',
+  '/api/integrations/ashby/mission-control/workflows',
+  '/api/notifications',
+  '/api/phone/calendar',
+];
+
+const ONE_CANDIDATE = "bounded by one candidate's history, not the workspace";
+const ONE_RECORD = 'reads one record, or one configuration singleton, by key';
+const CLIENT_PAGED = "each request is one explicit .range() page at the client's offset";
+const COUNTS_ONLY = 'head counts and one-row lookups, over constant lists of states and queue names';
+const NO_DB_LIST = 'no read that grows with the workspace';
+const STAFF_SIZED = 'grows with staff or configuration, not candidates';
+const ASHBY_READ = 'a live Ashby read, walked and bounded by the probe; no database list';
+
+/**
+ * Every other GET route, and why this suite does not drive it. Add a route here
+ * only with a reason that holds at 5,000 candidates: if it reads over a list
+ * that grows with the workspace, drive it above instead.
+ */
+const NOT_DRIVEN: Record<string, string> = {
+  '/api/admin/allowlist': STAFF_SIZED,
+  '/api/admin/audit': CLIENT_PAGED,
+  '/api/admin/funnel/candidates': CLIENT_PAGED,
+  '/api/admin/members': STAFF_SIZED,
+  '/api/admin/quotas': CLIENT_PAGED,
+  '/api/admin/r1/recording-health': COUNTS_ONLY,
+  '/api/admin/r1/settings': ONE_RECORD,
+  '/api/admin/r1/usage': ONE_RECORD,
+  '/api/admin/sessions': CLIENT_PAGED,
+  '/api/appeals': ONE_CANDIDATE,
+  '/api/candidate-consent/template': ONE_RECORD,
+  '/api/candidates/:id': ONE_CANDIDATE,
+  '/api/candidates/:id/ashby-workflow': ONE_CANDIDATE,
+  '/api/candidates/:id/interview-rounds': ONE_CANDIDATE,
+  '/api/candidates/:id/phone-attempts': ONE_CANDIDATE,
+  '/api/candidates/:id/phone-cycles': ONE_CANDIDATE,
+  '/api/consent/:candidateId/status': ONE_CANDIDATE,
+  '/api/consent/templates': STAFF_SIZED,
+  // With include_export: one data subject. lib/dsar.ts reads transcript_turns by
+  // a column that table does not have (0001_init.sql): a defect of its own, not of scale.
+  '/api/dsar/:dsarId': ONE_CANDIDATE,
+  '/api/dsar/candidate/:candidateId': ONE_CANDIDATE,
+  '/api/dsar/legal-holds/:holdId': ONE_RECORD,
+  '/api/dsar/legal-holds/check': ONE_RECORD,
+  '/api/health': NO_DB_LIST,
+  '/api/integrations/ashby/mission-control/health': COUNTS_ONLY,
+  '/api/integrations/ashby/mission-control/jobs': ASHBY_READ,
+  '/api/integrations/ashby/mission-control/jobs/:externalJobId/feedback-form': ASHBY_READ,
+  '/api/integrations/ashby/mission-control/jobs/:externalJobId/stages': ASHBY_READ,
+  '/api/integrations/ashby/mission-control/mappings/:id/scorecard-binding': ONE_RECORD,
+  '/api/integrations/ashby/review/:applicationLinkId': ONE_CANDIDATE,
+  '/api/integrations/ashby/review/:applicationLinkId/notes': ONE_CANDIDATE,
+  '/api/integrations/ashby/review/:applicationLinkId/workflow': ONE_CANDIDATE,
+  '/api/internal/phone/attempt/:attemptId/answered': ONE_RECORD,
+  '/api/interview-rounds/:id/recording': ONE_RECORD,
+  '/api/interview-rounds/availability': ONE_RECORD,
+  '/api/me': ONE_RECORD,
+  '/api/notes': ONE_CANDIDATE,
+  '/api/phone/calendar/slots': 'one IST day, capped at 400 live appointments with an explicit occupancy_truncated flag, and no id-list read',
+  '/api/phone/engagements/:id': ONE_RECORD,
+  '/api/phone/health': COUNTS_ONLY,
+  '/api/phone/suppressions/:candidateId': ONE_CANDIDATE,
+  '/api/recordings/:sessionId/download': ONE_RECORD,
+  '/api/recordings/attempts/:attemptId/download': ONE_RECORD,
+  '/api/recordings/health': COUNTS_ONLY,
+  '/api/roles': 'grows with roles, not candidates, and reads its mappings in batches of 100',
+  '/api/roles/:id': ONE_RECORD,
+  '/api/roles/draft': ONE_RECORD,
+  '/api/roles/draft/:id': ONE_RECORD,
+  '/api/scorecards/metrics': STAFF_SIZED,
+  '/api/scorecards/roles/:roleId/scorecard': ONE_RECORD,
+  '/api/screening/:id': ONE_RECORD,
+  '/api/status': NO_DB_LIST,
+};
+
+interface RouterLayer {
+  name: string;
+  route?: { path: unknown; methods: Record<string, boolean | undefined> };
+  handle: { stack?: RouterLayer[] };
+  regexp: RegExp & { fast_slash?: boolean };
+}
+
+/** The path an Express 4 `app.use('/x', router)` was mounted at, from its compiled regexp. */
+function mountPathOf(layer: RouterLayer): string {
+  if (layer.regexp.fast_slash) return '';
+  const mount = layer.regexp.source
+    .replace(String.raw`\/?(?=\/|$)`, '')
+    .replace(/^\^/, '')
+    .split(String.raw`\/`)
+    .join('/');
+  // A mount holding a parameter or a pattern would be misread, so refuse it.
+  if (!/^[/\w-]+$/.test(mount)) throw new Error(`cannot read a mount path from ${String(layer.regexp)}`);
+  return mount;
+}
+
+/** Every GET path `app` mounts, at any depth, without a trailing slash. */
+function mountedGetRoutes(app: Express): string[] {
+  const router = (app as unknown as { _router?: { stack: RouterLayer[] } })._router;
+  // Express 4 keeps this private. A major upgrade fails here, loudly, not by finding no routes.
+  if (!router) throw new Error('app._router is gone: teach mountedGetRoutes the new router stack');
+  const walk = (stack: RouterLayer[], prefix: string): string[] => stack.flatMap((layer) => {
+    if (layer.route) return layer.route.methods.get ? [`${prefix}${String(layer.route.path)}`.replace(/\/$/, '')] : [];
+    if (layer.name === 'router' && layer.handle.stack) return walk(layer.handle.stack, prefix + mountPathOf(layer));
+    return [];
+  });
+  return [...new Set(walk(router.stack, ''))].sort();
+}
+
+describe('the inventory of GET routes', () => {
+  const classified = new Set([...DRIVEN_ROUTES, ...Object.keys(NOT_DRIVEN)]);
+
+  it('finds a route added to any mounted router, and only GET routes', () => {
+    const nested = express.Router();
+    nested.get('/digest', (_req, res) => { res.end(); });
+    nested.post('/digest', (_req, res) => { res.end(); });
+    const app = express();
+    app.use('/api/candidates', nested);
+    app.get('/api/top', (_req, res) => { res.end(); });
+    expect(mountedGetRoutes(app)).toEqual(['/api/candidates/digest', '/api/top']);
+  });
+
+  it('classifies every GET route the app mounts', () => {
+    const mounted = mountedGetRoutes(appFor(admin));
+    expect(mounted.length).toBeGreaterThan(DRIVEN_ROUTES.length);
+    expect(
+      mounted.filter((route) => !classified.has(route)),
+      'a new GET route: drive it in this suite if it reads over a list that grows with the workspace, or add it to NOT_DRIVEN with the reason',
+    ).toEqual([]);
+  });
+
+  it('lists no route the app no longer mounts', () => {
+    const mounted = new Set(mountedGetRoutes(appFor(admin)));
+    expect([...classified].filter((route) => !mounted.has(route))).toEqual([]);
+  });
+
+  it('never lists a route as both driven and not driven', () => {
+    expect(DRIVEN_ROUTES.filter((route) => route in NOT_DRIVEN)).toEqual([]);
+  });
+
+  // Runs last, so it sees what the cases above really requested. Skipped by a
+  // `-t` filter that selects only the inventory, which requests nothing.
+  it('really drives every route it calls driven', () => {
+    if (requested.size === 0) return;
+    const undriven = DRIVEN_ROUTES.filter((route) => {
+      const pattern = new RegExp(`^${route.replace(/:\w+/g, '[^/]+')}$`);
+      return ![...requested].some((path) => pattern.test(path));
+    });
+    expect(undriven).toEqual([]);
   });
 });

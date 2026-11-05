@@ -434,7 +434,7 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', '/api/admin/r1/usage', () => ok(R1_USAGE)],
 
   // ── Ashby Mission Control ──────────────────────────────────────────
-  ['GET', `${ASHBY}/mappings`, (_r, db) => ok({ ok: true, mappings: db.ashby.mappings })],
+  ['GET', `${ASHBY}/mappings`, (_r, db) => ok({ ok: true, mappings: db.ashby.mappings, truncated: db.ashby.mappingsTruncated === true })],
   ['POST', `${ASHBY}/mappings`, ({ body }, db) => {
     const id = mintId();
     db.ashby.mappings.push({ id, externalJobId: String(body?.external_job_id ?? ''), status: 'paused', statusReason: null, deliveryMode: String(body?.delivery_mode ?? 'email'), hasAiStage: true, hasTaStage: true, label: (body?.label as string | null) ?? null, roleId: String(body?.role_id ?? ''), updatedAt: nowIso() });
@@ -461,7 +461,7 @@ const ROUTES: Array<[string, string, Handler]> = [
   }],
   ['POST', `${ASHBY}/mappings/:id/backlog/confirm`, ({ body }) => ok({ ok: true, status: 'queued', run_id: String(body?.run_id ?? ''), queued_count: Number(body?.expected_count ?? 0) })],
   ['GET', `${ASHBY}/mappings/:id/scorecard-binding`, (_r, db) => ok(db.ashby.bindingPreview)],
-  ['GET', `${ASHBY}/workflows`, (_r, db) => ok({ ok: true, workflows: db.ashby.workflows })],
+  ['GET', `${ASHBY}/workflows`, (_r, db) => ok({ ok: true, workflows: db.ashby.workflows, truncated: db.ashby.workflowsTruncated === true })],
   ['POST', `${ASHBY}/workflows/:id/cancel`, () => ok({ ok: true, status: 'cancelled', cancelled_operations: 1, cancelled_ingestion: 0 })],
   ['POST', `${ASHBY}/workflows/:id/invite`, () => ok({ ok: true, invite_id: mintId(), join_url: 'https://hello.example.com/candidate/join#invite=e2e-one-time-token', expires_at: new Date(FROZEN_NOW_MS + 24 * 3_600_000).toISOString(), ttl_hours: 24, revoked_invites: 0 } satisfies AshbyManualInviteResponse)],
   ['GET', `${ASHBY}/jobs`, (_r, db) => ok({ ok: true, jobs: db.ashby.jobs, truncated: false, withheld: db.ashby.withheld })],

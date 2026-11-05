@@ -354,6 +354,9 @@ export function AshbyMissionControlPage() {
    */
   const deleteReturnFocus = useRef<HTMLElement | null>(null);
   const [workflows, setWorkflows] = useState<AshbyMcWorkflow[]>([]);
+  /** The API left older rows out of the list. See `newestOnly`. */
+  const [mappingsTruncated, setMappingsTruncated] = useState(false);
+  const [workflowsTruncated, setWorkflowsTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -433,7 +436,9 @@ export function AshbyMissionControlPage() {
     try {
       const [m, w] = await Promise.all([api.listAshbyMappings(), api.listAshbyWorkflows()]);
       setMappings(m.mappings);
+      setMappingsTruncated(m.truncated === true);
       setWorkflows(w.workflows);
+      setWorkflowsTruncated(w.truncated === true);
       setError(null);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : 'Failed to load Ashby Live Jobs');
@@ -1101,25 +1106,39 @@ export function AshbyMissionControlPage() {
   /* What needs a look, said once above each list instead of left for the
      reader to count down the rows. */
   const mappingSummary = loaded
-    ? sentence([
-        [mappings.filter((m) => m.status === 'enabled').length, 'live'],
-        [mappings.filter((m) => m.status === 'paused').length, 'paused'],
-        [mappings.filter((m) => m.status === 'drift').length, 'out of sync'],
-      ])
+    ? newestOnly(
+        sentence([
+          [mappings.filter((m) => m.status === 'enabled').length, 'live'],
+          [mappings.filter((m) => m.status === 'paused').length, 'paused'],
+          [mappings.filter((m) => m.status === 'drift').length, 'out of sync'],
+        ]),
+        mappingsTruncated,
+        mappings.length,
+        'mappings',
+      )
     : null;
   const workflowSummary = loaded
-    ? sentence([
-        [workflows.filter((w) => w.operations.some((op) => op.state === 'failed')).length, 'with a failed operation'],
-        [workflows.filter(notQueuedForWriteback).length, 'not queued for write-back'],
-        [workflows.filter((w) => w.heldForEvidence === true).length, 'held for interview evidence'],
-        // A phone-parsing link's `failed_review` resume was set aside, not
-        // left for review: it fell back to phone parsing (M017).
-        [
-          workflows.filter((w) => w.ingestionState === 'failed_review' && w.intakeType !== 'phone_parsing')
-            .length,
-          'with a resume to review',
-        ],
-      ])
+    ? newestOnly(
+        sentence([
+          [workflows.filter((w) => w.operations.some((op) => op.state === 'failed')).length, 'with a failed operation'],
+          [workflows.filter(notQueuedForWriteback).length, 'not queued for write-back'],
+          [workflows.filter((w) => w.heldForEvidence === true).length, 'held for interview evidence'],
+          // A phone-parsing link's `failed_review` resume was set aside, not
+          // left for review: it fell back to phone parsing (M017).
+          [
+            workflows.filter((w) => w.ingestionState === 'failed_review' && w.intakeType !== 'phone_parsing')
+              .length,
+            'with a resume to review',
+          ],
+          // Said here too: a row that cannot be read must not lower the counts
+          // above without anything saying why.
+          [workflows.filter(sessionStatusUnreadable).length, 'with a session status that could not be read'],
+          [workflows.filter((w) => w.heldForEvidence === null).length, 'with an evidence hold that could not be read'],
+        ]),
+        workflowsTruncated,
+        workflows.length,
+        'applications',
+      )
     : null;
 
   const workflowRows = (
@@ -1214,6 +1233,22 @@ export function AshbyMissionControlPage() {
                   <StatusBadge tone="warning">
                     <span title="The newest scorecard was graded insufficient interview evidence, so it is held for review and will not be written to Ashby. A re-screen is recommended.">
                       Held for evidence
+                    </span>
+                  </StatusBadge>
+                )}
+                {/* The API's fail-closed answers. Without these, a read that
+                    failed looks exactly like a row with nothing wrong. */}
+                {sessionStatusUnreadable(w) && (
+                  <StatusBadge tone="neutral">
+                    <span title="The screening session's status could not be read just now, so this row cannot say whether its scorecard is queued for Ashby. Reload the page to check again.">
+                      Session status unknown
+                    </span>
+                  </StatusBadge>
+                )}
+                {w.heldForEvidence === null && (
+                  <StatusBadge tone="neutral">
+                    <span title="Whether this scorecard is held for interview evidence could not be read just now. Reload the page to check again.">
+                      Evidence hold unknown
                     </span>
                   </StatusBadge>
                 )}
@@ -1379,7 +1414,9 @@ export function AshbyMissionControlPage() {
               title="Job mappings"
               meta={
                 loaded ? (
-                  <span className="text-label tabular-nums text-ink-tertiary">{mappings.length}</span>
+                  <span className="text-label tabular-nums text-ink-tertiary">
+                    {mappingsTruncated ? `Newest ${mappings.length}` : mappings.length}
+                  </span>
                 ) : undefined
               }
               description={mappingSummary ?? undefined}
@@ -1585,7 +1622,9 @@ export function AshbyMissionControlPage() {
               title="Application workflows"
               meta={
                 loaded ? (
-                  <span className="text-label tabular-nums text-ink-tertiary">{workflows.length}</span>
+                  <span className="text-label tabular-nums text-ink-tertiary">
+                    {workflowsTruncated ? `Newest ${workflows.length}` : workflows.length}
+                  </span>
                 ) : undefined
               }
               description={workflowSummary ?? undefined}
@@ -2290,6 +2329,15 @@ function notQueuedForWriteback(w: AshbyMcWorkflow): boolean {
 }
 
 /**
+ * The row names a session whose status did not come back (the API read them in
+ * batches, and a failed batch leaves its rows null), on a workflow where that
+ * status decides `notQueuedForWriteback`: the warning may be hiding here.
+ */
+function sessionStatusUnreadable(w: AshbyMcWorkflow): boolean {
+  return Boolean(w.sessionId) && w.sessionStatus == null && w.terminalState == null && w.lifecycle !== 'writeback_pending';
+}
+
+/**
  * Counts as one sentence — "1 live, 1 paused and 1 out of sync." — leaving
  * out whatever is zero; null when everything is.
  */
@@ -2298,6 +2346,18 @@ function sentence(parts: Array<[number, string]>): string | null {
   if (said.length === 0) return null;
   const last = said.pop()!;
   return `${said.length > 0 ? `${said.join(', ')} and ` : ''}${last}.`;
+}
+
+/**
+ * A list the API cut says so: it holds the newest rows only, so its count and
+ * every figure in its summary are of those rows, and something older (a failed
+ * write-back, say) is not "not there".
+ */
+function newestOnly(summary: string | null, truncated: boolean, count: number, noun: string): string | null {
+  if (!truncated) return summary;
+  const scope = `the newest ${count} ${noun}`;
+  const older = `Older ${noun} are not shown or counted.`;
+  return summary ? `In ${scope}: ${summary} ${older}` : `Showing ${scope}. ${older}`;
 }
 
 /**

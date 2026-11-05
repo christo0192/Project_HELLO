@@ -50,6 +50,9 @@ import {
   maintenanceMeta,
 } from './statusMeta';
 
+/** GET /api/admin/sessions answers one page of at most this many, and no total. */
+const ADMIN_SESSIONS_PAGE = 100;
+
 interface SourceState<T> {
   data: T | null;
   error: string | null;
@@ -123,6 +126,9 @@ export function OverviewSection() {
   const activeNow = sessionsData.filter((s) =>
     ['created', 'waiting', 'in_progress'].includes(s.status),
   ).length;
+  // A full page may be all there is, or only the front of a longer list: the
+  // figures below then cover that page and say so, like the audit figure.
+  const sessionsPageFull = sessionsData.length >= ADMIN_SESSIONS_PAGE;
   const linkedAccess = allowlistData.filter(
     (e) => e.active && e.linked_user_id != null,
   ).length;
@@ -192,12 +198,12 @@ export function OverviewSection() {
             figure(sessions, {
               label: 'Sessions',
               value: sessionsData.length,
-              context: 'In the admin session view',
+              context: sessionsPageFull ? `The ${ADMIN_SESSIONS_PAGE} most recently updated` : 'In the admin session view',
             }),
             figure(sessions, {
               label: 'Active sessions',
               value: activeNow,
-              context: 'Created, waiting or in progress',
+              context: sessionsPageFull ? `Within the ${ADMIN_SESSIONS_PAGE} most recently updated` : 'Created, waiting or in progress',
             }),
             figure(allowlist, {
               label: 'Linked access',
@@ -224,7 +230,11 @@ export function OverviewSection() {
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <ChartCard
           title="Session status mix"
-          description={`${sessionsData.length} sessions in the admin view, largest first.`}
+          description={
+            sessionsPageFull
+              ? `The ${ADMIN_SESSIONS_PAGE} most recently updated sessions, largest first.`
+              : `${sessionsData.length} sessions in the admin view, largest first.`
+          }
         >
           {sessions.error ? (
             <SourceError label="Session status mix" detail={sessions.error} onRetry={load} />
@@ -243,7 +253,11 @@ export function OverviewSection() {
 
         <ChartCard
           title="Session activity"
-          description="Sessions created per day, last 14 days."
+          description={
+            sessionsPageFull
+              ? `Sessions created per day, last 14 days, within the ${ADMIN_SESSIONS_PAGE} most recently updated.`
+              : 'Sessions created per day, last 14 days.'
+          }
         >
           {sessions.error ? (
             <SourceError label="Session activity" detail={sessions.error} onRetry={load} />

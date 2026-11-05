@@ -8540,6 +8540,9 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AshbyMcMapping'
+        truncated:
+          type: boolean
+          description: True when older live mappings exist past this page, which has no offset.
       additionalProperties: false
 
     AshbyBacklogPreview:
@@ -9207,6 +9210,9 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AshbyMcWorkflow'
+        truncated:
+          type: boolean
+          description: True when older workflows exist past this page, which has no offset.
       additionalProperties: false
 
     AshbyCandidateWorkflowOperation:
