@@ -8,7 +8,7 @@
   - The repo's in-worker recorder is phone-only (`app/voice-livekit/recording_api.py:38,87-107`).
   - The browser lane records through Cloud Egress when `RECORDING_EGRESS_ENABLED` is on (`app/api/src/lib/room-provisioning.ts:186`, `recording-egress.ts:264-305`). Otherwise it falls back to a candidate-mic-only upload from the browser (`CandidateJoinPage.tsx:412-467`).
   - Recording R1 camera video in the worker is new work.
-- **Production has no CSP.** The CSP builder only runs under `vite serve` (`app/web/vite-csp-plugin.ts:83`), and `vercel.json` sends no CSP header. Switching between Cloud and the self-hosted server does not need a Vercel rebuild.
+- **Production has no CSP.** The CSP builder only runs under `vite serve` (`app/web/vite-csp-plugin.ts:83`), and `vercel.json` sends no headers. Switching between Cloud and the self-hosted server does not need a Vercel rebuild.
 - **`provisionRoomForCreatedSession` is called only by browser code** (`invites.ts:458`, `routes/livekit.ts:209`). The phone path imports only `requireLiveKitConfigured` (`integrations/livekit-phone-dial/phone-room.ts:40,266`).
 
 ---
