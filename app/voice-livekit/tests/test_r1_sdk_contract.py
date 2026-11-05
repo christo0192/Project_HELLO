@@ -447,6 +447,28 @@ class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tap._RecorderAudioOutput__pause_wall_times, [])
         self.assertIs(tap.recorder_io, tap._RecorderAudioOutput__recording_io)
 
+    def test_the_room_reports_the_first_played_frame_up_the_chain_and_again_after_a_resume(self) -> None:
+        """The keep-pauses tap moves its clock to the first played frame of each playback, which is what the
+        row is anchored at.  The room's task reports it, later than the tap saw the frame, and reports again
+        after every resume, which is no new start.  A fact about 1.6.4.
+        """
+        from livekit.agents.voice import io as voice_io
+        from livekit.agents.voice.room_io._output import _ParticipantAudioOutput
+
+        forward = inspect.getsource(_ParticipantAudioOutput._forward_audio)
+        self.assertIn("if not self._first_frame_event.is_set():", forward)
+        self.assertIn("self.on_playback_started(created_at=time.time())", forward)
+        self.assertIn("self._first_frame_event.clear()", inspect.getsource(_ParticipantAudioOutput.resume))
+        self.assertIn("self._first_frame_event.clear()", inspect.getsource(_ParticipantAudioOutput._wait_for_playout))
+        self.assertIn(
+            "self.on_playback_started(created_at=ev.created_at)",
+            inspect.getsource(voice_io.AudioOutput._forward_next_playback_started),
+        )
+        self.assertIn(
+            'next_in_chain.on("playback_started", self._forward_next_playback_started)',
+            inspect.getsource(voice_io.AudioOutput.__init__),
+        )
+
     def test_the_first_input_chunk_is_padded_once_with_silence_the_mixer_can_recognise(self) -> None:
         """What the tee's trim of a chunk that is ahead of the clock relies on (review round 1).
 
@@ -1591,6 +1613,7 @@ class TestR1PipelineOnARealSession(unittest.IsolatedAsyncioTestCase):
 
         import numpy as np
         from livekit.agents.voice import io as vio
+        from livekit.agents.voice.recorder_io.recorder_io import RecorderAudioOutput
 
         import r1_recorder
         from tests.test_r1_recorder import FakeApi, FakeEncoder, StubHttp
@@ -1632,11 +1655,12 @@ class TestR1PipelineOnARealSession(unittest.IsolatedAsyncioTestCase):
             await recorder.start("candidate")
             chain, node = [], self.session.output.audio
             while node is not None:  # the SDK wraps what it is given in its own proxy
-                chain.append(type(node).__name__)
+                chain.append(node)
                 node = getattr(node, "next_in_chain", None)
-            self.assertIn("RecorderAudioOutput", chain)  # tapped ...
+            taps = [index for index, link in enumerate(chain) if isinstance(link, RecorderAudioOutput)]
+            self.assertEqual(len(taps), 1)  # tapped (the keep-pauses tap is a subclass) ...
             self.assertIsNot(self.session.output.audio, original_output)
-            self.assertTrue(chain.index("RecorderAudioOutput") < len(chain) - 1)  # ... in line, not at the end
+            self.assertLess(taps[0], len(chain) - 1)  # ... in line, not at the end
             pump_stop = asyncio.Event()
 
             async def pump() -> None:  # what the SDK's audio recognition does with the input

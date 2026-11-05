@@ -1033,18 +1033,41 @@ def _build_recorder_io_class() -> type:
         silence in place, and both readers of that one write (the stock OGG and ``TeeMixer``) get
         every frame at its real playout time.  With no silence the list stays as it was, and the write
         is byte for byte the stock one.
+
+        This tap sees a frame when it is handed over; the room's own task takes it later, and that is
+        the moment the row is anchored at (``on_playback_started``).  A stall of the event loop between
+        the two is no silence: nothing had played yet.  So the first report of a playback restarts the
+        clock from the real first frame, and takes back what the clock made of the wait.  Only that
+        report: the room repeats it after every resume.  A sink that never reports leaves the clock on
+        the hand-over.
         """
 
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self._playout_end: float | None = None
             self._paused_at: float | None = None
+            self._handed_over = 0.0  # seconds of this playback's audio given to the room so far
+            self._playing = False  # the room has reported this playback's first played frame
+            self._silences: list[tuple[float, float]] = []  # this playback's entries on the SDK's list
+            self.silence_kept_seconds = 0.0  # the whole call, as written
+            self.silences_kept = 0
 
         def _keep_silence_until(self, now: float) -> None:
             end = self._playout_end
             if end is not None and now - end > PLAYOUT_GAP_SLACK_SECONDS:
                 self._RecorderAudioOutput__pause_wall_times.append((end, now))
+                self._silences.append((end, now))
                 self._playout_end = now
+
+        def on_playback_started(self, *, created_at: float) -> None:
+            if not self._playing:
+                self._playing = True
+                if self.recorder_io.recording:
+                    for silence in self._silences:  # (the SDK's own pauses stay: they held the audio)
+                        self._RecorderAudioOutput__pause_wall_times.remove(silence)
+                    self._silences.clear()
+                    self._playout_end = created_at + self._handed_over
+            super().on_playback_started(created_at=created_at)
 
         async def capture_frame(self, frame: Any) -> None:
             await super().capture_frame(frame)
@@ -1055,6 +1078,7 @@ def _build_recorder_io_class() -> type:
             elif self._paused_at is None:
                 self._keep_silence_until(time.time())
             self._playout_end += frame.duration
+            self._handed_over += frame.duration
 
         def pause(self) -> None:
             if self._paused_at is None and self.recorder_io.recording:
@@ -1076,15 +1100,23 @@ def _build_recorder_io_class() -> type:
             interrupted: bool,
             synchronized_transcript: str | None = None,
         ) -> None:
-            if self.recorder_io.recording and self._paused_at is None:
+            recording = self.recorder_io.recording
+            if recording and self._paused_at is None:
                 self._keep_silence_until(time.time())
+            written = recording and self.has_pending_data  # (the SDK writes the line only then)
             super().on_playback_finished(
                 playback_position=playback_position,
                 interrupted=interrupted,
                 synchronized_transcript=synchronized_transcript,
             )
+            if written:
+                self.silence_kept_seconds += sum(end - start for start, end in self._silences)
+                self.silences_kept += len(self._silences)
             self._playout_end = None
             self._paused_at = None
+            self._handed_over = 0.0
+            self._playing = False
+            self._silences = []
 
     class _TeeQueue(queue.Queue):
         """A ``queue.Queue`` that also hands every item to the tee, stamped with the clock.
@@ -1123,6 +1155,11 @@ def _build_recorder_io_class() -> type:
                 return super().record_output(audio_output)
             self._out_record = _PlayoutOutput(recording_io=self, audio_output=audio_output, write_fnc=self._write_cb)
             return self._out_record
+
+        def kept_silence(self) -> tuple[float, int] | None:
+            """Seconds and stretches of silence put back in this call; ``None`` on the SDK's own tap."""
+            out = self._out_record
+            return (out.silence_kept_seconds, out.silences_kept) if isinstance(out, _PlayoutOutput) else None
 
         def close_capture(self) -> None:
             """Neither tap accumulates audio from now on (the interview is over)."""
@@ -2233,6 +2270,7 @@ class R1Recorder:
             "unknown_event",
             error_type="r1_rec_started",
             error_category=MODE_AV if self._video else MODE_AUDIO,
+            schema="keep_pauses" if keep_pauses_enabled() else "sdk_tap",  # which tap made this recording
         )
 
     def _decide_video(self) -> bool:
@@ -2673,6 +2711,14 @@ class R1Recorder:
                 error_type="r1_rec_finished",
                 error_category=layout,
                 duration_sec=int((self._media_ms() or 0) // 1000),
+            )
+        kept = self._io.kept_silence()
+        if kept is not None:
+            _log.info(
+                "unknown_event",
+                error_type="r1_rec_silence_kept",
+                duration_sec=round(kept[0], 1),
+                option_count=kept[1],
             )
         await self._teardown_child()
         self._worker.halt()

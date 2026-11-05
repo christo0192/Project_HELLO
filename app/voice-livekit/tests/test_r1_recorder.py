@@ -878,6 +878,12 @@ def _finish(at: float, position: float, interrupted: bool = False) -> tuple[floa
     return (at, "finish", position, interrupted)
 
 
+def _started(at: float) -> tuple[float, str]:
+    """The room took the first frame of the line: the moment the row is anchored at.  A script without it
+    is a sink that never reports, and the tap's clock stays on the hand-over."""
+    return (at, "started")
+
+
 AGENT_HZ = 800.0
 CANDIDATE_HZ = 300.0
 AGENT_LEVEL = 3000  # the candidate's quiet tone (1500) never reaches it, the agent's (9000) always does
@@ -926,22 +932,28 @@ class _Replay:
             await asyncio.wait_for(rec.aclose(), 20)
         if not hasattr(rec, "tee_in"):  # the stock class: its encoder's input is what counts (``spying``)
             return self
+        self.drain(t0)
+        return self
+
+    def drain(self, t0: float) -> None:
+        """Everything the tee received, through the mixer, as ``_tee_loop`` does."""
         self.mixer = TeeMixer(t0)
         self.pieces: list[tuple[int, bytes]] = []
         while True:
-            stamp_in, input_buf = rec.tee_in.get_nowait()
-            stamp_out, output_buf = rec.tee_out.get_nowait()
+            stamp_in, input_buf = self.rec.tee_in.get_nowait()
+            stamp_out, output_buf = self.rec.tee_out.get_nowait()
             if input_buf is None or output_buf is None:
                 break
             self.chunks.append((input_buf, output_buf))
             self.pieces.extend(self.mixer.process(input_buf, output_buf, max(stamp_in, stamp_out)))
-        return self
 
     async def _apply(self, event, tap_out) -> None:
         kind = event[1]
         if kind == "frames":
             for _ in range(int(round(event[2] / self.STEP))):
                 await tap_out.capture_frame(frame(tone_samples(self.STEP, 24000, AGENT_HZ, 9000)))
+        elif kind == "started":
+            tap_out.on_playback_started(created_at=time.time())
         elif kind == "finish":
             tap_out.flush()
             tap_out.on_playback_finished(playback_position=event[2], interrupted=event[3])
@@ -1036,6 +1048,7 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
             with self.subTest(path=name):
                 self.assert_bursts(pcm, [(3.0, 4.5)])
         self.assertEqual(call.agent_seconds(), [1.5])
+        self.assertIsNone(call.rec.kept_silence())  # nothing was kept, and nothing says otherwise
         await self.assert_chunks_are_stock(script, until=6.0)
 
     async def test_on_by_default_and_the_phone_lanes_class_is_untouched(self) -> None:
@@ -1057,8 +1070,12 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
         ours = await self.replay(script, until=until)
         got = [(b"".join(bytes(f.data) for f in a), b"".join(bytes(f.data) for f in b)) for a, b in ours.chunks]
         self.assertGreater(len(stock.rec.consumed), 0)
+
+        def sums(chunks: list) -> list:  # (unittest takes minutes to diff the raw bytes of a failure)
+            return [(len(mic), hash(mic), len(agent), hash(agent)) for mic, agent in chunks]
+
         # (ours also flushes the idle tail at the end, which the stock recorder drops)
-        self.assertEqual(stock.rec.consumed, got[: len(stock.rec.consumed)])
+        self.assertEqual(sums(stock.rec.consumed), sums(got[: len(stock.rec.consumed)]))
 
     async def test_with_no_pause_the_recorder_is_fed_byte_for_byte_what_the_stock_one_is(self) -> None:
         await self.assert_chunks_are_stock([_hand_over(1.0, 1.5), _finish(2.5, 1.5)], until=4.0)
@@ -1151,6 +1168,103 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
         call = await self.replay(script, until=4.0)
         self.assert_bursts(call.mp4(), [(2.0, 3.0)])
 
+    # -- the clock is the room's from the first played frame: the row is anchored there
+
+    async def test_a_stall_before_the_first_played_frame_moves_the_line_with_it(self) -> None:
+        # 2 s handed over at 1.0 s; the loop stalls, so the room plays it from 1.3 s and finishes at 3.3 s.
+        script = [_hand_over(1.0, 2.0), _started(1.3), _finish(3.3, 2.0)]
+        await self.assert_chunks_are_stock(script, until=5.0)
+        call = await self.replay(script, until=5.0)
+        for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
+            with self.subTest(path=name):
+                self.assert_bursts(pcm, [(1.3, 3.3)])
+        self.assertEqual(call.agent_seconds(), [2.0])
+        self.assertEqual(call.rec.kept_silence(), (0.0, 0))
+
+    async def test_a_stall_after_the_first_frame_leaves_no_gap_nobody_heard(self) -> None:
+        # The room's task and the next frame race out of the stall; neither order may make up a silence.
+        for label, script, played in (
+            ("the rest first", [_hand_over(1.0, 0.06), _hand_over(1.3, 1.94), _started(1.32), _finish(3.32, 2.0)], 1.32),
+            ("the room first", [_hand_over(1.0, 0.06), _started(1.3), _hand_over(1.32, 1.94), _finish(3.3, 2.0)], 1.3),
+        ):
+            with self.subTest(label):
+                await self.assert_chunks_are_stock(script, until=5.0)
+                call = await self.replay(script, until=5.0)
+                self.assert_bursts(call.mp4(), [(played, played + 2.0)])
+                self.assertEqual(call.agent_seconds(), [2.0])
+
+    async def test_silence_after_the_first_played_frame_is_kept_and_only_that(self) -> None:
+        # 0.1 s at 1.0 s and 0.4 s at 1.4 s, all played from 1.5 s: nothing was heard before then, so the
+        # 0.3 s between the two hand-overs is no silence.  The audio runs out at 2.0 s; the rest comes at 3.0 s.
+        script = [_hand_over(1.0, 0.1), _hand_over(1.4, 0.4), _started(1.5), _hand_over(3.0, 1.0), _finish(4.0, 1.5)]
+        call = await self.replay(script, until=5.5)
+        for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
+            with self.subTest(path=name):
+                self.assert_bursts(pcm, [(1.5, 2.0), (3.0, 4.0)])
+        self.assertEqual(call.agent_seconds(), [2.5])
+        seconds, stretches = call.rec.kept_silence()
+        self.assertAlmostEqual(seconds, 1.0, delta=0.01)
+        self.assertEqual(stretches, 1)
+
+    async def test_a_report_ahead_of_the_tap_still_counts_the_frame_it_reports(self) -> None:
+        # A sink may report from inside ``capture_frame``, before the tap has counted that frame.
+        script = [_started(1.0), _hand_over(1.0, 0.5), _hand_over(3.0, 1.0), _finish(4.0, 1.5)]
+        call = await self.replay(script, until=5.5)
+        for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
+            with self.subTest(path=name):
+                self.assert_bursts(pcm, [(1.0, 1.5), (3.0, 4.0)])
+        self.assertEqual(call.agent_seconds(), [3.0])
+
+    async def test_a_resume_is_not_a_new_start(self) -> None:
+        # The room reports a start again after every resume.  Taken for the line's first frame, it would put
+        # the end of the audio an extra 1 s out, and the silence from 4.0 s to 5.0 s would go unnoticed.
+        script = [
+            _hand_over(1.0, 2.0), _started(1.0), (2.0, "pause"), (3.0, "resume"), _started(3.0),
+            _hand_over(5.0, 1.0), _finish(6.0, 3.0),
+        ]
+        call = await self.replay(script, until=7.0)
+        for name, pcm in (("mp4", call.mp4()), ("ogg", call.ogg_right())):
+            with self.subTest(path=name):
+                self.assert_bursts(pcm, [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)])
+
+    async def test_an_explicit_pause_before_the_first_played_frame_stays_the_sdks_alone(self) -> None:
+        # Handed over at 1.0 s and held by the pause: the room plays it from 2.0 s, not from 1.8 s.
+        script = [_hand_over(1.0, 1.0), (1.2, "pause"), (2.0, "resume"), _started(2.0), _finish(3.0, 1.0)]
+        await self.assert_chunks_are_stock(script, until=4.0)
+        call = await self.replay(script, until=4.0)
+        self.assert_bursts(call.mp4(), [(2.0, 3.0)])
+        self.assertEqual(call.rec.kept_silence(), (0.0, 0))
+
+    # -- how much was kept: what an operator can see
+
+    async def test_the_silence_kept_adds_up_over_the_call(self) -> None:
+        script = [
+            _hand_over(1.0, 0.5), _started(1.0), _hand_over(2.5, 0.5), _hand_over(4.0, 1.0), _finish(5.0, 2.0),
+            _hand_over(7.0, 1.0), _started(7.3), _finish(8.3, 1.0),
+        ]
+        call = await self.replay(script, until=9.5)
+        seconds, stretches = call.rec.kept_silence()
+        self.assertAlmostEqual(seconds, 2.0, delta=0.01)
+        self.assertEqual(stretches, 2)
+
+    async def test_silence_in_a_line_the_close_cut_off_is_not_counted(self) -> None:
+        source, sink = _Source(), _Sink()
+        wall = _Wall()
+        rec = r1_recorder.recorder_io_class()(agent_session=SimpleNamespace(), sample_rate=RATE)
+        rec.tee_clock = wall.time
+        tap_in, tap_out = rec.record_input(source), rec.record_output(sink)
+        with mock.patch("time.time", wall.time), no_forward_ticks():
+            await rec.start(output_path=self.dir / "cut.ogg")
+            await tap_out.capture_frame(frame(tone_samples(0.5)))
+            wall.t += 2.0
+            await tap_out.capture_frame(frame(tone_samples(0.5)))  # 1.5 s of silence, on the list so far
+            rec.close_capture()
+            wall.t += 0.5
+            tap_out.flush()
+            tap_out.on_playback_finished(playback_position=1.0, interrupted=False)
+            await rec.aclose()
+        self.assertEqual(rec.kept_silence(), (0.0, 0))
+
     # -- what the rest of the recorder relies on
 
     async def test_nothing_carries_over_to_the_next_line(self) -> None:
@@ -1209,6 +1323,98 @@ class TestPausesInsideAPlaybackAreKept(unittest.IsolatedAsyncioTestCase):
             tap_out.on_playback_finished(playback_position=1.0, interrupted=False)
             await rec.aclose()
         self.assertIsNone(rec.tee_out.get_nowait()[1])  # only the end marker: the line was not written
+
+
+class TestAStallAtTheStartOfALineOnTheRealRoomOutput(unittest.IsolatedAsyncioTestCase):
+    """The real ``_ParticipantAudioOutput`` behind R1's tap, on the real clock.
+
+    The tap sees a frame when it is handed over; the room's own task takes it later, and that is when the
+    row is anchored (``playback_started``).  An event-loop stall between the two (what ``cpu_loop_lag``
+    detects) must move the line with the anchor.  Before the fix a 0.3 s stall put the voice 0.3 s ahead of
+    its row, or left a stutter in the file that nobody heard.
+    """
+
+    STALL = 0.5  # (well over what the voice may be off by here: a slow machine must not pass the old code)
+    LINE_AT = 1.0
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="r1rec-room-")
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("R1_RECORDER_KEEP_PAUSES", None)
+
+    async def call(self, hand_over) -> tuple[float, _Replay]:
+        """One 2 s line through the real chain; returns the row's anchor (media seconds) and the recording."""
+        from livekit.agents.voice.room_io._output import _ParticipantAudioOutput
+
+        room = _ParticipantAudioOutput(
+            SimpleNamespace(), sample_rate=24000, num_channels=1,
+            track_publish_options=rtc.TrackPublishOptions(), track_name="agent",
+        )
+        room._subscribed_fut.set_result(None)  # (there is no room to publish to: nobody has to subscribe)
+        room._forwarding_task = asyncio.ensure_future(room._forward_audio())
+        self.addAsyncCleanup(room.aclose)
+        source = _Source()
+        replay = _Replay(self.dir)
+        rec = replay.rec = r1_recorder.recorder_io_class()(agent_session=SimpleNamespace(), sample_rate=RATE)
+        rec.tee_clock = time.time
+        tap_in, tap_out = rec.record_input(source), rec.record_output(room)
+        anchors: list[float] = []
+        tap_out.on("playback_started", lambda ev: anchors.append(ev.created_at))
+        await rec.start(output_path=replay.path)
+        t0 = time.time()
+        until = self.LINE_AT + self.STALL + 2.0 + 0.5
+
+        async def microphone() -> None:  # a quiet candidate, 20 ms per frame
+            sent = 0
+            while (media := time.time() - t0) < until:
+                while sent * 0.02 <= media:
+                    source.next_frame = frame(tone_samples(0.02, 24000, CANDIDATE_HZ, 1500))
+                    await tap_in.__anext__()
+                    sent += 1
+                await asyncio.sleep(0.005)
+
+        async def line() -> None:
+            await asyncio.sleep(self.LINE_AT)
+            await hand_over(tap_out)
+            tap_out.flush()
+            await tap_out.wait_for_playout()
+
+        await asyncio.gather(microphone(), line())
+        rec.flush_idle_tail()
+        await asyncio.wait_for(rec.aclose(), 20)
+        replay.drain(t0)
+        self.assertEqual(len(anchors), 1)
+        return anchors[0] - t0, replay
+
+    def assert_the_voice_sits_on_its_row(self, anchor: float, replay: _Replay) -> None:
+        for name, pcm in (("mp4", replay.mp4()), ("ogg", replay.ogg_right())):
+            with self.subTest(path=name):
+                got = _Replay.bursts(pcm, quiet=0.1)
+                self.assertEqual(len(got), 1, f"anchor {anchor:.2f}, agent audio at {got}")
+                self.assertLess(abs(got[0][0] - anchor), 0.2, f"anchor {anchor:.2f}, agent audio at {got}")
+                self.assertAlmostEqual(got[0][1] - got[0][0], 2.0, delta=0.2)
+        self.assertEqual(replay.rec.kept_silence(), (0.0, 0))
+
+    async def test_a_stall_after_the_line_was_handed_over(self) -> None:
+        async def hand_over(tap_out) -> None:
+            for _ in range(100):
+                await tap_out.capture_frame(frame(tone_samples(0.02, 24000, AGENT_HZ, 9000)))
+            spin(self.STALL)
+
+        self.assert_the_voice_sits_on_its_row(*await self.call(hand_over))
+
+    async def test_a_stall_right_after_the_first_frame(self) -> None:
+        async def hand_over(tap_out) -> None:
+            await tap_out.capture_frame(frame(tone_samples(0.06, 24000, AGENT_HZ, 9000)))
+            spin(self.STALL)
+            for _ in range(97):
+                await tap_out.capture_frame(frame(tone_samples(0.02, 24000, AGENT_HZ, 9000)))
+
+        self.assert_the_voice_sits_on_its_row(*await self.call(hand_over))
 
 
 class _RoomRateSink(_Sink):
@@ -1411,6 +1617,10 @@ class FakeIO:
         self.start_hangs = start_hangs
         self.output_path: Path | None = None
         self.sources: list = []
+        self.kept: tuple[float, int] | None = None
+
+    def kept_silence(self) -> tuple[float, int] | None:
+        return self.kept
 
     def record_input(self, source):
         self.sources.append(("in", source))
@@ -2418,6 +2628,24 @@ class TestStart(RecorderCase):
         self.assertEqual(recorder._t0, 1000.0)
         await recorder.finish()
 
+    async def started_line(self) -> dict:
+        with captured_logs() as lines:
+            recorder = await self.started()
+            await recorder.finish()
+        (started,) = [l for l in lines if l["error_type"] == "r1_rec_started"]
+        return started
+
+    async def test_the_started_line_says_which_output_tap_made_the_recording(self) -> None:
+        with mock.patch.dict(os.environ):
+            os.environ.pop("R1_RECORDER_KEEP_PAUSES", None)
+            line = await self.started_line()
+        self.assertEqual((line["error_category"], line["schema"]), ("audio", "keep_pauses"))
+
+    async def test_after_a_rollback_the_started_line_tells_the_recording_apart(self) -> None:
+        with mock.patch.dict(os.environ, {"R1_RECORDER_KEEP_PAUSES": "0"}):
+            line = await self.started_line()
+        self.assertEqual((line["error_category"], line["schema"]), ("audio", "sdk_tap"))
+
     async def test_a_video_request_without_a_room_or_a_picture_encoder_is_recorded_as_audio(self) -> None:
         for label in ("no room", "no ctx", "no libx264"):
             with self.subTest(label):
@@ -2637,6 +2865,40 @@ class TestFinish(RecorderCase):
         self.clock.advance(advance)
         await asyncio.wait_for(recorder.finish(), 20)
         return recorder
+
+    async def test_the_finish_says_how_much_silence_the_tap_kept(self) -> None:
+        self.lay_stream()
+        self.io.kept = (12.34, 3)
+        with captured_logs() as lines:
+            await self.run_normal()
+        (kept,) = [l for l in lines if l["error_type"] == "r1_rec_silence_kept"]
+        self.assertEqual(kept["level"], "info")
+        self.assertEqual((kept["duration_sec"], kept["option_count"]), (12.3, 3))
+
+    async def test_a_tap_that_kept_nothing_still_says_so(self) -> None:
+        """No line would read as "the tap never ran"."""
+        self.lay_stream()
+        self.io.kept = (0.0, 0)
+        with captured_logs() as lines:
+            await self.run_normal()
+        (kept,) = [l for l in lines if l["error_type"] == "r1_rec_silence_kept"]
+        self.assertEqual((kept["duration_sec"], kept["option_count"]), (0.0, 0))
+
+    async def test_the_silence_line_does_not_wait_for_the_api_to_accept_the_recording(self) -> None:
+        self.lay_stream()
+        self.io.kept = (1.5, 1)
+        self.api.script("complete", HttpFailure("network"), HttpFailure("network"), HttpFailure("network"), HttpFailure("network"))
+        with captured_logs() as lines:
+            await self.run_normal()
+        codes = [l["error_type"] for l in lines]
+        self.assertIn("r1_rec_complete_failed", codes)
+        self.assertIn("r1_rec_silence_kept", codes)
+
+    async def test_the_sdks_own_tap_has_no_silence_line(self) -> None:
+        self.lay_stream()
+        with captured_logs() as lines:
+            await self.run_normal()
+        self.assertEqual([l for l in lines if l["error_type"] == "r1_rec_silence_kept"], [])
 
     async def test_the_finish_steps_run_in_order_and_the_report_is_complete(self) -> None:
         self.lay_stream()
@@ -3070,7 +3332,8 @@ class TestNothingSensitiveIsLogged(RecorderCase):
             self.assertEqual(line["event"], "unknown_event")
             self.assertTrue(line["error_type"].startswith("r1_rec_"), line)
             self.assertLessEqual(set(line) - {"timestamp", "level", "component", "event", "correlationId"},
-                                 {"error_type", "error_category", "status", "option_count", "duration_sec"})
+                                 {"error_type", "error_category", "status", "option_count", "duration_sec", "schema"})
+            self.assertIn(line.get("schema", "keep_pauses"), ("keep_pauses", "sdk_tap"))  # a fixed word, never a value
 
     async def test_a_discard_logs_its_reason_as_a_fixed_word(self) -> None:
         self.api.script("prepare", ApiReply(409, {"error": "r1_consent_withdrawn"}, "r1_consent_withdrawn"))
@@ -4549,7 +4812,8 @@ class TestPictureLogging(VideoCase):
         for line in lines:
             self.assertTrue(line["error_type"].startswith("r1_rec_"), line)
             self.assertLessEqual(set(line) - {"timestamp", "level", "component", "event", "correlationId"},
-                                 {"error_type", "error_category", "status", "option_count", "duration_sec"})
+                                 {"error_type", "error_category", "status", "option_count", "duration_sec", "schema"})
+            self.assertIn(line.get("schema", "keep_pauses"), ("keep_pauses", "sdk_tap"))  # a fixed word, never a value
 
 
 class TestPresetKnob(unittest.TestCase):
