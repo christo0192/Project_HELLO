@@ -106,6 +106,8 @@ export interface R1ReviewAttempt extends R1AttemptSummary {
   /** Consent was withdrawn or declined after this attempt: its recording is gone and its transcript hidden. */
   consent_withdrawn: boolean;
   transcript_hidden: boolean;
+  /** The interview has not ended: `turns` stays empty until it has. */
+  in_progress: boolean;
   turns: R1ReviewTurn[];
 }
 
@@ -218,6 +220,10 @@ export interface R1ReviewResponse {
     recommendation: string | null;
     overall_score: number | null;
     created_at: string | null;
+    /** `insufficient`: the score is held. */
+    evidence_grade: string | null;
+    /** `incomplete_evidence`: the score is provisional. */
+    scoring_status: string | null;
   } | null;
   rubric: R1ReviewRubricMetric[];
 }

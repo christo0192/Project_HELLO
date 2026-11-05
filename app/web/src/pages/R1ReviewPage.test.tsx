@@ -67,7 +67,7 @@ const TURNS: R1ReviewTurn[] = [
 const attempt = (over: Partial<R1ReviewAttempt> = {}): R1ReviewAttempt => ({
   session_id: 's1', attempt_number: 1, counted: true, outcome: 'complete', recording: recording(), persona_id: 'p1_career_switcher',
   persona_label: 'Career switcher', learner_name: 'Priya Nair', session_status: 'completed', started_at: '2026-11-02T10:00:00.000Z',
-  ended_at: '2026-11-02T10:30:00.000Z', consent_withdrawn: false, transcript_hidden: false, turns: TURNS, ...over,
+  ended_at: '2026-11-02T10:30:00.000Z', consent_withdrawn: false, transcript_hidden: false, in_progress: false, turns: TURNS, ...over,
 });
 
 const METRICS = ['Probing & discovery', 'Objection handling', 'Urgency & close', 'Negotiation & discount discipline', 'Communication & rapport'];
@@ -300,7 +300,7 @@ describe('Overview, scored', () => {
 
   it('shows all five metric rows open, each with its rationale', async () => {
     await opened();
-    const rows = screen.getByRole('list', { name: 'Rubric' });
+    const rows = screen.getByRole('list', { name: 'AI rubric ratings' });
     expect(within(rows).getAllByRole('listitem')).toHaveLength(5);
     for (const name of METRICS) expect(within(rows).getByText(`${name} rationale.`)).toBeInTheDocument();
   });
@@ -309,7 +309,7 @@ describe('Overview, scored', () => {
     const body = review();
     body.assessment!.metric_results[1] = { ...body.assessment!.metric_results[1], score: null, evidence_status: 'insufficient_evidence' };
     await opened(body);
-    expect(within(screen.getByRole('list', { name: 'Rubric' })).getByText('Insufficient evidence')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'AI rubric ratings' })).getByText('Insufficient evidence')).toBeInTheDocument();
   });
 
   it('says a provisional score is one, in the words the phone scorecard uses', async () => {
@@ -360,6 +360,22 @@ describe('Overview, scored', () => {
     expect(checks).toHaveTextContent('The two scoring runs disagreed.');
   });
 
+  it('labels the ratings as AI, as it does the result', async () => {
+    await opened();
+    expect(screen.getByRole('region', { name: 'AI rubric ratings' })).toBeInTheDocument();
+  });
+
+  it('names the attempt the result is for when there are two: the switcher looks page-wide', async () => {
+    const second = attempt({ session_id: 's2', attempt_number: 2 });
+    await opened(review({ attempts: [attempt(), second] }), '?attempt=2');
+    expect(screen.getByRole('region', { name: 'AI recommendation' })).toHaveTextContent('This result is for Attempt 1 (counted).');
+  });
+
+  it('needs no attempt named when there is only one', async () => {
+    await opened();
+    expect(screen.getByRole('region', { name: 'AI recommendation' })).not.toHaveTextContent('This result is for');
+  });
+
   it('lists the needs, revealed or not, each revealed one seeking to its turn', async () => {
     await opened();
     const needs = screen.getByRole('region', { name: 'Needs revealed' });
@@ -371,6 +387,14 @@ describe('Overview, scored', () => {
     expect(lit()).toEqual(['4']);
   });
 
+  it('counts a need whose turn is unknown as revealed, and says the turn is what is unknown', async () => {
+    await opened(review({ events: [{ session_id: 's1', event_type: 'need_revealed', turn_index: null, family_id: null, need: 'H2', kind: null, created_at: null }] }));
+    const needs = screen.getByRole('region', { name: 'Needs revealed' });
+    expect(needs).toHaveTextContent('1 of 3 revealed');
+    expect(needs).toHaveTextContent('Revealed, turn unknown');
+    expect(within(needs).getAllByText('Not revealed')).toHaveLength(2);
+  });
+
   it('checks the recording of the attempt that was scored, not the one on screen', async () => {
     const second = attempt({ session_id: 's2', attempt_number: 2, recording: recording({ has_video: false }) });
     await opened(review({ attempts: [attempt(), second] }), '?attempt=2');
@@ -378,10 +402,23 @@ describe('Overview, scored', () => {
   });
 
   it('adds one line of phone context with a link', async () => {
-    await opened(review({ phone_screening: { recommendation: 'advance', overall_score: 71, created_at: '2026-10-30T00:00:00.000Z' } }));
+    await opened(review({ phone_screening: { recommendation: 'advance', overall_score: 71, created_at: '2026-10-30T00:00:00.000Z', evidence_grade: 'decision', scoring_status: 'complete' } }));
     const line = screen.getByText(/Phone screening/);
     expect(line).toHaveTextContent('Select 71 (AI)');
     expect(within(line).getByRole('link', { name: 'Open the candidate' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=review`);
+  });
+
+  it('never sets a held phone score beside the verdict as a result', async () => {
+    await opened(review({ phone_screening: { recommendation: 'reject', overall_score: 30, created_at: null, evidence_grade: 'insufficient', scoring_status: 'complete' } }));
+    const line = screen.getByText(/Phone screening/);
+    expect(line).toHaveTextContent('Held: not enough evidence (AI)');
+    expect(line).not.toHaveTextContent('Reject');
+    expect(line).not.toHaveTextContent('30');
+  });
+
+  it('says a provisional phone score is one', async () => {
+    await opened(review({ phone_screening: { recommendation: 'reject', overall_score: 30, created_at: null, evidence_grade: 'decision', scoring_status: 'incomplete_evidence' } }));
+    expect(screen.getByText(/Phone screening/)).toHaveTextContent('Reject 30, provisional (AI)');
   });
 });
 
@@ -397,16 +434,60 @@ describe('Overview, in every other state', () => {
     noResult();
   });
 
-  it('in progress: says so, and shows no result', async () => {
-    await opened(review({ assessment: null, attempts: [attempt({ session_status: 'in_progress', ended_at: null })], round: { ...review().round, status: 'in_progress', recommendation: null, overall: null } }));
+  const live = () => review({
+    assessment: null,
+    attempts: [attempt({ session_status: 'in_progress', ended_at: null, in_progress: true, turns: [], recording: recording({ state: 'recording', started_at_ms: null, duration_ms: null }) })],
+    round: { ...review().round, status: 'in_progress', recommendation: null, overall: null },
+  });
+
+  it('in progress: says so, says when the link runs out, and shows no result', async () => {
+    await opened(live());
     expect(panel('Overview')).toHaveTextContent('The interview is in progress.');
+    expect(panel('Overview')).toHaveTextContent(/Link valid until/);
     noResult();
   });
 
+  it('in progress: no transcript yet, and it says why rather than that none was saved', async () => {
+    await opened(live(), '?tab=recording');
+    expect(panel('Recording')).toHaveTextContent('The transcript appears here once the interview ends.');
+    expect(panel('Recording')).not.toHaveTextContent('No transcript lines were saved');
+  });
+
+  const scoring = () => review({
+    assessment: null,
+    attempts: [attempt({ ended_at: new Date(Date.now() - 60_000).toISOString() })],
+    round: { ...review().round, recommendation: null, overall: null },
+  });
+
   it('scoring: says so, and shows no result', async () => {
-    await opened(review({ assessment: null, round: { ...review().round, recommendation: null, overall: null } }));
+    await opened(scoring());
     expect(panel('Overview')).toHaveTextContent('Scoring in progress.');
     noResult();
+  });
+
+  it('scoring: Check again reads the round, and the result takes over: the page does not poll', async () => {
+    await opened(scoring());
+    mockApi.getR1Review.mockResolvedValue(review());
+    await userEvent.click(within(panel('Overview')).getByRole('button', { name: 'Check again' }));
+    expect(await screen.findByRole('region', { name: 'AI recommendation' })).toBeInTheDocument();
+    expect(mockApi.getR1Review).toHaveBeenCalledTimes(2);
+  });
+
+  it('a round whose consent was withdrawn never says a score is coming', async () => {
+    const left = attempt({
+      session_status: 'failed', outcome: 'candidate_left', ended_at: new Date(Date.now() - 60_000).toISOString(), consent_withdrawn: true, transcript_hidden: true, turns: [],
+      recording: recording({ state: 'deleted', reason: 'consent_withdrawn', started_at_ms: null, duration_ms: null, mode: null, has_video: null, retention_until: null }),
+    });
+    await opened(review({ assessment: null, attempts: [left], round: { ...review().round, recommendation: null, overall: null } }));
+    expect(panel('Overview')).toHaveTextContent('This round ended without a scored interview.');
+    expect(panel('Overview')).not.toHaveTextContent('Scoring in progress');
+    expect(within(panel('Overview')).queryByRole('button', { name: 'Check again' })).not.toBeInTheDocument();
+  });
+
+  it('a round that scoring never reached ends the same way, a day on', async () => {
+    const old = attempt({ ended_at: new Date(Date.now() - 2 * 24 * 3_600_000).toISOString() });
+    await opened(review({ assessment: null, attempts: [old], round: { ...review().round, recommendation: null, overall: null } }));
+    expect(panel('Overview')).toHaveTextContent('This round ended without a scored interview.');
   });
 
   it('closed: says the round ended with nothing to review', async () => {
@@ -419,6 +500,20 @@ describe('Overview, in every other state', () => {
     await opened(review({ assessment: a, round: { ...review().round, recommendation: null, overall: null } }));
     expect(panel('Overview')).toHaveTextContent('Not scored: the candidate said too little in the scored phases.');
     expect(document.querySelector('[data-verdict-mark]')).toBeNull();
+  });
+
+  it('human review with ratings: says plainly they gave no usable result, under the AI label', async () => {
+    const a = assessment({ recommendation: null, raw_recommendation: 'human_review', overall_score: null, r1: { ...assessment().r1, outcome: 'scored', valid: false, gate: { passed: false, failures: ['runs_disagree'] } } });
+    await opened(review({ assessment: a, round: { ...review().round, recommendation: null, overall: null } }));
+    expect(panel('Overview')).toHaveTextContent('Not scored: the interview did not pass its checks.');
+    const ratings = screen.getByRole('region', { name: 'AI rubric ratings' });
+    expect(ratings).toHaveTextContent('These AI ratings gave no usable result. They are here for human review only.');
+    expect(within(ratings).getAllByRole('listitem')).toHaveLength(5);
+  });
+
+  it('a usable result carries no such warning', async () => {
+    await opened();
+    expect(panel('Overview')).not.toHaveTextContent('no usable result');
   });
 
   it('an appeal: the existing notices, and no score anywhere', async () => {
@@ -657,6 +752,155 @@ describe('Recording: the controls', () => {
     const { el } = await pressPlay();
     expect(el).toHaveAttribute('controlslist', 'nodownload');
     expect(el).not.toHaveAttribute('controls');
+  });
+});
+
+describe('Recording: bringing focus in', () => {
+  const picture = () => document.querySelector('[data-r1-recording-state]') as HTMLElement;
+
+  it('lands on Play when the tab is pressed, so K and Space answer at once', async () => {
+    await opened();
+    await userEvent.click(tab('Recording'));
+    const play = screen.getByRole('button', { name: 'Play' });
+    expect(play).toHaveFocus();
+    fireEvent.keyDown(play, { key: 'k' });
+    await waitFor(() => expect(mockApi.getR1Recording).toHaveBeenCalledTimes(1));
+  });
+
+  it('leaves the arrow keys with the tabs', async () => {
+    await opened(review(), '?tab=resume');
+    tab('Resume').focus();
+    await userEvent.keyboard('{ArrowRight}');
+    expect(tab('Recording')).toHaveAttribute('aria-selected', 'true');
+    expect(tab('Recording')).toHaveFocus();
+  });
+
+  it('does not take focus from the attempt switcher', async () => {
+    const second = attempt({ session_id: 's2', attempt_number: 2, turns: [turn(0, 2, 'bot', 'opening', 'Welcome back.')] });
+    await opened(review({ attempts: [attempt(), second] }));
+    await userEvent.click(tab('Recording'));
+    const next = within(screen.getByRole('group', { name: 'Attempt' })).getByRole('button', { name: 'Attempt 2 (retake)' });
+    await userEvent.click(next);
+    expect(screen.getByRole('button', { name: 'Play' })).not.toHaveFocus();
+  });
+
+  it('plays and pauses from a click on the picture', async () => {
+    await opened(review(), '?tab=recording');
+    fireEvent.click(picture());
+    const el = await waitFor(() => {
+      const found = document.querySelector('video');
+      expect(found).not.toBeNull();
+      return found as HTMLVideoElement;
+    });
+    const state = drive(el);
+    fireEvent.loadedMetadata(el);
+    expect(state.paused).toBe(false);
+    fireEvent.click(el);
+    expect(state.paused).toBe(true);
+    fireEvent.click(el);
+    expect(state.paused).toBe(false);
+  });
+
+  it('takes focus into the panel from that click, so the keys answer after it', async () => {
+    await opened(review(), '?tab=recording');
+    await userEvent.click(picture());
+    expect(screen.getByRole('group', { name: 'Recording player' })).toHaveFocus();
+  });
+
+  it('takes neither Try again nor the error block for the picture', async () => {
+    mockApi.getR1Recording.mockRejectedValueOnce(new TestApiError('service_unavailable', 503));
+    await opened(review(), '?tab=recording');
+    fireEvent.click(picture());
+    const alert = await within(panel('Recording')).findByRole('alert');
+    expect(mockApi.getR1Recording).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(alert).getByText(/Could not load/));
+    expect(mockApi.getR1Recording).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(alert).getByRole('button', { name: /^Try again/ }));
+    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+    expect(mockApi.getR1Recording).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Recording: when the media fails', () => {
+  const minted = (sig: string) => ({ ...recording(), url: `https://media.example.com/r1.mp4?sig=${sig}`, content_type: 'video/mp4', expires_in_sec: 300 });
+
+  /** Play, then two errors inside 30 s: the player drops the element. */
+  async function dropped() {
+    mockApi.getR1Recording.mockResolvedValueOnce(minted('one')).mockResolvedValueOnce(minted('two'));
+    await opened(review(), '?tab=recording');
+    const { el, state } = await pressPlay();
+    fireEvent.play(el);
+    await screen.findByRole('button', { name: 'Pause' });
+    moveTo(el, state, 100);
+    fireEvent.error(el);
+    await waitFor(() => expect(el.getAttribute('src')).toContain('sig=two'));
+    fireEvent.loadedMetadata(el);
+    fireEvent.error(el);
+    return within(panel('Recording')).findByRole('alert');
+  }
+
+  it('goes back to Play when the element is dropped: it never sends its pause', async () => {
+    await dropped();
+    expect(screen.getByRole('button', { name: 'Play' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+  });
+
+  it('plays again from the button after Try again, at the same place', async () => {
+    const alert = await dropped();
+    fireEvent.click(within(alert).getByRole('button', { name: /^Try again/ }));
+    const el = await waitFor(() => {
+      const found = document.querySelector('video');
+      expect(found).not.toBeNull();
+      return found as HTMLVideoElement;
+    });
+    const state = drive(el);
+    fireEvent.loadedMetadata(el);
+    expect(state.currentTime).toBe(100);
+    expect(state.paused).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Play' }));
+    expect(state.paused).toBe(false);
+  });
+
+  it('decides from the media, not from the button: a media that stopped silently plays on a press of Pause', async () => {
+    await opened(review(), '?tab=recording');
+    const { el, state } = await pressPlay();
+    fireEvent.play(el);
+    state.paused = true;
+    fireEvent.click(await screen.findByRole('button', { name: 'Pause' }));
+    expect(state.paused).toBe(false);
+  });
+
+  it('keeps the clicked moment through a failed first load: Try again, then Play, starts at that turn', async () => {
+    mockApi.getR1Recording.mockRejectedValueOnce(new TestApiError('service_unavailable', 503));
+    await opened(review(), '?tab=recording');
+    fireEvent.click(screen.getByRole('button', { name: /^Play from 2:05/ }));
+    const alert = await within(panel('Recording')).findByRole('alert');
+    expect(screen.getByTestId('position')).toHaveTextContent('2:05');
+    fireEvent.click(within(alert).getByRole('button', { name: /^Try again/ }));
+    const el = await waitFor(() => {
+      const found = document.querySelector('video');
+      expect(found).not.toBeNull();
+      return found as HTMLVideoElement;
+    });
+    const state = drive(el);
+    fireEvent.loadedMetadata(el);
+    expect(state.sets).toEqual([]);
+    fireEvent.click(screen.getByRole('button', { name: 'Play' }));
+    expect(state.sets).toEqual([124.75]);
+    expect(state.paused).toBe(false);
+    expect(screen.getByTestId('position')).toHaveTextContent('2:05');
+    expect(lit()).toEqual(['3']);
+  });
+
+  it('skips from the reader\'s place after that, not from the start of the media', async () => {
+    mockApi.getR1Recording.mockRejectedValueOnce(new TestApiError('service_unavailable', 503));
+    await opened(review(), '?tab=recording');
+    fireEvent.click(screen.getByRole('button', { name: /^Play from 2:05/ }));
+    const alert = await within(panel('Recording')).findByRole('alert');
+    fireEvent.click(within(alert).getByRole('button', { name: /^Try again/ }));
+    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: 'Forward 15 seconds' }));
+    expect(screen.getByTestId('position')).toHaveTextContent('2:20');
   });
 });
 
@@ -922,6 +1166,58 @@ describe('Recording: the transcript panel', () => {
   });
 });
 
+describe('Recording: following', () => {
+  const scroller = () => screen.getByRole('region', { name: 'Transcript turns' });
+  const back = () => screen.queryByRole('button', { name: 'Back to current' });
+
+  async function following() {
+    await opened(review(), '?tab=recording');
+    const { el, state } = await pressPlay();
+    moveTo(el, state, 40);
+  }
+
+  it('stops on a scrollbar drag, which sends nothing but `scroll`', async () => {
+    await following();
+    scroller().scrollTop = 500;
+    fireEvent.scroll(scroller());
+    expect(await screen.findByRole('button', { name: 'Back to current' })).toBeInTheDocument();
+  });
+
+  it('keeps following through a `scroll` of its own', async () => {
+    await following();
+    fireEvent.scroll(scroller());
+    expect(back()).not.toBeInTheDocument();
+  });
+
+  it('stops on a press in the words: selecting text must not be pulled away', async () => {
+    await following();
+    fireEvent.pointerDown(screen.getByText('Hi, I saw your course.'));
+    expect(await screen.findByRole('button', { name: 'Back to current' })).toBeInTheDocument();
+  });
+
+  it('does not flash Back to current on a press of a timecode', async () => {
+    await following();
+    fireEvent.pointerDown(screen.getByRole('button', { name: /^Play from 2:05/ }));
+    expect(back()).not.toBeInTheDocument();
+  });
+});
+
+describe('Recording: the strip in words', () => {
+  const words = () => document.querySelector('[data-call-strip] figcaption')?.textContent ?? '';
+
+  it('names every phase, however narrow its box', async () => {
+    await opened(review(), '?tab=recording');
+    expect(words()).toContain('Phases: Opening from 0:05, Icebreaker from 0:30, Role-play from 2:00, Wrap-up from 6:40.');
+  });
+
+  it('says where the two role-play lines fall', async () => {
+    const body = review();
+    body.attempts[0].turns = [turn(0, 100, 'bot', 'roleplay', 'Hi.'), turn(1, 1400, 'candidate', 'wrapup', 'Bye.')];
+    await opened(body, '?tab=recording');
+    expect(words()).toContain('Earliest offer to wrap up at 15:40, End of the role-play at 21:40.');
+  });
+});
+
 describe('Recording: when there is nothing to play', () => {
   it.each([
     ['none', { state: 'none' as const, started_at_ms: null, duration_ms: null, retention_until: null }, 'No recording was made for this attempt.'],
@@ -991,7 +1287,8 @@ describe('after consent is withdrawn', () => {
       consent_withdrawn: true, transcript_hidden: true, turns: [],
       recording: recording({ state: 'deleted', reason: 'consent_withdrawn', started_at_ms: null, duration_ms: null, mode: null, has_video: null, retention_until: null }),
     });
-    body.assessment!.metric_results[0].evidence = [];
+    // The API drops the rationales and the quotes with the transcript.
+    body.assessment!.metric_results = body.assessment!.metric_results.map((metric) => ({ ...metric, evidence: [], rationale: null }));
     return body;
   };
 
@@ -1004,6 +1301,27 @@ describe('after consent is withdrawn', () => {
   it('says the transcript is hidden', async () => {
     await opened(withdrawn());
     expect(screen.getByText('The transcript is hidden.')).toBeInTheDocument();
+  });
+
+  it('gives the reason when there was no recording to delete', async () => {
+    const body = withdrawn();
+    body.attempts[0].recording = recording({ state: 'none', started_at_ms: null, duration_ms: null, mode: null, has_video: null, retention_until: null });
+    await opened(body);
+    expect(screen.getByText('No recording was made for this attempt.')).toBeInTheDocument();
+    expect(screen.getByText('The transcript is hidden because consent was withdrawn.')).toBeInTheDocument();
+    expect(tab('Recording')).toBeDisabled();
+  });
+
+  it('says each rating\'s detail is hidden, and keeps the rating', async () => {
+    await opened(withdrawn());
+    const ratings = screen.getByRole('region', { name: 'AI rubric ratings' });
+    expect(within(ratings).getAllByText('Detail hidden with the transcript.')).toHaveLength(5);
+    expect(within(ratings).getAllByText('3/4')).toHaveLength(5);
+  });
+
+  it('hides no detail of a scored attempt that kept its transcript', async () => {
+    await opened();
+    expect(screen.queryByText('Detail hidden with the transcript.')).not.toBeInTheDocument();
   });
 
   it('falls back to Overview from an address that names Recording', async () => {

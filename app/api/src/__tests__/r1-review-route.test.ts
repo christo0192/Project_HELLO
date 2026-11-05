@@ -248,7 +248,7 @@ describe('what the answer carries', () => {
     expect(attempt).toMatchObject({
       session_id: SESSION_1, attempt_number: 1, counted: true, outcome: 'complete', persona_id: 'p1_career_switcher',
       persona_label: 'Career switcher', learner_name: 'Priya Nair', started_at: '2026-11-02T10:00:00Z',
-      ended_at: '2026-11-02T10:30:00Z', consent_withdrawn: false, transcript_hidden: false,
+      ended_at: '2026-11-02T10:30:00Z', consent_withdrawn: false, transcript_hidden: false, in_progress: false,
     });
     expect(attempt.recording).toMatchObject({ state: 'ready', mode: 'single', has_video: true, started_at_ms: 1_800_000_000_000, duration_ms: 1_500_000 });
     expect(attempt.turns).toEqual([
@@ -326,7 +326,13 @@ describe('what the answer carries', () => {
 
   it('carries the phone screening beside it, and never takes an R1 assessment for one', async () => {
     const { body } = await review(appFor('admin'));
-    expect(body.phone_screening).toEqual({ recommendation: 'advance', overall_score: 71, created_at: '2026-10-30T10:20:00Z' });
+    expect(body.phone_screening).toEqual({ recommendation: 'advance', overall_score: 71, created_at: '2026-10-30T10:20:00Z', evidence_grade: null, scoring_status: null });
+  });
+
+  it('says when the phone score is held or provisional: neither is a firm result', async () => {
+    const tables = tablesFor();
+    Object.assign(tables.assessments[1], { evidence_grade: 'insufficient', scoring_status: 'incomplete_evidence' });
+    expect((await review(appFor('admin', OWNER, tables))).body.phone_screening).toMatchObject({ evidence_grade: 'insufficient', scoring_status: 'incomplete_evidence' });
   });
 
   it('still answers when the phone context cannot be read: it is one line of context', async () => {
@@ -444,6 +450,21 @@ describe('after consent is withdrawn', () => {
     expect(JSON.stringify(body)).not.toContain('Tell me about your goals');
   });
 
+  it('hides the rationales too: each one cites what the candidate said', async () => {
+    const tables = withdrawn();
+    tables.assessments[0].metric_results[0].rationale = 'Asked "Tell me about your goals" and followed up well.';
+    const { body } = await review(appFor('admin', OWNER, tables));
+    expect(body.assessment.metric_results.map((m: Row) => m.rationale)).toEqual([null, null]);
+    expect(JSON.stringify(body)).not.toContain('followed up well');
+  });
+
+  it('keeps each score, and the rationales of an attempt made after the withdrawal', async () => {
+    const tables = withdrawn();
+    expect((await review(appFor('admin', OWNER, tables))).body.assessment.metric_results[0].score).toBe(3);
+    tables.interview_round_attempts[0].created_at = '2026-11-04T00:00:00Z';
+    expect((await review(appFor('admin', OWNER, tables))).body.assessment.metric_results[0].rationale).toBe('Probing & discovery rationale.');
+  });
+
   it('treats a decline the same way', async () => {
     const { body } = await review(appFor('admin', OWNER, withdrawn('declined')));
     expect(body.attempts[0].transcript_hidden).toBe(true);
@@ -470,6 +491,45 @@ describe('after consent is withdrawn', () => {
     const tables = withdrawn();
     tables.interview_round_recordings = [];
     expect((await review(appFor('admin', OWNER, tables))).body.attempts[0].recording.state).toBe('none');
+  });
+});
+
+describe('while the interview runs', () => {
+  const live = (status: string) => {
+    const tables = tablesFor();
+    tables.call_sessions[0].status = status;
+    tables.call_sessions[0].ended_at = null;
+    return tables;
+  };
+
+  for (const status of ['created', 'waiting', 'in_progress']) {
+    it(`sends no transcript for a session that is ${status}, and says why`, async () => {
+      const [attempt] = (await review(appFor('admin', OWNER, live(status)))).body.attempts;
+      expect(attempt.in_progress).toBe(true);
+      expect(attempt.turns).toEqual([]);
+      expect(attempt.transcript_hidden).toBe(false);
+    });
+  }
+
+  it('does not read the transcript at all', async () => {
+    failing.add('transcript_turns');
+    expect((await review(appFor('admin', OWNER, live('in_progress')))).status).toBe(200);
+  });
+
+  it('still reads an attempt that has ended beside a live retake', async () => {
+    const tables = tablesFor();
+    tables.interview_round_attempts.push({ ...tables.interview_round_attempts[0], session_id: SESSION_2, attempt_number: 2, created_at: '2026-11-03T00:00:00Z' });
+    tables.call_sessions.push({ id: SESSION_2, candidate_id: CANDIDATE, interview_round_id: ROUND, status: 'in_progress', started_at: '2026-11-03T00:00:00Z', ended_at: null });
+    tables.transcript_turns.push({ session_id: SESSION_2, turn_index: 0, speaker: 'bot', text: 'Second try.', turn_started_at_ms: null, is_gate: false, phase: 'opening', interrupted: false });
+    const { body } = await review(appFor('viewer', OTHER, tables));
+    expect(body.attempts.map((a: Row) => a.in_progress)).toEqual([false, true]);
+    expect(body.attempts.map((a: Row) => a.turns.length)).toEqual([2, 0]);
+  });
+
+  it('reads the transcript of an attempt that ended, however it ended', async () => {
+    for (const status of ['failed', 'cancelled', 'expired']) {
+      expect((await review(appFor('admin', OWNER, live(status)))).body.attempts[0].turns).toHaveLength(2);
+    }
   });
 });
 

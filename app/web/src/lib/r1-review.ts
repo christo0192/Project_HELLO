@@ -17,6 +17,7 @@
  * unknown code to a neutral sentence.
  */
 import { activeTurnAt } from '../components/talent/sessionLegs';
+import { isEvidenceInsufficient } from './evidence-hold';
 import { RECOMMENDATION_LABELS } from './recommendation-labels';
 import { r1RecordingStateCopy, turnMediaSec, viewState } from './r1-recording';
 import type {
@@ -331,6 +332,8 @@ export function eventMarks(events: readonly R1ReviewEvent[], sessionId: string, 
 export interface NeedReveal {
   need: string;
   label: string;
+  /** The log has the reveal. Its turn can still be unknown: the worker could not map it to one. */
+  revealed: boolean;
   turnIndex: number | null;
   row: number | null;
   startSec: number | null;
@@ -345,6 +348,7 @@ export function neededReveals(events: readonly R1ReviewEvent[], sessionId: strin
     return {
       need,
       label: `Need ${needOrdinal(need)}`,
+      revealed: event !== undefined,
       turnIndex: event?.turn_index ?? null,
       row: turn?.row ?? null,
       startSec: turn?.startSec ?? null,
@@ -359,14 +363,31 @@ export type R1ReviewStage = 'withheld' | 'scored' | 'not_scored' | 'scoring' | '
 const notScored = (assessment: R1ReviewAssessment): boolean =>
   assessment.raw_recommendation === 'human_review' || assessment.recommendation === null;
 
-export function reviewStage(review: Pick<R1ReviewResponse, 'round' | 'attempts' | 'assessment'>): R1ReviewStage {
+/**
+ * How long after an attempt ends a score is still expected. The scorer's own limits are far shorter:
+ * a provider outage defers for about an hour, and a job that gives up leaves a placeholder. Past this
+ * no job exists: an attempt from before 0126, or a round left with no live consent.
+ */
+export const R1_SCORE_WAIT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Whether a score can still arrive for an attempt. A completed session is queued; a failed one only
+ * when the attempt counted (0126); and none is promised once consent is withdrawn, which stops the
+ * scoring of the interview.
+ */
+function scoreCanArrive(attempt: R1ReviewAttempt, roundCreatedAt: string, nowMs: number): boolean {
+  if (attempt.consent_withdrawn) return false;
+  if (attempt.session_status !== 'completed' && !(attempt.session_status === 'failed' && attempt.counted)) return false;
+  return nowMs - Date.parse(attempt.ended_at ?? attempt.started_at ?? roundCreatedAt) < R1_SCORE_WAIT_MS;
+}
+
+export function reviewStage(review: Pick<R1ReviewResponse, 'round' | 'attempts' | 'assessment'>, nowMs: number): R1ReviewStage {
   const { round, attempts, assessment } = review;
   if (round.scores_withheld) return 'withheld';
   // The round is what carries a usable result: only a valid gated score reaches it (0122).
   if (assessment) return notScored(assessment) || !round.recommendation ? 'not_scored' : 'scored';
-  if (attempts.some((attempt) => attempt.session_status === 'completed')) return 'scoring';
-  if (round.status === 'completed') return 'scoring';
-  if (round.status === 'expired' || round.status === 'cancelled') return 'closed';
+  if (attempts.some((attempt) => scoreCanArrive(attempt, round.created_at, nowMs))) return 'scoring';
+  if (round.status === 'completed' || round.status === 'expired' || round.status === 'cancelled') return 'closed';
   return round.status === 'in_progress' ? 'in_progress' : 'invited';
 }
 
@@ -397,6 +418,19 @@ export function verdictOf(round: Pick<R1ReviewRound, 'recommendation' | 'overall
     mark: VERDICT_MARK[round.recommendation],
     overall: round.overall,
   };
+}
+
+/**
+ * The phone screening's one line, in the candidate header's own terms. A held score is no result to
+ * set beside the R1 verdict, so it gives no verdict or figure at all.
+ */
+export function phoneResultWords(phone: NonNullable<R1ReviewResponse['phone_screening']>): string | null {
+  if (isEvidenceInsufficient(phone)) return 'Held: not enough evidence';
+  const word = phone.recommendation ? (RECOMMENDATION_LABELS as Readonly<Record<string, string>>)[phone.recommendation] : null;
+  const figure = phone.overall_score === null ? null : Math.round(phone.overall_score);
+  const result = [word, figure].filter((part) => part !== null && part !== undefined).join(' ');
+  if (!result) return null;
+  return phone.scoring_status === 'incomplete_evidence' ? `${result}, provisional` : result;
 }
 
 /* ── Check before trusting it ─────────────────────────────────────── */

@@ -119,6 +119,17 @@ describe('Tabs', () => {
 });
 
 describe('Tabs (controlled)', () => {
+  it('reports a press through onTabClick, and not a move of the arrow keys', async () => {
+    const user = userEvent.setup();
+    const onTabClick = vi.fn();
+    render(<Tabs items={items} ariaLabel="Candidate sections" onTabClick={onTabClick} />);
+    await user.click(screen.getByRole('tab', { name: items[1].label }));
+    expect(onTabClick).toHaveBeenCalledTimes(1);
+    expect(onTabClick).toHaveBeenCalledWith(items[1].id);
+    await user.keyboard('{ArrowRight}');
+    expect(onTabClick).toHaveBeenCalledTimes(1);
+  });
+
   it('follows selectedId and reports user selection through onSelect', async () => {
     const user = userEvent.setup();
     const onSelect = vi.fn();

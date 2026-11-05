@@ -177,6 +177,84 @@ test.describe('playing', () => {
   });
 });
 
+test.describe('bringing the keys in', () => {
+  test('a press on the tab lets K start the recording', async ({ app, page }) => {
+    await app.goto(ADDRESS);
+    await page.getByRole('tab', { name: 'Recording' }).click();
+    await expect(page.getByRole('button', { name: 'Play', exact: true })).toBeFocused();
+    await page.keyboard.press('k');
+    await expect(page.locator('video')).toHaveCount(1);
+    expect(mints(app)).toHaveLength(1);
+  });
+
+  test('the arrow keys stay with the tabs', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=resume`);
+    await page.getByRole('tab', { name: 'Resume' }).focus();
+    await page.keyboard.press('ArrowRight');
+    await expect(page.getByRole('tab', { name: 'Recording' })).toBeFocused();
+    await page.keyboard.press('ArrowLeft');
+    await expect(page.getByRole('tab', { name: 'Resume' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  test('a click on the picture plays and pauses, and the keys answer after it', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording`);
+    const picture = page.locator('[data-r1-recording-state]');
+    await picture.click();
+    const video = page.locator('video');
+    await expect(video).toHaveCount(1);
+    await expect.poll(() => video.evaluate((el: HTMLVideoElement) => !el.paused)).toBe(true);
+    await picture.click();
+    await expect.poll(() => video.evaluate((el: HTMLVideoElement) => el.paused)).toBe(true);
+    await page.keyboard.press('k');
+    await expect.poll(() => video.evaluate((el: HTMLVideoElement) => !el.paused)).toBe(true);
+  });
+});
+
+test.describe('the strip and the transcript answer the reader', () => {
+  test('a phase and a role-play mark answer the pointer, so their tooltips can show', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording`);
+    for (const selector of ['[data-phase]', '[data-marker]']) {
+      const onTop = await page.locator(selector).first().evaluate((el) => {
+        const box = el.getBoundingClientRect();
+        return document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) === el;
+      });
+      expect(onTop, selector).toBe(true);
+    }
+    await expect(page.locator('[data-call-strip] figcaption')).toContainText('Phases: ');
+  });
+
+  test('a press on a phase seeks like a press on the rail', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await page.locator('[data-phase]').last().click();
+    await expect(page.getByTestId('position')).not.toHaveText('0:00');
+  });
+
+  test('a move of the panel\'s own keeps following: its `scroll` is not the reader', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording`);
+    const rail = page.getByRole('slider', { name: 'Position in the recording' });
+    await rail.focus();
+    await page.keyboard.press('End');
+    const scroller = page.getByRole('region', { name: 'Transcript turns' });
+    await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+    // The event lands after the frame that moved it.
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    await expect(page.getByRole('button', { name: 'Back to current' })).toHaveCount(0);
+  });
+
+  test('a scroll the reader makes stops following, and a row change no longer moves the panel', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording&t=${R1_REVIEW_SEEK_SEC}`);
+    const scroller = page.getByRole('region', { name: 'Transcript turns' });
+    await expect(page.getByRole('button', { name: 'Back to current' })).toHaveCount(0);
+    await scroller.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    await expect(page.getByRole('button', { name: 'Back to current' })).toBeVisible();
+    const parked = await scroller.evaluate((el) => el.scrollTop);
+    await page.getByRole('button', { name: 'Back 15 seconds' }).click();
+    expect(await scroller.evaluate((el) => el.scrollTop)).toBe(parked);
+  });
+});
+
 test.describe('moving between the scorecard and the recording', () => {
   test('a quote opens Recording at its turn, and the first play starts there', async ({ app, page }) => {
     await app.goto(ADDRESS);
@@ -222,16 +300,30 @@ test.describe('the states', () => {
     app.db.r1.review = {
       ...review,
       attempts: [{ ...review.attempts[0], consent_withdrawn: true, transcript_hidden: true, turns: [], recording: { state: 'deleted', reason: 'consent_withdrawn' } }],
-      // The API drops the quotes with the transcript.
-      assessment: { ...review.assessment!, metric_results: review.assessment!.metric_results.map((metric) => ({ ...metric, evidence: [] })) },
+      // The API drops the rationales and the quotes with the transcript.
+      assessment: { ...review.assessment!, metric_results: review.assessment!.metric_results.map((metric) => ({ ...metric, evidence: [], rationale: null })) },
     };
     await app.goto(`${ADDRESS}?tab=recording`);
     await expect(page.getByRole('tab', { name: 'Recording' })).toBeDisabled();
     await expect(page.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByText('This recording was deleted because consent was withdrawn.')).toBeVisible();
     await expect(page.getByText('The transcript is hidden.')).toBeVisible();
+    await expect(page.getByText('Detail hidden with the transcript.').first()).toBeVisible();
     await look(page, 'state-consent-withdrawn', testInfo.project.name);
     await auditA11y(page, testInfo, 'r1-review-consent-withdrawn', { strict: true });
+  });
+
+  test('a round whose consent was withdrawn mid-interview says it ended, and never that a score is coming', async ({ app, page }) => {
+    const { review } = app.db.r1;
+    app.db.r1.review = {
+      ...review,
+      assessment: null,
+      round: { ...review.round, recommendation: null, overall: null },
+      attempts: [{ ...review.attempts[0], session_status: 'failed', outcome: 'candidate_left', consent_withdrawn: true, transcript_hidden: true, turns: [], recording: { state: 'deleted', reason: 'consent_withdrawn' } }],
+    };
+    await app.goto(ADDRESS);
+    await expect(page.getByRole('tabpanel', { name: 'Overview' })).toContainText('This round ended without a scored interview.');
+    await expect(page.getByText('Scoring in progress')).toHaveCount(0);
   });
 
   test('a staff dry run is marked', async ({ app, page }) => {

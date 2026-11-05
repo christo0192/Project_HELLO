@@ -9,22 +9,22 @@
 import { useId } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { InlineNotice, StatusBadge } from '../design';
+import { Button, InlineNotice, StatusBadge } from '../design';
 import { ScorePips } from '../session/ScoreVerdict';
 import { formatDateTime } from '../../lib/datetime';
 import { R1_RESULT_WITHHELD } from '../../lib/r1';
-import { clockText } from '../../lib/r1-recording';
+import { attemptLabels, clockText } from '../../lib/r1-recording';
 import {
   evidenceMarks,
   neededReveals,
   notScoredSentence,
+  phoneResultWords,
   placeTurns,
   reviewStage,
   trustChecks,
   verdictOf,
 } from '../../lib/r1-review';
 import type { EvidenceMark, NeedReveal, PlacedTurn } from '../../lib/r1-review';
-import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
 import type { R1ReviewAttempt, R1ReviewMetric, R1ReviewResponse } from '../../lib/r1-types';
 import { formatWeightPercent } from '../../lib/scorecard-weights';
 import { scoreLabel } from '../../types';
@@ -43,6 +43,8 @@ export interface OverviewPanelProps {
   attempt: R1ReviewAttempt | null;
   candidateName: string;
   onOpenTurn: (target: TurnTarget) => void;
+  /** Read the round again: this page does not poll. */
+  onCheckAgain: () => void;
 }
 
 function Section({ title, aside, children }: { title: string; aside?: ReactNode; children: ReactNode }) {
@@ -100,12 +102,15 @@ function MetricRow({
   index,
   scaleMax,
   quotes,
+  detailHidden,
   onOpenQuote,
 }: {
   metric: R1ReviewMetric;
   index: number;
   scaleMax: number;
   quotes: readonly EvidenceMark[];
+  /** The API left the rationale out with the transcript. */
+  detailHidden: boolean;
   onOpenQuote: (mark: EvidenceMark) => void;
 }) {
   return (
@@ -133,6 +138,7 @@ function MetricRow({
         )}
       </div>
       {metric.rationale && <p className="mt-1 max-w-prose text-sm leading-6 text-ink-secondary">{metric.rationale}</p>}
+      {detailHidden && <p className="mt-1 text-sm text-ink-secondary">Detail hidden with the transcript.</p>}
       {quotes.length > 0 && (
         <div className="mt-2 space-y-1.5">
           {quotes.map((mark) => (
@@ -145,7 +151,7 @@ function MetricRow({
 }
 
 function Needs({ reveals, onOpen }: { reveals: readonly NeedReveal[]; onOpen: (reveal: NeedReveal) => void }) {
-  const revealed = reveals.filter((reveal) => reveal.turnIndex !== null).length;
+  const revealed = reveals.filter((reveal) => reveal.revealed).length;
   return (
     <Section
       title="Needs revealed"
@@ -155,8 +161,10 @@ function Needs({ reveals, onOpen }: { reveals: readonly NeedReveal[]; onOpen: (r
         {reveals.map((reveal) => (
           <li key={reveal.need} className="flex min-h-9 items-center justify-between gap-3 py-1.5 text-sm">
             <span className="text-ink">{reveal.label}</span>
-            {reveal.turnIndex === null ? (
+            {!reveal.revealed ? (
               <span className="text-ink-tertiary">Not revealed</span>
+            ) : reveal.turnIndex === null ? (
+              <span className="text-ink-secondary">Revealed, turn unknown</span>
             ) : reveal.row === null ? (
               <SeekChip turnIndex={reveal.turnIndex} sec={null} />
             ) : (
@@ -175,17 +183,23 @@ function Needs({ reveals, onOpen }: { reveals: readonly NeedReveal[]; onOpen: (r
   );
 }
 
-function StateLine({ children }: { children: ReactNode }) {
-  return <p className="max-w-prose py-8 text-sm text-ink-secondary">{children}</p>;
+function StateLine({ children, onCheckAgain }: { children: ReactNode; onCheckAgain?: () => void }) {
+  return (
+    <div className="max-w-prose space-y-3 py-8">
+      <p className="text-sm text-ink-secondary">{children}</p>
+      {onCheckAgain && (
+        <Button variant="secondary" size="sm" onClick={onCheckAgain}>
+          Check again
+        </Button>
+      )}
+    </div>
+  );
 }
 
 function PhoneLine({ review }: { review: R1ReviewResponse }) {
   const phone = review.phone_screening;
   if (!phone) return null;
-  const word = phone.recommendation
-    ? (RECOMMENDATION_LABELS as Readonly<Record<string, string>>)[phone.recommendation]
-    : null;
-  const result = [word, phone.overall_score === null ? null : Math.round(phone.overall_score)].filter((part) => part !== null && part !== undefined).join(' ');
+  const result = phoneResultWords(phone);
   return (
     <p className="text-sm text-ink-secondary">
       Phone screening: {result ? `${result} (AI). ` : ''}
@@ -199,19 +213,30 @@ function PhoneLine({ review }: { review: R1ReviewResponse }) {
   );
 }
 
-export function OverviewPanel({ review, attempt, candidateName, onOpenTurn }: OverviewPanelProps) {
+export function OverviewPanel({ review, attempt, candidateName, onOpenTurn, onCheckAgain }: OverviewPanelProps) {
   const { round, assessment, attempts, events } = review;
-  const stage = reviewStage(review);
+  const stage = reviewStage(review, Date.now());
 
   if (stage === 'withheld') return <StateLine>{R1_RESULT_WITHHELD}</StateLine>;
   if (stage === 'invited') return <StateLine>Link valid until {formatDateTime(round.expires_at)}.</StateLine>;
-  if (stage === 'in_progress') return <StateLine>The interview is in progress. The review opens here once it ends.</StateLine>;
-  if (stage === 'scoring') return <StateLine>Scoring in progress. The result appears here once it is ready.</StateLine>;
+  if (stage === 'in_progress') {
+    return (
+      <StateLine onCheckAgain={onCheckAgain}>
+        The interview is in progress. The review opens here once it ends. Link valid until {formatDateTime(round.expires_at)}.
+      </StateLine>
+    );
+  }
+  if (stage === 'scoring') {
+    return <StateLine onCheckAgain={onCheckAgain}>Scoring in progress. The result appears here once it is ready.</StateLine>;
+  }
   if (stage === 'closed') return <StateLine>This round ended without a scored interview.</StateLine>;
   if (!assessment) return null;
 
   // Evidence belongs to the attempt that was scored, whichever attempt is on screen.
-  const scored = attempts.find((item) => item.session_id === assessment.session_id) ?? attempt;
+  const scoredIndex = attempts.findIndex((item) => item.session_id === assessment.session_id);
+  const scored = attempts[scoredIndex] ?? attempt;
+  // The attempt switcher looks page-wide, and this result stays with the attempt it came from.
+  const scoredLabel = attempts.length > 1 && scoredIndex >= 0 ? attemptLabels(attempts)[scoredIndex] : null;
   const turns: PlacedTurn[] = scored ? placeTurns(scored, candidateName, assessment) : [];
   const marks = evidenceMarks(assessment, turns);
   const reveals = scored ? neededReveals(events, scored.session_id, turns) : [];
@@ -251,15 +276,19 @@ export function OverviewPanel({ review, attempt, candidateName, onOpenTurn }: Ov
                 {`Provisional: scored from ${scoredCount} of ${metrics.length} metrics. The others lacked evidence and are left out of the weighted score, so confirm before deciding.`}
               </InlineNotice>
             )}
+            {scoredLabel && <p className="mt-2 text-sm text-ink-secondary">This result is for {scoredLabel}.</p>}
           </div>
         </Section>
 
         {showMetrics && metrics.length > 0 && (
           <Section
-            title="Rubric"
+            title="AI rubric ratings"
             aside={<span className="text-meta text-ink-tertiary">Weight, rating out of {scaleMax}</span>}
           >
-            <ul aria-label="Rubric" className="divide-y divide-line">
+            {stage === 'not_scored' && (
+              <p className="pt-3 text-sm text-ink-secondary">These AI ratings gave no usable result. They are here for human review only.</p>
+            )}
+            <ul aria-label="AI rubric ratings" className="divide-y divide-line">
               {metrics.map((metric, index) => (
                 <MetricRow
                   key={metric.metric_id || index}
@@ -267,6 +296,7 @@ export function OverviewPanel({ review, attempt, candidateName, onOpenTurn }: Ov
                   index={index}
                   scaleMax={scaleMax}
                   quotes={marks.filter((mark) => mark.metricId === metric.metric_id)}
+                  detailHidden={scored?.transcript_hidden === true}
                   onOpenQuote={(mark) => open(mark.row, mark.startSec)}
                 />
               ))}

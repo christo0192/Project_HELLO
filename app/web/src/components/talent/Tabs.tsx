@@ -47,6 +47,11 @@ export interface TabsProps {
   selectedId?: string;
   /** Called with the item id whenever the user selects a tab. */
   onSelect?: (id: string) => void;
+  /**
+   * Called when a tab is pressed, and not when the arrow keys move to one. The arrows keep focus on the
+   * tabs, so this is the only moment a host may take focus into the panel.
+   */
+  onTabClick?: (id: string) => void;
   className?: string;
 }
 
@@ -56,6 +61,7 @@ export function Tabs({
   defaultIndex = 0,
   selectedId,
   onSelect,
+  onTabClick,
   className,
 }: TabsProps) {
   const rawId = useId();
@@ -135,7 +141,10 @@ export function Tabs({
               aria-controls={panelId(index)}
               tabIndex={selected ? 0 : -1}
               disabled={item.disabled}
-              onClick={() => setActiveIndex(index)}
+              onClick={() => {
+                setActiveIndex(index);
+                onTabClick?.(item.id);
+              }}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
                 'h-9 shrink-0 border-b-2 text-sm font-medium',

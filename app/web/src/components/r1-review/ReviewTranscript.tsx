@@ -9,13 +9,15 @@
  * washed, it only narrows the list.
  *
  * Follow. The active row is kept in view without animation, by moving this panel's own scroll
- * position, so the page behind it never jumps. A reader who scrolls has taken over: following stops,
- * and "Back to current" gives it back. Only input stops it: moving the panel here fires `scroll` too.
+ * position, so the page behind it never jumps. A reader who takes over stops it, and "Back to current"
+ * gives it back. That is a wheel, a touch or a scroll key, a press that is not on a button (selecting
+ * text must not be pulled away), or a `scroll` to anywhere but where this panel put itself: a scrollbar
+ * drag sends nothing else, and moving the panel here fires `scroll` too.
  * A hidden panel has no layout to move, so it catches up when it is shown (`visible`): a quote on
  * Overview can light a row before its tab has opened.
  */
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { PointerEvent, ReactNode } from 'react';
 import { Button, SegmentedControl, TextField, cx } from '../design';
 import { clockText } from '../../lib/r1-recording';
 import { highlightRanges, phaseLabel } from '../../lib/r1-review';
@@ -106,16 +108,20 @@ export interface ReviewTranscriptProps {
   onSeek: (row: number) => void;
   /** False while the tab hiding this panel is closed. */
   visible: boolean;
+  /** What an attempt with no turns says. Without it: none were saved. */
+  emptyText?: string;
   className?: string;
 }
 
-export function ReviewTranscript({ turns, activeRow, onSeek, visible, className }: ReviewTranscriptProps) {
+export function ReviewTranscript({ turns, activeRow, onSeek, visible, emptyText, className }: ReviewTranscriptProps) {
   const headingId = useId();
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
   const [following, setFollowing] = useState(true);
   const [announcement, setAnnouncement] = useState('');
   const scrollerRef = useRef<HTMLDivElement>(null);
+  /** Where this panel last put itself, or settled after a change of rows. */
+  const placedTopRef = useRef(0);
 
   const shown = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -127,13 +133,16 @@ export function ReviewTranscript({ turns, activeRow, onSeek, visible, className 
 
   const bringIntoView = (row: number | null) => {
     const scroller = scrollerRef.current;
-    const element = row === null ? null : scroller?.querySelector<HTMLElement>(`[data-turn-row="${row}"]`);
-    if (!scroller || !element) return;
-    const top = element.offsetTop;
-    const bottom = top + element.offsetHeight;
-    if (top < scroller.scrollTop || bottom > scroller.scrollTop + scroller.clientHeight) {
-      scroller.scrollTop = Math.max(0, top - scroller.clientHeight / 3);
+    if (!scroller) return;
+    const element = row === null ? null : scroller.querySelector<HTMLElement>(`[data-turn-row="${row}"]`);
+    if (element) {
+      const top = element.offsetTop;
+      const bottom = top + element.offsetHeight;
+      if (top < scroller.scrollTop || bottom > scroller.scrollTop + scroller.clientHeight) {
+        scroller.scrollTop = Math.max(0, top - scroller.clientHeight / 3);
+      }
     }
+    placedTopRef.current = scroller.scrollTop;
   };
 
   useLayoutEffect(() => {
@@ -156,6 +165,14 @@ export function ReviewTranscript({ turns, activeRow, onSeek, visible, className 
 
   const narrowed = shown.length !== turns.length;
   const stopFollowing = () => setFollowing(false);
+  const onScroll = () => {
+    const scroller = scrollerRef.current;
+    if (scroller && Math.abs(scroller.scrollTop - placedTopRef.current) > 1) stopFollowing();
+  };
+  // A timecode takes the reader back to the recording, so pressing one must not flash "Back to current".
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (!(event.target as HTMLElement).closest('button')) stopFollowing();
+  };
   let phaseShown: string | null = null;
 
   return (
@@ -194,13 +211,17 @@ export function ReviewTranscript({ turns, activeRow, onSeek, visible, className 
           tabIndex={0}
           onWheel={stopFollowing}
           onTouchMove={stopFollowing}
+          onScroll={onScroll}
+          onPointerDown={onPointerDown}
           onKeyDown={(event) => {
             if (SCROLL_KEYS.has(event.key)) stopFollowing();
           }}
           className="absolute inset-0 overflow-y-auto overscroll-contain focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--ink)]"
         >
           {shown.length === 0 ? (
-            <p className="px-4 py-6 text-sm text-ink-secondary">{turns.length === 0 ? 'No transcript lines were saved for this attempt.' : 'No turn matches.'}</p>
+            <p className="px-4 py-6 text-sm text-ink-secondary">
+              {turns.length === 0 ? (emptyText ?? 'No transcript lines were saved for this attempt.') : 'No turn matches.'}
+            </p>
           ) : (
             <ul className="divide-y divide-line">
               {shown.flatMap((turn) => {

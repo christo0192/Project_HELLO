@@ -145,6 +145,18 @@ describe('moving through the call', () => {
     expect(props.onSeek).toHaveBeenLastCalledWith(600);
   });
 
+  it('lets a phase and a marker answer the pointer, so their tooltips can show, and seeks from them', () => {
+    const { container, props } = strip();
+    sized(rail());
+    const phase = container.querySelector('[data-phase]') as HTMLElement;
+    const marker = container.querySelector('[data-marker]') as HTMLElement;
+    for (const mark of [phase, marker]) expect(mark).toHaveClass('pointer-events-auto');
+    fireEvent.click(phase, { clientX: 400 });
+    expect(props.onSeek).toHaveBeenLastCalledWith(300);
+    fireEvent.click(marker, { clientX: 500 });
+    expect(props.onSeek).toHaveBeenLastCalledWith(400);
+  });
+
   it('opens a moment from its own button, by name', () => {
     const { props } = strip();
     fireEvent.click(screen.getByRole('button', { name: 'Need 1 revealed, 5:00' }));

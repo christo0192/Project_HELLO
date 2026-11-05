@@ -10,7 +10,9 @@ import {
   neededReveals,
   notScoredSentence,
   phaseSegments,
+  phoneResultWords,
   placeTurns,
+  R1_SCORE_WAIT_MS,
   recordingBands,
   reviewAttemptFrom,
   reviewDurationSec,
@@ -31,6 +33,8 @@ import type {
 } from './r1-types';
 
 const START = 1_800_000_000_000;
+const NOW = Date.parse('2026-11-02T12:00:00Z');
+const AN_HOUR_AGO = '2026-11-02T11:00:00Z';
 
 const recording = (over: Partial<R1RecordingSummary> = {}): R1RecordingSummary => ({
   state: 'ready', reason: null, mode: 'single', has_video: true, started_at_ms: START, duration_ms: 600_000,
@@ -44,7 +48,7 @@ const turn = (index: number, sec: number | null, speaker: 'bot' | 'candidate', p
 const attempt = (over: Partial<R1ReviewAttempt> = {}): R1ReviewAttempt => ({
   session_id: 's1', attempt_number: 1, counted: true, outcome: 'complete', recording: recording(), persona_id: 'p1_career_switcher',
   persona_label: 'Career switcher', learner_name: 'Priya Nair', session_status: 'completed', started_at: null, ended_at: null,
-  consent_withdrawn: false, transcript_hidden: false, turns: [], ...over,
+  consent_withdrawn: false, transcript_hidden: false, in_progress: false, turns: [], ...over,
 });
 
 const assessment = (over: Partial<R1ReviewAssessment> = {}): R1ReviewAssessment => ({
@@ -309,40 +313,75 @@ describe('the needs a learner held back', () => {
     const turns = placeTurns(attempt({ turns: [turn(4, 30, 'candidate', 'roleplay')] }), 'Ava Example', null);
     const events = [{ session_id: 's1', event_type: 'need_revealed', turn_index: 4, family_id: null, need: 'H2', kind: null, created_at: null }];
     expect(neededReveals(events, 's1', turns)).toEqual([
-      { need: 'H1', label: 'Need 1', turnIndex: null, row: null, startSec: null },
-      { need: 'H2', label: 'Need 2', turnIndex: 4, row: 0, startSec: 30 },
-      { need: 'H3', label: 'Need 3', turnIndex: null, row: null, startSec: null },
+      { need: 'H1', label: 'Need 1', revealed: false, turnIndex: null, row: null, startSec: null },
+      { need: 'H2', label: 'Need 2', revealed: true, turnIndex: 4, row: 0, startSec: 30 },
+      { need: 'H3', label: 'Need 3', revealed: false, turnIndex: null, row: null, startSec: null },
     ]);
+  });
+
+  it('counts a reveal the worker could not map to a turn: the event is the fact', () => {
+    const events = [{ session_id: 's1', event_type: 'need_revealed', turn_index: null, family_id: null, need: 'H1', kind: null, created_at: null }];
+    expect(neededReveals(events, 's1', [])[0]).toEqual({ need: 'H1', label: 'Need 1', revealed: true, turnIndex: null, row: null, startSec: null });
   });
 });
 
 describe('where the round stands', () => {
   it('is withheld first: an appeal outranks everything', () => {
-    expect(reviewStage(review({ round: { ...review().round, scores_withheld: true }, assessment: null }))).toBe('withheld');
+    expect(reviewStage(review({ round: { ...review().round, scores_withheld: true }, assessment: null }), NOW)).toBe('withheld');
   });
 
   it('is scored with a usable result, and not scored without one', () => {
-    expect(reviewStage(review())).toBe('scored');
-    expect(reviewStage(review({ assessment: assessment({ raw_recommendation: 'human_review', recommendation: null }) }))).toBe('not_scored');
+    expect(reviewStage(review(), NOW)).toBe('scored');
+    expect(reviewStage(review({ assessment: assessment({ raw_recommendation: 'human_review', recommendation: null }) }), NOW)).toBe('not_scored');
   });
 
   it('is not scored when the round carries no recommendation, whatever the assessment says', () => {
-    expect(reviewStage(review({ round: { ...review().round, recommendation: null } }))).toBe('not_scored');
+    expect(reviewStage(review({ round: { ...review().round, recommendation: null } }), NOW)).toBe('not_scored');
   });
 
   it('is scoring once an attempt finished and nothing is attached yet', () => {
-    expect(reviewStage(review({ assessment: null }))).toBe('scoring');
-    expect(reviewStage(review({ assessment: null, round: { ...review().round, status: 'in_progress' } }))).toBe('scoring');
+    const attempts = [attempt({ ended_at: AN_HOUR_AGO })];
+    expect(reviewStage(review({ assessment: null, attempts }), NOW)).toBe('scoring');
+    expect(reviewStage(review({ assessment: null, attempts, round: { ...review().round, status: 'in_progress' } }), NOW)).toBe('scoring');
+  });
+
+  it('is scoring for a counted attempt that ended failed: that one is queued too (0126)', () => {
+    const attempts = [attempt({ session_status: 'failed', outcome: 'candidate_left', ended_at: AN_HOUR_AGO })];
+    expect(reviewStage(review({ assessment: null, attempts }), NOW)).toBe('scoring');
+  });
+
+  it('never promises a score that cannot come: a withdrawal stops the scoring', () => {
+    const left = attempt({ session_status: 'failed', outcome: 'candidate_left', ended_at: AN_HOUR_AGO, consent_withdrawn: true, transcript_hidden: true });
+    expect(reviewStage(review({ assessment: null, attempts: [left] }), NOW)).toBe('closed');
+    expect(reviewStage(review({ assessment: null, attempts: [{ ...left, session_status: 'completed' }] }), NOW)).toBe('closed');
+  });
+
+  it('has no job for an attempt that failed uncounted, so nothing is on its way', () => {
+    const attempts = [attempt({ session_status: 'failed', counted: false, ended_at: AN_HOUR_AGO })];
+    expect(reviewStage(review({ assessment: null, attempts }), NOW)).toBe('closed');
+  });
+
+  it('stops waiting after a day: a row from before 0126 has no job at all', () => {
+    const ended = (msAgo: number) => [attempt({ session_status: 'failed', ended_at: new Date(NOW - msAgo).toISOString() })];
+    expect(reviewStage(review({ assessment: null, attempts: ended(R1_SCORE_WAIT_MS - 1) }), NOW)).toBe('scoring');
+    expect(reviewStage(review({ assessment: null, attempts: ended(R1_SCORE_WAIT_MS) }), NOW)).toBe('closed');
+  });
+
+  it('measures from the session start, then the round, when the end was not stored', () => {
+    const old = { ...review().round, created_at: new Date(NOW - 2 * R1_SCORE_WAIT_MS).toISOString() };
+    expect(reviewStage(review({ assessment: null, attempts: [attempt({ started_at: AN_HOUR_AGO })], round: old }), NOW)).toBe('scoring');
+    expect(reviewStage(review({ assessment: null, attempts: [attempt()], round: old }), NOW)).toBe('closed');
   });
 
   it('is invited or in progress before that', () => {
-    expect(reviewStage(review({ assessment: null, attempts: [], round: { ...review().round, status: 'invited' } }))).toBe('invited');
-    expect(reviewStage(review({ assessment: null, attempts: [attempt({ session_status: 'in_progress' })], round: { ...review().round, status: 'in_progress' } }))).toBe('in_progress');
+    expect(reviewStage(review({ assessment: null, attempts: [], round: { ...review().round, status: 'invited' } }), NOW)).toBe('invited');
+    expect(reviewStage(review({ assessment: null, attempts: [attempt({ session_status: 'in_progress' })], round: { ...review().round, status: 'in_progress' } }), NOW)).toBe('in_progress');
   });
 
   it('has ended unscored when the round closed with nothing to score', () => {
-    expect(reviewStage(review({ assessment: null, attempts: [], round: { ...review().round, status: 'expired' } }))).toBe('closed');
-    expect(reviewStage(review({ assessment: null, attempts: [attempt({ session_status: 'failed' })], round: { ...review().round, status: 'cancelled' } }))).toBe('closed');
+    expect(reviewStage(review({ assessment: null, attempts: [], round: { ...review().round, status: 'expired' } }), NOW)).toBe('closed');
+    expect(reviewStage(review({ assessment: null, attempts: [attempt({ session_status: 'failed', counted: false })], round: { ...review().round, status: 'cancelled' } }), NOW)).toBe('closed');
+    expect(reviewStage(review({ assessment: null, attempts: [] }), NOW)).toBe('closed');
   });
 });
 
@@ -365,6 +404,28 @@ describe('the verdict', () => {
 
   it('is nothing without a recommendation', () => {
     expect(verdictOf({ ...review().round, recommendation: null })).toBeNull();
+  });
+});
+
+describe('the phone screening line', () => {
+  const phone = (over: Partial<NonNullable<R1ReviewResponse['phone_screening']>> = {}) => ({
+    recommendation: 'reject', overall_score: 30, created_at: null, evidence_grade: 'decision', scoring_status: 'complete', ...over,
+  });
+
+  it('gives the verdict and the figure of a firm result', () => {
+    expect(phoneResultWords(phone())).toBe('Reject 30');
+  });
+
+  it('gives neither for a held score, which is no result', () => {
+    expect(phoneResultWords(phone({ evidence_grade: 'insufficient' }))).toBe('Held: not enough evidence');
+  });
+
+  it('says a provisional score is one', () => {
+    expect(phoneResultWords(phone({ scoring_status: 'incomplete_evidence' }))).toBe('Reject 30, provisional');
+  });
+
+  it('says nothing when there is nothing to say', () => {
+    expect(phoneResultWords(phone({ recommendation: null, overall_score: null }))).toBeNull();
   });
 });
 

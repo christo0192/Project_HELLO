@@ -14,6 +14,9 @@
  * Nothing here animates, and the playhead moves by writing to the DOM (`movePlayhead`), so a player
  * that reports every frame costs no render. Cueing a moment is instant.
  *
+ * The rail lies under the rows. Whatever carries a tooltip (a phase, a marker) answers the pointer
+ * itself, or the tooltip could never show, and passes its click on to the same seek.
+ *
  * Keyboard and screen readers. The rail is a slider: arrows step 5 s, Home and End go to either end.
  * The turn ticks are decoration a transcript repeats in full, so they are hidden from assistive
  * technology and take no tab stop (an interview has a hundred of them); a moment is a real button
@@ -144,9 +147,9 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
 
   const ticks = useMemo(() => speakers.flatMap((speaker) => speaker.turns.map((turn) => turn.startSec)), [speakers]);
 
-  const seekAt = (event: MouseEvent<HTMLDivElement>) => {
-    const box = event.currentTarget.getBoundingClientRect();
-    if (box.width <= 0 || durationSec <= 0) return;
+  const seekAt = (event: MouseEvent<HTMLElement>) => {
+    const box = railRef.current?.getBoundingClientRect();
+    if (!box || box.width <= 0 || durationSec <= 0) return;
     const sec = ((event.clientX - box.left) / box.width) * durationSec;
     const snapped = snapToTick(sec, ticks, (SNAP_PX / box.width) * durationSec);
     onSeek(Math.min(durationSec, Math.max(0, snapped)));
@@ -233,11 +236,12 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
                 key={`${phase.label}-${phase.startSec}`}
                 data-phase=""
                 title={phase.label}
+                onClick={seekAt}
                 style={{
                   left: percent(along(phase.startSec, durationSec)),
                   width: percent(along(phase.endSec, durationSec) - along(phase.startSec, durationSec)),
                 }}
-                className="absolute inset-y-1 overflow-hidden truncate border-l border-[var(--control)] bg-surface-secondary px-1 text-meta leading-4 text-ink-tertiary"
+                className="pointer-events-auto absolute inset-y-1 cursor-pointer overflow-hidden truncate border-l border-[var(--control)] bg-surface-secondary px-1 text-meta leading-4 text-ink-tertiary"
               >
                 {along(phase.endSec, durationSec) - along(phase.startSec, durationSec) >= PHASE_LABEL_MIN_PERCENT ? phase.label : null}
               </span>
@@ -330,8 +334,9 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
                   key={marker.label}
                   data-marker=""
                   title={marker.detail}
+                  onClick={seekAt}
                   style={{ left: percent(along(marker.sec, durationSec)) }}
-                  className="absolute top-0.5 -translate-x-1/2 bg-surface px-0.5 font-mono text-meta text-ink"
+                  className="pointer-events-auto absolute top-0.5 -translate-x-1/2 cursor-pointer bg-surface px-0.5 font-mono text-meta text-ink"
                 >
                   {marker.label}
                 </span>

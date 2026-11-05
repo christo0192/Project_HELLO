@@ -114,6 +114,11 @@ export function R1ReviewPage() {
 
   const reread = useCallback(() => setReadKey((key) => key + 1), []);
 
+  const [tabPress, setTabPress] = useState(0);
+  const onTabClick = useCallback((id: string) => {
+    if (id === 'recording') setTabPress((press) => press + 1);
+  }, []);
+
   const [cue, setCue] = useState<ReviewCue | null>(() => {
     const sec = cueSecFrom(searchParams.get('t'));
     return sec === null ? null : { sec, row: null, nonce: 0 };
@@ -245,7 +250,10 @@ export function R1ReviewPage() {
       {attempt && recordingDisabled && (
         <InlineNotice tone="neutral" role="none" className="mt-3">
           <span className="block">{r1RecordingStateCopy(attempt.recording).detail}</span>
-          <span className="block">The transcript is hidden.</span>
+          {/* With no recording there is no deletion sentence to carry the reason, so this one does, in its words. */}
+          <span className="block">
+            {attempt.recording.state === 'none' ? 'The transcript is hidden because consent was withdrawn.' : 'The transcript is hidden.'}
+          </span>
         </InlineNotice>
       )}
 
@@ -254,11 +262,12 @@ export function R1ReviewPage() {
         ariaLabel="R1 review sections"
         selectedId={tab}
         onSelect={selectTab}
+        onTabClick={onTabClick}
         items={[
           {
             id: 'overview',
             label: 'Overview',
-            panel: <OverviewPanel review={body} attempt={attempt} candidateName={candidateName} onOpenTurn={openTurn} />,
+            panel: <OverviewPanel review={body} attempt={attempt} candidateName={candidateName} onOpenTurn={openTurn} onCheckAgain={reread} />,
           },
           { id: 'briefing', label: 'Briefing', panel: <BriefingPanel rubric={body.rubric} attempt={attempt} /> },
           { id: 'resume', label: 'Resume', panel: <ResumePanel candidate={body.candidate} /> },
@@ -278,6 +287,7 @@ export function R1ReviewPage() {
                   events={body.events}
                   active={tab === 'recording'}
                   cue={cue}
+                  tabPress={tabPress}
                   onNeedRefresh={reread}
                 />
               ) : (

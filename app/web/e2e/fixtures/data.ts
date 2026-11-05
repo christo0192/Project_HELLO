@@ -1605,6 +1605,7 @@ const R1_REVIEW: R1ReviewResponse = {
       ended_at: iso(R1_REC_START_MS + R1_REVIEW_LENGTH_SEC * 1000),
       consent_withdrawn: false,
       transcript_hidden: false,
+      in_progress: false,
       turns: R1_REVIEW_TURNS,
     },
     {
@@ -1621,6 +1622,7 @@ const R1_REVIEW: R1ReviewResponse = {
       ended_at: iso(R1_REC_START_MS + DAY + 90_000),
       consent_withdrawn: false,
       transcript_hidden: false,
+      in_progress: false,
       turns: [{ turn_index: 0, speaker: 'bot', text: 'Thanks for the retake. Where shall we start?', turn_started_at_ms: R1_REC_START_MS + DAY + 4_000, is_gate: false, phase: 'opening', interrupted: false }],
     },
   ],
@@ -1658,7 +1660,7 @@ const R1_REVIEW: R1ReviewResponse = {
     { session_id: R1_SESSION_ATTEMPT_1, event_type: 'family_delivered', turn_index: 14, family_id: 'F1', need: null, kind: null, created_at: null },
     { session_id: R1_SESSION_ATTEMPT_1, event_type: 'discount_detected', turn_index: 21, family_id: null, need: null, kind: null, created_at: null },
   ],
-  phone_screening: { recommendation: 'advance', overall_score: 71, created_at: ago(9 * DAY) },
+  phone_screening: { recommendation: 'advance', overall_score: 71, created_at: ago(9 * DAY), evidence_grade: 'decision', scoring_status: 'complete' },
   rubric: R1_METRIC_ROWS.map(([name, weight], index) => ({ key: `r1_metric_${index}`, name, weight_bps: weight, levels: R1_RUBRIC_LEVELS })),
 };
 

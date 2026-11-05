@@ -20,10 +20,14 @@
  * position and lights the row, and mints nothing: the link is made by the first play, from that position.
  *
  * KEYS work while focus is inside this panel, so a single-letter shortcut never fires from elsewhere
- * on the page (WCAG 2.1.4). A field keeps its own keys, and Space on a button stays that button's.
+ * on the page (WCAG 2.1.4). A field keeps its own keys, and Space on a button stays that button's. So
+ * focus is brought in: a press on the tab lands on Play (the arrow keys stay with the tabs, and Tab
+ * walks in from there), and the panel takes it from a click anywhere that is not a control.
+ *
+ * THE PICTURE plays and pauses on a click, as native controls did. Play does the same from the keyboard.
  */
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { KeyboardEvent } from 'react';
+import type { KeyboardEvent, MouseEvent } from 'react';
 import { Button, EmptyPanel, InlineNotice } from '../design';
 import { CallStrip } from '../recording/CallStrip';
 import type { CallStripHandle, CallStripMoment, CallStripSpeaker } from '../recording/CallStrip';
@@ -51,13 +55,15 @@ import {
   reviewDurationSec,
   rolePlayMarks,
 } from '../../lib/r1-review';
-import type { PlacedTurn, R1SpeakerKind } from '../../lib/r1-review';
+import type { PhaseSegment, PlacedTurn, R1SpeakerKind, RolePlayMark } from '../../lib/r1-review';
 import type { R1ReviewAssessment, R1ReviewAttempt, R1ReviewEvent } from '../../lib/r1-types';
 import { PlayerControls } from './PlayerControls';
 import { ReviewTranscript } from './ReviewTranscript';
 
 const ARROW_STEP_SEC = 5;
 const SKIP_STEP_SEC = 15;
+/** Paused this close to the reader's place, the media carries on. A hold sits a lead-in short of it. */
+const RESUME_SLACK_SEC = 1;
 
 /** A moment to open at. `nonce` tells a second press of the same quote from a re-render. */
 export interface ReviewCue {
@@ -76,6 +82,8 @@ export interface RecordingPanelProps {
   events: readonly R1ReviewEvent[];
   active: boolean;
   cue: ReviewCue | null;
+  /** Counts presses on the Recording tab: each brings focus in here. */
+  tabPress: number;
   onNeedRefresh: () => void;
 }
 
@@ -95,9 +103,26 @@ function speakerRows(turns: readonly PlacedTurn[], candidateName: string, learne
 
 const plural = (count: number, one: string) => `${count} ${one}${count === 1 ? '' : 's'}`;
 
-function stripSentence(durationSec: number, speakers: readonly CallStripSpeaker[], quotes: number, moments: number): string {
+function stripSentence(
+  durationSec: number,
+  speakers: readonly CallStripSpeaker[],
+  phases: readonly PhaseSegment[],
+  marks: readonly RolePlayMark[],
+  quotes: number,
+  moments: number,
+): string {
   const talk = speakers.map((speaker) => `${speaker.label} took ${plural(speaker.turns.length, 'turn')}`).join(', ');
-  return `The recording runs ${clockText(durationSec)}. ${talk}. ${plural(quotes, 'evidence quote')} and ${plural(moments, 'logged moment')} are marked. The transcript beside it has every turn.`;
+  const stages = phases.map((phase) => `${phase.label} from ${clockText(phase.startSec)}`).join(', ');
+  const lines = marks.map((mark) => `${mark.detail} at ${clockText(mark.sec)}`).join(', ');
+  return [
+    `The recording runs ${clockText(durationSec)}.`,
+    talk && `${talk}.`,
+    stages && `Phases: ${stages}.`,
+    lines && `${lines}.`,
+    `${plural(quotes, 'evidence quote')} and ${plural(moments, 'logged moment')} are marked. The transcript beside it has every turn.`,
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 export function RecordingPanel({
@@ -109,6 +134,7 @@ export function RecordingPanel({
   events,
   active,
   cue,
+  tabPress,
   onNeedRefresh,
 }: RecordingPanelProps) {
   const summary = attempt.recording;
@@ -153,6 +179,12 @@ export function RecordingPanel({
     heldStartRef.current = null;
     showRow(null);
   }, [showRow]);
+
+  // A dropped element never sends its pause, so the transport is told here.
+  const onMediaDropped = useCallback(() => {
+    setPlaying(false);
+    dropHold();
+  }, [dropHold]);
 
   // A hold belongs to the rows it was clicked on: new rows end it (see the file header).
   useLayoutEffect(dropHold, [starts, dropHold]);
@@ -234,36 +266,48 @@ export function RecordingPanel({
     focusOnPlayRef.current = cueNonce > 0;
   }, [cue, cueNonce, openCue]);
 
-  // A quote moved focus away with the tab: land on Play, so Space or K starts it from here. The tab can
-  // open after the cue (the address changes in a transition), and a hidden button takes no focus.
+  const tabPressRef = useRef(tabPress);
+  useLayoutEffect(() => {
+    if (tabPressRef.current === tabPress) return;
+    tabPressRef.current = tabPress;
+    focusOnPlayRef.current = true;
+  }, [tabPress]);
+
+  // A quote or a press on the tab left focus outside: land on Play, so Space or K starts it from here. The
+  // tab can open after the cue (the address changes in a transition), and a hidden button takes no focus.
   useLayoutEffect(() => {
     if (!active || !focusOnPlayRef.current) return;
     focusOnPlayRef.current = false;
     playButtonRef.current?.focus({ preventScroll: true });
-  }, [active, cueNonce]);
+  }, [active, cueNonce, tabPress]);
 
   const toggle = useCallback(() => {
     const player = playerRef.current;
     if (!player) return;
-    if (player.hasUrl) {
-      if (playing) player.pause();
-      else player.play();
+    if (player.hasUrl && !player.paused) {
+      player.pause();
       return;
     }
-    // The first play starts where the reader is. Cued on a turn, it plays that turn with its lead-in.
     const sec = positionRef.current;
+    if (player.hasUrl && Math.abs(player.currentTime - sec) < RESUME_SLACK_SEC) {
+      player.play();
+      return;
+    }
+    // The first play starts where the reader is. So does a play after a click whose link failed: Try
+    // again brings the media back at the start, and the reader is still on the turn they asked for.
+    // Cued on a turn, it plays that turn with its lead-in.
     const row = cuedRow(turns, sec);
     if (row !== null && turns[row].startSec === sec) playRow(row);
     else player.playFrom(sec);
-  }, [playRow, playing, turns]);
+  }, [playRow, turns]);
 
-  const skip = useCallback(
-    (deltaSec: number) => {
-      const player = playerRef.current;
-      moveTo((player?.hasUrl ? player.currentTime : positionRef.current) + deltaSec);
-    },
-    [moveTo],
-  );
+  const onPictureClick = (event: MouseEvent<HTMLDivElement>) => {
+    // Try again is its own button, and an error block is not the picture.
+    if ((event.target as HTMLElement).closest('button, [role="alert"]')) return;
+    toggle();
+  };
+
+  const skip = useCallback((deltaSec: number) => moveTo(positionRef.current + deltaSec), [moveTo]);
 
   const changeRate = useCallback((next: number) => {
     setRate(next);
@@ -351,28 +395,31 @@ export function RecordingPanel({
     <div
       role="group"
       aria-label="Recording player"
+      tabIndex={-1}
       onKeyDown={onKeyDown}
-      className="grid gap-6 min-[1180px]:grid-cols-[minmax(0,1fr)_26rem]"
+      className="grid gap-6 focus:outline-none min-[1180px]:grid-cols-[minmax(0,1fr)_26rem]"
     >
       <div className="min-w-0 space-y-3">
         {playable ? (
           <>
-            <R1RecordingPlayer
-              ref={playerRef}
-              roundId={roundId}
-              sessionId={attempt.session_id}
-              summary={summary}
-              label={attemptLabel}
-              active={active}
-              controls="custom"
-              onTimeUpdate={onPosition}
-              onPlayState={setPlaying}
-              onEnded={onEnded}
-              onMediaDropped={dropHold}
-              onStateChange={onNeedRefresh}
-              onNeedRefresh={onNeedRefresh}
-              onDuration={setMediaSec}
-            />
+            <div onClick={onPictureClick} className="cursor-pointer">
+              <R1RecordingPlayer
+                ref={playerRef}
+                roundId={roundId}
+                sessionId={attempt.session_id}
+                summary={summary}
+                label={attemptLabel}
+                active={active}
+                controls="custom"
+                onTimeUpdate={onPosition}
+                onPlayState={setPlaying}
+                onEnded={onEnded}
+                onMediaDropped={onMediaDropped}
+                onStateChange={onNeedRefresh}
+                onNeedRefresh={onNeedRefresh}
+                onDuration={setMediaSec}
+              />
+            </div>
             <PlayerControls
               playing={playing}
               muted={muted}
@@ -398,7 +445,7 @@ export function RecordingPanel({
                 markersLabel="Role-play clock"
                 moments={moments}
                 bands={recordingBands(summary, durationSec)}
-                textAlternative={stripSentence(durationSec, speakers, evidence.length, logged.length)}
+                textAlternative={stripSentence(durationSec, speakers, segments, markers, evidence.length, logged.length)}
                 onSeek={moveTo}
                 onMoment={onMoment}
                 className="border-t border-line pt-3"
@@ -427,7 +474,14 @@ export function RecordingPanel({
 
       {/* The rows scroll in a box as tall as the left column, and never shorter than the window allows. */}
       <div className="relative min-h-[28rem] min-w-0 border-t border-line pt-3 min-[1180px]:min-h-[calc(100vh-15rem)] min-[1180px]:border-l min-[1180px]:border-t-0 min-[1180px]:pt-0">
-        <ReviewTranscript turns={turns} activeRow={activeRow} onSeek={playRow} visible={active} className="absolute inset-0 pt-3 min-[1180px]:pt-0" />
+        <ReviewTranscript
+          turns={turns}
+          activeRow={activeRow}
+          onSeek={playRow}
+          visible={active}
+          emptyText={attempt.in_progress ? 'The transcript appears here once the interview ends.' : undefined}
+          className="absolute inset-0 pt-3 min-[1180px]:pt-0"
+        />
       </div>
     </div>
   );

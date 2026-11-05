@@ -91,6 +91,8 @@ export interface R1RecordingPlayerHandle {
   setVolume(volume: number): void;
   setMuted(muted: boolean): void;
   readonly currentTime: number;
+  /** The media's own word, for a host with a button: an element dropped or reloaded sends no pause. */
+  readonly paused: boolean;
   readonly hasUrl: boolean;
   /**
    * A position is waiting for a link or for metadata (a `playFrom`, or the place a re-mint saved), so the
@@ -602,6 +604,9 @@ export const R1RecordingPlayer = forwardRef<R1RecordingPlayerHandle, R1Recording
         },
         get currentTime() {
           return masterRef.current?.currentTime ?? 0;
+        },
+        get paused() {
+          return masterRef.current?.paused ?? true;
         },
         get hasUrl() {
           return mintedRef.current !== null && phaseRef.current === 'media';

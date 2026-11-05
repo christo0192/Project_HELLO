@@ -18,8 +18,12 @@
  * AFTER CONSENT IS WITHDRAWN. An attempt made at or before the latest withdrawal or decline, the
  * erase rule's own test (`recording/erase.ts`), has its transcript hidden and its recording shown as
  * deleted for that reason, even in the moments before the erase job has run. Its transcript is not
- * read, and evidence quotes are dropped from the assessment, because a quote is the transcript by
- * another route. A consent merely superseded by a newer notice is not a withdrawal.
+ * read, and evidence quotes and rationales are dropped from the assessment: a quote is the transcript
+ * by another route, and a rationale cites what the candidate said (`r1-prompt.ts`), up to 900 characters
+ * a metric. A consent merely superseded by a newer notice is not a withdrawal.
+ *
+ * WHILE AN INTERVIEW RUNS. There is nothing to review yet, so a live attempt's transcript is not read:
+ * `in_progress` says why it is empty.
  *
  * FAILURE. A read this page depends on fails the whole answer (503): a partial page could say "no
  * recording" or "not scored" about something that exists. Only the role title and the one line of
@@ -45,6 +49,9 @@ const STAFF_LOCALE = 'en-IN-x-staff';
 
 /** The most pages of one transcript or one log: far past any real interview, and never truncated. */
 const MAX_PAGES = 5;
+
+/** The session states of an interview that has not ended (0115). */
+const LIVE_SESSION_STATES: ReadonlySet<unknown> = new Set(['created', 'waiting', 'in_progress']);
 
 const ROUND_COLUMNS =
   'id,candidate_id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,assessment_id,'
@@ -89,6 +96,8 @@ export interface R1ReviewAttempt {
   ended_at: string | null;
   consent_withdrawn: boolean;
   transcript_hidden: boolean;
+  /** The interview has not ended: `turns` is empty until it has. */
+  in_progress: boolean;
   recording: R1RecordingSummary;
   turns: R1ReviewTurn[];
 }
@@ -141,7 +150,15 @@ export interface R1ReviewBody {
   attempts: R1ReviewAttempt[];
   assessment: R1ReviewAssessment | null;
   events: R1ReviewEvent[];
-  phone_screening: { recommendation: string | null; overall_score: number | null; created_at: string | null } | null;
+  phone_screening: {
+    recommendation: string | null;
+    overall_score: number | null;
+    created_at: string | null;
+    /** `insufficient`: the score is held. A held row is no firm result. */
+    evidence_grade: string | null;
+    /** `incomplete_evidence`: the score is provisional. */
+    scoring_status: string | null;
+  } | null;
   rubric: Array<{ key: string; name: string; weight_bps: number; levels: Record<string, string> }>;
 }
 
@@ -217,7 +234,7 @@ function evidenceOf(result: Row): Array<{ turn_index: number; quote: string }> {
   });
 }
 
-function metricOf(value: unknown, hideQuotes: boolean): R1ReviewMetric | null {
+function metricOf(value: unknown, hideWords: boolean): R1ReviewMetric | null {
   if (!isRecord(value)) return null;
   const metric = isRecord(value.metric) ? value.metric : {};
   return {
@@ -226,12 +243,12 @@ function metricOf(value: unknown, hideQuotes: boolean): R1ReviewMetric | null {
     weight_bps: num(metric.weightBps),
     score: num(value.score),
     evidence_status: text(value.evidenceStatus),
-    rationale: text(value.rationale),
-    evidence: hideQuotes ? [] : evidenceOf(value),
+    rationale: hideWords ? null : text(value.rationale),
+    evidence: hideWords ? [] : evidenceOf(value),
   };
 }
 
-function assessmentOf(row: Row, hideQuotes: boolean): R1ReviewAssessment {
+function assessmentOf(row: Row, hideWords: boolean): R1ReviewAssessment {
   const raw = isRecord(row.raw) ? row.raw : {};
   const r1 = isRecord(raw.r1) ? raw.r1 : {};
   const results = Array.isArray(row.metric_results) ? row.metric_results : [];
@@ -244,7 +261,7 @@ function assessmentOf(row: Row, hideQuotes: boolean): R1ReviewAssessment {
     scoring_status: text(row.scoring_status),
     score_scale_max: num(row.score_scale_max),
     created_at: text(row.created_at),
-    metric_results: results.map((result) => metricOf(result, hideQuotes)).filter((metric) => metric !== null),
+    metric_results: results.map((result) => metricOf(result, hideWords)).filter((metric) => metric !== null),
     r1: {
       outcome: text(r1.outcome),
       valid: typeof r1.valid === 'boolean' ? r1.valid : null,
@@ -337,13 +354,19 @@ async function phoneScreening(db: R1DbClient, candidateId: string): Promise<R1Re
     if (phoneSessionIds.length === 0) return null;
     const { data, error } = await db
       .from('assessments')
-      .select('recommendation,overall_score,created_at')
+      .select('recommendation,overall_score,created_at,evidence_grade,scoring_status')
       .in('session_id', phoneSessionIds)
       .order('created_at', { ascending: false })
       .limit(1);
     const row = !error && Array.isArray(data) ? (data[0] as Row | undefined) : undefined;
     if (!row) return null;
-    return { recommendation: text(row.recommendation), overall_score: num(row.overall_score), created_at: text(row.created_at) };
+    return {
+      recommendation: text(row.recommendation),
+      overall_score: num(row.overall_score),
+      created_at: text(row.created_at),
+      evidence_grade: text(row.evidence_grade),
+      scoring_status: text(row.scoring_status),
+    };
   } catch {
     return null;
   }
@@ -394,9 +417,13 @@ export async function readR1Review(
       return !Number.isFinite(at) || at <= cutoff;
     };
 
+    const sessions = new Map<string, Row>();
+    for (const row of (Array.isArray(sessionsRead.data) ? sessionsRead.data : []) as Row[]) sessions.set(String(row.id), row);
+    const liveFor = (sessionId: unknown): boolean => LIVE_SESSION_STATES.has(sessions.get(String(sessionId))?.status);
+
     const attemptRows = (Array.isArray(attemptsRead.data) ? attemptsRead.data : []) as Row[];
     const turnsRead = await Promise.all(attemptRows.map((attempt) =>
-      withdrawnFor(attempt.created_at)
+      withdrawnFor(attempt.created_at) || liveFor(attempt.session_id)
         ? null
         : readAllPages<Row>(
             (from, to) => db.from('transcript_turns').select(TURN_COLUMNS).eq('session_id', String(attempt.session_id))
@@ -409,8 +436,6 @@ export async function readR1Review(
     for (const row of (Array.isArray(recordingsRead.data) ? recordingsRead.data : []) as R1RecordingRow[]) {
       recordings.set(row.session_id, row);
     }
-    const sessions = new Map<string, Row>();
-    for (const row of (Array.isArray(sessionsRead.data) ? sessionsRead.data : []) as Row[]) sessions.set(String(row.id), row);
     const variants = variantsBySession(logRead.rows);
 
     const attempts = attemptRows.map((row, index): R1ReviewAttempt => {
@@ -433,6 +458,7 @@ export async function readR1Review(
         ended_at: text(session?.ended_at),
         consent_withdrawn: withdrawn,
         transcript_hidden: withdrawn,
+        in_progress: liveFor(sessionId),
         recording: withdrawn ? withdrawnSummary(summary) : summary,
         turns: read?.ok ? read.rows.map(turnOf) : [],
       };
