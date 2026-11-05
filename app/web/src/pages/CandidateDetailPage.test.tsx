@@ -193,7 +193,7 @@ function renderDetailPage(id = 'candidate-1', search = '') {
 }
 
 function reviewTab() {
-  return screen.getByRole('tab', { name: 'Review' });
+  return screen.getByRole('tab', { name: 'Phone screening' });
 }
 
 describe('CandidateDetailPage', () => {
@@ -271,7 +271,7 @@ describe('CandidateDetailPage', () => {
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 480, candidate_words: 12 }],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     const words = document.querySelector('[data-candidate-words]');
     expect(words?.textContent).toContain('12');
     expect(words?.textContent).toContain('words spoken');
@@ -289,7 +289,7 @@ describe('CandidateDetailPage', () => {
       ],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain('7m 14s');
     // ...and the words come from THE SAME session, or the two figures
     // describe different calls while sitting side by side.
@@ -303,7 +303,7 @@ describe('CandidateDetailPage', () => {
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: null, candidate_words: 0 }],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
   });
 
@@ -351,7 +351,7 @@ describe('CandidateDetailPage', () => {
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: null }],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     // The call still happened, so its length is still shown...
     expect(document.querySelector('[data-candidate-call-length]')).not.toBeNull();
     // ...but nothing is claimed about what they said.
@@ -366,7 +366,7 @@ describe('CandidateDetailPage', () => {
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 0 }],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     const words = document.querySelector('[data-candidate-words]');
     expect(words?.textContent).toContain('0');
     expect(words?.textContent).toContain('words spoken');
@@ -384,7 +384,7 @@ describe('CandidateDetailPage', () => {
       sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 0, candidate_words: 0 }],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
   });
 
@@ -435,7 +435,7 @@ describe('CandidateDetailPage', () => {
       candidate: { ...mockCandidateDetail.candidate, role_id: 'role-gone' },
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     expect(document.querySelector('[data-candidate-role-title]')).toBeNull();
     expect(screen.queryByText('role-gone')).not.toBeInTheDocument();
   });
@@ -445,7 +445,7 @@ describe('CandidateDetailPage', () => {
     expect(await screen.findByText('Jane Doe')).toBeInTheDocument();
     expect(screen.getByText('jane@example.com')).toBeInTheDocument();
     expect(screen.getByText('5 years')).toBeInTheDocument();
-    expect(screen.getByText('Profile')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Profile', hidden: true })).toBeInTheDocument();
   });
 
   /**
@@ -608,7 +608,7 @@ describe('CandidateDetailPage', () => {
       }],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe(
       'Recorded 1m 11s across 2 calls',
     );
@@ -631,7 +631,7 @@ describe('CandidateDetailPage', () => {
       }],
     });
     renderDetailPage();
-    await screen.findByText(/Profile/);
+    await screen.findByRole('tab', { name: 'Profile' });
     expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe('Recorded 33s');
     expect(document.querySelector('[data-candidate-call-length]')?.textContent).toBe('35s on the call');
     expect(screen.queryByText(/16m 39s/)).toBeNull();
@@ -964,7 +964,7 @@ describe('CandidateDetailPage', () => {
         attempts_counted: 1, recommendation: null, overall: null, created_at: '2026-10-06T10:00:00.000Z', created_by: 'user-1',
       }],
     });
-    renderDetailPage("candidate-1", "?tab=overview");
+    renderDetailPage("candidate-1", "?tab=r1");
     const card = await screen.findByRole('list', { name: 'R1 rounds' });
     expect(within(card).getByText('Scorecards are suppressed while an appeal is under review.')).toBeInTheDocument();
     expect(within(card).queryByText(/No results yet/)).toBeNull();
@@ -1039,28 +1039,28 @@ describe('CandidateDetailPage', () => {
     expect(screen.getAllByText('Completed').length).toBeGreaterThanOrEqual(1);
   });
 
-  it('shows the session scorecard in the Review tab', async () => {
+  it('shows the session scorecard in the Phone screening tab', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     fireEvent.click(reviewTab());
     expect(await screen.findByText('Scorecard for this session')).toBeInTheDocument();
     // The figure is on the Review scorecard AND, as the latest screening, in the header.
-    const review = screen.getByRole('tabpanel', { name: 'Review' });
+    const review = screen.getByRole('tabpanel', { name: 'Phone screening' });
     expect(within(review).getByText('78')).toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: 'Latest screening score' })).getByText('78')).toBeInTheDocument();
   });
 
-  it('opens on Review by default when there is something to review, Overview when there is not', async () => {
+  it('opens on Phone screening by default when there is something to review', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Review', 'Overview']);
+    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Phone screening', 'R1 interview', 'Profile']);
   });
 
-  it('keeps ?tab=overview deep links on Overview, and writes the tab into the URL when switched', async () => {
+  it('keeps ?tab=overview deep links working, on Profile, and writes the tab into the URL when switched', async () => {
     renderDetailPage('candidate-1', '?tab=overview');
     await screen.findByText('Jane Doe');
-    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: 'Profile' })).toHaveAttribute('aria-selected', 'true');
     fireEvent.click(reviewTab());
     expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
   });
@@ -1237,7 +1237,7 @@ describe('Candidate header: one primary action for the state', () => {
     mockApi.listAppeals.mockResolvedValue({ appeals: [] });
   });
 
-  it('offers "Review screening" when there is a screening to read, and it opens the Review tab', async () => {
+  it('offers "Review screening" when there is a screening to read, and it opens Phone screening', async () => {
     const user = userEvent.setup();
     renderDetailPage('candidate-1', '?tab=overview');
     const primary = await screen.findByRole('button', { name: 'Review screening' });
@@ -1251,7 +1251,7 @@ describe('Candidate header: one primary action for the state', () => {
     expect(screen.queryByRole('button', { name: 'Review screening' })).not.toBeInTheDocument();
   });
 
-  it('opens on the Review tab from ?tab=review (the table "Review & decide" link)', async () => {
+  it('opens on Phone screening from ?tab=review (an old "Review & decide" link)', async () => {
     renderDetailPage('candidate-1', '?tab=review');
     await screen.findByText('Jane Doe');
     expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
@@ -1307,7 +1307,7 @@ describe('Candidate header: one primary action for the state', () => {
 
       await user.click(header);
 
-      expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+      expect(screen.getByRole('tab', { name: 'Profile' })).toHaveAttribute('aria-selected', 'true');
       const dialog = await screen.findByRole('dialog', { name: 'Confirm phone screening' });
       await waitFor(() =>
         expect(within(dialog).getByRole('button', { name: 'Confirm call' })).toHaveFocus(),

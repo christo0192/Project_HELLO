@@ -73,6 +73,20 @@ export const R1_RECOMMENDATION_LABEL: Readonly<Record<R1Recommendation, string>>
 /** A round's result while an appeal blocks decision use: the Review tab's own sentence, not new copy. */
 export const R1_RESULT_WITHHELD = 'Scorecards are suppressed while an appeal is under review.';
 
+/**
+ * The line under the phone score in the candidate header, from the newest round with a result (the
+ * rounds arrive newest first). Null when there is none, or while the result is withheld.
+ */
+export function r1ResultLine(rounds: readonly R1Round[]): string | null {
+  const round = rounds.find((item) => item.recommendation !== null || item.overall !== null);
+  if (!round || round.scores_withheld === true) return null;
+  const words = [
+    round.recommendation ? R1_RECOMMENDATION_LABEL[round.recommendation] : null,
+    round.overall === null ? null : String(Math.round(round.overall)),
+  ];
+  return `R1 role-play: ${words.filter(Boolean).join(' ')} (AI)`;
+}
+
 export function isLiveRound(round: Pick<R1Round, 'status'>): boolean {
   return round.status === 'invited' || round.status === 'in_progress';
 }

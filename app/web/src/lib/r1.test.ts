@@ -28,6 +28,7 @@ import {
   r1StatusTone,
   r1UsedMinutes,
   readingMonthLabel,
+  r1ResultLine,
   rebaseDraft,
   sendGate,
   sendGateNotice,
@@ -606,5 +607,31 @@ describe('a dashboard reading from an earlier month', () => {
     expect(currentMonthStart(new Date('2026-10-07T12:00:00.000Z'))).toBe('2026-10-01');
     expect(currentMonthStart(new Date('2026-12-31T23:59:59.000Z'))).toBe('2026-12-01');
     expect(readingMonthLabel('2026-09-30T20:00:00.000Z')).toBe('September 2026');
+  });
+});
+
+describe('r1ResultLine', () => {
+  const round = (over: Partial<R1Round>): R1Round => ({
+    id: 'round-1', status: 'completed', expires_at: '2026-11-04T00:00:00.000Z', attempts_allowed: 2, attempts_counted: 1,
+    recommendation: null, overall: null, created_at: '2026-11-01T00:00:00.000Z', ...over,
+  });
+
+  it('names the pipeline, the verdict, a whole figure and the AI', () => {
+    expect(r1ResultLine([round({ recommendation: 'hold', overall: 57.6 })])).toBe('R1 role-play: Borderline 58 (AI)');
+  });
+
+  it('says what it has when only one of the two is there', () => {
+    expect(r1ResultLine([round({ recommendation: 'reject' })])).toBe('R1 role-play: Reject (AI)');
+    expect(r1ResultLine([round({ overall: 40 })])).toBe('R1 role-play: 40 (AI)');
+  });
+
+  it('takes the newest round with a result', () => {
+    expect(r1ResultLine([round({ id: 'new' }), round({ id: 'old', recommendation: 'advance', overall: 80 })])).toBe('R1 role-play: Select 80 (AI)');
+  });
+
+  it('has no line with no result, or a withheld one', () => {
+    expect(r1ResultLine([])).toBeNull();
+    expect(r1ResultLine([round({})])).toBeNull();
+    expect(r1ResultLine([round({ recommendation: 'hold', overall: 58, scores_withheld: true })])).toBeNull();
   });
 });

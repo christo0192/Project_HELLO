@@ -219,9 +219,9 @@ export const KEY_STATES: KeyState[] = [
     fullPage: true,
     async run(app) {
       await app.goto(`/candidates/${STAR_CANDIDATE_ID}`);
-      await app.page.getByRole('tab', { name: 'Review' }).click();
+      await app.page.getByRole('tab', { name: 'Phone screening' }).click();
       await app.settle();
-      const panel = app.page.getByRole('tabpanel', { name: 'Review' });
+      const panel = app.page.getByRole('tabpanel', { name: 'Phone screening' });
       await expect(panel).toBeVisible();
       return panel;
     },
@@ -234,8 +234,8 @@ export const KEY_STATES: KeyState[] = [
     fullPage: true,
     async run(app) {
       await app.goto(`/candidates/${LEGACY_CANDIDATE_ID}`);
-      await app.page.getByRole('tab', { name: 'Review' }).click();
-      const panel = app.page.getByRole('tabpanel', { name: 'Review' });
+      await app.page.getByRole('tab', { name: 'Phone screening' }).click();
+      const panel = app.page.getByRole('tabpanel', { name: 'Phone screening' });
       const calls = panel.getByRole('list', { name: 'Calls in this session' });
       await expect(calls.getByRole('listitem')).toHaveCount(2);
       await expect(calls.getByText('Call 2 of 2 · reconnect')).toBeVisible();
@@ -257,7 +257,7 @@ export const KEY_STATES: KeyState[] = [
     name: 'candidate-attempt-recording-player',
     fullPage: false,
     async run(app) {
-      await app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=overview`);
+      await app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=profile`);
       const history = app.page.getByRole('region', { name: 'Call attempts' });
       const row = history.getByRole('listitem').filter({ hasText: 'Attempt 2' });
       await expect(row.getByText('Recorded before consent')).toBeVisible();

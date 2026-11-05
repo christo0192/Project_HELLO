@@ -143,8 +143,8 @@ async function pixelsOf(page: Page, subject: Locator, colour: string): Promise<n
 /** Open the Review tab and start a transcript turn, which marks it `aria-current`. */
 async function playTurn(app: AppHarness, page: Page): Promise<Locator> {
   await app.goto(`/candidates/${SEEK_CANDIDATE_ID}`);
-  await page.getByRole('tab', { name: 'Review' }).click();
-  const panel = page.getByRole('tabpanel', { name: 'Review' });
+  await page.getByRole('tab', { name: 'Phone screening' }).click();
+  const panel = page.getByRole('tabpanel', { name: 'Phone screening' });
   await panel.getByRole('combobox').selectOption(SEEK_NORMAL_SESSION_ID);
   const turn = panel.getByRole('group', { name: 'Call 1 of 2 · first call' }).getByRole('button', { name: /Turn 2:/ });
   await turn.click();

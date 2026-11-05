@@ -22,10 +22,13 @@ import { Link, MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Layout, pageTitleFor } from './Layout';
 
+const mockListR1Queue = vi.hoisted(() => vi.fn());
+
 vi.mock('../api', () => ({
   api: {
     status: () =>
       Promise.resolve({ status: 'ok', maintenance: null, updated_at: '2026-01-01T00:00:00.000Z' }),
+    listR1Queue: (...args: unknown[]) => mockListR1Queue(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -76,6 +79,8 @@ function sidebarInert(): boolean {
 
 beforeEach(() => {
   setAuth();
+  mockListR1Queue.mockReset();
+  mockListR1Queue.mockResolvedValue({ r1_deployed: false, total: 0, rounds: [] });
 });
 
 describe('a page never outlives its URL', () => {
@@ -325,6 +330,69 @@ describe('Layout shell', () => {
     await user.click(screen.getByRole('button', { name: 'Open navigation menu' }));
     await user.click(screen.getByRole('link', { name: /^Agents$/ }));
     await waitFor(() => expect(announcer?.textContent).toBe('Agents'));
+  });
+});
+
+describe('the R1 interviews item', () => {
+  const answered = (r1_deployed: boolean, total: number) =>
+    mockListR1Queue.mockResolvedValue({ r1_deployed, total, rounds: [] });
+
+  it('sits in Workspace, between Candidates and Agents, on a server that runs R1', async () => {
+    answered(true, 0);
+    renderLayout();
+    const link = await screen.findByRole('link', { name: 'R1 interviews' });
+    expect(link).toHaveAttribute('href', '/interviews');
+    const nav = screen.getByRole('navigation', { name: 'Main navigation' });
+    expect(within(nav).getAllByRole('link').map((item) => item.textContent).slice(0, 4)).toEqual([
+      'Dashboard', 'Candidates', 'R1 interviews', 'Agents',
+    ]);
+  });
+
+  it('stays for rounds that already exist, on a server that no longer runs R1', async () => {
+    answered(false, 3);
+    renderLayout();
+    expect(await screen.findByRole('link', { name: 'R1 interviews' })).toBeInTheDocument();
+  });
+
+  it('is hidden when R1 is not deployed and no round exists, and asks with dry runs counted', async () => {
+    answered(false, 0);
+    renderLayout();
+    await waitFor(() => expect(mockListR1Queue).toHaveBeenCalledWith({ view: 'all', pageSize: 1, includeDryRuns: true }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole('link', { name: 'R1 interviews' })).toBeNull();
+  });
+
+  it('never flashes in before the answer', async () => {
+    mockListR1Queue.mockReturnValue(new Promise(() => undefined));
+    renderLayout();
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole('link', { name: 'R1 interviews' })).toBeNull();
+  });
+
+  it('shows when the read fails: not knowing is no reason to take the way there away', async () => {
+    mockListR1Queue.mockRejectedValue(new Error('service_unavailable'));
+    renderLayout();
+    expect(await screen.findByRole('link', { name: 'R1 interviews' })).toBeInTheDocument();
+  });
+
+  it.each(['admin', 'interviewer', 'viewer'] as const)('shows for %s: everyone who can read rounds', async (role) => {
+    setAuth({ role });
+    answered(true, 0);
+    renderLayout();
+    expect(await screen.findByRole('link', { name: 'R1 interviews' })).toBeInTheDocument();
+  });
+
+  it('stays marked on the review page, and asks once for the whole session', async () => {
+    answered(true, 1);
+    renderLayout('/interviews/round-1');
+    const link = await screen.findByRole('link', { name: 'R1 interviews' });
+    expect(link).toHaveAttribute('aria-current', 'page');
+    expect(mockListR1Queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('names the queue and the review page apart', () => {
+    expect(pageTitleFor('/interviews')).toBe('R1 interviews');
+    expect(pageTitleFor('/interviews/round-1')).toBe('R1 review');
   });
 });
 

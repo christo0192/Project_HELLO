@@ -9,6 +9,7 @@ import { auditAccessDenied, recordAudit } from '../lib/audit.js';
 import { projectRecordingContext } from '../lib/r1/recording/context.js';
 import { toCanonicalUuid } from '../lib/r1/recording/keys.js';
 import { withRecordingAttempts } from '../lib/r1/recording/summary.js';
+import { parseR1QueueQuery, readR1Queue } from '../lib/r1/queue.js';
 import { readR1Review } from '../lib/r1/review.js';
 
 export const r1Router = Router();
@@ -79,6 +80,26 @@ r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (r
   // withheld, not unscored, even if its copy of the candidate predates the appeal.
   const rounds = candidate.decision_use_blocked_at != null ? (data ?? []).map((round) => ({ ...round, recommendation: null, overall: null, status_write: null, pending_reject_until: null, scores_withheld: true })) : (data ?? []);
   res.json({ rounds: await withRecordingAttempts(supabase as never, rounds) });
+} catch (e) { next(e); } });
+
+/**
+ * The R1 queue, one server page at a time (lib/r1/queue.ts). Viewer and above, by the rule of the R1
+ * video. `r1_deployed` is here because the sidebar hides the item on a server that does not run R1,
+ * and a viewer cannot read availability. A list read, so unaudited like the candidates list; opening a
+ * review is what is recorded. The search text goes nowhere but the query.
+ */
+r1Router.get('/interview-rounds', requireRole('viewer'), async (req, res, next) => { try {
+  res.setHeader('Cache-Control', 'no-store');
+  const query = parseR1QueueQuery(req.query);
+  if (!query) return res.status(400).json({ error: 'invalid_query' });
+  const actor = req.authUser!;
+  const result = await readR1Queue(supabase as never, { id: actor.id, appRole: actor.appRole, active: actor.active }, query);
+  if (result.kind === 'forbidden') {
+    await auditAccessDenied(req, 'r1_queue_access_denied').catch(() => undefined);
+    return res.status(403).json({ error: 'access_denied' });
+  }
+  if (result.kind === 'unavailable') return res.status(503).json({ error: 'service_unavailable' });
+  res.json({ ...result.body, r1_deployed: getR1Config().enabled });
 } catch (e) { next(e); } });
 
 /**

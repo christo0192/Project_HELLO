@@ -45,7 +45,7 @@ import { ID_BATCH_CONCURRENCY, ID_BATCH_SIZE, POSTGREST_MAX_ROWS } from '../lib/
 import { scaleDb as engine, UNDICI_OVERFLOW_ERROR, type RecordedQuery, type Row } from './support/scale-db.js';
 import {
   CALENDAR_FROM, CALENDAR_TO, FAILURES_FROM, FUNNEL_FROM, FUNNEL_TO, SCALE_ADMIN_ID, SCALE_INTERVIEWER_ID,
-  scaleIds, scaleIso, seedScaleWorkspace, type ScaleWorkspace,
+  scaleIds, scaleIso, seedScaleRounds, seedScaleWorkspace, type ScaleRounds, type ScaleWorkspace,
 } from './support/scale-workspace.js';
 
 vi.mock('../lib/supabase.js', async () => {
@@ -467,6 +467,95 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
     });
   });
 
+  describe('GET /api/interview-rounds', () => {
+    const PAGE = 50;
+    let rounds: ScaleRounds;
+
+    beforeEach(() => {
+      rounds = seedScaleRounds(engine.tables, n);
+    }, HOOK_TIMEOUT_MS);
+
+    /** The rounds an interviewer owns: their candidates are the even ones. */
+    const ownedOnly = (ids: readonly string[]): string[] => ids.filter((id) => Number(id.slice(-12)) % 2 === 0);
+
+    /** Every page of a view, in order. */
+    async function walk(query: string, user: AuthUser): Promise<{ ids: string[]; total: number }> {
+      const ids: string[] = [];
+      let total = 0;
+      for (let page = 1; ; page += 1) {
+        const res = await get(`/api/interview-rounds?${query}&page_size=${PAGE}&page=${page}`, user);
+        expect(res.status).toBe(200);
+        total = res.body.total as number;
+        const rows = res.body.rounds as Row[];
+        ids.push(...rows.map((row) => row.id as string));
+        if (page * PAGE >= total) return { ids, total };
+      }
+    }
+
+    it('as admin: the first page of To review is the oldest, with its true total, and every row complete', async () => {
+      const res = await get('/api/interview-rounds', admin);
+      expect(res.status).toBe(200);
+      expect(res.body.total).toBe(rounds.toReview.length);
+      const rows = res.body.rounds as Array<Row & { attempts: Row[] }>;
+      expect(rows.map((row) => row.id)).toEqual(rounds.toReview.slice(0, 25));
+      expect(rows.every((row) => row.attempts.length === 1 && (row.attempts[0].recording as Row).state === 'ready')).toBe(true);
+      expectNoSilentLimit();
+    });
+
+    it('as admin: every view counts every round, past the row cap', async () => {
+      expect(rounds.all.length).toBeGreaterThan(POSTGREST_MAX_ROWS);
+      for (const [view, ids] of [['in-progress', rounds.inProgress], ['reviewed', rounds.reviewed], ['all', rounds.all]] as const) {
+        const res = await get(`/api/interview-rounds?view=${view}`, admin);
+        expect(res.status).toBe(200);
+        expect(res.body.total, view).toBe(ids.length);
+      }
+      expectNoSilentLimit();
+    });
+
+    it('as interviewer: walks every page of exactly the rounds they own, each once, in order', async () => {
+      const want = ownedOnly(rounds.toReview);
+      const { ids, total } = await walk('view=to-review', interviewer);
+      expect(total).toBe(want.length);
+      expect(ids).toEqual(want);
+      expectNoSilentLimit();
+    });
+
+    it('as admin: paging from the newest never skips or repeats a round, however ties are answered', async () => {
+      const { ids, total } = await walk('view=reviewed', admin);
+      expect(total).toBe(rounds.reviewed.length);
+      expect(ids).toEqual([...rounds.reviewed].reverse());
+      expectNoSilentLimit();
+    });
+
+    it('finds a candidate past the row cap by name, without reading the workspace', async () => {
+      const last = rounds.toReview.at(-1)!;
+      const res = await get(`/api/interview-rounds?q=${encodeURIComponent(`Candidate ${Number(last.slice(-12))}`)}`, admin);
+      expect(res.status).toBe(200);
+      expect((res.body.rounds as Row[]).map((row) => row.id)).toEqual([last]);
+      expect(engine.queries.filter((q) => q.table === 'interview_rounds').every((q) => q.returned <= 25)).toBe(true);
+      expectNoSilentLimit();
+    });
+
+    it('costs the same few reads for any page, never one per round', async () => {
+      const res = await get('/api/interview-rounds?view=all&page_size=50', admin);
+      expect(res.status).toBe(200);
+      expect(res.body.rounds).toHaveLength(50);
+      const reads = engine.queries.map((q) => q.table).sort();
+      expect(reads).toEqual(['call_sessions', 'interview_round_attempts', 'interview_round_consents', 'interview_round_recordings', 'interview_rounds']);
+      expectNoSilentLimit();
+    });
+
+    it.each(['interview_round_attempts', 'interview_round_recordings', 'call_sessions', 'interview_round_consents'])(
+      'fails the page, never a partial row, when %s fails',
+      async (table) => {
+        engine.failWhen = (q) => q.table === table;
+        const res = await get('/api/interview-rounds', admin);
+        expect(res.status).toBe(503);
+        expect(res.body).toEqual({ error: 'service_unavailable' });
+      },
+    );
+  });
+
   describe('GET /api/phone/calendar (30 days)', () => {
     it('every appointment shown carries its engagement and candidate, and a cut list says so', async () => {
       const res = await get(`/api/phone/calendar?from=${CALENDAR_FROM}&to=${CALENDAR_TO}`, interviewer);
@@ -680,6 +769,7 @@ const DRIVEN_ROUTES = [
   '/api/funnel/summary',
   '/api/integrations/ashby/mission-control/mappings',
   '/api/integrations/ashby/mission-control/workflows',
+  '/api/interview-rounds',
   '/api/notifications',
   '/api/phone/calendar',
 ];
@@ -905,6 +995,7 @@ const BOUNDED_LISTS: ReadonlyArray<{ file: string; values: string; sites: number
   { file: 'lib/dsar.ts', values: 'sessionIds', sites: 1, why: "one data subject's sessions" },
   { file: 'lib/phone-runtime/read.ts', values: 'ids', sites: 1, why: 'one due pass, at most PHONE_RUNTIME_MAX_ROWS (200) candidates' },
   { file: 'lib/r1/recording/summary.ts', values: 'roundIds', sites: 2, why: "one candidate's R1 rounds" },
+  { file: 'lib/r1/review.ts', values: 'otherSessions', sites: 1, why: "one round's attempts: a few starts, less the deciding one" },
   { file: 'lib/r1/review.ts', values: 'phoneSessionIds', sites: 1, why: "one candidate's phone sessions" },
   { file: 'lib/r1/review.ts', values: 'sessionIds', sites: 1, why: "one round's attempts: a few starts, so the log uses its session index" },
   { file: 'lib/recording/sweeper.ts', values: 'sessionIds', sites: 1, why: 'one pass, at most ATTEMPT_LINK_PASS_LIMIT (10) attempts' },

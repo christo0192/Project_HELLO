@@ -766,7 +766,7 @@ describe('CandidatesPage table columns', () => {
     const review = within(rowOf('Screened Sam')).getByRole('link', {
       name: /^Review & decide\s*, Screened Sam$/,
     });
-    expect(review).toHaveAttribute('href', '/candidates/c-screened?tab=review');
+    expect(review).toHaveAttribute('href', '/candidates/c-screened?tab=phone');
     const start = within(rowOf('Jane Doe')).getByRole('link', {
       name: /^Start screening\s*, Jane Doe$/,
     });

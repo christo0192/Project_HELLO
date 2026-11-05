@@ -16,6 +16,7 @@ export {
   CloseIcon,
   DashboardIcon,
   IntegrationIcon,
+  InterviewIcon,
   LogOutIcon,
   MenuIcon,
   MoonIcon,

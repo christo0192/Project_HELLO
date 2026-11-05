@@ -23,11 +23,16 @@
  *
  * There is deliberately NO composer here: this is a review view, not a
  * live-screening console.
+ *
+ * An R1 session is not shown here. Its home is the review page, so the address
+ * redirects to the recording of that attempt, and nothing of this page is drawn
+ * on the way. The read behind this page is admin-only, so anyone else stops at
+ * its error, as they always have; the candidate page links them straight there.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, Navigate, useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { Session, SessionDetail } from '../types';
 import {
@@ -52,6 +57,7 @@ import { Scorecard } from '../components/Scorecard';
 import { BackIcon } from '../components/session/BackIcon';
 import { formatSessionWhen } from '../components/session/format';
 import { shortId } from '../lib/humanize';
+import { r1SessionHref } from '../lib/r1-review';
 import { sessionModeLabel } from '../lib/session-mode';
 
 /** What the page knows about the session beyond its own payload. */
@@ -210,6 +216,7 @@ export function SessionDetailPage() {
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [context, setContext] = useState<SessionContext | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [r1Home, setR1Home] = useState<string | null>(null);
   // A retry (or a new id) supersedes any read still in flight.
   const generation = useRef(0);
 
@@ -222,6 +229,14 @@ export function SessionDetailPage() {
     api
       .getSession(sessionId)
       .then(async (data) => {
+        if (data.session.interview_round_id != null) {
+          // Only for the attempt's place: without it the review chooses the attempt.
+          const candidate = await Promise.resolve()
+            .then(() => api.getCandidate(data.session.candidate_id))
+            .catch(() => null);
+          if (current === generation.current) setR1Home(r1SessionHref(data.session, candidate?.sessions ?? []));
+          return;
+        }
         const ctx = await readContext(data.session);
         if (current !== generation.current) return;
         // One commit: the heading renders once, already named, instead of
@@ -237,6 +252,7 @@ export function SessionDetailPage() {
 
   useEffect(load, [load]);
 
+  if (r1Home) return <Navigate to={r1Home} replace />;
   if (error) return <ErrorPanel message={error} onRetry={load} />;
   if (!detail || !context) return <LoadingPanel label="Loading session…" />;
 
@@ -246,8 +262,6 @@ export function SessionDetailPage() {
   const meta = pageMeta(session, context);
   const words = typeof session.candidate_words === 'number' ? session.candidate_words : null;
   const phone = session.mode === 'live';
-  // A session that belongs to an R1 round (a WebRTC role-play, not a phone screening).
-  const r1 = session.interview_round_id != null;
   // null = no "Connected time" row (no answered call, an unreadable roll-up,
   // or a complete roll-up with no total).
   const connected = context.connectedComplete === true
@@ -354,22 +368,7 @@ export function SessionDetailPage() {
               </DetailRow>
             </dl>
             <div className="mt-4">
-              {r1 ? (
-                // An R1 session has no file for the legacy recording card to find (it would end in
-                // "Recording not found"). Its recordings, one per attempt, are on the candidate page.
-                <div>
-                  <h3 className="text-label font-medium text-ink">Recording</h3>
-                  <p className="mt-1 text-sm text-ink-secondary">
-                    R1 interview recordings are on the candidate page, under R1 interview.{' '}
-                    <Link
-                      to={`/candidates/${session.candidate_id}`}
-                      className="rounded-sm font-medium text-ink underline underline-offset-2 hover:text-info focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
-                    >
-                      Open the candidate page
-                    </Link>
-                  </p>
-                </div>
-              ) : completed ? (
+              {completed ? (
                 <RecordingCard sessionId={session.id} title="Recording" />
               ) : (
                 <p className="text-sm text-ink-tertiary">

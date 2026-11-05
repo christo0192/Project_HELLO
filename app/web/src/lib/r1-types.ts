@@ -214,7 +214,10 @@ export interface R1ReviewResponse {
   };
   /** In the order they started. A restart shares its `attempt_number`, so `session_id` tells them apart. */
   attempts: R1ReviewAttempt[];
+  /** The assessment that decided the round: a later attempt replaces an earlier one (0122). */
   assessment: R1ReviewAssessment | null;
+  /** The newest scorecard of each attempt `assessment` is not from. Absent from an older API. */
+  replaced_assessments?: R1ReviewAssessment[];
   events: R1ReviewEvent[];
   /** The candidate's newest phone assessment: one line of context. Null when there is none to show. */
   phone_screening: {
@@ -265,6 +268,8 @@ export interface R1Round {
   overall: number | null;
   /** True while an appeal blocks decision use: the nulls above mean withheld, not unscored. Absent otherwise. */
   scores_withheld?: boolean;
+  /** What the scorer did with the round (`human_review`: it would not score it). Null while withheld. */
+  status_write?: string | null;
   created_at: string;
   created_by?: string;
   /** One entry per attempt, each with its recording summary. Absent from an older API. */
@@ -273,6 +278,60 @@ export interface R1Round {
 
 export interface R1RoundsResponse {
   rounds: R1Round[];
+}
+
+/* ── The queue: `GET /api/interview-rounds` ───────────────────────────── */
+
+/** What each view holds is the API's definition (`lib/r1/queue.ts`, and the OpenAPI entry). */
+export type R1QueueView = 'to-review' | 'in-progress' | 'reviewed' | 'all';
+export type R1QueueSort = 'oldest' | 'newest';
+
+export interface R1QueueQuery {
+  view?: R1QueueView;
+  sort?: R1QueueSort;
+  page?: number;
+  pageSize?: number;
+  /** Part of the candidate's name. */
+  search?: string;
+  /** Also list staff dry runs, which are hidden otherwise. */
+  includeDryRuns?: boolean;
+}
+
+export interface R1QueueAttempt extends R1AttemptSummary {
+  /** The interview has not ended. */
+  in_progress: boolean;
+  ended_at: string | null;
+}
+
+/** One row. While `scores_withheld` is true the result fields are null: withheld, not unscored. */
+export interface R1QueueRound {
+  id: string;
+  candidate_id: string;
+  candidate_name: string | null;
+  status: R1RoundStatus;
+  expires_at: string | null;
+  attempts_allowed: number;
+  attempts_counted: number;
+  recommendation: R1Recommendation | null;
+  overall: number | null;
+  status_write: string | null;
+  pending_reject_until: string | null;
+  scores_withheld: boolean;
+  is_staff_dry_run: boolean;
+  created_at: string;
+  attempts: R1QueueAttempt[];
+}
+
+export interface R1QueueResponse {
+  view: R1QueueView;
+  sort: R1QueueSort;
+  /** The page this is: a page past the end answers the last one. */
+  page: number;
+  page_size: number;
+  total: number;
+  rounds: R1QueueRound[];
+  /** False on a server that does not run R1. */
+  r1_deployed: boolean;
 }
 
 /** The only body `POST /api/candidates/:id/interview-rounds` accepts. */

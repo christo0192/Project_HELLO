@@ -152,11 +152,20 @@ export function AshbyScopedReviewPage() {
               id: 'review',
               label: 'Review',
               panel: (
-                <TranscriptionSyncWorkspace
-                  sessions={sessions}
-                  assessments={assessments}
-                  blocked={decisionBlocked}
-                />
+                <>
+                  {/* R1 is not in this workspace, and this shell has no R1 tab and links
+                      nowhere, so it says where the interview is. */}
+                  {sessions.some((session) => session.interview_round_id != null) && (
+                    <p className="mb-4 text-sm text-ink-secondary">
+                      The R1 interview for this candidate is on the candidate page, under R1 interview.
+                    </p>
+                  )}
+                  <TranscriptionSyncWorkspace
+                    sessions={sessions}
+                    assessments={assessments}
+                    blocked={decisionBlocked}
+                  />
+                </>
               ),
             },
           ]}

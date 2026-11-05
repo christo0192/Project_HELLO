@@ -410,6 +410,28 @@ const ROUTES: Array<[string, string, Handler]> = [
 
   // ── R1 (WebRTC sales role-play) ────────────────────────────────────
   ['GET', '/api/interview-rounds/availability', () => ok({ state: 'disabled', hold_minutes: 55 })],
+  // The queue, by the API's own rules (lib/r1/queue.ts): the views, the hidden dry runs, one page.
+  ['GET', '/api/interview-rounds', ({ query }, db) => {
+    const view = query.get('view') ?? 'to-review';
+    const sort = query.get('sort') ?? (view === 'to-review' ? 'oldest' : 'newest');
+    const search = (query.get('q') ?? '').toLowerCase();
+    const size = Number(query.get('page_size') ?? 25);
+    const settled = (write: string | null) => write === 'advanced' || write === 'rejected' || write === 'pending_reject_cancelled';
+    const inView = (round: Dataset['r1']['queue'][number]) => {
+      const live = round.status === 'invited' || round.status === 'in_progress';
+      if (view === 'in-progress') return live;
+      if (view === 'all') return true;
+      if (round.scores_withheld || round.status !== 'completed') return false;
+      return view === 'reviewed' ? settled(round.status_write) : !settled(round.status_write);
+    };
+    const rows = db.r1.queue
+      .filter((round) => query.get('dry_runs') === 'include' || !round.is_staff_dry_run)
+      .filter((round) => (round.candidate_name ?? '').toLowerCase().includes(search))
+      .filter(inView)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) * (sort === 'oldest' ? 1 : -1));
+    const page = Math.min(Number(query.get('page') ?? 1), Math.max(1, Math.ceil(rows.length / size)));
+    return ok({ view, sort, page, page_size: size, total: rows.length, rounds: rows.slice((page - 1) * size, page * size), r1_deployed: db.r1.deployed });
+  }],
   // Only the R1 candidate has rounds (R1-REC); everyone else's list is empty, as before.
   ['GET', '/api/candidates/:id/interview-rounds', ({ params }, db) => ok({ rounds: params.id === R1_CANDIDATE_ID ? db.r1.rounds : [] })],
   // The recording mint (R1-REC): always 200 with a `state` for the expected conditions; a link only

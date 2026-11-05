@@ -44,6 +44,8 @@ const fixtures = [
   // R1-REC: the staff playback mint (viewer+) and the admin health read.
   ['/api/interview-rounds/{id}/recording', 'get', '200'],
   ['/api/admin/r1/recording-health', 'get', '200'],
+  // R1 queue: the rounds across candidates, one server page at a time (viewer+).
+  ['/api/interview-rounds', 'get', '200'],
   // R1 review page: one round as a reviewer sees it (viewer+).
   ['/api/interview-rounds/{id}/review', 'get', '200'],
 ] as const;

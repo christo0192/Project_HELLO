@@ -41,6 +41,8 @@ export const scaleIds = {
   role: (r: number) => `10000000-0000-4000-8000-${pad(r)}`,
   rollup: (k: number) => `f0000000-0000-4000-8000-${pad(k)}`,
   failure: (i: number) => `fa000000-0000-4000-8000-${pad(i)}`,
+  round: (i: number) => `20000000-0000-4000-8000-${pad(i)}`,
+  roundSession: (i: number) => `52000000-0000-4000-8000-${pad(i)}`,
 };
 
 export const SCALE_ROLES = 12;
@@ -219,4 +221,61 @@ export function seedScaleWorkspace(tables: Record<string, Row[]>, n: number): Sc
     failures,
     rollupRows: rollup.size,
   };
+}
+
+export interface ScaleRounds {
+  /** Round ids by the view they sit in, in sent order. */
+  toReview: string[];
+  inProgress: string[];
+  reviewed: string[];
+  /** Every round but the staff dry runs. */
+  all: string[];
+}
+
+/**
+ * An R1 round for every candidate of a seeded workspace, so the rounds pass both the row cap and the id
+ * batch size. Kept out of seedScaleWorkspace: its sessions would change what the phone routes read.
+ * Round i sits by i % 5: invited, running, completed and held, completed and advanced, completed with
+ * auto-status off. A round is a staff dry run when i % 50 = 2. Decision use is blocked for candidate i
+ * when i % 100 = 4, which takes the round out of To review.
+ */
+export function seedScaleRounds(tables: Record<string, Row[]>, n: number): ScaleRounds {
+  const t = (name: string): Row[] => (tables[name] ??= []);
+  const views: ScaleRounds = { toReview: [], inProgress: [], reviewed: [], all: [] };
+  const STATES = [['invited', null], ['in_progress', null], ['completed', 'hold_flag'], ['completed', 'advanced'], ['completed', 'flag_off']] as const;
+  t('interview_round_consents');
+
+  for (let i = 0; i < n; i += 1) {
+    const candidate = t('candidates')[i];
+    const id = scaleIds.round(i);
+    const [status, statusWrite] = STATES[i % 5];
+    const dryRun = i % 50 === 2;
+    const blocked = i % 100 === 4;
+    if (blocked) candidate.decision_use_blocked_at = scaleIso(i);
+    t('interview_rounds').push({
+      id, candidate_id: candidate.id, status, status_write: statusWrite, expires_at: scaleIso(i, 3600), attempts_allowed: 2,
+      attempts_counted: status === 'completed' ? 1 : 0, recommendation: status === 'completed' ? 'hold' : null, overall: status === 'completed' ? 58 : null,
+      pending_reject_until: null, consent_locale: dryRun ? 'en-IN-x-staff' : 'en-IN', created_at: scaleIso(i), created_by: SCALE_ADMIN_ID,
+    });
+    if (status !== 'invited') {
+      const session = scaleIds.roundSession(i);
+      t('interview_round_attempts').push({ session_id: session, round_id: id, attempt_number: 1, counted: status === 'completed', outcome: null, created_at: scaleIso(i) });
+      t('call_sessions').push({
+        id: session, candidate_id: candidate.id, interview_round_id: id, status: status === 'completed' ? 'completed' : 'in_progress',
+        created_at: scaleIso(i), updated_at: scaleIso(i), started_at: null, ended_at: status === 'completed' ? scaleIso(i, 1800) : null,
+      });
+      t('interview_round_recordings').push({
+        session_id: session, round_id: id, status: status === 'completed' ? 'ready' : 'uploading', layout: 'combined', has_video: true,
+        started_at_ms: 1_800_000_000_000, duration_ms: 1_500_000, camera_off_ms: 0, degraded_at_ms: null, degraded_reason: null, failure_reason: null,
+        delete_after: '2027-02-01T00:00:00Z', delete_requested_at: null, delete_reason: null, deleted_at: null, updated_at: scaleIso(i),
+      });
+    }
+    if (dryRun) continue;
+    views.all.push(id);
+    if (status !== 'completed') views.inProgress.push(id);
+    else if (blocked) continue;
+    else if (statusWrite === 'advanced') views.reviewed.push(id);
+    else views.toReview.push(id);
+  }
+  return views;
 }

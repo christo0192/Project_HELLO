@@ -170,7 +170,7 @@ describe('CandidatesPage phone status', () => {
     // The review link still goes to the Review tab.
     expect(within(row).getByRole('link', { name: /Review & decide/ })).toHaveAttribute(
       'href',
-      '/candidates/c-screened?tab=review',
+      '/candidates/c-screened?tab=phone',
     );
   });
 

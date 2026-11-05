@@ -215,11 +215,11 @@ describe('the header', () => {
   it('carries the breadcrumb and the title, with the name linking to the candidate', async () => {
     await opened();
     const crumbs = screen.getByRole('navigation', { name: 'Breadcrumb' });
-    expect(crumbs).toHaveTextContent('R1 interviews');
+    expect(within(crumbs).getByRole('link', { name: 'R1 interviews' })).toHaveAttribute('href', '/interviews');
     expect(crumbs).toHaveTextContent('Ava Example');
     const heading = screen.getByRole('heading', { level: 1 });
     expect(heading).toHaveTextContent('Sales Program Advisor role-play, Ava Example');
-    expect(within(heading).getByRole('link', { name: 'Ava Example' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=overview`);
+    expect(within(heading).getByRole('link', { name: 'Ava Example' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=r1`);
   });
 
   it('carries the chips: ended, role, attempt, recording and how long it is kept', async () => {
@@ -371,6 +371,28 @@ describe('Overview, scored', () => {
     expect(screen.getByRole('region', { name: 'AI recommendation' })).toHaveTextContent('This result is for Attempt 1 (counted).');
   });
 
+  it('shows the scorecard of an attempt a later one replaced, and says it no longer stands', async () => {
+    const first = attempt({ session_id: 's1' });
+    const retake = attempt({ session_id: 's2', attempt_number: 2 });
+    const replaced = assessment({ id: 'a-first', session_id: 's1', recommendation: 'reject', overall_score: 31, raw_recommendation: 'reject' });
+    const deciding = assessment({ session_id: 's2' });
+    await opened(review({ attempts: [first, retake], assessment: deciding, replaced_assessments: [replaced] }), '?attempt=1');
+    const result = screen.getByRole('region', { name: 'AI recommendation' });
+    expect(result).toHaveTextContent('Reject');
+    expect(result).toHaveTextContent('31');
+    expect(result).toHaveTextContent('This result is for Attempt 1 (counted). A later attempt replaced it as the result of this round.');
+  });
+
+  it('keeps to the deciding scorecard on the attempt that set it', async () => {
+    const first = attempt({ session_id: 's1' });
+    const retake = attempt({ session_id: 's2', attempt_number: 2 });
+    const replaced = assessment({ id: 'a-first', session_id: 's1', recommendation: 'reject', overall_score: 31 });
+    await opened(review({ attempts: [first, retake], assessment: assessment({ session_id: 's2' }), replaced_assessments: [replaced] }), '?attempt=2');
+    const result = screen.getByRole('region', { name: 'AI recommendation' });
+    expect(result).not.toHaveTextContent('A later attempt replaced it');
+    expect(result).not.toHaveTextContent('31');
+  });
+
   it('needs no attempt named when there is only one', async () => {
     await opened();
     expect(screen.getByRole('region', { name: 'AI recommendation' })).not.toHaveTextContent('This result is for');
@@ -405,7 +427,7 @@ describe('Overview, scored', () => {
     await opened(review({ phone_screening: { recommendation: 'advance', overall_score: 71, created_at: '2026-10-30T00:00:00.000Z', evidence_grade: 'decision', scoring_status: 'complete' } }));
     const line = screen.getByText(/Phone screening/);
     expect(line).toHaveTextContent('Select 71 (AI)');
-    expect(within(line).getByRole('link', { name: 'Open the candidate' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=review`);
+    expect(within(line).getByRole('link', { name: 'Open the candidate' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=phone`);
   });
 
   it('never sets a held phone score beside the verdict as a result', async () => {

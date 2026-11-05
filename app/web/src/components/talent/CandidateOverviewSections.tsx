@@ -42,6 +42,7 @@ import {
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
 import { formatPhone } from '../../lib/humanize';
+import { r1SessionHref } from '../../lib/r1-review';
 import { sessionModeLabel } from '../../lib/session-mode';
 
 /** The quiet inline action style shared by every row link/button here. */
@@ -643,7 +644,9 @@ export function SessionsSummary({
                       in `title` for support. */}
                   <p className="truncate font-medium text-ink" title={`Session id ${s.id}`}>
                     Session {sessions.length - index}
-                    {s.mode && (
+                    {s.interview_round_id != null ? (
+                      <span className="ml-2 text-meta font-normal text-ink-tertiary">R1 role-play</span>
+                    ) : s.mode && (
                       <span className="ml-2 text-meta font-normal text-ink-tertiary">
                         {sessionModeLabel(s.mode).toLowerCase()}
                       </span>
@@ -662,7 +665,12 @@ export function SessionsSummary({
                     {sessionStatusLabel(s.status)}
                   </StatusBadge>
                   {linkToSession && (
-                    <Link to={`/sessions/${s.id}`} className={ROW_ACTION}>
+                    // An R1 session goes straight to its review, which every staff role can
+                    // read: the session page is admin-only and would only send it on.
+                    <Link
+                      to={s.interview_round_id != null ? r1SessionHref(s, sessions) : `/sessions/${s.id}`}
+                      className={ROW_ACTION}
+                    >
                       View details
                       <span className="sr-only"> for session {sessions.length - index}</span>
                     </Link>

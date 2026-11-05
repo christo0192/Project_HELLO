@@ -22,6 +22,10 @@
  * by another route, and a rationale cites what the candidate said (`r1-prompt.ts`), up to 900 characters
  * a metric. A consent merely superseded by a newer notice is not a withdrawal.
  *
+ * A LATER ATTEMPT WINS THE ROUND (0122), and `assessment` is the one that decided it. An attempt it
+ * replaced keeps a scorecard of its own, and this is the only page that carries it, so it comes back
+ * in `replaced_assessments`, one per attempt, under the same rules of what is withheld and hidden.
+ *
  * WHILE AN INTERVIEW RUNS. There is nothing to review yet, so a live attempt's transcript is not read:
  * `in_progress` says why it is empty.
  *
@@ -48,13 +52,13 @@ import { r1LearnerName, r1PersonaLabel } from './personas.js';
 import { R1_METRICS } from './rubric.js';
 
 /** The notice a staff dry run was consented under (0120). */
-const STAFF_LOCALE = 'en-IN-x-staff';
+export const STAFF_LOCALE = 'en-IN-x-staff';
 
 /** The most pages of one transcript or one log: far past any real interview, and never truncated. */
 const MAX_PAGES = 5;
 
 /** The session states of an interview that has not ended (0115). */
-const LIVE_SESSION_STATES: ReadonlySet<unknown> = new Set(['created', 'waiting', 'in_progress']);
+export const LIVE_SESSION_STATES: ReadonlySet<unknown> = new Set(['created', 'waiting', 'in_progress']);
 
 const ROUND_COLUMNS =
   'id,candidate_id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,assessment_id,'
@@ -64,7 +68,7 @@ const ATTEMPT_COLUMNS = 'session_id,attempt_number,persona_id,counted,outcome,cr
 const SESSION_COLUMNS = 'id,status,started_at,ended_at';
 const TURN_COLUMNS = 'turn_index,speaker,text,turn_started_at_ms,turn_ended_at_ms,ai_voice,ai_played_ms,is_gate,phase,interrupted';
 const ASSESSMENT_COLUMNS =
-  'id,session_id,recommendation,overall_score,scoring_status,score_scale_max,metric_results,raw,created_at';
+  'id,session_id,revision,recommendation,overall_score,scoring_status,score_scale_max,metric_results,raw,created_at';
 const LOG_COLUMNS = 'id,session_id,event_type,turn_index,family_id,payload,created_at';
 
 type Row = Record<string, unknown>;
@@ -152,6 +156,8 @@ export interface R1ReviewBody {
   candidate: Record<string, unknown>;
   attempts: R1ReviewAttempt[];
   assessment: R1ReviewAssessment | null;
+  /** The newest scorecard of each attempt `assessment` is not from. */
+  replaced_assessments: R1ReviewAssessment[];
   events: R1ReviewEvent[];
   phone_screening: {
     recommendation: string | null;
@@ -327,7 +333,7 @@ function variantsBySession(rows: readonly Row[]): Map<string, string> {
  * does (`recordingState`): deleted, with no anchor and nothing to play. No recording stays no
  * recording, because nothing was deleted.
  */
-function withdrawnSummary(summary: R1RecordingSummary): R1RecordingSummary {
+export function withdrawnSummary(summary: R1RecordingSummary): R1RecordingSummary {
   if (summary.state === 'none') return summary;
   return {
     state: 'deleted',
@@ -494,6 +500,22 @@ export async function readR1Review(
       }
     }
 
+    const replacedAssessments: R1ReviewAssessment[] = [];
+    const otherSessions = sessionIds.filter((sessionId) => sessionId !== assessment?.session_id);
+    if (!scoresWithheld && attempts.length > 1 && otherSessions.length > 0) {
+      const { data, error } = await db.from('assessments').select(ASSESSMENT_COLUMNS).in('session_id', otherSessions)
+        .order('revision', { ascending: false }).order('created_at', { ascending: false });
+      if (error) return UNAVAILABLE;
+      const seen = new Set<string>();
+      for (const row of (Array.isArray(data) ? data : []) as Row[]) {
+        const sessionId = String(row.session_id);
+        if (seen.has(sessionId)) continue;
+        seen.add(sessionId);
+        const scored = attempts.find((attempt) => attempt.session_id === sessionId);
+        replacedAssessments.push(assessmentOf(row, scored?.transcript_hidden === true));
+      }
+    }
+
     const roleId = text(candidate.role_id);
     const [roleRead, phone] = await Promise.all([
       roleId ? db.from('roles').select('title').eq('id', roleId).maybeSingle() : Promise.resolve({ data: null, error: null }),
@@ -531,6 +553,7 @@ export async function readR1Review(
         },
         attempts,
         assessment,
+        replaced_assessments: replacedAssessments,
         events: logRead.rows.map(eventOf),
         phone_screening: phone,
         rubric: RUBRIC,

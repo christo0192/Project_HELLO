@@ -33,6 +33,25 @@ import type {
 
 /* ── The address ──────────────────────────────────────────────────── */
 
+/**
+ * Where an R1 session lives: its recording on the review page. `attempt=n` is the place of the session
+ * among its round's, in the order they started, which is the order the review lists its attempts. It is
+ * left out when `sessions` does not hold this one, and the page then chooses the attempt itself.
+ */
+export function r1SessionHref(
+  session: { id: string; interview_round_id?: string | null },
+  sessions: ReadonlyArray<{ id: string; interview_round_id?: string | null; created_at: string | null }>,
+): string {
+  const round = session.interview_round_id;
+  const startedAt = (item: { created_at: string | null }) => Date.parse(item.created_at ?? '') || 0;
+  const started = sessions
+    .filter((item) => item.interview_round_id === round)
+    .sort((a, b) => startedAt(a) - startedAt(b));
+  const place = started.findIndex((item) => item.id === session.id);
+  const attempt = place === -1 ? '' : `attempt=${place + 1}&`;
+  return `/interviews/${encodeURIComponent(String(round))}?${attempt}tab=recording`;
+}
+
 export const R1_REVIEW_TABS = ['overview', 'briefing', 'resume', 'recording'] as const;
 export type R1ReviewTab = (typeof R1_REVIEW_TABS)[number];
 
@@ -372,6 +391,15 @@ export function neededReveals(events: readonly R1ReviewEvent[], sessionId: strin
 /* ── Where the round stands ───────────────────────────────────────── */
 
 export type R1ReviewStage = 'withheld' | 'scored' | 'not_scored' | 'scoring' | 'invited' | 'in_progress' | 'link_open' | 'closed';
+
+/** The scorecard of the attempt on screen, when a later attempt replaced it as the round's result. */
+export function replacedAssessmentOf(
+  review: Pick<R1ReviewResponse, 'assessment' | 'replaced_assessments'>,
+  attempt: Pick<R1ReviewAttempt, 'session_id'> | null,
+): R1ReviewAssessment | null {
+  if (!attempt || review.assessment?.session_id === attempt.session_id) return null;
+  return review.replaced_assessments?.find((item) => item.session_id === attempt.session_id) ?? null;
+}
 
 const notScored = (assessment: R1ReviewAssessment): boolean =>
   assessment.raw_recommendation === 'human_review' || assessment.recommendation === null;

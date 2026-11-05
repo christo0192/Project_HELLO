@@ -321,7 +321,7 @@ function NextActionCell({
     const isReview = normalizeStatus(status) === "screened";
     return (
       <Link
-        to={`/candidates/${candidateId}${isReview ? "?tab=review" : ""}`}
+        to={`/candidates/${candidateId}${isReview ? "?tab=phone" : ""}`}
         // The compact size with a 36px floor (`min-h-9`, the design
         // system's control minimum): the md size's wider padding alone would
         // push this column, and so the table, past a 1440px layout.

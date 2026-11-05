@@ -120,6 +120,8 @@ import type {
   R1RecordingPlayback,
   R1ReissueResponse,
   R1ReviewResponse,
+  R1QueueQuery,
+  R1QueueResponse,
   R1RoundsResponse,
   R1SendInput,
   R1SendResponse,
@@ -270,6 +272,19 @@ export const api = {
     request<R1RoundsResponse>(
       `/api/candidates/${encodeURIComponent(candidateId)}/interview-rounds`,
     ),
+  // The queue, one server page at a time. The API applies the candidate-access rule, so the rows and
+  // the total are only ever what this person may see.
+  listR1Queue: ({ view, sort, page, pageSize, search, includeDryRuns }: R1QueueQuery = {}) => {
+    const params = new URLSearchParams();
+    if (view) params.set('view', view);
+    if (sort) params.set('sort', sort);
+    if (page) params.set('page', String(page));
+    if (pageSize) params.set('page_size', String(pageSize));
+    if (search) params.set('q', search);
+    if (includeDryRuns) params.set('dry_runs', 'include');
+    const query = params.toString();
+    return request<R1QueueResponse>(`/api/interview-rounds${query ? `?${query}` : ''}`);
+  },
   sendR1Round: (candidateId: string, body: R1SendInput) =>
     request<R1SendResponse>(
       `/api/candidates/${encodeURIComponent(candidateId)}/interview-rounds`,

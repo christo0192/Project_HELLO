@@ -3,10 +3,11 @@
  *
  * - Brand: authorized IK logo on its own white plate (never CSS-inverted),
  *   the HELLO wordmark and a scope line.
- * - Navigation: TA/HR daily items (Dashboard · Candidates · Agents) under
- *   "Workspace"; Operations for admins/interviewers — Ashby Live Jobs
- *   and Mission Control stay admin-only, the phone calendar is for both
- *   roles.
+ * - Navigation: TA/HR daily items (Dashboard · Candidates · R1 interviews ·
+ *   Agents) under "Workspace"; Operations for admins/interviewers — Ashby Live
+ *   Jobs and Mission Control stay admin-only, the phone calendar is for both
+ *   roles. R1 interviews is for every role, and hidden only on a server that
+ *   does not run R1 and has no round to show.
  * - Material: a 232px sidebar on the desk, and the page as one opaque sheet
  *   inset 8px from the window (`.sheet`). No blur, no fixed ground, no shadow.
  * - The sidebar is sticky on desktop, so the nav stays on screen at any scroll.
@@ -47,6 +48,7 @@ import {
   CloseIcon,
   DashboardIcon,
   IntegrationIcon,
+  InterviewIcon,
   LogOutIcon,
   MobileMenuButton,
   NavGroup,
@@ -108,6 +110,7 @@ const PAGE_TITLES: Array<[RegExp, string]> = [
   [/^\/candidates\/[^/]+/, 'Candidate'],
   [/^\/candidates/, 'Candidates'],
   [/^\/interviews\//, 'R1 review'],
+  [/^\/interviews/, 'R1 interviews'],
   [/^\/sessions\//, 'Session'],
   [/^\/screening\//, 'Screening'],
   [/^\/roles/, 'Agents'],
@@ -123,6 +126,32 @@ export function pageTitleFor(pathname: string): string {
   return hit ? hit[1] : 'HELLO';
 }
 
+/**
+ * Whether the sidebar offers R1 interviews. The queue's own read answers it, with the one row it needs
+ * and the staff dry runs counted, because a viewer cannot read availability and a server that stopped
+ * running R1 can still hold rounds. Nothing shows until the answer is in, so the item never flashes in
+ * only to go. A failed read shows it: not knowing is no reason to take the way there away.
+ */
+function useR1Item(): boolean {
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    let live = true;
+    // `Promise.resolve().then`: an API adapter without the call must not take the shell down with it.
+    Promise.resolve()
+      .then(() => api.listR1Queue({ view: 'all', pageSize: 1, includeDryRuns: true }))
+      .then((answer) => {
+        if (live) setShown(answer.r1_deployed || answer.total > 0);
+      })
+      .catch(() => {
+        if (live) setShown(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return shown;
+}
+
 export function Layout() {
   const { user, signOut, isAuthenticated, role } = useAuth();
   const navigate = useNavigate();
@@ -131,6 +160,7 @@ export function Layout() {
   const [status, setStatus] = useState<Status>('checking');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const isDesktop = useIsDesktop();
+  const showR1 = useR1Item();
 
   const menuButtonRef = useRef<HTMLButtonElement | null>(null);
 
@@ -259,6 +289,14 @@ export function Layout() {
               icon={<UsersIcon className="h-4 w-4" />}
               onNavigate={closeDrawer}
             />
+            {showR1 && (
+              <NavLinkItem
+                to="/interviews"
+                label="R1 interviews"
+                icon={<InterviewIcon className="h-4 w-4" />}
+                onNavigate={closeDrawer}
+              />
+            )}
             <NavLinkItem
               to="/roles"
               label="Agents"

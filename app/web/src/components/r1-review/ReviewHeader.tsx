@@ -1,8 +1,7 @@
 /**
  * The header of the review page: breadcrumb, title, and the chips that say what this interview is.
  *
- * "R1 interviews" is plain text until the queue exists (R1 PR 3). The name links to the candidate's
- * Overview, where the R1 card is today.
+ * The breadcrumb goes back to the queue, and the name to the candidate's R1 interview tab.
  *
  * A pending rejection can be cancelled from here, after a confirmation, by an admin or the interviewer
  * who sent the round: the API's own rule, so nobody is offered a button that can only answer 403.
@@ -84,11 +83,11 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   return (
     <header>
       <nav aria-label="Breadcrumb" className="text-label text-ink-tertiary">
-        R1 interviews <span aria-hidden="true">/</span> {candidateName}
+        <Link to="/interviews" className={nameLink}>R1 interviews</Link> <span aria-hidden="true">/</span> {candidateName}
       </nav>
       <h1 className="mt-1 text-title text-ink">
         Sales Program Advisor role-play,{' '}
-        <Link to={`/candidates/${candidate.id}?tab=overview`} className={nameLink}>
+        <Link to={`/candidates/${candidate.id}?tab=r1`} className={nameLink}>
           {candidateName}
         </Link>
       </h1>

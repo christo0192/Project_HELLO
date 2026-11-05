@@ -36,7 +36,7 @@ import { candidateDisplayName } from '../components/talent/ResumeReviewBadge';
 import { Tabs } from '../components/talent/Tabs';
 import { canActOnRound } from '../lib/r1';
 import { attemptLabels, r1RecordingStateCopy } from '../lib/r1-recording';
-import { attemptParam, cueSecFrom, reviewAttemptFrom, reviewTabFrom } from '../lib/r1-review';
+import { attemptParam, cueSecFrom, replacedAssessmentOf, reviewAttemptFrom, reviewTabFrom } from '../lib/r1-review';
 import type { R1ReviewResponse } from '../lib/r1-types';
 import type { MeResponse } from '../types';
 
@@ -300,7 +300,7 @@ export function R1ReviewPage() {
                   attempt={attempt}
                   attemptLabel={labels[body.attempts.indexOf(attempt)]}
                   candidateName={candidateName}
-                  assessment={assessment}
+                  assessment={replacedAssessmentOf(body, attempt) ?? assessment}
                   events={body.events}
                   active={tab === 'recording'}
                   cue={cue}

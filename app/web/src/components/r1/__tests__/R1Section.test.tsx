@@ -532,8 +532,17 @@ describe('the rounds panel', () => {
     });
     renderSection();
     expect(
-      await screen.findByText('Recommendation: Borderline · Overall 58.5 of 100'),
+      await screen.findByText('AI recommendation: Borderline · Overall 58.5 of 100'),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+  });
+
+  it('says a round the scorer would not score was not scored, not that scoring is on its way', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'completed', attempts_counted: 1, status_write: 'human_review' })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI result: not scored. Open the R1 review for the reason.')).toBeInTheDocument();
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
   });
 
@@ -562,7 +571,7 @@ describe('the rounds panel', () => {
       });
       renderBlocked();
       expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
-      expect(screen.queryByText(/Recommendation:/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/AI recommendation:/)).not.toBeInTheDocument();
       expect(screen.queryByText(/of 100/)).not.toBeInTheDocument();
     });
 
@@ -602,7 +611,7 @@ describe('the rounds panel', () => {
       api.listR1Rounds.mockResolvedValue({ rounds: [{ ...scored, ...withheld }] });
       const user = userEvent.setup();
       renderSection();
-      expect(await screen.findByText('Recommendation: Reject · Overall 31 of 100')).toBeInTheDocument();
+      expect(await screen.findByText('AI recommendation: Reject · Overall 31 of 100')).toBeInTheDocument();
 
       await user.click(screen.getByRole('button', { name: 'Grant retake' }));
       const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
@@ -619,7 +628,7 @@ describe('the rounds panel', () => {
       rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58.5 })],
     });
     renderSection();
-    await screen.findByText('Recommendation: Borderline · Overall 58.5 of 100');
+    await screen.findByText('AI recommendation: Borderline · Overall 58.5 of 100');
     expect(screen.queryByText(/suppressed while an appeal/)).not.toBeInTheDocument();
   });
 
@@ -883,6 +892,43 @@ describe('failure and reload', () => {
       expect(screen.queryByLabelText('R1 link for the candidate')).not.toBeInTheDocument(),
     );
     expect(document.body.textContent).not.toContain(LINK);
+  });
+});
+
+describe('what the page learns from the card', () => {
+  const open = (props: Partial<React.ComponentProps<typeof R1Section>> = {}) =>
+    render(
+      <MemoryRouter>
+        <R1Section candidateId="cand-1" candidateName="Ava Rao" role="admin" userId="user-1" {...props} />
+      </MemoryRouter>,
+    );
+
+  it('reports the rounds it read, and again after a re-read', async () => {
+    const first = round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58 });
+    const second = { ...first, status: 'invited' as const };
+    api.listR1Rounds.mockResolvedValueOnce({ rounds: [first] });
+    api.listR1Rounds.mockResolvedValue({ rounds: [second] });
+    const onRoundsChange = vi.fn();
+    const user = userEvent.setup();
+    open({ onRoundsChange });
+    await waitFor(() => expect(onRoundsChange).toHaveBeenCalledWith([first]));
+    await user.click(await screen.findByRole('button', { name: 'Grant retake' }));
+    const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
+    await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
+    await waitFor(() => expect(onRoundsChange).toHaveBeenLastCalledWith([second]));
+  });
+
+  it('draws what the page gives it when it has no card to draw', async () => {
+    api.getR1Availability.mockResolvedValue({ state: 'not_deployed', hold_minutes: 55 });
+    api.listR1Rounds.mockResolvedValue({ rounds: [] });
+    open({ empty: <p>Nothing here</p> });
+    expect(await screen.findByText('Nothing here')).toBeInTheDocument();
+  });
+
+  it('draws it for a viewer with no round too', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [] });
+    open({ role: 'viewer', empty: <p>Nothing here</p> });
+    expect(await screen.findByText('Nothing here')).toBeInTheDocument();
   });
 });
 

@@ -13,7 +13,9 @@ import {
   phoneResultWords,
   placeTurns,
   R1_SCORE_WAIT_MS,
+  r1SessionHref,
   recordingBands,
+  replacedAssessmentOf,
   reviewAttemptFrom,
   reviewDurationSec,
   reviewStage,
@@ -528,5 +530,34 @@ describe('a position that lands on a row', () => {
     expect(cuedRow(turns, 20)).toBe(1);
     expect(cuedRow(turns, 15)).toBe(0);
     expect(cuedRow(turns, 5)).toBeNull();
+  });
+});
+
+describe('r1SessionHref', () => {
+  const session = (id: string, created_at: string | null, interview_round_id: string | null = 'round-1') => ({ id, created_at, interview_round_id });
+
+  it('names the attempt by its place among the sessions of its round, oldest first', () => {
+    const sessions = [session('c', '2026-11-03T00:00:00Z'), session('p', '2026-11-02T00:00:00Z', null), session('other', '2026-11-02T00:00:00Z', 'round-2'), session('a', '2026-11-01T00:00:00Z')];
+    expect(r1SessionHref(sessions[0], sessions)).toBe('/interviews/round-1?attempt=2&tab=recording');
+    expect(r1SessionHref(sessions[3], sessions)).toBe('/interviews/round-1?attempt=1&tab=recording');
+  });
+
+  it('leaves the attempt to the page when the list does not hold the session', () => {
+    expect(r1SessionHref(session('a', null), [])).toBe('/interviews/round-1?tab=recording');
+  });
+});
+
+describe('replacedAssessmentOf', () => {
+  const scorecard = (session_id: string) => ({ session_id }) as R1ReviewAssessment;
+
+  it('finds the scorecard of the attempt on screen when a later one decided the round', () => {
+    expect(replacedAssessmentOf({ assessment: scorecard('s2'), replaced_assessments: [scorecard('s1')] }, { session_id: 's1' })?.session_id).toBe('s1');
+  });
+
+  it('has none for the deciding attempt, an attempt never scored, or an older API', () => {
+    expect(replacedAssessmentOf({ assessment: scorecard('s2'), replaced_assessments: [scorecard('s1')] }, { session_id: 's2' })).toBeNull();
+    expect(replacedAssessmentOf({ assessment: scorecard('s2'), replaced_assessments: [] }, { session_id: 's1' })).toBeNull();
+    expect(replacedAssessmentOf({ assessment: scorecard('s2') }, { session_id: 's1' })).toBeNull();
+    expect(replacedAssessmentOf({ assessment: null, replaced_assessments: [scorecard('s1')] }, null)).toBeNull();
   });
 });

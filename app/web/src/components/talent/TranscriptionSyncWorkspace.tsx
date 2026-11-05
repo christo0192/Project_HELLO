@@ -17,37 +17,17 @@
  * Access: `GET /api/screening/:id` is admin-only. For non-admin reviewers the
  * transcript/recording load returns 403; we degrade gracefully — showing a
  * truthful note plus the candidate's latest screening scorecard, never an R1
- * one (from the viewer-visible candidate detail) instead of an error. With an
- * R1 session selected that scorecard is not this session's, so it is labelled
- * as the phone screening, the phone conflicts, role fit and summary (which have
- * no such label) wait for the phone session, and the note points at the R1 card
- * for the result, or at the candidate page from a host with no R1 card.
+ * one (from the viewer-visible candidate detail) instead of an error.
  *
  * Sync logic:
  *   1. Click a timed turn → if URL not loaded, mint it, queue the offset, wait
  *      for readiness, then seek + play (latest offset wins on rapid clicks).
  *   2. Playhead → the last turn in start-time order at or before it → highlight
- *      (`activeTurnAt`). A phone player reports on `timeupdate`; the R1 player
- *      every animation frame while playing. Either way this renders only when
- *      the active turn changes.
- *   3. R1 only: a click lands `R1_SEEK_LEAD_SEC` before the turn, where rule 2
- *      would light the row before it. So the clicked row lights at once and
- *      holds until the playhead reaches its start, then rule 2 is back. The
- *      hold ends sooner if the playhead leaves the lead-in (a scrub), playback
- *      ends, the media is dropped (the click then failed: no row stays lit) or
- *      the transcript changes. A click the player ignores lights nothing.
- *      While a seek is queued (`seekQueued`), held or not, the media's own
- *      reports do not count: a re-mint reloads it at 0, and the old file can run
- *      out first, so the lit row stays and is not announced again.
- *   4. Selecting a new session resets everything; stale loads are discarded.
+ *      (`activeTurnAt`).
+ *   3. Selecting a new session resets everything; stale loads are discarded.
  *
- * R1 sessions (a session that belongs to an R1 round): the recording is the R1
- * attempt's own, played by `R1RecordingPlayer` in the same slot, and the legacy
- * `RecordingPlayer` (and its download call, which R1 sessions have no file for)
- * is never rendered. The turns are placed on that recording from the attempt's
- * summary (`started_at_ms`, read from the rounds list) and a click seeks with
- * `playFromTurn`; a turn without a time stays untimed. A reduced API adapter
- * without the R1 rounds call degrades to a pointer, never an error.
+ * This is the phone workspace. An R1 session is not in its picker: R1 has its
+ * own review page (`/interviews/:roundId`), and the candidate page its own tab.
  *
  * Phone sessions (M013 S02): a phone session can span several LEGS (the first
  * call, then reconnects after a drop), each with its own recording file. When
@@ -60,7 +40,7 @@
  * session recording player is kept and turns seek it as before.
  */
 
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import { readScorecardAssessmentV2, isAssessmentV2 } from '../../types';
 import type {
@@ -84,8 +64,6 @@ import {
 } from './CandidateScorecard';
 import { CandidateScorecardV2 } from './CandidateScorecardV2';
 import { EvidenceHoldNotice } from './EvidenceHoldNotice';
-import { R1RecordingPlayer } from '../r1/R1RecordingPlayer';
-import type { R1RecordingPlayerHandle } from '../r1/R1RecordingPlayer';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
@@ -107,22 +85,7 @@ import {
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
 import { latestScreeningAssessment } from '../../lib/latest-screening-assessment';
-import { inSeekLead, turnMediaSec } from '../../lib/r1-recording';
-import type { R1RecordingSummary } from '../../lib/r1-types';
 import { sessionModeLabel } from '../../lib/session-mode';
-
-/** What the Review tab calls an R1 session (it is not a phone screening). */
-const R1_SESSION_LABEL = 'R1 role-play';
-
-/** Where an R1 recording is when this host cannot play it or has no R1 card of its own. */
-const R1_RECORDING_ON_CANDIDATE_PAGE =
-  'The recording for this R1 session is on the candidate page, under R1 interview.';
-
-/** An R1 session's attempt summary, read from the candidate's rounds. */
-type R1SessionRecording =
-  | { sessionId: string; status: 'loading' }
-  | { sessionId: string; status: 'ready'; roundId: string; summary: R1RecordingSummary }
-  | { sessionId: string; status: 'unavailable' };
 
 /** One leg page is plenty (a session has a handful of legs); follow a few. */
 const LEG_PAGE_SIZE = 50;
@@ -150,8 +113,7 @@ export interface TranscriptionSyncWorkspaceProps {
    * M013 S02: the candidate whose phone legs to list (`/phone-attempts`
    * filtered to the selected session). A host that omits it — the scoped
    * Ashby page, whose reduced API adapter may not offer the route — keeps the
-   * single session player. Its Overview tab has no R1 card either, so an R1
-   * pointer names the candidate page instead.
+   * single session player.
    */
   candidateId?: string;
   /**
@@ -163,11 +125,6 @@ export interface TranscriptionSyncWorkspaceProps {
    * Overview's, so the Review tab never fetches it a second time.
    */
   callRecordings?: React.ReactNode;
-  /**
-   * False pauses an R1 recording: this tab can be hidden while its panel stays
-   * mounted, and a video must not keep playing behind another tab. Default true.
-   */
-  active?: boolean;
 }
 
 /** Résumé conflicts, whether they arrive on the column or (rarely) inside raw. */
@@ -195,10 +152,9 @@ export function TranscriptionSyncWorkspace({
   blocked,
   candidateId,
   callRecordings,
-  active = true,
 }: TranscriptionSyncWorkspaceProps) {
   const selectableSessions = useMemo(
-    () => sessions.filter((s) => s.status === 'completed'),
+    () => sessions.filter((s) => s.status === 'completed' && s.interview_round_id == null),
     [sessions],
   );
 
@@ -212,37 +168,17 @@ export function TranscriptionSyncWorkspace({
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [activeTurnIndex, setActiveTurnIndex] = useState<number | null>(null);
-  // What the state holds, readable without a render: the R1 player reports every frame, and only a
-  // change of turn may cost one.
-  const activeTurnRef = useRef<number | null>(null);
-  const showActiveTurn = useCallback((next: number | null) => {
-    if (activeTurnRef.current === next) return;
-    activeTurnRef.current = next;
-    setActiveTurnIndex(next);
-  }, []);
-  // The start of the R1 row a click lit, while that row holds the highlight (file header, rule 3).
-  const heldTurnStartRef = useRef<number | null>(null);
-  const dropHeldTurn = useCallback(() => {
-    if (heldTurnStartRef.current === null) return;
-    heldTurnStartRef.current = null;
-    showActiveTurn(null);
-  }, [showActiveTurn]);
 
   // refreshKey counter for retry — changing it re-triggers the effect
   const [refreshKey, setRefreshKey] = useState(0);
 
   const playerRef = useRef<RecordingPlayerHandle>(null);
-  const r1PlayerRef = useRef<R1RecordingPlayerHandle>(null);
   const transcriptHeadingId = useId();
 
   const selectedSession = useMemo(
     () => selectableSessions.find((s) => s.id === selectedSessionId) ?? null,
     [selectableSessions, selectedSessionId],
   );
-
-  // An R1 session belongs to a round: its recording is that attempt's own (see the file header).
-  const r1RoundId = selectedSession?.interview_round_id ?? null;
-  const isR1 = r1RoundId !== null;
 
   // Load transcript + assessment + session meta when session/refreshKey changes
   const loadTranscript = useCallback((sessionId: string) => {
@@ -253,7 +189,7 @@ export function TranscriptionSyncWorkspace({
     setTranscript([]);
     setSessionAssessment(null);
     setLoadedSession(null);
-    showActiveTurn(null);
+    setActiveTurnIndex(null);
 
     api
       .getSession(sessionId)
@@ -280,7 +216,7 @@ export function TranscriptionSyncWorkspace({
     return () => {
       cancelled = true;
     };
-  }, [showActiveTurn]);
+  }, []);
 
   // If the sessions prop changes (candidate reload) and the selected session
   // is no longer completable, fall back to the first available one so the
@@ -301,83 +237,16 @@ export function TranscriptionSyncWorkspace({
       setTranscript([]);
       setTranscriptError(null);
       setPermissionDenied(false);
-      showActiveTurn(null);
+      setActiveTurnIndex(null);
       return;
     }
     return loadTranscript(selectedSessionId);
-  }, [selectedSessionId, refreshKey, loadTranscript, showActiveTurn]);
+  }, [selectedSessionId, refreshKey, loadTranscript]);
 
-  /* ── R1 recording: THIS session's attempt, from the rounds list ─── */
-
-  const r1Supported = !!candidateId && typeof api.listR1Rounds === 'function';
-  const [r1Rec, setR1Rec] = useState<R1SessionRecording | null>(null);
-  const [r1RefreshKey, setR1RefreshKey] = useState(0);
-  // Read only once the transcript has loaded: someone who cannot read the transcript (403) is
-  // pointed at the Overview tab and costs the API nothing here.
-  const loadedSessionId = loadedSession?.id ?? null;
-
-  useEffect(() => {
-    if (!isR1 || !r1Supported || !candidateId || !r1RoundId || !selectedSessionId || !loadedSessionId) {
-      setR1Rec(null);
-      return;
-    }
-    let cancelled = false;
-    const sessionId = selectedSessionId;
-    // A re-read ("Check again") keeps the player that is on screen until the answer is in.
-    setR1Rec((prev) =>
-      prev && prev.sessionId === sessionId && prev.status === 'ready' ? prev : { sessionId, status: 'loading' },
-    );
-    // `Promise.resolve().then`: an adapter without the call throws synchronously, which must not
-    // unmount the transcript.
-    Promise.resolve()
-      .then(() => api.listR1Rounds(candidateId))
-      .then((result) => {
-        if (cancelled) return;
-        const rounds = Array.isArray(result?.rounds) ? result.rounds : [];
-        const round = rounds.find((r) => r.id === r1RoundId);
-        const attempt =
-          round && Array.isArray(round.attempts)
-            ? round.attempts.find((a) => a?.session_id === sessionId)
-            : undefined;
-        setR1Rec(
-          round && attempt?.recording
-            ? { sessionId, status: 'ready', roundId: round.id, summary: attempt.recording }
-            : { sessionId, status: 'unavailable' },
-        );
-      })
-      .catch(() => {
-        if (!cancelled) setR1Rec({ sessionId, status: 'unavailable' });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isR1, r1Supported, candidateId, r1RoundId, selectedSessionId, loadedSessionId, r1RefreshKey]);
-
-  const r1Ready = r1Rec?.sessionId === selectedSessionId && r1Rec.status === 'ready' ? r1Rec : null;
-  const r1Summary = r1Ready?.summary ?? null;
-
-  // The turns as the transcript shows them. A phone turn comes with its own offset; an R1 turn is
-  // placed on the recording from the attempt's anchor (same worker clock, so exact), and a turn
-  // without a time stays untimed rather than being given a wrong one.
-  const displayTranscript = useMemo<TranscriptLine[]>(
-    () =>
-      !isR1
-        ? transcript
-        : transcript.map((turn) => ({
-            ...turn,
-            start_offset_sec: r1Summary ? turnMediaSec(turn.started_at_ms, r1Summary) : null,
-          })),
-    [isR1, transcript, r1Summary],
-  );
   const turnStarts = useMemo(
-    () => displayTranscript.map((turn) => turn.start_offset_sec),
-    [displayTranscript],
+    () => transcript.map((turn) => turn.start_offset_sec),
+    [transcript],
   );
-
-  // A hold belongs to the rows it was clicked on: another session or a reload ends it. In the commit, not
-  // after it: a passive effect waits for the paint, so the first click on new rows can arrive before it,
-  // and the rows that click landed on would then end its hold.
-  useLayoutEffect(dropHeldTurn, [turnStarts, dropHeldTurn]);
 
   /* ── Phone legs (M013 S02) ─────────────────────────────────── */
 
@@ -460,44 +329,15 @@ export function TranscriptionSyncWorkspace({
         setActiveLegTurn(found);
         return;
       }
-      // A queued seek has not moved the media yet, so this position says nothing about where it will be.
-      if (r1PlayerRef.current?.seekQueued) return;
-      const heldStart = heldTurnStartRef.current;
-      if (heldStart !== null) {
-        if (inSeekLead(heldStart, currentTime)) return;
-        heldTurnStartRef.current = null;
-      }
-      // R1 lights a row at its start; a phone row keeps its early tolerance.
-      showActiveTurn(activeTurnAt(turnStarts, currentTime, isR1 ? 0 : PHONE_HIGHLIGHT_TOLERANCE_SEC));
+      setActiveTurnIndex(activeTurnAt(turnStarts, currentTime, PHONE_HIGHLIGHT_TOLERANCE_SEC));
     },
-    [isR1, turnStarts, legsMode, legGroups, showActiveTurn],
-  );
-
-  const handleR1Ended = useCallback(
-    (sec: number) => {
-      // The old file ran out while its link was being replaced: the seek is still on its way.
-      if (r1PlayerRef.current?.seekQueued) return;
-      heldTurnStartRef.current = null;
-      handleTimeUpdate(sec);
-    },
-    [handleTimeUpdate],
+    [turnStarts, legsMode, legGroups],
   );
 
   // click-to-play contract — RecordingPlayer owns mint/wait/seek/play.
-  const handleSeek = useCallback(
-    (offsetSec: number, rowIndex: number) => {
-      if (isR1) {
-        // Seek by the clicked turn's OWN start time, so the lead-in and the anchor are applied in one place.
-        const startedAtMs = displayTranscript[rowIndex]?.started_at_ms;
-        if (typeof startedAtMs !== 'number' || !r1PlayerRef.current?.playFromTurn(startedAtMs)) return;
-        heldTurnStartRef.current = offsetSec;
-        showActiveTurn(rowIndex);
-        return;
-      }
-      playerRef.current?.playFrom(offsetSec);
-    },
-    [isR1, displayTranscript, showActiveTurn],
-  );
+  const handleSeek = useCallback((offsetSec: number) => {
+    playerRef.current?.playFrom(offsetSec);
+  }, []);
 
   /** A leg's playhead moved: highlight within that leg's group only. */
   const handleLegTimeUpdate = useCallback(
@@ -701,37 +541,7 @@ export function TranscriptionSyncWorkspace({
             </button>
           </div>
         )}
-        {selectedSessionId && isR1 && (
-          /* An R1 session: the attempt's own recording, in the slot the legacy player would have
-             had. The legacy player (and its download call) is never rendered for it. */
-          <div>
-            <h3 className="sr-only">{R1_SESSION_LABEL} recording</h3>
-            {r1Ready ? (
-              <R1RecordingPlayer
-                key={selectedSessionId}
-                ref={r1PlayerRef}
-                roundId={r1Ready.roundId}
-                sessionId={selectedSessionId}
-                summary={r1Ready.summary}
-                label={R1_SESSION_LABEL}
-                active={active}
-                onTimeUpdate={handleTimeUpdate}
-                onEnded={handleR1Ended}
-                onMediaDropped={dropHeldTurn}
-                onNeedRefresh={() => setR1RefreshKey((k) => k + 1)}
-              />
-            ) : r1Supported && r1Rec?.status !== 'unavailable' ? (
-              <p role="status" className="text-label text-[var(--c-ink-secondary)]">
-                Loading recording details…
-              </p>
-            ) : (
-              <p className="text-label text-[var(--c-ink-secondary)]">
-                {R1_RECORDING_ON_CANDIDATE_PAGE}
-              </p>
-            )}
-          </div>
-        )}
-        {selectedSessionId && showSessionPlayer && !isR1 && (
+        {selectedSessionId && showSessionPlayer && (
           <div className={legsMode ? 'mt-3 border-t border-[var(--c-border-light)] pt-3' : undefined}>
             {legsMode && (
               <p className="mb-1 text-xs text-[var(--c-ink-secondary)]">
@@ -808,7 +618,7 @@ export function TranscriptionSyncWorkspace({
           })
         ) : (
           <SeekableTranscript
-            transcript={displayTranscript}
+            transcript={transcript}
             activeTurnIndex={activeTurnIndex}
             onSeek={handleSeek}
             recordingReady={true}
@@ -834,20 +644,8 @@ export function TranscriptionSyncWorkspace({
       </h2>
       <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
         Detailed transcript playback and recording review require admin
-        access.{isR1 ? null : ' The session scorecard is shown alongside.'}
+        access. The session scorecard is shown alongside.
       </p>
-      {isR1 && (
-        <p className="mt-2 max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          {/* Nothing alongside is this role-play's. A host without a candidate id (the scoped Ashby
-              page) has no R1 card on its Overview tab. While an appeal blocks decision use the result
-              is withheld on the R1 card too, so only the recording is pointed at. */}
-          {!candidateId
-            ? R1_RECORDING_ON_CANDIDATE_PAGE
-            : blocked
-              ? 'This role-play’s recording is on the Overview tab, under R1 interview.'
-              : 'This role-play’s result and recording are on the Overview tab, under R1 interview.'}
-        </p>
-      )}
     </SurfaceCard>
   );
 
@@ -879,7 +677,7 @@ export function TranscriptionSyncWorkspace({
                     dropped call whose end was not observed). */}
                 {[
                   formatDateTime(s.created_at),
-                  s.interview_round_id != null ? R1_SESSION_LABEL : sessionModeLabel(s.mode),
+                  sessionModeLabel(s.mode),
                   sessionLengthLabel(s),
                 ]
                   .filter(Boolean)
@@ -906,16 +704,11 @@ export function TranscriptionSyncWorkspace({
             sessionAssessment
               ? 'Scorecard for this session'
               : permissionDenied && scorecardAssessment
-                ? isR1
-                  ? 'Latest phone screening scorecard'
-                  : 'Latest scorecard'
+                ? 'Latest scorecard'
                 : undefined
           }
-          emptyText={permissionDenied && isR1 ? 'No phone screening scorecard yet.' : undefined}
         />,
-        // Only the block above names the phone screening. The conflicts, role fit and summary would
-        // read as this role-play's, so a non-admin gets them by picking the phone session.
-        permissionDenied && isR1 ? null : scorecardAssessment,
+        scorecardAssessment,
       )}
     </div>
   );
@@ -927,13 +720,10 @@ function ScorecardBlock({
   blocked,
   assessment,
   heading,
-  emptyText = 'No scorecard for this session yet. One is generated when a screening completes.',
 }: {
   blocked: boolean;
   assessment: Assessment | null;
   heading?: string;
-  /** What to say when there is no assessment to show. */
-  emptyText?: string;
 }) {
   const headingId = useId();
   // v2 (role-scorecard) assessments render the metric-based card; everything
@@ -962,7 +752,7 @@ function ScorecardBlock({
         <CandidateScorecard assessment={assessment} narrative="none" roleFit="none" />
       ) : (
         <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          {emptyText}
+          No scorecard for this session yet. One is generated when a screening completes.
         </p>
       )}
     </section>

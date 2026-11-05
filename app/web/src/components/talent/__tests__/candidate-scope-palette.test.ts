@@ -31,6 +31,7 @@ const PALETTE = resolve(ROOT, 'src/styles/candidate-palette.css');
 const CANDIDATE_SCOPE_SOURCES = [
   'src/pages/CandidatesPage.tsx',
   'src/pages/CandidateDetailPage.tsx',
+  'src/pages/R1InterviewsPage.tsx',
   'src/pages/AshbyScopedReviewPage.tsx',
   'src/components/talent/CandidateShell.tsx',
   'src/components/talent/ResumeReviewBadge.tsx',
