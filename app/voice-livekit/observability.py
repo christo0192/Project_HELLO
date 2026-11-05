@@ -146,6 +146,9 @@ _KEY_TYPE_NUMBER: frozenset[str] = frozenset({
     # so that line has always shipped a comment describing a number it never
     # emitted. Same failure the `rejection_reason`/`phase` note above records.
     "option_count",
+    # R1: how long the candidate's voice held an AI line. A measurement of its own, so `duration_sec`
+    # on that playback's line means only the silence nothing explains.
+    "paused_sec",
 })
 
 # Allowlisted keys for rapid key-allowlist check (union of string + number).
@@ -340,7 +343,7 @@ def _validate_numeric_field(key: str, val: Any) -> Optional[Any]:
         # A count of things, never a measurement. Bounded so a runaway cannot
         # widen a log line without bound.
         return val if (isinstance(val, int) and 0 <= val <= 100_000) else None
-    if key == "duration_sec":
+    if key in ("duration_sec", "paused_sec"):
         # Must be finite, non-negative, and capped at 1e6 (about 11.5 days)
         return val if (isinstance(val, (int, float)) and 0 <= val <= 1_000_000) else None
     return val

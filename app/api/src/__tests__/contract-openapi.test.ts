@@ -271,6 +271,25 @@ function configureTables(config: Record<string, unknown | ((callIndex: number) =
   });
 }
 
+/** Record every `select` on `table`, over what configureTables set: `chain` ignores its arguments. */
+function recordSelects(table: string): string[] {
+  const selects: string[] = [];
+  const configured = mockFrom.getMockImplementation() as (name: string) => Record<string, unknown>;
+  mockFrom.mockImplementation((name: string) => {
+    const builder = configured(name);
+    if (name !== table) return builder;
+    const select = builder.select as (columns: string) => unknown;
+    return {
+      ...builder,
+      select: (columns: string) => {
+        selects.push(columns);
+        return select(columns);
+      },
+    };
+  });
+  return selects;
+}
+
 function configureStorage(options: { upload?: unknown; createSignedUrl?: unknown; download?: unknown } = {}): void {
   mockStorageFrom.mockReturnValue({
     upload: vi.fn().mockResolvedValue(options.upload ?? { data: { path: '2026/01/fake.txt' }, error: null }),
@@ -287,6 +306,12 @@ function configureStorage(options: { upload?: unknown; createSignedUrl?: unknown
 function ok(value: unknown) {
   return { data: value, error: null };
 }
+
+/** What PostgREST answers when a named column is not on the table (a database without 0136). */
+const TURNS_READ_FAILED = {
+  data: null,
+  error: { code: '42703', message: 'column transcript_turns.turn_ended_at_ms does not exist' },
+};
 
 // ════════════════════════════════════════════════════════════════════
 //  Fixtures (synthetic; no real data)
@@ -1655,6 +1680,7 @@ describe('live handler shapes match documented schemas', () => {
       roles: ok(mockRole),
       transcript_turns: ok([]),
     });
+    const selects = recordSelects('transcript_turns');
     const app = createContractApp();
     const res = await request(app)
       .post(`/api/screening/${UUID_1}/turn`)
@@ -1664,6 +1690,32 @@ describe('live handler shapes match documented schemas', () => {
     expect(validateResponseBody(res.body, 'ScreeningTurnResponse', spec)).toEqual([]);
     expect(res.body.done).toBe(false);
     expect(res.body.assessment).toBeNull();
+    // 0136: this path feeds the model and keeps its old read, with no R1 column.
+    expect(selects).toEqual(['speaker,text,turn_started_at_ms,is_gate']);
+  });
+
+  it('POST /api/screening/{id}/turn stops when the turns cannot be read, before it numbers a turn', async () => {
+    const { runClaudeJSON } = await import('../lib/claude.js');
+    vi.mocked(runClaudeJSON).mockClear();
+    const inserted: unknown[] = [];
+    configureTables({
+      call_sessions: ok({ id: UUID_1, candidate_id: UUID_2, status: 'in_progress' }),
+      candidates: ok({ ...mockCandidateRow, id: UUID_2, role_id: UUID_1, skills: ['TS'], parsed: { summary: 'x' } }),
+      roles: ok(mockRole),
+      // Only the read fails: a later write would succeed, so going on would number the turn 0.
+      transcript_turns: (call: number) => {
+        if (call > 0) inserted.push(call);
+        return call === 0 ? TURNS_READ_FAILED : ok(null);
+      },
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/screening/${UUID_1}/turn`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ text: 'I have led teams before.' });
+    expect(res.status).toBe(500);
+    expect(inserted).toEqual([]);
+    expect(runClaudeJSON).not.toHaveBeenCalled();
   });
 
   it('GET /api/screening/{id} → ScreeningSessionDetail', async () => {
@@ -1703,6 +1755,84 @@ describe('live handler shapes match documented schemas', () => {
       null,
     ]);
     expect(res.body.transcript.every((t: { start_offset_sec: unknown }) => t.start_offset_sec === null)).toBe(true);
+  });
+
+  it('GET /api/screening/{id} carries the 0136 R1 turn facts a row holds, and only those', async () => {
+    configureTables({
+      call_sessions: ok({ ...mockSessionRow, recording_egress_started_at_ms: null }),
+      transcript_turns: ok([
+        {
+          speaker: 'bot', text: 'New AI row.', turn_started_at_ms: 1700000005000, is_gate: false,
+          turn_ended_at_ms: 1700000007500, ai_voice: 'learner', ai_played_ms: 2300,
+        },
+        {
+          speaker: 'candidate', text: 'New candidate row.', turn_started_at_ms: 1700000008000, is_gate: false,
+          turn_ended_at_ms: '1700000009000', ai_voice: null, ai_played_ms: null,
+        },
+      ]),
+      assessments: ok(mockAssessmentRecord),
+    });
+    const selects = recordSelects('transcript_turns');
+    const app = createContractApp();
+    const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
+    expect(res.body.transcript).toEqual([
+      {
+        speaker: 'bot', text: 'New AI row.', start_offset_sec: null, is_gate: false,
+        started_at_ms: 1700000005000, ended_at_ms: 1700000007500, ai_voice: 'learner', ai_played_ms: 2300,
+      },
+      {
+        speaker: 'candidate', text: 'New candidate row.', start_offset_sec: null, is_gate: false,
+        started_at_ms: 1700000008000, ended_at_ms: 1700000009000,
+      },
+    ]);
+    // The fake returns the same rows whatever is selected, so the read itself is pinned here.
+    expect(selects).toHaveLength(1);
+    expect(selects[0].split(',')).toEqual([
+      'speaker', 'text', 'turn_started_at_ms', 'is_gate', 'turn_ended_at_ms', 'ai_voice', 'ai_played_ms',
+    ]);
+  });
+
+  it('GET /api/screening/{id} reports a failed turns read, never an empty transcript', async () => {
+    configureTables({
+      call_sessions: ok({ ...mockSessionRow, recording_egress_started_at_ms: null }),
+      transcript_turns: TURNS_READ_FAILED,
+      assessments: ok(mockAssessmentRecord),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(500);
+    expect(validateResponseBody(res.body, 'ErrorBody', spec)).toEqual([]);
+    expect(res.body).not.toHaveProperty('transcript');
+    expect(JSON.stringify(res.body)).not.toContain('turn_ended_at_ms');
+  });
+
+  it('GET /api/screening/{id} keeps the exact old shape for a turn with no end: phone, older R1, untimed', async () => {
+    const oldShape = {
+      speaker: 'bot', text: 'No end.', start_offset_sec: null, is_gate: false, started_at_ms: 1700000005000,
+    };
+    configureTables({
+      call_sessions: ok({ ...mockSessionRow, recording_egress_started_at_ms: null }),
+      transcript_turns: ok([
+        // A phone row or an older R1 row: the 0136 columns are NULL.
+        {
+          speaker: 'bot', text: 'No end.', turn_started_at_ms: 1700000005000, is_gate: false,
+          turn_ended_at_ms: null, ai_voice: null, ai_played_ms: null,
+        },
+        // Nothing the columns' CHECKs would refuse is passed on, whatever a row holds.
+        {
+          speaker: 'bot', text: 'No end.', turn_started_at_ms: 1700000005000, is_gate: false,
+          turn_ended_at_ms: 1.5, ai_voice: 'christy', ai_played_ms: -1,
+        },
+      ]),
+      assessments: ok(mockAssessmentRecord),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
+    expect(res.body.transcript).toEqual([oldShape, oldShape]);
   });
 
   it('POST /api/assess/{sessionId} → Assessment (injected runner)', async () => {

@@ -247,6 +247,6 @@ jobs:
       - name: Test R1 content (bare python, no skips)
         run: |
           cd app/voice-livekit
-          python3 -m unittest tests.test_r1_commitment tests.test_r1_content_pin tests.test_r1_detector_corpus tests.test_r1_guard tests.test_r1_negotiation tests.test_r1_personas tests.test_r1_prompts tests.test_r1_roleplay tests.test_r1_scheduler tests.test_r1_script tests.test_r1_text tests.test_r1_tracker tests.test_r1_world tests.test_r1_latency tests.test_r1_tts tests.test_r1_stt_ab tests.test_r1_linecache tests.test_r1_end_intent -v > /tmp/r1-content-test.log 2>&1 || { cat /tmp/r1-content-test.log; exit 1; }
+          python3 -m unittest tests.test_r1_commitment tests.test_r1_turn_timing tests.test_r1_content_pin tests.test_r1_detector_corpus tests.test_r1_guard tests.test_r1_negotiation tests.test_r1_personas tests.test_r1_prompts tests.test_r1_roleplay tests.test_r1_scheduler tests.test_r1_script tests.test_r1_text tests.test_r1_tracker tests.test_r1_world tests.test_r1_latency tests.test_r1_tts tests.test_r1_stt_ab tests.test_r1_linecache tests.test_r1_end_intent -v > /tmp/r1-content-test.log 2>&1 || { cat /tmp/r1-content-test.log; exit 1; }
           cat /tmp/r1-content-test.log
           if grep -Eq '\.\.\. skipped|skipped=[0-9]+' /tmp/r1-content-test.log; then echo "::error::R1 content tests skipped"; exit 1; fi

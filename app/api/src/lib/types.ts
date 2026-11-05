@@ -41,6 +41,19 @@ export interface TranscriptTurn {
    *  phone turn can be placed on its leg's recording. NULL for legacy rows.
    *  Only `GET /api/screening/:id` sets it. */
   started_at_ms?: number | null;
+  /** 0136, R1 only: the turn's own epoch-ms end on the same clock (AI: when
+   *  its audio stopped; candidate: the voice-activity end of speech). On a cut
+   *  line it is the pause, or the cut when nothing paused it: the latest the
+   *  audio can have stopped, so it can run late by the silence in that line and
+   *  is not exact. Absent when not stored: phone and older R1 turns, and any
+   *  turn whose end was not known. Only `GET /api/screening/:id` sets it. */
+  ended_at_ms?: number;
+  /** 0136, R1 only: the voice that spoke this AI turn. Absent otherwise. */
+  ai_voice?: 'interviewer' | 'learner';
+  /** 0136, R1 only: milliseconds of audio that played for this AI turn, less
+   *  than the line's length when it was cut and about 250 ms over on a line
+   *  that was paused, so not a way to work out its end. Absent otherwise. */
+  ai_played_ms?: number;
   /** 0067: true for a PRE-CONSENT (gate) turn — the greeting/consent exchange
    *  the recruiter transcript shows but the scorer excludes. Additive and
    *  optional; the scoring path never sets it. */

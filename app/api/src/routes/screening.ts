@@ -115,6 +115,27 @@ export function deriveStartOffsetSec(
   return Math.round(Math.max(0, turn - egress)) / 1000;
 }
 
+const TURN_COLUMNS = 'speaker,text,turn_started_at_ms,is_gate';
+const R1_TURN_COLUMNS = 'turn_ended_at_ms,ai_voice,ai_played_ms';
+
+/**
+ * The 0136 facts a turn row holds. A key is present only when the row stores a
+ * valid value, so a phone or older R1 turn keeps its exact old shape and a
+ * reader can tell "not known" by absence.
+ */
+function r1TurnFacts(
+  row: Record<string, unknown>,
+): Pick<TranscriptTurn, 'ended_at_ms' | 'ai_voice' | 'ai_played_ms'> {
+  const facts: Pick<TranscriptTurn, 'ended_at_ms' | 'ai_voice' | 'ai_played_ms'> = {};
+  const endedAtMs = validateEpochMsAnchor(row.turn_ended_at_ms);
+  if (endedAtMs !== null) facts.ended_at_ms = endedAtMs;
+  if (row.ai_voice === 'interviewer' || row.ai_voice === 'learner') facts.ai_voice = row.ai_voice;
+  if (Number.isSafeInteger(row.ai_played_ms) && (row.ai_played_ms as number) >= 0) {
+    facts.ai_played_ms = row.ai_played_ms as number;
+  }
+  return facts;
+}
+
 /**
  * Fetch transcript turns with start_offset_sec derived from the two
  * absolute epoch-ms anchors when both are present.
@@ -136,11 +157,19 @@ export function deriveStartOffsetSec(
  * `start_offset_sec` is always null; without the absolute start no phone
  * turn could seek. Only the read route asks for it: the simulation `/turn`
  * path feeds this array to the model and keeps the exact old shape.
+ *
+ * 0136: the read route also gets the R1 facts (`r1TurnFacts`) under the same
+ * flag, so the `/turn` path neither reads them nor passes them on.
+ *
+ * Throws when the turns cannot be read. A failure must never look like a
+ * session with no turns: the read route would show an empty transcript, and
+ * `/turn` would number the next turn from zero.
  */
 async function getTranscript(
   sessionId: string,
   { withTurnStart = false }: { withTurnStart?: boolean } = {},
 ): Promise<TranscriptTurn[]> {
+  const columns = withTurnStart ? `${TURN_COLUMNS},${R1_TURN_COLUMNS}` : TURN_COLUMNS;
   const [turnsResult, sessionResult] = await Promise.all([
     supabase
       .from('transcript_turns')
@@ -148,7 +177,7 @@ async function getTranscript(
       // it selects all rows and additionally reads `is_gate` so the UI can tag
       // them later. This is deliberately the mirror of the scorer, which
       // EXCLUDES `is_gate = true`. Additive only; no filter is applied here.
-      .select('speaker,text,turn_started_at_ms,is_gate')
+      .select(columns)
       .eq('session_id', sessionId)
       .order('turn_index', { ascending: true }),
     supabase
@@ -158,12 +187,14 @@ async function getTranscript(
       .maybeSingle(),
   ]);
 
-  const turns = turnsResult.data ?? [];
+  if (turnsResult.error) throw new Error('ERR_TRANSCRIPT_READ_FAILED');
+  // Cast: the client's select parser cannot type a column list chosen at run time.
+  const turns = (turnsResult.data ?? []) as unknown as Record<string, unknown>[];
   const egressStartMs = validateEpochMsAnchor(
     sessionResult.data?.recording_egress_started_at_ms ?? null,
   );
 
-  return turns.map((t: Record<string, unknown>) => {
+  return turns.map((t) => {
     const start_offset_sec = deriveStartOffsetSec(
       t.turn_started_at_ms,
       egressStartMs,
@@ -176,7 +207,10 @@ async function getTranscript(
       // turns from the scored assessment turns. Absent/legacy rows read false.
       is_gate: t.is_gate === true,
     };
-    if (withTurnStart) turn.started_at_ms = validateEpochMsAnchor(t.turn_started_at_ms);
+    if (withTurnStart) {
+      turn.started_at_ms = validateEpochMsAnchor(t.turn_started_at_ms);
+      Object.assign(turn, r1TurnFacts(t));
+    }
     return turn;
   });
 }
@@ -415,21 +449,25 @@ screeningRouter.post(
 );
 
 // GET /api/screening/:id  -> session + transcript + assessment
-screeningRouter.get('/:id', validateParams(screeningSessionIdParamSchema), async (req, res) => {
-  const sessionId = req.params.id;
-  const { data: session, error } = await supabase
-    .from('call_sessions')
-    .select('*')
-    .eq('id', sessionId)
-    .single();
-  if (error) return res.status(404).json({ error: 'Screening session not found' });
-  const transcript = await getTranscript(sessionId, { withTurnStart: true });
-  const { data: assessment } = await supabase
-    .from('assessments')
-    .select('*')
-    .eq('session_id', sessionId)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  res.json({ session, transcript, assessment });
+screeningRouter.get('/:id', validateParams(screeningSessionIdParamSchema), async (req, res, next) => {
+  try {
+    const sessionId = req.params.id;
+    const { data: session, error } = await supabase
+      .from('call_sessions')
+      .select('*')
+      .eq('id', sessionId)
+      .single();
+    if (error) return res.status(404).json({ error: 'Screening session not found' });
+    const transcript = await getTranscript(sessionId, { withTurnStart: true });
+    const { data: assessment } = await supabase
+      .from('assessments')
+      .select('*')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    res.json({ session, transcript, assessment });
+  } catch (error) {
+    next(error);
+  }
 });

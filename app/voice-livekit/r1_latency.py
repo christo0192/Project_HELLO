@@ -1,6 +1,6 @@
 """R1 turn taking and per-turn latency measurement (plan 5.15, "measure first").
 
-Two independent, SDK-free pieces live here so both are unit-testable without a session:
+Independent, SDK-free pieces live here so each is unit-testable without a session:
 
 * ``r1_turn_handling``: the endpointing, interruption and preemptive-generation options R1
   hands the ``AgentSession``.  The values are endpointing 0.8 / 3.0 s (R1-Q: the owner's 4/10
@@ -21,6 +21,10 @@ Two independent, SDK-free pieces live here so both are unit-testable without a s
   ``emit`` callback.  ``r1_session`` turns each call into one structured ``r1`` log line
   (``r1_latency``), because the metric sink is a no-op (``observability.py``).  The tracker
   keeps no text and no identifier: stages, a turn index, a phase and a duration only.
+
+* ``PlaybackMeter``: reckons where each agent playback's audio stopped, how long the candidate's
+  voice held it and the silence left over, for the transcript row and one ``r1_playback_silence``
+  log line per playback.  Numbers only.
 
 The anchor of every ``eou_to_*`` segment is the candidate's end of speech as the SDK reports
 it (``user_state_changed`` leaving ``speaking``).  That is the same anchor the phone lane's
@@ -485,6 +489,90 @@ class LatencyTracker:
         if not _valid_segment(seconds):
             return
         self._emit(schema, seconds, category=category, phase=phase, turn_index=index)
+
+
+# ------------------------------------------------------------------- playback silence
+
+
+@dataclass(frozen=True)
+class Playback:
+    """One finished agent playback: seconds and a count, never text or an identifier."""
+
+    finished_at: float  # wall clock, when its audio stopped (a cut one: at the latest, see below)
+    played_seconds: float  # the audio that played (the room's ``playback_position``)
+    silence_seconds: float  # wall time inside the playback that nothing accounts for
+    paused_seconds: float  # wall time the candidate's voice held it
+    resumes: int  # times it was paused and picked up again
+    interrupted: bool
+
+
+class PlaybackMeter:
+    """Reckon each agent playback from ``playback_started``, ``playback_finished`` and its pauses.
+
+    Silence is ``finish - first frame - played - paused``: the wall time nothing accounts for.  That
+    is the wait before a later speech fragment and the thinking filler's wait.  The room reports
+    most lines finished 0.1-0.25 s late, so a line with no silence in it reads about that, not 0.
+
+    The candidate's voice only pauses a line (``resume_false_interruption``: it may be a cough).  The
+    cut comes when their speech is transcribed, often after they have finished, and only then does
+    the room report the line finished.  So a line cut while paused stopped at the pause, not at that
+    report, and everything since is ``paused_seconds``, kept out of the silence.  The room also
+    counts what the pause dropped from its queue as played, about 0.25 s: start plus played is no
+    end either, and the silence of a paused line reads that much low.
+
+    So the end of a cut line is the LATEST its audio can have stopped, not when it did.  Nothing here
+    sees the frames: a line waiting for its next fragment when it was paused, or when R1 cut it with
+    no pause at all (the filler, then ``TURN_DEADLINE_SECONDS``), had already gone quiet, and its end
+    runs late by that silence.  ``silence_seconds`` is the most that can be.  Start plus played cannot
+    correct it, because a gap mid-line would then read seconds early.
+
+    The audio output plays one playback at a time, so one meter serves the whole session.  The room
+    reports ``playback_started`` again after every resume: only the first is the first frame, and
+    the rest count the resumes.
+    """
+
+    def __init__(self) -> None:
+        self._first_frame_at: float | None = None
+        self._resumes = 0
+        self._paused_at: float | None = None
+        self._paused_seconds = 0.0
+
+    def started(self, created_at: Any) -> None:
+        if self._first_frame_at is not None:
+            self._resumes += 1
+        elif _is_finite_number(created_at):
+            self._first_frame_at = float(created_at)
+
+    def paused(self, at: float) -> None:
+        """The open playback's audio stopped here.  With none open, nothing was playing."""
+        if self._first_frame_at is not None and self._paused_at is None:
+            self._paused_at = at
+
+    def resumed(self, at: float) -> None:
+        """The paused line came back: it plays on, so that pause says nothing about its end."""
+        if self._paused_at is not None:
+            self._paused_seconds += max(0.0, at - self._paused_at)
+            self._paused_at = None
+
+    def finished(self, position: Any, *, interrupted: bool, now: float) -> Playback | None:
+        """Close the playback; None when no frame of it ever played (nobody heard it)."""
+        first_frame_at, resumes = self._first_frame_at, self._resumes
+        paused_at, paused = self._paused_at, self._paused_seconds
+        self._first_frame_at, self._resumes = None, 0
+        self._paused_at, self._paused_seconds = None, 0.0
+        if first_frame_at is None:
+            return None
+        played = float(position) if _is_finite_number(position) and position > 0 else 0.0
+        if paused_at is not None:
+            paused += max(0.0, now - paused_at)
+        silence = max(0.0, now - first_frame_at - played - paused)
+        # Not cut, the line ran out while paused: its queued tail played, so the report is the end.
+        stopped_at = paused_at if interrupted and paused_at is not None else now
+        return Playback(stopped_at, played, silence, paused, resumes, interrupted)
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 # ------------------------------------------------------------ Stage A targets (plan 5.15)

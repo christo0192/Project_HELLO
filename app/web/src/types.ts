@@ -482,6 +482,18 @@ export interface TranscriptLine {
    */
   started_at_ms?: number | null;
   /**
+   * 0136, R1 only. The turn's own epoch-ms end on the same clock. Absent on
+   * phone and older R1 turns and whenever the end was not known, so a reader
+   * must always handle a turn without it. Not exact on a cut AI line: it is the
+   * latest the audio can have stopped, and can run late by the silence in that
+   * line, so a timeline must not draw it as the moment the voice stopped.
+   */
+  ended_at_ms?: number;
+  /** 0136, R1 only. The voice that spoke this AI turn. Absent otherwise. */
+  ai_voice?: "interviewer" | "learner";
+  /** 0136, R1 only. Milliseconds of audio played for this AI turn. Absent otherwise. */
+  ai_played_ms?: number;
+  /**
    * 0105. TRUE for the pre-consent gate — the disclosure, the identity turn,
    * the consent reply — which is now persisted as it happens so a call that
    * died at the gate still has a transcript. The API returns it on every turn
