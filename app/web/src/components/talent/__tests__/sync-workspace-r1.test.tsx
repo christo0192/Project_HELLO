@@ -528,20 +528,33 @@ describe('when the R1 summary cannot be had', () => {
 });
 
 describe('a person who cannot read the transcript', () => {
-  it('is pointed at the Overview tab, and the API is not asked for the recording summary', async () => {
+  const POINTER = 'This role-play’s result and recording are on the Overview tab, under R1 interview.';
+
+  it('is pointed at the R1 card for the result and the recording, and the API is not asked for the recording summary', async () => {
     mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
     renderWorkspace();
     expect(await screen.findByText(/require admin access/i)).toBeInTheDocument();
-    expect(screen.getByText('The recording is on the Overview tab.')).toBeInTheDocument();
+    expect(screen.getByText(POINTER)).toBeInTheDocument();
+    // Nothing alongside is this session's scorecard, so the pane must not say one is.
+    expect(screen.queryByText(/shown alongside/)).not.toBeInTheDocument();
     expect(mockApi.listR1Rounds).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
   });
 
-  it('a phone session\'s denied pane says nothing about the Overview tab', async () => {
+  it('while an appeal blocks decision use only the recording is pointed at: the result is withheld there too', async () => {
+    mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    renderWorkspace({ blocked: true });
+    expect(await screen.findByText('This role-play’s recording is on the Overview tab, under R1 interview.')).toBeInTheDocument();
+    expect(screen.queryByText(POINTER)).not.toBeInTheDocument();
+    expect(screen.getByText('Scorecards are suppressed while an appeal is under review.')).toBeInTheDocument();
+  });
+
+  it('a phone session\'s denied pane keeps its words and says nothing about the Overview tab', async () => {
     mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
     renderWorkspace({ sessions: [PHONE_SESSION] });
-    expect(await screen.findByText(/require admin access/i)).toBeInTheDocument();
-    expect(screen.queryByText('The recording is on the Overview tab.')).not.toBeInTheDocument();
+    expect(await screen.findByText(/require admin access.*The session scorecard is shown alongside\./i)).toBeInTheDocument();
+    expect(screen.queryByText(/Overview tab/)).not.toBeInTheDocument();
+    expect(screen.getByText(/^No scorecard for this session yet\./)).toBeInTheDocument();
   });
 });
 
@@ -560,19 +573,31 @@ describe('the "Latest scorecard" fallback never shows an R1 assessment', () => {
     mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
   });
 
-  it('a non-admin, with an R1 session selected, gets the newest PHONE scorecard', async () => {
+  it('a non-admin, with an R1 session selected, gets the newest PHONE scorecard, labelled as the phone screening', async () => {
     renderWorkspace({ sessions: [R1_SESSION, PHONE_SESSION], assessments: [R1_ASSESSMENT, PHONE_ASSESSMENT] });
+    // A bare "Latest scorecard" beside an R1 session would read as this role-play's result.
+    expect(await screen.findByText('Latest phone screening scorecard')).toBeInTheDocument();
+    expect(screen.queryByText('Latest scorecard')).not.toBeInTheDocument();
+    expect(screen.getByText('62')).toBeInTheDocument();
+    expect(screen.queryByText('91')).not.toBeInTheDocument();
+  });
+
+  it('a non-admin, with a phone session selected, keeps the "Latest scorecard" heading', async () => {
+    renderWorkspace({ sessions: [PHONE_SESSION, R1_SESSION], assessments: [R1_ASSESSMENT, PHONE_ASSESSMENT] });
     expect(await screen.findByText('Latest scorecard')).toBeInTheDocument();
     expect(screen.getByText('62')).toBeInTheDocument();
     expect(screen.queryByText('91')).not.toBeInTheDocument();
   });
 
-  it('a non-admin whose only assessment is R1 gets no scorecard and no "Latest scorecard" heading', async () => {
+  it('a non-admin whose only assessment is R1 gets no scorecard and is not told the session has none', async () => {
     renderWorkspace({ sessions: [R1_SESSION], assessments: [R1_ASSESSMENT] });
     expect(await screen.findByText(/require admin access/i)).toBeInTheDocument();
     expect(screen.queryByText('Latest scorecard')).not.toBeInTheDocument();
+    expect(screen.queryByText('Latest phone screening scorecard')).not.toBeInTheDocument();
     expect(screen.queryByText('91')).not.toBeInTheDocument();
-    expect(screen.getByText(/No scorecard for this session yet/)).toBeInTheDocument();
+    // The attempt may well be scored; its result is on the R1 card the denied pane points at.
+    expect(screen.queryByText(/No scorecard for this session/)).not.toBeInTheDocument();
+    expect(screen.getByText('No phone screening scorecard yet.')).toBeInTheDocument();
   });
 
   it('no completed session yet: the empty state falls back to the phone scorecard, never the R1 one', () => {
@@ -645,7 +670,7 @@ describe('accessibility', () => {
 
     mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
     const denied = renderWorkspace();
-    await screen.findByText('The recording is on the Overview tab.');
+    await screen.findByText(/on the Overview tab, under R1 interview/);
     await expect(denied.container).toHaveNoViolations();
   });
 });

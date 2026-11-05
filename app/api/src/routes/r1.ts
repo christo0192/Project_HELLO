@@ -72,7 +72,10 @@ r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (r
   if (error) throw error;
   // While an appeal blocks decision use the result is withheld at read time, as the phone list does
   // (latest_recommendation / latest_score in routes/candidates.ts); the stored round is untouched.
-  const rounds = candidate.decision_use_blocked_at != null ? (data ?? []).map((round) => ({ ...round, recommendation: null, overall: null })) : (data ?? []);
+  // status_write and pending_reject_until go with them: each gives the verdict away (0115 allows
+  // pending_reject_until only on a reject). `scores_withheld` tells a reader that the nulls mean
+  // withheld, not unscored, even if its copy of the candidate predates the appeal.
+  const rounds = candidate.decision_use_blocked_at != null ? (data ?? []).map((round) => ({ ...round, recommendation: null, overall: null, status_write: null, pending_reject_until: null, scores_withheld: true })) : (data ?? []);
   res.json({ rounds: await withRecordingAttempts(supabase as never, rounds) });
 } catch (e) { next(e); } });
 

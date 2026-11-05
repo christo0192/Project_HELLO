@@ -17,7 +17,9 @@
  * Access: `GET /api/screening/:id` is admin-only. For non-admin reviewers the
  * transcript/recording load returns 403; we degrade gracefully — showing a
  * truthful note plus the candidate's latest screening scorecard, never an R1
- * one (from the viewer-visible candidate detail) instead of an error.
+ * one (from the viewer-visible candidate detail) instead of an error. With an
+ * R1 session selected that scorecard is not this session's, so it is labelled
+ * as the phone screening and the note points at the R1 card for the result.
  *
  * Sync logic:
  *   1. Click a timed turn → if URL not loaded, mint it, queue the offset, wait
@@ -784,11 +786,15 @@ export function TranscriptionSyncWorkspace({
       </h2>
       <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
         Detailed transcript playback and recording review require admin
-        access. The session scorecard is shown alongside.
+        access.{isR1 ? null : ' The session scorecard is shown alongside.'}
       </p>
       {isR1 && (
         <p className="mt-2 max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          The recording is on the Overview tab.
+          {/* Nothing alongside is this role-play's. While an appeal blocks decision use its result
+              is withheld on the R1 card too, so only the recording is pointed at. */}
+          {blocked
+            ? 'This role-play’s recording is on the Overview tab, under R1 interview.'
+            : 'This role-play’s result and recording are on the Overview tab, under R1 interview.'}
         </p>
       )}
     </SurfaceCard>
@@ -849,9 +855,12 @@ export function TranscriptionSyncWorkspace({
             sessionAssessment
               ? 'Scorecard for this session'
               : permissionDenied && scorecardAssessment
-                ? 'Latest scorecard'
+                ? isR1
+                  ? 'Latest phone screening scorecard'
+                  : 'Latest scorecard'
                 : undefined
           }
+          emptyText={permissionDenied && isR1 ? 'No phone screening scorecard yet.' : undefined}
         />,
         scorecardAssessment,
       )}
@@ -865,10 +874,13 @@ function ScorecardBlock({
   blocked,
   assessment,
   heading,
+  emptyText = 'No scorecard for this session yet. One is generated when a screening completes.',
 }: {
   blocked: boolean;
   assessment: Assessment | null;
   heading?: string;
+  /** What to say when there is no assessment to show. */
+  emptyText?: string;
 }) {
   const headingId = useId();
   // v2 (role-scorecard) assessments render the metric-based card; everything
@@ -897,8 +909,7 @@ function ScorecardBlock({
         <CandidateScorecard assessment={assessment} narrative="none" roleFit="none" />
       ) : (
         <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          No scorecard for this session yet. One is generated when a screening
-          completes.
+          {emptyText}
         </p>
       )}
     </section>

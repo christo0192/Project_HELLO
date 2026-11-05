@@ -106,6 +106,8 @@ export interface R1RoundsPanelProps {
   /**
    * An appeal blocks decision use. The API nulls the scores, which must not read as "no results yet":
    * every round that would show a result says it is withheld, and no score prints even if one arrives.
+   * This is what the page knew when it loaded; a round's own `scores_withheld` covers an appeal opened
+   * since then, once a re-read brings it.
    */
   decisionBlocked?: boolean;
 }
@@ -207,6 +209,7 @@ export function R1RoundsPanel({
       {rounds.map((round) => {
         const live = round.status === 'invited' || round.status === 'in_progress';
         const scored = round.recommendation !== null || round.overall !== null;
+        const withheld = decisionBlocked || round.scores_withheld === true;
         const showsResult = round.status === 'completed' || round.status === 'in_progress';
         const active = pending?.roundId === round.id ? pending : null;
         const headingId = `r1-round-${uid}-${round.id}`;
@@ -234,7 +237,7 @@ export function R1RoundsPanel({
 
             {showsResult && (
               <p className="mt-1 text-label text-ink-secondary">
-                {decisionBlocked ? (
+                {withheld ? (
                   R1_RESULT_WITHHELD
                 ) : scored ? (
                   <>

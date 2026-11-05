@@ -49,7 +49,7 @@ paths:
       tags: [r1]
       operationId: listR1InterviewRounds
       summary: List R1 rounds for a candidate (viewer+; no video URLs; scores withheld while an appeal blocks decision use)
-      description: 'recommendation and overall are null while decision use is blocked (an open appeal). Each round carries attempts[] (R1-REC), ordered by attempt_number: session_id, attempt_number, counted, outcome and a recording summary (state none, recording, processing, ready, partial, failed or deleted; a reason; mode single or split; has_video; started_at_ms; duration_ms; camera_off_ms; degraded_at_ms; retention_until; deleted_at). A summary never carries a URL, key, bucket, hash or upload id. If the attempts or recordings cannot be read the rounds come back without attempts instead of failing the list.'
+      description: 'recommendation, overall, status_write and pending_reject_until are null, and scores_withheld is true, while decision use is blocked (an open appeal); scores_withheld is absent otherwise. Each round carries attempts[] (R1-REC), ordered by attempt_number: session_id, attempt_number, counted, outcome and a recording summary (state none, recording, processing, ready, partial, failed or deleted; a reason; mode single or split; has_video; started_at_ms; duration_ms; camera_off_ms; degraded_at_ms; retention_until; deleted_at). A summary never carries a URL, key, bucket, hash or upload id. If the attempts or recordings cannot be read the rounds come back without attempts instead of failing the list.'
       responses:
         '200': { description: R1 round cards }
     post:

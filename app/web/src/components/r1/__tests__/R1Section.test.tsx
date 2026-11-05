@@ -575,6 +575,37 @@ describe('the rounds panel', () => {
     });
   });
 
+  describe('an appeal opened after the page loaded', () => {
+    const WITHHELD = 'Scorecards are suppressed while an appeal is under review.';
+    const withheld = { recommendation: null, overall: null, scores_withheld: true };
+
+    it('the round itself says so: withheld, with no decisionBlocked prop', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'completed', attempts_counted: 1, ...withheld })],
+      });
+      renderSection();
+      expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    });
+
+    it('a re-read after an action turns the shown result into withheld, not into "no results yet"', async () => {
+      const scored = round({ status: 'completed', attempts_counted: 1, recommendation: 'reject', overall: 31 });
+      api.listR1Rounds.mockResolvedValueOnce({ rounds: [scored] });
+      api.listR1Rounds.mockResolvedValue({ rounds: [{ ...scored, ...withheld }] });
+      const user = userEvent.setup();
+      renderSection();
+      expect(await screen.findByText('Recommendation: Reject · Overall 31 of 100')).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Grant retake' }));
+      const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
+      await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
+
+      expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/of 100/)).not.toBeInTheDocument();
+    });
+  });
+
   it('without an appeal the withheld line never shows', async () => {
     api.listR1Rounds.mockResolvedValue({
       rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58.5 })],

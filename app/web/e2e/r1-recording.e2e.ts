@@ -333,10 +333,12 @@ test.describe('a viewer', () => {
     expect(mints(app)).toHaveLength(1);
     expect(mints(app)[0].method).toBe('GET');
 
-    // The transcript is admin-only (the API says 403): the Review tab says where the recording is.
+    // The transcript is admin-only (the API says 403): the Review tab says where the result and the
+    // recording are, and does not claim a scorecard alongside is this session's.
     await page.getByRole('tab', { name: 'Review' }).click();
     const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await expect(panel.getByText('The recording is on the Overview tab.')).toBeVisible();
+    await expect(panel.getByText('This role-play’s result and recording are on the Overview tab, under R1 interview.')).toBeVisible();
+    await expect(panel.getByText(/shown alongside/)).toHaveCount(0);
     await expect(panel.getByRole('button', { name: /Load recording/ })).toHaveCount(0);
     await noSideways(app, testInfo.project.name);
 

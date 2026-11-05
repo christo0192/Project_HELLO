@@ -89,6 +89,8 @@ export interface R1Round {
   recommendation: R1Recommendation | null;
   /** 0-100, null until scored, and while an appeal blocks decision use. */
   overall: number | null;
+  /** True while an appeal blocks decision use: the nulls above mean withheld, not unscored. Absent otherwise. */
+  scores_withheld?: boolean;
   created_at: string;
   created_by?: string;
   /** One entry per attempt, each with its recording summary. Absent from an older API. */
