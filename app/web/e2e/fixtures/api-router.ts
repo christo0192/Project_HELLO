@@ -422,7 +422,7 @@ const ROUTES: Array<[string, string, Handler]> = [
       const lapsed = open && Date.parse(round.expires_at ?? '') <= FROZEN_NOW_MS;
       if (view === 'in-progress') return open && !lapsed;
       if (view === 'all') return true;
-      const finished = round.status === 'completed' || ((round.status === 'expired' || lapsed) && round.attempts_counted > 0);
+      const finished = round.status === 'completed' || ((round.status === 'expired' || round.status === 'cancelled' || lapsed) && round.attempts_counted > 0);
       if (round.scores_withheld || !finished) return false;
       return view === 'reviewed' ? settled(round.status_write) : !settled(round.status_write);
     };
