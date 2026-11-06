@@ -1,0 +1,13 @@
+{
+  "cutoffs": { "select": 65, "borderline": 45 },
+  "cases": [
+    { "name": "every metric scored", "scaleMax": 4, "metrics": [[5000, 4], [3000, 3], [2000, 1]], "weighted": 3.1, "overall": 70, "recommendation": "advance" },
+    { "name": "a metric left out, so the rest share its weight", "scaleMax": 4, "metrics": [[2500, 4], [2000, 3], [2000, 3], [2000, 2], [1500, null]], "weighted": 3.0588, "overall": 69, "recommendation": "advance" },
+    { "name": "rounding to four places first lifts it over a .5: unrounded it reads 50", "scaleMax": 4, "metrics": [[1003, 2], [1065, 3], [7932, null]], "weighted": 2.515, "overall": 51, "recommendation": "hold" },
+    { "name": "exactly on the Select cut-off", "scaleMax": 4, "metrics": [[9500, 3], [500, 2]], "weighted": 2.95, "overall": 65, "recommendation": "advance" },
+    { "name": "one short of Select", "scaleMax": 4, "metrics": [[9200, 3], [800, 2]], "weighted": 2.92, "overall": 64, "recommendation": "hold" },
+    { "name": "exactly on the Borderline cut-off", "scaleMax": 4, "metrics": [[3500, 3], [6500, 2]], "weighted": 2.35, "overall": 45, "recommendation": "hold" },
+    { "name": "one short of Borderline", "scaleMax": 4, "metrics": [[3200, 3], [6800, 2]], "weighted": 2.32, "overall": 44, "recommendation": "reject" },
+    { "name": "a row on the older five-level scale", "scaleMax": 5, "metrics": [[10000, 3]], "weighted": 3, "overall": 50, "recommendation": "hold" }
+  ]
+}

@@ -7,7 +7,7 @@
  * "not available" state for unknown / malformed / unowned links.
  */
 import { StrictMode } from 'react';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AshbyScopedReviewPage } from './AshbyScopedReviewPage';
@@ -134,7 +134,9 @@ describe('scoped review shell', () => {
   it('renders no global navigation, no backlinks and no cross-candidate links', async () => {
     const { container } = renderPage();
     await screen.findByText('Jane Doe');
-    expect(screen.queryByRole('navigation')).toBeNull();
+    // Review is the tab this page opens on, so its skip links are in the tree. They stay inside the
+    // page; any other navigation here would be a way out of the scoped view.
+    expect(screen.getAllByRole('navigation').map((nav) => nav.getAttribute('aria-label'))).toEqual(['Skip to a pane']);
     expect(screen.queryByText(/back to candidates/i)).toBeNull();
     // No anchor may leave the scoped view. The only links present are the
     // Review workspace's in-page skip targets (`#…`); nothing routes to
@@ -192,6 +194,18 @@ describe('scoped review shell', () => {
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('session-1'));
     fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
     expect(await screen.findByText('Welcome to the screening.')).toBeInTheDocument();
+  });
+
+  it('gives the Review tab a sheet: this shell is on the desk, and the workspace is drawn for paper', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    await screen.findByText('Welcome to the screening.');
+    const sheet = document.querySelector('[data-review-workspace]')!.parentElement!;
+    expect(sheet).toHaveClass('bg-paper');
+    expect(sheet.closest('[role="tabpanel"]')).not.toBeNull();
+    // The Overview's cards are their own surfaces: it stays on the desk.
+    expect(document.querySelector('[role="tabpanel"][hidden] .bg-paper')).toBeNull();
   });
 
   it('a viewer with an R1 session is told the candidate page holds its recording: this shell has no R1 card', async () => {
@@ -307,6 +321,37 @@ describe('parked SSO return-to', () => {
   });
 });
 
+describe('the log header on the scoped Review tab', () => {
+  const header = () => document.querySelector<HTMLElement>('[data-log-header]')!;
+  const linked = {
+    lifecycle: 'writeback_pending',
+    terminalState: null,
+    ingestionState: 'ready',
+    operations: [],
+    sessionStatus: 'completed',
+    updatedAt: null,
+  };
+
+  it('says where the candidate stands, through the link scope, and leaves out a role it cannot name', async () => {
+    mockApi.getAshbyScopedReviewWorkflow.mockResolvedValue({ ok: true, workflow: linked });
+    renderPage();
+    await screen.findByText('Ashby screening pipeline');
+    await waitFor(() => expect(header()).toHaveTextContent('Writing results back to Ashby'));
+    expect(header()).not.toHaveTextContent('Not linked');
+    expect(header()).not.toHaveTextContent('Role');
+    expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalledWith(LINK_ID);
+  });
+
+  it('never says "Not linked" for a read that failed', async () => {
+    mockApi.getAshbyScopedReviewWorkflow.mockRejectedValue(new MockApiError('boom', 500));
+    renderPage();
+    await screen.findByText('Ashby screening pipeline');
+    await waitFor(() => expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalled());
+    expect(header()).toHaveTextContent('Not available');
+    expect(header()).not.toHaveTextContent('Not linked');
+  });
+});
+
 describe('Ashby pipeline card in the scoped review Overview', () => {
   it('reads the workflow through the link scope only — never a candidate id', async () => {
     mockApi.getAshbyScopedReviewWorkflow.mockResolvedValue({
@@ -322,8 +367,12 @@ describe('Ashby pipeline card in the scoped review Overview', () => {
     });
     renderPage();
     fireEvent.click(await screen.findByRole('tab', { name: 'Overview' }));
-    // Wait for the resolved card, not the identically-headed loading state.
-    expect(await screen.findByText('Writing results back to Ashby')).toBeInTheDocument();
+    // Wait for the resolved card, not the identically-headed loading state. Within the card, because
+    // the hidden Review panel stays mounted and its log header prints the same words.
+    await waitFor(() => {
+      const card = screen.getByRole('region', { name: 'Ashby screening pipeline' });
+      expect(within(card).getByText('Writing results back to Ashby')).toBeInTheDocument();
+    });
     expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalledWith(LINK_ID);
     expect(screen.getByText('Ashby server error')).toHaveAttribute('title', 'provider_5xx');
 

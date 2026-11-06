@@ -189,6 +189,6 @@ describe('R1 recordings on the candidate page', () => {
     expect(within(review).queryByText('Recording loads on request; the link expires automatically.')).not.toBeInTheDocument();
     expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
     // Turns are timed from the attempt's anchor.
-    expect(await within(review).findByRole('button', { name: /Turn 1: .*At 0:05\./ })).toBeInTheDocument();
+    expect(await within(review).findByRole('button', { name: /Turn 1: .*At 00:05\./ })).toBeInTheDocument();
   });
 });

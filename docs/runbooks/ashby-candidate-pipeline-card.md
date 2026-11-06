@@ -47,7 +47,12 @@ surface is wider (viewer role, every owning interviewer). Only these keys may
 ever appear, and a test asserts it by walking the whole response body:
 
 `ok`, `workflow`, `lifecycle`, `terminalState`, `ingestionState`, `operations`,
-`sessionStatus`, `updatedAt`, `type`, `state`, `errorCode`.
+`sessionStatus`, `updatedAt`, `type`, `state`, `errorCode`, `sessionCreatedAt`.
+
+`sessionCreatedAt` is on a delivered `scorecard_write` only: when the session the
+scorecard came from was created, so a page can tell whether the write belongs to
+the session on screen. It is a time, not an id, and the candidate read already
+lists it beside that session.
 
 Never emitted, even when the underlying row carries them:
 

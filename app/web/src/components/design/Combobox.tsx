@@ -98,6 +98,8 @@ export interface ComboboxProps {
   searchable?: boolean;
   /** Floats over the page instead of opening in flow; `'up'` above the trigger. See the header. */
   floating?: boolean | 'up';
+  /** One line, for a picker printed in a ruled row: the label truncates and its description stays in the list. */
+  compact?: boolean;
   'aria-describedby'?: string;
   /** Reaches the trigger button (e.g. to move focus onto it after a retry). */
   ref?: Ref<HTMLButtonElement>;
@@ -134,6 +136,7 @@ export function Combobox({
   size = 'lg',
   searchable = true,
   floating = false,
+  compact = false,
   'aria-describedby': describedBy,
   ref,
   className,
@@ -404,8 +407,8 @@ export function Combobox({
         className={cx(
           // One control vocabulary per form. A selected option with a
           // description grows.
-          'group flex w-full min-w-0 items-center gap-3 text-left',
-          TRIGGER_SIZE[size],
+          'group flex w-full min-w-0 items-center text-left',
+          compact ? 'min-h-6 gap-2 px-1.5 [@media(pointer:coarse)]:min-h-11' : cx('gap-3', TRIGGER_SIZE[size]),
           'border bg-surface transition-[background-color,border-color] duration-hover ease-out',
           // Keyboard focus is the design system's 2px ring with offset — the
           // same as every button — so it is never mistaken for "open".
@@ -438,8 +441,8 @@ export function Combobox({
             <>
               {/* Wraps like the option rows: what tells two same-titled
                   choices apart is at the END, where an ellipsis would cut. */}
-              <span className="line-clamp-2 break-words text-sm font-medium text-ink">{selected.label}</span>
-              {selected.description && (
+              <span className={cx('text-sm font-medium text-ink', compact ? 'truncate' : 'line-clamp-2 break-words')}>{selected.label}</span>
+              {selected.description && !compact && (
                 <span className="line-clamp-2 break-words text-xs text-ink-tertiary">{selected.description}</span>
               )}
             </>

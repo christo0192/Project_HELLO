@@ -29,6 +29,8 @@ import { expect, test, type AppHarness } from './fixtures/harness';
 
 const OVERVIEW = `/candidates/${R1_CANDIDATE_ID}?tab=overview`;
 const REVIEW = `/candidates/${R1_CANDIDATE_ID}?tab=review`;
+/** Attempt 1 ran ten minutes: its length is what tells it from attempt 2 in the picker. */
+const ATTEMPT_1_OPTION = /10m 0s/;
 
 /** The recording mints so far (a GET each, never a POST: a viewer cannot POST). */
 const mints = (app: AppHarness) => app.calls.filter((c) => /\/api\/interview-rounds\/[^/]+\/recording\?session_id=/.test(c.url));
@@ -97,12 +99,32 @@ test.describe('Overview: one row per attempt', () => {
 });
 
 test.describe('Review tab (admin): click a transcript turn to seek', () => {
+  test('at 1366x768 the video stays on screen beside a transcript with room to read', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await app.goto(REVIEW);
+    const panel = page.getByRole('tabpanel', { name: 'Review' });
+    await panel.getByRole('button', { name: /^Screening/ }).click();
+    await panel.getByRole('option', { name: ATTEMPT_1_OPTION }).click();
+
+    await panel.getByRole('button', { name: /Turn 2:/ }).click();
+    const video = panel.locator('video');
+    await expect(video).toHaveCount(1);
+    await expect.poll(() => position(video), { timeout: 10_000 }).toBeGreaterThanOrEqual(R1_TURN_LATE_SEC - 1);
+
+    // Outside both scrolling panes, so nothing the transcript does can carry it or its controls away.
+    expect(await video.evaluate((el) => el.closest('[data-review-pane]') === null)).toBe(true);
+    await expect(video).toBeInViewport({ ratio: 1 });
+    const transcript = (await panel.getByRole('region', { name: 'Transcript' }).boundingBox())!;
+    expect(transcript.height).toBeGreaterThan(300);
+    await video.evaluate((el: HTMLMediaElement) => el.pause());
+  });
+
   test('the R1 session plays through the R1 player, never the legacy one, and a click lands on the turn', async ({ app, page }, testInfo) => {
     await app.goto(REVIEW);
     const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await panel.getByRole('button', { name: /^Session/ }).click();
+    await panel.getByRole('button', { name: /^Screening/ }).click();
     await expect(panel.getByRole('option', { name: /R1 role-play/ })).toHaveCount(2);
-    await panel.getByRole('option', { name: /R1 role-play · 10m 0s/ }).click();
+    await panel.getByRole('option', { name: ATTEMPT_1_OPTION }).click();
 
     // The R1 player, not the legacy "Recording loads on request" row.
     const load = panel.getByRole('button', { name: 'Load recording, R1 role-play' });
@@ -158,7 +180,7 @@ test.describe('Review tab (admin): click a transcript turn to seek', () => {
   test('the highlight follows the playhead: a row lights at its own start, on frames while playing', async ({ app, page }) => {
     await app.goto(REVIEW);
     const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await pickSession(panel, /R1 role-play · 10m 0s/);
+    await pickSession(panel, ATTEMPT_1_OPTION);
     await panel.getByRole('button', { name: 'Load recording, R1 role-play' }).click();
     const video = panel.locator('video');
     await expect.poll(() => duration(video)).toBeGreaterThan(R1_REC_LENGTH_SEC - 5);
@@ -249,7 +271,7 @@ test.describe('the link expires, or was bad to begin with', () => {
   test('a double-click on an aged link: one more mint, the row stays lit through the reload, and playback lands on it', async ({ app, page }) => {
     await app.goto(REVIEW);
     const panel = page.getByRole('tabpanel', { name: 'Review' });
-    await pickSession(panel, /R1 role-play · 10m 0s/);
+    await pickSession(panel, ATTEMPT_1_OPTION);
     await panel.getByRole('button', { name: 'Load recording, R1 role-play' }).click();
     const video = panel.locator('video');
     await expect.poll(() => duration(video)).toBeGreaterThan(R1_REC_LENGTH_SEC - 5);

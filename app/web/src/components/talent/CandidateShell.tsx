@@ -86,6 +86,8 @@ export interface CandidateHeaderProps {
   aside?: ReactNode;
   /** Rule under the header — used by the standalone scoped shell. */
   divided?: boolean;
+  /** One line for the name, the email and the facts: the Review tab needs the height for its panes. */
+  compact?: boolean;
 }
 
 /**
@@ -101,6 +103,7 @@ export function CandidateHeader({
   actions,
   aside,
   divided = false,
+  compact = false,
 }: CandidateHeaderProps) {
   return (
     <div
@@ -119,13 +122,18 @@ export function CandidateHeader({
             description cut mid-word ("…through screen…") was one of the
             review's tells; `break-words` keeps a long unbroken name inside
             the column at 390px instead. */}
-        <h1 className="break-words text-title text-[var(--c-ink)]">{title}</h1>
+        <h1 className={cx('break-words text-title text-[var(--c-ink)]', compact && 'inline')}>{title}</h1>
         {description && (
-          <p className="mt-1 max-w-[70ch] text-pretty break-words text-sm text-[var(--c-ink-secondary)]">
+          <p
+            className={cx(
+              'max-w-[70ch] text-pretty break-words text-[var(--c-ink-secondary)]',
+              compact ? 'ml-3 inline text-label' : 'mt-1 text-sm',
+            )}
+          >
             {description}
           </p>
         )}
-        {meta && <div className="mt-3">{meta}</div>}
+        {meta && <div className={compact ? 'ml-3 inline-block' : 'mt-3'}>{meta}</div>}
       </div>
       {aside ? (
         <div className="flex shrink-0 flex-col gap-2 sm:items-end sm:pt-1">

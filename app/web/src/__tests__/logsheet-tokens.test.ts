@@ -520,12 +520,15 @@ describe('type', () => {
 
   it('allows Plex Mono only where a position in a recording is printed', () => {
     const users = sourceFiles().filter((rel) => /\bfont-mono\b/.test(stripJsComments(read(rel))));
-    expect(users).toEqual([
+    expect(users.sort()).toEqual([
       'src/components/r1-review/OverviewPanel.tsx',
       'src/components/r1-review/PlayerControls.tsx',
       'src/components/r1-review/ReviewNotes.tsx',
       'src/components/r1-review/ReviewTranscript.tsx',
       'src/components/recording/CallStrip.tsx',
+      'src/components/recording/ReviewCallStrip.tsx',
+      'src/components/talent/ReviewScorecard.tsx',
+      'src/components/talent/ReviewTape.tsx',
       'src/components/talent/SeekableTranscript.tsx',
     ]);
   });

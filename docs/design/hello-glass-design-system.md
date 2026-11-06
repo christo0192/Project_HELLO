@@ -98,7 +98,7 @@ Status is never carried by colour alone: every status has a word, and a fault ha
 Self-hosted from `@fontsource-variable/ibm-plex-sans` and `@fontsource/ibm-plex-mono` (SIL OFL 1.1), imported once in `src/main.tsx`. The Sans is the width-axis build (`wdth.css`: weight 100-700, width 75-100). The CSP is `font-src 'self'`, so no CDN: Vite emits each subset as a hashed same-origin woff2, and a browser downloads only the subsets a page renders.
 
 - **Form labels** are 12px at `font-stretch: 87.5%` (`.form-label`), like the condensed labels printed on a form. `Field`, `Th` and the `MetricStrip` labels use it.
-- **Plex Mono** is for timecodes, turn numbers and evidence numbers only: positions in a recording. Durations, scores and ids stay in Plex Sans. `SeekableTranscript`, the call strip and the R1 review page print it today, and the design gate holds that list.
+- **Plex Mono** is for timecodes, turn numbers and evidence numbers only: positions in a recording. Durations, scores and ids stay in Plex Sans. `SeekableTranscript`, both call strips (`CallStrip` on the R1 review page, `ReviewCallStrip` on the phone Review tab), the phone tape, the Review scorecard and the R1 review page print it today, and the design gate holds that list.
 
 ### Figures
 
