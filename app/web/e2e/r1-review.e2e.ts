@@ -10,7 +10,7 @@
 import path from 'node:path';
 import type { Locator, Page } from '@playwright/test';
 import { ARTIFACTS_DIR, auditA11y } from './fixtures/axe';
-import { R1_CANDIDATE_ID, R1_ROUND_ID, R1_REVIEW_CUT_TURN, R1_REVIEW_SEEK_SEC } from './fixtures/data';
+import { ADMIN_USER_ID, R1_CANDIDATE_ID, R1_ROUND_ID, R1_REVIEW_CUT_TURN, R1_REVIEW_SEEK_SEC, R1_SESSION_ATTEMPT_1, R1_SESSION_ATTEMPT_2 } from './fixtures/data';
 import { expect, test, type AppHarness } from './fixtures/harness';
 import { horizontalOverflow } from './fixtures/layout';
 
@@ -34,7 +34,7 @@ test.describe('a look at each tab', () => {
     test(`${tab} reads, fits and passes axe`, async ({ app, page }, testInfo) => {
       await app.goto(`${ADDRESS}?tab=${tab}`);
       await expect(page.getByRole('heading', { level: 1 })).toContainText('Sales Program Advisor role-play, Naveen Kapoor');
-      await expect(page.getByRole('tab', { selected: true })).toHaveText(new RegExp(tab, 'i'));
+      await expect(page.getByRole('tablist', { name: 'R1 review sections' }).getByRole('tab', { selected: true })).toHaveText(new RegExp(tab, 'i'));
       await noSideways(app);
       await look(page, tab, testInfo.project.name);
       await auditA11y(page, testInfo, `r1-review-${tab}`, { strict: true });
@@ -296,6 +296,214 @@ test.describe('moving between the scorecard and the recording', () => {
     await expect(page.getByText('3 of 27 turns')).toBeVisible();
     await page.getByRole('button', { name: 'Candidate only' }).click();
     await expect(page.getByText('1 of 27 turns')).toBeVisible();
+  });
+});
+
+test.describe('notes at a moment', () => {
+  const COLLEAGUE_ID = '9c0d1111-0000-4000-8000-000000000000';
+  const stored = (app: AppHarness, over: Partial<AppHarness['db']['notes'][number]>) =>
+    app.db.notes.push({
+      id: `0000000${app.db.notes.length}-0000-4000-8000-000000000000`, candidate_id: R1_CANDIDATE_ID, author_id: ADMIN_USER_ID, note: 'Asked the right follow-up here.',
+      created_at: '2026-11-05T09:30:00.000Z', round_id: R1_ROUND_ID, session_id: R1_SESSION_ATTEMPT_1, media_ms: R1_REVIEW_SEEK_SEC * 1000, ...over,
+    });
+  const notes = (page: Page) => page.getByRole('region', { name: 'Notes', exact: true });
+  const openNotes = (page: Page) => page.getByRole('tab', { name: 'Notes' }).click();
+  const posts = (app: AppHarness) => app.calls.filter((c) => c.method === 'POST' && new URL(c.url).pathname === '/api/notes');
+
+  test('notes pinned close together leave the strip on the first screen', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'the first-screen rule is for the 1440x900 layout');
+    // Seconds apart, so every flag would want a lane of its own: this is how a reviewer pins them. The
+    // fixture's quotes already fill the three lanes of Moments, so this is the strip at its tallest.
+    for (let index = 0; index < 8; index += 1) stored(app, { media_ms: 60_000 + index * 5000, note: `Close note ${index}.` });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await expect(page.locator('[data-note-flag]')).toHaveCount(8);
+    const strip = page.locator('[data-call-strip]');
+    expect(await page.locator('[data-moment-row="Moments"]').evaluate((row) => row.getBoundingClientRect().height)).toBe(60);
+    expect(await strip.evaluate((el) => el.getBoundingClientRect().bottom)).toBeLessThanOrEqual(900);
+    await expect(strip.getByRole('button', { name: 'Hide speakers' })).toBeInViewport({ ratio: 1 });
+    await look(page, 'notes-close-together', testInfo.project.name);
+  });
+
+  test('every crowded flag is still reached by the keyboard, and comes to the front as it is', async ({ app, page }) => {
+    for (let index = 0; index < 3; index += 1) stored(app, { media_ms: 60_000 + index * 1000, note: `Close note ${index}.` });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await page.getByRole('button', { name: 'Note, 1:00' }).focus();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('button', { name: 'Note, 1:01' })).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('button', { name: 'Note, 1:02' })).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    const flag = page.getByRole('button', { name: 'Note, 1:01' });
+    const onTop = await flag.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      return el.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2));
+    });
+    expect(onTop).toBe(true);
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('position')).toHaveText('1:01');
+    await expect(page.getByRole('tab', { name: 'Notes' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  test('the tab reads, fits and passes axe', async ({ app, page }, testInfo) => {
+    stored(app, {});
+    stored(app, { author_id: COLLEAGUE_ID, media_ms: 30_000, note: 'Warm opening.\nGood rapport.' });
+    stored(app, { media_ms: null, note: 'Worth a second listen.' });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await openNotes(page);
+    await expect(notes(page).locator('[data-note-row]')).toHaveCount(3);
+    await expect(page.locator('[data-note-flag]')).toHaveCount(2);
+    await noSideways(app);
+    await look(page, 'notes', testInfo.project.name);
+    await auditA11y(page, testInfo, 'r1-review-notes', { strict: true });
+
+    await notes(page).getByRole('button', { name: /^Add note at/ }).click();
+    await look(page, 'notes-writing', testInfo.project.name);
+    await auditA11y(page, testInfo, 'r1-review-notes-writing', { strict: true });
+    expect(mints(app)).toHaveLength(0);
+    app.expectHealthy();
+  });
+
+  test('a note is pinned to the playhead, gets its flag, and its timecode brings the reader back', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording&t=${R1_REVIEW_SEEK_SEC}`);
+    await openNotes(page);
+    await notes(page).getByRole('button', { name: 'Add note at 1:10' }).click();
+    await expect(notes(page).getByRole('textbox', { name: 'Note at 1:10' })).toBeFocused();
+    await page.keyboard.type('Good question, kept it short.');
+    await notes(page).getByRole('button', { name: 'Save note' }).click();
+
+    await expect(notes(page).locator('[data-note-row]')).toHaveCount(1);
+    await expect(notes(page).getByRole('button', { name: /^Add note at/ })).toBeFocused();
+    await expect(page.getByRole('button', { name: 'Note, 1:10' })).toBeVisible();
+    await expect(notes(page).locator('[data-note-row]')).toContainText('You');
+    expect(posts(app)).toHaveLength(1);
+    expect(app.db.notes.at(-1)).toMatchObject({ round_id: R1_ROUND_ID, session_id: R1_SESSION_ATTEMPT_1, media_ms: R1_REVIEW_SEEK_SEC * 1000 });
+
+    await page.getByRole('button', { name: 'Back 15 seconds' }).click();
+    await expect(page.getByTestId('position')).toHaveText('0:55');
+    await expect(notes(page).getByRole('button', { name: 'Add note at 0:55' })).toBeVisible();
+    await notes(page).getByRole('button', { name: /^Go to 1:10/ }).click();
+    await expect(page.getByTestId('position')).toHaveText('1:10');
+    expect(mints(app)).toHaveLength(0);
+  });
+
+  test('the words stay selectable, and only the timecode seeks', async ({ app, page }) => {
+    stored(app, { note: 'Selectable words.' });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await openNotes(page);
+    const words = notes(page).getByText('Selectable words.');
+    expect(await words.evaluate((el) => getComputedStyle(el).userSelect)).not.toBe('none');
+    expect(await words.evaluate((el) => el.closest('button'))).toBeNull();
+  });
+
+  test('a press on a flag seeks and opens the note, in view inside its panel', async ({ app, page }) => {
+    for (let index = 0; index < 14; index += 1) stored(app, { media_ms: 20_000 + index * 1000, note: `Earlier note ${index}.` });
+    stored(app, { note: 'The one pressed.' });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await expect(page.getByRole('tab', { name: 'Transcript' })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('button', { name: 'Note, 1:10' }).click();
+    await expect(page.getByRole('tab', { name: 'Notes' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('position')).toHaveText('1:10');
+    await expect(page.locator(`[data-turn-row="3"]`)).toHaveAttribute('aria-current', 'true');
+    const inPanel = await notes(page).getByText('The one pressed.').evaluate((words) => {
+      const box = words.closest('[role="region"]')!.getBoundingClientRect();
+      const row = words.getBoundingClientRect();
+      return row.top >= box.top && row.bottom <= box.bottom;
+    });
+    expect(inPanel).toBe(true);
+  });
+
+  test('a flag on a quote\'s own second stays pressable: notes have their own row on the strip', async ({ app, page }) => {
+    stored(app, { media_ms: 318_000, note: 'Right on the quote.' });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await page.getByRole('button', { name: 'Note, 5:18' }).click();
+    await expect(page.getByRole('tab', { name: 'Notes' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('position')).toHaveText('5:18');
+  });
+
+  test('a quote pressed with Notes left open shows its turn beside the video', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await openNotes(page);
+    await page.getByRole('tab', { name: 'Overview' }).click();
+    await page.getByRole('button', { name: /What made you start looking at this now/ }).click();
+    await expect(page.getByRole('tab', { name: 'Transcript' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('[data-turn-row="9"]')).toBeVisible();
+    await expect(page.locator('[data-turn-row="9"]')).toHaveAttribute('aria-current', 'true');
+  });
+
+  test('an unsaved note waits on its attempt while the reader looks at another', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording&t=${R1_REVIEW_SEEK_SEC}`);
+    await openNotes(page);
+    await notes(page).getByRole('button', { name: 'Add note at 1:10' }).click();
+    await page.keyboard.type('Half a thought.');
+    const attempts = page.getByRole('group', { name: 'Attempt', exact: true });
+    await attempts.getByRole('button', { name: /^Attempt 2/ }).click();
+    await expect(notes(page).getByRole('textbox')).toHaveCount(0);
+    await attempts.getByRole('button', { name: /^Attempt 1/ }).click();
+    await expect(notes(page).getByRole('textbox', { name: 'Note at 1:10' })).toHaveValue('Half a thought.');
+    expect(posts(app)).toHaveLength(0);
+  });
+
+  test('the arrow keys move the tabs and leave the recording where it is', async ({ app, page }) => {
+    await app.goto(`${ADDRESS}?tab=recording&t=${R1_REVIEW_SEEK_SEC}`);
+    await page.getByRole('tab', { name: 'Transcript' }).focus();
+    await page.keyboard.press('ArrowRight');
+    await expect(page.getByRole('tab', { name: 'Notes' })).toBeFocused();
+    await expect(page.getByRole('tab', { name: 'Notes' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('position')).toHaveText('1:10');
+  });
+
+  test('each attempt has its own notes and flags', async ({ app, page }) => {
+    stored(app, { note: 'On the first attempt.' });
+    stored(app, { note: 'On the retake.', session_id: R1_SESSION_ATTEMPT_2, media_ms: 5000 });
+    await app.goto(`${ADDRESS}?tab=recording&attempt=2`);
+    await openNotes(page);
+    await expect(notes(page).getByText('On the retake.')).toBeVisible();
+    await expect(notes(page).getByText('On the first attempt.')).toHaveCount(0);
+    await expect(page.locator('[data-note-flag]')).toHaveCount(1);
+  });
+
+  test('a long unbroken note wraps, and the page never scrolls sideways', async ({ app, page }) => {
+    stored(app, { note: 'x'.repeat(2000) });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await openNotes(page);
+    await expect(notes(page).locator('[data-note-row]')).toHaveCount(1);
+    await noSideways(app);
+    const inside = await notes(page).locator('[data-note-row]').evaluate((row) => row.getBoundingClientRect().right <= row.closest('[role="region"]')!.getBoundingClientRect().right);
+    expect(inside).toBe(true);
+  });
+
+  test('a flag survives forced colours, as the other marks do', async ({ app, page }) => {
+    stored(app, {});
+    await page.emulateMedia({ forcedColors: 'active' });
+    await app.goto(`${ADDRESS}?tab=recording`);
+    const canvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    const fill = await page.locator('[data-note-flag] [data-mark]').first().evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(fill).not.toBe(canvas);
+    expect(fill).not.toBe('rgba(0, 0, 0, 0)');
+  });
+
+  test('a viewer reads the notes, and is offered nothing to write', async ({ app, page }) => {
+    app.db.me.role = 'viewer';
+    stored(app, {});
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await openNotes(page);
+    await expect(notes(page).locator('[data-note-row]')).toHaveCount(1);
+    await expect(notes(page).getByRole('button', { name: /^Add note/ })).toHaveCount(0);
+  });
+
+  test('with no recording a note still reads, and a new one carries no time', async ({ app, page }) => {
+    const { review } = app.db.r1;
+    app.db.r1.review = { ...review, attempts: [{ ...review.attempts[0], recording: { state: 'none' } }] };
+    stored(app, {});
+    await app.goto(`${ADDRESS}?tab=recording`);
+    await openNotes(page);
+    await expect(notes(page).locator('[data-note-row]')).toContainText('1:10');
+    await expect(notes(page).getByRole('button', { name: /^Go to/ })).toHaveCount(0);
+    await notes(page).getByRole('button', { name: 'Add note', exact: true }).click();
+    await notes(page).getByRole('textbox').fill('Heard about this from the candidate.');
+    await notes(page).getByRole('button', { name: 'Save note' }).click();
+    await expect(notes(page).locator('[data-note-row]')).toHaveCount(2);
+    expect(app.db.notes.at(-1)).toMatchObject({ round_id: R1_ROUND_ID, session_id: R1_SESSION_ATTEMPT_1, media_ms: null });
   });
 });
 

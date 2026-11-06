@@ -320,6 +320,7 @@ const TURNS_READ_FAILED = {
 const UUID_1 = '00000000-0000-4000-8000-000000000001';
 const UUID_2 = '00000000-0000-4000-8000-000000000002';
 const UUID_3 = '00000000-0000-4000-8000-000000000003';
+const UUID_4 = '00000000-0000-4000-8000-000000000004';
 const ROOM_NAME = `screening-${UUID_1}`;
 const T_2026 = '2026-01-01T00:00:00.000Z';
 const GRANT_TOKEN = 'a'.repeat(64);
@@ -757,7 +758,9 @@ describe('OpenAPI document integrity', () => {
     // for a person who returns on the new company domain as a new login). 171 + 1 = 172.
     // The R1 review page adds ONE staff path: GET /api/interview-rounds/{id}/review (inline bodies,
     // no new schema). 172 + 1 = 173.
-    expect(Object.keys(paths).length).toBe(173);
+    // Notes tied to a moment add ONE staff path: GET /api/notes/rounds/{roundId} (NoteListResponse,
+    // no new schema). 173 + 1 = 174.
+    expect(Object.keys(paths).length).toBe(174);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1386,6 +1389,7 @@ describe('auth boundary vs spec security model', () => {
       ['get', '/api/admin/members', undefined],
       ['post', '/api/admin/maintenance', {}],
       ['get', '/api/notes', undefined],
+      ['get', '/api/notes/rounds/' + UUID_1, undefined],
       ['get', '/api/notifications', undefined],
       ['get', '/api/export/' + UUID_1 + '/csv', undefined],
       ['post', '/api/export/' + UUID_1 + '/report-audit', {}],
@@ -2352,6 +2356,45 @@ describe('live handler shapes match documented schemas', () => {
       .send({ candidate_id: UUID_2, note: 'notes' });
     expect(res.status).toBe(201);
     expect(validateResponseBody(res.body, 'NoteResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/notes keeps the moment on a note, and allows a note with none', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2, owner_id: null }),
+      recruiter_notes: ok([
+        { id: UUID_3, candidate_id: UUID_2, author_id: 'u-admin-1', note: 'at a moment', created_at: T_2026, round_id: UUID_1, session_id: UUID_4, media_ms: 462000 },
+        { id: UUID_4, candidate_id: UUID_2, author_id: 'u-admin-1', note: 'on the candidate', created_at: T_2026, round_id: null, session_id: null, media_ms: null },
+      ]),
+    });
+    const res = await request(createContractApp()).get(`/api/notes?candidate_id=${UUID_2}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'NoteListResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/notes with a moment → 201 NoteResponse', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2, owner_id: null }),
+      interview_rounds: ok({ id: UUID_1 }),
+      interview_round_attempts: ok({ session_id: UUID_4 }),
+      recruiter_notes: ok({ id: UUID_3, candidate_id: UUID_2, author_id: 'u-admin-1', note: 'notes', created_at: T_2026, round_id: UUID_1, session_id: UUID_4, media_ms: 0 }),
+    });
+    const res = await request(createContractApp())
+      .post('/api/notes')
+      .set('Authorization', AUTH_HEADER)
+      .send({ candidate_id: UUID_2, note: 'notes', round_id: UUID_1, session_id: UUID_4, media_ms: 0 });
+    expect(res.status).toBe(201);
+    expect(validateResponseBody(res.body, 'NoteResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/notes/rounds/{roundId} → NoteListResponse', async () => {
+    configureTables({
+      interview_rounds: ok({ id: UUID_1, candidate_id: UUID_2 }),
+      candidates: ok({ id: UUID_2, owner_id: null }),
+      recruiter_notes: ok([{ id: UUID_3, candidate_id: UUID_2, author_id: 'u-admin-1', note: 'at a moment', created_at: T_2026, round_id: UUID_1, session_id: UUID_4, media_ms: 462000 }]),
+    });
+    const res = await request(createContractApp()).get(`/api/notes/rounds/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'NoteListResponse', spec)).toEqual([]);
   });
 
   it('POST /api/notes/{candidateId}/status → StatusTransitionResponse', async () => {

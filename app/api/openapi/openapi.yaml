@@ -5034,12 +5034,12 @@ paths:
       tags: [ashby]
       operationId: listAshbyScopedReviewNotes
       summary: Read-only recruiter notes for the linked candidate
-      description: Read-only, bounded list of the linked candidate's append-only recruiter notes. Same server-side link resolution, role and ownership rules as the review payload; the scoped experience never adds a note.
+      description: 'Read-only list of the linked candidate''s append-only recruiter notes, oldest first and read to its end: a list past the page bound fails rather than answer part of it. Same server-side link resolution, role and ownership rules as the review payload; the scoped experience never adds a note.'
       security:
         - bearerAuth: []
       responses:
         '200':
-          description: Bounded note list, oldest first.
+          description: Every note on the linked candidate, oldest first.
           content:
             application/json:
               schema:
@@ -7088,13 +7088,14 @@ paths:
         - name: limit
           in: query
           required: false
+          description: Answer only the newest this many notes. Left out, every note is answered.
           schema:
             type: integer
             minimum: 1
             maximum: 100
       responses:
         '200':
-          description: Bounded note list.
+          description: 'Every note on the candidate, oldest first and read to its end: a list past the page bound fails rather than answer part of it. With limit, the newest that many, oldest of them first.'
           content:
             application/json:
               schema:
@@ -7109,6 +7110,7 @@ paths:
       tags: [notes]
       operationId: createNote
       summary: Append a bounded note (interviewer+/admin, ownership).
+      description: 'A note can name a moment (0137): round_id, session_id (needs round_id) and media_ms (needs session_id), milliseconds into that attempt''s recording. The attempt must be one of the round''s and the round the candidate''s, or the answer is 400 invalid_note_anchor, the same for a round that does not exist. Notes are human words: they reach no AI.'
       requestBody:
         required: true
         content:
@@ -7123,13 +7125,52 @@ paths:
               schema:
                 $ref: '#/components/schemas/NoteResponse'
         '400':
-          description: Bounded body rejected.
+          description: 'Bounded body rejected, or the round or attempt named is not this candidate''s (invalid_note_anchor).'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
           description: Non-owner denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/notes/rounds/{roundId}:
+    get:
+      tags: [notes]
+      operationId: listRoundNotes
+      summary: Every note on one R1 round, oldest first (viewer read-only, ownership-scoped).
+      description: 'The rule of GET /api/notes: admin and viewer any candidate, an interviewer only a candidate they own. A missing round answers an interviewer the same 403 as someone else''s. The list is read to its end, never truncated: a list past the page bound fails. A note on the candidate alone is not here: GET /api/notes with no limit answers every note. Cache-Control: no-store.'
+      parameters:
+        - name: roundId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The round's notes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteListResponse'
+        '400':
+          description: Malformed round id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Not allowed to read this candidate's notes, or an interviewer asking for a round that does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: No such round (round_not_found), to someone who sees every candidate.
           content:
             application/json:
               schema:
@@ -12780,6 +12821,18 @@ components:
         created_at:
           type: string
           format: date-time
+        round_id:
+          type: string
+          format: uuid
+          nullable: true
+        session_id:
+          type: string
+          format: uuid
+          nullable: true
+        media_ms:
+          type: integer
+          minimum: 0
+          nullable: true
       additionalProperties: false
 
     NoteListResponse:
@@ -12803,6 +12856,16 @@ components:
           type: string
           minLength: 1
           maxLength: 2000
+        round_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        media_ms:
+          type: integer
+          minimum: 0
+          maximum: 86400000
       additionalProperties: false
 
     NoteStatusUpdateRequest:

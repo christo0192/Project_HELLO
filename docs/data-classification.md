@@ -325,6 +325,8 @@ to describe implemented schema only.
 | `roles.interview_kind` | Internal | Selects an interview type such as `sales_r1` |
 | `call_sessions.interview_round_id` | Public | Opaque R1 round FK |
 | `transcript_turns.phase`, `transcript_turns.interrupted` | Internal | R1 phase/evidence administration metadata |
+| `recruiter_notes.round_id`, `recruiter_notes.session_id` | Public | 0137. Opaque ids: the round and attempt a note is about. No foreign key (see the migration) |
+| `recruiter_notes.media_ms` | Internal | 0137. Milliseconds into the attempt's recording: a position, no candidate speech |
 
 ### R1 scorer output (0122)
 

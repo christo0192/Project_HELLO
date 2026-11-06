@@ -99,4 +99,23 @@ describe('R1 api client', () => {
     request.mockResolvedValue({ rounds: [{ id: 'r' }] });
     await expect(api.listR1Rounds('c')).resolves.toEqual({ rounds: [{ id: 'r' }] });
   });
+
+  it('reads one round\'s notes, encoding the id', async () => {
+    await api.listRoundNotes('round 1/../x');
+    expect(request).toHaveBeenCalledWith('/api/notes/rounds/round%201%2F..%2Fx');
+  });
+
+  it('sends a note with its moment', async () => {
+    await api.addNote('c-1', 'Good recovery.', { round_id: 'r-1', session_id: 's-1', media_ms: 462000 });
+    const [path, init] = request.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe('/api/notes');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({ candidate_id: 'c-1', note: 'Good recovery.', round_id: 'r-1', session_id: 's-1', media_ms: 462000 });
+  });
+
+  it('sends a candidate note as it always did', async () => {
+    await api.addNote('c-1', 'Follow up.');
+    const [, init] = request.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ candidate_id: 'c-1', note: 'Follow up.' });
+  });
 });

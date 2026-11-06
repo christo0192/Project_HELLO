@@ -365,8 +365,12 @@ const ROUTES: Array<[string, string, Handler]> = [
 
   // ── Notes, status transitions, notifications, export, appeals ──────
   ['GET', '/api/notes', ({ query }, db) => ok({ notes: db.notes.filter((n) => n.candidate_id === query.get('candidate_id')) })],
+  ['GET', '/api/notes/rounds/:id', ({ params }, db) => ok({ notes: db.notes.filter((n) => n.round_id === params.id) })],
   ['POST', '/api/notes', ({ body }, db) => {
-    const note: Note = { id: mintId(), candidate_id: String(body?.candidate_id ?? ''), author_id: ADMIN_USER_ID, note: String(body?.note ?? ''), created_at: nowIso() };
+    const note: Note = {
+      id: mintId(), candidate_id: String(body?.candidate_id ?? ''), author_id: ADMIN_USER_ID, note: String(body?.note ?? ''), created_at: nowIso(),
+      round_id: (body?.round_id as string | undefined) ?? null, session_id: (body?.session_id as string | undefined) ?? null, media_ms: (body?.media_ms as number | undefined) ?? null,
+    };
     db.notes.push(note);
     return created(note);
   }],

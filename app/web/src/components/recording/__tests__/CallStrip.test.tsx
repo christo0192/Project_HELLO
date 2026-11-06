@@ -93,6 +93,111 @@ describe('what it draws', () => {
   });
 });
 
+describe('a reviewer\'s note', () => {
+  const noted = { moments: [{ key: 'nabc', sec: 150, kind: 'note' as const, label: 'Note, 2:30' }] };
+
+  it('is a button with a name, at its place on the scale', () => {
+    strip(noted);
+    const flag = screen.getByRole('button', { name: 'Note, 2:30' });
+    expect(flag.style.left).toBe('25%');
+    expect(flag).toHaveAttribute('title', 'Note, 2:30');
+  });
+
+  it('says its key when pressed', () => {
+    const { props } = strip(noted);
+    fireEvent.click(screen.getByRole('button', { name: 'Note, 2:30' }));
+    expect(props.onMoment).toHaveBeenCalledWith('nabc');
+  });
+
+  it('is drawn apart from a quote and a logged moment, so a mark means one thing', () => {
+    const { container } = strip({
+      moments: [
+        { key: 'q1', sec: 60, kind: 'evidence', number: 1, label: 'Evidence 1, Objection handling, 1:00' },
+        { key: 'e1', sec: 300, kind: 'event', label: 'Need 1 revealed, 5:00' },
+        { key: 'n1', sec: 450, kind: 'note', label: 'Note, 7:30' },
+      ],
+    });
+    expect(container.querySelectorAll('[data-note-flag]')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Note, 7:30' }).querySelector('[data-note-flag]')).not.toBeNull();
+    expect(screen.getByRole('button', { name: /^Need 1/ }).querySelector('[data-note-flag]')).toBeNull();
+  });
+
+  it('keeps its own row inside a dense cluster, so no box can cover it', () => {
+    // 25 minutes on the strip: these four are under 2 px apart, and quotes alone fill the lanes.
+    const { container, props } = strip({
+      durationSec: 1500,
+      moments: [
+        { key: 'q1', sec: 125, kind: 'evidence', number: 1, label: 'Evidence 1, Objection handling, 2:05' },
+        { key: 'q2', sec: 126, kind: 'evidence', number: 2, label: 'Evidence 2, Objection handling, 2:06' },
+        { key: 'n1', sec: 128, kind: 'note', label: 'Note, 2:08' },
+        { key: 'q3', sec: 130, kind: 'evidence', number: 3, label: 'Evidence 3, Objection handling, 2:10' },
+      ],
+    });
+    const flag = screen.getByRole('button', { name: 'Note, 2:08' });
+    const row = flag.parentElement as HTMLElement;
+    expect(row).toHaveAttribute('data-moment-row', 'Notes');
+    expect(within(row).getAllByRole('button')).toEqual([flag]);
+    expect(container.querySelectorAll('[data-moment-row="Moments"] button')).toHaveLength(3);
+    fireEvent.click(flag);
+    expect(props.onMoment).toHaveBeenCalledWith('n1');
+  });
+
+  it('adds no Notes row to a strip with no notes, and no Moments row to one with only notes', () => {
+    const { container, unmount } = strip();
+    expect(container.querySelector('[data-moment-row="Notes"]')).toBeNull();
+    expect(screen.queryByText('Notes')).toBeNull();
+    unmount();
+    const only = strip(noted);
+    expect(only.container.querySelector('[data-moment-row="Moments"]')).toBeNull();
+    expect(screen.getByText('Notes')).toBeInTheDocument();
+  });
+
+  describe('close together', () => {
+    const close = {
+      durationSec: 1500,
+      moments: [121, 120, 122, 123].map((sec) => ({ key: `n${sec}`, sec, kind: 'note' as const, label: `Note, ${sec}` })),
+    };
+
+    it('stays one lane high, so notes never push the strip off the first screen', () => {
+      const { container } = strip(close);
+      const tops = [...container.querySelectorAll<HTMLElement>('[data-moment-row="Notes"] button')].map((flag) => flag.style.top);
+      expect(new Set(tops).size).toBe(1);
+      expect((container.querySelector('[data-moment-row="Notes"]') as HTMLElement).style.height).toBe('20px');
+    });
+
+    it('keeps every flag a button of its own, in time order, for the keyboard', () => {
+      const { container, props } = strip(close);
+      const flags = [...container.querySelectorAll<HTMLElement>('[data-moment-row="Notes"] button')];
+      expect(flags.map((flag) => flag.getAttribute('aria-label'))).toEqual(['Note, 120', 'Note, 121', 'Note, 122', 'Note, 123']);
+      fireEvent.click(flags[0]);
+      expect(props.onMoment).toHaveBeenCalledWith('n120');
+    });
+
+    it('still stacks the moments, which have lanes to spare', () => {
+      const { container } = strip({
+        durationSec: 1500,
+        moments: [
+          { key: 'q1', sec: 120, kind: 'evidence', number: 1, label: 'Evidence 1, Objection handling, 2:00' },
+          { key: 'q2', sec: 121, kind: 'evidence', number: 2, label: 'Evidence 2, Objection handling, 2:01' },
+        ],
+      });
+      expect((container.querySelector('[data-moment-row="Moments"]') as HTMLElement).style.height).toBe('40px');
+    });
+  });
+
+  it('survives forced colours: a flag is fills, so each carries the mark', () => {
+    const { container } = strip(noted);
+    const flag = container.querySelector('[data-note-flag]') as HTMLElement;
+    expect(flag.querySelectorAll('[data-mark]').length).toBeGreaterThan(0);
+  });
+
+  it('uses no colour of its own: orange is the candidate\'s, and the wash is for quotes', () => {
+    const { container } = strip(noted);
+    const flag = container.querySelector('[data-note-flag]') as HTMLElement;
+    expect(flag.outerHTML).not.toMatch(/voice|wash|danger/);
+  });
+});
+
 describe('hiding the speakers', () => {
   it('collapses the speaker rows and keeps the ribbon and the moments', () => {
     const { container } = strip();

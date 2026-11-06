@@ -65,6 +65,7 @@ The `--c-*` names in `src/styles/candidate-palette.css` map the same way and hol
 | Highlighter wash (`--wash`) | Words cited as evidence | Never the only marker |
 | Dashed pencil outline | Not firm: Provisional, Insufficient evidence, a week still filling in | |
 | 1px diagonal hatch | The consent gate | |
+| Small ink flag | A reviewer's note on the call strip | Human words, never labelled AI |
 | Crimson (`--danger`) | Faults on our side, plus Halt all calling (filled) | |
 | Ink fill | The one primary action on a screen, plus pressed or selected states | |
 

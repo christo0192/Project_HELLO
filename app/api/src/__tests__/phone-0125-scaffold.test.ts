@@ -78,9 +78,10 @@ describe(`${N} registration`, () => {
     // aside like R1 ones: they redeclare only phone_max_daily_dials() (phone-0132-daily-cap.test.ts).
     // 0133_dexity_access_domain.sql (company domain switch) redefines only the dashboard
     // access-allowlist RPCs — no phone body — so, like the R1 lane, it is exempt by exact name.
+    // 0137_recruiter_notes_moment.sql (R1 notes at a moment) only adds columns to recruiter_notes — no phone body — so it is exempt by exact name too.
     const after = files.slice(files.indexOf(base) + 1);
-    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$/.test(f))).toBe(true);
-    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$/.test(f));
+    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$/.test(f))).toBe(true);
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$/.test(f));
     expect(nonR1[nonR1.length - 2]).toBe(base);
     expect(nonR1[nonR1.length - 1]).toMatch(/^0130_ashby_phone_parsing_intake\.sql$/);
   });
