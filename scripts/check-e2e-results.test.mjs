@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import {
   countTestsBySpec,
   evaluateE2eReport,
+  mergeE2eReports,
   REQUIRED_E2E_COVERAGE,
 } from './check-e2e-results.mjs';
 
@@ -174,6 +175,62 @@ check('the required coverage names both specs on both projects', () => {
   );
 });
 
+// ── The projects run as parallel jobs, so the gate reads one report per project ─────────────
+
+const onProject = (project) => [suite(APP, tests(APP, project, 49)), suite(R1, tests(R1, project, 25))];
+const desktopReport = (overrides) => report(onProject('desktop'), overrides);
+const mobileReport = (overrides) => report(onProject('mobile'), overrides);
+
+check('two project reports merge into one run that passes the coverage gate', () => {
+  const merged = mergeE2eReports([desktopReport(), mobileReport()]);
+  assert.equal(withCoverage(merged).ok, true);
+  assert.equal(merged.stats.expected, 24);
+  assert.deepEqual(countTestsBySpec(merged).get(`${R1} [mobile]`), { passed: 25, total: 25 });
+});
+
+check('one project alone does not pass, so a project that never reported is caught', () => {
+  const verdict = withCoverage(mergeE2eReports([desktopReport()]));
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.errors.join('\n'), /candidate-r1\.e2e\.ts \[mobile\]/);
+});
+
+check('a failure, a flaky test or a runner error in either report fails the merged run', () => {
+  assert.equal(withCoverage(mergeE2eReports([desktopReport(), mobileReport({ unexpected: 1 })])).ok, false);
+  assert.equal(withCoverage(mergeE2eReports([desktopReport({ flaky: 1 }), mobileReport()])).ok, false);
+  const crashed = { ...mobileReport(), errors: [{ message: 'worker crashed' }] };
+  assert.equal(withCoverage(mergeE2eReports([desktopReport(), crashed])).ok, false);
+});
+
+check('a malformed report fails the merged run closed', () => {
+  for (const bad of [null, undefined, 'ok', {}, { stats: null }, stats({ expected: '12' }), stats({ unexpected: -1 })]) {
+    assert.equal(withCoverage(mergeE2eReports([desktopReport(), bad])).ok, false, JSON.stringify(bad));
+  }
+});
+
+check('the CLI reads several reports, and a missing one is red', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'e2e-gate-'));
+  const first = path.join(dir, 'desktop.json');
+  const second = path.join(dir, 'mobile.json');
+  try {
+    const gate = path.join(HERE, 'check-e2e-results.mjs');
+    const run = (...args) => spawnSync(process.execPath, [gate, ...args], { encoding: 'utf8' });
+    writeFileSync(first, JSON.stringify(desktopReport()));
+    writeFileSync(second, JSON.stringify(mobileReport()));
+    assert.equal(run(first, second).status, 0);
+    assert.equal(run(first, second, '24').status, 0);
+    assert.equal(run(first, second, '25').status, 1);
+    assert.equal(run(first).status, 1, 'one project alone must not pass');
+    assert.equal(run(first, path.join(dir, 'absent.json')).status, 1);
+    writeFileSync(second, JSON.stringify(mobileReport({ unexpected: 1 })));
+    assert.equal(run(first, second).status, 1);
+  } finally {
+    // Remove exactly what this check created: two files, then the empty directory.
+    unlinkSync(first);
+    unlinkSync(second);
+    rmdirSync(dir);
+  }
+});
+
 check('the CLI exits non-zero for a failing report and zero for a clean one', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'e2e-gate-'));
   try {
@@ -223,6 +280,27 @@ check('the web-e2e workflow pins every action by commit SHA', () => {
 check('the web-e2e workflow is least-privilege and bounded', () => {
   assert.match(workflow, /^permissions:\s*\n\s+contents: read/m);
   assert.match(workflow, /timeout-minutes: \d+/);
+  assert.equal(workflow.match(/timeout-minutes: \d+/g).length, 2, 'both jobs must be bounded');
+});
+
+check('both projects run, each one finishes, and each one reports', () => {
+  assert.match(workflow, /project: \[desktop, mobile\]/);
+  assert.match(workflow, /fail-fast: false/);
+  assert.match(workflow, /npm run e2e -- --project=\$\{\{ matrix\.project \}\}/);
+  assert.match(workflow, /name: web-e2e-artifacts-\$\{\{ matrix\.project \}\}/);
+  // `.artifacts` is hidden: without this the upload finds nothing and only warns.
+  assert.match(workflow, /path: app\/web\/e2e\/\.artifacts\n\s+include-hidden-files: true/);
+});
+
+check('the web-e2e job is the verdict, reads both reports and runs even after a failure', () => {
+  const verdictJob = workflow.slice(workflow.indexOf('\n  web-e2e:'));
+  assert.ok(verdictJob.length > 1, 'no web-e2e job');
+  assert.match(verdictJob, /name: web-e2e\n/);
+  assert.match(verdictJob, /needs: e2e-project/);
+  assert.match(verdictJob, /^ {4}if: always\(\)/m);
+  assert.match(verdictJob, /node scripts\/check-e2e-results\.test\.mjs/);
+  assert.match(verdictJob, /test "\$PROJECTS_RESULT" = success/);
+  assert.match(verdictJob, /PROJECTS_RESULT: \$\{\{ needs\.e2e-project\.result \}\}/);
 });
 
 const playwrightConfig = await readFile(path.join(HERE, '..', 'app', 'web', 'e2e', 'playwright.config.ts'), 'utf8');
@@ -235,9 +313,12 @@ check('the browser gets a fake camera and microphone, with permissions, from the
   assert.match(playwrightConfig, /forbidOnly: Boolean\(process\.env\.CI\)/);
 });
 
-check('the gate reads the report the config writes', () => {
+check('the gate reads the report the config writes, from both projects', () => {
   assert.match(playwrightConfig, /outputFile: path\.join\(ARTIFACTS, 'results\.json'\)/);
-  assert.match(workflow, /check-e2e-results\.mjs app\/web\/e2e\/\.artifacts\/results\.json/);
+  assert.match(workflow, /path: e2e-reports\n/);
+  for (const project of ['desktop', 'mobile']) {
+    assert.match(workflow, new RegExp(`e2e-reports/web-e2e-artifacts-${project}/results\\.json`));
+  }
 });
 
 check('every spec and project the gate requires exists in the config, and `npm run e2e` collects it', () => {

@@ -16,7 +16,7 @@ name: Web E2E
 #     test is green only if it passed on its first attempt;
 #   - this workflow has no `continue-on-error`, no `|| true` and no failure
 #     threshold;
-#   - scripts/check-e2e-results.mjs re-reads the JSON report and fails on any
+#   - scripts/check-e2e-results.mjs re-reads the JSON reports and fails on any
 #     failed or flaky test and on a run that executed nothing, so an empty or
 #     partial run cannot read as a pass. It also requires passing tests from
 #     BOTH app.e2e.ts and candidate-r1.e2e.ts on BOTH projects (desktop and
@@ -24,6 +24,12 @@ name: Web E2E
 #     project, a changed testMatch, a grep) turns the job red instead of leaving
 #     the recruiter tests to carry a green gate with no R1 coverage.
 # The workflow's own policy is pinned by scripts/check-e2e-results.test.mjs.
+#
+# The two projects run as parallel jobs, because the suite is the slowest check on
+# a web pull request. Each uploads its report, and the `web-e2e` job reads both
+# through the one gate, so the rule above still sees both projects together: a
+# project that never reported leaves its report missing, and the gate goes red.
+# `.artifacts` is a hidden folder, which upload-artifact leaves out unless told.
 #
 # Every action SHA is pinned (no @vN tags), like deploy-fly.yml and the Phase 12
 # workflow. The job name `web-e2e` is deliberately NOT added to the required
@@ -51,10 +57,15 @@ permissions:
   contents: read
 
 jobs:
-  web-e2e:
-    name: web-e2e
+  e2e-project:
+    name: web-e2e (${{ matrix.project }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      # Both projects always finish, so one failure does not hide the other's.
+      fail-fast: false
+      matrix:
+        project: [desktop, mobile]
     env:
       CI: 'true'
     steps:
@@ -66,8 +77,6 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: app/web/package-lock.json
-      - name: Self-test the zero-tolerance gate and this workflow's policy
-        run: node scripts/check-e2e-results.test.mjs
       - name: Install web dependencies
         working-directory: app/web
         run: npm ci
@@ -79,17 +88,48 @@ jobs:
       - name: Install Chromium for Playwright
         working-directory: app/web
         run: npx --no-install playwright install --with-deps chromium
-      - name: Run the offline e2e suite (desktop and mobile projects)
+      - name: Run the offline e2e suite (${{ matrix.project }} project)
         working-directory: app/web
-        run: npm run e2e
-      - name: Zero-tolerance gate over the report
-        if: always()
-        run: node scripts/check-e2e-results.mjs app/web/e2e/.artifacts/results.json
+        run: npm run e2e -- --project=${{ matrix.project }}
       - name: Upload the report, traces and axe records
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: web-e2e-artifacts
+          name: web-e2e-artifacts-${{ matrix.project }}
           path: app/web/e2e/.artifacts
+          include-hidden-files: true
           retention-days: 14
           if-no-files-found: warn
+
+  web-e2e:
+    name: web-e2e
+    needs: e2e-project
+    # Also after a failed project: this job is the verdict, and it must go red.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Self-test the zero-tolerance gate and this workflow's policy
+        run: node scripts/check-e2e-results.test.mjs
+      - name: Download both projects' reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: web-e2e-artifacts-*
+          path: e2e-reports
+      - name: Zero-tolerance gate over both reports
+        if: always()
+        run: >-
+          node scripts/check-e2e-results.mjs
+          e2e-reports/web-e2e-artifacts-desktop/results.json
+          e2e-reports/web-e2e-artifacts-mobile/results.json
+      - name: Both project jobs must have passed
+        if: always()
+        env:
+          PROJECTS_RESULT: ${{ needs.e2e-project.result }}
+        run: test "$PROJECTS_RESULT" = success
