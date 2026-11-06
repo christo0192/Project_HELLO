@@ -134,6 +134,28 @@ test.describe('the header', () => {
     await noSideways(app, testInfo.project.name);
     app.expectHealthy();
   });
+
+  test('on Phone screening the header is compact: the score steps aside and the R1 result stays, among the facts', async ({ app, page }, testInfo) => {
+    Object.assign(app.db.r1.rounds[0], { recommendation: 'hold', overall: 58 });
+    const read = app.db.candidateDetail;
+    const phone = {
+      ...read(R1_CANDIDATE_ID)!.sessions[0],
+      id: '33333333-3333-4333-8333-333333333399',
+      mode: 'live' as const,
+      interview_round_id: null,
+    };
+    app.db.sessionDetails[phone.id] = { session: phone, transcript: [], assessment: null };
+    app.db.candidateDetail = (id) => {
+      const found = read(id);
+      return found && { ...found, sessions: [phone, ...found.sessions] };
+    };
+    await app.goto(`${CANDIDATE}?tab=phone`);
+    await expect(page.getByRole('tabpanel', { name: 'Phone screening' }).locator('[data-log-header]')).toBeVisible();
+    await expect(page.getByText('R1 role-play: Borderline 58 (AI)')).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Latest screening score' })).toHaveCount(0);
+    await noSideways(app, testInfo.project.name);
+    app.expectHealthy();
+  });
 });
 
 test.describe('the Phone screening tab', () => {
