@@ -6,8 +6,8 @@
  * It opens on To review, oldest first. The API decides what each view holds and who sees which round
  * (`GET /api/interview-rounds`), so the rows and the total are only ever what this person may read.
  *
- * The search stays out of the address: it is a candidate's name, and a name does not go in a URL, in a
- * browser's history or in a link passed along. Leaving the page drops it.
+ * The search goes in no URL: it is a candidate's name, so it stays out of the address, a browser's history
+ * and a link passed along, and it reaches the API in the body of a POST. Leaving the page drops it.
  *
  * A read that changes what is shown clears the rows first: a list under the wrong tab reads as true.
  * Each block keeps its size while it loads, and nothing rises in.

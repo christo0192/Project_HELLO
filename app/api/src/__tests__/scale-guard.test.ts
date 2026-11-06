@@ -527,13 +527,60 @@ describe.each(SIZES)('a workspace of %i candidates', { timeout: TEST_TIMEOUT_MS 
       expectNoSilentLimit();
     });
 
-    it('finds a candidate past the row cap by name, without reading the workspace', async () => {
-      const last = rounds.toReview.at(-1)!;
-      const res = await get(`/api/interview-rounds?q=${encodeURIComponent(`Candidate ${Number(last.slice(-12))}`)}`, admin);
-      expect(res.status).toBe(200);
-      expect((res.body.rounds as Row[]).map((row) => row.id)).toEqual([last]);
-      expect(engine.queries.filter((q) => q.table === 'interview_rounds').every((q) => q.returned <= 25)).toBe(true);
-      expectNoSilentLimit();
+    describe('searched by name, which goes in a body and in no URL', () => {
+      const search = (q: string, query: string, user: AuthUser) => request(appFor(user))
+        .post(`/api/interview-rounds/search${query}`)
+        .set('Authorization', `Bearer ${JWT}`)
+        .timeout(REQUEST_TIMEOUT_MS)
+        .send({ q });
+
+      it('finds the last round its read of the view reaches, past the row cap', async () => {
+        // Newest first, so the oldest round is the last row of the last page.
+        const res = await search('Candidate 0', '?view=all', admin);
+        expect(res.status).toBe(200);
+        expect(res.body.total).toBe(1);
+        expect((res.body.rounds as Row[]).map((row) => row.id)).toEqual([rounds.all[0]]);
+        expect(engine.queries.filter((q) => q.table === 'interview_rounds').length).toBe(Math.floor(rounds.all.length / POSTGREST_MAX_ROWS) + 1);
+        expectNoSilentLimit();
+      });
+
+      it('as interviewer: counts and pages exactly the rounds they own', async () => {
+        const want = ownedOnly(rounds.toReview);
+        const first = await search('Candidate', `?page_size=${PAGE}`, interviewer);
+        expect(first.body.total).toBe(want.length);
+        expect((first.body.rounds as Row[]).map((row) => row.id)).toEqual(want.slice(0, PAGE));
+        const second = await search('Candidate', `?page_size=${PAGE}&page=2`, interviewer);
+        expect((second.body.rounds as Row[]).map((row) => row.id)).toEqual(want.slice(PAGE, PAGE * 2));
+        expectNoSilentLimit();
+      });
+
+      it('as viewer: reads through the real app, whose guard refuses any other POST', async () => {
+        const viewer: AuthUser = { ...admin, appRole: 'viewer' };
+        expect((await search('Candidate 0', '?view=all', viewer)).status).toBe(200);
+        const write = await request(appFor(viewer)).post(`/api/interview-rounds/${rounds.all[0]}/cancel`).set('Authorization', `Bearer ${JWT}`).send({});
+        expect(write.status).toBe(403);
+      });
+
+      it('counts a round once when another is sent between two reads of the view', async () => {
+        let sent = false;
+        engine.beforeExecute = (q) => {
+          if (sent || q.table !== 'interview_rounds' || q.range?.[0] !== POSTGREST_MAX_ROWS) return;
+          sent = true;
+          const table = engine.tables.interview_rounds;
+          table.push({ ...table[0], id: scaleIds.round(999_999), created_at: '2099-01-01T00:00:00.000Z' });
+        };
+        const res = await search('Candidate', '?view=all', admin);
+        expect(sent, 'the read went past one page').toBe(true);
+        expect(res.body.total).toBe(rounds.all.length);
+        expectNoSilentLimit();
+      });
+
+      it('fails, never a partial search, when a later read of the view fails', async () => {
+        engine.failWhen = (q) => q.table === 'interview_rounds' && q.range?.[0] === POSTGREST_MAX_ROWS;
+        const res = await search('Candidate', '?view=all', admin);
+        expect(res.status).toBe(503);
+        expect(res.body).toEqual({ error: 'service_unavailable' });
+      });
     });
 
     it('costs the same few reads for any page, never one per round', async () => {

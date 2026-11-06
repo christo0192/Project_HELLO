@@ -155,7 +155,7 @@ test.describe('the queue', () => {
     app.expectHealthy();
   });
 
-  test('the search asks the API and leaves the address alone', async ({ app, page }) => {
+  test('the search asks the API with the name in no URL, the address or a request', async ({ app, page }) => {
     await app.goto('/interviews');
     await expect(page.getByRole('link', { name: 'Naveen Kapoor' })).toBeVisible();
     await page.getByRole('searchbox', { name: 'Find a candidate by name' }).fill('diego');
@@ -164,6 +164,8 @@ test.describe('the queue', () => {
     expect(page.url()).not.toContain('diego');
     await page.getByRole('searchbox', { name: 'Find a candidate by name' }).fill('nobody at all');
     await expect(page.getByText('No interview in this view matches that name.')).toBeVisible();
+    expect(app.calls.filter((c) => c.method === 'POST' && /\/api\/interview-rounds\/search/.test(c.url)).length).toBeGreaterThan(0);
+    expect(app.calls.map((c) => c.url).filter((url) => /diego|nobody/i.test(decodeURIComponent(url)))).toEqual([]);
     app.expectHealthy();
   });
 

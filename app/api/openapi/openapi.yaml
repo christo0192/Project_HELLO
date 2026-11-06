@@ -73,13 +73,6 @@ paths:
             type: string
             enum: [to-review, in-progress, reviewed, all]
             default: to-review
-        - name: q
-          in: query
-          required: false
-          description: Part of the candidate's name, in any case, at most 100 characters. A blank search is no search.
-          schema:
-            type: string
-            maxLength: 100
         - name: page
           in: query
           required: false
@@ -110,7 +103,66 @@ paths:
             enum: [include]
       responses:
         '200': { description: 'One page: view, sort, page, page_size, total, r1_deployed and rounds, each with candidate_name, status, attempts_allowed, attempts_counted, the AI recommendation and overall, status_write, pending_reject_until, scores_withheld, is_staff_dry_run, created_at and attempts, each with in_progress, session_status, started_at, ended_at, consent_withdrawn and its recording summary.' }
-        '400': { description: A query parameter is not one this route takes (invalid_query). }
+        '400': { description: 'A query parameter is not one this route takes (invalid_query), including q: a name goes in no URL, so a search is POST /api/interview-rounds/search.' }
+        '403': { description: The caller's account is inactive (access_denied). }
+        '503': { description: 'A read failed (service_unavailable): never a partial page.' }
+  /api/interview-rounds/search:
+    post:
+      tags: [r1]
+      operationId: searchR1Queue
+      summary: The R1 queue searched by candidate name (viewer+; reads only, so a viewer may call it)
+      description: 'The same read and the same answer as GET /api/interview-rounds, with the same rules and the same query parameters. The search is a candidate''s name, so it comes in the body and goes in no URL, neither this route''s nor PostgREST''s: the view is read through the same filters, and the name is matched in the API. A search therefore reads every round of its view, and answers 503 rather than miss a name past 50,000 rounds.'
+      parameters:
+        - name: view
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [to-review, in-progress, reviewed, all]
+            default: to-review
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 25
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [oldest, newest]
+        - name: dry_runs
+          in: query
+          required: false
+          description: include also lists staff dry runs, marked is_staff_dry_run.
+          schema:
+            type: string
+            enum: [include]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [q]
+              properties:
+                q:
+                  type: string
+                  maxLength: 100
+                  description: Part of the candidate's name, in any case. A blank search is no search.
+      responses:
+        '200': { description: 'One page, as GET /api/interview-rounds answers it. total counts what the search found.' }
+        '400': { description: 'q is missing, not a string or too long, or a query parameter is not one this route takes (invalid_query).' }
         '403': { description: The caller's account is inactive (access_denied). }
         '503': { description: 'A read failed (service_unavailable): never a partial page.' }
   /api/interview-rounds/{id}/cancel:

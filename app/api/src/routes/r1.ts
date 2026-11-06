@@ -88,11 +88,11 @@ r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (r
  * The R1 queue, one server page at a time (lib/r1/queue.ts). Viewer and above, by the rule of the R1
  * video. `r1_deployed` is here because the sidebar hides the item on a server that does not run R1,
  * and a viewer cannot read availability. A list read, so unaudited like the candidates list; opening a
- * review is what is recorded. The search text goes nowhere but the query.
+ * review is what is recorded.
  */
-r1Router.get('/interview-rounds', requireRole('viewer'), async (req, res, next) => { try {
+const answerR1Queue = async (req: Request, res: Response, next: NextFunction, searchText?: unknown) => { try {
   res.setHeader('Cache-Control', 'no-store');
-  const query = parseR1QueueQuery(req.query);
+  const query = parseR1QueueQuery(req.query, searchText);
   if (!query) return res.status(400).json({ error: 'invalid_query' });
   const actor = req.authUser!;
   const result = await readR1Queue(supabase as never, { id: actor.id, appRole: actor.appRole, active: actor.active }, query);
@@ -102,7 +102,15 @@ r1Router.get('/interview-rounds', requireRole('viewer'), async (req, res, next) 
   }
   if (result.kind === 'unavailable') return res.status(503).json({ error: 'service_unavailable' });
   res.json({ ...result.body, r1_deployed: getR1Config().enabled });
-} catch (e) { next(e); } });
+} catch (e) { next(e); } };
+
+r1Router.get('/interview-rounds', requireRole('viewer'), (req, res, next) => answerR1Queue(req, res, next));
+
+/**
+ * The same read, searched by name. The text is a candidate's name, so it comes in this body and goes in no
+ * URL, here or to PostgREST. It writes nothing, so a viewer may call it (`viewerReadOnly`).
+ */
+r1Router.post('/interview-rounds/search', requireRole('viewer'), (req, res, next) => answerR1Queue(req, res, next, req.body?.q ?? null));
 
 /**
  * One round as a reviewer sees it (lib/r1/review.ts). Viewer and above, by the rule of the R1 video,

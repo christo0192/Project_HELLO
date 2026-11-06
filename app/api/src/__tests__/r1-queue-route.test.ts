@@ -1,20 +1,23 @@
 /**
- * GET /api/interview-rounds: the R1 queue, one server page at a time.
+ * GET /api/interview-rounds and POST /api/interview-rounds/search: the R1 queue, one server page at a time.
  *
  * What this pins is what the queue must never get wrong: who sees which round (the candidate-access
  * rule, so an interviewer only ever pages through their own), which view a round sits in, what an
- * appeal withholds and that a view cannot give it away, what a withdrawn consent says, and that a
- * failed read fails the page rather than dropping rows. Scale is driven in scale-guard.test.ts.
+ * appeal withholds and that a view cannot give it away, what a withdrawn consent says, that a failed
+ * read fails the page rather than dropping rows, and that a search puts a candidate's name in no URL.
+ * Scale is driven in scale-guard.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import request from 'supertest';
+import { createClient } from '@supabase/supabase-js';
 
 vi.mock('../lib/supabase.js', async () => {
   const { scaleDb } = await import('./support/scale-db.js');
   return { supabase: scaleDb.client, RESUME_BUCKET: 'resumes_v2' };
 });
 
+import { viewerReadOnly } from '../lib/rbac.js';
 import { parseR1QueueQuery, readR1Queue } from '../lib/r1/queue.js';
 import { r1Router } from '../routes/r1.js';
 import { scaleDb as engine, type Row } from './support/scale-db.js';
@@ -60,18 +63,25 @@ function addAttempt(i: number, start = 0, over: Row = {}, session: Row = {}, rec
   });
 }
 
-function appFor(role: 'admin' | 'interviewer' | 'viewer', id = OWNER, active = true) {
+type Role = 'admin' | 'interviewer' | 'viewer';
+
+function appFor(role: Role, id = OWNER, active = true, guards: express.RequestHandler[] = []) {
   const app = express();
   app.use((req: Request, _res: Response, next: NextFunction) => {
     (req as unknown as { authUser: unknown }).authUser = { id, appRole: role, active };
     next();
   });
+  app.use(...guards, express.json());
   app.use('/api', r1Router);
   return app;
 }
 
-const list = (query = '', role: 'admin' | 'interviewer' | 'viewer' = 'admin', id = OWNER, active = true) =>
+const list = (query = '', role: Role = 'admin', id = OWNER, active = true) =>
   request(appFor(role, id, active)).get(`/api/interview-rounds${query}`);
+
+/** A search: the text in the body, the rest as the list takes it. */
+const find = (q: unknown, query = '', role: Role = 'admin', id = OWNER) =>
+  request(appFor(role, id)).post(`/api/interview-rounds/search${query}`).send({ q });
 
 const rowIds = (body: { rounds: Row[] }): unknown[] => body.rounds.map((round) => round.id);
 
@@ -253,8 +263,10 @@ describe('who sees what', () => {
   });
 
   it('a search cannot reach past that rule, and the count says nothing about what it found elsewhere', async () => {
-    const res = await list('?q=Candidate%201', 'interviewer', OWNER);
-    expect(res.body).toMatchObject({ rounds: [], total: 0 });
+    expect((await find('Candidate 1', '', 'interviewer', OWNER)).body).toMatchObject({ rounds: [], total: 0 });
+    const own = await find('Candidate', '', 'interviewer', OWNER);
+    expect(rowIds(own.body)).toEqual([roundId(0)]);
+    expect(own.body.total).toBe(1);
   });
 
   it('refuses an inactive user', async () => {
@@ -273,20 +285,130 @@ describe('the search', () => {
   });
 
   it('finds a part of the name, in any case, across the view', async () => {
-    expect(rowIds((await list('?q=ava')).body)).toEqual([roundId(0)]);
-    expect((await list('?q=EXAMPLE')).body.total).toBe(3);
+    expect(rowIds((await find('ava')).body)).toEqual([roundId(0)]);
+    expect((await find('EXAMPLE')).body.total).toBe(3);
   });
 
   it('reads a wildcard as the character it is', async () => {
-    expect(rowIds((await list('?q=100%25')).body)).toEqual([roundId(1)]);
-    expect((await list('?q=_ela')).body.total).toBe(0);
-    expect((await list('?q=a%25e')).body.total).toBe(0);
-    expect((await list('?q=b*a')).body.total).toBe(0);
+    expect(rowIds((await find('100%')).body)).toEqual([roundId(1)]);
+    expect((await find('_ela')).body.total).toBe(0);
+    expect((await find('a%e')).body.total).toBe(0);
+    expect((await find('b*a')).body.total).toBe(0);
   });
 
-  it('treats a blank search as no search, and refuses an over-long one', async () => {
-    expect((await list('?q=%20%20')).body.total).toBe(4);
-    expect((await list(`?q=${'x'.repeat(101)}`)).status).toBe(400);
+  it('treats a blank search as no search', async () => {
+    expect((await find('  ')).body.total).toBe(4);
+  });
+
+  it.each([[null], [7], [['ava']], [{ name: 'ava' }], ['x'.repeat(101)]])('refuses %j as a search', async (q) => {
+    const res = await find(q);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'invalid_query' });
+    expect(engine.queries).toEqual([]);
+  });
+
+  it('refuses a search with no text at all', async () => {
+    const res = await request(appFor('admin')).post('/api/interview-rounds/search').send({});
+    expect(res.status).toBe(400);
+    expect(engine.queries).toEqual([]);
+  });
+
+  it('refuses a name in a URL, rather than answer the whole list as what was found', async () => {
+    for (const res of [await list('?q=ava'), await find('ava', '?q=ava')]) {
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'invalid_query' });
+    }
+    expect(engine.queries).toEqual([]);
+  });
+
+  it('sorts and pages what it found, and answers the last page for a stale one', async () => {
+    const first = await find('example', '?page_size=2&sort=newest');
+    expect(first.body).toMatchObject({ page: 1, page_size: 2, total: 3, sort: 'newest' });
+    expect(rowIds(first.body)).toEqual([roundId(2), roundId(1)]);
+    expect(rowIds((await find('example', '?page_size=2&sort=newest&page=2')).body)).toEqual([roundId(0)]);
+    const stale = await find('example', '?page_size=2&sort=newest&page=9');
+    expect(stale.body).toMatchObject({ page: 2, total: 3 });
+    expect(rowIds(stale.body)).toEqual([roundId(0)]);
+    expect((await find('example', '?sort=score')).status).toBe(400);
+  });
+
+  it('holds only what its view holds: no dry run unless asked for, nothing a view would give away', async () => {
+    addRound(4, { status: 'invited', status_write: null }, { name: 'Dee Sample' });
+    addRound(5, { status_write: 'advanced' }, { name: 'Dee Sample' });
+    addRound(6, { consent_locale: 'en-IN-x-staff' }, { name: 'Dee Sample' });
+    addRound(7, { recommendation: 'reject', overall: 31 }, { name: 'Dee Sample', decision_use_blocked_at: '2026-11-03T00:00:00Z' });
+    expect((await find('dee')).body.total).toBe(0);
+    expect(rowIds((await find('dee', '?view=in-progress')).body)).toEqual([roundId(4)]);
+    expect(rowIds((await find('dee', '?view=reviewed')).body)).toEqual([roundId(5)]);
+    const all = await find('dee', '?view=all');
+    expect(rowIds(all.body)).toEqual([roundId(7), roundId(5), roundId(4)]);
+    expect(all.body.rounds[0]).toMatchObject({ recommendation: null, overall: null, scores_withheld: true });
+    expect((await find('dee', '?view=all&dry_runs=include')).body.total).toBe(4);
+  });
+
+  it('answers each row as the list does, uncached, with the sidebar\'s flag', async () => {
+    addAttempt(0);
+    const res = await find('ava');
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.body.r1_deployed).toBe(true);
+    expect(res.body.rounds[0]).toEqual((await list()).body.rounds.find((round: Row) => round.id === roundId(0)));
+    expect(res.body.rounds[0].attempts).toHaveLength(1);
+  });
+
+  it.each(['interview_rounds', 'interview_round_attempts'])('answers 503, never what it had so far, when %s fails', async (table) => {
+    addAttempt(0);
+    engine.failWhen = (q) => q.table === table;
+    const res = await find('ava');
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ error: 'service_unavailable' });
+  });
+
+  it('puts the name in no URL, on a real supabase-js client', async () => {
+    const urls: string[] = [];
+    const client = createClient('https://project.invalid', 'test-key', {
+      auth: { persistSession: false, autoRefreshToken: false },
+      global: {
+        fetch: async (input: RequestInfo | URL) => {
+          const url = input instanceof Request ? input.url : String(input);
+          urls.push(url);
+          const found = url.includes('/rest/v1/interview_rounds?')
+            ? [{ id: roundId(0), candidate_id: candidateId(0), status: 'completed', created_at: sentAt(0), candidates: { name: 'Zoya Testcase', decision_use_blocked_at: null } }]
+            : [];
+          return new Response(JSON.stringify(found), { status: 200, headers: { 'content-type': 'application/json' } });
+        },
+      },
+    });
+    const query = parseR1QueueQuery({ view: 'all' }, 'Zoya Testcase')!;
+    const result = await readR1Queue(client as never, { id: OWNER, appRole: 'admin', active: true }, query);
+    expect(result).toMatchObject({ kind: 'ok', body: { total: 1 } });
+    expect(urls.filter((url) => url.includes('/rest/v1/interview_rounds?'))).toHaveLength(1);
+    expect(urls.length).toBeGreaterThan(1);
+    expect(urls.filter((url) => /zoya|testcase/i.test(decodeURIComponent(url)))).toEqual([]);
+  });
+
+  describe('for a viewer, behind the read-only guard', () => {
+    const guarded = () => appFor('viewer', OTHER, true, [viewerReadOnly]);
+
+    it('is allowed, because it only reads', async () => {
+      const res = await request(guarded()).post('/api/interview-rounds/search?view=all').send({ q: 'ava' });
+      expect(res.status).toBe(200);
+      expect(rowIds(res.body)).toEqual([roundId(0)]);
+    });
+
+    it.each([
+      '/api/interview-rounds',
+      '/api/interview-rounds/search/',
+      '/api/interview-rounds/search/more',
+      '/api/INTERVIEW-ROUNDS/search',
+      `/api/interview-rounds/${roundId(0)}/search`,
+      `/api/interview-rounds/${roundId(0)}/cancel`,
+    ])('opens no other POST: %s', async (path) => {
+      expect((await request(guarded()).post(path).send({ q: 'ava' })).status).toBe(403);
+    });
+
+    it.each(['put', 'patch', 'delete'] as const)('opens no other verb on the path: %s', async (verb) => {
+      expect((await request(guarded())[verb]('/api/interview-rounds/search').send({ q: 'ava' })).status).toBe(403);
+    });
   });
 });
 
@@ -337,12 +459,12 @@ describe('paging', () => {
   });
 
   it('answers an empty first page for a page past the end of nothing', async () => {
-    const res = await list('?page=4&q=nobody');
+    const res = await find('nobody', '?page=4');
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ page: 1, total: 0, rounds: [] });
   });
 
-  it.each(['?page=0', '?page=-1', '?page=1.5', '?page=x', '?view=nope', '?sort=score', '?page_size=0', '?dry_runs=yes', '?view=all&view=to-review', '?q=a&q=b'])(
+  it.each(['?page=0', '?page=-1', '?page=1.5', '?page=x', '?view=nope', '?sort=score', '?page_size=0', '?dry_runs=yes', '?view=all&view=to-review', '?q=a', '?q=a&q=b'])(
     'refuses %s',
     async (query) => {
       const res = await list(query);

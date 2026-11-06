@@ -42,11 +42,21 @@ describe('R1 api client', () => {
     expect(request).toHaveBeenCalledWith('/api/candidates/cand%201%2F..%2Fx/interview-rounds');
   });
 
-  it('reads the queue with only what was asked for, the search as a query value', async () => {
+  it('reads the queue with only what was asked for', async () => {
     await api.listR1Queue();
     expect(request).toHaveBeenLastCalledWith('/api/interview-rounds');
+    await api.listR1Queue({ view: 'all', sort: 'newest', page: 2, pageSize: 1, includeDryRuns: true });
+    expect(request).toHaveBeenLastCalledWith('/api/interview-rounds?view=all&sort=newest&page=2&page_size=1&dry_runs=include');
+  });
+
+  it('searches the queue with the name in a POST body, and in no URL', async () => {
     await api.listR1Queue({ view: 'all', sort: 'newest', page: 2, pageSize: 1, search: 'Ava & Co', includeDryRuns: true });
-    expect(request).toHaveBeenLastCalledWith('/api/interview-rounds?view=all&sort=newest&page=2&page_size=1&q=Ava+%26+Co&dry_runs=include');
+    expect(request).toHaveBeenLastCalledWith('/api/interview-rounds/search?view=all&sort=newest&page=2&page_size=1&dry_runs=include', {
+      method: 'POST',
+      body: JSON.stringify({ q: 'Ava & Co' }),
+    });
+    await api.listR1Queue({ search: 'Ava' });
+    expect(request).toHaveBeenLastCalledWith('/api/interview-rounds/search', { method: 'POST', body: JSON.stringify({ q: 'Ava' }) });
   });
 
   it('sends no empty search', async () => {

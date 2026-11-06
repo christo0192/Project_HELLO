@@ -44,6 +44,13 @@
  * STAFF DRY RUNS (`consent_locale`, 0120) promise no decision use, so they are hidden unless asked for.
  * The candidate's R1 tab still lists them.
  *
+ * THE SEARCH is a candidate's name, and a name does not go in a URL: not this route's, which a browser and
+ * anything logging requests can keep, and not PostgREST's, where a filter is part of the query string and
+ * the response echoes it (`id-batches.ts`). So the text comes in the body of a POST
+ * (`POST /api/interview-rounds/search`), the GET refuses a `q`, and no filter carries it: the view is read
+ * through the same SQL filters, in page order, and the name is matched here. Who sees what and what each
+ * view holds stay in SQL, so a search can only ever find what the same person could page to.
+ *
  * ORDER. By the date the link was sent, then by id, so a page boundary is stable. `interview_rounds`
  * stores no finish time. The link lasts 72 hours, so sent order is close to finished order, and it does
  * not move when a round is touched, which `updated_at` would.
@@ -51,7 +58,9 @@
  * SCALE. One counted `.range()` page of rounds, filtered in SQL through the `candidates!inner` join (the
  * idiom of `phone-runtime/read.ts`). Everything else is read for that page only: at most four id-batched
  * reads, however long the list grows, with no read per round. A failed read fails the page, because a
- * row with no attempts would say "no recording" about something that exists.
+ * row with no attempts would say "no recording" about something that exists. A search is the exception:
+ * it reads every round of its view, one read per 1000, because its match cannot be a filter. It fails
+ * rather than miss a name past `SEARCH_MAX_PAGES`.
  */
 
 import { chunkIds, mapChunks, readAllPages, type PageResult } from '../id-batches.js';
@@ -74,6 +83,9 @@ export const R1_QUEUE_MAX_SEARCH = 100;
 
 /** A runaway bound on one id batch. A round has at most three starts, so one page always ends it. */
 const MAX_PAGES = 2;
+
+/** A search reads its whole view, up to here: 50,000 rounds. */
+const SEARCH_MAX_PAGES = 50;
 
 /** The writes that settle a round: the candidate's status changed, or HR overrode the rejection (0122). */
 const SETTLED_WRITES = ['advanced', 'rejected', 'pending_reject_cancelled'] as const;
@@ -167,8 +179,12 @@ function positiveInt(value: unknown, fallback: number): number | null {
   return typeof value === 'string' && /^[1-9]\d{0,5}$/.test(value) ? Number(value) : null;
 }
 
-/** The query string, or null when any part of it is not one this route takes. */
-export function parseR1QueueQuery(query: Record<string, unknown>): R1QueueQuery | null {
+/**
+ * The query string, and the search text from a POST's body, or null when any part of it is not one this
+ * route takes. A `q` in the query string is refused, not ignored: a name would already be in the URL, and
+ * the unfiltered page answered would read as what was found.
+ */
+export function parseR1QueueQuery(query: Record<string, unknown>, searchText: unknown = ''): R1QueueQuery | null {
   const view = query.view === undefined ? 'to-review' : query.view;
   if (!R1_QUEUE_VIEWS.includes(view as R1QueueView)) return null;
   // "To review, oldest first": whoever has waited longest. Every other view reads newest first.
@@ -177,49 +193,40 @@ export function parseR1QueueQuery(query: Record<string, unknown>): R1QueueQuery 
   const page = positiveInt(query.page, 1);
   const pageSize = positiveInt(query.page_size, R1_QUEUE_PAGE_SIZE);
   if (page === null || pageSize === null || pageSize > R1_QUEUE_MAX_PAGE_SIZE) return null;
-  const q = query.q === undefined ? '' : query.q;
-  if (typeof q !== 'string' || q.length > R1_QUEUE_MAX_SEARCH) return null;
+  if (query.q !== undefined) return null;
+  if (typeof searchText !== 'string' || searchText.length > R1_QUEUE_MAX_SEARCH) return null;
   if (query.dry_runs !== undefined && query.dry_runs !== 'include') return null;
   return {
     view: view as R1QueueView,
     sort: sort as R1QueueSort,
     page,
     pageSize,
-    search: q.trim(),
+    search: searchText.trim(),
     includeDryRuns: query.dry_runs === 'include',
   };
 }
 
-/**
- * The search as an `ilike` pattern: the typed text, anywhere in the name. LIKE's own wildcards are
- * escaped, and `*` goes because PostgREST reads it as `%`. Null when nothing is left to search for.
- */
-function namePattern(search: string): string | null {
-  const literal = search.replace(/\*/g, '').trim();
-  return literal === '' ? null : `%${literal.replace(/[\\%_]/g, '\\$&')}%`;
-}
-
-/** The rounds this person may see in this view: a page of them, or only how many there are. */
+/** The rounds this person may see in this view: a page of them, all of them, or only how many there are. */
 function roundsRead(db: R1DbClient, actor: R1StaffActor, query: R1QueueQuery, nowMs: number) {
   const nowIso = new Date(nowMs).toISOString();
-  const filtered = (columns: string, options: { count: 'exact'; head?: boolean }) => {
+  const filtered = (columns: string, options?: { count: 'exact'; head?: boolean }) => {
     let read = db.from('interview_rounds').select(columns, options);
     if (!seesEveryCandidate(actor)) read = read.eq('candidates.owner_id', actor.id);
     if (!query.includeDryRuns) read = read.neq('consent_locale', STAFF_LOCALE);
-    const pattern = namePattern(query.search);
-    if (pattern !== null) read = read.ilike('candidates.name', pattern);
     if (query.view === 'in-progress') read = read.in('status', [...OPEN_STATUSES]).gt('expires_at', nowIso);
     if (query.view === 'to-review') read = read.or(toReviewFilter(nowIso));
     if (query.view === 'reviewed') read = read.or(reviewedFilter(nowIso)).in('status_write', [...SETTLED_WRITES]);
     if (query.view === 'to-review' || query.view === 'reviewed') read = read.is('candidates.decision_use_blocked_at', null);
     return read;
   };
+  const inPageOrder = (options?: { count: 'exact' }) => filtered(`${ROUND_COLUMNS},${CANDIDATE_EMBED}`, options)
+    .order('created_at', { ascending: query.sort === 'oldest' })
+    .order('id', { ascending: true });
   return {
     count: () => filtered(`id,${CANDIDATE_EMBED}`, { count: 'exact', head: true }),
-    page: (from: number, to: number) => filtered(`${ROUND_COLUMNS},${CANDIDATE_EMBED}`, { count: 'exact' })
-      .order('created_at', { ascending: query.sort === 'oldest' })
-      .order('id', { ascending: true })
-      .range(from, to),
+    page: (from: number, to: number) => inPageOrder({ count: 'exact' }).range(from, to),
+    // Uncounted: a view of exactly 1000 rounds ends on a read past the end, which is refused when counted.
+    scan: (from: number, to: number) => inPageOrder().range(from, to),
   };
 }
 
@@ -229,6 +236,25 @@ interface RoundsWindow {
   page: number;
 }
 
+function candidateNameOf(round: Row): string | null {
+  return isRecord(round.candidates) ? text(round.candidates.name) : null;
+}
+
+/**
+ * The page asked for out of what a search found, or its last page. Each round counts once: one sent while
+ * a newest-first read is between pages moves the rows along, and brings the last of a page round again.
+ */
+async function searchRoundsWindow(reads: ReturnType<typeof roundsRead>, query: R1QueueQuery): Promise<RoundsWindow | null> {
+  const scanned = await readAllPages<Row>(reads.scan, SEARCH_MAX_PAGES);
+  if (!scanned.ok) return null;
+  const wanted = query.search.toLowerCase();
+  const found = [...new Map(scanned.rows.map((round) => [String(round.id), round])).values()]
+    .filter((round) => candidateNameOf(round)?.toLowerCase().includes(wanted));
+  const page = Math.min(query.page, Math.max(1, Math.ceil(found.length / query.pageSize)));
+  const from = (page - 1) * query.pageSize;
+  return { rows: found.slice(from, from + query.pageSize), total: found.length, page };
+}
+
 /**
  * The page asked for, or the last page when it runs past the end: a link kept while rounds left the
  * view is not an error. PostgREST refuses a counted read past the end outright (PGRST103, 416), so the
@@ -236,6 +262,7 @@ interface RoundsWindow {
  */
 async function readRoundsWindow(db: R1DbClient, actor: R1StaffActor, query: R1QueueQuery, nowMs: number): Promise<RoundsWindow | null> {
   const reads = roundsRead(db, actor, query, nowMs);
+  if (query.search !== '') return searchRoundsWindow(reads, query);
   const readPage = (page: number) => {
     const from = (page - 1) * query.pageSize;
     return reads.page(from, from + query.pageSize - 1);
