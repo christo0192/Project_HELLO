@@ -622,6 +622,21 @@ describe('the rounds panel', () => {
       expect(item).not.toHaveTextContent('Link valid until');
     });
 
+    it('paints its tag as the Expired it reads, not as the live link it is stored as', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [
+          round({ id: 'lapsed', expires_at: LAPSED, attempts: [] }),
+          round({ id: 'stored', status: 'expired', expires_at: LAPSED, attempts: [] }),
+          round({ id: 'live', attempts: [] }),
+        ],
+      });
+      renderSection();
+      const list = await screen.findByRole('list', { name: 'R1 rounds' });
+      const [lapsed, stored] = within(list).getAllByText('Expired');
+      expect(lapsed.className).toBe(stored.className);
+      expect(lapsed.className).not.toBe(within(list).getByText('Link sent').className);
+    });
+
     it('still offers the reissue that revives it', async () => {
       api.listR1Rounds.mockResolvedValue({ rounds: [round({ expires_at: LAPSED, attempts: [] })] });
       renderSection();
