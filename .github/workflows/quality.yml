@@ -16,6 +16,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # The merge commit and its parents, so the scope step can read the diff.
+          fetch-depth: 2
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -24,6 +27,18 @@ jobs:
           cache-dependency-path: |
             app/api/package-lock.json
             app/web/package-lock.json
+      # A pull request that changes only the web app skips the voice worker tests,
+      # which are about two thirds of this job. Pushes to main always run them, and
+      # deploy-fly.yml waits on that run, so nothing reaches the voice apps untested.
+      # Each voice step below carries the guard, rather than moving to its own job,
+      # for the reason the disarm gate gives below: a skipped job reports a neutral
+      # check, and a skipped step changes no check's identity. The script fails
+      # towards running, and its test pins which steps are guarded.
+      - name: Decide whether the voice worker tests can be skipped
+        id: scope
+        run: node scripts/ci-voice-test-scope.mjs
+      - name: Validate the voice test scope
+        run: node scripts/ci-voice-test-scope.test.mjs
       - name: Validate current-state manifest
         run: node scripts/check-current-state.mjs && node scripts/check-current-state.test.mjs
       - name: Validate Phase0-2 build closure
@@ -150,6 +165,7 @@ jobs:
       - name: Compile LiveKit worker
         run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/gate_judge.py app/voice-livekit/noise_suppression.py app/voice-livekit/endpointing_phase.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/phone_stt_shadow.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_routing.py app/voice-livekit/r1_session.py app/voice-livekit/r1_commitment.py app/voice-livekit/r1_content.py app/voice-livekit/r1_end_intent.py app/voice-livekit/r1_guard.py app/voice-livekit/r1_negotiation.py app/voice-livekit/r1_personas.py app/voice-livekit/r1_prompts.py app/voice-livekit/r1_roleplay.py app/voice-livekit/r1_scheduler.py app/voice-livekit/r1_script.py app/voice-livekit/r1_text.py app/voice-livekit/r1_tracker.py app/voice-livekit/r1_world.py app/voice-livekit/r1_replies.py app/voice-livekit/r1_latency.py app/voice-livekit/r1_linecache.py app/voice-livekit/r1_tts.py app/voice-livekit/r1_sarvam.py app/voice-livekit/r1_recorder.py app/voice-livekit/r1_video_encoder.py
       - name: Test LiveKit worker
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v
       # Phone RNNoise (noise_suppression.py): the bare-python step above SKIPS
       # its DSP tests (no numpy/livekit/librnnoise), so the FIFO, frame-length
@@ -158,6 +174,7 @@ jobs:
       # plus pyrnnoise --no-deps, exactly as the Dockerfile installs them — and
       # fail if any of them skipped.
       - name: Test phone noise suppression (real DSP)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           python3 -m venv /tmp/ns-venv
           /tmp/ns-venv/bin/pip install --no-cache-dir -q -r app/voice-livekit/requirements.txt
@@ -172,6 +189,7 @@ jobs:
       # recorder (encode + decode with PyAV) in the venv the previous step built
       # from requirements.txt, and fail if any case skipped.
       - name: Test recording tail flush (real SDK)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           cd app/voice-livekit
           /tmp/ns-venv/bin/python -m unittest tests.test_recorder_flush -v > /tmp/rf-test.log 2>&1 || { cat /tmp/rf-test.log; exit 1; }
@@ -184,6 +202,7 @@ jobs:
       # says). Checked against the REAL pinned SDK in the venv the step above
       # built from requirements.txt; a skip is a failure.
       - name: Gate real-SDK contract (livekit-agents 1.6.4)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           cd app/voice-livekit
           GATE_SDK_CONTRACT_REQUIRED=1 /tmp/ns-venv/bin/python -m unittest tests.test_gate_sdk_contract -v > /tmp/sdk-contract.log 2>&1 || { cat /tmp/sdk-contract.log; exit 1; }
@@ -195,6 +214,7 @@ jobs:
       # runs, the reply-start silence gate following the live minimum). Checked
       # against the REAL pinned SDK in the same venv; a skip is a failure.
       - name: Endpointing real-SDK contract (livekit-agents 1.6.4)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           cd app/voice-livekit
           ENDPOINTING_SDK_CONTRACT_REQUIRED=1 /tmp/ns-venv/bin/python -m unittest tests.test_endpointing_sdk_contract -v > /tmp/ep-contract.log 2>&1 || { cat /tmp/ep-contract.log; exit 1; }
@@ -207,6 +227,7 @@ jobs:
       # on a real aiohttp WebSocket round trip against a LOCAL fake Sarvam server.
       # Checked against the REAL pinned SDK in the same venv; a skip is a failure.
       - name: STT shadow real-SDK contract (livekit-agents 1.6.4)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           cd app/voice-livekit
           STT_SHADOW_SDK_CONTRACT_REQUIRED=1 /tmp/ns-venv/bin/python -m unittest tests.test_stt_shadow_sdk_contract -v > /tmp/stt-shadow-contract.log 2>&1 || { cat /tmp/stt-shadow-contract.log; exit 1; }
@@ -221,6 +242,7 @@ jobs:
       # venv (requirements.txt, with the exact SDK and rtc pins asserted) and fail if any
       # of them skipped. The skip grep matches unittest's own markers, not test names.
       - name: Test R1 SDK contract (livekit-agents 1.6.4)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           python3 -m venv /tmp/r1-sdk-venv
           /tmp/r1-sdk-venv/bin/pip install --no-cache-dir -q -r app/voice-livekit/requirements.txt "livekit-agents==1.6.4" "livekit==1.1.12"
@@ -236,6 +258,7 @@ jobs:
       # would drop it silently. Run it alone on bare python and fail if any of it skipped.
       # tests/test_r1_shipping.py pins that every R1 test module is named by a guarded step.
       - name: Test R1 routing (bare python, no skips)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           cd app/voice-livekit
           python3 -m unittest tests.test_r1_routing -v > /tmp/r1-routing-test.log 2>&1 || { cat /tmp/r1-routing-test.log; exit 1; }
@@ -245,6 +268,7 @@ jobs:
       # and guard modules are pure python. Run their suites alone on bare python and fail on any
       # skip, so an import break cannot pass as a skip (tests/test_r1_shipping.py pins this).
       - name: Test R1 content (bare python, no skips)
+        if: steps.scope.outputs.voice_tests != 'skip'
         run: |
           cd app/voice-livekit
           python3 -m unittest tests.test_r1_commitment tests.test_r1_turn_timing tests.test_r1_content_pin tests.test_r1_detector_corpus tests.test_r1_guard tests.test_r1_negotiation tests.test_r1_personas tests.test_r1_prompts tests.test_r1_roleplay tests.test_r1_scheduler tests.test_r1_script tests.test_r1_text tests.test_r1_tracker tests.test_r1_world tests.test_r1_latency tests.test_r1_tts tests.test_r1_stt_ab tests.test_r1_linecache tests.test_r1_end_intent -v > /tmp/r1-content-test.log 2>&1 || { cat /tmp/r1-content-test.log; exit 1; }

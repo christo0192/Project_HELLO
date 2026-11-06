@@ -124,6 +124,16 @@ Web (vitest/coverage-v8 **4.1.10**, clean runs 59.38/51.18/59.14/63.30) → comm
 
 ---
 
+## 7a. What a web-only pull request skips
+
+`quality.yml` skips the voice worker test steps on a pull request into main whose every changed file is in `app/web/`, is a top-level `docs/design/*.md`, or is the design gate. `app/web/src/lib/r1/r1-phase.ts` is the exception: a voice test reads it, so changing it runs them. Every other pull request, and every push to main, runs them, and `deploy-fly.yml` waits on the main run. That wait protects the Fly apps only: a web change is live on Vercel within a minute of merging, before main's voice run finishes.
+
+`scripts/ci-voice-test-scope.mjs` makes the call and fails towards running. Its test scans the worker's Python for the plain ways of reading a path the skip lets through. It is a static scan, so a read built some other way would not show up in it.
+
+`web-e2e.yml` runs the desktop and mobile projects as parallel jobs. The `web-e2e` job reads both reports through the one zero-tolerance gate, so the check still means both projects passed.
+
+---
+
 ## 8. Non-goals honoured
 
 No staging/prod deploy stages; no hosted branch-protection application; no real E2E/WebRTC; no measured load; no DR/restore drill; no SLSA signing; no OpenAPI for not-yet-built routes; no fabricated approvals; no secrets/`.env`/real candidate data; no provider/cloud calls; no AI-attribution markers anywhere in this PR.

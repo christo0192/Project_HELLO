@@ -25,7 +25,11 @@
  * Skipped tests are allowed and reported: mobile-only states legitimately skip
  * on the desktop project.
  *
- * Usage: node scripts/check-e2e-results.mjs <path to results.json> [minTests]
+ * The projects run as parallel jobs, so the workflow hands this gate one report per
+ * project and it reads them as one run. Every rule above then applies to the whole
+ * run, and a report that is missing or malformed fails the gate.
+ *
+ * Usage: node scripts/check-e2e-results.mjs <results.json> [<results.json> ...] [minTests]
  */
 
 import { readFile } from 'node:fs/promises';
@@ -69,6 +73,23 @@ export function countTestsBySpec(report) {
   return counts;
 }
 
+/**
+ * One report from several runs of the same suite. A stat that is not a whole number
+ * makes the total NaN, so a malformed report still fails `evaluateE2eReport`.
+ */
+export function mergeE2eReports(reports) {
+  const total = (key) =>
+    reports.reduce((sum, report) => {
+      const value = report?.stats?.[key];
+      return sum + (Number.isInteger(value) && value >= 0 ? value : Number.NaN);
+    }, 0);
+  return {
+    stats: { expected: total('expected'), unexpected: total('unexpected'), flaky: total('flaky'), skipped: total('skipped') },
+    suites: reports.flatMap((report) => (Array.isArray(report?.suites) ? report.suites : [])),
+    errors: reports.flatMap((report) => (Array.isArray(report?.errors) ? report.errors : [])),
+  };
+}
+
 export function evaluateE2eReport(report, { minTests = 1, requiredCoverage = [] } = {}) {
   const stats = report && typeof report === 'object' ? report.stats : undefined;
   if (!stats || typeof stats !== 'object') {
@@ -110,19 +131,22 @@ export function evaluateE2eReport(report, { minTests = 1, requiredCoverage = [] 
 }
 
 async function main() {
-  const [file, min] = process.argv.slice(2);
-  if (!file) {
-    console.error('usage: check-e2e-results.mjs <results.json> [minTests]');
+  const args = process.argv.slice(2);
+  const min = /^\d+$/.test(args.at(-1) ?? '') ? args.pop() : undefined;
+  if (args.length === 0) {
+    console.error('usage: check-e2e-results.mjs <results.json> [<results.json> ...] [minTests]');
     process.exit(2);
   }
-  let report;
-  try {
-    report = JSON.parse(await readFile(file, 'utf8'));
-  } catch (error) {
-    console.error(`cannot read the Playwright report ${file}: ${error.message}`);
-    process.exit(1);
+  const reports = [];
+  for (const file of args) {
+    try {
+      reports.push(JSON.parse(await readFile(file, 'utf8')));
+    } catch (error) {
+      console.error(`cannot read the Playwright report ${file}: ${error.message}`);
+      process.exit(1);
+    }
   }
-  const verdict = evaluateE2eReport(report, {
+  const verdict = evaluateE2eReport(reports.length === 1 ? reports[0] : mergeE2eReports(reports), {
     minTests: min ? Number(min) : 1,
     requiredCoverage: REQUIRED_E2E_COVERAGE,
   });
