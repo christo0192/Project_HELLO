@@ -643,6 +643,18 @@ describe('The role list — one surface of rows, not a card wall', () => {
     expect(within(retired).getByText('Inactive')).toBeInTheDocument();
   });
 
+  it('prints an active agent in the family of a good state, and an inactive one in plain ink', async () => {
+    mockApi.listRoles.mockResolvedValue([role(1), role(2, { is_active: false })]);
+    render(<RolesPage />);
+    const [live, retired] = within(await screen.findByRole('list', { name: 'All agents' })).getAllByRole('listitem');
+    const active = within(live).getByText('Active');
+    expect(active).toHaveClass('text-success-text');
+    expect(active.querySelector('[aria-hidden="true"]')).toHaveClass('bg-success');
+    const inactive = within(retired).getByText('Inactive');
+    expect(inactive).toHaveClass('text-ink-tertiary');
+    expect(inactive.querySelector('[aria-hidden="true"]')).toHaveClass('bg-ink-muted');
+  });
+
   it('never cuts the description without a way to read it: two lines on screen, all of it in the title', async () => {
     const jd =
       'Own the services behind a live interview-preparation platform: design APIs in Go and TypeScript, run PostgreSQL at scale and keep p99 latency honest. You will pair with product on roadmap trade-offs.';

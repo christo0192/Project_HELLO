@@ -6,7 +6,7 @@ import { ChartDataTable } from './accessibility';
 import { EChart } from './EChart';
 import { ChartEmpty, ChartError } from './states';
 import { chartTheme } from './theme';
-import { buildLineSeries, seriesStroke } from './series';
+import { buildLineSeries, seriesColor, seriesStroke } from './series';
 import type { LineChartDatum, LineChartSeries, SeriesStroke } from './series';
 
 export type { LineChartDatum, LineChartSeries } from './series';
@@ -109,7 +109,12 @@ export function LineChart({
 
   const series: LineChartSeries[] = seriesProp ?? [{ name: title, data }];
   const multi = series.length > 1;
-  const { labels, lines } = buildLineSeries(series, { discrete, colors: palette.colors, surface: palette.surface });
+  const { labels, lines } = buildLineSeries(series, {
+    discrete,
+    colors: palette.colors,
+    families: palette.families,
+    surface: palette.surface,
+  });
   const isPercent = unit === '%';
   const formatValue = (v: number | null | undefined) =>
     v == null ? 'No data' : isPercent ? `${v}%` : v.toLocaleString();
@@ -177,7 +182,7 @@ export function LineChart({
               <li key={s.name} className="flex items-center gap-1.5 text-xs text-ink-secondary">
                 <SeriesKey
                   stroke={seriesStroke(index)}
-                  color={s.color ?? palette.colors[index % palette.colors.length]}
+                  color={seriesColor(s, index, palette)}
                 />
                 {s.name}
               </li>

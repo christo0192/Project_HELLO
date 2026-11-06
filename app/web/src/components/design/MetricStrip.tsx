@@ -31,8 +31,9 @@ import type { CSSProperties, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { cx } from './cx';
 import { Skeleton } from './Skeleton';
+import { figureToneClass, type FigureTone } from './tones';
 
-export type MetricTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
+export type MetricTone = 'neutral' | 'info' | 'success' | 'warning' | 'closed' | 'danger';
 
 export interface MetricItem {
   /** Stable key; defaults to the label. */
@@ -46,7 +47,12 @@ export interface MetricItem {
   context?: ReactNode;
   /** A small dot before the label, for figures whose category has a meaning. */
   tone?: MetricTone;
-  /** The figure itself needs attention (e.g. overdue > 0): warning ink. */
+  /**
+   * The figure's own colour, when it means something: its family's text shade
+   * (components/design/tones.ts). A plain total has none, and stays ink.
+   */
+  figureTone?: FigureTone;
+  /** The figure itself needs attention (e.g. overdue > 0): it outranks `figureTone`. */
   attention?: boolean;
   /** Drill-down: the whole cell becomes a link. */
   href?: string;
@@ -89,9 +95,10 @@ export interface MetricStripProps {
 
 const DOT: Record<MetricTone, string> = {
   neutral: 'bg-ink-muted',
-  info: 'bg-info',
+  info: 'bg-moving',
   success: 'bg-success',
   warning: 'bg-warning',
+  closed: 'bg-closed',
   danger: 'bg-error',
 };
 
@@ -300,7 +307,8 @@ function MetricBody({
         className={cx(
           'mt-1 font-semibold tabular-nums',
           FIGURE[size],
-          item.attention ? 'text-warning-text' : 'text-ink',
+          // A figure that could not be read is a dash, which means nothing yet.
+          item.attention ? 'text-warning-text' : figureToneClass(item.value === '—' ? undefined : item.figureTone),
         )}
         title={item.title}
       >

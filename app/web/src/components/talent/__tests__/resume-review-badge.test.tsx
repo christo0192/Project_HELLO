@@ -88,6 +88,16 @@ describe('ResumeReviewBadge', () => {
     expect(processing.firstElementChild?.className).not.toContain('font-semibold');
   });
 
+  it('stays neutral in every state: a resume chip takes no status family', () => {
+    for (const value of RESUME_REVIEW_ORDER) {
+      const { container } = render(<ResumeReviewBadge value={value} />);
+      const badge = container.querySelector('[data-status-badge]');
+      if (badge) expect(badge, value).toHaveAttribute('data-status-badge', 'neutral');
+    }
+    const { container } = render(<ResumeReviewBadge value="needs_review" />);
+    expect(container.querySelector('[data-status-badge]')).toHaveAttribute('data-status-badge', 'neutral');
+  });
+
   it('declares no colour of its own — the palette owns colour', () => {
     const { container } = render(<ResumeReviewBadge value="needs_review" />);
     expect(container.innerHTML).not.toMatch(/#[0-9a-fA-F]{3,8}|rgba?\(|hsla?\(/);

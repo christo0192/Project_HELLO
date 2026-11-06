@@ -1,25 +1,41 @@
 import type { ReactNode } from 'react';
 import { cx } from './cx';
 
-export type StatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
+export type StatusTone = 'neutral' | 'ink' | 'ink-2' | 'info' | 'success' | 'warning' | 'closed' | 'danger';
 
 /*
- * The word carries the status. A tone is a shaded field and a dot in ink; only
- * a fault on our side takes a hue, as crimson text inside a crimson edge.
+ * The word carries the status and the colour says which kind it is. A tone is the
+ * family's soft wash, its text shade and a dot in its mark (components/design/tones.ts):
+ * `info` is underway, `success` a good or ready result, `warning` unfinished or
+ * needing a second look, `closed` ended with no judgement implied. `info` means the
+ * moving family HERE and in BarList: the `--info` token stays ink, because it is the
+ * primary fill. A fault on our side is crimson text inside a crimson edge, and a
+ * chip with no meaning of its own stays neutral.
+ *
+ * `ink` and `ink-2` are for a skill, a gap, a flag, a signal level or a resume conflict,
+ * which are neither a verdict nor a rating and take no hue: darker ink is the only
+ * weight a red flag or an unresolved conflict gets. They print exactly what these chips
+ * printed before the families came back.
  */
 const toneStyles: Record<StatusTone, string> = {
   neutral: 'bg-surface-secondary text-ink-secondary',
-  info: 'bg-info-soft text-ink-secondary',
+  ink: 'bg-surface-secondary text-ink',
+  'ink-2': 'bg-surface-secondary text-ink-secondary',
+  info: 'bg-moving-soft text-moving-text',
   success: 'bg-success-soft text-success-text',
   warning: 'bg-warning-soft text-warning-text',
+  closed: 'bg-closed-soft text-closed-text',
   danger: 'bg-error-soft text-error-text ring-1 ring-inset ring-error',
 };
 
 const dotStyles: Record<StatusTone, string> = {
   neutral: 'bg-ink-muted',
-  info: 'bg-info',
+  ink: 'bg-ink-secondary',
+  'ink-2': 'bg-ink-secondary',
+  info: 'bg-moving',
   success: 'bg-success',
   warning: 'bg-warning',
+  closed: 'bg-closed',
   danger: 'bg-error',
 };
 

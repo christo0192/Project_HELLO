@@ -274,6 +274,9 @@ describe('AccessSection', () => {
       .getByText('Admin@InterviewKickstart.com')
       .closest('tr') as HTMLElement;
     expect(within(row).getByText(/Your own entry/)).toBeInTheDocument();
+    // A rule about this row, not a state: it stays in ink.
+    expect(within(row).getByText(/Your own entry/)).toHaveClass('text-ink');
+    expect(within(row).getByText(/Your own entry/)).not.toHaveClass('text-warning-text');
     expect(within(row).getByRole('button', { name: /^Role for Admin@InterviewKickstart\.com/ })).toBeDisabled();
     expect(within(row).getByLabelText(/Active for Admin@InterviewKickstart.com/)).toBeDisabled();
     expect(within(row).getByRole('button', { name: 'Save' })).toBeDisabled();
@@ -294,6 +297,7 @@ describe('AccessSection', () => {
       .getByText('solo@interviewkickstart.com')
       .closest('tr') as HTMLElement;
     expect(within(row).getByText(/Last linked active admin/)).toBeInTheDocument();
+    expect(within(row).getByText(/Last linked active admin/)).toHaveClass('text-ink');
     expect(within(row).getByRole('button', { name: /^Role for solo@interviewkickstart\.com/ })).toBeDisabled();
     expect(within(row).getByLabelText(/Active for solo@interviewkickstart.com/)).toBeDisabled();
     expect(within(row).getByRole('button', { name: 'Save' })).toBeDisabled();

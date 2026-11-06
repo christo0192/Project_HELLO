@@ -146,15 +146,15 @@ export function segmentsFor(totals: FunnelSummaryTotals): PipelineSegment[] {
     // with the cumulative stage line underneath: "Connected 2" (this bucket)
     // sitting 20px above "Connected 6" (reached this stage) gave a recruiter
     // two defensible answers to one question from a single 40px block.
-    { key: 'not_dialed', label: 'Awaiting first dial', value: total - dialed, tone: 'neutral' },
-    { key: 'no_answer', label: 'Called, no answer', value: dialed - connected, tone: 'caution' },
-    { key: 'connected', label: 'Spoke, not assessed', value: connected - scored, tone: 'accent' },
-    { key: 'scored', label: 'Screening complete', value: scored, tone: 'positive' },
+    { key: 'not_dialed', label: 'Awaiting first dial', value: total - dialed, tone: 'moving-light' },
+    { key: 'no_answer', label: 'Called, no answer', value: dialed - connected, tone: 'unresolved' },
+    { key: 'connected', label: 'Spoke, not assessed', value: connected - scored, tone: 'moving' },
+    { key: 'scored', label: 'Screening complete', value: scored, tone: 'ready-light' },
     {
       key: 'selected',
       label: 'Selected',
       value: 0,
-      tone: 'positive',
+      tone: 'ready',
       // NOT a zero. See the file header.
       unavailable: 'Not tracked yet',
     },

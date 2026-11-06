@@ -334,6 +334,27 @@ describe('a recording that cannot be played renders no media element', () => {
 
 /* ── What a ready / partial recording says ────────────────────────── */
 
+describe('the recording chip takes its family', () => {
+  it.each([
+    ['recording', 'Recording', 'bg-moving-soft'],
+    ['processing', 'Processing', 'bg-moving-soft'],
+    ['ready', 'Ready', 'bg-ready-soft'],
+    ['partial', 'Partial', 'bg-unresolved-soft'],
+    ['deleted', 'Deleted', 'bg-closed-soft'],
+  ] as const)('%s prints "%s" on the wash %s', (state, word, wash) => {
+    renderPlayer({ summary: listed({ state, reason: null }) });
+    expect(screen.getByText(word)).toHaveClass(wash);
+  });
+
+  it('keeps a recording we could not make on the fault tone, and no recording in ink', () => {
+    const { view } = renderPlayer({ summary: listed({ state: 'failed', reason: null }) });
+    expect(screen.getByText('Unavailable').className).toContain('--c-negative');
+    view.unmount();
+    renderPlayer({ summary: listed({ state: 'none', reason: null }) });
+    expect(screen.getByText('No recording').className).toContain('--c-border-light');
+  });
+});
+
 describe('ready and partial', () => {
   it('says how long it is, when it is kept until, and how long the camera was off', () => {
     renderPlayer({ summary: listed({ camera_off_ms: 80_000 }) });

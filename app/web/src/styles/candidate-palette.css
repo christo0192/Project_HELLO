@@ -26,8 +26,11 @@
   --c-ink-muted: var(--ink-3);
 
   /* ── Accent and tones ─────────────────────────────────────────────
-     The accent is ink, and a status is a word, not a traffic light: only a
-     fault keeps a hue. `*-light` are the grounds those tones sit on. */
+     The accent is ink. These names reach the candidate-facing pages and a scorecard's
+     chips (a skill, a gap, a signal level), which are neither a verdict nor a rating, so
+     they stay ink and only a fault keeps a hue: the status families in index.css are not
+     for them. `*-light` are the
+     grounds those tones sit on. */
   --c-accent: var(--ink);
   --c-accent-light: var(--field);
   --c-positive: var(--ink-2);

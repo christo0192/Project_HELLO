@@ -16,7 +16,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { R1ListedAttempt, R1Round } from '../../../lib/r1-types';
 import { ApiError } from '../../../api';
-import { r1ResultLine } from '../../../lib/r1';
+import { R1_RESULT_WITHHELD, r1ResultLine } from '../../../lib/r1';
 import { R1Section } from '../R1Section';
 
 const api = vi.hoisted(() => ({
@@ -531,6 +531,28 @@ describe('the rounds panel', () => {
     expect(row).toHaveTextContent(/Link valid until .*2099/);
   });
 
+  it.each([
+    ['invited', 'Link sent', 'bg-moving-soft'],
+    ['in_progress', 'Link open', 'bg-moving-soft'],
+    ['completed', 'Completed', 'bg-ready-soft'],
+    ['expired', 'Expired', 'bg-closed-soft'],
+    ['cancelled', 'Cancelled', 'bg-closed-soft'],
+  ] as const)('prints a %s round as "%s" on the wash %s, not a grey outline', async (status, word, wash) => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status })] });
+    renderSection();
+    const list = await screen.findByRole('list', { name: 'R1 rounds' });
+    expect(within(list).getByText(word)).toHaveClass(wash);
+  });
+
+  it('prints a round with someone in it as "In progress" on the same wash', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'in_progress', attempts: [listed({ counted: false, in_progress: true, session_status: 'in_progress', ended_at: null })] })],
+    });
+    renderSection();
+    const list = await screen.findByRole('list', { name: 'R1 rounds' });
+    expect(within(list).getByText('In progress')).toHaveClass('bg-moving-soft');
+  });
+
   it('shows a results placeholder until scoring has produced something', async () => {
     api.listR1Rounds.mockResolvedValue({
       rounds: [round({ status: 'completed', attempts_counted: 1 })],
@@ -552,6 +574,37 @@ describe('the rounds panel', () => {
       await screen.findByText('AI recommendation: Borderline · Overall 58 of 100'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+  });
+
+  describe('the result line prints a verdict in its family', () => {
+    it.each([
+      ['advance', 72, 'AI recommendation: Select · Overall 72 of 100', 'text-ready-text'],
+      ['hold', 58.5, 'AI recommendation: Borderline · Overall 59 of 100', 'text-unresolved-text'],
+      ['reject', 31, 'AI recommendation: Reject · Overall 31 of 100', 'text-closed-text'],
+    ] as const)('%s, the recommendation and the figure together', async (recommendation, overall, words, shade) => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'completed', attempts_counted: 1, recommendation, overall })] });
+      renderSection();
+      expect(await screen.findByText(words)).toHaveClass(shade);
+    });
+
+    it('has no hue on a round with no verdict, whose figure does not print', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: null, overall: 72 })] });
+      renderSection();
+      const line = await screen.findByText('AI result: not scored. Open the R1 review for the reason.');
+      expect(line.className).not.toMatch(/ready|unresolved|closed/);
+      expect(screen.queryByText(/of 100/)).not.toBeInTheDocument();
+    });
+
+    it('leaves the withheld sentence as it is', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'reject', overall: 31, scores_withheld: true })],
+      });
+      renderSection();
+      const line = await screen.findByText(R1_RESULT_WITHHELD);
+      expect(line.tagName).toBe('P');
+      expect(line).toHaveClass('text-ink-secondary');
+      expect(line.innerHTML).not.toMatch(/ready|unresolved|closed/);
+    });
   });
 
   it.each([

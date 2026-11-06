@@ -104,6 +104,29 @@ test.describe('forced colours', () => {
       expect(fill, selector).not.toBe('rgba(0, 0, 0, 0)');
     }
   });
+
+  test('the verdict ruler survives: its zones, its two cut-offs and the score mark are fills, which forcing would drop', async ({ app, page }) => {
+    await page.emulateMedia({ forcedColors: 'active' });
+    await app.goto(ADDRESS);
+    const canvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    const drawn = async (selector: string, count: number) => {
+      const marks = page.locator(selector);
+      await expect(marks).toHaveCount(count);
+      for (const mark of await marks.all()) {
+        const fill = await mark.evaluate((el) => getComputedStyle(el).backgroundColor);
+        expect(fill, selector).not.toBe(canvas);
+        expect(fill, selector).not.toBe('rgba(0, 0, 0, 0)');
+      }
+    };
+    await drawn('[data-ruler-zone]', 3);
+    await drawn('[data-cut]', 2);
+    // The strip on the Recording tab carries `data-mark` too, so this is the ruler's own.
+    await drawn('div:has(> [data-cut]) > [data-mark]', 1);
+    // A circle is an svg, which keeps its author colour unless it is handed the word's.
+    const verdict = page.locator('p', { has: page.locator('[data-verdict-mark]') });
+    const circle = verdict.locator('circle');
+    expect(await circle.evaluate((el) => getComputedStyle(el).stroke)).toBe(await verdict.evaluate((el) => getComputedStyle(el).color));
+  });
 });
 
 test.describe('getting there', () => {

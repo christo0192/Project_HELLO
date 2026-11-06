@@ -45,8 +45,11 @@ Every pair the candidate surfaces paint is computed by
   anywhere in candidate scope by a source guard. Tone fills, rings and borders;
   ink writes.
 
-Verdicts are ink: a score, a meter and a recommendation take no hue. Crimson
-means a fault on our side.
+On the HR pages a verdict and a rating take their family, so a score, a meter
+and a recommendation are coloured by what they say, and the word and the figures
+stay (`docs/design/logsheet-colour-decision-2026-11-06.md`). A Reject is never
+crimson, because crimson means a fault on our side. Candidate-facing pages and the
+exported report print what they always printed, and read no family.
 
 ---
 

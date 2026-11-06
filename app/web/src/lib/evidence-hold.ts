@@ -14,6 +14,24 @@ export function isEvidenceInsufficient(assessment: unknown): boolean {
   );
 }
 
+const record = (value: unknown): Record<string, unknown> | null =>
+  value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+
+/**
+ * True when this row's verdict and ratings take no family: it is held (above), or it is an R1 row
+ * with no usable result, by the same rule as the R1 page (`reviewStage`), which says of those ratings
+ * that they gave no usable result and are for human review only. `human_review` is stored as NULL in
+ * the column, so only `raw` still has it. A phone `human_review` row has no `raw.r1` and keeps its
+ * rating colours, because no page disowns them.
+ */
+export function isResultDisowned(assessment: unknown): boolean {
+  if (isEvidenceInsufficient(assessment)) return true;
+  const row = record(assessment);
+  const raw = record(row?.raw);
+  if (!row || !raw || !record(raw.r1)) return false;
+  return row.recommendation == null || raw.recommendation === 'human_review';
+}
+
 function count(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
 }

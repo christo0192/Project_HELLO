@@ -301,6 +301,17 @@ describe('the header', () => {
     expect(await screen.findByText('R1 role-play: Select 72 (AI)')).toBeInTheDocument();
   });
 
+  it.each([
+    ['advance', 'Select', 'text-ready-text'],
+    ['hold', 'Borderline', 'text-unresolved-text'],
+    ['reject', 'Reject', 'text-closed-text'],
+  ] as const)('prints that line in the family of %s, as the R1 tab does', async (recommendation, word, shade) => {
+    mockApi.listR1Rounds.mockResolvedValue({ rounds: [{ ...ROUND, recommendation, overall: 58 }] });
+    renderPage();
+    await opened();
+    expect(await screen.findByText(`R1 role-play: ${word} 58 (AI)`)).toHaveClass(shade);
+  });
+
   describe('going straight from one candidate to another', () => {
     const SECOND = { ...mockCandidateDetail.candidate, id: 'candidate-2', name: 'Second Person' };
 

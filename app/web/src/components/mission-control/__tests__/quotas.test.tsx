@@ -56,6 +56,10 @@ describe('QuotasSection', () => {
     expect(within(candidateRow).getAllByText(/cand-1234-567/).length).toBeGreaterThan(0);
     expect(within(candidateRow).getByText('enabled')).toBeInTheDocument();
 
+    // Enabled is a good state, and disabled has ended: neither is a plain chip.
+    expect(within(globalRow).getByText('disabled').closest('[data-status-badge]')).toHaveAttribute('data-status-badge', 'closed');
+    expect(within(candidateRow).getByText('enabled').closest('[data-status-badge]')).toHaveAttribute('data-status-badge', 'success');
+
     // No currency/price anywhere.
     expect(screen.queryByText(/\$/)).not.toBeInTheDocument();
     expect(screen.queryByText(/usd|eur|inr/i)).not.toBeInTheDocument();

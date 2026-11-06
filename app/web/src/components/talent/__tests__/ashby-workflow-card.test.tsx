@@ -69,6 +69,65 @@ beforeEach(() => {
   mockApi.getAshbyScopedReviewWorkflow.mockResolvedValue({ ok: true, workflow: WORKFLOW });
 });
 
+describe('each state means one thing', () => {
+  const tones = (workflow: AshbyCandidateWorkflow) => {
+    const { container, unmount } = render(<AshbyWorkflowCardView workflow={workflow} />);
+    const found = [...container.querySelectorAll('[data-status-badge]')].map((badge) => [
+      badge.textContent,
+      badge.getAttribute('data-status-badge'),
+    ]);
+    unmount();
+    return Object.fromEntries(found);
+  };
+
+  it.each([
+    ['imported', 'info'],
+    ['ready', 'info'],
+    ['processing', 'info'],
+    ['writeback_pending', 'info'],
+    ['completed', 'success'],
+    ['cancelled', 'closed'],
+  ])('lifecycle %s is the %s tone', (lifecycle, tone) => {
+    const { container, unmount } = render(
+      <AshbyWorkflowCardView workflow={{ ...WORKFLOW, lifecycle, ingestionState: null, operations: [], sessionStatus: null }} />,
+    );
+    expect(container.querySelector('[data-status-badge]')).toHaveAttribute('data-status-badge', tone);
+    unmount();
+  });
+
+  it.each([
+    ['queued', 'Queued', 'info'],
+    ['fetching', 'Fetching resume', 'info'],
+    ['scanning', 'Scanning resume', 'info'],
+    ['extracting', 'Extracting text', 'info'],
+    ['structuring', 'Structuring profile', 'info'],
+    ['ready', 'Ready', 'success'],
+    ['failed_review', 'Needs manual review', 'warning'],
+    ['cancelled', 'Cancelled', 'closed'],
+  ])('resume import %s is the %s tone', (ingestionState, word, tone) => {
+    expect(tones({ ...WORKFLOW, lifecycle: 'imported', ingestionState, operations: [], sessionStatus: null })[word]).toBe(tone);
+  });
+
+  it.each([
+    ['pending', 'Pending', 'info'],
+    ['running', 'In progress', 'info'],
+    ['succeeded', 'Succeeded', 'success'],
+    ['blocked', 'Blocked', 'warning'],
+    ['failed', 'Failed', 'danger'],
+    ['cancelled', 'Cancelled', 'closed'],
+  ])('an operation %s is the %s tone', (state, word, tone) => {
+    expect(
+      tones({
+        ...WORKFLOW,
+        lifecycle: 'imported',
+        ingestionState: null,
+        sessionStatus: null,
+        operations: [{ type: 'invite_delivery', state, errorCode: null }],
+      })[word],
+    ).toBe(tone);
+  });
+});
+
 function renderCandidateCard() {
   return render(<AshbyWorkflowCard source={{ kind: 'candidate', candidateId: CANDIDATE_ID }} />);
 }
@@ -172,6 +231,18 @@ describe('AshbyWorkflowCard — accessible, colour-independent status', () => {
     );
     expect(screen.getByText('Application withdrawn')).toBeInTheDocument();
     expect(screen.getByText('Cancelled')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['withdrawn', 'Application withdrawn'],
+    ['deleted', 'Application deleted in Ashby'],
+    ['manual_stage_cancel', 'Cancelled by an administrator'],
+  ])('prints terminal state %s in the closed family, because nobody on our side failed', (terminalState, word) => {
+    render(<AshbyWorkflowCardView workflow={{ ...WORKFLOW, terminalState, lifecycle: 'cancelled' }} />);
+    const line = screen.getByText(word);
+    expect(line).toHaveClass('text-closed-text');
+    expect(line).not.toHaveClass('text-error');
+    expect(line).not.toHaveClass('text-error-text');
   });
 
   it("falls through to the raw value's own words for an unknown state rather than inventing a label", () => {

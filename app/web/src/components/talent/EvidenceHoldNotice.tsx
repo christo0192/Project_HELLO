@@ -34,7 +34,8 @@ export function EvidenceHoldNotice({ assessment, action }: EvidenceHoldNoticePro
       data-evidence-hold=""
       className="mb-4 rounded-control border border-glass-ring px-3.5 py-3 text-sm"
     >
-      <p className="font-medium text-warning-text">Not enough interview evidence to decide</p>
+      {/* A held card has no hue, so neither has the heading that says why. */}
+      <p className="font-medium text-ink">Not enough interview evidence to decide</p>
       <p className="mt-1 max-w-prose leading-6 text-ink-secondary">
         {evidenceHoldReason(row)} This scorecard is held for review: it was not sent to Ashby and did
         not change the candidate&apos;s status. A re-screen is recommended.

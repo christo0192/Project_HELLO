@@ -3,10 +3,45 @@
  * draws a line segment backwards in time, which reads as a real swing.
  */
 import { describe, expect, it } from 'vitest';
-import { buildLineSeries, unionLabels } from '../series';
+import { buildLineSeries, seriesColor, unionLabels } from '../series';
 import type { LineChartSeries } from '../series';
 
 const day = (label: string, date?: string, value = 1) => ({ label, value, ...(date ? { date } : {}) });
+
+describe('a series colour', () => {
+  const palette = {
+    colors: ['#000001', '#000002', '#000003'],
+    families: { moving: '#00000a', ready: '#00000b', unresolved: '#00000c', closed: '#00000d' },
+  };
+  const line = (extra: Partial<LineChartSeries> = {}): LineChartSeries => ({ name: 'S', data: [day('1 Sep')], ...extra });
+
+  it('takes its family, whatever its place in the cycle', () => {
+    expect(seriesColor(line({ family: 'closed' }), 0, palette)).toBe('#00000d');
+    expect(seriesColor(line({ family: 'closed' }), 2, palette)).toBe('#00000d');
+  });
+
+  it('falls back to its place in the cycle only when it means nothing', () => {
+    expect(seriesColor(line(), 0, palette)).toBe('#000001');
+    expect(seriesColor(line(), 4, palette)).toBe('#000002');
+  });
+
+  it('draws the line and its marker in the family, and keeps its dash and marker shape', () => {
+    const { lines } = buildLineSeries(
+      [
+        { name: 'Qualified', data: [day('1 Sep')], family: 'ready' },
+        { name: 'Disqualified', data: [day('1 Sep')], family: 'closed' },
+      ],
+      palette,
+    );
+    expect(lines[0].lineStyle?.color).toBe('#00000b');
+    expect(lines[0].itemStyle?.color).toBe('#00000b');
+    expect(lines[0].lineStyle?.type).toBe('solid');
+    expect(lines[0].symbol).toBe('circle');
+    expect(lines[1].lineStyle?.color).toBe('#00000d');
+    expect(lines[1].lineStyle?.type).toEqual([6, 4]);
+    expect(lines[1].symbol).toBe('rect');
+  });
+});
 
 describe('unionLabels', () => {
   it('puts a day only the later series has, and that LEADS it, in date order', () => {

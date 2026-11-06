@@ -54,6 +54,25 @@ export function auditActionLabel(action: string, targetType: string): string {
   return AUDIT_TARGET_ACTION_LABELS[action]?.[targetType] ?? AUDIT_ACTION_LABELS[action] ?? humanizeEnum(action);
 }
 
+/**
+ * `audit_events.result` is `success`, `failure` or `pending` (0007's
+ * `chk_audit_result`), and an audited route writes `failure` from any status of
+ * 400 and up (lib/audit.ts). Most of those are a refused request rather than a
+ * fault of ours, so a failure asks for a second look and is not crimson.
+ */
+export function auditResultTone(result: string): StatusTone {
+  switch (result) {
+    case 'success':
+      return 'success';
+    case 'failure':
+      return 'warning';
+    case 'pending':
+      return 'info';
+    default:
+      return 'neutral';
+  }
+}
+
 /* ── Allowlist entry state ───────────────────────────────────────────── */
 
 export type AllowlistEntryState = 'pending' | 'linked' | 'disabled';
@@ -81,9 +100,9 @@ export function allowlistStateTone(state: AllowlistEntryState): StatusTone {
     case 'linked':
       return 'success';
     case 'pending':
-      return 'info';
+      return 'warning';
     case 'disabled':
-      return 'neutral';
+      return 'closed';
   }
 }
 
@@ -314,7 +333,8 @@ export function phoneHealthReasonTone(reason: string): StatusTone {
   ) {
     return 'danger';
   }
-  if (reason === 'admission_halted' || reason === 'phone_due_halted') return 'info';
+  // A pause is not "underway", and it is not wrong either, so it takes no family.
+  if (reason === 'admission_halted' || reason === 'phone_due_halted') return 'neutral';
   return 'warning';
 }
 

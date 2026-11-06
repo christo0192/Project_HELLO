@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 configure({ asyncUtilTimeout: 3000 });
 import { TranscriptionSyncWorkspace } from '../TranscriptionSyncWorkspace';
+import { RoleScorecardView } from '../../session/RoleScorecardView';
 import type {
   AshbyCandidateWorkflow,
   AshbyCandidateWorkflowOperation,
@@ -385,6 +386,135 @@ describe('the log header', () => {
       renderWorkspace({ ashbyWorkflow: workflow({ updatedAt: '2026-10-07T06:28:00.000Z' }) });
       await screen.findByText('What is your monthly target?');
       expect(cell()).toHaveTextContent('AI scorecard sent 7 Oct 2026, 11:58 IST');
+    });
+  });
+
+  describe('the In Ashby cell says its state in colour, and only that cell', () => {
+    const workflow = (lifecycle: AshbyCandidateWorkflow['lifecycle'], sent = false): AshbyCandidateWorkflow => ({
+      lifecycle,
+      terminalState: null,
+      ingestionState: null,
+      operations: sent
+        ? [
+            {
+              type: 'scorecard_write',
+              state: 'succeeded',
+              errorCode: null,
+              updatedAt: '2026-10-05T06:28:00.000Z',
+              sessionCreatedAt: SESSION.created_at,
+            },
+          ]
+        : [],
+      sessionStatus: 'completed',
+      updatedAt: null,
+    });
+
+    it('prints "Writing results back to Ashby" in moving', async () => {
+      renderWorkspace({ ashbyWorkflow: workflow('writeback_pending') });
+      await screen.findByText('What is your monthly target?');
+      expect(screen.getByText('Writing results back to Ashby')).toHaveClass('text-moving-text');
+    });
+
+    it('prints "AI scorecard sent" in ready, and the same state word as the workflow card does', async () => {
+      renderWorkspace({ ashbyWorkflow: workflow('completed', true) });
+      await screen.findByText('What is your monthly target?');
+      const cell = screen.getByText('In Ashby').parentElement!;
+      expect(cell).toHaveTextContent('Screening complete · AI scorecard sent 11:58 IST');
+      expect(within(cell).getByText('AI scorecard sent 11:58 IST')).toHaveClass('text-ready-text');
+      expect(within(cell).getByText('Screening complete')).toHaveClass('text-success-text');
+    });
+
+    it.each([
+      ['Not linked', null],
+      ['Not available', undefined],
+    ])('leaves %s in ink', async (word, ashbyWorkflow) => {
+      renderWorkspace({ ashbyWorkflow });
+      await screen.findByText('What is your monthly target?');
+      const cell = screen.getByText('In Ashby').parentElement!;
+      expect(cell).toHaveTextContent(word);
+      expect(cell.innerHTML).not.toMatch(/moving|ready|success|closed|unresolved|warning/);
+    });
+
+    it('colours no consent line', async () => {
+      renderWorkspace({ ashbyWorkflow: workflow('completed', true) });
+      await screen.findByText('What is your monthly target?');
+      expect(document.querySelector('[data-consent-line]')!.innerHTML).not.toMatch(/moving|ready|success|closed|unresolved|warning/);
+    });
+  });
+
+  describe('an evidence number takes the family of the rating it cites', () => {
+    // Target clarity 4 of 4, Objection handling 2 of 4, Rapport 1 of 4.
+    const results = [
+      metricResult('m-target', 'Target clarity', 2500, 4, ['My target is twelve a month']),
+      metricResult('m-objection', 'Objection handling', 2500, 2, ['the EMI option first']),
+      metricResult('m-rapport', 'Rapport', 2500, 1, ['book the follow-up']),
+    ];
+    const card = (metricResults = results) =>
+      assessment({ raw: { ...assessment().raw, metricResults } as Assessment['raw'] });
+    const margin = (name: RegExp) => screen.getByRole('button', { name });
+
+    it.each([
+      [1, 'ready'],
+      [2, 'unresolved'],
+      [3, 'closed'],
+    ])('tick %s is paper with the %s family', async (number, family) => {
+      renderWorkspace({ card: card() });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      // Review opens with the weakest metric's quote cued, so cue another to see this one at rest.
+      const other = number === 1 ? 2 : 1;
+      fireEvent.click(tick(other));
+      await waitFor(() => expect(tick(other)).toHaveAttribute('aria-pressed', 'true'));
+      expect(tick(number)).toHaveClass('bg-paper', `border-${family}`, `text-${family}-text`);
+    });
+
+    it('fills a pressed tick with its family, in paper text, not with ink', async () => {
+      renderWorkspace({ card: card() });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      fireEvent.click(tick(3));
+      await waitFor(() => expect(tick(3)).toHaveAttribute('aria-pressed', 'true'));
+      expect(tick(3)).toHaveClass('bg-closed-text', 'text-paper');
+      expect(tick(3)).not.toHaveClass('bg-ink');
+    });
+
+    it('prints the same family in the transcript margin', async () => {
+      renderWorkspace({ card: card() });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      fireEvent.click(tick(1));
+      await waitFor(() => expect(tick(1)).toHaveAttribute('aria-pressed', 'true'));
+      expect(margin(/^Evidence 1, Target clarity/)).toHaveClass('bg-ready-text', 'text-paper', 'border-ready-text');
+      expect(margin(/^Evidence 2, Objection handling/)).toHaveClass('bg-paper', 'text-unresolved-text', 'border-unresolved');
+      expect(margin(/^Evidence 3, Rapport/)).toHaveClass('bg-paper', 'text-closed-text', 'border-closed');
+    });
+
+    it('prints the same family on the rubric quote row, keeping its row edge in ink when pressed', async () => {
+      renderWorkspace({ card: card() });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      fireEvent.click(tick(2));
+      const quote = await waitFor(() => {
+        const row = document.querySelector<HTMLElement>('[data-quote-button="2"]');
+        expect(row).toHaveAttribute('aria-pressed', 'true');
+        return row!;
+      });
+      expect(quote.querySelector('[data-evidence-number]')).toHaveClass('bg-unresolved-text', 'text-paper');
+      expect(quote).toHaveClass('border-ink');
+    });
+
+    it('keeps a metric with no score in ink', async () => {
+      renderWorkspace({
+        card: card([results[0], metricResult('m-objection', 'Objection handling', 2500, null, ['the EMI option first'])]),
+      });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(tick(2)).toHaveClass('bg-paper', 'border-ink', 'text-ink');
+      expect(margin(/^Evidence 2, Objection handling/)).toHaveClass('border-ink', 'text-ink');
+    });
+
+    it('changes nothing else on the strip: the wash, the voice segments, the grey segments and the hatch', async () => {
+      renderWorkspace({ card: card() });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(document.querySelector('[data-strip-segment="candidate"]')).toHaveAttribute('fill', 'var(--voice-mark)');
+      expect(document.querySelector('[data-strip-segment="ai"]')).toHaveAttribute('fill', 'var(--ai)');
+      expect(document.querySelector('[data-strip-segment="gate"]')?.getAttribute('fill')).toMatch(/^url\(/);
+      expect(document.querySelector('[data-evidence-mark]')).toHaveClass('bg-wash');
     });
   });
 
@@ -1354,7 +1484,7 @@ describe('the reasoning pane', () => {
     ['advance', 'full', 'Select'],
     ['hold', 'half', 'Borderline'],
     ['reject', 'empty', 'Reject'],
-  ])('draws %s as a %s circle beside its word, in ink', async (recommendation, shape, word) => {
+  ])('draws %s as a %s circle beside its word, keeping the shape', async (recommendation, shape, word) => {
     renderWorkspace({
       card: assessment({
         recommendation: recommendation as Assessment['recommendation'],
@@ -1366,6 +1496,358 @@ describe('the reasoning pane', () => {
     expect(mark).not.toBeNull();
     expect(mark.parentElement).toHaveTextContent(word);
     expect(mark.innerHTML).not.toMatch(/var\(/);
+  });
+
+  describe('takes its colour from the verdict and the ratings', () => {
+    /** The same row with its verdict, figure and rubric swapped, firm unless it says otherwise. */
+    function scored({
+      recommendation = 'advance',
+      overall = 67,
+      status = 'complete',
+      results = RESULTS.map((r) => (r.score === null ? metricResult('m-closing', 'Closing', 2500, 3, []) : r)),
+      scale = 4,
+      redFlags = [],
+      held = false,
+    }: {
+      recommendation?: string | null;
+      overall?: number | null;
+      status?: 'complete' | 'incomplete_evidence';
+      results?: ReturnType<typeof metricResult>[];
+      scale?: number;
+      redFlags?: string[];
+      held?: boolean;
+    }): Assessment {
+      return assessment({
+        recommendation: recommendation as Assessment['recommendation'],
+        overall_score: overall as number,
+        scoring_status: status,
+        ...(held ? { evidence_grade: 'insufficient' as const, evidence_reason: 'partial_thin' as const } : {}),
+        role_fit: { score: 0, matched_skills: [], gaps: [], red_flags: redFlags, notes: '' },
+        raw: {
+          ...assessment().raw,
+          recommendation,
+          overallScore: overall,
+          status,
+          scoreScaleMax: scale,
+          metricResults: results,
+        } as Assessment['raw'],
+      });
+    }
+
+    const verdictBox = () => document.querySelector<HTMLElement>('[data-verdict-box]')!;
+    const ruler = () => document.querySelector<HTMLElement>('[data-score-ruler]')!;
+    const zone = (family: string) => document.querySelector<HTMLElement>(`[data-ruler-zone="${family}"]`)!;
+    const rubricRows = () => [...document.querySelectorAll<HTMLElement>('[data-rubric-row]')];
+
+    it.each([
+      ['advance', 'bg-ready-soft', 'border-ready', 'text-ready-text'],
+      ['hold', 'bg-unresolved-soft', 'border-unresolved', 'text-unresolved-text'],
+      ['reject', 'bg-closed-soft', 'border-closed', 'text-closed-text'],
+    ])('a firm %s is a %s block with a solid %s edge, and its figure is %s', async (recommendation, wash, edge, text) => {
+      renderWorkspace({ card: scored({ recommendation }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      const box = verdictBox();
+      expect(box).toHaveAttribute('data-verdict-box', 'firm');
+      expect(box).toHaveClass(wash, edge, 'border');
+      expect(box.className).not.toMatch(/border-dashed|border-[lrtbxy]-|border-rule/);
+      expect(within(box).getByText('67')).toHaveClass(text);
+      expect(within(box).getByText('/100')).toHaveClass('text-ink-tertiary');
+    });
+
+    it.each([
+      ['advance', 'bg-ready-soft', 'border-ready'],
+      ['hold', 'bg-unresolved-soft', 'border-unresolved'],
+      ['reject', 'bg-closed-soft', 'border-closed'],
+    ])('a provisional %s keeps its family, and its edge is dashed', async (recommendation, wash, edge) => {
+      renderWorkspace({ card: scored({ recommendation, status: 'incomplete_evidence', results: RESULTS }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(verdictBox()).toHaveAttribute('data-verdict-box', 'provisional');
+      expect(verdictBox()).toHaveClass(wash, edge, 'border-dashed');
+    });
+
+    it('says "Provisional" in the unresolved family, on the stamp and in the paragraph, on any verdict', async () => {
+      renderWorkspace({ card: scored({ recommendation: 'advance', status: 'incomplete_evidence', results: RESULTS }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(within(verdictBox()).getByText('Provisional')).toHaveClass('text-unresolved-text');
+      expect(screen.getByText('Provisional:')).toHaveClass('text-unresolved-text');
+    });
+
+    it.each([
+      ['no recommendation', null, 67],
+      ['needs human review', 'human_review', 67],
+      ['no figure and no recommendation', null, null],
+    ])('gives a block with %s no hue', async (_case, recommendation, overall) => {
+      renderWorkspace({ card: scored({ recommendation, overall }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      const box = verdictBox();
+      expect(box.className).not.toMatch(/ready|unresolved|closed/);
+      expect(box).toHaveClass('border-rule-2');
+    });
+
+    /** The whole ruler has no hue and emphasises nothing: its zones are grey, its labels quiet. */
+    const expectNoHueRuler = () => {
+      for (const family of ['closed', 'unresolved', 'ready']) {
+        expect(zone(family)).toHaveClass('bg-rule-2', 'data-fill');
+        expect(zone(family).className).not.toMatch(/bg-(ready|unresolved|closed)/);
+      }
+      expect(document.querySelector('[data-ruler-zone][data-current]')).toBeNull();
+      for (const word of ['Reject', 'Borderline 45', 'Select 65']) {
+        const label = within(ruler()).getByText(word);
+        expect(label).toHaveClass('text-ink-tertiary');
+        expect(label.className).not.toMatch(/ready|unresolved|closed|font-semibold/);
+      }
+    };
+
+    it('prints "Not scored" with no hue, in the ruler as well', async () => {
+      renderWorkspace({ card: scored({ recommendation: null, overall: null }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      for (const word of within(verdictBox()).getAllByText('Not scored')) {
+        expect(word.className).not.toMatch(/ready|unresolved|closed/);
+      }
+      expectNoHueRuler();
+      expect(ruler().querySelector('[data-score-mark]')).toBeNull();
+      expect(ruler().querySelectorAll('[data-score-cut]')).toHaveLength(2);
+    });
+
+    it.each([
+      [0, 'reject', 'closed'],
+      [44, 'reject', 'closed'],
+      [45, 'hold', 'unresolved'],
+      [64, 'hold', 'unresolved'],
+      [65, 'advance', 'ready'],
+      [100, 'advance', 'ready'],
+    ])('at %s, a stored %s paints the %s zone in its mark and the other two in their light step', async (overall, recommendation, current) => {
+      renderWorkspace({ card: scored({ overall, recommendation }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      for (const family of ['closed', 'unresolved', 'ready']) {
+        expect(zone(family)).toHaveClass(family === current ? `bg-${family}` : `bg-${family}-light`);
+        expect(zone(family)).toHaveClass('data-fill');
+      }
+      expect(document.querySelector('[data-ruler-zone][data-current]')).toBe(zone(current));
+      expect(ruler().querySelector('[data-score-mark]')).toHaveStyle({ left: `${overall}%` });
+    });
+
+    it('never says Select beside a Reject: the stored verdict decides, and the mark stays at the raw score', async () => {
+      renderWorkspace({ card: scored({ recommendation: 'reject', overall: 72 }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(verdictBox()).toHaveClass('bg-closed-soft', 'border-closed');
+      expect(zone('closed')).toHaveClass('bg-closed');
+      expect(document.querySelector('[data-ruler-zone][data-current]')).toBe(zone('closed'));
+      expect(zone('ready')).toHaveClass('bg-ready-light');
+      expect(within(ruler()).getByText('Reject')).toHaveClass('text-closed-text', 'font-semibold');
+      expect(within(ruler()).getByText('Select 65')).not.toHaveClass('font-semibold');
+      expect(ruler().querySelector('[data-score-mark]')).toHaveStyle({ left: '72%' });
+    });
+
+    it('gives a score with no verdict of its own no hue and no emphasis, with the mark at the score', async () => {
+      renderWorkspace({ card: scored({ recommendation: 'human_review', overall: 67 }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expectNoHueRuler();
+      expect(ruler().querySelector('[data-score-mark]')).toHaveStyle({ left: '67%' });
+    });
+
+    describe('a scorecard held for thin evidence has no hue, and its words do not change', () => {
+      it.each([
+        ['advance', 'Select'],
+        ['hold', 'Borderline'],
+        ['reject', 'Reject'],
+      ])('a held %s: no wash, a plain edge, an ink figure, an ink circle and a grey ruler', async (recommendation, word) => {
+        renderWorkspace({ card: scored({ recommendation, overall: 80, held: true }) });
+        await screen.findByRole('heading', { name: 'AI recommendation' });
+        expect(screen.getByText('Not enough interview evidence to decide')).toBeInTheDocument();
+        const box = verdictBox();
+        expect(box).toHaveAttribute('data-verdict-box', 'firm');
+        expect(box).toHaveClass('border-rule-2');
+        expect(box.className).not.toMatch(/bg-|ready|unresolved|closed/);
+        expect(within(box).getByText('80')).toHaveClass('text-ink');
+        const verdict = box.querySelector('[data-recommendation]')!;
+        expect(verdict).toHaveClass('text-ink');
+        expect(verdict).toHaveTextContent(word);
+        expect(box.querySelector('[data-verdict-mark]')).toHaveClass('text-ink');
+        expectNoHueRuler();
+        expect(ruler().querySelector('[data-score-mark]')).toHaveStyle({ left: '80%' });
+      });
+
+      it('keeps the shape of the verdict and the dashes of a provisional one', async () => {
+        renderWorkspace({
+          card: scored({ recommendation: 'advance', overall: 80, held: true, status: 'incomplete_evidence', results: RESULTS }),
+        });
+        await screen.findByRole('heading', { name: 'AI recommendation' });
+        expect(verdictBox()).toHaveAttribute('data-verdict-box', 'provisional');
+        expect(verdictBox()).toHaveClass('border-dashed', 'border-ink-secondary');
+        expect(verdictBox().className).not.toMatch(/ready|bg-/);
+        expect(verdictBox().querySelector('[data-verdict-mark]')).toHaveAttribute('data-verdict-mark', 'full');
+      });
+
+      it('gives its ratings and its evidence numbers no hue either, on the rubric and on the strip', async () => {
+        renderWorkspace({ card: scored({ recommendation: 'advance', overall: 80, held: true }) });
+        await screen.findByRole('heading', { name: 'AI recommendation' });
+        for (const row of rubricRows()) {
+          for (const pip of row.querySelectorAll('[data-rating-pips] > .data-fill')) {
+            expect(pip).toHaveClass('bg-ink', 'border-ink');
+          }
+          expect(row.innerHTML).not.toMatch(/(?:bg|text|border)-(?:ready|unresolved|closed)/);
+        }
+        expect(ticks().length).toBeGreaterThan(0);
+        for (const strip of ticks()) expect(strip.getAttribute('class') ?? '').not.toMatch(/ready|unresolved|closed/);
+      });
+
+      it('reaches the fallback card too, the one Review prints when it cannot use the rubric pane', async () => {
+        // No completed screening to open, so the rubric pane has no session and the latest scorecard takes the card.
+        const unfinished: Session = { ...SESSION, status: 'failed' };
+        renderWorkspace({ session: unfinished, legs: [], card: scored({ recommendation: 'advance', overall: 80, held: true }) });
+        const card = await screen.findByRole('region', { name: 'Overall assessment' });
+        expect(document.querySelector('[data-verdict-box]')).toBeNull();
+        expect(within(card).getByText('80')).toHaveClass('text-ink');
+        expect(card.querySelector('[data-recommendation="advance"]')).toHaveClass('text-ink');
+        expect(card.innerHTML).not.toMatch(/(?:bg|text)-(?:ready|unresolved|closed)/);
+      });
+
+      // Review no longer opens an R1 session (#413), so an R1 row is read on the shared scorecard view.
+      describe('on the scorecard view, for an R1 row', () => {
+        /** As the scorer stores one: the column NULL, raw keeping the truth. */
+        const r1Row = (recommendation: string | null, stored: string, valid: boolean) => {
+          const row = scored({ recommendation, overall: 80, results: [metricResult('m-a', 'Rapport', 5000, 4, []), metricResult('m-b', 'Closing', 5000, 2, [])] });
+          return { ...row, raw: { ...row.raw, recommendation: stored, r1: { outcome: 'scored', valid, gate: { passed: valid, failures: [] } } } } as unknown as Assessment;
+        };
+
+        it('prints the ratings of a failed gate in ink, the words and figures unchanged', () => {
+          const { container: card } = render(<RoleScorecardView assessment={r1Row(null, 'human_review', false)} />);
+          expect(card.querySelector('[data-recommendation="human_review"]')).toHaveClass('text-ink');
+          expect(within(card).getByText('Needs human review')).toBeInTheDocument();
+          expect(within(card).getByText('Excellent')).toHaveClass('text-ink');
+          expect(within(card).getByText('Average')).toHaveClass('text-ink');
+          expect(within(card).getByText('2/4')).toBeInTheDocument();
+          expect(card.innerHTML).not.toMatch(/(?:bg|text)-(?:ready|closed)/);
+          expect(screen.queryByText('Not enough interview evidence to decide')).toBeNull();
+        });
+
+        it('keeps a valid R1 row in colour', () => {
+          const { container: card } = render(<RoleScorecardView assessment={r1Row('advance', 'advance', true)} />);
+          expect(within(card).getByText('Excellent')).toHaveClass('text-ready-text');
+          expect(within(card).getByText('Average')).toHaveClass('text-unresolved-text');
+        });
+      });
+
+      it('leaves the same row in colour when it is not held', async () => {
+        renderWorkspace({ card: scored({ recommendation: 'advance', overall: 80 }) });
+        await screen.findByRole('heading', { name: 'AI recommendation' });
+        expect(verdictBox()).toHaveClass('bg-ready-soft', 'border-ready');
+        expect(zone('ready')).toHaveClass('bg-ready');
+      });
+    });
+
+    it('lays the zones out Reject, Borderline, Select, each as wide as its cut-offs say', async () => {
+      renderWorkspace({ card: scored({ overall: 67 }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      const zones = [...document.querySelectorAll<HTMLElement>('[data-ruler-zone]')];
+      expect(zones.map((el) => el.getAttribute('data-ruler-zone'))).toEqual(['closed', 'unresolved', 'ready']);
+      expect(zones.map((el) => el.style.width)).toEqual(['45%', '20%', '35%']);
+    });
+
+    it('prints each label in its own family, the current one heavier, and the 100 quiet', async () => {
+      renderWorkspace({ card: scored({ overall: 50, recommendation: 'hold' }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      const on = within(ruler());
+      expect(on.getByText('Reject')).toHaveClass('text-closed-text');
+      expect(on.getByText('Reject')).not.toHaveClass('font-semibold');
+      expect(on.getByText('Borderline 45')).toHaveClass('text-unresolved-text', 'font-semibold');
+      expect(on.getByText('Select 65')).toHaveClass('text-ready-text');
+      expect(on.getByText('Select 65')).not.toHaveClass('font-semibold');
+      // It takes the row's own quiet ink.
+      expect(on.getByText('100').className).not.toMatch(/ready|unresolved|closed/);
+      expect(on.getByText('100').parentElement).toHaveClass('text-ink-tertiary');
+    });
+
+    it('sets Borderline and Select back to back on the Select tick, so they cannot run together on a phone', async () => {
+      renderWorkspace({ card: scored({ overall: 50, recommendation: 'hold' }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      const on = within(ruler());
+      expect(on.getByText('Borderline 45')).toHaveStyle({ left: '65%' });
+      expect(on.getByText('Borderline 45')).toHaveClass('-translate-x-full', 'pr-1');
+      expect(on.getByText('Select 65')).toHaveStyle({ left: '65%' });
+      expect(on.getByText('Select 65')).toHaveClass('pl-1');
+    });
+
+    it('keeps the score mark and the cut-off ticks as they were, so they read across any zone', async () => {
+      renderWorkspace({ card: scored({ overall: 67 }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(ruler().querySelector('[data-score-mark]')).toHaveClass('bg-ink', 'data-fill');
+      expect(ruler().querySelector('[data-score-mark]')).toHaveStyle({ left: '67%' });
+      expect(ruler().querySelectorAll('[data-score-cut]')).toHaveLength(2);
+    });
+
+    it('says what to check before deciding in the unresolved family, never crimson', async () => {
+      renderWorkspace({
+        card: scored({ status: 'incomplete_evidence', results: RESULTS, redFlags: ['Ended the call early'] }),
+      });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      // The role fit panel prints "Red flag:" as a screen reader prefix on its chips too.
+      const lead = screen.getAllByText('Red flag:').find((el) => el.closest('li')?.querySelector('svg'))!;
+      const missing = screen.getByText('Closing: insufficient evidence.');
+      expect(lead).toHaveClass('text-unresolved-text');
+      expect(missing).toHaveClass('text-unresolved-text');
+      expect(lead.closest('li')!.querySelector('svg')).toHaveClass('text-unresolved-text');
+      expect(missing.closest('li')!.querySelector('svg')).toHaveClass('text-unresolved-text');
+      expect(lead.closest('ul')!.innerHTML).not.toMatch(/danger|error/);
+    });
+
+    it('keeps "Red flags: none identified" quiet', async () => {
+      renderWorkspace({ card: scored({}) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(screen.getByText('Red flags: none identified')).toHaveClass('text-ink-tertiary');
+    });
+
+    it.each([
+      [4, 4, 'ready'],
+      [3, 4, 'ready'],
+      [2, 4, 'unresolved'],
+      [1, 4, 'closed'],
+      [5, 5, 'ready'],
+      [4, 5, 'ready'],
+      [3, 5, 'unresolved'],
+      [2, 5, 'closed'],
+      [1, 5, 'closed'],
+    ])('rates %s of %s in the %s family: pips, word and figure, the name and weight unchanged', async (score, scale, family) => {
+      renderWorkspace({
+        card: scored({ scale, results: [metricResult('m-target', 'Target clarity', 10000, score, ['My target is twelve a month'])] }),
+      });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      const [row] = rubricRows();
+      const pips = [...row.querySelectorAll<HTMLElement>('[data-rating-pips] > span')];
+      expect(pips).toHaveLength(scale);
+      pips.slice(0, score).forEach((pip) => expect(pip).toHaveClass(`bg-${family}`, `border-${family}`, 'data-fill'));
+      pips.slice(score).forEach((pip) => {
+        expect(pip).toHaveClass('border-control');
+        expect(pip.className).not.toMatch(/data-fill|bg-/);
+      });
+      expect(within(row).getByText(new RegExp(`, ${score}/${scale}$`)).parentElement).toHaveClass(`text-${family}-text`);
+      expect(within(row).getByRole('heading', { level: 4 })).toHaveClass('text-ink');
+      expect(within(row).getByText('100%')).toHaveClass('text-ink-tertiary');
+    });
+
+    it('says Insufficient evidence in the unresolved family, with a dashed edge, and prints no pips', async () => {
+      renderWorkspace({ card: scored({ status: 'incomplete_evidence', results: RESULTS }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      const row = rubricRows()[3];
+      const pill = within(row).getByText('Insufficient evidence');
+      expect(pill).toHaveClass('text-unresolved-text', 'border-unresolved', 'border-dashed');
+      expect(row.querySelector('[data-rating-pips]')).toBeNull();
+    });
+
+    it('keeps a pressed seek chip in ink: ink is selection', async () => {
+      renderWorkspace({ card: scored({}) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      fireEvent.click(chip(1));
+      await waitFor(() => expect(chip(1)).toHaveAttribute('aria-pressed', 'true'));
+      expect(chip(1)).toHaveClass('bg-ink', 'text-paper', 'border-ink');
+    });
+
+    it('changes no word: the block reads as it always did', async () => {
+      renderWorkspace({ card: scored({ recommendation: 'hold', overall: 58 }) });
+      await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(verdictBox()).toHaveTextContent('Borderline58/100RejectBorderline 45Select 65100');
+    });
   });
 
   it('says the verdict in one sentence built from the figures', async () => {
@@ -1478,12 +1960,14 @@ describe('the reasoning pane', () => {
     expect(screen.queryByText('Red flags: none identified')).toBeNull();
   });
 
-  it('lists a red flag in ink, as the AI said it', async () => {
+  it('lists a red flag as the AI said it, its lead word unresolved and the flag in the ink of the list', async () => {
     renderWorkspace({
       card: assessment({ role_fit: { score: 0, matched_skills: [], gaps: [], red_flags: ['Vague on numbers'], notes: '' } }),
     });
     const check = (await screen.findByRole('heading', { name: 'Check before deciding' })).parentElement!.parentElement!;
     expect(check).toHaveTextContent('Red flag: Vague on numbers');
+    expect(within(check).getByText('Red flag:')).toHaveClass('text-unresolved-text');
+    expect(within(check).getByText('Red flag:').parentElement!.className).not.toMatch(/ready|unresolved|closed/);
     expect(screen.queryByText('Red flags: none identified')).toBeNull();
   });
 

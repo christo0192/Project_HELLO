@@ -19,6 +19,7 @@ import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { R1Section } from "../components/r1/R1Section";
 import { Combobox, EmptyPanel, StatusBadge } from "../components/design";
+import { FAMILY_CLASSES, verdictFamily } from "../components/design/tones";
 import {
   CandidateButton,
   CandidateErrorState,
@@ -60,7 +61,7 @@ import { latestScreeningAssessment } from "../lib/latest-screening-assessment";
 import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
 import { candidateTabFrom, defaultCandidateTab, hasPhoneReview } from "../lib/candidate-tabs";
 import type { CandidateTab } from "../lib/candidate-tabs";
-import { r1ResultLine } from "../lib/r1";
+import { r1ResultLine, r1ResultRound } from "../lib/r1";
 import type { R1Round } from "../lib/r1-types";
 import {
   DUPLICATE_HOLD_NOTICE,
@@ -429,6 +430,9 @@ export function CandidateDetailPage() {
 
   // One figure per pipeline. Hidden with the phone score while an appeal blocks decision use.
   const r1Line = decisionBlocked ? null : r1ResultLine(r1Rounds);
+  // A verdict, so it reads as it does on the R1 tab below it.
+  const r1LineFamily = verdictFamily(r1ResultRound(r1Rounds)?.recommendation);
+  const r1LineShade = r1LineFamily ? FAMILY_CLASSES[r1LineFamily].text : "text-ink-secondary";
 
   // The list hands over the address it was on, so Back returns to the same page
   // of the same filter. Only a query string is taken from router state.
@@ -474,7 +478,7 @@ export function CandidateDetailPage() {
                 its own detail; nothing on an API without the field. */}
             <IntakeBadge value={candidate.intake_type} />
             {reviewing && r1Line && (
-              <span className="text-meta text-[var(--c-ink-secondary)]">{r1Line}</span>
+              <span className={`text-meta ${r1LineShade}`}>{r1Line}</span>
             )}
             <CandidateHeadlineFacts
               // On this tab the log header prints the role and the length.
@@ -504,7 +508,7 @@ export function CandidateDetailPage() {
           decisionBlocked || reviewing ? undefined : (
             <div className="flex flex-col gap-1 sm:items-end">
               <HeaderScore assessments={assessments} sessions={sessions} />
-              {r1Line && <p className="text-label text-ink-secondary">{r1Line}</p>}
+              {r1Line && <p className={`text-label ${r1LineShade}`}>{r1Line}</p>}
             </div>
           )
         }
@@ -1231,7 +1235,7 @@ function PhoneCycleCard({
               <li key={`${cycle.cycle_number}-${cycle.created_at}`} className="py-2 text-sm">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="font-medium text-ink">{cycleLabel(cycle)}</span>
-                  <StatusBadge tone={cycle.terminal_at ? "neutral" : "info"}>
+                  <StatusBadge tone={engagementStateTerm(cycle.state).tone}>
                     <span title={cycle.state}>{cycle.state === "unknown" ? "Unknown" : engagementStateTerm(cycle.state).label}</span>
                   </StatusBadge>
                 </div>
@@ -1271,7 +1275,7 @@ function PhoneCycleCard({
           )}
 
           {current?.state === "opted_out" ? (
-            <p className="mt-3 text-sm text-warning-text">
+            <p className="mt-3 text-sm text-ink">
               Re-screening is unavailable because the candidate opted out. Renewed consent requires separate governance.
             </p>
           ) : canRescreen && requiresVerification && !admin ? (
@@ -1555,16 +1559,16 @@ function AppealsSection({
                   {appealCategoryLabel(a.category)}
                 </p>
                 {/* Words, not the stored enum ("Under review", never
-                    `under_review`). Pending appeals take the accent tint
-                    (something to act on), a grant the positive one, a
-                    denial stays neutral: it is resolved, not a success. */}
+                    `under_review`). A pending appeal is unresolved (something
+                    to act on), a grant is ready, and a denial is closed: it is
+                    resolved, with no judgement implied. */}
                 <Tag
                   tone={
                     isAppealPending(a.status)
-                      ? "accent"
+                      ? "unresolved"
                       : a.status === "granted"
-                        ? "positive"
-                        : "neutral"
+                        ? "ready"
+                        : "closed"
                   }
                   srPrefix="Appeal status:"
                 >

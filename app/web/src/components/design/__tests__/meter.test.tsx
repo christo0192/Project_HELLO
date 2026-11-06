@@ -129,6 +129,37 @@ describe('Meter', () => {
     );
     expect(bands).toEqual(['low', 'fair', 'strong']);
   });
+
+  it.each([
+    [1, 'Low', 'var(--closed)', 'text-closed-text'],
+    [5, 'Fair', 'var(--unresolved)', 'text-unresolved-text'],
+    [9, 'Strong', 'var(--ready)', 'text-ready-text'],
+  ])('at %s reads %s, and the fill and the words take that band\'s family', (value, word, fill, text) => {
+    const { container } = render(<Meter label="Grammar" value={value} />);
+    expect(container.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toBe(fill);
+    expect(screen.getByText(word)).toHaveClass(text);
+    expect(screen.getByText(`${value}/10`)).toHaveClass(text);
+  });
+
+  it('never contradicts its word: 7 of 10 reads Strong, so it is ready, whatever its position on the scale', () => {
+    const { container } = render(<Meter label="Grammar" value={7} />);
+    expect(screen.getByText('Strong')).toHaveClass('text-ready-text');
+    expect(container.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toBe('var(--ready)');
+  });
+
+  it('stays in ink when `plain`: a reading where a high value is not a good one', () => {
+    const { container } = render(<Meter label="Impact" value={9} plain />);
+    expect(container.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toBe('var(--c-ink)');
+    expect(screen.getByText('Strong')).not.toHaveClass('text-ready-text');
+  });
+
+  it('takes the family it is given over its band, and keeps its own word', () => {
+    const { container } = render(<Meter label="Overall score" value={70} max={100} thresholds={{ fair: 0.5, strong: 0.75 }} family="ready" />);
+    expect(container.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toBe('var(--ready)');
+    expect(screen.getByText('Fair')).toHaveClass('text-ready-text');
+    expect(screen.getByText('70/100')).toHaveClass('text-ready-text');
+    expect(screen.getByRole('meter')).toHaveAttribute('aria-valuetext', '70 out of 100 — Fair');
+  });
 });
 
 describe('SurfaceCard', () => {

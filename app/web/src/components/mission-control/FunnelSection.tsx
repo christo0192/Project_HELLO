@@ -29,17 +29,19 @@ import {
   Th,
   Tr,
 } from '../design';
+import { countTone, figureToneClass, type FigureTone } from '../design/tones';
 import { formatDateTime } from './statusMeta';
 
 function pct(r: number | null): string {
   return r == null ? '—' : `${(r * 100).toFixed(0)}%`;
 }
 
-function convTone(r: number | null): 'success' | 'neutral' | 'danger' {
+/** A low conversion is worth a second look. It is not a fault on our side, so not crimson. */
+function convTone(r: number | null): 'success' | 'neutral' | 'warning' {
   if (r == null) return 'neutral';
   if (r >= 0.6) return 'success';
   if (r >= 0.3) return 'neutral';
-  return 'danger';
+  return 'warning';
 }
 
 export function FunnelSection() {
@@ -104,13 +106,15 @@ export function FunnelSection() {
     { label: 'Reached reference check', value: t.reached_reference_check, conv: c.qualified_to_reference_check, untracked },
   ];
 
-  const dropBuckets: Array<{ label: string; value: number }> = [
-    { label: 'Needs manual review', value: t.needs_review },
-    { label: 'Parse failed', value: t.parse_failed },
-    { label: 'Dropped at consent', value: t.consent_dropped },
-    { label: 'Disqualified', value: t.disqualified },
-    { label: 'Borderline', value: t.on_hold },
-    { label: 'Human review', value: t.human_review },
+  const dropBuckets: Array<{ label: string; value: number; tone: FigureTone }> = [
+    { label: 'Needs manual review', value: t.needs_review, tone: 'warning' },
+    // A resume with no readable text counts here as well as a parser fault, so this is
+    // not shown to be ours, and it is the same kind of event as the Ashby row above it.
+    { label: 'Parse failed', value: t.parse_failed, tone: 'warning' },
+    { label: 'Dropped at consent', value: t.consent_dropped, tone: 'closed' },
+    { label: 'Disqualified', value: t.disqualified, tone: 'closed' },
+    { label: 'Borderline', value: t.on_hold, tone: 'warning' },
+    { label: 'Human review', value: t.human_review, tone: 'warning' },
   ];
 
   const totalMinutes = Math.round(t.total_call_seconds / 60);
@@ -136,7 +140,7 @@ export function FunnelSection() {
       />
 
       {recomputeError ? (
-        <p className="px-1 text-xs text-danger" role="alert">
+        <p className="px-1 text-xs text-error-text" role="alert">
           Recompute failed: {recomputeError}
         </p>
       ) : null}
@@ -195,7 +199,9 @@ export function FunnelSection() {
             {dropBuckets.map((b) => (
               <div key={b.label}>
                 <p className="form-label">{b.label}</p>
-                <p className="tabular-nums text-base font-semibold text-ink">{b.value}</p>
+                <p className={`tabular-nums text-base font-semibold ${figureToneClass(countTone(b.value, b.tone))}`}>
+                  {b.value}
+                </p>
               </div>
             ))}
           </div>

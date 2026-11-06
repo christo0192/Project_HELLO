@@ -39,8 +39,8 @@ describe('allowlistEntryState', () => {
     expect(allowlistStateLabel('pending')).toBe('Pending');
     expect(allowlistStateLabel('disabled')).toBe('Disabled');
     expect(allowlistStateTone('linked')).toBe('success');
-    expect(allowlistStateTone('pending')).toBe('info');
-    expect(allowlistStateTone('disabled')).toBe('neutral');
+    expect(allowlistStateTone('pending')).toBe('warning');
+    expect(allowlistStateTone('disabled')).toBe('closed');
   });
 });
 

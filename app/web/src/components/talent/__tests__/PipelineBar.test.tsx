@@ -184,8 +184,8 @@ describe('segmentsFor — nested funnel stages become disjoint buckets', () => {
 
 describe('PipelineBar', () => {
   const SEGMENTS = [
-    { key: 'a', label: 'Alpha', value: 3, tone: 'accent' as const },
-    { key: 'b', label: 'Beta', value: 1, tone: 'positive' as const },
+    { key: 'a', label: 'Alpha', value: 3, tone: 'moving' as const },
+    { key: 'b', label: 'Beta', value: 1, tone: 'ready' as const },
   ];
 
   it('sizes each segment against the stated total, not the parts', () => {
@@ -214,7 +214,7 @@ describe('PipelineBar', () => {
     const { container } = render(
       <PipelineBar
         label="t"
-        segments={[...SEGMENTS, { key: 'z', label: 'Zero', value: 0, tone: 'negative' as const }]}
+        segments={[...SEGMENTS, { key: 'z', label: 'Zero', value: 0, tone: 'danger' as const }]}
       />,
     );
     expect(screen.getByText('Zero')).toBeInTheDocument();
@@ -235,7 +235,7 @@ describe('PipelineBar', () => {
         total={4}
         segments={[
           ...SEGMENTS,
-          { key: 'u', label: 'Selected', value: 99, tone: 'positive' as const, unavailable: 'Not tracked yet' },
+          { key: 'u', label: 'Selected', value: 99, tone: 'ready' as const, unavailable: 'Not tracked yet' },
         ]}
       />,
     );
@@ -258,7 +258,7 @@ describe('PipelineBar', () => {
       />,
     );
     const fill = container.querySelector<HTMLElement>('[data-pipeline-track] > span');
-    expect(fill?.style.backgroundColor).toBe('var(--c-border)');
+    expect(fill?.style.backgroundColor).toBe('var(--rule-2)');
     const track = container.querySelector('[data-pipeline-track]');
     expect(track?.className).toContain('border-[var(--c-control-border)]');
     expect(track?.className).toContain('bg-[var(--c-surface)]');
@@ -266,7 +266,19 @@ describe('PipelineBar', () => {
 
   it('DRAWS EVERY TONE DIFFERENTLY, because the swatch is the only link to the bar', () => {
     // Screening and Rejected once shared a fill, and so did their swatches.
-    const tones: PipelineTone[] = ['neutral', 'caution', 'voice', 'negative', 'accent', 'positive'];
+    const tones: PipelineTone[] = [
+      'neutral',
+      'moving-light',
+      'moving',
+      'moving-deep',
+      'ready-light',
+      'ready',
+      'unresolved-light',
+      'unresolved',
+      'closed-light',
+      'closed',
+      'danger',
+    ];
     const { container } = render(
       <PipelineBar
         label="t"
@@ -281,13 +293,37 @@ describe('PipelineBar', () => {
     expect(new Set(fills).size).toBe(tones.length);
   });
 
-  it('gives the voice hue to the voice tone alone', () => {
+  it.each([
+    ['moving-light', 'var(--moving-light)'],
+    ['moving', 'var(--moving)'],
+    ['moving-deep', 'var(--moving-deep)'],
+    ['ready-light', 'var(--ready-light)'],
+    ['ready', 'var(--ready)'],
+    ['unresolved-light', 'var(--unresolved-light)'],
+    ['unresolved', 'var(--unresolved)'],
+    ['closed-light', 'var(--closed-light)'],
+    ['closed', 'var(--closed)'],
+    ['danger', 'var(--danger)'],
+  ] as Array<[PipelineTone, string]>)('fills a %s segment and its key with %s', (tone, fill) => {
     const { container } = render(
-      <PipelineBar label="t" segments={[{ key: 'v', label: 'On a call', value: 1, tone: 'voice' }]} />,
+      <PipelineBar label="t" segments={[{ key: 'k', label: 'Key', value: 1, tone }]} />,
     );
-    expect(container.querySelector<HTMLElement>('[data-pipeline-segment]')?.style.backgroundColor).toBe(
-      'var(--voice-mark)',
+    expect(container.querySelector<HTMLElement>('[data-pipeline-segment]')?.style.backgroundColor).toBe(fill);
+    const key = within(container).getByText('Key').parentElement!.querySelector<HTMLElement>('[aria-hidden="true"]');
+    expect(key?.style.backgroundColor).toBe(fill);
+  });
+
+  it('never draws a stage in the voice hue: orange means the candidate speaking', () => {
+    const { container } = render(
+      <PipelineBar
+        label="t"
+        segments={[
+          { key: 'a', label: 'Alpha', value: 1, tone: 'moving-deep' },
+          { key: 'b', label: 'Beta', value: 1, tone: 'danger' },
+        ]}
+      />,
     );
+    expect(container.innerHTML).not.toMatch(/voice/);
   });
 
   it('leaves an unmeasured key hollow, so it cannot be read as a block of the bar', () => {
@@ -297,7 +333,7 @@ describe('PipelineBar', () => {
         total={4}
         segments={[
           ...SEGMENTS,
-          { key: 'u', label: 'Selected', value: 0, tone: 'positive', unavailable: 'Not tracked yet' },
+          { key: 'u', label: 'Selected', value: 0, tone: 'ready', unavailable: 'Not tracked yet' },
         ]}
       />,
     );
@@ -337,8 +373,8 @@ describe('PipelineBar', () => {
         label="t"
         total={5}
         segments={[
-          { key: 'a', label: 'Alpha', value: 3, tone: 'accent' },
-          { key: 'b', label: 'Beta', value: 4, tone: 'positive' },
+          { key: 'a', label: 'Alpha', value: 3, tone: 'moving' },
+          { key: 'b', label: 'Beta', value: 4, tone: 'ready' },
         ]}
       />,
     );
@@ -392,7 +428,7 @@ describe('PipelineBar', () => {
         total={4}
         segments={[
           ...SEGMENTS,
-          { key: 'u', label: 'Selected', value: 0, tone: 'positive', unavailable: 'Not tracked yet' },
+          { key: 'u', label: 'Selected', value: 0, tone: 'ready', unavailable: 'Not tracked yet' },
         ]}
         onToggle={onToggle}
       />,
@@ -410,8 +446,8 @@ describe('PipelineBar', () => {
 
 describe('PipelineBar hover detail', () => {
   const SEGS = [
-    { key: 'a', label: 'Alpha', value: 3, tone: 'accent' as const },
-    { key: 'b', label: 'Beta', value: 1, tone: 'positive' as const },
+    { key: 'a', label: 'Alpha', value: 3, tone: 'moving' as const },
+    { key: 'b', label: 'Beta', value: 1, tone: 'ready' as const },
     { key: 'z', label: 'Zero', value: 0, tone: 'neutral' as const },
   ];
   const tooltip = (c: HTMLElement) => c.querySelector('[data-pipeline-tooltip]');

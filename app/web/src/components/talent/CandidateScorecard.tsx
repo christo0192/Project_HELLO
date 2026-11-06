@@ -43,8 +43,10 @@ import { useId } from 'react';
 import type { ReactNode } from 'react';
 import type { Assessment, Recommendation } from '../../types';
 import { Meter, SurfaceCard, Tag } from '../design/candidate';
+import { FAMILY_CLASSES, verdictFamily } from '../design/tones';
 import { VerdictMark } from '../session/VerdictMark';
 import { cx } from '../design/cx';
+import { isEvidenceInsufficient } from '../../lib/evidence-hold';
 import { humanizeEnum } from '../../lib/humanize';
 import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
 
@@ -62,8 +64,7 @@ const OVERALL_THRESHOLDS = { fair: 0.5, strong: 0.75 };
 
 /**
  * An AI judgement about a candidate is never crimson: that hue means a fault on
- * our side, and on a judgement it would anchor the reviewer. `accent` is the
- * heaviest ink edge, and the word says the rest.
+ * our side. `accent` is the heaviest ink edge, and the word says the rest.
  */
 const SIGNAL_TONE: Record<string, 'positive' | 'caution' | 'accent'> = {
   none: 'positive',
@@ -252,7 +253,8 @@ function SignalBlock({
           {humanizeEnum(signal.level)}
         </Tag>
       </div>
-      <Meter label="Impact" value={signal.impact_score} />
+      {/* A filler or native-language impact is not better when high, so it is not coloured as if it were. */}
+      <Meter label="Impact" value={signal.impact_score} plain />
       {signal.examples.length > 0 && (
         <Prose>
           <span className="font-medium">Examples:</span>{' '}
@@ -317,6 +319,9 @@ export function CandidateScorecard({
       ? humanizeEnum(recommendation)
       : null;
   const roundedOverall = Math.round(overall_score);
+  // A score held for thin evidence is no result to act on, so nothing on the card takes a hue.
+  const held = isEvidenceInsufficient(assessment);
+  const verdict = held ? null : verdictFamily(recommendation);
 
   const hasSignalBlocks =
     communication?.filler_usage != null || communication?.native_language_usage != null;
@@ -327,7 +332,7 @@ export function CandidateScorecard({
       <SurfaceCard as="section" label="Overall assessment" className="p-4 sm:p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-baseline gap-2">
-            <span className="text-stat tabular-nums text-[var(--c-ink)]">
+            <span className={cx('text-stat tabular-nums', verdict ? FAMILY_CLASSES[verdict].text : 'text-[var(--c-ink)]')}>
               {roundedOverall}
             </span>
             <span className="text-sm text-[var(--c-ink-secondary)]">/ 100</span>
@@ -335,7 +340,7 @@ export function CandidateScorecard({
           {recoLabel && (
             <span>
               <span className="sr-only">Recommendation: </span>
-              <VerdictMark recommendation={recommendation} size="lg" />
+              <VerdictMark recommendation={recommendation} size="lg" plain={held} />
             </span>
           )}
         </div>
@@ -346,9 +351,13 @@ export function CandidateScorecard({
             value={overall_score}
             max={100}
             emphasis
-            // The legacy card coloured the overall score at 75 and 50 of
-            // 100 — not the 7/5-of-10 fractions the per-metric bars use.
+            // The legacy card's word cuts the overall score at 75 and 50 of
+            // 100, not the 7/5-of-10 fractions the per-metric bars use.
             thresholds={OVERALL_THRESHOLDS}
+            // Those are not the verdict's cuts (65 and 45), so the bar takes
+            // the verdict's family: a 70 is Select in green, over "Fair".
+            family={verdict ?? undefined}
+            plain={verdict === null}
           />
         </div>
 
@@ -390,18 +399,19 @@ export function CandidateScorecard({
             className="sm:col-span-2"
           >
             <div className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2">
-              <Meter label="Score" value={communication?.score ?? 0} />
+              {/* A missing score prints as 0, and an absence is no Low rating, so it takes no hue. */}
+              <Meter label="Score" value={communication?.score ?? 0} plain={held || communication?.score == null} />
               {communication?.clarity != null && (
-                <Meter label="Clarity" value={communication.clarity} />
+                <Meter label="Clarity" value={communication.clarity} plain={held} />
               )}
               {communication?.structure != null && (
-                <Meter label="Structure" value={communication.structure} />
+                <Meter label="Structure" value={communication.structure} plain={held} />
               )}
               {communication?.listening != null && (
-                <Meter label="Listening" value={communication.listening} />
+                <Meter label="Listening" value={communication.listening} plain={held} />
               )}
               {communication?.rapport != null && (
-                <Meter label="Rapport" value={communication.rapport} />
+                <Meter label="Rapport" value={communication.rapport} plain={held} />
               )}
             </div>
             {english && (
@@ -415,10 +425,10 @@ export function CandidateScorecard({
                   </Tag>
                 </div>
                 <div className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
-                  <Meter label="Grammar" value={english.grammar} />
-                  <Meter label="Vocabulary" value={english.vocabulary} />
-                  <Meter label="Fluency" value={english.fluency} />
-                  <Meter label="Coherence" value={english.coherence} />
+                  <Meter label="Grammar" value={english.grammar} plain={held} />
+                  <Meter label="Vocabulary" value={english.vocabulary} plain={held} />
+                  <Meter label="Fluency" value={english.fluency} plain={held} />
+                  <Meter label="Coherence" value={english.coherence} plain={held} />
                 </div>
                 <Prose>{english.notes}</Prose>
               </SurfaceCard>
@@ -440,9 +450,9 @@ export function CandidateScorecard({
             headingLevel={headingLevel}
             notes={tone.notes}
           >
-            <Meter label="Clarity" value={tone.clarity} />
-            <Meter label="Confidence" value={tone.confidence} />
-            <Meter label="Professionalism" value={tone.professionalism} />
+            <Meter label="Clarity" value={tone.clarity} plain={held} />
+            <Meter label="Confidence" value={tone.confidence} plain={held} />
+            <Meter label="Professionalism" value={tone.professionalism} plain={held} />
             <LabelledRow label="Sentiment">
               <Tag srPrefix="Sentiment:">{humanizeEnum(tone.sentiment)}</Tag>
             </LabelledRow>
@@ -457,7 +467,7 @@ export function CandidateScorecard({
               'No candidate responses are available to assess motivation.'
             }
           >
-            <Meter label="Score" value={motivation?.score ?? 0} />
+            <Meter label="Score" value={motivation?.score ?? 0} plain={held || motivation?.score == null} />
           </Group>
 
           {roleFit === 'inline' && (
@@ -468,7 +478,7 @@ export function CandidateScorecard({
             notes={role_fit.notes}
             className="sm:col-span-2"
           >
-            <Meter label="Fit score" value={role_fit.score} />
+            <Meter label="Fit score" value={role_fit.score} plain={held} />
             <SurfaceCard level="sunken" className="space-y-2 p-3">
               <TagGroup
                 label="Matched skills"
@@ -554,7 +564,7 @@ export function CandidateScorecardRoleFit({
           !supplementary && 'lg:grid-cols-[14rem_minmax(0,1fr)]',
         )}
       >
-        {!supplementary && <Meter label="Fit score" value={role_fit.score} />}
+        {!supplementary && <Meter label="Fit score" value={role_fit.score} plain={isEvidenceInsufficient(assessment)} />}
         <SurfaceCard level="sunken" className="grid grid-cols-1 gap-4 p-3 sm:grid-cols-3">
           <TagGroup
             label="Matched skills"

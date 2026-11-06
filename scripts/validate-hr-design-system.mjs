@@ -14,7 +14,8 @@
  *   contrast             every declared pair, computed from the tokens
  *   one voice            the orange lives in one pair of tokens, in one file
  *   raw colour           no hex, rgb or hsl outside the tokens; no stock Tailwind hue
- *   verdicts             a verdict stays in ink: no crimson, no voice
+ *   verdicts             a verdict and a rating take their family, by the one map:
+ *                        never crimson, never the voice, never `moving`
  *   surfaces             no blur, gradient or fixed ground; shadows float, in the
  *                        stylesheets and in source
  *   radii                sheet 8, box and control 4, chip 3, evidence 2, everywhere
@@ -49,6 +50,22 @@ export const TOKENS = {
   // text only (5.23:1 / 6.14:1).
   '--go': '#2f7a4f',
   '--go-strong': '#2a6e47',
+  // The four status families: the owner's request of 2026-11-06. Validated by the
+  // dataviz validator on --paper; docs/design/logsheet-colour-decision-2026-11-06.md.
+  '--moving': '#2f8bc3',
+  '--moving-light': '#72baeb',
+  '--moving-text': '#015e8c',
+  '--moving-soft': '#ddf0fe',
+  '--ready': '#0a693c',
+  '--ready-light': '#349d62',
+  '--ready-soft': '#dff3e5',
+  '--unresolved': '#958d0f',
+  '--unresolved-light': '#b7af47',
+  '--unresolved-text': '#6b6620',
+  '--unresolved-soft': '#efeed9',
+  '--closed': '#5d408a',
+  '--closed-light': '#ae96da',
+  '--closed-soft': '#efe9fd',
 };
 
 /** [foreground, background, minimum]: text 4.5:1, marks and control edges 3:1. */
@@ -75,6 +92,52 @@ export const CONTRAST_PAIRS = [
   ['--voice-mark', '--paper', 3],
   ['--voice-mark', '--field', 3],
   ['--ai', '--paper', 3],
+  // A family's text shade on every ground it is printed on, and on its own wash.
+  ['--moving-text', '--paper', 4.5],
+  ['--moving-text', '--field', 4.5],
+  ['--moving-text', '--desk', 4.5],
+  ['--moving-text', '--moving-soft', 4.5],
+  ['--ready', '--paper', 4.5],
+  ['--ready', '--field', 4.5],
+  ['--ready', '--desk', 4.5],
+  ['--ready', '--ready-soft', 4.5],
+  ['--unresolved-text', '--paper', 4.5],
+  ['--unresolved-text', '--field', 4.5],
+  ['--unresolved-text', '--desk', 4.5],
+  ['--unresolved-text', '--unresolved-soft', 4.5],
+  ['--closed', '--paper', 4.5],
+  ['--closed', '--field', 4.5],
+  ['--closed', '--desk', 4.5],
+  ['--closed', '--closed-soft', 4.5],
+  // Paper may sit on these three marks and no other family mark.
+  ['--paper', '--moving-text', 4.5],
+  ['--paper', '--ready', 4.5],
+  ['--paper', '--closed', 4.5],
+  // A family's mark on paper: bars, lines and dots.
+  ['--moving', '--paper', 3],
+  ['--ready', '--paper', 3],
+  ['--unresolved', '--paper', 3],
+  ['--closed', '--paper', 3],
+  // An evidence tag's resting edge is the mark, and it hovers onto the field.
+  ['--unresolved', '--field', 3],
+  // The verdict block: quiet text on its soft wash.
+  ['--ink-2', '--ready-soft', 4.5],
+  ['--ink-2', '--unresolved-soft', 4.5],
+  ['--ink-2', '--closed-soft', 4.5],
+  ['--ink-3', '--ready-soft', 4.5],
+  ['--ink-3', '--unresolved-soft', 4.5],
+  ['--ink-3', '--closed-soft', 4.5],
+  // The ruler prints all three verdicts' words on whichever wash the verdict took.
+  ['--unresolved-text', '--ready-soft', 4.5],
+  ['--closed', '--ready-soft', 4.5],
+  ['--ready', '--unresolved-soft', 4.5],
+  ['--closed', '--unresolved-soft', 4.5],
+  ['--ready', '--closed-soft', 4.5],
+  ['--unresolved-text', '--closed-soft', 4.5],
+  // A pressed evidence number: paper on the family's text shade.
+  ['--paper', '--unresolved-text', 4.5],
+  // The lightest step that clears 3:1 on paper. The other two rely on a printed label.
+  ['--ready-light', '--paper', 3],
 ];
 
 export const RADII = {
@@ -124,7 +187,7 @@ export const SHADOW_POP_ALLOWED = [
 export const INLINE_SHADOW_ALLOWED = ['src/components/talent/PipelineBar.tsx'];
 /** The animations that may exist: a loading pulse and the overlays. */
 export const KEYFRAMES_ALLOWED = ['skeleton-pulse', 'slide-over-in', 'dialog-in', 'combobox-in'];
-/** Where an AI verdict about a candidate is drawn. */
+/** Where an AI verdict about a candidate is drawn. Each may use a verdict's family and no other colour. */
 export const VERDICT_FILES = [
   'src/components/session/ScoreVerdict.tsx',
   'src/components/session/VerdictMark.tsx',
@@ -134,8 +197,13 @@ export const VERDICT_FILES = [
   'src/components/talent/CandidateScorecard.tsx',
   'src/components/Scorecard.tsx',
   'src/components/r1-review/VerdictBlock.tsx',
+  'src/components/session/RulerZones.tsx',
+  'src/components/session/RoleScorecardView.tsx',
+  'src/components/talent/EvidenceHoldNotice.tsx',
   'src/pages/R1InterviewsPage.tsx',
 ];
+/** The same rule, but these print ratings beside a quote, so each may use the highlighter once, on that quote. */
+export const VERDICT_FILES_WITH_A_QUOTE = ['src/components/r1-review/OverviewPanel.tsx'];
 export const TYPE_SCALE_PX = [12, 13, 14, 16, 20, 24, 30];
 export const SKELETON_RADII = [2, 3, 4, 8];
 /** Tailwind's stock scales that index.css has no token for. */
@@ -250,14 +318,45 @@ export function checkDesignSystem({ css, stylesheets, app, tailwind, main, packa
     new RegExp(`\\b(?:bg|text|border|ring|fill|stroke|from|to|via|divide|outline|decoration|accent|caret|placeholder|shadow)-(?:${STOCK_HUES})-\\d`),
   );
   if (stockHues.length) errors.push(`stock hue utilities in ${stockHues.join(', ')}`);
+  // Tailwind's colour map has `error`, not `danger`, so these compile to nothing: a
+  // fault written with one silently prints in whatever ink it inherits.
+  const noSuchColour = offenders(/(?<![\w-])(?:bg|text|border|ring|fill|stroke|outline|decoration)-danger(?![\w-])/);
+  if (noSuchColour.length) errors.push(`-danger utilities compile to nothing, use -error or -error-text, in ${noSuchColour.join(', ')}`);
   for (const scale of REPOINTED_SCALES) {
     if (!tailwind.includes(scale)) errors.push(`tailwind.config.js no longer re-points the stock scale ${scale.split(':')[0]}`);
   }
 
-  // ── Verdicts stay in ink ──────────────────────────────────────────────
-  const hued = /\b(?:bg|text|border|ring|fill|stroke|outline|decoration)-(?:error|danger|red-\d|voice|wash)|var\(--(?:danger|error|voice|wash)|tone:\s*'danger'/;
-  const verdicts = VERDICT_FILES.filter((rel) => hued.test(stripJs(sources[rel] ?? '')));
-  if (verdicts.length) errors.push(`a verdict takes a hue in ${verdicts.join(', ')}`);
+  // ── A verdict takes its family, and no other colour ───────────────────
+  // Crimson is a fault on our side and orange the candidate's voice, and a verdict is
+  // neither. Nothing about one is underway, so `moving` is out too.
+  const misused = /\b(?:bg|text|border|ring|fill|stroke|outline|decoration)-(?:error|danger|red-\d|voice|wash|moving)|var\(--(?:danger|error|voice|wash|moving)|tone:\s*'(?:danger|info|moving)'|tone=["{']+(?:danger|info|moving)/;
+  const verdicts = [
+    ...VERDICT_FILES.filter((rel) => misused.test(stripJs(sources[rel] ?? ''))),
+    // Only the first `bg-wash` is forgiven, so a second one still fails.
+    ...VERDICT_FILES_WITH_A_QUOTE.filter((rel) => misused.test(stripJs(sources[rel] ?? '').replace(/(?<![\w-])bg-wash(?![\w-])/, ''))),
+  ];
+  if (verdicts.length) errors.push(`a verdict takes a colour outside its family in ${verdicts.join(', ')}`);
+  const tones = stripJs(sources['src/components/design/tones.ts'] ?? '');
+  for (const [value, family] of [['advance', 'ready'], ['hold', 'unresolved'], ['reject', 'closed']]) {
+    if (!tones.includes(`${value}: '${family}'`)) errors.push(`the verdict ${value} should be the ${family} family`);
+  }
+  if (!tones.includes("position >= 0.75 ? 'ready' : position >= 0.5 ? 'unresolved' : 'closed'")) {
+    errors.push('a rating should be ready from 0.75 of its scale, unresolved from 0.5, closed below');
+  }
+  for (const rel of [
+    'src/components/session/VerdictMark.tsx',
+    'src/components/session/ScoreVerdict.tsx',
+    'src/components/talent/HeaderScore.tsx',
+    'src/components/talent/ReviewScorecard.tsx',
+    'src/components/talent/CandidateScorecard.tsx',
+  ]) {
+    if (!/\bverdictFamily\(/.test(stripJs(sources[rel] ?? ''))) errors.push(`${rel} no longer prints the verdict's family`);
+  }
+  // A held card has no hue, so the notice that says it is held has none either.
+  const heldNotice = stripJs(sources['src/components/talent/EvidenceHoldNotice.tsx'] ?? '');
+  if (/\b(?:bg|text|border|ring|fill|stroke|outline|decoration)-(?:ready|unresolved|closed|success|warning)|var\(--(?:ready|unresolved|closed|success|warning)/.test(heldNotice)) {
+    errors.push("a held card's notice takes a family in src/components/talent/EvidenceHoldNotice.tsx");
+  }
 
   // ── Surfaces ──────────────────────────────────────────────────────────
   for (const [rel, text] of Object.entries(stylesheets)) {

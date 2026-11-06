@@ -613,6 +613,9 @@ describe('candidate callback confirmation evidence', () => {
     const note = await screen.findByText(/Candidate confirmed this callback/i);
     expect(note.textContent).toMatch(/ten-minute reservation is rechecked/i);
     expect(note.textContent).toMatch(/IST/i);
+    // The call is still to come, so it is not green yet: the same family as Confirmed.
+    expect(note).toHaveClass('bg-moving-soft');
+    expect(note).not.toHaveClass('bg-success-soft');
   });
 
   it('reports a truncated week and a truncated occupancy as separate facts', async () => {

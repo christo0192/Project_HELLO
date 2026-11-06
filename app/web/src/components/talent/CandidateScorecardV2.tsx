@@ -25,14 +25,16 @@ import { RoleScorecardBody } from '../session/RoleScorecardView';
 
 export interface CandidateScorecardV2Props {
   scorecard: ScorecardAssessmentDisplay;
+  /** Held for thin evidence, or an R1 row with no usable result (`isResultDisowned`): the verdict and the ratings take no hue. */
+  held?: boolean;
 }
 
-export function CandidateScorecardV2({ scorecard }: CandidateScorecardV2Props) {
+export function CandidateScorecardV2({ scorecard, held = false }: CandidateScorecardV2Props) {
   return (
     <SurfaceCard as="section" label="Overall assessment" className="p-4 sm:p-5">
       {/* No summary here: the Review tab shows the transcript beside it, and
           the candidate header already carries the verdict's context. */}
-      <RoleScorecardBody scorecard={scorecard} />
+      <RoleScorecardBody scorecard={scorecard} held={held} />
     </SurfaceCard>
   );
 }

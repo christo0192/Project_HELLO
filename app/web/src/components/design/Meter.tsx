@@ -7,8 +7,10 @@
  *
  *   - Value redundancy: the number is ALWAYS rendered as text in tabular
  *     figures, and the band ("Low" / "Fair" / "Strong") is ALWAYS rendered
- *     as a word. The fill is ink and steps in weight, never in hue: a score
- *     is a reading, not a traffic light.
+ *     as a word. The fill and the words take the band's family, so the colour
+ *     can never disagree with the word beside it. `plain` keeps the old ink
+ *     steps, for a reading where a high value is not a good one. `family` is
+ *     for a reading that sits under a verdict, whose cuts are not the band's.
  *   - Semantics: `role="meter"` with aria-valuenow/min/max, an
  *     aria-valuetext that spells out value and band, and an accessible
  *     name taken from the visible label.
@@ -20,21 +22,18 @@
 
 import { useId } from 'react';
 import { cx } from './cx';
+import {
+  BAND_FAMILY,
+  DEFAULT_THRESHOLDS,
+  FAMILY_CLASSES,
+  meterBand,
+  type JudgementFamily,
+  type MeterBand,
+  type MeterThresholds,
+} from './tones';
 
-export type MeterBand = 'low' | 'fair' | 'strong';
-
-/**
- * Band cut-points as a fraction of the scale. The default reproduces the
- * legacy per-metric bar exactly (amber at 5/10, emerald at 7/10); the
- * overall score keeps its own legacy cut-points (50 and 75 of 100), which
- * are NOT the same fractions — so they are passed in rather than assumed.
- */
-export interface MeterThresholds {
-  fair: number;
-  strong: number;
-}
-
-export const DEFAULT_THRESHOLDS: MeterThresholds = { fair: 0.5, strong: 0.7 };
+export { DEFAULT_THRESHOLDS, meterBand };
+export type { MeterBand, MeterThresholds };
 
 export interface MeterProps {
   label: string;
@@ -44,18 +43,11 @@ export interface MeterProps {
   /** Larger presentation for the headline overall score. */
   emphasis?: boolean;
   thresholds?: MeterThresholds;
+  /** No family: a reading where a high value is not a good one, or no reading at all. */
+  plain?: boolean;
+  /** This family instead of the band's, so the bar cannot claim another verdict than the one beside it. */
+  family?: JudgementFamily;
   className?: string;
-}
-
-export function meterBand(
-  value: number,
-  max: number,
-  thresholds: MeterThresholds = DEFAULT_THRESHOLDS,
-): MeterBand {
-  const fraction = max === 0 ? 0 : value / max;
-  if (fraction >= thresholds.strong) return 'strong';
-  if (fraction >= thresholds.fair) return 'fair';
-  return 'low';
 }
 
 export const BAND_LABEL: Record<MeterBand, string> = {
@@ -64,10 +56,16 @@ export const BAND_LABEL: Record<MeterBand, string> = {
   strong: 'Strong',
 };
 
-const bandFill: Record<MeterBand, string> = {
+const plainFill: Record<MeterBand, string> = {
   low: 'var(--c-ink-muted)',
   fair: 'var(--c-ink-secondary)',
   strong: 'var(--c-ink)',
+};
+
+const familyFill: Record<JudgementFamily, string> = {
+  closed: 'var(--closed)',
+  unresolved: 'var(--unresolved)',
+  ready: 'var(--ready)',
 };
 
 /** Clamp to the scale and drop NaN, exactly as the legacy MetricBar did. */
@@ -81,6 +79,8 @@ export function Meter({
   max = 10,
   emphasis = false,
   thresholds = DEFAULT_THRESHOLDS,
+  plain = false,
+  family,
   className,
 }: MeterProps) {
   const rawId = useId();
@@ -88,6 +88,8 @@ export function Meter({
   const safe = clampScore(value, max);
   const band = meterBand(safe, max, thresholds);
   const pct = max === 0 ? 0 : (safe / max) * 100;
+  const hue = family ?? BAND_FAMILY[band];
+  const words = plain ? null : FAMILY_CLASSES[hue].text;
 
   return (
     <div className={cx('w-full', className)}>
@@ -101,13 +103,13 @@ export function Meter({
           {label}
         </span>
         <span className="font-medium text-[var(--c-ink)]">
-          <span className="tabular-nums">
+          <span className={cx('tabular-nums', words)}>
             {safe}/{max}
           </span>
           <span aria-hidden="true" className="mx-1.5 text-[var(--c-ink-secondary)]">
             ·
           </span>
-          <span className="text-[var(--c-ink-secondary)]">{BAND_LABEL[band]}</span>
+          <span className={words ?? 'text-[var(--c-ink-secondary)]'}>{BAND_LABEL[band]}</span>
         </span>
       </div>
       <div
@@ -125,7 +127,7 @@ export function Meter({
       >
         <div
           className="data-fill h-full rounded-full"
-          style={{ width: `${pct}%`, backgroundColor: bandFill[band] }}
+          style={{ width: `${pct}%`, backgroundColor: plain ? plainFill[band] : familyFill[hue] }}
         />
       </div>
     </div>

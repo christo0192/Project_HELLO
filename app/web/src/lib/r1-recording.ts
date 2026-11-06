@@ -220,7 +220,7 @@ export function durationWords(ms: number): string {
   return minutes === 0 ? `${seconds}s` : `${minutes}m ${seconds}s`;
 }
 
-export type R1CopyTone = 'neutral' | 'accent' | 'positive' | 'caution' | 'negative';
+export type R1CopyTone = 'neutral' | 'moving' | 'ready' | 'unresolved' | 'closed' | 'negative';
 
 /** What to say about a recording before (or instead of) playing it. */
 export interface R1StateCopy {
@@ -300,7 +300,7 @@ export function r1RecordingStateCopy(summary: R1RecordingSummary | null | undefi
     case 'recording':
       return {
         tag: 'Recording',
-        tone: 'accent',
+        tone: 'moving',
         detail: 'In progress. It can be played a few minutes after the interview ends.',
         notice: null,
         facts: [],
@@ -309,7 +309,7 @@ export function r1RecordingStateCopy(summary: R1RecordingSummary | null | undefi
     case 'processing':
       return {
         tag: 'Processing',
-        tone: 'caution',
+        tone: 'moving',
         detail: 'The recording is being prepared. This usually takes a few minutes.',
         notice: null,
         facts: [],
@@ -319,7 +319,7 @@ export function r1RecordingStateCopy(summary: R1RecordingSummary | null | undefi
     case 'partial':
       return {
         tag: state === 'ready' ? 'Ready' : 'Partial',
-        tone: state === 'ready' ? 'positive' : 'caution',
+        tone: state === 'ready' ? 'ready' : 'unresolved',
         detail: null,
         notice: noticeFor(s) ?? (state === 'partial' ? 'Part of this recording is missing.' : null),
         facts: factsFor(s),
@@ -341,7 +341,7 @@ export function r1RecordingStateCopy(summary: R1RecordingSummary | null | undefi
       const when = typeof s.deleted_at === 'string' && s.deleted_at ? ` on ${formatDate(s.deleted_at)}` : '';
       return {
         tag: 'Deleted',
-        tone: 'neutral',
+        tone: 'closed',
         detail: `This recording was deleted${when}${DELETED_WORDS[reason] ?? ''}.`,
         notice: null,
         facts: [],

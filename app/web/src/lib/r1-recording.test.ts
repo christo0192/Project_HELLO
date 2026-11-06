@@ -285,11 +285,20 @@ describe('r1RecordingStateCopy: every state', () => {
     });
   });
 
+  it.each([
+    ['recording', 'Recording', 'moving'],
+    ['processing', 'Processing', 'moving'],
+    ['partial', 'Partial', 'unresolved'],
+    ['deleted', 'Deleted', 'closed'],
+  ] as const)('tones %s (%s) as %s', (state, tag, tone) => {
+    expect(r1RecordingStateCopy({ state })).toMatchObject({ tag, tone });
+  });
+
   it('ready: facts, a Load action, no notice', () => {
     const copy = r1RecordingStateCopy(
       summary({ duration_ms: 423_000, retention_until: '2027-01-12T10:00:00.000Z', camera_off_ms: 80_000 }),
     );
-    expect(copy).toMatchObject({ tag: 'Ready', tone: 'positive', notice: null, action: 'load' });
+    expect(copy).toMatchObject({ tag: 'Ready', tone: 'ready', notice: null, action: 'load' });
     expect(copy.facts[0]).toBe('Length 7m 3s');
     expect(copy.facts[1]).toMatch(/^Kept until .*2027/);
     expect(copy.facts[2]).toBe('Camera was off for 1m 20s');

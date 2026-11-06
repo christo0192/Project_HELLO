@@ -277,9 +277,15 @@ describe('Layout shell', () => {
     expect(screen.queryByRole('link', { name: /Mission Control/i })).not.toBeInTheDocument();
   });
 
+  /** The dot printed in front of a service-state word, inside the same span. */
+  const serviceDot = (word: HTMLElement) => word.querySelector('[aria-hidden="true"]');
+
   it('shows the API online status', async () => {
     renderLayout();
-    expect(await screen.findByText('Online')).toBeInTheDocument();
+    const word = await screen.findByText('Online');
+    expect(word).toBeInTheDocument();
+    // Mission Control prints the same state as a green "Operational".
+    expect(serviceDot(word)).toHaveClass('bg-success');
   });
 
   it('shows maintenance state from /api/status', async () => {
@@ -296,7 +302,25 @@ describe('Layout shell', () => {
         <LayoutAgain />
       </MemoryRouter>,
     );
-    expect(await screen.findByText('Maintenance')).toBeInTheDocument();
+    const word = await screen.findByText('Maintenance');
+    expect(word).toBeInTheDocument();
+    // Mission Control prints the same state as an olive "Maintenance mode".
+    expect(serviceDot(word)).toHaveClass('bg-warning');
+    (apiMock.api as any).status = () =>
+      Promise.resolve({ status: 'ok', maintenance: null, updated_at: '2026-01-01T00:00:00.000Z' });
+  });
+
+  it('keeps Checking muted and an unreachable API crimson', async () => {
+    const apiMock = await import('../api');
+    let refuse: (reason: unknown) => void = () => {};
+    (apiMock.api as any).status = () =>
+      new Promise((_resolve, reject) => {
+        refuse = reject;
+      });
+    renderLayout();
+    expect(serviceDot(screen.getByText('Checking…'))).toHaveClass('bg-ink-muted');
+    await act(async () => refuse(new Error('unreachable')));
+    expect(serviceDot(await screen.findByText('API offline'))).toHaveClass('bg-error');
     (apiMock.api as any).status = () =>
       Promise.resolve({ status: 'ok', maintenance: null, updated_at: '2026-01-01T00:00:00.000Z' });
   });

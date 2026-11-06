@@ -11,8 +11,8 @@
  *  - an R1 (WebRTC sales role-play) assessment is never the screening score;
  *    the Candidates list drops them the same way;
  *  - never 0 for "no score": an unreadable or absent figure reads "Not scored";
- *  - the figure stays in ink and so does the verdict mark beside it (same rule
- *    as ScoreVerdict);
+ *  - the figure takes the verdict's family, as the mark beside it does (same rule
+ *    as ScoreVerdict), unless the score is held, when neither takes a hue;
  *  - held for evidence (C3) and provisional (incomplete metrics) are said in
  *    words, not by dimming alone.
  *
@@ -26,6 +26,7 @@ import { finiteNumber, readRoleScorecard, recommendationMeta } from '../session/
 import { VerdictMark } from '../session/VerdictMark';
 import { SurfaceCard, Tag } from '../design/candidate';
 import { cx } from '../design/cx';
+import { FAMILY_CLASSES, verdictFamily } from '../design/tones';
 import { formatDate } from '../../lib/datetime';
 import { isEvidenceInsufficient } from '../../lib/evidence-hold';
 
@@ -64,11 +65,13 @@ export function HeaderScore({ assessments, sessions, className }: HeaderScorePro
   const reco = reading ? recommendationMeta(reading.recommendation) : null;
   const held = latest ? isEvidenceInsufficient(latest) : false;
   const date = latest?.created_at ? formatDate(latest.created_at) : null;
+  const family = verdictFamily(reading?.recommendation);
+  const figureText = held ? 'text-ink-secondary' : family ? FAMILY_CLASSES[family].text : 'text-ink';
 
   const pills =
     score != null && (reco || reading?.provisional || held) ? (
       <>
-        <VerdictMark recommendation={reading?.recommendation} />
+        <VerdictMark recommendation={reading?.recommendation} plain={held} />
         {held ? (
           <Tag tone="caution">Held: not enough evidence</Tag>
         ) : reading?.provisional ? (
@@ -87,7 +90,7 @@ export function HeaderScore({ assessments, sessions, className }: HeaderScorePro
         {score == null ? (
           <p className="text-section leading-8 text-ink-secondary">Not scored</p>
         ) : (
-          <p className={cx('flex items-baseline gap-1.5', held ? 'text-ink-secondary' : 'text-ink')}>
+          <p className={cx('flex items-baseline gap-1.5', figureText)}>
             <span className="text-stat leading-none tabular-nums">{score}</span>
             <span className="text-sm tabular-nums text-ink-tertiary">/ 100</span>
           </p>

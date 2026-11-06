@@ -37,7 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import { apiErrorCopy } from '../../lib/api-error-copy';
 import type { FunnelDailyRow, FunnelSummaryResponse, Role } from '../../types';
-import { Combobox, ErrorPanel, GlassPanel, InlineNotice, SectionHeader, cx } from '../design';
+import { Combobox, ErrorPanel, GlassPanel, InlineNotice, SectionHeader, countTone, cx } from '../design';
 import { MetricStrip } from '../design/MetricStrip';
 import type { MetricItem } from '../design/MetricStrip';
 import { LineChart } from '../charts';
@@ -328,10 +328,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
       context: 'Entered in this range',
       loading,
     },
-    { label: 'Dialled', value: count(t?.dialed), context: 'At least one call', loading },
+    { label: 'Dialled', value: count(t?.dialed), figureTone: countTone(t?.dialed, 'info'), context: 'At least one call', loading },
     {
       label: 'Reached',
       value: count(t?.connected),
+      figureTone: countTone(t?.connected, 'info'),
       // `connected` is "a call was answered", and an answering machine
       // answers too, so this is an upper bound. Say that in the reader's words.
       context: 'Picked up, may be voicemail',
@@ -340,6 +341,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
     {
       label: 'Connect rate',
       value: pctLabel(pct(t?.connected ?? 0, t?.dialed ?? 0)),
+      figureTone: countTone(t?.connected, 'info'),
       // Both operands are the two figures immediately to the left, so a
       // reader can reproduce this number. Previously the neighbours were
       // ATTEMPT-level counts and dividing them gave a different, equally
@@ -501,18 +503,21 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                   {
                     label: 'Answered questions',
                     value: count(t?.answered_ge1),
+                    figureTone: countTone(t?.answered_ge1, 'success'),
                     context: 'Gave at least one usable answer',
                     loading,
                   },
                   {
                     label: 'Reached, no answers',
                     value: count(derived?.connectedNoAnswer),
+                    figureTone: countTone(derived?.connectedNoAnswer, 'warning'),
                     context: 'Picked up, gave no usable answer',
                     loading,
                   },
                   {
                     label: 'Never reached',
                     value: count(derived?.neverConnected),
+                    figureTone: countTone(derived?.neverConnected, 'warning'),
                     context: 'Dialled, never picked up',
                     loading,
                   },
@@ -546,17 +551,26 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                     label: 'Bot qualified',
                     value: count(t?.qualified),
                     tone: 'success',
+                    figureTone: countTone(t?.qualified, 'success'),
                     context: 'Recommended: Select',
                     loading,
                   },
                   {
                     label: 'Bot disqualified',
                     value: count(t?.disqualified),
-                    tone: 'neutral',
+                    tone: 'closed',
+                    figureTone: countTone(t?.disqualified, 'closed'),
                     context: 'Recommended: Reject',
                     loading,
                   },
-                  { label: 'Needs review', value: count(derived?.needsReview), tone: 'warning', context: 'Borderline or no verdict', loading },
+                  {
+                    label: 'Needs review',
+                    value: count(derived?.needsReview),
+                    tone: 'warning',
+                    figureTone: countTone(derived?.needsReview, 'warning'),
+                    context: 'Borderline or no verdict',
+                    loading,
+                  },
                 ]}
                 className={ROW}
               />
@@ -601,12 +615,14 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                     {
                       label: 'Advanced',
                       value: count(t?.hr_qualified),
+                      figureTone: countTone(t?.hr_qualified, 'success'),
                       context: 'At Reference check',
                       loading,
                     },
                     {
                       label: 'Not advanced',
                       value: count(t?.hr_disqualified),
+                      figureTone: countTone(t?.hr_disqualified, 'closed'),
                       context: 'At another stage',
                       loading,
                     },
@@ -658,8 +674,8 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 <LineChart
                   title="Screening outcomes"
                   series={[
-                    { name: 'Bot qualified', data: qualifiedSeries },
-                    { name: 'Bot disqualified', data: disqualifiedSeries },
+                    { name: 'Bot qualified', data: qualifiedSeries, family: 'ready' },
+                    { name: 'Bot disqualified', data: disqualifiedSeries, family: 'closed' },
                   ]}
                   unit="%"
                   isLoading={loading}

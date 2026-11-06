@@ -130,6 +130,93 @@ describe('ScreeningKpis', () => {
     getScreeningFunnel.mockResolvedValue(funnel());
   });
 
+  // ── Colour that carries meaning ────────────────────────────────────────
+
+  describe('colour that carries meaning', () => {
+    const DISTINCT = {
+      candidates_total: 900, dialed: 800, connected: 700, attempts_total: 600, connects_total: 500,
+      answered_ge1: 400, scored: 300, qualified: 110, disqualified: 120, on_hold: 30, human_review: 40,
+      hr_qualified: 13, hr_disqualified: 7,
+    };
+    /** The figure and the label's dot in the cell with this label. */
+    const cell = async (label: string) => {
+      await screen.findAllByText(label);
+      const node = screen.getAllByText(label).find((n) => !n.closest('details'))!;
+      const figure = node.closest('dl > div')!;
+      return { figure: figure.querySelector('dd')!, dot: figure.querySelector('dt [aria-hidden="true"]') };
+    };
+
+    it.each([
+      ['Candidates', 'text-ink'],
+      ['Dialled', 'text-moving-text'],
+      ['Reached', 'text-moving-text'],
+      ['Connect rate', 'text-moving-text'],
+      ['Call attempts', 'text-ink'],
+      ['Connects', 'text-ink'],
+      ['Answered questions', 'text-success-text'],
+      ['Reached, no answers', 'text-warning-text'],
+      ['Never reached', 'text-warning-text'],
+      ['Bot qualified', 'text-success-text'],
+      ['Bot disqualified', 'text-closed-text'],
+      ['Needs review', 'text-warning-text'],
+      // The same words as Pipeline by stage and Recent candidates on this page.
+      ['Advanced', 'text-success-text'],
+      ['Not advanced', 'text-closed-text'],
+      ['Advance rate', 'text-ink'],
+    ])('prints %s in %s', async (label, shade) => {
+      getScreeningFunnel.mockResolvedValue(funnel(DISTINCT));
+      renderKpis();
+      await waitFor(async () => expect((await cell('Dialled')).figure).toHaveTextContent('800'));
+      expect((await cell(label)).figure).toHaveClass(shade);
+    });
+
+    it('dots the three verdict counts by their family, and no other figure', async () => {
+      getScreeningFunnel.mockResolvedValue(funnel(DISTINCT));
+      renderKpis();
+      await waitFor(async () => expect((await cell('Dialled')).figure).toHaveTextContent('800'));
+      expect((await cell('Bot qualified')).dot).toHaveClass('bg-success');
+      expect((await cell('Bot disqualified')).dot).toHaveClass('bg-closed');
+      expect((await cell('Needs review')).dot).toHaveClass('bg-warning');
+      expect((await cell('Dialled')).dot).toBeNull();
+      expect((await cell('Answered questions')).dot).toBeNull();
+      expect((await cell('Advanced')).dot).toBeNull();
+    });
+
+    it.each([
+      'Dialled',
+      'Reached',
+      'Connect rate',
+      'Answered questions',
+      'Reached, no answers',
+      'Never reached',
+      'Bot qualified',
+      'Bot disqualified',
+      'Needs review',
+      'Advanced',
+      'Not advanced',
+    ])('prints %s in ink at zero: a bucket with nobody in it says nothing', async (label) => {
+      getScreeningFunnel.mockResolvedValue(funnel({ candidates_total: 3 }));
+      renderKpis();
+      await waitFor(async () => expect((await cell('Candidates')).figure).toHaveTextContent('3'));
+      expect((await cell(label)).figure).toHaveClass('text-ink');
+    });
+
+    it('prints a real 0% connect rate in ink, beside the dials it measured', async () => {
+      getScreeningFunnel.mockResolvedValue(funnel({ dialed: 9, connected: 0 }));
+      renderKpis();
+      await waitFor(async () => expect((await cell('Connect rate')).figure).toHaveTextContent('0%'));
+      expect((await cell('Connect rate')).figure).toHaveClass('text-ink');
+      expect((await cell('Dialled')).figure).toHaveClass('text-moving-text');
+    });
+
+    it('keeps a verdict count on its dot at zero, since the dot names the category', async () => {
+      getScreeningFunnel.mockResolvedValue(funnel({ candidates_total: 3 }));
+      renderKpis();
+      await waitFor(async () => expect((await cell('Candidates')).figure).toHaveTextContent('3'));
+      expect((await cell('Needs review')).dot).toHaveClass('bg-warning');
+    });
+  });
+
   // ── The HR band: the numbers most likely to be read as judgement ──────
 
   it('never counts an untouched candidate as a rejection', async () => {

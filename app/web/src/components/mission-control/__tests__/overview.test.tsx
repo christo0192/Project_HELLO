@@ -80,6 +80,63 @@ describe('OverviewSection', () => {
     vi.restoreAllMocks();
   });
 
+  describe('colour that carries meaning', () => {
+    const figureOf = (label: string) => figureCell(label).querySelector('dd');
+    const barOf = (label: string) =>
+      screen.getByRole('rowheader', { name: new RegExp(`^${label}`) }).querySelector('.data-fill');
+
+    it('prints Active sessions as underway, and every other total in ink', async () => {
+      renderOverview();
+      await screen.findByRole('table', { name: 'Access entries summary data' });
+      await waitFor(() => expect(figureOf('Active sessions')).toHaveClass('text-moving-text'));
+      for (const label of ['Sessions', 'Linked access', 'Quota policies enabled', 'Audit events · 24h']) {
+        expect(figureOf(label), label).toHaveClass('text-ink');
+      }
+    });
+
+    it('prints no active session in ink: a zero says nothing is underway', async () => {
+      apiFns.listAdminSessions.mockResolvedValue({ sessions: [] });
+      renderOverview();
+      await waitFor(() => expect(figureOf('Active sessions')).toHaveTextContent('0'));
+      expect(figureOf('Active sessions')).toHaveClass('text-ink');
+    });
+
+    it('draws Linked as ready, Pending as unresolved and Disabled as closed', async () => {
+      renderOverview();
+      await screen.findByRole('table', { name: 'Access entries summary data' });
+      expect(barOf('Linked')).toHaveClass('bg-success');
+      expect(barOf('Pending')).toHaveClass('bg-warning');
+      expect(barOf('Disabled')).toHaveClass('bg-closed');
+    });
+
+    it('draws the session mix by meaning, and a plain fact in ink', async () => {
+      apiFns.listAdminSessions.mockResolvedValue({
+        sessions: ['waiting', 'in_progress', 'completed', 'cancelled', 'expired', 'failed'].map((status, i) => ({
+          ...SESSIONS[0],
+          id: `s-${i}`,
+          status,
+        })),
+      });
+      renderOverview();
+      await screen.findByRole('table', { name: 'Session status data' });
+      expect(barOf('Waiting')).toHaveClass('bg-moving');
+      expect(barOf('In progress')).toHaveClass('bg-moving');
+      expect(barOf('Completed')).toHaveClass('bg-success');
+      expect(barOf('Cancelled')).toHaveClass('bg-closed');
+      expect(barOf('Expired')).toHaveClass('bg-closed');
+      expect(barOf('Failed')).toHaveClass('bg-error');
+      await screen.findByRole('table', { name: 'Quota policy state data' });
+      expect(barOf('Global scope')).toHaveClass('bg-ink');
+    });
+
+    it('prints Operational as a ready badge', async () => {
+      apiFns.status.mockResolvedValue({ ...STATUS, status: 'ok', maintenance: { enabled: false } });
+      renderOverview();
+      const badge = (await screen.findByText('Operational')).closest('[data-status-badge]');
+      expect(badge).toHaveAttribute('data-status-badge', 'success');
+    });
+  });
+
   it('derives every KPI from the returned data', async () => {
     renderOverview();
     await screen.findByText('Service state');

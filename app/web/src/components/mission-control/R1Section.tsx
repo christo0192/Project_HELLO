@@ -220,16 +220,8 @@ export function R1Section() {
                 u
                   ? [
                       { label: 'Used', value: r1UsedMinutes(u), tone: 'info' },
-                      {
-                        label: 'Held',
-                        value: u.minutes_reserved,
-                        tone: 'warning',
-                      },
-                      {
-                        label: 'Free',
-                        value: r1FreeMinutes(u),
-                        tone: 'success',
-                      },
+                      { label: 'Held', value: u.minutes_reserved, tone: 'warning' },
+                      { label: 'Free', value: r1FreeMinutes(u), tone: 'neutral' },
                     ]
                   : []
               }
@@ -263,9 +255,12 @@ export function R1Section() {
               data={
                 u
                   ? [
-                      { label: 'R1 interviews', value: u.r1_minutes },
-                      { label: 'Phone', value: u.phone_minutes },
-                      { label: 'Legacy browser', value: u.legacy_browser_minutes, tone: 'neutral' },
+                      // Three plain categories with no state: the chart cycle's first
+                      // three slots, in its order (charts/theme.ts). They tell the lanes
+                      // apart and mean nothing else.
+                      { label: 'R1 interviews', value: u.r1_minutes, tone: 'moving' },
+                      { label: 'Phone', value: u.phone_minutes, tone: 'ready' },
+                      { label: 'Legacy browser', value: u.legacy_browser_minutes, tone: 'unresolved' },
                     ]
                   : []
               }

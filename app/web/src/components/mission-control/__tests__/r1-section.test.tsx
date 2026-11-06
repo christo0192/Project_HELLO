@@ -331,6 +331,56 @@ describe('R1Section (Mission Control)', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(/invalid R1 setting/);
   });
 
+  describe('what the colours say', () => {
+    /** The bar in a named breakdown's row. */
+    const fill = (table: HTMLElement, label: string) =>
+      within(table).getByRole('rowheader', { name: label }).querySelector('.data-fill');
+    /** The dot before a tile's label. */
+    const dot = (label: string) => tile(label).querySelector('dt [aria-hidden="true"]');
+
+    it.each([
+      ['Used', 'bg-moving'],
+      ['Held', 'bg-warning'],
+      // Free capacity is not a verdict, so it is not the green of a good result.
+      ['Free', 'bg-ink-muted'],
+    ])('draws the allowance row %s in %s', async (label, shade) => {
+      renderSection();
+      expect(fill(await screen.findByRole('table', { name: 'R1 allowance data' }), label)).toHaveClass(shade);
+    });
+
+    it.each([
+      ['R1 interviews', 'bg-moving'],
+      ['Phone', 'bg-ready'],
+      ['Legacy browser', 'bg-unresolved'],
+    ])('tells the lane %s apart by its slot in the chart cycle', async (label, shade) => {
+      renderSection();
+      expect(fill(await screen.findByRole('table', { name: 'WebRTC minutes by lane data' }), label)).toHaveClass(shade);
+    });
+
+    it('keeps a lane on its own colour when the rows rank differently', async () => {
+      apiFns.getR1Usage.mockResolvedValue({ ...USAGE, r1_minutes: 900, phone_minutes: 10, legacy_browser_minutes: 40 });
+      renderSection();
+      const lanes = await screen.findByRole('table', { name: 'WebRTC minutes by lane data' });
+      expect(fill(lanes, 'Phone')).toHaveClass('bg-ready');
+      expect(fill(lanes, 'Legacy browser')).toHaveClass('bg-unresolved');
+    });
+
+    it.each([
+      [1000, '25%', 'bg-success'],
+      [2600, '65%', 'bg-ink-muted'],
+      [3000, '75%', 'bg-warning'],
+      // Past the line it asks for a look, with its figure. A rate is never crimson.
+      [3960, '99%', 'bg-warning'],
+    ])('dots a pool at %i minutes (%s) in %s', async (guard, figure, shade) => {
+      apiFns.getR1Usage.mockResolvedValue({ ...USAGE, guard_minutes: guard });
+      renderSection();
+      await waitFor(() => {
+        expect(within(tile('Shared WebRTC pool')).getByText(figure)).toBeInTheDocument();
+      });
+      expect(dot('Shared WebRTC pool')).toHaveClass(shade);
+    });
+  });
+
   it('renders the allowance and the lanes as real tables', async () => {
     renderSection();
     const allowance = await screen.findByRole('table', { name: 'R1 allowance data' });

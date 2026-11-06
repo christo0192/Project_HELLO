@@ -33,12 +33,16 @@ export function finiteNumber(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * A verdict's tone is its family (`verdictFamily` in design/tones.ts): Select
+ * `ready`, Borderline `unresolved`, Reject `closed`. Crimson means a fault on our
+ * side, so it is never a Reject. Needs human review is no verdict, and has no hue.
+ */
 const RECOMMENDATION: Record<string, { label: string; tone: StatusTone }> = {
   advance: { label: RECOMMENDATION_LABELS.advance, tone: 'success' },
   hold: { label: RECOMMENDATION_LABELS.hold, tone: 'warning' },
-  // A verdict is ink, never a traffic light: crimson means a fault on our side.
-  reject: { label: RECOMMENDATION_LABELS.reject, tone: 'neutral' },
-  human_review: { label: 'Needs human review', tone: 'warning' },
+  reject: { label: RECOMMENDATION_LABELS.reject, tone: 'closed' },
+  human_review: { label: 'Needs human review', tone: 'neutral' },
 };
 
 /**

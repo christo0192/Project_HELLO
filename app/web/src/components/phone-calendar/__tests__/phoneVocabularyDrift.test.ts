@@ -176,6 +176,41 @@ const API_SLOT_REFUSAL = enumOfProperty(openapi, 'PhoneSlot', 'refusals');
 //  The extractor is real
 // ══════════════════════════════════════════════════════════════════════
 
+describe('each status means one thing, on the calendar as everywhere', () => {
+  it.each([
+    ['scheduled', 'info'],
+    // Still to come: a call not yet made must not look like Fulfilled beside it.
+    ['confirmed', 'info'],
+    ['fulfilled', 'success'],
+    ['cancelled', 'closed'],
+    ['superseded', 'closed'],
+    // A slot passed without a call: unfinished, and not known to be our fault.
+    ['missed', 'warning'],
+  ])('appointment %s is the %s tone', (status, tone) => {
+    expect(appointmentStatusTerm(status).tone).toBe(tone);
+  });
+
+  it.each([
+    ['pending_prereqs', 'warning'],
+    ['eligible', 'info'],
+    ['scheduled', 'info'],
+    // A live call is underway, not a warning.
+    ['dialing', 'info'],
+    ['in_call', 'info'],
+    ['reconnecting', 'info'],
+    ['awaiting_retry', 'info'],
+    ['completed', 'success'],
+    // Nobody on our side failed, so only `failed` is crimson.
+    ['abandoned_no_answer', 'warning'],
+    ['wrong_number', 'warning'],
+    ['failed', 'danger'],
+    ['opted_out', 'closed'],
+    ['cancelled', 'closed'],
+  ])('engagement %s is the %s tone', (state, tone) => {
+    expect(engagementStateTerm(state).tone).toBe(tone);
+  });
+});
+
 describe('the extractor reads the API document, and says so when it cannot', () => {
   it('pulls the exact vocabularies P6 publishes', () => {
     expect(API_APPOINTMENT_STATUS).toEqual([

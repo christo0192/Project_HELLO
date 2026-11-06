@@ -2,8 +2,10 @@
  * Stock scales that legacy markup still names, re-pointed at the Logsheet tokens
  * so every remaining `text-gray-600` or `bg-accent-600` re-skins without a
  * per-page edit. Greys step through the inks and rules; a warm or cool tint
- * resolves to the shaded field, because status colour is the word, not the hue.
- * Only red keeps a hue: it is a fault, and the fault token is `--danger`.
+ * resolves to the shaded field, because a stock name carries no meaning of its
+ * own: `emerald` and `amber` stay on ink, and colour that means something is
+ * written with a status family below. Only red keeps a hue: it is a fault, and
+ * the fault token is `--danger`.
  */
 const neutralScale = {
   50: 'var(--field)',
@@ -71,6 +73,24 @@ export default {
         wash: 'var(--wash)',
         ai: 'var(--ai)',
         plate: 'var(--plate)',
+        // The four status families (index.css). Each means one thing everywhere.
+        moving: 'var(--moving)',
+        'moving-light': 'var(--moving-light)',
+        'moving-text': 'var(--moving-text)',
+        'moving-deep': 'var(--moving-deep)',
+        'moving-soft': 'var(--moving-soft)',
+        ready: 'var(--ready)',
+        'ready-light': 'var(--ready-light)',
+        'ready-text': 'var(--ready-text)',
+        'ready-soft': 'var(--ready-soft)',
+        unresolved: 'var(--unresolved)',
+        'unresolved-light': 'var(--unresolved-light)',
+        'unresolved-text': 'var(--unresolved-text)',
+        'unresolved-soft': 'var(--unresolved-soft)',
+        closed: 'var(--closed)',
+        'closed-light': 'var(--closed-light)',
+        'closed-text': 'var(--closed-text)',
+        'closed-soft': 'var(--closed-soft)',
         // Semantic tokens, mapped onto the palette in index.css.
         surface: 'var(--surface)',
         'surface-secondary': 'var(--surface-secondary)',

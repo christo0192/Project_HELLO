@@ -8,6 +8,7 @@
  */
 
 import type { Locator, Page } from '@playwright/test';
+import { auditA11y } from './fixtures/axe';
 import { R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_CANDIDATE_ID, STAR_CANDIDATE_ID } from './fixtures/data';
 import { expect, test, type AppHarness } from './fixtures/harness';
 
@@ -71,6 +72,206 @@ test.describe('Review, the panes', () => {
       await expect(panel.getByRole('region', { name: pane })).toBeFocused();
     }
   });
+});
+
+test.describe('Review, in colour', () => {
+  type Family = 'ready' | 'unresolved' | 'closed';
+  const FAMILIES: Family[] = ['closed', 'unresolved', 'ready'];
+
+  /** A token as the browser resolves it, as a text colour and as a fill. */
+  const token = (page: Page, name: string): Promise<{ colour: string; fill: string }> =>
+    page.evaluate((variable) => {
+      const probe = document.createElement('span');
+      probe.style.color = `var(${variable})`;
+      probe.style.backgroundColor = `var(${variable})`;
+      document.body.append(probe);
+      const style = getComputedStyle(probe);
+      const resolved = { colour: style.color, fill: style.backgroundColor };
+      probe.remove();
+      return resolved;
+    }, name);
+
+  const fill = (subject: Locator): Promise<string> => subject.evaluate((el) => getComputedStyle(el).backgroundColor);
+  const ink = (subject: Locator): Promise<string> => subject.evaluate((el) => getComputedStyle(el).color);
+
+  /** A firm, scored row of the fixture, its verdict and figure set: only the star's is provisional. */
+  const NISHA = 'Nisha Menon';
+  async function openFirm(app: AppHarness, page: Page, recommendation: 'advance' | 'hold' | 'reject', overall: number, held = false): Promise<Locator> {
+    const candidate = app.db.candidates.find((c) => c.name === NISHA)!;
+    const detail = Object.values(app.db.sessionDetails).find((d) => d.session.candidate_id === candidate.id && d.assessment)!;
+    const assessment = detail.assessment!;
+    assessment.recommendation = recommendation;
+    assessment.overall_score = overall;
+    Object.assign(assessment.raw as object, { recommendation, overallScore: overall });
+    if (held) Object.assign(assessment, { evidence_grade: 'insufficient', evidence_reason: 'partial_thin' });
+    await app.goto(`/candidates/${candidate.id}?tab=phone`);
+    const panel = page.getByRole('tabpanel', { name: 'Phone screening' });
+    await expect(panel.getByRole('heading', { name: 'AI recommendation' })).toBeVisible();
+    await app.settle();
+    return panel;
+  }
+
+  for (const [recommendation, overall, family, word, mark] of [
+    ['advance', 86, 'ready', 'Select', '--ready-text'],
+    ['hold', 58, 'unresolved', 'Borderline', '--unresolved-text'],
+    ['reject', 41, 'closed', 'Reject', '--closed-text'],
+  ] as const) {
+    test(`a firm ${word} block, figure and ruler take the ${family} family, and axe passes`, async ({ app, page }, testInfo) => {
+      const panel = await openFirm(app, page, recommendation, overall);
+      const box = panel.locator('[data-verdict-box]');
+      expect(await fill(box)).toBe((await token(page, `--${family}-soft`)).fill);
+      const edge = await box.evaluate((el) => {
+        const style = getComputedStyle(el);
+        return { style: style.borderTopStyle, width: style.borderTopWidth, colour: style.borderTopColor, left: style.borderLeftWidth };
+      });
+      expect(edge).toEqual({ style: 'solid', width: '1px', colour: (await token(page, `--${family}`)).colour, left: '1px' });
+      expect(await ink(box.getByText(String(overall), { exact: true }))).toBe((await token(page, mark)).colour);
+
+      for (const zone of FAMILIES) {
+        const paint = zone === family ? `--${zone}` : `--${zone}-light`;
+        expect(await fill(box.locator(`[data-ruler-zone="${zone}"]`)), zone).toBe((await token(page, paint)).fill);
+      }
+      await auditA11y(page, testInfo, `review-${word.toLowerCase()}`, { strict: true });
+    });
+  }
+
+  test('the star is provisional: dashed in its own family, and "Provisional" says so in unresolved', async ({ app, page }) => {
+    const panel = await openReview(app, page);
+    const box = panel.locator('[data-verdict-box]');
+    await expect(box).toHaveAttribute('data-verdict-box', 'provisional');
+    expect(await box.evaluate((el) => getComputedStyle(el).borderTopStyle)).toBe('dashed');
+    expect(await box.evaluate((el) => getComputedStyle(el).borderTopColor)).toBe((await token(page, '--ready')).colour);
+    expect(await ink(box.getByText('Provisional', { exact: true }))).toBe((await token(page, '--unresolved-text')).colour);
+  });
+
+  test('the colour moves nothing: the rubric starts in the same place whatever the verdict, and the ruler is 6px', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const offsets: number[] = [];
+    for (const [recommendation, overall] of [['advance', 86], ['hold', 58], ['reject', 41]] as const) {
+      const panel = await openFirm(app, page, recommendation, overall);
+      const pane = panel.getByRole('region', { name: 'AI recommendation' });
+      offsets.push(
+        await pane.evaluate((el) => el.querySelector('[data-rubric-row]')!.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop),
+      );
+      const bar = (await panel.locator('[data-ruler-zone="closed"]').boundingBox())!;
+      expect(bar.height).toBe(6);
+    }
+    expect(new Set(offsets).size).toBe(1);
+  });
+
+  test('an evidence number takes the family of the rating it cites, on the strip and in the margin', async ({ app, page }) => {
+    // Nisha: Communication clarity 1 of 4 is cued on opening, Technical depth 2, Problem solving 3.
+    const panel = await openFirm(app, page, 'reject', 41);
+    const tick = (n: number) => panel.locator(`[data-strip-tick="${n}"]`);
+    await expect(tick(1)).toHaveAttribute('aria-pressed', 'true');
+    expect(await fill(tick(1))).toBe((await token(page, '--closed-text')).fill);
+    expect(await ink(tick(1))).toBe((await token(page, '--paper')).colour);
+    expect(await fill(tick(2))).toBe((await token(page, '--paper')).fill);
+    expect(await ink(tick(2))).toBe((await token(page, '--unresolved-text')).colour);
+    // The edge is the mark: a tag has no word, and the text shades collapse for a colour-blind reader.
+    expect(await tick(2).evaluate((el) => getComputedStyle(el).borderTopColor)).toBe((await token(page, '--unresolved')).colour);
+    expect(await ink(tick(3))).toBe((await token(page, '--ready-text')).colour);
+    expect(await ink(panel.getByRole('button', { name: /^Evidence 1, / }))).toBe((await token(page, '--paper')).colour);
+    expect(await fill(panel.locator('[data-quote-button="1"] [data-evidence-number]'))).toBe((await token(page, '--closed-text')).fill);
+    // The voice stays the voice.
+    expect(await panel.locator('[data-strip-segment="candidate"]').first().getAttribute('fill')).toBe('var(--voice-mark)');
+  });
+
+  test('"Writing results back to Ashby" is underway', async ({ app, page }) => {
+    const panel = await openReview(app, page);
+    const cell = panel.locator('[data-log-header]').getByText('Writing results back to Ashby');
+    expect(await ink(cell)).toBe((await token(page, '--moving-text')).colour);
+  });
+
+  test('a contrast theme still draws the ruler and the pips, with a gap between the zones', async ({ app, page }) => {
+    const panel = await openFirm(app, page, 'hold', 58);
+    await page.emulateMedia({ forcedColors: 'active' });
+    const canvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    for (const zone of FAMILIES) {
+      expect(await fill(panel.locator(`[data-ruler-zone="${zone}"]`)), zone).not.toBe(canvas);
+    }
+    expect(
+      await panel.locator('[data-ruler-zone="unresolved"]').evaluate((el) => {
+        const style = getComputedStyle(el);
+        return { width: style.borderLeftWidth, colour: style.borderLeftColor };
+      }),
+    ).toEqual({ width: '2px', colour: canvas });
+    expect(await fill(panel.locator('[data-score-mark]'))).not.toBe(canvas);
+    expect(await fill(panel.locator('[data-rating-pips] > .data-fill').first())).not.toBe(canvas);
+  });
+
+  for (const [recommendation, overall] of [['advance', 86], ['hold', 58], ['reject', 41]] as const) {
+    test(`a contrast theme forces a ${recommendation} circle along with its word`, async ({ app, page }) => {
+      const panel = await openFirm(app, page, recommendation, overall);
+      const verdict = panel.locator('[data-verdict-box] [data-recommendation]');
+      const circle = verdict.locator('circle');
+      const strokeOf = () => circle.evaluate((el) => getComputedStyle(el).stroke);
+      const family = (await token(page, { advance: '--ready', hold: '--unresolved', reject: '--closed' }[recommendation])).colour;
+      expect(await strokeOf()).toBe(family);
+      await page.emulateMedia({ forcedColors: 'active' });
+      expect(await strokeOf()).toBe(await ink(verdict));
+      expect(await strokeOf()).not.toBe(family);
+    });
+  }
+
+  test('a scorecard held for thin evidence has no hue, in a real browser', async ({ app, page }, testInfo) => {
+    const panel = await openFirm(app, page, 'advance', 80, true);
+    await expect(panel.getByText('Not enough interview evidence to decide')).toBeVisible();
+    const box = panel.locator('[data-verdict-box]');
+    const edge = await box.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return { colour: style.borderTopColor, wash: style.backgroundColor };
+    });
+    expect(edge).toEqual({ colour: (await token(page, '--rule-2')).colour, wash: 'rgba(0, 0, 0, 0)' });
+    expect(await ink(box.getByText('80', { exact: true }))).toBe((await token(page, '--ink')).colour);
+    expect(await box.locator('circle').evaluate((el) => getComputedStyle(el).stroke)).toBe((await token(page, '--ink')).colour);
+    for (const zone of FAMILIES) {
+      expect(await fill(box.locator(`[data-ruler-zone="${zone}"]`)), zone).toBe((await token(page, '--rule-2')).fill);
+    }
+    expect(await fill(panel.locator('[data-rating-pips] > .data-fill').first())).toBe((await token(page, '--ink')).fill);
+    await auditA11y(page, testInfo, 'review-held', { strict: true });
+  });
+
+  test('a ruler never says Select beside a Reject: the stored verdict decides, and the mark stays at the score', async ({ app, page }) => {
+    const panel = await openFirm(app, page, 'reject', 72);
+    const box = panel.locator('[data-verdict-box]');
+    expect(await fill(box.locator('[data-ruler-zone="closed"]'))).toBe((await token(page, '--closed')).fill);
+    expect(await fill(box.locator('[data-ruler-zone="ready"]'))).toBe((await token(page, '--ready-light')).fill);
+    expect(await box.getByText('Select 65', { exact: true }).evaluate((el) => getComputedStyle(el).fontWeight)).toBe('400');
+    expect(await box.getByText('Reject', { exact: true }).last().evaluate((el) => getComputedStyle(el).fontWeight)).toBe('600');
+    const bar = (await box.locator('[data-score-ruler]').boundingBox())!;
+    const mark = (await box.locator('[data-score-mark]').boundingBox())!;
+    expect(Math.abs(mark.x + 1 - (bar.x + bar.width * 0.72))).toBeLessThan(2);
+  });
+
+  test('the zones of a ruler are set apart by a real gap, and it costs the ruler no height', async ({ app, page }) => {
+    const panel = await openFirm(app, page, 'hold', 58);
+    for (const zone of ['unresolved', 'ready']) {
+      expect(
+        await panel.locator(`[data-ruler-zone="${zone}"]`).evaluate((el) => {
+          const style = getComputedStyle(el);
+          return { width: style.borderLeftWidth, colour: style.borderLeftColor, clip: style.backgroundClip };
+        }),
+        zone,
+      ).toEqual({ width: '2px', colour: 'rgba(0, 0, 0, 0)', clip: 'padding-box' });
+    }
+    expect((await panel.locator('[data-ruler-zone="closed"]').boundingBox())!.height).toBe(6);
+  });
+
+  for (const width of [360, 390, 414, 1180]) {
+    test(`at ${width} wide the ruler's labels do not run together`, async ({ app, page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      const panel = await openFirm(app, page, 'hold', 58);
+      const ruler = panel.locator('[data-score-ruler]');
+      const box = async (word: string) => (await ruler.getByText(word, { exact: true }).boundingBox())!;
+      const [reject, borderline, select, hundred] = [await box('Reject'), await box('Borderline 45'), await box('Select 65'), await box('100')];
+      expect(reject.x + reject.width).toBeLessThanOrEqual(borderline.x);
+      expect(borderline.x + borderline.width).toBeLessThanOrEqual(select.x + 0.5);
+      expect(select.x + select.width).toBeLessThanOrEqual(hundred.x);
+      // One line each, on the ruler's own row.
+      expect(borderline.height).toBe(select.height);
+    });
+  }
 });
 
 test.describe('Review, the log header', () => {

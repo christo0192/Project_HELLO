@@ -98,6 +98,7 @@ import {
   candidateNextAction,
   candidateStatusKey,
   candidateStatusLabel,
+  candidateStatusMark,
   CANDIDATE_STATUS_ORDER,
   PHONE_OUTCOME_STATUS_KEYS,
   hasActiveFilters,
@@ -156,45 +157,13 @@ const PILL_COUNT_CLASS = (selected: boolean) =>
   selected ? "tabular-nums" : "tabular-nums text-[var(--c-ink-secondary)]";
 
 /**
- * Bar colour per status. Deliberately NOT the `StatusBadge` tone map: a badge
- * colours one candidate's state, while a stack has to stay legible as six
- * adjacent fills.
- *
- * Adjacent statuses must not share a tone. `new`+`queued` both neutral, and
- * `screened`+`advanced` both positive, rendered as single indistinguishable
- * runs — and since the swatch colour is the only thing linking legend to bar,
- * no sighted user could tell which part was which. Colour vision is not the
- * issue; injectivity is.
- */
-const STATUS_BAR_TONE: Record<string, PipelineTone> = {
-  new: "neutral",
-  queued: "caution",
-  // On a call: the one stage that takes the voice hue.
-  screening: "voice",
-  screened: "positive",
-  advanced: "accent",
-  rejected: "negative",
-  consent_declined: "neutral",
-  // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Six tones cannot
-  // be injective over thirteen keys, so the most this can promise is that
-  // neighbours in that order differ; the legend text names each one.
-  abandoned_no_answer: "caution",
-  phone_failed: "negative",
-  screening_abandoned: "caution",
-  wrong_number: "neutral",
-  opted_out: "accent",
-  phone_cancelled: "neutral",
-};
-
-/**
- * A verdict is a position on the ink ramp, never a hue, and the two ends sit as
- * far apart as the ramp allows: ink, control and the light step, as the approved
- * recommendation bar draws them.
+ * This bar takes verdict colour: Reject is closed, never crimson. A row's own verdict
+ * takes the same family, through `VerdictMark`.
  */
 const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
-  advance: "positive",
-  hold: "caution",
-  reject: "neutral",
+  advance: "ready",
+  hold: "unresolved",
+  reject: "closed",
 };
 
 /**
@@ -1061,7 +1030,7 @@ export function CandidatesPage() {
               key: status,
               label: candidateStatusLabel(status),
               value: statusCounts.get(status) ?? 0,
-              tone: STATUS_BAR_TONE[status] ?? 'neutral',
+              tone: candidateStatusMark(status),
             }))}
             footnote={
               // The cohort is the LOADED set, which the role filter narrows

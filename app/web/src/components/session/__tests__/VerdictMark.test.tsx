@@ -15,11 +15,48 @@ describe('VerdictMark', () => {
     expect(container.querySelector('[data-recommendation]')).toHaveAttribute('data-recommendation', value);
   });
 
-  it('draws the circle in ink, never a hue', () => {
-    const { container } = render(<VerdictMark recommendation="reject" />);
-    const mark = container.querySelector('[data-verdict-mark]') as SVGElement;
-    expect(mark.getAttribute('class')).toContain('text-ink');
-    expect(mark.innerHTML).not.toMatch(/#|rgb|var\(--danger|var\(--voice/);
+  it.each([
+    ['advance', 'text-ready', 'text-ready-text', 'full'],
+    ['hold', 'text-unresolved', 'text-unresolved-text', 'half'],
+    ['reject', 'text-closed', 'text-closed-text', 'empty'],
+  ])('prints %s in its family: the circle in %s, the word and the figure in %s, the %s shape kept', (value, mark, text, shape) => {
+    const { container } = render(<VerdictMark recommendation={value} score={61} />);
+    const root = container.querySelector('[data-recommendation]') as HTMLElement;
+    const circle = container.querySelector('[data-verdict-mark]') as SVGElement;
+    expect(root).toHaveClass(text);
+    expect(root).not.toHaveClass('text-ink');
+    expect(circle).toHaveClass(mark);
+    expect(circle).toHaveAttribute('data-verdict-mark', shape);
+    expect(screen.getByText('61')).toHaveClass(text);
+  });
+
+  it('takes the colour through currentColor, so index.css can force it in a contrast theme, and is never crimson or orange', () => {
+    const { container } = render(<VerdictMark recommendation="reject" score={31} />);
+    const circle = container.querySelector('[data-verdict-mark]') as SVGElement;
+    expect(circle.innerHTML).toContain('currentColor');
+    expect(circle.innerHTML).not.toMatch(/#|rgb|var\(/);
+    expect(container.innerHTML).not.toMatch(/danger|error|voice|wash|moving/);
+  });
+
+  it.each([
+    ['advance', 'Select', 'full'],
+    ['hold', 'Borderline', 'half'],
+    ['reject', 'Reject', 'empty'],
+  ])('prints a %s in ink when asked for no hue, the word and the shape kept', (value, word, shape) => {
+    const { container } = render(<VerdictMark recommendation={value} score={80} plain />);
+    expect(container.querySelector('[data-recommendation]')).toHaveClass('text-ink');
+    expect(container.querySelector('[data-verdict-mark]')).toHaveClass('text-ink');
+    expect(container.querySelector('[data-verdict-mark]')).toHaveAttribute('data-verdict-mark', shape);
+    expect(screen.getByText(word)).toBeInTheDocument();
+    expect(screen.getByText('80')).toHaveClass('text-ink-secondary');
+    expect(container.innerHTML).not.toMatch(/ready|unresolved|closed/);
+  });
+
+  it.each(['human_review', 'something_new'])('gives %s no hue: no recommendation of its own, no family', (value) => {
+    const { container } = render(<VerdictMark recommendation={value} score={50} />);
+    expect(container.querySelector('[data-recommendation]')).toHaveClass('text-ink');
+    expect(container.innerHTML).not.toMatch(/ready|unresolved|closed/);
+    expect(screen.getByText('50')).toHaveClass('text-ink-secondary');
   });
 
   it.each([

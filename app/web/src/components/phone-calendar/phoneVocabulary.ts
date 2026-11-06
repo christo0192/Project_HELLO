@@ -33,33 +33,36 @@ interface Term {
 
 const APPOINTMENT_STATUS_TERMS: Record<PhoneAppointmentStatus, Term> = {
   scheduled: { label: 'Scheduled', tone: 'info' },
-  confirmed: { label: 'Confirmed', tone: 'success' },
-  cancelled: { label: 'Cancelled', tone: 'neutral' },
-  superseded: { label: 'Superseded', tone: 'neutral' },
+  // Still to come: the call has not been made, so it is not a good result yet.
+  confirmed: { label: 'Confirmed', tone: 'info' },
+  cancelled: { label: 'Cancelled', tone: 'closed' },
+  superseded: { label: 'Superseded', tone: 'closed' },
   fulfilled: { label: 'Fulfilled', tone: 'success' },
-  missed: { label: 'Missed', tone: 'danger' },
+  // The slot passed without a call: unfinished, and not known to be our fault.
+  missed: { label: 'Missed', tone: 'warning' },
 };
 
 /**
- * Engagement states. `dialing`, `in_call` and `reconnecting` are toned as
- * warnings not because anything is wrong but because they mean a call is
- * LIVE — an operator about to reschedule or cancel needs that to catch the
- * eye, and the substrate refuses the write anyway (`attempt_in_flight`).
+ * Engagement states. `dialing`, `in_call` and `reconnecting` mean a call is LIVE,
+ * so they are underway, as a screening is everywhere else; an operator about to
+ * reschedule or cancel sees the word, and the substrate refuses the write anyway
+ * (`attempt_in_flight`). `abandoned_no_answer` and `wrong_number` are unfinished
+ * because nobody on our side failed, so only `failed` is crimson.
  */
 const ENGAGEMENT_STATE_TERMS: Record<PhoneEngagementState, Term> = {
   pending_prereqs: { label: 'Prerequisites pending', tone: 'warning' },
   eligible: { label: 'Eligible', tone: 'info' },
   scheduled: { label: 'Scheduled', tone: 'info' },
-  dialing: { label: 'Dialing', tone: 'warning' },
-  in_call: { label: 'In call', tone: 'warning' },
-  reconnecting: { label: 'Reconnecting', tone: 'warning' },
-  awaiting_retry: { label: 'Awaiting retry', tone: 'warning' },
+  dialing: { label: 'Dialing', tone: 'info' },
+  in_call: { label: 'In call', tone: 'info' },
+  reconnecting: { label: 'Reconnecting', tone: 'info' },
+  awaiting_retry: { label: 'Awaiting retry', tone: 'info' },
   completed: { label: 'Completed', tone: 'success' },
-  abandoned_no_answer: { label: 'Abandoned: no answer', tone: 'danger' },
-  opted_out: { label: 'Opted out', tone: 'neutral' },
-  wrong_number: { label: 'Wrong number', tone: 'danger' },
+  abandoned_no_answer: { label: 'Abandoned: no answer', tone: 'warning' },
+  opted_out: { label: 'Opted out', tone: 'closed' },
+  wrong_number: { label: 'Wrong number', tone: 'warning' },
   failed: { label: 'Failed', tone: 'danger' },
-  cancelled: { label: 'Cancelled', tone: 'neutral' },
+  cancelled: { label: 'Cancelled', tone: 'closed' },
 };
 
 /** The six terminal engagement states. 0042 makes their rows immutable. */

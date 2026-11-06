@@ -39,6 +39,7 @@ import { humanizeEnum } from '../lib/humanize';
 // A failed operation's sanitized code, in words (a `:suffix` falls back to its prefix).
 import { ashbyErrorCodeLabel } from '../lib/ashby-labels';
 import { intakeTypeLabel, PROFILE_OUTCOME_LABELS } from '../components/talent/ResumeReviewBadge';
+import { ashbyLifecycleTone, ashbyTerminalTone } from '../components/talent/status';
 import {
   isBrowserScreeningRetired,
   RETIRED_INVITE_RECRUITER_MESSAGE,
@@ -130,16 +131,17 @@ const MAPPING_STATUS: Record<string, { label: string; tone: StatusTone }> = {
 const STATUS_REASON_LABELS: Record<string, string> = {
   stage_id_invalid: 'A stage on this job no longer exists in Ashby',
 };
-const LIFECYCLE: Record<string, { label: string; tone: StatusTone }> = {
-  imported: { label: 'Imported', tone: 'neutral' },
-  processing: { label: 'Processing', tone: 'neutral' },
-  ready: { label: 'Ready to screen', tone: 'neutral' },
-  completed: { label: 'Screening complete', tone: 'success' },
-  writeback_pending: { label: 'Writing back to Ashby', tone: 'info' },
-  cancelled: { label: 'Cancelled', tone: 'neutral' },
+/** This page's words. The colour is shared with the candidate's card: `ashbyLifecycleTone`. */
+const LIFECYCLE_LABELS: Record<string, string> = {
+  imported: 'Imported',
+  processing: 'Processing',
+  ready: 'Ready to screen',
+  completed: 'Screening complete',
+  writeback_pending: 'Writing back to Ashby',
+  cancelled: 'Cancelled',
 };
 /**
- * Why a workflow stopped for good. Neutral, not red: a withdrawn applicant is
+ * Why a workflow stopped for good. Closed, not red: a withdrawn applicant is
  * not an error, and red on every closed row is the alarm the review flagged.
  */
 const TERMINAL_LABELS: Record<string, string> = {
@@ -1185,7 +1187,7 @@ export function AshbyMissionControlPage() {
         )
           ? 'Reissue invite link'
           : 'Get invite link';
-        const lifecycle = LIFECYCLE[w.lifecycle] ?? { label: humanizeEnum(w.lifecycle), tone: 'neutral' };
+        const lifecycle = { label: humanizeEnum(w.lifecycle, LIFECYCLE_LABELS), tone: ashbyLifecycleTone(w.lifecycle) };
         // M017: a phone-parsing application has no resume. It says so in place
         // of the resume import, whose harmless `queued` row never moves; a
         // resume that could not be read and fell back says that instead.
@@ -1241,7 +1243,7 @@ export function AshbyMissionControlPage() {
                   <span title={w.lifecycle}>{lifecycle.label}</span>
                 </StatusBadge>
                 {w.terminalState && (
-                  <StatusBadge tone="neutral">
+                  <StatusBadge tone={ashbyTerminalTone()}>
                     <span title={w.terminalState}>{humanizeEnum(w.terminalState, TERMINAL_LABELS)}</span>
                   </StatusBadge>
                 )}

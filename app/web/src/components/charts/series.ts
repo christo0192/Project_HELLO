@@ -5,6 +5,7 @@
  * draw.
  */
 import type { LineSeriesOption } from 'echarts';
+import type { ChartFamily, ChartPalette } from './theme';
 
 export interface LineChartDatum {
   label: string;
@@ -22,8 +23,22 @@ export interface LineChartDatum {
 export interface LineChartSeries {
   name: string;
   data: LineChartDatum[];
-  /** A token value from `chartPalette`; defaults to the categorical cycle. */
+  /**
+   * What this line means, when it means something: a verdict or an outcome passes
+   * its family, so its colour never depends on its place in the cycle.
+   */
+  family?: ChartFamily;
+  /** A token value from `chartPalette`; defaults to the family, then the cycle. */
   color?: string;
+}
+
+/** The colour series `index` draws in. The line and its legend key both read this. */
+export function seriesColor(
+  series: LineChartSeries,
+  index: number,
+  { colors, families }: Pick<ChartPalette, 'colors'> & Partial<Pick<ChartPalette, 'families'>>,
+): string {
+  return series.color ?? (series.family && families?.[series.family]) ?? colors[index % colors.length];
 }
 
 /**
@@ -80,10 +95,10 @@ export function unionLabels(series: LineChartSeries[]): string[] {
 const MARKERS = ['circle', 'rect', 'triangle', 'diamond'] as const;
 
 /**
- * Dash per series, in cycle order; `null` is a solid line. The cycle is ink
- * steps, so two lines that mean opposite things differ only by a grey. A marker
- * cannot settle that alone, because markers are hidden past 20 points; a dash
- * holds at any density.
+ * Dash per series, in cycle order; `null` is a solid line. Colour is never the only
+ * signal, so two lines that mean opposite things also differ in their stroke. A
+ * marker cannot settle that alone, because markers are hidden past 20 points; a
+ * dash holds at any density.
  */
 const DASHES: ReadonlyArray<readonly number[] | null> = [null, [6, 4], [2, 3], [8, 3, 2, 3]];
 
@@ -107,13 +122,18 @@ export function seriesStroke(index: number): SeriesStroke {
  */
 export function buildLineSeries(
   series: LineChartSeries[],
-  { discrete = false, colors, surface = 'transparent' }: { discrete?: boolean; colors: string[]; surface?: string },
+  {
+    discrete = false,
+    colors,
+    families,
+    surface = 'transparent',
+  }: { discrete?: boolean; colors: string[]; families?: ChartPalette['families']; surface?: string },
 ): { labels: string[]; lines: LineSeriesOption[] } {
   const labels = unionLabels(series);
   const dense = labels.length > 45;
   const lines: LineSeriesOption[] = series.map((s, index) => {
     const byLabel = new Map(s.data.map((d) => [d.label, d.value]));
-    const color = s.color ?? colors[index % colors.length];
+    const color = seriesColor(s, index, { colors, families });
     const { marker, dash } = seriesStroke(index);
     return {
       type: 'line',
@@ -122,7 +142,7 @@ export function buildLineSeries(
       data: labels.map((label) => byLabel.get(label) ?? null),
       smooth: false,
       connectNulls: false,
-      // The cycle is ink steps, so a shape and a dash tell lines apart without hue.
+      // A shape and a dash tell lines apart without relying on the hue.
       symbol: marker,
       // At 5px plus a 1.5px border markers merge into a solid band once
       // points are closer than ~8px, which a 90-day half-width chart

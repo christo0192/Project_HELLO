@@ -930,7 +930,7 @@ function TextInput({
 }
 
 /**
- * Characters used, shown only near the limit and turning amber past 90%.
+ * Characters used, shown only near the limit, needing a second look past 90%.
  * Decorative (`aria-hidden`): `maxLength` already stops the input, the
  * instruction's hint states its limit in words, and announcing a count on
  * every keystroke would drown a screen reader.
