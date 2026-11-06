@@ -31,9 +31,24 @@ function labelledAction(visible: string, label: string | undefined): string | un
   return label ? `${visible}, ${label}` : undefined;
 }
 
+/**
+ * What the player is doing, for a host that shows it somewhere else. `message` is set on `error` (the
+ * link could not be minted) and on `ready` when the media would not load, which is how an expired link
+ * looks: a media element cannot report an HTTP status.
+ */
+export interface RecordingPlayerStatus {
+  phase: 'idle' | 'loading' | 'ready' | 'error';
+  message: string | null;
+}
+
+/** The player's own fallback words, for when the API says nothing. */
+const LOAD_FAILED = 'Failed to load recording';
+
 export interface RecordingPlayerHandle {
   /** Mint the signed URL if not already loaded. Resolves when src is set. */
   load(): Promise<void>;
+  /** "Refresh link": re-mint, keeping the position and play state. */
+  refresh(): void;
   seek(offsetSec: number): void;
   play(): void;
   pause(): void;
@@ -68,7 +83,17 @@ export interface RecordingPlayerProps {
   label?: string;
   onTimeUpdate?: (currentTime: number) => void;
   onPlayState?: (playing: boolean) => void;
+  /** The file ran out. `onPlayState(false)` has already been reported. */
+  onEnded?: () => void;
   onCanPlay?: () => void;
+  /** Reported in the commit, so a host's copy of the state is never a frame behind this row's. */
+  onStatus?: (status: RecordingPlayerStatus) => void;
+  /**
+   * Driven from the tape above the transcript. A seek leaves keyboard focus where it is, because the
+   * ticks and quotes it came from stay on screen and focusing the audio would scroll the pane away from
+   * the moment. The tape also says how the recording loads, so the idle row does not say it again.
+   */
+  tapeDriven?: boolean;
   className?: string;
   /**
    * Retained for call-site compatibility. The player is now always the
@@ -79,7 +104,7 @@ export interface RecordingPlayerProps {
 }
 
 export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayerProps>(
-  function RecordingPlayer({ sessionId, attemptId, label, onTimeUpdate, onPlayState, onCanPlay, className }, ref) {
+  function RecordingPlayer({ sessionId, attemptId, label, onTimeUpdate, onPlayState, onEnded, onCanPlay, onStatus, tapeDriven = false, className }, ref) {
     // The recording this player points at. A minted URL belongs to exactly
     // one source, so a URL minted for another one is never shown or played,
     // not even in the commit that re-points the player.
@@ -88,6 +113,8 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     const url = minted && minted.source === source ? minted.url : null;
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    // The <audio> refused the URL it was given. Cleared by the next URL.
+    const [mediaFailedUrl, setMediaFailedUrl] = useState<string | null>(null);
 
     const audioRef = useRef<HTMLAudioElement>(null);
     const mountedRef = useRef(true);
@@ -101,11 +128,37 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     // Bumped by every playFrom(), so a refresh never restores its saved
     // position over a seek the user asked for while it was re-minting.
     const seekGenRef = useRef(0);
+    const tapeDrivenRef = useRef(tapeDriven);
+    tapeDrivenRef.current = tapeDriven;
+    const onStatusRef = useRef(onStatus);
+    onStatusRef.current = onStatus;
+    const onPlayStateRef = useRef(onPlayState);
+    onPlayStateRef.current = onPlayState;
+
+    // What the host was last told. An <audio> taken off the page fires no pause, so a refresh or an
+    // unmount says it here, or the host's Pause would stand over nothing.
+    const playingRef = useRef(false);
+    const reportPlaying = useCallback((playing: boolean) => {
+      playingRef.current = playing;
+      onPlayStateRef.current?.(playing);
+    }, []);
+    const reportAudioGone = useCallback(() => {
+      if (playingRef.current) reportPlaying(false);
+    }, [reportPlaying]);
 
     useEffect(() => {
       mountedRef.current = true;
-      return () => { mountedRef.current = false; };
-    }, []);
+      return () => {
+        mountedRef.current = false;
+        reportAudioGone();
+      };
+    }, [reportAudioGone]);
+
+    const phase: RecordingPlayerStatus['phase'] = loading ? 'loading' : error ? 'error' : url ? 'ready' : 'idle';
+    const statusMessage = phase === 'error' ? error : phase === 'ready' && mediaFailedUrl === url ? LOAD_FAILED : null;
+    useLayoutEffect(() => {
+      onStatusRef.current?.({ phase, message: statusMessage });
+    }, [phase, statusMessage]);
 
     // One mint for both sources: the session recording, or one leg of it.
     const mintUrl = useCallback(
@@ -161,7 +214,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
         })
         .catch((e: ApiError) => {
           if (!mountedRef.current || reqId !== reqIdRef.current) return;
-          setError(e.message || 'Failed to load recording');
+          setError(e.message || LOAD_FAILED);
           setLoading(false);
           pendingLoadPromise.current = null;
           pendingLoadResolve.current?.();
@@ -181,6 +234,9 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       const reqId = ++reqIdRef.current;
       setLoading(true);
       setError(null);
+      setMediaFailedUrl(null);
+      // The loading row replaces the <audio>. If the new link works, `restore` plays it again.
+      reportAudioGone();
 
       mintUrl()
         .then((res) => {
@@ -203,10 +259,10 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
         })
         .catch((e: ApiError) => {
           if (!mountedRef.current || reqId !== reqIdRef.current) return;
-          setError(e.message || 'Failed to load recording');
+          setError(e.message || LOAD_FAILED);
           setLoading(false);
         });
-    }, [mintUrl, source]);
+    }, [mintUrl, source, reportAudioGone]);
 
     // Apply a queued playFrom() offset against the (now-mounted) <audio>.
     // With preload="none" the element may be at HAVE_NOTHING, so kick a
@@ -222,7 +278,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
         try { el.currentTime = Math.max(0, offset); } catch { /* jsdom / not seekable yet */ }
         el.play().catch(() => { /* autoplay gesture may be lost after async mint */ });
         // P2-2: move focus to the player so keyboard users land on the controls.
-        el.focus();
+        if (!tapeDrivenRef.current) el.focus();
       };
       if (el.readyState >= 1 /* HAVE_METADATA */) {
         run();
@@ -244,6 +300,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     // Imperative handle
     useImperativeHandle(ref, () => ({
       load() { return fetchUrl(); },
+      refresh() { refreshUrl(); },
       seek(offsetSec: number) {
         const el = audioRef.current;
         if (!el) return;
@@ -275,7 +332,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       get hasUrl() {
         return url != null && error == null;
       },
-    }), [fetchUrl, applyPendingSeek, url, error]);
+    }), [fetchUrl, refreshUrl, applyPendingSeek, url, error]);
 
     // The player is a TOOLBAR ROW inside the Transcript card, not a card of
     // its own: the old bordered box left a 20rem column empty beneath it.
@@ -291,9 +348,11 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       return (
         <div className={cx(row, className)}>
           <h3 className="sr-only">{label ?? 'Recording'}</h3>
-          <p className="text-label text-[var(--c-ink-secondary)]">
-            Recording loads on request; the link expires automatically.
-          </p>
+          {!tapeDriven && (
+            <p className="text-label text-[var(--c-ink-secondary)]">
+              Recording loads on request; the link expires automatically.
+            </p>
+          )}
           <CandidateButton
             variant="secondary"
             className="shrink-0"
@@ -351,11 +410,15 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           // Media events as props: React wires them when the element is created,
           // so none is missed between the <audio> appearing and a passive effect
           // subscribing (the old addEventListener effect ran after the commit).
-          onPlay={() => onPlayState?.(true)}
-          onPause={() => onPlayState?.(false)}
-          onEnded={() => onPlayState?.(false)}
+          onPlay={() => reportPlaying(true)}
+          onPause={() => reportPlaying(false)}
+          onEnded={() => {
+            reportPlaying(false);
+            onEnded?.();
+          }}
           onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
           onCanPlay={() => onCanPlay?.()}
+          onError={() => setMediaFailedUrl(url)}
         >
           <a href={url!} target="_blank" rel="noreferrer">
             Download recording

@@ -34,6 +34,7 @@ import type {
   RoleDraftJob,
   RoleScorecardMetric,
   ScorecardMetricDraft,
+  Session,
   ScorecardMetricTemplate,
 } from '../../src/types';
 import type { R1RecordingPlayback, R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
@@ -199,6 +200,25 @@ function redistribute(metrics: RoleScorecardMetric[], editedId: string, newWeigh
 
 const ASHBY = '/api/integrations/ashby/mission-control';
 
+/**
+ * A session as a route that reads `call_sessions` sends it. The word count and the recorded and
+ * connected roll-ups are computed for GET /api/candidates/:id alone, and no column holds them, so a
+ * fixture that returned them from anywhere else would hide a screen that reads them from the wrong row.
+ */
+function bareSessionRow(session: Session): Session {
+  const row = { ...session };
+  delete row.candidate_words;
+  delete row.recorded_total_sec;
+  delete row.recorded_legs;
+  delete row.recorded_unknown_legs;
+  delete row.connected_complete;
+  delete row.connected_total_sec;
+  delete row.connected_unobserved_legs;
+  delete row.connected_detected_legs;
+  delete row.connected_open_legs;
+  return row;
+}
+
 /** [METHOD, pattern, handler]. `:name` matches exactly one path segment. */
 const ROUTES: Array<[string, string, Handler]> = [
   // ── Platform + identity ────────────────────────────────────────────
@@ -316,7 +336,7 @@ const ROUTES: Array<[string, string, Handler]> = [
     // test changes `db.me.role`, and then the transcript is refused exactly as the API refuses it.
     if (db.me.role !== 'admin') return { status: 403, json: { error: 'Insufficient permissions' } };
     const detail = db.sessionDetails[params.id];
-    return detail ? ok(detail) : notFound('session');
+    return detail ? ok({ ...detail, session: bareSessionRow(detail.session) }) : notFound('session');
   }],
   ['POST', '/api/assess/:id', ({ params }, db) => {
     const assessment: Assessment | null = db.sessionDetails[params.id]?.assessment ?? null;
@@ -481,7 +501,7 @@ const ROUTES: Array<[string, string, Handler]> = [
   // ── Ashby candidate-scoped review (opaque application link) ────────
   ['GET', '/api/integrations/ashby/review/:linkId', ({ params }, db) => {
     const detail = params.linkId === SCOPED_REVIEW_LINK_ID ? db.candidateDetail(STAR_CANDIDATE_ID) : null;
-    return detail ? ok(detail) : notFound('application link');
+    return detail ? ok({ ...detail, sessions: detail.sessions.map(bareSessionRow) }) : notFound('application link');
   }],
   ['GET', '/api/integrations/ashby/review/:linkId/notes', ({ params }, db) => ok({ notes: params.linkId === SCOPED_REVIEW_LINK_ID ? db.notes.filter((n) => n.candidate_id === STAR_CANDIDATE_ID) : [] })],
   ['GET', '/api/integrations/ashby/review/:linkId/workflow', ({ params }, db) => ok({ ok: true, workflow: params.linkId === SCOPED_REVIEW_LINK_ID ? db.ashbyWorkflowFor(STAR_CANDIDATE_ID) : null })],

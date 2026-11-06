@@ -20,7 +20,7 @@ import {
   makeReportSession,
   makeSession,
 } from '../../test/reportFixtures';
-import type { Assessment } from '../../types';
+import type { Assessment, CandidatePhoneAttempt, TranscriptLine } from '../../types';
 
 function parse(html: string): Document {
   return new DOMParser().parseFromString(html, 'text/html');
@@ -88,6 +88,48 @@ describe('buildReportHtml: document shell and security', () => {
     expect(bodyText(html)).toContain('Confidential: contains personal data and call recordings');
     expect(html).not.toMatch(/https?:\/\//);
     expect(html).not.toMatch(/[?&]token=|signed|storage|recordings_v2|access_token|bearer/i);
+  });
+});
+
+describe('buildReportHtml: what a later call is called', () => {
+  const later = makeLeg({
+    id: 'leg-2',
+    attempt_seq: 2,
+    admitted_at: new Date(T0 + 70_000).toISOString(),
+    answered_at: new Date(T0 + 71_000).toISOString(),
+    connected_from: new Date(T0 + 71_000).toISOString(),
+    connected_to: new Date(T0 + 90_000).toISOString(),
+    recording_started_at_ms: T0 + 71_500,
+  });
+  const report = (first: Partial<CandidatePhoneAttempt>) => {
+    const transcript: TranscriptLine[] = [
+      { speaker: 'bot', text: 'Words on the first call.', started_at_ms: T0 + 2000 },
+      { speaker: 'bot', text: 'Words on the second call.', started_at_ms: T0 + 75_000 },
+    ];
+    return parse(buildReportHtml(makeReportData({ sessions: [makeReportSession({ legs: [makeLeg(first), later], transcript })] })));
+  };
+  const headings = (doc: Document) => Array.from(doc.querySelectorAll('h4')).map((h) => h.textContent);
+
+  it('calls it a reconnect after a real drop, on its card and over its turns', () => {
+    const doc = report({ outcome_class: 'disconnected' });
+    expect(headings(doc).filter((h) => h === 'Call 2 of 2 · reconnect')).toHaveLength(2);
+  });
+
+  it('a call after a voicemail is plain, on its card and over its turns', () => {
+    const doc = report({ outcome_class: 'voicemail', consent_stage: 'before_consent' });
+    expect(headings(doc).filter((h) => h === 'Call 2 of 2')).toHaveLength(2);
+    expect(doc.body.textContent).not.toContain('reconnect');
+  });
+
+  it('says "End not observed" of a call that stopped before consent, not that a line dropped', () => {
+    const doc = report({
+      outcome_class: 'voicemail',
+      consent_stage: 'before_consent',
+      connected_to_source: 'unobserved',
+      connected_to: null,
+    });
+    expect(doc.body.textContent).toContain('End not observed.');
+    expect(doc.body.textContent).not.toContain('Line dropped');
   });
 });
 

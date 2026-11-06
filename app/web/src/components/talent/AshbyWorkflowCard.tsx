@@ -53,7 +53,7 @@ const SANITIZED_CODE_RE = /^[a-z0-9_.:-]{1,64}$/;
    second surface that needs the same wording should import the card, not
    re-render the vocabulary its own way. */
 
-function ashbyLifecycleLabel(lifecycle: string): string {
+export function ashbyLifecycleLabel(lifecycle: string): string {
   switch (lifecycle) {
     case 'imported':
       return 'Imported from Ashby';

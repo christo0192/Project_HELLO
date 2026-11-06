@@ -22,6 +22,7 @@ import {
   legPlayable,
   legRecordingAnchor,
   legTitle,
+  reconnectedLegs,
   sessionLengthLabel,
   sortLegs,
   turnStartMs,
@@ -67,9 +68,50 @@ describe('sessionLegs', () => {
     expect(sortLegs([tie, B, A]).map((l) => l.id)).toEqual(['a', 'b', 'c']);
   });
 
-  it('titles a leg by position: first call, then reconnect', () => {
-    expect(legTitle(0, 2)).toBe('Call 1 of 2 · first call');
-    expect(legTitle(1, 2)).toBe('Call 2 of 2 · reconnect');
+  it('titles a leg by position, and says reconnect only of a call reached through a drop', () => {
+    expect(legTitle(0, 2, false)).toBe('Call 1 of 2 · first call');
+    expect(legTitle(1, 2, true)).toBe('Call 2 of 2 · reconnect');
+    expect(legTitle(1, 2, false)).toBe('Call 2 of 2');
+  });
+
+  describe('reconnectedLegs', () => {
+    const answered = (id: string, seq: number, over: Partial<CandidatePhoneAttempt> = {}) =>
+      leg({
+        id,
+        attempt_seq: seq,
+        admitted_at: iso(T0 + seq * 60_000),
+        answered_at: iso(T0 + seq * 60_000 + 5000),
+        consent_stage: 'after_consent',
+        ...over,
+      });
+    const dropped = (id: string, seq: number) => answered(id, seq, { outcome_class: 'disconnected' });
+    const voicemail = (id: string, seq: number) => answered(id, seq, { outcome_class: 'voicemail', consent_stage: 'before_consent' });
+    const pairs = (legs: CandidatePhoneAttempt[]) => [...reconnectedLegs(legs)];
+
+    it('maps the call that carried an interview on to the call the line cut off', () => {
+      expect(pairs([dropped('a', 1), answered('b', 2)])).toEqual([[1, 0]]);
+    });
+
+    it('a call after a voicemail reconnects nothing: nothing was connected before it', () => {
+      expect(pairs([voicemail('a', 1), answered('b', 2)])).toEqual([]);
+    });
+
+    it('a call after one that finished is no reconnect', () => {
+      expect(pairs([answered('a', 1, { outcome_class: 'completed' }), answered('b', 2)])).toEqual([]);
+    });
+
+    it('looks past a voicemail and an unanswered call to the call that went on', () => {
+      const silent = leg({ id: 'x', attempt_seq: 3, admitted_at: iso(T0 + 180_000) });
+      expect(pairs([dropped('a', 1), voicemail('b', 2), silent, answered('c', 4)])).toEqual([[3, 0]]);
+    });
+
+    it('a drop with nothing after it carries on nowhere', () => {
+      expect(pairs([dropped('a', 1), voicemail('b', 2)])).toEqual([]);
+    });
+
+    it('follows a reconnect that dropped too', () => {
+      expect(pairs([dropped('a', 1), dropped('b', 2), answered('c', 3)])).toEqual([[1, 0], [2, 1]]);
+    });
   });
 
   it('anchors a leg on its recording start, else answered + 1 s (approximate), else nothing', () => {
@@ -182,6 +224,15 @@ describe('sessionLegs', () => {
     expect(groups[1].turns[0].turn.start_offset_sec).toBeNull();
   });
 
+  it('session mode with no session anchor reads from the call t = 0 stands on, not a voicemail before it', () => {
+    const dead = { state: 'unavailable' as const, reason: 'no_recording' as const };
+    const voicemail = { ...A, recording: dead, outcome_class: 'voicemail', consent_stage: 'before_consent' as const };
+    const real = { ...B, recording: dead, recording_started_at_ms: null, consent_stage: 'after_consent' as const };
+    const groups = groupTurnsByLeg([turn('x', T0 + 320_000, null)], [voicemail, real], null, 'session');
+    // B's answer (T0 + 310 s) + 1 s, not A's: 9 s in, never the gap between them.
+    expect(groups[0].turns[0].turn.start_offset_sec).toBe(9);
+  });
+
   it('session mode: a call whose recording failed is not seekable and keeps its reason', () => {
     const failed = { ...A, recording: { state: 'unavailable' as const, reason: 'recording_failed' as const } };
     const groups = groupTurnsByLeg([turn('x', T0 + 20_000, null), turn('y', T0 + 30_000, null)], [failed], null, 'session');
@@ -279,6 +330,10 @@ describe('sessionLegs', () => {
     expect(legRecordedWords(legB)).toBe('Recorded 18s');
     expect(legUnobservedNote(legB)).toMatch(/^Line dropped; end not observed \(detected \d\d:\d\d IST by timeout\)\.$/);
     expect(legUnobservedNote({ ...legB, connected_to: null })).toBe('Line dropped; end not observed.');
+    // No conversation had started before consent, so no line was dropped.
+    const stopped = { ...legB, consent_stage: 'before_consent' as const };
+    expect(legUnobservedNote(stopped)).toMatch(/^End not observed \(detected \d\d:\d\d IST by timeout\)\.$/);
+    expect(legUnobservedNote({ ...stopped, connected_to: null })).toBe('End not observed.');
     expect(legRecordedWords({ ...legB, recorded_sec: null })).toBeNull();
     expect(legConnectedWords({ ...legB, answered_at: null, connected_from: null })).toBe('Not answered');
     expect(LEG_TAIL_NOTE).toBe('This recording may end a few seconds before the call did.');

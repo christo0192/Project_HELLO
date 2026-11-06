@@ -61,6 +61,12 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/components/r1/R1RecordingPlayer.tsx',
   // M013 S02: each call leg of a phone session on the Review tab.
   'src/components/talent/SessionLegRow.tsx',
+  // M026: the Logsheet Review workspace.
+  'src/components/talent/ReviewScorecard.tsx',
+  'src/components/talent/ReviewTape.tsx',
+  'src/components/talent/EvidenceMark.tsx',
+  'src/components/recording/ReviewCallStrip.tsx',
+  'src/components/session/VerdictMark.tsx',
   'src/components/design/SurfaceCard.tsx',
   'src/components/design/Meter.tsx',
   'src/components/design/Tag.tsx',
