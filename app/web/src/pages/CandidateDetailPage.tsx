@@ -121,6 +121,9 @@ export function CandidateDetailPage() {
   const [detail, setDetail] = useState<CandidateDetail | null>(null);
   const [me, setMe] = useState<MeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The R1 tab's own read of the rounds, for the line under the phone score: its
+  // panel stays mounted, so this costs no second request. Empty until it answers.
+  const [r1Rounds, setR1Rounds] = useState<R1Round[]>([]);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
@@ -189,6 +192,10 @@ export function CandidateDetailPage() {
     setError(null);
     setDetail(null);
     setMe(null);
+    // The route keeps this page mounted from one candidate to the next, and the
+    // tab only reports a read that worked: another person's verdict must not wait
+    // here for it. Nulling the detail unmounts the tab, so it always reads again.
+    setR1Rounds([]);
     // Older embedded candidate surfaces may provide only the candidate
     // endpoint in their test/host adapter. Treat that missing optional role
     // lookup as viewer-safe; the production API always supplies it and the
@@ -260,10 +267,6 @@ export function CandidateDetailPage() {
   // tab switch. Loaded once the page itself has loaded, as the Profile copy
   // always was; reset whenever the candidate changes.
   const phoneAttempts = usePhoneAttemptHistory(id ?? "", Boolean(id && detail && me));
-
-  // The R1 tab's own read of the rounds, for the line under the phone score: its
-  // panel stays mounted, so this costs no second request. Empty until it answers.
-  const [r1Rounds, setR1Rounds] = useState<R1Round[]>([]);
 
   // Silent refresh: re-read the candidate (its session list feeds the Phone
   // screening tab) without unmounting the page. Used when a live call completes.

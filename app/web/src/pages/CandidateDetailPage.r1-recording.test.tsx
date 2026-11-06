@@ -3,9 +3,9 @@
  * header line that keeps the R1 result apart from the phone score. The recording itself plays on the
  * review page, so nothing here plays or mints anything.
  */
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { Link, MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { CandidateDetailPage } from './CandidateDetailPage';
 import { mockCandidateDetail, mockSession, mockSessionDetail } from '../test/helpers';
@@ -283,6 +283,63 @@ describe('the header', () => {
     renderPage();
     await opened();
     expect(await screen.findByText('R1 role-play: Select 72 (AI)')).toBeInTheDocument();
+  });
+
+  describe('going straight from one candidate to another', () => {
+    const SECOND = { ...mockCandidateDetail.candidate, id: 'candidate-2', name: 'Second Person' };
+
+    /** The route stays mounted across the change of id, as a jump in the browser's history leaves it. */
+    function renderBoth() {
+      render(
+        <MemoryRouter initialEntries={['/candidates/candidate-1']}>
+          <Routes>
+            <Route path="/candidates/:id" element={<CandidateDetailPage />} />
+          </Routes>
+          <Link to="/candidates/candidate-2">Next candidate</Link>
+        </MemoryRouter>,
+      );
+    }
+
+    /** Jane Doe's verdict is on screen, then the page moves to the second candidate. */
+    async function moveOn() {
+      expect(await screen.findByText('R1 role-play: Borderline 58 (AI)')).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('link', { name: 'Next candidate' }));
+      await screen.findByRole('heading', { level: 1, name: 'Second Person' });
+    }
+
+    beforeEach(() => {
+      mockApi.getCandidate.mockImplementation(async (id: string) => (
+        id === 'candidate-2'
+          ? { ...mockCandidateDetail, candidate: SECOND, sessions: [] }
+          : { ...mockCandidateDetail, sessions: [R1_SESSION, ...mockCandidateDetail.sessions] }
+      ));
+    });
+
+    it('never shows the first candidate\'s verdict while the second one\'s read is out', async () => {
+      renderBoth();
+      mockApi.listR1Rounds.mockReturnValueOnce(Promise.resolve({ rounds: [ROUND] })).mockReturnValue(new Promise(() => undefined));
+      await moveOn();
+      expect(screen.queryByText(/^R1 role-play:/)).toBeNull();
+    });
+
+    it('shows no verdict at all when the second candidate\'s read fails', async () => {
+      renderBoth();
+      mockApi.listR1Rounds.mockResolvedValueOnce({ rounds: [ROUND] }).mockRejectedValue(new Error('service_unavailable'));
+      await moveOn();
+      await waitFor(() => expect(mockApi.listR1Rounds).toHaveBeenCalledWith('candidate-2'));
+      await act(async () => { await Promise.resolve(); });
+      expect(screen.queryByText(/^R1 role-play:/)).toBeNull();
+    });
+
+    it('shows the second candidate\'s own verdict once it is read', async () => {
+      renderBoth();
+      mockApi.listR1Rounds.mockImplementation(async (id: string) => ({
+        rounds: [id === 'candidate-2' ? { ...ROUND, id: 'round-2', recommendation: 'reject', overall: 31 } : ROUND],
+      }));
+      await moveOn();
+      expect(await screen.findByText('R1 role-play: Reject 31 (AI)')).toBeInTheDocument();
+      expect(screen.queryByText('R1 role-play: Borderline 58 (AI)')).toBeNull();
+    });
   });
 
   it('has no line while nothing is scored', async () => {
