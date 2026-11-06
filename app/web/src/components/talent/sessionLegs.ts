@@ -50,14 +50,63 @@ export function sortLegs(attempts: readonly CandidatePhoneAttempt[]): CandidateP
   });
 }
 
-/** "Call 1 of 2 · first call" / "Call 2 of 2 · reconnect". */
-export function legTitle(index: number, total: number): string {
-  return `Call ${index + 1} of ${total} · ${index === 0 ? 'first call' : 'reconnect'}`;
+/**
+ * "Call 1 of 2 · first call", "Call 2 of 2 · reconnect" for a call reached through a real drop
+ * (`reconnectedLegs`), else "Call 2 of 2": after a voicemail nothing was connected to reconnect.
+ */
+export function legTitle(index: number, total: number, reconnect: boolean): string {
+  const role = index === 0 ? ' · first call' : reconnect ? ' · reconnect' : '';
+  return `${legName(index, total)}${role}`;
 }
 
 /** Short name for the leg's player and its group heading. */
 export function legName(index: number, total: number): string {
   return `Call ${index + 1} of ${total}`;
+}
+
+const legAnswered = (leg: CandidatePhoneAttempt) => instantMs(leg.connected_from ?? leg.answered_at) !== null;
+
+/**
+ * The call t = 0 of Review's clock stands on, by index: the first answered call that did not stop
+ * before consent, else the first answered. A voicemail leaves the session reusable and the redial binds
+ * to it, so such a call can come a day before the interview, and every call before this one takes no
+ * part in the clock (`reviewTimeline.ts`). 0 when no call was answered.
+ */
+export function clockLegIndex(legs: readonly CandidatePhoneAttempt[]): number {
+  const reached = legs.findIndex((leg) => legAnswered(leg) && leg.consent_stage !== 'before_consent');
+  return reached >= 0 ? reached : Math.max(0, legs.findIndex(legAnswered));
+}
+
+/**
+ * A call the line cut off mid-interview. Only a call that consented has an interview to lose: voicemail,
+ * a refusal or a hang-up before the notice is simply a call that came first. `disconnected` is a
+ * conversation that dropped, and a lease reclaim (`abandoned` with no outcome) one our side lost. A
+ * call that deferred or withdrew is not a drop, whatever its outcome, and a stage we could not read
+ * proves nothing, so the gap stays plain.
+ */
+function legDropped(leg: CandidatePhoneAttempt): boolean {
+  if (leg.consent_stage !== 'after_consent') return false;
+  if (leg.outcome_class === 'disconnected') return true;
+  return leg.state === 'abandoned' && !leg.outcome_class && leg.abandon_reason !== 'infra_deferred';
+}
+
+/**
+ * The calls reached through a real drop: each one's index, mapped to the index of the call the line cut
+ * off. A call that stopped before consent carries nothing on, so a drop passes over it to the first
+ * later answered call that did not, and a drop with no such call is in the map nowhere.
+ */
+export function reconnectedLegs(legs: readonly CandidatePhoneAttempt[]): ReadonlyMap<number, number> {
+  const carried = new Map<number, number>();
+  let cutOff: number | null = null;
+  legs.forEach((leg, index) => {
+    if (!legAnswered(leg)) return;
+    if (cutOff !== null && leg.consent_stage !== 'before_consent') {
+      carried.set(index, cutOff);
+      cutOff = null;
+    }
+    if (legDropped(leg)) cutOff = index;
+  });
+  return carried;
 }
 
 /** A leg's recording can be asked for (the mint route decides the rest). */
@@ -174,10 +223,13 @@ export function groupTurnsByLeg(
   const anchors = legs.map((leg) => legRecordingAnchor(leg, sessionAnchorMs));
   const callStarts = legs.map((leg) => instantMs(leg.connected_from ?? leg.answered_at));
   // Session mode: the session recording's t = 0. The egress anchor when the
-  // session has one (exact); else the first leg's best anchor (an estimate).
+  // session has one (exact); else the best anchor of the call the clock
+  // stands on (an estimate), so a voicemail a day earlier shifts nothing.
   const sessionExact = finiteOrNull(sessionAnchorMs);
   const sessionFallback =
-    sessionExact !== null && sessionExact > 0 ? null : (anchors.find((a) => a !== null) ?? null);
+    sessionExact !== null && sessionExact > 0
+      ? null
+      : (anchors[clockLegIndex(legs)] ?? anchors.find((a) => a !== null) ?? null);
   const byLeg: LegTurn[][] = legs.map(() => []);
   const untimed: LegTurn[] = [];
   const derivedApprox = new Set<number>();
@@ -320,7 +372,8 @@ export function legRecordedWords(leg: CandidatePhoneAttempt): string | null {
  * The note for a leg whose end is not exactly known, or null: only the lease
  * reclaim ended it (`unobserved`), or only our reconciler check saw it end
  * (`detected`). Either `connected_to` is when the end was DETECTED, never the
- * real end, so it is named as such rather than shown as a call length.
+ * real end, so it is named as such rather than shown as a call length. A call
+ * that stopped before consent had no conversation on it to drop.
  */
 export function legUnobservedNote(leg: CandidatePhoneAttempt): string | null {
   if (leg.connected_to_source === 'detected') {
@@ -329,9 +382,8 @@ export function legUnobservedNote(leg: CandidatePhoneAttempt): string | null {
       : 'End time approximate.';
   }
   if (leg.connected_to_source !== 'unobserved') return null;
-  return leg.connected_to
-    ? `Line dropped; end not observed (detected ${formatIstTime(leg.connected_to)} by timeout).`
-    : 'Line dropped; end not observed.';
+  const unseen = leg.consent_stage === 'before_consent' ? 'End not observed' : 'Line dropped; end not observed';
+  return leg.connected_to ? `${unseen} (detected ${formatIstTime(leg.connected_to)} by timeout).` : `${unseen}.`;
 }
 
 /**

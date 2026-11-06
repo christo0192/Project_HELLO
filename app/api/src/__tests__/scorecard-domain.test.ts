@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import {
@@ -36,6 +37,44 @@ function results(scores: Array<1 | 2 | 3 | 4 | null>): ScorecardMetricModelResul
     rationale: 'Evidence is bounded and grounded in the transcript.', evidenceRefs: ['turn:1'],
   }));
 }
+
+/**
+ * The web's what-if line mirrors this arithmetic (app/web/src/lib/scorecard-what-if.ts), and its test
+ * reads this same table. A change here must change the table, which then fails the mirror until it follows.
+ */
+const WORKED_SCORES = JSON.parse(
+  readFileSync(new URL('./fixtures/scorecard-worked-scores.json', import.meta.url), 'utf8'),
+) as {
+  cutoffs: { select: number; borderline: number };
+  cases: Array<{
+    name: string;
+    scaleMax: number;
+    metrics: Array<[number, 1 | 2 | 3 | 4 | null]>;
+    weighted: number;
+    overall: number;
+    recommendation: string;
+  }>;
+};
+
+describe('worked scores shared with the web what-if line', () => {
+  it.each(WORKED_SCORES.cases)('$name', ({ scaleMax, metrics: rows, weighted, overall, recommendation }) => {
+    // Only the four-level rubric can be scored today; a five-level row is read, never produced.
+    if (scaleMax === 4) {
+      const weights = rows.map(([weightBps]) => weightBps);
+      expect(calculateWeightedScore(metrics(weights), results(rows.map(([, score]) => score)))).toBe(weighted);
+    }
+    expect(weightedScoreToOverall(weighted, scaleMax)).toBe(overall);
+    expect(recommendationForOverall(overall)).toBe(recommendation);
+  });
+
+  it('the cut-offs are the ones the table names', () => {
+    const { select, borderline } = WORKED_SCORES.cutoffs;
+    expect(recommendationForOverall(select)).toBe('advance');
+    expect(recommendationForOverall(select - 1)).toBe('hold');
+    expect(recommendationForOverall(borderline)).toBe('hold');
+    expect(recommendationForOverall(borderline - 1)).toBe('reject');
+  });
+});
 
 describe('scorecard domain', () => {
   it('requires exact positive weights and immutable metric shape', () => {

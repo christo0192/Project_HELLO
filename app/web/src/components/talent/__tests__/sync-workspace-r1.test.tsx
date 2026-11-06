@@ -6,7 +6,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TranscriptionSyncWorkspace } from '../TranscriptionSyncWorkspace';
-import type { Assessment, Session } from '../../../types';
+import type { Assessment, Session, TranscriptLine } from '../../../types';
 
 const mockApi = vi.hoisted(() => ({
   getSession: vi.fn(),
@@ -61,6 +61,25 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof Transcriptio
   );
 }
 
+/** Legal approved the consent line for the phone Review screen only, and R1 is not on it. */
+describe('the consent line and an R1 session', () => {
+  it('stays off: its gate turns are never read here, even though they are timed', async () => {
+    const start = Date.parse('2026-10-02T10:00:00.000Z');
+    const gate: TranscriptLine[] = [
+      { speaker: 'bot', text: 'Do you consent?', start_offset_sec: null, started_at_ms: start + 5_000, is_gate: true },
+      { speaker: 'candidate', text: 'Yes, I consent.', start_offset_sec: null, started_at_ms: start + 9_000, is_gate: true },
+      { speaker: 'bot', text: 'Let us begin.', start_offset_sec: null, started_at_ms: start + 12_000 },
+    ];
+    mockApi.getSession.mockResolvedValue({ session: R1_SESSION, transcript: gate, assessment: null });
+    renderWorkspace({ sessions: [R1_SESSION] });
+    await waitFor(() => expect(screen.getByText(/No completed sessions with recordings yet/)).toBeInTheDocument());
+    expect(mockApi.getSession).not.toHaveBeenCalled();
+    expect(screen.queryByText('Yes, I consent.')).toBeNull();
+    expect(document.querySelector('[data-consent-line]')).toBeNull();
+    expect(screen.queryByText(/Consent given/)).toBeNull();
+  });
+});
+
 /** The rows lit right now, by turn number. */
 const lit = () =>
   screen
@@ -81,7 +100,7 @@ describe('an R1 session', () => {
   it('leaves one choice beside one phone session, which is a line of text, and the phone session is what loads', async () => {
     const { container } = renderWorkspace();
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('phone-session'));
-    expect(screen.queryByRole('button', { name: /^Session/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Screening/ })).toBeNull();
     const line = container.querySelector('[data-session-text]');
     expect(line).toHaveTextContent('Live voice');
     expect(line).not.toHaveTextContent('R1 role-play');
@@ -92,7 +111,7 @@ describe('an R1 session', () => {
     const second: Session = { ...PHONE_SESSION, id: 'phone-session-2', created_at: '2026-10-03T10:00:00.000Z' };
     renderWorkspace({ sessions: [R1_SESSION, second, PHONE_SESSION] });
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('phone-session-2'));
-    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Screening/ }));
     const options = screen.getAllByRole('option').map((option) => option.textContent ?? '');
     expect(options).toHaveLength(2);
     expect(options.filter((text) => /R1 role-play/.test(text))).toEqual([]);
@@ -108,7 +127,7 @@ describe('an R1 session', () => {
   it('alone leaves the workspace saying there is no completed screening', () => {
     renderWorkspace({ sessions: [R1_SESSION] });
     expect(screen.getByText(/No completed sessions with recordings yet/)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Session/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Screening/ })).toBeNull();
     expect(mockApi.getSession).not.toHaveBeenCalled();
   });
 });
@@ -177,7 +196,7 @@ describe('phone sessions are unchanged', () => {
     await waitFor(() => expect(mockApi.getRecordingDownloadUrl).toHaveBeenCalledWith('phone-session'));
   });
 
-  it('a click lights nothing by itself: the row waits for the playhead, a quarter-second early as ever', async () => {
+  it('a press lights its row at once, and the playhead then keeps its quarter-second lead', async () => {
     mockApi.getSession.mockResolvedValue({
       session: PHONE_SESSION,
       transcript: [
@@ -201,7 +220,7 @@ describe('phone sessions are unchanged', () => {
     at(8);
     expect(lit()).toEqual(['1']);
     fireEvent.click(screen.getByRole('button', { name: /Turn 2:/ }));
-    expect(lit()).toEqual(['1']);
+    expect(lit()).toEqual(['2']);
     at(11.7);
     expect(lit()).toEqual(['1']);
     at(11.8);

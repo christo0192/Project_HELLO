@@ -1755,6 +1755,13 @@ export interface AshbyCandidateWorkflowOperation {
   type: AshbyCandidateWorkflowOperationType;
   state: string;
   errorCode: string | null;
+  /** When this leg last changed; absent on older APIs. */
+  updatedAt?: string | null;
+  /**
+   * A delivered `scorecard_write`: when the session it came from was created, which is how a page tells
+   * whether the write belongs to the session on screen. Absent reads as "not known to be this one".
+   */
+  sessionCreatedAt?: string | null;
 }
 
 export interface AshbyCandidateWorkflow {
@@ -1769,6 +1776,12 @@ export interface AshbyCandidateWorkflow {
   profileOutcome?: AshbyProfileOutcome | null;
   /** Null when the workflow row carries no usable timestamp. */
   updatedAt: string | null;
+  /**
+   * Where this candidate opens in Ashby. NO API SUPPLIES THIS YET: the workflow projection may not
+   * carry an external Ashby identifier (docs/runbooks/ashby-candidate-pipeline-card.md), and a link
+   * would be one. The Review screen offers "Open in Ashby to decide" only when it is present.
+   */
+  ashbyProfileUrl?: string | null;
 }
 
 /** `workflow: null` = the candidate is not Ashby-linked. Never an error. */

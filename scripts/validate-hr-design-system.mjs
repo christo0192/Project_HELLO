@@ -96,7 +96,10 @@ export const EXPECTED_ROUTES = [
 /** The only files that may print Plex Mono: a position in a recording. */
 export const MONO_ALLOWED = [
   'src/components/talent/SeekableTranscript.tsx',
+  'src/components/talent/ReviewScorecard.tsx',
+  'src/components/talent/ReviewTape.tsx',
   'src/components/recording/CallStrip.tsx',
+  'src/components/recording/ReviewCallStrip.tsx',
   'src/components/r1-review/OverviewPanel.tsx',
   'src/components/r1-review/PlayerControls.tsx',
   'src/components/r1-review/ReviewTranscript.tsx',
@@ -126,6 +129,7 @@ export const VERDICT_FILES = [
   'src/components/session/VerdictMark.tsx',
   'src/components/session/scorecard-read.ts',
   'src/components/talent/HeaderScore.tsx',
+  'src/components/talent/ReviewScorecard.tsx',
   'src/components/talent/CandidateScorecard.tsx',
   'src/components/Scorecard.tsx',
   'src/components/r1-review/VerdictBlock.tsx',

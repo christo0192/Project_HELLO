@@ -17,13 +17,21 @@ type Fill = 'full' | 'half' | 'empty';
 
 const FILL: Readonly<Record<string, Fill>> = { advance: 'full', hold: 'half', reject: 'empty' };
 
+const WORD = {
+  md: 'gap-1.5 text-label font-medium',
+  lg: 'gap-1.5 text-sm font-medium',
+  xl: 'gap-2.5 text-xl font-semibold',
+} as const;
+
+const CIRCLE = { md: 'h-3 w-3', lg: 'h-3.5 w-3.5', xl: 'h-4 w-4' } as const;
+
 export interface VerdictMarkProps {
   /** The stored value (`advance`, `hold`, `reject`). Nothing renders without one. */
   recommendation: unknown;
   /** Printed after the word. Never a 0 for a score that is missing. */
   score?: unknown;
-  /** `lg` beside a figure, `md` in a list. */
-  size?: 'md' | 'lg';
+  /** `xl` as the headline on Review, `lg` beside a figure, `md` in a list. */
+  size?: keyof typeof WORD;
   className?: string;
 }
 
@@ -35,18 +43,14 @@ export function VerdictMark({ recommendation, score, size = 'md', className }: V
   return (
     <span
       data-recommendation={String(recommendation)}
-      className={cx(
-        'inline-flex items-center gap-1.5 whitespace-nowrap font-medium text-ink',
-        size === 'lg' ? 'text-sm' : 'text-label',
-        className,
-      )}
+      className={cx('inline-flex items-center whitespace-nowrap text-ink', WORD[size], className)}
     >
       {fill && (
         <svg
           aria-hidden="true"
           data-verdict-mark={fill}
           viewBox="0 0 12 12"
-          className={cx('shrink-0 text-ink', size === 'lg' ? 'h-3.5 w-3.5' : 'h-3 w-3')}
+          className={cx('shrink-0 text-ink', CIRCLE[size])}
         >
           <circle
             cx="6"

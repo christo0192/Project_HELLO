@@ -305,6 +305,34 @@ describe('Combobox', () => {
   });
 });
 
+describe('Combobox in a ruled row', () => {
+  const picker = (compact: boolean) => (
+    <Combobox id="row" aria-label="Screening" compact={compact} value="1" onChange={() => {}} options={OPTIONS} placeholder="Choose" searchLabel="Search" listLabel="Sessions" />
+  );
+
+  it('keeps the trigger to one line, and the description in the list', async () => {
+    render(picker(true));
+    const trigger = screen.getByRole('button', { name: /^Screening/ });
+    expect(trigger).toHaveTextContent('Sales Program Advisor');
+    expect(trigger).not.toHaveTextContent('Opened 1 Aug 2026');
+    expect(trigger.className).toContain('min-h-6');
+    await userEvent.click(trigger);
+    expect(within(screen.getByRole('listbox')).getByRole('option', { name: /Sales Program Advisor/ })).toHaveTextContent('Opened 1 Aug 2026');
+  });
+
+  it('stays a full touch target on a phone', () => {
+    render(picker(true));
+    expect(screen.getByRole('button', { name: /^Screening/ }).className).toContain('[@media(pointer:coarse)]:min-h-11');
+  });
+
+  it('leaves every other trigger as it was', () => {
+    render(picker(false));
+    const trigger = screen.getByRole('button', { name: /^Screening/ });
+    expect(trigger).toHaveTextContent('Opened 1 Aug 2026');
+    expect(trigger.className).toContain('min-h-10');
+  });
+});
+
 describe('Combobox on a toolbar or in a short list', () => {
   const SHORT: ComboboxOption[] = [
     { value: 'viewer', label: 'Viewer' },

@@ -144,8 +144,8 @@ describe('CandidateDetailPage tabs', () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
-    expect(await screen.findByText('transcript unavailable')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
+    expect(await screen.findByText('The transcript could not be loaded.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
   });
 
   it('gates recording access behind an explicit click', async () => {

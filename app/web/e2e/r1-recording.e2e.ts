@@ -193,6 +193,21 @@ test.describe('where a link lands', () => {
   });
 });
 
+test.describe('the review page at 1366x768', () => {
+  test('the video stays on screen beside a transcript with room to read', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await app.goto(RECORDING);
+    await page.getByRole('button', { name: 'Play', exact: true }).click();
+    const video = page.locator('video');
+    await expect.poll(() => duration(video)).toBeGreaterThan(R1_REC_LENGTH_SEC - 5);
+    await video.evaluate((el: HTMLMediaElement) => el.pause());
+    await expect(video).toBeInViewport({ ratio: 1 });
+    const transcript = (await page.getByRole('region', { name: 'Transcript turns' }).boundingBox())!;
+    expect(transcript.height).toBeGreaterThan(300);
+    app.expectHealthy();
+  });
+});
+
 test.describe('the link expires, or was bad to begin with', () => {
   test('an error after metadata: exactly one more mint, a new link, and the position is restored', async ({ app, page }) => {
     await app.goto(RECORDING);

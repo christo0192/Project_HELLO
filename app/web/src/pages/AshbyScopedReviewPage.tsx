@@ -28,7 +28,7 @@
 import { useCallback, useEffect, useId, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
-import type { CandidateDetail, Note } from '../types';
+import type { AshbyCandidateWorkflow, CandidateDetail, Note } from '../types';
 import { clearReturnTo } from '../lib/return-to';
 import { StatusBadge } from '../components/design';
 import {
@@ -82,6 +82,27 @@ export function AshbyScopedReviewPage() {
   useEffect(clearReturnTo, []);
 
   useEffect(load, [load]);
+
+  // Where this candidate stands in Ashby, for the Review tab's log header, through the same link scope
+  // as the Overview's card. `undefined` while unknown, reading or failed: that is never "Not linked".
+  // `Promise.resolve()`: an adapter without the call must not take the page down.
+  const [ashbyWorkflow, setAshbyWorkflow] = useState<AshbyCandidateWorkflow | null | undefined>(undefined);
+  useEffect(() => {
+    if (!applicationLinkId) return;
+    let live = true;
+    setAshbyWorkflow(undefined);
+    Promise.resolve()
+      .then(() => api.getAshbyScopedReviewWorkflow(applicationLinkId))
+      .then((result) => {
+        if (live) setAshbyWorkflow(result?.workflow ?? null);
+      })
+      .catch(() => {
+        if (live) setAshbyWorkflow(undefined);
+      });
+    return () => {
+      live = false;
+    };
+  }, [applicationLinkId]);
 
   if (error) {
     return (
@@ -160,17 +181,28 @@ export function AshbyScopedReviewPage() {
               panel: (
                 <>
                   {/* R1 is not in this workspace, and this shell has no R1 tab and links
-                      nowhere, so it says where the interview is. */}
+                      nowhere, so it says where the interview is. The workspace pulls itself
+                      up by 1.5rem at the width its panes stand side by side. */}
                   {sessions.some((session) => session.interview_round_id != null) && (
-                    <p className="mb-4 text-sm text-ink-secondary">
+                    <p className="mb-4 text-sm text-ink-secondary min-[1180px]:mb-10">
                       The R1 interview for this candidate is on the candidate page, under R1 interview.
                     </p>
                   )}
-                  <TranscriptionSyncWorkspace
-                    sessions={sessions}
-                    assessments={assessments}
-                    blocked={decisionBlocked}
-                  />
+                  {/* The workspace is drawn for the sheet the app's pages lie on, and this shell is on the
+                      desk, where its sticky head and labels would read as patches. So it brings its own,
+                      out to the shell's edge as its negative margins expect. */}
+                  <div className="-mx-4 bg-paper px-4 sm:-mx-6 sm:px-6">
+                    <TranscriptionSyncWorkspace
+                      sessions={sessions}
+                      assessments={assessments}
+                      blocked={decisionBlocked}
+                      candidateName={candidate.name}
+                      // No role title: the scoped payload carries only the id, and this shell has no
+                      // roles read, so the log header drops the cell rather than saying it is unknown.
+                      ashbyWorkflow={ashbyWorkflow}
+                      resumeFacts={candidate.parsed}
+                    />
+                  </div>
                 </>
               ),
             },

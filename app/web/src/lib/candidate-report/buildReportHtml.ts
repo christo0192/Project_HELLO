@@ -41,6 +41,7 @@ import {
   legRecordingShown,
   legTitle,
   legUnobservedNote,
+  reconnectedLegs,
   sessionLengthLabel,
   sortLegs,
 } from '../../components/talent/sessionLegs';
@@ -369,7 +370,7 @@ function turnRow(
   );
 }
 
-function legCard(leg: CandidatePhoneAttempt, index: number, total: number, rs: ReportSession): string {
+function legCard(leg: CandidatePhoneAttempt, index: number, total: number, reconnect: boolean, rs: ReportSession): string {
   const facts: string[] = [e(legConnectedWords(leg))];
   const recorded = legRecordingShown(leg) ? legRecordedWords(leg) : null;
   if (recorded) facts.push(e(recorded));
@@ -382,7 +383,7 @@ function legCard(leg: CandidatePhoneAttempt, index: number, total: number, rs: R
     player = playerOrNote(rs.legAudio[leg.id], `${legName(index, total)} recording`, 'Recording not included in this report.');
   }
   return (
-    `<div class="call"><h4>${e(legTitle(index, total))}</h4>` +
+    `<div class="call"><h4>${e(legTitle(index, total, reconnect))}</h4>` +
     `<p class="small muted">${facts.join(' · ')}</p>` +
     (unobserved ? `<p class="small muted">${e(unobserved)}</p>` : '') +
     (consent ? `<p><span class="tag warn">${e(consent.label)}</span> <span class="small muted">${e(consent.note)}</span></p>` : '') +
@@ -404,13 +405,14 @@ function transcriptHtml(rs: ReportSession, legs: CandidatePhoneAttempt[], seekMo
     return `${header}${hint}<ol class="transcript">${rows}</ol>`;
   }
   const groups: LegGroup[] = groupTurnsByLeg(rs.transcript, legs, rs.session.recording_egress_started_at_ms, seekMode);
+  const reconnects = reconnectedLegs(legs);
   const blocks = groups
     .map((g) => {
       const leg = g.legIndex === null ? null : legs[g.legIndex];
       const heading =
         g.legIndex === null
           ? 'No timing available'
-          : legTitle(g.legIndex, legs.length);
+          : legTitle(g.legIndex, legs.length, reconnects.has(g.legIndex));
       const audioId =
         seekMode === 'session'
           ? sessionAudioId
@@ -437,7 +439,8 @@ function sessionBlock(rs: ReportSession, index: number): string {
 
   let calls = '';
   if (legs.length > 0) {
-    calls = `<h3>Calls</h3>${legs.map((leg, i) => legCard(leg, i, legs.length, rs)).join('')}`;
+    const reconnects = reconnectedLegs(legs);
+    calls = `<h3>Calls</h3>${legs.map((leg, i) => legCard(leg, i, legs.length, reconnects.has(i), rs)).join('')}`;
   } else if (rs.legsNote) {
     calls = `<p class="notice">${e(rs.legsNote)}</p>`;
   }

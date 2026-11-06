@@ -13,7 +13,7 @@ import { forwardRef } from 'react';
 import type { CandidatePhoneAttempt } from '../../types';
 import { Tag } from '../design/candidate';
 import { RecordingPlayer } from './RecordingPlayer';
-import type { RecordingPlayerHandle } from './RecordingPlayer';
+import type { RecordingPlayerHandle, RecordingPlayerStatus } from './RecordingPlayer';
 import {
   LEG_TAIL_NOTE,
   legConnectedWords,
@@ -32,13 +32,19 @@ export interface SessionLegRowProps {
   leg: CandidatePhoneAttempt;
   index: number;
   total: number;
+  /** This call was reached through a real drop (`reconnectedLegs`). */
+  reconnect?: boolean;
   sessionId: string;
   onTimeUpdate?: (currentTime: number) => void;
   onPlayState?: (playing: boolean) => void;
+  onEnded?: () => void;
+  onStatus?: (status: RecordingPlayerStatus) => void;
+  /** See `RecordingPlayerProps.tapeDriven`. */
+  tapeDriven?: boolean;
 }
 
 export const SessionLegRow = forwardRef<RecordingPlayerHandle, SessionLegRowProps>(
-  function SessionLegRow({ leg, index, total, sessionId, onTimeUpdate, onPlayState }, ref) {
+  function SessionLegRow({ leg, index, total, reconnect = false, sessionId, onTimeUpdate, onPlayState, onEnded, onStatus, tapeDriven }, ref) {
     const unobservedNote = legUnobservedNote(leg);
     // A deleted, withdrawn or blocked recording states no length and no tail
     // note, exactly as the Overview list (legRecordingShown).
@@ -50,7 +56,7 @@ export const SessionLegRow = forwardRef<RecordingPlayerHandle, SessionLegRowProp
     return (
       <li className="py-3 first:pt-0 last:pb-0" data-leg-row="">
         <p className="text-sm text-[var(--c-ink)]">
-          <span className="font-medium">{legTitle(index, total)}</span>
+          <span className="font-medium">{legTitle(index, total, reconnect)}</span>
           <span aria-hidden="true" className="text-[var(--c-ink-secondary)]"> · </span>
           <span
             className="text-[var(--c-ink-secondary)]"
@@ -87,6 +93,9 @@ export const SessionLegRow = forwardRef<RecordingPlayerHandle, SessionLegRowProp
               label={legName(index, total)}
               onTimeUpdate={onTimeUpdate}
               onPlayState={onPlayState}
+              onEnded={onEnded}
+              onStatus={onStatus}
+              tapeDriven={tapeDriven}
             />
           ) : (
             <p className="text-xs text-[var(--c-ink-secondary)]">{legNoAudioLabel(leg.recording.reason)}</p>

@@ -31,6 +31,7 @@ import {
 import { ashbyReviewRouter, createAshbyScopedWorkflowRoute } from '../routes/ashby-review.js';
 import {
   ASHBY_PROFILE_OUTCOMES,
+  deliveredScorecardSessionId,
   projectCandidateWorkflow,
   projectIntakeType,
   projectProfileOutcome,
@@ -59,8 +60,8 @@ const WORKFLOW: CandidateAshbyWorkflowView = {
   terminalState: null,
   ingestionState: 'ready',
   operations: [
-    { type: 'invite_delivery', state: 'succeeded', errorCode: null },
-    { type: 'scorecard_write', state: 'failed', errorCode: 'provider_5xx' },
+    { type: 'invite_delivery', state: 'succeeded', errorCode: null, updatedAt: '2026-08-20T00:00:00.000Z' },
+    { type: 'scorecard_write', state: 'failed', errorCode: 'provider_5xx', updatedAt: '2026-08-20T00:00:00.000Z' },
   ],
   sessionStatus: 'completed',
   intakeType: 'resume_parsing',
@@ -307,6 +308,8 @@ const ALLOWED_KEYS = new Set([
   'type',
   'state',
   'errorCode',
+  // A time, never the session's id: which session a delivered scorecard came from.
+  'sessionCreatedAt',
 ]);
 
 function collectKeys(value: unknown, out: Set<string> = new Set()): Set<string> {
@@ -424,7 +427,59 @@ describe('projectCandidateWorkflow', () => {
       },
       null,
     );
-    expect(view.operations).toEqual([{ type: 'invite_delivery', state: 'succeeded', errorCode: null }]);
+    expect(view.operations).toEqual([
+      { type: 'invite_delivery', state: 'succeeded', errorCode: null, updatedAt: '2026-08-20T00:00:00.000Z' },
+    ]);
+  });
+
+  describe('the session a delivered scorecard came from', () => {
+    const CREATED = '2026-09-01T03:30:00.000Z';
+    const write = (over: Record<string, unknown> = {}) => ({
+      operation_type: 'scorecard_write',
+      state: 'succeeded',
+      error_code: null,
+      updated_at: '2026-09-01T06:00:00.000Z',
+      source_session_id: SESSION_ID,
+      ...over,
+    });
+
+    it('carries its time on the delivered write, and the id goes no further', () => {
+      const view = projectCandidateWorkflow({ lifecycle: 'completed', ashby_operations: [write()] }, null, CREATED);
+      expect(view.operations).toEqual([
+        { type: 'scorecard_write', state: 'succeeded', errorCode: null, updatedAt: '2026-09-01T06:00:00.000Z', sessionCreatedAt: CREATED },
+      ]);
+      expect(JSON.stringify(view)).not.toContain(SESSION_ID);
+    });
+
+    it('says nothing on a write that has not been delivered', () => {
+      const view = projectCandidateWorkflow({ lifecycle: 'writeback_pending', ashby_operations: [write({ state: 'failed' })] }, null, CREATED);
+      expect(view.operations[0]).not.toHaveProperty('sessionCreatedAt');
+    });
+
+    it('says nothing when the time could not be read', () => {
+      const view = projectCandidateWorkflow({ lifecycle: 'completed', ashby_operations: [write()] }, null);
+      expect(view.operations[0]).not.toHaveProperty('sessionCreatedAt');
+    });
+
+    it("reads the write's own session, else the link's, and only for a delivered write", () => {
+      const LINK_SESSION = '00000000-0000-4000-8000-000000000003';
+      expect(deliveredScorecardSessionId({ session_id: LINK_SESSION, ashby_operations: [write()] })).toBe(SESSION_ID);
+      expect(deliveredScorecardSessionId({ session_id: LINK_SESSION, ashby_operations: [write({ source_session_id: null })] })).toBe(LINK_SESSION);
+      expect(deliveredScorecardSessionId({ session_id: LINK_SESSION, ashby_operations: [write({ state: 'pending' })] })).toBeNull();
+      expect(deliveredScorecardSessionId({ session_id: LINK_SESSION, ashby_operations: [] })).toBeNull();
+    });
+  });
+
+  it('says when a leg last changed, and never invents a time for one without', () => {
+    const view = projectCandidateWorkflow(
+      {
+        lifecycle: 'completed',
+        updated_at: '2026-08-20T00:00:00.000Z',
+        ashby_operations: [{ operation_type: 'scorecard_write', state: 'succeeded', error_code: null, updated_at: 42 }],
+      },
+      null,
+    );
+    expect(view.operations).toEqual([{ type: 'scorecard_write', state: 'succeeded', errorCode: null, updatedAt: null }]);
   });
 
   it('degrades unusable rows without inventing state', () => {
@@ -566,6 +621,57 @@ describe('createCandidateWorkflowStore — scoping is load-bearing', () => {
     expect(client.applied).toContainEqual(['id', LINK_ID]);
     expect(client.applied.some(([c]: [string, unknown]) => c === 'candidate_id')).toBe(false);
     expect(view?.lifecycle).toBe('ready');
+  });
+
+  it("reads the delivered write's own session for its time, and passes on the time alone", async () => {
+    const created = '2026-09-01T03:30:00.000Z';
+    const read: string[] = [];
+    const client = filteringClient([{
+      ...MINE,
+      session_id: SESSION_ID,
+      ashby_operations: [
+        { operation_type: 'scorecard_write', state: 'succeeded', error_code: null, updated_at: '2026-09-01T06:00:00.000Z', source_session_id: OTHER_CANDIDATE_ID },
+      ],
+    }]);
+    const links = client.from.bind(client);
+    client.from = (table: string) => {
+      if (table !== 'call_sessions') return links(table);
+      const sessions: any = {
+        select: (columns: string) => {
+          sessions.columns = columns;
+          return sessions;
+        },
+        eq: (_column: string, id: string) => {
+          sessions.id = id;
+          return sessions;
+        },
+        maybeSingle: async () => {
+          if (sessions.columns === 'created_at') read.push(sessions.id);
+          return { data: { status: 'completed', created_at: created }, error: null };
+        },
+      };
+      return sessions;
+    };
+    const view = await createCandidateWorkflowStore(client).getForCandidate(CANDIDATE_ID);
+    expect(read).toEqual([OTHER_CANDIDATE_ID]);
+    expect(view?.operations[0]).toMatchObject({ type: 'scorecard_write', sessionCreatedAt: created });
+    expect(JSON.stringify(view)).not.toContain(OTHER_CANDIDATE_ID);
+  });
+
+  it('a failed read of that time degrades to no time, never a failed card', async () => {
+    const client = filteringClient([{
+      ...MINE,
+      session_id: SESSION_ID,
+      ashby_operations: [
+        { operation_type: 'scorecard_write', state: 'succeeded', error_code: null, updated_at: '2026-09-01T06:00:00.000Z' },
+      ],
+    }]);
+    const links = client.from.bind(client);
+    client.from = (table: string) =>
+      table === 'call_sessions' ? chainable({ data: null, error: { message: 'gone' } }) : links(table);
+    const view = await createCandidateWorkflowStore(client).getForCandidate(CANDIDATE_ID);
+    expect(view?.operations[0]).toMatchObject({ type: 'scorecard_write', state: 'succeeded' });
+    expect(view?.operations[0]).not.toHaveProperty('sessionCreatedAt');
   });
 
   it('filters stage_move out at the database, not only in the projection', async () => {

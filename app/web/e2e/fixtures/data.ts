@@ -522,6 +522,14 @@ function transcriptFor(role: Role, gateOnly = false): TranscriptLine[] {
   return lines;
 }
 
+const EVIDENCE_QUOTES = [
+  'We moved the hot path behind a queue',
+  'I usually start with EXPLAIN ANALYZE',
+  'Two late evenings a week is fine for me',
+  'see a product through several years',
+  'My notice period is sixty days',
+];
+
 /** A four-level (v2) role-scorecard assessment, carried in `raw` as the API stores it. */
 function v2Assessment(
   id: string,
@@ -540,7 +548,8 @@ function v2Assessment(
         score === null
           ? 'The call ran out of time before this topic was covered.'
           : `${metric.name}: ${metric.rubric[score]}. Answers stayed specific and consistent with the resume.`,
-      evidenceRefs: score === null ? [] : ['Described moving the hot path behind a queue', 'Quoted p99 latency before and after'],
+      // Verbatim from `ANSWERS`, as the scorer stores them. The last one was never said, so it stays text.
+      evidenceRefs: score === null ? [] : [EVIDENCE_QUOTES[i % EVIDENCE_QUOTES.length], 'Quoted p99 latency before and after'],
       metric,
     };
   });
@@ -1001,11 +1010,12 @@ const STAR_ASHBY_WORKFLOW: AshbyCandidateWorkflow = {
   terminalState: null,
   ingestionState: 'parsed',
   operations: [
-    { type: 'invite_delivery', state: 'succeeded', errorCode: null },
-    { type: 'scorecard_write', state: 'failed', errorCode: 'provider_5xx' },
+    { type: 'invite_delivery', state: 'succeeded', errorCode: null, updatedAt: ago(35 * MIN) },
+    { type: 'scorecard_write', state: 'failed', errorCode: 'provider_5xx', updatedAt: ago(35 * MIN) },
   ],
   sessionStatus: 'completed',
   updatedAt: ago(35 * MIN),
+  ashbyProfileUrl: 'https://app.ashbyhq.com/candidates/00000000-0000-4000-8000-000000000001',
 };
 
 /* ── Dashboard: intents + funnel ─────────────────────────────────────── */

@@ -75,6 +75,13 @@ describe('SessionLegRow', () => {
     expect(screen.queryByRole('button', { name: 'Load recording' })).toBeNull();
   });
 
+  it('says reconnect only of a call the host says was reached through a drop', () => {
+    const { rerender } = render(<ul><SessionLegRow leg={leg()} index={1} total={2} sessionId="s" reconnect /></ul>);
+    expect(screen.getByText('Call 2 of 2 · reconnect')).toBeInTheDocument();
+    rerender(<ul><SessionLegRow leg={leg()} index={1} total={2} sessionId="s" /></ul>);
+    expect(screen.getByText('Call 2 of 2')).toBeInTheDocument();
+  });
+
   it('a reconciler-detected end reads approximate, with no length', () => {
     const { container } = renderRow(leg({ connected_to_source: 'detected', connected_sec: null }));
     const text = container.textContent ?? '';

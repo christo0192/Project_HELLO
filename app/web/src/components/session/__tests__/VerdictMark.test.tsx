@@ -22,6 +22,16 @@ describe('VerdictMark', () => {
     expect(mark.innerHTML).not.toMatch(/#|rgb|var\(--danger|var\(--voice/);
   });
 
+  it.each([
+    ['md', 'text-label', 'font-medium', 'h-3'],
+    ['lg', 'text-sm', 'font-medium', 'h-3.5'],
+    ['xl', 'text-xl', 'font-semibold', 'h-4'],
+  ] as const)('sets %s in its own size, the word and the circle together', (size, text, weight, height) => {
+    const { container } = render(<VerdictMark recommendation="hold" size={size} />);
+    expect(container.querySelector('[data-recommendation]')).toHaveClass(text, weight);
+    expect(container.querySelector('[data-verdict-mark]')).toHaveClass(height);
+  });
+
   it('is decoration only: the name comes from the word', () => {
     const { container } = render(<VerdictMark recommendation="hold" score={61} />);
     expect(container.querySelector('[data-verdict-mark]')).toHaveAttribute('aria-hidden', 'true');

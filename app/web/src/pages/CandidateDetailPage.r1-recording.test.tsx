@@ -256,7 +256,7 @@ describe('the Phone screening tab', () => {
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalled());
     expect(mockApi.getSession).not.toHaveBeenCalledWith('session-r1');
     // The one phone session left to choose is a line of text, not a picker.
-    expect(within(panel('Phone screening')).queryByRole('button', { name: /^Session/ })).toBeNull();
+    expect(within(panel('Phone screening')).queryByRole('button', { name: /^Screening/ })).toBeNull();
     expect(panel('Phone screening').querySelector('[data-session-text]')).not.toHaveTextContent('R1');
   });
 });
@@ -265,11 +265,27 @@ describe('the header', () => {
   const score = () => screen.getByRole('region', { name: 'Latest screening score' });
 
   it('keeps the phone score, with the R1 result on its own line, labelled AI', async () => {
-    renderPage();
+    renderPage('?tab=profile');
     await opened();
     expect(await screen.findByText('R1 role-play: Borderline 58 (AI)')).toBeInTheDocument();
     expect(within(score()).getByText('78')).toBeInTheDocument();
     expect(within(score()).queryByText(/R1/)).toBeNull();
+  });
+
+  it('keeps the R1 result in the compact header on Phone screening, where the score steps aside', async () => {
+    renderPage('?tab=phone');
+    await opened();
+    expect(await screen.findByText('R1 role-play: Borderline 58 (AI)')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Latest screening score' })).toBeNull();
+    expect(screen.getByRole('heading', { level: 1, name: 'Jane Doe' })).toHaveClass('inline');
+  });
+
+  it('keeps the full header on Phone screening for an R1 interview alone: there are no panes to make room for', async () => {
+    mockApi.getCandidate.mockResolvedValue({ ...mockCandidateDetail, sessions: [R1_SESSION], assessments: [] });
+    renderPage('?tab=phone');
+    await opened();
+    expect(await screen.findByText(/No completed screening yet/)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Jane Doe' })).not.toHaveClass('inline');
   });
 
   it('says the newest round with a result, as a whole figure', async () => {
