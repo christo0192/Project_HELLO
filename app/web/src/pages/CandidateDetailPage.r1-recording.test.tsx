@@ -377,6 +377,22 @@ describe('the header', () => {
     expect(screen.queryByText(/^R1 role-play:/)).toBeNull();
   });
 
+  // The compact header is the one place only the page's own guard covers. A silent refresh can make the
+  // candidate blocked while the rounds read stays older, so the rounds here still carry the verdict.
+  it('hides the line in the compact header on Phone screening too, while decision use is blocked', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, decision_use_blocked_at: '2026-01-02T00:00:00.000Z' },
+      sessions: [R1_SESSION, ...mockCandidateDetail.sessions],
+    });
+    renderPage('?tab=phone');
+    await opened();
+    expect(screen.getByRole('heading', { level: 1, name: 'Jane Doe' })).toHaveClass('inline');
+    await waitFor(() => expect(mockApi.listR1Rounds).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByText(/^R1 role-play:/)).toBeNull();
+  });
+
   it('hides the line when the round says the result is withheld', async () => {
     mockApi.listR1Rounds.mockResolvedValue({ rounds: [{ ...ROUND, scores_withheld: true }] });
     renderPage('?tab=r1');

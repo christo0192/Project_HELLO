@@ -730,6 +730,15 @@ describe('a pending rejection', () => {
     await waitFor(() => expect(mockApi.getMe).toHaveBeenCalled());
     expect(screen.queryByRole('button', { name: 'Cancel rejection' })).not.toBeInTheDocument();
   });
+
+  // 0122 leaves the date on the row once the rejection lands, and a click would only answer not_pending.
+  it('is over once the rejection has landed, though the date stays on the round', async () => {
+    await opened(review({ round: { ...pending().round, status_write: 'rejected' } }));
+    await waitFor(() => expect(mockApi.getMe).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole('list', { name: 'About this interview' })).not.toHaveTextContent(/Rejection pending/);
+    expect(screen.queryByRole('button', { name: 'Cancel rejection' })).not.toBeInTheDocument();
+  });
 });
 
 describe('Briefing', () => {
