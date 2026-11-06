@@ -1,7 +1,8 @@
 /**
  * The header of the review page: breadcrumb, title, and the chips that say what this interview is.
  *
- * The breadcrumb goes back to the queue, and the name to the candidate's R1 interview tab.
+ * The breadcrumb goes back to the queue, at the view and page the row was opened from, and the name to
+ * the candidate's R1 interview tab.
  *
  * A pending rejection can be cancelled from here, after a confirmation, by an admin or the interviewer
  * who sent the round: the API's own rule, so nobody is offered a button that can only answer 403.
@@ -10,7 +11,7 @@
  */
 import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { Button, Dialog, SegmentedControl } from '../design';
 import { Tag } from '../design/candidate';
 import { api } from '../../api';
@@ -54,6 +55,11 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   const keptUntil = recording?.facts.find((fact) => fact.startsWith('Kept until'));
   const statusWord = roundStatusWord(round, attempts, Date.now());
 
+  // The queue hands over the address it was on. Only a query string is taken from router state.
+  const location = useLocation();
+  const listSearch = (location.state as { listSearch?: unknown } | null)?.listSearch;
+  const backToQueue = typeof listSearch === 'string' && listSearch.startsWith('?') ? `/interviews${listSearch}` : '/interviews';
+
   const [cancelledRound, setCancelledRound] = useState<string | null>(null);
   const pending = rejectionPendingUntil(round) !== null && cancelledRound !== round.id;
 
@@ -82,7 +88,7 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   return (
     <header>
       <nav aria-label="Breadcrumb" className="text-label text-ink-tertiary">
-        <Link to="/interviews" className={nameLink}>R1 interviews</Link> <span aria-hidden="true">/</span> {candidateName}
+        <Link to={backToQueue} className={nameLink}>R1 interviews</Link> <span aria-hidden="true">/</span> {candidateName}
       </nav>
       <h1 className="mt-1 text-title text-ink">
         Sales Program Advisor role-play,{' '}

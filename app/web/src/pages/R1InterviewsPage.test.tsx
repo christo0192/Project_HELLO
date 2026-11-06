@@ -34,8 +34,13 @@ const answer = (over: Partial<R1QueueResponse> = {}): R1QueueResponse => ({
 });
 
 function Address() {
-  const { pathname, search } = useLocation();
-  return <output data-testid="address">{`${pathname}${search}`}</output>;
+  const { pathname, search, state } = useLocation();
+  return (
+    <>
+      <output data-testid="address">{`${pathname}${search}`}</output>
+      <output data-testid="state">{JSON.stringify(state)}</output>
+    </>
+  );
 }
 
 function open(search = '') {
@@ -52,6 +57,7 @@ function open(search = '') {
 
 const address = () => screen.getByTestId('address').textContent ?? '';
 const lastAsked = () => mockApi.listR1Queue.mock.calls.at(-1)?.[0];
+const handedOver = () => JSON.parse(screen.getByTestId('state').textContent ?? 'null');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -191,6 +197,24 @@ describe('changing what is shown', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Reviewed' }));
     await waitFor(() => expect(lastAsked()).toEqual({ view: 'reviewed', sort: 'newest', page: 1, search: '', includeDryRuns: false }));
     expect(address()).toBe('/interviews?view=reviewed');
+  });
+
+  it('a row hands the review the address it was on, for the breadcrumb to come back to', async () => {
+    mockApi.listR1Queue.mockResolvedValue(answer({ view: 'all', sort: 'oldest', page: 2, total: 30 }));
+    open('?view=all&sort=oldest&page=2&dry_runs=include');
+    await userEvent.click(await screen.findByRole('link', { name: 'Ava Example' }));
+    await waitFor(() => expect(address()).toBe('/interviews/round-1'));
+    expect(handedOver()).toEqual({ listSearch: '?view=all&sort=oldest&page=2&dry_runs=include' });
+  });
+
+  it('a row hands over no name while a search is on', async () => {
+    open('?view=all');
+    await screen.findByRole('link', { name: 'Ava Example' });
+    await userEvent.type(screen.getByRole('searchbox', { name: 'Find a candidate by name' }), 'ava');
+    await waitFor(() => expect(lastAsked()).toMatchObject({ search: 'ava' }));
+    await userEvent.click(await screen.findByRole('link', { name: 'Ava Example' }));
+    await waitFor(() => expect(address()).toBe('/interviews/round-1'));
+    expect(handedOver()).toEqual({ listSearch: '?view=all' });
   });
 
   it('To review leaves the address bare again', async () => {

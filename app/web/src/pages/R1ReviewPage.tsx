@@ -20,7 +20,7 @@
  * not used on this page.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { EmptyPanel, ErrorPanel, InlineNotice, RetryButton, Skeleton, SkeletonText } from '../components/design';
 import { BriefingPanel } from '../components/r1-review/BriefingPanel';
@@ -79,6 +79,8 @@ function ReviewSkeleton() {
 export function R1ReviewPage() {
   const { roundId = '' } = useParams<{ roundId: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
+  // A replace drops router state unless it is handed on, and the breadcrumb's way back travels in it.
+  const { state: routerState } = useLocation();
   const [load, setLoad] = useState<Load>({ status: 'loading' });
   const [readKey, setReadKey] = useState(0);
   const [me, setMe] = useState<MeResponse | null>(null);
@@ -159,10 +161,10 @@ export function R1ReviewPage() {
           return params;
         },
         // Switching tabs is not a navigation: Back leaves the review.
-        { replace: true },
+        { replace: true, state: routerState },
       );
     },
-    [setSearchParams],
+    [setSearchParams, routerState],
   );
 
   const selectAttempt = useCallback(
@@ -177,10 +179,10 @@ export function R1ReviewPage() {
           params.delete('t');
           return params;
         },
-        { replace: true },
+        { replace: true, state: routerState },
       );
     },
-    [attempts, setSearchParams],
+    [attempts, setSearchParams, routerState],
   );
 
   const openTurn = useCallback(
@@ -198,10 +200,10 @@ export function R1ReviewPage() {
           else params.set('t', String(sec));
           return params;
         },
-        { replace: true },
+        { replace: true, state: routerState },
       );
     },
-    [attempts, setSearchParams],
+    [attempts, setSearchParams, routerState],
   );
 
   if (load.status === 'loading') {

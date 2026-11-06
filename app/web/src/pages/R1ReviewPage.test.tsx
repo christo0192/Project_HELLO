@@ -110,9 +110,9 @@ function Address() {
   return null;
 }
 
-function open(search = '') {
+function open(search = '', state: unknown = null) {
   return render(
-    <MemoryRouter initialEntries={[`/interviews/${ROUND}${search}`]}>
+    <MemoryRouter initialEntries={[{ pathname: `/interviews/${ROUND}`, search, state }]}>
       <Address />
       <Routes>
         <Route path="/interviews/:roundId" element={<R1ReviewPage />} />
@@ -121,9 +121,9 @@ function open(search = '') {
   );
 }
 
-const opened = async (body: R1ReviewResponse = review(), search = '') => {
+const opened = async (body: R1ReviewResponse = review(), search = '', state: unknown = null) => {
   mockApi.getR1Review.mockResolvedValue(body);
-  const view = open(search);
+  const view = open(search, state);
   await screen.findByRole('tablist', { name: 'R1 review sections' });
   return view;
 };
@@ -263,6 +263,39 @@ describe('the header', () => {
   it('has no feedback tab and no placeholder for one', async () => {
     await opened();
     expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Briefing', 'Resume', 'Recording']);
+  });
+});
+
+describe('the breadcrumb', () => {
+  const PLACE = '?view=reviewed&sort=oldest&page=3&dry_runs=include';
+  const crumb = () => within(screen.getByRole('navigation', { name: 'Breadcrumb' })).getByRole('link', { name: 'R1 interviews' });
+
+  it('goes to the queue from a bare link', async () => {
+    await opened();
+    expect(crumb()).toHaveAttribute('href', '/interviews');
+  });
+
+  it('goes back to the view and page the row was opened from', async () => {
+    await opened(review(), '', { listSearch: PLACE });
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
+  });
+
+  it.each([['a path', '//example.com'], ['a word', 'view=all'], ['a number', 7]])('takes only a query string from router state, not %s', async (_what, listSearch) => {
+    await opened(review(), '', { listSearch });
+    expect(crumb()).toHaveAttribute('href', '/interviews');
+  });
+
+  it('keeps the place through a change of tab, of attempt and a jump to a turn, which all replace the address', async () => {
+    await opened(review({ attempts: [attempt(), attempt({ session_id: 's2', attempt_number: 2 })] }), '', { listSearch: PLACE });
+    await userEvent.click(screen.getByRole('button', { name: /What made you look at it now/ }));
+    await waitFor(() => expect(address).toContain('tab=recording'));
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
+    await userEvent.click(within(screen.getByRole('group', { name: 'Attempt' })).getByRole('button', { name: 'Attempt 2 (retake)' }));
+    await waitFor(() => expect(address).toContain('attempt=2'));
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
+    await userEvent.click(tab('Briefing'));
+    await waitFor(() => expect(address).toContain('tab=briefing'));
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
   });
 });
 

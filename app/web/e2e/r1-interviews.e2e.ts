@@ -81,6 +81,29 @@ test.describe('the queue', () => {
     app.expectHealthy();
   });
 
+  test('the breadcrumb comes back to the same view and page, through a change of tab', async ({ app, page }) => {
+    const [first] = app.db.r1.queue;
+    app.db.r1.queue = Array.from({ length: 30 }, (_, i) => ({
+      ...first,
+      // The only round with a review behind it sits on the second page.
+      id: i === 27 ? R1_ROUND_ID : `round-${i}`,
+      candidate_name: `Candidate ${String(i).padStart(2, '0')}`,
+      created_at: new Date(Date.UTC(2026, 9, 1, i)).toISOString(),
+    }));
+    const place = '?view=all&sort=oldest&page=2&dry_runs=include';
+    await app.goto(`/interviews${place}`);
+    await page.getByRole('link', { name: 'Candidate 27' }).click();
+    await expect(page).toHaveURL(new RegExp(`/interviews/${R1_ROUND_ID}$`));
+    await page.getByRole('tab', { name: 'Briefing' }).click();
+    await expect(page).toHaveURL(/tab=briefing/);
+    await page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'R1 interviews' }).click();
+    await expect(page).toHaveURL(/\/interviews\?view=all&sort=oldest&page=2&dry_runs=include$/);
+    await expect(page.getByRole('link', { name: 'Candidate 27' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.getByRole('switch', { name: 'Show staff dry runs' })).toBeChecked();
+    app.expectHealthy();
+  });
+
   test('the name on the review goes to the R1 tab of the candidate', async ({ app, page }) => {
     await app.goto(`/interviews/${R1_ROUND_ID}`);
     await page.getByRole('heading', { level: 1 }).getByRole('link', { name: 'Naveen Kapoor' }).click();

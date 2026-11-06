@@ -15,7 +15,7 @@
  * Verdicts stay in ink. A row's result is the AI's, and the column says so.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import {
   EmptyPanel,
@@ -97,7 +97,7 @@ function lastEnded(round: R1QueueRound): string | null {
   }, null);
 }
 
-function QueueRow({ round }: { round: R1QueueRound }) {
+function QueueRow({ round, listSearch }: { round: R1QueueRound; listSearch: string }) {
   const name = candidateDisplayName(round.candidate_name);
   const nowMs = Date.now();
   const status = roundStatusWord(round, round.attempts, nowMs);
@@ -109,6 +109,7 @@ function QueueRow({ round }: { round: R1QueueRound }) {
       <Td className="py-2.5">
         <Link
           to={`/interviews/${round.id}`}
+          state={{ listSearch }}
           className="font-medium text-ink underline underline-offset-2 hover:text-ink-secondary focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink)]"
         >
           {name}
@@ -153,7 +154,7 @@ const HEADERS: ReadonlyArray<{ label: string; wide?: boolean }> = [
   { label: 'Sent', wide: true },
 ];
 
-function QueueTable({ rounds }: { rounds: readonly R1QueueRound[] }) {
+function QueueTable({ rounds, listSearch }: { rounds: readonly R1QueueRound[]; listSearch: string }) {
   return (
     <Table bare caption="R1 interviews">
       <THead>
@@ -164,7 +165,7 @@ function QueueTable({ rounds }: { rounds: readonly R1QueueRound[] }) {
         </tr>
       </THead>
       <TBody>
-        {rounds.map((round) => <QueueRow key={round.id} round={round} />)}
+        {rounds.map((round) => <QueueRow key={round.id} round={round} listSearch={listSearch} />)}
       </TBody>
     </Table>
   );
@@ -186,6 +187,8 @@ function QueueSkeleton() {
 
 export function R1InterviewsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  // A row hands this to the review, so its breadcrumb comes back to the same view and page.
+  const { search: listSearch } = useLocation();
   const view = queueViewFrom(searchParams.get('view'));
   const sort = queueSortFrom(searchParams.get('sort'), view);
   const page = queuePageFrom(searchParams.get('page'));
@@ -339,7 +342,7 @@ export function R1InterviewsPage() {
           />
         ) : (
           <>
-            <QueueTable rounds={answer.rounds} />
+            <QueueTable rounds={answer.rounds} listSearch={listSearch} />
             <Pagination
               noun="interviews"
               hidePageSize
