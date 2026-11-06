@@ -19,8 +19,8 @@ const FAILED_SESSION = /Recorded 1m 30s/;
 
 async function openReview(app: import('./fixtures/harness').AppHarness, session: RegExp) {
   await app.goto(`/candidates/${SEEK_CANDIDATE_ID}`);
-  await app.page.getByRole('tab', { name: 'Review' }).click();
-  const panel = app.page.getByRole('tabpanel', { name: 'Review' });
+  await app.page.getByRole('tab', { name: 'Phone screening' }).click();
+  const panel = app.page.getByRole('tabpanel', { name: 'Phone screening' });
   await pickSession(panel, session);
   await expect(panel.getByRole('list', { name: 'Calls in this session' }).getByRole('listitem')).toHaveCount(2);
   return panel;

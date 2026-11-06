@@ -18,7 +18,7 @@ import type {
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { R1Section } from "../components/r1/R1Section";
-import { Combobox, StatusBadge } from "../components/design";
+import { Combobox, EmptyPanel, StatusBadge } from "../components/design";
 import {
   CandidateButton,
   CandidateErrorState,
@@ -58,6 +58,10 @@ import { ExportReportButton } from "../components/talent/ExportReportButton";
 import { headlineCallFacts } from "../components/talent/sessionLegs";
 import { latestScreeningAssessment } from "../lib/latest-screening-assessment";
 import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
+import { candidateTabFrom, defaultCandidateTab, hasPhoneReview } from "../lib/candidate-tabs";
+import type { CandidateTab } from "../lib/candidate-tabs";
+import { r1ResultLine } from "../lib/r1";
+import type { R1Round } from "../lib/r1-types";
 import {
   DUPLICATE_HOLD_NOTICE,
   duplicateHoldErrorMessage,
@@ -76,12 +80,16 @@ import type { PhoneSlot } from "../types";
 /**
  * HELLO Lane 3 — CandidateDetail as one recruiter review workspace.
  *
- * Two tabs, Review first (it is the high-priority one):
- *   - Review: the single authoritative review workspace — session context,
- *     one recording player, synchronized transcript, and the session's
- *     scorecard (TranscriptionSyncWorkspace). This replaces the previously
- *     duplicated Sessions-tab audio, Recordings tab, and Overview scorecard.
- *   - Overview: identity/profile, live screening actions, call attempts and
+ * Three tabs, by pipeline, Phone screening first (it is the high-priority one):
+ *   - Phone screening: the single authoritative phone review workspace —
+ *     session context, one recording player, synchronized transcript, and the
+ *     session's scorecard (TranscriptionSyncWorkspace). This replaces the
+ *     previously duplicated Sessions-tab audio, Recordings tab, and Overview
+ *     scorecard.
+ *   - R1 interview: Send R1, reissue, retake and cancel, and one row per round
+ *     with "Open R1 review". No player: the recording is on the review page, so
+ *     each page has only one.
+ *   - Profile: identity/profile, live screening actions, call attempts and
  *     screening sessions, the Ashby pipeline, append-only notes, and appeals
  *     + one-time grant links.
  *
@@ -93,27 +101,28 @@ import type { PhoneSlot } from "../types";
  * THE HEADER carries who this is (name, status, role, the call facts) and ONE
  * primary action for the candidate's state, chosen from what the page
  * already offers rather than invented:
- *   - a screening to read   → "Review screening" opens the Review tab
- *   - reading it, on Review → "Open in Ashby to decide", when there is an Ashby
+ *   - a screening to read   → "Review screening" opens the Phone screening tab
+ *   - reading it, on that tab → "Open in Ashby to decide", when there is an Ashby
  *                             link and no appeal blocks decision use
  *   - nothing screened yet  → "Call candidate" opens the phone card's own
  *                             confirmation step (same request, same gates)
  *   - otherwise             → no primary; the status says what is happening
  * Export is the secondary beside it.
  *
- * On the Review tab the header is compact, because the log header below it
- * carries the role and the length, and the reasoning pane carries the score.
+ * On the Phone screening tab the header is compact, because the log header below
+ * it carries the role and the length, and the reasoning pane carries the score.
  *
- * The latest screening score sits top right of the header (HeaderScore).
+ * The latest screening score sits top right of the header (HeaderScore). It is
+ * the phone score. The R1 result, when there is one, is a line of its own under
+ * it, so each figure names its pipeline, and neither shows while an appeal
+ * blocks decision use. The compact header has no score to go under, so there
+ * the R1 line stands among the facts.
  *
- * The open tab is in the URL (`?tab=review` / `?tab=overview`), so the
- * Candidates table's "Review & decide" lands on the Review tab and a reload
- * keeps the place. With no `tab` param the page opens on Review when there is
- * something to review, and on Overview otherwise (that is where the call
- * actions live, and an empty Review workspace is not worth landing on).
+ * The open tab is in the URL (`?tab=phone|r1|profile`), so the Candidates
+ * table's "Review & decide" lands on Phone screening and a reload keeps the
+ * place. The names from before R1 had a tab, `review` and `overview`, still
+ * work. With no `tab` param the page chooses (`defaultCandidateTab`).
  */
-
-type CandidateTab = "overview" | "review";
 
 /** Only ever a link into Ashby's own app, whatever a payload says. */
 function ashbyDecisionUrl(workflow: AshbyCandidateWorkflow | null | undefined): string | null {
@@ -121,36 +130,29 @@ function ashbyDecisionUrl(workflow: AshbyCandidateWorkflow | null | undefined): 
   return typeof url === "string" && url.startsWith("https://app.ashbyhq.com/") ? url : null;
 }
 
-/** Something to review: an assessment, or a completed session (transcript, recording). */
-function hasReviewable(d: Pick<CandidateDetail, "assessments" | "sessions"> | null): boolean {
-  return (
-    d !== null
-    && (d.assessments.length > 0 || d.sessions.some((session) => session.status === "completed"))
-  );
-}
-
 export function CandidateDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<CandidateDetail | null>(null);
   const [me, setMe] = useState<MeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The R1 tab's own read of the rounds, for the line under the phone score: its
+  // panel stays mounted, so this costs no second request. Empty until it answers.
+  const [r1Rounds, setR1Rounds] = useState<R1Round[]>([]);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
   // The tab a bare link lands on, decided ONCE per load. Re-deciding on a
-  // silent refresh would yank the reader from Overview to Review the moment a
-  // live call finishes under them.
-  const [defaultTab, setDefaultTab] = useState<CandidateTab>("review");
-  const tabParam = searchParams.get("tab");
-  const tab: CandidateTab =
-    tabParam === "review" || tabParam === "overview" ? tabParam : defaultTab;
+  // silent refresh would yank the reader from Profile to Phone screening the
+  // moment a live call finishes under them.
+  const [defaultTab, setDefaultTab] = useState<CandidateTab>("phone");
+  const tab: CandidateTab = candidateTabFrom(searchParams.get("tab")) ?? defaultTab;
   const selectTab = useCallback(
     (next: string) => {
       setSearchParams(
         (prev) => {
           const params = new URLSearchParams(prev);
-          // Explicit both ways: a reload (or a refreshed default) keeps the place.
-          params.set("tab", next === "overview" ? "overview" : "review");
+          // Explicit every way: a reload (or a refreshed default) keeps the place.
+          params.set("tab", next);
           return params;
         },
         // Switching tabs is not a navigation: Back leaves the candidate. A
@@ -171,17 +173,17 @@ export function CandidateDetailPage() {
 
   // A header action that changes tab, and then has to put focus somewhere IN
   // the tab it opened:
-  //   - "Review screening" focuses the Review tab itself, so a keyboard user
-  //     is where the content changed rather than stranded on a button that
-  //     just vanished (it is hidden while Review is open);
-  //   - "Call candidate" opens the phone card's confirmation on the Overview,
-  //     which moves focus into the confirmation.
+  //   - "Review screening" focuses the Phone screening tab itself, so a keyboard
+  //     user is where the content changed rather than stranded on a button that
+  //     just vanished (it is hidden while that tab is open);
+  //   - "Call candidate" opens the phone card's confirmation on Profile, which
+  //     moves focus into the confirmation.
   //
   // Both are keyed on the TAB BEING SHOWN, not on the click: the router
   // applies a search-param change in its own (transition) render, after the
   // click's render has committed. Acting in the click's render would focus
-  // the tab that was still selected, or, from `?tab=review`, focus a button
-  // inside the Overview panel while that panel is still `hidden`, where a
+  // the tab that was still selected, or, from `?tab=phone`, focus a button
+  // inside the Profile panel while that panel is still `hidden`, where a
   // browser refuses focus and leaves it on the header button.
   const tabsRef = useRef<HTMLDivElement | null>(null);
   const [pendingTabAction, setPendingTabAction] = useState<
@@ -204,6 +206,10 @@ export function CandidateDetailPage() {
     setError(null);
     setDetail(null);
     setMe(null);
+    // The route keeps this page mounted from one candidate to the next, and the
+    // tab only reports a read that worked: another person's verdict must not wait
+    // here for it. Nulling the detail unmounts the tab, so it always reads again.
+    setR1Rounds([]);
     // Older embedded candidate surfaces may provide only the candidate
     // endpoint in their test/host adapter. Treat that missing optional role
     // lookup as viewer-safe; the production API always supplies it and the
@@ -214,7 +220,7 @@ export function CandidateDetailPage() {
       .catch(() => fallbackMe);
     Promise.all([api.getCandidate(id), meRequest])
       .then(([d, currentMe]) => {
-        setDefaultTab(hasReviewable(d) ? "review" : "overview");
+        setDefaultTab(defaultCandidateTab(d));
         setDetail(d);
         setMe(currentMe);
       })
@@ -269,10 +275,11 @@ export function CandidateDetailPage() {
     };
   }, [roleId]);
 
-  // The candidate's Ashby workflow, for the Review tab's log header and its one
-  // action. `null` only when the read says there is no Ashby link. `undefined`
-  // while it is unknown, reading or failed: the page then offers no Ashby action,
-  // and the log header must not say "Not linked". Guarded as `listRoles` is above.
+  // The candidate's Ashby workflow, for the Phone screening tab's log header and
+  // its one action. `null` only when the read says there is no Ashby link.
+  // `undefined` while it is unknown, reading or failed: the page then offers no
+  // Ashby action, and the log header must not say "Not linked". Guarded as
+  // `listRoles` is above.
   const [ashbyWorkflow, setAshbyWorkflow] = useState<AshbyCandidateWorkflow | null | undefined>(undefined);
   useEffect(() => {
     let live = true;
@@ -291,15 +298,15 @@ export function CandidateDetailPage() {
     };
   }, [id]);
 
-  // ONE attempt list for the page, shared by the Overview rail and the Review
-  // tab's call recordings. Each copy is mounted only while its tab is open
-  // (one player at a time), so self-loading copies would refetch on every tab
-  // switch. Loaded once the page itself has loaded, as the Overview copy
+  // ONE attempt list for the page, shared by the Profile rail and the Phone
+  // screening tab's call recordings. Each copy is mounted only while its tab is
+  // open (one player at a time), so self-loading copies would refetch on every
+  // tab switch. Loaded once the page itself has loaded, as the Profile copy
   // always was; reset whenever the candidate changes.
   const phoneAttempts = usePhoneAttemptHistory(id ?? "", Boolean(id && detail && me));
 
-  // Silent refresh: re-read the candidate (its session list feeds the Review
-  // tab) without unmounting the page. Used when a live call completes.
+  // Silent refresh: re-read the candidate (its session list feeds the Phone
+  // screening tab) without unmounting the page. Used when a live call completes.
   const refresh = useCallback(() => {
     if (!id) return;
     api
@@ -326,7 +333,7 @@ export function CandidateDetailPage() {
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
   // The list's derivation (stored status + phone progress from GET /:id), so
-  // the header, the Overview field and the list row say the same words.
+  // the header, the Profile field and the list row say the same words.
   // C3: the NEWEST phone assessment (the API orders by created_at desc; an R1
   // role-play result says nothing about the phone screen) was graded
   // `insufficient` — held from Ashby and from the status, so the phone card
@@ -353,18 +360,22 @@ export function CandidateDetailPage() {
   const headline = headlineCallFacts(sessions);
 
   /**
-   * Something to review: a completed session (its transcript and recording)
-   * or an assessment. The Review tab renders either; without both it only
-   * says there is nothing yet, which is not worth a primary action.
+   * A phone screening to review: a completed phone session (its transcript and
+   * recording) or a phone assessment. The Phone screening tab renders either;
+   * without both it only says there is nothing yet, which is not worth a primary
+   * action. An R1 interview is not one: it has its own tab.
    */
-  const reviewable = hasReviewable(detail);
-  // The compact header goes with the workspace, which needs a completed session.
-  const reviewing = tab === "review" && sessions.some((session) => session.status === "completed");
+  const reviewable = hasPhoneReview(detail);
+  // The compact header goes with the workspace, which needs a completed phone
+  // session: an R1 session is not in it, so R1 alone leaves the empty state.
+  const reviewing =
+    tab === "phone"
+    && sessions.some((session) => session.status === "completed" && session.interview_round_id == null);
   const ashbyUrl = ashbyDecisionUrl(ashbyWorkflow);
 
   let primaryAction: ReactNode = null;
   if (reviewable) {
-    if (tab === "review") {
+    if (tab === "phone") {
       // While an appeal blocks decision use, the page invites no decision.
       if (ashbyUrl && !decisionBlocked) {
         primaryAction = (
@@ -391,8 +402,8 @@ export function CandidateDetailPage() {
         <CandidateButton
           variant="primary"
           onClick={() => {
-            selectTab("review");
-            setPendingTabAction({ tab: "review", then: "focus-tab" });
+            selectTab("phone");
+            setPendingTabAction({ tab: "phone", then: "focus-tab" });
           }}
         >
           Review screening
@@ -405,16 +416,19 @@ export function CandidateDetailPage() {
         ref={headerCallRef}
         variant="primary"
         onClick={() => {
-          // The confirmation lives in the phone card on the Overview, and is
+          // The confirmation lives in the phone card on Profile, and is
           // opened once that tab is actually showing (see pendingTabAction).
-          selectTab("overview");
-          setPendingTabAction({ tab: "overview", then: "open-call" });
+          selectTab("profile");
+          setPendingTabAction({ tab: "profile", then: "open-call" });
         }}
       >
         Call candidate
       </CandidateButton>
     );
   }
+
+  // One figure per pipeline. Hidden with the phone score while an appeal blocks decision use.
+  const r1Line = decisionBlocked ? null : r1ResultLine(r1Rounds);
 
   // The list hands over the address it was on, so Back returns to the same page
   // of the same filter. Only a query string is taken from router state.
@@ -459,16 +473,19 @@ export function CandidateDetailPage() {
             {/* M017: "Resume parsing" / "Phone parsing", after the status and
                 its own detail; nothing on an API without the field. */}
             <IntakeBadge value={candidate.intake_type} />
+            {reviewing && r1Line && (
+              <span className="text-meta text-[var(--c-ink-secondary)]">{r1Line}</span>
+            )}
             <CandidateHeadlineFacts
-              // On Review the log header prints the role and the length.
+              // On this tab the log header prints the role and the length.
               roleTitle={reviewing ? null : roleTitle}
               callSeconds={reviewing ? null : (headline?.callSeconds ?? null)}
               recordedSeconds={reviewing ? null : (headline?.recordedSeconds ?? null)}
               recordedCalls={reviewing ? null : (headline?.recordedCalls ?? null)}
               recordedUnknownCalls={reviewing ? null : (headline?.recordedUnknownCalls ?? null)}
               // From THE SAME session as the length, or the two figures
-              // describe different calls while sitting side by side. On Review
-              // the log header describes the SELECTED session, which need not be
+              // describe different calls while sitting side by side. On Phone
+              // screening the log header describes the SELECTED session, which need not be
               // the longest, so this figure goes with the length it belongs to.
               candidateWords={reviewing ? null : (headline?.candidateWords ?? null)}
             />
@@ -481,11 +498,14 @@ export function CandidateDetailPage() {
           </>
         }
         // The score is the page's most important number: top right, under
-        // the actions, hidden while an appeal blocks decision use. On Review the
-        // reasoning pane carries it, against the session it belongs to.
+        // the actions, hidden while an appeal blocks decision use. On Phone
+        // screening the reasoning pane carries it, against the session it belongs to.
         aside={
           decisionBlocked || reviewing ? undefined : (
-            <HeaderScore assessments={assessments} sessions={sessions} />
+            <div className="flex flex-col gap-1 sm:items-end">
+              <HeaderScore assessments={assessments} sessions={sessions} />
+              {r1Line && <p className="text-label text-ink-secondary">{r1Line}</p>}
+            </div>
           )
         }
       />
@@ -499,8 +519,8 @@ export function CandidateDetailPage() {
           onSelect={selectTab}
           items={[
             {
-              id: "review",
-              label: "Review",
+              id: "phone",
+              label: "Phone screening",
               panel: (
                 <TranscriptionSyncWorkspace
                   sessions={sessions}
@@ -508,20 +528,20 @@ export function CandidateDetailPage() {
                   blocked={decisionBlocked}
                   // M013 S02: a phone session lists every leg with its own player.
                   candidateId={candidate.id}
-                  // Both tab panels stay mounted: an R1 recording must not keep playing
-                  // behind the other tab.
-                  active={tab === "review"}
+                  // The panel stays mounted when another tab opens, and the header
+                  // above changes height with the tab.
+                  active={tab === "phone"}
                   candidateName={candidate.name}
                   roleTitle={roleTitle}
                   ashbyWorkflow={ashbyWorkflow}
                   resumeFacts={candidate.parsed}
-                  // Mounted only while Review is the open tab (and the Overview
-                  // copy only while Overview is): one player on the page at a
+                  // Mounted only while this is the open tab (and the Profile
+                  // copy only while Profile is): one player on the page at a
                   // time, and switching tabs unmounts the <audio>, so nothing
                   // keeps playing in a hidden panel. The list itself is the
                   // shared `phoneAttempts`, so remounting never refetches.
                   callRecordings={
-                    tab === "review" ? (
+                    tab === "phone" ? (
                       <PhoneAttemptHistory
                         candidateId={candidate.id}
                         role={me.role}
@@ -535,18 +555,33 @@ export function CandidateDetailPage() {
               ),
             },
             {
-              id: "overview",
-              label: "Overview",
+              id: "r1",
+              label: "R1 interview",
               panel: (
-                <OverviewTab
+                // Renders nothing for a viewer until a round exists, or on a server
+                // with no R1 and no round: a tab still says what is there.
+                <R1Section
+                  candidateId={candidate.id}
+                  candidateName={candidate.name}
+                  role={me.role}
+                  userId={me.userId || null}
+                  decisionBlocked={decisionBlocked}
+                  onRoundsChange={setR1Rounds}
+                  empty={<EmptyPanel title="No R1 round has been sent yet." />}
+                />
+              ),
+            },
+            {
+              id: "profile",
+              label: "Profile",
+              panel: (
+                <ProfileTab
                   candidate={candidate}
                   sessions={sessions}
                   phoneRole={me.role}
-                  viewerId={me.userId}
                   legacyBrowserScreening={me.legacyBrowserScreeningEnabled !== false}
                   phoneAttempts={phoneAttempts}
-                  showPhoneAttempts={tab === "overview"}
-                  r1Active={tab === "overview"}
+                  showPhoneAttempts={tab === "profile"}
                   onSessionCompleted={refresh}
                   callInHeader={!reviewable}
                   callRequest={callRequest}
@@ -635,17 +670,15 @@ function useLiveCallRelevant(
   return payloadLive || latched;
 }
 
-/* ── Overview tab ───────────────────────────────────────────────────── */
+/* ── Profile tab ────────────────────────────────────────────────────── */
 
-function OverviewTab({
+function ProfileTab({
   candidate,
   sessions,
   phoneRole,
-  viewerId,
   legacyBrowserScreening,
   phoneAttempts,
   showPhoneAttempts,
-  r1Active,
   onSessionCompleted,
   callInHeader,
   callRequest,
@@ -656,8 +689,6 @@ function OverviewTab({
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
   phoneRole: MeResponse["role"];
-  /** The signed-in user's id, so R1 round actions follow the API's ownership rule. */
-  viewerId: string;
   /**
    * PR-L: false once the API reports the legacy browser screening lane retired.
    * Hides the "Browser voice screening" card (and with it the Create invite
@@ -669,8 +700,6 @@ function OverviewTab({
   phoneAttempts: PhoneAttemptHistorySource;
   /** False while another tab is open: unmounts the player (see the page). */
   showPhoneAttempts: boolean;
-  /** False while another tab is open: pauses the R1 recordings (the panel stays mounted). */
-  r1Active: boolean;
   onSessionCompleted?: () => void;
   callInHeader: boolean;
   callRequest: number;
@@ -684,8 +713,8 @@ function OverviewTab({
     // Two columns, not one short card beside a six-card stack. The slim left
     // rail holds who the person is (profile) and the notes; the wide column
     // holds the acting surfaces and the evidence behind them, top to bottom:
-    // the call cards, the phone cycle, R1, call attempts + screening sessions,
-    // the Ashby pipeline, appeals. Below `lg` it is one stack with the wide
+    // the call cards, the phone cycle, call attempts + screening sessions, the
+    // Ashby pipeline, appeals. Below `lg` it is one stack with the wide
     // column first. The rail is deliberately NOT sticky: notes grow, and a
     // sticky box taller than the viewport cannot be scrolled to its end.
     <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
@@ -743,17 +772,6 @@ function OverviewTab({
             rescreenRecommendation={rescreenRecommendation}
           />
         )}
-
-        {/* R1 (WebRTC sales role-play): the Send R1 card and the rounds panel
-            in one surface. Renders nothing for a viewer until a round exists. */}
-        <R1Section
-          candidateId={candidate.id}
-          candidateName={candidate.name}
-          role={phoneRole}
-          userId={viewerId || null}
-          active={r1Active}
-          decisionBlocked={candidate.decision_use_blocked_at != null}
-        />
 
         {/* Call attempts and screening sessions: side by side from `xl`, where
             the wide column is ~700px (two ~340px cards), stacked below that.

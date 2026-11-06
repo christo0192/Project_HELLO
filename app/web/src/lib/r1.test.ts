@@ -28,6 +28,8 @@ import {
   r1StatusTone,
   r1UsedMinutes,
   readingMonthLabel,
+  linkLapsed,
+  r1ResultLine,
   rebaseDraft,
   sendGate,
   sendGateNotice,
@@ -606,5 +608,59 @@ describe('a dashboard reading from an earlier month', () => {
     expect(currentMonthStart(new Date('2026-10-07T12:00:00.000Z'))).toBe('2026-10-01');
     expect(currentMonthStart(new Date('2026-12-31T23:59:59.000Z'))).toBe('2026-12-01');
     expect(readingMonthLabel('2026-09-30T20:00:00.000Z')).toBe('September 2026');
+  });
+});
+
+describe('linkLapsed', () => {
+  const at = Date.parse('2026-11-04T00:00:00.000Z');
+  const round = (status: R1Round['status'], expires_at: string | null = '2026-11-04T00:00:00.000Z') => ({ status, expires_at });
+
+  it('is the expiry passing on a round whose link could still be used', () => {
+    expect(linkLapsed(round('invited'), at - 1)).toBe(false);
+    expect(linkLapsed(round('invited'), at)).toBe(true);
+    expect(linkLapsed(round('in_progress'), at + 1)).toBe(true);
+  });
+
+  it('has nothing to say about a round that has ended, or one with no expiry', () => {
+    expect(linkLapsed(round('completed'), at + 1)).toBe(false);
+    expect(linkLapsed(round('cancelled'), at + 1)).toBe(false);
+    expect(linkLapsed(round('invited', null), at + 1)).toBe(false);
+  });
+});
+
+describe('r1ResultLine', () => {
+  const round = (over: Partial<R1Round>): R1Round => ({
+    id: 'round-1', status: 'completed', expires_at: '2026-11-04T00:00:00.000Z', attempts_allowed: 2, attempts_counted: 1,
+    recommendation: null, overall: null, created_at: '2026-11-01T00:00:00.000Z', ...over,
+  });
+
+  it('names the pipeline, the verdict, a whole figure and the AI', () => {
+    expect(r1ResultLine([round({ recommendation: 'hold', overall: 57.6 })])).toBe('R1 role-play: Borderline 58 (AI)');
+  });
+
+  it('leaves the figure out when the round has none', () => {
+    expect(r1ResultLine([round({ recommendation: 'reject' })])).toBe('R1 role-play: Reject (AI)');
+  });
+
+  it('prints no figure the checks refused: a score with no recommendation is not a result', () => {
+    expect(r1ResultLine([round({ overall: 42, status_write: 'human_review' })])).toBeNull();
+  });
+
+  it('does not read a staff dry run as the candidate’s result', () => {
+    expect(r1ResultLine([round({ recommendation: 'reject', overall: 30, is_staff_dry_run: true })])).toBeNull();
+    expect(r1ResultLine([
+      round({ id: 'dry', recommendation: 'reject', overall: 30, is_staff_dry_run: true }),
+      round({ id: 'real', recommendation: 'hold', overall: 58, is_staff_dry_run: false }),
+    ])).toBe('R1 role-play: Borderline 58 (AI)');
+  });
+
+  it('takes the newest round with a result', () => {
+    expect(r1ResultLine([round({ id: 'new' }), round({ id: 'old', recommendation: 'advance', overall: 80 })])).toBe('R1 role-play: Select 80 (AI)');
+  });
+
+  it('has no line with no result, or a withheld one', () => {
+    expect(r1ResultLine([])).toBeNull();
+    expect(r1ResultLine([round({})])).toBeNull();
+    expect(r1ResultLine([round({ recommendation: 'hold', overall: 58, scores_withheld: true })])).toBeNull();
   });
 });

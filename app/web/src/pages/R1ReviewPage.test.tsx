@@ -87,7 +87,7 @@ const assessment = (over: Partial<R1ReviewAssessment> = {}): R1ReviewAssessment 
 
 const review = (over: Partial<R1ReviewResponse> = {}): R1ReviewResponse => ({
   round: {
-    id: ROUND, candidate_id: CANDIDATE, status: 'completed', expires_at: '2026-11-06T00:00:00.000Z', attempts_allowed: 2, attempts_counted: 1,
+    id: ROUND, candidate_id: CANDIDATE, status: 'completed', expires_at: '2099-01-01T00:00:00.000Z', attempts_allowed: 2, attempts_counted: 1,
     recommendation: 'hold', overall: 58, status_write: null, pending_reject_until: null, scores_withheld: false, is_staff_dry_run: false,
     created_at: '2026-11-01T00:00:00.000Z', created_by: 'user-1',
   },
@@ -110,9 +110,9 @@ function Address() {
   return null;
 }
 
-function open(search = '') {
+function open(search = '', state: unknown = null) {
   return render(
-    <MemoryRouter initialEntries={[`/interviews/${ROUND}${search}`]}>
+    <MemoryRouter initialEntries={[{ pathname: `/interviews/${ROUND}`, search, state }]}>
       <Address />
       <Routes>
         <Route path="/interviews/:roundId" element={<R1ReviewPage />} />
@@ -121,9 +121,9 @@ function open(search = '') {
   );
 }
 
-const opened = async (body: R1ReviewResponse = review(), search = '') => {
+const opened = async (body: R1ReviewResponse = review(), search = '', state: unknown = null) => {
   mockApi.getR1Review.mockResolvedValue(body);
-  const view = open(search);
+  const view = open(search, state);
   await screen.findByRole('tablist', { name: 'R1 review sections' });
   return view;
 };
@@ -225,11 +225,11 @@ describe('the header', () => {
   it('carries the breadcrumb and the title, with the name linking to the candidate', async () => {
     await opened();
     const crumbs = screen.getByRole('navigation', { name: 'Breadcrumb' });
-    expect(crumbs).toHaveTextContent('R1 interviews');
+    expect(within(crumbs).getByRole('link', { name: 'R1 interviews' })).toHaveAttribute('href', '/interviews');
     expect(crumbs).toHaveTextContent('Ava Example');
     const heading = screen.getByRole('heading', { level: 1 });
     expect(heading).toHaveTextContent('Sales Program Advisor role-play, Ava Example');
-    expect(within(heading).getByRole('link', { name: 'Ava Example' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=overview`);
+    expect(within(heading).getByRole('link', { name: 'Ava Example' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=r1`);
   });
 
   it('carries the chips: ended, role, attempt, recording and how long it is kept', async () => {
@@ -263,6 +263,39 @@ describe('the header', () => {
   it('has no feedback tab and no placeholder for one', async () => {
     await opened();
     expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Briefing', 'Resume', 'Recording']);
+  });
+});
+
+describe('the breadcrumb', () => {
+  const PLACE = '?view=reviewed&sort=oldest&page=3&dry_runs=include';
+  const crumb = () => within(screen.getByRole('navigation', { name: 'Breadcrumb' })).getByRole('link', { name: 'R1 interviews' });
+
+  it('goes to the queue from a bare link', async () => {
+    await opened();
+    expect(crumb()).toHaveAttribute('href', '/interviews');
+  });
+
+  it('goes back to the view and page the row was opened from', async () => {
+    await opened(review(), '', { listSearch: PLACE });
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
+  });
+
+  it.each([['a path', '//example.com'], ['a word', 'view=all'], ['a number', 7]])('takes only a query string from router state, not %s', async (_what, listSearch) => {
+    await opened(review(), '', { listSearch });
+    expect(crumb()).toHaveAttribute('href', '/interviews');
+  });
+
+  it('keeps the place through a change of tab, of attempt and a jump to a turn, which all replace the address', async () => {
+    await opened(review({ attempts: [attempt(), attempt({ session_id: 's2', attempt_number: 2 })] }), '', { listSearch: PLACE });
+    await userEvent.click(screen.getByRole('button', { name: /What made you look at it now/ }));
+    await waitFor(() => expect(address).toContain('tab=recording'));
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
+    await userEvent.click(within(screen.getByRole('group', { name: 'Attempt' })).getByRole('button', { name: 'Attempt 2 (retake)' }));
+    await waitFor(() => expect(address).toContain('attempt=2'));
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
+    await userEvent.click(tab('Briefing'));
+    await waitFor(() => expect(address).toContain('tab=briefing'));
+    expect(crumb()).toHaveAttribute('href', `/interviews${PLACE}`);
   });
 });
 
@@ -381,6 +414,28 @@ describe('Overview, scored', () => {
     expect(screen.getByRole('region', { name: 'AI recommendation' })).toHaveTextContent('This result is for Attempt 1 (counted).');
   });
 
+  it('shows the scorecard of an attempt a later one replaced, and says it no longer stands', async () => {
+    const first = attempt({ session_id: 's1' });
+    const retake = attempt({ session_id: 's2', attempt_number: 2 });
+    const replaced = assessment({ id: 'a-first', session_id: 's1', recommendation: 'reject', overall_score: 31, raw_recommendation: 'reject' });
+    const deciding = assessment({ session_id: 's2' });
+    await opened(review({ attempts: [first, retake], assessment: deciding, replaced_assessments: [replaced] }), '?attempt=1');
+    const result = screen.getByRole('region', { name: 'AI recommendation' });
+    expect(result).toHaveTextContent('Reject');
+    expect(result).toHaveTextContent('31');
+    expect(result).toHaveTextContent('This result is for Attempt 1 (counted). A later attempt replaced it as the result of this round.');
+  });
+
+  it('keeps to the deciding scorecard on the attempt that set it', async () => {
+    const first = attempt({ session_id: 's1' });
+    const retake = attempt({ session_id: 's2', attempt_number: 2 });
+    const replaced = assessment({ id: 'a-first', session_id: 's1', recommendation: 'reject', overall_score: 31 });
+    await opened(review({ attempts: [first, retake], assessment: assessment({ session_id: 's2' }), replaced_assessments: [replaced] }), '?attempt=2');
+    const result = screen.getByRole('region', { name: 'AI recommendation' });
+    expect(result).not.toHaveTextContent('A later attempt replaced it');
+    expect(result).not.toHaveTextContent('31');
+  });
+
   it('needs no attempt named when there is only one', async () => {
     await opened();
     expect(screen.getByRole('region', { name: 'AI recommendation' })).not.toHaveTextContent('This result is for');
@@ -415,7 +470,7 @@ describe('Overview, scored', () => {
     await opened(review({ phone_screening: { recommendation: 'advance', overall_score: 71, created_at: '2026-10-30T00:00:00.000Z', evidence_grade: 'decision', scoring_status: 'complete' } }));
     const line = screen.getByText(/Phone screening/);
     expect(line).toHaveTextContent('Select 71 (AI)');
-    expect(within(line).getByRole('link', { name: 'Open the candidate' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=review`);
+    expect(within(line).getByRole('link', { name: 'Open the candidate' })).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=phone`);
   });
 
   it('never sets a held phone score beside the verdict as a result', async () => {
@@ -477,6 +532,16 @@ describe('Overview, in every other state', () => {
     expect(chips).toHaveTextContent('Link open');
     expect(chips).not.toHaveTextContent('In progress');
     noResult();
+  });
+
+  it('a link past its expiry: nobody is told to wait on it, whatever the stored status says', async () => {
+    const lapsed = waiting();
+    await opened({ ...lapsed, round: { ...lapsed.round, expires_at: '2026-11-04T00:00:00.000Z' } });
+    expect(panel('Overview')).toHaveTextContent('This round ended without a scored interview.');
+    expect(panel('Overview')).not.toHaveTextContent(/Link valid until/);
+    const chips = screen.getByRole('list', { name: 'About this interview' });
+    expect(chips).toHaveTextContent('Expired');
+    expect(chips).not.toHaveTextContent('Link open');
   });
 
   it('an attempt that ended uncounted: Check again sees a new start, because the page does not poll', async () => {
@@ -696,6 +761,15 @@ describe('a pending rejection', () => {
     mockApi.getMe.mockRejectedValue(new TestApiError('unavailable', 503));
     await opened(pending());
     await waitFor(() => expect(mockApi.getMe).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: 'Cancel rejection' })).not.toBeInTheDocument();
+  });
+
+  // 0122 leaves the date on the row once the rejection lands, and a click would only answer not_pending.
+  it('is over once the rejection has landed, though the date stays on the round', async () => {
+    await opened(review({ round: { ...pending().round, status_write: 'rejected' } }));
+    await waitFor(() => expect(mockApi.getMe).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole('list', { name: 'About this interview' })).not.toHaveTextContent(/Rejection pending/);
     expect(screen.queryByRole('button', { name: 'Cancel rejection' })).not.toBeInTheDocument();
   });
 });

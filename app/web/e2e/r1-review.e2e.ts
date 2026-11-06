@@ -107,8 +107,8 @@ test.describe('forced colours', () => {
 });
 
 test.describe('getting there', () => {
-  test('opens from the R1 card', async ({ app, page }) => {
-    await app.goto(`/candidates/${R1_CANDIDATE_ID}?tab=overview`);
+  test('opens from the R1 tab', async ({ app, page }) => {
+    await app.goto(`/candidates/${R1_CANDIDATE_ID}?tab=r1`);
     await page.getByRole('link', { name: 'Open R1 review' }).click();
     await expect(page).toHaveURL(new RegExp(`/interviews/${R1_ROUND_ID}$`));
     await expect(page.getByRole('heading', { level: 1 })).toContainText('Sales Program Advisor role-play');

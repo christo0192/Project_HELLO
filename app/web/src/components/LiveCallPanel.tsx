@@ -292,7 +292,7 @@ export function LiveCallPanel({
                 the role, where a manager scanning the page actually looks.
                 Repeating it here would be two places to keep in step. */}
             <p className="text-xs text-gray-500">
-              Transcript, recording and scorecard are in the Review tab.
+              Transcript, recording and scorecard are in the Phone screening tab.
             </p>
           </div>
           {assessment ? (

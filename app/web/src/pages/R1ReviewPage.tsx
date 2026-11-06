@@ -20,7 +20,7 @@
  * not used on this page.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { EmptyPanel, ErrorPanel, InlineNotice, RetryButton, Skeleton, SkeletonText } from '../components/design';
 import { BriefingPanel } from '../components/r1-review/BriefingPanel';
@@ -37,7 +37,7 @@ import { candidateDisplayName } from '../components/talent/ResumeReviewBadge';
 import { Tabs } from '../components/talent/Tabs';
 import { canActOnRound } from '../lib/r1';
 import { attemptLabels, r1RecordingStateCopy } from '../lib/r1-recording';
-import { attemptParam, cueSecFrom, reviewAttemptFrom, reviewTabFrom } from '../lib/r1-review';
+import { attemptParam, cueSecFrom, replacedAssessmentOf, reviewAttemptFrom, reviewTabFrom } from '../lib/r1-review';
 import type { R1ReviewResponse } from '../lib/r1-types';
 import type { MeResponse } from '../types';
 
@@ -79,6 +79,8 @@ function ReviewSkeleton() {
 export function R1ReviewPage() {
   const { roundId = '' } = useParams<{ roundId: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
+  // A replace drops router state unless it is handed on, and the breadcrumb's way back travels in it.
+  const { state: routerState } = useLocation();
   const [load, setLoad] = useState<Load>({ status: 'loading' });
   const [readKey, setReadKey] = useState(0);
   const [me, setMe] = useState<MeResponse | null>(null);
@@ -159,10 +161,10 @@ export function R1ReviewPage() {
           return params;
         },
         // Switching tabs is not a navigation: Back leaves the review.
-        { replace: true },
+        { replace: true, state: routerState },
       );
     },
-    [setSearchParams],
+    [setSearchParams, routerState],
   );
 
   const selectAttempt = useCallback(
@@ -177,10 +179,10 @@ export function R1ReviewPage() {
           params.delete('t');
           return params;
         },
-        { replace: true },
+        { replace: true, state: routerState },
       );
     },
-    [attempts, setSearchParams],
+    [attempts, setSearchParams, routerState],
   );
 
   const openTurn = useCallback(
@@ -198,10 +200,10 @@ export function R1ReviewPage() {
           else params.set('t', String(sec));
           return params;
         },
-        { replace: true },
+        { replace: true, state: routerState },
       );
     },
-    [attempts, setSearchParams],
+    [attempts, setSearchParams, routerState],
   );
 
   if (load.status === 'loading') {
@@ -308,7 +310,7 @@ export function R1ReviewPage() {
                   attempt={attempt}
                   attemptLabel={labels[body.attempts.indexOf(attempt)]}
                   candidateName={candidateName}
-                  assessment={assessment}
+                  assessment={replacedAssessmentOf(body, attempt) ?? assessment}
                   events={body.events}
                   active={tab === 'recording'}
                   cue={cue}

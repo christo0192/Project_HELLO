@@ -49,7 +49,7 @@ paths:
       tags: [r1]
       operationId: listR1InterviewRounds
       summary: List R1 rounds for a candidate (viewer+; no video URLs; scores withheld while an appeal blocks decision use)
-      description: 'recommendation, overall, status_write and pending_reject_until are null, and scores_withheld is true, while decision use is blocked (an open appeal); scores_withheld is absent otherwise. Each round carries attempts[] (R1-REC), ordered by attempt_number: session_id, attempt_number, counted, outcome and a recording summary (state none, recording, processing, ready, partial, failed or deleted; a reason; mode single or split; has_video; started_at_ms; duration_ms; camera_off_ms; degraded_at_ms; retention_until; deleted_at). A summary never carries a URL, key, bucket, hash or upload id. If the attempts or recordings cannot be read the rounds come back without attempts instead of failing the list.'
+      description: 'recommendation, overall, status_write and pending_reject_until are null, and scores_withheld is true, while decision use is blocked (an open appeal); scores_withheld is absent otherwise. Each round carries attempts[] (R1-REC), ordered by attempt_number: session_id, attempt_number, counted, outcome, in_progress, session_status, started_at, ended_at, consent_withdrawn and a recording summary (state none, recording, processing, ready, partial, failed or deleted; a reason; mode single or split; has_video; started_at_ms; duration_ms; camera_off_ms; degraded_at_ms; retention_until; deleted_at). An attempt covered by a consent withdrawal reads as a deleted recording, as in the queue and on the review page. A summary never carries a URL, key, bucket, hash or upload id. If the attempts, recordings, sessions or withdrawals cannot be read the rounds come back without attempts instead of failing the list. is_staff_dry_run marks a staff dry run, whose notice promises no decision use.'
       responses:
         '200': { description: R1 round cards }
     post:
@@ -59,6 +59,112 @@ paths:
       responses:
         '201': { description: Created; Cache-Control is no-store }
         '409': { description: R1 disabled, paused, ineligible, or at capacity }
+  /api/interview-rounds:
+    get:
+      tags: [r1]
+      operationId: listR1Queue
+      summary: The R1 queue, one server page at a time (viewer+; an interviewer sees only candidates they own)
+      description: 'Read rule = the rule of the R1 video: admin and viewer every candidate, interviewer only a candidate they own, applied as a filter on the read so a page and its total count only what the caller may see. VIEWS come from status, status_write and expires_at; R1 has no human-feedback record yet, so Reviewed means a status outcome has settled, not that a person watched the interview. Expired below means what the candidate routes read: status expired, or status invited or in_progress with expires_at passed, whether or not anything has written expired yet. in-progress: status is invited or in_progress and the link has not lapsed (a retake re-opens a round, so one can carry an older result). Finished means completed, or expired or cancelled with a counted attempt (a round whose retake lapsed or was cancelled, which keeps its result). reviewed: a finished round whose status_write is advanced, rejected or pending_reject_cancelled. to-review: every other finished round, with any other status_write or none yet (scoring has not finished); so while auto-status is off a finished round stays here. all: every round, including one that ended with nothing counted. An interview that outlasts its link reads as expired until its attempt settles, so it is in all, with in_progress true on its attempt, and not in in-progress. SORT is by the date the link was sent, then id: oldest first by default in to-review, newest first otherwise. STAFF DRY RUNS (consent_locale en-IN-x-staff) are hidden unless dry_runs=include. WHILE AN APPEAL BLOCKS DECISION USE a row has recommendation, overall, status_write and pending_reject_until null and scores_withheld true, and the round is left out of to-review and reviewed, because which of those it sat in would give the verdict away; it stays in all and in-progress. An attempt covered by a consent withdrawal reads as a deleted recording, as on the review page. A page past the end answers the last page, and page says which. Each row carries the candidate''s name and no contact detail, and each attempt its recording summary with no URL or key. r1_deployed is false on a server that does not run R1, so the sidebar can hide its item for a viewer, who cannot read availability. Cache-Control is no-store.'
+      parameters:
+        - name: view
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [to-review, in-progress, reviewed, all]
+            default: to-review
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 25
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [oldest, newest]
+        - name: dry_runs
+          in: query
+          required: false
+          description: include also lists staff dry runs, marked is_staff_dry_run.
+          schema:
+            type: string
+            enum: [include]
+      responses:
+        '200': { description: 'One page: view, sort, page, page_size, total, r1_deployed and rounds, each with candidate_name, status, attempts_allowed, attempts_counted, the AI recommendation and overall, status_write, pending_reject_until, scores_withheld, is_staff_dry_run, created_at and attempts, each with in_progress, session_status, started_at, ended_at, consent_withdrawn and its recording summary.' }
+        '400': { description: 'A query parameter is not one this route takes (invalid_query), including q: a name goes in no URL, so a search is POST /api/interview-rounds/search.' }
+        '403': { description: The caller's account is inactive (access_denied). }
+        '503': { description: 'A read failed (service_unavailable): never a partial page.' }
+  /api/interview-rounds/search:
+    post:
+      tags: [r1]
+      operationId: searchR1Queue
+      summary: The R1 queue searched by candidate name (viewer+; reads only, so a viewer may call it)
+      description: 'The same read and the same answer as GET /api/interview-rounds, with the same rules and the same query parameters. The search is a candidate''s name, so it comes in the body and goes in no URL, neither this route''s nor PostgREST''s: the view is read through the same filters, and the name is matched in the API. A search therefore reads every round of its view, and answers 503 rather than miss a name past 50,000 rounds.'
+      parameters:
+        - name: view
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [to-review, in-progress, reviewed, all]
+            default: to-review
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 25
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [oldest, newest]
+        - name: dry_runs
+          in: query
+          required: false
+          description: include also lists staff dry runs, marked is_staff_dry_run.
+          schema:
+            type: string
+            enum: [include]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [q]
+              properties:
+                q:
+                  type: string
+                  maxLength: 100
+                  description: Part of the candidate's name, in any case. A blank search is no search.
+      responses:
+        '200': { description: 'One page, as GET /api/interview-rounds answers it. total counts what the search found.' }
+        '400': { description: 'q is missing, not a string or too long, or a query parameter is not one this route takes (invalid_query).' }
+        '403': { description: The caller's account is inactive (access_denied). }
+        '503': { description: 'A read failed (service_unavailable): never a partial page.' }
   /api/interview-rounds/{id}/cancel:
     post:
       tags: [r1]
@@ -121,7 +227,7 @@ paths:
             type: string
             format: uuid
       responses:
-        '200': { description: 'The review: round, candidate, attempts with their turns, assessment, events, phone_screening and rubric.' }
+        '200': { description: 'The review: round, candidate, attempts with their turns, assessment (the one that decided the round), replaced_assessments (the newest scorecard of each attempt a later attempt replaced), events, phone_screening and rubric.' }
         '400': { description: Malformed round id (invalid_id). }
         '403': { description: Not allowed to read this candidate's interviews (access_denied). }
         '404': { description: No such round (not_found). }

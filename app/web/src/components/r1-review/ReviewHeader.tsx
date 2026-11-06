@@ -1,8 +1,8 @@
 /**
  * The header of the review page: breadcrumb, title, and the chips that say what this interview is.
  *
- * "R1 interviews" is plain text until the queue exists (R1 PR 3). The name links to the candidate's
- * Overview, where the R1 card is today.
+ * The breadcrumb goes back to the queue, at the view and page the row was opened from, and the name to
+ * the candidate's R1 interview tab.
  *
  * A pending rejection can be cancelled from here, after a confirmation, by an admin or the interviewer
  * who sent the round: the API's own rule, so nobody is offered a button that can only answer 403.
@@ -11,15 +11,14 @@
  */
 import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { Button, Dialog, SegmentedControl } from '../design';
 import { Tag } from '../design/candidate';
 import { api } from '../../api';
 import { plainErrorText } from '../../lib/api-error-copy';
 import { formatDateTime, formatRelative } from '../../lib/datetime';
 import { r1RecordingStateCopy, attemptLabels } from '../../lib/r1-recording';
-import { r1StatusLabel } from '../../lib/r1';
-import { roundIsRunning } from '../../lib/r1-review';
+import { rejectionPendingUntil, roundStatusWord } from '../../lib/r1-review';
 import type { R1ReviewAttempt, R1ReviewResponse } from '../../lib/r1-types';
 
 const nameLink =
@@ -54,10 +53,15 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   const label = attempt ? labels[attempts.indexOf(attempt)] : null;
   const recording = attempt ? r1RecordingStateCopy(attempt.recording) : null;
   const keptUntil = recording?.facts.find((fact) => fact.startsWith('Kept until'));
-  const statusWord = round.status === 'in_progress' && !roundIsRunning(attempts) ? 'Link open' : r1StatusLabel(round.status);
+  const statusWord = roundStatusWord(round, attempts, Date.now());
+
+  // The queue hands over the address it was on. Only a query string is taken from router state.
+  const location = useLocation();
+  const listSearch = (location.state as { listSearch?: unknown } | null)?.listSearch;
+  const backToQueue = typeof listSearch === 'string' && listSearch.startsWith('?') ? `/interviews${listSearch}` : '/interviews';
 
   const [cancelledRound, setCancelledRound] = useState<string | null>(null);
-  const pending = round.status_write === 'pending_reject' && round.pending_reject_until !== null && cancelledRound !== round.id;
+  const pending = rejectionPendingUntil(round) !== null && cancelledRound !== round.id;
 
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -84,11 +88,11 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   return (
     <header>
       <nav aria-label="Breadcrumb" className="text-label text-ink-tertiary">
-        R1 interviews <span aria-hidden="true">/</span> {candidateName}
+        <Link to={backToQueue} className={nameLink}>R1 interviews</Link> <span aria-hidden="true">/</span> {candidateName}
       </nav>
       <h1 className="mt-1 text-title text-ink">
         Sales Program Advisor role-play,{' '}
-        <Link to={`/candidates/${candidate.id}?tab=overview`} className={nameLink}>
+        <Link to={`/candidates/${candidate.id}?tab=r1`} className={nameLink}>
           {candidateName}
         </Link>
       </h1>

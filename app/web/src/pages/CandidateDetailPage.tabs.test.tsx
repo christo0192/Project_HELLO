@@ -1,6 +1,6 @@
 /**
- * CandidateDetailPage — tab semantics for the redesigned 2-tab workspace
- * (Overview + Review). Covers ARIA tablist + keyboard activation, the Review
+ * CandidateDetailPage — tab semantics for the workspace by pipeline
+ * (Phone screening, R1 interview, Profile). Covers ARIA tablist + keyboard activation, the Review
  * workspace transcript load (empty/error), on-demand recording gating, and
  * axe with hidden panels.
  */
@@ -98,33 +98,33 @@ describe('CandidateDetailPage tabs', () => {
     mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [], next_cursor: null });
   });
 
-  it('renders a keyboard tablist with Overview + Review', async () => {
+  it('renders a keyboard tablist with the three pipelines', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     const tablist = screen.getByRole('tablist', { name: 'Candidate sections' });
     expect(tablist).toBeInTheDocument();
-    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Review', 'Overview']);
-    // Review is the high-priority tab: first, and the default when there is something to review.
-    expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Phone screening', 'R1 interview', 'Profile']);
+    // Phone screening is the high-priority tab: first, and the default when there is something to review.
+    expect(screen.getByRole('tab', { name: 'Phone screening' })).toHaveAttribute('aria-selected', 'true');
   });
 
-  it('activates the Overview tab on ArrowRight from Review', async () => {
+  it('activates Profile on ArrowLeft from Phone screening, wrapping round', async () => {
     const user = userEvent.setup();
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    screen.getByRole('tab', { name: 'Review' }).focus();
-    await user.keyboard('{ArrowRight}');
-    const overview = screen.getByRole('tab', { name: 'Overview' });
+    screen.getByRole('tab', { name: 'Phone screening' }).focus();
+    await user.keyboard('{ArrowLeft}');
+    const overview = screen.getByRole('tab', { name: 'Profile' });
     expect(overview).toHaveFocus();
     expect(overview).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByRole('tabpanel', { name: 'Overview' })).not.toHaveAttribute('hidden');
+    expect(screen.getByRole('tabpanel', { name: 'Profile' })).not.toHaveAttribute('hidden');
   });
 
   it('auto-loads the transcript for the first completed session', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('session-1'));
-    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
     expect(await screen.findByText('Welcome to the screening.')).toBeInTheDocument();
     expect(screen.getByText('Thank you!')).toBeInTheDocument();
   });
@@ -133,7 +133,7 @@ describe('CandidateDetailPage tabs', () => {
     mockApi.getSession.mockResolvedValue({ ...mockSessionDetail, transcript: [] });
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
     expect(
       await screen.findByText(/No transcript lines recorded for this session yet/i),
     ).toBeInTheDocument();
@@ -143,7 +143,7 @@ describe('CandidateDetailPage tabs', () => {
     mockApi.getSession.mockRejectedValue({ message: 'transcript unavailable' });
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
     expect(await screen.findByText('The transcript could not be loaded.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
   });
@@ -152,7 +152,7 @@ describe('CandidateDetailPage tabs', () => {
     mockApi.getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
     const loadBtn = await screen.findByRole('button', { name: /load recording/i });
     expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
     fireEvent.click(loadBtn);
@@ -173,7 +173,7 @@ describe('CandidateDetailPage tabs', () => {
     });
     renderDetailPage();
     expect(await screen.findByText(/Decision use is paused — open appeal/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
     expect(
       await screen.findByText(/Scorecards are suppressed while an appeal is under review/i),
     ).toBeInTheDocument();
@@ -215,8 +215,8 @@ describe('CandidateDetailPage tabs', () => {
       renderDetailPage();
       await screen.findByText('Jane Doe');
       await waitFor(() => expect(mockApi.getCandidatePhoneAttempts).toHaveBeenCalled());
-      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
-      const review = screen.getByRole('tabpanel', { name: 'Review' });
+      fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
+      const review = screen.getByRole('tabpanel', { name: 'Phone screening' });
       expect(await within(review).findByRole('heading', { name: 'Call recordings' })).toBeInTheDocument();
       expect(within(review).getByText('Recorded before consent')).toBeInTheDocument();
       expect(within(review).getByText(/No completed screening yet/i)).toBeInTheDocument();
@@ -224,9 +224,9 @@ describe('CandidateDetailPage tabs', () => {
       expect(mockApi.getCandidatePhoneAttempts).toHaveBeenCalledTimes(1);
       expect(mockApi.getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
       // Switching back and forth never refetches either.
-      fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
-      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
-      await within(screen.getByRole('tabpanel', { name: 'Review' })).findByRole('heading', { name: 'Call recordings' });
+      fireEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+      fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
+      await within(screen.getByRole('tabpanel', { name: 'Phone screening' })).findByRole('heading', { name: 'Call recordings' });
       expect(mockApi.getCandidatePhoneAttempts).toHaveBeenCalledTimes(1);
     });
 
@@ -242,8 +242,8 @@ describe('CandidateDetailPage tabs', () => {
       expect(container.querySelectorAll('audio')).toHaveLength(1);
       // Switching to Review unmounts the Overview player: no audio keeps
       // playing in a hidden panel, and Review starts with its player closed.
-      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
-      const review = screen.getByRole('tabpanel', { name: 'Review' });
+      fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
+      const review = screen.getByRole('tabpanel', { name: 'Phone screening' });
       await within(review).findByRole('button', { name: 'Play recording' });
       expect(container.querySelectorAll('audio')).toHaveLength(0);
       expect(screen.getAllByRole('button', { name: 'Play recording' })).toHaveLength(1);
@@ -253,8 +253,8 @@ describe('CandidateDetailPage tabs', () => {
       mockApi.getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://storage.invalid/a1', content_type: 'audio/mpeg' });
       renderDetailPage();
       await screen.findByText('Jane Doe');
-      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
-      const review = screen.getByRole('tabpanel', { name: 'Review' });
+      fireEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
+      const review = screen.getByRole('tabpanel', { name: 'Phone screening' });
       fireEvent.click(await within(review).findByRole('button', { name: 'Play recording' }));
       const player = await within(review).findByLabelText('Attempt 1 recording', { selector: 'audio' });
       expect(player).toHaveAttribute('src', 'https://storage.invalid/a1');

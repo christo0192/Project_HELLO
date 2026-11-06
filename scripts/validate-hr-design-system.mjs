@@ -87,7 +87,7 @@ export const RADII = {
 
 export const EXPECTED_ROUTES = [
   '/login', '/candidate/join', '/privacy-notice', '/status', '/appeal',
-  '/dashboard', '/roles', '/candidates', '/candidates/:id', '/interviews/:roundId',
+  '/dashboard', '/roles', '/candidates', '/candidates/:id', '/interviews', '/interviews/:roundId',
   '/sessions/:sessionId', '/screening/:sessionId', '/phone-calendar',
   '/admin', '/admin/r1', '/mission-control', '/ashby-mission-control',
   '/ashby/review/:applicationLinkId', '/mfa/*',
@@ -134,6 +134,7 @@ export const VERDICT_FILES = [
   'src/components/talent/CandidateScorecard.tsx',
   'src/components/Scorecard.tsx',
   'src/components/r1-review/VerdictBlock.tsx',
+  'src/pages/R1InterviewsPage.tsx',
 ];
 export const TYPE_SCALE_PX = [12, 13, 14, 16, 20, 24, 30];
 export const SKELETON_RADII = [2, 3, 4, 8];

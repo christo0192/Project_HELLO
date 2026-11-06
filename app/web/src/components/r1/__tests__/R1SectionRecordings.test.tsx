@@ -1,14 +1,11 @@
 /**
- * The recording rows on the R1 card (Overview tab): which attempts get a row, who sees it, what a
- * viewer can do with it, the labels, the refresh path, and that a hidden tab pauses the media.
- *
- * The player itself is covered in R1RecordingPlayer.test.tsx; here it is exercised through the card,
- * as a staff member meets it.
+ * The recording chips on the R1 tab: which attempts get one, what each says, and that the tab embeds no
+ * player, so each page has only one. The recording plays on the review page, which every row links to.
  */
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { R1AttemptSummary, R1RecordingSummary, R1Round } from '../../../lib/r1-types';
+import type { R1ListedAttempt, R1RecordingSummary, R1Round } from '../../../lib/r1-types';
 import { R1Section } from '../R1Section';
 
 const api = vi.hoisted(() => ({
@@ -32,16 +29,13 @@ vi.mock('../../../api', () => ({
   },
 }));
 
-const START = 1_790_000_000_000;
-const MINT_URL = 'https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/r1/x/video.mp4?X-Amz-Signature=SIG_ROW_1';
-
 function recording(over: Partial<R1RecordingSummary> = {}): R1RecordingSummary {
   return {
     state: 'ready',
     reason: null,
     mode: 'single',
     has_video: true,
-    started_at_ms: START,
+    started_at_ms: 1_790_000_000_000,
     duration_ms: 423_000,
     camera_off_ms: 0,
     degraded_at_ms: null,
@@ -51,15 +45,11 @@ function recording(over: Partial<R1RecordingSummary> = {}): R1RecordingSummary {
   };
 }
 
-function attempt(n: number, over: Partial<R1AttemptSummary> & { rec?: Partial<R1RecordingSummary> } = {}): R1AttemptSummary {
+function attempt(n: number, over: Partial<R1ListedAttempt> & { rec?: Partial<R1RecordingSummary> } = {}): R1ListedAttempt {
   const { rec, ...rest } = over;
   return {
-    session_id: `session-${n}`,
-    attempt_number: n,
-    counted: true,
-    outcome: 'completed',
-    recording: recording(rec),
-    ...rest,
+    session_id: `session-${n}`, attempt_number: n, counted: true, outcome: 'completed', in_progress: false, session_status: 'completed',
+    started_at: null, ended_at: null, consent_withdrawn: false, recording: recording(rec), ...rest,
   };
 }
 
@@ -79,271 +69,123 @@ function round(over: Partial<R1Round> = {}): R1Round {
   };
 }
 
-function renderSection(
-  role: 'admin' | 'interviewer' | 'viewer' = 'viewer',
-  over: { userId?: string | null; active?: boolean } = {},
-) {
-  const props = { candidateId: 'cand-1', candidateName: 'Ava Rao', role, userId: 'user-1', ...over };
-  const view = render(
+function renderSection(role: 'admin' | 'interviewer' | 'viewer' = 'viewer') {
+  return render(
     <MemoryRouter>
-      <R1Section {...props} />
+      <R1Section candidateId="cand-1" candidateName="Ava Rao" role={role} userId="user-1" />
     </MemoryRouter>,
   );
-  return {
-    ...view,
-    rerenderWith: (next: { active?: boolean }) =>
-      view.rerender(
-        <MemoryRouter>
-          <R1Section {...props} {...next} />
-        </MemoryRouter>,
-      ),
-  };
 }
 
-const rows = async () => screen.findByRole('list', { name: 'R1 rounds' });
-const loadButtons = () => screen.queryAllByRole('button', { name: /^load recording/i });
+const rows = () => screen.findByRole('list', { name: 'R1 rounds' });
+const chipWords = () => {
+  const list = screen.queryByRole('list', { name: 'Recordings' });
+  return list ? within(list).getAllByRole('listitem').map((chip) => chip.textContent) : [];
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
-  HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
-  HTMLMediaElement.prototype.pause = vi.fn();
-  HTMLMediaElement.prototype.load = vi.fn();
   api.listR1Rounds.mockResolvedValue({ rounds: [round()] });
   api.getR1Availability.mockResolvedValue({ state: 'ready', hold_minutes: 55 });
-  api.getR1Recording.mockResolvedValue({
-    ...recording(),
-    url: MINT_URL,
-    content_type: 'video/mp4',
-    expires_in_sec: 300,
+});
+
+describe('no player on this tab', () => {
+  it('draws no video or audio, offers no Load, and mints nothing', async () => {
+    const { container } = renderSection('admin');
+    await rows();
+    expect(container.querySelector('video, audio')).toBeNull();
+    expect(screen.queryByRole('button', { name: /load recording/i })).toBeNull();
+    expect(api.getR1Recording).not.toHaveBeenCalled();
+  });
+
+  it.each(['viewer', 'interviewer', 'admin'] as const)('still gives a %s the way to the recording: the review', async (role) => {
+    renderSection(role);
+    await rows();
+    expect(screen.getByRole('link', { name: 'Open R1 review' })).toHaveAttribute('href', '/interviews/round-1');
   });
 });
 
-describe('who sees a recording row', () => {
-  it('a viewer sees a completed round with a ready recording: exactly one button, Load recording', async () => {
-    renderSection('viewer');
+describe('which attempts get a chip', () => {
+  it('a completed round says plainly when an attempt has no recording', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { rec: { state: 'none' } })] })] });
+    renderSection();
     await rows();
-    const buttons = screen.getAllByRole('button');
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0]).toHaveAccessibleName('Load recording, Attempt 1 (counted)');
-    expect(screen.getByRole('heading', { name: 'Attempt 1 (counted)' })).toBeInTheDocument();
-    expect(screen.getByText(/Length 7m 3s/)).toBeInTheDocument();
-    // Read-only: none of the round's actions.
-    for (const name of ['Reissue link', 'Cancel round', 'Grant retake', 'Send R1']) {
-      expect(screen.queryByRole('button', { name })).not.toBeInTheDocument();
-    }
-    expect(api.getR1Availability).not.toHaveBeenCalled();
+    expect(chipWords()).toEqual(['Recording: Attempt 1 (counted): No recording']);
   });
 
-  it('an interviewer who owns the candidate but did not create the round sees the row, not the actions', async () => {
-    renderSection('interviewer', { userId: 'user-1' });
-    await rows();
-    expect(loadButtons()).toHaveLength(1);
-    expect(screen.queryByRole('button', { name: 'Grant retake' })).not.toBeInTheDocument();
-  });
-
-  it('the creator and an admin see the row beside the round actions', async () => {
-    renderSection('admin', { userId: 'admin-1' });
-    await rows();
-    expect(loadButtons()).toHaveLength(1);
-    expect(screen.getByRole('button', { name: 'Grant retake' })).toBeInTheDocument();
-  });
-
-  it('an invited round with no attempts has no recording row (and keeps a viewer button-free)', async () => {
+  it('an invited round with no attempts has none', async () => {
     api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'invited', attempts_counted: 0, attempts: [] })] });
-    renderSection('viewer');
+    renderSection();
     await rows();
-    expect(screen.queryByRole('button')).not.toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: /Attempt/ })).not.toBeInTheDocument();
+    expect(chipWords()).toEqual([]);
   });
 
   it('an invited round whose first attempt was recorded (a retake is pending) shows that recording', async () => {
-    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'invited', attempts_counted: 1 })] });
-    renderSection('viewer');
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'invited' })] });
+    renderSection();
     await rows();
-    expect(loadButtons()).toHaveLength(1);
+    expect(chipWords()).toEqual(['Recording: Attempt 1 (counted): Ready']);
   });
 
-  it('a live round shows no "no recording" line for an attempt that has not recorded yet', async () => {
-    api.listR1Rounds.mockResolvedValue({
-      rounds: [round({ status: 'in_progress', attempts: [attempt(1, { rec: { state: 'none' } })] })],
-    });
-    renderSection('viewer');
+  it('a live round has no "no recording" chip for an attempt that has not recorded yet', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'in_progress', attempts: [attempt(1, { rec: { state: 'none' } })] })] });
+    renderSection();
     await rows();
-    expect(screen.queryByText('No recording was made for this attempt.')).not.toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: /Attempt/ })).not.toBeInTheDocument();
-  });
-
-  it('a completed round says plainly when an attempt has no recording', async () => {
-    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { rec: { state: 'none' } })] })] });
-    renderSection('viewer');
-    await rows();
-    expect(screen.getByText('No recording was made for this attempt.')).toBeInTheDocument();
-    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(chipWords()).toEqual([]);
   });
 
   it('an older API without attempts adds nothing and does not crash', async () => {
-    const legacy = round();
-    delete legacy.attempts;
-    api.listR1Rounds.mockResolvedValue({ rounds: [legacy] });
-    renderSection('viewer');
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: undefined })] });
+    renderSection();
     await rows();
-    expect(screen.queryByRole('heading', { name: /Attempt/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(chipWords()).toEqual([]);
   });
 
   it('ignores an attempt entry with no recording', async () => {
-    api.listR1Rounds.mockResolvedValue({
-      rounds: [round({ attempts: [{ session_id: 's', attempt_number: 1, counted: true } as unknown as R1AttemptSummary] })],
-    });
-    renderSection('viewer');
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [{ ...attempt(1), recording: undefined as never }] })] });
+    renderSection();
     await rows();
-    expect(screen.queryByRole('heading', { name: /Attempt/ })).not.toBeInTheDocument();
+    expect(chipWords()).toEqual([]);
   });
 });
 
-describe('one row per attempt', () => {
-  it('labels the first counted attempt counted and the second the retake, each with its own button', async () => {
+describe('what a chip says', () => {
+  it('names each attempt with its own state', async () => {
     api.listR1Rounds.mockResolvedValue({
-      rounds: [round({ attempts_counted: 2, attempts: [attempt(1), attempt(2)] })],
+      rounds: [round({ attempts_counted: 2, attempts: [attempt(1), attempt(2, { rec: { state: 'partial' } })] })],
     });
-    renderSection('viewer');
+    renderSection();
     await rows();
-    expect(screen.getByRole('heading', { name: 'Attempt 1 (counted)' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Attempt 2 (retake)' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Load recording, Attempt 1 (counted)' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Load recording, Attempt 2 (retake)' })).toBeInTheDocument();
+    expect(chipWords()).toEqual(['Recording: Attempt 1 (counted): Ready', 'Recording: Attempt 2 (retake): Partial']);
   });
 
   it('labels an attempt that did not count', async () => {
-    api.listR1Rounds.mockResolvedValue({
-      rounds: [round({ attempts: [attempt(1, { counted: false, rec: { state: 'failed', reason: 'capture_failed' } }), attempt(2)] })],
-    });
-    renderSection('viewer');
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { counted: false })] })] });
+    renderSection();
     await rows();
-    expect(screen.getByRole('heading', { name: 'Attempt 1 (not counted)' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Attempt 2 (counted)' })).toBeInTheDocument();
-    expect(screen.getByText('Recording failed during the interview.')).toBeInTheDocument();
+    expect(chipWords()).toEqual(['Recording: Attempt 1 (not counted): Ready']);
   });
 
-  it('each row groups its own player, named by the attempt', async () => {
-    api.listR1Rounds.mockResolvedValue({
-      rounds: [round({ attempts: [attempt(1), attempt(2, { rec: { state: 'processing' } })] })],
-    });
-    renderSection('viewer');
+  it.each([
+    [{ state: 'recording' }, 'Recording'],
+    [{ state: 'processing' }, 'Processing'],
+    [{ state: 'failed', reason: 'capture_failed' }, 'Unavailable'],
+    [{ state: 'deleted', reason: 'consent_withdrawn' }, 'Deleted'],
+  ] as const)('reads %j as a word', async (rec, word) => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { rec })] })] });
+    renderSection();
     await rows();
-    const first = screen.getByRole('group', { name: 'Attempt 1 (counted)' });
-    const second = screen.getByRole('group', { name: 'Attempt 2 (retake)' });
-    expect(within(first).getByRole('button', { name: /load recording/i })).toBeInTheDocument();
-    expect(within(second).queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
-    expect(within(second).getByText('The recording is being prepared. This usually takes a few minutes.')).toBeInTheDocument();
-  });
-
-  it('every state in the list is drawn for its attempt', async () => {
-    api.listR1Rounds.mockResolvedValue({
-      rounds: [
-        round({
-          attempts: [
-            attempt(1, { rec: { state: 'deleted', reason: 'retention', deleted_at: '2027-01-12T10:00:00.000Z' } }),
-            attempt(2, { rec: { state: 'recording' } }),
-            attempt(3, { rec: { state: 'partial', reason: 'audio_only_degraded', degraded_at_ms: 60_000 } }),
-          ],
-        }),
-      ],
-    });
-    renderSection('viewer');
-    await rows();
-    expect(screen.getByText(/This recording was deleted on .*2027 after the retention period\./)).toBeInTheDocument();
-    expect(screen.getByText('In progress. It can be played a few minutes after the interview ends.')).toBeInTheDocument();
-    expect(screen.getByText('Video stopped at 1:00 to protect the interview; the rest is audio only.')).toBeInTheDocument();
-    expect(loadButtons()).toHaveLength(1);
-  });
-});
-
-describe('playing from the card', () => {
-  it('mints nothing until Load is pressed, then with (round id, session id) and shows the video', async () => {
-    renderSection('viewer');
-    await rows();
-    expect(api.getR1Recording).not.toHaveBeenCalled();
-    fireEvent.click(loadButtons()[0]);
-    expect(api.getR1Recording).toHaveBeenCalledWith('round-1', 'session-1');
-    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
-    expect(document.querySelector('video')).toHaveAttribute('src', MINT_URL);
-    expect(document.body.textContent).not.toContain('SIG_ROW_1');
-  });
-
-  it('a viewer who is refused (403) is told so in words', async () => {
-    api.getR1Recording.mockRejectedValue(Object.assign(new Error('access_denied'), { status: 403 }));
-    renderSection('viewer');
-    await rows();
-    fireEvent.click(loadButtons()[0]);
-    expect(await screen.findByRole('alert')).toHaveTextContent('You do not have access to this recording.');
-  });
-
-  it('"Check again" on a processing recording re-reads the rounds', async () => {
-    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { rec: { state: 'processing' } })] })] });
-    renderSection('viewer');
-    await rows();
-    expect(api.listR1Rounds).toHaveBeenCalledTimes(1);
-    api.listR1Rounds.mockResolvedValue({ rounds: [round()] });
-    fireEvent.click(screen.getByRole('button', { name: 'Check again, Attempt 1 (counted)' }));
-    await waitFor(() => expect(api.listR1Rounds).toHaveBeenCalledTimes(2));
-    // The re-read found it ready: Load is offered now.
-    expect(await screen.findByRole('button', { name: 'Load recording, Attempt 1 (counted)' })).toBeInTheDocument();
-  });
-
-  it('pauses the media when the tab is hidden (active=false) and keeps the link', async () => {
-    const view = renderSection('viewer', { active: true });
-    await rows();
-    fireEvent.click(loadButtons()[0]);
-    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
-    const video = document.querySelector('video') as HTMLVideoElement;
-    const pause = vi.fn();
-    video.pause = pause;
-    view.rerenderWith({ active: false });
-    expect(pause).toHaveBeenCalled();
-    expect(document.querySelector('video')).toBe(video);
-    expect(video).toHaveAttribute('src', MINT_URL);
-  });
-
-  it('a re-read of the list does not drop a player that is already loaded', async () => {
-    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'invited', attempts_counted: 1 })] });
-    renderSection('interviewer', { userId: 'creator-1' });
-    await rows();
-    fireEvent.click(loadButtons()[0]);
-    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
-    const video = document.querySelector('video');
-    // Cancelling the round re-reads the list; the recording on screen stays.
-    api.cancelR1Round.mockResolvedValue({ ok: true });
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel round' }));
-    fireEvent.click(within(await screen.findByRole('group', { name: 'Cancel this R1 round?' })).getByRole('button', { name: 'Cancel round' }));
-    await waitFor(() => expect(api.listR1Rounds).toHaveBeenCalledTimes(2));
-    expect(document.querySelector('video')).toBe(video);
+    expect(chipWords()).toEqual([`Recording: Attempt 1 (counted): ${word}`]);
   });
 });
 
 describe('accessibility', () => {
-  it('has no axe violations with a recording row in each of several states', async () => {
+  it('has no axe violations with a chip in each of several states', async () => {
     api.listR1Rounds.mockResolvedValue({
-      rounds: [
-        round({
-          attempts: [
-            attempt(1),
-            attempt(2, { rec: { state: 'processing' } }),
-            attempt(3, { counted: false, rec: { state: 'failed', reason: 'integrity' } }),
-          ],
-        }),
-      ],
+      rounds: [round({ attempts: [attempt(1), attempt(2, { rec: { state: 'processing' } }), attempt(3, { rec: { state: 'deleted', reason: 'retention' } })] })],
     });
-    const { container } = renderSection('viewer');
+    const { container } = renderSection('admin');
     await rows();
-    await expect(container).toHaveNoViolations();
-  });
-
-  it('has no axe violations with the video loaded', async () => {
-    const { container } = renderSection('viewer');
-    await rows();
-    fireEvent.click(loadButtons()[0]);
-    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
     await expect(container).toHaveNoViolations();
   });
 });

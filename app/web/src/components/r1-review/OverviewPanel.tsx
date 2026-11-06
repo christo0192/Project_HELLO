@@ -20,6 +20,7 @@ import {
   notScoredSentence,
   phoneResultWords,
   placeTurns,
+  replacedAssessmentOf,
   reviewStage,
   trustChecks,
   verdictOf,
@@ -205,7 +206,7 @@ function PhoneLine({ review }: { review: R1ReviewResponse }) {
     <p className="text-sm text-ink-secondary">
       Phone screening: {result ? `${result} (AI). ` : ''}
       <Link
-        to={`/candidates/${review.round.candidate_id}?tab=review`}
+        to={`/candidates/${review.round.candidate_id}?tab=phone`}
         className="text-ink underline underline-offset-2 hover:text-ink-secondary focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink)]"
       >
         Open the candidate
@@ -214,7 +215,19 @@ function PhoneLine({ review }: { review: R1ReviewResponse }) {
   );
 }
 
-export function OverviewPanel({ review, attempt, candidateName, onOpenTurn, onCheckAgain }: OverviewPanelProps) {
+/**
+ * The attempt on screen may hold a scorecard a later attempt replaced. It reads like any other, as that
+ * attempt's own result, and says that it no longer stands as the round's.
+ */
+export function OverviewPanel(props: OverviewPanelProps) {
+  const { review, attempt } = props;
+  const replaced = replacedAssessmentOf(review, attempt);
+  if (!replaced) return <AttemptResult {...props} replaced={false} />;
+  const round = { ...review.round, recommendation: replaced.recommendation, overall: replaced.overall_score };
+  return <AttemptResult {...props} review={{ ...review, round, assessment: replaced }} replaced />;
+}
+
+function AttemptResult({ review, attempt, candidateName, onOpenTurn, onCheckAgain, replaced }: OverviewPanelProps & { replaced: boolean }) {
   const { round, assessment, attempts, events } = review;
   const stage = reviewStage(review, Date.now());
 
@@ -281,7 +294,11 @@ export function OverviewPanel({ review, attempt, candidateName, onOpenTurn, onCh
                 {`Provisional: scored from ${scoredCount} of ${metrics.length} metrics. The others lacked evidence and are left out of the weighted score, so confirm before deciding.`}
               </InlineNotice>
             )}
-            {scoredLabel && <p className="mt-2 text-sm text-ink-secondary">This result is for {scoredLabel}.</p>}
+            {scoredLabel && (
+              <p className="mt-2 text-sm text-ink-secondary">
+                This result is for {scoredLabel}.{replaced ? ' A later attempt replaced it as the result of this round.' : ''}
+              </p>
+            )}
           </div>
         </Section>
 

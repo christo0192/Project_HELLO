@@ -76,7 +76,13 @@ export function requireViewer(req: Request, res: Response, next: NextFunction): 
 }
 
 /**
- * Viewer mutation guard: rejects non-GET/HEAD for viewers.
+ * POST routes that only read, which a viewer may call like any GET, by their whole path. A candidate's
+ * name in a search goes in a body because it may not go in a URL (lib/r1/queue.ts).
+ */
+const VIEWER_READ_POSTS: ReadonlySet<string> = new Set(['/api/interview-rounds/search']);
+
+/**
+ * Viewer mutation guard: rejects non-GET/HEAD for viewers, but for VIEWER_READ_POSTS.
  * Must be used after requireAuth and requireViewer.
  */
 export function viewerReadOnly(req: Request, res: Response, next: NextFunction): void {
@@ -85,7 +91,8 @@ export function viewerReadOnly(req: Request, res: Response, next: NextFunction):
     res.status(403).json(forbiddenBody());
     return;
   }
-  if (user.appRole === 'viewer' && req.method !== 'GET' && req.method !== 'HEAD') {
+  const readOnly = req.method === 'GET' || req.method === 'HEAD' || (req.method === 'POST' && VIEWER_READ_POSTS.has(req.path));
+  if (user.appRole === 'viewer' && !readOnly) {
     res.status(403).json(forbiddenBody());
     return;
   }

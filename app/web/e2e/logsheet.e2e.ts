@@ -143,8 +143,8 @@ async function pixelsOf(page: Page, subject: Locator, colour: string): Promise<n
 /** Open the Review tab and start a transcript turn, which marks it `aria-current`. */
 async function playTurn(app: AppHarness, page: Page): Promise<Locator> {
   await app.goto(`/candidates/${SEEK_CANDIDATE_ID}`);
-  await page.getByRole('tab', { name: 'Review' }).click();
-  const panel = page.getByRole('tabpanel', { name: 'Review' });
+  await page.getByRole('tab', { name: 'Phone screening' }).click();
+  const panel = page.getByRole('tabpanel', { name: 'Phone screening' });
   await pickSession(panel, /Recorded 2m 0s/);
   const turn = panel.getByRole('group', { name: 'Call 1 of 2 · first call' }).getByRole('button', { name: /Turn 2:/ });
   await turn.click();
@@ -263,7 +263,7 @@ test.describe('the sheet at both desk sizes', () => {
     await page.getByRole('button', { name: 'Next page' }).click();
     await expect(page).toHaveURL(/page=2/);
     await page.getByRole('table').getByRole('link').first().click();
-    for (const name of ['Overview', 'Review']) {
+    for (const name of ['Profile', 'Phone screening']) {
       await page.getByRole('tab', { name }).click();
       await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'true');
     }

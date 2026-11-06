@@ -40,6 +40,40 @@ function renderSessions(count: number) {
   );
 }
 
+describe('SessionsSummary and R1', () => {
+  const session = (id: string, created_at: string, interview_round_id: string | null) =>
+    ({ ...sessionsOf(1)[0], id, created_at, interview_round_id, mode: interview_round_id ? 'browser' : 'live' });
+
+  it('takes an R1 session straight to its recording on the review page, for every role', () => {
+    render(
+      <MemoryRouter>
+        <SessionsSummary
+          sessions={[
+            session('r1-b', '2026-08-03T00:00:00.000Z', 'round-1'),
+            session('r1-a', '2026-08-02T00:00:00.000Z', 'round-1'),
+            session('phone', '2026-08-01T00:00:00.000Z', null),
+          ]}
+        />
+      </MemoryRouter>,
+    );
+    const links = screen.getAllByRole('link', { name: /View details/ }).map((link) => link.getAttribute('href'));
+    expect(links).toEqual([
+      '/interviews/round-1?attempt=2&tab=recording',
+      '/interviews/round-1?attempt=1&tab=recording',
+      '/sessions/phone',
+    ]);
+  });
+
+  it('names an R1 session as what it is', () => {
+    render(
+      <MemoryRouter>
+        <SessionsSummary sessions={[session('r1-a', '2026-08-02T00:00:00.000Z', 'round-1')]} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('R1 role-play')).toBeInTheDocument();
+  });
+});
+
 describe('SessionsSummary bounding', () => {
   it('lists five sessions inline, with no nested scroll region', () => {
     renderSessions(5);

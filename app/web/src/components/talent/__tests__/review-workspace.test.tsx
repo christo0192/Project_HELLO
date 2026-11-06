@@ -1335,13 +1335,6 @@ describe('the consent line (Legal, 2026-11-05)', () => {
     await screen.findByText('What is your monthly target?');
     expect(document.querySelector('[data-leg-consent]')).toHaveTextContent('Consent withdrawn – recording kept');
   });
-
-  it('does not fold anything on an R1 session', async () => {
-    const r1: Session = { ...SESSION, interview_round_id: 'round-1', mode: 'browser' };
-    renderWorkspace({ session: r1, legs: [], card: null });
-    expect(await screen.findByText('Yes, I consent.')).toBeInTheDocument();
-    expect(screen.queryByText(/Consent given/)).toBeNull();
-  });
 });
 
 describe('the reasoning pane', () => {
@@ -1626,15 +1619,6 @@ describe('the states', () => {
 });
 
 describe('the panes', () => {
-  it('keeps an R1 recording outside both scrolling panes, where playback cannot move it', async () => {
-    const r1: Session = { ...SESSION, interview_round_id: 'round-1', mode: 'browser' };
-    renderWorkspace({ session: r1, legs: [], card: null });
-    await screen.findByText('Yes, I consent.');
-    const slot = document.querySelector<HTMLElement>('[data-r1-player-slot]')!;
-    expect(slot).not.toBeNull();
-    expect(slot.closest('[data-review-pane]')).toBeNull();
-  });
-
   it('has a skip link into each pane, and each pane can take focus', async () => {
     renderWorkspace();
     await screen.findByText('What is your monthly target?');

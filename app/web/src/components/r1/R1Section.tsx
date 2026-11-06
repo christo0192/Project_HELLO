@@ -1,7 +1,9 @@
 /**
- * R1Section: the "R1 interview" card on the candidate page. It is the Send R1
+ * R1Section: the "R1 interview" tab of the candidate page. It is the Send R1
  * card and the R1 panel in one surface: the card sends (and shows the link
- * once), the panel lists the rounds and what can be done to each.
+ * once), the panel lists the rounds and what can be done to each. There is no
+ * player here: a recording plays on the review page each row links to, so a
+ * page has only one.
  *
  * Data. One read of the candidate's rounds (viewer and above) and, for
  * people who can send, one read of availability. The two fail independently:
@@ -14,9 +16,9 @@
  *   - admin / interviewer: Send R1 (when the candidate has no live round and
  *     has used no attempt), availability reasons, and the round actions on
  *     their own rounds (an admin: every round);
- *   - viewer: the rounds, read-only, with each attempt's recording (every staff role
- *     sees the recording rows; the API decides who may play one); no card at all
- *     when there are no rounds;
+ *   - viewer: the rounds, read-only, with each attempt's recording chip (every staff
+ *     role sees them; the API decides who may play one); no card at all when there
+ *     are no rounds;
  *   - nobody: a card at all while the server does not run R1 and there is no
  *     round to show.
  *
@@ -32,6 +34,7 @@
  * Renders inside `.candidate-scope` (`--c-*` tokens only, no motion import).
  */
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { api, ApiError } from '../../api';
 import { SurfaceCard, CandidateButton } from '../design/candidate';
 import { IssuedLink } from './IssuedLink';
@@ -48,13 +51,12 @@ export interface R1SectionProps {
   role: MeResponse['role'];
   /** The signed-in user, so round actions are offered only on rounds they may act on. */
   userId: string | null;
-  /**
-   * False pauses the recordings: the Overview tab is hidden but stays mounted, and a video must
-   * not keep playing behind another tab. Default true.
-   */
-  active?: boolean;
   /** An appeal blocks decision use: a round's result reads as withheld. Default false. */
   decisionBlocked?: boolean;
+  /** Every read of the rounds, so the page can say the result in its header without a second read. */
+  onRoundsChange?: (rounds: R1Round[]) => void;
+  /** What to draw when there is no card to draw. This is a tab, so nothing would be an empty panel. */
+  empty?: ReactNode;
 }
 
 type RoundsState =
@@ -67,8 +69,9 @@ export function R1Section({
   candidateName,
   role,
   userId,
-  active = true,
   decisionBlocked = false,
+  onRoundsChange,
+  empty = null,
 }: R1SectionProps) {
   const headingId = useId();
   const headingRef = useRef<HTMLHeadingElement | null>(null);
@@ -139,6 +142,10 @@ export function R1Section({
     loadAvailability();
   }, [candidateId, loadRounds, loadAvailability]);
 
+  useEffect(() => {
+    if (rounds.status === 'ready') onRoundsChange?.(rounds.rounds);
+  }, [rounds, onRoundsChange]);
+
   const settle = useCallback(() => {
     headingRef.current?.focus();
   }, []);
@@ -148,11 +155,11 @@ export function R1Section({
   // a 403 means the candidate is not theirs; and a server that does not run R1 has no
   // card unless a round already exists to show.
   if (rounds.status === 'loading') return null;
-  if (rounds.status === 'error' && rounds.forbidden) return null;
+  if (rounds.status === 'error' && rounds.forbidden) return empty;
   if (rounds.status === 'ready') {
-    if (!canManage && rounds.rounds.length === 0) return null;
+    if (!canManage && rounds.rounds.length === 0) return empty;
     if (canManage && !availabilitySettled) return null;
-    if (rounds.rounds.length === 0 && availability?.state === 'not_deployed') return null;
+    if (rounds.rounds.length === 0 && availability?.state === 'not_deployed') return empty;
   }
 
   const list = rounds.status === 'ready' ? rounds.rounds : [];
@@ -250,7 +257,6 @@ export function R1Section({
                 }}
                 onMessage={setMessage}
                 onSettled={settle}
-                active={active}
                 decisionBlocked={decisionBlocked}
               />
             </div>

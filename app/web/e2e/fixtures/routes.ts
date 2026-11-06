@@ -13,6 +13,7 @@ import {
   DIALED_CANDIDATE_ID,
   LEGACY_CANDIDATE_ID,
   LEGACY_SESSION_ID,
+  R1_CANDIDATE_ID,
   R1_ROUND_ID,
   SCOPED_REVIEW_LINK_ID,
   STAR_CANDIDATE_ID,
@@ -72,12 +73,16 @@ export const ROUTES: RouteCase[] = [
   { name: 'candidates-search-queued', path: '/candidates?status=queued&q=vikram', heading: 'Candidates', landmark: 'Queued (dialed 2)' },
   // A phone outcome is its own, filterable status key.
   { name: 'candidates-abandoned', path: '/candidates?status=abandoned_no_answer', heading: 'Candidates', landmark: 'Lucía Fernández' },
-  { name: 'candidate-detail', path: `/candidates/${STAR_CANDIDATE_ID}?tab=overview`, heading: 'Meera Iyer', landmark: 'Screening cycle 1' },
+  { name: 'candidate-detail', path: `/candidates/${STAR_CANDIDATE_ID}?tab=profile`, heading: 'Meera Iyer', landmark: 'Screening cycle 1' },
   // Mid-cycle: the attempt history shows a lease-reclaimed "Call interrupted"
   // leg with a pre-consent recording, and an infra-deferred "Not placed" one.
   { name: 'candidate-detail-dialed', path: `/candidates/${DIALED_CANDIDATE_ID}`, heading: 'Vikram Pillai', landmark: 'Call interrupted' },
   { name: 'candidate-detail-abandoned', path: `/candidates/${ABANDONED_CANDIDATE_ID}`, heading: 'Lucía Fernández', landmark: 'Abandoned: no answer' },
-  { name: 'candidate-detail-legacy', path: `/candidates/${LEGACY_CANDIDATE_ID}?tab=overview`, heading: 'Rohan Deshpande', landmark: 'Moved to technical round.' },
+  { name: 'candidate-detail-legacy', path: `/candidates/${LEGACY_CANDIDATE_ID}?tab=profile`, heading: 'Rohan Deshpande', landmark: 'Moved to technical round.' },
+  { name: 'candidate-detail-r1', path: `/candidates/${R1_CANDIDATE_ID}?tab=r1`, heading: 'Naveen Kapoor', landmark: 'Open R1 review' },
+  // The R1 queue, in each view that has rows of its own.
+  { name: 'r1-interviews', path: '/interviews', heading: 'R1 interviews', landmark: 'Naveen Kapoor' },
+  { name: 'r1-interviews-all', path: '/interviews?view=all', heading: 'R1 interviews', landmark: 'Tanvi Joshi' },
   // The R1 review: each tab is its own address, so each is checked and captured.
   { name: 'r1-review-overview', path: `/interviews/${R1_ROUND_ID}?tab=overview`, heading: /Sales Program Advisor role-play/, landmark: 'Check before trusting it' },
   { name: 'r1-review-briefing', path: `/interviews/${R1_ROUND_ID}?tab=briefing`, heading: /Sales Program Advisor role-play/, landmark: 'What the candidate saw' },

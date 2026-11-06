@@ -24,7 +24,10 @@
  *
  * A builder method this double does not model is recorded in `unsupported`
  * and throws, so a route can never pass a test because a filter was silently
- * ignored.
+ * ignored. An embed spelled `candidates!inner(...)` joins on `candidate_id` and
+ * drops a row with no match, dotted columns (`candidates.owner_id`) filter on
+ * it, `.or()` takes PostgREST's logic grammar with SQL's NULL rules, and a
+ * counted read past the end answers 416 (PGRST103), as PostgREST does.
  *
  * Use one engine per test file: point the supabase mock at the shared
  * `scaleDb.client` and reset it before each test.
@@ -158,9 +161,78 @@ function comparable(value: unknown, against: unknown): number | null {
   return compareNonNull(value, against);
 }
 
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** LIKE as Postgres reads it: a backslash escapes the next character, and PostgREST takes `*` for `%`. */
 function likeToRegExp(pattern: string, flags: string): RegExp {
-  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.');
-  return new RegExp(`^${escaped}$`, flags);
+  let source = '';
+  for (let i = 0; i < pattern.length; i += 1) {
+    const c = pattern[i];
+    if (c === '\\' && i + 1 < pattern.length) {
+      i += 1;
+      source += escapeRegExp(pattern[i]);
+    } else if (c === '%' || c === '*') source += '.*';
+    else if (c === '_') source += '.';
+    else source += escapeRegExp(c);
+  }
+  return new RegExp(`^${source}$`, flags);
+}
+
+/** A column of the row, or of a row embedded in it: `candidates.owner_id`. */
+function valueAt(row: Row, column: string): unknown {
+  const dot = column.indexOf('.');
+  if (dot === -1) return row[column];
+  const embedded = row[column.slice(0, dot)];
+  return typeof embedded === 'object' && embedded !== null ? (embedded as Row)[column.slice(dot + 1)] : undefined;
+}
+
+/** Split a logic list on its top-level commas: parentheses nest. */
+function splitTopLevel(list: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < list.length; i += 1) {
+    if (list[i] === '(') depth += 1;
+    else if (list[i] === ')') depth -= 1;
+    else if (list[i] === ',' && depth === 0) {
+      parts.push(list.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(list.slice(start));
+  return parts;
+}
+
+/** Whether a filter holds, or null when SQL answers NULL, which a `not` leaves NULL. */
+function leafTest(row: Row, column: string, op: string, value: string): boolean | null {
+  const actual = valueAt(row, column);
+  if (op === 'is') {
+    if (value !== 'null') throw new Error(`scale-db: .or() is.${value} is not modelled`);
+    return actual === null || actual === undefined;
+  }
+  if (actual === null || actual === undefined) return null;
+  if (op === 'eq') return String(actual) === value;
+  if (op === 'neq') return String(actual) !== value;
+  if (op === 'in') return splitTopLevel(value.slice(1, -1)).includes(String(actual));
+  // Every value in the grammar is text: a number column still compares as a number.
+  const c = compareNonNull(actual, typeof actual === 'number' ? Number(value) : value);
+  return op === 'gt' ? c > 0 : op === 'gte' ? c >= 0 : op === 'lt' ? c < 0 : c <= 0;
+}
+
+/** One item of PostgREST's logic grammar: `and(...)`, `or(...)` or `column[.not].op.value`. */
+function logicItem(item: string): (r: Row) => boolean {
+  const group = /^(and|or)\((.*)\)$/.exec(item);
+  if (group) {
+    const items = splitTopLevel(group[2]).map(logicItem);
+    return group[1] === 'and' ? (r) => items.every((f) => f(r)) : (r) => items.some((f) => f(r));
+  }
+  const leaf = /^([\w.]+?)\.(not\.)?(eq|neq|is|in|gte|gt|lte|lt)\.(.*)$/.exec(item);
+  if (!leaf) throw new Error(`scale-db: .or() item ${item} is not modelled`);
+  const [, column, negated, op, value] = leaf;
+  return (r) => {
+    const held = leafTest(r, column, op, value);
+    return held === null ? false : negated ? !held : held;
+  };
 }
 
 /** Properties that tooling may read off a builder without it being a query method. */
@@ -235,6 +307,7 @@ export function createScaleDb(options: ScaleDbOptions = {}): ScaleDb {
     };
     const filters: Array<(r: Row) => boolean> = [];
     const orderSpecs: Array<{ column: string; ascending: boolean; nullsFirst?: boolean }> = [];
+    const innerEmbeds: string[] = [];
     let single: 'single' | 'maybeSingle' | null = null;
     let countRequested = false;
     let head = false;
@@ -243,19 +316,20 @@ export function createScaleDb(options: ScaleDbOptions = {}): ScaleDb {
     const b: Record<string, unknown> = {};
     const chain = <A extends unknown[]>(fn: (...args: A) => void) => (...args: A) => { fn(...args); return proxy; };
 
-    b.select = chain((_columns?: string, opts?: { count?: string; head?: boolean }) => {
+    b.select = chain((columns?: string, opts?: { count?: string; head?: boolean }) => {
       if (opts?.count) countRequested = true;
       if (opts?.head) head = true;
+      for (const embed of (columns ?? '').matchAll(/(\w+)!inner\(/g)) innerEmbeds.push(embed[1]);
     });
     b.eq = chain((column: string, value: unknown) => {
       q.eqs.push([column, value]);
-      filters.push((r) => r[column] === value);
+      filters.push((r) => valueAt(r, column) === value);
     });
     b.neq = chain((column: string, value: unknown) => {
-      filters.push((r) => r[column] !== null && r[column] !== undefined && r[column] !== value);
+      filters.push((r) => { const v = valueAt(r, column); return v !== null && v !== undefined && v !== value; });
     });
     const cmp = (test: (c: number) => boolean) => chain((column: string, value: unknown) => {
-      filters.push((r) => { const c = comparable(r[column], value); return c !== null && test(c); });
+      filters.push((r) => { const c = comparable(valueAt(r, column), value); return c !== null && test(c); });
     });
     b.gt = cmp((c) => c > 0);
     b.gte = cmp((c) => c >= 0);
@@ -263,18 +337,18 @@ export function createScaleDb(options: ScaleDbOptions = {}): ScaleDb {
     b.lte = cmp((c) => c <= 0);
     b.like = chain((column: string, pattern: string) => {
       const re = likeToRegExp(pattern, '');
-      filters.push((r) => typeof r[column] === 'string' && re.test(r[column] as string));
+      filters.push((r) => { const v = valueAt(r, column); return typeof v === 'string' && re.test(v); });
     });
     b.ilike = chain((column: string, pattern: string) => {
       const re = likeToRegExp(pattern, 'i');
-      filters.push((r) => typeof r[column] === 'string' && re.test(r[column] as string));
+      filters.push((r) => { const v = valueAt(r, column); return typeof v === 'string' && re.test(v); });
     });
     b.is = chain((column: string, value: unknown) => {
-      filters.push((r) => (value === null ? r[column] == null : r[column] === value));
+      filters.push((r) => { const v = valueAt(r, column); return value === null ? v == null : v === value; });
     });
     b.not = chain((column: string, op: string, value: unknown) => {
-      if (op === 'is' && value === null) filters.push((r) => r[column] != null);
-      else if (op === 'eq') filters.push((r) => r[column] != null && r[column] !== value);
+      if (op === 'is' && value === null) filters.push((r) => valueAt(r, column) != null);
+      else if (op === 'eq') filters.push((r) => { const v = valueAt(r, column); return v != null && v !== value; });
       else {
         engine.unsupported.push(`${table}.not(${op})`);
         throw new Error(`scale-db: .not(column, '${op}', ...) is not modelled`);
@@ -283,7 +357,16 @@ export function createScaleDb(options: ScaleDbOptions = {}): ScaleDb {
     b.in = chain((column: string, values: readonly unknown[]) => {
       q.inValues = [...(q.inValues ?? []), ...values];
       const set = new Set(values);
-      filters.push((r) => set.has(r[column]));
+      filters.push((r) => set.has(valueAt(r, column)));
+    });
+    b.or = chain((list: string) => {
+      try {
+        const items = splitTopLevel(list).map(logicItem);
+        filters.push((r) => items.some((f) => f(r)));
+      } catch (error) {
+        engine.unsupported.push(`${table}.or(${list})`);
+        throw error;
+      }
     });
     b.order = chain((column: string, opts?: { ascending?: boolean; nullsFirst?: boolean; foreignTable?: string; referencedTable?: string }) => {
       if (isForeign(opts)) return;
@@ -324,8 +407,23 @@ export function createScaleDb(options: ScaleDbOptions = {}): ScaleDb {
         return { data: null, error: null, status: 204 };
       }
 
-      let rows = stored.filter((r) => filters.every((f) => f(r)));
+      // The `!inner` joins: a row without its match is gone, as in the SQL.
+      let joined = stored;
+      for (const embed of innerEmbeds) {
+        const byId = new Map((engine.tables[embed] ?? []).map((row) => [row.id, row]));
+        const key = `${embed.replace(/s$/, '')}_id`;
+        joined = joined.flatMap((row) => (byId.has(row[key]) ? [{ ...row, [embed]: byId.get(row[key]) }] : []));
+      }
+      let rows = joined.filter((r) => filters.every((f) => f(r)));
       q.matched = rows.length;
+      if (countRequested && q.range && q.range[0] > q.matched) {
+        return {
+          data: null,
+          error: { message: 'Requested range not satisfiable', details: `An offset of ${q.range[0]} was requested, but there are only ${q.matched} rows.`, hint: null, code: 'PGRST103' },
+          count: null,
+          status: 416,
+        };
+      }
       if (engine.scrambleTies) {
         const rand = prng(++seedCounter);
         rows = rows.map((r) => [rand(), r] as const).sort((x, y) => x[0] - y[0]).map(([, r]) => r);

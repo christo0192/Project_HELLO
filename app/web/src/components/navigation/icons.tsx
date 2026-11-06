@@ -36,6 +36,16 @@ export function DashboardIcon({ className }: IconProps) {
   );
 }
 
+/** A video camera: R1 is the recorded interview. */
+export function InterviewIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <rect x="3" y="6" width="13" height="12" rx="2" />
+      <path d="m16 10.5 5-3v9l-5-3" />
+    </svg>
+  );
+}
+
 export function UsersIcon({ className }: IconProps) {
   return (
     <svg {...base(className)}>

@@ -14,8 +14,9 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { R1Round } from '../../../lib/r1-types';
+import type { R1ListedAttempt, R1Round } from '../../../lib/r1-types';
 import { ApiError } from '../../../api';
+import { r1ResultLine } from '../../../lib/r1';
 import { R1Section } from '../R1Section';
 
 const api = vi.hoisted(() => ({
@@ -44,13 +45,29 @@ function round(over: Partial<R1Round> = {}): R1Round {
   return {
     id: 'round-1',
     status: 'invited',
-    expires_at: '2026-10-09T10:00:00.000Z',
+    expires_at: '2099-10-09T10:00:00.000Z',
     attempts_allowed: 2,
     attempts_counted: 0,
     recommendation: null,
     overall: null,
     created_at: '2026-10-06T10:00:00.000Z',
     created_by: 'user-1',
+    ...over,
+  };
+}
+
+function listed(over: Partial<R1ListedAttempt> = {}): R1ListedAttempt {
+  return {
+    session_id: 'session-1',
+    attempt_number: 1,
+    counted: true,
+    outcome: 'complete',
+    in_progress: false,
+    session_status: 'completed',
+    started_at: null,
+    ended_at: '2026-10-07T10:00:00.000Z',
+    consent_withdrawn: false,
+    recording: { state: 'none' },
     ...over,
   };
 }
@@ -511,7 +528,7 @@ describe('the rounds panel', () => {
     expect(row).toHaveTextContent(/Sent .*2026/);
     expect(row).toHaveTextContent('Status: Link sent');
     expect(row).toHaveTextContent('0 of 2 attempts used');
-    expect(row).toHaveTextContent(/Link valid until .*2026/);
+    expect(row).toHaveTextContent(/Link valid until .*2099/);
   });
 
   it('shows a results placeholder until scoring has produced something', async () => {
@@ -527,14 +544,187 @@ describe('the rounds panel', () => {
   it('shows the recommendation and score once the scorer has written them', async () => {
     api.listR1Rounds.mockResolvedValue({
       rounds: [
-        round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58.5 }),
+        round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58 }),
       ],
     });
     renderSection();
     expect(
-      await screen.findByText('Recommendation: Borderline · Overall 58.5 of 100'),
+      await screen.findByText('AI recommendation: Borderline · Overall 58 of 100'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [58.4, 58],
+    [58.5, 59],
+  ])('prints a score of %s as %s, the whole figure the candidate header shows', async (overall, shown) => {
+    const scored = round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall });
+    api.listR1Rounds.mockResolvedValue({ rounds: [scored] });
+    renderSection();
+    expect(await screen.findByText(`AI recommendation: Borderline · Overall ${shown} of 100`)).toBeInTheDocument();
+    expect(r1ResultLine([scored])).toBe(`R1 role-play: Borderline ${shown} (AI)`);
+  });
+
+  it('says a round the scorer would not score was not scored, not that scoring is on its way', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'completed', attempts_counted: 1, status_write: 'human_review' })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI result: not scored. Open the R1 review for the reason.')).toBeInTheDocument();
+    expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+  });
+
+  it('prints no figure the checks refused: a score with no recommendation is not a result', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'completed', attempts_counted: 1, overall: 42, status_write: 'human_review' })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI result: not scored. Open the R1 review for the reason.')).toBeInTheDocument();
+    expect(screen.queryByText(/42/)).not.toBeInTheDocument();
+  });
+
+  it('says not scored for a figure whose status write has not landed yet', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'completed', attempts_counted: 1, overall: 42 })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI result: not scored. Open the R1 review for the reason.')).toBeInTheDocument();
+    expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the result on the row after a retake re-opens the round', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [round({ status: 'invited', attempts_counted: 1, recommendation: 'hold', overall: 58 })],
+    });
+    renderSection();
+    expect(await screen.findByText('AI recommendation: Borderline · Overall 58 of 100')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'R1 rounds' })).getByRole('listitem')).toHaveTextContent('Status: Link sent');
+  });
+
+  it('says nothing about results on a link nobody has used', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'invited' })] });
+    renderSection();
+    await screen.findByRole('list', { name: 'R1 rounds' });
+    expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/AI re/)).not.toBeInTheDocument();
+  });
+
+  describe('a link past its expiry, which nothing writes as expired', () => {
+    const LAPSED = '2026-10-09T10:00:00.000Z';
+    const row = async () => within(await screen.findByRole('list', { name: 'R1 rounds' })).getByRole('listitem');
+
+    it('reads Expired, as the queue does, and does not say how long the link is valid', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ expires_at: LAPSED, attempts: [] })] });
+      renderSection();
+      const item = await row();
+      expect(item).toHaveTextContent('Status: Expired');
+      expect(item).not.toHaveTextContent('Link sent');
+      expect(item).not.toHaveTextContent('Link valid until');
+    });
+
+    it('paints its tag as the Expired it reads, not as the live link it is stored as', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [
+          round({ id: 'lapsed', expires_at: LAPSED, attempts: [] }),
+          round({ id: 'stored', status: 'expired', expires_at: LAPSED, attempts: [] }),
+          round({ id: 'live', attempts: [] }),
+        ],
+      });
+      renderSection();
+      const list = await screen.findByRole('list', { name: 'R1 rounds' });
+      const [lapsed, stored] = within(list).getAllByText('Expired');
+      expect(lapsed.className).toBe(stored.className);
+      expect(lapsed.className).not.toBe(within(list).getByText('Link sent').className);
+    });
+
+    it('still offers the reissue that revives it', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ expires_at: LAPSED, attempts: [] })] });
+      renderSection();
+      expect(await screen.findByRole('button', { name: 'Reissue link' })).toBeInTheDocument();
+    });
+
+    it('reads Expired from in_progress with nobody in it, and promises nothing', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'in_progress', expires_at: LAPSED, attempts: [listed({ counted: false, session_status: 'failed' })] })],
+      });
+      renderSection();
+      const item = await row();
+      expect(item).toHaveTextContent('Status: Expired');
+      expect(item).not.toHaveTextContent('No results yet');
+    });
+
+    it('reads In progress while an interview outlasts its link', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'in_progress', expires_at: LAPSED, attempts: [listed({ counted: false, in_progress: true, session_status: 'in_progress', ended_at: null })] })],
+      });
+      renderSection();
+      expect(await row()).toHaveTextContent('Status: In progress');
+    });
+
+    it('keeps a completed round as it is', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'completed', expires_at: LAPSED, attempts_counted: 1, recommendation: 'hold', overall: 58 })] });
+      renderSection();
+      expect(await row()).toHaveTextContent('Status: Completed');
+    });
+
+    it('reads Expired even when the list could not read the attempts', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ expires_at: LAPSED })] });
+      renderSection();
+      expect(await row()).toHaveTextContent('Status: Expired');
+    });
+  });
+
+  it('reads a live link nobody is in as an open link, as the queue does', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'in_progress', attempts: [listed({ counted: false, session_status: 'failed' })] })] });
+    renderSection();
+    expect(await screen.findByRole('list', { name: 'R1 rounds' })).toHaveTextContent('Status: Link open');
+  });
+
+  describe('a completed round with no result', () => {
+    const NOT_SCORED = 'AI result: not scored. Open the R1 review for the reason.';
+    const completed = (attempts: R1Round['attempts']) => round({ status: 'completed', attempts_counted: 1, attempts });
+
+    it('says a score is coming only while one can arrive', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [completed([listed({ ended_at: new Date(Date.now() - 60_000).toISOString() })])] });
+      renderSection();
+      expect(await screen.findByText(/No results yet/)).toBeInTheDocument();
+      expect(screen.queryByText(NOT_SCORED)).not.toBeInTheDocument();
+    });
+
+    it('says not scored once consent is withdrawn, which stops the scoring', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [completed([listed({ ended_at: new Date(Date.now() - 60_000).toISOString(), consent_withdrawn: true })])] });
+      renderSection();
+      expect(await screen.findByText(NOT_SCORED)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    });
+
+    it('says not scored once the wait for a score has passed', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [completed([listed({ ended_at: '2026-10-07T10:00:00.000Z' })])] });
+      renderSection();
+      expect(await screen.findByText(NOT_SCORED)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    });
+
+    it('does not claim either way when the list could not read the attempts', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'completed', attempts_counted: 1 })] });
+      renderSection();
+      expect(await screen.findByText(/No results yet/)).toBeInTheDocument();
+      expect(screen.queryByText(NOT_SCORED)).not.toBeInTheDocument();
+    });
+  });
+
+  it('marks a staff dry run, and only that', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [
+        round({ id: 'dry', status: 'completed', attempts_counted: 1, is_staff_dry_run: true }),
+        round({ id: 'real', status: 'completed', attempts_counted: 1, is_staff_dry_run: false }),
+      ],
+    });
+    renderSection();
+    const list = await screen.findByRole('list', { name: 'R1 rounds' });
+    const [dry, real] = within(list).getAllByRole('listitem');
+    expect(dry).toHaveTextContent('Staff dry run');
+    expect(real).not.toHaveTextContent('Staff dry run');
   });
 
   describe('while an appeal blocks decision use', () => {
@@ -562,7 +752,7 @@ describe('the rounds panel', () => {
       });
       renderBlocked();
       expect(await screen.findByText(WITHHELD)).toBeInTheDocument();
-      expect(screen.queryByText(/Recommendation:/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/AI recommendation:/)).not.toBeInTheDocument();
       expect(screen.queryByText(/of 100/)).not.toBeInTheDocument();
     });
 
@@ -602,7 +792,7 @@ describe('the rounds panel', () => {
       api.listR1Rounds.mockResolvedValue({ rounds: [{ ...scored, ...withheld }] });
       const user = userEvent.setup();
       renderSection();
-      expect(await screen.findByText('Recommendation: Reject · Overall 31 of 100')).toBeInTheDocument();
+      expect(await screen.findByText('AI recommendation: Reject · Overall 31 of 100')).toBeInTheDocument();
 
       await user.click(screen.getByRole('button', { name: 'Grant retake' }));
       const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
@@ -616,10 +806,10 @@ describe('the rounds panel', () => {
 
   it('without an appeal the withheld line never shows', async () => {
     api.listR1Rounds.mockResolvedValue({
-      rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58.5 })],
+      rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58 })],
     });
     renderSection();
-    await screen.findByText('Recommendation: Borderline · Overall 58.5 of 100');
+    await screen.findByText('AI recommendation: Borderline · Overall 58 of 100');
     expect(screen.queryByText(/suppressed while an appeal/)).not.toBeInTheDocument();
   });
 
@@ -661,7 +851,7 @@ describe('reissue, cancel and grant retake', () => {
     const group = await screen.findByRole('group', { name: 'New candidate link' });
     expect(group).toHaveTextContent(/previous link has stopped working/);
     // The reissue answer carries no expiry, so it is read from the refreshed round.
-    expect(group).toHaveTextContent(/valid for 72 hours \(until .*2026.*\)/);
+    expect(group).toHaveTextContent(/valid for 72 hours \(until .*2099.*\)/);
     expect(screen.getByLabelText('R1 link for the candidate')).toHaveValue(LINK);
   });
 
@@ -883,6 +1073,43 @@ describe('failure and reload', () => {
       expect(screen.queryByLabelText('R1 link for the candidate')).not.toBeInTheDocument(),
     );
     expect(document.body.textContent).not.toContain(LINK);
+  });
+});
+
+describe('what the page learns from the card', () => {
+  const open = (props: Partial<React.ComponentProps<typeof R1Section>> = {}) =>
+    render(
+      <MemoryRouter>
+        <R1Section candidateId="cand-1" candidateName="Ava Rao" role="admin" userId="user-1" {...props} />
+      </MemoryRouter>,
+    );
+
+  it('reports the rounds it read, and again after a re-read', async () => {
+    const first = round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58 });
+    const second = { ...first, status: 'invited' as const };
+    api.listR1Rounds.mockResolvedValueOnce({ rounds: [first] });
+    api.listR1Rounds.mockResolvedValue({ rounds: [second] });
+    const onRoundsChange = vi.fn();
+    const user = userEvent.setup();
+    open({ onRoundsChange });
+    await waitFor(() => expect(onRoundsChange).toHaveBeenCalledWith([first]));
+    await user.click(await screen.findByRole('button', { name: 'Grant retake' }));
+    const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
+    await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
+    await waitFor(() => expect(onRoundsChange).toHaveBeenLastCalledWith([second]));
+  });
+
+  it('draws what the page gives it when it has no card to draw', async () => {
+    api.getR1Availability.mockResolvedValue({ state: 'not_deployed', hold_minutes: 55 });
+    api.listR1Rounds.mockResolvedValue({ rounds: [] });
+    open({ empty: <p>Nothing here</p> });
+    expect(await screen.findByText('Nothing here')).toBeInTheDocument();
+  });
+
+  it('draws it for a viewer with no round too', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [] });
+    open({ role: 'viewer', empty: <p>Nothing here</p> });
+    expect(await screen.findByText('Nothing here')).toBeInTheDocument();
   });
 });
 

@@ -65,7 +65,7 @@ import type {
   SessionDetail,
   TranscriptLine,
 } from '../../src/types';
-import type { R1RecordingPlayback, R1ReviewResponse, R1ReviewTurn, R1Round } from '../../src/lib/r1-types';
+import type { R1QueueRound, R1RecordingPlayback, R1ReviewResponse, R1ReviewTurn, R1Round } from '../../src/lib/r1-types';
 import { FROZEN_NOW_MS } from './env';
 
 /* ── Time + id helpers ────────────────────────────────────────────────── */
@@ -1494,18 +1494,74 @@ const R1_ROUNDS: R1Round[] = [
     created_at: ago(5 * DAY),
     created_by: ADMIN_USER_ID,
     attempts: [
-      { session_id: R1_SESSION_ATTEMPT_1, attempt_number: 1, counted: true, outcome: 'completed', recording: r1Recording({}) },
+      {
+        session_id: R1_SESSION_ATTEMPT_1,
+        attempt_number: 1,
+        counted: true,
+        outcome: 'completed',
+        in_progress: false,
+        session_status: 'completed',
+        started_at: iso(R1_REC_START_MS),
+        ended_at: iso(R1_REC_START_MS + R1_REC_LENGTH_SEC * 1000),
+        consent_withdrawn: false,
+        recording: r1Recording({}),
+      },
       {
         session_id: R1_SESSION_ATTEMPT_2,
         attempt_number: 2,
         counted: true,
         outcome: 'completed',
+        in_progress: false,
+        session_status: 'completed',
+        started_at: iso(R1_REC_START_MS + DAY),
+        ended_at: iso(R1_REC_START_MS + DAY + 90_000),
+        consent_withdrawn: false,
         recording: r1Recording({ has_video: false, started_at_ms: R1_REC_START_MS + DAY, duration_ms: 90_000 }),
       },
     ],
   },
 ];
 
+
+/**
+ * The R1 queue (`GET /api/interview-rounds`): one round for each thing a row can say. The router applies
+ * the views as the API does, so a test changes `r1.queue` to reach any state.
+ */
+function r1QueueRound(n: number, name: string, over: Partial<R1QueueRound>): R1QueueRound {
+  const completed = (over.status ?? 'completed') === 'completed';
+  return {
+    id: uid('9', 100 + n),
+    candidate_id: uid('c', 100 + n),
+    candidate_name: name,
+    status: 'completed',
+    expires_at: completed ? ago((10 - n) * DAY - 3 * DAY) : iso(FROZEN_NOW_MS + 1 * DAY),
+    attempts_allowed: 2,
+    attempts_counted: completed ? 1 : 0,
+    recommendation: null,
+    overall: null,
+    status_write: null,
+    pending_reject_until: null,
+    scores_withheld: false,
+    is_staff_dry_run: false,
+    created_at: ago((10 - n) * DAY),
+    attempts: completed
+      ? [{ session_id: uid('3', 950 + n), attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, session_status: 'completed', started_at: null, ended_at: ago((9 - n) * DAY), consent_withdrawn: false, recording: r1Recording({}) }]
+      : [],
+    ...over,
+  };
+}
+
+const R1_QUEUE: R1QueueRound[] = [
+  // Oldest first: the row the queue opens on, and the only round with a review behind it.
+  r1QueueRound(0, 'Naveen Kapoor', { id: R1_ROUND_ID, candidate_id: R1_CANDIDATE_ID, recommendation: 'hold', overall: 58, status_write: 'hold_flag', attempts_counted: 2 }),
+  r1QueueRound(1, 'Diego Ferreira', { recommendation: 'reject', overall: 31, status_write: 'pending_reject', pending_reject_until: iso(FROZEN_NOW_MS + 6 * HOUR) }),
+  r1QueueRound(2, 'Arjun Rao', { status_write: 'human_review' }),
+  r1QueueRound(3, 'Isha Kulkarni', { recommendation: 'advance', overall: 81, status_write: 'advanced' }),
+  r1QueueRound(4, 'Meera Iyer', { status: 'invited' }),
+  r1QueueRound(5, 'Wei Zhang', { status: 'in_progress', attempts: [{ session_id: uid('3', 960), attempt_number: 1, counted: false, outcome: null, in_progress: true, session_status: 'in_progress', started_at: ago(10 * 60_000), ended_at: null, consent_withdrawn: false, recording: r1Recording({ state: 'recording' }) }] }),
+  r1QueueRound(6, 'Tanvi Joshi', { scores_withheld: true, is_staff_dry_run: false }),
+  r1QueueRound(7, 'Omar Haddad', { recommendation: 'hold', overall: 49, status_write: 'hold_flag', is_staff_dry_run: true }),
+];
 
 /**
  * The R1 review (`GET /api/interview-rounds/:id/review`). The interview is invented and long enough to
@@ -1724,6 +1780,9 @@ export interface Dataset {
    */
   r1: {
     rounds: R1Round[];
+    queue: R1QueueRound[];
+    /** False: this server does not run R1 (`r1_deployed` on the queue's answer). */
+    deployed: boolean;
     mints: Record<string, Array<Partial<R1RecordingPlayback> | null>>;
     /** The review of `R1_ROUND_ID`. Change it to reach any state of the page. */
     review: R1ReviewResponse;
@@ -1752,7 +1811,7 @@ export function createDataset(): Dataset {
     quotas: QUOTAS,
     appointments: APPOINTMENTS,
     ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW },
-    r1: { rounds: R1_ROUNDS, mints: {}, review: R1_REVIEW },
+    r1: { rounds: R1_ROUNDS, queue: R1_QUEUE, deployed: true, mints: {}, review: R1_REVIEW },
   });
   return {
     ...d,

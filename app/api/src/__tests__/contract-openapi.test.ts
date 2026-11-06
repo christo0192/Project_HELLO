@@ -758,9 +758,12 @@ describe('OpenAPI document integrity', () => {
     // for a person who returns on the new company domain as a new login). 171 + 1 = 172.
     // The R1 review page adds ONE staff path: GET /api/interview-rounds/{id}/review (inline bodies,
     // no new schema). 172 + 1 = 173.
+    // The R1 queue adds ONE staff path: GET /api/interview-rounds (inline bodies, no new schema).
     // Notes tied to a moment add ONE staff path: GET /api/notes/rounds/{roundId} (NoteListResponse,
-    // no new schema). 173 + 1 = 174.
-    expect(Object.keys(paths).length).toBe(174);
+    // no new schema). 173 + 2 = 175.
+    // The queue's search adds ONE staff path: POST /api/interview-rounds/search (a name goes in no
+    // URL; inline bodies, no new schema). 175 + 1 = 176.
+    expect(Object.keys(paths).length).toBe(176);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

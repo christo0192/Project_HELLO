@@ -19,6 +19,7 @@
 import { activeTurnAt } from '../components/talent/sessionLegs';
 import { isEvidenceInsufficient } from './evidence-hold';
 import { RECOMMENDATION_LABELS } from './recommendation-labels';
+import { linkLapsed, r1StatusLabel } from './r1';
 import { r1RecordingStateCopy, turnMediaSec, viewState } from './r1-recording';
 import type { Note } from '../types';
 import type {
@@ -29,10 +30,30 @@ import type {
   R1ReviewResponse,
   R1ReviewRound,
   R1ReviewTurn,
+  R1RoundStatus,
   R1TurnPhase,
 } from './r1-types';
 
 /* ── The address ──────────────────────────────────────────────────── */
+
+/**
+ * Where an R1 session lives: its recording on the review page. `attempt=n` is the place of the session
+ * among its round's, in the order they started, which is the order the review lists its attempts. It is
+ * left out when `sessions` does not hold this one, and the page then chooses the attempt itself.
+ */
+export function r1SessionHref(
+  session: { id: string; interview_round_id?: string | null },
+  sessions: ReadonlyArray<{ id: string; interview_round_id?: string | null; created_at: string | null }>,
+): string {
+  const round = session.interview_round_id;
+  const startedAt = (item: { created_at: string | null }) => Date.parse(item.created_at ?? '') || 0;
+  const started = sessions
+    .filter((item) => item.interview_round_id === round)
+    .sort((a, b) => startedAt(a) - startedAt(b));
+  const place = started.findIndex((item) => item.id === session.id);
+  const attempt = place === -1 ? '' : `attempt=${place + 1}&`;
+  return `/interviews/${encodeURIComponent(String(round))}?${attempt}tab=recording`;
+}
 
 export const R1_REVIEW_TABS = ['overview', 'briefing', 'resume', 'recording'] as const;
 export type R1ReviewTab = (typeof R1_REVIEW_TABS)[number];
@@ -420,6 +441,15 @@ export function neededReveals(events: readonly R1ReviewEvent[], sessionId: strin
 
 export type R1ReviewStage = 'withheld' | 'scored' | 'not_scored' | 'scoring' | 'invited' | 'in_progress' | 'link_open' | 'closed';
 
+/** The scorecard of the attempt on screen, when a later attempt replaced it as the round's result. */
+export function replacedAssessmentOf(
+  review: Pick<R1ReviewResponse, 'assessment' | 'replaced_assessments'>,
+  attempt: Pick<R1ReviewAttempt, 'session_id'> | null,
+): R1ReviewAssessment | null {
+  if (!attempt || review.assessment?.session_id === attempt.session_id) return null;
+  return review.replaced_assessments?.find((item) => item.session_id === attempt.session_id) ?? null;
+}
+
 const notScored = (assessment: R1ReviewAssessment): boolean =>
   assessment.raw_recommendation === 'human_review' || assessment.recommendation === null;
 
@@ -435,7 +465,11 @@ export const R1_SCORE_WAIT_MS = 24 * 60 * 60 * 1000;
  * when the attempt counted (0126); and none is promised once consent is withdrawn, which stops the
  * scoring of the interview.
  */
-function scoreCanArrive(attempt: R1ReviewAttempt, roundCreatedAt: string, nowMs: number): boolean {
+export function scoreCanArrive(
+  attempt: Pick<R1ReviewAttempt, 'consent_withdrawn' | 'session_status' | 'counted' | 'started_at' | 'ended_at'>,
+  roundCreatedAt: string,
+  nowMs: number,
+): boolean {
   if (attempt.consent_withdrawn) return false;
   if (attempt.session_status !== 'completed' && !(attempt.session_status === 'failed' && attempt.counted)) return false;
   return nowMs - Date.parse(attempt.ended_at ?? attempt.started_at ?? roundCreatedAt) < R1_SCORE_WAIT_MS;
@@ -449,15 +483,50 @@ export function roundIsRunning(attempts: readonly Pick<R1ReviewAttempt, 'in_prog
   return attempts.some((attempt) => attempt.in_progress);
 }
 
+/**
+ * The status a round reads as. A link past its expiry is expired whatever is stored, though the
+ * interview that outlasted it runs on.
+ */
+export function shownRoundStatus(
+  round: Pick<R1ReviewRound, 'status'> & { expires_at: string | null },
+  attempts: readonly Pick<R1ReviewAttempt, 'in_progress'>[],
+  nowMs: number,
+): R1RoundStatus {
+  return !roundIsRunning(attempts) && linkLapsed(round, nowMs) ? 'expired' : round.status;
+}
+
+/**
+ * Where a round stands, in a word, on a queue row, on the candidate's R1 tab and on the review. An
+ * in_progress round with nobody in it is an open link.
+ */
+export function roundStatusWord(
+  round: Pick<R1ReviewRound, 'status'> & { expires_at: string | null },
+  attempts: readonly Pick<R1ReviewAttempt, 'in_progress'>[],
+  nowMs: number,
+): string {
+  const status = shownRoundStatus(round, attempts, nowMs);
+  return status === 'in_progress' && !roundIsRunning(attempts) ? 'Link open' : r1StatusLabel(status);
+}
+
+/**
+ * When a pending rejection lands, or null when none is pending. The date alone cannot say: the sweep
+ * that applies a rejection leaves `pending_reject_until` on the row (0122).
+ */
+export function rejectionPendingUntil(round: Pick<R1ReviewRound, 'status_write' | 'pending_reject_until'>): string | null {
+  return round.status_write === 'pending_reject' ? round.pending_reject_until : null;
+}
+
 export function reviewStage(review: Pick<R1ReviewResponse, 'round' | 'attempts' | 'assessment'>, nowMs: number): R1ReviewStage {
   const { round, attempts, assessment } = review;
   if (round.scores_withheld) return 'withheld';
   // The round is what carries a usable result: only a valid gated score reaches it (0122).
   if (assessment) return notScored(assessment) || !round.recommendation ? 'not_scored' : 'scored';
   if (attempts.some((attempt) => scoreCanArrive(attempt, round.created_at, nowMs))) return 'scoring';
+  const running = roundIsRunning(attempts);
   if (round.status === 'completed' || round.status === 'expired' || round.status === 'cancelled') return 'closed';
+  if (!running && linkLapsed(round, nowMs)) return 'closed';
   if (round.status !== 'in_progress') return 'invited';
-  return roundIsRunning(attempts) ? 'in_progress' : 'link_open';
+  return running ? 'in_progress' : 'link_open';
 }
 
 export function notScoredSentence(assessment: R1ReviewAssessment): string {

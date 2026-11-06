@@ -16,10 +16,15 @@ import {
   phoneResultWords,
   placeTurns,
   R1_SCORE_WAIT_MS,
+  r1SessionHref,
   recordingBands,
+  replacedAssessmentOf,
   reviewAttemptFrom,
   reviewDurationSec,
   reviewStage,
+  rejectionPendingUntil,
+  roundStatusWord,
+  shownRoundStatus,
   attemptParam,
   reviewTabFrom,
   rolePlayMarks,
@@ -362,6 +367,66 @@ describe('the needs a learner held back', () => {
   });
 });
 
+describe('rejectionPendingUntil', () => {
+  const until = '2026-10-08T10:00:00Z';
+
+  it('is the date while a rejection is pending', () => {
+    expect(rejectionPendingUntil({ status_write: 'pending_reject', pending_reject_until: until })).toBe(until);
+  });
+
+  it.each(['rejected', 'advanced', 'hold_flag', null])('is null at %s, whatever date the row kept', (write) => {
+    expect(rejectionPendingUntil({ status_write: write, pending_reject_until: until })).toBeNull();
+  });
+});
+
+describe('shownRoundStatus', () => {
+  const NOW_MS = Date.parse('2026-11-03T12:00:00Z');
+  const alive = '2026-11-06T00:00:00Z';
+  const lapsed = '2026-11-02T11:59:59Z';
+
+  it('is the stored status while the link is good, and for a round that is over', () => {
+    expect(shownRoundStatus({ status: 'invited', expires_at: alive }, [], NOW_MS)).toBe('invited');
+    expect(shownRoundStatus({ status: 'completed', expires_at: lapsed }, [], NOW_MS)).toBe('completed');
+    expect(shownRoundStatus({ status: 'cancelled', expires_at: lapsed }, [], NOW_MS)).toBe('cancelled');
+  });
+
+  it('is expired past the link, unless the interview that outlasted it runs on', () => {
+    expect(shownRoundStatus({ status: 'invited', expires_at: lapsed }, [], NOW_MS)).toBe('expired');
+    expect(shownRoundStatus({ status: 'in_progress', expires_at: lapsed }, [{ in_progress: false }], NOW_MS)).toBe('expired');
+    expect(shownRoundStatus({ status: 'in_progress', expires_at: lapsed }, [{ in_progress: true }], NOW_MS)).toBe('in_progress');
+  });
+});
+
+describe('roundStatusWord', () => {
+  const alive = '2026-11-06T00:00:00Z';
+  const lapsed = '2026-11-02T11:59:59Z';
+  const nobody = [{ in_progress: false }];
+  const someone = [{ in_progress: true }];
+
+  it('says a link is out while it lasts', () => {
+    expect(roundStatusWord({ status: 'invited', expires_at: alive }, [], NOW)).toBe('Link sent');
+  });
+
+  it('tells an interview running from a link nobody is on', () => {
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive }, someone, NOW)).toBe('In progress');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive }, nobody, NOW)).toBe('Link open');
+  });
+
+  it('says a lapsed link has expired, so nobody waits on it', () => {
+    expect(roundStatusWord({ status: 'invited', expires_at: lapsed }, [], NOW)).toBe('Expired');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: lapsed }, nobody, NOW)).toBe('Expired');
+  });
+
+  it('does not call an interview that outlasted its link expired', () => {
+    expect(roundStatusWord({ status: 'in_progress', expires_at: lapsed }, someone, NOW)).toBe('In progress');
+  });
+
+  it('takes a round that has ended at its word', () => {
+    expect(roundStatusWord({ status: 'completed', expires_at: lapsed }, nobody, NOW)).toBe('Completed');
+    expect(roundStatusWord({ status: 'cancelled', expires_at: lapsed }, someone, NOW)).toBe('Cancelled');
+  });
+});
+
 describe('where the round stands', () => {
   it('is withheld first: an appeal outranks everything', () => {
     expect(reviewStage(review({ round: { ...review().round, scores_withheld: true }, assessment: null }), NOW)).toBe('withheld');
@@ -420,6 +485,25 @@ describe('where the round stands', () => {
     const ended = attempt({ session_status: 'failed', counted: false, outcome: 'provider_error' });
     expect(reviewStage(review({ assessment: null, attempts: [ended], round }), NOW)).toBe('link_open');
     expect(reviewStage(review({ assessment: null, attempts: [ended, attempt({ session_id: 's2', session_status: 'in_progress', in_progress: true })], round }), NOW)).toBe('in_progress');
+  });
+
+  describe('once the link has lapsed', () => {
+    const lapsed = { expires_at: new Date(NOW - 1).toISOString() };
+
+    it('has ended, whatever the status still says: nobody can get in', () => {
+      const ended = attempt({ session_status: 'failed', counted: false, outcome: 'provider_error' });
+      expect(reviewStage(review({ assessment: null, attempts: [], round: { ...review().round, ...lapsed, status: 'invited' } }), NOW)).toBe('closed');
+      expect(reviewStage(review({ assessment: null, attempts: [ended], round: { ...review().round, ...lapsed, status: 'in_progress' } }), NOW)).toBe('closed');
+    });
+
+    it('still shows the interview that outlasted it', () => {
+      const running = attempt({ session_status: 'in_progress', in_progress: true });
+      expect(reviewStage(review({ assessment: null, attempts: [running], round: { ...review().round, ...lapsed, status: 'in_progress' } }), NOW)).toBe('in_progress');
+    });
+
+    it('keeps the result of a retake nobody took', () => {
+      expect(reviewStage(review({ round: { ...review().round, ...lapsed, status: 'invited' } }), NOW)).toBe('scored');
+    });
   });
 
   it('has ended unscored when the round closed with nothing to score', () => {
@@ -590,5 +674,34 @@ describe('a position that lands on a row', () => {
     expect(cuedRow(turns, 20)).toBe(1);
     expect(cuedRow(turns, 15)).toBe(0);
     expect(cuedRow(turns, 5)).toBeNull();
+  });
+});
+
+describe('r1SessionHref', () => {
+  const session = (id: string, created_at: string | null, interview_round_id: string | null = 'round-1') => ({ id, created_at, interview_round_id });
+
+  it('names the attempt by its place among the sessions of its round, oldest first', () => {
+    const sessions = [session('c', '2026-11-03T00:00:00Z'), session('p', '2026-11-02T00:00:00Z', null), session('other', '2026-11-02T00:00:00Z', 'round-2'), session('a', '2026-11-01T00:00:00Z')];
+    expect(r1SessionHref(sessions[0], sessions)).toBe('/interviews/round-1?attempt=2&tab=recording');
+    expect(r1SessionHref(sessions[3], sessions)).toBe('/interviews/round-1?attempt=1&tab=recording');
+  });
+
+  it('leaves the attempt to the page when the list does not hold the session', () => {
+    expect(r1SessionHref(session('a', null), [])).toBe('/interviews/round-1?tab=recording');
+  });
+});
+
+describe('replacedAssessmentOf', () => {
+  const scorecard = (session_id: string) => ({ session_id }) as R1ReviewAssessment;
+
+  it('finds the scorecard of the attempt on screen when a later one decided the round', () => {
+    expect(replacedAssessmentOf({ assessment: scorecard('s2'), replaced_assessments: [scorecard('s1')] }, { session_id: 's1' })?.session_id).toBe('s1');
+  });
+
+  it('has none for the deciding attempt, an attempt never scored, or an older API', () => {
+    expect(replacedAssessmentOf({ assessment: scorecard('s2'), replaced_assessments: [scorecard('s1')] }, { session_id: 's2' })).toBeNull();
+    expect(replacedAssessmentOf({ assessment: scorecard('s2'), replaced_assessments: [] }, { session_id: 's1' })).toBeNull();
+    expect(replacedAssessmentOf({ assessment: scorecard('s2') }, { session_id: 's1' })).toBeNull();
+    expect(replacedAssessmentOf({ assessment: null, replaced_assessments: [scorecard('s1')] }, null)).toBeNull();
   });
 });

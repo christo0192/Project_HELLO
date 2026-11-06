@@ -294,7 +294,7 @@ export function SeekableTranscript({
   }, [activeTurnIndex, reveal]);
 
   // Announce active turn change, and take it back when no turn is active: a row can light before its
-  // media exists (an R1 click), so a failed load must not leave "Now playing" behind.
+  // media exists (a press), so a failed load must not leave "Now playing" behind.
   useEffect(() => {
     if (announce && activeTurnIndex != null && transcript[activeTurnIndex]) {
       const turn = transcript[activeTurnIndex];

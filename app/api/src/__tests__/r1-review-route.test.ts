@@ -340,6 +340,62 @@ describe('what the answer carries', () => {
     expect(body.assessment.metric_results[0].evidence).toEqual([{ turn_index: 1, quote: 'Tell me about your goals' }]);
   });
 
+  describe('a retake that replaced the first result', () => {
+    const FIRST = '60000000-0000-4000-8000-000000000011';
+    const NEWEST_OF_FIRST = '60000000-0000-4000-8000-000000000012';
+
+    function retaken(): Tables {
+      const tables = tablesFor();
+      tables.interview_round_attempts.push({ ...tables.interview_round_attempts[0], session_id: SESSION_2, attempt_number: 2, created_at: '2026-11-03T10:00:00Z' });
+      tables.call_sessions.push({ ...tables.call_sessions[0], id: SESSION_2 });
+      // The round's assessment is now the retake's; the first attempt keeps two revisions of its own.
+      tables.assessments[0].session_id = SESSION_2;
+      tables.assessments.push(
+        { ...tables.assessments[0], id: FIRST, session_id: SESSION_1, revision: 1, overall_score: 40, recommendation: 'reject', created_at: '2026-11-02T10:40:00Z' },
+        { ...tables.assessments[0], id: NEWEST_OF_FIRST, session_id: SESSION_1, revision: 2, overall_score: 44, recommendation: 'reject', created_at: '2026-11-02T10:50:00Z' },
+      );
+      return tables;
+    }
+
+    it('still carries the scorecard of the attempt it replaced: its newest, once', async () => {
+      const { body } = await review(appFor('viewer', OTHER, retaken()));
+      expect(body.assessment.session_id).toBe(SESSION_2);
+      expect(body.replaced_assessments.map((item: Row) => [item.id, item.session_id, item.overall_score])).toEqual([[NEWEST_OF_FIRST, SESSION_1, 44]]);
+      expect(body.replaced_assessments[0].metric_results[0]).toMatchObject({ rationale: 'Probing & discovery rationale.' });
+    });
+
+    it('never repeats the deciding attempt there', async () => {
+      const { body } = await review(appFor('admin', OWNER, retaken()));
+      expect(body.replaced_assessments.some((item: Row) => item.session_id === SESSION_2)).toBe(false);
+    });
+
+    it('has none for a round with one attempt', async () => {
+      const { body } = await review(appFor('admin'));
+      expect(body.replaced_assessments).toEqual([]);
+    });
+
+    it('holds them back with the rest while an appeal blocks decision use', async () => {
+      const tables = retaken();
+      tables.candidates[0].decision_use_blocked_at = '2026-11-02T00:00:00Z';
+      const { body } = await review(appFor('admin', OWNER, tables));
+      expect(body.replaced_assessments).toEqual([]);
+    });
+
+    it('drops the words of an attempt consent was withdrawn from, as for the deciding one', async () => {
+      const tables = retaken();
+      tables.interview_round_consents = [{ id: 'c1', round_id: ROUND, withdrawn_at: '2026-11-02T12:00:00Z', proof: { decision: 'withdrawn' } }];
+      const { body } = await review(appFor('admin', OWNER, tables));
+      expect(body.replaced_assessments[0].metric_results[0]).toMatchObject({ rationale: null, evidence: [] });
+    });
+
+    it('answers 503 rather than a page that has lost a scorecard', async () => {
+      const app = appFor('admin', OWNER, retaken());
+      failingReads.add('assessments in:session_id');
+      const res = await request(app).get(`/api/interview-rounds/${ROUND}/review`);
+      expect(res.status).toBe(503);
+    });
+  });
+
   it('has no assessment before the round holds one', async () => {
     const tables = tablesFor();
     tables.interview_rounds[0].assessment_id = null;

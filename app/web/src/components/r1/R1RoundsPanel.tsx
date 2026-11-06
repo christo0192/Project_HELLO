@@ -3,9 +3,16 @@
  *
  * Shows what the list route returns today: status, when the link was sent,
  * its expiry while it can still be used, attempts used, and the result once
- * the scorer has written one. Until scoring ships (PR-5) the recommendation
- * and score are null, and the row says so in words instead of leaving a gap.
+ * the scorer has written one. Until then the row says so in words instead of
+ * leaving a gap, and only while a score can still arrive: past that it says not
+ * scored, as the queue does.
  * While an appeal blocks decision use the result reads as withheld instead.
+ * The result stays on the row through a retake, which re-opens the round.
+ * A score with no recommendation is not a result: only a valid gated score
+ * carries one (0122), so that figure never prints here.
+ *
+ * A status reads as it does on the queue and the review: a lapsed link is
+ * Expired whatever is stored, so nobody here waits on a dead link.
  *
  * Row actions (an admin, or the interviewer who created the round: the API's own
  * rule, so nobody is offered a button that can only answer 403):
@@ -16,9 +23,10 @@
  * at a time; focus moves to it, Escape closes it and returns focus to the
  * button that opened it, and a finished action hands focus to the card.
  *
- * Recordings: one row per attempt that has anything to say (a recording in any
+ * Recordings: one chip per attempt that has anything to say (a recording in any
  * state, or, once the round has completed, the fact that none was made), for
- * EVERY role. It has no write controls; the API decides who may play it.
+ * EVERY role. Nothing plays here: "Open R1 review" is where the recording is, so
+ * a page has only one player.
  *
  * Renders inside `.candidate-scope` (`--c-*` tokens only, no motion import).
  */
@@ -27,7 +35,6 @@ import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../../api';
 import { CandidateButton, Tag } from '../design/candidate';
-import { R1RecordingRow } from './R1RecordingRow';
 import type { IssuedLinkValue } from './SendR1Controls';
 import { formatDateTime } from '../../lib/datetime';
 import {
@@ -40,10 +47,10 @@ import {
   canGrantRetake,
   canReissue,
   r1ErrorMessage,
-  r1StatusLabel,
   r1StatusTone,
 } from '../../lib/r1';
-import { attemptLabels, showsRecordingRow } from '../../lib/r1-recording';
+import { attemptLabels, r1RecordingStateCopy, showsRecordingRow } from '../../lib/r1-recording';
+import { roundStatusWord, scoreCanArrive, shownRoundStatus } from '../../lib/r1-review';
 import type { R1Round } from '../../lib/r1-types';
 import type { MeResponse } from '../../types';
 
@@ -100,11 +107,6 @@ export interface R1RoundsPanelProps {
   /** An action finished: put focus somewhere that still exists. */
   onSettled: () => void;
   /**
-   * False pauses every recording (the tab this panel is on is hidden but stays mounted).
-   * Default true.
-   */
-  active?: boolean;
-  /**
    * An appeal blocks decision use. The API nulls the scores, which must not read as "no results yet":
    * every round that would show a result says it is withheld, and no score prints even if one arrives.
    * This is what the page knew when it loaded; a round's own `scores_withheld` covers an appeal opened
@@ -121,7 +123,6 @@ export function R1RoundsPanel({
   onChanged,
   onMessage,
   onSettled,
-  active: recordingsActive = true,
   decisionBlocked = false,
 }: R1RoundsPanelProps) {
   const uid = useId().replace(/:/g, '');
@@ -205,28 +206,48 @@ export function R1RoundsPanel({
     }
   }
 
+  const nowMs = Date.now();
+
   return (
     <ul aria-label="R1 rounds" className="divide-y divide-line">
       {rounds.map((round) => {
         const live = round.status === 'invited' || round.status === 'in_progress';
-        const scored = round.recommendation !== null || round.overall !== null;
-        const withheld = decisionBlocked || round.scores_withheld === true;
-        const showsResult = round.status === 'completed' || round.status === 'in_progress';
-        const active = pending?.roundId === round.id ? pending : null;
-        const headingId = `r1-round-${uid}-${round.id}`;
-        // One recording row per attempt, in attempt order (the API sends them that way). An older
+        // One recording chip per attempt, in attempt order (the API sends them that way). An older
         // API sends no `attempts`, and then there is simply nothing to add here.
         const attempts = Array.isArray(round.attempts) ? round.attempts : [];
+        const status = shownRoundStatus(round, attempts, nowMs);
+        // A list with no attempts could not read them, which says nothing about a score either way.
+        const scoreGone =
+          round.status === 'completed' &&
+          Array.isArray(round.attempts) &&
+          !attempts.some((attempt) => scoreCanArrive(attempt, round.created_at, nowMs));
+        const notScored =
+          round.recommendation === null &&
+          (round.status_write === 'human_review' || round.overall !== null || scoreGone);
+        const withheld = decisionBlocked || round.scores_withheld === true;
+        const showsResult =
+          round.recommendation !== null ||
+          notScored ||
+          status === 'completed' ||
+          status === 'in_progress';
+        const active = pending?.roundId === round.id ? pending : null;
+        const headingId = `r1-round-${uid}-${round.id}`;
         const labels = attemptLabels(attempts);
+        const recordings = attempts.flatMap((attempt, index) =>
+          showsRecordingRow(attempt?.recording, round.status === 'completed')
+            ? [{ id: attempt.session_id, label: labels[index], copy: r1RecordingStateCopy(attempt.recording) }]
+            : [],
+        );
         return (
           <li key={round.id} className="py-3 text-sm">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span id={headingId} className="font-medium text-ink">
                 Sent {formatDateTime(round.created_at)}
               </span>
-              <Tag tone={r1StatusTone(round.status)} srPrefix="Status:">
-                {r1StatusLabel(round.status)}
+              <Tag tone={r1StatusTone(status)} srPrefix="Status:">
+                {roundStatusWord(round, attempts, nowMs)}
               </Tag>
+              {round.is_staff_dry_run === true && <Tag>Staff dry run</Tag>}
               <span className="text-label text-ink-secondary">{attemptsLabel(round)}</span>
               <Link
                 to={`/interviews/${round.id}`}
@@ -236,7 +257,7 @@ export function R1RoundsPanel({
               </Link>
             </div>
 
-            {round.status === 'invited' && (
+            {status === 'invited' && (
               <p className="mt-1 text-label text-ink-secondary">
                 Link valid until {formatDateTime(round.expires_at)}
               </p>
@@ -246,14 +267,11 @@ export function R1RoundsPanel({
               <p className="mt-1 text-label text-ink-secondary">
                 {withheld ? (
                   R1_RESULT_WITHHELD
-                ) : scored ? (
-                  <>
-                    {round.recommendation
-                      ? `Recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}`
-                      : null}
-                    {round.recommendation && round.overall !== null ? ' · ' : null}
-                    {round.overall !== null ? `Overall ${round.overall} of 100` : null}
-                  </>
+                ) : round.recommendation !== null ? (
+                  `AI recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}` +
+                  (round.overall !== null ? ` · Overall ${Math.round(round.overall)} of 100` : '')
+                ) : notScored ? (
+                  'AI result: not scored. Open the R1 review for the reason.'
                 ) : (
                   'No results yet. The scorecard and recommendation will appear here once R1 ' +
                   'scoring is live.'
@@ -261,17 +279,16 @@ export function R1RoundsPanel({
               </p>
             )}
 
-            {attempts.map((attempt, index) =>
-              showsRecordingRow(attempt?.recording, round.status === 'completed') ? (
-                <R1RecordingRow
-                  key={attempt.session_id}
-                  roundId={round.id}
-                  attempt={attempt}
-                  label={labels[index]}
-                  active={recordingsActive}
-                  onNeedRefresh={onChanged}
-                />
-              ) : null,
+            {recordings.length > 0 && (
+              <ul aria-label="Recordings" className="mt-2 flex flex-wrap gap-2">
+                {recordings.map(({ id, label, copy }) => (
+                  <li key={id}>
+                    <Tag tone={copy.tone} srPrefix="Recording:">
+                      {label}: {copy.tag}
+                    </Tag>
+                  </li>
+                ))}
+              </ul>
             )}
 
             {canActOnRound(round, role, userId) && (live || canGrantRetake(round)) && (

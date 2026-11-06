@@ -137,6 +137,17 @@ export function AshbyScopedReviewPage() {
         eyebrow="Candidate review"
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
+        // R1 is not in this workspace, and this shell has no R1 tab and links nowhere, so it says where
+        // the interview is. Here and not above the workspace: the workspace is measured to fill the window
+        // and has 5px over its height floor at 1366x768, while beside the taller score card this line
+        // adds no height. `-mt-2` closes the slot's gap so it sits under the email as one block.
+        meta={
+          sessions.some((session) => session.interview_round_id != null) ? (
+            <p className="-mt-2 text-sm text-[var(--c-ink-secondary)]">
+              The R1 interview for this candidate is on the candidate page, under R1 interview.
+            </p>
+          ) : undefined
+        }
         // Ashby's Detailed report link lands here, so the verdict is on the first
         // screen, in the same words as the card. Hidden while decision use is
         // blocked, as on the main page.

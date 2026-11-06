@@ -7,7 +7,7 @@
  * lifecycle, and axe compliance.
  */
 import { render, screen, fireEvent, act } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SessionDetailPage } from './SessionDetailPage';
 import { mockAssessment, mockTranscript } from '../test/helpers';
@@ -496,26 +496,51 @@ describe('SessionDetailPage', () => {
       session: { ...completedSessionDetail.session, mode: 'browser', interview_round_id: 'round-1' },
     };
 
-    it('points to the candidate page instead of the legacy recording card, which has no file for it', async () => {
+    function Landed() {
+      const { pathname, search } = useLocation();
+      return <p data-testid="landed">{`${pathname}${search}`}</p>;
+    }
+
+    function renderRedirecting() {
+      return render(
+        <MemoryRouter initialEntries={[`/sessions/${r1Detail.session.id}`]}>
+          <Routes>
+            <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
+            <Route path="/interviews/:roundId" element={<Landed />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+    }
+
+    const earlier = { id: 'session-0', interview_round_id: 'round-1', created_at: '2026-08-01T00:00:00.000Z' };
+    const phone = { id: 'session-phone', interview_round_id: null, created_at: '2026-07-01T00:00:00.000Z' };
+
+    it('redirects to the recording of that attempt on the review page, by its place among the sessions of the round', async () => {
       getSession.mockResolvedValue(r1Detail);
-      renderPage();
-      await screen.findByText('Recording');
-      await act(async () => {});
-      expect(screen.queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: /refresh link/i })).not.toBeInTheDocument();
-      expect(
-        screen.getByText(/R1 interview recordings are on the candidate page, under R1 interview\./),
-      ).toBeInTheDocument();
-      const link = screen.getByRole('link', { name: 'Open the candidate page' });
-      expect(link).toHaveAttribute('href', '/candidates/candidate-1');
+      getCandidate.mockResolvedValue({
+        candidate: { id: 'candidate-1' },
+        // Newest first, as the API lists them; this session is the second of the round.
+        sessions: [{ id: r1Detail.session.id, interview_round_id: 'round-1', created_at: '2026-08-02T00:00:00.000Z' }, earlier, phone],
+      });
+      renderRedirecting();
+      expect(await screen.findByTestId('landed')).toHaveTextContent('/interviews/round-1?attempt=2&tab=recording');
       expect(getRecordingDownloadUrl).not.toHaveBeenCalled();
     });
 
-    it('says the same for an R1 session that has not completed (no "available once it completes")', async () => {
-      getSession.mockResolvedValue({ ...r1Detail, session: { ...r1Detail.session, status: 'in_progress' } });
-      renderPage();
-      expect(await screen.findByRole('link', { name: 'Open the candidate page' })).toBeInTheDocument();
-      expect(screen.queryByText(/Recording access is available once the session completes/i)).not.toBeInTheDocument();
+    it('still redirects, to the round, when the candidate cannot be read', async () => {
+      getSession.mockResolvedValue(r1Detail);
+      getCandidate.mockRejectedValue(new Error('down'));
+      renderRedirecting();
+      expect(await screen.findByTestId('landed')).toHaveTextContent('/interviews/round-1?tab=recording');
+    });
+
+    it('draws nothing of the session page on the way', async () => {
+      getSession.mockResolvedValue(r1Detail);
+      getCandidate.mockResolvedValue({ candidate: { id: 'candidate-1' }, sessions: [] });
+      renderRedirecting();
+      await screen.findByTestId('landed');
+      expect(screen.queryByRole('heading', { level: 1 })).toBeNull();
+      expect(screen.queryByText('Scorecard')).toBeNull();
     });
 
     it('a phone or simulation session keeps its recording card', async () => {
@@ -528,12 +553,6 @@ describe('SessionDetailPage', () => {
       expect(screen.queryByRole('link', { name: 'Open the candidate page' })).not.toBeInTheDocument();
     });
 
-    it('has no axe violations', async () => {
-      getSession.mockResolvedValue(r1Detail);
-      const { container } = renderPage();
-      await screen.findByRole('link', { name: 'Open the candidate page' });
-      await expect(container).toHaveNoViolations();
-    });
   });
 
   it('does not offer recording access before completion', async () => {

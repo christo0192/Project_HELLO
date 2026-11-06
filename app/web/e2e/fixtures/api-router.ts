@@ -63,6 +63,30 @@ const ok = (json: unknown): MockResponse => ({ status: 200, json });
 const created = (json: unknown): MockResponse => ({ status: 201, json });
 const notFound = (what: string): MockResponse => ({ status: 404, json: { error: `not_found: ${what}` } });
 
+/** The queue, by the API's own rules (lib/r1/queue.ts): the views, the hidden dry runs, one page. */
+function r1QueuePage(query: URLSearchParams, search: string, db: Dataset): MockResponse {
+  const view = query.get('view') ?? 'to-review';
+  const sort = query.get('sort') ?? (view === 'to-review' ? 'oldest' : 'newest');
+  const size = Number(query.get('page_size') ?? 25);
+  const settled = (write: string | null) => write === 'advanced' || write === 'rejected' || write === 'pending_reject_cancelled';
+  const inView = (round: Dataset['r1']['queue'][number]) => {
+    const open = round.status === 'invited' || round.status === 'in_progress';
+    const lapsed = open && Date.parse(round.expires_at ?? '') <= FROZEN_NOW_MS;
+    if (view === 'in-progress') return open && !lapsed;
+    if (view === 'all') return true;
+    const finished = round.status === 'completed' || ((round.status === 'expired' || round.status === 'cancelled' || lapsed) && round.attempts_counted > 0);
+    if (round.scores_withheld || !finished) return false;
+    return view === 'reviewed' ? settled(round.status_write) : !settled(round.status_write);
+  };
+  const rows = db.r1.queue
+    .filter((round) => query.get('dry_runs') === 'include' || !round.is_staff_dry_run)
+    .filter((round) => (round.candidate_name ?? '').toLowerCase().includes(search))
+    .filter(inView)
+    .sort((a, b) => a.created_at.localeCompare(b.created_at) * (sort === 'oldest' ? 1 : -1));
+  const page = Math.min(Number(query.get('page') ?? 1), Math.max(1, Math.ceil(rows.length / size)));
+  return ok({ view, sort, page, page_size: size, total: rows.length, rounds: rows.slice((page - 1) * size, page * size), r1_deployed: db.r1.deployed });
+}
+
 const nowIso = () => new Date(FROZEN_NOW_MS).toISOString();
 let seq = 1;
 /** Ids minted by write handlers; distinct from every seeded id prefix. */
@@ -434,6 +458,9 @@ const ROUTES: Array<[string, string, Handler]> = [
 
   // ── R1 (WebRTC sales role-play) ────────────────────────────────────
   ['GET', '/api/interview-rounds/availability', () => ok({ state: 'disabled', hold_minutes: 55 })],
+  // A name goes in no URL, so a `q` is refused here as the API refuses it, and a search is a POST's body.
+  ['GET', '/api/interview-rounds', ({ query }, db) => (query.has('q') ? { status: 400, json: { error: 'invalid_query' } } : r1QueuePage(query, '', db))],
+  ['POST', '/api/interview-rounds/search', ({ query, body }, db) => r1QueuePage(query, String(body?.q ?? '').toLowerCase(), db)],
   // Only the R1 candidate has rounds (R1-REC); everyone else's list is empty, as before.
   ['GET', '/api/candidates/:id/interview-rounds', ({ params }, db) => ok({ rounds: params.id === R1_CANDIDATE_ID ? db.r1.rounds : [] })],
   // The recording mint (R1-REC): always 200 with a `state` for the expected conditions; a link only

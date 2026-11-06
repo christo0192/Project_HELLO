@@ -17,6 +17,7 @@
 
 import type { R1DbClient } from '../../../services/r1-assessment.js';
 import { createLogger } from '../../logger.js';
+import { withdrawalCutoffs } from './erase.js';
 import { RECORDINGS_TABLE, type R1RecordingRow } from './service.js';
 
 const logger = createLogger('r1-recording');
@@ -46,6 +47,21 @@ export interface R1AttemptSummary {
   outcome: string | null;
   recording: R1RecordingSummary;
 }
+
+/** An attempt on a list of rounds, with what its session says: enough to read the round's status and whether a score can come. */
+export interface R1ListedAttempt extends R1AttemptSummary {
+  in_progress: boolean;
+  session_status: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  consent_withdrawn: boolean;
+}
+
+/** The session states of an interview that has not ended (0115). */
+export const LIVE_SESSION_STATES: ReadonlySet<unknown> = new Set(['created', 'waiting', 'in_progress']);
+
+/** What {@link listedAttempt} needs of an attempt's session. */
+export const ATTEMPT_SESSION_COLUMNS = 'id,interview_round_id,status,started_at,ended_at';
 
 /** A recording still being written counts as `recording` while its row moved within this window. */
 export const LIVE_RECORDING_WINDOW_MS = 10 * 60 * 1000;
@@ -197,10 +213,63 @@ export function summarizeRecording(row: SummaryRow | null, nowMs: number): R1Rec
 }
 
 /**
- * Add `attempts[]` (ordered by attempt number, each with its recording summary) to every round of
- * the rounds list: one query on `interview_round_attempts`, one on the recordings, no N+1.
+ * What consent withdrawal leaves of a summary. It reads as the summary of a recording being erased
+ * does (`recordingState`): deleted, with no anchor and nothing to play. No recording stays no
+ * recording, because nothing was deleted.
+ */
+export function withdrawnSummary(summary: R1RecordingSummary): R1RecordingSummary {
+  if (summary.state === 'none') return summary;
+  return {
+    state: 'deleted',
+    reason: 'consent_withdrawn',
+    mode: null,
+    has_video: null,
+    started_at_ms: null,
+    duration_ms: null,
+    camera_off_ms: null,
+    degraded_at_ms: null,
+    retention_until: null,
+    deleted_at: summary.deleted_at,
+  };
+}
+
+const text = (value: unknown): string | null => (typeof value === 'string' && value !== '' ? value : null);
+
+/**
+ * One attempt as a list of rounds shows it, the queue's and the candidate's alike, so the two can only
+ * say the same thing. `cutoff` is the round's latest withdrawal (`withdrawalCutoffs`).
+ */
+export function listedAttempt(
+  row: Record<string, unknown>,
+  session: Record<string, unknown> | undefined,
+  recording: SummaryRow | null,
+  cutoff: number | undefined,
+  nowMs: number,
+): R1ListedAttempt {
+  const at = Date.parse(String(row.created_at));
+  // The review page's rule: a time that cannot be read is treated as covered.
+  const withdrawn = cutoff !== undefined && (!Number.isFinite(at) || at <= cutoff);
+  const summary = summarizeRecording(recording, nowMs);
+  return {
+    session_id: String(row.session_id),
+    attempt_number: Number(row.attempt_number),
+    counted: row.counted === true,
+    outcome: text(row.outcome),
+    in_progress: LIVE_SESSION_STATES.has(session?.status),
+    session_status: text(session?.status),
+    started_at: text(session?.started_at),
+    ended_at: text(session?.ended_at),
+    consent_withdrawn: withdrawn,
+    recording: withdrawn ? withdrawnSummary(summary) : summary,
+  };
+}
+
+/**
+ * Add `attempts[]` (ordered by attempt number, each with its session's facts and recording summary) to
+ * every round of the rounds list: one query each on `interview_round_attempts`, the recordings, the
+ * sessions and the withdrawals, no N+1. This is one candidate's rounds, so it needs no paging.
  *
- * NEVER throws and never breaks the list: if either read fails the rounds come back unchanged
+ * NEVER throws and never breaks the list: if any read fails the rounds come back unchanged
  * (without `attempts`, which the web treats as optional) and one fixed log category is written. A
  * partial result would show attempts with a false "no recording" state.
  */
@@ -208,34 +277,35 @@ export async function withRecordingAttempts<T extends { id?: unknown }>(
   db: R1DbClient,
   rounds: readonly T[],
   nowMs: number = Date.now(),
-): Promise<Array<T | (T & { attempts: R1AttemptSummary[] })>> {
+): Promise<Array<T | (T & { attempts: R1ListedAttempt[] })>> {
   const roundIds = rounds.map((round) => round.id).filter((id): id is string => typeof id === 'string');
   if (roundIds.length === 0) return [...rounds];
   try {
-    const attemptsResult = await db
-      .from('interview_round_attempts')
-      .select('session_id,round_id,attempt_number,counted,outcome')
-      .in('round_id', roundIds)
-      .order('attempt_number', { ascending: true })
-      // A restart shares its number (0119), and the page labels starts by this order.
-      .order('created_at', { ascending: true });
-    const recordingsResult = await db.from(RECORDINGS_TABLE).select(SUMMARY_COLUMNS).in('round_id', roundIds);
-    if (attemptsResult.error || recordingsResult.error) throw new Error('r1_attempts_read_error');
+    const [attemptsResult, recordingsResult, sessionsResult, cutoffs] = await Promise.all([
+      db
+        .from('interview_round_attempts')
+        .select('session_id,round_id,attempt_number,counted,outcome,created_at')
+        .in('round_id', roundIds)
+        .order('attempt_number', { ascending: true })
+        // A restart shares its number (0119), and the page labels starts by this order.
+        .order('created_at', { ascending: true }),
+      db.from(RECORDINGS_TABLE).select(SUMMARY_COLUMNS).in('round_id', roundIds),
+      db.from('call_sessions').select(ATTEMPT_SESSION_COLUMNS).in('interview_round_id', roundIds),
+      withdrawalCutoffs(db, roundIds),
+    ]);
+    if (attemptsResult.error || recordingsResult.error || sessionsResult.error) throw new Error('r1_attempts_read_error');
 
     const bySession = new Map<string, SummaryRow>();
     for (const row of (Array.isArray(recordingsResult.data) ? recordingsResult.data : []) as SummaryRow[]) bySession.set(row.session_id, row);
-    const byRound = new Map<string, R1AttemptSummary[]>();
+    const sessions = new Map<string, Record<string, unknown>>();
+    for (const row of (Array.isArray(sessionsResult.data) ? sessionsResult.data : []) as Array<Record<string, unknown>>) sessions.set(String(row.id), row);
+    const byRound = new Map<string, R1ListedAttempt[]>();
     for (const attempt of (Array.isArray(attemptsResult.data) ? attemptsResult.data : []) as Array<Record<string, unknown>>) {
       const sessionId = String(attempt.session_id);
-      const list = byRound.get(String(attempt.round_id)) ?? [];
-      list.push({
-        session_id: sessionId,
-        attempt_number: Number(attempt.attempt_number),
-        counted: attempt.counted === true,
-        outcome: typeof attempt.outcome === 'string' ? attempt.outcome : null,
-        recording: summarizeRecording(bySession.get(sessionId) ?? null, nowMs),
-      });
-      byRound.set(String(attempt.round_id), list);
+      const roundId = String(attempt.round_id);
+      const list = byRound.get(roundId) ?? [];
+      list.push(listedAttempt(attempt, sessions.get(sessionId), bySession.get(sessionId) ?? null, cutoffs.get(roundId), nowMs));
+      byRound.set(roundId, list);
     }
     return rounds.map((round) => ({
       ...round,
