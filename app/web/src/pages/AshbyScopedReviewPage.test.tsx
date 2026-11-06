@@ -216,9 +216,11 @@ describe('scoped review shell', () => {
     renderPage();
     await screen.findByText('Jane Doe');
     fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
-    expect(
-      await screen.findByText('The R1 interview for this candidate is on the candidate page, under R1 interview.'),
-    ).toBeInTheDocument();
+    const pointer = await screen.findByText('The R1 interview for this candidate is on the candidate page, under R1 interview.');
+    expect(pointer).toBeInTheDocument();
+    // In the header: in a panel it would stand above a workspace that has no height to give it, as
+    // review.e2e.ts measures.
+    expect(pointer.closest('[role="tabpanel"]')).toBeNull();
     expect(mockApi.getSession).not.toHaveBeenCalled();
   });
 

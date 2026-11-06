@@ -8,7 +8,7 @@
  */
 
 import type { Locator, Page } from '@playwright/test';
-import { SCOPED_REVIEW_LINK_ID, SEEK_CANDIDATE_ID, STAR_CANDIDATE_ID } from './fixtures/data';
+import { R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_CANDIDATE_ID, STAR_CANDIDATE_ID } from './fixtures/data';
 import { expect, test, type AppHarness } from './fixtures/harness';
 
 /** The star candidate has one completed session, so Review opens on it with nothing to pick. */
@@ -190,6 +190,29 @@ test.describe('Review, the Ashby deep link', () => {
     expect(box.x + box.width).toBeLessThanOrEqual(sheetBox.right);
     expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
   });
+
+  // The workspace has about 5px to spare over its height floor at 1366x768, so the sentence that says
+  // where the R1 interview is cannot stand above it.
+  for (const viewport of [{ width: 1366, height: 768 }, { width: 1180, height: 800 }]) {
+    test(`at ${viewport.width}x${viewport.height} a candidate with an R1 session keeps the page still too`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      const read = app.db.candidateDetail;
+      app.db.candidateDetail = (id) => {
+        const detail = read(id);
+        if (detail && id === STAR_CANDIDATE_ID) {
+          detail.sessions = [...detail.sessions, { ...detail.sessions[0], id: '44444444-4444-4444-8444-444444444444', interview_round_id: R1_ROUND_ID }];
+        }
+        return detail;
+      };
+      await app.goto(`/ashby/review/${SCOPED_REVIEW_LINK_ID}`);
+      await app.settle();
+      await page.getByRole('tab', { name: 'Review' }).click();
+      const panel = page.getByRole('tabpanel', { name: 'Review' });
+      await expect(panel.locator('[data-review-workspace]')).toBeVisible();
+      await expect(page.getByText('The R1 interview for this candidate is on the candidate page, under R1 interview.')).toBeVisible();
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+  }
 });
 
 test.describe('Review, the cue', () => {
