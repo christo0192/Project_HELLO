@@ -99,7 +99,7 @@ describe('the views', () => {
     SETTLED.forEach((write, i) => addRound(20 + i, { status_write: write }));
     addRound(30, { status: 'invited', status_write: null });
     addRound(31, { status: 'in_progress', status_write: null });
-    addRound(32, { status: 'cancelled', status_write: 'round_not_final' });
+    addRound(32, { status: 'cancelled', status_write: null, attempts_counted: 0, recommendation: null, overall: null });
     const res = await list();
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ view: 'to-review', sort: 'oldest', page: 1, total: OPEN.length });
@@ -113,6 +113,17 @@ describe('the views', () => {
     expect(rowIds((await list('?view=to-review')).body)).toEqual([roundId(0)]);
     expect(rowIds((await list('?view=reviewed')).body)).toEqual([roundId(2)]);
     expect((await list('?view=all')).body.total).toBe(3);
+  });
+
+  it('keeps a scored round in the queue when its retake was cancelled, and leaves out a link cancelled with nothing counted', async () => {
+    addRound(0, { status: 'cancelled', status_write: 'hold_flag' });
+    addRound(1, { status: 'cancelled', status_write: 'pending_reject_dropped', recommendation: 'reject', overall: 31 });
+    addRound(2, { status: 'cancelled', status_write: 'advanced', recommendation: 'advance', overall: 81 });
+    addRound(3, { status: 'cancelled', status_write: null, attempts_counted: 0, recommendation: null, overall: null });
+    expect(rowIds((await list('?view=to-review')).body)).toEqual([roundId(0), roundId(1)]);
+    expect(rowIds((await list('?view=reviewed')).body)).toEqual([roundId(2)]);
+    expect((await list('?view=in-progress')).body.total).toBe(0);
+    expect((await list('?view=all')).body.total).toBe(4);
   });
 
   describe('a link that has lapsed, whatever the status still says', () => {
@@ -448,6 +459,38 @@ describe('GET /api/candidates/:id/interview-rounds', () => {
     addRound(0, { consent_locale: 'en-IN-x-staff' }, { decision_use_blocked_at: '2026-11-03T00:00:00Z' });
     expect((await rounds(0))[0]).toMatchObject({ recommendation: null, scores_withheld: true, is_staff_dry_run: true });
   });
+
+  it('gives each attempt exactly what the queue gives it, so the two screens read a round alike', async () => {
+    addRound(0);
+    addAttempt(0, 0, {}, { started_at: sentAt(0) });
+    addAttempt(0, 1, { counted: false, outcome: null }, { status: 'in_progress', ended_at: null }, null);
+    const queued = (await list('?view=all')).body.rounds[0];
+    const [round] = await rounds(0);
+    expect(round.attempts).toEqual(queued.attempts);
+    expect(round.attempts).toMatchObject([
+      { session_status: 'completed', started_at: sentAt(0), ended_at: sentAt(1), in_progress: false, consent_withdrawn: false },
+      { session_status: 'in_progress', ended_at: null, in_progress: true },
+    ]);
+  });
+
+  it('reads a recording as deleted once consent is withdrawn, as the queue does', async () => {
+    addRound(0);
+    addAttempt(0);
+    engine.tables.interview_round_consents = [{ round_id: roundId(0), withdrawn_at: sentAt(5), proof: { decision: 'withdrawn' } }];
+    expect((await rounds(0))[0].attempts).toMatchObject([{ consent_withdrawn: true, recording: { state: 'deleted', reason: 'consent_withdrawn' } }]);
+  });
+
+  it.each(['interview_round_attempts', 'interview_round_recordings', 'call_sessions', 'interview_round_consents'])(
+    'answers without attempts, never with half of them, when %s fails',
+    async (table) => {
+      addRound(0);
+      addAttempt(0);
+      engine.failWhen = (q) => q.table === table;
+      const [round] = await rounds(0);
+      expect(round).toMatchObject({ id: roundId(0) });
+      expect(round).not.toHaveProperty('attempts');
+    },
+  );
 });
 
 describe('a read that fails', () => {

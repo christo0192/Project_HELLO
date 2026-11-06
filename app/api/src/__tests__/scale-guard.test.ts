@@ -994,7 +994,7 @@ const BOUNDED_LISTS: ReadonlyArray<{ file: string; values: string; sites: number
   { file: 'lib/attempt-consent-stage.ts', values: 'ids', sites: 2, why: "one candidate's call legs, and past the limit the read fails closed to unknown" },
   { file: 'lib/dsar.ts', values: 'sessionIds', sites: 1, why: "one data subject's sessions" },
   { file: 'lib/phone-runtime/read.ts', values: 'ids', sites: 1, why: 'one due pass, at most PHONE_RUNTIME_MAX_ROWS (200) candidates' },
-  { file: 'lib/r1/recording/summary.ts', values: 'roundIds', sites: 2, why: "one candidate's R1 rounds" },
+  { file: 'lib/r1/recording/summary.ts', values: 'roundIds', sites: 3, why: "one candidate's R1 rounds" },
   { file: 'lib/r1/review.ts', values: 'otherSessions', sites: 1, why: "one round's attempts: a few starts, less the deciding one" },
   { file: 'lib/r1/review.ts', values: 'phoneSessionIds', sites: 1, why: "one candidate's phone sessions" },
   { file: 'lib/r1/review.ts', values: 'sessionIds', sites: 1, why: "one round's attempts: a few starts, so the log uses its session index" },

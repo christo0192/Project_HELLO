@@ -11,13 +11,16 @@
  *
  *   in-progress  status is invited or in_progress and the link has not lapsed. A retake re-opens a round,
  *                so one can carry an older result here.
- *   reviewed     completed or expired, and status_write is advanced, rejected (the candidate's status was
+ *   reviewed     a finished round whose status_write is advanced, rejected (the candidate's status was
  *                written) or pending_reject_cancelled (HR overrode the rejection).
- *   to-review    every other finished round: completed with any other status_write or none yet (scoring
- *                has not finished), or expired with a counted attempt, which is a round whose retake
- *                lapsed. An expired round with nothing counted never produced a result: its link lapsed
- *                with nobody getting through an interview.
- *   all          every round, cancelled ones and links that lapsed with nothing counted included.
+ *   to-review    every other finished round, with any other status_write or none yet (scoring has not
+ *                finished).
+ *   all          every round, including one that ended with nothing counted.
+ *
+ * FINISHED means completed, or expired or cancelled with a counted attempt. A retake re-opens a round and
+ * keeps its result, so that is one whose retake lapsed or was cancelled: the interview stands. Expired or
+ * cancelled with nothing counted never produced a result: nobody got through an interview, and there is
+ * nothing to review.
  *
  * EXPIRED is what the candidate routes read (`effectiveRoundStatus`): the status, or an invited or
  * in_progress round past `expires_at`. The stored status cannot be left to say it. Only
@@ -56,8 +59,8 @@ import type { R1DbClient } from '../../services/r1-assessment.js';
 import { type R1StaffActor, seesEveryCandidate } from './recording/access.js';
 import { withdrawalCutoffs } from './recording/erase.js';
 import { RECORDINGS_TABLE, type R1RecordingRow } from './recording/service.js';
-import { SUMMARY_COLUMNS, summarizeRecording, type R1AttemptSummary } from './recording/summary.js';
-import { LIVE_SESSION_STATES, STAFF_LOCALE, withdrawnSummary } from './review.js';
+import { ATTEMPT_SESSION_COLUMNS, SUMMARY_COLUMNS, listedAttempt, type R1ListedAttempt } from './recording/summary.js';
+import { STAFF_LOCALE } from './review.js';
 
 export const R1_QUEUE_VIEWS = ['to-review', 'in-progress', 'reviewed', 'all'] as const;
 export type R1QueueView = (typeof R1_QUEUE_VIEWS)[number];
@@ -87,15 +90,20 @@ const UNSETTLED = `or(status_write.is.null,status_write.not.in.(${SETTLED_LIST})
 const expiredBranches = (nowIso: string): string =>
   `status.eq.expired,and(status.in.(${OPEN_LIST}),expires_at.lte.${nowIso})`;
 
+/** A round that ended short of completing, which is finished only with a counted attempt behind it. */
+const endedShort = (nowIso: string): string => `or(status.eq.cancelled,${expiredBranches(nowIso)})`;
+
 const toReviewFilter = (nowIso: string): string =>
-  `and(status.eq.completed,${UNSETTLED}),and(attempts_counted.gt.0,${UNSETTLED},or(${expiredBranches(nowIso)}))`;
+  `and(status.eq.completed,${UNSETTLED}),and(attempts_counted.gt.0,${UNSETTLED},${endedShort(nowIso)})`;
+
+const reviewedFilter = (nowIso: string): string =>
+  `status.eq.completed,and(attempts_counted.gt.0,${endedShort(nowIso)})`;
 
 const ROUND_COLUMNS =
   'id,candidate_id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,'
   + 'pending_reject_until,consent_locale,created_at';
 const CANDIDATE_EMBED = 'candidates!inner(name,decision_use_blocked_at)';
 const ATTEMPT_COLUMNS = 'session_id,round_id,attempt_number,counted,outcome,created_at';
-const SESSION_COLUMNS = 'id,interview_round_id,status,started_at,ended_at';
 
 type Row = Record<string, unknown>;
 
@@ -107,14 +115,6 @@ export interface R1QueueQuery {
   /** The search as typed, trimmed. Empty is no search. */
   search: string;
   includeDryRuns: boolean;
-}
-
-export interface R1QueueAttempt extends R1AttemptSummary {
-  in_progress: boolean;
-  session_status: string | null;
-  started_at: string | null;
-  ended_at: string | null;
-  consent_withdrawn: boolean;
 }
 
 export interface R1QueueRound {
@@ -132,7 +132,7 @@ export interface R1QueueRound {
   scores_withheld: boolean;
   is_staff_dry_run: boolean;
   created_at: string;
-  attempts: R1QueueAttempt[];
+  attempts: R1ListedAttempt[];
 }
 
 export interface R1QueueBody {
@@ -210,7 +210,7 @@ function roundsRead(db: R1DbClient, actor: R1StaffActor, query: R1QueueQuery, no
     if (pattern !== null) read = read.ilike('candidates.name', pattern);
     if (query.view === 'in-progress') read = read.in('status', [...OPEN_STATUSES]).gt('expires_at', nowIso);
     if (query.view === 'to-review') read = read.or(toReviewFilter(nowIso));
-    if (query.view === 'reviewed') read = read.or(`status.eq.completed,${expiredBranches(nowIso)}`).in('status_write', [...SETTLED_WRITES]);
+    if (query.view === 'reviewed') read = read.or(reviewedFilter(nowIso)).in('status_write', [...SETTLED_WRITES]);
     if (query.view === 'to-review' || query.view === 'reviewed') read = read.is('candidates.decision_use_blocked_at', null);
     return read;
   };
@@ -306,7 +306,7 @@ export async function readR1Queue(
             .order('attempt_number', { ascending: true }).order('created_at', { ascending: true }).order('session_id', { ascending: true })),
           readForRounds(roundIds, (chunk) => db.from(RECORDINGS_TABLE).select(SUMMARY_COLUMNS).in('round_id', chunk)
             .order('session_id', { ascending: true })),
-          readForRounds(roundIds, (chunk) => db.from('call_sessions').select(SESSION_COLUMNS).in('interview_round_id', chunk)
+          readForRounds(roundIds, (chunk) => db.from('call_sessions').select(ATTEMPT_SESSION_COLUMNS).in('interview_round_id', chunk)
             .order('id', { ascending: true })),
           withdrawalCutoffs(db, roundIds),
         ]);
@@ -314,28 +314,11 @@ export async function readR1Queue(
 
     const sessions = new Map(sessionRows.map((row) => [String(row.id), row]));
     const recordings = new Map((recordingRows as unknown as R1RecordingRow[]).map((row) => [row.session_id, row]));
-    const attemptsByRound = new Map<string, R1QueueAttempt[]>();
+    const attemptsByRound = new Map<string, R1ListedAttempt[]>();
     for (const row of attemptRows) {
       const sessionId = String(row.session_id);
       const roundId = String(row.round_id);
-      const session = sessions.get(sessionId);
-      const cutoff = cutoffs.get(roundId);
-      const at = Date.parse(String(row.created_at));
-      // The review page's rule: a time that cannot be read is treated as covered.
-      const withdrawn = cutoff !== undefined && (!Number.isFinite(at) || at <= cutoff);
-      const summary = summarizeRecording(recordings.get(sessionId) ?? null, nowMs);
-      push(attemptsByRound, roundId, {
-        session_id: sessionId,
-        attempt_number: Number(row.attempt_number),
-        counted: row.counted === true,
-        outcome: text(row.outcome),
-        in_progress: LIVE_SESSION_STATES.has(session?.status),
-        session_status: text(session?.status),
-        started_at: text(session?.started_at),
-        ended_at: text(session?.ended_at),
-        consent_withdrawn: withdrawn,
-        recording: withdrawn ? withdrawnSummary(summary) : summary,
-      });
+      push(attemptsByRound, roundId, listedAttempt(row, sessions.get(sessionId), recordings.get(sessionId) ?? null, cutoffs.get(roundId), nowMs));
     }
 
     const rounds = window.rows.map((round): R1QueueRound => {

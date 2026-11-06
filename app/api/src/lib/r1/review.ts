@@ -46,7 +46,7 @@ import { readAllPages, type PageResult } from '../id-batches.js';
 import { seesEveryCandidate, type R1StaffActor } from './recording/access.js';
 import { withdrawalCutoffs } from './recording/erase.js';
 import { RECORDINGS_TABLE, type R1RecordingRow } from './recording/service.js';
-import { SUMMARY_COLUMNS, summarizeRecording, type R1RecordingSummary } from './recording/summary.js';
+import { LIVE_SESSION_STATES, SUMMARY_COLUMNS, summarizeRecording, withdrawnSummary, type R1RecordingSummary } from './recording/summary.js';
 import { parseEvidenceRef } from './evidence.js';
 import { r1LearnerName, r1PersonaLabel } from './personas.js';
 import { R1_METRICS } from './rubric.js';
@@ -56,9 +56,6 @@ export const STAFF_LOCALE = 'en-IN-x-staff';
 
 /** The most pages of one transcript or one log: far past any real interview, and never truncated. */
 const MAX_PAGES = 5;
-
-/** The session states of an interview that has not ended (0115). */
-export const LIVE_SESSION_STATES: ReadonlySet<unknown> = new Set(['created', 'waiting', 'in_progress']);
 
 const ROUND_COLUMNS =
   'id,candidate_id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,assessment_id,'
@@ -326,27 +323,6 @@ function variantsBySession(rows: readonly Row[]): Map<string, string> {
     if (variant) variants.set(String(row.session_id), variant);
   }
   return variants;
-}
-
-/**
- * What consent withdrawal leaves of a summary. It reads as the summary of a recording being erased
- * does (`recordingState`): deleted, with no anchor and nothing to play. No recording stays no
- * recording, because nothing was deleted.
- */
-export function withdrawnSummary(summary: R1RecordingSummary): R1RecordingSummary {
-  if (summary.state === 'none') return summary;
-  return {
-    state: 'deleted',
-    reason: 'consent_withdrawn',
-    mode: null,
-    has_video: null,
-    started_at_ms: null,
-    duration_ms: null,
-    camera_off_ms: null,
-    degraded_at_ms: null,
-    retention_until: null,
-    deleted_at: summary.deleted_at,
-  };
 }
 
 const RUBRIC = R1_METRICS.map((metric) => ({
