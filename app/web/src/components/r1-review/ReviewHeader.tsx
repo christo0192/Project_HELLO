@@ -17,7 +17,7 @@ import { api } from '../../api';
 import { plainErrorText } from '../../lib/api-error-copy';
 import { formatDateTime, formatRelative } from '../../lib/datetime';
 import { r1RecordingStateCopy, attemptLabels } from '../../lib/r1-recording';
-import { roundStatusWord } from '../../lib/r1-review';
+import { rejectionPendingUntil, roundStatusWord } from '../../lib/r1-review';
 import type { R1ReviewAttempt, R1ReviewResponse } from '../../lib/r1-types';
 
 const nameLink =
@@ -55,7 +55,7 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   const statusWord = roundStatusWord(round, attempts, Date.now());
 
   const [cancelledRound, setCancelledRound] = useState<string | null>(null);
-  const pending = round.status_write === 'pending_reject' && round.pending_reject_until !== null && cancelledRound !== round.id;
+  const pending = rejectionPendingUntil(round) !== null && cancelledRound !== round.id;
 
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);

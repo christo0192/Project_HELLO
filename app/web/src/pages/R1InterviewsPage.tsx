@@ -48,7 +48,7 @@ import {
   queueViewFrom,
   r1ResultWords,
 } from '../lib/r1-queue';
-import { roundStatusWord } from '../lib/r1-review';
+import { rejectionPendingUntil, roundStatusWord } from '../lib/r1-review';
 import type { R1QueueResponse, R1QueueRound, R1QueueSort, R1QueueView } from '../lib/r1-types';
 
 /** How long the typing must stop before a search goes to the API. */
@@ -103,7 +103,7 @@ function QueueRow({ round }: { round: R1QueueRound }) {
   const status = roundStatusWord(round, round.attempts, nowMs);
   const recording = queueRecordingWords(round);
   const ended = lastEnded(round);
-  const pending = round.pending_reject_until;
+  const pending = rejectionPendingUntil(round);
   return (
     <Tr>
       <Td className="py-2.5">

@@ -6,7 +6,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { R1QueueAttempt, R1QueueResponse, R1QueueRound } from '../lib/r1-types';
+import type { R1ListedAttempt, R1QueueResponse, R1QueueRound } from '../lib/r1-types';
 import { R1InterviewsPage } from './R1InterviewsPage';
 
 const mockApi = vi.hoisted(() => ({ listR1Queue: vi.fn() }));
@@ -18,7 +18,7 @@ vi.mock('../api', () => ({
   },
 }));
 
-const attempt = (over: Partial<R1QueueAttempt> = {}): R1QueueAttempt => ({
+const attempt = (over: Partial<R1ListedAttempt> = {}): R1ListedAttempt => ({
   session_id: 'session-1', attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, session_status: 'completed', started_at: null,
   ended_at: '2026-11-02T10:30:00.000Z', consent_withdrawn: false, recording: { state: 'ready' }, ...over,
 });
@@ -137,6 +137,13 @@ describe('a row', () => {
     open();
     const row = (await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')!;
     expect(row).toHaveTextContent(/Rejection pending until/);
+  });
+
+  it('says nothing is pending once the rejection has landed, though the sweep leaves the date on the row', async () => {
+    mockApi.listR1Queue.mockResolvedValue(answer({ view: 'reviewed', sort: 'newest', rounds: [round({ recommendation: 'reject', pending_reject_until: '2026-10-08T10:00:00.000Z', status_write: 'rejected' })] }));
+    open('?view=reviewed');
+    const row = (await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')!;
+    expect(row).not.toHaveTextContent(/Rejection pending/);
   });
 
   it('reads a round nobody is in as an open link, not as an interview running', async () => {

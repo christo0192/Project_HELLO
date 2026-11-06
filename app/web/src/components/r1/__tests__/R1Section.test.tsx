@@ -14,7 +14,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { R1Round } from '../../../lib/r1-types';
+import type { R1ListedAttempt, R1Round } from '../../../lib/r1-types';
 import { ApiError } from '../../../api';
 import { R1Section } from '../R1Section';
 
@@ -44,13 +44,29 @@ function round(over: Partial<R1Round> = {}): R1Round {
   return {
     id: 'round-1',
     status: 'invited',
-    expires_at: '2026-10-09T10:00:00.000Z',
+    expires_at: '2099-10-09T10:00:00.000Z',
     attempts_allowed: 2,
     attempts_counted: 0,
     recommendation: null,
     overall: null,
     created_at: '2026-10-06T10:00:00.000Z',
     created_by: 'user-1',
+    ...over,
+  };
+}
+
+function listed(over: Partial<R1ListedAttempt> = {}): R1ListedAttempt {
+  return {
+    session_id: 'session-1',
+    attempt_number: 1,
+    counted: true,
+    outcome: 'complete',
+    in_progress: false,
+    session_status: 'completed',
+    started_at: null,
+    ended_at: '2026-10-07T10:00:00.000Z',
+    consent_withdrawn: false,
+    recording: { state: 'none' },
     ...over,
   };
 }
@@ -511,7 +527,7 @@ describe('the rounds panel', () => {
     expect(row).toHaveTextContent(/Sent .*2026/);
     expect(row).toHaveTextContent('Status: Link sent');
     expect(row).toHaveTextContent('0 of 2 attempts used');
-    expect(row).toHaveTextContent(/Link valid until .*2026/);
+    expect(row).toHaveTextContent(/Link valid until .*2099/);
   });
 
   it('shows a results placeholder until scoring has produced something', async () => {
@@ -579,6 +595,95 @@ describe('the rounds panel', () => {
     await screen.findByRole('list', { name: 'R1 rounds' });
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
     expect(screen.queryByText(/AI re/)).not.toBeInTheDocument();
+  });
+
+  describe('a link past its expiry, which nothing writes as expired', () => {
+    const LAPSED = '2026-10-09T10:00:00.000Z';
+    const row = async () => within(await screen.findByRole('list', { name: 'R1 rounds' })).getByRole('listitem');
+
+    it('reads Expired, as the queue does, and does not say how long the link is valid', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ expires_at: LAPSED, attempts: [] })] });
+      renderSection();
+      const item = await row();
+      expect(item).toHaveTextContent('Status: Expired');
+      expect(item).not.toHaveTextContent('Link sent');
+      expect(item).not.toHaveTextContent('Link valid until');
+    });
+
+    it('still offers the reissue that revives it', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ expires_at: LAPSED, attempts: [] })] });
+      renderSection();
+      expect(await screen.findByRole('button', { name: 'Reissue link' })).toBeInTheDocument();
+    });
+
+    it('reads Expired from in_progress with nobody in it, and promises nothing', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'in_progress', expires_at: LAPSED, attempts: [listed({ counted: false, session_status: 'failed' })] })],
+      });
+      renderSection();
+      const item = await row();
+      expect(item).toHaveTextContent('Status: Expired');
+      expect(item).not.toHaveTextContent('No results yet');
+    });
+
+    it('reads In progress while an interview outlasts its link', async () => {
+      api.listR1Rounds.mockResolvedValue({
+        rounds: [round({ status: 'in_progress', expires_at: LAPSED, attempts: [listed({ counted: false, in_progress: true, session_status: 'in_progress', ended_at: null })] })],
+      });
+      renderSection();
+      expect(await row()).toHaveTextContent('Status: In progress');
+    });
+
+    it('keeps a completed round as it is', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'completed', expires_at: LAPSED, attempts_counted: 1, recommendation: 'hold', overall: 58 })] });
+      renderSection();
+      expect(await row()).toHaveTextContent('Status: Completed');
+    });
+
+    it('reads Expired even when the list could not read the attempts', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ expires_at: LAPSED })] });
+      renderSection();
+      expect(await row()).toHaveTextContent('Status: Expired');
+    });
+  });
+
+  it('reads a live link nobody is in as an open link, as the queue does', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'in_progress', attempts: [listed({ counted: false, session_status: 'failed' })] })] });
+    renderSection();
+    expect(await screen.findByRole('list', { name: 'R1 rounds' })).toHaveTextContent('Status: Link open');
+  });
+
+  describe('a completed round with no result', () => {
+    const NOT_SCORED = 'AI result: not scored. Open the R1 review for the reason.';
+    const completed = (attempts: R1Round['attempts']) => round({ status: 'completed', attempts_counted: 1, attempts });
+
+    it('says a score is coming only while one can arrive', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [completed([listed({ ended_at: new Date(Date.now() - 60_000).toISOString() })])] });
+      renderSection();
+      expect(await screen.findByText(/No results yet/)).toBeInTheDocument();
+      expect(screen.queryByText(NOT_SCORED)).not.toBeInTheDocument();
+    });
+
+    it('says not scored once consent is withdrawn, which stops the scoring', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [completed([listed({ ended_at: new Date(Date.now() - 60_000).toISOString(), consent_withdrawn: true })])] });
+      renderSection();
+      expect(await screen.findByText(NOT_SCORED)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    });
+
+    it('says not scored once the wait for a score has passed', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [completed([listed({ ended_at: '2026-10-07T10:00:00.000Z' })])] });
+      renderSection();
+      expect(await screen.findByText(NOT_SCORED)).toBeInTheDocument();
+      expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+    });
+
+    it('does not claim either way when the list could not read the attempts', async () => {
+      api.listR1Rounds.mockResolvedValue({ rounds: [round({ status: 'completed', attempts_counted: 1 })] });
+      renderSection();
+      expect(await screen.findByText(/No results yet/)).toBeInTheDocument();
+      expect(screen.queryByText(NOT_SCORED)).not.toBeInTheDocument();
+    });
   });
 
   it('marks a staff dry run, and only that', async () => {
@@ -719,7 +824,7 @@ describe('reissue, cancel and grant retake', () => {
     const group = await screen.findByRole('group', { name: 'New candidate link' });
     expect(group).toHaveTextContent(/previous link has stopped working/);
     // The reissue answer carries no expiry, so it is read from the refreshed round.
-    expect(group).toHaveTextContent(/valid for 72 hours \(until .*2026.*\)/);
+    expect(group).toHaveTextContent(/valid for 72 hours \(until .*2099.*\)/);
     expect(screen.getByLabelText('R1 link for the candidate')).toHaveValue(LINK);
   });
 

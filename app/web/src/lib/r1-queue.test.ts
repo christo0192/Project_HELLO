@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { queuePageFrom, queueRecordingWords, queueSortFrom, queueSummary, queueViewFrom, r1ResultWords } from './r1-queue';
 import { R1_SCORE_WAIT_MS } from './r1-review';
-import type { R1QueueAttempt, R1QueueRound, R1RecordingState } from './r1-types';
+import type { R1ListedAttempt, R1QueueRound, R1RecordingState } from './r1-types';
 
 const NOW = Date.parse('2026-11-02T12:00:00Z');
 const ago = (ms: number): string => new Date(NOW - ms).toISOString();
 
-function attempt(over: Partial<R1QueueAttempt> = {}): R1QueueAttempt {
+function attempt(over: Partial<R1ListedAttempt> = {}): R1ListedAttempt {
   return {
     session_id: 's1', attempt_number: 1, counted: true, outcome: 'complete', in_progress: false, session_status: 'completed', started_at: null,
     ended_at: ago(60_000), consent_withdrawn: false, recording: { state: 'ready' }, ...over,
@@ -68,7 +68,7 @@ describe('r1ResultWords', () => {
   });
 
   describe('a finished round with no result', () => {
-    const unscored = (attempts: R1QueueAttempt[]) => row({ recommendation: null, overall: null, status_write: null, attempts });
+    const unscored = (attempts: R1ListedAttempt[]) => row({ recommendation: null, overall: null, status_write: null, attempts });
 
     it('is waiting for its score while one can still arrive', () => {
       expect(r1ResultWords(unscored([attempt()]), NOW)).toEqual({ kind: 'text', text: 'Not scored yet' });

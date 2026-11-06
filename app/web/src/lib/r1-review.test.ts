@@ -19,7 +19,9 @@ import {
   reviewAttemptFrom,
   reviewDurationSec,
   reviewStage,
+  rejectionPendingUntil,
   roundStatusWord,
+  shownRoundStatus,
   attemptParam,
   reviewTabFrom,
   rolePlayMarks,
@@ -349,6 +351,36 @@ describe('the needs a learner held back', () => {
   it('counts a reveal the worker could not map to a turn: the event is the fact', () => {
     const events = [{ session_id: 's1', event_type: 'need_revealed', turn_index: null, family_id: null, need: 'H1', kind: null, created_at: null }];
     expect(neededReveals(events, 's1', [])[0]).toEqual({ need: 'H1', label: 'Need 1', revealed: true, turnIndex: null, row: null, startSec: null });
+  });
+});
+
+describe('rejectionPendingUntil', () => {
+  const until = '2026-10-08T10:00:00Z';
+
+  it('is the date while a rejection is pending', () => {
+    expect(rejectionPendingUntil({ status_write: 'pending_reject', pending_reject_until: until })).toBe(until);
+  });
+
+  it.each(['rejected', 'advanced', 'hold_flag', null])('is null at %s, whatever date the row kept', (write) => {
+    expect(rejectionPendingUntil({ status_write: write, pending_reject_until: until })).toBeNull();
+  });
+});
+
+describe('shownRoundStatus', () => {
+  const NOW_MS = Date.parse('2026-11-03T12:00:00Z');
+  const alive = '2026-11-06T00:00:00Z';
+  const lapsed = '2026-11-02T11:59:59Z';
+
+  it('is the stored status while the link is good, and for a round that is over', () => {
+    expect(shownRoundStatus({ status: 'invited', expires_at: alive }, [], NOW_MS)).toBe('invited');
+    expect(shownRoundStatus({ status: 'completed', expires_at: lapsed }, [], NOW_MS)).toBe('completed');
+    expect(shownRoundStatus({ status: 'cancelled', expires_at: lapsed }, [], NOW_MS)).toBe('cancelled');
+  });
+
+  it('is expired past the link, unless the interview that outlasted it runs on', () => {
+    expect(shownRoundStatus({ status: 'invited', expires_at: lapsed }, [], NOW_MS)).toBe('expired');
+    expect(shownRoundStatus({ status: 'in_progress', expires_at: lapsed }, [{ in_progress: false }], NOW_MS)).toBe('expired');
+    expect(shownRoundStatus({ status: 'in_progress', expires_at: lapsed }, [{ in_progress: true }], NOW_MS)).toBe('in_progress');
   });
 });
 

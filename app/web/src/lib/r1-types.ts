@@ -274,8 +274,8 @@ export interface R1Round {
   is_staff_dry_run?: boolean;
   created_at: string;
   created_by?: string;
-  /** One entry per attempt, each with its recording summary. Absent from an older API. */
-  attempts?: R1AttemptSummary[];
+  /** One entry per attempt. Absent from an older API, and when the list could not read them. */
+  attempts?: R1ListedAttempt[];
 }
 
 export interface R1RoundsResponse {
@@ -299,7 +299,8 @@ export interface R1QueueQuery {
   includeDryRuns?: boolean;
 }
 
-export interface R1QueueAttempt extends R1AttemptSummary {
+/** An attempt on a list of rounds, the queue's and the candidate's alike. */
+export interface R1ListedAttempt extends R1AttemptSummary {
   /** The interview has not ended. */
   in_progress: boolean;
   session_status: string | null;
@@ -325,7 +326,7 @@ export interface R1QueueRound {
   scores_withheld: boolean;
   is_staff_dry_run: boolean;
   created_at: string;
-  attempts: R1QueueAttempt[];
+  attempts: R1ListedAttempt[];
 }
 
 export interface R1QueueResponse {

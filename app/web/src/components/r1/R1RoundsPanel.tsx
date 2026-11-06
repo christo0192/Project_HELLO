@@ -3,12 +3,16 @@
  *
  * Shows what the list route returns today: status, when the link was sent,
  * its expiry while it can still be used, attempts used, and the result once
- * the scorer has written one. Until scoring ships (PR-5) the recommendation
- * and score are null, and the row says so in words instead of leaving a gap.
+ * the scorer has written one. Until then the row says so in words instead of
+ * leaving a gap, and only while a score can still arrive: past that it says not
+ * scored, as the queue does.
  * While an appeal blocks decision use the result reads as withheld instead.
  * The result stays on the row through a retake, which re-opens the round.
  * A score with no recommendation is not a result: only a valid gated score
  * carries one (0122), so that figure never prints here.
+ *
+ * A status reads as it does on the queue and the review: a lapsed link is
+ * Expired whatever is stored, so nobody here waits on a dead link.
  *
  * Row actions (an admin, or the interviewer who created the round: the API's own
  * rule, so nobody is offered a button that can only answer 403):
@@ -43,10 +47,10 @@ import {
   canGrantRetake,
   canReissue,
   r1ErrorMessage,
-  r1StatusLabel,
   r1StatusTone,
 } from '../../lib/r1';
 import { attemptLabels, r1RecordingStateCopy, showsRecordingRow } from '../../lib/r1-recording';
+import { roundStatusWord, scoreCanArrive, shownRoundStatus } from '../../lib/r1-review';
 import type { R1Round } from '../../lib/r1-types';
 import type { MeResponse } from '../../types';
 
@@ -202,24 +206,32 @@ export function R1RoundsPanel({
     }
   }
 
+  const nowMs = Date.now();
+
   return (
     <ul aria-label="R1 rounds" className="divide-y divide-line">
       {rounds.map((round) => {
         const live = round.status === 'invited' || round.status === 'in_progress';
+        // One recording chip per attempt, in attempt order (the API sends them that way). An older
+        // API sends no `attempts`, and then there is simply nothing to add here.
+        const attempts = Array.isArray(round.attempts) ? round.attempts : [];
+        const status = shownRoundStatus(round, attempts, nowMs);
+        // A list with no attempts could not read them, which says nothing about a score either way.
+        const scoreGone =
+          round.status === 'completed' &&
+          Array.isArray(round.attempts) &&
+          !attempts.some((attempt) => scoreCanArrive(attempt, round.created_at, nowMs));
         const notScored =
           round.recommendation === null &&
-          (round.status_write === 'human_review' || round.overall !== null);
+          (round.status_write === 'human_review' || round.overall !== null || scoreGone);
         const withheld = decisionBlocked || round.scores_withheld === true;
         const showsResult =
           round.recommendation !== null ||
           notScored ||
-          round.status === 'completed' ||
-          round.status === 'in_progress';
+          status === 'completed' ||
+          status === 'in_progress';
         const active = pending?.roundId === round.id ? pending : null;
         const headingId = `r1-round-${uid}-${round.id}`;
-        // One recording chip per attempt, in attempt order (the API sends them that way). An older
-        // API sends no `attempts`, and then there is simply nothing to add here.
-        const attempts = Array.isArray(round.attempts) ? round.attempts : [];
         const labels = attemptLabels(attempts);
         const recordings = attempts.flatMap((attempt, index) =>
           showsRecordingRow(attempt?.recording, round.status === 'completed')
@@ -232,8 +244,8 @@ export function R1RoundsPanel({
               <span id={headingId} className="font-medium text-ink">
                 Sent {formatDateTime(round.created_at)}
               </span>
-              <Tag tone={r1StatusTone(round.status)} srPrefix="Status:">
-                {r1StatusLabel(round.status)}
+              <Tag tone={r1StatusTone(status)} srPrefix="Status:">
+                {roundStatusWord(round, attempts, nowMs)}
               </Tag>
               {round.is_staff_dry_run === true && <Tag>Staff dry run</Tag>}
               <span className="text-label text-ink-secondary">{attemptsLabel(round)}</span>
@@ -245,7 +257,7 @@ export function R1RoundsPanel({
               </Link>
             </div>
 
-            {round.status === 'invited' && (
+            {status === 'invited' && (
               <p className="mt-1 text-label text-ink-secondary">
                 Link valid until {formatDateTime(round.expires_at)}
               </p>

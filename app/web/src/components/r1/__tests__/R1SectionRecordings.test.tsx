@@ -5,7 +5,7 @@
 import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { R1AttemptSummary, R1RecordingSummary, R1Round } from '../../../lib/r1-types';
+import type { R1ListedAttempt, R1RecordingSummary, R1Round } from '../../../lib/r1-types';
 import { R1Section } from '../R1Section';
 
 const api = vi.hoisted(() => ({
@@ -45,9 +45,12 @@ function recording(over: Partial<R1RecordingSummary> = {}): R1RecordingSummary {
   };
 }
 
-function attempt(n: number, over: Partial<R1AttemptSummary> & { rec?: Partial<R1RecordingSummary> } = {}): R1AttemptSummary {
+function attempt(n: number, over: Partial<R1ListedAttempt> & { rec?: Partial<R1RecordingSummary> } = {}): R1ListedAttempt {
   const { rec, ...rest } = over;
-  return { session_id: `session-${n}`, attempt_number: n, counted: true, outcome: 'completed', recording: recording(rec), ...rest };
+  return {
+    session_id: `session-${n}`, attempt_number: n, counted: true, outcome: 'completed', in_progress: false, session_status: 'completed',
+    started_at: null, ended_at: null, consent_withdrawn: false, recording: recording(rec), ...rest,
+  };
 }
 
 function round(over: Partial<R1Round> = {}): R1Round {

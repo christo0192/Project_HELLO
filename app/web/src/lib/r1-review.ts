@@ -29,6 +29,7 @@ import type {
   R1ReviewResponse,
   R1ReviewRound,
   R1ReviewTurn,
+  R1RoundStatus,
   R1TurnPhase,
 } from './r1-types';
 
@@ -436,18 +437,36 @@ export function roundIsRunning(attempts: readonly Pick<R1ReviewAttempt, 'in_prog
 }
 
 /**
- * Where a round stands, in a word, on a queue row and on the review. A link past its expiry is expired
- * whatever is stored, though the interview that outlasted it runs on. An in_progress round with nobody
- * in it is an open link.
+ * The status a round reads as. A link past its expiry is expired whatever is stored, though the
+ * interview that outlasted it runs on.
+ */
+export function shownRoundStatus(
+  round: Pick<R1ReviewRound, 'status'> & { expires_at: string | null },
+  attempts: readonly Pick<R1ReviewAttempt, 'in_progress'>[],
+  nowMs: number,
+): R1RoundStatus {
+  return !roundIsRunning(attempts) && linkLapsed(round, nowMs) ? 'expired' : round.status;
+}
+
+/**
+ * Where a round stands, in a word, on a queue row, on the candidate's R1 tab and on the review. An
+ * in_progress round with nobody in it is an open link.
  */
 export function roundStatusWord(
   round: Pick<R1ReviewRound, 'status'> & { expires_at: string | null },
   attempts: readonly Pick<R1ReviewAttempt, 'in_progress'>[],
   nowMs: number,
 ): string {
-  const running = roundIsRunning(attempts);
-  if (!running && linkLapsed(round, nowMs)) return r1StatusLabel('expired');
-  return round.status === 'in_progress' && !running ? 'Link open' : r1StatusLabel(round.status);
+  const status = shownRoundStatus(round, attempts, nowMs);
+  return status === 'in_progress' && !roundIsRunning(attempts) ? 'Link open' : r1StatusLabel(status);
+}
+
+/**
+ * When a pending rejection lands, or null when none is pending. The date alone cannot say: the sweep
+ * that applies a rejection leaves `pending_reject_until` on the row (0122).
+ */
+export function rejectionPendingUntil(round: Pick<R1ReviewRound, 'status_write' | 'pending_reject_until'>): string | null {
+  return round.status_write === 'pending_reject' ? round.pending_reject_until : null;
 }
 
 export function reviewStage(review: Pick<R1ReviewResponse, 'round' | 'attempts' | 'assessment'>, nowMs: number): R1ReviewStage {
