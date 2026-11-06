@@ -7,6 +7,7 @@
  * Pure rules, so the page stays layout. No clock and no network.
  */
 import type { CandidateDetail } from '../types';
+import { latestScreeningAssessment } from './latest-screening-assessment';
 
 export type CandidateTab = 'phone' | 'r1' | 'profile';
 
@@ -27,12 +28,14 @@ type TabFacts = Pick<CandidateDetail, 'sessions' | 'assessments'>;
 
 const isR1Session = (session: CandidateDetail['sessions'][number]): boolean => session.interview_round_id != null;
 
-/** Something to read on the Phone screening tab: a completed phone session, or a phone assessment. */
+/**
+ * Something to read on the Phone screening tab: a completed phone session, or a phone assessment by the
+ * header's rule, so that the tab and the score beside it never disagree about what is a phone screening.
+ */
 export function hasPhoneReview(detail: TabFacts): boolean {
-  const r1Sessions = new Set(detail.sessions.filter(isR1Session).map((session) => session.id));
   return (
     detail.sessions.some((session) => !isR1Session(session) && session.status === 'completed')
-    || detail.assessments.some((assessment) => assessment.session_id == null || !r1Sessions.has(assessment.session_id))
+    || latestScreeningAssessment(detail.assessments, detail.sessions) !== null
   );
 }
 

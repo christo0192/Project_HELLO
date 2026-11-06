@@ -41,6 +41,22 @@ describe('hasPhoneReview', () => {
     expect(hasPhoneReview(detail({ sessions: [r1Session], assessments: [{ session_id: 'r1' }] }))).toBe(false);
     expect(hasPhoneReview(detail({ sessions: [failedPhoneSession] }))).toBe(false);
   });
+
+  // GET /api/candidates/:id leaves `sessions` empty when that read fails, and the assessments still come.
+  describe('when the page has no session for an assessment', () => {
+    const stamped = { session_id: 'r1', raw: { r1: { attempt: 1 } } };
+
+    it('does not take a row the R1 scorer stamped for a phone review, as the header does not', () => {
+      expect(hasPhoneReview(detail({ assessments: [stamped] }))).toBe(false);
+      expect(defaultCandidateTab(detail({ assessments: [stamped] }))).toBe('profile');
+    });
+
+    it('keeps a row with no stamp: that is a phone screening whose session it cannot see', () => {
+      expect(hasPhoneReview(detail({ assessments: [{ session_id: 'p9', raw: {} }] }))).toBe(true);
+      expect(hasPhoneReview(detail({ assessments: [stamped, { session_id: 'p9', raw: null }] }))).toBe(true);
+      expect(hasPhoneReview(detail({ assessments: [{ session_id: null }] }))).toBe(true);
+    });
+  });
 });
 
 describe('defaultCandidateTab', () => {
