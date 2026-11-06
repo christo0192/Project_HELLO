@@ -16,6 +16,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { R1ListedAttempt, R1Round } from '../../../lib/r1-types';
 import { ApiError } from '../../../api';
+import { r1ResultLine } from '../../../lib/r1';
 import { R1Section } from '../R1Section';
 
 const api = vi.hoisted(() => ({
@@ -543,14 +544,25 @@ describe('the rounds panel', () => {
   it('shows the recommendation and score once the scorer has written them', async () => {
     api.listR1Rounds.mockResolvedValue({
       rounds: [
-        round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58.5 }),
+        round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58 }),
       ],
     });
     renderSection();
     expect(
-      await screen.findByText('AI recommendation: Borderline · Overall 58.5 of 100'),
+      await screen.findByText('AI recommendation: Borderline · Overall 58 of 100'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [58.4, 58],
+    [58.5, 59],
+  ])('prints a score of %s as %s, the whole figure the candidate header shows', async (overall, shown) => {
+    const scored = round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall });
+    api.listR1Rounds.mockResolvedValue({ rounds: [scored] });
+    renderSection();
+    expect(await screen.findByText(`AI recommendation: Borderline · Overall ${shown} of 100`)).toBeInTheDocument();
+    expect(r1ResultLine([scored])).toBe(`R1 role-play: Borderline ${shown} (AI)`);
   });
 
   it('says a round the scorer would not score was not scored, not that scoring is on its way', async () => {
@@ -779,10 +791,10 @@ describe('the rounds panel', () => {
 
   it('without an appeal the withheld line never shows', async () => {
     api.listR1Rounds.mockResolvedValue({
-      rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58.5 })],
+      rounds: [round({ status: 'completed', attempts_counted: 1, recommendation: 'hold', overall: 58 })],
     });
     renderSection();
-    await screen.findByText('AI recommendation: Borderline · Overall 58.5 of 100');
+    await screen.findByText('AI recommendation: Borderline · Overall 58 of 100');
     expect(screen.queryByText(/suppressed while an appeal/)).not.toBeInTheDocument();
   });
 

@@ -269,7 +269,7 @@ export function R1RoundsPanel({
                   R1_RESULT_WITHHELD
                 ) : round.recommendation !== null ? (
                   `AI recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}` +
-                  (round.overall !== null ? ` · Overall ${round.overall} of 100` : '')
+                  (round.overall !== null ? ` · Overall ${Math.round(round.overall)} of 100` : '')
                 ) : notScored ? (
                   'AI result: not scored. Open the R1 review for the reason.'
                 ) : (
