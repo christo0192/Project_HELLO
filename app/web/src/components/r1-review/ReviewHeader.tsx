@@ -14,20 +14,23 @@ import type { ReactNode } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Button, Dialog, SegmentedControl } from '../design';
 import { Tag } from '../design/candidate';
+import type { TagTone } from '../design/candidate';
 import { api } from '../../api';
 import { plainErrorText } from '../../lib/api-error-copy';
 import { formatDateTime, formatRelative } from '../../lib/datetime';
 import { r1RecordingStateCopy, attemptLabels } from '../../lib/r1-recording';
-import { rejectionPendingUntil, roundStatusWord } from '../../lib/r1-review';
+import { r1StatusTone } from '../../lib/r1';
+import { rejectionPendingUntil, roundStatusWord, shownRoundStatus } from '../../lib/r1-review';
 import type { R1ReviewAttempt, R1ReviewResponse } from '../../lib/r1-types';
 
 const nameLink =
   'underline underline-offset-4 hover:text-ink-secondary focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink)]';
 
-function Chip({ children }: { children: ReactNode }) {
+/** A chip that names a process state takes its family, as on the candidate Overview. The rest stay neutral. */
+function Chip({ tone, children }: { tone?: TagTone; children: ReactNode }) {
   return (
     <li>
-      <Tag>{children}</Tag>
+      <Tag tone={tone}>{children}</Tag>
     </li>
   );
 }
@@ -53,7 +56,9 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
   const label = attempt ? labels[attempts.indexOf(attempt)] : null;
   const recording = attempt ? r1RecordingStateCopy(attempt.recording) : null;
   const keptUntil = recording?.facts.find((fact) => fact.startsWith('Kept until'));
-  const statusWord = roundStatusWord(round, attempts, Date.now());
+  const nowMs = Date.now();
+  const statusWord = roundStatusWord(round, attempts, nowMs);
+  const shownStatus = shownRoundStatus(round, attempts, nowMs);
 
   // The queue hands over the address it was on. Only a query string is taken from router state.
   const location = useLocation();
@@ -98,7 +103,9 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
       </h1>
 
       <ul aria-label="About this interview" className="mt-3 flex flex-wrap items-center gap-2">
-        {round.status !== 'completed' && <Chip>{statusWord}</Chip>}
+        {/* The tone follows the word: "Link open" is an `in_progress` round with no running attempt, so it
+            takes that status's tone, and a lapsed link reads Expired, so it takes Expired's. */}
+        {round.status !== 'completed' && <Chip tone={r1StatusTone(shownStatus)}>{statusWord}</Chip>}
         {attempt?.ended_at && <Chip>Ended {formatRelative(attempt.ended_at)}</Chip>}
         {candidate.role_title && <Chip>{candidate.role_title}</Chip>}
         {attempts.length === 1 && label && <Chip>{label}</Chip>}
@@ -115,7 +122,7 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
           </li>
         )}
         {recording && (
-          <Chip>
+          <Chip tone={recording.tone}>
             <span className="sr-only">Recording: </span>
             {recording.tag}
             {keptUntil ? ` · ${keptUntil}` : ''}

@@ -25,24 +25,40 @@
  * Only a whole-scaled bar gets a grey track: a track says "out of 100%",
  * which a bar scaled to the leader is not.
  *
- * COLOUR. One accent for every bar unless a category carries a meaning of
- * its own (advance / hold / reject), in which case the caller passes a tone.
- * Colour is never the only signal: the label is always printed.
+ * COLOUR. A bar with no meaning of its own is ink. A category that carries one
+ * (a pipeline stage, advance / hold / reject) passes its tone, and the figures
+ * stay ink: the mark beside the text carries the identity. `info` means the moving
+ * family here, as in StatusBadge, and a stage may pass a step of its family
+ * (components/design/tones.ts). Colour is never the only signal: the label is
+ * always printed.
  */
 import { Link } from 'react-router-dom';
 import { cx } from '../design/cx';
 import { Skeleton } from '../design/Skeleton';
+import type { StatusTone } from '../design/StatusBadge';
+import type { MarkTone } from '../design/tones';
 import { ChartEmpty, ChartError } from './states';
 import { shareLabel } from './series';
 
-export type BarTone = 'info' | 'success' | 'warning' | 'danger' | 'neutral';
+export type BarTone = StatusTone | MarkTone | 'ink';
 
 const FILL: Record<BarTone, string> = {
-  info: 'bg-info',
-  success: 'bg-success',
-  warning: 'bg-warning',
-  danger: 'bg-error',
+  ink: 'bg-ink',
+  'ink-2': 'bg-ink-secondary',
   neutral: 'bg-ink-muted',
+  info: 'bg-moving',
+  'moving-light': 'bg-moving-light',
+  moving: 'bg-moving',
+  'moving-deep': 'bg-moving-deep',
+  success: 'bg-success',
+  'ready-light': 'bg-ready-light',
+  ready: 'bg-ready',
+  warning: 'bg-warning',
+  'unresolved-light': 'bg-unresolved-light',
+  unresolved: 'bg-unresolved',
+  closed: 'bg-closed',
+  'closed-light': 'bg-closed-light',
+  danger: 'bg-error',
 };
 
 export interface BarListDatum {
@@ -197,7 +213,7 @@ export function BarList({
                       scale === 'total' && 'overflow-hidden rounded-chip bg-ink/[0.06]',
                     )}
                   >
-                    <Fill pct={pct} className={FILL[row.tone ?? 'info']} />
+                    <Fill pct={pct} className={FILL[row.tone ?? 'ink']} />
                   </span>
                 </div>
               </th>

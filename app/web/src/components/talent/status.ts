@@ -12,6 +12,7 @@
  */
 
 import type { StatusTone } from '../design/StatusBadge';
+import { markFamilyTone, type MarkTone } from '../design/tones';
 import type { Candidate } from '../../types';
 import { humanizeEnum } from '../../lib/humanize';
 import { formatDateTime } from '../../lib/datetime';
@@ -63,26 +64,45 @@ export function candidateStatusLabel(status: string | null | undefined): string 
   }
 }
 
+/**
+ * What each status means, as one step of one family (components/design/tones.ts).
+ * The one place a status gets a colour: a badge takes the family, a bar the step.
+ *
+ * `screening` is the deep underway step: the voice hue means the candidate's voice
+ * and nothing else. `abandoned_no_answer` and `wrong_number` are unresolved because
+ * nobody on our side failed. `screening_abandoned` is unresolved because it can go
+ * either way: the candidate may have dropped, or `infra_interrupted` may say the call
+ * was cut off on our side, and its detail line says which. So one reason code of an
+ * olive status IS our fault, a question docs/design/logsheet-colour-decision-2026-11-06.md
+ * puts to the owner. Only `phone_failed` is crimson.
+ * An outcome the candidate or the team chose is closed: ended, with no judgement
+ * implied. Thirteen keys cannot all differ, so `opted_out` and `phone_cancelled` share
+ * a step: on a bar a 2px gap and a labelled chip with its count keep them apart.
+ */
+const CANDIDATE_STATUS_MARK = new Map<string, MarkTone>([
+  ['new', 'moving-light'],
+  ['queued', 'moving'],
+  ['screening', 'moving-deep'],
+  ['screened', 'ready-light'],
+  ['advanced', 'ready'],
+  ['rejected', 'closed'],
+  ['consent_declined', 'closed-light'],
+  ['opted_out', 'closed-light'],
+  ['phone_cancelled', 'closed-light'],
+  ['abandoned_no_answer', 'unresolved'],
+  ['wrong_number', 'unresolved'],
+  ['screening_abandoned', 'unresolved-light'],
+  ['phone_failed', 'danger'],
+]);
+
+/** The step a status is drawn with on a bar. Anything unknown invents no meaning. */
+export function candidateStatusMark(status: string | null | undefined): MarkTone {
+  return CANDIDATE_STATUS_MARK.get(status ?? '') ?? 'neutral';
+}
+
+/** The tone of a status's badge: its family, in the wash, text shade and dot. */
 export function candidateStatusTone(status: string | null | undefined): StatusTone {
-  switch (status) {
-    case 'screened':
-    case 'advanced':
-      return 'success';
-    case 'screening':
-    case 'queued':
-      return 'warning';
-    case 'abandoned_no_answer':
-    case 'phone_failed':
-    case 'screening_abandoned':
-    case 'wrong_number':
-      return 'danger';
-    case 'new':
-      return 'info';
-    default:
-      // rejected, consent_declined, opted_out, phone_cancelled and anything
-      // unknown. An outcome is not coloured good or bad; crimson is for faults.
-      return 'neutral';
-  }
+  return markFamilyTone(candidateStatusMark(status));
 }
 
 /* ── Display status: the stored status plus what the phone screen did ──
@@ -506,17 +526,92 @@ export function appealCategoryLabel(category: string | null | undefined): string
 
 export function sessionStatusTone(status: string | null | undefined): StatusTone {
   switch (status) {
-    case 'completed':
-      return 'success';
-    case 'in_progress':
-      return 'warning';
     case 'created':
     case 'waiting':
+    case 'in_progress':
       return 'info';
-    case 'failed':
+    case 'completed':
+      return 'success';
+    case 'abandoned':
+      return 'warning';
     case 'cancelled':
     case 'expired':
+    case 'deleted':
+      return 'closed';
+    case 'failed':
       return 'danger';
+    default:
+      return 'neutral';
+  }
+}
+
+/* ── The Ashby workflow ──────────────────────────────────────────────
+ *
+ * The one place these four vocabularies get a colour. Both screens that print
+ * them read it: the candidate's Ashby card and Ashby Live Jobs. Their words differ
+ * ("Writing results back to Ashby", "Writing back to Ashby"), and those stay with
+ * each screen, but the same state cannot take two families. An unknown value
+ * invents no meaning.
+ */
+
+export function ashbyLifecycleTone(lifecycle: string): 'success' | 'info' | 'closed' | 'neutral' {
+  switch (lifecycle) {
+    case 'completed':
+      return 'success';
+    case 'imported':
+    case 'ready':
+    case 'processing':
+    case 'writeback_pending':
+      return 'info';
+    case 'cancelled':
+      return 'closed';
+    default:
+      return 'neutral';
+  }
+}
+
+export function ashbyIngestionTone(state: string): StatusTone {
+  switch (state) {
+    case 'ready':
+      return 'success';
+    case 'failed_review':
+      return 'warning';
+    case 'cancelled':
+      return 'closed';
+    case 'queued':
+    case 'fetching':
+    case 'scanning':
+    case 'extracting':
+    case 'structuring':
+      return 'info';
+    default:
+      return 'neutral';
+  }
+}
+
+/**
+ * Why an application stopped for good (`withdrawn`, `deleted`, `manual_stage_cancel`).
+ * It takes no argument: any terminal state says the application ended, so it is closed
+ * whatever it is. Never crimson, because a candidate withdrawing is not a fault on our side.
+ */
+export function ashbyTerminalTone(): 'closed' {
+  return 'closed';
+}
+
+/** `pending` is moving: a queued operation, which the worker has. Compare `allowlistStateTone`. */
+export function ashbyOperationStateTone(state: string): StatusTone {
+  switch (state) {
+    case 'succeeded':
+      return 'success';
+    case 'failed':
+      return 'danger';
+    case 'blocked':
+      return 'warning';
+    case 'pending':
+    case 'running':
+      return 'info';
+    case 'cancelled':
+      return 'closed';
     default:
       return 'neutral';
   }
@@ -553,13 +648,13 @@ export function candidateStatusCounts(
 /** Count sessions by status — only statuses actually present are emitted. */
 export function sessionStatusCounts(
   sessions: ReadonlyArray<{ status: string | null | undefined }>,
-): Array<{ label: string; value: number }> {
+): Array<{ label: string; value: number; tone: StatusTone }> {
   const counts = new Map<string, number>();
   for (const session of sessions) {
     const status = session.status ?? 'created';
     counts.set(status, (counts.get(status) ?? 0) + 1);
   }
   return [...counts.entries()]
-    .map(([status, value]) => ({ label: sessionStatusLabel(status), value }))
+    .map(([status, value]) => ({ label: sessionStatusLabel(status), value, tone: sessionStatusTone(status) }))
     .sort((a, b) => b.value - a.value);
 }

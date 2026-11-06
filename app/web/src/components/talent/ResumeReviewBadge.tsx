@@ -18,11 +18,11 @@
  * All of that is operator information and lives in admin-gated Mission
  * Control. Recovery is admin-only too, so there is no retry affordance here.
  *
- * Colour: `StatusBadge`'s tones resolve to the approved candidate palette
- * inside `.candidate-scope` (src/styles/candidate-palette.css), so this file
- * declares no colour of its own. Distinction is never hue-only — each state
- * spells out its own meaning in words, and `needs_review` additionally
- * carries more weight than its siblings.
+ * Colour: none. Intake and resume chips stay neutral beside the row's status
+ * badge, which is the one that carries a status colour, so this file declares no
+ * colour of its own. Distinction is never hue-only: each state spells out its own
+ * meaning in words, and `needs_review` additionally carries more weight than its
+ * siblings.
  *
  * M017 adds the intake type ("Resume parsing" / "Phone parsing") beside it,
  * and the words for the Ashby profile check's outcome, for the same reason:
@@ -30,7 +30,6 @@
  */
 
 import { StatusBadge } from '../design';
-import type { StatusTone } from '../design/StatusBadge';
 import type { AshbyProfileOutcome, IntakeType, ResumeReview } from '../../types';
 
 /**
@@ -98,12 +97,6 @@ const LABELS: Record<ResumeReviewKey, string> = {
   cancelled: 'Resume cancelled',
 };
 
-const TONES: Record<ResumeReviewKey, StatusTone> = {
-  processing: 'info',
-  needs_review: 'warning',
-  cancelled: 'neutral',
-};
-
 /** True when the value is one of the three states that render a badge. */
 export function isBadgedResumeReview(
   value: string | null | undefined,
@@ -129,7 +122,7 @@ export function ResumeReviewBadge({ value, className }: ResumeReviewBadgeProps) 
   if (!isBadgedResumeReview(value)) return null;
   return (
     <StatusBadge
-      tone={TONES[value]}
+      tone="neutral"
       className={
         value === 'needs_review'
           ? className

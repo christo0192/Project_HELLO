@@ -31,6 +31,7 @@ import {
   LoadingPanel,
   StatusBadge,
 } from '..';
+import { Tag } from '../Tag';
 import type { PageSize, SegmentedOption } from '..';
 import { optionsOf, pickOption, stubMatchMedia } from './helpers';
 
@@ -873,11 +874,64 @@ describe('StatusBadge', () => {
     expect(badge.querySelectorAll('span')).toHaveLength(0);
   });
 
+  // A badge is the family's soft wash, its text shade and a dot in its mark.
+  it.each([
+    ['info', 'bg-moving-soft', 'text-moving-text', 'bg-moving'],
+    ['success', 'bg-success-soft', 'text-success-text', 'bg-success'],
+    ['warning', 'bg-warning-soft', 'text-warning-text', 'bg-warning'],
+    ['closed', 'bg-closed-soft', 'text-closed-text', 'bg-closed'],
+  ] as const)('prints %s as the wash %s, the text %s and the dot %s', (tone, wash, text, dot) => {
+    render(<StatusBadge tone={tone}>Word</StatusBadge>);
+    const badge = screen.getByText('Word').closest('[data-status-badge]')!;
+    expect(badge).toHaveClass(wash, text);
+    expect(badge.querySelector('[aria-hidden="true"]')).toHaveClass(dot);
+  });
+
+  it('keeps neutral in ink, with the word to carry it', () => {
+    render(<StatusBadge>Word</StatusBadge>);
+    expect(screen.getByText('Word').closest('[data-status-badge]')).toHaveClass(
+      'bg-surface-secondary',
+      'text-ink-secondary',
+    );
+  });
+
+  // A skill, a gap, a flag or a signal level: darker ink is the only weight it gets.
+  it.each([
+    ['ink', 'text-ink'],
+    ['ink-2', 'text-ink-secondary'],
+  ] as const)('prints %s on the field in %s, with an ink-2 dot and no hue', (tone, text) => {
+    render(<StatusBadge tone={tone}>Word</StatusBadge>);
+    const badge = screen.getByText('Word').closest('[data-status-badge]')!;
+    expect(badge).toHaveClass('bg-surface-secondary', text);
+    expect(badge.querySelector('[aria-hidden="true"]')).toHaveClass('bg-ink-secondary');
+  });
+
   it('defaults to the neutral tone', () => {
     render(<StatusBadge className="ml-1">Queued</StatusBadge>);
     const badge = screen.getByText('Queued').closest('[data-status-badge]')!;
     expect(badge).toHaveAttribute('data-status-badge', 'neutral');
     expect(badge).toHaveClass('ml-1');
+  });
+});
+
+/* ── Tag ─────────────────────────────────────────────────────────── */
+
+describe('Tag', () => {
+  // A process state: the family's wash, its text shade and a ring in its mark.
+  it.each([
+    ['moving', 'bg-moving-soft', 'text-moving-text', 'ring-moving'],
+    ['ready', 'bg-ready-soft', 'text-ready-text', 'ring-ready'],
+    ['unresolved', 'bg-unresolved-soft', 'text-unresolved-text', 'ring-unresolved'],
+    ['closed', 'bg-closed-soft', 'text-closed-text', 'ring-closed'],
+  ] as const)('prints %s as the wash %s, the text %s and the ring %s', (tone, wash, text, ring) => {
+    render(<Tag tone={tone}>Word</Tag>);
+    expect(screen.getByText('Word')).toHaveClass(wash, text, ring);
+  });
+
+  // These reach a scorecard's chips, which are neither a verdict nor a rating, so no hue on the label.
+  it.each(['neutral', 'accent', 'positive', 'caution', 'negative'] as const)('keeps the %s label on the secondary ink', (tone) => {
+    render(<Tag tone={tone}>Word</Tag>);
+    expect(screen.getByText('Word').className).toContain('text-[var(--c-ink-secondary)]');
   });
 });
 

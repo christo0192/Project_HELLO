@@ -110,6 +110,25 @@ describe('RolePipelinePanel', () => {
     ).toEqual(['r1', 'r2']);
   });
 
+  it('draws each bucket by what it means', async () => {
+    render(<RolePipelinePanel roles={ROLES} />);
+    await expand();
+    const bar = document.querySelector('[data-role-pipeline="r1"]')!;
+    const fills = Object.fromEntries(
+      [...bar.querySelectorAll<HTMLElement>('[data-pipeline-segment]')].map((segment) => [
+        segment.getAttribute('data-pipeline-segment'),
+        segment.style.backgroundColor,
+      ]),
+    );
+    expect(fills).toEqual({
+      not_dialed: 'var(--moving-light)',
+      // Rung and not reached: unfinished, and nobody on our side failed.
+      no_answer: 'var(--unresolved)',
+      connected: 'var(--moving)',
+      scored: 'var(--ready-light)',
+    });
+  });
+
   it('PRINTS THE CUMULATIVE STAGE FIGURES under the bar', async () => {
     // Read off the <strong> nodes. `textContent.toContain('Screened')` was
     // satisfied by the LEGEND, so deleting a stage figure passed; and

@@ -4,8 +4,10 @@
  *
  * The search is not here. The address carries the view, the sort and the page, and never a name.
  */
+import type { FigureTone } from '../components/design/tones';
 import { R1_RESULT_WITHHELD } from './r1';
 import { isPlayableState, r1RecordingStateCopy, viewState } from './r1-recording';
+import type { R1StateCopy } from './r1-recording';
 import { scoreCanArrive, verdictOf } from './r1-review';
 import type { R1Verdict } from './r1-review';
 import type { R1QueueRound, R1QueueSort, R1QueueView } from './r1-types';
@@ -53,20 +55,39 @@ export function queueSummary(view: R1QueueView, sort: R1QueueSort, total: number
   return `${noun}${VIEW_WORDS[view]}${order}`;
 }
 
+/**
+ * The family of the figure at the head of a view, as on the Dashboard's tiles: waiting on a person is
+ * `ready`, the process having it is `moving`, and a settled outcome has ended with no judgement implied.
+ * All is a plain total, so it stays ink. The page holds a zero in ink too (`countTone`).
+ */
+const VIEW_FIGURE_TONE: Readonly<Record<R1QueueView, FigureTone | undefined>> = {
+  'to-review': 'success',
+  'in-progress': 'info',
+  reviewed: 'closed',
+  all: undefined,
+};
+
+export function queueFigureTone(view: R1QueueView): FigureTone | undefined {
+  return VIEW_FIGURE_TONE[view];
+}
+
 export type R1ResultWords = { kind: 'verdict'; verdict: R1Verdict } | { kind: 'text'; text: string };
 
 /**
- * The AI result a row shows. A withheld round says only that, whatever it carries. A finished round with
- * no verdict waits for one only while the review page would: past that, nothing is coming.
+ * The AI result a row shows. A withheld round says only that, whatever it carries. With no verdict, the
+ * words follow the R1 tab and the review, whatever the status: a figure means the scorer has answered
+ * though its status write may not have landed, so the round was not scored. Otherwise a score that can
+ * still arrive is waited for, even on a round cancelled, lapsed or re-opened before it came. Past that,
+ * nothing is coming.
  */
 export function r1ResultWords(round: R1QueueRound, nowMs: number): R1ResultWords {
   if (round.scores_withheld) return { kind: 'text', text: R1_RESULT_WITHHELD };
   const verdict = verdictOf(round);
   if (verdict) return { kind: 'verdict', verdict };
-  if (round.status_write === 'human_review') return { kind: 'text', text: 'Not scored' };
-  if (round.status !== 'completed') return { kind: 'text', text: 'No result' };
+  if (round.status_write === 'human_review' || round.overall !== null) return { kind: 'text', text: 'Not scored' };
   const waiting = round.attempts.some((attempt) => scoreCanArrive(attempt, round.created_at, nowMs));
-  return { kind: 'text', text: waiting ? 'Not scored yet' : 'Not scored' };
+  if (waiting) return { kind: 'text', text: 'Not scored yet' };
+  return { kind: 'text', text: round.status === 'completed' ? 'Not scored' : 'No result' };
 }
 
 /**
@@ -74,11 +95,11 @@ export function r1ResultWords(round: R1QueueRound, nowMs: number): R1ResultWords
  * else the latest. A retake that left nothing must not read as "no recording" over the interview that
  * has one. Null: no attempt yet.
  */
-export function queueRecordingWords(round: Pick<R1QueueRound, 'attempts'>): string | null {
+export function queueRecording(round: Pick<R1QueueRound, 'attempts'>): R1StateCopy | null {
   const latestFirst = [...round.attempts].reverse();
   const shown =
     latestFirst.find((attempt) => isPlayableState(viewState(attempt.recording)))
     ?? latestFirst.find((attempt) => viewState(attempt.recording) !== 'none')
     ?? latestFirst[0];
-  return shown ? r1RecordingStateCopy(shown.recording).tag : null;
+  return shown ? r1RecordingStateCopy(shown.recording) : null;
 }

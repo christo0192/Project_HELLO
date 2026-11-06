@@ -43,28 +43,18 @@
  */
 import { useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-
-export type PipelineTone =
-  "accent" | "positive" | "caution" | "negative" | "neutral" | "voice";
+import { markVar, type MarkTone } from "../design/tones";
 
 /**
- * Fill per tone, on the ramp the approved mock draws. The bar is an outlined box
- * and a bucket darkens as people move through it, so "nobody dialled yet", the
- * usually-largest bucket, is the lightest block and not a heavy one. The outline
- * is the 3:1 boundary (WCAG 1.4.11), the gap between segments keeps neighbours
- * apart, and an outcome is not coloured good or bad.
+ * A segment's fill: one step of one status family, or `neutral` for a bucket with
+ * no meaning of its own (components/design/tones.ts). The bar is an outlined box,
+ * and the lightest steps sit under 3:1 on purpose, on the relief rule: every
+ * segment has a printed, labelled chip with its count. The outline is the 3:1
+ * boundary (WCAG 1.4.11), and the 2px gap keeps neighbours apart.
  *
- * `voice` is the one hue on the ramp. Orange means the candidate's voice, so it
- * marks the on-a-call stage and nothing else.
+ * The voice hue is not on this bar. Orange means the candidate's voice.
  */
-const FILL: Record<PipelineTone, string> = {
-  neutral: "var(--c-border)",
-  caution: "var(--c-control-border)",
-  voice: "var(--voice-mark)",
-  negative: "var(--c-ink-muted)",
-  accent: "var(--c-ink-secondary)",
-  positive: "var(--c-ink)",
-};
+export type PipelineTone = MarkTone;
 
 /**
  * The legend's key: a printed box, so even the lightest fill has an edge.
@@ -235,7 +225,7 @@ export function PipelineBar({
                 style={{
                   opacity: active && active.key !== s.key ? 0.45 : 1,
                   width: `${(s.value / denominator) * 100}%`,
-                  backgroundColor: FILL[s.tone],
+                  backgroundColor: markVar(s.tone),
                   // The gap sits inside the segment, so its width stays exact,
                   // and it is a border so forced colours keep it. Two buckets
                   // may share a tone and would otherwise read as one block.
@@ -259,7 +249,7 @@ export function PipelineBar({
             >
               <span
                 className={fillClass}
-                style={{ backgroundColor: FILL[activeSegment.tone] }}
+                style={{ backgroundColor: markVar(activeSegment.tone) }}
               />
               <span>{activeSegment.label}</span>
               <span aria-hidden="true">·</span>
@@ -285,7 +275,7 @@ export function PipelineBar({
                 className={s.unavailable ? SWATCH_CLASS : fillClass}
                 style={{
                   // Hollow when unmeasured: a filled key would claim a block.
-                  backgroundColor: s.unavailable ? undefined : FILL[s.tone],
+                  backgroundColor: s.unavailable ? undefined : markVar(s.tone),
                   // A ring in the pill's own text colour when pressed. The
                   // selected pill is filled with `--c-accent`, against which
                   // an ink swatch scores 1.00:1 — it disappeared exactly when

@@ -44,8 +44,9 @@ describe('phoneHealthReasonLabel', () => {
   });
 
   it('a pause is informational, not an error', () => {
-    expect(phoneHealthReasonTone('admission_halted')).toBe('info');
-    expect(phoneHealthReasonTone('phone_due_halted')).toBe('info');
+    // A pause is not "underway", and it is not wrong either, so it takes no family.
+    expect(phoneHealthReasonTone('admission_halted')).toBe('neutral');
+    expect(phoneHealthReasonTone('phone_due_halted')).toBe('neutral');
     expect(phoneHealthReasonTone('phone_loop_stale')).toBe('warning');
   });
 

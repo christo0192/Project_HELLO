@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { queuePageFrom, queueRecordingWords, queueSortFrom, queueSummary, queueViewFrom, r1ResultWords } from './r1-queue';
+import { queueFigureTone, queuePageFrom, queueRecording, queueSortFrom, queueSummary, queueViewFrom, r1ResultWords } from './r1-queue';
 import { R1_SCORE_WAIT_MS } from './r1-review';
 import type { R1ListedAttempt, R1QueueRound, R1RecordingState } from './r1-types';
 
@@ -95,35 +95,70 @@ describe('r1ResultWords', () => {
   it.each(['invited', 'in_progress', 'cancelled', 'expired'] as const)('has nothing to say for a %s round with no result', (status) => {
     expect(r1ResultWords(row({ status, recommendation: null, overall: null, status_write: null }), NOW)).toEqual({ kind: 'text', text: 'No result' });
   });
+
+  // Attach and apply are separate writes, so a figure can be on the row before its status write.
+  it.each(['completed', 'cancelled', 'expired'] as const)('says a figure with no verdict on a %s round was not scored, as the R1 tab and the review do', (status) => {
+    const attached = row({ status, recommendation: null, overall: 42, status_write: null, attempts: [attempt()] });
+    expect(r1ResultWords(attached, NOW)).toEqual({ kind: 'text', text: 'Not scored' });
+  });
+
+  describe('a round that stopped, or re-opened, before its score came', () => {
+    const early = (status: 'cancelled' | 'expired' | 'invited' | 'in_progress', ended: number) =>
+      row({ status, recommendation: null, overall: null, status_write: null, attempts: [attempt({ ended_at: ago(ended) })] });
+
+    it.each(['cancelled', 'expired', 'invited', 'in_progress'] as const)('waits on a %s round while a score can arrive, as the review does', (status) => {
+      expect(r1ResultWords(early(status, 60_000), NOW)).toEqual({ kind: 'text', text: 'Not scored yet' });
+    });
+
+    it.each(['cancelled', 'expired', 'invited', 'in_progress'] as const)('has nothing to say on a %s round once the wait is over', (status) => {
+      expect(r1ResultWords(early(status, R1_SCORE_WAIT_MS), NOW)).toEqual({ kind: 'text', text: 'No result' });
+    });
+  });
 });
 
-describe('queueRecordingWords', () => {
+describe('queueRecording', () => {
   const states = (...list: R1RecordingState[]) => ({
     attempts: list.map((state, index) => attempt({ session_id: `s${index}`, recording: { state } })),
   });
+  const words = (...list: R1RecordingState[]) => queueRecording(states(...list))?.tag;
 
   it('has nothing to say before an attempt', () => {
-    expect(queueRecordingWords({ attempts: [] })).toBeNull();
+    expect(queueRecording({ attempts: [] })).toBeNull();
   });
 
   it('does not let a retake that left nothing hide the recording that exists', () => {
-    expect(queueRecordingWords(states('ready', 'none'))).toBe('Ready');
+    expect(words('ready', 'none')).toBe('Ready');
   });
 
   it('names a recording to watch over a later one that cannot be', () => {
-    expect(queueRecordingWords(states('ready', 'failed'))).toBe('Ready');
-    expect(queueRecordingWords(states('partial', 'deleted'))).toBe('Partial');
+    expect(words('ready', 'failed')).toBe('Ready');
+    expect(words('partial', 'deleted')).toBe('Partial');
   });
 
   it('takes the latest of two to watch', () => {
-    expect(queueRecordingWords(states('ready', 'partial'))).toBe('Partial');
+    expect(words('ready', 'partial')).toBe('Partial');
   });
 
   it('says what became of a recording when none can be watched', () => {
-    expect(queueRecordingWords(states('failed', 'none'))).toBe('Unavailable');
+    expect(words('failed', 'none')).toBe('Unavailable');
   });
 
   it('says there is none when no attempt left one', () => {
-    expect(queueRecordingWords(states('none', 'none'))).toBe('No recording');
+    expect(words('none', 'none')).toBe('No recording');
+  });
+
+  it('takes its family from the attempt it names, not the latest', () => {
+    expect(queueRecording(states('ready', 'failed'))).toMatchObject({ tag: 'Ready', tone: 'ready' });
+    expect(queueRecording(states('partial', 'deleted'))).toMatchObject({ tag: 'Partial', tone: 'unresolved' });
+    expect(queueRecording(states('none', 'none'))).toMatchObject({ tag: 'No recording', tone: 'neutral' });
+  });
+});
+
+describe('queueFigureTone', () => {
+  it('colours a figure that counts a state, and leaves the plain total in ink', () => {
+    expect(queueFigureTone('to-review')).toBe('success');
+    expect(queueFigureTone('in-progress')).toBe('info');
+    expect(queueFigureTone('reviewed')).toBe('closed');
+    expect(queueFigureTone('all')).toBeUndefined();
   });
 });

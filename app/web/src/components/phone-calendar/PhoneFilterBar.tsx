@@ -28,6 +28,9 @@
  *
  * Zero-count facets are hidden, except an active one; see `phoneFacets` for
  * why that exception exists.
+ *
+ * Each facet carries its family's swatch, as the Candidates chips do, so the two
+ * vocabularies read the way their badges below do. The word stays the signal.
  */
 
 import { useId, type ReactNode } from 'react';
@@ -38,7 +41,8 @@ import type {
   PhoneCalendarView,
   PhoneFacet,
 } from './phoneCalendarFilters';
-import { Button, Combobox, GlassPanel, RetryButton, cx } from '../design';
+import { Button, Combobox, GlassPanel, RetryButton, cx, markVar, toneMark } from '../design';
+import type { StatusTone } from '../design';
 import { appointmentStatusTerm, engagementStateTerm } from './phoneVocabulary';
 
 /**
@@ -102,6 +106,12 @@ function pillClass(active: boolean): string {
       : 'bg-surface text-ink-secondary border border-[var(--control)] hover:bg-surface-secondary hover:text-ink',
   );
 }
+
+/**
+ * A facet's key, the box the Candidates chips draw (talent/PipelineBar.tsx). The
+ * class names it for forced colours, where every fill takes one colour.
+ */
+const SWATCH = 'data-fill h-2.5 w-3 shrink-0 rounded-sm border border-[var(--control)]';
 
 /** One half of the view switch: a printed segment, an ink fill when on. */
 function segmentClass(active: boolean): string {
@@ -178,13 +188,13 @@ function FacetGroup({
   legend,
   facets,
   dimension,
-  labelFor,
+  termFor,
   onToggle,
 }: {
   legend: string;
   facets: PhoneFacet[];
   dimension: 'status' | 'state';
-  labelFor: (value: string) => string;
+  termFor: (value: string) => { label: string; tone: StatusTone };
   onToggle: (dimension: 'status' | 'state', value: string) => void;
 }) {
   if (facets.length === 0) return null;
@@ -198,20 +208,30 @@ function FacetGroup({
         and it is an ordinary scroll box — its pills are the focus stops.
       */}
       <div className="mt-1 flex gap-1.5 max-sm:-mx-4 max-sm:overflow-x-auto max-sm:px-4 max-sm:pb-1 sm:flex-wrap">
-        {facets.map((facet) => (
-          <button
-            key={facet.value}
-            type="button"
-            aria-pressed={facet.active}
-            onClick={() => onToggle(dimension, facet.value)}
-            className={pillClass(facet.active)}
-          >
-            {labelFor(facet.value)}
-            <span className={cx('tabular-nums', facet.active ? 'text-white' : 'text-ink-tertiary')}>
-              {facet.count}
-            </span>
-          </button>
-        ))}
+        {facets.map((facet) => {
+          const term = termFor(facet.value);
+          return (
+            <button
+              key={facet.value}
+              type="button"
+              aria-pressed={facet.active}
+              onClick={() => onToggle(dimension, facet.value)}
+              className={pillClass(facet.active)}
+            >
+              {/* A ring in the pill's own text colour when pressed: on the ink fill,
+                  the darker marks would otherwise disappear. */}
+              <span
+                aria-hidden="true"
+                className={cx(SWATCH, facet.active && 'ring-[1.5px] ring-surface')}
+                style={{ backgroundColor: markVar(toneMark(term.tone)) }}
+              />
+              {term.label}
+              <span className={cx('tabular-nums', facet.active ? 'text-white' : 'text-ink-tertiary')}>
+                {facet.count}
+              </span>
+            </button>
+          );
+        })}
       </div>
     </fieldset>
   );
@@ -280,7 +300,7 @@ export function PhoneFilterBar({
               legend="Appointment"
               facets={holding ? HELD_FACETS : statusFacets}
               dimension="status"
-              labelFor={(v) => appointmentStatusTerm(v).label}
+              termFor={appointmentStatusTerm}
               onToggle={onToggle}
             />
           </div>
@@ -290,7 +310,7 @@ export function PhoneFilterBar({
                 legend="Engagement"
                 facets={engagements}
                 dimension="state"
-                labelFor={(v) => engagementStateTerm(v).label}
+                termFor={engagementStateTerm}
                 onToggle={onToggle}
               />
               {anyActive && !holding && (

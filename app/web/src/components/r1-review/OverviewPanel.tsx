@@ -9,9 +9,11 @@
 import { useId } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { Button, InlineNotice, StatusBadge } from '../design';
+import { Button, cx, InlineNotice, StatusBadge } from '../design';
+import { FAMILY_CLASSES, ratingFamily, verdictFamily } from '../design/tones';
 import { ScorePips } from '../session/ScoreVerdict';
 import { formatDateTime } from '../../lib/datetime';
+import { isEvidenceInsufficient } from '../../lib/evidence-hold';
 import { R1_RESULT_WITHHELD } from '../../lib/r1';
 import { attemptLabels, clockText } from '../../lib/r1-recording';
 import {
@@ -105,6 +107,7 @@ function MetricRow({
   scaleMax,
   quotes,
   detailHidden,
+  unusable,
   onOpenQuote,
 }: {
   metric: R1ReviewMetric;
@@ -113,8 +116,12 @@ function MetricRow({
   quotes: readonly EvidenceMark[];
   /** The API left the rationale out with the transcript. */
   detailHidden: boolean;
+  /** The page has just said these ratings gave no usable result, so none takes a family. */
+  unusable: boolean;
   onOpenQuote: (mark: EvidenceMark) => void;
 }) {
+  const family = unusable ? null : ratingFamily(metric.score, scaleMax);
+  const rated = family ? FAMILY_CLASSES[family].text : null;
   return (
     <li className="py-3">
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
@@ -126,9 +133,9 @@ function MetricRow({
         </p>
         {metric.score !== null ? (
           <p className="flex items-center gap-2 whitespace-nowrap">
-            <span className="text-label font-semibold text-ink">{scoreLabel(metric.score, scaleMax as 4)}</span>
-            <ScorePips level={metric.score} max={scaleMax} />
-            <span aria-hidden="true" className="text-meta tabular-nums text-ink-tertiary">
+            <span className={cx('text-label font-semibold', rated ?? 'text-ink')}>{scoreLabel(metric.score, scaleMax as 4)}</span>
+            <ScorePips level={metric.score} max={scaleMax} family={family} />
+            <span aria-hidden="true" className={cx('text-meta tabular-nums', rated ?? 'text-ink-tertiary')}>
               {metric.score}/{scaleMax}
             </span>
             <span className="sr-only">
@@ -136,6 +143,7 @@ function MetricRow({
             </span>
           </p>
         ) : (
+          // Not a rating, so not on the rating's scale: it needs a second look.
           <StatusBadge tone="warning">Insufficient evidence</StatusBadge>
         )}
       </div>
@@ -202,9 +210,16 @@ function PhoneLine({ review }: { review: R1ReviewResponse }) {
   const phone = review.phone_screening;
   if (!phone) return null;
   const result = phoneResultWords(phone);
+  // A held score is no verdict, so its words take no hue. A figure with no verdict has none either.
+  const family = isEvidenceInsufficient(phone) ? null : verdictFamily(phone.recommendation);
   return (
     <p className="text-sm text-ink-secondary">
-      Phone screening: {result ? `${result} (AI). ` : ''}
+      Phone screening: {result && (
+        <>
+          <span className={family ? FAMILY_CLASSES[family].text : undefined}>{result}</span>
+          {' (AI). '}
+        </>
+      )}
       <Link
         to={`/candidates/${review.round.candidate_id}?tab=phone`}
         className="text-ink underline underline-offset-2 hover:text-ink-secondary focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink)]"
@@ -290,6 +305,7 @@ function AttemptResult({ review, attempt, candidateName, onOpenTurn, onCheckAgai
               )
             )}
             {provisional && (
+              // "Provisional" needs a second look, in the same family as the stamp above it: see RoleScorecardView.
               <InlineNotice tone="warning" role="none" className="mt-3">
                 {`Provisional: scored from ${scoredCount} of ${metrics.length} metrics. The others lacked evidence and are left out of the weighted score, so confirm before deciding.`}
               </InlineNotice>
@@ -319,6 +335,7 @@ function AttemptResult({ review, attempt, candidateName, onOpenTurn, onCheckAgai
                   scaleMax={scaleMax}
                   quotes={marks.filter((mark) => mark.metricId === metric.metric_id)}
                   detailHidden={scored?.transcript_hidden === true}
+                  unusable={stage === 'not_scored'}
                   onOpenQuote={(mark) => open(mark.row, mark.startSec)}
                 />
               ))}

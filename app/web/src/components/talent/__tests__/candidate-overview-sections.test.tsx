@@ -143,3 +143,28 @@ describe('CandidateProfileCard intake wording', () => {
     expect(screen.queryByText('No resume')).toBeNull();
   });
 });
+
+describe('CandidateProfileCard phone number', () => {
+  const withPhone = (phone_valid: boolean) =>
+    ({
+      ...mockCandidate,
+      name: 'Test Person',
+      skills: [],
+      experience_years: null,
+      parsed: null,
+      phone_e164: '+919876543210',
+      phone_valid,
+    }) as CandidateDetail['candidate'];
+
+  it('marks an invalid number unresolved, as "Wrong number" is: nobody on our side failed', () => {
+    render(<CandidateProfileCard candidate={withPhone(false)} />);
+    const chip = screen.getByText('Invalid');
+    expect(chip).toHaveClass('bg-unresolved-soft', 'text-unresolved-text', 'ring-unresolved');
+    expect(chip.className).not.toContain('--c-negative');
+  });
+
+  it('adds no chip to a valid number', () => {
+    render(<CandidateProfileCard candidate={withPhone(true)} />);
+    expect(screen.queryByText('Invalid')).toBeNull();
+  });
+});

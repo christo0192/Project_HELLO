@@ -44,13 +44,27 @@ describe('chart colours come from the tokens', () => {
     expect(palette.tooltipBorder).toBe(value('--rule-2'));
   });
 
-  it('cycles through the ink steps in order, and never the voice hue or a fault colour', () => {
+  it('cycles through the four families in order, and never the voice hue or a fault colour', () => {
     const { colors } = chartPalette();
-    expect(colors).toEqual(['--ink', '--ink-3', '--ai', '--ink-2', '--control'].map(value));
+    expect(colors).toEqual(['--moving', '--ready', '--unresolved', '--closed', '--ink-3'].map(value));
     expect(new Set(colors).size).toBe(colors.length);
     for (const banned of ['--voice', '--voice-mark', '--danger', '--wash']) {
       expect(colors).not.toContain(value(banned));
     }
+  });
+
+  it('names each family, so a series that means one passes it, not its place in the cycle', () => {
+    expect(chartPalette().families).toEqual({
+      moving: value('--moving'),
+      ready: value('--ready'),
+      unresolved: value('--unresolved'),
+      closed: value('--closed'),
+    });
+  });
+
+  it('keeps axis, label and legend text in ink', () => {
+    const { text, subtext } = chartPalette();
+    expect([text, subtext]).toEqual(['--ink', '--ink-3'].map(value));
   });
 
   it('reads the whole chart folder and the dashboard', () => {

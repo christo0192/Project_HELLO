@@ -190,6 +190,101 @@ describe('a row', () => {
   });
 });
 
+describe('a fact reads as it does on the R1 tab and the review', () => {
+  const opened = async (rows: R1QueueRound[], search = '') => {
+    mockApi.listR1Queue.mockResolvedValue(answer({ total: rows.length, rounds: rows }));
+    open(search);
+    return (await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')!;
+  };
+  const NO_FAMILY = /\btext-(?:moving|ready|unresolved|closed)-text\b/;
+
+  it.each([
+    ['advance', 'Select', 'ready'],
+    ['hold', 'Borderline', 'unresolved'],
+    ['reject', 'Reject', 'closed'],
+  ] as const)('prints %s in its family: circle, word and figure', async (recommendation, word, family) => {
+    const row = await opened([round({ recommendation, overall: 58 })]);
+    expect(row.querySelector('[data-verdict-mark]')).toHaveClass(`text-${family}`);
+    expect(within(row).getByText(word).parentElement).toHaveClass(`text-${family}-text`);
+    expect(within(row).getByText('58')).not.toHaveClass('text-ink-secondary');
+  });
+
+  it.each<[string, Partial<R1QueueRound>]>([
+    ['Not scored', { status_write: 'human_review' }],
+    ['No result', { status: 'invited', attempts: [] }],
+    ['Scorecards are suppressed while an appeal is under review.', { scores_withheld: true }],
+  ])('leaves "%s" without a family', async (words, over) => {
+    const row = await opened([round({ recommendation: null, overall: null, status_write: null, ...over })]);
+    const cell = within(row).getByText(words);
+    expect(cell).toHaveClass('text-ink-secondary');
+    expect(cell.className).not.toMatch(NO_FAMILY);
+  });
+
+  it('leaves "Not scored" without a family on the row production sends, which keeps the figure the checks refused', async () => {
+    const row = await opened([round({ recommendation: null, overall: 42, status_write: 'human_review' })]);
+    const cell = within(row).getByText('Not scored');
+    expect(cell).toHaveClass('text-ink-secondary');
+    expect(cell.className).not.toMatch(NO_FAMILY);
+    expect(row.querySelector('[data-verdict-mark]')).toBeNull();
+    expect(within(row).queryByText('42')).toBeNull();
+  });
+
+  it.each([
+    ['invited', [], 'Link sent', 'moving'],
+    ['in_progress', [attempt({ counted: false })], 'Link open', 'moving'],
+    ['in_progress', [attempt({ in_progress: true, ended_at: null })], 'In progress', 'moving'],
+    ['completed', [attempt()], 'Completed', 'ready'],
+    ['expired', [], 'Expired', 'closed'],
+    ['cancelled', [], 'Cancelled', 'closed'],
+  ] as const)('prints a %s round as "%s" in its family, in both layouts', async (status, attempts, word, family) => {
+    const row = await opened([round({ status, attempts: [...attempts] })]);
+    const printed = within(row).getAllByText(word);
+    expect(printed).toHaveLength(2);
+    for (const span of printed) expect(span).toHaveClass(`text-${family}-text`);
+  });
+
+  it('takes a lapsed link\'s family from the word it prints, not the stored status', async () => {
+    const lapsed = round({ status: 'in_progress', expires_at: '2026-11-04T10:00:00.000Z', attempts: [attempt({ counted: false })] });
+    const row = await opened([lapsed]);
+    for (const span of within(row).getAllByText('Expired')) expect(span).toHaveClass('text-closed-text');
+  });
+
+  it.each([
+    ['ready', 'Ready', 'bg-ready-soft'],
+    ['partial', 'Partial', 'bg-unresolved-soft'],
+    ['processing', 'Processing', 'bg-moving-soft'],
+    ['deleted', 'Deleted', 'bg-closed-soft'],
+  ] as const)('puts a %s recording on its family\'s wash', async (state, word, wash) => {
+    const row = await opened([round({ attempts: [attempt({ recording: { state } })] })]);
+    expect(within(row).getByRole('cell', { name: `Recording: ${word}` }).querySelector('span')).toHaveClass(wash);
+  });
+
+  it('leaves No recording neutral', async () => {
+    const row = await opened([round({ attempts: [attempt({ recording: { state: 'none' } })] })]);
+    const tag = within(row).getByRole('cell', { name: 'Recording: No recording' }).querySelector('span');
+    expect(tag?.className).not.toMatch(/\bbg-(?:moving|ready|unresolved|closed)-soft\b/);
+  });
+
+  it.each([
+    ['', 'to-review', 'text-success-text'],
+    ['?view=in-progress', 'in-progress', 'text-moving-text'],
+    ['?view=reviewed', 'reviewed', 'text-closed-text'],
+    ['?view=all', 'all', 'text-ink'],
+  ] as const)('gives the figure on "%s" its view\'s family', async (search, view, shade) => {
+    mockApi.listR1Queue.mockResolvedValue(answer({ view, total: 12 }));
+    open(search);
+    await screen.findByRole('link', { name: 'Ava Example' });
+    expect(within(screen.getByTestId('queue-summary')).getByText('12')).toHaveClass(shade);
+  });
+
+  it('keeps a zero in ink, in a view that would colour it', async () => {
+    mockApi.listR1Queue.mockResolvedValue(answer({ total: 0, rounds: [] }));
+    open();
+    await screen.findByText('Nothing is waiting for review.');
+    expect(within(screen.getByTestId('queue-summary')).getByText('0')).toHaveClass('text-ink');
+  });
+});
+
 describe('changing what is shown', () => {
   it('a view goes into the address, back to its first page, with its own order', async () => {
     open('?page=3');

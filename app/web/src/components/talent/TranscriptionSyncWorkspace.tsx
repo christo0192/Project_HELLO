@@ -81,6 +81,7 @@ import type { ComboboxOption } from '../design/Combobox';
 import { Skeleton, SkeletonText } from '../design/Skeleton';
 import { CandidateButton, SurfaceCard } from '../design/candidate';
 import { cx } from '../design/cx';
+import { figureToneClass, ratingFamily } from '../design/tones';
 import {
   CandidateScorecard,
   CandidateScorecardNarrative,
@@ -126,16 +127,16 @@ import {
   sortLegs,
 } from './sessionLegs';
 import type { LegGroup, LegSeekMode } from './sessionLegs';
-import { formatDurationSec } from './status';
+import { ashbyLifecycleTone, formatDurationSec } from './status';
 import { formatDateTime } from '../../lib/datetime';
-import { isEvidenceInsufficient } from '../../lib/evidence-hold';
+import { isEvidenceInsufficient, isResultDisowned } from '../../lib/evidence-hold';
 import { buildEvidence } from '../../lib/evidence-quotes';
 import type { PlacedQuote } from '../../lib/evidence-quotes';
 import { formatIstDateTime, formatIstTime, istDateOf } from '../../lib/ist-datetime';
 import { latestScreeningAssessment } from '../../lib/latest-screening-assessment';
 import { sessionModeLabel } from '../../lib/session-mode';
 import { AI_SPEAKER_LABEL, presentTranscriptTurn } from '../../lib/transcript-presentation';
-import { readRoleScorecard } from '../session/scorecard-read';
+import { finiteNumber, readRoleScorecard } from '../session/scorecard-read';
 
 /** The player's own words, unchanged: recording wording does not move without Legal. */
 const RECORDING_NOTE = 'Recording loads on request; the link expires automatically.';
@@ -643,6 +644,7 @@ export function TranscriptionSyncWorkspace({
   // The fallback row can be another call's, and must then never read as this one's.
   const otherCallScorecard =
     sessionAssessment === null && scorecardAssessment !== null && scorecardAssessment.session_id !== selectedSessionId;
+  const scorecardHeld = isEvidenceInsufficient(scorecardAssessment);
 
   const reviewCard = useMemo(() => {
     if (blocked || !scorecardAssessment) return null;
@@ -673,6 +675,17 @@ export function TranscriptionSyncWorkspace({
   const quoteNamed = useCallback(
     (number: number) => evidence.placed.find((quote) => quote.number === number) ?? null,
     [evidence],
+  );
+  // Each number takes the family of the rating of the metric it cites. A held scorecard's stay ink.
+  const familyOfMetric = useMemo(
+    () =>
+      new Map(
+        (reviewCard?.metrics ?? []).map((metric) => [
+          metric.id,
+          scorecardHeld ? null : ratingFamily(finiteNumber(metric.score), reviewCard?.scoreScaleMax),
+        ]),
+      ),
+    [reviewCard, scorecardHeld],
   );
 
   /** A placed quote's moment, printed the way its row prints it. */
@@ -838,9 +851,10 @@ export function TranscriptionSyncWorkspace({
           number: quote.number,
           sec: at,
           label: `Evidence ${quote.number}: turn ${quote.row + 1} at ${timecode(at)}, ${quote.metricName}`,
+          family: familyOfMetric.get(quote.metricId) ?? null,
         }];
       }),
-    [evidence, rows],
+    [evidence, rows, familyOfMetric],
   );
 
   // Turns folded into the consent line, and how a row of a list finds its quotes.
@@ -852,12 +866,18 @@ export function TranscriptionSyncWorkspace({
         if (index < 0) continue;
         byRow.set(index, [
           ...(byRow.get(index) ?? []),
-          { number: quote.number, metricName: quote.metricName, start: quote.start, end: quote.end },
+          {
+            number: quote.number,
+            metricName: quote.metricName,
+            start: quote.start,
+            end: quote.end,
+            family: familyOfMetric.get(quote.metricId) ?? null,
+          },
         ]);
       }
       return byRow;
     },
-    [evidence],
+    [evidence, familyOfMetric],
   );
 
   const foldIn = (toListIndex: (row: number) => number): ConsentFold | null => {
@@ -1018,8 +1038,11 @@ export function TranscriptionSyncWorkspace({
   const scorecardSent = scorecardSentNote(
     ashbyWorkflow?.operations.find((op) => op.type === 'scorecard_write'),
     selectedSession?.created_at,
-    isEvidenceInsufficient(scorecardAssessment),
+    scorecardHeld,
   );
+
+  // The same word in the same family as the workflow card. Consent lines take no colour.
+  const lifecycleTone = ashbyWorkflow ? ashbyLifecycleTone(ashbyWorkflow.lifecycle) : 'neutral';
 
   /* The log header: one ruled row of labelled cells. */
   const logHeader = (
@@ -1064,8 +1087,15 @@ export function TranscriptionSyncWorkspace({
       <LogCell label="In Ashby">
         {ashbyWorkflow ? (
           <>
-            {ashbyLifecycleLabel(ashbyWorkflow.lifecycle)}
-            {scorecardSent && <span className="text-ink-tertiary"> · {scorecardSent}</span>}
+            <span className={lifecycleTone === 'neutral' ? undefined : figureToneClass(lifecycleTone)}>
+              {ashbyLifecycleLabel(ashbyWorkflow.lifecycle)}
+            </span>
+            {scorecardSent && (
+              <span className="text-ink-tertiary">
+                {' · '}
+                <span className="text-ready-text">{scorecardSent}</span>
+              </span>
+            )}
           </>
         ) : ashbyWorkflow === null ? (
           'Not linked'
@@ -1314,6 +1344,7 @@ export function TranscriptionSyncWorkspace({
           checks={otherCallScorecard ? [] : drops.map(dropWords)}
           redFlags={redFlagsOf(scorecardAssessment)}
           otherCall={otherCallScorecard}
+          held={scorecardHeld}
         />
       ) : !detailReady && !transcriptError && !permissionDenied && !blocked ? (
         <div role="status" aria-label="Loading the scorecard">
@@ -1490,7 +1521,7 @@ function ScorecardBlock({
           Scorecards are suppressed while an appeal is under review.
         </p>
       ) : v2 ? (
-        <CandidateScorecardV2 scorecard={v2} />
+        <CandidateScorecardV2 scorecard={v2} held={isResultDisowned(assessment)} />
       ) : assessment ? (
         <CandidateScorecard assessment={assessment} narrative="none" roleFit="none" />
       ) : (

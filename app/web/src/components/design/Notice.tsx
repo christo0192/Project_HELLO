@@ -2,9 +2,12 @@
  * Notices and empty/error panels.
  *
  * `InlineNotice`: a one-line status or alert with a tone dot. Small text is
- * always ink, and a notice appears at once: it is news, not an entrance.
+ * always ink, and a notice appears at once: it is news, not an entrance. `success`
+ * and `warning` take their family's wash and dot, and a fault its hue on its edge
+ * and dot. `info` is a plain note, not "underway", so it stays on the shaded field.
+ * `ink` takes no hue, for a notice that must not read as any family.
  * `EmptyPanel` / `ErrorPanel`: quiet, centred states that sit inside a panel
- * without adding another card. Only a fault carries a hue, on its edge and dot.
+ * without adding another card.
  *
  * Type: messages are body (14/20); an empty state's title is body-medium and
  * its hint the label step (13/20, tertiary). Centred copy wraps with
@@ -15,7 +18,7 @@ import { plainErrorText } from '../../lib/api-error-copy';
 import { Button } from './Button';
 import { cx } from './cx';
 
-export type NoticeTone = 'info' | 'success' | 'warning' | 'danger' | 'neutral';
+export type NoticeTone = 'info' | 'success' | 'warning' | 'danger' | 'neutral' | 'ink';
 
 const toneTint: Record<NoticeTone, string> = {
   info: 'border-line-strong bg-info-soft',
@@ -23,6 +26,7 @@ const toneTint: Record<NoticeTone, string> = {
   warning: 'border-line-strong bg-warning-soft',
   danger: 'border-error bg-error-soft',
   neutral: 'border-line-strong bg-surface-secondary',
+  ink: 'border-line-strong bg-surface-secondary',
 };
 
 const toneDot: Record<NoticeTone, string> = {
@@ -31,6 +35,7 @@ const toneDot: Record<NoticeTone, string> = {
   warning: 'bg-warning',
   danger: 'bg-error',
   neutral: 'bg-ink-muted',
+  ink: 'bg-ink-secondary',
 };
 
 export interface InlineNoticeProps {

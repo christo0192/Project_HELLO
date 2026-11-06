@@ -70,7 +70,7 @@ export function AppealPage() {
 
   if (submitted) {
     return (
-      <div className="app-ground flex min-h-screen items-start justify-center px-4 py-10">
+      <div className="app-ground keep-ink flex min-h-screen items-start justify-center px-4 py-10">
         <main className="w-full max-w-2xl">
           <GlassPanel level="strong" padding="lg">
             <h1 className="text-title text-ink">Appeal submitted</h1>

@@ -1194,7 +1194,7 @@ const AUDIT_ACTIONS: Array<[action: string, targetType: string, result: string]>
   ['resource_update', 'scorecard_metric', 'success'],
   ['ashby_mapping_update', 'ashby_mapping', 'success'],
   ['quota_override', 'quota_policy', 'success'],
-  ['admin_maintenance_toggle', 'config', 'denied'],
+  ['admin_maintenance_toggle', 'config', 'failure'],
   ['recording_download', 'call_session', 'success'],
   ['export_requested', 'candidate', 'success'],
 ];

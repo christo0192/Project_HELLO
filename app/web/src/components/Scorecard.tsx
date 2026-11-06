@@ -19,9 +19,11 @@
  * weight as a data label, not baked into the heading text. Communication's
  * sub-parts (English, speech signals) sit in one sunken grid under it, so
  * they read as part of that dimension rather than as dimensions of their
- * own. Bars fill in the accent for every reading: several of them (filler
- * "impact") are better when LOW, so a red/amber/green fill keyed to the
- * value painted a good result as an alarm. The number is the reading.
+ * own. A reading's figure and bar take its band's family, by the same map as
+ * the Review tab's bars (`design/tones`), so one number keeps one colour on both
+ * cards. A filler or native-language "impact" is not better when high, so it stays ink,
+ * and so does every reading on a row held for thin evidence. The number is the
+ * reading.
  *
  * `layout="split"` is for a full-width host (the screening console): from
  * `lg` up each dimension puts its heading in a left column and its readings
@@ -34,9 +36,11 @@ import type { Assessment } from '../types';
 import { humanizeEnum } from '../lib/humanize';
 import { cx, StatusBadge } from './design';
 import type { StatusTone } from './design';
+import { BAND_FAMILY, FAMILY_CLASSES, meterBand } from './design/tones';
 import { RoleScorecardView } from './session/RoleScorecardView';
 import { ScoreVerdict } from './session/ScoreVerdict';
 import { EvidenceHoldNotice } from './talent/EvidenceHoldNotice';
+import { isEvidenceInsufficient } from '../lib/evidence-hold';
 import { finiteNumber, isRecord } from './session/scorecard-read';
 import type { ScorecardLayout } from './session/scorecard-read';
 
@@ -64,28 +68,32 @@ const WEIGHT = {
   role_fit: '20%',
 } as const;
 
-/** An AI judgement about a candidate stays in ink: crimson means our fault. */
+/** A signal level is neither a verdict nor a rating, so it stays in ink: a stronger signal is darker ink, never a hue. */
 const SIGNAL_TONE: Record<string, StatusTone> = {
-  none: 'success',
-  low: 'success',
-  moderate: 'warning',
-  high: 'warning',
+  none: 'ink-2',
+  low: 'ink-2',
+  moderate: 'ink',
+  high: 'ink',
 };
 
-/** A 0–10 reading with its bar. Renders nothing when there is no number to show. */
-function ScoreBar({ label, value }: { label: string; value: unknown }) {
+/**
+ * A 0–10 reading with its bar, in its band's family. Renders nothing when there is no number to show.
+ * `plain` is ink: a reading where a high value is not a good one, or one on a held row.
+ */
+function ScoreBar({ label, value, plain = false }: { label: string; value: unknown; plain?: boolean }) {
   const n = finiteNumber(value);
   if (n == null) return null;
   const safe = Math.max(0, Math.min(10, n));
   const shown = Math.round(safe * 10) / 10;
+  const shades = plain ? null : FAMILY_CLASSES[BAND_FAMILY[meterBand(safe, 10)]];
   return (
     <div>
       <div className="flex items-baseline justify-between gap-3 text-label">
         <span className="text-ink-secondary">{label}</span>
-        <span className="font-semibold tabular-nums text-ink">{`${shown}/10`}</span>
+        <span className={cx('font-semibold tabular-nums', shades?.text ?? 'text-ink')}>{`${shown}/10`}</span>
       </div>
       <div aria-hidden="true" className="mt-1.5 h-1 overflow-hidden rounded-full bg-ink/[0.07]">
-        <div className="data-fill h-full rounded-full bg-info" style={{ width: `${safe * 10}%` }} />
+        <div className={cx('data-fill h-full rounded-full', shades?.fill ?? 'bg-info')} style={{ width: `${safe * 10}%` }} />
       </div>
     </div>
   );
@@ -177,6 +185,7 @@ function PartGrid({ cells }: { cells: PartCell[] }) {
   );
 }
 
+/** A skill, a gap or a flag is neither a verdict nor a rating, so its chip takes no status family. */
 function ChipGroup({ label, items, tone }: { label: string; items: string[]; tone: StatusTone }) {
   return (
     <div>
@@ -215,7 +224,8 @@ function signalCell(key: string, label: string, signal: unknown): PartCell | nul
           ) : null
         }
       >
-        <ScoreBar label="Impact" value={signal.impact_score} />
+        {/* A filler or native-language impact is not better when high, so it is not coloured as if it were. */}
+        <ScoreBar label="Impact" value={signal.impact_score} plain />
         {examples.length > 0 && (
           <p className="text-label text-ink-secondary">
             <span className="font-medium text-ink">Examples:</span> {examples.join(', ')}
@@ -247,6 +257,8 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
   const sentiment = text(tone?.sentiment);
   const band = text(english?.band);
   const hasDimension = Boolean(communication || motivation || tone || roleFit);
+  // A score held for thin evidence is no result to act on, so no reading on the card takes a hue.
+  const held = isEvidenceInsufficient(assessment);
 
   const parts = [
     english
@@ -258,17 +270,17 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
               title="English band"
               aside={
                 band ? (
-                  <StatusBadge dot={false} tone="info">
+                  <StatusBadge dot={false}>
                     {band}
                   </StatusBadge>
                 ) : null
               }
             >
               <Bars>
-                <ScoreBar label="Grammar" value={english.grammar} />
-                <ScoreBar label="Vocabulary" value={english.vocabulary} />
-                <ScoreBar label="Fluency" value={english.fluency} />
-                <ScoreBar label="Coherence" value={english.coherence} />
+                <ScoreBar label="Grammar" value={english.grammar} plain={held} />
+                <ScoreBar label="Vocabulary" value={english.vocabulary} plain={held} />
+                <ScoreBar label="Fluency" value={english.fluency} plain={held} />
+                <ScoreBar label="Coherence" value={english.coherence} plain={held} />
               </Bars>
               {text(english.notes) && (
                 <p className="max-w-prose text-label text-ink-tertiary">{text(english.notes)}</p>
@@ -283,7 +295,12 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
 
   return (
     <div>
-      <ScoreVerdict overall={row.overall_score} recommendation={row.recommendation} summary={row.summary} />
+      <ScoreVerdict
+        overall={row.overall_score}
+        recommendation={row.recommendation}
+        summary={row.summary}
+        held={held}
+      />
 
       <div className="mt-6 divide-y divide-glass-ring border-t border-glass-ring">
         {hasDimension && (
@@ -291,11 +308,11 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
             {communication ? (
               <>
                 <Bars>
-                  <ScoreBar label="Score" value={communication.score} />
-                  <ScoreBar label="Clarity" value={communication.clarity} />
-                  <ScoreBar label="Structure" value={communication.structure} />
-                  <ScoreBar label="Listening" value={communication.listening} />
-                  <ScoreBar label="Rapport" value={communication.rapport} />
+                  <ScoreBar label="Score" value={communication.score} plain={held} />
+                  <ScoreBar label="Clarity" value={communication.clarity} plain={held} />
+                  <ScoreBar label="Structure" value={communication.structure} plain={held} />
+                  <ScoreBar label="Listening" value={communication.listening} plain={held} />
+                  <ScoreBar label="Rapport" value={communication.rapport} plain={held} />
                 </Bars>
                 <Prose>{text(communication.notes)}</Prose>
               </>
@@ -310,7 +327,7 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
           <Dimension title="Motivation" weight={WEIGHT.motivation} split={split}>
             {motivation && finiteNumber(motivation.score) != null && (
               <Bars>
-                <ScoreBar label="Score" value={motivation.score} />
+                <ScoreBar label="Score" value={motivation.score} plain={held} />
               </Bars>
             )}
             <Prose>
@@ -322,9 +339,9 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
         {tone && (
           <Dimension title="Tone" weight={WEIGHT.tone} split={split}>
             <Bars>
-              <ScoreBar label="Clarity" value={tone.clarity} />
-              <ScoreBar label="Confidence" value={tone.confidence} />
-              <ScoreBar label="Professionalism" value={tone.professionalism} />
+              <ScoreBar label="Clarity" value={tone.clarity} plain={held} />
+              <ScoreBar label="Confidence" value={tone.confidence} plain={held} />
+              <ScoreBar label="Professionalism" value={tone.professionalism} plain={held} />
             </Bars>
             {sentiment && (
               <div className="flex items-center gap-3 text-label">
@@ -340,13 +357,13 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
           <Dimension title="Role fit" weight={WEIGHT.role_fit} split={split}>
             {finiteNumber(roleFit.score) != null && (
               <Bars>
-                <ScoreBar label="Fit score" value={roleFit.score} />
+                <ScoreBar label="Fit score" value={roleFit.score} plain={held} />
               </Bars>
             )}
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-              <ChipGroup label="Matched skills" items={strings(roleFit.matched_skills)} tone="success" />
-              <ChipGroup label="Gaps" items={strings(roleFit.gaps)} tone="warning" />
-              <ChipGroup label="Red flags" items={strings(roleFit.red_flags)} tone="warning" />
+              <ChipGroup label="Matched skills" items={strings(roleFit.matched_skills)} tone="ink-2" />
+              <ChipGroup label="Gaps" items={strings(roleFit.gaps)} tone="ink" />
+              <ChipGroup label="Red flags" items={strings(roleFit.red_flags)} tone="ink" />
             </div>
             <Prose>{text(roleFit.notes)}</Prose>
           </Dimension>
@@ -365,7 +382,7 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
           >
             <div className="flex items-center gap-2 self-start">
               <h3 className="text-sm font-semibold text-ink">Resume conflicts</h3>
-              <span className="rounded-chip bg-warning-soft px-2 py-0.5 text-xs font-medium tabular-nums text-warning-text">
+              <span className="rounded-chip bg-surface-secondary px-2 py-0.5 text-xs font-medium tabular-nums text-ink">
                 {conflicts.length}
               </span>
             </div>
@@ -377,7 +394,7 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
                   <li key={i} className="py-3 first:pt-0 last:pb-0">
                     <div className="flex items-start justify-between gap-3">
                       <p className="text-label font-semibold text-ink">{text(c.topic) || 'Conflict'}</p>
-                      <StatusBadge tone={resolved ? 'success' : 'warning'}>
+                      <StatusBadge tone={resolved ? 'ink-2' : 'ink'}>
                         {resolved ? 'Resolved' : 'Unresolved'}
                       </StatusBadge>
                     </div>

@@ -25,8 +25,10 @@ import type {
   ScorecardMetricDisplay,
   ScoreScaleMax,
 } from '../../types';
+import { isResultDisowned } from '../../lib/evidence-hold';
 import { formatWeightPercent } from '../../lib/scorecard-weights';
 import { cx, InlineNotice, StatusBadge } from '../design';
+import { FAMILY_CLASSES, ratingFamily } from '../design/tones';
 import { ScorePips, ScoreVerdict } from './ScoreVerdict';
 import { finiteNumber, readRoleScorecard } from './scorecard-read';
 import type { ScorecardLayout } from './scorecard-read';
@@ -40,11 +42,13 @@ function MetricRow({
   index,
   scaleMax,
   split,
+  held,
 }: {
   metric: ScorecardMetricDisplay;
   index: number;
   scaleMax: ScoreScaleMax;
   split: boolean;
+  held: boolean;
 }) {
   const id = text(metric.id);
   const rawName = text(metric.name);
@@ -55,6 +59,8 @@ function MetricRow({
   const weightBps = finiteNumber(metric.weightBps);
   const rationale = text(metric.rationale);
   const refs = Array.isArray(metric.evidenceRefs) ? metric.evidenceRefs.map(text).filter(Boolean) : [];
+  const family = held ? null : ratingFamily(score, scaleMax);
+  const rated = family ? FAMILY_CLASSES[family].text : null;
 
   return (
     <li
@@ -82,9 +88,9 @@ function MetricRow({
         </div>
         {score != null ? (
           <p className="flex items-center gap-2.5 whitespace-nowrap">
-            <span className="text-label font-semibold text-ink">{scoreLabel(score, scaleMax)}</span>
-            <ScorePips level={score} max={scaleMax} />
-            <span aria-hidden="true" className="text-xs tabular-nums text-ink-tertiary">
+            <span className={cx('text-label font-semibold', rated ?? 'text-ink')}>{scoreLabel(score, scaleMax)}</span>
+            <ScorePips level={score} max={scaleMax} family={family} />
+            <span aria-hidden="true" className={cx('text-xs tabular-nums', rated ?? 'text-ink-tertiary')}>
               {score}/{scaleMax}
             </span>
             <span className="sr-only">
@@ -93,6 +99,7 @@ function MetricRow({
           </p>
         ) : (
           <span className="self-start">
+            {/* Not a rating, so not on the rating's scale: it needs a second look. */}
             <StatusBadge tone="warning">Insufficient evidence</StatusBadge>
           </span>
         )}
@@ -134,7 +141,14 @@ export function RoleScorecardView({
       </p>
     );
   }
-  return <RoleScorecardBody scorecard={scorecard} summary={assessment.summary} layout={layout} />;
+  return (
+    <RoleScorecardBody
+      scorecard={scorecard}
+      summary={assessment.summary}
+      layout={layout}
+      held={isResultDisowned(assessment)}
+    />
+  );
 }
 
 /** The verdict and the metric list for an already-read v2 scorecard. */
@@ -142,11 +156,14 @@ export function RoleScorecardBody({
   scorecard,
   summary,
   layout = 'stacked',
+  held = false,
 }: {
   scorecard: ScorecardAssessmentDisplay;
   /** The model's summary, shown under the verdict; omit where the page shows it elsewhere. */
   summary?: unknown;
   layout?: ScorecardLayout;
+  /** Held for thin evidence, or an R1 row with no usable result (`isResultDisowned`): the verdict and the ratings take no hue. */
+  held?: boolean;
 }) {
   const metricsId = useId();
   const scaleMax = scorecard.scoreScaleMax;
@@ -163,6 +180,7 @@ export function RoleScorecardBody({
         overall={overall}
         recommendation={scorecard.recommendation}
         summary={summary}
+        held={held}
         detail={
           weighted != null ? (
             <span className="text-ink-tertiary">
@@ -173,6 +191,7 @@ export function RoleScorecardBody({
         }
       >
         {incomplete && (
+          // "Provisional" needs a second look, in the family it takes on Review and on the R1 stamp.
           <InlineNotice tone="warning" role="none" className="mt-4">
             {overall == null
               ? 'No metric had enough evidence to score. This screening needs a human review.'
@@ -203,6 +222,7 @@ export function RoleScorecardBody({
                 index={i}
                 scaleMax={scaleMax}
                 split={layout === 'split'}
+                held={held}
               />
             ))}
           </ol>

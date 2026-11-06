@@ -711,6 +711,26 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     expect(screen.queryByText('Not queued for write-back')).toBeNull();
   });
 
+  it.each([
+    ['imported', 'Imported', 'info'],
+    ['processing', 'Processing', 'info'],
+    ['ready', 'Ready to screen', 'info'],
+    ['completed', 'Screening complete', 'success'],
+    // Olive beside blue for one state was the fault: it reads the candidate card's map now.
+    ['writeback_pending', 'Writing back to Ashby', 'info'],
+    ['cancelled', 'Cancelled', 'closed'],
+    ['a_later_state', 'A later state', 'neutral'],
+  ])('prints the lifecycle %s as %s in the %s tone', async (lifecycle, word, tone) => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], lifecycle, sessionStatus: null }],
+    });
+    renderPage();
+    const badge = (await screen.findByTitle(lifecycle)).closest('[data-status-badge]');
+    expect(badge).toHaveTextContent(word);
+    expect(badge).toHaveAttribute('data-status-badge', tone);
+  });
+
   it('does not flag a terminal application', async () => {
     listAshbyWorkflows.mockResolvedValue({
       ok: true,
@@ -731,6 +751,20 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     expect(screen.queryByRole('button', { name: /invite link/i })).toBeNull();
     expect(screen.queryByRole('button', { name: 'More actions for app_1' })).toBeNull();
     expect(deliverAshbyManualInvite).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['withdrawn', 'Withdrawn'],
+    ['deleted', 'Deleted in Ashby'],
+    ['manual_stage_cancel', 'Cancelled by an admin'],
+  ])('prints terminal state %s as closed, the same family as the candidate card', async (terminalState, word) => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], terminalState }],
+    });
+    renderPage();
+    const chip = (await screen.findByText(word)).closest('[data-status-badge]');
+    expect(chip).toHaveAttribute('data-status-badge', 'closed');
   });
 
   it('a completed screening leads with Review screening; the invite moves into More', async () => {

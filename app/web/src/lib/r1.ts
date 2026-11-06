@@ -49,14 +49,15 @@ export const R1_STATUS_LABEL: Readonly<Record<R1RoundStatus, string>> = {
   cancelled: 'Cancelled',
 };
 
-export type R1Tone = 'neutral' | 'accent' | 'positive' | 'caution' | 'negative';
+export type R1Tone = 'neutral' | 'moving' | 'ready' | 'closed';
 
+/** A round is a process state, so it takes a status family (design/Tag.tsx). */
 export const R1_STATUS_TONE: Readonly<Record<R1RoundStatus, R1Tone>> = {
-  invited: 'accent',
-  in_progress: 'accent',
-  completed: 'positive',
-  expired: 'neutral',
-  cancelled: 'neutral',
+  invited: 'moving',
+  in_progress: 'moving',
+  completed: 'ready',
+  expired: 'closed',
+  cancelled: 'closed',
 };
 
 export function r1StatusLabel(status: string): string {
@@ -73,6 +74,12 @@ export const R1_RECOMMENDATION_LABEL: Readonly<Record<R1Recommendation, string>>
 /** A round's result while an appeal blocks decision use: the Review tab's own sentence, not new copy. */
 export const R1_RESULT_WITHHELD = 'Scorecards are suppressed while an appeal is under review.';
 
+/** The round `r1ResultLine` speaks for, so the page can print that line in its verdict's family. */
+export function r1ResultRound(rounds: readonly R1Round[]): R1Round | null {
+  const round = rounds.find((item) => item.recommendation !== null && item.is_staff_dry_run !== true);
+  return round && round.scores_withheld !== true ? round : null;
+}
+
 /**
  * The line under the phone score in the candidate header, from the newest round with a result (the
  * rounds arrive newest first). Null when there is none, or while the result is withheld.
@@ -82,8 +89,8 @@ export const R1_RESULT_WITHHELD = 'Scorecards are suppressed while an appeal is 
  * run promises no decision use, so its result is never the candidate's.
  */
 export function r1ResultLine(rounds: readonly R1Round[]): string | null {
-  const round = rounds.find((item) => item.recommendation !== null && item.is_staff_dry_run !== true);
-  if (!round?.recommendation || round.scores_withheld === true) return null;
+  const round = r1ResultRound(rounds);
+  if (!round?.recommendation) return null;
   const figure = round.overall === null ? '' : ` ${Math.round(round.overall)}`;
   return `R1 role-play: ${R1_RECOMMENDATION_LABEL[round.recommendation]}${figure} (AI)`;
 }
@@ -571,12 +578,15 @@ export function readingMonthLabel(readAt: string): string {
 
 export type UsageTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
 
-/** Alert bands from the plan (§3.3): 60 / 75 / 90 % of the line. */
-export function usageTone(percent: number | null): UsageTone {
+/**
+ * Alert bands from the plan (§3.3), as a share of the line. From 75% it wants a
+ * second look, and the middle band claims nothing. A rate is never crimson, which
+ * means a fault on our side, and using the pool is not "underway".
+ */
+export function usageTone(percent: number | null): Extract<UsageTone, 'neutral' | 'success' | 'warning'> {
   if (percent === null) return 'neutral';
-  if (percent >= 90) return 'danger';
   if (percent >= 75) return 'warning';
-  if (percent >= 60) return 'info';
+  if (percent >= 60) return 'neutral';
   return 'success';
 }
 

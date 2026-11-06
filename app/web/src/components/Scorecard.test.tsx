@@ -186,6 +186,88 @@ describe('Scorecard (legacy v1)', () => {
     expect(container.querySelector('[data-status-badge="danger"]')).toBeNull();
   });
 
+  it('prints a skill, a gap and a flag in ink, and only the verdict takes a family: no status family on any chip', () => {
+    const { container } = render(
+      <Scorecard
+        assessment={{
+          ...baseAssessment,
+          role_fit: {
+            ...baseAssessment.role_fit,
+            matched_skills: ['TypeScript'],
+            gaps: ['Kubernetes'],
+            red_flags: ['Ended the call early'],
+          },
+          resume_conflicts: [
+            { topic: 'Tenure', resume_says: '5 years', candidate_said: '3 years', resolved: true, note: '' },
+            { topic: 'Title', resume_says: 'Lead', candidate_said: 'Senior', resolved: false, note: '' },
+          ],
+        }}
+      />,
+    );
+    const badges = [...container.querySelectorAll('[data-status-badge]')];
+    expect(badges.length).toBeGreaterThan(4);
+    const inkOnly = new Set(['neutral', 'ink', 'ink-2']);
+    for (const badge of badges) expect(inkOnly, badge.textContent ?? '').toContain(badge.getAttribute('data-status-badge'));
+    for (const badge of badges) {
+      expect(badge.outerHTML).not.toMatch(/\b(?:bg|text)-(?:success|warning|moving|ready|unresolved|closed)/);
+    }
+    expect(container.querySelector('[data-recommendation="advance"]')).toHaveClass('text-ready-text');
+  });
+
+  it('gives a chip exactly the ink it had before the families came back', () => {
+    const { container } = render(
+      <Scorecard
+        assessment={{
+          ...baseAssessment,
+          role_fit: {
+            ...baseAssessment.role_fit,
+            matched_skills: ['TypeScript'],
+            gaps: ['Kubernetes'],
+            red_flags: ['Ended the call early'],
+          },
+          resume_conflicts: [
+            { topic: 'Tenure', resume_says: '5 years', candidate_said: '3 years', resolved: true, note: '' },
+            { topic: 'Title', resume_says: 'Lead', candidate_said: 'Senior', resolved: false, note: '' },
+          ],
+        }}
+      />,
+    );
+    const badge = (word: string) => screen.getByText(word).closest('[data-status-badge]') as HTMLElement;
+    const dot = (word: string) => badge(word).querySelector('[aria-hidden="true"]');
+    // The heavier ink says a gap, a red flag or an unresolved conflict is the one to read.
+    for (const word of ['Kubernetes', 'Ended the call early', 'Unresolved']) {
+      expect(badge(word), word).toHaveClass('bg-surface-secondary', 'text-ink');
+    }
+    for (const word of ['TypeScript', 'Resolved']) {
+      expect(badge(word), word).toHaveClass('bg-surface-secondary', 'text-ink-secondary');
+    }
+    expect(dot('Unresolved')).toHaveClass('bg-ink-secondary');
+    expect(dot('Resolved')).toHaveClass('bg-ink-secondary');
+    expect(container.querySelector('.bg-ink-muted')).toBeNull();
+  });
+
+  it.each([
+    ['moderate', 'Moderate', 'ink'],
+    ['high', 'High', 'ink'],
+    ['low', 'Low', 'ink-2'],
+    ['none', 'None', 'ink-2'],
+    ['something_new', 'Something new', 'neutral'],
+  ])('prints a %s signal level in ink, the heavier step only where it matters', (level, word, tone) => {
+    render(
+      <Scorecard
+        assessment={
+          {
+            ...baseAssessment,
+            communication: { ...baseAssessment.communication, filler_usage: { level, impact_score: 4, examples: [], notes: '' } },
+          } as unknown as Assessment
+        }
+      />,
+    );
+    // "None" is also what an empty chip group prints, with no badge around it.
+    const chip = screen.getAllByText(word).map((node) => node.closest('[data-status-badge]')).find(Boolean);
+    expect(chip).toHaveAttribute('data-status-badge', tone);
+  });
+
   it('renders the conflict section when conflicts exist', () => {
     const assessmentWithConflicts: Assessment = {
       ...baseAssessment,
@@ -250,6 +332,165 @@ describe('Scorecard (legacy v1)', () => {
   });
 });
 
+describe('Scorecard held for thin evidence', () => {
+  const HOLD_NOTICE = 'Not enough interview evidence to decide';
+
+  it('gives a held legacy row no hue under its notice, and leaves the same row in colour when it is not held', () => {
+    const held: Assessment = { ...baseAssessment, evidence_grade: 'insufficient', evidence_reason: 'partial_thin' };
+    const { container, rerender } = render(<Scorecard assessment={held} />);
+    expect(screen.getByText(HOLD_NOTICE)).toBeInTheDocument();
+    expect(screen.getByText('78')).toHaveClass('text-ink');
+    expect(container.querySelector('[data-recommendation="advance"]')).toHaveClass('text-ink');
+    expect(container.querySelector('[data-verdict-mark]')).toHaveClass('text-ink');
+    rerender(<Scorecard assessment={baseAssessment} />);
+    expect(screen.getByText('78')).toHaveClass('text-ready-text');
+  });
+
+  it('gives a held role scorecard no hue, its figure, its mark and its rows', () => {
+    const { container } = render(
+      <Scorecard assessment={v2Assessment({ evidence_grade: 'insufficient', evidence_reason: 'partial_thin' })} />,
+    );
+    expect(screen.getByText(HOLD_NOTICE)).toBeInTheDocument();
+    expect(screen.getByText('86')).toHaveClass('text-ink');
+    expect(screen.getByText('Excellent')).toHaveClass('text-ink');
+    expect(container.querySelector('[data-verdict-mark]')).toHaveClass('text-ink');
+    expect(container.querySelector('ol')!.innerHTML).not.toMatch(/(?:bg|text)-(?:ready|closed)/);
+  });
+});
+
+describe('Scorecard on an R1 row', () => {
+  /** A real shape: `input.recommendation === 'human_review' ? null`, and raw keeps the truth (r1-assessment.ts). */
+  const r1Row = (recommendation: string | null, stored: string, r1: Record<string, unknown>) => {
+    const row = v2Assessment({ recommendation });
+    return { ...row, raw: { ...row.raw, recommendation: stored, r1 } } as unknown as Assessment;
+  };
+  const FAILED_GATE = { outcome: 'scored', valid: false, gate: { passed: false, failures: ['roleplay_too_short'] } };
+
+  it('prints the ratings of a failed gate in ink, the words and figures unchanged, with no hold notice', () => {
+    const { container } = render(<Scorecard assessment={r1Row(null, 'human_review', FAILED_GATE)} />);
+    expect(container.querySelector('[data-recommendation="human_review"]')).toHaveClass('text-ink');
+    expect(screen.getByText('Needs human review')).toBeInTheDocument();
+    expect(screen.getByText('86')).toHaveClass('text-ink');
+    const ratings = container.querySelector('ol')!;
+    expect(within(ratings).getByText('Excellent')).toHaveClass('text-ink');
+    expect(within(ratings).getByText('Average')).toHaveClass('text-ink');
+    expect(within(ratings).getByText('4/4')).toBeInTheDocument();
+    expect(within(ratings).getByText('2/4')).toBeInTheDocument();
+    expect(ratings.querySelectorAll('.data-fill.bg-info')).toHaveLength(6);
+    expect(ratings.innerHTML).not.toMatch(/(?:bg|text)-(?:ready|closed)/);
+    expect(screen.queryByText('Not enough interview evidence to decide')).toBeNull();
+  });
+
+  it('keeps a valid R1 row in colour', () => {
+    const { container } = render(<Scorecard assessment={r1Row('advance', 'advance', { outcome: 'scored', valid: true })} />);
+    expect(screen.getByText('86')).toHaveClass('text-ready-text');
+    expect(within(container.querySelector('ol')!).getByText('Excellent')).toHaveClass('text-ready-text');
+  });
+
+  it('keeps the rating colours of a phone human_review row, because no page disowns them', () => {
+    const row = v2Assessment({ recommendation: null });
+    const phone = { ...row, raw: { ...row.raw, recommendation: 'human_review' } } as unknown as Assessment;
+    const { container } = render(<Scorecard assessment={phone} />);
+    const ratings = within(container.querySelector('ol')!);
+    expect(ratings.getByText('Excellent')).toHaveClass('text-ready-text');
+    expect(ratings.getByText('Average')).toHaveClass('text-unresolved-text');
+  });
+});
+
+describe('Scorecard legacy readings take their band\'s family', () => {
+  /** The figure and the fill of the readings under one label: a word in that card can recur, so all of them. */
+  const readings = (label: string) =>
+    screen.getAllByText(label).map((word) => {
+      const row = word.parentElement!.parentElement!;
+      return { figure: within(row).getByText(/\/10$/), fill: row.querySelector<HTMLElement>('.data-fill')! };
+    });
+  const SCORED = { notes: '', clarity: 8, structure: 8, listening: 8, rapport: 8 };
+  const withScore = (score: number): Assessment => ({ ...baseAssessment, communication: { ...SCORED, score } });
+
+  it.each([
+    [0, 'closed'],
+    [4.9, 'closed'],
+    [5, 'unresolved'],
+    [6.9, 'unresolved'],
+    [7, 'ready'],
+    [10, 'ready'],
+  ] as const)('prints %s of 10 in the %s family, figure and bar', (score, family) => {
+    render(<Scorecard assessment={withScore(score)} />);
+    const [{ figure, fill }] = readings('Score');
+    expect(figure).toHaveClass(`text-${family}-text`);
+    expect(figure).not.toHaveClass('text-ink');
+    expect(fill).toHaveClass(`bg-${family}`, 'data-fill');
+    expect(fill).not.toHaveClass('bg-info');
+    expect(fill).toHaveStyle({ width: `${score * 10}%` });
+  });
+
+  it('gives one number one colour on both legacy cards: the band map, not the rating position', () => {
+    // 7 of 10 prints "Strong" on the Review tab's Meter, though by position it would be `unresolved`.
+    render(<Scorecard assessment={withScore(7)} />);
+    expect(readings('Score')[0].figure).toHaveClass('text-ready-text');
+  });
+
+  it('takes the family on every dimension, not just Communication', () => {
+    render(
+      <Scorecard
+        assessment={{
+          ...baseAssessment,
+          motivation: { score: 3, notes: '' },
+          tone: { ...baseAssessment.tone, confidence: 6 },
+          role_fit: { ...baseAssessment.role_fit, score: 9 },
+          communication: {
+            ...SCORED,
+            score: 8,
+            english_proficiency: { band: 'B2', grammar: 2, vocabulary: 5, fluency: 8, coherence: 8, notes: '' },
+          },
+        }}
+      />,
+    );
+    expect(readings('Grammar')[0].fill).toHaveClass('bg-closed');
+    expect(readings('Vocabulary')[0].fill).toHaveClass('bg-unresolved');
+    expect(readings('Confidence')[0].fill).toHaveClass('bg-unresolved');
+    expect(readings('Fit score')[0].fill).toHaveClass('bg-ready');
+    expect(readings('Score')[1].fill).toHaveClass('bg-closed');
+  });
+
+  it('leaves Impact in ink: a high filler or native-language impact is not good', () => {
+    render(
+      <Scorecard
+        assessment={{
+          ...baseAssessment,
+          communication: {
+            ...SCORED,
+            score: 8,
+            filler_usage: { level: 'high', examples: [], impact_score: 9, notes: '' },
+            native_language_usage: { level: 'low', examples: [], impact_score: 2, notes: '' },
+          },
+        }}
+      />,
+    );
+    const impacts = readings('Impact');
+    expect(impacts).toHaveLength(2);
+    for (const { figure, fill } of impacts) {
+      expect(figure).toHaveClass('text-ink');
+      expect(fill).toHaveClass('bg-info', 'data-fill');
+      expect(figure.className + fill.className).not.toMatch(/ready|unresolved|closed/);
+    }
+  });
+
+  it('gives a held row no hue on any reading, and keeps every figure and bar', () => {
+    const { container } = render(
+      <Scorecard assessment={{ ...withScore(9), motivation: { score: 2, notes: '' }, evidence_grade: 'insufficient', evidence_reason: 'partial_thin' }} />,
+    );
+    const all = ['Score', 'Clarity', 'Structure', 'Listening', 'Rapport', 'Confidence', 'Professionalism', 'Fit score'].flatMap(readings);
+    expect(all.length).toBeGreaterThan(8);
+    for (const { figure, fill } of all) {
+      expect(figure).toHaveClass('text-ink');
+      expect(fill).toHaveClass('bg-info', 'data-fill');
+    }
+    expect(readings('Score')[0].figure).toHaveTextContent('9/10');
+    expect(container.innerHTML).not.toMatch(/(?:bg|text)-(?:ready|unresolved|closed)/);
+  });
+});
+
 describe('Scorecard (role scorecard v2)', () => {
   it('renders a v2 row without reading any v1 field (the route crash)', () => {
     expect(() => render(<Scorecard assessment={v2Assessment()} />)).not.toThrow();
@@ -293,6 +534,21 @@ describe('Scorecard (role scorecard v2)', () => {
   it('flags a provisional score when a metric lacked evidence', () => {
     render(<Scorecard assessment={v2Assessment()} />);
     expect(screen.getByText(/Provisional: scored from 2 of 3 metrics/)).toBeInTheDocument();
+  });
+
+  it('prints the provisional notice in the unresolved family, the one "Provisional" takes on Review', () => {
+    render(<Scorecard assessment={v2Assessment()} />);
+    const notice = screen.getByText(/Provisional: scored from 2 of 3 metrics/).closest('div');
+    expect(notice).toHaveClass('bg-warning-soft');
+    expect(notice).not.toHaveClass('bg-surface-secondary');
+    expect(notice?.querySelector('[aria-hidden="true"]')).toHaveClass('bg-warning');
+  });
+
+  it('holds a metric with no evidence in the unresolved family: it is no rating, and needs a second look', () => {
+    render(<Scorecard assessment={v2Assessment()} />);
+    const chip = screen.getByText('Insufficient evidence').closest('[data-status-badge]');
+    expect(chip).toHaveAttribute('data-status-badge', 'warning');
+    expect(chip).toHaveClass('bg-warning-soft', 'text-warning-text');
   });
 
   it('reads a pre-migration five-level row on its own scale', () => {

@@ -54,6 +54,7 @@ export { TranscriptionSyncWorkspace } from './TranscriptionSyncWorkspace';
 export type { TranscriptionSyncWorkspaceProps } from './TranscriptionSyncWorkspace';
 export {
   candidateStatusLabel,
+  candidateStatusMark,
   candidateStatusTone,
   candidateDisplayStatus,
   candidateStatusKey,

@@ -31,7 +31,7 @@ import {
   Tr,
 } from '../design';
 import { humanizeEnum } from '../../lib/humanize';
-import { auditActionLabel, formatDateTime, shortId } from './statusMeta';
+import { auditActionLabel, auditResultTone, formatDateTime, shortId } from './statusMeta';
 
 const PAGE_SIZE = 50 as const;
 
@@ -123,15 +123,7 @@ export function AuditSection() {
                     </span>
                   </Td>
                   <Td>
-                    <StatusBadge
-                      tone={
-                        row.result === 'success'
-                          ? 'success'
-                          : row.result === 'denied'
-                            ? 'danger'
-                            : 'neutral'
-                      }
-                    >
+                    <StatusBadge tone={auditResultTone(row.result)}>
                       <span title={row.result}>{humanizeEnum(row.result)}</span>
                     </StatusBadge>
                   </Td>

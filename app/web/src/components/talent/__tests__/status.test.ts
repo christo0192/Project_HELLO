@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   anyPhoneProgressUnknown,
   candidateStatusLabel,
+  candidateStatusMark,
   candidateStatusTone,
   sessionStatusLabel,
   sessionStatusTone,
@@ -42,17 +43,38 @@ describe('candidateStatusLabel', () => {
   });
 });
 
-describe('candidateStatusTone', () => {
-  it('maps screened/advanced to success, screening/queued to warning, rejected to neutral, new to info', () => {
-    expect(candidateStatusTone('screened')).toBe('success');
-    expect(candidateStatusTone('advanced')).toBe('success');
-    expect(candidateStatusTone('screening')).toBe('warning');
-    expect(candidateStatusTone('queued')).toBe('warning');
-    // An outcome is not coloured good or bad; crimson is a fault on our side.
-    expect(candidateStatusTone('rejected')).toBe('neutral');
-    expect(candidateStatusTone('new')).toBe('info');
-    expect(candidateStatusTone('mystery')).toBe('neutral');
+describe('candidateStatusTone and candidateStatusMark: each status has one family and one step', () => {
+  // [status, the badge's tone, the bar's step]. The owner's request of 2026-11-06.
+  it.each([
+    ['new', 'info', 'moving-light'],
+    ['queued', 'info', 'moving'],
+    // The deep step, so the voice hue means the candidate's voice and nothing else.
+    ['screening', 'info', 'moving-deep'],
+    ['screened', 'success', 'ready-light'],
+    ['advanced', 'success', 'ready'],
+    ['rejected', 'closed', 'closed'],
+    ['consent_declined', 'closed', 'closed-light'],
+    ['opted_out', 'closed', 'closed-light'],
+    ['phone_cancelled', 'closed', 'closed-light'],
+    // No longer crimson: nobody on our side failed.
+    ['abandoned_no_answer', 'warning', 'unresolved'],
+    ['wrong_number', 'warning', 'unresolved'],
+    // It can go either way, and the decision record asks the owner about the reason that is ours.
+    ['screening_abandoned', 'warning', 'unresolved-light'],
+    // A fault on our side, and the only status in crimson.
+    ['phone_failed', 'danger', 'danger'],
+  ])('%s is %s, drawn as %s', (status, tone, mark) => {
+    expect(candidateStatusTone(status)).toBe(tone);
+    expect(candidateStatusMark(status)).toBe(mark);
   });
+
+  it.each(['mystery', null, undefined, 'constructor', '__proto__'])(
+    'leaves %s neutral: an unknown status invents no meaning',
+    (status) => {
+      expect(candidateStatusTone(status)).toBe('neutral');
+      expect(candidateStatusMark(status)).toBe('neutral');
+    },
+  );
 });
 
 describe('sessionStatusLabel / tone', () => {
@@ -73,13 +95,18 @@ describe('sessionStatusLabel / tone', () => {
     expect(sessionStatusLabel({ value: 'completed' } as unknown as string)).toBe('—');
   });
 
-  it('tones terminal failure states as danger', () => {
-    expect(sessionStatusTone('completed')).toBe('success');
-    expect(sessionStatusTone('in_progress')).toBe('warning');
-    expect(sessionStatusTone('failed')).toBe('danger');
-    expect(sessionStatusTone('cancelled')).toBe('danger');
-    expect(sessionStatusTone('expired')).toBe('danger');
+  it('maps each session status to its one meaning', () => {
     expect(sessionStatusTone('created')).toBe('info');
+    expect(sessionStatusTone('waiting')).toBe('info');
+    expect(sessionStatusTone('in_progress')).toBe('info');
+    expect(sessionStatusTone('completed')).toBe('success');
+    expect(sessionStatusTone('abandoned')).toBe('warning');
+    // Ended, no judgement implied: only a real failure is crimson.
+    expect(sessionStatusTone('cancelled')).toBe('closed');
+    expect(sessionStatusTone('expired')).toBe('closed');
+    expect(sessionStatusTone('deleted')).toBe('closed');
+    expect(sessionStatusTone('failed')).toBe('danger');
+    expect(sessionStatusTone('mystery')).toBe('neutral');
   });
 });
 
@@ -120,8 +147,8 @@ describe('sessionStatusCounts', () => {
       { status: 'in_progress' },
     ]);
     expect(counts).toEqual([
-      { label: 'Completed', value: 2 },
-      { label: 'In progress', value: 1 },
+      { label: 'Completed', value: 2, tone: 'success' },
+      { label: 'In progress', value: 1, tone: 'info' },
     ]);
   });
 
@@ -129,7 +156,7 @@ describe('sessionStatusCounts', () => {
     const counts = sessionStatusCounts([
       { status: { value: 'completed' } as unknown as string },
     ]);
-    expect(counts).toEqual([{ label: '—', value: 1 }]);
+    expect(counts).toEqual([{ label: '—', value: 1, tone: 'neutral' }]);
     expect(counts.every((row) => typeof row.label === 'string')).toBe(true);
   });
 });
@@ -292,7 +319,7 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
     expect(candidateDisplayStatus({ status: 'queued', dial_count: 3 }).label).toBe('Queued (dialed 3)');
     expect(candidateDisplayStatus({ status: 'queued', dial_count: 1 }).label).toBe('Queued (dialed 1)');
     const ds = candidateDisplayStatus({ status: 'queued', dial_count: 3, phone_state: 'awaiting_retry' });
-    expect(ds).toMatchObject({ key: 'queued', label: 'Queued (dialed 3)', tone: 'warning' });
+    expect(ds).toMatchObject({ key: 'queued', label: 'Queued (dialed 3)', tone: 'info' });
   });
 
   it('shows plain Queued when the count is 0 (never dialled) or unknown', () => {
@@ -314,7 +341,7 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
     // No "(dialed N)" on a terminal phone key: the count is in detail/title.
     expect(ds.label).toBe('Abandoned: no answer');
     expect(ds.detail).toContain('Phone rang 5 times');
-    expect(ds.tone).toBe('danger');
+    expect(ds.tone).toBe('warning');
     expect(candidateStatusKey({ status: 'queued', phone_state: 'abandoned_no_answer' })).toBe(
       'abandoned_no_answer',
     );
@@ -327,9 +354,9 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
   it('maps the other terminal phone states', () => {
     const cases: Array<[string, string, string, string]> = [
       ['failed', 'phone_failed', 'Phone screen failed', 'danger'],
-      ['wrong_number', 'wrong_number', 'Wrong number', 'danger'],
-      ['opted_out', 'opted_out', 'Opted out', 'neutral'],
-      ['cancelled', 'phone_cancelled', 'Phone screen cancelled', 'neutral'],
+      ['wrong_number', 'wrong_number', 'Wrong number', 'warning'],
+      ['opted_out', 'opted_out', 'Opted out', 'closed'],
+      ['cancelled', 'phone_cancelled', 'Phone screen cancelled', 'closed'],
     ];
     for (const [state, key, label, tone] of cases) {
       const ds = candidateDisplayStatus({
@@ -482,7 +509,7 @@ describe('candidateDisplayStatus: failed/screening_abandoned', () => {
       const ds = candidateDisplayStatus({ status, ...abandoned });
       expect(ds.key, status).toBe('screening_abandoned');
       expect(ds.label, status).toBe('Abandoned: dropped before screening');
-      expect(ds.tone, status).toBe('danger');
+      expect(ds.tone, status).toBe('warning');
       // Never the stored words, never a dial suffix on a terminal key.
       expect(ds.label, status).not.toMatch(/Queued|Screening\b|dialed/);
       expect(candidateStatusKey({ status, ...abandoned }), status).toBe('screening_abandoned');
@@ -537,7 +564,7 @@ describe('candidateDisplayStatus: failed/screening_abandoned', () => {
 
   it('counts it under its own label, in plain words', () => {
     expect(candidateStatusLabel('screening_abandoned')).toBe('Abandoned: dropped before screening');
-    expect(candidateStatusTone('screening_abandoned')).toBe('danger');
+    expect(candidateStatusTone('screening_abandoned')).toBe('warning');
     expect(
       candidateStatusCounts([
         { status: 'screening', ...abandoned },

@@ -62,6 +62,26 @@ describe('ReviewCallStrip', () => {
     expect(onTick).toHaveBeenCalledWith(1);
   });
 
+  it.each([
+    ['ready', 'border-ready bg-paper text-ready-text', 'border-ready-text bg-ready-text text-paper'],
+    ['unresolved', 'border-unresolved bg-paper text-unresolved-text', 'border-unresolved-text bg-unresolved-text text-paper'],
+    ['closed', 'border-closed bg-paper text-closed-text', 'border-closed-text bg-closed-text text-paper'],
+    [null, 'border-ink bg-paper text-ink', 'border-ink bg-ink text-paper'],
+  ] as const)('prints a tick of a %s rating in its family, resting and pressed', (family, resting, pressed) => {
+    const ticks = [{ ...PROPS.ticks![0], family }];
+    const { rerender } = render(<ReviewCallStrip {...PROPS} ticks={ticks} />);
+    const tick = screen.getByRole('button', { name: /^Evidence 1/ });
+    expect(tick).toHaveClass(...resting.split(' '), 'hover:bg-field');
+    rerender(<ReviewCallStrip {...PROPS} ticks={ticks} activeTick={1} />);
+    expect(tick).toHaveClass(...pressed.split(' '));
+    expect(tick).not.toHaveClass('hover:bg-field');
+  });
+
+  it('keeps a tick its stem in ink, so it reads across the voice mark', () => {
+    render(<ReviewCallStrip {...PROPS} ticks={[{ ...PROPS.ticks![0], family: 'closed' }]} />);
+    expect(document.querySelector('.bg-ink.w-px')).not.toBeNull();
+  });
+
   it('draws a playhead only when there is a position, on the same scale', () => {
     const { rerender } = render(<ReviewCallStrip {...PROPS} />);
     expect(document.querySelector('[data-playhead]')).toBeNull();

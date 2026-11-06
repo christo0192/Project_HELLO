@@ -10,7 +10,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { AdminAuditRow } from '../../../types';
 import { missionApi, apiFns } from './apiMock';
 import { AuditSection } from '../AuditSection';
-import { AUDIT_ACTION_LABELS, auditActionLabel } from '../statusMeta';
+import { AUDIT_ACTION_LABELS, auditActionLabel, auditResultTone } from '../statusMeta';
 
 vi.mock('../../../api', () => ({
   api: missionApi.api,
@@ -31,6 +31,33 @@ const ROW: AdminAuditRow = {
 function renderAudit() {
   return render(<AuditSection />);
 }
+
+describe('AuditSection colour', () => {
+  it.each([
+    ['success', 'Success', 'success'],
+    // Covers every refused request, so it is worth a look and not always our fault.
+    ['failure', 'Failure', 'warning'],
+    ['pending', 'Pending', 'info'],
+    ['other', 'Other', 'neutral'],
+  ])('prints the result %s as %s in the %s tone', async (result, word, tone) => {
+    apiFns.listAdminAudit.mockResolvedValue({ audit: [{ ...ROW, result }] });
+    renderAudit();
+    const badge = (await screen.findByTitle(result)).closest('[data-status-badge]');
+    expect(badge).toHaveTextContent(word);
+    expect(badge).toHaveAttribute('data-status-badge', tone);
+  });
+
+  it('gives every value the database can store a meaning of its own', () => {
+    const sql = readFileSync(
+      resolve(process.cwd(), '../supabase/migrations/0007_invites_audit_rbac.sql'),
+      'utf8',
+    );
+    const stored = /constraint chk_audit_result check \(\s*result in \(([^)]*)\)/.exec(sql)![1];
+    const values = [...stored.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]);
+    expect(values).toEqual(['success', 'failure', 'pending']);
+    for (const value of values) expect(auditResultTone(value), value).not.toBe('neutral');
+  });
+});
 
 describe('AuditSection', () => {
   beforeEach(() => {

@@ -327,7 +327,7 @@ export function AccessSection() {
                     <Td>
                       <span className="font-medium text-ink">{entry.email}</span>
                       {locked && (
-                        <p className="mt-0.5 max-w-xs text-xs leading-5 text-warning-text">
+                        <p className="mt-0.5 max-w-xs text-xs leading-5 text-ink">
                           {selfEntry
                             ? 'Your own entry — self-modification is protected.'
                             : 'Last linked active admin — cannot be removed or demoted.'}

@@ -40,6 +40,7 @@ import {
   GlassPanel,
   SectionHeader,
   StatusBadge,
+  countTone,
 } from '../design';
 import { MetricStrip } from '../design/MetricStrip';
 import type { MetricItem } from '../design/MetricStrip';
@@ -207,6 +208,7 @@ export function OverviewSection() {
             figure(sessions, {
               label: 'Active sessions',
               value: activeNow,
+              figureTone: countTone(activeNow, 'info'),
               context: sessionsCut ? `Within the ${newestSessions}` : 'Created, waiting or in progress',
             }),
             figure(allowlist, {
@@ -298,11 +300,12 @@ export function OverviewSection() {
                 {
                   label: 'Pending',
                   value: allowlistData.filter((e) => e.active && e.linked_user_id == null).length,
+                  tone: 'warning',
                 },
                 {
                   label: 'Disabled',
                   value: allowlistData.filter((e) => !e.active).length,
-                  tone: 'neutral',
+                  tone: 'closed',
                 },
               ]}
               order="none"

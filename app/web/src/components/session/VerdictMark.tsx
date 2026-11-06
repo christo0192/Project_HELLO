@@ -1,16 +1,20 @@
 /**
- * The verdict mark: a circle in ink beside the word, used everywhere an AI
- * recommendation is printed.
+ * The verdict mark: a circle beside the word, used everywhere an AI recommendation
+ * is printed.
  *
  * The circle says where the verdict sits, full for Select, half for Borderline
  * and empty for Reject, so a column of them can be read by shape. The word is
- * what a reader and a screen reader get, so the circle is decoration. It takes
- * `currentColor`, and that is the whole colour rule: a Reject is not a fault and
- * a Select is not a success, so neither gets a hue, and Windows contrast themes
- * force the ink like any other text.
+ * what a reader and a screen reader get, so the circle is decoration.
+ *
+ * Circle, word and figure take the verdict's family (the owner's decision of
+ * 2026-11-06): Select `ready`, Borderline `unresolved`, Reject `closed`. Crimson
+ * stays a fault on our side, so a Reject is never red. A word with no verdict of its
+ * own has no hue. An svg keeps an author colour in a Windows contrast theme, so
+ * index.css hands the circle its word's forced colour there.
  */
 
 import { cx } from '../design/cx';
+import { FAMILY_CLASSES, verdictFamily } from '../design/tones';
 import { finiteNumber, recommendationMeta } from './scorecard-read';
 
 type Fill = 'full' | 'half' | 'empty';
@@ -32,25 +36,29 @@ export interface VerdictMarkProps {
   score?: unknown;
   /** `xl` as the headline on Review, `lg` beside a figure, `md` in a list. */
   size?: keyof typeof WORD;
+  /** No hue, for a verdict the server held for thin evidence: the word and the circle still say it. */
+  plain?: boolean;
   className?: string;
 }
 
-export function VerdictMark({ recommendation, score, size = 'md', className }: VerdictMarkProps) {
+export function VerdictMark({ recommendation, score, size = 'md', plain = false, className }: VerdictMarkProps) {
   const meta = recommendationMeta(recommendation);
   if (!meta) return null;
   const fill = typeof recommendation === 'string' ? FILL[recommendation] : undefined;
   const figure = finiteNumber(score);
+  const family = plain ? null : verdictFamily(recommendation);
+  const shades = family ? FAMILY_CLASSES[family] : null;
   return (
     <span
       data-recommendation={String(recommendation)}
-      className={cx('inline-flex items-center whitespace-nowrap text-ink', WORD[size], className)}
+      className={cx('inline-flex items-center whitespace-nowrap', shades?.text ?? 'text-ink', WORD[size], className)}
     >
       {fill && (
         <svg
           aria-hidden="true"
           data-verdict-mark={fill}
           viewBox="0 0 12 12"
-          className={cx('shrink-0 text-ink', CIRCLE[size])}
+          className={cx('shrink-0', shades?.glyph ?? 'text-ink', CIRCLE[size])}
         >
           <circle
             cx="6"
@@ -65,7 +73,7 @@ export function VerdictMark({ recommendation, score, size = 'md', className }: V
       )}
       <span>{meta.label}</span>
       {figure !== null && (
-        <span className="ml-1 font-normal tabular-nums text-ink-secondary">{Math.round(figure)}</span>
+        <span className={cx('ml-1 font-normal tabular-nums', shades?.text ?? 'text-ink-secondary')}>{Math.round(figure)}</span>
       )}
     </span>
   );

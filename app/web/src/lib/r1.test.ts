@@ -179,7 +179,11 @@ describe('round state', () => {
     expect(r1StatusLabel('invited')).toBe('Link sent');
     expect(r1StatusLabel('in_progress')).toBe('In progress');
     expect(r1StatusLabel('mystery')).toBe('mystery');
-    expect(r1StatusTone('completed')).toBe('positive');
+    expect(r1StatusTone('invited')).toBe('moving');
+    expect(r1StatusTone('in_progress')).toBe('moving');
+    expect(r1StatusTone('completed')).toBe('ready');
+    expect(r1StatusTone('expired')).toBe('closed');
+    expect(r1StatusTone('cancelled')).toBe('closed');
     expect(r1StatusTone('mystery')).toBe('neutral');
   });
 });
@@ -551,16 +555,16 @@ describe('usage figures', () => {
     expect(poolGatesSends({})).toBe(true);
   });
 
-  it('bands the pool at 60, 75 and 90 percent', () => {
+  it('bands the pool at 60 and 75 percent, and a rate is never crimson or underway', () => {
     expect(usageTone(null)).toBe('neutral');
     expect(usageTone(0)).toBe('success');
     expect(usageTone(59)).toBe('success');
-    expect(usageTone(60)).toBe('info');
-    expect(usageTone(74)).toBe('info');
+    expect(usageTone(60)).toBe('neutral');
+    expect(usageTone(74)).toBe('neutral');
     expect(usageTone(75)).toBe('warning');
     expect(usageTone(89)).toBe('warning');
-    expect(usageTone(90)).toBe('danger');
-    expect(usageTone(250)).toBe('danger');
+    expect(usageTone(90)).toBe('warning');
+    expect(usageTone(250)).toBe('warning');
   });
 
   it('computes a percentage only against a real whole', () => {

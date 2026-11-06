@@ -292,7 +292,7 @@ describe('arrivals', () => {
 });
 
 describe('the page itself', () => {
-  it('prints every verdict as the shared mark, in ink', async () => {
+  it('prints every verdict as the shared mark, in its family', async () => {
     mockApi.listCandidates.mockResolvedValue([
       row(1, { status: 'screened', latest_score: 72, latest_recommendation: 'advance' }),
       row(2, { status: 'screened', latest_score: 54, latest_recommendation: 'hold' }),
@@ -300,8 +300,12 @@ describe('the page itself', () => {
     ]);
     const { container } = renderPage();
     await screen.findByText('Person 1');
-    const marks = container.querySelectorAll('tbody [data-verdict-mark]');
-    expect(Array.from(marks).map((m) => m.getAttribute('data-verdict-mark'))).toEqual(['full', 'half', 'empty']);
+    const marks = [...container.querySelectorAll('tbody [data-verdict-mark]')];
+    expect(marks.map((m) => m.getAttribute('data-verdict-mark'))).toEqual(['full', 'half', 'empty']);
+    expect(marks[0]).toHaveClass('text-ready');
+    expect(marks[1]).toHaveClass('text-unresolved');
+    expect(marks[2]).toHaveClass('text-closed');
+    expect(marks[2].closest('[data-recommendation]')).toHaveClass('text-closed-text');
   });
 
   it('keeps no eyebrow or description, and Upload is not the filled action', async () => {

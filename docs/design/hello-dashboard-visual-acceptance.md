@@ -35,7 +35,8 @@ cd app/web && npm run lint && npm run test:typecheck && npm test && npm run buil
 
 The validator is intentionally offline. It checks every palette anchor at its
 approved value, computes the declared contrast pairs, refuses any alternate dark
-surface, keeps the voice hue to one pair of tokens and verdicts in ink, refuses
+surface, keeps the voice hue to one pair of tokens and a verdict and a rating
+to their family, never crimson, refuses
 raw colours and stock Tailwind hues, refuses blur, gradients, a fixed ground,
 resting shadows, entrance motion and radii or type off the scale in every
 stylesheet and in source, and verifies every routed surface remains present. Its
@@ -61,7 +62,8 @@ and failed call. Check for:
 
 - one opaque sheet on the desk, inset 8px, with no blur, gradient or glow;
 - printed 1px rules, and shadows on floating layers only;
-- orange only on the candidate's voice; verdicts in ink; crimson only on a fault;
+- orange only on the candidate's voice; a verdict and a rating in their family,
+  never crimson; crimson only on a fault;
 - a word on every status;
 - nothing entering, revealing or counting up, and no layout shift on arrival;
 - the IK logo on its white plate, never inverted;

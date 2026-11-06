@@ -1,7 +1,12 @@
 import type { EChartsOption } from 'echarts';
 
+/** The four status families (index.css), for a series that means one of them. */
+export type ChartFamily = 'moving' | 'ready' | 'unresolved' | 'closed';
+
 export interface ChartPalette {
   colors: string[];
+  /** Each family's mark, for a series or an arc whose meaning is that family. */
+  families: Record<ChartFamily, string>;
   text: string;
   subtext: string;
   axisLine: string;
@@ -26,15 +31,23 @@ function token(name: string): string {
  * THE ONE PLACE CHARTS GET A COLOUR. Everything here is read from the tokens in
  * index.css, so a chart cannot drift from the page around it.
  *
- * The categorical cycle is ink steps, not hues: a series is told apart by its
- * printed label, its dash and its marker shape (series.ts), and an outcome is not
- * coloured good or bad. Neighbours in the cycle are at least 1.5:1 from each other and
- * every step is at least 3:1 on paper. The voice hue never appears here: orange
- * means the candidate's voice and nothing else.
+ * The categorical cycle is the four status families, then a quiet ink step. Every
+ * pair of the four is validated for colour-blind readers and on paper, in
+ * logsheet-tokens.test.ts. A series that means a verdict or an outcome passes its
+ * family explicitly (`families`, `LineChartSeries.family`), never its place in the
+ * cycle. It is still told apart by its printed label, its dash and its marker shape
+ * (series.ts), and axis, label and legend text stays ink. The voice hue never
+ * appears here: orange means the candidate's voice and nothing else.
  */
 export function chartPalette(): ChartPalette {
   return {
-    colors: [token('--ink'), token('--ink-3'), token('--ai'), token('--ink-2'), token('--control')],
+    colors: [token('--moving'), token('--ready'), token('--unresolved'), token('--closed'), token('--ink-3')],
+    families: {
+      moving: token('--moving'),
+      ready: token('--ready'),
+      unresolved: token('--unresolved'),
+      closed: token('--closed'),
+    },
     text: token('--ink'),
     subtext: token('--ink-3'),
     axisLine: token('--rule-2'),

@@ -4,7 +4,9 @@
 @tailwind utilities;
 
 /* Project HELLO design tokens: Logsheet (docs/design/hello-glass-design-system.md),
-   approved by the owner and the stakeholder on 2026-11-05.
+   approved by the owner and the stakeholder on 2026-11-05. The four status
+   families are the owner's request of 2026-11-06
+   (docs/design/logsheet-colour-decision-2026-11-06.md).
 
    The world is a taped interview and its log sheet: one sheet of paper on a
    desk, typed in carbon ink, ruled like a form. These primitives are the whole
@@ -37,6 +39,36 @@
     --danger: #a01c3c;     /* faults on our side, and Halt all calling (filled) */
     --plate: #ffffff;      /* the IK logo's own plate, never inverted */
 
+    /* ── The four status families ─────────────────────────────────────
+       Each colour means one thing on every screen, and is never the only
+       signal: the printed word stays, and shapes and dashes stay. The figures
+       are computed in logsheet-tokens.test.ts, so a move here fails CI.
+       `*-light` and the deep step are ramp steps for a stacked bar; `*-text` is
+       the shade for words and figures; `*-soft` is the wash under a badge.
+       NEVER PUT TEXT ON --moving OR --unresolved: paper on them is 3.59 and
+       3.30. Paper may sit on --moving-text, --ready and --closed. */
+    /* Underway: the process has it. */
+    --moving: #2f8bc3;
+    --moving-light: #72baeb;
+    --moving-text: #015e8c;
+    --moving-deep: var(--moving-text);
+    --moving-soft: #ddf0fe;
+    /* A good or ready result. */
+    --ready: #0a693c;
+    --ready-light: #349d62;
+    --ready-text: var(--ready);
+    --ready-soft: #dff3e5;
+    /* Unfinished, or needs a second look. */
+    --unresolved: #958d0f;
+    --unresolved-light: #b7af47;
+    --unresolved-text: #6b6620;
+    --unresolved-soft: #efeed9;
+    /* Ended, no judgement implied. */
+    --closed: #5d408a;
+    --closed-light: #ae96da;
+    --closed-text: var(--closed);
+    --closed-soft: #efe9fd;
+
     /* rgb triples for alpha-capable Tailwind tokens (same values as above). */
     --ink-rgb: 27 25 21;
     --ink-muted-rgb: 130 125 116;
@@ -54,17 +86,19 @@
     --line: var(--rule);
     --line-strong: var(--rule-2);
 
-    /* Status carries a word, so its tone needs no traffic light: only a fault
-       on our side gets a hue. `--info` is the accent's old name; the primary
-       fill, selection and focus are all ink now. */
+    /* `--info` is the accent's old name; the primary fill, selection and focus
+       are all ink, so it stays ink. `info` means underway only in the tone maps
+       of StatusBadge and BarList. `success` and `warning` are the old names of
+       two families, so every remaining use took its new meaning from the audit
+       recorded in the decision file. */
     --info: var(--ink);
     --info-soft: var(--field);
-    --success: var(--ink-2);
-    --success-text: var(--ink-2);
-    --success-soft: var(--field);
-    --warning: var(--ink-2);
-    --warning-text: var(--ink);
-    --warning-soft: var(--field);
+    --success: var(--ready);
+    --success-text: var(--ready-text);
+    --success-soft: var(--ready-soft);
+    --warning: var(--unresolved);
+    --warning-text: var(--unresolved-text);
+    --warning-soft: var(--unresolved-soft);
     --error: var(--danger);
     --error-text: var(--danger);
     --error-soft: var(--paper);
@@ -151,6 +185,18 @@
     background-color: var(--paper);
     border: 1px solid var(--rule-2);
     border-radius: var(--radius-sheet);
+  }
+
+  /* A public page a candidate can open keeps the ink it has always had: the
+     status families are for the people working the pipeline. Candidate-facing
+     surfaces outside this class read the `--c-*` names, which stay ink. */
+  .keep-ink {
+    --success: var(--ink-2);
+    --success-text: var(--ink-2);
+    --success-soft: var(--field);
+    --warning: var(--ink-2);
+    --warning-text: var(--ink);
+    --warning-soft: var(--field);
   }
 
   /* ── Panels ─────────────────────────────────────────────────────────
@@ -376,6 +422,12 @@
   [data-mark] {
     forced-color-adjust: none;
     background-color: CanvasText;
+  }
+
+  /* An svg keeps an author colour under forcing, so a verdict's circle would stay in its
+     family beside a forced word: a Reject's violet is about 2.56:1 on a black theme. */
+  svg[data-verdict-mark] {
+    color: inherit;
   }
 
   .sheet,

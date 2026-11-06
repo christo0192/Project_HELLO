@@ -334,11 +334,24 @@ describe('Overview, scored', () => {
     expect(result).toHaveTextContent('Not a hiring decision');
   });
 
-  it('draws the verdict in position and word, with no tone', async () => {
+  it('draws the verdict in position and word, in its family and never crimson or orange', async () => {
     await opened();
     const mark = document.querySelector('[data-verdict-mark]')!;
     expect(mark).toHaveAttribute('data-verdict-mark', 'half');
+    expect(mark).toHaveClass('text-unresolved');
     expect(mark.getAttribute('class') ?? '').not.toMatch(/voice|danger|error|wash/);
+  });
+
+  it('rates a metric row in its family: pips, word and figure, with the name in ink', async () => {
+    const body = review();
+    body.assessment!.metric_results = body.assessment!.metric_results.map((metric, index) => ({ ...metric, score: index === 0 ? 4 : index === 1 ? 2 : 1 }));
+    await opened(body);
+    const rows = within(screen.getByRole('list', { name: 'AI rubric ratings' })).getAllByRole('listitem');
+    for (const [row, family, figure] of [[rows[0], 'ready', '4/4'], [rows[1], 'unresolved', '2/4'], [rows[2], 'closed', '1/4']] as const) {
+      expect(within(row).getByText(figure)).toHaveClass(`text-${family}-text`);
+      expect(row.querySelector('.data-fill')).toHaveClass(`bg-${family}`);
+      expect(row.querySelector('.text-sm.font-semibold')).toHaveClass('text-ink');
+    }
   });
 
   it('shows all five metric rows open, each with its rationale', async () => {
@@ -352,7 +365,11 @@ describe('Overview, scored', () => {
     const body = review();
     body.assessment!.metric_results[1] = { ...body.assessment!.metric_results[1], score: null, evidence_status: 'insufficient_evidence' };
     await opened(body);
-    expect(within(screen.getByRole('list', { name: 'AI rubric ratings' })).getByText('Insufficient evidence')).toBeInTheDocument();
+    const insufficient = within(screen.getByRole('list', { name: 'AI rubric ratings' })).getByText('Insufficient evidence');
+    expect(insufficient).toBeInTheDocument();
+    // No rating to take a family from: it needs a second look.
+    expect(insufficient).toHaveAttribute('data-status-badge', 'warning');
+    expect(insufficient).toHaveClass('bg-warning-soft', 'text-warning-text');
   });
 
   it('says a provisional score is one, in the words the phone scorecard uses', async () => {
@@ -360,7 +377,12 @@ describe('Overview, scored', () => {
     body.assessment!.scoring_status = 'incomplete_evidence';
     body.assessment!.metric_results[1] = { ...body.assessment!.metric_results[1], score: null };
     await opened(body);
-    expect(screen.getByText(/^Provisional: scored from 4 of 5 metrics/)).toBeInTheDocument();
+    const notice = screen.getByText(/^Provisional: scored from 4 of 5 metrics/);
+    expect(notice).toBeInTheDocument();
+    // In the family of the "Provisional" stamp above it.
+    expect(notice.closest('div')).toHaveClass('bg-warning-soft');
+    expect(notice.closest('div')).not.toHaveClass('bg-surface-secondary');
+    expect(notice.closest('div')?.querySelector('[aria-hidden="true"]')).toHaveClass('bg-warning');
   });
 
   it('opens Recording at the cited turn from a quote', async () => {
@@ -485,6 +507,39 @@ describe('Overview, scored', () => {
     await opened(review({ phone_screening: { recommendation: 'reject', overall_score: 30, created_at: null, evidence_grade: 'decision', scoring_status: 'incomplete_evidence' } }));
     expect(screen.getByText(/Phone screening/)).toHaveTextContent('Reject 30, provisional (AI)');
   });
+
+  describe('the phone line prints its verdict in that verdict family', () => {
+    const phone = (over: Partial<NonNullable<R1ReviewResponse['phone_screening']>>) => ({
+      recommendation: 'advance', overall_score: 71, created_at: null, evidence_grade: 'decision', scoring_status: 'complete', ...over,
+    });
+
+    it.each([
+      ['advance', 71, 'Select 71', 'text-ready-text'],
+      ['hold', 50, 'Borderline 50', 'text-unresolved-text'],
+      ['reject', 30, 'Reject 30', 'text-closed-text'],
+    ])('%s prints in its family, with the rest of the line as it was', async (recommendation, overall_score, words, shade) => {
+      await opened(review({ phone_screening: phone({ recommendation, overall_score }) }));
+      expect(screen.getByText(words)).toHaveClass(shade);
+      expect(screen.getByText(/Phone screening/)).toHaveTextContent(`Phone screening: ${words} (AI). Open the candidate`);
+      expect(screen.getByText(/Phone screening/)).toHaveClass('text-ink-secondary');
+    });
+
+    it('has no hue on a held score, whatever it was going to say', async () => {
+      await opened(review({ phone_screening: phone({ evidence_grade: 'insufficient' }) }));
+      expect(screen.getByText('Held: not enough evidence').className).not.toMatch(/ready|unresolved|closed/);
+    });
+
+    it('has no hue on a figure with no verdict', async () => {
+      await opened(review({ phone_screening: phone({ recommendation: null, overall_score: 71 }) }));
+      expect(screen.getByText('71').className).not.toMatch(/ready|unresolved|closed/);
+      expect(screen.getByText(/Phone screening/)).toHaveTextContent('Phone screening: 71 (AI). Open the candidate');
+    });
+
+    it('prints the bare line when there is nothing to say', async () => {
+      await opened(review({ phone_screening: phone({ recommendation: null, overall_score: null }) }));
+      expect(screen.getByText(/Phone screening/)).toHaveTextContent(/^Phone screening: Open the candidate$/);
+    });
+  });
 });
 
 describe('Overview, in every other state', () => {
@@ -542,6 +597,8 @@ describe('Overview, in every other state', () => {
     const chips = screen.getByRole('list', { name: 'About this interview' });
     expect(chips).toHaveTextContent('Expired');
     expect(chips).not.toHaveTextContent('Link open');
+    // The tone follows the word, not the live status still stored.
+    expect(within(chips).getByText('Expired')).toHaveClass('bg-closed-soft');
   });
 
   it('an attempt that ended uncounted: Check again sees a new start, because the page does not poll', async () => {
@@ -661,6 +718,18 @@ describe('Overview, in every other state', () => {
     expect(within(ratings).getAllByRole('listitem')).toHaveLength(5);
   });
 
+  it('human review with ratings: gives them no family, because the page has just disowned them', async () => {
+    const a = assessment({ recommendation: null, raw_recommendation: 'human_review', overall_score: null, r1: { ...assessment().r1, outcome: 'scored', valid: false, gate: { passed: false, failures: ['runs_disagree'] } } });
+    await opened(review({ assessment: a, round: { ...review().round, recommendation: null, overall: null } }));
+    const ratings = screen.getByRole('list', { name: 'AI rubric ratings' });
+    for (const row of within(ratings).getAllByRole('listitem')) {
+      expect(within(row).getByText('Good')).toHaveClass('text-ink');
+      expect(within(row).getByText('3/4')).toHaveClass('text-ink-tertiary');
+      expect(row.querySelector('.data-fill')).toHaveClass('bg-info');
+      expect(row.innerHTML).not.toMatch(/(?:bg|text)-(?:ready|unresolved|closed)/);
+    }
+  });
+
   it('a usable result carries no such warning', async () => {
     await opened();
     expect(panel('Overview')).not.toHaveTextContent('no usable result');
@@ -680,6 +749,45 @@ describe('Overview, in every other state', () => {
   });
 });
 
+describe('the header chips say the same as the candidate Overview', () => {
+  const chip = (word: string | RegExp) =>
+    within(screen.getByRole('list', { name: 'About this interview' })).getByText(word);
+
+  it.each([
+    ['cancelled', 'Cancelled', 'bg-closed-soft'],
+    ['expired', 'Expired', 'bg-closed-soft'],
+    ['invited', 'Link sent', 'bg-moving-soft'],
+    // The API says in progress, nobody is on the call yet: still underway.
+    ['in_progress', 'Link open', 'bg-moving-soft'],
+  ] as const)('a %s round prints %s on %s', async (status, word, wash) => {
+    await opened(review({ round: { ...review().round, status } }));
+    expect(chip(word)).toHaveClass(wash);
+  });
+
+  it('prints a running attempt as in progress, underway', async () => {
+    const running = attempt({ in_progress: true, ended_at: null });
+    await opened(review({ round: { ...review().round, status: 'in_progress' }, attempts: [running] }));
+    expect(chip('In progress')).toHaveClass('bg-moving-soft');
+  });
+
+  it.each([
+    ['ready', 'bg-ready-soft'],
+    ['partial', 'bg-unresolved-soft'],
+    ['processing', 'bg-moving-soft'],
+    ['deleted', 'bg-closed-soft'],
+  ] as const)('a %s recording takes %s', async (state, wash) => {
+    await opened(review({ attempts: [attempt({ recording: recording({ state }) })] }));
+    expect(chip('Recording:').parentElement).toHaveClass(wash);
+  });
+
+  it('leaves a chip with no state of its own neutral', async () => {
+    await opened();
+    expect(chip('Sales Program Advisor')).not.toHaveClass('bg-moving-soft');
+    expect(chip('Sales Program Advisor').className).toContain('--c-border-light');
+    expect(chip(/^Ended /).className).toContain('--c-border-light');
+  });
+});
+
 describe('a staff dry run', () => {
   it('is marked in the header and in a banner', async () => {
     await opened(review({ round: { ...review().round, is_staff_dry_run: true } }));
@@ -695,6 +803,14 @@ describe('a staff dry run', () => {
 
 describe('a pending rejection', () => {
   const pending = () => review({ round: { ...review().round, recommendation: 'reject', status_write: 'pending_reject', pending_reject_until: '2026-11-06T10:00:00.000Z', created_by: 'interviewer-1' } });
+
+  it('stays in ink: it only follows from the AI verdict, which carries the family', async () => {
+    await opened(pending());
+    const tag = within(screen.getByRole('list', { name: 'About this interview' })).getByText(/Rejection pending until/);
+    expect(tag.className).toContain('--c-border-light');
+    expect(tag).not.toHaveClass('bg-unresolved-soft');
+    expect(tag).not.toHaveClass('bg-closed-soft');
+  });
 
   it('shows in the header, and Cancel asks first', async () => {
     await opened(pending());

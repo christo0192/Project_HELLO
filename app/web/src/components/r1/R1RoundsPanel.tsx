@@ -35,6 +35,7 @@ import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../../api';
 import { CandidateButton, Tag } from '../design/candidate';
+import { FAMILY_CLASSES, verdictFamily } from '../design/tones';
 import type { IssuedLinkValue } from './SendR1Controls';
 import { formatDateTime } from '../../lib/datetime';
 import {
@@ -230,6 +231,8 @@ export function R1RoundsPanel({
           notScored ||
           status === 'completed' ||
           status === 'in_progress';
+        // A verdict takes its family, as the header above this card does. No verdict, no hue.
+        const family = verdictFamily(round.recommendation);
         const active = pending?.roundId === round.id ? pending : null;
         const headingId = `r1-round-${uid}-${round.id}`;
         const labels = attemptLabels(attempts);
@@ -268,8 +271,10 @@ export function R1RoundsPanel({
                 {withheld ? (
                   R1_RESULT_WITHHELD
                 ) : round.recommendation !== null ? (
-                  `AI recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}` +
-                  (round.overall !== null ? ` · Overall ${Math.round(round.overall)} of 100` : '')
+                  <span className={family ? FAMILY_CLASSES[family].text : undefined}>
+                    {`AI recommendation: ${R1_RECOMMENDATION_LABEL[round.recommendation]}` +
+                      (round.overall !== null ? ` · Overall ${Math.round(round.overall)} of 100` : '')}
+                  </span>
                 ) : notScored ? (
                   'AI result: not scored. Open the R1 review for the reason.'
                 ) : (

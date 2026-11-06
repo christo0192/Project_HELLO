@@ -3,8 +3,10 @@
  *
  * 24px tall. The candidate's turns stand full height in the voice mark, the interviewer's a third of
  * that in `--ai`, the consent gate is hatched, a line drop runs on a dotted baseline, and every
- * evidence quote is one numbered ink tick. Any other gap between calls stays bare paper. Candidate and
- * interviewer are told apart by height and by the transcript's speaker labels, not by colour.
+ * evidence quote is one numbered tick, its box in the family of the rating it cites, so the strip shows
+ * where the weak and the strong evidence sit. Its stem stays ink, to read across the voice mark. Any
+ * other gap between calls stays bare paper. Candidate and interviewer are told apart by height and by
+ * the transcript's speaker labels, not by colour.
  *
  * This is the phone strip. The R1 review page draws its call with `CallStrip.tsx` beside this file,
  * from speakers, phases and moments; a later change can bring the two onto one. Nothing here knows
@@ -16,6 +18,7 @@
 
 import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { cx } from '../design/cx';
+import { evidenceNumberClass, type JudgementFamily } from '../design/tones';
 import { dropStartSec, layoutTickLabels, stripAxis, stripBreaks, timecode } from './callStripGeometry';
 import type { StripDrop, StripSegment } from './callStripGeometry';
 
@@ -31,6 +34,8 @@ export interface ReviewCallStripTick {
   sec: number;
   /** The tick's accessible name: "Evidence 3: turn 12 at 02:20, Objection handling". */
   label: string;
+  /** The family of the rating it cites. A metric with no score has none, and stays ink. */
+  family?: JudgementFamily | null;
 }
 
 /** Words printed above the strip at a moment: the consent span, the line drop. */
@@ -124,8 +129,9 @@ export function ReviewCallStrip({
               aria-pressed={pressed}
               aria-label={tick.label}
               className={cx(
-                'absolute top-0 flex h-[1.125rem] min-w-[1.125rem] -translate-x-1/2 items-center justify-center rounded-evidence border border-ink px-0.5 font-mono text-meta leading-none transition-colors duration-hover ease-out',
-                pressed ? 'bg-ink text-paper' : 'bg-paper text-ink hover:bg-field',
+                'absolute top-0 flex h-[1.125rem] min-w-[1.125rem] -translate-x-1/2 items-center justify-center rounded-evidence border px-0.5 font-mono text-meta leading-none transition-colors duration-hover ease-out',
+                evidenceNumberClass(tick.family ?? null, pressed),
+                !pressed && 'hover:bg-field',
               )}
               style={{ left: `${labels[index]}px` }}
             >

@@ -510,7 +510,7 @@ export function CandidateProfileCard({
                 {formatPhone(candidate.phone_e164)}
               </span>
               {!candidate.phone_valid && (
-                <Tag tone="negative" srPrefix="Phone number:">
+                <Tag tone="unresolved" srPrefix="Phone number:">
                   Invalid
                 </Tag>
               )}

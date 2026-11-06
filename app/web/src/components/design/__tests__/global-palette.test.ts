@@ -9,6 +9,39 @@ describe('global palette', () => {
     expect(css).toMatch(/:root \{\n\s+color-scheme: light;/);
     expect(css).not.toMatch(/\.dark\b/);
   });
+
+  it('points the old status names at their families, not at ink', () => {
+    expect(css).toMatch(/^\s*--success:\s*var\(--ready\);/m);
+    expect(css).toMatch(/^\s*--success-text:\s*var\(--ready-text\);/m);
+    expect(css).toMatch(/^\s*--success-soft:\s*var\(--ready-soft\);/m);
+    expect(css).toMatch(/^\s*--warning:\s*var\(--unresolved\);/m);
+    expect(css).toMatch(/^\s*--warning-text:\s*var\(--unresolved-text\);/m);
+    expect(css).toMatch(/^\s*--warning-soft:\s*var\(--unresolved-soft\);/m);
+  });
+
+  it('keeps `info` on ink: it is the primary fill, whatever a tone map does with the word', () => {
+    expect(css).toMatch(/^\s*--info:\s*var\(--ink\);/m);
+    expect(css).toMatch(/^\s*--info-soft:\s*var\(--field\);/m);
+  });
+
+  it('holds the public pages on ink, with the same values the old names had', () => {
+    const rule = /\.keep-ink \{([^}]*)\}/.exec(css);
+    expect(rule).not.toBeNull();
+    for (const [name, token] of [
+      ['--success', 'ink-2'],
+      ['--success-text', 'ink-2'],
+      ['--success-soft', 'field'],
+      ['--warning', 'ink-2'],
+      ['--warning-text', 'ink'],
+      ['--warning-soft', 'field'],
+    ]) {
+      expect(rule![1]).toMatch(new RegExp(`${name}:\\s*var\\(--${token}\\);`));
+    }
+    for (const page of ['pages/AppealPage.tsx', 'pages/StatusPage.tsx']) {
+      const source = readFileSync(resolve(process.cwd(), 'src', page), 'utf8');
+      expect(source, page).toMatch(/<div className="app-ground keep-ink /);
+    }
+  });
 });
 
 /* ── The "Resume calling" green ─────────────────────────────────────────
@@ -63,6 +96,11 @@ function sourceFiles(): string[] {
 }
 
 describe('the "Resume calling" green (--go)', () => {
+  it('stays its own colour: the ready family does not borrow it, and it does not mean ready', () => {
+    expect(tokenValue('--ready')).not.toBe(tokenValue('--go'));
+    expect(tokenValue('--ready')).not.toBe(tokenValue('--go-strong'));
+  });
+
   it('is actually green — not the teal that read as blue', () => {
     for (const name of ['--go', '--go-strong']) {
       const { hue, chroma } = hueOf(tokenValue(name));

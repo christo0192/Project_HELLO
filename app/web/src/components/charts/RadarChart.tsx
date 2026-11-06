@@ -29,8 +29,9 @@ export interface RadarChartProps {
 }
 
 /**
- * Skill scorecard radar chart. Pairs the canvas with an sr-only data table
- * (no Canvas keyboard claims — see EChart).
+ * Skill scorecard radar chart. One shape spans several ratings, so no one family
+ * fits it and the series is ink: a place in the cycle would mean nothing. Pairs the
+ * canvas with an sr-only data table (no Canvas keyboard claims — see EChart).
  */
 export function RadarChart({
   title,
@@ -80,8 +81,9 @@ export function RadarChart({
           ],
           symbol: 'circle',
           symbolSize: 5,
-          lineStyle: { width: 2 },
-          areaStyle: { opacity: 0.12 },
+          lineStyle: { width: 2, color: palette.text },
+          itemStyle: { color: palette.text },
+          areaStyle: { opacity: 0.12, color: palette.text },
         },
       ],
     };

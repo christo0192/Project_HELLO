@@ -8,8 +8,13 @@
  * screen (a 768px-tall window runs out of pane first, and they are a short scroll away): the weakest
  * metric alone carries its reasoning and quote buttons open, and the others are one press away.
  *
- * Verdicts stay in ink. Dashed means not firm: Provisional and Insufficient evidence, nothing else.
- * Every status carries a word. This is AI output and says so.
+ * The verdict and each rating take their family (`design/tones`): Select `ready`, Borderline
+ * `unresolved`, Reject `closed`, and never crimson. What needs a second look is `unresolved`. Dashed
+ * means not firm: Provisional and Insufficient evidence, nothing else. Every status carries a word, and
+ * shape and figures stay, so colour is never the only signal. This is AI output and says so.
+ *
+ * A scorecard held for thin evidence (`held`) has no hue at all: `ready` is a good or ready result, and
+ * the server has just said this one is neither. Its words do not change.
  *
  * Quotes come from `lib/evidence-quotes`. A quote that could not be placed is the same words with no
  * number and no button: it stays readable, and nothing claims a moment it does not have.
@@ -22,6 +27,15 @@ import { formatWeightPercent } from '../../lib/scorecard-weights';
 import { BORDERLINE_CUTOFF, SELECT_CUTOFF, scoreWhatIf, whatIfLine } from '../../lib/scorecard-what-if';
 import type { Evidence, EvidenceQuote, PlacedQuote } from '../../lib/evidence-quotes';
 import { cx } from '../design/cx';
+import {
+  evidenceNumberClass,
+  FAMILY_CLASSES,
+  ratingFamily,
+  rulerLabelClass,
+  verdictFamily,
+  type JudgementFamily,
+} from '../design/tones';
+import { RulerZones } from '../session/RulerZones';
 import { VerdictMark } from '../session/VerdictMark';
 import { EvidenceMark } from './EvidenceMark';
 import { finiteNumber, recommendationMeta } from '../session/scorecard-read';
@@ -55,6 +69,8 @@ export interface ReviewScorecardProps {
    * screening. It is then named as that and never as this call's, and `checks` belong to this call.
    */
   otherCall?: boolean;
+  /** Graded insufficient: not written to Ashby and no change of status, so nothing here takes a hue. */
+  held?: boolean;
 }
 
 /** Lowest score, then the heaviest of those, so it is the one that costs the most. */
@@ -106,16 +122,17 @@ const RUBRIC_COLUMNS_HOURS = 'sm:grid-cols-[minmax(0,1fr)_2.25rem_8.75rem_8.5rem
 export const metricDisplayName = (metric: ScorecardMetricDisplay, index: number): string =>
   metric.name && metric.name !== metric.id ? metric.name : `Metric ${index + 1}`;
 
-/** The rating as form tick-boxes. Decoration: the word and the figure beside it are the text. */
-function Pips({ level, max }: { level: number; max: number }) {
+/** The rating as form tick-boxes, in its family. Decoration: the word and the figure beside it are the text. */
+function Pips({ level, max, family }: { level: number; max: number; family: JudgementFamily | null }) {
+  const filled = family ? cx(FAMILY_CLASSES[family].edge, FAMILY_CLASSES[family].fill) : 'border-ink bg-ink';
   return (
-    <span aria-hidden="true" className="flex items-center gap-0.5">
+    <span aria-hidden="true" data-rating-pips="" className="flex items-center gap-0.5">
       {Array.from({ length: max }, (_, at) => (
         <span
           key={at}
           className={cx(
             'h-2.5 w-2.5 rounded-evidence border',
-            at < level ? 'data-fill border-ink bg-ink' : 'border-control',
+            at < level ? cx('data-fill', filled) : 'border-control',
           )}
         />
       ))}
@@ -123,25 +140,26 @@ function Pips({ level, max }: { level: number; max: number }) {
   );
 }
 
-/** The 0-100 ruler. The Reject zone is left clear, and the mark is the score. */
-function ScoreRuler({ score }: { score: number | null }) {
+/**
+ * The 0-100 ruler: three painted zones, each with its word under it. The stored verdict decides which
+ * is emphasised, so it can never say more than the word above it. The mark is the score, in ink to read
+ * across any zone.
+ */
+function ScoreRuler({ score, current }: { score: number | null; current: JudgementFamily | null }) {
   return (
-    <div aria-hidden="true" className="relative mt-2">
-      <div className="flex h-1.5 overflow-hidden rounded-evidence border border-control">
-        <span className="h-full" style={{ width: `${BORDERLINE_CUTOFF}%` }} />
-        <span className="h-full bg-field" style={{ width: `${SELECT_CUTOFF - BORDERLINE_CUTOFF}%` }} />
-        <span className="h-full flex-1 bg-rule-2" />
-      </div>
+    <div aria-hidden="true" data-score-ruler="" className="relative mt-2">
+      <RulerZones current={current} borderline={BORDERLINE_CUTOFF} select={SELECT_CUTOFF} className="h-1.5" />
       {[BORDERLINE_CUTOFF, SELECT_CUTOFF].map((cut) => (
-        <span key={cut} className="data-fill absolute -top-1 h-3.5 w-px bg-control" style={{ left: `${cut}%` }} />
+        <span key={cut} data-score-cut="" className="data-fill absolute -top-1 h-3.5 w-px bg-control" style={{ left: `${cut}%` }} />
       ))}
       {score !== null && (
-        <span className="data-fill absolute -top-1.5 h-[1.125rem] w-0.5 -translate-x-px bg-ink" style={{ left: `${score}%` }} />
+        <span data-score-mark="" className="data-fill absolute -top-1.5 h-[1.125rem] w-0.5 -translate-x-px bg-ink" style={{ left: `${score}%` }} />
       )}
       <div className="relative mt-0.5 h-4 text-meta text-ink-tertiary">
-        <span className="absolute left-0">Reject</span>
-        <span className="absolute translate-x-1" style={{ left: `${BORDERLINE_CUTOFF}%` }}>Borderline {BORDERLINE_CUTOFF}</span>
-        <span className="absolute translate-x-1" style={{ left: `${SELECT_CUTOFF}%` }}>Select {SELECT_CUTOFF}</span>
+        <span className={cx('absolute left-0', rulerLabelClass('closed', current))}>Reject</span>
+        {/* Back to back on the Select tick, as R1's ruler sets them: the zone between the cut-offs is too narrow on a phone to hold a label. */}
+        <span className={cx('absolute -translate-x-full whitespace-nowrap pr-1', rulerLabelClass('unresolved', current))} style={{ left: `${SELECT_CUTOFF}%` }}>Borderline {BORDERLINE_CUTOFF}</span>
+        <span className={cx('absolute whitespace-nowrap pl-1', rulerLabelClass('ready', current))} style={{ left: `${SELECT_CUTOFF}%` }}>Select {SELECT_CUTOFF}</span>
         <span className="absolute right-0">100</span>
       </div>
     </div>
@@ -150,7 +168,7 @@ function ScoreRuler({ score }: { score: number | null }) {
 
 function AlertIcon() {
   return (
-    <svg aria-hidden="true" viewBox="0 0 16 16" width="14" height="14" className="mt-0.5 shrink-0 text-ink">
+    <svg aria-hidden="true" viewBox="0 0 16 16" width="14" height="14" className="mt-0.5 shrink-0 text-unresolved-text">
       <circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" strokeWidth="1.5" />
       <path d="M8 4.5v4.25M8 10.75v.75" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
     </svg>
@@ -206,10 +224,12 @@ function SeekChip({ quote, moment, pressed, onCue }: {
 }
 
 /** A placed quote's button, or the same words as plain text when it has no moment. */
-function QuoteRow({ quote, moment, pressed, onCue }: {
+function QuoteRow({ quote, moment, pressed, family, onCue }: {
   quote: EvidenceQuote;
   moment: QuoteMoment | null;
   pressed: boolean;
+  /** The family of the rating it cites. A metric with no score has none, and stays ink. */
+  family: JudgementFamily | null;
   onCue: (number: number) => void;
 }) {
   if (quote.number === null || moment === null) {
@@ -230,9 +250,10 @@ function QuoteRow({ quote, moment, pressed, onCue }: {
     >
       <span className="flex items-center gap-1.5 whitespace-nowrap font-mono text-meta leading-5 text-ink-secondary">
         <span
+          data-evidence-number={number}
           className={cx(
-            'flex h-[1.125rem] min-w-[1.125rem] items-center justify-center rounded-evidence border border-ink px-0.5 leading-none',
-            pressed ? 'bg-ink text-paper' : 'text-ink',
+            'flex h-[1.125rem] min-w-[1.125rem] items-center justify-center rounded-evidence border px-0.5 leading-none',
+            evidenceNumberClass(family, pressed),
           )}
         >
           {number}
@@ -250,7 +271,7 @@ function QuoteRow({ quote, moment, pressed, onCue }: {
   );
 }
 
-function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, onToggle, momentOf, activeEvidence, onCue }: {
+function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, held, onToggle, momentOf, activeEvidence, onCue }: {
   metric: ScorecardMetricDisplay;
   index: number;
   scorecard: ScorecardAssessmentDisplay;
@@ -258,6 +279,7 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, o
   weakest: boolean;
   open: boolean;
   columns: string;
+  held: boolean;
   onToggle: () => void;
   momentOf: (quote: PlacedQuote) => QuoteMoment;
   activeEvidence: number | null;
@@ -273,6 +295,7 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, o
   // The weakest metric keeps its quote buttons open. An unscored one says why in a line.
   const showsQuotes = open || weakest;
   const rationaleLines = open ? null : weakest ? 'line-clamp-2' : score === null ? 'line-clamp-1' : 'hidden';
+  const family = held ? null : ratingFamily(score, scorecard.scoreScaleMax);
 
   return (
     <li data-rubric-row={metric.id} className="border-b border-rule py-0.5">
@@ -311,15 +334,15 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, o
           </span>
         )}
         {score !== null ? (
-          <span className="flex items-center gap-2 whitespace-nowrap text-label text-ink">
-            <Pips level={score} max={scorecard.scoreScaleMax} />
+          <span className={cx('flex items-center gap-2 whitespace-nowrap text-label', family ? FAMILY_CLASSES[family].text : 'text-ink')}>
+            <Pips level={score} max={scorecard.scoreScaleMax} family={family} />
             <span>
               {scoreLabel(score, scorecard.scoreScaleMax)}, {score}/{scorecard.scoreScaleMax}
             </span>
           </span>
         ) : (
           <span className="col-span-2 flex items-center gap-2 whitespace-nowrap text-label">
-            <span className="rounded-chip border border-dashed border-ink-secondary px-2 py-0.5 text-meta text-ink">
+            <span className="rounded-chip border border-dashed border-unresolved px-2 py-0.5 text-meta text-unresolved-text">
               Insufficient evidence
             </span>
             <span className="text-ink-tertiary">not counted</span>
@@ -340,6 +363,7 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, o
                     quote={quote}
                     moment={quote.number === null ? null : momentOf(quote as PlacedQuote)}
                     pressed={quote.number !== null && quote.number === activeEvidence}
+                    family={family}
                     onCue={onCue}
                   />
                 </li>
@@ -387,6 +411,7 @@ export function ReviewScorecard({
   checks = [],
   redFlags = null,
   otherCall = false,
+  held = false,
 }: ReviewScorecardProps) {
   const metrics = Array.isArray(scorecard.metrics) ? scorecard.metrics : [];
   const total = metrics.length;
@@ -396,6 +421,7 @@ export function ReviewScorecard({
   const score = overall === null ? null : Math.round(overall);
   const provisional = scorecard.status === 'incomplete_evidence';
   const verdict = recommendationMeta(scorecard.recommendation);
+  const family = held ? null : verdictFamily(scorecard.recommendation);
   const sentence = verdictSentence(scorecard);
   const whatIf = scoreWhatIf({ metrics, scoreScaleMax: scorecard.scoreScaleMax });
   const weakest = weakestMetric(metrics);
@@ -419,28 +445,33 @@ export function ReviewScorecard({
         data-verdict-box={provisional ? 'provisional' : 'firm'}
         className={cx(
           'relative mt-2 rounded-control border px-4 pb-1 pt-1.5',
-          provisional ? 'border-dashed border-ink-secondary' : 'border-rule-2',
+          provisional && 'border-dashed',
+          family
+            ? cx(FAMILY_CLASSES[family].wash, FAMILY_CLASSES[family].edge)
+            : provisional
+              ? 'border-ink-secondary'
+              : 'border-rule-2',
         )}
       >
         {provisional && (
           <p className="absolute -top-2 right-3 bg-paper px-1.5 text-meta text-ink-secondary">
-            <span className="font-semibold text-ink">Provisional</span> · {scoredCount} of {total} metrics
+            <span className="font-semibold text-unresolved-text">Provisional</span> · {scoredCount} of {total} metrics
           </p>
         )}
         <div className="flex items-center justify-between gap-3">
           <p className="flex min-w-0 items-center text-xl font-semibold text-ink">
-            {verdict ? <VerdictMark recommendation={scorecard.recommendation} size="xl" /> : 'Not scored'}
+            {verdict ? <VerdictMark recommendation={scorecard.recommendation} size="xl" plain={held} /> : 'Not scored'}
           </p>
           {score !== null ? (
             <p className="flex items-baseline gap-0.5 whitespace-nowrap">
-              <span className="text-stat text-ink">{score}</span>
+              <span className={cx('text-stat', family ? FAMILY_CLASSES[family].text : 'text-ink')}>{score}</span>
               <span className="text-sm text-ink-tertiary">/100</span>
             </p>
           ) : (
             <p className="text-sm text-ink-secondary">Not scored</p>
           )}
         </div>
-        <ScoreRuler score={score} />
+        <ScoreRuler score={score} current={family} />
       </div>
 
       {sentence && <p className="mt-1.5 text-sm leading-[1.3125rem] text-ink">{sentence}</p>}
@@ -450,7 +481,7 @@ export function ReviewScorecard({
             'No metric had enough evidence to score. This screening needs a human review.'
           ) : (
             <>
-              <span className="font-semibold text-ink">Provisional:</span>{' '}
+              <span className="font-semibold text-unresolved-text">Provisional:</span>{' '}
               {`scored from ${scoredCount} of ${total} metrics. The others lacked evidence and are left out of the weighted score, so confirm before deciding.`}
             </>
           )}
@@ -470,7 +501,7 @@ export function ReviewScorecard({
               <li key={metric.id} className="flex gap-2.5 border-b border-rule py-0.5">
                 <AlertIcon />
                 <span>
-                  <span className="font-semibold text-ink">
+                  <span className="font-semibold text-unresolved-text">
                     {metricDisplayName(metric, metrics.indexOf(metric))}: insufficient evidence.
                   </span>
                   {whatIf && at === unscored.length - 1 && (
@@ -492,7 +523,7 @@ export function ReviewScorecard({
               <li key={flag} className="flex gap-2.5 border-b border-rule py-0.5">
                 <AlertIcon />
                 <span>
-                  <span className="font-semibold text-ink">Red flag:</span> {flag}
+                  <span className="font-semibold text-unresolved-text">Red flag:</span> {flag}
                 </span>
               </li>
             ))}
@@ -519,6 +550,7 @@ export function ReviewScorecard({
                 weakest={metric === weakest}
                 open={openMetrics.has(metric.id)}
                 columns={pastTheHour ? RUBRIC_COLUMNS_HOURS : RUBRIC_COLUMNS}
+                held={held}
                 onToggle={() => onToggleMetric(metric.id)}
                 momentOf={momentOf}
                 activeEvidence={activeEvidence}

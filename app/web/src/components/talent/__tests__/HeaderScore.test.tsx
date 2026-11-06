@@ -35,6 +35,52 @@ describe('HeaderScore', () => {
     expect(within(r).queryByText('Provisional')).not.toBeInTheDocument();
   });
 
+  it.each([
+    ['advance', 'text-ready-text', 'text-ready'],
+    ['hold', 'text-unresolved-text', 'text-unresolved'],
+    ['reject', 'text-closed-text', 'text-closed'],
+  ])('prints a %s figure and mark in its family', (recommendation, text, mark) => {
+    const { container } = render(
+      <HeaderScore assessments={[assessment({ recommendation })]} sessions={[session({})]} />,
+    );
+    expect(within(region()).getByText('39').parentElement).toHaveClass(text);
+    expect(container.querySelector('[data-verdict-mark]')).toHaveClass(mark);
+    // The scale beside it is not the verdict.
+    expect(within(region()).getByText('/ 100')).toHaveClass('text-ink-tertiary');
+  });
+
+  it('keeps a figure with no recommendation in ink, and dims a held one as it always did', () => {
+    const { rerender } = render(
+      <HeaderScore assessments={[assessment({ recommendation: null })]} sessions={[session({})]} />,
+    );
+    expect(region().querySelector('.text-stat')!.parentElement).toHaveClass('text-ink');
+    rerender(
+      <HeaderScore
+        assessments={[assessment({ evidence_grade: 'insufficient', evidence_reason: 'partial_thin' })]}
+        sessions={[session({})]}
+      />,
+    );
+    expect(region().querySelector('.text-stat')!.parentElement).toHaveClass('text-ink-secondary');
+  });
+
+  it.each([
+    ['advance', 'Select'],
+    ['reject', 'Reject'],
+  ])('gives a held %s no hue at all: the figure and the mark agree, with the shape and the word kept', (recommendation, word) => {
+    const { container } = render(
+      <HeaderScore
+        assessments={[assessment({ recommendation, evidence_grade: 'insufficient', evidence_reason: 'partial_thin' })]}
+        sessions={[session({})]}
+      />,
+    );
+    expect(region().querySelector('.text-stat')!.parentElement).toHaveClass('text-ink-secondary');
+    const mark = container.querySelector('[data-verdict-mark]')!;
+    expect(mark).toHaveClass('text-ink');
+    expect(mark.getAttribute('class')).not.toMatch(/ready|unresolved|closed/);
+    expect(within(region()).getByText(word).parentElement).toHaveClass('text-ink');
+    expect(within(region()).getByText('Held: not enough evidence')).toBeInTheDocument();
+  });
+
   it('says Not scored, never 0, when there is no assessment or no readable figure', () => {
     const { rerender } = render(<HeaderScore assessments={[]} sessions={[]} />);
     expect(within(region()).getByText('Not scored')).toBeInTheDocument();

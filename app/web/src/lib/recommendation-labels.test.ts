@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { verdictFamily } from '../components/design/tones';
 import { recommendationMeta } from '../components/session/scorecard-read';
 import { RECOMMENDATION_ORDER, recommendationLabel } from '../components/talent/candidateFilters';
 import { recommendationWords } from './candidate-report/buildReportHtml';
@@ -57,6 +58,20 @@ describe('recommendation labels', () => {
       expect(R1_RECOMMENDATION_LABEL[value]).toBe(word);
     },
   );
+
+  it.each([
+    ['advance', 'success', 'ready'],
+    ['hold', 'warning', 'unresolved'],
+    ['reject', 'closed', 'closed'],
+  ])('gives the verdict %s the %s tone, which is its family %s wherever it is printed', (value, tone, family) => {
+    expect(recommendationMeta(value)?.tone).toBe(tone);
+    expect(verdictFamily(value)).toBe(family);
+  });
+
+  it('gives human review no family: it is no verdict', () => {
+    expect(recommendationMeta('human_review')?.tone).toBe('neutral');
+    expect(verdictFamily('human_review')).toBeNull();
+  });
 
   it('leaves each surface its own human_review wording and fallback', () => {
     expect(recommendationMeta('human_review')?.label).toBe('Needs human review');

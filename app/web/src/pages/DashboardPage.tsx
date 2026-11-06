@@ -61,8 +61,9 @@ import {
   SectionHeader,
   Skeleton,
   StatusBadge,
+  countTone,
 } from '../components/design';
-import type { StatusTone } from '../components/design';
+import type { FigureTone, StatusTone } from '../components/design';
 import { MetricStrip } from '../components/design/MetricStrip';
 import type { MetricItem } from '../components/design/MetricStrip';
 import { BarList, LineChart } from '../components/charts';
@@ -74,6 +75,7 @@ import {
   candidateDisplayStatus,
   candidateFunnel,
   candidatesHref,
+  candidateStatusMark,
   candidateStatusKey,
   recommendationLabel,
   RECOMMENDATION_ORDER,
@@ -111,16 +113,16 @@ const COMPLETION_EXCLUDED: ReadonlySet<string> = new Set([
 ]);
 
 const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
-  assessment_ready: { title: 'Screening ready for review', tone: 'info' },
-  appeal_resolved: { title: 'Appeal resolved, review the outcome', tone: 'success' },
+  assessment_ready: { title: 'Screening ready for review', tone: 'success' },
+  appeal_resolved: { title: 'Appeal resolved, review the outcome', tone: 'closed' },
   quota_warning: { title: 'Session quota nearing its limit', tone: 'warning' },
 };
 
-/** A recommendation's own meaning, so its bar is coloured by it. */
+/** A recommendation's own meaning, so its bar is coloured by it, as a single candidate's verdict is. */
 const RECOMMENDATION_TONE: Record<string, BarTone> = {
   advance: 'success',
   hold: 'warning',
-  reject: 'neutral',
+  reject: 'closed',
 };
 
 /**
@@ -241,6 +243,7 @@ export function DashboardPage() {
             value: f.value,
             href: candidatesHref({ statuses: [f.status] }),
             title: f.status,
+            tone: candidateStatusMark(f.status),
           }))
         : [],
     [candidates],
@@ -271,9 +274,10 @@ export function DashboardPage() {
     value: number | undefined,
     context: string,
     href: string,
+    figureTone?: FigureTone,
   ): MetricItem =>
     value !== undefined
-      ? { label, value: value.toLocaleString(), context, href }
+      ? { label, value: value.toLocaleString(), context, href, figureTone: countTone(value, figureTone) }
       : listError
         ? { label, value: '—', context: 'Could not load' }
         : { label, value: '', context, loading: true };
@@ -346,18 +350,21 @@ export function DashboardPage() {
               figures?.awaiting,
               'New, not yet screened',
               candidatesHref({ statuses: ['new'] }),
+              'info',
             ),
             heroFigure(
               'In screening',
               figures?.inScreening,
               'Queued or on a call',
               candidatesHref({ statuses: ['queued', 'screening'] }),
+              'info',
             ),
             heroFigure(
               'Awaiting decision',
               figures?.awaitingDecision,
               'Screened, ready to review',
               candidatesHref({ statuses: ['screened'] }),
+              'success',
             ),
           ]}
         >
@@ -879,7 +886,7 @@ function PhoneScheduleCard({
               columns={3}
               bleed
               items={[
-                { label: 'Upcoming', value: atLeast(upcoming.length, truncated) },
+                { label: 'Upcoming', value: atLeast(upcoming.length, truncated), figureTone: countTone(upcoming.length, 'info') },
                 {
                   label: 'Overdue',
                   value: atLeast(overdue.length, overdueCut),

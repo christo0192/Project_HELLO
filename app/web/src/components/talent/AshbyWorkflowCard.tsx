@@ -32,10 +32,17 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { AshbyCandidateWorkflow, AshbyCandidateWorkflowOperation } from '../../types';
-import { StatusBadge, type StatusTone } from '../design';
+import { cx, figureToneClass, StatusBadge } from '../design';
 import { SurfaceCard } from '../design/candidate';
 import { formatDateTime } from '../../lib/datetime';
-import { sessionStatusLabel, sessionStatusTone } from './status';
+import {
+  ashbyIngestionTone,
+  ashbyLifecycleTone,
+  ashbyOperationStateTone,
+  ashbyTerminalTone,
+  sessionStatusLabel,
+  sessionStatusTone,
+} from './status';
 import { humanizeEnum } from '../../lib/humanize';
 import { ashbyErrorCodeLabel } from '../../lib/ashby-labels';
 import { IntakeBadge, isIntakeType, PROFILE_OUTCOME_LABELS } from './ResumeReviewBadge';
@@ -48,10 +55,11 @@ export type AshbyWorkflowSource =
 /** Mirrors the 0029 CHECK on `ashby_operations.error_code`. */
 const SANITIZED_CODE_RE = /^[a-z0-9_.:-]{1,64}$/;
 
-/* ── Truthful label/tone maps (raw value is the fallback) ───────────── */
+/* ── Truthful labels (raw value is the fallback) ────────────────────── */
 /* Module-local on purpose: these are presentation for THIS card only. A
    second surface that needs the same wording should import the card, not
-   re-render the vocabulary its own way. */
+   re-render the vocabulary its own way. The tones are shared, in `status.ts`:
+   a state keeps its family wherever it is printed. */
 
 export function ashbyLifecycleLabel(lifecycle: string): string {
   switch (lifecycle) {
@@ -72,24 +80,7 @@ export function ashbyLifecycleLabel(lifecycle: string): string {
   }
 }
 
-function ashbyLifecycleTone(lifecycle: string): StatusTone {
-  switch (lifecycle) {
-    case 'completed':
-      return 'success';
-    case 'processing':
-    case 'writeback_pending':
-      return 'warning';
-    case 'imported':
-    case 'ready':
-      return 'info';
-    case 'cancelled':
-      return 'danger';
-    default:
-      return 'neutral';
-  }
-}
-
-function ashbyTerminalStateLabel(terminalState: string): string {
+export function ashbyTerminalStateLabel(terminalState: string): string {
   switch (terminalState) {
     case 'withdrawn':
       return 'Application withdrawn';
@@ -102,7 +93,7 @@ function ashbyTerminalStateLabel(terminalState: string): string {
   }
 }
 
-function ashbyIngestionLabel(state: string): string {
+export function ashbyIngestionLabel(state: string): string {
   switch (state) {
     case 'queued':
       return 'Queued';
@@ -125,25 +116,6 @@ function ashbyIngestionLabel(state: string): string {
   }
 }
 
-function ashbyIngestionTone(state: string): StatusTone {
-  switch (state) {
-    case 'ready':
-      return 'success';
-    case 'failed_review':
-    case 'cancelled':
-      return 'danger';
-    case 'queued':
-      return 'info';
-    case 'fetching':
-    case 'scanning':
-    case 'extracting':
-    case 'structuring':
-      return 'warning';
-    default:
-      return 'neutral';
-  }
-}
-
 function ashbyOperationLabel(type: AshbyCandidateWorkflowOperation['type']): string {
   switch (type) {
     case 'invite_delivery':
@@ -155,7 +127,7 @@ function ashbyOperationLabel(type: AshbyCandidateWorkflowOperation['type']): str
   }
 }
 
-function ashbyOperationStateLabel(state: string): string {
+export function ashbyOperationStateLabel(state: string): string {
   switch (state) {
     case 'pending':
       return 'Pending';
@@ -171,24 +143,6 @@ function ashbyOperationStateLabel(state: string): string {
       return 'Cancelled';
     default:
       return humanizeEnum(state);
-  }
-}
-
-function ashbyOperationStateTone(state: string): StatusTone {
-  switch (state) {
-    case 'succeeded':
-      return 'success';
-    case 'failed':
-      return 'danger';
-    case 'running':
-    case 'blocked':
-      return 'warning';
-    case 'pending':
-      return 'info';
-    case 'cancelled':
-      return 'neutral';
-    default:
-      return 'neutral';
   }
 }
 
@@ -224,7 +178,7 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
       </div>
 
       {workflow.terminalState && (
-        <p className="mt-2 text-sm text-error">
+        <p className={cx('mt-2 text-sm', figureToneClass(ashbyTerminalTone()))}>
           {ashbyTerminalStateLabel(workflow.terminalState)}
         </p>
       )}

@@ -18,6 +18,7 @@ import { Scorecard } from '../../Scorecard';
 import {
   CandidateScorecard,
   CandidateScorecardNarrative,
+  CandidateScorecardRoleFit,
 } from '../CandidateScorecard';
 import { CandidateShell } from '../CandidateShell';
 import type { Assessment } from '../../../types';
@@ -107,6 +108,133 @@ const MINIMAL: Assessment = {
 function normalize(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
+
+describe('CandidateScorecard takes its colour from the verdict and the ratings', () => {
+  it.each([
+    ['advance', 'text-ready-text', 'text-ready'],
+    ['hold', 'text-unresolved-text', 'text-unresolved'],
+    ['reject', 'text-closed-text', 'text-closed'],
+  ] as const)('prints a %s figure in %s and its mark in %s', (recommendation, text, mark) => {
+    const { container } = render(<CandidateScorecard assessment={{ ...MINIMAL, recommendation }} />);
+    expect(screen.getByText('78')).toHaveClass(text);
+    expect(container.querySelector('[data-verdict-mark]')).toHaveClass(mark);
+  });
+
+  it('keeps the figure in ink when there is no verdict', () => {
+    render(<CandidateScorecard assessment={{ ...MINIMAL, recommendation: null as unknown as Assessment['recommendation'] }} />);
+    expect(screen.getByText('78')).toHaveClass('text-[var(--c-ink)]');
+  });
+
+  it('leaves Impact in ink: a filler or native-language impact is not better when high', () => {
+    render(<CandidateScorecard assessment={FULL} />);
+    const impacts = screen.getAllByRole('meter', { name: 'Impact' });
+    expect(impacts.length).toBeGreaterThan(0);
+    for (const impact of impacts) {
+      expect(impact.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toMatch(/--c-ink/);
+    }
+  });
+
+  it('colours the other readings by the word they print', () => {
+    render(<CandidateScorecard assessment={MINIMAL} />);
+    const fit = screen.getByRole('meter', { name: 'Fit score' });
+    expect(fit.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toBe('var(--ready)');
+  });
+
+  describe('the Overall score bar never claims another verdict than the one beside it', () => {
+    const overall = () => screen.getByRole('meter', { name: 'Overall score' });
+    const overallFill = () => overall().querySelector<HTMLElement>('.data-fill')!.style.backgroundColor;
+    const overallWord = (word: string) => within(overall().parentElement!).getByText(word);
+
+    // Its word cuts at 50 and 75 and the verdict at 45 and 65, so these are where the two part.
+    it.each([
+      ['advance', 70, 'Fair', 'ready'],
+      ['advance', 65, 'Fair', 'ready'],
+      ['hold', 47, 'Low', 'unresolved'],
+      ['hold', 60, 'Fair', 'unresolved'],
+      ['reject', 30, 'Low', 'closed'],
+    ] as const)('a stored %s at %s keeps the word %s and takes the %s family', (recommendation, overall_score, word, family) => {
+      render(<CandidateScorecard assessment={{ ...MINIMAL, recommendation, overall_score }} />);
+      expect(overallFill()).toBe(`var(--${family})`);
+      expect(overallWord(word)).toHaveClass(`text-${family}-text`);
+      expect(overallWord(`${overall_score}/100`)).toHaveClass(`text-${family}-text`);
+    });
+
+    it('is ink with no verdict, and still prints its word', () => {
+      render(
+        <CandidateScorecard assessment={{ ...MINIMAL, recommendation: null as unknown as Assessment['recommendation'], overall_score: 70 }} />,
+      );
+      expect(overallFill()).toMatch(/--c-ink/);
+      expect(overallWord('Fair').className).not.toMatch(/ready|unresolved|closed/);
+    });
+  });
+
+  it('gives a missing Communication or Motivation score no hue, and prints what it always printed', () => {
+    render(<CandidateScorecard assessment={MINIMAL} />);
+    const scores = screen.getAllByRole('meter', { name: 'Score' });
+    expect(scores).toHaveLength(2);
+    for (const meter of scores) {
+      expect(meter.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toMatch(/--c-ink/);
+      expect(meter).toHaveAttribute('aria-valuetext', '0 out of 10 — Low');
+    }
+    for (const word of screen.getAllByText('0/10')) expect(word.className).not.toMatch(/closed/);
+    expect(screen.getByText('No candidate responses are available to assess communication.')).toBeInTheDocument();
+    expect(screen.getByText('No candidate responses are available to assess motivation.')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['advance', 'Select'],
+    ['reject', 'Reject'],
+  ] as const)('gives a held %s no hue: figure, mark and every reading, with the words unchanged', (recommendation, word) => {
+    const { container } = render(
+      <CandidateScorecard assessment={{ ...FULL, recommendation, overall_score: 80, evidence_grade: 'insufficient' }} />,
+    );
+    expect(screen.getByText('80')).toHaveClass('text-[var(--c-ink)]');
+    expect(screen.getByText('80').className).not.toMatch(/ready|unresolved|closed/);
+    expect(container.querySelector('[data-verdict-mark]')).toHaveClass('text-ink');
+    expect(screen.getByText(word).parentElement).toHaveClass('text-ink');
+    const meters = screen.getAllByRole('meter');
+    expect(meters.length).toBeGreaterThan(5);
+    for (const meter of meters) {
+      expect(meter.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toMatch(/--c-ink/);
+    }
+    expect(container.innerHTML).not.toMatch(/(?:bg|text|border)-(?:ready|unresolved|closed)/);
+  });
+
+  describe('the Role fit row a host prints on its own', () => {
+    const fit = () => screen.getByRole('meter', { name: 'Fit score' });
+
+    it('colours its Fit score by the word it prints', () => {
+      render(<CandidateScorecardRoleFit assessment={FULL} />);
+      expect(fit().querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toBe('var(--closed)');
+      expect(within(fit().parentElement!).getByText('Low')).toHaveClass('text-closed-text');
+      expect(within(fit().parentElement!).getByText('4/10')).toHaveClass('text-closed-text');
+    });
+
+    it('gives a held row no family on its Fit score, with the word and the figure unchanged', () => {
+      render(<CandidateScorecardRoleFit assessment={{ ...FULL, evidence_grade: 'insufficient' }} />);
+      expect(fit().querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toMatch(/--c-ink/);
+      const word = within(fit().parentElement!).getByText('Low');
+      const figure = within(fit().parentElement!).getByText('4/10');
+      expect(word.className).not.toMatch(/ready|unresolved|closed/);
+      expect(figure.className).not.toMatch(/ready|unresolved|closed/);
+    });
+  });
+
+  it('still rates a Communication or Motivation score of 0 that was given', () => {
+    render(
+      <CandidateScorecard
+        assessment={{
+          ...MINIMAL,
+          communication: { score: 0, notes: '' },
+          motivation: { score: 0, notes: '' },
+        } as unknown as Assessment}
+      />,
+    );
+    for (const meter of screen.getAllByRole('meter', { name: 'Score' })) {
+      expect(meter.querySelector<HTMLElement>('.data-fill')!.style.backgroundColor).toBe('var(--closed)');
+    }
+  });
+});
 
 /**
  * Every distinct value the assessment puts on screen, derived from the

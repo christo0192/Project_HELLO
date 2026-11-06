@@ -281,15 +281,95 @@ test.describe('the sheet at both desk sizes', () => {
     await expect(table.getByText(/^Admin /)).toHaveCount(0);
   });
 
-  test('a verdict is a circle and a word, in ink, with no hue', async ({ app, page }) => {
+  test('a verdict is a circle and a word, in its family', async ({ app, page }) => {
     await openRoute(app, routeNamed('candidates'));
-    const mark = page.locator('tbody [data-verdict-mark]').first();
-    await expect(mark).toBeVisible();
-    const [ink, stroke] = await Promise.all([
-      tokenColour(page, '--ink'),
-      mark.evaluate((el) => getComputedStyle(el.querySelector('circle')!).stroke),
-    ]);
-    expect(stroke).toBe(ink);
+    for (const [value, shape, mark, text] of [
+      ['advance', 'full', '--ready', '--ready-text'],
+      ['hold', 'half', '--unresolved', '--unresolved-text'],
+      ['reject', 'empty', '--closed', '--closed-text'],
+    ]) {
+      const verdict = page.locator(`tbody [data-recommendation="${value}"]`).first();
+      await expect(verdict).toBeVisible();
+      await expect(verdict.locator('[data-verdict-mark]')).toHaveAttribute('data-verdict-mark', shape);
+      expect(await verdict.locator('circle').evaluate((el) => getComputedStyle(el).stroke), value).toBe(await tokenColour(page, mark));
+      expect(await verdict.evaluate((el) => getComputedStyle(el).color), value).toBe(await tokenColour(page, text));
+    }
+  });
+});
+
+test.describe('colour that carries meaning', () => {
+  /** A token as a fill, resolved the way the browser resolves the page. */
+  const tokenFill = (page: Page, name: string): Promise<string> =>
+    page.evaluate((token) => {
+      const probe = document.createElement('span');
+      probe.style.backgroundColor = `var(${token})`;
+      document.body.append(probe);
+      const colour = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return colour;
+    }, name);
+
+  test('a row badge is its family wash, text shade and dot, and the verdict beside it takes its own', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates'));
+    const badge = page.locator('tbody [data-status-badge="success"]').first();
+    await expect(badge).toBeVisible();
+    expect(await badge.evaluate((el) => getComputedStyle(el).color)).toBe(await tokenColour(page, '--ready'));
+    expect(await fillOf(badge)).toBe(await tokenFill(page, '--ready-soft'));
+    expect(await fillOf(badge.locator('[aria-hidden="true"]').first())).toBe(await tokenFill(page, '--ready'));
+    const stroke = await page
+      .locator('tbody [data-recommendation="reject"] circle')
+      .first()
+      .evaluate((el) => getComputedStyle(el).stroke);
+    expect(stroke).toBe(await tokenColour(page, '--closed'));
+  });
+
+  test('the status bar draws each stage in its step, keeps its 2px gap, and is never the voice hue', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates'));
+    const segment = (key: string) => page.locator(`[data-pipeline-segment="${key}"]`);
+    for (const [key, token] of [
+      ['new', '--moving-light'],
+      ['queued', '--moving'],
+      ['screening', '--moving-deep'],
+      ['screened', '--ready-light'],
+      ['advanced', '--ready'],
+      ['rejected', '--closed'],
+      ['consent_declined', '--closed-light'],
+      ['abandoned_no_answer', '--unresolved'],
+    ]) {
+      expect(await fillOf(segment(key)), key).toBe(await tokenFill(page, token));
+    }
+    expect(await fillOf(segment('screening'))).not.toBe(await tokenFill(page, '--voice-mark'));
+    expect(await segment('queued').evaluate((el) => getComputedStyle(el).borderLeftWidth)).toBe('2px');
+  });
+
+  test('the recommendation bar gives Select, Borderline and Reject their families', async ({ app, page }) => {
+    await openRoute(app, routeNamed('candidates'));
+    const segment = (key: string) => page.locator(`[data-pipeline-segment="${key}"]`);
+    for (const [key, token] of [
+      ['advance', '--ready'],
+      ['hold', '--unresolved'],
+      ['reject', '--closed'],
+    ]) {
+      expect(await fillOf(segment(key)), key).toBe(await tokenFill(page, token));
+    }
+  });
+
+  test('on the Dashboard a plain total is ink and a figure with a meaning is its text shade', async ({ app, page }) => {
+    await openRoute(app, routeNamed('dashboard'));
+    const figure = (name: RegExp) => page.getByRole('link', { name }).locator('p').nth(1);
+    expect(await figure(/^Candidates: /).evaluate((el) => getComputedStyle(el).color)).toBe(await tokenColour(page, '--ink'));
+    expect(await figure(/^In screening: /).evaluate((el) => getComputedStyle(el).color)).toBe(await tokenColour(page, '--moving-text'));
+    expect(await figure(/^Awaiting decision: /).evaluate((el) => getComputedStyle(el).color)).toBe(await tokenColour(page, '--ready'));
+    const stage = (name: RegExp) => page.getByRole('rowheader', { name }).locator('.data-fill');
+    expect(await fillOf(stage(/^Screening/).first())).toBe(await tokenFill(page, '--moving-deep'));
+  });
+
+  test('the public status page keeps the ink it has always had', async ({ app, page }) => {
+    await app.goto('/status');
+    const badge = page.locator('[data-status-badge]').first();
+    await expect(badge).toBeVisible();
+    expect(await badge.evaluate((el) => getComputedStyle(el).color)).toBe(await tokenColour(page, '--ink-2'));
+    expect(await fillOf(badge)).toBe(await tokenFill(page, '--field'));
   });
 });
 

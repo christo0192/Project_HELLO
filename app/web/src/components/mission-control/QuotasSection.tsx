@@ -300,7 +300,7 @@ export function QuotasSection() {
                     </div>
 
                     <div className="shrink-0">
-                      <StatusBadge tone={policy.enabled ? 'success' : 'neutral'}>
+                      <StatusBadge tone={policy.enabled ? 'success' : 'closed'}>
                         {policy.enabled ? 'enabled' : 'disabled'}
                       </StatusBadge>
                       <p className="mt-1 text-xs text-ink-tertiary">

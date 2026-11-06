@@ -31,8 +31,12 @@ const LAYOUT = 'src/components/Layout.tsx';
 const PAGE = 'src/pages/CandidatesPage.tsx';
 const R1_CSS = 'src/styles/candidate-r1.css';
 const CANDIDATE_CSS = 'src/styles/candidate-experience.css';
+const R1_OVERVIEW = 'src/components/r1-review/OverviewPanel.tsx';
 const CASES = [
   ['a palette token drifts', 'css', (s) => s.replace('--paper: #fbfaf6', '--paper: #ffffff'), /--paper should be/],
+  ['a family token drifts', 'css', (s) => s.replace('--ready: #0a693c', '--ready: #12857a'), /--ready should be/],
+  ['a family loses a step', 'css', (s) => s.replace('--closed-light: #ae96da;', ''), /--closed-light should be/],
+  ['a family text falls below its bar', 'css', (s) => s.replace('--unresolved-text: #6b6620', '--unresolved-text: #958d0f'), /--unresolved-text should be/],
   ['the go green disappears', 'css', (s) => s.replace('--go: #2f7a4f;', ''), /--go should be/],
   ['a .dark block returns', 'css', (s) => `${s}\n.dark { --paper: #000000; }`, /alternate dark rule/],
   ['a dark: utility appears', LAYOUT, (s) => `${s}\nconst x = 'dark:bg-ink';`, /dark: utilities/],
@@ -88,12 +92,33 @@ const CASES = [
   ['an uppercase utility appears', LAYOUT, (s) => `${s}\nconst a = 'uppercase';`, /uppercase utilities/],
   ['an eyebrow is tracked open', LAYOUT, (s) => `${s}\nconst a = 'tracking-wide';`, /open tracking/],
   ['a stock hue appears', LAYOUT, (s) => `${s}\nconst a = 'bg-green-600 text-blue-700';`, /stock hue utilities/],
+  ['a fault is printed with a colour that does not exist', PAGE, (s) => `${s}\nconst a = 'text-danger';`, /-danger utilities compile to nothing/],
+  ['a fault is filled with a colour that does not exist', LAYOUT, (s) => `${s}\nconst a = 'bg-danger';`, /-danger utilities compile to nothing/],
   ['a re-pointed scale is dropped', 'tailwind', (s) => s.replace('red: dangerScale', 'crimson: dangerScale'), /re-points the stock scale red/],
   ['a raw hex lands in a page', PAGE, (s) => `${s}\nconst a = '#123456';`, /raw colours in/],
   ['a raw rgb lands in a page', PAGE, (s) => `${s}\nconst a = 'rgb(1, 2, 3)';`, /raw colours in/],
   ['a raw hex lands in a candidate sheet', CANDIDATE_CSS, (s) => `${s}\n.x { color: #123456; }`, /raw colours in/],
-  ['a verdict goes crimson', 'src/components/session/ScoreVerdict.tsx', (s) => `${s}\nconst a = 'text-error-text';`, /a verdict takes a hue/],
-  ['a recommendation takes the fault tone', 'src/components/session/scorecard-read.ts', (s) => s.replace("tone: 'neutral' }", "tone: 'danger' }"), /a verdict takes a hue/],
+  ['a verdict goes crimson', 'src/components/session/ScoreVerdict.tsx', (s) => `${s}\nconst a = 'text-error-text';`, /a verdict takes a colour outside its family/],
+  ['a verdict takes the voice', 'src/components/session/VerdictMark.tsx', (s) => `${s}\nconst a = 'text-voice';`, /a verdict takes a colour outside its family/],
+  ['a verdict block takes the underway wash', 'src/components/talent/ReviewScorecard.tsx', (s) => `${s}\nconst a = 'bg-moving-soft';`, /a verdict takes a colour outside its family/],
+  ['a figure takes the fault token', 'src/components/talent/HeaderScore.tsx', (s) => `${s}\nconst a = 'var(--danger)';`, /a verdict takes a colour outside its family/],
+  ['a recommendation takes the fault tone', 'src/components/session/scorecard-read.ts', (s) => s.replace("tone: 'closed' }", "tone: 'danger' }"), /a verdict takes a colour outside its family/],
+  ['a ruler zone goes crimson', 'src/components/session/RulerZones.tsx', (s) => `${s}\nconst a = 'bg-danger text-error-text';`, /a verdict takes a colour outside its family in [^\n]*RulerZones/],
+  ['a role scorecard rating goes crimson', 'src/components/session/RoleScorecardView.tsx', (s) => `${s}\nconst a = 'text-error-text';`, /a verdict takes a colour outside its family in [^\n]*RoleScorecardView/],
+  ['an R1 rating goes crimson', R1_OVERVIEW, (s) => `${s}\nconst a = 'text-error-text';`, /a verdict takes a colour outside its family in [^\n]*OverviewPanel/],
+  ['an R1 rating takes the voice', R1_OVERVIEW, (s) => `${s}\nconst a = 'text-voice';`, /a verdict takes a colour outside its family in [^\n]*OverviewPanel/],
+  ['an R1 rating takes the underway wash', R1_OVERVIEW, (s) => `${s}\nconst a = 'bg-moving-soft';`, /a verdict takes a colour outside its family in [^\n]*OverviewPanel/],
+  ['the highlighter leaves its one quote on the R1 overview', R1_OVERVIEW, (s) => `${s}\nconst a = 'bg-wash';`, /a verdict takes a colour outside its family in [^\n]*OverviewPanel/],
+  ['Select stops being ready', 'src/components/design/tones.ts', (s) => s.replace("advance: 'ready'", "advance: 'unresolved'"), /the verdict advance should be the ready family/],
+  ['Reject goes back to no family', 'src/components/design/tones.ts', (s) => s.replace("reject: 'closed',", ''), /the verdict reject should be the closed family/],
+  ['a rating moves its cut-off', 'src/components/design/tones.ts', (s) => s.replace('position >= 0.75', 'position >= 0.7'), /a rating should be ready from 0\.75/],
+  ['the mark drops the family', 'src/components/session/VerdictMark.tsx', (s) => s.replace('verdictFamily(recommendation)', 'null'), /VerdictMark.tsx no longer prints the verdict's family/],
+  ['the Review panel drops the family', 'src/components/talent/ReviewScorecard.tsx', (s) => s.replace('verdictFamily(scorecard.recommendation)', 'null'), /ReviewScorecard.tsx no longer prints the verdict's family/],
+  ['a provisional chip takes the underway tag', 'src/components/talent/HeaderScore.tsx', (s) => `${s}\nconst a = <Tag tone="moving">Provisional</Tag>;`, /a verdict takes a colour outside its family in [^\n]*HeaderScore/],
+  ['a matched skill takes the underway tag', 'src/components/talent/CandidateScorecard.tsx', (s) => `${s}\nconst a = <Tag tone="moving">Matched skills</Tag>;`, /a verdict takes a colour outside its family in [^\n]*CandidateScorecard/],
+  ['the provisional notice takes the crimson wash', 'src/components/session/RoleScorecardView.tsx', (s) => `${s}\nconst a = 'bg-error-soft';`, /a verdict takes a colour outside its family in [^\n]*RoleScorecardView/],
+  ['the evidence hold goes crimson', 'src/components/talent/EvidenceHoldNotice.tsx', (s) => `${s}\nconst a = 'text-error-text';`, /a verdict takes a colour outside its family in [^\n]*EvidenceHoldNotice/],
+  ['the evidence hold takes a family', 'src/components/talent/EvidenceHoldNotice.tsx', (s) => `${s}\nconst a = 'text-warning-text';`, /a held card's notice takes a family/],
   ['mono spreads', LAYOUT, (s) => `${s}\nconst m = 'font-mono';`, /Plex Mono outside/],
 ];
 

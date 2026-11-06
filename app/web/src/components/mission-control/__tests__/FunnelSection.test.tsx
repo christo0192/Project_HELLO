@@ -91,6 +91,37 @@ describe('FunnelSection', () => {
     expect(screen.getByText('parse_bad_output')).toBeInTheDocument();
   });
 
+  it('asks for a second look at a low conversion: crimson is a fault, and this is not one', async () => {
+    api.getFunnelSummary.mockResolvedValue({
+      ...SUMMARY,
+      conversions: { ...SUMMARY.conversions, parse_to_dial: 0.1, dial_to_connect: 0.5, connect_to_consent: 0.9, scored_to_qualified: 0.7 },
+    });
+    render(<FunnelSection />);
+    const badge = async (figure: string) => (await screen.findByText(figure)).closest('[data-status-badge]');
+    expect(await badge('10%')).toHaveAttribute('data-status-badge', 'warning');
+    expect(await badge('50%')).toHaveAttribute('data-status-badge', 'neutral');
+    expect(await badge('90%')).toHaveAttribute('data-status-badge', 'success');
+  });
+
+  it('prints a drop bucket by its meaning only above zero, and a plain total in ink', async () => {
+    api.getFunnelSummary.mockResolvedValue({
+      ...SUMMARY,
+      totals: {
+        ...SUMMARY.totals,
+        needs_review: 11, parse_failed: 12, consent_dropped: 13, disqualified: 14, on_hold: 15, human_review: 0,
+      },
+    });
+    render(<FunnelSection />);
+    const figure = async (label: string) => (await screen.findByText(label)).parentElement!.querySelector('p:last-child');
+    expect(await figure('Needs manual review')).toHaveClass('text-warning-text');
+    expect(await figure('Parse failed')).toHaveClass('text-warning-text');
+    expect(await figure('Dropped at consent')).toHaveClass('text-closed-text');
+    expect(await figure('Disqualified')).toHaveClass('text-closed-text');
+    expect(await figure('Borderline')).toHaveClass('text-warning-text');
+    expect(await figure('Human review')).toHaveClass('text-ink');
+    expect(await figure('Attempts')).toHaveClass('text-ink');
+  });
+
   it('words the on_hold drop bucket as Borderline', async () => {
     render(<FunnelSection />);
     expect(await screen.findByText('Borderline')).toBeInTheDocument();
@@ -148,6 +179,16 @@ describe('FunnelSection', () => {
     await waitFor(() => expect(api.refreshFunnel).toHaveBeenCalledWith(30));
     // reload re-fetches the summary (initial load + post-recompute reload)
     await waitFor(() => expect(api.getFunnelSummary).toHaveBeenCalledTimes(2));
+  });
+
+  it('prints a failed Recompute in crimson: it is a fault on our side', async () => {
+    api.refreshFunnel.mockRejectedValue(new Error('rollup is busy'));
+    render(<FunnelSection />);
+    await screen.findByText('Entered parser');
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Recompute' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/^Recompute failed:/);
+    expect(alert).toHaveClass('text-error-text');
   });
 
   it('warns that failure counts are a lower bound when the window is truncated', async () => {

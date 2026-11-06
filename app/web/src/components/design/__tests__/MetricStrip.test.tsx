@@ -70,6 +70,49 @@ describe('MetricStrip', () => {
     expect(document.querySelector('dl')).toBeNull();
   });
 
+  it('prints a plain figure in ink, and a figure with a meaning in its family text shade', () => {
+    render(
+      <MetricStrip
+        label="Reach"
+        items={[
+          { label: 'Plain', value: '1' },
+          { label: 'Underway', value: '2', figureTone: 'info' },
+          { label: 'Good', value: '3', figureTone: 'success' },
+          { label: 'Open', value: '4', figureTone: 'warning' },
+          { label: 'Ended', value: '5', figureTone: 'closed' },
+        ]}
+      />,
+    );
+    expect(screen.getByText('1')).toHaveClass('text-ink');
+    expect(screen.getByText('2')).toHaveClass('text-moving-text');
+    expect(screen.getByText('3')).toHaveClass('text-success-text');
+    expect(screen.getByText('4')).toHaveClass('text-warning-text');
+    expect(screen.getByText('5')).toHaveClass('text-closed-text');
+    // A figure tone alone adds no dot: the dot is the separate `tone`.
+    expect(screen.getByText('Good').parentElement!.querySelector('[aria-hidden="true"]')).toBeNull();
+  });
+
+  it('lets a figure that needs attention outrank its tone, and draws a dot in the family mark', () => {
+    render(
+      <MetricStrip
+        label="Reach"
+        items={[
+          { label: 'Overdue', value: '6', figureTone: 'info', attention: true },
+          { label: 'Disqualified', value: '7', tone: 'closed', figureTone: 'closed' },
+          { label: 'Busy', value: '8', tone: 'info' },
+        ]}
+      />,
+    );
+    expect(screen.getByText('6')).toHaveClass('text-warning-text');
+    expect(screen.getByText('Disqualified').parentElement!.querySelector('[aria-hidden="true"]')).toHaveClass('bg-closed');
+    expect(screen.getByText('Busy').parentElement!.querySelector('[aria-hidden="true"]')).toHaveClass('bg-moving');
+  });
+
+  it('leaves a figure that could not be read in ink: a dash means nothing yet', () => {
+    render(<MetricStrip label="Reach" items={[{ label: 'Connect rate', value: '—', figureTone: 'info' }]} />);
+    expect(screen.getByText('—').parentElement).toHaveClass('text-ink');
+  });
+
   it('shows a skeleton, not a zero, while a figure loads', () => {
     render(<MetricStrip label="Reach" items={[{ label: 'Dialled', value: '0', loading: true }]} />);
     expect(document.querySelector('.skeleton')).toBeInTheDocument();

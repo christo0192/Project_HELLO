@@ -20,6 +20,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, us
 import type { ReactNode } from 'react';
 import type { TranscriptLine } from '../../types';
 import { cx } from '../design/cx';
+import { evidenceNumberClass, type JudgementFamily } from '../design/tones';
 import { SkeletonText } from '../design/Skeleton';
 import { presentTranscriptTurn } from '../../lib/transcript-presentation';
 import { formatIstTime } from '../../lib/ist-datetime';
@@ -39,6 +40,8 @@ export interface TurnEvidence {
   metricName: string;
   start: number;
   end: number;
+  /** The family of the rating it cites. A metric with no score has none, and stays ink. */
+  family?: JudgementFamily | null;
 }
 
 /** The consent gate, folded into one line. Indexes are rows of this list. */
@@ -210,7 +213,7 @@ function Citations({ evidence, activeEvidence, onEvidence }: {
 }) {
   return (
     <ul className="mt-1 flex flex-wrap justify-end gap-x-4 gap-y-1">
-      {evidence.map(({ number, metricName }) => {
+      {evidence.map(({ number, metricName, family }) => {
         const pressed = number === activeEvidence;
         return (
           <li key={number} className="flex items-center gap-1.5 text-meta text-ink-tertiary">
@@ -221,8 +224,9 @@ function Citations({ evidence, activeEvidence, onEvidence }: {
               aria-pressed={pressed}
               aria-label={`Evidence ${number}, ${metricName}`}
               className={cx(
-                'min-h-6 min-w-6 rounded-evidence border border-ink px-1 font-mono text-meta transition-colors duration-hover ease-out',
-                pressed ? 'bg-ink text-paper' : 'bg-paper text-ink hover:bg-field',
+                'min-h-6 min-w-6 rounded-evidence border px-1 font-mono text-meta transition-colors duration-hover ease-out',
+                evidenceNumberClass(family ?? null, pressed),
+                !pressed && 'hover:bg-field',
               )}
             >
               {number}

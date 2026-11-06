@@ -105,6 +105,26 @@ describe('no player on this tab', () => {
   });
 });
 
+describe('what a chip means', () => {
+  it.each([
+    ['ready', 'Ready', 'bg-ready-soft'],
+    ['partial', 'Partial', 'bg-unresolved-soft'],
+    ['deleted', 'Deleted', 'bg-closed-soft'],
+  ] as const)('puts a %s recording on its family\'s wash', async (state, word, wash) => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { rec: { state } })] })] });
+    renderSection();
+    await rows();
+    expect(screen.getByText(`Attempt 1 (counted): ${word}`)).toHaveClass(wash);
+  });
+
+  it('leaves No recording neutral', async () => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { rec: { state: 'none' } })] })] });
+    renderSection();
+    await rows();
+    expect(screen.getByText('Attempt 1 (counted): No recording').className).not.toMatch(/\bbg-(?:moving|ready|unresolved|closed)-soft\b/);
+  });
+});
+
 describe('which attempts get a chip', () => {
   it('a completed round says plainly when an attempt has no recording', async () => {
     api.listR1Rounds.mockResolvedValue({ rounds: [round({ attempts: [attempt(1, { rec: { state: 'none' } })] })] });

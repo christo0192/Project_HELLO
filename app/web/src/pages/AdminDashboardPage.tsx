@@ -496,13 +496,12 @@ function QuotaPoliciesSection({
                 {p.max_cost_units ?? '∞'} · units/session: {p.cost_units_per_session ?? '—'} ·
                 warning: {p.warning_percentage == null ? 'off' : `${p.warning_percentage}%`}
               </span>
-              {/* Approved tokens only: the `*-text` ink on its own soft tint
-                  (enabled), the secondary ink on a faint ink tint (disabled).
-                  Grey-on-colour and stock palettes read as washed out and
-                  fail small-text contrast. */}
+              {/* Approved tokens only: a family's text shade on its own soft wash,
+                  ready when enabled and closed when disabled. Grey-on-colour and
+                  stock palettes read as washed out and fail small-text contrast. */}
               <span
                 className={`rounded px-1.5 py-0.5 text-xs font-medium ${
-                  p.enabled ? 'bg-success-soft text-success-text' : 'bg-ink/[0.06] text-ink-secondary'
+                  p.enabled ? 'bg-success-soft text-success-text' : 'bg-closed-soft text-closed-text'
                 }`}
               >
                 {p.enabled ? 'Enabled' : 'Disabled'}

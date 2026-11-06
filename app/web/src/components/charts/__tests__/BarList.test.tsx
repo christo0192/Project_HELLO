@@ -44,6 +44,41 @@ describe('BarList', () => {
     expect(rows.map((r) => r.textContent)).toEqual(['New542%', 'Screened650%', 'Rejected18%']);
   });
 
+  /** The fill of the row named `label`. */
+  const fillOf = (label: string) =>
+    screen.getByRole('rowheader', { name: label }).querySelector('.data-fill');
+
+  it('draws a bar with no meaning in ink: colour is for a category that carries one', () => {
+    render(wrap(<BarList title="Lanes" data={[{ label: 'Phone', value: 5 }]} />));
+    expect(fillOf('Phone')).toHaveClass('bg-ink');
+  });
+
+  it.each([
+    ['info', 'bg-moving'],
+    ['moving-light', 'bg-moving-light'],
+    ['moving', 'bg-moving'],
+    ['moving-deep', 'bg-moving-deep'],
+    ['success', 'bg-success'],
+    ['ready-light', 'bg-ready-light'],
+    ['ready', 'bg-ready'],
+    ['warning', 'bg-warning'],
+    ['unresolved-light', 'bg-unresolved-light'],
+    ['unresolved', 'bg-unresolved'],
+    ['closed', 'bg-closed'],
+    ['closed-light', 'bg-closed-light'],
+    ['danger', 'bg-error'],
+    ['neutral', 'bg-ink-muted'],
+    ['ink', 'bg-ink'],
+  ] as const)('fills a %s row with %s', (tone, fill) => {
+    render(wrap(<BarList title="Toned" data={[{ label: 'Row', value: 5, tone }]} />));
+    expect(fillOf('Row')).toHaveClass(fill);
+  });
+
+  it('keeps every row figure in ink: the mark beside the text carries the identity', () => {
+    render(wrap(<BarList title="Toned" data={[{ label: 'Row', value: 5, tone: 'success' }]} />));
+    expect(screen.getByRole('cell', { name: '5' })).toHaveClass('text-ink');
+  });
+
   it('ranks by count by default, and keeps a meaningful order when asked', () => {
     const { unmount } = render(wrap(<BarList title="Ranked" data={STAGES} />));
     expect(screen.getAllByRole('rowheader').map((h) => h.textContent)).toEqual(['Screened', 'New', 'Rejected']);

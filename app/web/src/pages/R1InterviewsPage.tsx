@@ -12,7 +12,9 @@
  * A read that changes what is shown clears the rows first: a list under the wrong tab reads as true.
  * Each block keeps its size while it loads, and nothing rises in.
  *
- * Verdicts stay in ink. A row's result is the AI's, and the column says so.
+ * A fact reads here as it does on the candidate's R1 tab and the review: a status, a recording and a
+ * verdict each take their family (design/tones), from the same maps. "Not scored" and a withheld result
+ * claim nothing, so they have no hue. A row's result is the AI's, and the column says so.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useSearchParams } from 'react-router-dom';
@@ -30,25 +32,30 @@ import {
   Td,
   Th,
   Tr,
+  countTone,
+  cx,
+  figureToneClass,
 } from '../components/design';
 import { CandidateInput, Tag } from '../components/design/candidate';
+import { FAMILY_CLASSES, stateTextClass, verdictFamily } from '../components/design/tones';
 import { VerdictMark } from '../components/r1-review/VerdictBlock';
 import { CandidateShell } from '../components/talent/CandidateShell';
 import { candidateDisplayName } from '../components/talent/ResumeReviewBadge';
 import { formatDate, formatDateTime, formatRelative } from '../lib/datetime';
-import { attemptsLabel } from '../lib/r1';
+import { attemptsLabel, r1StatusTone } from '../lib/r1';
 import {
   R1_QUEUE_SORT_OPTIONS,
   R1_QUEUE_VIEW_OPTIONS,
   defaultQueueSort,
+  queueFigureTone,
   queuePageFrom,
-  queueRecordingWords,
+  queueRecording,
   queueSortFrom,
   queueSummary,
   queueViewFrom,
   r1ResultWords,
 } from '../lib/r1-queue';
-import { rejectionPendingUntil, roundStatusWord } from '../lib/r1-review';
+import { rejectionPendingUntil, roundStatusWord, shownRoundStatus } from '../lib/r1-review';
 import type { R1QueueResponse, R1QueueRound, R1QueueSort, R1QueueView } from '../lib/r1-types';
 
 /** How long the typing must stop before a search goes to the API. */
@@ -80,11 +87,12 @@ function ResultCell({ round, nowMs }: { round: R1QueueRound; nowMs: number }) {
   const result = r1ResultWords(round, nowMs);
   if (result.kind === 'text') return <span className="text-label text-ink-secondary">{result.text}</span>;
   const { word, mark, overall } = result.verdict;
+  const family = verdictFamily(round.recommendation);
   return (
-    <span className={RESULT_CELL}>
+    <span className={cx(RESULT_CELL, family && FAMILY_CLASSES[family].text)}>
       <VerdictMark mark={mark} />
       <span className="font-medium">{word}</span>
-      {overall !== null && <span className="tabular-nums text-ink-secondary">{Math.round(overall)}</span>}
+      {overall !== null && <span className="tabular-nums">{Math.round(overall)}</span>}
     </span>
   );
 }
@@ -101,7 +109,9 @@ function QueueRow({ round, listSearch }: { round: R1QueueRound; listSearch: stri
   const name = candidateDisplayName(round.candidate_name);
   const nowMs = Date.now();
   const status = roundStatusWord(round, round.attempts, nowMs);
-  const recording = queueRecordingWords(round);
+  // The tone follows the word: "Link open" takes In progress's, and a lapsed link reads Expired and takes its.
+  const statusShade = stateTextClass(r1StatusTone(shownRoundStatus(round, round.attempts, nowMs)));
+  const recording = queueRecording(round);
   const ended = lastEnded(round);
   const pending = rejectionPendingUntil(round);
   return (
@@ -117,19 +127,26 @@ function QueueRow({ round, listSearch }: { round: R1QueueRound; listSearch: stri
         {round.is_staff_dry_run && <span className="ml-2"><Tag>Staff dry run</Tag></span>}
         {/* The columns this width has no room for, in one line. */}
         <p className="mt-0.5 text-meta text-ink-tertiary md:hidden">
-          {[status, attemptsLabel(round), recording ? `Recording: ${recording}` : null].filter(Boolean).join(' · ')}
+          <span className={statusShade}>{status}</span>
+          {` · ${attemptsLabel(round)}`}
+          {recording && (
+            <>
+              {' · Recording: '}
+              <span className={stateTextClass(recording.tone)}>{recording.tag}</span>
+            </>
+          )}
         </p>
         {pending && <p className="text-meta text-ink-tertiary md:hidden">Rejection pending until {formatDateTime(pending)}</p>}
       </Td>
       <Td className="py-2.5"><ResultCell round={round} nowMs={nowMs} /></Td>
       <Td className="hidden py-2.5 md:table-cell">
-        <span className="text-label">{status}</span>
+        <span className={cx('text-label', statusShade)}>{status}</span>
         {pending && <p className="text-meta text-ink-tertiary">Rejection pending until {formatDateTime(pending)}</p>}
       </Td>
       <Td className="hidden whitespace-nowrap py-2.5 text-label text-ink-secondary md:table-cell">{attemptsLabel(round)}</Td>
       <Td className="hidden py-2.5 md:table-cell">
         {recording ? (
-          <Tag srPrefix="Recording:">{recording}</Tag>
+          <Tag tone={recording.tone} srPrefix="Recording:">{recording.tag}</Tag>
         ) : (
           <>
             <span aria-hidden="true">–</span>
@@ -303,7 +320,9 @@ export function R1InterviewsPage() {
       <p data-testid="queue-summary" className="mt-3 flex min-h-9 items-baseline gap-2 text-sm text-ink">
         {answer ? (
           <>
-            <span className="text-stat tabular-nums">{answer.total}</span>{' '}
+            <span className={cx('text-stat tabular-nums', figureToneClass(countTone(answer.total, queueFigureTone(view))))}>
+              {answer.total}
+            </span>{' '}
             <span>{queueSummary(view, sort, answer.total)}</span>
           </>
         ) : (

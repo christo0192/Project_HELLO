@@ -21,11 +21,45 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const ROOT = resolve(__dirname, '../../../..');
 const PALETTE = resolve(ROOT, 'src/styles/candidate-palette.css');
+
+/** Every source file under a folder, tests left out. A new screen joins by existing. */
+function sourcesUnder(folder: string): string[] {
+  return readdirSync(resolve(ROOT, folder), { recursive: true, encoding: 'utf8' })
+    .map((file) => `${folder}/${file.replace(/\\/g, '/')}`)
+    .filter((file) => /\.tsx?$/.test(file) && !/\.test\.tsx?$/.test(file) && !file.includes('__tests__/'));
+}
+
+/**
+ * Everything a candidate sees. The folders are read, not listed, because a hand list
+ * here named eleven files out of the seventy-odd a candidate's routes reach, and missed
+ * the screen they sit in during the interview. `/appeal` and `/status` are not here:
+ * they hold the status names on ink with `.keep-ink` (global-palette.test.ts).
+ */
+const CANDIDATE_FACING = [
+  'src/styles/candidate-experience.css',
+  'src/styles/candidate-r1.css',
+  'src/pages/CandidateJoinPage.tsx',
+  'src/pages/CandidateScreeningEndedPage.tsx',
+  'src/pages/PrivacyNoticePage.tsx',
+  'src/pages/R1JoinPage.tsx',
+  ...sourcesUnder('src/components/candidate-r1'),
+  ...sourcesUnder('src/components/candidate-join'),
+  ...sourcesUnder('src/lib/r1'),
+  ...sourcesUnder('src/lib/candidate-report'),
+];
+
+const FAMILY_REACHES: ReadonlyArray<readonly [string, RegExp]> = [
+  ['a family token', /var\(--(?:moving|ready|unresolved|closed|success|warning)/],
+  ['a family utility', /\b(?:bg|text|border|ring)-(?:moving|ready|unresolved|closed|success|warning)/],
+  ['a family tone', /\btone(?:=["{']+|:\s*["'])(?:success|warning|info|closed|moving|ready|unresolved)/],
+];
+const reachedFamilies = (source: string) =>
+  FAMILY_REACHES.filter(([, pattern]) => pattern.test(source)).map(([what]) => what);
 
 /** Every source file that renders inside `.candidate-scope`. */
 const CANDIDATE_SCOPE_SOURCES = [
@@ -178,6 +212,48 @@ describe('candidate palette tokens', () => {
     expect(lightRule['color-scheme']).toBe('light');
   });
 
+  it('stays on ink: the status families are not for this scope', () => {
+    // These names reach the candidate-facing pages and the chips of an AI
+    // judgement about one person. The internal pages' colour is written with the
+    // families directly, and a candidate never sees it.
+    expect(paletteCss).not.toMatch(/var\(--(?:moving|ready|unresolved|closed|success|warning|info)/);
+    for (const name of ['--c-positive', '--c-positive-light', '--c-caution', '--c-caution-light', '--c-accent']) {
+      expect(TOKEN_MAP[name], name).toMatch(/^var\(--(?:ink|ink-2|field)\)$/);
+    }
+  });
+
+  it.each(CANDIDATE_FACING)('%s, which a candidate sees, reaches no status family', (rel) => {
+    expect(reachedFamilies(read(rel))).toEqual([]);
+  });
+
+  it('reads the candidate screens from their folders, so none can sit outside this rule', () => {
+    expect(CANDIDATE_FACING.length).toBeGreaterThanOrEqual(30);
+    expect(CANDIDATE_FACING).toEqual(
+      expect.arrayContaining([
+        'src/components/candidate-r1/R1LiveView.tsx',
+        'src/components/candidate-r1/R1Captions.tsx',
+        'src/components/candidate-r1/R1PhaseLabel.tsx',
+        'src/components/candidate-r1/R1ScenarioCard.tsx',
+        'src/components/candidate-r1/R1ConsentExit.tsx',
+        'src/components/candidate-join/InterviewerAura.tsx',
+        'src/lib/r1/r1-room.ts',
+        'src/lib/candidate-report/reportStyles.ts',
+      ]),
+    );
+    expect(CANDIDATE_FACING.filter((rel) => /\.test\.|__tests__/.test(rel))).toEqual([]);
+    for (const rel of CANDIDATE_FACING) expect(existsSync(resolve(ROOT, rel)), rel).toBe(true);
+  });
+
+  it('NEGATIVE CONTROL: the rule catches a family, however it is written', () => {
+    expect(reachedFamilies('className="bg-ready-soft text-ready-text"')).toEqual(['a family utility']);
+    expect(reachedFamilies('color: var(--unresolved-text);')).toEqual(['a family token']);
+    expect(reachedFamilies('<Tag tone="unresolved">Waiting</Tag>')).toEqual(['a family tone']);
+    expect(reachedFamilies('<StatusBadge tone={"moving"}>Waiting</StatusBadge>')).toEqual(['a family tone']);
+    expect(reachedFamilies("const chip = { tone: 'closed' };")).toEqual(['a family tone']);
+    // Not a family: the R1 ready button, which has a similar name.
+    expect(reachedFamilies('className="r1-ready__button"')).toEqual([]);
+  });
+
   it('leaves the app-wide semantic names alone: they are already Logsheet', () => {
     for (const name of ['--surface', '--ink', '--ink-secondary', '--ink-tertiary', '--line', '--info']) {
       expect(lightRule[name], `${name} is re-pointed`).toBeUndefined();
@@ -231,7 +307,9 @@ describe('candidate-scope source guard', () => {
    *
    * Tone is carried by tint, ring and border; the label is always ink. A tone
    * written as a text colour is how a status starts reading as a traffic light,
-   * so neither is a text colour anywhere in candidate scope.
+   * so neither is a text colour anywhere in candidate scope. The status families
+   * are a separate thing, for a process state only: each has a text shade, pinned
+   * at 4.5:1 on its own wash in logsheet-tokens.test.ts.
    *
    * SCOPE: this reads `text-[var(--c-…)]` utilities only. A colour applied
    * through an inline `style` — the 36px overall score is the one such site —

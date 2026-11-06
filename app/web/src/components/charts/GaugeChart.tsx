@@ -23,9 +23,10 @@ export interface GaugeChartProps {
 }
 
 /**
- * Quota-utilization gauge. The arc steps to full ink when utilization crosses
- * the 85% threshold; the printed figure carries the reading. Pairs the canvas
- * with an sr-only data table (no Canvas keyboard claims — see EChart).
+ * Quota-utilization gauge. The arc is underway until utilization crosses the 85%
+ * threshold, where it needs a second look: each by its family, never by its place
+ * in the cycle. The printed figure carries the reading. Pairs the canvas with an
+ * sr-only data table (no Canvas keyboard claims — see EChart).
  */
 export function GaugeChart({
   title,
@@ -43,7 +44,7 @@ export function GaugeChart({
 }: GaugeChartProps) {
   const { palette, base } = chartTheme();
   const ratio = max > 0 ? value / max : 0;
-  const arcColor = ratio >= 0.85 ? palette.colors[0] : palette.colors[1];
+  const arcColor = ratio >= 0.85 ? palette.families.unresolved : palette.families.moving;
 
   let body: React.ReactNode;
   if (isLoading) {

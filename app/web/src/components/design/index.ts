@@ -11,6 +11,8 @@ export { PageHeader } from './PageHeader';
 export type { PageHeaderProps } from './PageHeader';
 export { StatusBadge } from './StatusBadge';
 export type { StatusBadgeProps, StatusTone } from './StatusBadge';
+export { countTone, figureToneClass, markFamilyTone, markVar, toneMark } from './tones';
+export type { FigureTone, MarkTone } from './tones';
 export { ChartCard } from './ChartCard';
 export type { ChartCardProps } from './ChartCard';
 export { GlassPanel } from './GlassPanel';

@@ -137,10 +137,14 @@ const STATUS_LABEL: Record<Status, string> = {
   offline: 'API offline',
 };
 
+/**
+ * The same state on every screen: Mission Control prints Operational in `ready` and
+ * Maintenance mode in `unresolved`. The word beside the dot carries the state.
+ */
 const STATUS_DOT: Record<Status, string> = {
   checking: 'bg-ink-muted',
-  online: 'bg-ink',
-  maintenance: 'bg-ink-muted',
+  online: 'bg-success',
+  maintenance: 'bg-warning',
   offline: 'bg-error',
 };
 

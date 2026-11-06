@@ -901,6 +901,47 @@ describe('CandidateDetailPage', () => {
     ));
   });
 
+  describe('a phone cycle keeps the family its state has on every other screen', () => {
+    const cycleIn = (state: string, terminal_at: string | null) => ({
+      ok: true,
+      enabled: true,
+      current_cycle: 1,
+      cycles: [{
+        cycle_number: 1, state, state_reason: null, version: 2,
+        no_answer_attempts: 0, no_answer_limit: 3, reconnects_used: 0, provider_failures: 0,
+        next_eligible_at: null, last_attempt_at: null, terminal_at,
+        created_at: '2026-08-27T09:00:00Z', updated_at: '2026-08-27T10:00:00Z',
+        has_session: false, has_assessment: false, appointment: null,
+      }],
+    });
+
+    it.each([
+      ['completed', '2026-08-27T10:00:00Z', 'success'],
+      ['abandoned_no_answer', '2026-08-27T10:00:00Z', 'warning'],
+      ['wrong_number', '2026-08-27T10:00:00Z', 'warning'],
+      ['opted_out', '2026-08-27T10:00:00Z', 'closed'],
+      ['cancelled', '2026-08-27T10:00:00Z', 'closed'],
+      ['failed', '2026-08-27T10:00:00Z', 'danger'],
+      ['in_call', null, 'info'],
+      ['awaiting_retry', null, 'info'],
+      ['pending_prereqs', null, 'warning'],
+    ])('%s prints in the tone of its state, not of whether it has ended', async (state, terminal_at, tone) => {
+      mockApi.getCandidatePhoneScreenings.mockResolvedValue(cycleIn(state, terminal_at));
+      renderDetailPage('candidate-1', '?tab=overview');
+      const card = await screen.findByRole('region', { name: 'Phone screening cycles' });
+      const word = await within(card).findByTitle(state);
+      expect(word.closest('[data-status-badge]')).toHaveAttribute('data-status-badge', tone);
+    });
+
+    it('keeps the line about an opted-out candidate in ink: it is a rule, not a state', async () => {
+      mockApi.getCandidatePhoneScreenings.mockResolvedValue(cycleIn('opted_out', '2026-08-27T10:00:00Z'));
+      renderDetailPage('candidate-1', '?tab=overview');
+      const line = await screen.findByText(/Re-screening is unavailable because the candidate opted out/);
+      expect(line).toHaveClass('text-ink');
+      expect(line).not.toHaveClass('text-warning-text');
+    });
+  });
+
   it('M017: an identity_unconfirmed cycle offers number verification above the re-screen form', async () => {
     mockApi.getCandidatePhoneScreenings.mockResolvedValue({
       ok: true, enabled: true, current_cycle: 1,
@@ -1485,6 +1526,29 @@ describe('Human words for machine values', () => {
     expect(state).toHaveAttribute('title', 'under_review');
     expect(screen.getByText('Recording appeal')).toBeInTheDocument();
     expect(screen.queryByText('under_review')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['open', 'Open', 'bg-unresolved-soft'],
+    ['under_review', 'Under review', 'bg-unresolved-soft'],
+    ['granted', 'Granted', 'bg-ready-soft'],
+    ['denied', 'Denied', 'bg-closed-soft'],
+  ])('prints an appeal that is %s, "%s", on the wash %s', async (status, word, wash) => {
+    mockApi.listAppeals.mockResolvedValue({
+      appeals: [{
+        id: 'ap1',
+        candidate_id: 'candidate-1',
+        session_id: 'session-1',
+        assessment_id: null,
+        category: 'recording',
+        description: 'Please disregard the first call.',
+        status,
+        created_at: '2026-09-16T04:30:00Z',
+        updated_at: '2026-09-16T05:00:00Z',
+      }],
+    });
+    renderDetailPage();
+    expect((await screen.findByText(word)).parentElement).toHaveClass(wash);
   });
 
   it('formats the phone number, with the E.164 value one hover away', async () => {

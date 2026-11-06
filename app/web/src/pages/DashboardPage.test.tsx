@@ -802,8 +802,8 @@ describe('DashboardPage', () => {
   });
 
   it('colours each appointment status the way the phone calendar does', async () => {
-    // Every status was forced to `info`: a confirmed call looked exactly like
-    // an unconfirmed one here, and green on the calendar one click away.
+    // This panel once forced its own tone on every status. It reads the calendar's
+    // vocabulary, so a status cannot be one colour here and another a click away.
     const at = (h: number) => new Date(Date.now() + h * 3_600_000).toISOString();
     const appt = (id: string, h: number, status: string, name: string) => ({
       id, engagement_id: `e-${id}`, starts_at: at(h), ends_at: at(h + 0.5), ist_date: '2026-06-05', ist_start: null, ist_end: null,
@@ -819,7 +819,113 @@ describe('DashboardPage', () => {
     const list = await screen.findByRole('list', { name: 'Next phone appointments' });
     const badge = (label: string) => within(list).getByText(label).closest('[data-status-badge]');
     expect(badge('Scheduled')).toHaveAttribute('data-status-badge', 'info');
-    expect(badge('Confirmed')).toHaveAttribute('data-status-badge', 'success');
+    // Still to come, so underway: green would say the call has been made.
+    expect(badge('Confirmed')).toHaveAttribute('data-status-badge', 'info');
+  });
+
+  describe('colour that carries meaning', () => {
+    /** The figure inside a hero drill-down link. */
+    const heroFigure = async (name: string) =>
+      (await screen.findByRole('link', { name })).querySelectorAll('p')[1];
+    /** The fill of a bar in a named bar list. */
+    const barOf = (list: HTMLElement, label: string) =>
+      within(list).getByRole('rowheader', { name: new RegExp(`^${label}`) }).querySelector('.data-fill');
+
+    it('prints the hero by meaning, and the plain total in ink', async () => {
+      renderDashboard();
+      expect(await heroFigure('Candidates: 4')).toHaveClass('text-ink');
+      expect(await heroFigure('Awaiting screening: 1')).toHaveClass('text-moving-text');
+      expect(await heroFigure('In screening: 1')).toHaveClass('text-moving-text');
+      expect(await heroFigure('Awaiting decision: 1')).toHaveClass('text-success-text');
+    });
+
+    it('prints a hero figure with nobody in it in ink', async () => {
+      listCandidates.mockResolvedValue([]);
+      renderDashboard();
+      expect(await heroFigure('Awaiting screening: 0')).toHaveClass('text-ink');
+      expect(await heroFigure('In screening: 0')).toHaveClass('text-ink');
+      expect(await heroFigure('Awaiting decision: 0')).toHaveClass('text-ink');
+    });
+
+    it('prints no upcoming call in ink, as it does no overdue one', async () => {
+      getPhoneCalendar.mockResolvedValue({ ...PHONE_CALENDAR, count: 0, appointments: [] });
+      renderDashboard();
+      const panel = await screen.findByRole('region', { name: 'Phone schedule' });
+      await within(panel).findByText('Upcoming');
+      expect(within(panel).getByText('Upcoming').closest('dl > div')!.querySelector('dd')).toHaveClass('text-ink');
+    });
+
+    it('draws each stage in its own step, with the row figures still in ink', async () => {
+      listCandidates.mockResolvedValue([
+        ...CANDIDATES,
+        { ...CANDIDATES[0], id: 'c5', status: 'queued' },
+        { ...CANDIDATES[0], id: 'c6', status: 'rejected' },
+        { ...CANDIDATES[0], id: 'c7', status: 'consent_declined' },
+        { ...CANDIDATES[0], id: 'c8', status: 'queued', phone_state: 'abandoned_no_answer' },
+        { ...CANDIDATES[0], id: 'c9', status: 'queued', phone_state: 'failed' },
+      ]);
+      renderDashboard();
+      const list = await screen.findByRole('table', { name: 'Pipeline by stage data' });
+      expect(barOf(list, 'New')).toHaveClass('bg-moving-light');
+      expect(barOf(list, 'Queued')).toHaveClass('bg-moving');
+      expect(barOf(list, 'Screening')).toHaveClass('bg-moving-deep');
+      expect(barOf(list, 'Screened')).toHaveClass('bg-ready-light');
+      expect(barOf(list, 'Advanced')).toHaveClass('bg-ready');
+      expect(barOf(list, 'Rejected')).toHaveClass('bg-closed');
+      expect(barOf(list, 'Consent declined')).toHaveClass('bg-closed-light');
+      expect(barOf(list, 'Abandoned: no answer')).toHaveClass('bg-unresolved');
+      expect(barOf(list, 'Phone screen failed')).toHaveClass('bg-error');
+      for (const cell of within(list).getAllByRole('cell').filter((c) => /^\d+$/.test(c.textContent ?? ''))) {
+        expect(cell).toHaveClass('text-ink');
+      }
+    });
+
+    it('gives the assessments aggregate a verdict colour, Reject closed, and the average in ink', async () => {
+      getCandidatesSummary.mockResolvedValue({
+        ...SUMMARY,
+        recommendation_distribution: { advance: 2, hold: 3, reject: 1 },
+      });
+      renderDashboard();
+      const list = await screen.findByRole('table', { name: 'Recommendation distribution data' });
+      expect(barOf(list, 'Select')).toHaveClass('bg-success');
+      expect(barOf(list, 'Borderline')).toHaveClass('bg-warning');
+      expect(barOf(list, 'Reject')).toHaveClass('bg-closed');
+      expect(screen.getByText('64')).toHaveClass('text-ink');
+    });
+
+    it('prints Upcoming as underway, Overdue only above zero, and All in ink', async () => {
+      const at = (h: number) => new Date(Date.now() + h * 3_600_000).toISOString();
+      const appt = (id: string, h: number) => ({
+        id, engagement_id: `e-${id}`, starts_at: at(h), ends_at: at(h + 0.5), ist_date: '2026-06-05', ist_start: null, ist_end: null,
+        status: 'scheduled', source: 'recruiter', confirmed_at: null, cancel_reason: null, version: 1, created_at: at(0), updated_at: at(0),
+        engagement_state: null, role_id: null, candidate: { id: `c-${id}`, name: 'Jane Doe' },
+      });
+      getPhoneCalendar.mockResolvedValue({ ...PHONE_CALENDAR, count: 3, appointments: [appt('a1', 2), appt('a2', 3), appt('a3', 4)] });
+      const { unmount } = renderDashboard();
+      const cell = (label: string, panel: HTMLElement) =>
+        within(panel).getByText(label).closest('dl > div')!.querySelector('dd');
+      let panel = await screen.findByRole('region', { name: 'Phone schedule' });
+      await within(panel).findByText('Upcoming');
+      expect(cell('Upcoming', panel)).toHaveClass('text-moving-text');
+      expect(cell('Overdue', panel)).toHaveClass('text-ink');
+      expect(cell('All', panel)).toHaveClass('text-ink');
+      unmount();
+      getPhoneCalendar.mockResolvedValue({ ...PHONE_CALENDAR, count: 1, appointments: [appt('a4', -2)] });
+      renderDashboard();
+      panel = await screen.findByRole('region', { name: 'Phone schedule' });
+      await within(panel).findByText('Overdue');
+      expect(cell('Overdue', panel)).toHaveClass('text-warning-text');
+    });
+
+    it('tones the action queue by meaning, and a verified consent as a good result', async () => {
+      listNotificationIntents.mockResolvedValue({ intents: INTENTS });
+      renderDashboard();
+      const badge = async (label: string) => (await screen.findByText(label)).closest('[data-status-badge]');
+      expect(await badge('Screening ready for review')).toHaveAttribute('data-status-badge', 'success');
+      expect(await badge('Appeal resolved, review the outcome')).toHaveAttribute('data-status-badge', 'closed');
+      expect(await badge('Session quota nearing its limit')).toHaveAttribute('data-status-badge', 'warning');
+      expect(await badge('Consent verified')).toHaveAttribute('data-status-badge', 'success');
+    });
   });
 
   it('does not call a capped schedule "All": a truncated load reads as a floor', async () => {
