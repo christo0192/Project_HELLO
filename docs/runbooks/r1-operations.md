@@ -2570,8 +2570,9 @@ into a fragmented MP4 in `/tmp/r1-rec/<session_id>/`. An uploader thread sends 5
 and a 2-minute OGG checkpoint to **presigned URLs the API hands out**; the worker holds no R2 credential. When the
 interview ends the worker flushes, uploads the last part, optionally a faststart copy `video.mp4`, and calls
 `complete`; the API finalizes (completes the multipart upload, verifies size, SHA-256 and file signature) and the
-row becomes `ready`, `partial` or `failed`. Staff play it from the candidate page (all roles; interviewers only for
-their own candidates) and admins can click a transcript turn on the Review tab to seek.
+row becomes `ready`, `partial` or `failed`. Staff play it on `/interviews/:roundId?tab=recording`, reached from the
+candidate's R1 interview tab or the R1 interviews queue (all roles; interviewers only for their own candidates), and
+a click on a transcript turn's timecode there seeks.
 
 | Object under `r1/<round_id>/<session_id>/` | Written by | Kept |
 |---|---|---|
@@ -2683,7 +2684,7 @@ the automatic run would redeploy the API and both voice apps at the merge.
 | E1 | Flags off: `a0_retest.py rehearse` against the resized worker | the worker boots and registers; an R1 interview still works with the audio-only subscription (this is the one live-lane change in the PR) |
 | E2 | Bucket, lifecycle, CORS and the smoke above (if not done before the merge) | smoke prints PASS for every item |
 | E3 | Zero-live: `fly secrets set -a project-hello-voice R1_RECORDING=on R1_VIDEO_RECORDING=on`; `recording_mode='audio'`; one staff rehearsal | row `ready`, `layout=combined`, `has_video=false`, it plays |
-| E4 | `recording_mode='av'`; two extended rehearsals (>= 7 min, camera toggled off and on once) | `ready`, `has_video=true`, `frames_dropped/frames_encoded < 2 %`; Chrome and Safari (desktop and iOS) play and seek to 10/50/90 %; an admin click on a Review turn lands within 1 s; a withdrawal test erases; a DSAR test erases |
+| E4 | `recording_mode='av'`; two extended rehearsals (>= 7 min, camera toggled off and on once) | `ready`, `has_video=true`, `frames_dropped/frames_encoded < 2 %`; Chrome and Safari (desktop and iOS) play and seek to 10/50/90 %; an admin click on a turn on the review page's Recording tab lands within 1 s; a withdrawal test erases; a DSAR test erases |
 | E5 | One 20-minute human staff session on a real laptop camera | loop-lag max < 250 ms, CPU p95 < 60 %, finish < 18 s; append the S0-C and S0-D evidence to ADR-0016 |
 | E6 | Owner test with a FRESH staff R1 link | rule "prove before owner tests" |
 | E7 | Candidates (Stage B) | only after the Legal gates of 0123 |

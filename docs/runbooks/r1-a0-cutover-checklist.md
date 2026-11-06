@@ -606,7 +606,7 @@ the repair then is to cancel the round and send a new one.
 
 1. A candidate record exists for the staff tester (a staff member's own details),
    with no active phone engagement.
-2. **PRODUCTION CHANGE**: HR UI: candidate page -> R1 card -> **Send R1** -> tick
+2. **PRODUCTION CHANGE**: HR UI: candidate page -> R1 interview tab -> **Send R1** -> tick
    the India-location attestation. **Copy the join link now**: it is shown once
    (`<WEB_ORIGIN>/candidate/r1#<token>`). Do not open it yet. Sending books a
    65-minute hold against the allocation.
