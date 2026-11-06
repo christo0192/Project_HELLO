@@ -111,7 +111,7 @@ export interface PipelineBarProps {
 /** 44px minimum target, matching the filter pills this legend replaced. */
 const TOGGLE_CLASS = (selected: boolean) =>
   [
-    "inline-flex min-h-11 items-center gap-1.5 rounded-control px-3 text-label font-medium transition-colors duration-hover",
+    "inline-flex min-h-9 items-center gap-1.5 rounded-control px-3 text-label font-medium transition-colors duration-hover [@media(pointer:coarse)]:min-h-11",
     // The offset is what shows on a selected chip: its fill and its ring are both ink.
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
     selected
@@ -344,7 +344,7 @@ export function PipelineBar({
               {...legendHover(s.key)}
               className={
                 interactive
-                  ? "inline-flex min-h-11 items-center gap-1.5 px-3 text-label"
+                  ? "inline-flex min-h-9 items-center gap-1.5 px-3 text-label [@media(pointer:coarse)]:min-h-11"
                   : "inline-flex items-center gap-1.5"
               }
             >
@@ -460,7 +460,7 @@ function DiscrepancyEntry({
     </>
   );
   const cls = interactive
-    ? "inline-flex min-h-11 items-center gap-1.5 px-3 text-label"
+    ? "inline-flex min-h-9 items-center gap-1.5 px-3 text-label [@media(pointer:coarse)]:min-h-11"
     : "inline-flex items-center gap-1.5";
   return interactive ? (
     <span className={cls}>{body}</span>

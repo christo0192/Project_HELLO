@@ -296,9 +296,7 @@ describe('CandidatesPage search', () => {
   it('announces the match count (never the query) in a live region', async () => {
     renderPage();
     await screen.findByText('Jane Doe');
-    const live = Array.from(document.querySelectorAll('p[role="status"]')).find((p) =>
-      p.classList.contains('sr-only'),
-    )!;
+    const live = document.querySelector('[data-search-status]')!;
     expect(live).toBeTruthy();
     expect(live.textContent).toBe('');
     type('sam');

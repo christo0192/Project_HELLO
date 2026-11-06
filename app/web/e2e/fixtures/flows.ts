@@ -77,6 +77,12 @@ async function openAshbyJobPicker(app: AppHarness): Promise<{ dialog: Locator; l
   return { dialog, listbox };
 }
 
+/** The Review tab's session picker. A session is named by when, what and how long. */
+export async function pickSession(panel: Locator, name: RegExp): Promise<void> {
+  await panel.getByRole('button', { name: /^Session/ }).click();
+  await panel.getByRole('option', { name }).click();
+}
+
 /** A search no fixture job can match (see `ashby-add-mapping-job-picker-no-match`). */
 const NO_MATCH_QUERY = 'zqxj no such job';
 
@@ -243,7 +249,7 @@ export const KEY_STATES: KeyState[] = [
       await expect(calls.getByText('This recording may end a few seconds before the call did.')).toBeVisible();
       await expect(panel.getByRole('group', { name: 'Call 1 of 2 · first call' })).toBeVisible();
       await expect(panel.getByRole('group', { name: 'Call 2 of 2 · reconnect' })).toBeVisible();
-      await expect(panel.getByRole('combobox')).toContainText(/Recorded \d+m \d+s across 2 calls/);
+      await expect(panel.getByText(/Recorded \d+m \d+s across 2 calls/).first()).toBeVisible();
       const mints = app.calls.filter((c) => c.method === 'GET' && /^\/api\/recordings\//.test(new URL(c.url).pathname));
       expect(mints, 'no recording URL may be minted before a player is asked for').toEqual([]);
       await app.settle();

@@ -116,7 +116,7 @@ describe('SessionDetailPage', () => {
   it('shows an error state with retry', async () => {
     getSession.mockRejectedValueOnce({ message: 'Session not found' });
     renderPage();
-    expect(await screen.findByText('Session not found')).toBeInTheDocument();
+    expect(await screen.findByText(/This screening couldn't load\. Session not found/)).toBeInTheDocument();
     getSession.mockResolvedValue(completedSessionDetail);
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
     expect(await screen.findByText('Transcript')).toBeInTheDocument();
@@ -356,7 +356,7 @@ describe('SessionDetailPage', () => {
     renderPage();
     expect(await screen.findByText('Welcome to the screening.')).toBeInTheDocument();
     expect(screen.getByText('Thank you!')).toBeInTheDocument();
-    expect(screen.getAllByText('Bot').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Christy (AI)').length).toBeGreaterThan(0);
     // Truthful turn count.
     expect(screen.getByText('3 speaker turns')).toBeInTheDocument();
   });

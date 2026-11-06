@@ -29,7 +29,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { PhoneSlot, PhoneSlotsResponse } from '../../types';
-import { Field, TextField, cx } from '../design';
+import { ErrorPanel, Field, TextField, cx } from '../design';
 import { formatIstTimeRange, isIstDate } from '../../lib/ist-datetime';
 import type { IstDate } from '../../lib/ist-datetime';
 import { slotRefusalLabel } from './phoneVocabulary';
@@ -57,6 +57,8 @@ export function PhoneSlotPicker({
 }: PhoneSlotPickerProps) {
   const [data, setData] = useState<PhoneSlotsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Bumped by Try again: a failed read has no other way back but changing the date. */
+  const [attempt, setAttempt] = useState(0);
 
   const dateFieldId = `${idPrefix}-date`;
   const groupLabelId = `${idPrefix}-slots-label`;
@@ -75,13 +77,13 @@ export function PhoneSlotPicker({
         if (live) setData(res);
       })
       .catch((e: ApiError) => {
-        if (live) setError(phoneErrorMessage(e));
+        if (live) setError(`Slots couldn't load. ${phoneErrorMessage(e)}`);
       });
     return () => {
       live = false;
       controller.abort();
     };
-  }, [date]);
+  }, [date, attempt]);
 
   const select = useCallback(
     (slot: PhoneSlot) => {
@@ -121,11 +123,7 @@ export function PhoneSlotPicker({
         )}
       </Field>
 
-      {error && (
-        <p role="status" className="rounded-control bg-error-soft px-3.5 py-2.5 text-sm text-ink">
-          {error}
-        </p>
-      )}
+      {error && <ErrorPanel compact message={error} onRetry={() => setAttempt((n) => n + 1)} />}
 
       {!error && data === null && (
         <p className="text-sm text-ink-tertiary">Loading slots…</p>
@@ -147,21 +145,21 @@ export function PhoneSlotPicker({
               the tooltip): the same caveat is repeated by every host well. */}
           <p
             className="mt-1 truncate text-xs text-ink-tertiary"
-            title={`Capacity below is an advisory projection, not a reservation. The fleet limit is applied when the call is dialled, not when it is booked, so booking a slot does not guarantee dial capacity at that time. ${
+            title={`Capacity below is an advisory projection, not a reservation. The calling limit is applied when the call is dialled, not when it is booked, so booking a slot does not guarantee dial capacity at that time. ${
               data.max_concurrent === null
-                ? 'The fleet limit is currently unknown.'
-                : `The fleet limit is ${data.max_concurrent} concurrent ${
+                ? 'The calling limit is currently unknown.'
+                : `The calling limit is ${data.max_concurrent} concurrent ${
                     data.max_concurrent === 1 ? 'call' : 'calls'
                   }.`
             }`}
           >
             Capacity below is an <strong className="font-semibold">advisory
-            projection</strong>, not a reservation. The fleet limit is applied
+            projection</strong>, not a reservation. The calling limit is applied
             when the call is dialled, not when it is booked, so booking a slot
             does not guarantee dial capacity at that time.{' '}
             {data.max_concurrent === null
-              ? 'The fleet limit is currently unknown.'
-              : `The fleet limit is ${data.max_concurrent} concurrent ${
+              ? 'The calling limit is currently unknown.'
+              : `The calling limit is ${data.max_concurrent} concurrent ${
                   data.max_concurrent === 1 ? 'call' : 'calls'
                 }.`}
           </p>
@@ -234,7 +232,7 @@ export function PhoneSlotPicker({
                           {' · '}
                           {slot.booked} booked
                           {data.max_concurrent === null
-                            ? ' · fleet limit unknown'
+                            ? ' · calling limit unknown'
                             : ` · ${slot.remaining} projected free`}
                         </span>
                       </span>

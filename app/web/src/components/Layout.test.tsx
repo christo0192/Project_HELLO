@@ -9,6 +9,7 @@
  *     Operations
  *   - Role gating: non-admins never see either Mission Control
  *   - API health status display (online / maintenance / offline)
+ *   - A calling halt: said to admins and interviewers, never read for a viewer
  *   - Auth state: user email + role chip + sign-out
  *   - Mobile drawer: toggle aria-expanded/controls, inert when closed,
  *     backdrop, Escape close + focus return, close on nav, scroll lock
@@ -19,16 +20,18 @@ import { act, render, screen, fireEvent, waitFor, within } from '@testing-librar
 import userEvent from '@testing-library/user-event';
 import { useEffect, useState } from 'react';
 import { Link, MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Layout, pageTitleFor } from './Layout';
 
 const mockListR1Queue = vi.hoisted(() => vi.fn());
+const { getPhoneHealth } = vi.hoisted(() => ({ getPhoneHealth: vi.fn() }));
 
 vi.mock('../api', () => ({
   api: {
     status: () =>
       Promise.resolve({ status: 'ok', maintenance: null, updated_at: '2026-01-01T00:00:00.000Z' }),
     listR1Queue: (...args: unknown[]) => mockListR1Queue(...args),
+    getPhoneHealth: (...args: unknown[]) => getPhoneHealth(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -77,10 +80,20 @@ function sidebarInert(): boolean {
   return aside?.hasAttribute('inert') ?? false;
 }
 
+const phoneHealth = (halted: boolean, haltReason: string | null = null) => ({
+  ok: true,
+  enabled: true,
+  status: 'ok',
+  reasons: [],
+  admission: { control_present: true, halted, halt_reason: haltReason },
+});
+
 beforeEach(() => {
   setAuth();
   mockListR1Queue.mockReset();
   mockListR1Queue.mockResolvedValue({ r1_deployed: false, total: 0, rounds: [] });
+  getPhoneHealth.mockReset();
+  getPhoneHealth.mockResolvedValue(phoneHealth(false));
 });
 
 describe('a page never outlives its URL', () => {
@@ -266,7 +279,7 @@ describe('Layout shell', () => {
 
   it('shows the API online status', async () => {
     renderLayout();
-    expect(await screen.findByText('API online')).toBeInTheDocument();
+    expect(await screen.findByText('Online')).toBeInTheDocument();
   });
 
   it('shows maintenance state from /api/status', async () => {
@@ -396,6 +409,19 @@ describe('the R1 interviews item', () => {
   });
 });
 
+describe('Layout: the tab title', () => {
+  it.each([
+    ['/candidates', 'Candidates · HELLO'],
+    ['/candidates/some-id', 'Candidate · HELLO'],
+    ['/roles', 'Agents · HELLO'],
+    ['/mission-control', 'Mission Control · HELLO'],
+    ['/ashby-mission-control', 'Ashby Live Jobs · HELLO'],
+  ])('names %s, and never a person', async (path, title) => {
+    renderLayout(path);
+    await waitFor(() => expect(document.title).toBe(title));
+  });
+});
+
 describe('Layout: the desk and the sheet', () => {
   it('lays the page on one opaque sheet, inset 8px from the window', () => {
     renderLayout();
@@ -421,13 +447,132 @@ describe('Layout: the desk and the sheet', () => {
     expect(screen.getByRole('button', { name: 'Sign out' }).querySelector('svg')).toBeInTheDocument();
   });
 
-  // The calling state's only read is GET /api/phone/health, limited to
-  // interviewers and above: a viewer would get a 403 on every route. It stays
-  // out of the shell until a read exists that is safe for every role.
-  it.each(['admin', 'interviewer', 'viewer'] as const)('shows no calling state to %s', (role) => {
+});
+
+describe('Layout: a calling halt', () => {
+  const PAUSED = 'Calling halted — operator pause';
+
+  /** Answers the read, then moves the clock past the shortest gap between two. */
+  async function afterTheGap(reads: number) {
+    await waitFor(() => expect(getPhoneHealth).toHaveBeenCalledTimes(reads));
+    const later = Date.now() + 16_000;
+    vi.spyOn(Date, 'now').mockReturnValue(later);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    Reflect.deleteProperty(window, 'matchMedia');
+  });
+
+  it.each(['admin', 'interviewer'] as const)('tells %s, whichever page they are on', async (role) => {
     setAuth({ role });
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    renderLayout('/phone-calendar');
+    expect(await screen.findByText(PAUSED)).toHaveAttribute('role', 'status');
+  });
+
+  it('names a halt nobody here can lift, in the same line', async () => {
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'legal_hold'));
     renderLayout();
+    expect(await screen.findByText('Calling halted — legal hold')).toBeInTheDocument();
+  });
+
+  it('offers no Halt or Resume button, which stay in Mission Control', async () => {
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    renderLayout();
+    await screen.findByText(PAUSED);
+    expect(screen.queryByRole('button', { name: /halt|resume/i })).not.toBeInTheDocument();
+  });
+
+  it('asks nothing for a viewer, because the read would answer 403 on every route', async () => {
+    setAuth({ role: 'viewer' });
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    renderLayout();
+    expect(await screen.findByText('Online')).toBeInTheDocument();
+    expect(getPhoneHealth).not.toHaveBeenCalled();
     expect(screen.queryByText(/calling/i)).not.toBeInTheDocument();
+  });
+
+  it('says nothing while calling is on', async () => {
+    renderLayout();
+    await waitFor(() => expect(getPhoneHealth).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText('Online')).toBeInTheDocument();
+    expect(screen.queryByText(/calling/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['a failed read', () => getPhoneHealth.mockRejectedValue(new Error('nope'))],
+    ['screening turned off', () => getPhoneHealth.mockResolvedValue({ ok: true, enabled: false, status: 'disabled', reasons: [], admission: null })],
+    ['a missing control row', () => getPhoneHealth.mockResolvedValue({ ...phoneHealth(true), admission: { control_present: false, halted: true, halt_reason: null } })],
+  ])('claims no halt from %s', async (_label, arrange) => {
+    arrange();
+    renderLayout();
+    await waitFor(() => expect(getPhoneHealth).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText('Online')).toBeInTheDocument();
+    expect(screen.queryByText(/calling/i)).not.toBeInTheDocument();
+  });
+
+  it('takes the line down when the halt is lifted and the tab comes back', async () => {
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    renderLayout();
+    await screen.findByText(PAUSED);
+    await afterTheGap(1);
+    getPhoneHealth.mockResolvedValue(phoneHealth(false));
+    fireEvent.focus(window);
+    await waitFor(() => expect(screen.queryByText(PAUSED)).not.toBeInTheDocument());
+    expect(getPhoneHealth).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the line through a re-read that fails: that says nothing about the switch', async () => {
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    renderLayout();
+    await screen.findByText(PAUSED);
+    await afterTheGap(1);
+    getPhoneHealth.mockRejectedValue(new Error('nope'));
+    fireEvent.focus(window);
+    await waitFor(() => expect(getPhoneHealth).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(PAUSED)).toBeInTheDocument();
+  });
+
+  it('reads again on a route change, but not on every one', async () => {
+    const user = userEvent.setup();
+    renderLayout('/dashboard');
+    await waitFor(() => expect(getPhoneHealth).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole('link', { name: /^Candidates$/ }));
+    await waitFor(() => expect(document.title).toBe('Candidates · HELLO'));
+    expect(getPhoneHealth).toHaveBeenCalledTimes(1);
+
+    await afterTheGap(1);
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'emergency_stop'));
+    await user.click(screen.getByRole('link', { name: /^Agents$/ }));
+    expect(await screen.findByText('Calling halted — emergency stop')).toBeInTheDocument();
+    expect(getPhoneHealth).toHaveBeenCalledTimes(2);
+  });
+
+  it('sits in the sidebar at a desk, where it stays on screen', async () => {
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: () => ({ matches: true, addEventListener: () => {}, removeEventListener: () => {} }),
+    });
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    renderLayout();
+    expect((await screen.findAllByText(PAUSED))).toHaveLength(1);
+    expect(document.getElementById('app-sidebar')).toContainElement(screen.getByText(PAUSED));
+  });
+
+  it('sits under the top bar on a narrow screen, where the sidebar is folded away', async () => {
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    renderLayout();
+    expect((await screen.findAllByText(PAUSED))).toHaveLength(1);
+    expect(document.getElementById('app-sidebar')).not.toContainElement(screen.getByText(PAUSED));
+  });
+
+  it('has no axe violations with the line up', async () => {
+    getPhoneHealth.mockResolvedValue(phoneHealth(true, 'operator_pause'));
+    const { container } = renderLayout();
+    await screen.findByText(PAUSED);
+    await expect(container).toHaveNoViolations();
   });
 });
 

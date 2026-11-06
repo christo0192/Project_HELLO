@@ -255,8 +255,9 @@ describe('the Phone screening tab', () => {
     await opened();
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalled());
     expect(mockApi.getSession).not.toHaveBeenCalledWith('session-r1');
-    const options = within(panel('Phone screening')).getAllByRole('option').map((option) => option.textContent ?? '');
-    expect(options.some((text) => /R1/.test(text))).toBe(false);
+    // The one phone session left to choose is a line of text, not a picker.
+    expect(within(panel('Phone screening')).queryByRole('button', { name: /^Session/ })).toBeNull();
+    expect(panel('Phone screening').querySelector('[data-session-text]')).not.toHaveTextContent('R1');
   });
 });
 

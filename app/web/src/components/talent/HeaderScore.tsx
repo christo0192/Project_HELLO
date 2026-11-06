@@ -11,8 +11,8 @@
  *  - an R1 (WebRTC sales role-play) assessment is never the screening score;
  *    the Candidates list drops them the same way;
  *  - never 0 for "no score": an unreadable or absent figure reads "Not scored";
- *  - the figure stays in ink and the recommendation pill carries the tone, so
- *    colour is never the only signal (same rule as ScoreVerdict);
+ *  - the figure stays in ink and so does the verdict mark beside it (same rule
+ *    as ScoreVerdict);
  *  - held for evidence (C3) and provisional (incomplete metrics) are said in
  *    words, not by dimming alone.
  *
@@ -23,7 +23,7 @@
 import type { Assessment, Session } from '../../types';
 import { latestScreeningAssessment } from '../../lib/latest-screening-assessment';
 import { finiteNumber, readRoleScorecard, recommendationMeta } from '../session/scorecard-read';
-import { PILL_DOT, PILL_TONE } from '../session/ScoreVerdict';
+import { VerdictMark } from '../session/VerdictMark';
 import { SurfaceCard, Tag } from '../design/candidate';
 import { cx } from '../design/cx';
 import { formatDate } from '../../lib/datetime';
@@ -68,18 +68,7 @@ export function HeaderScore({ assessments, sessions, className }: HeaderScorePro
   const pills =
     score != null && (reco || reading?.provisional || held) ? (
       <>
-        {reco && (
-          <span
-            data-recommendation={reco.tone}
-            className={cx(
-              'inline-flex items-center gap-1.5 whitespace-nowrap rounded-chip px-2.5 py-0.5 text-label font-semibold',
-              PILL_TONE[reco.tone],
-            )}
-          >
-            <span aria-hidden="true" className={cx('h-1.5 w-1.5 rounded-full', PILL_DOT[reco.tone])} />
-            {reco.label}
-          </span>
-        )}
+        <VerdictMark recommendation={reading?.recommendation} />
         {held ? (
           <Tag tone="caution">Held: not enough evidence</Tag>
         ) : reading?.provisional ? (

@@ -10,6 +10,8 @@
 import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { optionsOf, pickOption } from '../components/design/__tests__/helpers';
 import { CandidatesPage } from './CandidatesPage';
 import { mockCandidate, mockRole } from '../test/helpers';
 import { EMPTY_FUNNEL_TOTALS, funnelTotals } from '../test/funnel';
@@ -127,9 +129,12 @@ describe('CandidatesPage Active / Paused scope', () => {
     expect(within(bar).getByRole('button', { name: /Screened/ })).toHaveTextContent('1');
     // The role dropdown still lists EVERY mapped role: the scope and the role
     // intersect, the scope never narrows or resets the role control.
-    const select = screen.getByLabelText('Filter by role');
-    const options = within(select).getAllByRole('option').map((o) => o.textContent);
-    expect(options).toEqual(['All roles', 'Drift Role', 'Live Role', 'Paused Role']);
+    expect(await optionsOf(userEvent.setup(), /^Filter by role/)).toEqual([
+      'All roles',
+      'Drift Role',
+      'Live Role',
+      'Paused Role',
+    ]);
     // Removable chip.
     fireEvent.click(screen.getByRole('button', { name: 'Remove filter Ashby jobs: Active' }));
     expect(screen.getByTestId('location')).not.toHaveTextContent('ashby');
@@ -161,7 +166,7 @@ describe('CandidatesPage Active / Paused scope', () => {
   });
 });
 
-describe('CandidatesPage search lives in the candidate-list panel', () => {
+describe('CandidatesPage search lives in the filter row', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.listRoles.mockResolvedValue(ROLES);
@@ -169,13 +174,12 @@ describe('CandidatesPage search lives in the candidate-list panel', () => {
     mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
   });
 
-  it('puts the searchbox in the panel with the table, not in the Filters panel', async () => {
+  it('puts the searchbox in the Filters panel, so the rows start higher up the page', async () => {
     renderPage();
     const box = await screen.findByRole('searchbox', { name: 'Search candidates' });
+    expect(screen.getByRole('region', { name: 'Filters' }).contains(box)).toBe(true);
     const panel = screen.getByRole('region', { name: 'Candidate list' });
-    expect(panel.contains(box)).toBe(true);
     expect(panel.contains(screen.getByRole('table'))).toBe(true);
-    expect(screen.getByRole('region', { name: 'Filters' }).contains(box)).toBe(false);
   });
 
   it('keeps the box mounted when a search matches nothing, so it can be cleared', async () => {
@@ -246,7 +250,7 @@ describe('Active / Paused is attributed per candidate, and intersects with ?role
     const search = screen.getByTestId('location').textContent ?? '';
     expect(search).toContain('role=r-live');
     expect(search).toContain('ashby=paused');
-    expect(screen.getByLabelText('Filter by role')).toHaveValue('r-live');
+    expect(screen.getByRole('button', { name: /^Filter by role/ })).toHaveAccessibleName('Filter by role Live Role');
     // No second load, no reset: the role was never dropped.
     expect(mockApi.listCandidates.mock.calls.map((c) => c[0])).toEqual(['r-live']);
   });
@@ -260,7 +264,7 @@ describe('Active / Paused is attributed per candidate, and intersects with ?role
     expect(await screen.findByText('No candidates match these filters')).toBeInTheDocument();
     expect(screen.queryByText('No candidates yet')).not.toBeInTheDocument();
     // The role survives, and the segment advertises exactly what the rows show.
-    expect(screen.getByLabelText('Filter by role')).toHaveValue('r-drift');
+    expect(screen.getByRole('button', { name: /^Filter by role/ })).toHaveAccessibleName('Filter by role Drift Role');
     const group = screen.getByRole('group', { name: 'Filter by Ashby job status' });
     expect(within(group).getByRole('button', { name: /^Paused/ })).toHaveTextContent('0');
     fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
@@ -276,7 +280,7 @@ describe('Active / Paused is attributed per candidate, and intersects with ?role
     expect(within(group).getByRole('button', { name: /^Paused/ })).toHaveTextContent('0');
     fireEvent.click(within(group).getByRole('button', { name: /^Paused/ }));
     expect(screen.getByTestId('location').textContent).toContain('role=r-live');
-    expect(screen.getByLabelText('Filter by role')).toHaveValue('r-live');
+    expect(screen.getByRole('button', { name: /^Filter by role/ })).toHaveAccessibleName('Filter by role Live Role');
     expect(await screen.findByText('No candidates match these filters')).toBeInTheDocument();
   });
 
@@ -348,12 +352,11 @@ describe('Active / Paused edge states', () => {
   it('keeps the search box and its live region mounted across a reload', async () => {
     renderPage();
     const box = await screen.findByRole('searchbox', { name: 'Search candidates' });
-    const liveRegion = () =>
-      screen.getByRole('region', { name: 'Candidate list' }).querySelector('p[role="status"]');
+    const liveRegion = () => document.querySelector('[data-search-status]');
     const region = liveRegion();
     let release: (rows: unknown[]) => void = () => {};
     mockApi.listCandidates.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
-    fireEvent.change(screen.getByLabelText('Filter by role'), { target: { value: 'r-live' } });
+    await pickOption(userEvent.setup(), /^Filter by role/, 'Live Role');
     // Mid-reload: same DOM nodes, loading shown inside the panel.
     expect(await screen.findByText('Loading candidates…')).toBeInTheDocument();
     expect(screen.getByRole('searchbox', { name: 'Search candidates' })).toBe(box);

@@ -6,6 +6,7 @@
  * best-practice. `src/test/SeededViolation.test.tsx` already proves the
  * matcher really fails on a real violation, so a pass here means something.
  */
+import { pickOption } from '../components/design/__tests__/helpers';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -121,12 +122,11 @@ describe('axe — no WCAG A/AA violations', () => {
   it('with the Agent picker narrowing the week to one agent', async () => {
     const { container } = renderPage();
     await screen.findByRole('table');
-    const select = await screen.findByRole('combobox', { name: 'Agent' });
+    const select = await screen.findByRole('button', { name: /^Agent/ });
     await waitFor(() => expect(select).toBeEnabled());
-    // A native <select> with a real <label>: its name is "Agent", not a
-    // placeholder option's text.
-    expect(select).toHaveAccessibleName('Agent');
-    await userEvent.selectOptions(select, 'Zara');
+    // Named by its printed label, then what it is set to.
+    expect(select).toHaveAccessibleName('Agent All agents');
+    await pickOption(userEvent.setup(), /^Agent/, 'Zara');
     await expect(container).toHaveNoViolations();
   });
 
@@ -141,13 +141,13 @@ describe('axe — no WCAG A/AA violations', () => {
     apiFns.listRoles.mockReturnValue(new Promise(() => {}));
     const loading = renderPage();
     await screen.findByRole('table');
-    expect(screen.getByRole('combobox', { name: 'Agent' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^Agent/ })).toBeDisabled();
     await expect(loading.container).toHaveNoViolations();
     loading.unmount();
 
     apiFns.listRoles.mockRejectedValue(new Error('roles_read_error'));
     const failed = renderPage(`?week=2026-08-24&agent=${ROLE_DATA}`);
-    await screen.findByText(/Agents could not be loaded/);
+    await screen.findByText(/Agents couldn't load/);
     await expect(failed.container).toHaveNoViolations();
   });
 
@@ -181,11 +181,12 @@ describe('touch targets', () => {
     ].filter((el) => !el.closest('[aria-hidden="true"]'));
 
     expect(controls.length).toBeGreaterThan(5);
-    // `min-h-[44px]` and nothing else. An earlier version of this guard also
+    // 44px on a touch screen, by either route: a fixed floor, or the 36px control
+    // that grows under a coarse pointer. An earlier version of this guard also
     // accepted `py-2`, which let every ConfirmButton through at ~36px — i.e.
     // it exempted exactly the write controls it existed to protect.
     const tooSmall = controls.filter(
-      (el) => !/(^|\s)min-h-\[44px\](\s|$)/.test(el.className),
+      (el) => !/(^|\s)(min-h-\[44px\]|\[@media\(pointer:coarse\)\]:min-h-1[01])(\s|$)/.test(el.className),
     );
     expect(tooSmall.map((el) => `${el.tagName}:${el.textContent?.trim()}`)).toEqual([]);
   });

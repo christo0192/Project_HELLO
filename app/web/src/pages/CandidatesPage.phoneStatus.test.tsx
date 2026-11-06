@@ -132,18 +132,29 @@ describe('CandidatesPage phone status', () => {
     expect(within(row).queryByText(/dialed/)).toBeNull();
     // ...and the page says once that some statuses may be the stored value,
     // so a failed phone read never silently turns "Abandoned" into "Queued".
-    expect(screen.getByText(/Phone progress could not be loaded for some candidates/)).toBeInTheDocument();
+    expect(screen.getByText(/Phone progress couldn't load for some candidates/)).toBeInTheDocument();
     expect(within(row).getByText('Queued')).toHaveAttribute(
       'title',
       expect.stringContaining('Phone progress unavailable'),
     );
   });
 
+  it('reads the list again from the phone-progress notice, and the notice goes once it answers', async () => {
+    renderPage();
+    await screen.findByText('Unknown Uma');
+    expect(mockApi.listCandidates).toHaveBeenCalledTimes(1);
+    mockApi.listCandidates.mockResolvedValue(CANDIDATES.filter((c) => c.dial_count !== null));
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByText(/Phone progress couldn't load/)).toBeNull());
+    await screen.findByText('Dialled Dee');
+    expect(mockApi.listCandidates).toHaveBeenCalledTimes(2);
+  });
+
   it('shows no phone-progress notice when every count is known', async () => {
     mockApi.listCandidates.mockResolvedValue(CANDIDATES.filter((c) => c.dial_count !== null));
     renderPage();
     await screen.findByText('Dialled Dee');
-    expect(screen.queryByText(/Phone progress could not be loaded/)).toBeNull();
+    expect(screen.queryByText(/Phone progress couldn't load/)).toBeNull();
   });
 
   it('names an abandoned cycle, with the reason in the tooltip', async () => {
@@ -154,7 +165,7 @@ describe('CandidatesPage phone status', () => {
     expect(badge).toHaveAttribute('title', expect.stringContaining('No answer after every attempt'));
     // The tooltip's facts reach a screen reader too (sr-only, beside the badge).
     expect(
-      within(row).getByText(/^, No answer after every attempt · Phone reached 5 times/, { selector: '.sr-only' }),
+      within(row).getByText(/^, No answer after every attempt · Phone rang 5 times/, { selector: '.sr-only' }),
     ).toBeInTheDocument();
     // Its next action restates the outcome; it is not a "Queued" row.
     expect(within(row).getByText('No answer after every attempt', { selector: '.sr-only' })).toBeInTheDocument();
@@ -168,7 +179,7 @@ describe('CandidatesPage phone status', () => {
     expect(within(row).getByText('Screened')).toBeInTheDocument();
     expect(within(row).queryByText(/Phone screen failed|dialed/)).toBeNull();
     // The review link still goes to the Review tab.
-    expect(within(row).getByRole('link', { name: /Review & decide/ })).toHaveAttribute(
+    expect(within(row).getByRole('link', { name: /^Review\b/ })).toHaveAttribute(
       'href',
       '/candidates/c-screened?tab=phone',
     );

@@ -12,6 +12,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CandidateDetailPage } from './CandidateDetailPage';
+import { optionsOf, pickOption } from '../components/design/__tests__/helpers';
 import { mockCandidateDetail, mockSessionDetail } from '../test/helpers';
 
 const mockApi = {
@@ -542,7 +543,7 @@ describe('CandidateDetailPage', () => {
     expect(badges[0]).toHaveAttribute('title', expect.stringContaining('Phone cycle – Awaiting retry'));
     // The same facts are VISIBLE under the header badge, not hover-only.
     const detail = document.querySelector('[data-phone-status-detail]');
-    expect(detail?.textContent).toMatch(/Phone reached 3 times .* · Last dialed/);
+    expect(detail?.textContent).toMatch(/Phone rang 3 times .* · Last dialed/);
   });
 
   it('names an abandoned_no_answer cycle in the header, never "Queued"', async () => {
@@ -588,7 +589,7 @@ describe('CandidateDetailPage', () => {
     expect(screen.queryByText('Phone screen failed')).toBeNull();
     // The detail line says WHY, from the held assessment's evidence reason.
     const detail = document.querySelector('[data-phone-status-detail]');
-    expect(detail?.textContent).toMatch(/^No screening question was answered · Phone reached 2 times/);
+    expect(detail?.textContent).toMatch(/^No screening question was answered · Phone rang 2 times/);
   });
 
   it('M013 S02: a phone session header says what was recorded, and no call length while an end is unknown', async () => {
@@ -797,7 +798,54 @@ describe('CandidateDetailPage', () => {
     expect(screen.getByRole('dialog', { name: 'Confirm phone screening' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Confirm call' }));
     await waitFor(() => expect(mockApi.requestCandidatePhoneCall).toHaveBeenCalledWith('candidate-1'));
-    expect(await screen.findByRole('status')).toHaveTextContent(/Phone screening requested/);
+    const told = await screen.findByRole('status');
+    expect(told).toHaveTextContent(/Phone screening requested/);
+    // A halt or a spent daily cap can hold the call in an open window with a free
+    // line, so the words give conditions it needs and never ones that guarantee it.
+    expect(told).toHaveTextContent(/in an open calling window when capacity allows\. No time is promised\./);
+    expect(told).not.toHaveTextContent(/if a line is free/);
+  });
+
+  describe('the way back to the list', () => {
+    function renderFrom(state?: unknown) {
+      return render(
+        <MemoryRouter initialEntries={[{ pathname: '/candidates/candidate-1', state }]}>
+          <Routes>
+            <Route path="/candidates/:id" element={<CandidateDetailPage />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+    }
+
+    it('returns to the filtered page it came from', async () => {
+      renderFrom({ listSearch: '?status=screened&page=3' });
+      expect(await screen.findByRole('link', { name: /Back to candidates/ })).toHaveAttribute(
+        'href',
+        '/candidates?status=screened&page=3',
+      );
+    });
+
+    it('survives a change of tab', async () => {
+      renderFrom({ listSearch: '?status=new&page=2' });
+      await userEvent.click(await screen.findByRole('tab', { name: 'Profile' }));
+      await waitFor(() => expect(screen.getByRole('tab', { name: 'Profile' })).toHaveAttribute('aria-selected', 'true'));
+      await userEvent.click(screen.getByRole('tab', { name: 'Phone screening' }));
+      await waitFor(() => expect(screen.getByRole('tab', { name: 'Phone screening' })).toHaveAttribute('aria-selected', 'true'));
+      expect(screen.getByRole('link', { name: /Back to candidates/ })).toHaveAttribute(
+        'href',
+        '/candidates?status=new&page=2',
+      );
+    });
+
+    it('goes to the plain list from a deep link', async () => {
+      renderFrom();
+      expect(await screen.findByRole('link', { name: /Back to candidates/ })).toHaveAttribute('href', '/candidates');
+    });
+
+    it('takes only a query string from router state', async () => {
+      renderFrom({ listSearch: '//example.com' });
+      expect(await screen.findByRole('link', { name: /Back to candidates/ })).toHaveAttribute('href', '/candidates');
+    });
   });
 
   it('requests a governed new cycle from an eligible terminal cycle', async () => {
@@ -825,10 +873,11 @@ describe('CandidateDetailPage', () => {
       }],
     });
     renderDetailPage("candidate-1", "?tab=overview");
-    await screen.findByRole('button', { name: 'Request re-screen' });
-    fireEvent.change(screen.getByRole('combobox', { name: 'Reason for new cycle' }), {
-      target: { value: 'technical_issue' },
-    });
+    const request = await screen.findByRole('button', { name: 'Request re-screen' });
+    // A required choice that starts empty: no reason is recorded by default.
+    expect(screen.getByRole('button', { name: 'Reason for new cycle Choose a reason' })).toBeInTheDocument();
+    expect(request).toBeDisabled();
+    await pickOption(userEvent.setup(), /^Reason for new cycle/, 'Technical issue');
     await userEvent.click(screen.getByRole('button', { name: 'Request re-screen' }));
     await waitFor(() => expect(mockApi.requestPhoneRescreen).toHaveBeenCalledWith(
       'candidate-1',
@@ -1432,11 +1481,10 @@ describe('Human words for machine values', () => {
 
   it('names appeal-grant sessions by when they happened, never by an id prefix', async () => {
     renderDetailPage("candidate-1", "?tab=overview");
-    const select = await screen.findByRole('combobox', { name: 'Session' });
-    const option = within(select).getAllByRole('option')[0];
-    expect(option).toHaveValue('session-1');
-    expect(option.textContent).not.toContain('session-');
-    expect(option.textContent).toContain('Completed');
+    await screen.findByRole('button', { name: /^Session/ });
+    const [option] = await optionsOf(userEvent.setup(), /^Session/);
+    expect(option).not.toContain('session-');
+    expect(option).toContain('Completed');
   });
 });
 

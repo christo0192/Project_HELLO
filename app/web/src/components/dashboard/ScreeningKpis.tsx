@@ -37,7 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import { apiErrorCopy } from '../../lib/api-error-copy';
 import type { FunnelDailyRow, FunnelSummaryResponse, Role } from '../../types';
-import { ErrorPanel, GlassPanel, InlineNotice, SectionHeader, controlClass, cx } from '../design';
+import { Combobox, ErrorPanel, GlassPanel, InlineNotice, SectionHeader, cx } from '../design';
 import { MetricStrip } from '../design/MetricStrip';
 import type { MetricItem } from '../design/MetricStrip';
 import { LineChart } from '../charts';
@@ -363,21 +363,20 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
         />
         <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           {roleOptions.length > 0 && (
-            <label className="block w-full sm:w-56">
-              <span className="sr-only">Filter by role</span>
-              <select
-                value={roleId}
-                onChange={(e) => setRoleId(e.target.value)}
-                className={cx(controlClass, 'control-select h-11 text-label')}
-              >
-                <option value="">All roles</option>
-                {roleOptions.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <Combobox
+              id="screening-kpis-role"
+              aria-label="Filter by role"
+              size="md"
+              floating
+              value={roleId}
+              onChange={setRoleId}
+              options={[{ value: '', label: 'All roles' }, ...roleOptions.map((option) => ({ value: option.id, label: option.label }))]}
+              placeholder="All roles"
+              searchLabel="Search roles"
+              listLabel="Roles"
+              noun={['role', 'roles']}
+              className="w-full sm:w-56"
+            />
           )}
           <div role="group" aria-label="Time range" className="inline-flex gap-0.5 rounded-control border border-[var(--control)] bg-surface p-0.5">
             {RANGE_OPTIONS.map((opt) => (

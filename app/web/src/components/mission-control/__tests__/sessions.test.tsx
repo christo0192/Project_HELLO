@@ -3,7 +3,8 @@
  * Covers: filter, response-confirmed updates (no optimism), terminal-state
  * locking (no resurrection), stable 400/409 copy, no PII, axe.
  */
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { optionsOf, pickOption } from '../../design/__tests__/helpers';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { missionApi, apiFns } from './apiMock';
@@ -73,7 +74,7 @@ describe('SessionsSection', () => {
   it('calls a short list a total, and adds nothing about a cut', async () => {
     apiFns.listAdminSessions.mockResolvedValue({ sessions: SESSIONS, truncated: false });
     renderSessions();
-    expect(await screen.findByText('3 total · 1 terminal')).toBeInTheDocument();
+    expect(await screen.findByText('3 total · 1 closed')).toBeInTheDocument();
     expect(screen.queryByText(/most recently updated/)).not.toBeInTheDocument();
   });
 
@@ -83,16 +84,16 @@ describe('SessionsSection', () => {
     const page = Array.from({ length: 100 }, (_, i) => ({
       ...SESSIONS[0],
       id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
-      status: i < 34 ? 'failed' : 'waiting',
+      status: i >= 66 ? 'failed' : 'waiting',
     }));
     apiFns.listAdminSessions.mockResolvedValue({ sessions: page, truncated: true });
     renderSessions();
-    expect(await screen.findByText('The 100 most recently updated · 34 terminal')).toBeInTheDocument();
+    expect(await screen.findByText('The 100 most recently updated · 34 closed')).toBeInTheDocument();
     expect(screen.queryByText(/\btotal\b/)).not.toBeInTheDocument();
     expect(
       screen.getByText(/hold the 50 most recently updated\. Older sessions cannot be overridden from here\./),
     ).toBeInTheDocument();
-    expect(within(screen.getByLabelText('Session')).getAllByRole('option')).toHaveLength(50);
+    expect(await optionsOf(userEvent.setup(), /^Session/)).toHaveLength(50);
   });
 
   it('says the table bound when a whole list of more than 50 does not fit it', async () => {
@@ -102,14 +103,14 @@ describe('SessionsSection', () => {
     }));
     apiFns.listAdminSessions.mockResolvedValue({ sessions: page, truncated: false });
     renderSessions();
-    expect(await screen.findByText('60 total · 0 terminal')).toBeInTheDocument();
+    expect(await screen.findByText('60 total · 0 closed')).toBeInTheDocument();
     expect(screen.getByText(/hold the 50 most recently updated/)).toBeInTheDocument();
   });
 
   it('filters by status via the select', async () => {
     renderSessions();
     await screen.findByText('Sessions');
-    await userEvent.selectOptions(screen.getByLabelText('Status filter'), 'completed');
+    await pickOption(userEvent.setup(), /^Status filter/, 'Completed');
     await waitFor(() => {
       expect(apiFns.listAdminSessions).toHaveBeenLastCalledWith('completed');
     });
@@ -129,7 +130,7 @@ describe('SessionsSection', () => {
       screen.getByText(/Reason: “Call completed off-hook”/),
     ).toBeInTheDocument();
 
-    await userEvent.selectOptions(screen.getByLabelText('Target status'), 'completed');
+    await pickOption(userEvent.setup(), /^Target status/, 'completed');
     fireEvent.click(screen.getByRole('button', { name: 'Confirm override' }));
     await waitFor(() => {
       expect(apiFns.overrideSession).toHaveBeenCalledWith(
@@ -165,17 +166,24 @@ describe('SessionsSection', () => {
     renderSessions();
     await screen.findByText('Override session status');
 
-    await userEvent.selectOptions(
-      screen.getByLabelText('Session'),
-      '00000000-0000-4000-8000-000000000002',
-    );
+    await pickOption(userEvent.setup(), /^Session/, /closed, locked/);
     expect(
-      screen.getByText(/terminal state \(Failed\) and cannot be changed/i),
+      screen.getByText(/is closed \(Failed\) and can't be changed/i),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText('Session')).toBeDisabled();
-    expect(screen.getByLabelText('Target status')).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^Session/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^Target status/ })).toBeDisabled();
     expect(screen.getByLabelText('Reason (required)')).toBeDisabled();
     expect(screen.queryByRole('button', { name: 'Apply override' })).not.toBeInTheDocument();
+  });
+
+  it('keeps a Completed session out of the closed count, and open to an override', async () => {
+    renderSessions();
+    await screen.findByText('Override session status');
+    expect(screen.getByText('3 total · 1 closed')).toBeInTheDocument();
+    await pickOption(userEvent.setup(), /^Session/, /— completed$/);
+    expect(screen.queryByText(/is closed/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Reason (required)')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Apply override' })).toBeInTheDocument();
   });
 
   it('maps a 409 resurrection rejection to stable copy', async () => {
@@ -201,10 +209,6 @@ describe('SessionsSection', () => {
   it('has no axe violations', async () => {
     const { container } = renderSessions();
     await screen.findByText('Override session status');
-    await userEvent.selectOptions(
-      screen.getByLabelText('Session'),
-      '00000000-0000-4000-8000-000000000003',
-    );
     await expect(container).toHaveNoViolations();
   });
 });

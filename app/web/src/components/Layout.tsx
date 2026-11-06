@@ -11,9 +11,11 @@
  * - Material: a 232px sidebar on the desk, and the page as one opaque sheet
  *   inset 8px from the window (`.sheet`). No blur, no fixed ground, no shadow.
  * - The sidebar is sticky on desktop, so the nav stays on screen at any scroll.
- * - The calling state is NOT shown here. Its only read, `GET /api/phone/health`,
- *   is `requireRole('interviewer')`, so a viewer would get a 403 on every route,
- *   and `GET /api/status` carries no calling state. It needs its own safe read.
+ * - A calling halt is said here, on every route, to admins and interviewers: the
+ *   two roles `GET /api/phone/health` answers. "Online" is about the API, and a
+ *   recruiter would otherwise read it beside a calendar that dials nothing. A
+ *   viewer's shell asks nothing, so there is no 403 on their routes. The Halt
+ *   button itself stays in Mission Control.
  * - Responsive: desktop sticky sidebar (lg+); mobile off-canvas drawer with
  *   backdrop, Escape-to-close, `inert` when closed (out of tab order and
  *   the accessibility tree), focus moved into the drawer on open and
@@ -35,12 +37,13 @@
  *   flight would otherwise land on the next person's page.
  */
 
-import { Fragment, Suspense, useEffect, useRef, useState } from 'react';
+import { Fragment, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth, type MembershipRole } from '../lib/auth';
 import { LoadingPanel } from './design';
 import { ErrorBoundary } from './ErrorBoundary';
+import { RECHECK_MIN_INTERVAL_MS, haltShellLine, haltViewFrom } from './mission-control/operatorHalt';
 import {
   Brand,
   BriefcaseIcon,
@@ -82,11 +85,54 @@ function useIsDesktop(): boolean {
   return isDesktop;
 }
 
+/**
+ * The shell's line while calling is halted, or null. The switch is read on
+ * arrival, on a route change, and when the tab comes back, at most once per
+ * `RECHECK_MIN_INTERVAL_MS`: no polling. Only an answer that describes the switch
+ * moves the line. A failed read says nothing about it, so the line stays as it
+ * was, and nothing is claimed that was not read.
+ */
+function useCallingHaltLine(role: MembershipRole | null, pathname: string): string | null {
+  const canRead = role === 'admin' || role === 'interviewer';
+  const [line, setLine] = useState<string | null>(null);
+  const lastReadAt = useRef(Number.NEGATIVE_INFINITY);
+
+  const read = useCallback(async () => {
+    if (Date.now() - lastReadAt.current < RECHECK_MIN_INTERVAL_MS) return;
+    lastReadAt.current = Date.now();
+    try {
+      const view = haltViewFrom(await api.getPhoneHealth());
+      if (view.kind !== 'unavailable') setLine(haltShellLine(view));
+    } catch {
+      // See above. The shell has no error state of its own to show.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (canRead) void read();
+  }, [canRead, pathname, read]);
+
+  useEffect(() => {
+    if (!canRead) return undefined;
+    const onReturn = () => {
+      if (document.visibilityState === 'visible') void read();
+    };
+    window.addEventListener('focus', onReturn);
+    document.addEventListener('visibilitychange', onReturn);
+    return () => {
+      window.removeEventListener('focus', onReturn);
+      document.removeEventListener('visibilitychange', onReturn);
+    };
+  }, [canRead, read]);
+
+  return canRead ? line : null;
+}
+
 type Status = 'checking' | 'online' | 'maintenance' | 'offline';
 
 const STATUS_LABEL: Record<Status, string> = {
   checking: 'Checking…',
-  online: 'API online',
+  online: 'Online',
   maintenance: 'Maintenance',
   offline: 'API offline',
 };
@@ -97,6 +143,24 @@ const STATUS_DOT: Record<Status, string> = {
   maintenance: 'bg-ink-muted',
   offline: 'bg-error',
 };
+
+/**
+ * The tab's title by route. Thirty routes shared one, so a person with five tabs
+ * open, or a screen reader arriving on a page, could not tell them apart. Never
+ * a candidate's name: a tab title reaches browser history and screen shares.
+ */
+const ROUTE_TITLES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^\/dashboard/, 'Dashboard'],
+  [/^\/candidates\/./, 'Candidate'],
+  [/^\/candidates/, 'Candidates'],
+  [/^\/roles/, 'Agents'],
+  [/^\/phone-calendar/, 'Phone calendar'],
+  [/^\/ashby-mission-control/, 'Ashby Live Jobs'],
+  [/^\/mission-control/, 'Mission Control'],
+  [/^\/admin\/r1/, 'R1 settings'],
+  [/^\/sessions\//, 'Screening'],
+  [/^\/screening\//, 'Screening'],
+];
 
 const ROLE_LABEL: Record<MembershipRole, string> = {
   admin: 'Admin',
@@ -157,10 +221,16 @@ export function Layout() {
   const navigate = useNavigate();
   const location = useLocation();
 
+  useEffect(() => {
+    const title = ROUTE_TITLES.find(([path]) => path.test(location.pathname))?.[1];
+    document.title = title ? `${title} · HELLO` : 'HELLO';
+  }, [location.pathname]);
+
   const [status, setStatus] = useState<Status>('checking');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const isDesktop = useIsDesktop();
   const showR1 = useR1Item();
+  const haltLine = useCallingHaltLine(role, location.pathname);
 
   const menuButtonRef = useRef<HTMLButtonElement | null>(null);
 
@@ -344,6 +414,13 @@ export function Layout() {
           )}
         </nav>
 
+        {/* Below the nav, where the sidebar keeps it on screen at any scroll. */}
+        {haltLine && isDesktop && (
+          <p role="status" className="mt-3 px-2.5 text-label font-medium text-error-text">
+            {haltLine}
+          </p>
+        )}
+
         <div className="mt-3 border-t border-line-strong px-2.5 pt-3">
           {isAuthenticated && user ? (
             <div className="flex items-center gap-2">
@@ -417,6 +494,16 @@ export function Layout() {
             {pageTitle}
           </p>
         </header>
+
+        {/* A narrow screen folds the sidebar away, so the line sits under the bar. */}
+        {haltLine && !isDesktop && (
+          <p
+            role="status"
+            className="border-b border-line-strong bg-surface-tertiary px-4 py-2 text-label font-medium text-error-text sm:px-6"
+          >
+            {haltLine}
+          </p>
+        )}
 
         {/* The sheet: one opaque page on the desk, inset 8px from the window. */}
         <main

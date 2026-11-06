@@ -78,13 +78,24 @@ beforeEach(() => {
 });
 
 describe('an R1 session', () => {
-  it('is not in the session picker, and the phone session is what loads', async () => {
-    renderWorkspace();
+  it('leaves one choice beside one phone session, which is a line of text, and the phone session is what loads', async () => {
+    const { container } = renderWorkspace();
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('phone-session'));
-    const options = screen.getAllByRole('option').map((option) => option.textContent ?? '');
-    expect(options).toHaveLength(1);
-    expect(options[0]).not.toMatch(/R1 role-play/);
+    expect(screen.queryByRole('button', { name: /^Session/ })).toBeNull();
+    const line = container.querySelector('[data-session-text]');
+    expect(line).toHaveTextContent('Live voice');
+    expect(line).not.toHaveTextContent('R1 role-play');
     expect(mockApi.getSession).not.toHaveBeenCalledWith('r1-session');
+  });
+
+  it('is not in the picker beside two phone sessions', async () => {
+    const second: Session = { ...PHONE_SESSION, id: 'phone-session-2', created_at: '2026-10-03T10:00:00.000Z' };
+    renderWorkspace({ sessions: [R1_SESSION, second, PHONE_SESSION] });
+    await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('phone-session-2'));
+    fireEvent.click(screen.getByRole('button', { name: /^Session/ }));
+    const options = screen.getAllByRole('option').map((option) => option.textContent ?? '');
+    expect(options).toHaveLength(2);
+    expect(options.filter((text) => /R1 role-play/.test(text))).toEqual([]);
   });
 
   it('reads and plays nothing of R1', async () => {
@@ -97,7 +108,7 @@ describe('an R1 session', () => {
   it('alone leaves the workspace saying there is no completed screening', () => {
     renderWorkspace({ sessions: [R1_SESSION] });
     expect(screen.getByText(/No completed sessions with recordings yet/)).toBeInTheDocument();
-    expect(screen.queryByRole('combobox')).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Session/ })).toBeNull();
     expect(mockApi.getSession).not.toHaveBeenCalled();
   });
 });

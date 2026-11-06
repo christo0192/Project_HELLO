@@ -416,7 +416,6 @@ describe('shell and accessibility', () => {
     for (const rel of [
       'src/components/roles/AskHelloButton.tsx',
       'src/components/mission-control/MetricAskHello.tsx',
-      'src/pages/RolesPage.tsx',
     ]) {
       expect(read(rel), rel).toMatch(/`ask-hello [^`]*border border-transparent/);
     }

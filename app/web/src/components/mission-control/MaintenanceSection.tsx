@@ -9,6 +9,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import type { PublicStatus } from '../../types';
 import {
   Button,
@@ -42,7 +43,7 @@ export function MaintenanceSection() {
         setEnabled(next.maintenance?.enabled === true);
         setReason(next.maintenance?.reason ?? '');
       })
-      .catch((e: ApiError) => setLoadError(e.message));
+      .catch((e: ApiError) => setLoadError(`Maintenance status couldn't load. ${plainErrorText(e.message)}`));
   }, []);
 
   useEffect(load, [load]);
@@ -103,7 +104,7 @@ export function MaintenanceSection() {
         </InlineNotice>
       )}
 
-      <GlassPanel>
+      <GlassPanel level="ruled">
         <SectionHeader level={3} title="Current state" />
         <div className="glass-sunken mt-3 flex flex-wrap items-center gap-3 rounded-control p-4">
           <StatusBadge tone={meta.tone}>{meta.label}</StatusBadge>
@@ -115,7 +116,7 @@ export function MaintenanceSection() {
         </p>
       </GlassPanel>
 
-      <GlassPanel>
+      <GlassPanel level="ruled">
         <SectionHeader
           level={3}
           title="Change maintenance mode"

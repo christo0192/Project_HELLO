@@ -15,6 +15,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { plainErrorText } from '../../lib/api-error-copy';
 import { COMPANY_EMAIL_DOMAINS_LABEL, isCompanyEmail } from '../../lib/auth';
 import type {
   AdminAllowlistEntry,
@@ -23,6 +24,7 @@ import type {
 } from '../../types';
 import {
   Button,
+  Combobox,
   EmptyPanel,
   ErrorPanel,
   Field,
@@ -32,7 +34,6 @@ import {
   Pagination,
   SectionHeader,
   SegmentedControl,
-  SelectField,
   StatusBadge,
   Switch,
   Table,
@@ -59,12 +60,23 @@ import type { AllowlistEntryState } from './statusMeta';
 
 type FilterValue = 'all' | AllowlistEntryState;
 
+/** The stored role word stays the value; a person reads the label. */
+const ROLE_OPTIONS: Array<{ value: MembershipRole; label: string }> = [
+  { value: 'viewer', label: 'Viewer' },
+  { value: 'interviewer', label: 'Interviewer' },
+  { value: 'admin', label: 'Admin' },
+];
+
 const FILTERS: Array<{ value: FilterValue; label: string }> = [
   { value: 'all', label: 'All' },
   { value: 'linked', label: 'Linked' },
   { value: 'pending', label: 'Pending' },
   { value: 'disabled', label: 'Disabled' },
 ];
+
+function roleLabel(role: MembershipRole): string {
+  return ROLE_OPTIONS.find((option) => option.value === role)?.label ?? role;
+}
 
 export function AccessSection() {
   const [me, setMe] = useState<MeResponse | null>(null);
@@ -94,7 +106,7 @@ export function AccessSection() {
           ),
         );
       })
-      .catch((e: ApiError) => setLoadError(e.message));
+      .catch((e: ApiError) => setLoadError(`The access list couldn't load. ${plainErrorText(e.message)}`));
   }, []);
 
   useEffect(load, [load]);
@@ -277,7 +289,7 @@ export function AccessSection() {
         />
       ) : (
         <div>
-          <Table caption="Access list — email, role, active, state and actions">
+          <Table bare flush caption="Access list — email, role, active, state and actions">
             <THead>
               <Tr>
                 <Th>Email</Th>
@@ -305,7 +317,7 @@ export function AccessSection() {
                   (draft.role !== entry.role || draft.active !== entry.active);
                 const changes: string[] = [];
                 if (draft && draft.role !== entry.role) {
-                  changes.push(`role ${entry.role} → ${draft.role}`);
+                  changes.push(`role ${roleLabel(entry.role)} → ${roleLabel(draft.role)}`);
                 }
                 if (draft && draft.active !== entry.active) {
                   changes.push(`active ${entry.active ? 'yes' : 'no'} → ${draft.active ? 'yes' : 'no'}`);
@@ -323,22 +335,22 @@ export function AccessSection() {
                       )}
                     </Td>
                     <Td>
-                      <SelectField
-                        size="sm"
+                      {/* In flow, not floating: the table's scroller would clip a
+                          floating list, and three short names need no search. */}
+                      <Combobox
+                        id={`access-role-${entry.id}`}
                         aria-label={`Role for ${entry.email}`}
+                        size="sm"
+                        searchable={false}
                         value={draft?.role ?? entry.role}
                         disabled={locked}
-                        onChange={(e) =>
-                          setDraft(entry.id, {
-                            role: e.target.value as MembershipRole,
-                          })
-                        }
+                        onChange={(value) => setDraft(entry.id, { role: value as MembershipRole })}
+                        options={ROLE_OPTIONS}
+                        placeholder="Role"
+                        searchLabel={`Role for ${entry.email}`}
+                        listLabel="Roles"
                         className="w-36 min-w-[9rem]"
-                      >
-                        <option value="viewer">viewer</option>
-                        <option value="interviewer">interviewer</option>
-                        <option value="admin">admin</option>
-                      </SelectField>
+                      />
                     </Td>
                     <Td>
                       <Switch
@@ -366,6 +378,7 @@ export function AccessSection() {
                         label="Save"
                         confirmLabel="Confirm change"
                         variant="secondary"
+                        triggerSize="sm"
                         disabled={locked || !dirty}
                         summary={
                           <span>
@@ -388,9 +401,8 @@ export function AccessSection() {
       <HandoverPanel entries={entries} onHandover={handoverRecords} />
 
       <p className="text-label leading-5 text-ink-tertiary">
-        Self-modification and removal of the last linked active admin are
-        rejected by the server (409) — this surface never attempts to bypass
-        those guards.
+        You can't change your own entry, or remove or demote the last linked active
+        admin, so nobody can lock the workspace out.
       </p>
     </div>
   );
@@ -421,7 +433,7 @@ function AddEntryForm({
   }
 
   return (
-    <GlassPanel>
+    <GlassPanel level="ruled">
       <SectionHeader
         level={3}
         title="Add an access entry"
@@ -453,16 +465,19 @@ function AddEntryForm({
           )}
         </Field>
         <Field label="Role" id="access-role">
-          {({ id }) => (
-            <SelectField
+          {({ id, labelId }) => (
+            <Combobox
               id={id}
+              labelId={labelId}
+              size="md"
+              searchable={false}
               value={newRole}
-              onChange={(e) => setNewRole(e.target.value as MembershipRole)}
-            >
-              <option value="viewer">viewer</option>
-              <option value="interviewer">interviewer</option>
-              <option value="admin">admin</option>
-            </SelectField>
+              onChange={(value) => setNewRole(value as MembershipRole)}
+              options={ROLE_OPTIONS}
+              placeholder="Role"
+              searchLabel="Role"
+              listLabel="Roles"
+            />
           )}
         </Field>
         <ConfirmButton
@@ -473,7 +488,7 @@ function AddEntryForm({
           summary={
             <span>
               Add <strong>{email.trim() || 'this email'}</strong> as a{' '}
-              <strong>{newRole}</strong>? The person can sign in before
+              <strong>{roleLabel(newRole)}</strong>? The person can sign in before
               creating an account.
             </span>
           }
@@ -528,7 +543,7 @@ function HandoverPanel({
   }
 
   return (
-    <GlassPanel>
+    <GlassPanel level="ruled">
       <SectionHeader
         level={3}
         title="Hand over a person's records"
@@ -549,35 +564,41 @@ function HandoverPanel({
         <>
           <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-start">
             <Field label="From (old login)" id="handover-from">
-              {({ id }) => (
-                <SelectField
+              {({ id, labelId }) => (
+                <Combobox
                   id={id}
+                  labelId={labelId}
+                  size="md"
                   value={fromId}
-                  onChange={(e) => {
-                    setFromId(e.target.value);
-                    if (e.target.value === toId) setToId('');
+                  onChange={(value) => {
+                    setFromId(value);
+                    if (value === toId) setToId('');
                   }}
-                >
-                  <option value="">Choose a person</option>
-                  {sources.map((entry) => (
-                    <option key={entry.id} value={entry.id}>
-                      {entry.email}
-                      {entry.active ? '' : ' (disabled)'}
-                    </option>
-                  ))}
-                </SelectField>
+                  options={sources.map((entry) => ({
+                    value: entry.id,
+                    label: `${entry.email}${entry.active ? '' : ' (disabled)'}`,
+                  }))}
+                  placeholder="Choose a person"
+                  searchLabel="Search people"
+                  listLabel="People"
+                  noun={['person', 'people']}
+                />
               )}
             </Field>
             <Field label="To (new login)" id="handover-to">
-              {({ id }) => (
-                <SelectField id={id} value={toId} onChange={(e) => setToId(e.target.value)}>
-                  <option value="">Choose a person</option>
-                  {targets.map((entry) => (
-                    <option key={entry.id} value={entry.id}>
-                      {entry.email}
-                    </option>
-                  ))}
-                </SelectField>
+              {({ id, labelId }) => (
+                <Combobox
+                  id={id}
+                  labelId={labelId}
+                  size="md"
+                  value={toId}
+                  onChange={setToId}
+                  options={targets.map((entry) => ({ value: entry.id, label: entry.email }))}
+                  placeholder="Choose a person"
+                  searchLabel="Search people"
+                  listLabel="People"
+                  noun={['person', 'people']}
+                />
               )}
             </Field>
             <ConfirmButton

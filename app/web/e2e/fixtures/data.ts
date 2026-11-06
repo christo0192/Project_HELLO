@@ -1178,14 +1178,15 @@ const ADMIN_SESSIONS: AdminSessionRow[] = sessions
   .map((s) => ({ id: s.id, candidate_id: s.candidate_id, role_id: s.role_id, status: s.status, created_at: s.created_at ?? ago(DAY), started_at: s.started_at ?? null, ended_at: s.ended_at ?? null }));
 
 const AUDIT_ACTIONS: Array<[action: string, targetType: string, result: string]> = [
-  ['allowlist.add', 'allowlist_entry', 'success'],
-  ['session.override', 'call_session', 'success'],
-  ['scorecard_metric.update', 'scorecard_metric', 'success'],
-  ['ashby_mapping.pause', 'ashby_mapping', 'success'],
-  ['quota.update', 'quota_policy', 'success'],
-  ['maintenance.toggle', 'system', 'denied'],
-  ['recording.download', 'call_session', 'success'],
-  ['export.csv', 'candidate', 'success'],
+  // The stored vocabulary (`chk_audit_action`), so a label keyed on anything else fails here.
+  ['admin_allowlist_add', 'allowlist_entry', 'success'],
+  ['admin_session_override', 'session', 'success'],
+  ['resource_update', 'scorecard_metric', 'success'],
+  ['ashby_mapping_update', 'ashby_mapping', 'success'],
+  ['quota_override', 'quota_policy', 'success'],
+  ['admin_maintenance_toggle', 'config', 'denied'],
+  ['recording_download', 'call_session', 'success'],
+  ['export_requested', 'candidate', 'success'],
 ];
 
 const AUDIT: AdminAuditRow[] = Array.from({ length: 64 }, (_, i) => {

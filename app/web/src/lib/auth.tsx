@@ -90,6 +90,14 @@ export interface AuthState {
    * recruiter/candidate data before the role resolves.
    */
   isRoleLoading: boolean;
+  /**
+   * True when GET /api/me failed for a reason that is not a denial: a network
+   * blip, or a 5xx. `role` is still null, so nothing renders, but the guard can
+   * say so with a Retry instead of calling it "Access denied".
+   */
+  roleCheckFailed: boolean;
+  /** Re-run the check behind `roleCheckFailed`. */
+  retryRoleCheck: () => Promise<void>;
 
   /** Sign in with email and password. */
   signIn: (email: string, password: string) => Promise<{ error: AuthError | null }>;
@@ -193,6 +201,12 @@ async function getVerifiedTotpFactors(): Promise<MfaFactor[]> {
   }
 }
 
+/** The server's own answer of no, as against a check that never got one. */
+function isDenial(error: unknown): boolean {
+  const status = (error as { status?: number } | null)?.status;
+  return status === 401 || status === 403;
+}
+
 /* ── Provider ──────────────────────────────────────────────────────── */
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -202,6 +216,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
   const [role, setRole] = useState<MembershipRole | null>(null);
   const [isRoleLoading, setIsRoleLoading] = useState(false);
+  const [roleCheckFailed, setRoleCheckFailed] = useState(false);
   const subscriptionRef = useRef<{ unsubscribe: () => void } | null>(null);
 
   // ADR-0011: single factor. A valid session authenticates; the API enforces
@@ -220,13 +235,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const refreshRole = useCallback(async (): Promise<void> => {
     setIsRoleLoading(true);
+    setRoleCheckFailed(false);
     try {
       const me = await api.getMe();
       setRole(me.role);
       roleUserIdRef.current = me.userId;
-    } catch {
+    } catch (error) {
       setRole(null);
       roleUserIdRef.current = null;
+      // Fail closed either way. Only a real answer of no is "denied".
+      setRoleCheckFailed(!isDenial(error));
     } finally {
       setIsRoleLoading(false);
     }
@@ -250,8 +268,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // An explicit denial (allowlist entry revoked or deactivated → 403)
       // fails closed exactly as the gated path does. Only a transport
       // failure keeps the resolved role; the server enforces every call.
-      const status = (error as { status?: number } | null)?.status;
-      if (status === 403 || status === 401) {
+      if (isDenial(error)) {
         setRole(null);
         roleUserIdRef.current = null;
       }
@@ -436,10 +453,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             setRole(me.role);
             roleUserIdRef.current = me.userId;
           }
-        } catch {
+        } catch (error) {
           if (!cancelled) {
             setRole(null);
             roleUserIdRef.current = null;
+            setRoleCheckFailed(!isDenial(error));
           }
         } finally {
           if (!cancelled) setIsRoleLoading(false);
@@ -519,6 +537,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       factors: NO_FACTORS,
       role,
       isRoleLoading,
+      roleCheckFailed,
+      retryRoleCheck: refreshRole,
       signIn,
       signOut,
       signInWithSSO,
@@ -535,6 +555,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isAuthenticated,
       role,
       isRoleLoading,
+      roleCheckFailed,
+      refreshRole,
       signIn,
       signOut,
       signInWithSSO,
