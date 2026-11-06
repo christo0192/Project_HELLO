@@ -21,6 +21,7 @@ import { isEvidenceInsufficient } from './evidence-hold';
 import { RECOMMENDATION_LABELS } from './recommendation-labels';
 import { linkLapsed, r1StatusLabel } from './r1';
 import { r1RecordingStateCopy, turnMediaSec, viewState } from './r1-recording';
+import type { Note } from '../types';
 import type {
   R1RecordingSummary,
   R1ReviewAssessment,
@@ -178,10 +179,19 @@ export function cuedRow(turns: readonly PlacedTurn[], sec: number): number | nul
   return activeTurnAt(turns.map((turn) => turn.startSec), sec);
 }
 
-/** The recording's length; a turn past it stretches the scale rather than fall off the end. */
-export function reviewDurationSec(attempt: R1ReviewAttempt, turns: readonly PlacedTurn[]): number {
-  const recorded = typeof attempt.recording.duration_ms === 'number' ? attempt.recording.duration_ms / 1000 : 0;
-  return Math.max(recorded, ...turns.map((turn) => turn.startSec ?? 0), 0);
+/**
+ * The recording's length; a turn past it stretches the scale rather than fall off the end. With no stored
+ * length the last turn's start is only how far the scale is known to reach, and a note pinned after it was
+ * pinned to playing media, so it reaches further. A stored length needs no help from a note.
+ */
+export function reviewDurationSec(
+  attempt: R1ReviewAttempt,
+  turns: readonly PlacedTurn[],
+  notes: readonly { sec: number | null }[] = [],
+): number {
+  const stored = attempt.recording.duration_ms;
+  const pinned = typeof stored === 'number' ? [] : notes.map((note) => note.sec ?? 0);
+  return Math.max(typeof stored === 'number' ? stored / 1000 : 0, ...turns.map((turn) => turn.startSec ?? 0), ...pinned, 0);
 }
 
 /* ── Phases ───────────────────────────────────────────────────────── */
@@ -361,6 +371,43 @@ export function eventMarks(events: readonly R1ReviewEvent[], sessionId: string, 
     if (event.session_id !== sessionId || !label || !turn) return [];
     return [{ key: `${event.event_type}-${index}`, label, turnIndex: turn.turn_index, row: turn.row, startSec: turn.startSec }];
   });
+}
+
+/* ── Notes ────────────────────────────────────────────────────────── */
+
+/** The API's window on a note's time (0137). */
+const NOTE_MEDIA_MS_MAX = 86_400_000;
+
+export interface AttemptNote extends Note {
+  /** Seconds into the recording. Null: the note names no moment. */
+  sec: number | null;
+}
+
+/**
+ * The notes of one attempt, in the order of the recording, and then the ones with no time. A note on the
+ * round alone belongs to each attempt. The answer runs oldest first, so a tie stays as it was written.
+ */
+export function attemptNotes(notes: readonly Note[], sessionId: string): AttemptNote[] {
+  const place = (note: AttemptNote) => note.sec ?? Number.MAX_SAFE_INTEGER;
+  return notes
+    .filter((note) => (note.session_id ?? sessionId) === sessionId)
+    .map((note) => ({ ...note, sec: typeof note.media_ms === 'number' ? note.media_ms / 1000 : null }))
+    .sort((a, b) => place(a) - place(b));
+}
+
+/** The playhead as a note's time. Rounded down: the clock floors too, so a note prints the second it was added at. */
+export function noteMediaMs(sec: number): number {
+  const ms = Math.floor(sec * 1000);
+  return Number.isFinite(ms) ? Math.min(NOTE_MEDIA_MS_MAX, Math.max(0, ms)) : 0;
+}
+
+/**
+ * Who wrote a note, as far as this page may say. Staff names are not available to it: an allowlist email
+ * never reaches a non-admin, and no other name is held. "You" is known, and a short piece of the opaque id
+ * tells two colleagues apart. Never a guess at a name.
+ */
+export function noteAuthor(authorId: string, reviewerId: string | null): string {
+  return authorId === reviewerId ? 'You' : `Reviewer ${authorId.slice(0, 4)}`;
 }
 
 export interface NeedReveal {

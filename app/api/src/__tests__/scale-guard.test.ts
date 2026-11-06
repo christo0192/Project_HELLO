@@ -826,6 +826,7 @@ const NOT_DRIVEN: Record<string, string> = {
   '/api/interview-rounds/availability': ONE_RECORD,
   '/api/me': ONE_RECORD,
   '/api/notes': ONE_CANDIDATE,
+  '/api/notes/rounds/:roundId': "one round of one candidate: read through that candidate's index, and paged past the row cap",
   '/api/phone/calendar/slots': 'one IST day, capped at 400 live appointments with an explicit occupancy_truncated flag, and no id-list read',
   '/api/phone/engagements/:id': ONE_RECORD,
   '/api/phone/health': COUNTS_ONLY,

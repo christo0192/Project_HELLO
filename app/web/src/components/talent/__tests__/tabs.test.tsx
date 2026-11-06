@@ -189,3 +189,24 @@ describe('a disabled tab', () => {
     expect(overview).toHaveAttribute('aria-selected', 'true');
   });
 });
+
+describe('Tabs inside a tighter box', () => {
+  it('keeps the page spacing unless a host sets its own', () => {
+    render(<Tabs items={items} ariaLabel="Sections" />);
+    expect(screen.getByRole('tabpanel', { name: 'Overview' })).toHaveClass('pt-6');
+  });
+
+  it('takes the host\'s classes for the row and the panels', () => {
+    render(<Tabs items={items} ariaLabel="Sections" listClassName="px-4" panelClassName="relative flex-1" />);
+    expect(screen.getByRole('tablist', { name: 'Sections' })).toHaveClass('px-4');
+    const panel = screen.getByRole('tabpanel', { name: 'Overview' });
+    expect(panel).toHaveClass('relative', 'flex-1');
+    expect(panel).not.toHaveClass('pt-6');
+  });
+
+  it('still hides an inactive panel: a host class must not put it back on screen', () => {
+    const { container } = render(<Tabs items={items} ariaLabel="Sections" panelClassName="relative flex-1" />);
+    const hidden = [...container.querySelectorAll('[role="tabpanel"]')].filter((panel) => panel.hasAttribute('hidden'));
+    expect(hidden).toHaveLength(2);
+  });
+});

@@ -5,7 +5,11 @@
  *   - the candidate's turns are grease-pencil orange, the AI voices warm grey, in a row each;
  *   - a turn is a TICK at its start. A talk BAR needs a stored end time: drawing start-to-next-start
  *     would show every silence as talk, so a turn with no end stays a tick;
- *   - an evidence quote is a numbered ink box, and a logged moment a plain ink tick;
+ *   - an evidence quote is a numbered ink box and a logged moment a plain ink tick, in the Moments row;
+ *   - a reviewer's note is a small ink flag in a Notes row of its own: quotes can fill every lane of
+ *     Moments, and a flag drawn under a box could not be pressed. The row is one lane high however close
+ *     the notes sit, because reviewers pin them close and lanes would push the strip off the first
+ *     screen. Crowded flags overlap: each is still a tab stop, and a row in the Notes list;
  *   - a band is a dashed "pencil" outline with its word: part of the recording is not firm;
  *   - the playhead is an ink line.
  *
@@ -58,7 +62,7 @@ export interface CallStripMarker {
 export interface CallStripMoment {
   key: string;
   sec: number;
-  kind: 'evidence' | 'event';
+  kind: 'evidence' | 'event' | 'note';
   /** The evidence number printed in the box. */
   number?: number;
   /** The button's accessible name, and its tooltip. */
@@ -103,6 +107,19 @@ const LANE_PX = 20;
 const PHASE_LABEL_MIN_PERCENT = 12;
 
 const percent = (value: number) => `${value}%`;
+
+interface MomentRow {
+  label: string;
+  moments: readonly CallStripMoment[];
+  lanes: readonly number[];
+  heightPx: number;
+}
+
+function momentRow(label: string, unsorted: readonly CallStripMoment[], lanesOf: (secs: number[]) => number[]): MomentRow {
+  const moments = [...unsorted].sort((a, b) => a.sec - b.sec);
+  const lanes = lanesOf(moments.map((moment) => moment.sec));
+  return { label, moments, lanes, heightPx: (Math.max(-1, ...lanes) + 1) * LANE_PX };
+}
 
 export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function CallStrip(
   {
@@ -170,12 +187,14 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
     onSeek(Math.min(durationSec, Math.max(0, target)));
   };
 
-  const sortedMoments = useMemo(() => [...moments].sort((a, b) => a.sec - b.sec), [moments]);
-  const lanes = useMemo(
-    () => assignLanes(sortedMoments.map((moment) => moment.sec), durationSec, MOMENT_GAP_PX),
-    [sortedMoments, durationSec],
+  const momentRows = useMemo(
+    () =>
+      [
+        momentRow('Moments', moments.filter((moment) => moment.kind !== 'note'), (secs) => assignLanes(secs, durationSec, MOMENT_GAP_PX)),
+        momentRow('Notes', moments.filter((moment) => moment.kind === 'note'), (secs) => secs.map(() => 0)),
+      ].filter((row) => row.moments.length > 0),
+    [moments, durationSec],
   );
-  const laneCount = lanes.length > 0 ? Math.max(...lanes) + 1 : 0;
   const rowLabel = 'form-label flex items-center truncate';
 
   return (
@@ -196,11 +215,11 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
                 <span className="truncate">{speaker.label}</span>
               </div>
             ))}
-          {laneCount > 0 && (
-            <div className={rowLabel} style={{ height: laneCount * LANE_PX }}>
-              Moments
+          {momentRows.map((row) => (
+            <div key={row.label} className={rowLabel} style={{ height: row.heightPx }}>
+              {row.label}
             </div>
-          )}
+          ))}
           {bands.length > 0 && <div className={cx(rowLabel, 'h-5')}>Recording</div>}
           {markers.length > 0 && <div className={cx(rowLabel, 'h-5')}>{markersLabel}</div>}
           {/* In the axis row's empty cell: the toggle costs the strip no height of its own. */}
@@ -281,33 +300,40 @@ export const CallStrip = forwardRef<CallStripHandle, CallStripProps>(function Ca
               </div>
             ))}
 
-          {laneCount > 0 && (
-            <div className="pointer-events-none relative" style={{ height: laneCount * LANE_PX }}>
-              {sortedMoments.map((moment, index) => (
+          {momentRows.map((row) => (
+            <div key={row.label} data-moment-row={row.label} className="pointer-events-none relative" style={{ height: row.heightPx }}>
+              {row.moments.map((moment, index) => (
                 <button
                   key={moment.key}
                   type="button"
                   aria-label={moment.label}
                   title={moment.label}
                   onClick={() => onMoment?.(moment.key)}
-                  style={{ left: percent(along(moment.sec, durationSec)), top: lanes[index] * LANE_PX + 2 }}
+                  style={{ left: percent(along(moment.sec, durationSec)), top: row.lanes[index] * LANE_PX + 2 }}
                   className={cx(
                     'pointer-events-auto absolute flex h-4 -translate-x-1/2 items-center justify-center rounded-evidence font-mono text-meta leading-none text-ink',
                     'focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--ink)]',
                     moment.kind === 'evidence'
                       ? 'min-w-4 border border-ink bg-surface px-0.5 hover:bg-ink hover:text-surface'
                       : 'w-3 hover:bg-surface-secondary',
+                    // Flags can overlap: the one under the pointer or the focus comes to the front.
+                    moment.kind === 'note' && 'hover:z-10 focus-visible:z-10',
                   )}
                 >
                   {moment.kind === 'evidence' ? (
                     moment.number
+                  ) : moment.kind === 'note' ? (
+                    <span data-note-flag="" aria-hidden="true" className="relative h-2.5 w-2">
+                      <span data-mark="" className="absolute inset-y-0 left-0 w-px bg-ink" />
+                      <span data-mark="" className="absolute left-0 top-0 h-1.5 w-2 bg-ink" />
+                    </span>
                   ) : (
                     <span data-mark="" aria-hidden="true" className="h-2.5 w-px bg-ink" />
                   )}
                 </button>
               ))}
             </div>
-          )}
+          ))}
 
           {bands.length > 0 && (
             <div className="pointer-events-none relative h-5">

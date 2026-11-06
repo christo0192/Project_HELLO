@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   R1_INTERVIEWER_LABEL,
+  attemptNotes,
   cueSecFrom,
   cuedRow,
   eventMarks,
@@ -9,6 +10,8 @@ import {
   learnerLabel,
   neededReveals,
   notScoredSentence,
+  noteAuthor,
+  noteMediaMs,
   phaseSegments,
   phoneResultWords,
   placeTurns,
@@ -231,6 +234,16 @@ describe('the length of a call', () => {
 
   it('is nothing to draw when neither a length nor a timed turn exists', () => {
     expect(reviewDurationSec(attempt({ recording: recording({ duration_ms: null }) }), [])).toBe(0);
+  });
+
+  it('reaches a note past the last turn when no length is stored: the note was pinned to playing media', () => {
+    const unknown = attempt({ recording: recording({ duration_ms: null }) });
+    expect(reviewDurationSec(unknown, [placed(400, 'closing')], [{ sec: 430 }, { sec: null }])).toBe(430);
+    expect(reviewDurationSec(unknown, [placed(400, 'closing')], [{ sec: 100 }])).toBe(400);
+  });
+
+  it('takes no length from a note when one is stored', () => {
+    expect(reviewDurationSec(attempt(), [placed(10, 'opening')], [{ sec: 9000 }])).toBe(600);
   });
 });
 
@@ -603,6 +616,55 @@ describe('the band on the strip', () => {
 
   it('has none for a full recording', () => {
     expect(recordingBands(recording(), 600)).toEqual([]);
+  });
+});
+
+describe('notes', () => {
+  const note = (id: string, session: string | null, media: number | null, created = '2026-11-02T10:00:00Z') => ({
+    id, candidate_id: 'c1', author_id: 'u1', note: 'Words.', created_at: created, round_id: 'r1', session_id: session, media_ms: media,
+  });
+
+  it('keeps this attempt\'s notes, and a note on the whole round, and no other attempt\'s', () => {
+    const notes = [note('mine', 's1', 5000), note('theirs', 's2', 5000), note('round', null, null)];
+    expect(attemptNotes(notes, 's1').map((item) => item.id)).toEqual(['mine', 'round']);
+  });
+
+  it('places a note in seconds, and zero is a place', () => {
+    expect(attemptNotes([note('a', 's1', 462_500)], 's1')[0].sec).toBe(462.5);
+    expect(attemptNotes([note('a', 's1', 0)], 's1')[0].sec).toBe(0);
+    expect(attemptNotes([note('a', 's1', null)], 's1')[0].sec).toBeNull();
+  });
+
+  it('runs in the order of the recording, ties as they were written, untimed notes last', () => {
+    const notes = [note('late', 's1', 9000), note('none', 's1', null), note('early', 's1', 1000), note('tie', 's1', 9000)];
+    expect(attemptNotes(notes, 's1').map((item) => item.id)).toEqual(['early', 'late', 'tie', 'none']);
+  });
+
+  it('reads a note from before 0137, which has no moment fields at all, as having no moment', () => {
+    const old = { id: 'old', candidate_id: 'c1', author_id: 'u1', note: 'Words.', created_at: '2026-11-02T10:00:00Z' };
+    expect(attemptNotes([old], 's1')).toEqual([{ ...old, sec: null }]);
+  });
+
+  it('pins the second the clock prints: rounding up would move a note to the next one', () => {
+    expect(noteMediaMs(462)).toBe(462_000);
+    expect(noteMediaMs(462.9996)).toBe(462_999);
+    expect(noteMediaMs(0)).toBe(0);
+  });
+
+  it('never sends a time the API would refuse', () => {
+    expect(noteMediaMs(-1)).toBe(0);
+    expect(noteMediaMs(Number.NaN)).toBe(0);
+    expect(noteMediaMs(90_000)).toBe(86_400_000);
+  });
+
+  it('says You to the person who wrote it', () => {
+    expect(noteAuthor('5f3a0000-1111', '5f3a0000-1111')).toBe('You');
+  });
+
+  it('tells two colleagues apart by a short id, and gives away nothing else', () => {
+    expect(noteAuthor('5f3a0000-1111', 'other')).toBe('Reviewer 5f3a');
+    expect(noteAuthor('9c0d0000-1111', 'other')).toBe('Reviewer 9c0d');
+    expect(noteAuthor('5f3a0000-1111', null)).toBe('Reviewer 5f3a');
   });
 });
 

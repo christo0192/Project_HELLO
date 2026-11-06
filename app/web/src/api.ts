@@ -68,6 +68,7 @@ import type {
   HealthResult,
   MeResponse,
   Note,
+  NoteAnchor,
   NoteListResponse,
   NotificationIntentListResponse,
   PublicStatus,
@@ -486,10 +487,12 @@ export const api = {
     request<NoteListResponse>(
       `/api/notes?candidate_id=${encodeURIComponent(candidateId)}`,
     ),
-  addNote: (candidateId: string, note: string) =>
+  listRoundNotes: (roundId: string) =>
+    request<NoteListResponse>(`/api/notes/rounds/${encodeURIComponent(roundId)}`),
+  addNote: (candidateId: string, note: string, anchor?: NoteAnchor) =>
     request<Note>('/api/notes', {
       method: 'POST',
-      body: JSON.stringify({ candidate_id: candidateId, note }),
+      body: JSON.stringify({ candidate_id: candidateId, note, ...anchor }),
     }),
   updateCandidateStatus: (candidateId: string, status: string) =>
     request<StatusTransitionResponse>(`/api/notes/${candidateId}/status`, {

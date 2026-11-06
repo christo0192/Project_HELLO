@@ -523,6 +523,7 @@ describe('type', () => {
     expect(users.sort()).toEqual([
       'src/components/r1-review/OverviewPanel.tsx',
       'src/components/r1-review/PlayerControls.tsx',
+      'src/components/r1-review/ReviewNotes.tsx',
       'src/components/r1-review/ReviewTranscript.tsx',
       'src/components/recording/CallStrip.tsx',
       'src/components/recording/ReviewCallStrip.tsx',
