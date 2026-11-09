@@ -335,8 +335,12 @@ export async function runClaimedAshbyOperation(
         // A cached definition can be up to a few minutes old. Rather than write
         // an irretractable card that drops a metric the recruiter has just
         // added a field for, re-read the definition uncached and re-bind before
-        // accepting ANY unmatched metric.
-        if (autobind.unmatched.length > 0) {
+        // accepting ANY unmatched metric. The same holds for the Overall
+        // Recommendation guard below (M029 D10): its failure is permanent, so
+        // it is never decided on a cached read. An admin who fixes the options
+        // in Ashby and clicks Retry straight away must not fail again on the
+        // old form and burn another attempt.
+        if (autobind.unmatched.length > 0 || !overallOptionsMatch(HELLO_CHRISTY_SCORECARD_BINDING, form)) {
           const fresh = await readForm(true);
           if (!fresh || !fresh.schemaAvailable) return deferFormRead();
           form = fresh;
@@ -351,8 +355,9 @@ export async function runClaimedAshbyOperation(
         // M029 D10: HELLO writes the verdict as the option value "1".."4". If
         // the live Overall Recommendation does not offer exactly those, the
         // value would be rejected or mean something else on a card that cannot
-        // be retracted. Permanent: retrying cannot change the form; an admin
-        // fixes it (the binding preview lists the field's options).
+        // be retracted. Checked on an UNCACHED read (above), so it is
+        // permanent: retrying cannot change the form; an admin fixes it (the
+        // binding preview lists the field's options) and then retries.
         if (!overallOptionsMatch(HELLO_CHRISTY_SCORECARD_BINDING, form)) {
           const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'overall_options_mismatch', false);
           emit('blocked', 'overall_options_mismatch');

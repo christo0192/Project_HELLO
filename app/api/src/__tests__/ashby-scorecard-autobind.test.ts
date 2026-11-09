@@ -526,28 +526,63 @@ describe('worker — a v2 scorecard auto-binds by name against the live form def
   // HELLO sends the verdict as the option value "1".."4" on a card that cannot
   // be retracted. A form whose Overall Recommendation offers anything else
   // would take a wrong value, or reject it, for every candidate.
-  function withOverallOptions(options: ProbeFormField['options']): ProbeFeedbackForm {
+  function withOverallOptions(options: ProbeFormField['options'], base: ProbeFeedbackForm = LIVE_FORM): ProbeFeedbackForm {
     return {
-      ...LIVE_FORM,
-      sections: LIVE_FORM.sections.map((s) => ({
+      ...base,
+      sections: base.sections.map((s) => ({
         ...s,
         fields: s.fields.map((f) => (f.path === PATHS.overall ? { ...f, options } : f)),
       })),
     };
   }
 
-  async function runWithForm(liveForm: ProbeFeedbackForm) {
+  type FormReader = (formDefinitionId: string, fresh?: boolean) => Promise<ProbeFeedbackForm | null>;
+
+  async function runWithReader(readFormDefinition: FormReader) {
     const submit = vi.fn(async () => ({}));
     const events: string[] = [];
     const fx = workerFixture(v2Source());
     const out = await runClaimedAshbyOperation({
       stores: fx.stores, materialization: {} as never,
-      scorecard: { submit, dashboardOrigin: ORIGIN, readFormDefinition: async () => liveForm },
+      scorecard: { submit, dashboardOrigin: ORIGIN, readFormDefinition },
       resolveMappingForLink: async () => null, reissuePathFor: () => '/x',
       email: { providerApproved: false, domainVerified: false }, owner: 'w1', leaseSeconds: 30,
       onEvent: (e) => events.push(`${e.kind}:${e.code ?? ''}`),
     });
     return { out, submit, events, failures: fx.failures, defers: fx.defers };
+  }
+
+  async function runWithForm(liveForm: ProbeFeedbackForm) {
+    return runWithReader(async () => liveForm);
+  }
+
+  /**
+   * LIVE_FORM plus a `Stability` field, so EVERY metric of v2Source binds: the
+   * unmatched-metric re-read never fires, and only the overall guard can ask
+   * for an uncached read.
+   */
+  const FULL_FORM: ProbeFeedbackForm = {
+    ...LIVE_FORM,
+    sections: LIVE_FORM.sections.map((s) => ({
+      ...s,
+      fields: [...s.fields, field({ id: 'f-st', title: 'Stability', path: 'p-st', options: FOUR_POINT })],
+    })),
+  };
+
+  /** The official feedbackFormDefinition.info envelope for a form fixture. */
+  function definitionPayload(f: ProbeFeedbackForm) {
+    return {
+      id: f.formDefinitionId, title: f.title, isArchived: false,
+      formDefinition: {
+        sections: f.sections.map((s) => ({
+          id: s.id, title: s.title,
+          fields: s.fields.map((x) => ({
+            isRequired: x.required ?? false,
+            field: { id: x.id, type: x.type, path: x.path, title: x.title, selectableValues: x.options },
+          })),
+        })),
+      },
+    };
   }
 
   it('D10: fails permanently with overall_options_mismatch when the overall field does not offer exactly "1"-"4"', async () => {
@@ -593,6 +628,86 @@ describe('worker — a v2 scorecard auto-binds by name against the live form def
       expect(submit).toHaveBeenCalledTimes(1);
       // The labels are not read: whether "4" means the top answer on the live
       // form is confirmed by a person before merge (D8), not by this guard.
+    }
+  });
+
+  // The guard's failure is permanent, so it must never be decided on a cached
+  // read: an admin who fixes the form in Ashby and clicks Retry within the
+  // cache TTL would otherwise fail again on the old form and burn an attempt.
+  it('D10: a cached bad form is re-read uncached before failing; the fixed form is written', async () => {
+    const stale = withOverallOptions(FIVE_POINT, FULL_FORM);
+    const readFormDefinition = vi.fn<FormReader>(async (_id, fresh) => (fresh ? FULL_FORM : stale));
+    const { out, submit, failures, defers } = await runWithReader(readFormDefinition);
+    expect(readFormDefinition.mock.calls).toEqual([[FORM_ID, false], [FORM_ID, true]]);
+    expect(failures).toEqual([]);
+    expect(defers).toEqual([]);
+    expect(out).toMatchObject({ committed: true, code: 'scorecard_submitted' });
+    expect(submit).toHaveBeenCalledTimes(1);
+  });
+
+  it('D10: fails permanently only when the uncached read is still bad, and defers when it is unavailable', async () => {
+    const bad = withOverallOptions(FIVE_POINT, FULL_FORM);
+    const stillBad = vi.fn<FormReader>(async () => bad);
+    const r1 = await runWithReader(stillBad);
+    expect(stillBad.mock.calls).toEqual([[FORM_ID, false], [FORM_ID, true]]);
+    expect(r1.failures).toEqual([{ reason: 'overall_options_mismatch', retryable: false }]);
+    expect(r1.submit).not.toHaveBeenCalled();
+
+    for (const fresh of [
+      async () => { throw new Error('503'); },
+      async () => null,
+      async () => ({ ...FULL_FORM, schemaAvailable: false, sections: [] }),
+    ]) {
+      const reader = vi.fn<FormReader>(async (_id, isFresh) => (isFresh ? fresh() : bad));
+      const r2 = await runWithReader(reader);
+      // Not knowing the live options is a WAIT, never a permanent failure.
+      expect(r2.defers).toEqual(['form_schema_unavailable']);
+      expect(r2.failures).toEqual([]);
+      expect(r2.submit).not.toHaveBeenCalled();
+    }
+  });
+
+  it('D10: a good form costs no extra read — the guard alone never asks for an uncached one', async () => {
+    const readFormDefinition = vi.fn<FormReader>(async () => FULL_FORM);
+    const { out } = await runWithReader(readFormDefinition);
+    expect(out).toMatchObject({ committed: true, code: 'scorecard_submitted' });
+    expect(readFormDefinition.mock.calls).toEqual([[FORM_ID, false]]);
+  });
+
+  it('D10: with the real 5-minute cache, Retry right after the admin fixes the options writes the card', async () => {
+    __resetFormDefinitionCacheForTest();
+    try {
+      let live = withOverallOptions(FIVE_POINT, FULL_FORM);
+      const info = vi.fn(async () => ({ results: definitionPayload(live) }));
+      const reader = { feedbackFormDefinitionInfo: info } as unknown as FormDefinitionReader;
+      const now = 1_000_000;
+      const readFormDefinition = vi.fn<FormReader>((id, fresh) => readFormDefinitionCached(id, reader, () => now, fresh === true));
+
+      const first = await runWithReader(readFormDefinition);
+      expect(first.failures).toEqual([{ reason: 'overall_options_mismatch', retryable: false }]);
+
+      // The admin fixes the Overall Recommendation in Ashby and clicks Retry
+      // at once, well inside FORM_DEFINITION_CACHE_MS: the cache still holds
+      // the five-point form.
+      live = withOverallOptions(FOUR_POINT, FULL_FORM);
+      readFormDefinition.mockClear();
+      info.mockClear();
+      const retry = await runWithReader(readFormDefinition);
+      expect(retry.failures).toEqual([]);
+      expect(retry.out).toMatchObject({ committed: true, code: 'scorecard_submitted' });
+      expect(retry.submit).toHaveBeenCalledTimes(1);
+      expect(readFormDefinition.mock.calls).toEqual([[FORM_ID, false], [FORM_ID, true]]);
+      expect(info).toHaveBeenCalledTimes(1); // the cache served the stale form; one uncached provider read
+
+      // The fresh read refreshed the cache, so the next card reads it cached.
+      readFormDefinition.mockClear();
+      info.mockClear();
+      const next = await runWithReader(readFormDefinition);
+      expect(next.out).toMatchObject({ committed: true, code: 'scorecard_submitted' });
+      expect(readFormDefinition.mock.calls).toEqual([[FORM_ID, false]]);
+      expect(info).not.toHaveBeenCalled();
+    } finally {
+      __resetFormDefinitionCacheForTest();
     }
   });
 
