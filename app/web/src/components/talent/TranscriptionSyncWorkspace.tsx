@@ -73,6 +73,7 @@
 
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { api, ApiError } from '../../api';
 import { readScorecardAssessmentV2, isAssessmentV2 } from '../../types';
 import type {
@@ -88,6 +89,7 @@ import type {
 } from '../../types';
 import { Combobox } from '../design/Combobox';
 import type { ComboboxOption } from '../design/Combobox';
+import { cx } from '../design/cx';
 import { Skeleton, SkeletonText } from '../design/Skeleton';
 import { CandidateButton, SurfaceCard } from '../design/candidate';
 import { figureToneClass, ratingFamily } from '../design/tones';
@@ -99,6 +101,7 @@ import {
 import { CandidateScorecardV2 } from './CandidateScorecardV2';
 import { ashbyLifecycleLabel } from './AshbyWorkflowCard';
 import { EvidenceHoldNotice } from './EvidenceHoldNotice';
+import { HeaderRatings, HeaderRatingsReserve, reviewFloorClass, showsHeaderRatings } from './HeaderRatings';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle, RecordingPlayerStatus } from './RecordingPlayer';
 import { FromTheResume, ReviewScorecard, metricDisplayName, weakestMetric } from './ReviewScorecard';
@@ -224,6 +227,12 @@ export interface TranscriptionSyncWorkspaceProps {
   ashbyWorkflow?: AshbyCandidateWorkflow | null;
   /** The parsed resume, for "From the resume" under the rubric. */
   resumeFacts?: CandidateResumeFacts | null;
+  /**
+   * Where the page's header keeps a place for the rating summary (`HeaderRatings`). This workspace holds
+   * the scorecard, below the header in the tree, so the summary is portalled up with no second read. A
+   * host that offers none, as the scoped Ashby page does, shows none.
+   */
+  ratingsSlot?: HTMLElement | null;
 }
 
 /** How the transcript names the candidate: their first name, or the plain word. */
@@ -284,6 +293,7 @@ export function TranscriptionSyncWorkspace({
   roleTitle,
   ashbyWorkflow,
   resumeFacts = null,
+  ratingsSlot = null,
 }: TranscriptionSyncWorkspaceProps) {
   const selectableSessions = useMemo(
     () => sessions.filter((s) => s.status === 'completed' && s.interview_round_id == null),
@@ -688,6 +698,20 @@ export function TranscriptionSyncWorkspace({
     return { ...card, metrics: card.metrics.map((m, i) => ({ ...m, name: metricDisplayName(m, i) })) };
   }, [blocked, scorecardAssessment]);
 
+  // The header's rating summary, from the panel's own card and so behind its every rule. Another call's
+  // scorecard is named as that in the panel, and the header has nowhere to say so, so it prints nothing.
+  // A picked session's first render still holds the last one's row until its read starts: that is not
+  // this session's either, however briefly.
+  const ownScorecard =
+    !otherCallScorecard && (sessionAssessment === null || settledSessionId === selectedSessionId);
+  const headerCard = ownScorecard && reviewCard && showsHeaderRatings(reviewCard) ? reviewCard : null;
+  // What the candidate payload says is coming, for the height alone: nothing is printed from it.
+  const expectedCard = useMemo(() => {
+    if (blocked || !ownAssessment) return null;
+    const card = readRoleScorecard(ownAssessment);
+    return card && showsHeaderRatings(card) ? card : null;
+  }, [blocked, ownAssessment]);
+
   // A quote is placed only on the session it scored: a fallback row is another call's words.
   const placesQuotes = sessionAssessment !== null;
   const evidence = useMemo(
@@ -860,6 +884,37 @@ export function TranscriptionSyncWorkspace({
       return next;
     });
   }, []);
+
+  // A press in the header's summary. It opens the row the row's own toggle opens and stays open on a
+  // second press, because a reader asking to see a row never wants it shut. It cues nothing: no audio, no
+  // link minted, no moment pressed.
+  const [ratingPress, setRatingPress] = useState<{ metricId: string } | null>(null);
+  const handleOpenRating = useCallback((metricId: string) => {
+    setOpenMetrics((open) => (open.has(metricId) ? open : new Set(open).add(metricId)));
+    setRatingPress({ metricId });
+  }, []);
+
+  // In the commit, with the row already open. It moves only a row that is out of view, and the pane scrolls
+  // only at 1180px and up: below that the panes stack and the page does. The app bar sticks over the top of
+  // the page below `lg`, so a row under it is out of view too: the row's own scroll margin says how far down
+  // view starts, and it is what `scrollIntoView` keeps clear.
+  useLayoutEffect(() => {
+    const pane = reasoningPaneRef.current;
+    if (!ratingPress || !pane) return;
+    const row = [...pane.querySelectorAll<HTMLElement>('[data-rubric-row]')].find(
+      (candidate) => candidate.getAttribute('data-rubric-row') === ratingPress.metricId,
+    );
+    if (!row) return;
+    const rowBox = row.getBoundingClientRect();
+    if (pane.scrollHeight > pane.clientHeight) {
+      const paneBox = pane.getBoundingClientRect();
+      if (rowBox.top < paneBox.top || rowBox.bottom > paneBox.bottom) pane.scrollTop += rowBox.top - paneBox.top - 16;
+    } else {
+      const clearance = Number.parseFloat(getComputedStyle(row).scrollMarginTop) || 0;
+      if (rowBox.top < clearance || rowBox.bottom > window.innerHeight) row.scrollIntoView?.({ block: 'start' });
+    }
+    (row.querySelector<HTMLElement>('h4 button') ?? row).focus({ preventScroll: true });
+  }, [ratingPress]);
 
   // Review opens cued on the weakest metric's first quote, as the sheet was left: nothing plays and
   // nothing is minted. In the commit, so the first paint is already there, and only once per session.
@@ -1049,12 +1104,15 @@ export function TranscriptionSyncWorkspace({
     observer?.observe(root);
     const sheet = root.closest('main');
     if (sheet) observer?.observe(sheet);
+    // The header above can change height, which moves this box without resizing it: the summary takes a
+    // line of its own, or the facts beside the name wrap.
+    if (ratingsSlot?.parentElement) observer?.observe(ratingsSlot.parentElement);
     return () => {
       window.removeEventListener('resize', measure);
       observer?.disconnect();
     };
     // `active`: the header above changes height with the tab.
-  }, [selectableSessions.length, active, bringRowIntoView]);
+  }, [selectableSessions.length, active, bringRowIntoView, ratingsSlot]);
 
   const turnCount = transcript.length;
 
@@ -1466,14 +1524,37 @@ export function TranscriptionSyncWorkspace({
     </div>
   );
 
+  // Only on the Phone screening tab: every panel stays mounted, and Profile has `HeaderScore`. While the
+  // panel holds its skeleton the place is kept, blank, so the summary arriving does not move the panes.
+  const reservedCard = !detailReady && !transcriptError && !permissionDenied ? expectedCard : null;
+  const summaryCard = ratingsSlot && active ? (headerCard ?? reservedCard) : null;
+  const headerRatings =
+    ratingsSlot && summaryCard
+      ? createPortal(
+          headerCard ? (
+            <HeaderRatings scorecard={headerCard} held={scorecardHeld} onOpen={handleOpenRating} />
+          ) : (
+            <HeaderRatingsReserve
+              metrics={summaryCard.metrics.length}
+              provisional={summaryCard.status === 'incomplete_evidence'}
+            />
+          ),
+          ratingsSlot,
+        )
+      : null;
+
   return (
     <div
       ref={rootRef}
       data-review-workspace=""
       // The page does not scroll at this width; the panes do. Measured from the top of this box, since
       // the header above it wraps with the candidate's facts. Below 1180px the panes stack.
-      className="-mx-4 flex flex-col sm:-mx-6 min-[1180px]:-mb-6 min-[1180px]:-mt-6 min-[1180px]:h-[calc(100dvh-var(--review-top,0px)-0.5625rem)] min-[1180px]:min-h-[34rem]"
+      className={cx(
+        '-mx-4 flex flex-col sm:-mx-6 min-[1180px]:-mb-6 min-[1180px]:-mt-6 min-[1180px]:h-[calc(100dvh-var(--review-top,0px)-0.5625rem)]',
+        reviewFloorClass(summaryCard?.metrics.length ?? 0),
+      )}
     >
+      {headerRatings}
       {logHeader}
       {tape}
       <nav aria-label="Skip to a pane" className="contents">

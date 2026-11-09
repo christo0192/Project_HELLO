@@ -1772,7 +1772,7 @@ export interface Dataset {
     bindingPreview: AshbyScorecardBindingPreviewResponse;
   };
   /**
-   * R1-REC. `rounds` are the R1 candidate's (every other candidate has none). `mints` queues the
+   * R1-REC. `rounds` are the R1 candidate's, and `otherRounds` any other's by id. `mints` queues the
    * link fields (`url`, `content_type`, ...) the recording mint answers with for a session, one
    * answer per call and the last one repeating (`null` = the playable default); with none queued
    * the mint serves the playable default (`api-router.ts`). Change a round's `recording` to reach
@@ -1780,6 +1780,7 @@ export interface Dataset {
    */
   r1: {
     rounds: R1Round[];
+    otherRounds: Record<string, R1Round[]>;
     queue: R1QueueRound[];
     /** False: this server does not run R1 (`r1_deployed` on the queue's answer). */
     deployed: boolean;
@@ -1811,7 +1812,7 @@ export function createDataset(): Dataset {
     quotas: QUOTAS,
     appointments: APPOINTMENTS,
     ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW },
-    r1: { rounds: R1_ROUNDS, queue: R1_QUEUE, deployed: true, mints: {}, review: R1_REVIEW },
+    r1: { rounds: R1_ROUNDS, otherRounds: {}, queue: R1_QUEUE, deployed: true, mints: {}, review: R1_REVIEW },
   });
   return {
     ...d,
@@ -1825,5 +1826,170 @@ export function createDataset(): Dataset {
     phoneCycles,
     phoneAttempts,
     ashbyWorkflowFor: (candidateId) => (candidateId === STAR_CANDIDATE_ID ? structuredClone(STAR_ASHBY_WORKFLOW) : null),
+  };
+}
+
+/* ── A busy Review page ───────────────────────────────────────────────── */
+
+const BUSY_R1_ROUND_ID = uid('9', 951);
+
+export interface BusyReviewOptions {
+  /** The address in the name row. A candidate with none is a real and rarer case. */
+  email?: string | null;
+  /** In place of the star's name. */
+  name?: string;
+  /** The same page with no scorecard: the height the header has without a summary. */
+  noScorecard?: boolean;
+  /** How many metrics the rubric has, past the six a real role has. The API allows 20. */
+  metrics?: number;
+  /** A scored R1 round as well, so the facts carry the R1 result line. Its widest words, "Borderline". */
+  r1?: boolean;
+  /** Keep the Ashby link no API sends yet, so the row holds its widest actions. */
+  ashbyLink?: boolean;
+  /** A status that is not settled, so the phone facts print a detail line beside it and the facts wrap. */
+  statusDetail?: boolean;
+}
+
+/**
+ * The page real roles get and the star's short mock does not: six metrics, one with a long name, a
+ * provisional score, five flags, three quotes on the weakest metric and a dropped call. As a real row
+ * does, it says which session it scored. Synthetic throughout.
+ */
+export function busyReview(db: Dataset, { email = null, name, noScorecard = false, metrics = 6, r1 = false, ashbyLink = false, statusDetail = false }: BusyReviewOptions = {}): void {
+  const detail = db.sessionDetails[V2_SESSION_ID];
+  const rubric: Array<[id: string, name: string, weightBps: number, score: 2 | 3 | null, quotes: string[]]> = [
+    ['busy-communication', 'Communication', 6000, 2, ['We moved the hot path behind a queue', 'I usually start with EXPLAIN ANALYZE', 'Two late evenings a week is fine for me']],
+    ['busy-compensation', 'Compensation fit', 1000, null, []],
+    ['busy-profile', 'Profile relevance', 1000, 3, ['We moved the hot path behind a queue']],
+    ['busy-stability', 'Stability', 1000, 2, ['see a product through several years']],
+    ['busy-shift', 'Shift fitment', 500, 3, ['Two late evenings a week is fine for me']],
+    ['busy-office', 'Work from office fitment', 500, 3, ['Two late evenings a week is fine for me']],
+    ...Array.from({ length: Math.max(0, metrics - 6) }, (_, index): [string, string, number, 3, string[]] => [`busy-extra-${index + 1}`, `Sample metric ${index + 1}`, 0, 3, []]),
+  ];
+  const metricResults = rubric.map(([id, metric, weightBps, score, evidenceRefs]) => ({
+    configMetricId: id,
+    score,
+    evidenceStatus: score === null ? ('insufficient_evidence' as const) : ('scored' as const),
+    rationale:
+      score === null
+        ? 'The call ran out of time before this topic was covered.'
+        : `${metric}: sample reasoning, long enough to wrap the way real reasoning wraps when it is shown in full.`,
+    evidenceRefs,
+    metric: { id, name: metric, weightBps },
+  }));
+  const assessment = {
+    id: uid('4', 950),
+    session_id: V2_SESSION_ID,
+    schema_version: 2,
+    scoring_status: 'incomplete_evidence',
+    weighted_score_5: 2.4,
+    score_scale_max: 4,
+    overall_score: 43,
+    recommendation: 'reject',
+    summary: 'Sample summary.',
+    role_fit: {
+      score: 0,
+      matched_skills: [],
+      gaps: [],
+      notes: '',
+      red_flags: [
+        'Sample flag, invented for this fixture',
+        'Sample flag two, invented for this fixture',
+        'Sample flag three, invented for this fixture',
+        'Sample flag four, invented for this fixture, and long enough to wrap onto a second line of the pane',
+        'Sample flag five, invented for this fixture',
+      ],
+    },
+    metric_results: metricResults.map(({ metric: _metric, ...rest }) => rest),
+    raw: {
+      schemaVersion: 2,
+      revision: 1,
+      status: 'incomplete_evidence',
+      scoreScaleMax: 4,
+      metricResults,
+      weightedScore5: 2.4,
+      overallScore: 43,
+      recommendation: 'reject',
+    },
+  } as unknown as Assessment;
+
+  // The line drops halfway, and the call picks up 40 seconds later.
+  const answeredMs = Date.parse(detail.session.started_at!);
+  const turns = detail.transcript;
+  const splitSec = (turns[Math.floor(turns.length / 2)].start_offset_sec ?? 0) - 0.5;
+  const lastSec = turns[turns.length - 1].start_offset_sec ?? 0;
+  const firstCallSec = Math.round(splitSec + 8);
+  const secondAnsweredMs = answeredMs + (firstCallSec + 40) * 1000;
+  const secondCallSec = Math.round(lastSec - splitSec + 12);
+  const placed = turns.map((turn) => {
+    const offset = turn.start_offset_sec ?? 0;
+    const at = offset <= splitSec ? answeredMs + offset * 1000 : secondAnsweredMs + (offset - splitSec) * 1000;
+    return { ...turn, start_offset_sec: null, started_at_ms: Math.round(at) };
+  });
+  const recorded = { recorded_total_sec: firstCallSec + secondCallSec, recorded_legs: 2, recording_egress_started_at_ms: null };
+  const call = (seq: number, fromMs: number, seconds: number, outcome: string | null): CandidatePhoneAttempt => ({
+    id: uid('7', 950 + seq),
+    attempt_seq: seq,
+    admitted_at: iso(fromMs - 10_000),
+    answered_at: iso(fromMs),
+    ended_at: iso(fromMs + seconds * 1000),
+    state: 'completed',
+    abandon_reason: null,
+    outcome_class: outcome,
+    duration_sec: seconds,
+    connected_from: iso(fromMs),
+    connected_to: iso(fromMs + seconds * 1000),
+    connected_to_source: 'observed',
+    connected_sec: seconds,
+    recorded_sec: seconds,
+    recorded_sec_estimated: false,
+    recording_started_at_ms: fromMs,
+    tail_may_be_missing: false,
+    session_ref: V2_SESSION_ID,
+    recording: { state: 'ready' },
+    consent_stage: 'after_consent',
+    transcript: { href: `/sessions/${V2_SESSION_ID}`, scope: 'session', kind: 'session', shared_session: true },
+  });
+
+  db.sessionDetails[V2_SESSION_ID] = {
+    session: { ...detail.session, ...recorded },
+    transcript: placed,
+    assessment: noScorecard ? null : assessment,
+  };
+
+  const readDetail = db.candidateDetail;
+  db.candidateDetail = (id) => {
+    const found = readDetail(id);
+    if (!found || id !== STAR_CANDIDATE_ID) return found;
+    found.candidate.email = email;
+    // The chip a phone-parsed candidate has, so the name row is as full as a real one.
+    found.candidate.intake_type = 'phone_parsing';
+    if (name) found.candidate.name = name;
+    if (statusDetail) {
+      found.candidate.status = 'screening';
+      found.candidate.phone_state = 'completed';
+      found.candidate.dial_count = 3;
+      found.candidate.last_dialed_at = ago(4 * HOUR);
+    }
+    found.assessments = noScorecard ? [] : [structuredClone(assessment)];
+    found.sessions = found.sessions.map((session) => (session.id === V2_SESSION_ID ? { ...session, ...recorded } : session));
+    if (r1) found.sessions = [...found.sessions, { ...found.sessions[0], id: uid('3', 951), interview_round_id: BUSY_R1_ROUND_ID }];
+    return found;
+  };
+  db.r1.otherRounds[STAR_CANDIDATE_ID] = r1
+    ? [{ ...db.r1.rounds[0], id: BUSY_R1_ROUND_ID, recommendation: 'hold', overall: 58, attempts: [] }]
+    : [];
+
+  const readAttempts = db.phoneAttempts;
+  db.phoneAttempts = (candidate) =>
+    candidate.id === STAR_CANDIDATE_ID
+      ? [call(2, secondAnsweredMs, secondCallSec, 'answered'), call(1, answeredMs, firstCallSec, 'disconnected')]
+      : readAttempts(candidate);
+
+  // No API sends a link yet, so the row has what production's has: Export report alone.
+  const readWorkflow = db.ashbyWorkflowFor;
+  db.ashbyWorkflowFor = (id) => {
+    const workflow = readWorkflow(id);
+    return workflow && (ashbyLink ? workflow : { ...workflow, ashbyProfileUrl: undefined });
   };
 }

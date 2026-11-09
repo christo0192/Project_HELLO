@@ -28,6 +28,11 @@ type TabFacts = Pick<CandidateDetail, 'sessions' | 'assessments'>;
 
 const isR1Session = (session: CandidateDetail['sessions'][number]): boolean => session.interview_round_id != null;
 
+/** An R1 session in the candidate's own payload: a result may follow, when the rounds answer. */
+export function hasR1Session(detail: Pick<TabFacts, 'sessions'>): boolean {
+  return detail.sessions.some(isR1Session);
+}
+
 /**
  * Something to read on the Phone screening tab: a completed phone session, or a phone assessment by the
  * header's rule, so that the tab and the score beside it never disagree about what is a phone screening.

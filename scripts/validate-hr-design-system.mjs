@@ -193,6 +193,7 @@ export const VERDICT_FILES = [
   'src/components/session/VerdictMark.tsx',
   'src/components/session/scorecard-read.ts',
   'src/components/talent/HeaderScore.tsx',
+  'src/components/talent/HeaderRatings.tsx',
   'src/components/talent/ReviewScorecard.tsx',
   'src/components/talent/CandidateScorecard.tsx',
   'src/components/Scorecard.tsx',

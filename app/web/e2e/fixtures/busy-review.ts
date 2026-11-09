@@ -162,12 +162,15 @@ export function makeReviewBusy(db: Dataset, { redFlags = RED_FLAGS.length }: { r
   const roleId = db.candidates.find((candidate) => candidate.id === STAR_CANDIDATE_ID)!.role_id;
   db.roles.find((role) => role.id === roleId)!.title = 'Sales Program Advisor';
 
+  // The candidate payload carries the session's own row, as production's does, so the header can hold
+  // the rating summary's room while the screening read is still out.
+  const ownRow: Assessment = { ...assessment, session_id: session.id };
   const readCandidate = db.candidateDetail;
   db.candidateDetail = (id) => {
     const candidate = readCandidate(id);
     if (!candidate || id !== STAR_CANDIDATE_ID) return candidate;
     candidate.sessions = candidate.sessions.map((row) => (row.id === session.id ? session : row));
-    candidate.assessments = candidate.assessments.map((row) => (row.id === assessment.id ? assessment : row));
+    candidate.assessments = [...candidate.assessments.filter((row) => row.id !== assessment.id), ownRow];
     return candidate;
   };
 

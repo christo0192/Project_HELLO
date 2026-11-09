@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { candidateTabFrom, defaultCandidateTab, hasPhoneReview } from './candidate-tabs';
+import { candidateTabFrom, defaultCandidateTab, hasPhoneReview, hasR1Session } from './candidate-tabs';
 
 type Detail = Parameters<typeof defaultCandidateTab>[0];
 
@@ -28,6 +28,15 @@ describe('candidateTabFrom', () => {
 
   it.each([null, '', 'sessions', 'PHONE', 'constructor'])('has no tab for %s: the page then chooses', (param) => {
     expect(candidateTabFrom(param)).toBeNull();
+  });
+});
+
+describe('hasR1Session', () => {
+  it('finds an R1 session whatever its status, and never a phone one', () => {
+    expect(hasR1Session(detail({ sessions: [phoneSession, r1Session] }))).toBe(true);
+    expect(hasR1Session(detail({ sessions: [{ ...r1Session, status: 'in_progress' }] }))).toBe(true);
+    expect(hasR1Session(detail({ sessions: [phoneSession, failedPhoneSession] }))).toBe(false);
+    expect(hasR1Session(detail())).toBe(false);
   });
 });
 
