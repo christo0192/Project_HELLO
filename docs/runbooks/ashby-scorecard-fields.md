@@ -131,7 +131,7 @@ changed: see the next section.)
 
 ## Overall recommendation value (M029)
 
-Cut-over: **YYYY-MM-DD (the API deploy date, filled in at deploy)**.
+Cut-over: **2026-11-09** (the API deploy date). Cards written before it keep the old 25-point-band value; the owner confirmed on 2026-11-09 that the form's Overall Recommendation has the four options "1" to "4".
 
 The overall recommendation is still submitted as the option value string "1" to
 "4" on the same path. What decides the number changed: it is the verdict, not

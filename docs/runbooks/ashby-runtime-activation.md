@@ -1014,7 +1014,7 @@ candidate id (it still matches by phone number and email).
 
 ### The tag and the Ashby 1-4 rating (M029)
 
-Cut-over: **YYYY-MM-DD (the API deploy date, filled in at deploy)**.
+Cut-over: **2026-11-09** (the API deploy date). Cards written before it keep the old 25-point-band value; the owner confirmed on 2026-11-09 that the form's Overall Recommendation has the four options "1" to "4".
 
 From the cut-over, the scorecard's Overall Recommendation follows the verdict of the
 assessment the card was built from. The verdict decides first; the score only splits
