@@ -4,9 +4,12 @@
  * Logsheet's sheet with Readout's scorecard panel. Top to bottom: the AI recommendation in a box, a
  * pencilled one while it is provisional, with the 45 and 65 cut-offs on a ruler; one sentence built
  * from the data, never by a model; the provisional notice; "Check before deciding"; then every rubric
- * row, each with a seek chip. None is collapsed, and a row is one line so that all five fit a 1440x900
- * screen (a 768px-tall window runs out of pane first, and they are a short scroll away): the weakest
- * metric alone carries its reasoning and quote buttons open, and the others are one press away.
+ * row, each with a seek chip. A row is one line, so a busy screening shows four whole on arrival at
+ * 1440x900 and the rest are a short scroll away. The weakest metric alone opens with two lines of its
+ * reasoning, one in a window under 820px tall. Everything else in a row, the weakest metric's quotes and
+ * an unscored metric's reason included, sits behind its chevron, one press away. The owner reversed
+ * "the weakest metric keeps its quotes open" on 2026-11-06: each quote stays marked in the transcript
+ * and ticked on the strip, and any tick, chip or margin number still opens its row.
  *
  * The verdict and each rating take their family (`design/tones`): Select `ready`, Borderline
  * `unresolved`, Reject `closed`, and never crimson. What needs a second look is `unresolved`. Dashed
@@ -56,7 +59,8 @@ export interface ReviewScorecardProps {
   momentOf: (quote: PlacedQuote) => QuoteMoment;
   /** The evidence number that is cued. */
   activeEvidence: number | null;
-  onCue: (number: number) => void;
+  /** `pressed` is the control, which stands in this pane and must not move under the pointer. */
+  onCue: (number: number, pressed: HTMLElement) => void;
   /** The metrics opened by hand or by a cue: their reasoning in full, and their quote buttons. */
   openMetrics: ReadonlySet<string>;
   onToggleMetric: (metricId: string) => void;
@@ -122,8 +126,18 @@ const RUBRIC_COLUMNS_HOURS = 'sm:grid-cols-[minmax(0,1fr)_2.25rem_8.75rem_8.5rem
 export const metricDisplayName = (metric: ScorecardMetricDisplay, index: number): string =>
   metric.name && metric.name !== metric.id ? metric.name : `Metric ${index + 1}`;
 
-/** The rating as form tick-boxes, in its family. Decoration: the word and the figure beside it are the text. */
-function Pips({ level, max, family }: { level: number; max: number; family: JudgementFamily | null }) {
+/** How many metrics a provisional score rests on: the words the verdict box prints, and the header's summary too. */
+export function scoredOfTotal(scorecard: ScorecardAssessmentDisplay): string {
+  const metrics = Array.isArray(scorecard.metrics) ? scorecard.metrics : [];
+  const scored = metrics.filter((m) => finiteNumber(m.score) !== null).length;
+  return `${scored} of ${metrics.length} metrics`;
+}
+
+/**
+ * The rating as form tick-boxes, in its family. Decoration: the word and the figure beside it are the text.
+ * The header's summary prints this same component, so the two can never disagree.
+ */
+export function Pips({ level, max, family }: { level: number; max: number; family: JudgementFamily | null }) {
   const filled = family ? cx(FAMILY_CLASSES[family].edge, FAMILY_CLASSES[family].fill) : 'border-ink bg-ink';
   return (
     <span aria-hidden="true" data-rating-pips="" className="flex items-center gap-0.5">
@@ -168,7 +182,7 @@ function ScoreRuler({ score, current }: { score: number | null; current: Judgeme
 
 function AlertIcon() {
   return (
-    <svg aria-hidden="true" viewBox="0 0 16 16" width="14" height="14" className="mt-0.5 shrink-0 text-unresolved-text">
+    <svg aria-hidden="true" viewBox="0 0 16 16" width="14" height="14" className="shrink-0 text-unresolved-text">
       <circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" strokeWidth="1.5" />
       <path d="M8 4.5v4.25M8 10.75v.75" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
     </svg>
@@ -202,14 +216,14 @@ function SeekChip({ quote, moment, pressed, onCue }: {
   quote: PlacedQuote;
   moment: QuoteMoment;
   pressed: boolean;
-  onCue: (number: number) => void;
+  onCue: ReviewScorecardProps['onCue'];
 }) {
   const text = moment.clock === null ? `T${moment.turn}` : `T${moment.turn} · ${moment.clock}`;
   return (
     <button
       type="button"
       data-seek-chip={quote.number}
-      onClick={() => onCue(quote.number)}
+      onClick={(event) => onCue(quote.number, event.currentTarget)}
       aria-pressed={pressed}
       aria-label={`${text}, evidence ${quote.number}, ${quote.metricName}. ${moment.playable ? 'Play from here.' : 'Go to this turn.'}`}
       className={cx(
@@ -230,7 +244,7 @@ function QuoteRow({ quote, moment, pressed, family, onCue }: {
   pressed: boolean;
   /** The family of the rating it cites. A metric with no score has none, and stays ink. */
   family: JudgementFamily | null;
-  onCue: (number: number) => void;
+  onCue: ReviewScorecardProps['onCue'];
 }) {
   if (quote.number === null || moment === null) {
     return <p className="text-sm leading-[1.3125rem] text-ink-secondary">“{quote.text}”</p>;
@@ -241,11 +255,12 @@ function QuoteRow({ quote, moment, pressed, family, onCue }: {
     <button
       type="button"
       data-quote-button={number}
-      onClick={() => onCue(number)}
+      onClick={(event) => onCue(number, event.currentTarget)}
       aria-pressed={pressed}
+      // A ruled line, and only the pressed one a box. Every side has its edge, so a press moves nothing.
       className={cx(
-        'grid w-full grid-cols-[auto_minmax(0,1fr)_0.75rem] items-start gap-x-2.5 rounded-control border px-2.5 py-1 text-left transition-colors duration-hover ease-out',
-        pressed ? 'border-ink' : 'border-rule-2 hover:border-control',
+        'grid w-full grid-cols-[auto_minmax(0,1fr)_0.75rem] items-start gap-x-2.5 border px-2.5 py-1 text-left transition-colors duration-hover ease-out',
+        pressed ? 'rounded-control border-ink' : 'border-transparent border-b-rule hover:border-b-control',
       )}
     >
       <span className="flex items-center gap-1.5 whitespace-nowrap font-mono text-meta leading-5 text-ink-secondary">
@@ -283,7 +298,7 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, h
   onToggle: () => void;
   momentOf: (quote: PlacedQuote) => QuoteMoment;
   activeEvidence: number | null;
-  onCue: (number: number) => void;
+  onCue: ReviewScorecardProps['onCue'];
 }) {
   const bodyId = useId();
   const score = finiteNumber(metric.score);
@@ -292,13 +307,18 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, h
   const placed = quotes.filter((quote): quote is PlacedQuote => quote.number !== null);
   const chip = placed.find((quote) => quote.number === activeEvidence) ?? placed[0];
   const hasMore = rationale !== '' || quotes.length > 0;
-  // The weakest metric keeps its quote buttons open. An unscored one says why in a line.
-  const showsQuotes = open || weakest;
-  const rationaleLines = open ? null : weakest ? 'line-clamp-2' : score === null ? 'line-clamp-1' : 'hidden';
+  // Closed, only the weakest metric says anything more, and in a short window less of it.
+  const rationaleLines = open ? null : weakest ? 'line-clamp-2 [@media(max-height:819.98px)]:line-clamp-1' : 'hidden';
   const family = held ? null : ratingFamily(score, scorecard.scoreScaleMax);
 
   return (
-    <li data-rubric-row={metric.id} className="border-b border-rule py-0.5">
+    // Focusable only with no toggle to take the focus when the header's summary brings a reader here. The
+    // scroll margin is what that press keeps clear: 16px, past the 56px app bar that sticks below `lg`.
+    <li
+      data-rubric-row={metric.id}
+      tabIndex={hasMore ? undefined : -1}
+      className="scroll-mt-[4.5rem] border-b border-rule py-0.5 lg:scroll-mt-4"
+    >
       {/* Printed columns, so the weights, chips and ratings of every row line up as on a form. As narrow
           as their widest content, so a two-word metric keeps one line at 1366px. */}
       <div className={cx('flex flex-wrap items-center gap-x-1.5 gap-y-1 sm:grid', columns)}>
@@ -355,7 +375,7 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, h
           {rationale && (
             <p className={cx('mt-0.5 text-label leading-5 text-ink-secondary', rationaleLines)}>{rationale}</p>
           )}
-          {showsQuotes && quotes.length > 0 && (
+          {open && quotes.length > 0 && (
             <ul aria-label={`Quotes for ${name}`} className="mb-0.5 mt-1 space-y-1">
               {quotes.map((quote, at) => (
                 <li key={at}>
@@ -429,7 +449,8 @@ export function ReviewScorecard({
   const pastTheHour = evidence.placed.some((quote) => (momentOf(quote).clock?.split(':').length ?? 0) > 2);
 
   const flags = redFlags ?? [];
-  const showChecks = unscored.length > 0 || checks.length > 0 || flags.length > 0 || redFlags !== null;
+  const anyCheck = unscored.length > 0 || checks.length > 0 || flags.length > 0;
+  const showChecks = anyCheck || redFlags !== null;
 
   return (
     // Not a landmark of its own: the pane around it is the region, under this same name.
@@ -455,7 +476,7 @@ export function ReviewScorecard({
       >
         {provisional && (
           <p className="absolute -top-2 right-3 bg-paper px-1.5 text-meta text-ink-secondary">
-            <span className="font-semibold text-unresolved-text">Provisional</span> · {scoredCount} of {total} metrics
+            <span className="font-semibold text-unresolved-text">Provisional</span> · {scoredOfTotal(scorecard)}
           </p>
         )}
         <div className="flex items-center justify-between gap-3">
@@ -489,49 +510,46 @@ export function ReviewScorecard({
       )}
 
       {showChecks && (
-        <div className="mt-2">
+        <div className="mt-4">
           <div className="flex flex-wrap items-baseline justify-between gap-x-3">
-            <h3 className="text-sm font-semibold text-ink">Check before deciding</h3>
+            {/* One icon for the list. With nothing on it there is nothing to warn of. */}
+            <h3 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
+              {anyCheck && <AlertIcon />}
+              Check before deciding
+            </h3>
             {redFlags !== null && flags.length === 0 && (
               <p className="text-meta text-ink-tertiary">Red flags: none identified</p>
             )}
           </div>
           <ul className="mt-0.5 border-t border-rule text-label leading-5 text-ink-secondary">
             {unscored.map((metric, at) => (
-              <li key={metric.id} className="flex gap-2.5 border-b border-rule py-0.5">
-                <AlertIcon />
-                <span>
-                  <span className="font-semibold text-unresolved-text">
-                    {metricDisplayName(metric, metrics.indexOf(metric))}: insufficient evidence.
-                  </span>
-                  {whatIf && at === unscored.length - 1 && (
-                    <>
-                      {' '}
-                      <span data-what-if="">{whatIfLine(whatIf)}</span>
-                    </>
-                  )}
+              <li key={metric.id} className="border-b border-rule py-0.5">
+                <span className="font-semibold text-unresolved-text">
+                  {metricDisplayName(metric, metrics.indexOf(metric))}: insufficient evidence.
                 </span>
+                {whatIf && at === unscored.length - 1 && (
+                  <>
+                    {' '}
+                    <span data-what-if="">{whatIfLine(whatIf)}</span>
+                  </>
+                )}
               </li>
             ))}
             {checks.map((check) => (
-              <li key={check} className="flex gap-2.5 border-b border-rule py-0.5">
-                <AlertIcon />
-                <span>{check}</span>
+              <li key={check} className="border-b border-rule py-0.5">
+                {check}
               </li>
             ))}
             {flags.map((flag) => (
-              <li key={flag} className="flex gap-2.5 border-b border-rule py-0.5">
-                <AlertIcon />
-                <span>
-                  <span className="font-semibold text-unresolved-text">Red flag:</span> {flag}
-                </span>
+              <li key={flag} className="border-b border-rule py-0.5">
+                <span className="font-semibold text-unresolved-text">Red flag:</span> {flag}
               </li>
             ))}
           </ul>
         </div>
       )}
 
-      <div className="mt-2">
+      <div className="mt-4">
         <div className="flex flex-wrap items-baseline justify-between gap-x-3">
           <h3 className="text-sm font-semibold text-ink">Rubric</h3>
           <p className="text-meta text-ink-tertiary">Weight · rating out of {scorecard.scoreScaleMax}</p>

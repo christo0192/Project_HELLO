@@ -4,8 +4,11 @@
  * 24px tall. The candidate's turns stand full height in the voice mark, the interviewer's a third of
  * that in `--ai`, the consent gate is hatched, a line drop runs on a dotted baseline, and every
  * evidence quote is one numbered tick, its box in the family of the rating it cites, so the strip shows
- * where the weak and the strong evidence sit. Its stem stays ink, to read across the voice mark. Any
- * other gap between calls stays bare paper. Candidate and interviewer are told apart by height and by
+ * where the weak and the strong evidence sit. Its stem stays ink, to read across the voice mark. A tick
+ * the host marks quiet steps back to a faint box and a lighter stem, and moves nothing. That stem reads
+ * on paper only: across the voice mark and the AI bar it is lost, and the 4px stub above the strip
+ * carries its moment (docs/design/logsheet-colour-decision-2026-11-06.md). Any other gap
+ * between calls stays bare paper. Candidate and interviewer are told apart by height and by
  * the transcript's speaker labels, not by colour.
  *
  * This is the phone strip. The R1 review page draws its call with `CallStrip.tsx` beside this file,
@@ -36,6 +39,8 @@ export interface ReviewCallStripTick {
   label: string;
   /** The family of the rating it cites. A metric with no score has none, and stays ink. */
   family?: JudgementFamily | null;
+  /** It steps back: a faint edge and a lighter line. A pressed tick never does. */
+  quiet?: boolean;
 }
 
 /** Words printed above the strip at a moment: the consent span, the line drop. */
@@ -104,6 +109,7 @@ export function ReviewCallStrip({
     () => layoutTickLabels(ordered.map((tick) => (percent(tick.sec) / 100) * width), width, TICK_BOX),
     [ordered, percent, width],
   );
+  const stepsBack = (tick: ReviewCallStripTick) => tick.quiet === true && tick.number !== activeTick;
 
   return (
     <div ref={rootRef} data-call-strip="" className={cx('relative', className)}>
@@ -125,12 +131,13 @@ export function ReviewCallStrip({
               key={tick.number}
               type="button"
               data-strip-tick={tick.number}
+              data-tick-quiet={stepsBack(tick) ? '' : undefined}
               onClick={() => onTick?.(tick.number)}
               aria-pressed={pressed}
               aria-label={tick.label}
               className={cx(
                 'absolute top-0 flex h-[1.125rem] min-w-[1.125rem] -translate-x-1/2 items-center justify-center rounded-evidence border px-0.5 font-mono text-meta leading-none transition-colors duration-hover ease-out',
-                evidenceNumberClass(tick.family ?? null, pressed),
+                evidenceNumberClass(tick.family ?? null, pressed, stepsBack(tick)),
                 !pressed && 'hover:bg-field',
               )}
               style={{ left: `${labels[index]}px` }}
@@ -202,7 +209,8 @@ export function ReviewCallStrip({
           <span
             key={tick.number}
             aria-hidden="true"
-            className="pointer-events-none absolute -top-1 bottom-0 w-px bg-ink"
+            data-tick-stem={tick.number}
+            className={cx('pointer-events-none absolute -top-1 bottom-0 w-px', stepsBack(tick) ? 'bg-control' : 'bg-ink')}
             style={{ left: `${percent(tick.sec)}%` }}
           />
         ))}

@@ -62,6 +62,37 @@ describe('ReviewCallStrip', () => {
     expect(onTick).toHaveBeenCalledWith(1);
   });
 
+  describe('a quiet tick', () => {
+    const quiet = [{ ...PROPS.ticks![0], family: 'ready' as const, quiet: true }];
+    const box = () => screen.getByRole('button', { name: 'Evidence 1: turn 3 at 00:40, Rapport' });
+    const stem = () => document.querySelector('[data-tick-stem="1"]')!;
+
+    it('has a faint edge and a lighter line, and keeps its digit', () => {
+      render(<ReviewCallStrip {...PROPS} ticks={quiet} />);
+      expect(box()).toHaveClass('border-rule', 'text-ready-text');
+      expect(box()).not.toHaveClass('border-ready');
+      expect(stem()).toHaveClass('bg-control');
+      expect(stem()).not.toHaveClass('bg-ink');
+    });
+
+    it('keeps its place, its name and its press', () => {
+      const onTick = vi.fn();
+      const { rerender } = render(<ReviewCallStrip {...PROPS} ticks={[{ ...quiet[0], quiet: false }]} onTick={onTick} />);
+      const [left, stemLeft] = [box().style.left, stem().getAttribute('style')];
+      rerender(<ReviewCallStrip {...PROPS} ticks={quiet} onTick={onTick} />);
+      expect(box().style.left).toBe(left);
+      expect(stem().getAttribute('style')).toBe(stemLeft);
+      fireEvent.click(box());
+      expect(onTick).toHaveBeenCalledWith(1);
+    });
+
+    it('stands at full weight while it is pressed', () => {
+      render(<ReviewCallStrip {...PROPS} ticks={quiet} activeTick={1} />);
+      expect(box()).toHaveClass('border-ready-text', 'bg-ready-text', 'text-paper');
+      expect(stem()).toHaveClass('bg-ink');
+    });
+  });
+
   it.each([
     ['ready', 'border-ready bg-paper text-ready-text', 'border-ready-text bg-ready-text text-paper'],
     ['unresolved', 'border-unresolved bg-paper text-unresolved-text', 'border-unresolved-text bg-unresolved-text text-paper'],

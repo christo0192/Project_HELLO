@@ -3,7 +3,7 @@
  * wordings, and every state the screen can be in. Geometry, matching and the what-if arithmetic have
  * their own files; this is how they meet on the screen.
  */
-import { render, screen, fireEvent, waitFor, within, configure } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within, configure } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 configure({ asyncUtilTimeout: 3000 });
@@ -272,13 +272,57 @@ beforeEach(() => {
 });
 
 describe('the log header', () => {
-  it('prints the role, the screening, the interviewer, the length and the drop', async () => {
+  it('prints the role, the screening, the length and the drop, each beside its own label', async () => {
     renderWorkspace();
     await screen.findByText('What is your monthly target?');
     const header = document.querySelector<HTMLElement>('[data-log-header]')!;
     expect(within(header).getByText('Sales Advisor')).toBeInTheDocument();
-    expect(within(header).getByText('Christy (AI)')).toBeInTheDocument();
     expect(header).toHaveTextContent('Recorded 4m 5s across 2 calls · line dropped once');
+    expect([...header.querySelectorAll('dt')].map((label) => label.textContent)).toEqual(['Role', 'Screening', 'Length', 'In Ashby']);
+    for (const label of header.querySelectorAll('dt')) expect(label.nextElementSibling?.tagName).toBe('DD');
+  });
+
+  it('drops the interviewer while the tape shows, because the tape key and every AI turn print it', async () => {
+    renderWorkspace();
+    await screen.findByText('What is your monthly target?');
+    const header = document.querySelector<HTMLElement>('[data-log-header]')!;
+    expect(document.querySelector('[data-call-strip]')).not.toBeNull();
+    expect(within(header).queryByText('Interviewer')).toBeNull();
+    expect(within(header).queryByText('Christy (AI)')).toBeNull();
+  });
+
+  it('holds the interviewer back while the tape loads too, so the line does not change when it arrives', async () => {
+    mockApi.getSession.mockReturnValue(new Promise(() => undefined));
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [], next_cursor: null });
+    render(<TranscriptionSyncWorkspace sessions={[SESSION]} assessments={[]} blocked={false} candidateId="c1" />);
+    expect(document.querySelector('[data-tape-placeholder]')).not.toBeNull();
+    expect(screen.queryByText('Interviewer')).toBeNull();
+  });
+
+  it('keeps the interviewer when nothing else on the page names it: a viewer with no access', async () => {
+    mockApi.getSession.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    render(<TranscriptionSyncWorkspace sessions={[SESSION]} assessments={[assessment()]} blocked={false} />);
+    await screen.findByText(/require admin access/i);
+    expect(document.querySelector('[data-call-strip]')).toBeNull();
+    expect(screen.getByText('Interviewer').parentElement).toHaveTextContent('Christy (AI)');
+  });
+
+  it('keeps the interviewer when the transcript failed', async () => {
+    mockApi.getSession.mockRejectedValue({ message: 'upstream_timeout_504' });
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [], next_cursor: null });
+    render(<TranscriptionSyncWorkspace sessions={[SESSION]} assessments={[]} blocked={false} candidateId="c1" />);
+    await screen.findByText('The transcript could not be loaded.');
+    expect(document.querySelector('[data-call-strip]')).toBeNull();
+    expect(screen.getByText('Interviewer').parentElement).toHaveTextContent('Christy (AI)');
+  });
+
+  it('keeps the interviewer on a session with no times, which has no tape', async () => {
+    const untimed = TRANSCRIPT.map((turn) => ({ ...turn, started_at_ms: null }));
+    renderWorkspace({ transcript: untimed, legs: [] });
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).toBeNull();
+    expect(document.querySelector('[data-tape-placeholder]')).toBeNull();
+    expect(screen.getByText('Interviewer').parentElement).toHaveTextContent('Christy (AI)');
   });
 
   it('reads the length from the list row: the loaded row has no recorded total', async () => {
@@ -460,11 +504,69 @@ describe('the log header', () => {
     ])('tick %s is paper with the %s family', async (number, family) => {
       renderWorkspace({ card: card() });
       await screen.findByRole('heading', { name: 'AI recommendation' });
-      // Review opens with the weakest metric's quote cued, so cue another to see this one at rest.
+      // Review opens with the weakest metric's quote cued, so cue another to see this one at rest. Its
+      // row stands open, so that it is at full weight.
       const other = number === 1 ? 2 : 1;
       fireEvent.click(tick(other));
       await waitFor(() => expect(tick(other)).toHaveAttribute('aria-pressed', 'true'));
+      fireEvent.click(document.querySelector(`[data-rubric-row="${results[number - 1].configMetricId}"] h4 button`)!);
       expect(tick(number)).toHaveClass('bg-paper', `border-${family}`, `text-${family}-text`);
+    });
+
+    describe('on the strip, only what is being read stands at full weight', () => {
+      // Tick 3 cites the weakest metric, and Review arrives pressed on it.
+      const isQuiet = (n: number) => tick(n).hasAttribute('data-tick-quiet');
+      const arrive = async () => {
+        renderWorkspace({ card: card() });
+        await screen.findByRole('heading', { name: 'AI recommendation' });
+        await waitFor(() => expect(tick(3)).toHaveAttribute('aria-pressed', 'true'));
+      };
+
+      it('the weakest metric\'s ticks stand, and the others step back, in their own digit', async () => {
+        await arrive();
+        expect([1, 2, 3].map(isQuiet)).toEqual([true, true, false]);
+        expect(tick(1)).toHaveClass('border-rule', 'text-ready-text');
+        expect(tick(2)).toHaveClass('border-rule', 'text-unresolved-text');
+      });
+
+      it('a metric opened with its arrow stands, and steps back again when it closes', async () => {
+        await arrive();
+        const arrow = document.querySelector<HTMLElement>(`[data-rubric-row="${results[0].configMetricId}"] h4 button`)!;
+        fireEvent.click(arrow);
+        expect(isQuiet(1)).toBe(false);
+        fireEvent.click(arrow);
+        expect(isQuiet(1)).toBe(true);
+      });
+
+      it('a press stands, on its open row', async () => {
+        await arrive();
+        fireEvent.click(tick(2));
+        expect(tick(2)).toHaveAttribute('aria-pressed', 'true');
+        expect(isQuiet(2)).toBe(false);
+      });
+
+      it('the weakest metric\'s tick still stands once the press has moved off it', async () => {
+        await arrive();
+        fireEvent.click(tick(2));
+        expect(tick(3)).toHaveAttribute('aria-pressed', 'false');
+        expect(isQuiet(3)).toBe(false);
+      });
+
+      it('a quiet tick keeps its name, and a press still cues it', async () => {
+        await arrive();
+        expect(tick(1)).toHaveAccessibleName(/^Evidence 1: turn \d+ at \d\d:\d\d, /);
+        fireEvent.click(tick(1));
+        expect(tick(1)).toHaveAttribute('aria-pressed', 'true');
+        expect(document.querySelector('[data-quote-button="1"]')).toHaveAttribute('aria-pressed', 'true');
+      });
+
+      it('with no scored metric nothing steps back, because nothing leads', async () => {
+        const unscored = results.map((result) => ({ ...result, score: null, evidenceStatus: 'insufficient_evidence' }));
+        renderWorkspace({ card: card(unscored) });
+        await screen.findByRole('heading', { name: 'AI recommendation' });
+        expect(ticks().length).toBeGreaterThan(0);
+        expect(ticks().filter((el) => el.hasAttribute('data-tick-quiet'))).toEqual([]);
+      });
     });
 
     it('fills a pressed tick with its family, in paper text, not with ink', async () => {
@@ -504,6 +606,8 @@ describe('the log header', () => {
         card: card([results[0], metricResult('m-objection', 'Objection handling', 2500, null, ['the EMI option first'])]),
       });
       await screen.findByRole('heading', { name: 'AI recommendation' });
+      expect(tick(2)).toHaveClass('bg-paper', 'border-rule', 'text-ink');
+      fireEvent.click(screen.getByRole('button', { name: 'Objection handling' }));
       expect(tick(2)).toHaveClass('bg-paper', 'border-ink', 'text-ink');
       expect(margin(/^Evidence 2, Objection handling/)).toHaveClass('border-ink', 'text-ink');
     });
@@ -858,6 +962,169 @@ describe('one cue, everywhere at once', () => {
     expect(document.querySelector('[data-quote-button="1"]')).toHaveAttribute('aria-pressed', 'true');
   });
 
+  describe('a cue closes the row the last cue opened', () => {
+    const rowOpen = (id: string) =>
+      document.querySelector(`[data-rubric-row="${id}"] h4 button`)!.getAttribute('aria-expanded') === 'true';
+    const arrow = (name: string) => fireEvent.click(screen.getByRole('button', { name }));
+    const arrive = async () => {
+      renderWorkspace();
+      await screen.findByText('What is your monthly target?');
+    };
+
+    it('closes it when the next cue opens another metric', async () => {
+      await arrive();
+      fireEvent.click(tick(1));
+      expect(rowOpen('m-target')).toBe(true);
+      fireEvent.click(tick(3));
+      expect(rowOpen('m-rapport')).toBe(true);
+      expect(rowOpen('m-target')).toBe(false);
+    });
+
+    it('never closes a row opened with its arrow', async () => {
+      await arrive();
+      arrow('Target clarity');
+      fireEvent.click(tick(2));
+      fireEvent.click(tick(3));
+      expect(rowOpen('m-target')).toBe(true);
+      expect(rowOpen('m-objection')).toBe(false);
+      expect(rowOpen('m-rapport')).toBe(true);
+    });
+
+    it('leaves a row with the arrow when a cue lands in it, because the cue did not open it', async () => {
+      await arrive();
+      arrow('Target clarity');
+      fireEvent.click(tick(1));
+      fireEvent.click(tick(3));
+      expect(rowOpen('m-target')).toBe(true);
+    });
+
+    it('still closes the last cue\'s row when the next cue lands in a row opened by hand', async () => {
+      await arrive();
+      arrow('Rapport');
+      fireEvent.click(tick(1));
+      fireEvent.click(tick(3));
+      expect(rowOpen('m-target')).toBe(false);
+      expect(rowOpen('m-rapport')).toBe(true);
+    });
+
+    it('hands a row to the reader once they close and reopen it with its arrow', async () => {
+      await arrive();
+      fireEvent.click(tick(1));
+      arrow('Target clarity');
+      expect(rowOpen('m-target')).toBe(false);
+      arrow('Target clarity');
+      fireEvent.click(tick(3));
+      expect(rowOpen('m-target')).toBe(true);
+    });
+
+    it('keeps the row while the cues stay in it, then closes it', async () => {
+      const twice = [
+        RESULTS[0],
+        metricResult('m-objection', 'Objection handling', 2500, 2, ['the EMI option first', 'I tell them about']),
+        ...RESULTS.slice(2),
+      ];
+      renderWorkspace({ card: assessment({ raw: { ...assessment().raw, metricResults: twice } as Assessment['raw'] }) });
+      await screen.findByText('What is your monthly target?');
+      const [first, second] = screen.getAllByRole('button', { name: /^Evidence \d, Objection handling/ });
+      fireEvent.click(first);
+      fireEvent.click(second);
+      expect(rowOpen('m-objection')).toBe(true);
+      fireEvent.click(tick(1));
+      expect(rowOpen('m-objection')).toBe(false);
+    });
+
+    it('closes nothing for a timecode, which opens no metric', async () => {
+      await arrive();
+      fireEvent.click(tick(1));
+      fireEvent.click(turnButton(7));
+      expect(rowOpen('m-target')).toBe(true);
+    });
+
+    it('leaves arrival alone: being cued on the weakest metric opens nothing, so nothing waits to close', async () => {
+      await arrive();
+      arrow('Objection handling');
+      fireEvent.click(tick(3));
+      expect(rowOpen('m-objection')).toBe(true);
+    });
+
+    describe('with the pressed chip below the row that closes', () => {
+      const ROW_ABOVE = 300;
+      const CHIP_WITH_ROW_SHUT = 200;
+
+      /**
+       * A pane that really stops at the top, and a chip the open row above pushes down. It scrolls on its
+       * own, as it does at 1180px and up; `stacked` is the narrower page, where the page scrolls instead.
+       */
+      function paneScrolled(to: number, { stacked = false } = {}): { chipTop: () => number } {
+        const reasoning = pane('reasoning');
+        reasoning.style.overflowY = stacked ? 'visible' : 'auto';
+        let top = to;
+        Object.defineProperty(reasoning, 'scrollTop', {
+          configurable: true,
+          get: () => top,
+          set: (value: number) => {
+            top = Math.max(0, value);
+          },
+        });
+        const chipTop = () => CHIP_WITH_ROW_SHUT + (rowOpen('m-target') ? ROW_ABOVE : 0) - top;
+        layout((el) => (el.matches('[data-seek-chip="3"]') ? chipTop() : null));
+        return { chipTop };
+      }
+
+      it('scrolls by what the row gave back, so the chip stays under the pointer', async () => {
+        await arrive();
+        fireEvent.click(tick(1));
+        const { chipTop } = paneScrolled(400);
+        const before = chipTop();
+        fireEvent.click(chip(3));
+        expect(rowOpen('m-target')).toBe(false);
+        expect(rowOpen('m-rapport')).toBe(true);
+        expect(chipTop()).toBe(before);
+        expect(pane('reasoning').scrollTop).toBe(100);
+      });
+
+      it('keeps the row open until the next cue when the pane cannot absorb the shift', async () => {
+        await arrive();
+        fireEvent.click(tick(1));
+        const { chipTop } = paneScrolled(100);
+        const before = chipTop();
+        fireEvent.click(chip(3));
+        expect(rowOpen('m-target')).toBe(true);
+        expect(rowOpen('m-rapport')).toBe(true);
+        expect(chipTop()).toBe(before);
+        expect(pane('reasoning').scrollTop).toBe(100);
+
+        // A tick is not under the pointer in this pane, so the next cue closes both.
+        fireEvent.click(tick(2));
+        expect(rowOpen('m-target')).toBe(false);
+        expect(rowOpen('m-rapport')).toBe(false);
+        expect(rowOpen('m-objection')).toBe(true);
+      });
+
+      it('below 1180px holds nothing, so the rows a cue opened close and never pile up', async () => {
+        await arrive();
+        fireEvent.click(tick(1));
+        paneScrolled(100, { stacked: true });
+        fireEvent.click(chip(3));
+        expect(rowOpen('m-target')).toBe(false);
+        expect(rowOpen('m-rapport')).toBe(true);
+        fireEvent.click(chip(2));
+        expect(rowOpen('m-rapport')).toBe(false);
+        expect(rowOpen('m-objection')).toBe(true);
+        expect(pane('reasoning').scrollTop).toBe(100);
+      });
+
+      it('moves nothing for a press from outside the pane: nothing there is under the pointer', async () => {
+        await arrive();
+        fireEvent.click(tick(1));
+        paneScrolled(100);
+        fireEvent.click(tick(3));
+        expect(rowOpen('m-target')).toBe(false);
+        expect(pane('reasoning').scrollTop).toBe(100);
+      });
+    });
+  });
+
   it('a seek leaves keyboard focus on the control that was pressed', async () => {
     const focus = vi.spyOn(HTMLElement.prototype, 'focus');
     renderWorkspace();
@@ -1160,7 +1427,50 @@ describe('a press and the panes', () => {
     expect(writes).toHaveLength(1);
   });
 
-  it('Play leaves the reasoning pane alone; only a press on a quote moves it', async () => {
+  describe('a quote cued off the pane', () => {
+    const PANE_BOTTOM = 40;
+
+    it('below the fold comes up only as far as it needs, so its row stays on screen', async () => {
+      layout((el) => (el.matches('[data-quote-button]') ? 100 : null));
+      renderWorkspace();
+      await screen.findByText('What is your monthly target?');
+      const writes = scrollWrites(pane('reasoning'));
+      fireEvent.click(tick(2));
+      // Its bottom, 140, to the pane's, 40, and 16 to spare.
+      expect(writes).toEqual([140 - PANE_BOTTOM + 16]);
+    });
+
+    it('above the top comes down to it', async () => {
+      layout((el) => (el.matches('[data-quote-button]') ? -100 : null));
+      renderWorkspace();
+      await screen.findByText('What is your monthly target?');
+      const writes = scrollWrites(pane('reasoning'));
+      fireEvent.click(tick(2));
+      expect(writes).toEqual([-100 - 16]);
+    });
+
+    it('stays where it is for a chip: it opened under the chip, and the chip must not move', async () => {
+      layout((el) => (el.matches('[data-quote-button]') ? 100 : null));
+      renderWorkspace();
+      await screen.findByText('What is your monthly target?');
+      const writes = scrollWrites(pane('reasoning'));
+      fireEvent.click(chip(2));
+      expect(document.querySelector('[data-quote-button="2"]')).toHaveAttribute('aria-pressed', 'true');
+      expect(writes).toEqual([]);
+    });
+
+    it('stays where it is when the quote itself is pressed', async () => {
+      renderWorkspace();
+      await screen.findByText('What is your monthly target?');
+      fireEvent.click(tick(2));
+      layout((el) => (el.matches('[data-quote-button]') ? -100 : null));
+      const writes = scrollWrites(pane('reasoning'));
+      fireEvent.click(document.querySelector<HTMLElement>('[data-quote-button="2"]')!);
+      expect(writes).toEqual([]);
+    });
+  });
+
+  it('Play leaves the reasoning pane alone; only a cue from outside it moves it', async () => {
     layout((el) => (el.matches('[data-quote-button]') ? 900 : null));
     renderWorkspace();
     await screen.findByText('What is your monthly target?');
@@ -1172,7 +1482,7 @@ describe('a press and the panes', () => {
     await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
     expect(writes).toEqual([]);
 
-    fireEvent.click(chip(2));
+    fireEvent.click(tick(2));
     expect(writes).toHaveLength(1);
   });
 
@@ -1407,6 +1717,51 @@ describe('the transcript as a log sheet', () => {
     const row = mark.closest<HTMLElement>('[data-turn-row]')!;
     expect(within(row).getByText('Cited · Target clarity')).toBeInTheDocument();
     expect(within(row).getByRole('button', { name: 'Evidence 1, Target clarity' })).toHaveTextContent('1');
+  });
+
+  describe('a turn cited more than once', () => {
+    const cited = (results: ReturnType<typeof metricResult>[]) =>
+      assessment({ raw: { ...assessment().raw, metricResults: results } as Assessment['raw'] });
+
+    it('prints one label for each metric, with its numbers beside it', async () => {
+      renderWorkspace({
+        card: cited([
+          metricResult('m-target', 'Target clarity', 2500, 4, ['My target is twelve a month', 'I usually reach it']),
+          metricResult('m-objection', 'Objection handling', 2500, 2, ['the EMI option first']),
+        ]),
+      });
+      await screen.findByText('What is your monthly target?');
+      const row = document.querySelector('[data-evidence-mark="1"]')!.closest<HTMLElement>('[data-turn-row]')!;
+      expect(within(row).getAllByText('Cited · Target clarity')).toHaveLength(1);
+      const label = within(row).getByText('Cited · Target clarity');
+      const numbers = within(label.parentElement!).getAllByRole('button');
+      expect(numbers.map((el) => el.textContent)).toEqual(['1', '2']);
+    });
+
+    it('keeps each number its own button and name, and a press on each cues its own quote', async () => {
+      renderWorkspace({
+        card: cited([metricResult('m-target', 'Target clarity', 2500, 4, ['My target is twelve a month', 'I usually reach it'])]),
+      });
+      await screen.findByText('What is your monthly target?');
+      fireEvent.click(screen.getByRole('button', { name: 'Evidence 2, Target clarity' }));
+      expect(tick(2)).toHaveAttribute('aria-pressed', 'true');
+      fireEvent.click(screen.getByRole('button', { name: 'Evidence 1, Target clarity' }));
+      expect(tick(1)).toHaveAttribute('aria-pressed', 'true');
+      expect(tick(2)).toHaveAttribute('aria-pressed', 'false');
+    });
+
+    it('keeps two metrics in the same turn apart', async () => {
+      renderWorkspace({
+        card: cited([
+          metricResult('m-target', 'Target clarity', 2500, 4, ['My target is twelve a month']),
+          metricResult('m-rapport', 'Rapport', 2500, 3, ['I usually reach it']),
+        ]),
+      });
+      await screen.findByText('What is your monthly target?');
+      const row = document.querySelector('[data-evidence-mark="1"]')!.closest<HTMLElement>('[data-turn-row]')!;
+      expect(within(row).getByText('Cited · Target clarity')).toBeInTheDocument();
+      expect(within(row).getByText('Cited · Rapport')).toBeInTheDocument();
+    });
   });
 
   it('marks the drop where the second call begins', async () => {
@@ -1783,13 +2138,14 @@ describe('the reasoning pane', () => {
       });
       await screen.findByRole('heading', { name: 'AI recommendation' });
       // The role fit panel prints "Red flag:" as a screen reader prefix on its chips too.
-      const lead = screen.getAllByText('Red flag:').find((el) => el.closest('li')?.querySelector('svg'))!;
+      const heading = screen.getByRole('heading', { name: 'Check before deciding' });
+      const list = heading.parentElement!.parentElement!.querySelector('ul')!;
+      const lead = within(list).getByText('Red flag:');
       const missing = screen.getByText('Closing: insufficient evidence.');
       expect(lead).toHaveClass('text-unresolved-text');
       expect(missing).toHaveClass('text-unresolved-text');
-      expect(lead.closest('li')!.querySelector('svg')).toHaveClass('text-unresolved-text');
-      expect(missing.closest('li')!.querySelector('svg')).toHaveClass('text-unresolved-text');
-      expect(lead.closest('ul')!.innerHTML).not.toMatch(/danger|error/);
+      expect(heading.querySelector('svg')).toHaveClass('text-unresolved-text');
+      expect(list.innerHTML).not.toMatch(/danger|error/);
     });
 
     it('keeps "Red flags: none identified" quiet', async () => {
@@ -1919,13 +2275,110 @@ describe('the reasoning pane', () => {
     expect(columns()[0]).toContain('_8.75rem_');
   });
 
-  it('opens the quote buttons on the weakest metric only', async () => {
+  it('keeps every quote behind its chevron on arrival, the weakest metric too', async () => {
     renderWorkspace();
     await screen.findByRole('heading', { name: 'AI recommendation' });
-    const rows = [...document.querySelectorAll<HTMLElement>('[data-rubric-row]')];
-    expect(within(rows[1]).getByRole('button', { name: /the EMI option first/ })).toBeInTheDocument();
-    expect(rows[0].querySelector('[data-quote-button]')).toBeNull();
-    expect(rows[2].querySelector('[data-quote-button]')).toBeNull();
+    expect(document.querySelector('[data-quote-button]')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Objection handling' })).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('arrives cued all the same: the chip and the tick pressed, with no quote showing', async () => {
+    renderWorkspace();
+    await screen.findByRole('heading', { name: 'AI recommendation' });
+    await waitFor(() => expect(tick(2)).toHaveAttribute('aria-pressed', 'true'));
+    expect(chip(2)).toHaveAttribute('aria-pressed', 'true');
+    expect(document.querySelector('[data-quote-button]')).toBeNull();
+  });
+
+  it('the weakest metric\'s chevron opens its quotes, as every row\'s does', async () => {
+    renderWorkspace();
+    await screen.findByRole('heading', { name: 'AI recommendation' });
+    fireEvent.click(screen.getByRole('button', { name: 'Objection handling' }));
+    expect(screen.getByRole('button', { name: /the EMI option first/ })).toBeInTheDocument();
+    expect(mockRecordingApi.getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
+  });
+
+  it('a tick reaches the weakest metric\'s quotes', async () => {
+    renderWorkspace();
+    await screen.findByRole('heading', { name: 'AI recommendation' });
+    await waitFor(() => expect(tick(2)).toHaveAttribute('aria-pressed', 'true'));
+    fireEvent.click(tick(2));
+    expect(document.querySelector('[data-quote-button="2"]')).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('gives the weakest metric two lines of reasoning, one in a short window, and every other row none', async () => {
+    renderWorkspace();
+    await screen.findByRole('heading', { name: 'AI recommendation' });
+    expect(screen.getByText('Objection handling rationale.')).toHaveClass('line-clamp-2', '[@media(max-height:819.98px)]:line-clamp-1');
+    expect(screen.getByText('Target clarity rationale.')).toHaveClass('hidden');
+    expect(screen.getByText('Rapport rationale.')).toHaveClass('hidden');
+  });
+
+  it('puts an unscored metric\'s reason behind its chevron, and leaves its chip and its check line', async () => {
+    renderWorkspace();
+    await screen.findByRole('heading', { name: 'AI recommendation' });
+    const row = document.querySelector<HTMLElement>('[data-rubric-row="m-closing"]')!;
+    expect(within(row).getByText('Closing rationale.')).toHaveClass('hidden');
+    expect(within(row).getByText('Insufficient evidence')).toBeInTheDocument();
+    expect(within(row).getByText('not counted')).toBeInTheDocument();
+    const check = screen.getByRole('heading', { name: 'Check before deciding' }).parentElement!.parentElement!;
+    expect(check).toHaveTextContent('Closing: insufficient evidence.');
+
+    fireEvent.click(within(row).getByRole('button', { name: 'Closing' }));
+    expect(within(row).getByText('Closing rationale.')).not.toHaveClass('hidden');
+  });
+
+  it('a metric opened by hand reads in full, weakest or not', async () => {
+    renderWorkspace();
+    await screen.findByRole('heading', { name: 'AI recommendation' });
+    fireEvent.click(screen.getByRole('button', { name: 'Objection handling' }));
+    expect(screen.getByText('Objection handling rationale.')).not.toHaveClass('line-clamp-2');
+  });
+
+  it('Check before deciding carries one alert icon, on its heading, and every line stays open', async () => {
+    renderWorkspace({
+      card: assessment({ role_fit: { score: 0, matched_skills: [], gaps: [], red_flags: ['Vague on numbers', 'Late to the call'], notes: '' } }),
+    });
+    const heading = await screen.findByRole('heading', { name: 'Check before deciding' });
+    expect(heading.querySelectorAll('svg')).toHaveLength(1);
+    const list = heading.parentElement!.parentElement!.querySelector('ul')!;
+    expect(list.querySelectorAll('svg')).toHaveLength(0);
+    expect(within(list).getAllByText('Red flag:')).toHaveLength(2);
+    expect(list).toHaveTextContent('Closing: insufficient evidence.');
+    expect(list).toHaveTextContent('Line dropped at 01:40; the call continued at 03:20');
+  });
+
+  it('raises no alert over an empty list: "Red flags: none identified" has nothing to warn of', async () => {
+    const complete = RESULTS.map((r) => (r.score === null ? metricResult('m-closing', 'Closing', 2500, 3, []) : r));
+    renderWorkspace({
+      legs: [CALL_ONE],
+      card: assessment({
+        scoring_status: 'complete',
+        raw: { ...assessment().raw, status: 'complete', metricResults: complete } as Assessment['raw'],
+      }),
+    });
+    const heading = await screen.findByRole('heading', { name: 'Check before deciding' });
+    expect(await screen.findByText('Red flags: none identified')).toBeInTheDocument();
+    expect(heading.querySelector('svg')).toBeNull();
+  });
+
+  it('rules its quote buttons, and a pressed one keeps its box', async () => {
+    const twice = [
+      RESULTS[0],
+      metricResult('m-objection', 'Objection handling', 2500, 2, ['the EMI option first', 'I tell them about']),
+      ...RESULTS.slice(2),
+    ];
+    renderWorkspace({ card: assessment({ raw: { ...assessment().raw, metricResults: twice } as Assessment['raw'] }) });
+    await screen.findByText('What is your monthly target?');
+    const [first, second] = screen.getAllByRole('button', { name: /^Evidence \d, Objection handling/ });
+    fireEvent.click(first);
+    const quotes = [...document.querySelectorAll<HTMLElement>('[data-quote-button]')];
+    const pressed = quotes.find((quote) => quote.getAttribute('aria-pressed') === 'true')!;
+    const ruled = quotes.find((quote) => quote.getAttribute('aria-pressed') === 'false')!;
+    expect(pressed).toHaveClass('rounded-control', 'border-ink');
+    expect(ruled).toHaveClass('border-transparent', 'border-b-rule');
+    expect(ruled).not.toHaveClass('rounded-control');
+    expect(second).toBeInTheDocument();
   });
 
   it('shows a quote that was cut short as cut, in its row and in its button', async () => {
@@ -1936,6 +2389,7 @@ describe('the reasoning pane', () => {
     ];
     renderWorkspace({ card: assessment({ raw: { ...assessment().raw, metricResults: cut } as Assessment['raw'] }) });
     await screen.findByRole('heading', { name: 'AI recommendation' });
+    fireEvent.click(screen.getByRole('button', { name: 'Objection handling' }));
     expect(screen.getByRole('button', { name: /the EMI opt…/ })).toBeInTheDocument();
     expect(screen.getByText('“words that were never sa…”')).toBeInTheDocument();
   });
@@ -1943,6 +2397,7 @@ describe('the reasoning pane', () => {
   it('keeps a quote it could not place readable as text, with no number, position or apology', async () => {
     renderWorkspace();
     await screen.findByRole('heading', { name: 'AI recommendation' });
+    fireEvent.click(screen.getByRole('button', { name: 'Objection handling' }));
     const words = screen.getByText('“words that were never said”');
     expect(words.closest('button')).toBeNull();
     expect(words.tagName).toBe('P');
@@ -2115,6 +2570,165 @@ describe('the panes', () => {
   it('has no axe violations with the strip, the transcript and the scorecard on screen', async () => {
     const { container } = renderWorkspace();
     await screen.findByText('What is your monthly target?');
+    await expect(container).toHaveNoViolations();
+  });
+});
+
+/*
+ * Stage 6, inside the scope Legal approved on 2026-11-09 (owner's report): on one call with a working tape
+ * the connected-time line, Load recording and the processing note sit behind one press, word for word.
+ * The consent tag and every note about a drop, an approximate end, a missing end or missing audio stay in
+ * view. The component's own file pins each of those; this is how the block meets the tape and the cue.
+ */
+describe('the call block on a single call', () => {
+  const ONE: Session = { ...SESSION, recorded_legs: 1, recorded_total_sec: 100 };
+  const NO_AUDIO = { state: 'unavailable', reason: 'deleted' } as unknown as CandidatePhoneAttempt['recording'];
+  const callList = () => screen.getByRole('list', { name: 'Calls in this session' });
+  const arrow = () => within(callList()).getByRole('button', { name: /^Call 1 of 1 · first call/ });
+  const anyArrow = () => within(callList()).queryAllByRole('button').filter((button) => button.hasAttribute('aria-expanded'));
+
+  it('closes with a working tape, and the call title over the turns is for screen readers only', async () => {
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).not.toBeNull();
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(arrow()).toHaveAccessibleName('Call 1 of 1 · first call · Dropped mid-call · Recorded 1m 40s');
+    expect(screen.queryByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeNull();
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+    // The turns keep their group and the group its name: only the printed repeat goes.
+    const group = screen.getByRole('group', { name: 'Call 1 of 1 · first call' });
+    expect(within(group).getByRole('heading', { level: 3, name: 'Call 1 of 1 · first call' }).closest('.sr-only')).not.toBeNull();
+  });
+
+  it('keeps the consent tag and the end-time note in view while closed', async () => {
+    renderWorkspace({ session: ONE, legs: [{ ...CALL_ONE, connected_to_source: 'detected', consent_stage: 'deferred_after_consent' }] });
+    await screen.findByText('What is your monthly target?');
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(within(callList()).getByText('Callback requested after consent – recording kept')).toBeVisible();
+    expect(within(callList()).getByText(/^End time approximate: our check found the call over by \d\d:\d\d IST\.$/)).toBeVisible();
+  });
+
+  it('keeps a note over the turns in view while the title beside it goes', async () => {
+    // No stamp on the call: its times are estimated from when it was answered.
+    renderWorkspace({ session: ONE, legs: [{ ...CALL_ONE, recording_started_at_ms: null }] });
+    await screen.findByText('What is your monthly target?');
+    const note = screen.getByText('Times in this call (≈) are estimated from when it was answered.');
+    expect(note.closest('.sr-only')).toBeNull();
+    expect(screen.getByRole('heading', { level: 3, name: 'Call 1 of 1 · first call' })).toHaveClass('sr-only');
+  });
+
+  it('opens by itself when the call cannot play and the session recording can, and its reason stays in view', async () => {
+    renderWorkspace({ session: { ...ONE, recording_egress_started_at_ms: T0 }, legs: [{ ...CALL_ONE, recording: NO_AUDIO }] });
+    await screen.findByText('What is your monthly target?');
+    expect(arrow()).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(arrow());
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(within(callList()).getByText('Recording deleted')).toBeVisible();
+  });
+
+  it('two calls keep the full block, and each title stays printed over its turns', async () => {
+    renderWorkspace();
+    await screen.findByText('What is your monthly target?');
+    expect(anyArrow()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'Load recording, Call 1 of 2' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Load recording, Call 2 of 2' })).toBeVisible();
+    for (const title of ['Call 1 of 2 · first call', 'Call 2 of 2 · reconnect']) {
+      expect(screen.getByRole('heading', { level: 3, name: title }).closest('.sr-only')).toBeNull();
+    }
+  });
+
+  it('one call with no tape keeps the full block', async () => {
+    renderWorkspace({ session: ONE, legs: [CALL_ONE], transcript: TRANSCRIPT.map((turn) => ({ ...turn, started_at_ms: null })) });
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).toBeNull();
+    expect(anyArrow()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeVisible();
+  });
+
+  it('"Play from" plays through the closed block, offers Pause, and the block stays closed', async () => {
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    fireEvent.click(screen.getByRole('button', { name: /^Play from/ }));
+    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-1'));
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    fireEvent.play(document.querySelector('audio')!);
+    expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument();
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    // Legal's yes covers Load recording, not the player it turns into: that is in view, closed or not.
+    expect(document.querySelector('audio')).toBeVisible();
+    expect(within(callList()).getByRole('link', { name: 'Download file, Call 1 of 1' })).toBeVisible();
+    expect(within(callList()).getByRole('button', { name: 'Refresh link, Call 1 of 1' })).toBeVisible();
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+  });
+
+  it('is closed from its first paint when the calls answer before the transcript, so it never folds under the reader', async () => {
+    let answer: (detail: unknown) => void = () => undefined;
+    const card = assessment();
+    mockApi.getSession.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [CALL_ONE], next_cursor: null });
+    render(<TranscriptionSyncWorkspace sessions={[ONE]} assessments={[card]} blocked={false} candidateId="c1" candidateName="Asha Rao" />);
+    await waitFor(() => expect(arrow()).toHaveAttribute('aria-expanded', 'false'));
+    expect(document.querySelector('[data-tape-placeholder]')).not.toBeNull();
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeNull();
+    await act(async () => answer({ session: bareRow(ONE), transcript: TRANSCRIPT, assessment: card }));
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).not.toBeNull();
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+  });
+
+  it('opens in full when the transcript then settles with no tape to play the call from', async () => {
+    let answer: (detail: unknown) => void = () => undefined;
+    const card = assessment();
+    mockApi.getSession.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [CALL_ONE], next_cursor: null });
+    render(<TranscriptionSyncWorkspace sessions={[ONE]} assessments={[card]} blocked={false} candidateId="c1" candidateName="Asha Rao" />);
+    await waitFor(() => expect(arrow()).toHaveAttribute('aria-expanded', 'false'));
+    const untimed = TRANSCRIPT.map((turn) => ({ ...turn, started_at_ms: null }));
+    await act(async () => answer({ session: bareRow(ONE), transcript: untimed, assessment: card }));
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).toBeNull();
+    expect(anyArrow()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeVisible();
+  });
+
+  it.each([
+    ['a tick', () => tick(3)],
+    ['a seek chip', () => chip(3)],
+    ['a margin number', () => screen.getByRole('button', { name: 'Evidence 3, Rapport' })],
+  ])('%s cues through the closed block: everything moves in one commit, then that moment plays', async (_what, control) => {
+    const seeks: number[] = [];
+    Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+      configurable: true,
+      get: () => 0,
+      set: (sec: number) => seeks.push(sec),
+    });
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    fireEvent.click(control());
+    expect(clock()).toContain('03:36');
+    expect(activeTurns()).toEqual(['10']);
+    expect(tick(3)).toHaveAttribute('aria-pressed', 'true');
+    await waitFor(() => expect(seeks).toContain(216));
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('a load that fails opens the block, and the tape says so too', async () => {
+    mockRecordingApi.getAttemptRecordingDownloadUrl.mockRejectedValue(new Error('Recording not found'));
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    fireEvent.click(screen.getByRole('button', { name: /^Play from/ }));
+    expect(await within(tapeStatus()).findByRole('alert')).toHaveTextContent('Recording not found');
+    await waitFor(() => expect(arrow()).toHaveAttribute('aria-expanded', 'true'));
+    expect(within(callList()).getByRole('button', { name: 'Try again, Call 1 of 1' })).toBeVisible();
+  });
+
+  it('has no axe violations closed or open', async () => {
+    const { container } = renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    await expect(container).toHaveNoViolations();
+    fireEvent.click(arrow());
     await expect(container).toHaveNoViolations();
   });
 });

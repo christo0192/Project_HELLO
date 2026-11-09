@@ -1152,6 +1152,26 @@ describe('what the page learns from the card', () => {
     await waitFor(() => expect(onRoundsChange).toHaveBeenLastCalledWith([second]));
   });
 
+  it.each([
+    ['fails', () => new Error('service_unavailable')],
+    ['is refused', () => new ApiError('forbidden', 403)],
+  ])('says when its read %s, and reports no rounds for it', async (_what, failure) => {
+    api.listR1Rounds.mockRejectedValue(failure());
+    const onRoundsChange = vi.fn();
+    const onRoundsFailed = vi.fn();
+    open({ onRoundsChange, onRoundsFailed });
+    await waitFor(() => expect(onRoundsFailed).toHaveBeenCalledTimes(1));
+    expect(onRoundsChange).not.toHaveBeenCalled();
+  });
+
+  it('says nothing failed when the read worked', async () => {
+    const onRoundsChange = vi.fn();
+    const onRoundsFailed = vi.fn();
+    open({ onRoundsChange, onRoundsFailed });
+    await waitFor(() => expect(onRoundsChange).toHaveBeenCalledWith([]));
+    expect(onRoundsFailed).not.toHaveBeenCalled();
+  });
+
   it('draws what the page gives it when it has no card to draw', async () => {
     api.getR1Availability.mockResolvedValue({ state: 'not_deployed', hold_minutes: 55 });
     api.listR1Rounds.mockResolvedValue({ rounds: [] });

@@ -67,6 +67,46 @@ Where colour would have said more than the words beside it, it steps back. The w
 - **The hold notice's heading is ink.** "Not enough interview evidence to decide" sits on a card that has no hue, so it has none either.
 - **A pending rejection on the R1 review header is neutral.** It only follows from the verdict, which carries the family.
 
+## The rating summary in the candidate page header
+
+The owner's request, 2026-11-06: move the rubric ratings into the empty space beside the status chips, because "this will help the users to quickly see where they scored and where they lacked". The owner saw this on a real page in the comparison sheets and liked it.
+
+**Legal has not seen the header ratings.** AI ratings now stay on screen away from "Not a hiring decision", and this record does not say Legal approved that. The Provisional words beside them are the one mitigation so far, and they reuse an existing string, so no wording changed.
+
+**The verdict stamps are parked.** The owner: "the reject stamp is parked for now. dont work on the stamp part but work on the other things." There are no stamp images, no generator and no `VerdictStamp` component in the app, the verdict box is unchanged, and the Provisional note stays open. The artwork is kept outside the repo. The owner's earlier approval of the artwork stands if this comes back, and Legal has not seen the stamps either.
+
+What it is:
+
+- **Provisional first, whenever the verdict box says it:** the box's own words, "Provisional · 5 of 6 metrics", with "Provisional" in `unresolved` and the count from the same helper the box uses. AI ratings would otherwise read as firm away from the box. Stacked in the name row, the line break parts the two where the dot does. The words name a group around the items, so someone tabbing through with a screen reader hears them on the way in, and that adds no wording.
+- **One item per metric, in rubric order:** the name in ink, the same `Pips` as the rubric row in the rating's family, and the figure ("3/4"). The rating word does not fit, so it is in `title` and the accessible name, "Communication, Good, 3 of 4". A long name truncates first, and the pips and figure stay.
+- **A metric with no score:** the dashed `unresolved` mark and a dash, and "Insufficient evidence" in the accessible name, which is the rubric row's own wording.
+- **A press** opens that row, brings it into view and moves focus to it. Below `lg` that means clear of the app bar, which sticks over the top of the page. It plays no audio, mints no recording link and cues no moment. A second press leaves the row open.
+- **A scorecard held for thin evidence** has no hue here either, as its rows have none.
+- **The rubric rows keep their ratings.** The header is the glance, and each row is the detail beside its rationale.
+
+Where it sits, measured on the 6-metric fixture at true 1440x900, 1440x768 and 1366x768:
+
+| In the name row | Fit | Summary | Header |
+|---|---|---|---|
+| No email, no summary | | | 123 px |
+| No email | Three columns by two rows, in the row | 675 x 48 px at 1440, 601 x 48 px at 1366 | 123 px, no change |
+| Email or a long name | Its own line under the name, across the full width | 1150 x 24 px at 1440, 1076 x 24 px at 1366 | 143 px, 20 more |
+| The same, Provisional, below 1350 wide | Its own line, on two rows | 990 x 48 px at 1280, 890 x 48 px at 1180 | 167 px with an email, 44 more |
+
+- **It chooses by measuring the room left beside the name,** never by testing for an email, so a long name behaves the same way. At 500 px or more it takes the row. The prototype's 534 px and 607 px fit there, and the 392 px left beside an email did not.
+- **Its height is kept before the scorecard arrives,** blank, while the panel holds its skeleton, because the panes are measured from the header and must not jump. It is kept only when the candidate's own row says a scored card is coming, so a page that will show nothing keeps no box. `--review-top` now observes it too. The Provisional words and the blank that holds their place take one fixed width, 176 px on their own line and 92 px stacked, sized for the widest count, "20 of 20 metrics" with room to spare: it measures 160 px on Windows and a little more on Linux. The list takes what is left, so the two get the same columns at every width.
+- **Six across needs 1350 wide beside the Provisional words.** A column is at least 136 px. Below 1350 a provisional card's own line wraps to two rows, 44 px and not 20: with an email the pane goes from 393 px to 349 at 1280x720, and from 473 px to 413 at 1180x800. A firm card has no such words, so its six stay on one row down to 1180.
+- **The page still does not scroll.** What the summary adds to the header comes out of the panes' floor, which is 34rem with no summary, 31rem for up to six metrics, whose two rows are 48 px, and 26.5rem past six, because 20 add 120 px at most. So a window that held the page with no summary still holds it with one. At 1180x720, where the page scrolled 13 px with a long name and 45 px with a long name and email, it no longer does, and the pane is 320 px and 288 px. The panes pay for it: in a short window they now get less height, where before the page scrolled.
+- **It never overlaps Export report.** Each has its own grid track, and below `sm` it stacks under the actions.
+- **The own line costs the pane its height.** The owner's sheet says the panes lose 18 px, and here it is 20. On the 5-metric mock at 1440x900, the fifth row then ends 13 px below the fold, where all five fitted before. On the 6-metric fixture with 5 flags no row is whole on arrival either way: the rubric starts 487 px down a pane of 577 px with no email and 557 px with one, and at 768 tall it starts below the fold. The header carries what those rows would have said.
+
+Two places this differs from the picture, on purpose:
+
+- **Each item is 24 px tall, where the prototype's was 20.** 24 px is this app's smallest target, as the compact picker and the back link are, so two rows are the whole 48 px name row. On its own line the header grows by 20 px, not the prototype's 18.
+- **The dash is "—",** the app's own mark for a figure with no value, where the prototype typed a hyphen.
+
+It renders nothing wherever the panel hides scores: decision use blocked, a legacy row, no scorecard, no metric scored, or "Not scored" in the verdict box. A candidate with only an R1 interview has no phone workspace, so nothing fills it and the header stays plain. It is built from the panel's own gated card, so a new rule there reaches it. The brief lists consent withdrawn among the panel's rules, but Review has none: `consent_withdrawn` is a stage of one call, used for its recording. A session with a scorecard prints it in the panel and here alike. That is a question for the owner below. It never shows another call's figures: when the panel reads "Latest scorecard" for another call the header is empty, because it has nowhere to say so. It follows the session picker, clears on a change of candidate, and makes no API call of its own. It is on the Phone screening tab alone, reached by `?tab=phone` or the old `?tab=review`: Profile has `HeaderScore`, the R1 interview tab has its own result, and neither has a compact header. The scoped Ashby page offers it no place, and the R1 review page has its own header.
+
 ## What did not change
 
 - **Reserved colours:** `--voice` and `--voice-mark`, `--danger`, `--go`, the primary button, focus ring and selection.
@@ -88,6 +128,7 @@ The dataviz validator, on `--paper`. `logsheet-tokens.test.ts` ports its Machado
 - **Rejected, do not retry by eye:** teal `#12857a` with plum `#9c4a8f` collapses for colour-blind readers (delta E 4.2), and that pair would be Select against Reject. Amber `#b98500` sits 10.6 from the voice orange (floor 15).
 - **The verdict ruler, adjacent, on the verdict's own wash:** the Reject state passes (worst normal-vision 16.1, colour-blind 9.9), and so does the Select state (22.4, 20.6).
 - **An evidence tag's resting edge is the family's mark, not its text shade.** A tag is a bare number, so colour alone says its family. The text shades `#6b6620` and `#0a693c` fail the validator (colour-blind delta E 3.7, normal-vision 9.5, and `#6b6620` reads grey at chroma 0.09). Everywhere else a word relieves them, and a tag has none. The marks `#958d0f` and `#0a693c` pass (normal-vision 20.0, colour-blind 15.5), and `--unresolved` clears 3:1 on paper (3.30) and on the tag's hover field (3.02). The digit and the pressed fill keep the text shade, because paper on `#958d0f` is only 3.30.
+- **A tick that steps back gives that edge up.** The Review congestion work (2026-11-06) leaves only the weakest metric's ticks, an open metric's and the pressed one at full weight. The others keep their digit, which still clears 4.5:1 on paper and on the field it hovers onto, and take the `--rule` edge and a `--control` stem, 3:1 or better on paper. The edge is decorative, so nothing depends on it, but on those ticks the family rests on the digit alone, and Select and Borderline read alike there to a colour-blind reader. The rating stays a word in its rubric row, and the tick takes its mark edge back when its metric opens or it is pressed. The `--control` stem reads on paper only: across the voice mark it is 1.00:1 and across the `--ai` bar 1.15:1, and no grey short of ink reaches 3:1 there (`--ink-2` is 2.36:1, `--ink-3` 1.50:1). Where it crosses a turn, the 4px stub above the strip carries the moment, and when two quiet ticks share a moment and one box is set to the side, that stub is all that marks it. Each tick's name still gives its turn and time.
 - **One recorded exception: the Borderline state of the ruler.** The mark `#958d0f` beside the light step `#349d62` on `#efeed9` is normal-vision 11.0 (floor 15) and colour-blind 6.7, in the band the validator allows only with secondary encoding. It is the pair a reader has to read on a Borderline verdict. Each zone therefore sits behind a real 2px gap with the wash showing through, and each has its word printed under it, so the ruler does not depend on telling the two apart. The tokens stay, because they pass everywhere else, and all three states are pinned in `logsheet-tokens.test.ts`.
 
 ### What the figures do not cover
@@ -138,3 +179,16 @@ Everything rendered as ink before this, so some uses would have turned green or 
 1. "Abandoned: dropped before screening" prints olive even when its reason says the call was cut off on our side, so that one reason shows an olive badge beside a sentence admitting a fault of ours. The brief maps the status as one colour, so it stays. Should that reason turn crimson?
 2. For a red-green colour-blind reader, green and crimson read as one colour, so Completed and Failed look alike on Mission Control's Session status mix. The word carries it, and a fault's badge also has a crimson edge. Is that enough, or should the tokens be revisited?
 3. Answered: `VerdictMark` and the ratings take colour. See the owner's later decision above.
+4. The header's rating summary still prints a scorecard held for thin evidence, in ink, because the panel still prints its rows under the hold notice. The notice is not in the header. Should a held scorecard print nothing there?
+5. Review has no rule that hides a scorecard after a candidate withdraws consent on a call, though the brief assumed one. If there should be one, it belongs in the panel, and the header will follow it.
+6. A role can have up to 20 metrics, and real roles have 6. Past 6 the name row adds a row for every three metrics, where the brief's fit is at most two rows and no growth, and the panes pay for each one. The page does not scroll at any of these, because the floor gives way, and that is the minimum fix. What should the header do past 6: keep growing, take its own line past about 12, cap its height, or leave the extra metrics to the rubric? Measured on the fixture, the reasoning pane's height:
+
+   | Metrics | 1440x900, no email | 1366x768, no email | 1366x768, email | 1280x720, no email | 1280x720, email |
+   |---|---|---|---|---|---|
+   | 6 | 577 px | 441 px | 421 px | 393 px | 349 px |
+   | 7 | 553 px | 417 px | 397 px | 369 px | 349 px |
+   | 12 | 529 px | 393 px | 397 px | 345 px | 325 px |
+   | 20 | 457 px | 321 px | 349 px | 273 px | 301 px |
+
+   With no email the header is 0, 24, 48 and 120 px taller at 6, 7, 12 and 20 metrics. So the name row is the better place at 7, about level at 12, and worse at 20. The tightest case measured is 20 metrics with a long name and a long email at 1180x720: a 216 px pane.
+7. Answered by review finding Land417-6 (WCAG 2.4.3 and 1.3.2): Tab now reaches Export report before the ratings in every fit, because the summary follows the actions in the reading order. On its own line and on a phone that is the order on screen. In the name row the summary sits between the name and Export report, in the same band, where either order reads. The order is still the same whichever way the summary fits, so a change of fit moves no focus.

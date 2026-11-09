@@ -84,7 +84,7 @@ export const ReviewTape = forwardRef<ReviewTapeHandle, ReviewTapeProps>(function
   const failed = recording.phase === 'error' || (recording.phase === 'ready' && recording.message !== null);
 
   return (
-    <section aria-label="Call recording and strip" className="border-b border-rule-2 px-6 pb-2 pt-2.5">
+    <section aria-label="Call recording and strip" className="border-b border-rule-2 px-6 pb-1 pt-1.5">
       <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1">
         {canPlay && (
           <CandidateButton variant="secondary" size="sm" onClick={playing ? onPause : onPlay}>
