@@ -158,8 +158,14 @@ The overall recommendation is still submitted as the option value string "1" to
   key, not the marker (see Idempotency below).
 - **Form guard (v2 only).** After reading the live form, the worker fails a
   write permanently with `overall_options_mismatch` unless the overall field
-  offers exactly the values "1" to "4". The Mission Control binding preview
-  lists the field's option values and labels (`preview.overallOptions`).
+  offers exactly the values "1" to "4". It decides that on an uncached read
+  (a cached form that fails is re-read first), so a Retry right after the
+  form is fixed succeeds. The Mission Control binding preview runs the same
+  guard: on a mismatch it is not `ready` and the overall fixed field has
+  status `options_mismatch`. It lists the field's option values and labels
+  in `preview.overallOptions`, which is in the API response only; the page
+  does not render it. The deploy check is in `ashby-runtime-activation.md`
+  ("Deploy check for the 1-4 options").
 - Cards written before the cut-over keep their old number; there is no re-write
   path.
 
