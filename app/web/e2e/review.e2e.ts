@@ -1144,6 +1144,157 @@ test.describe('Review, the ratings in the header', () => {
   }
 });
 
+/**
+ * Stage 6, inside the scope Legal approved on 2026-11-09 (owner's report): on one call with a working tape
+ * the connected-time line, Load recording and the processing note sit behind one press, word for word, and
+ * the consent tag and every note about a drop, an approximate end, a missing end or missing audio stay in
+ * view. The busy screening is one dropped call whose end our check found, so its end-time note shows.
+ */
+test.describe('Review, the call block on one call', () => {
+  const block = (panel: Locator): Locator => panel.locator('#sync-workspace-player');
+  // Its name is the line it prints: closed, the recorded length comes up onto it.
+  const arrow = (panel: Locator): Locator => block(panel).getByRole('button', { name: /^Call 1 of 1 · first call · Dropped mid-call/ });
+
+  /** A WAV long enough to reach the cued moment, so the seek is not clamped to the end of a short clip. */
+  const longClip = (): string => {
+    const samples = 8000 * 60;
+    const buf = Buffer.alloc(44 + samples, 128);
+    buf.write('RIFF', 0);
+    buf.writeUInt32LE(36 + samples, 4);
+    buf.write('WAVEfmt ', 8);
+    buf.writeUInt32LE(16, 16);
+    buf.writeUInt16LE(1, 20);
+    buf.writeUInt16LE(1, 22);
+    buf.writeUInt32LE(8000, 24);
+    buf.writeUInt32LE(8000, 28);
+    buf.writeUInt16LE(1, 32);
+    buf.writeUInt16LE(8, 34);
+    buf.write('data', 36);
+    buf.writeUInt32LE(samples, 40);
+    return `data:audio/wav;base64,${buf.toString('base64')}`;
+  };
+
+  // Measured with the full block on 2026-11-09: block 133px and the cited turn 327px down the pane.
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 1440, height: 768 }, { width: 1366, height: 768 }]) {
+    test(`at ${viewport.width}x${viewport.height} the block closes to 57px and the cited turn rises 105px`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      const panel = await openBusy(app, page);
+      await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'false');
+      await expect(arrow(panel)).toHaveAccessibleName('Call 1 of 1 · first call · Dropped mid-call · Recorded 4m 23s');
+      expect((await block(panel).boundingBox())!.height).toBe(57);
+      const pane = (await panel.getByRole('region', { name: 'Transcript' }).boundingBox())!;
+      const cited = (await panel.locator('[data-turn-row]', { has: page.locator('[aria-current="true"]') }).boundingBox())!;
+      expect(cited.y - pane.y).toBe(222);
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+  }
+
+  test('closed, the end-time note stays in view; the arrow opens the connected-time line and Load recording word for word', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    const note = block(panel).getByText(/^End time approximate: our check found the call over by \d\d:\d\d IST\.$/);
+    const connected = block(panel).getByText(/^Connected from \d\d:\d\d IST · Recorded 4m 23s$/);
+    const load = block(panel).getByRole('button', { name: 'Load recording, Call 1 of 1' });
+    await expect(note).toBeVisible();
+    await expect(connected).toBeHidden();
+    await expect(load).toBeHidden();
+    // The repeated title is for screen readers only: the group keeps its name.
+    await expect(panel.getByRole('group', { name: 'Call 1 of 1 · first call' })).toHaveCount(1);
+    await expect(panel.getByRole('group', { name: 'Call 1 of 1 · first call' }).getByRole('heading', { level: 3 })).toHaveClass(/sr-only/);
+
+    await arrow(panel).focus();
+    await page.keyboard.press('Enter');
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'true');
+    // One name, closed or open: the state is in aria-expanded alone.
+    await expect(arrow(panel)).toHaveAccessibleName('Call 1 of 1 · first call · Dropped mid-call · Recorded 4m 23s');
+    await expect(connected).toBeVisible();
+    await expect(load).toHaveText('Load recording');
+    await expect(note).toBeVisible();
+    await page.keyboard.press('Tab');
+    await expect(load).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Space');
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'false');
+    await expect(connected).toBeHidden();
+    expect((await block(panel).boundingBox())!.height).toBe(57);
+    // Opening and closing it minted nothing.
+    expect(app.calls.filter((c) => /\/api\/recordings\//.test(new URL(c.url).pathname))).toEqual([]);
+  });
+
+  test('a consent tag stays on the closed block', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    makeReviewBusy(app.db);
+    const read = app.db.phoneAttempts;
+    app.db.phoneAttempts = (candidate) => read(candidate).map((call) => ({ ...call, consent_stage: 'deferred_after_consent' as const }));
+    const panel = await openReview(app, page);
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'false');
+    await expect(block(panel).getByText('Callback requested after consent – recording kept', { exact: true })).toBeVisible();
+    await expect(block(panel).getByText(/^End time approximate/)).toBeVisible();
+  });
+
+  // Legal's yes covers Load recording, not the player it turns into: that comes into view, closed or not.
+  test('the tape plays through the closed block: the cued moment, then Pause, with the player it loaded in view', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const clip = longClip();
+    await page.route(/\/api\/recordings\/attempts\/[^/]+\/download/, (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ url: clip, content_type: 'audio/wav' }) }),
+    );
+    const panel = await openBusy(app, page);
+    await panel.getByRole('button', { name: /^Play from 00:34/ }).click();
+    const audio = page.locator('audio[aria-label="Call 1 of 1 recording player"]');
+    await expect(audio).toHaveCount(1);
+    await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.currentTime), { timeout: 10_000 }).toBeGreaterThanOrEqual(34);
+    await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.paused), { timeout: 10_000 }).toBe(false);
+    await expect(panel.getByRole('button', { name: 'Pause' })).toBeVisible();
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'false');
+    await expect(audio).toBeVisible();
+    await expect(block(panel).getByRole('link', { name: 'Download file, Call 1 of 1' })).toBeVisible();
+    await expect(block(panel).getByRole('button', { name: 'Refresh link, Call 1 of 1' })).toBeVisible();
+    await expect(block(panel).getByText(/^Connected from \d\d:\d\d IST · Recorded 4m 23s$/)).toBeHidden();
+    // The arrow still folds the connected-time line, and the player stays.
+    await arrow(panel).click();
+    await arrow(panel).click();
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'false');
+    await expect(audio).toBeVisible();
+    await expect(block(panel).getByRole('link', { name: 'Download file, Call 1 of 1' })).toBeVisible();
+  });
+
+  test('closed from its first paint when the calls are read before the transcript: the block never changes height', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    makeReviewBusy(app.db);
+    let release = (): void => undefined;
+    const answered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route(/\/api\/screening\/[^/]+$/, async (route) => {
+      await answered;
+      await route.fallback();
+    });
+    const going = app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=phone`);
+    const panel = page.getByRole('tabpanel', { name: 'Phone screening' });
+    await expect(page.locator('[data-tape-placeholder]')).toBeVisible();
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'false');
+    await expect(block(panel).getByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeHidden();
+    const waiting = (await block(panel).boundingBox())!.height;
+
+    release();
+    await going;
+    await expect(panel.getByRole('region', { name: 'Call recording and strip' })).toBeVisible();
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'false');
+    expect((await block(panel).boundingBox())!.height).toBe(waiting);
+    expect(waiting).toBe(57);
+  });
+
+  test('passes axe closed and open', async ({ app, page }, testInfo) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    await auditA11y(page, testInfo, 'review-call-block-closed', { strict: true });
+    await arrow(panel).click();
+    await expect(arrow(panel)).toHaveAttribute('aria-expanded', 'true');
+    await auditA11y(page, testInfo, 'review-call-block-open', { strict: true });
+  });
+});
+
 test.describe('Review, a call past the hour', () => {
   test('a seek chip stays clear of the rating on every row', async ({ app, page }) => {
     await page.setViewportSize({ width: 1366, height: 768 });

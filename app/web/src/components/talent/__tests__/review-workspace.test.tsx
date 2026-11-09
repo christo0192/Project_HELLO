@@ -3,7 +3,7 @@
  * wordings, and every state the screen can be in. Geometry, matching and the what-if arithmetic have
  * their own files; this is how they meet on the screen.
  */
-import { render, screen, fireEvent, waitFor, within, configure } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within, configure } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 configure({ asyncUtilTimeout: 3000 });
@@ -2570,6 +2570,165 @@ describe('the panes', () => {
   it('has no axe violations with the strip, the transcript and the scorecard on screen', async () => {
     const { container } = renderWorkspace();
     await screen.findByText('What is your monthly target?');
+    await expect(container).toHaveNoViolations();
+  });
+});
+
+/*
+ * Stage 6, inside the scope Legal approved on 2026-11-09 (owner's report): on one call with a working tape
+ * the connected-time line, Load recording and the processing note sit behind one press, word for word.
+ * The consent tag and every note about a drop, an approximate end, a missing end or missing audio stay in
+ * view. The component's own file pins each of those; this is how the block meets the tape and the cue.
+ */
+describe('the call block on a single call', () => {
+  const ONE: Session = { ...SESSION, recorded_legs: 1, recorded_total_sec: 100 };
+  const NO_AUDIO = { state: 'unavailable', reason: 'deleted' } as unknown as CandidatePhoneAttempt['recording'];
+  const callList = () => screen.getByRole('list', { name: 'Calls in this session' });
+  const arrow = () => within(callList()).getByRole('button', { name: /^Call 1 of 1 · first call/ });
+  const anyArrow = () => within(callList()).queryAllByRole('button').filter((button) => button.hasAttribute('aria-expanded'));
+
+  it('closes with a working tape, and the call title over the turns is for screen readers only', async () => {
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).not.toBeNull();
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(arrow()).toHaveAccessibleName('Call 1 of 1 · first call · Dropped mid-call · Recorded 1m 40s');
+    expect(screen.queryByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeNull();
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+    // The turns keep their group and the group its name: only the printed repeat goes.
+    const group = screen.getByRole('group', { name: 'Call 1 of 1 · first call' });
+    expect(within(group).getByRole('heading', { level: 3, name: 'Call 1 of 1 · first call' }).closest('.sr-only')).not.toBeNull();
+  });
+
+  it('keeps the consent tag and the end-time note in view while closed', async () => {
+    renderWorkspace({ session: ONE, legs: [{ ...CALL_ONE, connected_to_source: 'detected', consent_stage: 'deferred_after_consent' }] });
+    await screen.findByText('What is your monthly target?');
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(within(callList()).getByText('Callback requested after consent – recording kept')).toBeVisible();
+    expect(within(callList()).getByText(/^End time approximate: our check found the call over by \d\d:\d\d IST\.$/)).toBeVisible();
+  });
+
+  it('keeps a note over the turns in view while the title beside it goes', async () => {
+    // No stamp on the call: its times are estimated from when it was answered.
+    renderWorkspace({ session: ONE, legs: [{ ...CALL_ONE, recording_started_at_ms: null }] });
+    await screen.findByText('What is your monthly target?');
+    const note = screen.getByText('Times in this call (≈) are estimated from when it was answered.');
+    expect(note.closest('.sr-only')).toBeNull();
+    expect(screen.getByRole('heading', { level: 3, name: 'Call 1 of 1 · first call' })).toHaveClass('sr-only');
+  });
+
+  it('opens by itself when the call cannot play and the session recording can, and its reason stays in view', async () => {
+    renderWorkspace({ session: { ...ONE, recording_egress_started_at_ms: T0 }, legs: [{ ...CALL_ONE, recording: NO_AUDIO }] });
+    await screen.findByText('What is your monthly target?');
+    expect(arrow()).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(arrow());
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(within(callList()).getByText('Recording deleted')).toBeVisible();
+  });
+
+  it('two calls keep the full block, and each title stays printed over its turns', async () => {
+    renderWorkspace();
+    await screen.findByText('What is your monthly target?');
+    expect(anyArrow()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'Load recording, Call 1 of 2' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Load recording, Call 2 of 2' })).toBeVisible();
+    for (const title of ['Call 1 of 2 · first call', 'Call 2 of 2 · reconnect']) {
+      expect(screen.getByRole('heading', { level: 3, name: title }).closest('.sr-only')).toBeNull();
+    }
+  });
+
+  it('one call with no tape keeps the full block', async () => {
+    renderWorkspace({ session: ONE, legs: [CALL_ONE], transcript: TRANSCRIPT.map((turn) => ({ ...turn, started_at_ms: null })) });
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).toBeNull();
+    expect(anyArrow()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeVisible();
+  });
+
+  it('"Play from" plays through the closed block, offers Pause, and the block stays closed', async () => {
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    fireEvent.click(screen.getByRole('button', { name: /^Play from/ }));
+    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-1'));
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    fireEvent.play(document.querySelector('audio')!);
+    expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument();
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    // Legal's yes covers Load recording, not the player it turns into: that is in view, closed or not.
+    expect(document.querySelector('audio')).toBeVisible();
+    expect(within(callList()).getByRole('link', { name: 'Download file, Call 1 of 1' })).toBeVisible();
+    expect(within(callList()).getByRole('button', { name: 'Refresh link, Call 1 of 1' })).toBeVisible();
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+  });
+
+  it('is closed from its first paint when the calls answer before the transcript, so it never folds under the reader', async () => {
+    let answer: (detail: unknown) => void = () => undefined;
+    const card = assessment();
+    mockApi.getSession.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [CALL_ONE], next_cursor: null });
+    render(<TranscriptionSyncWorkspace sessions={[ONE]} assessments={[card]} blocked={false} candidateId="c1" candidateName="Asha Rao" />);
+    await waitFor(() => expect(arrow()).toHaveAttribute('aria-expanded', 'false'));
+    expect(document.querySelector('[data-tape-placeholder]')).not.toBeNull();
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeNull();
+    await act(async () => answer({ session: bareRow(ONE), transcript: TRANSCRIPT, assessment: card }));
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).not.toBeNull();
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+    expect(within(callList()).getByText(/^Connected /)).not.toBeVisible();
+  });
+
+  it('opens in full when the transcript then settles with no tape to play the call from', async () => {
+    let answer: (detail: unknown) => void = () => undefined;
+    const card = assessment();
+    mockApi.getSession.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [CALL_ONE], next_cursor: null });
+    render(<TranscriptionSyncWorkspace sessions={[ONE]} assessments={[card]} blocked={false} candidateId="c1" candidateName="Asha Rao" />);
+    await waitFor(() => expect(arrow()).toHaveAttribute('aria-expanded', 'false'));
+    const untimed = TRANSCRIPT.map((turn) => ({ ...turn, started_at_ms: null }));
+    await act(async () => answer({ session: bareRow(ONE), transcript: untimed, assessment: card }));
+    await screen.findByText('What is your monthly target?');
+    expect(document.querySelector('[data-call-strip]')).toBeNull();
+    expect(anyArrow()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'Load recording, Call 1 of 1' })).toBeVisible();
+  });
+
+  it.each([
+    ['a tick', () => tick(3)],
+    ['a seek chip', () => chip(3)],
+    ['a margin number', () => screen.getByRole('button', { name: 'Evidence 3, Rapport' })],
+  ])('%s cues through the closed block: everything moves in one commit, then that moment plays', async (_what, control) => {
+    const seeks: number[] = [];
+    Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+      configurable: true,
+      get: () => 0,
+      set: (sec: number) => seeks.push(sec),
+    });
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    fireEvent.click(control());
+    expect(clock()).toContain('03:36');
+    expect(activeTurns()).toEqual(['10']);
+    expect(tick(3)).toHaveAttribute('aria-pressed', 'true');
+    await waitFor(() => expect(seeks).toContain(216));
+    expect(arrow()).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('a load that fails opens the block, and the tape says so too', async () => {
+    mockRecordingApi.getAttemptRecordingDownloadUrl.mockRejectedValue(new Error('Recording not found'));
+    renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    fireEvent.click(screen.getByRole('button', { name: /^Play from/ }));
+    expect(await within(tapeStatus()).findByRole('alert')).toHaveTextContent('Recording not found');
+    await waitFor(() => expect(arrow()).toHaveAttribute('aria-expanded', 'true'));
+    expect(within(callList()).getByRole('button', { name: 'Try again, Call 1 of 1' })).toBeVisible();
+  });
+
+  it('has no axe violations closed or open', async () => {
+    const { container } = renderWorkspace({ session: ONE, legs: [CALL_ONE] });
+    await screen.findByText('What is your monthly target?');
+    await expect(container).toHaveNoViolations();
+    fireEvent.click(arrow());
     await expect(container).toHaveNoViolations();
   });
 });

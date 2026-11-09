@@ -1305,8 +1305,15 @@ export function TranscriptionSyncWorkspace({
       <TapePlaceholder candidateName={speakers.candidate} aiName={speakers.bot} />
     );
 
+  // Stage 6: the session's only call, with a tape that can play it, folds its block to its first line.
+  // Several calls, or no working tape, keep the full block: there its player is how a call is played.
+  // The placeholder counts as the tape, so a block whose calls are read before the transcript is closed
+  // from its first paint and never folds under the reader; it opens only if the read settles with no tape.
+  const oneCall = legs.length === 1;
+  const callFolds = oneCall && !noTape && canPlay;
+
   const players = (
-    <div id="sync-workspace-player" className="border-b border-rule px-6 py-3 empty:hidden">
+    <div id="sync-workspace-player" className={cx('border-b border-rule px-6 empty:hidden', callFolds ? 'py-2' : 'py-3')}>
       {selectedSessionId && legsLoading && (
         <p className="text-label text-[var(--c-ink-secondary)]">Loading the calls in this session…</p>
       )}
@@ -1330,6 +1337,8 @@ export function TranscriptionSyncWorkspace({
               onEnded={() => handleFileEnded(leg.id)}
               onStatus={(status) => reportFile(leg.id, status)}
               tapeDriven={tapeShown}
+              foldable={callFolds}
+              beforeClock={i < clockLeg}
             />
           ))}
         </ol>
@@ -1381,10 +1390,14 @@ export function TranscriptionSyncWorkspace({
         const indexOf = (row: number) => group.turns.findIndex((t) => t.index === row);
         const drop = group.legIndex === null ? undefined : dropForLeg.get(group.legIndex);
         const activeHere = activeTurnIndex === null ? -1 : indexOf(activeTurnIndex);
+        // On one call the call block above already prints this title, so here it names the group for a
+        // screen reader only. A note about the call keeps its bar.
+        const titleRepeats = oneCall && leg !== null;
+        const notes = Boolean(drop) || group.approximate || Boolean(group.unseekableReason);
         return (
           <div key={key} role="group" aria-labelledby={headingId}>
-            <div className="border-b border-rule bg-field px-6 py-1.5">
-              <h3 id={headingId} className="text-meta font-semibold text-ink-secondary">
+            <div className={titleRepeats && !notes ? 'sr-only' : 'border-b border-rule bg-field px-6 py-1.5'}>
+              <h3 id={headingId} className={cx('text-meta font-semibold text-ink-secondary', titleRepeats && 'sr-only')}>
                 {leg && group.legIndex !== null
                   ? legTitle(group.legIndex, legs.length, reconnects.has(group.legIndex))
                   : 'Turns without timing'}
