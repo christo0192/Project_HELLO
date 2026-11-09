@@ -23,14 +23,27 @@ async function openReview(app: AppHarness, page: Page): Promise<Locator> {
   return panel;
 }
 
+/** An address as long as most. */
+const EMAIL = 'firstname.lastname@example.com';
+
 /**
- * The same page on a screening shaped like a real one: see `fixtures/busy-review`. The rating summary
- * sits in the name row, as it does on production, so the header is the height these layouts were
- * measured at.
+ * The same page on a screening shaped like a real one: see `fixtures/busy-review`. With no email, so the
+ * rating summary fits in the name row and the header is the height these layouts were measured at. That
+ * is not the header most candidates get: most have an email, and beside one as long as most, with the
+ * intake chip a real name row carries, the summary takes its own line, 20px more header and so 20px less
+ * pane. `openBusyWithEmail` is that page, and the pins that count whole rows on arrival are pinned on both.
  */
 async function openBusy(app: AppHarness, page: Page, options?: Parameters<typeof makeReviewBusy>[1]): Promise<Locator> {
   makeReviewBusy(app.db, options);
   roomInTheNameRow(app);
+  return openReview(app, page);
+}
+
+/** The common case: the same page with an email in the name row, so the summary takes its own line. */
+async function openBusyWithEmail(app: AppHarness, page: Page, options?: Parameters<typeof makeReviewBusy>[1]): Promise<Locator> {
+  makeReviewBusy(app.db, options);
+  aFullNameRow(app);
+  onlyExportReport(app);
   return openReview(app, page);
 }
 
@@ -494,7 +507,7 @@ async function rubricOnArrival(panel: Locator): Promise<{ heights: number[]; who
 
 /**
  * The name row with room for the rating summary, so the header is the height it was without one: no
- * email, and only Export report, which is all production has until an API sends the Ashby link.
+ * email, the rarer real case, and only Export report.
  */
 function roomInTheNameRow(app: AppHarness): void {
   const read = app.db.candidateDetail;
@@ -503,10 +516,43 @@ function roomInTheNameRow(app: AppHarness): void {
     if (detail && id === STAR_CANDIDATE_ID) detail.candidate.email = null;
     return detail;
   };
+  onlyExportReport(app);
+}
+
+/**
+ * The name row most candidates get, as `busyReview` has it: an address as long as most, and the intake chip.
+ * Beside them the rating summary has no room and takes its own line.
+ */
+function aFullNameRow(app: AppHarness): void {
+  const read = app.db.candidateDetail;
+  app.db.candidateDetail = (id) => {
+    const detail = read(id);
+    if (detail && id === STAR_CANDIDATE_ID) {
+      detail.candidate.email = EMAIL;
+      detail.candidate.intake_type = 'phone_parsing';
+    }
+    return detail;
+  };
+}
+
+/** Only Export report among the actions, which is all production has until an API sends the Ashby link. */
+function onlyExportReport(app: AppHarness): void {
   const readWorkflow = app.db.ashbyWorkflowFor;
   app.db.ashbyWorkflowFor = (id) => {
     const workflow = readWorkflow(id);
     return workflow && { ...workflow, ashbyProfileUrl: undefined };
+  };
+}
+
+/** A second completed session for the star, so the log header offers the session picker. */
+function aSecondSession(app: AppHarness): void {
+  const read = app.db.candidateDetail;
+  app.db.candidateDetail = (id) => {
+    const detail = read(id);
+    if (detail && id === STAR_CANDIDATE_ID) {
+      detail.sessions = [...detail.sessions, { ...detail.sessions[0], id: '33333333-3333-4333-8333-333333333333', created_at: '2026-01-05T10:00:00.000Z' }];
+    }
+    return detail;
   };
 }
 
@@ -533,11 +579,21 @@ test.describe('Review, the rubric', () => {
     }
   });
 
-  test('at 1440x900 four whole rows stand on arrival when Check before deciding has five lines', async ({ app, page }, testInfo) => {
+  test('at 1440x900 with no email four whole rows stand on arrival when Check before deciding has five lines', async ({ app, page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target, so the rating summary takes two of them');
     await page.setViewportSize({ width: 1440, height: 900 });
     const panel = await openBusy(app, page, { redFlags: 4 });
+    await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'row');
     expect((await rubricOnArrival(panel)).whole).toBe(4);
+  });
+
+  // The trade-off the header made: beside an email the summary takes its own line, and the pane pays for it.
+  test('at 1440x900 with an email, the common case, three whole rows stand on arrival when Check before deciding has five lines: the summary\'s own line costs the fourth', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target, so the rating summary takes two of them');
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusyWithEmail(app, page, { redFlags: 4 });
+    await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'line');
+    expect((await rubricOnArrival(panel)).whole).toBe(3);
   });
 
   for (const viewport of [{ width: 1440, height: 768 }, { width: 1366, height: 768 }]) {
@@ -624,25 +680,35 @@ test.describe('Review, the rubric', () => {
     }
   });
 
-  test('a second session keeps them there: the picker in the log header stays one line', async ({ app, page }, testInfo) => {
+  test('with no email a second session keeps four whole rows: the picker in the log header stays one line', async ({ app, page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target');
     await page.setViewportSize({ width: 1440, height: 900 });
     makeReviewBusy(app.db, { redFlags: 4 });
     roomInTheNameRow(app);
-    const read = app.db.candidateDetail;
-    app.db.candidateDetail = (id) => {
-      const detail = read(id);
-      if (detail && id === STAR_CANDIDATE_ID) {
-        detail.sessions = [...detail.sessions, { ...detail.sessions[0], id: '33333333-3333-4333-8333-333333333333', created_at: '2026-01-05T10:00:00.000Z' }];
-      }
-      return detail;
-    };
+    aSecondSession(app);
     const panel = await openReview(app, page);
+    await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'row');
     const picker = panel.locator('#sync-session-select');
     await expect(picker).toBeVisible();
     expect((await picker.boundingBox())!.height, 'the picker wrapped').toBeLessThanOrEqual(26);
     expect((await panel.locator('[data-log-header]').boundingBox())!.height).toBe(34);
     expect((await rubricOnArrival(panel)).whole).toBe(4);
+  });
+
+  test('with an email a second session keeps three whole rows: the picker stays one line, and the summary\'s own line costs the fourth', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target');
+    await page.setViewportSize({ width: 1440, height: 900 });
+    makeReviewBusy(app.db, { redFlags: 4 });
+    aFullNameRow(app);
+    onlyExportReport(app);
+    aSecondSession(app);
+    const panel = await openReview(app, page);
+    await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'line');
+    const picker = panel.locator('#sync-session-select');
+    await expect(picker).toBeVisible();
+    expect((await picker.boundingBox())!.height, 'the picker wrapped').toBeLessThanOrEqual(26);
+    expect((await panel.locator('[data-log-header]').boundingBox())!.height).toBe(34);
+    expect((await rubricOnArrival(panel)).whole).toBe(3);
   });
 
   test('metric names stay on one line at 1366x768', async ({ app, page }) => {
@@ -660,7 +726,6 @@ test.describe('Review, the ratings in the header', () => {
     { width: 1440, height: 768 },
     { width: 1366, height: 768 },
   ];
-  const EMAIL = 'firstname.lastname@example.com';
   const LONG_NAME = 'Venkatanarasimha Raghavendra Subramanyam Iyengar';
   const LONG_EMAIL = 'firstname.middlename.lastname.someone.long@example-company-domain.com';
   /** The own line: a 44px action row and one 24px line, where a plain row is 44 and 4 of padding. */
@@ -1036,6 +1101,69 @@ test.describe('Review, the ratings in the header', () => {
       expect(fits, 'the count runs out of the room the blank kept for it').toBe(true);
     });
   }
+
+  /** Each stop Tab makes from the back link to the Phone screening tab: its accessible name and its box. */
+  async function tabStops(page: Page): Promise<Array<{ name: string; top: number; bottom: number }>> {
+    await page.getByRole('link', { name: /Back to candidates/ }).focus();
+    const stops: Array<{ name: string; top: number; bottom: number }> = [];
+    for (let step = 0; step < 20; step += 1) {
+      const stop = await page.evaluate(() => {
+        const el = document.activeElement as HTMLElement;
+        const box = el.getBoundingClientRect();
+        return { name: el.getAttribute('aria-label') ?? el.textContent!.trim(), top: box.top, bottom: box.bottom, tab: el.getAttribute('role') === 'tab' };
+      });
+      stops.push({ name: stop.name, top: stop.top, bottom: stop.bottom });
+      if (stop.tab) break;
+      await page.keyboard.press('Tab');
+    }
+    return stops;
+  }
+
+  /** The header's stops in every layout: the summary comes after Export report, whichever way it sits. */
+  const HEADER_TAB_ORDER = [
+    '← Back to candidates',
+    'Export report',
+    'Communication, Average, 2 of 4',
+    'Compensation fit, Insufficient evidence',
+    'Profile relevance, Good, 3 of 4',
+    'Stability, Average, 2 of 4',
+    'Shift fitment, Good, 3 of 4',
+    'Work from office fitment, Good, 3 of 4',
+    'Phone screening',
+  ];
+
+  /** In the order they are on screen: focus never climbs to a stop wholly above one it has passed. */
+  async function tabsAsItReads(page: Page): Promise<void> {
+    const stops = await tabStops(page);
+    stops.forEach((stop, index) => {
+      for (const passed of stops.slice(0, index)) {
+        expect(stop.bottom, `Tab climbs from ${passed.name} at y=${passed.top} up to ${stop.name} at y=${stop.top}`).toBeGreaterThan(passed.top);
+      }
+    });
+    expect(stops.map((stop) => stop.name)).toEqual(HEADER_TAB_ORDER);
+  }
+
+  // WCAG 2.4.3 and 1.3.2: the summary is under Export report on its own line and on a phone, so it is after it
+  // in the DOM. In the name row it shares Export report's band, so either order reads, and keeping the one
+  // DOM order means a change of fit moves no focus.
+  for (const [fit, options, where] of [
+    ['line', { email: EMAIL }, 'with an email it has its own line under Export report'],
+    ['row', {}, 'with no email it sits between the name and Export report, in their band'],
+  ] as const) {
+    test(`at 1440x900 ${where}, and Tab goes down the page: Export report, the summary, the tabs`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await openBusy(app, page, options);
+      await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', fit);
+      await tabsAsItReads(page);
+    });
+  }
+
+  test('on a phone Tab goes down the page: Export report, the summary stacked under it, the tabs', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout');
+    await openBusy(app, page, { email: EMAIL });
+    await tabsAsItReads(page);
+  });
 
   test('pressing an item opens that row in the pane and moves focus to it, and mints nothing', async ({ app, page }, testInfo) => {
     desktopOnly(testInfo);

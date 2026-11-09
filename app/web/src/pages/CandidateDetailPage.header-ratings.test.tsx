@@ -141,7 +141,7 @@ beforeEach(() => {
 });
 
 describe('the rating summary on the candidate page', () => {
-  it('sits in the header, after the name and before the actions, outside the Phone screening panel', async () => {
+  it('sits in the header, after the name and after the actions, outside the Phone screening panel', async () => {
     renderPage();
     const item = await rating(/^Rapport/);
     expect(item).toHaveAttribute('aria-label', 'Rapport, Excellent, 4 of 4');
@@ -149,7 +149,8 @@ describe('the rating summary on the candidate page', () => {
     expect(item.closest('[data-header-ratings]')).toBe(place());
     const name = screen.getByRole('heading', { level: 1, name: 'Asha Rao' });
     expect(name.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(item.compareDocumentPosition(document.querySelector('[data-header-actions]')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Under Export report on screen, mostly, so after the actions in the Tab order: focus never climbs back up to them.
+    expect(document.querySelector('[data-header-actions]')!.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it.each(['Profile', 'R1 interview'])('goes with the Phone screening tab for %s, and comes back with no second read', async (other) => {

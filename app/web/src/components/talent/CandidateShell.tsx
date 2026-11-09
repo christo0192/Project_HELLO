@@ -222,15 +222,6 @@ export function CandidateHeader({
         )}
         {meta && <div className={compact ? 'ml-3 inline-block' : 'mt-3'}>{meta}</div>}
       </div>
-      {/* In the reading order after the name whichever way it sits, so a change of fit moves no focus.
-          Below the actions on a phone, and on its own line under them when the row has no room. */}
-      {withRatings && (
-        <div
-          ref={onRatingsSlot}
-          data-header-ratings=""
-          className={cx('order-last min-w-0 empty:hidden sm:order-none', ownLine ? 'sm:col-span-2 sm:row-start-2' : 'sm:self-center')}
-        />
-      )}
       {aside ? (
         <div ref={actionsRef} data-header-actions="" className="flex shrink-0 flex-col gap-2 sm:items-end sm:pt-1">
           {actions && <div className="flex flex-wrap items-center gap-2 sm:justify-end">{actions}</div>}
@@ -246,12 +237,23 @@ export function CandidateHeader({
               // Named tracks, because an empty place is out of the grid, and these would land in its track
               // and stretch: the room measured would then change with the layout it decides. On its own
               // line the summary sits straight under them, and with no summary the row is as it always was.
-              withRatings && (ownLine ? 'sm:col-start-2 sm:row-start-1 sm:group-has-[[data-header-ratings]:not(:empty)]/header:pt-0' : 'sm:col-start-3'),
+              withRatings && (ownLine ? 'sm:col-start-2 sm:row-start-1 sm:group-has-[[data-header-ratings]:not(:empty)]/header:pt-0' : 'sm:col-start-3 sm:row-start-1'),
             )}
           >
             {actions}
           </div>
         )
+      )}
+      {/* After the actions in the reading order whichever way it sits, so a change of fit moves no focus. On a
+          phone and on its own line it is under them on screen, so Tab never climbs back up to Export report.
+          Only in the name row, the rarer layout, does the grid pull it between the name and the actions, in
+          Export report's band, where either order reads. */}
+      {withRatings && (
+        <div
+          ref={onRatingsSlot}
+          data-header-ratings=""
+          className={cx('min-w-0 empty:hidden', ownLine ? 'sm:col-span-2 sm:row-start-2' : 'sm:col-start-2 sm:row-start-1 sm:self-center')}
+        />
       )}
     </div>
   );
