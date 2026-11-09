@@ -52,6 +52,11 @@ Four pull requests. This record ships with the first.
 - **A calling halt is in the shell, for the roles that can read it.** The foundation's note above held for a line shown to everyone. The RCA asks for admins and interviewers, whom `GET /api/phone/health` answers, so "Calling halted" needed no new read and a viewer's shell asks nothing. The direction's fuller line (window, on a call, queued) still waits for a read that is safe for every role.
 - **"Closed", not "finished", for sessions that can't be changed.** Those are failed, cancelled, expired and deleted. A Completed session is finished in plain words and can still be overridden, so the RCA's example, "Finished sessions can't be changed", read false beside it.
 
+## What the Review congestion work decided on the way
+
+- **The weakest metric no longer keeps its quotes open.** The owner reversed this on 2026-11-06, after comparing the two on the real page. The weakest metric opens with two lines of its reasoning, one in a window under 820px tall, and its quotes sit behind its chevron like every other row's. Each quote stays marked in the transcript and ticked on the strip, and any tick, chip or margin number still opens its row. Review still arrives cued on that metric's first quote, with nothing playing.
+- **An unscored metric's reason sits behind its chevron too.** Its Insufficient evidence chip and its line in "Check before deciding" stay.
+
 ## Sources
 
 The directions, the comparison and the judges' scores live in the project's planning folder under `M026/directions/`. The root-cause analysis behind the redesign is `M026/M026-RCA.md`. The owner's decisions are dated in `DECISIONS.md`.

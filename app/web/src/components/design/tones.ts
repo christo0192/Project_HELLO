@@ -222,21 +222,25 @@ export function rulerLabelClass(family: JudgementFamily, current: JudgementFamil
   return family === current ? `${FAMILY_CLASSES[family].text} font-semibold` : FAMILY_CLASSES[family].text;
 }
 
-const EVIDENCE_NUMBER: Readonly<Record<JudgementFamily | 'ink', { resting: string; pressed: string }>> = {
+const EVIDENCE_NUMBER: Readonly<Record<JudgementFamily | 'ink', { resting: string; quiet: string; pressed: string }>> = {
   ready: {
     resting: 'border-ready bg-paper text-ready-text',
+    quiet: 'border-rule bg-paper text-ready-text',
     pressed: 'border-ready-text bg-ready-text text-paper',
   },
   unresolved: {
     resting: 'border-unresolved bg-paper text-unresolved-text',
+    quiet: 'border-rule bg-paper text-unresolved-text',
     pressed: 'border-unresolved-text bg-unresolved-text text-paper',
   },
   closed: {
     resting: 'border-closed bg-paper text-closed-text',
+    quiet: 'border-rule bg-paper text-closed-text',
     pressed: 'border-closed-text bg-closed-text text-paper',
   },
   ink: {
     resting: 'border-ink bg-paper text-ink',
+    quiet: 'border-rule bg-paper text-ink',
     pressed: 'border-ink bg-ink text-paper',
   },
 };
@@ -250,8 +254,14 @@ const EVIDENCE_NUMBER: Readonly<Record<JudgementFamily | 'ink', { resting: strin
  * Select and Borderline collapse for a colour-blind reader (delta E 3.7). So the resting
  * edge is the family's mark, which the validator passes (15.5). The digit and the pressed
  * fill keep the text shade, because paper on the Borderline mark is only 3.30:1.
+ *
+ * A tick on the strip can step back (`quiet`), so that the weakest metric's lead: the digit
+ * stays, and the edge goes to the printed rule. Its family then rests on the digit alone, so
+ * Select and Borderline read alike there to a colour-blind reader. The rating stays a word in
+ * its rubric row, and the tick takes its mark edge back once its metric is open or it is pressed.
  */
-export function evidenceNumberClass(family: JudgementFamily | null, pressed: boolean): string {
+export function evidenceNumberClass(family: JudgementFamily | null, pressed: boolean, quiet = false): string {
   const shades = EVIDENCE_NUMBER[family ?? 'ink'];
-  return pressed ? shades.pressed : shades.resting;
+  if (pressed) return shades.pressed;
+  return quiet ? shades.quiet : shades.resting;
 }

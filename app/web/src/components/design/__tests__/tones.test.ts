@@ -190,6 +190,19 @@ describe('an evidence number', () => {
     expect(evidenceNumberClass(null, false)).toBe('border-ink bg-paper text-ink');
     expect(evidenceNumberClass(null, true)).toBe('border-ink bg-ink text-paper');
   });
+
+  it.each([
+    ['ready', 'border-rule bg-paper text-ready-text'],
+    ['unresolved', 'border-rule bg-paper text-unresolved-text'],
+    ['closed', 'border-rule bg-paper text-closed-text'],
+    [null, 'border-rule bg-paper text-ink'],
+  ] as const)('of a %s metric steps back to a faint edge and keeps its digit', (family, quiet) => {
+    expect(evidenceNumberClass(family, false, true)).toBe(quiet);
+  });
+
+  it('pressed, never steps back', () => {
+    expect(evidenceNumberClass('ready', true, true)).toBe(evidenceNumberClass('ready', true));
+  });
 });
 
 describe('a state printed as a word', () => {
