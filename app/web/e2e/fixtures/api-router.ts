@@ -462,7 +462,7 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', '/api/interview-rounds', ({ query }, db) => (query.has('q') ? { status: 400, json: { error: 'invalid_query' } } : r1QueuePage(query, '', db))],
   ['POST', '/api/interview-rounds/search', ({ query, body }, db) => r1QueuePage(query, String(body?.q ?? '').toLowerCase(), db)],
   // Only the R1 candidate has rounds (R1-REC); everyone else's list is empty, as before.
-  ['GET', '/api/candidates/:id/interview-rounds', ({ params }, db) => ok({ rounds: params.id === R1_CANDIDATE_ID ? db.r1.rounds : [] })],
+  ['GET', '/api/candidates/:id/interview-rounds', ({ params }, db) => ok({ rounds: params.id === R1_CANDIDATE_ID ? db.r1.rounds : (db.r1.otherRounds[params.id] ?? []) })],
   // The recording mint (R1-REC): always 200 with a `state` for the expected conditions; a link only
   // for ready/partial. `db.r1.mints[session]` queues what the link fields are, call by call.
   ['GET', '/api/interview-rounds/:id/recording', ({ params, query }, db) => {

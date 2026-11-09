@@ -55,6 +55,8 @@ export interface R1SectionProps {
   decisionBlocked?: boolean;
   /** Every read of the rounds, so the page can say the result in its header without a second read. */
   onRoundsChange?: (rounds: R1Round[]) => void;
+  /** A read of the rounds that failed, so the page stops waiting for one. */
+  onRoundsFailed?: () => void;
   /** What to draw when there is no card to draw. This is a tab, so nothing would be an empty panel. */
   empty?: ReactNode;
 }
@@ -71,6 +73,7 @@ export function R1Section({
   userId,
   decisionBlocked = false,
   onRoundsChange,
+  onRoundsFailed,
   empty = null,
 }: R1SectionProps) {
   const headingId = useId();
@@ -145,6 +148,10 @@ export function R1Section({
   useEffect(() => {
     if (rounds.status === 'ready') onRoundsChange?.(rounds.rounds);
   }, [rounds, onRoundsChange]);
+
+  useEffect(() => {
+    if (rounds.status === 'error') onRoundsFailed?.();
+  }, [rounds, onRoundsFailed]);
 
   const settle = useCallback(() => {
     headingRef.current?.focus();

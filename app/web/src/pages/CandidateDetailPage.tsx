@@ -59,7 +59,7 @@ import { ExportReportButton } from "../components/talent/ExportReportButton";
 import { headlineCallFacts } from "../components/talent/sessionLegs";
 import { latestScreeningAssessment } from "../lib/latest-screening-assessment";
 import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
-import { candidateTabFrom, defaultCandidateTab, hasPhoneReview } from "../lib/candidate-tabs";
+import { candidateTabFrom, defaultCandidateTab, hasPhoneReview, hasR1Session } from "../lib/candidate-tabs";
 import type { CandidateTab } from "../lib/candidate-tabs";
 import { r1ResultLine, r1ResultRound } from "../lib/r1";
 import type { R1Round } from "../lib/r1-types";
@@ -112,6 +112,8 @@ import type { PhoneSlot } from "../types";
  *
  * On the Phone screening tab the header is compact, because the log header below
  * it carries the role and the length, and the reasoning pane carries the score.
+ * It keeps a place for the rating summary (`HeaderRatings`), which the phone
+ * workspace fills from the scorecard its panel is showing.
  *
  * The latest screening score sits top right of the header (HeaderScore). It is
  * the phone score. The R1 result, when there is one, is a line of its own under
@@ -139,6 +141,14 @@ export function CandidateDetailPage() {
   // The R1 tab's own read of the rounds, for the line under the phone score: its
   // panel stays mounted, so this costs no second request. Empty until it answers.
   const [r1Rounds, setR1Rounds] = useState<R1Round[]>([]);
+  // Whether that read has answered, with rounds or with a failure. Until it has, the compact header keeps
+  // the R1 line's room; after, only a line to print takes any.
+  const [r1RoundsRead, setR1RoundsRead] = useState(false);
+  const takeR1Rounds = useCallback((rounds: R1Round[]) => {
+    setR1Rounds(rounds);
+    setR1RoundsRead(true);
+  }, []);
+  const r1RoundsFailed = useCallback(() => setR1RoundsRead(true), []);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
@@ -187,6 +197,8 @@ export function CandidateDetailPage() {
   // inside the Profile panel while that panel is still `hidden`, where a
   // browser refuses focus and leaves it on the header button.
   const tabsRef = useRef<HTMLDivElement | null>(null);
+  // The header's place for the rating summary, once it exists. See `ratingsSlot` below.
+  const [ratingsSlot, setRatingsSlot] = useState<HTMLElement | null>(null);
   const [pendingTabAction, setPendingTabAction] = useState<
     { tab: CandidateTab; then: "focus-tab" | "open-call" } | null
   >(null);
@@ -211,6 +223,7 @@ export function CandidateDetailPage() {
     // tab only reports a read that worked: another person's verdict must not wait
     // here for it. Nulling the detail unmounts the tab, so it always reads again.
     setR1Rounds([]);
+    setR1RoundsRead(false);
     // Older embedded candidate surfaces may provide only the candidate
     // endpoint in their test/host adapter. Treat that missing optional role
     // lookup as viewer-safe; the production API always supplies it and the
@@ -433,6 +446,16 @@ export function CandidateDetailPage() {
   // A verdict, so it reads as it does on the R1 tab below it.
   const r1LineFamily = verdictFamily(r1ResultRound(r1Rounds)?.recommendation);
   const r1LineShade = r1LineFamily ? FAMILY_CLASSES[r1LineFamily].text : "text-ink-secondary";
+  // The rounds answer after this header has painted. The line would then widen the facts under it, and
+  // that can wrap them or take the rating summary out of the name row, so the panes would jump. Its room
+  // is kept from the first paint for anyone with an R1 session, while the read is out. 180px holds the
+  // widest line there can be, "R1 role-play: Borderline 100 (AI)", and 16px is its line's height: empty,
+  // the span is 0px tall, so where it wraps onto a line of its own that line would grow when the words
+  // arrive. Once the read has answered, only a line keeps it: a blank 180px wide would hold the summary
+  // out of the name row for as long as the page is open, and an unscored round is the common case. Giving
+  // it back is the one move at load; the header measures the summary's fit again on that commit.
+  const r1LineInCompactHeader =
+    reviewing && (r1Line !== null || (!decisionBlocked && !r1RoundsRead && hasR1Session(detail)));
 
   // The list hands over the address it was on, so Back returns to the same page
   // of the same filter. Only a query string is taken from router state.
@@ -455,6 +478,7 @@ export function CandidateDetailPage() {
 
       <CandidateHeader
         compact={reviewing}
+        onRatingsSlot={setRatingsSlot}
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
         // Directly under the name, above the tabs: where the candidate is
@@ -477,8 +501,8 @@ export function CandidateDetailPage() {
             {/* M017: "Resume parsing" / "Phone parsing", after the status and
                 its own detail; nothing on an API without the field. */}
             <IntakeBadge value={candidate.intake_type} />
-            {reviewing && r1Line && (
-              <span className={`text-meta ${r1LineShade}`}>{r1Line}</span>
+            {r1LineInCompactHeader && (
+              <span data-header-r1-line="" className={`inline-block min-h-4 min-w-[11.25rem] text-meta ${r1LineShade}`}>{r1Line}</span>
             )}
             <CandidateHeadlineFacts
               // On this tab the log header prints the role and the length.
@@ -539,6 +563,9 @@ export function CandidateDetailPage() {
                   roleTitle={roleTitle}
                   ashbyWorkflow={ashbyWorkflow}
                   resumeFacts={candidate.parsed}
+                  // Between a change of address and its read this page still holds the last
+                  // candidate, and none of their figures may stand in the next one's header.
+                  ratingsSlot={candidate.id === id ? ratingsSlot : null}
                   // Mounted only while this is the open tab (and the Profile
                   // copy only while Profile is): one player on the page at a
                   // time, and switching tabs unmounts the <audio>, so nothing
@@ -570,7 +597,8 @@ export function CandidateDetailPage() {
                   role={me.role}
                   userId={me.userId || null}
                   decisionBlocked={decisionBlocked}
-                  onRoundsChange={setR1Rounds}
+                  onRoundsChange={takeR1Rounds}
+                  onRoundsFailed={r1RoundsFailed}
                   empty={<EmptyPanel title="No R1 round has been sent yet." />}
                 />
               ),

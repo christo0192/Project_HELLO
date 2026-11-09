@@ -10,7 +10,8 @@
 import type { Locator, Page } from '@playwright/test';
 import { auditA11y } from './fixtures/axe';
 import { makeReviewBusy } from './fixtures/busy-review';
-import { R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_CANDIDATE_ID, STAR_CANDIDATE_ID } from './fixtures/data';
+import { busyReview, R1_CANDIDATE_ID, R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_CANDIDATE_ID, STAR_CANDIDATE_ID, V2_SESSION_ID } from './fixtures/data';
+import type { BusyReviewOptions } from './fixtures/data';
 import { expect, test, type AppHarness } from './fixtures/harness';
 
 /** The star candidate has one completed session, so Review opens on it with nothing to pick. */
@@ -22,9 +23,14 @@ async function openReview(app: AppHarness, page: Page): Promise<Locator> {
   return panel;
 }
 
-/** The same page on a screening shaped like a real one: see `fixtures/busy-review`. */
+/**
+ * The same page on a screening shaped like a real one: see `fixtures/busy-review`. The rating summary
+ * sits in the name row, as it does on production, so the header is the height these layouts were
+ * measured at.
+ */
 async function openBusy(app: AppHarness, page: Page, options?: Parameters<typeof makeReviewBusy>[1]): Promise<Locator> {
   makeReviewBusy(app.db, options);
+  roomInTheNameRow(app);
   return openReview(app, page);
 }
 
@@ -486,6 +492,37 @@ async function rubricOnArrival(panel: Locator): Promise<{ heights: number[]; who
   };
 }
 
+/**
+ * The name row with room for the rating summary, so the header is the height it was without one: no
+ * email, and only Export report, which is all production has until an API sends the Ashby link.
+ */
+function roomInTheNameRow(app: AppHarness): void {
+  const read = app.db.candidateDetail;
+  app.db.candidateDetail = (id) => {
+    const detail = read(id);
+    if (detail && id === STAR_CANDIDATE_ID) detail.candidate.email = null;
+    return detail;
+  };
+  const readWorkflow = app.db.ashbyWorkflowFor;
+  app.db.ashbyWorkflowFor = (id) => {
+    const workflow = readWorkflow(id);
+    return workflow && { ...workflow, ashbyProfileUrl: undefined };
+  };
+}
+
+/** The five rows of the star candidate's plain screening, each whole above the pane's fold and on one line. */
+async function allFiveRowsFit(panel: Locator): Promise<void> {
+  const pane = panel.getByRole('region', { name: 'AI recommendation' });
+  const rows = pane.locator('[data-rubric-row]');
+  await expect(rows).toHaveCount(5);
+  const paneBox = (await pane.boundingBox())!;
+  for (const row of await rows.all()) {
+    const box = (await row.boundingBox())!;
+    expect(box.y + box.height, 'a rubric row is below the fold').toBeLessThanOrEqual(paneBox.y + paneBox.height);
+    expect((await row.locator('h4').boundingBox())!.height, 'a metric name wrapped').toBeLessThan(26);
+  }
+}
+
 test.describe('Review, the rubric', () => {
   test('at 1440x900 the rows of a busy screening are 72, 27, 30, 30, 30 and 30, each name on one line', async ({ app, page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -559,10 +596,38 @@ test.describe('Review, the rubric', () => {
     await expect(list.getByText('Red flag:', { exact: true })).toHaveCount(5);
   });
 
+  test('all five rows are on screen when Review opens at 1440x900, each on one line', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target, so the summary takes two of them');
+    await page.setViewportSize({ width: 1440, height: 900 });
+    roomInTheNameRow(app);
+    const panel = await openReview(app, page);
+    await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'row');
+    await allFiveRowsFit(panel);
+  });
+
+  test('with the summary on its own line the pane gives up that line and no more, and every name stays on one line', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'a phone stacks the panes');
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openReview(app, page);
+    await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'line');
+    const pane = panel.getByRole('region', { name: 'AI recommendation' });
+    const rows = pane.locator('[data-rubric-row]');
+    await expect(rows).toHaveCount(5);
+    const paneBox = (await pane.boundingBox())!;
+    const last = (await rows.last().boundingBox())!;
+    // The own line costs the pane its height, so the last row can fall a scroll away. What it says is in
+    // the header. This pins that the cost stops at the line.
+    expect(last.y + last.height, 'more than the summary\'s 20px line went').toBeLessThanOrEqual(paneBox.y + paneBox.height + 20);
+    for (const row of await rows.all()) {
+      expect((await row.locator('h4').boundingBox())!.height, 'a metric name wrapped').toBeLessThan(26);
+    }
+  });
+
   test('a second session keeps them there: the picker in the log header stays one line', async ({ app, page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target');
     await page.setViewportSize({ width: 1440, height: 900 });
     makeReviewBusy(app.db, { redFlags: 4 });
+    roomInTheNameRow(app);
     const read = app.db.candidateDetail;
     app.db.candidateDetail = (id) => {
       const detail = read(id);
@@ -586,6 +651,496 @@ test.describe('Review, the rubric', () => {
       expect((await name.boundingBox())!.height, 'a metric name wrapped').toBeLessThan(26);
     }
   });
+});
+
+test.describe('Review, the ratings in the header', () => {
+  const SCREENS = [
+    { width: 1440, height: 900 },
+    { width: 1440, height: 768 },
+    { width: 1366, height: 768 },
+  ];
+  const EMAIL = 'firstname.lastname@example.com';
+  const LONG_NAME = 'Venkatanarasimha Raghavendra Subramanyam Iyengar';
+  const LONG_EMAIL = 'firstname.middlename.lastname.someone.long@example-company-domain.com';
+  /** The own line: a 44px action row and one 24px line, where a plain row is 44 and 4 of padding. */
+  const OWN_LINE_GROWTH = 20;
+  /** The same, on two lines. */
+  const TWO_LINE_GROWTH = 44;
+
+  const desktopOnly = (testInfo: { project: { name: string } }) =>
+    test.skip(testInfo.project.name !== 'desktop', 'a phone stacks the summary, and has its own test');
+
+  async function openBusy(app: AppHarness, page: Page, options: BusyReviewOptions): Promise<Locator> {
+    busyReview(app.db, options);
+    await app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=phone`);
+    const panel = page.getByRole('tabpanel', { name: 'Phone screening' });
+    await expect(panel.getByRole('heading', { name: 'AI recommendation' })).toBeVisible();
+    await app.settle();
+    return panel;
+  }
+
+  const ratings = (page: Page): Locator => page.locator('[data-header-ratings]');
+  const items = (page: Page): Locator => page.locator('[data-header-rating]');
+  const exportReport = (page: Page): Locator => page.getByRole('button', { name: /Export report/ });
+  /** As it reads on screen: `innerText` leaves out what the layout hides, and keeps a stacked line break. */
+  const leadAsPrinted = (page: Page): Promise<string> => page.locator('[data-header-ratings-lead]').evaluate((el) => (el as HTMLElement).innerText);
+  const workspaceTop = async (page: Page): Promise<number> => (await page.locator('[data-review-workspace]').boundingBox())!.y;
+  const edgesOf = async (subject: Locator) => {
+    const box = (await subject.boundingBox())!;
+    return { left: box.x, right: box.x + box.width, top: box.y, bottom: box.y + box.height, width: box.width, height: box.height };
+  };
+
+  /** The header's height with no summary in it, for the same candidate in the same window. */
+  async function plainTop(app: AppHarness, page: Page, options: BusyReviewOptions): Promise<number> {
+    busyReview(app.db, { ...options, noScorecard: true });
+    await app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=phone`);
+    await expect(page.locator('[data-review-workspace]')).toBeVisible();
+    await app.settle();
+    return workspaceTop(page);
+  }
+
+  /** Nothing covers it: `toBeInViewport` passes a control under a sticky bar. */
+  const onTop = async (subject: Locator) => {
+    const hit = await subject.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      const top = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      return { itself: top !== null && (top === el || el.contains(top)), found: top?.outerHTML.slice(0, 80) };
+    });
+    expect(hit.itself, `covered by ${hit.found}`).toBe(true);
+  };
+
+  const clearOf = async (page: Page) => {
+    const summary = await edgesOf(ratings(page));
+    const action = await edgesOf(exportReport(page));
+    const apart = summary.right <= action.left || summary.top >= action.bottom;
+    expect(apart, `the summary runs over Export report: ${JSON.stringify({ summary, action })}`).toBe(true);
+  };
+
+  const r1Line = (page: Page): Locator => page.locator('[data-header-r1-line]');
+  const R1_LINE = 'R1 role-play: Borderline 58 (AI)';
+
+  /** Neither box touches the other, on either axis. */
+  const noOverlap = async (one: Locator, other: Locator, what: string) => {
+    const a = await edgesOf(one);
+    const b = await edgesOf(other);
+    const apart = a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top;
+    expect(apart, `${what}: ${JSON.stringify({ a, b })}`).toBe(true);
+  };
+
+  /** The rounds wait for the test, so the page settles on what it has before the R1 line arrives. */
+  async function openBeforeTheRounds(app: AppHarness, page: Page, options: BusyReviewOptions): Promise<() => void> {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(`**/api/candidates/${STAR_CANDIDATE_ID}/interview-rounds`, async (route) => {
+      await held;
+      await route.fallback();
+    });
+    busyReview(app.db, { ...options, r1: true });
+    await page.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=phone`);
+    await expect(items(page)).toHaveCount(options.metrics ?? 6);
+    // Not `app.settle()`: the held read is what keeps the network busy.
+    await page.evaluate(() => document.fonts.ready.then(() => new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))));
+    return release;
+  }
+
+  for (const screen of SCREENS) {
+    test(`at ${screen.width}x${screen.height} with no email it sits in the name row, three by two, and the header does not grow`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize(screen);
+      const plain = await plainTop(app, page, {});
+      await openBusy(app, page, {});
+
+      await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'row');
+      expect(await workspaceTop(page), 'the header grew').toBe(plain);
+      await expect(items(page)).toHaveCount(6);
+
+      const summary = await edgesOf(ratings(page));
+      expect(summary.height).toBeLessThanOrEqual(48);
+      await clearOf(page);
+      const heading = await edgesOf(page.getByRole('heading', { level: 1 }));
+      expect(summary.left).toBeGreaterThanOrEqual(heading.right);
+      // Filled across, in rubric order: three on each of two rows.
+      const boxes = await Promise.all((await items(page).all()).map(edgesOf));
+      expect(new Set(boxes.map((box) => box.top)).size).toBe(2);
+      expect(boxes[0].top).toBe(boxes[2].top);
+      expect(boxes[3].top).toBeGreaterThan(boxes[2].top);
+      expect(boxes[0].left).toBeLessThan(boxes[1].left);
+      expect(boxes[1].left).toBeLessThan(boxes[2].left);
+      expect(boxes[3].left).toBe(boxes[0].left);
+      // Stacked, so the line break parts the words the box's dot parts.
+      expect((await leadAsPrinted(page)).split('\n')).toEqual(['Provisional', '5 of 6 metrics']);
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+
+    test(`at ${screen.width}x${screen.height} with an email it takes its own line, and grows the header by that line alone`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize(screen);
+      const plain = await plainTop(app, page, { email: EMAIL });
+      await openBusy(app, page, { email: EMAIL });
+
+      await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'line');
+      expect(await workspaceTop(page)).toBe(plain + OWN_LINE_GROWTH);
+      const boxes = await Promise.all((await items(page).all()).map(edgesOf));
+      expect(boxes).toHaveLength(6);
+      expect(new Set(boxes.map((box) => box.top)).size, 'six across, on one line').toBe(1);
+      await clearOf(page);
+      const summary = await edgesOf(ratings(page));
+      expect(summary.top).toBeGreaterThanOrEqual((await edgesOf(exportReport(page))).bottom);
+      expect(summary.height).toBe(24);
+      expect(await leadAsPrinted(page)).toBe('Provisional · 5 of 6 metrics');
+      await expect(page.getByRole('group', { name: 'Provisional · 5 of 6 metrics' })).toBeVisible();
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+
+    test(`at ${screen.width}x${screen.height} a long name with no email behaves as an email does`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize(screen);
+      await openBusy(app, page, { name: LONG_NAME });
+      await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'line');
+      await clearOf(page);
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+  }
+
+  for (const screen of SCREENS) {
+    for (const options of [{}, { email: EMAIL }, { name: LONG_NAME }, { name: LONG_NAME, email: LONG_EMAIL }, { statusDetail: true }] as BusyReviewOptions[]) {
+      test(`at ${screen.width}x${screen.height} an R1 result stands beside the summary, and nothing moves when it arrives: ${JSON.stringify(options)}`, async ({ app, page }, testInfo) => {
+        desktopOnly(testInfo);
+        await page.setViewportSize(screen);
+        const release = await openBeforeTheRounds(app, page, options);
+        if (options.statusDetail) await expect(page.locator('[data-phone-status-detail]')).toBeVisible();
+        await expect(r1Line(page)).toBeEmpty();
+        const fit = await page.locator('[data-ratings-fit]').getAttribute('data-ratings-fit');
+        const before = await workspaceTop(page);
+        const room = await edgesOf(r1Line(page));
+
+        release();
+        await expect(r1Line(page)).toHaveText(R1_LINE);
+        await app.settle();
+
+        expect(await workspaceTop(page), 'the panes moved').toBe(before);
+        await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', fit!);
+        expect((await edgesOf(r1Line(page))).width, 'the line outgrew the room kept for it').toBe(room.width);
+        expect((await edgesOf(r1Line(page))).height, 'the line grew taller than the room kept for it').toBe(room.height);
+        await expect(items(page)).toHaveCount(6);
+        await clearOf(page);
+        await noOverlap(r1Line(page), ratings(page), 'the R1 line runs into the summary');
+        await noOverlap(r1Line(page), exportReport(page), 'the R1 line runs into Export report');
+        expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+      });
+    }
+
+    test(`at ${screen.width}x${screen.height} the Ashby action keeps clear of the summary and the R1 line`, async ({ app, page }, testInfo) => {
+      test.info().annotations.push({ type: 'fixture-only', description: 'No API supplies ashbyProfileUrl yet.' });
+      desktopOnly(testInfo);
+      await page.setViewportSize(screen);
+      await openBusy(app, page, { email: EMAIL, r1: true, ashbyLink: true });
+      await expect(r1Line(page)).toHaveText(R1_LINE);
+      const decide = page.getByRole('link', { name: /^Open in Ashby to decide/ });
+      await expect(decide).toBeVisible();
+      await noOverlap(ratings(page), decide, 'the summary runs into the Ashby action');
+      await noOverlap(r1Line(page), decide, 'the R1 line runs into the Ashby action');
+      await noOverlap(r1Line(page), page.getByText('The decision is made in Ashby.'), 'the R1 line runs into the sentence beside the action');
+      await clearOf(page);
+      await noOverlap(r1Line(page), ratings(page), 'the R1 line runs into the summary');
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+  }
+
+  test('the room kept for the R1 line holds the widest line there can be', async ({ app, page }, testInfo) => {
+    desktopOnly(testInfo);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openBusy(app, page, { r1: true });
+    await expect(r1Line(page)).toHaveText(R1_LINE);
+    const room = (await edgesOf(r1Line(page))).width;
+    await r1Line(page).evaluate((el) => { el.textContent = 'R1 role-play: Borderline 100 (AI)'; });
+    expect((await edgesOf(r1Line(page))).width, 'the widest line outgrew its room').toBe(room);
+  });
+
+  // Every R1 round in production is unscored today, so this is the common case: once the rounds answer
+  // with nothing to print, the header is the one a candidate with no R1 session gets.
+  for (const screen of SCREENS) {
+    test(`at ${screen.width}x${screen.height} a round with no result gives its room back, and the summary returns to the name row`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize(screen);
+      await openBusy(app, page, {});
+      await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'row');
+      const withoutR1 = await workspaceTop(page);
+
+      const release = await openBeforeTheRounds(app, page, {});
+      await expect(r1Line(page)).toBeEmpty();
+      app.db.r1.otherRounds[STAR_CANDIDATE_ID] = app.db.r1.otherRounds[STAR_CANDIDATE_ID].map((round) => ({ ...round, recommendation: null, overall: null }));
+      release();
+      await expect(r1Line(page)).toHaveCount(0);
+      await app.settle();
+
+      await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'row');
+      expect(await workspaceTop(page), 'the header kept room for a line it has nothing to print in').toBe(withoutR1);
+      await expect(items(page)).toHaveCount(6);
+      await clearOf(page);
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+  }
+
+  // A status with a detail line wraps the facts, so the room kept for the R1 line can take a line of its own.
+  for (const screen of [{ width: 1280, height: 720 }, { width: 1180, height: 720 }]) {
+    test(`at ${screen.width}x${screen.height} with a status detail line, nothing moves when the R1 line arrives`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize(screen);
+      const release = await openBeforeTheRounds(app, page, { statusDetail: true });
+      await expect(page.locator('[data-phone-status-detail]')).toBeVisible();
+      await expect(r1Line(page)).toBeEmpty();
+      const before = await workspaceTop(page);
+      const scrolled = await pageScrolls(page);
+
+      release();
+      await expect(r1Line(page)).toHaveText(R1_LINE);
+      await app.settle();
+
+      expect(await workspaceTop(page), 'the panes moved').toBe(before);
+      expect(await pageScrolls(page), 'the page began to scroll, or stopped').toBe(scrolled);
+    });
+  }
+
+  for (const options of [{}, { email: EMAIL }, { name: LONG_NAME }, { statusDetail: true }] as BusyReviewOptions[]) {
+    test(`a phone keeps the R1 line's room as well, so nothing moves when it arrives: ${JSON.stringify(options)}`, async ({ app, page }, testInfo) => {
+      test.skip(testInfo.project.name !== 'mobile', 'the phone layout');
+      // From the top of the document: the phone's page scrolls.
+      const top = () => page.locator('[data-review-workspace]').evaluate((el) => el.getBoundingClientRect().top + window.scrollY);
+      const release = await openBeforeTheRounds(app, page, options);
+      await expect(r1Line(page)).toBeEmpty();
+      const before = await top();
+      const room = await edgesOf(r1Line(page));
+
+      release();
+      await expect(r1Line(page)).toHaveText(R1_LINE);
+      await app.settle();
+
+      expect(await top(), 'the panes moved').toBe(before);
+      const line = await edgesOf(r1Line(page));
+      expect(line.height, 'the line grew taller than the room kept for it').toBe(room.height);
+      expect(line.width, 'the line outgrew the room kept for it').toBe(room.width);
+    });
+  }
+
+  test('a phone stacks the R1 line among the facts and the summary under the actions', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout');
+    await openBusy(app, page, { email: EMAIL, r1: true });
+    await expect(r1Line(page)).toHaveText(R1_LINE);
+    await noOverlap(r1Line(page), ratings(page), 'the R1 line runs into the summary');
+    await noOverlap(r1Line(page), exportReport(page), 'the R1 line runs into Export report');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
+  });
+
+  // Six columns need 1350 wide beside the Provisional words, so a smaller window pays for a second line.
+  for (const screen of [{ width: 1280, height: 720 }, { width: 1180, height: 800 }]) {
+    test(`at ${screen.width}x${screen.height} the own line wraps to two rows beside Provisional, and the page stays put`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize(screen);
+      const plain = await plainTop(app, page, { email: EMAIL });
+      await openBusy(app, page, { email: EMAIL });
+
+      await expect(page.locator('[data-ratings-fit]')).toHaveAttribute('data-ratings-fit', 'line');
+      expect(await workspaceTop(page)).toBe(plain + TWO_LINE_GROWTH);
+      const boxes = await Promise.all((await items(page).all()).map(edgesOf));
+      expect(new Set(boxes.map((box) => box.top)).size).toBe(2);
+      await clearOf(page);
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+    });
+  }
+
+  // What the summary adds comes out of the panes' floor, so the page holds wherever it held without one.
+  for (const [width, height, options] of [
+    [1180, 720, { name: LONG_NAME }],
+    [1180, 720, { email: LONG_EMAIL }],
+    [1180, 720, { name: LONG_NAME, email: LONG_EMAIL }],
+    // The tightest window with the R1 line among the facts as well.
+    [1180, 720, { email: EMAIL, r1: true }],
+    [1180, 720, { name: LONG_NAME, email: LONG_EMAIL, r1: true }],
+    [1280, 720, { name: LONG_NAME, email: LONG_EMAIL, r1: true }],
+    // The API's limit, and the owner's question 6. Six is what a real role has.
+    [1440, 900, { metrics: 20 }],
+    [1366, 768, { metrics: 20 }],
+    [1280, 720, { metrics: 20 }],
+    [1180, 720, { metrics: 20, name: LONG_NAME, email: LONG_EMAIL }],
+  ] as Array<[number, number, BusyReviewOptions]>) {
+    test(`at ${width}x${height} the page does not scroll: ${JSON.stringify(options)}`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize({ width, height });
+      const panel = await openBusy(app, page, options);
+      await expect(items(page)).toHaveCount(options.metrics ?? 6);
+      expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+      expect(await scrollsOnItsOwn(panel.getByRole('region', { name: 'AI recommendation' }))).toBe(true);
+    });
+  }
+
+  test('a name cut short keeps its pips and its figure, and says the rest in its title and name', async ({ app, page }, testInfo) => {
+    desktopOnly(testInfo);
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openBusy(app, page, {});
+    const long = page.getByRole('button', { name: 'Work from office fitment, Good, 3 of 4' });
+    await expect(long).toHaveAttribute('title', 'Work from office fitment, Good, 3 of 4');
+    await expect(long.getByText('3/4')).toBeVisible();
+    await expect(long.locator('[data-rating-pips]')).toBeVisible();
+    const name = long.getByText('Work from office fitment');
+    expect(await name.evaluate((el) => el.scrollWidth > el.clientWidth), 'the name should be cut with an ellipsis').toBe(true);
+    const row = await edgesOf(long);
+    expect((await edgesOf(long.locator('[data-rating-pips]'))).right).toBeLessThanOrEqual(row.right);
+  });
+
+  // Beside the Provisional words the columns change at 1350 wide, and a count of two digits is wider.
+  for (const [width, height, options] of [
+    [1440, 900, {}],
+    [1440, 900, { email: EMAIL }],
+    [1440, 900, { name: LONG_NAME }],
+    [1349, 768, { email: EMAIL }],
+    [1350, 768, { email: EMAIL }],
+    [1360, 768, { email: EMAIL }],
+    [1366, 768, { email: EMAIL, metrics: 12 }],
+    [1440, 900, { email: EMAIL, metrics: 20 }],
+  ] as Array<[number, number, BusyReviewOptions]>) {
+    test(`the panes do not move when the scorecard arrives at ${width}x${height}: ${JSON.stringify(options)}`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize({ width, height });
+      // The read waits for the test, so the page shows what it has before the scorecard.
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      await page.route(`**/api/screening/${V2_SESSION_ID}`, async (route) => {
+        await held;
+        await route.fallback();
+      });
+      busyReview(app.db, options);
+      await page.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=phone`);
+      await expect(page.locator('[data-review-workspace]')).toBeVisible();
+      await expect(page.locator('[data-header-ratings-reserve]')).toHaveCount(1);
+      await expect(items(page)).toHaveCount(0);
+      const before = await workspaceTop(page);
+
+      release();
+      await expect(items(page)).toHaveCount(options.metrics ?? 6);
+      await app.settle();
+      expect(await workspaceTop(page)).toBe(before);
+    });
+  }
+
+  for (const options of [{ email: EMAIL, metrics: 20 }, { metrics: 20 }] as BusyReviewOptions[]) {
+    test(`the lead's fixed room holds its widest count: ${JSON.stringify(options)}`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await openBusy(app, page, options);
+      const fits = await page.locator('[data-header-ratings-lead]').evaluate((lead) => {
+        lead.lastElementChild!.textContent = '20 of 20 metrics';
+        return lead.scrollWidth <= lead.clientWidth;
+      });
+      expect(fits, 'the count runs out of the room the blank kept for it').toBe(true);
+    });
+  }
+
+  test('pressing an item opens that row in the pane and moves focus to it, and mints nothing', async ({ app, page }, testInfo) => {
+    desktopOnly(testInfo);
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const panel = await openBusy(app, page, { email: EMAIL });
+    const pane = panel.getByRole('region', { name: 'AI recommendation' });
+    const row = pane.locator('[data-rubric-row="busy-office"]');
+    const toggle = row.getByRole('button', { name: 'Work from office fitment', exact: true });
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    const box = (await pane.boundingBox())!;
+    expect((await row.boundingBox())!.y, 'on this short window the last row starts out of the pane').toBeGreaterThan(box.y + box.height);
+
+    await page.getByRole('button', { name: 'Work from office fitment, Good, 3 of 4' }).click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(toggle).toBeFocused();
+    const head = (await row.getByRole('heading', { level: 4 }).boundingBox())!;
+    expect(head.y).toBeGreaterThanOrEqual(box.y);
+    expect(head.y + head.height).toBeLessThanOrEqual(box.y + box.height);
+    expect(app.calls.filter((c) => /\/api\/recordings\/|\/recording/.test(new URL(c.url).pathname))).toEqual([]);
+    await expect(panel.locator('[data-tape-status]')).toHaveAttribute('data-tape-status', 'idle');
+  });
+
+  test('it is on Phone screening alone, and passes axe there', async ({ app, page }, testInfo) => {
+    desktopOnly(testInfo);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openBusy(app, page, { r1: true });
+    await auditA11y(page, testInfo, 'review-header-ratings', { strict: true });
+    await page.getByRole('tab', { name: 'R1 interview' }).click();
+    await expect(items(page)).toHaveCount(0);
+    await page.getByRole('tab', { name: 'Profile' }).click();
+    await expect(items(page)).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'Latest screening score' })).toBeVisible();
+    await page.getByRole('tab', { name: 'Phone screening' }).click();
+    await expect(items(page)).toHaveCount(6);
+  });
+
+  test('the old links land where they always did: review on the summary, overview off it', async ({ app, page }, testInfo) => {
+    desktopOnly(testInfo);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    busyReview(app.db, {});
+    await app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=review`);
+    await expect(page.getByRole('tab', { name: 'Phone screening' })).toHaveAttribute('aria-selected', 'true');
+    await expect(items(page)).toHaveCount(6);
+    await app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=overview`);
+    await expect(page.getByRole('tab', { name: 'Profile' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('region', { name: 'Latest screening score' })).toBeVisible();
+    await expect(items(page)).toHaveCount(0);
+  });
+
+  test('a candidate with an R1 interview and no phone screening shows no summary, whatever the tab says', async ({ app, page }, testInfo) => {
+    desktopOnly(testInfo);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    for (const tab of ['phone', 'review']) {
+      await app.goto(`/candidates/${R1_CANDIDATE_ID}?tab=${tab}`);
+      await expect(page.getByRole('tab', { name: 'Phone screening' })).toHaveAttribute('aria-selected', 'true');
+      await expect(page.locator('[data-review-workspace]')).toHaveCount(0);
+      await expect(page.locator('[data-ratings-fit]')).toHaveCount(0);
+      await expect(ratings(page)).toHaveCount(0);
+      await expect(items(page)).toHaveCount(0);
+    }
+  });
+
+  test('a contrast theme still draws the pips and the dashed mark', async ({ app, page }, testInfo) => {
+    desktopOnly(testInfo);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openBusy(app, page, {});
+    await page.emulateMedia({ forcedColors: 'active' });
+    const canvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    const pip = items(page).first().locator('[data-rating-pips] > .data-fill').first();
+    expect(await pip.evaluate((el) => getComputedStyle(el).backgroundColor)).not.toBe(canvas);
+    const dashed = page.locator('[data-header-ratings] [data-rating-none]');
+    expect(await dashed.evaluate((el) => getComputedStyle(el).borderTopStyle)).toBe('dashed');
+    expect(await dashed.evaluate((el) => getComputedStyle(el).borderTopColor)).not.toBe(canvas);
+  });
+
+  test('on a phone it stacks under the header, every target reachable, and the page does not scroll sideways', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout');
+    await openBusy(app, page, { email: EMAIL });
+    const summary = await edgesOf(ratings(page));
+    expect(summary.top).toBeGreaterThanOrEqual((await edgesOf(exportReport(page))).bottom);
+    expect(summary.right).toBeLessThanOrEqual(page.viewportSize()!.width);
+    await expect(items(page)).toHaveCount(6);
+    for (const item of await items(page).all()) {
+      expect((await item.boundingBox())!.height, 'a touch screen keeps its 44px target').toBeGreaterThanOrEqual(44);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
+
+    const toggle = page.locator('[data-rubric-row="busy-office"]').getByRole('button', { name: 'Work from office fitment', exact: true });
+    await page.getByRole('button', { name: 'Work from office fitment, Good, 3 of 4' }).click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(toggle).toBeFocused();
+    await onTop(toggle);
+  });
+
+  // Below `lg` the app bar sticks over the top of the page, and `toBeInViewport` cannot see that.
+  for (const [width, metric] of [[1023, 'Communication'], [768, 'Communication'], [640, 'Communication'], [639, 'Stability']] as const) {
+    test(`at ${width} wide a press leaves ${metric} clear of the app bar, with focus on what can be seen`, async ({ app, page }, testInfo) => {
+      desktopOnly(testInfo);
+      await page.setViewportSize({ width, height: 900 });
+      await openBusy(app, page, { email: EMAIL });
+      await items(page).filter({ hasText: metric }).click();
+      const toggle = page.locator('[data-rubric-row]').getByRole('button', { name: metric, exact: true });
+      await expect(toggle).toBeFocused();
+      await onTop(toggle);
+    });
+  }
 });
 
 test.describe('Review, a call past the hour', () => {

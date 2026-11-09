@@ -126,8 +126,18 @@ const RUBRIC_COLUMNS_HOURS = 'sm:grid-cols-[minmax(0,1fr)_2.25rem_8.75rem_8.5rem
 export const metricDisplayName = (metric: ScorecardMetricDisplay, index: number): string =>
   metric.name && metric.name !== metric.id ? metric.name : `Metric ${index + 1}`;
 
-/** The rating as form tick-boxes, in its family. Decoration: the word and the figure beside it are the text. */
-function Pips({ level, max, family }: { level: number; max: number; family: JudgementFamily | null }) {
+/** How many metrics a provisional score rests on: the words the verdict box prints, and the header's summary too. */
+export function scoredOfTotal(scorecard: ScorecardAssessmentDisplay): string {
+  const metrics = Array.isArray(scorecard.metrics) ? scorecard.metrics : [];
+  const scored = metrics.filter((m) => finiteNumber(m.score) !== null).length;
+  return `${scored} of ${metrics.length} metrics`;
+}
+
+/**
+ * The rating as form tick-boxes, in its family. Decoration: the word and the figure beside it are the text.
+ * The header's summary prints this same component, so the two can never disagree.
+ */
+export function Pips({ level, max, family }: { level: number; max: number; family: JudgementFamily | null }) {
   const filled = family ? cx(FAMILY_CLASSES[family].edge, FAMILY_CLASSES[family].fill) : 'border-ink bg-ink';
   return (
     <span aria-hidden="true" data-rating-pips="" className="flex items-center gap-0.5">
@@ -302,7 +312,13 @@ function RubricRow({ metric, index, scorecard, quotes, weakest, open, columns, h
   const family = held ? null : ratingFamily(score, scorecard.scoreScaleMax);
 
   return (
-    <li data-rubric-row={metric.id} className="border-b border-rule py-0.5">
+    // Focusable only with no toggle to take the focus when the header's summary brings a reader here. The
+    // scroll margin is what that press keeps clear: 16px, past the 56px app bar that sticks below `lg`.
+    <li
+      data-rubric-row={metric.id}
+      tabIndex={hasMore ? undefined : -1}
+      className="scroll-mt-[4.5rem] border-b border-rule py-0.5 lg:scroll-mt-4"
+    >
       {/* Printed columns, so the weights, chips and ratings of every row line up as on a form. As narrow
           as their widest content, so a two-word metric keeps one line at 1366px. */}
       <div className={cx('flex flex-wrap items-center gap-x-1.5 gap-y-1 sm:grid', columns)}>
@@ -460,7 +476,7 @@ export function ReviewScorecard({
       >
         {provisional && (
           <p className="absolute -top-2 right-3 bg-paper px-1.5 text-meta text-ink-secondary">
-            <span className="font-semibold text-unresolved-text">Provisional</span> · {scoredCount} of {total} metrics
+            <span className="font-semibold text-unresolved-text">Provisional</span> · {scoredOfTotal(scorecard)}
           </p>
         )}
         <div className="flex items-center justify-between gap-3">
