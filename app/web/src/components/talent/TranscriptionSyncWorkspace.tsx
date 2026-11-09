@@ -3,8 +3,9 @@
  *
  * A single authoritative place to review a completed screening session, laid
  * out as a log sheet (Logsheet, M026):
- *   - the log header: one ruled row of role, screening, interviewer, length and
- *     where the candidate stands in Ashby
+ *   - the log header: one ruled line of role, screening, length and where the
+ *     candidate stands in Ashby, each beside its label, wrapping and never cut.
+ *     The interviewer joins it only when there is no tape to name them
  *   - the call strip, drawn to scale, with its transport (ReviewTape)
  *   - two panes that scroll on their own at 1180px and up, and stack below it:
  *     the transcript as a log sheet (SeekableTranscript), and the reasoning
@@ -16,6 +17,15 @@
  * Pressing a moment also plays it (the signed URL is minted by that press, and
  * never on load). Review opens cued on the weakest metric's first quote, with
  * nothing playing and nothing minted.
+ *
+ * The reasoning pane stays clear as you work. A cue that lands on a metric closes
+ * the row the last cue opened, and a row opened with its arrow is the reader's and
+ * stays. A press inside the pane must not move what was pressed, so the pane scrolls
+ * by what the closing row gave back, and when it runs out of room, that row stays
+ * open until the next cue. Below 1180px the page scrolls and the pane does not, so
+ * there is nothing to hold and the row closes.
+ * Nor does a press scroll the pane to its quote, which is the control pressed or in
+ * the row just opened under it.
  *
  * A cue outranks the audio until the audio catches up. Moving to another call
  * pauses the one playing, and that pause fires a last `timeupdate` from the old
@@ -80,7 +90,6 @@ import { Combobox } from '../design/Combobox';
 import type { ComboboxOption } from '../design/Combobox';
 import { Skeleton, SkeletonText } from '../design/Skeleton';
 import { CandidateButton, SurfaceCard } from '../design/candidate';
-import { cx } from '../design/cx';
 import { figureToneClass, ratingFamily } from '../design/tones';
 import {
   CandidateScorecard,
@@ -93,6 +102,7 @@ import { EvidenceHoldNotice } from './EvidenceHoldNotice';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle, RecordingPlayerStatus } from './RecordingPlayer';
 import { FromTheResume, ReviewScorecard, metricDisplayName, weakestMetric } from './ReviewScorecard';
+import { ReviewCallStripLegend } from '../recording/ReviewCallStrip';
 import { ReviewTape } from './ReviewTape';
 import type { ReviewTapeHandle } from './ReviewTape';
 import { SeekableTranscript } from './SeekableTranscript';
@@ -156,6 +166,24 @@ type LegsState =
 
 /** `legIndex`, or -1 for the "no timing" bucket. */
 const groupKey = (g: LegGroup) => g.legIndex ?? -1;
+
+/** A press inside the reasoning pane, and where things stood before it. `closing`: the rows it holds. */
+interface PaneHold {
+  control: HTMLElement;
+  top: number;
+  scrollTop: number;
+  closing: readonly string[];
+}
+
+/** From the pane and not the window: a press can also scroll the page, and that is no shift. */
+const topInPane = (control: HTMLElement, pane: HTMLElement): number =>
+  control.getBoundingClientRect().top - pane.getBoundingClientRect().top;
+
+/** Only at 1180px and up. Below that the page scrolls and the pane does not, so it has no room to give back. */
+const scrollsOnItsOwn = (pane: HTMLElement): boolean => {
+  const overflow = getComputedStyle(pane).overflowY;
+  return overflow === 'auto' || overflow === 'scroll';
+};
 
 export interface TranscriptionSyncWorkspaceProps {
   sessions: Session[];
@@ -288,6 +316,8 @@ export function TranscriptionSyncWorkspace({
   }, []);
   // Counts evidence presses: the one thing that moves the reasoning pane.
   const [quotePress, setQuotePress] = useState(0);
+  // A press whose closing rows had to reopen: where the pane goes back to, once they have.
+  const [reopened, setReopened] = useState<{ scrollTop: number } | null>(null);
   // What each recording is doing, and the one the tape speaks for.
   const [fileStatus, setFileStatus] = useState<Readonly<Record<string, RecordingPlayerStatus>>>({});
   const [tapeFile, setTapeFile] = useState<string | null>(null);
@@ -305,6 +335,9 @@ export function TranscriptionSyncWorkspace({
   const playingLegRef = useRef<string | null>(null);
   // What Review has already opened cued, so a re-render never cues it again. See `openKey`.
   const openedOnRef = useRef<string | null>(null);
+  // The rows a cue opened, for the next cue to close. A row opened with its arrow is never here.
+  const cueOpenedRef = useRef(new Set<string>());
+  const paneHoldRef = useRef<PaneHold | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const transcriptPaneRef = useRef<HTMLDivElement | null>(null);
   const reasoningPaneRef = useRef<HTMLDivElement | null>(null);
@@ -330,6 +363,8 @@ export function TranscriptionSyncWorkspace({
     setQuietCue(false);
     setConsentOpen(false);
     setOpenMetrics(new Set());
+    cueOpenedRef.current.clear();
+    paneHoldRef.current = null;
     setPlaying(false);
     setTapeFile(null);
     playingLegRef.current = null;
@@ -743,33 +778,82 @@ export function TranscriptionSyncWorkspace({
     [rows, moveTape, bringRowIntoView, playTarget, handlePause],
   );
 
+  /** `pressed`: the control, when it stands in the reasoning pane and so must not move under the pointer. */
   const cueEvidence = useCallback(
-    (number: number) => {
+    (number: number, pressed?: HTMLElement) => {
       const quote = quoteNamed(number);
       if (!quote) return;
-      setOpenMetrics((open) => (open.has(quote.metricId) ? open : new Set(open).add(quote.metricId)));
+      const cueOpened = cueOpenedRef.current;
+      const closing = [...cueOpened].filter((id) => id !== quote.metricId);
+      for (const id of closing) cueOpened.delete(id);
+      if (!openMetrics.has(quote.metricId)) cueOpened.add(quote.metricId);
+      const pane = reasoningPaneRef.current;
+      paneHoldRef.current =
+        pressed && pane
+          ? {
+              control: pressed,
+              top: topInPane(pressed, pane),
+              scrollTop: pane.scrollTop,
+              closing: scrollsOnItsOwn(pane) ? closing : [],
+            }
+          : null;
+      setOpenMetrics((open) => {
+        const next = new Set(open);
+        for (const id of closing) next.delete(id);
+        return next.add(quote.metricId);
+      });
       setQuotePress((count) => count + 1);
       cue(quote.row, number);
     },
-    [quoteNamed, cue],
+    [quoteNamed, cue, openMetrics],
   );
 
-  // Bring a pressed quote into the reasoning pane, without moving keyboard focus. Only for a press: Review
-  // opens with this pane at its top on the recommendation, and playing leaves it where the reader left it.
+  // What a press does to the reasoning pane. Only a press: Review opens with this pane at its top on the
+  // recommendation, and playing leaves it where the reader left it. Keyboard focus never moves.
+  //
+  // A press inside the pane moves nothing in it, or a second press at the same spot would cue another
+  // quote. Its quote is the control pressed, or in the row that just opened under it, so it is not brought
+  // into view. Rows the press closed give back their height, and the pane scrolls by it so the control
+  // stays under the pointer: measured after they close, and before the paint, so a row that has to reopen
+  // never shows. Below 1180px nothing is held: the pane does not scroll, the page does, and those rows close.
+  //
+  // A press from anywhere else, a tick or a margin number, brings its quote in, only as far as it needs.
   useLayoutEffect(() => {
     if (quotePress === 0 || activeEvidence === null) return;
+    const hold = paneHoldRef.current;
     const pane = reasoningPaneRef.current;
-    const quote = pane?.querySelector<HTMLElement>(`[data-quote-button="${activeEvidence}"]`);
-    if (!pane || !quote) return;
+    paneHoldRef.current = null;
+    if (!pane) return;
+    if (hold) {
+      if (hold.closing.length === 0) return;
+      const moved = () => topInPane(hold.control, pane) - hold.top;
+      if (moved() !== 0) pane.scrollTop += moved();
+      if (Math.abs(moved()) >= 1) {
+        // The pane ran out of room. They stay open until the next cue.
+        for (const id of hold.closing) cueOpenedRef.current.add(id);
+        setOpenMetrics((open) => new Set([...open, ...hold.closing]));
+        setReopened({ scrollTop: hold.scrollTop });
+      }
+      return;
+    }
+    const quote = pane.querySelector<HTMLElement>(`[data-quote-button="${activeEvidence}"]`);
+    if (!quote) return;
     const paneBox = pane.getBoundingClientRect();
     const quoteBox = quote.getBoundingClientRect();
-    if (quoteBox.top >= paneBox.top && quoteBox.bottom <= paneBox.bottom) return;
-    pane.scrollTop += quoteBox.top - paneBox.top - 16;
+    if (quoteBox.top < paneBox.top) pane.scrollTop += quoteBox.top - paneBox.top - 16;
+    else if (quoteBox.bottom > paneBox.bottom) pane.scrollTop += quoteBox.bottom - paneBox.bottom + 16;
     // Keyed on the press alone: what it reads changes for other reasons, and those must not scroll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [quotePress]);
 
+  useLayoutEffect(() => {
+    if (reopened === null) return;
+    if (reasoningPaneRef.current) reasoningPaneRef.current.scrollTop = reopened.scrollTop;
+  }, [reopened]);
+
   const handleToggleMetric = useCallback((metricId: string) => {
+    // Touched by hand, a row is the reader's, and no cue closes it.
+    cueOpenedRef.current.delete(metricId);
     setOpenMetrics((open) => {
       const next = new Set(open);
       if (!next.delete(metricId)) next.add(metricId);
@@ -842,6 +926,9 @@ export function TranscriptionSyncWorkspace({
   );
   const consent = useMemo(() => consentSummary(rows, legs), [rows, legs]);
   const consentAt = consent ? `${consent.approximate ? '≈' : ''}${timecode(consent.atSec)}` : null;
+  // The strip leads with what is being read: the weakest metric's ticks and an open metric's. With no
+  // scored metric nothing leads, so nothing steps back. A pressed tick stands on its own, in the strip.
+  const weakestId = reviewCard ? (weakestMetric(reviewCard.metrics)?.id ?? null) : null;
   const ticks = useMemo(
     () =>
       evidence.placed.flatMap((quote) => {
@@ -852,9 +939,10 @@ export function TranscriptionSyncWorkspace({
           sec: at,
           label: `Evidence ${quote.number}: turn ${quote.row + 1} at ${timecode(at)}, ${quote.metricName}`,
           family: familyOfMetric.get(quote.metricId) ?? null,
+          quiet: weakestId !== null && quote.metricId !== weakestId && !openMetrics.has(quote.metricId),
         }];
       }),
-    [evidence, rows, familyOfMetric],
+    [evidence, rows, familyOfMetric, weakestId, openMetrics],
   );
 
   // Turns folded into the consent line, and how a row of a list finds its quotes.
@@ -948,7 +1036,9 @@ export function TranscriptionSyncWorkspace({
     if (!root) return;
     const measure = () => {
       const top = root.getBoundingClientRect().top + window.scrollY;
-      root.style.setProperty('--review-top', `${Math.round(top)}px`);
+      // Up, never down: on a scaled display the header has a fraction, and a workspace that took it as
+      // room would run past the window.
+      root.style.setProperty('--review-top', `${Math.ceil(top)}px`);
       const shown = root.getClientRects().length > 0;
       if (shown && !rootShownRef.current) bringRowIntoView(false);
       rootShownRef.current = shown;
@@ -1025,6 +1115,8 @@ export function TranscriptionSyncWorkspace({
 
   /* The strip and its transport. Always the same height, loading or not. */
   const tapeShown = !permissionDenied && !transcriptError && detailReady && segments.length > 0;
+  // Nothing stands for the tape: the read failed, or the session settled with no times to draw.
+  const noTape = permissionDenied || Boolean(transcriptError) || (detailReady && !tapeShown);
 
   const dropCount = drops.length;
   // The list row, never the loaded one: the recorded roll-ups are computed for the candidate read, and
@@ -1044,73 +1136,70 @@ export function TranscriptionSyncWorkspace({
   // The same word in the same family as the workflow card. Consent lines take no colour.
   const lifecycleTone = ashbyWorkflow ? ashbyLifecycleTone(ashbyWorkflow.lifecycle) : 'neutral';
 
-  /* The log header: one ruled row of labelled cells. */
+  /* The log header: one ruled line of labelled cells, which wraps and is never cut. Each cell's rule
+     stands before it, in the gap, and the list clips the rule of a cell that starts a line: a line
+     that wraps never ends on a rule with nothing beside it. */
   const logHeader = (
-    <dl
-      data-log-header=""
-      className={cx(
-        'grid grid-cols-1 border-y border-rule-2 sm:grid-cols-2',
-        roleTitle === undefined
-          ? 'min-[1180px]:grid-cols-[1.5fr_0.8fr_1.2fr_1.25fr]'
-          : 'min-[1180px]:grid-cols-[1.05fr_1.5fr_0.8fr_1.2fr_1.25fr]',
-      )}
-    >
-      {roleTitle !== undefined && <LogCell label="Role">{roleTitle ?? 'Not available'}</LogCell>}
-      <LogCell label="Screening" labelId={sessionLabelId}>
-        {/* One session has nothing to choose between, so it is a line of text. Two or more are a
-            picker: never the operating system's list, which is the control the owner screenshotted.
-            It floats, or opening it would push the tape and both panes down the page. */}
-        {options.length === 1 ? (
-          <span data-session-text="">{options[0].label}</span>
-        ) : (
-          <Combobox
-            id="sync-session-select"
-            labelId={sessionLabelId}
-            compact
-            floating
-            searchable={options.length > 6}
-            value={selectedSessionId ?? ''}
-            onChange={handleSessionChange}
-            options={options}
-            placeholder="Choose a session"
-            searchLabel="Search sessions"
-            listLabel="Sessions"
-            noun={['session', 'sessions']}
-          />
-        )}
-      </LogCell>
-      <LogCell label="Interviewer">{AI_SPEAKER_LABEL}</LogCell>
-      <LogCell label="Length">
-        {lengthShown}
-        {dropNote && <span className="text-ink-tertiary"> · {dropNote}</span>}
-      </LogCell>
-      <LogCell label="In Ashby">
-        {ashbyWorkflow ? (
-          <>
-            <span className={lifecycleTone === 'neutral' ? undefined : figureToneClass(lifecycleTone)}>
-              {ashbyLifecycleLabel(ashbyWorkflow.lifecycle)}
-            </span>
-            {scorecardSent && (
-              <span className="text-ink-tertiary">
-                {' · '}
-                <span className="text-ready-text">{scorecardSent}</span>
+    <div data-log-header="" className="border-y border-rule-2 px-6">
+      <dl className="flex flex-col sm:flex-row sm:flex-wrap sm:gap-x-[2.0625rem] sm:overflow-x-clip">
+        {roleTitle !== undefined && <LogCell label="Role">{roleTitle ?? 'Not available'}</LogCell>}
+        <LogCell label="Screening" labelId={sessionLabelId}>
+          {/* One session has nothing to choose between, so it is a line of text. Two or more are a
+              picker: never the operating system's list, which is the control the owner screenshotted.
+              It floats, or opening it would push the tape and both panes down the page. */}
+          {options.length === 1 ? (
+            <span data-session-text="">{options[0].label}</span>
+          ) : (
+            <Combobox
+              id="sync-session-select"
+              labelId={sessionLabelId}
+              compact
+              floating
+              searchable={options.length > 6}
+              value={selectedSessionId ?? ''}
+              onChange={handleSessionChange}
+              options={options}
+              placeholder="Choose a session"
+              searchLabel="Search sessions"
+              listLabel="Sessions"
+              noun={['session', 'sessions']}
+            />
+          )}
+        </LogCell>
+        {/* The tape's key and every AI turn print it, so only a page with no tape needs it here. */}
+        {noTape && <LogCell label="Interviewer">{AI_SPEAKER_LABEL}</LogCell>}
+        <LogCell label="Length">
+          {lengthShown}
+          {dropNote && <span className="text-ink-tertiary"> · {dropNote}</span>}
+        </LogCell>
+        <LogCell label="In Ashby">
+          {ashbyWorkflow ? (
+            <>
+              <span className={lifecycleTone === 'neutral' ? undefined : figureToneClass(lifecycleTone)}>
+                {ashbyLifecycleLabel(ashbyWorkflow.lifecycle)}
               </span>
-            )}
-          </>
-        ) : ashbyWorkflow === null ? (
-          'Not linked'
-        ) : (
-          'Not available'
-        )}
-      </LogCell>
-    </dl>
+              {scorecardSent && (
+                <span className="text-ink-tertiary">
+                  {' · '}
+                  <span className="text-ready-text">{scorecardSent}</span>
+                </span>
+              )}
+            </>
+          ) : ashbyWorkflow === null ? (
+            'Not linked'
+          ) : (
+            'Not available'
+          )}
+        </LogCell>
+      </dl>
+    </div>
   );
 
   // A cued moment with no audio says why, in the words its call's group already uses.
   const cuedRow = activeTurnIndex === null ? null : (rows[activeTurnIndex] ?? null);
   const silentLeg = cuedRow && cuedRow.target === null && cuedRow.legIndex !== null ? legs[cuedRow.legIndex] : null;
   const tape =
-    permissionDenied || transcriptError ? null : tapeShown ? (
+    noTape ? null : tapeShown ? (
       <ReviewTape
         key={selectedSessionId}
         ref={tapeRef}
@@ -1154,9 +1243,9 @@ export function TranscriptionSyncWorkspace({
               : RECORDING_NOTE
         }
       />
-    ) : !detailReady ? (
-      <TapePlaceholder />
-    ) : null;
+    ) : (
+      <TapePlaceholder candidateName={speakers.candidate} aiName={speakers.bot} />
+    );
 
   const players = (
     <div id="sync-workspace-player" className="border-b border-rule px-6 py-3 empty:hidden">
@@ -1422,7 +1511,7 @@ export function TranscriptionSyncWorkspace({
           role="region"
           aria-label="AI recommendation"
           tabIndex={0}
-          className="relative min-w-0 border-rule-2 pb-8 pl-6 pr-6 pt-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--c-accent)] max-[1179px]:border-t min-[1180px]:col-start-2 min-[1180px]:row-start-1 min-[1180px]:overflow-y-auto min-[1180px]:border-l min-[1180px]:pl-5"
+          className="relative min-w-0 border-rule-2 pb-8 pl-6 pr-6 pt-1.5 [overflow-anchor:none] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--c-accent)] max-[1179px]:border-t min-[1180px]:col-start-2 min-[1180px]:row-start-1 min-[1180px]:overflow-y-auto min-[1180px]:border-l min-[1180px]:pl-5"
         >
           {reasoningPane}
         </div>
@@ -1435,20 +1524,35 @@ export function TranscriptionSyncWorkspace({
 
 function LogCell({ label, labelId, children }: { label: string; labelId?: string; children: ReactNode }) {
   return (
-    <div className="min-w-0 border-b border-rule px-6 py-1.5 sm:border-l sm:first:border-l-0 min-[1180px]:border-b-0 min-[1180px]:px-3 min-[1180px]:first:pl-6">
-      <dt id={labelId} className="form-label">
+    // In the 33px gap the rule stands 16px from either value, as before; at the start of a line it falls
+    // outside the list, which clips it.
+    <div className="flex min-w-0 items-baseline gap-1.5 border-b border-rule py-1 last:border-b-0 sm:-ml-[1.0625rem] sm:border-b-0 sm:border-l sm:pl-4">
+      <dt id={labelId} className="form-label whitespace-nowrap">
         {label}
       </dt>
-      <dd className="text-sm leading-5 text-ink">{children}</dd>
+      <dd className="min-w-0 text-sm leading-5 text-ink">{children}</dd>
     </div>
   );
 }
 
-/** The strip's own height, so nothing below it moves when the session arrives. */
-function TapePlaceholder() {
+/**
+ * The tape's own height, so nothing below it moves when the session arrives. Its top row wraps at some
+ * widths, so the note and the key stand here too, unseen, and wrap at the same width.
+ */
+function TapePlaceholder({ candidateName, aiName }: { candidateName: string; aiName: string }) {
   return (
-    <div aria-hidden="true" data-tape-placeholder="" className="border-b border-rule-2 px-6 pb-2 pt-2.5">
-      <Skeleton height={28} width={220} className="block" />
+    <div aria-hidden="true" data-tape-placeholder="" className="border-b border-rule-2 px-6 pb-1 pt-1.5">
+      <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1">
+        <Skeleton height={28} width={220} className="block" />
+        <p className="invisible min-w-40 flex-1 basis-0 text-meta">{RECORDING_NOTE}</p>
+        <ReviewCallStripLegend
+          className="invisible ml-auto"
+          candidateName={candidateName}
+          candidateTalk="≈00:00 · ≈00% of talk"
+          aiName={aiName}
+          aiTalk="≈00:00"
+        />
+      </div>
       <Skeleton height={24} width="100%" className="mt-[1.75rem] block" />
       <span className="mt-1.5 block h-4" />
     </div>

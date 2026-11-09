@@ -9,6 +9,7 @@
 
 import type { Locator, Page } from '@playwright/test';
 import { auditA11y } from './fixtures/axe';
+import { makeReviewBusy } from './fixtures/busy-review';
 import { R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_CANDIDATE_ID, STAR_CANDIDATE_ID } from './fixtures/data';
 import { expect, test, type AppHarness } from './fixtures/harness';
 
@@ -19,6 +20,12 @@ async function openReview(app: AppHarness, page: Page): Promise<Locator> {
   await expect(panel.getByRole('heading', { name: 'AI recommendation' })).toBeVisible();
   await app.settle();
   return panel;
+}
+
+/** The same page on a screening shaped like a real one: see `fixtures/busy-review`. */
+async function openBusy(app: AppHarness, page: Page, options?: Parameters<typeof makeReviewBusy>[1]): Promise<Locator> {
+  makeReviewBusy(app.db, options);
+  return openReview(app, page);
 }
 
 const pageScrolls = (page: Page): Promise<boolean> =>
@@ -51,6 +58,26 @@ test.describe('Review, the panes', () => {
       expect(await scrollsOnItsOwn(panel.getByRole('region', { name: 'AI recommendation' }))).toBe(true);
     });
   }
+
+  test('a header of a fractional height, as on a scaled display, leaves the sheet inside its 8px inset', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openBusy(app, page);
+    // Rounded down, --review-top leaves the workspace taller than the window by the difference.
+    for (const margin of ['0.2px', '0.4px', '0.49px']) {
+      await expect
+        .poll(
+          () =>
+            page.evaluate(async (top) => {
+              document.querySelector<HTMLElement>('[role="tablist"]')!.style.marginTop = top;
+              window.dispatchEvent(new Event('resize'));
+              await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
+              return document.querySelector('main')!.getBoundingClientRect().bottom;
+            }, margin),
+          { message: margin },
+        )
+        .toBeLessThanOrEqual(892);
+    }
+  });
 
   test('below 1180px the panes stack, the transcript first', async ({ app, page }) => {
     await page.setViewportSize({ width: 1100, height: 800 });
@@ -164,6 +191,8 @@ test.describe('Review, in colour', () => {
     const panel = await openFirm(app, page, 'reject', 41);
     const tick = (n: number) => panel.locator(`[data-strip-tick="${n}"]`);
     await expect(tick(1)).toHaveAttribute('aria-pressed', 'true');
+    await panel.getByRole('button', { name: 'Communication clarity', exact: true }).click();
+    await panel.getByRole('button', { name: 'Technical depth', exact: true }).click();
     expect(await fill(tick(1))).toBe((await token(page, '--closed-text')).fill);
     expect(await ink(tick(1))).toBe((await token(page, '--paper')).colour);
     expect(await fill(tick(2))).toBe((await token(page, '--paper')).fill);
@@ -175,6 +204,30 @@ test.describe('Review, in colour', () => {
     expect(await fill(panel.locator('[data-quote-button="1"] [data-evidence-number]'))).toBe((await token(page, '--closed-text')).fill);
     // The voice stays the voice.
     expect(await panel.locator('[data-strip-segment="candidate"]').first().getAttribute('fill')).toBe('var(--voice-mark)');
+  });
+
+  test('a tick that steps back keeps its place, its digit and its stem, on a faint edge', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    const quiet = panel.locator('[data-strip-tick][data-tick-quiet]').first();
+    const number = await quiet.getAttribute('data-strip-tick');
+    const before = (await quiet.boundingBox())!;
+    const edge = () => quiet.evaluate((el) => getComputedStyle(el).borderTopColor);
+    const stem = panel.locator(`[data-tick-stem="${number}"]`);
+
+    // The first quiet tick cites a Good, 3 of 4.
+    expect(await ink(quiet)).toBe((await token(page, '--ready-text')).colour);
+    expect(await edge()).toBe((await token(page, '--rule')).colour);
+    expect(await fill(stem)).toBe((await token(page, '--control')).fill);
+    await expect(quiet).toHaveAccessibleName(/^Evidence \d+: turn \d+ at \d\d:\d\d, /);
+
+    // Its metric opens by a press: the same box, at full weight.
+    await holdTheRecording(page);
+    await quiet.click();
+    await expect(panel.locator(`[data-strip-tick="${number}"]`)).toHaveAttribute('aria-pressed', 'true');
+    const after = (await panel.locator(`[data-strip-tick="${number}"]`).boundingBox())!;
+    expect({ x: after.x, y: after.y, width: after.width, height: after.height }).toEqual({ x: before.x, y: before.y, width: before.width, height: before.height });
+    expect(await fill(stem)).toBe((await token(page, '--ink')).fill);
   });
 
   test('"Writing results back to Ashby" is underway', async ({ app, page }) => {
@@ -275,6 +328,118 @@ test.describe('Review, in colour', () => {
 });
 
 test.describe('Review, the log header', () => {
+  /** What the sheet leaves for the panes: the window, less all that sits above them and the 9px below. */
+  const panesFill = async (panel: Locator, height: number): Promise<void> => {
+    const pane = (await panel.getByRole('region', { name: 'AI recommendation' }).boundingBox())!;
+    expect(pane.y + pane.height).toBe(height - 9);
+  };
+
+  test('at 1440x900 it is one ruled line of 30px, and the tape is 113px', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    const header = panel.locator('[data-log-header]');
+    expect((await header.boundingBox())!.height).toBe(30);
+    expect((await panel.getByRole('region', { name: 'Call recording and strip' }).boundingBox())!.height).toBe(113);
+    await panesFill(panel, 900);
+    // Every label stays printed, on the same line as its value.
+    for (const label of ['Role', 'Screening', 'Length', 'In Ashby']) {
+      const printed = header.getByText(label, { exact: true });
+      await expect(printed).toBeVisible();
+      const value = printed.locator('xpath=following-sibling::dd');
+      const [labelBox, valueBox] = [(await printed.boundingBox())!, (await value.boundingBox())!];
+      expect(labelBox.x + labelBox.width, label).toBeLessThanOrEqual(valueBox.x);
+      expect(Math.abs(labelBox.y + labelBox.height - (valueBox.y + valueBox.height)), label).toBeLessThan(4);
+    }
+    await expect(header).not.toContainText('Interviewer');
+  });
+
+  test('at 1366 wide the line wraps to about 58px, and nothing is cut', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const panel = await openBusy(app, page);
+    const header = panel.locator('[data-log-header]');
+    expect((await header.boundingBox())!.height).toBe(58);
+    await panesFill(panel, 768);
+    for (const value of await header.locator('dd').all()) {
+      const cut = await value.evaluate((el) => el.scrollWidth > el.clientWidth || getComputedStyle(el).textOverflow === 'ellipsis');
+      expect(cut, 'a value is cut').toBe(false);
+    }
+    await expect(header).toContainText('AI scorecard sent');
+  });
+
+  for (const viewport of [{ width: 1366, height: 768 }, { width: 1024, height: 768 }]) {
+    test(`at ${viewport.width} wide a wrapped line never ends on a rule with nothing beside it`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      const panel = await openBusy(app, page);
+      const { lines, stray } = await panel.locator('[data-log-header]').evaluate((header) => {
+        const list = header.matches('dl') ? header : header.querySelector('dl')!;
+        const clip = getComputedStyle(list).overflowX === 'visible' ? { left: 0, right: window.innerWidth } : list.getBoundingClientRect();
+        const words = [...list.querySelectorAll('dt, dd')].map((el) => el.getBoundingClientRect());
+        const found: string[] = [];
+        for (const cell of list.children) {
+          const box = cell.getBoundingClientRect();
+          const style = getComputedStyle(cell);
+          const rules = [
+            parseFloat(style.borderLeftWidth) > 0 ? box.left : null,
+            parseFloat(style.borderRightWidth) > 0 ? box.right - parseFloat(style.borderRightWidth) : null,
+          ];
+          for (const x of rules) {
+            if (x === null || x < clip.left || x >= clip.right) continue;
+            const onLine = words.filter((w) => w.top + w.height / 2 > box.top && w.top + w.height / 2 < box.bottom);
+            const before = onLine.some((w) => w.right <= x + 0.5);
+            const after = onLine.some((w) => w.left >= x + 0.5);
+            if (!before || !after) found.push(`${cell.querySelector('dt')!.textContent} at ${Math.round(x)}`);
+          }
+        }
+        return { lines: new Set([...list.children].map((cell) => Math.round(cell.getBoundingClientRect().top))).size, stray: found };
+      });
+      expect(lines, 'the header did not wrap, so this proves nothing').toBeGreaterThan(1);
+      expect(stray).toEqual([]);
+    });
+  }
+
+  test('a role too long for the line wraps inside the sheet, and the panes still fill the window', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    makeReviewBusy(app.db);
+    const role = app.db.roles.find((r) => r.id === app.db.candidates.find((c) => c.id === STAR_CANDIDATE_ID)!.role_id)!;
+    role.title = 'Senior Inside Sales Program Advisor for Working Professionals, Upskilling and Career Transitions';
+    const panel = await openReview(app, page);
+    const header = panel.locator('[data-log-header]');
+    await expect(header).toContainText(role.title);
+    const headerBox = (await header.boundingBox())!;
+    for (const value of await header.locator('dd').all()) {
+      const box = (await value.boundingBox())!;
+      expect(box.x + box.width, 'a value runs out of the sheet').toBeLessThanOrEqual(headerBox.x + headerBox.width);
+    }
+    await panesFill(panel, 900);
+  });
+
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 1440, height: 768 }, { width: 1366, height: 768 }]) {
+    test(`at ${viewport.width}x${viewport.height} the panes do not jump when the tape replaces its placeholder`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      makeReviewBusy(app.db);
+      let release = (): void => undefined;
+      const answered = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await page.route(/\/api\/screening\/[^/]+$/, async (route) => {
+        await answered;
+        await route.fallback();
+      });
+      const going = app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=phone`);
+      const placeholder = page.locator('[data-tape-placeholder]');
+      await expect(placeholder).toBeVisible();
+      const waiting = (await placeholder.boundingBox())!;
+      const paneWaiting = (await page.locator('[data-review-pane="reasoning"]').boundingBox())!;
+
+      release();
+      await going;
+      const tape = page.getByRole('region', { name: 'Call recording and strip' });
+      await expect(tape).toBeVisible();
+      expect((await tape.boundingBox())!.height).toBe(waiting.height);
+      expect((await page.locator('[data-review-pane="reasoning"]').boundingBox())!.y).toBe(paneWaiting.y);
+    });
+  }
+
   test('reads the length from the session list: GET /api/screening/:id has no recorded total', async ({ app, page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     const panel = await openReview(app, page);
@@ -297,31 +462,107 @@ test.describe('Review, the log header', () => {
     await expect(two.getByRole('listbox', { name: 'Sessions' })).toBeVisible();
     // In flow, the list would push the tape and both panes down the page.
     expect((await transcript.boundingBox())!.y).toBe(before.y);
-    await expect(two.getByRole('option', { name: /Recorded 1m 30s/ })).toBeInViewport();
+    const option = two.getByRole('option', { name: /Recorded 1m 30s/ });
+    await expect(option).toBeInViewport();
+    // Over the page, edge to edge: the header clips nothing of it, and nothing below paints over it.
+    const reachable = await option.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      const y = box.top + box.height / 2;
+      return [box.left + 2, box.left + box.width / 2, box.right - 2].map((x) => el.contains(document.elementFromPoint(x, y)));
+    });
+    expect(reachable).toEqual([true, true, true]);
   });
 });
 
-async function allFiveRowsFit(panel: Locator): Promise<void> {
+/** What the reasoning pane shows on arrival: each row's height, and how many stand whole above its fold. */
+async function rubricOnArrival(panel: Locator): Promise<{ heights: number[]; whole: number; firstTop: number }> {
   const pane = panel.getByRole('region', { name: 'AI recommendation' });
-  const rows = pane.locator('[data-rubric-row]');
-  await expect(rows).toHaveCount(5);
   const paneBox = (await pane.boundingBox())!;
-  for (const row of await rows.all()) {
-    const box = (await row.boundingBox())!;
-    expect(box.y + box.height, 'a rubric row is below the fold').toBeLessThanOrEqual(paneBox.y + paneBox.height);
-    expect((await row.locator('h4').boundingBox())!.height, 'a metric name wrapped').toBeLessThan(26);
-  }
+  const boxes = await Promise.all((await pane.locator('[data-rubric-row]').all()).map(async (row) => (await row.boundingBox())!));
+  return {
+    heights: boxes.map((box) => box.height),
+    whole: boxes.filter((box) => box.y >= paneBox.y && box.y + box.height <= paneBox.y + paneBox.height).length,
+    firstTop: boxes[0].y,
+  };
 }
 
 test.describe('Review, the rubric', () => {
-  test('all five rows are on screen when Review opens at 1440x900, each on one line', async ({ app, page }) => {
+  test('at 1440x900 the rows of a busy screening are 72, 27, 30, 30, 30 and 30, each name on one line', async ({ app, page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
-    await allFiveRowsFit(await openReview(app, page));
+    const panel = await openBusy(app, page);
+    expect((await rubricOnArrival(panel)).heights).toEqual([72, 27, 30, 30, 30, 30]);
+    for (const name of await panel.locator('[data-rubric-row] h4').all()) {
+      expect((await name.boundingBox())!.height, 'a metric name wrapped').toBeLessThan(26);
+    }
+  });
+
+  test('at 1440x900 four whole rows stand on arrival when Check before deciding has five lines', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page, { redFlags: 4 });
+    expect((await rubricOnArrival(panel)).whole).toBe(4);
+  });
+
+  for (const viewport of [{ width: 1440, height: 768 }, { width: 1366, height: 768 }]) {
+    test(`below 820px tall, at ${viewport.width}x${viewport.height}, the weakest metric's reasoning takes one line`, async ({ app, page }) => {
+      await page.setViewportSize(viewport);
+      const panel = await openBusy(app, page);
+      expect((await rubricOnArrival(panel)).heights[0]).toBe(52);
+    });
+  }
+
+  test('the weakest metric takes two lines again at 820px tall', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 820 });
+    const panel = await openBusy(app, page);
+    expect((await rubricOnArrival(panel)).heights[0]).toBe(72);
+  });
+
+  test('its quotes wait behind the chevron, and a tick reaches them', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    await expect(panel.locator('[data-quote-button]')).toHaveCount(0);
+
+    await holdTheRecording(page);
+    const weakest = panel.locator('[data-rubric-row]').first();
+    const tick = panel.locator('[data-strip-tick][aria-pressed="true"]');
+    const number = await tick.getAttribute('data-strip-tick');
+    await tick.click();
+    await expect(weakest.locator(`[data-quote-button="${number}"]`)).toHaveAttribute('aria-pressed', 'true');
+    await expect(weakest.locator('[data-quote-button]')).toHaveCount(3);
+  });
+
+  test('its chevron opens the same quotes, with nothing played', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    const weakest = panel.locator('[data-rubric-row]').first();
+    await weakest.getByRole('button', { name: 'Communication', exact: true }).click();
+    await expect(weakest.locator('[data-quote-button]')).toHaveCount(3);
+    expect(app.calls.filter((c) => /\/api\/recordings\//.test(new URL(c.url).pathname))).toEqual([]);
+  });
+
+  test('arrival stays cued: chip and tick pressed, the turn lit, nothing played', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    const pressed = await panel.locator('[data-strip-tick][aria-pressed="true"]').getAttribute('data-strip-tick');
+    await expect(panel.locator('[data-rubric-row]').first().locator(`[data-seek-chip="${pressed}"]`)).toHaveAttribute('aria-pressed', 'true');
+    await expect(panel.locator('[data-turn-row] [aria-current="true"]')).toBeInViewport();
+    await expect(panel.getByRole('button', { name: /^Play from/ })).toBeVisible();
+    expect(app.calls.filter((c) => /\/api\/recordings\//.test(new URL(c.url).pathname))).toEqual([]);
+  });
+
+  test('Check before deciding carries one alert icon, and "Red flag:" stays on every line', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    const heading = panel.getByRole('heading', { name: 'Check before deciding' });
+    await expect(heading.locator('svg')).toHaveCount(1);
+    const list = heading.locator('xpath=ancestor::div[2]').locator('ul');
+    await expect(list.locator('svg')).toHaveCount(0);
+    await expect(list.getByText('Red flag:', { exact: true })).toHaveCount(5);
   });
 
   test('a second session keeps them there: the picker in the log header stays one line', async ({ app, page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target');
     await page.setViewportSize({ width: 1440, height: 900 });
+    makeReviewBusy(app.db, { redFlags: 4 });
     const read = app.db.candidateDetail;
     app.db.candidateDetail = (id) => {
       const detail = read(id);
@@ -334,7 +575,8 @@ test.describe('Review, the rubric', () => {
     const picker = panel.locator('#sync-session-select');
     await expect(picker).toBeVisible();
     expect((await picker.boundingBox())!.height, 'the picker wrapped').toBeLessThanOrEqual(26);
-    await allFiveRowsFit(panel);
+    expect((await panel.locator('[data-log-header]').boundingBox())!.height).toBe(34);
+    expect((await rubricOnArrival(panel)).whole).toBe(4);
   });
 
   test('metric names stay on one line at 1366x768', async ({ app, page }) => {
@@ -368,6 +610,22 @@ test.describe('Review, a call past the hour', () => {
 });
 
 test.describe('Review, the Ashby deep link', () => {
+  test('its log header is the same one line: no role to print, and the tape names the interviewer', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await app.goto(`/ashby/review/${SCOPED_REVIEW_LINK_ID}`);
+    await app.settle();
+    await page.getByRole('tab', { name: 'Review' }).click();
+    const panel = page.getByRole('tabpanel', { name: 'Review' });
+    const header = panel.locator('[data-log-header]');
+    await expect(panel.locator('[data-call-strip]')).toBeVisible();
+    expect((await header.boundingBox())!.height).toBe(30);
+    await expect(header).not.toContainText('Role');
+    await expect(header).not.toContainText('Interviewer');
+    await expect(header.getByText('Length', { exact: true })).toBeVisible();
+    await expect(header.getByText('In Ashby', { exact: true })).toBeVisible();
+    expect(await pageScrolls(page), 'the page itself scrolls').toBe(false);
+  });
+
   test('the Review tab is on paper, so its sticky head and labels are no patches on the desk', async ({ app, page }) => {
     await page.setViewportSize({ width: 1366, height: 768 });
     await app.goto(`/ashby/review/${SCOPED_REVIEW_LINK_ID}`);
@@ -540,6 +798,203 @@ test.describe('Review, the cue', () => {
     expect(mints()).toEqual([]);
     await panel.getByRole('button', { name: /^Play from/ }).click();
     await expect.poll(() => mints().length).toBeGreaterThan(0);
+  });
+});
+
+test.describe('Review, a cue keeps the pane clear', () => {
+  const row = (panel: Locator, id: string): Locator => panel.locator(`[data-rubric-row="${id}"]`);
+  const arrow = (panel: Locator, id: string): Locator => row(panel, id).locator('h4 button');
+  const chip = (panel: Locator, id: string): Locator => row(panel, id).locator('[data-seek-chip]');
+  const tickOf = async (panel: Locator, id: string): Promise<Locator> => {
+    const number = await chip(panel, id).getAttribute('data-seek-chip');
+    return panel.locator(`[data-strip-tick="${number}"]`);
+  };
+
+  test('a cue closes the row the last cue opened, and never one opened with its arrow', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    await holdTheRecording(page);
+
+    await arrow(panel, 'm-logistics').click();
+    await (await tickOf(panel, 'm-communication')).click();
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'true');
+    await (await tickOf(panel, 'm-relevance')).click();
+    await expect(arrow(panel, 'm-relevance')).toHaveAttribute('aria-expanded', 'true');
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'false');
+    await expect(arrow(panel, 'm-logistics')).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  test('a pressed chip stays under the pointer when the row above it closes', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    await holdTheRecording(page);
+    await (await tickOf(panel, 'm-communication')).click();
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'true');
+
+    // Read down to it, with the row above still open.
+    const pressed = chip(panel, 'm-stability');
+    await pressed.evaluate((el) => el.scrollIntoView({ block: 'center' }));
+    await expect(pressed).toBeInViewport();
+    const pane = panel.getByRole('region', { name: 'AI recommendation' });
+    const scrolled = (): Promise<number> => pane.evaluate((el) => el.scrollTop);
+    const [before, scrolledBefore] = [(await pressed.boundingBox())!, await scrolled()];
+    await pressed.click();
+    await expect(arrow(panel, 'm-stability')).toHaveAttribute('aria-expanded', 'true');
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'false');
+    const after = (await pressed.boundingBox())!;
+    expect(Math.abs(after.y - before.y)).toBeLessThan(1);
+    // The chip stayed because the pane moved, not because nothing shifted.
+    expect(await scrolled()).toBeLessThan(scrolledBefore - 50);
+  });
+
+  test('when the pane cannot absorb the shift the row stays open until the next cue', async ({ app, page }) => {
+    // Tall enough that nothing scrolls, so there is no room to give back.
+    await page.setViewportSize({ width: 1440, height: 1500 });
+    const panel = await openBusy(app, page);
+    await holdTheRecording(page);
+    await (await tickOf(panel, 'm-communication')).click();
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'true');
+
+    const pressed = chip(panel, 'm-relevance');
+    const before = (await pressed.boundingBox())!;
+    await pressed.click();
+    await expect(arrow(panel, 'm-relevance')).toHaveAttribute('aria-expanded', 'true');
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'true');
+    expect(Math.abs((await pressed.boundingBox())!.y - before.y)).toBeLessThan(1);
+
+    await (await tickOf(panel, 'm-stability')).click();
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'false');
+    await expect(arrow(panel, 'm-relevance')).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  test('below 1180px the page scrolls and the pane does not, so a chip press closes the last cue\'s row', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1100, height: 800 });
+    const panel = await openBusy(app, page);
+    await holdTheRecording(page);
+    await (await tickOf(panel, 'm-communication')).click();
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'true');
+
+    await chip(panel, 'm-stability').click();
+    await expect(arrow(panel, 'm-stability')).toHaveAttribute('aria-expanded', 'true');
+    await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'false');
+
+    await chip(panel, 'm-logistics').click();
+    await expect(arrow(panel, 'm-logistics')).toHaveAttribute('aria-expanded', 'true');
+    await expect(arrow(panel, 'm-stability')).toHaveAttribute('aria-expanded', 'false');
+    await expect(panel.locator('[data-rubric-row] h4 button[aria-expanded="true"]')).toHaveCount(1);
+  });
+
+  test('pressing the cued chip on arrival leaves it where it is, with its quote opened under it', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    await holdTheRecording(page);
+    const pressed = chip(panel, 'm-communication');
+    const number = await pressed.getAttribute('data-seek-chip');
+    const before = (await pressed.boundingBox())!;
+    await pressed.click();
+
+    const quote = panel.locator(`[data-quote-button="${number}"]`);
+    await expect(quote).toHaveAttribute('aria-pressed', 'true');
+    const [quoteBox, after] = [(await quote.boundingBox())!, (await pressed.boundingBox())!];
+    expect(Math.abs(after.y - before.y)).toBeLessThan(1);
+    expect(quoteBox.y, 'the quote is not under its chip').toBeGreaterThan(after.y + after.height);
+  });
+
+  // The fourth row stands at the foot of the pane on arrival, so its quote opens below the fold. Bringing
+  // that quote up would put another one under the pointer, and a double-click would cue it. The same holds
+  // when the press also closes a row above it, and the pane scrolls by what that row gave back.
+  for (const { id, closesAbove } of [
+    { id: 'm-objections', closesAbove: false },
+    { id: 'm-stability', closesAbove: true },
+  ]) {
+    test(`a chip at the foot of the pane stays under the pointer, and a second press cues the same quote: ${id}`, async ({ app, page }) => {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      const panel = await openBusy(app, page);
+      await holdTheRecording(page);
+      if (closesAbove) {
+        await (await tickOf(panel, 'm-communication')).click();
+        await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'true');
+      }
+      const pane = panel.getByRole('region', { name: 'AI recommendation' });
+      const pressed = chip(panel, id);
+      // Its foot 20px above the pane's.
+      await pressed.evaluate((el) => {
+        const scroller = el.closest<HTMLElement>('[data-review-pane="reasoning"]')!;
+        scroller.scrollTop += el.getBoundingClientRect().bottom - scroller.getBoundingClientRect().bottom + 20;
+      });
+      const paneBox = (await pane.boundingBox())!;
+      const before = (await pressed.boundingBox())!;
+      expect(before.y + before.height, 'the chip is not at the foot of the pane').toBeGreaterThan(paneBox.y + paneBox.height - 60);
+      const number = await pressed.getAttribute('data-seek-chip');
+      const [x, y] = [before.x + before.width / 2, before.y + before.height / 2];
+
+      await page.mouse.click(x, y);
+      await expect(arrow(panel, id)).toHaveAttribute('aria-expanded', 'true');
+      if (closesAbove) await expect(arrow(panel, 'm-communication')).toHaveAttribute('aria-expanded', 'false');
+      expect(Math.abs((await pressed.boundingBox())!.y - before.y)).toBeLessThan(1);
+
+      await page.mouse.click(x, y);
+      await expect(panel.locator(`[data-strip-tick="${number}"]`)).toHaveAttribute('aria-pressed', 'true');
+      await expect(pressed).toHaveAttribute('aria-pressed', 'true');
+      expect(Math.abs((await pressed.boundingBox())!.y - before.y)).toBeLessThan(1);
+    });
+  }
+
+  test('sections stand 16px apart, so spacing groups them', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    for (const name of ['Check before deciding', 'Rubric']) {
+      const section = panel.getByRole('heading', { name, exact: true }).locator('xpath=ancestor::div[2]');
+      expect(await section.evaluate((el) => getComputedStyle(el).marginTop), name).toBe('16px');
+    }
+  });
+
+  test('a quote is a ruled line and the pressed one a box, and neither moves when pressed', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    await holdTheRecording(page);
+    await panel.locator('[data-strip-tick][aria-pressed="true"]').click();
+    const quotes = panel.locator('[data-rubric-row="m-communication"] [data-quote-button]');
+    await expect(quotes).toHaveCount(3);
+    const edges = (quote: Locator) =>
+      quote.evaluate((el) => {
+        const style = getComputedStyle(el);
+        return { top: style.borderTopColor, bottom: style.borderBottomColor };
+      });
+    const pressed = panel.locator('[data-rubric-row="m-communication"] [data-quote-button][aria-pressed="true"]');
+    const rest = panel.locator('[data-rubric-row="m-communication"] [data-quote-button][aria-pressed="false"]').first();
+    const clear = 'rgba(0, 0, 0, 0)';
+    expect((await edges(rest)).top).toBe(clear);
+    expect((await edges(rest)).bottom).not.toBe(clear);
+    expect((await edges(pressed)).top).toBe((await edges(pressed)).bottom);
+    expect((await edges(pressed)).top).not.toBe(clear);
+
+    const before = (await rest.boundingBox())!;
+    const number = await rest.getAttribute('data-quote-button');
+    await rest.click();
+    const after = (await panel.locator(`[data-quote-button="${number}"]`).boundingBox())!;
+    expect({ x: after.x, width: after.width, height: after.height }).toEqual({ x: before.x, width: before.width, height: before.height });
+  });
+
+  test('a cited turn prints one Cited label for each metric, every number still its own button', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    const turn = panel.locator('[data-turn-row]', { has: page.getByRole('button', { name: /^Evidence 1, / }) });
+    await expect(turn.getByText('Cited · Profile relevance')).toHaveCount(1);
+    await expect(turn.getByRole('button', { name: /^Evidence \d+, Profile relevance$/ })).toHaveCount(2);
+  });
+
+  test('the one-cue path holds: the press lands the turn, the tick and the quote together', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const panel = await openBusy(app, page);
+    await holdTheRecording(page);
+    const tick = await tickOf(panel, 'm-relevance');
+    const number = await tick.getAttribute('data-strip-tick');
+    await tick.click();
+    await expect(tick).toHaveAttribute('aria-pressed', 'true');
+    await expect(panel.locator(`[data-quote-button="${number}"]`)).toHaveAttribute('aria-pressed', 'true');
+    await expect(panel.locator(`[data-quote-button="${number}"]`)).toBeInViewport();
+    await expect(panel.locator('[data-turn-row] [aria-current="true"]')).toBeInViewport();
   });
 });
 

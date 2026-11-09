@@ -205,35 +205,40 @@ function TurnWords({ turn, text, evidence, activeEvidence }: {
   );
 }
 
-/** "Cited · Objection handling" beside its number, one for each quote in the turn. */
+/** "Cited · Objection handling" once for each metric in the turn, with its numbers beside it. */
 function Citations({ evidence, activeEvidence, onEvidence }: {
   evidence: readonly TurnEvidence[];
   activeEvidence: number | null;
   onEvidence?: (number: number) => void;
 }) {
+  const byMetric = new Map<string, TurnEvidence[]>();
+  for (const quote of evidence) byMetric.set(quote.metricName, [...(byMetric.get(quote.metricName) ?? []), quote]);
   return (
     <ul className="mt-1 flex flex-wrap justify-end gap-x-4 gap-y-1">
-      {evidence.map(({ number, metricName, family }) => {
-        const pressed = number === activeEvidence;
-        return (
-          <li key={number} className="flex items-center gap-1.5 text-meta text-ink-tertiary">
-            <span>Cited · {metricName}</span>
-            <button
-              type="button"
-              onClick={() => onEvidence?.(number)}
-              aria-pressed={pressed}
-              aria-label={`Evidence ${number}, ${metricName}`}
-              className={cx(
-                'min-h-6 min-w-6 rounded-evidence border px-1 font-mono text-meta transition-colors duration-hover ease-out',
-                evidenceNumberClass(family ?? null, pressed),
-                !pressed && 'hover:bg-field',
-              )}
-            >
-              {number}
-            </button>
-          </li>
-        );
-      })}
+      {[...byMetric].map(([metricName, quotes]) => (
+        <li key={metricName} className="flex items-center gap-1.5 text-meta text-ink-tertiary">
+          <span>Cited · {metricName}</span>
+          {quotes.map(({ number, family }) => {
+            const pressed = number === activeEvidence;
+            return (
+              <button
+                key={number}
+                type="button"
+                onClick={() => onEvidence?.(number)}
+                aria-pressed={pressed}
+                aria-label={`Evidence ${number}, ${metricName}`}
+                className={cx(
+                  'min-h-6 min-w-6 rounded-evidence border px-1 font-mono text-meta transition-colors duration-hover ease-out',
+                  evidenceNumberClass(family ?? null, pressed),
+                  !pressed && 'hover:bg-field',
+                )}
+              >
+                {number}
+              </button>
+            );
+          })}
+        </li>
+      ))}
     </ul>
   );
 }
