@@ -190,8 +190,10 @@ export type AshbyOverallValue = 1 | 2 | 3 | 4;
  *   reject → 1 · hold below {@link ASHBY_BORDERLINE_UPPER_MIN} → 2 ·
  *   hold at or above it → 3 · advance → 4
  *
- * So a hold is never 1 or 4 whatever its score, and Ashby's number always
- * agrees with the Christy tag, which reads the same raw verdict. Returns null
+ * So a hold is never 1 or 4 whatever its score, and the number agrees with the
+ * verdict of the assessment the card was built from. The Christy tag can move
+ * on later (a rescore, or a newer result on another of the candidate's
+ * applications) while the card, written once per link, keeps its number. Returns null
  * — and the caller writes NO card — when the verdict is not advance, hold or
  * reject (no verdict, `human_review`) or the score is not a finite number, for
  * every verdict: a value is never made up. Pure and total.

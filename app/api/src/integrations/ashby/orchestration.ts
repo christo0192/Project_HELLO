@@ -193,9 +193,10 @@ export interface RecommendationTagLink {
  * The candidate's authoritative verdict at run time (0134
  * `ashby_candidate_tag_verdict`): the newest assessment on any of the
  * candidate's Ashby links, not the one the operation was enqueued for.
- * `recommendation` is the RAW `assessments.recommendation` column: never
- * `ScorecardSource` or `NormalizedScorecard`, both of which coerce a missing
- * verdict to `hold`.
+ * `recommendation` is the RAW `assessments.recommendation` column, read for
+ * the tag itself and never taken from the scorecard path. (Since M029
+ * `ScorecardSource` carries the raw verdict as well and `buildScorecard`
+ * refuses a missing one rather than reading it as `hold`.)
  */
 export interface RecommendationTagSource {
   /** `no_assessment`: no result on any of the candidate's links, so no tag. */
