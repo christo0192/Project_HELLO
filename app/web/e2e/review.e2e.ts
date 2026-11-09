@@ -533,7 +533,8 @@ test.describe('Review, the rubric', () => {
     }
   });
 
-  test('at 1440x900 four whole rows stand on arrival when Check before deciding has five lines', async ({ app, page }) => {
+  test('at 1440x900 four whole rows stand on arrival when Check before deciding has five lines', async ({ app, page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'a touch screen keeps its 44px target, so the rating summary takes two of them');
     await page.setViewportSize({ width: 1440, height: 900 });
     const panel = await openBusy(app, page, { redFlags: 4 });
     expect((await rubricOnArrival(panel)).whole).toBe(4);

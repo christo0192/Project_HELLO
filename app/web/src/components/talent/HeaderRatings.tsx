@@ -64,7 +64,7 @@ const ITEM_HEIGHT = 'min-h-6 [@media(pointer:coarse)]:min-h-11';
  * left, so its columns follow this, and so does the header's height. It fits the widest count, "20 of 20
  * metrics", on one line and stacked, and the digits are tabular, so no count needs more.
  */
-const LEAD_ROOM = 'sm:group-data-[ratings-fit=line]/header:w-40 sm:group-data-[ratings-fit=row]/header:w-[5.75rem]';
+const LEAD_ROOM = 'sm:group-data-[ratings-fit=line]/header:w-44 sm:group-data-[ratings-fit=row]/header:w-[5.75rem]';
 
 /** One line, as the verdict box prints it, on its own line and on a phone. Two lines in the name row. */
 const LEAD = cx(
