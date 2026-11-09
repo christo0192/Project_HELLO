@@ -346,8 +346,14 @@ export interface FixedFieldCheck {
   path: string;
   /** Type the binding expects, when it declares one. */
   expectedType: string | null;
-  /** Whether a field with that path exists on the live form, and with what type. */
-  status: 'present' | 'missing' | 'type_mismatch';
+  /**
+   * Whether a field with that path exists on the live form, and with what
+   * type. `options_mismatch` (overall only, M029 D10): the field is there but
+   * does not offer exactly the option values "1".."4", so the worker refuses
+   * every v2 card (`overall_options_mismatch`); `overallOptions` lists what it
+   * does offer.
+   */
+  status: 'present' | 'missing' | 'type_mismatch' | 'options_mismatch';
   actualType: string | null;
 }
 
@@ -379,7 +385,8 @@ export interface ScorecardBindingPreview {
   unusedScoreFields: Array<{ fieldId: string; title: string | null }>;
   /**
    * True only when the form is the verified one, every fixed field is present
-   * with the expected type, and EVERY metric bound. A false here means a v2
+   * with the expected type, the Overall Recommendation offers exactly "1".."4"
+   * (the worker's D10 guard), and EVERY metric bound. A false here means a v2
    * card would submit with metrics omitted (or not at all).
    */
   ready: boolean;
@@ -408,6 +415,11 @@ export function previewScorecardBinding(
     ['redFlags', paths?.redFlags, base.fieldTypes?.redFlags ?? null],
     ['detailedReport', paths?.detailedReport, base.fieldTypes?.detailedReport ?? null],
   ];
+  // The worker's D10 guard, run on the same form. A preview that said "ready"
+  // while the worker refuses every v2 card would be a promise it never keeps,
+  // so a mismatch marks the overall row (the Mission Control page counts any
+  // row that is not `present` as "Not ready") and `ready` below.
+  const overallOptionsOk = overallOptionsMatch(base, form);
   for (const [name, path, expectedType] of fixedSpec) {
     if (!path) continue;
     const field = form.schemaAvailable ? byPath.get(path) : undefined;
@@ -416,7 +428,9 @@ export function previewScorecardBinding(
       ? 'missing'
       : expectedType && actualType !== expectedType
         ? 'type_mismatch'
-        : 'present';
+        : name === 'overall' && !overallOptionsOk
+          ? 'options_mismatch'
+          : 'present';
     fixedFields.push({ name, path, expectedType, status, actualType });
   }
   // Value and label only — copied key by key, so nothing else a field carries
@@ -445,6 +459,7 @@ export function previewScorecardBinding(
     formMatchesBinding &&
     form.schemaAvailable &&
     fixedFields.every((f) => f.status === 'present') &&
+    overallOptionsOk &&
     rows.length > 0 &&
     rows.every((r) => r.status === 'bound');
 

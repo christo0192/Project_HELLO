@@ -9145,7 +9145,8 @@ components:
           nullable: true
         status:
           type: string
-          enum: [present, missing, type_mismatch]
+          enum: [present, missing, type_mismatch, options_mismatch]
+          description: '`options_mismatch` (overall only): the field is on the form but does not offer exactly the option values "1"-"4", so every v2 scorecard write fails with `overall_options_mismatch`; `overallOptions` lists what it offers.'
         actualType:
           type: string
           nullable: true
@@ -9231,7 +9232,7 @@ components:
             additionalProperties: false
         ready:
           type: boolean
-          description: True only when the form matches, every fixed field is present with its type, and every metric would bind.
+          description: True only when the form matches, every fixed field is present with its type, the Overall Recommendation offers exactly the option values "1"-"4", and every metric would bind.
       additionalProperties: false
 
     AshbyScorecardBindingPreviewResponse:
