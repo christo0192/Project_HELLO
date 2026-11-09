@@ -5,7 +5,9 @@
  * The observer's one rule: a tag problem can never change its outcome or touch
  * the scorecard path. The store's rules: the verdict is the database's
  * candidate-wide answer (0134 `ashby_candidate_tag_verdict`), and it is the RAW
- * column, because every other reader coerces a missing verdict to `hold`.
+ * column, read for the tag itself: a missing verdict stays missing and gets no
+ * tag. (Since M029 the scorecard path carries the raw verdict too and refuses
+ * a missing one, but the tag never depends on it.)
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { observeAshbyCompletion, type CompletionStore } from '../integrations/ashby/completion-observer.js';

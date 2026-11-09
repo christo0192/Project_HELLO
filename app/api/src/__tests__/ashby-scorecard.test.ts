@@ -2,8 +2,9 @@
  * Ashby scorecard mapper — determinism, redaction, fail-closed binding.
  *
  * Proves: raw model/CoT/transcript/recording/bearer inputs are rejected;
- * absolute review URLs are rejected (relative-only); the overall→scale bucket
- * is deterministic; the idempotency marker is stable and content-sensitive;
+ * absolute review URLs are rejected (relative-only); the overall value follows
+ * the verdict (M029; the full table is in ashby-overall-by-verdict.test.ts);
+ * the idempotency marker is stable and content-sensitive;
  * and feedback-form binding fails closed until a tenant probe verifies field
  * ids, never inventing an Ashby form shape.
  */
@@ -14,7 +15,6 @@ import {
   buildScorecard,
   bindFeedbackForm,
   HELLO_CHRISTY_SCORECARD_BINDING,
-  mapOverallToScale,
   isScorecardSafe,
   isRelativeReviewPath,
   type ScorecardSource,
@@ -96,21 +96,17 @@ describe('buildScorecard — fail closed', () => {
   });
 });
 
-describe('mapOverallToScale — deterministic bucketing', () => {
-  it('maps low/mid/high overall scores into the 1..4 scale monotonically', () => {
-    expect(mapOverallToScale(0, scale)).toBe(1);
-    expect(mapOverallToScale(100, scale)).toBe(4);
-    const low = mapOverallToScale(10, scale);
-    const mid = mapOverallToScale(55, scale);
-    const high = mapOverallToScale(90, scale);
-    expect(low).toBeLessThanOrEqual(mid);
-    expect(mid).toBeLessThanOrEqual(high);
-  });
-
-  it('clamps out-of-range input and a degenerate scale', () => {
-    expect(mapOverallToScale(-5, scale)).toBe(1);
-    expect(mapOverallToScale(999, scale)).toBe(4);
-    expect(mapOverallToScale(50, { min: 3, max: 3 })).toBe(3);
+describe('the overall value follows the verdict, not 25-point score bands (M029)', () => {
+  it('sends Select as 4, Borderline as 2 or 3 split at 50, and Reject as 1', () => {
+    const value = (over: Partial<ScorecardSource>) => {
+      const r = buildScorecard(source(over), scale);
+      return r.ok ? r.scorecard.scaleValue : r.reason;
+    };
+    // Each of these got a different number under the old even bands.
+    expect(value({ recommendation: 'advance', overallScore: 72 })).toBe(4); // was 3
+    expect(value({ recommendation: 'reject', overallScore: 30 })).toBe(1); // was 2
+    expect(value({ recommendation: 'hold', overallScore: 49 })).toBe(2);
+    expect(value({ recommendation: 'hold', overallScore: 50 })).toBe(3);
   });
 });
 
@@ -143,7 +139,8 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
     if (r.ok) {
       expect(r.formDefinitionId).toBe(HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId);
       const fields = r.feedbackForm.fieldSubmissions as Array<{ path: string; value: unknown }>;
-      expect(fields.find((f) => f.path === 'overall_recommendation')?.value).toBe('3');
+      // A Select (advance, 72) is the top option, whatever its score.
+      expect(fields.find((f) => f.path === 'overall_recommendation')?.value).toBe('4');
       expect(fields.find((f) => f.path === 'ee3ca034-ea9c-451a-85de-1e22b1bce180')?.value).toEqual({ score: 4 });
       // Summary is the approved PlainText summary and NOTHING else: the
       // clickable destination now lives only in `Detailed report`.

@@ -126,7 +126,48 @@ Two consequences for the existing payload:
 
 Nothing else moved: the verified form id, the overall/dimension paths, the 1–4
 scales, the `{ fieldSubmissions: [...] }` request shape, and the informational
-(never auto-acting) recommendation are unchanged.
+(never auto-acting) recommendation are unchanged. (The overall VALUE has since
+changed: see the next section.)
+
+## Overall recommendation value (M029)
+
+Cut-over: **2026-11-09** (the API deploy date). Cards written before it keep the old 25-point-band value; the owner confirmed on 2026-11-09 that the form's Overall Recommendation has the four options "1" to "4".
+
+The overall recommendation is still submitted as the option value string "1" to
+"4" on the same path. What decides the number changed: it is the verdict, not
+25-point bands of the 0–100 score. `overallRecommendationValue` in
+`integrations/ashby/scorecard.ts`:
+
+| Verdict | Score | Value |
+| --- | --- | --- |
+| `reject` | any | "1" |
+| `hold` | below `ASHBY_BORDERLINE_UPPER_MIN` (50) | "2" |
+| `hold` | 50 and above | "3" |
+| `advance` | any | "4" |
+
+- **The verdict decides first.** A hold is never 1 or 4 whatever its score. The
+  verdict cut-offs themselves (65 and 45) are unchanged and now named in
+  `lib/scorecards/domain.ts` (`RECOMMENDATION_ADVANCE_MIN`,
+  `RECOMMENDATION_HOLD_MIN`).
+- **Nothing is made up.** `buildScorecard` refuses a verdict that is not
+  advance/hold/reject (`invalid_recommendation`) and a score that is not a finite
+  number (`invalid_overall`), and the v1 reader passes both through raw. Before
+  M029 a v1 row with no verdict was written as hold and one with no score as "1".
+- **The marker** hashes the value, so the same assessment hashes differently
+  from before the cut-over. Harmless: one card per link is enforced by the link
+  key, not the marker (see Idempotency below).
+- **Form guard (v2 only).** After reading the live form, the worker fails a
+  write permanently with `overall_options_mismatch` unless the overall field
+  offers exactly the values "1" to "4". It decides that on an uncached read
+  (a cached form that fails is re-read first), so a Retry right after the
+  form is fixed succeeds. The Mission Control binding preview runs the same
+  guard: on a mismatch it is not `ready` and the overall fixed field has
+  status `options_mismatch`. It lists the field's option values and labels
+  in `preview.overallOptions`, which is in the API response only; the page
+  does not render it. The deploy check is in `ashby-runtime-activation.md`
+  ("Deploy check for the 1-4 options").
+- Cards written before the cut-over keep their old number; there is no re-write
+  path.
 
 ## Value shapes — the part that is easy to get wrong
 
@@ -185,8 +226,9 @@ and normalize through the same helper, so the two markers agree.
 - Verification: `cd app/api && npm run typecheck && npm test`. The pinned
   contracts live in `src/__tests__/ashby-scorecard-fields.test.ts`,
   `ashby-scorecard.test.ts`, `ashby-scoped-review-path.test.ts`,
-  `ashby-scorecard-link-idempotency.test.ts`, and
-  `ashby-writeback-fail-closed.test.ts`.
+  `ashby-scorecard-link-idempotency.test.ts`,
+  `ashby-writeback-fail-closed.test.ts`, and (the overall value table, M029)
+  `ashby-overall-by-verdict.test.ts`.
 
 ## Out of scope (unchanged, and deliberately so)
 

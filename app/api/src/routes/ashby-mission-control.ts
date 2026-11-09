@@ -756,7 +756,10 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // that binding WOULD do for one mapping's role — which metrics have a Score
   // field titled exactly like them, which do not and why, and whether the four
   // fixed fields are still where the verified binding expects them — BEFORE a
-  // candidate is scored. One allowlisted READ (feedbackFormDefinition.info) of
+  // candidate is scored. It also lists the Overall Recommendation field's
+  // option values and labels (M029, `preview.overallOptions`), so an admin can
+  // confirm from HELLO what "1".."4" say on the live form; value and label
+  // only, never persisted. One allowlisted READ (feedbackFormDefinition.info) of
   // the verified form, plus two server-side table reads. Nothing is written,
   // persisted, bound, or submitted; no feedback content is read.
   router.get('/mappings/:id/scorecard-binding', requireRole('admin'), async (req: Request, res: Response) => {

@@ -420,9 +420,14 @@ export function weightedScoreToOverall(score: number | null, scaleMax: number = 
   return Math.round(((score - SCORE_MIN) / (scaleMax - SCORE_MIN)) * 100);
 }
 
+/** Lowest 0–100 overall that is an `advance` (HELLO "Select"). */
+export const RECOMMENDATION_ADVANCE_MIN = 65 as const;
+/** Lowest 0–100 overall that is a `hold` (HELLO "Borderline"); below it is `reject`. */
+export const RECOMMENDATION_HOLD_MIN = 45 as const;
+
 export function recommendationForOverall(overall: number | null): 'advance' | 'hold' | 'reject' | 'human_review' {
   if (overall === null) return 'human_review';
-  if (overall >= 65) return 'advance';
-  if (overall >= 45) return 'hold';
+  if (overall >= RECOMMENDATION_ADVANCE_MIN) return 'advance';
+  if (overall >= RECOMMENDATION_HOLD_MIN) return 'hold';
   return 'reject';
 }

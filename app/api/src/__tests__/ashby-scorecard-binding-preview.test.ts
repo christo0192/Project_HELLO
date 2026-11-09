@@ -17,6 +17,10 @@ import type { MissionControlStore } from '../integrations/ashby/workflow-stores.
 import { previewScorecardBinding } from '../integrations/ashby/scorecard-autobind.js';
 import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
 import type { ProbeFeedbackForm, ProbeFormField } from '../integrations/ashby/probe.js';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseYamlDocument, validateNamed } from './support/openapi-schema.js';
 
 const FORM_ID = HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId!;
 const PATHS = HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!;
@@ -103,6 +107,67 @@ describe('previewScorecardBinding', () => {
     expect(noSchema.fixedFields.every((f) => f.status === 'missing')).toBe(true);
     expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, good, []).ready).toBe(false);
   });
+
+  // M029: the Overall Recommendation's option values and labels, so an admin
+  // can confirm from HELLO what "1".."4" say on the live form (D8).
+  it('carries the overall field’s option values and labels, in form order, and nothing else', () => {
+    const labelled = [
+      { value: '1', label: '1 - Strong No' }, { value: '2', label: '2 - No' },
+      { value: '3', label: '3 - Yes' }, { value: '4', label: '4 - Strong Yes' },
+    ];
+    const withLabels = form([
+      field({ id: 'ov', title: 'Overall recommendation', path: PATHS.overall, type: 'ValueSelect', required: true, options: labelled }),
+      ...FIXED.filter((f) => f.id !== 'ov'),
+    ]);
+    const p = previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, withLabels, []);
+    expect(p.overallOptions).toEqual(labelled);
+    for (const o of p.overallOptions) expect(Object.keys(o).sort()).toEqual(['label', 'value']);
+    expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, form(FIXED), []).overallOptions)
+      .toEqual([1, 2, 3, 4].map((n) => ({ value: String(n), label: `${n}` })));
+  });
+
+  // The worker refuses every v2 card (`overall_options_mismatch`) when the
+  // overall field does not offer exactly "1".."4". The preview runs the same
+  // guard, so it can never say "ready" for a card the worker will refuse, and
+  // marks the overall row so the Mission Control page says "Not ready".
+  it('is not ready, and marks the overall row options_mismatch, when the overall options are not exactly "1"-"4"', () => {
+    const one = [{ key: 'stability', name: 'Stability' }];
+    const withOverall = (options: ProbeFormField['options']) => form([
+      field({ id: 'ov', title: 'Overall recommendation', path: PATHS.overall, type: 'ValueSelect', options }),
+      ...FIXED.filter((f) => f.id !== 'ov'),
+      field({ id: 'st', title: 'Stability' }),
+    ]);
+    const bad: Array<[string, ProbeFormField['options']]> = [
+      ['no options', []],
+      ['five points', FIVE],
+      ['zero-based', [0, 1, 2, 3].map((n) => ({ value: String(n), label: `${n}` }))],
+      ['words for values', ['strong_no', 'no', 'yes', 'strong_yes'].map((v) => ({ value: v, label: v }))],
+      ['an extra no-decision option', [...[1, 2, 3, 4].map((n) => ({ value: String(n), label: `${n}` })), { value: '0', label: 'No decision' }]],
+    ];
+    for (const [label, options] of bad) {
+      const p = previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, withOverall(options), one);
+      expect(p.ready, label).toBe(false);
+      expect(p.fixedFields.find((f) => f.name === 'overall'), label)
+        .toMatchObject({ status: 'options_mismatch', actualType: 'ValueSelect' });
+      // Every other fixed field and the metric still read as before.
+      expect(p.fixedFields.filter((f) => f.name !== 'overall').every((f) => f.status === 'present'), label).toBe(true);
+      expect(p.metrics.every((m) => m.status === 'bound'), label).toBe(true);
+      // …and the options it does offer are shown, so the admin can see why.
+      expect(p.overallOptions, label).toEqual(options.map((o) => ({ value: o.value, label: o.label })));
+    }
+    // "1".."4" in any order is ready.
+    const reversed = [4, 3, 2, 1].map((n) => ({ value: String(n), label: `${n}` }));
+    const ok = previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, withOverall(reversed), one);
+    expect(ok.ready).toBe(true);
+    expect(ok.fixedFields.find((f) => f.name === 'overall')?.status).toBe('present');
+  });
+
+  it('shows no overall options when the field is missing or the definition has no schema', () => {
+    const noOverall = form(FIXED.filter((f) => f.id !== 'ov'));
+    expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, noOverall, []).overallOptions).toEqual([]);
+    const noSchema = form(FIXED, { schemaAvailable: false });
+    expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, noSchema, []).overallOptions).toEqual([]);
+  });
 });
 
 // ── Route ───────────────────────────────────────────────────────────────────
@@ -188,6 +253,60 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
     } finally {
       setAuditSink(sink);
     }
+  });
+
+  it('returns the overall field’s option values and labels from the live definition (M029, read-only)', async () => {
+    const labelled = [
+      { value: '1', label: '1 - Strong No' }, { value: '2', label: '2 - No' },
+      { value: '3', label: '3 - Yes' }, { value: '4', label: '4 - Strong Yes' },
+    ];
+    const d = previewDeps();
+    (d.formDefinitionReader as { feedbackFormDefinitionInfo: unknown }).feedbackFormDefinitionInfo = async () => ({
+      results: {
+        ...DEFINITION_PAYLOAD,
+        formDefinition: { sections: [{ id: 'sec', title: 'All', fields: DEFINITION_PAYLOAD.formDefinition.sections[0].fields.map((w) => (
+          (w.field as { path?: string }).path === PATHS.overall
+            ? { ...w, field: { ...w.field, selectableValues: labelled.map((o) => ({ ...o, submittedValue: 'ANSWER-MUST-NOT-SURFACE' })) } }
+            : w
+        )) }] },
+      },
+    });
+    const res = await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+    expect(res.status).toBe(200);
+    expect(res.body.preview.overallOptions).toEqual(labelled);
+    expect(JSON.stringify(res.body)).not.toMatch(/ANSWER-MUST-NOT-SURFACE|submittedValue/);
+    // The documented response shape (additionalProperties: false) carries it.
+    const spec = parseYamlDocument(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../openapi/openapi.yaml'), 'utf8'));
+    expect(validateNamed(res.body, 'AshbyScorecardBindingPreviewResponse', spec)).toEqual([]);
+    // The default definition offers plain "1".."4".
+    const plain = await request(appWith('admin', previewDeps())).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+    expect(plain.body.preview.overallOptions).toEqual([1, 2, 3, 4].map((n) => ({ value: String(n), label: `${n}` })));
+  });
+
+  it('reports a five-point overall field as options_mismatch and not ready, in the documented shape (M029 D10)', async () => {
+    // Every metric binds, so only the overall options can make it "not ready".
+    const d = previewDeps({ loadMetrics: async () => [{ key: 'profile_relevance', name: 'Profile relevance' }] });
+    const fields = DEFINITION_PAYLOAD.formDefinition.sections[0].fields.map((w) => (
+      (w.field as { path?: string }).path === PATHS.overall ? { ...w, field: { ...w.field, selectableValues: FIVE } } : w
+    ));
+    (d.formDefinitionReader as { feedbackFormDefinitionInfo: unknown }).feedbackFormDefinitionInfo = async () => ({
+      results: {
+        ...DEFINITION_PAYLOAD,
+        formDefinition: { sections: [{ id: 'sec', title: 'All', fields: [
+          ...fields,
+          { field: { id: 'rf2', type: 'Score', path: 'path-rolefit', title: 'Role fit' } },
+        ] }] },
+      },
+    });
+    const res = await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+    expect(res.status).toBe(200);
+    expect(res.body.preview.metrics.every((m: { status: string }) => m.status === 'bound')).toBe(true);
+    expect(res.body.preview.ready).toBe(false);
+    expect(res.body.preview.fixedFields.find((f: { name: string }) => f.name === 'overall'))
+      .toMatchObject({ status: 'options_mismatch', actualType: 'ValueSelect' });
+    expect(res.body.preview.overallOptions).toEqual(FIVE);
+    const spec = parseYamlDocument(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../openapi/openapi.yaml'), 'utf8'));
+    expect(validateNamed(res.body, 'AshbyScorecardBindingPreviewResponse', spec)).toEqual([]);
   });
 
   it('says v1_legacy when the role has no active scorecard and no_role when the mapping has none — still reading the form once', async () => {

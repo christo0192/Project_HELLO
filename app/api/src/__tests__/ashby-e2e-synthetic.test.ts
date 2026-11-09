@@ -174,6 +174,8 @@ describe('synthetic end-to-end: stage signal → TA transition', () => {
     // overall + summary + red flags + detailed report + the one mapped dimension
     expect(fields).toHaveLength(5);
     const paths = HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!;
+    // M029: a Select is the top option, "4", whatever its score (78 here).
+    expect(fields.find((f) => f.path === paths.overall)!.value).toBe('4');
     expect(fields.find((f) => f.path === paths.detailedReport)!.value)
       .toBe(`https://hello.example.com/ashby/review/${linkId}`);
     expect(fields.find((f) => f.path === paths.redFlags)!.value)
@@ -191,6 +193,54 @@ describe('synthetic end-to-end: stage signal → TA transition', () => {
     expect(stage.status).toBe('stage_enqueued');
     const stageOp = store.ops.find((o) => o.type === 'stage_move');
     expect(stageOp?.dependsOn).toBe(scoreOp!.id);
+  });
+
+  it('writes the verdict as the Overall Recommendation: Borderline split at 50, Reject 1 (M029)', async () => {
+    const cases: Array<[string, 'advance' | 'hold' | 'reject', number, string]> = [
+      ['app_b49', 'hold', 49, '2'],
+      ['app_b50', 'hold', 50, '3'],
+      ['app_b60', 'hold', 60, '3'],
+      ['app_r44', 'reject', 44, '1'],
+      ['app_s65', 'advance', 65, '4'],
+    ];
+    const store = new SyntheticStore();
+    for (const [appId, recommendation, overallScore, expected] of cases) {
+      const app = { application: { id: appId, job: { id: 'job_1' }, currentInterviewStage: { id: AI } } };
+      const imported = await runImport(appId, { gates, client: reader(app), stores: store, resolveMapping: async () => mapping });
+      expect(imported.status).toBe('imported');
+      const linkId = imported.status === 'imported' ? imported.applicationLinkId : '';
+      const saga = { gates, stores: store, client: reader(app), scale: { min: 1, max: 4 }, applicationLinkId: linkId, externalApplicationId: appId, aiScreeningStageId: AI };
+      const scorecardSource = {
+        overallScore,
+        recommendation,
+        dimensions: [{ key: 'communication', score: 6 }],
+        summary: `Synthetic ${appId}`,
+        provenance: { model: 'm' },
+        reviewPath: ashbyReviewPath(linkId),
+      };
+      expect((await enqueueScorecard(scorecardSource, saga)).status, appId).toBe('scorecard_enqueued');
+      const built = buildScorecard(scorecardSource, { min: 1, max: 4 });
+      expect(built.ok, appId).toBe(true);
+      if (!built.ok) return;
+      const bound = bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'https://hello.example.com');
+      expect(bound.ok, appId).toBe(true);
+      if (!bound.ok) return;
+      const fields = (bound.feedbackForm as { fieldSubmissions: Array<{ path: string; value: unknown }> }).fieldSubmissions;
+      expect(fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.overall)!.value, appId).toBe(expected);
+    }
+    expect(store.ops.filter((o) => o.type === 'scorecard_write')).toHaveLength(cases.length);
+  });
+
+  it('a result with no verdict is never queued as Borderline (M029)', async () => {
+    const store = new SyntheticStore();
+    const { id } = await store.createLink({ externalApplicationId: 'app_nv' });
+    const saga = { gates, stores: store, client: reader(appAtAi), scale: { min: 1, max: 4 }, applicationLinkId: id, externalApplicationId: 'app_nv', aiScreeningStageId: AI };
+    const noVerdict = {
+      overallScore: 55, recommendation: null, dimensions: [{ key: 'communication', score: 6 }],
+      summary: 'Synthetic', provenance: { model: 'm' }, reviewPath: ashbyReviewPath(id),
+    };
+    expect(await enqueueScorecard(noVerdict, saga)).toEqual({ status: 'blocked_scorecard', reason: 'invalid_recommendation' });
+    expect(store.ops.filter((o) => o.type === 'scorecard_write')).toHaveLength(0);
   });
 });
 

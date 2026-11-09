@@ -27,6 +27,10 @@ import { SCORE_MAX, SCORE_SCALE_MAX_VALUES } from '../../lib/scorecards/contract
 export const RECOMMENDATIONS = ['advance', 'hold', 'reject'] as const;
 export type Recommendation = (typeof RECOMMENDATIONS)[number];
 
+function isRecommendation(value: unknown): value is Recommendation {
+  return typeof value === 'string' && (RECOMMENDATIONS as readonly string[]).includes(value);
+}
+
 /** One normalized 0–10 dimension score carried into the scorecard. */
 export interface ScorecardDimension {
   /** Stable internal dimension key (e.g. 'communication'). */
@@ -57,10 +61,18 @@ export interface ScorecardSource {
   externalApplicationId?: string;
   /** 1 (legacy columns) or 2 (per-metric scorecard). Absent means 1. */
   schemaVersion?: 1 | 2;
-  /** Overall 0–100 score. */
-  overallScore: number;
-  /** Informational recommendation. */
-  recommendation: Recommendation;
+  /**
+   * Overall 0–100 score. Null when the stored row has none (a malformed legacy
+   * v1 row): it is passed through so {@link buildScorecard} refuses it
+   * (`invalid_overall`) rather than a reader turning it into 0.
+   */
+  overallScore: number | null;
+  /**
+   * The stored verdict, passed through RAW. Anything but advance/hold/reject
+   * (NULL, `human_review`, …) is refused by {@link buildScorecard}
+   * (`invalid_recommendation`); no reader defaults it to `hold`.
+   */
+  recommendation: string | null;
   /** Existing dimension scores (0–10). */
   dimensions: readonly ScorecardDimension[];
   /** Bounded human-readable summary (already free of raw model text). */
@@ -152,24 +164,62 @@ function clampNum(n: unknown, min: number, max: number): number {
   return v < min ? min : v > max ? max : v;
 }
 
+// ── The Overall Recommendation value (M029) ─────────────────────────────────
+
 /**
- * Deterministically bucket a 0–100 overall score into the configured scale.
- * Uses evenly-sized bands so the mapping is reproducible and explainable.
+ * The Ashby Overall Recommendation select HELLO writes: option values "1".."4".
+ * The verdict mapping below is defined on exactly this scale.
  */
-export function mapOverallToScale(overallScore: number, scale: ScorecardScale): number {
-  const min = Math.round(scale.min);
-  const max = Math.round(scale.max);
-  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return min;
-  const pct = clampNum(overallScore, 0, 100) / 100;
-  const buckets = max - min + 1;
-  // Map [0,1] into [0, buckets-1]; the top score only at exactly 100-ish band.
-  const idx = Math.min(buckets - 1, Math.floor(pct * buckets));
-  return min + idx;
+export const ASHBY_OVERALL_SCALE: Readonly<ScorecardScale> = Object.freeze({ min: 1, max: 4 });
+
+/**
+ * Where Borderline (`hold`) splits: a hold scored at or above this sends 3,
+ * below it 2. Owner decision 2026-11-09 ("split borderline lower to 50"). It
+ * lies between the verdict cut-offs (`RECOMMENDATION_HOLD_MIN` 45 and
+ * `RECOMMENDATION_ADVANCE_MIN` 65 in lib/scorecards/domain.ts), so on normal
+ * data Borderline 45-49 = 2 and 50-64 = 3.
+ */
+export const ASHBY_BORDERLINE_UPPER_MIN = 50;
+
+export type AshbyOverallValue = 1 | 2 | 3 | 4;
+
+/**
+ * The Overall Recommendation option for one result. The VERDICT decides first;
+ * the score only splits Borderline:
+ *
+ *   reject → 1 · hold below {@link ASHBY_BORDERLINE_UPPER_MIN} → 2 ·
+ *   hold at or above it → 3 · advance → 4
+ *
+ * So a hold is never 1 or 4 whatever its score, and the number agrees with the
+ * verdict of the assessment the card was built from. The Christy tag can move
+ * on later (a rescore, or a newer result on another of the candidate's
+ * applications) while the card, written once per link, keeps its number. Returns null
+ * — and the caller writes NO card — when the verdict is not advance, hold or
+ * reject (no verdict, `human_review`) or the score is not a finite number, for
+ * every verdict: a value is never made up. Pure and total.
+ */
+export function overallRecommendationValue(recommendation: unknown, overallScore: unknown): AshbyOverallValue | null {
+  if (typeof overallScore !== 'number' || !Number.isFinite(overallScore)) return null;
+  switch (recommendation) {
+    case 'reject': return 1;
+    case 'hold': return overallScore >= ASHBY_BORDERLINE_UPPER_MIN ? 3 : 2;
+    case 'advance': return 4;
+    default: return null;
+  }
 }
 
 export type ScorecardBuild =
   | { ok: true; scorecard: NormalizedScorecard; marker: string }
-  | { ok: false; reason: 'unsafe_source' | 'invalid_review_path' | 'empty_summary' | 'no_dimensions' };
+  | {
+      ok: false;
+      reason:
+        | 'unsafe_source'
+        | 'invalid_review_path'
+        | 'empty_summary'
+        | 'no_dimensions'
+        | 'invalid_recommendation'
+        | 'invalid_overall';
+    };
 
 /** The normalized, transport-ready scorecard (before tenant field binding). */
 export interface NormalizedScorecard {
@@ -342,7 +392,12 @@ export function isRelativeReviewPath(p: string): boolean {
 /**
  * Build the normalized, redaction-safe scorecard + a deterministic idempotency
  * marker. Fails closed on any unsafe field, an absolute/invalid review path, an
- * empty summary, or no dimensions.
+ * empty summary, no dimensions, a verdict that is not advance/hold/reject
+ * (`invalid_recommendation`, checked first), or no overall value
+ * (`invalid_overall`: a non-finite score, or a scale other than the Ashby 1–4
+ * select the verdict mapping is defined on). It never defaults a verdict to
+ * hold or a score to 0: no card is better than a made-up one that cannot be
+ * retracted.
  */
 export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): ScorecardBuild {
   if (!isScorecardSafe(source)) return { ok: false, reason: 'unsafe_source' };
@@ -377,11 +432,15 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
     });
   if (dims.length === 0) return { ok: false, reason: 'no_dimensions' };
 
-  const recommendation: Recommendation = RECOMMENDATIONS.includes(source.recommendation)
-    ? source.recommendation
-    : 'hold';
-
-  const scaleValue = mapOverallToScale(source.overallScore, scale);
+  // M029: the verdict decides the Overall Recommendation. A missing or unknown
+  // verdict is refused, never turned into Borderline.
+  const recommendation = source.recommendation;
+  if (!isRecommendation(recommendation)) return { ok: false, reason: 'invalid_recommendation' };
+  if (Math.round(scale.min) !== ASHBY_OVERALL_SCALE.min || Math.round(scale.max) !== ASHBY_OVERALL_SCALE.max) {
+    return { ok: false, reason: 'invalid_overall' };
+  }
+  const scaleValue = overallRecommendationValue(recommendation, source.overallScore);
+  if (scaleValue === null) return { ok: false, reason: 'invalid_overall' };
   const provenance = {
     model: typeof source.provenance?.model === 'string' ? source.provenance.model : undefined,
     scoredAt: typeof source.provenance?.scoredAt === 'string' ? source.provenance.scoredAt : undefined,

@@ -150,9 +150,10 @@ export function recommendationTagsEnabled(): boolean {
 
 /**
  * Pure verdict-to-tag map. `recommendation` MUST be the raw
- * `assessments.recommendation` column, never `ScorecardSource.recommendation` or
- * `NormalizedScorecard.recommendation`: those coerce a missing verdict to `hold`,
- * which would tag it Borderline.
+ * `assessments.recommendation` column, read for the tag itself. Since M029
+ * `ScorecardSource.recommendation` carries the raw verdict too and
+ * `buildScorecard` refuses a missing one (`invalid_recommendation`) rather than
+ * reading it as `hold`, but the tag still never depends on the scorecard path.
  *
  * The evidence grade is deliberately not an input: since M028 a verdict graded
  * `insufficient` is tagged with its lean like any other.

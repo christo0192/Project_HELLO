@@ -178,10 +178,10 @@ describe('the bound payload is exactly the nine approved field submissions', () 
     }
   });
 
-  it('leaves the legacy recommendation, dimensions and Summary semantics unchanged', () => {
+  it('sends the verdict value (M029) and leaves the dimensions and Summary semantics unchanged', () => {
     const fields = fieldsOf();
     const at = (p: string) => fields.find((f) => f.path === p)!.value;
-    expect(at('overall_recommendation')).toBe('3');
+    expect(at('overall_recommendation')).toBe('4'); // Select (advance, 72) → 4
     expect(at('46ee47b9-71a7-42bd-844c-c279c0e8bebf')).toEqual({ score: 4 }); // english 8/10
     expect(at('d1220462-1d8a-43b9-a56f-c5635cdd5e2f')).toEqual({ score: 3 }); // role_fit 5/10
     expect(B.dimensionScale).toEqual({ min: 1, max: 4 });

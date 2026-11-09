@@ -30,8 +30,8 @@
  * Pure and DB-free; the form schema arrives from the read-only probe.
  */
 
-import type { ProbeFeedbackForm, ProbeFormField } from './probe.js';
-import type { ScorecardFormBinding, ScorecardScale } from './scorecard.js';
+import type { ProbeFeedbackForm, ProbeFormField, ProbeFormOption } from './probe.js';
+import { ASHBY_OVERALL_SCALE, type ScorecardFormBinding, type ScorecardScale } from './scorecard.js';
 
 /** The Ashby input type of a rating field. Only these may carry a dimension. */
 export const SCORE_FIELD_TYPE = 'Score';
@@ -262,6 +262,45 @@ export function composeAutoboundBinding(
   };
 }
 
+// ── The Overall Recommendation options (M029, D10) ──────────────────────────
+
+/**
+ * The option values HELLO writes to the Overall Recommendation field: the
+ * verdict as "1".."4" (see `overallRecommendationValue`).
+ */
+export const OVERALL_OPTION_VALUES: readonly string[] = Object.freeze(
+  Array.from({ length: ASHBY_OVERALL_SCALE.max - ASHBY_OVERALL_SCALE.min + 1 }, (_, i) => String(ASHBY_OVERALL_SCALE.min + i)),
+);
+
+/**
+ * The live form's Overall Recommendation field: the first field carrying the
+ * verified overall path (first wins, as in every other path lookup here), or
+ * null when the form has no such field or no schema.
+ */
+export function overallFieldOf(base: ScorecardFormBinding, form: ProbeFeedbackForm): ProbeFormField | null {
+  const path = base.fieldPaths?.overall;
+  if (!path || !form.schemaAvailable) return null;
+  return formFields(form).find((f) => f.path === path) ?? null;
+}
+
+/**
+ * True only when the live overall field offers EXACTLY the option values
+ * "1".."4", each once, in any order. Anything else — no field, no options, a
+ * missing or extra value, a five-point or zero-based select, label-only
+ * options — is false: HELLO would write a value that the form rejects or that
+ * means something else, on a card that cannot be retracted. Values only: the
+ * labels are not read, so whether "4" is the top answer is confirmed by a
+ * person (D8), not here.
+ */
+export function overallOptionsMatch(base: ScorecardFormBinding, form: ProbeFeedbackForm): boolean {
+  const field = overallFieldOf(base, form);
+  if (!field || field.optionsTruncated) return false;
+  const values = field.options.map((o) => o.value);
+  if (values.length !== OVERALL_OPTION_VALUES.length) return false;
+  const offered = new Set(values);
+  return offered.size === OVERALL_OPTION_VALUES.length && OVERALL_OPTION_VALUES.every((v) => offered.has(v));
+}
+
 /** The form is the one the static binding was verified against, and usable. */
 export function formIsVerifiedBindingTarget(base: ScorecardFormBinding, form: ProbeFeedbackForm): boolean {
   return Boolean(base.verified) && Boolean(base.formDefinitionId)
@@ -307,8 +346,14 @@ export interface FixedFieldCheck {
   path: string;
   /** Type the binding expects, when it declares one. */
   expectedType: string | null;
-  /** Whether a field with that path exists on the live form, and with what type. */
-  status: 'present' | 'missing' | 'type_mismatch';
+  /**
+   * Whether a field with that path exists on the live form, and with what
+   * type. `options_mismatch` (overall only, M029 D10): the field is there but
+   * does not offer exactly the option values "1".."4", so the worker refuses
+   * every v2 card (`overall_options_mismatch`); `overallOptions` lists what it
+   * does offer.
+   */
+  status: 'present' | 'missing' | 'type_mismatch' | 'options_mismatch';
   actualType: string | null;
 }
 
@@ -329,11 +374,19 @@ export interface ScorecardBindingPreview {
   /** The form matches the verified static binding (id, not archived). */
   formMatchesBinding: boolean;
   fixedFields: FixedFieldCheck[];
+  /**
+   * M029: the live Overall Recommendation field's options, value and label
+   * only, in form order — so an admin can confirm from HELLO what "1".."4"
+   * say before the verdict mapping writes them. Empty when the field is
+   * missing or the definition carried no schema. Read-only; never persisted.
+   */
+  overallOptions: ProbeFormOption[];
   metrics: MetricBindingPreviewRow[];
   unusedScoreFields: Array<{ fieldId: string; title: string | null }>;
   /**
    * True only when the form is the verified one, every fixed field is present
-   * with the expected type, and EVERY metric bound. A false here means a v2
+   * with the expected type, the Overall Recommendation offers exactly "1".."4"
+   * (the worker's D10 guard), and EVERY metric bound. A false here means a v2
    * card would submit with metrics omitted (or not at all).
    */
   ready: boolean;
@@ -362,6 +415,11 @@ export function previewScorecardBinding(
     ['redFlags', paths?.redFlags, base.fieldTypes?.redFlags ?? null],
     ['detailedReport', paths?.detailedReport, base.fieldTypes?.detailedReport ?? null],
   ];
+  // The worker's D10 guard, run on the same form. A preview that said "ready"
+  // while the worker refuses every v2 card would be a promise it never keeps,
+  // so a mismatch marks the overall row (the Mission Control page counts any
+  // row that is not `present` as "Not ready") and `ready` below.
+  const overallOptionsOk = overallOptionsMatch(base, form);
   for (const [name, path, expectedType] of fixedSpec) {
     if (!path) continue;
     const field = form.schemaAvailable ? byPath.get(path) : undefined;
@@ -370,9 +428,15 @@ export function previewScorecardBinding(
       ? 'missing'
       : expectedType && actualType !== expectedType
         ? 'type_mismatch'
-        : 'present';
+        : name === 'overall' && !overallOptionsOk
+          ? 'options_mismatch'
+          : 'present';
     fixedFields.push({ name, path, expectedType, status, actualType });
   }
+  // Value and label only — copied key by key, so nothing else a field carries
+  // can ride along.
+  const overallOptions: ProbeFormOption[] = (overallFieldOf(base, form)?.options ?? [])
+    .map((o) => ({ value: o.value, label: o.label }));
 
   const auto = autobindScorecardDimensions(form, metrics);
   const rows: MetricBindingPreviewRow[] = [];
@@ -395,6 +459,7 @@ export function previewScorecardBinding(
     formMatchesBinding &&
     form.schemaAvailable &&
     fixedFields.every((f) => f.status === 'present') &&
+    overallOptionsOk &&
     rows.length > 0 &&
     rows.every((r) => r.status === 'bound');
 
@@ -405,6 +470,7 @@ export function previewScorecardBinding(
     archived: form.archived === true,
     formMatchesBinding,
     fixedFields,
+    overallOptions,
     metrics: rows,
     unusedScoreFields: auto.unusedScoreFields,
     ready,

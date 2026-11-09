@@ -1012,13 +1012,77 @@ in "Making the lane re-check a candidate" above. Until a run stores the id again
 the phone lane's duplicate-application check cannot match that link by its Ashby
 candidate id (it still matches by phone number and email).
 
-### The tag and the Ashby 1-4 rating can look inconsistent
+### The tag and the Ashby 1-4 rating (M029)
 
-The scorecard's overall rating uses 25-point bands (below 25 is 1, 25-49 is 2, 50-74
-is 3, 75 and above is 4). The verdict uses 65 and 45. So the same rating can sit
-beside different tags: a 3 covers both Borderline (50-64) and Select (65-74), and a 2
-covers both Reject (25-44) and Borderline (45-49). That is existing behaviour the
-tags make visible, not a fault.
+Cut-over: **2026-11-09** (the API deploy date). Cards written before it keep the old 25-point-band value; the owner confirmed on 2026-11-09 that the form's Overall Recommendation has the four options "1" to "4".
+
+From the cut-over, the scorecard's Overall Recommendation follows the verdict of the
+assessment the card was built from. The verdict decides first; the score only splits
+Borderline, at 50 (owner decision 2026-11-09):
+
+| Christy tag (verdict) | Score | Overall Recommendation |
+| --- | --- | --- |
+| Reject | any | 1 |
+| Borderline | below 50 (normally 45-49) | 2 |
+| Borderline | 50 and above (normally 50-64) | 3 |
+| Select | any | 4 |
+
+The number and the tag can still differ later, and that is not a fault. The card is
+written once per application link and never changes. The tag follows the candidate's
+newest verdict on any of their applications. So after a rescore, or a newer result on
+another application of the same candidate, the tag moves and the card keeps its
+number.
+
+Cards written before the cut-over used 25-point score bands (below 25 is 1, 25-49
+is 2, 50-74 is 3, 75 and above is 4) and keep that number: HELLO cannot change or
+delete Ashby feedback. On an older card a 3 can be a Borderline (50-64) or a Select
+(65-74), and a 2 a Reject (25-44) or a Borderline (45-49), so read a card's number
+against its date. A card that was still queued, or failed and was retried, at the
+cut-over gets the new number, because the worker rebuilds the card when it runs.
+
+When no card is written:
+
+- **No verdict or no score.** HELLO sends no card rather than make one up. For a
+  legacy v1 row this is `scorecard_invalid_recommendation` or
+  `scorecard_invalid_overall`. At queueing the refusal leaves no operation and no
+  log line (the completion observer ignores the enqueue result); in the worker it
+  is a permanent failure in Mission Control. A v2 result with no verdict was
+  already never written.
+- **`overall_options_mismatch`** (v2 writes). The live form's Overall
+  Recommendation does not offer exactly the option values 1-4. The worker decides
+  this on an uncached read of the form, never on the 5-minute cache. In Mission
+  Control the mapping's scorecard binding preview then says "Not ready", and its
+  Overall recommendation row does not say "present". The page does not show the
+  options themselves. They are in the preview's API response: with the preview
+  open, read `preview.overallOptions` in the browser's developer tools (Network
+  tab, the `GET /api/integrations/ashby/mission-control/mappings/<id>/scorecard-binding`
+  response). It lists each option's value and label as Ashby's API serves them.
+  Fix the form in Ashby, check that the preview's Overall recommendation row says
+  "present" again, then Retry the operation. There is no need to wait for the cache: the worker re-reads the form
+  before it refuses. The check reads values only; whether 4 is the top answer is
+  read from the labels by a person.
+
+#### Deploy check for the 1-4 options (D8 and D10)
+
+The guard and the only HELLO-side view of the options (`preview.overallOptions`)
+ship in the same deploy, and HELLO has never seen what Ashby's API returns for this
+field. Reading the labels in the Ashby UI confirms the labels. It does not confirm
+that the API lists the values "1" to "4" with no extra option. If it does not, every
+v2 card fails with `overall_options_mismatch` from the deploy on. So:
+
+1. **Before merge (D8).** The Ashby admin confirms in Ashby that the Overall
+   Recommendation offers 1 to 4, with 4 the top answer. Necessary, not enough.
+2. **Right after the API deploy, before anything else.** An admin opens the
+   scorecard binding preview of every enabled mapping. On each, the Overall
+   recommendation row must say "present", and `preview.overallOptions` in the
+   response (see above) must list exactly the
+   values "1", "2", "3" and "4", with labels that run from the lowest answer (1) to
+   the top answer (4). Record what the labels say. Labels only, no candidate data.
+3. **If any of that fails** (the overall row is not "present", `overallOptions` is
+   empty or has another value, or the labels run the other way), redeploy the
+   previous API image at once. Every v2 card claimed in between has failed with
+   `overall_options_mismatch`. After the rollback, Retry each one from Mission
+   Control so the previous code writes it. Each Retry uses an attempt.
 
 ### Backfill (only after owner testing and go-ahead)
 
