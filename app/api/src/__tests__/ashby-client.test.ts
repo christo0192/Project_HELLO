@@ -15,6 +15,7 @@ import {
   AshbyError,
   isAshbyError,
   ASHBY_API_BASE_URL,
+  ASHBY_OPERATIONS,
   createMetadataLogger,
   type AshbyTransport,
   type AshbyTransportRequest,
@@ -445,6 +446,112 @@ describe('endpoint helpers', () => {
     await client.applicationChangeStage('app_1', 'stage_2');
     expect(calls[0].url).toBe('https://api.ashbyhq.com/application.changeStage');
     expect(JSON.parse(calls[0].body)).toMatchObject({ applicationId: 'app_1', interviewStageId: 'stage_2' });
+  });
+});
+
+// ── M031: interview-stage reads, the status filter, call deadlines ─────────
+
+describe('M031 — interview-stage reads (Interviews read) are fixed-path READS', () => {
+  it('registers interviewStage.list and interviewStage.info with mutation: false', () => {
+    expect(ASHBY_OPERATIONS['interviewStage.list']).toEqual({ path: '/interviewStage.list', mutation: false });
+    expect(ASHBY_OPERATIONS['interviewStage.info']).toEqual({ path: '/interviewStage.info', mutation: false });
+  });
+
+  it('interviewStage.list posts exactly { interviewPlanId } to the fixed path', async () => {
+    const { client, calls } = makeClient([ok([{ id: 'stage_1' }])]);
+    const r = await client.interviewStageList({ interviewPlanId: 'plan_1' });
+    expect(r.results).toEqual([{ id: 'stage_1' }]);
+    expect(calls[0].url).toBe('https://api.ashbyhq.com/interviewStage.list');
+    expect(JSON.parse(calls[0].body)).toEqual({ interviewPlanId: 'plan_1' });
+    expect(calls[0].url).not.toContain('plan_1');
+  });
+
+  it('interviewStage.info posts exactly { interviewStageId } to the fixed path', async () => {
+    const { client, calls } = makeClient([ok({ id: 'stage_1', type: 'Active' })]);
+    await client.interviewStageInfo('stage_1');
+    expect(calls[0].url).toBe('https://api.ashbyhq.com/interviewStage.info');
+    expect(JSON.parse(calls[0].body)).toEqual({ interviewStageId: 'stage_1' });
+  });
+
+  it('both validate the id before any transport call', async () => {
+    const { client, calls } = makeClient([ok([])]);
+    await expect(client.interviewStageList({ interviewPlanId: '' }))
+      .rejects.toMatchObject({ code: 'invalid_id', operation: 'interviewStage.list' });
+    await expect(client.interviewStageList({ interviewPlanId: 'p\u0000' }))
+      .rejects.toMatchObject({ code: 'id_control_char', operation: 'interviewStage.list' });
+    await expect(client.interviewStageList({ interviewPlanId: 'p'.repeat(300) }))
+      .rejects.toMatchObject({ code: 'id_too_long' });
+    await expect(client.interviewStageInfo(undefined as unknown as string))
+      .rejects.toMatchObject({ code: 'invalid_id', operation: 'interviewStage.info' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a read is retried on a 5xx, as every read is', async () => {
+    const { client, calls } = makeClient([res(503, 'busy'), ok([])]);
+    await client.interviewStageList({ interviewPlanId: 'plan_1' });
+    expect(calls).toHaveLength(2);
+  });
+});
+
+describe('M031 — application.list status filter', () => {
+  it.each(['Active', 'Hired', 'Archived', 'Lead'] as const)('sends the documented status %s with the job filter', async (status) => {
+    const { client, calls } = makeClient([ok([])]);
+    await client.applicationList({ jobId: 'job_1', status, limit: 1 });
+    expect(JSON.parse(calls[0].body)).toEqual({ jobId: 'job_1', status, limit: 1 });
+  });
+
+  it('refuses any other status before a transport call, so a typo can never list everything', async () => {
+    const { client, calls } = makeClient([ok([])]);
+    for (const bad of ['hired', 'Rejected', '', 7]) {
+      await expect(client.applicationList({ status: bad as never }))
+        .rejects.toMatchObject({ code: 'invalid_status', operation: 'application.list' });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a status in `extra` cannot override the validated one', async () => {
+    const { client, calls } = makeClient([ok([])]);
+    await client.applicationList({ status: 'Hired', extra: { status: 'Active' } });
+    expect(JSON.parse(calls[0].body).status).toBe('Hired');
+  });
+});
+
+describe('M031 — call deadlines are honoured and never sent', () => {
+  const spentDeadline = () => Date.now() - 1;
+  const liveDeadline = () => Date.now() + 60_000;
+
+  it('application.list', async () => {
+    const live = makeClient([ok([])]);
+    await live.client.applicationList({ jobId: 'job_1', deadlineAt: liveDeadline() });
+    expect(JSON.parse(live.calls[0].body)).toEqual({ jobId: 'job_1' });
+    const spent = makeClient([ok([])]);
+    await expect(spent.client.applicationList({ jobId: 'job_1', deadlineAt: spentDeadline() }))
+      .rejects.toMatchObject({ category: 'timeout', code: 'deadline_exceeded', operation: 'application.list' });
+    expect(spent.calls).toHaveLength(0);
+  });
+
+  it('jobInterviewPlan.info', async () => {
+    const live = makeClient([ok({})]);
+    await live.client.jobInterviewPlanInfo('job_1', undefined, { deadlineAt: liveDeadline() });
+    expect(JSON.parse(live.calls[0].body)).toEqual({ jobId: 'job_1' });
+    const spent = makeClient([ok({})]);
+    await expect(spent.client.jobInterviewPlanInfo('job_1', undefined, { deadlineAt: spentDeadline() }))
+      .rejects.toMatchObject({ code: 'deadline_exceeded', operation: 'jobInterviewPlan.info' });
+    expect(spent.calls).toHaveLength(0);
+  });
+
+  it('interviewStage.list and interviewStage.info', async () => {
+    const live = makeClient([ok([]), ok({})]);
+    await live.client.interviewStageList({ interviewPlanId: 'plan_1', deadlineAt: liveDeadline() });
+    await live.client.interviewStageInfo('stage_1', { deadlineAt: liveDeadline() });
+    expect(JSON.parse(live.calls[0].body)).toEqual({ interviewPlanId: 'plan_1' });
+    expect(JSON.parse(live.calls[1].body)).toEqual({ interviewStageId: 'stage_1' });
+    const spent = makeClient([ok([])]);
+    await expect(spent.client.interviewStageList({ interviewPlanId: 'plan_1', deadlineAt: spentDeadline() }))
+      .rejects.toMatchObject({ code: 'deadline_exceeded' });
+    await expect(spent.client.interviewStageInfo('stage_1', { deadlineAt: spentDeadline() }))
+      .rejects.toMatchObject({ code: 'deadline_exceeded' });
+    expect(spent.calls).toHaveLength(0);
   });
 });
 

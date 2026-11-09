@@ -21,6 +21,7 @@
 import { AshbyError, sanitizeCodes } from './errors.js';
 import {
   ASHBY_OPERATIONS,
+  ASHBY_APPLICATION_STATUSES,
   type AshbyOperation,
   type AshbyEnvelope,
   type AshbyResult,
@@ -28,6 +29,7 @@ import {
   type ApplicationListParams,
   type ApplicationHistoryParams,
   type CandidateTagListParams,
+  type InterviewStageListParams,
   type JobListParams,
   type FeedbackSubmitRequest,
   type FeedbackRequestCreateRequest,
@@ -464,6 +466,11 @@ export class AshbyClient {
     return this.request<T>('application.info', { applicationId, ...(extra ?? {}) }, { deadlineAt: options.deadlineAt });
   }
 
+  /**
+   * One page of `application.list`. `status` (M031) is checked against the
+   * documented closed set before anything is sent, and written after `extra`
+   * so `extra` cannot override it. `deadlineAt` is internal, never sent.
+   */
   async applicationList<T = OpaqueRecord[]>(params: ApplicationListParams = {}): Promise<AshbyResult<T>> {
     const body: OpaqueRecord = { ...(params.extra ?? {}) };
     if (params.cursor !== undefined) body.cursor = validateId('application.list', 'cursor', params.cursor);
@@ -474,7 +481,13 @@ export class AshbyClient {
       body.limit = limit;
     }
     if (params.jobId !== undefined) body.jobId = validateId('application.list', 'jobId', params.jobId);
-    return this.request<T>('application.list', body);
+    if (params.status !== undefined) {
+      if (!(ASHBY_APPLICATION_STATUSES as readonly unknown[]).includes(params.status)) {
+        throw new AshbyError('invalid_request', { code: 'invalid_status', operation: 'application.list' });
+      }
+      body.status = params.status;
+    }
+    return this.request<T>('application.list', body, { deadlineAt: params.deadlineAt });
   }
 
   /**
@@ -537,9 +550,34 @@ export class AshbyClient {
     return this.request<T>('file.info', { fileHandle, ...(extra ?? {}) });
   }
 
-  async jobInterviewPlanInfo<T = OpaqueRecord>(jobId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
+  /** `options.deadlineAt` is internal (see {@link AshbyCallOptions}), never sent. */
+  async jobInterviewPlanInfo<T = OpaqueRecord>(
+    jobId: string,
+    extra?: OpaqueRecord,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
     validateId('jobInterviewPlan.info', 'jobId', jobId);
-    return this.request<T>('jobInterviewPlan.info', { jobId, ...(extra ?? {}) });
+    return this.request<T>('jobInterviewPlan.info', { jobId, ...(extra ?? {}) }, { deadlineAt: options.deadlineAt });
+  }
+
+  /**
+   * One interview plan's stages in plan order (permission `interviewsRead`).
+   * The body is exactly `{ interviewPlanId }`: paging and other filters are not
+   * verified against a tenant, so none is sent. Structure only — no
+   * application or candidate data.
+   */
+  async interviewStageList<T = OpaqueRecord[]>(params: InterviewStageListParams): Promise<AshbyResult<T>> {
+    const interviewPlanId = validateId('interviewStage.list', 'interviewPlanId', params?.interviewPlanId);
+    return this.request<T>('interviewStage.list', { interviewPlanId }, { deadlineAt: params.deadlineAt });
+  }
+
+  /** One interview stage (permission `interviewsRead`). Body is exactly `{ interviewStageId }`. */
+  async interviewStageInfo<T = OpaqueRecord>(
+    interviewStageId: string,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
+    const id = validateId('interviewStage.info', 'interviewStageId', interviewStageId);
+    return this.request<T>('interviewStage.info', { interviewStageId: id }, { deadlineAt: options.deadlineAt });
   }
 
   /**
