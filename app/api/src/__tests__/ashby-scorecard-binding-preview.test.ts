@@ -103,6 +103,31 @@ describe('previewScorecardBinding', () => {
     expect(noSchema.fixedFields.every((f) => f.status === 'missing')).toBe(true);
     expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, good, []).ready).toBe(false);
   });
+
+  // M029: the Overall Recommendation's option values and labels, so an admin
+  // can confirm from HELLO what "1".."4" say on the live form (D8).
+  it('carries the overall field’s option values and labels, in form order, and nothing else', () => {
+    const labelled = [
+      { value: '1', label: '1 - Strong No' }, { value: '2', label: '2 - No' },
+      { value: '3', label: '3 - Yes' }, { value: '4', label: '4 - Strong Yes' },
+    ];
+    const withLabels = form([
+      field({ id: 'ov', title: 'Overall recommendation', path: PATHS.overall, type: 'ValueSelect', required: true, options: labelled }),
+      ...FIXED.filter((f) => f.id !== 'ov'),
+    ]);
+    const p = previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, withLabels, []);
+    expect(p.overallOptions).toEqual(labelled);
+    for (const o of p.overallOptions) expect(Object.keys(o).sort()).toEqual(['label', 'value']);
+    expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, form(FIXED), []).overallOptions)
+      .toEqual([1, 2, 3, 4].map((n) => ({ value: String(n), label: `${n}` })));
+  });
+
+  it('shows no overall options when the field is missing or the definition has no schema', () => {
+    const noOverall = form(FIXED.filter((f) => f.id !== 'ov'));
+    expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, noOverall, []).overallOptions).toEqual([]);
+    const noSchema = form(FIXED, { schemaAvailable: false });
+    expect(previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, noSchema, []).overallOptions).toEqual([]);
+  });
 });
 
 // ── Route ───────────────────────────────────────────────────────────────────
@@ -188,6 +213,31 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
     } finally {
       setAuditSink(sink);
     }
+  });
+
+  it('returns the overall field’s option values and labels from the live definition (M029, read-only)', async () => {
+    const labelled = [
+      { value: '1', label: '1 - Strong No' }, { value: '2', label: '2 - No' },
+      { value: '3', label: '3 - Yes' }, { value: '4', label: '4 - Strong Yes' },
+    ];
+    const d = previewDeps();
+    (d.formDefinitionReader as { feedbackFormDefinitionInfo: unknown }).feedbackFormDefinitionInfo = async () => ({
+      results: {
+        ...DEFINITION_PAYLOAD,
+        formDefinition: { sections: [{ id: 'sec', title: 'All', fields: DEFINITION_PAYLOAD.formDefinition.sections[0].fields.map((w) => (
+          (w.field as { path?: string }).path === PATHS.overall
+            ? { ...w, field: { ...w.field, selectableValues: labelled.map((o) => ({ ...o, submittedValue: 'ANSWER-MUST-NOT-SURFACE' })) } }
+            : w
+        )) }] },
+      },
+    });
+    const res = await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+    expect(res.status).toBe(200);
+    expect(res.body.preview.overallOptions).toEqual(labelled);
+    expect(JSON.stringify(res.body)).not.toMatch(/ANSWER-MUST-NOT-SURFACE|submittedValue/);
+    // The default definition offers plain "1".."4".
+    const plain = await request(appWith('admin', previewDeps())).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+    expect(plain.body.preview.overallOptions).toEqual([1, 2, 3, 4].map((n) => ({ value: String(n), label: `${n}` })));
   });
 
   it('says v1_legacy when the role has no active scorecard and no_role when the mapping has none — still reading the form once', async () => {

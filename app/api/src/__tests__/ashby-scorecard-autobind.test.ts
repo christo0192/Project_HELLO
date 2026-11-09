@@ -448,9 +448,10 @@ describe('worker — a v2 scorecard auto-binds by name against the live form def
     // bucketed onto ITS scale, exactly as v1 did — never a metric score.
     expect(byPath.get('d1220462-1d8a-43b9-a56f-c5635cdd5e2f')).toEqual({ score: dimensionValueOnScale({ score: 7 }, { min: 1, max: 4 }) });
     expect(byPath.has('46ee47b9-71a7-42bd-844c-c279c0e8bebf')).toBe(false); // v1 "English" id is not on the form → nothing written
-    // Fixed fields intact: overall on the 1–4 select (weighted 3.2/4 → 73 → 3),
-    // rich summary, red flags, deep link.
-    expect(byPath.get(PATHS.overall)).toBe('3');
+    // Fixed fields intact: overall on the 1–4 select (a Select, weighted
+    // 3.2/4 → 73, sends 4 — M029: the verdict decides), rich summary, red
+    // flags, deep link.
+    expect(byPath.get(PATHS.overall)).toBe('4');
     expect(byPath.get(PATHS.summary)).toEqual({
       type: 'PlainText',
       value: expect.stringContaining('Compensation fit — NOT SCORED (insufficient evidence)'),
@@ -519,6 +520,80 @@ describe('worker — a v2 scorecard auto-binds by name against the live form def
     });
     expect(failures).toEqual([{ reason: 'form_definition_mismatch', retryable: false }]);
     expect(submit).not.toHaveBeenCalled();
+  });
+
+  // ── M029 D10: the live overall field must offer exactly "1"-"4" ──────────
+  // HELLO sends the verdict as the option value "1".."4" on a card that cannot
+  // be retracted. A form whose Overall Recommendation offers anything else
+  // would take a wrong value, or reject it, for every candidate.
+  function withOverallOptions(options: ProbeFormField['options']): ProbeFeedbackForm {
+    return {
+      ...LIVE_FORM,
+      sections: LIVE_FORM.sections.map((s) => ({
+        ...s,
+        fields: s.fields.map((f) => (f.path === PATHS.overall ? { ...f, options } : f)),
+      })),
+    };
+  }
+
+  async function runWithForm(liveForm: ProbeFeedbackForm) {
+    const submit = vi.fn(async () => ({}));
+    const events: string[] = [];
+    const fx = workerFixture(v2Source());
+    const out = await runClaimedAshbyOperation({
+      stores: fx.stores, materialization: {} as never,
+      scorecard: { submit, dashboardOrigin: ORIGIN, readFormDefinition: async () => liveForm },
+      resolveMappingForLink: async () => null, reissuePathFor: () => '/x',
+      email: { providerApproved: false, domainVerified: false }, owner: 'w1', leaseSeconds: 30,
+      onEvent: (e) => events.push(`${e.kind}:${e.code ?? ''}`),
+    });
+    return { out, submit, events, failures: fx.failures, defers: fx.defers };
+  }
+
+  it('D10: fails permanently with overall_options_mismatch when the overall field does not offer exactly "1"-"4"', async () => {
+    const bad: Array<[string, ProbeFormField['options']]> = [
+      ['no options', []],
+      ['five points', FIVE_POINT],
+      ['zero-based', [0, 1, 2, 3].map((n) => ({ value: String(n), label: `${n}` }))],
+      ['a value missing', [1, 2, 4].map((n) => ({ value: String(n), label: `${n}` }))],
+      ['labels only, no values', [1, 2, 3, 4].map((n) => ({ value: null, label: `${n}` }))],
+      ['words for values', ['strong_no', 'no', 'yes', 'strong_yes'].map((v) => ({ value: v, label: v }))],
+      ['a duplicated value', [...FOUR_POINT, { value: '4', label: '4 again' }]],
+    ];
+    for (const [label, options] of bad) {
+      const { out, submit, events, failures, defers } = await runWithForm(withOverallOptions(options));
+      expect(failures, label).toEqual([{ reason: 'overall_options_mismatch', retryable: false }]);
+      expect(defers, label).toEqual([]);
+      expect(out, label).toMatchObject({ claimed: true, committed: false, code: 'overall_options_mismatch' });
+      expect(events, label).toContain('blocked:overall_options_mismatch');
+      expect(submit, label).not.toHaveBeenCalled();
+    }
+  });
+
+  it('D10: fails permanently when the overall field is not on the live form at all', async () => {
+    const noOverall: ProbeFeedbackForm = {
+      ...LIVE_FORM,
+      sections: LIVE_FORM.sections.map((s) => ({ ...s, fields: s.fields.filter((f) => f.path !== PATHS.overall) })),
+    };
+    const { submit, failures } = await runWithForm(noOverall);
+    // A deleted fixed field is already refused by the compose step.
+    expect(failures).toEqual([{ reason: 'form_definition_mismatch', retryable: false }]);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it('D10: writes the card when the overall field offers "1"-"4", in any order and whatever the labels say', async () => {
+    const labelled = [
+      { value: '1', label: '1 - Strong No' }, { value: '2', label: '2 - No' },
+      { value: '3', label: '3 - Yes' }, { value: '4', label: '4 - Strong Yes' },
+    ];
+    for (const options of [FOUR_POINT, labelled, [...labelled].reverse()]) {
+      const { out, submit, failures } = await runWithForm(withOverallOptions(options));
+      expect(failures).toEqual([]);
+      expect(out).toMatchObject({ committed: true, code: 'scorecard_submitted' });
+      expect(submit).toHaveBeenCalledTimes(1);
+      // The labels are not read: whether "4" means the top answer on the live
+      // form is confirmed by a person before merge (D8), not by this guard.
+    }
   });
 
   it('without a form reader a v2 operation is deferred as unavailable, while a v1 operation still uses the static binding', async () => {
