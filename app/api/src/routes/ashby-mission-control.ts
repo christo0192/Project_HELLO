@@ -30,6 +30,10 @@
  *                                    openedAt only; confidential jobs withheld
  *                                    and counted; single-flight + 60 s cache)
  *   GET  /jobs/:externalJobId/stages         — admin: read-only stage discovery
+ *                                    (id, title, type, plan order, group id)
+ *   GET  /access-check             — admin: which Ashby permissions the key
+ *                                    holds (M031); states, counts and stage
+ *                                    types only, never an id or a name
  *   GET  /jobs/:externalJobId/feedback-form  — admin: read-only feedback-form
  *                                    SCHEMA discovery (ids/labels/types/scales;
  *                                    never feedback content)
@@ -60,6 +64,13 @@ import {
   type JobListReader,
   type ProbeJobDirectory,
 } from '../integrations/ashby/probe.js';
+import {
+  createAshbyAccessCheckSource,
+  runAccessCheck,
+  type AccessCheckReader,
+  type AccessCheckResult,
+  type AccessCheckSource,
+} from '../integrations/ashby/access-check.js';
 import { HELLO_CHRISTY_SCREENING_STAGE_ID } from '../integrations/ashby/screening-stage.js';
 import { createAshbyProbeClient } from '../integrations/ashby/runtime.js';
 import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
@@ -159,6 +170,18 @@ export interface AshbyMissionControlDeps {
    */
   jobListReader?: JobListReader | null;
   /**
+   * Injected read-only reader for the M031 access check. Production uses the
+   * same gated probe client; an explicit `null` means "disabled" (tests), and
+   * so does `probeReader: null`.
+   */
+  accessCheckReader?: AccessCheckReader | null;
+  /**
+   * Injected reader of HELLO's own tables for the access check: enabled
+   * mappings' job ids and the newest imported application (tests).
+   * Production reads them with the service role.
+   */
+  accessCheckSource?: AccessCheckSource;
+  /**
    * Injected mapping/metric lookups for the binding preview (tests).
    * Production reads the mapping's role and feedback form in one row read,
    * and the role's ACTIVE scorecard version.
@@ -251,6 +274,18 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     if (deps.probeReader === null) return null;
     return resolveProbeClient();
   };
+  // The M031 access check reads through that same gated client, closed by the
+  // same `probeReader: null` seam.
+  const resolveAccessCheckReader = (): AccessCheckReader | null => {
+    if (deps.accessCheckReader !== undefined) return deps.accessCheckReader;
+    if (deps.probeReader === null) return null;
+    return resolveProbeClient();
+  };
+  let accessSourceCached: AccessCheckSource | undefined = deps.accessCheckSource;
+  const accessSource = (): AccessCheckSource => {
+    if (!accessSourceCached) accessSourceCached = createAshbyAccessCheckSource(supabase as never);
+    return accessSourceCached;
+  };
   const scorecardPreview = deps.scorecardPreview ?? {
     async readMapping(mappingId: string): Promise<{ roleId: string | null; feedbackFormId: string | null } | undefined> {
       const { data, error } = await supabase
@@ -308,6 +343,31 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     // requests awaiting `flight`; this derived chain swallows it so it is
     // never reported as unhandled.
     const release = (): void => { if (directoryInFlight === flight) directoryInFlight = null; };
+    flight.then(release, release);
+    return flight;
+  };
+
+  // ── Access check: one run shared by concurrent requests (M031) ────────────
+  // One check makes at most 24 Ashby reads. Requests that arrive while a run is
+  // in flight (two admins, a double click) share it. Nothing is cached: the
+  // next request after it settles checks again, because the point is a live
+  // answer. The audit row stays per request.
+  const ACCESS_TARGETS_UNREADABLE = 'ashby_access_check_targets_unreadable';
+  let accessInFlight: Promise<AccessCheckResult> | null = null;
+  const sharedAccessCheck = (reader: AccessCheckReader): Promise<AccessCheckResult> => {
+    if (accessInFlight) return accessInFlight;
+    const flight = (async () => {
+      let targets: Awaited<ReturnType<AccessCheckSource['readTargets']>>;
+      try {
+        targets = await accessSource().readTargets();
+      } catch {
+        // HELLO's own tables, not Ashby: a different status, and no detail.
+        throw new Error(ACCESS_TARGETS_UNREADABLE);
+      }
+      return runAccessCheck(reader, targets, { now });
+    })();
+    accessInFlight = flight;
+    const release = (): void => { if (accessInFlight === flight) accessInFlight = null; };
     flight.then(release, release);
     return flight;
   };
@@ -706,6 +766,47 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     } catch {
       // A tenant 401/403/404 is reported as a sanitized capability failure and
       // enables nothing. Never echo the provider body.
+      res.status(502).json({ ok: false, error: 'probe_unavailable' });
+    }
+  });
+
+  // ── Read-only Ashby access check (admin) — M031 S1 ────────────────────────
+  // Which Ashby permissions does HELLO's key hold for the business-impact
+  // page? Reads only, bounded by one deadline (integrations/ashby/
+  // access-check.ts): each enabled job's plan (Jobs read), those plans' stage
+  // lists (Interviews read), the newest imported application and its history,
+  // and one hired and one archived application's history matched against the
+  // job plan (Candidates read). Answers permission states, coarse codes,
+  // counts and stage types — never an id, a name or a title. Writes nothing in
+  // Ashby or in HELLO's data; the one audit row carries counts only.
+  router.get('/access-check', requireRole('admin'), async (req: Request, res: Response) => {
+    const reader = resolveAccessCheckReader();
+    if (!reader) {
+      // Runtime gates closed → no client is constructed, no table or provider read.
+      res.status(503).json({ ok: false, error: 'integration_disabled' }); return;
+    }
+    try {
+      const result = await sharedAccessCheck(reader);
+      const states = Object.values(result.permissions).map((p) => p.state);
+      const permissionCount = (state: string): number => states.filter((s) => s === state).length;
+      await recordAudit(req, 'resource.read', 200, {
+        metadata: {
+          resource: 'ashby_access_check',
+          permissions_ok: permissionCount('ok'),
+          permissions_missing: permissionCount('missing_permission'),
+          permissions_error: permissionCount('error'),
+          permissions_not_tried: permissionCount('not_tried'),
+          jobs_checked: result.mappings.jobsChecked,
+          provider_calls: Object.values(result.operations).reduce((n, o) => n + o.calls, 0),
+          deadline_hit: result.deadlineHit,
+        },
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      if (err instanceof Error && err.message === ACCESS_TARGETS_UNREADABLE) {
+        res.status(500).json({ ok: false, error: 'mission_control_read_error' }); return;
+      }
+      // Never echo why: the check itself could not run.
       res.status(502).json({ ok: false, error: 'probe_unavailable' });
     }
   });

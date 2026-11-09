@@ -41,8 +41,25 @@ makes **no** claim of tenant validation or live Ashby connectivity.
 `candidate.info`, `file.info`, `jobInterviewPlan.info`,
 `feedbackFormDefinition.info`, `job.list`, `applicationFeedback.list`,
 `applicationFeedbackRequest.create`, `applicationFeedback.submit`,
-`application.changeStage`, `candidateTag.list`, `candidate.addTag`, and
-`candidate.removeTag`.
+`application.changeStage`, `candidateTag.list`, `candidate.addTag`,
+`candidate.removeTag`, `interviewStage.list`, and `interviewStage.info`.
+
+`interviewStage.list` and `interviewStage.info` (reads; need `interviewsRead`,
+M031) return interview-plan STRUCTURE: one plan's stages in order, or one stage,
+with type and plan position. Each body is exactly the one validated id
+(`{interviewPlanId}` or `{interviewStageId}`); no paging or filter is sent.
+`applicationList` takes the documented `status` filter, checked against the
+closed set Active, Hired, Archived, Lead before anything is sent; `extra`
+cannot override it. `applicationList`, `jobInterviewPlanInfo` and the two
+interview-stage helpers take an internal `deadlineAt` that is never sent.
+
+The admin access check (`GET …/mission-control/access-check`,
+`integrations/ashby/access-check.ts`) uses these reads, plus
+`application.info`, `application.listHistory` and `jobInterviewPlan.info`, to
+report whether the key holds Candidates read, Jobs read and Interviews read. It
+treats HTTP 403 and HTTP 200 with `errorInfo.code: missing_endpoint_permission`
+alike as a missing permission, and a 401 as a rejected key. It returns states,
+coarse codes, counts and stage types, never an id or a name.
 
 `candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
 and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy

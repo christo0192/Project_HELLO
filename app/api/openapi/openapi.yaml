@@ -4610,6 +4610,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyProbeStagesResponse'
+  /api/integrations/ashby/mission-control/access-check:
+    get:
+      tags: [ashby]
+      operationId: checkAshbyAccess
+      summary: Read-only check of the Ashby permissions the business-impact page relies on (M031)
+      description: Admin-only. Reports, for Candidates read, Jobs read and Interviews read, whether HELLO's Ashby key holds the permission — `ok`, `missing_permission`, `error` (the call failed for another reason, with a coarse code) or `not_tried` (nothing to try, or `deadline` when the overall time budget ran out first). Ashby's two missing-permission answers — HTTP 403 and HTTP 200 with success false and errorInfo.code missing_endpoint_permission — both read as `missing_permission`; a 401 reads as `error` `unauthorized`. It makes only allowlisted READS, under one ~25 s deadline — jobInterviewPlan.info for each enabled mapping's job (at most five), interviewStage.list for each distinct plan those reads name, application.info and application.listHistory on the newest live imported application of an enabled mapping, and application.list by job with status Hired, then Archived (limit 1), followed by application.listHistory on what it finds. A listed application whose own status is not the one asked for is not used (`status_unconfirmed`). History rows carry no stage type, so each is matched by stage id against the job's plan and reported as counts by type. The body carries permission states, coarse codes, counts and stage types ONLY — never an application, candidate, job, plan, stage or actor id, and never a name or title. Concurrent requests share one run; nothing is cached. Writes nothing in Ashby or in HELLO's data; the one audit row per request carries counts only. 503 when the integration is disabled (no client is constructed, no table or provider read); 500 when HELLO's own mapping or link tables cannot be read; 502 when the check itself cannot run. Provider failures never fail the request — they are reported as states.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Per-permission and per-operation states, counts, and stage-type counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyAccessCheckResponse'
+        '403':
+          description: Insufficient role (admin required).
+        '500':
+          description: HELLO's own mapping or link tables could not be read. No Ashby call was made.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '502':
+          description: The check itself could not run. Sanitized, never the cause.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '503':
+          description: Integration disabled — no client is constructed and no read is made.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
   /api/integrations/ashby/mission-control/jobs/{externalJobId}/feedback-form:
     get:
       tags: [ashby]
@@ -8992,6 +9027,171 @@ components:
           items:
             $ref: '#/components/schemas/AshbyProbeStage'
         empty:
+          type: boolean
+      additionalProperties: false
+
+    AshbyAccessState:
+      description: ok — the call answered; missing_permission — Ashby refused it for a missing permission (HTTP 403, or HTTP 200 with errorInfo.code missing_endpoint_permission); error — it failed for another reason; not_tried — nothing to try, or the deadline ran out first.
+      type: string
+      enum: [ok, missing_permission, error, not_tried]
+
+    AshbyAccessErrorCode:
+      description: Coarse, closed set — never a provider message. `deadline` only accompanies not_tried; `status_unconfirmed` only a sample, when the application Ashby listed did not carry the status asked for.
+      type: string
+      enum: [unauthorized, not_found, client_error, rate_limited, server_error, timeout, network, malformed_response, output_limit, logical_failure, invalid_request, status_unconfirmed, deadline, unknown]
+
+    AshbyAccessOutcome:
+      type: object
+      description: One permission's verdict, rolled up over the reads that need it. missing_permission outranks ok, ok outranks error.
+      required: [state, error]
+      properties:
+        state:
+          $ref: '#/components/schemas/AshbyAccessState'
+        error:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyAccessErrorCode'
+      additionalProperties: false
+
+    AshbyAccessOperation:
+      type: object
+      description: One Ashby read across all its calls. calls = ok + missingPermission + failed; a call the deadline left no time for is not made and not counted.
+      required: [state, error, calls, ok, missingPermission, failed]
+      properties:
+        state:
+          $ref: '#/components/schemas/AshbyAccessState'
+        error:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyAccessErrorCode'
+        calls:
+          type: integer
+        ok:
+          type: integer
+        missingPermission:
+          type: integer
+        failed:
+          type: integer
+      additionalProperties: false
+
+    AshbyAccessStageTypeCount:
+      type: object
+      required: [type, count]
+      properties:
+        type:
+          description: Ashby stage type (identifier-shaped, not a closed list); null when the plan stage carried none.
+          type: string
+          nullable: true
+        count:
+          type: integer
+      additionalProperties: false
+
+    AshbyAccessHistory:
+      type: object
+      description: One application's stage history (one page), as counts only. Rows carry no type, so each is matched by stage id against the job's interview plan.
+      required: [rows, matched, unmatched, truncated, stageTypes]
+      properties:
+        rows:
+          type: integer
+        matched:
+          description: Rows whose stage is on the job's plan. Null when no plan was read to match against.
+          type: integer
+          nullable: true
+        unmatched:
+          description: Rows whose stage is not on the job's current plan. Null as for matched.
+          type: integer
+          nullable: true
+        truncated:
+          description: Ashby said there were more rows than the one page read.
+          type: boolean
+        stageTypes:
+          description: Matched rows by stage type, in plan order of each type's first stage.
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyAccessStageTypeCount'
+      additionalProperties: false
+
+    AshbyAccessSample:
+      type: object
+      description: One application looked at — the newest imported one, or one hired or archived on an enabled job. Never its id.
+      required: [state, error, found, history]
+      properties:
+        state:
+          $ref: '#/components/schemas/AshbyAccessState'
+        error:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyAccessErrorCode'
+        found:
+          description: Whether such an application exists; null when the look-up could not answer.
+          type: boolean
+          nullable: true
+        history:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyAccessHistory'
+      additionalProperties: false
+
+    AshbyAccessCheckResponse:
+      type: object
+      description: M031 access check. Permission states, coarse codes, counts and stage types only — no id, name or title anywhere.
+      required: [ok, permissions, operations, mappings, samples, deadlineHit]
+      properties:
+        ok:
+          type: boolean
+        permissions:
+          type: object
+          required: [candidatesRead, jobsRead, interviewsRead]
+          properties:
+            candidatesRead:
+              $ref: '#/components/schemas/AshbyAccessOutcome'
+            jobsRead:
+              $ref: '#/components/schemas/AshbyAccessOutcome'
+            interviewsRead:
+              $ref: '#/components/schemas/AshbyAccessOutcome'
+          additionalProperties: false
+        operations:
+          type: object
+          required: [applicationInfo, applicationListHistory, applicationList, jobInterviewPlanInfo, interviewStageList]
+          properties:
+            applicationInfo:
+              $ref: '#/components/schemas/AshbyAccessOperation'
+            applicationListHistory:
+              $ref: '#/components/schemas/AshbyAccessOperation'
+            applicationList:
+              $ref: '#/components/schemas/AshbyAccessOperation'
+            jobInterviewPlanInfo:
+              $ref: '#/components/schemas/AshbyAccessOperation'
+            interviewStageList:
+              $ref: '#/components/schemas/AshbyAccessOperation'
+          additionalProperties: false
+        mappings:
+          type: object
+          required: [enabled, jobsChecked, truncated]
+          properties:
+            enabled:
+              description: Enabled, live mappings read (at most 50).
+              type: integer
+            jobsChecked:
+              description: Distinct jobs whose plans the check set out to read (at most 5).
+              type: integer
+            truncated:
+              description: There were more mappings or jobs than were checked.
+              type: boolean
+          additionalProperties: false
+        samples:
+          type: object
+          required: [imported, hired, archived]
+          properties:
+            imported:
+              $ref: '#/components/schemas/AshbyAccessSample'
+            hired:
+              $ref: '#/components/schemas/AshbyAccessSample'
+            archived:
+              $ref: '#/components/schemas/AshbyAccessSample'
+          additionalProperties: false
+        deadlineHit:
+          description: The overall deadline cut the check short.
           type: boolean
       additionalProperties: false
 

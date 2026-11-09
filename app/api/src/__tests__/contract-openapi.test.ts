@@ -763,7 +763,9 @@ describe('OpenAPI document integrity', () => {
     // no new schema). 173 + 2 = 175.
     // The queue's search adds ONE staff path: POST /api/interview-rounds/search (a name goes in no
     // URL; inline bodies, no new schema). 175 + 1 = 176.
-    expect(Object.keys(paths).length).toBe(176);
+    // M031 S1 adds ONE admin read: GET .../mission-control/access-check, which reports which Ashby
+    // permissions the key holds (states, counts and stage types only; reads only). 176 + 1 = 177.
+    expect(Object.keys(paths).length).toBe(177);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -880,7 +882,12 @@ describe('OpenAPI document integrity', () => {
     // list and the detail cannot drift. 259 + 4 = 263.
     // 0133 adds TWO: AdminAllowlistHandoverRequest and AdminAllowlistHandoverResponse,
     //   both additionalProperties:false (the response's per-table counts too). 263 + 2 = 265.
-    expect(Object.keys(schemas).length).toBe(265);
+    // M031 S1 adds EIGHT for the Ashby access check: the two closed vocabularies
+    //   (AshbyAccessState, AshbyAccessErrorCode), the per-permission outcome, the
+    //   per-operation tally, the stage-type count, the history counts, the sample,
+    //   and the response envelope. Every object one is additionalProperties:false,
+    //   and none can carry an id. 265 + 8 = 273.
+    expect(Object.keys(schemas).length).toBe(273);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
