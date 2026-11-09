@@ -9,6 +9,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import request from 'supertest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { parseYamlDocument, validateNamed } from './support/openapi-schema.js';
 import { createAshbyMissionControlRouter } from '../routes/ashby-mission-control.js';
 import { setAuditSink, getAuditSink, type AuditEntry } from '../lib/audit.js';
 import { viewerReadOnly } from '../lib/rbac.js';
@@ -17,6 +21,7 @@ import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard
 
 const UUID = '11111111-1111-4111-8111-111111111111';
 const ROLE_UUID = '66666666-6666-4666-8666-666666666666';
+const SPEC_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../../openapi/openapi.yaml');
 
 function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore {
   return {
@@ -999,7 +1004,9 @@ describe('GET /jobs — read-only job directory for the Add-mapping picker', () 
 
     const stages = await request(app).get('/mc/jobs/job_open/stages');
     expect(stages.status).toBe(200);
-    expect(stages.body.stages).toEqual([{ id: 'stage_ai', title: 'AI' }]);
+    expect(stages.body.stages).toEqual([
+      { id: 'stage_ai', title: 'AI', type: null, orderInInterviewPlan: null, interviewStageGroupId: null },
+    ]);
     expect(jobListReader.jobList).toHaveBeenCalledTimes(1);
   });
 });
@@ -1193,8 +1200,40 @@ describe('GET /jobs/:externalJobId/stages — read-only probe', () => {
     const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
       .get('/mc/jobs/job_1/stages');
     expect(res.status).toBe(200);
-    expect(res.body.stages).toEqual([{ id: 'stage_ai', title: 'Bot Screening' }]);
+    expect(res.body.stages).toEqual([
+      { id: 'stage_ai', title: 'Bot Screening', type: null, orderInInterviewPlan: null, interviewStageGroupId: null },
+    ]);
     expect(JSON.stringify(res.body)).not.toContain('leak@example.invalid');
+  });
+
+  it('M031: carries each stage\'s type and plan order, and removes no field', async () => {
+    const probeReader = {
+      jobInterviewPlanInfo: async () => ({
+        results: {
+          interviewPlanId: 'plan_1',
+          stages: [
+            { id: 'stage_ai', title: 'Hello Christy', type: 'PreInterviewScreen', orderInInterviewPlan: 4, interviewStageGroupId: 'grp_1' },
+            { id: 'stage_hired', title: 'Hired', type: 'Hired', orderInInterviewPlan: 17 },
+          ],
+        },
+      }),
+    };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+      .get('/mc/jobs/job_1/stages');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      empty: false,
+      stages: [
+        { id: 'stage_ai', title: 'Hello Christy', type: 'PreInterviewScreen', orderInInterviewPlan: 4, interviewStageGroupId: 'grp_1' },
+        { id: 'stage_hired', title: 'Hired', type: 'Hired', orderInInterviewPlan: 17, interviewStageGroupId: null },
+      ],
+    });
+    // The documented schema matches the live body, and still refuses a field it does not name.
+    const spec = parseYamlDocument(readFileSync(SPEC_PATH, 'utf8'));
+    expect(validateNamed(res.body, 'AshbyProbeStagesResponse', spec)).toEqual([]);
+    const extra = { ...res.body, stages: [{ ...res.body.stages[0], interviewPlanId: 'plan_1' }] };
+    expect(validateNamed(extra, 'AshbyProbeStagesResponse', spec)).not.toEqual([]);
   });
 
   it('answers 503 when the runtime gates are closed — no client, no call', async () => {

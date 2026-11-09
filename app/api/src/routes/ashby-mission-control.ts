@@ -684,7 +684,8 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
 
   // ── Read-only tenant stage probe (admin) ──────────────────────────────────
   // Discovery only: performs exactly one allowlisted READ operation
-  // (jobInterviewPlan.info) and returns sanitized stage ids + bounded titles.
+  // (jobInterviewPlan.info) and returns sanitized stage ids + bounded titles,
+  // plus each stage's type, plan order and group id (M031).
   // It NEVER writes a mapping — an admin applies the ids through POST /mappings.
   router.get('/jobs/:externalJobId/stages', requireRole('admin'), async (req: Request, res: Response) => {
     const jobId = req.params.externalJobId;

@@ -4593,7 +4593,7 @@ paths:
       tags: [ashby]
       operationId: probeAshbyJobStages
       summary: Read-only tenant probe for a job's interview stages
-      description: Admin-only discovery. Performs exactly one allowlisted READ operation (jobInterviewPlan.info) and returns sanitized stage ids plus bounded display titles. Writes nothing — it proposes stage ids that an admin applies via POST /mappings. Returns 503 when the runtime gates are closed (no client is constructed and no network call is made).
+      description: Admin-only discovery. Performs exactly one allowlisted READ operation (jobInterviewPlan.info) and returns sanitized stage ids, bounded display titles, and each stage's type, zero-indexed plan order and stage-group id (M031; null when the payload did not carry them). Writes nothing — it proposes stage ids that an admin applies via POST /mappings. Returns 503 when the runtime gates are closed (no client is constructed and no network call is made).
       security:
         - bearerAuth: []
       parameters:
@@ -8959,11 +8959,24 @@ components:
 
     AshbyProbeStage:
       type: object
-      required: [id, title]
+      description: One sanitized interview-plan stage. Five fields copied by name off the provider stage; every other field is never read. Each nullable field is null when the payload carried no usable value — never inferred.
+      required: [id, title, type, orderInInterviewPlan, interviewStageGroupId]
       properties:
         id:
           type: string
         title:
+          type: string
+          nullable: true
+        type:
+          description: Ashby's stage type (for example Lead, PreInterviewScreen, Active, Offer, Archived, Hired). Ashby gives these as examples, not a closed list, so any identifier-shaped value is passed through; free text is not.
+          type: string
+          nullable: true
+        orderInInterviewPlan:
+          description: Zero-indexed position of the stage in the job's interview plan.
+          type: integer
+          nullable: true
+        interviewStageGroupId:
+          description: Opaque stage-group id, when the stage belongs to a group. The group's name is not read here.
           type: string
           nullable: true
       additionalProperties: false

@@ -52,10 +52,25 @@ export function assertReadOnly(operation: string): asserts operation is ProbeRea
   }
 }
 
-/** A sanitized stage descriptor. Opaque id + bounded display title only. */
+/**
+ * A sanitized stage descriptor: opaque id, bounded display title, and (M031)
+ * the three structural fields `jobInterviewPlan.info` documents on a stage.
+ * Each new field is `null` when the payload did not carry a usable value —
+ * never inferred.
+ */
 export interface ProbeStage {
   id: string;
   title: string | null;
+  /**
+   * Ashby's stage type (Lead, PreInterviewScreen, Active, Offer, Archived,
+   * Hired, ...). The docs give these as examples, not a closed list, so any
+   * identifier-shaped value is kept; free text is not.
+   */
+  type: string | null;
+  /** Zero-indexed position in the interview plan. */
+  orderInInterviewPlan: number | null;
+  /** Opaque stage-group id (the group's NAME needs Interviews read; not read here). */
+  interviewStageGroupId: string | null;
 }
 
 export interface ProbeResult {
@@ -81,6 +96,18 @@ export interface FormDefinitionReader {
 const MAX_STAGES = 100;
 const MAX_TITLE_LEN = 120;
 const ID_RE = /^[A-Za-z0-9_.:-]{1,256}$/;
+/** A stage type is an identifier (`PreInterviewScreen`), never free text. */
+const STAGE_TYPE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/** A stage type as Ashby sends it, or null. Not checked against a closed list. */
+function stageType(raw: unknown): string | null {
+  return typeof raw === 'string' && STAGE_TYPE_RE.test(raw) ? raw : null;
+}
+
+/** A zero-indexed plan position: a whole number from 0, or null. */
+function planOrder(raw: unknown): number | null {
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0 ? raw : null;
+}
 
 /**
  * What a display title may not carry. Each run becomes ONE space:
@@ -132,8 +159,10 @@ function sanitizeTitle(raw: unknown): string | null {
  *
  * The exact envelope shape is tenant-verifiable, so this reads defensively
  * across the plausible shapes rather than locking one speculatively, and
- * copies ONLY `id` and a display title — never any sibling field, so a payload
- * that happens to carry candidate data cannot ride along.
+ * copies ONLY `id`, a display title, and (M031) `type`,
+ * `orderInInterviewPlan` and `interviewStageGroupId` — each by name and each
+ * validated — never any other sibling field, so a payload that happens to
+ * carry candidate data cannot ride along.
  */
 export function extractStages(results: unknown): ProbeStage[] {
   const out: ProbeStage[] = [];
@@ -146,7 +175,14 @@ export function extractStages(results: unknown): ProbeStage[] {
     const id = rec.id ?? rec.interviewStageId ?? rec.stageId;
     if (typeof id === 'string' && ID_RE.test(id) && !seen.has(id)) {
       seen.add(id);
-      out.push({ id, title: sanitizeTitle(rec.title ?? rec.name) });
+      const group = rec.interviewStageGroupId;
+      out.push({
+        id,
+        title: sanitizeTitle(rec.title ?? rec.name),
+        type: stageType(rec.type),
+        orderInInterviewPlan: planOrder(rec.orderInInterviewPlan),
+        interviewStageGroupId: typeof group === 'string' && ID_RE.test(group) ? group : null,
+      });
     }
   };
 
