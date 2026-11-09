@@ -675,6 +675,37 @@ describe('the place in the header', () => {
     expect(ratingsFit(392)).toBe('line');
   });
 
+  it('reads the name, the actions, then the summary, whichever way it sits, so a change of fit moves no focus', () => {
+    // The summary sits under the actions on its own line and on a phone, so it follows them in the reading
+    // order too: Tab never climbs back up to Export report. Only the rarer name row pulls it between them.
+    let item: HTMLButtonElement | null = null;
+    const fill = (place: HTMLElement | null) => {
+      if (!place || item) return;
+      item = document.createElement('button');
+      item.textContent = 'Communication, Good, 3 of 4';
+      place.append(item);
+    };
+    const inOrder = () => {
+      const who = document.querySelector('[data-header-who]')!;
+      const actions = document.querySelector('[data-header-actions]')!;
+      const place = document.querySelector('[data-header-ratings]')!;
+      expect(who.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING, 'the actions come before the name').toBeTruthy();
+      expect(actions.compareDocumentPosition(place) & Node.DOCUMENT_POSITION_FOLLOWING, 'the summary comes before the actions').toBeTruthy();
+    };
+
+    room({ row: 1137, who: 400, actions: 120 });
+    const { rerender } = render(header({ onRatingsSlot: fill }));
+    expect(fit()).toBe('row');
+    inOrder();
+    item!.focus();
+
+    room({ row: 1137, who: 800, actions: 120 });
+    rerender(header({ onRatingsSlot: fill }));
+    expect(fit()).toBe('line');
+    inOrder();
+    expect(document.activeElement, 'the change of fit took focus away').toBe(item);
+  });
+
   it('offers no place unless compact: the fuller header has HeaderScore', () => {
     const offered = vi.fn();
     render(header({ compact: false, onRatingsSlot: offered }));
