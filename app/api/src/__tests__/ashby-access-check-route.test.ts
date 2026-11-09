@@ -209,7 +209,9 @@ describe('GET /access-check — what the body may hold', () => {
 
   it('a body with missing permissions and empty samples also matches the schema', async () => {
     const reader = fakeReader();
-    reader.interviewStageList.mockRejectedValue(new AshbyError('http_client_error', { httpStatus: 403 }));
+    reader.interviewStageList.mockRejectedValue(
+      new AshbyError('http_client_error', { httpStatus: 403, endpointCodes: ['missing_endpoint_permission'] }),
+    );
     reader.applicationList.mockRejectedValue(new AshbyError('retry_exhausted', { code: 'timeout' }));
     const res = await request(appWith('admin', {
       accessCheckReader: reader as never,
@@ -219,6 +221,18 @@ describe('GET /access-check — what the body may hold', () => {
     expect(res.body.permissions.interviewsRead).toEqual({ state: 'missing_permission', error: null });
     expect(res.body.samples.imported).toEqual({ state: 'not_tried', error: null, found: false, history: null });
     expect(res.body.samples.hired).toEqual({ state: 'error', error: 'timeout', found: null, history: null });
+    expect(validateNamed(res.body, 'AshbyAccessCheckResponse', SPEC)).toEqual([]);
+  });
+
+  it('a rejected key (a bare 403 everywhere) reads as forbidden and matches the schema', async () => {
+    const reader = fakeReader();
+    const refused = new AshbyError('http_client_error', { httpStatus: 403 });
+    for (const fn of Object.values(reader)) fn.mockRejectedValue(refused);
+    const res = await request(appWith('admin', { accessCheckReader: reader as never, accessCheckSource: fakeSource() }))
+      .get('/mc/access-check');
+    expect(res.status).toBe(200);
+    expect(res.body.permissions.jobsRead).toEqual({ state: 'error', error: 'forbidden' });
+    expect(res.body.permissions.candidatesRead).toEqual({ state: 'error', error: 'forbidden' });
     expect(validateNamed(res.body, 'AshbyAccessCheckResponse', SPEC)).toEqual([]);
   });
 });

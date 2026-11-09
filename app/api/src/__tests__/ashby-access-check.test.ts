@@ -291,6 +291,43 @@ describe('a missing permission', () => {
     expect(r.operations.applicationListHistory.state).toBe('ok');
     expect(r.permissions.candidatesRead).toEqual({ state: 'missing_permission', error: null });
   });
+
+  it('HTTP 403 naming the code in the `errors` string list is also a missing permission', async () => {
+    const missing = () => json(403, { success: false, errors: ['missing_endpoint_permission'] });
+    const r = await runAccessCheck(tenant({ '/interviewStage.list': missing }).client, TARGETS);
+    expect(r.permissions.interviewsRead).toEqual({ state: 'missing_permission', error: null });
+  });
+});
+
+// ── A 403 WITHOUT missing_endpoint_permission: the key itself was refused ───
+//
+// Ashby: "When the provided key is wrong or deactivated, the API will respond
+// with a 403 status code"; a missing module is a 403 "and an error of
+// missing_endpoint_permission". Only the code tells them apart.
+
+describe('a 403 that does not name missing_endpoint_permission', () => {
+  const REJECTED_KEY = () => ({
+    status: 403, ok: false, headers: { get: () => null }, text: async () => 'Forbidden: this API key is deactivated',
+  });
+
+  it('a wrong or deactivated key (403 on every call) reads as forbidden, never as missing modules', async () => {
+    const routes = Object.fromEntries(Object.keys(TENANT).map((p) => [p, REJECTED_KEY])) as Routes;
+    const r = await runAccessCheck(tenant(routes).client, TARGETS);
+    expect(r.permissions.candidatesRead).toEqual({ state: 'error', error: 'forbidden' });
+    expect(r.permissions.jobsRead).toEqual({ state: 'error', error: 'forbidden' });
+    // No plan was read, so there is no plan to list.
+    expect(r.permissions.interviewsRead).toEqual({ state: 'not_tried', error: null });
+    for (const op of Object.values(r.operations)) expect(op.missingPermission).toBe(0);
+    expect(r.operations.jobInterviewPlanInfo).toMatchObject({ state: 'error', error: 'forbidden', calls: 2, failed: 2 });
+    expect(JSON.stringify(r)).not.toContain('deactivated');
+  });
+
+  it('a 403 with some other code is forbidden too', async () => {
+    const other = () => json(403, { success: false, errorInfo: { code: 'invalid_api_key', message: 'no' } });
+    const r = await runAccessCheck(tenant({ '/interviewStage.list': other }).client, TARGETS);
+    expect(r.permissions.interviewsRead).toEqual({ state: 'error', error: 'forbidden' });
+    expect(r.permissions.jobsRead).toEqual(OK);
+  });
 });
 
 // ── Other failures: a coarse code, never a guess ────────────────────────────
@@ -313,6 +350,7 @@ describe('a call that fails for another reason', () => {
     [503, 'server_error'],
     [429, 'rate_limited'],
     [401, 'unauthorized'],
+    [403, 'forbidden'],
     [404, 'not_found'],
     [400, 'client_error'],
   ] as const)('HTTP %i reports error: %s', async (status, code) => {
@@ -497,7 +535,12 @@ describe('classifyAccessError', () => {
     new AshbyError(category, init);
 
   it.each([
-    [err('http_client_error', { httpStatus: 403 }), { state: 'missing_permission', error: null }],
+    [err('http_client_error', { httpStatus: 403, endpointCodes: ['missing_endpoint_permission'] }), { state: 'missing_permission', error: null }],
+    // A bare 403 is a wrong or deactivated key as often as a missing module.
+    [err('http_client_error', { httpStatus: 403 }), { state: 'error', error: 'forbidden' }],
+    [err('http_client_error', { httpStatus: 403, endpointCodes: ['invalid_api_key'] }), { state: 'error', error: 'forbidden' }],
+    // The code means a missing module only on the two documented answers.
+    [err('http_client_error', { httpStatus: 404, endpointCodes: ['missing_endpoint_permission'] }), { state: 'error', error: 'not_found' }],
     [err('logical_failure', { httpStatus: 200, endpointCodes: ['missing_endpoint_permission'] }), { state: 'missing_permission', error: null }],
     [err('logical_failure', { httpStatus: 200, endpointCodes: ['MISSING_ENDPOINT_PERMISSION'] }), { state: 'missing_permission', error: null }],
     [err('http_client_error', { httpStatus: 401 }), { state: 'error', error: 'unauthorized' }],

@@ -355,9 +355,16 @@ export class AshbyClient {
           }
           break;
         }
-        // Permanent 4xx (401/403/404/405/410/…): never retried.
+        // Permanent 4xx (401/403/404/405/410/…): never retried. A JSON body's
+        // safe error codes are kept, through the same sanitizer a 200
+        // success:false uses, and every message is dropped. Ashby answers 403
+        // both for a wrong or deactivated key and for a missing module; only
+        // the second names `missing_endpoint_permission`, so the code is the one
+        // way to tell them apart.
         this.log(operation, attempt, 'failure', started, 'http_client_error', status);
-        throw new AshbyError('http_client_error', { operation, attempt, httpStatus: status, retriable: false });
+        throw new AshbyError('http_client_error', {
+          operation, attempt, httpStatus: status, retriable: false, endpointCodes: endpointCodesFromBody(raw),
+        });
       }
 
       // 2xx — parse and validate the envelope.
@@ -757,6 +764,22 @@ function extractEndpointCodes(envelope: AshbyEnvelope<unknown>): string[] {
     if (typeof code === 'string') raw.push(code);
   }
   return sanitizeCodes(raw);
+}
+
+/**
+ * The sanitized endpoint codes of a non-2xx body, or none. Ashby does not
+ * promise JSON on an error status (it may answer plain text), so anything that
+ * is not a JSON object yields an empty list and never an error of its own.
+ */
+function endpointCodesFromBody(raw: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+  return extractEndpointCodes(parsed as AshbyEnvelope<unknown>);
 }
 
 /** Construct a client from config (mirrors the factory style used elsewhere). */

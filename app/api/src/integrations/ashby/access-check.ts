@@ -31,11 +31,15 @@
  * history page per application, all under ONE deadline. A call the deadline
  * leaves no time for is not made.
  *
- * Ashby answers a missing permission in two documented ways — HTTP 403, and
- * HTTP 200 `{ success: false, errorInfo: { code: 'missing_endpoint_permission' } }`
- * (both pinned in ashby-recommendation-tag-contract.test.ts) — and both read
- * as `missing_permission` here. A 401 is a rejected key, not a missing module,
- * and reads as `error: unauthorized`.
+ * A call reads as `missing_permission` ONLY when Ashby names the error
+ * `missing_endpoint_permission`, on HTTP 403 or on HTTP 200 with
+ * `success: false` (both pinned in ashby-recommendation-tag-contract.test.ts).
+ * Ashby also answers HTTP 403 when the key is wrong or deactivated
+ * (developers.ashbyhq.com/docs/authentication), so a 403 that does not name
+ * that code reads as `error: forbidden`: the key itself may be refused, and
+ * ticking modules will not help. `forbidden` on every permission means the key
+ * should be replaced. A 401 means Ashby saw no key at all; HELLO never sends a
+ * request without one, so `unauthorized` should not occur in production.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -82,9 +86,12 @@ export type AccessState = (typeof ACCESS_STATES)[number];
  * Coarse, closed set. `deadline` only ever accompanies `not_tried` (the time
  * budget ran out before the call); `status_unconfirmed` only a sample (the
  * application Ashby returned did not carry the status that was asked for).
+ * `forbidden` is an HTTP 403 that did not name `missing_endpoint_permission`:
+ * most likely a wrong or deactivated key.
  */
 export const ACCESS_ERROR_CODES = [
   'unauthorized',
+  'forbidden',
   'not_found',
   'client_error',
   'rate_limited',
@@ -229,10 +236,13 @@ export type ClassifiedAccessError =
 /** Map a failed call to a permission verdict or one coarse code. Never a provider message. */
 export function classifyAccessError(err: unknown): ClassifiedAccessError {
   if (!isAshbyError(err)) return { state: 'error', error: 'unknown' };
-  if (err.httpStatus === 403) return { state: 'missing_permission', error: null };
-  if (err.endpointCodes.some((c) => c.toLowerCase() === 'missing_endpoint_permission')) {
+  const namesMissingPermission = err.endpointCodes.some((c) => c.toLowerCase() === 'missing_endpoint_permission');
+  // Only Ashby's two documented missing-permission answers count as one.
+  if (namesMissingPermission && (err.httpStatus === 403 || err.category === 'logical_failure')) {
     return { state: 'missing_permission', error: null };
   }
+  // A 403 without that code: a wrong or deactivated key, not a missing module.
+  if (err.httpStatus === 403) return { state: 'error', error: 'forbidden' };
   if (err.httpStatus === 401) return { state: 'error', error: 'unauthorized' };
   const byCategory = (category: string): AccessErrorCode => {
     switch (category) {

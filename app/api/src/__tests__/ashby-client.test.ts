@@ -216,6 +216,55 @@ describe('HTTP error classification', () => {
   });
 });
 
+// ── M031: a 4xx keeps Ashby's safe error codes, never its message ──────────
+//
+// Ashby answers HTTP 403 both for a wrong or deactivated key and for a key
+// that lacks an endpoint's module; only the second carries the error
+// `missing_endpoint_permission` (developers.ashbyhq.com/docs/authentication).
+// The codes are the one way to tell the two apart, so a 4xx keeps them through
+// the same sanitizer a 200 success:false uses. Every message is dropped.
+
+describe('M031 — a 4xx keeps only the safe endpoint codes of a JSON body', () => {
+  const SECRET = 'synthetic.person@example.invalid';
+
+  it('403 missing_endpoint_permission: the code survives, the message does not, and it is not retried', async () => {
+    const { client, count } = makeClient([res(403, JSON.stringify({
+      success: false,
+      errors: ['missing_endpoint_permission'],
+      errorInfo: { code: 'missing_endpoint_permission', message: `Key of ${SECRET} lacks candidatesRead` },
+    }))]);
+    const err = await client.applicationInfo('app_1').catch((e) => e) as AshbyError;
+    expect(err.category).toBe('http_client_error');
+    expect(err.httpStatus).toBe(403);
+    expect(err.retriable).toBe(false);
+    expect([...new Set(err.endpointCodes)]).toEqual(['missing_endpoint_permission']);
+    expect(count()).toBe(1);
+    const blob = `${err.message}\n${JSON.stringify(err)}\n${JSON.stringify(err, Object.getOwnPropertyNames(err))}`;
+    expect(blob).not.toContain(SECRET);
+  });
+
+  it.each([
+    ['a human-readable text body', 'Forbidden: this API key is deactivated'],
+    ['a JSON body with a message and no code', JSON.stringify({ success: false, errors: [{ message: `Invalid key for ${SECRET}` }] })],
+    ['an empty body', ''],
+    ['a JSON array', '["not", "an envelope"]'],
+    ['JSON null', 'null'],
+  ])('403 with %s carries no endpoint code', async (_label, body) => {
+    const { client } = makeClient([res(403, body)]);
+    const err = await client.applicationInfo('app_1').catch((e) => e) as AshbyError;
+    expect(err.category).toBe('http_client_error');
+    expect(err.httpStatus).toBe(403);
+    expect(err.endpointCodes).toEqual([]);
+    expect(JSON.stringify(err)).not.toContain(SECRET);
+  });
+
+  it('a code that is not identifier-shaped is dropped, as on a 200 success:false', async () => {
+    const { client } = makeClient([res(400, JSON.stringify({ success: false, errorInfo: { code: `bad ${SECRET}` } }))]);
+    const err = await client.applicationInfo('app_1').catch((e) => e) as AshbyError;
+    expect(err.endpointCodes).toEqual([]);
+  });
+});
+
 // ── Retry safety: reads vs mutations ───────────────────────────────────────
 
 describe('retry safety', () => {

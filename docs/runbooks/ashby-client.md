@@ -56,10 +56,16 @@ interview-stage helpers take an internal `deadlineAt` that is never sent.
 The admin access check (`GET …/mission-control/access-check`,
 `integrations/ashby/access-check.ts`) uses these reads, plus
 `application.info`, `application.listHistory` and `jobInterviewPlan.info`, to
-report whether the key holds Candidates read, Jobs read and Interviews read. It
-treats HTTP 403 and HTTP 200 with `errorInfo.code: missing_endpoint_permission`
-alike as a missing permission, and a 401 as a rejected key. It returns states,
-coarse codes, counts and stage types, never an id or a name.
+report whether the key holds Candidates read, Jobs read and Interviews read. A
+call reads as a missing permission only when Ashby names the error
+`missing_endpoint_permission`, on HTTP 403 or on HTTP 200 with `success: false`.
+Ashby also answers HTTP 403 when the key is wrong or deactivated
+(developers.ashbyhq.com/docs/authentication), so a 403 without that code reads
+as `error: forbidden`. `forbidden` on every permission means the key was
+rejected: replace the `ASHBY_API_KEY` secret rather than ask the Ashby admin to
+tick modules. A 401 means Ashby saw no key at all (`error: unauthorized`); HELLO
+never sends a request without one. It returns states, coarse codes, counts and
+stage types, never an id or a name.
 
 `candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
 and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy
@@ -118,6 +124,12 @@ const app = await client.applicationInfo(applicationId); // throws AshbyError on
 `http_server_error`, `malformed_response`, `timeout`, `network`, `output_limit`,
 `retry_exhausted`. Errors expose only `category`, `code`, `httpStatus`,
 `operation`, `attempt`, `retriable`, and bounded sanitized `endpointCodes`.
+`endpointCodes` come from a `success: false` body on HTTP 200 and, since M031,
+from a JSON body on a permanent 4xx too (a 403 for a missing module names
+`missing_endpoint_permission`; a 403 for a wrong key does not). Only
+identifier-shaped `code` / `errorCode` values and string `errors` entries
+survive; every message is dropped, and a body that is not a JSON object yields
+none.
 
 ## Verification
 
