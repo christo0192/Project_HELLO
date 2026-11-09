@@ -1012,13 +1012,45 @@ in "Making the lane re-check a candidate" above. Until a run stores the id again
 the phone lane's duplicate-application check cannot match that link by its Ashby
 candidate id (it still matches by phone number and email).
 
-### The tag and the Ashby 1-4 rating can look inconsistent
+### The tag and the Ashby 1-4 rating (M029)
 
-The scorecard's overall rating uses 25-point bands (below 25 is 1, 25-49 is 2, 50-74
-is 3, 75 and above is 4). The verdict uses 65 and 45. So the same rating can sit
-beside different tags: a 3 covers both Borderline (50-64) and Select (65-74), and a 2
-covers both Reject (25-44) and Borderline (45-49). That is existing behaviour the
-tags make visible, not a fault.
+Cut-over: **YYYY-MM-DD (the API deploy date, filled in at deploy)**.
+
+From the cut-over, the scorecard's Overall Recommendation follows the verdict, so it
+always agrees with the tag. The verdict decides first; the score only splits
+Borderline, at 50 (owner decision 2026-11-09):
+
+| Christy tag (verdict) | Score | Overall Recommendation |
+| --- | --- | --- |
+| Reject | any | 1 |
+| Borderline | below 50 (normally 45-49) | 2 |
+| Borderline | 50 and above (normally 50-64) | 3 |
+| Select | any | 4 |
+
+Cards written before the cut-over used 25-point score bands (below 25 is 1, 25-49
+is 2, 50-74 is 3, 75 and above is 4) and keep that number: HELLO cannot change or
+delete Ashby feedback. On an older card a 3 can be a Borderline (50-64) or a Select
+(65-74), and a 2 a Reject (25-44) or a Borderline (45-49), so read a card's number
+against its date. A card that was still queued, or failed and was retried, at the
+cut-over gets the new number, because the worker rebuilds the card when it runs.
+
+When no card is written:
+
+- **No verdict or no score.** HELLO sends no card rather than make one up. For a
+  legacy v1 row this is `scorecard_invalid_recommendation` or
+  `scorecard_invalid_overall`. At queueing the refusal leaves no operation and no
+  log line (the completion observer ignores the enqueue result); in the worker it
+  is a permanent failure in Mission Control. A v2 result with no verdict was
+  already never written.
+- **`overall_options_mismatch`** (v2 writes). The live form's Overall
+  Recommendation does not offer exactly the option values 1-4. Open the mapping's
+  scorecard binding preview in Mission Control: `preview.overallOptions` lists the
+  field's option values and labels as Ashby serves them. Fix the form in Ashby,
+  then Retry the operation. The check reads values only; whether 4 is the top
+  answer is read from the labels by a person.
+
+After a rescore the tag moves to the new verdict, but Ashby keeps the first card's
+number (one card per application link).
 
 ### Backfill (only after owner testing and go-ahead)
 
