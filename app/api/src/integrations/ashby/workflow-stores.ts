@@ -55,7 +55,11 @@ const SCORECARD_ASSESSMENT_COLUMNS =
  * rationales; red flags from the integrity pass). A blocked v2 row returns
  * `null`, exactly as a missing assessment does — no overall is ever invented
  * for an evidence-incomplete scorecard.
- * v1 (anything else) → the legacy column reader, byte-for-byte as before.
+ * v1 (anything else) → the legacy column reader. Its verdict and overall
+ * score are passed through RAW (M029, D6): a missing verdict is no longer read
+ * as `hold`, nor a missing score as 0, so `buildScorecard` refuses the row
+ * (`invalid_recommendation` / `invalid_overall`) instead of writing a made-up
+ * Overall Recommendation.
  */
 function scorecardSourceFromAssessmentRow(
   a: Record<string, unknown>,
@@ -71,12 +75,19 @@ function scorecardSourceFromAssessmentRow(
   }
   const obj = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const num = (value: unknown): number => typeof value === 'number' ? value : Number(value) || 0;
+  // The stored overall, or null when there is none. Never 0: a missing score
+  // must reach buildScorecard as missing, so it refuses instead of sending "1".
+  const storedOverall = (value: unknown): number | null => {
+    const n = typeof value === 'number' ? value : typeof value === 'string' && value.trim().length > 0 ? Number(value) : NaN;
+    return Number.isFinite(n) ? n : null;
+  };
   const english = obj(a.english), tone = obj(a.tone), communication = obj(a.communication), motivation = obj(a.motivation), roleFit = obj(a.role_fit), provenance = obj(a.provenance);
   return {
     schemaVersion: 1,
     externalApplicationId,
-    overallScore: num(a.overall_score),
-    recommendation: a.recommendation === 'advance' || a.recommendation === 'reject' ? a.recommendation : 'hold',
+    overallScore: storedOverall(a.overall_score),
+    // The raw stored verdict; buildScorecard is the one place that decides it.
+    recommendation: typeof a.recommendation === 'string' ? a.recommendation : null,
     dimensions: [
       { key: 'english', score: (num(english.grammar) + num(english.vocabulary) + num(english.fluency) + num(english.coherence)) / 4 },
       { key: 'tone', score: (num(tone.clarity) + num(tone.confidence) + num(tone.professionalism)) / 3 },
@@ -442,9 +453,9 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
     /**
      * The candidate's authoritative verdict, decided by the 0134 RPC across every
      * link of the candidate. The verdict is the RAW column and nothing else:
-     * `scorecardSourceFromAssessmentRow` and `buildScorecard` both turn a missing
-     * verdict into `hold`, which would tag a candidate Borderline for a result
-     * that has no verdict at all. Any read failure, or an answer that is neither
+     * a missing verdict must never tag a candidate Borderline for a result that
+     * has no verdict at all (the scorecard path refuses one too since M029,
+     * rather than reading it as `hold`). Any read failure, or an answer that is neither
      * `ok` nor `no_assessment`, is null: the lane waits and reads again.
      */
     async readRecommendationTagSource(

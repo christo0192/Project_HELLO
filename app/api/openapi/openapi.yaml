@@ -4637,7 +4637,7 @@ paths:
       tags: [ashby]
       operationId: previewAshbyScorecardBinding
       summary: Read-only preview of the v2 scorecard binding for a mapping's role
-      description: Admin-only. Reads the verified feedback form's definition (feedbackFormDefinition.info) plus the mapping's role, its feedback form id and the role's active scorecard metrics, and reports which metrics would bind to a Score field by title, which would not and why, and whether the four fixed fields are still present with their verified types. `mappingFormBound` says whether the MAPPING itself names the verified form — the scorecard writer writes nothing for a mapping that does not, whatever the preview of the form says. Structure and metric names only — no feedback content, no candidate data. Nothing is written, bound, or submitted. 404 when the mapping is unknown, 503 when the integration is disabled, 502 when the provider read fails.
+      description: Admin-only. Reads the verified feedback form's definition (feedbackFormDefinition.info) plus the mapping's role, its feedback form id and the role's active scorecard metrics, and reports which metrics would bind to a Score field by title, which would not and why, and whether the four fixed fields are still present with their verified types. `preview.overallOptions` lists the Overall Recommendation field's option values and labels. `mappingFormBound` says whether the MAPPING itself names the verified form — the scorecard writer writes nothing for a mapping that does not, whatever the preview of the form says. Structure and metric names only — no feedback content, no candidate data. Nothing is written, bound, or submitted. 404 when the mapping is unknown, 503 when the integration is disabled, 502 when the provider read fails.
       security:
         - bearerAuth: []
       parameters:
@@ -9180,7 +9180,7 @@ components:
 
     AshbyScorecardBindingPreview:
       type: object
-      required: [formDefinitionId, formTitle, schemaAvailable, archived, formMatchesBinding, fixedFields, metrics, unusedScoreFields, ready]
+      required: [formDefinitionId, formTitle, schemaAvailable, archived, formMatchesBinding, fixedFields, overallOptions, metrics, unusedScoreFields, ready]
       properties:
         formDefinitionId:
           type: string
@@ -9199,6 +9199,20 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AshbyScorecardFixedFieldCheck'
+        overallOptions:
+          type: array
+          description: The live Overall Recommendation field's options, value and label only, in form order, so an admin can confirm what the option values "1"-"4" say before HELLO writes the verdict as one of them. Empty when the field is missing or the definition carried no schema. Read-only; nothing is persisted.
+          items:
+            type: object
+            required: [value, label]
+            properties:
+              value:
+                type: string
+                nullable: true
+              label:
+                type: string
+                nullable: true
+            additionalProperties: false
         metrics:
           type: array
           items:

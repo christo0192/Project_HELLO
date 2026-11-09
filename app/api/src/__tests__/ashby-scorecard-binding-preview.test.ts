@@ -17,6 +17,10 @@ import type { MissionControlStore } from '../integrations/ashby/workflow-stores.
 import { previewScorecardBinding } from '../integrations/ashby/scorecard-autobind.js';
 import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
 import type { ProbeFeedbackForm, ProbeFormField } from '../integrations/ashby/probe.js';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseYamlDocument, validateNamed } from './support/openapi-schema.js';
 
 const FORM_ID = HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId!;
 const PATHS = HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!;
@@ -235,6 +239,9 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
     expect(res.status).toBe(200);
     expect(res.body.preview.overallOptions).toEqual(labelled);
     expect(JSON.stringify(res.body)).not.toMatch(/ANSWER-MUST-NOT-SURFACE|submittedValue/);
+    // The documented response shape (additionalProperties: false) carries it.
+    const spec = parseYamlDocument(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../openapi/openapi.yaml'), 'utf8'));
+    expect(validateNamed(res.body, 'AshbyScorecardBindingPreviewResponse', spec)).toEqual([]);
     // The default definition offers plain "1".."4".
     const plain = await request(appWith('admin', previewDeps())).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
     expect(plain.body.preview.overallOptions).toEqual([1, 2, 3, 4].map((n) => ({ value: String(n), label: `${n}` })));

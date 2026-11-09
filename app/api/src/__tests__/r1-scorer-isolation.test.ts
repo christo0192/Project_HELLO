@@ -39,7 +39,8 @@ describe('phone scorer byte-identity fence (PR-5)', () => {
   const PINS: Record<string, string> = {
     'lib/scorecards/prompt.ts': '93df1c703a2469deabf47fcb3943cfd9abd1c0bc3b5a394d2adaea5516880c6d',
     'lib/scorecards/scorer.ts': '173d62ed3d4fcb5c07c43766d6cc906005a6309e30090bada93b8f70ff10f887',
-    'lib/scorecards/domain.ts': 'da506d335f9050d403d942ca7190a7f60b447e3a211e5aa33d51bdd902cefe94',
+    // M029: the 65/45 verdict cut-offs named as exported constants; no behaviour change.
+    'lib/scorecards/domain.ts': 'c76bf48f4a937e20face72cc626a61b448caddd0a0fd2bc3cf0a8717d82ffdef',
     'lib/scorecards/evidence.ts': 'f60697bcb4921363404aa824b17ceb5ea630cf7a9c719afb1c65cabe5b7873f8',
     'lib/scorecards/integrity.ts': '4c2460cd8e90f7b1a0dfc5898fd256defd7da3b2e0bb8ed884218ebf27d9a6c3',
     'lib/prompts.ts': '639765ed9b4a1ae8cfbfc40541ae916609b4cd6b8e2016c070f43d5f35475a2c',
