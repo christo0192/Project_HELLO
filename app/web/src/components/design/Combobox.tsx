@@ -43,6 +43,14 @@
  *
  * `value` is an opaque string the caller owns. The picker never renders it,
  * so a caller that must keep an id out of the DOM can pass a position.
+ *
+ * `busy` IS NOT `loading`. `loading` disables the trigger, which is right
+ * before there is anything to pick. A picker that SAVES the choice just made
+ * in it must not: a focused button that turns disabled drops keyboard focus to
+ * the page body, and a screen-reader user hears the document instead of the
+ * control they just used (WCAG 2.4.3). So `busy` shows the same spinner and
+ * opens and picks nothing, but keeps the trigger focusable, as
+ * `aria-disabled` + `aria-busy`, and focus stays where it was.
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
@@ -88,8 +96,13 @@ export interface ComboboxProps {
   /** Noun for the result count, singular/plural, e.g. ['job', 'jobs']. */
   noun?: [string, string];
   disabled?: boolean;
-  /** Shows a spinner in the trigger and keeps it closed. */
+  /** Shows a spinner in the trigger and keeps it closed. Disables it. */
   loading?: boolean;
+  /**
+   * Saving the choice just made: a spinner, closed, no choice taken, but the
+   * trigger keeps focus (`aria-disabled`, not `disabled`). See the header.
+   */
+  busy?: boolean;
   /** Decorative glyph in the trigger's leading tile. */
   icon?: ReactNode;
   /** Trigger height: `sm` 28, `md` 36 (the control height), `lg` 40 for a dialog form. */
@@ -132,6 +145,7 @@ export function Combobox({
   noun = ['option', 'options'],
   disabled = false,
   loading = false,
+  busy = false,
   icon,
   size = 'lg',
   searchable = true,
@@ -168,6 +182,8 @@ export function Combobox({
   );
 
   const selected = options.find((o) => o.value === value) ?? null;
+  // Every reason the list must stay shut. Only `disabled` and `loading` disable the button.
+  const inert = disabled || loading || busy;
 
   const filtered = useMemo(() => {
     const q = fold(query.trim());
@@ -188,9 +204,9 @@ export function Combobox({
   }, []);
 
   const openList = useCallback(() => {
-    if (disabled || loading) return;
+    if (inert) return;
     setOpen(true);
-  }, [disabled, loading]);
+  }, [inert]);
 
   // On open: focus the search field and start on the chosen option, or the
   // first one that can be chosen.
@@ -274,8 +290,8 @@ export function Combobox({
 
   // The list cannot outlive the control being switched off under it.
   useEffect(() => {
-    if ((disabled || loading) && open) close(false);
-  }, [disabled, loading, open, close]);
+    if (inert && open) close(false);
+  }, [inert, open, close]);
 
   function pick(index: number) {
     const option = filtered[index];
@@ -394,7 +410,9 @@ export function Combobox({
         aria-label={ariaLabel ? `${ariaLabel} ${selected?.label ?? placeholder}` : undefined}
         aria-labelledby={labelId && !ariaLabel ? `${labelId} ${valueId}` : undefined}
         aria-describedby={describedBy}
-        aria-busy={loading || undefined}
+        aria-busy={loading || busy || undefined}
+        // Busy stays focusable: announced as unavailable, never `disabled`.
+        aria-disabled={(busy && !disabled && !loading) || undefined}
         onClick={() => (open ? close(true) : openList())}
         // Safari and Firefox-on-Mac do not focus a button on click, so the
         // press would blur the search field and close the list, and the click
@@ -414,6 +432,7 @@ export function Combobox({
           // same as every button — so it is never mistaken for "open".
           'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
           'disabled:cursor-not-allowed disabled:bg-surface-secondary disabled:text-ink-tertiary',
+          busy && 'cursor-progress',
           // A real border, so it survives forced colours. Open, it turns ink to
           // match the panel it now heads.
           !open
@@ -450,7 +469,7 @@ export function Combobox({
             <span className="truncate text-sm text-ink-tertiary">{placeholder}</span>
           )}
         </span>
-        {loading ? (
+        {loading || busy ? (
           <ButtonSpinner className="h-4 w-4 shrink-0 text-ink-tertiary" />
         ) : (
           <ChevronIcon

@@ -211,6 +211,40 @@ export function extractStages(results: unknown): ProbeStage[] {
   return out;
 }
 
+function asPlainRecord(raw: unknown): Record<string, unknown> | null {
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+}
+
+function planIdOf(raw: unknown): string | null {
+  return typeof raw === 'string' && ID_RE.test(raw) ? raw : null;
+}
+
+/**
+ * The interview plan id an opaque `jobInterviewPlan.info` payload names, or
+ * null. Read from the top level, then a nested plan object, then the first
+ * stage that names its plan (every documented stage carries `interviewPlanId`).
+ * Shared by the M031 access check and the stage catalogue.
+ */
+export function extractInterviewPlanId(results: unknown): string | null {
+  const root = asPlainRecord(results);
+  if (!root) return null;
+  const direct = planIdOf(root.interviewPlanId);
+  if (direct) return direct;
+  const nested = asPlainRecord(root.jobInterviewPlan) ?? asPlainRecord(root.interviewPlan);
+  if (nested) {
+    const id = planIdOf(nested.interviewPlanId) ?? planIdOf(nested.id);
+    if (id) return id;
+  }
+  for (const list of [root.stages, root.interviewStages]) {
+    if (!Array.isArray(list)) continue;
+    for (const stage of list) {
+      const id = planIdOf(asPlainRecord(stage)?.interviewPlanId);
+      if (id) return id;
+    }
+  }
+  return null;
+}
+
 /**
  * Probe one job's interview plan. Performs exactly one allowlisted READ and
  * returns sanitized stage descriptors. Never writes anything, anywhere.

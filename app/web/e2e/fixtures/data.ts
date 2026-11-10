@@ -65,6 +65,7 @@ import type {
   SessionDetail,
   TranscriptLine,
 } from '../../src/types';
+import type { AshbyStageCatalogStage } from '../../src/lib/ashby-stages';
 import type { R1QueueRound, R1RecordingPlayback, R1ReviewResponse, R1ReviewTurn, R1Round } from '../../src/lib/r1-types';
 import { FROZEN_NOW_MS } from './env';
 
@@ -1396,6 +1397,44 @@ const FEEDBACK_FORM: AshbyFeedbackForm = {
   ],
 };
 
+/**
+ * The Ashby stage catalogue (M031): the 18 stages every mapped job's plan
+ * holds, in plan order, as GET .../stage-catalog answers them after a first
+ * refresh. Titles are Ashby's own stage names, not candidate data; the ids are
+ * synthetic. The default milestones are the API's rules: the Christy stage,
+ * R1 to R5, Reference Check, Offer, Archived and Hired.
+ */
+const STAGE_SEEDS: Array<[string, string, AshbyStageCatalogStage['milestone']]> = [
+  ['New Lead', 'Lead', null],
+  ['Reached Out', 'Lead', null],
+  ['Replied', 'Lead', null],
+  ['Application Review', 'PreInterviewScreen', null],
+  ['Hello Christy', 'PreInterviewScreen', 'christy'],
+  ['TA Screen', 'PreInterviewScreen', null],
+  ['HM Review', 'Active', null],
+  ['R0 - Online Assessment', 'Active', null],
+  ['R1', 'Active', 'r1'],
+  ['R2', 'Active', 'r2'],
+  ['R3', 'Active', 'r3'],
+  ['R4', 'Active', 'r4'],
+  ['R5', 'Active', 'r5'],
+  ['Reference Check', 'Active', 'reference'],
+  ['Document Submission', 'Active', null],
+  ['Offer', 'Offer', 'offer'],
+  ['Archived', 'Archived', 'archived'],
+  ['Hired', 'Hired', 'hired'],
+];
+export const STAGES: AshbyStageCatalogStage[] = STAGE_SEEDS.map(([title, type, milestone], order) => ({
+  // An Ashby stage id is opaque tenant text, not a UUID: obviously synthetic here.
+  id: `e2e-stage-${String(order + 1).padStart(2, '0')}`,
+  title,
+  type,
+  order,
+  milestone,
+  milestoneSource: milestone ? 'default' : null,
+  inPlan: true,
+}));
+
 const BINDING_PREVIEW: AshbyScorecardBindingPreviewResponse = {
   ok: true,
   scoringPath: 'v2_autobind',
@@ -1770,6 +1809,9 @@ export interface Dataset {
     mappedJobIds?: string[];
     feedbackForm: AshbyFeedbackForm;
     bindingPreview: AshbyScorecardBindingPreviewResponse;
+    /** The stage catalogue (M031). `stagesRead: false` is a catalogue no refresh has filled yet. */
+    stages: AshbyStageCatalogStage[];
+    stagesRead: boolean;
   };
   /**
    * R1-REC. `rounds` are the R1 candidate's, and `otherRounds` any other's by id. `mints` queues the
@@ -1811,7 +1853,7 @@ export function createDataset(): Dataset {
     audit: AUDIT,
     quotas: QUOTAS,
     appointments: APPOINTMENTS,
-    ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW },
+    ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW, stages: STAGES, stagesRead: true },
     r1: { rounds: R1_ROUNDS, otherRounds: {}, queue: R1_QUEUE, deployed: true, mints: {}, review: R1_REVIEW },
   });
   return {

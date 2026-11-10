@@ -38,6 +38,7 @@ import type {
   ScorecardMetricTemplate,
 } from '../../src/types';
 import type { R1RecordingPlayback, R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
+import type { AshbyStageMilestone } from '../../src/lib/ashby-stages';
 import { ADMIN_USER_ID, PHONE_WINDOW, R1_CANDIDATE_ID, R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
 import { FROZEN_NOW_MS } from './env';
 
@@ -223,6 +224,12 @@ function redistribute(metrics: RoleScorecardMetric[], editedId: string, newWeigh
 }
 
 const ASHBY = '/api/integrations/ashby/mission-control';
+
+/** The default each fixture stage returns to when its label is cleared (the API's rules). */
+const STAGE_DEFAULTS: Readonly<Record<string, AshbyStageMilestone>> = {
+  'Hello Christy': 'christy', R1: 'r1', R2: 'r2', R3: 'r3', R4: 'r4', R5: 'r5',
+  'Reference Check': 'reference', Offer: 'offer', Archived: 'archived', Hired: 'hired',
+};
 
 /**
  * A session as a route that reads `call_sessions` sends it. The word count and the recorded and
@@ -528,6 +535,53 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', `${ASHBY}/jobs`, (_r, db) => ok({ ok: true, jobs: db.ashby.jobs, truncated: false, withheld: db.ashby.withheld })],
   ['GET', `${ASHBY}/jobs/:jobId/feedback-form`, (_r, db) => ok({ ok: true, forms: [db.ashby.feedbackForm], empty: false, truncated: false })],
   ['POST', `${ASHBY}/operations/:id/retry`, () => ok({ ok: true, status: 'pending' })],
+  // The stage catalogue (M031). The API's rules, kept small: a refresh fills an
+  // unread catalogue and never overwrites a label; "Not labelled" (null) puts a
+  // stage back on its default.
+  ['GET', `${ASHBY}/stage-catalog`, (_r, db) => ok({
+    ok: true,
+    stages: db.ashby.stagesRead ? db.ashby.stages : [],
+    enabledMappings: db.ashby.mappings.filter((m) => m.status === 'enabled').length,
+    unreadMappings: db.ashby.stagesRead ? 0 : db.ashby.mappings.filter((m) => m.status === 'enabled').length,
+    truncated: false,
+  })],
+  ['POST', `${ASHBY}/stage-catalog/refresh`, (_r, db) => {
+    const enabled = db.ashby.mappings.filter((m) => m.status === 'enabled').length;
+    const first = !db.ashby.stagesRead;
+    db.ashby.stagesRead = true;
+    const seen = enabled > 0 ? db.ashby.stages.length : 0;
+    return ok({
+      ok: true,
+      refresh: {
+        mappings: { enabled, truncated: false },
+        jobs: { attempted: enabled, read: enabled, failed: 0, notTried: 0 },
+        failures: [],
+        stages: {
+          seen,
+          inserted: first ? seen : 0,
+          updated: first ? 0 : seen,
+          defaulted: first ? db.ashby.stages.filter((s) => s.milestoneSource === 'default').length : 0,
+          redefaulted: 0,
+          leftPlan: 0,
+        },
+        deadlineHit: false,
+      },
+    });
+  }],
+  ['PATCH', `${ASHBY}/stage-catalog/:stageId`, ({ params, body }, db) => {
+    const stage = db.ashby.stages.find((s) => s.id === params.stageId);
+    if (!stage) return { status: 404, json: { ok: false, error: 'not_found' } };
+    const milestone = body?.milestone;
+    if (milestone === null) {
+      const fallback = STAGE_DEFAULTS[stage.title ?? ''] ?? null;
+      stage.milestone = fallback;
+      stage.milestoneSource = fallback ? 'default' : null;
+    } else {
+      stage.milestone = milestone as typeof stage.milestone;
+      stage.milestoneSource = 'admin';
+    }
+    return ok({ ok: true, stage });
+  }],
 
   // ── Ashby candidate-scoped review (opaque application link) ────────
   ['GET', '/api/integrations/ashby/review/:linkId', ({ params }, db) => {

@@ -144,7 +144,8 @@ describe('0130 registration and frame', () => {
     // 0134_ashby_recommendation_tags.sql (Christy verdict tags) redefines only Ashby outbox RPCs
     // (enqueue/claim_ashby_operation plus two new ones) — no phone body — so it is exempt by exact name too.
     // 0137_recruiter_notes_moment.sql (R1 notes at a moment) only adds columns to recruiter_notes — no phone body — so it is exempt by exact name too.
-    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$/.test(f));
+    // 0138_ashby_pipeline_progress.sql (M031 Ashby stage catalogue and progress) only creates five new Ashby tables and one catalogue function — no phone body — so it is exempt by exact name too.
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$|^0138_ashby_pipeline_progress\.sql$/.test(f));
     expect(nonR1[nonR1.length - 1]).toBe(base);
   });
 

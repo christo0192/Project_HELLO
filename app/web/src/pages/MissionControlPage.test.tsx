@@ -246,6 +246,35 @@ describe('MissionControlPage', () => {
     });
   });
 
+  it('adds a Stages tab after Funnel that reads the stage catalogue only once it is opened', async () => {
+    apiFns.listAshbyStageCatalog.mockResolvedValue({
+      ok: true,
+      stages: [{ id: 'stage-1', title: 'R1', type: 'Active', order: 8, milestone: 'r1', milestoneSource: 'default' }],
+      enabledMappings: 1,
+      unreadMappings: 0,
+      truncated: false,
+    });
+    renderPage();
+    const tablist = await screen.findByRole('tablist', { name: 'Mission Control sections' });
+    const labels = [...tablist.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
+    expect(labels.indexOf('Stages')).toBe(labels.indexOf('Funnel') + 1);
+    expect(apiFns.listAshbyStageCatalog).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Stages' }));
+    expect(await screen.findByRole('table', { name: /Ashby stages in plan order/ })).toBeInTheDocument();
+    await waitFor(() => expect(apiFns.listAshbyStageCatalog).toHaveBeenCalledTimes(1));
+    expect(apiFns.refreshAshbyStageCatalog).not.toHaveBeenCalled();
+  });
+
+  it('never reads the stage catalogue for a non-admin', async () => {
+    apiFns.getMe.mockResolvedValue(VIEWER_ME);
+    renderPage();
+    expect(await screen.findByText('Admin access required')).toBeInTheDocument();
+    expect(apiFns.listAshbyStageCatalog).not.toHaveBeenCalled();
+    expect(apiFns.refreshAshbyStageCatalog).not.toHaveBeenCalled();
+    expect(apiFns.labelAshbyStage).not.toHaveBeenCalled();
+  });
+
   it('has no axe violations', async () => {
     const { container } = renderPage();
     await screen.findByRole('tablist', { name: 'Mission Control sections' });

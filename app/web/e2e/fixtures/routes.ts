@@ -102,6 +102,7 @@ export const ROUTES: RouteCase[] = [
   { name: 'mission-control-sessions', path: '/mission-control#sessions', heading: 'Mission Control', landmark: 'Override session status' },
   { name: 'mission-control-quotas', path: '/mission-control#quotas', heading: 'Mission Control', landmark: 'Quota policies' },
   { name: 'mission-control-funnel', path: '/mission-control#funnel', heading: 'Mission Control', landmark: 'Failures by stage' },
+  { name: 'mission-control-stages', path: '/mission-control#stages', heading: 'Mission Control', landmark: 'R0 - Online Assessment' },
   { name: 'mission-control-r1', path: '/mission-control#r1', heading: 'Mission Control', landmark: 'R1 allowance used' },
   { name: 'mission-control-audit', path: '/mission-control#audit', heading: 'Mission Control', landmark: 'Audit log' },
   { name: 'mission-control-maintenance', path: '/mission-control#maintenance', heading: 'Mission Control', landmark: 'Change maintenance mode' },

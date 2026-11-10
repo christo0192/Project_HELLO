@@ -41,6 +41,10 @@ const hoisted = vi.hoisted(() => {
     // The R1 section (usage tiles and allocation).
     getR1Usage: vi.fn(),
     getR1Settings: vi.fn(),
+    // The Stages section (M031 Ashby stage catalogue).
+    listAshbyStageCatalog: vi.fn(),
+    refreshAshbyStageCatalog: vi.fn(),
+    labelAshbyStage: vi.fn(),
   };
 
   const api = {
@@ -62,6 +66,9 @@ const hoisted = vi.hoisted(() => {
     clearPhoneHalt: fns.clearPhoneHalt,
     getR1Usage: fns.getR1Usage,
     getR1Settings: fns.getR1Settings,
+    listAshbyStageCatalog: fns.listAshbyStageCatalog,
+    refreshAshbyStageCatalog: fns.refreshAshbyStageCatalog,
+    labelAshbyStage: fns.labelAshbyStage,
   };
 
   return { api, fns, ApiError };

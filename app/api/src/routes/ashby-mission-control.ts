@@ -37,15 +37,24 @@
  *   GET  /jobs/:externalJobId/feedback-form  — admin: read-only feedback-form
  *                                    SCHEMA discovery (ids/labels/types/scales;
  *                                    never feedback content)
+ *   GET  /stage-catalog            — admin: the enabled mappings' plan stages
+ *                                    with the milestone each counts as (M031)
+ *   POST /stage-catalog/refresh    — admin: re-read each enabled job's plan
+ *                                    from Ashby and upsert it; never deletes,
+ *                                    never overwrites an admin label, and
+ *                                    recomputes every default label
+ *   PATCH /stage-catalog/:stageId  — admin: label one stage, or clear it back
+ *                                    to its default
  *
- * Every mutation is race-safe + audited inside its RPC (0031). Candidate results
- * are never exposed here.
+ * Every mutation is race-safe + audited inside its RPC (0031), the M031
+ * stage-catalogue writes included. Candidate results are never exposed here.
  */
 
 import { Router, type Request, type Response } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import { createLogger } from '../lib/logger.js';
 import { legacyBrowserScreeningGuard } from '../lib/legacy-browser-screening.js';
 import { createMissionControlStore, type MissionControlStore } from '../integrations/ashby/workflow-stores.js';
 import {
@@ -71,6 +80,16 @@ import {
   type AccessCheckResult,
   type AccessCheckSource,
 } from '../integrations/ashby/access-check.js';
+import {
+  createStageCatalogStore,
+  defaultMilestone,
+  isStageMilestone,
+  runStageCatalogRefresh,
+  type StageCatalogReader,
+  type StageCatalogRefreshResult,
+  type StageCatalogStore,
+  type StoredStage,
+} from '../integrations/ashby/stage-catalog.js';
 import { HELLO_CHRISTY_SCREENING_STAGE_ID } from '../integrations/ashby/screening-stage.js';
 import { createAshbyProbeClient } from '../integrations/ashby/runtime.js';
 import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
@@ -99,6 +118,22 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const TERMINAL_STATES = new Set(['withdrawn', 'deleted', 'manual_stage_cancel']);
 const MAX_LIMIT = 200;
 const DEFAULT_LIMIT = 50;
+
+const stageCatalogLogger = createLogger('ashby-stage-catalog');
+
+/**
+ * The request-level trail of a stage-catalogue write the database has already
+ * audited in the write's own transaction. A sink failure here cannot undo
+ * that write, so it must not turn the answer into a failure the admin would
+ * read as "not saved": it is logged, and the answer stands.
+ */
+async function recordStageCatalogTrail(req: Request, metadata: Record<string, unknown>): Promise<void> {
+  try {
+    await recordAudit(req, 'resource.update', 200, { metadata });
+  } catch {
+    stageCatalogLogger.error('error_unhandled', { error_type: 'audit_sink_failure' });
+  }
+}
 
 function boundedLimit(raw: unknown): number {
   const n = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : DEFAULT_LIMIT;
@@ -141,6 +176,24 @@ const MAX_LABEL_LEN = 120;
 /** How long one successful job-directory walk serves every admin. */
 const JOB_DIRECTORY_TTL_MS = 60_000;
 
+/**
+ * One stage-catalogue row as the API sends it: the Ashby stage id (used only
+ * to address a PATCH), its title, Ashby type, zero-indexed plan order, the
+ * milestone, whether an admin or a default set it, and whether the stage is
+ * still in its Ashby plan (false: Ashby removed it; kept for history).
+ */
+function stageRow(s: StoredStage) {
+  return {
+    id: s.stageId,
+    title: s.title,
+    type: s.stageType,
+    order: s.orderInPlan,
+    milestone: s.milestone,
+    milestoneSource: s.milestoneSource,
+    inPlan: s.inPlan,
+  };
+}
+
 /** Validate an optional opaque tenant id. `null` when absent, `false` when bad. */
 function optionalOpaqueId(raw: unknown): string | null | false {
   if (raw === undefined || raw === null || raw === '') return null;
@@ -181,6 +234,17 @@ export interface AshbyMissionControlDeps {
    * Production reads them with the service role.
    */
   accessCheckSource?: AccessCheckSource;
+  /**
+   * Injected Ashby reader for the M031 stage-catalogue refresh. Production
+   * uses the same gated probe client; an explicit `null` means "disabled"
+   * (tests), and so does `probeReader: null`.
+   */
+  stageCatalogReader?: StageCatalogReader | null;
+  /**
+   * Injected stage-catalogue store (tests). Production reads the enabled
+   * mappings and the catalogue, and writes the catalogue, with the service role.
+   */
+  stageCatalog?: StageCatalogStore;
   /**
    * Injected mapping/metric lookups for the binding preview (tests).
    * Production reads the mapping's role and feedback form in one row read,
@@ -286,6 +350,19 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     if (!accessSourceCached) accessSourceCached = createAshbyAccessCheckSource(supabase as never);
     return accessSourceCached;
   };
+  // The M031 stage-catalogue refresh reads through that same gated client,
+  // closed by the same `probeReader: null` seam. Its GET and PATCH read and
+  // write HELLO's own table only, so they need no client.
+  const resolveStageCatalogReader = (): StageCatalogReader | null => {
+    if (deps.stageCatalogReader !== undefined) return deps.stageCatalogReader;
+    if (deps.probeReader === null) return null;
+    return resolveProbeClient();
+  };
+  let stageCatalogCached: StageCatalogStore | undefined = deps.stageCatalog;
+  const stageCatalog = (): StageCatalogStore => {
+    if (!stageCatalogCached) stageCatalogCached = createStageCatalogStore(supabase as never);
+    return stageCatalogCached;
+  };
   const scorecardPreview = deps.scorecardPreview ?? {
     async readMapping(mappingId: string): Promise<{ roleId: string | null; feedbackFormId: string | null } | undefined> {
       const { data, error } = await supabase
@@ -368,6 +445,34 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     })();
     accessInFlight = flight;
     const release = (): void => { if (accessInFlight === flight) accessInFlight = null; };
+    flight.then(release, release);
+    return flight;
+  };
+
+  // ── Stage-catalogue refresh: one run shared by concurrent requests (M031) ─
+  // A refresh makes at most MAX_REFRESH_JOBS (5) Ashby reads and one catalogue
+  // write. A double click or two admins share the run in flight; the next
+  // request after it settles refreshes again. The write is audited, in its own
+  // transaction, under the admin whose request started the run; the
+  // request-level trail stays per request.
+  const STAGE_TARGETS_UNREADABLE = 'ashby_stage_catalog_targets_unreadable';
+  let refreshInFlight: Promise<StageCatalogRefreshResult> | null = null;
+  const sharedStageRefresh = (reader: StageCatalogReader, actorId: string): Promise<StageCatalogRefreshResult> => {
+    if (refreshInFlight) return refreshInFlight;
+    const store = stageCatalog();
+    const flight = (async () => {
+      // HELLO's mappings are read first, apart, so their failure answers 500
+      // with no Ashby call; the refresh then reads them from this one answer.
+      let targets: Awaited<ReturnType<StageCatalogStore['readTargets']>>;
+      try {
+        targets = await store.readTargets();
+      } catch {
+        throw new Error(STAGE_TARGETS_UNREADABLE);
+      }
+      return runStageCatalogRefresh(reader, { ...store, readTargets: async () => targets }, { now, actorId });
+    })();
+    refreshInFlight = flight;
+    const release = (): void => { if (refreshInFlight === flight) refreshInFlight = null; };
     flight.then(release, release);
     return flight;
   };
@@ -808,6 +913,132 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       }
       // Never echo why: the check itself could not run.
       res.status(502).json({ ok: false, error: 'probe_unavailable' });
+    }
+  });
+
+  // ── Ashby stage catalogue (admin) — M031 S2 ───────────────────────────────
+  // What each Ashby stage counts as on the business-impact page: christy,
+  // r1..r5, reference, offer, hired, archived or other (integrations/ashby/
+  // stage-catalog.ts). Stage titles, types, plan order and labels only: no
+  // candidate data. The table stores who set a label as `admin` or `default`;
+  // the admin themself is in the audit row.
+
+  // GET: the stages of the enabled mappings' plans, in plan order, and after
+  // them the stages Ashby removed from those plans (`inPlan: false`). HELLO's
+  // table only, no Ashby call. `unreadMappings` counts the live mappings whose
+  // plan has not been read yet (press Refresh).
+  router.get('/stage-catalog', requireRole('admin'), async (req: Request, res: Response) => {
+    try {
+      const listing = await stageCatalog().listForEnabledPlans();
+      const stages = listing.stages.map(stageRow);
+      await recordAudit(req, 'resource.list', 200, {
+        metadata: { resource: 'ashby_stage_catalog', count: stages.length, unread_mappings: listing.unreadMappings, truncated: listing.truncated },
+      });
+      res.json({
+        ok: true,
+        stages,
+        enabledMappings: listing.enabledMappings,
+        unreadMappings: listing.unreadMappings,
+        truncated: listing.truncated,
+      });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_read_error' });
+    }
+  });
+
+  // POST refresh: read jobInterviewPlan.info for each enabled mapping's job
+  // (Jobs read, at most 5, one ~20 s deadline) and upsert every stage through
+  // refresh_ashby_stage_catalog, which never deletes, never touches an admin
+  // label and recomputes every other label from the plan as it stands.
+  // Idempotent. A provider failure is counted by code and never fails the
+  // request. The catalogue write and its audit row (counts only) are one
+  // transaction in refresh_ashby_stage_catalog; the request-level trail after
+  // it is extra and never fails a refresh that was written.
+  router.post('/stage-catalog/refresh', requireRole('admin'), async (req: Request, res: Response) => {
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+    const reader = resolveStageCatalogReader();
+    if (!reader) {
+      // Runtime gates closed → no client is constructed, no table or provider read.
+      res.status(503).json({ ok: false, error: 'integration_disabled' }); return;
+    }
+    let refresh: StageCatalogRefreshResult;
+    try {
+      refresh = await sharedStageRefresh(reader, actorId);
+    } catch (err) {
+      if (err instanceof Error && err.message === STAGE_TARGETS_UNREADABLE) {
+        res.status(500).json({ ok: false, error: 'mission_control_read_error' }); return;
+      }
+      // The catalogue write (with its audit row) failed and rolled back. Never echo why.
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' }); return;
+    }
+    await recordStageCatalogTrail(req, {
+      resource: 'ashby_stage_catalog_refresh',
+      mappings_enabled: refresh.mappings.enabled,
+      jobs_attempted: refresh.jobs.attempted,
+      jobs_read: refresh.jobs.read,
+      jobs_failed: refresh.jobs.failed,
+      jobs_not_tried: refresh.jobs.notTried,
+      stages_seen: refresh.stages.seen,
+      inserted: refresh.stages.inserted,
+      updated: refresh.stages.updated,
+      defaulted: refresh.stages.defaulted,
+      redefaulted: refresh.stages.redefaulted,
+      left_plan: refresh.stages.leftPlan,
+      deadline_hit: refresh.deadlineHit,
+    });
+    res.json({ ok: true, refresh });
+  });
+
+  // PATCH: label one stage. `milestone` is one of STAGE_MILESTONES (source
+  // `admin`), or null to clear the admin's label: the stage returns to its
+  // default, if it has one (source `default`), which is what the next refresh
+  // would leave anyway. To say a stage is not a milestone, label it `other`.
+  // The label and its audit row (stage, label before and after) are one
+  // transaction in set_ashby_stage_milestone, so a label is never saved
+  // unaudited; the request-level trail after it never fails a saved label.
+  router.patch('/stage-catalog/:stageId', requireRole('admin'), async (req: Request, res: Response) => {
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+    const stageId = req.params.stageId;
+    if (typeof stageId !== 'string' || !OPAQUE_ID_RE.test(stageId)) {
+      res.status(400).json({ ok: false, error: 'invalid_stage_id' }); return;
+    }
+    const body = req.body as unknown;
+    const isObject = body !== null && typeof body === 'object' && !Array.isArray(body);
+    const keys = isObject ? Object.keys(body as Record<string, unknown>) : [];
+    const requested = isObject ? (body as Record<string, unknown>).milestone : undefined;
+    if (keys.length !== 1 || keys[0] !== 'milestone' || (requested !== null && !isStageMilestone(requested))) {
+      res.status(400).json({ ok: false, error: 'invalid_milestone' }); return;
+    }
+    try {
+      const store = stageCatalog();
+      const current = await store.readStage(stageId);
+      if (!current) { res.status(404).json({ ok: false, error: 'not_found' }); return; }
+      let milestone = requested;
+      let source: 'admin' | 'default' | null = 'admin';
+      if (milestone === null) {
+        const targets = await store.readTargets();
+        milestone = defaultMilestone(
+          { id: current.stageId, type: current.stageType, title: current.title },
+          new Set(targets.christyStageIds),
+        );
+        source = milestone === null ? null : 'default';
+      }
+      const result = await store.setMilestone(stageId, milestone, source, actorId);
+      if (!result) { res.status(404).json({ ok: false, error: 'not_found' }); return; }
+      // The actor is the audit rows' own; the table never holds it.
+      await recordStageCatalogTrail(req, {
+        resource: 'ashby_stage_catalog',
+        stage_id: stageId,
+        milestone_from: result.from,
+        milestone_to: result.stage.milestone,
+        milestone_source: result.stage.milestoneSource,
+      });
+      res.json({ ok: true, stage: stageRow(result.stage) });
+    } catch {
+      // The label (with its audit row) was not written. Never echo why.
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' });
     }
   });
 
