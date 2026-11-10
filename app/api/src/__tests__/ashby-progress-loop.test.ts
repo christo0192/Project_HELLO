@@ -3,7 +3,7 @@
  *
  *   - registered next to the other Ashby loops, with its interval reported, so
  *     /health measures it against its own cadence;
- *   - ASHBY_PROGRESS_ENABLED off (the default, and fly.toml in this release):
+ *   - ASHBY_PROGRESS_ENABLED off (the default; fly.toml turns it on since M031 go-live):
  *     the loop ticks and does nothing: no query, no Ashby call;
  *   - on: one pass through the runtime's client and progress store, and the
  *     short drain interval only while a pass fills its batch.
