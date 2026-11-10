@@ -58,6 +58,7 @@ import {
 } from '../../lib/resume-structurer.js';
 import { createLogger } from '../../lib/logger.js';
 import { createProgressStore, type ProgressStore } from './progress-worker.js';
+import { createProgressNudgeStore, type ProgressNudgeStore } from './progress-nudge.js';
 
 /** Version tags recorded as ingestion provenance (never PII). */
 export const ASHBY_EXTRACTOR_VERSION = 'ashby-ephemeral-1';
@@ -148,6 +149,12 @@ export interface AshbyRuntime {
    * leaves the `ashby-progress` loop idle.
    */
   progress?: ProgressStore;
+  /**
+   * The M031 S4 webhook nudge's one call (0141; writes the progress table
+   * only). Optional so a runtime built by hand (tests) without it wires no
+   * nudge. The signal handler uses it only while ASHBY_PROGRESS_ENABLED is on.
+   */
+  progressNudge?: ProgressNudgeStore;
   /** Release pooled resources (parser child processes). Idempotent. */
   shutdown(): Promise<void>;
 }
@@ -751,6 +758,7 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
     buildIngestionPorts,
     mappings,
     progress: createProgressStore(supabase),
+    progressNudge: createProgressNudgeStore(supabase),
     async shutdown() {
       if (shut) return;
       shut = true;

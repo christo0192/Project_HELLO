@@ -134,6 +134,7 @@ primary_region = "sin"
   ASHBY_PHONE_PARSING_ENABLED = "true"
   # Ashby progress worker (M031 S3, docs/runbooks/ashby-progress-worker.md):
   # OFF. The `ashby-progress` loop ticks and does nothing until this is "true".
+  # "true" also turns on the webhook nudge (M031 S4, migration 0141 first).
   # Tunables keep their defaults (10 a pass, about 2 Ashby calls a second).
   ASHBY_PROGRESS_ENABLED = "false"
   # Phone canary flip (docs/runbooks/phone-worker-deployment.md §6): the exact

@@ -1,8 +1,9 @@
 # Ashby progress worker: where imported applications went after Christy
 
-**Migration:** `0139_ashby_progress_worker.sql` (functions over the 0138 tables) · **Status:** off by default
-(`ASHBY_PROGRESS_ENABLED`, and `fly.toml` sets it `"false"`) · **Milestone:** M031 S3 · **Plan:**
-`.gsd/milestones/M031/BUSINESS-IMPACT-PLAN.md` section 5
+**Migrations:** `0139_ashby_progress_worker.sql` (functions over the 0138 tables) and
+`0141_ashby_progress_nudge.sql` (the webhook nudge) · **Status:** off by default
+(`ASHBY_PROGRESS_ENABLED`, and `fly.toml` sets it `"false"`) · **Milestone:** M031 S3 and S4 ·
+**Plan:** `.gsd/milestones/M031/BUSINESS-IMPACT-PLAN.md` section 5
 
 ---
 
@@ -74,11 +75,44 @@ personal) and are not read again.
 timestamps. No name, email, phone, resume, custom field, hiring team, offer or Ashby staff id. Each
 field is copied off the payload by name and validated; `moved_by_person` replaces the actor id.
 
+**Webhook nudge (M031 S4).** A `candidateStageChange` webhook for an application HELLO imported
+marks its progress row due now, so the next pass (an idle loop ticks every 30 to 60 s) reads it
+instead of waiting for the cadence (6 h for a recently moved application). `integrations/ashby/progress-nudge.ts`, called by
+the signal worker (`processAshbySignal`), through `nudge_ashby_application_progress` (0141):
+
+- **When.** Only while `ASHBY_PROGRESS_ENABLED` is `true`: off, the signal handler wires no nudge,
+  so nothing is called and nothing is written. Once per stage-change signal that carries an
+  application id, first, before the stage pre-filter (`ASHBY_STAGE_PREFILTER_ENABLED`), so a stage
+  the pre-filter skips is still nudged. A signal reconciliation re-drives (only ever for an
+  application sitting in a mapped Christy stage) is nudged too; an admin's explicit backlog import
+  is not (it is an import run, not a stage move).
+- **Cost.** One database call and no Ashby call: the link on its unique key (an application HELLO
+  never imported, the usual case, answers `not_imported` after one index probe), then the
+  coverage rule (`ashby_progress_covered_links()`, the same one the worker uses) for a link that
+  exists, then one write. Measured on Postgres 17 with 20,000 links: about 0.3 ms for an
+  application HELLO never imported, about 9 ms for one it did.
+- **What it writes.** `ashby_application_progress` only. A missing row is created due now, as the
+  claim seeds one (`created`); a row due later is moved to now (`marked`); a row already due is left
+  alone (`already_due`). `next_check_at` only ever moves earlier, and nothing else on the row
+  changes (not the stored state, the attempts, the error code or `updated_at`). A link the coverage
+  rule leaves out (erasure, an ended link with no candidate, a restriction) is never nudged
+  (`not_covered`). An application Ashby no longer had (`application_not_found`, never due) is due
+  once more: the webhook is proof it exists.
+- **Never in the way.** It is not a decision: the signal's decision, receipt, provider reads, order
+  and retries are exactly as without it. The call is bounded at 2 s (`PROGRESS_NUDGE_TIMEOUT_MS`);
+  a failure or timeout is logged as `ashby_progress_nudge` with `error_type` `error`, `timeout` or
+  `refused` (a code only, never an id) and skips nudges on that machine for 30 s
+  (`PROGRESS_NUDGE_FAILURE_BACKOFF_MS`), so a webhook storm cannot pile onto a sick database. A
+  skipped nudge costs freshness only: the cadence still reads the application.
+- **A row being read.** A nudge that lands while a pass is reading that application moves the row to
+  now: the read in flight may predate the move, so it is refused (`lease_lost` on the run) and the
+  next pass reads the application again.
+
 ## 2. Switch and tunables
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ASHBY_PROGRESS_ENABLED` | `false` | Only the literal `true` turns it on. Also needs the Ashby runtime on. |
+| `ASHBY_PROGRESS_ENABLED` | `false` | Only the literal `true` turns it on. Also needs the Ashby runtime on. Turns on the webhook nudge too (section 1). |
 | `ASHBY_PROGRESS_INTERVAL_MS` | 120000 | Base loop interval. `lib/scheduler.ts` caps idle backoff at 60 s, so an idle loop ticks every 30 to 60 s; a tick with nothing due is two small queries and no Ashby call. |
 | `ASHBY_PROGRESS_DRAIN_INTERVAL_MS` | 5000 | Interval after a pass that filled its batch (a backfill draining). |
 | `ASHBY_PROGRESS_BATCH_SIZE` | 10 | Applications one pass claims (1 to 50). |
@@ -113,7 +147,7 @@ Every failure is stored on its row as `check_error_code` and counted on `GET ...
 | `timeout` | A call that did not answer inside its own budget (20 s), or a row whose own slow reads ran the pass out after it began with more than one call budget left. | 15 min doubling, to a day | Nothing unless it persists; a growing count means Ashby is slow for those applications. |
 | `server_error`, `network`, ... | The access check's coarse codes. | 15 min doubling, to a day | Nothing unless it persists. |
 | `record_error`, `record_refused`, `internal_error` | HELLO's own write or read failed. Backed off like the above. | 15 min doubling | Check Supabase. |
-| `lease_lost` | Counted on the run only: a backfill re-marked the row while it was read. Nothing written; it is read again soon. | at once | Nothing. |
+| `lease_lost` | Counted on the run only: a backfill or a webhook nudge re-marked the row while it was read. Nothing written; it is read again soon. | at once | Nothing. |
 
 A row the pass never started, or one the **pass's** deadline cut short after it began with no more
 than one call budget left, is handed back unread (`deferred`) with its claim refunded and is due
@@ -167,7 +201,9 @@ Control health (memory note on clamscan CPU throttling).
 
 ## 6. Turning it on (GO-LIVE)
 
-1. Migration 0139 is applied (the owner's `supabase db push`, after 0138).
+1. Migrations 0139 and 0141 are applied (the owner's `supabase db push`, after 0138). The switch
+   also turns on the webhook nudge, which calls 0141: with 0141 missing every nudge fails, is
+   logged as `ashby_progress_nudge` `error` and backs off, and the signals go on unharmed.
 2. Run the S2 stage-catalogue refresh, so plan stages are known (`POST .../stage-catalog/refresh`).
 3. **Before** the switch: `POST .../progress/backfill` with `{ "dryRun": true }`; note `toCheck`,
    `expectedCalls` and `estimatedMinutes`. The dry run answers with the worker off, and with the
@@ -198,15 +234,30 @@ select c.milestone, count(distinct i.application_link_id) as applications
 
 ## 7. Rollback
 
-Set the switch off. Nothing else needs undoing: the tables and functions are additive, the worker
-writes only them, and no existing table, row or candidate is touched.
+Set the switch off: it stops the worker and the webhook nudge. Nothing else needs undoing: the
+tables and functions are additive, the worker and the nudge write only them, and no existing table,
+row or candidate is touched.
 
 ## 8. Limits, recorded honestly
 
 - The monthly tier (Hired or Archived more than 90 days ago) re-reads the history on each check,
   so such an application's history is read monthly, not weekly.
-- A stage-change webhook does not mark the application due yet (S4). Until then a move shows
-  within the cadence (6 h for a recent active application).
+- The webhook nudge only sees moves whose webhook arrives. Ashby's docs do not say whether
+  archiving fires `candidateStageChange`, Ashby stops retrying after about 2.8 hours, and
+  reconciliation re-drives only applications in a mapped Christy stage, so a lost webhook for a
+  later move is never replayed. Such a move shows within the cadence (6 h for a recent active
+  application).
+- A move back into a stage whose receipt is already concluded is not nudged. Stage-change receipts
+  are keyed per application and stage (`stage:<application>:<stage>`), and
+  `record_ashby_event_receipt` (0030) creates no signal job for a receipt already `processed`,
+  `ignored` or `failed`: the delivery answers `duplicate`, so `processAshbySignal`, and the nudge
+  with it, never runs. In practice that is an imported application moved back into its Christy stage
+  (its receipt was `processed` by the import); the signal worker leaves every other stage's receipt
+  `received`, so a move back into one of those is re-driven and nudged. Such a move shows within the
+  cadence; no import decision changes. Nudging from the ingress on a duplicate receipt would put a
+  database write on the webhook path, so it is left out.
+- The nudge's backoff is per machine and in memory: after a failure that machine skips nudges for
+  30 s. Nudges are not counted on the status route; only failures show, in the logs.
 - The Mission Control UI does not show these counters yet; the status route does.
 - A machine's pace is its own: with two API machines the tenant sees up to about 4 calls a second.
 - The scanner signal is the fleet's, not the machine's: `job_queue` clears a job's lease owner when
