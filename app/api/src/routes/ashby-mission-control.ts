@@ -45,6 +45,13 @@
  *                                    recomputes every default label
  *   PATCH /stage-catalog/:stageId  — admin: label one stage, or clear it back
  *                                    to its default
+ *   GET  /progress/status          — admin: the Ashby progress worker (M031
+ *                                    S3): switch, coverage, counts by status
+ *                                    and error code, stale rows, recent runs
+ *   POST /progress/backfill        — admin: { dryRun: true } counts and the
+ *                                    expected Ashby calls; { dryRun: false }
+ *                                    marks every link due for the worker
+ *                                    (idempotent, audited, no Ashby call)
  *
  * Every mutation is race-safe + audited inside its RPC (0031), the M031
  * stage-catalogue writes included. Candidate results are never exposed here.
@@ -60,10 +67,19 @@ import { createMissionControlStore, type MissionControlStore } from '../integrat
 import {
   loadAshbyConfig,
   loadAshbyRuntimeConfig,
+  loadAshbyProgressConfig,
   describeAshbyConfig,
   describeAshbyRuntime,
   isAshbyRuntimeActive,
+  type AshbyProgressConfig,
 } from '../integrations/ashby/config.js';
+import {
+  createProgressStore,
+  estimateBackfill,
+  PROGRESS_STALE_AFTER_SECONDS,
+  type ProgressOverview,
+  type ProgressStore,
+} from '../integrations/ashby/progress-worker.js';
 import {
   probeJobStages,
   probeJobFeedbackForms,
@@ -133,6 +149,66 @@ async function recordStageCatalogTrail(req: Request, metadata: Record<string, un
   } catch {
     stageCatalogLogger.error('error_unhandled', { error_type: 'audit_sink_failure' });
   }
+}
+
+/** The progress worker's request-level trail; the backfill itself is audited in its own transaction. */
+async function recordProgressTrail(req: Request, metadata: Record<string, unknown>): Promise<void> {
+  try {
+    await recordAudit(req, 'resource.update', 200, { metadata });
+  } catch {
+    stageCatalogLogger.error('error_unhandled', { error_type: 'audit_sink_failure' });
+  }
+}
+
+interface ProgressWorkerState {
+  config: AshbyProgressConfig;
+  enabled: boolean;
+  runtimeActive: boolean;
+}
+
+/** The worker's switch and pace, as the progress routes answer them. */
+function progressWorkerRow(worker: ProgressWorkerState) {
+  const c = worker.config;
+  return {
+    enabled: worker.enabled,
+    runtimeActive: worker.runtimeActive,
+    running: worker.enabled && worker.runtimeActive,
+    batchSize: c.batchSize,
+    passDeadlineMs: c.passDeadlineMs,
+    minCallIntervalMs: c.minCallIntervalMs,
+    cadenceHours: { ...c.cadenceHours },
+  };
+}
+
+/** The status route's counts. */
+function progressOverviewBody(o: ProgressOverview) {
+  return {
+    coverage: { links: o.links, checked: o.checked, neverChecked: o.neverChecked, excluded: o.linksExcluded },
+    due: { now: o.dueNow, stale: o.stale, gone: o.gone, staleAfterHours: PROGRESS_STALE_AFTER_SECONDS / 3_600 },
+    byStatus: o.byStatus,
+    byError: o.byError,
+    intervals: o.intervals,
+    historyStages: o.historyStages,
+    openBackfill: o.openBackfill,
+    lastPass: o.lastSweep,
+    recentRuns: o.recentRuns,
+    scannerPause: o.scannerPause,
+  };
+}
+
+/**
+ * What a backfill would read: every covered link, newest first, each with its
+ * whole history (a backfill re-reads every history read before it began), so
+ * two calls an application, one for an application Ashby no longer has.
+ */
+function backfillPlan(o: ProgressOverview, config: AshbyProgressConfig) {
+  return {
+    links: o.links,
+    alreadyChecked: o.checked,
+    neverChecked: o.neverChecked,
+    toCheck: o.links,
+    ...estimateBackfill(o.links, config, o.gone),
+  };
 }
 
 function boundedLimit(raw: unknown): number {
@@ -276,6 +352,11 @@ export interface AshbyMissionControlDeps {
   backlog?: () => Promise<BacklogView>;
   /** Injected scanner-readiness reader (tests). Production reads the signature DB. */
   scanner?: () => Promise<ScannerHealthView>;
+  /**
+   * Injected progress-worker store (tests). Production reads and writes the
+   * 0138 tables through the 0139 functions with the service role.
+   */
+  progress?: ProgressStore;
 }
 
 export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = {}): Router {
@@ -362,6 +443,23 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   const stageCatalog = (): StageCatalogStore => {
     if (!stageCatalogCached) stageCatalogCached = createStageCatalogStore(supabase as never);
     return stageCatalogCached;
+  };
+  // The M031 progress worker's tables. Its routes read and write HELLO's
+  // tables only and make no Ashby call, so they need no client.
+  let progressCached: ProgressStore | undefined = deps.progress;
+  const progressStore = (): ProgressStore => {
+    if (!progressCached) progressCached = createProgressStore(supabase as never);
+    return progressCached;
+  };
+  /** The worker's switch as this process reads it, and whether the runtime that runs it is on. */
+  const progressWorker = (): ProgressWorkerState => {
+    const source = deps.configSource ?? process.env;
+    const config = loadAshbyProgressConfig(source);
+    return {
+      config,
+      enabled: config.enabled,
+      runtimeActive: isAshbyRuntimeActive(loadAshbyConfig(source), loadAshbyRuntimeConfig(source)),
+    };
   };
   const scorecardPreview = deps.scorecardPreview ?? {
     async readMapping(mappingId: string): Promise<{ roleId: string | null; feedbackFormId: string | null } | undefined> {
@@ -1040,6 +1138,121 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       // The label (with its audit row) was not written. Never echo why.
       res.status(500).json({ ok: false, error: 'mission_control_action_error' });
     }
+  });
+
+  // ── Ashby progress worker (admin) — M031 S3 ───────────────────────────────
+  // The `ashby-progress` loop re-reads each imported application's status and
+  // stage history (integrations/ashby/progress-worker.ts). These routes read
+  // and write HELLO's own tables only, through the 0139 functions, and never
+  // call Ashby: the worker makes every read. Counts and codes only: no link,
+  // application, candidate or run id, no name.
+
+  // GET status: the switch, coverage (links checked of links), counts by
+  // Ashby status and by error code, stale rows, the open backfill, the last
+  // pass and the recent runs.
+  router.get('/progress/status', requireRole('admin'), async (req: Request, res: Response) => {
+    try {
+      const worker = progressWorker();
+      const overview = await progressStore().overview(new Date(now()).toISOString(), PROGRESS_STALE_AFTER_SECONDS);
+      await recordAudit(req, 'resource.read', 200, {
+        metadata: {
+          resource: 'ashby_progress_status',
+          links: overview.links,
+          checked: overview.checked,
+          stale: overview.stale,
+          worker_enabled: worker.enabled,
+        },
+      });
+      res.json({ ok: true, worker: progressWorkerRow(worker), ...progressOverviewBody(overview) });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_read_error' });
+    }
+  });
+
+  // POST backfill: `{ dryRun: true }` answers counts only (the links, how many
+  // were already read, how many a backfill reads, the expected Ashby calls and
+  // minutes at the worker's pace) and changes nothing. `{ dryRun: false }`
+  // marks every link due now, newest first, for the worker, and opens one
+  // backfill run: start_ashby_progress_backfill writes that and its audit row
+  // (counts only, under the admin) in one transaction. Idempotent: while a
+  // backfill is open a second call answers `already_running` and changes
+  // nothing. With the worker off (ASHBY_PROGRESS_ENABLED not 'true', or the
+  // Ashby runtime off) it marks nothing and answers `worker_disabled`, so a
+  // backfill never waits on a worker that will not come. No Ashby call here.
+  router.post('/progress/backfill', requireRole('admin'), async (req: Request, res: Response) => {
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+    const body = req.body as unknown;
+    const isObject = body !== null && typeof body === 'object' && !Array.isArray(body);
+    const keys = isObject ? Object.keys(body as Record<string, unknown>) : [];
+    const dryRun = isObject ? (body as Record<string, unknown>).dryRun : undefined;
+    if (keys.length !== 1 || keys[0] !== 'dryRun' || typeof dryRun !== 'boolean') {
+      res.status(400).json({ ok: false, error: 'invalid_backfill_request' }); return;
+    }
+    const worker = progressWorker();
+    const store = progressStore();
+    let overview: ProgressOverview;
+    try {
+      overview = await store.overview(new Date(now()).toISOString(), PROGRESS_STALE_AFTER_SECONDS);
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_read_error' }); return;
+    }
+    const plan = backfillPlan(overview, worker.config);
+
+    if (dryRun) {
+      try {
+        await recordAudit(req, 'resource.read', 200, {
+          metadata: {
+            resource: 'ashby_progress_backfill_preview',
+            links: plan.links,
+            already_checked: plan.alreadyChecked,
+            to_check: plan.toCheck,
+            expected_calls: plan.expectedCalls,
+            worker_enabled: worker.enabled && worker.runtimeActive,
+          },
+        });
+      } catch {
+        res.status(500).json({ ok: false, error: 'mission_control_read_error' }); return;
+      }
+      res.json({ ok: true, dryRun: true, worker: progressWorkerRow(worker), ...plan, openBackfill: overview.openBackfill });
+      return;
+    }
+
+    if (!worker.enabled || !worker.runtimeActive) {
+      // Nothing is marked: the backfill is the worker's, and the worker is off.
+      await recordProgressTrail(req, { resource: 'ashby_progress_backfill', state: 'worker_disabled', links: plan.links });
+      res.json({
+        ok: true, dryRun: false, state: 'worker_disabled', worker: progressWorkerRow(worker), ...plan,
+        startedAt: null, seeded: 0, marked: 0, remaining: plan.toCheck,
+      });
+      return;
+    }
+
+    let start: Awaited<ReturnType<ProgressStore['startBackfill']>>;
+    let after: ProgressOverview;
+    try {
+      start = await store.startBackfill(actorId, new Date(now()).toISOString());
+      after = await store.overview(new Date(now()).toISOString(), PROGRESS_STALE_AFTER_SECONDS);
+    } catch {
+      // The backfill (with its audit row) was not opened, or its counts could not be read. Never echo why.
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' }); return;
+    }
+    await recordProgressTrail(req, {
+      resource: 'ashby_progress_backfill', state: start.state, links: start.links, seeded: start.seeded, marked: start.marked,
+    });
+    const remaining = after.openBackfill?.remaining ?? 0;
+    res.json({
+      ok: true,
+      dryRun: false,
+      state: start.state,
+      worker: progressWorkerRow(worker),
+      ...plan,
+      ...estimateBackfill(remaining, worker.config, Math.min(after.gone, remaining)),
+      startedAt: start.startedAt,
+      seeded: start.seeded,
+      marked: start.marked,
+      remaining,
+    });
   });
 
   // ── Read-only feedback-form schema discovery (admin) ──────────────────────

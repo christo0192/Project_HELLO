@@ -1,0 +1,1232 @@
+{
+  "note": "Captured from Postgres 16 (PGlite) running migration 0140 on the fixture of app/supabase/tests/ashby_impact_assert.sql. Synthetic data only.",
+  "summaryOn": {
+    "status": "ok",
+    "summary": {
+      "meta": {
+        "coverage": {
+          "total": 22,
+          "checked": 15
+        },
+        "timezone": "Asia/Kolkata",
+        "staleRows": 1,
+        "lastPassAt": "2026-11-10T05:00:00+00:00",
+        "minTimingN": 5,
+        "generatedAt": "2026-11-10T06:30:00+00:00",
+        "progressEnabled": true,
+        "labelsConfigured": false,
+        "unlabelledStages": 5
+      },
+      "byJob": [
+        {
+          "jobId": "88ac2ae6-2c02-b8fb-1529-1bfdf0b00a4d",
+          "label": "Archived Kept Role",
+          "cameIn": 1,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0,
+            "connected": 0,
+            "moved_forward": null
+          }
+        },
+        {
+          "jobId": "fb448b8c-bc67-331a-cb97-fc06f8d369f8",
+          "label": "Browser Screen Role",
+          "cameIn": 4,
+          "shares": {
+            "r1": 0,
+            "r2": 0,
+            "hired": 0,
+            "offer": 0,
+            "scored": 0.25,
+            "connected": 0.25,
+            "moved_forward": 0
+          }
+        },
+        {
+          "jobId": "b22ebac3-b082-dc4f-ccfd-cfccf6eb9bb6",
+          "label": "Data Analyst",
+          "cameIn": 1,
+          "shares": {
+            "r1": 1,
+            "r2": 0,
+            "hired": 0,
+            "offer": 0,
+            "scored": 1,
+            "connected": 1,
+            "moved_forward": 1
+          }
+        },
+        {
+          "jobId": "a588c8cd-1bd8-a40f-d109-1ac907ea9412",
+          "label": "Sales Program Advisor",
+          "cameIn": 16,
+          "shares": {
+            "r1": 0.188,
+            "r2": 0.125,
+            "hired": 0.063,
+            "offer": 0.063,
+            "scored": 0.563,
+            "connected": 0.625,
+            "moved_forward": 0.25
+          }
+        }
+      ],
+      "leaves": [
+        {
+          "stageId": "imp-stage-05-christy",
+          "archived": 3,
+          "milestone": "christy",
+          "stageTitle": "Hello Christy",
+          "topReasons": [
+            {
+              "text": "Not a fit",
+              "count": 1
+            },
+            {
+              "text": "Withdrew",
+              "count": 1
+            }
+          ],
+          "byReasonType": {
+            "none": 1,
+            "other": 0,
+            "rejected_by_org": 1,
+            "rejected_by_candidate": 1
+          }
+        },
+        {
+          "stageId": "imp-stage-09-r1",
+          "archived": 1,
+          "milestone": "r1",
+          "stageTitle": "R1",
+          "topReasons": [
+            {
+              "text": "Position filled",
+              "count": 1
+            }
+          ],
+          "byReasonType": {
+            "none": 0,
+            "other": 1,
+            "rejected_by_org": 0,
+            "rejected_by_candidate": 0
+          }
+        }
+      ],
+      "cohorts": [
+        {
+          "cameIn": 3,
+          "shares": {
+            "r1": 0.333,
+            "r2": 0,
+            "hired": 0,
+            "offer": 0,
+            "scored": 0.667,
+            "connected": 0.667,
+            "moved_forward": 0.333
+          },
+          "ageDays": 43,
+          "maturing": false,
+          "weekStart": "2026-09-28"
+        },
+        {
+          "cameIn": 9,
+          "shares": {
+            "r1": 0.222,
+            "r2": 0.111,
+            "hired": 0.111,
+            "offer": 0.111,
+            "scored": 0.667,
+            "connected": 0.667,
+            "moved_forward": 0.222
+          },
+          "ageDays": 36,
+          "maturing": true,
+          "weekStart": "2026-10-05"
+        },
+        {
+          "cameIn": 3,
+          "shares": {
+            "r1": 0.333,
+            "r2": 0.333,
+            "hired": 0,
+            "offer": 0,
+            "scored": 0.667,
+            "connected": 0.667,
+            "moved_forward": 0.667
+          },
+          "ageDays": 29,
+          "maturing": true,
+          "weekStart": "2026-10-12"
+        },
+        {
+          "cameIn": 5,
+          "shares": {
+            "r1": 0,
+            "r2": 0,
+            "hired": 0,
+            "offer": 0,
+            "scored": 0.2,
+            "connected": 0.4,
+            "moved_forward": 0
+          },
+          "ageDays": 22,
+          "maturing": true,
+          "weekStart": "2026-10-19"
+        },
+        {
+          "cameIn": 1,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0,
+            "connected": 0,
+            "moved_forward": null
+          },
+          "ageDays": 15,
+          "maturing": true,
+          "weekStart": "2026-10-26"
+        },
+        {
+          "cameIn": 1,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0,
+            "connected": 0,
+            "moved_forward": null
+          },
+          "ageDays": 8,
+          "maturing": true,
+          "weekStart": "2026-11-02"
+        }
+      ],
+      "filters": {
+        "to": "2026-11-10",
+        "job": null,
+        "from": "2026-09-01",
+        "jobs": [
+          {
+            "id": "88ac2ae6-2c02-b8fb-1529-1bfdf0b00a4d",
+            "label": "Archived Kept Role"
+          },
+          {
+            "id": "fb448b8c-bc67-331a-cb97-fc06f8d369f8",
+            "label": "Browser Screen Role"
+          },
+          {
+            "id": "b22ebac3-b082-dc4f-ccfd-cfccf6eb9bb6",
+            "label": "Data Analyst"
+          },
+          {
+            "id": "a588c8cd-1bd8-a40f-d109-1ac907ea9412",
+            "label": "Sales Program Advisor"
+          }
+        ]
+      },
+      "timings": [
+        {
+          "n": 16,
+          "key": "entry_to_first_call",
+          "label": "Christy stage to first call",
+          "p90Days": 0.6,
+          "medianDays": 0.35
+        },
+        {
+          "n": 11,
+          "key": "entry_to_verdict",
+          "label": "Christy stage to verdict",
+          "p90Days": 0.63,
+          "medianDays": 0.46
+        },
+        {
+          "n": 6,
+          "key": "verdict_to_decision",
+          "label": "Verdict to a person deciding",
+          "p90Days": 1.9,
+          "medianDays": 1.63
+        },
+        {
+          "n": 4,
+          "key": "christy_to_r1",
+          "label": "Christy stage to R1",
+          "p90Days": null,
+          "medianDays": null
+        },
+        {
+          "n": 1,
+          "key": "r1_to_r2",
+          "label": "R1 to R2",
+          "p90Days": null,
+          "medianDays": null
+        },
+        {
+          "n": 1,
+          "key": "r2_to_offer",
+          "label": "R2 to Offer",
+          "p90Days": null,
+          "medianDays": null
+        },
+        {
+          "n": 1,
+          "key": "offer_to_hired",
+          "label": "Offer to Hired",
+          "p90Days": null,
+          "medianDays": null
+        }
+      ],
+      "pipeline": [
+        {
+          "step": "came_in",
+          "label": "Came in",
+          "reached": 22,
+          "ofCameIn": 1,
+          "stillHere": 0,
+          "ofPrevious": null,
+          "droppedHere": 1
+        },
+        {
+          "step": "called",
+          "label": "Christy called",
+          "reached": 16,
+          "ofCameIn": 0.727,
+          "stillHere": 1,
+          "ofPrevious": 0.727,
+          "droppedHere": 1
+        },
+        {
+          "sub": {
+            "label": "Call answered",
+            "reached": 15
+          },
+          "step": "connected",
+          "label": "Christy connected",
+          "reached": 12,
+          "ofCameIn": 0.545,
+          "stillHere": 1,
+          "ofPrevious": 0.75,
+          "droppedHere": 0
+        },
+        {
+          "step": "scored",
+          "label": "Scored",
+          "reached": 11,
+          "ofCameIn": 0.5,
+          "stillHere": 4,
+          "ofPrevious": 0.917,
+          "droppedHere": 0
+        },
+        {
+          "step": "decided",
+          "label": "A person decided in Ashby",
+          "reached": 7,
+          "ofCameIn": 0.318,
+          "stillHere": null,
+          "ofPrevious": 0.636,
+          "droppedHere": 1
+        },
+        {
+          "step": "moved_forward",
+          "label": "Moved forward in Ashby",
+          "reached": 5,
+          "ofCameIn": 0.227,
+          "stillHere": 1,
+          "ofPrevious": 0.714,
+          "droppedHere": 0
+        },
+        {
+          "step": "r1",
+          "label": "R1 or later",
+          "reached": 4,
+          "ofCameIn": 0.182,
+          "stillHere": 1,
+          "ofPrevious": 0.8,
+          "droppedHere": 1
+        },
+        {
+          "step": "r2",
+          "label": "R2 or later",
+          "reached": 2,
+          "ofCameIn": 0.091,
+          "stillHere": 1,
+          "ofPrevious": 0.5,
+          "droppedHere": 0
+        },
+        {
+          "step": "offer",
+          "label": "Offer or later",
+          "reached": 1,
+          "ofCameIn": 0.045,
+          "stillHere": 0,
+          "ofPrevious": 0.5,
+          "droppedHere": 0
+        },
+        {
+          "step": "hired",
+          "label": "Hired",
+          "reached": 1,
+          "ofCameIn": 0.045,
+          "stillHere": null,
+          "ofPrevious": 1,
+          "droppedHere": null
+        }
+      ],
+      "verdictOutcomes": {
+        "rows": [
+          {
+            "cells": {
+              "r1": 3,
+              "r2": 2,
+              "hired": 1,
+              "offer": 1,
+              "active": 6,
+              "moved_forward": 4,
+              "still_christy": 3,
+              "archived_christy": 0
+            },
+            "label": "Select",
+            "total": 7,
+            "verdict": "select"
+          },
+          {
+            "cells": {
+              "r1": 1,
+              "r2": 0,
+              "hired": 0,
+              "offer": 0,
+              "active": 0,
+              "moved_forward": 1,
+              "still_christy": 0,
+              "archived_christy": 0
+            },
+            "label": "Borderline",
+            "total": 1,
+            "verdict": "borderline"
+          },
+          {
+            "cells": {
+              "r1": 0,
+              "r2": 0,
+              "hired": 0,
+              "offer": 0,
+              "active": 1,
+              "moved_forward": 0,
+              "still_christy": 1,
+              "archived_christy": 1
+            },
+            "label": "Reject",
+            "total": 2,
+            "verdict": "reject"
+          },
+          {
+            "cells": {
+              "r1": 0,
+              "r2": 0,
+              "hired": 0,
+              "offer": 0,
+              "active": 1,
+              "moved_forward": 0,
+              "still_christy": 1,
+              "archived_christy": 0
+            },
+            "label": "Held (thin evidence)",
+            "total": 1,
+            "verdict": "held"
+          },
+          {
+            "cells": {
+              "r1": 0,
+              "r2": 0,
+              "hired": 0,
+              "offer": 0,
+              "active": 0,
+              "moved_forward": 0,
+              "still_christy": 0,
+              "archived_christy": 0
+            },
+            "label": "No verdict",
+            "total": 0,
+            "verdict": "none"
+          }
+        ],
+        "columns": [
+          {
+            "key": "still_christy",
+            "label": "Still in the Christy stage"
+          },
+          {
+            "key": "archived_christy",
+            "label": "Archived from the Christy stage"
+          },
+          {
+            "key": "moved_forward",
+            "label": "Moved forward"
+          },
+          {
+            "key": "r1",
+            "label": "R1 or later"
+          },
+          {
+            "key": "r2",
+            "label": "R2 or later"
+          },
+          {
+            "key": "offer",
+            "label": "Offer or later"
+          },
+          {
+            "key": "hired",
+            "label": "Hired"
+          },
+          {
+            "key": "active",
+            "label": "Still active"
+          }
+        ]
+      }
+    }
+  },
+  "summaryOff": {
+    "status": "ok",
+    "summary": {
+      "meta": {
+        "coverage": {
+          "total": 22,
+          "checked": 15
+        },
+        "timezone": "Asia/Kolkata",
+        "staleRows": 1,
+        "lastPassAt": "2026-11-10T05:00:00+00:00",
+        "minTimingN": 5,
+        "generatedAt": "2026-11-10T06:30:00+00:00",
+        "progressEnabled": false,
+        "labelsConfigured": false,
+        "unlabelledStages": 5
+      },
+      "byJob": [
+        {
+          "jobId": "88ac2ae6-2c02-b8fb-1529-1bfdf0b00a4d",
+          "label": "Archived Kept Role",
+          "cameIn": 1,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0,
+            "connected": 0,
+            "moved_forward": null
+          }
+        },
+        {
+          "jobId": "fb448b8c-bc67-331a-cb97-fc06f8d369f8",
+          "label": "Browser Screen Role",
+          "cameIn": 4,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0.25,
+            "connected": 0.25,
+            "moved_forward": null
+          }
+        },
+        {
+          "jobId": "b22ebac3-b082-dc4f-ccfd-cfccf6eb9bb6",
+          "label": "Data Analyst",
+          "cameIn": 1,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 1,
+            "connected": 1,
+            "moved_forward": null
+          }
+        },
+        {
+          "jobId": "a588c8cd-1bd8-a40f-d109-1ac907ea9412",
+          "label": "Sales Program Advisor",
+          "cameIn": 16,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0.563,
+            "connected": 0.625,
+            "moved_forward": null
+          }
+        }
+      ],
+      "leaves": [],
+      "cohorts": [
+        {
+          "cameIn": 3,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0.667,
+            "connected": 0.667,
+            "moved_forward": null
+          },
+          "ageDays": 43,
+          "maturing": false,
+          "weekStart": "2026-09-28"
+        },
+        {
+          "cameIn": 9,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0.667,
+            "connected": 0.667,
+            "moved_forward": null
+          },
+          "ageDays": 36,
+          "maturing": true,
+          "weekStart": "2026-10-05"
+        },
+        {
+          "cameIn": 3,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0.667,
+            "connected": 0.667,
+            "moved_forward": null
+          },
+          "ageDays": 29,
+          "maturing": true,
+          "weekStart": "2026-10-12"
+        },
+        {
+          "cameIn": 5,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0.2,
+            "connected": 0.4,
+            "moved_forward": null
+          },
+          "ageDays": 22,
+          "maturing": true,
+          "weekStart": "2026-10-19"
+        },
+        {
+          "cameIn": 1,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0,
+            "connected": 0,
+            "moved_forward": null
+          },
+          "ageDays": 15,
+          "maturing": true,
+          "weekStart": "2026-10-26"
+        },
+        {
+          "cameIn": 1,
+          "shares": {
+            "r1": null,
+            "r2": null,
+            "hired": null,
+            "offer": null,
+            "scored": 0,
+            "connected": 0,
+            "moved_forward": null
+          },
+          "ageDays": 8,
+          "maturing": true,
+          "weekStart": "2026-11-02"
+        }
+      ],
+      "filters": {
+        "to": "2026-11-10",
+        "job": null,
+        "from": "2026-09-01",
+        "jobs": [
+          {
+            "id": "88ac2ae6-2c02-b8fb-1529-1bfdf0b00a4d",
+            "label": "Archived Kept Role"
+          },
+          {
+            "id": "fb448b8c-bc67-331a-cb97-fc06f8d369f8",
+            "label": "Browser Screen Role"
+          },
+          {
+            "id": "b22ebac3-b082-dc4f-ccfd-cfccf6eb9bb6",
+            "label": "Data Analyst"
+          },
+          {
+            "id": "a588c8cd-1bd8-a40f-d109-1ac907ea9412",
+            "label": "Sales Program Advisor"
+          }
+        ]
+      },
+      "timings": [
+        {
+          "n": 16,
+          "key": "entry_to_first_call",
+          "label": "Christy stage to first call",
+          "p90Days": 0.6,
+          "medianDays": 0.35
+        },
+        {
+          "n": 11,
+          "key": "entry_to_verdict",
+          "label": "Christy stage to verdict",
+          "p90Days": 0.63,
+          "medianDays": 0.46
+        },
+        {
+          "n": 0,
+          "key": "verdict_to_decision",
+          "label": "Verdict to a person deciding",
+          "p90Days": null,
+          "medianDays": null
+        },
+        {
+          "n": 0,
+          "key": "christy_to_r1",
+          "label": "Christy stage to R1",
+          "p90Days": null,
+          "medianDays": null
+        },
+        {
+          "n": 0,
+          "key": "r1_to_r2",
+          "label": "R1 to R2",
+          "p90Days": null,
+          "medianDays": null
+        },
+        {
+          "n": 0,
+          "key": "r2_to_offer",
+          "label": "R2 to Offer",
+          "p90Days": null,
+          "medianDays": null
+        },
+        {
+          "n": 0,
+          "key": "offer_to_hired",
+          "label": "Offer to Hired",
+          "p90Days": null,
+          "medianDays": null
+        }
+      ],
+      "pipeline": [
+        {
+          "step": "came_in",
+          "label": "Came in",
+          "reached": 22,
+          "ofCameIn": 1,
+          "stillHere": null,
+          "ofPrevious": null,
+          "droppedHere": null
+        },
+        {
+          "step": "called",
+          "label": "Christy called",
+          "reached": 16,
+          "ofCameIn": 0.727,
+          "stillHere": null,
+          "ofPrevious": 0.727,
+          "droppedHere": null
+        },
+        {
+          "sub": {
+            "label": "Call answered",
+            "reached": 15
+          },
+          "step": "connected",
+          "label": "Christy connected",
+          "reached": 12,
+          "ofCameIn": 0.545,
+          "stillHere": null,
+          "ofPrevious": 0.75,
+          "droppedHere": null
+        },
+        {
+          "step": "scored",
+          "label": "Scored",
+          "reached": 11,
+          "ofCameIn": 0.5,
+          "stillHere": null,
+          "ofPrevious": 0.917,
+          "droppedHere": null
+        },
+        {
+          "step": "decided",
+          "label": "A person decided in Ashby",
+          "reached": null,
+          "ofCameIn": null,
+          "stillHere": null,
+          "ofPrevious": null,
+          "droppedHere": null
+        },
+        {
+          "step": "moved_forward",
+          "label": "Moved forward in Ashby",
+          "reached": null,
+          "ofCameIn": null,
+          "stillHere": null,
+          "ofPrevious": null,
+          "droppedHere": null
+        },
+        {
+          "step": "r1",
+          "label": "R1 or later",
+          "reached": null,
+          "ofCameIn": null,
+          "stillHere": null,
+          "ofPrevious": null,
+          "droppedHere": null
+        },
+        {
+          "step": "r2",
+          "label": "R2 or later",
+          "reached": null,
+          "ofCameIn": null,
+          "stillHere": null,
+          "ofPrevious": null,
+          "droppedHere": null
+        },
+        {
+          "step": "offer",
+          "label": "Offer or later",
+          "reached": null,
+          "ofCameIn": null,
+          "stillHere": null,
+          "ofPrevious": null,
+          "droppedHere": null
+        },
+        {
+          "step": "hired",
+          "label": "Hired",
+          "reached": null,
+          "ofCameIn": null,
+          "stillHere": null,
+          "ofPrevious": null,
+          "droppedHere": null
+        }
+      ],
+      "verdictOutcomes": {
+        "rows": [
+          {
+            "cells": {
+              "r1": null,
+              "r2": null,
+              "hired": null,
+              "offer": null,
+              "active": null,
+              "moved_forward": null,
+              "still_christy": null,
+              "archived_christy": null
+            },
+            "label": "Select",
+            "total": 7,
+            "verdict": "select"
+          },
+          {
+            "cells": {
+              "r1": null,
+              "r2": null,
+              "hired": null,
+              "offer": null,
+              "active": null,
+              "moved_forward": null,
+              "still_christy": null,
+              "archived_christy": null
+            },
+            "label": "Borderline",
+            "total": 1,
+            "verdict": "borderline"
+          },
+          {
+            "cells": {
+              "r1": null,
+              "r2": null,
+              "hired": null,
+              "offer": null,
+              "active": null,
+              "moved_forward": null,
+              "still_christy": null,
+              "archived_christy": null
+            },
+            "label": "Reject",
+            "total": 2,
+            "verdict": "reject"
+          },
+          {
+            "cells": {
+              "r1": null,
+              "r2": null,
+              "hired": null,
+              "offer": null,
+              "active": null,
+              "moved_forward": null,
+              "still_christy": null,
+              "archived_christy": null
+            },
+            "label": "Held (thin evidence)",
+            "total": 1,
+            "verdict": "held"
+          },
+          {
+            "cells": {
+              "r1": null,
+              "r2": null,
+              "hired": null,
+              "offer": null,
+              "active": null,
+              "moved_forward": null,
+              "still_christy": null,
+              "archived_christy": null
+            },
+            "label": "No verdict",
+            "total": 0,
+            "verdict": "none"
+          }
+        ],
+        "columns": [
+          {
+            "key": "still_christy",
+            "label": "Still in the Christy stage"
+          },
+          {
+            "key": "archived_christy",
+            "label": "Archived from the Christy stage"
+          },
+          {
+            "key": "moved_forward",
+            "label": "Moved forward"
+          },
+          {
+            "key": "r1",
+            "label": "R1 or later"
+          },
+          {
+            "key": "r2",
+            "label": "R2 or later"
+          },
+          {
+            "key": "offer",
+            "label": "Offer or later"
+          },
+          {
+            "key": "hired",
+            "label": "Hired"
+          },
+          {
+            "key": "active",
+            "label": "Still active"
+          }
+        ]
+      }
+    }
+  },
+  "candidatesAllHired": {
+    "page": 1,
+    "rows": [
+      {
+        "name": "Impact fixture a1",
+        "score": 70,
+        "status": "Hired",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-20T04:00:00+00:00",
+        "candidateId": "c43709b9-9056-aab9-def9-daaadfa266cf",
+        "provisional": false,
+        "currentMilestone": "hired",
+        "enteredChristyAt": "2026-10-05T04:00:00+00:00",
+        "currentStageTitle": "Hired"
+      }
+    ],
+    "total": 1,
+    "hidden": 0,
+    "status": "ok",
+    "pageSize": 50
+  },
+  "candidatesAllCameIn": {
+    "page": 1,
+    "rows": [
+      {
+        "name": "Impact fixture a5",
+        "score": null,
+        "status": "Archived",
+        "verdict": "none",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-23T04:00:00+00:00",
+        "candidateId": "c58181e6-6bd3-3cdb-c7b3-faa65ab8c483",
+        "provisional": false,
+        "currentMilestone": "archived",
+        "enteredChristyAt": "2026-10-22T04:00:00+00:00",
+        "currentStageTitle": "Archived"
+      },
+      {
+        "name": "Impact fixture a1",
+        "score": 70,
+        "status": "Hired",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-20T04:00:00+00:00",
+        "candidateId": "c43709b9-9056-aab9-def9-daaadfa266cf",
+        "provisional": false,
+        "currentMilestone": "hired",
+        "enteredChristyAt": "2026-10-05T04:00:00+00:00",
+        "currentStageTitle": "Hired"
+      },
+      {
+        "name": "Impact fixture a9",
+        "score": 70,
+        "status": "Active",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-16T04:00:00+00:00",
+        "candidateId": "6f424b0c-1aec-5a5f-8e47-fd0a71fd102e",
+        "provisional": false,
+        "currentMilestone": "christy",
+        "enteredChristyAt": "2026-10-13T04:00:00+00:00",
+        "currentStageTitle": "Hello Christy"
+      },
+      {
+        "name": "Impact fixture a8",
+        "score": 70,
+        "status": "Active",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-14T04:00:00+00:00",
+        "candidateId": "d3911bca-2e69-6d9e-1997-8ed70717d1fc",
+        "provisional": false,
+        "currentMilestone": "r2",
+        "enteredChristyAt": "2026-10-12T04:00:00+00:00",
+        "currentStageTitle": "R2"
+      },
+      {
+        "name": "Impact fixture ax",
+        "score": 70,
+        "status": "Active",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-09T04:00:00+00:00",
+        "candidateId": "ed24bde3-a7c8-460b-8b98-63648d2faadc",
+        "provisional": false,
+        "currentMilestone": "r1",
+        "enteredChristyAt": "2026-10-08T04:00:00+00:00",
+        "currentStageTitle": "R1"
+      }
+    ],
+    "total": 22,
+    "hidden": 0,
+    "status": "ok",
+    "pageSize": 5
+  },
+  "candidatesOwnerCameIn": {
+    "page": 1,
+    "rows": [
+      {
+        "name": "Impact fixture a5",
+        "score": null,
+        "status": "Archived",
+        "verdict": "none",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-23T04:00:00+00:00",
+        "candidateId": "c58181e6-6bd3-3cdb-c7b3-faa65ab8c483",
+        "provisional": false,
+        "currentMilestone": "archived",
+        "enteredChristyAt": "2026-10-22T04:00:00+00:00",
+        "currentStageTitle": "Archived"
+      },
+      {
+        "name": "Impact fixture a9",
+        "score": 70,
+        "status": "Active",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-16T04:00:00+00:00",
+        "candidateId": "6f424b0c-1aec-5a5f-8e47-fd0a71fd102e",
+        "provisional": false,
+        "currentMilestone": "christy",
+        "enteredChristyAt": "2026-10-13T04:00:00+00:00",
+        "currentStageTitle": "Hello Christy"
+      },
+      {
+        "name": "Impact fixture a18",
+        "score": null,
+        "status": "Archived",
+        "verdict": "none",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-04T04:00:00+00:00",
+        "candidateId": "f9c229ed-3a4e-2ac2-50c2-1e2b310ab5d4",
+        "provisional": false,
+        "currentMilestone": "archived",
+        "enteredChristyAt": "2026-10-03T04:00:00+00:00",
+        "currentStageTitle": "Archived"
+      },
+      {
+        "name": "Impact fixture a11",
+        "score": 70,
+        "status": "Active",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": "2026-10-04T04:00:00+00:00",
+        "candidateId": "3177a5c6-87c4-ff42-627c-04957481af6f",
+        "provisional": false,
+        "currentMilestone": null,
+        "enteredChristyAt": "2026-10-02T04:00:00+00:00",
+        "currentStageTitle": "Other team screen"
+      },
+      {
+        "name": "Impact fixture a3",
+        "score": 70,
+        "status": "Active",
+        "verdict": "select",
+        "roleTitle": "Sales Program Advisor",
+        "lastMoveAt": null,
+        "candidateId": "78f69af1-ceff-1e16-05bf-53d01a589c08",
+        "provisional": true,
+        "currentMilestone": "christy",
+        "enteredChristyAt": "2026-10-20T04:00:00+00:00",
+        "currentStageTitle": "Hello Christy"
+      },
+      {
+        "name": "Impact fixture c3",
+        "score": null,
+        "status": null,
+        "verdict": "none",
+        "roleTitle": "Browser Screen Role",
+        "lastMoveAt": null,
+        "candidateId": "093637ee-381f-4dbe-94b1-b21bbb72beb4",
+        "provisional": false,
+        "currentMilestone": null,
+        "enteredChristyAt": "2026-10-11T07:00:00+00:00",
+        "currentStageTitle": null
+      },
+      {
+        "name": "Impact fixture c4",
+        "score": null,
+        "status": null,
+        "verdict": "none",
+        "roleTitle": "Browser Screen Role",
+        "lastMoveAt": null,
+        "candidateId": "7dbeb6c7-b2c3-deff-4913-78ae05fad784",
+        "provisional": false,
+        "currentMilestone": null,
+        "enteredChristyAt": "2026-10-11T05:00:00+00:00",
+        "currentStageTitle": null
+      },
+      {
+        "name": "Impact fixture c2",
+        "score": null,
+        "status": null,
+        "verdict": "none",
+        "roleTitle": "Browser Screen Role",
+        "lastMoveAt": null,
+        "candidateId": "5847a2a7-67b6-17a6-16d2-f5357857b923",
+        "provisional": false,
+        "currentMilestone": null,
+        "enteredChristyAt": "2026-10-11T04:00:00+00:00",
+        "currentStageTitle": null
+      },
+      {
+        "name": "Impact fixture c1",
+        "score": 70,
+        "status": "Active",
+        "verdict": "select",
+        "roleTitle": "Browser Screen Role",
+        "lastMoveAt": null,
+        "candidateId": "6100e4dd-4be2-54dd-8587-4e2c1f1201f8",
+        "provisional": false,
+        "currentMilestone": "christy",
+        "enteredChristyAt": "2026-10-10T04:00:00+00:00",
+        "currentStageTitle": "Hello Christy"
+      }
+    ],
+    "total": 9,
+    "hidden": 13,
+    "status": "ok",
+    "pageSize": 50
+  },
+  "mappingSettings": {
+    "mappings": [
+      {
+        "id": "4187d044-6bf3-585e-ecca-d83ddbd9ff47",
+        "label": null,
+        "archived": false,
+        "excluded": true,
+        "inImpact": false,
+        "roleTitle": "Staff Test Role"
+      },
+      {
+        "id": "88ac2ae6-2c02-b8fb-1529-1bfdf0b00a4d",
+        "label": null,
+        "archived": true,
+        "excluded": false,
+        "inImpact": true,
+        "roleTitle": "Archived Kept Role"
+      },
+      {
+        "id": "a588c8cd-1bd8-a40f-d109-1ac907ea9412",
+        "label": null,
+        "archived": false,
+        "excluded": null,
+        "inImpact": true,
+        "roleTitle": "Sales Program Advisor"
+      },
+      {
+        "id": "b22ebac3-b082-dc4f-ccfd-cfccf6eb9bb6",
+        "label": null,
+        "archived": false,
+        "excluded": null,
+        "inImpact": true,
+        "roleTitle": "Data Analyst"
+      },
+      {
+        "id": "be4d90b0-9b83-37a2-1090-a341ef1d39e5",
+        "label": null,
+        "archived": true,
+        "excluded": null,
+        "inImpact": false,
+        "roleTitle": "Archived Old Role"
+      },
+      {
+        "id": "fb448b8c-bc67-331a-cb97-fc06f8d369f8",
+        "label": null,
+        "archived": false,
+        "excluded": null,
+        "inImpact": true,
+        "roleTitle": "Browser Screen Role"
+      }
+    ],
+    "truncated": false
+  },
+  "setExclusion": {
+    "status": "ok",
+    "archived": false,
+    "excluded": true,
+    "in_impact": false,
+    "excluded_from": null
+  }
+}

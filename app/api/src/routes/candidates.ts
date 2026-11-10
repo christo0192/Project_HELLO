@@ -16,6 +16,7 @@ import { phoneAppointmentCancelSchema } from '../schemas/phone-api.js';
 import { idParamSchema, uuidSchema } from '../schemas/common.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import { candidateScope } from '../lib/candidate-scope.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
 import { loadCandidatePhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
 import { attemptConsentStage, loadLegConsentFacts, NO_LEG_CONSENT_FACTS } from '../lib/attempt-consent-stage.js';
@@ -1927,15 +1928,17 @@ candidatesRouter.post(
 );
 
 // Candidate detail incl. latest assessment + session list — viewer and above.
-// Interviewer sees only own records; admin sees all.
+// Interviewer sees only own records; admin sees all. The rule lives in
+// lib/candidate-scope.ts, which the business-impact list follows too (D-M031-5).
 candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdParamSchema), async (req, res) => {
   let q = supabase
     .from('candidates')
     .select('*')
     .eq('id', req.params.id);
 
-  if (req.authUser?.appRole === 'interviewer') {
-    q = q.eq('owner_id', req.authUser.id);
+  const scope = candidateScope(req.authUser);
+  if (scope.kind === 'owner') {
+    q = q.eq('owner_id', scope.ownerId);
   }
 
   const { data: candidate, error } = await q.single();

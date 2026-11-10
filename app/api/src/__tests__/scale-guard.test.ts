@@ -859,6 +859,11 @@ const NOT_DRIVEN: Record<string, string> = {
   '/api/dsar/legal-holds/:holdId': ONE_RECORD,
   '/api/dsar/legal-holds/check': ONE_RECORD,
   '/api/health': NO_DB_LIST,
+  // M031 S5: each is ONE database function call (0140) that aggregates or pages in Postgres; no
+  // id list is read into the API and no `.in()` is sent. The list answers at most 100 rows a page.
+  '/api/impact/candidates': CLIENT_PAGED,
+  '/api/impact/exclusions': 'grows with Ashby mappings (configuration), capped at 500 with an explicit truncated flag',
+  '/api/impact/summary': 'one SQL function aggregates in the database and answers counts only; no id-list read',
   '/api/integrations/ashby/mission-control/access-check':
     'at most 51 enabled mappings and one link, then at most 24 live Ashby reads under one deadline (5 job plans, 5 stage lists, one history page per application)',
   '/api/integrations/ashby/mission-control/health': COUNTS_ONLY,
@@ -866,6 +871,8 @@ const NOT_DRIVEN: Record<string, string> = {
   '/api/integrations/ashby/mission-control/jobs/:externalJobId/feedback-form': ASHBY_READ,
   '/api/integrations/ashby/mission-control/jobs/:externalJobId/stages': ASHBY_READ,
   '/api/integrations/ashby/mission-control/mappings/:id/scorecard-binding': ONE_RECORD,
+  '/api/integrations/ashby/mission-control/progress/status':
+    'one RPC (ashby_progress_overview) answering counts by status and code, and the last ten runs; no row list',
   '/api/integrations/ashby/mission-control/stage-catalog':
     'at most 51 enabled mappings, then the catalogue rows of their interview plans (stages, not candidates), capped at 501 with an explicit truncated flag',
   '/api/integrations/ashby/review/:applicationLinkId': ONE_CANDIDATE,

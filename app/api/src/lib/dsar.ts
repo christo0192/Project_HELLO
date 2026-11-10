@@ -722,6 +722,42 @@ export async function deleteDSAR(
   }
   deletedEntities.push(`ashby_link_terminated:${(terminatedLinks ?? []).length}`);
 
+  // List EVERY Ashby link of the person, live or already terminal (M031, migration 0140). After the
+  // candidate delete nothing else marks a link that was already terminal as an erased person's: it
+  // keeps its own terminal_reason, `candidate_id` is set to null and the request row goes with the
+  // candidate (ON DELETE CASCADE). The business-impact read model leaves a listed link out of every
+  // figure and list. The function writes only that list, and lists only while this person has a
+  // deletion request. Like the step above, a failure or refusal returns BEFORE the candidate delete,
+  // with the request in progress and a failure audit, until a retry succeeds (the list is idempotent).
+  const { data: listedLinks, error: listErr } = await client.rpc('mark_ashby_application_links_erased', {
+    p_candidate_id: candidateId,
+  });
+  const listAnswer = listedLinks as { status?: unknown; listed?: unknown } | null;
+  if (listErr || listAnswer?.status !== 'ok') {
+    const code = listErr ? 'ashby_erasure_list_error' : 'ashby_erasure_list_refused';
+    await client
+      .from('data_subject_requests')
+      .update({ request_status: 'in_progress', notes: `Ashby erasure list incomplete (${code})` })
+      .eq('id', dsarId);
+    await recordGovernanceAudit({
+      action: 'data_deleted',
+      actorId,
+      entityType: 'candidate',
+      entityId: candidateId,
+      details: { dsar_id: dsarId, stage: 'ashby_erasure_list', code },
+      outcome: 'failure',
+      correlationId: corrId,
+    }, clientOverride);
+    return {
+      success: false,
+      deletedEntities,
+      blockedByLegalHolds: [],
+      auditEntryId: null,
+    };
+  }
+  const listedCount = typeof listAnswer.listed === 'number' ? listAnswer.listed : 0;
+  deletedEntities.push(`ashby_link_erasure_listed:${listedCount}`);
+
   // Finally, delete the candidate
   const { error: candidateErr } = await client
     .from('candidates')

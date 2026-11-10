@@ -769,7 +769,14 @@ describe('OpenAPI document integrity', () => {
     // enabled plans' stages and their milestones), POST .../stage-catalog/refresh (re-read the
     // plans from Ashby; never deletes) and PATCH .../stage-catalog/{stageId} (label one stage).
     // 177 + 3 = 180.
-    expect(Object.keys(paths).length).toBe(180);
+    // M031 S3 adds TWO admin paths for the Ashby progress worker: GET .../progress/status (the
+    // switch and counts only) and POST .../progress/backfill (a dry run's counts, or every link
+    // marked due for the worker; the route itself never calls Ashby). 180 + 2 = 182.
+    // M031 S5 adds FOUR business-impact paths: GET /api/impact/summary (the page's aggregates,
+    // interviewer+), GET /api/impact/candidates (the applications behind one figure, scoped like
+    // the candidate page), GET /api/impact/exclusions and PUT /api/impact/exclusions/{mappingId}
+    // (the admin's per-mapping switch). 182 + 4 = 186.
+    expect(Object.keys(paths).length).toBe(186);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -895,7 +902,14 @@ describe('OpenAPI document integrity', () => {
     //   one catalogue row, the list response, one refresh failure, the refresh response, and the
     //   label request and response. Every object one is additionalProperties:false, and none can
     //   carry a staff id or candidate data. 273 + 7 = 280.
-    expect(Object.keys(schemas).length).toBe(280);
+    // M031 S3 adds SEVEN for the progress worker: the worker's switch and pace, a count by code,
+    //   one run, the open backfill, the status response, and the backfill request and response.
+    //   Every one is additionalProperties:false, and none can carry an id or a name. 280 + 7 = 287.
+    // M031 S5 adds NINE for the business-impact contract: the error body, the shares, one pipeline
+    //   step, the summary, one candidate row, the list, the switch list, and the switch request and
+    //   response. Every one is additionalProperties:false, and a candidate row carries the contract's
+    //   eleven fields and no email, phone or Ashby id. 287 + 9 = 296.
+    expect(Object.keys(schemas).length).toBe(296);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -2130,6 +2144,10 @@ describe('live handler shapes match documented schemas', () => {
       candidates: ok([]),
       governance_audit: ok({ data: null, error: null }),
     });
+    // 0140: the erasure lists the person's Ashby links before the candidate row goes (fails closed otherwise).
+    mockRpc.mockImplementation((fn: string) => Promise.resolve(fn === 'mark_ashby_application_links_erased'
+      ? { data: { status: 'ok', listed: 0, added: 0 }, error: null }
+      : { data: null, error: { message: 'unknown rpc' } }));
     const app = createContractApp();
     const res = await request(app)
       .post(`/api/dsar/${UUID_3}/delete`)

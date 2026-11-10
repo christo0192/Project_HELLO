@@ -17,6 +17,7 @@ import { consentRouter } from './routes/consent.js';
 import { cspReportRouter } from './routes/csp.js';
 import { adminRouter } from './routes/admin.js';
 import { funnelRouter } from './routes/funnel.js';
+import { impactRouter } from './routes/impact.js';
 import { statusRouter } from './routes/status.js';
 import { meRouter } from './routes/me.js';
 import { notesRouter } from './routes/notes.js';
@@ -456,6 +457,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   // recordings-health precedent above). A throttled caller gets a plain 429,
   // which the client contract must NOT read as degraded.
   app.use('/api/phone', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'phone:', useUserKey: true }));
+  // Business impact (M031): interviewer+ aggregates and the candidate list behind them,
+  // admin switches. Each is one database function call; the default bucket.
+  app.use('/api/impact', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'impact:', useUserKey: true }));
 
   // Public: health endpoint (no auth). Bounded — `{ ok: true }` only, so
   // no model/provider/internal dependency leaks to unauthenticated callers.
@@ -505,6 +509,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   // Recruiter-facing funnel KPIs. Same aggregation as the admin route, gated
   // at interviewer+ inside the router; the admin boundary stays absolute.
   app.use('/api/funnel', funnelRouter);
+  // Business impact (M031 S5): the read model in 0140. Each route states its own gate
+  // (interviewer+ for the page, admin for the per-mapping switch) inside the router.
+  app.use('/api/impact', impactRouter);
   app.use('/api/status', statusRouter);
   app.use('/api/me', meRouter);
   app.use('/api/notes', notesRouter);

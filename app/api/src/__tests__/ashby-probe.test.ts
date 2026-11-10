@@ -752,6 +752,9 @@ describe('probe module has no write capability', () => {
       'probeJobDirectory',
       'probeJobFeedbackForms',
       'probeJobStages',
+      // M031 S3: the shared display-title sanitizer, applied by the progress
+      // worker to history-row stage titles. A pure string function; it reads nothing.
+      'sanitizeTitle',
     ]);
   });
 });

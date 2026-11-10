@@ -392,6 +392,13 @@ export interface AuditOptions {
   metadata?: Record<string, unknown>;
   /** Override to skip redaction (e.g., already-sanitized data). */
   skipRedact?: boolean;
+  /**
+   * Make this one entry fail-closed although its event is informational: a read
+   * that hands out candidate names (the business-impact list, M031) must not
+   * answer if its audit row could not be written. It can only tighten: an event
+   * that is already fail-closed stays so.
+   */
+  failClosed?: boolean;
 }
 
 /**
@@ -430,7 +437,7 @@ export async function recordAudit(
     sourceIp: minimizeIp(req.ip ?? req.socket.remoteAddress),
   };
 
-  const isFailClosed = FAIL_CLOSED_EVENTS.has(event);
+  const isFailClosed = FAIL_CLOSED_EVENTS.has(event) || opts.failClosed === true;
 
   try {
     await _auditSink(entry);

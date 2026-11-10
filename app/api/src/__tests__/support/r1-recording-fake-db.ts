@@ -285,7 +285,19 @@ export function createRecordingFakeDb(initial: Tables = {}, options: { now?: () 
     },
     client: {
       from: (table: string) => query(table),
-      rpc: async () => ({ data: null, error: null }),
+      rpc: async (fn: string, args?: Record<string, unknown>) => {
+        // The DSAR erasure's Ashby step (migration 0140): lists every link of the person while they
+        // have a deletion request, and refuses otherwise. Every other function answers nothing.
+        if (fn === 'mark_ashby_application_links_erased') {
+          const person = args?.p_candidate_id;
+          const requested = (tables.data_subject_requests ?? []).some((r) => r.candidate_id === person
+            && r.request_type === 'delete' && ['pending', 'in_progress', 'fulfilled'].includes(String(r.request_status)));
+          if (!requested) return { data: { status: 'no_erasure_request' }, error: null };
+          const listed = (tables.ashby_application_links ?? []).filter((l) => l.candidate_id === person).length;
+          return { data: { status: 'ok', listed, added: listed }, error: null };
+        }
+        return { data: null, error: null };
+      },
     },
   };
 }

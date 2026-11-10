@@ -404,6 +404,8 @@ timestamps. None holds a name, email, phone, resume, offer amount, custom field,
 member, Ashby staff id (`actorId`) or text typed about a candidate. Progress and intervals
 follow their `ashby_application_links` row on delete (`ON DELETE CASCADE`). A DSAR erasure
 terminates the link rather than deleting it, and these rows carry nothing personal to erase.
+From 0140 the erasure also lists every link of the person in `ashby_erased_application_links`,
+and the business-impact read model leaves those applications out.
 
 #### `screening_v2.ashby_stage_catalog`
 
@@ -460,8 +462,77 @@ terminates the link rather than deleting it, and these rows carry nothing person
 | `id` (PK) | Public | Opaque UUID |
 | `started_at`, `finished_at` | Public | Timestamps |
 | `checked`, `changed` | Public | Counts |
-| `errors_by_code` | Internal | Failures counted by sanitized code, bounded at 2 KB; no ids |
+| `errors_by_code` | Internal | Failures counted by sanitized code, bounded at 2 KB; no ids. The worker (0139) also keeps two counts here that are not failures: `deferred` (rows handed back unread) and `scanner_paused` (passes skipped for the resume scanner) |
 | `mode` | Internal | `sweep` or `backfill` |
+
+#### Written by the progress worker (0139, M031 S3)
+
+`0139_ashby_progress_worker.sql` adds no table and no column: its six service-role functions fill
+the five tables above (`docs/runbooks/ashby-progress-worker.md`). What they store is what the
+classification above already covers, copied by name off `application.info` and
+`application.listHistory`: a history row's actor is kept only as `moved_by_person`, and an archive
+reason only as Ashby's catalogue entry. One rule, `ashby_progress_covered_links()`, decides which
+links are read: a link a data-subject erasure ended, a link that was already ended when its
+candidate was erased (ended, with no candidate left), and a link whose candidate has a restriction
+or erasure request are never read. The one row written elsewhere is the backfill's
+`audit_events` row (`resource_update`, target `ashby_progress/backfill`): the admin as actor and
+counts only.
+
+### Business impact read model (0140, M031)
+
+`0140_ashby_business_impact.sql` adds two tables, one view and six functions for the
+business-impact page (`/impact`, API `GET /api/impact/summary` and `/candidates`). All are
+service-role only (RLS on, no policy, no browser grant; the view is `security_invoker`).
+Nothing personal is stored.
+
+Erased subjects and candidates with a pending, in-progress or fulfilled restriction or
+erasure request are left out of every figure and list. An erased subject's application is
+recognised by one of three marks:
+- the erasure list (`ashby_erased_application_links`, below). A DSAR delete lists every link
+  of the person, live or already terminal, before it deletes the candidate. After the delete
+  nothing else marks a link that was already terminal: the request row goes with the
+  candidate, `candidate_id` becomes NULL, and the link keeps its own `terminal_reason`;
+- a link the erasure terminated (`terminal_reason = 'subject_erasure'`);
+- while the candidate row still exists, the request itself.
+
+An erasure fulfilled before 0140, of a link that was already terminal, left none of these
+marks and cannot be recognised. The 0139 progress worker does not read the erasure list, but
+it never reads such an application from Ashby again: besides the last two marks it skips every
+link already ended with no candidate left, which is what an erasure leaves on a link that was
+already terminal, before 0140 too.
+
+#### `screening_v2.ashby_impact_exclusions`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `job_mapping_id` (PK, FK `ashby_job_mappings` ON DELETE CASCADE) | Public | Opaque UUID of the mapping the switch is for |
+| `excluded` | Internal | true = left out of the page (staff or test applications), false = counted even if archived, NULL = the default (archived = left out) |
+| `created_at`, `updated_at` | Public | Timestamps. Who set the switch is in its `audit_events` row (`config_changed`), never here |
+
+#### `screening_v2.ashby_erased_application_links`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `application_link_id` (PK, FK `ashby_application_links` ON DELETE CASCADE) | Public | Opaque UUID of an Ashby application link of a person a DSAR delete erased. Written only by `mark_ashby_application_links_erased`, which `lib/dsar.ts` calls before it deletes the candidate, and only while that person has a deletion request. No candidate id is kept |
+| `created_at` | Public | When the erasure listed the link. Rows are never deleted; one goes only with its link |
+
+#### `screening_v2.v_ashby_application_impact` (view, no storage)
+
+One row per imported Ashby application: opaque link, mapping and candidate ids, the time it
+came in and its IST cohort day, Christy's called, answered and connected flags and times on
+that application, its own verdict code, provisional flag and score, and, from the 0138
+tables, its Ashby status, stage ids and titles, milestones reached with their first times,
+and Ashby's own archive-reason catalogue text and type. Internal. It carries no name, email,
+phone, resume, offer amount, Ashby actor id or text typed about a candidate.
+
+`impact_summary` answers aggregates only (counts, shares, days, stage titles, job labels).
+`impact_candidates` is the one place a candidate's **name** and **role title** leave the
+database (Confidential, from the existing candidate record), only for applications the
+caller's scope can open (the candidate page's rule: an interviewer their own candidates, a
+role that opens every candidate all; D-M031-5). Everything else is counted in `hidden` and
+never sent. While an appeal blocks decision use, the candidate's verdict is suppressed everywhere:
+no verdict or score on the row, and the application is left out of the verdict table and its
+lists (the view reads `decision_use_blocked_at` as a flag, no other candidate column).
 
 ## Classification summary
 

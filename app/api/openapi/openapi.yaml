@@ -4745,6 +4745,64 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/progress/status:
+    get:
+      tags: [ashby]
+      operationId: getAshbyProgressStatus
+      summary: The Ashby progress worker, as counts (M031)
+      description: Admin-only. Whether the `ashby-progress` worker is on (ASHBY_PROGRESS_ENABLED is 'true' and the Ashby runtime is active, as this process reads them), its pace and cadences, and counts only — coverage (covered links, how many have been read, never read, and links left out because a data-subject erasure ended them, they were already ended when their candidate was erased (ended, with no candidate left), or their candidate has a restriction or erasure request), rows due now, rows overdue by more than `staleAfterHours` (stale), applications Ashby no longer has (gone), applications by Ashby status, last read failures by sanitized code (`missing_endpoint_permission` when Ashby named it), stage intervals (open, and gone after an edit of the history in Ashby), stages known only from history, the open backfill, the last pass and the last ten runs (each with the rows it handed back unread and the passes skipped for a CPU-starved resume scanner just before it, apart from its failures), and the scanner pause over the last 24 hours. Reads HELLO's tables only and makes no Ashby call. No link, application, candidate, run or stage id, and no name. One audit row per request, counts only.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The worker's state and counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyProgressStatusResponse'
+        '403':
+          description: Insufficient role (admin required).
+        '500':
+          description: HELLO's progress tables could not be read. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/progress/backfill:
+    post:
+      tags: [ashby]
+      operationId: backfillAshbyProgress
+      summary: Preview, or start, a re-read of every imported Ashby application by the progress worker (M031)
+      description: Admin-only. The body must hold exactly `dryRun`, a boolean. `dryRun` true answers counts only and changes nothing — the covered links, how many were already read, how many a backfill reads (every covered link, each with its whole stage history again), the expected Ashby calls (two per application, application.info and one history page, and one per application Ashby no longer has) and the estimated minutes at the worker's pace (about 2 requests a second), plus the open backfill if one is running. `dryRun` false marks every covered link due now, newest first, for the worker, seeding a progress row for any link that has none, and opens one backfill run; start_ashby_progress_backfill writes that and its audit row (counts only, under the admin) in one transaction, so a 500 means nothing was marked. Idempotent — while a backfill is open a second call answers `already_running` and changes nothing; the backfill closes on its own once every covered link has been read since it began. With the worker off (ASHBY_PROGRESS_ENABLED not 'true', or the Ashby runtime off) nothing is marked and the answer is `worker_disabled`. The route itself never calls Ashby; the worker makes every read through the same code path as its sweeps. Never writes a link, candidate or assessment. No id and no name in the body.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AshbyProgressBackfillRequest'
+      responses:
+        '200':
+          description: The preview's counts, or what the backfill marked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyProgressBackfillResponse'
+        '400':
+          description: invalid_backfill_request (not exactly one boolean `dryRun`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '403':
+          description: Insufficient role (admin required).
+        '500':
+          description: HELLO's progress tables could not be read, or the backfill could not be opened. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
   /api/integrations/ashby/mission-control/jobs/{externalJobId}/feedback-form:
     get:
       tags: [ashby]
@@ -6775,6 +6833,252 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+
+  /api/impact/summary:
+    get:
+      tags: [impact]
+      operationId: getBusinessImpactSummary
+      summary: The business-impact page's aggregates — what happened in Ashby to the applications Christy screened (M031). Interviewer and above.
+      description: One row per Ashby application HELLO imported, on mappings an admin has not left out (an archived mapping is out unless an admin keeps it; erased and restricted subjects are never counted), cohorted by the IST day it entered the Christy stage. The steps nest — each counts only applications that reached the step before — so no share is over 1. `connected` is consent given; `sub` under it is call answered (voicemail included); a browser_primary mapping's called and connected are its browser session starting and the consent bound to that session. `scored` is a Select, Borderline or Reject verdict (provisional included) of the newest non-R1 assessment on that application's OWN sessions, never the same person's other applications. The verdict table counts the connected applications by verdict, less any whose appeal blocks decision use (their verdict is suppressed everywhere; they still count in the pipeline). `decided` is leaving the Christy stage; `moved_forward` is reaching a later stage of the plan; `r1` to `hired` are the labelled milestones or later; Archived-type and Lead-type stages never count as reached. While ASHBY_PROGRESS_ENABLED is off, or none of the window's applications has been read from Ashby (`meta.coverage.checked` 0), every Ashby-side figure (decided onward, still and dropped, the verdict cells, leaves, Ashby timings and shares) is null, never 0. Timings give the median and p90 in days only from n 5 (`meta.minTimingN`); n is always given. Counts, shares, days, opaque ids and stage titles only, no personal data. One audit row per request with the filter and counts. Computed live by the 0140 function impact_summary.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: First IST cohort day, YYYY-MM-DD. Default the Monday 11 weeks before this week's (the last 12 IST weeks).
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: false
+          description: Last IST cohort day, YYYY-MM-DD, not before `from`. Default today (IST).
+          schema:
+            type: string
+        - name: job
+          in: query
+          required: false
+          description: One counted ashby_job_mappings id. Default all.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The contract's summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactSummaryResponse'
+        '400':
+          description: invalid_filter — an unknown parameter, a date that is not a real day, a window that runs backwards or over ten years, or a job that is not counted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: forbidden — below interviewer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '503':
+          description: impact_unavailable — the read model could not be read or answered something the contract cannot carry. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+  /api/impact/candidates:
+    get:
+      tags: [impact]
+      operationId: listBusinessImpactCandidates
+      summary: The applications behind one business-impact figure, scoped exactly like the candidate page (M031 D-M031-3, D-M031-5). Interviewer and above.
+      description: Exactly one selector — `step` (a pipeline step; `dropped=true` for the ones that stopped there and Ashby archived, `reachedOnly=true` is the default), or `verdict` with `outcome` (one cell of the verdict table), or `leaveStageId` (archived after that stage) — over the same window, job and nested rows as the summary, so total + hidden equals the figure. VISIBILITY follows GET /api/candidates/{id} exactly (lib/candidate-scope.ts) — an interviewer is listed only the candidates whose owner_id is theirs; a role that opens every candidate is listed all, including an application with no candidate record yet (candidateId and name null). What the viewer cannot open is never returned, not even as an id, and is counted in `hidden`; for an interviewer an application with no candidate record counts there too. While an appeal blocks decision use the candidate's verdict is suppressed everywhere, as on the candidate list — the row has no verdict, score or provisional mark, and the application is left out of the verdict table and its lists (neither listed nor hidden), so no list can be subtracted from its cell. A row carries only the candidate record's name and role, Christy's verdict and score, and the Ashby stage and status — no email, phone, Ashby id or archive free text. Paged in a total order (newest Ashby move first, then newest came in); a page past the end is empty. One audit row per request (who, the filter, the counts; never a name), fail-closed — without it no name is sent (503).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: step
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [came_in, called, connected, scored, decided, moved_forward, r1, r2, offer, hired]
+        - name: verdict
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [select, borderline, reject, held, none]
+        - name: outcome
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [still_christy, archived_christy, moved_forward, r1, r2, offer, hired, active]
+        - name: leaveStageId
+          in: query
+          required: false
+          description: Opaque Ashby stage id from `leaves[].stageId`.
+          schema:
+            type: string
+        - name: reachedOnly
+          in: query
+          required: false
+          description: true (the default) lists the applications that reached the step. Only with `step`.
+          schema:
+            type: string
+            enum: ['true', 'false']
+        - name: dropped
+          in: query
+          required: false
+          description: true lists the applications that stopped at the step and Ashby archived. Only with `step`, never with Hired.
+          schema:
+            type: string
+            enum: ['true', 'false']
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: job
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: page
+          in: query
+          required: false
+          description: 1-based. Default 1.
+          schema:
+            type: integer
+        - name: pageSize
+          in: query
+          required: false
+          description: 1 to 100. Default 50.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: One page of the visible applications, and how many are hidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactCandidatesResponse'
+        '400':
+          description: invalid_filter — no selector or two, a verdict without an outcome, dropped without a step or with Hired, an unknown parameter or value, a bad page, or a window or job the summary would refuse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: forbidden — below interviewer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '503':
+          description: impact_unavailable — the list or its audit row could not be read or written; no row is sent. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+  /api/impact/exclusions:
+    get:
+      tags: [impact]
+      operationId: listBusinessImpactExclusions
+      summary: Every Ashby mapping and whether the business-impact page counts it (M031). Admin only.
+      description: Newest first, at most 500 (`truncated` says when there are more). `excluded` is the admin's switch — true leaves the mapping out, false counts it even archived, null is the default (an archived mapping is left out, every other counted). Configuration only; no candidate data. One audit row per request, counts only.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The mappings and their switches.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactExclusionsResponse'
+        '403':
+          description: forbidden — admin required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '503':
+          description: impact_unavailable. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+  /api/impact/exclusions/{mappingId}:
+    put:
+      tags: [impact]
+      operationId: setBusinessImpactExclusion
+      summary: Leave one Ashby mapping out of the business-impact page, keep an archived one in, or go back to the default (M031). Admin only.
+      description: The body holds exactly `excluded` — true (staff or test applications), false (count it even if archived) or null (the default). The switch and its audit row (config_changed, the admin as actor, before and after) are one transaction in the 0140 function set_ashby_impact_exclusion, so a 503 means nothing was written; the request-level trail after it never fails a saved switch. Writes only ashby_impact_exclusions; no mapping, link, candidate or assessment is touched.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: mappingId
+          in: path
+          required: true
+          description: An ashby_job_mappings id.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImpactExclusionUpdateRequest'
+      responses:
+        '200':
+          description: The switch as now stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactExclusionUpdateResponse'
+        '400':
+          description: invalid_filter — not a mapping id, or a body that is not exactly `excluded`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '403':
+          description: forbidden — admin required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '404':
+          description: not_found — no such Ashby mapping.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
+        '503':
+          description: impact_unavailable — the switch was not written. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImpactError'
 
   /api/admin/funnel/summary:
     get:
@@ -9453,6 +9757,716 @@ components:
           type: boolean
         stage:
           $ref: '#/components/schemas/AshbyStageCatalogStage'
+      additionalProperties: false
+
+    AshbyProgressWorker:
+      type: object
+      description: The progress worker's switch and pace, as this API process reads its environment.
+      required: [enabled, runtimeActive, running, batchSize, passDeadlineMs, minCallIntervalMs, cadenceHours]
+      properties:
+        enabled:
+          description: ASHBY_PROGRESS_ENABLED is 'true'.
+          type: boolean
+        runtimeActive:
+          description: The Ashby runtime that runs the worker is on (integration, webhook secret, runtime flag and API key).
+          type: boolean
+        running:
+          description: enabled and runtimeActive.
+          type: boolean
+        batchSize:
+          description: Applications one pass claims.
+          type: integer
+        passDeadlineMs:
+          type: integer
+        minCallIntervalMs:
+          description: Gap between two Ashby calls of one pass (500 is about 2 a second).
+          type: integer
+        cadenceHours:
+          type: object
+          description: activeRecent = Active and moved in the last 14 days; active = any other Active; terminal = Hired or Archived within 90 days; terminalOld = longer ago; historyMaxAge = the stage history is re-read on a check at least this often.
+          required: [activeRecent, active, terminal, terminalOld, historyMaxAge]
+          properties:
+            activeRecent:
+              type: integer
+            active:
+              type: integer
+            terminal:
+              type: integer
+            terminalOld:
+              type: integer
+            historyMaxAge:
+              type: integer
+          additionalProperties: false
+      additionalProperties: false
+
+    AshbyProgressCodeCount:
+      type: object
+      description: A count under one sanitized code. Never a provider message.
+      required: [code, count]
+      properties:
+        code:
+          type: string
+        count:
+          type: integer
+      additionalProperties: false
+
+    AshbyProgressRun:
+      type: object
+      description: One worker pass (sweep) or backfill, counts and codes only. A backfill's counts are those of the passes since it began, filled in when it closes.
+      required: [mode, startedAt, finishedAt, checked, changed, deferred, scannerPaused, errors]
+      properties:
+        mode:
+          type: string
+          enum: [sweep, backfill]
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          description: Null while a backfill is open.
+          type: string
+          format: date-time
+          nullable: true
+        checked:
+          description: Applications whose read was recorded (read, failed or gone).
+          type: integer
+        changed:
+          description: Recorded reads that changed something the impact page counts.
+          type: integer
+        deferred:
+          description: Applications the pass handed back unread, their claim refunded — its own deadline cut them short, or a rate limit held them. Not a failure.
+          type: integer
+        scannerPaused:
+          description: Passes this machine skipped just before this one because the resume scanner was short of CPU (scanner_timeout or scanner_busy deferrals). After five in a row a pass of one application runs anyway. Not a failure.
+          type: integer
+        errors:
+          description: Failures by sanitized code, largest first. deferred and scannerPaused are not among them.
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyProgressCodeCount'
+      additionalProperties: false
+
+    AshbyProgressOpenBackfill:
+      type: object
+      description: The backfill still running.
+      required: [startedAt, remaining]
+      properties:
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        remaining:
+          description: Covered links not read since it began.
+          type: integer
+      additionalProperties: false
+
+    AshbyProgressStatusResponse:
+      type: object
+      description: The progress worker and its tables, as counts only.
+      required: [ok, worker, coverage, due, byStatus, byError, intervals, historyStages, openBackfill, lastPass, recentRuns, scannerPause]
+      properties:
+        ok:
+          type: boolean
+        worker:
+          $ref: '#/components/schemas/AshbyProgressWorker'
+        coverage:
+          type: object
+          description: checked of links have been read at least once.
+          required: [links, checked, neverChecked, excluded]
+          properties:
+            links:
+              description: Imported Ashby applications the worker covers.
+              type: integer
+            checked:
+              type: integer
+            neverChecked:
+              type: integer
+            excluded:
+              description: Links never read again (a data-subject erasure ended them, they were already ended and their candidate is gone, or their candidate has a restriction or erasure request).
+              type: integer
+          additionalProperties: false
+        due:
+          type: object
+          required: [now, stale, gone, staleAfterHours]
+          properties:
+            now:
+              description: Rows due now (and links with no progress row yet).
+              type: integer
+            stale:
+              description: Rows overdue by more than staleAfterHours.
+              type: integer
+            gone:
+              description: Applications Ashby no longer has; not read again until a backfill.
+              type: integer
+            staleAfterHours:
+              type: integer
+          additionalProperties: false
+        byStatus:
+          type: object
+          description: Rows by the Ashby status last read; unknown = not read yet.
+          required: [Active, Hired, Archived, Lead, unknown]
+          properties:
+            Active:
+              type: integer
+            Hired:
+              type: integer
+            Archived:
+              type: integer
+            Lead:
+              type: integer
+            unknown:
+              type: integer
+          additionalProperties: false
+        byError:
+          description: Rows whose last read failed, by sanitized code, largest first.
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyProgressCodeCount'
+        intervals:
+          type: object
+          description: Stage-history rows kept. open = the current stage of an application; gone = rows Ashby stopped returning (history edited), kept and never deleted.
+          required: [total, open, gone]
+          properties:
+            total:
+              type: integer
+            open:
+              type: integer
+            gone:
+              type: integer
+          additionalProperties: false
+        historyStages:
+          description: Catalogue stages known only from a history row.
+          type: integer
+        openBackfill:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyProgressOpenBackfill'
+        lastPass:
+          description: The newest worker pass that recorded a run (it read, failed, handed rows back, or followed passes skipped for the scanner), or null.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyProgressRun'
+        recentRuns:
+          description: The last ten runs of either mode, newest first.
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyProgressRun'
+        scannerPause:
+          type: object
+          description: Passes skipped in the last 24 hours because the resume scanner was short of CPU, as the passes that ran after them recorded (a paused machine records at least every sixth tick), and when the newest of those ran. 0 and null when the worker has not paused.
+          required: [skippedPasses, lastAt]
+          properties:
+            skippedPasses:
+              type: integer
+            lastAt:
+              type: string
+              format: date-time
+              nullable: true
+          additionalProperties: false
+      additionalProperties: false
+
+    AshbyProgressBackfillRequest:
+      type: object
+      description: Exactly one key.
+      required: [dryRun]
+      properties:
+        dryRun:
+          description: true = counts only, nothing changes; false = mark every covered link due for the worker.
+          type: boolean
+      additionalProperties: false
+
+    AshbyProgressBackfillResponse:
+      type: object
+      description: A preview (dryRun true) or a backfill start (dryRun false). Counts only.
+      required: [ok, dryRun, worker, links, alreadyChecked, neverChecked, toCheck, expectedCalls, estimatedMinutes, requestsPerSecond]
+      properties:
+        ok:
+          type: boolean
+        dryRun:
+          type: boolean
+        state:
+          description: Present when dryRun is false. started = every covered link is due now; already_running = a backfill is open and nothing changed; worker_disabled = the worker is off and nothing was marked.
+          type: string
+          enum: [started, already_running, worker_disabled]
+        worker:
+          $ref: '#/components/schemas/AshbyProgressWorker'
+        links:
+          description: Covered links.
+          type: integer
+        alreadyChecked:
+          description: Covered links read at least once.
+          type: integer
+        neverChecked:
+          type: integer
+        toCheck:
+          description: Links a backfill reads (every covered link, each with its whole stage history again).
+          type: integer
+        expectedCalls:
+          description: Two Ashby calls per application (application.info and one history page; a backfill re-reads every history read before it began), one per application Ashby no longer has (application.info answers 404 again). A history longer than 100 rows takes a page more per 100. For a started backfill, those still to make.
+          type: integer
+        estimatedMinutes:
+          description: expectedCalls at the worker's pace (minCallIntervalMs), Ashby time only.
+          type: integer
+        requestsPerSecond:
+          type: number
+        openBackfill:
+          description: Present on a preview. The backfill already running, if any.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyProgressOpenBackfill'
+        startedAt:
+          description: Present when dryRun is false. When the open backfill began; null when the worker is off.
+          type: string
+          format: date-time
+          nullable: true
+        seeded:
+          description: Links given their first progress row by this call.
+          type: integer
+        marked:
+          description: Rows this call marked due.
+          type: integer
+        remaining:
+          description: Covered links the open backfill still has to read.
+          type: integer
+      additionalProperties: false
+
+    ImpactError:
+      type: object
+      description: A business-impact refusal (M031). Never a driver message.
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+          enum: [invalid_filter, forbidden, impact_unavailable, not_found]
+      additionalProperties: false
+
+    ImpactShares:
+      type: object
+      description: The share of a cohort's or a job's applications that reached each nested step, a fraction 0 to 1. The Ashby-side ones are null while Ashby stages are not read.
+      required: [connected, scored, moved_forward, r1, r2, offer, hired]
+      properties:
+        connected:
+          type: number
+          nullable: true
+        scored:
+          type: number
+          nullable: true
+        moved_forward:
+          type: number
+          nullable: true
+        r1:
+          type: number
+          nullable: true
+        r2:
+          type: number
+          nullable: true
+        offer:
+          type: number
+          nullable: true
+        hired:
+          type: number
+          nullable: true
+      additionalProperties: false
+
+    ImpactPipelineStep:
+      type: object
+      description: One nested step. reached never exceeds the step before; ofPrevious and ofCameIn are fractions 0 to 1, null where they do not apply. stillHere and droppedHere are the applications whose furthest step this is, still open in Ashby or archived there. Every Ashby-side figure is null while Ashby stages are not read; stillHere is null for decided, and both for hired.
+      required: [step, label, reached, ofPrevious, ofCameIn, stillHere, droppedHere]
+      properties:
+        step:
+          type: string
+          enum: [came_in, called, connected, scored, decided, moved_forward, r1, r2, offer, hired]
+        label:
+          type: string
+        reached:
+          type: integer
+          nullable: true
+        ofPrevious:
+          type: number
+          nullable: true
+        ofCameIn:
+          type: number
+          nullable: true
+        stillHere:
+          type: integer
+          nullable: true
+        droppedHere:
+          type: integer
+          nullable: true
+        sub:
+          type: object
+          description: Only on connected — Call answered (voicemail included), among the applications called.
+          required: [label, reached]
+          properties:
+            label:
+              type: string
+            reached:
+              type: integer
+              nullable: true
+          additionalProperties: false
+      additionalProperties: false
+
+    ImpactSummaryResponse:
+      type: object
+      description: The business-impact summary (M031 API-CONTRACT.md). Counts, shares, days, opaque ids and stage titles only.
+      required: [ok, meta, filters, pipeline, verdictOutcomes, leaves, timings, cohorts, byJob]
+      properties:
+        ok:
+          type: boolean
+        meta:
+          type: object
+          required: [generatedAt, timezone, progressEnabled, lastPassAt, coverage, staleRows, labelsConfigured, unlabelledStages, minTimingN]
+          properties:
+            generatedAt:
+              type: string
+              format: date-time
+            timezone:
+              type: string
+            progressEnabled:
+              description: ASHBY_PROGRESS_ENABLED on the API.
+              type: boolean
+            lastPassAt:
+              description: When the last Ashby progress pass finished.
+              type: string
+              format: date-time
+              nullable: true
+            coverage:
+              type: object
+              description: Of the window's applications, how many the progress worker has read from Ashby.
+              required: [checked, total]
+              properties:
+                checked:
+                  type: integer
+                total:
+                  type: integer
+              additionalProperties: false
+            staleRows:
+              description: The window's applications due a fresh read for more than a day.
+              type: integer
+            labelsConfigured:
+              description: Every counted mapping's plan has been read and no stage after the Christy stage is unlabelled.
+              type: boolean
+            unlabelledStages:
+              type: integer
+            minTimingN:
+              type: integer
+          additionalProperties: false
+        filters:
+          type: object
+          required: [from, to, job, jobs]
+          properties:
+            from:
+              type: string
+            to:
+              type: string
+            job:
+              type: string
+              format: uuid
+              nullable: true
+            jobs:
+              type: array
+              items:
+                type: object
+                required: [id, label]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  label:
+                    type: string
+                additionalProperties: false
+          additionalProperties: false
+        pipeline:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImpactPipelineStep'
+        verdictOutcomes:
+          type: object
+          required: [columns, rows]
+          properties:
+            columns:
+              type: array
+              items:
+                type: object
+                required: [key, label]
+                properties:
+                  key:
+                    type: string
+                    enum: [still_christy, archived_christy, moved_forward, r1, r2, offer, hired, active]
+                  label:
+                    type: string
+                additionalProperties: false
+            rows:
+              type: array
+              items:
+                type: object
+                description: The connected applications with this verdict; a null cell is not known, never 0.
+                required: [verdict, label, total, cells]
+                properties:
+                  verdict:
+                    type: string
+                    enum: [select, borderline, reject, held, none]
+                  label:
+                    type: string
+                  total:
+                    type: integer
+                  cells:
+                    type: object
+                    required: [still_christy, archived_christy, moved_forward, r1, r2, offer, hired, active]
+                    properties:
+                      still_christy:
+                        type: integer
+                        nullable: true
+                      archived_christy:
+                        type: integer
+                        nullable: true
+                      moved_forward:
+                        type: integer
+                        nullable: true
+                      r1:
+                        type: integer
+                        nullable: true
+                      r2:
+                        type: integer
+                        nullable: true
+                      offer:
+                        type: integer
+                        nullable: true
+                      hired:
+                        type: integer
+                        nullable: true
+                      active:
+                        type: integer
+                        nullable: true
+                    additionalProperties: false
+                additionalProperties: false
+          additionalProperties: false
+        leaves:
+          type: array
+          items:
+            type: object
+            description: Archived applications by the last stage before the Archived one. topReasons is Ashby's reason catalogue only, at most five.
+            required: [stageId, stageTitle, milestone, archived, byReasonType, topReasons]
+            properties:
+              stageId:
+                type: string
+              stageTitle:
+                type: string
+              milestone:
+                type: string
+                nullable: true
+              archived:
+                type: integer
+              byReasonType:
+                type: object
+                required: [rejected_by_org, rejected_by_candidate, other, none]
+                properties:
+                  rejected_by_org:
+                    type: integer
+                  rejected_by_candidate:
+                    type: integer
+                  other:
+                    type: integer
+                  none:
+                    type: integer
+                additionalProperties: false
+              topReasons:
+                type: array
+                items:
+                  type: object
+                  required: [text, count]
+                  properties:
+                    text:
+                      type: string
+                    count:
+                      type: integer
+                  additionalProperties: false
+            additionalProperties: false
+        timings:
+          type: array
+          items:
+            type: object
+            description: Completed steps only, in days. medianDays and p90Days are null under n 5; n is always given.
+            required: [key, label, medianDays, p90Days, n]
+            properties:
+              key:
+                type: string
+                enum: [entry_to_first_call, entry_to_verdict, verdict_to_decision, christy_to_r1, r1_to_r2, r2_to_offer, offer_to_hired]
+              label:
+                type: string
+              medianDays:
+                type: number
+                nullable: true
+              p90Days:
+                type: number
+                nullable: true
+              n:
+                type: integer
+            additionalProperties: false
+        cohorts:
+          type: array
+          items:
+            type: object
+            description: One IST week (Monday start). maturing marks a week younger than the usual time to hire (never under six weeks).
+            required: [weekStart, ageDays, maturing, cameIn, shares]
+            properties:
+              weekStart:
+                type: string
+              ageDays:
+                type: integer
+              maturing:
+                type: boolean
+              cameIn:
+                type: integer
+              shares:
+                $ref: '#/components/schemas/ImpactShares'
+            additionalProperties: false
+        byJob:
+          type: array
+          items:
+            type: object
+            required: [jobId, label, cameIn, shares]
+            properties:
+              jobId:
+                type: string
+                format: uuid
+              label:
+                type: string
+              cameIn:
+                type: integer
+              shares:
+                $ref: '#/components/schemas/ImpactShares'
+            additionalProperties: false
+      additionalProperties: false
+
+    ImpactCandidateRow:
+      type: object
+      description: One application behind a figure, as the candidate page would show it. candidateId and name are null only for an application with no candidate record yet, and only to a viewer who opens every candidate. verdict and score are null, and provisional false, while an appeal blocks decision use. No email, phone, Ashby id or archive free text.
+      required: [candidateId, name, roleTitle, verdict, score, provisional, currentStageTitle, currentMilestone, status, enteredChristyAt, lastMoveAt]
+      properties:
+        candidateId:
+          type: string
+          format: uuid
+          nullable: true
+        name:
+          type: string
+          nullable: true
+        roleTitle:
+          type: string
+          nullable: true
+        verdict:
+          type: string
+          nullable: true
+          enum: [select, borderline, reject, held, none]
+        score:
+          type: number
+          nullable: true
+        provisional:
+          type: boolean
+        currentStageTitle:
+          type: string
+          nullable: true
+        currentMilestone:
+          type: string
+          nullable: true
+        status:
+          type: string
+          nullable: true
+        enteredChristyAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastMoveAt:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+
+    ImpactCandidatesResponse:
+      type: object
+      description: total counts the rows this viewer is listed; hidden the applications behind the same figure they cannot open (never sent, not even as ids), so total + hidden is the figure (D-M031-5).
+      required: [ok, total, hidden, page, pageSize, rows]
+      properties:
+        ok:
+          type: boolean
+        total:
+          type: integer
+        hidden:
+          type: integer
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImpactCandidateRow'
+      additionalProperties: false
+
+    ImpactExclusionsResponse:
+      type: object
+      required: [ok, mappings, truncated]
+      properties:
+        ok:
+          type: boolean
+        mappings:
+          type: array
+          items:
+            type: object
+            required: [id, roleTitle, label, archived, excluded, inImpact]
+            properties:
+              id:
+                type: string
+                format: uuid
+              roleTitle:
+                type: string
+              label:
+                type: string
+                nullable: true
+              archived:
+                type: boolean
+              excluded:
+                description: The admin's switch; null = the default.
+                type: boolean
+                nullable: true
+              inImpact:
+                type: boolean
+            additionalProperties: false
+        truncated:
+          type: boolean
+      additionalProperties: false
+
+    ImpactExclusionUpdateRequest:
+      type: object
+      required: [excluded]
+      properties:
+        excluded:
+          description: true leaves the mapping out, false counts it even archived, null is the default.
+          type: boolean
+          nullable: true
+      additionalProperties: false
+
+    ImpactExclusionUpdateResponse:
+      type: object
+      required: [ok, mappingId, excluded, excludedFrom, archived, inImpact]
+      properties:
+        ok:
+          type: boolean
+        mappingId:
+          type: string
+          format: uuid
+        excluded:
+          type: boolean
+          nullable: true
+        excludedFrom:
+          type: boolean
+          nullable: true
+        archived:
+          type: boolean
+        inImpact:
+          type: boolean
       additionalProperties: false
 
     AshbyJob:

@@ -810,6 +810,18 @@ log '0122: PASS — R1 scorer assertions ran against migrations 0001..0122 in su
 env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-recordings.sh 2>&1 | tee -a "$RESULTS_FILE"
 
 # =====================================================================
+# 0140 business impact (M031 S5) — the read model's numbers and the list's
+# visibility on the complete chain, in one rolled-back transaction.
+# =====================================================================
+log '0140: business-impact view, summary, candidate list and switch assertions...'
+env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-ashby-impact.sh 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0140 business-impact assertions FAILED.'
+  exit 1
+fi
+log '0140: PASS — business-impact assertions ran against the complete migration chain in supabase-check.'
+
+# =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore
 # (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
 # sanctioned recovery path: the committed migration set can always be
