@@ -182,6 +182,34 @@ describe('Layout shell', () => {
     expect(pageTitleFor('/roles')).toBe('Agents');
   });
 
+  /*
+    Business impact (M031): interviewers and admins, the roles its page and
+    API serve (owner decision D-M031-3). Right after Dashboard, in Workspace.
+  */
+  it.each(['admin', 'interviewer'] as const)('offers Business impact to an %s, right after Dashboard', (role) => {
+    setAuth({ role });
+    renderLayout();
+    const workspace = screen.getByRole('group', { name: 'Workspace' });
+    const link = within(workspace).getByRole('link', { name: /^Business impact$/ });
+    expect(link).toHaveAttribute('href', '/impact');
+    expect(link.querySelector('svg')).toHaveAttribute('aria-hidden', 'true');
+    const names = within(workspace).getAllByRole('link').map((item) => item.textContent);
+    expect(names.slice(0, 2)).toEqual(['Dashboard', 'Business impact']);
+  });
+
+  it('does not offer Business impact to a viewer, whose page would only say no', () => {
+    setAuth({ role: 'viewer' });
+    renderLayout();
+    expect(screen.queryByRole('link', { name: /Business impact/ })).not.toBeInTheDocument();
+  });
+
+  it('marks Business impact current on its route and names the page there', () => {
+    renderLayout('/impact?weeks=4');
+    expect(screen.getByRole('link', { name: /^Business impact$/ })).toHaveAttribute('aria-current', 'page');
+    expect(pageTitleFor('/impact')).toBe('Business impact');
+    expect(document.title).toBe('Business impact · HELLO');
+  });
+
   // Exact names throughout, so the Ashby link ("Ashby Live Jobs", formerly
   // "Ashby Mission Control") and Mission Control can never be confused.
   const MISSION_CONTROL = { name: /^Mission Control$/ };
@@ -380,8 +408,8 @@ describe('the R1 interviews item', () => {
     const link = await screen.findByRole('link', { name: 'R1 interviews' });
     expect(link).toHaveAttribute('href', '/interviews');
     const nav = screen.getByRole('navigation', { name: 'Main navigation' });
-    expect(within(nav).getAllByRole('link').map((item) => item.textContent).slice(0, 4)).toEqual([
-      'Dashboard', 'Candidates', 'R1 interviews', 'Agents',
+    expect(within(nav).getAllByRole('link').map((item) => item.textContent).slice(0, 5)).toEqual([
+      'Dashboard', 'Business impact', 'Candidates', 'R1 interviews', 'Agents',
     ]);
   });
 

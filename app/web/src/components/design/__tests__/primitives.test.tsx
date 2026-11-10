@@ -73,6 +73,44 @@ describe('Table primitives', () => {
     expect(table.parentElement).toHaveClass('overflow-x-auto');
     await expect(table).toHaveNoViolations();
   });
+
+  /** jsdom has no layout: give every element the widths a narrow screen would. */
+  function sideways(scrollWidth: number, clientWidth: number) {
+    vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(scrollWidth);
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(clientWidth);
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+  }
+
+  const wide = () => (
+    <Table caption="Cohorts" focusWhenScrolling>
+      <TBody>
+        <Tr>
+          <Td>Week</Td>
+        </Tr>
+      </TBody>
+    </Table>
+  );
+
+  it('becomes a named, focusable region while it scrolls sideways, so a keyboard can scroll it', async () => {
+    sideways(900, 390);
+    render(wide());
+    const region = screen.getByRole('region', { name: 'Cohorts' });
+    expect(region).toHaveAttribute('tabindex', '0');
+    expect(region).toContainElement(screen.getByRole('table', { name: 'Cohorts' }));
+  });
+
+  it('adds no tab stop while it fits', () => {
+    sideways(600, 600);
+    render(wide());
+    expect(screen.queryByRole('region')).toBeNull();
+    expect(screen.getByRole('table').parentElement).not.toHaveAttribute('tabindex');
+  });
 });
 
 describe('PageHeader', () => {

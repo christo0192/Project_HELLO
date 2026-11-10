@@ -83,6 +83,10 @@ export const API_ERROR_COPY: Readonly<Record<string, string>> = {
   // Phone reads a page outside the calendar can hit (the Dashboard's schedule).
   phone_read_error: 'Phone data could not be read just now. Try again in a moment.',
   phone_screening_disabled: 'Phone screening is turned off.',
+
+  // The Business impact reads (M031 API contract).
+  impact_unavailable: 'These figures are not available just now. Try again in a moment.',
+  invalid_filter: 'These filters were not accepted. Reset them and try again.',
 };
 
 /**

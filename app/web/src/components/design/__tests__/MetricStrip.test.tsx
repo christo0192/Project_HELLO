@@ -70,6 +70,30 @@ describe('MetricStrip', () => {
     expect(document.querySelector('dl')).toBeNull();
   });
 
+  it('turns a figure that opens something on this page into a button, with no paragraph inside it', () => {
+    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
+    const opened: string[] = [];
+    render(
+      <MetricStrip
+        label="Pipeline"
+        items={[
+          { label: 'Came in', value: '415', onActivate: (button) => opened.push(button.textContent ?? ''), ariaLabel: 'Came in: 415. Show these applications' },
+          { label: 'Hired', value: '—' },
+        ]}
+      />,
+    );
+    const button = screen.getByRole('button', { name: 'Came in: 415. Show these applications' });
+    // Phrasing content only: a `<p>` may not sit inside a `<button>`.
+    expect(button.querySelector('p, div, dt, dd')).toBeNull();
+    button.click();
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toContain('415');
+    // A figure with nothing behind it stays a plain cell in the same list.
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+    expect(screen.getAllByRole('button')).toHaveLength(1);
+    expect(document.querySelector('dl')).toBeNull();
+  });
+
   it('prints a plain figure in ink, and a figure with a meaning in its family text shade', () => {
     render(
       <MetricStrip

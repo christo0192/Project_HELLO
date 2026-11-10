@@ -68,6 +68,7 @@ import type {
 import type { AshbyStageCatalogStage } from '../../src/lib/ashby-stages';
 import type { R1QueueRound, R1RecordingPlayback, R1ReviewResponse, R1ReviewTurn, R1Round } from '../../src/lib/r1-types';
 import { FROZEN_NOW_MS } from './env';
+import { defaultImpactState, type ImpactFixtureState } from './impact';
 
 /* ── Time + id helpers ────────────────────────────────────────────────── */
 
@@ -1830,6 +1831,12 @@ export interface Dataset {
     /** The review of `R1_ROUND_ID`. Change it to reach any state of the page. */
     review: R1ReviewResponse;
   };
+  /**
+   * Business impact (M031): what the two impact reads answer, from about 400 invented applications
+   * (`impact.ts`). Change it before `goto` to reach a state: Ashby progress off, nothing checked yet,
+   * unlabelled stages, a failure, or no application at all.
+   */
+  impact: ImpactFixtureState;
 }
 
 /** A fresh, independently mutable copy of the synthetic world. */
@@ -1855,6 +1862,7 @@ export function createDataset(): Dataset {
     appointments: APPOINTMENTS,
     ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW, stages: STAGES, stagesRead: true },
     r1: { rounds: R1_ROUNDS, otherRounds: {}, queue: R1_QUEUE, deployed: true, mints: {}, review: R1_REVIEW },
+    impact: defaultImpactState(),
   });
   return {
     ...d,

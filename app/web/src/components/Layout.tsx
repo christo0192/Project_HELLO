@@ -3,11 +3,12 @@
  *
  * - Brand: authorized IK logo on its own white plate (never CSS-inverted),
  *   the HELLO wordmark and a scope line.
- * - Navigation: TA/HR daily items (Dashboard · Candidates · R1 interviews ·
- *   Agents) under "Workspace"; Operations for admins/interviewers — Ashby Live
- *   Jobs and Mission Control stay admin-only, the phone calendar is for both
- *   roles. R1 interviews is for every role, and hidden only on a server that
- *   does not run R1 and has no round to show.
+ * - Navigation: TA/HR daily items (Dashboard · Business impact · Candidates ·
+ *   R1 interviews · Agents) under "Workspace"; Operations for admins/interviewers
+ *   — Ashby Live Jobs and Mission Control stay admin-only, the phone calendar is
+ *   for both roles. Business impact is for interviewers and admins, the roles
+ *   its page and API serve. R1 interviews is for every role, and hidden only on
+ *   a server that does not run R1 and has no round to show.
  * - Material: a 232px sidebar on the desk, and the page as one opaque sheet
  *   inset 8px from the window (`.sheet`). No blur, no fixed ground, no shadow.
  * - The sidebar is sticky on desktop, so the nav stays on screen at any scroll.
@@ -50,6 +51,7 @@ import {
   CalendarIcon,
   CloseIcon,
   DashboardIcon,
+  ImpactIcon,
   IntegrationIcon,
   InterviewIcon,
   LogOutIcon,
@@ -155,6 +157,7 @@ const STATUS_DOT: Record<Status, string> = {
  */
 const ROUTE_TITLES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^\/dashboard/, 'Dashboard'],
+  [/^\/impact/, 'Business impact'],
   [/^\/candidates\/./, 'Candidate'],
   [/^\/candidates/, 'Candidates'],
   [/^\/roles/, 'Agents'],
@@ -175,6 +178,7 @@ const ROLE_LABEL: Record<MembershipRole, string> = {
 /** Human page name for the top bar, derived from the first path segment. */
 const PAGE_TITLES: Array<[RegExp, string]> = [
   [/^\/dashboard/, 'Dashboard'],
+  [/^\/impact/, 'Business impact'],
   [/^\/candidates\/[^/]+/, 'Candidate'],
   [/^\/candidates/, 'Candidates'],
   [/^\/interviews\//, 'R1 review'],
@@ -357,6 +361,16 @@ export function Layout() {
               icon={<DashboardIcon className="h-4 w-4" />}
               onNavigate={closeDrawer}
             />
+            {/* The roles the page and its API serve (owner decision D-M031-3).
+                A viewer is not offered a page that would only say no. */}
+            {(role === 'admin' || role === 'interviewer') && (
+              <NavLinkItem
+                to="/impact"
+                label="Business impact"
+                icon={<ImpactIcon className="h-4 w-4" />}
+                onNavigate={closeDrawer}
+              />
+            )}
             <NavLinkItem
               to="/candidates"
               label="Candidates"

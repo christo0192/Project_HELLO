@@ -151,7 +151,7 @@ export const RADII = {
 export const EXPECTED_ROUTES = [
   '/login', '/candidate/join', '/privacy-notice', '/status', '/appeal',
   '/dashboard', '/roles', '/candidates', '/candidates/:id', '/interviews', '/interviews/:roundId',
-  '/sessions/:sessionId', '/screening/:sessionId', '/phone-calendar',
+  '/sessions/:sessionId', '/screening/:sessionId', '/phone-calendar', '/impact',
   '/admin', '/admin/r1', '/mission-control', '/ashby-mission-control',
   '/ashby/review/:applicationLinkId', '/mfa/*',
 ];
@@ -202,6 +202,7 @@ export const VERDICT_FILES = [
   'src/components/session/RoleScorecardView.tsx',
   'src/components/talent/EvidenceHoldNotice.tsx',
   'src/pages/R1InterviewsPage.tsx',
+  'src/components/impact/ImpactVerdict.tsx',
 ];
 /** The same rule, but these print ratings beside a quote, so each may use the highlighter once, on that quote. */
 export const VERDICT_FILES_WITH_A_QUOTE = ['src/components/r1-review/OverviewPanel.tsx'];

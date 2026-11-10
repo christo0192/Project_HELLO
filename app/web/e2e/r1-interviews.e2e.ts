@@ -28,7 +28,7 @@ test.describe('the sidebar', () => {
     const nav = page.getByRole('navigation', { name: 'Main navigation' });
     const item = nav.getByRole('link', { name: 'R1 interviews' });
     await expect(item).toBeVisible();
-    await expect(nav.getByRole('link')).toHaveText(['Dashboard', 'Candidates', 'R1 interviews', 'Agents', 'Ashby Live Jobs', 'Mission Control', 'Phone calendar']);
+    await expect(nav.getByRole('link')).toHaveText(['Dashboard', 'Business impact', 'Candidates', 'R1 interviews', 'Agents', 'Ashby Live Jobs', 'Mission Control', 'Phone calendar']);
     await item.click();
     await expect(page).toHaveURL(/\/interviews$/);
     await expect(page.getByRole('heading', { level: 1, name: 'R1 interviews' })).toBeVisible();
