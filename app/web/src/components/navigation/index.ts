@@ -15,6 +15,7 @@ export {
   CalendarIcon,
   CloseIcon,
   DashboardIcon,
+  ImpactIcon,
   IntegrationIcon,
   InterviewIcon,
   LogOutIcon,

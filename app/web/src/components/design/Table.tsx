@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react';
 import type {
   HTMLAttributes,
   TdHTMLAttributes,
@@ -17,6 +18,29 @@ export interface TableProps extends HTMLAttributes<HTMLTableElement> {
    * sheet's own margin with the heading above it.
    */
   flush?: boolean;
+  /**
+   * While the table is wider than its box (a phone), the box becomes a named,
+   * focusable region, so a keyboard can scroll it even when no cell holds a
+   * control (axe: scrollable-region-focusable). While it fits, it adds no tab stop.
+   */
+  focusWhenScrolling?: boolean;
+}
+
+/** Whether the box scrolls sideways, watched as the window and the table resize. */
+function useScrollsSideways(enabled: boolean) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [scrolls, setScrolls] = useState(false);
+  useEffect(() => {
+    const box = ref.current;
+    if (!enabled || !box || typeof ResizeObserver === 'undefined') return undefined;
+    const check = () => setScrolls(box.scrollWidth > box.clientWidth + 1);
+    check();
+    const observer = new ResizeObserver(check);
+    observer.observe(box);
+    if (box.firstElementChild) observer.observe(box.firstElementChild);
+    return () => observer.disconnect();
+  }, [enabled]);
+  return [ref, scrolls] as const;
 }
 
 /**
@@ -32,21 +56,34 @@ export interface TableProps extends HTMLAttributes<HTMLTableElement> {
  * width. (IBM Plex already draws every digit one width; the utility keeps
  * the column aligned under any fallback face, where "11" and "88" differ.)
  */
-export function Table({ caption, className, children, bare = false, flush = false, maxHeight, ...rest }: TableProps) {
+export function Table({
+  caption,
+  className,
+  children,
+  bare = false,
+  flush = false,
+  maxHeight,
+  focusWhenScrolling = false,
+  ...rest
+}: TableProps) {
+  const [boxRef, scrollsSideways] = useScrollsSideways(focusWhenScrolling && !maxHeight);
+  // A bounded table, or one wider than its box, is a scroll region: give keyboard
+  // users a focus stop and assistive technology a name (axe: scrollable-region-focusable).
+  const region = Boolean(maxHeight) || scrollsSideways;
   return (
     <div
-      // A bounded table is a scroll region: give keyboard users a focus stop
-      // and assistive technology a name (axe: scrollable-region-focusable).
-      role={maxHeight ? 'region' : undefined}
-      aria-label={maxHeight ? caption : undefined}
-      tabIndex={maxHeight ? 0 : undefined}
+      ref={boxRef}
+      role={region ? 'region' : undefined}
+      aria-label={region ? caption : undefined}
+      tabIndex={region ? 0 : undefined}
       className={cx(
         'w-full overflow-x-auto',
         // Bare still establishes the containing block: an absolutely placed
         // cell child (a row's stretched link) must be clipped by this scroller,
         // not escape to the page and scroll it sideways.
         bare ? 'relative' : 'glass rounded-card',
-        maxHeight && 'overflow-y-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
+        maxHeight && 'overflow-y-auto',
+        region && 'focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
       )}
       style={maxHeight ? { maxHeight } : undefined}
     >

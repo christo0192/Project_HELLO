@@ -166,3 +166,16 @@ export function IntegrationIcon({ className }: IconProps) {
     </svg>
   );
 }
+
+/**
+ * A rising line on an axis: Business impact, what happened after Christy.
+ * Decorative and `aria-hidden` like every sibling; the nav item's text is its name.
+ */
+export function ImpactIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <path d="M4 4v16h16" />
+      <path d="m8 15 3.5-4 3 2.5L19 8" />
+    </svg>
+  );
+}

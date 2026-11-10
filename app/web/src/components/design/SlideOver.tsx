@@ -45,8 +45,12 @@ export interface SlideOverProps {
    * Tab is still trapped but never swallowed — see `useModal`'s handler.
    */
   busy?: boolean;
+  /** `default` is a reading width; `wide` is for a table of several columns. */
+  size?: 'default' | 'wide';
   children: ReactNode;
 }
+
+const WIDTH = { default: 'max-w-2xl', wide: 'max-w-5xl' } as const;
 
 export function SlideOver({
   open,
@@ -56,6 +60,7 @@ export function SlideOver({
   idPrefix,
   returnFocusRef,
   busy = false,
+  size = 'default',
   children,
 }: SlideOverProps) {
   const panelRef = useModal({ open, onClose, returnFocusRef, busy });
@@ -85,7 +90,8 @@ export function SlideOver({
         tabIndex={-1}
         className={cx(
           // `glass-modal`, not `glass`: a floating layer, so it carries the shadow.
-          'slide-over-panel glass-modal relative z-10 flex h-full w-full max-w-2xl flex-col',
+          'slide-over-panel glass-modal relative z-10 flex h-full w-full flex-col',
+          WIDTH[size],
           'overflow-y-auto p-5 outline-none sm:p-6',
         )}
       >

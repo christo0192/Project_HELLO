@@ -172,4 +172,20 @@ describe('SlideOver', () => {
     );
     expect(dialog().parentElement).toHaveStyle({ margin: '0px' });
   });
+
+  it('is the reading width by default, and wider for a table that needs the room', () => {
+    const { rerender } = render(
+      <SlideOver open onClose={() => {}} idPrefix="w" title="List">
+        <p>Rows</p>
+      </SlideOver>,
+    );
+    expect(dialog()).toHaveClass('max-w-2xl');
+    rerender(
+      <SlideOver open onClose={() => {}} idPrefix="w" title="List" size="wide">
+        <p>Rows</p>
+      </SlideOver>,
+    );
+    expect(dialog()).toHaveClass('max-w-5xl');
+    expect(dialog()).not.toHaveClass('max-w-2xl');
+  });
 });

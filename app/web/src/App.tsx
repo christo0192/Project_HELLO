@@ -88,6 +88,10 @@ const AshbyScopedReviewPage = lazyPage(
   () => import('./pages/AshbyScopedReviewPage'),
   'AshbyScopedReviewPage',
 );
+const BusinessImpactPage = lazyPage(
+  () => import('./pages/BusinessImpactPage'),
+  'BusinessImpactPage',
+);
 
 /**
  * Post-SSO landing. A full-page identity-provider round trip destroys router
@@ -183,6 +187,14 @@ export default function App() {
               request regardless.
             */}
             <Route path="/phone-calendar" element={<PhoneCalendarPage />} />
+            {/*
+              Business impact (M031) — authenticated, and NOT behind
+              `requireRole`, for the phone calendar's reason: interviewers and
+              admins may read it (owner decision D-M031-3), and ProtectedRoute
+              matches one exact role. The page tells the roles apart itself and
+              makes no impact call for a viewer; the API checks every call.
+            */}
+            <Route path="/impact" element={<BusinessImpactPage />} />
           </Route>
         </Route>
 

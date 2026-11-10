@@ -75,6 +75,9 @@ vi.mock('./pages/R1SettingsPage', () => ({
 vi.mock('./pages/PhoneCalendarPage', () => ({
   PhoneCalendarPage: () => <div data-testid="page-phone-calendar">Phone calendar</div>,
 }));
+vi.mock('./pages/BusinessImpactPage', () => ({
+  BusinessImpactPage: () => <div data-testid="page-impact">Business impact</div>,
+}));
 
 function renderApp(initialEntry = '/dashboard') {
   // App owns its <BrowserRouter>; drive the URL through the history API.
@@ -220,6 +223,29 @@ describe('App route wiring', () => {
     renderApp('/phone-calendar');
     await screen.findByTestId('page-phone-calendar');
     expect(screen.getByRole('navigation', { name: 'Main navigation' })).toBeInTheDocument();
+  });
+
+  /*
+    Business impact (M031) follows the phone calendar: interviewers and admins
+    may read it, ProtectedRoute matches one exact role, so every signed-in role
+    reaches the route and `BusinessImpactPage.test.tsx` covers the page's gate.
+  */
+  it.each([
+    ['an admin', authedAdmin],
+    ['an interviewer', authedInterviewer],
+    ['a viewer, so the page can gate them', authedViewer],
+  ])('renders Business impact at /impact for %s', async (_who, sign) => {
+    sign();
+    renderApp('/impact?weeks=4');
+    expect(await screen.findByTestId('page-impact')).toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: 'Main navigation' })).toBeInTheDocument();
+  });
+
+  it('sends an unauthenticated visitor at /impact to /login', async () => {
+    unauthenticated();
+    renderApp('/impact');
+    expect(await screen.findByText(/Recruiter sign-in/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('page-impact')).not.toBeInTheDocument();
   });
 
   it('redirects unknown protected paths to /dashboard when authenticated', async () => {

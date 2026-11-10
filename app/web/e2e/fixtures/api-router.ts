@@ -41,6 +41,7 @@ import type { R1RecordingPlayback, R1SettingsResponse, R1UsageResponse } from '.
 import type { AshbyStageMilestone } from '../../src/lib/ashby-stages';
 import { ADMIN_USER_ID, PHONE_WINDOW, R1_CANDIDATE_ID, R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
 import { FROZEN_NOW_MS } from './env';
+import { impactCandidates, impactSummary } from './impact';
 
 export interface MockRequest {
   method: string;
@@ -614,6 +615,12 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', '/api/phone/health', () => ok({ ok: true, enabled: true, status: 'ok', reasons: [], admission: { control_present: true, halted: false, halt_reason: null } } satisfies PhoneHealthResponse)],
   ['POST', '/api/phone/halt', () => ok({ ok: true, halted: true, already_halted: false, reason: 'operator_pause', requested_reason: 'operator_pause' } satisfies PhoneHaltResponse)],
   ['POST', '/api/phone/halt/clear', () => ok({ ok: true, halted: false, was_halted: true, previous_reason: 'operator_pause' } satisfies PhoneHaltClearResponse)],
+
+  // ── Business impact (M031 API contract) ────────────────────────────
+  // Both reads are computed from one invented set of applications (impact.ts), so a count and the
+  // list behind it agree. `db.impact` reaches every state the page has.
+  ['GET', '/api/impact/summary', ({ query }, db) => impactSummary(query, db.impact)],
+  ['GET', '/api/impact/candidates', ({ query }, db) => impactCandidates(query, db.impact)],
 
   // ── Scorecards: metric library ("Scorebar") + role scorecards ──────
   ['GET', '/api/scorecards/metrics', (_r, db) => ok(db.metrics)],

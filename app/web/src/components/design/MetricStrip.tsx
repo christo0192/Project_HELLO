@@ -56,7 +56,12 @@ export interface MetricItem {
   attention?: boolean;
   /** Drill-down: the whole cell becomes a link. */
   href?: string;
-  /** The link's accessible name. Defaults to "label: figure". */
+  /**
+   * Drill-down on this page (a list panel): the whole cell becomes a button,
+   * handed itself so the caller can return focus to it.
+   */
+  onActivate?: (button: HTMLButtonElement) => void;
+  /** The link's or button's accessible name. Defaults to "label: figure". */
   ariaLabel?: string;
   loading?: boolean;
   /** Raw value one hover away, for an operator. */
@@ -171,7 +176,7 @@ export function MetricStrip({
   // `false` entries are conditional figures the caller withheld on purpose;
   // they must not leave an empty cell that reads as a figure that failed.
   const items = rawItems.filter((item): item is MetricItem => Boolean(item));
-  const linked = items.some((item) => item.href);
+  const linked = items.some((item) => item.href || item.onActivate);
   const Heading = `h${headingLevel}` as 'h2' | 'h3' | 'h4';
 
   const cols = columns ?? Math.max(items.length, 1);
@@ -238,6 +243,22 @@ export function MetricStrip({
                     >
                       <MetricBody item={item} size={size} linked contextId={`${headingId}-c${i}`} />
                     </Link>
+                  ) : item.onActivate ? (
+                    <button
+                      type="button"
+                      onClick={(event) => item.onActivate?.(event.currentTarget)}
+                      aria-label={item.ariaLabel ?? defaultName(item)}
+                      aria-describedby={item.context && !item.loading ? `${headingId}-c${i}` : undefined}
+                      className={cx(
+                        'group/metric w-full text-left transition-colors duration-hover ease-out',
+                        SUBGRID,
+                        'hover:bg-ink/[0.025] focus:outline-none focus-visible:bg-info/[0.06] focus-visible:shadow-[inset_0_0_0_2px_var(--info)]',
+                        pad,
+                      )}
+                    >
+                      {/* Spans: a button holds phrasing content only. */}
+                      <MetricBody item={item} size={size} linked inline contextId={`${headingId}-c${i}`} />
+                    </button>
                   ) : (
                     <div className={cx(SUBGRID, pad)}>
                       <MetricBody item={item} size={size} />
@@ -277,17 +298,20 @@ function MetricBody({
   size,
   asTerms = false,
   linked = false,
+  inline = false,
   contextId,
 }: {
   item: MetricItem;
   size: MetricStripSize;
   asTerms?: boolean;
   linked?: boolean;
+  /** Spans instead of paragraphs, inside a button. The subgrid blockifies them. */
+  inline?: boolean;
   /** Id for the context line, so a drill-down link can use it as its description. */
   contextId?: string;
 }) {
-  const Term = asTerms ? 'dt' : 'p';
-  const Def = asTerms ? 'dd' : 'p';
+  const Term = asTerms ? 'dt' : inline ? 'span' : 'p';
+  const Def = asTerms ? 'dd' : inline ? 'span' : 'p';
   const figure = typeof item.value === 'number' ? item.value.toLocaleString() : item.value;
 
   return (

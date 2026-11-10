@@ -97,6 +97,8 @@ export const ROUTES: RouteCase[] = [
   { name: 'screening-console-legacy', path: `/screening/${LEGACY_SESSION_ID}`, heading: 'Screening with Gopu', landmark: /walk me through your current role/i },
   { name: 'roles', path: '/roles', heading: 'Agents', landmark: 'Senior Backend Engineer' },
   { name: 'phone-calendar', path: '/phone-calendar', heading: 'Phone calendar', landmark: /Meera Iyer|Ananya Chaudhary/ },
+  // Business impact (M031): the invented impact fixture, aggregated by the contract's rules.
+  { name: 'impact', path: '/impact', heading: 'Business impact', landmark: 'Christy’s verdict against what happened next' },
   { name: 'mission-control', path: '/mission-control', heading: 'Mission Control', landmark: 'Session status mix' },
   { name: 'mission-control-access', path: '/mission-control#access', heading: 'Mission Control', landmark: 'hiring.lead@example.com' },
   { name: 'mission-control-sessions', path: '/mission-control#sessions', heading: 'Mission Control', landmark: 'Override session status' },
