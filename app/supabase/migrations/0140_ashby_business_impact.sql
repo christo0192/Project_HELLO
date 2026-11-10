@@ -80,9 +80,9 @@
 --     restriction or erasure request.
 -- An erasure fulfilled before this migration, of a link that was ALREADY
 -- terminal, left no mark at all and cannot be recognised here. This file does
--- not change 0139: its progress worker applies the last two rules only, and
--- must read the erasure list too before it stops reading every erased
--- subject's application. `in_impact` then says whether the mapping counts
+-- not change 0139: its progress worker does not read the erasure list, but it
+-- skips every ended link whose candidate is gone, so it never reads such an
+-- application again. `in_impact` then says whether the mapping counts
 -- (ashby_impact_exclusions).
 --
 -- THE RULES (API-CONTRACT.md):

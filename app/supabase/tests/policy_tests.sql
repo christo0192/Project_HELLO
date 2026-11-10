@@ -24709,11 +24709,12 @@ $$;
 drop function _policy_tests.p138_try(text);
 
 -- ═══════════════════════════════════════════════════════════════════════
--- 0139: the Ashby progress worker's functions (M031 S3). Five SECURITY
+-- 0139: the Ashby progress worker's functions (M031 S3). Six SECURITY
 -- DEFINER functions over the 0138 tables, service-role only: the claim
 -- (seed, lease, SKIP LOCKED, newest first), one application's read (intervals
 -- marked gone_at and never deleted, a stale lease refused), a pass's run row,
--- the backfill (idempotent while open, audited) and the counts-only overview.
+-- the backfill (idempotent while open, audited), the counts-only overview, and
+-- the covered-links helper the others share.
 -- A link an erasure ended, or whose candidate asked for restriction, is never
 -- seeded, claimed or counted. Nothing outside the 0138 tables is written but
 -- the backfill's audit row.
