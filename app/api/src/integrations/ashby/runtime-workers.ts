@@ -74,6 +74,7 @@ import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reco
 import { LEGACY_INVITE_SKIPPED_EVENT, runAshbyOperationPass } from './operation-worker.js';
 import { createChristyTagResolver, recommendationTagsEnabled } from './recommendation-tags.js';
 import { runProgressPass, type ProgressPassResult } from './progress-worker.js';
+import { createProgressNudge } from './progress-nudge.js';
 import { loadAshbyProgressConfig } from './config.js';
 import { probeFeedbackFormDefinition, type FormDefinitionReader, type ProbeFeedbackForm } from './probe.js';
 
@@ -785,6 +786,17 @@ export interface AshbyHandlerDeps {
    * `ASHBY_PHONE_PARSING_ENABLED` through the runtime config.
    */
   phoneParsingEnabled?: boolean;
+  /**
+   * Override the progress worker's switch for the webhook nudge (tests).
+   * Production reads `ASHBY_PROGRESS_ENABLED` through the runtime config.
+   */
+  progressEnabled?: boolean;
+  /**
+   * Override the webhook nudge handed to {@link processAshbySignal} (tests).
+   * Production builds one guarded nudge over `runtime.progressNudge`. Either
+   * way it is wired only while the progress switch is on.
+   */
+  progressNudge?: (input: { applicationId: string }) => Promise<unknown> | unknown;
 }
 
 /**
@@ -820,6 +832,24 @@ export function buildAshbyHandlers(
   // queued profile job into a no-op; the always-on guards below (the
   // ingestion's phone-parsing return, the late-resume refusal) do not read it.
   const phoneParsingEnabled = deps.phoneParsingEnabled ?? rc?.phoneParsingEnabled === true;
+  // The webhook nudge (M031 S4): a stage change for an imported application
+  // marks its progress row due now. Wired only while ASHBY_PROGRESS_ENABLED is
+  // on, so off means no call and no write. Built ONCE per handler map so its
+  // failure backoff is shared by every signal job on this machine. Bounded
+  // and never throwing (progress-nudge.ts); a failure logs a code only.
+  const progressEnabled = deps.progressEnabled ?? rc?.progress?.enabled === true;
+  const nudgeProgress = !progressEnabled
+    ? undefined
+    : deps.progressNudge
+      ?? (runtime.progressNudge
+        ? createProgressNudge({
+            store: runtime.progressNudge,
+            onFailure: (code) => logger.warn('unknown_event', {
+              error_category: 'ashby_progress_nudge',
+              error_type: code,
+            }),
+          })
+        : undefined);
   const scannerGate = deps.scannerGate
     ?? (() => checkScannerReadiness({ timeoutMs: rc?.scannerReadinessTimeoutMs }));
   const scannerDeferSeconds = deps.scannerDeferSeconds
@@ -874,6 +904,9 @@ export function buildAshbyHandlers(
         ...(stageInterest && stagePrefilterEnabled
           ? { isStageOfInterest: stageInterest }
           : {}),
+        // Freshness for the progress worker, ahead of the pre-filter. Never a
+        // decision: absent (switch off) the path is byte-identical.
+        ...(nudgeProgress ? { nudgeProgress } : {}),
         onImportEligible: async ({ applicationId, jobId, stageId, source, explicitImportRunId }) => {
           // Dedup by APPLICATION: a duplicate webhook, a redelivery, and a
           // reconciliation recovery all collapse onto one live import job.

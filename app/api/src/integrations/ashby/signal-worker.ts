@@ -19,6 +19,11 @@
  * reconciliation instead. `onStageHintObserved` exists to measure whether the
  * hint is ever wrong; a non-zero mismatch count is the signal to unwire it.
  *
+ * The progress nudge (M031 S4, `nudgeProgress`) runs before that pre-filter
+ * and is not a decision either: it marks an imported application due for the
+ * progress worker, its answer is ignored and its failures are swallowed, so
+ * every decision below is reached exactly as without it.
+ *
  * Decisions (this PR produces a SAFE decision only — it never creates a
  * candidate, invite, session, or any Ashby mutation; that is a later PR):
  *   import_eligible      → the application is genuinely at the active AI stage
@@ -269,6 +274,22 @@ export interface SignalWorkerDeps {
   enforceActivationFence?: boolean;
   /** Required by the production composition for every non-explicit signal. */
   history?: ApplicationHistoryLister;
+  /**
+   * The progress nudge (M031 S4, progress-nudge.ts): a stage change for an
+   * application HELLO imported marks its progress row due now, so the
+   * progress worker reads it on its next pass. Called once per
+   * candidateStageChange signal that carries an application id and is not an
+   * explicit backlog import (that is an admin's import run, not a stage
+   * move), FIRST: before the stage pre-filter, so its skip still nudges.
+   *
+   * It is NOT a decision and must never become one: what it answers is
+   * ignored, a throw or rejection is swallowed, and every step after it runs
+   * exactly as it would without it (same decision, receipt mark, provider
+   * reads, order and retries). Production binds it only while
+   * ASHBY_PROGRESS_ENABLED is on, to a nudge that is bounded and never throws.
+   * Default `undefined`: the signal path is byte-identical to before.
+   */
+  nudgeProgress?: (input: { applicationId: string }) => Promise<unknown> | unknown;
 }
 
 /** Queue name for application imports scheduled from an eligible signal. */
@@ -328,6 +349,18 @@ export async function processAshbySignal(
   if (!payload.externalApplicationId) {
     await mark(deps, payload, 'failed');
     return { decision: 'skipped_no_application' };
+  }
+
+  // ── Progress nudge (M031 S4): freshness only, never a decision ──────────
+  // Before the pre-filter, so a skipped stage still marks an imported
+  // application due. Its answer is ignored and any failure is swallowed: the
+  // rest of this function runs exactly as it would without it.
+  if (deps.nudgeProgress && payload.source !== 'explicit_backlog') {
+    try {
+      await deps.nudgeProgress({ applicationId: payload.externalApplicationId });
+    } catch {
+      // A nudge must never fail, retry or reorder a signal.
+    }
   }
 
   // ── Local pre-filter: skip the provider read for a stage no mapping names ──

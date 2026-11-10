@@ -59,10 +59,12 @@ function functionBody(name: string): string {
 }
 
 describe('0140 shape', () => {
-  it('is the only 0140 migration and the newest, and only S3\'s 0139 sits between it and 0138', () => {
+  it('is the only 0140 migration, only S4\'s 0141 follows it, and only S3\'s 0139 sits between it and 0138', () => {
     const files = readdirSync(migrations).filter((f) => f.endsWith('.sql')).sort();
     expect(files.filter((f) => f.startsWith('0140_'))).toEqual([FILE]);
-    expect(files[files.length - 1]).toBe(FILE);
+    // 0141_ashby_progress_nudge.sql (M031 S4, the webhook nudge) adds one function over the 0138
+    // progress table and nothing this read model depends on.
+    expect(files.slice(files.indexOf(FILE) + 1)).toEqual(['0141_ashby_progress_nudge.sql']);
     const between = files.slice(files.indexOf('0138_ashby_pipeline_progress.sql') + 1, files.indexOf(FILE));
     expect(between).toEqual(['0139_ashby_progress_worker.sql']);
   });

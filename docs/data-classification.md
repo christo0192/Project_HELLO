@@ -534,6 +534,17 @@ never sent. While an appeal blocks decision use, the candidate's verdict is supp
 no verdict or score on the row, and the application is left out of the verdict table and its
 lists (the view reads `decision_use_blocked_at` as a flag, no other candidate column).
 
+### Ashby pipeline progress written by the webhook nudge (0141, M031 S4)
+
+`0141_ashby_progress_nudge.sql` adds no table and no column: one service-role function,
+`nudge_ashby_application_progress`, marks an imported application's `ashby_application_progress`
+row due now when a stage-change webhook arrives for it (creating the row, due now, if it has none).
+It takes an opaque Ashby application id and a time, writes only `next_check_at` (and, for a new
+row, the same timestamps the worker's claim writes), and answers a status code, never an id. It
+uses the same coverage rule, `ashby_progress_covered_links()`, so a link an erasure ended, an ended
+link with no candidate left, or a link whose candidate has a restriction or erasure request is
+never nudged. No audit row: a webhook is not a person's action, and the nudge decides nothing.
+
 ## Classification summary
 
 | Level | Count | Examples |

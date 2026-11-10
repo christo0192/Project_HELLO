@@ -25425,6 +25425,255 @@ begin
 end;
 $$;
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0141: the Ashby progress worker's webhook nudge (M031 S4). One SECURITY
+-- DEFINER function, service-role only: a stage change for an application
+-- HELLO imported marks its progress row due now (created if missing), never
+-- later than it already was. A link the 0139 coverage rule leaves out (an
+-- erasure, an ended link with no candidate left, a restriction) is never
+-- nudged, and an application HELLO never imported writes nothing. Nothing but
+-- ashby_application_progress is written.
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  '0141: the nudge is SECURITY DEFINER, pins search_path, and only service_role may run it',
+  (select count(*) from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'nudge_ashby_application_progress'
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+       and not has_function_privilege('anon', p.oid, 'EXECUTE')
+       and not has_function_privilege('authenticated', p.oid, 'EXECUTE')) = 1
+  and (select count(*) from pg_proc p
+         join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'screening_v2' and p.proname = 'nudge_ashby_application_progress') = 1,
+  'the nudge must be one pinned SECURITY DEFINER function executable by service_role only'
+);
+
+do $$
+declare
+  v_t0        timestamptz := date_trunc('second', now());
+  v_cand      uuid;
+  v_held_cand uuid;
+  v_l1        uuid;
+  v_l2        uuid;
+  v_l3        uuid;
+  v_l4        uuid;
+  v_erased    uuid;
+  v_ended     uuid;
+  v_held      uuid;
+  v_p1        uuid;
+  v_before    screening_v2.ashby_application_progress%rowtype;
+  v_row       screening_v2.ashby_application_progress%rowtype;
+  v_json      jsonb;
+  v_claim     jsonb;
+  v_ids       text[];
+  v_lease     text;
+  v_rows      integer;
+  v_fp        text;
+  v_cand_fp   timestamptz;
+  v_audits    integer;
+  v_intervals integer;
+  v_runs      integer;
+  v_i         integer;
+  v_a         jsonb;
+  v_b         jsonb;
+  v_c         jsonb;
+  v_pfp       text;
+begin
+  -- Any due row another section left is taken under a long lease first, so
+  -- the claims below see only this section's rows. Nothing is seeded.
+  for v_i in 1..200 loop
+    v_claim := screening_v2.claim_ashby_progress_due(50, 3600, 0, v_t0 + interval '1 day');
+    exit when jsonb_array_length(v_claim->'claimed') = 0;
+  end loop;
+
+  -- Four imported applications: one read and due in 6 h, one with no progress
+  -- row yet, one already due an hour ago, and one Ashby no longer had.
+  insert into screening_v2.candidates default values returning id into v_cand;
+  insert into screening_v2.ashby_application_links (external_application_id, external_job_id, candidate_id)
+  values ('pol141-app-1', 'pol141-job', v_cand) returning id into v_l1;
+  insert into screening_v2.ashby_application_links (external_application_id, external_job_id)
+  values ('pol141-app-2', 'pol141-job') returning id into v_l2;
+  insert into screening_v2.ashby_application_links (external_application_id, external_job_id)
+  values ('pol141-app-3', 'pol141-job') returning id into v_l3;
+  insert into screening_v2.ashby_application_links (external_application_id, external_job_id)
+  values ('pol141-app-4', 'pol141-job') returning id into v_l4;
+  insert into screening_v2.ashby_application_progress
+    (application_link_id, status, current_stage_id, current_job_id, last_checked_at, next_check_at,
+     attempts, created_at, updated_at)
+  values (v_l1, 'Active', 'pol141-st-christy', 'pol141-job', v_t0 - interval '1 hour', v_t0 + interval '6 hours',
+          0, v_t0 - interval '2 hours', v_t0 - interval '1 hour')
+  returning id into v_p1;
+  insert into screening_v2.ashby_application_progress (application_link_id, next_check_at, created_at, updated_at)
+  values (v_l3, v_t0 - interval '1 hour', v_t0 - interval '2 hours', v_t0 - interval '2 hours');
+  insert into screening_v2.ashby_application_progress
+    (application_link_id, next_check_at, check_error_code, attempts, created_at, updated_at)
+  values (v_l4, 'infinity'::timestamptz, 'application_not_found', 0, v_t0 - interval '2 hours', v_t0 - interval '2 hours');
+
+  -- Three the erasure rules leave out: a link an erasure ended (its progress
+  -- row from before the erasure kept), a link already ended with no candidate
+  -- left, and a link whose candidate asked for restriction.
+  insert into screening_v2.ashby_application_links (external_application_id, terminal_state, terminal_reason)
+  values ('pol141-erased', 'deleted', 'subject_erasure') returning id into v_erased;
+  insert into screening_v2.ashby_application_progress (application_link_id, next_check_at, created_at, updated_at)
+  values (v_erased, v_t0 + interval '6 hours', v_t0 - interval '2 hours', v_t0 - interval '2 hours');
+  insert into screening_v2.ashby_application_links (external_application_id, terminal_state, terminal_reason)
+  values ('pol141-ended', 'withdrawn', 'withdrawn_in_ashby') returning id into v_ended;
+  insert into screening_v2.candidates default values returning id into v_held_cand;
+  insert into screening_v2.ashby_application_links (external_application_id, candidate_id)
+  values ('pol141-held', v_held_cand) returning id into v_held;
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  values (v_held_cand, 'restrict', 'pending', '00000000-0000-4000-8000-0000000000ad');
+
+  -- What a nudge may never change.
+  select string_agg(l.external_application_id || ':' || l.updated_at::text || ':' || coalesce(l.terminal_state, '-')
+                    || ':' || l.lifecycle || ':' || coalesce(l.candidate_id::text, '-'), ',' order by l.external_application_id)
+    into v_fp from screening_v2.ashby_application_links l where l.external_application_id like 'pol141-%';
+  select updated_at into v_cand_fp from screening_v2.candidates where id = v_cand;
+  v_audits := (select count(*) from screening_v2.audit_events);
+  v_intervals := (select count(*) from screening_v2.ashby_application_stage_intervals);
+  v_runs := (select count(*) from screening_v2.ashby_progress_runs);
+
+  -- ── Imported, read, due later: due now, nothing else moves ────────────
+  select * into v_before from screening_v2.ashby_application_progress where id = v_p1;
+  v_json := screening_v2.nudge_ashby_application_progress('pol141-app-1', v_t0);
+  select * into v_row from screening_v2.ashby_application_progress where id = v_p1;
+  perform _policy_tests.assert('0141: a nudge marks an imported application due now and changes nothing else on its row',
+    v_json = '{"status": "marked"}'::jsonb
+    and v_row.next_check_at = v_t0
+    and (to_jsonb(v_row) - 'next_check_at') = (to_jsonb(v_before) - 'next_check_at'),
+    v_json::text || ' ' || row_to_json(v_row)::text);
+
+  -- ── Imported, never read: the row the claim would have seeded, due now ──
+  v_json := screening_v2.nudge_ashby_application_progress('pol141-app-2', v_t0);
+  select * into v_row from screening_v2.ashby_application_progress where application_link_id = v_l2;
+  perform _policy_tests.assert('0141: a nudge creates the missing row of an imported application, due now',
+    v_json = '{"status": "created"}'::jsonb
+    and v_row.next_check_at = v_t0 and v_row.created_at = v_t0 and v_row.updated_at = v_t0
+    and v_row.status is null and v_row.current_stage_id is null and v_row.last_checked_at is null
+    and v_row.attempts = 0 and v_row.check_error_code is null,
+    v_json::text || ' ' || coalesce(row_to_json(v_row)::text, 'no row'));
+
+  -- ── Again, later, and earlier ──────────────────────────────────────────
+  -- Each call is its own statement: a query does not see what a function it
+  -- calls writes, so every check below reads afresh.
+  v_a := screening_v2.nudge_ashby_application_progress('pol141-app-1', v_t0);
+  v_b := screening_v2.nudge_ashby_application_progress('pol141-app-1', v_t0 + interval '1 minute');
+  v_c := screening_v2.nudge_ashby_application_progress('pol141-app-2', v_t0 + interval '1 minute');
+  perform _policy_tests.assert('0141: a nudge is idempotent and never moves a due time later',
+    v_a = '{"status": "already_due"}'::jsonb and v_b = '{"status": "already_due"}'::jsonb
+    and v_c = '{"status": "already_due"}'::jsonb
+    and (select next_check_at = v_t0 from screening_v2.ashby_application_progress where id = v_p1)
+    and (select count(*) = 1 and bool_and(next_check_at = v_t0) from screening_v2.ashby_application_progress where application_link_id = v_l2),
+    v_a::text || v_b::text || v_c::text);
+  -- An earlier nudge (another machine's clock) only ever moves it earlier.
+  v_a := screening_v2.nudge_ashby_application_progress('pol141-app-1', v_t0 - interval '30 seconds');
+  perform _policy_tests.assert('0141: a nudge only ever moves a due time earlier',
+    v_a = '{"status": "marked"}'::jsonb
+    and (select next_check_at = v_t0 - interval '30 seconds' from screening_v2.ashby_application_progress where id = v_p1),
+    v_a::text);
+
+  v_json := screening_v2.nudge_ashby_application_progress('pol141-app-3', v_t0);
+  perform _policy_tests.assert('0141: a nudge never delays a row already due earlier',
+    v_json = '{"status": "already_due"}'::jsonb
+    and (select next_check_at = v_t0 - interval '1 hour' and updated_at = v_t0 - interval '2 hours'
+           from screening_v2.ashby_application_progress where application_link_id = v_l3),
+    v_json::text);
+
+  -- A stage change is proof Ashby has the application again.
+  v_json := screening_v2.nudge_ashby_application_progress('pol141-app-4', v_t0);
+  perform _policy_tests.assert('0141: a nudge marks a gone application due once more',
+    v_json = '{"status": "marked"}'::jsonb
+    and (select next_check_at = v_t0 and check_error_code = 'application_not_found' and attempts = 0
+                and updated_at = v_t0 - interval '2 hours'
+           from screening_v2.ashby_application_progress where application_link_id = v_l4),
+    v_json::text);
+
+  -- ── Nothing to nudge ──────────────────────────────────────────────────
+  select string_agg(p.application_link_id::text || ':' || p.next_check_at::text || ':' || p.updated_at::text, ',' order by p.id)
+    into v_pfp from screening_v2.ashby_application_progress p;
+  v_json := screening_v2.nudge_ashby_application_progress('pol141-never-imported', v_t0);
+  perform _policy_tests.assert('0141: a nudge for an application HELLO never imported writes nothing',
+    v_json = '{"status": "not_imported"}'::jsonb
+    and (select string_agg(p.application_link_id::text || ':' || p.next_check_at::text || ':' || p.updated_at::text, ',' order by p.id)
+           from screening_v2.ashby_application_progress p) = v_pfp,
+    v_json::text);
+
+  v_a := screening_v2.nudge_ashby_application_progress('pol141-erased', v_t0);
+  v_b := screening_v2.nudge_ashby_application_progress('pol141-ended', v_t0);
+  v_c := screening_v2.nudge_ashby_application_progress('pol141-held', v_t0);
+  perform _policy_tests.assert('0141: a link the erasure rules leave out is never nudged',
+    v_a = '{"status": "not_covered"}'::jsonb and v_b = '{"status": "not_covered"}'::jsonb
+    and v_c = '{"status": "not_covered"}'::jsonb
+    -- The erased link's row from before the erasure is left exactly as it was.
+    and (select next_check_at = v_t0 + interval '6 hours' and updated_at = v_t0 - interval '2 hours'
+           from screening_v2.ashby_application_progress where application_link_id = v_erased)
+    and not exists (select 1 from screening_v2.ashby_application_progress where application_link_id in (v_ended, v_held))
+    and (select string_agg(p.application_link_id::text || ':' || p.next_check_at::text || ':' || p.updated_at::text, ',' order by p.id)
+           from screening_v2.ashby_application_progress p) = v_pfp,
+    v_a::text || v_b::text || v_c::text);
+
+  v_a := screening_v2.nudge_ashby_application_progress(null, v_t0);
+  v_b := screening_v2.nudge_ashby_application_progress('', v_t0);
+  v_c := screening_v2.nudge_ashby_application_progress(repeat('x', 257), v_t0);
+  perform _policy_tests.assert('0141: a malformed nudge is refused and writes nothing',
+    v_a = '{"status": "invalid_request"}'::jsonb and v_b = '{"status": "invalid_request"}'::jsonb
+    and v_c = '{"status": "invalid_request"}'::jsonb
+    and (select string_agg(p.application_link_id::text || ':' || p.next_check_at::text || ':' || p.updated_at::text, ',' order by p.id)
+           from screening_v2.ashby_application_progress p) = v_pfp,
+    v_a::text || v_b::text || v_c::text);
+
+  -- ── The worker's next pass ────────────────────────────────────────────
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 0, v_t0);
+  v_ids := array(select x->>'application_id' from jsonb_array_elements(v_claim->'claimed') x
+                  where x->>'application_id' like 'pol141-%' order by 1);
+  perform _policy_tests.assert('0141: the next claim takes every nudged row',
+    v_ids = array['pol141-app-1', 'pol141-app-2', 'pol141-app-3', 'pol141-app-4'],
+    v_claim::text);
+
+  -- A nudge while the worker reads the row: the read may predate the move, so
+  -- the row is due again at once, the read in flight is refused, and the next
+  -- pass reads it again (the lease rule of 0139, as a backfill already does).
+  v_lease := (select x->>'lease_until' from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol141-app-1');
+  v_json := screening_v2.nudge_ashby_application_progress('pol141-app-1', v_t0 + interval '10 seconds');
+  v_a := screening_v2.record_ashby_application_progress(v_p1, v_lease::timestamptz, v_t0 + interval '11 seconds',
+           jsonb_build_object('outcome', 'ok', 'next_check_at', v_t0 + interval '6 hours',
+             'application', jsonb_build_object('status', 'Archived'), 'history', null));
+  select * into v_row from screening_v2.ashby_application_progress where id = v_p1;
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 0, v_t0 + interval '12 seconds');
+  v_ids := array(select x->>'application_id' from jsonb_array_elements(v_claim->'claimed') x
+                  where x->>'application_id' like 'pol141-%' order by 1);
+  perform _policy_tests.assert('0141: a nudge during a read marks it due again; the read is refused (lease_lost) and read again',
+    v_lease::timestamptz = v_t0 + interval '120 seconds'
+    and v_json = '{"status": "marked"}'::jsonb
+    and v_a = '{"status": "lease_lost"}'::jsonb
+    and v_row.next_check_at = v_t0 + interval '10 seconds' and v_row.status = 'Active'
+    and v_row.last_checked_at = v_t0 - interval '1 hour'
+    and v_ids = array['pol141-app-1'],
+    v_json::text || ' ' || v_a::text || ' ' || row_to_json(v_row)::text || ' ' || v_claim::text);
+
+  -- ── Nothing outside the progress table changed ────────────────────────
+  perform _policy_tests.assert('0141: a nudge writes nothing but the progress row',
+    (select string_agg(l.external_application_id || ':' || l.updated_at::text || ':' || coalesce(l.terminal_state, '-')
+                       || ':' || l.lifecycle || ':' || coalesce(l.candidate_id::text, '-'), ',' order by l.external_application_id)
+       from screening_v2.ashby_application_links l where l.external_application_id like 'pol141-%') = v_fp
+    and (select updated_at from screening_v2.candidates where id = v_cand) = v_cand_fp
+    and (select count(*) from screening_v2.audit_events) = v_audits
+    and (select count(*) from screening_v2.ashby_application_stage_intervals) = v_intervals
+    and (select count(*) from screening_v2.ashby_progress_runs) = v_runs,
+    'links, candidates, audit rows, intervals and runs must be untouched');
+
+  delete from screening_v2.ashby_application_progress
+   where application_link_id in (v_l1, v_l2, v_l3, v_l4, v_erased, v_ended, v_held);
+  delete from screening_v2.ashby_application_links where external_application_id like 'pol141-%';
+  delete from screening_v2.data_subject_requests where candidate_id = v_held_cand;
+  delete from screening_v2.candidates where id in (v_cand, v_held_cand);
+end;
+$$;
+
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
 -- the last phone assertion before the verdict.

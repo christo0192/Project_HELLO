@@ -82,8 +82,14 @@ describe('0138 shape', () => {
     const files = readdirSync(migrations).filter((f) => f.endsWith('.sql')).sort();
     expect(files.filter((f) => f.startsWith('0138_'))).toEqual([FILE]);
     // 0139_ashby_progress_worker.sql (M031 S3) adds functions over these tables and nothing else;
-    // 0140_ashby_business_impact.sql (M031 S5, the read model) follows it. Both by exact name, in that order.
-    expect(files.slice(files.indexOf(FILE) + 1)).toEqual(['0139_ashby_progress_worker.sql', '0140_ashby_business_impact.sql']);
+    // 0140_ashby_business_impact.sql (M031 S5, the read model) follows it, and
+    // 0141_ashby_progress_nudge.sql (M031 S4, the webhook nudge, one function over the progress table)
+    // follows that. All by exact name, in that order.
+    expect(files.slice(files.indexOf(FILE) + 1)).toEqual([
+      '0139_ashby_progress_worker.sql',
+      '0140_ashby_business_impact.sql',
+      '0141_ashby_progress_nudge.sql',
+    ]);
   });
 
   it('creates exactly the five tables and touches no other table', () => {
