@@ -133,10 +133,13 @@ primary_region = "sin"
   # route. See docs/runbooks/ashby-runtime-activation.md.
   ASHBY_PHONE_PARSING_ENABLED = "true"
   # Ashby progress worker (M031 S3, docs/runbooks/ashby-progress-worker.md):
-  # OFF. The `ashby-progress` loop ticks and does nothing until this is "true".
-  # "true" also turns on the webhook nudge (M031 S4, migration 0141 first).
+  # ON since M031 go-live (2026-11-11). The `ashby-progress` loop re-reads each
+  # imported application's Ashby stage history for the Business impact page,
+  # and "true" also turns on the webhook nudge (M031 S4, migration 0141). KILL
+  # SWITCH, no deploy needed (a Fly secret overrides [env]):
+  #   fly secrets set ASHBY_PROGRESS_ENABLED=false -a project-hello-api
   # Tunables keep their defaults (10 a pass, about 2 Ashby calls a second).
-  ASHBY_PROGRESS_ENABLED = "false"
+  ASHBY_PROGRESS_ENABLED = "true"
   # Phone canary flip (docs/runbooks/phone-worker-deployment.md §6): the exact
   # name of the dedicated phone worker (fly.phone.toml's PHONE_AGENT_NAME).
   # Non-empty means the API DISPATCHES phone rooms to that worker by name; the
