@@ -61,10 +61,34 @@ describe('probeJobStages — exactly one read, nothing written', () => {
     expect(jobInterviewPlanInfo).toHaveBeenCalledTimes(1);
     expect(jobInterviewPlanInfo).toHaveBeenCalledWith('job_1');
     expect(r.stages).toEqual([
-      { id: 'stage_ai', title: 'Bot Screening' },
-      { id: 'stage_ta', title: 'TA Screen' },
+      { id: 'stage_ai', title: 'Bot Screening', type: null, orderInInterviewPlan: null, interviewStageGroupId: null },
+      { id: 'stage_ta', title: 'TA Screen', type: null, orderInInterviewPlan: null, interviewStageGroupId: null },
     ]);
     expect(r.empty).toBe(false);
+  });
+
+  it('M031: keeps each stage\'s type, plan order and group id from the documented plan shape', async () => {
+    // jobInterviewPlan.info (API 2026-01-01): stages in plan order, each with
+    // `type`, a zero-indexed `orderInInterviewPlan` and `interviewStageGroupId`.
+    const jobInterviewPlanInfo = vi.fn(async () => ({
+      results: {
+        jobId: 'job_1',
+        interviewPlanId: 'plan_1',
+        stages: [
+          { id: 'stage_lead', title: 'New Lead', type: 'Lead', orderInInterviewPlan: 0, interviewStageGroupId: 'grp_1', interviewPlanId: 'plan_1' },
+          { id: 'stage_ai', title: 'Hello Christy', type: 'PreInterviewScreen', orderInInterviewPlan: 4, interviewStageGroupId: 'grp_2', interviewPlanId: 'plan_1' },
+          { id: 'stage_r1', title: 'R1', type: 'Active', orderInInterviewPlan: 8, interviewPlanId: 'plan_1' },
+          { id: 'stage_hired', title: 'Hired', type: 'Hired', orderInInterviewPlan: 17, interviewStageGroupId: null, interviewPlanId: 'plan_1' },
+        ],
+      },
+    }));
+    const r = await probeJobStages('job_1', { jobInterviewPlanInfo } as never);
+    expect(r.stages).toEqual([
+      { id: 'stage_lead', title: 'New Lead', type: 'Lead', orderInInterviewPlan: 0, interviewStageGroupId: 'grp_1' },
+      { id: 'stage_ai', title: 'Hello Christy', type: 'PreInterviewScreen', orderInInterviewPlan: 4, interviewStageGroupId: 'grp_2' },
+      { id: 'stage_r1', title: 'R1', type: 'Active', orderInInterviewPlan: 8, interviewStageGroupId: null },
+      { id: 'stage_hired', title: 'Hired', type: 'Hired', orderInInterviewPlan: 17, interviewStageGroupId: null },
+    ]);
   });
 
   it('reports empty rather than inventing stages', async () => {
@@ -79,7 +103,11 @@ describe('probeJobStages — exactly one read, nothing written', () => {
   });
 });
 
-describe('extractStages — copies ids and titles ONLY', () => {
+describe('extractStages — copies id, title, type, plan order and group id ONLY', () => {
+  /** A stage whose payload said nothing beyond its id (and maybe a title). */
+  const bare = (id: string, title: string | null = null) =>
+    ({ id, title, type: null, orderInInterviewPlan: null, interviewStageGroupId: null });
+
   it('never copies sibling fields that could carry candidate data', () => {
     const stages = extractStages({
       interviewStages: [{
@@ -89,22 +117,64 @@ describe('extractStages — copies ids and titles ONLY', () => {
         candidateName: 'Leaky Person',
         resumeUrl: 'https://files.example/leak.pdf',
         feedback: 'sensitive feedback text',
+        interviewPlanId: 'plan_not_copied',
       }],
     });
-    expect(stages).toEqual([{ id: 'stage_ai', title: 'Bot Screening' }]);
+    expect(stages).toEqual([bare('stage_ai', 'Bot Screening')]);
     const serialized = JSON.stringify(stages);
-    for (const leak of ['leak@example.invalid', 'Leaky Person', 'files.example', 'sensitive feedback']) {
+    for (const leak of ['leak@example.invalid', 'Leaky Person', 'files.example', 'sensitive feedback', 'plan_not_copied']) {
       expect(serialized).not.toContain(leak);
     }
   });
 
   it('reads the plausible tenant shapes without locking one speculatively', () => {
-    expect(extractStages([{ id: 'a' }])).toEqual([{ id: 'a', title: null }]);
-    expect(extractStages({ stages: [{ id: 'b' }] })).toEqual([{ id: 'b', title: null }]);
+    expect(extractStages([{ id: 'a' }])).toEqual([bare('a')]);
+    expect(extractStages({ stages: [{ id: 'b' }] })).toEqual([bare('b')]);
     expect(extractStages({ jobInterviewPlan: { interviewStages: [{ id: 'c' }] } }))
-      .toEqual([{ id: 'c', title: null }]);
+      .toEqual([bare('c')]);
     expect(extractStages({ interviewStages: [{ interviewStageId: 'd' }] }))
-      .toEqual([{ id: 'd', title: null }]);
+      .toEqual([bare('d')]);
+  });
+
+  it('M031: a type is an identifier or null, never free text, and is not a closed list', () => {
+    const types = extractStages({
+      stages: [
+        { id: 's1', type: 'Offer' },
+        // Ashby lists its types as examples, not a closed enum: a new one passes.
+        { id: 's2', type: 'SomeFutureType' },
+        { id: 's3', type: 'Not a type' },
+        { id: 's4', type: 'x'.repeat(65) },
+        { id: 's5', type: 42 },
+        { id: 's6', type: '' },
+      ],
+    }).map((s) => s.type);
+    expect(types).toEqual(['Offer', 'SomeFutureType', null, null, null, null]);
+  });
+
+  it('M031: plan order is a whole number from zero, or null', () => {
+    const orders = extractStages({
+      stages: [
+        { id: 's1', orderInInterviewPlan: 0 },
+        { id: 's2', orderInInterviewPlan: 17 },
+        { id: 's3', orderInInterviewPlan: -1 },
+        { id: 's4', orderInInterviewPlan: 1.5 },
+        { id: 's5', orderInInterviewPlan: '3' },
+        { id: 's6', orderInInterviewPlan: Number.MAX_SAFE_INTEGER + 2 },
+      ],
+    }).map((s) => s.orderInInterviewPlan);
+    expect(orders).toEqual([0, 17, null, null, null, null]);
+  });
+
+  it('M031: a group id must be opaque-id shaped, like the stage id', () => {
+    const groups = extractStages({
+      stages: [
+        { id: 's1', interviewStageGroupId: 'grp-1' },
+        { id: 's2', interviewStageGroupId: 'has space' },
+        { id: 's3', interviewStageGroupId: 7 },
+        { id: 's4' },
+      ],
+    }).map((s) => s.interviewStageGroupId);
+    expect(groups).toEqual(['grp-1', null, null, null]);
   });
 
   it('rejects ids that are not opaque-id shaped', () => {

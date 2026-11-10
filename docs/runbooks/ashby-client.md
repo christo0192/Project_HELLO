@@ -41,8 +41,47 @@ makes **no** claim of tenant validation or live Ashby connectivity.
 `candidate.info`, `file.info`, `jobInterviewPlan.info`,
 `feedbackFormDefinition.info`, `job.list`, `applicationFeedback.list`,
 `applicationFeedbackRequest.create`, `applicationFeedback.submit`,
-`application.changeStage`, `candidateTag.list`, `candidate.addTag`, and
-`candidate.removeTag`.
+`application.changeStage`, `candidateTag.list`, `candidate.addTag`,
+`candidate.removeTag`, `interviewStage.list`, and `interviewStage.info`.
+
+`interviewStage.list` and `interviewStage.info` (reads; need `interviewsRead`,
+M031) return interview-plan STRUCTURE: one plan's stages in order, or one stage,
+with type and plan position. Each body is exactly the one validated id
+(`{interviewPlanId}` or `{interviewStageId}`); no paging or filter is sent.
+`applicationList` takes the documented `status` filter, checked against the
+closed set Active, Hired, Archived, Lead before anything is sent; `extra`
+cannot override it. `applicationList`, `jobInterviewPlanInfo` and the two
+interview-stage helpers take an internal `deadlineAt` that is never sent.
+
+`failFastPastDeadline` (M031, internal, never sent, opt-in) goes with
+`deadlineAt` on `applicationInfo`, `candidateInfo`, `applicationList`,
+`applicationListHistory`, `jobInterviewPlanInfo`, the two interview-stage
+helpers and the two tag writes. Without it, a retry wait (a 429's
+`Retry-After`, a 5xx or network backoff) is clamped to the deadline and the
+next attempt then fails as `timeout` / `deadline_exceeded`, so the caller sleeps
+its whole budget and loses the 429. With it, a wait that would reach the
+deadline is not slept: the call fails at once as `retry_exhausted`, with the
+transient class (`rate_limited`, `http_server_error`, `timeout`, `network`) as
+its `code` and the last HTTP status. The access check sets it on every call;
+other callers keep the old behaviour.
+
+The admin access check (`GET …/mission-control/access-check`,
+`integrations/ashby/access-check.ts`) uses these reads, plus
+`application.info`, `application.listHistory` and `jobInterviewPlan.info`, to
+report whether the key holds Candidates read, Jobs read and Interviews read. A
+call reads as a missing permission only when Ashby names the error
+`missing_endpoint_permission`, on HTTP 403 or on HTTP 200 with `success: false`.
+Ashby also answers HTTP 403 when the key is wrong or deactivated
+(developers.ashbyhq.com/docs/authentication), so a 403 without that code reads
+as `error: forbidden`. `forbidden` on every permission means the key was
+rejected: replace the `ASHBY_API_KEY` secret rather than ask the Ashby admin to
+tick modules. A 401 means Ashby saw no key at all (`error: unauthorized`); HELLO
+never sends a request without one. A 429 or 5xx whose `Retry-After` or backoff
+would outlast the check's ~25 s budget is not waited on: it reads at once as
+`error: rate_limited` or `error: server_error` (never as a missing permission or
+`not_tried`), and the remaining reads still run; a short wait that fits is
+slept and the call retried. `rate_limited` means try the check again later. It
+returns states, coarse codes, counts and stage types, never an id or a name.
 
 `candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
 and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy
@@ -101,6 +140,12 @@ const app = await client.applicationInfo(applicationId); // throws AshbyError on
 `http_server_error`, `malformed_response`, `timeout`, `network`, `output_limit`,
 `retry_exhausted`. Errors expose only `category`, `code`, `httpStatus`,
 `operation`, `attempt`, `retriable`, and bounded sanitized `endpointCodes`.
+`endpointCodes` come from a `success: false` body on HTTP 200 and, since M031,
+from a JSON body on a permanent 4xx too (a 403 for a missing module names
+`missing_endpoint_permission`; a 403 for a wrong key does not). Only
+identifier-shaped `code` / `errorCode` values and string `errors` entries
+survive; every message is dropped, and a body that is not a JSON object yields
+none.
 
 ## Verification
 

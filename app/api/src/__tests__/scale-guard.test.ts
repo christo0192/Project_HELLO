@@ -859,6 +859,8 @@ const NOT_DRIVEN: Record<string, string> = {
   '/api/dsar/legal-holds/:holdId': ONE_RECORD,
   '/api/dsar/legal-holds/check': ONE_RECORD,
   '/api/health': NO_DB_LIST,
+  '/api/integrations/ashby/mission-control/access-check':
+    'at most 51 enabled mappings and one link, then at most 24 live Ashby reads under one deadline (5 job plans, 5 stage lists, one history page per application)',
   '/api/integrations/ashby/mission-control/health': COUNTS_ONLY,
   '/api/integrations/ashby/mission-control/jobs': ASHBY_READ,
   '/api/integrations/ashby/mission-control/jobs/:externalJobId/feedback-form': ASHBY_READ,
@@ -1038,6 +1040,7 @@ function variableListReads(source: string): string[] {
  * grows with the workspace, read it through chunkIds (lib/id-batches.ts) instead.
  */
 const BOUNDED_LISTS: ReadonlyArray<{ file: string; values: string; sites: number; why: string }> = [
+  { file: 'integrations/ashby/access-check.ts', values: '[...jobByMapping.keys()]', sites: 1, why: 'the enabled mappings the check read, at most MAPPING_READ_CAP (50) ids' },
   { file: 'integrations/ashby/runtime-health.ts', values: 'names', sites: 5, why: 'a copy of the constant ASHBY_QUEUE_NAMES' },
   { file: 'lib/attempt-consent-stage.ts', values: 'ids', sites: 2, why: "one candidate's call legs, and past the limit the read fails closed to unknown" },
   { file: 'lib/dsar.ts', values: 'sessionIds', sites: 1, why: "one data subject's sessions" },

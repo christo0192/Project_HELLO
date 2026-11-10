@@ -79,7 +79,9 @@ export type AshbyOperation =
   | 'application.changeStage'
   | 'candidateTag.list'
   | 'candidate.addTag'
-  | 'candidate.removeTag';
+  | 'candidate.removeTag'
+  | 'interviewStage.list'
+  | 'interviewStage.info';
 
 export interface AshbyOperationSpec {
   /** Fixed request path appended to the allowlisted base origin. */
@@ -120,7 +122,21 @@ export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpe
   // sends the three Christy tags and reads candidate.info before it writes.
   'candidate.addTag':                  { path: '/candidate.addTag',                  mutation: true },
   'candidate.removeTag':               { path: '/candidate.removeTag',               mutation: true },
+  // Interview-plan STRUCTURE (permission `interviewsRead`, M031): one plan's
+  // stages in order, or one stage, each with its type and plan position. No
+  // application or candidate data. Read by the Mission Control access check
+  // and, later, the stage catalogue for stages outside a job's current plan.
+  'interviewStage.list':               { path: '/interviewStage.list',               mutation: false },
+  'interviewStage.info':               { path: '/interviewStage.info',               mutation: false },
 } as const;
+
+/**
+ * `application.list` status values Ashby documents. A closed set on purpose:
+ * a filter value the endpoint did not recognise could be ignored (listing
+ * every application) rather than refused, so nothing else is ever sent.
+ */
+export const ASHBY_APPLICATION_STATUSES = ['Active', 'Hired', 'Archived', 'Lead'] as const;
+export type AshbyApplicationStatus = (typeof ASHBY_APPLICATION_STATUSES)[number];
 
 // ── Narrow, extension-friendly request shapes ───────────────────────────────
 // Only fields we are confident about are named; everything else rides in
@@ -135,8 +151,27 @@ export interface ApplicationListParams {
   limit?: number;
   /** Documented jobId filter; used only for mapping-scoped previews. */
   jobId?: string;
+  /**
+   * Documented status filter (M031 access check). Validated against
+   * {@link ASHBY_APPLICATION_STATUSES}; any other value is refused before a
+   * transport call. Callers still check each returned row's own status.
+   */
+  status?: AshbyApplicationStatus;
   /** Tenant-verifiable additional request fields. */
   extra?: OpaqueRecord;
+  /** Internal wall-clock deadline (epoch ms); never sent to Ashby. */
+  deadlineAt?: number;
+  /** Internal; see {@link AshbyCallOptions.failFastPastDeadline}. Never sent. */
+  failFastPastDeadline?: boolean;
+}
+
+/** `interviewStage.list`: one interview plan's stages, in plan order. */
+export interface InterviewStageListParams {
+  interviewPlanId: string;
+  /** Internal wall-clock deadline (epoch ms); never sent to Ashby. */
+  deadlineAt?: number;
+  /** Internal; see {@link AshbyCallOptions.failFastPastDeadline}. Never sent. */
+  failFastPastDeadline?: boolean;
 }
 
 /**
@@ -168,6 +203,8 @@ export interface ApplicationHistoryParams {
   limit?: number;
   /** Internal wall-clock deadline; never sent to Ashby. */
   deadlineAt?: number;
+  /** Internal; see {@link AshbyCallOptions.failFastPastDeadline}. Never sent. */
+  failFastPastDeadline?: boolean;
 }
 
 /** `candidateTag.list` paging. `includeArchived: false` is sent by the helper. */
@@ -190,6 +227,15 @@ export interface AshbyCallOptions {
    * and any Retry-After wait, and past it the call fails as a `timeout`.
    */
   deadlineAt?: number;
+  /**
+   * Only with `deadlineAt` (M031). A retry wait (Retry-After or backoff) that
+   * would reach the deadline is not slept: the call fails at once as
+   * `retry_exhausted` carrying the transient class (`rate_limited`,
+   * `http_server_error`, `timeout`, `network`) as its code and the last HTTP
+   * status, instead of sleeping to the deadline and failing as a bare
+   * `timeout`. Off by default, so existing callers keep their behaviour.
+   */
+  failFastPastDeadline?: boolean;
 }
 
 export interface FeedbackSubmitRequest {
