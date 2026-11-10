@@ -509,6 +509,94 @@ describe('one deadline for the whole check', () => {
     expect(reader.applicationInfo).not.toHaveBeenCalled();
     expect(reader.applicationList).not.toHaveBeenCalled();
   });
+
+  it('asks every call to fail at once rather than sleep past the deadline', async () => {
+    const reader = readerFrom();
+    await runAccessCheck(reader, TARGETS);
+    const options = [
+      ...reader.jobInterviewPlanInfo.mock.calls.map((c) => (c as unknown[])[2]),
+      ...reader.interviewStageList.mock.calls.map((c) => (c as unknown[])[0]),
+      ...reader.applicationInfo.mock.calls.map((c) => (c as unknown[])[2]),
+      ...reader.applicationListHistory.mock.calls.map((c) => (c as unknown[])[0]),
+      ...reader.applicationList.mock.calls.map((c) => (c as unknown[])[0]),
+    ] as Array<{ failFastPastDeadline?: boolean }>;
+    expect(options.length).toBeGreaterThan(0);
+    for (const o of options) expect(o.failFastPastDeadline).toBe(true);
+  });
+
+  it('a 429 whose Retry-After outlasts the budget is reported as rate_limited at once, not slept on until a timeout', async () => {
+    const slept: number[] = [];
+    const limited = () => ({
+      status: 429, ok: false, text: async () => '',
+      headers: { get: (n: string) => (n.toLowerCase() === 'retry-after' ? '30' : null) },
+    });
+    const t = tenant({ '/jobInterviewPlan.info': limited }, {
+      maxAttempts: 3,
+      sleep: async (ms: number) => { slept.push(ms); await new Promise((r) => setTimeout(r, ms)); },
+    });
+    const started = Date.now();
+    const r = await runAccessCheck(t.client, TARGETS, { deadlineAt: started + 1_500 });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(slept).toEqual([]);
+    expect(r.permissions.jobsRead).toEqual({ state: 'error', error: 'rate_limited' });
+    expect(r.operations.jobInterviewPlanInfo).toMatchObject({ state: 'error', error: 'rate_limited', calls: 2, failed: 2 });
+    // The budget was not spent: the other reads still ran.
+    expect(r.deadlineHit).toBe(false);
+    expect(r.permissions.candidatesRead).toEqual(OK);
+  });
+
+  it('a 429 whose Retry-After fits the budget is honoured: the wait is slept and the retry answers ok', async () => {
+    const slept: number[] = [];
+    let limitedOnce = false;
+    const t = tenant({
+      '/jobInterviewPlan.info': (body) => {
+        if (!limitedOnce) {
+          limitedOnce = true;
+          return {
+            status: 429, ok: false, text: async () => '',
+            headers: { get: (n: string) => (n.toLowerCase() === 'retry-after' ? '1' : null) },
+          };
+        }
+        return success(plan(String(body.jobId)));
+      },
+    }, {
+      maxAttempts: 3,
+      sleep: async (ms: number) => { slept.push(ms); },
+    });
+    const r = await runAccessCheck(t.client, TARGETS);
+    expect(slept).toEqual([1_000]);
+    expect(r.permissions).toEqual({ candidatesRead: OK, jobsRead: OK, interviewsRead: OK });
+    // Two jobs, two calls: the retry happens inside the first call.
+    expect(r.operations.jobInterviewPlanInfo).toEqual({ ...OK, calls: 2, ok: 2, missingPermission: 0, failed: 0 });
+    expect(t.requests.filter((q) => q.path === '/jobInterviewPlan.info')).toHaveLength(3);
+    expect(r.deadlineHit).toBe(false);
+  });
+
+  it('when the plan reads ran into the deadline, Interviews read says deadline, not "nothing to try"', async () => {
+    const reader = readerFrom();
+    let t = Date.now();
+    reader.jobInterviewPlanInfo.mockImplementation(async () => {
+      t += 60_000;
+      throw new AshbyError('timeout', { code: 'deadline_exceeded' });
+    });
+    const r = await runAccessCheck(reader, TARGETS, { now: () => t });
+    expect(r.deadlineHit).toBe(true);
+    expect(r.permissions.jobsRead).toEqual({ state: 'error', error: 'timeout' });
+    expect(r.permissions.interviewsRead).toEqual({ state: 'not_tried', error: 'deadline' });
+    expect(r.operations.interviewStageList).toMatchObject({ state: 'not_tried', error: 'deadline', calls: 0 });
+    expect(reader.interviewStageList).not.toHaveBeenCalled();
+  });
+
+  it('when the plan reads failed for another reason, Interviews read stays "nothing to try"', async () => {
+    const reader = readerFrom();
+    reader.jobInterviewPlanInfo.mockImplementation(async () => {
+      throw new AshbyError('retry_exhausted', { code: 'http_server_error', httpStatus: 503 });
+    });
+    const r = await runAccessCheck(reader, TARGETS);
+    expect(r.deadlineHit).toBe(false);
+    expect(r.permissions.jobsRead).toEqual({ state: 'error', error: 'server_error' });
+    expect(r.permissions.interviewsRead).toEqual({ state: 'not_tried', error: null });
+  });
 });
 
 // ── Read-only by construction ───────────────────────────────────────────────

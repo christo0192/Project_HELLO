@@ -161,6 +161,8 @@ export interface ApplicationListParams {
   extra?: OpaqueRecord;
   /** Internal wall-clock deadline (epoch ms); never sent to Ashby. */
   deadlineAt?: number;
+  /** Internal; see {@link AshbyCallOptions.failFastPastDeadline}. Never sent. */
+  failFastPastDeadline?: boolean;
 }
 
 /** `interviewStage.list`: one interview plan's stages, in plan order. */
@@ -168,6 +170,8 @@ export interface InterviewStageListParams {
   interviewPlanId: string;
   /** Internal wall-clock deadline (epoch ms); never sent to Ashby. */
   deadlineAt?: number;
+  /** Internal; see {@link AshbyCallOptions.failFastPastDeadline}. Never sent. */
+  failFastPastDeadline?: boolean;
 }
 
 /**
@@ -199,6 +203,8 @@ export interface ApplicationHistoryParams {
   limit?: number;
   /** Internal wall-clock deadline; never sent to Ashby. */
   deadlineAt?: number;
+  /** Internal; see {@link AshbyCallOptions.failFastPastDeadline}. Never sent. */
+  failFastPastDeadline?: boolean;
 }
 
 /** `candidateTag.list` paging. `includeArchived: false` is sent by the helper. */
@@ -221,6 +227,15 @@ export interface AshbyCallOptions {
    * and any Retry-After wait, and past it the call fails as a `timeout`.
    */
   deadlineAt?: number;
+  /**
+   * Only with `deadlineAt` (M031). A retry wait (Retry-After or backoff) that
+   * would reach the deadline is not slept: the call fails at once as
+   * `retry_exhausted` carrying the transient class (`rate_limited`,
+   * `http_server_error`, `timeout`, `network`) as its code and the last HTTP
+   * status, instead of sleeping to the deadline and failing as a bare
+   * `timeout`. Off by default, so existing callers keep their behaviour.
+   */
+  failFastPastDeadline?: boolean;
 }
 
 export interface FeedbackSubmitRequest {

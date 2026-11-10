@@ -29,7 +29,10 @@
  *
  * BOUNDED: at most {@link MAX_JOBS} jobs, {@link MAX_PLANS} plans and one
  * history page per application, all under ONE deadline. A call the deadline
- * leaves no time for is not made.
+ * leaves no time for is not made, and a retry wait (a 429's Retry-After, a
+ * 5xx backoff) that would outlast it is not slept: the call reports its cause,
+ * `rate_limited` or `server_error`, at once (the client's
+ * `failFastPastDeadline`).
  *
  * A call reads as `missing_permission` ONLY when Ashby names the error
  * `missing_endpoint_permission`, on HTTP 403 or on HTTP 200 with
@@ -431,9 +434,15 @@ export async function runAccessCheck(
     return { state: 'not_tried', error: 'deadline', found, history: null };
   };
 
+  // Every call shares the one deadline and fails at once, rather than sleeping
+  // until the deadline, when a Retry-After or backoff would outlast it: the
+  // admin then reads `rate_limited` or `server_error`, not a bare `timeout`
+  // after the whole budget was spent waiting.
+  const timing = { deadlineAt, failFastPastDeadline: true } as const;
+
   async function readHistory(applicationId: string, plan: PlanView | null): Promise<AccessCheckSample> {
     const outcome = await call('applicationListHistory', () =>
-      reader.applicationListHistory({ applicationId, limit: HISTORY_PAGE, deadlineAt }));
+      reader.applicationListHistory({ applicationId, limit: HISTORY_PAGE, ...timing }));
     if (outcome.kind !== 'ok') return sampleFrom(outcome, true);
     return {
       state: 'ok',
@@ -448,22 +457,27 @@ export async function runAccessCheck(
   const jobs = distinctJobs.slice(0, MAX_JOBS);
   const plans = new Map<string, PlanView>();
   for (const jobId of jobs) {
-    const outcome = await call('jobInterviewPlanInfo', () => reader.jobInterviewPlanInfo(jobId, undefined, { deadlineAt }));
+    const outcome = await call('jobInterviewPlanInfo', () => reader.jobInterviewPlanInfo(jobId, undefined, timing));
     if (outcome.kind === 'ok') plans.set(jobId, readPlan(outcome.value.results));
   }
 
   // 2. Interviews read: the stage list of each distinct plan those reads named.
   const planIds = [...new Set([...plans.values()].map((p) => p.planId).filter((id): id is string => id !== null))]
     .slice(0, MAX_PLANS);
+  // No plan to list because the deadline cut the plan reads short: that is
+  // "not tried: deadline", not "nothing to try".
+  if (planIds.length === 0 && deadlineHit && plans.size < jobs.length) {
+    tallies.interviewStageList.skippedForDeadline = true;
+  }
   for (const interviewPlanId of planIds) {
-    await call('interviewStageList', () => reader.interviewStageList({ interviewPlanId, deadlineAt }));
+    await call('interviewStageList', () => reader.interviewStageList({ interviewPlanId, ...timing }));
   }
 
   // 3. Candidates read: the newest imported application, and its history.
   let imported: AccessCheckSample = { state: 'not_tried', error: null, found: false, history: null };
   const importedId = opaqueId(targets.imported?.applicationId);
   if (targets.imported && importedId) {
-    await call('applicationInfo', () => reader.applicationInfo(importedId, undefined, { deadlineAt }));
+    await call('applicationInfo', () => reader.applicationInfo(importedId, undefined, timing));
     imported = await readHistory(importedId, plans.get(targets.imported.jobId) ?? null);
   }
 
@@ -471,7 +485,7 @@ export async function runAccessCheck(
   async function findByStatus(status: AshbyApplicationStatus): Promise<AccessCheckSample> {
     if (jobs.length === 0) return { state: 'not_tried', error: null, found: null, history: null };
     for (const jobId of jobs) {
-      const outcome = await call('applicationList', () => reader.applicationList({ jobId, status, limit: 1, deadlineAt }));
+      const outcome = await call('applicationList', () => reader.applicationList({ jobId, status, limit: 1, ...timing }));
       if (outcome.kind !== 'ok') return sampleFrom(outcome, null);
       const rows = Array.isArray(outcome.value.results) ? outcome.value.results : [];
       if (rows.length === 0) continue;

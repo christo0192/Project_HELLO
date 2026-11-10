@@ -143,6 +143,8 @@ export interface RequestOptions {
   idempotent?: boolean;
   /** Internal caller deadline used to shorten the per-request timeout. */
   deadlineAt?: number;
+  /** See {@link AshbyCallOptions.failFastPastDeadline}. Only with `deadlineAt`. */
+  failFastPastDeadline?: boolean;
 }
 
 function defaultTransport(req: AshbyTransportRequest): Promise<AshbyTransportResponse> {
@@ -159,6 +161,14 @@ function boundedInt(v: number | undefined, def: number, min: number, max: number
   if (v < min) return min;
   if (v > max) return max;
   return v;
+}
+
+/**
+ * A helper's internal timing options as request options. Copies only the
+ * deadline and the fail-fast flag; neither is ever part of the request body.
+ */
+function callTiming(options: { deadlineAt?: number; failFastPastDeadline?: boolean } = {}): RequestOptions {
+  return { deadlineAt: options.deadlineAt, failFastPastDeadline: options.failFastPastDeadline === true };
 }
 
 /** Validate a caller-supplied id/handle string. Fail closed on anything unsafe. */
@@ -300,9 +310,24 @@ export class AshbyClient {
 
     const retryDelay = (delay: number) => options.deadlineAt === undefined
       ? delay : Math.max(0, Math.min(delay, options.deadlineAt - Date.now()));
+    // Fail fast (opt-in): a retry wait that would reach the deadline is not
+    // slept, so the caller learns what Ashby said (a 429, a 5xx) at once rather
+    // than a bare timeout once the whole budget has been slept away.
+    const deadlineAt = options.deadlineAt;
+    const failFast = options.failFastPastDeadline === true && deadlineAt !== undefined;
+    const waitOutlastsDeadline = (delay: number) => failFast && Date.now() + delay >= (deadlineAt as number);
+    const exhausted = (last: AshbyError | null) => new AshbyError('retry_exhausted', {
+      operation,
+      attempt: last?.attempt ?? this.maxAttempts,
+      httpStatus: last?.httpStatus ?? null,
+      code: last?.category ?? 'retry_exhausted',
+      retriable: false,
+    });
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       const started = Date.now();
-      if (options.deadlineAt !== undefined && started >= options.deadlineAt) {
+      if (deadlineAt !== undefined && started >= deadlineAt) {
+        // A sleep that overran the deadline: under fail-fast, keep the cause.
+        if (failFast && lastError) throw exhausted(lastError);
         throw new AshbyError('timeout', { operation, attempt, retriable: true, code: 'deadline_exceeded' });
       }
       let response: AshbyTransportResponse;
@@ -320,7 +345,9 @@ export class AshbyClient {
           throw new AshbyError(category, { operation, attempt, retriable: false });
         }
         if (attempt < this.maxAttempts) {
-          await this.sleep(retryDelay(this.backoffMs(attempt)));
+          const delay = this.backoffMs(attempt);
+          if (waitOutlastsDeadline(delay)) break;
+          await this.sleep(retryDelay(delay));
           continue;
         }
         break;
@@ -350,7 +377,9 @@ export class AshbyClient {
             const retryAfter = status === 429
               ? parseRetryAfterMs(response.headers.get('retry-after'), this.maxRetryAfterMs)
               : null;
-            await this.sleep(retryDelay(retryAfter ?? this.backoffMs(attempt)));
+            const delay = retryAfter ?? this.backoffMs(attempt);
+            if (waitOutlastsDeadline(delay)) break;
+            await this.sleep(retryDelay(delay));
             continue;
           }
           break;
@@ -396,14 +425,9 @@ export class AshbyClient {
       };
     }
 
-    // Exhausted the attempt budget on a transient class.
-    throw new AshbyError('retry_exhausted', {
-      operation,
-      attempt: this.maxAttempts,
-      httpStatus: lastError?.httpStatus ?? null,
-      code: lastError?.category ?? 'retry_exhausted',
-      retriable: false,
-    });
+    // Exhausted the attempt budget on a transient class (or, under fail-fast,
+    // the time budget: the next wait would have reached the deadline).
+    throw exhausted(lastError);
   }
 
   private async send(url: string, body: string, timeoutMs: number): Promise<AshbyTransportResponse> {
@@ -470,7 +494,7 @@ export class AshbyClient {
     options: AshbyCallOptions = {},
   ): Promise<AshbyResult<T>> {
     validateId('application.info', 'applicationId', applicationId);
-    return this.request<T>('application.info', { applicationId, ...(extra ?? {}) }, { deadlineAt: options.deadlineAt });
+    return this.request<T>('application.info', { applicationId, ...(extra ?? {}) }, callTiming(options));
   }
 
   /**
@@ -494,7 +518,7 @@ export class AshbyClient {
       }
       body.status = params.status;
     }
-    return this.request<T>('application.list', body, { deadlineAt: params.deadlineAt });
+    return this.request<T>('application.list', body, callTiming(params));
   }
 
   /**
@@ -525,7 +549,7 @@ export class AshbyClient {
       if (limit === 0) throw new AshbyError('invalid_request', { code: 'invalid_limit', operation: 'application.listHistory' });
       body.limit = limit;
     }
-    return this.request<T>('application.listHistory', body, { deadlineAt: params.deadlineAt });
+    return this.request<T>('application.listHistory', body, callTiming(params));
   }
 
   /**
@@ -541,7 +565,7 @@ export class AshbyClient {
     options: AshbyCallOptions = {},
   ): Promise<AshbyResult<T>> {
     const id = validateId('candidate.info', 'candidateId', candidateId);
-    return this.request<T>('candidate.info', { ...(extra ?? {}), id }, { deadlineAt: options.deadlineAt });
+    return this.request<T>('candidate.info', { ...(extra ?? {}), id }, callTiming(options));
   }
 
   /**
@@ -564,7 +588,7 @@ export class AshbyClient {
     options: AshbyCallOptions = {},
   ): Promise<AshbyResult<T>> {
     validateId('jobInterviewPlan.info', 'jobId', jobId);
-    return this.request<T>('jobInterviewPlan.info', { jobId, ...(extra ?? {}) }, { deadlineAt: options.deadlineAt });
+    return this.request<T>('jobInterviewPlan.info', { jobId, ...(extra ?? {}) }, callTiming(options));
   }
 
   /**
@@ -575,7 +599,7 @@ export class AshbyClient {
    */
   async interviewStageList<T = OpaqueRecord[]>(params: InterviewStageListParams): Promise<AshbyResult<T>> {
     const interviewPlanId = validateId('interviewStage.list', 'interviewPlanId', params?.interviewPlanId);
-    return this.request<T>('interviewStage.list', { interviewPlanId }, { deadlineAt: params.deadlineAt });
+    return this.request<T>('interviewStage.list', { interviewPlanId }, callTiming(params));
   }
 
   /** One interview stage (permission `interviewsRead`). Body is exactly `{ interviewStageId }`. */
@@ -584,7 +608,7 @@ export class AshbyClient {
     options: AshbyCallOptions = {},
   ): Promise<AshbyResult<T>> {
     const id = validateId('interviewStage.info', 'interviewStageId', interviewStageId);
-    return this.request<T>('interviewStage.info', { interviewStageId: id }, { deadlineAt: options.deadlineAt });
+    return this.request<T>('interviewStage.info', { interviewStageId: id }, callTiming(options));
   }
 
   /**
@@ -677,7 +701,7 @@ export class AshbyClient {
       candidateId: validateId('candidate.addTag', 'candidateId', candidateId),
       tagId: validateId('candidate.addTag', 'tagId', tagId),
     };
-    return this.request<T>('candidate.addTag', body, { idempotent: true, deadlineAt: options.deadlineAt });
+    return this.request<T>('candidate.addTag', body, { idempotent: true, ...callTiming(options) });
   }
 
   /** Remove one tag from a candidate. Same body and retry reasoning as {@link candidateAddTag}. */
@@ -690,7 +714,7 @@ export class AshbyClient {
       candidateId: validateId('candidate.removeTag', 'candidateId', candidateId),
       tagId: validateId('candidate.removeTag', 'tagId', tagId),
     };
-    return this.request<T>('candidate.removeTag', body, { idempotent: true, deadlineAt: options.deadlineAt });
+    return this.request<T>('candidate.removeTag', body, { idempotent: true, ...callTiming(options) });
   }
 
   // ── Cursor pagination helper (page/item caps + loop detection) ────────────

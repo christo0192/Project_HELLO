@@ -53,6 +53,18 @@ closed set Active, Hired, Archived, Lead before anything is sent; `extra`
 cannot override it. `applicationList`, `jobInterviewPlanInfo` and the two
 interview-stage helpers take an internal `deadlineAt` that is never sent.
 
+`failFastPastDeadline` (M031, internal, never sent, opt-in) goes with
+`deadlineAt` on `applicationInfo`, `candidateInfo`, `applicationList`,
+`applicationListHistory`, `jobInterviewPlanInfo`, the two interview-stage
+helpers and the two tag writes. Without it, a retry wait (a 429's
+`Retry-After`, a 5xx or network backoff) is clamped to the deadline and the
+next attempt then fails as `timeout` / `deadline_exceeded`, so the caller sleeps
+its whole budget and loses the 429. With it, a wait that would reach the
+deadline is not slept: the call fails at once as `retry_exhausted`, with the
+transient class (`rate_limited`, `http_server_error`, `timeout`, `network`) as
+its `code` and the last HTTP status. The access check sets it on every call;
+other callers keep the old behaviour.
+
 The admin access check (`GET …/mission-control/access-check`,
 `integrations/ashby/access-check.ts`) uses these reads, plus
 `application.info`, `application.listHistory` and `jobInterviewPlan.info`, to
@@ -64,8 +76,12 @@ Ashby also answers HTTP 403 when the key is wrong or deactivated
 as `error: forbidden`. `forbidden` on every permission means the key was
 rejected: replace the `ASHBY_API_KEY` secret rather than ask the Ashby admin to
 tick modules. A 401 means Ashby saw no key at all (`error: unauthorized`); HELLO
-never sends a request without one. It returns states, coarse codes, counts and
-stage types, never an id or a name.
+never sends a request without one. A 429 or 5xx whose `Retry-After` or backoff
+would outlast the check's ~25 s budget is not waited on: it reads at once as
+`error: rate_limited` or `error: server_error` (never as a missing permission or
+`not_tried`), and the remaining reads still run; a short wait that fits is
+slept and the call retried. `rate_limited` means try the check again later. It
+returns states, coarse codes, counts and stage types, never an id or a name.
 
 `candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
 and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy

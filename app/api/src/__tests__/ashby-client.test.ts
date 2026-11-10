@@ -604,6 +604,82 @@ describe('M031 — call deadlines are honoured and never sent', () => {
   });
 });
 
+// ── M031: a retry wait the deadline cannot cover fails at once ─────────────
+//
+// Without the option a 429 whose Retry-After outlasts the caller's budget is
+// slept on until the deadline and then fails as `timeout`/`deadline_exceeded`:
+// the caller waits the whole budget and loses the 429. With
+// `failFastPastDeadline` the call fails at once as `retry_exhausted`, carrying
+// the transient class, so the caller can report what Ashby actually said.
+
+describe('M031 — failFastPastDeadline', () => {
+  const retryAfter = (seconds: string) => res(429, '', { 'retry-after': seconds });
+  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+  it('a 429 whose Retry-After outlasts the budget fails at once as rate_limited, with no sleep', async () => {
+    const { client, calls, sleepLog } = makeClient([retryAfter('30'), ok({})], { maxAttempts: 3 });
+    const err = await client.jobInterviewPlanInfo('job_1', undefined, {
+      deadlineAt: Date.now() + 1_000, failFastPastDeadline: true,
+    }).catch((e) => e) as AshbyError;
+    expect(err).toMatchObject({ category: 'retry_exhausted', code: 'rate_limited', httpStatus: 429, operation: 'jobInterviewPlan.info', attempt: 1 });
+    expect(sleepLog).toEqual([]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a 5xx whose backoff outlasts the budget fails at once as http_server_error', async () => {
+    // backoff = 500 * 2^0 * jitter(0.75) = 375 ms, more than the 100 ms left.
+    const { client, calls, sleepLog } = makeClient([res(503, 'busy'), ok([])], { maxAttempts: 3 });
+    await expect(client.applicationList({ jobId: 'job_1', deadlineAt: Date.now() + 100, failFastPastDeadline: true }))
+      .rejects.toMatchObject({ category: 'retry_exhausted', code: 'http_server_error', httpStatus: 503 });
+    expect(sleepLog).toEqual([]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a network failure whose backoff outlasts the budget fails at once as network', async () => {
+    const { client, sleepLog } = makeClient([new Error('econn'), ok([])], { maxAttempts: 3 });
+    await expect(client.interviewStageList({ interviewPlanId: 'plan_1', deadlineAt: Date.now() + 100, failFastPastDeadline: true }))
+      .rejects.toMatchObject({ category: 'retry_exhausted', code: 'network' });
+    expect(sleepLog).toEqual([]);
+  });
+
+  it('a wait the budget does cover is still slept, and the retry still succeeds', async () => {
+    const { client, calls, sleepLog } = makeClient([retryAfter('1'), ok([])], { maxAttempts: 3 });
+    const r = await client.applicationListHistory({ applicationId: 'app_1', deadlineAt: Date.now() + 60_000, failFastPastDeadline: true });
+    expect(r.results).toEqual([]);
+    expect(sleepLog).toEqual([1_000]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('a sleep that overran the deadline still reports the transient cause, not a bare timeout', async () => {
+    // Retry-After 0 fits the budget, but the sleep itself runs past the deadline.
+    const { client } = makeClient([retryAfter('0'), ok({})], { maxAttempts: 3, sleep: async () => { await wait(80); } });
+    await expect(client.applicationInfo('app_1', undefined, { deadlineAt: Date.now() + 40, failFastPastDeadline: true }))
+      .rejects.toMatchObject({ category: 'retry_exhausted', code: 'rate_limited', httpStatus: 429 });
+  });
+
+  it('without the option nothing changes: the wait is clamped to the deadline and the call fails as a timeout', async () => {
+    const { client, calls } = makeClient([retryAfter('30'), ok({})], { maxAttempts: 3, sleep: async (ms: number) => { await wait(ms); } });
+    await expect(client.jobInterviewPlanInfo('job_1', undefined, { deadlineAt: Date.now() + 50 }))
+      .rejects.toMatchObject({ category: 'timeout', code: 'deadline_exceeded' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('the option is internal and never sent', async () => {
+    const { client, calls } = makeClient([ok({}), ok([]), ok([]), ok([]), ok({}), ok({})]);
+    const o = { deadlineAt: Date.now() + 60_000, failFastPastDeadline: true };
+    await client.applicationInfo('app_1', undefined, o);
+    await client.applicationList({ jobId: 'job_1', ...o });
+    await client.applicationListHistory({ applicationId: 'app_1', ...o });
+    await client.interviewStageList({ interviewPlanId: 'plan_1', ...o });
+    await client.jobInterviewPlanInfo('job_1', undefined, o);
+    await client.interviewStageInfo('stage_1', o);
+    for (const c of calls) {
+      expect(c.body).not.toContain('failFast');
+      expect(c.body).not.toContain('deadline');
+    }
+  });
+});
+
 // ── Metadata-only default logger ───────────────────────────────────────────
 
 describe('createMetadataLogger', () => {
