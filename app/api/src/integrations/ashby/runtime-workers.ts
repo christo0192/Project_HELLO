@@ -73,6 +73,8 @@ import {
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { LEGACY_INVITE_SKIPPED_EVENT, runAshbyOperationPass } from './operation-worker.js';
 import { createChristyTagResolver, recommendationTagsEnabled } from './recommendation-tags.js';
+import { runProgressPass, type ProgressPassResult } from './progress-worker.js';
+import { loadAshbyProgressConfig } from './config.js';
 import { probeFeedbackFormDefinition, type FormDefinitionReader, type ProbeFeedbackForm } from './probe.js';
 
 /**
@@ -161,6 +163,9 @@ const PROFILE_SWEEP_INTERVAL_MS = 600_000;
 
 /** Links one sweep tick may claim. */
 const PROFILE_SWEEP_LIMIT = 25;
+
+/** The M031 progress worker's loop name (plan section 5). */
+export const ASHBY_PROGRESS_LOOP = 'ashby-progress';
 
 /**
  * Should a candidate admitted to phone screening get questions written about
@@ -2321,6 +2326,18 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
   // is shared across ticks.
   const christyTagResolver = createChristyTagResolver(runtime.client);
 
+  // ── M031 progress worker ────────────────────────────────────────────────
+  // Off unless ASHBY_PROGRESS_ENABLED is 'true'. A runtime built by hand
+  // without the config or the store reads as off: the loop still ticks (so
+  // /health sees it) and does nothing, with no query and no Ashby call.
+  const progressConfig = rc.progress ?? loadAshbyProgressConfig({});
+  const progressStore = runtime.progress;
+  let lastProgressPass: ProgressPassResult | null = null;
+  // Passes this machine skipped in a row for a CPU-starved scanner. At
+  // MAX_SCANNER_SKIPS the pass reads one application anyway; any pass that
+  // runs records the count on its run row, and the count starts over.
+  let progressScannerSkips = 0;
+
   const scheduler = createAshbyScheduler({
     ...(options.scheduler ?? {}),
     loops: [
@@ -2576,6 +2593,40 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
           return linkIds.length > 0;
         },
       },
+      {
+        // ── Ashby progress (M031 S3, plan section 5) ─────────────────────
+        // Re-reads each imported application's status and stage history
+        // (integrations/ashby/progress-worker.ts). The claim, its lease,
+        // the cadence and the backfill all live in the 0139 functions, so
+        // two machines never read one application at once. Small batches,
+        // about 2 Ashby calls a second, each call with its own budget inside
+        // one pass deadline, and no pass while the resume scanner is short
+        // of CPU (scanner_timeout / scanner_busy deferrals), capped at
+        // MAX_SCANNER_SKIPS passes in a row. While a pass fills its batch (a
+        // backfill draining) the next one comes on the short drain interval.
+        name: ASHBY_PROGRESS_LOOP,
+        intervalMs: progressConfig.intervalMs,
+        intervalMsFor: () => (lastProgressPass?.drain ? progressConfig.drainIntervalMs : progressConfig.intervalMs),
+        tick: async () => {
+          if (!progressConfig.enabled || !progressStore) return false;
+          const r = await runProgressPass({
+            reader: runtime.client, store: progressStore, config: progressConfig, scannerSkips: progressScannerSkips,
+          });
+          lastProgressPass = r;
+          progressScannerSkips = r.skipped === 'scanner_busy' ? progressScannerSkips + 1 : 0;
+          if (r.skipped === null && (r.claimed > 0 || r.backfillFinished)) {
+            // Counts only, as a sanitized code: never an id.
+            logger.info('unknown_event', {
+              error_category: 'ashby_progress_pass',
+              error_type: r.rateLimited ? 'rate_limited' : r.deadlineHit ? 'deadline' : r.trickle ? 'scanner_trickle' : 'complete',
+              schema: `checked_${r.checked}_changed_${r.changed}_deferred_${r.deferred}_errors_${Object.values(r.errors).reduce((n, v) => n + v, 0)}`,
+            });
+          } else if (r.skipped === 'scanner_busy') {
+            logger.info('unknown_event', { error_category: 'ashby_progress_pass', error_type: 'scanner_busy' });
+          }
+          return r.checked > 0;
+        },
+      },
     ],
   });
 
@@ -2589,6 +2640,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
       reconcile: rc.reconcileIntervalMs,
       reclaim: rc.reclaimIntervalMs,
       profile_sweep: PROFILE_SWEEP_INTERVAL_MS,
+      [ASHBY_PROGRESS_LOOP]: progressConfig.intervalMs,
     },
     async tickAll() {
       await runner.tick();

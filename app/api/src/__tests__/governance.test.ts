@@ -24,12 +24,16 @@ import { setAuditSink } from '../lib/audit.js';
 // These are swapped by beforeEach. vi.mock factory captures them by ref.
 
 let mockFromImpl: (tableName: string) => any;
+let mockRpcImpl: (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
 
 // Hoisted mock — uses the mutable reference above
 vi.mock('../lib/supabase.js', () => ({
   supabase: {
     from(tableName: string) {
       return mockFromImpl(tableName);
+    },
+    rpc(fn: string, args: Record<string, unknown>) {
+      return mockRpcImpl(fn, args);
     },
     storage: {
       from() {
@@ -67,6 +71,8 @@ interface TableStore {
   transcriptTurns: any[];
   resumes: any[];
   ashbyApplicationLinks: any[];
+  /** 0140 `ashby_erased_application_links`: the link ids an erasure listed. */
+  ashbyErasedLinks: string[];
 }
 
 /**
@@ -105,6 +111,7 @@ function freshTables(): TableStore {
       { id: nextId(), candidate_id: '11111111-1111-4111-8111-111111111111', file_name: 'alice_resume.pdf', mime_type: 'application/pdf', text_extracted: 'Alice Applicant - 5 years experience', created_at: ts() },
     ],
     ashbyApplicationLinks: [],
+    ashbyErasedLinks: [],
   };
 }
 
@@ -238,6 +245,26 @@ function makeFrom(tableName: string) {
   return q;
 }
 
+/**
+ * The database functions the erasure calls, as 0140 defines them. Only
+ * `mark_ashby_application_links_erased` exists here: it lists EVERY link of the
+ * person (live or already terminal) while they have a deletion request, and
+ * refuses otherwise. Every call is logged under the table name `rpc`.
+ */
+async function fakeRpc(fn: string, args: Record<string, unknown>): Promise<{ data: unknown; error: unknown }> {
+  queryLog.push({ table: 'rpc', method: fn, args: [args] });
+  if (fn !== 'mark_ashby_application_links_erased') return { data: null, error: { message: `no function ${fn}` } };
+  const candidateId = args.p_candidate_id;
+  if (!candidateId) return { data: { status: 'invalid_request' }, error: null };
+  const requested = tables.dsarRequests.some(r => r.candidate_id === candidateId && r.request_type === 'delete'
+    && ['pending', 'in_progress', 'fulfilled'].includes(r.request_status));
+  if (!requested) return { data: { status: 'no_erasure_request' }, error: null };
+  const mine = tables.ashbyApplicationLinks.filter(l => l.candidate_id === candidateId).map(l => l.id as string);
+  const added = mine.filter(id => !tables.ashbyErasedLinks.includes(id));
+  tables.ashbyErasedLinks.push(...added);
+  return { data: { status: 'ok', listed: mine.length, added: added.length }, error: null };
+}
+
 // ── JWT constants ────────────────────────────────────────────────────
 
 const JWT_AAL2 = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTAwMSIsImFhbCI6ImFhbDIifQ.signature';
@@ -265,6 +292,7 @@ function createGovApp(user: AuthUser) {
   _idCounter = 100;
   tables = freshTables();
   mockFromImpl = makeFrom;
+  mockRpcImpl = fakeRpc;
   auditEntries = [];
   queryLog = [];
 
@@ -755,6 +783,86 @@ describe('GOV-05: DSAR Delete (Erasure)', () => {
     const deleteRes = await request(app).post(`/api/dsar/${dsarRes.body.data.id}/delete`).set('Authorization', VALID_TOKEN);
     expect(deleteRes.status).toBe(409);
     expect(tables.ashbyApplicationLinks[0]).toMatchObject({ terminal_state: null, terminal_reason: null });
+    expect(tables.ashbyErasedLinks).toEqual([]);
+  });
+
+  // M031 (0140): a link that was ALREADY terminal keeps its own terminal_reason, and the request row goes
+  // with the candidate (ON DELETE CASCADE), so after the delete nothing says the link was an erased
+  // person's. The business-impact read model would count and list it. Erasure therefore lists EVERY
+  // link of the person, while `candidate_id` still ties them, and only the new list is written.
+  it('lists every Ashby link of the person, an already-terminal one too, BEFORE the candidate row is deleted (M031)', async () => {
+    const bob = '33333333-3333-4333-8333-333333333333';
+    const alice = '11111111-1111-4111-8111-111111111111';
+    const { app, tables, queryLog } = createGovApp(makeInterviewer());
+    tables.ashbyApplicationLinks.push(
+      { id: 'link-live', candidate_id: bob, terminal_state: null, terminal_reason: null },
+      { id: 'link-withdrawn', candidate_id: bob, terminal_state: 'withdrawn', terminal_reason: 'terminal_cancel' },
+      { id: 'link-other', candidate_id: alice, terminal_state: null, terminal_reason: null },
+    );
+    const crate = await request(app).post('/api/dsar').set('Authorization', VALID_TOKEN).send({
+      candidate_id: bob, request_type: 'delete',
+    });
+    expect(crate.status).toBe(201);
+
+    const deleteRes = await request(app).post(`/api/dsar/${crate.body.data.id}/delete`).set('Authorization', VALID_TOKEN);
+    expect(deleteRes.status).toBe(200);
+    expect(deleteRes.body.data.deleted_entities).toEqual(expect.arrayContaining(['ashby_link_terminated:1', 'ashby_link_erasure_listed:2']));
+    expect([...tables.ashbyErasedLinks].sort()).toEqual(['link-live', 'link-withdrawn']);
+    // The already-terminal link keeps its own state: the list is the only write for it.
+    expect(tables.ashbyApplicationLinks.find(l => l.id === 'link-withdrawn')).toMatchObject({ terminal_state: 'withdrawn', terminal_reason: 'terminal_cancel' });
+
+    // One call, scoped to the person, after the live links are terminated and before the candidate goes.
+    expect(queryLog.filter(e => e.table === 'rpc')).toEqual([
+      { table: 'rpc', method: 'mark_ashby_application_links_erased', args: [{ p_candidate_id: bob }] },
+    ]);
+    const linkUpdate = queryLog.findIndex(e => e.table === 'ashby_application_links' && e.method === 'update');
+    const listed = queryLog.findIndex(e => e.table === 'rpc');
+    const candidateDelete = queryLog.findIndex(e => e.table === 'candidates' && e.method === 'delete');
+    expect(listed).toBeGreaterThan(linkUpdate);
+    expect(candidateDelete).toBeGreaterThan(listed);
+  });
+
+  it('a failed or refused erasure listing keeps the candidate and the request in progress, and a retry completes (M031)', async () => {
+    const bob = '33333333-3333-4333-8333-333333333333';
+    const { app, tables } = createGovApp(makeInterviewer());
+    tables.ashbyApplicationLinks.push({ id: 'link-withdrawn', candidate_id: bob, terminal_state: 'withdrawn', terminal_reason: 'terminal_cancel' });
+    const crate = await request(app).post('/api/dsar').set('Authorization', VALID_TOKEN).send({
+      candidate_id: bob, request_type: 'delete',
+    });
+    expect(crate.status).toBe(201);
+    const dsarId = crate.body.data.id;
+
+    // A database error, a refusal and an empty answer all fail closed: after the candidate delete
+    // nothing could tie the link to the person again.
+    const answers: Array<{ data: unknown; error: unknown; code: string }> = [
+      { data: null, error: { message: 'synthetic failure' }, code: 'ashby_erasure_list_error' },
+      { data: { status: 'no_erasure_request' }, error: null, code: 'ashby_erasure_list_refused' },
+      { data: null, error: null, code: 'ashby_erasure_list_refused' },
+    ];
+    for (const answer of answers) {
+      mockRpcImpl = async () => ({ data: answer.data, error: answer.error });
+      const failed = await request(app).post(`/api/dsar/${dsarId}/delete`).set('Authorization', VALID_TOKEN);
+      expect(failed.status).toBe(500);
+      expect(tables.candidates.map(c => c.id)).toContain(bob);
+      expect(tables.dsarRequests.find(r => r.id === dsarId)).toMatchObject({
+        request_status: 'in_progress', notes: `Ashby erasure list incomplete (${answer.code})`,
+      });
+      expect(tables.governanceAudits).toContainEqual(expect.objectContaining({
+        action: 'data_deleted',
+        outcome: 'failure',
+        entity_id: bob,
+        details: { dsar_id: dsarId, stage: 'ashby_erasure_list', code: answer.code },
+      }));
+    }
+    expect(tables.ashbyErasedLinks).toEqual([]);
+
+    mockRpcImpl = fakeRpc;
+    const retried = await request(app).post(`/api/dsar/${dsarId}/delete`).set('Authorization', VALID_TOKEN);
+    expect(retried.status).toBe(200);
+    expect(retried.body.data.deleted_entities).toContain('ashby_link_erasure_listed:1');
+    expect(tables.ashbyErasedLinks).toEqual(['link-withdrawn']);
+    expect(tables.candidates.map(c => c.id)).not.toContain(bob);
+    expect(tables.dsarRequests.find(r => r.id === dsarId)).toMatchObject({ request_status: 'fulfilled' });
   });
 });
 

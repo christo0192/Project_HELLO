@@ -57,6 +57,7 @@ import {
   type ResumeModelFailureCategory,
 } from '../../lib/resume-structurer.js';
 import { createLogger } from '../../lib/logger.js';
+import { createProgressStore, type ProgressStore } from './progress-worker.js';
 
 /** Version tags recorded as ingestion provenance (never PII). */
 export const ASHBY_EXTRACTOR_VERSION = 'ashby-ephemeral-1';
@@ -141,6 +142,12 @@ export interface AshbyRuntime {
     applicationLinkId: string;
     onState: IngestionPorts['onState'];
   }): Promise<IngestionPortsResult>;
+  /**
+   * The M031 progress worker's tables, through the 0139 functions (writes the
+   * 0138 tables only). Optional so a runtime built by hand (tests) without it
+   * leaves the `ashby-progress` loop idle.
+   */
+  progress?: ProgressStore;
   /** Release pooled resources (parser child processes). Idempotent. */
   shutdown(): Promise<void>;
 }
@@ -743,6 +750,7 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
     resolveMappingForLink,
     buildIngestionPorts,
     mappings,
+    progress: createProgressStore(supabase),
     async shutdown() {
       if (shut) return;
       shut = true;

@@ -137,9 +137,10 @@ const TITLE_JOINER_RE = /[\u200c\u200d]/g;
  * space runs, trim, and only THEN bound, so the bound counts visible text. A
  * title made of nothing but invisible characters is `null`, not an
  * empty-looking entry. Shared by every probe surface (stages, forms, fields,
- * jobs).
+ * jobs), and by the M031 progress worker for history-row stage titles and
+ * archive-reason catalogue text.
  */
-function sanitizeTitle(raw: unknown): string | null {
+export function sanitizeTitle(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
   const cleaned = raw
     .normalize('NFC')

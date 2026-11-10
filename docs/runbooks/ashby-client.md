@@ -102,6 +102,16 @@ counted under
 Jobs read). The list (`GET …/stage-catalog`) and the label change
 (`PATCH …/stage-catalog/:stageId`) make no Ashby call.
 
+The progress worker (`integrations/ashby/progress-worker.ts`, loop `ashby-progress`, M031 S3,
+off unless `ASHBY_PROGRESS_ENABLED=true`) makes three reads at about 2 calls a second, each with
+`failFastPastDeadline` and its own `deadlineAt`: 20 s for the call (5 s for a stage lookup), cut to
+what is left of the pass: `application.info`, `application.listHistory` (every page) and, for a
+stage known only from history, `interviewStage.info`. A call that has not answered in its own
+budget is that application's `timeout`, backed off; only one the pass deadline cut short is handed
+back. A 429 the client cannot wait out inside the call's budget ends the pass and hands the rest of
+the batch back. It classifies a missing permission exactly as the access check does. See
+`docs/runbooks/ashby-progress-worker.md`.
+
 `candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
 and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy
 verdict tag lane (`recommendation-tags.ts`, runbook

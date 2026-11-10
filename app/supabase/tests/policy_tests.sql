@@ -24708,6 +24708,722 @@ $$;
 
 drop function _policy_tests.p138_try(text);
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0139: the Ashby progress worker's functions (M031 S3). Five SECURITY
+-- DEFINER functions over the 0138 tables, service-role only: the claim
+-- (seed, lease, SKIP LOCKED, newest first), one application's read (intervals
+-- marked gone_at and never deleted, a stale lease refused), a pass's run row,
+-- the backfill (idempotent while open, audited) and the counts-only overview.
+-- A link an erasure ended, or whose candidate asked for restriction, is never
+-- seeded, claimed or counted. Nothing outside the 0138 tables is written but
+-- the backfill's audit row.
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  '0139: the six progress functions are SECURITY DEFINER, pin search_path, and only service_role may run them',
+  (select count(*) from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('ashby_progress_covered_links', 'claim_ashby_progress_due', 'record_ashby_application_progress',
+                         'record_ashby_progress_run', 'start_ashby_progress_backfill', 'ashby_progress_overview')
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+       and not has_function_privilege('anon', p.oid, 'EXECUTE')
+       and not has_function_privilege('authenticated', p.oid, 'EXECUTE')) = 6
+  and (select count(*) from pg_proc p
+         join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'screening_v2'
+          and p.proname in ('ashby_progress_covered_links', 'claim_ashby_progress_due', 'record_ashby_application_progress',
+                            'record_ashby_progress_run', 'start_ashby_progress_backfill', 'ashby_progress_overview')) = 6,
+  'each progress function must be one pinned SECURITY DEFINER function executable by service_role only'
+);
+
+do $$
+declare
+  v_t0      timestamptz := date_trunc('second', now());
+  v_tb      timestamptz;
+  v_links   uuid[] := '{}';
+  v_link    uuid;
+  v_erased  uuid;
+  v_held    uuid;
+  v_cand    uuid;
+  v_claim   jsonb;
+  v_claim2  jsonb;
+  v_json    jsonb;
+  v_hist    jsonb;
+  v_app     jsonb;
+  v_ids     text[];
+  v_p4      uuid;
+  v_p3      uuid;
+  v_p2      uuid;
+  v_p1      uuid;
+  v_lease   text;
+  v_lease3  text;
+  v_lease2  text;
+  v_lease1  text;
+  v_row     screening_v2.ashby_application_progress%rowtype;
+  v_i       integer;
+  v_n       integer;
+  v_links_n integer;
+  v_audits  integer;
+  v_runs    integer;
+  v_actor   uuid := '44444444-4444-4444-8444-444444444439';
+  v_run     uuid;
+  v_fp      text;
+  v_cand_fp timestamptz;
+  v_x       jsonb;
+  v_cand2   uuid;
+  v_ended   uuid;
+  v_live2   uuid;
+  v_first   jsonb;
+begin
+  -- Every link another section left gets its progress row now, under a long
+  -- lease, so the claims below see only this section's links.
+  for v_i in 1..200 loop
+    v_claim := screening_v2.claim_ashby_progress_due(50, 3600, 5000, v_t0);
+    exit when jsonb_array_length(v_claim->'claimed') = 0;
+  end loop;
+
+  -- Four readable links, the newest last, and two that must never be read.
+  for v_i in 1..4 loop
+    insert into screening_v2.ashby_application_links (external_application_id, external_job_id, created_at)
+    values ('pol139-app-' || v_i, 'pol139-job', v_t0 + interval '1 day' + make_interval(mins => v_i))
+    returning id into v_link;
+    v_links := v_links || v_link;
+  end loop;
+  insert into screening_v2.ashby_application_links (external_application_id, terminal_state, terminal_reason, created_at)
+  values ('pol139-erased', 'deleted', 'subject_erasure', v_t0 + interval '2 days') returning id into v_erased;
+  insert into screening_v2.candidates default values returning id into v_cand;
+  insert into screening_v2.ashby_application_links (external_application_id, candidate_id, created_at)
+  values ('pol139-held', v_cand, v_t0 + interval '2 days') returning id into v_held;
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  values (v_cand, 'restrict', 'pending', '00000000-0000-4000-8000-0000000000ad');
+  -- One person, two links: one an admin had already cancelled, one live. Then
+  -- the person is erased exactly as lib/dsar.ts does it: only the live link is
+  -- stamped subject_erasure ("a link already terminal keeps its state"), then
+  -- the candidate is deleted, which nulls both links' candidate_id and takes
+  -- the erasure request with it (on delete cascade). Newest of all, so a seed
+  -- would take them first.
+  insert into screening_v2.candidates default values returning id into v_cand2;
+  insert into screening_v2.ashby_application_links (external_application_id, candidate_id, terminal_state, terminal_reason, created_at)
+  values ('pol139-ended', v_cand2, 'manual_stage_cancel', 'admin_cancel', v_t0 + interval '3 days') returning id into v_ended;
+  insert into screening_v2.ashby_application_links (external_application_id, candidate_id, created_at)
+  values ('pol139-live2', v_cand2, v_t0 + interval '3 days') returning id into v_live2;
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  values (v_cand2, 'delete', 'pending', '00000000-0000-4000-8000-0000000000ad');
+  update screening_v2.ashby_application_links
+     set terminal_state = 'deleted', terminal_reason = 'subject_erasure', updated_at = v_t0
+   where candidate_id = v_cand2 and terminal_state is null;
+  delete from screening_v2.candidates where id = v_cand2;
+  perform _policy_tests.assert('0139: (setup) the erasure left the ended link with no candidate and no request',
+    (select candidate_id is null and terminal_state = 'manual_stage_cancel' and terminal_reason = 'admin_cancel'
+       from screening_v2.ashby_application_links where id = v_ended)
+    and (select candidate_id is null and terminal_reason = 'subject_erasure' from screening_v2.ashby_application_links where id = v_live2)
+    and not exists (select 1 from screening_v2.data_subject_requests where candidate_id = v_cand2),
+    'the setup must leave what lib/dsar.ts leaves');
+  -- What no function may change: the links and the candidate.
+  select string_agg(l.external_application_id || ':' || l.updated_at::text || ':' || coalesce(l.terminal_state, '-')
+                    || ':' || l.lifecycle, ',' order by l.external_application_id)
+    into v_fp from screening_v2.ashby_application_links l where l.external_application_id like 'pol139-%';
+  select updated_at into v_cand_fp from screening_v2.candidates where id = v_cand;
+
+  -- ── The claim: seed, newest first, under a lease ──────────────────────
+  v_claim := screening_v2.claim_ashby_progress_due(2, 120, 5000, v_t0);
+  v_first := v_claim;
+  v_ids := array(select x->>'application_id' from jsonb_array_elements(v_claim->'claimed') x);
+  perform _policy_tests.assert('0139: the first claim seeds every readable link and takes the newest first',
+    (v_claim->>'seeded')::int = 4 and v_ids = array['pol139-app-4', 'pol139-app-3']
+    and (v_claim->>'backfill_open')::boolean = false,
+    v_claim::text);
+  perform _policy_tests.assert('0139: a link already ended when its candidate was erased is never seeded, claimed or counted',
+    not exists (select 1 from screening_v2.ashby_application_progress where application_link_id in (v_ended, v_live2))
+    and not exists (select 1 from screening_v2.ashby_progress_covered_links() c where c.link_id in (v_ended, v_live2, v_erased, v_held))
+    and (select count(*) from screening_v2.ashby_progress_covered_links() c where c.link_id = any (v_links)) = 4,
+    v_claim::text);
+  perform _policy_tests.assert('0139: a claim holds each row under a lease and counts the attempt',
+    (select bool_and((x->>'lease_until')::timestamptz = v_t0 + interval '120 seconds'
+                     and (x->>'attempts')::int = 1 and x->>'status' is null and x->>'history_read_at' is null)
+       from jsonb_array_elements(v_claim->'claimed') x)
+    and (select count(*) from screening_v2.ashby_application_progress p
+          where p.application_link_id = any (v_links[3:4]) and p.next_check_at = v_t0 + interval '120 seconds') = 2,
+    v_claim::text);
+  perform _policy_tests.assert('0139: a link an erasure ended, or whose candidate asked for restriction, is never seeded',
+    not exists (select 1 from screening_v2.ashby_application_progress where application_link_id in (v_erased, v_held)),
+    'excluded links must have no progress row');
+
+  v_claim := screening_v2.claim_ashby_progress_due(10, 120, 5000, v_t0);
+  v_ids := array(select x->>'application_id' from jsonb_array_elements(v_claim->'claimed') x);
+  perform _policy_tests.assert('0139: a second claim takes the rows the first left, never a leased one',
+    (v_claim->>'seeded')::int = 0 and v_ids = array['pol139-app-2', 'pol139-app-1'],
+    v_claim::text);
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 5000, v_t0 + interval '119 seconds');
+  perform _policy_tests.assert('0139: nothing is claimed again while its lease holds',
+    jsonb_array_length(v_claim->'claimed') = 0, v_claim::text);
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 5000, v_t0 + interval '121 seconds');
+  v_ids := array(select x->>'application_id' from jsonb_array_elements(v_claim->'claimed') x order by 1);
+  perform _policy_tests.assert('0139: a row whose lease ran out is claimed again, its attempt counted',
+    v_ids = array['pol139-app-1', 'pol139-app-2', 'pol139-app-3', 'pol139-app-4']
+    and (select bool_and((x->>'attempts')::int = 2) from jsonb_array_elements(v_claim->'claimed') x),
+    v_claim::text);
+  select (x->>'progress_id')::uuid, x->>'lease_until' into v_p4, v_lease
+    from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-4';
+  select (x->>'progress_id')::uuid, x->>'lease_until' into v_p3, v_lease3
+    from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-3';
+  select (x->>'progress_id')::uuid, x->>'lease_until' into v_p2, v_lease2
+    from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-2';
+  select (x->>'progress_id')::uuid, x->>'lease_until' into v_p1, v_lease1
+    from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-1';
+
+  -- ── One application's read ────────────────────────────────────────────
+  -- A plan stage the catalogue already holds: the read must leave it alone.
+  insert into screening_v2.ashby_stage_catalog (stage_id, interview_plan_id, title, stage_type, order_in_plan, source)
+  values ('pol139-st-christy', 'pol139-plan', 'Hello Christy', 'PreInterviewScreen', 4, 'plan');
+  v_app := jsonb_build_object('status', 'Active', 'current_stage_id', 'pol139-st-r1', 'current_job_id', 'pol139-job',
+    'archive_reason_id', null, 'archive_reason_type', null, 'archived_at', null,
+    'ashby_updated_at', v_t0 - interval '1 hour', 'current_stage_entered_at', v_t0 - interval '1 hour');
+  v_hist := jsonb_build_array(
+    jsonb_build_object('history_id', 'pol139-h1', 'stage_id', 'pol139-st-christy', 'title', 'Hello Christy',
+      'entered_at', v_t0 - interval '3 days', 'left_at', v_t0 - interval '2 days', 'stage_number', 0, 'moved_by_person', false),
+    jsonb_build_object('history_id', 'pol139-h2', 'stage_id', 'pol139-st-hm', 'title', 'HM Review',
+      'entered_at', v_t0 - interval '2 days', 'left_at', v_t0 - interval '1 hour', 'stage_number', 1, 'moved_by_person', true),
+    -- The current stage: Ashby leaves leftStageAt out, the API sends null.
+    jsonb_build_object('history_id', 'pol139-h3', 'stage_id', 'pol139-st-r1', 'title', 'R1',
+      'entered_at', v_t0 - interval '1 hour', 'left_at', null, 'stage_number', 2, 'moved_by_person', null));
+  v_json := screening_v2.record_ashby_application_progress(v_p4, v_lease::timestamptz, v_t0 + interval '130 seconds',
+    jsonb_build_object('outcome', 'ok', 'next_check_at', v_t0 + interval '6 hours', 'application', v_app, 'history', v_hist,
+      'reason', null,
+      'stages', jsonb_build_array(
+        jsonb_build_object('stage_id', 'pol139-st-christy', 'title', 'Renamed', 'stage_type', 'Active', 'default_milestone', 'other'),
+        jsonb_build_object('stage_id', 'pol139-st-hm', 'interview_plan_id', null, 'title', 'HM Review', 'stage_type', null,
+          'order_in_plan', null, 'stage_group_id', null, 'default_milestone', null),
+        jsonb_build_object('stage_id', 'pol139-st-r1', 'interview_plan_id', 'pol139-plan-2', 'title', 'R1', 'stage_type', 'Active',
+          'order_in_plan', 8, 'stage_group_id', null, 'default_milestone', 'r1'))));
+  perform _policy_tests.assert('0139: a first read is recorded and reported as a change',
+    v_json = '{"status": "ok", "changed": true, "intervals_changed": 3, "intervals_gone": 0, "stages_written": 2}'::jsonb,
+    v_json::text);
+  select * into v_row from screening_v2.ashby_application_progress where id = v_p4;
+  perform _policy_tests.assert('0139: the read becomes the stored state, the attempts and error reset, due at the cadence',
+    v_row.status = 'Active' and v_row.current_stage_id = 'pol139-st-r1' and v_row.current_job_id = 'pol139-job'
+    and v_row.current_stage_entered_at = v_t0 - interval '1 hour' and v_row.ashby_updated_at = v_t0 - interval '1 hour'
+    and v_row.attempts = 0 and v_row.check_error_code is null
+    and v_row.last_checked_at = v_t0 + interval '130 seconds' and v_row.next_check_at = v_t0 + interval '6 hours'
+    and v_row.updated_at = v_t0 + interval '130 seconds',
+    row_to_json(v_row)::text);
+  perform _policy_tests.assert('0139: every history row is an interval; a person, no person or unknown; the current one open',
+    (select count(*) from screening_v2.ashby_application_stage_intervals where application_link_id = v_links[4]) = 3
+    and (select moved_by_person = false and left_at is not null from screening_v2.ashby_application_stage_intervals where history_id = 'pol139-h1')
+    and (select moved_by_person = true from screening_v2.ashby_application_stage_intervals where history_id = 'pol139-h2')
+    and (select moved_by_person is null and left_at is null and stage_title_seen = 'R1' and stage_number = 2
+           from screening_v2.ashby_application_stage_intervals where history_id = 'pol139-h3'),
+    'intervals must hold what each history row said, never an actor id');
+  perform _policy_tests.assert('0139: a stage seen only in history is added from it; a plan stage is never touched',
+    (select source = 'history' and title = 'HM Review' and stage_type is null and milestone is null
+       from screening_v2.ashby_stage_catalog where stage_id = 'pol139-st-hm')
+    and (select source = 'history' and stage_type = 'Active' and order_in_plan = 8 and interview_plan_id = 'pol139-plan-2'
+                and milestone = 'r1' and milestone_source = 'default'
+           from screening_v2.ashby_stage_catalog where stage_id = 'pol139-st-r1')
+    and (select source = 'plan' and title = 'Hello Christy' and stage_type = 'PreInterviewScreen' and milestone is null
+           from screening_v2.ashby_stage_catalog where stage_id = 'pol139-st-christy'),
+    'the history stage must be added, the plan stage left as the plan read it');
+
+  -- A read whose lease is not the one held writes nothing, even a second
+  -- record of the same claim.
+  v_json := screening_v2.record_ashby_application_progress(v_p4, v_lease::timestamptz, v_t0 + interval '131 seconds',
+    jsonb_build_object('outcome', 'error', 'error_code', 'timeout', 'next_check_at', v_t0 + interval '1 hour'));
+  perform _policy_tests.assert('0139: a stale lease writes nothing (lease_lost)',
+    v_json = '{"status": "lease_lost"}'::jsonb
+    and (select check_error_code is null and next_check_at = v_t0 + interval '6 hours'
+           from screening_v2.ashby_application_progress where id = v_p4),
+    v_json::text);
+
+  -- Ashby history is edited: h2 deleted, h1 retimed. h2 is marked, not deleted.
+  update screening_v2.ashby_application_progress set next_check_at = v_t0 + interval '1 second' where id = v_p4;
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 5000, v_t0 + interval '200 seconds');
+  v_ids := array(select x->>'application_id' from jsonb_array_elements(v_claim->'claimed') x);
+  select x into v_x from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-4';
+  perform _policy_tests.assert('0139: a claim hands back the stored state and when the history was last read',
+    v_ids = array['pol139-app-4'] and v_x->>'status' = 'Active' and v_x->>'current_stage_id' = 'pol139-st-r1'
+    and (v_x->>'history_read_at')::timestamptz = v_t0 + interval '130 seconds'
+    and (v_x->>'last_checked_at')::timestamptz = v_t0 + interval '130 seconds',
+    v_claim::text);
+  v_lease := v_x->>'lease_until';
+  v_hist := jsonb_build_array(
+    jsonb_build_object('history_id', 'pol139-h1', 'stage_id', 'pol139-st-christy', 'title', 'Hello Christy',
+      'entered_at', v_t0 - interval '4 days', 'left_at', v_t0 - interval '2 days', 'stage_number', 0, 'moved_by_person', false),
+    jsonb_build_object('history_id', 'pol139-h3', 'stage_id', 'pol139-st-r1', 'title', 'R1',
+      'entered_at', v_t0 - interval '1 hour', 'left_at', null, 'stage_number', 1, 'moved_by_person', null));
+  v_json := screening_v2.record_ashby_application_progress(v_p4, v_lease::timestamptz, v_t0 + interval '210 seconds',
+    jsonb_build_object('outcome', 'ok', 'next_check_at', v_t0 + interval '6 hours', 'application', v_app, 'history', v_hist,
+      'stages', '[]'::jsonb));
+  perform _policy_tests.assert('0139: an edited history marks the row Ashby stopped returning gone_at, and keeps it',
+    v_json = '{"status": "ok", "changed": true, "intervals_changed": 2, "intervals_gone": 1, "stages_written": 0}'::jsonb
+    and (select gone_at = v_t0 + interval '210 seconds' and last_seen_at = v_t0 + interval '130 seconds'
+           from screening_v2.ashby_application_stage_intervals where history_id = 'pol139-h2')
+    and (select entered_at = v_t0 - interval '4 days' and gone_at is null and last_seen_at = v_t0 + interval '210 seconds'
+           from screening_v2.ashby_application_stage_intervals where history_id = 'pol139-h1')
+    and (select count(*) from screening_v2.ashby_application_stage_intervals where application_link_id = v_links[4]) = 3,
+    v_json::text);
+
+  -- The same read again changes nothing; a row Ashby returns again is back.
+  update screening_v2.ashby_application_progress set next_check_at = v_t0 + interval '1 second' where id = v_p4;
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 5000, v_t0 + interval '220 seconds');
+  v_lease := (select x->>'lease_until' from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-4');
+  v_json := screening_v2.record_ashby_application_progress(v_p4, v_lease::timestamptz, v_t0 + interval '230 seconds',
+    jsonb_build_object('outcome', 'ok', 'next_check_at', v_t0 + interval '6 hours', 'application', v_app, 'history', v_hist));
+  perform _policy_tests.assert('0139: a read that finds nothing new reports no change',
+    v_json = '{"status": "ok", "changed": false, "intervals_changed": 0, "intervals_gone": 0, "stages_written": 0}'::jsonb
+    and (select gone_at = v_t0 + interval '210 seconds' from screening_v2.ashby_application_stage_intervals where history_id = 'pol139-h2'),
+    v_json::text);
+  update screening_v2.ashby_application_progress set next_check_at = v_t0 + interval '1 second' where id = v_p4;
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 5000, v_t0 + interval '240 seconds');
+  v_lease := (select x->>'lease_until' from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-4');
+  v_json := screening_v2.record_ashby_application_progress(v_p4, v_lease::timestamptz, v_t0 + interval '250 seconds',
+    jsonb_build_object('outcome', 'ok', 'next_check_at', v_t0 + interval '6 hours',
+      'application', v_app || jsonb_build_object('status', 'Archived', 'archived_at', v_t0 - interval '5 minutes'),
+      'history', null));
+  perform _policy_tests.assert('0139: a read that skips the history keeps every interval and still records the application',
+    v_json = '{"status": "ok", "changed": true, "intervals_changed": 0, "intervals_gone": 0, "stages_written": 0}'::jsonb
+    and (select status = 'Archived' and archived_at = v_t0 - interval '5 minutes' from screening_v2.ashby_application_progress where id = v_p4)
+    and (select count(*) from screening_v2.ashby_application_stage_intervals where application_link_id = v_links[4]) = 3
+    and (select last_seen_at = v_t0 + interval '230 seconds' from screening_v2.ashby_application_stage_intervals where history_id = 'pol139-h1'),
+    v_json::text);
+
+  -- An archive with Ashby's own reason; a later read with no text keeps it.
+  v_json := screening_v2.record_ashby_application_progress(v_p3, v_lease3::timestamptz, v_t0 + interval '140 seconds',
+    jsonb_build_object('outcome', 'ok', 'next_check_at', v_t0 + interval '7 days',
+      'application', jsonb_build_object('status', 'Archived', 'current_stage_id', 'pol139-st-christy',
+        'archive_reason_id', 'pol139-reason', 'archive_reason_type', 'RejectedByOrg', 'archived_at', v_t0 - interval '1 day'),
+      'history', '[]'::jsonb,
+      'reason', jsonb_build_object('reason_id', 'pol139-reason', 'text', 'Not a fit', 'reason_type', 'RejectedByOrg', 'is_archived', false)));
+  perform _policy_tests.assert('0139: an archive reason from the read lands in the catalogue of reasons',
+    v_json->>'status' = 'ok'
+    and (select text = 'Not a fit' and reason_type = 'RejectedByOrg' and is_archived = false
+           from screening_v2.ashby_archive_reasons where reason_id = 'pol139-reason')
+    and (select archive_reason_id = 'pol139-reason' and archive_reason_type = 'RejectedByOrg' and status = 'Archived'
+           from screening_v2.ashby_application_progress where id = v_p3),
+    v_json::text);
+
+  -- A failed read keeps the stored state and the counted attempt.
+  v_json := screening_v2.record_ashby_application_progress(v_p2, v_lease2::timestamptz, v_t0 + interval '150 seconds',
+    jsonb_build_object('outcome', 'error', 'error_code', 'missing_endpoint_permission', 'next_check_at', v_t0 + interval '1 day'));
+  select * into v_row from screening_v2.ashby_application_progress where id = v_p2;
+  perform _policy_tests.assert('0139: a missing permission is recorded as a code, the state and the attempt kept',
+    v_json = '{"status": "ok", "changed": false}'::jsonb
+    and v_row.check_error_code = 'missing_endpoint_permission' and v_row.status is null and v_row.last_checked_at is null
+    and v_row.attempts = 2 and v_row.next_check_at = v_t0 + interval '1 day' and v_row.updated_at = v_t0 + interval '150 seconds',
+    row_to_json(v_row)::text);
+
+  -- An application Ashby no longer has is never due again.
+  v_json := screening_v2.record_ashby_application_progress(v_p1, v_lease1::timestamptz, v_t0 + interval '160 seconds',
+    jsonb_build_object('outcome', 'gone', 'error_code', 'application_not_found'));
+  perform _policy_tests.assert('0139: a gone application is marked and never due again',
+    v_json = '{"status": "ok", "changed": false}'::jsonb
+    and (select next_check_at = 'infinity'::timestamptz and check_error_code = 'application_not_found' and attempts = 0
+                and updated_at = v_t0 + interval '160 seconds'
+           from screening_v2.ashby_application_progress where id = v_p1),
+    v_json::text);
+
+  -- A row the pass hands back unread: the attempt refunded, nothing else moves.
+  update screening_v2.ashby_application_progress set next_check_at = v_t0 + interval '1 second' where id = v_p2;
+  v_claim := screening_v2.claim_ashby_progress_due(50, 120, 0, v_t0 + interval '300 seconds');
+  v_lease := (select x->>'lease_until' from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-2');
+  v_json := screening_v2.record_ashby_application_progress(v_p2, v_lease::timestamptz, v_t0 + interval '310 seconds',
+    jsonb_build_object('outcome', 'deferred', 'next_check_at', v_t0 + interval '310 seconds'));
+  select * into v_row from screening_v2.ashby_application_progress where id = v_p2;
+  perform _policy_tests.assert('0139: a deferred row is due again with its claim refunded, its state and updated_at untouched',
+    v_json = '{"status": "ok", "changed": false}'::jsonb
+    and v_row.next_check_at = v_t0 + interval '310 seconds' and v_row.attempts = 2
+    and v_row.check_error_code = 'missing_endpoint_permission' and v_row.updated_at = v_t0 + interval '150 seconds',
+    row_to_json(v_row)::text);
+
+  -- Refusals name why and write nothing.
+  perform _policy_tests.assert('0139: a malformed record is refused before anything is read or written',
+    screening_v2.record_ashby_application_progress(v_p2, v_t0, v_t0, '{"outcome": "maybe"}'::jsonb) = '{"status": "invalid_outcome"}'::jsonb
+    and screening_v2.record_ashby_application_progress(v_p2, v_t0, v_t0,
+          '{"outcome": "error", "error_code": "Missing Permission", "next_check_at": "2026-01-01T00:00:00Z"}'::jsonb) = '{"status": "invalid_error_code"}'::jsonb
+    and screening_v2.record_ashby_application_progress(v_p2, v_t0, v_t0,
+          '{"outcome": "ok", "application": {"status": "Rejected"}, "next_check_at": "2026-01-01T00:00:00Z"}'::jsonb) = '{"status": "invalid_application"}'::jsonb
+    and screening_v2.record_ashby_application_progress(v_p2, v_t0, v_t0,
+          '{"outcome": "ok", "application": {}, "history": {"id": "x"}, "next_check_at": "2026-01-01T00:00:00Z"}'::jsonb) = '{"status": "invalid_history"}'::jsonb
+    and screening_v2.record_ashby_application_progress(v_p2, v_t0, v_t0,
+          '{"outcome": "ok", "application": {}, "stages": [{"stage_id": "x", "default_milestone": "round_one"}], "next_check_at": "2026-01-01T00:00:00Z"}'::jsonb) = '{"status": "invalid_stages"}'::jsonb
+    and screening_v2.record_ashby_application_progress(v_p2, v_t0, v_t0, '{"outcome": "ok", "application": {}}'::jsonb) = '{"status": "invalid_next_check"}'::jsonb
+    and screening_v2.record_ashby_application_progress(gen_random_uuid(), v_t0, v_t0,
+          '{"outcome": "deferred", "next_check_at": "2026-01-01T00:00:00Z"}'::jsonb) = '{"status": "not_found"}'::jsonb
+    and (select next_check_at = v_t0 + interval '310 seconds' and attempts = 2 from screening_v2.ashby_application_progress where id = v_p2),
+    'every refusal must leave the row as it was');
+
+  -- ── A pass's run row ──────────────────────────────────────────────────
+  v_runs := (select count(*) from screening_v2.ashby_progress_runs where mode = 'sweep');
+  v_json := screening_v2.record_ashby_progress_run(v_t0, v_t0 + interval '30 seconds', 4, 2,
+    '{"missing_endpoint_permission": 1, "application_not_found": 1}'::jsonb, v_t0 + interval '30 seconds');
+  perform _policy_tests.assert('0139: a pass records one sweep row, counts and codes only',
+    v_json->>'status' = 'ok' and v_json->>'run_id' is not null and (v_json->>'backfill_finished')::boolean = false
+    and (select checked = 4 and changed = 2 and finished_at = v_t0 + interval '30 seconds'
+                and errors_by_code = '{"missing_endpoint_permission": 1, "application_not_found": 1}'::jsonb
+           from screening_v2.ashby_progress_runs where id = (v_json->>'run_id')::uuid),
+    v_json::text);
+  v_json := screening_v2.record_ashby_progress_run(v_t0, v_t0, 0, 0, '{}'::jsonb, v_t0);
+  perform _policy_tests.assert('0139: an empty pass writes no run row; a bad one is refused',
+    v_json->>'status' = 'ok' and v_json->'run_id' = 'null'::jsonb
+    and (select count(*) from screening_v2.ashby_progress_runs where mode = 'sweep') = v_runs + 1
+    and screening_v2.record_ashby_progress_run(v_t0, v_t0, 1, 2, '{}'::jsonb, v_t0) = '{"status": "invalid_run"}'::jsonb
+    and screening_v2.record_ashby_progress_run(v_t0, v_t0, 1, 0, '[1]'::jsonb, v_t0) = '{"status": "invalid_run"}'::jsonb
+    and screening_v2.record_ashby_progress_run(v_t0, v_t0 - interval '1 second', 1, 0, '{}'::jsonb, v_t0) = '{"status": "invalid_run"}'::jsonb,
+    v_json::text);
+  -- Counts that are not failures: rows handed back unread, passes skipped for
+  -- the scanner. Before this section's other runs, so the last sweep below
+  -- stays the one that read four applications.
+  v_json := screening_v2.record_ashby_progress_run(v_t0 - interval '2 hours', v_t0 - interval '2 hours' + interval '45 seconds', 0, 0,
+    '{"deferred": 3}'::jsonb, v_t0 - interval '2 hours' + interval '45 seconds');
+  perform _policy_tests.assert('0139: a pass that only handed rows back records its run',
+    v_json->>'status' = 'ok' and v_json->>'run_id' is not null
+    and (select checked = 0 and changed = 0 and errors_by_code = '{"deferred": 3}'::jsonb
+           from screening_v2.ashby_progress_runs where id = (v_json->>'run_id')::uuid),
+    v_json::text);
+  perform screening_v2.record_ashby_progress_run(v_t0 - interval '26 hours', v_t0 - interval '26 hours', 1, 0,
+    '{"scanner_paused": 40}'::jsonb, v_t0 - interval '26 hours');
+  perform screening_v2.record_ashby_progress_run(v_t0 - interval '90 minutes', v_t0 - interval '90 minutes', 1, 0,
+    '{"scanner_paused": 5}'::jsonb, v_t0 - interval '90 minutes');
+  perform screening_v2.record_ashby_progress_run(v_t0 - interval '1 hour', v_t0 - interval '1 hour', 1, 0,
+    '{"scanner_paused": 2, "timeout": 1}'::jsonb, v_t0 - interval '1 hour');
+
+  -- ── The overview: counts only ─────────────────────────────────────────
+  v_json := screening_v2.ashby_progress_overview(v_t0 + interval '320 seconds', 86400);
+  perform _policy_tests.assert('0139: the overview counts the passes skipped for the scanner over the last day',
+    v_json->'scanner_pause' = jsonb_build_object('skipped_passes', 7, 'last_at', v_t0 - interval '1 hour'),
+    coalesce(v_json->'scanner_pause', 'null'::jsonb)::text);
+  perform _policy_tests.assert('0139: the overview counts the covered links and carries no id',
+    (v_json->>'links')::int >= 4 and (v_json->>'links_excluded')::int >= 4 and (v_json->>'gone')::int >= 1
+    and (v_json->'by_status') ?& array['Active', 'Hired', 'Archived', 'Lead', 'unknown']
+    and (v_json->'by_status'->>'Archived')::int >= 2
+    and (v_json->'by_error'->>'missing_endpoint_permission')::int >= 1
+    and (v_json->'intervals'->>'gone')::int >= 1 and (v_json->>'history_stages')::int >= 2
+    and v_json->'open_backfill' = 'null'::jsonb
+    and v_json->'last_sweep'->>'checked' = '4' and jsonb_typeof(v_json->'recent_runs') = 'array'
+    and v_json::text !~ 'pol139-app' and v_json::text !~ v_links[1]::text and v_json::text !~ '"run_id"'
+    and v_json::text !~ '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    v_json::text);
+
+  -- ── The backfill ──────────────────────────────────────────────────────
+  v_audits := (select count(*) from screening_v2.audit_events where actor_id = v_actor);
+  perform _policy_tests.assert('0139: a backfill with no admin is refused before any write',
+    screening_v2.start_ashby_progress_backfill(null, v_t0) = '{"status": "actor_required"}'::jsonb
+    and (select count(*) from screening_v2.audit_events where actor_id = v_actor) = v_audits
+    and not exists (select 1 from screening_v2.ashby_progress_runs where mode = 'backfill'),
+    'no admin, no backfill');
+  v_tb := v_t0 + interval '400 days';
+  v_json := screening_v2.start_ashby_progress_backfill(v_actor, v_tb);
+  v_links_n := (v_json->>'links')::int;
+  perform _policy_tests.assert('0139: a backfill marks every covered link due now and audits itself, counts only',
+    v_json->>'status' = 'started' and v_links_n >= 4 and (v_json->>'marked')::int = v_links_n and (v_json->>'seeded')::int = 0
+    and (select count(*) from screening_v2.audit_events where actor_id = v_actor) = v_audits + 1
+    and (select action = 'resource_update' and actor_type = 'recruiter' and target_type = 'ashby_progress'
+                and target_id = 'backfill' and result = 'success'
+                and metadata - 'run_id' = jsonb_build_object('resource', 'ashby_progress_backfill', 'links', v_links_n, 'seeded', 0, 'marked', v_links_n)
+           from screening_v2.audit_events where actor_id = v_actor and target_type = 'ashby_progress')
+    and not exists (select 1 from screening_v2.ashby_application_progress p
+                     where p.application_link_id = any (v_links) and p.next_check_at > v_tb),
+    v_json::text);
+  v_run := (v_json->>'run_id')::uuid;
+  v_json := screening_v2.start_ashby_progress_backfill(v_actor, v_tb + interval '1 minute');
+  perform _policy_tests.assert('0139: a second backfill while one is open changes nothing (idempotent)',
+    v_json->>'status' = 'already_running' and (v_json->>'run_id')::uuid = v_run
+    and (select count(*) from screening_v2.audit_events where actor_id = v_actor) = v_audits + 1
+    and (select count(*) from screening_v2.ashby_progress_runs where mode = 'backfill') = 1,
+    v_json::text);
+  v_claim := screening_v2.claim_ashby_progress_due(4, 120, 0, v_tb);
+  v_ids := array(select x->>'application_id' from jsonb_array_elements(v_claim->'claimed') x);
+  perform _policy_tests.assert('0139: after a backfill the newest link is read first, and a gone one is read once more',
+    v_ids = array['pol139-app-4', 'pol139-app-3', 'pol139-app-2', 'pol139-app-1'] and (v_claim->>'backfill_open')::boolean,
+    v_claim::text);
+  -- The worker re-reads every history read before this moment.
+  perform _policy_tests.assert('0139: a claim answers when the open backfill began',
+    (v_claim->>'backfill_started_at')::timestamptz = v_tb
+    and v_first ? 'backfill_started_at' and v_first->'backfill_started_at' = 'null'::jsonb,
+    v_claim::text);
+  perform _policy_tests.assert('0139: the overview counts what the open backfill still has to read',
+    (screening_v2.ashby_progress_overview(v_tb, 86400)->'open_backfill'->>'remaining')::int = v_links_n,
+    'every covered link must still be to read');
+  -- Every covered row is read (here: fails) once; the next pass closes the
+  -- backfill. pol139-app-1 is held back so the first pass leaves one unread.
+  v_n := 0;
+  for v_x in select x from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' <> 'pol139-app-1' loop
+    perform screening_v2.record_ashby_application_progress((v_x->>'progress_id')::uuid, (v_x->>'lease_until')::timestamptz,
+      v_tb + interval '5 seconds', jsonb_build_object('outcome', 'error', 'error_code', 'timeout', 'next_check_at', v_tb + interval '1 day'));
+    v_n := v_n + 1;
+  end loop;
+  v_lease1 := (select x->>'lease_until' from jsonb_array_elements(v_claim->'claimed') x where x->>'application_id' = 'pol139-app-1');
+  v_json := screening_v2.record_ashby_progress_run(v_tb, v_tb + interval '6 seconds', v_n, 0, jsonb_build_object('timeout', v_n), v_tb + interval '6 seconds');
+  perform _policy_tests.assert('0139: a backfill stays open while a covered link is unread',
+    (v_json->>'backfill_finished')::boolean = false
+    and (select finished_at is null from screening_v2.ashby_progress_runs where id = v_run),
+    v_json::text);
+  perform screening_v2.record_ashby_application_progress(v_p1, v_lease1::timestamptz, v_tb + interval '10 seconds',
+    jsonb_build_object('outcome', 'gone', 'error_code', 'application_not_found'));
+  v_n := v_n + 1;
+  for v_i in 1..200 loop
+    v_claim := screening_v2.claim_ashby_progress_due(50, 120, 0, v_tb + make_interval(secs => 10 + v_i));
+    exit when jsonb_array_length(v_claim->'claimed') = 0;
+    for v_x in select x from jsonb_array_elements(v_claim->'claimed') x loop
+      perform screening_v2.record_ashby_application_progress((v_x->>'progress_id')::uuid, (v_x->>'lease_until')::timestamptz,
+        v_tb + make_interval(secs => 10 + v_i), jsonb_build_object('outcome', 'error', 'error_code', 'timeout', 'next_check_at', v_tb + interval '1 day'));
+      v_n := v_n + 1;
+    end loop;
+  end loop;
+  -- Second pass: pol139-app-1 (gone again) and every other covered link (timeouts).
+  v_json := screening_v2.record_ashby_progress_run(v_tb + interval '10 seconds', v_tb + interval '300 seconds', v_n - 3, 0,
+    case when v_n - 4 > 0 then jsonb_build_object('timeout', v_n - 4, 'application_not_found', 1)
+         else jsonb_build_object('application_not_found', 1) end,
+    v_tb + interval '300 seconds');
+  perform _policy_tests.assert('0139: once every covered link is read the backfill closes with the summed counts',
+    (v_json->>'backfill_finished')::boolean
+    and (select finished_at = v_tb + interval '300 seconds' and checked = v_n and changed = 0
+                and errors_by_code = jsonb_build_object('timeout', v_n - 1, 'application_not_found', 1)
+           from screening_v2.ashby_progress_runs where id = v_run)
+    and v_n = v_links_n,
+    v_json::text || ' read=' || v_n || ' links=' || v_links_n);
+  v_json := screening_v2.start_ashby_progress_backfill(v_actor, v_tb + interval '1 hour');
+  perform _policy_tests.assert('0139: a backfill after the last one closed starts afresh',
+    v_json->>'status' = 'started' and (v_json->>'run_id')::uuid <> v_run,
+    v_json::text);
+  -- With no link to read, a backfill is closed the moment it opens. The links
+  -- are hidden only inside a sub-block that is rolled back.
+  begin
+    update screening_v2.ashby_progress_runs set finished_at = v_tb + interval '2 hours' where mode = 'backfill' and finished_at is null;
+    update screening_v2.ashby_application_links set terminal_reason = 'subject_erasure';
+    v_json := screening_v2.start_ashby_progress_backfill(v_actor, v_tb + interval '3 hours');
+    v_x := (select to_jsonb(r) from screening_v2.ashby_progress_runs r where id = (v_json->>'run_id')::uuid);
+    raise exception using errcode = 'P0001', message = 'pol139_rollback';
+  exception when raise_exception then
+    null;
+  end;
+  perform _policy_tests.assert('0139: a backfill with nothing to read is closed at once',
+    v_json->>'status' = 'started' and (v_json->>'links')::int = 0 and v_x->>'finished_at' is not null
+    and not exists (select 1 from screening_v2.ashby_application_links where external_application_id like 'pol139-app-%'
+                     and terminal_reason = 'subject_erasure'),
+    coalesce(v_json::text, 'null') || ' ' || coalesce(v_x::text, 'null'));
+
+  -- ── Nothing outside the new tables changed ────────────────────────────
+  perform _policy_tests.assert('0139: no function wrote a link or a candidate',
+    (select string_agg(l.external_application_id || ':' || l.updated_at::text || ':' || coalesce(l.terminal_state, '-')
+                       || ':' || l.lifecycle, ',' order by l.external_application_id)
+       from screening_v2.ashby_application_links l where l.external_application_id like 'pol139-%') = v_fp
+    and (select updated_at from screening_v2.candidates where id = v_cand) = v_cand_fp,
+    'links and candidates must be read only');
+
+  delete from screening_v2.ashby_application_progress;
+  delete from screening_v2.ashby_application_stage_intervals where history_id like 'pol139-%';
+  delete from screening_v2.ashby_progress_runs where started_at >= v_t0 - interval '2 days';
+  delete from screening_v2.ashby_stage_catalog where stage_id like 'pol139-%';
+  delete from screening_v2.ashby_archive_reasons where reason_id like 'pol139-%';
+  delete from screening_v2.ashby_application_links where external_application_id like 'pol139-%';
+  delete from screening_v2.data_subject_requests where candidate_id = v_cand;
+  delete from screening_v2.candidates where id = v_cand;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0140: the business-impact read model (M031 S5). Two new tables (the
+-- per-mapping switch and the erasure list), one view and six functions, all
+-- service-role only; the view runs as its caller; the switch follows its
+-- mapping on delete and writes its audit row in its own transaction; a listed
+-- link follows its link on delete. The numbers themselves are
+-- proven on the complete schema by app/supabase/tests/ashby_impact_assert.sql
+-- (scripts/test-ashby-impact.sh).
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  '0140: ashby_impact_exclusions exists with RLS enabled, no policy and no browser privilege',
+  (select c.relrowsecurity from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2' and c.relkind = 'r' and c.relname = 'ashby_impact_exclusions')
+  and not exists (select 1 from pg_policies where schemaname = 'screening_v2' and tablename = 'ashby_impact_exclusions')
+  and not has_table_privilege('anon', 'screening_v2.ashby_impact_exclusions', 'SELECT,INSERT,UPDATE,DELETE')
+  and not has_table_privilege('authenticated', 'screening_v2.ashby_impact_exclusions', 'SELECT,INSERT,UPDATE,DELETE')
+  and has_table_privilege('service_role', 'screening_v2.ashby_impact_exclusions', 'SELECT,INSERT,UPDATE,DELETE'),
+  'the 0140 switch table must be service_role-only: RLS on, no policy, no anon/authenticated grant'
+);
+
+select _policy_tests.assert(
+  '0140: ashby_erased_application_links exists with RLS enabled, no policy and no browser privilege',
+  (select c.relrowsecurity from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2' and c.relkind = 'r' and c.relname = 'ashby_erased_application_links')
+  and not exists (select 1 from pg_policies where schemaname = 'screening_v2' and tablename = 'ashby_erased_application_links')
+  and not has_table_privilege('anon', 'screening_v2.ashby_erased_application_links', 'SELECT,INSERT,UPDATE,DELETE')
+  and not has_table_privilege('authenticated', 'screening_v2.ashby_erased_application_links', 'SELECT,INSERT,UPDATE,DELETE')
+  and has_table_privilege('service_role', 'screening_v2.ashby_erased_application_links', 'SELECT,INSERT,UPDATE,DELETE'),
+  'the 0140 erasure list must be service_role-only: RLS on, no policy, no anon/authenticated grant'
+);
+
+select _policy_tests.assert(
+  '0140: the erasure list holds a link id and a time only, and follows its link on delete (cascade)',
+  (select array_agg(column_name::text order by ordinal_position) from information_schema.columns
+    where table_schema = 'screening_v2' and table_name = 'ashby_erased_application_links')
+    = array['application_link_id', 'created_at']
+  and (select count(*) from pg_constraint
+        where contype = 'f' and conrelid = 'screening_v2.ashby_erased_application_links'::regclass) = 1
+  and exists (select 1 from pg_constraint
+               where contype = 'f' and conrelid = 'screening_v2.ashby_erased_application_links'::regclass
+                 and confrelid = 'screening_v2.ashby_application_links'::regclass and confdeltype = 'c'),
+  'no name, candidate id or free text may be stored on the erasure list; it references only its link'
+);
+
+select _policy_tests.assert(
+  '0140: v_ashby_application_impact runs as its caller and only service_role may read it',
+  exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname = 'screening_v2' and c.relname = 'v_ashby_application_impact' and c.relkind = 'v'
+             and c.reloptions @> array['security_invoker=true'])
+  and has_table_privilege('service_role', 'screening_v2.v_ashby_application_impact', 'SELECT')
+  and not has_table_privilege('anon', 'screening_v2.v_ashby_application_impact', 'SELECT')
+  and not has_table_privilege('authenticated', 'screening_v2.v_ashby_application_impact', 'SELECT'),
+  'the impact view must be security_invoker and readable by service_role only'
+);
+
+select _policy_tests.assert(
+  '0140: the six impact functions are SECURITY DEFINER, pin search_path, and only service_role may run them',
+  (select count(*) from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('impact_application_rows', 'impact_summary', 'impact_candidates',
+                         'ashby_impact_mapping_settings', 'set_ashby_impact_exclusion',
+                         'mark_ashby_application_links_erased')
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+       and not has_function_privilege('anon', p.oid, 'EXECUTE')
+       and not has_function_privilege('authenticated', p.oid, 'EXECUTE')) = 6
+  and (select count(*) from pg_proc p
+         join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'screening_v2'
+          and p.proname in ('impact_application_rows', 'impact_summary', 'impact_candidates',
+                            'ashby_impact_mapping_settings', 'set_ashby_impact_exclusion',
+                            'mark_ashby_application_links_erased')) = 6,
+  'each 0140 function must be a pinned SECURITY DEFINER function executable by service_role only, one of each'
+);
+
+select _policy_tests.assert(
+  '0140: only the switch and the erasure list write; the read model''s functions are STABLE',
+  (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('impact_application_rows', 'impact_summary', 'impact_candidates', 'ashby_impact_mapping_settings')
+      and p.provolatile = 's') = 4
+  and (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'screening_v2'
+          and p.proname in ('set_ashby_impact_exclusion', 'mark_ashby_application_links_erased')
+          and p.provolatile = 'v') = 2,
+  'a STABLE function cannot write: only set_ashby_impact_exclusion and mark_ashby_application_links_erased may'
+);
+
+select _policy_tests.assert(
+  '0140: the switch references its mapping with ON DELETE CASCADE (cascade) and nothing else',
+  (select count(*) from pg_constraint
+    where contype = 'f' and conrelid = 'screening_v2.ashby_impact_exclusions'::regclass) = 1
+  and exists (select 1 from pg_constraint
+               where contype = 'f' and conrelid = 'screening_v2.ashby_impact_exclusions'::regclass
+                 and confrelid = 'screening_v2.ashby_job_mappings'::regclass and confdeltype = 'c'),
+  'a mapping delete must take its switch; the switch references no candidate data'
+);
+
+select _policy_tests.assert(
+  '0140: the switch table holds a mapping id, a boolean and timestamps only',
+  (select array_agg(column_name::text order by ordinal_position) from information_schema.columns
+    where table_schema = 'screening_v2' and table_name = 'ashby_impact_exclusions')
+    = array['job_mapping_id', 'excluded', 'created_at', 'updated_at'],
+  'no staff id, name or free text may be stored with the switch'
+);
+
+do $$
+declare
+  v_role    uuid;
+  v_map     uuid;
+  v_cand    uuid;
+  v_link    uuid;
+  v_actor   constant uuid := '01400000-0000-4000-8000-000000000001';
+  v_json    jsonb;
+  v_failed  boolean := false;
+  v_audits  integer;
+begin
+  insert into screening_v2.roles (title) values ('pol140 role') returning id into v_role;
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id, status, delivery_mode)
+  values ('pol140-job', v_role, v_actor, 'pol140-ai', 'pol140-ta', 'paused', 'manual')
+  returning id into v_map;
+
+  select count(*) into v_audits from screening_v2.audit_events where target_type = 'ashby_impact_exclusion';
+  v_json := screening_v2.set_ashby_impact_exclusion(v_map, true, v_actor);
+  perform _policy_tests.assert('0140: a switch writes its row and one audit row (config_changed, the admin as actor)',
+    v_json ->> 'status' = 'ok'
+    and (select excluded from screening_v2.ashby_impact_exclusions where job_mapping_id = v_map)
+    and (select count(*) from screening_v2.audit_events
+          where target_type = 'ashby_impact_exclusion' and target_id = v_map::text
+            and action = 'config_changed' and actor_id = v_actor) = 1
+    and (select count(*) from screening_v2.audit_events where target_type = 'ashby_impact_exclusion') = v_audits + 1,
+    v_json::text);
+  v_json := screening_v2.set_ashby_impact_exclusion(v_map, null, v_actor);
+  perform _policy_tests.assert('0140: back to the default keeps the row with NULL: the switch never deletes',
+    (select count(*) from screening_v2.ashby_impact_exclusions where job_mapping_id = v_map and excluded is null) = 1,
+    v_json::text);
+
+  -- A refused audit insert takes the switch with it (no exception handler in the function).
+  create function _policy_tests.p140_refuse() returns trigger language plpgsql as $f$
+  begin raise exception 'p140 audit refused'; end; $f$;
+  create trigger p140_refuse before insert on screening_v2.audit_events
+    for each row when (new.target_type = 'ashby_impact_exclusion') execute function _policy_tests.p140_refuse();
+  begin
+    perform screening_v2.set_ashby_impact_exclusion(v_map, false, v_actor);
+  exception when others then
+    v_failed := sqlerrm like '%p140 audit refused%';
+  end;
+  drop trigger p140_refuse on screening_v2.audit_events;
+  drop function _policy_tests.p140_refuse();
+  perform _policy_tests.assert('0140: a switch whose audit row is refused is not written',
+    v_failed and (select excluded from screening_v2.ashby_impact_exclusions where job_mapping_id = v_map) is null,
+    'the switch must roll back with its refused audit row');
+
+  perform _policy_tests.assert('0140: impact_summary and impact_candidates refuse a bad filter without reading',
+    screening_v2.impact_summary(date '2026-11-10', date '2026-11-01', null, true, now()) ->> 'status' = 'invalid_filter'
+    and screening_v2.impact_candidates(null, null, null, 'called', null, null, null, null, 'everyone', null, 1, 50, true, now()) ->> 'status' = 'invalid_scope',
+    'refusals must answer a status');
+
+  -- The erasure list: only under a deletion request, every link of the person, and a listed link
+  -- follows its link on delete. The link and the candidate are only read.
+  insert into screening_v2.candidates (role_id, name, owner_id, status)
+  values (v_role, 'pol140 erased', null, 'screened') returning id into v_cand;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, external_stage_id, job_mapping_id, candidate_id, terminal_state, terminal_reason)
+  values ('pol140-app', 'pol140-job', 'pol140-ai', v_map, v_cand, 'withdrawn', 'ashby_application_archived')
+  returning id into v_link;
+  v_json := screening_v2.mark_ashby_application_links_erased(v_cand);
+  perform _policy_tests.assert('0140: the erasure list lists nothing without a deletion request',
+    v_json = '{"status": "no_erasure_request"}'::jsonb
+    and not exists (select 1 from screening_v2.ashby_erased_application_links where application_link_id = v_link),
+    v_json::text);
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  values (v_cand, 'delete', 'in_progress', v_actor);
+  v_json := screening_v2.mark_ashby_application_links_erased(v_cand);
+  perform _policy_tests.assert('0140: under a deletion request every link of the person is listed, an already-terminal one too, and the link is not written',
+    v_json = '{"status": "ok", "listed": 1, "added": 1}'::jsonb
+    and (select terminal_state = 'withdrawn' and terminal_reason = 'ashby_application_archived' and candidate_id = v_cand
+           from screening_v2.ashby_application_links where id = v_link),
+    v_json::text);
+  delete from screening_v2.ashby_application_links where id = v_link;
+  perform _policy_tests.assert('0140: deleting a link takes its erasure-list row (cascade)',
+    not exists (select 1 from screening_v2.ashby_erased_application_links where application_link_id = v_link),
+    'a listed link must follow its link');
+  delete from screening_v2.candidates where id = v_cand;
+
+  -- The mapping's delete takes its switch (cascade), and nothing else is left behind.
+  delete from screening_v2.ashby_job_mappings where id = v_map;
+  perform _policy_tests.assert('0140: deleting a mapping takes its switch (cascade)',
+    not exists (select 1 from screening_v2.ashby_impact_exclusions where job_mapping_id = v_map),
+    'the switch must follow its mapping');
+  delete from screening_v2.roles where id = v_role;
+end;
+$$;
+
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
 -- the last phone assertion before the verdict.

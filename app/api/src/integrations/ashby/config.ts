@@ -49,6 +49,18 @@ const _contractVisibleEnvReads = [
   process.env.ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS,
   // Phone-parsing intake kill switch (M017, ADR-0018).
   process.env.ASHBY_PHONE_PARSING_ENABLED,
+  // Ashby progress worker (M031 S3): the switch, the pass bounds and the cadences.
+  process.env.ASHBY_PROGRESS_ENABLED,
+  process.env.ASHBY_PROGRESS_INTERVAL_MS,
+  process.env.ASHBY_PROGRESS_DRAIN_INTERVAL_MS,
+  process.env.ASHBY_PROGRESS_BATCH_SIZE,
+  process.env.ASHBY_PROGRESS_PASS_DEADLINE_MS,
+  process.env.ASHBY_PROGRESS_MIN_CALL_INTERVAL_MS,
+  process.env.ASHBY_PROGRESS_ACTIVE_RECENT_HOURS,
+  process.env.ASHBY_PROGRESS_ACTIVE_HOURS,
+  process.env.ASHBY_PROGRESS_TERMINAL_HOURS,
+  process.env.ASHBY_PROGRESS_TERMINAL_OLD_HOURS,
+  process.env.ASHBY_PROGRESS_HISTORY_MAX_AGE_HOURS,
 ];
 void _contractVisibleEnvReads;
 
@@ -266,6 +278,85 @@ export interface AshbyRuntimeConfig {
    * Production turns it on through fly.toml [env]; a Fly secret overrides that.
    */
   phoneParsingEnabled: boolean;
+  /**
+   * The Ashby progress worker (M031 S3), off unless `ASHBY_PROGRESS_ENABLED`
+   * is the literal 'true'. Optional so a runtime built by hand (tests) without
+   * it reads as OFF.
+   */
+  progress?: AshbyProgressConfig;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Ashby progress worker (M031 S3)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The `ashby-progress` loop re-reads each imported application's status and
+// stage history (integrations/ashby/progress-worker.ts). Every value is
+// clamped. Cadences are hours; the 14-day "recently moved" window and the
+// 90-day "long finished" window are fixed in the worker.
+
+export const PROGRESS_BOUNDS = {
+  /**
+   * Base loop interval. `lib/scheduler.ts` caps every backoff at 60 s, so an
+   * idle loop ticks every 30-60 s whatever this says; it sets the first
+   * staggered tick and the health window. A tick with nothing due costs two
+   * small queries and no Ashby read.
+   */
+  intervalMs: { def: 120_000, min: 30_000, max: 3_600_000 },
+  /** Interval while the last pass filled its batch (a backfill draining). */
+  drainIntervalMs: { def: 5_000, min: 1_000, max: 60_000 },
+  /** Applications one pass claims. Small on purpose: the API machine is shared. */
+  batchSize: { def: 10, min: 1, max: 50 },
+  /** Wall-clock budget of one pass, every Ashby call and retry included. */
+  passDeadlineMs: { def: 45_000, min: 5_000, max: 300_000 },
+  /** Gap between two Ashby calls of one pass: 500 ms is about 2 requests a second. */
+  minCallIntervalMs: { def: 500, min: 100, max: 10_000 },
+  /** Active (or Lead) and moved in the last 14 days. */
+  activeRecentHours: { def: 6, min: 1, max: 168 },
+  /** Any other Active (or Lead). */
+  activeHours: { def: 24, min: 1, max: 720 },
+  /** Hired or Archived within the last 90 days. */
+  terminalHours: { def: 168, min: 1, max: 2_160 },
+  /** Hired or Archived longer ago than that. */
+  terminalOldHours: { def: 720, min: 24, max: 8_760 },
+  /** The history is re-read on a check at least this often, change or not. */
+  historyMaxAgeHours: { def: 168, min: 1, max: 2_160 },
+} as const;
+
+export interface AshbyProgressConfig {
+  /** KILL SWITCH (`ASHBY_PROGRESS_ENABLED=true`). Default false: the loop ticks and does nothing. */
+  enabled: boolean;
+  intervalMs: number;
+  drainIntervalMs: number;
+  batchSize: number;
+  passDeadlineMs: number;
+  minCallIntervalMs: number;
+  cadenceHours: {
+    activeRecent: number;
+    active: number;
+    terminal: number;
+    terminalOld: number;
+    historyMaxAge: number;
+  };
+}
+
+/** Load the progress worker's switch and tunables. No I/O; every number clamped. */
+export function loadAshbyProgressConfig(source: NodeJS.ProcessEnv = process.env): AshbyProgressConfig {
+  return {
+    enabled: source.ASHBY_PROGRESS_ENABLED === 'true',
+    intervalMs: boundedMs(source.ASHBY_PROGRESS_INTERVAL_MS, PROGRESS_BOUNDS.intervalMs),
+    drainIntervalMs: boundedMs(source.ASHBY_PROGRESS_DRAIN_INTERVAL_MS, PROGRESS_BOUNDS.drainIntervalMs),
+    batchSize: boundedMs(source.ASHBY_PROGRESS_BATCH_SIZE, PROGRESS_BOUNDS.batchSize),
+    passDeadlineMs: boundedMs(source.ASHBY_PROGRESS_PASS_DEADLINE_MS, PROGRESS_BOUNDS.passDeadlineMs),
+    minCallIntervalMs: boundedMs(source.ASHBY_PROGRESS_MIN_CALL_INTERVAL_MS, PROGRESS_BOUNDS.minCallIntervalMs),
+    cadenceHours: {
+      activeRecent: boundedMs(source.ASHBY_PROGRESS_ACTIVE_RECENT_HOURS, PROGRESS_BOUNDS.activeRecentHours),
+      active: boundedMs(source.ASHBY_PROGRESS_ACTIVE_HOURS, PROGRESS_BOUNDS.activeHours),
+      terminal: boundedMs(source.ASHBY_PROGRESS_TERMINAL_HOURS, PROGRESS_BOUNDS.terminalHours),
+      terminalOld: boundedMs(source.ASHBY_PROGRESS_TERMINAL_OLD_HOURS, PROGRESS_BOUNDS.terminalOldHours),
+      historyMaxAge: boundedMs(source.ASHBY_PROGRESS_HISTORY_MAX_AGE_HOURS, PROGRESS_BOUNDS.historyMaxAgeHours),
+    },
+  };
 }
 
 /** Clamp a raw env integer into [min,max]; any malformed value yields `def`. */
@@ -358,6 +449,7 @@ export function loadAshbyRuntimeConfig(
     // Opt-in: absent or anything but 'true' leaves the pre-filter off.
     stagePrefilterEnabled: source.ASHBY_STAGE_PREFILTER_ENABLED === 'true',
     phoneParsingEnabled: ashbyPhoneParsingEnabled(source),
+    progress: loadAshbyProgressConfig(source),
   };
 }
 

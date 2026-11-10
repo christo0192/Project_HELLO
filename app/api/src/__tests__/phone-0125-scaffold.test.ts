@@ -80,9 +80,11 @@ describe(`${N} registration`, () => {
     // access-allowlist RPCs — no phone body — so, like the R1 lane, it is exempt by exact name.
     // 0137_recruiter_notes_moment.sql (R1 notes at a moment) only adds columns to recruiter_notes — no phone body — so it is exempt by exact name too.
     // 0138_ashby_pipeline_progress.sql (M031 Ashby stage catalogue and progress) only creates five new Ashby tables and one catalogue function — no phone body — so it is exempt by exact name too.
+    // 0139_ashby_progress_worker.sql (M031 S3, the Ashby progress worker) only creates six functions over the 0138 tables — no phone body — so it is exempt by exact name too.
+    // 0140_ashby_business_impact.sql (M031 S5, the business-impact read model) only adds two Ashby tables, one view and six functions — no phone body — so it is exempt by exact name too.
     const after = files.slice(files.indexOf(base) + 1);
-    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$|^0138_ashby_pipeline_progress\.sql$/.test(f))).toBe(true);
-    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$|^0138_ashby_pipeline_progress\.sql$/.test(f));
+    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$|^0138_ashby_pipeline_progress\.sql$|^0139_ashby_progress_worker\.sql$|^0140_ashby_business_impact\.sql$/.test(f))).toBe(true);
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$|^0134_ashby_recommendation_tags\.sql$|^0137_recruiter_notes_moment\.sql$|^0138_ashby_pipeline_progress\.sql$|^0139_ashby_progress_worker\.sql$|^0140_ashby_business_impact\.sql$/.test(f));
     expect(nonR1[nonR1.length - 2]).toBe(base);
     expect(nonR1[nonR1.length - 1]).toMatch(/^0130_ashby_phone_parsing_intake\.sql$/);
   });

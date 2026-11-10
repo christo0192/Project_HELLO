@@ -132,6 +132,10 @@ primary_region = "sin"
   # Read back as runtime.phoneParsingEnabled on the Mission Control health
   # route. See docs/runbooks/ashby-runtime-activation.md.
   ASHBY_PHONE_PARSING_ENABLED = "true"
+  # Ashby progress worker (M031 S3, docs/runbooks/ashby-progress-worker.md):
+  # OFF. The `ashby-progress` loop ticks and does nothing until this is "true".
+  # Tunables keep their defaults (10 a pass, about 2 Ashby calls a second).
+  ASHBY_PROGRESS_ENABLED = "false"
   # Phone canary flip (docs/runbooks/phone-worker-deployment.md §6): the exact
   # name of the dedicated phone worker (fly.phone.toml's PHONE_AGENT_NAME).
   # Non-empty means the API DISPATCHES phone rooms to that worker by name; the

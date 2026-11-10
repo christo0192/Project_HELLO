@@ -27,6 +27,16 @@ function roleLevel(role: AppRole): number {
   return ROLE_HIERARCHY[role] ?? -1;
 }
 
+/**
+ * The same comparison `requireRole` makes, for a route whose contract fixes its
+ * own 403 body (M031 business impact: `{ ok: false, error: 'forbidden' }`).
+ * Unknown or missing roles are below every role.
+ */
+export function hasRoleAtLeast(role: AppRole | null | undefined, minRole: AppRole): boolean {
+  if (!role) return false;
+  return roleLevel(role) >= roleLevel(minRole);
+}
+
 // ── Middleware factories ─────────────────────────────────────────────
 
 /**

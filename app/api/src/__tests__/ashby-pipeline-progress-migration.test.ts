@@ -78,10 +78,12 @@ function functionBody(name: string = FUNCTION): string {
 }
 
 describe('0138 shape', () => {
-  it('is the only 0138 migration and the newest one', () => {
+  it('is the only 0138 migration, and only the later M031 migrations follow it', () => {
     const files = readdirSync(migrations).filter((f) => f.endsWith('.sql')).sort();
     expect(files.filter((f) => f.startsWith('0138_'))).toEqual([FILE]);
-    expect(files[files.length - 1]).toBe(FILE);
+    // 0139_ashby_progress_worker.sql (M031 S3) adds functions over these tables and nothing else;
+    // 0140_ashby_business_impact.sql (M031 S5, the read model) follows it. Both by exact name, in that order.
+    expect(files.slice(files.indexOf(FILE) + 1)).toEqual(['0139_ashby_progress_worker.sql', '0140_ashby_business_impact.sql']);
   });
 
   it('creates exactly the five tables and touches no other table', () => {
