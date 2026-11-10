@@ -866,6 +866,8 @@ const NOT_DRIVEN: Record<string, string> = {
   '/api/integrations/ashby/mission-control/jobs/:externalJobId/feedback-form': ASHBY_READ,
   '/api/integrations/ashby/mission-control/jobs/:externalJobId/stages': ASHBY_READ,
   '/api/integrations/ashby/mission-control/mappings/:id/scorecard-binding': ONE_RECORD,
+  '/api/integrations/ashby/mission-control/stage-catalog':
+    'at most 51 enabled mappings, then the catalogue rows of their interview plans (stages, not candidates), capped at 501 with an explicit truncated flag',
   '/api/integrations/ashby/review/:applicationLinkId': ONE_CANDIDATE,
   '/api/integrations/ashby/review/:applicationLinkId/notes': ONE_CANDIDATE,
   '/api/integrations/ashby/review/:applicationLinkId/workflow': ONE_CANDIDATE,
@@ -1042,6 +1044,8 @@ function variableListReads(source: string): string[] {
 const BOUNDED_LISTS: ReadonlyArray<{ file: string; values: string; sites: number; why: string }> = [
   { file: 'integrations/ashby/access-check.ts', values: '[...jobByMapping.keys()]', sites: 1, why: 'the enabled mappings the check read, at most MAPPING_READ_CAP (50) ids' },
   { file: 'integrations/ashby/runtime-health.ts', values: 'names', sites: 5, why: 'a copy of the constant ASHBY_QUEUE_NAMES' },
+  { file: 'integrations/ashby/stage-catalog.ts', values: 'christyIds', sites: 1, why: 'the Christy stage ids of the enabled mappings read, at most MAPPING_READ_CAP (50)' },
+  { file: 'integrations/ashby/stage-catalog.ts', values: 'planIds', sites: 1, why: 'the interview plans those Christy stages name, at most one per enabled mapping (50)' },
   { file: 'lib/attempt-consent-stage.ts', values: 'ids', sites: 2, why: "one candidate's call legs, and past the limit the read fails closed to unknown" },
   { file: 'lib/dsar.ts', values: 'sessionIds', sites: 1, why: "one data subject's sessions" },
   { file: 'lib/phone-runtime/read.ts', values: 'ids', sites: 1, why: 'one due pass, at most PHONE_RUNTIME_MAX_ROWS (200) candidates' },

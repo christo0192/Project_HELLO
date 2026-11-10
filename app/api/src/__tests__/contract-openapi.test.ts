@@ -765,7 +765,11 @@ describe('OpenAPI document integrity', () => {
     // URL; inline bodies, no new schema). 175 + 1 = 176.
     // M031 S1 adds ONE admin read: GET .../mission-control/access-check, which reports which Ashby
     // permissions the key holds (states, counts and stage types only; reads only). 176 + 1 = 177.
-    expect(Object.keys(paths).length).toBe(177);
+    // M031 S2 adds THREE admin paths for the Ashby stage catalogue: GET .../stage-catalog (the
+    // enabled plans' stages and their milestones), POST .../stage-catalog/refresh (re-read the
+    // plans from Ashby; never deletes) and PATCH .../stage-catalog/{stageId} (label one stage).
+    // 177 + 3 = 180.
+    expect(Object.keys(paths).length).toBe(180);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -887,7 +891,11 @@ describe('OpenAPI document integrity', () => {
     //   per-operation tally, the stage-type count, the history counts, the sample,
     //   and the response envelope. Every object one is additionalProperties:false,
     //   and none can carry an id. 265 + 8 = 273.
-    expect(Object.keys(schemas).length).toBe(273);
+    // M031 S2 adds SEVEN for the stage catalogue: the milestone vocabulary (AshbyStageMilestone),
+    //   one catalogue row, the list response, one refresh failure, the refresh response, and the
+    //   label request and response. Every object one is additionalProperties:false, and none can
+    //   carry a staff id or candidate data. 273 + 7 = 280.
+    expect(Object.keys(schemas).length).toBe(280);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

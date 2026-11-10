@@ -130,6 +130,12 @@ import type {
   R1SettingsResponse,
   R1UsageResponse,
 } from './lib/r1-types';
+import type {
+  AshbyStageCatalogRefreshResponse,
+  AshbyStageCatalogResponse,
+  AshbyStageMilestone,
+  AshbyStageMilestoneUpdateResponse,
+} from './lib/ashby-stages';
 
 export { ApiError };
 
@@ -754,6 +760,32 @@ export const api = {
   previewAshbyScorecardBinding: (mappingId: string) =>
     request<AshbyScorecardBindingPreviewResponse>(
       `/api/integrations/ashby/mission-control/mappings/${encodeURIComponent(mappingId)}/scorecard-binding`,
+    ),
+  /**
+   * The Ashby stage catalogue (M031, admin-gated server side): the live jobs'
+   * interview-plan stages in plan order, with what each counts as on Business
+   * impact. HELLO's table only; no Ashby call.
+   */
+  listAshbyStageCatalog: () =>
+    request<AshbyStageCatalogResponse>('/api/integrations/ashby/mission-control/stage-catalog'),
+  /**
+   * Re-read every live job's interview plan from Ashby into the catalogue.
+   * Never deletes a stage and never overwrites an admin's label. A job Ashby
+   * refuses is counted in the answer, not thrown.
+   */
+  refreshAshbyStageCatalog: () =>
+    request<AshbyStageCatalogRefreshResponse>('/api/integrations/ashby/mission-control/stage-catalog/refresh', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  /**
+   * Label one stage. `null` clears the admin's label: the stage returns to
+   * its default, if it has one. Refusals throw `ApiError` with the route's code.
+   */
+  labelAshbyStage: (stageId: string, milestone: AshbyStageMilestone | null) =>
+    request<AshbyStageMilestoneUpdateResponse>(
+      `/api/integrations/ashby/mission-control/stage-catalog/${encodeURIComponent(stageId)}`,
+      { method: 'PATCH', body: JSON.stringify({ milestone }) },
     ),
   // ── Ashby candidate-scoped review ────────────────────────────────
   // Purpose-built READ endpoints. The candidate/session are resolved

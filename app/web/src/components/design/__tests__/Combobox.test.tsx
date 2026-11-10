@@ -303,6 +303,35 @@ describe('Combobox', () => {
     );
     expect(screen.getByRole('button')).toBeDisabled();
   });
+
+  it('while busy saving a choice, keeps the trigger focusable and says so, but opens nothing and picks nothing', async () => {
+    // A disabled button drops keyboard focus to the page body (WCAG 2.4.3):
+    // `busy` is for a picker that saves the choice just made in it.
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <Combobox id="x" aria-label="Stage" value="1" onChange={onChange} options={OPTIONS} placeholder="p" searchLabel="Search" listLabel="List" busy />,
+    );
+    const button = screen.getByRole('button', { name: 'Stage Sales Program Advisor' });
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    expect(button).toHaveAttribute('aria-busy', 'true');
+    button.focus();
+    await user.click(button);
+    await user.keyboard('{Enter}');
+    await user.keyboard(' ');
+    await user.keyboard('{ArrowDown}');
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(button).toHaveFocus();
+    // Done saving: the same control, still focused, works again.
+    rerender(<Combobox id="x" aria-label="Stage" value="1" onChange={onChange} options={OPTIONS} placeholder="p" searchLabel="Search" listLabel="List" />);
+    expect(button).toHaveFocus();
+    expect(button).not.toHaveAttribute('aria-disabled');
+    expect(button).not.toHaveAttribute('aria-busy');
+    await user.keyboard('{Enter}');
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+  });
 });
 
 describe('Combobox in a ruled row', () => {

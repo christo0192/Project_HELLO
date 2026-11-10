@@ -47,7 +47,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { isAshbyError } from './errors.js';
-import { extractStages } from './probe.js';
+import { extractInterviewPlanId, extractStages } from './probe.js';
 import {
   ASHBY_OPERATIONS,
   type AshbyApplicationStatus,
@@ -300,27 +300,6 @@ interface PlanView {
   typeOrder: Array<string | null>;
 }
 
-function readPlanId(results: unknown): string | null {
-  const root = asRecord(results);
-  if (!root) return null;
-  const direct = opaqueId(root.interviewPlanId);
-  if (direct) return direct;
-  const nested = asRecord(root.jobInterviewPlan) ?? asRecord(root.interviewPlan);
-  if (nested) {
-    const id = opaqueId(nested.interviewPlanId) ?? opaqueId(nested.id);
-    if (id) return id;
-  }
-  // Every documented stage also names its plan.
-  for (const list of [root.stages, root.interviewStages]) {
-    if (!Array.isArray(list)) continue;
-    for (const stage of list) {
-      const id = opaqueId(asRecord(stage)?.interviewPlanId);
-      if (id) return id;
-    }
-  }
-  return null;
-}
-
 function readPlan(results: unknown): PlanView {
   const stages = extractStages(results);
   const typeById = new Map<string, string | null>();
@@ -329,7 +308,7 @@ function readPlan(results: unknown): PlanView {
     typeById.set(stage.id, stage.type);
     if (!typeOrder.includes(stage.type)) typeOrder.push(stage.type);
   }
-  return { planId: readPlanId(results), typeById, typeOrder };
+  return { planId: extractInterviewPlanId(results), typeById, typeOrder };
 }
 
 function summarizeHistory(results: unknown, moreDataAvailable: boolean, plan: PlanView | null): AccessCheckHistory {

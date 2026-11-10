@@ -395,6 +395,74 @@ live Ashby links (`terminal_state = 'deleted'`, `terminal_reason = 'subject_eras
 the data is not re-collected by a later import or sweep, and a pending correction,
 restriction or erasure request holds every profile write.
 
+### Ashby pipeline progress (0138, M031)
+
+Five tables added by `0138_ashby_pipeline_progress.sql` for the business-impact page. All
+five are service-role only (RLS on, no policy, no browser grant). They hold opaque Ashby
+ids, stage titles, Ashby's own archive-reason catalogue, closed codes, booleans, counts and
+timestamps. None holds a name, email, phone, resume, offer amount, custom field, hiring-team
+member, Ashby staff id (`actorId`) or text typed about a candidate. Progress and intervals
+follow their `ashby_application_links` row on delete (`ON DELETE CASCADE`). A DSAR erasure
+terminates the link rather than deleting it, and these rows carry nothing personal to erase.
+
+#### `screening_v2.ashby_stage_catalog`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `stage_id` (PK), `interview_plan_id`, `stage_group_id` | Internal | Opaque Ashby stage, plan and stage-group ids (tenant configuration) |
+| `provider` | Public | Always `ashby` |
+| `title` | Internal | The stage's display title in Ashby (e.g. "R1"), sanitized and bounded at 120 characters; tenant configuration, not candidate data |
+| `stage_type` | Internal | Ashby's stage type as sent (`Active`, `Offer`, ...); open vocabulary, checked for shape |
+| `order_in_plan` | Public | Zero-indexed position in the interview plan |
+| `milestone` | Internal | What the impact page counts the stage as: `christy`, `r1`..`r5`, `reference`, `offer`, `hired`, `archived`, `other`, or NULL (not labelled) |
+| `milestone_source` | Internal | `admin` or `default`: the kind of setter, never a person. The admin who set a label is recorded in the audit row |
+| `milestone_set_at`, `first_seen_at`, `last_seen_at`, `updated_at` | Public | Timestamps |
+| `not_in_plan_since` | Public | Timestamp: set when a read of the stage's plan no longer lists it (Ashby removed it), cleared if it comes back; the row and its label are kept for history |
+| `source` | Internal | `plan` (read from the job's interview plan) or `history` (known only from a history row) |
+
+#### `screening_v2.ashby_application_progress`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id` (PK), `application_link_id` (FK, unique) | Public | Opaque UUIDs; one row per imported application |
+| `status` | Internal | Ashby application status: `Active`, `Hired`, `Archived` or `Lead` |
+| `current_stage_id`, `current_job_id`, `archive_reason_id` | Internal | Opaque Ashby ids |
+| `archive_reason_type` | Internal | Ashby `reasonType` as sent (`RejectedByCandidate`, `RejectedByOrg`, `Other`); an archive may carry none |
+| `current_stage_entered_at`, `archived_at`, `ashby_updated_at`, `last_checked_at`, `next_check_at`, `created_at`, `updated_at` | Public | Timestamps; `next_check_at` is the progress worker's claim order |
+| `check_error_code` | Internal | Last read failure as a sanitized code (e.g. `missing_endpoint_permission`) |
+| `attempts` | Internal | Read attempt counter |
+
+#### `screening_v2.ashby_application_stage_intervals`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id` (PK), `application_link_id` (FK) | Public | Opaque UUIDs |
+| `history_id` (unique), `stage_id` | Internal | Opaque Ashby history-row and stage ids |
+| `stage_title_seen` | Internal | The stage's title as the history row gave it, bounded at 120 characters; tenant configuration |
+| `entered_at`, `left_at`, `first_seen_at`, `last_seen_at`, `gone_at` | Public | Timestamps; `gone_at` marks a history row Ashby stopped returning (edited history), never deleted |
+| `stage_number` | Public | Ashby's position of the row in the application's history |
+| `moved_by_person` | Internal | true, false or NULL (unknown): whether a person made the move. The Ashby actor id is never stored |
+
+#### `screening_v2.ashby_archive_reasons`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `reason_id` (PK) | Internal | Opaque Ashby archive-reason id |
+| `text` | Internal | The reason's text in Ashby's own catalogue (e.g. "Not a fit"), bounded at 200 characters; organisation-wide configuration, never text typed about one candidate |
+| `reason_type` | Internal | Ashby `reasonType` |
+| `is_archived` | Public | Whether Ashby has archived the reason itself |
+| `first_seen_at`, `last_seen_at` | Public | Timestamps |
+
+#### `screening_v2.ashby_progress_runs`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id` (PK) | Public | Opaque UUID |
+| `started_at`, `finished_at` | Public | Timestamps |
+| `checked`, `changed` | Public | Counts |
+| `errors_by_code` | Internal | Failures counted by sanitized code, bounded at 2 KB; no ids |
+| `mode` | Internal | `sweep` or `backfill` |
+
 ## Classification summary
 
 | Level | Count | Examples |

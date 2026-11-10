@@ -743,6 +743,9 @@ describe('probe module has no write capability', () => {
       // #275: one form definition's STRUCTURE (fields/types/scales), read by the
       // scorecard auto-binder and the Mission Control binding preview.
       'extractFormDefinition',
+      // M031: the plan id a jobInterviewPlan.info payload names, shared by the
+      // access check and the stage catalogue. A parser; it reads nothing.
+      'extractInterviewPlanId',
       'extractStages',
       'probeFeedbackFormDefinition',
       // The Add-mapping picker's job directory: id/title/status/openedAt only.

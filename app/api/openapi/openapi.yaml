@@ -4645,6 +4645,106 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/stage-catalog:
+    get:
+      tags: [ashby]
+      operationId: listAshbyStageCatalog
+      summary: The Ashby stage catalogue for the enabled mappings' interview plans (M031)
+      description: Admin-only. Lists the stages of every enabled mapping's interview plan, in plan order, as the catalogue last stored them, followed by any stage Ashby has since removed from those plans (`inPlan: false`, kept for history), with the milestone each counts as on the business-impact page (christy, r1..r5, reference, offer, hired, archived, other, or null for "Other, not labelled") and whether an admin or a default set it. A plan is found through the mapping's own Christy stage, so a mapping whose plan has not been read yet is counted in `unreadMappings` (run the refresh). Reads HELLO's tables only and makes no Ashby call. Stage ids, titles, Ashby types and plan order only; no candidate data and no staff id. One audit row per request, counts only.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The catalogue rows, in plan order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyStageCatalogResponse'
+        '403':
+          description: Insufficient role (admin required).
+        '500':
+          description: HELLO's mapping or catalogue tables could not be read.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/stage-catalog/refresh:
+    post:
+      tags: [ashby]
+      operationId: refreshAshbyStageCatalog
+      summary: Re-read each enabled job's interview plan from Ashby and upsert the stage catalogue (M031)
+      description: Admin-only. Calls the allowlisted READ jobInterviewPlan.info (Jobs read) for each enabled mapping's job, at most five distinct jobs under one ~20 s deadline, and upserts every stage it returns (title, Ashby type, zero-indexed plan order, stage group) through refresh_ashby_stage_catalog. Idempotent, and it never deletes a stage: one a plan read no longer lists is kept with its label and marked as no longer in the plan (`leftPlan`); a plan whose read failed is not judged. An admin's label is never overwritten. Every other label is recomputed on each refresh from the plan as it stands, so a stage Ashby renames or retypes, or one no mapping names as its Christy stage any more, takes its new default or none (counted as `redefaulted`). The rules — the Christy stage of any mapping not archived (paused included) is christy; Ashby type Offer, Hired and Archived are offer, hired and archived; an Active stage titled exactly R1 to R5 (trimmed, any case) is r1 to r5; a stage titled exactly "Reference Check" is reference; anything else stays unlabelled. A failed job read never fails the request; it is counted under `failures` by code (`missing_permission` when Ashby names missing_endpoint_permission). Concurrent requests share one run. Writes only the catalogue, never a link, candidate or assessment. The catalogue write and its audit row (counts only, under the admin whose request started the run) are one transaction in refresh_ashby_stage_catalog, so a 500 means nothing was written; the per-request audit trail after it never fails a refresh that was written. 503 when the integration is disabled (no client is constructed, no table or provider read); 500 when HELLO's mappings cannot be read (no Ashby call is made) or the catalogue cannot be written.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Counts of what the refresh read and wrote.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyStageCatalogRefreshResponse'
+        '403':
+          description: Insufficient role (admin required).
+        '500':
+          description: HELLO's mappings could not be read, or the catalogue could not be written. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '503':
+          description: Integration disabled — no client is constructed and no read is made.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/stage-catalog/{stageId}:
+    patch:
+      tags: [ashby]
+      operationId: labelAshbyStage
+      summary: Label one Ashby stage with the milestone it counts as (M031)
+      description: Admin-only. `milestone` is one of christy, r1, r2, r3, r4, r5, reference, offer, hired, archived or other, stored as set by an admin; a later refresh never overwrites it. `null` clears the admin's label and returns the stage to its default, if it has one (stored as set by default), computed by the refresh's own rules and Christy stages, so it is what the next refresh would leave; label a stage `other` to say it is not a milestone. The body must hold exactly `milestone`. The label and its audit row (the stage id, the label before and after and the kinds of setter; the actor is the audit row's own) are written in one transaction by set_ashby_stage_milestone, so a label is never saved without its audit row and a 500 means nothing was written; the per-request audit trail after it never fails a saved label. No staff id is stored in the catalogue.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: stageId
+          in: path
+          required: true
+          description: Opaque Ashby stage id.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AshbyStageMilestoneUpdateRequest'
+      responses:
+        '200':
+          description: The stage as now labelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyStageMilestoneUpdateResponse'
+        '400':
+          description: invalid_stage_id, or invalid_milestone (not exactly one `milestone` key, or a value outside the allowed set).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '403':
+          description: Insufficient role (admin required).
+        '404':
+          description: The catalogue holds no such stage (run the refresh).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '500':
+          description: The label could not be read or written. Sanitized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
   /api/integrations/ashby/mission-control/jobs/{externalJobId}/feedback-form:
     get:
       tags: [ashby]
@@ -9193,6 +9293,166 @@ components:
         deadlineHit:
           description: The overall deadline cut the check short.
           type: boolean
+      additionalProperties: false
+
+    AshbyStageMilestone:
+      description: What an Ashby stage counts as on the business-impact page (M031). The 0138 CHECK chk_ashby_stage_catalog_milestone is exactly this list.
+      type: string
+      enum: [christy, r1, r2, r3, r4, r5, reference, offer, hired, archived, other]
+
+    AshbyStageCatalogStage:
+      type: object
+      description: One catalogue row. `id` is the opaque Ashby stage id, used only to address a label change. No candidate data, no staff id.
+      required: [id, title, type, order, milestone, milestoneSource, inPlan]
+      properties:
+        id:
+          type: string
+        title:
+          description: The stage's display title in Ashby, sanitized and bounded at 120 characters.
+          type: string
+          nullable: true
+        type:
+          description: Ashby's stage type as sent (Lead, PreInterviewScreen, Active, Offer, Archived, Hired, ...). Not a closed list.
+          type: string
+          nullable: true
+        order:
+          description: Zero-indexed position in the interview plan.
+          type: integer
+          nullable: true
+        milestone:
+          description: Null = not labelled ("Other, not labelled").
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyStageMilestone'
+        milestoneSource:
+          description: Who set the milestone, as a kind — an admin, or a default rule. Null exactly when milestone is null.
+          type: string
+          nullable: true
+          enum: [admin, default]
+        inPlan:
+          description: False once a read of the stage's interview plan stopped listing it (Ashby removed it). The row and its label are kept for history; `order` is its last position.
+          type: boolean
+      additionalProperties: false
+
+    AshbyStageCatalogResponse:
+      type: object
+      description: The enabled mappings' plan stages, in plan order, then the stages Ashby removed from those plans (inPlan false).
+      required: [ok, stages, enabledMappings, unreadMappings, truncated]
+      properties:
+        ok:
+          type: boolean
+        stages:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyStageCatalogStage'
+        enabledMappings:
+          description: Enabled, live mappings read (at most 50).
+          type: integer
+        unreadMappings:
+          description: Enabled mappings whose interview plan has not been read into the catalogue yet.
+          type: integer
+        truncated:
+          description: A bound cut the mappings or the stages.
+          type: boolean
+      additionalProperties: false
+
+    AshbyStageCatalogRefreshFailure:
+      type: object
+      description: Failed job-plan reads of one coarse code. Never a provider message.
+      required: [code, count]
+      properties:
+        code:
+          description: missing_permission when Ashby named missing_endpoint_permission (on HTTP 403 or HTTP 200 with success false); otherwise the access check's coarse code — `forbidden` is a 403 without that code (most likely a wrong or deactivated key).
+          type: string
+          enum: [missing_permission, unauthorized, forbidden, not_found, client_error, rate_limited, server_error, timeout, network, malformed_response, output_limit, logical_failure, invalid_request, unknown]
+        count:
+          type: integer
+      additionalProperties: false
+
+    AshbyStageCatalogRefreshResponse:
+      type: object
+      description: What one stage-catalogue refresh read and wrote. Counts and coarse codes only.
+      required: [ok, refresh]
+      properties:
+        ok:
+          type: boolean
+        refresh:
+          type: object
+          required: [mappings, jobs, failures, stages, deadlineHit]
+          properties:
+            mappings:
+              type: object
+              required: [enabled, truncated]
+              properties:
+                enabled:
+                  description: Enabled, live mappings read (at most 50).
+                  type: integer
+                truncated:
+                  description: There were more mappings, or more than five distinct jobs, than were read.
+                  type: boolean
+              additionalProperties: false
+            jobs:
+              type: object
+              description: attempted = read + failed; notTried = the deadline left no time.
+              required: [attempted, read, failed, notTried]
+              properties:
+                attempted:
+                  type: integer
+                read:
+                  type: integer
+                failed:
+                  type: integer
+                notTried:
+                  type: integer
+              additionalProperties: false
+            failures:
+              type: array
+              items:
+                $ref: '#/components/schemas/AshbyStageCatalogRefreshFailure'
+            stages:
+              type: object
+              description: seen = distinct stages read; inserted and updated sum to seen; defaulted = stages with no label that got a default one this time; redefaulted = stages whose default label moved (renamed, retyped, or no longer a mapping's Christy stage), to another default or to none.
+              required: [seen, inserted, updated, defaulted, redefaulted, leftPlan]
+              properties:
+                seen:
+                  type: integer
+                inserted:
+                  type: integer
+                updated:
+                  type: integer
+                defaulted:
+                  type: integer
+                redefaulted:
+                  type: integer
+                leftPlan:
+                  description: Stages of a plan read this time that it no longer lists, newly marked as not in the plan (kept, never deleted).
+                  type: integer
+              additionalProperties: false
+            deadlineHit:
+              description: The overall deadline cut the refresh short.
+              type: boolean
+          additionalProperties: false
+      additionalProperties: false
+
+    AshbyStageMilestoneUpdateRequest:
+      type: object
+      description: Exactly one key. Null clears the admin's label back to the stage's default, if it has one.
+      required: [milestone]
+      properties:
+        milestone:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AshbyStageMilestone'
+      additionalProperties: false
+
+    AshbyStageMilestoneUpdateResponse:
+      type: object
+      required: [ok, stage]
+      properties:
+        ok:
+          type: boolean
+        stage:
+          $ref: '#/components/schemas/AshbyStageCatalogStage'
       additionalProperties: false
 
     AshbyJob:

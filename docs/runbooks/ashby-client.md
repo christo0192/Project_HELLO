@@ -83,6 +83,25 @@ would outlast the check's ~25 s budget is not waited on: it reads at once as
 slept and the call retried. `rate_limited` means try the check again later. It
 returns states, coarse codes, counts and stage types, never an id or a name.
 
+The stage-catalogue refresh (`POST …/mission-control/stage-catalog/refresh`,
+`integrations/ashby/stage-catalog.ts`, M031) makes one read,
+`jobInterviewPlan.info` with `failFastPastDeadline`, for each enabled mapping's
+job: at most five distinct jobs under one ~20 s deadline. It stores each stage's
+id, title, type, plan order and group id in `screening_v2.ashby_stage_catalog`
+(0138) through `refresh_ashby_stage_catalog`, which never deletes, never
+touches a label an admin set, and recomputes every other label from the plan
+as it stands (a renamed or retyped stage, or a Christy stage no mapping not
+archived names any more, takes its new default or none: `redefaulted`). A
+stage a plan read no longer lists is kept, label and all, and marked
+`not_in_plan_since` (`leftPlan`); the list shows it last as no longer in the
+Ashby plan. A plan whose read failed is not judged. The refresh and the label
+change (`set_ashby_stage_milestone`) each write their audit row in the same
+transaction as the change, under the admin's id. A job Ashby refuses is
+counted under
+`failures` by the access check's codes (`missing_permission` means the key lacks
+Jobs read). The list (`GET …/stage-catalog`) and the label change
+(`PATCH …/stage-catalog/:stageId`) make no Ashby call.
+
 `candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
 and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy
 verdict tag lane (`recommendation-tags.ts`, runbook

@@ -7,7 +7,7 @@
  * invents capabilities the API does not expose.
  *
  * Sections (internal accessible sub-navigation, keyboard + mobile safe):
- * Overview · Access · Sessions · Quotas · Funnel · R1 · Audit · Maintenance. The active
+ * Overview · Access · Sessions · Quotas · Funnel · Stages · R1 · Audit · Maintenance. The active
  * section is mirrored into the URL hash (`#sessions`) so a section is
  * shareable and survives a refresh; unknown hashes fall back to Overview.
  *
@@ -42,13 +42,14 @@ import {
   QuotasSection,
   R1Section,
   SessionsSection,
+  StagesSection,
 } from '../components/mission-control';
 
 // `scorebar` is deliberately absent: the metric library moved to the Roles
 // page, where the person editing a role can reach it without changing pages.
 // An old `#scorebar` bookmark falls through `sectionFromHash` to `overview`
 // rather than 404-ing, which is the right failure for a deep link.
-const SECTION_IDS = ['overview', 'access', 'sessions', 'quotas', 'funnel', 'r1', 'audit', 'maintenance'] as const;
+const SECTION_IDS = ['overview', 'access', 'sessions', 'quotas', 'funnel', 'stages', 'r1', 'audit', 'maintenance'] as const;
 type SectionId = (typeof SECTION_IDS)[number];
 
 function sectionFromHash(hash: string): SectionId {
@@ -128,6 +129,8 @@ export function MissionControlPage() {
           { id: 'sessions', label: 'Sessions', render: () => <SessionsSection /> },
           { id: 'quotas', label: 'Quotas', render: () => <QuotasSection /> },
           { id: 'funnel', label: 'Funnel', render: () => <FunnelSection /> },
+          // M031: what each Ashby stage counts as on Business impact.
+          { id: 'stages', label: 'Stages', render: () => <StagesSection /> },
           { id: 'r1', label: 'R1', render: () => <R1Section /> },
           { id: 'audit', label: 'Audit', render: () => <AuditSection /> },
           { id: 'maintenance', label: 'Maintenance', render: () => <MaintenanceSection /> },

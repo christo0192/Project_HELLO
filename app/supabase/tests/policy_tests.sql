@@ -24156,6 +24156,558 @@ $$;
 
 drop function _policy_tests.p137_insert(uuid, uuid, uuid, integer);
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0138: the Ashby pipeline tables (M031 S2). Five new tables, RLS on and
+-- service-role only like the sibling Ashby tables; progress and intervals
+-- follow their link on delete; every closed CHECK accepts each real value and
+-- refuses a near miss; the catalogue refresh never deletes and never
+-- overwrites a label already set.
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  '0138: the five Ashby pipeline tables exist with RLS enabled',
+  (select count(*) from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2'
+      and c.relkind = 'r'
+      and c.relname in ('ashby_stage_catalog','ashby_application_progress',
+                        'ashby_application_stage_intervals','ashby_archive_reasons','ashby_progress_runs')
+      and c.relrowsecurity) = 5,
+  'all five 0138 tables must exist and enable row-level security'
+);
+
+select _policy_tests.assert(
+  '0138: no policy and no browser privilege on the pipeline tables',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename in ('ashby_stage_catalog','ashby_application_progress',
+                         'ashby_application_stage_intervals','ashby_archive_reasons','ashby_progress_runs')
+  )
+  and not exists (
+    select 1 from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname in ('ashby_stage_catalog','ashby_application_progress',
+                         'ashby_application_stage_intervals','ashby_archive_reasons','ashby_progress_runs')
+       and (has_table_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,DELETE')
+         or has_table_privilege('authenticated', c.oid, 'SELECT,INSERT,UPDATE,DELETE'))
+  ),
+  'the 0138 tables must stay service_role-only: no policy, no anon/authenticated grant'
+);
+
+select _policy_tests.assert(
+  '0138: service_role reads and writes every pipeline table',
+  (select count(*) from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2'
+      and c.relname in ('ashby_stage_catalog','ashby_application_progress',
+                        'ashby_application_stage_intervals','ashby_archive_reasons','ashby_progress_runs')
+      and has_table_privilege('service_role', c.oid, 'SELECT,INSERT,UPDATE,DELETE')) = 5,
+  'the API service role must have full access to the 0138 tables'
+);
+
+select _policy_tests.assert(
+  '0138: refresh_ashby_stage_catalog and set_ashby_stage_milestone are SECURITY DEFINER, pin search_path, and only service_role may run them',
+  (select count(*) from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('refresh_ashby_stage_catalog', 'set_ashby_stage_milestone')
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+       and not has_function_privilege('anon', p.oid, 'EXECUTE')
+       and not has_function_privilege('authenticated', p.oid, 'EXECUTE')) = 2
+  and (select count(*) from pg_proc p
+         join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'screening_v2'
+          and p.proname in ('refresh_ashby_stage_catalog', 'set_ashby_stage_milestone')) = 2,
+  'the catalogue refresh and the label must be pinned SECURITY DEFINER functions executable by service_role only, one of each'
+);
+
+select _policy_tests.assert(
+  '0138: progress and intervals reference their link with ON DELETE CASCADE (cascade)',
+  (select count(*) from pg_constraint
+    where contype = 'f'
+      and confrelid = 'screening_v2.ashby_application_links'::regclass
+      and conrelid in ('screening_v2.ashby_application_progress'::regclass,
+                       'screening_v2.ashby_application_stage_intervals'::regclass)
+      and confdeltype = 'c') = 2
+  and (select count(*) from pg_constraint
+        where contype = 'f'
+          and conrelid in ('screening_v2.ashby_stage_catalog'::regclass,
+                           'screening_v2.ashby_archive_reasons'::regclass,
+                           'screening_v2.ashby_progress_runs'::regclass)) = 0,
+  'a link delete must take its progress and intervals; the catalogue, reasons and runs reference nothing'
+);
+
+-- Returns 'accepted', or the name of the constraint that refused the row.
+create or replace function _policy_tests.p138_try(p_sql text) returns text
+language plpgsql as $$
+declare
+  v_constraint text;
+begin
+  execute p_sql;
+  return 'accepted';
+exception
+  when check_violation or unique_violation or not_null_violation or foreign_key_violation then
+    get stacked diagnostics v_constraint = constraint_name;
+    return coalesce(v_constraint, 'refused');
+end;
+$$;
+
+do $$
+declare
+  v_link  uuid;
+  v_link2 uuid;
+  v_res   text;
+  v_json  jsonb;
+  v_row   screening_v2.ashby_stage_catalog%rowtype;
+  v_case  record;
+  v_n     integer := 0;
+  v_actor uuid := '44444444-4444-4444-8444-444444444438';
+  v_audits integer;
+  v_audit screening_v2.audit_events%rowtype;
+begin
+  insert into screening_v2.ashby_application_links (external_application_id)
+    values ('pol138-app-1') returning id into v_link;
+  insert into screening_v2.ashby_application_links (external_application_id)
+    values ('pol138-app-2') returning id into v_link2;
+
+  -- ── Catalogue: every real value is accepted, a near miss refused ──────
+  for v_case in
+    select * from (values
+      ('milestone christy',   'christy',   'default', 'Active',             'plan',    'accepted'),
+      ('milestone r1',        'r1',        'default', 'Active',             'plan',    'accepted'),
+      ('milestone r2',        'r2',        'admin',   'Active',             'plan',    'accepted'),
+      ('milestone r3',        'r3',        'admin',   'Active',             'plan',    'accepted'),
+      ('milestone r4',        'r4',        'admin',   'Active',             'plan',    'accepted'),
+      ('milestone r5',        'r5',        'admin',   'Active',             'plan',    'accepted'),
+      ('milestone reference', 'reference', 'default', 'Active',             'plan',    'accepted'),
+      ('milestone offer',     'offer',     'default', 'Offer',              'plan',    'accepted'),
+      ('milestone hired',     'hired',     'default', 'Hired',              'plan',    'accepted'),
+      ('milestone archived',  'archived',  'default', 'Archived',           'plan',    'accepted'),
+      ('milestone other',     'other',     'admin',   'Lead',               'history', 'accepted'),
+      ('no milestone',        null,        null,      'PreInterviewScreen', 'plan',    'accepted'),
+      ('a stage type Ashby may add', null, null,      'SomethingNew',       'plan',    'accepted'),
+      ('no stage type',       null,        null,      null,                 'history', 'accepted'),
+      ('milestone r6',        'r6',        'admin',   'Active',             'plan',    'chk_ashby_stage_catalog_milestone'),
+      ('milestone R1 upper',  'R1',        'admin',   'Active',             'plan',    'chk_ashby_stage_catalog_milestone'),
+      ('a staff id as source', 'r1',       'user-123', 'Active',            'plan',    'chk_ashby_stage_catalog_milestone_source'),
+      ('a label with no source', 'r1',     null,      'Active',             'plan',    'chk_ashby_stage_catalog_milestone_pair'),
+      ('a source with no label', null,     'admin',   'Active',             'plan',    'chk_ashby_stage_catalog_milestone_pair'),
+      ('a free-text stage type', null,     null,      'Free text type',     'plan',    'chk_ashby_stage_catalog_stage_type'),
+      ('an unknown source',   null,        null,      'Active',             'guess',   'chk_ashby_stage_catalog_source')
+    ) as t(name, milestone, msource, stype, source, expected)
+  loop
+    v_n := v_n + 1;
+    v_res := _policy_tests.p138_try(format(
+      'insert into screening_v2.ashby_stage_catalog (stage_id, title, stage_type, milestone, milestone_source, source) values (%L, %L, %L, %L, %L, %L)',
+      'pol138-stage-' || v_n, 'Stage ' || v_n, v_case.stype, v_case.milestone, v_case.msource, v_case.source));
+    perform _policy_tests.assert(
+      '0138: catalogue ' || v_case.name || ' is ' || case when v_case.expected = 'accepted' then 'accepted' else 'refused' end,
+      v_res = v_case.expected, 'expected ' || v_case.expected || ', got ' || coalesce(v_res, 'null'));
+  end loop;
+
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_stage_catalog (stage_id) values (''pol138-stage-1'')');
+  perform _policy_tests.assert('0138: a stage id is unique in the catalogue',
+    v_res = 'ashby_stage_catalog_pkey', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_stage_catalog (stage_id) values (''has space'')');
+  perform _policy_tests.assert('0138: a stage id must be identifier-shaped',
+    v_res = 'chk_ashby_stage_catalog_stage_id', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_stage_catalog (stage_id, title) values (''pol138-long'', repeat(''x'', 121))');
+  perform _policy_tests.assert('0138: a stage title is bounded at 120',
+    v_res = 'chk_ashby_stage_catalog_title', coalesce(v_res, 'null'));
+  -- The API takes an Ashby id of up to 256 characters; so must the table. (A
+  -- regex bound of {1,256} is refused by Postgres when the CHECK first runs.)
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_stage_catalog (stage_id, interview_plan_id, stage_group_id) values (''pol138-'' || repeat(''a'', 249), repeat(''p'', 256), repeat(''g'', 256))');
+  perform _policy_tests.assert('0138: a 256-character stage, plan and group id is accepted',
+    v_res = 'accepted', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_stage_catalog (stage_id) values (''pol138-'' || repeat(''a'', 250))');
+  perform _policy_tests.assert('0138: a 257-character stage id is refused',
+    v_res = 'chk_ashby_stage_catalog_stage_id', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_stage_catalog (stage_id, interview_plan_id) values (''pol138-plan-long'', repeat(''p'', 257))');
+  perform _policy_tests.assert('0138: a 257-character plan id is refused',
+    v_res = 'chk_ashby_stage_catalog_plan_id', coalesce(v_res, 'null'));
+
+  -- ── Progress: each Ashby status, one row per link ─────────────────────
+  for v_case in
+    select * from (values
+      ('Active', 'accepted'), ('Hired', 'accepted'), ('Archived', 'accepted'), ('Lead', 'accepted'),
+      ('active', 'chk_ashby_application_progress_status'), ('Rejected', 'chk_ashby_application_progress_status')
+    ) as t(status, expected)
+  loop
+    v_res := _policy_tests.p138_try(format(
+      'insert into screening_v2.ashby_application_progress (application_link_id, status, archive_reason_type) values (%L, %L, %L)',
+      v_link, v_case.status, 'RejectedByOrg'));
+    perform _policy_tests.assert(
+      '0138: progress status ' || v_case.status || ' is ' || case when v_case.expected = 'accepted' then 'accepted' else 'refused' end,
+      v_res = v_case.expected, 'expected ' || v_case.expected || ', got ' || coalesce(v_res, 'null'));
+    delete from screening_v2.ashby_application_progress where application_link_id = v_link;
+  end loop;
+
+  for v_case in
+    select * from (values ('RejectedByCandidate'), ('RejectedByOrg'), ('Other'), (null)) as t(rtype)
+  loop
+    v_res := _policy_tests.p138_try(format(
+      'insert into screening_v2.ashby_application_progress (application_link_id, status, archive_reason_type) values (%L, ''Archived'', %L)',
+      v_link, v_case.rtype));
+    perform _policy_tests.assert('0138: progress archive reason type ' || coalesce(v_case.rtype, 'none') || ' is accepted',
+      v_res = 'accepted', coalesce(v_res, 'null'));
+    delete from screening_v2.ashby_application_progress where application_link_id = v_link;
+  end loop;
+
+  insert into screening_v2.ashby_application_progress (application_link_id, status) values (v_link, 'Active');
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_progress (application_link_id) values (%L)', v_link));
+  perform _policy_tests.assert('0138: one progress row per link',
+    v_res = 'uq_ashby_application_progress_link', coalesce(v_res, 'null'));
+  perform _policy_tests.assert('0138: a new progress row is due at once',
+    (select next_check_at <= now() and attempts = 0 from screening_v2.ashby_application_progress where application_link_id = v_link),
+    'next_check_at must default to now() and attempts to 0');
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_progress (application_link_id, check_error_code) values (%L, ''Missing Permission'')', v_link2));
+  perform _policy_tests.assert('0138: a progress error is a sanitized code',
+    v_res = 'chk_ashby_application_progress_error', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_progress (application_link_id, current_stage_id, current_job_id, archive_reason_id) values (%L, repeat(''s'', 256), repeat(''j'', 256), repeat(''r'', 256))', v_link2));
+  perform _policy_tests.assert('0138: progress takes 256-character stage, job and reason ids',
+    v_res = 'accepted', coalesce(v_res, 'null'));
+  delete from screening_v2.ashby_application_progress where application_link_id = v_link2;
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_progress (application_link_id, current_job_id) values (%L, repeat(''j'', 257))', v_link2));
+  perform _policy_tests.assert('0138: a 257-character job id is refused',
+    v_res = 'chk_ashby_application_progress_job', coalesce(v_res, 'null'));
+
+  -- ── Intervals: unique on Ashby's history id; moved_by_person true/false/unknown ──
+  for v_case in
+    select * from (values ('pol138-hist-1', true), ('pol138-hist-2', false), ('pol138-hist-3', null::boolean)) as t(hid, moved)
+  loop
+    v_res := _policy_tests.p138_try(format(
+      'insert into screening_v2.ashby_application_stage_intervals (application_link_id, history_id, stage_id, entered_at, moved_by_person) values (%L, %L, ''pol138-stage-1'', now(), %L)',
+      v_link, v_case.hid, v_case.moved));
+    perform _policy_tests.assert('0138: an interval moved by a person = ' || coalesce(v_case.moved::text, 'unknown') || ' is accepted',
+      v_res = 'accepted', coalesce(v_res, 'null'));
+  end loop;
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_stage_intervals (application_link_id, history_id, stage_id) values (%L, ''pol138-hist-1'', ''pol138-stage-2'')', v_link2));
+  perform _policy_tests.assert('0138: an Ashby history id is unique across intervals',
+    v_res = 'uq_ashby_application_stage_intervals_history', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_stage_intervals (application_link_id, history_id, stage_id) values (%L, ''pol138-hist-9'', null)', v_link2));
+  perform _policy_tests.assert('0138: an interval needs a stage id',
+    v_res <> 'accepted', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_stage_intervals (application_link_id, history_id, stage_id) values (%L, repeat(''h'', 256), repeat(''s'', 256))', v_link2));
+  perform _policy_tests.assert('0138: an interval takes a 256-character history and stage id',
+    v_res = 'accepted', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(format(
+    'insert into screening_v2.ashby_application_stage_intervals (application_link_id, history_id, stage_id) values (%L, repeat(''h'', 257), ''pol138-stage-1'')', v_link2));
+  perform _policy_tests.assert('0138: a 257-character history id is refused',
+    v_res = 'chk_ashby_application_stage_intervals_history', coalesce(v_res, 'null'));
+
+  -- ── Reasons and runs ──────────────────────────────────────────────────
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_archive_reasons (reason_id, text, reason_type, is_archived) values (''pol138-reason'', ''Not a fit'', ''RejectedByOrg'', false)');
+  perform _policy_tests.assert('0138: an archive reason from the catalogue is accepted', v_res = 'accepted', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_archive_reasons (reason_id, text) values (''pol138-reason-long'', repeat(''x'', 201))');
+  perform _policy_tests.assert('0138: archive reason text is bounded at 200',
+    v_res = 'chk_ashby_archive_reasons_text', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_archive_reasons (reason_id) values (''pol138-'' || repeat(''r'', 249))');
+  perform _policy_tests.assert('0138: a 256-character archive reason id is accepted', v_res = 'accepted', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_archive_reasons (reason_id) values (''pol138-'' || repeat(''r'', 250))');
+  perform _policy_tests.assert('0138: a 257-character archive reason id is refused',
+    v_res = 'chk_ashby_archive_reasons_id', coalesce(v_res, 'null'));
+  for v_case in
+    select * from (values ('sweep', 'accepted'), ('backfill', 'accepted'), ('dry_run', 'chk_ashby_progress_runs_mode')) as t(mode, expected)
+  loop
+    v_res := _policy_tests.p138_try(format(
+      'insert into screening_v2.ashby_progress_runs (mode, checked, changed, errors_by_code) values (%L, 3, 1, ''{"missing_endpoint_permission": 1}'')', v_case.mode));
+    perform _policy_tests.assert(
+      '0138: progress run mode ' || v_case.mode || ' is ' || case when v_case.expected = 'accepted' then 'accepted' else 'refused' end,
+      v_res = v_case.expected, 'expected ' || v_case.expected || ', got ' || coalesce(v_res, 'null'));
+  end loop;
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_progress_runs (mode, checked, changed) values (''sweep'', 1, 2)');
+  perform _policy_tests.assert('0138: a run cannot change more than it checked',
+    v_res = 'chk_ashby_progress_runs_changed', coalesce(v_res, 'null'));
+  v_res := _policy_tests.p138_try(
+    'insert into screening_v2.ashby_progress_runs (mode, errors_by_code) values (''sweep'', ''[1]'')');
+  perform _policy_tests.assert('0138: errors_by_code is an object',
+    v_res = 'chk_ashby_progress_runs_errors', coalesce(v_res, 'null'));
+
+  -- ── The link goes, and its progress and intervals go with it ──────────
+  delete from screening_v2.ashby_application_links where id = v_link;
+  perform _policy_tests.assert('0138: deleting a link cascades to its progress and intervals',
+    not exists (select 1 from screening_v2.ashby_application_progress where application_link_id = v_link)
+    and not exists (select 1 from screening_v2.ashby_application_stage_intervals where application_link_id = v_link),
+    'progress and intervals must follow their link on delete');
+  perform _policy_tests.assert('0138: the catalogue is not touched by a link delete',
+    exists (select 1 from screening_v2.ashby_stage_catalog where stage_id = 'pol138-stage-1'),
+    'the catalogue references no link');
+  delete from screening_v2.ashby_application_links where id = v_link2;
+
+  -- ── refresh_ashby_stage_catalog ───────────────────────────────────────
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-r1', 'interview_plan_id', 'pol138-plan', 'title', 'R1',
+                       'stage_type', 'Active', 'order_in_plan', 8, 'stage_group_id', null, 'default_milestone', 'r1'),
+    jsonb_build_object('stage_id', 'pol138-hm', 'interview_plan_id', 'pol138-plan', 'title', 'HM Review',
+                       'stage_type', 'Active', 'order_in_plan', 6, 'stage_group_id', 'grp-1', 'default_milestone', null)), v_actor);
+  perform _policy_tests.assert('0138: a first refresh inserts both stages and defaults one',
+    v_json = '{"status": "ok", "inserted": 2, "updated": 0, "defaulted": 1, "redefaulted": 0, "left_plan": 0}'::jsonb, v_json::text);
+  select * into v_row from screening_v2.ashby_stage_catalog where stage_id = 'pol138-r1';
+  perform _policy_tests.assert('0138: a refresh default is labelled default, from the plan',
+    v_row.milestone = 'r1' and v_row.milestone_source = 'default' and v_row.milestone_set_at is not null
+    and v_row.source = 'plan' and v_row.order_in_plan = 8 and v_row.interview_plan_id = 'pol138-plan',
+    row_to_json(v_row)::text);
+
+  perform _policy_tests.assert('0138: the refresh writes its own audit row, in its transaction, with counts only',
+    (select count(*) from screening_v2.audit_events
+      where actor_id = v_actor and action = 'config_changed' and target_type = 'ashby_stage_catalog' and target_id = 'refresh') = 1
+    and (select metadata = '{"resource": "ashby_stage_catalog_refresh", "stages": 2, "inserted": 2, "updated": 0, "defaulted": 1, "redefaulted": 0, "left_plan": 0}'::jsonb
+                and actor_type = 'recruiter' and result = 'success'
+           from screening_v2.audit_events where actor_id = v_actor and target_id = 'refresh'),
+    'one config_changed row per refresh, by the admin, with the counts');
+
+  -- The admin labels HM Review and relabels R1, through the label function.
+  v_audits := (select count(*) from screening_v2.audit_events where actor_id = v_actor);
+  v_json := screening_v2.set_ashby_stage_milestone('pol138-hm', 'other', 'admin', v_actor);
+  perform _policy_tests.assert('0138: an admin label is stored and answers the label it replaced',
+    v_json->>'status' = 'ok' and v_json ? 'milestone_from' and v_json->'milestone_from' = 'null'::jsonb
+    and v_json->'stage'->>'milestone' = 'other' and v_json->'stage'->>'milestone_source' = 'admin'
+    and v_json->'stage'->>'stage_id' = 'pol138-hm' and v_json->'stage'->>'title' = 'HM Review'
+    and (select milestone = 'other' and milestone_source = 'admin' and milestone_set_at is not null
+           from screening_v2.ashby_stage_catalog where stage_id = 'pol138-hm'),
+    v_json::text);
+  v_json := screening_v2.set_ashby_stage_milestone('pol138-r1', 'r2', 'admin', v_actor);
+  select * into v_audit from screening_v2.audit_events
+   where actor_id = v_actor and target_type = 'ashby_stage' and target_id = 'pol138-r1';
+  perform _policy_tests.assert('0138: each label writes one audit row in its own transaction, with the label before and after',
+    v_json->>'milestone_from' = 'r1'
+    and (select count(*) from screening_v2.audit_events where actor_id = v_actor) = v_audits + 2
+    and v_audit.action = 'config_changed' and v_audit.actor_type = 'recruiter' and v_audit.result = 'success'
+    and v_audit.metadata = '{"resource": "ashby_stage_catalog", "stage_id": "pol138-r1", "milestone_from": "r1", "milestone_source_from": "default", "milestone_to": "r2", "milestone_source": "admin"}'::jsonb,
+    coalesce(v_audit.metadata::text, 'no audit row'));
+
+  -- Refusals change nothing and write no audit row.
+  v_audits := (select count(*) from screening_v2.audit_events where actor_id = v_actor);
+  perform _policy_tests.assert('0138: a label refusal names why, and writes neither the label nor an audit row',
+    screening_v2.set_ashby_stage_milestone('pol138-r1', 'r1', 'admin', null) = '{"status": "actor_required"}'::jsonb
+    and screening_v2.set_ashby_stage_milestone('pol138-r1', 'r6', 'admin', v_actor) = '{"status": "invalid_milestone"}'::jsonb
+    and screening_v2.set_ashby_stage_milestone('pol138-r1', 'R1', 'admin', v_actor) = '{"status": "invalid_milestone"}'::jsonb
+    and screening_v2.set_ashby_stage_milestone('pol138-r1', 'r1', 'user-123', v_actor) = '{"status": "invalid_milestone_source"}'::jsonb
+    and screening_v2.set_ashby_stage_milestone('pol138-r1', 'r1', null, v_actor) = '{"status": "invalid_milestone_source"}'::jsonb
+    and screening_v2.set_ashby_stage_milestone('pol138-r1', null, 'admin', v_actor) = '{"status": "invalid_milestone_source"}'::jsonb
+    and screening_v2.set_ashby_stage_milestone('pol138-nowhere', 'r1', 'admin', v_actor) = '{"status": "not_found"}'::jsonb
+    and screening_v2.set_ashby_stage_milestone(null, 'r1', 'admin', v_actor) = '{"status": "not_found"}'::jsonb
+    and (select milestone = 'r2' and milestone_source = 'admin' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-r1')
+    and (select count(*) from screening_v2.audit_events where actor_id = v_actor) = v_audits,
+    'refusals must write nothing');
+  v_audits := (select count(*) from screening_v2.audit_events where actor_id = v_actor);
+  perform _policy_tests.assert('0138: a refresh with no admin is refused before any write',
+    screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+      jsonb_build_object('stage_id', 'pol138-anon', 'default_milestone', 'r1')), null) = '{"status": "actor_required"}'::jsonb
+    and not exists (select 1 from screening_v2.ashby_stage_catalog where stage_id = 'pol138-anon')
+    and (select count(*) from screening_v2.audit_events where actor_id = v_actor) = v_audits,
+    'a refresh must name the admin it is audited under');
+
+  -- An audit row Postgres refuses takes the change down with it: each change
+  -- and its audit row are one transaction (S2-3). The refusing constraint is
+  -- added inside the sub-block, so it rolls back with the change.
+  begin
+    alter table screening_v2.audit_events
+      add constraint pol138_refuse_stage_audit check (target_type not in ('ashby_stage', 'ashby_stage_catalog')) not valid;
+    perform screening_v2.set_ashby_stage_milestone('pol138-r1', 'r5', 'admin', v_actor);
+    v_res := 'written';
+  exception when check_violation then
+    get stacked diagnostics v_res = constraint_name;
+  end;
+  perform _policy_tests.assert('0138: a label whose audit row is refused is not written',
+    v_res = 'pol138_refuse_stage_audit'
+    and (select milestone = 'r2' and milestone_source = 'admin' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-r1')
+    and not exists (select 1 from pg_constraint where conname = 'pol138_refuse_stage_audit'),
+    coalesce(v_res, 'null'));
+  begin
+    alter table screening_v2.audit_events
+      add constraint pol138_refuse_stage_audit check (target_type not in ('ashby_stage', 'ashby_stage_catalog')) not valid;
+    perform screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+      jsonb_build_object('stage_id', 'pol138-unaudited', 'interview_plan_id', 'pol138-plan', 'default_milestone', 'r1')), v_actor);
+    v_res := 'written';
+  exception when check_violation then
+    get stacked diagnostics v_res = constraint_name;
+  end;
+  perform _policy_tests.assert('0138: a refresh whose audit row is refused writes nothing',
+    v_res = 'pol138_refuse_stage_audit'
+    and not exists (select 1 from screening_v2.ashby_stage_catalog where stage_id = 'pol138-unaudited')
+    and not exists (select 1 from screening_v2.ashby_stage_catalog where interview_plan_id = 'pol138-plan' and not_in_plan_since is not null),
+    coalesce(v_res, 'null'));
+
+  -- A second refresh offers defaults for both and a null title: nothing an admin set moves.
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-r1', 'interview_plan_id', 'pol138-plan', 'title', null,
+                       'stage_type', 'Active', 'order_in_plan', 9, 'default_milestone', 'r1'),
+    jsonb_build_object('stage_id', 'pol138-hm', 'interview_plan_id', 'pol138-plan', 'title', 'HM Review',
+                       'stage_type', 'Active', 'order_in_plan', 6, 'default_milestone', 'r3')), v_actor);
+  perform _policy_tests.assert('0138: a repeat refresh updates both and defaults none',
+    v_json = '{"status": "ok", "inserted": 0, "updated": 2, "defaulted": 0, "redefaulted": 0, "left_plan": 0}'::jsonb, v_json::text);
+  perform _policy_tests.assert('0138: the refresh never overwrites an admin label',
+    (select milestone = 'r2' and milestone_source = 'admin' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-r1')
+    and (select milestone = 'other' and milestone_source = 'admin' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-hm'),
+    'an admin label must survive any refresh');
+  perform _policy_tests.assert('0138: a null from the plan keeps the stored title; a new order is taken',
+    (select title = 'R1' and order_in_plan = 9 from screening_v2.ashby_stage_catalog where stage_id = 'pol138-r1'),
+    'title must be kept, order refreshed');
+
+  -- A cleared label takes the next refresh's default.
+  v_json := screening_v2.set_ashby_stage_milestone('pol138-hm', null, null, v_actor);
+  perform _policy_tests.assert('0138: clearing a label stores none, with no set time',
+    v_json->>'status' = 'ok' and v_json->>'milestone_from' = 'other' and v_json->'stage'->'milestone' = 'null'::jsonb
+    and (select milestone is null and milestone_source is null and milestone_set_at is null
+           from screening_v2.ashby_stage_catalog where stage_id = 'pol138-hm'),
+    v_json::text);
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-hm', 'title', 'HM Review', 'stage_type', 'Active', 'default_milestone', 'r3')), v_actor);
+  perform _policy_tests.assert('0138: a refresh defaults a stage whose label was cleared',
+    v_json = '{"status": "ok", "inserted": 0, "updated": 1, "defaulted": 1, "redefaulted": 0, "left_plan": 0}'::jsonb
+    and (select milestone = 'r3' and milestone_source = 'default' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-hm'),
+    v_json::text);
+
+  -- A default follows the stage; an admin label does not move (S2-2). Ashby
+  -- renames R2 to Assignment and adds a new R2, retypes R4 as an Offer stage
+  -- titled Offer Call, and the mapping's Christy stage moves to TA Screen. The
+  -- API computes each stage's default from the plan as it stands now.
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-d-christy', 'interview_plan_id', 'pol138-plan-d', 'title', 'Hello Christy',
+                       'stage_type', 'PreInterviewScreen', 'order_in_plan', 4, 'default_milestone', 'christy'),
+    jsonb_build_object('stage_id', 'pol138-d-ta', 'interview_plan_id', 'pol138-plan-d', 'title', 'TA Screen',
+                       'stage_type', 'PreInterviewScreen', 'order_in_plan', 5, 'default_milestone', null),
+    jsonb_build_object('stage_id', 'pol138-d-r2', 'interview_plan_id', 'pol138-plan-d', 'title', 'R2',
+                       'stage_type', 'Active', 'order_in_plan', 9, 'default_milestone', 'r2'),
+    jsonb_build_object('stage_id', 'pol138-d-r4', 'interview_plan_id', 'pol138-plan-d', 'title', 'R4',
+                       'stage_type', 'Active', 'order_in_plan', 11, 'default_milestone', 'r4')), v_actor);
+  perform _policy_tests.assert('0138: the plan whose defaults will move is read once',
+    v_json = '{"status": "ok", "inserted": 4, "updated": 0, "defaulted": 3, "redefaulted": 0, "left_plan": 0}'::jsonb, v_json::text);
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-d-christy', 'interview_plan_id', 'pol138-plan-d', 'title', 'Hello Christy',
+                       'stage_type', 'PreInterviewScreen', 'order_in_plan', 4, 'default_milestone', null),
+    jsonb_build_object('stage_id', 'pol138-d-ta', 'interview_plan_id', 'pol138-plan-d', 'title', 'TA Screen',
+                       'stage_type', 'PreInterviewScreen', 'order_in_plan', 5, 'default_milestone', 'christy'),
+    jsonb_build_object('stage_id', 'pol138-d-r2', 'interview_plan_id', 'pol138-plan-d', 'title', 'Assignment',
+                       'stage_type', 'Active', 'order_in_plan', 9, 'default_milestone', null),
+    jsonb_build_object('stage_id', 'pol138-d-r2b', 'interview_plan_id', 'pol138-plan-d', 'title', 'R2',
+                       'stage_type', 'Active', 'order_in_plan', 10, 'default_milestone', 'r2'),
+    jsonb_build_object('stage_id', 'pol138-d-r4', 'interview_plan_id', 'pol138-plan-d', 'title', 'Offer Call',
+                       'stage_type', 'Offer', 'order_in_plan', 11, 'default_milestone', 'offer')), v_actor);
+  perform _policy_tests.assert('0138: a refresh counts the defaults it moved apart from the ones it set',
+    v_json = '{"status": "ok", "inserted": 1, "updated": 4, "defaulted": 2, "redefaulted": 3, "left_plan": 0}'::jsonb, v_json::text);
+  perform _policy_tests.assert('0138: a stage renamed away from R2 loses its default label',
+    (select milestone is null and milestone_source is null and milestone_set_at is null and title = 'Assignment'
+       from screening_v2.ashby_stage_catalog where stage_id = 'pol138-d-r2'),
+    'a default must be recomputed, and cleared when no rule applies');
+  perform _policy_tests.assert('0138: a retyped stage takes the default of its new type',
+    (select milestone = 'offer' and milestone_source = 'default' and stage_type = 'Offer'
+       from screening_v2.ashby_stage_catalog where stage_id = 'pol138-d-r4'),
+    'R4 retyped Offer must count as offer');
+  perform _policy_tests.assert('0138: a moved Christy stage moves the christy default with it',
+    (select milestone is null and milestone_source is null from screening_v2.ashby_stage_catalog where stage_id = 'pol138-d-christy')
+    and (select milestone = 'christy' and milestone_source = 'default' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-d-ta'),
+    'the old Christy stage must not keep christy by default');
+  perform _policy_tests.assert('0138: after the moves one stage of the plan is r2 and one is christy',
+    (select count(*) from screening_v2.ashby_stage_catalog where interview_plan_id = 'pol138-plan-d' and milestone = 'r2') = 1
+    and (select count(*) from screening_v2.ashby_stage_catalog where interview_plan_id = 'pol138-plan-d' and milestone = 'christy') = 1
+    and (select milestone = 'r2' and milestone_source = 'default' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-d-r2b'),
+    'two stages must not share a default milestone after a rename');
+
+  -- A stage Ashby removes from a plan is kept, label and all, and marked as no
+  -- longer in it (S2-4). R5 goes and Panel takes its position. Only a plan this
+  -- call read is judged: a plan whose read failed is not in the call.
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-g-r4', 'interview_plan_id', 'pol138-plan-g', 'title', 'R4',
+                       'stage_type', 'Active', 'order_in_plan', 11, 'default_milestone', 'r4'),
+    jsonb_build_object('stage_id', 'pol138-g-r5', 'interview_plan_id', 'pol138-plan-g', 'title', 'R5',
+                       'stage_type', 'Active', 'order_in_plan', 12, 'default_milestone', 'r5'),
+    jsonb_build_object('stage_id', 'pol138-g-ref', 'interview_plan_id', 'pol138-plan-g', 'title', 'Reference Check',
+                       'stage_type', 'Active', 'order_in_plan', 13, 'default_milestone', 'reference')), v_actor);
+  perform _policy_tests.assert('0138: a fresh plan has every stage in it',
+    v_json = '{"status": "ok", "inserted": 3, "updated": 0, "defaulted": 3, "redefaulted": 0, "left_plan": 0}'::jsonb
+    and not exists (select 1 from screening_v2.ashby_stage_catalog where interview_plan_id = 'pol138-plan-g' and not_in_plan_since is not null),
+    v_json::text);
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-g-r4', 'interview_plan_id', 'pol138-plan-g', 'title', 'R4',
+                       'stage_type', 'Active', 'order_in_plan', 11, 'default_milestone', 'r4'),
+    jsonb_build_object('stage_id', 'pol138-g-panel', 'interview_plan_id', 'pol138-plan-g', 'title', 'Panel',
+                       'stage_type', 'Active', 'order_in_plan', 12, 'default_milestone', null),
+    jsonb_build_object('stage_id', 'pol138-g-ref', 'interview_plan_id', 'pol138-plan-g', 'title', 'Reference Check',
+                       'stage_type', 'Active', 'order_in_plan', 13, 'default_milestone', 'reference')), v_actor);
+  perform _policy_tests.assert('0138: a refresh counts the stages that left a plan it read',
+    v_json = '{"status": "ok", "inserted": 1, "updated": 2, "defaulted": 0, "redefaulted": 0, "left_plan": 1}'::jsonb, v_json::text);
+  perform _policy_tests.assert('0138: a stage removed from its plan is kept and marked, label and position kept',
+    (select not_in_plan_since is not null and milestone = 'r5' and milestone_source = 'default' and order_in_plan = 12
+       from screening_v2.ashby_stage_catalog where stage_id = 'pol138-g-r5')
+    and (select count(*) from screening_v2.ashby_stage_catalog
+          where interview_plan_id = 'pol138-plan-g' and not_in_plan_since is null) = 3,
+    'R5 must be kept, marked not in the plan, and Panel, R4 and Reference Check must stay in it');
+  perform _policy_tests.assert('0138: a plan the refresh did not read is never marked',
+    not exists (select 1 from screening_v2.ashby_stage_catalog
+                 where interview_plan_id in ('pol138-plan', 'pol138-plan-d') and not_in_plan_since is not null),
+    'only stages of a plan the call read can leave it');
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-g-r4', 'interview_plan_id', 'pol138-plan-g', 'title', 'R4',
+                       'stage_type', 'Active', 'order_in_plan', 11, 'default_milestone', 'r4')), v_actor);
+  perform _policy_tests.assert('0138: a stage already marked is not counted again',
+    v_json = '{"status": "ok", "inserted": 0, "updated": 1, "defaulted": 0, "redefaulted": 0, "left_plan": 2}'::jsonb
+    and (select count(*) from screening_v2.ashby_stage_catalog
+          where interview_plan_id = 'pol138-plan-g' and not_in_plan_since is not null) = 3,
+    v_json::text);
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-g-r5', 'interview_plan_id', 'pol138-plan-g', 'title', 'R5',
+                       'stage_type', 'Active', 'order_in_plan', 12, 'default_milestone', 'r5')), v_actor);
+  perform _policy_tests.assert('0138: a stage back in the plan is in it again',
+    (select not_in_plan_since is null and milestone = 'r5' from screening_v2.ashby_stage_catalog where stage_id = 'pol138-g-r5')
+    and (select not_in_plan_since is not null from screening_v2.ashby_stage_catalog where stage_id = 'pol138-g-r4'),
+    v_json::text);
+  v_res := _policy_tests.p138_try(
+    'update screening_v2.ashby_stage_catalog set not_in_plan_since = first_seen_at - interval ''1 day'' where stage_id = ''pol138-g-r4''');
+  perform _policy_tests.assert('0138: a stage cannot leave its plan before it was first seen',
+    v_res = 'chk_ashby_stage_catalog_not_in_plan', coalesce(v_res, 'null'));
+
+  -- A refresh that no longer lists a stage leaves it, label and all.
+  v_json := screening_v2.refresh_ashby_stage_catalog('[]'::jsonb, v_actor);
+  perform _policy_tests.assert('0138: the refresh never deletes a stage it no longer sees',
+    v_json = '{"status": "ok", "inserted": 0, "updated": 0, "defaulted": 0, "redefaulted": 0, "left_plan": 0}'::jsonb
+    and (select count(*) from screening_v2.ashby_stage_catalog where stage_id in ('pol138-r1','pol138-hm')) = 2,
+    v_json::text);
+
+  -- Refusals write nothing.
+  v_json := screening_v2.refresh_ashby_stage_catalog(jsonb_build_array(
+    jsonb_build_object('stage_id', 'pol138-new', 'default_milestone', 'r1'),
+    jsonb_build_object('stage_id', 'pol138-bad', 'default_milestone', 'round_one')), v_actor);
+  perform _policy_tests.assert('0138: a default outside the allowed set refuses the whole refresh',
+    v_json = '{"status": "invalid_default_milestone"}'::jsonb
+    and not exists (select 1 from screening_v2.ashby_stage_catalog where stage_id in ('pol138-new','pol138-bad')),
+    v_json::text);
+  perform _policy_tests.assert('0138: a refresh that is not an array is refused',
+    screening_v2.refresh_ashby_stage_catalog('{"stage_id": "x"}'::jsonb, v_actor) = '{"status": "invalid_stages"}'::jsonb
+    and screening_v2.refresh_ashby_stage_catalog(null, v_actor) = '{"status": "invalid_stages"}'::jsonb,
+    'a non-array must be refused');
+
+  delete from screening_v2.ashby_stage_catalog where stage_id like 'pol138-%';
+  delete from screening_v2.ashby_archive_reasons where reason_id like 'pol138-%';
+  delete from screening_v2.ashby_progress_runs where errors_by_code ? 'missing_endpoint_permission' or (checked = 0 and mode = 'sweep');
+end;
+$$;
+
+drop function _policy_tests.p138_try(text);
+
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
 -- the last phone assertion before the verdict.
