@@ -1014,8 +1014,11 @@ begin
     (r ->> 'archived')::boolean and (r ->> 'in_impact')::boolean and (_impact_tests.step(s, 'came_in') ->> 'reached')::int = 23, s::text);
   select count(*) - audits into n from screening_v2.audit_events where target_type = 'ashby_impact_exclusion';
   perform _impact_tests.ok('0140 switch: each change wrote one audit row (config_changed), the admin as its actor, no names',
+    -- Only this block's rows: policy_tests.sql runs first in CI and leaves its own switch's audit rows.
     n = 3 and not exists (select 1 from screening_v2.audit_events
-                           where target_type = 'ashby_impact_exclusion' and (actor_id <> admin or action <> 'config_changed')),
+                           where target_type = 'ashby_impact_exclusion'
+                             and target_id in (map_a::text, map_d::text)
+                             and (actor_id <> admin or action <> 'config_changed')),
     n::text);
   perform _impact_tests.ok('0140 switch: refusals change nothing',
     screening_v2.set_ashby_impact_exclusion(map_a, true, null) ->> 'status' = 'actor_required'
