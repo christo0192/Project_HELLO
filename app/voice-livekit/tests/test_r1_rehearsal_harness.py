@@ -2759,5 +2759,48 @@ class FinalReviewRoundOneHarnessTests(unittest.TestCase):
         self.assertEqual(first["unprompted_dump_count"], 1)  # only the first telling is a dump
 
 
+class BunchingGridTests(unittest.TestCase):
+    """M032 S1 item 8: the bunching grid (advisor patterns x 20-65 s an exchange) with the S1 flags
+    off and on.  With them on no gated run may turn late or excluded, use the forced path more than
+    ``FORCED_TOLERANCE`` times more, or lose the time cue; and the families spread later at the
+    owner's pace instead of bunching on the first turn the rules allow.  Flags off is the behaviour
+    of origin/main (checked by hand against a main checkout when the grid was added)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        cls.off = bunching_grid.run_grid(bunching_grid.flags("0"))
+        cls.on = bunching_grid.run_grid(bunching_grid.flags("1"))
+
+    def test_no_gated_run_gets_worse(self):
+        self.assertEqual(self.grid.regressions(self.off, self.on), [])
+
+    def test_the_forced_path_is_not_used_more_often(self):
+        off = self.grid.totals(self.off)
+        on = self.grid.totals(self.on)
+        self.assertLessEqual(on["forced_moves"], off["forced_moves"])
+        self.assertLessEqual(on["late_runs"], off["late_runs"])
+        self.assertLessEqual(on["excluded_runs"], off["excluded_runs"])
+        self.assertLessEqual(on["cue_missing"], off["cue_missing"])
+
+    def test_the_families_spread_later_at_the_owner_s_pace(self):
+        def last(results, pattern, pace):
+            return next(r.last_r for r in results if (r.pattern, r.pace) == (pattern, pace))
+
+        for pattern in ("questioner", "offerer", "owner_shape"):
+            for pace in (20.0, 25.0):
+                with self.subTest(pattern=pattern, pace=pace):
+                    self.assertGreater(last(self.on, pattern, pace), last(self.off, pattern, pace))
+        for item in self.on:
+            with self.subTest(pattern=item.pattern, pace=item.pace):
+                self.assertGreaterEqual(item.last_r, last(self.off, item.pattern, item.pace))
+
+    def test_flags_off_waits_for_no_moment(self):
+        self.assertEqual(sum(item.waits for item in self.off), 0)
+        self.assertGreater(sum(item.waits for item in self.on), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
