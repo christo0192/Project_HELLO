@@ -231,6 +231,8 @@
         "R1_ACK_RESUME_SEC": { "requiredInProduction": false, "secret": false },
         "R1_END_INTENT_LLM": { "requiredInProduction": false, "secret": false },
         "R1_END_INTENT_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
+        "R1_TURN_READER": { "requiredInProduction": false, "secret": false },
+        "R1_TURN_READER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "R1_BARE_YES_SETTLE_SEC": { "requiredInProduction": false, "secret": false },
         "R1_TTS_FLUSH_MIN_CHARS": { "requiredInProduction": false, "secret": false },
         "R1_LINE_CACHE": { "requiredInProduction": false, "secret": false },
