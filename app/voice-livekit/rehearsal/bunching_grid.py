@@ -15,7 +15,10 @@ reports per pattern and pace:
 * ``last_r``: the R (seconds) of the last graded delivery, the end of the "bunch";
 * ``cue_r``: when the 17:00 time cue was said (None if never);
 * ``holds``: how many turns held an owed move back (any ``owed_deferred_*`` reason);
-* ``waits``: how many turns an idle primary waited for a natural moment (M032 S1).
+* ``waits``: how many turns an idle primary waited for a natural moment (M032 S1);
+* ``gaps``: per family, the learner lines heard between the line that delivered its primary and
+  the line that delivered its push (SWEEP-1: at least 1 when neither was forced and the pace is
+  35 s or faster), with ``forced_primaries`` the families whose primary was forced.
 
 The six patterns of the earlier review (cooperative, pitcher, terse, questioner, offerer, cutter)
 are the gate.  A seventh, ``owner_shape``, is a paraphrased reconstruction of the shape of the
@@ -68,7 +71,18 @@ S1_FLAGS: tuple[str, ...] = (
     "R1_RESPOND_FIRST",
     "R1_CONCERN_LEDGER",
     "R1_SPLIT_REPLAN",
+    "R1_PUSH_AFTER_REACTION",
 )
+# The graded families with a primary and a push (F1's counter answers the advisor's price).
+PUSH_PAIRS: dict[str, tuple[str, str]] = {
+    "F3": ("F3-PRIMARY", "F3-PUSH"),
+    "F2": ("F2-PRIMARY", "F2-PUSH"),
+    "F1": ("F1-ANCHOR", "F1-COUNTER"),
+    "F4": ("F4-PRIMARY", "F4-PUSH"),
+}
+# SWEEP-1's target: at these paces and faster an unforced push follows at least one reaction.
+REACTION_PACE_MAX = 35.0
+REACTION_FAMILIES: tuple[str, ...] = ("F3", "F2", "F4")
 END_R_SEC = 1150.0
 START_R_SEC = 20.0
 GREETING = "Hi, this is Alex from the admissions team. Thanks for taking my call."
@@ -201,6 +215,8 @@ class RunResult:
     waits: int = 0
     delivered: dict[str, float | None] = field(default_factory=dict)
     turns: int = 0
+    gaps: dict[str, int | None] = field(default_factory=dict)
+    forced_moves: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +231,17 @@ class RunResult:
             "waits": self.waits,
             "delivered": dict(self.delivered),
             "turns": self.turns,
+            "gaps": dict(self.gaps),
+            "forced_moves": list(self.forced_moves),
+        }
+
+    def reaction_gaps(self) -> dict[str, int | None]:
+        """SWEEP-1: the gaps of the families whose primary and push were both unforced."""
+        return {
+            family: self.gaps.get(family)
+            for family in REACTION_FAMILIES
+            if not set(PUSH_PAIRS[family]) & set(self.forced_moves)
+            and self.gaps.get(family) is not None
         }
 
 
@@ -224,6 +251,7 @@ class _Learner:
     def __init__(self, engine: RolePlayEngine) -> None:
         self.engine = engine
         self.last_question: str | None = None
+        self.heard = 0  # learner lines the advisor heard (some or all of)
 
     def speak(self, plan: Any, r_sec: float, *, cut: bool = False) -> str:
         engine = self.engine
@@ -247,9 +275,11 @@ class _Learner:
                 self.last_question = None  # the guard dropped the question
         if cut and spoken:
             words = spoken.split()
+            self.heard += 1
             engine.record_spoken(plan, " ".join(words[:3]), r_sec=r_sec, interrupted=True)
             return ""
         if spoken:
+            self.heard += 1
             engine.record_spoken(plan, spoken, r_sec=r_sec)
         return spoken
 
@@ -314,6 +344,7 @@ def run_one(pattern: str, pace: float, *, seed: str = "grid") -> RunResult:
     learner = _Learner(engine)
     result = RunResult(pattern, pace)
     cut_moves: set[str] = set()
+    line_of: dict[str, int] = {}  # the heard learner line that delivered each graded move
     r = START_R_SEC
     index = -1
     text = GREETING
@@ -335,6 +366,9 @@ def run_one(pattern: str, pace: float, *, seed: str = "grid") -> RunResult:
         if cut:
             cut_moves.add(plan.move_id)
         learner.speak(plan, r, cut=cut)
+        for move_id in GRADED_MOVES:
+            if move_id not in line_of and engine.scheduler.is_delivered(move_id):
+                line_of[move_id] = learner.heard
         index += 1
         text = advisor(index, learner)
         r += pace
@@ -345,6 +379,12 @@ def run_one(pattern: str, pace: float, *, seed: str = "grid") -> RunResult:
         result.delivered[move_id] = move["delivered_sec"]
         if move["delivered_sec"] is not None and move["forced"]:
             result.forced += 1
+            result.forced_moves.append(move_id)
+    for family, (primary, push) in PUSH_PAIRS.items():
+        if primary in line_of and push in line_of:
+            result.gaps[family] = line_of[push] - line_of[primary] - 1
+        else:
+            result.gaps[family] = None
     delivered = [value for value in result.delivered.values() if value is not None]
     result.last_r = max(delivered) if delivered else None
     result.cue_r = summary["time_cue_delivered_sec"]
@@ -385,7 +425,23 @@ def totals(results: list[RunResult]) -> dict[str, Any]:
         "forced_moves": sum(item.forced for item in results),
         "mean_last_r": round(sum(last) / len(last), 1) if last else None,
         "cue_missing": sum(1 for item in results if item.cue_r is None),
+        "pushes_without_reaction_fast": len(pushes_without_reaction(results)),
     }
+
+
+def pushes_without_reaction(
+    results: list[RunResult], *, patterns: tuple[str, ...] = GATED_PATTERNS
+) -> list[str]:
+    """SWEEP-1: the unforced pushes said on the line right after their primary, at
+    ``REACTION_PACE_MAX`` or faster (``pattern@pace:family``)."""
+    found: list[str] = []
+    for item in results:
+        if item.pattern not in patterns or item.pace > REACTION_PACE_MAX:
+            continue
+        for family, gap in item.reaction_gaps().items():
+            if gap is not None and gap < 1:
+                found.append(f"{item.pattern}@{item.pace:.0f}:{family}")
+    return found
 
 
 def regressions(
@@ -436,16 +492,20 @@ def last_delivery_table(before: list[RunResult], after: list[RunResult]) -> str:
 def _rows(results: list[RunResult]) -> Iterator[str]:
     yield (
         "pattern      pace  late         excluded                 forced  last_r  cue_r  holds "
-        "waits"
+        "waits  gaps (F3 F2 F1 F4)"
     )
     for item in results:
         late = ",".join(item.late) or "-"
         excluded = ",".join(item.excluded) or "-"
         last = "-" if item.last_r is None else f"{item.last_r:.0f}"
         cue = "-" if item.cue_r is None else f"{item.cue_r:.0f}"
+        gaps = " ".join(
+            "-" if item.gaps.get(family) is None else str(item.gaps[family])
+            for family in PUSH_PAIRS
+        )
         yield (
             f"{item.pattern:<12} {item.pace:>4.0f}  {late:<11}  {excluded:<23}  {item.forced:>6}  "
-            f"{last:>6}  {cue:>5}  {item.holds:>5} {item.waits:>5}"
+            f"{last:>6}  {cue:>5}  {item.holds:>5} {item.waits:>5}  {gaps}"
         )
 
 

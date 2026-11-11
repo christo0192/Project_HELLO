@@ -2797,6 +2797,23 @@ class BunchingGridTests(unittest.TestCase):
             with self.subTest(pattern=item.pattern, pace=item.pace):
                 self.assertGreaterEqual(item.last_r, last(self.off, item.pattern, item.pace))
 
+    def test_an_unforced_push_follows_a_reaction_where_the_plan_has_slack(self):
+        """SWEEP-1 (R1_PUSH_AFTER_REACTION): with the flags on far fewer unforced pushes come on the
+        line right after their primary at 35 s or faster, and at 20-25 s none does for the
+        patterns that leave the plan its slack.  The offerer's respond-first holds spend the slack
+        (its F3 push at 25 s has no turn to spare), and at 35 s the plan often has none
+        (``_may_hold``): there the push is raised at once, as before."""
+        off = self.grid.pushes_without_reaction(self.off)
+        on = self.grid.pushes_without_reaction(self.on)
+        self.assertLess(len(on), len(off) // 2)
+        slack = ("cooperative", "pitcher", "terse", "questioner")
+        fast = [
+            item
+            for item in on
+            if item.split("@")[0] in slack and float(item.split("@")[1].split(":")[0]) <= 25
+        ]
+        self.assertEqual(fast, [])
+
     def test_flags_off_waits_for_no_moment(self):
         self.assertEqual(sum(item.waits for item in self.off), 0)
         self.assertGreater(sum(item.waits for item in self.on), 0)
