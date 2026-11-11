@@ -21,9 +21,18 @@ reports per pattern and pace:
   35 s or faster), with ``forced_primaries`` the families whose primary was forced.
 
 The six patterns of the earlier review (cooperative, pitcher, terse, questioner, offerer, cutter)
-are the gate.  A seventh, ``owner_shape``, is a paraphrased reconstruction of the shape of the
-owner's 2026-11-11 call (the advisor answers her questions, offers to bring her husband in, puts a
-question to her and gives her time); it is reported, not gated, and copies no line of that call.
+are the gate, with two more from the S1 review (S1-R1): ``decider`` and ``cutter_decider`` are the
+cooperative and the cutting advisor with a learner who names her decision maker in a free reply
+whenever she is asked who else decides (a volunteered stall, S1 item 3).  ``owner_shape`` is a
+paraphrased reconstruction of the shape of the owner's 2026-11-11 call (the advisor answers her
+questions, offers to bring her husband in, puts a question to her and gives her time); it is
+reported, not gated, and copies no line of that call.
+
+The STEP rows (``STEPS``, review S1-R2) start at the owner's pace and slow down mid-call (20 or
+25 s an exchange, then 55-80 s from R 250-650).  The S1 waits spend slack while the pace is fast,
+so a later slowdown can leave a family a little later than the release before it; the gate there
+is the scoring one (``gate_regressions``): no new exclusion (a slip past the limit or a missing
+family) and no time cue lost.  Lateness and forced moves are reported.
 
 Run it from ``app/voice-livekit``::
 
@@ -73,6 +82,15 @@ S1_FLAGS: tuple[str, ...] = (
     "R1_SPLIT_REPLAN",
     "R1_PUSH_AFTER_REACTION",
 )
+# The S1 review's step rows: (fast pace, slow pace, R from which the slow pace applies).
+STEPS: tuple[tuple[float, float, float], ...] = (
+    (20.0, 55.0, 250.0),
+    (20.0, 65.0, 250.0),
+    (20.0, 80.0, 450.0),
+    (20.0, 80.0, 650.0),
+    (25.0, 65.0, 350.0),
+    (25.0, 80.0, 250.0),
+)
 # The graded families with a primary and a push (F1's counter answers the advisor's price).
 PUSH_PAIRS: dict[str, tuple[str, str]] = {
     "F3": ("F3-PRIMARY", "F3-PUSH"),
@@ -88,6 +106,8 @@ START_R_SEC = 20.0
 GREETING = "Hi, this is Alex from the admissions team. Thanks for taking my call."
 INTENT_ACK = "Okay, I see."
 FREE_REPLY = "I see, that helps."
+# The ``decider`` learners' free reply when the advisor asks who else decides (S1-R1).
+DECIDER_REPLY = "Honestly, I'd need to talk it through with my husband first."
 # What the scripted learner asks when a free reply is handed a curiosity topic (keyed by the label
 # the reminder quotes), and how a helpful advisor answers it.
 CURIOSITY_QUESTIONS: dict[str, str] = {
@@ -196,6 +216,8 @@ GATED_PATTERNS: tuple[str, ...] = (
     "questioner",
     "offerer",
     "cutter",
+    "decider",
+    "cutter_decider",
 )
 FORCED_TOLERANCE = 1
 
@@ -206,6 +228,7 @@ class RunResult:
 
     pattern: str
     pace: float
+    step: tuple[float, float] | None = None  # (slow pace, from R) for a STEP row
     late: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)
     forced: int = 0
@@ -222,6 +245,7 @@ class RunResult:
         return {
             "pattern": self.pattern,
             "pace": self.pace,
+            "step": None if self.step is None else list(self.step),
             "late": list(self.late),
             "excluded": list(self.excluded),
             "forced": self.forced,
@@ -248,10 +272,12 @@ class RunResult:
 class _Learner:
     """The scripted learner model: an acknowledgement on intents, a question when handed one."""
 
-    def __init__(self, engine: RolePlayEngine) -> None:
+    def __init__(self, engine: RolePlayEngine, *, names_decider: bool = False) -> None:
         self.engine = engine
         self.last_question: str | None = None
         self.heard = 0  # learner lines the advisor heard (some or all of)
+        self.names_decider = names_decider
+        self.advisor_text = ""  # the advisor's turn this reply answers
 
     def speak(self, plan: Any, r_sec: float, *, cut: bool = False) -> str:
         engine = self.engine
@@ -263,11 +289,14 @@ class _Learner:
         elif plan.mode is TurnMode.INTENT:
             spoken = engine.compose_speech(plan, INTENT_ACK).text
         else:
-            reply = FREE_REPLY
+            base = FREE_REPLY
+            if self.names_decider and "anyone else" in self.advisor_text.lower():
+                base = DECIDER_REPLY  # a stall she volunteers (S1 item 3)
+            reply = base
             reminder = plan.reminder or ""
             for label, question in CURIOSITY_QUESTIONS.items():
                 if f'curious about "{label}"' in reminder:
-                    reply = f"{FREE_REPLY} {question}"
+                    reply = f"{base} {question}"
                     self.last_question = question
                     break
             spoken = engine.sanitize_reply(plan, reply).text
@@ -332,17 +361,30 @@ PATTERNS: dict[str, AdvisorFn] = {
     "questioner": _questioner,
     "offerer": _offerer,
     "cutter": _cutter,
+    "decider": _cooperative,
+    "cutter_decider": _cutter,
     "owner_shape": _owner_shape,
 }
+# The patterns whose learner names her decision maker when asked who else decides.
+DECIDER_PATTERNS = frozenset({"decider", "cutter_decider"})
 
 
-def run_one(pattern: str, pace: float, *, seed: str = "grid") -> RunResult:
-    """One role-play: ``pattern``'s advisor at ``pace`` seconds an exchange until R = 19:10."""
+def run_one(
+    pattern: str,
+    pace: float,
+    *,
+    seed: str = "grid",
+    step: tuple[float, float] | None = None,
+) -> RunResult:
+    """One role-play: ``pattern``'s advisor at ``pace`` seconds an exchange until R = 19:10.
+
+    ``step`` (slow pace, from R): the exchanges from that R on take the slow pace (a STEP row).
+    """
     advisor = PATTERNS[pattern]
     persona = resolve_persona("p1_career_switcher", variant="v1")
     engine = RolePlayEngine(persona, candidate_first_name="Alex", seed=f"{seed}:{pattern}:{pace}")
-    learner = _Learner(engine)
-    result = RunResult(pattern, pace)
+    learner = _Learner(engine, names_decider=pattern in DECIDER_PATTERNS)
+    result = RunResult(pattern, pace, step)
     cut_moves: set[str] = set()
     line_of: dict[str, int] = {}  # the heard learner line that delivered each graded move
     r = START_R_SEC
@@ -365,13 +407,14 @@ def run_one(pattern: str, pace: float, *, seed: str = "grid") -> RunResult:
         )
         if cut:
             cut_moves.add(plan.move_id)
+        learner.advisor_text = text
         learner.speak(plan, r, cut=cut)
         for move_id in GRADED_MOVES:
             if move_id not in line_of and engine.scheduler.is_delivered(move_id):
                 line_of[move_id] = learner.heard
         index += 1
         text = advisor(index, learner)
-        r += pace
+        r += pace if step is None or r < step[1] else step[0]
     summary = engine.scheduler.summary(final=True)
     moves = {move["id"]: move for move in summary["moves"]}
     for move_id in GRADED_MOVES:
@@ -408,6 +451,45 @@ def run_grid(
     names = patterns or tuple(PATTERNS)
     with mock.patch.dict(os.environ, env or {}):
         return [run_one(name, pace) for name in names for pace in paces]
+
+
+def run_steps(
+    env: dict[str, str] | None = None,
+    *,
+    patterns: tuple[str, ...] = GATED_PATTERNS,
+    steps: tuple[tuple[float, float, float], ...] = STEPS,
+) -> list[RunResult]:
+    """The STEP rows: every gated pattern at each (fast, slow, from R) of ``steps``."""
+    with mock.patch.dict(os.environ, env or {}):
+        return [
+            run_one(name, fast, step=(slow, at)) for name in patterns for fast, slow, at in steps
+        ]
+
+
+def _key(item: RunResult) -> tuple[str, float, tuple[float, float] | None]:
+    return (item.pattern, item.pace, item.step)
+
+
+def _where(item: RunResult) -> str:
+    where = f"{item.pattern}@{item.pace:.0f}"
+    if item.step is not None:
+        where += f"->{item.step[0]:.0f}@R{item.step[1]:.0f}"
+    return where
+
+
+def gate_regressions(before: list[RunResult], after: list[RunResult]) -> list[str]:
+    """The runs ``after`` made worse for scoring: a new exclusion or a newly missing time cue."""
+    found: list[str] = []
+    old = {_key(item): item for item in before}
+    for item in after:
+        base = old.get(_key(item))
+        if base is None:
+            continue
+        for reason in sorted(set(item.excluded) - set(base.excluded)):
+            found.append(f"{_where(item)}: {reason} new")
+        if item.cue_r is None and base.cue_r is not None:
+            found.append(f"{_where(item)}: time cue newly missing")
+    return found
 
 
 def flags(value: str) -> dict[str, str]:
@@ -453,14 +535,14 @@ def regressions(
     """The runs ``after`` made worse than ``before``: a family newly late or excluded, the forced
     path used more than ``FORCED_TOLERANCE`` times more, or the time cue newly missing."""
     found: list[str] = []
-    old = {(item.pattern, item.pace): item for item in before}
+    old = {_key(item): item for item in before}
     for item in after:
         if item.pattern not in patterns:
             continue
-        base = old.get((item.pattern, item.pace))
+        base = old.get(_key(item))
         if base is None:
             continue
-        where = f"{item.pattern}@{item.pace:.0f}"
+        where = _where(item)
         for family in sorted(set(item.late) - set(base.late)):
             found.append(f"{where}: {family} newly late")
         for reason in sorted(set(item.excluded) - set(base.excluded)):
@@ -491,10 +573,13 @@ def last_delivery_table(before: list[RunResult], after: list[RunResult]) -> str:
 
 def _rows(results: list[RunResult]) -> Iterator[str]:
     yield (
-        "pattern      pace  late         excluded                 forced  last_r  cue_r  holds "
-        "waits  gaps (F3 F2 F1 F4)"
+        "pattern              pace  late         excluded                 forced  last_r  cue_r  "
+        "holds waits  gaps (F3 F2 F1 F4)"
     )
     for item in results:
+        pace = f"{item.pace:.0f}" + (
+            "" if item.step is None else f">{item.step[0]:.0f}@{item.step[1]:.0f}"
+        )
         late = ",".join(item.late) or "-"
         excluded = ",".join(item.excluded) or "-"
         last = "-" if item.last_r is None else f"{item.last_r:.0f}"
@@ -504,7 +589,7 @@ def _rows(results: list[RunResult]) -> Iterator[str]:
             for family in PUSH_PAIRS
         )
         yield (
-            f"{item.pattern:<12} {item.pace:>4.0f}  {late:<11}  {excluded:<23}  {item.forced:>6}  "
+            f"{item.pattern:<14} {pace:>10}  {late:<11}  {excluded:<23}  {item.forced:>6}  "
             f"{last:>6}  {cue:>5}  {item.holds:>5} {item.waits:>5}  {gaps}"
         )
 
@@ -534,6 +619,22 @@ def main(argv: list[str] | None = None) -> int:
         print(last_delivery_table(grids["off"], grids["on"]))
         print("== regressions (gated patterns): " + ("; ".join(found) if found else "none"))
         out["regressions"] = found
+        steps_off = run_steps(flags("0"))
+        steps_on = run_steps(flags("1"))
+        print("== step rows, flags off")
+        print(table(steps_off))
+        print("== step rows, flags on")
+        print(table(steps_on))
+        gate = gate_regressions(steps_off, steps_on)
+        other = regressions(steps_off, steps_on)
+        print("== step rows, scoring regressions: " + ("; ".join(gate) if gate else "none"))
+        print("== step rows, later or more forced (reported): " + ("; ".join(other) or "none"))
+        out["step_gate_regressions"] = gate
+        out["step_changes"] = other
+        out["steps"] = {
+            "off": [item.as_dict() for item in steps_off],
+            "on": [item.as_dict() for item in steps_on],
+        }
     if args.json:
         Path(args.json).write_text(json.dumps(out, indent=1), encoding="utf-8")
     return 0

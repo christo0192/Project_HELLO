@@ -81,10 +81,11 @@ SPACING_TURNS = 2
 IDLE_GAP_TURNS = SPACING_TURNS + 1
 # M032 S1 (owner decision D-M032-1, flag ``R1_NATURAL_TIMING``).  While the plan is ahead of its
 # pacing map (``Moment.slack_ok``), the idle path waits for a natural moment: the advisor handed
-# her the floor, or a thread just closed; otherwise for this longer quiet stretch, and never while
-# a thread is open (an offer, a back-off or a question put to her, or her own question just
-# answered).  IDLE_GAP_TURNS itself is unchanged (the engine's SLACK_TURNS_PER_MOVE derives from
-# it), and so are spacing, the topic trigger, the deadlines and the forced path.
+# her the floor, or a thread just closed, and not while a thread is open (an offer, a back-off or
+# a question put to her, or her own question just answered); after this longer quiet stretch it is
+# ready again whatever the turn (the wait is bounded).  IDLE_GAP_TURNS itself is unchanged (the
+# engine's SLACK_TURNS_PER_MOVE derives from it), and so are spacing, the topic trigger, the
+# deadlines and the forced path.
 IDLE_GAP_SLACK_TURNS = 5
 # An advisor turn this long (and not a bare "Okay", nor mainly a question or a request about the
 # call) counts as a substantive answer to a primary.
@@ -1388,6 +1389,18 @@ class OwedMoveScheduler:
         average = sum(recent) / len(recent) if recent else DEFAULT_TURN_SEC
         return min(LOOKAHEAD_MAX_SEC, max(LOOKAHEAD_MIN_SEC, average))
 
+    @property
+    def cautious_lookahead_sec(self) -> float:
+        """The slowest recent turn, never below ``lookahead_sec`` (M032 S1, review S1-R2).
+
+        The S1 waits and holds spend the plan's buffer, so their slack is judged at the pace of the
+        slowest of the last four turns: the first slow exchange after a fast stretch counts at once,
+        where the average takes four turns to catch up.  Clamped like the average.
+        """
+        recent = self._gaps[-4:]
+        slowest = max(recent) if recent else DEFAULT_TURN_SEC
+        return min(LOOKAHEAD_MAX_SEC, max(self.lookahead_sec, slowest))
+
     def observe_candidate_turn(self, text: object, r_sec: float) -> TurnSignals:
         """Record one candidate turn at role-play time ``r_sec`` and derive its signals."""
         self.turn += 1
@@ -1605,9 +1618,12 @@ class OwedMoveScheduler:
         """Breathing room first; then the topic came up, or it has been quiet for a while.
 
         With a ``moment`` that has slack (M032 S1, D-M032-1) the quiet-stretch path needs a
-        natural moment too: the floor handed to her or a thread just closed, else
-        ``IDLE_GAP_SLACK_TURNS`` quiet turns, and never an open thread.  It can only make a primary
-        later than without one, never earlier.
+        natural moment too: the floor handed to her or a thread just closed, and not an open
+        thread.  The wait is bounded (review S1-R2): after ``IDLE_GAP_SLACK_TURNS`` turns without an
+        objection the primary is ready again, open thread or not (an advisor who puts something to
+        her every turn kept a thread open on every turn, and the wait spent the plan's whole
+        buffer); on such a turn the engine's respond-first hold may still hold it once.  It can
+        only make a primary later than without a moment, never earlier.
         """
         gap = self._since_objection()
         if gap < SPACING_TURNS:
@@ -1618,11 +1634,11 @@ class OwedMoveScheduler:
             return False
         if moment is None or not moment.slack_ok:
             return True
-        if moment.floor_offered:
+        if moment.floor_offered or gap >= IDLE_GAP_SLACK_TURNS:
             return True
         if moment.thread_open:
             return False
-        return moment.thread_closed or gap >= IDLE_GAP_SLACK_TURNS
+        return moment.thread_closed
 
     def _push_answered(self, primary_id: str) -> bool:
         """A push follows an answer to its primary, or waits a couple of turns.

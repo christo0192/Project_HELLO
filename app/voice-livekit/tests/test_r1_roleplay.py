@@ -7758,11 +7758,12 @@ class SplitAnswerReplanTests(unittest.TestCase):
             second, issued = run()
         self.assertEqual(second.move_id, F3_PUSH)
         self.assertEqual(issued, 1)
-        # SWEEP-1 on: the continuation (planned at the pace of a split answer, so with slack) holds
-        # the push for her reaction; the issue the lost reply made is still given back.
+        # Every flag on: the 60 s exchange before the split leaves no S1 slack (the slowest recent
+        # turn, review S1-R2), so the continuation raises the push too, and it is issued once.
         second, issued = run()
-        self.assertIn("owed_deferred_for_reaction", second.reasons)
-        self.assertEqual(issued, 0)
+        self.assertEqual(second.move_id, F3_PUSH)
+        self.assertNotIn("owed_deferred_for_reaction", second.reasons)
+        self.assertEqual(issued, 1)
         with flags(**ALL_OFF):
             second, issued = run()
         self.assertEqual(issued, 2)

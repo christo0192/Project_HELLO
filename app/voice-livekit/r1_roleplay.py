@@ -494,6 +494,10 @@ _PRESSING_LEVERS = frozenset({"limited_spots", "application_deadline", "seasonal
 # SWEEP-1: the pushes that wait for her reaction to the advisor's answer, with their primaries.
 # Never F1-COUNTER (the negotiation answers a price), the 19:00 stall, the time cue or a primary.
 _REACT_PUSHES = {F2_PUSH: F2_PRIMARY, F3_PUSH: F3_PRIMARY, F4_PUSH: F4_PRIMARY}
+# The S1 waits and holds spend slack only while every graded move still owed can land by R 10:00 at
+# this many turns each (``RolePlayEngine._s1_slack``; reviews S1-R2 and S1R-4).
+S1_FINISH_BY_SEC = FIDELITY_MIN_R_SEC
+S1_FINISH_TURNS_PER_MOVE = 2.5
 
 
 @dataclass(frozen=True)
@@ -1283,7 +1287,13 @@ class RolePlayEngine:
         challenged = False
         held_for_cut = False
         reacting = False  # SWEEP-1: the push waits for her reaction (quiet, like a challenge)
-        moment = self._moment(reading, negotiated, kinds, r_sec) if natural else None
+        # An ask the negotiation left to the owed move (``ask_yields_to_owed_move``) is answered by
+        # the move it selected, with no moment to wait for.
+        moment = (
+            self._moment(reading, negotiated, kinds, r_sec)
+            if natural and "ask_yields_to_owed_move" not in reasons
+            else None
+        )
         move = self.scheduler.select(r_sec, moment=moment)
         if moment is not None and moment.slack_ok:
             # Logged only: the idle primary the rule of before would have raised waits (item 1).
@@ -1376,13 +1386,13 @@ class RolePlayEngine:
                 and kinds
                 and move.id not in self._respond_held
                 and not (move.family == "F1" and self._price_talk)
-                and self._may_hold(move, r_sec)
+                and self._may_hold_s1(move, r_sec)
             ):
                 # M032 S1 item 2 (D-M032-1): the advisor made an offer, gave her time, asked her
                 # something or answered her own question.  She responds to that first and the owed
-                # move waits ONE turn: once per move, only while the plan has slack (``_may_hold``),
-                # never a forced move, the time cue or the 19:00 stall, and never an F1 move on a
-                # turn about price (the negotiation reads that turn).
+                # move waits ONE turn: once per move, only while the plan has slack
+                # (``_may_hold_s1``), never a forced move, the time cue or the 19:00 stall, and
+                # never an F1 move on a turn about price (the negotiation reads that turn).
                 self._respond_held.add(move.id)
                 kind = next(item for item in _RESPOND_ORDER if item in kinds)
                 self._respond_holds[kind] = self._respond_holds.get(kind, 0) + 1
@@ -1392,18 +1402,23 @@ class RolePlayEngine:
                 self._heard_primary is not None
                 and _REACT_PUSHES.get(move.id) == self._heard_primary
                 and move.id not in self._respond_held
-                and not (negotiated.checkin or offers_floor(reading))
+                and wants is None
+                and not offers_floor(reading)
                 and flag_on(FLAG_PUSH_AFTER_REACTION)
-                and self._may_hold(move, r_sec)
+                and self._may_hold_s1(move, r_sec)
             ):
                 # M032 SWEEP-1: her last heard line raised this family's primary and the advisor
                 # has answered it; the push waits ONE turn so that she reacts to that answer first
                 # (in every role-play the push was her very next line, after a token "[ack], but").
                 # Once per push and shared with the respond-first budget (``_respond_held``), only
-                # with slack (``_may_hold``): never forced, never F1-COUNTER, the time cue or the
-                # 19:00 stall.  Not when the advisor handed her the floor ("what else is on your
-                # mind?"): that invites her next point, the natural moment for it (D-M032-1).  On
-                # the next turn the scheduler releases the push as before.
+                # with slack (``_may_hold_s1``): never forced, never F1-COUNTER, the time cue or
+                # the 19:00 stall.  Not when the advisor handed her the floor ("what else is on
+                # your mind?"): that invites her next point, the natural moment for it (D-M032-1).
+                # A confirmation check-in ("does that make sense?") is held through: the reply is
+                # quiet, so it gets no CHECKIN_NOTE (review S1-R5).  Never on a call or enrolment
+                # ask: the negotiation left that ask to this very move, which answers it in context
+                # (``ask_yields_to_owed_move``; review S1R-1, the owner's late-call shape).  On the
+                # next turn the scheduler releases the push as before.
                 self._respond_held.add(move.id)
                 family = move.family or move.id
                 self._push_react_holds[family] = self._push_react_holds.get(family, 0) + 1
@@ -1696,6 +1711,34 @@ class RolePlayEngine:
                 return False
         return True
 
+    def _may_hold_s1(self, move: OwedMove, r_sec: float) -> bool:
+        """``_may_hold`` for the holds M032 S1 added (respond first, SWEEP-1's push reaction)."""
+        return self._may_hold(move, r_sec) and self._s1_slack(r_sec)
+
+    def _s1_slack(self, r_sec: float) -> bool:
+        """Whether the M032 S1 waits and holds may spend a turn now (reviews S1-R1, S1-R2, S1R-4).
+
+        Stricter than ``_ahead_of_pacing``, which the holds of before keep (flags off is unchanged):
+
+        * the pace is the slowest recent turn (``cautious_lookahead_sec``), not the 4-turn
+          average, so a candidate who slows down mid-call stops the S1 waits at once instead of
+          four turns later (on a step from 20 s to 55-80 s an exchange the average let natural-
+          moment waits and respond-first holds push F4 past its deadline);
+        * and the graded moves still owed can all land by ``S1_FINISH_BY_SEC`` (R 10:00) at
+          ``S1_FINISH_TURNS_PER_MOVE`` turns each.  From 10:00 on a stop is scored (the gate's
+          10-minute minimum) but only with every family delivered, so S1 spreads the families
+          inside the first ten minutes and never makes a stop after 10:00 unscored that the
+          release before it would have scored; past that point the moves come as before.
+        """
+        pace = self.scheduler.cautious_lookahead_sec
+        owed = 0
+        for deadline, move_ids in _PACING_MAP:
+            left = sum(1 for move_id in move_ids if not self.scheduler.is_delivered(move_id))
+            owed += left
+            if left and r_sec + pace * (1 + SLACK_TURNS_PER_MOVE * owed) > deadline:
+                return False
+        return r_sec + pace * (1 + S1_FINISH_TURNS_PER_MOVE * owed) <= S1_FINISH_BY_SEC
+
     def _wants_aside(self, break_kind: str | None) -> bool:
         """The one-off aside: a coaching request, or the second "are you an AI?" question."""
         if break_kind is None or self._coach_played or len(self._asides) >= MAX_ASIDES:
@@ -1954,7 +1997,7 @@ class RolePlayEngine:
             or (is_hollow_turn(text) and not self._learner_asked_last())
         )
         return Moment(
-            slack_ok=self._ahead_of_pacing(r_sec),
+            slack_ok=self._s1_slack(r_sec),
             floor_offered=negotiated.checkin or offers_floor(text),
             thread_open=thread_open,
             thread_closed=thread_closed,
@@ -1970,7 +2013,13 @@ class RolePlayEngine:
         both halves and may hold the move again, so the reply that is heard is the one that
         answers first.
         """
-        if half.issued is not None:
+        # A lost graded commitment line (the 19:00 stall, or a close-window WEAK stall carrying a
+        # family move) keeps its issue: ``_revoice_commitment`` says that very line again without
+        # issuing it (review S1-R7: it was delivered with "issued": 0).
+        unheard = self._unheard_commitment
+        if half.issued is not None and not (
+            unheard is not None and unheard.turn == half.turn and unheard.move_id == half.issued
+        ):
             self.scheduler.unissue(half.issued)
         key = half.intent_key
         if key is not None and self._intent_uses.get(key, 0) > 0:
@@ -3022,11 +3071,14 @@ class RolePlayEngine:
             and spoken_text.strip()
             and flag_on(FLAG_NATURAL_TIMING)
             and self.scheduler.spoken_proves(F4_PUSH, spoken_text)
+            and self._s1_slack(when)
         ):
             # M032 S1 item 3 (RCA LR-5, fda9e9f6 #48): she volunteered the decision-maker stall in a
             # free reply.  It is an objection for spacing, so the idle fuse does not fire the next
             # primary right after it; it is NOT a voiced reason (grading reads those) and the owed
-            # F4 push is not marked delivered.
+            # F4 push is not marked delivered.  Only while the plan has S1 slack (``_s1_slack``,
+            # review S1-R1): at 50-65 s an exchange the spacing it adds pushed F2 past its slip
+            # limit, an attempt the release before it scored.
             self.scheduler.note_objection(turn=plan.turn)
             self._volunteered_objections += 1
         self.negotiation.note_learner_text(

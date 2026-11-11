@@ -1764,11 +1764,27 @@ class NaturalMomentTests(unittest.TestCase):
         self.assertIsNone(s.select(r, moment=quiet))
         s.observe_candidate_turn(SHORT, r + 40)  # gap 4
         self.assertIsNone(s.select(r + 40, moment=quiet))
+        # An open thread holds it below the longer gap ...
+        held = sched.Moment(slack_ok=True, thread_open=True)
+        self.assertIsNone(s.select(r + 40, moment=held))
         s.observe_candidate_turn(SHORT, r + 80)  # gap 5
         self.assertEqual(s.select(r + 80, moment=quiet).id, F2_PRIMARY)
-        # ... but never while a thread is open.
-        held = sched.Moment(slack_ok=True, thread_open=True)
-        self.assertIsNone(s.select(r + 80, moment=held))
+        # ... and no longer (review S1-R2): an advisor who puts something to her every turn keeps a
+        # thread open on every turn, and an unbounded wait spent the plan's whole buffer.
+        self.assertEqual(s.select(r + 80, moment=held).id, F2_PRIMARY)
+
+    def test_the_cautious_pace_is_the_slowest_recent_turn(self):
+        """Review S1-R2: the S1 waits judge slack at the slowest of the last four turns, so the
+        first slow exchange after a fast stretch counts at once."""
+        s = make()
+        for r in (20, 40, 60, 80):
+            s.observe_candidate_turn(SHORT, r)
+        self.assertEqual((s.lookahead_sec, s.cautious_lookahead_sec), (20.0, 20.0))
+        s.observe_candidate_turn(SHORT, 145)  # one 65 s exchange
+        self.assertEqual(s.lookahead_sec, (20 + 20 + 20 + 65) / 4)
+        self.assertEqual(s.cautious_lookahead_sec, 65.0)
+        s.observe_candidate_turn(SHORT, 400)  # clamped like the average
+        self.assertEqual(s.cautious_lookahead_sec, sched.LOOKAHEAD_MAX_SEC)
 
     def test_a_fresh_topic_still_fires_even_on_an_open_thread(self):
         s = make()

@@ -2773,9 +2773,31 @@ class BunchingGridTests(unittest.TestCase):
         cls.grid = bunching_grid
         cls.off = bunching_grid.run_grid(bunching_grid.flags("0"))
         cls.on = bunching_grid.run_grid(bunching_grid.flags("1"))
+        cls.steps_off = bunching_grid.run_steps(bunching_grid.flags("0"))
+        cls.steps_on = bunching_grid.run_steps(bunching_grid.flags("1"))
 
     def test_no_gated_run_gets_worse(self):
+        """Including the learner who names her decision maker when asked (review S1-R1: one stall
+        she volunteered at 50-65 s an exchange pushed F2 past its slip limit)."""
+        self.assertIn("decider", self.grid.GATED_PATTERNS)
         self.assertEqual(self.grid.regressions(self.off, self.on), [])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        """Review S1-R2: the S1 waits spend slack at the owner's pace, so a candidate who then slows
+        to 55-80 s an exchange may land a family later than before, but never so late that the
+        attempt loses its score (no new exclusion) or its time cue."""
+        self.assertEqual(self.grid.gate_regressions(self.steps_off, self.steps_on), [])
+
+    def test_every_family_lands_by_ten_minutes_at_the_owner_s_pace(self):
+        """Review S1R-4: a stop from R 10:00 is scored only with every family delivered, so where
+        the release before S1 finished by 10:00, S1 does too."""
+        for item in self.on:
+            base = next(
+                r for r in self.off if (r.pattern, r.pace) == (item.pattern, item.pace)
+            )
+            if base.last_r is not None and base.last_r <= 600:
+                with self.subTest(pattern=item.pattern, pace=item.pace):
+                    self.assertLessEqual(item.last_r, 600)
 
     def test_the_forced_path_is_not_used_more_often(self):
         off = self.grid.totals(self.off)
