@@ -968,12 +968,25 @@ def answers_substantively(text: object) -> bool:
 # nearly always the programme described ("we can set up a catch-up session if you miss a class"),
 # and so is a pitch ("we will send you a certificate").  Nothing about price, a discount, a free
 # trial, a budget or enrolling counts (the negotiation reads those), nor an e-mail, a link, the
-# details or a callback (the negotiation's too).
+# details or a callback (the negotiation's too).  Nor a discourse phrase said with one of those
+# verbs (review S1R-5): "let me put it this way", "let me add one more thing", "I'll give you an
+# example", "I can give you an idea of ...", "I will show you why ...": the advisor explains, and
+# nothing waits for her reaction.
+_NOT_AN_OFFER_TAIL = (
+    r"(?!(?<=put) (?:it|that|things)\b)"
+    r"(?!(?<=add) (?:that|this|to that)\b)"
+    r"(?! (?:one|a|another|just one) (?:more |last |final |quick |small )?(?:thing|point|word)\b)"
+    r"(?! (?:you |to that )?(?:an? |some |one )?(?:examples?|idea|sense|picture|overview|"
+    r"breakdown|analogy|perspective|context)\b)"
+    r"(?! (?:you )?(?:why|how|what|where|when)\b)"
+    r"(?! (?:it |this |that )?(?:simply|differently|another way|this way|in perspective)\b)"
+)
 _OFFER = _compile(
     r"\bi(?:'ll| will| can| could)(?: also| actually| even| easily| happily| definitely| just)? "
     r"(?:put|add|get(?! back)|bring|arrange|give|send|share|set up|connect|organi[sz]e|book|"
-    r"include|show|introduce|loop)\b",
-    r"\blet me (?:send|arrange|set up|get you|connect|put|add|organi[sz]e|book)\b",
+    r"include|show|introduce|loop)\b" + _NOT_AN_OFFER_TAIL,
+    r"\blet me (?:send|arrange|set up|get you|connect|put|add|organi[sz]e|book)\b"
+    + _NOT_AN_OFFER_TAIL,
     r"\b(?:would you like|do you want|want) me to\b",
     r"\bif you (?:want|like|prefer|wish)\b[^.?!]{0,40}\bi(?:'ll| will| can| could)\b",
 )
@@ -1020,10 +1033,13 @@ _PRESSES_AGAIN = _compile(
 # ("..., right?"), "does that make sense?", a presence check, a request about the call itself, a
 # discourse marker said as a question ("Okay, you know what? ...", "Guess what?"), or a pitch said
 # as a question ("did you know you can book a mentor anytime?", "isn't it great that ...?", "why
-# do you think our students ...?").
+# do you think our students ...?").  The tag is a bounded run read on the sentence's last
+# ``_TAG_TAIL_CHARS`` characters only (review S1-R6: "[,\s]+" with ``search`` was quadratic in a
+# run of commas and spaces, 0.2 s on a 4,000-character turn).
 _TAG_TAIL = re.compile(
-    r"[,\s]+(?:right|okay|ok|yeah|yes|no|na|isn'?t it|you know|correct|huh|eh)\W{0,3}$"
+    r"[,\s]{1,6}(?:right|okay|ok|yeah|yes|no|na|isn'?t it|you know|correct|huh|eh)\W{0,3}$"
 )
+_TAG_TAIL_CHARS = 40
 _NOT_PUT_TO_HER = _compile(
     r"\bmakes? sense\b",
     r"\b(?:can you hear me|are you (?:there|with me)|hello)\b",
@@ -1077,7 +1093,7 @@ def asks_her_directly(text: object) -> bool:
     for sentence in _sentences(text):
         if not _asks_the_learner(sentence):
             continue
-        tag = _TAG_TAIL.search(sentence)
+        tag = _TAG_TAIL.search(sentence, max(0, len(sentence) - _TAG_TAIL_CHARS))
         if tag is not None:
             head = sentence[: tag.start()]
             if "?" not in head and not is_question_like(head):

@@ -406,51 +406,99 @@ CONCERN_PRESSURE = "pressure"
 CONCERN_OFFENDED = "offended"
 CONCERN_THINK_OVER = "think_over"
 CONCERN_TRUST = "trust"
-_CONCERNS = (
+
+
+def _concern(pattern: str) -> re.Pattern[str]:
+    return re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE)
+
+
+# Per theme: the words a negation turns around ("I'm not offended", "there's no hurry", "I don't
+# need proof": review S1-R3, a false "you have already told the advisor ..." for the rest of the
+# session), then the phrasings that voice the concern whatever precedes them (None: none).  Trust is
+# read in its doubting forms only ("I trust you on that" voices no doubt).
+_CONCERNS: tuple[tuple[str, re.Pattern[str], re.Pattern[str] | None], ...] = (
     (
         CONCERN_PRESSURE,
-        re.compile(
-            r"\b(?:pressur(?:e|ed|es|ing)|rush(?:ed|ing)?|hurr(?:y|ied|ying)|pushed into|"
-            r"only chance|breathing room|back off|on the spot)\b",
-            re.IGNORECASE,
-        ),
+        _concern(r"pressur(?:e|ed|es|ing)|rush(?:ed|ing)?|hurr(?:y|ied|ying)"),
+        _concern(r"pushed into|only chance|breathing room|back off|on the spot"),
     ),
     (
         CONCERN_OFFENDED,
-        re.compile(
-            r"\b(?:caught me off guard|sour (?:taste|note)|uncalled for|offend(?:ed|s|ing)?|"
-            r"hurtful|disrespect\w*|"
-            r"(?:that was|that's|that is|pretty|quite|very|bit|really|so) rude)\b",
-            re.IGNORECASE,
+        _concern(
+            r"uncalled for|offend(?:ed|s|ing)?|hurtful|disrespect\w*|"
+            r"(?:that was|that's|that is|pretty|quite|very|bit|really|so) rude"
         ),
+        _concern(r"caught me off guard|sour (?:taste|note)"),
     ),
     (
         CONCERN_THINK_OVER,
-        re.compile(
-            r"\b(?:think (?:it|this|that|things) (?:over|through)|get(?:ting)? back to you|"
+        _concern(
+            r"think (?:it|this|that|things) (?:over|through)|"
+            r"get(?:ting)? back to you (?:later|after|once|when|tomorrow|next week|"
+            r"in a (?:few|couple of) days)|"
             r"(?:give|put) (?:it|this) (?:some )?(?:proper |more |real |serious )?thought|"
             r"sit with (?:it|this)|sleep on (?:it|this)|mull (?:it|this) over|"
-            r"take (?:some|a (?:bit|little) of|a few days'?|a day'?s?) (?:time|to think))\b",
-            re.IGNORECASE,
+            r"take (?:some|a (?:bit|little) of|a few days'?|a day'?s?) (?:time|to think)"
         ),
+        None,
     ),
     (
         CONCERN_TRUST,
-        re.compile(
-            r"\b(?:proof|prove (?:it|that|this)|evidence|see (?:it|that|this|some of (?:that|it|"
-            r"this)|results) (?:for )?myself|see for myself|before trusting|trust (?:it|that|this|"
-            r"you|them)|track record|too good to be true)\b",
-            re.IGNORECASE,
+        _concern(
+            r"proof|prove (?:it|that|this)|evidence|"
+            r"see (?:it|that|this|some of (?:that|it|this)|results) (?:for )?myself|"
+            r"see for myself|"
+            r"(?:see|know|check|hear about|look at|what's|what is) (?:your|the|their) track record"
+        ),
+        _concern(
+            r"(?:don't|do not|can't|cannot|couldn't|hard to|not sure(?: if)?(?: i)?(?: can| could)?"
+            r"|before) trust(?:ing)?|"
+            r"trust (?:it|that|this|you|them|those numbers) (?:yet|blindly|just like that)|"
+            r"too good to be true"
         ),
     ),
 )
-CONCERN_THEMES = tuple(theme for theme, _pattern in _CONCERNS)
+CONCERN_THEMES = tuple(theme for theme, _turned, _fixed in _CONCERNS)
+# A negation in the same clause, at most ``NEGATION_WINDOW_WORDS`` words before the concern word.
+NEGATION_WINDOW_WORDS = 3
+_NEGATOR = re.compile(
+    r"\b(?:not|no|never|nothing|cannot|dont|doesnt|didnt|isnt|wasnt|arent|cant|wont)\b|n't\b",
+    re.IGNORECASE,
+)
+# ... unless the negation still voices it: an imperative clause ("please don't rush me"), "I don't
+# like being rushed", "I'd rather not be rushed", "I won't be pressured".
+_IMPERATIVE = re.compile(
+    r"^\s*(?:(?:so|and|but|just|okay|look|please)\s+){0,2}(?:don'?t|do not|never)\b",
+    re.IGNORECASE,
+)
+_STILL_VOICED = re.compile(
+    r"(?:n't|\bnot|\bnever)\s+(?:\w+\s+)?(?:like|want|appreciate|enjoy|love)\b"
+    r"|\brather not\b"
+    r"|\b(?:can'?t|cannot|won'?t|will not|refuse to)\s+be\b",
+    re.IGNORECASE,
+)
+_CLAUSE_BREAK = re.compile(r"[,.;:!?()\"]|\s-\s")
+
+
+def _negated(folded: str, start: int) -> bool:
+    """A negation in the clause just before ``start`` turns the concern around (review S1-R3)."""
+    clause = _CLAUSE_BREAK.split(folded[max(0, start - 80) : start])[-1]
+    window = " ".join(clause.split()[-NEGATION_WINDOW_WORDS:])
+    if _NEGATOR.search(window) is None:
+        return False
+    return _IMPERATIVE.search(clause) is None and _STILL_VOICED.search(window) is None
 
 
 def concern_themes(text: object) -> frozenset[str]:
     """The concern themes the learner's own ``text`` voices (worker-side labels only)."""
     folded = fold(text)
-    return frozenset(theme for theme, pattern in _CONCERNS if pattern.search(folded))
+    found: set[str] = set()
+    for theme, turned, fixed in _CONCERNS:
+        if (fixed is not None and fixed.search(folded)) or any(
+            not _negated(folded, match.start()) for match in turned.finditer(folded)
+        ):
+            found.add(theme)
+    return frozenset(found)
 
 
 def is_closer(text: object) -> bool:

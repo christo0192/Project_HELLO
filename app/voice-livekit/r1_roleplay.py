@@ -1916,8 +1916,11 @@ class RolePlayEngine:
         """Her last line asked something of her own (not an owed move) and this turn answers it."""
         if not self._learner_asked_last() or self._last_owed_line or is_hollow_turn(text):
             return False
-        if any(curiosity_covered(topic, text) for topic in self._her_question_topics):
-            return True
+        if self._her_question_topics:
+            # Her question had a topic: only an answer on it counts (review S1R-3: "our alumni
+            # work at big tech" after "how many hours a week?" is no answer, and telling her it
+            # was invites the token "That helps" the owner complained about).
+            return any(curiosity_covered(topic, text) for topic in self._her_question_topics)
         return tells_something(text)
 
     def _respond_notes(self, kinds: frozenset[str]) -> None:

@@ -1849,9 +1849,27 @@ class AdvisorTurnReaderTests(unittest.TestCase):
             "I can understand that, it's a big decision.",
             "I'll get back to you on that tomorrow.",
             "Can I send you the enrolment link?",
+            # A discourse phrase said with an offer verb (review S1R-5): nothing waits for her.
+            "Let me put it this way, the course pays for itself within a year.",
+            "Let me add one more thing: our mentors are all senior engineers.",
+            "Let me add that our mentors are senior engineers.",
+            "I will give you an example. One of our learners moved into analytics.",
+            "I can give you an idea of how a typical week looks.",
+            "I will show you why this matters for your career.",
+            "I can put it simply: you learn by building.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(sched.offers_something(text))
+
+    def test_offers_of_something_real_with_the_same_verbs(self):
+        for text in (
+            "I can show you a sample project from the last batch.",
+            "I can give you a demo of the platform this week.",
+            "I'll send it over right after this call.",
+            "Let me put you in touch with one of our alumni.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.offers_something(text))
 
     def test_back_offs(self):
         for text in (
@@ -1940,6 +1958,18 @@ class AdvisorTurnReaderTests(unittest.TestCase):
             for reader in (sched.offers_something, sched.backs_off, sched.asks_her_directly):
                 reader(text)
             self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_a_long_run_of_commas_before_the_question_mark_is_read_in_linear_time(self):
+        """Review S1-R6: the tag reader was quadratic in a run of commas and spaces (0.2 s at the
+        engine's 4,000-character cap, 26 s at 40,000); bounded now, so 20,000 is instant."""
+        import time
+
+        text = "So is it you" + " ," * 10000 + " ?"
+        start = time.perf_counter()
+        sched.asks_her_directly(text)
+        self.assertLess(time.perf_counter() - start, 0.5)
+        # A tag after a short run is still a tag; a long run before it is not one.
+        self.assertFalse(sched.asks_her_directly("It is worth it , , right?"))
 
 
 class AdvisorTurnReaderCorpusTests(unittest.TestCase):

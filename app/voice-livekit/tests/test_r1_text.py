@@ -712,6 +712,45 @@ class ConcernThemeTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(concern_themes(text), frozenset())
 
+    def test_a_negated_or_inverted_line_voices_no_theme(self):
+        """Review S1-R3: a reassurance is no concern (else every later free reply is told she
+        already said it)."""
+        from r1_text import concern_themes
+
+        for text in (
+            "I'm not offended, it's fine.",
+            "I trust you on that.",
+            "I don't need proof, that makes sense.",
+            "You clearly have a good track record.",
+            "There's no hurry on my end.",
+            "I'm not in a rush, honestly.",
+            "You're not pressuring me at all.",
+            "I don't feel rushed.",
+            "No pressure on my side, I'm just curious.",
+            "That wasn't rude at all.",
+            "I don't need to think it over, it sounds good.",
+            "Okay, I'll get back to you on the timing question in a second.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(concern_themes(text), frozenset())
+
+    def test_a_negation_that_still_voices_the_concern_counts(self):
+        from r1_text import CONCERN_PRESSURE, CONCERN_TRUST, concern_themes
+
+        for text, theme in (
+            ("Please don't rush me.", CONCERN_PRESSURE),
+            ("So please don't pressure me like that.", CONCERN_PRESSURE),
+            ("I don't want to be pushed into anything.", CONCERN_PRESSURE),
+            ("I won't be pressured into this.", CONCERN_PRESSURE),
+            ("No, I just feel rushed.", CONCERN_PRESSURE),
+            ("I don't trust that yet.", CONCERN_TRUST),
+            ("I'm not sure I can trust those numbers.", CONCERN_TRUST),
+            ("I'd want proof before I commit.", CONCERN_TRUST),
+            ("I'd need to know your track record first.", CONCERN_TRUST),
+        ):
+            with self.subTest(text=text):
+                self.assertIn(theme, concern_themes(text))
+
     def test_the_theme_readers_are_quick(self):
         import time
 
