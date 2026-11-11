@@ -54,6 +54,7 @@ from r1_phases import R1Phase
 from r1_replies import (
     GUARD_KINDS,
     SESSION_FACT_KEYS,
+    SESSION_FACT_WORKER_KEYS,
     fidelity_events,
     fidelity_pins,
     guard_kind,
@@ -474,8 +475,11 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         facts = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
         self.assertEqual(len(facts), 1)
         payload = facts[0]["payload"]
-        self.assertEqual(set(payload) - {"pins"}, API_PAYLOAD_KEYS["session_facts"])
+        # The worker-only counts (M032 SWEEP-1) are stored with the row and never parsed.
+        worker_only = set(SESSION_FACT_WORKER_KEYS)
+        self.assertEqual(set(payload) - {"pins"} - worker_only, API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"])
+        self.assertEqual(worker_only & API_PAYLOAD_KEYS["session_facts"], set())
         for key in SESSION_FACT_KEYS:
             value = payload[key]
             self.assertTrue(
@@ -605,6 +609,55 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         event = session_facts_event(None, fidelity_pins(rig.interview.persona_choice),
                                     roleplay_seconds=rig.machine.roleplay_elapsed)
         self.assertEqual(event["payload"]["roleplay_seconds"], round(at_exit, 1))
+
+    def test_the_learner_timing_counts_ride_along_as_counts_only(self):
+        """M032 SWEEP-1 and S1: the learner's timing holds go with the row (counts only, bounded),
+        so the owner's next test shows how often each fired; the API stores them unparsed."""
+        admin = {
+            "intents": {
+                "push_react_holds": {"F3": 1, "F2": 2},
+                "respond_first_holds": {"offer": 1},
+                "moment_waits": 3,
+                "volunteered_objections": 1,
+                "concerns": {"pressure": 2},
+                "split_replans": 0,
+            }
+        }
+        timing = session_facts_event(admin, {}, roleplay_seconds=42.0)["payload"]["learner_timing"]
+        self.assertEqual(
+            timing,
+            {
+                "push_react_holds": {"F2": 2, "F3": 1},
+                "respond_first_holds": {"offer": 1},
+                "moment_waits": 3,
+                "volunteered_objections": 1,
+                "concerns": {"pressure": 2},
+                "split_replans": 0,
+            },
+        )
+        # Anything that is not a small count is dropped, never guessed.
+        bad = {
+            "intents": {
+                "push_react_holds": {"F3": True, "F2": -1, "x" * 99: 1, "F4": 2.5, 7: 1},
+                "moment_waits": "3",
+                "split_replans": float("nan"),
+                "respond_first_holds": ["offer"],
+                "transcript": "never sent",
+            }
+        }
+        timing = session_facts_event(bad, {}, roleplay_seconds=42.0)["payload"]["learner_timing"]
+        self.assertEqual(timing, {"push_react_holds": {}, "respond_first_holds": {},
+                                  "moment_waits": None, "volunteered_objections": None,
+                                  "concerns": {}, "split_replans": None})
+        many = {"intents": {"concerns": {f"t{i}": 1 for i in range(40)}}}
+        timing = session_facts_event(many, {}, roleplay_seconds=1.0)["payload"]["learner_timing"]
+        self.assertLessEqual(len(timing["concerns"]), 16)
+        for admin in (None, {}, {"intents": None}):
+            with self.subTest(admin=admin):
+                timing = session_facts_event(admin, {}, roleplay_seconds=1.0)["payload"][
+                    "learner_timing"]
+                self.assertEqual(timing["push_react_holds"], {})
+                self.assertIsNone(timing["moment_waits"])
 
     def test_unmeasured_or_invalid_values_are_sent_as_null_never_as_a_guess(self):
         for admin in (None, {}, {"communication": {}},

@@ -23,7 +23,9 @@ so the isolation rules are unit-testable without a session:
   ``parseR1AdministrationLog`` (``app/api/src/lib/r1/admin-log.ts``) reads exactly the names
   below; any other name parses as unknown, the scorer is told ``NOT PROBED`` / ``slip not
   reported``, and the gate fails closed.  ``tests/test_r1_admin_contract.py`` mirrors that key
-  set and fails when either side drifts.
+  set and fails when either side drifts.  The one exception is ``SESSION_FACT_WORKER_KEYS``:
+  counts the worker adds to ``session_facts`` for the owner (the learner's timing holds), which
+  the API stores with the row and never parses.
 
 No I/O, no logging, no clock and no candidate text is kept beyond what the caller passes in.
 """
@@ -93,6 +95,15 @@ SESSION_FACT_KEYS = (
     "interruption_count",
     "first_audio_p95_ms",
 )
+# Worker-only ``session_facts`` keys (M032 S1 and SWEEP-1): the API stores them with the row and
+# does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
+# learner's timing holds as counts only (no text), so the owner's next test shows how often each
+# fired.  The engine's ``admin_log()["intents"]`` keys it reads, each a count or counts by label:
+SESSION_FACT_WORKER_KEYS = ("learner_timing",)
+_LEARNER_TIMING_COUNTS = ("moment_waits", "volunteered_objections", "split_replans")
+_LEARNER_TIMING_BY_LABEL = ("push_react_holds", "respond_first_holds", "concerns")
+_LABEL_MAX_CHARS = 32
+_LABELS_MAX = 16
 
 
 def guard_kind(category: object) -> str:
@@ -111,6 +122,38 @@ def _measured(value: object) -> int | float | None:
     if not math.isfinite(value) or value < 0:
         return None
     return value
+
+
+def _count(value: object) -> int | None:
+    """A non-negative whole count, or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _learner_timing(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The learner's timing holds from the engine's admin log, as bounded counts only."""
+    intents = (admin or {}).get("intents")
+    if not isinstance(intents, Mapping):
+        intents = {}
+    timing: dict[str, Any] = {}
+    for key in _LEARNER_TIMING_BY_LABEL:
+        raw = intents.get(key)
+        counts: dict[str, int] = {}
+        if isinstance(raw, Mapping):
+            for label, value in sorted(
+                (item for item in raw.items() if isinstance(item[0], str)), key=lambda x: x[0]
+            ):
+                count = _count(value)
+                if count is None or len(label) > _LABEL_MAX_CHARS:
+                    continue
+                if len(counts) >= _LABELS_MAX:
+                    break
+                counts[label] = count
+        timing[key] = counts
+    for key in _LEARNER_TIMING_COUNTS:
+        timing[key] = _count(intents.get(key))
+    return timing
 
 
 @dataclass(frozen=True)
@@ -362,5 +405,5 @@ def session_facts_event(
         "event_type": "session_facts",
         "turn_index": None,
         "family_id": None,
-        "payload": {"pins": dict(pins), **facts},
+        "payload": {"pins": dict(pins), **facts, "learner_timing": _learner_timing(admin)},
     }
