@@ -131,7 +131,12 @@ import r1_world
 #    has two shapes and two lengths and answers a dig first (L2); the F4 push refers back to a
 #    decision maker already named (L7), a free reply does not name them again, and a monthly figure
 #    above the card's budget is never "workable" (L5: BUDGET_OVER_NOTE, BUDGET_REPLACEMENT).
-CONTENT_REVISION = 20
+# 21: M032 S5, Christy as interviewer (owner go of 2026-11-11 after the RCA of test fda9e9f6): her
+#    persona and register inside the interviewer prefix (r1_prompts.INTERVIEWER_VOICE_TEXT) and a
+#    per-turn delivery rider on the opening, icebreaker, transition and wrap-up notes
+#    (INTERVIEWER_DELIVERY_RIDER), both behind R1_INTERVIEWER_VOICE.  The manifest pins the prefix
+#    WITH the voice text, whatever the flag says, so the digest never depends on the environment.
+CONTENT_REVISION = 21
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -318,7 +323,9 @@ def manifest() -> dict[str, Any]:
             "flag_threshold": r1_guard.HIT_FLAG_THRESHOLD,
         },
         "prompts": {
-            "interviewer_prefix": r1_prompts.interviewer_prefix(),
+            "interviewer_prefix": r1_prompts.interviewer_prefix(voice=True),
+            "interviewer_voice_text": r1_prompts.INTERVIEWER_VOICE_TEXT,
+            "interviewer_delivery_rider": r1_prompts.INTERVIEWER_DELIVERY_RIDER,
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,

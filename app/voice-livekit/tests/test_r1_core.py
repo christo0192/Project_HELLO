@@ -5720,22 +5720,31 @@ class TestIcebreakerNote(unittest.TestCase):
 
     def test_the_icebreaker_and_opening_replies_carry_the_note(self) -> None:
         from r1_personas import resolve_persona
-        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE, interviewer_prefix
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE, interviewer_prefix, interviewer_reminder
         from r1_replies import Reply, llm_messages
 
         persona = resolve_persona("p1_career_switcher", variant="v1")
         for phase in ("opening", "icebreaker"):
-            with self.subTest(phase=phase):
-                messages = llm_messages(
-                    Reply(phase=phase, candidate_text="I sell courses."), persona, []
-                )
-                self.assertEqual(
-                    messages[0], {"role": "system", "content": interviewer_prefix()}
-                )  # the cache prefix is untouched
-                self.assertEqual(
-                    messages[-2], {"role": "system", "content": GETTING_TO_KNOW_YOU_NOTE}
-                )
-                self.assertEqual(messages[-1], {"role": "user", "content": "I sell courses."})
+            for voice in (True, False):
+                with self.subTest(phase=phase, voice=voice):
+                    messages = llm_messages(
+                        Reply(phase=phase, candidate_text="I sell courses."),
+                        persona,
+                        [],
+                        voice=voice,
+                    )
+                    self.assertEqual(
+                        messages[0], {"role": "system", "content": interviewer_prefix(voice=voice)}
+                    )  # the cache prefix is untouched by the per-turn note
+                    # M032 S5: with the voice on, the delivery rider follows the note.
+                    self.assertEqual(
+                        messages[-2],
+                        {"role": "system", "content": interviewer_reminder(phase, rider=voice)},
+                    )
+                    self.assertTrue(messages[-2]["content"].startswith(GETTING_TO_KNOW_YOU_NOTE))
+                    if not voice:
+                        self.assertEqual(messages[-2]["content"], GETTING_TO_KNOW_YOU_NOTE)
+                    self.assertEqual(messages[-1], {"role": "user", "content": "I sell courses."})
         lowered = GETTING_TO_KNOW_YOU_NOTE.lower()
         self.assertIn("never start, announce", lowered)
         self.assertIn("role-play", lowered)

@@ -176,16 +176,32 @@ class Reply:
     # A scripted sentence spoken after the model's reply in the same speech (M1: Christy's
     # L-TRANSITION-ASK after an answer before the role-play); "" for none.
     tail: str = ""
+    # M032 S5, the icebreaker plan (``r1_icebreaker``): the per-turn note that takes the
+    # getting-to-know-you note's place ("" for the phase's own note), the line spoken INSTEAD of
+    # a model call ("Take your time."; "" for a model reply), the line a reply with nothing usable
+    # left falls back to (the current objective's question; "" for the guard's own fallback),
+    # and the plan's decision itself (``IcebreakerJob``; labels only, kept to undo it when the
+    # reply is never heard).
+    note: str = ""
+    scripted: str = ""
+    fallback: str = ""
+    job: Any = None
 
 
 def llm_messages(
-    reply: Reply, persona: RenderedPersona, history: Sequence[Mapping[str, Any]]
+    reply: Reply,
+    persona: RenderedPersona,
+    history: Sequence[Mapping[str, Any]],
+    *,
+    voice: bool | None = None,
 ) -> list[dict[str, str]]:
     """The only messages the model may see for ``reply`` (the llm_node context filter).
 
     ``history`` is every transcript item so far (both voices, every phase); the filter
     picks from it by phase and voice.  The reminder is a ``system`` message because
-    DeepSeek rejects ``developer``.
+    DeepSeek rejects ``developer``.  ``voice`` (M032 S5) is the session's reading of
+    ``R1_INTERVIEWER_VOICE`` (``None`` reads it now): Christy's voice text in the prefix and
+    the delivery rider on the note.
     """
     ordered = sorted(
         (item for item in history if item is not reply.entry),
@@ -199,10 +215,10 @@ def llm_messages(
             reply.plan.reminder,
         )
     return assemble_messages(
-        interviewer_prefix(),
+        interviewer_prefix(voice=voice),
         select_context(ordered, reply.phase),
         reply.candidate_text,
-        interviewer_reminder(reply.phase),
+        interviewer_reminder(reply.phase, note=reply.note or None, rider=voice),
     )
 
 

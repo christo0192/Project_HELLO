@@ -191,7 +191,7 @@ import time
 import unicodedata
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from observability import StructuredLogger
@@ -234,7 +234,12 @@ from r1_replies import (
     llm_messages,
     session_facts_event,
 )
-from r1_prompts import ROLEPLAY_PHASE
+from r1_prompts import (
+    ROLEPLAY_PHASE,
+    control_prose,
+    interviewer_prefix,
+    interviewer_voice_enabled,
+)
 from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
 from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
 from r1_sarvam import current_speech_id
@@ -1852,6 +1857,9 @@ class R1Interview:
         # spoken, the call started for them at the final, and a running number for the fence.
         self._end_intent_runner = end_intent_runner
         self._end_intent_unusable = False
+        # M032 S5: Christy's voice (``R1_INTERVIEWER_VOICE``), read once, so the interviewer
+        # prefix (the DeepSeek cache prefix) stays byte-stable for the whole session.
+        self._interviewer_voice = interviewer_voice_enabled()
         self._turn_finals: list[str] = []
         self._end_intent_call: _EndIntentCall | None = None
         self._end_intent_seq = 0
@@ -4146,17 +4154,39 @@ class R1Interview:
         plan = reply.plan
         if plan is not None and plan.mode is TurnMode.SAY_ONLY:
             return self._single(plan.scripted_text)
+        if plan is None and reply.scripted:
+            # M032 S5: the icebreaker plan's "Take your time." is the whole reply (no model call).
+            return self._single(reply.scripted)
         if plan is not None:
             ctx = plan.guard_ctx
         else:
-            ctx = self.engine.guard_context(reply.phase, mode="reply", turn=reply.candidate_index)
+            ctx = self._interviewer_guard_context(reply)
         guard = StreamGuard(ctx)
-        messages = llm_messages(reply, self.persona, self._history)
+        messages = llm_messages(reply, self.persona, self._history, voice=self._interviewer_voice)
         if plan is not None and plan.mode is TurnMode.INTENT:
             source = self._intent_reply(lambda: provider(messages), guard, reply)
         else:
             source = self._screened(lambda: provider(messages), guard, reply)
         return self.guard_llm_stream(source)
+
+    def _interviewer_guard_context(self, reply: Reply) -> Any:
+        """The guard context of one of Christy's replies (M032 S5 on top of the engine's).
+
+        The echo check reads the prefix this session actually sends (``_interviewer_voice``), the
+        praise check runs while her voice is on, and the icebreaker plan's question is the line a
+        reply with nothing usable left falls back to (``Reply.fallback``).  With
+        ``R1_INTERVIEWER_VOICE=0`` and no plan the context is exactly the engine's.
+        """
+        ctx = self.engine.guard_context(reply.phase, mode="reply", turn=reply.candidate_index)
+        changes: dict[str, Any] = {}
+        if self._interviewer_voice:
+            changes["control_texts"] = (
+                control_prose(interviewer_prefix(voice=self._interviewer_voice)),
+            )
+            changes["praise_check"] = True
+        if reply.fallback:
+            changes["interviewer_fallback"] = reply.fallback
+        return _dataclass_replace(ctx, **changes) if changes else ctx
 
     async def _screened(
         self,
@@ -4212,7 +4242,9 @@ class R1Interview:
             # only) chunk of this reply.  It is not an answer from the provider, so it must not
             # reset the failure count (the 3-failure abort stays reachable).
             self._skip_failure_reset = True
-            yield FALLBACK_REPLY + " "
+            # M032 S5: in the icebreaker the plan's current question, not "Sorry, what were you
+            # saying?" (the candidate was clear; the provider was not).
+            yield (reply.fallback or FALLBACK_REPLY) + " "
         elif spoke and reply.tail:
             yield reply.tail + " "
 

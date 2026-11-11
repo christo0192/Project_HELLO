@@ -428,6 +428,8 @@ ACK_FORMAT = "ack_format"
 REPEAT = "repeat"
 REOPEN = "reopen"
 MISREAD = "misread"
+# M032 S5: Christy grading an answer in the getting-to-know-you part ("... is solid experience").
+PRAISE = "praise"
 CATEGORIES = (
     CONTROL,
     VENDOR,
@@ -447,9 +449,10 @@ CATEGORIES = (
     REPEAT,
     REOPEN,
     MISREAD,
+    PRAISE,
 )
 # Hygiene is counted and logged but is not a leak and is never posted to the API.
-HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT, REOPEN, MISREAD})
+HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT, REOPEN, MISREAD, PRAISE})
 # Categories that count toward the 3-hit gate: everything except hygiene.
 LEAK_CATEGORIES = frozenset(CATEGORIES) - HYGIENE_CATEGORIES
 
@@ -576,6 +579,91 @@ _ROLEPLAY_ANNOUNCE = _ci(
     r"\bi(?:'ll| will|'m going to| am going to)\b[^.?!]{0,30}\bplay(?:ing)?\b[^.?!]{0,25}"
     r"\b(?:learner|student|prospect|lead|customer)\b",
 )
+# M032 S5: Christy grading an answer in the opening or the icebreaker (owner's call fda9e9f6: "...
+# is solid experience", "... is a real asset", "That drive sounds useful").  Narrow on purpose: a
+# warm acknowledgement ("Got it", "Thanks for sharing that", "That makes sense", "Sounds like a busy
+# day", "Good to know") is not a verdict and passes.  Every quantifier is bounded (no ReDoS).
+_PRAISE_STRONG = (
+    r"(?:solid|strong|great|impressive|excellent|valuable|fantastic|amazing|wonderful|brilliant|"
+    r"outstanding|remarkable|incredible|exceptional|commendable|admirable|terrific|superb|stellar)"
+)
+_PRAISE_NOUN = (
+    r"(?:experience|background|track record|skills?|skill set|strengths?|qualit(?:y|ies)|"
+    r"answers?|examples?|achievements?|accomplishments?|results?|record|foundation|attitude|"
+    r"mindset|approach|drive|traits?|profile|work ethic|grit)"
+)
+_PRAISE = _ci(
+    # "solid experience", "a strong background", "great answer", "such an impressive result"
+    r"\b" + _PRAISE_STRONG + r" " + _PRAISE_NOUN + r"\b",
+    # "a real asset", "a big plus", "a definite strength" (a verdict about them, as a statement)
+    r"\b(?:is|are|was|'s|be|sounds like|seems like) (?:a|an) (?:real |great |big |huge |valuable |"
+    r"definite |genuine |clear )?(?:asset|plus|strength)\b",
+    # "That's impressive", "sounds really outstanding", "That drive sounds useful"
+    r"\b(?:is|are|was|were|'s|sounds?|seems?|looks?)(?: like)? (?:really |very |so |quite |truly |"
+    r"genuinely |pretty |incredibly |super |especially |particularly )?(?:impressive|admirable|"
+    r"commendable|remarkable|outstanding|excellent|exceptional|brilliant|fantastic|amazing|"
+    r"incredible|terrific|superb|stellar|inspiring)\b",
+    r"\b(?:sounds?|seems?) (?:really |very |quite |so )?(?:useful|valuable)\b",
+    # "Impressive!", "Wow, amazing."
+    r"^(?:wow|oh)?[ ,!.]{0,3}(?:impressive|excellent|amazing|fantastic|brilliant|wonderful|"
+    r"outstanding|terrific|superb)\b",
+    r"\b(?:well done|good for you|i love that|love that|kudos|hats off|bravo|nicely done|"
+    r"(?:good|great|nice|excellent) (?:job|work|answer|point))\b",
+    r"\byou(?:'re| are) clearly\b|\byou clearly (?:have|know|are|did)\b",
+    r"\bplay(?:s|ing)? to your strengths?\b",
+    r"\bshows? (?:real |great |a lot of |genuine |strong |true )?(?:dedication|commitment|"
+    r"initiative|resilience|grit|drive|passion|maturity|leadership)\b",
+)
+# Where a question's leading clause ends: a comma, semicolon or colon, or a spaced dash.
+_CLAUSE_BREAK = re.compile(r"[,;:]\s+|\s+[-\u2013\u2014]\s+")
+# A clause that asks without a question mark ("Tell me about a great result you're proud of.").
+_ASKING_CLAUSE = _ci(
+    r"^(?:(?:so|and|okay|ok|now|then|also|right)\W{1,2}){0,3}(?:tell me|walk me|talk me|"
+    r"describe|share|give me|can you|could you|would you|i'd love to hear|i'd like to hear|"
+    r"i'd love to know|i'd like to know)\b"
+)
+PRAISE_KEEP_MIN_WORDS = 3
+
+
+def praise_detected(sentence: object) -> bool:
+    """True when ``sentence`` grades the candidate or their answer (``_PRAISE``)."""
+    return _PRAISE.search(fold(sentence)) is not None
+
+
+def _asks(clause: str) -> bool:
+    return "?" in clause or _ASKING_CLAUSE.search(clause.strip()) is not None
+
+
+def without_praise(sentence: str) -> str:
+    """``sentence`` without its praise: "" for a praising statement, the question for a question.
+
+    A statement that praises is dropped whole.  A sentence that asks (a question mark, or "tell
+    me", "could you ..." without one) keeps the clause that asks: the leading clauses that praise
+    ("That's impressive, what made you ...?") are cut, and an asking clause that itself names the
+    quality ("Could you share a great example ...?") is left as it is.  What would keep fewer than
+    ``PRAISE_KEEP_MIN_WORDS`` words is dropped too.
+    """
+    if not praise_detected(sentence):
+        return sentence
+    breaks = list(_CLAUSE_BREAK.finditer(sentence))
+    bounds = [0, *(match.end() for match in breaks)]
+    ends = [*(match.start() for match in breaks), len(sentence)]
+    clauses = [sentence[begin:end] for begin, end in zip(bounds, ends)]
+    if not any(_asks(clause) for clause in clauses):
+        return ""
+    start = 0
+    for index, clause in enumerate(clauses[:-1]):
+        if _asks(clause) or not praise_detected(clause):
+            break
+        start = bounds[index + 1]
+    if start == 0:
+        return sentence
+    rest = sentence[start:].strip()
+    if word_count(rest) < PRAISE_KEEP_MIN_WORDS:
+        return ""
+    return rest[0].upper() + rest[1:]
+
+
 _ROLE_CONTEXT = _ci(
     r"\b(?:(?:this|the) role(?!-)|our shifts?|the shifts?|shift timings?|working days|"
     r"you(?:'ll| will) (?:work|be working)|we work)\b"
@@ -758,6 +846,12 @@ class GuardContext:
     # L5 (mock call aa166f09).  The latest monthly payment the advisor named (None: none): above
     # the card's budget it is never "workable" (``over_budget_accepted``).
     monthly_quote_usd: int | None = None
+    # M032 S5.  Christy's praise of an answer is cut in the opening and the icebreaker (hygiene;
+    # the session sets it from ``R1_INTERVIEWER_VOICE``), and an interviewer reply with nothing
+    # usable left says this line (the icebreaker plan's current question) instead of
+    # ``FALLBACK_REPLY`` ("" keeps the guard's own fallback).
+    praise_check: bool = False
+    interviewer_fallback: str = ""
 
     @property
     def is_learner(self) -> bool:
@@ -1313,7 +1407,7 @@ def _fallback(ctx: GuardContext, *, only_repeats: bool = False) -> str:
             if repeat_kind(candidate, ctx.said) is None:
                 return candidate
         return pick_variant(FALLBACK_REPLIES, ctx.seed, ctx.variant)
-    return FALLBACK_REPLY
+    return ctx.interviewer_fallback or FALLBACK_REPLY
 
 
 class StreamGuard:
@@ -1343,6 +1437,10 @@ class StreamGuard:
         self._phrases_used: dict[str, int] = {}  # tracked phrases used so far in this reply
         self._last_dropped = False  # the sentence before this one was dropped
         self._anchor_seen = False  # an earlier sentence of this reply named the $7,000
+        # M032 S5: the praising sentences this reply lost whole (``_cut_praise``), and whether the
+        # praise check is off for the rest of the reply (``flush``'s last resort).
+        self._praise_dropped: list[str] = []
+        self._praise_off = False
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -1566,8 +1664,42 @@ class StreamGuard:
             text = _swap_that(text)
         return text
 
+    def _cut_praise(self, sentence: str) -> str:
+        """M032 S5: ``sentence`` without Christy's praise of the answer ("" when none is left).
+
+        Only in the opening and the icebreaker and only when the session turned the check on
+        (``praise_check``).  Each cut is a ``praise`` hit: hygiene, counted but never a leak.
+        """
+        ctx = self.ctx
+        if (
+            not ctx.praise_check
+            or self._praise_off
+            or ctx.is_learner
+            or ctx.phase not in SMALL_TALK_PHASES
+        ):
+            return sentence
+        kept = without_praise(sentence)
+        if kept == sentence:
+            return sentence
+        folded = fold(sentence)
+        digest = hashlib.sha256(normalize(folded).encode("utf-8")).hexdigest()[:12]
+        excerpt = ""
+        if ctx.keep_excerpts:
+            excerpt = _scrub_name(mask_contact(folded, 60), ctx.candidate_first_name)
+        self._hits.append(Hit(PRAISE, "icebreaker_praise", excerpt, digest))
+        self._replaced = True
+        if not kept:
+            self._praise_dropped.append(sentence)
+        else:
+            self._style_edits += 1
+        return kept
+
     def _vet(self, sentence: str) -> list[str]:
         if self._done:
+            return []
+        sentence = self._cut_praise(sentence)
+        if not sentence:
+            self._last_dropped = True
             return []
         if self.ctx.is_learner:
             sentence = _unquote_figures(sentence)
@@ -1663,6 +1795,18 @@ class StreamGuard:
         for sentence in split_sentences(self._buffer):
             out.extend(self._vet(sentence))
         self._buffer = ""
+        if (
+            not self._emitted
+            and self._praise_dropped
+            and self._other_drops == 0
+            and not self.ctx.interviewer_fallback
+        ):
+            # M032 S5: praise was all the reply said and there is no question to fall back on.
+            # The model's own line beats "Sorry, what were you saying?" (the phone's lesson: never
+            # swap a natural line for a canned one), so it is vetted again without the praise cut.
+            self._praise_off = True
+            for sentence in self._praise_dropped:
+                out.extend(self._vet(sentence))
         if not self._emitted and not self.ctx.quiet_empty:
             self._fallback_used = True
             only_repeats = self._repeat_drops > 0 and self._other_drops == 0

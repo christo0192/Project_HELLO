@@ -1127,7 +1127,9 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         messages = wrap.last_messages()
         self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
         self.assertEqual(messages[1], {"role": "system", "content": WRAPUP_NOTE})
-        self.assertEqual(messages[-2], {"role": "system", "content": WRAPUP_REMINDER})
+        # M032 S5: Christy's delivery rider follows the note while R1_INTERVIEWER_VOICE is on.
+        self.assertTrue(messages[-2]["content"].startswith(WRAPUP_REMINDER))
+        self.assertEqual(messages[-2]["role"], "system")
         self.assertIn("never say goodbye", messages[-2]["content"])
 
     async def test_the_phase_driver_keeps_waiting_through_an_injection(self) -> None:
@@ -3420,6 +3422,105 @@ class TestLineCacheBuiltByTheRunner(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(run_r1_session(ctx, session_factory=factory), 10.0)
         self.assertIn(sentinel, seen)
+
+
+# ----------------------------------------------------------------- M032 S5: Christy as interviewer
+
+
+def _env(**values: str):
+    """``os.environ`` with these R1 flags set for the block (and none of the others changed)."""
+    return mock.patch.dict(os.environ, values)
+
+
+class TokenProvider(FakeProvider):
+    """``FakeProvider`` streaming the way DeepSeek does: each word carries its LEADING space.
+
+    (``FakeProvider``'s trailing spaces are trimmed at a sentence boundary by the guard's buffer,
+    which glues a second sentence's first two words together.)
+    """
+
+    async def _stream(self, text: str):
+        if self.hang:
+            await asyncio.Event().wait()
+        if self.error is not None:
+            raise self.error
+        for index, word in enumerate(text.split(" ")):
+            chunk = word if index == 0 else " " + word
+            yield SimpleNamespace(delta=SimpleNamespace(content=chunk), usage=None)
+
+
+class TestChristyVoiceWiring(unittest.IsolatedAsyncioTestCase):
+    """M032 S5 items 1-2: the session sends Christy's voice and cuts her praise (flag ON).
+
+    Owner's call fda9e9f6 (#3-#21, paraphrased here): every icebreaker reply opened with a verdict
+    on the answer before its question.  ``R1_INTERVIEWER_VOICE=0`` gives back today's prefix, notes
+    and guard exactly.
+    """
+
+    async def icebreaker_reply(self, provider: FakeProvider, **flags: str) -> tuple[Rig, str]:
+        with _env(R1_ICEBREAKER_PLAN="0", **flags):
+            rig = Rig(provider=provider)
+            await rig.interview.say("L-OPEN")
+            spoken = await rig.converse("I have spent eight years selling insurance to families.")
+        return rig, spoken
+
+    async def test_the_icebreaker_call_carries_the_voice_and_the_rider_and_praise_is_cut(self):
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE, INTERVIEWER_DELIVERY_RIDER
+
+        provider = TokenProvider("Eight years is solid experience. What does a normal day look like?")
+        rig, spoken = await self.icebreaker_reply(provider)
+        messages = rig.last_messages()
+        self.assertEqual(messages[0]["content"], interviewer_prefix(voice=True))
+        self.assertEqual(
+            messages[-2]["content"], GETTING_TO_KNOW_YOU_NOTE + "\n" + INTERVIEWER_DELIVERY_RIDER
+        )
+        self.assertEqual(spoken, "What does a normal day look like?")
+        self.assertEqual(
+            [trip["category"] for trip in rig.interview._guard_trips], [r1_guard_praise()]
+        )
+        self.assertEqual(rig.engine.ledger.summary()["leak_hits"], 0)  # hygiene, never a leak
+
+    async def test_the_flag_off_is_todays_interviewer_exactly(self):
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE
+
+        provider = TokenProvider("Eight years is solid experience. What does a normal day look like?")
+        rig, spoken = await self.icebreaker_reply(provider, R1_INTERVIEWER_VOICE="0")
+        messages = rig.last_messages()
+        self.assertEqual(messages[0]["content"], interviewer_prefix(voice=False))
+        self.assertEqual(messages[-2]["content"], GETTING_TO_KNOW_YOU_NOTE)
+        self.assertEqual(
+            spoken, "Eight years is solid experience. What does a normal day look like?"
+        )
+
+    async def test_the_prefix_is_read_once_per_session(self):
+        with _env(R1_INTERVIEWER_VOICE="1", R1_ICEBREAKER_PLAN="0"):
+            rig = Rig()
+            await rig.interview.say("L-OPEN")
+        with _env(R1_INTERVIEWER_VOICE="0", R1_ICEBREAKER_PLAN="0"):
+            await rig.converse("I sold insurance for eight years.")
+            await rig.converse("Mostly to young families in the city.")
+        first, second = rig.provider.calls
+        self.assertEqual(first[0], second[0])  # byte-stable: the DeepSeek cache prefix
+        self.assertEqual(first[0]["content"], interviewer_prefix(voice=True))
+
+    async def test_the_wrapup_and_transition_carry_the_rider_but_no_praise_cut(self):
+        from r1_prompts import INTERVIEWER_DELIVERY_RIDER
+
+        with _env(R1_ICEBREAKER_PLAN="0"):
+            rig = Rig(provider=TokenProvider("That's impressive. The hiring team will follow up."))
+            rig.machine.transition(R1Phase.TRANSITION)
+            await rig.converse("What are the working days?")
+        messages = rig.last_messages()
+        self.assertTrue(messages[-2]["content"].endswith(INTERVIEWER_DELIVERY_RIDER))
+        self.assertNotIn(
+            r1_guard_praise(), {trip["category"] for trip in rig.interview._guard_trips}
+        )
+
+
+def r1_guard_praise() -> str:
+    import r1_guard
+
+    return r1_guard.PRAISE
 
 
 if __name__ == "__main__":

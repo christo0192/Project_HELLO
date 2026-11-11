@@ -127,7 +127,10 @@ import r1_world
 # revision, the learner: the card's call direction and work answers (M4, L4), three more curiosity
 # topics and a check-in-done note that never closes (L1), the intent shapes (L2), the F4 push's
 # refer-back and the decider and budget notes (L5, L7).
-PINNED_CONTENT_SHA256 = "9f5d7bf6a039aca045c1409247b2b693f7acaf57d4fcd621c937b7116e4edabc"
+# Revision 21 (M032 S5, owner go of 2026-11-11): Christy's voice text inside the interviewer prefix
+# and her delivery rider (R1_INTERVIEWER_VOICE).  The manifest pins the voiced prefix whatever the
+# flag says.
+PINNED_CONTENT_SHA256 = "bc0cb0793234630b69d71d62d8b19be009bfc9d78645648202bad97f2e13ddd1"
 
 CONTENT_MODULES = (
     "r1_text",

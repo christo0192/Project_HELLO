@@ -19,6 +19,7 @@ its own phase's turns, never the persona.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Iterable, Mapping, Sequence
 
@@ -311,6 +312,45 @@ TRANSITION_REMINDER = (
 )
 _TRANSITION_PHASES = frozenset({"transition"})
 
+# M032 S5 item 1 (owner's call fda9e9f6, #3-#21: every icebreaker reply opened with a verdict on
+# the answer, "solid experience", "a real asset", and the part read as an interrogation).  Christy's
+# persona and register, copied in spirit from the phone Christy (never imported).  Appended INSIDE
+# the interviewer prefix, so it is part of the byte-stable cache prefix; ``R1_INTERVIEWER_VOICE=0``
+# leaves the prefix exactly as it was.  The examples to avoid sit in double quotes, so the guard's
+# echo check never reads Christy saying them as a leaked instruction; the unquoted wording is
+# chosen so that no natural interviewer sentence repeats six words of it.  No humour: this is an
+# assessed interview (the verifier's note on the phone primer).
+INTERVIEWER_VOICE_TEXT = (
+    "Your manner: you are relaxed, curious and friendly, and you put people at ease; the "
+    "exchange should feel natural and two-way, never like a checklist. Talk the way people talk "
+    "on a call: contractions, short sentences, one idea per turn. Before you ask something, react "
+    "in a few words to one specific thing they just said, then ask it, and start each reply with "
+    "a different word from your last ones. Take in what they say without judging it: never praise "
+    'or rate an answer or the candidate (no "solid experience", "a real asset", "impressive" or '
+    '"great answer"), never start with "I understand, but", and no jokes.'
+)
+# M032 S5 item 2: the same manners at the point of generation, as the LAST line of the opening,
+# icebreaker, transition and wrap-up notes (the phone team measured that per-turn style lines work
+# on DeepSeek Flash where prefix rules do not).  About 50 tokens, no example to copy.
+INTERVIEWER_DELIVERY_RIDER = (
+    "- Delivery: speak as you would on a call, with contractions, short sentences and a comma "
+    "where you'd breathe. A few words of reaction, then your point. Open differently from your "
+    "last replies, and never praise or judge their answer."
+)
+# The phases whose notes carry the rider.
+_RIDER_PHASES = _GETTING_TO_KNOW_YOU_PHASES | _TRANSITION_PHASES | _WRAPUP_PHASES
+_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+
+
+def interviewer_voice_enabled() -> bool:
+    """``R1_INTERVIEWER_VOICE`` (default on): Christy's voice text, delivery rider and praise check.
+
+    Rollback: ``fly secrets set R1_INTERVIEWER_VOICE=0 -a project-hello-voice`` gives back the
+    prefix, the notes and the guard exactly as they were before M032 S5.
+    """
+    return (os.getenv("R1_INTERVIEWER_VOICE") or "1").strip().lower() not in _OFF_VALUES
+
+
 ROLEPLAY_PHASE = "roleplay"
 _INTERVIEW_CONTEXT_PHASES = {
     "opening": ("opening", "icebreaker"),
@@ -322,8 +362,21 @@ _INTERVIEW_CONTEXT_PHASES = {
 }
 
 
-def interviewer_prefix() -> str:
-    """The interviewer's system prefix (byte-stable; the deck's shift timings are its FAQ)."""
+def interviewer_prefix(*, voice: bool | None = None) -> str:
+    """The interviewer's system prefix (byte-stable; the deck's shift timings are its FAQ).
+
+    ``voice`` (M032 S5) appends ``INTERVIEWER_VOICE_TEXT``; ``None`` reads
+    ``R1_INTERVIEWER_VOICE``.  The session reads the flag once and passes it, so the prefix is
+    byte-stable for the whole session (the DeepSeek cache prefix).
+    """
+    if voice is None:
+        voice = interviewer_voice_enabled()
+    plain = _plain_interviewer_prefix()
+    return plain + "\n" + INTERVIEWER_VOICE_TEXT if voice else plain
+
+
+def _plain_interviewer_prefix() -> str:
+    """The interviewer prefix as it was before M032 S5 (``R1_INTERVIEWER_VOICE=0``)."""
     faq = " ".join(fact.text for fact in facts_for(AUDIENCE_INTERVIEWER_FAQ))
     return (
         f"You are {INTERVIEWER_NAME}, an AI interviewer from Interview Kickstart, running a "
@@ -342,8 +395,28 @@ def interviewer_prefix() -> str:
     )
 
 
-def interviewer_reminder(phase: str) -> str | None:
+def interviewer_reminder(
+    phase: str, *, note: str | None = None, rider: bool | None = None
+) -> str | None:
     """The ephemeral note for an interviewer-phase reply (``None`` where the prefix is enough).
+
+    M032 S5: ``note`` (the icebreaker plan's per-turn note) takes the phase note's place, and
+    ``rider`` appends ``INTERVIEWER_DELIVERY_RIDER`` as the last line in the opening, icebreaker,
+    transition and wrap-up (``None`` reads ``R1_INTERVIEWER_VOICE``).  Without either, the notes
+    are exactly what they were.
+    """
+    base = note or _phase_reminder(phase)
+    if base is None:
+        return None
+    if rider is None:
+        rider = interviewer_voice_enabled()
+    if rider and phase in _RIDER_PHASES:
+        return base + "\n" + INTERVIEWER_DELIVERY_RIDER
+    return base
+
+
+def _phase_reminder(phase: str) -> str | None:
+    """The phase's own note, before M032 S5's rider.
 
     The prefix is byte-stable for the whole session (the DeepSeek cache prefix) and has no
     notion of a phase, so what only the getting-to-know-you part needs travels here, just
