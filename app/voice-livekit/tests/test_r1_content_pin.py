@@ -132,7 +132,9 @@ import r1_world
 # flag says.  Same revision: the icebreaker plan's objectives, fallback questions, per-turn notes and
 # "Take your time." (r1_icebreaker, R1_ICEBREAKER_PLAN).  Same revision: the transition bridge's
 # note and limits and L-TRANSITION-BRIDGED, the brief without its thanks (R1_TRANSITION_BRIDGE).
-PINNED_CONTENT_SHA256 = "5871281c7d260c279d724e58378a7854108c7bf35f0aafdf16c59a4b8cf894ff"
+# Same revision (review fixes): the icebreaker note tail for a skip request and the notes once
+# every objective is reached (a decline, a repeat request, a skip request).
+PINNED_CONTENT_SHA256 = "e4e769e2d728905fc39b53cd527ff4bdb64d31212ea76e0d975fef72f5fade04"
 
 CONTENT_MODULES = (
     "r1_text",

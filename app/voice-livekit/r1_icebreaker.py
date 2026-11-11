@@ -15,6 +15,10 @@ One decision per committed icebreaker answer (``IcebreakerPlan.next_job``), read
   same objective again, after a short answer or one warm clause, at most ``MAX_HOLDS`` times;
 * "let me think": "Take your time." and nothing else (no advance, nothing counted).
 
+Once every objective is reached Christy follows up on what they said, and the same manners hold
+(``FREE_JOB_NOTES``): a decline is accepted, and a repeat request or a skip request gets her last
+question again, bounded like a hold.
+
 The transition bridge (M032 S5 item 4) lives here too, as pure pieces: whether the answer that
 ended the icebreaker deserves a reaction (``bridge_wanted``), the note the reaction is composed
 under (``BRIDGE_NOTE``) and the vetting of what came back (``clean_bridge``).  The session composes
@@ -87,7 +91,8 @@ class Objective:
     ``goal`` is what the model is told to reach, in its own words (quoted in the note, so the
     guard's echo check never treats it as instruction prose).  ``restate`` is the question Christy
     says when her whole reply was blocked or failed, instead of "Sorry, what were you saying?".
-    ``covers`` says, narrowly, that an answer already reached this objective (it is then skipped).
+    ``covers`` says, narrowly, that an answer already reached this objective (it is then skipped):
+    "this role because ...", never "the job because ..." (a past job; review of S5).
     """
 
     id: str
@@ -120,7 +125,7 @@ OBJECTIVES: tuple[Objective, ...] = (
         "what draws them to this role",
         "What draws you to this role?",
         re.compile(
-            r"\b(?:(?:this|the) (?:role|job|position|opportunity) (?:because|since|appeals|"
+            r"\b(?:this (?:role|job|position|opportunity) (?:because|since|appeals|"
             r"excites|interests)|why i (?:applied|want this|chose this)|what (?:draws|attracts|"
             r"excites) me|(?:that's|that is) why i(?:'m| am) (?:opting|applying|interested)|"
             r"i(?:'m| am)? ?(?:applied|applying) (?:for this|here) because)\b"
@@ -151,6 +156,15 @@ PLAN_NOTE_TAIL = (
     "Ask nothing about selling scenarios, prices or how they would handle a learner. Never "
     "start, announce, describe or hint at the role-play, never say the interview is moving on "
     "or ending, and never say goodbye: the interview moves on by itself."
+)
+# The tail of a note that asks for the warm "you will get there soon" clause (a request to skip
+# ahead): the same rails, with that one clause excepted, so the note never contradicts itself
+# (review of S5).
+PLAN_NOTE_TAIL_SKIP = (
+    "Ask nothing about selling scenarios, prices or how they would handle a learner. Apart from "
+    "that one warm clause, never start, announce, describe or hint at the role-play, never say "
+    "the interview is moving on or ending, and never say goodbye: the interview moves on by "
+    "itself."
 )
 ASKED_NOTE = "They asked you something: answer it first, in one short sentence, then go on."
 SKIP_NOTE = (
@@ -188,6 +202,29 @@ JOB_NOTES: dict[str, str] = {
         "customer-facing work."
     ),
 }
+# Once every objective is reached (or the last one was declined) there is no objective to quote,
+# but a decline is still accepted, and a request to hear the question again or to skip ahead still
+# gets the last question again (review of S5: the phone's "a decline never loops" and "a repeat
+# restates the current item" held only while an objective was left).
+FREE_JOB_NOTES: dict[str, str] = {
+    JOB_DECLINED: (
+        "They would rather not answer that, and that is fine: accept it in a few words, "
+        "without pressing or asking again, then ask one short follow-up question about "
+        "something else they already told you about their sales or customer-facing work."
+    ),
+    JOB_REASK: (
+        "They have not answered your last question yet. If they asked you something, answer it "
+        "first in one short sentence; then ask your last question again, simply and in other "
+        "words."
+    ),
+    JOB_SKIP: (
+        "They asked to skip ahead. Say warmly, in one short clause, that you will get there "
+        "soon, without naming any part of the interview, then ask your last question again, "
+        'simply. Never start with "I understand, but".'
+    ),
+}
+# The holds counter of the free follow-ups (no objective of its own).
+_FREE_HOLDS = "free"
 
 # --- reading one turn -------------------------------------------------------------------------
 
@@ -264,6 +301,20 @@ _SKIP_RE = re.compile(
     r")\b"
 )
 # "I'd rather not say", "nothing comes to mind", "I can't think of one": declining this question.
+# "I don't have one" / "I can't recall any" decline only when the thing they lack is the question's
+# own (one, an example, a specific moment) and nothing but a filler follows it: "I don't have any
+# sales experience" and "I don't have one fixed routine, I call leads" answer (review of S5).
+_DECLINE_OBJECT = (
+    r"(?:one|any|anything(?: specific| in particular| like that)?|an example|"
+    r"any (?:such |specific |particular |good )?(?:examples?|moments?|stories|story|instances?)|"
+    r"a (?:specific|particular|good)(?: (?:one|example|moment|story|instance|time))?|"
+    r"such (?:a|an) (?:example|moment|story|instance))"
+)
+_DECLINE_END = (
+    r"(?=(?: (?:right now|at the moment|off the top of my head|to be honest|honestly|really|"
+    r"sorry|i'm afraid|that i can think of|that comes to mind|can we move on|let's move on|"
+    r"next question)){0,3}$)"
+)
 _DECLINE_RE = re.compile(
     r"\b(?:"
     r"(?:i'd|i would|id) (?:rather|prefer to) not (?:say|share|talk|answer|discuss|go into|get "
@@ -274,11 +325,10 @@ _DECLINE_RE = re.compile(
     r"|(?:can|could) (?:we|i) (?:skip|pass on) (?:this|that|it)(?: one| question)?"
     r"|(?:i'll|i will|let me) (?:skip|pass on) (?:this|that|it)"
     r"|(?:nothing|none) (?:really |specific |in particular )?comes to mind"
-    r"|(?:can't|cannot|cant|can not) (?:think of|recall|remember) (?:one|any|anything|a "
-    r"specific|a particular|an example)"
-    r"|(?:don't|do not|dont) (?:have|recall|remember) (?:one|any|a specific|a particular|"
-    r"an example|such)"
-    r")\b"
+    r"|(?:(?:can't|cannot|cant|can not) (?:really )?(?:think of|recall|remember)|"
+    r"(?:don't|do not|dont) (?:really )?(?:have|recall|remember)) " + _DECLINE_OBJECT
+    + r"\b" + _DECLINE_END
+    + r")\b"
 )
 # A question aimed at Christy (the phone lesson about directedness: a broad interrogative check
 # fired on answer openings).  With a question mark: an interrogative opening that is not an answer
@@ -313,6 +363,15 @@ _YES_NO_RE = re.compile(
 )
 
 
+# A question the candidate asks themselves and answers in the same turn ("What do I do? I call
+# leads ...", "Why sales? Because ...", review of S5): a "wh" question about themselves (I, me, my)
+# or a bare "why" with a word or two, never one that names "you".
+_WH_OPEN_RE = re.compile(_ASK_LEAD + _ASK_WH + r"\b")
+_WHY_SHORT_RE = re.compile(_ASK_LEAD + r"why(?: [a-z']+){1,2}$")
+_FIRST_PERSON = frozenset({"i", "me", "my", "myself", "i'm", "i've", "i'd", "i'll"})
+_SECOND_PERSON = frozenset({"you", "your", "yours", "you're", "you've", "you'd", "you'll"})
+
+
 def _sentence_asks(sentence: str) -> bool:
     plain = _plain(sentence)
     if not plain:
@@ -322,17 +381,38 @@ def _sentence_asks(sentence: str) -> bool:
     return _DIRECTED_RE.match(plain) is not None
 
 
+def _self_question(sentence: str) -> bool:
+    """A "wh" question about the candidate themselves, or a bare "why sales?"."""
+    plain = _plain(sentence)
+    words = set(plain.split())
+    if words & _SECOND_PERSON or _WH_OPEN_RE.match(plain) is None:
+        return False
+    return bool(words & _FIRST_PERSON) or _WHY_SHORT_RE.match(plain) is not None
+
+
+def _asking_sentences(text: object) -> list[tuple[str, bool]]:
+    """Each sentence of ``text`` with whether it asks the interviewer something.
+
+    A question the candidate asks themselves (``_self_question``) and answers with a statement
+    in the same turn is the opening of their answer, not a question to Christy.
+    """
+    sentences = split_sentences(text)
+    flags = [_sentence_asks(sentence) for sentence in sentences]
+    for index, sentence in enumerate(sentences[:-1]):
+        if flags[index] and not flags[index + 1] and _self_question(sentence):
+            flags[index] = False
+    return list(zip(sentences, flags))
+
+
 def asks_christy(text: object) -> bool:
     """True when some sentence of ``text`` is a question aimed at the interviewer."""
-    return any(_sentence_asks(sentence) for sentence in split_sentences(text))
+    return any(asks for _, asks in _asking_sentences(text))
 
 
 def _statement_substance(text: object) -> int:
     """Substantive words in the sentences of ``text`` that do not ask the interviewer anything."""
     return sum(
-        substantive_words(sentence)
-        for sentence in split_sentences(text)
-        if not _sentence_asks(sentence)
+        substantive_words(sentence) for sentence, asks in _asking_sentences(text) if not asks
     )
 
 
@@ -344,7 +424,9 @@ def is_thinking(text: object) -> bool:
     plain = _plain(raw)
     if _THINKING_RE.search(plain) is None:
         return False
-    rest = _THINKING_TAIL_RE.sub(" ", _THINKING_RE.sub(" ", plain))
+    # The tail first (review of S5): the head's "(a) second" would otherwise take "a second" out
+    # of "for a second" and leave a bare "for".
+    rest = _THINKING_RE.sub(" ", _THINKING_TAIL_RE.sub(" ", plain))
     return all(word in _FILLER_WORDS for word in rest.split())
 
 
@@ -419,14 +501,16 @@ class IcebreakerJob:
         """The reminder for this reply ("" for the scripted one)."""
         if self.kind == JOB_TAKE_TIME:
             return ""
-        template = JOB_NOTES[self.kind]
-        body = template.format(goal=self.objective.goal) if self.objective is not None else template
+        if self.objective is not None:
+            body = JOB_NOTES[self.kind].format(goal=self.objective.goal)
+        else:
+            body = FREE_JOB_NOTES.get(self.kind, JOB_NOTES[JOB_FREE])
         lines = [PLAN_NOTE_HEAD, body]
         if self.skip and self.kind != JOB_SKIP:
             lines.append(SKIP_NOTE)
         if self.asked and self.kind not in (JOB_REASK, JOB_SKIP):
             lines.append(ASKED_NOTE)
-        lines.append(PLAN_NOTE_TAIL)
+        lines.append(PLAN_NOTE_TAIL_SKIP if self.skip or self.kind == JOB_SKIP else PLAN_NOTE_TAIL)
         return "\n".join(lines)
 
     @property
@@ -481,6 +565,16 @@ class IcebreakerPlan:
         self._advance(text)
         return JOB_ASK
 
+    def _free_job(self, reading: Reading) -> str:
+        """The reply once every objective is reached: a decline is still accepted, and a turn
+        that did not answer still gets the last question again (bounded like a hold)."""
+        if reading.kind == DECLINED:
+            return JOB_DECLINED
+        if reading.kind in (NONANSWER, SKIP) and self.holds.get(_FREE_HOLDS, 0) < MAX_HOLDS:
+            self.holds[_FREE_HOLDS] = self.holds.get(_FREE_HOLDS, 0) + 1
+            return JOB_SKIP if reading.kind == SKIP else JOB_REASK
+        return JOB_FREE
+
     def next_job(self, text: str, *, content_words: int) -> IcebreakerJob:
         """Decide what Christy's reply to this committed icebreaker turn is for."""
         undo = self._snapshot()
@@ -489,7 +583,7 @@ class IcebreakerPlan:
         if reading.kind == THINKING:
             kind = JOB_TAKE_TIME
         elif current is None:
-            kind = JOB_FREE
+            kind = self._free_job(reading)
         elif reading.kind == ANSWERED:
             self._advance(text)
             kind = JOB_ASK
@@ -506,8 +600,8 @@ class IcebreakerPlan:
         else:  # NONANSWER or SKIP: the same objective again, a bounded number of times
             kind = self._hold(current, reading, text)
         objective = self.current
-        if kind in (JOB_ASK, JOB_DECLINED) and objective is None:
-            kind = JOB_FREE
+        if kind == JOB_ASK and objective is None:
+            kind = JOB_FREE  # a decline of the last objective stays a decline (FREE_JOB_NOTES)
         self.jobs[kind] = self.jobs.get(kind, 0) + 1
         self.serial += 1
         return IcebreakerJob(

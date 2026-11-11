@@ -6,7 +6,7 @@ synthetic or paraphrased, never the session's own words:
 * #4: a fragment of a dozen words got a new topic (a selling scenario, #5) instead of one probe;
 * #6: a request to skip ahead got "I understand, but we're still in the getting-to-know-you part"
   (the note's own label, read out);
-* #14: "I don't want to talk about it" was accepted well: a decline moves on and never loops;
+* #14: a short decline was accepted well: a decline moves on and never loops;
 * #8/#9 and #17/#18: one answer committed as two turns.
 
 The module is pure: no clock, no I/O, no SDK, and the plan keeps no candidate text.
@@ -31,7 +31,7 @@ from r1_personas import ALL_PERSONA_NAMES
 
 SUBSTANTIVE = "I spent six years selling insurance policies to young families across the city."
 THIN = "I mostly pitch and then I just follow up."
-FRAGMENT = "Yeah, I will just go ahead and pitch them and I will just. Start."
+FRAGMENT = "Okay so I would call them and then I would. Explain it, yeah."
 
 
 def words(text: str) -> int:
@@ -66,6 +66,7 @@ class TestObjectives(unittest.TestCase):
     def test_no_text_names_a_persona_the_role_play_or_a_grade(self):
         texts = [o.goal for o in ib.OBJECTIVES] + [o.restate for o in ib.OBJECTIVES]
         texts += [ib.FREE_RESTATE, ib.TAKE_YOUR_TIME, *ib.JOB_NOTES.values(), ib.ASKED_NOTE]
+        texts += [*ib.FREE_JOB_NOTES.values()]
         for text in texts:
             lowered = text.lower()
             for name in ALL_PERSONA_NAMES:
@@ -94,12 +95,12 @@ class TestDisposition(unittest.TestCase):
         self.assertGreater(len(FRAGMENT.split()), 10)
         self.assertEqual(self.reading(FRAGMENT).kind, ib.THIN)
         self.assertEqual(self.reading(THIN).kind, ib.THIN)
-        brief = "I enjoy talking to people. I am very patient."
+        brief = "I like meeting new folks. I stay calm."
         self.assertEqual(self.reading(brief).kind, ib.THIN)
 
     def test_a_decline_is_declined_only_when_it_is_short(self):
         for text in (
-            "I don't want to talk about it.",
+            "I do not wish to share that.",
             "I'd rather not say.",
             "Nothing really comes to mind.",
             "I can't think of one right now.",
@@ -141,6 +142,15 @@ class TestDisposition(unittest.TestCase):
             "One moment please.",
             "Okay, I'm just thinking.",
             "Let me think about how to put it.",
+            # Review of S5: the commonest spoken forms ("for a second") were missed.
+            "Let me think for a second.",
+            "Let me think for a moment.",
+            "Let me just think for a second.",
+            "Let me think about that for a second.",
+            "Let me gather my thoughts for a moment.",
+            "Hmm, let me think about it for a minute.",
+            "Give me a minute to think about it.",
+            "Hmm, let me think for a bit.",
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.reading(text).kind, ib.THINKING)
@@ -182,6 +192,55 @@ class TestDisposition(unittest.TestCase):
                 self.assertFalse(ib.asks_christy(text))
         self.assertTrue(ib.asks_christy("What does the role involve day to day?"))
         self.assertTrue(ib.asks_christy("Could you repeat that for me"))
+
+    def test_a_rhetorical_question_the_candidate_answers_is_no_question_to_christy(self):
+        # Review of S5: a real answer that opens with its own question (speech-to-text adds the
+        # "?") was read as a question to Christy, held the objective and got it asked again.
+        for text in (
+            "So what drew me here? Honestly the chance to work with learners who want to grow.",
+            "What do I do? I call leads every morning and qualify them for the counsellors.",
+            "Why sales? Because I love talking to people and I have done it for years.",
+            "How do I handle a tough customer? I listen first and then answer each worry.",
+            "Why did I pick this field? My cousin did it and loved the work.",
+        ):
+            with self.subTest(text=text):
+                reading = self.reading(text)
+                self.assertFalse(reading.asked)
+                self.assertNotEqual(reading.kind, ib.NONANSWER)
+                self.assertFalse(ib.asks_christy(text))
+        # Questions to Christy stay questions, wherever they sit and whoever they name.
+        for text in (
+            "I sold courses to parents for years. What happens in the next part?",
+            "Do I need to prepare anything? I have my notes here.",
+            "What do I need to do next?",
+            "How long is this part? I have another call later.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(ib.asks_christy(text))
+
+    def test_saying_they_have_none_of_something_answers_and_is_no_decline(self):
+        # Review of S5: "I don't have any sales experience" is a fact about them, not a refusal;
+        # Christy must not reassure them about a refusal they never made.
+        for text in (
+            "I don't have any sales experience honestly.",
+            "I don't have any experience in sales, I was a teacher.",
+            "I don't have any experience in edtech yet, mostly retail.",
+            "No, I don't have any direct sales background, I did customer support.",
+            "I don't have one fixed routine, I call leads and follow up.",
+            "I can't think of any other job I'd enjoy as much as this one.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(self.reading(text).kind, ib.DECLINED)
+        for text in (
+            "I don't have one.",
+            "I don't really have one, sorry.",
+            "I don't have an example right now.",
+            "I don't remember a specific moment.",
+            "Honestly I can't think of anything specific.",
+            "I can't recall one off the top of my head.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.reading(text).kind, ib.DECLINED)
 
     def test_a_bare_yes_or_no_answers_a_closed_question_thinly(self):
         # The model may ask a yes/no question; "Yes." answers it (one probe follows), it is no
@@ -230,6 +289,10 @@ class TestDisposition(unittest.TestCase):
         ib.is_thinking(long)
         ib.asks_christy(long)
         ib.substantive_words(long)
+        # The decline's end check and the self-question reader (review of S5).
+        ib.disposition("i don't have any " * 3000 + "really sorry " * 3000, content_words=5)
+        ib.disposition("i don't really have one " + "honestly " * 6000, content_words=5)
+        ib.asks_christy("What do I do? I call. " * 2000)
         self.assertLess(time.perf_counter() - start, 2.0)
 
 
@@ -259,7 +322,7 @@ class TestPlan(unittest.TestCase):
         # #14 -> #15 went well; it stays that way.
         plan = ib.IcebreakerPlan()
         job(plan, SUBSTANTIVE)  # I1 answered, I2 asked
-        declined = job(plan, "I don't want to talk about it.")
+        declined = job(plan, "I'd prefer not to discuss that.")
         self.assertEqual(declined.kind, ib.JOB_DECLINED)
         self.assertEqual(declined.objective.id, "I3")
         self.assertIn("accept it", declined.note)
@@ -332,6 +395,86 @@ class TestPlan(unittest.TestCase):
         self.assertEqual(free.fallback, ib.FREE_RESTATE)
         self.assertEqual(job(plan, SUBSTANTIVE).kind, ib.JOB_FREE)
 
+    def test_talk_about_a_past_job_does_not_answer_why_this_role(self):
+        # Review of S5: "I left the job because ..." credited "what draws you to this role" and
+        # the plan never asked it.
+        for text in (
+            "A typical day was calls and store visits. I left the job because the branch closed.",
+            "I call around fifty parents a day, and I stayed in the job because the team was great.",
+            "I left the role since the targets kept rising every quarter at that firm.",
+            "I liked the job because no two calls were ever the same for me there.",
+        ):
+            with self.subTest(text=text):
+                plan = ib.IcebreakerPlan()
+                job(plan, SUBSTANTIVE)  # I1 answered, I2 asked
+                nxt = job(plan, text)
+                self.assertNotIn("I3", plan.summary()["credited"])
+                self.assertNotEqual(nxt.objective and nxt.objective.id, "I4")
+        plan = ib.IcebreakerPlan()
+        job(plan, SUBSTANTIVE)
+        job(plan, "A typical day is forty calls, and I want this role because I love those talks.")
+        self.assertEqual(plan.summary()["credited"], ["I3"])
+
+    def through(self) -> ib.IcebreakerPlan:
+        plan = ib.IcebreakerPlan()
+        for _ in range(4):
+            job(plan, SUBSTANTIVE)
+        self.assertIsNone(plan.current)
+        return plan
+
+    def test_a_decline_after_the_plan_is_through_is_still_accepted(self):
+        # Review of S5: once the cursor ran out (and for a decline of the last objective) the
+        # decline lost its "accept it, without pressing" and got a plain follow-up.
+        plan = ib.IcebreakerPlan()
+        for _ in range(3):
+            job(plan, SUBSTANTIVE)
+        self.assertEqual(plan.current.id, "I4")
+        for current in (plan, self.through()):
+            declined = job(current, "I'd rather not say.")
+            self.assertEqual(declined.kind, ib.JOB_DECLINED)
+            self.assertIsNone(declined.objective)
+            self.assertIn("accept it", declined.note)
+            self.assertIn("without pressing", declined.note)
+            self.assertIn("something else they already told you", declined.note)
+            self.assertEqual(declined.fallback, ib.FREE_RESTATE)
+
+    def test_a_repeat_request_after_the_plan_is_through_asks_the_last_question_again(self):
+        # Review of S5: "Can you repeat the question?" got a NEW follow-up question.
+        plan = self.through()
+        kinds = []
+        for _ in range(ib.MAX_HOLDS):
+            again = job(plan, "Sorry, can you repeat the question?", content_words=0)
+            kinds.append(again.kind)
+            self.assertIn("ask your last question again", again.note)
+            self.assertNotIn(
+                "follow-up question about something they already told you", again.note
+            )
+        self.assertEqual(kinds, [ib.JOB_REASK] * ib.MAX_HOLDS)
+        self.assertEqual(job(plan, "Sorry, what?", content_words=0).kind, ib.JOB_FREE)  # bounded
+        skip = job(self.through(), "Can we go straight to the role play?")
+        self.assertEqual(skip.kind, ib.JOB_SKIP)
+        self.assertIn("get there soon", skip.note)
+        self.assertIn("ask your last question again", skip.note)
+
+    def test_the_skip_note_and_the_tail_never_contradict_each_other(self):
+        # Review of S5 (naturalness R8): "say you will get there soon" and "never hint at the
+        # role-play" in one note.  The notes that say the clause carry the exception in the tail.
+        plan = ib.IcebreakerPlan()
+        job(plan, SUBSTANTIVE)
+        notes = {
+            "skip": job(plan, "Can we go straight to the role play?").note,
+            "answer_and_skip": job(
+                plan, SUBSTANTIVE + " Can we go straight to the role play after this?"
+            ).note,
+        }
+        for name, note in notes.items():
+            with self.subTest(name=name):
+                self.assertTrue(note.endswith(ib.PLAN_NOTE_TAIL_SKIP))
+                self.assertIn("apart from that one warm clause", note.lower())
+        plain = job(plan, SUBSTANTIVE).note
+        self.assertTrue(plain.endswith(ib.PLAN_NOTE_TAIL))
+        self.assertNotIn("apart from", plain.lower())
+
     def test_a_reply_that_was_never_heard_is_undone(self):
         # #8/#9: the first half committed alone, its reply was cancelled before any audio, and the
         # second half must be read against the question that was really asked.
@@ -360,6 +503,9 @@ class TestPlan(unittest.TestCase):
         ]
         for _ in range(4):
             notes.append(job(plan, SUBSTANTIVE).note)
+        notes.append(job(plan, "I'd rather not say.").note)  # the plan is through by now
+        notes.append(job(plan, "Sorry, can you repeat that?", content_words=0).note)
+        notes.append(job(plan, "Can we go straight to the role play?").note)
         for note in notes:
             with self.subTest(note=note[:60]):
                 lowered = note.lower()

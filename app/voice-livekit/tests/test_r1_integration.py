@@ -3546,7 +3546,7 @@ def r1_guard_praise() -> str:
 
 
 IB_ANSWER = "I spent six years selling insurance policies to young families across the city."
-IB_FRAGMENT = "Yeah, I will just go ahead and pitch them and I will just. Start."
+IB_FRAGMENT = "Okay so I would call them and then I would. Explain it, yeah."
 
 
 class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
@@ -3661,12 +3661,24 @@ class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rig.interview._icebreaker_plan.current.id, "I2")
 
     async def test_at_the_soft_exit_a_thinking_turn_waits_like_an_unfinished_one(self):
+        # Review of S5: "for a second" was missed, so that turn ended the icebreaker and the
+        # uninterruptible brief started over a thinking candidate.
+        for text in ("Let me think about that.", "Let me think for a second."):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                rig.clock.advance(215)
+                rig.machine.candidate_turns = 4
+                self.assertIsNone(await rig.converse(text))
+                self.assertFalse(rig.interview._icebreaker_boundary_turn)
+                self.assertIsNotNone(rig.interview._icebreaker_continuation_at)
+
+    async def test_let_me_think_for_a_second_gets_take_your_time(self):
         rig = await self.rig()
-        rig.clock.advance(215)
-        rig.machine.candidate_turns = 4
-        self.assertIsNone(await rig.converse("Let me think about that."))
-        self.assertFalse(rig.interview._icebreaker_boundary_turn)
-        self.assertIsNotNone(rig.interview._icebreaker_continuation_at)
+        await rig.converse(IB_ANSWER)
+        calls, answers = len(rig.provider.calls), rig.machine.candidate_turns
+        self.assertEqual(await rig.converse("Let me think for a moment."), "Take your time.")
+        self.assertEqual(len(rig.provider.calls), calls)
+        self.assertEqual(rig.machine.candidate_turns, answers)
 
     async def test_the_flag_off_is_todays_icebreaker_exactly(self):
         from r1_prompts import GETTING_TO_KNOW_YOU_NOTE

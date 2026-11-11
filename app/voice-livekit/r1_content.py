@@ -143,6 +143,8 @@ import r1_world
 #    (R1_TRANSITION_BRIDGE, off by default): the note Christy's one-sentence reaction to the last
 #    icebreaker answer is composed under, its limits, and L-TRANSITION-BRIDGED, the brief without
 #    "Thank you, {first_name}." that follows the reaction.
+#    Same revision (review fixes): the note tail for a request to skip ahead
+#    (PLAN_NOTE_TAIL_SKIP) and the notes once every objective is reached (FREE_JOB_NOTES).
 CONTENT_REVISION = 21
 
 
@@ -440,9 +442,11 @@ def manifest() -> dict[str, Any]:
             "take_your_time": r1_icebreaker.TAKE_YOUR_TIME,
             "plan_note_head": r1_icebreaker.PLAN_NOTE_HEAD,
             "plan_note_tail": r1_icebreaker.PLAN_NOTE_TAIL,
+            "plan_note_tail_skip": r1_icebreaker.PLAN_NOTE_TAIL_SKIP,
             "asked_note": r1_icebreaker.ASKED_NOTE,
             "skip_note": r1_icebreaker.SKIP_NOTE,
             "job_notes": dict(r1_icebreaker.JOB_NOTES),
+            "free_job_notes": dict(r1_icebreaker.FREE_JOB_NOTES),
             "constants": {
                 "thin_words": r1_icebreaker.THIN_WORDS,
                 "decline_max_words": r1_icebreaker.DECLINE_MAX_WORDS,
