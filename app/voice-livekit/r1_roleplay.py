@@ -197,7 +197,7 @@ from r1_prompts import (
     TRY_NOT_GRANTED_NOTE,
     control_prose,
     format_usd,
-    interviewer_prefix,
+    interviewer_control_prose,
     learner_prefix,
     turn_reminder,
 )
@@ -547,7 +547,9 @@ class RolePlayEngine:
         self._coach_played = False
         self._break_kind: str | None = None
         self._learner_control = control_prose(learner_prefix(persona))
-        self._interviewer_control = control_prose(interviewer_prefix())
+        # M032 S5: the plain prefix's prose, whatever R1_INTERVIEWER_VOICE says (the voice text
+        # holds nothing private and Christy's natural sentences reuse its wording).
+        self._interviewer_control = interviewer_control_prose()
         self.exit_requested = False
         # Repetition control: every learner sentence actually played, so the guard can drop
         # a sentence the learner already said; and how often a rotating line was used.

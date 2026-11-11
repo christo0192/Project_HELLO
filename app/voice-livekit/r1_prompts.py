@@ -316,10 +316,10 @@ _TRANSITION_PHASES = frozenset({"transition"})
 # the answer, "solid experience", "a real asset", and the part read as an interrogation).  Christy's
 # persona and register, copied in spirit from the phone Christy (never imported).  Appended INSIDE
 # the interviewer prefix, so it is part of the byte-stable cache prefix; ``R1_INTERVIEWER_VOICE=0``
-# leaves the prefix exactly as it was.  The examples to avoid sit in double quotes, so the guard's
-# echo check never reads Christy saying them as a leaked instruction; the unquoted wording is
-# chosen so that no natural interviewer sentence repeats six words of it.  No humour: this is an
-# assessed interview (the verifier's note on the phone primer).
+# leaves the prefix exactly as it was.  It is left out of the guard's echo check
+# (``interviewer_control_prose``): it holds nothing private, and Christy's natural answers reuse its
+# everyday wording ("Just talk the way people talk on a call.").  No humour: this is an assessed
+# interview (the verifier's note on the phone primer).
 INTERVIEWER_VOICE_TEXT = (
     "Your manner: you are relaxed, curious and friendly, and you put people at ease; the "
     "exchange should feel natural and two-way, never like a checklist. Talk the way people talk "
@@ -373,6 +373,17 @@ def interviewer_prefix(*, voice: bool | None = None) -> str:
         voice = interviewer_voice_enabled()
     plain = _plain_interviewer_prefix()
     return plain + "\n" + INTERVIEWER_VOICE_TEXT if voice else plain
+
+
+def interviewer_control_prose() -> str:
+    """The interviewer prefix's private instruction prose, for the guard's echo check.
+
+    The prefix as it was before M032 S5, whatever ``R1_INTERVIEWER_VOICE`` says: the voice text
+    is register guidance with nothing private in it, and the sentences Christy naturally says in
+    the transition or the wrap-up ("Just talk the way people talk on a call.", "Use short
+    sentences, one idea per turn.") repeat its wording, so they must never read as a leak.
+    """
+    return control_prose(_plain_interviewer_prefix())
 
 
 def _plain_interviewer_prefix() -> str:

@@ -1163,6 +1163,19 @@ WARM_INTERVIEWER_LINES = (
     "Let's keep it conversational, there are no trick questions here.",
     "I'm curious, what does a normal morning look like for you?",
 )
+# Natural answers in the transition and the wrap-up that reuse the voice text's everyday wording
+# (review of S5, correctness R5; synthetic): asked "how should I run the call?", Christy may well
+# say these.
+NATURAL_REGISTER_LINES = (
+    "Keep it natural and two-way, never like a checklist.",
+    "Just talk the way people talk on a call.",
+    "I'll react in a few words to what you say.",
+    "Use contractions, short sentences, one idea per turn.",
+    "It sounds like you put people at ease, the way a good advisor should.",
+    "Just take in what they say without judging it, then respond.",
+    "React to one specific thing they just said before you ask your next question.",
+    "Be relaxed, curious and friendly, and put people at ease.",
+)
 
 
 def _sha(text: str) -> str:
@@ -1228,15 +1241,31 @@ class InterviewerVoiceTests(unittest.TestCase):
 
     def test_warm_lines_never_read_as_an_echo_of_the_voice_text(self):
         from r1_guard import echo_detected
+        from r1_prompts import interviewer_control_prose
 
-        control = (control_prose(interviewer_prefix(voice=True)),)
-        for line in WARM_INTERVIEWER_LINES:
+        control = (interviewer_control_prose(),)
+        for line in WARM_INTERVIEWER_LINES + NATURAL_REGISTER_LINES:
             with self.subTest(line=line):
                 self.assertFalse(echo_detected(line, control))
-        # Not vacuous: the instruction wording itself is caught.
-        self.assertTrue(
-            echo_detected("Talk the way people talk on a call, with contractions.", control)
-        )
+        # Not vacuous: the prefix's private instruction prose is still caught.
+        words = re.findall(r"[A-Za-z']+", interviewer_control_prose())
+        self.assertTrue(echo_detected(" ".join(words[10:20]) + ".", control))
+
+    def test_the_echo_check_leaves_the_voice_text_out_whatever_the_flag(self):
+        # Review of S5 (correctness R5): with the voice text in the echo check, natural answers
+        # in the transition and the wrap-up ("Just talk the way people talk on a call.") were
+        # blocked as control leaks and counted toward the 3-hit gate.  The voice text holds
+        # nothing private; the plain prefix's instruction prose is what the check guards.
+        import os
+        from unittest import mock
+
+        from r1_prompts import INTERVIEWER_VOICE_TEXT, interviewer_control_prose
+
+        expected = control_prose(interviewer_prefix(voice=False))
+        for value in ("1", "0"):
+            with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": value}):
+                self.assertEqual(interviewer_control_prose(), expected)
+        self.assertNotIn(INTERVIEWER_VOICE_TEXT[:40], interviewer_control_prose())
 
     def test_the_rider_rides_the_opening_icebreaker_transition_and_wrapup_notes(self):
         from r1_prompts import (

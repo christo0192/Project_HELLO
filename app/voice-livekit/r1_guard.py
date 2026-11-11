@@ -602,11 +602,18 @@ _PRAISE = _ci(
     r"\b(?:is|are|was|were|'s|sounds?|seems?|looks?)(?: like)? (?:really |very |so |quite |truly |"
     r"genuinely |pretty |incredibly |super |especially |particularly )?(?:impressive|admirable|"
     r"commendable|remarkable|outstanding|excellent|exceptional|brilliant|fantastic|amazing|"
-    r"incredible|terrific|superb|stellar|inspiring)\b",
+    r"incredible|terrific|superb|stellar|inspiring|wonderful|lovely)\b",
     r"\b(?:sounds?|seems?) (?:really |very |quite |so )?(?:useful|valuable)\b",
-    # "Impressive!", "Wow, amazing."
+    # A verdict as a statement about any noun (review of S5): "That's an impressive streak",
+    # "That's a solid number".  Only the grading adjectives: "a big jump", "a long run" pass.
+    r"\b(?:is|are|was|'s|sounds like|seems like) (?:a|an|such a|such an) (?:really |very |pretty |"
+    r"truly )?(?:impressive|solid|strong|excellent|outstanding|remarkable|exceptional|stellar|"
+    r"terrific) [a-z]",
+    r"\b(?:big|huge|real|major) (?:achievements?|accomplishments?)\b",
+    # "Impressive!", "Wow, amazing.", "Perfect.", "Nice one."
     r"^(?:wow|oh)?[ ,!.]{0,3}(?:impressive|excellent|amazing|fantastic|brilliant|wonderful|"
-    r"outstanding|terrific|superb)\b",
+    r"outstanding|terrific|superb|perfect|lovely)\b",
+    r"^(?:nice one|good stuff|great stuff)\b",
     r"\b(?:well done|good for you|i love that|love that|kudos|hats off|bravo|nicely done|"
     r"(?:good|great|nice|excellent) (?:job|work|answer|point))\b",
     r"\byou(?:'re| are) clearly\b|\byou clearly (?:have|know|are|did)\b",
@@ -616,12 +623,16 @@ _PRAISE = _ci(
 )
 # Where a question's leading clause ends: a comma, semicolon or colon, or a spaced dash.
 _CLAUSE_BREAK = re.compile(r"[,;:]\s+|\s+[-\u2013\u2014]\s+")
-# A clause that asks without a question mark ("Tell me about a great result you're proud of.").
+# A clause that asks without a question mark ("Tell me about a great result you're proud of.",
+# "I'm curious what drew you to this role.").
 _ASKING_CLAUSE = _ci(
-    r"^(?:(?:so|and|okay|ok|now|then|also|right)\W{1,2}){0,3}(?:tell me|walk me|talk me|"
+    r"^(?:(?:so|and|but|okay|ok|now|then|also|right)\W{1,2}){0,3}(?:tell me|walk me|talk me|"
     r"describe|share|give me|can you|could you|would you|i'd love to hear|i'd like to hear|"
-    r"i'd love to know|i'd like to know)\b"
+    r"i'd love to know|i'd like to know|i'm curious|i am curious|i'd be curious|i would be "
+    r"curious|i wonder|i'm wondering|help me understand)\b"
 )
+# A connector that leaned on a clause the cut removed ("..., and I'm curious what ...").
+_KEPT_LEAD_CONNECTOR = _ci(r"^(?:and|but)\s+")
 PRAISE_KEEP_MIN_WORDS = 3
 
 
@@ -634,13 +645,22 @@ def _asks(clause: str) -> bool:
     return "?" in clause or _ASKING_CLAUSE.search(clause.strip()) is not None
 
 
+def sentence_asks(sentence: str) -> bool:
+    """True when some clause of ``sentence`` asks (a question mark, or "tell me", "I'm curious
+    ..." without one)."""
+    return "?" in sentence or any(
+        _asks(clause) for clause in _CLAUSE_BREAK.split(sentence)
+    )
+
+
 def without_praise(sentence: str) -> str:
     """``sentence`` without its praise: "" for a praising statement, the question for a question.
 
     A statement that praises is dropped whole.  A sentence that asks (a question mark, or "tell
-    me", "could you ..." without one) keeps the clause that asks: the leading clauses that praise
-    ("That's impressive, what made you ...?") are cut, and an asking clause that itself names the
-    quality ("Could you share a great example ...?") is left as it is.  What would keep fewer than
+    me", "I'm curious ..." without one) keeps what asks: every clause before the first asking one
+    that praises is cut, with an acknowledgement kept ("Got it, that's solid experience, so what
+    ...?" -> "Got it, so what ...?"), and an asking clause that itself names a quality ("Could you
+    share a great example ...?") is left as it is.  What would keep fewer than
     ``PRAISE_KEEP_MIN_WORDS`` words is dropped too.
     """
     if not praise_detected(sentence):
@@ -649,16 +669,22 @@ def without_praise(sentence: str) -> str:
     bounds = [0, *(match.end() for match in breaks)]
     ends = [*(match.start() for match in breaks), len(sentence)]
     clauses = [sentence[begin:end] for begin, end in zip(bounds, ends)]
-    if not any(_asks(clause) for clause in clauses):
+    asking = next((index for index, clause in enumerate(clauses) if _asks(clause)), None)
+    if asking is None:
         return ""
-    start = 0
-    for index, clause in enumerate(clauses[:-1]):
-        if _asks(clause) or not praise_detected(clause):
-            break
-        start = bounds[index + 1]
-    if start == 0:
+    kept = [
+        index
+        for index, clause in enumerate(clauses)
+        if index >= asking or not praise_detected(clause)
+    ]
+    if len(kept) == len(clauses):
         return sentence
-    rest = sentence[start:].strip()
+    parts: list[str] = []
+    for index in kept:
+        if parts:
+            parts.append(sentence[ends[index - 1] : bounds[index]])  # the original separator
+        parts.append(clauses[index])
+    rest = _KEPT_LEAD_CONNECTOR.sub("", "".join(parts).strip(), count=1)
     if word_count(rest) < PRAISE_KEEP_MIN_WORDS:
         return ""
     return rest[0].upper() + rest[1:]
@@ -1668,7 +1694,9 @@ class StreamGuard:
         """M032 S5: ``sentence`` without Christy's praise of the answer ("" when none is left).
 
         Only in the opening and the icebreaker and only when the session turned the check on
-        (``praise_check``).  Each cut is a ``praise`` hit: hygiene, counted but never a leak.
+        (``praise_check``).  Each cut is a ``praise`` hit: hygiene, counted but never a leak.  A
+        sentence that also leaks is left whole for the leak rules (review of S5): it is blocked
+        either way, and its leak hits must reach the posted rows and the 3-hit gate.
         """
         ctx = self.ctx
         if (
@@ -1680,6 +1708,8 @@ class StreamGuard:
             return sentence
         kept = without_praise(sentence)
         if kept == sentence:
+            return sentence
+        if any(hit.category in LEAK_CATEGORIES for hit in check_sentence(sentence, ctx)):
             return sentence
         folded = fold(sentence)
         digest = hashlib.sha256(normalize(folded).encode("utf-8")).hexdigest()[:12]
@@ -1807,6 +1837,23 @@ class StreamGuard:
             self._praise_off = True
             for sentence in self._praise_dropped:
                 out.extend(self._vet(sentence))
+        restate = self.ctx.interviewer_fallback
+        if (
+            self._emitted
+            and self._praise_dropped
+            and restate
+            and not self._done
+            and restate not in self._emitted
+            and not any(sentence_asks(sentence) for sentence in self._emitted)
+            and (self.ctx.word_cap is None or self._used + word_count(restate) <= self.ctx.word_cap)
+        ):
+            # M032 S5 (review): the praise cut took the reply's only question ("Got it. That's
+            # solid experience."): the plan's current question follows the acknowledgement, so
+            # the candidate is never left waiting for a question that was never asked.
+            self._emitted.append(restate)
+            self._used += word_count(restate)
+            self._style_edits += 1
+            out.append(restate)
         if not self._emitted and not self.ctx.quiet_empty:
             self._fallback_used = True
             only_repeats = self._repeat_drops > 0 and self._other_drops == 0

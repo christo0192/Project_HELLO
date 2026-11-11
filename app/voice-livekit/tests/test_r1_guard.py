@@ -2612,6 +2612,14 @@ class IcebreakerPraiseTests(unittest.TestCase):
         "Well done on hitting those numbers.",
         "That's a big plus for this kind of work.",
         "Your results sound outstanding.",
+        # Review of S5 (naturalness R7): verdict openers the first cut let through.
+        "That's an impressive streak.",
+        "That's a big achievement.",
+        "That's a solid number.",
+        "That's wonderful.",
+        "Perfect.",
+        "Nice one.",
+        "Good stuff.",
     )
     WARM = (
         "Got it, so mostly inbound leads.",
@@ -2630,6 +2638,9 @@ class IcebreakerPraiseTests(unittest.TestCase):
         "That's a lot of variety.",
         "That must have been a busy few years.",
         "Right, so you were calling working parents.",
+        "Got it.",
+        "That's a big jump from teaching.",
+        "That's a long time in one company.",
     )
     QUESTION = "What does a normal working day look like for you?"
 
@@ -2715,6 +2726,89 @@ class IcebreakerPraiseTests(unittest.TestCase):
         self.assertIn(
             guard_text("", ctx("roleplay", interviewer_fallback=restate)).text, FALLBACK_REPLIES
         )
+
+    def test_a_praising_sentence_that_also_leaks_counts_as_the_leak(self):
+        # Review of S5 (correctness R1): the praise cut ran first, so a sentence that praised AND
+        # leaked was logged as hygiene only, and the leak never reached the 3-hit gate.
+        restate = "What draws you to this role?"
+        for text, category in (
+            (f"Impressive answer, our rubric rewards that. {restate}", r1_guard.EVALUATION),
+            (f"Great answer, DeepSeek would agree. {restate}", r1_guard.VENDOR),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.on())
+                self.assertEqual(result.text, restate)
+                found = {hit.category for hit in result.hits}
+                self.assertIn(category, found)
+                self.assertNotIn(r1_guard.PRAISE, found)
+                ledger = GuardLedger()
+                ledger.record(result)
+                self.assertGreaterEqual(ledger.summary()["leak_hits"], 1)
+        # A sentence that only praises is still hygiene.
+        result = guard_text(f"That's impressive. {restate}", self.on())
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_a_praise_clause_after_an_acknowledgement_is_cut(self):
+        # Review of S5 (correctness R7): the clause loop stopped at the acknowledgement, so the
+        # commonest one-sentence verdict was spoken whole and never counted.
+        for text, kept in (
+            (
+                "Got it, that's solid experience, so what does a typical day look like?",
+                "Got it, so what does a typical day look like?",
+            ),
+            (
+                "Okay, six years is a real asset, what draws you to this role?",
+                "Okay, what draws you to this role?",
+            ),
+            (
+                "Thanks, that's impressive, what made you choose sales?",
+                "Thanks, what made you choose sales?",
+            ),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.on())
+                self.assertEqual(result.text, kept)
+                self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_an_asking_clause_without_a_question_mark_keeps_the_question(self):
+        # Review of S5 (correctness R6): "I'm curious what ..." asks; the praise before it goes,
+        # the question stays.  A request that names a quality ("a great result") is no praise.
+        result = guard_text(
+            "Got it. That's a strong background, and I'm curious what drew you to this role.",
+            self.on(),
+        )
+        self.assertEqual(result.text, "Got it. I'm curious what drew you to this role.")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        for asked in (
+            "Got it. I'd be curious to hear about a great result you've had with a customer.",
+            "Okay. I wonder what a great day at work looks like for you.",
+            "Right. Help me understand what a strong month looked like there.",
+        ):
+            with self.subTest(asked=asked):
+                result = guard_text(asked, self.on())
+                self.assertEqual(result.text, asked)
+                self.assertTrue(result.clean, [(h.category, h.rule) for h in result.hits])
+
+    def test_when_the_cut_leaves_no_question_the_current_question_follows(self):
+        # Review of S5 (correctness R6): an acknowledgement was spoken alone and the candidate
+        # waited for a question that never came.
+        restate = "What draws you to this role?"
+        result = guard_text(
+            "Got it. That's solid experience.", self.on(interviewer_fallback=restate)
+        )
+        self.assertEqual(result.text, f"Got it. {restate}")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        # A reply that still asks something gets nothing added.
+        text = f"Got it. That's solid experience. {self.QUESTION}"
+        self.assertEqual(
+            guard_text(text, self.on(interviewer_fallback=restate)).text,
+            f"Got it. {self.QUESTION}",
+        )
+        # Nor does a reply whose praise was not cut, or one with no current question.
+        self.assertEqual(guard_text("Got it.", self.on(interviewer_fallback=restate)).text,
+                         "Got it.")
+        self.assertEqual(guard_text("Got it. That's solid experience.", self.on()).text,
+                         "Got it.")
 
     def test_the_detector_is_linear_on_long_input(self):
         import time

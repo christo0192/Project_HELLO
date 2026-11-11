@@ -253,6 +253,7 @@ from r1_prompts import (
     ROLEPLAY_PHASE,
     assemble_messages,
     control_prose,
+    interviewer_control_prose,
     interviewer_prefix,
     interviewer_voice_enabled,
     select_context,
@@ -4295,17 +4296,15 @@ class R1Interview:
     def _interviewer_guard_context(self, reply: Reply) -> Any:
         """The guard context of one of Christy's replies (M032 S5 on top of the engine's).
 
-        The echo check reads the prefix this session actually sends (``_interviewer_voice``), the
-        praise check runs while her voice is on, and the icebreaker plan's question is the line a
-        reply with nothing usable left falls back to (``Reply.fallback``).  With
-        ``R1_INTERVIEWER_VOICE=0`` and no plan the context is exactly the engine's.
+        The praise check runs while her voice is on, and the icebreaker plan's question is the
+        line a reply with nothing usable left falls back to (``Reply.fallback``).  The echo check
+        is the engine's (the plain prefix's prose: the voice text holds nothing private and her
+        natural sentences reuse its wording).  With ``R1_INTERVIEWER_VOICE=0`` and no plan the
+        context is exactly the engine's.
         """
         ctx = self.engine.guard_context(reply.phase, mode="reply", turn=reply.candidate_index)
         changes: dict[str, Any] = {}
         if self._interviewer_voice:
-            changes["control_texts"] = (
-                control_prose(interviewer_prefix(voice=self._interviewer_voice)),
-            )
             changes["praise_check"] = True
         if reply.fallback:
             changes["interviewer_fallback"] = reply.fallback
@@ -6232,12 +6231,9 @@ class R1Interview:
 
     def _bridge_guard_context(self) -> Any:
         """The icebreaker's guard rules for the reaction, with the echo check over the prompts
-        this call used (the prefix and the bridge note)."""
+        this call used (the prefix's private prose and the bridge note)."""
         ctx = self.engine.guard_context("icebreaker", mode="reply")
-        control = (
-            control_prose(interviewer_prefix(voice=self._interviewer_voice)),
-            control_prose(BRIDGE_NOTE),
-        )
+        control = (interviewer_control_prose(), control_prose(BRIDGE_NOTE))
         return _dataclass_replace(ctx, control_texts=control, praise_check=True)
 
     async def _transition_bridge(self) -> str | None:

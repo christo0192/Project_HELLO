@@ -3617,6 +3617,15 @@ class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spoken, ib.OBJECTIVES[1].restate)
         self.assertNotEqual(spoken, FALLBACK_REPLY)
 
+    async def test_a_line_in_the_voice_texts_own_words_is_spoken_not_blocked(self):
+        # Review of S5 (correctness R5): the voice text sat in the echo check, so this reply was
+        # dropped as a control leak and counted toward the 3-hit gate.
+        reply = "Just talk the way people talk on a call. What does a normal day look like?"
+        rig = await self.rig(TokenProvider(reply))
+        spoken = await rig.converse(IB_ANSWER)
+        self.assertEqual(spoken, reply)
+        self.assertEqual(rig.interview.engine.ledger.summary()["leak_hits"], 0)
+
     async def test_a_failed_model_call_restates_the_current_question(self):
         import r1_icebreaker as ib
 
