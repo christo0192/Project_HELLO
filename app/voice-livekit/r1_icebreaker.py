@@ -540,3 +540,15 @@ class IcebreakerPlan:
             "holds": sum(self.holds.values()),
             "jobs": dict(self.jobs),
         }
+
+    def log_labels(self) -> tuple[str, str]:
+        """The end-of-icebreaker log line's category and schema: fixed words and counts only."""
+        summary = self.summary()
+        reached = len(summary["reached"])
+        follow_ups = summary["follow_ups"]
+        holds = summary["holds"]
+        credited = len(summary["credited"])
+        return (
+            f"reached_{reached}",
+            f"follow_ups_{follow_ups}_holds_{holds}_credited_{credited}",
+        )

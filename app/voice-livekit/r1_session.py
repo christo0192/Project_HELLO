@@ -3697,16 +3697,13 @@ class R1Interview:
         """M032 S5: one line when the icebreaker ends: how far the plan got (counts only)."""
         if not icebreaker_plan_enabled():
             return
-        summary = self._icebreaker_plan.summary()
+        category, schema = self._icebreaker_plan.log_labels()
         _log.info(
             "unknown_event",
             error_type="r1_icebreaker_plan",
-            error_category=f"reached_{len(summary['reached'])}",
-            schema=(
-                f"follow_ups_{summary['follow_ups']}_holds_{summary['holds']}"
-                f"_credited_{len(summary['credited'])}"
-            ),
-            option_count=summary["cursor"],
+            error_category=category,
+            schema=schema,
+            option_count=self._icebreaker_plan.cursor,
         )
 
     def _queue_transition_line(self, action: str) -> None:

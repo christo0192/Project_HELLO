@@ -383,6 +383,11 @@ class TestPlan(unittest.TestCase):
         blob = repr(summary).lower()
         for word in ("insurance", "pitch", "families"):
             self.assertNotIn(word, blob)
+        # The log line's labels are fixed words and counts (built here, not in the log call, so
+        # the session's static log fence sees plain names).
+        self.assertEqual(
+            plan.log_labels(), ("reached_1", "follow_ups_1_holds_0_credited_0")
+        )
 
 
 class TestFlags(unittest.TestCase):
