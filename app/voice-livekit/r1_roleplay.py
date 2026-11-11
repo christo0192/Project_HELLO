@@ -465,11 +465,20 @@ FLAG_CONCERN_LEDGER = "R1_CONCERN_LEDGER"
 FLAG_SPLIT_REPLAN = "R1_SPLIT_REPLAN"
 FLAG_PUSH_AFTER_REACTION = "R1_PUSH_AFTER_REACTION"
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+# One literal read per flag, so the repository's env-contract scanner (and
+# config/environment.schema.json) sees every one of them (review S1R-7).
+_FLAG_READS = {
+    FLAG_NATURAL_TIMING: lambda: os.getenv("R1_NATURAL_TIMING"),
+    FLAG_RESPOND_FIRST: lambda: os.getenv("R1_RESPOND_FIRST"),
+    FLAG_CONCERN_LEDGER: lambda: os.getenv("R1_CONCERN_LEDGER"),
+    FLAG_SPLIT_REPLAN: lambda: os.getenv("R1_SPLIT_REPLAN"),
+    FLAG_PUSH_AFTER_REACTION: lambda: os.getenv("R1_PUSH_AFTER_REACTION"),
+}
 
 
 def flag_on(name: str) -> bool:
     """An M032 rollback flag, read now: unset or anything but 0/off/false/no is on."""
-    return (os.getenv(name) or "1").strip().lower() not in _FLAG_OFF_VALUES
+    return (_FLAG_READS[name]() or "1").strip().lower() not in _FLAG_OFF_VALUES
 
 
 # What the advisor's turn left open for her (S1 item 2), in the order the notes are added.
