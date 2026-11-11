@@ -3719,6 +3719,21 @@ class BridgeRunner:
         return self.text
 
 
+class GatedRunner(BridgeRunner):
+    """A compose call that is in flight until the test opens its gate."""
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def __call__(self, messages: list[dict[str, str]]) -> str:
+        self.calls.append(messages)
+        self.entered.set()
+        await self.gate.wait()
+        return self.text
+
+
 # Synthetic boundary answers (the owner's #22 was a reflective answer about deals that did not
 # close; none of its words are here).
 BRIDGE_LAST = (
@@ -3887,6 +3902,66 @@ class TestTransitionBridgeWiring(R1TestCase):
         await self.advance_to_transition(run)
         self.assertEqual(runner.calls, [])
         self.assertEqual(run.session.spoken[1:], [self.spoken_line("L-TRANSITION")])
+        await self.drain_cancel(run)
+
+    async def test_a_transition_turn_during_the_compose_is_not_answered_ahead_of_the_brief(self):
+        # Review of S5: the phase was TRANSITION and nothing was scheduled while the bridge
+        # composed, so a question committed then got Christy's answer and "Shall we start the
+        # role-play now ...?" BEFORE the brief, and used up one of the three answers.  It is held
+        # like a turn spoken over the brief, and the reaction (composed on the earlier answer, now
+        # stale) is dropped: the brief plays with its thanks.
+        runner = GatedRunner(BRIDGE_REACTION)
+        with self.capture_logs() as logs:
+            run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
+            await self.until(runner.entered.is_set)
+            question = "What happens in the next part?"
+            run.session.emit("user_input_transcribed", final_event(question))
+            await self.settle()
+            with self.assertRaises(r1_session.StopResponse):
+                await run.session.agent.on_user_turn_completed(
+                    None, SimpleNamespace(text_content=question, id="msg_during_compose")
+                )
+            self.assertEqual(run.interview._transition_answers, 0)
+            self.assertEqual(list(run.interview._transition_lines), [])
+            runner.gate.set()
+            await self.brief_played(run, "L-TRANSITION")
+        brief = run.interview.render_line("L-TRANSITION")
+        self.assertEqual(run.session.spoken[1:], [brief])
+        (line_,) = self.bridge_lines(logs)
+        self.assertEqual(line_["error_category"], "superseded")
+        await self.drain_cancel(run)
+
+    async def test_the_reaction_never_starts_over_a_candidate_who_is_speaking(self):
+        # Review of S5: the uninterruptible reaction and brief started without a look at the
+        # candidate, reopening the talk-over race the icebreaker's hold closes.
+        runner = GatedRunner(BRIDGE_REACTION)
+        run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
+        await self.until(runner.entered.is_set)
+        run.session.emit("user_state_changed", SimpleNamespace(old_state="listening",
+                                                               new_state="speaking"))
+        runner.gate.set()
+        await self.settle()
+        self.assertEqual(run.session.spoken[1:], [])  # nothing over them, not even the brief
+        run.session.emit("user_state_changed", SimpleNamespace(old_state="speaking",
+                                                               new_state="listening"))
+        await self.brief_played(run, "L-TRANSITION")
+        self.assertEqual(run.session.spoken[1:], [run.interview.render_line("L-TRANSITION")])
+        await self.drain_cancel(run)
+
+    async def test_the_reaction_and_the_brief_are_queued_together(self):
+        # Review of S5: the brief was only queued after the reaction's playout, so a turn
+        # committed during the reaction was answered between the two.
+        runner = GatedRunner(BRIDGE_REACTION)
+        run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
+        await self.until(runner.entered.is_set)
+        run.session.playout_seconds = 0.3
+        runner.gate.set()
+        await self.until(lambda: BRIDGE_REACTION in run.session.spoken)
+        brief = run.interview.render_line("L-TRANSITION-BRIDGED")
+        self.assertEqual(run.session.spoken[1:], [BRIDGE_REACTION, brief])
+        self.assertFalse(run.interview._bridging)
+        await self.brief_played(run, "L-TRANSITION-BRIDGED")
+        self.assertEqual(run.interview._start_question, r1_session._EITHER_OR)
         await self.drain_cancel(run)
 
     async def test_the_flag_off_is_todays_transition_exactly(self):

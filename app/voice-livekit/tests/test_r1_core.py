@@ -5452,8 +5452,9 @@ class TestWhatTheCandidateCanCut(R1TestCase):
         self.assertIn("interruptible: bool = False", source)  # say()'s own default
         self.assertEqual(source.count("interruptible=True"), 1)  # the llm_recovery line only
         # _play_aside: the asides; _say_brief: the transition bridge's reaction (M032 S5), which
-        # comes right before the uninterruptible brief and cannot be cut either.
-        self.assertEqual(source.count("interruptible=False"), 2)
+        # comes right before the uninterruptible brief and cannot be cut either, and that brief
+        # (L-TRANSITION-BRIDGED), queued together with the reaction (review of S5).
+        self.assertEqual(source.count("interruptible=False"), 3)
 
 
 class TestTransitionKeepsTheSessionsEndpointing(R1TestCase):

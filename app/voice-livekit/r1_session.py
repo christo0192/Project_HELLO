@@ -1899,6 +1899,12 @@ class R1Interview:
         self._bridge_runner = bridge_runner
         self._bridge_llm: Any = None
         self._icebreaker_boundary_entries: list[dict[str, Any]] = []
+        # While the brief is not yet queued (``_say_brief``: the compose and any wait after it) a
+        # transition turn is held like one spoken over the brief (``_transition_action``); a
+        # compose call ran; a candidate turn came in meanwhile, so the reaction is stale.
+        self._bridging = False
+        self._bridge_composed = False
+        self._bridge_superseded = False
         # The brief the candidate heard (L-TRANSITION, or L-TRANSITION-BRIDGED after the
         # bridge's reaction): what a request to hear it again replays (``_repeat_brief``).
         self._brief_line = "L-TRANSITION"
@@ -2767,6 +2773,17 @@ class R1Interview:
         A line the cache holds is played from its stored audio (``say(audio=...)``): same
         text, same transcript row, no TTS round trip.  Anything else is spoken live.
         """
+        handle = self._start_text(text, interruptible=interruptible, marker=marker, voice=voice)
+        await self._await_playout(handle, marker, timeout)
+
+    def _start_text(
+        self, text: str, *, interruptible: bool, marker: str, voice: str
+    ) -> Any:
+        """Queue one scripted line with the SDK (no await) and return its speech handle.
+
+        ``_say_text``'s first half: lines queued one after another play in that order, so a turn
+        committed after the last of them is answered after it (M032 S5's reaction and brief).
+        """
         audio = self._cached_audio(text, marker, voice)
         if audio is None:
             handle = self.session.say(text, allow_interruptions=interruptible)
@@ -2776,6 +2793,10 @@ class R1Interview:
         if handle_id is not None:
             self._voices[str(handle_id)] = voice
             self._latency.say_created(str(handle_id), marker, self.machine.transcript_phase())
+        return handle
+
+    async def _await_playout(self, handle: Any, marker: str, timeout: float) -> None:
+        """``_say_text``'s second half: wait, at most ``timeout``, for the line to finish."""
         wait_for_playout = getattr(handle, "wait_for_playout", None)
         if not callable(wait_for_playout):
             return
@@ -3352,6 +3373,11 @@ class R1Interview:
         """
         if self._ready_latched or self._transition_consented or self._transition_consent(text):
             return _TRANSITION_READY
+        if self._bridging:
+            # M032 S5 (review): the brief is not queued yet (the transition bridge is composing
+            # or waiting for the candidate): a turn now is held like one spoken over the brief,
+            # never answered ahead of it.  A brief request is still latched at the transcript.
+            return _TRANSITION_QUIET
         if self._brief_due() or (not self._brief_repeated and is_brief_request(text)):
             return _TRANSITION_BRIEF
         if (
@@ -3622,6 +3648,13 @@ class R1Interview:
                 # ("Sorry", "Thank you.") leaves the wait for the reply it cancelled running.
                 self._unvoiced_since = None
         phase = self.machine.phase
+        if (
+            self._bridging
+            and phase is R1Phase.TRANSITION
+            and text
+            and not is_backchannel_turn(text)
+        ):
+            self._bridge_superseded = True  # M032 S5: the reaction would answer an older turn
         deferral = self._icebreaker_deferral(text) if phase is R1Phase.ICEBREAKER else None
         action = self._transition_action(text) if phase is R1Phase.TRANSITION else None
         suppressed = self.reply_suppressed(text)
@@ -6174,16 +6207,55 @@ class R1Interview:
         spoken first and the brief follows without its "Thank you, {first_name}."
         (L-TRANSITION-BRIDGED); both are uninterruptible, as the brief always was.  Otherwise
         L-TRANSITION plays exactly as before.
+
+        Review of S5: until the brief is queued (``_bridging``) a transition turn is held like
+        one spoken over the brief, never answered ahead of it.  A turn that came in during the
+        compose makes the reaction stale (``_transition_bridge``: "superseded"), and after a
+        compose nothing starts while the candidate is mid-turn (bounded like the icebreaker's
+        hold).  The reaction and the brief are queued together, so a turn committed during the
+        reaction is answered after the brief, as one during L-TRANSITION always was.
         """
-        reaction = await self._transition_bridge()
+        self._bridging = True
+        self._bridge_composed = False
+        self._bridge_superseded = False
+        try:
+            reaction = await self._transition_bridge()
+            if reaction is None and self._bridge_composed:
+                await self._wait_for_candidate_turn(
+                    endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+                )
+        except BaseException:
+            self._bridging = False
+            raise
         if reaction is None:
+            self._bridging = False  # no await before the brief is queued
             await self.say("L-TRANSITION")
             return
-        await self._say_text(
+        self._brief_line = _BRIDGED_BRIEF
+        spoken = self._start_text(
             reaction, interruptible=False, marker=_BRIDGE_MARKER, voice=INTERVIEWER
         )
-        self._brief_line = _BRIDGED_BRIEF
-        await self.say(_BRIDGED_BRIEF)
+        brief = self._start_text(
+            self.render_line(_BRIDGED_BRIEF),
+            interruptible=False,
+            marker=_BRIDGED_BRIEF,
+            voice=INTERVIEWER,
+        )
+        self._bridging = False
+        await self._await_playout(spoken, _BRIDGE_MARKER, SAY_PLAYOUT_SECONDS)
+        await self._await_playout(brief, _BRIDGED_BRIEF, SAY_PLAYOUT_SECONDS)
+        # Set once the brief has played, as ``say`` does: a short yes over it answers nothing.
+        self._start_question = _START_QUESTION_OF_LINE[_BRIDGED_BRIEF]
+
+    async def _wait_for_candidate_turn(self, limit: float) -> None:
+        """Wait, at most ``limit`` seconds, while the candidate is mid-turn (speaking, or a final
+        heard whose turn has not committed) or until a stop fires."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limit
+        while self._candidate_turn_open() and loop.time() < deadline:
+            if self._stop_outcome() is not None:
+                return
+            await asyncio.sleep(0.05)
 
     def _bridge_runner_or_none(self) -> Callable[[list[dict[str, str]]], Awaitable[Any]] | None:
         """The compose call, or None (an injected runner as it is; else R1's own client, and
@@ -6246,7 +6318,8 @@ class R1Interview:
         ``BRIDGE_TIMEOUT_SEC`` from its start, and what comes back is spoken only when
         ``clean_bridge`` passes it as it is.  A timeout, an error or a sentence that is not clean
         says nothing extra.  One ``r1_latency`` line (``transition_bridge``): the compose time,
-        with ``spoken``, ``dropped``, ``timeout`` or ``error`` as its category; never the words.
+        with ``spoken``, ``dropped``, ``superseded`` (the candidate went on meanwhile),
+        ``timeout`` or ``error`` as its category; never the words.
         """
         entries, self._icebreaker_boundary_entries = self._icebreaker_boundary_entries, []
         if not entries or not transition_bridge_enabled() or self._stop_outcome() is not None:
@@ -6260,6 +6333,7 @@ class R1Interview:
         loop = asyncio.get_running_loop()
         started = loop.time()
         reaction: str | None = None
+        self._bridge_composed = True
         try:
             raw = await asyncio.wait_for(
                 runner(self._bridge_messages(text, entries)), BRIDGE_TIMEOUT_SEC
@@ -6278,6 +6352,13 @@ class R1Interview:
         else:
             reaction = clean_bridge(raw, self._bridge_guard_context())
             outcome = "dropped" if reaction is None else "spoken"
+            if reaction is not None and (
+                self._bridge_superseded or self._candidate_turn_open()
+            ):
+                # The candidate went on while it was composed: it reacts to an older turn and
+                # would start over them or after their new point.  Nothing extra is said.
+                reaction = None
+                outcome = "superseded"
         self._emit_latency(
             "transition_bridge",
             loop.time() - started,

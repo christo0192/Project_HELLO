@@ -400,7 +400,7 @@ class TestPlan(unittest.TestCase):
         # the plan never asked it.
         for text in (
             "A typical day was calls and store visits. I left the job because the branch closed.",
-            "I call around fifty parents a day, and I stayed in the job because the team was great.",
+            "I call about fifty parents a day, and I stayed in the job because the team was kind.",
             "I left the role since the targets kept rising every quarter at that firm.",
             "I liked the job because no two calls were ever the same for me there.",
         ):

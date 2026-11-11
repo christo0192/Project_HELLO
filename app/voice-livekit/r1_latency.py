@@ -272,8 +272,9 @@ class LatencyTracker:
     waited for it; ``reused`` for a call started at the final, ``at_hook`` otherwise).  None of
     the three is read by ``stage_a_report``; the hook's wait already shows in the headline.
     M032 S5's transition bridge (off by default) adds ``transition_bridge`` the same way: its
-    compose call, start to result, with ``spoken``, ``dropped``, ``timeout`` or ``error`` as the
-    category; the reaction's own audio start is ``say_to_first_audio`` (``transition_bridge``).
+    compose call, start to result, with ``spoken``, ``dropped``, ``superseded``, ``timeout`` or
+    ``error`` as the category; the reaction's own audio start is ``say_to_first_audio``
+    (``transition_bridge``).
     """
 
     def __init__(self, clock: Callable[[], float], emit: Emit) -> None:
