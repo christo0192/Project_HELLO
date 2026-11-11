@@ -527,5 +527,460 @@ class EnvironmentTests(unittest.TestCase):
                 self.assertEqual(reader_timeout_sec(), expected)
 
 
+# ------------------------------------------------------------------ the session
+
+from tests.test_r1_core import (  # noqa: E402 - the session's fakes, after the pure tests
+    R1TestCase,
+    capture_r1_logs,
+    error_types,
+    setUpModule,  # noqa: F401 - unittest runs it: silences the loggers' stdout
+    tearDownModule,  # noqa: F401
+)
+from tests.test_r1_integration import (  # noqa: E402
+    COOPERATIVE_TURN_GAP,
+    FIDELITY_DISCOVERY_TURN_GAP,
+    FIDELITY_FIRST_AUDIO_SECONDS,
+    GOOD_JUDGE,
+    FakeProvider,
+    Rig,
+    judge_returning,
+)
+from tests.test_r1_roleplay import (  # noqa: E402
+    ASK,
+    FOLLOWUP,
+    H1_PROBE,
+    OPENER,
+    PITCH,
+    cooperative_script,
+)
+
+
+def fenced_turn(messages: list[dict]) -> str:
+    """The candidate's turn as the reader was shown it (between the two fence lines)."""
+    return messages[1]["content"].split("\n")[-2]
+
+
+class ReaderRunner:
+    """A fake reader: records its calls and answers ``raw`` (or a callable of the messages), or
+    raises, hangs or waits for ``gate``."""
+
+    def __init__(self, raw=None, *, hang=False, error=None, gate=None):
+        self.raw = raw if raw is not None else answer()
+        self.hang = hang
+        self.error = error
+        self.gate = gate
+        self.calls: list[list[dict]] = []
+        self.cancelled = 0
+        self.finished = 0
+
+    async def __call__(self, messages):
+        self.calls.append(messages)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            if self.hang:
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        if self.error is not None:
+            raise self.error
+        self.finished += 1
+        return self.raw(messages) if callable(self.raw) else self.raw
+
+
+def offer_from_first_words(messages: list[dict]) -> str:
+    """A reader that marks "offer" with the first three words of whatever turn it is shown."""
+    words = fenced_turn(messages).split()[:3]
+    return answer({"offer": " ".join(words)}, "dodge")
+
+
+def reader_lines(lines: list[dict]) -> list[dict]:
+    return [line_ for line_ in lines if line_.get("error_type") == "r1_turn_reader"]
+
+
+def strings_of(value) -> list[str]:
+    """Every key and string value inside a JSON-shaped value."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for key, item in value.items() for s in (key, *strings_of(item))]
+    if isinstance(value, (list, tuple)):
+        return [s for item in value for s in strings_of(item)]
+    return []
+
+
+class TestTheReaderInTheSession(R1TestCase):
+    """The speculative reading: started at the final, recorded when the row closes, never awaited."""
+
+    def use(self, runner: ReaderRunner) -> ReaderRunner:
+        self.interview._turn_reader_runner = runner
+        return runner
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.enter_roleplay()
+        self.interview.engine  # built, as the first role-play turn builds it
+
+    def shadow(self) -> dict:
+        return self.interview._reader_shadow.payload()
+
+    async def test_the_reading_starts_at_the_final_and_is_reused_when_the_row_closes(self):
+        runner = self.use(ReaderRunner(answer({"closing": "ring me back whenever"})))
+        self.final_transcript(CALL_BACK_LATER)
+        self.assertIsNotNone(self.interview._turn_reader_call)  # started at the final
+        index = self.interview._open_row.index
+        await self.settle()
+        self.assertEqual(len(runner.calls), 1)  # before the hook
+        self.assertEqual(fenced_turn(runner.calls[0]), CALL_BACK_LATER)
+        with self.capture_logs() as logs:
+            await self.commit_turn(CALL_BACK_LATER)
+            await self.settle()
+        self.assertEqual(len(runner.calls), 1)  # reused
+        (row,) = self.shadow()["reader_shadow"]
+        self.assertEqual(
+            row,
+            {"turn_index": index, "phase": "roleplay", "status": "ok", "reader": ["closing"],
+             "answered": "none", "regex": ["handled"]},
+        )
+        # Today's detectors: no goodbye read, only "no rush" as the timing worry handled.
+        (line_,) = reader_lines(logs)
+        self.assertEqual(
+            (line_["error_category"], line_["turn_index"], line_["phase"], line_["schema"],
+             line_["rejection_reason"]),
+            ("ok", index, "roleplay", "close", "handled"),
+        )
+        calls = [item for item in logs if item.get("schema") == "turn_reader_call"]
+        self.assertEqual([item["error_category"] for item in calls], ["ok"])
+        # Labels only: no word of the turn reaches a log line.
+        for item in logs:
+            for word in ("whenever", "rush at"):
+                self.assertNotIn(word, json.dumps(item).lower())
+
+    async def test_a_continuation_reads_the_whole_row_again(self):
+        runner = self.use(ReaderRunner())
+        self.final_transcript("No rush at all.")
+        first = self.interview._turn_reader_call
+        self.final_transcript("Ring me back whenever you are ready.")
+        self.assertIsNot(self.interview._turn_reader_call, first)
+        self.assertTrue(first.task.cancelled() or first.task.cancelling())
+        await self.settle()
+        self.assertEqual(len(runner.calls), 1)  # the first never ran; the joined text's did
+        self.assertEqual(
+            fenced_turn(runner.calls[0]), "No rush at all. Ring me back whenever you are ready."
+        )
+        await self.commit_turn("No rush at all. Ring me back whenever you are ready.")
+        await self.settle()
+        self.assertEqual(len(runner.calls), 1)  # the row's text is the one it read
+        self.assertEqual(self.shadow()["reader_agreement"]["status"], {"ok": 1})
+
+    async def test_the_hook_never_waits_for_the_reading(self):
+        gate = asyncio.Event()
+        runner = self.use(ReaderRunner(gate=gate))
+        self.final_transcript(SIGN_OFF)
+        await self.settle()
+        hook = asyncio.ensure_future(self.commit_turn(SIGN_OFF))
+        await self.settle()
+        self.assertTrue(hook.done())  # decided with the reading still on its way
+        self.assertFalse(hook.result())  # a reply was planned, exactly as without it
+        self.assertIsNotNone(self.interview._last_reply.plan)
+        self.assertEqual(runner.finished, 0)
+        self.assertEqual(self.shadow()["reader_agreement"]["status"], {"pending": 1})
+        gate.set()
+        await self.settle()
+        self.assertEqual(runner.finished, 1)
+        self.assertEqual(self.shadow()["reader_agreement"]["status"], {"ok": 1})
+
+    async def test_a_reading_past_its_budget_is_a_timeout_and_is_cancelled(self):
+        runner = self.use(ReaderRunner(hang=True))
+        with mock.patch.dict(os.environ, {"R1_TURN_READER_TIMEOUT_SEC": "0.3"}):
+            self.final_transcript(SIGN_OFF)
+            await self.commit_turn(SIGN_OFF)
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            await self.until(lambda: runner.cancelled == 1, timeout=3.0)
+            self.assertLess(loop.time() - started, 1.5)
+        await self.settle()
+        (row,) = self.shadow()["reader_shadow"]
+        self.assertEqual((row["status"], row["reader"]), ("timeout", None))
+        self.assertIn("dig", row["regex"])  # today's detectors are still compared
+
+    async def test_an_error_or_nonsense_is_recorded_never_raised(self):
+        for runner, status in (
+            (ReaderRunner(error=RuntimeError("provider down")), "error"),
+            (ReaderRunner("they want to stop, I think"), "parse_failed"),
+        ):
+            with self.subTest(status=status):
+                await self.asyncSetUp()
+                self.use(runner)
+                with self.capture_logs() as logs:
+                    self.final_transcript(SIGN_OFF)
+                    self.assertFalse(await self.commit_turn(SIGN_OFF))
+                    await self.settle()
+                (row,) = self.shadow()["reader_shadow"]
+                self.assertEqual(row["status"], status)
+                if status == "error":
+                    self.assertIn("r1_turn_reader_failed", error_types(logs))
+
+    async def test_off_reads_nothing(self):
+        runner = self.use(ReaderRunner())
+        with mock.patch.dict(os.environ, {"R1_TURN_READER": "off"}):
+            self.final_transcript(SIGN_OFF)
+            self.assertIsNone(self.interview._turn_reader_call)
+            await self.commit_turn(SIGN_OFF)
+            await self.settle()
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(self.shadow(), {})
+
+    async def test_an_acknowledgement_alone_is_not_read(self):
+        runner = self.use(ReaderRunner())
+        self.final_transcript("Okay.")
+        await self.commit_turn("Okay.")
+        await self.settle()
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(self.shadow()["reader_agreement"]["skipped_ack"], 1)
+        self.assertEqual(self.shadow()["reader_shadow"], [])
+
+    async def test_a_session_without_a_client_reads_nothing_and_a_broken_client_once(self):
+        self.interview._turn_reader_runner = None
+        self.assertIsNone(getattr(self.session, "llm", None))
+        self.assertIsNone(self.interview._turn_reader_runner_or_none())
+        self.session.llm = object()
+        self.assertEqual(
+            self.interview._turn_reader_runner_or_none(), self.interview._default_turn_reader
+        )
+        with mock.patch.object(
+            r1_llm, "build_r1_judge_llm", side_effect=r1_llm.R1LLMConfigurationError("x")
+        ), self.capture_logs() as logs:
+            self.final_transcript(SIGN_OFF)
+            await self.settle()
+        self.assertIn("r1_turn_reader_unusable", error_types(logs))
+        self.assertTrue(self.interview._turn_reader_unusable)
+        self.assertIsNone(self.interview._turn_reader_runner_or_none())
+        self.interview._flush_candidate_row()
+        await self.settle()
+        (row,) = self.shadow()["reader_shadow"]
+        self.assertEqual(row["status"], "error")
+
+    async def test_the_learner_line_is_the_context(self):
+        runner = self.use(ReaderRunner())
+        self.interview._history.append(
+            {"role": "bot", "voice": "learner", "text": "Is there any way to pay in parts?"}
+        )
+        self.final_transcript("We do have monthly instalments.")
+        await self.settle()
+        self.assertIn(
+            'The learner\'s last line: "Is there any way to pay in parts?"',
+            runner.calls[0][1]["content"],
+        )
+
+    async def test_the_owners_missed_farewell_is_read_and_set_beside_todays_detectors(self):
+        # fda9e9f6 turns 73-83 (paraphrased), at R of about 9:00: no detector read the goodbye, so
+        # the close ladder never ran.  Shadow: the reader's "closing" is logged next to today's
+        # blind close detector, and nothing acts on it (the inertness test below proves the rest).
+        self.clock.advance(540)
+        self.use(ReaderRunner(answer({"closing": "let us know what you both decide"})))
+        self.final_transcript(SIGN_OFF)
+        await self.settle()
+        self.assertFalse(await self.commit_turn(SIGN_OFF))
+        await self.settle()
+        self.assertFalse(self.interview.engine.exit_requested)
+        self.assertEqual(self.interview.engine.scheduler.close_attempts, 0)
+        (row,) = self.shadow()["reader_shadow"]
+        self.assertEqual(row["reader"], ["closing"])
+        self.assertNotIn("close_attempt", row["regex"])
+        self.assertIn("dig", row["regex"])  # today's broad question reader fires on it instead
+        labels = self.shadow()["reader_agreement"]["labels"]
+        self.assertEqual(labels["closing"]["reader_only"], 1)
+        self.assertEqual(labels["question_to_her"]["regex_only"], 1)
+
+    async def test_each_reading_gets_its_own_fence(self):
+        runner = self.use(ReaderRunner())
+        for text in ("We do have monthly instalments.", "And a weekend batch too."):
+            self.final_transcript(text)
+            await self.commit_turn(text)
+            await self.settle()
+        fences = {call[1]["content"].split("\n")[-1] for call in runner.calls}
+        self.assertEqual(len(fences), 2)
+
+
+class TestTheReaderOutsideTheRolePlay(R1TestCase):
+    def use(self, runner: ReaderRunner) -> ReaderRunner:
+        self.interview._turn_reader_runner = runner
+        return runner
+
+    async def test_the_icebreaker_is_not_read_and_the_transition_is(self):
+        runner = self.use(ReaderRunner())
+        self.final_transcript("I have sold courses for six years.")
+        self.assertIsNone(self.interview._turn_reader_call)
+        self.interview._flush_candidate_row()
+        self.interview.machine.transition(R1Phase.TRANSITION)
+        self.final_transcript("Sorry, could you explain the task again?")
+        self.assertIsNotNone(self.interview._turn_reader_call)
+        await self.settle()
+        self.assertTrue(
+            runner.calls[0][1]["content"].startswith(r1_turn_reader.TRANSITION_CONTEXT)
+        )
+        self.interview._flush_candidate_row()
+        await self.settle()
+        (row,) = self.interview._reader_shadow.payload()["reader_shadow"]
+        self.assertEqual(row["phase"], "transition")
+        self.assertIn("brief_request", row["regex"])  # the session's own detector, passed in
+        self.assertEqual(len(runner.calls), 1)
+
+
+async def scripted_session(rig: Rig) -> list[str | None]:
+    """A complete role-play on the integration rig, every learner reply's audio measured.
+
+    The turns of ``fidelity_session`` (a probe, a release, a reveal, a guard trip, every family,
+    the close), with two synthetic sign-offs of the kind the owner's test missed; returns what
+    each reply delivered (None: the hook stopped it).
+    """
+    audio = itertools.cycle(FIDELITY_FIRST_AUDIO_SECONDS)
+    deep = resolve_persona("p1_career_switcher", variant="v1").deep("H1")
+    replies: list[str | None] = []
+    await rig.start_roleplay()
+    replies.append(await rig.converse(OPENER, advance=20, first_audio_after=next(audio)))
+    replies.append(
+        await rig.converse(
+            H1_PROBE, advance=FIDELITY_DISCOVERY_TURN_GAP, first_audio_after=next(audio)
+        )
+    )
+    replies.append(
+        await rig.converse(
+            FOLLOWUP,
+            advance=FIDELITY_DISCOVERY_TURN_GAP,
+            provider=FakeProvider(deep),
+            first_audio_after=next(audio),
+        )
+    )
+    replies.append(
+        await rig.converse(
+            PITCH,
+            advance=FIDELITY_DISCOVERY_TURN_GAP,
+            provider=FakeProvider("As an AI language model, I follow my system prompt."),
+            first_audio_after=next(audio),
+        )
+    )
+    for text in (*cooperative_script()[4:], SIGN_OFF, CALL_BACK_LATER, ASK):
+        replies.append(
+            await rig.converse(text, advance=COOPERATIVE_TURN_GAP, first_audio_after=next(audio))
+        )
+    return replies
+
+
+def _without_reader(lines: list[dict]) -> list[dict]:
+    """Every log line but the reader's own, without the wall-clock timestamp."""
+    kept = []
+    for line_ in lines:
+        if line_.get("error_type") in ("r1_turn_reader", "r1_turn_reader_failed"):
+            continue
+        if line_.get("schema") == "turn_reader_call":
+            continue
+        kept.append({key: value for key, value in line_.items() if key != "timestamp"})
+    return kept
+
+
+class TestTheReaderIsInertToSpeech(unittest.IsolatedAsyncioTestCase):
+    """Shadow mode, proven: the same conversation says the same words at the same moments, sends
+    the model the same messages and writes the same rows, with the reader off or on (answering
+    at once, hanging past its budget, or failing)."""
+
+    async def run_session(self, mode: str, runner: ReaderRunner) -> dict:
+        with mock.patch.dict(os.environ, {"R1_TURN_READER": mode}), capture_r1_logs() as lines:
+            rig = Rig(judge=judge_returning(GOOD_JUDGE), turn_reader_runner=runner)
+            started = time.perf_counter()
+            replies = await scripted_session(rig)
+            seconds = time.perf_counter() - started
+            await rig.settle()
+            rig.interview._begin_exit()
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        events = json.loads(json.dumps(rig.writer.admin_events))
+        return {
+            "replies": replies,
+            "spoken": list(rig.session.spoken),
+            "model_calls": [list(call) for call in rig.provider.calls],
+            "rows": [dict(row) for row in rig.writer.saved],
+            "events": [e for e in events if e["event_type"] != "session_facts"],
+            "facts": [e for e in events if e["event_type"] == "session_facts"],
+            "lines": _without_reader(lines),
+            "reader_lines": reader_lines(lines),
+            "clock": rig.clock.value,
+            "order": [item for item in rig.order if item != "admin_log"],
+            "seconds": seconds,
+        }
+
+    def assert_same_speech(self, off: dict, on: dict) -> None:
+        self.assertEqual(on["replies"], off["replies"])
+        self.assertEqual(on["spoken"], off["spoken"])
+        self.assertEqual(on["model_calls"], off["model_calls"])
+        self.assertEqual(on["rows"], off["rows"])
+        self.assertEqual(on["events"], off["events"])
+        self.assertEqual(on["clock"], off["clock"])
+        self.assertEqual(on["order"], off["order"])
+        # Timing: every latency stage, plan and reason line is the same, value for value.
+        self.assertEqual(on["lines"], off["lines"])
+        (facts_off,) = off["facts"]
+        (facts_on,) = on["facts"]
+        shadow_keys = {"reader_shadow", "reader_agreement"}
+        self.assertEqual(
+            {k: v for k, v in facts_on["payload"].items() if k not in shadow_keys},
+            facts_off["payload"],
+        )
+
+    async def test_the_same_words_at_the_same_moments_with_the_reader_on_or_off(self):
+        off_runner = ReaderRunner(offer_from_first_words)
+        off = await self.run_session("off", off_runner)
+        self.assertEqual(off_runner.calls, [])
+        self.assertTrue(any(reply for reply in off["replies"]))
+        self.assertGreater(len(off["lines"]), 50)
+        self.assertNotIn("reader_shadow", off["facts"][0]["payload"])
+        for name, runner in (
+            ("answers at once", ReaderRunner(offer_from_first_words)),
+            ("hangs", ReaderRunner(hang=True)),
+            ("fails", ReaderRunner(error=RuntimeError("provider down"))),
+        ):
+            with self.subTest(runner=name):
+                on = await self.run_session("shadow", runner)
+                self.assertGreater(len(runner.calls), 10)
+                self.assertIn("reader_shadow", on["facts"][0]["payload"])
+                self.assert_same_speech(off, on)
+                if name == "hangs":
+                    # Awaited anywhere on the way to a reply, a hanging reading would cost its
+                    # 1.3 s budget on each of these turns (about 25 s); never awaited, nothing.
+                    self.assertLess(on["seconds"], off["seconds"] + 8.0)
+                    statuses = on["facts"][0]["payload"]["reader_agreement"]["status"]
+                    self.assertLessEqual(set(statuses), {"pending", "timeout"})
+
+    async def test_the_session_facts_carry_labels_and_never_words(self):
+        on = await self.run_session("shadow", ReaderRunner(offer_from_first_words))
+        (facts,) = on["facts"]
+        payload = facts["payload"]
+        rows = payload["reader_shadow"]
+        summary = payload["reader_agreement"]
+        self.assertEqual(summary["mode"], "shadow")
+        self.assertEqual(summary["prompt"], READER_PROMPT_VERSION)
+        self.assertEqual(len(rows), summary["turns"])
+        self.assertTrue(all(row["status"] == "ok" for row in rows), rows)
+        self.assertGreater(summary["labels"]["offer"]["reader_only"], 0)
+        self.assertEqual(len(on["reader_lines"]), len(rows))
+        candidate_rows = {
+            row["index"]: row for row in on["rows"] if row["speaker"] == "candidate"
+        }
+        for row in rows:
+            self.assertIn(row["turn_index"], candidate_rows)
+            self.assertEqual(row["phase"], candidate_rows[row["turn_index"]]["phase"])
+        # Every string in the record is one of a fixed vocabulary: there is no room for text.
+        allowed = {
+            *READER_LABELS, *ANSWERED_VALUES, *REGEX_DETECTORS, *LABEL_REGEX,
+            "turn_index", "phase", "status", "reader", "answered", "regex", "dropped",
+            "transition", "roleplay", "ok", "timeout", "error", "parse_failed", "pending",
+            "mode", "shadow", "prompt", READER_PROMPT_VERSION, "turns", "labels", "both",
+            "reader_only", "regex_only", "neither", "rows_dropped", "skipped_ack",
+        }
+        self.assertLessEqual(set(strings_of(rows)) | set(strings_of(summary)), allowed)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -177,6 +177,18 @@ Owner and manager decisions of 2026-11-03 (mock call aa166f09) change the way in
   (``_close_roleplay_on_time``): the candidate's turn in flight is waited for, then the learner's
   L-TIME-UP, then L-EXIT.  L-ASIDE-END, the bare yes, the end-intent model and the 10:00 scoring
   gate are unchanged; an end request from 14:00 is still a farewell on the close ladder.
+
+M032 S4 (owner decision D-M032-6): the turn reader, in SHADOW only.  Every transition and role-play
+candidate row is read by one quick model call on R1's own judge client (``r1_turn_reader``: closing,
+offer, conceded, question_to_her, answered_her_worry, brief_request, presence_check, abuse,
+end_request, each with the candidate's own words as evidence, checked in code).  The reading starts
+at each final (``_speculate_turn_reader``; a continuation starts it again for the whole row) and is
+recorded for the row when the row closes (``_bind_turn_reader``), by a background task that waits
+at most ``R1_TURN_READER_TIMEOUT_SEC`` from the reading's start.  Nothing on the speech path awaits
+it and nothing but its log line (``r1_turn_reader``: the reader's labels beside today's regex
+detectors) and the ``session_facts`` record (``reader_shadow``, ``reader_agreement``) reads it, so a
+reply, a plan, a phase and a grade are exactly what they are without it.  ``R1_TURN_READER=off``
+turns it off; the act mode is a later PR, after the owner has seen the labels.
 """
 from __future__ import annotations
 
@@ -240,6 +252,18 @@ from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, lin
 from r1_sarvam import current_speech_id
 from r1_text import normalize
 from r1_tracker import explicit_end_request
+from r1_turn_reader import (
+    MODE_OFF,
+    READER_PHASES,
+    ReaderShadowLog,
+    build_reader_messages,
+    parse_reader,
+    reader_code,
+    reader_mode,
+    reader_timeout_sec,
+    regex_code,
+    regex_labels,
+)
 from r1_tts import (
     INTERVIEWER,
     LEARNER,
@@ -1132,6 +1156,15 @@ def is_brief_request(text: str) -> bool:
     return _has_question_mark(text) and _BRIEF_ROLE_CHECK_RE.search(folded) is not None
 
 
+# M032 S4: the session's own detectors that the turn reader's shadow record compares with
+# (``r1_turn_reader.regex_labels``; the module cannot import them from here).
+_SESSION_READERS: dict[str, Callable[[str], bool]] = {
+    "brief_request": is_brief_request,
+    "repair": is_repair_turn,
+    "backchannel": is_backchannel_turn,
+}
+
+
 # A1: the last word of a turn that stops in the middle of a sentence ("... to be added is. I.",
 # "and the reason was"), after ``fold_speech``.  A false positive costs only the short continuation
 # wait, so the set is generous, but it leaves out words that end real answers ("so", "that", "on",
@@ -1585,6 +1618,19 @@ class _EndIntentCall:
 
 
 @dataclass
+class _TurnReaderCall:
+    """One shadow turn reading in flight (M032 S4): the row text it is for and its start (loop s).
+
+    ``task`` returns ``(status, raw, seconds)``: ``ok`` with the model's raw answer, or ``timeout``
+    / ``error`` with None; it bounds itself (``R1_TURN_READER_TIMEOUT_SEC`` from its start).
+    """
+
+    key: str
+    task: asyncio.Future[Any]
+    started: float
+
+
+@dataclass
 class _OpenTurn:
     """A committed candidate turn between the SDK hook and its decision (``prepare_turn_async``).
 
@@ -1679,6 +1725,7 @@ class R1Interview:
         line_cache: LineCache | None = None,
         rate_limits: RateLimitCounter | None = None,
         end_intent_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
+        turn_reader_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
     ) -> None:
         self.ctx = ctx
         self.context = context
@@ -1855,6 +1902,15 @@ class R1Interview:
         self._turn_finals: list[str] = []
         self._end_intent_call: _EndIntentCall | None = None
         self._end_intent_seq = 0
+        # M032 S4, the turn reader in SHADOW: the injectable runner (the default asks R1's own
+        # judge client, only when the session has an LLM), whether it proved unusable, the reading
+        # started for the open row's text at its latest final, a running number for its fence, and
+        # the labels-only record that ``session_facts`` carries at the end.
+        self._turn_reader_runner = turn_reader_runner
+        self._turn_reader_unusable = False
+        self._turn_reader_call: _TurnReaderCall | None = None
+        self._turn_reader_seq = 0
+        self._reader_shadow = ReaderShadowLog()
         # The bare-yes settle (``_settle_bare_yes``): candidate speech, an SDK-visible final, and
         # any change of either (a final, or the candidate starting or stopping speaking).
         self._settle_speech = asyncio.Event()
@@ -2525,6 +2581,8 @@ class R1Interview:
                         pins,
                         roleplay_seconds=self.machine.roleplay_elapsed,
                         first_audio_p95_ms=self._first_audio_p95_ms(),
+                        # M032 S4: the turn reader's shadow record (labels only), if it ran.
+                        reader=self._reader_facts(),
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - the record must never block the exit
@@ -4045,6 +4103,231 @@ class R1Interview:
         )
         return verdict
 
+    # ------------------------------------------------------- turn reader (M032 S4, shadow)
+    #
+    # Owner decision D-M032-6: one quick model reading of every transition and role-play candidate
+    # row (``r1_turn_reader``), LOGGED next to today's regex detectors and nothing else.  It starts
+    # at each final (a continuation starts it again for the whole row), and the row's result is
+    # recorded when the row closes, by a background task.  Nothing on the speech path ever awaits
+    # it, and nothing reads its result but the log line and the ``session_facts`` record, so it
+    # cannot delay or change a reply.  Every step is guarded: a reader bug is logged, never raised.
+
+    def _turn_reader_runner_or_none(self) -> Callable[[list[dict[str, str]]], Awaitable[Any]] | None:
+        """The reader's runner, or None when it is off or cannot run this session.
+
+        ``R1_TURN_READER=off`` turns it off; an injected runner is used as it is; the default asks
+        R1's own judge client, and only when the session has an LLM at all (the fakes have none).
+        A client that cannot be built disables it for the rest of the session.
+        """
+        if self._turn_reader_unusable or reader_mode() == MODE_OFF:
+            return None
+        if self._turn_reader_runner is not None:
+            return self._turn_reader_runner
+        if getattr(self.session, "llm", None) is not None:
+            return self._default_turn_reader
+        return None
+
+    def _turn_reader_wanted(self, phase: str) -> bool:
+        """True when a row of this transcript phase is read (the transition and the role-play)."""
+        return (
+            not self._exiting
+            and phase in READER_PHASES
+            and self._turn_reader_runner_or_none() is not None
+        )
+
+    def _start_turn_reader_call(self, text: str, key: str, phase: str) -> _TurnReaderCall | None:
+        """Start one reading of ``text`` as a tracked task (the exit funnel cancels it)."""
+        runner = self._turn_reader_runner_or_none()
+        if runner is None:
+            return None
+        self._turn_reader_seq += 1
+        messages = build_reader_messages(
+            text,
+            phase=phase,
+            learner_last="" if phase == "transition" else self._learner_last(),
+            seed=self._seed(),
+            turn=self._turn_reader_seq,
+        )
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        task = asyncio.ensure_future(
+            self._run_turn_reader(runner, messages, started, reader_timeout_sec())
+        )
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return _TurnReaderCall(key=key, task=task, started=started)
+
+    def _cancel_turn_reader_call(self) -> None:
+        call, self._turn_reader_call = self._turn_reader_call, None
+        if call is not None and not call.task.done():
+            call.task.cancel()
+
+    def _speculate_turn_reader(self, row: _CandidateRow) -> None:
+        """Start reading the open row at its latest final, or again when a continuation changed it.
+
+        The key is the row's text so far, normalised: the same key when the row closes reuses the
+        reading.  An acknowledgement alone ("Okay.", "Yeah, go on.") is not read.
+        """
+        try:
+            text = " ".join(row.parts)
+            key = normalize(text)
+            call = self._turn_reader_call
+            if call is not None and call.key == key:
+                return
+            self._cancel_turn_reader_call()
+            if not key or is_acknowledgement_turn(text) or not self._turn_reader_wanted(row.phase):
+                return
+            self._turn_reader_call = self._start_turn_reader_call(text, key, row.phase)
+        except Exception as exc:  # noqa: BLE001 - a shadow reading must never touch the turn
+            _log.warn(
+                "unknown_event",
+                error_type="r1_turn_reader_failed",
+                error_category="speculate",
+                schema=_error_type_of(exc),
+            )
+
+    def _bind_turn_reader(self, row: _CandidateRow) -> None:
+        """Record the closed row's reading for its transcript index, off the speech path.
+
+        The reading started at the row's last final is reused when it read this very text;
+        otherwise (a held acknowledgement joined the row, or no final started one) a reading
+        starts now.  Either way only a background task waits for it.
+        """
+        try:
+            call, self._turn_reader_call = self._turn_reader_call, None
+            text = " ".join(row.parts)
+            key = normalize(text)
+            if call is not None and (call.key != key or reader_mode() == MODE_OFF):
+                if not call.task.done():
+                    call.task.cancel()
+                call = None
+            if call is None:
+                if not key or not self._turn_reader_wanted(row.phase):
+                    return
+                if is_acknowledgement_turn(text):
+                    self._reader_shadow.skip()
+                    return
+                call = self._start_turn_reader_call(text, key, row.phase)
+                if call is None:
+                    return
+            self._reader_shadow.bind(row.index, row.phase)
+            self._spawn(
+                self._finish_turn_reader(
+                    call, row.index, row.phase, text, self.machine.roleplay_elapsed
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a shadow reading must never touch the row
+            _log.warn(
+                "unknown_event",
+                error_type="r1_turn_reader_failed",
+                error_category="bind",
+                schema=_error_type_of(exc),
+            )
+
+    async def _default_turn_reader(self, messages: list[dict[str, str]]) -> str:
+        """Ask the reader on R1's OWN judge client (temperature 0; shared with the judge).
+
+        Its failures never reach ``_on_provider_error`` and so never count toward the 3-failure
+        abort.  A client that cannot be built disables the reader for the session.
+        """
+        from r1_llm import build_r1_judge_llm
+
+        if self._judge_llm is None:
+            try:
+                self._judge_llm = build_r1_judge_llm()
+            except Exception as exc:  # noqa: BLE001 - no client: no reading
+                self._turn_reader_unusable = True
+                _log.warn(
+                    "unknown_event",
+                    error_type="r1_turn_reader_unusable",
+                    error_category=_error_type_of(exc),
+                )
+                raise
+        parts: list[str] = []
+        async with self._judge_llm.chat(chat_ctx=_chat_context_from(messages)) as stream:
+            async for chunk in stream:
+                parts.append(delta_text(chunk))
+        return "".join(parts)
+
+    async def _run_turn_reader(
+        self,
+        runner: Callable[[list[dict[str, str]]], Awaitable[Any]],
+        messages: list[dict[str, str]],
+        started: float,
+        budget: float,
+    ) -> tuple[str, Any, float]:
+        """One reading, bounded by its own budget: ``(status, raw, seconds)``; never raises."""
+        loop = asyncio.get_running_loop()
+        try:
+            raw = await asyncio.wait_for(runner(messages), budget)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            return "timeout", None, loop.time() - started
+        except Exception as exc:  # noqa: BLE001 - a failed reading is recorded as one
+            _log.warn(
+                "unknown_event",
+                error_type="r1_turn_reader_failed",
+                error_category="call",
+                schema=_error_type_of(exc),
+            )
+            return "error", None, loop.time() - started
+        return "ok", raw, loop.time() - started
+
+    async def _finish_turn_reader(
+        self,
+        call: _TurnReaderCall,
+        index: int,
+        phase: str,
+        text: str,
+        r_sec: float,
+    ) -> None:
+        """Wait (in the background) for one row's reading and record it next to today's detectors.
+
+        The record and its log line hold labels only (``r1_turn_reader``): the status, the reader's
+        labels (``schema``) and today's detectors (``rejection_reason``), with the row's index and
+        phase.  ``turn_reader_call`` reports the reading's own time.
+        """
+        status, raw, seconds = await call.task
+        try:
+            reading = parse_reader(raw, text) if status == "ok" else None
+            if status == "ok" and reading is None:
+                status = "parse_failed"
+            regex = regex_labels(text, r_sec, extra=_SESSION_READERS)
+            self._reader_shadow.record(index, phase, status, reading, regex)
+            self._emit_latency(
+                "turn_reader_call", seconds, category=status, phase=phase, turn_index=index
+            )
+            _log.info(
+                "unknown_event",
+                error_type="r1_turn_reader",
+                error_category=status,
+                phase=phase,
+                turn_index=index,
+                schema=reader_code(reading),
+                rejection_reason=regex_code(regex),
+            )
+        except Exception as exc:  # noqa: BLE001 - a shadow record must never raise
+            _log.warn(
+                "unknown_event",
+                error_type="r1_turn_reader_failed",
+                error_category="record",
+                schema=_error_type_of(exc),
+            )
+
+    def _reader_facts(self) -> dict[str, Any] | None:
+        """The shadow record for ``session_facts`` (None when it fails: the facts go out without)."""
+        try:
+            return self._reader_shadow.payload()
+        except Exception as exc:  # noqa: BLE001 - never at the cost of the gate's facts
+            _log.warn(
+                "unknown_event",
+                error_type="r1_turn_reader_failed",
+                error_category="facts",
+                schema=_error_type_of(exc),
+            )
+            return None
+
     async def _settle_bare_yes(self, turn: _OpenTurn) -> bool:
         """True when a bare yes to L-ASIDE-END stood unanswered and so confirms the stop.
 
@@ -4687,6 +4970,8 @@ class R1Interview:
         self._settle_final.set()
         self._settle_change.set()
         self._speculate_end_intent()
+        # M032 S4: the shadow turn reader reads the row so far (last, and it can never raise here).
+        self._speculate_turn_reader(row)
 
     def _flush_candidate_row(self) -> None:
         """Write the open candidate row (all its finals, one space apart), once, then close it.
@@ -4709,6 +4994,8 @@ class R1Interview:
             row.ended_at_ms = self._candidate_turn_end(row)
             # The row is over: speech heard up to its last final is its own, never a later row's.
             self._raise_anchor_floor(row.last_final_at, commit=True)
+            # M032 S4: its shadow reading is recorded for it, off the speech path.
+            self._bind_turn_reader(row)
         return row
 
     def _candidate_turn_end(self, row: _CandidateRow) -> int | None:
