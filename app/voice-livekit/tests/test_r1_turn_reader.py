@@ -34,6 +34,7 @@ from r1_turn_reader import (
     LABEL_REGEX,
     READER_LABELS,
     READER_PROMPT_VERSION,
+    READER_SHADOW_MAX_BYTES,
     READER_SHADOW_MAX_ROWS,
     READER_SYSTEM,
     READER_TURN_CHARS,
@@ -479,18 +480,33 @@ class ShadowLogTests(unittest.TestCase):
 
     def test_the_rows_are_bounded_and_small(self):
         log = ReaderShadowLog()
-        everything = ReaderReading(READER_LABELS, "partly", READER_LABELS)
+        everything = ReaderReading(READER_LABELS, "partly", (*READER_LABELS, "answered_her_worry"))
         for index in range(READER_SHADOW_MAX_ROWS + 50):
-            log.record(index * 2 + 10_000, "roleplay", "ok", everything, tuple(REGEX_DETECTORS))
+            log.record(index * 2 + 10_000, "transition", "parse_failed", everything,
+                       tuple(REGEX_DETECTORS))
+        log.bind(99_999, "transition")
+        payload = log.payload()
+        rows = payload["reader_shadow"]
+        summary = payload["reader_agreement"]
+        self.assertEqual(summary["turns"], READER_SHADOW_MAX_ROWS + 51)
+        self.assertEqual(summary["rows_dropped"], READER_SHADOW_MAX_ROWS + 51 - len(rows))
+        self.assertEqual(summary["status"]["parse_failed"], READER_SHADOW_MAX_ROWS + 50)
+        # The API takes a 64 kB body per admin row, and this row is the one the scoring gate
+        # cannot pass without: the per-turn rows have a hard byte budget, so even this impossible
+        # worst case (every label, every detector and every rail on every turn) stays far inside.
+        self.assertLessEqual(len(json.dumps(rows)), READER_SHADOW_MAX_BYTES)
+        self.assertLess(len(json.dumps(payload)), READER_SHADOW_MAX_BYTES + 2_000)
+        self.assertGreater(len(rows), 10)  # the budget keeps rows; it only trims the tail
+
+    def test_a_usual_session_keeps_every_row_inside_the_byte_budget(self):
+        # About what a 20-minute role-play reads: one or two labels and detectors a turn.
+        log = ReaderShadowLog()
+        usual = ReaderReading(("offer", "question_to_her"), "partly", ("closing",))
+        for index in range(READER_SHADOW_MAX_ROWS):
+            log.record(index * 2 + 100, "roleplay", "ok", usual, ("callback", "dig", "handled"))
         payload = log.payload()
         self.assertEqual(len(payload["reader_shadow"]), READER_SHADOW_MAX_ROWS)
-        summary = payload["reader_agreement"]
-        self.assertEqual(summary["turns"], READER_SHADOW_MAX_ROWS + 50)
-        self.assertEqual(summary["rows_dropped"], 50)
-        self.assertEqual(summary["status"]["ok"], READER_SHADOW_MAX_ROWS + 50)
-        # The API takes a 64 kB body per admin row; even this impossible worst case (every label,
-        # every detector and every rail on every turn) stays well inside it.
-        self.assertLess(len(json.dumps(payload)), 48_000)
+        self.assertNotIn("rows_dropped", payload["reader_agreement"])
 
     def test_a_pending_row_beyond_the_bound_is_not_kept(self):
         log = ReaderShadowLog()

@@ -66,6 +66,7 @@ __all__ = [
     "READER_LABELS",
     "READER_PHASES",
     "READER_PROMPT_VERSION",
+    "READER_SHADOW_MAX_BYTES",
     "READER_SHADOW_MAX_ROWS",
     "READER_SYSTEM",
     "REGEX_DETECTORS",
@@ -118,6 +119,10 @@ READER_RAW_MAX_CHARS = 4000
 READER_REGEX_MAX_CHARS = 4000
 # Per-turn rows kept for ``session_facts`` (a role-play has about 30-40 candidate turns).
 READER_SHADOW_MAX_ROWS = 80
+# And their serialised size: the API takes a 64 kB body per admin row, and ``session_facts`` is the
+# row the scoring gate cannot pass without, so the shadow rows may never crowd it out.  A usual
+# session (one or two labels a turn) keeps all its rows; only an impossible one is trimmed.
+READER_SHADOW_MAX_BYTES = 24_000
 # Bump when READER_SYSTEM or a context line changes, so the owner's data names its prompt.
 READER_PROMPT_REVISION = 1
 
@@ -456,10 +461,12 @@ class ReaderShadowLog:
 
     Labels, phases, statuses and turn indices only.  ``bind`` marks a row whose reading is still
     on its way (reported as ``pending`` if the session ends first), ``record`` stores its result,
-    ``skip`` counts an acknowledgement-only row that was not read.
+    ``skip`` counts an acknowledgement-only row that was not read.  ``payload`` keeps the first
+    ``max_rows`` rows that fit in ``max_bytes`` of JSON; the counts always cover every turn.
     """
 
     max_rows: int = READER_SHADOW_MAX_ROWS
+    max_bytes: int = READER_SHADOW_MAX_BYTES
     _rows: list[dict[str, Any]] = field(default_factory=list)
     _pending: dict[int, str] = field(default_factory=dict)
     _turns: int = 0
@@ -532,18 +539,24 @@ class ReaderShadowLog:
         """``reader_shadow`` and ``reader_agreement`` for ``session_facts``; {} when nothing ran."""
         if not (self._turns or self._pending or self._skipped):
             return {}
-        rows = list(self._rows)
+        candidates = list(self._rows)
         for turn_index, phase in self._pending.items():
-            if len(rows) < self.max_rows:
-                rows.append(
-                    {
-                        "turn_index": turn_index,
-                        "phase": phase,
-                        "status": "pending",
-                        "reader": None,
-                        "regex": None,
-                    }
-                )
+            candidates.append(
+                {
+                    "turn_index": turn_index,
+                    "phase": phase,
+                    "status": "pending",
+                    "reader": None,
+                    "regex": None,
+                }
+            )
+        rows: list[dict[str, Any]] = []
+        size = 2  # "[]"
+        for row in candidates[: self.max_rows]:
+            size += len(json.dumps(row)) + 2  # and ", "
+            if size > self.max_bytes:
+                break
+            rows.append(row)
         status = dict(self._status)
         if self._pending:
             status["pending"] = len(self._pending)
