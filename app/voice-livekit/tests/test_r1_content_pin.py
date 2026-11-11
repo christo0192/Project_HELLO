@@ -129,8 +129,9 @@ import r1_world
 # refer-back and the decider and budget notes (L5, L7).
 # Revision 21 (M032 S5, owner go of 2026-11-11): Christy's voice text inside the interviewer prefix
 # and her delivery rider (R1_INTERVIEWER_VOICE).  The manifest pins the voiced prefix whatever the
-# flag says.
-PINNED_CONTENT_SHA256 = "bc0cb0793234630b69d71d62d8b19be009bfc9d78645648202bad97f2e13ddd1"
+# flag says.  Same revision: the icebreaker plan's objectives, fallback questions, per-turn notes and
+# "Take your time." (r1_icebreaker, R1_ICEBREAKER_PLAN).
+PINNED_CONTENT_SHA256 = "b13efb7a378b472ad79dca92886d9f4f7f09e29a6a8999b2138c93c16907eef9"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -142,6 +143,7 @@ CONTENT_MODULES = (
     "r1_negotiation",
     "r1_tracker",
     "r1_end_intent",
+    "r1_icebreaker",
     "r1_guard",
     "r1_prompts",
     "r1_content",

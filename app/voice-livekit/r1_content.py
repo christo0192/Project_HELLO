@@ -23,6 +23,7 @@ from typing import Any
 import r1_commitment
 import r1_end_intent
 import r1_guard
+import r1_icebreaker
 import r1_negotiation
 import r1_personas
 import r1_prompts
@@ -136,6 +137,9 @@ import r1_world
 #    per-turn delivery rider on the opening, icebreaker, transition and wrap-up notes
 #    (INTERVIEWER_DELIVERY_RIDER), both behind R1_INTERVIEWER_VOICE.  The manifest pins the prefix
 #    WITH the voice text, whatever the flag says, so the digest never depends on the environment.
+#    Same revision: the icebreaker plan (r1_icebreaker, R1_ICEBREAKER_PLAN): its objectives, their
+#    fallback questions, the per-turn notes that take the getting-to-know-you note's place and
+#    "Take your time." for a candidate who is thinking.
 CONTENT_REVISION = 21
 
 
@@ -423,6 +427,25 @@ def manifest() -> dict[str, Any]:
             "react_how_it_lands": r1_prompts.REACT_HOW_IT_LANDS,
             "reaction_only_note": r1_prompts.REACTION_ONLY_NOTE,
             "forced_note": r1_prompts.FORCED_NOTE,
+        },
+        "icebreaker": {
+            "objectives": [
+                {"id": item.id, "goal": item.goal, "restate": item.restate}
+                for item in r1_icebreaker.OBJECTIVES
+            ],
+            "free_restate": r1_icebreaker.FREE_RESTATE,
+            "take_your_time": r1_icebreaker.TAKE_YOUR_TIME,
+            "plan_note_head": r1_icebreaker.PLAN_NOTE_HEAD,
+            "plan_note_tail": r1_icebreaker.PLAN_NOTE_TAIL,
+            "asked_note": r1_icebreaker.ASKED_NOTE,
+            "skip_note": r1_icebreaker.SKIP_NOTE,
+            "job_notes": dict(r1_icebreaker.JOB_NOTES),
+            "constants": {
+                "thin_words": r1_icebreaker.THIN_WORDS,
+                "decline_max_words": r1_icebreaker.DECLINE_MAX_WORDS,
+                "max_holds": r1_icebreaker.MAX_HOLDS,
+                "max_follow_ups": r1_icebreaker.MAX_FOLLOW_UPS,
+            },
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

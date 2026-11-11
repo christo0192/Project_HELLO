@@ -3523,5 +3523,140 @@ def r1_guard_praise() -> str:
     return r1_guard.PRAISE
 
 
+IB_ANSWER = "I spent six years selling insurance policies to young families across the city."
+IB_FRAGMENT = "Yeah, I will just go ahead and pitch them and I will just. Start."
+
+
+class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
+    """M032 S5 item 3: each icebreaker reply is told what its question is FOR (plan ON).
+
+    The owner's call fda9e9f6, paraphrased: a fragment (#4) got a selling-scenario question (#5), a
+    skip request (#6) got the note's own label back (#7), and one answer committed as two turns
+    (#8/#9).  ``R1_ICEBREAKER_PLAN=0`` gives back today's icebreaker exactly.
+    """
+
+    async def rig(self, provider: FakeProvider | None = None, **flags: str) -> Rig:
+        with _env(**flags):
+            rig = Rig(provider=provider or TokenProvider("Got it. What does a normal day look like?"))
+            await rig.interview.say("L-OPEN")
+        return rig
+
+    def note(self, rig: Rig) -> str:
+        return rig.last_messages()[-2]["content"]
+
+    async def test_an_answer_asks_the_next_objective_with_the_plan_note(self):
+        import r1_icebreaker as ib
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE, INTERVIEWER_DELIVERY_RIDER
+
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        note = self.note(rig)
+        self.assertTrue(note.startswith(ib.PLAN_NOTE_HEAD))
+        self.assertIn(f'"{ib.OBJECTIVES[1].goal}"', note)
+        self.assertTrue(note.endswith(INTERVIEWER_DELIVERY_RIDER))  # the rider stays last
+        self.assertNotIn(GETTING_TO_KNOW_YOU_NOTE, note)
+        self.assertEqual(rig.last_messages()[0]["content"], interviewer_prefix())  # untouched
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I2")
+
+    async def test_a_fragment_gets_one_probe_on_the_same_objective(self):
+        import r1_icebreaker as ib
+
+        rig = await self.rig()
+        await rig.converse(IB_FRAGMENT)
+        note = self.note(rig)
+        self.assertIn("Their answer was short", note)
+        self.assertIn(f'"{ib.OBJECTIVES[0].goal}"', note)
+        self.assertIn("selling scenarios", note)  # never a #5-style scenario question
+
+    async def test_a_skip_request_gets_the_warm_clause_and_the_same_question(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse("Can we go straight to the role play?")
+        note = self.note(rig)
+        self.assertIn("get there soon", note)
+        self.assertIn('Never start with "I understand, but"', note)
+        self.assertNotIn("getting-to-know-you", note)
+
+    async def test_let_me_think_gets_take_your_time_and_no_model_call(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        calls, answers = len(rig.provider.calls), rig.machine.candidate_turns
+        spoken = await rig.converse("Hmm, let me think about that.")
+        self.assertEqual(spoken, "Take your time.")
+        self.assertEqual(len(rig.provider.calls), calls)  # nothing was asked of the model
+        self.assertEqual(rig.machine.candidate_turns, answers)  # not an answer to the soft exit
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I2")  # no advance
+
+    async def test_a_fully_blocked_reply_restates_the_current_question(self):
+        import r1_icebreaker as ib
+
+        rig = await self.rig(TokenProvider("Great, let's move into the role-play now."))
+        spoken = await rig.converse(IB_ANSWER)
+        self.assertEqual(spoken, ib.OBJECTIVES[1].restate)
+        self.assertNotEqual(spoken, FALLBACK_REPLY)
+
+    async def test_a_failed_model_call_restates_the_current_question(self):
+        import r1_icebreaker as ib
+
+        rig = await self.rig(FakeProvider(error=RuntimeError("provider down")))
+        spoken = await rig.converse(IB_ANSWER)
+        self.assertEqual(spoken, ib.OBJECTIVES[1].restate)
+
+    async def test_a_reply_cancelled_before_audio_is_undone_and_read_with_the_rest(self):
+        # #8/#9: the first half committed alone; its reply was cut before any audio by the rest of
+        # the answer.  The rest is read together with the first half, against the question that
+        # was really asked, so the plan moves on once and never probes an unasked objective.
+        rig = await self.rig()
+        message_id = "msg_lost"
+        rig.final(IB_ANSWER)
+        await rig.settle()
+        await rig.agent.on_user_turn_completed(
+            None, SimpleNamespace(text_content=IB_ANSWER, id=message_id)
+        )
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I2")
+        handle = FakeSpeechHandle("reply")
+        rig.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
+        )
+        handle.interrupted = True
+        handle.finish()  # cancelled before any audio: no speaking state, no item
+        await rig.settle()
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I1")  # undone
+        await rig.converse("And that's why I want to keep working with families.")
+        note = self.note(rig)
+        self.assertIn("then ask one short question", note)  # an ask, not a probe
+        self.assertIn('"what a typical day', note)
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I2")
+
+    async def test_at_the_soft_exit_a_thinking_turn_waits_like_an_unfinished_one(self):
+        rig = await self.rig()
+        rig.clock.advance(215)
+        rig.machine.candidate_turns = 4
+        self.assertIsNone(await rig.converse("Let me think about that."))
+        self.assertFalse(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNotNone(rig.interview._icebreaker_continuation_at)
+
+    async def test_the_flag_off_is_todays_icebreaker_exactly(self):
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE
+
+        rig = await self.rig(R1_ICEBREAKER_PLAN="0", R1_INTERVIEWER_VOICE="0")
+        with _env(R1_ICEBREAKER_PLAN="0", R1_INTERVIEWER_VOICE="0"):
+            await rig.converse(IB_FRAGMENT)
+            self.assertEqual(self.note(rig), GETTING_TO_KNOW_YOU_NOTE)
+            answers = rig.machine.candidate_turns
+            calls = len(rig.provider.calls)
+            spoken = await rig.converse("Hmm, let me think about that.")
+            self.assertNotEqual(spoken, "Take your time.")
+            self.assertEqual(len(rig.provider.calls), calls + 1)  # the model answers it
+            self.assertEqual(rig.machine.candidate_turns, answers + 1)  # and it counts, as today
+            blocked = TokenProvider("Great, let's move into the role-play now.")
+            self.assertEqual(await rig.converse(IB_ANSWER, provider=blocked), FALLBACK_REPLY)
+            rig.clock.advance(215)
+            rig.machine.candidate_turns = 4
+            self.assertIsNone(await rig.converse("Let me think about that."))
+            self.assertTrue(rig.interview._icebreaker_boundary_turn)  # today: it ends the phase
+
+
 if __name__ == "__main__":
     unittest.main()

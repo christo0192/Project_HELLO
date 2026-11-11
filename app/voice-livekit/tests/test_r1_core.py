@@ -5773,6 +5773,14 @@ class TestLlmFailureRecovery(R1TestCase):
 
     FALLBACK = FALLBACK_REPLY
 
+    async def asyncSetUp(self) -> None:
+        # M032 S5: with the icebreaker plan on, an icebreaker reply falls back to the plan's
+        # current question (TestLlmFailureRecoveryWithThePlan); these pin the guard's own line.
+        patcher = mock.patch.dict(os.environ, {"R1_ICEBREAKER_PLAN": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        await super().asyncSetUp()
+
     def provider(self, error: BaseException | None = None, *, reported: bool = False):
         interview = self.interview
 
@@ -5918,6 +5926,57 @@ class TestLlmFailureRecovery(R1TestCase):
 
     def enter_roleplay_from_transition(self) -> None:
         self.interview.machine.transition(R1Phase.ROLEPLAY)
+
+
+class TestLlmFailureRecoveryWithThePlan(R1TestCase):
+    """M032 S5: with the icebreaker plan on, a failed icebreaker reply asks the plan's question.
+
+    The candidate was clear; the provider was not, so "Sorry, what were you saying?" is the wrong
+    line (phone map, the missed recovery item).  The 3-failure abort is unchanged.
+    """
+
+    async def asyncSetUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {"R1_ICEBREAKER_PLAN": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        await super().asyncSetUp()
+
+    ANSWER = "I spent six years selling insurance policies to young families across the city."
+
+    async def test_a_failed_and_a_hung_icebreaker_reply_ask_the_current_question(self) -> None:
+        import r1_icebreaker as ib
+
+        def failing(_messages):
+            async def stream():
+                raise RuntimeError("provider unavailable")
+                yield ""  # pragma: no cover - makes this an async generator
+
+            return stream()
+
+        self.interview.prepare_turn(self.ANSWER, f"msg_{next(_IDS)}")
+        stream = self.interview.llm_node_stream(SimpleNamespace(items=[]), failing)
+        spoken = "".join([chunk async for chunk in stream]).strip()
+        self.assertEqual(spoken, ib.OBJECTIVES[1].restate)
+        self.assertEqual(self.interview._failures, 1)
+
+        async def hung(_messages):
+            await asyncio.Event().wait()
+            yield "never"
+
+        self.interview.prepare_turn(self.ANSWER, f"msg_{next(_IDS)}")
+        with mock.patch.object(r1_session, "TURN_DEADLINE_SECONDS", 0.05), mock.patch.object(
+            r1_session, "FILLER_AFTER_SECONDS", 5.0
+        ):
+            with self.assertRaises(TimeoutError):
+                async for _ in self.interview.llm_node_stream(
+                    SimpleNamespace(items=[]), lambda messages: hung(messages)
+                ):
+                    pass
+        restate = ib.OBJECTIVES[2].restate
+        await self.until(lambda: restate in self.session.spoken)
+        self.assertNotIn(FALLBACK_REPLY, self.session.spoken)
+        self.assertEqual(self.interview._failures, 2)
+        await self.flush()
 
 
 async def self_stream(*sentences: str):

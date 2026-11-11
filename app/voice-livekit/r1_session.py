@@ -205,6 +205,7 @@ from r1_end_intent import (
     prefilter_hit,
 )
 from r1_guard import FALLBACK_REPLY, StreamGuard
+from r1_icebreaker import IcebreakerPlan, icebreaker_plan_enabled, is_thinking
 from r1_latency import (
     GATE_PHASE,
     LatencyTracker,
@@ -1757,6 +1758,12 @@ class R1Interview:
         self._commit_floor: float = 0.0
         self._candidate_activity_at: float | None = None
         self._icebreaker_hold_since: float | None = None
+        # M032 S5: the icebreaker plan (``r1_icebreaker``; labels and counters only), the text of
+        # a turn whose reply was cancelled before any audio (read again with the turn after it,
+        # in memory only), and the current question, said if a reply to it fails outright.
+        self._icebreaker_plan = IcebreakerPlan()
+        self._icebreaker_carry = ""
+        self._icebreaker_fallback = ""
         self._roleplay_end_hold_since: float | None = None  # M2: the closing's hold
         self._replies_cancelled_before_audio = 0
         # When (``_clock``) the candidate began waiting for a reply nobody has heard yet: set when
@@ -3280,6 +3287,10 @@ class R1Interview:
             return None
         if is_unfinished_turn(text):
             return _DEFER_UNFINISHED
+        if icebreaker_plan_enabled() and is_thinking(text):
+            # M032 S5: "Let me think." once the exit is due is not the last answer either: the
+            # answer is still coming, so it waits like an unfinished turn (hard cap unchanged).
+            return _DEFER_UNFINISHED
         if (
             self._icebreaker_reply_cut
             and content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS
@@ -3362,6 +3373,8 @@ class R1Interview:
         """
         if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
             return
+        if icebreaker_plan_enabled() and is_thinking(text):
+            return  # M032 S5: "Let me think about that." answers nothing yet
         if content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS:
             self.machine.candidate_turns += 1
 
@@ -3621,6 +3634,12 @@ class R1Interview:
                 self._start_question = _EITHER_OR
             elif action == _TRANSITION_INVITE:
                 self._start_question = None  # "of course, go ahead": no start question
+            elif (
+                text
+                and phase in (R1Phase.OPENING, R1Phase.ICEBREAKER)
+                and icebreaker_plan_enabled()
+            ):
+                self._plan_icebreaker_reply(reply, text, index)
         self._last_reply = self._latest_reply = reply
         if self.machine.phase is R1Phase.WRAPUP:
             self._wrapup_answer_owed = reply
@@ -3628,6 +3647,67 @@ class R1Interview:
             self._replies[str(message_id)] = reply
             while len(self._replies) > _REPLIES_KEPT:
                 self._replies.pop(next(iter(self._replies)))
+
+    def _plan_icebreaker_reply(self, reply: Reply, text: str, index: int | None) -> None:
+        """M032 S5: decide what Christy's icebreaker reply is FOR (``r1_icebreaker``).
+
+        The plan reads the committed turn (with the text of a turn whose reply was cancelled
+        before any audio, when there is one: the two halves are one answer) and the reply gets
+        the plan's note, its question as the fallback line, or the scripted "Take your time."
+        instead of a model call.  One log line per decision, labels and counts only.
+        """
+        carried, self._icebreaker_carry = self._icebreaker_carry, ""
+        judged = f"{carried} {text}" if carried else text
+        job = self._icebreaker_plan.next_job(judged, content_words=content_word_count(judged))
+        reply.job = job
+        reply.note = job.note
+        reply.scripted = job.scripted
+        if not job.scripted:
+            reply.fallback = job.fallback
+            self._icebreaker_fallback = job.fallback
+        _log.info(
+            "unknown_event",
+            error_type="r1_icebreaker_job",
+            error_category=job.kind,
+            schema=job.disposition,
+            option_count=self._icebreaker_plan.cursor,
+            turn_index=index,
+        )
+
+    def _report_unheard_icebreaker(self, slot: _SpeechSlot) -> None:
+        """M032 S5: an icebreaker reply nobody heard is taken back from the plan.
+
+        It asked nothing, so the objective it moved on to was never put to the candidate; the
+        turn that follows (usually the rest of the same answer) is read together with this one.
+        """
+        reply = slot.reply
+        job = None if reply is None else reply.job
+        if job is None or slot.used:
+            return
+        if self._icebreaker_plan.reply_lost(job):
+            self._icebreaker_carry = reply.candidate_text
+            _log.info(
+                "unknown_event",
+                error_type="r1_icebreaker_job_undone",
+                error_category=job.kind,
+                option_count=self._icebreaker_plan.cursor,
+            )
+
+    def _log_icebreaker_plan(self) -> None:
+        """M032 S5: one line when the icebreaker ends: how far the plan got (counts only)."""
+        if not icebreaker_plan_enabled():
+            return
+        summary = self._icebreaker_plan.summary()
+        _log.info(
+            "unknown_event",
+            error_type="r1_icebreaker_plan",
+            error_category=f"reached_{len(summary['reached'])}",
+            schema=(
+                f"follow_ups_{summary['follow_ups']}_holds_{summary['holds']}"
+                f"_credited_{len(summary['credited'])}"
+            ),
+            option_count=summary["cursor"],
+        )
 
     def _queue_transition_line(self, action: str) -> None:
         """M1: hand the driver the scripted line a suppressed transition turn gets, if any."""
@@ -4564,8 +4644,15 @@ class R1Interview:
             or phase not in _REPLY_PHASES
         ):
             return
+        text = FALLBACK_REPLY
+        if (
+            phase in (R1Phase.OPENING, R1Phase.ICEBREAKER)
+            and self._icebreaker_fallback
+            and icebreaker_plan_enabled()
+        ):
+            text = self._icebreaker_fallback  # M032 S5: the current question, not "say again"
         await self._say_text(
-            FALLBACK_REPLY,
+            text,
             interruptible=True,
             marker="llm_recovery",
             voice=voice if voice in VOICES else self._voice_for_phase(phase),
@@ -4989,6 +5076,7 @@ class R1Interview:
             # reads.
             self._latency.reply_lost(slot.latency_turn)
         self._report_unheard_plan(slot)
+        self._report_unheard_icebreaker(slot)
         if (
             before_audio
             and self.machine.phase is R1Phase.ICEBREAKER
@@ -6380,6 +6468,7 @@ class R1Interview:
             await self.say("L-OPEN")
             self._enter(R1Phase.ICEBREAKER)
             stop = await self._run_icebreaker()
+            self._log_icebreaker_plan()
             if stop is not None:
                 outcome = await self._finish_stop(stop)
                 return outcome
