@@ -180,7 +180,8 @@ ASKED_DIRECTLY_NOTE = (
 )
 ANSWERED_YOU_NOTE = (
     "- The advisor just answered the question you asked. React to their answer first, in a few "
-    "words, saying how it lands for you."
+    "words, saying how it lands for you as a feeling, without repeating their promises "
+    "(placement, guarantees, refunds, success rates) back as facts."
 )
 # RCA END-5 (fda9e9f6 #73-#74): a hand-back (talk it over, then come back to us) was not heard
 # as easing off.
@@ -191,11 +192,16 @@ PRESSURE_EASED_NOTE = (
 # M032 SWEEP-1 (flag R1_PUSH_AFTER_REACTION): the advisor just answered the objection her last
 # line raised, and its push waits a turn, so this reply reacts to that answer (in every role-play
 # the push came on the very next line, after a token "[ack], but").  It asks or says how it lands
-# and never states a course fact (D-M032-7).  New wording under D-M032-4: listed for review.
+# and never states a course fact (D-M032-7).  New wording under D-M032-4: listed for review.  It
+# says how it lands as a feeling: the advisor's answer to F3 is often about placement or hiring,
+# and echoing that as a fact is the guard's outcome_or_policy_claim (review S1R-6: "Placement
+# support until I'm hired does sound reassuring." was replaced by the filler line).
 PUSH_REACT_NOTE = (
     "- React to what the advisor just said before anything else: pick up one specific thing they "
-    "said and say how it lands for you, or ask one short follow-up question about it. Do not raise "
-    "a new worry or a new topic this turn, and do not state course details yourself."
+    "said and say how it lands for you as a feeling, or ask one short follow-up question about "
+    "it. Do not repeat their promises (placement, guarantees, refunds, success rates) back as "
+    "facts, do not raise a new worry or a new topic this turn, and do not state course details "
+    "yourself."
 )
 # M032 S1 concern ledger (flag R1_CONCERN_LEDGER): what she already told the advisor, in
 # worker-authored words (never her own sentences), merged with the hollow-advisor note.
@@ -208,6 +214,12 @@ CONCERN_LABELS: tuple[tuple[str, str], ...] = (
 VOICED_CONCERNS_NOTE = (
     "- You have already told the advisor {concerns}. Do not say that again in any words: "
     "respond to what they just said."
+)
+# Review S1R-2: on a turn that asks her something directly the ledger yields to the question, so
+# the reply is never told both to answer honestly and never to say the honest answer.
+VOICED_CONCERNS_ASKED_NOTE = (
+    "- You have already told the advisor {concerns}. They asked you directly: if that is still "
+    "your honest answer, you may say it once more in a few fresh words, without dwelling on it."
 )
 HOLLOW_CONCERNS_NOTE = (
     "- The advisor said almost nothing. You have already told them {concerns}, so do not say "

@@ -141,7 +141,9 @@ import r1_world
 #    R1_PUSH_AFTER_REACTION): an unforced push waits a turn after the advisor answered its
 #    primary, and that reply reacts to the answer first (PUSH_REACT_NOTE).  No scripted line,
 #    brief, marker or variant changed; the graded moves, their deadlines and the forced path are
-#    as before.
+#    as before.  After the S1 review PUSH_REACT_NOTE and ANSWERED_YOU_NOTE say how it lands as a
+#    feeling (never the advisor's promises as facts) and VOICED_CONCERNS_ASKED_NOTE lets the
+#    ledger yield to a direct question.
 CONTENT_REVISION = 21
 
 
@@ -435,6 +437,7 @@ def manifest() -> dict[str, Any]:
             "push_react_note": r1_prompts.PUSH_REACT_NOTE,
             "concern_labels": [list(item) for item in r1_prompts.CONCERN_LABELS],
             "voiced_concerns_note": r1_prompts.VOICED_CONCERNS_NOTE,
+            "voiced_concerns_asked_note": r1_prompts.VOICED_CONCERNS_ASKED_NOTE,
             "hollow_concerns_note": r1_prompts.HOLLOW_CONCERNS_NOTE,
         },
         "end_intent": {

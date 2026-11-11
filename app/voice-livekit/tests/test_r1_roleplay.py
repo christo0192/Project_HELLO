@@ -8013,6 +8013,201 @@ class PushAfterReactionTests(unittest.TestCase):
         self.assertNotIn('curious about "', held.reminder)
         self.assertNotIn(CHECKIN_TEXT, held.reminder)
 
+    def test_a_confirmation_check_in_after_the_answer_still_holds_the_push(self):
+        """Review S1-R5: "..., does that make sense?" closes many answers.  It asks for no new point,
+        so the push still waits a turn, and the quiet reply carries no check-in note."""
+        s, held = self.primary_then_answer(answer=f"{F3_ANSWER} Does that make sense?")
+        self.assertIn("checkin", held.reasons)
+        self.assertEqual((held.mode, held.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_for_reaction", held.reasons)
+        self.assertNotIn(CHECKIN_TEXT, held.reminder)
+        self.assertNotIn('curious about "', held.reminder)
+
+    def test_the_held_reply_is_steered_away_from_repeating_promises(self):
+        """Review S1R-6: "say how it lands" after a placement-worded answer drew the claim back as
+        a fact (the guard's outcome_or_policy_claim, then the filler line)."""
+        placement = (
+            "Free videos give you no feedback; here mentors review your work and our placement "
+            "support stays with you until you are hired."
+        )
+        s, held = self.primary_then_answer(answer=placement)
+        self.assertIn("owed_deferred_for_reaction", held.reasons)
+        self.assertIn("as a feeling", held.reminder)
+        self.assertIn("Do not repeat their promises (placement", held.reminder)
+        # The reaction the note asks for passes the guard as it is.
+        out = s.eng.sanitize_reply(held, "That lands well, honestly. How often would a mentor look?")
+        self.assertEqual(out.text, "That lands well, honestly. How often would a mentor look?")
+
+
+def f4_primary_session(reply="That's a lot to take in on one call."):
+    """The strong script at 20 s an exchange up to F4's primary; returns the session and its R."""
+    s = Session(engine(), reply=reply)
+    for index, text in enumerate([*strong_script()[:-1], *[NEUTRAL] * 12]):
+        r = 20 + 20 * index
+        if s.say(text, r).move_id == r1_scheduler.F4_PRIMARY:
+            return s, r
+    raise AssertionError("F4-PRIMARY was never said")
+
+
+class S1ReviewFixTests(unittest.TestCase):
+    """The S1 reviews' findings, each as the shape that found it (synthetic advisor turns)."""
+
+    def test_s1r1_an_ask_after_the_f4_primary_gets_the_stall_at_once(self):
+        """S1R-1 / S1-R4: the negotiation leaves a call or enrolment ask right after F4's primary to
+        the F4 push (``ask_yields_to_owed_move``); the reaction hold took it and the stall then
+        answered the advisor's back-off a turn later (the owner's late-call shape)."""
+        from r1_prompts import PRESSURE_EASED_NOTE, PUSH_REACT_NOTE
+
+        for ask in (
+            "Would you be free for a quick call with our senior counsellor tomorrow at six?",
+            "The next batch may not even run, so unless you pay today you will lose your seat.",
+        ):
+            with self.subTest(ask=ask):
+                s, r = f4_primary_session()
+                plan = s.say(ask, r + 20)
+                self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, r1_scheduler.F4_PUSH))
+                self.assertIn("ask_yields_to_owed_move", plan.reasons)
+                self.assertNotIn("owed_deferred_for_reaction", plan.reasons)
+                self.assertNotIn(PUSH_REACT_NOTE, plan.reminder)
+                eased = s.say("Okay, you can talk it over at home and get back to us.", r + 40)
+                self.assertEqual((eased.mode, eased.move_id), (TurnMode.LLM_REPLY, None))
+                self.assertIn(PRESSURE_EASED_NOTE, eased.reminder)
+                self.assertNotIn("F4", react_holds(s))
+
+    def test_s1_r1_a_stall_volunteered_without_slack_leaves_the_spacing_alone(self):
+        """S1-R1: at 50-65 s an exchange the spacing a volunteered stall adds pushed F2 past its slip
+        limit; it counts only while the plan has S1 slack."""
+        s = Session(engine(), reply="I see.")
+        s.say(OPENER, 20)
+        self.assertEqual(s.say(PITCH, 85).move_id, F3_PRIMARY)  # 65 s an exchange
+        primary_turn = s.eng.scheduler._last_objection_turn
+        s.reply = "Enrolling feels like a big jump. I'd want to talk it over with my husband first."
+        plan = s.say(SHORT_ACK, 150)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn("husband", s.spoken[-1])
+        self.assertFalse(s.eng._s1_slack(150))
+        self.assertEqual(s.eng.scheduler._last_objection_turn, primary_turn)
+        self.assertEqual(s.eng.admin_log()["intents"]["volunteered_objections"], 0)
+
+    def test_s1_r2_an_advisor_who_asks_every_turn_gets_the_primary_within_the_bound(self):
+        """S1-R2: a question put to her every turn keeps a thread open every turn; the idle primary
+        waited as long as slack lasted (19 turns in the reviewer's run).  Now it waits until
+        ``IDLE_GAP_SLACK_TURNS`` turns without an objection, then once more to respond first."""
+        s = Session(engine())
+        r = after_f3(s)
+        moves = []
+        for step in range(8):
+            plan = s.say(NUMBER_QUESTION, r + 20 * step)
+            moves.append(plan.move_id)
+            if plan.move_id is not None:
+                break
+        self.assertEqual(moves[-1], r1_roleplay.F2_PRIMARY)
+        self.assertLessEqual(len(moves), r1_scheduler.IDLE_GAP_SLACK_TURNS - 1)
+
+    def test_s1_r2_one_slow_exchange_ends_the_s1_slack_at_once(self):
+        """S1-R2: the average of four turns took four turns to see a slowdown; the S1 waits and
+        holds judge slack at the slowest recent turn, while the holds of before keep the average."""
+        s = Session(engine())
+        sched = s.eng.scheduler
+        done = {F3_PRIMARY, F3_PUSH, r1_roleplay.F2_PRIMARY, r1_roleplay.F2_PUSH}
+        with mock.patch.object(sched, "is_delivered", side_effect=lambda move_id: move_id in done):
+            sched._gaps = [20.0, 20.0, 20.0, 20.0]
+            self.assertTrue(s.eng._s1_slack(200))
+            sched._gaps = [20.0, 20.0, 20.0, 45.0]
+            self.assertTrue(s.eng._ahead_of_pacing(200))  # at the average, 26 s
+            self.assertFalse(s.eng._s1_slack(200))  # F4: 200 + 45 * 17 > 930
+
+    def test_s1r4_s1_spends_slack_only_while_every_move_can_land_by_ten_minutes(self):
+        """S1R-4: a stop from R 10:00 is scored only with every family delivered, so S1 never
+        spreads them past where they can all land by then (2.5 turns a move)."""
+        s = Session(engine())
+        sched = s.eng.scheduler
+        sched._gaps = [20.0] * 4
+        done = {F3_PRIMARY, F3_PUSH, r1_roleplay.F2_PRIMARY, r1_roleplay.F2_PUSH}
+        with mock.patch.object(sched, "is_delivered", side_effect=lambda move_id: move_id in done):
+            self.assertTrue(s.eng._ahead_of_pacing(450))
+            self.assertFalse(s.eng._s1_slack(450))  # 450 + 20 * (1 + 2.5 * 4) = 670 > 600
+            self.assertTrue(s.eng._s1_slack(380))  # 380 + 220 = 600
+
+    def test_s1_r7_a_lost_commitment_line_said_again_stays_issued_once(self):
+        """S1-R7: the split replan gave back the lost COMMIT-STALL's issue and the revoice says the
+        line without issuing it, so it was delivered with "issued": 0."""
+
+        def run():
+            s = Session(engine())
+            script = list(strong_script()[:-1])
+            r = 20
+            for index in range(70):
+                text = script[index] if index < len(script) else SHORT_ACK
+                if r >= r1_roleplay.COMMIT_STALL_R_SEC:
+                    plan = s.eng.plan_turn(text, r)
+                    if plan.move_id == r1_roleplay.COMMIT_STALL:
+                        break
+                    s.eng.record_spoken(plan, s.eng.compose_speech(plan, "Okay.").text, r_sec=r)
+                else:
+                    s.say(text, r)
+                r += 20
+            else:
+                raise AssertionError("the 19:00 stall was never planned")
+            s.eng.reply_lost(plan)
+            again = s.eng.plan_turn("And the mentors help you with the projects as well.", r + 4)
+            self.assertIn("commitment_revoiced", again.reasons)
+            s.eng.record_spoken(again, again.scripted_text, r_sec=r + 5)
+            return {m["id"]: m for m in s.eng.scheduler.summary()["moves"]}[
+                r1_roleplay.COMMIT_STALL
+            ]
+
+        for env in ({}, ALL_OFF):
+            with self.subTest(flags="off" if env else "on"), flags(**env):
+                move = run()
+                self.assertEqual((move["status"], move["issued"]), ("delivered", 1))
+
+    def test_s1r3_a_dodge_of_her_question_is_not_called_an_answer(self):
+        """S1R-3: after "how many hours a week?" an off-topic statement was taken as the answer, and
+        ANSWERED_YOU_NOTE invited a token "That helps" to a non-answer."""
+        from r1_prompts import ANSWERED_YOU_NOTE
+
+        def asked(then):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.reply = "Thanks for calling. How many hours a week would it take?"
+            s.say("Happy to help. Tell me what you are looking for.", 40)
+            return s, s.say(then, 60)
+
+        s, dodge = asked("Our alumni work at big companies and our mentors are senior engineers.")
+        self.assertNotIn(ANSWERED_YOU_NOTE, dodge.reminder or "")
+        self.assertNotIn("answered", s.eng.admin_log()["intents"]["respond_first_holds"])
+        s, answer = asked("Most learners spend about eight hours a week on it, alongside work.")
+        self.assertIn(ANSWERED_YOU_NOTE, answer.reminder)
+
+    def test_s1r2_the_ledger_never_contradicts_a_direct_question_or_the_price_notes(self):
+        """S1R-2: "do not say that again in any words" sat next to "answer that first, plainly and
+        honestly" and the price notes' "say ... you need to think"."""
+        from r1_prompts import ASKED_DIRECTLY_NOTE, VOICED_CONCERNS_ASKED_NOTE, VOICED_CONCERNS_NOTE
+
+        s = Session(engine(), reply="I'll think it over and get back to you later.")
+        s.say(OPENER, 20)
+        s.say(SHORT_ACK, 40)
+        s.reply = "I see."
+        plan = s.say("So what do you want from me?", 60)
+        concerns = "that you want to think it over"
+        self.assertIn(ASKED_DIRECTLY_NOTE, plan.reminder)
+        self.assertIn(VOICED_CONCERNS_ASKED_NOTE.format(concerns=concerns), plan.reminder)
+        self.assertNotIn(VOICED_CONCERNS_NOTE.format(concerns=concerns), plan.reminder)
+        # A turn that puts nothing to her keeps the plain ledger note.
+        plain = s.say(SHORT_ACK, 80)
+        self.assertEqual(plain.mode, TurnMode.LLM_REPLY)
+        self.assertIn(VOICED_CONCERNS_NOTE.format(concerns=concerns), plain.reminder)
+        # On a price-wrap reply the price notes tell her to say she needs to think: that theme is
+        # left out of the ledger there, the others stay.
+        s.eng._concerns = {"think_over": 1, "trust": 1}
+        notes = s.eng._standing_notes(
+            mode=TurnMode.LLM_REPLY, move_id=None, price_wrap=True, intent=None
+        )
+        text = "\n".join(notes)
+        self.assertNotIn("want to think it over", text)
+        self.assertIn("proof before trusting it", text)
+
 
 if __name__ == "__main__":
     unittest.main()

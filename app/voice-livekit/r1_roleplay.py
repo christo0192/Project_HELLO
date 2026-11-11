@@ -203,6 +203,7 @@ from r1_prompts import (
     STYLE_NOTES,
     TEMPLATE_USED_NOTE,
     TRY_NOT_GRANTED_NOTE,
+    VOICED_CONCERNS_ASKED_NOTE,
     VOICED_CONCERNS_NOTE,
     control_prose,
     format_usd,
@@ -258,6 +259,7 @@ from r1_text import (
     PHRASE_TEMPLATE_Q,
     SpokenMemory,
     CONCERN_PRESSURE,
+    CONCERN_THINK_OVER,
     canonical_amounts,
     concern_themes,
     dollar_amounts,
@@ -2048,12 +2050,13 @@ class RolePlayEngine:
         elif kind == "challenge" and move_id in self._challenge_deferred:
             self._challenge_deferred.remove(move_id)
 
-    def _voiced_concerns(self) -> str:
+    def _voiced_concerns(self, *, skip: frozenset[str] = frozenset()) -> str:
         """The themes she already voiced, as worker-authored clauses joined by "and" (item 5)."""
         labels = [
             label
             for theme, label in CONCERN_LABELS
-            if self._concerns.get(theme, 0) >= CONCERN_THRESHOLDS.get(theme, 1)
+            if theme not in skip
+            and self._concerns.get(theme, 0) >= CONCERN_THRESHOLDS.get(theme, 1)
         ]
         return " and ".join(labels)
 
@@ -2304,16 +2307,23 @@ class RolePlayEngine:
             topics = "; ".join(labels[topic] for topic in self._answered if topic in labels)
             if topics:
                 notes.append(ANSWERED_NOTE.format(topics=topics))
+        # M032 S1 item 5.  The ledger never contradicts another note of the same reply (review
+        # S1R-2): on a price-wrap turn the price notes tell her to say she needs to think, so that
+        # theme is left out; and a question put to her directly may get the honest answer again.
         concerns = (
-            self._voiced_concerns()
+            self._voiced_concerns(
+                skip=frozenset({CONCERN_THINK_OVER}) if price_wrap else frozenset()
+            )
             if mode is TurnMode.LLM_REPLY and flag_on(FLAG_CONCERN_LEDGER)
             else ""
         )
         if mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
-            # M032 S1 item 5: merged with what she already said, so the two never pull apart.
+            # Merged with what she already said, so the two never pull apart.
             notes.append(
                 HOLLOW_CONCERNS_NOTE.format(concerns=concerns) if concerns else HOLLOW_NOTE
             )
+        elif concerns and RESPOND_QUESTION in self._turn_kinds:
+            notes.append(VOICED_CONCERNS_ASKED_NOTE.format(concerns=concerns))
         elif concerns:
             notes.append(VOICED_CONCERNS_NOTE.format(concerns=concerns))
         if (

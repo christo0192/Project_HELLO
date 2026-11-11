@@ -132,8 +132,10 @@ import r1_world
 # ASKED_DIRECTLY_NOTE, ANSWERED_YOU_NOTE, PRESSURE_EASED_NOTE) and concern-ledger notes
 # (CONCERN_LABELS, VOICED_CONCERNS_NOTE, HOLLOW_CONCERNS_NOTE) join the manifest, and so does
 # SWEEP-1's PUSH_REACT_NOTE (the push waits for her reaction).  No scripted line, brief, marker
-# or variant changed.
-PINNED_CONTENT_SHA256 = "b94547046a1b40a7baa2b467753c91e44f068834044f362cd040ece397b599b8"
+# or variant changed.  The S1 review then reworded PUSH_REACT_NOTE and ANSWERED_YOU_NOTE (say how
+# it lands as a feeling, never the advisor's promises as facts) and added
+# VOICED_CONCERNS_ASKED_NOTE (the ledger yields to a direct question).
+PINNED_CONTENT_SHA256 = "c2e33bb99acafacd6a477795c350e4a6a7e5b82103bae8a2dd82613d46edc78e"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -307,6 +309,7 @@ class PinTests(unittest.TestCase):
             (r1_prompts, "OFFER_MADE_NOTE", "- Take the offer."),
             (r1_prompts, "VOICED_CONCERNS_NOTE", "- {concerns}."),
             (r1_prompts, "PUSH_REACT_NOTE", "- React."),
+            (r1_prompts, "VOICED_CONCERNS_ASKED_NOTE", "- {concerns} again."),
             (r1_prompts, "INTENT_PRICE_NOTE", "- Do not push on price."),
             (r1_prompts, "FORCED_NOTE", "- Link it."),
         ):
