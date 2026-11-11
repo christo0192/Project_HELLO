@@ -139,7 +139,10 @@ import r1_world
 #    WITH the voice text, whatever the flag says, so the digest never depends on the environment.
 #    Same revision: the icebreaker plan (r1_icebreaker, R1_ICEBREAKER_PLAN): its objectives, their
 #    fallback questions, the per-turn notes that take the getting-to-know-you note's place and
-#    "Take your time." for a candidate who is thinking.
+#    "Take your time." for a candidate who is thinking.  Same revision: the transition bridge
+#    (R1_TRANSITION_BRIDGE, off by default): the note Christy's one-sentence reaction to the last
+#    icebreaker answer is composed under, its limits, and L-TRANSITION-BRIDGED, the brief without
+#    "Thank you, {first_name}." that follows the reaction.
 CONTENT_REVISION = 21
 
 
@@ -445,6 +448,12 @@ def manifest() -> dict[str, Any]:
                 "decline_max_words": r1_icebreaker.DECLINE_MAX_WORDS,
                 "max_holds": r1_icebreaker.MAX_HOLDS,
                 "max_follow_ups": r1_icebreaker.MAX_FOLLOW_UPS,
+            },
+            "transition_bridge": {
+                "note": r1_icebreaker.BRIDGE_NOTE,
+                "timeout_sec": r1_icebreaker.BRIDGE_TIMEOUT_SEC,
+                "min_words": r1_icebreaker.BRIDGE_MIN_WORDS,
+                "max_words": r1_icebreaker.BRIDGE_MAX_WORDS,
             },
         },
         "end_intent": {

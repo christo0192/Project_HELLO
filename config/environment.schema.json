@@ -234,6 +234,7 @@
         "R1_BARE_YES_SETTLE_SEC": { "requiredInProduction": false, "secret": false },
         "R1_INTERVIEWER_VOICE": { "requiredInProduction": false, "secret": false },
         "R1_ICEBREAKER_PLAN": { "requiredInProduction": false, "secret": false },
+        "R1_TRANSITION_BRIDGE": { "requiredInProduction": false, "secret": false },
         "R1_TTS_FLUSH_MIN_CHARS": { "requiredInProduction": false, "secret": false },
         "R1_LINE_CACHE": { "requiredInProduction": false, "secret": false },
         "R1_SYNTH_PER_MIN": { "requiredInProduction": false, "secret": false },

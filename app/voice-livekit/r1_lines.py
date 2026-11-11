@@ -32,6 +32,17 @@ LINES = {
         "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
         "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
     ),
+    "L-TRANSITION-BRIDGED": (
+        "We'll now move to the role-play. I'll play a prospective "
+        "learner so we can evaluate how you handle a real sales call. The learner is "
+        "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
+        "Science course a few days ago. You're the Program Advisor calling her back. The "
+        "role-play runs for up to twenty minutes, and in that time your goal is to convince "
+        "her: understand her needs and help her decide to enrol, as you would on a real call, "
+        "using the course details from your preparation guide. I'll stay in character until I "
+        "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
+        "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
+    ),
     "L-PICKUP": "Hello? Yes, this is Meera speaking.",
     "L-TRANSITION-NUDGE": "Whenever you're ready, just say ready.",
     "L-TIME-CUE": "Just so you know, I've only got a couple of minutes before my next call.",

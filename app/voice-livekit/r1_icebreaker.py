@@ -15,11 +15,18 @@ One decision per committed icebreaker answer (``IcebreakerPlan.next_job``), read
   same objective again, after a short answer or one warm clause, at most ``MAX_HOLDS`` times;
 * "let me think": "Take your time." and nothing else (no advance, nothing counted).
 
+The transition bridge (M032 S5 item 4) lives here too, as pure pieces: whether the answer that
+ended the icebreaker deserves a reaction (``bridge_wanted``), the note the reaction is composed
+under (``BRIDGE_NOTE``) and the vetting of what came back (``clean_bridge``).  The session composes
+it out of band at the boundary and speaks it, then the brief without its "Thank you, {first_name}."
+(L-TRANSITION-BRIDGED); anything not clean says nothing extra and the brief plays as before.
+
 Invariants: pure (no I/O, no clock, no SDK, no asyncio) and never imports the phone lane; the plan
 keeps labels and counters only, never candidate text; every note keeps the getting-to-know-you
 note's guard rails word for word and never names this part of the interview; the pacing (the soft
 exit at S >= 3:30 with four answers, the hard stop at S = 4:30) is ``r1_phases``' and unchanged.
-``R1_ICEBREAKER_PLAN=0`` turns the plan off and the session is exactly as before.
+``R1_ICEBREAKER_PLAN=0`` turns the plan off and the session is exactly as before.  The bridge
+ships OFF (``R1_TRANSITION_BRIDGE``, see ``transition_bridge_enabled``).
 """
 from __future__ import annotations
 
@@ -28,6 +35,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from r1_guard import GuardContext, check_sentence, praise_detected
 from r1_text import fold, split_sentences
 
 # Dispositions of one committed icebreaker answer.
@@ -552,3 +560,87 @@ class IcebreakerPlan:
             f"reached_{reached}",
             f"follow_ups_{follow_ups}_holds_{holds}_credited_{credited}",
         )
+
+
+# --- the transition bridge (M032 S5 item 4) ---------------------------------------------------
+#
+# The owner's #22 -> #23: a reflective last answer got only "Thank you, {first_name}." and then the
+# 44 s brief.  The turn that ends the icebreaker gets no reply of its own (the boundary line answers
+# it), so the reaction is composed out of band, under its own note, and spoken only when it is one
+# plain sentence that asks nothing, thanks nobody, praises nothing and says nothing about what
+# comes next.  Otherwise nothing extra is said and L-TRANSITION plays exactly as before.
+#
+# It ships OFF.  The plan allows about 1.5 s at the boundary.  The added silence before Christy's
+# first word is the compose call (the whole sentence before any of it can be vetted), the first
+# request on a client the replies have not warmed, and the live synthesis of a line the cache
+# cannot hold, where today the cached brief starts at once.  An estimate from the owner's call
+# fda9e9f6 (no live measurement was possible offline): Christy's generated icebreaker replies
+# started 2.5-3.7 s after the candidate stopped (median 2.95 s, 8 replies), her cached lines
+# 1.4-2.3 s (the brief itself 2.3 s).  That difference, plus a cold client, is about 1.2-1.8 s
+# typically and up to about 2.6 s; a compose that times out is BRIDGE_TIMEOUT_SEC of extra
+# silence and no reaction at all.  Measure ``transition_bridge`` and ``say_to_first_audio``
+# (``transition_bridge``) on a test call before turning it on.
+BRIDGE_NOTE = (
+    "INTERVIEW NOTE (not spoken; never mention it). Reply with one short sentence, at most "
+    "twelve words, that reacts warmly to one specific thing they just said. No question, no "
+    "thanks, no praise or judgement of the answer, nothing about what comes next, and no "
+    "goodbye."
+)
+# The compose budget, from the start of the call; a reaction that is later says nothing.
+BRIDGE_TIMEOUT_SEC = 1.5
+# A reaction is a few words about something they said ("Right." is not one), and short.
+BRIDGE_MIN_WORDS = 4
+BRIDGE_MAX_WORDS = 16
+# What the brief already does or must not be pre-empted: what comes next, thanks, a goodbye.
+# Broad on purpose: a word too many only means the brief plays without a reaction, as today.
+_BRIDGE_FORWARD_RE = re.compile(
+    r"\b(?:role ?plays?|roleplays?|role playing|next|move on|moving on|move (?:to|into|ahead)|"
+    r"moving (?:to|into|ahead)|let's|let us|brings? us|interview|learner|scenario|brief|ready|"
+    r"begin|start (?:the|our|with))\b"
+)
+_BRIDGE_THANKS_RE = re.compile(r"\b(?:thank you|thanks|thank|appreciate|grateful)\b")
+_BRIDGE_GOODBYE_RE = re.compile(r"\b(?:goodbye|good bye|bye|farewell|take care|see you)\b")
+_BRIDGE_QUOTES = "\"'\u201c\u201d\u2018\u2019 "
+_ON_VALUES = frozenset({"1", "on", "true", "yes"})
+
+
+def transition_bridge_enabled() -> bool:
+    """``R1_TRANSITION_BRIDGE`` (default OFF: its boundary cost is above the plan's ~1.5 s).
+
+    Turn it on with ``fly secrets set R1_TRANSITION_BRIDGE=1 -a project-hello-voice``; unset or
+    ``0`` is today's transition exactly.
+    """
+    return (os.getenv("R1_TRANSITION_BRIDGE") or "0").strip().lower() in _ON_VALUES
+
+
+def bridge_wanted(text: object, *, content_words: int) -> bool:
+    """True when the answer that ended the icebreaker is one worth reacting to.
+
+    Only a real answer (``disposition`` ANSWERED) that asks Christy nothing and asks to skip
+    nothing: a fragment, a yes, "let me think", a question or a decline gets the brief alone.
+    """
+    reading = disposition(text, content_words=content_words)
+    return reading.kind == ANSWERED and not reading.asked and not reading.skip
+
+
+def clean_bridge(text: object, ctx: GuardContext) -> str | None:
+    """The composed reaction when it may be spoken as it is, else None (nothing extra is said).
+
+    One sentence of ``BRIDGE_MIN_WORDS`` to ``BRIDGE_MAX_WORDS`` words with no question mark, no
+    thanks (the brief's own opener is gone, not moved), no goodbye, nothing about what comes next,
+    no praise of the answer (``praise_detected``) and no hit of the output guard in ``ctx`` (the
+    icebreaker's rules, with the echo check over the prompts in play).  Never rewritten: a
+    sentence that needs an edit is dropped.
+    """
+    raw = " ".join(str(text or "").split()).strip(_BRIDGE_QUOTES)
+    if not raw or "?" in raw or len(split_sentences(raw)) != 1:
+        return None
+    plain = _plain(raw)
+    if not BRIDGE_MIN_WORDS <= len(plain.split()) <= BRIDGE_MAX_WORDS:
+        return None
+    for pattern in (_BRIDGE_FORWARD_RE, _BRIDGE_THANKS_RE, _BRIDGE_GOODBYE_RE):
+        if pattern.search(plain) is not None:
+            return None
+    if praise_detected(raw) or check_sentence(raw, ctx):
+        return None
+    return raw

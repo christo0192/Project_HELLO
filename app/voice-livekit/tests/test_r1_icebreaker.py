@@ -390,6 +390,97 @@ class TestPlan(unittest.TestCase):
         )
 
 
+class TestTransitionBridge(unittest.TestCase):
+    """M032 S5 item 4: one guarded reaction sentence to the boundary answer, or nothing.
+
+    #22 -> #23: a reflective last answer got only "Thank you, {name}." and a 44 s brief.  The
+    sentence is composed out of band and spoken only when it is clean.
+    """
+
+    CTX = GuardContext(phase="icebreaker", praise_check=True)
+
+    def test_a_clean_short_reaction_passes_as_it_is(self):
+        for text in (
+            "So for you it's really about the person you're talking to in that moment.",
+            "  Staying with the conversation instead of the outcome, that makes sense.  ",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(ib.clean_bridge(text, self.CTX), text.strip())
+
+    def test_anything_but_one_plain_reaction_sentence_is_dropped(self):
+        for text in (
+            "",
+            "   ",
+            None,
+            "What made you think that way?",  # a question
+            "That makes sense. Let's move on.",  # two sentences
+            "Thank you for sharing that with me.",  # L-TRANSITION's own opener
+            "That's impressive.",  # praise
+            "Eight years is solid experience.",
+            "Great, now we move to the role-play.",  # what comes next
+            "That brings us to the next part of the interview.",
+            "Goodbye for now.",
+            "So for you it's about the person you're talking to in that very moment and not "
+            "about whatever the final number turns out to be.",  # too long
+            "Right.",  # too short to be a reaction to anything
+            "You're hired.",  # a guard hit
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(ib.clean_bridge(text, self.CTX))
+
+    def test_quotes_around_the_sentence_are_not_spoken(self):
+        self.assertEqual(
+            ib.clean_bridge('"That sounds like a long week on the phones."', self.CTX),
+            "That sounds like a long week on the phones.",
+        )
+
+    def test_praise_the_learner_and_an_echo_of_the_note_are_dropped(self):
+        echo_ctx = GuardContext(
+            phase="icebreaker", praise_check=True, control_texts=(ib.BRIDGE_NOTE,)
+        )
+        for text in (
+            "You clearly know your customers well.",
+            "Your patience with that parent shows real dedication.",
+            "That will help you a lot with the learner.",
+            "I'll react warmly to one specific thing they just said.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(ib.clean_bridge(text, echo_ctx))
+
+    def test_only_a_substantive_boundary_answer_gets_one(self):
+        self.assertTrue(ib.bridge_wanted(SUBSTANTIVE, content_words=words(SUBSTANTIVE)))
+        for text in (
+            FRAGMENT,
+            "Yes.",
+            "Let me think.",
+            "Can we go straight to the role play?",
+            "Sorry, what do you mean by a typical day?",
+            "I'd rather not say.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(ib.bridge_wanted(text, content_words=words(text)))
+
+    def test_the_note_asks_for_one_short_sentence_with_no_question(self):
+        lowered = ib.BRIDGE_NOTE.lower()
+        for phrase in ("one short sentence", "no question", "no thanks", "no praise",
+                       "nothing about what comes next", "goodbye"):
+            self.assertIn(phrase, lowered)
+        self.assertNotIn("role-play", lowered)  # nothing to copy
+        self.assertLessEqual(ib.BRIDGE_TIMEOUT_SEC, 1.5)
+
+    def test_the_bridge_flag_ships_off_and_turns_on(self):
+        # Off by default: the measured boundary cost is above the ~1.5 s the plan allows
+        # (r1_icebreaker's module notes).
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("R1_TRANSITION_BRIDGE", None)
+            self.assertFalse(ib.transition_bridge_enabled())
+        for on in ("1", "on", "true", "yes", " ON "):
+            with mock.patch.dict(os.environ, {"R1_TRANSITION_BRIDGE": on}):
+                self.assertTrue(ib.transition_bridge_enabled())
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_BRIDGE": "0"}):
+            self.assertFalse(ib.transition_bridge_enabled())
+
+
 class TestFlags(unittest.TestCase):
     def test_the_plan_flag_defaults_on_and_turns_off(self):
         with mock.patch.dict(os.environ, {}, clear=False):

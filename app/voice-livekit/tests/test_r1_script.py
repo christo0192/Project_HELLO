@@ -411,5 +411,27 @@ class ConsensualEndLineTests(unittest.TestCase):
         self.assertNotIn("pause the role-play", LINES["L-ASIDE-WRAP-RESUME"].lower())
 
 
+class TransitionBridgeLineTests(unittest.TestCase):
+    """M032 S5 item 4: the brief after Christy's own reaction does not thank the candidate again.
+
+    L-TRANSITION-BRIDGED is L-TRANSITION without "Thank you, {first_name}." (the reaction sentence
+    took its place), so it carries no candidate name and can be kept on disk once per machine.
+    """
+
+    OPENER = "Thank you, {first_name}. "
+
+    def test_it_is_the_brief_without_its_thanks(self):
+        self.assertTrue(LINES["L-TRANSITION"].startswith(self.OPENER))
+        self.assertEqual(
+            LINES["L-TRANSITION-BRIDGED"], LINES["L-TRANSITION"][len(self.OPENER) :]
+        )
+        self.assertEqual(placeholders("L-TRANSITION-BRIDGED"), {"lead_name", "lead_city"})
+        self.assertIn("L-TRANSITION-BRIDGED", CANDIDATE_FREE_LINES)
+        self.assertNotIn("thank", LINES["L-TRANSITION-BRIDGED"].lower())
+        self.assertTrue(LINES["L-TRANSITION-BRIDGED"].endswith(
+            "Shall we start the role-play now, or do you have any questions first?"
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

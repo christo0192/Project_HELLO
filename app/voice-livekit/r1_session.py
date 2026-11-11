@@ -177,6 +177,11 @@ Owner and manager decisions of 2026-11-03 (mock call aa166f09) change the way in
   (``_close_roleplay_on_time``): the candidate's turn in flight is waited for, then the learner's
   L-TIME-UP, then L-EXIT.  L-ASIDE-END, the bare yes, the end-intent model and the 10:00 scoring
   gate are unchanged; an end request from 14:00 is still a farewell on the close ladder.
+
+M032 S5 (owner go of 2026-11-11, test fda9e9f6): Christy's voice and delivery rider
+(``R1_INTERVIEWER_VOICE``), the icebreaker plan (``r1_icebreaker``, ``R1_ICEBREAKER_PLAN``) and the
+transition bridge (``_say_brief``, ``R1_TRANSITION_BRIDGE``, off by default): one guarded sentence
+reacting to the answer that ended the icebreaker, composed out of band, then L-TRANSITION-BRIDGED.
 """
 from __future__ import annotations
 
@@ -205,7 +210,16 @@ from r1_end_intent import (
     prefilter_hit,
 )
 from r1_guard import FALLBACK_REPLY, StreamGuard
-from r1_icebreaker import IcebreakerPlan, icebreaker_plan_enabled, is_thinking
+from r1_icebreaker import (
+    BRIDGE_NOTE,
+    BRIDGE_TIMEOUT_SEC,
+    IcebreakerPlan,
+    bridge_wanted,
+    clean_bridge,
+    icebreaker_plan_enabled,
+    is_thinking,
+    transition_bridge_enabled,
+)
 from r1_latency import (
     GATE_PHASE,
     LatencyTracker,
@@ -237,9 +251,11 @@ from r1_replies import (
 )
 from r1_prompts import (
     ROLEPLAY_PHASE,
+    assemble_messages,
     control_prose,
     interviewer_prefix,
     interviewer_voice_enabled,
+    select_context,
 )
 from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
 from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
@@ -604,6 +620,12 @@ _WARM_ORDER = (
     "L-SIL-END",
     "L-SYSTEM-STOP",
 )
+# M032 S5 item 4: the brief that follows Christy's reaction plays only behind the transition
+# bridge, which ships off, so it is warmed (right after L-TRANSITION) only while the bridge is on:
+# off, the warm-up spends exactly today's Sarvam requests (``R1Interview._warm_order``).
+_BRIDGED_BRIEF = "L-TRANSITION-BRIDGED"
+# The marker of the reaction sentence's speech (latency and line-cache lines; never its words).
+_BRIDGE_MARKER = "transition_bridge"
 # Line-cache events that mean something went wrong (logged as warnings).
 _LINE_CACHE_WARNINGS = frozenset(
     {
@@ -653,6 +675,7 @@ _SAY_READY = "say_ready"
 _BARE_NO_WORDS = frozenset({"no", "nope", "nah", "none", "nothing"})
 _START_QUESTION_OF_LINE = {
     "L-TRANSITION": _EITHER_OR,
+    "L-TRANSITION-BRIDGED": _EITHER_OR,  # M032 S5: the same brief, after Christy's reaction
     "L-TRANSITION-REASK": _YES_NO,
     "L-TRANSITION-STEER": _YES_NO,
     "L-TRANSITION-REASK-2": _SAY_READY,
@@ -1685,6 +1708,7 @@ class R1Interview:
         line_cache: LineCache | None = None,
         rate_limits: RateLimitCounter | None = None,
         end_intent_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
+        bridge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
     ) -> None:
         self.ctx = ctx
         self.context = context
@@ -1867,6 +1891,16 @@ class R1Interview:
         # M032 S5: Christy's voice (``R1_INTERVIEWER_VOICE``), read once, so the interviewer
         # prefix (the DeepSeek cache prefix) stays byte-stable for the whole session.
         self._interviewer_voice = interviewer_voice_enabled()
+        # M032 S5 item 4, the transition bridge (``R1_TRANSITION_BRIDGE``, off by default): the
+        # injectable compose call (like ``end_intent_runner``; the default asks R1's own client,
+        # only when the session has an LLM), that client, and the history entries of the turns
+        # that ended the icebreaker with no reply of their own (the boundary answer).
+        self._bridge_runner = bridge_runner
+        self._bridge_llm: Any = None
+        self._icebreaker_boundary_entries: list[dict[str, Any]] = []
+        # The brief the candidate heard (L-TRANSITION, or L-TRANSITION-BRIDGED after the
+        # bridge's reaction): what a request to hear it again replays (``_repeat_brief``).
+        self._brief_line = "L-TRANSITION"
         self._turn_finals: list[str] = []
         self._end_intent_call: _EndIntentCall | None = None
         self._end_intent_seq = 0
@@ -2853,7 +2887,7 @@ class R1Interview:
         line is warmed in the voice ``say`` speaks it in (the learner's for ``_LEARNER_LINES``).
         """
         specs: list[LineSpec] = []
-        for line_id in _WARM_ORDER:
+        for line_id in self._warm_order():
             if is_candidate_free(line_id) is not candidate_free:
                 continue
             try:
@@ -2863,6 +2897,14 @@ class R1Interview:
             voice = LEARNER if line_id in _LEARNER_LINES else INTERVIEWER
             specs.append(LineSpec(line_id, text, persist=candidate_free, voice=voice))
         return specs
+
+    @staticmethod
+    def _warm_order() -> tuple[str, ...]:
+        """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on."""
+        if not transition_bridge_enabled():
+            return _WARM_ORDER
+        index = _WARM_ORDER.index("L-TRANSITION") + 1
+        return (*_WARM_ORDER[:index], _BRIDGED_BRIEF, *_WARM_ORDER[index:])
 
     def _start_line_warmup(self, *, candidate_free: bool) -> None:
         """Warm one group of lines in the background.
@@ -3592,6 +3634,10 @@ class R1Interview:
                     and phase is R1Phase.ICEBREAKER
                     and self.machine.icebreaker_should_end()
                 ):
+                    if entry is not None:
+                        # M032 S5 item 4: part of the last answer, which no reply answers (the
+                        # transition bridge may react to it once the icebreaker is over).
+                        self._icebreaker_boundary_entries.append(entry)
                     if deferral == _DEFER_UNFINISHED:
                         # A1: not the last answer.  No reply (it would talk over the rest of the
                         # thought); the next committed turn, or a short quiet, ends the phase.
@@ -6119,6 +6165,134 @@ class R1Interview:
                 if value is not None:
                     return value
 
+    # ------------------------------------------------------- M032 S5: the transition bridge
+
+    async def _say_brief(self) -> None:
+        """The brief that opens the transition: L-TRANSITION, or a reaction and then the brief.
+
+        M032 S5 item 4 (``R1_TRANSITION_BRIDGE``, off by default).  When ``_transition_bridge``
+        has one clean sentence of Christy's own about the answer that ended the icebreaker, it is
+        spoken first and the brief follows without its "Thank you, {first_name}."
+        (L-TRANSITION-BRIDGED); both are uninterruptible, as the brief always was.  Otherwise
+        L-TRANSITION plays exactly as before.
+        """
+        reaction = await self._transition_bridge()
+        if reaction is None:
+            await self.say("L-TRANSITION")
+            return
+        await self._say_text(
+            reaction, interruptible=False, marker=_BRIDGE_MARKER, voice=INTERVIEWER
+        )
+        self._brief_line = _BRIDGED_BRIEF
+        await self.say(_BRIDGED_BRIEF)
+
+    def _bridge_runner_or_none(self) -> Callable[[list[dict[str, str]]], Awaitable[Any]] | None:
+        """The compose call, or None (an injected runner as it is; else R1's own client, and
+        only when the session has an LLM at all: the fakes have none, so they never call it)."""
+        if self._bridge_runner is not None:
+            return self._bridge_runner
+        if getattr(self.session, "llm", None) is not None:
+            return self._default_bridge
+        return None
+
+    async def _default_bridge(self, messages: list[dict[str, str]]) -> str:
+        """Compose on R1's OWN DeepSeek client (the interviewer's settings), never the session's.
+
+        Its failures and timings then never reach the SDK's error count (``_on_provider_error``)
+        or its per-turn metrics, which belong to the replies.  Built on first use; a client that
+        cannot be built raises, and the brief plays alone.
+        """
+        from r1_llm import assert_thinking_disabled, build_r1_llm
+
+        if self._bridge_llm is None:
+            self._bridge_llm = build_r1_llm()
+        parts: list[str] = []
+        async with self._bridge_llm.chat(chat_ctx=_chat_context_from(messages)) as stream:
+            async for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    assert_thinking_disabled(usage)
+                parts.append(delta_text(chunk))
+        return "".join(parts)
+
+    def _bridge_messages(self, text: str, entries: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """The compose call's messages: Christy's own byte-stable prefix (the DeepSeek cache
+        prefix), the icebreaker so far, ``BRIDGE_NOTE`` and the boundary answer (once)."""
+        skip = {id(entry) for entry in entries}
+        ordered = sorted(
+            (item for item in self._history if id(item) not in skip),
+            key=lambda item: item.get("seq", 0),
+        )
+        return assemble_messages(
+            interviewer_prefix(voice=self._interviewer_voice),
+            select_context(ordered, "icebreaker"),
+            text,
+            BRIDGE_NOTE,
+        )
+
+    def _bridge_guard_context(self) -> Any:
+        """The icebreaker's guard rules for the reaction, with the echo check over the prompts
+        this call used (the prefix and the bridge note)."""
+        ctx = self.engine.guard_context("icebreaker", mode="reply")
+        control = (
+            control_prose(interviewer_prefix(voice=self._interviewer_voice)),
+            control_prose(BRIDGE_NOTE),
+        )
+        return _dataclass_replace(ctx, control_texts=control, praise_check=True)
+
+    async def _transition_bridge(self) -> str | None:
+        """One sentence reacting to the answer that ended the icebreaker, or None.
+
+        Owner's call fda9e9f6, #22 -> #23: the boundary turn gets no reply of its own (the brief
+        answers it), so a reflective last answer heard only "Thank you, {first_name}.".  With the
+        bridge on, a substantive boundary answer (``bridge_wanted``: not a fragment, a question
+        or a decline) gets ONE out-of-band compose call under ``BRIDGE_NOTE``, bounded by
+        ``BRIDGE_TIMEOUT_SEC`` from its start, and what comes back is spoken only when
+        ``clean_bridge`` passes it as it is.  A timeout, an error or a sentence that is not clean
+        says nothing extra.  One ``r1_latency`` line (``transition_bridge``): the compose time,
+        with ``spoken``, ``dropped``, ``timeout`` or ``error`` as its category; never the words.
+        """
+        entries, self._icebreaker_boundary_entries = self._icebreaker_boundary_entries, []
+        if not entries or not transition_bridge_enabled() or self._stop_outcome() is not None:
+            return None
+        text = " ".join(str(entry.get("text", "")) for entry in entries).strip()
+        if not bridge_wanted(text, content_words=content_word_count(text)):
+            return None
+        runner = self._bridge_runner_or_none()
+        if runner is None:
+            return None
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        reaction: str | None = None
+        try:
+            raw = await asyncio.wait_for(
+                runner(self._bridge_messages(text, entries)), BRIDGE_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            outcome = "timeout"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the brief plays alone
+            outcome = "error"
+            _log.warn(
+                "unknown_event",
+                error_type="r1_transition_bridge_failed",
+                error_category=_error_type_of(exc),
+            )
+        else:
+            reaction = clean_bridge(raw, self._bridge_guard_context())
+            outcome = "dropped" if reaction is None else "spoken"
+        self._emit_latency(
+            "transition_bridge",
+            loop.time() - started,
+            category=outcome,
+            phase=self.machine.transcript_phase(),
+            turn_index=None,
+        )
+        if self._stop_outcome() is not None:
+            return None
+        return reaction
+
     async def _run_transition(self) -> str | None:
         """Wait for the candidate's consent, answering their questions, then speak the pickup.
 
@@ -6225,16 +6399,19 @@ class R1Interview:
         return self._brief_requested and not self._brief_repeated
 
     async def _repeat_brief(self) -> bool:
-        """Replay L-TRANSITION once; True when the candidate said ready while it played.
+        """Replay the brief once; True when the candidate said ready while it played.
 
-        The line is the owner-approved one, verbatim (no new wording to approve), cached and
-        uninterruptible like the first time, and its second transcript row is the bot's own.
-        What the candidate said during it was queued: a ready counts, the rest is dropped.
+        The line is the owner-approved one the candidate heard, verbatim (no new wording to
+        approve): L-TRANSITION, or L-TRANSITION-BRIDGED when the transition bridge's reaction
+        came first (M032 S5; its thanks is not added back mid-way through the transition).  It
+        is cached and uninterruptible like the first time, and its second transcript row is the
+        bot's own.  What the candidate said during it was queued: a ready counts, the rest is
+        dropped.
         """
         self._brief_repeated = True
         self._brief_requested = False
         _log.info("unknown_event", error_type="r1_brief_repeat")
-        await self.say("L-TRANSITION")
+        await self.say(self._brief_line)
         ready = False
         while not self._turns.empty():
             if is_transition_consent(self._turns.get_nowait()):
@@ -6470,7 +6647,7 @@ class R1Interview:
                 outcome = await self._finish_stop(stop)
                 return outcome
             self._enter(R1Phase.TRANSITION)
-            await self.say("L-TRANSITION")
+            await self._say_brief()
             stop = await self._run_transition()
             if stop is not None:
                 outcome = await self._finish_stop(stop)

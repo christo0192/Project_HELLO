@@ -51,6 +51,21 @@ LINES: dict[str, str] = {
         "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
         "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
     ),
+    # M032 S5 item 4: the brief after Christy's own one-sentence reaction to the last icebreaker
+    # answer (R1_TRANSITION_BRIDGE, off by default).  L-TRANSITION without "Thank you,
+    # {first_name}.", word for word otherwise, so it carries no candidate name and is cached once
+    # per machine.
+    "L-TRANSITION-BRIDGED": (
+        "We'll now move to the role-play. I'll play a prospective "
+        "learner so we can evaluate how you handle a real sales call. The learner is "
+        "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
+        "Science course a few days ago. You're the Program Advisor calling her back. The "
+        "role-play runs for up to twenty minutes, and in that time your goal is to convince "
+        "her: understand her needs and help her decide to enrol, as you would on a real call, "
+        "using the course details from your preparation guide. I'll stay in character until I "
+        "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
+        "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
+    ),
     "L-TRANSITION-NUDGE": "Whenever you're ready, just say ready.",
     # Owner decision 2026-11-03 (M1): no auto-start.  L-TRANSITION-ASK ends every answer Christy
     # gives before the role-play (it travels inside her reply); the two re-asks follow candidate

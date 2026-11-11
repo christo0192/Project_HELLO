@@ -130,8 +130,9 @@ import r1_world
 # Revision 21 (M032 S5, owner go of 2026-11-11): Christy's voice text inside the interviewer prefix
 # and her delivery rider (R1_INTERVIEWER_VOICE).  The manifest pins the voiced prefix whatever the
 # flag says.  Same revision: the icebreaker plan's objectives, fallback questions, per-turn notes and
-# "Take your time." (r1_icebreaker, R1_ICEBREAKER_PLAN).
-PINNED_CONTENT_SHA256 = "b13efb7a378b472ad79dca92886d9f4f7f09e29a6a8999b2138c93c16907eef9"
+# "Take your time." (r1_icebreaker, R1_ICEBREAKER_PLAN).  Same revision: the transition bridge's
+# note and limits and L-TRANSITION-BRIDGED, the brief without its thanks (R1_TRANSITION_BRIDGE).
+PINNED_CONTENT_SHA256 = "5871281c7d260c279d724e58378a7854108c7bf35f0aafdf16c59a4b8cf894ff"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -143,8 +144,8 @@ CONTENT_MODULES = (
     "r1_negotiation",
     "r1_tracker",
     "r1_end_intent",
-    "r1_icebreaker",
     "r1_guard",
+    "r1_icebreaker",
     "r1_prompts",
     "r1_content",
     "r1_roleplay",

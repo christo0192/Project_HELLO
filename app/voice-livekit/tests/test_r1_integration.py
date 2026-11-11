@@ -3314,6 +3314,28 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-TRANSITION-ASK"):
             self.assertNotIn(rig.interview.render_line(line_id), warmed)
 
+    async def test_the_bridged_brief_is_warmed_only_while_the_bridge_is_on(self) -> None:
+        # M032 S5 item 4: L-TRANSITION-BRIDGED can only play behind the bridge, which ships off.
+        # Off, the warm-up is today's exactly (no Sarvam request for audio nothing plays); on, it
+        # is warmed right after L-TRANSITION, and kept on disk (it carries no candidate name).
+        self.assertNotIn("L-TRANSITION-BRIDGED", r1_session._WARM_ORDER)
+        rig, _cache, _synth = self.build()
+        with _env(R1_TRANSITION_BRIDGE="0"):
+            off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
+                candidate_free=False
+            )
+        self.assertEqual(len(off), 22)
+        self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
+        with _env(R1_TRANSITION_BRIDGE="1"):
+            free = rig.interview._warm_specs(candidate_free=True)
+            named = rig.interview._warm_specs(candidate_free=False)
+        self.assertEqual(len(free) + len(named), 23)
+        self.assertEqual(free[0].line_id, "L-TRANSITION-BRIDGED")
+        self.assertTrue(free[0].persist)
+        self.assertNotIn("Asha", free[0].text)
+        self.assertEqual(free[0].text, rig.interview.render_line("L-TRANSITION-BRIDGED"))
+        self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in named})
+
     async def test_the_background_warm_up_fills_the_cache_and_is_released_at_exit(self) -> None:
         rig, cache, synth = self.build()
         rig.interview._start_line_warmup(candidate_free=True)
@@ -3656,6 +3678,219 @@ class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
             rig.machine.candidate_turns = 4
             self.assertIsNone(await rig.converse("Let me think about that."))
             self.assertTrue(rig.interview._icebreaker_boundary_turn)  # today: it ends the phase
+
+
+class BridgeRunner:
+    """The out-of-band compose call of the transition bridge: records its messages, answers."""
+
+    def __init__(self, text: str = "", *, error: Exception | None = None, hang: bool = False):
+        self.text = text
+        self.error = error
+        self.hang = hang
+        self.calls: list[list[dict[str, str]]] = []
+
+    async def __call__(self, messages: list[dict[str, str]]) -> str:
+        self.calls.append(messages)
+        if self.hang:
+            await asyncio.Event().wait()
+        if self.error is not None:
+            raise self.error
+        return self.text
+
+
+# Synthetic boundary answers (the owner's #22 was a reflective answer about deals that did not
+# close; none of its words are here).
+BRIDGE_LAST = (
+    "The one I remember is a parent who was scared of the fees, so we went through the plan "
+    "together for an hour and she enrolled her son the week after."
+)
+BRIDGE_REACTION = "An hour on one worried parent's questions is a long call."
+
+
+class TestTransitionBridgeWiring(R1TestCase):
+    """M032 S5 item 4: one guarded reaction to the answer that ended the icebreaker, or nothing.
+
+    The owner's call fda9e9f6, #22 -> #23 (paraphrased): a reflective last answer got only "Thank
+    you, {first_name}." and the 44 s brief.  With ``R1_TRANSITION_BRIDGE`` on, a substantive
+    boundary answer gets one sentence of Christy's own (composed out of band, within its budget,
+    vetted), then the brief without its thanks.  Off (the default) is today's transition exactly.
+    """
+
+    async def boundary(
+        self, runner: BridgeRunner | None, last: str = BRIDGE_LAST, **flags: str
+    ) -> SimpleNamespace:
+        """Run the real driver to the soft exit and commit ``last`` as the boundary turn."""
+        patcher = _env(**flags)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        context = FakeContext(self.order)
+        context.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        session = FakeSession(log=self.order)
+        clock = Clock()
+        interview = R1Interview(
+            context,
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            session,
+            self.writer,
+            clock=clock,
+            bridge_runner=runner,
+        )
+        task = asyncio.create_task(interview.run())
+        run = SimpleNamespace(
+            interview=interview, context=context, session=session, clock=clock, task=task
+        )
+        await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
+        clock.advance(215)
+        interview.machine.candidate_turns = 3
+        session.emit("user_input_transcribed", final_event(last))
+        await self.settle()
+        with self.assertRaises(r1_session.StopResponse):  # the boundary turn gets no reply
+            await session.agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content=last, id="msg_boundary")
+            )
+        await self.until(lambda: interview.machine.phase is R1Phase.TRANSITION)
+        return run
+
+    async def brief_played(self, run: SimpleNamespace, line_id: str) -> None:
+        text = run.interview.render_line(line_id)
+        await self.until(lambda: ("play_end", text) in self.order)
+        await self.settle()
+
+    def bridge_lines(self, logs: list[dict]) -> list[dict]:
+        return [
+            item for item in logs
+            if item.get("error_type") == "r1_latency" and item.get("schema") == "transition_bridge"
+        ]
+
+    async def test_a_substantive_last_answer_gets_one_reaction_then_the_brief_without_thanks(self):
+        runner = BridgeRunner(BRIDGE_REACTION)
+        with self.capture_logs() as logs:
+            run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
+            await self.brief_played(run, "L-TRANSITION-BRIDGED")
+        brief = run.interview.render_line("L-TRANSITION-BRIDGED")
+        self.assertEqual(run.session.spoken, [run.interview.render_line("L-OPEN"),
+                                              BRIDGE_REACTION, brief])
+        self.assertNotIn("Thank you", brief)
+        self.assertFalse(any(h.allow_interruptions for h in run.session.handles[1:]))
+        self.assertEqual(run.interview._start_question, r1_session._EITHER_OR)  # same question
+        # One call, on the interviewer's own byte-stable prefix, with the bridge note last before
+        # the answer, and the answer only once.
+        import r1_icebreaker as ib
+
+        (messages,) = runner.calls
+        self.assertEqual(messages[0]["content"], interviewer_prefix(voice=True))
+        self.assertEqual(messages[-2], {"role": "system", "content": ib.BRIDGE_NOTE})
+        self.assertEqual(messages[-1], {"role": "user", "content": BRIDGE_LAST})
+        self.assertEqual(sum(BRIDGE_LAST in m["content"] for m in messages), 1)
+        (line_,) = self.bridge_lines(logs)
+        self.assertEqual(line_["error_category"], "spoken")
+        self.assertNotIn(BRIDGE_REACTION, json.dumps(logs))  # labels only, never the words
+        self.assertNotIn(BRIDGE_LAST, json.dumps(logs))
+        await self.drain_cancel(run)
+
+    async def test_a_replay_after_the_reaction_is_the_brief_that_was_heard(self):
+        # The candidate asks for the brief again after the bridged one: the replay is the brief
+        # they heard, word for word (no "Thank you, {first_name}." appearing mid-way through the
+        # transition), and the reaction is not composed or spoken again.
+        runner = BridgeRunner(BRIDGE_REACTION)
+        run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
+        await self.brief_played(run, "L-TRANSITION-BRIDGED")
+        run.session.emit("user_input_transcribed", final_event("Can you repeat that?"))
+        brief = run.interview.render_line("L-TRANSITION-BRIDGED")
+        await self.until(lambda: run.session.spoken.count(brief) == 2)
+        await self.settle()
+        self.assertNotIn(run.interview.render_line("L-TRANSITION"), run.session.spoken)
+        self.assertEqual(run.session.spoken.count(BRIDGE_REACTION), 1)
+        self.assertEqual(len(runner.calls), 1)
+        await self.drain_cancel(run)
+
+    async def test_a_reaction_that_is_not_clean_says_nothing_extra(self):
+        for text in (
+            "What made that call work so well?",
+            "That's impressive.",
+            "Thank you for sharing that story with me.",
+            "That's a lovely story. Let's move on to the role-play now.",
+        ):
+            with self.subTest(text=text):
+                self.order.clear()
+                with self.capture_logs() as logs:
+                    run = await self.boundary(BridgeRunner(text), R1_TRANSITION_BRIDGE="1")
+                    await self.brief_played(run, "L-TRANSITION")
+                brief = run.interview.render_line("L-TRANSITION")
+                self.assertEqual(run.session.spoken[1:], [brief])
+                (line_,) = self.bridge_lines(logs)
+                self.assertEqual(line_["error_category"], "dropped")
+                await self.drain_cancel(run)
+
+    async def test_a_slow_or_failed_compose_says_nothing_extra_within_the_budget(self):
+        for runner, outcome in (
+            (BridgeRunner(hang=True), "timeout"),
+            (BridgeRunner(error=RuntimeError("provider down")), "error"),
+        ):
+            with self.subTest(outcome=outcome):
+                self.order.clear()
+                with self.capture_logs() as logs, mock.patch.object(
+                    r1_session, "BRIDGE_TIMEOUT_SEC", 0.05
+                ):
+                    run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
+                    await self.brief_played(run, "L-TRANSITION")
+                brief = run.interview.render_line("L-TRANSITION")
+                self.assertEqual(run.session.spoken[1:], [brief])
+                (line_,) = self.bridge_lines(logs)
+                self.assertEqual(line_["error_category"], outcome)
+                self.assertLess(line_["duration_sec"], 1.0)
+                await self.drain_cancel(run)
+
+    async def test_a_thin_or_asking_last_answer_is_not_composed_for(self):
+        for last in (
+            "Yes, that is how I work most days.",
+            "I sold courses to parents for years. What happens in the next part?",
+        ):
+            with self.subTest(last=last):
+                self.order.clear()
+                runner = BridgeRunner(BRIDGE_REACTION)
+                run = await self.boundary(runner, last, R1_TRANSITION_BRIDGE="1")
+                await self.brief_played(run, "L-TRANSITION")
+                self.assertEqual(runner.calls, [])
+                brief = run.interview.render_line("L-TRANSITION")
+                self.assertEqual(run.session.spoken[1:], [brief])
+                await self.drain_cancel(run)
+
+    async def test_the_hard_cap_with_no_boundary_answer_is_not_composed_for(self):
+        runner = BridgeRunner(BRIDGE_REACTION)
+        patcher = _env(R1_TRANSITION_BRIDGE="1")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        run = await self.start_interview()
+        run.interview._bridge_runner = runner
+        await self.advance_to_transition(run)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(run.session.spoken[1:], [self.spoken_line("L-TRANSITION")])
+        await self.drain_cancel(run)
+
+    async def test_the_flag_off_is_todays_transition_exactly(self):
+        runner = BridgeRunner(BRIDGE_REACTION)
+        with self.capture_logs() as logs:
+            run = await self.boundary(runner, R1_TRANSITION_BRIDGE="0")
+            await self.brief_played(run, "L-TRANSITION")
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(
+            run.session.spoken,
+            [run.interview.render_line("L-OPEN"), run.interview.render_line("L-TRANSITION")],
+        )
+        self.assertEqual(self.bridge_lines(logs), [])
+        await self.drain_cancel(run)
+
+    async def test_unset_is_off(self):
+        runner = BridgeRunner(BRIDGE_REACTION)
+        patcher = _env()
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("R1_TRANSITION_BRIDGE", None)
+        run = await self.boundary(runner)
+        await self.brief_played(run, "L-TRANSITION")
+        self.assertEqual(runner.calls, [])
+        await self.drain_cancel(run)
 
 
 if __name__ == "__main__":
