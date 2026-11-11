@@ -2375,8 +2375,9 @@ Where to look (labels, statuses, turn indices and counts only, never the words):
   `repair`, `backch`, `end` = `detect_end_request`; `more:N` when more fired than fit).
   `r1_latency` schema `turn_reader_call` is the reading's own time. `r1_turn_reader_failed` /
   `r1_turn_reader_unusable` are a failed call or record and a session without a client.
-* `session_facts` admin-log row, payload `reader_shadow` (up to 80 rows: `turn_index`, `phase`,
-  `status`, `reader`, `answered`, `regex`, `dropped`) and `reader_agreement` (the prompt version, the
+* `session_facts` admin-log row, payload `reader_shadow` (up to 80 rows and 24 kB of JSON, the rest
+  counted in `rows_dropped`: `turn_index`, `phase`, `status`, `reader`, `answered`, `regex`,
+  `dropped`) and `reader_agreement` (the prompt version, the
   status counts and, per label, `both` / `reader_only` / `regex_only` / `neither` over the rows the
   reader answered; `conceded` and `abuse` have no detector today, so only the reader's count). The API
   stores these keys with the row and reads none of them: no gate or score depends on them.
