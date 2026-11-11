@@ -7377,7 +7377,13 @@ class LearnerBehaviourS03EngineTests(unittest.TestCase):
 # turns shaped like the owner's session fda9e9f6 (turn numbers refer to that timeline; no line of
 # it is copied).  Every behaviour sits behind a rollback flag that defaults ON; each class also
 # proves the OFF path is the behaviour of before.
-S1_FLAGS = ("R1_NATURAL_TIMING", "R1_RESPOND_FIRST", "R1_CONCERN_LEDGER", "R1_SPLIT_REPLAN")
+S1_FLAGS = (
+    "R1_NATURAL_TIMING",
+    "R1_RESPOND_FIRST",
+    "R1_CONCERN_LEDGER",
+    "R1_SPLIT_REPLAN",
+    "R1_PUSH_AFTER_REACTION",
+)
 ALL_OFF = {name: "0" for name in S1_FLAGS}
 SHORT_ACK = "Okay, got it."
 # fda9e9f6 #49: the advisor offers to bring the husband into the call (paraphrased).
@@ -7748,9 +7754,15 @@ class SplitAnswerReplanTests(unittest.TestCase):
             moves = {m["id"]: m for m in s.eng.scheduler.summary()["moves"]}
             return second, moves[F3_PUSH]["issued"]
 
-        second, issued = run()
+        with flags(R1_PUSH_AFTER_REACTION="0"):
+            second, issued = run()
         self.assertEqual(second.move_id, F3_PUSH)
         self.assertEqual(issued, 1)
+        # SWEEP-1 on: the continuation (planned at the pace of a split answer, so with slack) holds
+        # the push for her reaction; the issue the lost reply made is still given back.
+        second, issued = run()
+        self.assertIn("owed_deferred_for_reaction", second.reasons)
+        self.assertEqual(issued, 0)
         with flags(**ALL_OFF):
             second, issued = run()
         self.assertEqual(issued, 2)
@@ -7802,6 +7814,204 @@ class SplitAnswerReplanTests(unittest.TestCase):
             off, second = run()
         # Without the replan the lost reply spent the hold: the heard reply raises the move.
         self.assertEqual(second.move_id, r1_roleplay.F2_PRIMARY)
+
+
+# M032 SWEEP-1 (P01, folded into S1 item 2): react before the push.  In every role-play session a
+# family's push was her very next scripted line after its primary, and the advisor's answer in
+# between got only "[ack], but ...".  Synthetic advisor turns; no transcript line is copied.
+# An on-topic, substantive answer to F3's primary (free content against a paid course).
+F3_ANSWER = "Free videos never give you feedback, but here a mentor reviews every project you build."
+DECIDER_REPLY = "That helps. I'd still want to talk it over with my husband first."
+CHECKIN_TEXT = "Then, if there is something you really still want to know"
+
+
+def push_react_note():
+    from r1_prompts import PUSH_REACT_NOTE
+
+    return PUSH_REACT_NOTE
+
+
+def issued(s, move_id):
+    return {m["id"]: m for m in s.eng.scheduler.summary()["moves"]}[move_id]["issued"]
+
+
+def react_holds(s):
+    return s.eng.admin_log()["intents"]["push_react_holds"]
+
+
+class PushAfterReactionTests(unittest.TestCase):
+    """SWEEP-1 (R1_PUSH_AFTER_REACTION, default on): an unforced F2, F3 or F4 push waits ONE turn
+    when her last heard line delivered its primary, so she reacts to the advisor's answer first.
+    Once per push, shared with the respond-first budget, and only with slack (``_may_hold``).
+    The default runs go at 25 s an exchange (OPENER at 35, F3's primary at 60)."""
+
+    def primary_then_answer(self, answer=F3_ANSWER, r=85):
+        s = Session(engine())
+        s.say(OPENER, 35)
+        self.assertEqual(s.say(PITCH, 60).move_id, F3_PRIMARY)
+        return s, s.say(answer, r)
+
+    def test_a_the_push_waits_for_her_reaction(self):
+        s, held = self.primary_then_answer()
+        self.assertEqual((held.mode, held.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_for_reaction", held.reasons)
+        self.assertIn(push_react_note(), held.reminder)
+        self.assertNotIn('curious about "', held.reminder)
+        self.assertNotIn(CHECKIN_TEXT, held.reminder)
+        push = s.say(SHORT_ACK, 110)
+        self.assertEqual((push.mode, push.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn(push_react_note(), push.reminder)
+        self.assertEqual(react_holds(s), {"F3": 1})
+        self.assertEqual(issued(s, F3_PUSH), 1)
+
+    def test_b_off_the_push_follows_the_answer_at_once(self):
+        with flags(R1_PUSH_AFTER_REACTION="0"):
+            s, plan = self.primary_then_answer()
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn("owed_deferred_for_reaction", plan.reasons)
+        self.assertNotIn(push_react_note(), plan.reminder)
+        self.assertEqual(react_holds(s), {})
+
+    def test_b_the_bare_acknowledgement_twin_is_unchanged(self):
+        """test_a_push_waits_for_the_advisors_answer with the flag on: the bare acknowledgement got
+        a free reply, so her last heard line is no longer the primary and the push is not held."""
+        s = Session(engine())
+        s.say(OPENER, 35)
+        s.say(PITCH, 60)
+        self.assertEqual(s.say("Okay, got it.", 100).mode, TurnMode.LLM_REPLY)
+        push = s.say("Sure, our mentors review every project you build with you.", 140)
+        self.assertEqual((push.mode, push.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn("owed_deferred_for_reaction", push.reasons)
+
+    def test_c_a_forced_push_is_issued_at_once(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        self.assertEqual(s.say(PITCH, 340).move_id, F3_PRIMARY)
+        push = s.say(F3_ANSWER, 380)  # 380 s plus the lookahead reaches F3's 430 s deadline
+        self.assertEqual((push.mode, push.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertIn(f"owed:{F3_PUSH}:forced", push.reasons)
+        self.assertNotIn("owed_deferred_for_reaction", push.reasons)
+
+    def test_d_without_slack_the_push_is_issued_at_once(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(SHORT_ACK, 85)
+        self.assertEqual(s.say(PITCH, 150).move_id, F3_PRIMARY)
+        self.assertFalse(s.eng._ahead_of_pacing(215))  # 65 s an exchange: no turn to spare
+        push = s.say(F3_ANSWER, 215)
+        self.assertEqual((push.mode, push.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn("owed_deferred_for_reaction", push.reasons)
+
+    def test_e_a_price_drop_after_the_f2_primary_holds_the_push_and_keeps_the_price_notes(self):
+        s = Session(engine())
+        r = after_f3(s)
+        self.assertEqual(s.say(SCHEDULE_TALK, r).move_id, r1_roleplay.F2_PRIMARY)
+        held = s.say("I can give it to you for $3,000 instead of $9,000.", r + 20)
+        self.assertEqual((held.mode, held.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_for_reaction", held.reasons)
+        self.assertIn(push_react_note(), held.reminder)
+        self.assertIn("$3,000", held.reminder)  # the negotiation's price note still applies
+        self.assertFalse(any(F1_ANCHOR in reason for reason in held.reasons))
+        self.assertEqual(react_holds(s), {"F2": 1})
+
+    def test_f_her_follow_up_answered_does_not_hold_the_push_a_second_time(self):
+        s = Session(engine())
+        s.say(OPENER, 35)
+        s.say(PITCH, 60)
+        s.reply = "How often would those reviews happen?"  # her follow-up in the held turn
+        self.assertIn("owed_deferred_for_reaction", s.say(F3_ANSWER, 85).reasons)
+        s.reply = "Just exploring options."
+        push = s.say("Every week, a mentor goes through your project with you on a call.", 110)
+        self.assertEqual((push.mode, push.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn("owed_deferred_to_respond", push.reasons)
+        self.assertNotIn("owed_deferred_for_reaction", push.reasons)
+        self.assertEqual(react_holds(s), {"F3": 1})
+
+    def test_g_a_bare_okay_gets_a_free_reply_and_no_hold_follows(self):
+        s, plan = self.primary_then_answer(answer="Okay.")
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertNotIn("owed_deferred_for_reaction", plan.reasons)
+        push = s.say(F3_ANSWER, 110)
+        self.assertEqual((push.mode, push.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn("owed_deferred_for_reaction", push.reasons)
+        self.assertEqual(react_holds(s), {})
+
+    def test_h_a_lost_reply_split_after_the_primary_still_holds_once(self):
+        s = Session(engine())
+        s.say(OPENER, 35)
+        s.say(PITCH, 60)
+        first = s.eng.plan_turn(F3_ANSWER, 85)
+        self.assertIn("owed_deferred_for_reaction", first.reasons)
+        s.eng.reply_lost(first)
+        second = s.say("And they review it with you on a call.", 89)
+        self.assertEqual((second.mode, second.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_for_reaction", second.reasons)
+        self.assertIn(push_react_note(), second.reminder)
+        self.assertEqual(react_holds(s), {"F3": 1})
+        push = s.say(SHORT_ACK, 115)
+        self.assertEqual(push.move_id, F3_PUSH)
+        self.assertEqual(issued(s, F3_PUSH), 1)
+
+    def test_h_heard_lines_count_not_planned_turns(self):
+        """The "Okay." whose free reply was lost before any audio was no reaction she gave: the
+        answer in the continuation still gets one."""
+        s = Session(engine())
+        s.say(OPENER, 35)
+        s.say(PITCH, 60)
+        first = s.eng.plan_turn("Okay.", 85)
+        s.eng.reply_lost(first)
+        second = s.say(F3_ANSWER, 90)
+        self.assertIsNone(second.move_id)
+        self.assertIn("owed_deferred_for_reaction", second.reasons)
+
+    def test_i_the_f1_counter_after_a_concession_is_issued_at_once(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        self.assertEqual(s.say(PRICE_ONLY, 60).move_id, F1_ANCHOR)
+        counter = s.say("Fine, let's make it $6,000 for you.", 100)
+        self.assertEqual(counter.move_id, F1_COUNTER)
+        self.assertNotIn("owed_deferred_for_reaction", counter.reasons)
+
+    def f4_primary(self, s):
+        """Drives the strong script at 20 s an exchange until F4's primary is said; its R."""
+        for index, text in enumerate([*strong_script()[:-1], *[NEUTRAL] * 12]):
+            r = 20 + 20 * index
+            if s.say(text, r).move_id == F4_PRIMARY:
+                return r
+        self.fail("F4's primary was never raised")
+
+    def test_j_the_f4_push_waits_once_and_refers_back_to_a_decider_she_named(self):
+        answer = "Plenty of our learners started with the same worry and found the weekend rhythm fine."
+        s = Session(engine())
+        r = self.f4_primary(s)
+        s.reply = DECIDER_REPLY
+        held = s.say(answer, r + 20)
+        self.assertEqual((held.mode, held.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_for_reaction", held.reasons)
+        s.reply = "Just exploring options."
+        push = s.say(SUBSTANTIVE_PITCH, r + 40)
+        self.assertEqual(push.move_id, r1_scheduler.F4_PUSH)
+        self.assertIn("refer back to it in a few words", push.intent.brief)
+        self.assertEqual(react_holds(s).get("F4"), 1)
+
+    def test_an_answer_that_hands_her_the_floor_gets_the_push(self):
+        """The advisor answered and then invited her next point ("what else is on your mind?"):
+        that is the natural moment for it (D-M032-1), so the push is not held."""
+        s, plan = self.primary_then_answer(answer=f"{F3_ANSWER} What else is on your mind?")
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn("owed_deferred_for_reaction", plan.reasons)
+        self.assertEqual(react_holds(s), {})
+
+    def test_the_held_turn_hands_over_no_curiosity_topic_on_the_third_free_reply(self):
+        s = Session(engine())
+        s.say(OPENER, 15)
+        s.say(SHORT_ACK, 25)  # the second free reply; the held one is the third
+        self.assertEqual(s.say(PITCH, 35).move_id, F3_PRIMARY)
+        held = s.say(F3_ANSWER, 55)
+        self.assertIn("owed_deferred_for_reaction", held.reasons)
+        self.assertNotIn('curious about "', held.reminder)
+        self.assertNotIn(CHECKIN_TEXT, held.reminder)
+
 
 if __name__ == "__main__":
     unittest.main()

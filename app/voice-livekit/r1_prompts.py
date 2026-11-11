@@ -188,6 +188,15 @@ PRESSURE_EASED_NOTE = (
     "- The advisor just gave you time. Acknowledge it warmly in a few words and do not bring up "
     "the earlier pressure again."
 )
+# M032 SWEEP-1 (flag R1_PUSH_AFTER_REACTION): the advisor just answered the objection her last
+# line raised, and its push waits a turn, so this reply reacts to that answer (in every role-play
+# the push came on the very next line, after a token "[ack], but").  It asks or says how it lands
+# and never states a course fact (D-M032-7).  New wording under D-M032-4: listed for review.
+PUSH_REACT_NOTE = (
+    "- React to what the advisor just said before anything else: pick up one specific thing they "
+    "said and say how it lands for you, or ask one short follow-up question about it. Do not raise "
+    "a new worry or a new topic this turn, and do not state course details yourself."
+)
 # M032 S1 concern ledger (flag R1_CONCERN_LEDGER): what she already told the advisor, in
 # worker-authored words (never her own sentences), merged with the hollow-advisor note.
 CONCERN_LABELS: tuple[tuple[str, str], ...] = (

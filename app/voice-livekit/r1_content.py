@@ -137,9 +137,11 @@ import r1_world
 #    notes join the manifest: she responds first to an offer (OFFER_MADE_NOTE), a question put to
 #    her (ASKED_DIRECTLY_NOTE), an answer to her own question (ANSWERED_YOU_NOTE) and time given
 #    (PRESSURE_EASED_NOTE), and a concern she already voiced is not voiced again
-#    (CONCERN_LABELS, VOICED_CONCERNS_NOTE, HOLLOW_CONCERNS_NOTE).  No scripted line, brief,
-#    marker or variant changed; the graded moves, their deadlines and the forced path are as
-#    before.
+#    (CONCERN_LABELS, VOICED_CONCERNS_NOTE, HOLLOW_CONCERNS_NOTE).  SWEEP-1 (flag
+#    R1_PUSH_AFTER_REACTION): an unforced push waits a turn after the advisor answered its
+#    primary, and that reply reacts to the answer first (PUSH_REACT_NOTE).  No scripted line,
+#    brief, marker or variant changed; the graded moves, their deadlines and the forced path are
+#    as before.
 CONTENT_REVISION = 21
 
 
@@ -430,6 +432,7 @@ def manifest() -> dict[str, Any]:
             "asked_directly_note": r1_prompts.ASKED_DIRECTLY_NOTE,
             "answered_you_note": r1_prompts.ANSWERED_YOU_NOTE,
             "pressure_eased_note": r1_prompts.PRESSURE_EASED_NOTE,
+            "push_react_note": r1_prompts.PUSH_REACT_NOTE,
             "concern_labels": [list(item) for item in r1_prompts.CONCERN_LABELS],
             "voiced_concerns_note": r1_prompts.VOICED_CONCERNS_NOTE,
             "hollow_concerns_note": r1_prompts.HOLLOW_CONCERNS_NOTE,

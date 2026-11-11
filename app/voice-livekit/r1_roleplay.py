@@ -197,6 +197,7 @@ from r1_prompts import (
     PRESSURE_EASED_NOTE,
     PRICE_MET_NOTE,
     PRICE_UNCHANGED_NOTE,
+    PUSH_REACT_NOTE,
     RESOLVED_NOTE,
     STRETCH_USED_NOTE,
     STYLE_NOTES,
@@ -455,10 +456,14 @@ MONTHLY_QUOTE_TURNS = 3
 # * R1_SPLIT_REPLAN: a real continuation after a reply lost before any audio is planned from both
 #   halves (their text for the readers, the monologue, the disclosure layers and their hold) and
 #   the move the lost plan issued is issued once.
+# * R1_PUSH_AFTER_REACTION (SWEEP-1, folded into item 2): when her last heard line delivered a
+#   family's primary, its unforced F2, F3 or F4 push waits ONE turn and that reply reacts to the
+#   advisor's answer first (PUSH_REACT_NOTE); it shares the respond-first once-per-move budget.
 FLAG_NATURAL_TIMING = "R1_NATURAL_TIMING"
 FLAG_RESPOND_FIRST = "R1_RESPOND_FIRST"
 FLAG_CONCERN_LEDGER = "R1_CONCERN_LEDGER"
 FLAG_SPLIT_REPLAN = "R1_SPLIT_REPLAN"
+FLAG_PUSH_AFTER_REACTION = "R1_PUSH_AFTER_REACTION"
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
 
 
@@ -477,6 +482,9 @@ _RESPOND_ORDER = (RESPOND_OFFER, RESPOND_BACK_OFF, RESPOND_QUESTION, RESPOND_ANS
 CONCERN_THRESHOLDS = {CONCERN_PRESSURE: 2}
 # The urgency levers that press again, so "take your time" in the same turn eases nothing.
 _PRESSING_LEVERS = frozenset({"limited_spots", "application_deadline", "seasonal_discount"})
+# SWEEP-1: the pushes that wait for her reaction to the advisor's answer, with their primaries.
+# Never F1-COUNTER (the negotiation answers a price), the 19:00 stall, the time cue or a primary.
+_REACT_PUSHES = {F2_PUSH: F2_PRIMARY, F3_PUSH: F3_PRIMARY, F4_PUSH: F4_PRIMARY}
 
 
 @dataclass(frozen=True)
@@ -770,6 +778,10 @@ class RolePlayEngine:
         self._turn_issued: str | None = None
         self._turn_hold: tuple[str, str, str] | None = None
         self._lost_half: _LostHalf | None = None
+        # SWEEP-1: the primary her last HEARD line delivered (None when it delivered none; a reply
+        # lost before any audio changes nothing), and the pushes held for her reaction, by family.
+        self._heard_primary: str | None = None
+        self._push_react_holds: dict[str, int] = {}
 
     # ------------------------------------------------------------------- properties
     @property
@@ -1261,6 +1273,7 @@ class RolePlayEngine:
         reveal_due = bool(first_probes) or bool(reveal_topics)
         challenged = False
         held_for_cut = False
+        reacting = False  # SWEEP-1: the push waits for her reaction (quiet, like a challenge)
         moment = self._moment(reading, negotiated, kinds, r_sec) if natural else None
         move = self.scheduler.select(r_sec, moment=moment)
         if moment is not None and moment.slack_ok:
@@ -1366,6 +1379,29 @@ class RolePlayEngine:
                 self._respond_holds[kind] = self._respond_holds.get(kind, 0) + 1
                 self._turn_hold = ("respond", move.id, kind)
                 reasons.append("owed_deferred_to_respond")
+            elif (
+                self._heard_primary is not None
+                and _REACT_PUSHES.get(move.id) == self._heard_primary
+                and move.id not in self._respond_held
+                and not (negotiated.checkin or offers_floor(reading))
+                and flag_on(FLAG_PUSH_AFTER_REACTION)
+                and self._may_hold(move, r_sec)
+            ):
+                # M032 SWEEP-1: her last heard line raised this family's primary and the advisor
+                # has answered it; the push waits ONE turn so that she reacts to that answer first
+                # (in every role-play the push was her very next line, after a token "[ack], but").
+                # Once per push and shared with the respond-first budget (``_respond_held``), only
+                # with slack (``_may_hold``): never forced, never F1-COUNTER, the time cue or the
+                # 19:00 stall.  Not when the advisor handed her the floor ("what else is on your
+                # mind?"): that invites her next point, the natural moment for it (D-M032-1).  On
+                # the next turn the scheduler releases the push as before.
+                self._respond_held.add(move.id)
+                family = move.family or move.id
+                self._push_react_holds[family] = self._push_react_holds.get(family, 0) + 1
+                self._turn_hold = ("push_react", move.id, family)
+                reacting = True
+                self._notes.append(PUSH_REACT_NOTE)
+                reasons.append("owed_deferred_for_reaction")
             else:
                 self.scheduler.issue(move)
                 self._turn_issued = move.id
@@ -1412,7 +1448,9 @@ class RolePlayEngine:
         if (
             trigger is not None
             and not cut
-            and not (reveal_due or break_kind is not None or challenged or held_for_cut)
+            and not (
+                reveal_due or break_kind is not None or challenged or held_for_cut or reacting
+            )
             and wants is None
             and not (negotiated.email_offer or negotiated.checkin)
             and not self._wrap_engaged(negotiated)
@@ -1428,8 +1466,9 @@ class RolePlayEngine:
             self._notes.append(INTERRUPTED_NOTE)
         curiosity = ""
         # A challenge is only answered (``CHALLENGE_NOTE``): no curiosity question, no check-in.
-        # Neither is the turn that cut the learner off while she was raising an owed move.
-        quiet = reveal_due or break_kind is not None or challenged or held_for_cut
+        # Neither is the turn that cut the learner off while she was raising an owed move, nor
+        # (SWEEP-1) the turn whose reply reacts to the advisor's answer before the push.
+        quiet = reveal_due or break_kind is not None or challenged or held_for_cut or reacting
         # M032 S1 item 4: a turn that left something open for her hands over no curiosity topic;
         # her reply answers it (a check-in still asks for one real question).
         responding = respond and bool(kinds) and not self._force_curiosity
@@ -1928,13 +1967,14 @@ class RolePlayEngine:
         if half.hold is None:
             return
         kind, move_id, counted = half.hold
-        if kind == "respond":
+        if kind in ("respond", "push_react"):
             self._respond_held.discard(move_id)
-            left = self._respond_holds.get(counted, 0) - 1
+            counts = self._respond_holds if kind == "respond" else self._push_react_holds
+            left = counts.get(counted, 0) - 1
             if left > 0:
-                self._respond_holds[counted] = left
+                counts[counted] = left
             else:
-                self._respond_holds.pop(counted, None)
+                counts.pop(counted, None)
         elif kind == "dig":
             self._dig_deferred.discard(move_id)
             self._dig_deferred_topics.discard(counted)
@@ -2933,6 +2973,10 @@ class RolePlayEngine:
             return  # the interviewer's aside is scripted and excluded from evidence
         when = self.last_r if r_sec is None else r_sec
         cap = self._commitment_cap()  # the level on record BEFORE this turn's line
+        # SWEEP-1: the primaries already delivered before this line, to tell which one it delivered.
+        primaries_before = {
+            primary for primary in _REACT_PUSHES.values() if self.scheduler.is_delivered(primary)
+        }
         self._spoken.add(spoken_text)
         if spoken_text.strip():
             self._styles.append((reply_opener(spoken_text), reply_tics(spoken_text)))
@@ -3028,6 +3072,16 @@ class RolePlayEngine:
         if not scripted_commitment or plan.commitment_level is Level.WEAK:
             if classify_learner_commitment(spoken_text) > cap or has_concession(spoken_text):
                 self._violations += 1
+        if spoken_text.strip():
+            # SWEEP-1: a heard line; the primary it delivered, if any (lost replies never get here).
+            self._heard_primary = next(
+                (
+                    primary
+                    for primary in _REACT_PUSHES.values()
+                    if primary not in primaries_before and self.scheduler.is_delivered(primary)
+                ),
+                None,
+            )
 
     def _credit_organic_push(self, plan: TurnPlan, spoken_text: str, when: float) -> None:
         """A push the learner already voiced in a free reply is not owed again.
@@ -3181,6 +3235,8 @@ class RolePlayEngine:
                 "volunteered_objections": self._volunteered_objections,
                 "concerns": dict(sorted(self._concerns.items())),
                 "split_replans": self._split_replans,
+                # SWEEP-1 (counts only): pushes held one turn for her reaction, by family.
+                "push_react_holds": dict(sorted(self._push_react_holds.items())),
             },
             # Counts only (logged for the rehearsal metrics, not posted): replies that held a
             # question, the tracked phrase tics, and what the advisor already answered.
