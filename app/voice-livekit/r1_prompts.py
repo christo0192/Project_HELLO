@@ -166,6 +166,46 @@ NEXT_STEP_PROPOSED_NOTE = (
     "- The advisor just proposed a call or a next step. React to that in a few words, without "
     "agreeing to it and without naming a day or a time, and then carry on."
 )
+# M032 S1 (owner decision D-M032-1: she responds first).  The advisor's turn left something open
+# for her (an offer, a question put to her, an answer to her own question, or time given): the
+# reply's job is to respond to that, and an owed move that no deadline forces waits a turn
+# (``r1_roleplay``, flag R1_RESPOND_FIRST).  New wording under D-M032-4: listed for review.
+OFFER_MADE_NOTE = (
+    "- The advisor just offered you something. Respond to that offer first, in a few words, "
+    "saying how it lands for you, without accepting a call, a day, a time or a payment."
+)
+ASKED_DIRECTLY_NOTE = (
+    "- The advisor asked you something directly. Answer that first, plainly and honestly, in "
+    "your own words, before anything else."
+)
+ANSWERED_YOU_NOTE = (
+    "- The advisor just answered the question you asked. React to their answer first, in a few "
+    "words, saying how it lands for you."
+)
+# RCA END-5 (fda9e9f6 #73-#74): a hand-back (talk it over, then come back to us) was not heard
+# as easing off.
+PRESSURE_EASED_NOTE = (
+    "- The advisor just gave you time. Acknowledge it warmly in a few words and do not bring up "
+    "the earlier pressure again."
+)
+# M032 S1 concern ledger (flag R1_CONCERN_LEDGER): what she already told the advisor, in
+# worker-authored words (never her own sentences), merged with the hollow-advisor note.
+CONCERN_LABELS: tuple[tuple[str, str], ...] = (
+    ("pressure", "that you feel pressured or rushed"),
+    ("offended", "that their remark upset you"),
+    ("think_over", "that you want to think it over"),
+    ("trust", "that you would want proof before trusting it"),
+)
+VOICED_CONCERNS_NOTE = (
+    "- You have already told the advisor {concerns}. Do not say that again in any words: "
+    "respond to what they just said."
+)
+HOLLOW_CONCERNS_NOTE = (
+    "- The advisor said almost nothing. You have already told them {concerns}, so do not say "
+    "that again in any words. Do not say goodbye, thank them for the call or say that you will "
+    "reach out again: ask them one real question about something you still want to know, or say "
+    "something new that is on your mind."
+)
 # R1-Q iteration 1.  The commitment is on record: the learner confirms it warmly and opens nothing
 # new (in the smoke test the learner answered the advisor's confirmation with "hold on, what would
 # that call involve?").

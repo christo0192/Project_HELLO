@@ -131,7 +131,16 @@ import r1_world
 #    has two shapes and two lengths and answers a dig first (L2); the F4 push refers back to a
 #    decision maker already named (L7), a free reply does not name them again, and a monthly figure
 #    above the card's budget is never "workable" (L5: BUDGET_OVER_NOTE, BUDGET_REPLACEMENT).
-CONTENT_REVISION = 20
+# 21: M032 S1, learner timing + memory (owner decisions D-M032-1 and D-M032-4, rollback flags
+#    R1_NATURAL_TIMING, R1_RESPOND_FIRST, R1_CONCERN_LEDGER, R1_SPLIT_REPLAN).  The idle path's
+#    longer quiet stretch while the plan has slack (IDLE_GAP_SLACK_TURNS) and the learner's new
+#    notes join the manifest: she responds first to an offer (OFFER_MADE_NOTE), a question put to
+#    her (ASKED_DIRECTLY_NOTE), an answer to her own question (ANSWERED_YOU_NOTE) and time given
+#    (PRESSURE_EASED_NOTE), and a concern she already voiced is not voiced again
+#    (CONCERN_LABELS, VOICED_CONCERNS_NOTE, HOLLOW_CONCERNS_NOTE).  No scripted line, brief,
+#    marker or variant changed; the graded moves, their deadlines and the forced path are as
+#    before.
+CONTENT_REVISION = 21
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -219,6 +228,7 @@ def manifest() -> dict[str, Any]:
                 "slip_limit_sec": r1_scheduler.SLIP_LIMIT_SEC,
                 "spacing_turns": r1_scheduler.SPACING_TURNS,
                 "idle_gap_turns": r1_scheduler.IDLE_GAP_TURNS,
+                "idle_gap_slack_turns": r1_scheduler.IDLE_GAP_SLACK_TURNS,
                 "substantive_answer_words": r1_scheduler.SUBSTANTIVE_ANSWER_WORDS,
                 "push_patience_turns": r1_scheduler.PUSH_PATIENCE_TURNS,
                 "curiosity_every": r1_scheduler.CURIOSITY_EVERY,
@@ -416,6 +426,13 @@ def manifest() -> dict[str, Any]:
             "react_how_it_lands": r1_prompts.REACT_HOW_IT_LANDS,
             "reaction_only_note": r1_prompts.REACTION_ONLY_NOTE,
             "forced_note": r1_prompts.FORCED_NOTE,
+            "offer_made_note": r1_prompts.OFFER_MADE_NOTE,
+            "asked_directly_note": r1_prompts.ASKED_DIRECTLY_NOTE,
+            "answered_you_note": r1_prompts.ANSWERED_YOU_NOTE,
+            "pressure_eased_note": r1_prompts.PRESSURE_EASED_NOTE,
+            "concern_labels": [list(item) for item in r1_prompts.CONCERN_LABELS],
+            "voiced_concerns_note": r1_prompts.VOICED_CONCERNS_NOTE,
+            "hollow_concerns_note": r1_prompts.HOLLOW_CONCERNS_NOTE,
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

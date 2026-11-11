@@ -127,7 +127,12 @@ import r1_world
 # revision, the learner: the card's call direction and work answers (M4, L4), three more curiosity
 # topics and a check-in-done note that never closes (L1), the intent shapes (L2), the F4 push's
 # refer-back and the decider and budget notes (L5, L7).
-PINNED_CONTENT_SHA256 = "9f5d7bf6a039aca045c1409247b2b693f7acaf57d4fcd621c937b7116e4edabc"
+# Revision 21 (M032 S1, learner timing + memory): the idle path's longer quiet stretch while the
+# plan has slack (IDLE_GAP_SLACK_TURNS) and the learner's respond-first notes (OFFER_MADE_NOTE,
+# ASKED_DIRECTLY_NOTE, ANSWERED_YOU_NOTE, PRESSURE_EASED_NOTE) and concern-ledger notes
+# (CONCERN_LABELS, VOICED_CONCERNS_NOTE, HOLLOW_CONCERNS_NOTE) join the manifest.  No scripted
+# line, brief, marker or variant changed.
+PINNED_CONTENT_SHA256 = "19a998473541924264b5b9885474fe0d6c00b7c03a61c9a9c9e01ebda0e30700"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -297,6 +302,9 @@ class PinTests(unittest.TestCase):
             (r1_scheduler, "REDIRECT_BRIEF", "x"),
             (r1_scheduler, "CURIOSITY_TOPICS", (("format", "x"),)),
             (r1_scheduler, "IDLE_GAP_TURNS", 4),
+            (r1_scheduler, "IDLE_GAP_SLACK_TURNS", 6),
+            (r1_prompts, "OFFER_MADE_NOTE", "- Take the offer."),
+            (r1_prompts, "VOICED_CONCERNS_NOTE", "- {concerns}."),
             (r1_prompts, "INTENT_PRICE_NOTE", "- Do not push on price."),
             (r1_prompts, "FORCED_NOTE", "- Link it."),
         ):

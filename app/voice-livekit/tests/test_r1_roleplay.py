@@ -5951,13 +5951,15 @@ class ChallengeAnsweredFirstTests(unittest.TestCase):
         script = strong_script()
         probe = Session(engine())
         owed_at = None
-        for index, text in enumerate([*script, *[NEUTRAL] * 6]):
+        # M032 S1: with slack, the idle primaries wait for a natural moment, so F4's primary comes
+        # a turn later than before; the padding leaves room for the two holds and the primary.
+        for index, text in enumerate([*script, *[NEUTRAL] * 8]):
             if probe.say(text, 20 + 20 * index).move_id == F4_PRIMARY:
                 owed_at = index
                 break
         self.assertIsNotNone(owed_at)
         s = Session(engine())
-        texts = [*script, *[NEUTRAL] * 6]
+        texts = [*script, *[NEUTRAL] * 8]
         texts[owed_at] = f"{texts[owed_at]} {T56_WHERE}"
         texts[owed_at + 1] = f"{texts[owed_at + 1]} {T58_TOO_MANY}"
         plans = [s.say(text, 20 + 20 * index) for index, text in enumerate(texts[: owed_at + 3])]
@@ -7014,7 +7016,7 @@ class WrapUpOfferEngineTests(unittest.TestCase):
         s = Session(engine())
         s.say(OPENER, 20)
         s.eng.scheduler.mark_commitment_resolved()
-        s.eng.scheduler.select = lambda _r: None
+        s.eng.scheduler.select = lambda _r, **_kw: None
         return s
 
     def offered(self):
@@ -7142,7 +7144,7 @@ class WrapUpOfferEngineTests(unittest.TestCase):
         s = Session(engine())
         s.say(OPENER, 20)
         self.assertFalse(s.eng.commitment_resolved)
-        s.eng.scheduler.select = lambda _r: None  # nothing owed
+        s.eng.scheduler.select = lambda _r, **_kw: None  # nothing owed
         s.eng.scheduler.graded_moves_owed = lambda _r: False  # every graded move said
         plans = [s.say("Okay.", self.R + 20 * step) for step in range(3)]
         self.assertEqual([p.aside for p in plans], [False, False, True])
@@ -7188,7 +7190,7 @@ class WrapUpOfferEngineTests(unittest.TestCase):
     def test_a_declined_end_question_starts_the_cool_down(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        s.eng.scheduler.select = lambda _r: None  # nothing owed
+        s.eng.scheduler.select = lambda _r, **_kw: None  # nothing owed
         self.assertEqual(s.say("Can you disconnect the call?", 800).line_id, "L-ASIDE-END")
         s.say("No, let's carry on.", 810)
         s.eng.scheduler.mark_commitment_resolved()
@@ -7369,6 +7371,437 @@ class LearnerBehaviourS03EngineTests(unittest.TestCase):
         s.say("Which company are you working at, and what is your current CTC?", 40)
         self.assertEqual(s.spoken[-1], reply)
 
+
+# ---------------------------------------------------------------------------------------------
+# M032 S1: learner timing + memory (owner decisions D-M032-1 and D-M032-4).  Synthetic advisor
+# turns shaped like the owner's session fda9e9f6 (turn numbers refer to that timeline; no line of
+# it is copied).  Every behaviour sits behind a rollback flag that defaults ON; each class also
+# proves the OFF path is the behaviour of before.
+S1_FLAGS = ("R1_NATURAL_TIMING", "R1_RESPOND_FIRST", "R1_CONCERN_LEDGER", "R1_SPLIT_REPLAN")
+ALL_OFF = {name: "0" for name in S1_FLAGS}
+SHORT_ACK = "Okay, got it."
+# fda9e9f6 #49: the advisor offers to bring the husband into the call (paraphrased).
+OFFER_HUSBAND = "Sure, if he is around, I can bring him into a joint call and go over it all with him."
+# #73 and #77: the advisor hands the decision back and gives her time (paraphrased).
+BACK_OFF = "Fine, discuss it with your family and come back to me whenever you are ready."
+# #67: a question put to her that is not a dig (paraphrased).
+NUMBER_QUESTION = "So which number would suit you?"
+SUBSTANTIVE_PITCH = (
+    "Our mentors come from top companies and they review every project you build in the program."
+)
+
+
+def flags(**values):
+    """Patch S1 flags for a block: ``flags(R1_NATURAL_TIMING="0")``."""
+    return mock.patch.dict(r1_roleplay.os.environ, values)
+
+
+def after_f3(s, r=20, step=20):
+    """OPENER, F3's primary on a pitch, its push after two short acknowledgements; then two short
+    turns, so the next turn is F2's idle-fuse turn at the owner's pace (20 s an exchange)."""
+    s.say(OPENER, r)
+    assert s.say(PITCH, r + step).move_id == F3_PRIMARY
+    s.say(SHORT_ACK, r + 2 * step)
+    assert s.say(SHORT_ACK, r + 3 * step).move_id == F3_PUSH
+    s.say(SHORT_ACK, r + 4 * step)
+    s.say(SHORT_ACK, r + 5 * step)
+    return r + 6 * step
+
+
+class NaturalTimingEngineTests(unittest.TestCase):
+    """S1 item 1 (R1_NATURAL_TIMING): with slack, the idle primary waits for a natural moment."""
+
+    def test_the_offer_turn_no_longer_gets_the_f2_primary_on_the_idle_fuse(self):
+        with flags(**ALL_OFF):
+            before = Session(engine())
+            r = after_f3(before)
+            plan = before.say(OFFER_HUSBAND, r)
+            self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, r1_roleplay.F2_PRIMARY))
+        s = Session(engine())
+        r = after_f3(s)
+        plan = s.say(OFFER_HUSBAND, r)
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_waits_for_moment", plan.reasons)
+        # The next turn that closes a thread is the natural moment: the primary lands there.
+        nxt = s.say(SUBSTANTIVE_PITCH, r + 20)
+        self.assertEqual((nxt.mode, nxt.move_id), (TurnMode.INTENT, r1_roleplay.F2_PRIMARY))
+
+    def test_natural_timing_alone_waits_without_the_respond_first_note(self):
+        from r1_prompts import OFFER_MADE_NOTE
+
+        with flags(R1_RESPOND_FIRST="0"):
+            s = Session(engine())
+            r = after_f3(s)
+            plan = s.say(OFFER_HUSBAND, r)
+        self.assertEqual(plan.move_id, None)
+        self.assertIn("owed_waits_for_moment", plan.reasons)
+        self.assertNotIn(OFFER_MADE_NOTE, plan.reminder)
+
+    def test_a_bare_acknowledgement_after_her_statement_closes_the_thread(self):
+        s = Session(engine(), reply="I see.")
+        r = after_f3(s)
+        # A bare "Okay, got it." after her statement closes nothing new: hollow, so the floor is
+        # back with her and the primary may come (gap 3), exactly as before.
+        plan = s.say(SHORT_ACK, r)
+        self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
+
+    def test_without_slack_the_idle_fuse_fires_as_before(self):
+        s = Session(engine())
+        r = after_f3(s, step=45)  # 45 s an exchange: no turn to spare
+        self.assertFalse(s.eng._ahead_of_pacing(r))
+        plan = s.say(OFFER_HUSBAND, r)
+        self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
+        self.assertNotIn("owed_waits_for_moment", plan.reasons)
+
+
+class RespondFirstEngineTests(unittest.TestCase):
+    """S1 items 2, 4 and 6 (R1_RESPOND_FIRST): she answers what the advisor left open first."""
+
+    def test_an_offer_on_a_topic_turn_holds_the_primary_one_turn(self):
+        from r1_prompts import OFFER_MADE_NOTE
+
+        offer = "I can send you the recordings of the weekend classes so you can catch up."
+        s = Session(engine())
+        r = after_f3(s)
+        held = s.say(offer, r)
+        self.assertEqual((held.mode, held.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_to_respond", held.reasons)
+        self.assertIn(OFFER_MADE_NOTE, held.reminder)
+        self.assertNotIn("You are curious about", held.reminder)
+        # Once per move: the same offer again gets the move, which reacts to it in the same reply.
+        again = s.say(offer, r + 20)
+        self.assertEqual(again.move_id, r1_roleplay.F2_PRIMARY)
+        self.assertIn(OFFER_MADE_NOTE, again.reminder)
+        with flags(**ALL_OFF):
+            off = Session(engine())
+            r = after_f3(off)
+            plan = off.say(offer, r)
+        self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
+        self.assertNotIn(OFFER_MADE_NOTE, plan.reminder)
+
+    def test_an_answer_to_her_own_question_is_reacted_to_first(self):
+        from r1_prompts import ANSWERED_YOU_NOTE
+
+        answer = "The classes are live on weekends, and every session is recorded for you."
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)  # F3 primary
+        s.say(SHORT_ACK, 60)
+        self.assertEqual(s.say(SHORT_ACK, 80).move_id, F3_PUSH)
+        s.say(SHORT_ACK, 100)
+        s.reply = "Are the classes live or recorded?"  # her own question (fda9e9f6 #39)
+        s.say(SHORT_ACK, 120)
+        s.reply = "That helps, thanks."
+        held = s.say(answer, 140)  # F2's topic came up in the answer (#40)
+        self.assertIn("owed_deferred_to_respond", held.reasons)
+        self.assertIn(ANSWERED_YOU_NOTE, held.reminder)
+        self.assertEqual(s.say(SUBSTANTIVE_PITCH, 160).move_id, r1_roleplay.F2_PRIMARY)
+
+    def test_a_question_put_to_her_is_answered_first_and_hands_over_no_curiosity(self):
+        from r1_prompts import ASKED_DIRECTLY_NOTE
+
+        s = Session(engine())
+        r = after_f3(s)
+        held = s.say(NUMBER_QUESTION, r)
+        self.assertIsNone(held.move_id)  # the idle primary waits (item 1) ...
+        self.assertIn(ASKED_DIRECTLY_NOTE, held.reminder)
+        with flags(R1_NATURAL_TIMING="0"):
+            alone = Session(engine())
+            r = after_f3(alone)
+            held = alone.say(NUMBER_QUESTION, r)
+        self.assertIsNone(held.move_id)  # ... and respond-first alone holds it one turn
+        self.assertIn("owed_deferred_to_respond", held.reasons)
+        self.assertIn(ASKED_DIRECTLY_NOTE, held.reminder)
+        # Item 4: the curiosity cadence never hands a topic over on such a turn ...
+        cadence = Session(engine())
+        cadence.say(OPENER, 20)
+        cadence.say(SHORT_ACK, 40)
+        third = cadence.say(NUMBER_QUESTION, 60)  # the third free reply
+        self.assertEqual(third.mode, TurnMode.LLM_REPLY)
+        self.assertNotIn("You are curious about", third.reminder)
+        with flags(**ALL_OFF):
+            off = Session(engine())
+            off.say(OPENER, 20)
+            off.say(SHORT_ACK, 40)
+            self.assertIn("You are curious about", off.say(NUMBER_QUESTION, 60).reminder)
+        # ... but a check-in still asks her for one real question.
+        checkin = Session(engine())
+        checkin.say(OPENER, 20)
+        checkin.say(SHORT_ACK, 40)
+        plan = checkin.say("What do you think about all of that?", 60)
+        self.assertIn(CHECKIN_NOTE_TEXT, plan.reminder)
+
+    def test_an_intent_on_a_question_put_to_her_answers_it_first(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(f"{PITCH} Which number would suit you?", 415)  # F3 forced: no hold
+        self.assertEqual(plan.move_id, F3_PRIMARY)
+        self.assertIn("the advisor asked you something, so answer that first", plan.reminder)
+        with flags(**ALL_OFF):
+            off = Session(engine())
+            off.say(OPENER, 20)
+            plan = off.say(f"{PITCH} Which number would suit you?", 415)
+        self.assertNotIn("the advisor asked you something", plan.reminder)
+
+    def test_a_forced_move_is_never_held_and_reacts_to_the_offer_in_the_same_reply(self):
+        from r1_prompts import OFFER_MADE_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 300)  # F3 primary late in its window
+        plan = s.say(OFFER_HUSBAND, 410)
+        self.assertEqual(plan.move_id, F3_PUSH)
+        self.assertNotIn("owed_deferred_to_respond", plan.reasons)
+        self.assertIn(OFFER_MADE_NOTE, plan.reminder)
+
+    def test_without_slack_the_move_is_not_held(self):
+        s = Session(engine())
+        r = after_f3(s, step=45)
+        plan = s.say("I can send you the recordings of the weekend classes too.", r)
+        self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
+        self.assertNotIn("owed_deferred_to_respond", plan.reasons)
+
+    def test_a_back_off_clears_the_hold_note_and_eases_the_pressure_once(self):
+        from r1_prompts import HOLD_NOTE, PRESSURE_EASED_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        asked = s.say(ASK, 200)
+        self.assertIn(HOLD_NOTE, asked.reminder)
+        self.assertIn(HOLD_NOTE, s.say(NEUTRAL, 220).reminder)  # a neutral turn keeps it
+        eased = s.say(BACK_OFF, 240)
+        self.assertNotIn(HOLD_NOTE, eased.reminder)
+        self.assertIn(PRESSURE_EASED_NOTE, eased.reminder)
+        later = s.say(NEUTRAL, 260)
+        self.assertNotIn(HOLD_NOTE, later.reminder)
+        self.assertNotIn(PRESSURE_EASED_NOTE, later.reminder)  # one turn only
+        with flags(**ALL_OFF):
+            off = Session(engine())
+            off.say(OPENER, 20)
+            off.say(ASK, 200)
+            plan = off.say(BACK_OFF, 240)
+        self.assertIn(HOLD_NOTE, plan.reminder)
+        self.assertNotIn(PRESSURE_EASED_NOTE, plan.reminder)
+
+    def test_a_back_off_with_nothing_to_ease_carries_no_pressure_note(self):
+        from r1_prompts import PRESSURE_EASED_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Take your time, there's no rush at all.", 40)
+        self.assertNotIn(PRESSURE_EASED_NOTE, plan.reminder)
+
+    def test_holds_are_counted_in_the_log(self):
+        s = Session(engine())
+        r = after_f3(s)
+        plan = s.say("We have weekend batches too. Which timing would suit you better?", r)
+        self.assertIn("owed_deferred_to_respond", plan.reasons)  # F2's topic came up: held
+        holds = s.eng.admin_log()["intents"]["respond_first_holds"]
+        self.assertEqual(holds, {"question": 1})
+
+
+class VolunteeredObjectionTests(unittest.TestCase):
+    """S1 item 3 (R1_NATURAL_TIMING): a decision-maker stall voiced in a free reply counts for
+    spacing (fda9e9f6 #48), but is never a voiced reason for grading."""
+
+    def test_the_stall_resets_the_spacing_and_not_the_negotiation(self):
+        stall = "Enrolling feels like a big jump. I'd want to talk it over with my husband first."
+
+        def run():
+            s = Session(engine(), reply="I see.")
+            s.say(OPENER, 20)
+            s.say(PITCH, 40)  # F3 primary
+            s.say(SHORT_ACK, 60)
+            assert s.say(SHORT_ACK, 80).move_id == F3_PUSH
+            s.say(SHORT_ACK, 100)  # gap 1
+            s.reply = stall
+            plan = s.say("Right, so after this you would just need to enrol with us.", 120)  # gap 2: free
+            s.reply = "I see."
+            return s, plan, s.say(SUBSTANTIVE_PITCH, 140)  # gap 3 before; gap 1 now
+
+        s, plan, nxt = run()
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn("husband", s.spoken[-2])
+        self.assertEqual(s.eng.scheduler._last_objection_turn, plan.turn)
+        self.assertNotIn("decision_maker", s.eng.negotiation.log().get("reasons_voiced", {}))
+        self.assertEqual(s.eng.admin_log()["intents"]["volunteered_objections"], 1)
+        self.assertIsNone(nxt.move_id)  # one turn after an objection: no idle fuse
+        with flags(**ALL_OFF):
+            off, _plan, nxt = run()
+        self.assertEqual(nxt.move_id, r1_roleplay.F2_PRIMARY)
+        self.assertEqual(off.eng.admin_log()["intents"]["volunteered_objections"], 0)
+
+    def test_off_it_leaves_the_spacing_alone(self):
+        stall = "I'd want to talk it over with my husband first."
+        with flags(**ALL_OFF):
+            s = Session(engine(), reply=stall)
+            s.say(OPENER, 20)
+            s.say(SHORT_ACK, 40)
+        self.assertIsNone(s.eng.scheduler._last_objection_turn)
+
+
+class ConcernLedgerEngineTests(unittest.TestCase):
+    """S1 item 5 (R1_CONCERN_LEDGER): a theme she voiced is not voiced again (fda9e9f6 #72-#76)."""
+
+    PRESSURE = "That is a lot of pressure for one phone call."
+
+    def test_pressure_said_twice_is_not_said_a_third_time(self):
+        from r1_prompts import VOICED_CONCERNS_NOTE
+
+        s = Session(engine(), reply=self.PRESSURE)
+        s.say(OPENER, 20)
+        first = s.say(SHORT_ACK, 40)
+        self.assertNotIn("feel pressured or rushed", first.reminder)
+        s.reply = "I don't like being rushed into something this big."
+        second = s.say(SHORT_ACK, 60)
+        self.assertNotIn("feel pressured or rushed", second.reminder)  # said once so far
+        s.reply = "I see."
+        third = s.say(SHORT_ACK, 80)
+        note = VOICED_CONCERNS_NOTE.format(concerns="that you feel pressured or rushed")
+        self.assertIn(note, third.reminder)
+        with flags(**ALL_OFF):
+            off = Session(engine(), reply=self.PRESSURE)
+            off.say(OPENER, 20)
+            off.say(SHORT_ACK, 40)
+            off.say(SHORT_ACK, 60)
+            self.assertNotIn("feel pressured or rushed", off.say(SHORT_ACK, 80).reminder)
+
+    def test_other_themes_count_from_the_first_time(self):
+        s = Session(engine(), reply="I'll think it over and get back to you.")
+        s.say(OPENER, 20)
+        s.say(SHORT_ACK, 40)
+        s.reply = "I'd want to see some of that myself before trusting it."
+        s.say(SHORT_ACK, 60)
+        plan = s.say(NEUTRAL, 80)
+        self.assertIn(
+            "that you want to think it over and that you would want proof before trusting it",
+            plan.reminder,
+        )
+        self.assertEqual(
+            s.eng.admin_log()["intents"]["concerns"], {"think_over": 1, "trust": 1}
+        )
+
+    def test_it_merges_with_the_hollow_note(self):
+        from r1_prompts import HOLLOW_CONCERNS_NOTE, HOLLOW_NOTE
+
+        s = Session(engine(), reply="I'll think it over and get back to you. Thanks for your time.")
+        s.say(OPENER, 20)
+        plan = s.say("Sure.", 40)  # hollow, after her goodbye
+        self.assertNotIn(HOLLOW_NOTE, plan.reminder)
+        self.assertIn(
+            HOLLOW_CONCERNS_NOTE.format(concerns="that you want to think it over"), plan.reminder
+        )
+
+    def test_intent_replies_get_no_concern_note(self):
+        s = Session(engine(), reply="I'll think it over and get back to you.")
+        s.say(OPENER, 20)
+        s.say(SHORT_ACK, 40)
+        plan = s.say(PITCH, 60)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        self.assertNotIn("want to think it over", plan.reminder)
+
+
+class SplitAnswerReplanTests(unittest.TestCase):
+    """S1 item 7 (R1_SPLIT_REPLAN): a continuation after a lost reply is planned from both halves
+    (fda9e9f6 #42/#43: a 60 s answer with a question in it, then a 4 s fragment)."""
+
+    FIRST_HALF = (
+        f"{SUBSTANTIVE_PITCH} {H3_PROBE} And you will learn python, sql and machine learning."
+    )
+    FRAGMENT = "And our team supports you right up to the job offer."
+
+    def lost_then_fragment(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)  # F3 primary
+        first = s.eng.plan_turn(self.FIRST_HALF, 100, candidate_seconds=58.0)
+        s.eng.reply_lost(first)
+        second = s.eng.plan_turn(self.FRAGMENT, 104, candidate_seconds=4.0)
+        return s, first, second
+
+    def test_the_monologue_the_hint_and_the_reveal_hold_carry_over(self):
+        s, first, second = self.lost_then_fragment()
+        self.assertIn("owed_deferred_for_reveal", first.reasons)
+        self.assertEqual(second.mode, TurnMode.LLM_REPLY)
+        self.assertIn("owed_deferred_for_reveal", second.reasons)
+        self.assertIn("CANDIDATE_MONOLOGUE=62", second.reminder)
+        self.assertIn("first real question about", second.reminder)
+        self.assertIn("split_replan", second.reasons)
+        offers = s.eng.tracker.gate.offers_view()["H3"]
+        self.assertEqual(offers["hint_turn"], second.turn)
+
+    def test_off_the_fragment_is_planned_alone(self):
+        with flags(**ALL_OFF):
+            s, first, second = self.lost_then_fragment()
+        self.assertEqual((second.mode, second.move_id), (TurnMode.INTENT, F3_PUSH))
+        self.assertNotIn("CANDIDATE_MONOLOGUE", second.reminder)
+
+    def test_a_move_issued_for_a_lost_reply_is_issued_once(self):
+        def run():
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.say(PITCH, 40)  # F3 primary
+            first = s.eng.plan_turn(SUBSTANTIVE_PITCH, 100)
+            assert first.move_id == F3_PUSH
+            s.eng.reply_lost(first)
+            second = s.say("And the reviews are weekly.", 104)
+            moves = {m["id"]: m for m in s.eng.scheduler.summary()["moves"]}
+            return second, moves[F3_PUSH]["issued"]
+
+        second, issued = run()
+        self.assertEqual(second.move_id, F3_PUSH)
+        self.assertEqual(issued, 1)
+        with flags(**ALL_OFF):
+            second, issued = run()
+        self.assertEqual(issued, 2)
+
+    def test_a_lone_acknowledgement_still_replays_the_lost_plan(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)
+        first = s.eng.plan_turn(SUBSTANTIVE_PITCH, 100)
+        s.eng.reply_lost(first)
+        again = s.eng.plan_turn("Okay.", 102, backchannel=True)
+        self.assertIn("replanned_after_lost_reply", again.reasons)
+        moves = {m["id"]: m for m in s.eng.scheduler.summary()["moves"]}
+        self.assertEqual(moves[F3_PUSH]["issued"], 1)
+
+    def test_an_offer_split_across_the_halves_is_still_answered_first(self):
+        from r1_prompts import OFFER_MADE_NOTE
+
+        s = Session(engine())
+        r = after_f3(s)
+        first = s.eng.plan_turn("Sure, if he is around, I can bring him", r)
+        s.eng.reply_lost(first)
+        second = s.eng.plan_turn("into a joint call and go over it all with him.", r + 4)
+        self.assertIsNone(second.move_id)
+        self.assertIn(OFFER_MADE_NOTE, second.reminder)
+
+
+    def test_the_hold_a_lost_reply_spent_is_given_back_to_the_reply_that_is_heard(self):
+        """The lost half held F2's primary to respond to an offer; the continuation is planned from
+        both halves, so the reply that is heard is the one that responds first and holds it."""
+        from r1_prompts import OFFER_MADE_NOTE
+
+        offer = "I can send you the recordings of the weekend classes so you can catch up."
+
+        def run():
+            s = Session(engine())
+            r = after_f3(s)
+            first = s.eng.plan_turn(offer, r)
+            self.assertIn("owed_deferred_to_respond", first.reasons)
+            s.eng.reply_lost(first)
+            return s, s.eng.plan_turn("That way nobody falls behind on the course.", r + 4)
+
+        s, second = run()
+        self.assertEqual((second.mode, second.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_to_respond", second.reasons)
+        self.assertIn(OFFER_MADE_NOTE, second.reminder)
+        self.assertEqual(s.eng.admin_log()["intents"]["respond_first_holds"], {"offer": 1})
+        with flags(R1_SPLIT_REPLAN="0"):
+            off, second = run()
+        # Without the replan the lost reply spent the hold: the heard reply raises the move.
+        self.assertEqual(second.move_id, r1_roleplay.F2_PRIMARY)
 
 if __name__ == "__main__":
     unittest.main()

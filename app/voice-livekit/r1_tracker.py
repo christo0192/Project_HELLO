@@ -272,6 +272,18 @@ class DisclosureGate:
             if record.state is NeedState.UNLOCKED and self.turn not in record.deep_offer_turns:
                 record.deep_offer_turns.append(self.turn)
 
+    def give_back_offers(self, turn: int) -> None:
+        """Undo the layer marks of ``turn``: its reply was cancelled before any audio (M032 S1).
+
+        The split-answer replan hands the same layers to the reply that is heard and marks them on
+        its own turn, so an unheard hint or deep offer neither counts as given nor as a miss.
+        """
+        for record in self._records.values():
+            if record.hint_turn == turn:
+                record.hint_turn = None
+            if turn in record.deep_offer_turns:
+                record.deep_offer_turns.remove(turn)
+
     def offers_view(self) -> dict[str, dict[str, Any]]:
         """Which layer was offered on which role-play turn (indices and counts only)."""
         return {

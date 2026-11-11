@@ -108,6 +108,7 @@ transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play c
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -174,20 +175,26 @@ from r1_personas import (
 from r1_prompts import (
     ANCHOR_NOT_OFFERED_NOTE,
     ANSWERED_NOTE,
+    ANSWERED_YOU_NOTE,
+    ASKED_DIRECTLY_NOTE,
     BACKCHANNEL_CUT_NOTE,
     CHALLENGE_NOTE,
     CHECKIN_DONE_NOTE,
     BUDGET_OVER_NOTE,
     CHECKIN_NOTE,
+    CONCERN_LABELS,
     DECIDER_ASKED_NOTE,
     DECIDER_SAID_NOTE,
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
     HOLD_NOTE,
+    HOLLOW_CONCERNS_NOTE,
     HOLLOW_NOTE,
     CUT_REPEAT_NOTE,
     INTERRUPTED_NOTE,
     NEXT_STEP_PROPOSED_NOTE,
+    OFFER_MADE_NOTE,
+    PRESSURE_EASED_NOTE,
     PRICE_MET_NOTE,
     PRICE_UNCHANGED_NOTE,
     RESOLVED_NOTE,
@@ -195,6 +202,7 @@ from r1_prompts import (
     STYLE_NOTES,
     TEMPLATE_USED_NOTE,
     TRY_NOT_GRANTED_NOTE,
+    VOICED_CONCERNS_NOTE,
     control_prose,
     format_usd,
     interviewer_prefix,
@@ -224,16 +232,23 @@ from r1_scheduler import (
     REDIRECT_OPENERS,
     TIME_CUE,
     TIME_CUE_BRIEF_ALTERNATIVES,
+    Moment,
     OwedMove,
     OwedMoveScheduler,
     answered_topics,
+    answers_substantively,
+    asks_her_directly,
+    backs_off,
     curiosity_asked_in,
     curiosity_covered,
     f4_push_said,
     is_close_attempt,
     is_pitch_statement,
     markers_match,
+    offers_floor,
+    offers_something,
     quotes_price,
+    tells_something,
 )
 from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
@@ -241,7 +256,9 @@ from r1_text import (
     PHRASE_STRETCH,
     PHRASE_TEMPLATE_Q,
     SpokenMemory,
+    CONCERN_PRESSURE,
     canonical_amounts,
+    concern_themes,
     dollar_amounts,
     fold,
     fuzzy_contains,
@@ -270,6 +287,7 @@ from r1_tracker import (
     is_short_wrap_yes,
     parse_judge_output,
     promises_call_back,
+    urgency_levers,
 )
 from r1_world import WORLD_VERSION
 
@@ -292,7 +310,7 @@ KIND_CUE = "cue"
 # How many of the learner's last replies the style rules look back over (``r1_guard``).
 STYLE_HISTORY = 8
 # Situation notes that belong to a free reply: an intent has its own brief to voice.
-_FREE_REPLY_NOTES = frozenset({ANCHOR_NOT_OFFERED_NOTE, TRY_NOT_GRANTED_NOTE})
+_FREE_REPLY_NOTES = frozenset({ANCHOR_NOT_OFFERED_NOTE, TRY_NOT_GRANTED_NOTE, ASKED_DIRECTLY_NOTE})
 # The advisor challenges the learner's own words or how the learner is asking (owner test
 # 7f2a25e6: 56 "where did you get that number?", 58 "you are asking too many questions").  Read
 # sentence by sentence; "where did you get your degree?" is a dig, not a challenge.  A sales point
@@ -420,6 +438,66 @@ DISCOVERY_HOLD_LIMIT = 2
 # L5: a monthly figure above the card's budget is checked by the guard for this many turns after
 # the advisor named it (``GuardContext.monthly_quote_usd``).
 MONTHLY_QUOTE_TURNS = 3
+
+# M032 S1 (learner timing + memory, owner decisions D-M032-1 and D-M032-4).  Each behaviour has a
+# rollback flag, read at use, default ON; "0", "off", "false" or "no" restores the behaviour of
+# before (``fly secrets set R1_NATURAL_TIMING=0 -a project-hello-voice``, and the same for the
+# others):
+#
+# * R1_NATURAL_TIMING: while the plan has slack, an owed primary on the idle path waits for a
+#   natural moment (``r1_scheduler.Moment``); a decision-maker stall she volunteers in a free reply
+#   counts as an objection for spacing (never as a voiced reason for grading).
+# * R1_RESPOND_FIRST: an offer, a back-off, a question put to her or an answer to her own question
+#   is responded to first (one-turn hold of an unforced owed move, once per move, only with slack;
+#   no curiosity hand-over that turn); a back-off clears the standing hold on a proposed next step.
+# * R1_CONCERN_LEDGER: a theme she already voiced (pressure twice) is not voiced again in a free
+#   reply.
+# * R1_SPLIT_REPLAN: a real continuation after a reply lost before any audio is planned from both
+#   halves (their text for the readers, the monologue, the disclosure layers and their hold) and
+#   the move the lost plan issued is issued once.
+FLAG_NATURAL_TIMING = "R1_NATURAL_TIMING"
+FLAG_RESPOND_FIRST = "R1_RESPOND_FIRST"
+FLAG_CONCERN_LEDGER = "R1_CONCERN_LEDGER"
+FLAG_SPLIT_REPLAN = "R1_SPLIT_REPLAN"
+_FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+
+
+def flag_on(name: str) -> bool:
+    """An M032 rollback flag, read now: unset or anything but 0/off/false/no is on."""
+    return (os.getenv(name) or "1").strip().lower() not in _FLAG_OFF_VALUES
+
+
+# What the advisor's turn left open for her (S1 item 2), in the order the notes are added.
+RESPOND_OFFER = "offer"
+RESPOND_BACK_OFF = "back_off"
+RESPOND_QUESTION = "question"
+RESPOND_ANSWERED = "answered"
+_RESPOND_ORDER = (RESPOND_OFFER, RESPOND_BACK_OFF, RESPOND_QUESTION, RESPOND_ANSWERED)
+# S1 item 5: a theme counts as said after this many of her lines voiced it.
+CONCERN_THRESHOLDS = {CONCERN_PRESSURE: 2}
+# The urgency levers that press again, so "take your time" in the same turn eases nothing.
+_PRESSING_LEVERS = frozenset({"limited_spots", "application_deadline", "seasonal_discount"})
+
+
+@dataclass(frozen=True)
+class _LostHalf:
+    """What a plan whose reply was cancelled before any audio had read and handed over (S1 item 7).
+
+    ``text`` is the first half of the candidate's answer, held in memory only until the next turn
+    is planned (never logged or stored); the rest are turn indices, seconds and topic ids.
+    ``hold``: the one-turn hold the lost plan spent on the owed move (its kind, the move and the
+    key it was counted under), given back so that the reply that is heard can hold it again.
+    """
+
+    turn: int
+    text: str
+    seconds: float | None
+    first_probes: tuple[str, ...]
+    reveal_topics: tuple[str, ...]
+    kinds: frozenset[str]
+    issued: str | None
+    intent_key: str | None
+    hold: tuple[str, str, str] | None = None
 
 
 def challenges_learner(text: object) -> bool:
@@ -671,6 +749,27 @@ class RolePlayEngine:
         self._lost_undo: tuple[Any, ...] | None = None
         self._turn_undo: tuple[Any, ...] | None = None
         self._turn_ask: AskKind | None = None
+        # M032 S1.  What this advisor turn left open for her (``RESPOND_*``) and the owed moves held
+        # once to respond first (with a count per kind); whether her last line was a question that
+        # did not carry an owed move, and the curiosity topics it asked; the themes of her lines;
+        # the free replies that volunteered a stall; the turns whose idle primary waited for a
+        # moment.  And for the split-answer replan: this turn's text (memory only, only while
+        # R1_SPLIT_REPLAN is on), seconds, layers and issued move, and the half a lost reply left.
+        self._turn_kinds: frozenset[str] = frozenset()
+        self._respond_held: set[str] = set()
+        self._respond_holds: dict[str, int] = {}
+        self._her_question_topics: frozenset[str] = frozenset()
+        self._last_owed_line = False
+        self._concerns: dict[str, int] = {}
+        self._volunteered_objections = 0
+        self._moment_waits = 0
+        self._split_replans = 0
+        self._turn_text = ""
+        self._turn_seconds: float | None = None
+        self._turn_layers: tuple[int, tuple[str, ...], tuple[str, ...]] | None = None
+        self._turn_issued: str | None = None
+        self._turn_hold: tuple[str, str, str] | None = None
+        self._lost_half: _LostHalf | None = None
 
     # ------------------------------------------------------------------- properties
     @property
@@ -885,6 +984,9 @@ class RolePlayEngine:
         # A plan whose reply the SDK cancelled before any audio, and what its planning consumed.
         lost, self._lost_plan = self._lost_plan, None
         lost_undo, self._lost_undo = self._lost_undo, None
+        lost_half, self._lost_half = self._lost_half, None
+        self._turn_kinds = frozenset()
+        carried: _LostHalf | None = None  # M032 S1: the first half of a split answer
         if self._wrap_open:
             # M2: this turn answers the interviewer's offer to wrap up (L-ASIDE-WRAP).
             answer = self._wrap_answer_plan(
@@ -1004,6 +1106,11 @@ class RolePlayEngine:
                     self._unheard_commitment = None
                 return replace(lost, reasons=lost.reasons + ("replanned_after_lost_reply",))
             self._restore_lost(lost_undo)
+            if lost_half is not None and lost_half.turn == lost.turn:
+                carried = lost_half
+        split = carried if carried is not None and flag_on(FLAG_SPLIT_REPLAN) else None
+        if split is not None:
+            self._give_back_lost(split)
         if self._wants_aside(break_kind):
             return self._aside_plan(break_kind or "ai", r_sec, turn_index)
         if break_kind == "ai":
@@ -1026,26 +1133,39 @@ class RolePlayEngine:
             self._turn_map[turn] = turn_index
         if candidate_seconds is not None:
             self._longest_turn_sec = max(self._longest_turn_sec, candidate_seconds)
+        # M032 S1 item 7: the readers below see both halves of a split answer; the observers
+        # (scheduler, tracker, negotiation, figures) saw the first half on its own turn already.
+        reading = candidate_text
+        monologue = candidate_seconds
+        if split is not None:
+            reading = f"{split.text} {candidate_text}"[-MAX_CANDIDATE_CHARS:]
+            if split.seconds is not None or candidate_seconds is not None:
+                monologue = (split.seconds or 0.0) + (candidate_seconds or 0.0)
+            self._split_replans += 1
+        self._turn_text = reading if flag_on(FLAG_SPLIT_REPLAN) else ""
+        self._turn_seconds = monologue
+        self._turn_issued = None
+        self._turn_hold = None
         words = word_count(candidate_text)
         self._word_counts.append(words)
         if not backchannel:
             self._stt_word_counts.append(words)
-        self._hollow_run = self._hollow_run + 1 if is_hollow_turn(candidate_text) else 0
+        self._hollow_run = self._hollow_run + 1 if is_hollow_turn(reading) else 0
         self._decider_asked_now = False
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         known = (len(self._advisor_amounts), len(self._answered))
         self._advisor_amounts.update(advisor_amounts_in(candidate_text))
         self._advisor_hours.update(hours_said(candidate_text))
-        self._price_talk = quotes_price(candidate_text)
-        for topic in answered_topics(candidate_text):
+        self._price_talk = quotes_price(reading)
+        for topic in answered_topics(reading):
             if topic not in self._answered:
                 self._answered.append(topic)
         negotiated = self._observe_negotiation(candidate_text, turn)
         self._note_situation(negotiated)
-        self._note_curiosity_covered(candidate_text)
+        self._note_curiosity_covered(reading)
         self._note_monthly_quote(candidate_text, turn)
-        self._dig_now = asks_about_learner(candidate_text)
+        self._dig_now = asks_about_learner(reading)
         # Nothing in the very first advisor turn is an ask: it is the greeting ("is now a good
         # time?", "I thought I'd give you a quick call"), and it gets a free reply.
         early = turn == 1 and r_sec < EARLY_ASK_IGNORE_SEC
@@ -1061,6 +1181,19 @@ class RolePlayEngine:
         if break_kind:
             reasons.append(f"character_break:{break_kind}")
         self._break_kind = break_kind
+        if split is not None:
+            reasons.append("split_replan")
+        # M032 S1 items 1, 2 and 6: what this turn left open for her.  A first half whose reply was
+        # never heard counts too (fda9e9f6 #58/#59: the answer to her question was in the half that
+        # was lost).
+        natural = flag_on(FLAG_NATURAL_TIMING)
+        respond = flag_on(FLAG_RESPOND_FIRST)
+        kinds: frozenset[str] = frozenset()
+        if natural or respond:
+            kinds = self._respond_kinds(reading, negotiated, wants, carried=carried)
+        self._turn_kinds = kinds
+        if respond and kinds:
+            self._respond_notes(kinds)
         decision = None
         if farewell_end:
             reasons.append("end_request_as_farewell")
@@ -1080,12 +1213,17 @@ class RolePlayEngine:
         # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
         # DEEP layer, in that very reply.  An owed move that is not forced waits one turn.
         reveal_topics = self.tracker.gate.deep_due(obs.gate)
+        first_probes = obs.gate.first_probes
+        if split is not None:
+            # The lost reply's layers (and so its reveal hold) go to the reply that is heard.
+            first_probes = tuple(dict.fromkeys((*split.first_probes, *first_probes)))
+            reveal_topics = tuple(dict.fromkeys((*split.reveal_topics, *reveal_topics)))
         # M2 "going nowhere": did this advisor turn raise anything new (a topic, a figure, a probe)?
         fresh = (
             (len(self._advisor_amounts), len(self._answered)) != known
-            or bool(obs.gate.first_probes)
+            or bool(first_probes)
             or bool(reveal_topics)
-            or asks_about_learner(candidate_text)
+            or asks_about_learner(reading)
             or self._wrap_engaged(negotiated)
         )
         self._stale_run = 0 if fresh else self._stale_run + 1
@@ -1095,15 +1233,16 @@ class RolePlayEngine:
                 wants,
                 r_sec,
                 reasons,
-                first_probes=obs.gate.first_probes,
+                first_probes=first_probes,
                 reveal_topics=reveal_topics,
-                monologue=candidate_seconds,
+                monologue=monologue,
             )
             if planned is not None:
                 return planned
         if decision is not None and decision.move is not None:
             move = decision.move
             self.scheduler.issue(move)
+            self._turn_issued = move.id
             if decision.action == "redirect":
                 # Ship restore: production's scripted redirect, "Oh wait, before you go..." and the
                 # owed line (a model-voiced redirect said its goodbye and then the opener).
@@ -1119,10 +1258,17 @@ class RolePlayEngine:
                 level=Level.WEAK,
                 resolves=True,
             )
-        reveal_due = bool(obs.gate.first_probes) or bool(reveal_topics)
+        reveal_due = bool(first_probes) or bool(reveal_topics)
         challenged = False
         held_for_cut = False
-        move = self.scheduler.select(r_sec)
+        moment = self._moment(reading, negotiated, kinds, r_sec) if natural else None
+        move = self.scheduler.select(r_sec, moment=moment)
+        if moment is not None and moment.slack_ok:
+            # Logged only: the idle primary the rule of before would have raised waits (item 1).
+            baseline = self.scheduler.select(r_sec)
+            if baseline is not None and (move is None or move.id != baseline.id):
+                self._moment_waits += 1
+                reasons.append("owed_waits_for_moment")
         if move is not None:
             if reveal_due and self._may_defer(move, r_sec):
                 reasons.append("owed_deferred_for_reveal")
@@ -1161,7 +1307,7 @@ class RolePlayEngine:
                 self._interrupt_deferred.add(move.id)
                 held_for_cut = True
                 reasons.append("owed_deferred_for_interrupt")
-            elif challenges_learner(candidate_text) and self._may_hold_for_challenge(move, r_sec):
+            elif challenges_learner(reading) and self._may_hold_for_challenge(move, r_sec):
                 # The advisor pushed back on the learner's own words or on how it asks (owner test
                 # 7f2a25e6: "where did you get that number?" got a one-line answer and the F2 push).
                 # That is answered first and the owed move waits ONE turn; twice per session and
@@ -1171,13 +1317,14 @@ class RolePlayEngine:
                 # challenges, and under a once-per-move rule 58 got the F4 primary on top of "you
                 # are asking too many questions").
                 self._challenge_deferred.append(move.id)
+                self._turn_hold = ("challenge", move.id, "")
                 challenged = True
                 self._notes.append(CHALLENGE_NOTE)
                 reasons.append("owed_deferred_for_challenge")
             elif (
                 move.id not in self._dig_deferred
-                and self._dig_key(candidate_text) not in self._dig_deferred_topics
-                and asks_about_learner(candidate_text)
+                and self._dig_key(reading) not in self._dig_deferred_topics
+                and asks_about_learner(reading)
                 and self._may_defer(move, r_sec)
             ):
                 # The advisor asked the learner a direct question about themselves (a dig the
@@ -1188,7 +1335,8 @@ class RolePlayEngine:
                 # deferral per topic of dig (iteration 3): a run of digs on the same topic would
                 # otherwise hold every owed move back in turn.
                 self._dig_deferred.add(move.id)
-                self._dig_deferred_topics.add(self._dig_key(candidate_text))
+                self._dig_deferred_topics.add(self._dig_key(reading))
+                self._turn_hold = ("dig", move.id, self._dig_key(reading))
                 reasons.append("owed_deferred_for_dig")
             elif (
                 self._dig_now
@@ -1199,9 +1347,28 @@ class RolePlayEngine:
                 # answers, and the owed move waits (``DISCOVERY_HOLD_LIMIT``).  A forced move, the
                 # time cue and the 19:00 stall never wait here (``_may_hold``).
                 self._discovery_holds[move.id] = self._discovery_holds.get(move.id, 0) + 1
+                self._turn_hold = ("discovery", move.id, "")
                 reasons.append("owed_deferred_for_discovery")
+            elif (
+                respond
+                and kinds
+                and move.id not in self._respond_held
+                and not (move.family == "F1" and self._price_talk)
+                and self._may_hold(move, r_sec)
+            ):
+                # M032 S1 item 2 (D-M032-1): the advisor made an offer, gave her time, asked her
+                # something or answered her own question.  She responds to that first and the owed
+                # move waits ONE turn: once per move, only while the plan has slack (``_may_hold``),
+                # never a forced move, the time cue or the 19:00 stall, and never an F1 move on a
+                # turn about price (the negotiation reads that turn).
+                self._respond_held.add(move.id)
+                kind = next(item for item in _RESPOND_ORDER if item in kinds)
+                self._respond_holds[kind] = self._respond_holds.get(kind, 0) + 1
+                self._turn_hold = ("respond", move.id, kind)
+                reasons.append("owed_deferred_to_respond")
             else:
                 self.scheduler.issue(move)
+                self._turn_issued = move.id
                 reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
                 if repeat_request and move.id == cut_move:
                     reasons.append("repeat_after_cut")  # her cut line again: the repeat asked for
@@ -1211,9 +1378,9 @@ class RolePlayEngine:
                     stall = self._commit_stall_plan(
                         move,
                         reasons,
-                        first_probes=obs.gate.first_probes,
+                        first_probes=first_probes,
                         reveal_topics=reveal_topics,
-                        monologue=candidate_seconds,
+                        monologue=monologue,
                     )
                     if stall is not None:
                         return stall
@@ -1222,9 +1389,9 @@ class RolePlayEngine:
                         move,
                         reasons,
                         redirect=False,
-                        first_probes=obs.gate.first_probes,
+                        first_probes=first_probes,
                         reveal_topics=reveal_topics,
-                        monologue=candidate_seconds,
+                        monologue=monologue,
                     )
         if lone_backchannel or repeat_request:
             # "Yeah" said over the learner cut her off: she finishes her point in one sentence and
@@ -1236,9 +1403,9 @@ class RolePlayEngine:
             return self._plan(
                 TurnMode.LLM_REPLY,
                 reasons,
-                first_probes=obs.gate.first_probes,
+                first_probes=first_probes,
                 reveal_topics=reveal_topics,
-                monologue=candidate_seconds,
+                monologue=monologue,
                 credit_move_id=cut_move,
             )
         trigger = self._wrap_trigger(r_sec)
@@ -1249,7 +1416,7 @@ class RolePlayEngine:
             and wants is None
             and not (negotiated.email_offer or negotiated.checkin)
             and not self._wrap_engaged(negotiated)
-            and self._wrap_turn_is_pause(candidate_text)
+            and self._wrap_turn_is_pause(reading)
         ):
             # M2: a natural pause, and an offer is due: the interviewer offers to wrap up in place
             # of the learner's free reply (this turn was said to her and stays evidence).
@@ -1263,6 +1430,9 @@ class RolePlayEngine:
         # A challenge is only answered (``CHALLENGE_NOTE``): no curiosity question, no check-in.
         # Neither is the turn that cut the learner off while she was raising an owed move.
         quiet = reveal_due or break_kind is not None or challenged or held_for_cut
+        # M032 S1 item 4: a turn that left something open for her hands over no curiosity topic;
+        # her reply answers it (a check-in still asks for one real question).
+        responding = respond and bool(kinds) and not self._force_curiosity
         if self._force_curiosity and not quiet:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
             # reaction and one real question, never the stall.
@@ -1271,14 +1441,14 @@ class RolePlayEngine:
             # honest reaction, a question only if she has one), never "say you have no more".
             done = not curiosity and r_sec >= TIME_CUE_SEC
             self._notes.append(CHECKIN_DONE_NOTE if done else CHECKIN_NOTE)
-        elif not quiet:
+        elif not quiet and not responding:
             curiosity = self._curiosity_for_free_reply()
         return self._plan(
             TurnMode.LLM_REPLY,
             reasons,
-            first_probes=obs.gate.first_probes,
+            first_probes=first_probes,
             reveal_topics=reveal_topics,
-            monologue=candidate_seconds,
+            monologue=monologue,
             curiosity=curiosity,
         )
 
@@ -1369,6 +1539,22 @@ class RolePlayEngine:
         if plan.aside or plan.mode is TurnMode.EXIT or plan.turn != self.turn:
             return
         self._lost_plan = plan
+        layers = self._turn_layers
+        if layers is None or layers[0] != plan.turn:
+            layers = (plan.turn, (), ())
+        self._lost_half = _LostHalf(
+            turn=plan.turn,
+            text=self._turn_text,
+            seconds=self._turn_seconds,
+            first_probes=layers[1],
+            reveal_topics=layers[2],
+            kinds=self._turn_kinds,
+            issued=self._turn_issued,
+            hold=self._turn_hold,
+            intent_key=(
+                (plan.move_id or plan.negotiation_id) if plan.mode is TurnMode.INTENT else None
+            ),
+        )
         self._lost_undo = None if self._turn_undo is None else (*self._turn_undo, self._turn_ask)
         if (
             plan.resolves_commitment
@@ -1641,6 +1827,135 @@ class RolePlayEngine:
         """The learner's last line asked the advisor something: the next words are theirs."""
         return bool(self._asked) and self._asked[-1]
 
+    # ------------------------------------------------- M032 S1: respond first, natural moments
+    def _respond_kinds(
+        self,
+        text: str,
+        negotiated: NegotiationTurn,
+        wants: AskKind | None,
+        *,
+        carried: _LostHalf | None = None,
+    ) -> frozenset[str]:
+        """What the advisor's turn left open for her (``RESPOND_*``), or nothing.
+
+        A turn the negotiation answers (a call or enrolment ask, a callback, an e-mail offer or a
+        price on the table) leaves nothing here: the negotiation has its own lines for it.  A
+        check-in is not a question put to her (it hands her the floor and asks her for one real
+        question).  ``carried``: the first half of a split answer, whose reply was never heard.
+        """
+        if (
+            wants is not None
+            or negotiated.email_offer
+            or negotiated.callback is not None
+            or negotiated.offers
+        ):
+            return frozenset()
+        kinds: set[str] = set() if carried is None else set(carried.kinds)
+        if offers_something(text):
+            kinds.add(RESPOND_OFFER)
+        if backs_off(text):
+            levers, coercive = urgency_levers(text)
+            if not coercive and not levers & _PRESSING_LEVERS:
+                kinds.add(RESPOND_BACK_OFF)
+        if asks_her_directly(text) and not negotiated.checkin and not challenges_learner(text):
+            # A challenge has its own hold (twice per session) and its own note.
+            kinds.add(RESPOND_QUESTION)
+        if self._answers_her_question(text):
+            kinds.add(RESPOND_ANSWERED)
+        return frozenset(kinds)
+
+    def _answers_her_question(self, text: str) -> bool:
+        """Her last line asked something of her own (not an owed move) and this turn answers it."""
+        if not self._learner_asked_last() or self._last_owed_line or is_hollow_turn(text):
+            return False
+        if any(curiosity_covered(topic, text) for topic in self._her_question_topics):
+            return True
+        return tells_something(text)
+
+    def _respond_notes(self, kinds: frozenset[str]) -> None:
+        """The reply's job on a turn that left something open for her (S1 items 2 and 6)."""
+        if RESPOND_OFFER in kinds:
+            self._notes.append(OFFER_MADE_NOTE)
+        if RESPOND_BACK_OFF in kinds:
+            # RCA END-5: the advisor gave her time, so the proposed next step no longer stands
+            # (HOLD_NOTE stops) and, if there was pressure to ease, she lets it go.  A new ask
+            # later sets the hold again.
+            eased = (
+                self._pending_ask is not None
+                or self._concerns.get(CONCERN_PRESSURE, 0) > 0
+                or self.scheduler.is_delivered(F4_PRIMARY)
+            )
+            self._pending_ask = None
+            if eased:
+                self._notes.append(PRESSURE_EASED_NOTE)
+        if RESPOND_QUESTION in kinds:
+            self._notes.append(ASKED_DIRECTLY_NOTE)  # a free reply's; an intent answers it first
+        if RESPOND_ANSWERED in kinds:
+            self._notes.append(ANSWERED_YOU_NOTE)
+
+    def _moment(
+        self, text: str, negotiated: NegotiationTurn, kinds: frozenset[str], r_sec: float
+    ) -> Moment:
+        """The natural-moment reading of this turn for the scheduler (S1 item 1, D-M032-1)."""
+        thread_open = bool(kinds) or self._dig_now
+        thread_closed = not thread_open and (
+            answers_substantively(text)
+            or (is_hollow_turn(text) and not self._learner_asked_last())
+        )
+        return Moment(
+            slack_ok=self._ahead_of_pacing(r_sec),
+            floor_offered=negotiated.checkin or offers_floor(text),
+            thread_open=thread_open,
+            thread_closed=thread_closed,
+        )
+
+    def _give_back_lost(self, half: _LostHalf) -> None:
+        """S1 item 7: what the lost reply's plan used up and nobody heard, given back.
+
+        The move it issued (so a move is issued once per heard reply), its turn with the model
+        (the variants rotate as if it never happened), the disclosure layers it marked (the
+        replan hands them to the reply that is heard) and the one-turn hold it spent on the owed
+        move (to respond first, for a dig, for discovery or for a challenge): the replan reads
+        both halves and may hold the move again, so the reply that is heard is the one that
+        answers first.
+        """
+        if half.issued is not None:
+            self.scheduler.unissue(half.issued)
+        key = half.intent_key
+        if key is not None and self._intent_uses.get(key, 0) > 0:
+            self._intent_uses[key] -= 1
+        self.tracker.gate.give_back_offers(half.turn)
+        if half.hold is None:
+            return
+        kind, move_id, counted = half.hold
+        if kind == "respond":
+            self._respond_held.discard(move_id)
+            left = self._respond_holds.get(counted, 0) - 1
+            if left > 0:
+                self._respond_holds[counted] = left
+            else:
+                self._respond_holds.pop(counted, None)
+        elif kind == "dig":
+            self._dig_deferred.discard(move_id)
+            self._dig_deferred_topics.discard(counted)
+        elif kind == "discovery":
+            left = self._discovery_holds.get(move_id, 0) - 1
+            if left > 0:
+                self._discovery_holds[move_id] = left
+            else:
+                self._discovery_holds.pop(move_id, None)
+        elif kind == "challenge" and move_id in self._challenge_deferred:
+            self._challenge_deferred.remove(move_id)
+
+    def _voiced_concerns(self) -> str:
+        """The themes she already voiced, as worker-authored clauses joined by "and" (item 5)."""
+        labels = [
+            label
+            for theme, label in CONCERN_LABELS
+            if self._concerns.get(theme, 0) >= CONCERN_THRESHOLDS.get(theme, 1)
+        ]
+        return " and ".join(labels)
+
     @staticmethod
     def _wrap_engaged(negotiated: NegotiationTurn) -> bool:
         """The advisor worked the sale this turn: handled a reason, proposed a call or a price."""
@@ -1888,8 +2203,18 @@ class RolePlayEngine:
             topics = "; ".join(labels[topic] for topic in self._answered if topic in labels)
             if topics:
                 notes.append(ANSWERED_NOTE.format(topics=topics))
+        concerns = (
+            self._voiced_concerns()
+            if mode is TurnMode.LLM_REPLY and flag_on(FLAG_CONCERN_LEDGER)
+            else ""
+        )
         if mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
-            notes.append(HOLLOW_NOTE)
+            # M032 S1 item 5: merged with what she already said, so the two never pull apart.
+            notes.append(
+                HOLLOW_CONCERNS_NOTE.format(concerns=concerns) if concerns else HOLLOW_NOTE
+            )
+        elif concerns:
+            notes.append(VOICED_CONCERNS_NOTE.format(concerns=concerns))
         if (
             mode is TurnMode.LLM_REPLY
             and self._decider_said
@@ -2492,6 +2817,13 @@ class RolePlayEngine:
             # The layers are handed over only here, on the turn that asked about the topic.
             self.tracker.gate.mark_hint_offered(first_probes)
             self.tracker.gate.mark_deep_offered(reveal_topics)
+            self._turn_layers = (self.turn, tuple(first_probes), tuple(reveal_topics))
+            # M032 S1 item 2: an intent on a turn that put a question to her answers it first.
+            answering = self._dig_now or (
+                intent is not None
+                and RESPOND_QUESTION in self._turn_kinds
+                and flag_on(FLAG_RESPOND_FIRST)
+            )
             reminder = turn_reminder(
                 self.persona,
                 r_sec=self.last_r,
@@ -2511,7 +2843,7 @@ class RolePlayEngine:
                 reaction_only=intent is not None and intent.kind == KIND_COMMIT,
                 style_note=style_note,
                 confirm=confirm,
-                answering=self._dig_now,
+                answering=answering,
                 intent_shape=pick_variant((0, 1), self.seed, self.turn),
             )
             ctx = self.guard_context(
@@ -2607,6 +2939,17 @@ class RolePlayEngine:
             self._asked.append("?" in spoken_text)
             self._last_reply_closer = is_closer(spoken_text)
             self._raised_last = plan.move_id is not None or plan.negotiation_id is not None
+            # M032 S1: whether her line carried an owed move or a negotiation line (her question in
+            # it is the move's, answered by its push), what her own question asked about, and the
+            # themes of her line (counts).
+            self._last_owed_line = (
+                plan.move_id is not None
+                or plan.negotiation_id is not None
+                or plan.credit_move_id is not None
+            )
+            self._her_question_topics = curiosity_asked_in(spoken_text)
+            for theme in concern_themes(spoken_text):
+                self._concerns[theme] = self._concerns.get(theme, 0) + 1
             phrases = reply_phrases(spoken_text)
             self._phrase_history.append(phrases)
             for key in phrases:
@@ -2615,6 +2958,21 @@ class RolePlayEngine:
         self._curiosity_asked.update(curiosity_asked_in(spoken_text))  # L1: her own questions
         if self._decider_said_turn is None and self.scheduler.spoken_proves(F4_PUSH, spoken_text):
             self._decider_said_turn = plan.turn  # L7: the decision maker is named
+        if (
+            plan.mode is TurnMode.LLM_REPLY
+            and plan.move_id is None
+            and plan.negotiation_id is None
+            and plan.credit_move_id is None
+            and spoken_text.strip()
+            and flag_on(FLAG_NATURAL_TIMING)
+            and self.scheduler.spoken_proves(F4_PUSH, spoken_text)
+        ):
+            # M032 S1 item 3 (RCA LR-5, fda9e9f6 #48): she volunteered the decision-maker stall in a
+            # free reply.  It is an objection for spacing, so the idle fuse does not fire the next
+            # primary right after it; it is NOT a voiced reason (grading reads those) and the owed
+            # F4 push is not marked delivered.
+            self.scheduler.note_objection(turn=plan.turn)
+            self._volunteered_objections += 1
         self.negotiation.note_learner_text(
             spoken_text,
             plan.turn,
@@ -2815,6 +3173,14 @@ class RolePlayEngine:
                 # Pushes the learner voiced in a free reply (not owed again), and calls it declined.
                 "organic_pushes": list(self._organic_pushes),
                 "declined_calls": self._declined_calls,
+                # M032 S1 (counts only): owed moves held to respond first, by what was open; idle
+                # primaries that waited for a natural moment; stalls she volunteered; the themes
+                # of her lines; continuations planned from both halves of a split answer.
+                "respond_first_holds": dict(sorted(self._respond_holds.items())),
+                "moment_waits": self._moment_waits,
+                "volunteered_objections": self._volunteered_objections,
+                "concerns": dict(sorted(self._concerns.items())),
+                "split_replans": self._split_replans,
             },
             # Counts only (logged for the rehearsal metrics, not posted): replies that held a
             # question, the tracked phrase tics, and what the advisor already answered.
