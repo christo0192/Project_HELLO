@@ -79,6 +79,13 @@ LOOKAHEAD_MAX_SEC = 90.0
 SPACING_TURNS = 2
 # A primary whose topic never came up is raised after this many turns without an objection.
 IDLE_GAP_TURNS = SPACING_TURNS + 1
+# M032 S1 (owner decision D-M032-1, flag ``R1_NATURAL_TIMING``).  While the plan is ahead of its
+# pacing map (``Moment.slack_ok``), the idle path waits for a natural moment: the advisor handed
+# her the floor, or a thread just closed; otherwise for this longer quiet stretch, and never while
+# a thread is open (an offer, a back-off or a question put to her, or her own question just
+# answered).  IDLE_GAP_TURNS itself is unchanged (the engine's SLACK_TURNS_PER_MOVE derives from
+# it), and so are spacing, the topic trigger, the deadlines and the forced path.
+IDLE_GAP_SLACK_TURNS = 5
 # An advisor turn this long (and not a bare "Okay", nor mainly a question or a request about the
 # call) counts as a substantive answer to a primary.
 SUBSTANTIVE_ANSWER_WORDS = 8
@@ -950,6 +957,163 @@ def answers_substantively(text: object) -> bool:
     return 2 * said >= total
 
 
+# M032 S1: readers of the advisor's turn for the learner's manners (respond first, the natural
+# moment).  Lexical, sentence by sentence, every quantifier bounded.  Copied in spirit from the
+# phone bot's directedness rule (a broad "is it a question?" test fired on answer openings), never
+# imported from it.
+#
+# An OFFER waits for her reaction: the advisor, in the first person singular, proposes to do
+# something for her ("I can bring him into a joint call", "let me set up a demo class", "would you
+# like me to arrange a mentor chat?").  "We can ..." is left out: on the advisor corpus it is
+# nearly always the programme described ("we can set up a catch-up session if you miss a class"),
+# and so is a pitch ("we will send you a certificate").  Nothing about price, a discount, a free
+# trial, a budget or enrolling counts (the negotiation reads those), nor an e-mail, a link, the
+# details or a callback (the negotiation's too).
+_OFFER = _compile(
+    r"\bi(?:'ll| will| can| could)(?: also| actually| even| easily| happily| definitely| just)? "
+    r"(?:put|add|get(?! back)|bring|arrange|give|send|share|set up|connect|organi[sz]e|book|"
+    r"include|show|introduce|loop)\b",
+    r"\blet me (?:send|arrange|set up|get you|connect|put|add|organi[sz]e|book)\b",
+    r"\b(?:would you like|do you want|want) me to\b",
+    r"\bif you (?:want|like|prefer|wish)\b[^.?!]{0,40}\bi(?:'ll| will| can| could)\b",
+)
+_OFFER_EXCLUDED = _compile(
+    r"\$\s?\d",
+    r"\b\d[\d,]*\s*(?:dollars|usd|k)\b",
+    r"\b\d{1,2}\s?%",
+    r"\b(?:price|pricing|priced|fees?|costs?|discount\w*|off|scholarships?|cashback|rebate|"
+    r"waive\w*|emi|instal\w*|free|percent|enrol\w*|pay|paying|payment\w*|budget|monthly|"
+    r"per month|a month|call you|ring you)\b",
+)
+# The negotiation's own offers: an e-mail, a message, a link or the details sent over.
+_OFFER_NEGOTIATION = _compile(
+    r"\b(?:e-?mail\w*|mail|whatsapp|text message|link|brochure|summary|details|information|"
+    r"info|curriculum|syllabus)\b",
+)
+# A BACK-OFF gives her time ("take your time", "no rush", "discuss it at home and come back to
+# me").  Not when the same turn presses again ("no pressure, but the offer ends today"), and not a
+# course description ("the program is self-paced, so you can take your time with each module").
+_BACK_OFF = _compile(
+    r"\btake (?:your|all the|as much|some) time\b",
+    r"\bno (?:rush|hurry|pressure)\b",
+    r"\bdon'?t (?:rush|hurry|feel (?:rushed|pressured))\b",
+    r"\bwhenever you(?:'re| are) ready\b",
+    r"\bthink (?:it|this|about it) over\b",
+    r"\bsleep on it\b",
+    r"\byou can\b[^.?!]{0,50}\b(?:get back to (?:me|us)|call (?:me|us) back|come back to (?:me|us)|"
+    r"reach out to (?:me|us))\b",
+    r"\b(?:get back to (?:me|us)|call (?:me|us) back|come back to (?:me|us))\b[^.?!]{0,30}"
+    r"\b(?:later|whenever|when you|once you|after you|any ?time)\b",
+)
+_BACK_OFF_COURSE = _compile(
+    r"\b(?:modules?|lessons?|class(?:es)?|courses?|program(?:me)?s?|curriculum|recordings?|"
+    r"sessions?|pace|paced|assignments?|projects?)\b",
+)
+_PRESSES_AGAIN = _compile(
+    r"\b(?:today|tonight|ends?|ending|deadline|last (?:chance|day|few)|limited|hurry up|"
+    r"won'?t wait|spots?|seats?|fill(?:ing)? (?:up|fast)|higher price|"
+    r"(?:price|fee) (?:goes|will go) up)\b",
+    r"\b(?:decid|enrol|sign|join|commit|regist)\w* (?:soon|quickly|now|today|this week)\b",
+)
+# A QUESTION PUT TO HER: a question-like sentence that names her ("which figure would suit you?",
+# "how does your week usually look").  Not an open invitation (that hands her the floor), a tag
+# ("..., right?"), "does that make sense?", a presence check, a request about the call itself, a
+# discourse marker said as a question ("Okay, you know what? ...", "Guess what?"), or a pitch said
+# as a question ("did you know you can book a mentor anytime?", "isn't it great that ...?", "why
+# do you think our students ...?").
+_TAG_TAIL = re.compile(
+    r"[,\s]+(?:right|okay|ok|yeah|yes|no|na|isn'?t it|you know|correct|huh|eh)\W{0,3}$"
+)
+_NOT_PUT_TO_HER = _compile(
+    r"\bmakes? sense\b",
+    r"\b(?:can you hear me|are you (?:there|with me)|hello)\b",
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then|but)\W+){0,3}(?:do|did) you (?:even )?(?:know|"
+    r"realis\w*|realiz\w*)\b",
+    r"\bwould it help (?:you )?to know\b",
+    r"^\W*(?:\w+\W+){0,2}why do you think\b",
+    r"\b(?:isn'?t|wouldn'?t|won'?t) (?:it|that|this) be\b",
+    r"\bisn'?t (?:it|that|this) (?:great|amazing|nice|good|wonderful|awesome|fair|cool)\b",
+    r"\bdon'?t you think\b",
+    # A sentence that is only a discourse marker ("Okay, you know what?", "See, guess what?").
+    r"^\W*(?:(?:okay|ok|so|and|but|well|hey|oh|yeah|see|now|listen)\W+){0,3}"
+    r"(?:you know(?: what)?|guess what)\W*$",
+)
+_SECOND_PERSON = re.compile(r"\b(?:you|your|yours|yourself)\b")
+
+
+def offers_something(text: object) -> bool:
+    """The advisor offers to do something for the learner that waits for her reaction (M032 S1)."""
+    sentences = _sentences(text)
+    if any(pattern.search(sentence) for sentence in sentences for pattern in _OFFER_NEGOTIATION):
+        return False
+    for sentence in sentences:
+        if any(pattern.search(sentence) for pattern in _OFFER_EXCLUDED):
+            continue
+        if any(pattern.search(sentence) for pattern in _OFFER):
+            return True
+    return False
+
+
+def backs_off(text: object) -> bool:
+    """The advisor gives the learner time or hands the decision back to her (M032 S1)."""
+    sentences = _sentences(text)
+    if any(pattern.search(sentence) for sentence in sentences for pattern in _PRESSES_AGAIN):
+        return False
+    for sentence in sentences:
+        if any(pattern.search(sentence) for pattern in _BACK_OFF_COURSE):
+            continue
+        if any(pattern.search(sentence) for pattern in _BACK_OFF):
+            return True
+    return False
+
+
+def asks_her_directly(text: object) -> bool:
+    """A question-like sentence addressed to the learner herself (M032 S1, RCA LR-4).
+
+    Wider than ``r1_personas.asks_about_learner`` ("which figure would suit you?" is no dig) and
+    narrower than "any question": an open invitation hands her the floor instead, a tag question
+    asks nothing, and a presence check or a request about the call is not put to her in role.
+    """
+    for sentence in _sentences(text):
+        if not _asks_the_learner(sentence):
+            continue
+        tag = _TAG_TAIL.search(sentence)
+        if tag is not None:
+            head = sentence[: tag.start()]
+            if "?" not in head and not is_question_like(head):
+                continue
+        if any(pattern.search(sentence) for pattern in _OPEN_INVITATION):
+            continue
+        if any(pattern.search(sentence) for pattern in (*_META_REQUEST, *_NOT_PUT_TO_HER)):
+            continue
+        if _SECOND_PERSON.search(sentence):
+            return True
+    return False
+
+
+def tells_something(text: object) -> bool:
+    """The advisor SAID something (M032 S1): ``SUBSTANTIVE_ANSWER_WORDS`` words in statements.
+
+    Stricter than ``answers_substantively``: an open invitation ("That makes sense. What else is
+    on your mind?") hands her the floor but answers nothing, so its words do not count here.
+    """
+    said = 0
+    for sentence in _sentences(text):
+        if _asks_the_learner(sentence) or any(
+            pattern.search(sentence) for pattern in (*_OPEN_INVITATION, *_META_REQUEST)
+        ):
+            continue
+        said += word_count(sentence)
+    return said >= SUBSTANTIVE_ANSWER_WORDS
+
+
+def offers_floor(text: object) -> bool:
+    """The advisor hands the learner the floor ("What else is on your mind?", "Any questions?")."""
+    return any(
+        pattern.search(sentence) for sentence in _sentences(text) for pattern in _OPEN_INVITATION
+    )
+
+
 def _asks_something(sentence: str) -> bool:
     """A question that is not itself a farewell ("Have a great day." opens like one)."""
     if "?" in sentence:
@@ -1077,6 +1241,24 @@ class TurnSignals:
     substantive: bool
     topics: frozenset[str] = frozenset()
     answered: bool = False
+
+
+@dataclass(frozen=True)
+class Moment:
+    """What the advisor's turn was, for the idle path of a primary (M032 S1, D-M032-1).
+
+    ``slack_ok``: the plan is ahead of its pacing map (the engine's ``_ahead_of_pacing``); without
+    it the moment changes nothing.  ``floor_offered``: the advisor handed her the floor (a check-in,
+    "what else is on your mind?").  ``thread_open``: something waits for her answer (an offer, a
+    back-off, a question put to her, a dig, or her own question just answered).  ``thread_closed``:
+    the advisor finished a point and left nothing open.  The engine builds it per turn and passes it
+    to ``select`` for that turn only.
+    """
+
+    slack_ok: bool = False
+    floor_offered: bool = False
+    thread_open: bool = False
+    thread_closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1333,12 +1515,16 @@ class OwedMoveScheduler:
         ):
             self.price_answered_turn = self.turn
 
-    def note_objection(self) -> None:
+    def note_objection(self, *, turn: int | None = None) -> None:
         """A learner objection that is not a scheduled move (a stall reason) just landed.
 
-        Spacing counts it, so the next scheduled objection still has breathing room.
+        Spacing counts it, so the next scheduled objection still has breathing room.  ``turn`` is
+        the learner turn it was said on (M032 S1: a stall she volunteered in a free reply, recorded
+        after that reply played); the current turn by default, and never earlier than the last one.
         """
-        self._last_objection_turn = self.turn
+        when = self.turn if turn is None else min(turn, self.turn)
+        if self._last_objection_turn is None or when > self._last_objection_turn:
+            self._last_objection_turn = when
 
     def _primary_gate(self, family: str | None) -> bool:
         return self.open_family in (None, family)
@@ -1399,12 +1585,28 @@ class OwedMoveScheduler:
         last = self._topic_turn.get(family)
         return last is not None and self.turn - last <= 1
 
-    def _primary_in_context(self, family: str | None) -> bool:
-        """Breathing room first; then the topic came up, or it has been quiet for a while."""
+    def _primary_in_context(self, family: str | None, moment: Moment | None = None) -> bool:
+        """Breathing room first; then the topic came up, or it has been quiet for a while.
+
+        With a ``moment`` that has slack (M032 S1, D-M032-1) the quiet-stretch path needs a
+        natural moment too: the floor handed to her or a thread just closed, else
+        ``IDLE_GAP_SLACK_TURNS`` quiet turns, and never an open thread.  It can only make a primary
+        later than without one, never earlier.
+        """
         gap = self._since_objection()
         if gap < SPACING_TURNS:
             return False
-        return self._topic_fresh(family) or gap >= IDLE_GAP_TURNS
+        if self._topic_fresh(family):
+            return True
+        if gap < IDLE_GAP_TURNS:
+            return False
+        if moment is None or not moment.slack_ok:
+            return True
+        if moment.floor_offered:
+            return True
+        if moment.thread_open:
+            return False
+        return moment.thread_closed or gap >= IDLE_GAP_SLACK_TURNS
 
     def _push_answered(self, primary_id: str) -> bool:
         """A push follows an answer to its primary, or waits a couple of turns.
@@ -1426,11 +1628,11 @@ class OwedMoveScheduler:
             or (self._since(primary_id) or 0) >= PUSH_PATIENCE_TURNS
         )
 
-    def _soft_ready(self, state: _MoveState) -> bool:
+    def _soft_ready(self, state: _MoveState, moment: Moment | None = None) -> bool:
         move_id = state.spec.id
         since = self._since
         if state.spec.role == "primary":
-            return self._primary_in_context(state.spec.family)
+            return self._primary_in_context(state.spec.family, moment)
         if move_id == F3_PUSH:
             return self._push_answered(F3_PRIMARY)
         if move_id == F2_PUSH:
@@ -1473,8 +1675,12 @@ class OwedMoveScheduler:
             return enabled
         return max(float(deadline), enabled)
 
-    def select(self, r_sec: float) -> OwedMove | None:
-        """The one move owed at this turn, or None.  Does not mark it as issued."""
+    def select(self, r_sec: float, *, moment: Moment | None = None) -> OwedMove | None:
+        """The one move owed at this turn, or None.  Does not mark it as issued.
+
+        ``moment`` (M032 S1) is what the advisor's turn was, for the idle path of a primary
+        (``_primary_in_context``); None is the rule of before, so every other caller keeps it.
+        """
         if self._delivered_in_turn == self.turn:
             return None
         self._refresh_enabled(r_sec)
@@ -1484,7 +1690,7 @@ class OwedMoveScheduler:
             if not self._hard_ready(state, r_sec):
                 continue
             forced = self._is_forced(state, r_sec)
-            if not (forced or self._soft_ready(state)):
+            if not (forced or self._soft_ready(state, moment)):
                 continue
             order = _ORDER[state.spec.id]
             deadline = state.spec.deadline_sec
@@ -1521,6 +1727,16 @@ class OwedMoveScheduler:
         state = self._states[move.id]
         state.issued += 1
         state.forced_when_issued = move.forced
+
+    def unissue(self, move_id: str) -> None:
+        """Give back one issue of ``move_id``: its reply was cancelled before any audio (M032 S1).
+
+        The split-answer replan issues the move again for the reply that is heard, so a move is
+        counted once per reply the candidate heard ("issued": 2 for one spoken F2 push).
+        """
+        state = self._states.get(move_id)
+        if state is not None and state.issued > 0:
+            state.issued -= 1
 
     def next_move(self, r_sec: float) -> OwedMove | None:
         """Select the owed move and mark it issued."""

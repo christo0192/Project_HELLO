@@ -1705,5 +1705,290 @@ class PushAnsweredByTopicTests(unittest.TestCase):
                         self.assertLessEqual(delivery.slip_sec, 60.0, delivery)
 
 
+# M032 S1 (owner decision D-M032-1): while the plan has slack, an owed primary whose topic did not
+# come up waits for a natural moment.  Synthetic advisor turns, shaped like the owner's session
+# (fda9e9f6 #49: an offer to put the husband on the call got the F2 primary on the idle fuse).
+OFFER_TURN = "Sure, if he is around, I can bring him into a joint call and go over it all with him."
+BACKOFF_TURN = "Fine, discuss it with your family and come back to me whenever you are ready."
+DIRECT_QUESTION = "So which number would suit you?"
+
+
+def idle_three(s: OwedMoveScheduler) -> float:
+    """F3 done, then two quiet turns: the third quiet turn is F2's idle-fuse turn (returns its R)."""
+    r = through_f3(s)
+    turn(s, NEUTRAL, r)
+    turn(s, NEUTRAL, r + 40)
+    return r + 80
+
+
+class NaturalMomentTests(unittest.TestCase):
+    """D-M032-1: the idle path of a primary waits for a natural moment while the plan has slack."""
+
+    def test_the_idle_gap_constants(self):
+        self.assertEqual(sched.IDLE_GAP_TURNS, 3)  # SLACK_TURNS_PER_MOVE derives from it
+        self.assertEqual(sched.IDLE_GAP_SLACK_TURNS, 5)
+
+    def test_no_moment_is_today_s_idle_fuse(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(OFFER_TURN, r)
+        self.assertEqual(s.select(r).id, F2_PRIMARY)
+        self.assertEqual(s.select(r, moment=None).id, F2_PRIMARY)
+
+    def test_an_open_thread_holds_the_idle_primary_while_there_is_slack(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(OFFER_TURN, r)
+        self.assertIsNone(s.select(r, moment=sched.Moment(slack_ok=True, thread_open=True)))
+        # Without slack the idle fuse fires exactly as before, open thread or not.
+        moment = sched.Moment(slack_ok=False, thread_open=True)
+        self.assertEqual(s.select(r, moment=moment).id, F2_PRIMARY)
+
+    def test_a_closed_thread_or_a_handed_floor_fires_the_idle_primary(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(PITCH, r)
+        for moment in (
+            sched.Moment(slack_ok=True, thread_closed=True),
+            sched.Moment(slack_ok=True, floor_offered=True),
+            sched.Moment(slack_ok=True, floor_offered=True, thread_open=True),
+        ):
+            with self.subTest(moment=moment):
+                self.assertEqual(s.select(r, moment=moment).id, F2_PRIMARY)
+
+    def test_with_slack_and_no_moment_the_primary_waits_for_the_longer_gap(self):
+        s = make()
+        r = idle_three(s)  # gap 3
+        quiet = sched.Moment(slack_ok=True)
+        s.observe_candidate_turn(SHORT, r)
+        self.assertIsNone(s.select(r, moment=quiet))
+        s.observe_candidate_turn(SHORT, r + 40)  # gap 4
+        self.assertIsNone(s.select(r + 40, moment=quiet))
+        s.observe_candidate_turn(SHORT, r + 80)  # gap 5
+        self.assertEqual(s.select(r + 80, moment=quiet).id, F2_PRIMARY)
+        # ... but never while a thread is open.
+        held = sched.Moment(slack_ok=True, thread_open=True)
+        self.assertIsNone(s.select(r + 80, moment=held))
+
+    def test_a_fresh_topic_still_fires_even_on_an_open_thread(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(SCHEDULE_TALK, r)
+        moment = sched.Moment(slack_ok=True, thread_open=True)
+        self.assertEqual(s.select(r, moment=moment).id, F2_PRIMARY)
+
+    def test_spacing_and_the_forced_path_are_unchanged(self):
+        s = make()
+        r = through_f3(s)
+        s.observe_candidate_turn(SCHEDULE_TALK, r)  # topic fresh but one turn after the push
+        self.assertIsNone(s.select(r, moment=sched.Moment(slack_ok=True, floor_offered=True)))
+        late = make()
+        turn(late, OPENER, 20)
+        turn(late, PITCH, 60)  # F3 primary
+        self.assertEqual(turn(late, NEUTRAL, 490).id, F3_PUSH)
+        late.observe_candidate_turn(OFFER_TURN, 600)
+        move = late.select(600, moment=sched.Moment(slack_ok=True, thread_open=True))
+        self.assertEqual((move.id, move.forced), (F2_PRIMARY, True))
+
+    def test_a_push_is_not_held_by_the_moment(self):
+        s = make()
+        turn(s, OPENER, 20)
+        turn(s, PITCH, 60)  # F3 primary
+        s.observe_candidate_turn(OFFER_TURN, 100)
+        move = s.select(100, moment=sched.Moment(slack_ok=True, thread_open=True))
+        self.assertEqual(move.id, F3_PUSH)
+
+    def test_unissue_gives_back_one_issue(self):
+        s = make()
+        turn(s, OPENER, 20)
+        s.observe_candidate_turn(PITCH, 60)
+        move = s.next_move(60)
+        self.assertEqual(s._states[move.id].issued, 1)
+        s.unissue(move.id)
+        self.assertEqual(s._states[move.id].issued, 0)
+        s.unissue(move.id)  # never below zero
+        self.assertEqual(s._states[move.id].issued, 0)
+        s.unissue("NOT-A-MOVE")  # unknown ids are ignored
+
+
+class AdvisorTurnReaderTests(unittest.TestCase):
+    """M032 S1 readers of the advisor's turn: an offer, a back-off and a question put to her."""
+
+    def test_offers(self):
+        for text in (
+            OFFER_TURN,
+            "I can send you the recordings of a sample class.",
+            "If you like, I can share a few alumni stories with you.",
+            "Let me set up a demo class for you this week.",
+            "Would you like me to set up a demo class for you?",
+            "I'll put your husband on the call as well, no problem.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.offers_something(text))
+
+    def test_not_offers(self):
+        for text in (
+            PITCH,
+            NEUTRAL,
+            SCHEDULE_TALK,
+            "We send you the recordings after every class.",
+            "We will send you a certificate at the end of the program.",
+            "You'll build three portfolio projects.",
+            "We can coach you for interviews at top companies.",
+            # The programme described ("we can ..."), as the advisor corpus nearly always means it.
+            "We can arrange a short session with one of our mentors for you.",
+            "If you miss a class, we can set up a quick catch-up session for you on Sunday.",
+            # Price, a discount, a free trial or enrolling: the negotiation reads these.
+            "I can't go down to $7,000, but I can take $1,000 off on the upfront plan.",
+            "I can throw in a free month if you sign up this week.",
+            "I can offer you a scholarship of ten percent.",
+            "I can get you exact numbers on the monthly plan if you're leaning toward it.",
+            # An e-mail, the details or a link: the negotiation's e-mail offer.
+            "Would you like me to send you the curriculum?",
+            "Sure, I can send those over. What's the best email for you?",
+            "I can understand that, it's a big decision.",
+            "I'll get back to you on that tomorrow.",
+            "Can I send you the enrolment link?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.offers_something(text))
+
+    def test_back_offs(self):
+        for text in (
+            BACKOFF_TURN,
+            "No hurry at all. Mull it over and come back to me whenever you like.",
+            "There's no pressure at all, think it over.",
+            "Whenever you're ready, just let me know.",
+            "Take your time.",
+            "No hurry, you can discuss it with your husband and let me know.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.backs_off(text))
+
+    def test_not_back_offs(self):
+        for text in (
+            PITCH,
+            NEUTRAL,
+            "I'll call you back tomorrow at six.",
+            "The program is self-paced, so you can take your time with each module.",
+            "If you miss a class you can catch up and get back on track.",
+            "You can always reach out to your mentor with doubts.",
+            "No pressure, but the offer ends today.",
+            "Take your time, but seats are limited, so decide by tonight.",
+            "Totally fair, take your time. The discount window won't wait, so decide soon.",
+            "No pressure, though waiting for the next cohort usually means a higher price.",
+            "Let me know if you have any questions.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.backs_off(text))
+
+    def test_questions_put_to_her(self):
+        for text in (
+            DIRECT_QUESTION,
+            "So tell me, what are you hoping to get from me?",
+            "We have weekend batches too. Which timing would suit you better?",
+            "How does your week usually look",  # speech-to-text dropped the question mark
+            "Does that work for you?",
+            "Have you looked at any other courses before?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.asks_her_directly(text))
+
+    def test_not_questions_put_to_her(self):
+        for text in (
+            NEUTRAL,  # an open invitation hands her the floor
+            "Any questions?",
+            "What do you think?",
+            "Does that make sense?",
+            "Does that make sense to you?",
+            "You know what I mean, right?",
+            "It is worth it, right?",
+            # A discourse marker said as a question, then a statement.
+            "Okay, you know what? I will explain it once more.",
+            "Guess what? The next batch has weekend classes.",
+            "Can you hear me?",
+            "Are you there?",
+            "Can you disconnect the call?",
+            "What I do is call learners every day.",
+            "Shall we look at the next steps?",
+            # A pitch said as a question (the advisor corpus has dozens).
+            "Do you know you can book a slot with a mentor whenever you want?",
+            "Did you know you can book a one-on-one session with a mentor anytime?",
+            "Would it help to know that you can book a session with a mentor anytime?",
+            "Why do you think our students book a mentor call every month?",
+            "Isn't it great that you can schedule a mock interview anytime?",
+            "Don't you think that is worth it for your career?",
+            PITCH,
+            OFFER_TURN,
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.asks_her_directly(text))
+
+    def test_floor_offers(self):
+        for text in (NEUTRAL, "Anything else you want to know?", "Any other concerns?"):
+            with self.subTest(text=text):
+                self.assertTrue(sched.offers_floor(text))
+        for text in (PITCH, DIRECT_QUESTION, OFFER_TURN, "We have no other fees."):
+            with self.subTest(text=text):
+                self.assertFalse(sched.offers_floor(text))
+
+    def test_the_readers_are_quick_on_hostile_text(self):
+        import time
+
+        for text in ("you " * 4000, "I can " * 3000, "take " * 4000 + "?", "a" * 20000):
+            start = time.perf_counter()
+            for reader in (sched.offers_something, sched.backs_off, sched.asks_her_directly):
+                reader(text)
+            self.assertLess(time.perf_counter() - start, 1.0)
+
+
+class AdvisorTurnReaderCorpusTests(unittest.TestCase):
+    """The new readers on the labelled advisor corpus and the held-out set (2,160 phrasings).
+
+    The corpus's ``pitch_only`` label is derived (no ask, offer, price or farewell), so many of its
+    rows ARE questions put to the learner ("Have you tried learning on your own?") or back-offs
+    ("Take your time, no rush."), which these readers are meant to see.  So the counts are pinned
+    instead, per reader, after the hits were read by hand (M032 S1): a change to a reader that moves
+    them has to be looked at again.  The e-mail offers, call proposals and enrolment asks among the
+    offers and questions go to the negotiation first in the engine (``RolePlayEngine``), which only
+    reads an offer or a question put to her on a turn with no ask, callback or e-mail offer.
+    """
+
+    PINNED = {"offers_something": 70, "backs_off": 45, "asks_her_directly": 680}
+
+    @staticmethod
+    def _rows():
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if line:
+                    yield json.loads(line)
+
+    def test_the_hit_counts_are_the_reviewed_ones(self):
+        counts = {name: 0 for name in self.PINNED}
+        for row in self._rows():
+            for reader in (sched.offers_something, sched.backs_off, sched.asks_her_directly):
+                if reader(row["text"]):
+                    counts[reader.__name__] += 1
+        self.assertEqual(counts, self.PINNED)
+
+    def test_no_pitch_only_row_is_an_offer_unless_it_offers_in_the_first_person(self):
+        for row in self._rows():
+            if row["labels"].get("pitch_only") and sched.offers_something(row["text"]):
+                with self.subTest(id=row["id"]):
+                    self.assertRegex(
+                        row["text"].lower(), r"\b(?:i can|i'll|i will|want me to|would you like me)"
+                    )
+
+    def test_every_corpus_row_is_read_quickly(self):
+        import time
+
+        start = time.perf_counter()
+        for row in self._rows():
+            for reader in (sched.offers_something, sched.backs_off, sched.asks_her_directly):
+                reader(row["text"])
+        self.assertLess(time.perf_counter() - start, 10.0)
+
+
 if __name__ == "__main__":
     unittest.main()
