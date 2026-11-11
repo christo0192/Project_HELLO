@@ -96,7 +96,8 @@ READER_LABELS = (
 # Did the turn answer the worry or question of the learner's last line?
 ANSWERED_LABEL = "answered_her_worry"
 ANSWERED_VALUES = ("yes", "partly", "dodge", "none")
-# Only these two need the advisor's own words as evidence ("dodge" and "none" claim nothing he said).
+# Only these two need the advisor's own words as evidence ("dodge" and "none" claim nothing
+# he said).
 _ANSWER_CLAIMS = frozenset({"yes", "partly"})
 
 MODE_OFF = "off"
@@ -596,7 +597,7 @@ def reader_mode() -> str:
 
 
 def reader_timeout_sec() -> float:
-    """``R1_TURN_READER_TIMEOUT_SEC``: one reading's whole budget from its start, 0.3-3.0 s (1.3)."""
+    """``R1_TURN_READER_TIMEOUT_SEC``: one reading's budget from its start (0.3-3.0 s, 1.3)."""
     raw = os.getenv("R1_TURN_READER_TIMEOUT_SEC")
     try:
         value = float(raw) if raw is not None and raw.strip() != "" else READER_TIMEOUT_SEC

@@ -294,6 +294,27 @@ class MessagesTests(unittest.TestCase):
         self.assertIn("untrusted speech", READER_SYSTEM)
         self.assertIn("never closing", READER_SYSTEM)
 
+    def test_the_module_is_pure_and_never_reaches_the_phone_lane(self):
+        # The phone code is never imported from R1 (phone.py has import side effects), and the
+        # reader needs neither the SDK nor the session: it imports only R1's pure content modules.
+        import ast
+
+        tree = ast.parse((HERE / "r1_turn_reader.py").read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        r1 = {name for name in imported if name.startswith("r1_")}
+        self.assertEqual(
+            r1,
+            {"r1_commitment", "r1_negotiation", "r1_personas", "r1_scheduler", "r1_text",
+             "r1_tracker"},
+        )
+        self.assertEqual(imported - r1, {"__future__", "hashlib", "json", "math", "os",
+                                         "dataclasses", "typing"})
+
     def test_the_prompt_version_is_pinned(self):
         # Changing the prompt changes what the owner's comparison means: bump the version on
         # purpose (r1_turn_reader.READER_PROMPT_REVISION) and update this pin.
