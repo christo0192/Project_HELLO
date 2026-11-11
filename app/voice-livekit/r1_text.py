@@ -399,6 +399,60 @@ def reply_phrases(text: object) -> tuple[str, ...]:
     return tuple(found)
 
 
+# M032 S1 concern ledger (RCA END-5, phone map M8 / spoken-style M4).  The themes the learner
+# herself voiced, read from what she actually said: once said (twice for pressure), a free reply is
+# told not to say it again in any words.  Steering only: nothing is ever cut from a reply.
+CONCERN_PRESSURE = "pressure"
+CONCERN_OFFENDED = "offended"
+CONCERN_THINK_OVER = "think_over"
+CONCERN_TRUST = "trust"
+_CONCERNS = (
+    (
+        CONCERN_PRESSURE,
+        re.compile(
+            r"\b(?:pressur(?:e|ed|es|ing)|rush(?:ed|ing)?|hurr(?:y|ied|ying)|pushed into|"
+            r"only chance|breathing room|back off|on the spot)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        CONCERN_OFFENDED,
+        re.compile(
+            r"\b(?:caught me off guard|sour (?:taste|note)|uncalled for|offend(?:ed|s|ing)?|"
+            r"hurtful|disrespect\w*|"
+            r"(?:that was|that's|that is|pretty|quite|very|bit|really|so) rude)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        CONCERN_THINK_OVER,
+        re.compile(
+            r"\b(?:think (?:it|this|that|things) (?:over|through)|get(?:ting)? back to you|"
+            r"(?:give|put) (?:it|this) (?:some )?(?:proper |more |real |serious )?thought|"
+            r"sit with (?:it|this)|sleep on (?:it|this)|mull (?:it|this) over|"
+            r"take (?:some|a (?:bit|little) of|a few days'?|a day'?s?) (?:time|to think))\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        CONCERN_TRUST,
+        re.compile(
+            r"\b(?:proof|prove (?:it|that|this)|evidence|see (?:it|that|this|some of (?:that|it|"
+            r"this)|results) (?:for )?myself|see for myself|before trusting|trust (?:it|that|this|"
+            r"you|them)|track record|too good to be true)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+CONCERN_THEMES = tuple(theme for theme, _pattern in _CONCERNS)
+
+
+def concern_themes(text: object) -> frozenset[str]:
+    """The concern themes the learner's own ``text`` voices (worker-side labels only)."""
+    folded = fold(text)
+    return frozenset(theme for theme, pattern in _CONCERNS if pattern.search(folded))
+
+
 def is_closer(text: object) -> bool:
     """True when ``text`` is the learner closing the call itself (``CLOSER``)."""
     return CLOSER.search(fold(text)) is not None

@@ -652,5 +652,76 @@ class FinalReviewRoundOnePhraseTests(unittest.TestCase):
             self.assertGreaterEqual(r1_guard.PHRASE_WINDOW[phrase], 3)
 
 
+class ConcernThemeTests(unittest.TestCase):
+    """M032 S1 concern ledger: the themes the learner herself voiced (paraphrased session lines)."""
+
+    def test_each_theme_is_read_from_her_own_words(self):
+        from r1_text import (
+            CONCERN_OFFENDED,
+            CONCERN_PRESSURE,
+            CONCERN_THINK_OVER,
+            CONCERN_TRUST,
+            concern_themes,
+        )
+
+        cases = {
+            CONCERN_PRESSURE: (
+                "That is a lot of pressure for one phone call.",
+                "I don't like being rushed into something this big.",
+                "Saying this is my only chance doesn't sit right with me.",
+                "I just need some breathing room to weigh it.",
+                "I'd rather not be put on the spot like this.",
+            ),
+            CONCERN_OFFENDED: (
+                "Wow, that caught me off guard.",
+                "That left a sour taste, honestly.",
+                "That was pretty rude.",
+                "I'm a bit offended by that.",
+            ),
+            CONCERN_THINK_OVER: (
+                "I'll think it over and get back to you.",
+                "I want to give it some proper thought on my end.",
+                "Let me sit with it for a bit.",
+                "I'd like to sleep on it.",
+                "I need to take some time on my own first.",
+            ),
+            CONCERN_TRUST: (
+                "I'd want to see some of that myself before trusting it.",
+                "Is there any proof that people actually get hired?",
+                "It sounds a little too good to be true.",
+            ),
+        }
+        for theme, texts in cases.items():
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertIn(theme, concern_themes(text))
+
+    def test_ordinary_lines_voice_no_theme(self):
+        from r1_text import concern_themes
+
+        for text in (
+            "Are the classes live or recorded?",
+            "My schedule is already packed, so six months worries me.",
+            "I'm not ready to decide today, maybe the next cohort.",
+            "I'd need to talk to my husband first.",
+            "$9,000 feels like a lot, can you do $7,000?",
+            "What happens if I fall behind?",
+            "That sounds helpful, thanks.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(concern_themes(text), frozenset())
+
+    def test_the_theme_readers_are_quick(self):
+        import time
+
+        from r1_text import concern_themes
+
+        start = time.perf_counter()
+        for text in ("pressure " * 5000, "see " * 5000 + "myself", "take some " * 4000, "a" * 50000):
+            concern_themes(text)
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
