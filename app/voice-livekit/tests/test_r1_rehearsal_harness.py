@@ -2915,6 +2915,19 @@ class S2PBunchingGridTests(unittest.TestCase):
     def test_a_mid_call_slowdown_costs_no_score(self):
         self.assertEqual(self.grid.gate_regressions(self.steps_s2, self.steps_on), [])
 
+    def test_she_still_probes_at_slower_paces(self):
+        """Review S2P-R3: the R 10:00 bound switched the probe off from 35 s an exchange (0 F1 and
+        F2 probes in 33 runs) and the anchor checked the website's price unprompted instead."""
+        print("\n" + self.grid.probe_table(self.on))
+        at = {pace: [item for item in self.on if item.pace == pace] for pace in self.grid.PACES}
+        self.assertTrue(any(item.probes.get("F1") for item in at[35.0]))
+        self.assertTrue(any(item.probes.get("F2") for item in at[35.0]))
+        for pace in (20.0, 25.0):
+            with self.subTest(pace=pace):
+                self.assertEqual([i.pattern for i in at[pace] if i.unprompted_check], [])
+        slow = [item for pace in (35.0, 50.0, 65.0) for item in at[pace]]
+        self.assertLessEqual(sum(1 for item in slow if item.unprompted_check), 5)
+
     def test_the_probe_then_react_path_lands_every_family_at_the_owner_s_pace(self):
         for item in self.on:
             if item.pattern == "answerer" and item.pace <= 35:

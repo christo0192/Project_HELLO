@@ -402,10 +402,11 @@ KIND_CUE = "cue"
 KIND_PROBE = "probe"
 # Her price questions the advisor answered without a figure, before she checks the website's price.
 MAX_PRICE_DODGES = 2
-# A probe spends a turn only while every owed graded move can still land at this many turns each
-# (``RolePlayEngine._probe_slack``).  On the bunching grid (2026-11-12) 2.0, 2.5 and 3.0 gave the
-# same rows; with no slack check the probes at 35-65 s an exchange forced 13 more moves and made
-# F1 and F4 late for three patterns.
+# A probe spends a turn only while every owed graded move can still land by its family's deadline
+# at this many turns each (``RolePlayEngine._probe_slack``).  On the bunching grid (2026-11-12) 2.0,
+# 2.5 and 3.0 gave the same rows; with no slack check the probes at 35-65 s an exchange forced 13
+# more moves and made F1 and F4 late for three patterns.  After the S2P review (R 10:00 no longer
+# bounds a probe) 1.5 forced one move more than the release before, 2.0 none.
 PROBE_TURNS_PER_MOVE = 2.0
 # SWEEP-20: the early-close redirect's probe lines (scripted and pinned in ``r1_script``; a SAY_ONLY
 # plan's text, spoken in the learner's voice through the reply stream like the redirect before them,
@@ -3554,10 +3555,18 @@ class RolePlayEngine:
         )
 
     def _probe_slack(self, r_sec: float) -> bool:
-        """One more turn now still lets every owed graded move land by its family's deadline, and
-        all of them by R 10:00 (``S1_FINISH_BY_SEC``: from 10:00 a stop is scored only with every
-        family delivered, so a probe never makes such a stop unscored), at
-        ``PROBE_TURNS_PER_MOVE`` turns each and the slowest recent pace."""
+        """One more turn now still lets every owed graded move land by its family's deadline, at
+        ``PROBE_TURNS_PER_MOVE`` turns each and the slowest recent pace: S2.10's "probe deadline =
+        family deadline minus about one exchange", for the probe's family and the families due
+        before it.
+
+        Review S2P-R3: the R 10:00 bound the S1 waits keep (``_s1_slack``) is not applied here.
+        D-M032-7 lets her state the website's price unasked only after two dodges or when the
+        family's deadline forces it, and that bound switched the probe off from the first turn at
+        35 s an exchange or slower (0 F1 and F2 probes in 33 grid runs, the check form asked
+        unprompted in 9).  Without it the grid has no newly late or excluded run and no more forced
+        moves (``rehearsal/bunching_grid.py --compare-s2p``, ``probe_table``).
+        """
         pace = self.scheduler.cautious_lookahead_sec
         owed = 0
         for deadline, move_ids in _PACING_MAP:
@@ -3565,7 +3574,7 @@ class RolePlayEngine:
             owed += left
             if left and r_sec + pace * (1 + PROBE_TURNS_PER_MOVE * owed) > deadline:
                 return False
-        return r_sec + pace * (1 + PROBE_TURNS_PER_MOVE * owed) <= S1_FINISH_BY_SEC
+        return True
 
     def _probe_step(self, move: OwedMove, r_sec: float) -> ProbeSpec | None:
         """The probe S2.10 owes before ``move`` now, or None (the move itself is due).

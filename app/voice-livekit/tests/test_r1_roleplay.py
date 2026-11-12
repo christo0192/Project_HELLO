@@ -9407,15 +9407,23 @@ class ProbeFirstF1Tests(unittest.TestCase):
         eng = engine()
         state = eng.scheduler._states[F1_ANCHOR]
         early = eng.scheduler._owed(state, 150.0, False)
-        self.assertIsNone(eng._probe_step(early, 150.0))  # F3 and F2 still owed: no slack
+        # F3 and F2 still owed: 150 + 45 x (1 + 2 x 8 owed) = 915 <= 930, every deadline holds.
+        self.assertIs(eng._probe_step(early, 150.0), r1_scheduler.PROBE_F1)
+        # 400 + 45 x (1 + 2 x 2 owed) = 625 > 430: F3's pair would land late, so no slack.
+        self.assertIsNone(eng._probe_step(eng.scheduler._owed(state, 400.0, False), 400.0))
         for r, move_id in enumerate(
             (F3_PRIMARY, F3_PUSH, r1_roleplay.F2_PRIMARY, r1_roleplay.F2_PUSH), start=1
         ):
             eng.scheduler.confirm_delivered(move_id, 20.0 * r)
-        # 150 + 45 x (1 + 2 x 4 owed) = 555: every family can still land by R 10:00.
+        # 150 + 45 x (1 + 2 x 2 owed) = 375 <= 810 and 150 + 45 x (1 + 2 x 4) = 555 <= 930.
         self.assertIs(eng._probe_step(early, 150.0), r1_scheduler.PROBE_F1)
-        # 500 + 405 > 600: a probe now would push a family past R 10:00.
-        self.assertIsNone(eng._probe_step(eng.scheduler._owed(state, 500.0, False), 500.0))
+        # Review S2P-R3: R 10:00 no longer bounds the probe (500 + 405 > 600), only the deadlines:
+        # 500 + 225 <= 810 and 500 + 405 <= 930.
+        self.assertIs(
+            eng._probe_step(eng.scheduler._owed(state, 500.0, False), 500.0), r1_scheduler.PROBE_F1
+        )
+        # 600 + 45 x 5 = 825 > 810: the probe would leave F1's pair no room before its deadline.
+        self.assertIsNone(eng._probe_step(eng.scheduler._owed(state, 600.0, False), 600.0))
         late = eng.scheduler._owed(state, 740.0, False)  # 740 + 2 x 45 > 810
         forced = eng.scheduler._owed(state, 150.0, True)
         self.assertIsNone(eng._probe_step(late, 740.0))
@@ -9853,6 +9861,21 @@ class Sweep20RedirectTests(unittest.TestCase):
         self.assertIn("$9,000", plan.scripted_text)
         self.assertIn("is that right", plan.scripted_text)
         self.assertTrue(s.eng.scheduler.is_delivered(F1_ANCHOR))
+
+    def test_a_farewell_at_a_slower_pace_still_asks_the_price(self):
+        # Review S2P-R3 (naturalness): at 35 s an exchange (R 5:00) the redirect said "I think the
+        # website said around $9,000, is that right?", the line shape SWEEP-20 exists to remove.
+        s = Session(engine())
+        r = after_f3(s, step=35)
+        s.say(SUBSTANTIVE_PITCH, r)
+        s.say(TIME_ANSWER, r + 35)
+        s.say(SHORT_ACK, r + 70)
+        s.say(ALUMNI, r + 105)
+        self.assertTrue(s.eng.scheduler.is_delivered(r1_roleplay.F2_PUSH))
+        plan = s.say(FAREWELL, 300.0)
+        self.assertEqual(plan.scripted_text, line("L-REDIRECT-PRICE"))
+        self.assertIsNone(COURSE_FIGURES.search(plan.scripted_text))
+        self.assertFalse(s.eng.scheduler.is_delivered(F1_ANCHOR))
 
     def test_an_f2_redirect_speaks_the_time_probe(self):
         s = Session(engine())

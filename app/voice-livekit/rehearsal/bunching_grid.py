@@ -300,6 +300,12 @@ class RunResult:
     turns: int = 0
     gaps: dict[str, int | None] = field(default_factory=dict)
     forced_moves: list[str] = field(default_factory=list)
+    # M032 S2P (review S2P-R3): the probes she asked per family, the F1-ANCHOR form she used, and
+    # whether that form checked the website's price unprompted (no price question asked, fewer than
+    # two dodged, the anchor not forced: the case D-M032-7 does not allow).
+    probes: dict[str, int] = field(default_factory=dict)
+    anchor: str | None = None
+    unprompted_check: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -317,6 +323,9 @@ class RunResult:
             "turns": self.turns,
             "gaps": dict(self.gaps),
             "forced_moves": list(self.forced_moves),
+            "probes": dict(self.probes),
+            "anchor": self.anchor,
+            "unprompted_check": self.unprompted_check,
         }
 
     def reaction_gaps(self) -> dict[str, int | None]:
@@ -548,6 +557,21 @@ def run_one(
             late.add(family)
     result.late = sorted(late)
     result.excluded = sorted(summary["exclusion_reasons"])
+    admin = engine.admin_log()
+    probe_first = admin.get("probe_first") or {}
+    result.probes = dict(probe_first.get("probes") or {})
+    anchors = [
+        str(item.get("response"))[len("anchor:"):]
+        for item in admin["negotiation"]["responses"]
+        if str(item.get("response", "")).startswith("anchor:")
+    ]
+    result.anchor = anchors[0] if anchors else None
+    result.unprompted_check = (
+        result.anchor == "check"
+        and not result.probes.get("F1")
+        and int(probe_first.get("price_dodges") or 0) < 2
+        and "F1-ANCHOR" not in result.forced_moves
+    )
     return result
 
 
@@ -678,6 +702,20 @@ def regressions(
         if item.cue_r is None and base.cue_r is not None:
             found.append(f"{where}: time cue newly missing")
     return found
+
+
+def probe_table(results: list[RunResult]) -> str:
+    """M032 S2P (review S2P-R3): per pace, the runs whose F1 and F2 probes were asked, and the
+    runs whose anchor checked the website's price unprompted (``RunResult.unprompted_check``)."""
+    paces = sorted({item.pace for item in results if item.step is None})
+    lines = ["pace   runs  F1_probe  F2_probe  unprompted_check"]
+    for pace in paces:
+        rows = [item for item in results if item.pace == pace and item.step is None]
+        f1 = sum(1 for item in rows if item.probes.get("F1"))
+        f2 = sum(1 for item in rows if item.probes.get("F2"))
+        bad = sum(1 for item in rows if item.unprompted_check)
+        lines.append(f"{pace:>4.0f} {len(rows):>6} {f1:>9} {f2:>9} {bad:>17}")
+    return "\n".join(lines)
 
 
 def last_delivery_table(before: list[RunResult], after: list[RunResult]) -> str:
@@ -839,6 +877,9 @@ def _compare_s2p(json_path: str | None) -> int:
         print(table(results))
         print(json.dumps(totals(results)))
         out[label] = {"totals": totals(results), "runs": [item.as_dict() for item in results]}
+    print("== probe rate per pace (s2p)")
+    print(probe_table(grids["s2p"]))
+    out["probe_rates"] = probe_table(grids["s2p"]).splitlines()
     for base in ("s2", "main"):
         found = regressions(grids[base], grids["s2p"])
         print(f"== last graded delivery R ({base} -> s2p)")
