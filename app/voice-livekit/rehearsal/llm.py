@@ -447,44 +447,97 @@ async def preflight(
 
 
 # --------------------------------------------------------------------- learner provider side
+# The session LLM's connection options in production (``r1_session._default_session_factory``:
+# ``SessionConnectOptions(llm_conn_options=APIConnectOptions(max_retry=1, retry_interval=0.5,
+# timeout=10.0))``).  A test pins these against that factory's source.
+SESSION_LLM_MAX_RETRY = 1
+SESSION_LLM_RETRY_INTERVAL = 0.5
+SESSION_LLM_TIMEOUT = 10.0
+
+
+def session_llm_conn_options() -> Any:
+    """``APIConnectOptions`` as the production session gives its LLM (None without the SDK)."""
+    try:
+        from livekit.agents import APIConnectOptions
+    except ImportError:  # pragma: no cover - the bare run has no SDK
+        return None
+    return APIConnectOptions(
+        max_retry=SESSION_LLM_MAX_RETRY,
+        retry_interval=SESSION_LLM_RETRY_INTERVAL,
+        timeout=SESSION_LLM_TIMEOUT,
+    )
+
+
 def make_live_learner_provider(
-    env: Mapping[str, str], ledger: Ledger, *, learner: Any = None
+    env: Mapping[str, str],
+    ledger: Ledger,
+    *,
+    learner: Any = None,
+    on_error: Callable[[Any], None] | None = None,
 ) -> Callable[[list], Any]:
     """The production learner client (``r1_llm.build_r1_llm``) as a ``provider(messages)``.
 
     Exactly what ``R1Agent.llm_node`` hands the SDK: the filtered messages as a chat context,
-    no tools.  Chunks are passed through unchanged, so the session's own guard, cutoff and
-    failure counting see what they see in production.
+    no tools, and the session's LLM connection options (one retry after 0.5 s, not the SDK's
+    default three after 2 s).  Chunks are passed through unchanged, so the session's own guard,
+    cutoff and failure counting see what they see in production.  ``on_error`` receives the
+    client's SDK ``error`` events (``LLMError``, recoverable or not), which ``AgentSession``
+    forwards to the session's ``error`` event in production.
     """
     from r1_llm import build_r1_llm
     from r1_session import _chat_context_from
 
     learner = learner if learner is not None else build_r1_llm(dict(env))
+    if on_error is not None and callable(getattr(learner, "on", None)):
+        learner.on("error", lambda event: on_error(_session_error(event, learner)))
+    options = session_llm_conn_options()
 
     async def stream(messages: list[dict[str, str]]) -> AsyncIterator[Any]:
-        async with learner.chat(chat_ctx=_chat_context_from(messages)) as chunks:
+        kwargs: dict[str, Any] = {"chat_ctx": _chat_context_from(messages)}
+        if options is not None:
+            kwargs["conn_options"] = options
+        async with learner.chat(**kwargs) as chunks:
             async for chunk in chunks:
                 yield chunk
 
     return stream
 
 
-def make_live_judge_runner(
-    env: Mapping[str, str], ledger: Ledger, *, judge_llm: Any = None, role: str = "shadow_judge"
-) -> Callable[[list], Any]:
-    """The shadow judge on R1's own judge client (temperature 0), as ``judge_runner``.
+def _session_error(event: Any, source: Any) -> Any:
+    """The session's ``error`` event for an LLM ``error`` event (``ErrorEvent(error, source)``)."""
+    from types import SimpleNamespace
 
-    ``role`` names the ledger line (the full tier also runs the end-intent classifier on it).
+    return SimpleNamespace(type="error", error=event, source=source, created_at=time.time())
+
+
+def make_live_judge_runner(
+    env: Mapping[str, str],
+    ledger: Ledger,
+    *,
+    judge_llm: Any = None,
+    role: str = "shadow_judge",
+    client: str = "judge",
+) -> Callable[[list], Any]:
+    """A model seam on its production client, as a ``*_runner``: the shadow judge by default.
+
+    ``client`` is the seam's production client (``rehearsal.seams.SEAM_CLIENTS``): ``judge`` is
+    R1's own judge client (``build_r1_judge_llm``, temperature 0: the shadow judge, the end-intent
+    classifier, the turn reader); ``interviewer`` is Christy's client (``build_r1_llm`` at its
+    default temperature: the transition bridge composes a spoken line on it).  Each runner builds
+    its own client, as production keeps one per seam.  ``role`` names the ledger line.
     """
-    from r1_llm import build_r1_judge_llm
+    from r1_llm import build_r1_judge_llm, build_r1_llm
     from r1_session import _chat_context_from
 
+    if client not in ("judge", "interviewer"):
+        raise ValueError(f"unknown seam client {client!r}")
+    build = build_r1_judge_llm if client == "judge" else build_r1_llm
     holder: dict[str, Any] = {} if judge_llm is None else {"llm": judge_llm}
     scrub = Scrubber([env.get(KEY_NAME, "")])
 
     async def run(messages: list[dict[str, str]]) -> str:
         if "llm" not in holder:
-            holder["llm"] = build_r1_judge_llm(dict(env))
+            holder["llm"] = build(dict(env))
         started = time.perf_counter()
         parts: list[str] = []
         usage = None

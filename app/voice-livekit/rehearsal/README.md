@@ -155,28 +155,48 @@ role-play, the exit, the wrap-up and L-CLOSE.
 * CLOCK (`vloop.py`): a virtual-time event loop. The driver's silence windows and caps take no real
   time (a 25-minute interview runs in about a second offline); a production model call (Christy, the
   learner, the shadow judge, the end-intent classifier) takes its real seconds on the clock; a harness
-  call (the simulated candidate, the rubric judge) stands the clock still. S is the interview clock, R
-  the role-play clock, both read from the session's own phase machine.
+  call (the simulated candidate, the rubric judge) stands the clock still; its retry backoff sleeps
+  in real time (`vloop.real_sleep`), and each call's header records how its clock moved (`clock`:
+  watchdog trips, real and jumped seconds). S is the interview clock, R the role-play clock, both read
+  from the session's own phase machine.
 * SDK SIDE (`sim.py`): scripted lines play for their words at the voice's pace; a candidate turn is
   `user_state_changed`, the STT finals, the endpoint, `on_user_turn_completed`, the reply through
   `llm_node`; the "I'm ready" button is the server-sent `data_received` packet the API relays
-  (`TestReadyButton`). Not emulated: barge-in, VAD fragments, the acknowledgement hold, TTS audio.
+  (`TestReadyButton`), pressed only while the page shows it (`awaiting` is `ready`; else a
+  `button_not_shown` event). Speech is scheduled as livekit-agents 1.6.4 does: one speech at a time in
+  creation order (a `say` made while a reply plays waits behind it), `interrupt()` cuts the playing
+  line (the transcript keeps the words played), and a turn that ends over an uninterruptible line gets
+  no reply. Live, the learner and Christy client uses the session's connection options (one retry
+  after 0.5 s) and its SDK `error` events reach the session as in production. Not emulated: barge-in,
+  VAD fragments, the acknowledgement hold, TTS audio.
+* SEAMS (`seams.py`): every `*_runner` of `R1Interview` runs as in production, where each is on by
+  default. Live, on its production client (`SEAM_CLIENTS`: the judge client for the shadow judge,
+  the end-intent classifier and the turn reader; Christy's client for the transition bridge); an
+  unmapped seam stops the sweep. Offline, a scripted stand-in (the end-intent classifier answers from
+  the turn's ground truth). The header's `seams` says which ran `live`, `scripted` or `absent`.
 * CANDIDATE (`candidate.py`): one person through the whole interview, phase-aware: a job candidate to
   Christy (icebreaker answers, brief questions, "ready", wrap-up questions), the Program Advisor to the
   learner (`advisor.py` behaviours), and out of role when Christy steps in (an end question, the offer
-  to wrap up). Live, DeepSeek plays it; offline, scripted banks.
+  to wrap up). It decides from what it HEARD: a sound check ("Can you hear me okay?") gets a short
+  yes, Christy's in-role questions are recognised from the line said, the offer to wrap up is taken
+  only on spoken cues, and a nervous silence lasts until Christy speaks again. A failed live advisor
+  turn is played by the scripted advisor of that level. Live, DeepSeek plays it; offline, scripted
+  banks.
 * SCENARIOS (`scenarios.py`, `manual.py`): the synthetic edge scenarios (strong, average,
   terse-nervous, brief-repair, button-mid-brief, roleplay-question, icebreaker-skip, early-end,
   early-end-late, abuse-once, price-dodge, price-never, pushy-discounter, wrapup-question, wrapup-none,
   silent) and the owner's manual tests (`scenarios/manual_tests.json`, paraphrased, the candidate is
   "Alex"): `manual-M01`..`manual-M10` replay a session's moves in order (live, DeepSeek rewords each
-  move to fit what was said; offline, the paraphrase), `manual-mix` samples the catalogue. Groups:
+  move to fit what was said; offline, the paraphrase; moves that shared one bot turn are one turn, and a
+  role-play move waits until R is within 15 s of when it was made), `manual-mix` samples the catalogue
+  (its call id says `mix`; the header has the level it drew). Groups:
   `default` (all of them), `manual-replay`, `manual`, `synthetic`, `early`, `price`, `wrapup`.
 * CHECKS (`full_metrics.py`): phase order, the close, the icebreaker exit window, the role-play start
-  only on "ready" or the button, the transition ceiling, no in-role exit before R 14:00 without
-  agreement, the end-request consent, the abuse path (feature-detected), brief repair, the wrap-up
-  answered, the hiring team named once, Christy's repeats, one goodbye, no learner after the exit,
-  dead air. Optional M032 behaviours are feature-detected (`session_facts.start_by`, an abuse path, any
+  the way the scenario started it (no fallback to the button, the button only when shown), the
+  transition ceiling, no in-role exit before R 14:00 without agreement, every end request heard
+  (asked, or an at-once exit the design allows; an ignored request also fails a time-cap end), the
+  abuse path (feature-detected), brief repair, the wrap-up answered, the hiring team named once,
+  Christy's repeats, one goodbye, no learner after the exit, dead air, no two bot lines at once. Optional M032 behaviours are feature-detected (`session_facts.start_by`, an abuse path, any
   extra `*_runner` seam of `R1Interview`), so the same harness runs on main and on the M032 branch.
 
 Files: `calls/<id>.json` (rows in the export schema with `phase`, `speaker`, `voice`, `ai_voice`,

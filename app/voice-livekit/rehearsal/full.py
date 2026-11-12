@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
-from rehearsal import HARNESS_VERSION
+from rehearsal import HARNESS_VERSION, vloop
 from rehearsal.call import _plan_summary, _suppressed_why, git_sha
 from rehearsal.candidate import CandidateSim, ScenarioAdvisor, View, heard_since
 from rehearsal.llm import (
@@ -77,7 +77,12 @@ class FullCallSpec:
 
     @property
     def level(self) -> str:
-        return self.advisor_level or SCENARIOS[self.scenario].level
+        """The advisor level the call id names.  A catalogue mix chooses its level per call (from
+        the seed), so its id says ``mix``; the realized level is in the record's header."""
+        if self.advisor_level:
+            return self.advisor_level
+        scenario = SCENARIOS[self.scenario]
+        return "mix" if scenario.mix else scenario.level
 
     @property
     def seed(self) -> str:
@@ -106,9 +111,18 @@ class FullDeps:
     rubric: Any = None
     # The call's own scenario when it differs from the registry's (a sampled manual mix).
     scenario: Any = None
+    # Seams built per call from its runtime (the offline stand-ins: ``rehearsal.seams``), and how
+    # each seam runs ("live" or "scripted"; a seam passed nothing is "absent").
+    make_runners: Callable[[Any], dict[str, Callable[[list], Any]]] | None = None
+    seam_mode: str = "scripted"
+    # Live: told the running call's session, so the production client's SDK error events reach
+    # it as AgentSession forwards them (``R1Interview._on_provider_error``).
+    bind_session: Callable[[Any], None] | None = None
 
 
-def interview_kwargs(deps: FullDeps) -> dict[str, Any]:
+def interview_kwargs(
+    deps: FullDeps, extra: Mapping[str, Callable[[list], Any]] | None = None
+) -> dict[str, Any]:
     """The ``*_runner`` seams this checkout's ``R1Interview`` accepts (feature detect)."""
     from r1_session import R1Interview
 
@@ -116,10 +130,15 @@ def interview_kwargs(deps: FullDeps) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if deps.judge_runner is not None and "judge_runner" in accepted:
         out["judge_runner"] = deps.judge_runner
-    for name, runner in deps.runners.items():
+    for name, runner in {**deps.runners, **dict(extra or {})}.items():
         if name in accepted and name not in out:
             out[name] = runner
     return out
+
+
+def seam_modes(deps: FullDeps, passed: Mapping[str, Any]) -> dict[str, str]:
+    """How each model seam of this checkout ran: live, scripted, or absent (off, as with no LLM)."""
+    return {name: (deps.seam_mode if name in passed else "absent") for name in runner_names()}
 
 
 def runner_names() -> tuple[str, ...]:
@@ -136,6 +155,9 @@ def runner_names() -> tuple[str, ...]:
 async def run_full_call(spec: FullCallSpec, deps: FullDeps) -> dict[str, Any]:
     """Run one whole interview and return its record (never raises: failures are recorded)."""
     scenario = deps.scenario or SCENARIOS[spec.scenario]
+    # The level the advisor really played: a catalogue mix samples it per call, and the role-play
+    # scorecard groups and gates calls by this header field.
+    level = scenario.level if (scenario.mix and not spec.advisor_level) else spec.level
     record: dict[str, Any] = {
         "header": {
             "harness_version": HARNESS_VERSION,
@@ -151,7 +173,7 @@ async def run_full_call(spec: FullCallSpec, deps: FullDeps) -> dict[str, Any]:
             "ground_truth": ground_truth(scenario),
             "persona_id": spec.persona_id,
             "persona_variant": spec.persona_variant,
-            "advisor_level": spec.level,
+            "advisor_level": level,
             "seed": spec.seed,
             "rep": spec.rep,
             "candidate_name": spec.candidate_name,
@@ -177,6 +199,7 @@ async def run_full_call(spec: FullCallSpec, deps: FullDeps) -> dict[str, Any]:
         "session_seconds": None,
     }
     wall = time.perf_counter()
+    counters = vloop.clock_counters()
     try:
         await _drive(spec, deps, record)
     except InsufficientBalance:
@@ -184,9 +207,18 @@ async def run_full_call(spec: FullCallSpec, deps: FullDeps) -> dict[str, Any]:
     except BudgetExceeded:
         record["stop_reason"] = "budget_exceeded"
     except Exception as exc:  # noqa: BLE001 - a broken call is a result, not a crash
-        record["stop_reason"] = record["stop_reason"] or "exception"
+        # The collection already named how the role-play stood ("stopped" ...); a call that broke
+        # is labelled as broken whatever that was, and the role-play's state is kept beside it.
+        record["roleplay_end_at_break"] = record["stop_reason"]
+        record["stop_reason"] = "exception"
         record["error"] = describe_error(exc, deps.scrub, 300)
     record["wall_seconds"] = round(time.perf_counter() - wall, 2)
+    after = vloop.clock_counters()
+    # How this call's clock moved: by real time (production calls, a tripped watchdog) or by jumps.
+    # A watchdog trip means a harness call stood the clock still for too long and then let it run.
+    record["header"]["clock"] = {
+        key: round(after[key] - counters[key], 3) for key in ("watchdog_trips", "real_seconds", "jumped_seconds")
+    }
     _score(record, deps)
     if deps.rubric is not None and record["exchanges"] and not record["error"]:
         try:
@@ -221,6 +253,8 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
     scenario = deps.scenario or SCENARIOS[spec.scenario]
     runtime = Runtime(spec.seed, offline=deps.offline)
     session = build_session(runtime)
+    if deps.bind_session is not None:
+        deps.bind_session(session)
     ctx = build_context(runtime)
     writer = build_writer(runtime)
     context = {
@@ -242,8 +276,10 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
         "learner": RecordingProvider(inner, deps.ledger, scrub=deps.scrub, role="learner"),
         "interviewer": RecordingProvider(inner, deps.ledger, scrub=deps.scrub, role="interviewer"),
     }
-    kwargs = interview_kwargs(deps)
+    extra = deps.make_runners(runtime) if deps.make_runners is not None else {}
+    kwargs = interview_kwargs(deps, extra)
     record["header"]["runners"] = sorted(kwargs)
+    record["header"]["seams"] = seam_modes(deps, kwargs)
     with capture_logs(loop.time) as lines:
         interview = R1Interview(ctx, context, session, writer, clock=loop.time, **kwargs)
         runtime.interview = interview
@@ -251,7 +287,9 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
         candidate = CandidateSim(
             scenario,
             deps.talker,
-            ScenarioAdvisor(deps.advisor, scenario, rewriter=getattr(deps.talker, "rewriter", None)),
+            ScenarioAdvisor(
+                deps.advisor, scenario, rewriter=getattr(deps.talker, "rewriter", None), seed=spec.seed
+            ),
             candidate_wps=runtime.timing.candidate_wps,
             advisor_wps=runtime.timing.advisor_wps,
             shadow=deps.shadow,
@@ -281,6 +319,16 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
                 _collect(runtime, interview, writer, record, lines)
             except Exception as exc:  # noqa: BLE001 - never mask the call's own failure
                 record["collect_error"] = describe_error(exc, deps.scrub, 200)
+            talker = deps.talker
+            record["candidate_failures"] = {
+                "advisor": int(getattr(candidate.advisor, "failures", 0) or 0),
+                "talker": int(
+                    getattr(talker, "failures", 0)
+                    or getattr(getattr(talker, "fallback", None), "failures", 0)
+                    or 0
+                ),
+                "rewriter": int(getattr(getattr(talker, "rewriter", None), "failures", 0) or 0),
+            }
         failure = results[0] if results else None
         if isinstance(failure, BaseException) and not isinstance(failure, asyncio.CancelledError):
             raise failure
@@ -334,22 +382,28 @@ async def _candidate_loop(
         view = _view(rt, since, waited)
         action = await sim.next_action(view)
         if action.kind == "press":
+            since, waited = rt.now(), 0.0
+            if not _button_shown(rt):
+                # The page shows the button only while the worker waits for "ready" (``awaiting``):
+                # a candidate cannot press what is not there.  Recorded, and they say it instead.
+                rt.note_event("button_not_shown", why=action.why or "candidate", awaiting=rt.page.get("awaiting"))
+                sim.note_button_missing(rt.interview.machine.phase.value)
+                continue
             sim.pressed = True
             driver.press_ready(action.why or "candidate")
-            since, waited = rt.now(), 0.0
-            # The page only shows the button while the worker waits for "ready": a press made
-            # elsewhere is a no-op there too, so the candidate then waits to hear something.
             await _wait_new_speech(rt, since, 30.0, run_task)
             continue
-        if action.kind in ("wait", "silent"):
-            limit = None if action.kind == "silent" else action.wait
-            heard = await _wait_new_speech(rt, since, limit, run_task)
+        if action.kind == "silent":
+            # Silence lasts until Christy speaks AGAIN: the line that prompted it (already over,
+            # and in the view) must not count, or the "silence" ends at once.
+            since, waited = rt.now(), 0.0
+            await _wait_new_speech(rt, since, None, run_task)
+            continue
+        if action.kind == "wait":
+            heard = await _wait_new_speech(rt, since, action.wait, run_task)
             waited = 0.0 if heard else waited + (action.wait or 0.0)
             continue
-        if not view.heard:
-            since_before = since
-        else:
-            since_before = since
+        since_before = since
         result = await driver.speak(
             action.text, wps=action.wps, act=action.act, role=action.role, intent=action.intent
         )
@@ -368,7 +422,9 @@ async def _wait_floor(
         playing = rt.now_playing
         if playing is not None:
             phase = rt.interview.machine.phase.value
-            if sim.press_due(phase, playing, rt.now() - playing.t_start, rt.now_playing_seconds):
+            if sim.press_due(
+                phase, playing, rt.now() - playing.t_start, rt.now_playing_seconds, rt.page
+            ):
                 sim.pressed = True
                 driver.press_ready("mid_brief")
         if rt.floor_free:
@@ -395,27 +451,69 @@ async def _wait_new_speech(
     return False
 
 
+def _button_shown(rt: Runtime) -> bool:
+    """The page shows the "I'm ready" button only while the worker waits for it."""
+    return rt.page.get("awaiting") == "ready"
+
+
+ASIDE_QUESTIONS = (("end", "L-ASIDE-END"), ("wrap", "L-ASIDE-WRAP"))
+
+
+def aside_texts(rt: Runtime) -> dict[str, str]:
+    """Christy's in-role questions as this call renders them (normalised), rendered once."""
+    cached = getattr(rt, "_aside_texts", None)
+    if cached is not None:
+        return cached
+    out: dict[str, str] = {}
+    for key, line_id in ASIDE_QUESTIONS:
+        try:
+            out[key] = normalize(rt.interview.render_line(line_id))
+        except Exception:  # noqa: BLE001 - a line this checkout does not have
+            continue
+    rt._aside_texts = out  # type: ignore[attr-defined]
+    return out
+
+
+def heard_question(rt: Runtime, heard: list[Any]) -> str | None:
+    """The in-role question the candidate just HEARD: the last bot line is Christy's L-ASIDE-END
+    ("end") or her offer to wrap up L-ASIDE-WRAP ("wrap"), as it was said; else None."""
+    bots = [span for span in heard if span.speaker == "bot"]
+    if not bots or bots[-1].voice == LEARNER:
+        return None
+    return aside_question_of(rt, bots[-1].text)
+
+
+def aside_question_of(rt: Runtime, text: str) -> str | None:
+    """"end" or "wrap" when ``text`` is Christy's L-ASIDE-END or L-ASIDE-WRAP as said, else None."""
+    said = normalize(text)
+    if not said:
+        return None
+    for key, line in aside_texts(rt).items():
+        if line and (line in said or (len(said) >= 30 and line.startswith(said))):
+            return key
+    return None
+
+
 def _view(rt: Runtime, since: float, waited: float) -> View:
     interview = rt.interview
     machine = interview.machine
     phase = machine.phase.value
-    open_question = None
-    resolved = False
+    heard = heard_since(rt.spans, since)
+    engine_question = None
     engine = getattr(interview, "_engine", None)
     if engine is not None and phase in ("roleplay", "aside"):
         if getattr(engine, "end_question_open", False):
-            open_question = "end"
+            engine_question = "end"
         elif getattr(engine, "wrap_question_open", False):
-            open_question = "wrap"
-        resolved = bool(getattr(engine, "commitment_resolved", False))
+            engine_question = "wrap"
     return View(
         phase=phase,
-        heard=heard_since(rt.spans, since),
+        heard=heard,
         s_sec=float(machine.session_clock),
         r_sec=float(machine.roleplay_elapsed) if machine.roleplay_entered else None,
         roleplay_started=any(span.speaker == "bot" and span.voice == LEARNER for span in rt.spans),
-        open_question=open_question,
-        commitment_resolved=resolved,
+        open_question=heard_question(rt, heard) if phase in ("roleplay", "aside") else None,
+        engine_question=engine_question,
         waited=waited,
         page=dict(rt.page),
     )
@@ -445,6 +543,10 @@ def _note_turn(
         "suppressed": result.get("why") if result.get("suppressed") else None,
         "reply": result.get("spoken"),
     }
+    if action.answering is not None:
+        # What the candidate answered (heard) next to the engine's own flag (cross-check).
+        turn["answering"] = action.answering
+        turn["engine_question"] = action.engine_question
     record["candidate_turns"].append(turn)
     if action.role != "advisor" or action.advisor is None:
         return
@@ -594,6 +696,9 @@ def transcript_rows(rt: Runtime, writer: Any) -> list[dict[str, Any]]:
         elif voice is None:
             voice = "learner" if saved["phase"] == "roleplay" else "interviewer"
         row["voice"] = VOICE_LABEL.get(voice, voice)
+        if row["voice"] == "christy" and saved["phase"] in ("aside", "roleplay"):
+            # Which in-role question this Christy line is ("end", "wrap"; None for any other).
+            row["question"] = aside_question_of(rt, saved["text"])
         if span is not None:
             row.update(
                 {

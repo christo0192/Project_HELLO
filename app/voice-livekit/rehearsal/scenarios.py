@@ -54,6 +54,7 @@ ACTS = (
     "wrapup_other",
     "tactic",
     "noise",
+    "sound_check_answer",
 )
 
 

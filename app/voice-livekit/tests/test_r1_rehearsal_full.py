@@ -400,15 +400,74 @@ class OfflineFullInterviewTests(unittest.TestCase):
         self.assertTrue(first["asked"])
         self.assertEqual(first["answer"], "end_decline")
         self.assertTrue(first["resumed"])
-        self.assertTrue(second.get("exited") or second["exited_at_once"], second)
+        # The second request either gets the question again, or exits at once on a basis the
+        # design allows: Christy already asked once (the request again confirms the stop).
+        if not second["asked"]:
+            self.assertTrue(second["exited_at_once"], second)
+            self.assertEqual(second["exit_basis"], "asked_before")
         self.assertEqual(self.records["early-end"]["stop_reason"], "end_request")
         self.assertLess(self.records["early-end"]["roleplay_seconds"], 600.0)
         late = _check(self.records["early-end-late"], "end_consent")
         self.assertTrue(late["ok"], late)
+        for item in late["requests"]:
+            self.assertTrue(item["asked"] or item.get("exit_basis") == "names_the_end", item)
         self.assertGreater(self.records["early-end-late"]["roleplay_seconds"], 700.0)
         self.assertLess(self.records["early-end-late"]["roleplay_seconds"], 840.0)
         for name in ("early-end", "early-end-late"):
             self.assertTrue(_check(self.records[name], "roleplay_end")["ok"])
+
+    def test_every_end_request_is_heard_in_the_offline_sweep(self) -> None:
+        # The end-intent classifier runs offline too (scripted from the turn's ground truth), so
+        # a request the lexical detectors miss ("can we wrap up this role-play?") is still heard,
+        # as in production where the classifier is on by default.
+        for name, record in self.records.items():
+            check = _check(record, "end_consent")
+            if check["ok"] is None:
+                continue
+            with self.subTest(scenario=name):
+                for item in check["requests"]:
+                    self.assertFalse(item.get("ignored"), item)
+                    self.assertFalse(item.get("exited_without_asking"), item)
+
+    def test_the_offline_seams_run_scripted_and_are_recorded(self) -> None:
+        from rehearsal.full import runner_names
+        from rehearsal.seams import SCRIPTED
+
+        record = self.records["strong"]
+        seams = record["header"]["seams"]
+        self.assertEqual(set(seams), set(runner_names()))
+        for name in runner_names():
+            expected = "scripted" if (name in SCRIPTED or name == "judge_runner") else "absent"
+            self.assertEqual(seams[name], expected, name)
+        self.assertIn("clock", record["header"])
+        self.assertEqual(record["header"]["clock"]["watchdog_trips"], 0)
+
+    def test_a_replayed_end_request_made_after_the_floor_is_said_after_it(self) -> None:
+        # M01's request was made at R 10:30 in the real session: the replay holds it until R is
+        # within the slack of that time, so it is not said below the 10:00 scoring floor.
+        from rehearsal.manual import REPLAY_HOLD_SLACK_SEC
+
+        record = self.records["manual-M01"]
+        request = _rows(record, speaker="candidate", act="end_request")[0]
+        self.assertGreaterEqual(request["r_sec"], 630.0 - REPLAY_HOLD_SLACK_SEC - 1.0)
+        self.assertEqual(record["stop_reason"], "end_request")
+        self.assertGreaterEqual(record["roleplay_seconds"], 600.0)
+
+    def test_no_two_bot_lines_ever_play_at_once(self) -> None:
+        for name, record in self.records.items():
+            with self.subTest(scenario=name):
+                check = _check(record, "bot_overlap")
+                self.assertNotEqual(check["ok"], False, check)
+
+    def test_a_time_up_line_waits_for_the_reply_in_flight(self) -> None:
+        # A say made while a reply plays is queued behind it (the SDK plays one speech at a time).
+        for name, record in self.records.items():
+            if record["stop_reason"] != "time_cap":
+                continue
+            rows = [r for r in _rows(record, speaker="bot") if r.get("t_end") is not None]
+            with self.subTest(scenario=name):
+                for before, after in zip(rows, rows[1:]):
+                    self.assertGreaterEqual(after["t_start"] + 0.05, before["t_end"], (before["text"][:40], after["text"][:40]))
 
     def test_the_abuse_path_where_the_code_base_has_one(self) -> None:
         from rehearsal.full_metrics import abuse_supported
@@ -463,15 +522,38 @@ class OfflineFullInterviewTests(unittest.TestCase):
         self.assertTrue(replies[0]["ok"])  # the brief was given again
 
     def test_the_price_scenarios_hold_their_rule(self) -> None:
-        from rehearsal.candidate import _PRICE_ASK, _PRICE_NAMED
+        from rehearsal.candidate import _PRICE_NAMED, asks_price
 
-        dodges = [t for t in self.records["price-dodge"]["candidate_turns"] if t["act"] == "price_dodge"]
-        self.assertTrue(dodges)
+        # price-dodge: two dodges of a price QUESTION come before any price is named.
+        turns = [t for t in self.records["price-dodge"]["candidate_turns"] if t["role"] == "advisor"]
+        acts = [t["act"] for t in turns]
+        self.assertEqual(acts.count("price_dodge"), 2, acts)
+        second_dodge = [i for i, act in enumerate(acts) if act == "price_dodge"][1]
+        for turn in turns[:second_dodge]:
+            if turn["act"] != "price_dodge":
+                self.assertNotRegex(turn["text"], _PRICE_NAMED)
+        # price-never: a price is named only right after the learner asked for it.
         exchanges = self.records["price-never"]["exchanges"]
         for index, exchange in enumerate(exchanges):
             if _PRICE_NAMED.search(exchange["advisor"]["text"]):
                 previous = exchanges[index - 1]["learner"]["spoken"] if index else ""
-                self.assertRegex(previous or "", _PRICE_ASK)
+                self.assertTrue(asks_price(previous), previous)
+            if exchange["advisor"]["act"] == "price_held":
+                previous = exchanges[index - 1]["learner"]["spoken"] if index else ""
+                self.assertFalse(asks_price(previous), previous)
+
+    def test_a_nervous_silence_lasts_until_christy_prompts_again(self) -> None:
+        rows = _rows(self.records["terse-nervous"])
+        index = next(i for i, r in enumerate(rows) if r.get("act") == "silence_answer")
+        before = rows[index - 1]
+        self.assertEqual(before["voice"], "christy")
+        previous_candidate = max(
+            (r for r in rows[:index] if r["speaker"] == "candidate"), key=lambda r: r["t_end"]
+        )
+        question = next(r for r in rows[:index][::-1] if r["voice"] == "christy" and r is not before)
+        # The candidate said nothing from the question to Christy's prompt (her silence window).
+        self.assertGreaterEqual(before["t_start"] - question["t_end"], 15.0)
+        self.assertLess(previous_candidate["t_end"], question["t_start"])
 
     def test_manual_replays_follow_their_moves_in_order(self) -> None:
         from rehearsal import manual
@@ -483,7 +565,10 @@ class OfflineFullInterviewTests(unittest.TestCase):
             with self.subTest(scenario=name):
                 moves = manual.replay_moves(manual.replay_of(SCENARIOS[name]))
                 names = {"learner": record["header"]["learner_first_name"], "wrong_name": "Priya"}
-                said = [t["text"] for t in record["candidate_turns"] if t["role"] == "advisor"]
+                # The replayed moves (a held move lets the fallback advisor fill in: no intent).
+                said = [
+                    t["text"] for t in record["candidate_turns"] if t["role"] == "advisor" and t["intent"]
+                ]
                 planned = [manual.render(m.text, names) or "Mm-hmm." for m in moves if m.phase == "roleplay"]
                 k = min(len(said), len(planned), 5)
                 self.assertGreater(k, 0)
@@ -548,6 +633,684 @@ class OfflineFullInterviewTests(unittest.TestCase):
             summary = json.loads((out / "results.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(summary["scenario"], "early-end")
             self.assertIn("phase_checks_failed", summary)
+
+
+def _span(speaker: str, voice: str, text: str, t_start: float, t_end: float, act: str | None = None):
+    from rehearsal.sim import Span
+
+    return Span(speaker, voice, text, "say", t_start, "icebreaker", t_start, None, t_end=t_end, act=act)
+
+
+class _CountingTalker:
+    """A talker that records what it heard and answers from a short list."""
+
+    offline = True
+
+    def __init__(self) -> None:
+        self.heard: list[str] = []
+        self.answers = 0
+
+    def hear(self, text: str) -> None:
+        self.heard.append(text)
+
+    def said(self, text: str) -> None:
+        return None
+
+    async def icebreaker_answer(self, thinking: bool = False) -> str:
+        self.answers += 1
+        return f"answer {self.answers}"
+
+    async def wrapup_question(self) -> str:
+        return "What happens next?"
+
+
+def _sim(scenario_name: str = "average", talker=None):
+    from rehearsal.candidate import CandidateSim, ScenarioAdvisor
+    from rehearsal.scenarios import SCENARIOS
+    from rehearsal.scripted_advisor import ScriptedAdvisor
+
+    scenario = SCENARIOS[scenario_name]
+    advisor = ScenarioAdvisor(ScriptedAdvisor("average", "t"), scenario)
+    return CandidateSim(scenario, talker or _CountingTalker(), advisor, candidate_wps=2.6, advisor_wps=3.2)
+
+
+def _view(phase: str, heard: list, **extra):
+    from rehearsal.candidate import View
+
+    return View(phase=phase, heard=heard, s_sec=0.0, r_sec=extra.pop("r_sec", None),
+                roleplay_started=False, **extra)
+
+
+class CandidateSimTests(unittest.TestCase):
+    """The candidate decides from what it HEARD (M032 S8 review)."""
+
+    def test_price_questions_are_told_from_price_statements(self) -> None:
+        from rehearsal.candidate import asks_price
+
+        for text in (
+            "Is it $9,000?",
+            "How much is it?",
+            "I saw $9,000 on the website, but you said 10,000?",
+            "Can you do it for around $7,000?",
+            "$9,000 feels like a lot to me. Can you do that?",
+            "How would I even afford that?",
+        ):
+            self.assertTrue(asks_price(text), text)
+        for text in (
+            "But $9,000 is a big number.",
+            "The cost still worries me, and I'd need to see how I could manage the payments.",
+            "What would I actually build in the course?",
+            "",
+            None,
+        ):
+            self.assertFalse(asks_price(text), text)
+
+    def test_price_dodge_holds_the_price_until_it_has_dodged_twice(self) -> None:
+        from rehearsal.advisor import AdvisorTurn
+        from rehearsal.candidate import PRICE_DODGES, ScenarioAdvisor
+        from rehearsal.scenarios import SCENARIOS
+
+        class Base:
+            history: list = []
+
+            async def start(self, _pickup: str) -> None:
+                return None
+
+            async def next_turn(self, _learner, _r, _n):
+                return AdvisorTurn("The price is $9,000, and I can take $500 off.", "price", "F1")
+
+        advisor = ScenarioAdvisor(Base(), SCENARIOS["price-dodge"])
+
+        async def main() -> list[str]:
+            acts = []
+            for line in ("But $9,000 is a big number.", "Is it $9,000?", "Okay.", "How much exactly?", "Hmm."):
+                _turn, act = await advisor.next_turn(line, 300.0, 1)
+                acts.append(act)
+            return acts
+
+        acts = asyncio.run(main())
+        self.assertEqual(acts, ["price_held", "price_dodge", "price_held", "price_dodge", "advisor_turn"])
+        self.assertEqual(advisor.dodges, len(PRICE_DODGES))
+
+    def test_price_never_answers_a_figure_question_and_holds_otherwise(self) -> None:
+        from rehearsal.advisor import AdvisorTurn
+        from rehearsal.candidate import ScenarioAdvisor
+        from rehearsal.scenarios import SCENARIOS
+
+        class Base:
+            async def start(self, _pickup: str) -> None:
+                return None
+
+            async def next_turn(self, _learner, _r, _n):
+                return AdvisorTurn("It is $9,000 in total.", "price", "F1")
+
+        advisor = ScenarioAdvisor(Base(), SCENARIOS["price-never"])
+        asked = asyncio.run(advisor.next_turn("I saw $9,000 on the website, but is it $10,000?", 300.0, 1))
+        told = asyncio.run(advisor.next_turn("That is a lot of money.", 320.0, 2))
+        self.assertEqual(asked[1], "advisor_turn")
+        self.assertIn("$9,000", asked[0].text)
+        self.assertEqual(told[1], "price_held")
+
+    def test_a_failed_live_advisor_turn_is_played_by_the_scripted_advisor(self) -> None:
+        from rehearsal.advisor import AdvisorTurn
+        from rehearsal.candidate import ScenarioAdvisor
+        from rehearsal.llm import InsufficientBalance, ProviderError
+        from rehearsal.scenarios import SCENARIOS
+
+        class Flaky:
+            level = "strong"
+
+            def __init__(self, exc: BaseException) -> None:
+                self.exc, self.calls, self.history = exc, 0, []
+
+            async def start(self, _pickup: str) -> None:
+                return None
+
+            async def next_turn(self, learner, _r, _n):
+                self.calls += 1
+                self.history.append({"who": "learner", "text": learner})
+                if self.calls == 2:
+                    raise self.exc
+                return AdvisorTurn("Tell me about your goals.", "probe", "H1")
+
+        base = Flaky(ProviderError("gave up after 4 attempts (HTTP 503)"))
+        advisor = ScenarioAdvisor(base, SCENARIOS["strong"], seed="s")
+
+        async def main():
+            await advisor.start("Hello? Yes, this is Meera speaking.")
+            out = []
+            for n in range(3):
+                out.append(await advisor.next_turn("Okay.", 60.0 * (n + 1), n + 1))
+            return out
+
+        turns = asyncio.run(main())
+        self.assertEqual(advisor.failures, 1)
+        self.assertNotIn("Hi Meera", turns[1][0].text)  # taken over mid-call: no greeting
+        self.assertEqual(turns[1][1], "advisor_turn")
+        self.assertEqual(base.history[-1]["who"], "learner")  # the next live turn came after it
+        dead = ScenarioAdvisor(Flaky(InsufficientBalance("402")), SCENARIOS["strong"])
+        asyncio.run(dead.next_turn("Okay.", 10.0, 1))
+        with self.assertRaises(InsufficientBalance):
+            asyncio.run(dead.next_turn("Okay.", 20.0, 2))
+
+    def test_a_sound_check_gets_a_short_yes_and_uses_up_no_answer(self) -> None:
+        from rehearsal.candidate import is_icebreaker_question, is_sound_check
+
+        self.assertTrue(is_sound_check("Hi Alex, I'm Christy. Can you hear me okay?"))
+        self.assertFalse(is_icebreaker_question("Hi Alex, I'm Christy. Can you hear me okay?"))
+        self.assertFalse(is_icebreaker_question("Are you still with me, Alex?"))
+        self.assertTrue(is_icebreaker_question("So, to begin, tell me a bit about yourself."))
+        self.assertTrue(is_icebreaker_question("What drew you to sales?"))
+        talker = _CountingTalker()
+        sim = _sim(talker=talker)
+        hello = _span("bot", "interviewer", "Hi Alex, I'm Christy. Can you hear me okay?", 0.0, 4.0)
+        first = asyncio.run(sim.next_action(_view("opening", [hello])))
+        self.assertEqual((first.act, first.text), ("sound_check_answer", "Yes, I can hear you."))
+        self.assertEqual(talker.answers, 0)
+        agenda = _span("bot", "interviewer", "Good, I can hear you. So, to begin, tell me about yourself.", 6.0, 12.0)
+        second = asyncio.run(sim.next_action(_view("icebreaker", [agenda])))
+        self.assertEqual((second.act, second.text), ("icebreaker_answer", "answer 1"))
+
+    def test_the_nervous_silence_counts_questions_not_lines(self) -> None:
+        sim = _sim("terse-nervous")
+        hello = _span("bot", "interviewer", "Hi Alex. Can you hear me okay?", 0.0, 3.0)
+        self.assertEqual(asyncio.run(sim.next_action(_view("opening", [hello]))).act, "sound_check_answer")
+        q1 = _span("bot", "interviewer", "Good. Tell me about your sales work.", 5.0, 8.0)
+        self.assertEqual(asyncio.run(sim.next_action(_view("icebreaker", [q1]))).kind, "speak")
+        q2 = _span("bot", "interviewer", "Thanks. What do you enjoy most?", 12.0, 14.0)
+        self.assertEqual(asyncio.run(sim.next_action(_view("icebreaker", [q2]))).kind, "silent")
+
+    def test_each_heard_line_reaches_the_talker_once_across_polls(self) -> None:
+        talker = _CountingTalker()
+        sim = _sim(talker=talker)
+        brief = _span("bot", "interviewer", "Here is the brief.", 0.0, 30.0)
+        for _ in range(4):  # a wait loop polls with the same view
+            asyncio.run(sim.next_action(_view("transition", [brief])))
+        self.assertEqual(talker.heard, ["Here is the brief."])
+
+    def test_the_end_question_is_answered_only_when_it_was_heard(self) -> None:
+        sim = _sim("early-end")
+        learner = _span("bot", "learner", "Sure, go on.", 0.0, 2.0)
+        # The engine's flag alone (L-ASIDE-END never said) must not make the candidate answer it.
+        silent_flag = asyncio.run(
+            sim.next_action(_view("roleplay", [learner], r_sec=300.0, engine_question="end"))
+        )
+        self.assertNotIn(silent_flag.act, ("end_decline", "end_agree"))
+        heard = asyncio.run(
+            sim.next_action(_view("aside", [learner], r_sec=310.0, open_question="end", engine_question="end"))
+        )
+        self.assertEqual(heard.act, "end_decline")
+        self.assertEqual((heard.answering, heard.engine_question), ("end", "end"))
+
+    def test_the_wrap_offer_is_taken_from_spoken_cues_only(self) -> None:
+        sim = _sim("strong")
+        early = asyncio.run(sim.next_action(_view("aside", [], r_sec=860.0, open_question="wrap")))
+        self.assertEqual(early.act, "wrap_decline")
+        committed = _span("bot", "learner", "Okay, let's book a call so we can decide together.", 900.0, 904.0)
+        sim2 = _sim("strong")
+        later = asyncio.run(sim2.next_action(_view("aside", [committed], r_sec=905.0, open_question="wrap")))
+        self.assertEqual(later.act, "wrap_accept")
+
+    def test_the_button_is_pressed_only_while_the_page_shows_it(self) -> None:
+        sim = _sim("button-mid-brief")
+        brief = _span("bot", "interviewer", "Here is the brief.", 0.0, 30.0)
+        self.assertFalse(sim.press_due("transition", brief, 20.0, 30.0, {"awaiting": ""}))
+        self.assertTrue(sim.press_due("transition", brief, 20.0, 30.0, {"awaiting": "ready"}))
+        sim.note_button_missing("icebreaker")  # never shown there: no lasting effect
+        self.assertTrue(sim.press_due("transition", brief, 20.0, 30.0, {"awaiting": "ready"}))
+        sim.note_button_missing("transition")
+        self.assertFalse(sim.press_due("transition", brief, 20.0, 30.0, {"awaiting": "ready"}))
+        action = asyncio.run(sim.next_action(_view("transition", [brief])))
+        self.assertEqual((action.kind, action.act), ("speak", "ready"))
+
+
+class ManualReplayTimingTests(unittest.TestCase):
+    def test_moves_that_shared_one_turn_are_said_as_one(self) -> None:
+        from rehearsal.manual import Move, merge_shared_turns
+
+        moves = [
+            Move("roleplay", "10:00 | R 3:00", "projects", "We build real projects.", "advisor_turn", "Candidate continued."),
+            Move("roleplay", "10:05 | R 3:05", "continuation: redo it", "You can redo one.", "advisor_turn", ""),
+            Move("roleplay", "10:20 | R 3:20", "asks to close the role-play", "Can we end the role-play?", "end_request", ""),
+            Move("icebreaker", "01:00", "thanks (overlap)", "Thanks.", "backchannel", ""),
+            Move("icebreaker", "01:10", "answers", "I sell plans.", "icebreaker_answer", ""),
+        ]
+        merged = merge_shared_turns(moves)
+        self.assertEqual([m.text for m in merged], [
+            "We build real projects. You can redo one.",
+            "Can we end the role-play?",
+            "Thanks. I sell plans.",
+        ])
+        self.assertEqual([m.act for m in merged], ["advisor_turn", "end_request", "icebreaker_answer"])
+        self.assertEqual(merged[0].r_at, 180.0)
+
+    def test_a_move_is_held_until_r_nears_its_time_and_the_fallback_never_greets(self) -> None:
+        from rehearsal.manual import REPLAY_HOLD_SLACK_SEC, Move, ReplayAdvisor
+        from rehearsal.scripted_advisor import ScriptedAdvisor
+
+        moves = [
+            Move("roleplay", "05:00 | R 0:05", "greets", "Hi there, quick call.", "advisor_turn"),
+            Move("roleplay", "15:30 | R 10:30", "steps out of role to ask Christy to close the role-play",
+                 "Can we wrap up this role-play?", "end_request"),
+        ]
+        replay = ReplayAdvisor(moves, ScriptedAdvisor("pushy", "t"))
+
+        async def main():
+            await replay.start("Hello? Yes, this is Meera speaking.")
+            first = await replay.next_turn(None, 3.0, 1)
+            early = await replay.next_turn("Okay.", 560.0, 2)
+            early_act = replay.last_act
+            due = await replay.next_turn("Okay.", 630.0 - REPLAY_HOLD_SLACK_SEC, 3)
+            return first, early, early_act, due, replay.last_act
+
+        first, early, early_act, due, due_act = asyncio.run(main())
+        self.assertEqual(first.text, "Hi there, quick call.")
+        self.assertIsNone(early_act)
+        self.assertNotIn("Hi Meera, quick call", early.text)
+        self.assertEqual(due.text, "Can we wrap up this role-play?")
+        self.assertEqual(due_act, "end_request")
+        self.assertEqual(replay.held, 1)
+
+    def test_every_request_to_stop_the_call_in_the_library_is_an_end_request(self) -> None:
+        import re
+
+        from rehearsal import manual
+
+        wants_stop = re.compile(
+            r"(?:asks|tells) (?:her )?to hang up|asks to disconnect|disconnect now|wants to stop|"
+            r"close the role-?play|end the (?:whole )?interview|wrap up this interview",
+            re.IGNORECASE,
+        )
+        for replay in manual.load_library()["replays"]:
+            for index, turn in enumerate(replay["turns"]):
+                if turn["phase"] == "roleplay" and wants_stop.search(turn["intent"]):
+                    with self.subTest(replay=replay["id"], turn=index):
+                        self.assertEqual(manual.act_of("roleplay", turn["intent"], turn["text"]), "end_request")
+        self.assertEqual(manual.act_of("roleplay", "promises an email once we hang up", "After we hang up I'll email you."), "advisor_turn")
+        self.assertEqual(manual.act_of("roleplay", "gives up on the sale", "Good luck finding better."), "advisor_turn")
+
+    def test_the_library_shares_no_six_word_run_with_a_real_candidate_line(self) -> None:
+        # Local only: R1_REHEARSAL_PRIVACY_EXPORT names a JSON export of real candidate lines (rows
+        # with speaker "candidate"); it never ships, so CI skips this.  Nothing of it is printed.
+        import os
+        import re
+
+        from rehearsal import manual
+
+        path = os.environ.get("R1_REHEARSAL_PRIVACY_EXPORT", "")
+        if not path or not Path(path).is_file():
+            self.skipTest("no local export of real candidate lines")
+        export = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+        def lines(obj):
+            if isinstance(obj, dict):
+                if obj.get("speaker") == "candidate" and isinstance(obj.get("text"), str):
+                    yield obj["text"]
+                for value in obj.values():
+                    yield from lines(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    yield from lines(value)
+
+        def grams(text: str) -> set:
+            words = re.findall(r"[a-z0-9']+", text.lower())
+            return {tuple(words[i : i + 6]) for i in range(len(words) - 5)}
+
+        real: set = set()
+        for line in lines(export):
+            real |= grams(line)
+        hits = []
+
+        def walk(obj, where):
+            if isinstance(obj, str):
+                if grams(obj) & real:
+                    hits.append(where)
+            elif isinstance(obj, dict):
+                for key, value in obj.items():
+                    walk(value, f"{where}.{key}")
+            elif isinstance(obj, list):
+                for i, value in enumerate(obj):
+                    walk(value, f"{where}[{i}]")
+
+        walk(manual.load_library(), "library")
+        self.assertEqual(hits, [])
+
+
+class SimSessionTests(unittest.TestCase):
+    """The SDK's speech scheduling (livekit-agents 1.6.4): one speech at a time, in order."""
+
+    def _session(self):
+        from rehearsal.sim import Runtime, build_session
+
+        runtime = Runtime("t", offline=True)
+        return runtime, build_session(runtime)
+
+    def test_a_say_during_a_reply_waits_for_it_and_interrupt_cuts_the_playing_line(self) -> None:
+        async def main():
+            runtime, session = self._session()
+            first = session.say("one two three four five six seven eight nine ten", allow_interruptions=False)
+            second = session.say("eleven twelve", allow_interruptions=True)
+            await asyncio.sleep(0.5)
+            current = session.current_speech
+            queued = list(session.queue)
+            await first.wait_for_playout()
+            third = session.say("thirteen fourteen fifteen sixteen seventeen eighteen", allow_interruptions=True)
+            await asyncio.sleep(2.5)
+            await session.interrupt()
+            await asyncio.sleep(0.1)
+            return runtime, first, second, third, current, queued
+
+        runtime, first, second, third, current, queued = vloop.run_virtual(main())
+        self.assertIs(current, first)
+        self.assertEqual(queued, [second])
+        spans = sorted(runtime.spans, key=lambda s: s.t_start)
+        for before, after in zip(spans, spans[1:]):
+            self.assertGreaterEqual(after.t_start, before.t_end)
+        self.assertTrue(second.done() and third.done())
+        cut = [s for s in spans if s.interrupted]
+        self.assertTrue(cut, [s.text for s in spans])
+        self.assertLess(len(cut[0].text.split()), 6)  # the transcript keeps the words played
+
+    def test_a_turn_that_ends_over_an_uninterruptible_line_gets_no_reply(self) -> None:
+        from rehearsal.sim import SdkDriver
+
+        class Agent:
+            def __init__(self) -> None:
+                self.turns = 0
+
+            async def on_user_turn_completed(self, *_args) -> None:
+                self.turns += 1
+
+        async def main():
+            runtime, session = self._session()
+            runtime.interview = types_interview()
+            agent = Agent()
+            session.agent = agent
+            driver = SdkDriver(runtime, session, None, {"interviewer": None, "learner": None})
+            session.say("a long scripted line that nobody may cut short at all " * 3, allow_interruptions=False)
+            result = await driver.speak("Okay.", wps=2.6, act="x", role="candidate")
+            return result, agent.turns
+
+        result, turns = vloop.run_virtual(main())
+        self.assertEqual(result["why"], "uninterruptible_speech")
+        self.assertEqual(turns, 0)
+
+
+def types_interview():
+    from types import SimpleNamespace
+
+    machine = SimpleNamespace(
+        transcript_phase=lambda: "icebreaker", session_clock=0.0, roleplay_elapsed=0.0,
+        roleplay_entered=False, phase=SimpleNamespace(value="icebreaker"),
+    )
+    return SimpleNamespace(machine=machine, _exiting=False, _voices={})
+
+
+class ClockAndSeamTests(unittest.TestCase):
+    def test_a_backoff_inside_a_harness_call_takes_real_time_and_never_moves_the_clock(self) -> None:
+        async def main():
+            loop = asyncio.get_running_loop()
+            loop.frozen_watchdog_sec = 3.0
+            start = loop.time()
+            real = time.perf_counter()
+            with vloop.harness_io():
+                await vloop.real_sleep(0.3)
+            return loop.time() - start, time.perf_counter() - real, loop.watchdog_trips
+
+        moved, real, trips = vloop.run_virtual(main())
+        self.assertLess(moved, 0.01)
+        self.assertLess(real, 2.0)
+        self.assertEqual(trips, 0)
+
+    def test_the_live_harness_client_backs_off_in_real_time(self) -> None:
+        from rehearsal.full_run import FullSettings, LiveFullFactory
+        from rehearsal.llm import KEY_NAME
+
+        factory = LiveFullFactory(FullSettings(offline=False), {KEY_NAME: "sk-test-not-real"})
+        self.assertIs(factory._raw._sleep, vloop.real_sleep)
+
+    def test_each_seam_runs_on_its_production_client_and_an_unknown_one_stops_the_sweep(self) -> None:
+        from rehearsal import full_run
+        from rehearsal.full_run import FullSettings, LiveFullFactory
+        from rehearsal.llm import KEY_NAME
+        from rehearsal.seams import SEAM_CLIENTS, UnknownSeam, seam_client
+
+        self.assertEqual(seam_client("bridge_runner"), "interviewer")
+        for name in ("judge_runner", "end_intent_runner", "turn_reader_runner"):
+            self.assertEqual(SEAM_CLIENTS[name], "judge")
+        with self.assertRaises(UnknownSeam):
+            seam_client("made_up_runner")
+        made: dict = {}
+
+        def fake_runner(_env, _ledger, *, role="shadow_judge", client="judge", judge_llm=None):
+            made[role] = client
+
+            async def run(_messages):
+                return ""
+
+            return run
+
+        settings = FullSettings(offline=False, preflight=False)
+        factory = LiveFullFactory(settings, {KEY_NAME: "sk-test-not-real"})
+        names = ("judge_runner", "end_intent_runner", "bridge_runner")
+        with unittest.mock.patch.object(full_run, "runner_names", lambda: names), \
+                unittest.mock.patch.object(full_run, "make_live_judge_runner", fake_runner), \
+                unittest.mock.patch.object(full_run, "make_live_learner_provider", lambda *a, **k: (lambda m: None)):
+            info = asyncio.run(factory.start())
+        self.assertEqual(made, {"shadow_judge": "judge", "end_intent": "judge", "bridge": "interviewer"})
+        self.assertEqual(info["seam_clients"]["bridge_runner"], "interviewer")
+        unknown = LiveFullFactory(settings, {KEY_NAME: "sk-test-not-real"})
+        with unittest.mock.patch.object(full_run, "runner_names", lambda: ("made_up_runner",)):
+            with self.assertRaises(UnknownSeam):
+                asyncio.run(unknown.start())
+
+    def test_the_scripted_end_intent_answers_from_the_turns_ground_truth(self) -> None:
+        from rehearsal.seams import ScriptedEndIntent
+        from rehearsal.sim import Span
+
+        class Rt:
+            spans: list = []
+
+        rt = Rt()
+        judge = ScriptedEndIntent(rt, latency=0.0)
+
+        def verdict(text: str, act: str) -> str:
+            rt.spans = [Span("candidate", "candidate", text, "candidate", 0.0, "roleplay", 0.0, 1.0, act=act)]
+            return json.loads(asyncio.run(judge([])))["intent"]
+
+        self.assertEqual(verdict("Hey, can we wrap up this role-play?", "end_request"), "end")
+        self.assertEqual(verdict("Sorry, I want to stop here.", "end_request"), "maybe")
+        self.assertEqual(verdict("Oh come on, stop wasting my time.", "insult"), "no")
+        self.assertEqual(verdict("We support you end to end.", "advisor_turn"), "no")
+
+    def test_the_live_learner_client_uses_the_sessions_retry_options_and_forwards_errors(self) -> None:
+        import inspect
+        import re
+
+        import r1_session
+        from rehearsal import llm
+
+        source = inspect.getsource(r1_session._default_session_factory)
+        self.assertRegex(source, rf"max_retry={llm.SESSION_LLM_MAX_RETRY}\b")
+        self.assertRegex(source, rf"retry_interval={re.escape(str(llm.SESSION_LLM_RETRY_INTERVAL))}\b")
+        self.assertRegex(source, rf"timeout={re.escape(str(llm.SESSION_LLM_TIMEOUT))}\b")
+        try:
+            import livekit.agents  # noqa: F401 - the chat context needs the SDK
+        except ImportError:
+            self.skipTest("the bare run has no SDK")
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.kwargs: dict = {}
+                self.handlers: dict = {}
+
+            def on(self, name, handler):
+                self.handlers[name] = handler
+
+            def chat(self, **kwargs):
+                self.kwargs = kwargs
+                outer = self
+
+                class Stream:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, *exc):
+                        return False
+
+                    def __aiter__(self):
+                        return self
+
+                    async def __anext__(self):
+                        raise StopAsyncIteration
+
+                return Stream()
+
+        fake = FakeLLM()
+        seen: list = []
+        stream = llm.make_live_learner_provider({}, llm.Ledger(), learner=fake, on_error=seen.append)
+
+        async def main():
+            return [chunk async for chunk in stream([{"role": "user", "content": "hi"}])]
+
+        asyncio.run(main())
+        options = fake.kwargs.get("conn_options")
+        if options is not None:  # the bare run has no SDK: no options object to pass
+            self.assertEqual((options.max_retry, options.retry_interval), (1, 0.5))
+        error = SimpleNamespaceError(type="llm_error", recoverable=False)
+        fake.handlers["error"](error)
+        self.assertIs(seen[0].error, error)
+
+
+def SimpleNamespaceError(**kwargs):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(**kwargs)
+
+
+def _row(speaker: str, voice: str, phase: str, text: str, t: float, **extra) -> dict:
+    return {"speaker": speaker, "voice": voice, "phase": phase, "text": text, "t_start": t,
+            "t_end": t + 2.0, "s_sec": t, "r_sec": t - 300.0, **extra}
+
+
+class PhaseCheckTests(unittest.TestCase):
+    """The per-phase checks fail on what the owner's rules forbid (synthetic records)."""
+
+    def _record(self, rows: list, *, stop: str = "time_cap", r_end: float = 1205.0, events=(), truth=None) -> dict:
+        phases = ["opening", "icebreaker", "transition", "roleplay", "roleplay_exit", "wrapup", "closing"]
+        return {
+            "header": {"ground_truth": truth or {"transition": ["ready"], "press_button": None}},
+            "rows": rows,
+            "phase_trace": [{"phase": p, "s_sec": 10.0 * i, "t": 10.0 * i} for i, p in enumerate(phases)],
+            "candidate_turns": [{"act": r.get("act")} for r in rows if r["speaker"] == "candidate"],
+            "events": list(events),
+            "stop_reason": stop,
+            "roleplay_seconds": r_end,
+            "outcome": "complete",
+        }
+
+    def test_an_ignored_end_request_fails_and_so_does_running_to_the_cap_after_it(self) -> None:
+        from rehearsal.full_metrics import phase_checks
+
+        rows = [
+            _row("candidate", "candidate", "roleplay", "Hey, can we wrap up this role-play?", 900.0, act="end_request"),
+            _row("bot", "learner", "roleplay", "Sure, and what about the fees?", 904.0),
+            _row("candidate", "candidate", "roleplay", "They are fine.", 910.0, act="advisor_turn"),
+        ]
+        checks = phase_checks(self._record(rows))["checks"]
+        self.assertFalse(checks["end_consent"]["ok"])
+        self.assertTrue(checks["end_consent"]["requests"][0]["ignored"])
+        self.assertTrue(checks["end_consent"]["requests"][0]["answered_in_role"])
+        self.assertFalse(checks["roleplay_end"]["ok"])
+
+    def test_an_at_once_exit_needs_a_named_end_or_an_earlier_question(self) -> None:
+        from rehearsal.full_metrics import phase_checks
+
+        vague = [
+            _row("candidate", "candidate", "roleplay", "Sorry, I want to stop here.", 600.0, act="end_request"),
+            _row("bot", "christy", "roleplay_exit", "Let's pause the role-play here.", 603.0),
+        ]
+        checks = phase_checks(self._record(vague, stop="end_request", r_end=603.0))["checks"]
+        self.assertFalse(checks["end_consent"]["ok"])
+        self.assertTrue(checks["end_consent"]["requests"][0]["exited_without_asking"])
+        named = [
+            _row("candidate", "candidate", "roleplay", "Can we end the role play now?", 600.0, act="end_request"),
+            _row("bot", "christy", "roleplay_exit", "Let's pause the role-play here.", 603.0),
+        ]
+        checks = phase_checks(self._record(named, stop="end_request", r_end=603.0))["checks"]
+        self.assertTrue(checks["end_consent"]["ok"], checks["end_consent"])
+        self.assertEqual(checks["end_consent"]["requests"][0]["exit_basis"], "names_the_end")
+
+    def test_the_start_must_match_the_scenario_and_never_fall_back_to_the_button(self) -> None:
+        from rehearsal.full_metrics import phase_checks
+
+        rows = [
+            _row("bot", "christy", "transition", "Here is the brief. Shall we start?", 200.0),
+            _row("candidate", "candidate", "transition", "Okay, I'm ready.", 260.0, act="ready"),
+            _row("bot", "learner", "transition", "Hello? Yes, this is Meera speaking.", 290.0),
+        ]
+        press = {"kind": "ready_button", "t": 280.0, "why": "ready_not_taken"}
+        checks = phase_checks(self._record(rows, events=[press]))["checks"]
+        self.assertFalse(checks["start_by"]["ok"])
+        self.assertEqual(checks["start_by"]["start_by"], "button")
+        self.assertEqual(checks["start_by"]["expected"], "spoken")
+        missing = {"kind": "button_not_shown", "t": 250.0, "why": "after_brief", "phase": "transition"}
+        truth = {"transition": [], "press_button": "mid_brief"}
+        checks = phase_checks(self._record(rows, events=[missing], truth=truth))["checks"]
+        self.assertFalse(checks["start_by"]["ok"])
+
+    def test_two_bot_lines_at_once_fail_the_overlap_check(self) -> None:
+        from rehearsal.full_metrics import phase_checks
+
+        rows = [
+            _row("bot", "learner", "roleplay", "Great, thanks so much.", 1500.0),
+            _row("bot", "learner", "roleplay", "I'm sorry, I really have to go now.", 1501.0),
+        ]
+        checks = phase_checks(self._record(rows))["checks"]
+        self.assertFalse(checks["bot_overlap"]["ok"])
+        self.assertEqual(checks["bot_overlap"]["count"], 1)
+
+
+class FullCallFailureTests(unittest.TestCase):
+    def test_a_call_that_breaks_is_labelled_exception_and_a_mix_records_its_real_level(self) -> None:
+        from rehearsal.full import FullCallSpec, run_full_call
+        from rehearsal.full_run import FullSettings, OfflineFullFactory
+        from rehearsal.manual import mix_scenario, register
+
+        register()
+        factory = OfflineFullFactory(FullSettings(offline=True, judge=False))
+        spec = FullCallSpec(scenario="strong", persona_id="p1_career_switcher")
+        deps = factory.make(spec)
+        inner = deps.advisor
+
+        class Breaks:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.level = inner.level
+
+            async def start(self, pickup):
+                await inner.start(pickup)
+
+            async def next_turn(self, *args):
+                self.calls += 1
+                if self.calls == 3:
+                    raise RuntimeError("a harness bug")
+                return await inner.next_turn(*args)
+
+        deps.advisor = Breaks()
+        mix_spec = FullCallSpec(scenario="manual-mix", persona_id="p2_recent_grad")
+
+        async def main():
+            broken = await run_full_call(spec, deps)
+            return broken, mix_spec.seed
+
+        broken, mix_seed = vloop.run_virtual(main())
+        self.assertEqual(broken["stop_reason"], "exception")
+        self.assertEqual(broken["roleplay_end_at_break"], "stopped")
+        self.assertIn("harness bug", broken["error"])
+        self.assertIn("-mix-", mix_seed)
+        record = offline_records()["manual-mix"]
+        self.assertEqual(record["header"]["advisor_level"], mix_scenario(record["header"]["seed"])[0].level)
 
 
 class FullCliTests(unittest.TestCase):

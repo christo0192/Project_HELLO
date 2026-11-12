@@ -7,14 +7,17 @@ livekit-agents 1.6.4 does on a call, on the same seams the role-play tier's ``Ri
 * ``SimSession`` (a ``FakeSession``) plays every scripted ``say`` line for a modelled duration (its
   words at the voice's pace), with ``agent_state_changed`` speaking/listening around it and the
   delivered item at the end, and runs the driver's own ``generate_reply`` (the wrap-up's owed
-  answer) through the reply pipeline;
+  answer) through the reply pipeline.  Speech is serialized as the SDK's ``_scheduling_task`` does:
+  one speech at a time in creation order, ``current_speech`` the one at the head, ``interrupt()``
+  cutting the playing line and every queued one;
 * ``SimContext`` / its room record every attribute write the page would see (``phase``,
   ``awaiting`` ...) on the virtual clock: the phase trace;
 * ``SimWriter`` (the integration tests' ``AdminWriter``) keeps every transcript row with all the
   columns the session wrote (the 0136 timing facts included) and every administration row;
 * ``SdkDriver.speak`` is one candidate turn: ``user_state_changed`` speaking, the STT finals
   (``user_input_transcribed``; a long answer is several finals, as Sarvam splits it), listening, the
-  endpointing delay, then the commit (``R1Agent.on_user_turn_completed``) and, unless it raised
+  endpointing delay, then (unless an uninterruptible line is current: the SDK then drops the turn)
+  the commit (``R1Agent.on_user_turn_completed``) and, unless it raised
   ``StopResponse``, the reply: ``speech_created``, ``agent_state_changed`` thinking, the
   ``llm_node`` stream, speaking for the reply's modelled duration, ``conversation_item_added``,
   listening.  ``SdkDriver.press_ready`` is the page's "I'm ready" button exactly as the API relays
@@ -51,6 +54,7 @@ _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 FINAL_MAX_WORDS = 28
 MIN_FINAL_SEC = 0.5
 SETTLE_TICKS = 40
+INTERRUPT_SETTLE_SEC = 5.0  # how long session.interrupt() waits for the cut speeches to finish
 _IDS = itertools.count(1)
 
 
@@ -236,28 +240,130 @@ class Runtime:
         return voices.get(str(getattr(handle, "id", "")))
 
 
+def speech_handle(text: str, *, allow_interruptions: bool = True) -> Any:
+    """A ``FakeSpeechHandle`` whose ``interrupt`` really cuts its playback (``cut``)."""
+    fakes = _fakes()
+
+    class SimSpeechHandle(fakes.core.FakeSpeechHandle):
+        def __init__(self) -> None:
+            super().__init__(text, allow_interruptions=allow_interruptions)
+            self.cut = asyncio.Event()
+            self.turn = asyncio.Event()
+
+        def interrupt(self, *, force: bool = False) -> Any:
+            super().interrupt(force=force)
+            self.cut.set()
+            return self
+
+        def done(self) -> bool:
+            return self._done.is_set()
+
+    return SimSpeechHandle()
+
+
+def played_part(text: str, played: float, total: float) -> str:
+    """The words of a line that were played before it was cut (at least the first one)."""
+    words = text.split()
+    if total <= 0 or played >= total or not words:
+        return text
+    keep = max(1, min(len(words), int(len(words) * played / total)))
+    return " ".join(words[:keep])
+
+
 def build_session(runtime: Runtime) -> Any:
-    """A ``FakeSession`` whose ``say`` lines take their modelled time on the virtual clock."""
+    """A ``FakeSession`` that plays speech the way livekit-agents 1.6.4 schedules it.
+
+    One speech plays at a time, in creation order (``_scheduling_task``): a ``say`` made while a
+    reply is playing waits behind it, and ``current_speech`` is the speech at the head of that
+    queue (a reply is current while it is generated, as in the SDK).  ``interrupt()`` on a handle
+    cuts its playback (the transcript keeps the words played), and ``session.interrupt()`` cuts
+    the current speech and every queued one (``force`` also cuts an uninterruptible one).
+    """
     fakes = _fakes()
 
     class SimSession(fakes.core.FakeSession):
         def __init__(self) -> None:
             super().__init__(log=runtime.order)
             self.driver: "SdkDriver | None" = None
+            self.queue: list[Any] = []
+
+        # --------------------------------------------------------- the speech queue
+        def schedule(self, handle: Any) -> None:
+            """Queue a speech behind the ones already queued (the SDK's ``_schedule_speech``)."""
+            self.queue.append(handle)
+            self._advance()
+
+        def _advance(self) -> None:
+            while (self.current_speech is None or self.current_speech.done()) and self.queue:
+                handle = self.queue.pop(0)
+                if handle.done():
+                    continue  # cut while it waited: skipped, as the SDK skips a done speech
+                self.current_speech = handle
+                handle.turn.set()
+            if self.current_speech is not None and self.current_speech.done() and not self.queue:
+                self.current_speech = None
+
+        def release(self, handle: Any) -> None:
+            """A speech is over (played, cut or skipped): the next one may play."""
+            if handle in self.queue:
+                self.queue.remove(handle)
+            if self.current_speech is handle:
+                self.current_speech = None
+            self._advance()
+
+        async def wait_turn(self, handle: Any) -> bool:
+            """Until ``handle`` is the current speech (True), or it was cut while queued (False)."""
+            if not handle.turn.is_set() and not handle.cut.is_set():
+                turn = asyncio.ensure_future(handle.turn.wait())
+                cut = asyncio.ensure_future(handle.cut.wait())
+                await asyncio.wait({turn, cut}, return_when=asyncio.FIRST_COMPLETED)
+                for waiter in (turn, cut):
+                    waiter.cancel()
+            return handle.turn.is_set() and not handle.interrupted
+
+        async def play_for(self, handle: Any, seconds: float) -> float:
+            """Play for ``seconds`` unless the handle is cut first; returns the seconds played."""
+            if handle.cut.is_set():
+                return 0.0
+            started = asyncio.get_running_loop().time()
+            try:
+                await asyncio.wait_for(handle.cut.wait(), seconds)
+            except asyncio.TimeoutError:
+                return seconds
+            return asyncio.get_running_loop().time() - started
+
+        # ---------------------------------------------------------------- speech
+        def say(self, text: str, **kwargs: Any) -> Any:
+            if self.raise_on_say:
+                raise RuntimeError("tts unavailable")
+            self.spoken.append(text)
+            handle = speech_handle(text, allow_interruptions=kwargs.get("allow_interruptions", True))
+            self.handles.append(handle)
+            self.emit(
+                "speech_created",
+                SimpleNamespace(speech_handle=handle, source="say", user_initiated=True),
+            )
+            runtime.saying += 1  # claimed now: a queued line holds the floor too
+            self.schedule(handle)
+            self._tasks.append(asyncio.ensure_future(self._play(handle, text)))
+            return handle
 
         async def _play(self, handle: Any, text: str) -> None:  # mirrors FakeSession._play
-            runtime.saying += 1
             try:
+                if not await self.wait_turn(handle):
+                    handle.finish()  # cut before it could play: nothing is said, nothing kept
+                    return
                 self.log.append(("play_start", text))
-                self.current_speech = handle
                 voice = runtime.voice_of(handle)
                 span = runtime.open_span("bot", voice, text, "say")
                 seconds = runtime.timing.say_start + runtime.timing.speak_seconds(text, voice)
                 runtime.now_playing, runtime.now_playing_seconds = span, seconds
                 self.emit("agent_state_changed", _state("listening", "speaking"))
-                await asyncio.sleep(seconds)
+                played = await self.play_for(handle, seconds)
                 interrupted, self.next_interrupted = self.next_interrupted or handle.interrupted, False
-                message = fakes.core.FakeChatMessage(text, interrupted=interrupted)
+                said = played_part(text, played, seconds) if handle.cut.is_set() else text
+                span.text = said
+                message = fakes.core.FakeChatMessage(said, interrupted=interrupted)
                 handle.chat_items.append(message)
                 runtime.close_span(span, interrupted=interrupted)
                 runtime.now_playing = None
@@ -268,11 +374,12 @@ def build_session(runtime: Runtime) -> Any:
                 handle.finish()
             finally:
                 runtime.saying -= 1
+                self.release(handle)
 
         def generate_reply(self, **kwargs: Any) -> Any:
             """The driver asked for a reply itself (the wrap-up's owed answer): it is generated
             and spoken, as the SDK does, from the reply the hook prepared."""
-            handle = fakes.core.FakeSpeechHandle("reply")
+            handle = speech_handle("reply")
             self.generated.append(handle)
             self.emit(
                 "speech_created",
@@ -280,8 +387,25 @@ def build_session(runtime: Runtime) -> Any:
             )
             if self.driver is not None:
                 runtime.replying += 1  # claimed now: the floor is taken from this moment
+                self.schedule(handle)
                 self._tasks.append(asyncio.ensure_future(self.driver.driven_reply(handle)))
             return handle
+
+        async def interrupt(self, *, force: bool = False) -> None:
+            """Cut the current speech and every queued one (``AgentActivity.interrupt``)."""
+            cut = []
+            for handle in [self.current_speech, *self.queue]:
+                if handle is None or handle.done():
+                    continue
+                if force or handle.allow_interruptions:
+                    handle.interrupt(force=force)
+                    cut.append(handle)
+            await super().interrupt(force=force)
+            if cut:
+                await asyncio.wait(
+                    [asyncio.ensure_future(handle.wait_for_playout()) for handle in cut],
+                    timeout=INTERRUPT_SETTLE_SEC,
+                )
 
     return SimSession()
 
@@ -396,6 +520,16 @@ class SdkDriver:
         interview = self.interview
         if getattr(interview, "_exiting", False) or session.agent is None:
             return {"suppressed": True, "why": "exiting", "spoken": None, "span": span}
+        current = getattr(session, "current_speech", None)
+        if current is not None and not current.done():
+            # livekit-agents 1.6.4 ``_user_turn_completed_task``: a turn that ends while an
+            # uninterruptible speech is current gets no reply at all (the hook is never called);
+            # an interruptible one is cut first, and the hook runs once it is over.
+            if not current.allow_interruptions:
+                await settle()
+                return {"suppressed": True, "why": "uninterruptible_speech", "spoken": None, "span": span}
+            current.interrupt()
+            await current.wait_for_playout()
         recorder = self.recorder()
         previous = getattr(interview, "_last_reply", None)
         recorder.take()
@@ -409,11 +543,12 @@ class SdkDriver:
             except StopResponse:
                 await settle()
                 return {"suppressed": True, "why": "stop_response", "spoken": None, "span": span}
-            handle = _fakes().core.FakeSpeechHandle("reply")
+            handle = speech_handle("reply")
             session.emit(
                 "speech_created",
                 SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
             )
+            session.schedule(handle)
             spoken = await self._play_reply(handle, message_id, recorder)
         finally:
             rt.replying -= 1
@@ -434,35 +569,51 @@ class SdkDriver:
             self.rt.replying -= 1
 
     async def _play_reply(self, handle: Any, message_id: str | None, recorder: Any) -> str | None:
+        """Generate the reply at once (the SDK runs the LLM node before the speech's turn), then
+        play it when it reaches the head of the speech queue, unless it was cut meanwhile."""
         rt = self.rt
         session = self.session
-        session.emit("agent_state_changed", _state("listening", "thinking"))
-        items = [SimpleNamespace(role="user", id=message_id)] if message_id else []
-        stream = self.interview.llm_node_stream(SimpleNamespace(items=items), recorder)
-        parts: list[str] = []
-        async for chunk in stream:
-            parts.append(chunk if isinstance(chunk, str) else delta_text(chunk))
-        spoken = "".join(parts).strip()
-        if not spoken:
-            session.emit("agent_state_changed", _state("thinking", "listening"))
+        try:
+            session.emit("agent_state_changed", _state("listening", "thinking"))
+            items = [SimpleNamespace(role="user", id=message_id)] if message_id else []
+            stream = self.interview.llm_node_stream(SimpleNamespace(items=items), recorder)
+            parts: list[str] = []
+            async for chunk in stream:
+                parts.append(chunk if isinstance(chunk, str) else delta_text(chunk))
+            spoken = "".join(parts).strip()
+            if not spoken or not await session.wait_turn(handle):
+                session.emit("agent_state_changed", _state("thinking", "listening"))
+                handle.finish()
+                await settle()
+                return None
+            voice = rt.voice_of(handle)
+            await session.play_for(handle, rt.timing.reply_start)
+            if handle.cut.is_set():
+                session.emit("agent_state_changed", _state("thinking", "listening"))
+                handle.finish()
+                await settle()
+                return None
+            session.emit("agent_state_changed", _state("thinking", "speaking"))
+            span = rt.open_span("bot", voice, spoken, "reply")
+            seconds = rt.timing.speak_seconds(spoken, voice)
+            played = await session.play_for(handle, seconds)
+            interrupted = handle.cut.is_set()
+            said = played_part(spoken, played, seconds) if interrupted else spoken
+            span.text = said
+            message = _fakes().core.FakeChatMessage(said, interrupted=interrupted)
+            handle.chat_items.append(message)
+            rt.close_span(span, interrupted=interrupted)
+            session.emit("conversation_item_added", SimpleNamespace(item=message))
+            session.current_speech = None
+            session.emit("agent_state_changed", _state("speaking", "listening"))
             handle.finish()
+            session.release(handle)
             await settle()
-            return None
-        voice = rt.voice_of(handle)
-        await asyncio.sleep(rt.timing.reply_start)
-        session.current_speech = handle
-        session.emit("agent_state_changed", _state("thinking", "speaking"))
-        span = rt.open_span("bot", voice, spoken, "reply")
-        await asyncio.sleep(rt.timing.speak_seconds(spoken, voice))
-        message = _fakes().core.FakeChatMessage(spoken, interrupted=False)
-        handle.chat_items.append(message)
-        rt.close_span(span)
-        session.emit("conversation_item_added", SimpleNamespace(item=message))
-        session.current_speech = None
-        session.emit("agent_state_changed", _state("speaking", "listening"))
-        handle.finish()
-        await settle()
-        return spoken
+            return said
+        finally:
+            if not handle.done():
+                handle.finish()
+            session.release(handle)
 
 
 # --------------------------------------------------------------------------- latency

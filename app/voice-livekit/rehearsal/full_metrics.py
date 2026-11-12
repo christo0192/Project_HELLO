@@ -9,13 +9,19 @@ phase, the questions the owner's rules and the plan ask (M032 S8):
   a silent one ended on its own without a role-play;
 * ``icebreaker_exit``: the icebreaker ended between its soft exit (S 3:30) and its hard stop
   (S 4:30) plus the hold for a turn in flight;
-* ``start_by``: the role-play started only on a spoken "ready" or the "I'm ready" button (and, when
-  the code base reports it, ``session_facts.start_by`` agrees);
+* ``start_by``: the role-play started the way the scenario started it (its ground truth: a spoken
+  "ready", or the "I'm ready" button), the button was on the page whenever it was pressed, and
+  the candidate never had to fall back to the button because a spoken "ready" was not taken (and,
+  when the code base reports it, ``session_facts.start_by`` agrees);
 * ``transition_ceiling``: the role-play started within the transition's 6:00 ceiling;
 * ``roleplay_end``: an in-role close (a farewell, the offer to wrap up) never exits before R 14:00
-  unless the candidate agreed (D-M032-2); a time-cap exit falls inside 19:00-20:30; an exit on the
-  candidate's own end request is theirs;
-* ``end_consent``: a declined end request resumed the role-play, an agreed one exited it;
+  unless the candidate agreed (D-M032-2); a time-cap exit falls inside 19:00-20:30 and never
+  follows an end request that was ignored; an exit on the candidate's own end request is theirs;
+* ``end_consent``: every end request is heard: Christy asks (L-ASIDE-END), or the role-play exits
+  at once where the design allows it (the request names the interview or the role-play and ends on
+  it, or Christy already asked once); an ignored request (no question, no exit, answered in role)
+  fails, and so does an at-once exit for a request that neither names the exercise nor follows a
+  question; a declined request resumed the role-play, an agreed one exited it;
 * ``abuse``: what followed an insult to the learner (a hang-up path counts only where the code
   base has one: feature-detected);
 * ``brief_repair``: a brief request got the brief (or a recap) again, a shorter-brief request a
@@ -24,7 +30,8 @@ phase, the questions the owner's rules and the plan ask (M032 S8):
 * ``hiring_team_once``: the wrap-up and the close mention the hiring team once (M032 S3 item 5);
 * ``christy_repeats``: Christy says no sentence of six words or more three times outside the role-play;
 * ``closing_once``: one goodbye; ``learner_after_exit``: the learner never speaks after the exit;
-* ``dead_air``: no bot silence over ``DEAD_AIR_SEC`` after a candidate turn.
+* ``dead_air``: no bot silence over ``DEAD_AIR_SEC`` after a candidate turn;
+* ``bot_overlap``: no two bot lines play at the same time (the SDK plays one speech at a time).
 
 Each check is ``{"ok": True | False | None, ...detail}`` (None: not applicable to this call), and
 ``failed`` lists the checks that are False.  ``build_full_scorecard`` aggregates them over a sweep
@@ -75,7 +82,9 @@ CHECK_IDS = (
     "closing_once",
     "learner_after_exit",
     "dead_air",
+    "bot_overlap",
 )
+OVERLAP_TOLERANCE_SEC = 0.05
 
 
 # ------------------------------------------------------------------------------ helpers
@@ -204,17 +213,37 @@ def _start_by(record: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], trut
                 latest = (t, "button", None)
     start_by = None if latest is None else latest[1]
     ok = start_by in ("spoken", "button")
+    why: list[str] = []
+    # What the scenario did (its ground truth): the button when it presses it, else a spoken ready.
+    pressed = bool(truth.get("press_button")) or "ready_button" in (truth.get("transition") or [])
+    expected = "button" if pressed else "spoken"
+    if start_by in ("spoken", "button") and start_by != expected:
+        ok = False
+        why.append(f"expected a {expected} start, got {start_by}")
+    events = list(record.get("events") or [])
+    if any(e.get("kind") == "ready_button" and e.get("why") == "ready_not_taken" for e in events):
+        ok = False
+        why.append("a spoken ready was not taken: the candidate fell back to the button")
+    if any(e.get("kind") == "button_not_shown" and e.get("phase") == "transition" for e in events):
+        # In the transition the page must show the button; elsewhere it never does (a replay move
+        # recorded as a press there is the scenario's, not the product's).
+        ok = False
+        why.append("a press was due in the transition but the page did not show the button")
     agrees = None
     if reported is not None and start_by in ("spoken", "button"):
         agrees = reported == start_by
         ok = ok and agrees
-    return {
+    out = {
         "ok": ok,
         "start_by": start_by,
+        "expected": expected,
         "reported": reported,
         "reported_agrees": agrees,
         "s_pickup": _num(pickup.get("s_sec")),
     }
+    if why:
+        out["why"] = why
+    return out
 
 
 def _transition_ceiling(record: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -230,7 +259,9 @@ def _candidate_acts(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return list(record.get("candidate_turns") or [])
 
 
-def _roleplay_end(record: Mapping[str, Any], phases: Sequence[str]) -> dict[str, Any]:
+def _roleplay_end(
+    record: Mapping[str, Any], phases: Sequence[str], consent: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     if "roleplay" not in phases:
         return {"ok": None}
     end = record.get("stop_reason")
@@ -238,8 +269,14 @@ def _roleplay_end(record: Mapping[str, Any], phases: Sequence[str]) -> dict[str,
     acts = [turn.get("act") for turn in _candidate_acts(record)]
     agreed = "end_agree" in acts or "wrap_accept" in acts
     detail: dict[str, Any] = {"end": end, "r_end": round(r_end, 1), "agreed": agreed}
+    ignored = [item for item in (consent or {}).get("requests") or [] if item.get("ignored")]
     if end == "time_cap":
         detail["ok"] = ROLEPLAY_STALL_SEC <= r_end <= ROLEPLAY_CAP_SEC
+        if ignored:
+            # The role-play ran to the cap after the candidate asked to stop and was not heard.
+            detail["ok"] = False
+            detail["why"] = "the role-play ran to the time cap after an ignored end request"
+            detail["ignored_requests_r"] = [item.get("r") for item in ignored]
     elif end in ("farewell_exit", "wrap_accepted"):
         detail["ok"] = r_end >= ROLEPLAY_FLOOR_SEC or agreed
         if not detail["ok"]:
@@ -253,6 +290,37 @@ def _roleplay_end(record: Mapping[str, Any], phases: Sequence[str]) -> dict[str,
     return detail
 
 
+def _bot_rows_until_candidate(rows: Sequence[Mapping[str, Any]], index: int) -> list[Mapping[str, Any]]:
+    """The bot rows after ``rows[index]`` and before the candidate's next row."""
+    out = []
+    for row in rows[index + 1 :]:
+        if row.get("speaker") == "candidate":
+            break
+        if row.get("speaker") == "bot":
+            out.append(row)
+    return out
+
+
+def _is_end_question(row: Mapping[str, Any]) -> bool:
+    """Christy's L-ASIDE-END as said (the ``question`` column the harness writes), or, in a record
+    without that column, any Christy line inside the role-play."""
+    if row.get("voice") != "christy" or row.get("phase") not in ("aside", "roleplay"):
+        return False
+    question = row.get("question", "end")
+    return question == "end"
+
+
+def _names_the_end(text: Any) -> bool | None:
+    """Whether the request names the interview or the role-play and ends on it (the engine exits
+    such a request at once, by design: owner test 1eb18cd4); None when this checkout cannot say."""
+    try:
+        from r1_tracker import explicit_end_request, strictly_names_end
+    except ImportError:  # pragma: no cover - feature detect
+        return None
+    value = str(text or "")
+    return bool(explicit_end_request(value) or strictly_names_end(value))
+
+
 def _end_consent(record: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     requests = [i for i, row in enumerate(rows) if row.get("speaker") == "candidate" and row.get("act") == "end_request"]
     if not requests:
@@ -260,13 +328,31 @@ def _end_consent(record: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -
     items = []
     ok = True
     for index in requests:
-        reply = _next_bot(rows, index)
-        asked = bool(reply and reply.get("voice") == "christy" and reply.get("phase") in ("aside", "roleplay"))
-        exited = bool(reply and reply.get("phase") in ("roleplay_exit", "wrapup"))
+        bots = _bot_rows_until_candidate(rows, index)
+        reply = bots[0] if bots else None
+        asked = bool(reply is not None and _is_end_question(reply))
+        exited = any(row.get("phase") in ("roleplay_exit", "wrapup") for row in bots)
+        asked_before = any(_is_end_question(row) for row in rows[:index])
         answer = next(
             (row for row in rows[index + 1 :] if row.get("speaker") == "candidate"), None
         )
         item: dict[str, Any] = {"r": _num(rows[index].get("r_sec")), "asked": asked, "exited_at_once": exited}
+        if not asked and not exited:
+            # Neither asked nor exited: the request was ignored (answered in role, or not at all).
+            item["ignored"] = True
+            item["answered_in_role"] = any(row.get("voice") == "learner" for row in bots)
+            ok = False
+        elif exited and not asked:
+            names = _names_the_end(rows[index].get("text"))
+            basis = "asked_before" if asked_before else ("names_the_end" if names else None)
+            if basis is None and names is None:
+                basis = "unknown"
+            item["exit_basis"] = basis
+            if basis is None:
+                # An at-once exit is the design only for a request that names the interview or the
+                # role-play, or a request after Christy already asked once (D-M032-2: consent).
+                item["exited_without_asking"] = True
+                ok = False
         if asked and answer is not None:
             item["answer"] = answer.get("act")
             later = rows[rows.index(answer) + 1 :]
@@ -421,6 +507,26 @@ def _dead_air(rows: Sequence[Mapping[str, Any]], truth: Mapping[str, Any]) -> di
     }
 
 
+def _bot_overlap(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """No two bot lines play at once (livekit-agents plays one speech at a time, in order)."""
+    spans = sorted(
+        (float(row["t_start"]), float(row["t_end"]), row)
+        for row in rows
+        if row.get("speaker") == "bot" and _num(row.get("t_start")) is not None and _num(row.get("t_end")) is not None
+    )
+    if not spans:
+        return {"ok": None}
+    overlaps = []
+    end_so_far = spans[0][1]
+    for start, end, row in spans[1:]:
+        if start < end_so_far - OVERLAP_TOLERANCE_SEC:
+            overlaps.append(
+                {"s_sec": _num(row.get("s_sec")), "voice": row.get("voice"), "seconds": round(end_so_far - start, 2)}
+            )
+        end_so_far = max(end_so_far, end)
+    return {"ok": not overlaps, "overlaps": overlaps[:10], "count": len(overlaps)}
+
+
 def phase_timings(record: Mapping[str, Any]) -> dict[str, Any]:
     """Seconds spent in each phase (the S clock), and R at the role-play's end."""
     trace = [(str(item.get("phase")), _num(item.get("s_sec"))) for item in record.get("phase_trace") or []]
@@ -442,14 +548,15 @@ def phase_checks(record: Mapping[str, Any]) -> dict[str, Any]:
     rows = _ordered(record.get("rows") or [])
     truth = (record.get("header") or {}).get("ground_truth") or {}
     phases = phases_seen(record)
+    consent = _end_consent(record, rows)
     checks = {
         "phase_order": _phase_order(phases),
         "reached_closing": _reached_closing(record, phases, truth),
         "icebreaker_exit": _icebreaker_exit(record, truth),
         "start_by": _start_by(record, rows, truth),
         "transition_ceiling": _transition_ceiling(record, rows),
-        "roleplay_end": _roleplay_end(record, phases),
-        "end_consent": _end_consent(record, rows),
+        "roleplay_end": _roleplay_end(record, phases, consent),
+        "end_consent": consent,
         "abuse": _abuse(record, rows),
         "brief_repair": _brief_repair(rows),
         "wrapup_answered": _wrapup_answered(rows, phases),
@@ -458,6 +565,7 @@ def phase_checks(record: Mapping[str, Any]) -> dict[str, Any]:
         "closing_once": _closing_once(rows, phases),
         "learner_after_exit": _learner_after_exit(rows),
         "dead_air": _dead_air(rows, truth),
+        "bot_overlap": _bot_overlap(rows),
     }
     failed = [name for name in CHECK_IDS if checks[name].get("ok") is False]
     return {

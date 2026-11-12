@@ -214,6 +214,33 @@ def production_runner(
     return run
 
 
+async def real_sleep(seconds: float) -> None:
+    """Sleep ``seconds`` of REAL time without moving the virtual clock.
+
+    A harness client's retry backoff (``HttpxDeepSeek(sleep=...)``) runs while its call stands the
+    clock still; ``asyncio.sleep`` there is a virtual timer that the frozen clock never reaches, so
+    it only ended when the watchdog tripped (90 s later) and then charged the interview for it.  A
+    thread sleeps instead; its completion wakes the frozen loop's poll.
+    """
+    if seconds <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    with harness_io():
+        await loop.run_in_executor(None, time.sleep, float(seconds))
+
+
+def clock_counters() -> dict[str, float]:
+    """The running virtual loop's counters (zeros on another loop): for a call's header."""
+    loop = current()
+    if loop is None:
+        return {"watchdog_trips": 0, "real_seconds": 0.0, "jumped_seconds": 0.0}
+    return {
+        "watchdog_trips": loop.watchdog_trips,
+        "real_seconds": loop.real_seconds,
+        "jumped_seconds": loop.jumped_seconds,
+    }
+
+
 class FrozenClient:
     """A harness HTTP client (``HttpxDeepSeek``) whose calls stand the clock still."""
 

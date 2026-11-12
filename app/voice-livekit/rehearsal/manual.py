@@ -138,9 +138,20 @@ def act_of(phase: str, intent: str, text: str) -> str:
         if re.search(r"swears at|hostile|abus|crude line", intent.lower()):
             return "insult"
         if re.search(
-            r"steps out of role|end (?:or close )?the role-?play|close the role-?play|end the interview|"
+            r"steps out of role|end (?:or close )?the role-?play|close the role-?play|"
+            r"end the (?:whole )?interview|"
             r"wrap up this interview|end phrase|command phrase|finish the role-?play|wants to stop",
             what,
+        ):
+            return "end_request"
+        # The candidate asking for the call itself to end ("gives up: asks her to hang up", "asks
+        # to disconnect now"): read from the intent only, since "once we hang up, I'll e-mail
+        # you" is a promise inside the sale, and giving up on the SALE ("gives up on the sale")
+        # is not a request to stop.
+        if re.search(
+            r"\b(?:asks|tells) (?:her )?to hang up\b|\basks to (?:disconnect|end the call)\b|"
+            r"\bdisconnect now\b",
+            intent.lower(),
         ):
             return "end_request"
         return "advisor_turn"
@@ -186,6 +197,14 @@ def advisor_tags(intent: str, text: str) -> tuple[str, str]:
     return "pitch", ""
 
 
+_AT_R = re.compile(r"\bR\s*~?(\d{1,2}):(\d{2})")
+_CONTINUED = re.compile(r"^candidate continued", re.IGNORECASE)
+# Acts that are plain talk (no control meaning), so two of them may share one spoken turn.
+PLAIN_ACTS = frozenset({"icebreaker_answer", "backchannel", "advisor_turn", "tactic", "wrapup_other"})
+# A role-play move is held until R is at most this far before the time it was made at.
+REPLAY_HOLD_SLACK_SEC = 15.0
+
+
 @dataclass(frozen=True)
 class Move:
     """One move of a replay: its phase, when it happened, what it was for and how it was said."""
@@ -195,22 +214,69 @@ class Move:
     intent: str
     text: str
     act: str
+    notes: str = ""
 
     @property
     def is_press(self) -> bool:
         return self.act == "ready_button"
 
+    @property
+    def r_at(self) -> float | None:
+        """The role-play clock R the move was made at (``"12:18 | R 8:06"``), or None."""
+        found = _AT_R.search(self.at or "")
+        return None if found is None else int(found.group(1)) * 60.0 + int(found.group(2))
+
+
+def _merge(first: Move, second: Move, *, act: str) -> Move:
+    return Move(
+        first.phase,
+        first.at,
+        f"{first.intent}; {second.intent}",
+        f"{first.text} {second.text}".strip(),
+        act,
+        second.notes,
+    )
+
+
+def merge_shared_turns(moves: Sequence[Move]) -> list[Move]:
+    """Moves that shared one turn of the bot's become one spoken turn.
+
+    In the real session "Candidate continued" (the move's notes) means the next move followed with
+    no bot reply in between, so the simulated candidate says both in one turn instead of answering
+    a later question with the second half.  An icebreaker backchannel ("thanks", said over
+    Christy's reply) is said at the start of the next answer.  Control moves (an end request, an
+    insult, the button, a brief request ...) always stay turns of their own.
+    """
+    out: list[Move] = []
+    for move in moves:
+        prev = out[-1] if out else None
+        if (
+            prev is not None
+            and prev.phase == move.phase
+            and prev.act in PLAIN_ACTS
+            and move.act in PLAIN_ACTS
+        ):
+            continued = bool(_CONTINUED.search(prev.notes or ""))
+            lead_in = prev.act == "backchannel" and prev.phase == "icebreaker"
+            if continued or lead_in:
+                act = move.act if prev.act == "backchannel" else prev.act
+                out[-1] = _merge(prev, move, act=act)
+                continue
+        out.append(move)
+    return out
+
 
 def replay_moves(replay: Mapping[str, Any]) -> list[Move]:
+    """A replay's moves in order, with the moves that shared one bot turn merged."""
     phases = {"opening": "icebreaker"}  # the driver enters the icebreaker right after L-OPEN
     moves = []
     for turn in replay.get("turns") or []:
         phase = phases.get(turn["phase"], turn["phase"])
         moves.append(
             Move(phase, str(turn.get("at", "")), str(turn["intent"]), str(turn["text"]),
-                 act_of(phase, str(turn["intent"]), str(turn["text"])))
+                 act_of(phase, str(turn["intent"]), str(turn["text"])), str(turn.get("notes") or ""))
         )
-    return moves
+    return merge_shared_turns(moves)
 
 
 def _persona(replay: Mapping[str, Any]) -> str | None:
@@ -515,8 +581,11 @@ class ReplayTalker:
 class ReplayAdvisor:
     """The replay's role-play moves in order; then the fallback advisor of the replay's level.
 
-    Every move and every learner line also goes into the fallback's ``history`` (live), so the
-    advisor that takes over knows the conversation.
+    A move is said no earlier than ``REPLAY_HOLD_SLACK_SEC`` before the R it was made at (so a
+    request made after the 10:00 floor is not said before it): while the simulated call runs
+    ahead of the real one, the fallback advisor fills the turns in.  The fallback always takes
+    over mid-call (no greeting).  Every move and every learner line also goes into the fallback's
+    ``history`` (live), so the advisor that takes over knows the conversation.
     """
 
     def __init__(self, moves: Sequence[Move], base: Any, *, rewriter: Rewriter | None = None) -> None:
@@ -529,6 +598,17 @@ class ReplayAdvisor:
         self.last_act: str | None = None
         self.last_intent: str | None = None
         self.replayed = 0
+        self.held = 0
+        self._base_resumed = False
+
+    async def _base_turn(self, learner_text: str | None, r_sec: float, exchange: int) -> AdvisorTurn:
+        if not self._base_resumed:
+            self._base_resumed = True
+            resume = getattr(self.base, "resume_mid_call", None)
+            if callable(resume):
+                resume()
+        self.last_act, self.last_intent = None, None
+        return await self.base.next_turn(learner_text, r_sec, exchange)
 
     def bind(self, names: Mapping[str, str]) -> None:
         self.names.update({k: v for k, v in names.items() if v})
@@ -544,8 +624,12 @@ class ReplayAdvisor:
         if learner_text is not None:
             self._chat.append({"role": "user", "content": learner_text})
         if not self._moves:
-            self.last_act, self.last_intent = None, None
-            return await self.base.next_turn(learner_text, r_sec, exchange)
+            return await self._base_turn(learner_text, r_sec, exchange)
+        due = self._moves[0].r_at
+        # The opening move (the advisor's hello after the pickup) is never held.
+        if self.replayed and due is not None and r_sec < due - REPLAY_HOLD_SLACK_SEC:
+            self.held += 1  # the simulated call runs ahead of the real one: not yet
+            return await self._base_turn(learner_text, r_sec, exchange)
         move = self._moves.pop(0)
         self.replayed += 1
         text = render(move.text, self.names) or "Mm-hmm."

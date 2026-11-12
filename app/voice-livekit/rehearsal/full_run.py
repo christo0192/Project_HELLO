@@ -48,6 +48,7 @@ from rehearsal.llm import (
     preflight,
 )
 from rehearsal.scenarios import SCENARIOS, parse_scenarios, scenario_persona
+from rehearsal.seams import UnknownSeam
 from r1_content import CONTENT_SHA256
 from r1_personas import PERSONA_IDS
 
@@ -122,6 +123,7 @@ class OfflineFullFactory:
         from rehearsal.manual import candidate_parts
         from rehearsal.scripted_interviewer import PhaseRouter, ScriptedInterviewerLLM
         from rehearsal.scripted_learner import ScriptedLearnerLLM, ScriptedShadowJudge
+        from rehearsal.seams import scripted_runners
 
         parts = candidate_parts(
             spec.scenario, spec.seed, spec.level, offline=True, candidate_name=spec.candidate_name
@@ -133,12 +135,17 @@ class OfflineFullFactory:
                 ScriptedLearnerLLM(spec.seed), ScriptedInterviewerLLM(spec.seed, phase_of)
             )
 
+        # Production runs every model seam by default (the session has an LLM); the fake session
+        # has none, so each known seam gets its scripted stand-in here (rehearsal.seams).
+        names = [name for name in runner_names() if name != "judge_runner"]
         return FullDeps(
             make_provider=make_provider,
             talker=parts.talker,
             advisor=parts.advisor,
             scenario=parts.scenario,
             judge_runner=shadow,
+            make_runners=lambda runtime: scripted_runners(runtime, names),
+            seam_mode="scripted",
             ledger=self.ledger,
             scrub=self.scrub,
             offline=True,
@@ -157,18 +164,20 @@ class LiveFullFactory:
     offline = False
 
     def __init__(self, settings: FullSettings, env: dict[str, str] | None = None, *, transport: Any = None) -> None:
-        from rehearsal.vloop import FrozenClient
+        from rehearsal.vloop import FrozenClient, real_sleep
 
         self.settings = settings
         self.env = env if env is not None else load_api_env()
         self.ledger = Ledger(budget_usd=settings.budget_usd)
         self.scrub = Scrubber([self.env[KEY_NAME]])
-        self._raw = HttpxDeepSeek(self.env, self.ledger, transport=transport)
+        # Its retry backoff sleeps in real time: the clock stands still during a harness call.
+        self._raw = HttpxDeepSeek(self.env, self.ledger, transport=transport, sleep=real_sleep)
         self.client = FrozenClient(self._raw)  # harness calls stand the interview clock still
         self.judge_model = settings.judge_model
         self._provider: Callable[[list], Any] | None = None
         self._judge_runner: Callable[[list], Any] | None = None
         self._runners: dict[str, Callable[[list], Any]] = {}
+        self._session: Any = None  # the running call's session (calls run one at a time)
 
     async def check(self) -> dict[str, Any]:
         info: dict[str, Any] = {"mode": "live"}
@@ -189,21 +198,40 @@ class LiveFullFactory:
     async def start(self) -> dict[str, Any]:
         from rehearsal.vloop import production_runner, production_stream
 
+        from rehearsal.seams import check_seams, seam_client
+
+        check_seams(runner_names())  # an unmapped seam stops here, before any spend
         info = await self.check()
-        self._provider = production_stream(make_live_learner_provider(self.env, self.ledger))
+        self._provider = production_stream(
+            make_live_learner_provider(self.env, self.ledger, on_error=self._forward_error)
+        )
         self._judge_runner = production_runner(make_live_judge_runner(self.env, self.ledger))
-        # Every other model seam of this checkout's R1Interview (the end-intent classifier on main;
-        # whatever classifier a later branch adds) asks R1's own judge client in production
-        # (temperature 0), which reads the key from the process environment.  The harness keeps the
-        # key in a dict, so it hands each seam that client explicitly (feature-detected by name).
+        # Every other model seam of this checkout's R1Interview runs on the client it uses in
+        # production (rehearsal.seams.SEAM_CLIENTS): the end-intent classifier and the turn reader
+        # on R1's judge client (temperature 0), the transition bridge on Christy's own client (the
+        # interviewer's settings).  Production reads the key from the process environment; the
+        # harness keeps it in a dict, so it hands each seam its client explicitly.
         for name in runner_names():
-            if name != "judge_runner":
-                role = name[: -len("_runner")]
-                self._runners[name] = production_runner(
-                    make_live_judge_runner(self.env, self.ledger, role=role)
-                )
+            if name == "judge_runner":
+                continue
+            role = name[: -len("_runner")]
+            client = seam_client(name)
+            self._runners[name] = production_runner(
+                make_live_judge_runner(self.env, self.ledger, role=role, client=client)
+            )
         info["runners"] = sorted(self._runners)
+        info["seam_clients"] = {name: seam_client(name) for name in runner_names()}
         return info
+
+    def _forward_error(self, event: Any) -> None:
+        """The learner and Christy client's SDK error events go to the running call's session, as
+        AgentSession forwards its LLM's errors (``R1Interview._on_provider_error`` counts them)."""
+        session = self._session
+        if session is not None:
+            session.emit("error", event)
+
+    def bind_session(self, session: Any) -> None:
+        self._session = session
 
     def make(self, spec: FullCallSpec) -> FullDeps:
         from rehearsal.judge import RubricJudge
@@ -227,6 +255,8 @@ class LiveFullFactory:
             scenario=parts.scenario,
             judge_runner=self._judge_runner,
             runners=dict(self._runners),
+            seam_mode="live",
+            bind_session=self.bind_session,
             ledger=self.ledger,
             scrub=self.scrub,
             offline=False,
@@ -352,6 +382,8 @@ async def run_full_all(
             await factory.aclose()
     except MissingKey as exc:
         run["stopped"], run["message"], code = "missing_key", str(exc), EXIT_NO_KEY
+    except UnknownSeam as exc:
+        run["stopped"], run["message"], code = "unknown_seam", str(exc), EXIT_ERROR
     except InsufficientBalance:
         run["stopped"], run["message"], code = "insufficient_balance", TOP_UP_MESSAGE, EXIT_NO_BALANCE
     except ProviderError as exc:
