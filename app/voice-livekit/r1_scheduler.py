@@ -141,6 +141,12 @@ class MoveSpec:
     must_say: tuple[str, ...] = ()
     markers: tuple[tuple[str, ...], ...] = ()
     variants: tuple[str, ...] = ()
+    # M032 S2 item 3 (flag R1_LEARNER_VOICE_V2, phone map spoken-style M10): the owed worry as an
+    # objective (the feeling and what she wants to know, no sentence shape), voiced as a statement
+    # or a question; and statement-form fallback variants tried before ``variants``.  F3 and F2
+    # only: an F1 anchor is an ask.  The markers are unchanged and prove every variant.
+    worry: str = ""
+    worry_variants: tuple[str, ...] = ()
 
 
 PLAN: tuple[MoveSpec, ...] = (
@@ -175,6 +181,15 @@ PLAN: tuple[MoveSpec, ...] = (
         variants=(
             "I can find a lot of this for free online. What would I be paying for?",
             "I keep seeing free courses everywhere, so why would I pay for this one?",
+        ),
+        worry=(
+            "you doubt it is worth paying when so much is free online (YouTube, Coursera); what "
+            "you want to know is what this would give you that free material does not"
+        ),
+        worry_variants=(
+            "I can find a lot of this for free online, so I'm not sure it's worth paying for.",
+            "There's so much free material on YouTube and Coursera that I'm not sure what paying "
+            "would add.",
         ),
     ),
     MoveSpec(
@@ -214,6 +229,15 @@ PLAN: tuple[MoveSpec, ...] = (
         variants=(
             "And with so many layoffs going on, can this really help me land a job?",
             "Do people actually get jobs after this, given how the market is right now?",
+        ),
+        worry=(
+            "with all the layoffs in the news you are not sure a course like this would really "
+            "help you get a job; what you want to know is whether it actually leads to work"
+        ),
+        worry_variants=(
+            "With all the layoffs right now, I'm not sure this would actually help me get a job.",
+            "With so many layoffs around, I'm not sure a course like this would lead to a job for "
+            "me.",
         ),
     ),
     MoveSpec(
@@ -256,6 +280,12 @@ PLAN: tuple[MoveSpec, ...] = (
             "keep up.",
             "I'm quite busy as it is, so I'm worried about keeping up with this for six months.",
         ),
+        # The worry states no course length of its own: the figure stays the move's must_say until
+        # S2P (probe first) changes it.  The variants above are statements already.
+        worry=(
+            "your days are already full with work and home, and you are not sure you could keep "
+            "up with a course this long on top of them"
+        ),
     ),
     MoveSpec(
         F2_PUSH,
@@ -276,6 +306,14 @@ PLAN: tuple[MoveSpec, ...] = (
         variants=(
             "And if I miss a few classes, how do I catch up?",
             "What if I get busy at work and fall behind?",
+        ),
+        worry=(
+            "you are scared that if work gets busy you would fall behind and not be able to catch "
+            "up; what you want to know is what happens then"
+        ),
+        worry_variants=(
+            "I'm worried that if work gets busy, I'd fall behind and never catch up.",
+            "If I miss a few classes when work piles up, I'm scared I won't be able to catch up.",
         ),
     ),
     MoveSpec(
@@ -478,6 +516,32 @@ CURIOSITY_TOPICS: tuple[tuple[str, str], ...] = (
     ("prerequisites", "whether you need to know anything before you start"),
     ("job_search", "whether there is any help with the job search afterwards"),
 )
+# M032 SWEEP-12 (flag R1_TIC_V2): the labels the model read out as a question ("What would I
+# actually build ...?" in six sessions, "Are the classes live or recorded?" in five) become phrases,
+# rotated per session; her question about any of them still uses the topic up
+# (``curiosity_asked_in(..., wide=True)``).
+CURIOSITY_LABELS_V2: dict[str, tuple[str, ...]] = {
+    "format": ("the class format", "live classes or recordings", "how the classes are run"),
+    "build": (
+        "the projects in the course",
+        "the hands-on project work",
+        "what gets built in the course",
+    ),
+    "payment": (
+        "paying in monthly instalments",
+        "a monthly payment option",
+        "spreading the fee out",
+    ),
+    "mentor_time": ("time with mentors", "mentor access", "one-to-one mentor time"),
+    "weekly_hours": ("the weekly time needed", "hours per week", "the time it takes each week"),
+    "class_size": ("the batch size", "class size", "the number of people per batch"),
+    "prerequisites": (
+        "prerequisites",
+        "the starting level needed",
+        "any preparation before starting",
+    ),
+    "job_search": ("help with the job search", "job-search support", "support after the course"),
+}
 REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
 _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
@@ -801,11 +865,35 @@ _CURIOSITY_ASKED = {
 }
 
 
-def curiosity_asked_in(text: object) -> frozenset[str]:
+# M032 SWEEP-12: the rotated noun-phrase labels (``CURIOSITY_LABELS_V2``) asked back in her own
+# question ("what about the class format?", "and the weekly time needed?").  Read only with
+# ``wide`` (flag R1_TIC_V2), so the release before reads her questions as it did.
+_CURIOSITY_ASKED_WIDE = {
+    "format": _compile(
+        r"\b(?:class|course) format\b", r"\bhow (?:are )?the classes (?:are )?run\b"
+    ),
+    "build": _compile(r"\b(?:gets|get|is|are) built\b", r"\bhands-?on\b"),
+    "payment": _compile(
+        r"\bspread(?:ing)? (?:the |it |out )?(?:fee|cost|payments?|out)\b",
+        r"\bmonthly (?:payments?|options?)\b",
+    ),
+    "weekly_hours": _compile(
+        r"\bweekly time\b",
+        r"\btime (?:it takes|needed|required) (?:each|every|a|per) week\b",
+        r"\bhours per week\b",
+    ),
+    "class_size": _compile(r"\b(?:number of )?people (?:per|in a|in each) batch\b"),
+    "prerequisites": _compile(r"\bstarting level\b", r"\bprepar(?:e|ation) before\b"),
+    "job_search": _compile(r"\bjob[- ]search\b", r"\bsupport after the course\b"),
+}
+
+
+def curiosity_asked_in(text: object, *, wide: bool = False) -> frozenset[str]:
     """The curiosity topics a question of the LEARNER's ``text`` asks about (L1).
 
     Only question-like sentences count: "I like that it's live" asks nothing.  A topic is used up
-    once she asked it, whether the engine handed it over or she asked on her own.
+    once she asked it, whether the engine handed it over or she asked on her own.  ``wide``
+    (SWEEP-12) also reads the rotated labels of ``CURIOSITY_LABELS_V2``.
     """
     found: set[str] = set()
     for sentence in split_sentences(text):
@@ -814,6 +902,8 @@ def curiosity_asked_in(text: object) -> frozenset[str]:
         lowered = fold(sentence).lower()
         for topic, _label in CURIOSITY_TOPICS:
             patterns = (*_CURIOSITY_COVERED.get(topic, ()), *_CURIOSITY_ASKED.get(topic, ()))
+            if wide:
+                patterns += _CURIOSITY_ASKED_WIDE.get(topic, ())
             if any(pattern.search(lowered) for pattern in patterns):
                 found.add(topic)
     return frozenset(found)
@@ -863,6 +953,50 @@ F4_PUSH_SAID_VARIANTS = (
     "Like I said, I'd need to talk it over with my {decision_maker} first.",
     "As I mentioned, I'd want to talk to my {decision_maker} before anything moves.",
 )
+
+
+# M032 SWEEP-3 (flag R1_NO_COMMIT_LEDGER): she already said she is not deciding today in a line of
+# her own, so the owed F4 primary refers back to it ("like I said") instead of saying it as news.
+# Its markers and must-say are unchanged; both variants prove the move.
+F4_PRIMARY_SAID_SUFFIX = (
+    "; you already said earlier that you are not ready to decide yet, so refer back to it in a few "
+    'words (for example "like I said") instead of saying it as news'
+)
+F4_PRIMARY_SAID_VARIANTS = (
+    "Like I said, I'm not ready to decide today. I want a bit more time.",
+    "As I mentioned, I'd like to wait and decide later, not today.",
+)
+# M032 S2 item 4 (phone map question-flow M5): the advisor already talked about the topic of an owed
+# primary before it was raised, so she says why it still worries her in light of what she was told
+# ("what you were told about X", never the advisor's details said back as facts: the guard's
+# format_or_schedule_claim would drop them).
+PREEMPTED_SUFFIX = (
+    "; the advisor already told you something about {label}, so say in your own words why it "
+    "still worries you after what you were told, without repeating their details as facts"
+)
+PREEMPTED_LABELS: tuple[tuple[str, str], ...] = (
+    ("F3", "what the course gives you"),
+    ("F2", "the schedule and the time it takes"),
+)
+
+
+def preempting_families(text: object) -> frozenset[str]:
+    """The families an advisor turn already talked about in a statement (S2 item 4).
+
+    Narrower than ``topics_in``: F3 is free material, worth or outcomes (``_VALUE_TALK``), never a
+    pitch alone; F2 is the format or the schedule.  A question about the topic pre-empts nothing.
+    """
+    found: set[str] = set()
+    if covers_format(text):
+        found.add("F2")
+    for sentence in _sentences(text):
+        if is_question_like(sentence):
+            continue
+        if any(pattern.search(sentence) for pattern in _VALUE_TALK):
+            found.add("F3")
+        if any(pattern.search(sentence) for pattern in _SCHEDULE_TALK):
+            found.add("F2")
+    return frozenset(found)
 
 
 def f4_push_said(decision_maker: str) -> tuple[str, tuple[str, ...]]:

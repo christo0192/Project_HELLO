@@ -2036,5 +2036,68 @@ class AdvisorTurnReaderCorpusTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - start, 10.0)
 
 
+class LearnerVoiceS2SchedulerTests(unittest.TestCase):
+    """M032 S2 texts in the plan: the worry objectives (item 3), the pre-empted suffix (item 4), the
+    rotated curiosity labels (SWEEP-12) and F4-PRIMARY's said-back variants (SWEEP-3)."""
+
+    def test_every_rotated_curiosity_label_asked_back_uses_its_topic_up(self):
+        for topic, labels in sched.CURIOSITY_LABELS_V2.items():
+            self.assertEqual(len(labels), 3, topic)
+            for label in labels:
+                for question in (f"What about {label}?", f"Could you tell me about {label}?"):
+                    with self.subTest(question=question):
+                        self.assertIn(topic, sched.curiosity_asked_in(question, wide=True))
+        self.assertEqual(set(sched.CURIOSITY_LABELS_V2), {t for t, _ in sched.CURIOSITY_TOPICS})
+        # Her own wording still counts, and a statement asks nothing.
+        self.assertIn("build", sched.curiosity_asked_in("What kind of projects would I work on?"))
+        self.assertIn(
+            "build", sched.curiosity_asked_in("What kind of projects would I work on?", wide=True)
+        )
+        self.assertEqual(
+            sched.curiosity_asked_in("I like the hands-on project work.", wide=True), frozenset()
+        )
+
+    def test_the_worry_variants_prove_their_move_and_are_statements(self):
+        for spec in sched.PLAN:
+            if not spec.worry:
+                continue
+            self.assertIn(spec.family, ("F2", "F3"), spec.id)
+            for text in spec.worry_variants:
+                with self.subTest(move=spec.id, text=text):
+                    self.assertTrue(markers_match(spec.markers, text))
+                    self.assertNotIn("?", text)
+        self.assertFalse(any(spec.worry for spec in sched.PLAN if spec.family in ("F1", "F4")))
+
+    def test_the_said_back_variants_prove_f4_primary(self):
+        spec = sched.SPEC_BY_ID[sched.F4_PRIMARY]
+        for text in sched.F4_PRIMARY_SAID_VARIANTS:
+            with self.subTest(text=text):
+                self.assertTrue(markers_match(spec.markers, text))
+
+    def test_the_preempting_reader_needs_a_statement_about_the_topic(self):
+        self.assertEqual(
+            sched.preempting_families("We have live classes on weekends and recordings too."),
+            frozenset({"F2"}),
+        )
+        self.assertEqual(
+            sched.preempting_families(
+                "Free videos won't give you mentors or feedback, that is what you pay for."
+            ),
+            frozenset({"F3"}),
+        )
+        for text in ("Do you have weekends free?", "Our program is great.", "", None):
+            with self.subTest(text=text):
+                self.assertEqual(sched.preempting_families(text), frozenset())
+
+    def test_the_new_readers_are_linear(self):
+        import time
+
+        start = time.perf_counter()
+        for text in ("weekly time " * 5000, "what about the class format? " * 2000, "a" * 50000):
+            sched.curiosity_asked_in(text, wide=True)
+            sched.preempting_families(text)
+        self.assertLess(time.perf_counter() - start, 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()
