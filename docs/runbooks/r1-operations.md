@@ -2238,6 +2238,35 @@ revision 21's lines stay pinned under -V20 ids. The four new `say` lines are war
 flag is on. Rollback: `fly secrets set R1_TRANSITION_REPAIR=0 -a project-hello-voice` restores
 revision 21's brief, replay, nudge, pickup, aside, note and routing exactly.
 
+### Icebreaker repairs (M032 S6, owner go 2026-11-11)
+
+Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the
+soft exit got the brief instead, "Sorry, I was not able to hear you" counted as an answer, a request
+for a minute got "I can't pause" and a new question, and a two-word thank-you cut her reply.
+
+* **`R1_ICEBREAKER_REPAIR`** (default on). Once the soft exit is due and before S = 4:30, the
+  first request to repeat the question (`is_repeat_request`: repeat, rephrase, say it again, what
+  did you say, didn't catch or hear, a bare "Sorry?" or "Pardon?") gets "Of course. {question}"
+  (the last question of Christy's own reply; no model call, no answer counted, the S5 plan
+  unchanged) and the next answer is the boundary. "Are you there?" at the boundary gets L-PRESENT
+  ("Yes, I'm here.") before the brief; any repair turn at the boundary gets the brief without
+  "Thank you, {first_name}." (L-TRANSITION-BRIDGED). Mid-icebreaker, a reply to "Are you there?"
+  is told to open with "Yes, I'm here." (with an apology after a 6 s wait); the plan still decides
+  the question. A hold request ("Can you give me a minute?") gets L-IB-HOLD ("Of course, take a
+  moment. I'm here when you're ready."), is no answer, and the next silence window is 60 s (once
+  per session, never past S = 4:30); with under 15 s left nothing is promised and the turn ends
+  the icebreaker. The repair readers also read "once again", "not able to hear" and "I'm sorry".
+  Counts: `icebreaker_repeat_deferrals`, `boundary_presence_lines`, `ib_holds`. Logs:
+  `r1_icebreaker_repeat`, `r1_icebreaker_hold`, `r1_icebreaker_presence_opener`,
+  `r1_icebreaker_boundary_presence`. Rollback: `fly secrets set R1_ICEBREAKER_REPAIR=0 -a
+  project-hello-voice`.
+* **`R1_ICEBREAKER_ACK_HOLD`** (default on, only with `R1_ACK_HOLD`). An acknowledgement or a
+  courtesy-only "Thank you" said over Christy's live icebreaker model reply is held back from the
+  SDK like an "Okay" over the learner: written to the row in the icebreaker phase, never counted,
+  planned or carried, and it never stretches the hold at the S = 4:30 cap. Count:
+  `icebreaker_acks_held`. Rollback: `fly secrets set R1_ICEBREAKER_ACK_HOLD=0 -a
+  project-hello-voice`.
+
 ### Leaving the role-play by consent (owner decisions 2026-11-03, M2)
 
 Mock call aa166f09: the learner's scripted WEAK line ("Let me think about it. I'll read through the

@@ -137,7 +137,9 @@ import r1_world
 # Revision 22 (M032 S6, R1_TRANSITION_REPAIR): the brief from one shared body, its replay and short
 # recap, "Yes, I'm here.", the pickup bridge, the rotated start questions, the new pickup and coach
 # aside, revision 21's texts under -V20 ids, and the transition note that asks nothing itself.
-PINNED_CONTENT_SHA256 = "d9c1215ea8c4957d0d0b48ccb058e969798e28c24db8a65e6ee8ecea91fe4380"
+# Same revision, the icebreaker repair (R1_ICEBREAKER_REPAIR): L-IB-HOLD, the repeated question's
+# template, the presence opener notes and the hold's limits.
+PINNED_CONTENT_SHA256 = "be387944eeccfd7870d9c70b5082c4fbb2f1cd622c44e0641961dae2bab8e5d9"
 
 CONTENT_MODULES = (
     "r1_text",

@@ -3327,7 +3327,12 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # M032 S6: R1_TRANSITION_REPAIR=0 warms revision 21's set exactly (the Sarvam quota is
         # shared with the phone lane), with revision 21's texts.
         rig, _cache, _synth = self.build()
+        # "Yes, I'm here." is the icebreaker repair's line too (SWEEP-28): warmed while either is on.
         with _env(R1_TRANSITION_REPAIR="0"):
+            ids = [spec.line_id for spec in rig.interview._warm_specs(candidate_free=True)]
+            self.assertIn("L-PRESENT", ids)
+            self.assertNotIn("L-TRANSITION-RECAP", ids)
+        with _env(R1_TRANSITION_REPAIR="0", R1_ICEBREAKER_REPAIR="0"):
             off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
                 candidate_free=False
             )
@@ -3736,6 +3741,260 @@ class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
             rig.machine.candidate_turns = 4
             self.assertIsNone(await rig.converse("Let me think about that."))
             self.assertTrue(rig.interview._icebreaker_boundary_turn)  # today: it ends the phase
+
+
+# M032 S6 (SWEEP-28): synthetic icebreaker turns (owner tests b419d478, a95398ab and 7f2a25e6,
+# paraphrased by shape only).
+IB_QUESTION_REPLY = "Thanks. How do you keep track of all your leads?"
+IB_REPEAT = "Sorry, could you repeat the question?"
+IB_LAST = "I keep a sheet and call every new lead back within a day."
+IB_HOLD_TEXT = "Could you give me a second?"
+IB_PRESENCE = "Hello? Are you there?"
+
+
+class TestIcebreakerRepairWiring(unittest.IsolatedAsyncioTestCase):
+    """M032 S6 (SWEEP-28, ``R1_ICEBREAKER_REPAIR`` on): a request to repeat Christy's question at
+    the soft exit gets the question again, a presence check gets "Yes, I'm here.", and a request for
+    a moment gets one.  The soft exit (S >= 3:30 with four answers) and the S=4:30 cap are as they
+    were; ``R1_ICEBREAKER_REPAIR=0`` is today's icebreaker exactly."""
+
+    async def rig(self, *, bridge_runner=None, **flags: str) -> Rig:
+        kwargs = {} if bridge_runner is None else {"bridge_runner": bridge_runner}
+        with _env(**flags):
+            rig = Rig(provider=TokenProvider(IB_QUESTION_REPLY), **kwargs)
+            await rig.interview.say("L-OPEN")
+        return rig
+
+    async def due(self, rig: Rig) -> None:
+        """Four answers before S = 3:30, then S = 3:32: the next committed answer is the last."""
+        for _ in range(4):
+            await rig.converse(IB_ANSWER)
+        rig.clock.advance(212)
+        self.assertTrue(rig.machine.icebreaker_should_end())
+
+    def plan_state(self, rig: Rig) -> tuple:
+        plan = rig.interview._icebreaker_plan
+        return plan.cursor, dict(plan.holds), dict(plan.follow_ups), dict(plan.jobs)
+
+    async def brief(self, rig: Rig) -> list[str]:
+        before = len(rig.session.spoken)
+        rig.interview._enter(R1Phase.TRANSITION)
+        await rig.interview._say_brief()
+        return rig.session.spoken[before:]
+
+    async def test_a_repeat_request_at_the_soft_exit_gets_the_question_again(self):
+        rig = await self.rig()
+        await self.due(rig)
+        calls, answers, plan = len(rig.provider.calls), rig.machine.candidate_turns, self.plan_state(rig)
+        spoken = await rig.converse(IB_REPEAT)  # no StopResponse: it gets a reply
+        self.assertEqual(spoken, "Of course. How do you keep track of all your leads?")
+        self.assertEqual(len(rig.provider.calls), calls)  # scripted, no model call
+        self.assertEqual(rig.machine.candidate_turns, answers)  # not an answer
+        self.assertEqual(self.plan_state(rig), plan)  # S5's plan is left as it was
+        self.assertFalse(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNone(await rig.converse(IB_LAST))  # the next answer is the boundary
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNone(rig.interview._icebreaker_boundary_kind)
+        brief = await self.brief(rig)
+        self.assertEqual(brief, [rig.interview.render_line("L-TRANSITION")])  # thanked as before
+        self.assertEqual(rig.interview._repair_facts()["icebreaker_repeat_deferrals"], 1)
+
+    async def test_the_answer_that_cuts_the_repeated_question_is_the_boundary(self):
+        rig = await self.rig()
+        await self.due(rig)
+        await rig.converse(IB_REPEAT)
+        rig.interview._icebreaker_reply_cut = True  # their answer cut "Of course. How do you..."
+        self.assertIsNone(await rig.converse(IB_LAST))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+
+    async def test_a_second_repeat_is_the_boundary_and_the_brief_has_no_thanks(self):
+        rig = await self.rig()
+        await self.due(rig)
+        await rig.converse(IB_REPEAT)
+        calls = len(rig.provider.calls)
+        self.assertIsNone(await rig.converse("Sorry, can you say that again?"))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+        self.assertEqual(rig.interview._icebreaker_boundary_kind, "repair")
+        brief = await self.brief(rig)
+        self.assertEqual(brief, [rig.interview.render_line("L-TRANSITION-BRIDGED")])
+        self.assertEqual(len(rig.provider.calls), calls)
+
+    async def test_at_the_hard_cap_a_repeat_request_is_not_deferred(self):
+        rig = await self.rig()
+        await self.due(rig)
+        rig.clock.advance(60)  # S = 4:32
+        self.assertIsNone(await rig.converse(IB_REPEAT))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+        self.assertEqual(rig.interview._repair_facts()["icebreaker_repeat_deferrals"], 0)
+
+    async def test_a_repeat_request_before_the_soft_exit_is_still_the_models(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        calls = len(rig.provider.calls)
+        self.assertEqual(await rig.converse(IB_REPEAT), IB_QUESTION_REPLY)
+        self.assertEqual(len(rig.provider.calls), calls + 1)
+        self.assertEqual(rig.interview._last_reply.job.kind, "reask")  # S5's same question again
+
+    async def test_a_presence_check_at_the_soft_exit_gets_yes_im_here_and_no_thanks(self):
+        rig = await self.rig()
+        await self.due(rig)
+        calls = len(rig.provider.calls)
+        self.assertIsNone(await rig.converse(IB_PRESENCE))
+        self.assertEqual(rig.interview._icebreaker_boundary_kind, "presence")
+        brief = await self.brief(rig)
+        self.assertEqual(
+            brief,
+            [rig.interview.render_line("L-PRESENT"), rig.interview.render_line("L-TRANSITION-BRIDGED")],
+        )
+        self.assertEqual(brief[0], "Yes, I'm here.")
+        self.assertFalse(any(line.startswith("Of course.") for line in brief))
+        self.assertEqual(len(rig.provider.calls), calls)  # no model call
+        self.assertEqual(rig.interview._repair_facts()["boundary_presence_lines"], 1)
+        self.assertFalse(any(h.allow_interruptions for h in rig.session.handles[-2:]))
+
+    async def test_with_the_bridge_on_a_lost_answer_before_the_presence_check_is_reacted_to(self):
+        runner = BridgeRunner(BRIDGE_REACTION)
+        rig = await self.rig(bridge_runner=runner, R1_TRANSITION_BRIDGE="1")
+        await self.due(rig)
+        # An answer whose reply was cut before any audio, as ``_report_unheard_icebreaker`` leaves
+        # it (the 7f2a25e6 shape): its text and its own history entry are carried.
+        entry = rig.interview._note_candidate_turn(BRIDGE_LAST, 99)
+        rig.interview._icebreaker_carry = BRIDGE_LAST
+        rig.interview._icebreaker_carry_entry = entry
+        with _env(R1_TRANSITION_BRIDGE="1"):
+            self.assertIsNone(await rig.converse(IB_PRESENCE))
+            brief = await self.brief(rig)
+        self.assertEqual(
+            brief,
+            [
+                rig.interview.render_line("L-PRESENT"),
+                BRIDGE_REACTION,
+                rig.interview.render_line("L-TRANSITION-BRIDGED"),
+            ],
+        )
+        (messages,) = runner.calls
+        self.assertIn(BRIDGE_LAST, messages[-1]["content"])
+
+    async def test_a_presence_check_mid_icebreaker_gets_the_opener_and_keeps_the_job(self):
+        import r1_icebreaker as ib
+        from r1_prompts import INTERVIEWER_DELIVERY_RIDER
+
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse(IB_PRESENCE)
+        note = rig.last_messages()[-2]["content"]
+        self.assertIn(ib.PRESENCE_OPENER_NOTE, note)
+        self.assertTrue(note.endswith(INTERVIEWER_DELIVERY_RIDER))  # the rider stays last
+        # After a long unvoiced wait the opener apologises.
+        rig.interview._unvoiced_since = rig.interview._clock() - 7.0
+        await rig.converse("Hello, can you hear me?")
+        self.assertIn(ib.PRESENCE_OPENER_NOTE_LATE, rig.last_messages()[-2]["content"])
+
+    async def test_the_7f2a25e6_shape_keeps_the_plans_ask(self):
+        # An answer whose reply was cut before any audio, then "Hello? Are you there?": the plan
+        # reads both halves as the answer (S5's JOB_ASK, never "ask your question again"), and the
+        # reply opens with "Yes, I'm here.".
+        import r1_icebreaker as ib
+
+        rig = await self.rig()
+        rig.final(IB_ANSWER)
+        await rig.settle()
+        await rig.agent.on_user_turn_completed(
+            None, SimpleNamespace(text_content=IB_ANSWER, id="msg_lost")
+        )
+        handle = FakeSpeechHandle("reply")
+        rig.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
+        )
+        handle.interrupted = True
+        handle.finish()  # cancelled before any audio
+        await rig.settle()
+        self.assertEqual(rig.interview._icebreaker_carry, IB_ANSWER)
+        await rig.converse(IB_PRESENCE)
+        self.assertEqual(rig.interview._last_reply.job.kind, ib.JOB_ASK)
+        self.assertIn(ib.PRESENCE_OPENER_NOTE, rig.last_messages()[-2]["content"])
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I2")
+
+    async def test_a_hold_request_gets_a_moment_and_is_no_answer(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        calls, answers, plan = len(rig.provider.calls), rig.machine.candidate_turns, self.plan_state(rig)
+        spoken = await rig.converse(IB_HOLD_TEXT)
+        self.assertEqual(spoken, "Of course, take a moment. I'm here when you're ready.")
+        self.assertEqual(len(rig.provider.calls), calls)
+        self.assertEqual(rig.machine.candidate_turns, answers)
+        self.assertEqual(self.plan_state(rig), plan)
+        self.assertTrue(rig.interview._ib_hold_window)
+        # Once per session: a second one is an ordinary turn (still no answer).
+        self.assertEqual(await rig.converse("Hold on a sec, please."), "Take your time.")
+        self.assertEqual(rig.machine.candidate_turns, answers)
+        self.assertFalse(rig.interview._ib_hold_window)
+        self.assertEqual(rig.interview._repair_facts()["ib_holds"], 1)
+
+    async def test_a_hold_at_the_soft_exit_gets_its_moment_and_the_next_answer_ends_it(self):
+        rig = await self.rig()
+        await self.due(rig)
+        spoken = await rig.converse(IB_HOLD_TEXT)
+        self.assertEqual(spoken, rig.interview.render_line("L-IB-HOLD"))
+        self.assertFalse(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNone(await rig.converse(IB_LAST))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+
+    async def test_a_hold_with_little_time_left_promises_nothing(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        rig.clock.advance(260)  # S = 4:20: 10 s of the hard budget left
+        self.assertIsNone(await rig.converse(IB_HOLD_TEXT))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+        self.assertEqual(rig.interview._icebreaker_boundary_kind, "repair")
+        self.assertEqual(rig.interview._ib_holds, 0)
+        self.assertNotIn(rig.interview.render_line("L-IB-HOLD"), rig.session.spoken)
+
+    async def test_the_hold_window_is_longer_once(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse(IB_HOLD_TEXT)
+        rig.interview._drop_stale_turns()  # the driver already read those finals
+        # "Of course, take a moment." plays; the candidate's silence window starts when it ends.
+        for old_state, new_state in (("listening", "speaking"), ("speaking", "listening")):
+            rig.session.emit(
+                "agent_state_changed", SimpleNamespace(old_state=old_state, new_state=new_state)
+            )
+        with mock.patch.object(r1_session, "ICEBREAKER_PROMPT_SECONDS", 0.02), mock.patch.object(
+            r1_session, "ICEBREAKER_HOLD_WAIT_SECONDS", 0.4
+        ):
+            task = asyncio.create_task(rig.interview._run_icebreaker())
+            await asyncio.sleep(0.15)
+            silent = rig.interview.render_line("L-SIL-IB")
+            self.assertNotIn(silent, rig.session.spoken)  # still inside the hold's window
+            await rig.until(lambda: silent in rig.session.spoken)
+            self.assertFalse(rig.interview._ib_hold_window)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    async def test_the_flag_off_is_todays_icebreaker(self):
+        rig = await self.rig(R1_ICEBREAKER_REPAIR="0")
+        with _env(R1_ICEBREAKER_REPAIR="0"):
+            await rig.converse(IB_ANSWER)
+            calls, answers = len(rig.provider.calls), rig.machine.candidate_turns
+            self.assertEqual(await rig.converse(IB_HOLD_TEXT), IB_QUESTION_REPLY)  # the model's
+            self.assertEqual(len(rig.provider.calls), calls + 1)
+            self.assertEqual(rig.machine.candidate_turns, answers + 1)  # counted, as today
+            await rig.converse(IB_PRESENCE)
+            self.assertNotIn("I'm here", rig.last_messages()[-2]["content"])
+            for _ in range(2):
+                await rig.converse(IB_ANSWER)
+            rig.clock.advance(212)
+            self.assertIsNone(await rig.converse(IB_REPEAT))  # today: it ends the icebreaker
+            self.assertTrue(rig.interview._icebreaker_boundary_turn)
+            self.assertIsNone(rig.interview._icebreaker_boundary_kind)
+            brief = await self.brief(rig)
+            self.assertEqual(brief, [rig.interview.render_line("L-TRANSITION")])
+            facts = rig.interview._repair_facts()
+            for key in ("icebreaker_repeat_deferrals", "boundary_presence_lines", "ib_holds"):
+                self.assertNotIn(key, facts)
 
 
 class BridgeRunner:

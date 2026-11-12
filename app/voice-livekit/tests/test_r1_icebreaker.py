@@ -627,6 +627,102 @@ class TestTransitionBridge(unittest.TestCase):
             self.assertFalse(ib.transition_bridge_enabled())
 
 
+class TestIcebreakerRepair(unittest.TestCase):
+    """M032 S6 (SWEEP-28): the pure pieces of the icebreaker repair (synthetic texts only)."""
+
+    HOLDS = (
+        "Can you pause this for a minute?",
+        "Could you give me a second?",
+        "Can I take a minute?",
+        "Hold on a sec, please.",
+        "Give me a moment.",
+        "Can we take a short break?",
+        "Could we pause for a bit?",
+        "Wait a minute, please.",
+        "Sorry, hold on.",
+        "Pause, please.",
+        "Can I have a quick minute?",
+    )
+    NOT_HOLDS = (
+        "Could you give me an example of what you mean?",
+        "Can you give me more context on the role?",
+        "Will you wait for my answer?",
+        "Would you hold that thought?",
+        "I took a short break from sales in 2020",
+        "There was a pause in my career after college.",
+        "I hold on to my best customers by calling them every month.",
+        "Give me a moment to explain: I sold software for six years to banks, insurers, retailers, "
+        "two hospitals and a chain of schools across the city.",
+        "Let me think about that.",
+        "One moment.",
+        "",
+    )
+
+    def test_a_hold_request(self):
+        for text in self.HOLDS:
+            with self.subTest(text=text):
+                self.assertTrue(ib.is_hold_request(text))
+        for text in self.NOT_HOLDS:
+            with self.subTest(text=text):
+                self.assertFalse(ib.is_hold_request(text))
+
+    def test_a_hold_request_is_linear_on_long_input(self):
+        for text in (
+            "give me " + "a " * 5000 + "second",
+            "can i " + "take " * 5000 + "a minute",
+            "sorry " * 5000 + "hold on",
+            "wait for " * 3000 + "a minute",
+        ):
+            started = time.perf_counter()
+            ib.is_hold_request(text)
+            self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_the_question_to_repeat(self):
+        cases = (
+            ("Thanks. So, what does a typical day look like for you?",
+             "So, what does a typical day look like for you?"),
+            ("Here's my next question: how do you keep track of your leads?",
+             "How do you keep track of your leads?"),
+            ("Got it - and how do you follow up with them?", "And how do you follow up with them?"),
+            ("What do you sell - courses or software?", "What do you sell - courses or software?"),
+            ("Is it inbound? Or do you also call cold leads?", "Or do you also call cold leads?"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(ib.repeat_question(text), expected)
+        for text in ("That sounds like a busy week.", "", "?", None):
+            with self.subTest(text=text):
+                self.assertIsNone(ib.repeat_question(text))
+
+    def test_the_repeat_line_and_the_presence_notes(self):
+        self.assertEqual(
+            ib.repeat_line("How do you keep track of your leads?"),
+            "Of course. How do you keep track of your leads?",
+        )
+        self.assertEqual(ib.IB_REPEAT_TEMPLATE, "Of course. {question}")
+        self.assertEqual(
+            ib.PRESENCE_OPENER_NOTE,
+            'If they asked whether you are there, start with "Yes, I\'m here."',
+        )
+        self.assertEqual(
+            ib.PRESENCE_OPENER_NOTE_LATE,
+            'If they asked whether you are there, start with "Sorry about that, yes, I\'m here."',
+        )
+        self.assertEqual(ib.presence_opener_note(waited=5.9), ib.PRESENCE_OPENER_NOTE)
+        self.assertEqual(ib.presence_opener_note(waited=6.0), ib.PRESENCE_OPENER_NOTE_LATE)
+        self.assertEqual(ib.presence_opener_note(waited=None), ib.PRESENCE_OPENER_NOTE)
+        self.assertEqual(ib.ICEBREAKER_HOLD_WAIT_SECONDS, 60.0)
+        self.assertEqual(ib.HOLD_MIN_BUDGET_SECONDS, 15.0)
+
+    def test_the_repair_flag_defaults_on_and_turns_off(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("R1_ICEBREAKER_REPAIR", None)
+            self.assertTrue(ib.icebreaker_repair_enabled())
+        for off in ("0", "off", "false", "no", " OFF "):
+            with mock.patch.dict(os.environ, {"R1_ICEBREAKER_REPAIR": off}):
+                self.assertFalse(ib.icebreaker_repair_enabled())
+
+
 class TestFlags(unittest.TestCase):
     def test_the_plan_flag_defaults_on_and_turns_off(self):
         with mock.patch.dict(os.environ, {}, clear=False):

@@ -5461,8 +5461,9 @@ class TestWhatTheCandidateCanCut(R1TestCase):
         self.assertEqual(source.count("interruptible=True"), 1)  # the llm_recovery line only
         # _play_aside: the asides; _say_brief: the transition bridge's reaction (M032 S5), which
         # comes right before the uninterruptible brief and cannot be cut either, and that brief
-        # (L-TRANSITION-BRIDGED), queued together with the reaction (review of S5).
-        self.assertEqual(source.count("interruptible=False"), 3)
+        # (L-TRANSITION-BRIDGED), queued together with the reaction (review of S5); and "Yes, I'm
+        # here." queued right before them after a presence check ends the icebreaker (M032 S6).
+        self.assertEqual(source.count("interruptible=False"), 4)
 
 
 class TestTransitionKeepsTheSessionsEndpointing(R1TestCase):
@@ -8445,6 +8446,116 @@ class TestIcebreakerAcksDoNotCutChristy(R1TestCase):
                 self.assertFalse(r1_session.is_courtesy_turn(text))
 
 
+class TestIcebreakerRepairReaders(unittest.TestCase):
+    """M032 S6 (SWEEP-28, ``R1_ICEBREAKER_REPAIR``): the wider repair readers.  Synthetic texts;
+    owner test b419d478 (paraphrased) had "Can you repeat it once again?" and "Sorry, I was not
+    able to hear you" read as answers."""
+
+    NEW_CLARIFICATIONS = (
+        "Can you repeat that once again?",
+        "Sorry, I was not able to hear you.",
+        "I'm sorry, could you repeat that?",
+        "I am sorry, can you say that again?",
+        "Sorry, we were unable to hear you properly.",
+        "I'm not able to catch that.",
+    )
+    REPEATS = (
+        "Sorry, could you repeat the question?",
+        "Can you repeat that once again?",
+        "Could you say that again, please?",
+        "Sorry, what was the question?",
+        "I didn't catch that.",
+        "Sorry, I was not able to hear you.",
+        "What did you say?",
+        "Can you rephrase that?",
+        "Sorry?",
+        "Pardon?",
+        "Come again?",
+    )
+    NOT_REPEATS = (
+        "Hello? Are you there?",
+        "Can you hear me?",
+        "Yes, I can hear you.",
+        "Sorry.",
+        "What do you mean?",
+        "Sorry, can you repeat that? I sell courses to working professionals.",
+        "Could you give me a second?",
+        "I repeat the same process every day.",
+        "",
+    )
+
+    def test_the_new_forms_are_repairs_with_no_content_words(self) -> None:
+        for text in self.NEW_CLARIFICATIONS:
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.content_word_count(text), 0)
+                self.assertTrue(r1_session.is_repair_turn(text))
+        with mock.patch.dict(os.environ, {"R1_ICEBREAKER_REPAIR": "0"}):
+            for text in self.NEW_CLARIFICATIONS:
+                with self.subTest(text=text, flag="off"):
+                    self.assertGreater(r1_session.content_word_count(text), 0)
+                    self.assertFalse(r1_session.is_repair_turn(text))
+
+    def test_the_pinned_clarifications_and_answers_read_as_before(self) -> None:
+        for text in TestReplyPolicy.CLARIFICATIONS:
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.content_word_count(text), 0)
+        for text in (
+            "I couldn't get a job at first",
+            "I say what I think to every learner",
+            "I was not able to close that one deal",
+            "We were unable to follow up in time",
+        ):
+            with self.subTest(text=text):
+                wide = r1_session.content_word_count(text)
+                with mock.patch.dict(os.environ, {"R1_ICEBREAKER_REPAIR": "0"}):
+                    self.assertEqual(wide, r1_session.content_word_count(text))
+                self.assertFalse(r1_session.is_repair_turn(text))
+
+    def test_a_repeat_request_only_asks_to_hear_it_again(self) -> None:
+        for text in self.REPEATS:
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_repeat_request(text))
+        for text in self.NOT_REPEATS:
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_repeat_request(text))
+
+    def test_real_advisor_turns_read_the_same_but_for_a_folded_sorry(self) -> None:
+        # The 2,136-turn advisor corpus and its held-out set (the role-play's barge-in repair reads
+        # them too): no turn becomes or stops being a repair turn, none is a repeat request, and
+        # the only count that moves is one word fewer where "I'm sorry" folds to "sorry" (two turns).
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        moved: list[int] = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for raw in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if not raw:
+                    continue
+                text = json.loads(raw)["text"]
+                wide = (r1_session.content_word_count(text), r1_session.is_repair_turn(text))
+                self.assertFalse(r1_session.is_repeat_request(text))
+                with mock.patch.dict(os.environ, {"R1_ICEBREAKER_REPAIR": "0"}):
+                    narrow = (r1_session.content_word_count(text), r1_session.is_repair_turn(text))
+                self.assertEqual(wide[1], narrow[1])
+                if wide[0] != narrow[0]:
+                    self.assertIn("i'm sorry", r1_session.fold_speech(text))
+                    moved.append(narrow[0] - wide[0])
+        self.assertEqual(moved, [1, 1])
+
+    def test_the_new_readers_are_linear_on_long_input(self) -> None:
+        import time as _time
+
+        for text in (
+            "i was " + "not able to " * 3000 + "hear",
+            "can you say " + "that " * 5000 + "once again",
+            "sorry " * 5000 + "pardon",
+            "i'm sorry " * 3000,
+        ):
+            started = _time.perf_counter()
+            r1_session.content_word_count(text)
+            r1_session.is_repair_turn(text)
+            r1_session.is_repeat_request(text)
+            self.assertLess(_time.perf_counter() - started, 1.0)
+
+
 class EndIntentRunner:
     """A fake classifier: records its calls, answers ``verdict`` (or raises, or hangs)."""
 
@@ -9032,6 +9143,11 @@ class TestBriefRepairOnRequest(R1TestCase):
     def count(self, line_id: str) -> int:
         return self.session.spoken.count(self.spoken_line(line_id))
 
+    def transition_facts(self) -> dict:
+        """The transition repair's ``session_facts`` labels and counts (the icebreaker's apart)."""
+        keys = ("start_by", "pressed_during", "transition_recaps")
+        return {k: v for k, v in self.interview._repair_facts().items() if k in keys}
+
     def test_the_brief_ids_for_every_flag_combination(self) -> None:
         # SWEEP-30 item 6: one helper picks the first brief and the replay for both ``say`` sites;
         # R1_TRANSITION_REPAIR=0 speaks revision 21's texts (bridged or not) byte for byte.
@@ -9360,7 +9476,7 @@ class TestBriefRepairOnRequest(R1TestCase):
         ])
         self.assertEqual(self.spoken_line("L-PICKUP-BRIDGE"), "Great, here she is.")
         self.assertEqual(
-            self.interview._repair_facts(),
+            self.transition_facts(),
             {"start_by": "button", "pressed_during": "replay", "transition_recaps": 0},
         )
 
@@ -9383,7 +9499,7 @@ class TestBriefRepairOnRequest(R1TestCase):
         self.assertIsNone(await asyncio.wait_for(task, 10.0))
         self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
         self.assertEqual(
-            self.interview._repair_facts(),
+            self.transition_facts(),
             {"start_by": "button", "pressed_during": "wait", "transition_recaps": 0},
         )
 
@@ -9395,7 +9511,7 @@ class TestBriefRepairOnRequest(R1TestCase):
         lead = self.interview.persona.first_name
         self.assertEqual(self.spoken_line("L-PICKUP"), f"Hello, {lead} speaking.")
         self.assertEqual(
-            self.interview._repair_facts(), {"start_by": "spoken", "transition_recaps": 0}
+            self.transition_facts(), {"start_by": "spoken", "transition_recaps": 0}
         )
 
     async def test_with_the_repair_off_the_button_during_the_replay_gets_no_bridge(self) -> None:
@@ -9410,7 +9526,7 @@ class TestBriefRepairOnRequest(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(task, 10.0))
             self.assertEqual(self.session.spoken, [brief, self.spoken_line("L-PICKUP")])
             self.assertTrue(self.spoken_line("L-PICKUP").startswith("Hello? Yes, this is "))
-            self.assertEqual(self.interview._repair_facts(), {})
+            self.assertEqual(self.transition_facts(), {})
 
     async def test_answers_rotate_the_start_question_and_a_bare_yes_still_gets_the_nudge(
         self,

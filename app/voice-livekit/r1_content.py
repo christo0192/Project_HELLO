@@ -153,7 +153,10 @@ import r1_world
 #    L-PICKUP-BRIDGE, the rotated start questions L-TRANSITION-ASK-2/-3, the pickup "Hello, {lead}
 #    speaking.", and L-ASIDE-COACH saying Christy is PLAYING the learner.  Revision 21's texts stay
 #    pinned under their -V20 ids, which R1_TRANSITION_REPAIR=0 speaks.  The transition note that
-#    asks nothing itself (r1_prompts.TRANSITION_REMINDER_REPAIRED) joins the manifest.
+#    asks nothing itself (r1_prompts.TRANSITION_REMINDER_REPAIRED) joins the manifest.  Same
+#    revision, the icebreaker repair (r1_icebreaker, R1_ICEBREAKER_REPAIR): "Of course, take a
+#    moment. I'm here when you're ready." (L-IB-HOLD), the repeated question's template "Of course.
+#    {question}", the opener notes for a reply to "Are you there?" and the hold's limits.
 CONTENT_REVISION = 22
 
 
@@ -468,6 +471,16 @@ def manifest() -> dict[str, Any]:
                 "timeout_sec": r1_icebreaker.BRIDGE_TIMEOUT_SEC,
                 "min_words": r1_icebreaker.BRIDGE_MIN_WORDS,
                 "max_words": r1_icebreaker.BRIDGE_MAX_WORDS,
+            },
+            # M032 S6 (SWEEP-28, R1_ICEBREAKER_REPAIR): the repeated question's template, the
+            # presence opener notes and the hold's limits (L-IB-HOLD and L-PRESENT are lines).
+            "repair": {
+                "repeat_template": r1_icebreaker.IB_REPEAT_TEMPLATE,
+                "presence_opener_note": r1_icebreaker.PRESENCE_OPENER_NOTE,
+                "presence_opener_note_late": r1_icebreaker.PRESENCE_OPENER_NOTE_LATE,
+                "presence_late_seconds": r1_icebreaker.PRESENCE_LATE_SECONDS,
+                "hold_wait_seconds": r1_icebreaker.ICEBREAKER_HOLD_WAIT_SECONDS,
+                "hold_min_budget_seconds": r1_icebreaker.HOLD_MIN_BUDGET_SECONDS,
             },
         },
         "end_intent": {

@@ -656,6 +656,111 @@ class IcebreakerPlan:
         )
 
 
+# --- the icebreaker repair (M032 S6, SWEEP-28) ------------------------------------------------
+#
+# Owner tests b419d478 and a95398ab (paraphrased): a request to repeat Christy's question at the
+# soft exit got the brief instead, and a request for a minute's pause got "I can't pause" and a new
+# question in one breath.  The session decides WHEN these apply (``r1_session``); the pieces here
+# are pure: the hold-request reader, the question a repeat request gets again, and the opener note
+# a reply to "Are you there?" gets.  ``R1_ICEBREAKER_REPAIR=0`` turns all of it off.
+
+
+def icebreaker_repair_enabled() -> bool:
+    """``R1_ICEBREAKER_REPAIR`` (default on).  Rollback: ``fly secrets set R1_ICEBREAKER_REPAIR=0
+    -a project-hello-voice`` (the icebreaker's repeat, presence and hold handling as before)."""
+    return (os.getenv("R1_ICEBREAKER_REPAIR") or "1").strip().lower() not in _OFF_VALUES
+
+
+# After "Can you give me a minute?", the next silence window (once per session), never longer than
+# the icebreaker's hard budget; with less than ``HOLD_MIN_BUDGET_SECONDS`` of it left nothing is
+# promised and the turn ends the icebreaker.
+ICEBREAKER_HOLD_WAIT_SECONDS = 60.0
+HOLD_MIN_BUDGET_SECONDS = 15.0
+# Christy's question again, for a request to repeat it once the soft exit is due (a runtime
+# template: ``{question}`` is the last question of her own last model reply).
+IB_REPEAT_TEMPLATE = "Of course. {question}"
+# The opener of a model reply to a turn that checks she is there (the quoted words are dropped
+# from the guard's echo check), and its apology after a wait of ``PRESENCE_LATE_SECONDS`` or more.
+PRESENCE_OPENER_NOTE = 'If they asked whether you are there, start with "Yes, I\'m here."'
+PRESENCE_OPENER_NOTE_LATE = (
+    'If they asked whether you are there, start with "Sorry about that, yes, I\'m here."'
+)
+PRESENCE_LATE_SECONDS = 6.0
+
+# A request for a moment ("Can you give me a minute?", "Hold on a sec", "Can we pause?").  Narrow:
+# "give me", "wait" and "hold" need a time object ("give me an example", "wait for my answer" and
+# "hold that thought" are not holds); "pause" and "hold on" stand alone only as a request or at the
+# start of the turn ("there was a pause in my career", "I hold on to my customers" are answers).
+_HOLD_TIME = r"(?:a|one|just a|a quick|a short) (?:minute|moment|second|sec|bit)"
+_HOLD_RE = re.compile(
+    r"\b(?:"
+    r"give (?:me|us) " + _HOLD_TIME
+    + r"|(?:wait|hold)(?: on)?(?: for)? " + _HOLD_TIME
+    + r"|(?:can|could|may) (?:i|we) (?:have|take|get) a (?:quick |short )?"
+    r"(?:minute|moment|second|sec|break)"
+    r"|(?:can|could|would|will) (?:you|we) (?:please |just |quickly )?"
+    r"(?:pause|take a (?:quick |short )?break)"
+    r"|(?:please|let's|let us|let me) (?:pause|take a (?:quick |short )?break)"
+    r")\b"
+    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy) )*(?:hold on|pause)\b"
+)
+
+
+def is_hold_request(text: object) -> bool:
+    """True for a turn that asks Christy for a moment, and says little else.
+
+    The rest of the turn (the hold phrase taken out) must have fewer than ``THIN_WORDS + 3``
+    substantive words: "Give me a moment to explain: I sold software for six years ..." is an
+    answer.  Checked before ``disposition``, so a hold never takes S5's "Take your time." route.
+    """
+    plain = _plain(text)
+    if not plain or _HOLD_RE.search(plain) is None:
+        return False
+    return substantive_words(_HOLD_RE.sub(" ", plain)) < THIN_WORDS + 3
+
+
+# A lead-in before the last ":" or " - " of a question ("Here's my next question: how ...").  It is
+# cut only when what follows is itself a question's opening, so "What do you sell - courses or
+# software?" stays whole.
+_LEAD_IN_SEPARATORS = (":", " - ", " \u2013 ", " \u2014 ")
+
+
+def repeat_question(text: object) -> str | None:
+    """The last question of one of Christy's replies, ready to be said again, or None.
+
+    The last sentence that ends with "?"; any lead-in before its last ":" or " - " is cut when
+    what follows opens a question, and the first letter is capitalised.
+    """
+    asked = [sentence for sentence in split_sentences(text) if sentence.rstrip().endswith("?")]
+    if not asked:
+        return None
+    question = asked[-1].strip()
+    end = 0  # just past the last separator, 0 for none
+    for sep in _LEAD_IN_SEPARATORS:
+        at = question.rfind(sep)
+        if at >= 0:
+            end = max(end, at + len(sep))
+    if end:
+        rest = question[end:].strip()
+        if rest and _ASK_OPEN_RE.match(_plain(rest)) is not None:
+            question = rest
+    if not _plain(question):
+        return None
+    return question[:1].upper() + question[1:]
+
+
+def repeat_line(question: str) -> str:
+    """``IB_REPEAT_TEMPLATE`` with ``question`` (``repeat_question``'s, or an objective's)."""
+    return IB_REPEAT_TEMPLATE.format(question=question)
+
+
+def presence_opener_note(*, waited: float | None) -> str:
+    """The opener note for a reply to "Are you there?"; the apology after a long wait."""
+    if waited is not None and waited >= PRESENCE_LATE_SECONDS:
+        return PRESENCE_OPENER_NOTE_LATE
+    return PRESENCE_OPENER_NOTE
+
+
 # --- the transition bridge (M032 S5 item 4) ---------------------------------------------------
 #
 # The owner's #22 -> #23: a reflective last answer got only "Thank you, {first_name}." and then the

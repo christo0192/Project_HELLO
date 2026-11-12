@@ -237,6 +237,7 @@
         "R1_TRANSITION_BRIDGE": { "requiredInProduction": false, "secret": false },
         "R1_TRANSITION_REPAIR": { "requiredInProduction": false, "secret": false },
         "R1_ICEBREAKER_ACK_HOLD": { "requiredInProduction": false, "secret": false },
+        "R1_ICEBREAKER_REPAIR": { "requiredInProduction": false, "secret": false },
         "R1_TTS_FLUSH_MIN_CHARS": { "requiredInProduction": false, "secret": false },
         "R1_LINE_CACHE": { "requiredInProduction": false, "secret": false },
         "R1_SYNTH_PER_MIN": { "requiredInProduction": false, "secret": false },
