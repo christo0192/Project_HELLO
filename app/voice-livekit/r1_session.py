@@ -778,6 +778,16 @@ def ack_hold_enabled() -> bool:
     return _env_switch(os.getenv("R1_ACK_HOLD"))
 
 
+def icebreaker_ack_hold_enabled() -> bool:
+    """``R1_ICEBREAKER_ACK_HOLD`` (default on; M032 S6, SWEEP-31): in the icebreaker too, an "Okay"
+    or a reflexive "Thank you" over Christy's live reply is held back and never cuts her.
+
+    Only while ``R1_ACK_HOLD`` is on as well.  Rollback: ``fly secrets set
+    R1_ICEBREAKER_ACK_HOLD=0 -a project-hello-voice`` (the icebreaker as before: nothing held).
+    """
+    return _env_switch(os.getenv("R1_ICEBREAKER_ACK_HOLD"))
+
+
 def ack_resume_seconds() -> float:
     """``R1_ACK_RESUME_SEC`` (0.3, 0-2): the quicker resume after a held acknowledgement."""
     return _env_seconds(os.getenv("R1_ACK_RESUME_SEC"), ACK_RESUME_SECONDS, 0.0, 2.0)
@@ -1115,6 +1125,30 @@ def is_acknowledgement_turn(text: str) -> bool:
     rest = _YIELD_RE.sub(" ", _ACK_PHRASE_RE.sub(" ", folded))
     allowed = _ACK_WORDS | _YIELD_SOFTENERS if handed_back else _ACK_WORDS
     return all(word in allowed for word in rest.split())
+
+
+# M032 S6 (SWEEP-31, owner test b58c7d9c #4-#6, paraphrased: a two-word thank-you cut Christy's
+# icebreaker reply and she restarted with a new reaction).  A reflexive courtesy said over her: every
+# word one of these, at least one "thank"/"thanks", and no question mark.  "Yes" is never one of
+# them (it can answer), and anything else ("Thank you, but what does it pay?") is a turn of its own.
+_COURTESY_WORDS = frozenset(
+    {
+        "thank", "thanks", "you", "so", "much", "very", "okay", "ok", "yeah", "sure", "sir",
+        "maam", "ma'am", "mam", "madam",
+    }
+)
+
+
+def is_courtesy_turn(text: str) -> bool:
+    """True for "Thank you", "Thanks so much, sir", "Okay, thank you" (SWEEP-31)."""
+    if _has_question_mark(text):
+        return False
+    words = fold_speech(text).split()
+    return (
+        bool(words)
+        and all(word in _COURTESY_WORDS for word in words)
+        and any(word in ("thank", "thanks") for word in words)
+    )
 
 
 def is_repair_turn(text: str) -> bool:
@@ -1894,6 +1928,10 @@ class _CandidateRow:
     # Epoch milliseconds the candidate stopped speaking this turn (``turn_ended_at_ms``), fixed when
     # the row closes (``_candidate_turn_end``), or None when that is not known.
     ended_at_ms: int | None = None
+    # M032 S6 (SWEEP-31): the row holds only acknowledgements held back from the SDK over
+    # Christy's icebreaker reply.  No turn of the SDK's is in flight for it, so it never keeps the
+    # candidate "mid-turn" (``_candidate_turn_open``); a real final joining it clears this.
+    held_only: bool = False
 
 
 # The recording's turn anchor (``transcript_turns.turn_started_at_ms``, migration 0026) must lie in
@@ -2121,6 +2159,7 @@ class R1Interview:
         # (``hold_ack_transcript``), and whether one arrived while the candidate was still speaking
         # (its monologue clock is judged when the speech stops, as a held-back fragment's is).
         self._acks_held = 0
+        self._icebreaker_acks_held = 0  # M032 S6 (SWEEP-31): held over Christy's icebreaker reply
         self._ack_unjudged = False
         # The end-intent classifier: the injectable runner (like ``judge_runner``; the default
         # asks R1's own judge client, and only when the session has an LLM, so no fake calls it),
@@ -2868,6 +2907,8 @@ class R1Interview:
             if self._start_by == "button" and self._pressed_during is not None:
                 facts["pressed_during"] = self._pressed_during
             facts["transition_recaps"] = self._recaps_played
+        if ack_hold_enabled() and icebreaker_ack_hold_enabled():
+            facts["icebreaker_acks_held"] = self._icebreaker_acks_held
         return facts
 
     async def _post_fidelity(
@@ -3425,13 +3466,25 @@ class R1Interview:
             kind = str(getattr(kind, "value", kind) or "")
             if kind not in _HELD_STT_EVENTS:
                 return False
-            if self._exiting or self.machine.phase is not R1Phase.ROLEPLAY:
+            if self._exiting:
+                return False
+            icebreaker = self.machine.phase is R1Phase.ICEBREAKER
+            if not icebreaker and self.machine.phase is not R1Phase.ROLEPLAY:
+                return False
+            if icebreaker and not icebreaker_ack_hold_enabled():
                 return False
             alternatives = getattr(event, "alternatives", None) or ()
             text = str(getattr(alternatives[0], "text", "") or "").strip() if alternatives else ""
-            if not text or not is_acknowledgement_turn(text):
+            if not text:
                 return False
-            if not self._ack_holdable_speech():
+            if icebreaker:
+                # M032 S6 (SWEEP-31): an acknowledgement or a reflexive courtesy, and only over
+                # Christy's live, interruptible model reply (never a scripted line).
+                if not (is_acknowledgement_turn(text) or is_courtesy_turn(text)):
+                    return False
+                if not self._icebreaker_reply_holdable():
+                    return False
+            elif not is_acknowledgement_turn(text) or not self._ack_holdable_speech():
                 return False
         except Exception as exc:  # noqa: BLE001 - the speech-to-text path must never break
             _log.warn(
@@ -3444,7 +3497,7 @@ class R1Interview:
             # speech-to-text pump (``_STTPipeline``'s done-callback closes its event channel), and
             # no later transcript would reach the SDK or R1 for the rest of the interview.
             try:
-                self._note_held_ack(text, event)
+                self._note_held_ack(text, event, icebreaker=icebreaker)
             except Exception as exc:  # noqa: BLE001 - the speech-to-text path must never break
                 _log.warn(
                     "unknown_event",
@@ -3473,7 +3526,16 @@ class R1Interview:
         slot = self._speeches.get(getattr(speech, "id", None))
         return slot is None or not slot.cut_by_r1
 
-    def _note_held_ack(self, text: str, event: Any) -> None:
+    def _icebreaker_reply_holdable(self) -> bool:
+        """SWEEP-31: ``_ack_holdable_speech``, and the speech is a model reply of Christy's
+        (``generate_reply``), never a ``say`` line or a speech R1 does not track."""
+        if not self._ack_holdable_speech():
+            return False
+        speech = getattr(self.session, "current_speech", None)
+        slot = self._speeches.get(getattr(speech, "id", None))
+        return slot is not None and slot.source == "generate_reply"
+
+    def _note_held_ack(self, text: str, event: Any, *, icebreaker: bool = False) -> None:
         """Write a held acknowledgement into the candidate's row, and count it for nothing else.
 
         It joins the open row exactly as a final does (a row opened for it reserves its index
@@ -3482,9 +3544,18 @@ class R1Interview:
         next phase.  It is NOT queued for the driver, NOT counted toward the words the SDK holds
         (``_banked_words``: the SDK holds none of it), NOT a latency anchor and never planned.
         Like a held-back fragment it is no part of a monologue (``_judge_fragment``).
+
+        ``icebreaker`` (M032 S6, SWEEP-31): one held over Christy's icebreaker reply is counted on
+        its own (``icebreaker_acks_held``), does not move ``_candidate_activity_at`` (it must not
+        stretch the bounded hold at the S=4:30 cap) and opens a row of its own as ``held_only``.
+        It is written in the icebreaker as above, and it never reaches the plan, the carry, the
+        answer count or the soft exit, since no turn of the SDK's carries it.
         """
         self._acks_held += 1
-        self._candidate_activity_at = self._clock()
+        if icebreaker:
+            self._icebreaker_acks_held += 1
+        else:
+            self._candidate_activity_at = self._clock()
         if self._user_state == "speaking":
             self._ack_unjudged = True
             self._fragment_unjudged = True
@@ -3497,6 +3568,7 @@ class R1Interview:
                 self.machine.transcript_phase(),
                 [],
                 self._candidate_turn_anchor(event),
+                held_only=icebreaker,
             )
         row.parts.append(text)
         row.last_final_at = self._event_seconds(event)
@@ -5306,6 +5378,7 @@ class R1Interview:
                 [],
                 self._candidate_turn_anchor(event),
             )
+        row.held_only = False  # M032 S6: a real final, so a turn of the SDK's is in flight
         row.parts.append(text)
         row.last_final_at = self._event_seconds(event)
         self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
@@ -5496,7 +5569,10 @@ class R1Interview:
 
     def _candidate_turn_open(self) -> bool:
         """True while the candidate is mid-turn: speaking, or a final heard whose turn has not committed."""
-        return self._user_state == "speaking" or self._open_row is not None
+        if self._user_state == "speaking":
+            return True
+        row = self._open_row
+        return row is not None and not row.held_only  # M032 S6: not for held acknowledgements
 
     def _on_speech_created(self, event: Any) -> None:
         """Track a speech; its transcript position is fixed when it starts speaking."""

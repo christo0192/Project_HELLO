@@ -8302,6 +8302,149 @@ class TestHeldAckFastResume(AckHoldCase):
                 self.assertEqual(r1_session.ack_resume_seconds(), expected)
 
 
+class TestIcebreakerAcksDoNotCutChristy(R1TestCase):
+    """M032 S6 (SWEEP-31; owner test b58c7d9c #4-#6, paraphrased): a two-word thank-you said over
+    Christy's icebreaker reply cut it, and she restarted with a new reaction and question.  With
+    ``R1_ICEBREAKER_ACK_HOLD`` on, an acknowledgement or a reflexive courtesy over her live model
+    reply is held back from the SDK like an "Okay" over the learner.  Synthetic texts only."""
+
+    HELD = ("Okay", "Mm-hmm.", "Thank you", "Thanks so much, sir", "Okay, thank you.", "Yeah.")
+    NOT_HELD = (
+        "Yes", "Okay?", "Thank you, but what does the role pay?",
+        "Thank you. So in my last role I handled inbound leads.", "Sorry?", "Thank you?",
+        "Hello? Are you there?",
+    )
+
+    def christy_replying(self, *, source: str = "generate_reply", **flags) -> FakeSpeechHandle:
+        handle = FakeSpeechHandle("Thanks. So what does a typical", allow_interruptions=True)
+        for name, value in flags.items():
+            setattr(handle, name, value)
+        self.session.current_speech = handle
+        self.interview._speeches[handle.id] = r1_session._SpeechSlot(handle, source=source)
+        return handle
+
+    def test_an_ack_or_a_courtesy_over_her_live_reply_is_held(self) -> None:
+        self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
+        self.christy_replying()
+        for text in self.HELD:
+            with self.subTest(text=text):
+                self.assertTrue(self.interview.hold_ack_transcript(stt_event(text)))
+        for kind in ("interim_transcript", "preflight_transcript"):
+            with self.subTest(kind=kind):
+                self.assertTrue(self.interview.hold_ack_transcript(stt_event("Thank you", kind)))
+
+    def test_a_turn_of_their_own_still_reaches_the_sdk(self) -> None:
+        self.christy_replying()
+        for text in self.NOT_HELD + ("",):
+            with self.subTest(text=text):
+                self.assertFalse(self.interview.hold_ack_transcript(stt_event(text)))
+        for kind in ("end_of_speech", "start_of_speech"):
+            with self.subTest(kind=kind):
+                self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay", kind)))
+
+    def test_only_a_live_interruptible_model_reply_is_protected(self) -> None:
+        self.session.current_speech = None
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Thank you")))
+        # A scripted line ("Are you still with me?"), an untracked speech, a finished, cut or
+        # uninterruptible one, and one R1 cut itself: nothing is held.
+        self.christy_replying(source="say")
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.session.current_speech = FakeSpeechHandle("untracked", allow_interruptions=True)
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        for flags in (
+            {"allow_interruptions": False},
+            {"interrupted": True},
+            {"done": lambda: True},
+        ):
+            with self.subTest(flags=list(flags)):
+                self.christy_replying(**flags)
+                self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        handle = self.christy_replying()
+        self.interview._speeches[handle.id].cut_by_r1 = True
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+
+    def test_the_opening_transition_and_wrap_up_are_not_covered(self) -> None:
+        opening = R1Interview(self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer)
+        opening.machine.transition(R1Phase.OPENING)
+        handle = self.christy_replying()
+        opening._speeches[handle.id] = r1_session._SpeechSlot(handle, source="generate_reply")
+        self.assertFalse(opening.hold_ack_transcript(stt_event("Thank you")))
+        self.interview.machine.transition(R1Phase.TRANSITION)
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Thank you")))
+        self.interview.machine.transition(R1Phase.ROLEPLAY)
+        # The role-play's held set is unchanged: "Okay" yes, a "Thank you" no.
+        self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Thank you")))
+        self.interview.machine.transition(R1Phase.ROLEPLAY_EXIT)
+        self.interview.machine.transition(R1Phase.WRAPUP)
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+
+    async def test_the_held_final_is_written_in_the_icebreaker_and_counts_for_nothing(
+        self,
+    ) -> None:
+        self.christy_replying()
+        answers = self.interview.machine.candidate_turns
+        cursor = self.interview._icebreaker_plan.cursor
+        activity = self.interview._candidate_activity_at
+        self.assertTrue(self.interview.hold_ack_transcript(stt_event("Thanks so much, sir")))
+        self.assertTrue(self.interview._turns.empty())  # the driver is not told
+        self.assertEqual(self.interview.machine.candidate_turns, answers)  # no answer counted
+        self.assertEqual(self.interview._icebreaker_plan.cursor, cursor)  # the plan never saw it
+        self.assertEqual(self.interview._icebreaker_carry, "")
+        self.assertFalse(self.interview._icebreaker_reply_cut)
+        self.assertEqual(self.interview._candidate_activity_at, activity)
+        self.assertFalse(self.interview._candidate_turn_open())  # it is no turn in flight
+        self.assertEqual(self.interview._icebreaker_acks_held, 1)
+        self.assertEqual(self.interview._repair_facts()["icebreaker_acks_held"], 1)
+        self.interview._flush_candidate_row()  # Christy's next line
+        await self.flush()
+        rows = [
+            (row["text"], row["phase"]) for row in self.writer.saved
+            if row["speaker"] == "candidate"
+        ]
+        self.assertEqual(rows, [("Thanks so much, sir", "icebreaker")])
+
+    async def test_a_real_answer_joins_the_held_row_as_one_turn(self) -> None:
+        self.christy_replying()
+        self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.final_transcript("In my last role I handled inbound leads every day for a year.")
+        await self.settle()
+        self.assertTrue(self.interview._candidate_turn_open())  # now a turn is in flight
+        self.assertFalse(
+            await self.commit_turn("In my last role I handled inbound leads every day for a year.")
+        )
+        await self.flush()
+        rows = [row["text"] for row in self.writer.saved if row["speaker"] == "candidate"]
+        self.assertEqual(
+            rows, ["Okay In my last role I handled inbound leads every day for a year."]
+        )
+
+    def test_a_held_ack_never_stretches_the_hold_at_the_cap(self) -> None:
+        self.clock.advance(275)  # past the hard S=4:30 cap
+        self.christy_replying()
+        self.assertTrue(self.interview.hold_ack_transcript(stt_event("Thank you")))
+        self.assertEqual(self.interview._icebreaker_hold_left(), 0.0)
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0.0)
+
+    def test_the_flags_restore_todays_icebreaker(self) -> None:
+        self.christy_replying()
+        for env in ({"R1_ICEBREAKER_ACK_HOLD": "0"}, {"R1_ACK_HOLD": "0"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                for text in ("Okay", "Thank you"):
+                    self.assertFalse(self.interview.hold_ack_transcript(stt_event(text)))
+                self.assertNotIn("icebreaker_acks_held", self.interview._repair_facts())
+
+    def test_the_courtesy_reader(self) -> None:
+        for text in ("Thank you", "Thanks.", "Okay, thank you so much.", "Thank you, ma'am."):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_courtesy_turn(text))
+        for text in ("Yes, thank you.", "Thank you?", "Okay.", "Thank you for asking, I sell",
+                     "No thanks", ""):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_courtesy_turn(text))
+
+
 class EndIntentRunner:
     """A fake classifier: records its calls, answers ``verdict`` (or raises, or hangs)."""
 
