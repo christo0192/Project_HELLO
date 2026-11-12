@@ -271,6 +271,26 @@ class ManualLibraryTests(unittest.TestCase):
         self.assertEqual(act_of("wrapup", "asks about next steps", "What next?"), "wrapup_question")
         self.assertEqual(act_of("wrapup", "says Christy's name, then pauses", "Christy."), "wrapup_other")
 
+    def test_a_failed_live_rewording_says_the_paraphrase_and_a_dead_account_stops(self) -> None:
+        from rehearsal.llm import InsufficientBalance, ProviderError
+        from rehearsal.manual import Rewriter
+
+        class Failing:
+            def __init__(self, exc: BaseException) -> None:
+                self.exc = exc
+
+            async def complete(self, *_args, **_kwargs):
+                raise self.exc
+
+        said = asyncio.run(Rewriter(Failing(ProviderError("HTTP 500")), "m").reword(
+            "candidate", "says ready", "Okay, I'm ready.", [], {}
+        ))
+        self.assertEqual(said, "Okay, I'm ready.")
+        with self.assertRaises(InsufficientBalance):
+            asyncio.run(Rewriter(Failing(InsufficientBalance("402")), "m").reword(
+                "candidate", "says ready", "Okay, I'm ready.", [], {}
+            ))
+
     def test_a_mix_is_reproducible_for_a_call_and_differs_between_calls(self) -> None:
         from rehearsal.manual import mix_scenario
 

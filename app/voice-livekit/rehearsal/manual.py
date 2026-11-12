@@ -428,6 +428,8 @@ class Rewriter:
         ]
         messages += [dict(item) for item in list(history)[-16:]]
         messages.append({"role": "system", "content": "Now say your next move."})
+        from rehearsal.llm import BudgetExceeded, InsufficientBalance, ProviderError
+
         try:
             completion = await self.client.complete(
                 messages,
@@ -437,9 +439,11 @@ class Rewriter:
                 json_mode=True,
                 role="candidate",
             )
-        except Exception:  # noqa: BLE001 - the 402 / budget stops are re-raised by the caller's next call
+        except (InsufficientBalance, BudgetExceeded):
+            raise  # the sweep stops on these
+        except ProviderError:
             self.failures += 1
-            raise
+            return text  # one failed rewording: the paraphrase is said as it is
         raw = (completion.text or "").strip()
         start, end = raw.find("{"), raw.rfind("}")
         try:

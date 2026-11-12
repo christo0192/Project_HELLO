@@ -198,14 +198,22 @@ class LLMTalker:
         messages = [{"role": "system", "content": talker_system_prompt(self.style, self.name)}]
         messages += self.history[-24:]
         messages.append({"role": "system", "content": task})
-        completion = await self.client.complete(
-            messages,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=260,
-            json_mode=True,
-            role="candidate",
-        )
+        from rehearsal.llm import BudgetExceeded, InsufficientBalance, ProviderError
+
+        try:
+            completion = await self.client.complete(
+                messages,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=260,
+                json_mode=True,
+                role="candidate",
+            )
+        except (InsufficientBalance, BudgetExceeded):
+            raise  # the sweep stops on these
+        except ProviderError:
+            self.failures += 1
+            return None  # the scripted fallback answers this once
         raw = (completion.text or "").strip()
         start, end = raw.find("{"), raw.rfind("}")
         try:
