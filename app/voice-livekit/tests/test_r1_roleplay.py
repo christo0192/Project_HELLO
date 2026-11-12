@@ -10361,6 +10361,54 @@ class S2PReviewConflictOnceTests(unittest.TestCase):
         self.assertEqual(counter.move_id, F1_COUNTER)
         self.assertNotIn("saw on the website", counter.intent.brief)
 
+    def test_a_price_split_across_a_lost_reply_answers_her_probe(self):
+        # Review S2P-R4 (correctness) and S2P-R5 (naturalness): the answer to her price question
+        # came in two halves and the first half's reply was lost before any audio.
+        s = Session(engine())
+        plan, r = to_f1(s)
+        self.assertEqual(plan.probe, "F1")
+        first = s.eng.plan_turn("Good question, so let me tell you,", r)
+        self.assertEqual(s.eng._price_dodges, 1)
+        s.eng.reply_lost(first)
+        second = s.eng.plan_turn("it's around 6000 dollars for the whole thing.", r + 4)
+        self.assertIn("split_replan", second.reasons)
+        self.assertEqual(s.eng.negotiation.best_offer_usd, 6000)
+        self.assertEqual(s.eng._price_dodges, 0)
+        self.assertNotEqual(second.probe, "F1")
+        self.assertEqual(second.move_id, F1_ANCHOR)
+        self.assertIn("$6,000", second.intent.brief)
+
+    def test_a_lost_dodge_is_given_back_and_counted_once(self):
+        s = Session(engine())
+        _plan, r = to_f1(s)
+        first = s.eng.plan_turn(PRICE_DODGE, r)
+        s.eng.reply_lost(first)
+        s.eng.plan_turn("We can talk about all of that a bit later.", r + 4)
+        self.assertEqual(s.eng._price_dodges, 1)
+
+    def test_a_conflict_on_a_lost_first_half_is_checked_on_the_continuation(self):
+        s = _anchor_done()
+        first = s.eng.plan_turn("Actually the real fee for this track is $12,000,", 60)
+        self.assertIn("website", [kind for kind, _usd in s.eng.negotiation.conflicts])
+        s.eng.reply_lost(first)
+        second = s.eng.plan_turn("because placement support is part of it.", 64)
+        self.assertIn("split_replan", second.reasons)
+        if second.move_id == F1_COUNTER:
+            self.assertIn("saw on the website", second.intent.brief)
+        else:
+            self.assertIn(
+                P2.PRICE_CONFLICT_WEBSITE_NOTE.format(amount="$12,000"), second.reminder
+            )
+        self.assertEqual(s.eng.negotiation.conflicts, [("website", 12000)])
+        # Without the split replan the turn after is planned alone: the unheard check is given back
+        # for later instead of being used up.
+        with flags(R1_SPLIT_REPLAN="0"):
+            other = _anchor_done()
+            first = other.eng.plan_turn("Actually the real fee for this track is $12,000,", 60)
+            other.eng.reply_lost(first)
+            other.eng.plan_turn("Anyway, let me tell you about our mentors.", 64)
+        self.assertEqual(other.eng.negotiation.conflicts, [])
+
     def test_a_far_below_anchor_carries_no_contradicting_surprise_note(self):
         # Review S2P-R6 (naturalness): the anchor's own calm brief, not SWEEP-13's note as well.
         s = Session(engine())

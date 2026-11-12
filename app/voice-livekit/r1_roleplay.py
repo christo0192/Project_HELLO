@@ -747,6 +747,8 @@ class _LostHalf:
     hold: tuple[str, str, str] | None = None
     # Review S2R-6: the S2 state its planning used up (``RolePlayEngine._turn_s2_undo``).
     s2_undo: tuple[Any, ...] | None = None
+    # M032 S2P (review S2P-R5): the price conflict the lost half raised, (kind, usd, earlier usd).
+    conflict: tuple[str, int, int | None] | None = None
 
 
 # M032 SWEEP-17 item 6 (flag R1_PROBE_FIRST): the advisor says he never gave the figure she used
@@ -1158,6 +1160,7 @@ class RolePlayEngine:
         self._conflict_note = ""
         self._asks_number_now = False  # SWEEP-19 item 6: this turn asked what number works for her
         self._number_moment = False  # ... before the anchor, with probe first: the F1 step answers
+        self._split_turn: int | None = None  # the lost first half's turn of a continuation
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -1169,15 +1172,18 @@ class RolePlayEngine:
             price_check=self._price_conflict,
         )
 
-    def _price_probe_answer_due(self, turn: int) -> bool:
-        """SWEEP-19 item 4: her last heard line asked the price before the anchor, so an amount in
-        this advisor turn needs no pricing word ("It's around 6000 dollars"), as after the
-        anchor."""
+    def _price_probe_answer_due(self, turn: int, *, before_anchor: bool = True) -> bool:
+        """SWEEP-19 item 4: her last heard line asked the price (before the anchor, unless
+        ``before_anchor`` is False), so an amount in this advisor turn needs no pricing word ("It's
+        around 6000 dollars"), as after the anchor.  Review S2P-R4/R5: a continuation whose lost
+        first half was the turn right after her question answers it too."""
+        asked = self._price_asked_turn
+        split = self._split_turn
         return (
             self._probe_first
-            and self._price_asked_turn is not None
-            and self._price_asked_turn == turn - 1
-            and not self.scheduler.is_delivered(F1_ANCHOR)
+            and asked is not None
+            and (asked == turn - 1 or (split is not None and asked == split - 1))
+            and not (before_anchor and self.scheduler.is_delivered(F1_ANCHOR))
         )
 
     @property
@@ -1561,6 +1567,13 @@ class RolePlayEngine:
             dict(self._terms_counts),
             self._ack_turn_notes,
             self._no_commit_notes,
+            # M032 S2P (review S2P-R4/R5): her price dodges, the conflicts checked and the open
+            # rise, the price-reflex notes and the price-first turns this turn's planning counts.
+            self._price_dodges,
+            tuple(self.negotiation.conflicts),
+            self.negotiation.rise_open_turn,
+            self._price_reflexes,
+            self._price_first_turns,
         )
         resumed, self._after_coach = self._after_coach, False
         if break_kind == "ai":
@@ -1596,6 +1609,8 @@ class RolePlayEngine:
                 monologue = (split.seconds or 0.0) + (candidate_seconds or 0.0)
             self._split_replans += 1
         self._turn_text = reading if flag_on(FLAG_SPLIT_REPLAN) else ""
+        # M032 S2P (review S2P-R4/R5): a continuation answers what the lost first half answered.
+        self._split_turn = None if split is None else split.turn
         self._turn_seconds = monologue
         self._turn_issued = None
         self._turn_hold = None
@@ -1644,11 +1659,15 @@ class RolePlayEngine:
         negotiated = self._observe_negotiation(candidate_text, turn)
         self._turn_conflict = negotiated.conflict if self._price_conflict else None
         if (
-            self._probe_first
-            and self._price_asked_turn is not None
-            and self._price_asked_turn == turn - 1
-            and not self._price_named()
+            split is not None
+            and split.conflict is not None
+            and self._turn_conflict is None
+            and self._price_conflict
         ):
+            # Review S2P-R5 (naturalness): the conflict the lost first half raised (given back
+            # with it) is this continuation's to check, read over both halves.
+            self._turn_conflict = self.negotiation.reapply_conflict(split.conflict, turn)
+        if self._price_probe_answer_due(turn, before_anchor=False) and not self._price_named():
             self._price_dodges += 1  # S2.10: her price question got no figure
         number_question = asks_her_number(reading)
         self._asks_number_now = flag_on(FLAG_COUNTER_V2) and number_question
@@ -2131,6 +2150,7 @@ class RolePlayEngine:
             issued=self._turn_issued,
             hold=self._turn_hold,
             s2_undo=self._turn_s2_undo,
+            conflict=self._turn_conflict,
             intent_key=(
                 (plan.move_id or plan.negotiation_id) if plan.mode is TurnMode.INTENT else None
             ),
@@ -2604,8 +2624,28 @@ class RolePlayEngine:
         reply that is heard may carry them, and they are not counted twice), its note counts did
         not happen, and the coach aside it followed still wants the "carry on" note.
         """
-        after_coach, count, turn, used, counts, acks, no_commit = undo
+        (
+            after_coach,
+            count,
+            turn,
+            used,
+            counts,
+            acks,
+            no_commit,
+            dodges,
+            conflicts,
+            rise_open,
+            reflexes,
+            price_first,
+        ) = undo
         self._after_coach = self._after_coach or after_coach
+        # M032 S2P (review S2P-R4/R5): the dodge the lost half counted, the conflict it raised (a
+        # continuation checks it, ``reapply_conflict``) and the notes it used up are given back.
+        self._price_dodges = dodges
+        self.negotiation.conflicts = list(conflicts)
+        self.negotiation.rise_open_turn = rise_open
+        self._price_reflexes = reflexes
+        self._price_first_turns = price_first
         self._implausible_count = count
         self._implausible_turn = turn
         self._terms_used = set(used)

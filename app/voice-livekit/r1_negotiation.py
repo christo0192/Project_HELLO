@@ -3979,6 +3979,23 @@ class Negotiation:
             (turn for turn, _usd, kind in reversed(self.quotes) if kind in _STATED_KINDS), None
         )
 
+    def reapply_conflict(
+        self, conflict: tuple[str, int, int | None], turn: int
+    ) -> tuple[str, int, int | None] | None:
+        """Review S2P-R5 (naturalness): the conflict a lost first half raised (its reply was never
+        heard, so it was given back) is raised again on the continuation that replans it, unless
+        it was checked since or the session's checks are used up.  Returns it, or None."""
+        kind, usd, _earlier = conflict
+        key = (kind, usd)
+        if key in self.conflicts or len(self.conflicts) >= MAX_CONFLICTS:
+            return None
+        if kind == CONFLICT_WEBSITE and self.website_checked:
+            return None
+        self.conflicts.append(key)
+        if kind == CONFLICT_RISE:
+            self.rise_open_turn = turn
+        return conflict
+
     def note_anchor(self, anchor_id: str, stated_usd: int | None) -> None:
         """Her heard F1-ANCHOR checked the website's price (review S2P-R2, naturalness): the check
         form asked "is it about $9,000?", so no WEBSITE conflict is checked after it (his next
