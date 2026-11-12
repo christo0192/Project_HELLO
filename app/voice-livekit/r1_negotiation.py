@@ -2928,13 +2928,47 @@ _TOTAL_NOT_OURS = re.compile(
 )
 
 
+# M032 S2P (the SWEEP-21 corpus check, 2026-11-12): the price the course goes back or up to after a
+# deadline is a later price, never a total.  While the lower price stands it is an urgency lever
+# ("That price is locked only if you deposit tonight. Tomorrow it's back to $9000.", "In a week the
+# price is back to $9000"), so it raises no rise and no website check.  Read in the figure's own
+# clause only, so "Tomorrow we can talk, but the course is $9,000." is still a total.
+_LATER_TOTAL_FRAME = re.compile(
+    r"\b(?:back (?:up )?to|(?:goes|go|going|will go|rises?|jumps?|reverts?|returns?|resets?) "
+    r"(?:back )?(?:up )?to)\s+(?:about |around |roughly )?$",
+    re.IGNORECASE,
+)
+_LATER_TOTAL_TIME = re.compile(
+    r"\b(?:tomorrow|next (?:week|month)|in (?:a|one|two|three|a few|a couple of) (?:days?|weeks?)|"
+    r"after (?:today|tonight|this week|the deadline|friday)|from (?:tomorrow|next week|monday))\b",
+    re.IGNORECASE,
+)
+# The deadline said right after the figure ("resets to $9000 tomorrow", "$9,500 from next week").
+_LATER_TOTAL_TIME_AFTER = re.compile(
+    r"^\s*(?:dollars?\s+)?(?:again\s+)?(?:from\s+|starting\s+|after\s+)?(?:tomorrow|tonight|"
+    r"next (?:week|month)|monday)\b",
+    re.IGNORECASE,
+)
+
+
+def _later_total(lowered: str, start: int, end: int) -> bool:
+    """The figure at ``start:end`` is what the price becomes after a deadline (``_LATER_TOTAL_*``)."""
+    clause = clause_before(lowered, start)
+    return bool(
+        _LATER_TOTAL_FRAME.search(clause)
+        or _LATER_TOTAL_TIME.search(clause)
+        or _LATER_TOTAL_TIME_AFTER.match(lowered[end:])
+    )
+
+
 def stated_totals(text: object) -> list[int]:
     """The course totals at or above the list price the advisor names in ``text`` (SWEEP-21).
 
     The figures ``states_full_price`` accepts, plus a frame after the figure ("a $9,500 fee") and
     the same total spread out ("the same $9,000 over nine months").  A later-price threat or another
-    batch's price, a value, a saving, an add-on, a salary, a refused or negated figure and someone
-    else's price are none.  Ints only, in the order said.
+    batch's price, the price after a deadline ("Tomorrow it's back to $9000"), a value, a saving, an
+    add-on, a salary, a refused or negated figure and someone else's price are none.  Ints only, in
+    the order said.
     """
     found: list[int] = []
     for sentence in split_sentences(_tail(text)):
@@ -2974,9 +3008,61 @@ def stated_totals(text: object) -> list[int]:
                         and not _third_party_seller(lowered, start, sellers)
                         and not negated_before(lowered, start, 8)
                         and not _PRICE_NO.search(clause_after(lowered, end))
+                        and not _later_total(lowered, start, end)
                         and value not in found
                     ):
                         found.append(value)
+    return found
+
+
+# M032 S2P (the SWEEP-21 corpus check): the discounts a turn names ("discounts of $500, $1,000 or
+# $1,500", "discounts up to $1500", "$1,000 off", "the $500 to $1,500 plan discounts").  Figures
+# joined as a list ("$500, $1,000 or $1,500", "$500 to $1,500") are one group, and the whole group
+# is discounts when one of them sits right after a discount frame or right before "off" or
+# "discount(s)" (one word may come between: "plan discounts").  A list price said with a discount
+# that brings it to or below the earlier offer keeps that offer reachable, so it is no rise.
+_DISCOUNT_LIST_JOIN = re.compile(r"^\s*,?\s*(?:or|and|to)?\s*(?:even\s+)?$", re.IGNORECASE)
+_DISCOUNT_NOUN_AFTER = re.compile(
+    r"^\s*(?:dollars?\s+)?(?:[a-z]+(?:-[a-z]+)?\s+)?(?:off|discounts?|reductions?)\b",
+    re.IGNORECASE,
+)
+# A bare three-digit figure ("discounts of 500, 1000 or 1500") counts only inside such a group.
+_BARE_HUNDREDS = re.compile(r"(?<![\d$.,])([1-9]\d{2})(?![\d,])" + _NOT_UNIT, re.IGNORECASE)
+
+
+def discount_amounts(text: object) -> list[int]:
+    """The dollar discounts ``text`` names, $100 to $3,000, in the order said (ints only)."""
+    found: list[int] = []
+    for sentence in split_sentences(_tail(text)):
+        lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", sentence)).lower()
+        figures = sorted(
+            [
+                (match.start(), match.end(), parse_amount(match.group(1), bool(match.group(2))))
+                for match in _DOLLARS.finditer(lowered)
+            ]
+            + [
+                (match.start(), match.end(), parse_amount(match.group(1)))
+                for pattern in (_BARE_WHOLE, _BARE_HUNDREDS)
+                for match in pattern.finditer(lowered)
+            ]
+        )
+        groups: list[list[tuple[int, int, float | None]]] = []
+        for figure in figures:
+            if groups and _DISCOUNT_LIST_JOIN.match(lowered[groups[-1][-1][1] : figure[0]]):
+                groups[-1].append(figure)
+            else:
+                groups.append([figure])
+        for group in groups:
+            framed = any(
+                _DISCOUNT_BEFORE.search(lowered[max(0, start - 40) : start]) is not None
+                or _DISCOUNT_NOUN_AFTER.match(lowered[end:]) is not None
+                for start, end, _value in group
+            )
+            if not framed or negated_before(lowered, group[0][0], 8):
+                continue
+            for _start, _end, value in group:
+                if value is not None and 100 <= value <= IMPLAUSIBLE_NET_USD:
+                    found.append(int(value))
     return found
 
 
@@ -3667,7 +3753,9 @@ class Negotiation:
                 self.quotes.append((turn, usd, QUOTE_TOTAL))
             if nets_now or totals:
                 self.rise_open_turn = None
-            conflict = self._price_conflict(totals, nets_now, prior_best, after_anchor)
+            conflict = self._price_conflict(
+                totals, nets_now, prior_best, after_anchor, discounts=discount_amounts(text)
+            )
             if conflict is not None:
                 self.conflicts.append((conflict[0], conflict[1]))
                 if conflict[0] == CONFLICT_RISE:
@@ -3719,13 +3807,17 @@ class Negotiation:
         nets_now: set[int],
         prior_best: int | None,
         after_anchor: bool,
+        *,
+        discounts: list[int] | tuple[int, ...] = (),
     ) -> tuple[str, int, int | None] | None:
         """SWEEP-21: the price conflict this turn raises, each (kind, usd) once, at most twice.
 
         WEBSITE: after the anchor, a total of $9,000 or more at least $300 away from the website's
         $9,000 (before the anchor S2.10's anchor owns the check).  RISE: a total at least $500 above
         the best offer on the table, unless this turn keeps the lower figure as an option ("$6,000
-        upfront or $9,000 over nine months").
+        upfront or $9,000 over nine months"), also through a discount it names that brings the
+        total to or below that offer ("$9,000, with discounts up to $1,500" after $8,000;
+        ``discounts``, from ``discount_amounts``).
         """
         if len(self.conflicts) >= MAX_CONFLICTS:
             return None
@@ -3741,6 +3833,8 @@ class Negotiation:
             return None
         for usd in totals:
             key = (CONFLICT_RISE, usd)
+            if any(usd - discount <= prior_best for discount in discounts):
+                continue
             if usd >= prior_best + RISE_MIN_USD and key not in self.conflicts:
                 return CONFLICT_RISE, usd, prior_best
         return None

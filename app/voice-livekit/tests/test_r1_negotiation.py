@@ -2714,6 +2714,33 @@ class OfferReaderV2Tests(unittest.TestCase):
         cold.observe(5, "It's around 6000 dollars.")
         self.assertIsNone(cold.best_offer_usd)
 
+    def test_ticket_size_priced_and_pricing_name_the_course_price_before_the_anchor(self):
+        # SWEEP-19 item 4 (b419d478 #43-44, paraphrased): "ticket size" and "priced" are course
+        # price cues for the v2 reader, before the anchor too; the v1 reader is unchanged.
+        for text in (
+            "We usually see a ticket size of around 6000 USD for this course.",
+            "It's priced at 6000 dollars.",
+            "Our pricing is 6000.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    neg.read_advisor_turn(text, after_anchor=False, reader_v2=True).best_offer_usd,
+                    6000,
+                )
+                self.assertIsNone(
+                    neg.read_advisor_turn(text, after_anchor=False, reader_v2=False).best_offer_usd
+                )
+        for text in (
+            "This is a high ticket size program.",
+            "We trained 6000 learners last year.",
+            "Our ticket size is high because the mentors are senior.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    neg.read_advisor_turn(text, after_anchor=False, reader_v2=True).best_offer_usd
+                )
+                self.assertEqual(neg.unread_low_figures(text, set(), v2=True), [])
+
     def test_the_v2_readers_are_fast_on_hostile_text(self):
         hostile = ("so for you it is " * 400) + "$9,000 " + ("brings it to " * 300)
         start = time.perf_counter()
@@ -2864,6 +2891,122 @@ class ProbeFirstNegotiationTests(unittest.TestCase):
         for turn, text in enumerate(("The fee is $9,500.", "The fee is $10,000.", "The fee is $11,000."), 5):
             capped.observe(turn, text, anchor_turn=4, read_totals=True)
         self.assertEqual(len(capped.conflicts), neg.MAX_CONFLICTS)
+
+    def test_a_price_after_a_deadline_is_a_later_price_not_a_total(self):
+        # The S2P corpus check: "back to $9000 tomorrow" is the offer's deadline (an urgency lever
+        # while the lower price stands), not the advisor contradicting his offer.
+        for text in (
+            "That price is locked only if you deposit tonight. Tomorrow it's back to $9000.",
+            "In a week the price is back to $9000 and the seats will be gone.",
+            "After tonight it goes back up to $9,000.",
+            "From tomorrow the fee goes up to $9,500.",
+            "Next week it will be $9,000 again.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.stated_totals(text), [])
+                state = neg.Negotiation("husband")
+                state.observe(5, "I can do $8,000 for you.", anchor_turn=4, read_totals=True)
+                self.assertIsNone(state.observe(6, text, anchor_turn=4, read_totals=True).conflict)
+        # A price stated now is still a total.
+        for text, expected in {
+            "The course is $9,000 and I can't change that.": [9000],
+            "It's back in the budget at $9,000.": [9000],
+            "Tomorrow we can talk, but the course is $9,000.": [9000],
+        }.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.stated_totals(text), expected)
+
+    def test_a_list_price_with_a_discount_down_to_the_offer_is_no_rise(self):
+        # The same turn keeps a price at or below the earlier offer reachable (SWEEP-21's "keeps
+        # the lower figure as an option"), so she has nothing to ask "which is it?" about.
+        for text in (
+            "The course is listed at $9,000. Depending on the plan, discounts of $500, $1,000 or "
+            "$1,500 apply.",
+            "It's $9000, with discounts up to $1500.",
+            "The course is $9,000, and I can take $1,000 off if you pay upfront.",
+        ):
+            with self.subTest(text=text):
+                state = neg.Negotiation("husband")
+                state.observe(5, "I can do $8,000 for you.", anchor_turn=4, read_totals=True)
+                self.assertIsNone(state.observe(6, text, anchor_turn=4, read_totals=True).conflict)
+        # The discount ladder in its other shapes (paraphrased from the corpus check).
+        ladders = {
+            "The email has the $9,000 price with the $500, $1,000 or $1,500 plan discounts.": [
+                500, 1000, 1500,
+            ],
+            "The fee is 9000 dollars, with discounts of 500, 1000 or 1500 depending on the plan.": [
+                500, 1000, 1500,
+            ],
+            "It's $9,000 with the payment plans and their $500 to $1,500 discounts.": [500, 1500],
+            "We can take $500, $1000, or even $1500 off the $9000.": [500, 1000, 1500],
+            "I can do $1,000 off for you.": [1000],
+        }
+        for text, expected in ladders.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.discount_amounts(text), expected)
+        for text in (
+            "We have 750 instructors and it's $9,000.",
+            "It's $9,000 or $1,000 a month.",
+            "I can't give you $1,000 off.",
+            "There's no $1,000 discount on this one.",
+            "You'll only pay 2,000 upfront and the rest in instalments.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.discount_amounts(text), [])
+        self.assertEqual(
+            neg.stated_totals("The discount resets to $9000 tomorrow, so I can hold the seat."), []
+        )
+        # A discount that still leaves the total above the earlier offer is a rise.
+        state = neg.Negotiation("husband")
+        state.observe(5, "I can do $8,000 for you.", anchor_turn=4, read_totals=True)
+        seen = state.observe(
+            6, "The course is $9,000 and there is a $500 discount.", anchor_turn=4, read_totals=True
+        )
+        self.assertEqual(seen.conflict, ("rise", 9000, 8000))
+
+    # The SWEEP-21 corpus check (2026-11-12): every labelled advisor turn read after the anchor,
+    # once on its own (WEBSITE) and once after "I can do $8,000 for you." (RISE).  No turn names a
+    # total $300 or more from the website's.  The 20 RISE turns all say the $9,000 again after the
+    # offer, with no discount or one that still leaves it above $8,000 ("a five hundred dollar
+    # discount", "discounts available" with no figure).  Before the corpus check 82 fired: 4 were
+    # a deadline's later price ("Tomorrow it's back to $9000", "resets to $9000 tomorrow", "In a
+    # week the price is back to $9000", the next cohort's price) and 58 named the $500 / $1,000 /
+    # $1,500 ladder, which keeps the $8,000 reachable.
+    CORPUS_RISES = frozenset(
+        "c0195 c0350 c0435 c0569 c0616 c0644 c0664 c0700 c0736 c0755 c0986 c1012 c1013 c1014 "
+        "c1325 c1626 c1781 c1983 c1992 h0165".split()
+    )
+
+    def test_the_corpus_conflicts_are_the_reviewed_ones(self):
+        website: list[str] = []
+        rises: set[str] = set()
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                alone = neg.Negotiation("husband")
+                seen = alone.observe(5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True)
+                if seen.conflict is not None:
+                    website.append(entry["id"])
+                after = neg.Negotiation("husband")
+                after.observe(4, "I can do $8,000 for you.", anchor_turn=3, reader_v2=True, read_totals=True)
+                seen = after.observe(5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True)
+                if seen.conflict is not None and seen.conflict[0] == neg.CONFLICT_RISE:
+                    rises.add(entry["id"])
+        self.assertEqual(website, [])
+        self.assertEqual(sorted(rises), sorted(self.CORPUS_RISES))
+
+    def test_the_conflict_readers_are_fast_on_hostile_text(self):
+        hostile = (
+            ("discounts of $500, " * 300) + ("tomorrow it's back to " * 200) + "$9,000 "
+            + ("plan discounts " * 200) + ("500, 1000 or " * 300)
+        )
+        start = time.perf_counter()
+        neg.discount_amounts(hostile)
+        neg.stated_totals(hostile)
+        self.assertLess(time.perf_counter() - start, 2.0)
 
     def test_the_quote_record_is_logged_only_when_read(self):
         off = neg.Negotiation("husband")
