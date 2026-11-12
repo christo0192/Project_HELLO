@@ -99,9 +99,27 @@ SESSION_FACT_KEYS = (
 # does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
 # learner's timing holds as counts only (no text), so the owner's next test shows how often each
 # fired.  The engine's ``admin_log()["intents"]`` keys it reads, each a count or counts by label:
-SESSION_FACT_WORKER_KEYS = ("learner_timing",)
+SESSION_FACT_WORKER_KEYS = ("learner_timing", "learner_voice")
 _LEARNER_TIMING_COUNTS = ("moment_waits", "volunteered_objections", "split_replans")
 _LEARNER_TIMING_BY_LABEL = ("push_react_holds", "respond_first_holds", "concerns")
+# M032 S2 (learner voice): ``learner_voice`` reads the engine's ``admin_log()["voice"]``, counts
+# only: how her replies opened (SWEEP-4), their sentence counts (SWEEP-14), the scripted tails
+# bolted onto intent replies (item 8) and how often each S2 note or trim fired.
+_LEARNER_VOICE_COUNTS = (
+    "learner_replies",
+    "learner_ack_hinge_replies",
+    "learner_verdict_openers",
+    "learner_doubt_opener_replies",
+    "intent_turns",
+    "intent_tails_appended",
+    "intent_tails_after_question",
+    "no_commit_notes",
+    "volunteered_timing_stalls",
+    "ack_turn_notes",
+    "soft_tic_trims",
+    "implausible_offer_count",
+)
+_LEARNER_VOICE_BY_LABEL = ("sentence_histogram", "stall_theme_counts", "offer_terms_counts")
 _LABEL_MAX_CHARS = 32
 _LABELS_MAX = 16
 
@@ -131,15 +149,16 @@ def _count(value: object) -> int | None:
     return value
 
 
-def _learner_timing(admin: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The learner's timing holds from the engine's admin log, as bounded counts only."""
-    intents = (admin or {}).get("intents")
-    if not isinstance(intents, Mapping):
-        intents = {}
-    timing: dict[str, Any] = {}
-    for key in _LEARNER_TIMING_BY_LABEL:
-        raw = intents.get(key)
-        counts: dict[str, int] = {}
+def _bounded_counts(
+    section: object, by_label: tuple[str, ...], counts: tuple[str, ...]
+) -> dict[str, Any]:
+    """``section``'s counts by label and plain counts, bounded; anything else is dropped."""
+    if not isinstance(section, Mapping):
+        section = {}
+    out: dict[str, Any] = {}
+    for key in by_label:
+        raw = section.get(key)
+        labelled: dict[str, int] = {}
         if isinstance(raw, Mapping):
             for label, value in sorted(
                 (item for item in raw.items() if isinstance(item[0], str)), key=lambda x: x[0]
@@ -147,13 +166,27 @@ def _learner_timing(admin: Mapping[str, Any] | None) -> dict[str, Any]:
                 count = _count(value)
                 if count is None or len(label) > _LABEL_MAX_CHARS:
                     continue
-                if len(counts) >= _LABELS_MAX:
+                if len(labelled) >= _LABELS_MAX:
                     break
-                counts[label] = count
-        timing[key] = counts
-    for key in _LEARNER_TIMING_COUNTS:
-        timing[key] = _count(intents.get(key))
-    return timing
+                labelled[label] = count
+        out[key] = labelled
+    for key in counts:
+        out[key] = _count(section.get(key))
+    return out
+
+
+def _learner_timing(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The learner's timing holds from the engine's admin log, as bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("intents"), _LEARNER_TIMING_BY_LABEL, _LEARNER_TIMING_COUNTS
+    )
+
+
+def _learner_voice(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S2: the learner's voice counts from the engine's admin log, bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("voice"), _LEARNER_VOICE_BY_LABEL, _LEARNER_VOICE_COUNTS
+    )
 
 
 @dataclass(frozen=True)
@@ -236,7 +269,8 @@ def llm_messages(
     )
     if reply.plan is not None:
         return assemble_messages(
-            learner_prefix(persona),
+            # M032 SWEEP-13: the session's latched prefix (byte-stable for the whole session).
+            learner_prefix(persona, offer_realism=reply.plan.offer_realism),
             select_context(ordered, ROLEPLAY_PHASE),
             reply.candidate_text,
             reply.plan.reminder,
@@ -405,5 +439,10 @@ def session_facts_event(
         "event_type": "session_facts",
         "turn_index": None,
         "family_id": None,
-        "payload": {"pins": dict(pins), **facts, "learner_timing": _learner_timing(admin)},
+        "payload": {
+            "pins": dict(pins),
+            **facts,
+            "learner_timing": _learner_timing(admin),
+            "learner_voice": _learner_voice(admin),
+        },
     }

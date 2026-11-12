@@ -190,9 +190,11 @@ class SlowIntentReplies(FakeProvider):
 
     def __call__(self, messages):
         self.calls.append([dict(message) for message in messages])
-        # Every intent reminder hands its brief over with this line (L2 changed the shapes).
-        owed = "Raise this in your own words, as a real person would"
-        if owed in "\n".join(m["content"] for m in messages):
+        # Every intent reminder hands its brief over with one of these lines (L2 changed the
+        # shapes; M032 S2 hands an owed worry over as an objective, ``WORRY_LINE``).
+        owed = ("Raise this in your own words, as a real person would", "- What is on your mind:")
+        blob = "\n".join(m["content"] for m in messages)
+        if any(line in blob for line in owed):
             return self._hang_forever()
         return self._stream("Okay, that makes sense.")
 
@@ -575,7 +577,11 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(
                         {m["role"] for m in messages} <= {"system", "user", "assistant"}
                     )
-                    self.assertEqual(messages[0]["content"], learner_prefix(rendered))
+                    # The session's latched prefix (M032 SWEEP-13, R1_OFFER_REALISM default on).
+                    self.assertTrue(plan.offer_realism)
+                    self.assertEqual(
+                        messages[0]["content"], learner_prefix(rendered, offer_realism=True)
+                    )
                     self.assertIn(rendered.public_card_text(), blob)
                     self.assertIn("$9,000", blob)  # all the learner knows of the product
                     self.assertEqual(messages[-1], {"role": "user", "content": OPENER})
@@ -620,7 +626,10 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
         spoken = await rig.converse(OPENER, advance=20)
         self.assertEqual(spoken, "Just exploring options.")
         messages = rig.last_messages()
-        self.assertEqual(messages[0], {"role": "system", "content": learner_prefix(rig.persona)})
+        self.assertEqual(
+            messages[0],
+            {"role": "system", "content": learner_prefix(rig.persona, offer_realism=True)},
+        )
         self.assertEqual(messages[1], {"role": "assistant", "content": rig.persona.pickup_line})
         reminder = messages[-2]
         self.assertEqual(reminder["role"], "system")
@@ -708,7 +717,8 @@ class TestInterviewerContext(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, blob)
         for topic in ("H1", "H2", "H3"):
             self.assertNotIn(persona.deep(topic), blob)
-        self.assertNotIn(learner_prefix(persona), blob)
+        for realism in (False, True):  # either latched prefix (M032 SWEEP-13)
+            self.assertNotIn(learner_prefix(persona, offer_realism=realism), blob)
         for other in PERSONAS:
             for variant in other.variants:
                 self.assertNotIn(variant.first_name, blob)

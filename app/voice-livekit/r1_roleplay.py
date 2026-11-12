@@ -141,8 +141,13 @@ from r1_guard import (
 from r1_negotiation import (
     ANCHOR_USD,
     COMMIT_REACTION_BRIEF,
+    IMPLAUSIBLE_FREE,
+    IMPLAUSIBLE_LOW,
     KIND_COMMIT,
     KIND_STALL,
+    OFFER_TERMS,
+    TERM_FREE_EXTRA,
+    TERM_INSTALMENTS,
     N_DECISION_MAKER,
     N_EMAIL,
     N_EMAIL_YES,
@@ -161,7 +166,10 @@ from r1_negotiation import (
     declines_call,
     fill_decision_maker,
     filled_markers,
+    implausible_offer_in,
     monthly_amounts,
+    no_commit_spec,
+    offer_terms_in,
     question_spec,
 )
 from r1_personas import (
@@ -173,36 +181,59 @@ from r1_personas import (
     has_question,
 )
 from r1_prompts import (
+    ACK_TURN_CONCERNS_NOTE,
+    ACK_TURN_NOTE,
     ANCHOR_NOT_OFFERED_NOTE,
     ANSWERED_NOTE,
     ANSWERED_YOU_NOTE,
+    ANSWERED_YOU_NOTE_V2,
     ASKED_DIRECTLY_NOTE,
     BACKCHANNEL_CUT_NOTE,
     CHALLENGE_NOTE,
     CHECKIN_DONE_NOTE,
     BUDGET_OVER_NOTE,
     CHECKIN_NOTE,
+    COACH_RESUME_NOTE,
     CONCERN_LABELS,
     DECIDER_ASKED_NOTE,
     DECIDER_SAID_NOTE,
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
+    HINGE_USED_NOTE,
     HOLD_NOTE,
     HOLLOW_CONCERNS_NOTE,
     HOLLOW_NOTE,
     CUT_REPEAT_NOTE,
+    IMPLAUSIBLE_FREE_NOTE,
+    IMPLAUSIBLE_PRICE_NOTE,
+    INTENT_OPENER_NOTES,
     INTERRUPTED_NOTE,
+    LENGTH_LONG,
+    LENGTH_ONE,
+    LENGTH_ONE_OR_TWO,
+    LENGTH_VERY_SHORT,
     NEXT_STEP_PROPOSED_NOTE,
+    NO_COMMIT_INTENT_NOTE,
+    NOT_ANSWERED_NOTE,
+    NOT_TODAY_RESERVED_NOTE,
     OFFER_MADE_NOTE,
+    OFFER_MADE_NOTE_V2,
+    OFFER_TERMS_FREE_EXTRA,
+    OFFER_TERMS_HEADER,
+    OFFER_TERMS_INSTALMENTS,
     PRESSURE_EASED_NOTE,
     PRICE_MET_NOTE,
     PRICE_UNCHANGED_NOTE,
     PUSH_REACT_NOTE,
+    PUSH_REACT_NOTE_V2,
     RESOLVED_NOTE,
+    SOFT_TIC_NOTE,
     STRETCH_USED_NOTE,
     STYLE_NOTES,
+    STYLE_NOTES_V2,
     TEMPLATE_USED_NOTE,
     TRY_NOT_GRANTED_NOTE,
+    VERDICT_USED_NOTE,
     VOICED_CONCERNS_ASKED_NOTE,
     VOICED_CONCERNS_NOTE,
     control_prose,
@@ -215,8 +246,14 @@ from r1_scheduler import (
     ANSWERED_LABELS,
     COMMIT_STALL,
     CURIOSITY_EVERY,
+    CURIOSITY_LABELS_V2,
     CURIOSITY_TOPICS,
     EARLY_CLOSE_BEFORE_SEC,
+    F4_PRIMARY_SAID_SUFFIX,
+    F4_PRIMARY_SAID_VARIANTS,
+    PREEMPTED_LABELS,
+    PREEMPTED_SUFFIX,
+    SPEC_BY_ID as MOVE_SPEC_BY_ID,
     F1_ANCHOR,
     F1_COUNTER,
     F2_PRIMARY,
@@ -249,30 +286,39 @@ from r1_scheduler import (
     markers_match,
     offers_floor,
     offers_something,
+    preempting_families,
     quotes_price,
     tells_something,
 )
 from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
 from r1_text import (
+    PHRASE_DECIDER_STALL,
     PHRASE_STRETCH,
     PHRASE_TEMPLATE_Q,
+    SOFT_TICS,
     SpokenMemory,
+    CONCERN_NOT_TODAY,
     CONCERN_PRESSURE,
     CONCERN_THINK_OVER,
+    CONCERN_TRUST,
+    ack_hinge,
     canonical_amounts,
     concern_themes,
+    doubt_opener,
     dollar_amounts,
     fold,
     fuzzy_contains,
     is_closer,
     is_hollow_turn,
     normalize,
+    not_deciding,
     pick_variant,
     repeat_kind,
     reply_opener,
     reply_phrases,
     reply_tics,
+    reply_verdict,
     split_sentences,
     word_count,
 )
@@ -466,6 +512,29 @@ FLAG_RESPOND_FIRST = "R1_RESPOND_FIRST"
 FLAG_CONCERN_LEDGER = "R1_CONCERN_LEDGER"
 FLAG_SPLIT_REPLAN = "R1_SPLIT_REPLAN"
 FLAG_PUSH_AFTER_REACTION = "R1_PUSH_AFTER_REACTION"
+# M032 S2, learner voice (owner decisions D-M032-4 and D-M032-7), each default ON with the same
+# rollback (``fly secrets set <FLAG>=0 -a project-hello-voice``):
+#
+# * R1_LEARNER_VOICE_V2 (items 1-9, SWEEP-4, SWEEP-5's note texts): an owed point grows out of what
+#   the advisor said or comes as an honest change of subject, never "[ack], but"; an opener note and
+#   the delivery rider on every reply; F3 and F2 worries as objectives with statement fallbacks
+#   first; a pre-empted topic is raised in light of what she was told; no grading of an answer that
+#   did not answer her; the next reply after a hinge or a verdict opener is told so; she carries on
+#   after the coach aside without greeting again; the offer notes have one text each.
+# * R1_NO_COMMIT_LEDGER (SWEEP-3): the not-today stall belongs to F4-PRIMARY.
+# * R1_OFFER_TERMS (SWEEP-5): she reacts to instalments or a free extra that came with an offer.
+# * R1_ACK_TURN_NOTE (SWEEP-11): a lone "okay" or "hmm" gets a short reply that keeps her question.
+# * R1_TIC_V2 (SWEEP-12): the wider honesty tic, the soft tics and rotated curiosity labels.
+# * R1_OFFER_REALISM (SWEEP-13): a price far below expectation or a free course gets a careful
+#   buyer's surprise (latched per session: it changes one prefix sentence).
+# * R1_REPLY_LENGTH (SWEEP-14): a free reply's length follows the advisor's turn.
+FLAG_LEARNER_VOICE_V2 = "R1_LEARNER_VOICE_V2"
+FLAG_NO_COMMIT_LEDGER = "R1_NO_COMMIT_LEDGER"
+FLAG_OFFER_TERMS = "R1_OFFER_TERMS"
+FLAG_ACK_TURN_NOTE = "R1_ACK_TURN_NOTE"
+FLAG_TIC_V2 = "R1_TIC_V2"
+FLAG_OFFER_REALISM = "R1_OFFER_REALISM"
+FLAG_REPLY_LENGTH = "R1_REPLY_LENGTH"
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
 # One literal read per flag, so the repository's env-contract scanner (and
 # config/environment.schema.json) sees every one of them (review S1R-7).
@@ -475,6 +544,13 @@ _FLAG_READS = {
     FLAG_CONCERN_LEDGER: lambda: os.getenv("R1_CONCERN_LEDGER"),
     FLAG_SPLIT_REPLAN: lambda: os.getenv("R1_SPLIT_REPLAN"),
     FLAG_PUSH_AFTER_REACTION: lambda: os.getenv("R1_PUSH_AFTER_REACTION"),
+    FLAG_LEARNER_VOICE_V2: lambda: os.getenv("R1_LEARNER_VOICE_V2"),
+    FLAG_NO_COMMIT_LEDGER: lambda: os.getenv("R1_NO_COMMIT_LEDGER"),
+    FLAG_OFFER_TERMS: lambda: os.getenv("R1_OFFER_TERMS"),
+    FLAG_ACK_TURN_NOTE: lambda: os.getenv("R1_ACK_TURN_NOTE"),
+    FLAG_TIC_V2: lambda: os.getenv("R1_TIC_V2"),
+    FLAG_OFFER_REALISM: lambda: os.getenv("R1_OFFER_REALISM"),
+    FLAG_REPLY_LENGTH: lambda: os.getenv("R1_REPLY_LENGTH"),
 }
 
 
@@ -500,6 +576,24 @@ _REACT_PUSHES = {F2_PUSH: F2_PRIMARY, F3_PUSH: F3_PRIMARY, F4_PUSH: F4_PRIMARY}
 # this many turns each (``RolePlayEngine._s1_slack``; reviews S1-R2 and S1R-4).
 S1_FINISH_BY_SEC = FIDELITY_MIN_R_SEC
 S1_FINISH_TURNS_PER_MOVE = 2.5
+# M032 S2 item 5: the family whose worry a negotiation stall voiced (the F4 pair's reasons, money).
+_STALL_FAMILY = {N_TIMING: "F4", N_DECISION_MAKER: "F4", N_MONEY: "F1"}
+# SWEEP-4: a verdict opener in either of her last this-many lines gets VERDICT_USED_NOTE.
+VERDICT_LOOKBACK = 2
+# SWEEP-12: a soft tic (or "I'd rather") in this many of her last ``SOFT_TIC_LOOKBACK`` replies gets
+# SOFT_TIC_NOTE.  "I'd rather" is steered only (``declines_call`` and the wait reader read it).
+SOFT_TIC_LOOKBACK = 4
+SOFT_TIC_REPEATS = 2
+_RATHER = "I'd rather"
+_SAYS_RATHER = re.compile(r"\bi(?:'d| would) rather\b", re.IGNORECASE)
+# SWEEP-13: at most this many careful-buyer notes per session, never on two learner turns in a row;
+# and the "payment" curiosity topic waits while the latest price the advisor named is under this.
+IMPLAUSIBLE_NOTE_LIMIT = 2
+CHEAP_PRICE_USD = 1000
+# SWEEP-14: an advisor turn this long gets the long length line.
+LONG_ADVISOR_WORDS = 60
+# The learner sentence-count histogram's last bucket (``SENTENCE_BUCKETS`` or more).
+SENTENCE_BUCKETS = 4
 
 
 @dataclass(frozen=True)
@@ -553,6 +647,8 @@ class LearnerIntent:
     fallback: str
     fallbacks: tuple[str, ...] = ()
     forced: bool = False
+    # M032 S2 item 3: ``brief`` is an owed worry, rendered as an objective (``WORRY_LINE``).
+    worry: bool = False
 
 
 @dataclass(frozen=True)
@@ -580,6 +676,11 @@ class TurnPlan:
     # learner off while she was raising it and she is told to finish (or repeat) her point: when the
     # played text proves the move it counts as delivered then (``record_spoken``), never twice.
     credit_move_id: str | None = None
+    # M032 SWEEP-13: which learner prefix the session sends (``learner_prefix(offer_realism=...)``),
+    # latched for the whole session so the prefix stays byte-stable.
+    offer_realism: bool = False
+    # M032 SWEEP-13: this plan's reminder carries a careful-buyer note (counts and the trust theme).
+    implausible: bool = False
 
     @property
     def needs_llm(self) -> bool:
@@ -647,7 +748,7 @@ class RolePlayEngine:
         self._asides: list[dict[str, Any]] = []
         self._coach_played = False
         self._break_kind: str | None = None
-        self._learner_control = control_prose(learner_prefix(persona))
+        # ``_learner_control`` is set below, with the session's latched prefix (M032 SWEEP-13).
         self._interviewer_control = control_prose(interviewer_prefix())
         self.exit_requested = False
         # Repetition control: every learner sentence actually played, so the guard can drop
@@ -797,6 +898,58 @@ class RolePlayEngine:
         # lost before any audio changes nothing), and the pushes held for her reaction, by family.
         self._heard_primary: str | None = None
         self._push_react_holds: dict[str, int] = {}
+        # M032 S2 (learner voice).  SWEEP-13's prefix sentence is latched for the session (the
+        # prefix is the DeepSeek cache prefix), and the guard's echo check reads that very prefix.
+        self._offer_realism = flag_on(FLAG_OFFER_REALISM)
+        self._learner_control = control_prose(
+            learner_prefix(persona, offer_realism=self._offer_realism)
+        )
+        # Item 7: the coach aside just played (the next reply carries on, no new greeting).
+        self._after_coach = False
+        # Item 4: the families whose topic the advisor talked about on an EARLIER turn.
+        self._preempted: set[str] = set()
+        self._preempted_before: frozenset[str] = frozenset()
+        # Item 5: the family whose worry her last heard line raised, and whether this advisor turn
+        # left it untouched.
+        self._worry_family: str | None = None
+        self._unanswered_worry = False
+        # This turn's reading for the per-turn notes: a lone acknowledgement, a cut, the reading
+        # itself (memory only, never logged), an ask.
+        self._turn_backchannel = False
+        self._turn_cut = False
+        self._turn_reading = ""
+        # SWEEP-4 (counts only): her heard lines that opened with a hinge, a verdict or "My worry
+        # is"; the last flags steer the next reply.  And a sentence-count histogram (SWEEP-14).
+        self._hinges: list[bool] = []
+        self._verdicts: list[bool] = []
+        self._voice_replies = 0
+        self._doubt_openers = 0
+        self._sentence_counts: dict[int, int] = {}
+        # Item 8 (counts only): scripted tails appended to an intent reply, and how many of them
+        # followed model text that had already asked a question.
+        self._tails_appended = 0
+        self._tails_after_question = 0
+        # SWEEP-3: the turn she first said the not-today stall in a line of her own (F4-PRIMARY
+        # still owed), the free replies that did so, the notes given, and the stall themes counted.
+        self._timing_said_turn: int | None = None
+        self._volunteered_timing = 0
+        self._no_commit_notes = 0
+        self._stall_themes: dict[str, int] = {}
+        # SWEEP-5: the offer terms already reacted to (each once per session), and their counts.
+        self._terms_used: set[str] = set()
+        self._terms_counts: dict[str, int] = {}
+        self._turn_terms: tuple[str, ...] = ()
+        # SWEEP-11: replies told to answer a lone "okay" or "hmm" briefly.
+        self._ack_turn_notes = 0
+        # SWEEP-12: soft tics trimmed, and the soft tics (and "I'd rather") of each heard reply.
+        self._soft_tic_trims = 0
+        self._soft_history: list[tuple[str, ...]] = []
+        # SWEEP-13: careful-buyer notes given, the turn of the last one, this turn's note, and the
+        # latest price the advisor named (the "payment" topic waits while it is under $1,000).
+        self._implausible_count = 0
+        self._implausible_turn: int | None = None
+        self._implausible_note = ""
+        self._latest_price_usd: int | None = None
 
     # ------------------------------------------------------------------- properties
     @property
@@ -833,8 +986,12 @@ class RolePlayEngine:
         released: Iterable[str] | None = None,
         confirm: bool = False,
         free_reply: bool = False,
+        carries_move: bool = False,
     ) -> GuardContext:
         """The guard context for an LLM reply now.
+
+        M032 S2: ``carries_move`` says the plan voices or may complete an owed move (SWEEP-12 never
+        trims a soft tic from such a reply); the S2 flags are read here, once per plan.
 
         Its ``control_texts`` are the private instruction prose of the prompts in play
         (never the words the model is meant to say), for the guard's echo check.
@@ -893,6 +1050,9 @@ class RolePlayEngine:
                 if self.turn - self._monthly_quote_turn <= MONTHLY_QUOTE_TURNS
                 else None
             ),
+            voice_v2=flag_on(FLAG_LEARNER_VOICE_V2),
+            tic_v2=flag_on(FLAG_TIC_V2),
+            carries_move=carries_move,
         )
 
     def filler_text(self) -> str:
@@ -1140,6 +1300,8 @@ class RolePlayEngine:
             self._give_back_lost(split)
         if self._wants_aside(break_kind):
             return self._aside_plan(break_kind or "ai", r_sec, turn_index)
+        # M032 S2 item 7: the first turn after the coach aside (its turn is not in her context).
+        resumed, self._after_coach = self._after_coach, False
         if break_kind == "ai":
             self._ai_questions += 1
         self._turn_undo = (
@@ -1156,6 +1318,9 @@ class RolePlayEngine:
         self._price_notes = []
         self._nothing_granted = False
         self._force_curiosity = False
+        voice_v2 = flag_on(FLAG_LEARNER_VOICE_V2)
+        if resumed and voice_v2:
+            self._notes.append(COACH_RESUME_NOTE)
         if turn_index is not None:
             self._turn_map[turn] = turn_index
         if candidate_seconds is not None:
@@ -1179,7 +1344,17 @@ class RolePlayEngine:
             self._stt_word_counts.append(words)
         self._hollow_run = self._hollow_run + 1 if is_hollow_turn(reading) else 0
         self._decider_asked_now = False
+        # M032 S2: this turn's reading for the per-turn notes (memory only, never logged), and the
+        # families the advisor talked about BEFORE this turn (item 4).
+        self._turn_backchannel = backchannel
+        self._turn_cut = cut
+        self._turn_reading = reading
+        self._preempted_before = frozenset(self._preempted)
+        self._preempted.update(preempting_families(reading))
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
+        # Item 5: the worry her last heard line raised, and whether this turn touched its topic.
+        worry, self._worry_family = self._worry_family, None
+        self._unanswered_worry = worry is not None and worry not in signals.topics
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         known = (len(self._advisor_amounts), len(self._answered))
         self._advisor_amounts.update(advisor_amounts_in(candidate_text))
@@ -1190,6 +1365,7 @@ class RolePlayEngine:
                 self._answered.append(topic)
         negotiated = self._observe_negotiation(candidate_text, turn)
         self._note_situation(negotiated)
+        self._read_offer_extras(candidate_text, negotiated, turn)
         self._note_curiosity_covered(reading)
         self._note_monthly_quote(candidate_text, turn)
         self._dig_now = asks_about_learner(reading)
@@ -1426,7 +1602,7 @@ class RolePlayEngine:
                 self._push_react_holds[family] = self._push_react_holds.get(family, 0) + 1
                 self._turn_hold = ("push_react", move.id, family)
                 reacting = True
-                self._notes.append(PUSH_REACT_NOTE)
+                self._notes.append(PUSH_REACT_NOTE_V2 if voice_v2 else PUSH_REACT_NOTE)
                 reasons.append("owed_deferred_for_reaction")
             else:
                 self.scheduler.issue(move)
@@ -1507,7 +1683,11 @@ class RolePlayEngine:
             done = not curiosity and r_sec >= TIME_CUE_SEC
             self._notes.append(CHECKIN_DONE_NOTE if done else CHECKIN_NOTE)
         elif not quiet and not responding:
-            curiosity = self._curiosity_for_free_reply()
+            # M032 SWEEP-12: no hand-over on a turn that put a new price or offer on the table.
+            figure = flag_on(FLAG_TIC_V2) and (
+                bool(negotiated.offers) or bool(self._implausible_note)
+            )
+            curiosity = self._curiosity_for_free_reply(skip=figure)
         return self._plan(
             TurnMode.LLM_REPLY,
             reasons,
@@ -1754,6 +1934,7 @@ class RolePlayEngine:
         role-play clock is the session's to pause, and nothing in the schedule moves.
         """
         self._coach_played = True
+        self._after_coach = True  # M032 S2 item 7: the next reply carries on, no new greeting
         self._asides.append(
             {"kind": kind, "after_roleplay_turn": self.turn, "transcript_turn": turn_index}
         )
@@ -1969,9 +2150,14 @@ class RolePlayEngine:
         return tells_something(text)
 
     def _respond_notes(self, kinds: frozenset[str]) -> None:
-        """The reply's job on a turn that left something open for her (S1 items 2 and 6)."""
+        """The reply's job on a turn that left something open for her (S1 items 2 and 6).
+
+        M032 SWEEP-4: with R1_LEARNER_VOICE_V2 the offer and answer notes ask what it means for
+        her, never "how it lands" (the cue for a graded "That sounds reasonable").
+        """
+        voice_v2 = flag_on(FLAG_LEARNER_VOICE_V2)
         if RESPOND_OFFER in kinds:
-            self._notes.append(OFFER_MADE_NOTE)
+            self._notes.append(OFFER_MADE_NOTE_V2 if voice_v2 else OFFER_MADE_NOTE)
         if RESPOND_BACK_OFF in kinds:
             # RCA END-5: the advisor gave her time, so the proposed next step no longer stands
             # (HOLD_NOTE stops) and, if there was pressure to ease, she lets it go.  A new ask
@@ -1987,7 +2173,103 @@ class RolePlayEngine:
         if RESPOND_QUESTION in kinds:
             self._notes.append(ASKED_DIRECTLY_NOTE)  # a free reply's; an intent answers it first
         if RESPOND_ANSWERED in kinds:
-            self._notes.append(ANSWERED_YOU_NOTE)
+            self._notes.append(ANSWERED_YOU_NOTE_V2 if voice_v2 else ANSWERED_YOU_NOTE)
+
+    # ------------------------------------------------------------- M032 S2: learner voice
+    def _read_offer_extras(self, text: str, seen: NegotiationTurn, turn: int) -> None:
+        """What an offer carried for her reaction this turn (SWEEP-5 terms, SWEEP-13 realism).
+
+        Only candidates are kept here; ``_plan`` adds the note to a reply that is voiced by the
+        model (never a scripted line or the reaction before one) and counts it there.
+        """
+        self._implausible_note = ""
+        self._turn_terms = ()
+        found = None
+        if flag_on(FLAG_OFFER_REALISM):
+            found = implausible_offer_in(text, self.negotiation.own_amounts)
+        named = [offer.net_usd for offer in seen.offers]
+        if found is not None and found[0] == IMPLAUSIBLE_LOW and found[1] is not None:
+            named.append(found[1])
+        if named:
+            self._latest_price_usd = min(named)
+        if (
+            found is not None
+            and self._implausible_count < IMPLAUSIBLE_NOTE_LIMIT
+            and self._implausible_turn != turn - 1
+        ):
+            kind, usd = found
+            if kind == IMPLAUSIBLE_FREE:
+                self._implausible_note = IMPLAUSIBLE_FREE_NOTE
+            elif usd is not None:
+                self._implausible_note = IMPLAUSIBLE_PRICE_NOTE.format(amount=format_usd(usd))
+        if flag_on(FLAG_OFFER_TERMS):
+            terms = offer_terms_in(text)
+            fresh = [term for term in OFFER_TERMS if term in terms and term not in self._terms_used]
+            if self._implausible_note == IMPLAUSIBLE_FREE_NOTE:
+                fresh = [term for term in fresh if term != TERM_FREE_EXTRA]  # its note wins
+            self._turn_terms = tuple(fresh)
+
+    def _offer_extra_notes(self) -> tuple[str, ...]:
+        """This turn's careful-buyer note and offer-terms note, counted as given (``_plan``)."""
+        notes: list[str] = []
+        if self._implausible_note:
+            notes.append(self._implausible_note)
+            self._implausible_count += 1
+            self._implausible_turn = self.turn
+        terms = self._turn_terms
+        if terms:
+            clauses = {
+                TERM_INSTALMENTS: OFFER_TERMS_INSTALMENTS,
+                TERM_FREE_EXTRA: OFFER_TERMS_FREE_EXTRA,
+            }
+            notes.append(" ".join((OFFER_TERMS_HEADER, *(clauses[term] for term in terms[:2]))))
+            for term in terms:
+                self._terms_used.add(term)
+                self._terms_counts[term] = self._terms_counts.get(term, 0) + 1
+        self._implausible_note = ""
+        self._turn_terms = ()
+        return tuple(notes)
+
+    def _length_note(self) -> str:
+        """SWEEP-14: a free reply's length line, keyed to the advisor's turn."""
+        reading = self._turn_reading
+        if offers_floor(reading):
+            return LENGTH_LONG
+        if self._turn_backchannel:
+            return LENGTH_VERY_SHORT
+        if RESPOND_QUESTION in self._turn_kinds or asks_her_directly(reading):
+            return LENGTH_LONG
+        if RESPOND_ANSWERED in self._turn_kinds or self._answers_her_question(reading):
+            return LENGTH_VERY_SHORT
+        if word_count(reading) >= LONG_ADVISOR_WORDS:
+            return LENGTH_LONG
+        rotation = (LENGTH_ONE, LENGTH_ONE_OR_TWO, LENGTH_ONE_OR_TWO)  # one in three: one sentence
+        return pick_variant(rotation, self.seed, self.turn)
+
+    def _ack_turn(self) -> bool:
+        """SWEEP-11: a lone acknowledgement that did not cut her, after a line that was no goodbye,
+        with no interviewer question open."""
+        return (
+            flag_on(FLAG_ACK_TURN_NOTE)
+            and self._turn_backchannel
+            and not self._turn_cut
+            and not (self._hollow_run >= 1 and self._last_reply_closer)
+            and not self.end_question_open
+            and not self._wrap_open
+        )
+
+    def _soft_tic_words(self) -> str:
+        """SWEEP-12: the soft tics (and "I'd rather") in two of her last four replies, quoted."""
+        recent = self._soft_history[-SOFT_TIC_LOOKBACK:]
+        words = []
+        for word in (*SOFT_TICS, _RATHER):
+            if word == _RATHER and self._pending_ask is not None:
+                continue  # "I'd rather not book it" may be the very answer to the open ask
+            if sum(1 for tics in recent if word in tics) >= SOFT_TIC_REPEATS:
+                words.append(f'"{word}"')
+        if not words:
+            return ""
+        return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
 
     def _moment(
         self, text: str, negotiated: NegotiationTurn, kinds: frozenset[str], r_sec: float
@@ -2285,6 +2567,7 @@ class RolePlayEngine:
         move_id: str | None,
         price_wrap: bool,
         intent: LearnerIntent | None,
+        negotiation_id: str | None = None,
     ) -> tuple[str, ...]:
         """Worker notes that hold on every reply of a situation, not only the turn that began it.
 
@@ -2294,6 +2577,11 @@ class RolePlayEngine:
         * a tracked phrase tic already used ("a stretch", "what would that call involve") is not
           used again;
         * where the price stands, unless the turn carries the price in its own brief.
+
+        M032 S2 adds, each behind its flag: no grading of a turn that did not answer her worry
+        (item 5); the next reply after a hinge or a verdict opener is told so (SWEEP-4); the
+        not-today stall is F4-PRIMARY's (SWEEP-3); a lone "okay" gets a short reply that keeps her
+        question (SWEEP-11); a soft tic leaned on lately is named (SWEEP-12).
         """
         notes: list[str] = []
         if (
@@ -2310,18 +2598,31 @@ class RolePlayEngine:
         # M032 S1 item 5.  The ledger never contradicts another note of the same reply (review
         # S1R-2): on a price-wrap turn the price notes tell her to say she needs to think, so that
         # theme is left out; and a question put to her directly may get the honest answer again.
+        # SWEEP-3: an ask turn is never told to dodge the ask, so neither the not-today theme nor
+        # the think-it-over theme is in its ledger note.
+        voice_v2 = flag_on(FLAG_LEARNER_VOICE_V2)
+        no_commit = flag_on(FLAG_NO_COMMIT_LEDGER)
+        ask_turn = self._turn_ask is not None
+        skip = {CONCERN_THINK_OVER} if price_wrap else set()
+        if no_commit and ask_turn:
+            skip |= {CONCERN_NOT_TODAY, CONCERN_THINK_OVER}
         concerns = (
-            self._voiced_concerns(
-                skip=frozenset({CONCERN_THINK_OVER}) if price_wrap else frozenset()
-            )
+            self._voiced_concerns(skip=frozenset(skip))
             if mode is TurnMode.LLM_REPLY and flag_on(FLAG_CONCERN_LEDGER)
             else ""
         )
+        ack_turn = mode is TurnMode.LLM_REPLY and self._ack_turn()
         if mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
             # Merged with what she already said, so the two never pull apart.
             notes.append(
                 HOLLOW_CONCERNS_NOTE.format(concerns=concerns) if concerns else HOLLOW_NOTE
             )
+        elif ack_turn:
+            # SWEEP-11: never together with VOICED_CONCERNS_NOTE (its concerns clause is merged in).
+            notes.append(
+                ACK_TURN_CONCERNS_NOTE.format(concerns=concerns) if concerns else ACK_TURN_NOTE
+            )
+            self._ack_turn_notes += 1
         elif concerns and RESPOND_QUESTION in self._turn_kinds:
             notes.append(VOICED_CONCERNS_ASKED_NOTE.format(concerns=concerns))
         elif concerns:
@@ -2341,6 +2642,40 @@ class RolePlayEngine:
             notes.append(TEMPLATE_USED_NOTE)
         if not price_wrap and move_id not in (F1_ANCHOR, F1_COUNTER):
             notes.extend(self._price_notes)
+        commit_line = intent is not None and intent.kind == KIND_COMMIT
+        if voice_v2 and not commit_line:
+            # Item 5 (anti-validation): her worry was not answered, so she does not call the reply
+            # reasonable or good (a lone acknowledgement has its own note).
+            unanswered = self._unanswered_worry and not ack_turn
+            if unanswered:
+                notes.append(NOT_ANSWERED_NOTE)
+            # SWEEP-4: steering only, never both, and never on a confirmation (not called then).
+            if self._hinges and self._hinges[-1]:
+                notes.append(HINGE_USED_NOTE)
+            elif not unanswered and any(self._verdicts[-VERDICT_LOOKBACK:]):
+                notes.append(VERDICT_USED_NOTE)
+        if no_commit and not self.scheduler.is_delivered(F4_PRIMARY):
+            # SWEEP-3: while F4-PRIMARY is owed, a free reply does not voice the not-today stall
+            # (not on an ask turn or a check-in, which want a real answer).
+            if mode is TurnMode.LLM_REPLY and not ask_turn and not self._force_curiosity:
+                notes.append(NOT_TODAY_RESERVED_NOTE)
+                self._no_commit_notes += 1
+        if (
+            no_commit
+            and mode is TurnMode.INTENT
+            and self._concerns.get(CONCERN_NOT_TODAY, 0) >= 1
+            and move_id != F4_PRIMARY
+            and negotiation_id != N_TIMING
+            and not commit_line
+            and not ask_turn
+        ):
+            # SWEEP-3: once said, an owed point does not add the stall again.
+            notes.append(NO_COMMIT_INTENT_NOTE)
+            self._no_commit_notes += 1
+        if mode is TurnMode.LLM_REPLY and flag_on(FLAG_TIC_V2):
+            words = self._soft_tic_words()
+            if words:
+                notes.append(SOFT_TIC_NOTE.format(words=words))
         return tuple(notes)
 
     def _evidence(self, kind: AskKind) -> CommitmentEvidence:
@@ -2503,7 +2838,7 @@ class RolePlayEngine:
         if reason is not None:
             spec = SPEC_BY_REASON[reason]
         elif not self.negotiation.question_used:
-            spec = question_spec(ask)
+            spec = question_spec(ask, no_commit=flag_on(FLAG_NO_COMMIT_LEDGER))
             self.negotiation.question_used = True
         else:
             return None  # every reason is spent: react in a free reply (the next-step note)
@@ -2521,7 +2856,12 @@ class RolePlayEngine:
         reveal_topics: tuple[str, ...],
         monologue: float | None,
     ) -> TurnPlan:
-        """The plan for a negotiation spec the model voices (a reason, a question, e-mail yes)."""
+        """The plan for a negotiation spec the model voices (a reason, a question, e-mail yes).
+
+        M032 SWEEP-3: without the "before you agree to anything" priming (R1_NO_COMMIT_LEDGER).
+        """
+        if flag_on(FLAG_NO_COMMIT_LEDGER):
+            spec = no_commit_spec(spec)
         dm = self.persona.decision_maker
         variants = tuple(fill_decision_maker(text, dm) for text in spec.variants)
         fallbacks = self._fallback_order(spec.id, variants)
@@ -2725,6 +3065,32 @@ class RolePlayEngine:
             # Three wordings of the cue, one per attempt ("before my own next call": 8 of 20).
             briefs = (move.brief, *TIME_CUE_BRIEF_ALTERNATIVES)
             move = replace(move, brief=pick_variant(briefs, self.seed, 0))
+        elif (
+            move.id == F4_PRIMARY
+            and self._timing_said_turn is not None
+            and flag_on(FLAG_NO_COMMIT_LEDGER)
+        ):
+            # SWEEP-3: she already said she is not deciding today in a line of her own, so the owed
+            # primary refers back to it; markers and must-say unchanged.
+            move = replace(
+                move,
+                brief=move.brief + F4_PRIMARY_SAID_SUFFIX,
+                variants=F4_PRIMARY_SAID_VARIANTS,
+            )
+        worry = False
+        statements: tuple[str, ...] = ()
+        spec = MOVE_SPEC_BY_ID.get(move.id)
+        if spec is not None and spec.worry and flag_on(FLAG_LEARNER_VOICE_V2):
+            # M032 S2 items 3 and 4: the worry as an objective, raised in light of what the advisor
+            # already said about its topic; statement fallbacks first, then the question ones.
+            brief = spec.worry
+            if spec.role == "primary" and spec.family in self._preempted_before:
+                label = dict(PREEMPTED_LABELS).get(spec.family or "")
+                if label:
+                    brief += PREEMPTED_SUFFIX.format(label=label)
+            move = replace(move, brief=brief)
+            worry = True
+            statements = spec.worry_variants
         variants = move.variants or (move.text,)
         if move.id == TIME_CUE:
             # The scripted cue never puts the learner on another call when a variant without it
@@ -2736,6 +3102,12 @@ class RolePlayEngine:
         fallbacks = self._fallback_order(
             move.id, variants, REDIRECT_OPENERS if redirect else ()
         )
+        if statements and not redirect:
+            first = self._fallback_order(move.id, statements)
+            said = self._spoken.snapshot()
+            ordered = (*first, *fallbacks)
+            fresh = tuple(text for text in ordered if not _repeats(text, said))
+            fallbacks = fresh + tuple(text for text in ordered if text not in fresh)
         self._intent_uses[move.id] = self._intent_uses.get(move.id, 0) + 1
         brief = f"{REDIRECT_BRIEF} {move.brief}" if redirect else move.brief
         kind = KIND_REDIRECT if redirect else (KIND_CUE if move.id == TIME_CUE else KIND_OBJECTION)
@@ -2747,6 +3119,7 @@ class RolePlayEngine:
             fallback=fallbacks[0],
             fallbacks=fallbacks,
             forced=move.forced and not redirect,
+            worry=worry and not redirect,
         )
         return self._plan(
             TurnMode.INTENT,
@@ -2806,6 +3179,11 @@ class RolePlayEngine:
         key = plan.move_id or plan.negotiation_id
         if key is not None:
             self._intent_fallbacks[key] = self._intent_fallbacks.get(key, 0) + 1
+        # M032 S2 item 8 (counts only): how often a scripted tail was bolted on, and how often the
+        # model's own text had already asked a question when it was.
+        self._tails_appended += 1
+        if "?" in spoken_so_far:
+            self._tails_after_question += 1
         return chosen
 
     # ------------------------------------------------------------------- curiosity
@@ -2838,7 +3216,7 @@ class RolePlayEngine:
         """
         return not any(self._asked[-QUESTION_DIET_WINDOW:])
 
-    def _curiosity_for_free_reply(self, *, force: bool = False) -> str:
+    def _curiosity_for_free_reply(self, *, force: bool = False, skip: bool = False) -> str:
         """One unasked question topic every ``CURIOSITY_EVERY`` free replies, else "".
 
         These are the neutral questions that used to be scheduled (live or recorded, what
@@ -2850,26 +3228,40 @@ class RolePlayEngine:
         ``curiosity_asked_in``), whether the topic was handed over or she asked on her own.  The
         topic handed over least often comes next (in the attempt's seeded order), and one handed
         over ``CURIOSITY_OFFER_LIMIT`` times without being asked is not handed over again.
+
+        M032: ``skip`` (SWEEP-12, a turn that put a new price or offer on the table) counts the free
+        reply but hands nothing over.  With R1_TIC_V2 the label is a rotated noun phrase
+        (``CURIOSITY_LABELS_V2``), and with R1_OFFER_REALISM "payment" waits while the latest price
+        the advisor named is under $1,000 (SWEEP-13).
         """
         self._free_replies += 1
-        if not self._question_budget():
+        if skip or not self._question_budget():
             return ""
         if not force and self._free_replies - self._free_at_last_curiosity < CURIOSITY_EVERY:
             return ""
         ids = tuple(topic for topic, _label in CURIOSITY_TOPICS)
         labels = dict(CURIOSITY_TOPICS)
         order = [pick_variant(ids, self.seed, step) for step in range(len(ids))]
+        cheap = (
+            flag_on(FLAG_OFFER_REALISM)
+            and self._latest_price_usd is not None
+            and self._latest_price_usd < CHEAP_PRICE_USD
+        )
         open_topics = [
             topic
             for topic in dict.fromkeys(order)
             if topic not in self._curiosity_asked
             and self._curiosity_offered.get(topic, 0) < CURIOSITY_OFFER_LIMIT
+            and not (cheap and topic == "payment")
         ]
         if not open_topics:
             return ""
         topic = min(open_topics, key=lambda item: self._curiosity_offered.get(item, 0))
-        self._curiosity_offered[topic] = self._curiosity_offered.get(topic, 0) + 1
+        offered = self._curiosity_offered.get(topic, 0)
+        self._curiosity_offered[topic] = offered + 1
         self._free_at_last_curiosity = self._free_replies
+        if flag_on(FLAG_TIC_V2):
+            return pick_variant(CURIOSITY_LABELS_V2[topic], f"{self.seed}:{topic}", offered)
         return labels[topic]
 
     # ------------------------------------------------------------------ the plan
@@ -2913,18 +3305,52 @@ class RolePlayEngine:
                 # locked.
                 first_probes = tuple(topic for topic in first_probes if topic in reveal_topics)
             # One opening style per free reply, rotated (an intent opens with its own reaction).
-            style_note = (
-                pick_variant(STYLE_NOTES, self.seed, self.turn)
-                if mode is TurnMode.LLM_REPLY
-                else ""
-            )
+            # M032 S2 item 2: with R1_LEARNER_VOICE_V2 an intent gets one too, from the notes that
+            # fit an owed point (``INTENT_OPENER_NOTES``), never the 19:00 stall's reaction.
+            voice_v2 = flag_on(FLAG_LEARNER_VOICE_V2)
+            reaction_only = intent is not None and intent.kind == KIND_COMMIT
+            if mode is TurnMode.LLM_REPLY:
+                style_note = pick_variant(
+                    STYLE_NOTES_V2 if voice_v2 else STYLE_NOTES, self.seed, self.turn
+                )
+            elif voice_v2 and intent is not None and not reaction_only:
+                style_note = pick_variant(INTENT_OPENER_NOTES, self.seed, self.turn)
+            else:
+                style_note = ""
             notes = tuple(
                 note for note in self._notes if intent is None or note not in _FREE_REPLY_NOTES
             )
             if not confirm:
                 notes += self._standing_notes(
-                    mode=mode, move_id=move_id, price_wrap=price_wrap, intent=intent
+                    mode=mode,
+                    move_id=move_id,
+                    price_wrap=price_wrap,
+                    intent=intent,
+                    negotiation_id=negotiation_id,
                 )
+            # SWEEP-5 and SWEEP-13: what came with an offer, on a reply the model voices.
+            implausible = bool(self._implausible_note) and not confirm and not reaction_only
+            if not confirm and not reaction_only:
+                notes += self._offer_extra_notes()
+            intent_join = ""
+            if voice_v2 and intent is not None:
+                if move_id in (F1_ANCHOR, F1_COUNTER):
+                    intent_join = "price"
+                elif negotiation_id is not None:
+                    intent_join = "topic_fresh"  # it answers the advisor's own ask or offer
+                else:
+                    spec = MOVE_SPEC_BY_ID.get(move_id or "")
+                    family = None if spec is None else spec.family
+                    fresh = self.scheduler._topic_fresh(family)
+                    intent_join = "topic_fresh" if fresh else "new_topic"
+            length_note = (
+                self._length_note()
+                if mode is TurnMode.LLM_REPLY
+                and not confirm
+                and "free_reply" in reasons
+                and flag_on(FLAG_REPLY_LENGTH)
+                else ""
+            )
             # The layers are handed over only here, on the turn that asked about the topic.
             self.tracker.gate.mark_hint_offered(first_probes)
             self.tracker.gate.mark_deep_offered(reveal_topics)
@@ -2948,14 +3374,24 @@ class RolePlayEngine:
                 intent_forced=False if intent is None else intent.forced,
                 curiosity=curiosity,
                 offer_usd=self.negotiation.best_offer_usd,
-                # The anchor already reacts to the price on the table: no "pleasant surprise".
-                new_offer_usd=None if move_id == F1_ANCHOR else self._new_offer_usd,
+                # The anchor already reacts to the price on the table: no "pleasant surprise"; and
+                # a careful-buyer note replaces the new-offer note on its turn (SWEEP-13).
+                new_offer_usd=(
+                    None if move_id == F1_ANCHOR or implausible else self._new_offer_usd
+                ),
                 notes=notes,
-                reaction_only=intent is not None and intent.kind == KIND_COMMIT,
+                reaction_only=reaction_only,
                 style_note=style_note,
                 confirm=confirm,
                 answering=answering,
                 intent_shape=pick_variant((0, 1), self.seed, self.turn),
+                voice_v2=voice_v2,
+                intent_join=intent_join,
+                intent_worry=(
+                    intent.brief if voice_v2 and intent is not None and intent.worry else ""
+                ),
+                length_note=length_note,
+                curiosity_v2=flag_on(FLAG_TIC_V2),
             )
             ctx = self.guard_context(
                 mode="reply",
@@ -2964,8 +3400,10 @@ class RolePlayEngine:
                 released=reveal_topics,
                 confirm=confirm,
                 free_reply=mode is TurnMode.LLM_REPLY and not confirm,
+                carries_move=move_id is not None or credit_move_id is not None,
             )
         else:
+            implausible = False
             ctx = self.guard_context(mode="reply")
         return TurnPlan(
             turn=self.turn,
@@ -2984,6 +3422,8 @@ class RolePlayEngine:
             negotiation_id=negotiation_id,
             line_id=line_id,
             credit_move_id=credit_move_id,
+            offer_realism=self._offer_realism,
+            implausible=implausible,
         )
 
     # ---------------------------------------------------------------------- speech
@@ -3024,6 +3464,7 @@ class RolePlayEngine:
         self.ledger.record(result)
         if result.fallback_used:
             self._fallbacks += 1  # the next fallback starts at the next variant
+        self._soft_tic_trims += result.soft_tic_trims  # M032 SWEEP-12 (a count)
 
     def record_spoken(
         self,
@@ -3048,10 +3489,14 @@ class RolePlayEngine:
         primaries_before = {
             primary for primary in _REACT_PUSHES.values() if self.scheduler.is_delivered(primary)
         }
+        f4_owed = not self.scheduler.is_delivered(F4_PRIMARY)  # SWEEP-3, before this line
+        tic_v2 = flag_on(FLAG_TIC_V2)
         self._spoken.add(spoken_text)
         if spoken_text.strip():
-            self._styles.append((reply_opener(spoken_text), reply_tics(spoken_text)))
+            tics = reply_tics(spoken_text, v2=tic_v2)
+            self._styles.append((reply_opener(spoken_text), tics))
             self._asked.append("?" in spoken_text)
+            self._note_voice(plan, spoken_text, tics)
             self._last_reply_closer = is_closer(spoken_text)
             self._raised_last = plan.move_id is not None or plan.negotiation_id is not None
             # M032 S1: whether her line carried an owed move or a negotiation line (her question in
@@ -3062,7 +3507,7 @@ class RolePlayEngine:
                 or plan.negotiation_id is not None
                 or plan.credit_move_id is not None
             )
-            self._her_question_topics = curiosity_asked_in(spoken_text)
+            self._her_question_topics = curiosity_asked_in(spoken_text, wide=tic_v2)
             for theme in concern_themes(spoken_text):
                 self._concerns[theme] = self._concerns.get(theme, 0) + 1
             phrases = reply_phrases(spoken_text)
@@ -3070,7 +3515,8 @@ class RolePlayEngine:
             for key in phrases:
                 self._phrases[key] = self._phrases.get(key, 0) + 1
         self.tracker.note_learner_text(spoken_text, plan.turn)
-        self._curiosity_asked.update(curiosity_asked_in(spoken_text))  # L1: her own questions
+        # L1: her own questions.
+        self._curiosity_asked.update(curiosity_asked_in(spoken_text, wide=tic_v2))
         if self._decider_said_turn is None and self.scheduler.spoken_proves(F4_PUSH, spoken_text):
             self._decider_said_turn = plan.turn  # L7: the decision maker is named
         if (
@@ -3091,6 +3537,8 @@ class RolePlayEngine:
             # limit, an attempt the release before it scored.
             self.scheduler.note_objection(turn=plan.turn)
             self._volunteered_objections += 1
+        if spoken_text.strip():
+            self._note_not_today(plan, spoken_text, when, f4_owed=f4_owed)
         self.negotiation.note_learner_text(
             spoken_text,
             plan.turn,
@@ -3156,6 +3604,83 @@ class RolePlayEngine:
                 ),
                 None,
             )
+            # M032 S2 item 5: the family whose worry this heard line raised (an owed move it
+            # delivered, or a stall reason), so the next turn can tell whether it was answered.
+            spec = MOVE_SPEC_BY_ID.get(plan.move_id or "")
+            if spec is not None and spec.family in FAMILIES and self.scheduler.is_delivered(
+                spec.id
+            ):
+                self._worry_family = spec.family
+            else:
+                self._worry_family = _STALL_FAMILY.get(plan.negotiation_id or "")
+            if (
+                plan.move_id == F4_PRIMARY
+                and self.scheduler.is_delivered(F4_PRIMARY)
+                and flag_on(FLAG_NO_COMMIT_LEDGER)
+            ):
+                # SWEEP-3: F4-PRIMARY's own delivery voices the not-today theme.
+                self._concerns[CONCERN_NOT_TODAY] = self._concerns.get(CONCERN_NOT_TODAY, 0) + 1
+            if plan.implausible:
+                # SWEEP-13: once she has been told to be wary, the trust theme is on record.
+                self._concerns[CONCERN_TRUST] = self._concerns.get(CONCERN_TRUST, 0) + 1
+
+    def _note_voice(self, plan: TurnPlan, spoken_text: str, tics: tuple[str, ...]) -> None:
+        """M032 S2: how her heard line opened (SWEEP-4), its soft tics (SWEEP-12) and its sentence
+        count (SWEEP-14).  Counts and flags only; the text is not kept."""
+        hinge = ack_hinge(spoken_text)
+        verdict = reply_verdict(spoken_text)
+        self._hinges.append(hinge)
+        self._verdicts.append(verdict)
+        soft = tuple(tic for tic in tics if tic in SOFT_TICS)
+        if _SAYS_RATHER.search(fold(spoken_text)):
+            soft += (_RATHER,)
+        self._soft_history.append(soft)
+        if plan.mode in (TurnMode.LLM_REPLY, TurnMode.INTENT):
+            self._voice_replies += 1
+            if doubt_opener(spoken_text):
+                self._doubt_openers += 1
+            count = min(len(split_sentences(spoken_text)), SENTENCE_BUCKETS)
+            self._sentence_counts[count] = self._sentence_counts.get(count, 0) + 1
+
+    def _note_not_today(
+        self, plan: TurnPlan, spoken_text: str, when: float, *, f4_owed: bool
+    ) -> None:
+        """SWEEP-3: her heard line said the not-today stall (``not_deciding``).
+
+        Counted as a theme (the ledger note), and while F4-PRIMARY is owed the first such line sets
+        ``_timing_said_turn`` (F4-PRIMARY then refers back to it).  A free reply that does so counts
+        as an objection for spacing, once and only with S1 slack (mirroring S1 item 3); it is never
+        a voiced reason for grading and never delivers F4-PRIMARY.
+        """
+        said = not_deciding(spoken_text)
+        if said:
+            self._stall_themes[CONCERN_NOT_TODAY] = self._stall_themes.get(CONCERN_NOT_TODAY, 0) + 1
+        if CONCERN_THINK_OVER in concern_themes(spoken_text):
+            self._stall_themes[CONCERN_THINK_OVER] = (
+                self._stall_themes.get(CONCERN_THINK_OVER, 0) + 1
+            )
+        if PHRASE_DECIDER_STALL in reply_phrases(spoken_text):
+            self._stall_themes["decider"] = self._stall_themes.get("decider", 0) + 1
+        if not said or not flag_on(FLAG_NO_COMMIT_LEDGER):
+            return
+        self._concerns[CONCERN_NOT_TODAY] = self._concerns.get(CONCERN_NOT_TODAY, 0) + 1
+        if (
+            not f4_owed
+            or self._timing_said_turn is not None
+            or plan.move_id == F4_PRIMARY
+            or plan.negotiation_id == N_TIMING
+        ):
+            return
+        self._timing_said_turn = plan.turn
+        free = (
+            plan.mode is TurnMode.LLM_REPLY
+            and plan.move_id is None
+            and plan.negotiation_id is None
+            and plan.credit_move_id is None
+        )
+        if free and self._s1_slack(when):
+            self.scheduler.note_objection(turn=plan.turn)
+            self._volunteered_timing += 1
 
     def _credit_organic_push(self, plan: TurnPlan, spoken_text: str, when: float) -> None:
         """A push the learner already voiced in a free reply is not owed again.
@@ -3311,6 +3836,28 @@ class RolePlayEngine:
                 "split_replans": self._split_replans,
                 # SWEEP-1 (counts only): pushes held one turn for her reaction, by family.
                 "push_react_holds": dict(sorted(self._push_react_holds.items())),
+            },
+            # M032 S2, learner voice (counts only; ``session_facts.learner_voice``): how her replies
+            # opened, how long they were, how often a scripted tail was bolted on, and how often
+            # each S2 note or trim fired.
+            "voice": {
+                "learner_replies": self._voice_replies,
+                "learner_ack_hinge_replies": sum(1 for flag in self._hinges if flag),
+                "learner_verdict_openers": sum(1 for flag in self._verdicts if flag),
+                "learner_doubt_opener_replies": self._doubt_openers,
+                "sentence_histogram": {
+                    str(count): number for count, number in sorted(self._sentence_counts.items())
+                },
+                "intent_turns": sum(self._intent_uses.values()),
+                "intent_tails_appended": self._tails_appended,
+                "intent_tails_after_question": self._tails_after_question,
+                "stall_theme_counts": dict(sorted(self._stall_themes.items())),
+                "no_commit_notes": self._no_commit_notes,
+                "volunteered_timing_stalls": self._volunteered_timing,
+                "offer_terms_counts": dict(sorted(self._terms_counts.items())),
+                "ack_turn_notes": self._ack_turn_notes,
+                "soft_tic_trims": self._soft_tic_trims,
+                "implausible_offer_count": self._implausible_count,
             },
             # Counts only (logged for the rehearsal metrics, not posted): replies that held a
             # question, the tracked phrase tics, and what the advisor already answered.
