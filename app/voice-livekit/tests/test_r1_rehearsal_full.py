@@ -1134,10 +1134,13 @@ class ClockAndSeamTests(unittest.TestCase):
         self.assertRegex(source, rf"max_retry={llm.SESSION_LLM_MAX_RETRY}\b")
         self.assertRegex(source, rf"retry_interval={re.escape(str(llm.SESSION_LLM_RETRY_INTERVAL))}\b")
         self.assertRegex(source, rf"timeout={re.escape(str(llm.SESSION_LLM_TIMEOUT))}\b")
-        try:
-            import livekit.agents  # noqa: F401 - the chat context needs the SDK
+        try:  # the real SDK class (the bare run has none, or another test's stub)
+            from livekit.agents import APIConnectOptions
         except ImportError:
-            self.skipTest("the bare run has no SDK")
+            APIConnectOptions = None
+        if APIConnectOptions is not None and isinstance(llm.session_llm_conn_options(), APIConnectOptions):
+            real = llm.session_llm_conn_options()
+            self.assertEqual((real.max_retry, real.retry_interval, real.timeout), (1, 0.5, 10.0))
 
         class FakeLLM:
             def __init__(self) -> None:
@@ -1149,7 +1152,6 @@ class ClockAndSeamTests(unittest.TestCase):
 
             def chat(self, **kwargs):
                 self.kwargs = kwargs
-                outer = self
 
                 class Stream:
                     async def __aenter__(self):
@@ -1168,15 +1170,18 @@ class ClockAndSeamTests(unittest.TestCase):
 
         fake = FakeLLM()
         seen: list = []
-        stream = llm.make_live_learner_provider({}, llm.Ledger(), learner=fake, on_error=seen.append)
+        options = object()
 
-        async def main():
+        async def main(stream):
             return [chunk async for chunk in stream([{"role": "user", "content": "hi"}])]
 
-        asyncio.run(main())
-        options = fake.kwargs.get("conn_options")
-        if options is not None:  # the bare run has no SDK: no options object to pass
-            self.assertEqual((options.max_retry, options.retry_interval), (1, 0.5))
+        # The chat context and the options object are the SDK's; here the call's shape is what is
+        # checked, so it runs with or without the SDK installed.
+        with unittest.mock.patch.object(r1_session, "_chat_context_from", lambda messages: messages), \
+                unittest.mock.patch.object(llm, "session_llm_conn_options", lambda: options):
+            stream = llm.make_live_learner_provider({}, llm.Ledger(), learner=fake, on_error=seen.append)
+            asyncio.run(main(stream))
+        self.assertIs(fake.kwargs.get("conn_options"), options)
         error = SimpleNamespaceError(type="llm_error", recoverable=False)
         fake.handlers["error"](error)
         self.assertIs(seen[0].error, error)
