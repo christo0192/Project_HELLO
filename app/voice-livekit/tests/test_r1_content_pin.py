@@ -135,7 +135,12 @@ import r1_world
 # or variant changed.  The S1 review then reworded PUSH_REACT_NOTE and ANSWERED_YOU_NOTE (say how
 # it lands as a feeling, never the advisor's promises as facts) and added
 # VOICED_CONCERNS_ASKED_NOTE (the ledger yields to a direct question).
-PINNED_CONTENT_SHA256 = "c2e33bb99acafacd6a477795c350e4a6a7e5b82103bae8a2dd82613d46edc78e"
+# Revision 22 (M032 S2, learner voice): the S2 texts join the manifest beside the texts they replace
+# while their flags are on (``r1_content._learner_voice_v2``, the worry fields of the F3 and F2
+# moves, F4-PRIMARY's "like I said" texts, the pre-empted suffix, the rotated curiosity labels, the
+# stall briefs without "before you agree to anything", BUDGET_REPLACEMENT_V2).  No graded meaning,
+# marker, must-say, deadline or scripted line of the release before changed.
+PINNED_CONTENT_SHA256 = "d34b13b5bb502dfb1f514d3293462c57ee8f944fb11d7b2f96ef3645824e63de"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -312,6 +317,27 @@ class PinTests(unittest.TestCase):
             (r1_prompts, "VOICED_CONCERNS_ASKED_NOTE", "- {concerns} again."),
             (r1_prompts, "INTENT_PRICE_NOTE", "- Do not push on price."),
             (r1_prompts, "FORCED_NOTE", "- Link it."),
+            # M032 S2 (revision 22): every new learner text is pinned.
+            (r1_prompts, "LEARNER_DELIVERY_RIDER", "- Talk."),
+            (r1_prompts, "INTENT_SHAPE_TOPIC_FRESH", "x"),
+            (r1_prompts, "INTENT_SHAPE_NEW_TOPIC", "x"),
+            (r1_prompts, "FREE_REPLY_NOTE_V2", "x"),
+            (r1_prompts, "WORRY_LINE", "- {worry}"),
+            (r1_prompts, "NOT_ANSWERED_NOTE", "- x"),
+            (r1_prompts, "COACH_RESUME_NOTE", "- x"),
+            (r1_prompts, "OFFER_ON_TABLE_NOTE_V2", "- {amount}"),
+            (r1_prompts, "OFFER_TERMS_INSTALMENTS", "x"),
+            (r1_prompts, "IMPLAUSIBLE_FREE_NOTE", "- x"),
+            (r1_prompts, "NOT_TODAY_RESERVED_NOTE", "- x"),
+            (r1_prompts, "ACK_TURN_NOTE", "- x"),
+            (r1_prompts, "SOFT_TIC_NOTE", "- {words}"),
+            (r1_prompts, "LENGTH_ONE", "- x"),
+            (r1_prompts, "PREFIX_OFFER_SENTENCE_V2", "x\n"),
+            (r1_scheduler, "F4_PRIMARY_SAID_VARIANTS", ("Like I said, not today.",)),
+            (r1_scheduler, "PREEMPTED_SUFFIX", "; {label}"),
+            (r1_scheduler, "CURIOSITY_LABELS_V2", {"format": ("x",)}),
+            (r1_negotiation, "NO_COMMIT_BRIEFS", {}),
+            (r1_guard, "BUDGET_REPLACEMENT_V2", "x"),
         ):
             original = getattr(module, name)
             try:

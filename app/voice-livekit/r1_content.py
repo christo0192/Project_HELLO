@@ -144,7 +144,21 @@ import r1_world
 #    as before.  After the S1 review PUSH_REACT_NOTE and ANSWERED_YOU_NOTE say how it lands as a
 #    feeling (never the advisor's promises as facts) and VOICED_CONCERNS_ASKED_NOTE lets the
 #    ledger yield to a direct question.
-CONTENT_REVISION = 21
+# 22: M032 S2, learner voice (owner decisions D-M032-4 and D-M032-7; rollback flags
+#    R1_LEARNER_VOICE_V2, R1_NO_COMMIT_LEDGER, R1_OFFER_TERMS, R1_ACK_TURN_NOTE, R1_TIC_V2,
+#    R1_OFFER_REALISM, R1_REPLY_LENGTH).  New per-turn texts join the manifest, each beside the text
+#    it replaces while its flag is on: the intent shapes (an owed point grows out of what the
+#    advisor said, or comes as an honest change of subject; a price shape), REACT_SPECIFIC and the
+#    free-reply line, the delivery rider, the v2 opening-style notes and the intent opener notes,
+#    the F3 and F2 worries with statement fallbacks and the pre-empted suffix, the anti-validation,
+#    hinge and verdict notes, the coach-aside re-entry note, the S1 notes without "how it lands",
+#    SWEEP-5's single offer notes and offer-terms note, SWEEP-3's not-today notes, F4-PRIMARY's
+#    "like I said" suffix and variants and the stall briefs without "before you agree to anything",
+#    SWEEP-11's acknowledgement notes, SWEEP-12's soft-tic note, curiosity line and rotated labels,
+#    SWEEP-13's careful-buyer notes and the prefix sentence it latches, SWEEP-14's length lines and
+#    BUDGET_REPLACEMENT without "though".  No graded meaning, marker, must-say, deadline or
+#    scripted line of the release before changed; with every flag off the reminders are the same.
+CONTENT_REVISION = 22
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -184,6 +198,75 @@ def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
     }
 
 
+def _learner_voice_v2(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
+    """M032 S2 (revision 22): every new learner text, and reminders rendered with the flags on."""
+    p = r1_prompts
+    worry = r1_scheduler.SPEC_BY_ID[r1_scheduler.F3_PRIMARY].worry
+    return {
+        "react_specific": p.REACT_SPECIFIC,
+        "free_reply_note": p.FREE_REPLY_NOTE,
+        "free_reply_note_v2": p.FREE_REPLY_NOTE_V2,
+        "intent_answering_note": p.INTENT_ANSWERING_NOTE,
+        "intent_shape_topic_fresh": p.INTENT_SHAPE_TOPIC_FRESH,
+        "intent_shape_new_topic": p.INTENT_SHAPE_NEW_TOPIC,
+        "intent_shape_price": p.INTENT_SHAPE_PRICE,
+        "worry_line": p.WORRY_LINE,
+        "delivery_rider_base": p.LEARNER_DELIVERY_RIDER_BASE,
+        "delivery_rider": p.LEARNER_DELIVERY_RIDER,
+        "style_notes_v2": list(p.STYLE_NOTES_V2),
+        "intent_opener_notes": list(p.INTENT_OPENER_NOTES),
+        "hinge_used_note": p.HINGE_USED_NOTE,
+        "verdict_used_note": p.VERDICT_USED_NOTE,
+        "not_answered_note": p.NOT_ANSWERED_NOTE,
+        "coach_resume_note": p.COACH_RESUME_NOTE,
+        "offer_made_note_v2": p.OFFER_MADE_NOTE_V2,
+        "answered_you_note_v2": p.ANSWERED_YOU_NOTE_V2,
+        "push_react_note_v2": p.PUSH_REACT_NOTE_V2,
+        "new_offer_note_v2": p.NEW_OFFER_NOTE_V2,
+        "new_offer_above_ask_note": p.NEW_OFFER_ABOVE_ASK_NOTE,
+        "offer_on_table_note_v2": p.OFFER_ON_TABLE_NOTE_V2,
+        "offer_met_note_v2": p.OFFER_MET_NOTE_V2,
+        "offer_terms": [p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS, p.OFFER_TERMS_FREE_EXTRA],
+        "implausible_notes": [p.IMPLAUSIBLE_PRICE_NOTE, p.IMPLAUSIBLE_FREE_NOTE],
+        "not_today_reserved_note": p.NOT_TODAY_RESERVED_NOTE,
+        "no_commit_intent_note": p.NO_COMMIT_INTENT_NOTE,
+        "ack_turn_notes": [p.ACK_TURN_NOTE, p.ACK_TURN_CONCERNS_NOTE],
+        "soft_tic_note": p.SOFT_TIC_NOTE,
+        "curiosity_notes": [p.CURIOSITY_NOTE, p.CURIOSITY_NOTE_V2],
+        "length_lines": [p.LENGTH_VERY_SHORT, p.LENGTH_ONE, p.LENGTH_ONE_OR_TWO, p.LENGTH_LONG],
+        "prefix_offer_sentences": [p.PREFIX_OFFER_SENTENCE, p.PREFIX_OFFER_SENTENCE_V2],
+        "learner_prefix_offer_realism_sample": p.learner_prefix(sample, offer_realism=True),
+        "free_reminder_sample": p.turn_reminder(
+            sample,
+            r_sec=0,
+            style_note=p.STYLE_NOTES_V2[1],
+            curiosity=r1_scheduler.CURIOSITY_LABELS_V2["format"][0],
+            voice_v2=True,
+            length_note=p.LENGTH_ONE,
+            curiosity_v2=True,
+            price_wrap=True,
+            offer_usd=8500,
+            new_offer_usd=8500,
+        ),
+        "intent_reminder_sample": p.turn_reminder(
+            sample,
+            r_sec=0,
+            intent_brief=worry,
+            intent_forced=True,
+            voice_v2=True,
+            intent_join="topic_fresh",
+            intent_worry=worry,
+            style_note=p.INTENT_OPENER_NOTES[0],
+        ),
+        "confirm_reminder_sample": p.turn_reminder(
+            sample, r_sec=0, confirm=True, style_note=p.STYLE_NOTES_V2[0], voice_v2=True
+        ),
+        "reaction_only_sample": p.turn_reminder(
+            sample, r_sec=0, reaction_only=True, voice_v2=True
+        ),
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -217,9 +300,18 @@ def manifest() -> dict[str, Any]:
                     "must_say": list(spec.must_say),
                     "markers": [list(group) for group in spec.markers],
                     "variants": list(spec.variants),
+                    "worry": spec.worry,
+                    "worry_variants": list(spec.worry_variants),
                 }
                 for spec in r1_scheduler.PLAN
             ],
+            "f4_primary_said_suffix": r1_scheduler.F4_PRIMARY_SAID_SUFFIX,
+            "f4_primary_said_variants": list(r1_scheduler.F4_PRIMARY_SAID_VARIANTS),
+            "preempted_suffix": r1_scheduler.PREEMPTED_SUFFIX,
+            "preempted_labels": [list(item) for item in r1_scheduler.PREEMPTED_LABELS],
+            "curiosity_labels_v2": {
+                topic: list(labels) for topic, labels in r1_scheduler.CURIOSITY_LABELS_V2.items()
+            },
             "redirect_openers": list(r1_scheduler.REDIRECT_OPENERS),
             "redirect_brief": r1_scheduler.REDIRECT_BRIEF,
             "answered_labels": [list(item) for item in r1_scheduler.ANSWERED_LABELS],
@@ -262,6 +354,15 @@ def manifest() -> dict[str, Any]:
                 "brief": r1_negotiation.N_QUESTION_ENROL_BRIEF,
                 "variants": list(r1_negotiation.N_QUESTION_ENROL_VARIANTS),
             },
+            "no_commit_briefs": dict(r1_negotiation.NO_COMMIT_BRIEFS),
+            "no_commit_variants": {
+                key: list(value) for key, value in r1_negotiation.NO_COMMIT_VARIANTS.items()
+            },
+            "question_enrol_v2": {
+                "brief": r1_negotiation.N_QUESTION_ENROL_BRIEF_V2,
+                "variants": list(r1_negotiation.N_QUESTION_ENROL_VARIANTS_V2),
+            },
+            "implausible_net_usd": r1_negotiation.IMPLAUSIBLE_NET_USD,
             "anchor_after_offer": [
                 {
                     "id": item.id,
@@ -315,6 +416,8 @@ def manifest() -> dict[str, Any]:
             "anchor_replacement": r1_guard.ANCHOR_REPLACEMENT,
             "gratitude_replacement": r1_guard.GRATITUDE_REPLACEMENT,
             "budget_replacement": r1_guard.BUDGET_REPLACEMENT,
+            "budget_replacement_v2": r1_guard.BUDGET_REPLACEMENT_V2,
+            "soft_tic_window": r1_guard.SOFT_TIC_WINDOW,
             "confirm_fallbacks": list(r1_guard.CONFIRM_FALLBACKS),
             "style": {
                 "tic_window": r1_guard.STYLE_TIC_WINDOW,
@@ -439,6 +542,7 @@ def manifest() -> dict[str, Any]:
             "voiced_concerns_note": r1_prompts.VOICED_CONCERNS_NOTE,
             "voiced_concerns_asked_note": r1_prompts.VOICED_CONCERNS_ASKED_NOTE,
             "hollow_concerns_note": r1_prompts.HOLLOW_CONCERNS_NOTE,
+            "learner_voice_v2": _learner_voice_v2(sample),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,
