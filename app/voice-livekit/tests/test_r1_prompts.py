@@ -1,10 +1,12 @@
 """Unit tests for ``r1_prompts``: separated prefixes, ephemeral reminders and the filter."""
 from __future__ import annotations
 
+import os
 import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -731,9 +733,15 @@ class ContextFilterTests(unittest.TestCase):
         self.assertEqual(select_context(items, "roleplay"), [])
 
 
+# M032 SWEEP-26: the wrap-up reminder's sentences, each behind its rollback flag (both off: the
+# release before).
+WRAPUP_FLAGS_OFF = {"R1_WRAPUP_ANSWERS": "0", "R1_WRAPUP_ONE_MENTION": "0"}
+
+
 class WrapupReminderTests(unittest.TestCase):
     """R1-Q item 8: the model answered "Alright" with a goodbye, and L-CLOSE said it again."""
 
+    @mock.patch.dict(os.environ, WRAPUP_FLAGS_OFF)
     def test_the_wrapup_replies_carry_a_note_that_forbids_a_goodbye(self):
         from r1_prompts import WRAPUP_REMINDER, interviewer_reminder
         from r1_replies import Reply, llm_messages
@@ -1228,6 +1236,92 @@ class LearnerVoiceS2PromptTests(unittest.TestCase):
         self.assertEqual(learner_prefix(P1), learner_prefix(P1, offer_realism=False))
         self.assertIn(p.PREFIX_OFFER_SENTENCE, learner_prefix(P1))
         self.assertIn(p.PREFIX_OFFER_SENTENCE_V2, learner_prefix(P1, offer_realism=True))
+
+
+class WrapupAnswersReminderTests(unittest.TestCase):
+    """M032 SWEEP-26 (S3.5): one merged wrap-up reminder, by flag.
+
+    a95398ab #66-68: asked whether any part of the interview was left, Christy deferred to the
+    hiring team and L-CLOSE named it again.  With R1_WRAPUP_ANSWERS a what's-left question gets a
+    sentence that adds no fact; with R1_WRAPUP_ONE_MENTION a question she cannot answer gets
+    L-FAQ-DEFER-WRAP; R1_WRAPUP_NEXT_ROUND (default off) swaps in the second-round sentence.
+    """
+
+    EVERYTHING = (
+        'If they ask what happens next or whether anything is left, say exactly: "That\'s '
+        'everything for today\'s interview."'
+    )
+    CANNOT = (
+        "If you cannot answer a question (pay, work mode, training, timelines, whether they will "
+        "be selected), say exactly: \"I'm afraid that's not something I can tell you.\" instead "
+        "of the line in your instructions, and do not say who will follow up."
+    )
+    ANSWER = "Answer the question in one or two short sentences."
+
+    def test_all_four_flag_combinations(self):
+        from r1_prompts import WRAPUP_REMINDER, wrapup_reminder
+
+        self.assertEqual(wrapup_reminder(), WRAPUP_REMINDER)
+        self.assertEqual(
+            wrapup_reminder(answers=True),
+            WRAPUP_REMINDER.replace(self.ANSWER, f"{self.ANSWER} {self.EVERYTHING}"),
+        )
+        self.assertEqual(
+            wrapup_reminder(one_mention=True),
+            WRAPUP_REMINDER.replace(self.ANSWER, f"{self.ANSWER} {self.CANNOT}"),
+        )
+        both = wrapup_reminder(answers=True, one_mention=True)
+        self.assertEqual(
+            both,
+            WRAPUP_REMINDER.replace(self.ANSWER, f"{self.ANSWER} {self.EVERYTHING} {self.CANNOT}"),
+        )
+        # What's left comes first (its own sentence), then what she cannot answer.
+        self.assertLess(both.index("whether anything is left"), both.index("cannot answer"))
+
+    def test_the_second_round_sentence_waits_for_its_own_flag(self):
+        from r1_prompts import WRAPUP_NEXT_ROUND_LINE, wrapup_reminder
+
+        on = wrapup_reminder(answers=True, next_round=True)
+        self.assertIn(f'"{WRAPUP_NEXT_ROUND_LINE}"', on)
+        self.assertNotIn("everything for today", on)
+        # Without the what's-left flag it is not said at all.
+        self.assertNotIn(WRAPUP_NEXT_ROUND_LINE, wrapup_reminder(next_round=True))
+
+    def test_the_second_round_sentence_restates_the_role_process(self):
+        # It restates role.process, deliberately kept out of the interviewer's FAQ: if the process
+        # changes, this sentence must change with it (owner and HR first).
+        from r1_prompts import WRAPUP_NEXT_ROUND_LINE
+        from r1_world import AUDIENCE_INTERVIEWER_FAQ, fact, facts_for
+
+        process = fact("role.process").text.lower()
+        self.assertIn("round 2 is a functional and culture interview", process)
+        self.assertIn("functional and culture interview", WRAPUP_NEXT_ROUND_LINE.lower())
+        self.assertNotIn("role.process", {item.id for item in facts_for(AUDIENCE_INTERVIEWER_FAQ)})
+
+    def test_the_session_flags_reach_the_wrap_up_reply(self):
+        from r1_prompts import wrapup_reminder
+        from r1_replies import Reply, llm_messages
+
+        reply = Reply(phase="wrapup", candidate_text="Is anything left?")
+        messages = llm_messages(reply, P1, [])
+        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True, one_mention=True))
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_ROUND": "1"}):
+            messages = llm_messages(reply, P1, [])
+        self.assertEqual(
+            messages[-2]["content"],
+            wrapup_reminder(answers=True, one_mention=True, next_round=True),
+        )
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_ONE_MENTION": "0"}):
+            messages = llm_messages(reply, P1, [])
+        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True))
+        self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
+
+    def test_the_quoted_lines_are_dropped_from_the_echo_check(self):
+        from r1_prompts import wrapup_reminder
+
+        prose = control_prose(wrapup_reminder(answers=True, one_mention=True))
+        self.assertNotIn("everything for today", prose)
+        self.assertNotIn("not something I can tell you", prose)
 
 
 if __name__ == "__main__":

@@ -442,6 +442,21 @@ def _anchor_taken_as_offer(sentence: str, ctx: "GuardContext") -> bool:
 
 LEARNER_PHASE = "roleplay"
 FEEDBACK_PHASES = frozenset({"roleplay_exit", "wrapup", "closing"})
+# M032 SWEEP-26: the phases whose deflection is L-FAQ-DEFER-WRAP and that name the hiring team
+# only in L-CLOSE (``GuardContext.one_mention``).
+ONE_MENTION_PHASES = frozenset({"wrapup", "closing"})
+FAQ_DEFER_WRAP_LINE = LINES["L-FAQ-DEFER-WRAP"]
+_HIRING_TEAM = re.compile(r"\bhiring (?:team|manager|panel)s?\b", re.IGNORECASE)
+# The words of an acknowledgement ("That's a good question.", "Sure, thanks for asking."): a
+# sentence with at least ``OWN_CONTENT_WORDS`` other words has content of its own ("That's
+# everything for today's interview."), so a hiring-team sentence after it is dropped rather than
+# replaced (the reply already said something).
+_ACK_ONLY_WORDS = frozenset(
+    "great good sure okay ok of course thats that is its a an the question questions thanks thank "
+    "you for asking absolutely yes yeah right i see understand fair point interesting nice so well "
+    "and glad asked really very totally definitely happy to help".split()
+)
+OWN_CONTENT_WORDS = 3
 PERSONA_REVEALED_PHASES = frozenset({"transition", "roleplay_exit", "wrapup", "closing"})
 
 CONTROL = "control"
@@ -466,6 +481,11 @@ MISREAD = "misread"
 # Hygiene, never posted to the 3-hit gate: the sentence is dropped and counted
 # (``course_fact_unsaid``).
 COURSE_FACT = "course_fact"
+# M032 SWEEP-26 (flag R1_WRAPUP_ONE_MENTION): a wrap-up or closing sentence of Christy's that names
+# the hiring team, which L-CLOSE names (replaced by L-FAQ-DEFER-WRAP once per reply, or dropped
+# after a sentence with content of its own).  Hygiene, never posted: the gate's 3-hit count is
+# unchanged.
+HIRING_MENTION = "hiring_mention"
 CATEGORIES = (
     CONTROL,
     VENDOR,
@@ -486,9 +506,10 @@ CATEGORIES = (
     REOPEN,
     MISREAD,
     COURSE_FACT,
+    HIRING_MENTION,
 )
 # Hygiene is counted and logged but is not a leak and is never posted to the API.
-HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT, REOPEN, MISREAD, COURSE_FACT})
+HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT, REOPEN, MISREAD, COURSE_FACT, HIRING_MENTION})
 # Categories that count toward the 3-hit gate: everything except hygiene.
 LEAK_CATEGORIES = frozenset(CATEGORIES) - HYGIENE_CATEGORIES
 
@@ -995,6 +1016,20 @@ class GuardContext:
     probe_first: bool = False
     allowed_extra: frozenset[int] = frozenset()
     advisor_durations: frozenset[float] = frozenset()
+    # M032 SWEEP-26 (R1_WRAPUP_ONE_MENTION; Christy in the wrap-up and the closing only): the hiring
+    # team is named once, by L-CLOSE, so a model sentence that names it is replaced by
+    # L-FAQ-DEFER-WRAP (or dropped after a sentence with content of its own), and the deflection
+    # for a hiring or invented fact is L-FAQ-DEFER-WRAP as well.
+    one_mention: bool = False
+    # M032 S3.2 (R1_CLOSING_STATE): the advisor is closing the call (WINDING), so her reply is one
+    # short goodbye: a goodbye is not dropped as said again (``closer_again``) and the stall-closer
+    # quota does not cut "I'll get back to you" (``closing_exempt``, one reply).
+    winding: bool = False
+    closing_exempt: bool = False
+    # M032 SWEEP-25 B (R1_COMMIT_REACTION_V2): the 19:00 reaction before the scripted WEAK line; a
+    # sentence of it that says goodbye, that she has to go, that she will think it over or get back
+    # to them, or asks for an e-mail is dropped (the WEAK line says that, once).
+    reaction_only: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -1171,6 +1206,12 @@ def _interviewer_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         hits.append(_hit(INVENTED_FACT, "role_fact_beyond_deck", sentence))
     if question and _PROTECTED.search(sentence):
         hits.append(_hit(PROTECTED_QUESTION, "protected_class", sentence))
+    if (
+        ctx.one_mention
+        and ctx.phase in ONE_MENTION_PHASES
+        and _HIRING_TEAM.search(sentence) is not None
+    ):
+        hits.append(_hit(HIRING_MENTION, "hiring_team_mention", sentence))
     if ctx.phase in SMALL_TALK_PHASES and not question and _ROLEPLAY_ANNOUNCE.search(sentence):
         hits.append(_hit(SCRIPTED_CUE, "roleplay_announcement", sentence))
     return hits
@@ -1545,6 +1586,13 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
         return ""
     if FEEDBACK in categories:
         return NO_FEEDBACK_LINE
+    if (
+        not ctx.is_learner
+        and ctx.one_mention
+        and ctx.phase in ONE_MENTION_PHASES
+        and categories & {HIRING_COMP, INVENTED_FACT, HIRING_MENTION}
+    ):
+        return FAQ_DEFER_WRAP_LINE  # M032 SWEEP-26: L-CLOSE is the one mention of the hiring team
     if not ctx.is_learner and categories & {HIRING_COMP, INVENTED_FACT}:
         return INTERVIEWER_DEFLECTION
     if ctx.is_learner and ctx.persona is not None:
@@ -1903,6 +1951,14 @@ class StreamGuard:
             if any(hit.category == COURSE_FACT for hit in hits):
                 self._length_drops += 1
             out = _replacement(hits, self.ctx, sentence)
+            if (
+                out == FAQ_DEFER_WRAP_LINE
+                and {hit.category for hit in hits} == {HIRING_MENTION}
+                and any(_has_own_content(said) for said in self._emitted)
+            ):
+                # M032 SWEEP-26: "Great, that's all from my side." already said something, so its
+                # "The hiring team will follow up ..." is dropped, not answered with a deflection.
+                out = ""
             final = out == NO_FEEDBACK_LINE
             if out in self._replacements:
                 out = ""
@@ -2013,6 +2069,12 @@ def guard_text(text: str, ctx: GuardContext) -> GuardResult:
     guard.feed(text)
     guard.flush()
     return guard.result
+
+
+def _has_own_content(sentence: str) -> bool:
+    """A sentence that is more than an acknowledgement (``OWN_CONTENT_WORDS`` other words)."""
+    words = normalize(sentence).split()
+    return sum(1 for word in words if word not in _ACK_ONLY_WORDS) >= OWN_CONTENT_WORDS
 
 
 def _filler_gap(match: re.Match[str]) -> str:

@@ -47,7 +47,13 @@ from r1_prompts import (
     learner_prefix,
     select_context,
 )
-from r1_roleplay import TurnPlan
+from r1_roleplay import (
+    FLAG_WRAPUP_ANSWERS,
+    FLAG_WRAPUP_NEXT_ROUND,
+    FLAG_WRAPUP_ONE_MENTION,
+    TurnPlan,
+    flag_on,
+)
 from r1_world import WORLD_VERSION
 
 SOURCE_ATTEMPT = "attempt"
@@ -99,7 +105,13 @@ SESSION_FACT_KEYS = (
 # does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
 # learner's timing holds as counts only (no text), so the owner's next test shows how often each
 # fired.  The engine's ``admin_log()["intents"]`` keys it reads, each a count or counts by label:
-SESSION_FACT_WORKER_KEYS = ("learner_timing", "learner_voice", "learner_probe_first")
+SESSION_FACT_WORKER_KEYS = (
+    "learner_timing",
+    "learner_voice",
+    "learner_probe_first",
+    "learner_endings",
+    "wrapup",
+)
 _LEARNER_TIMING_COUNTS = ("moment_waits", "volunteered_objections", "split_replans")
 _LEARNER_TIMING_BY_LABEL = ("push_react_holds", "respond_first_holds", "concerns")
 # M032 S2 (learner voice): ``learner_voice`` reads the engine's ``admin_log()["voice"]``, counts
@@ -134,6 +146,35 @@ _LEARNER_PROBE_FIRST_COUNTS = (
     "price_first_turns",
 )
 _LEARNER_PROBE_FIRST_BY_LABEL = ("probes",)
+# M032 S3 (endings and abuse): ``learner_endings`` reads the engine's ``admin_log()["endings"]``,
+# counts only: the closes read in role (hand-over closes, mutual goodbyes), the replies told to say
+# one short goodbye, the early-close asides and how they were answered, the late end requests and
+# the last-point asides (SWEEP-24), the abuse hits and hang-ups (S3.4, D-M032-3: scoring is
+# unchanged), the 19:00 reactions the guard cut a goodbye from (SWEEP-25) and the replies after
+# the time cue (SWEEP-27).  ``wrapup`` is the session's own counts of the wrap-up (S3.5 and
+# SWEEP-26): the one invitation asked, the hiring-team sentences taken out, the turns said in the
+# beat after L-EXIT and the affirmations that did not count as a question.
+_LEARNER_ENDINGS_COUNTS = (
+    "handover_closes",
+    "mutual_goodbyes",
+    "winding_replies",
+    "early_close_asks",
+    "early_close_accepted",
+    "early_close_declined",
+    "late_end_requests",
+    "last_point_asides",
+    "abuse_count",
+    "abuse_hangups",
+    "commit_reaction_dropped",
+    "short_on_time_notes",
+)
+_LEARNER_ENDINGS_BY_LABEL = ("closing_states",)
+_WRAPUP_COUNTS = (
+    "wrapup_more_asked",
+    "wrapup_hiring_team_drops",
+    "wrap_beat_turns",
+    "wrapup_affirmations",
+)
 _LABEL_MAX_CHARS = 32
 _LABELS_MAX = 16
 
@@ -212,6 +253,18 @@ def _learner_probe_first(admin: Mapping[str, Any] | None) -> dict[str, Any]:
     )
 
 
+def _learner_endings(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S3: the endings and abuse counts from the engine's admin log, bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("endings"), _LEARNER_ENDINGS_BY_LABEL, _LEARNER_ENDINGS_COUNTS
+    )
+
+
+def _wrapup_counts(wrapup: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S3.5 and SWEEP-26: the session's wrap-up counts, bounded counts only."""
+    return _bounded_counts(wrapup, (), _WRAPUP_COUNTS)
+
+
 @dataclass(frozen=True)
 class PersonaChoice:
     """The persona card a session plays, and where the choice came from."""
@@ -275,6 +328,9 @@ class Reply:
     # A scripted sentence spoken after the model's reply in the same speech (M1: Christy's
     # L-TRANSITION-ASK after an answer before the role-play); "" for none.
     tail: str = ""
+    # The line id of ``tail`` (M032 SWEEP-26: the wrap-up's L-WRAP-MORE is counted, and used up,
+    # only when it is actually spoken); "" for none.
+    tail_id: str = ""
 
 
 def llm_messages(
@@ -308,7 +364,13 @@ def llm_messages(
         interviewer_prefix(),
         select_context(ordered, reply.phase),
         reply.candidate_text,
-        interviewer_reminder(reply.phase),
+        interviewer_reminder(
+            reply.phase,
+            # M032 SWEEP-26: the wrap-up's sentences, by their rollback flags (read per reply).
+            wrapup_answers=flag_on(FLAG_WRAPUP_ANSWERS),
+            wrapup_one_mention=flag_on(FLAG_WRAPUP_ONE_MENTION),
+            wrapup_next_round=flag_on(FLAG_WRAPUP_NEXT_ROUND),
+        ),
     )
 
 
@@ -440,6 +502,7 @@ def session_facts_event(
     *,
     roleplay_seconds: float,
     first_audio_p95_ms: float | None = None,
+    wrapup: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The one ``session_facts`` row the plan 6.4 gate cannot pass without.
 
@@ -474,5 +537,7 @@ def session_facts_event(
             "learner_timing": _learner_timing(admin),
             "learner_voice": _learner_voice(admin),
             "learner_probe_first": _learner_probe_first(admin),
+            "learner_endings": _learner_endings(admin),
+            "wrapup": _wrapup_counts(wrapup),
         },
     }

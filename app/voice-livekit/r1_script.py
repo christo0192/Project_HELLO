@@ -79,6 +79,12 @@ LINES: dict[str, str] = {
     # candidate who asks for feedback hears it once, not twice a few seconds apart.
     "L-NO-FEEDBACK": "I'm sorry, I can't share any feedback on how it went.",
     "L-FAQ-DEFER": "That's a good question for the hiring team; they'll follow up with you on it.",
+    # M032 S3.5 and SWEEP-26 (flags R1_WRAPUP_ANSWERS and R1_WRAPUP_ONE_MENTION).  The wrap-up's
+    # one invitation for another question (a tail of Christy's answer, once per session), and her
+    # deflection in the wrap-up and the closing in place of L-FAQ-DEFER: L-CLOSE is the one mention
+    # of the hiring team.  Both travel inside a reply stream, so neither is warmed.
+    "L-WRAP-MORE": "Is there anything else you'd like to ask?",
+    "L-FAQ-DEFER-WRAP": "I'm afraid that's not something I can tell you.",
     "L-CLOSE": (
         "Thank you for your time today, {first_name}. The hiring team will review your "
         "interview and get back to you. You can close this window now. Goodbye."
@@ -108,6 +114,36 @@ LINES: dict[str, str] = {
         "carry on with {lead_first_name}."
     ),
     "L-ASIDE-WRAP-RESUME": "Of course, let's keep going. {lead_first_name} is back on the line.",
+    # M032 S3.3 (owner decision D-M032-2, flag R1_EARLY_CLOSE_ASIDE): the advisor closes the call in
+    # role before R = 14:00 and no redirect is left, so Christy asks (R paused) instead of the
+    # role-play ending without the candidate's word.  A yes ends it (L-EXIT and the wrap-up), a no
+    # resumes it (L-ASIDE-WRAP-RESUME, then the learner carries on with a real point).  Below R =
+    # 10:00 the variant adds that there is still time (a stop there leaves the attempt unscored).
+    # Owner-approved draft wording (D-M032-4), listed for review.
+    "L-ASIDE-EARLY-CLOSE": (
+        "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
+        "with {lead_first_name}. You're welcome to keep going with her, or if you'd rather stop "
+        "the role-play here, just say so."
+    ),
+    "L-ASIDE-EARLY-CLOSE-TIME": (
+        "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
+        "with {lead_first_name}. We still have some time for the role-play, so you're welcome to "
+        "keep going with her, or if you'd rather stop the role-play here, just say so."
+    ),
+    # M032 SWEEP-24 (flag R1_LATE_END_REQUEST): from R = 14:00 an explicit request to end the
+    # exercise when one owed move would complete the schedule: Christy says it will stop in a
+    # moment (R paused), the learner raises that one point, and the next real turn ends it.
+    "L-ASIDE-LAST-POINT": (
+        "This is Christy, your interviewer. Of course, we'll stop in just a moment; "
+        "{lead_first_name} has one last thing she'd like to say first."
+    ),
+    # M032 S3.4 (owner decision D-M032-3, flag R1_ABUSE_HANGUP): abuse aimed at the learner.  She
+    # ends the call in character in one line (her voice), then Christy asks (R paused); a yes ends
+    # the role-play, a no resumes it (L-ASIDE-WRAP-RESUME) with her cool.  Scoring is unchanged.
+    "L-LEARNER-HANGUP": "I don't think I want to continue this call. Goodbye.",
+    "L-ASIDE-HANGUP": (
+        "{lead_first_name} has ended the call. Shall we pause the role-play here and move on?"
+    ),
     # M2: the end of the role-play's time (R = 20:00, or its S cap) is never abrupt: after the
     # 17:00 time cue, the learner closes in role with this line, and then L-EXIT follows.
     "L-TIME-UP": "I'm sorry, I really have to go now. Thank you for your time.",

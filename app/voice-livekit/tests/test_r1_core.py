@@ -4194,6 +4194,166 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
         self.assertTrue(r1_session.is_no_questions("No, thank you, Christie."))
 
 
+class TestWrapupEndingsM032(R1TestCase):
+    """M032 S3.5 and SWEEP-26: the wrap-up says what is left, invites one more question, and
+    "No, we are good." ends it (fda9e9f6 #94-95, a95398ab #66-68; synthetic text only)."""
+
+    MORE = "Is there anything else you'd like to ask?"
+
+    def enter_wrapup(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()
+        self.interview.machine.transition(R1Phase.WRAPUP)
+
+    async def answered(self, question: str, *answer: str) -> str:
+        """The interviewer's reply to ``question`` as streamed (the guard and the tail)."""
+        self.interview.prepare_turn(question, f"msg_{next(_IDS)}")
+        stream = self.interview.llm_node_stream(
+            SimpleNamespace(items=[]), lambda _messages: self_stream(*answer)
+        )
+        return "".join([chunk async for chunk in stream]).strip()
+
+    def test_we_are_good_refuses_like_im_good(self) -> None:
+        for text in ("No, we are good.", "We're good.", "No no, we're all set, thank you.",
+                     "We are good, thanks Christy.", "All good.", "Nothing from my side."):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_no_questions(text))
+        for text in ("We're good?", "We're good, but what is the salary?",
+                     "We are good at sales, what is the next round?"):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_no_questions(text))
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_DECLINE_V2": "0"}):
+            self.assertFalse(r1_session.is_no_questions("No, we are good."))
+            self.assertTrue(r1_session.is_no_questions("All good."))  # as before
+
+    def test_a_bare_yes_or_leave_to_ask_is_no_question_of_its_own(self) -> None:
+        for text in ("Yes.", "Yeah, one more.", "Can I ask one more?", "Yes, I have a question.",
+                     "Sure, one more question.", "I do."):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_affirmation_only(text))
+        for text in ("Yes, what is the salary?", "Okay.", "One more thing: the shift timings?",
+                     "Can I ask about the notice period?"):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_affirmation_only(text))
+
+    async def test_the_first_answer_ends_with_the_invitation_once(self) -> None:
+        self.enter_wrapup()
+        first = await self.answered("What are the shift timings?", "Monday to Friday, nights.")
+        self.assertEqual(first, f"Monday to Friday, nights. {self.MORE}")
+        self.assertTrue(self.interview._wrap_more_used)
+        second = await self.answered("And the weekends?", "Saturday is half a day.")
+        self.assertEqual(second, "Saturday is half a day.")
+        self.assertEqual(self.interview._wrapup_counts()["wrapup_more_asked"], 1)
+
+    async def test_no_invitation_after_an_answer_that_already_asks(self) -> None:
+        self.enter_wrapup()
+        asked = await self.answered("What is the role like?", "It is a sales role. Does that help?")
+        self.assertEqual(asked, "It is a sales role. Does that help?")
+        self.assertFalse(self.interview._wrap_more_used)  # not used up: the next answer gets it
+        later = await self.answered("Yes. And the shift?", "Nights, Monday to Friday.")
+        self.assertTrue(later.endswith(self.MORE))
+
+    async def test_no_invitation_late_in_the_wrapup_or_with_the_flag_off(self) -> None:
+        self.enter_wrapup()
+        with mock.patch.object(
+            self.interview.machine, "remaining_wrapup_seconds", return_value=29.0
+        ):
+            late = await self.answered("What is the shift?", "Nights.")
+        self.assertEqual(late, "Nights.")
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_ANSWERS": "0"}):
+            off = await self.answered("What is the shift?", "Nights.")
+        self.assertEqual(off, "Nights.")
+        self.assertFalse(self.interview._wrap_more_used)
+
+    async def test_the_hiring_team_mention_of_the_model_is_taken_out(self) -> None:
+        self.enter_wrapup()
+        said = await self.answered(
+            "Is any part of the interview left?",
+            "That's everything for today's interview.",
+            "The hiring team will follow up with you on next steps.",
+        )
+        self.assertEqual(said, f"That's everything for today's interview. {self.MORE}")
+        self.assertEqual(self.interview._wrapup_counts()["wrapup_hiring_team_drops"], 1)
+        self.assertNotIn("hiring", said.lower())
+
+    async def test_a_yes_does_not_use_up_a_question_so_the_invited_one_is_answered(self) -> None:
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02), mock.patch.object(
+            r1_session, "REPLY_SETTLE_SECONDS", 0.05
+        ):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            self.final_transcript("What are the shift timings?")
+            await self.settle()
+            self.final_transcript("Yes.")
+            await self.settle()
+            await asyncio.sleep(0.1)
+            self.assertFalse(task.done(), "a bare yes is not the second question")
+            self.final_transcript("How many days a week is it?")
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))  # the limit of two: the close
+        self.assertEqual(self.interview._wrapup_counts()["wrapup_affirmations"], 1)
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_ANSWERS": "0"}), mock.patch.object(
+            r1_session, "REPLY_SETTLE_SECONDS", 0.05
+        ):
+            await self.asyncSetUp()
+            self.enter_wrapup()
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            self.final_transcript("What are the shift timings?")
+            await self.settle()
+            self.final_transcript("Yes.")
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))  # flag off: it counted
+
+    async def test_the_owed_answer_said_again_has_no_invitation(self) -> None:
+        self.enter_wrapup()
+        owed = r1_session.Reply(
+            phase="wrapup", candidate_text="What is next?", tail=self.MORE, tail_id="L-WRAP-MORE"
+        )
+        self.interview._wrapup_answer_owed = owed
+        with mock.patch.object(r1_session, "REPLY_SETTLE_SECONDS", 0.05):
+            self.assertIsNone(await asyncio.wait_for(self.interview._end_wrapup(), 5.0))
+        self.assertEqual(len(self.session.generated), 1)
+        self.assertEqual((owed.tail, owed.tail_id), ("", ""))
+
+    async def test_a_beat_after_the_exit_line_and_a_turn_in_it_is_waited_for(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()
+        with mock.patch.object(r1_session, "WRAP_BEAT_SECONDS", 0.05):
+            self.user_state("speaking")
+            task = asyncio.create_task(self.interview._wrap_beat())
+            await asyncio.sleep(0.15)
+            self.assertFalse(task.done(), "L-WRAP would be said over the candidate")
+            self.user_state("listening")
+            await asyncio.wait_for(task, 5.0)
+        self.assertEqual(self.interview._wrapup_counts()["wrap_beat_turns"], 1)
+        # A turn committed inside the beat gets no reply of its own (L-WRAP invites it).
+        self.assertTrue(await self.commit_turn("Thank you, that was fun."))
+        # Nothing in flight: the beat alone, and none at all with the flag off.
+        with mock.patch.object(r1_session, "WRAP_BEAT_SECONDS", 0.05):
+            started = asyncio.get_running_loop().time()
+            await self.interview._wrap_beat()
+            self.assertGreaterEqual(asyncio.get_running_loop().time() - started, 0.04)
+            with mock.patch.dict(os.environ, {"R1_WRAPUP_DECLINE_V2": "0"}):
+                started = asyncio.get_running_loop().time()
+                await self.interview._wrap_beat()
+                self.assertLess(asyncio.get_running_loop().time() - started, 0.04)
+        self.assertEqual(self.interview._wrapup_counts()["wrap_beat_turns"], 1)
+
+    def test_the_counts_ride_along_in_session_facts_as_counts_only(self) -> None:
+        facts = r1_session.session_facts_event(
+            None,
+            {},
+            roleplay_seconds=1.0,
+            wrapup={"wrapup_more_asked": 1, "wrapup_hiring_team_drops": 2, "text": "never sent",
+                    "wrap_beat_turns": -1},
+        )["payload"]["wrapup"]
+        self.assertEqual(facts["wrapup_more_asked"], 1)
+        self.assertEqual(facts["wrapup_hiring_team_drops"], 2)
+        self.assertIsNone(facts["wrap_beat_turns"])
+        self.assertNotIn("text", facts)
+        self.assertIsNone(facts["wrapup_affirmations"])
+
+
 class TestUnknownAndSpokenFirstName(R1TestCase):
     """R1-Q item 6: "Thank you, there." is never spoken; the name the candidate gave is used.
 

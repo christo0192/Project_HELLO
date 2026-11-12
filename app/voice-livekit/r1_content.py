@@ -175,7 +175,15 @@ import r1_world
 #    prefix and the reminders are the release before.
 #    After the S2P review (still revision 23, unreleased): the first money stall about a price the
 #    advisor named has its own three variants, none with "still" (they rotate by seed).
-CONTENT_REVISION = 23
+# 24: M032 S3, endings and abuse (owner decisions D-M032-2, D-M032-3 and D-M032-4; rollback flags
+#    R1_CLOSING_STATE, R1_EARLY_CLOSE_ASIDE, R1_ABUSE_HANGUP, R1_LATE_END_REQUEST, R1_WEAK_EMAIL_V2,
+#    R1_COMMIT_REACTION_V2, R1_TIME_CUE_V2, R1_WRAPUP_DECLINE_V2, R1_WRAPUP_ANSWERS,
+#    R1_WRAPUP_ONE_MENTION and R1_WRAPUP_NEXT_ROUND).  The early-close, last-point and hang-up
+#    asides, the learner's hang-up line, the wrap-up's invitation (L-WRAP-MORE) and deflection
+#    (L-FAQ-DEFER-WRAP) join the script; the wrap-up reminder's flagged sentences and the endings'
+#    notes join the manifest (``_endings``).  Markers, deadlines, the scorer's facts and every text
+#    of the release before are unchanged; with every flag off the reminders are the release before.
+CONTENT_REVISION = 24
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -379,6 +387,28 @@ def _probe_first(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
             "conflict_min_gap_usd": n.CONFLICT_MIN_GAP_USD,
             "max_conflicts": n.MAX_CONFLICTS,
             "rise_min_usd": n.RISE_MIN_USD,
+        },
+    }
+
+
+def _endings() -> dict[str, Any]:
+    """M032 S3 (revision 24): the endings' and the wrap-up's new texts and constants."""
+    p = r1_prompts
+    return {
+        "wrapup": {
+            "everything_line": p.WRAPUP_EVERYTHING_LINE,
+            "next_round_line": p.WRAPUP_NEXT_ROUND_LINE,
+            "whats_left_note": p.WRAPUP_WHATS_LEFT_NOTE,
+            "cannot_answer_note": p.WRAPUP_CANNOT_ANSWER_NOTE,
+            "reminders": {
+                f"answers={answers},one_mention={one},next_round={nxt}": p.wrapup_reminder(
+                    answers=answers, one_mention=one, next_round=nxt
+                )
+                for answers in (False, True)
+                for one in (False, True)
+                for nxt in (False, True)
+            },
+            "own_content_words": r1_guard.OWN_CONTENT_WORDS,
         },
     }
 
@@ -660,6 +690,7 @@ def manifest() -> dict[str, Any]:
             "hollow_concerns_note": r1_prompts.HOLLOW_CONCERNS_NOTE,
             "learner_voice_v2": _learner_voice_v2(sample),
             "probe_first": _probe_first(sample),
+            "endings": _endings(),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

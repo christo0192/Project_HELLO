@@ -129,6 +129,7 @@ from r1_commitment import (
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
     COURSE_FACT,
+    ONE_MENTION_PHASES,
     QUESTION_DIET_WINDOW,
     REPEAT,
     GuardContext,
@@ -614,7 +615,38 @@ FLAG_PROBE_FIRST = "R1_PROBE_FIRST"
 FLAG_OFFER_READER_V2 = "R1_OFFER_READER_V2"
 FLAG_COUNTER_V2 = "R1_COUNTER_V2"
 FLAG_PRICE_CONFLICT = "R1_PRICE_CONFLICT"
+# M032 S3, endings and abuse (owner decisions D-M032-2, D-M032-3 and D-M032-4), each default ON with
+# the same rollback, except R1_WRAPUP_NEXT_ROUND (default OFF until the owner and HR confirm the
+# second round):
+#
+# * R1_CLOSING_STATE (S3.1, S3.2): an advisor's hand-over close ("call me back later", "get back to
+#   me") and a courtesy turn after her own sign-off are read as closes; the engine's closing state
+#   (OPEN, WINDING, CLOSED) gives a free reply in WINDING one short goodbye and no new question; and
+#   HOLD_NOTE no longer tells her to keep the conversation going.
+# * R1_EARLY_CLOSE_ASIDE (S3.3): before R = 14:00 an in-role close the ladder would end the
+#   role-play on is asked about instead (L-ASIDE-EARLY-CLOSE, at most twice); a yes ends it, a no
+#   resumes it and the learner carries on with a real point.
+# * R1_ABUSE_HANGUP (S3.4): abuse aimed at her ends the call in character (L-LEARNER-HANGUP), and
+#   Christy asks (L-ASIDE-HANGUP); scoring is unchanged.
+# * R1_LATE_END_REQUEST (SWEEP-24): from R = 14:00 an explicit request to end the exercise is
+#   never answered in role: it exits, or (one owed move left) L-ASIDE-LAST-POINT and that point.
+# * R1_WEAK_EMAIL_V2 and R1_COMMIT_REACTION_V2 (SWEEP-25), R1_TIME_CUE_V2 (SWEEP-27), and the
+#   wrap-up's R1_WRAPUP_DECLINE_V2 (S3.5), R1_WRAPUP_ANSWERS, R1_WRAPUP_ONE_MENTION and
+#   R1_WRAPUP_NEXT_ROUND (SWEEP-26), read by the session.
+FLAG_CLOSING_STATE = "R1_CLOSING_STATE"
+FLAG_EARLY_CLOSE_ASIDE = "R1_EARLY_CLOSE_ASIDE"
+FLAG_ABUSE_HANGUP = "R1_ABUSE_HANGUP"
+FLAG_LATE_END_REQUEST = "R1_LATE_END_REQUEST"
+FLAG_WEAK_EMAIL_V2 = "R1_WEAK_EMAIL_V2"
+FLAG_COMMIT_REACTION_V2 = "R1_COMMIT_REACTION_V2"
+FLAG_TIME_CUE_V2 = "R1_TIME_CUE_V2"
+FLAG_WRAPUP_DECLINE_V2 = "R1_WRAPUP_DECLINE_V2"
+FLAG_WRAPUP_ANSWERS = "R1_WRAPUP_ANSWERS"
+FLAG_WRAPUP_ONE_MENTION = "R1_WRAPUP_ONE_MENTION"
+FLAG_WRAPUP_NEXT_ROUND = "R1_WRAPUP_NEXT_ROUND"
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+# The flags that are OFF unless set (every other flag is on unless set to 0/off/false/no).
+_FLAG_DEFAULT_OFF = frozenset({FLAG_WRAPUP_NEXT_ROUND})
 # One literal read per flag, so the repository's env-contract scanner (and
 # config/environment.schema.json) sees every one of them (review S1R-7).
 _FLAG_READS = {
@@ -634,12 +666,27 @@ _FLAG_READS = {
     FLAG_OFFER_READER_V2: lambda: os.getenv("R1_OFFER_READER_V2"),
     FLAG_COUNTER_V2: lambda: os.getenv("R1_COUNTER_V2"),
     FLAG_PRICE_CONFLICT: lambda: os.getenv("R1_PRICE_CONFLICT"),
+    FLAG_CLOSING_STATE: lambda: os.getenv("R1_CLOSING_STATE"),
+    FLAG_EARLY_CLOSE_ASIDE: lambda: os.getenv("R1_EARLY_CLOSE_ASIDE"),
+    FLAG_ABUSE_HANGUP: lambda: os.getenv("R1_ABUSE_HANGUP"),
+    FLAG_LATE_END_REQUEST: lambda: os.getenv("R1_LATE_END_REQUEST"),
+    FLAG_WEAK_EMAIL_V2: lambda: os.getenv("R1_WEAK_EMAIL_V2"),
+    FLAG_COMMIT_REACTION_V2: lambda: os.getenv("R1_COMMIT_REACTION_V2"),
+    FLAG_TIME_CUE_V2: lambda: os.getenv("R1_TIME_CUE_V2"),
+    FLAG_WRAPUP_DECLINE_V2: lambda: os.getenv("R1_WRAPUP_DECLINE_V2"),
+    FLAG_WRAPUP_ANSWERS: lambda: os.getenv("R1_WRAPUP_ANSWERS"),
+    FLAG_WRAPUP_ONE_MENTION: lambda: os.getenv("R1_WRAPUP_ONE_MENTION"),
+    FLAG_WRAPUP_NEXT_ROUND: lambda: os.getenv("R1_WRAPUP_NEXT_ROUND"),
 }
 
 
 def flag_on(name: str) -> bool:
-    """An M032 rollback flag, read now: unset or anything but 0/off/false/no is on."""
-    return (_FLAG_READS[name]() or "1").strip().lower() not in _FLAG_OFF_VALUES
+    """An M032 rollback flag, read now: unset or anything but 0/off/false/no is on.
+
+    A flag in ``_FLAG_DEFAULT_OFF`` (R1_WRAPUP_NEXT_ROUND) is off while unset instead.
+    """
+    raw = _FLAG_READS[name]() or ("0" if name in _FLAG_DEFAULT_OFF else "1")
+    return raw.strip().lower() not in _FLAG_OFF_VALUES
 
 
 # What the advisor's turn left open for her (S1 item 2), in the order the notes are added.
@@ -1224,8 +1271,16 @@ class RolePlayEngine:
         carries_move: bool = False,
         reask: tuple[str, ...] = (),
         must_say: tuple[str, ...] = (),
+        winding: bool = False,
+        closing_exempt: bool = False,
+        reaction_only: bool = False,
     ) -> GuardContext:
         """The guard context for an LLM reply now.
+
+        M032 S3: ``winding`` and ``closing_exempt`` (R1_CLOSING_STATE: the advisor is closing the
+        call, so one short goodbye passes), ``reaction_only`` (R1_COMMIT_REACTION_V2: the 19:00
+        reaction before the WEAK line says no goodbye), and Christy's wrap-up and closing name the
+        hiring team only in L-CLOSE (R1_WRAPUP_ONE_MENTION, ``one_mention``).
 
         M032 S2P (SWEEP-17, the session's latched R1_PROBE_FIRST): the card's figures are gone, so
         the context carries the amounts and course lengths this reply may say beyond it (the plan's
@@ -1304,6 +1359,11 @@ class RolePlayEngine:
             probe_first=self._probe_first,
             allowed_extra=extra_amounts,
             advisor_durations=extra_months,
+            # M032 SWEEP-26: Christy's wrap-up and closing name the hiring team only in L-CLOSE.
+            one_mention=phase in ONE_MENTION_PHASES and flag_on(FLAG_WRAPUP_ONE_MENTION),
+            winding=winding,
+            closing_exempt=closing_exempt,
+            reaction_only=reaction_only,
         )
 
     def _offer_on_table(self) -> int | None:

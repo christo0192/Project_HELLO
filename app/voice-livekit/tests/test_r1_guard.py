@@ -921,12 +921,14 @@ class AckHygieneTests(unittest.TestCase):
 
     def test_only_hygiene_categories_are_outside_the_leak_categories(self):
         # M032 SWEEP-17: a course length she was never told is hygiene, never posted to the gate.
+        # M032 SWEEP-26: so is Christy's hiring-team mention in the wrap-up (L-CLOSE names it).
         hygiene = {
             r1_guard.ACK_FORMAT,
             r1_guard.REPEAT,
             r1_guard.REOPEN,
             r1_guard.MISREAD,
             r1_guard.COURSE_FACT,
+            r1_guard.HIRING_MENTION,
         }
         self.assertEqual(set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES), hygiene)
         self.assertEqual(r1_guard.HYGIENE_CATEGORIES, frozenset(hygiene))
@@ -2827,6 +2829,122 @@ class ProbeFirstGuardTests(unittest.TestCase):
         r1_guard.course_length_unsaid(hostile, persona=resolve_persona("p4_research_scholar"))
         r1_guard.durations_said(hostile)
         self.assertLess(time.perf_counter() - start, 2.0)
+
+
+class WrapupOneMentionGuardTests(unittest.TestCase):
+    """M032 SWEEP-26 (R1_WRAPUP_ONE_MENTION): the hiring team is named once, by L-CLOSE.
+
+    a95398ab #66-68 and 199e97c2 #91-93: L-FAQ-DEFER ("a good question for the hiring team") came
+    seconds before L-CLOSE ("The hiring team will review your interview"), and fda9e9f6 #95 broke the
+    reminder's "do not mention the hiring team".  Synthetic sentences only.
+    """
+
+    WRAP = r1_guard.FAQ_DEFER_WRAP_LINE
+
+    def ctx(self, phase="wrapup", one_mention=True):
+        return GuardContext(phase=phase, one_mention=one_mention)
+
+    def test_the_new_line_is_the_scripted_one(self):
+        self.assertEqual(self.WRAP, "I'm afraid that's not something I can tell you.")
+        self.assertNotIn("hiring", self.WRAP.lower())
+
+    def test_hiring_and_invented_facts_get_the_wrap_deflection_in_the_wrap_up_and_closing(self):
+        for phase in ("wrapup", "closing"):
+            for text in (
+                "We'll call you for the next round.",
+                "If you're shortlisted, you will hear back soon.",
+                "The salary is ten lakhs a year.",
+            ):
+                with self.subTest(phase=phase, text=text):
+                    result = guard_text(text, self.ctx(phase))
+                    self.assertEqual(result.text, self.WRAP)
+                    self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+
+    def test_other_phases_keep_the_interviewer_deflection(self):
+        for phase in ("icebreaker", "transition", "opening"):
+            for one_mention in (True, False):
+                with self.subTest(phase=phase, one_mention=one_mention):
+                    result = guard_text(
+                        "We'll call you for the next round.", self.ctx(phase, one_mention)
+                    )
+                    self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+                    result = guard_text(
+                        "The hiring team will be in touch.", self.ctx(phase, one_mention)
+                    )
+                    self.assertEqual(result.text, "The hiring team will be in touch.")
+
+    def test_a_hiring_team_sentence_after_content_is_dropped(self):
+        result = guard_text(
+            "Great, that's all from my side. The hiring team will follow up with you on next "
+            "steps.",
+            self.ctx(),
+        )
+        self.assertEqual(result.text, "Great, that's all from my side.")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.HIRING_MENTION])
+
+    def test_after_an_acknowledgement_alone_it_is_replaced(self):
+        result = guard_text(
+            "That's a good question. The hiring team will follow up on that.", self.ctx()
+        )
+        self.assertEqual(result.text, f"That's a good question. {self.WRAP}")
+        result = guard_text("The hiring team will be in touch with you about that.", self.ctx())
+        self.assertEqual(result.text, self.WRAP)
+
+    def test_the_old_deflection_said_by_the_model_is_replaced_once_per_reply(self):
+        result = guard_text(f"{INTERVIEWER_DEFLECTION} {INTERVIEWER_DEFLECTION}", self.ctx())
+        self.assertEqual(result.text, self.WRAP)
+        result = guard_text(
+            "The hiring manager decides that. The hiring panel will tell you.", self.ctx()
+        )
+        self.assertEqual(result.text, self.WRAP)
+
+    def test_flag_off_is_the_release_before(self):
+        for text in (
+            "Great, that's all from my side. The hiring team will follow up with you on next "
+            "steps.",
+            "That's a good question. The hiring team will follow up on that.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(one_mention=False)).text, text)
+        self.assertEqual(
+            guard_text("We'll call you for the next round.", self.ctx(one_mention=False)).text,
+            INTERVIEWER_DEFLECTION,
+        )
+
+    def test_the_new_category_is_hygiene_and_never_a_leak(self):
+        self.assertIn(r1_guard.HIRING_MENTION, r1_guard.CATEGORIES)
+        self.assertIn(r1_guard.HIRING_MENTION, r1_guard.HYGIENE_CATEGORIES)
+        self.assertNotIn(r1_guard.HIRING_MENTION, r1_guard.LEAK_CATEGORIES)
+        ledger = GuardLedger()
+        ledger.record(guard_text("The hiring team will be in touch.", self.ctx()))
+        ledger.record(guard_text("The hiring team will decide.", self.ctx()))
+        ledger.record(guard_text("The hiring panel will tell you.", self.ctx()))
+        self.assertFalse(ledger.flagged)
+
+    def test_paraphrases_still_trip_the_hiring_rule(self):
+        for text in ("We'll call you for the next round.", "If you're shortlisted, we'll email."):
+            with self.subTest(text=text):
+                categories = {hit.category for hit in check_sentence(text, self.ctx())}
+                self.assertIn("hiring_comp", categories)
+
+    def test_the_hiring_team_is_named_once_across_the_wrap_up_lines(self):
+        from r1_script import line
+
+        lines = (
+            line("L-WRAP"),
+            line("L-FAQ-DEFER-WRAP"),
+            line("L-WRAP-MORE"),
+            line("L-CLOSE", first_name="Alex"),
+        )
+        self.assertEqual(sum(text.lower().count("hiring team") for text in lines), 1)
+
+    def test_the_learner_is_never_touched(self):
+        ctx = GuardContext(phase="roleplay", one_mention=True)
+        self.assertEqual(
+            [hit.category for hit in check_sentence("The hiring team liked my profile.", ctx)
+             if hit.category == r1_guard.HIRING_MENTION],
+            [],
+        )
 
 if __name__ == "__main__":
     unittest.main()

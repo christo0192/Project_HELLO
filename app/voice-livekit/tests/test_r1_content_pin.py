@@ -148,7 +148,11 @@ import r1_world
 # LEARNER_POLICY was reworded (world revision 3).  Markers, deadlines and scorer facts unchanged.
 # After the S2P review (still revision 23, unreleased): the first money stall about a named price
 # has its own variants, none with "still" (``N_MONEY_NAMED_VARIANTS``).
-PINNED_CONTENT_SHA256 = "5422c8cef25bcd54915af1025790e8a901b820c3515e3a4ef715f39c32cfd023"
+# Revision 24 (M032 S3, endings and abuse): the early-close, last-point and hang-up asides, the
+# learner's hang-up line and the wrap-up's invitation and deflection join the script; the wrap-up
+# reminder's flagged sentences and the endings' notes join the manifest (``r1_content._endings``).
+# No graded meaning, marker, must-say, deadline or text of the release before changed.
+PINNED_CONTENT_SHA256 = "2a7cf79d18565f3d563cd64ab901ee2f85035a733f10587b7d1387c8e1191620"
 
 CONTENT_MODULES = (
     "r1_text",

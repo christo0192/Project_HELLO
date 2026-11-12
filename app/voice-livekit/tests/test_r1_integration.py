@@ -1157,8 +1157,23 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         messages = wrap.last_messages()
         self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
         self.assertEqual(messages[1], {"role": "system", "content": WRAPUP_NOTE})
-        self.assertEqual(messages[-2], {"role": "system", "content": WRAPUP_REMINDER})
+        # M032 SWEEP-26: with its flags on (the default) the reminder carries the what's-left and
+        # cannot-answer sentences; with them off it is WRAPUP_REMINDER exactly.
+        from r1_prompts import wrapup_reminder
+
+        self.assertEqual(
+            messages[-2],
+            {"role": "system", "content": wrapup_reminder(answers=True, one_mention=True)},
+        )
+        self.assertTrue(WRAPUP_REMINDER.startswith(messages[-2]["content"][:120]))
         self.assertIn("never say goodbye", messages[-2]["content"])
+        with mock.patch.dict(
+            os.environ, {"R1_WRAPUP_ANSWERS": "0", "R1_WRAPUP_ONE_MENTION": "0"}
+        ):
+            await wrap.converse("And what are the shift timings?")
+        self.assertEqual(
+            wrap.last_messages()[-2], {"role": "system", "content": WRAPUP_REMINDER}
+        )
 
     async def test_the_phase_driver_keeps_waiting_through_an_injection(self) -> None:
         rig = Rig()

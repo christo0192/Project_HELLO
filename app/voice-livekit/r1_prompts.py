@@ -24,7 +24,7 @@ from typing import Iterable, Mapping, Sequence
 
 from r1_guard import REPLY_WORD_CAP
 from r1_personas import TOPIC_LABELS, RenderedPersona
-from r1_script import INTERVIEWER_NAME
+from r1_script import INTERVIEWER_NAME, LINES
 from r1_world import AUDIENCE_INTERVIEWER_FAQ, INTERVIEWER_DEFLECTION, facts_for
 
 MONOLOGUE_THRESHOLD_SEC = 60
@@ -627,6 +627,49 @@ WRAPUP_REMINDER = (
     "time, never say goodbye, bye, take care or have a great day, and never ask whether they "
     "have more questions: the interview closes by itself, with its own goodbye."
 )
+# M032 SWEEP-26 (S3.5).  The wrap-up's one merged reminder, by flag: with R1_WRAPUP_ANSWERS a
+# question about what happens next or what is left gets a sentence that adds no fact (with
+# R1_WRAPUP_NEXT_ROUND, default off until the owner and HR confirm it, the second-round sentence,
+# which restates the world's ``role.process``); with R1_WRAPUP_ONE_MENTION a question she cannot
+# answer gets L-FAQ-DEFER-WRAP instead of the prefix's deflection, which names the hiring team that
+# L-CLOSE names.  Inserted after the answer sentence, what's-left first; the interviewer prefix is
+# untouched (byte-stable).  New wording under D-M032-4, listed for review.
+WRAPUP_ANSWER_SENTENCE = "Answer the question in one or two short sentences."
+WRAPUP_EVERYTHING_LINE = "That's everything for today's interview."
+WRAPUP_NEXT_ROUND_LINE = (
+    "That's the end of this round. If you go through, the next one is a functional and culture "
+    "interview."
+)
+WRAPUP_WHATS_LEFT_NOTE = (
+    "If they ask what happens next or whether anything is left, say exactly: \"{line}\""
+)
+WRAPUP_CANNOT_ANSWER_NOTE = (
+    "If you cannot answer a question (pay, work mode, training, timelines, whether they will be "
+    "selected), say exactly: \"{line}\" instead of the line in your instructions, and do not say "
+    "who will follow up."
+)
+
+
+def wrapup_reminder(
+    *, answers: bool = False, one_mention: bool = False, next_round: bool = False
+) -> str:
+    """The wrap-up reminder with the M032 SWEEP-26 sentences its flags turn on (all off: as before).
+
+    ``next_round`` only counts with ``answers`` (it picks the what's-left sentence).
+    """
+    added: list[str] = []
+    if answers:
+        line = WRAPUP_NEXT_ROUND_LINE if next_round else WRAPUP_EVERYTHING_LINE
+        added.append(WRAPUP_WHATS_LEFT_NOTE.format(line=line))
+    if one_mention:
+        added.append(WRAPUP_CANNOT_ANSWER_NOTE.format(line=LINES["L-FAQ-DEFER-WRAP"]))
+    if not added:
+        return WRAPUP_REMINDER
+    return WRAPUP_REMINDER.replace(
+        WRAPUP_ANSWER_SENTENCE, " ".join((WRAPUP_ANSWER_SENTENCE, *added)), 1
+    )
+
+
 # The phases whose replies answer the candidate's questions after the role-play.
 _WRAPUP_PHASES = frozenset({"wrapup", "closing"})
 # Owner decision 2026-11-03 (M1): after the brief the candidate may ask Christy up to three
@@ -677,7 +720,13 @@ def interviewer_prefix() -> str:
     )
 
 
-def interviewer_reminder(phase: str) -> str | None:
+def interviewer_reminder(
+    phase: str,
+    *,
+    wrapup_answers: bool = False,
+    wrapup_one_mention: bool = False,
+    wrapup_next_round: bool = False,
+) -> str | None:
     """The ephemeral note for an interviewer-phase reply (``None`` where the prefix is enough).
 
     The prefix is byte-stable for the whole session (the DeepSeek cache prefix) and has no
@@ -692,11 +741,16 @@ def interviewer_reminder(phase: str) -> str | None:
 
     The transition (owner decision 2026-11-03) answers the candidate's questions before the
     role-play: its note keeps the model to the role facts and away from starting the role-play.
+
+    M032 SWEEP-26: the wrap-up's flags (the session reads them) add its what's-left and
+    cannot-answer sentences (``wrapup_reminder``).
     """
     if phase in _GETTING_TO_KNOW_YOU_PHASES:
         return GETTING_TO_KNOW_YOU_NOTE
     if phase in _WRAPUP_PHASES:
-        return WRAPUP_REMINDER
+        return wrapup_reminder(
+            answers=wrapup_answers, one_mention=wrapup_one_mention, next_round=wrapup_next_round
+        )
     if phase in _TRANSITION_PHASES:
         return TRANSITION_REMINDER
     return None
