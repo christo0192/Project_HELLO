@@ -566,6 +566,87 @@ def is_closer(text: object) -> bool:
 
 
 # ----------------------------------------------------------------------------------
+# M032 S3 (endings).  Readers of the learner's own sign-off and of what a reaction before the
+# scripted WEAK line must not say.  Every quantifier is bounded; nothing here trims a reply by
+# itself (the guard and the engine decide).
+# ----------------------------------------------------------------------------------
+# S3.1 (RCA END-1 missed item: her sign-offs #80-#90 matched neither CLOSER nor STALL_CLOSER): her
+# real sign-off forms, besides ``CLOSER``.  "I'll get back to you" and "let me think it over" are
+# also the stall (``STALL_CLOSER``), so they count as a sign-off only under the two-part rule of
+# ``is_sign_off`` (the phrase ends the line and the line asks nothing) and only on a line that
+# carried no owed move or negotiation line (the engine's rule).
+SIGN_OFF = re.compile(
+    r"\b(?:i(?:'ll| will)|let me|i(?:'d| would) like to|i need to|i want to|i should) "
+    r"(?:think (?:it|this|things) (?:over|through)|get back to you|give (?:it|this) (?:some )?"
+    r"(?:proper |real |more |serious )?thought|take (?:some|a (?:bit|little) of) time"
+    r"(?: (?:on|over|with) (?:it|this))?|sit with (?:it|this)|sleep on (?:it|this))"
+    r"(?: (?:first|properly|for a (?:bit|while|day or two)|on my (?:own|end)|tonight|"
+    r"and get back to you|and come back to you))?"
+    r"|\b(?:let'?s|i'?ll|i will|we can) leave it (?:there|at that)\b",
+    re.IGNORECASE,
+)
+# What may follow the sign-off phrase at the end of the line: courtesy only.
+_SIGN_OFF_TAIL = re.compile(
+    r"^(?:[\s,.!-]*(?:then|now|for now|thanks?(?: you)?(?: so much)?(?: again)?|bye|goodbye|"
+    r"take care|okay|ok|alright))*[\s,.!-]*$",
+    re.IGNORECASE,
+)
+
+
+def is_sign_off(text: object) -> bool:
+    """S3.1: the learner's line signs off (its last sentence ENDS on a sign-off; nothing asked).
+
+    ``CLOSER`` ("Thanks for your time.", "Take care.") or one of her real forms (``SIGN_OFF``: "I'll
+    think it over", "I'll get back to you", "let me give it some proper thought", "I'll take some
+    time", "I'll sit with it", "let's leave it there"), followed by courtesy alone.  A line with a
+    question mark is never a sign-off ("I'll think it over, but what about the EMI?").
+    """
+    folded = fold(text)
+    if "?" in folded:
+        return False
+    sentences = split_sentences(folded)
+    if not sentences:
+        return False
+    last = sentences[-1]
+    for pattern in (SIGN_OFF, CLOSER):
+        for match in pattern.finditer(last):
+            if _SIGN_OFF_TAIL.match(last[match.end():]) is not None:
+                return True
+    return False
+
+
+# SWEEP-25 B: "I should go now", "I need to get going": she is leaving.  ("I'll let you go" is a
+# ``CLOSER``.)  And A2: her own request for the details by e-mail ("Could you just e-mail me the
+# details instead?", "send those over").
+LEAVE_TAKING = re.compile(
+    r"\bi(?:'ve got to| (?:should|must|need to|have to|gotta|got to)) "
+    r"(?:go|run|head off|hop off|jump off|get going|leave)\b",
+    re.IGNORECASE,
+)
+LEARNER_EMAIL_REQUEST = re.compile(
+    r"\b(?:e-?mail|send) me (?:the |those |all the )?(?:details|info|information|documents?|"
+    r"brochures?|it|that)\b"
+    r"|\bsend (?:it|them|those|the details|the documents?) (?:over|across|by e-?mail|on e-?mail|"
+    r"to my (?:e-?mail|inbox))\b"
+    r"|\bby e-?mail instead\b",
+    re.IGNORECASE,
+)
+
+
+def says_goodbye_or_sends(text: object) -> bool:
+    """SWEEP-25 B: a sentence the 19:00 reaction must not say.
+
+    A goodbye or sign-off, the stall, that she has to go, or a request for the e-mail (the
+    scripted WEAK line says that, once).
+    """
+    folded = fold(text)
+    return any(
+        pattern.search(folded) is not None
+        for pattern in (CLOSER, SIGN_OFF, STALL_CLOSER, LEAVE_TAKING, LEARNER_EMAIL_REQUEST)
+    )
+
+
+# ----------------------------------------------------------------------------------
 # M032 S2 (owner decision D-M032-4): readers of the LEARNER's own lines, for the next reply's
 # steering notes and for counts.  None of them ever trims a reply (SWEEP-4: a trimmed reply can be
 # emptied, and an emptied free reply speaks "Give me a second ...").  Every quantifier is bounded.

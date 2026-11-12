@@ -410,6 +410,11 @@ def _endings() -> dict[str, Any]:
             },
             "own_content_words": r1_guard.OWN_CONTENT_WORDS,
         },
+        # SWEEP-25 B and SWEEP-27.
+        "commit_reaction_brief_v2": r1_negotiation.COMMIT_REACTION_BRIEF_V2,
+        "time_cue_brief_v2": r1_scheduler.TIME_CUE_BRIEF_V2,
+        "short_on_time_note": p.SHORT_ON_TIME_NOTE,
+        "short_on_time_concerns_note": p.SHORT_ON_TIME_CONCERNS_NOTE,
     }
 
 

@@ -631,6 +631,13 @@ def probe_first_texts(move_id: str) -> tuple[str, str, str, tuple[str, ...]] | N
 # R1-Q iteration 3.  "before my (own) next call" came back verbatim in 8 of 20 calls, also from a
 # learner who was at home after work.  The cue is the same move said three ways (rotated by the
 # attempt id); the markers accept all three.
+# M032 SWEEP-27 (flag R1_TIME_CUE_V2; a95398ab p1): the first brief put her on "YOUR own next call"
+# although she is at home after work.  The neutral wording replaces it while the flag is on (the
+# spec's brief, pinned, is unchanged for the flag off); the markers already take "get going".
+TIME_CUE_BRIEF_V2 = (
+    "you tell the advisor that YOU only have a couple of minutes left before you need to get "
+    "going; it is your time that is short, not theirs"
+)
 TIME_CUE_BRIEF_ALTERNATIVES = (
     "you tell the advisor that YOU can only stay for a couple more minutes because something else "
     "is coming up for you; it is your time that is short, not theirs",

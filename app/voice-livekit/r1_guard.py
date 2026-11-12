@@ -126,6 +126,7 @@ from r1_text import (
     STRETCH_PHRASE,
     repeat_kind,
     reply_opener,
+    says_goodbye_or_sends,
     split_sentences,
     truncate_words,
     word_count,
@@ -1402,6 +1403,11 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     hits: list[Hit] = []
     if _LEARNER_META.search(sentence):
         hits.append(_hit(META, "learner_meta", sentence))
+    if ctx.reaction_only and says_goodbye_or_sends(sentence):
+        # M032 SWEEP-25 B: the 19:00 reaction says no goodbye, no "I have to go" and no e-mail
+        # request (the scripted WEAK line follows and says that, once).  Hygiene: the sentence is
+        # dropped; an emptied reaction leaves the WEAK line alone (``quiet_empty``).
+        hits.append(_hit(MISREAD, "reaction_leave_taking", sentence))
     persona = ctx.persona
     if persona is not None:
         for topic in H_TOPICS:

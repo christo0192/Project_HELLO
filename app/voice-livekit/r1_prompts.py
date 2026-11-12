@@ -185,6 +185,21 @@ ANSWERED_YOU_NOTE = (
 )
 # RCA END-5 (fda9e9f6 #73-#74): a hand-back (talk it over, then come back to us) was not heard
 # as easing off.
+# M032 SWEEP-27 (flag R1_TIME_CUE_V2): once she has said she only has a few minutes, a free reply
+# stays short and opens nothing new (a95398ab: a new course question two turns after "I need to hop
+# off").  Merged with the concern ledger's and the hollow-advisor notes rather than stacked on them.
+# New wording under D-M032-4, listed for review.
+SHORT_ON_TIME_NOTE = (
+    "- You told the advisor you only have a few minutes left. Keep this reply short: respond to "
+    "what they just said, answer anything they asked, and do not bring up a new question or a "
+    "new worry."
+)
+SHORT_ON_TIME_CONCERNS_NOTE = (
+    "- You told the advisor you only have a few minutes left, and you have already told them "
+    "{concerns}, so do not say that again in any words. Keep this reply short: respond to what "
+    "they just said, answer anything they asked, and do not bring up a new question or a new "
+    "worry."
+)
 PRESSURE_EASED_NOTE = (
     "- The advisor just gave you time. Acknowledge it warmly in a few words and do not bring up "
     "the earlier pressure again."

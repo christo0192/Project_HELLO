@@ -146,6 +146,7 @@ from r1_negotiation import (
     ANCHOR_STATED_CONFLICT,
     ANCHOR_USD,
     COMMIT_REACTION_BRIEF,
+    COMMIT_REACTION_BRIEF_V2,
     CONFLICT_RISE,
     CONFLICT_WEBSITE,
     IMPLAUSIBLE_FREE,
@@ -260,6 +261,8 @@ from r1_prompts import (
     PUSH_REACT_NOTE,
     PUSH_REACT_NOTE_V2,
     RESOLVED_NOTE,
+    SHORT_ON_TIME_CONCERNS_NOTE,
+    SHORT_ON_TIME_NOTE,
     SOFT_TIC_NOTE,
     STRETCH_USED_NOTE,
     STYLE_NOTES,
@@ -305,6 +308,7 @@ from r1_scheduler import (
     REDIRECT_OPENERS,
     TIME_CUE,
     TIME_CUE_BRIEF_ALTERNATIVES,
+    TIME_CUE_BRIEF_V2,
     PROBE_F1,
     PROBE_F1_AGAIN,
     PROBE_F1_CLARIFY,
@@ -336,6 +340,7 @@ from r1_scheduler import (
 from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
 from r1_text import (
+    LEARNER_EMAIL_REQUEST,
     PHRASE_DECIDER_STALL,
     PHRASE_STRETCH,
     PHRASE_TEMPLATE_Q,
@@ -812,6 +817,34 @@ _CHALLENGE_FIGURE = re.compile(
 )
 
 
+# M032 SWEEP-25 A2: the advisor agrees to e-mail what she asked for ("Sure, I can do that.", "Of
+# course, will do."): a short turn that opens with an agreement, asks nothing and declines nothing
+# ("Sure, but let's decide now." is no agreement).
+_AGREES = re.compile(
+    r"^\W*(?:(?:sure|of course|yes|yeah|yep|absolutely|definitely|no problem|no worries|"
+    r"will do|i can do that|i(?:'ll| will) do that|done|okay|ok|alright)\b[\s,.!]*){1,4}",
+    re.IGNORECASE,
+)
+_AGREE_DECLINE = re.compile(
+    r"\b(?:but|however|instead|rather|can'?t|cannot|won'?t|not|no need|"
+    r"let'?s (?:decide|do it|finish|close|lock|go ahead)|decide (?:now|today|right now)|"
+    r"enrol\w*|pay|payment|sign up)\b",
+    re.IGNORECASE,
+)
+AGREE_MAX_WORDS = 15
+
+
+def agrees_to_send(text: object) -> bool:
+    """SWEEP-25 A2: a short advisor turn that agrees to send what she asked for."""
+    folded = fold(text)
+    return (
+        "?" not in folded
+        and word_count(folded) <= AGREE_MAX_WORDS
+        and _AGREES.match(folded) is not None
+        and _AGREE_DECLINE.search(folded) is None
+    )
+
+
 def challenges_figure(text: object) -> bool:
     """The advisor says he never said the course length she used (SWEEP-17 item 6)."""
     return any(_CHALLENGE_FIGURE.search(fold(sentence)) for sentence in split_sentences(text))
@@ -1209,6 +1242,14 @@ class RolePlayEngine:
         self._asks_number_now = False  # SWEEP-19 item 6: this turn asked what number works for her
         self._number_moment = False  # ... before the anchor, with probe first: the F1 step answers
         self._split_turn: int | None = None  # the lost first half's turn of a continuation
+        # M032 S3, endings (ints and booleans only).  SWEEP-25 A2: the turn of her own request for
+        # the details by e-mail, until the advisor's next turn answers it, and whether he agreed;
+        # B: reaction sentences the guard took out before the 19:00 WEAK line.  SWEEP-27: free
+        # replies told she is short on time.
+        self._email_request_turn: int | None = None
+        self._learner_asked_email = False
+        self._commit_reaction_dropped = 0
+        self._short_on_time_notes = 0
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -1718,6 +1759,7 @@ class RolePlayEngine:
             if topic not in self._answered:
                 self._answered.append(topic)
         negotiated = self._observe_negotiation(candidate_text, turn)
+        self._read_email_agreement(reading, negotiated, turn)
         self._turn_conflict = negotiated.conflict if self._price_conflict else None
         if (
             split is not None
@@ -2093,7 +2135,8 @@ class RolePlayEngine:
             curiosity = self._curiosity_for_free_reply(force=True)
             # L1: before the 17:00 time cue an empty pool still gets the ordinary check-in (an
             # honest reaction, a question only if she has one), never "say you have no more".
-            done = not curiosity and r_sec >= TIME_CUE_SEC
+            # M032 SWEEP-27: after her time cue a check-in is told she has no more questions.
+            done = self._short_on_time() or (not curiosity and r_sec >= TIME_CUE_SEC)
             self._notes.append(CHECKIN_DONE_NOTE if done else CHECKIN_NOTE)
         elif not quiet and not responding:
             # M032 SWEEP-12: no hand-over on a turn that put a new price or offer on the table;
@@ -3021,6 +3064,7 @@ class RolePlayEngine:
             reader_v2=flag_on(FLAG_OFFER_READER_V2),
             probed=self._price_probe_answer_due(turn),
             read_totals=self._probe_first or self._price_conflict,
+            email_v2=flag_on(FLAG_WEAK_EMAIL_V2),
         )
         if seen.price_answer:
             self.scheduler.note_price_answered()
@@ -3092,6 +3136,7 @@ class RolePlayEngine:
         intent: LearnerIntent | None,
         negotiation_id: str | None = None,
         credit_move_id: str | None = None,
+        reveal: bool = False,
     ) -> tuple[str, ...]:
         """Worker notes that hold on every reply of a situation, not only the turn that began it.
 
@@ -3136,7 +3181,18 @@ class RolePlayEngine:
             else ""
         )
         ack_turn = mode is TurnMode.LLM_REPLY and self._ack_turn()
-        if mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
+        # M032 SWEEP-27: after her time cue a free reply is short and opens nothing new; the note
+        # takes the place of the hollow, the acknowledgement and the ledger notes (merged, never
+        # stacked) and is not given on a turn that hands over a disclosure layer.
+        short = mode is TurnMode.LLM_REPLY and not reveal and self._short_on_time()
+        if short:
+            notes.append(
+                SHORT_ON_TIME_CONCERNS_NOTE.format(concerns=concerns)
+                if concerns
+                else SHORT_ON_TIME_NOTE
+            )
+            self._short_on_time_notes += 1
+        elif mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
             # Merged with what she already said, so the two never pull apart.
             notes.append(
                 HOLLOW_CONCERNS_NOTE.format(concerns=concerns) if concerns else HOLLOW_NOTE
@@ -3340,7 +3396,11 @@ class RolePlayEngine:
             # A stall that answers a CALL ask does not ask for an e-mail nobody offered.
             return self._commit_plan(Level.WEAK, reasons, call=wants is AskKind.CALL, ask=wants)
         if seen.email_offer:
-            if negotiation.email_answered:
+            if negotiation.email_answered or (
+                flag_on(FLAG_WEAK_EMAIL_V2) and self._learner_asked_email
+            ):
+                # SWEEP-25 A3: she asked for it herself and he agreed, so a later offer is not
+                # met with a second "yes, send it".
                 self._notes.append(EMAIL_AGAIN_NOTE)
             else:
                 owed = self.scheduler.select(r_sec)
@@ -3470,10 +3530,27 @@ class RolePlayEngine:
         The e-mail was offered or accepted: "I'll read through the email and get back to you", not a
         second request for it.  A call ask and no declined call: "call me back after I've talked to
         my husband".  Otherwise (also after a declined call) the plain "email me the details".
+        M032 SWEEP-25 A3 (R1_WEAK_EMAIL_V2): her own request for the e-mail that the advisor agreed
+        to counts as e-mailed too.
         """
         negotiation = self.negotiation
         emailed = bool(negotiation.email_offers) or negotiation.email_answered
+        if flag_on(FLAG_WEAK_EMAIL_V2) and self._learner_asked_email:
+            emailed = True
         return {"emailed": emailed, "call": call and not negotiation.call_declined()}
+
+    def _read_email_agreement(self, text: str, seen: NegotiationTurn, turn: int) -> None:
+        """SWEEP-25 A2: the advisor's answer to her own request for the details by e-mail.
+
+        Only the advisor turn right after her request answers it: an e-mail offer, or a short
+        agreement with no decline ("Sure, I can do that.") confirms it; anything else (ignored,
+        "Let's decide now") leaves the plain WEAK line.
+        """
+        asked, self._email_request_turn = self._email_request_turn, None
+        if asked is None or turn != asked + 1 or not flag_on(FLAG_WEAK_EMAIL_V2):
+            return
+        if seen.email_offer or agrees_to_send(text):
+            self._learner_asked_email = True
 
     def _weak_text(self, default: str) -> str:
         """The WEAK line of a farewell or the 19:00 stall, in the wording that fits."""
@@ -3543,7 +3620,12 @@ class RolePlayEngine:
         text = self._weak_text(move.text)
         intent = LearnerIntent(
             kind=KIND_COMMIT,
-            brief=COMMIT_REACTION_BRIEF,
+            # M032 SWEEP-25 B: no goodbye and no "I have to go" either (R1_COMMIT_REACTION_V2).
+            brief=(
+                COMMIT_REACTION_BRIEF_V2
+                if flag_on(FLAG_COMMIT_REACTION_V2)
+                else COMMIT_REACTION_BRIEF
+            ),
             must_say=(),
             markers=(),
             fallback=text,
@@ -3967,7 +4049,9 @@ class RolePlayEngine:
                 move = replace(move, brief=move.brief + F4_PUSH_CALL_SUFFIX)
         elif move.id == TIME_CUE:
             # Three wordings of the cue, one per attempt ("before my own next call": 8 of 20).
-            briefs = (move.brief, *TIME_CUE_BRIEF_ALTERNATIVES)
+            # M032 SWEEP-27: the first is neutral for a learner at home (R1_TIME_CUE_V2).
+            first = TIME_CUE_BRIEF_V2 if flag_on(FLAG_TIME_CUE_V2) else move.brief
+            briefs = (first, *TIME_CUE_BRIEF_ALTERNATIVES)
             move = replace(move, brief=pick_variant(briefs, self.seed, 0))
         elif (
             move.id == F4_PRIMARY
@@ -4122,6 +4206,13 @@ class RolePlayEngine:
         if self._monthly_quote_usd > MONTHLY_BUDGET_MAX_USD:
             self._notes.append(BUDGET_OVER_NOTE.format(amount=format_usd(self._monthly_quote_usd)))
 
+    def _short_on_time(self) -> bool:
+        """M032 SWEEP-27 (R1_TIME_CUE_V2): she has said her time cue, so she opens nothing new.
+
+        Keyed on the cue's delivery, never on R: the cue may come late or not at all.
+        """
+        return flag_on(FLAG_TIME_CUE_V2) and self.scheduler.is_delivered(TIME_CUE)
+
     def _question_budget(self) -> bool:
         """The learner may ask a question now: none of its last replies held one.
 
@@ -4149,7 +4240,8 @@ class RolePlayEngine:
         the advisor named is under $1,000 (SWEEP-13).
         """
         self._free_replies += 1
-        if skip or not self._question_budget():
+        if skip or not self._question_budget() or self._short_on_time():
+            # M032 SWEEP-27: after her time cue she opens no new question, check-in or not.
             return ""
         if not force and self._free_replies - self._free_at_last_curiosity < CURIOSITY_EVERY:
             return ""
@@ -4237,6 +4329,7 @@ class RolePlayEngine:
                     intent=intent,
                     negotiation_id=negotiation_id,
                     credit_move_id=credit_move_id,
+                    reveal=bool(first_probes) or bool(reveal_topics),
                 )
             if mode is TurnMode.LLM_REPLY:
                 style_note = pick_variant(
@@ -4358,6 +4451,8 @@ class RolePlayEngine:
                 # Review S2R-4: ACK_TURN_NOTE asks her to ask her last question again.
                 reask=self._last_questions if ack and self._learner_asked_last() else (),
                 must_say=() if intent is None else intent.must_say,
+                # M032 SWEEP-25 B: the 19:00 reaction says no goodbye and asks for no e-mail.
+                reaction_only=reaction_only and flag_on(FLAG_COMMIT_REACTION_V2),
             )
         else:
             implausible = False
@@ -4425,6 +4520,10 @@ class RolePlayEngine:
         if result.fallback_used:
             self._fallbacks += 1  # the next fallback starts at the next variant
         self._soft_tic_trims += result.soft_tic_trims  # M032 SWEEP-12 (a count)
+        # M032 SWEEP-25 B (a count): goodbyes taken out of the 19:00 reaction.
+        self._commit_reaction_dropped += sum(
+            1 for hit in result.hits if hit.rule == "reaction_leave_taking"
+        )
 
     def record_spoken(
         self,
@@ -4464,6 +4563,14 @@ class RolePlayEngine:
             )
             self._asked_yes_no = bool(questions) and _NOT_YES_NO.search(questions[-1]) is None
             self._note_voice(plan, spoken_text, tics)
+            if (
+                plan.commitment_level is None
+                and LEARNER_EMAIL_REQUEST.search(fold(spoken_text)) is not None
+                and flag_on(FLAG_WEAK_EMAIL_V2)
+            ):
+                # SWEEP-25 A2: she asked for the details by e-mail herself (not in a scripted
+                # commitment line); the advisor's next turn says whether he agreed.
+                self._email_request_turn = plan.turn
             self._last_reply_closer = is_closer(spoken_text)
             self._raised_last = plan.move_id is not None or plan.negotiation_id is not None
             # M032 S1: whether her line carried an owed move or a negotiation line (her question in
@@ -4775,6 +4882,14 @@ class RolePlayEngine:
             "acknowledgement_turns": len(self._word_counts) - len(stt),
         }
 
+    def _endings_log(self) -> dict[str, Any]:
+        """M032 S3: the endings' counts, no text (SWEEP-25 e-mail and reaction, SWEEP-27 notes)."""
+        return {
+            "learner_asked_email": self._learner_asked_email,
+            "commit_reaction_dropped": self._commit_reaction_dropped,
+            "short_on_time_notes": self._short_on_time_notes,
+        }
+
     def admin_log(self, *, final: bool = False, r_end: float | None = None) -> dict[str, Any]:
         """The trusted administration log (turn indices, counts and booleans only)."""
         schedule = self.scheduler.summary(final=final)
@@ -4888,6 +5003,8 @@ class RolePlayEngine:
                 if self._probe_first
                 else {}
             ),
+            # M032 S3, endings and abuse (counts and booleans; ``session_facts.learner_endings``).
+            "endings": self._endings_log(),
             # Counts only (logged for the rehearsal metrics, not posted): replies that held a
             # question, the tracked phrase tics, and what the advisor already answered.
             "style": {

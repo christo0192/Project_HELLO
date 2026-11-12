@@ -301,6 +301,27 @@ def s2p_off(target):
     return mock.patch.dict(r1_roleplay.os.environ, S2P_OFF)(target)
 
 
+# M032 S3 (endings and abuse) rollback flags.  The tests written before S3 that pin the endings of
+# the release before it (the close ladder's exit before 14:00, an explicit request from 14:00 as a
+# farewell, the time cue's first brief, the WEAK line's wording) run with these off: they are the
+# proof that the flags off restore it exactly.
+S3_FLAGS = (
+    "R1_CLOSING_STATE",
+    "R1_EARLY_CLOSE_ASIDE",
+    "R1_ABUSE_HANGUP",
+    "R1_LATE_END_REQUEST",
+    "R1_WEAK_EMAIL_V2",
+    "R1_COMMIT_REACTION_V2",
+    "R1_TIME_CUE_V2",
+)
+S3_OFF = {name: "0" for name in S3_FLAGS}
+
+
+def s3_off(target):
+    """Run a test (or every test of a class) with the M032 S3 engine flags off."""
+    return mock.patch.dict(r1_roleplay.os.environ, S3_OFF)(target)
+
+
 def engine(persona=P1, name="Arjun", seed="sess-1") -> RolePlayEngine:
     return RolePlayEngine(persona, candidate_first_name=name, seed=seed)
 
@@ -5084,6 +5105,7 @@ class TimeCueIsTheLearnersOwnTests(unittest.TestCase):
         self.assertIn("YOU", plan.intent.brief)
         self.assertIn("not theirs", plan.intent.brief)
 
+    @s3_off
     def test_the_cue_is_worded_three_ways_one_per_attempt(self):
         """R1-Q iteration 3: "before my own next call" came back verbatim in 8 of 20 calls."""
         from r1_scheduler import SPEC_BY_ID, TIME_CUE_BRIEF_ALTERNATIVES
@@ -10461,6 +10483,233 @@ class S2PReviewConflictOnceTests(unittest.TestCase):
         anchor = s.say("Honestly, I can give you the whole course for $2,500.", 40)
         self.assertEqual(anchor.move_id, F1_ANCHOR)
         self.assertNotIn("A careful buyer would be surprised", anchor.reminder)
+
+def cued_cooperative():
+    """The cooperative call at 62.5 s an exchange, run on until the 17:00 time cue was said, so the
+    next turns are free replies (returns the session and the next R)."""
+    session, r = run_cooperative(62.5)
+    while not session.eng.scheduler.is_delivered(TIME_CUE) and r < COMMIT_STALL_R_SEC - 60:
+        session.say(NEUTRAL, r)
+        r += 10.0
+    return session, r
+
+
+class WeakLineFitsWhatWasSaidTests(unittest.TestCase):
+    """M032 SWEEP-25: the WEAK line fits what was already said (synthetic advisor turns).
+
+    a95398ab #60 and 199e97c2 #87: the documents and the road map were promised, or she had asked
+    for the details by e-mail and the advisor agreed, and the 19:00 line asked for the e-mail again.
+    """
+
+    DONE = commitment_line(Level.WEAK, "husband", emailed=True)
+
+    def stall_after(self, *turns, ack="Okay, I see.", reply="Just exploring options."):
+        """A cooperative call, then ``turns`` (text, reply) before 19:00, then the 19:00 stall."""
+        session, r = cued_cooperative()
+        for text, said in turns:
+            session.reply = said
+            session.say(text, r)
+            r += 15.0
+        session.reply = reply
+        session.ack = ack
+        plan = session.say(NEUTRAL, max(r, COMMIT_STALL_R_SEC + 10.0))
+        self.assertEqual(plan.move_id, COMMIT_STALL)
+        return session, plan
+
+    def test_documents_promised_pick_the_email_done_line(self):
+        session, plan = self.stall_after(
+            ("I'll send you the documents once we finish the call.", "Thank you, that helps.")
+        )
+        self.assertEqual(plan.scripted_text, self.DONE)
+        self.assertEqual(self.DONE, "Let me think about it. I'll read through the email and get "
+                                    "back to you.")
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_WEAK_EMAIL_V2": "0"}):
+            session, plan = self.stall_after(
+                ("I'll send you the documents once we finish the call.", "Thank you.")
+            )
+        self.assertEqual(plan.scripted_text, stall_line("husband"))
+
+    def test_her_own_request_counts_once_the_advisor_agrees(self):
+        ask = "Could you just e-mail me the details instead?"
+        session, plan = self.stall_after(
+            ("Tell me what else is on your mind.", ask), ("Sure, I can do that.", "Thanks.")
+        )
+        self.assertTrue(session.eng.admin_log()["endings"]["learner_asked_email"])
+        self.assertEqual(plan.scripted_text, self.DONE)
+        for answer in ("Let's decide now, the offer ends today.", "Our mentors are great."):
+            with self.subTest(answer=answer):
+                session, plan = self.stall_after(
+                    ("Tell me what else is on your mind.", ask), (answer, "Okay.")
+                )
+                self.assertFalse(session.eng.admin_log()["endings"]["learner_asked_email"])
+                self.assertEqual(plan.scripted_text, stall_line("husband"))
+
+    def test_after_her_agreed_request_a_later_offer_is_no_second_yes(self):
+        ask = "Could you just e-mail me the details instead?"
+        session, r = cued_cooperative()
+        session.reply = ask
+        session.say("Tell me what else is on your mind.", r)
+        session.reply = "Thanks."
+        session.say("Sure, I can do that.", r + 15)
+        plan = session.say("I'll email you the brochure today.", r + 30)
+        self.assertNotEqual(plan.negotiation_id, "N-EMAIL")
+        self.assertIn(r1_roleplay.EMAIL_AGAIN_NOTE, plan.reminder)
+
+    def test_a_documents_offer_now_gets_the_email_yes(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("I can send over the road map and the brochures after this.", 60)
+        self.assertEqual(plan.negotiation_id, "N-EMAIL")
+        self.assertIn("email_offer", plan.reasons)
+        self.assertEqual(s.eng.admin_log()["negotiation"]["email_offer_turns"], [2])
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_WEAK_EMAIL_V2": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("I can send over the road map and the brochures after this.", 60)
+        self.assertIsNone(plan.negotiation_id)
+        self.assertEqual(s.eng.admin_log()["negotiation"]["email_offer_turns"], [])
+
+    def test_a_forced_move_is_not_starved_by_a_documents_offer(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("I'll send you the documents tonight.", 420)  # F3 is forced at 7:00
+        self.assertEqual(plan.move_id, F3_PRIMARY)
+        self.assertIn("email_yields_to_owed_move", plan.reasons)
+
+    def test_paperwork_is_no_email_offer(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("I'll send you the documents to sign for enrolment.", 60)
+        self.assertEqual(s.eng.admin_log()["negotiation"]["email_offer_turns"], [])
+
+    def test_the_reaction_says_no_goodbye_and_the_line_follows_once(self):
+        session, plan = self.stall_after(
+            ack="That sounds useful. I should go now, so send those over."
+        )
+        self.assertEqual(session.spoken[-1], f"That sounds useful. {stall_line('husband')}")
+        self.assertIn("do not say goodbye", plan.intent.brief)
+        self.assertEqual(session.eng.admin_log()["endings"]["commit_reaction_dropped"], 1)
+        session, plan = self.stall_after(ack="Okay, bye for now, take care.")
+        self.assertEqual(session.spoken[-1], stall_line("husband"))  # the tail alone
+        self.assertTrue(session.eng.negotiation.weak_line_said)
+        self.assertTrue(session.eng.commitment_resolved)
+
+    def test_flag_off_keeps_the_reaction_and_the_old_brief(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_COMMIT_REACTION_V2": "0"}):
+            session, plan = self.stall_after(ack="That sounds useful. I should go now.")
+        self.assertEqual(plan.intent.brief, r1_roleplay.COMMIT_REACTION_BRIEF)
+        self.assertEqual(
+            session.spoken[-1], f"That sounds useful. I should go now. {stall_line('husband')}"
+        )
+
+    def test_the_weak_line_is_still_said_once(self):
+        session, plan = self.stall_after()
+        self.assertTrue(session.eng.negotiation.weak_line_said)
+        again = session.say(ASK, COMMIT_STALL_R_SEC + 40.0)
+        self.assertNotIn(stall_line("husband"), again.scripted_text)
+
+
+class TimeCueV2Tests(unittest.TestCase):
+    """M032 SWEEP-27: the time cue is neutral for a learner at home, and after it she opens no new
+    question (a95398ab: a new course question two turns after "I need to hop off")."""
+
+    def cued(self, seed="cue-2"):
+        """A cooperative call that runs until the time cue is said, plus the R after it."""
+        s = Session(engine(seed=seed), ack="Okay, I see.")
+        r = 20.0
+        for text in cooperative_script():
+            plan = s.say(text, r)
+            r += 72.5
+            if plan.move_id == TIME_CUE:
+                self.assertTrue(s.eng.scheduler.is_delivered(TIME_CUE))
+                return s, plan, r
+        self.fail("the time cue was never owed")
+
+    def test_the_first_brief_has_no_next_call(self):
+        from r1_scheduler import SPEC_BY_ID, TIME_CUE_BRIEF_V2
+
+        _s, plan, _r = self.cued("cue-2")  # this seed picks the first brief
+        self.assertEqual(plan.intent.brief, TIME_CUE_BRIEF_V2)
+        self.assertNotIn("next call", plan.intent.brief)
+        self.assertIn("get going", plan.intent.brief)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_TIME_CUE_V2": "0"}):
+            _s, plan, _r = self.cued("cue-2")
+        self.assertEqual(plan.intent.brief, SPEC_BY_ID[TIME_CUE].brief)
+
+    def test_after_the_cue_a_free_reply_is_short_and_asks_nothing_new(self):
+        s, _plan, r = self.cued()
+        replies = []
+        for _ in range(4):
+            plan = s.say("Our alumni have done really well in the job market.", r)
+            r += 20.0
+            if plan.mode is TurnMode.LLM_REPLY:
+                replies.append(plan)
+        self.assertTrue(replies)
+        for plan in replies:
+            self.assertIn("Keep this reply short", plan.reminder)
+            self.assertIn("You told the advisor you only have a few minutes left", plan.reminder)
+            self.assertNotIn(r1_roleplay.HOLLOW_NOTE, plan.reminder)
+            self.assertNotIn("you are curious about", plan.reminder.lower())
+        self.assertGreaterEqual(s.eng.admin_log()["endings"]["short_on_time_notes"], 1)
+
+    def test_a_check_in_after_the_cue_gets_the_done_note(self):
+        s, _plan, r = self.cued()
+        plan = s.say("Is there anything else I can help you with?", r)
+        self.assertIn(r1_roleplay.CHECKIN_DONE_NOTE, plan.reminder)
+        self.assertNotIn(r1_roleplay.CHECKIN_NOTE, plan.reminder)
+
+    def test_before_the_cue_nothing_changes(self):
+        s = Session(engine(seed="cue-2"))
+        s.say(OPENER, 20)
+        plan = s.say("Our alumni have done really well in the job market.", 200)
+        self.assertNotIn(r1_roleplay.SHORT_ON_TIME_NOTE, plan.reminder or "")
+
+    def test_flag_off_is_the_release_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_TIME_CUE_V2": "0"}):
+            s, _plan, r = self.cued()
+            plan = s.say("Is there anything else I can help you with?", r)
+        self.assertNotIn(r1_roleplay.SHORT_ON_TIME_NOTE, plan.reminder)
+
+    def test_the_commit_stall_is_unchanged_after_the_cue(self):
+        s, _plan, r = self.cued()
+        plan = s.say(NEUTRAL, max(r, COMMIT_STALL_R_SEC + 10.0))
+        self.assertEqual(plan.move_id, COMMIT_STALL)
+        self.assertEqual(plan.scripted_text, stall_line("husband"))
+
+    def test_a_reveal_after_the_cue_still_releases_without_the_note(self):
+        s = Session(engine(seed="cue-2"))
+        s.say(OPENER, 20)
+        r = 60.0
+        while not s.eng.scheduler.is_delivered(TIME_CUE) and r < COMMIT_STALL_R_SEC - 60:
+            s.say(PITCH, r)  # no probe: every need is still locked
+            r += 40.0
+        self.assertTrue(s.eng.scheduler.is_delivered(TIME_CUE))
+        plan = s.say(H1_PROBE, r)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn("H1", s.eng._turn_layers[1])  # the hint is handed over on this turn
+        self.assertNotIn("Keep this reply short", plan.reminder)
+
+    def test_an_offer_at_seventeen_makes_the_owed_cue_fire_and_a_question_is_answered(self):
+        s = Session(engine(seed="cue-2"))
+        r = 20.0
+        for text in cooperative_script():
+            if r >= TIME_CUE_SEC:
+                break
+            s.say(text, r)
+            r += 60.0
+        plan = s.say("We also have a free trial week you could start with.", TIME_CUE_SEC + 5)
+        self.assertEqual(plan.move_id, TIME_CUE)
+        s2 = Session(engine(seed="cue-2"))
+        r = 20.0
+        for text in cooperative_script():
+            if r >= TIME_CUE_SEC:
+                break
+            s2.say(text, r)
+            r += 60.0
+        asked = s2.say("What time works for you for a quick follow-up?", TIME_CUE_SEC + 5)
+        if asked.move_id == TIME_CUE:
+            self.assertIn("answer", asked.reminder.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2946,5 +2946,41 @@ class WrapupOneMentionGuardTests(unittest.TestCase):
             [],
         )
 
+class CommitReactionGuardTests(unittest.TestCase):
+    """M032 SWEEP-25 B (R1_COMMIT_REACTION_V2): the 19:00 reaction before the scripted WEAK line
+    says no goodbye, no "I have to go" and asks for no e-mail (synthetic text)."""
+
+    def ctx(self, reaction_only=True):
+        return GuardContext(phase="roleplay", reaction_only=reaction_only, quiet_empty=True)
+
+    def test_a_goodbye_or_an_email_request_is_dropped(self):
+        result = guard_text("That sounds useful. I should go now, so send those over.", self.ctx())
+        self.assertEqual(result.text, "That sounds useful.")
+        self.assertEqual(
+            [(hit.category, hit.rule) for hit in result.hits],
+            [(r1_guard.MISREAD, "reaction_leave_taking")],
+        )
+        for text in ("Okay, bye for now.", "I'll get back to you.", "Let me sit with it for a bit.",
+                     "Could you e-mail me the details?"):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx()).text, "")  # the WEAK line alone
+
+    def test_a_plain_reaction_is_kept_and_nothing_changes_without_the_flag(self):
+        self.assertEqual(
+            guard_text("That makes sense, the mentors sound helpful.", self.ctx()).text,
+            "That makes sense, the mentors sound helpful.",
+        )
+        self.assertEqual(
+            guard_text("That sounds useful. I should go now.", self.ctx(False)).text,
+            "That sounds useful. I should go now.",
+        )
+
+    def test_the_drop_is_hygiene_and_never_a_leak(self):
+        ledger = GuardLedger()
+        for _ in range(4):
+            ledger.record(guard_text("I should go now, bye.", self.ctx()))
+        self.assertFalse(ledger.flagged)
+
+
 if __name__ == "__main__":
     unittest.main()

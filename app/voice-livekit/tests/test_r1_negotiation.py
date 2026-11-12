@@ -29,6 +29,7 @@ from r1_guard import GuardContext, check_sentence, has_concession
 from r1_personas import PERSONAS, deep_need_topics_in, resolve_persona
 from r1_scheduler import F1_COUNTER, SPEC_BY_ID as MOVE_BY_ID, markers_match
 from r1_text import split_sentences
+from r1_negotiation import Negotiation, detect_email_offer
 
 # The real advisor turns of owner session b58c7d9c (the candidate rows, merged per learner turn).
 T56 = (
@@ -3168,6 +3169,71 @@ class ProbeFirstNegotiationTests(unittest.TestCase):
             for text in spec.variants:
                 self.assertTrue(markers_match(money.markers, text), text)
                 self.assertNotIn("agree to anything before", text)
+
+class EmailOfferV2Tests(unittest.TestCase):
+    """M032 SWEEP-25 A1 (R1_WEAK_EMAIL_V2): documents, brochures, PDFs and road maps are e-mail
+    offers too; paperwork to sign or for the enrolment is not (synthetic advisor turns)."""
+
+    def test_documents_and_road_maps_are_offers_with_v2_only(self):
+        for text in (
+            "I'll send you the documents once we finish the call.",
+            "I can send over the road map and the brochures after this.",
+            "Let me email you the PDFs tonight.",
+            "I will share the documents on WhatsApp today.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_email_offer(text, v2=True))
+        self.assertFalse(detect_email_offer("I'll send you the documents once we finish the call."))
+
+    def test_paperwork_is_never_an_offer(self):
+        for text in (
+            "I'll send you the documents to sign for enrolment.",
+            "I'll send you the document to sign for enrolment.",
+            "I will email you the documents for the registration.",
+            "We'll send the documents for payment and KYC.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_email_offer(text, v2=True))
+        # The release before read the singular "document" as information even there.
+        self.assertTrue(detect_email_offer("I'll send you the document to sign for enrolment."))
+
+    def test_a_programme_description_is_still_no_offer(self):
+        for text in (
+            "We send you the documents every week once you enroll.",
+            "You will get the road map in the first class.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_email_offer(text, v2=True))
+
+    def test_the_corpus_gains_one_unlabelled_row_and_loses_none(self):
+        gained, lost = [], []
+        for row in _corpus_rows():
+            before = detect_email_offer(row["text"])
+            after = detect_email_offer(row["text"], v2=True)
+            if after and not before:
+                gained.append((row["id"], row["labels"].get("email_offer")))
+            if before and not after:
+                lost.append(row["id"])
+        self.assertEqual(gained, [("c1677", None)])
+        self.assertEqual(lost, [])
+
+    def test_the_wider_reader_stays_linear(self):
+        import time
+
+        hostile = "I'll send you the " + "documents and the " * 2000 + "road map"
+        start = time.perf_counter()
+        detect_email_offer(hostile, v2=True)
+        detect_email_offer("I will email " + "you " * 3000, v2=True)
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+    def test_the_negotiation_reads_it_only_when_asked(self):
+        seen = Negotiation("husband").observe(3, "I'll send you the documents tonight.")
+        self.assertFalse(seen.email_offer)
+        negotiation = Negotiation("husband")
+        seen = negotiation.observe(3, "I'll send you the documents tonight.", email_v2=True)
+        self.assertTrue(seen.email_offer)
+        self.assertEqual(negotiation.email_offers, [3])
+
 
 if __name__ == "__main__":
     unittest.main()

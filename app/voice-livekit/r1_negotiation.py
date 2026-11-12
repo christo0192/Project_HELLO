@@ -574,6 +574,14 @@ COMMIT_REACTION_BRIEF = (
     "thinking it over, e-mail or getting back to them, because the closing line follows "
     "separately"
 )
+# M032 SWEEP-25 B (flag R1_COMMIT_REACTION_V2; a95398ab #60: the reaction said she had to go and
+# asked for the documents, then the WEAK line asked for the e-mail again).  New wording under
+# D-M032-4, listed for review; the guard drops a goodbye left in it all the same.
+COMMIT_REACTION_BRIEF_V2 = (
+    "react to what the advisor just said in one short, friendly sentence; do not say goodbye or "
+    "that you have to go, and say nothing about thinking it over, e-mail, sending anything or "
+    "getting back to them, because the closing line follows separately"
+)
 
 
 @dataclass(frozen=True)
@@ -1233,6 +1241,23 @@ _EMAIL_OFFER = _compile(
     r"(?:[\w-]+ ){0,4}?(?:e-?mails?|mail|details|information|brochure|everything)\b[^.?!]{0,25}"
     r"\b(?:out|sent|over|e-?mailed|mailed|off)\b",
 )
+# M032 SWEEP-25 A1 (flag R1_WEAK_EMAIL_V2; a95398ab #60, 199e97c2 #82: "I'll send you the documents
+# and the road map" was no e-mail offer, so the 19:00 WEAK line asked for the e-mail again).  The
+# first frame of ``_EMAIL_OFFER`` also takes documents, brochures, PDFs and road maps, and no object
+# the learner is to sign or that is for the enrolment, the registration, a payment or KYC ("I'll
+# send you the documents to sign for enrolment" is paperwork, not information).
+_MAIL_INFO_V2 = r"(?:" + _MAIL_INFO + r"|documents?|brochures?|pdfs?|road ?maps?)"
+_NOT_PAPERWORK = (
+    r"(?!\s+(?:to sign|for (?:the |your )?(?:enrol\w*|registration|payment|kyc))\b)"
+)
+_EMAIL_OFFER_V2 = (
+    re.compile(
+        r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + _MAIL_VERB + r"\b" + _GAP + r"\b"
+        + _MAIL_INFO_V2 + r"\b" + _NOT_PAPERWORK,
+        re.IGNORECASE,
+    ),
+    *_EMAIL_OFFER[1:],
+)
 # "I'll send it over today" is an e-mail offer.  A QUESTION in a turn that is about a form or a link
 # and names no e-mail word is not: the pronoun is the form ("... a two-minute enrollment form. Can
 # I send it right now?"; R1-Q iteration 2: the learner answered "What would that email actually
@@ -1338,20 +1363,22 @@ def detect_callback(text: object) -> Callback | None:
     return None
 
 
-def detect_email_offer(text: object) -> bool:
+def detect_email_offer(text: object, *, v2: bool = False) -> bool:
     """The advisor offers to e-mail or send the details.
 
     Not a pitch about what the programme sends: "we'll send you the schedule once you enroll",
     "we will send you the link to the live class on Monday" and "we mail you a report every
     week" describe the programme (R1-Q round 2), so a match whose neighbourhood is a cadence, a
-    programme timeline or class logistics is not an offer.
+    programme timeline or class logistics is not an offer.  ``v2`` (M032 SWEEP-25, the engine's
+    R1_WEAK_EMAIL_V2) also reads documents, brochures, PDFs and road maps, never paperwork.
     """
     folded = _tail(text).lower()
     form_talk = _EMAIL_WORD.search(folded) is None and _FORM_WORD.search(folded) is not None
+    offers = _EMAIL_OFFER_V2 if v2 else _EMAIL_OFFER
     for sentence in split_sentences(folded):
-        patterns = _EMAIL_OFFER
+        patterns = offers
         if not (form_talk and is_question_like(sentence)):
-            patterns = (*_EMAIL_OFFER, *_EMAIL_OFFER_PRONOUN)
+            patterns = (*offers, *_EMAIL_OFFER_PRONOUN)
         for pattern in patterns:
             for match in pattern.finditer(sentence):
                 near = around(sentence, match.start(), match.end())
@@ -3753,6 +3780,7 @@ class Negotiation:
         reader_v2: bool = False,
         probed: bool = False,
         read_totals: bool = False,
+        email_v2: bool = False,
     ) -> NegotiationTurn:
         """Read one advisor turn.  ``anchor_turn`` is the learner turn of the $7,000 ask.
 
@@ -3767,7 +3795,8 @@ class Negotiation:
         R1_PROBE_FIRST) says the learner just asked the price, so an amount needs no pricing word,
         as after the anchor ("It's around 6000 dollars"); ``read_totals`` (S2P, SWEEP-19, SWEEP-21)
         keeps the quote record (every offer and stated total), the price conflict of the turn and
-        the turn that restated the full price after the anchor.
+        the turn that restated the full price after the anchor.  ``email_v2`` (SWEEP-25, flag
+        R1_WEAK_EMAIL_V2) reads an e-mail offer of documents, brochures or a road map too.
         """
         callback = detect_callback(text)
         if callback is not None:
@@ -3775,7 +3804,7 @@ class Negotiation:
             if callback.slot is not None:
                 self.last_slot = callback.slot
                 self.last_slot_turn = turn
-        email = detect_email_offer(text)
+        email = detect_email_offer(text, v2=email_v2)
         if email:
             self.email_offers.append(turn)
         checkin = detect_checkin(text)

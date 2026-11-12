@@ -974,6 +974,73 @@ class LearnerVoiceReaderTests(unittest.TestCase):
             reply_tics(text, v2=True)
         self.assertLess(time.perf_counter() - start, 2.0)
 
+class EndingsReaderTests(unittest.TestCase):
+    """M032 S3 readers of the learner's own lines (synthetic or paraphrased text only)."""
+
+    def test_her_real_sign_offs_end_the_line(self):
+        from r1_text import is_sign_off
+
+        for text in (
+            "Okay, I'll get back to you.",
+            "Thanks, I'll give it some proper thought on my end.",
+            "I think I'll take some time on my own.",
+            "Let me sit with it for a bit.",
+            "Let's leave it there for now, thank you.",
+            "I'll think it over and get back to you. Bye.",
+            "Thanks for your time.",
+            "Take care.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_sign_off(text))
+
+    def test_a_question_or_more_after_it_is_no_sign_off(self):
+        from r1_text import is_sign_off
+
+        for text in (
+            "I'll think it over, but what about the EMI?",
+            "I'll get back to you. How long is the trial?",
+            "I'll get back to you once I know more about the mentors and the projects.",
+            "I want to think it through before I decide anything about the price.",
+            "Let me think. The mentors sound good.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_sign_off(text))
+
+    def test_leaving_and_her_own_email_request(self):
+        from r1_text import LEARNER_EMAIL_REQUEST, LEAVE_TAKING, says_goodbye_or_sends
+
+        for text in ("I should go now.", "I need to get going.", "I've got to run.",
+                     "I have to hop off soon."):
+            with self.subTest(text=text):
+                self.assertIsNotNone(LEAVE_TAKING.search(text))
+        self.assertIsNone(LEAVE_TAKING.search("You should go through the syllabus."))
+        for text in ("Could you just e-mail me the details instead?", "Email me the brochure.",
+                     "Can you send those over?", "Maybe by email instead.",
+                     "Send the documents to my inbox."):
+            with self.subTest(text=text):
+                self.assertIsNotNone(LEARNER_EMAIL_REQUEST.search(text))
+        self.assertIsNone(LEARNER_EMAIL_REQUEST.search("Do you send weekly updates?"))
+        self.assertTrue(says_goodbye_or_sends("Okay, bye for now."))
+        self.assertTrue(says_goodbye_or_sends("I'll get back to you."))
+        self.assertFalse(says_goodbye_or_sends("That sounds useful."))
+
+    def test_the_readers_stay_linear(self):
+        import time
+
+        from r1_text import is_sign_off, says_goodbye_or_sends
+
+        for hostile in (
+            "I'll get back to you" + ", thanks" * 4000,
+            "let me " * 3000 + "think it over",
+            ". " * 5000 + "bye",
+            "i should " * 3000,
+        ):
+            start = time.perf_counter()
+            is_sign_off(hostile)
+            says_goodbye_or_sends(hostile)
+            self.assertLess(time.perf_counter() - start, 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
