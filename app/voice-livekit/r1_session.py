@@ -1131,7 +1131,7 @@ def is_acknowledgement_turn(text: str) -> bool:
 # icebreaker reply and she restarted with a new reaction).  A reflexive courtesy said over her: every
 # word one of these, at least one "thank"/"thanks", and no question mark.  "Yes" is never one of
 # them (it can answer), and anything else ("Thank you, but what does it pay?") is a turn of its own.
-_COURTESY_WORDS = frozenset(
+_ICEBREAKER_COURTESY_WORDS = frozenset(
     {
         "thank", "thanks", "you", "so", "much", "very", "okay", "ok", "yeah", "sure", "sir",
         "maam", "ma'am", "mam", "madam",
@@ -1146,7 +1146,7 @@ def is_courtesy_turn(text: str) -> bool:
     words = fold_speech(text).split()
     return (
         bool(words)
-        and all(word in _COURTESY_WORDS for word in words)
+        and all(word in _ICEBREAKER_COURTESY_WORDS for word in words)
         and any(word in ("thank", "thanks") for word in words)
     )
 
