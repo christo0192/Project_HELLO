@@ -10954,6 +10954,27 @@ class EarlyCloseAsideTests(unittest.TestCase):
         self.assertIn(r1_roleplay.CONTINUE_NOTE, follow.reminder)
         self.assertIsNone(s.eng.continuation_plan(661))  # once
 
+    def test_with_a_move_still_owed_the_learner_resumes_with_it(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("Thanks for your time, bye.", 100)  # the one redirect
+        self.assertTrue(s.say("Okay, goodbye then.", 150).aside)
+        s.say("No, carry on.", 153)
+        # Right after the redirect's objection nothing is due yet: one real question instead.
+        quiet = Session(engine())
+        quiet.say(OPENER, 20)
+        quiet.say("Thanks for your time, bye.", 100)
+        quiet.say("Okay, goodbye then.", 150)
+        quiet.say("No, carry on.", 153)
+        free = quiet.eng.continuation_plan(155)
+        self.assertEqual(free.mode, TurnMode.LLM_REPLY)
+        self.assertIn(r1_roleplay.CONTINUE_NOTE, free.reminder)
+        follow = s.eng.continuation_plan(425)  # F3's push is due by 7:10
+        self.assertEqual((follow.mode, follow.move_id), (TurnMode.INTENT, "F3-PUSH"))
+        self.assertIn("continuation:resume", follow.reasons)
+        self.assertIn(r1_roleplay.CONTINUE_NOTE, follow.reminder)
+        self.assertFalse(follow.intent.brief.startswith(r1_roleplay.REDIRECT_BRIEF))
+
     def test_at_most_two_asks_and_never_a_silent_exit_before_fourteen(self):
         s = done_session()
         r = 600.0
