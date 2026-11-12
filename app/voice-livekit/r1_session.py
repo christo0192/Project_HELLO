@@ -1373,17 +1373,25 @@ _IB_QUIET_WORDS = _ACK_WORDS | _IB_ADDRESS_WORDS | frozenset(
 # M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``): the reply to the hello's "Can you hear me okay?",
 # read on folded text and never by the model.  Three readings:
 #
-# * ``SOUND_CANT_HEAR``: a directed complaint anywhere in the turn ("I can't hear you", "I can
-#   barely hear you", "not able to hear you", "you're breaking up", "your voice is very low", "you
-#   sound a bit muffled", "can you speak up?"); a request to say it again or a presence check
-#   ("Sorry?", "Could you repeat that?", "Hello? Are you there?", a bare "Hello?"); or, the whole
-#   turn of at most ``OPEN_CHECK_COMPLAINT_MAX_WORDS`` words, a bare negative or a quality
-#   complaint ("No.", "Not really.", "Barely.", "It's a bit low.", "There's an echo.").  Directed
-#   on purpose: "our customers could not hear the offer" is an answer, not a complaint, and so is
-#   "No problem".
+# * ``SOUND_CANT_HEAR``: a directed complaint anywhere in the turn ("I can't hear you", "I can't
+#   hear your voice", "I can barely hear you", "not able to hear you", "you're breaking up", "your
+#   voice is little low", "voice is not clear", "the audio is breaking", "you sound a bit
+#   muffled", "I can hear you but not clearly", "can you speak up?", "can you increase the
+#   volume?"); a request to say it again ("Sorry?", "Could you repeat that?"); after the question
+#   only, a presence check or a bare questioning sound ("Hello? Are you there?", "Hello?",
+#   "What?", "Hmm?"); or, the whole turn of at most ``OPEN_CHECK_COMPLAINT_MAX_WORDS`` words, a
+#   bare negative or a quality complaint ("No.", "Not really.", "Barely.", "Not audible.", "Not
+#   clear.", "Low.", "It's a bit low.", "Volume is low.", "There's an echo.", "There is some
+#   disturbance.", "Louder, please.").  Directed on purpose: "our customers could not hear the
+#   offer" is an answer, not a complaint, and so is "No problem".
 # * ``SOUND_ANSWER``: an early answer, ``OPEN_CHECK_ANSWER_WORDS`` content words or more once the
-#   greetings, courtesy and hearing words are out (``content_word_count``).
-# * ``SOUND_HEARD``: anything else ("Yes", "Hi Christy!", "Can you hear me?": we just did).
+#   greetings, courtesy and hearing words are out (``content_word_count``), that tells something
+#   about the candidate (``_SOUND_ANSWER_CUE_RE``: "I have been working in", "my last job", "four
+#   years in sales") and does not end on a question to Christy.  Review of S7C: a long courtesy, a
+#   check-back ("I hope you can hear me as well") or a hold ("give me one second, I'm closing the
+#   door") is no answer to go on with: it gets the agenda, which asks the first question.
+# * ``SOUND_HEARD``: anything else ("Yes", "Hi Christy!", "Hello Christy?", "Can you hear me?": we
+#   just did).
 SOUND_CANT_HEAR = "cant_hear"
 SOUND_ANSWER = "answer"
 SOUND_HEARD = "heard"
@@ -1391,52 +1399,109 @@ _NEG_AUX = (
     r"(?:can not|cannot|can't|cant|could not|couldn't|couldnt|did not|didn't|didnt|do not|don't|"
     r"dont)"
 )
-# What may follow "hear" in a complaint: Christy ("you"), nothing at all ("anything", "a thing"), or
-# the end of the turn or an adverb or address word.  "We couldn't hear the customer" is not one.
-_HEAR_OBJECT = (
-    r"(?: (?:you|anything|a thing|much|what you)\b|$| (?=(?:properly|clearly|well|at all|now|"
-    r"christy|sir|ma'am|maam|madam|sorry|please)\b))"
-)
-_SOUND_CHECK_CANT_HEAR_RE = re.compile(
-    r"(?:^|\b(?:i|we) )(?:"
-    # "I can't hear you (properly)", "couldn't hear anything", "I can barely hear you"
-    + _NEG_AUX + r"(?: really| quite| properly| clearly)? hear" + _HEAR_OBJECT + r"|"
-    r"(?:can|could) (?:barely|hardly|only just) hear" + _HEAR_OBJECT + r"|"
-    r"(?:was|were|am|are) (?:not able|unable) to hear" + _HEAR_OBJECT
-    + r")|"
-    r"\b(?:i'm|im|we're) (?:not able|unable) to hear" + _HEAR_OBJECT + r"|"
-    # "you're breaking up", "your voice is very low", "you sound a bit muffled"
-    r"\b(?:you(?:'re| are| sound| seem)|your (?:voice|audio|sound|volume|mic|microphone) "
-    r"(?:is|was|sounds|seems)|the (?:sound|audio|volume|voice) (?:is|was|sounds)) "
-    r"(?:(?:a (?:bit|little)|very|too|quite|really|so|kind of) )?"
-    r"(?:breaking up|cutting (?:out|off)|low|faint|soft|quiet|muffled|unclear|"
-    r"not (?:audible|clear)|choppy|robotic|distorted|echoing|lagging)\b|"
-    # "can you speak up?", "please speak louder"
-    r"\bspeak(?: a (?:little )?bit| a little)? (?:up|louder|more loudly)\b"
-)
+# Words a reply may open with before what it says ("Sorry, not audible.", "Yes, but it's low.").
 _SOUND_CHECK_LEAD = (
     r"(?:(?:yes|yeah|okay|ok|um|uh|hmm|sorry|but|well|actually|so|hi|hello|christy|sir|ma'am|maam|"
     r"mam|madam) )*"
+)
+# What may follow "hear" in a complaint: Christy ("you", "your voice", "the audio"), nothing at all
+# ("anything", "a thing"), or the end of the turn or an adverb or address word.  "We couldn't hear
+# the customer" is not one.
+_HEAR_OBJECT = (
+    r"(?: (?:you|anything|a thing|much|what you)\b|"
+    r" (?:your|the) (?:voice|audio|sound)\b|$| (?=(?:properly|clearly|well|at all|now|christy|"
+    r"sir|ma'am|maam|madam|sorry|please)\b))"
+)
+# How much: "a bit low", "little low", "very low", "slightly muffled".
+_SOUND_DEGREE = (
+    r"(?:(?:a (?:bit|little)|little|bit|very|too|quite|really|so|kind of|slightly|somewhat) )?"
+)
+# What is wrong with the sound.  Bare "breaking" and "cutting" only after a sound is named.
+_SOUND_FAULTS = (
+    r"breaking up|cutting (?:out|off)|low|faint|soft|quiet|muffled|unclear|inaudible|"
+    r"not (?:very |that |so )?(?:audible|clear|loud)|choppy|robotic|distorted|echoing|lagging"
+)
+_SOUND_CHECK_CANT_HEAR_RE = re.compile(
+    r"(?:^" + _SOUND_CHECK_LEAD + r"|\b(?:i|we) )(?:"
+    # "I can't hear you (properly)", "couldn't hear your voice", "I can barely hear you",
+    # "not able to hear you"
+    + _NEG_AUX + r"(?: really| quite| properly| clearly)? hear" + _HEAR_OBJECT + r"|"
+    r"(?:can|could) (?:barely|hardly|only just) hear" + _HEAR_OBJECT + r"|"
+    r"(?:(?:was|were|am|are) )?(?:not able|unable) to hear" + _HEAR_OBJECT
+    + r")|"
+    r"\b(?:i'm|im|we're) (?:not able|unable) to hear" + _HEAR_OBJECT + r"|"
+    # "you're breaking up", "you sound a bit muffled"
+    r"\byou(?:'re| are| sound| seem) " + _SOUND_DEGREE + r"(?:" + _SOUND_FAULTS + r")\b|"
+    # "your voice is little low", "voice is not clear", "the audio is breaking"
+    r"\b(?:(?:your|the) )?(?:voice|audio|sound|volume|mic|microphone)(?: quality)? "
+    r"(?:is|was|sounds|seems|keeps)(?: (?:getting|going))? " + _SOUND_DEGREE
+    + r"(?:" + _SOUND_FAULTS + r"|breaking|cutting|disturbed|fluctuating)\b|"
+    # "I can hear you but not clearly", "I can hear you, but it is very low"
+    r"\bhear(?: you| it)?(?: (?:now|okay|ok|fine))? but (?:(?:it(?:'s| is)|you(?:'re| are)) )?"
+    + _SOUND_DEGREE + r"(?:not (?:clearly|properly|very well|that well|well)|" + _SOUND_FAULTS
+    + r")\b|"
+    # "can you speak up?", "please speak louder", "can you increase the volume?"
+    r"\bspeak(?: a (?:little )?bit| a little)? (?:up|louder|more loudly)\b|"
+    r"\b(?:(?:can|could|would) you|please) (?:please |kindly )?(?:increase|raise|turn up)"
+    r"(?: the| your)? (?:volume|sound)\b"
 )
 _SOUND_CHECK_SHORT_RE = re.compile(
     r"^" + _SOUND_CHECK_LEAD + r"(?:"
     r"(?:no|nope|nah|nahi|nahin)(?: (?:no|not (?:really|clearly|properly|very well|much|quite|at "
     r"all|yet)))*|"
-    r"not (?:really|clearly|properly|very well|much|quite|at all|yet)|"
-    r"barely|hardly|(?:very )?faintly|"
-    r"(?:it(?:'s| is)|that(?:'s| is)|you(?:'re| are)|the (?:sound|audio|voice|volume) is) "
-    r"(?:(?:a (?:bit|little)|very|too|quite|really|so) )?"
-    r"(?:low|faint|soft|quiet|muffled|unclear|choppy|robotic|distorted|breaking|breaking up|"
-    r"echoing|lagging)|"
-    r"there(?:'s| is) (?:an |some |a lot of |a bit of )?(?:echo|noise|static|lag|delay)|"
-    r"(?:a (?:bit|little)|very|too) (?:low|faint|quiet|soft)"
-    r")(?: sorry)?$"
+    r"not (?:really|clearly|properly|very well|much|quite|at all|yet|audible|clear|loud enough|"
+    r"(?:very|that|so) (?:clear|clearly|audible))|"
+    r"inaudible|barely|hardly|(?:very )?faintly|"
+    r"(?:(?:it(?:'s| is)|that(?:'s| is)|you(?:'re| are)|(?:the )?(?:sound|audio|voice|volume) is) )?"
+    + _SOUND_DEGREE
+    + r"(?:low|faint|soft|quiet|muffled|unclear|choppy|robotic|distorted|breaking|breaking up|"
+    r"echoing|lagging|not (?:audible|clear))|"
+    r"there(?:'s| is) (?:an |some |a lot of |a bit of )?(?:echo|noise|static|lag|delay|"
+    r"disturbance)|"
+    r"(?:a (?:little )?bit |a little |little )?louder(?: please)?|volume up(?: please)?"
+    r")(?: (?:sorry|please|sir|ma'am|maam|mam|madam|christy))?$"
+)
+# Review of S7C: what an early answer tells about the candidate.  First person with a work or
+# study verb ("I have been working in", "I handled", "we sell", "I started my career", "I did my
+# graduation"), "currently working", "from a sales background", a background noun of theirs ("my
+# last job", "my experience"), a role ("I'm a sales executive") or a span of time ("four years in
+# sales").  A courtesy, a check-back or a hold has none of these.
+_SOUND_ANSWER_CUE_RE = re.compile(
+    r"\b(?:"
+    r"(?:i|we)(?:'ve|'m|'d| have| had| am| was| were)?(?: been)?"
+    r"(?: (?:also|mostly|currently|recently|previously|just))? "
+    r"(?:work|works|worked|working|sell|selling|sold|handle|handling|handled|manage|managing|"
+    r"managed|lead|leading|led|run|running|ran|studied|study|studying|graduated|completed|joined|"
+    r"moved|switched|spent|started my|did my|done my|doing my)\b|"
+    r"(?:currently|presently) (?:working|employed|handling|selling|managing)\b|"
+    r"from an? (?:\w+ )?background\b|"
+    r"my (?:(?:last|previous|current|first|present) )?(?:background|experience|career|job|role|"
+    r"work|company|team|degree|graduation|education|profile|organisation|organization|employer)\b|"
+    r"(?:i'm|im|i am) (?:a|an) (?:\w+ )?(?:executive|manager|advisor|adviser|associate|counsellor|"
+    r"counselor|consultant|engineer|graduate|fresher|student|representative|officer|specialist|"
+    r"analyst|lead)\b|"
+    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|"
+    r"a couple of|a few|few|several) (?:\w+ )?(?:years?|months?)\b"
+    r")"
 )
 _HELLO_ONLY_WORDS = frozenset({"hello", "hi", "hey"}) | _IB_ADDRESS_WORDS
+# After the question, a bare questioning sound ("What?", "Hmm?", "Huh?") did not catch it.
+_SOUND_QUERY_WORDS = frozenset({"what", "hmm", "hm", "huh", "eh"}) | _IB_ADDRESS_WORDS
 
 
-def sound_check_reading(text: str) -> str:
-    """How the reply to the hello's "Can you hear me okay?" reads (see the comment above)."""
+def _ends_on_question(text: str) -> bool:
+    """True when the last thing said is a question ("..., so how long will this take?")."""
+    stripped = str(text or "").rstrip().rstrip("\"'”’)")
+    return stripped.endswith(("?", "？"))
+
+
+def sound_check_reading(text: str, *, after_question: bool = True) -> str:
+    """How the reply to the hello's "Can you hear me okay?" reads (see the comment above).
+
+    ``after_question`` is False when every word of ``text`` was said over the hello itself
+    (review of S7C): a "Hello?" or "Are you there?" on joining, before the question was heard,
+    says nothing about hearing it, and reads as heard.
+    """
     folded = _repair_fold(text)
     if not folded:
         return SOUND_HEARD
@@ -1446,14 +1511,22 @@ def sound_check_reading(text: str) -> str:
     words = folded.split()
     if len(words) <= OPEN_CHECK_COMPLAINT_MAX_WORDS and _SOUND_CHECK_SHORT_RE.match(folded):
         return SOUND_CANT_HEAR
-    if view and (
-        is_repeat_request(view)
-        or (is_repair_turn(view) and _STILL_THERE_RE.search(view) is not None)
-    ):
+    if view and is_repeat_request(view):
         return SOUND_CANT_HEAR
-    if _has_question_mark(text) and all(word in _HELLO_ONLY_WORDS for word in words):
-        return SOUND_CANT_HEAR  # a bare "Hello?" after the question: they did not hear it
-    if content_word_count(text) >= OPEN_CHECK_ANSWER_WORDS:
+    if after_question and _has_question_mark(text):
+        if view and is_repair_turn(view) and _STILL_THERE_RE.search(view) is not None:
+            return SOUND_CANT_HEAR  # "Hello? Are you there?"
+        named = any(word in _INTERVIEWER_NAMES for word in words)  # "Hello Christy?" heard her
+        if not named and (
+            all(word in _HELLO_ONLY_WORDS for word in words)
+            or all(word in _SOUND_QUERY_WORDS for word in words)
+        ):
+            return SOUND_CANT_HEAR  # a bare "Hello?" or "What?" after the question
+    if (
+        content_word_count(text) >= OPEN_CHECK_ANSWER_WORDS
+        and _SOUND_ANSWER_CUE_RE.search(folded) is not None
+        and not _ends_on_question(text)
+    ):
         return SOUND_ANSWER
     return SOUND_HEARD
 

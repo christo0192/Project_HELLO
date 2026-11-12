@@ -10699,6 +10699,106 @@ class TestTheSoundCheckReader(unittest.TestCase):
             r1_session.SOUND_CANT_HEAR,
         )
 
+    # Review of S7C: the complaints this candidate pool says most, Indian-English forms included.
+    # Each read as heard before, so Christy said "Good, I can hear you." to someone who could not.
+    CANT_HEAR_RECALL = (
+        "I can't hear your voice.",
+        "I can't hear your voice clearly.",
+        "I cannot hear the audio.",
+        "Not audible.",
+        "Not audible, ma'am.",
+        "Sorry, not audible.",
+        "Not clear.",
+        "It's not clear.",
+        "Audio is not clear.",
+        "Voice is not clear.",
+        "Your voice is not clear.",
+        "Not able to hear you.",
+        "Not able to hear you properly.",
+        "Unable to hear you.",
+        "I not able to hear you.",
+        "Your voice is breaking.",
+        "Voice is breaking.",
+        "Your voice is cutting.",
+        "Your voice is little low.",
+        "Little low.",
+        "Low.",
+        "Volume is low.",
+        "Sound is very low.",
+        "There is some disturbance.",
+        "I can hear you but it is very low.",
+        "I can hear you, but not clearly.",
+        "Yes, but not clearly.",
+        "Yes I can hear you but your voice is breaking.",
+        "Can you increase the volume?",
+        "Louder, please.",
+        "What?",
+        "Hmm?",
+    )
+    # Review of S7C: long replies that tell nothing about the candidate.  They read as an early
+    # answer before, so Christy said "Please, carry on with what you were telling me." and counted
+    # an icebreaker answer that was never given.
+    NOT_AN_EARLY_ANSWER = (
+        "Yes I can hear you, I hope my voice is also clear to you, please let me know if there is "
+        "any issue.",
+        "Yes, I can hear you. Just give me one second, let me plug in my headphones so the audio "
+        "is better.",
+        "Yes I can hear you perfectly fine, I hope you can hear me as well, my internet connection "
+        "is stable now.",
+        "Hi Christy, yes I can hear you. Just give me one second, I'm closing the door because "
+        "there is a lot of noise outside.",
+        "Yes, I can hear you clearly. Thank you so much for giving me this opportunity, I am "
+        "really excited and a little nervous to be talking with you today.",
+        # An answer that ends on a question to her: the agenda says how long it takes.
+        "Yes. I have been working in sales for four years, but before we start, how long will "
+        "this interview take?",
+    )
+
+    def test_the_complaints_candidates_say_most_read_as_cant_hear(self) -> None:
+        for text in self.CANT_HEAR_RECALL:
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), r1_session.SOUND_CANT_HEAR)
+
+    def test_a_long_reply_that_tells_nothing_about_them_is_no_early_answer(self) -> None:
+        for text in self.NOT_AN_EARLY_ANSWER:
+            with self.subTest(text=text):
+                self.assertGreaterEqual(
+                    r1_session.content_word_count(text), r1_session.OPEN_CHECK_ANSWER_WORDS
+                )
+                self.assertEqual(self.read(text), r1_session.SOUND_HEARD)
+
+    def test_an_early_answer_tells_about_them(self) -> None:
+        for text in (
+            "Hi, I am Priya. I have done my MBA in marketing and am currently working at a bank "
+            "as a relationship executive.",
+            "Yes, I can hear you. I did my graduation in commerce and since then I have been "
+            "handling inbound sales calls.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), r1_session.SOUND_ANSWER)
+
+    def test_a_questioning_hello_that_names_her_heard_her(self) -> None:
+        for text in ("Hello Christy?", "Hi Christy?"):
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), r1_session.SOUND_HEARD)
+        self.assertEqual(self.read("Hello sir?"), r1_session.SOUND_CANT_HEAR)
+
+    def test_a_hello_said_over_the_hello_is_no_complaint(self) -> None:
+        # Review of S7C: said before the question was heard (a line check on joining), "Hello?"
+        # says nothing about hearing it.  A complaint is one whenever it is said.
+        for text in ("Hello?", "Hello? Are you there?", "Hi, hello?", "What?"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    r1_session.sound_check_reading(text, after_question=False),
+                    r1_session.SOUND_HEARD,
+                )
+        for text in ("Sorry, I can't hear you.", "Not audible.", "Could you repeat that?"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    r1_session.sound_check_reading(text, after_question=False),
+                    r1_session.SOUND_CANT_HEAR,
+                )
+
     def test_the_readers_are_linear_on_long_input(self) -> None:
         for text in (
             "no " * 5000,
@@ -10706,6 +10806,12 @@ class TestTheSoundCheckReader(unittest.TestCase):
             "you are " + "a bit " * 4000 + "low",
             "yes but " * 4000 + "it's low",
             "hello " * 5000 + "?",
+            "voice is " + "very " * 4000 + "low",
+            "i can hear you but " * 2000 + "low",
+            "i have been " * 3000 + "working",
+            "a bit " * 5000 + "louder",
+            "sorry " * 5000 + "not audible",
+            "four " * 5000 + "years",
         ):
             started = time.perf_counter()
             self.read(text)
