@@ -66,6 +66,7 @@ from r1_text import (
     fold,
     fuzzy_contains,
     is_question_like,
+    normalize,
     split_sentences,
     word_count,
 )
@@ -118,6 +119,13 @@ REDIRECT_OPENERS = (
 REDIRECT_BRIEF = (
     "the advisor sounds like they are wrapping up the call, so stop them politely for a "
     "moment because you have one more thing to bring up; then"
+)
+# M032 SWEEP-24 (flag R1_LATE_END_REQUEST): from R = 14:00 an explicit request to end the exercise
+# when one owed move completes the schedule: Christy says it will stop in a moment
+# (L-ASIDE-LAST-POINT) and the learner raises that move with this brief in place of REDIRECT_BRIEF,
+# with no "Oh wait, before you go" opener.  Worker-authored, listed for review (D-M032-4).
+LAST_POINT_BRIEF = (
+    "the call is about to end, so raise this one last thing briefly, in a sentence or two; then"
 )
 
 
@@ -1580,6 +1588,90 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     return False
 
 
+# M032 S3.1 (flag R1_CLOSING_STATE; RCA END-1, fda9e9f6 #73-#90: "take your time and call me back
+# later" and "get back to us" were never read as closes, so the learner filled four goodbye
+# cycles).  A hand-over close ENDS the turn and nothing is asked after it: "call me back (later)"
+# and "get back to me/us", with only a time and courtesy after them.  ``is_close_attempt`` and the
+# corpus's ``farewell`` labels are unchanged: this is the engine's own, flagged reading, and before
+# 14:00 it reaches Christy's question, never a silent exit.  "Take your time", "no rush" and "no
+# pressure" alone are how an advisor waits for an answer mid-call (corpus: "Take your time." is
+# no farewell), so they close only right after her own sign-off (``after_sign_off``).
+_HANDOVER_WHEN = (
+    r"(?: (?:later(?: on)?|anytime|any time|tomorrow|whenever(?: you(?:'re| are) (?:ready|free))?"
+    r"|when(?:ever)? you(?:'re| are) (?:ready|free|done)|once you(?:'ve| have) decided"
+    r"|after you(?:'ve| have) (?:talked|spoken|decided)(?: (?:to|with) (?:him|her|them))?))?"
+)
+_HANDOVER_TAIL = (
+    r"(?:[\s,]+(?:then|okay|ok|please|thanks|thank you|bye|take care|no rush|no pressure))*"
+    r"[\s.!]*$"
+)
+_HANDOVER_CLOSE = _compile(
+    r"\bcall (?:me|us) back" + _HANDOVER_WHEN + _HANDOVER_TAIL,
+    r"\bget back to (?:me|us)" + _HANDOVER_WHEN + _HANDOVER_TAIL,
+)
+# The whole sentence is the wait ("Sure, take your time.", "Take your time, no rush."): "Just a
+# quick check-in, no pressure." is the advisor still talking.
+_WAIT_PHRASE = r"(?:take (?:all )?your time|no rush|no hurry|no pressure)"
+_WAIT_FOR_HER = _compile(
+    r"^\W*(?:(?:sure|okay|ok|of course|no problem|absolutely|alright|yes|yeah|that'?s fine)"
+    r"[,\s]+){0,3}" + _WAIT_PHRASE + r"(?:[,\s]+" + _WAIT_PHRASE + r")?" + _HANDOVER_TAIL,
+)
+# A sentence of courtesy alone ("Thank you.", "Bye.", "Take care, Divya.") after the close.
+_COURTESY_WORDS = frozenset(
+    "thank thanks you so much very bye goodbye take care okay ok alright sure great have a nice "
+    "good day evening then all the best talk soon later again".split()
+)
+COURTESY_MAX_WORDS = 8
+
+
+def _courtesy_sentence(sentence: str) -> bool:
+    words = normalize(sentence).split()
+    if len(words) > COURTESY_MAX_WORDS:
+        return False
+    unknown = [word for word in words if word not in _COURTESY_WORDS]
+    return len(unknown) <= 1 and (not unknown or len(words) >= 2)
+
+
+def hands_over_close(text: object, *, after_sign_off: bool = False) -> bool:
+    """S3.1: the advisor closes in role by handing over ("Take your time and call me back later.").
+
+    Read on the turn's last sentence that is not courtesy alone, which must hold no question.
+    ``after_sign_off``: her own last line signed off, so "Sure, take your time." closes too.
+    """
+    sentences = _sentences(fold(text)[-CLOSE_MAX_CHARS:])
+    while len(sentences) > 1 and _courtesy_sentence(sentences[-1]):
+        sentences.pop()
+    if not sentences or "?" in sentences[-1]:
+        return False
+    last = sentences[-1]
+    if any(pattern.search(last) for pattern in _HANDOVER_CLOSE):
+        return True
+    return after_sign_off and any(pattern.search(last) for pattern in _WAIT_FOR_HER)
+
+
+# S3.1: the words of a courtesy-only advisor turn ("Sure. Thank you.", "Yeah, sure.", "Okay, no
+# problem, take care."): right after her own sign-off it is a mutual goodbye.
+_COURTESY_TURN_WORDS = frozenset(
+    {*_COURTESY_WORDS, "yes", "yeah", "yep", "fine", "perfect", "cool", "no", "problem",
+     "worries", "of", "course", "absolutely", "definitely", "sounds", "good", "that", "works",
+     "your", "time", "hmm", "mm", "mhm", "noted", "got", "it", "understood", "will", "do",
+     "right"}
+)
+COURTESY_TURN_MAX_WORDS = 10
+
+
+def courtesy_only(text: object) -> bool:
+    """S3.1: an advisor turn of courtesy and acknowledgement alone, asking nothing."""
+    folded = fold(text)
+    if "?" in folded:
+        return False
+    words = normalize(folded).split()
+    return (
+        0 < len(words) <= COURTESY_TURN_MAX_WORDS
+        and all(word in _COURTESY_TURN_WORDS for word in words)
+    )
+
+
 def _is_closing_tail(sentence: str) -> bool:
     """A sentence that may follow "thanks for your time" in a sign-off.
 
@@ -2244,6 +2336,32 @@ class OwedMoveScheduler:
             if state.enabled_sec is None:
                 state.enabled_sec = r_sec
             return self._owed(state, r_sec, True)
+        return None
+
+    def required_pending(self) -> tuple[str, ...]:
+        """M032 SWEEP-24: the required graded moves not yet delivered, in plan order (pure)."""
+        return tuple(
+            spec.id
+            for spec in PLAN
+            if spec.required and spec.family in FAMILIES and not self._delivered(spec.id)
+        )
+
+    def next_forced_peek(self, r_sec: float) -> OwedMove | None:
+        """M032 SWEEP-24: the move ``_force_next`` would give, without changing any state.
+
+        Neither its enabled time nor the redirect's give-back record is touched; ``r_sec`` is only
+        the reading time of the ``OwedMove`` returned.
+        """
+        open_family = self.open_family
+        for spec in PLAN:
+            if spec.id in (COMMIT_STALL, TIME_CUE):
+                continue
+            if open_family is not None and spec.family != open_family:
+                continue
+            state = self._states[spec.id]
+            if state.status != "pending":
+                continue
+            return self._owed(state, r_sec, True)  # reads the state, sets nothing
         return None
 
     def return_to_pending(self, move_id: str) -> bool:

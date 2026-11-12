@@ -410,6 +410,14 @@ def _endings() -> dict[str, Any]:
             },
             "own_content_words": r1_guard.OWN_CONTENT_WORDS,
         },
+        # S3.2, S3.3, S3.4 and SWEEP-24.
+        "close_note": p.CLOSE_NOTE,
+        "hold_note_v2": p.HOLD_NOTE_V2,
+        "continue_note": p.CONTINUE_NOTE,
+        "cool_note": p.COOL_NOTE,
+        "last_point_brief": r1_scheduler.LAST_POINT_BRIEF,
+        "early_close_ask_limit": 2,
+        "hangup_limit": 2,
         # SWEEP-25 B and SWEEP-27.
         "commit_reaction_brief_v2": r1_negotiation.COMMIT_REACTION_BRIEF_V2,
         "time_cue_brief_v2": r1_scheduler.TIME_CUE_BRIEF_V2,

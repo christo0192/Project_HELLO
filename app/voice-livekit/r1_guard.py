@@ -1392,7 +1392,8 @@ def _reopens(sentence: str) -> bool:
 def _iteration_three_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
     """Misreadings the third live sweep found (hygiene hits: never posted, never a leak)."""
     hits: list[Hit] = []
-    if ctx.hollow and CLOSER.search(sentence) is not None:
+    if ctx.hollow and not ctx.winding and CLOSER.search(sentence) is not None:
+        # M032 S3.2: while the advisor closes the call her one goodbye is the reply's job.
         hits.append(_hit(MISREAD, "closer_again", sentence))
     if _I_CALLED.search(sentence) is not None:
         hits.append(_hit(MISREAD, "learner_called", sentence))
@@ -1714,6 +1715,11 @@ class StreamGuard:
             if pattern.search(text) is None:
                 continue
             if key == PHRASE_DECIDER_STALL and ctx.decider_asked:
+                self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
+                continue
+            if key == PHRASE_STALL_CLOSER and ctx.closing_exempt:
+                # M032 S3.2: the advisor closed the call, so "I'll get back to you, bye" is her
+                # plain goodbye for this one reply, not the stall loop.
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
                 continue
             if self._stall_blocked(key):

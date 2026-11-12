@@ -2158,5 +2158,80 @@ class ProbeFirstSchedulerTests(unittest.TestCase):
         ):
             self.assertFalse(sched.asks_her_number(text), text)
 
+class EndingsSchedulerTests(unittest.TestCase):
+    """M032 S3.1 readers of an in-role close, and SWEEP-24's pure peeks (synthetic text)."""
+
+    @staticmethod
+    def corpus():
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if line:
+                    yield json.loads(line)
+
+    def test_hand_over_closes_end_the_turn(self):
+        for text in ("Take your time and call me back later.", "Talk to him and get back to us.",
+                     "Sure, call me back whenever you're ready. Thank you.",
+                     "Okay, get back to me once you've decided. Bye."):
+            with self.subTest(text=text):
+                self.assertTrue(sched.hands_over_close(text))
+        for text in ("Call me back in ten minutes. Three seats left!",
+                     "Feel free to call me back whenever you have questions.",
+                     "Get back to me by tonight, deal?",
+                     "Once you check with him, get back to me and we'll talk about the EMI options."):
+            with self.subTest(text=text):
+                self.assertFalse(sched.hands_over_close(text))
+
+    def test_waiting_for_her_closes_only_after_her_sign_off(self):
+        for text in ("Take your time.", "Of course, take your time.", "No rush, no pressure."):
+            with self.subTest(text=text):
+                self.assertFalse(sched.hands_over_close(text))
+                self.assertTrue(sched.hands_over_close(text, after_sign_off=True))
+
+    def test_courtesy_only_turns(self):
+        for text in ("Sure. Thank you.", "Yeah, sure.", "Okay.", "Okay, no problem, take care."):
+            with self.subTest(text=text):
+                self.assertTrue(sched.courtesy_only(text))
+        for text in ("Sure, but what is your budget?", "Okay, so the mentors are from Google.",
+                     "Thank you?"):
+            with self.subTest(text=text):
+                self.assertFalse(sched.courtesy_only(text))
+
+    def test_the_corpus_hand_over_hits_are_the_reviewed_ones(self):
+        rows = list(self.corpus())
+        hits = [row["id"] for row in rows if sched.hands_over_close(row["text"])]
+        # Three unscored "... and get back to me." turns; no turn labelled not-a-farewell.
+        self.assertEqual(hits, ["c1917", "c1919", "c1927"])
+        after = [
+            row["id"] for row in rows if sched.hands_over_close(row["text"], after_sign_off=True)
+        ]
+        # Right after her own sign-off a whole-sentence "take your time" or "no pressure" closes
+        # too (labelled not-a-farewell when read without that context).
+        self.assertEqual(after, ["c1104", "c1444", "c1448", "c1917", "c1919", "c1927"])
+
+    def test_the_peeks_change_nothing(self):
+        scheduler = sched.OwedMoveScheduler("husband")
+        before = scheduler.summary()
+        peek = scheduler.next_forced_peek(500)
+        self.assertEqual(peek.id, sched.F3_PRIMARY)
+        self.assertEqual(scheduler.summary(), before)
+        self.assertIsNone(scheduler._states[sched.F3_PRIMARY].enabled_sec)
+        self.assertEqual(len(scheduler.required_pending()), 8)
+        for move_id in scheduler.required_pending()[:-1]:
+            scheduler.confirm_delivered(move_id, 600)
+        self.assertEqual(scheduler.required_pending(), (sched.F4_PUSH,))
+        self.assertEqual(scheduler.next_forced_peek(860).id, sched.F4_PUSH)
+
+    def test_the_readers_stay_linear(self):
+        import time
+
+        for hostile in ("call me back " * 3000, "thank you. " * 3000, "sure " * 5000,
+                        "get back to us" + ", thanks" * 3000):
+            start = time.perf_counter()
+            sched.hands_over_close(hostile, after_sign_off=True)
+            sched.courtesy_only(hostile)
+            self.assertLess(time.perf_counter() - start, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

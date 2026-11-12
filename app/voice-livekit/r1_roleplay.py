@@ -219,7 +219,10 @@ from r1_prompts import (
     CHECKIN_DONE_NOTE,
     BUDGET_OVER_NOTE,
     CHECKIN_NOTE,
+    CLOSE_NOTE,
     COACH_RESUME_NOTE,
+    CONTINUE_NOTE,
+    COOL_NOTE,
     CONCERN_LABELS,
     DECIDER_ASKED_NOTE,
     DECIDER_SAID_NOTE,
@@ -234,6 +237,7 @@ from r1_prompts import (
     PRICE_RISE_NOTE,
     HINGE_USED_NOTE,
     HOLD_NOTE,
+    HOLD_NOTE_V2,
     HOLLOW_CONCERNS_NOTE,
     HOLLOW_NOTE,
     CUT_REPEAT_NOTE,
@@ -285,6 +289,7 @@ from r1_scheduler import (
     CURIOSITY_LABELS_V2,
     CURIOSITY_TOPICS,
     EARLY_CLOSE_BEFORE_SEC,
+    CloseDecision,
     F4_PRIMARY_SAID_SUFFIX,
     F4_PRIMARY_SAID_VARIANTS,
     PREEMPTED_F2_FORMAT,
@@ -303,6 +308,7 @@ from r1_scheduler import (
     FAMILIES,
     TIME_CUE_SEC,
     IDLE_GAP_TURNS,
+    LAST_POINT_BRIEF,
     PLAN,
     REDIRECT_BRIEF,
     REDIRECT_OPENERS,
@@ -324,6 +330,8 @@ from r1_scheduler import (
     answers_substantively,
     asks_her_directly,
     backs_off,
+    courtesy_only,
+    hands_over_close,
     curiosity_asked_in,
     curiosity_covered,
     f4_push_said,
@@ -359,6 +367,7 @@ from r1_text import (
     fuzzy_contains,
     is_closer,
     is_hollow_turn,
+    is_sign_off,
     normalize,
     not_deciding,
     pick_variant,
@@ -378,6 +387,7 @@ from r1_tracker import (
     confirms_end,
     declines_end,
     declines_wrap_offer,
+    detect_abuse,
     detect_character_break,
     end_intent_level,
     is_bare_yes,
@@ -556,6 +566,25 @@ DISCOVERY_HOLD_LIMIT = 2
 # L5: a monthly figure above the card's budget is checked by the guard for this many turns after
 # the advisor named it (``GuardContext.monthly_quote_usd``).
 MONTHLY_QUOTE_TURNS = 3
+# M032 S3 (endings and abuse).  The closing state (S3.2): OPEN, WINDING (the advisor is closing the
+# call and her reply is one short goodbye), CLOSED (she said it).  The early-close question (S3.3,
+# D-M032-2) is asked at most this often per session, with its own line below R = 10:00, where a stop
+# leaves the attempt unscored; the hang-up (S3.4, D-M032-3) at most this often.  Both are offers
+# answered like L-ASIDE-WRAP (``_wrap_answer_plan``), told apart by their trigger.
+CLOSING_OPEN = "open"
+CLOSING_WINDING = "winding"
+CLOSING_CLOSED = "closed"
+EARLY_CLOSE_ASK_LIMIT = 2
+EARLY_CLOSE_LINE = "L-ASIDE-EARLY-CLOSE"
+EARLY_CLOSE_TIME_LINE = "L-ASIDE-EARLY-CLOSE-TIME"
+LAST_POINT_LINE = "L-ASIDE-LAST-POINT"
+HANGUP_LINE = "L-LEARNER-HANGUP"
+HANGUP_ASIDE_LINE = "L-ASIDE-HANGUP"
+HANGUP_LIMIT = 2
+TRIGGER_EARLY_CLOSE = "early_close"
+TRIGGER_ABUSE = "abuse"
+# The asides whose triggering turn was said to the learner, in role: its row stays a role-play row.
+IN_ROLE_ASIDE_REASONS = ("wrap_offer:", "early_close:", "abuse_hangup")
 
 # M032 S1 (learner timing + memory, owner decisions D-M032-1 and D-M032-4).  Each behaviour has a
 # rollback flag, read at use, default ON; "0", "off", "false" or "no" restores the behaviour of
@@ -925,6 +954,11 @@ class TurnPlan:
     probe_first: bool = False
     price_check: bool = False
     probe: str | None = None
+    # M032 S3: a scripted LEARNER line the session says before this aside (S3.4: her one-line
+    # hang-up before Christy's question), and whether the learner carries on right after the aside
+    # (S3.3's resume and SWEEP-24's last point: the session asks ``continuation_plan``).
+    prelude_line: str | None = None
+    continuation: bool = False
 
     @property
     def needs_llm(self) -> bool:
@@ -1250,6 +1284,24 @@ class RolePlayEngine:
         self._learner_asked_email = False
         self._commit_reaction_dropped = 0
         self._short_on_time_notes = 0
+        # S3.1 and S3.2: the closing state, whether her last heard line signed off (a line that
+        # carried no owed move or negotiation line), how often each state was entered, and the
+        # closes read in role.  S3.3: the learner line owed right after an aside (("resume", None)
+        # or ("last_point", move id)).  SWEEP-24: the last point asked for and whether the next
+        # real turn ends the role-play.  S3.4: abusive turns, and whether she is cool after a
+        # resumed hang-up.
+        self._closing = CLOSING_OPEN
+        self._closing_states: dict[str, int] = {}
+        self._last_reply_signoff = False
+        self._handover_closes = 0
+        self._mutual_goodbyes = 0
+        self._winding_replies = 0
+        self._continuation_due: tuple[str, str | None] | None = None
+        self._last_point: dict[str, Any] | None = None
+        self._exit_after_last_point = False
+        self._late_end_requests = 0
+        self._abuse_count = 0
+        self._cool = False
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -1532,6 +1584,15 @@ class RolePlayEngine:
         lost_half, self._lost_half = self._lost_half, None
         self._turn_kinds = frozenset()
         carried: _LostHalf | None = None  # M032 S1: the first half of a split answer
+        if self._exit_after_last_point:
+            # M032 SWEEP-24: her last point was said after an explicit request to end; the next
+            # real turn ends the role-play.
+            latched = self._after_last_point(
+                candidate_text, turn_index, backchannel=backchannel, repair=repair
+            )
+            if latched is not None:
+                self._restore_lost(lost_undo)
+                return latched
         if self._wrap_open:
             # M2: this turn answers the interviewer's offer to wrap up (L-ASIDE-WRAP).
             answer = self._wrap_answer_plan(
@@ -1575,8 +1636,10 @@ class RolePlayEngine:
         # ``end_level``; the end-intent model's verdict (``end_intent``) may raise it within the
         # rails of ``end_intent_level`` (owner decision 2026-10-30).  A first request at level
         # "end" is confirmed at once, one at "maybe" gets the question.
-        end_level = end_intent_level(candidate_text, end_intent)
-        lexical_level = end_intent_level(candidate_text, None)
+        # M032 SWEEP-24 (c): "You can disconnect the call." is a request too ("maybe" only).
+        late_on = flag_on(FLAG_LATE_END_REQUEST)
+        end_level = end_intent_level(candidate_text, end_intent, permission=late_on)
+        lexical_level = end_intent_level(candidate_text, None, permission=late_on)
         # Reviewed fix (2026-10-30): once the question has been asked and has closed (declined, or
         # answered by talk about the sale), a "later request" that confirms the stop at once must
         # be the candidate's own words, never a model-only "maybe": after a declined aside, "At the
@@ -1634,6 +1697,18 @@ class RolePlayEngine:
             if end_level == "end":
                 return self._end_plan(turn_index, r_sec=r_sec, by_model=by_model)
             return self._end_aside_plan(r_sec, turn_index, by_model=by_model)
+        if (
+            late_on
+            and end_level == "end"
+            and not out_of_role
+            and not promises_call_back(candidate_text)
+        ):
+            # M032 SWEEP-24: from 14:00 (or with a commitment on record) an explicit request to end
+            # the interview or the role play is never answered in role (the farewell ladder said
+            # "Oh wait, before you go..." and an owed move, and only a second request exited).
+            self._end_pending = False
+            self._restore_lost(lost_undo)
+            return self._late_end_request(turn_index, r_sec=r_sec, by_model=by_model)
         break_kind = detect_character_break(candidate_text)
         if lost is not None:
             if (
@@ -1820,16 +1895,49 @@ class RolePlayEngine:
             reasons.append("end_request_as_farewell")
             if by_model:
                 reasons.append("end_intent_model")
+        # M032 S3.4 (D-M032-3): abuse aimed at her.  She hangs up in role and Christy asks; the
+        # turn was said to her and stays evidence, and scoring is unchanged.
+        if detect_abuse(reading):
+            self._abuse_count += 1
+            if (
+                flag_on(FLAG_ABUSE_HANGUP)
+                and self._hangups() < HANGUP_LIMIT
+                and not self._question_open()
+            ):
+                return self._hangup_plan(r_sec, turn_index, reasons)
         if self._unheard_commitment is not None:
             revoiced = self._revoice_commitment(r_sec, reasons)
             if revoiced is not None:
                 return revoiced
-        if signals.close_attempt or farewell_end:
+        close_attempt = signals.close_attempt
+        if flag_on(FLAG_CLOSING_STATE):
+            close_attempt = self._read_close(reading, close_attempt, reasons)
+        held_close = False
+        if close_attempt or farewell_end:
             decision = self.scheduler.register_close_attempt(r_sec)
+            if (
+                decision.action == "exit"
+                and r_sec < EARLY_CLOSE_BEFORE_SEC
+                and flag_on(FLAG_EARLY_CLOSE_ASIDE)
+            ):
+                # M032 S3.3 (D-M032-2): before 14:00 an in-role close never ends the role-play
+                # without the candidate's word: Christy asks (at most twice), and once asked out
+                # she says one short goodbye and the role-play goes on.
+                if self._early_asks() < EARLY_CLOSE_ASK_LIMIT and not self._question_open():
+                    return self._early_close_plan(r_sec, turn_index, reasons)
+                reasons.append("close_attempt_held")
+                held_close = True
+                decision = CloseDecision("held", None, "")
             if decision.action == "exit":
                 self.exit_requested = True
                 reasons.append("close_attempt_exit")
                 return self._plan(TurnMode.EXIT, reasons)
+        if held_close:
+            owed_now = self.scheduler.select(r_sec)
+            if owed_now is None or not owed_now.forced:
+                # S3.2: the advisor is closing and the question was asked out: one short, warm
+                # goodbye, no new question (a forced move still lands below).
+                return self._winding_plan(reasons)
         # Disclosure is tied to the turn that asks about the topic: a first probe is answered
         # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
         # DEEP layer, in that very reply.  An owed move that is not forced waits one turn.
@@ -2462,7 +2570,7 @@ class RolePlayEngine:
         return self._end_pending and self._end_question_last
 
     def _end_plan(
-        self, turn_index: int | None, *, r_sec: float, by_model: bool = False
+        self, turn_index: int | None, *, r_sec: float, by_model: bool = False, late: bool = False
     ) -> TurnPlan:
         """The candidate confirmed the stop: the role-play exits into the interviewer's wrap-up.
 
@@ -2482,8 +2590,11 @@ class RolePlayEngine:
         ``end_intent_model`` as well, which also marks a confirmation only the model heard).
         """
         reasons = ["end_confirmed"] + (["end_intent_model"] if by_model else [])
-        if self._end_aside is None:
+        if self._end_aside is None or late:
             reasons.insert(0, "end_request_explicit")
+        if late:
+            reasons.append("end_request_late")  # M032 SWEEP-24: from 14:00, never in role
+        if self._end_aside is None:
             self._end_aside = {
                 "after_roleplay_turn": self.turn,
                 "transcript_turn": turn_index,
@@ -2499,6 +2610,231 @@ class RolePlayEngine:
         self.exit_requested = True
         return self._plan(TurnMode.EXIT, reasons)
 
+    # ------------------------------------------------- M032 S3: endings, the asides and abuse
+    def _question_open(self) -> bool:
+        """An interviewer question or the last point waits for its answer: no new aside now."""
+        return self._wrap_open or self._end_pending or self._exit_after_last_point
+
+    def _early_asks(self) -> int:
+        """How often Christy asked about an in-role close before 14:00 (S3.3)."""
+        return sum(1 for offer in self._wrap_offers if offer["trigger"] == TRIGGER_EARLY_CLOSE)
+
+    def _hangups(self) -> int:
+        """How often the learner hung up on abuse (S3.4)."""
+        return sum(1 for offer in self._wrap_offers if offer["trigger"] == TRIGGER_ABUSE)
+
+    def _enter_closing(self, state: str) -> None:
+        """S3.2: move the closing state (counted per state entered; no text)."""
+        if self._closing != state:
+            self._closing = state
+            self._closing_states[state] = self._closing_states.get(state, 0) + 1
+
+    def _read_close(self, reading: str, close_attempt: bool, reasons: list[str]) -> bool:
+        """S3.1 (R1_CLOSING_STATE): whether this advisor turn closes the call in role.
+
+        Besides ``is_close_attempt``: a hand-over close ("Take your time and call me back
+        later.", ``hands_over_close``), and a courtesy-only or hollow turn right after her own
+        sign-off or her goodbye (a mutual goodbye).  Anything with substance releases the closing
+        state (a question, a pitch, more than courtesy).
+        """
+        signed_off = self._last_reply_signoff or self._closing != CLOSING_OPEN
+        courtesy = courtesy_only(reading) or is_hollow_turn(reading)
+        handover = not close_attempt and hands_over_close(reading, after_sign_off=signed_off)
+        mutual = not close_attempt and not handover and signed_off and courtesy
+        if handover:
+            self._handover_closes += 1
+            reasons.append("handover_close")
+        elif mutual:
+            self._mutual_goodbyes += 1
+            reasons.append("mutual_goodbye")
+        elif not close_attempt and not courtesy and self._closing != CLOSING_OPEN:
+            self._enter_closing(CLOSING_OPEN)  # the advisor said something real: the call goes on
+        return close_attempt or handover or mutual
+
+    def _winding_plan(self, reasons: list[str]) -> TurnPlan:
+        """S3.2: the advisor is closing the call: one short, warm goodbye in her own words."""
+        self._enter_closing(CLOSING_WINDING)
+        reasons.append("closing_winding")
+        return self._plan(TurnMode.LLM_REPLY, reasons, winding=True)
+
+    def _early_close_plan(
+        self, r_sec: float, turn_index: int | None, reasons: list[str]
+    ) -> TurnPlan:
+        """S3.3 (D-M032-2): Christy asks before an in-role close ends the role-play before 14:00.
+
+        R is paused (an aside).  The turn was said to the learner and stays evidence.  Below R =
+        10:00 the line adds that there is still time (a stop there leaves the attempt unscored).
+        A yes ends the role-play, a no resumes it and the learner carries on with a real point
+        (``continuation_plan``); answered like L-ASIDE-WRAP (``_wrap_answer_plan``).
+        """
+        line_id = EARLY_CLOSE_TIME_LINE if r_sec < FIDELITY_MIN_R_SEC else EARLY_CLOSE_LINE
+        self._enter_closing(CLOSING_WINDING)
+        self._wrap_open = True
+        self._wrap_offers.append(
+            {
+                "r_sec": round(r_sec, 1),
+                "trigger": TRIGGER_EARLY_CLOSE,
+                "after_roleplay_turn": self.turn,
+                "transcript_turn": turn_index,
+                "answer": None,
+                "line": line_id,
+            }
+        )
+        return self._wrap_line_plan(line_id, [*reasons, "early_close:offer"])
+
+    def _hangup_plan(self, r_sec: float, turn_index: int | None, reasons: list[str]) -> TurnPlan:
+        """S3.4 (D-M032-3): she ends the call in role in one line, then Christy asks (R paused).
+
+        The session says L-LEARNER-HANGUP in her voice (``prelude_line``), then L-ASIDE-HANGUP.
+        A yes ends the role-play; a no resumes it with her cool (``COOL_NOTE``).  The abusive
+        turn was said to her and stays evidence; nothing is graded here.
+        """
+        self._wrap_open = True
+        self._wrap_offers.append(
+            {
+                "r_sec": round(r_sec, 1),
+                "trigger": TRIGGER_ABUSE,
+                "after_roleplay_turn": self.turn,
+                "transcript_turn": turn_index,
+                "answer": None,
+                "line": HANGUP_ASIDE_LINE,
+            }
+        )
+        plan = self._wrap_line_plan(HANGUP_ASIDE_LINE, [*reasons, "abuse_hangup"])
+        return replace(plan, prelude_line=HANGUP_LINE)
+
+    def _late_end_request(
+        self, turn_index: int | None, *, r_sec: float, by_model: bool
+    ) -> TurnPlan:
+        """SWEEP-24: an explicit request to end the exercise from 14:00 is never answered in role.
+
+        Nothing required owed: the role-play exit (no WEAK line, no close-ladder count).  One owed
+        move that completes the schedule (the only required move pending, F1-COUNTER delivered):
+        L-ASIDE-LAST-POINT, then the learner raises it (forced) and the next real turn exits, once
+        per session.  More owed: the exit at once, as an explicit request before 14:00 does.
+        """
+        self._late_end_requests += 1
+        pending = self.scheduler.required_pending()
+        if (
+            len(pending) == 1
+            and self.scheduler.is_delivered(F1_COUNTER)
+            and self._last_point is None
+        ):
+            move = self.scheduler.next_forced_peek(r_sec)
+            if move is not None and move.id == pending[0]:
+                return self._last_point_plan(move.id, r_sec, turn_index, by_model=by_model)
+        return self._end_plan(turn_index, r_sec=r_sec, by_model=by_model, late=True)
+
+    def _last_point_plan(
+        self, move_id: str, r_sec: float, turn_index: int | None, *, by_model: bool
+    ) -> TurnPlan:
+        """SWEEP-24: Christy says it will stop in a moment; the learner's last point follows."""
+        self._last_point = {
+            "move_id": move_id,
+            "r_sec": round(r_sec, 1),
+            "after_roleplay_turn": self.turn,
+            "transcript_turn": turn_index,
+            "answer": None,
+        }
+        self._exit_after_last_point = True
+        self._continuation_due = ("last_point", move_id)
+        reasons = ["end_request_explicit", "end_request_late", "last_point_aside"]
+        if by_model:
+            reasons.append("end_intent_model")
+        plan = self._wrap_line_plan(LAST_POINT_LINE, reasons)
+        return replace(plan, continuation=True)
+
+    def _after_last_point(
+        self, text: str, turn_index: int | None, *, backchannel: bool, repair: bool
+    ) -> TurnPlan | None:
+        """SWEEP-24: the turn after her last point (None: plan it as usual).
+
+        A real turn ends the role-play (``end_request_late_exit``); "No, carry on" resumes it; a
+        "Sorry?" gets her point again; a back-channel or a fragment waits.
+        """
+        point = self._last_point or {}
+        if declines_end(text) and not confirms_end(text):
+            self._exit_after_last_point = False
+            point["answer"] = "resumed"
+            return None
+        if repair and not backchannel:
+            self._notes = [CUT_REPEAT_NOTE]
+            self._price_notes = []
+            return self._plan(TurnMode.LLM_REPLY, ["last_point_repeat"])
+        if backchannel or word_count(text) <= END_FRAGMENT_WORDS:
+            return self._wrap_line_plan(None, ["last_point_pending"])
+        self._exit_after_last_point = False
+        point["answer"] = "exit"
+        point["answer_transcript_turn"] = turn_index
+        self.exit_requested = True
+        return self._plan(TurnMode.EXIT, ["end_request_late_exit"])
+
+    def last_point_lapsed(self) -> bool:
+        """SWEEP-24: a quiet after her last point ends the role-play (True when it did)."""
+        if not self._exit_after_last_point:
+            return False
+        self._exit_after_last_point = False
+        if self._last_point is not None:
+            self._last_point["answer"] = "quiet"
+        self.exit_requested = True
+        return True
+
+    def continuation_plan(self, r_sec: float) -> TurnPlan | None:
+        """The learner's line right after an aside (S3.3's resume, SWEEP-24's last point), or None.
+
+        The session asks for it once the aside has played and speaks it as her reply (no candidate
+        turn: the turn and its evidence are the ones before the aside).  The last point is the owed
+        move, forced, with the last-point brief and no "Oh wait" opener; the resume picks the call
+        up with an owed move or one real question, never a greeting or a goodbye.
+        """
+        due, self._continuation_due = self._continuation_due, None
+        if due is None or self.exit_requested:
+            return None
+        kind, move_id = due
+        self.last_r = r_sec
+        self._notes = []
+        self._price_notes = []
+        self._force_curiosity = False
+        if kind == "last_point":
+            move = self.scheduler.next_forced_peek(r_sec)
+            if move is None or move.id != move_id:
+                return None  # it was delivered meanwhile: nothing is left to say
+            move = self.scheduler._force_next(r_sec) or move
+            self.scheduler.issue(move)
+            self._turn_issued = move.id
+            return self._intent_plan(
+                move,
+                ["continuation:last_point", f"owed:{move.id}:forced"],
+                redirect=False,
+                last_point=True,
+                first_probes=(),
+                reveal_topics=(),
+                monologue=None,
+            )
+        self._notes.append(CONTINUE_NOTE)
+        reasons = ["continuation:resume"]
+        move = self.scheduler.select(r_sec)
+        if move is not None and move.id != COMMIT_STALL:
+            probe = self._probe_step(move, r_sec) if self._probe_first else None
+            if probe is not None:
+                return self._probe_plan(
+                    probe, reasons, first_probes=(), reveal_topics=(), monologue=None
+                )
+            self.scheduler.issue(move)
+            self._turn_issued = move.id
+            reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
+            return self._intent_plan(
+                move,
+                reasons,
+                redirect=False,
+                first_probes=(),
+                reveal_topics=(),
+                monologue=None,
+            )
+        reasons.append("free_reply")
+        curiosity = self._curiosity_for_free_reply(force=True)
+        return self._plan(TurnMode.LLM_REPLY, reasons, curiosity=curiosity)
+
     # ------------------------------------------------------------- M2: the wrap-up offer
     @property
     def wrap_question_open(self) -> bool:
@@ -2510,7 +2846,10 @@ class RolePlayEngine:
         """The interviewer's question the next candidate turn answers, if any (its line id)."""
         if self.end_question_open:
             return "L-ASIDE-END"
-        return WRAP_OFFER_LINE if self._wrap_open else None
+        if not self._wrap_open:
+            return None
+        # M032 S3: the early-close and hang-up questions are answered like the offer.
+        return str(self._wrap_offers[-1].get("line") or WRAP_OFFER_LINE)
 
     def settles_as_yes(self, text: object) -> bool:
         """True for a short yes to an open question: the session lets it settle before planning.
@@ -2520,6 +2859,10 @@ class RolePlayEngine:
         """
         if self.end_question_open and is_bare_yes(text):
             return True
+        if self._wrap_open and self._wrap_offers[-1]["trigger"] == TRIGGER_EARLY_CLOSE:
+            # M032 S3.3: "you're welcome to keep going, or if you'd rather stop, just say so": a
+            # bare "Okay." or "Sounds good." could mean either, so only a bare yes settles.
+            return is_bare_yes(text)
         return self._wrap_open and is_short_wrap_yes(text)
 
     def _wrap_trigger(self, r_sec: float) -> str | None:
@@ -2535,7 +2878,8 @@ class RolePlayEngine:
             self.exit_requested
             or self._wrap_open
             or self._end_pending
-            or len(self._wrap_offers) >= WRAP_OFFER_LIMIT
+            or self._exit_after_last_point  # M032 SWEEP-24: the role-play is already ending
+            or self._wrap_offers_made() >= WRAP_OFFER_LIMIT
             or not WRAP_OFFER_FROM_R_SEC <= r_sec < WRAP_OFFER_UNTIL_R_SEC
         ):
             return None
@@ -2555,6 +2899,14 @@ class RolePlayEngine:
             # accepted offer would end the role-play before it and fail the gate.
             return "going_nowhere"
         return None
+
+    def _wrap_offers_made(self) -> int:
+        """The offers to wrap up from 14:00 (M032 S3's early-close and hang-up asks not counted)."""
+        return sum(
+            1
+            for offer in self._wrap_offers
+            if offer["trigger"] not in (TRIGGER_EARLY_CLOSE, TRIGGER_ABUSE)
+        )
 
     def _learner_asked_last(self) -> bool:
         """The learner's last line asked the advisor something: the next words are theirs."""
@@ -2990,6 +3342,10 @@ class RolePlayEngine:
         offer["answer"] = answer
         offer["answer_transcript_turn"] = turn_index
         self._wrap_declined_at = r_sec
+        if offer["trigger"] == TRIGGER_EARLY_CLOSE:
+            self._enter_closing(CLOSING_OPEN)  # M032 S3.3: they chose to carry on
+        elif offer["trigger"] == TRIGGER_ABUSE:
+            self._cool = True  # M032 S3.4: the call goes on, and she is cool
 
     def _wrap_answer_plan(
         self,
@@ -3015,34 +3371,48 @@ class RolePlayEngine:
           learner answers this very turn (None).
         Neither a no nor carrying on changes a grade, a disclosure or the schedule.
         """
+        offer = self._wrap_offers[-1]
+        trigger = offer["trigger"]
+        early = trigger == TRIGGER_EARLY_CLOSE
+        # M032 S3.3: after the early-close question only a bare yes settles as a yes.
+        short_yes = is_bare_yes if early else is_short_wrap_yes
         declined = declines_wrap_offer(text)
         accepted = not declined and (
             accepts_wrap_offer(text)
-            or (confirmed_yes and is_short_wrap_yes(text))
+            or (confirmed_yes and short_yes(text))
             or end_intent == "end"
             or is_close_attempt(text, r_sec)
         )
         if accepted:
             self._wrap_open = False
-            offer = self._wrap_offers[-1]
             offer["answer"] = "yes"
             offer["answer_transcript_turn"] = turn_index
             self.wrap_accepted = True
             self.exit_requested = True
             reasons = ["wrap_offer_accepted"]
+            if early:
+                reasons.append("early_close_accepted")
+            elif trigger == TRIGGER_ABUSE:
+                reasons.append("abuse_hangup_accepted")
             if end_intent == "end" and not accepts_wrap_offer(text):
                 reasons.append("end_intent_model")
             return self._plan(TurnMode.EXIT, reasons)
         if declined and word_count(text) <= WRAP_NO_WORDS and not has_question(text):
             self._wrap_closed("no", r_sec, turn_index)
-            return self._wrap_line_plan(WRAP_RESUME_LINE, ["wrap_offer_declined"])
+            plan = self._wrap_line_plan(WRAP_RESUME_LINE, ["wrap_offer_declined"])
+            if early:
+                # M032 S3.3: the role-play resumes and the learner carries on with a real point.
+                self._continuation_due = ("resume", None)
+                return replace(plan, continuation=True)
+            return plan
         if declined:
             # "No, I'd like to continue. What budget did you have in mind?": the no is said and the
             # rest is for the learner, who answers it (no resume line over the advisor's point).
             self._wrap_closed("no", r_sec, turn_index)
             return None
         if repair:
-            return self._wrap_line_plan(WRAP_OFFER_LINE, ["wrap_offer_repeated"])
+            line_id = str(offer.get("line") or WRAP_OFFER_LINE)
+            return self._wrap_line_plan(line_id, ["wrap_offer_repeated"])
         if word_count(text) <= END_FRAGMENT_WORDS or is_short_wrap_yes(text):
             return self._wrap_line_plan(None, ["wrap_offer_pending"])
         self._wrap_closed("carried_on", r_sec, turn_index)
@@ -3137,6 +3507,7 @@ class RolePlayEngine:
         negotiation_id: str | None = None,
         credit_move_id: str | None = None,
         reveal: bool = False,
+        winding: bool = False,
     ) -> tuple[str, ...]:
         """Worker notes that hold on every reply of a situation, not only the turn that began it.
 
@@ -3158,7 +3529,8 @@ class RolePlayEngine:
             and not (self.negotiation.resolved or self.commitment_resolved)
             and not self.scheduler.commit_permitted(self.last_r)
         ):
-            notes.append(HOLD_NOTE)
+            # M032 S3.2: without "keep the conversation going" (R1_CLOSING_STATE).
+            notes.append(HOLD_NOTE_V2 if flag_on(FLAG_CLOSING_STATE) else HOLD_NOTE)
         if mode is TurnMode.LLM_REPLY and self._answered:
             labels = dict(ANSWERED_LABELS)
             topics = "; ".join(labels[topic] for topic in self._answered if topic in labels)
@@ -3185,7 +3557,11 @@ class RolePlayEngine:
         # takes the place of the hollow, the acknowledgement and the ledger notes (merged, never
         # stacked) and is not given on a turn that hands over a disclosure layer.
         short = mode is TurnMode.LLM_REPLY and not reveal and self._short_on_time()
-        if short:
+        if winding and mode is TurnMode.LLM_REPLY:
+            # M032 S3.2: the advisor is closing the call: one short goodbye (it wins over the
+            # time cue's note and the hollow, acknowledgement and ledger notes).
+            notes.append(CLOSE_NOTE)
+        elif short:
             notes.append(
                 SHORT_ON_TIME_CONCERNS_NOTE.format(concerns=concerns)
                 if concerns
@@ -3273,6 +3649,8 @@ class RolePlayEngine:
             words = self._soft_tic_words()
             if words:
                 notes.append(SOFT_TIC_NOTE.format(words=words))
+        if self._cool and not commit_line:
+            notes.append(COOL_NOTE)  # M032 S3.4: after a resumed hang-up she stays cool
         return tuple(notes)
 
     def _evidence(self, kind: AskKind) -> CommitmentEvidence:
@@ -3972,8 +4350,12 @@ class RolePlayEngine:
         first_probes: tuple[str, ...],
         reveal_topics: tuple[str, ...],
         monologue: float | None,
+        last_point: bool = False,
     ) -> TurnPlan:
         """The plan for an owed move the model voices (the move is already issued).
+
+        M032 SWEEP-24: ``last_point`` (after L-ASIDE-LAST-POINT) raises it with
+        ``LAST_POINT_BRIEF`` in place of the redirect's and with no "Oh wait" opener.
 
         The price counter depends on how the advisor answered the anchor (R1-Q): push for a bit
         more after a concession short of the ask, "is there nothing at all?" after a refusal,
@@ -4101,6 +4483,8 @@ class RolePlayEngine:
             fallbacks = fresh + tuple(text for text in ordered if text not in fresh)
         self._intent_uses[move.id] = self._intent_uses.get(move.id, 0) + 1
         brief = f"{REDIRECT_BRIEF} {move.brief}" if redirect else move.brief
+        if last_point:
+            brief = f"{LAST_POINT_BRIEF} {move.brief}"
         kind = KIND_REDIRECT if redirect else (KIND_CUE if move.id == TIME_CUE else KIND_OBJECTION)
         intent = LearnerIntent(
             kind=kind,
@@ -4291,6 +4675,7 @@ class RolePlayEngine:
         line_id: str | None = None,
         credit_move_id: str | None = None,
         probe: str | None = None,
+        winding: bool = False,
     ) -> TurnPlan:
         reminder: str | None = None
         kind = None if aside else self._break_kind
@@ -4330,6 +4715,7 @@ class RolePlayEngine:
                     negotiation_id=negotiation_id,
                     credit_move_id=credit_move_id,
                     reveal=bool(first_probes) or bool(reveal_topics),
+                    winding=winding,
                 )
             if mode is TurnMode.LLM_REPLY:
                 style_note = pick_variant(
@@ -4453,6 +4839,10 @@ class RolePlayEngine:
                 must_say=() if intent is None else intent.must_say,
                 # M032 SWEEP-25 B: the 19:00 reaction says no goodbye and asks for no e-mail.
                 reaction_only=reaction_only and flag_on(FLAG_COMMIT_REACTION_V2),
+                # M032 S3.2: one short goodbye passes the guard (no closer_again drop, and the
+                # stall-closer quota is lifted for this one reply).
+                winding=winding,
+                closing_exempt=winding,
             )
         else:
             implausible = False
@@ -4571,7 +4961,22 @@ class RolePlayEngine:
                 # SWEEP-25 A2: she asked for the details by e-mail herself (not in a scripted
                 # commitment line); the advisor's next turn says whether he agreed.
                 self._email_request_turn = plan.turn
-            self._last_reply_closer = is_closer(spoken_text)
+            closing_on = flag_on(FLAG_CLOSING_STATE)
+            # M032 S3.1: her own sign-off ("I'll give it some proper thought", "let's leave it
+            # there"), never on a line that carried an owed move, a negotiation line or a scripted
+            # commitment (the stall wording of those is graded, not a goodbye).
+            self._last_reply_signoff = (
+                closing_on
+                and plan.move_id is None
+                and plan.negotiation_id is None
+                and plan.credit_move_id is None
+                and plan.commitment_level is None
+                and is_sign_off(spoken_text)
+            )
+            self._last_reply_closer = is_closer(spoken_text) or self._last_reply_signoff
+            if closing_on and "closing_winding" in plan.reasons:
+                self._winding_replies += 1
+                self._enter_closing(CLOSING_CLOSED)  # S3.2: she said her goodbye
             self._raised_last = plan.move_id is not None or plan.negotiation_id is not None
             # M032 S1: whether her line carried an owed move or a negotiation line (her question in
             # it is the move's, answered by its push), what her own question asked about, and the
@@ -4884,7 +5289,22 @@ class RolePlayEngine:
 
     def _endings_log(self) -> dict[str, Any]:
         """M032 S3: the endings' counts, no text (SWEEP-25 e-mail and reaction, SWEEP-27 notes)."""
+        early = [o for o in self._wrap_offers if o["trigger"] == TRIGGER_EARLY_CLOSE]
+        hangups = [o for o in self._wrap_offers if o["trigger"] == TRIGGER_ABUSE]
         return {
+            "closing_state": self._closing,
+            "closing_states": dict(sorted(self._closing_states.items())),
+            "handover_closes": self._handover_closes,
+            "mutual_goodbyes": self._mutual_goodbyes,
+            "winding_replies": self._winding_replies,
+            "early_close_asks": len(early),
+            "early_close_accepted": sum(1 for o in early if o["answer"] == "yes"),
+            "early_close_declined": sum(1 for o in early if o["answer"] in ("no", "carried_on")),
+            "late_end_requests": self._late_end_requests,
+            "last_point": None if self._last_point is None else dict(self._last_point),
+            "last_point_asides": int(self._last_point is not None),
+            "abuse_count": self._abuse_count,
+            "abuse_hangups": len(hangups),
             "learner_asked_email": self._learner_asked_email,
             "commit_reaction_dropped": self._commit_reaction_dropped,
             "short_on_time_notes": self._short_on_time_notes,

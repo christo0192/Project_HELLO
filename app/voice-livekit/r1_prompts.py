@@ -84,6 +84,35 @@ HOLD_NOTE = (
     "it now, whoever raises it, and do not fix a day or a time: keep the conversation going "
     "with what the advisor just said."
 )
+# M032 S3.2 (flag R1_CLOSING_STATE; RCA END-2: "keep the conversation going" kept reopening a call
+# the advisor was closing).  The hold without that clause; what it guards (no late acceptance of an
+# early call) is unchanged.
+HOLD_NOTE_V2 = (
+    "- A call or a next step was proposed earlier and you have not agreed to it. Do not accept "
+    "it now, whoever raises it, and do not fix a day or a time."
+)
+# M032 S3.2 (R1_CLOSING_STATE): the advisor is closing the call (WINDING).  Her job is one short,
+# warm goodbye in her own words and nothing new; this reverses the R1-Q iteration 3 HOLLOW_NOTE
+# choice ("ask them one real question") only while the call is winding up (D-M032-2).  New wording
+# under D-M032-4, listed for review.
+CLOSE_NOTE = (
+    "- The advisor is wrapping up the call. Reply with one short, warm goodbye in your own words "
+    "and nothing else: no question and nothing new."
+)
+# M032 S3.3 (R1_EARLY_CLOSE_ASIDE): the advisor said no to stopping, so the learner picks the call
+# up again right after Christy's aside (she did not hear the aside: interviewer lines are not in her
+# context).  New wording under D-M032-4, listed for review.
+CONTINUE_NOTE = (
+    "- The call paused for a moment and the advisor is carrying on with you. Pick it up again "
+    "with something real that is still on your mind: no greeting, no goodbye, and do not mention "
+    "the pause."
+)
+# M032 S3.4 (R1_ABUSE_HANGUP): the advisor was rude to her, she hung up, and the advisor chose to
+# carry on.  She stays cool.  New wording under D-M032-4, listed for review.
+COOL_NOTE = (
+    "- The advisor was rude to you earlier and you nearly ended the call. Stay polite but cool "
+    "and brief: no warmth, no small talk, and do not bring the rudeness up again yourself."
+)
 # What the advisor already answered (hours, live or recorded, falling behind ...): not asked again.
 ANSWERED_NOTE = (
     "- The advisor has already answered these, so do not ask about them again: {topics}."

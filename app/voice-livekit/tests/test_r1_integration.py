@@ -1960,6 +1960,9 @@ class TestRoleplayDriver(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await rig.converse("ready"))
         self.assertIsNone(rig.interview._engine)  # nothing planned, nothing created
 
+    # M032 S3.3 changes this before 14:00 (Christy asks instead of the second goodbye's exit:
+    # ``TestEndingsThroughTheSession``); with R1_EARLY_CLOSE_ASIDE off it is the release before.
+    @mock.patch.dict(os.environ, {"R1_EARLY_CLOSE_ASIDE": "0"})
     async def test_a_farewell_ends_the_roleplay_only_after_the_early_close_redirect(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
@@ -3364,6 +3367,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 "L-TRANSITION", "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-STEER",
                 "L-TRANSITION-REASK-2", "L-PICKUP", "L-EXIT", "L-WRAP", "L-CLOSE",
                 "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
+                "L-ASIDE-EARLY-CLOSE", "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-LAST-POINT",
+                "L-LEARNER-HANGUP", "L-ASIDE-HANGUP",
                 "L-TIME-UP", "L-MUTE", "L-SIL-IB", "L-SIL-RP1",
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
             ),
@@ -3376,7 +3381,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
             candidate_free=False
         )
-        self.assertEqual(len(specs), 22)  # M2 adds the offer, its resume line and L-TIME-UP
+        # M2 adds the offer, its resume line and L-TIME-UP; M032 S3 the early-close (two
+        # wordings), last-point and hang-up asides and her hang-up line.
+        self.assertEqual(len(specs), 27)
         warmed = {spec.text for spec in specs}
         for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-TRANSITION-ASK"):
             self.assertNotIn(rig.interview.render_line(line_id), warmed)
@@ -3489,6 +3496,119 @@ class TestLineCacheBuiltByTheRunner(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(run_r1_session(ctx, session_factory=factory), 10.0)
         self.assertIn(sentinel, seen)
+
+S3_MOVES = (
+    "F3-PRIMARY",
+    "F3-PUSH",
+    "F2-PRIMARY",
+    "F2-PUSH",
+    "F1-ANCHOR",
+    "F1-COUNTER",
+    "F4-PRIMARY",
+    "F4-PUSH",
+)
+
+
+class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
+    """M032 S3 through the real session: Christy's asides, the learner's line after them, and her
+    hang-up before Christy (synthetic advisor turns)."""
+
+    async def done_rig(self, *, keep: tuple[str, ...] = ()) -> Rig:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        for move_id in S3_MOVES:
+            if move_id not in keep:
+                rig.engine.scheduler.confirm_delivered(move_id, 60)
+        return rig
+
+    async def generated(self, rig: Rig) -> None:
+        await rig.until(lambda: bool(rig.session.generated))
+
+    async def test_an_in_role_close_is_asked_and_a_no_resumes_with_her_point(self) -> None:
+        rig = await self.done_rig()
+        close = "Okay, take your time and call me back later."
+        self.assertIsNone(await rig.converse(close, advance=300))
+        await rig.until_spoken("L-ASIDE-EARLY-CLOSE-TIME")
+        self.assertFalse(rig.interview._roleplay_over())
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # said to her
+        self.assertIsNone(await rig.converse("No, let's keep going.", advance=3))
+        await rig.until_spoken("L-ASIDE-WRAP-RESUME")
+        await self.generated(rig)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")  # said to Christy
+        reply = rig.interview._last_reply
+        self.assertIn("continuation:resume", reply.plan.reasons)
+        self.assertEqual(reply.candidate_text, close)  # her context ends on the advisor's close
+        stream = rig.interview.llm_node_stream(SimpleNamespace(items=[]), rig.provider)
+        said = "".join([chunk async for chunk in stream]).strip()
+        self.assertTrue(said)
+        blob = blob_of(rig.last_messages())
+        self.assertIn(r1_roleplay.CONTINUE_NOTE, blob)
+        self.assertNotIn(rig.interview.render_line("L-ASIDE-WRAP-RESUME"), blob)
+        self.assertEqual(rig.last_messages()[-1], {"role": "user", "content": close})
+
+    async def test_a_yes_to_the_question_ends_the_roleplay_into_the_wrapup(self) -> None:
+        rig = await self.done_rig()
+        await rig.converse("Thanks for your time, bye.", advance=640)
+        await rig.until_spoken("L-ASIDE-EARLY-CLOSE")
+        self.assertIsNone(await rig.converse("Yes, let's stop here.", advance=3))
+        self.assertTrue(rig.interview._roleplay_over())
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")
+        self.assertEqual(rig.session.generated, [])
+
+    async def test_she_hangs_up_in_her_voice_before_christy_asks(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        self.assertIsNone(await rig.converse("Oh just shut up.", advance=60))
+        await rig.until_spoken("L-ASIDE-HANGUP")
+        hangup = rig.interview.render_line("L-LEARNER-HANGUP")
+        aside = rig.interview.render_line("L-ASIDE-HANGUP")
+        self.assertLess(rig.order.index(("play_end", hangup)), rig.order.index(("play_start", aside)))
+        learner = [item for item in rig.interview._history if item.get("text") == hangup]
+        self.assertEqual([item["voice"] for item in learner], ["learner"])
+        self.assertEqual([item["phase"] for item in learner], ["roleplay"])
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # the abuse is evidence
+        self.assertTrue(rig.engine.wrap_question_open)
+        self.assertIsNone(await rig.converse("No, sorry, let's continue.", advance=3))
+        await rig.until_spoken("L-ASIDE-WRAP-RESUME")
+        self.assertEqual(rig.session.generated, [])  # the advisor calls her back: he speaks next
+        self.assertFalse(rig.interview._roleplay_over())
+
+    async def test_the_last_point_follows_christy_and_a_quiet_then_ends_it(self) -> None:
+        rig = await self.done_rig(keep=("F4-PUSH",))
+        self.assertIsNone(await rig.converse("End the interview.", advance=830))
+        await rig.until_spoken("L-ASIDE-LAST-POINT")
+        await self.generated(rig)
+        plan = rig.interview._last_reply.plan
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, "F4-PUSH"))
+        self.assertIn("continuation:last_point", plan.reasons)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")  # said to Christy
+        self.assertFalse(rig.interview._roleplay_over())
+        rig.interview._drop_stale_turns()  # the request's own transcript is the driver's past
+        with mock.patch.object(r1_session, "ROLEPLAY_PROMPT_SECONDS", 0.05):
+            self.assertIsNone(await asyncio.wait_for(rig.interview._roleplay_turn(), 5.0))
+        self.assertTrue(rig.interview._roleplay_over())
+
+    async def test_the_new_asides_are_warmed_and_her_line_is_hers(self) -> None:
+        for line_id in ("L-ASIDE-EARLY-CLOSE", "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-LAST-POINT",
+                        "L-LEARNER-HANGUP", "L-ASIDE-HANGUP"):
+            self.assertIn(line_id, r1_session._WARM_ORDER)
+        self.assertIn("L-LEARNER-HANGUP", r1_session._LEARNER_LINES)
+        for line_id in ("L-WRAP-MORE", "L-FAQ-DEFER-WRAP"):  # inside a reply stream
+            self.assertNotIn(line_id, r1_session._WARM_ORDER)
+
+    async def test_the_session_facts_carry_the_endings_counts(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        await rig.converse("Oh just shut up.", advance=60)
+        facts = r1_session.session_facts_event(
+            rig.engine.admin_log(), {}, roleplay_seconds=80.0
+        )["payload"]["learner_endings"]
+        self.assertEqual(facts["abuse_count"], 1)
+        self.assertEqual(facts["abuse_hangups"], 1)
+        self.assertNotIn("last_point", facts)  # counts only
 
 
 if __name__ == "__main__":

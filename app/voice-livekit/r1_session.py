@@ -236,6 +236,7 @@ from r1_replies import (
 )
 from r1_prompts import ROLEPLAY_PHASE
 from r1_roleplay import (
+    IN_ROLE_ASIDE_REASONS,
     FLAG_WRAPUP_ANSWERS,
     FLAG_WRAPUP_DECLINE_V2,
     WRAP_OFFER_PAUSE_SEC,
@@ -450,7 +451,7 @@ _HELD_STT_EVENTS = frozenset({"final_transcript", "interim_transcript", "preflig
 # Scripted lines the LEARNER speaks; every other line is the interviewer's.  The voice decides
 # which model call may later see the line (``r1_prompts.select_context``).
 _LEARNER_LINES = frozenset(
-    {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP"}
+    {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP", "L-LEARNER-HANGUP"}
 )
 _REPLIES_KEPT = 8
 _SESSION_ID_FROM_ROOM = re.compile(
@@ -602,6 +603,12 @@ _WARM_ORDER = (
     "L-ASIDE-END",
     "L-ASIDE-WRAP",
     "L-ASIDE-WRAP-RESUME",
+    # M032 S3: the early-close, last-point and hang-up asides and her hang-up line.
+    "L-ASIDE-EARLY-CLOSE",
+    "L-ASIDE-EARLY-CLOSE-TIME",
+    "L-ASIDE-LAST-POINT",
+    "L-LEARNER-HANGUP",
+    "L-ASIDE-HANGUP",
     "L-TIME-UP",
     "L-MUTE",
     "L-SIL-IB",
@@ -3789,16 +3796,25 @@ class R1Interview:
             # M2: the turn the offer to wrap up follows was said to the learner, so it stays a
             # role-play turn (``wrap_offer:<trigger>``).  An answer to the offer is said to the
             # interviewer, as the turn that confirms a stop is: its row is ``aside`` too.
-            if not any(reason.startswith("wrap_offer:") for reason in plan.reasons):
+            # M032 S3: so was the in-role close Christy asks about and the abuse she hangs up on.
+            if not any(reason.startswith(IN_ROLE_ASIDE_REASONS) for reason in plan.reasons):
                 if entry is not None:
                     entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
-                if any(reason.startswith("wrap_offer_") for reason in plan.reasons):
+                if any(reason.startswith("wrap_offer_") for reason in plan.reasons) or (
+                    "last_point_aside" in plan.reasons or "last_point_pending" in plan.reasons
+                ):
+                    # M032 SWEEP-24: the late request to end is said to Christy, as a confirmed
+                    # stop is (the engine leaves it out of the role-play turns too).
                     self._candidate_row_phase = "aside"
             if plan.scripted_text:  # an answer that leaves the offer open says nothing
                 self._spawn(self._play_aside(plan))
             raise StopResponse()
         if plan.exit_roleplay:
-            if "end_confirmed" in plan.reasons or "wrap_offer_accepted" in plan.reasons:
+            if (
+                "end_confirmed" in plan.reasons
+                or "wrap_offer_accepted" in plan.reasons
+                or "end_request_late_exit" in plan.reasons
+            ):
                 # An out-of-role stop is said to the interviewer, not to the learner: like the
                 # turns of an aside it stays out of the learner's context (plan 5.10), and its
                 # transcript row is written as ``aside`` too (``prepare_turn``), so the API gate
@@ -3829,6 +3845,12 @@ class R1Interview:
         This runs off the SDK hook, not in the driver, so it is the one place besides the mute
         event that moves ROLEPLAY -> ASIDE, and it must guarantee the way back.
         """
+        prelude = getattr(plan, "prelude_line", None)
+        if prelude and self.machine.phase is R1Phase.ROLEPLAY:
+            # M032 S3.4: the learner hangs up in role first (her voice, R running), then Christy.
+            await self.say(prelude)
+            if self._stop_outcome() is not None:
+                return
         resume = self.machine.phase is R1Phase.ROLEPLAY
         if resume:
             self._enter(R1Phase.ASIDE)
@@ -3842,6 +3864,60 @@ class R1Interview:
         finally:
             if resume:
                 self._close_coach_aside()
+        if getattr(plan, "continuation", False):
+            self._speak_continuation()
+
+    def _speak_continuation(self) -> None:
+        """M032 S3.3 and SWEEP-24: the learner carries on right after the aside (one reply).
+
+        Her line answers no new candidate turn: it is planned by the engine
+        (``continuation_plan``) and spoken through the SDK's ``generate_reply``, paired with a
+        prepared Reply whose newest user message is the candidate's last role-play turn (the
+        aside's own turns are not in her context).  Nothing is said while the candidate is muted,
+        after a stop, or once the role-play is over.
+        """
+        engine = self._engine
+        if (
+            engine is None
+            or self.machine.phase is not R1Phase.ROLEPLAY
+            or self._muted
+            or self._stop_outcome() is not None
+            or self._roleplay_over()
+        ):
+            return
+        entry = next(
+            (
+                item
+                for item in reversed(self._history)
+                if item.get("role") == "candidate" and item.get("phase") == ROLEPLAY_PHASE
+            ),
+            None,
+        )
+        generate = getattr(self.session, "generate_reply", None)
+        if entry is None or not callable(generate):
+            return
+        r_sec = self.machine.roleplay_elapsed
+        plan = engine.continuation_plan(r_sec)
+        if plan is None:
+            return
+        reply = Reply(
+            phase=ROLEPLAY_PHASE,
+            candidate_text=str(entry.get("text") or ""),
+            entry=entry,
+            plan=plan,
+            r_sec=r_sec,
+        )
+        _log.info("unknown_event", error_type="r1_continuation", error_category=plan.mode.value)
+        self._last_reply = self._latest_reply = reply
+        try:
+            generate()  # a SpeechHandle: never awaited (that waits out its whole playout)
+        except Exception as exc:  # noqa: BLE001 - the role-play goes on without the line
+            self._latest_reply = None
+            _log.warn(
+                "unknown_event",
+                error_type="r1_continuation_failed",
+                error_category=_error_type_of(exc),
+            )
 
     def _close_coach_aside(self) -> None:
         """Return from the coach aside, or hand the return to the path that will see it.
@@ -5915,6 +5991,9 @@ class R1Interview:
                 # there?" is not an answer to L-ASIDE-END.  Nor to the offer to wrap up (M2).
                 self._engine.end_question_lapsed()
                 self._engine.wrap_question_lapsed(self.machine.roleplay_elapsed)
+                if self._engine.last_point_lapsed():
+                    # M032 SWEEP-24: a quiet after her last point ends the role-play as asked.
+                    return None
             return await self._silence_ladder(
                 [
                     ("L-SIL-RP1", ROLEPLAY_FIRST_STEP_SECONDS),

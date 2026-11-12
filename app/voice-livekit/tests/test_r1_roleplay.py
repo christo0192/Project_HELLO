@@ -1323,6 +1323,7 @@ class AskTests(unittest.TestCase):
 
 
 class CloseLadderTests(unittest.TestCase):
+    @s3_off
     def test_the_first_early_farewell_redirects_with_oh_wait_and_the_second_exits(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -1344,6 +1345,7 @@ class CloseLadderTests(unittest.TestCase):
         self.assertTrue(s.eng.exit_requested)
 
     @s2p_off
+    @s3_off
     def test_the_early_closer_adversary_is_stalled_then_exits(self):
         """S0-B early_closer: wrap up and send the enrolment link immediately."""
         s = Session(engine())
@@ -1454,6 +1456,7 @@ class InjectionTests(unittest.TestCase):
                         self.assertNotEqual(plan.mode, TurnMode.EXIT)
                     self._assert_nothing_moved(s)
 
+    @s3_off
     def test_a_confirmed_stop_reaches_only_what_a_second_bye_reaches(self):
         """The stop is no new route: two farewells before 14:00 reach the same role-play exit."""
         stop, bye = Session(engine()), Session(engine())
@@ -1682,7 +1685,9 @@ class InvariantFuzzTests(unittest.TestCase):
             self.assertFalse(plan.aside)
             self.assertEqual(plan.scripted_text, "")
             self.assertTrue(eng.exit_requested)
-            self.assertLess(r, EARLY_CLOSE_BEFORE_SEC)
+            if "end_request_late" not in plan.reasons:
+                # M032 SWEEP-24: from 14:00 only an explicit request to end the exercise is one.
+                self.assertLess(r, EARLY_CLOSE_BEFORE_SEC)
         if plan.aside:
             self.assertEqual(plan.voice, "interviewer")
         else:
@@ -2259,6 +2264,7 @@ class EndRequestTests(unittest.TestCase):
         self.assertTrue(s.eng.commitment_resolved)
         return s
 
+    @s3_off
     def test_with_a_commitment_on_record_a_request_before_fourteen_is_a_farewell(self):
         # Reviewed fix M2 (s12_end_after_commit): at 13:30, after the call was booked, "Can you end
         # the call now?" got the question and "End the interview." then failed the session, where
@@ -2435,6 +2441,7 @@ class EndRequestTests(unittest.TestCase):
         self.assertFalse(s.eng.end_confirmed)
         self.assertFalse(s.eng.admin_log()["early_close"]["end_request"]["confirmed"])
 
+    @s3_off
     def test_an_explicit_request_from_fifteen_minutes_is_still_a_farewell(self):
         # Unchanged: from 14:00 (or with a commitment on record) the request is a farewell on the
         # close ladder, never the stop, explicit or not.
@@ -3165,6 +3172,7 @@ class SttSanityUnderBargeInTests(unittest.TestCase):
                 eng, r = self.run_turns(turns, acks)
                 self.assertTrue(eng.fidelity(r_end=r)["checks"]["stt_sanity"])
 
+    @s3_off
     def test_real_short_fragments_still_fail(self):
         # Speech-to-text chopping is what the check is for: "Hi Pooja", "the price", "So bye" are
         # no acknowledgements, and acknowledgements beside them do not water the share down.
@@ -5168,6 +5176,7 @@ class IterationTwoEngineTests(unittest.TestCase):
     FAREWELL = "Alright, thanks so much for your time today. Bye for now!"
 
     # --- D3: a call proposed before the window stays unaccepted
+    @s3_off
     def test_an_open_call_proposal_carries_a_hold_note_until_the_window_opens(self):
         from r1_prompts import HOLD_NOTE
 
@@ -6691,6 +6700,7 @@ class LostRedirectAndRevoiceTests(unittest.TestCase):
         assert "close_attempt_redirect" in redirect.reasons, redirect.reasons
         return s, redirect
 
+    @s3_off
     def test_a_redirect_lost_to_the_split_off_bye_is_said_when_the_bye_comes(self):
         # s5_split_farewell: speech-to-text finalised "... have a great day." and "Bye." apart, and
         # the "Bye." cancelled the redirect before any audio.  Counting the unheard redirect made
@@ -6708,6 +6718,7 @@ class LostRedirectAndRevoiceTests(unittest.TestCase):
         self.assertEqual(s.say("Bye.", 230).mode, TurnMode.EXIT)
         self.assertTrue(s.eng.exit_requested)
 
+    @s3_off
     def test_a_heard_redirect_still_makes_the_next_bye_the_exit(self):
         s, redirect = self._farewell_redirect()
         s.eng.record_spoken(redirect, s.eng.compose_speech(redirect).text, r_sec=200)
@@ -6968,6 +6979,7 @@ class EndIntentPlanTests(unittest.TestCase):
                 self.assertNotIn("end_intent_model", plan.reasons)
                 self.assertIsNone(s.eng.admin_log()["early_close"]["end_request"])
 
+    @s3_off
     def test_from_fourteen_minutes_or_with_a_commitment_a_verdict_is_a_farewell(self):
         s = self.started()
         late = s.say("Kindly end the interview.", 845, end_intent="end")
@@ -7093,7 +7105,7 @@ class EndIntentPlanTests(unittest.TestCase):
                 plan = s.say(text, 300, end_intent=None)
                 if explicit_end_request(text):
                     self.assertTrue(ended(plan))
-                elif detect_end_request(text):
+                elif detect_end_request(text, permission=True):  # M032 SWEEP-24 (c), default on
                     self.assertEqual((plan.aside, plan.line_id), (True, "L-ASIDE-END"))
                 else:
                     self.assertFalse(ended(plan))
@@ -7681,6 +7693,7 @@ class RespondFirstEngineTests(unittest.TestCase):
         self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
         self.assertNotIn("owed_deferred_to_respond", plan.reasons)
 
+    @s3_off
     def test_a_back_off_clears_the_hold_note_and_eases_the_pressure_once(self):
         from r1_prompts import HOLD_NOTE, PRESSURE_EASED_NOTE
 
@@ -7802,6 +7815,7 @@ class ConcernLedgerEngineTests(unittest.TestCase):
             s.eng.admin_log()["intents"]["concerns"], {"think_over": 1, "trust": 1}
         )
 
+    @s3_off
     def test_it_merges_with_the_hollow_note(self):
         from r1_prompts import HOLLOW_CONCERNS_NOTE, HOLLOW_NOTE
 
@@ -8174,6 +8188,7 @@ def f4_primary_session(reply="That's a lot to take in on one call."):
 class S1ReviewFixTests(unittest.TestCase):
     """The S1 reviews' findings, each as the shape that found it (synthetic advisor turns)."""
 
+    @s3_off
     def test_s1r1_an_ask_after_the_f4_primary_gets_the_stall_at_once(self):
         """S1R-1 / S1-R4: the negotiation leaves a call or enrolment ask right after F4's primary to
         the F4 push (``ask_yields_to_owed_move``); the reaction hold took it and the stall then
@@ -8642,6 +8657,7 @@ class CoachResumeAndCountsTests(unittest.TestCase):
 class NoCommitLedgerTests(unittest.TestCase):
     """SWEEP-3 (R1_NO_COMMIT_LEDGER): the not-today stall belongs to F4-PRIMARY."""
 
+    @s3_off
     def test_the_reserved_note_is_on_free_replies_while_f4_is_owed(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -8826,6 +8842,7 @@ class AckTurnTests(unittest.TestCase):
         self.assertIn(expected, plan.reminder)
         self.assertNotIn("Do not say that again in any words: respond", plan.reminder)
 
+    @s3_off
     def test_no_note_for_an_answer_a_cut_or_after_her_goodbye(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -10709,6 +10726,444 @@ class TimeCueV2Tests(unittest.TestCase):
         asked = s2.say("What time works for you for a quick follow-up?", TIME_CUE_SEC + 5)
         if asked.move_id == TIME_CUE:
             self.assertIn("answer", asked.reminder.lower())
+
+def deliver(eng, *move_ids, r=100.0):
+    """Mark graded moves delivered directly on the scheduler (the shape under test is the end)."""
+    for move_id in move_ids:
+        eng.scheduler.confirm_delivered(move_id, r)
+
+
+ALL_MOVES = (
+    F3_PRIMARY,
+    "F3-PUSH",
+    "F2-PRIMARY",
+    "F2-PUSH",
+    "F1-ANCHOR",
+    "F1-COUNTER",
+    "F4-PRIMARY",
+    "F4-PUSH",
+)
+
+
+def done_session(r=200.0):
+    """A role-play with every graded move delivered and nothing said yet past the opener."""
+    s = Session(engine())
+    s.say(OPENER, 20)
+    deliver(s.eng, *ALL_MOVES, r=r)
+    return s
+
+
+class InRoleFarewellTests(unittest.TestCase):
+    """M032 S3.1 (R1_CLOSING_STATE): hand-over closes and mutual goodbyes are read as closes.
+
+    RCA END-1 (fda9e9f6 #77-#90, paraphrased): "take your time and call me back later" and the
+    courtesy turns after her sign-offs were never closes, so she filled four goodbye cycles.
+    """
+
+    def test_a_hand_over_close_reaches_the_close_ladder(self):
+        s = done_session()
+        plan = s.say("Okay, take your time and call me back later.", 300)
+        self.assertIn("handover_close", plan.reasons)
+        self.assertEqual(s.eng.scheduler.close_attempts, 1)
+        self.assertTrue(plan.aside)  # nothing owed and R < 14:00: Christy asks (S3.3)
+        self.assertEqual(s.eng.admin_log()["endings"]["handover_closes"], 1)
+
+    def test_with_only_the_closing_state_on_the_ladder_of_before_exits(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_EARLY_CLOSE_ASIDE": "0"}):
+            s = done_session()
+            plan = s.say("Talk to him and get back to us.", 300)
+        self.assertEqual(plan.mode, TurnMode.EXIT)
+        self.assertIn("handover_close", plan.reasons)
+
+    def test_with_the_flag_off_a_hand_over_is_a_free_reply(self):
+        with mock.patch.dict(r1_roleplay.os.environ, S3_OFF):
+            s = done_session()
+            plan = s.say("Okay, take your time and call me back later.", 300)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertEqual(s.eng.scheduler.close_attempts, 0)
+
+    def test_take_your_time_alone_is_no_close_mid_call(self):
+        s = done_session()
+        for text in ("Take your time.", "Of course, take your time.", "No rush, think about it."):
+            with self.subTest(text=text):
+                plan = s.say(text, 300)
+                self.assertNotIn("handover_close", plan.reasons)
+                self.assertNotIn("mutual_goodbye", plan.reasons)
+        self.assertEqual(s.eng.scheduler.close_attempts, 0)
+
+    def test_a_courtesy_turn_after_her_own_sign_off_is_a_mutual_goodbye(self):
+        s = done_session()
+        s.reply = "Okay, I'll give it some proper thought on my end."
+        s.say("The mentors are there every week.", 300)
+        self.assertTrue(s.eng._last_reply_signoff)
+        plan = s.say("Sure. Thank you.", 320)
+        self.assertIn("mutual_goodbye", plan.reasons)
+        self.assertEqual(s.eng.admin_log()["endings"]["mutual_goodbyes"], 1)
+        # "Sure, take your time." closes too right after her sign-off.
+        s = done_session()
+        s.reply = "Let me sit with it for a bit."
+        s.say("The mentors are there every week.", 300)
+        plan = s.say("Sure, take your time.", 320)
+        self.assertIn("handover_close", plan.reasons)
+
+    def test_a_sign_off_on_an_owed_line_never_arms_it(self):
+        s = Session(engine(), ack="Okay. I'll think it over and get back to you.")
+        s.say(OPENER, 20)
+        plan = s.say(NEUTRAL, 415)  # F3 forced: an owed line
+        self.assertIsNotNone(plan.move_id)
+        self.assertFalse(s.eng._last_reply_signoff)
+        later = s.say("Sure.", 430)
+        self.assertNotIn("mutual_goodbye", later.reasons)
+
+
+class ClosingStateTests(unittest.TestCase):
+    """M032 S3.2: OPEN, WINDING, CLOSED; one short goodbye while the advisor closes the call."""
+
+    def asked_out(self):
+        """Every graded move done and both early-close questions declined (R < 14:00)."""
+        s = done_session()
+        r = 300.0
+        for _ in range(2):
+            plan = s.say("Okay then, bye for now.", r)
+            self.assertTrue(plan.aside, plan.reasons)
+            s.say("No, let's keep going.", r + 5)
+            r += 30.0
+        return s, r
+
+    def test_once_the_questions_are_asked_out_she_says_one_short_goodbye(self):
+        s, r = self.asked_out()
+        plan = s.say("Okay then, bye for now.", r)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertFalse(s.eng.exit_requested)  # never a silent exit before 14:00
+        self.assertIn("close_attempt_held", plan.reasons)
+        self.assertIn("closing_winding", plan.reasons)
+        self.assertIn(r1_roleplay.CLOSE_NOTE, plan.reminder)
+        self.assertNotIn(r1_roleplay.HOLLOW_NOTE, plan.reminder)
+        self.assertNotIn("you are curious about", plan.reminder.lower())
+        self.assertTrue(plan.guard_ctx.winding)
+        self.assertTrue(plan.guard_ctx.closing_exempt)
+        # The Session fake said her goodbye (``record_spoken``): WINDING, then CLOSED.
+        self.assertEqual(s.eng._closing_states.get(r1_roleplay.CLOSING_WINDING), 3)
+        self.assertEqual(s.eng._closing, r1_roleplay.CLOSING_CLOSED)
+        log = s.eng.admin_log()["endings"]
+        self.assertEqual(log["winding_replies"], 1)
+        self.assertEqual(log["early_close_asks"], 2)
+        self.assertEqual(log["early_close_declined"], 2)
+
+    def test_the_guard_lets_her_one_goodbye_through(self):
+        s, r = self.asked_out()
+        plan = s.say("Okay then, bye for now.", r)
+        result = s.eng.sanitize_reply(plan, "Thanks so much, I'll get back to you. Take care.")
+        self.assertEqual(result.text, "Thanks so much, I'll get back to you. Take care.")
+
+    def test_something_real_from_the_advisor_opens_the_call_again(self):
+        s, r = self.asked_out()
+        s.say("Okay then, bye for now.", r)
+        plan = s.say("Before you go, what is your budget for this?", r + 20)
+        self.assertEqual(s.eng._closing, r1_roleplay.CLOSING_OPEN)
+        self.assertNotIn(r1_roleplay.CLOSE_NOTE, plan.reminder or "")
+
+    def test_the_hold_note_no_longer_keeps_the_conversation_going(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("Shall we book a quick call tomorrow at six?", 100)
+        plan = s.say(PITCH, 140)
+        self.assertIn(r1_roleplay.HOLD_NOTE_V2, plan.reminder)
+        self.assertNotIn("keep the conversation going", plan.reminder)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_CLOSING_STATE": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.say("Shall we book a quick call tomorrow at six?", 100)
+            plan = s.say(PITCH, 140)
+        self.assertIn(r1_roleplay.HOLD_NOTE, plan.reminder)
+
+
+class EarlyCloseAsideTests(unittest.TestCase):
+    """M032 S3.3 (D-M032-2): before 14:00 an in-role close never ends the role-play silently."""
+
+    def test_nothing_owed_gets_christys_question_with_r_paused(self):
+        s = done_session()
+        plan = s.say("Thanks for your time, bye.", 650)
+        self.assertTrue(plan.aside)
+        self.assertEqual((plan.voice, plan.line_id), ("interviewer", "L-ASIDE-EARLY-CLOSE"))
+        self.assertEqual(
+            plan.scripted_text,
+            "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
+            "with Meera. You're welcome to keep going with her, or if you'd rather stop the "
+            "role-play here, just say so.",
+        )
+        self.assertIn("early_close:offer", plan.reasons)  # the turn was said to her: evidence
+        self.assertTrue(s.eng.wrap_question_open)
+        self.assertEqual(s.eng.open_question_line, "L-ASIDE-EARLY-CLOSE")
+        self.assertFalse(s.eng.exit_requested)
+
+    def test_below_ten_minutes_the_line_says_there_is_still_time(self):
+        s = done_session()
+        plan = s.say("Thanks for your time, bye.", 400)
+        self.assertEqual(plan.line_id, "L-ASIDE-EARLY-CLOSE-TIME")
+        self.assertIn("We still have some time for the role-play", plan.scripted_text)
+
+    def test_a_move_owed_keeps_the_single_redirect_then_asks(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        first = s.say("Thanks for your time, bye.", 100)
+        self.assertIn("close_attempt_redirect", first.reasons)
+        self.assertTrue(first.scripted_text.startswith(REDIRECT_OPENERS[0]))
+        second = s.say("Okay, goodbye then.", 150)
+        self.assertTrue(second.aside)
+        self.assertEqual(second.line_id, "L-ASIDE-EARLY-CLOSE-TIME")
+        self.assertFalse(s.eng.exit_requested)
+
+    def test_a_yes_ends_the_roleplay(self):
+        for answer, kwargs in (
+            ("Yes, let's stop here.", {}),
+            ("Okay, bye.", {}),
+            ("Yes.", {"confirmed_yes": True}),
+        ):
+            with self.subTest(answer=answer):
+                s = done_session()
+                s.say("Thanks for your time, bye.", 650)
+                plan = s.say(answer, 655, **kwargs)
+                self.assertEqual(plan.mode, TurnMode.EXIT)
+                self.assertIn("wrap_offer_accepted", plan.reasons)
+                self.assertIn("early_close_accepted", plan.reasons)
+                self.assertTrue(s.eng.exit_requested)
+                self.assertEqual(s.eng.admin_log()["endings"]["early_close_accepted"], 1)
+
+    def test_a_bare_okay_is_no_yes_to_this_question(self):
+        s = done_session()
+        s.say("Thanks for your time, bye.", 650)
+        self.assertFalse(s.eng.settles_as_yes("Okay."))
+        self.assertTrue(s.eng.settles_as_yes("Yes."))
+        plan = s.say("Okay.", 655, confirmed_yes=True)
+        self.assertFalse(plan.exit_roleplay)
+        self.assertTrue(s.eng.wrap_question_open)  # still waiting for the answer
+
+    def test_a_no_resumes_and_the_learner_carries_on_with_a_real_point(self):
+        s = done_session()
+        s.say("Thanks for your time, bye.", 650)
+        plan = s.say("No, let's keep going.", 655)
+        self.assertEqual(plan.line_id, "L-ASIDE-WRAP-RESUME")
+        self.assertTrue(plan.continuation)
+        self.assertFalse(s.eng.wrap_question_open)
+        self.assertEqual(s.eng._closing, r1_roleplay.CLOSING_OPEN)
+        follow = s.eng.continuation_plan(660)
+        self.assertIsNotNone(follow)
+        self.assertTrue(follow.needs_llm)
+        self.assertIn("continuation:resume", follow.reasons)
+        self.assertIn(r1_roleplay.CONTINUE_NOTE, follow.reminder)
+        self.assertIsNone(s.eng.continuation_plan(661))  # once
+
+    def test_at_most_two_asks_and_never_a_silent_exit_before_fourteen(self):
+        s = done_session()
+        r = 600.0
+        asides = 0
+        for _ in range(4):
+            plan = s.say("Bye, take care.", r)
+            if plan.aside:
+                asides += 1
+                s.say("No, carry on.", r + 3)
+            self.assertFalse(s.eng.exit_requested)
+            r += 20
+        self.assertEqual(asides, 2)
+
+    def test_from_fourteen_the_ladder_is_unchanged(self):
+        s = done_session()
+        plan = s.say("Thanks for your time, bye.", 900)
+        self.assertNotIn("early_close:offer", plan.reasons)
+
+    def test_the_pinned_limits_are_the_engines(self):
+        import r1_content
+
+        endings = r1_content.manifest()["prompts"]["endings"]
+        self.assertEqual(endings["early_close_ask_limit"], r1_roleplay.EARLY_CLOSE_ASK_LIMIT)
+        self.assertEqual(endings["hangup_limit"], r1_roleplay.HANGUP_LIMIT)
+
+    def test_flag_off_exits_as_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_EARLY_CLOSE_ASIDE": "0"}):
+            s = done_session()
+            plan = s.say("Thanks for your time, bye.", 650)
+        self.assertEqual(plan.mode, TurnMode.EXIT)
+        self.assertIn("close_attempt_exit", plan.reasons)
+
+
+class LateEndRequestTests(unittest.TestCase):
+    """M032 SWEEP-24 (R1_LATE_END_REQUEST): from 14:00 an explicit request to end the exercise is
+    never answered in role (1eb18cd4 #75-76: "Ending it works for me. Before I go, though...")."""
+
+    def only_f4_push_owed(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        deliver(s.eng, *[move for move in ALL_MOVES if move != "F4-PUSH"], r=600)
+        return s
+
+    def test_one_owed_move_gets_the_last_point_then_the_exit(self):
+        s = self.only_f4_push_owed()
+        aside = s.say("End the interview.", 845, turn_index=90)
+        self.assertTrue(aside.aside)
+        self.assertEqual((aside.voice, aside.line_id), ("interviewer", "L-ASIDE-LAST-POINT"))
+        self.assertTrue(aside.continuation)
+        self.assertEqual(
+            aside.scripted_text,
+            "This is Christy, your interviewer. Of course, we'll stop in just a moment; Meera has "
+            "one last thing she'd like to say first.",
+        )
+        point = s.eng.continuation_plan(846)
+        self.assertEqual((point.mode, point.move_id), (TurnMode.INTENT, "F4-PUSH"))
+        self.assertTrue(point.intent.brief.startswith(r1_roleplay.LAST_POINT_BRIEF))
+        self.assertTrue(point.intent.forced)
+        for fallback in point.intent.fallbacks:
+            self.assertFalse(fallback.startswith(REDIRECT_OPENERS[0]))
+        spoken = s.eng.compose_speech(point, "Okay.").text
+        s.eng.record_spoken(point, spoken, r_sec=850)
+        self.assertTrue(s.eng.scheduler.is_delivered("F4-PUSH"))
+        bye = s.say("Sure, I understand. Thank you so much.", 860)
+        self.assertEqual(bye.mode, TurnMode.EXIT)
+        self.assertIn("end_request_late_exit", bye.reasons)
+        self.assertTrue(s.eng.exit_requested)
+        log = s.eng.admin_log()["endings"]
+        self.assertEqual(log["last_point"]["move_id"], "F4-PUSH")
+        self.assertEqual(log["last_point"]["answer"], "exit")
+        self.assertEqual(s.eng.scheduler.close_attempts, 0)
+
+    def test_after_the_last_point_a_no_resumes_and_sorry_hears_it_again(self):
+        s = self.only_f4_push_owed()
+        s.say("End the interview.", 845)
+        point = s.eng.continuation_plan(846)
+        s.eng.record_spoken(point, s.eng.compose_speech(point, "").text, r_sec=850)
+        again = s.say("Sorry?", 855, repair=True)
+        self.assertIn("last_point_repeat", again.reasons)
+        self.assertIn(r1_roleplay.CUT_REPEAT_NOTE, again.reminder)
+        held = s.say("Okay.", 857, backchannel=True)
+        self.assertFalse(held.exit_roleplay)
+        resumed = s.say("No, wait, let's carry on, I want to answer that.", 860)
+        self.assertFalse(resumed.exit_roleplay)
+        self.assertFalse(s.eng.exit_requested)
+        self.assertEqual(s.eng.admin_log()["endings"]["last_point"]["answer"], "resumed")
+
+    def test_a_quiet_after_the_last_point_ends_it(self):
+        s = self.only_f4_push_owed()
+        s.say("End the interview.", 845)
+        s.eng.continuation_plan(846)
+        self.assertTrue(s.eng.last_point_lapsed())
+        self.assertTrue(s.eng.exit_requested)
+        self.assertFalse(s.eng.last_point_lapsed())  # once
+
+    def test_more_owed_exits_at_once(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        deliver(s.eng, "F2-PRIMARY", "F2-PUSH", "F1-ANCHOR", "F1-COUNTER", r=600)
+        plan = s.say("End the interview.", 845)
+        self.assertTrue(ended(plan))
+        self.assertIn("end_request_late", plan.reasons)
+        self.assertIn("end_request_explicit", plan.reasons)
+        self.assertEqual(s.eng.scheduler.close_attempts, 0)
+
+    def test_nothing_owed_exits_with_no_weak_line(self):
+        s = done_session(r=700)
+        plan = s.say("Can we end this role play?", 860)
+        self.assertTrue(ended(plan))
+        self.assertEqual(plan.scripted_text, "")
+        self.assertIsNone(plan.commitment_level)
+        self.assertEqual(s.eng.scheduler.close_attempts, 0)
+        self.assertFalse(s.eng.commitment_resolved)  # unresolved: the line is masked anyway
+
+    def test_generic_requests_and_farewells_keep_the_ladder(self):
+        for text in ("Can you disconnect the call?", "Thanks for your time, bye."):
+            with self.subTest(text=text):
+                s = self.only_f4_push_owed()
+                plan = s.say(text, 845)
+                self.assertFalse(ended(plan))
+                self.assertIn("close_attempt_redirect", plan.reasons)
+                self.assertEqual(s.eng.scheduler.close_attempts, 1)
+
+    def test_the_permission_form_is_a_maybe_request(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("You can disconnect the call.", 300)
+        self.assertEqual(plan.line_id, "L-ASIDE-END")
+        s = self.only_f4_push_owed()
+        late = s.say("Okay, you can end the call now.", 845)
+        self.assertIn("end_request_as_farewell", late.reasons)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_LATE_END_REQUEST": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("You can disconnect the call.", 300)
+        self.assertNotEqual(plan.line_id, "L-ASIDE-END")
+
+    def test_flag_off_an_explicit_late_request_is_a_farewell(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_LATE_END_REQUEST": "0"}):
+            s = self.only_f4_push_owed()
+            plan = s.say("End the interview.", 845)
+        self.assertIn("end_request_as_farewell", plan.reasons)
+        self.assertFalse(plan.aside)
+
+
+class AbuseHangUpTests(unittest.TestCase):
+    """M032 S3.4 (D-M032-3): abuse aimed at her ends the call in character, and Christy asks.
+
+    fda9e9f6 #85 (paraphrased): an expletive and "go away" got an ordinary free reply.
+    """
+
+    ABUSE = "Oh just shut up."
+
+    def test_she_hangs_up_in_one_line_and_christy_asks(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        turns = s.eng.scheduler.turn
+        plan = s.say(self.ABUSE, 300, turn_index=40)
+        self.assertTrue(plan.aside)
+        self.assertEqual(plan.prelude_line, "L-LEARNER-HANGUP")
+        self.assertEqual(line("L-LEARNER-HANGUP"), "I don't think I want to continue this call. Goodbye.")
+        self.assertEqual((plan.voice, plan.line_id), ("interviewer", "L-ASIDE-HANGUP"))
+        self.assertEqual(
+            plan.scripted_text,
+            "Meera has ended the call. Shall we pause the role-play here and move on?",
+        )
+        self.assertIn("abuse_hangup", plan.reasons)  # said to her: the turn stays evidence
+        self.assertEqual(s.eng.scheduler.turn, turns + 1)
+        self.assertEqual(s.eng.admin_log()["endings"]["abuse_count"], 1)
+        self.assertTrue(s.eng.wrap_question_open)
+        self.assertIsNone(plan.commitment_level)
+
+    def test_a_yes_ends_the_roleplay_and_scores_nothing_new(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(self.ABUSE, 300)
+        plan = s.say("Okay.", 303, confirmed_yes=True)
+        self.assertEqual(plan.mode, TurnMode.EXIT)
+        self.assertIn("abuse_hangup_accepted", plan.reasons)
+        self.assertIsNone(s.eng.commitment_level)
+
+    def test_a_no_resumes_with_her_cool_and_a_second_hang_up_is_the_last(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(self.ABUSE, 300)
+        resume = s.say("No, sorry, let's continue.", 303)
+        self.assertEqual(resume.line_id, "L-ASIDE-WRAP-RESUME")
+        self.assertFalse(resume.continuation)  # the advisor calls her back: he speaks next
+        plan = s.say(PITCH, 320)
+        self.assertIn(r1_roleplay.COOL_NOTE, plan.reminder)
+        again = s.say("Get lost, lady.", 340)
+        self.assertTrue(again.aside)
+        s.say("No, continue.", 343)
+        third = s.say("You're an idiot.", 360)
+        self.assertFalse(third.aside)  # at most two hang-ups; still counted
+        self.assertIn(r1_roleplay.COOL_NOTE, third.reminder or "")
+        log = s.eng.admin_log()["endings"]
+        self.assertEqual((log["abuse_count"], log["abuse_hangups"]), (3, 2))
+
+    def test_banter_is_no_abuse_and_the_flag_off_is_the_release_before(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Shut up, that is amazing news about your promotion!", 300)
+        self.assertFalse(plan.aside)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_ABUSE_HANGUP": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say(self.ABUSE, 300)
+        self.assertFalse(plan.aside)
+        self.assertEqual(s.eng.admin_log()["endings"]["abuse_count"], 1)  # counted all the same
 
 
 if __name__ == "__main__":

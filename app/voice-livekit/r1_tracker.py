@@ -729,6 +729,54 @@ _COACH_REQUEST = tuple(
 )
 
 
+# M032 S3.4 (owner decision D-M032-3; RCA END-4, fda9e9f6 #85: an expletive aimed at the learner and
+# "go away" got an ordinary free reply, and three more lines about the sour ending followed).
+# Abuse aimed at HER, read narrowly: an expletive or insult said to "you" ("f*** off", "screw you",
+# "you're an idiot", "you stupid woman"), a strong Hinglish slur (aimed at the listener by
+# itself), or a dismissal that is its whole sentence ("Shut up.", "Just go away.", "Get lost,
+# lady.", "Chup karo.").  "The doubts will go away", "they told me to shut up", "shut up, that's
+# amazing!", "my old boss was an idiot" and "what the hell" are not abuse.  A hit makes the learner
+# hang up in role and Christy ask; it never ends the call by itself and scores nothing.
+_INSULT = (
+    r"(?:idiot|moron|stupid|dumb(?:ass)?|bitch|bastard|asshole|arsehole|jerk|fool|loser|imbecile|"
+    r"cunt|dick|prick|slut|whore|retard)"
+)
+_ABUSE_DIRECTED = re.compile(
+    r"\b(?:fuck|f\*+k|f\*+|screw) (?:you|off|yourself)\b"
+    r"|\b(?:piss|bugger|sod) off\b"
+    r"|\b(?:you|you're|youre|you are|ur|u r)\s+(?:(?:an?|such an?|so|a bloody|a fucking|"
+    r"bloody|fucking|stupid|dumb|little)\s+){0,2}" + _INSULT + r"s?\b"
+    r"|\b(?:stupid|dumb|bloody|fucking) (?:woman|girl|lady|bitch|idiot|fool|cow)\b"
+    r"|\b(?:chutiy[ae]|chutiya|madarchod|maderchod|bhenchod|behenchod|bhen chod|bsdk|"
+    r"bhosdi(?:ke|ka|wale)|gaandu|gandu|kutiya|haramzad[ie])\b",
+    re.IGNORECASE,
+)
+_ABUSE_OPENER = (
+    r"(?:(?:oh|just|please|now|so|okay|ok|hey|look|listen|lady|you|yaar|arre|bas|madam|"
+    r"ma'?am)[,\s]+){0,3}"
+)
+_ABUSE_DISMISSAL = re.compile(
+    r"^" + _ABUSE_OPENER
+    + r"(?:shut up|shut your mouth|get lost|go away|buzz off|chup kar(?:o)?|chup ho ja(?:o)?|"
+    r"nikal (?:yahan se|ja(?:o)?)|bhaag ja(?:o)?|dimag mat kha(?:o)?|bakwas band kar(?:o)?)"
+    r"(?:[,\s]+(?:now|already|please|lady|madam|ma'?am|yaar|and (?:listen|let me (?:talk|speak|"
+    r"finish))|[a-z]{2,15}))?[\s.!]*$",
+    re.IGNORECASE,
+)
+ABUSE_MAX_CHARS = 4000
+
+
+def detect_abuse(text: object) -> bool:
+    """M032 S3.4: abuse aimed at the learner (see ``_ABUSE_DIRECTED`` and ``_ABUSE_DISMISSAL``)."""
+    folded = fold(text)[-ABUSE_MAX_CHARS:]
+    if _ABUSE_DIRECTED.search(folded) is not None:
+        return True
+    return any(
+        _ABUSE_DISMISSAL.match(sentence.strip()) is not None
+        for sentence in split_sentences(folded)
+    )
+
+
 def detect_character_break(text: object) -> str | None:
     """Classify a character break (plan 5.10): ``coach``, ``ai`` or None.
 
@@ -836,6 +884,17 @@ _END_REQUEST = tuple(
         rf"^{_END_OPENER}{_END_VERB} {_END_OBJECT}{_CLAUSE_END}",
     )
 )
+# M032 SWEEP-24 (c) (the engine's R1_LATE_END_REQUEST; b419d478 #64-65): leave given to the bot to
+# end the call ("You can disconnect the call.", "Okay, you can end the call now.").  A request at
+# the "maybe" level only, never explicit: before 14:00 it gets the one L-ASIDE-END question, from
+# 14:00 it is a farewell like "bye".  The object ends its clause, so "you can end the call and I'll
+# call you back tomorrow", "you can end the course early" and "you can cut the cost with EMI" are
+# not one, and a call-back promise never is (``_end_request_sentences``).
+_END_PERMISSION = re.compile(
+    rf"^{_END_OPENER}you (?:can|may) (?:now |just )?(?:disconnect|end|cut|hang up) "
+    rf"{_END_OBJECT}{_CLAUSE_END}",
+    re.IGNORECASE,
+)
 # A negated end phrase is removed first ("please don't hang up", "can you not end the call", "I
 # didn't mean to end it", "let's not stop"), as phone.py's ``phone_preconsent_end_requested`` does;
 # an unnegated request elsewhere still counts.
@@ -885,13 +944,20 @@ def promises_call_back(text: object) -> bool:
     return _CALL_BACK.search(fold(text)) is not None
 
 
-def _end_request_sentences(text: object) -> list[str]:
-    """The sentences of ``text`` that ask the bot to end, with their negated end phrases removed."""
+def _end_request_sentences(text: object, *, permission: bool = False) -> list[str]:
+    """The sentences of ``text`` that ask the bot to end, with their negated end phrases removed.
+
+    ``permission`` (M032 SWEEP-24 (c)): leave given to end the call counts too, unless the turn
+    promises a call-back.
+    """
     sentences = split_sentences(fold(text))
     found: list[str] = []
+    call_back = permission and promises_call_back(text)
     for index, sentence in enumerate(sentences):
         cleaned = _END_NEGATED.sub(" ", sentence).strip()
         if any(pattern.search(cleaned) for pattern in _END_REQUEST):
+            found.append(cleaned)
+        elif permission and not call_back and _END_PERMISSION.search(cleaned):
             found.append(cleaned)
         elif _I_WANT_TO_STOP.search(cleaned) and all(
             "?" not in later and word_count(later) <= _COURTESY_TAIL_WORDS
@@ -901,8 +967,11 @@ def _end_request_sentences(text: object) -> list[str]:
     return found
 
 
-def detect_end_request(text: object) -> bool:
+def detect_end_request(text: object, *, permission: bool = False) -> bool:
     """The candidate asks the bot to end the call or the interview (an out-of-role request).
+
+    ``permission`` (M032 SWEEP-24 (c), the engine's R1_LATE_END_REQUEST) reads "You can disconnect
+    the call." as a request too, at the "maybe" level only (``explicit_end_request`` never does).
 
     Lexical and sentence by sentence, after negated end phrases are removed.  Before R = 14:00 with
     no commitment on record it chooses the interviewer's one-off L-ASIDE-END question
@@ -912,7 +981,7 @@ def detect_end_request(text: object) -> bool:
     From 14:00, or with a commitment on record, the engine treats the request as a farewell: it
     reaches only what "bye" reaches.
     """
-    return bool(_end_request_sentences(text))
+    return bool(_end_request_sentences(text, permission=permission))
 
 
 def explicit_end_request(text: object) -> bool:
@@ -1380,7 +1449,9 @@ def strictly_names_end(text: object) -> bool:
 END_INTENT_LEVELS = ("no", "maybe", "end")
 
 
-def end_intent_level(text: object, verdict: str | None = None) -> str:
+def end_intent_level(
+    text: object, verdict: str | None = None, *, permission: bool = False
+) -> str:
     """How surely this turn asks to stop the interview or the role play: end, maybe or no.
 
     The regex reading first: an explicit request (``explicit_end_request``) is "end", any other
@@ -1400,7 +1471,7 @@ def end_intent_level(text: object, verdict: str | None = None) -> str:
     """
     if explicit_end_request(text):
         regex = "end"
-    elif detect_end_request(text):
+    elif detect_end_request(text, permission=permission):
         regex = "maybe"
     else:
         regex = "no"

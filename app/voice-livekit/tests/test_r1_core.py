@@ -7880,7 +7880,8 @@ class TestVoicePerSpeech(R1TestCase):
     async def test_scripted_lines_are_bound_by_the_line_table(self) -> None:
         self.assertEqual(
             r1_session._LEARNER_LINES,
-            {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP"},
+            {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP",
+             "L-LEARNER-HANGUP"},  # M032 S3.4: her one-line hang-up is hers
         )
         for line_id in [*sorted(r1_session._LEARNER_LINES), "L-SIL-IB", "L-EXIT", "L-SIL-RP2"]:
             with self.subTest(line_id=line_id):
@@ -8055,7 +8056,7 @@ class TestVoicePerSpeech(R1TestCase):
                 self.assertEqual(spec.voice, "learner" if learner else "interviewer")
         self.assertEqual(
             {spec.line_id for spec in free + named if spec.voice == "learner"},
-            {"L-PICKUP", "L-SIL-RP1", "L-TIME-UP"},
+            {"L-PICKUP", "L-SIL-RP1", "L-TIME-UP", "L-LEARNER-HANGUP"},
         )
 
     async def test_voices_are_forgotten_when_a_speech_ends(self) -> None:
