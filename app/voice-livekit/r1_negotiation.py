@@ -54,6 +54,7 @@ from r1_text import (
     clause_after,
     clause_before,
     dollar_amounts,
+    expand_shorthand_amounts,
     fold,
     is_question_like,
     later_price_threat,
@@ -75,6 +76,9 @@ STATED_CARRY_TURNS = 1
 # above the best offer a total is a rise.
 QUOTE_OFFER = "offer"
 QUOTE_TOTAL = "total"
+# Review S2P-R2: a course price named in another frame ("We charge $9,000", "Ours is $9,000").
+QUOTE_NAMED = "named"
+_STATED_KINDS = (QUOTE_TOTAL, QUOTE_NAMED)
 CONFLICT_WEBSITE = "website"
 CONFLICT_RISE = "rise"
 MAX_CONFLICTS = 2
@@ -3015,6 +3019,69 @@ def stated_totals(text: object) -> list[int]:
     return found
 
 
+# M032 S2P review S2P-R2: the course price the advisor names however he frames it ("We charge
+# $9,000 for the full program", "The total is $9,000", "Ours is $9,000", "You'd be looking at
+# $9,000", "We're at $9,500 for this cohort", "It's 9k"): a course-scale dollar figure in a
+# statement, with every exclusion ``stated_totals`` makes (a value, a saving, an add-on, a salary,
+# someone else's or another program's price, a refused or negated figure, a later or another
+# batch's price) and no discount ("$5,000 off").  It only tells her a price was named (no probe,
+# no price question) and what the anchor reacts to; the conflict check keeps ``stated_totals``.
+NAMED_MIN_USD = 4500
+# Someone else's figure said after it ("$7,200 by someone else, that was not us", "$7,000 is what
+# people say they paid").
+_NAMED_NOT_OURS_AFTER = re.compile(
+    r"^[^.?!]{0,30}\b(?:someone else|somebody else|elsewhere|not us|another (?:company|provider|"
+    r"institute|program(?:me)?|course)|(?:people|someone|somebody|others|students|learners|they)"
+    r"\s+(?:\w+\s+){0,3}?(?:paid|pay|got|spent))\b",
+    re.IGNORECASE,
+)
+# "You'd be looking at $9,000" states the price; the hedge "I'm looking into $8,000" does not.
+_YOU_LOOKING_AT = re.compile(
+    r"\byou(?:'d| would|'ll| will|'re| are)?(?: be)? looking at\s+(?:about |around |roughly )?$",
+    re.IGNORECASE,
+)
+
+
+def named_prices(text: object) -> list[int]:
+    """The course prices ($4,500 to ``MAX_LIST_USD``) the advisor names in ``text``, however
+    framed (review S2P-R2), in the order said; ints only."""
+    found: list[int] = []
+    for sentence in split_sentences(_tail(expand_shorthand_amounts(text))):
+        if later_price_threat(sentence, PRICE_USD):
+            continue
+        for clause in _clauses(sentence):
+            for piece in _pieces(clause):
+                if is_question_like(piece):
+                    continue
+                lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", piece)).lower()
+                sellers = _named_sellers(piece)
+                for match in _DOLLARS.finditer(lowered):
+                    value = parse_amount(match.group(1), bool(match.group(2)))
+                    if value is None or not NAMED_MIN_USD <= value <= MAX_LIST_USD:
+                        continue
+                    start, end = match.start(), match.end()
+                    window = lowered[max(0, start - _STATED_SPAN) : end + _STATED_SPAN]
+                    after = lowered[end:]
+                    before = lowered[max(0, start - 40) : start]
+                    hedged = _HEDGE_BEFORE.search(before) is not None
+                    if (
+                        not _TOTAL_NOT_PRICE_RE.search(window)
+                        and not _TOTAL_NOT_OURS.search(clause_before(lowered, start))
+                        and not _NOT_OURS_AFTER.match(after)
+                        and not _OFF_AFTER.match(after)
+                        and not _NAMED_NOT_OURS_AFTER.match(after)
+                        and not _DISCOUNT_BEFORE.search(before)
+                        and not (hedged and _YOU_LOOKING_AT.search(before) is None)
+                        and not _third_party_seller(lowered, start, sellers)
+                        and not negated_before(lowered, start, 8)
+                        and not _PRICE_NO.search(clause_after(lowered, end))
+                        and not _later_total(lowered, start, end)
+                        and value not in found
+                    ):
+                        found.append(value)
+    return found
+
+
 # M032 S2P (the SWEEP-21 corpus check): the discounts a turn names ("discounts of $500, $1,000 or
 # $1,500", "discounts up to $1500", "$1,000 off", "the $500 to $1,500 plan discounts").  Figures
 # joined as a list ("$500, $1,000 or $1,500", "$500 to $1,500") are one group, and the whole group
@@ -3582,6 +3649,8 @@ class NegotiationTurn:
     # any: (kind, usd, earlier usd) with kind "website" or "rise" (``Negotiation.price_conflict``).
     totals: tuple[int, ...] = ()
     conflict: tuple[str, int, int | None] | None = None
+    # Review S2P-R2: the course prices this turn named in any other frame (``named_prices``).
+    named: tuple[int, ...] = ()
 
     @property
     def offer_added(self) -> bool:
@@ -3664,6 +3733,9 @@ class Negotiation:
         # offer, or said the price is fixed ("No, the price is $9,000 for everyone.").
         self.full_price_turn: int | None = None
         self._totals_read = False
+        # Review S2P-R2 (naturalness): her heard anchor asked about the website's price (the check
+        # form), so no WEBSITE conflict is checked after it (``note_anchor``).
+        self.website_checked = False
 
     # ------------------------------------------------------------------ observation
     def observe(
@@ -3743,24 +3815,48 @@ class Negotiation:
         # M032 SWEEP-21 and SWEEP-19 (only when the engine reads them: ``read_totals``).
         totals: tuple[int, ...] = ()
         conflict: tuple[str, int, int | None] | None = None
+        named: tuple[int, ...] = ()
         if read_totals:
             self._totals_read = True
             totals = tuple(stated_totals(text))
             nets_now = {net for net, _conditional in read_offers}
+            # Review S2P-R2: a course price named in any frame ("We charge $9,000", "Ours is
+            # $9,000"); not one read above or one she said herself.  At or above the $7,000 it is a
+            # named price the anchor reacts to; under it, before the anchor, a low mention.
+            named = tuple(
+                usd
+                for usd in named_prices(text)
+                if usd not in totals and usd not in read and usd not in self.own_amounts
+            )
             for item in offers:
                 self.quotes.append((turn, item.net_usd, QUOTE_OFFER))
             for usd in totals:
                 self.quotes.append((turn, usd, QUOTE_TOTAL))
-            if nets_now or totals:
+            for usd in named:
+                if usd >= ANCHOR_USD:
+                    self.quotes.append((turn, usd, QUOTE_NAMED))
+                    self.low_cleared_turn = turn
+                elif not after_anchor and (turn, usd) not in self.low_mentions:
+                    self.low_mentions.append((turn, usd))
+            if nets_now or totals or named:
                 self.rise_open_turn = None
             conflict = self._price_conflict(
-                totals, nets_now, prior_best, after_anchor, discounts=discount_amounts(text)
+                totals,
+                nets_now,
+                prior_best,
+                after_anchor,
+                discounts=discount_amounts(text),
+                named=named,
             )
             if conflict is not None:
                 self.conflicts.append((conflict[0], conflict[1]))
                 if conflict[0] == CONFLICT_RISE:
                     self.rise_open_turn = turn
-            if after_anchor and not read_offers and (full_price or holds_price(text)):
+            # Review S2P-R2 (naturalness): a price at or above the $7,000 restated after the anchor
+            # with no offer ("No, it's actually $9,500 for the full program") answers her check
+            # or her ask as a refusal does (SWEEP-19's REFUSED), whatever its frame.
+            restated = any(usd >= ANCHOR_USD for usd in (*totals, *named))
+            if after_anchor and not read_offers and (full_price or holds_price(text) or restated):
                 self.full_price_turn = turn
         lowest_now = min((item.net_usd for item in offers), default=None)
         lower = lowest_now if lowest_now is not None and (
@@ -3799,6 +3895,7 @@ class Negotiation:
             lower_offer_usd=lower,
             totals=totals,
             conflict=conflict,
+            named=named,
         )
 
     def _price_conflict(
@@ -3809,6 +3906,7 @@ class Negotiation:
         after_anchor: bool,
         *,
         discounts: list[int] | tuple[int, ...] = (),
+        named: tuple[int, ...] = (),
     ) -> tuple[str, int, int | None] | None:
         """SWEEP-21: the price conflict this turn raises, each (kind, usd) once, at most twice.
 
@@ -3818,13 +3916,26 @@ class Negotiation:
         upfront or $9,000 over nine months"), also through a discount it names that brings the
         total to or below that offer ("$9,000, with discounts up to $1,500" after $8,000;
         ``discounts``, from ``discount_amounts``).
+
+        Review S2P-R2/R4 (naturalness): no WEBSITE check once her anchor asked about the website's
+        price (``website_checked``: his next figure is the answer), nor on a turn that also names a
+        price within $300 of the website's ("$9,000, or $9,600 in total with the EMI", "the
+        advanced track is $11,000") or an offer under it ("$6,000 for you rather than $12,000").
         """
         if len(self.conflicts) >= MAX_CONFLICTS:
             return None
+        website_ok = (
+            after_anchor
+            and not self.website_checked
+            and not any(
+                abs(usd - PRICE_USD) < CONFLICT_MIN_GAP_USD for usd in (*totals, *named)
+            )
+            and not any(net < PRICE_USD for net in nets_now)
+        )
         for usd in totals:
             key = (CONFLICT_WEBSITE, usd)
             if (
-                after_anchor
+                website_ok
                 and abs(usd - PRICE_USD) >= CONFLICT_MIN_GAP_USD
                 and key not in self.conflicts
             ):
@@ -3842,6 +3953,34 @@ class Negotiation:
     def latest_total_usd(self) -> int | None:
         """The latest course total the advisor stated (SWEEP-21's quote record), or None."""
         return next((usd for _t, usd, kind in reversed(self.quotes) if kind == QUOTE_TOTAL), None)
+
+    def latest_stated_usd(self) -> int | None:
+        """The course price the advisor last stated, in any frame (a total or a named price), or
+        None.  Review S2P-R4: of the figures that turn named, the website's (within $300 of it)
+        comes first, so "The fee is $9,000 and the advanced track is $11,000" or "$9,000, or
+        $9,600 in total with the EMI" is a $9,000 price, not the last figure said."""
+        stated = [(turn, usd) for turn, usd, kind in self.quotes if kind in _STATED_KINDS]
+        if not stated:
+            return None
+        last_turn = stated[-1][0]
+        same = [usd for turn, usd in stated if turn == last_turn]
+        near = [usd for usd in same if abs(usd - PRICE_USD) < CONFLICT_MIN_GAP_USD]
+        return near[0] if near else same[-1]
+
+    def latest_stated_turn(self) -> int | None:
+        """The turn of ``latest_stated_usd`` (None when no price was stated)."""
+        return next((turn for turn, _usd, kind in reversed(self.quotes) if kind in _STATED_KINDS), None)
+
+    def note_anchor(self, anchor_id: str, stated_usd: int | None) -> None:
+        """Her heard F1-ANCHOR checked the website's price (review S2P-R2, naturalness): the check
+        form asked "is it about $9,000?", so no WEBSITE conflict is checked after it (his next
+        figure is the answer); the stated-conflict form already checked ``stated_usd``."""
+        if anchor_id == ANCHOR_CHECK:
+            self.website_checked = True
+        elif anchor_id == ANCHOR_STATED_CONFLICT and stated_usd is not None:
+            key = (CONFLICT_WEBSITE, stated_usd)
+            if key not in self.conflicts:
+                self.conflicts.append(key)
 
     def price_now_usd(self) -> int | None:
         """The latest price named, a total or an offer (the later by turn; SWEEP-21)."""
@@ -4130,6 +4269,7 @@ class Negotiation:
                     ],
                     "conflicts": [{"kind": kind, "usd": usd} for kind, usd in self.conflicts],
                     "full_price_turn": self.full_price_turn,
+                    "website_checked": self.website_checked,
                 }
                 if self._totals_read
                 else {}

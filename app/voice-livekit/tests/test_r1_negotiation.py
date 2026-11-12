@@ -3012,7 +3012,111 @@ class ProbeFirstNegotiationTests(unittest.TestCase):
         start = time.perf_counter()
         neg.discount_amounts(hostile)
         neg.stated_totals(hostile)
-        self.assertLess(time.perf_counter() - start, 2.0)
+        neg.named_prices(hostile)
+        neg.named_prices("9k " * 2000 + "nine grand " * 2000 + "you'd be looking at " * 300)
+        self.assertLess(time.perf_counter() - start, 3.0)
+
+    # Review S2P-R2 (correctness): the price named in any frame, and the thousands shorthand
+    # (review S2P-R6).  Synthetic sentences.
+    NAMED = {
+        "We charge $9,000 for the full program.": [9000],
+        "The total is $9,000.": [9000],
+        "The investment is $9,000.": [9000],
+        "Ours is $9,000.": [9000],
+        "You'd be looking at $9,000.": [9000],
+        "We're at $9,500 for this cohort.": [9500],
+        "It's 9k for the whole program.": [9000],
+        "It's nine grand all in.": [9000],
+        "Another platform sells it for 3000. Ours is $9,000.": [9000],
+    }
+    NOT_NAMED = (
+        "Other bootcamps charge $15,000.",
+        "You will save $10,000.",
+        "Analysts earn $15,000 more.",
+        "If you wait, you'll pay $13,000.",
+        "A new batch would be $12,000.",
+        "I can give you $5,000 off.",
+        "We have 10k learners.",
+        "Is it $9,000 for you?",
+        "It's not $9,000.",
+        "Tomorrow it's back to $9000.",
+        "Salaries go up to $20,000 a month.",
+        "If you were quoted $7,200 by someone else, that was not us.",
+        "Roughly $7,000 is what people say they paid.",
+        "Maybe I can look into $8,000, but I can't promise.",
+        "I wish I could do $7,000, truly.",
+    )
+
+    def test_a_price_named_in_any_frame(self):
+        for text, expected in self.NAMED.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.named_prices(text), expected)
+        for text in self.NOT_NAMED:
+            with self.subTest(text=text):
+                self.assertEqual(neg.named_prices(text), [])
+        self.assertEqual(neg.stated_totals("We charge $9,000 for the full program."), [])
+
+    def test_a_named_price_is_on_record_and_clears_a_low_mention(self):
+        state = neg.Negotiation("husband")
+        state.observe(2, "There's a $2,000 scholarship some people get.", read_totals=True)
+        seen = state.observe(3, "We charge $9,000 for the full program.", read_totals=True)
+        self.assertEqual(seen.named, (9000,))
+        self.assertEqual(state.latest_stated_usd(), 9000)
+        self.assertIsNone(state.latest_total_usd())  # the conflict reader is unchanged
+        self.assertIsNone(state.unread_low_usd())
+        low = neg.Negotiation("husband")
+        low.observe(3, "Ours is $6,000.", read_totals=True)
+        self.assertEqual(low.unread_low_usd(), 6000)
+        off = neg.Negotiation("husband")
+        off.observe(3, "We charge $9,000 for the full program.")
+        self.assertIsNone(off.latest_stated_usd())  # only when the engine reads the totals
+
+    def test_the_website_price_said_on_the_same_turn_is_the_price(self):
+        # Review S2P-R4 (naturalness): "$9,000 and the advanced track is $11,000" is $9,000.
+        for text in (
+            "The fee is $9,000 and the advanced track is $11,000.",
+            "It's $9,000, or $9,600 in total if you take the EMI.",
+            "The list price is really $12,000. You get a $3,000 discount, so for you it is $9,000.",
+        ):
+            with self.subTest(text=text):
+                state = neg.Negotiation("husband")
+                state.observe(3, text, read_totals=True)
+                self.assertEqual(state.latest_stated_usd(), 9000)
+                after = neg.Negotiation("husband")
+                seen = after.observe(5, text, anchor_turn=4, read_totals=True)
+                self.assertIsNone(seen.conflict)
+        offered = neg.Negotiation("husband")
+        seen = offered.observe(
+            5,
+            "We could do $6,000 for you rather than $12,000, a straight 50% discount.",
+            anchor_turn=4,
+            read_totals=True,
+        )
+        self.assertIsNone(seen.conflict)
+
+    def test_the_website_check_is_asked_once(self):
+        # Review S2P-R2 (naturalness): after the check form his next figure is the answer, and
+        # the stated-conflict form already checked its figure.
+        checked = neg.Negotiation("husband")
+        checked.note_anchor(neg.ANCHOR_CHECK, None)
+        seen = checked.observe(
+            5, "No, it's actually $9,500 for the full program.", anchor_turn=4, read_totals=True
+        )
+        self.assertIsNone(seen.conflict)
+        self.assertEqual(checked.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        self.assertEqual(checked.refusals, 0)
+        stated = neg.Negotiation("husband")
+        stated.note_anchor(neg.ANCHOR_STATED_CONFLICT, 9500)
+        seen = stated.observe(
+            5, "The fee is $9,500, that's the price.", anchor_turn=4, read_totals=True
+        )
+        self.assertIsNone(seen.conflict)
+        self.assertEqual(stated.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        # A different figure after the stated-conflict anchor is still checked once.
+        other = neg.Negotiation("husband")
+        other.note_anchor(neg.ANCHOR_STATED_CONFLICT, 9500)
+        seen = other.observe(5, "The fee is $12,000.", anchor_turn=4, read_totals=True)
+        self.assertEqual(seen.conflict, ("website", 12000, None))
 
     def test_the_quote_record_is_logged_only_when_read(self):
         off = neg.Negotiation("husband")

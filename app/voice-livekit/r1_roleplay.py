@@ -142,6 +142,7 @@ from r1_guard import (
     hours_said,
 )
 from r1_negotiation import (
+    ANCHOR_STATED_CONFLICT,
     ANCHOR_USD,
     COMMIT_REACTION_BRIEF,
     CONFLICT_RISE,
@@ -347,6 +348,7 @@ from r1_text import (
     concern_themes,
     doubt_opener,
     dollar_amounts,
+    expand_shorthand_amounts,
     fold,
     fuzzy_contains,
     is_closer,
@@ -412,6 +414,9 @@ REDIRECT_PRICE_LINE = "L-REDIRECT-PRICE"
 REDIRECT_TIME_LINE = "L-REDIRECT-TIME"
 # SWEEP-22: at most this many price-reflex notes per session.
 PRICE_REFLEX_LIMIT = 2
+# Review S2P-R1 (naturalness): the advisor's "free" is what the anchor or the counter reacts to only
+# on the turn it was said and the next (``RolePlayEngine._free_fresh``).
+FREE_FRESH_TURNS = 1
 _PROBE_MARKERS = {"F1": PROBE_F1.markers, "F2": PROBE_F2.markers}
 # How many of the learner's last replies the style rules look back over (``r1_guard``).
 STYLE_HISTORY = 8
@@ -1143,6 +1148,10 @@ class RolePlayEngine:
         # line asked, whether that line held a figure the advisor never said, and this turn's
         # price conflict (SWEEP-21) with its note.
         self._last_price_kind: str | None = None
+        self._free_turn: int | None = None  # the turn of the last "free" (review S2P-R1)
+        # The F1-ANCHOR form planned on a turn, as (turn, anchor id, the stated price it checked),
+        # noted on the negotiation when that line is heard (review S2P-R2, naturalness).
+        self._anchor_planned: tuple[int, str, int | None] | None = None
         self._last_probe_family: str | None = None
         self._last_line_unsaid_figure = False
         self._turn_conflict: tuple[str, int, int | None] | None = None
@@ -1617,7 +1626,9 @@ class RolePlayEngine:
         )
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         known = (len(self._advisor_amounts), len(self._answered))
-        self._advisor_amounts.update(advisor_amounts_in(candidate_text))
+        self._advisor_amounts.update(
+            advisor_amounts_in(candidate_text, shorthand=self._probe_first)
+        )
         self._advisor_hours.update(hours_said(candidate_text))
         if self._probe_first:
             # SWEEP-17 item 4: the course lengths the advisor said, and a price he stated without
@@ -2514,6 +2525,8 @@ class RolePlayEngine:
         # $1,000 is a low mention the anchor reacts to (probe first).
         if found is not None:
             self._last_price_kind = found[0]
+            if found[0] == IMPLAUSIBLE_FREE:
+                self._free_turn = turn
             usd = found[1]
             if (
                 self._probe_first
@@ -2523,7 +2536,12 @@ class RolePlayEngine:
                 and (turn, usd) not in self.negotiation.low_mentions
             ):
                 self.negotiation.low_mentions.append((turn, usd))
-        elif any(offer.net_usd > IMPLAUSIBLE_NET_USD for offer in seen.offers):
+        elif (
+            any(offer.net_usd > IMPLAUSIBLE_NET_USD for offer in seen.offers)
+            or (self._probe_first and (seen.totals or seen.named))
+        ):
+            # Review S2P-R1 (naturalness): a price he stated afterwards is the price now, so a
+            # hypothetical "free" said earlier is no longer what she reacts to.
             self._last_price_kind = None
         if not realism:
             found = None  # the careful-buyer note itself stays SWEEP-13's
@@ -3443,16 +3461,27 @@ class RolePlayEngine:
 
     # --------------------------------------------------------- M032 S2P: probe first
     def _price_named(self) -> bool:
-        """SWEEP-22 item 1: the advisor named a course price (an offer, a stated total, a low
-        figure, or "free"); a figure-less "it costs money" is none.  Read from the negotiation
-        only."""
+        """SWEEP-22 item 1: the advisor named a course price AMOUNT (an offer, a stated total, a
+        price named in any other frame such as "We charge $9,000" or "It's 9k", review S2P-R2, or a
+        low figure); a figure-less "it costs money" is none, and so is "if I give it to you for
+        free" (review S2P-R1, naturalness: she still asks what it costs).  Read from the
+        negotiation only."""
         negotiation = self.negotiation
         return (
             negotiation.best_offer_usd is not None
-            or negotiation.latest_total_usd() is not None
+            or negotiation.latest_stated_usd() is not None
             or bool(negotiation.low_mentions)
             or negotiation.low_cleared_turn is not None
-            or self._last_price_kind == IMPLAUSIBLE_FREE
+        )
+
+    def _free_fresh(self) -> bool:
+        """The advisor's "free" is the latest price talk and was said this turn or the one before
+        (review S2P-R1, naturalness): the anchor never reacts to a hypothetical from minutes ago,
+        and a price he stated since (which resets the reading) wins."""
+        return (
+            self._last_price_kind == IMPLAUSIBLE_FREE
+            and self._free_turn is not None
+            and self.turn - self._free_turn <= FREE_FRESH_TURNS
         )
 
     def _time_known(self) -> bool:
@@ -3557,11 +3586,13 @@ class RolePlayEngine:
         )
 
     def _far_below(self) -> bool:
-        """SWEEP-19: the best price is $3,000 or less, or the last price read was low or free."""
+        """SWEEP-19: the best price is $3,000 or less, or the last price read was low, or free
+        and still fresh (``_free_fresh``)."""
         best = self.negotiation.best_offer_usd
-        return (best is not None and best <= IMPLAUSIBLE_NET_USD) or self._last_price_kind in (
-            IMPLAUSIBLE_LOW,
-            IMPLAUSIBLE_FREE,
+        return (
+            (best is not None and best <= IMPLAUSIBLE_NET_USD)
+            or self._last_price_kind == IMPLAUSIBLE_LOW
+            or self._free_fresh()
         )
 
     def _anchor_situation(self) -> AnchorSituation:
@@ -3569,8 +3600,10 @@ class RolePlayEngine:
         negotiation only (SWEEP-19 item 4), or checks the website's price when nobody said one.
 
         A price under the $7,000 not read as an offer: the unclear-low anchor; an offer: the
-        above / reached / below anchors; free: what is the catch; a stated total: his number (with
-        the one conflict check when it is $300 or more away from the website's); none: the check.
+        above / reached / below anchors; free, said this turn or the one before and not followed by
+        a stated price (review S2P-R1, naturalness): what is the catch; a stated price, in any frame
+        (review S2P-R2): his number (the website's when that turn named it, review S2P-R4; with the
+        one conflict check when it is $300 or more away from the website's); none: the check.
         """
         negotiation = self.negotiation
         best = negotiation.best_offer_usd
@@ -3581,12 +3614,17 @@ class RolePlayEngine:
             return anchor_after_offer(
                 best, probe_first=True, counter_v2=flag_on(FLAG_COUNTER_V2)
             )
-        if self._last_price_kind == IMPLAUSIBLE_FREE:
+        if self._free_fresh():
             return anchor_after_free()
-        total = negotiation.latest_total_usd()
-        if total is not None:
-            return anchor_after_stated(total)
+        stated = negotiation.latest_stated_usd()
+        if stated is not None:
+            return anchor_after_stated(stated)
         return anchor_check()
+
+    def _plan_anchor(self, anchor_id: str) -> None:
+        """Remember the F1-ANCHOR form this turn planned, noted when the line is heard."""
+        stated = self.negotiation.latest_stated_usd() if anchor_id == ANCHOR_STATED_CONFLICT else None
+        self._anchor_planned = (self.turn, anchor_id, stated)
 
     def _redirect_plan(
         self, move: OwedMove, prefix: str, reasons: list[str], r_sec: float
@@ -3617,6 +3655,7 @@ class RolePlayEngine:
             text = self._fallback_order(move.id, anchor.variants)[0]
             self._intent_uses[move.id] = self._intent_uses.get(move.id, 0) + 1
             self.negotiation.note_response(self.turn, f"anchor:{anchor.id}")
+            self._plan_anchor(anchor.id)
         elif move.id in (F2_PRIMARY, F4_PRIMARY):
             texts = probe_first_texts(move.id)
             if texts is not None:
@@ -3773,6 +3812,7 @@ class RolePlayEngine:
                 move, brief=anchor.brief, must_say=anchor.must_say, variants=anchor.variants
             )
             self.negotiation.note_response(self.turn, f"anchor:{anchor.id}")
+            self._plan_anchor(anchor.id)
         elif move.id == F1_ANCHOR and (
             self.negotiation.best_offer_usd is not None
             or self.negotiation.unread_low_usd() is not None
@@ -4091,6 +4131,11 @@ class RolePlayEngine:
             else:
                 style_note = ""
             # SWEEP-5 and SWEEP-13: what came with an offer, on a reply the model voices.
+            if self._probe_first and move_id == F1_ANCHOR:
+                # Review S2P-R6 (naturalness): the anchor's own brief reacts to the price on the
+                # table ("below the $7,000 you heard ... no surprise"); SWEEP-13's careful-buyer note
+                # would contradict it on the same turn (the far-below counter is wary afterwards).
+                self._implausible_note = ""
             implausible = bool(self._implausible_note) and not confirm and not reaction_only
             if not confirm and not reaction_only:
                 notes += self._offer_extra_notes()
@@ -4156,7 +4201,10 @@ class RolePlayEngine:
                 # new-offer note on its turn.
                 new_offer_usd=(
                     None
-                    if move_id == F1_ANCHOR or implausible or conflict_note
+                    if move_id == F1_ANCHOR
+                    or implausible
+                    or conflict_note
+                    or (move_id == F1_COUNTER and self._turn_conflict is not None)
                     else self._new_offer_usd
                 ),
                 notes=notes,
@@ -4503,6 +4551,11 @@ class RolePlayEngine:
             self._last_probe_family = None
         if asks_price(spoken_text):
             self._price_asked_turn = plan.turn
+        planned = self._anchor_planned
+        if plan.move_id == F1_ANCHOR and planned is not None and planned[0] == plan.turn:
+            # Review S2P-R2 (naturalness): the website's price was checked once, by this anchor.
+            self.negotiation.note_anchor(planned[1], planned[2])
+            self._anchor_planned = None
         allowed = plan.guard_ctx.allowed_extra
         if plan.mode is TurnMode.SAY_ONLY and plan.move_id == F1_ANCHOR:
             allowed = allowed | frozenset(dollar_amounts(canonical_amounts(plan.scripted_text)))
@@ -4754,16 +4807,18 @@ _BARE_MONTHLY = re.compile(
 )
 
 
-def advisor_amounts_in(text: object) -> set[int]:
+def advisor_amounts_in(text: object, *, shorthand: bool = False) -> set[int]:
     """The whole-dollar amounts the advisor's ``text`` names, however they are written.
 
     The learner may repeat any of them.  Spoken amounts ("two hundred a month", "fifteen hundred
     dollars a month") and a bare number beside "a month" count as well as "$N" (R1-Q final review
     round 1: the guard read the learner's "two hundred a month" in canonical form but only the
     advisor's digits with a dollar sign, so repeating the advisor's own figure was an "invented"
-    amount and cost the learner its reply).
+    amount and cost the learner its reply).  ``shorthand`` (M032 S2P, the session's latched
+    R1_PROBE_FIRST; review S2P-R6): "9k" and "nine grand" count too, since the website's $9,000 is
+    no longer a figure she may always say.
     """
-    folded = canonical_amounts(text)
+    folded = canonical_amounts(expand_shorthand_amounts(text) if shorthand else text)
     amounts = set(dollar_amounts(folded))
     amounts.update(int(match.group(1)) for match in _BARE_MONTHLY.finditer(folded))
     return amounts

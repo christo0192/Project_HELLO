@@ -1135,6 +1135,42 @@ def canonical_amounts(text: object) -> str:
     return _DOLLAR.sub(_dollar_repl, folded)
 
 
+# M032 S2P (review S2P-R6): the advisor's thousands shorthand without a currency word, "9k", "9.5k",
+# "nine grand", "9 grand".  Read only where the advisor's own figures are collected
+# (``r1_roleplay.advisor_amounts_in``, ``r1_negotiation.named_prices``), never by the shared
+# grammar above, so no other reader changes.  A count is none ("10k learners", "5k followers").
+_SHORTHAND_K = re.compile(r"(?<![\w$.,])(\d{1,2}(?:\.\d{1,2})?)\s?k\b", re.IGNORECASE)
+_SHORTHAND_GRAND = re.compile(
+    r"\b(\d{1,2}(?:\.\d)?|" + "|".join(sorted(_SMALL, key=len, reverse=True)) + r")\s+grand\b",
+    re.IGNORECASE,
+)
+
+
+def _shorthand_value(token: str) -> float | None:
+    lowered = token.lower()
+    if lowered in _SMALL:
+        return float(_SMALL[lowered])
+    try:
+        return float(lowered)
+    except ValueError:
+        return None
+
+
+def expand_shorthand_amounts(text: object) -> str:
+    """``text`` with "9k" and "nine grand" written as "$9000" (review S2P-R6); counts stay."""
+
+    def repl(match: re.Match[str]) -> str:
+        if COUNT_NOUN_AFTER.match(match.string, match.end()) is not None:
+            return match.group(0)
+        value = _shorthand_value(match.group(1))
+        if value is None or value <= 0:
+            return match.group(0)
+        return f"${int(round(value * 1000))}"
+
+    folded = fold(text)
+    return _SHORTHAND_GRAND.sub(repl, _SHORTHAND_K.sub(repl, folded))
+
+
 def clause_after(text: str, pos: int) -> str:
     """The clause of ``text`` that starts at ``pos`` and runs to the next clause break."""
     stop = _CLAUSE_BREAK.search(text, pos)

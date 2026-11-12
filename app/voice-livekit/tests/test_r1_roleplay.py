@@ -10173,5 +10173,169 @@ class Sweep18EngineTests(unittest.TestCase):
         )
         self.assertNotIn("at or below the $7,000", plan.reminder)
 
+
+def _responses(s) -> list[str]:
+    return [item["response"] for item in s.eng.negotiation.log()["responses"]]
+
+
+@s2p_on
+class S2PReviewPriceNamedTests(unittest.TestCase):
+    """Review S2P-R2 and S2P-R6 (correctness): a price said in any frame is a price named."""
+
+    PHRASINGS = (
+        "We charge $9,000 for the full program.",
+        "The total is $9,000.",
+        "The investment is $9,000.",
+        "Ours is $9,000.",
+        "You'd be looking at $9,000.",
+        "We're at $9,500 for this cohort.",
+        "It's 9k for the whole program.",
+        "It's nine grand all in.",
+    )
+
+    def test_she_never_asks_the_price_she_was_just_told(self):
+        for text in self.PHRASINGS:
+            with self.subTest(text=text):
+                s = Session(engine())
+                plan, r = to_f1(s)
+                self.assertEqual(plan.probe, "F1")
+                fresh = Session(engine())
+                r = after_f3(fresh)
+                fresh.say(SUBSTANTIVE_PITCH, r)
+                fresh.say(TIME_ANSWER, r + 20)
+                fresh.say(SHORT_ACK, r + 40)
+                fresh.say(ALUMNI, r + 60)
+                fresh.say(text, r + 80)
+                self.assertTrue(fresh.eng._price_named(), text)
+                later = [fresh.say(SHORT_ACK, r + 100), fresh.say(SUBSTANTIVE_PITCH, r + 120)]
+                self.assertTrue(all(p.probe != "F1" for p in later), [p.reasons for p in later])
+                anchors = [x for x in _responses(fresh) if x.startswith("anchor:")]
+                self.assertTrue(anchors, [p.reasons for p in fresh.plans[-3:]])
+                self.assertNotIn("anchor:check", anchors)
+
+    def test_an_ask_with_the_price_gets_no_price_question(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(
+            "We charge $9,000 for the full program. Shall I send you the enrolment link?", 180
+        )
+        self.assertNotEqual(plan.negotiation_id, NEG.N_PRICE_FIRST)
+        self.assertNotEqual(plan.probe, "F1")
+        if plan.negotiation_id == NEG.N_MONEY:
+            self.assertEqual(plan.intent.brief, NEG.N_MONEY_NAMED_BRIEF)
+
+    def test_the_shorthand_price_is_one_she_may_repeat(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("It's 9k for the whole program.", 40)
+        self.assertIn(9000, plan.guard_ctx.advisor_amounts)
+        free = s.say(SHORT_ACK, 60)
+        result = s.eng.sanitize_reply(free, "Hmm, $9,000 is more than I planned to spend.")
+        self.assertIn("$9,000", result.text)
+        self.assertFalse(any(hit.rule == "amount_off_card" for hit in result.hits))
+
+    @s2p_off
+    def test_flag_off_reads_no_shorthand(self):
+        self.assertEqual(r1_roleplay.advisor_amounts_in("It's 9k for the whole program."), set())
+
+
+@s2p_on
+class S2PReviewFreeTests(unittest.TestCase):
+    """Review S2P-R1 (naturalness): "free" is no price named and does not latch for the call."""
+
+    FREE = "If I give you this course for free, would you take it?"
+
+    def test_a_free_hypothetical_gets_the_price_reflex(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(self.FREE, 40)
+        self.assertFalse(s.eng._price_named())
+        self.assertIn("Nobody has told you the price yet.", plan.reminder)
+
+    def test_a_price_after_free_is_the_one_the_anchor_reacts_to(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(self.FREE, 40)
+        plan = s.say("Anyway, the course fee is $9,000.", 140)
+        self.assertEqual(plan.move_id, F1_ANCHOR)
+        self.assertEqual(plan.intent.brief, NEG.anchor_after_stated(9000).brief)
+        self.assertNotIn("anchor:free", _responses(s))
+
+    def test_an_enrol_ask_after_free_asks_the_price(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(self.FREE, 40)
+        s.say(SHORT_ACK, 60)
+        plan = s.say("Do you want to enrol today?", 180)
+        self.assertEqual(plan.negotiation_id, NEG.N_PRICE_FIRST)
+
+    def test_a_stale_free_is_no_anchor_reaction(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(self.FREE, 40)
+        s.say(SHORT_ACK, 60)
+        s.say(SHORT_ACK, 80)
+        s.eng._price_dodges = r1_roleplay.MAX_PRICE_DODGES  # straight to the anchor's form
+        self.assertNotEqual(s.eng._anchor_situation().id, NEG.ANCHOR_FREE)
+        fresh = Session(engine())
+        fresh.say(OPENER, 20)
+        fresh.say(self.FREE, 40)
+        self.assertEqual(fresh.eng._anchor_situation().id, NEG.ANCHOR_FREE)
+
+
+@s2p_on
+class S2PReviewConflictOnceTests(unittest.TestCase):
+    """Review S2P-R2 and S2P-R4 (naturalness): the website's price is checked once, and a second
+    figure on the turn that names the website's price raises no check."""
+
+    def test_after_the_check_form_his_figure_is_the_answer(self):
+        s = Session(engine())
+        _plan, r = to_f1(s)
+        plans = [s.say(text, r + 20 * i) for i, text in enumerate((PRICE_DODGE, SUBSTANTIVE_PITCH, GOALS_DODGE))]
+        self.assertEqual(plans[-1].intent.brief, NEG.anchor_check().brief)
+        self.assertTrue(s.eng.negotiation.website_checked)
+        counter = s.say("No, it's actually $9,500 for the full program.", r + 80)
+        self.assertEqual(counter.move_id, F1_COUNTER)
+        self.assertNotIn("saw on the website", counter.intent.brief)
+        self.assertNotIn("counter:conflict", _responses(s))
+
+    def test_a_restated_figure_after_the_stated_conflict_is_a_refusal(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        anchor = s.say("The program fee is $9,500.", 40)
+        self.assertEqual(anchor.intent.brief, NEG.anchor_after_stated(9500).brief)
+        counter = s.say("The fee is $9,500, that's the price.", 60)
+        self.assertEqual(counter.move_id, F1_COUNTER)
+        self.assertNotIn("saw on the website", counter.intent.brief)
+        self.assertIn("counter:refused", _responses(s))
+
+    def test_the_website_price_on_the_same_turn_is_the_one_she_reacts_to(self):
+        for text in (
+            "The fee is $9,000 and the advanced track is $11,000.",
+            "It's $9,000, or $9,600 in total if you take the EMI.",
+        ):
+            with self.subTest(text=text):
+                s = Session(engine())
+                s.say(OPENER, 20)
+                anchor = s.say(text, 40)
+                self.assertEqual(anchor.move_id, F1_ANCHOR)
+                self.assertEqual(anchor.intent.brief, NEG.anchor_after_stated(9000).brief)
+
+    def test_an_offer_under_the_list_price_is_no_website_check(self):
+        s = _anchor_done()
+        counter = s.say(
+            "We could do $6,000 for you rather than $12,000, a straight 50% discount.", 60
+        )
+        self.assertEqual(counter.move_id, F1_COUNTER)
+        self.assertNotIn("saw on the website", counter.intent.brief)
+
+    def test_a_far_below_anchor_carries_no_contradicting_surprise_note(self):
+        # Review S2P-R6 (naturalness): the anchor's own calm brief, not SWEEP-13's note as well.
+        s = Session(engine())
+        s.say(OPENER, 20)
+        anchor = s.say("Honestly, I can give you the whole course for $2,500.", 40)
+        self.assertEqual(anchor.move_id, F1_ANCHOR)
+        self.assertNotIn("A careful buyer would be surprised", anchor.reminder)
+
 if __name__ == "__main__":
     unittest.main()
