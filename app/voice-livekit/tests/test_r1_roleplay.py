@@ -1766,7 +1766,9 @@ class CharacterBreakTests(unittest.TestCase):
         self.assertTrue(plan.aside)
         self.assertEqual(plan.voice, "interviewer")
         self.assertEqual(plan.scripted_text, line("L-ASIDE-COACH", **P1.line_values))
-        self.assertIn("I'm the learner, Meera Iyer.", plan.scripted_text)
+        # M032 S6 (SWEEP-30): Christy is PLAYING the learner; never "I'm the learner ... She".
+        self.assertIn("I'm playing the learner, Meera Iyer, who enquired", plan.scripted_text)
+        self.assertNotIn("I'm the learner", plan.scripted_text)
         self.assertFalse(plan.needs_llm)
         speech = s.eng.compose_speech(plan)
         self.assertEqual((speech.text, speech.voice), (plan.scripted_text, "interviewer"))
@@ -1774,6 +1776,20 @@ class CharacterBreakTests(unittest.TestCase):
         self.assertFalse(again.aside)
         self.assertEqual(again.character_break, "ai")
         self.assertTrue(again.needs_llm)
+
+    def test_with_the_transition_repair_off_the_aside_is_revision_21s(self):
+        # M032 S6: R1_TRANSITION_REPAIR=0 speaks the aside as it was, under the same line id.
+        import os
+
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.say("Are you an AI?", 60)
+            plan = s.say("Seriously, is this the test?", 100)
+        self.assertTrue(plan.aside)
+        self.assertEqual(plan.line_id, "L-ASIDE-COACH")
+        self.assertEqual(plan.scripted_text, line("L-ASIDE-COACH-V20", **P1.line_values))
+        self.assertIn("I'm the learner, Meera Iyer.", plan.scripted_text)
 
     def test_a_coaching_request_plays_the_aside_immediately_and_only_once(self):
         s = Session(engine())

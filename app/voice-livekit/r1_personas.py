@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass
 
 from r1_commitment import call_proposal_in
+from r1_script import active_line_id
 from r1_script import line as script_line
 from r1_text import dollar_amounts, fold, is_question_like, split_sentences
 
@@ -636,7 +637,8 @@ class RenderedPersona:
 
     @property
     def pickup_line(self) -> str:
-        return script_line("L-PICKUP", **self.line_values)
+        # M032 S6: the pickup the session speaks (revision 21's with R1_TRANSITION_REPAIR=0).
+        return script_line(active_line_id("L-PICKUP"), **self.line_values)
 
     @property
     def profile(self) -> str:

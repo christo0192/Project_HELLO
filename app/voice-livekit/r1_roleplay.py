@@ -197,7 +197,7 @@ from r1_prompts import (
     TRY_NOT_GRANTED_NOTE,
     control_prose,
     format_usd,
-    interviewer_prefix,
+    interviewer_control_prose,
     learner_prefix,
     turn_reminder,
 )
@@ -235,7 +235,7 @@ from r1_scheduler import (
     markers_match,
     quotes_price,
 )
-from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS
+from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS, active_line_id
 from r1_script import line as script_line
 from r1_text import (
     PHRASE_STRETCH,
@@ -547,7 +547,9 @@ class RolePlayEngine:
         self._coach_played = False
         self._break_kind: str | None = None
         self._learner_control = control_prose(learner_prefix(persona))
-        self._interviewer_control = control_prose(interviewer_prefix())
+        # M032 S5: the plain prefix's prose, whatever R1_INTERVIEWER_VOICE says (the voice text
+        # holds nothing private and Christy's natural sentences reuse its wording).
+        self._interviewer_control = interviewer_control_prose()
         self.exit_requested = False
         # Repetition control: every learner sentence actually played, so the guard can drop
         # a sentence the learner already said; and how often a rotating line was used.
@@ -1500,7 +1502,8 @@ class RolePlayEngine:
         return self._plan(
             TurnMode.SAY_ONLY,
             ["aside_coach", f"character_break:{kind}"],
-            scripted=script_line("L-ASIDE-COACH", **self.persona.line_values),
+            # M032 S6 (SWEEP-30): the reworded aside, or revision 21's with R1_TRANSITION_REPAIR=0.
+            scripted=script_line(active_line_id("L-ASIDE-COACH"), **self.persona.line_values),
             voice="interviewer",
             aside=True,
             line_id="L-ASIDE-COACH",

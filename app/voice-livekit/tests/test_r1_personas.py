@@ -1,9 +1,11 @@
 """Unit tests for ``r1_personas``: the four cards, hidden needs and genuine-probe unlocks."""
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -404,14 +406,22 @@ class PublicCardTests(unittest.TestCase):
         self.assertEqual(answers["what success looks like for you"], "A data role within a year.")
 
     def test_pickup_names_the_variant(self):
+        # M032 S6 item 8: "Hello? Yes, this is X speaking." answered a question nobody had asked.
         self.assertEqual(
             resolve_persona("p1_career_switcher", variant="v1").pickup_line,
-            "Hello? Yes, this is Meera speaking.",
+            "Hello, Meera speaking.",
         )
         self.assertEqual(
             resolve_persona("p1_career_switcher", variant="v2").pickup_line,
-            "Hello? Yes, this is Priya speaking.",
+            "Hello, Priya speaking.",
         )
+
+    def test_with_the_transition_repair_off_the_pickup_is_revision_21s(self):
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.assertEqual(
+                resolve_persona("p1_career_switcher", variant="v1").pickup_line,
+                "Hello? Yes, this is Meera speaking.",
+            )
 
 
 class ResolveTests(unittest.TestCase):

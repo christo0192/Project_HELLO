@@ -180,16 +180,39 @@ class Reply:
     # A scripted sentence spoken after the model's reply in the same speech (M1: Christy's
     # L-TRANSITION-ASK after an answer before the role-play); "" for none.
     tail: str = ""
+    # M032 S6 item 7: the tail is left out when the model's reply already ends with a question
+    # (never two questions in one turn); False keeps it whatever the reply says.
+    tail_optional: bool = False
+    # M032 S5, the icebreaker plan (``r1_icebreaker``): the per-turn note that takes the
+    # getting-to-know-you note's place ("" for the phase's own note), the line spoken INSTEAD of
+    # a model call ("Take your time."; "" for a model reply), the line a reply with nothing usable
+    # left falls back to (the current objective's question; "" for the guard's own fallback),
+    # and the plan's decision itself (``IcebreakerJob``; labels only, kept to undo it when the
+    # reply is never heard).
+    note: str = ""
+    scripted: str = ""
+    fallback: str = ""
+    job: Any = None
+    # M032 S6 (SWEEP-28, review): "hold" or "repeat" for the icebreaker's scripted repair line
+    # (L-IB-HOLD, "Of course. {question}"), so a line nobody heard gives its once-per-session
+    # budget back; "" for every other reply.
+    repair: str = ""
 
 
 def llm_messages(
-    reply: Reply, persona: RenderedPersona, history: Sequence[Mapping[str, Any]]
+    reply: Reply,
+    persona: RenderedPersona,
+    history: Sequence[Mapping[str, Any]],
+    *,
+    voice: bool | None = None,
 ) -> list[dict[str, str]]:
     """The only messages the model may see for ``reply`` (the llm_node context filter).
 
     ``history`` is every transcript item so far (both voices, every phase); the filter
     picks from it by phase and voice.  The reminder is a ``system`` message because
-    DeepSeek rejects ``developer``.
+    DeepSeek rejects ``developer``.  ``voice`` (M032 S5) is the session's reading of
+    ``R1_INTERVIEWER_VOICE`` (``None`` reads it now): Christy's voice text in the prefix and
+    the delivery rider on the note.
     """
     ordered = sorted(
         (item for item in history if item is not reply.entry),
@@ -203,10 +226,10 @@ def llm_messages(
             reply.plan.reminder,
         )
     return assemble_messages(
-        interviewer_prefix(),
+        interviewer_prefix(voice=voice),
         select_context(ordered, reply.phase),
         reply.candidate_text,
-        interviewer_reminder(reply.phase),
+        interviewer_reminder(reply.phase, note=reply.note or None, rider=voice),
     )
 
 
@@ -332,6 +355,20 @@ def fidelity_events(
     return events
 
 
+# M032 S6: what the transition and the icebreaker repairs add to the ``session_facts`` row (labels
+# and counts only; the API's parser reads none of them, so the gate is unchanged).  ``start_by`` is
+# "button" or "spoken"; ``pressed_during`` is "brief", "replay", "recap", "answer" or "wait".
+EXTRA_FACT_KEYS = (
+    "start_by",
+    "pressed_during",
+    "transition_recaps",
+    "icebreaker_repeat_deferrals",
+    "boundary_presence_lines",
+    "ib_holds",
+    "icebreaker_acks_held",
+)
+
+
 def session_facts_event(
     admin: Mapping[str, Any] | None,
     pins: Mapping[str, Any],
@@ -339,6 +376,7 @@ def session_facts_event(
     roleplay_seconds: float,
     first_audio_p95_ms: float | None = None,
     reader: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The one ``session_facts`` row the plan 6.4 gate cannot pass without.
 
@@ -352,6 +390,8 @@ def session_facts_event(
 
     ``reader`` is the turn reader's shadow record (M032 S4): only its ``READER_FACT_KEYS`` are
     added, and only when it ran, so a session without it posts exactly the row of before.
+    ``extra`` (M032 S6) adds only its ``EXTRA_FACT_KEYS``, and only those it has, so a session with
+    the repairs off posts exactly the row of before.
     """
     communication = (admin or {}).get("communication", {})
     # The engine starts the longest turn at 0.0 and only raises it for a turn whose speaking
@@ -367,9 +407,10 @@ def session_facts_event(
         "first_audio_p95_ms": _measured(first_audio_p95_ms),
     }
     shadow = {key: reader[key] for key in READER_FACT_KEYS if key in (reader or {})}
+    added = {key: extra[key] for key in EXTRA_FACT_KEYS if key in (extra or {})}
     return {
         "event_type": "session_facts",
         "turn_index": None,
         "family_id": None,
-        "payload": {"pins": dict(pins), **facts, **shadow},
+        "payload": {"pins": dict(pins), **facts, **shadow, **added},
     }

@@ -437,12 +437,26 @@ Clocks:
 | ID | Exact text |
 |---|---|
 | L-OPEN | "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll be running your first-round interview for the Sales Program Advisor role. It takes about thirty minutes. We'll spend a few minutes getting to know you, then I'll switch into a sales role-play of up to twenty minutes where I play a prospective learner, and we'll finish with a couple of minutes for your questions. Let's start: could you walk me through your background, especially any sales or customer-facing work you've done?" |
-| L-TRANSITION | "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective learner so we can evaluate how you handle a real sales call. The learner is {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. The role-play runs for up to twenty minutes, and in that time your goal is to convince her: understand her needs and help her decide to enrol, as you would on a real call, using the course details from your preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and she'll pick up. Shall we start the role-play now, or do you have any questions first?" |
+| L-OPEN-HELLO (M032 S7C; R1_OPENING_SOUND_CHECK=0 speaks L-OPEN) | "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?" |
+| L-OPEN-HELLO-AGAIN (the reply could not hear, once, M032 S7C) | "Sorry about that. Please check your speaker or headphone volume. Can you hear me now?" |
+| L-OPEN-AGENDA (a reply that heard Christy, M032 S7C) | "Good, I can hear you. This first-round interview takes about thirty minutes: we'll get to know each other, then do a sales role-play of up to twenty minutes, and you can ask me questions at the end. So, to begin, tell me a bit about yourself and your sales or customer-facing work." |
+| L-OPEN-AGENDA-PLAIN (silence, or still not heard, M032 S7C) | "Let's get started. This first-round interview takes about thirty minutes: we'll get to know each other, then do a sales role-play of up to twenty minutes, and you can ask me questions at the end. So, to begin, tell me a bit about yourself and your sales or customer-facing work." |
+| L-OPEN-AGENDA-CONTINUE (an early answer, M032 S7C) | "Good, I can hear you. This first-round interview takes about thirty minutes: we'll get to know each other, then do a sales role-play of up to twenty minutes, and you can ask me questions at the end. Please, carry on with what you were telling me." |
+| L-TRANSITION (M032 S6; R1_TRANSITION_REPAIR=0 speaks L-TRANSITION-V20, the text before) | "Thank you, {first_name}. Next, let's do a sales role-play. I'll play {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. You'll have up to twenty minutes, and your goal is to convince her as you would on a real call: understand her needs and help her decide to enrol, using the course details from your preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' To begin, just say 'ready'. Shall we start the role-play now, or do you have any questions first?" |
+| L-TRANSITION-AGAIN (the replay on request, M032 S6) | "Of course, here it is again. I'll play {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. You'll have up to twenty minutes, and your goal is to convince her as you would on a real call: understand her needs and help her decide to enrol, using the course details from your preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' To begin, just say 'ready'. Shall we start the role-play now, or do you have any questions first?" |
+| L-TRANSITION-RECAP (the short recap, M032 S6) | "Of course, in short: I'll play {lead_name}, and you're the Program Advisor calling her back about the Data Science course. Understand her needs and help her decide to enrol, using your preparation guide. Shall we start the role-play now, or do you have any questions first?" |
+| L-PRESENT (M032 S6) | "Yes, I'm here." |
 | L-TRANSITION-ASK | "Shall we start the role-play now, or do you have another question?" |
+| L-TRANSITION-ASK-2 (rotated, M032 S6) | "Anything else, or shall we start?" |
+| L-TRANSITION-ASK-3 (rotated, M032 S6) | "Any other questions, or shall we begin the role-play?" |
 | L-TRANSITION-REASK | "Shall we start the role-play now? Just say 'ready' when you are, or ask me a question first if you have one." |
 | L-TRANSITION-REASK-2 | "I'm still here whenever you're ready. Just say 'ready', or press the I'm ready button, and she'll pick up." |
 | L-TRANSITION-STEER | "Let's keep any other questions for the end of the interview; there'll be time for them then. Shall we start the role-play now?" |
-| L-PICKUP | Per persona, e.g. "Hello? Yes, this is Meera speaking." |
+| L-PICKUP | Per persona, e.g. "Hello, Meera speaking." (M032 S6; before it, "Hello? Yes, this is Meera speaking.") |
+| L-PICKUP-BRIDGE (the button pressed during a brief, M032 S6) | "Great, here she is." |
+| L-IB-HOLD (a request for a moment in the icebreaker, M032 S6) | "Of course, take a moment. I'm here when you're ready." |
+| L-IB-REPEAT (runtime template: a request to repeat the question at the soft exit, M032 S6) | "Of course. {question}" ({question}: the last question of Christy's own icebreaker reply) |
+| L-TRANSITION-BRIDGED (M032 S5; M032 S6 also after a repair turn ends the icebreaker) | L-TRANSITION without "Thank you, {first_name}. " |
 | L-TIME-CUE (learner, R ≈ 17:00) | "Just so you know, I've only got a couple of minutes before my next call." |
 | L-TIME-UP (learner, at the end of the time, M2) | "I'm sorry, I really have to go now. Thank you for your time." |
 | L-ASIDE-WRAP (interviewer aside, R ≥ 14:00, M2) | "This is Christy, your interviewer, stepping in for a moment. We're well into the role-play now, so would you like to wrap it up here? If you'd rather keep going, just carry on with {lead_first_name}." |
@@ -452,9 +466,13 @@ Clocks:
 | L-NO-FEEDBACK | "I'm sorry, I can't share any feedback on how it went." |
 | L-FAQ-DEFER | "That's a good question for the hiring team; they'll follow up with you on it." |
 | L-CLOSE | "Thank you for your time today, {first_name}. The hiring team will review your interview and get back to you. You can close this window now. Goodbye." |
-| L-ASIDE-COACH | "Quick note from Christy, your interviewer: in this role-play you're the Program Advisor and I'm the learner, {lead_name}. She enquired about the Data Science course and you're calling her back. Please carry on as you would on a real call." |
+| L-ASIDE-COACH (M032 S6) | "Quick note from Christy, your interviewer: in this role-play you're the Program Advisor, and I'm playing the learner, {lead_name}, who enquired about the Data Science course; you're calling her back. Please carry on as you would on a real call." |
 | L-MUTE | "This is Christy. It looks like your microphone may be muted. Please unmute when you're ready." |
+| L-MUTE-RP (role-play, M032 S7C; R1_MUTE_ASIDE_V2=0 speaks L-MUTE) | "This is Christy, your interviewer. Your microphone seems to be muted. Please unmute it so we can carry on." |
+| L-MUTE-IV (Christy's own phases, M032 S7C) | "Your microphone seems to be muted. Please unmute it so I can hear you." |
 | L-SIL-IB | "Are you still with me, {first_name}?" |
+| L-SIL-NOAUDIO (never heard, M032 S7C) | "I can't hear anything from you yet. If you're speaking, please check that your microphone is switched on and selected." |
+| L-SIL-END-NOAUDIO (never heard, M032 S7C) | "I still can't hear you, so I'll have to stop here for now. The hiring team will be in touch. Goodbye." |
 | L-SIL-RP1 (learner) | "Hello? Are you still there?" |
 | L-SIL-RP2 | "This is Christy, your interviewer. It sounds like we may have lost you. I'll wait a few more seconds." |
 | L-SIL-END | "I'm going to end the interview here as we seem to have lost the connection. The hiring team will be in touch. Goodbye." |

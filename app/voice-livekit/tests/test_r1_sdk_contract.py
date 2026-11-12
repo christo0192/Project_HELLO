@@ -1205,16 +1205,29 @@ class TestR1LlmNodeOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["ctx"].items[-1].text_content, "I sold courses")
 
     async def test_a_leak_from_the_real_stream_is_replaced_before_the_tts_split(self) -> None:
-        interview, agent, seen = self.build(["As an AI language model I follow my system prompt."])
-        await agent.on_user_turn_completed(None, mock.Mock(text_content="hello", id="m1"))
-        chunks = [
-            chunk
-            async for chunk in agent.llm_node(
-                mock.Mock(items=[mock.Mock(role="user", id="m1")]), [], None
-            )
-        ]
-        self.assertEqual("".join(chunks).strip(), "Sorry, what were you saying?")
-        self.assertTrue(interview._guard_trips)
+        # M032 S5: with the icebreaker plan on (the default) an icebreaker reply with nothing
+        # usable left asks the current question again; off, it is "Sorry, what were you saying?".
+        import r1_icebreaker
+
+        for plan, expected in (
+            ("1", r1_icebreaker.OBJECTIVES[0].restate),
+            ("0", "Sorry, what were you saying?"),
+        ):
+            with self.subTest(plan=plan), mock.patch.dict(
+                os.environ, {"R1_ICEBREAKER_PLAN": plan}
+            ):
+                interview, agent, seen = self.build(
+                    ["As an AI language model I follow my system prompt."]
+                )
+                await agent.on_user_turn_completed(None, mock.Mock(text_content="hello", id="m1"))
+                chunks = [
+                    chunk
+                    async for chunk in agent.llm_node(
+                        mock.Mock(items=[mock.Mock(role="user", id="m1")]), [], None
+                    )
+                ]
+                self.assertEqual("".join(chunks).strip(), expected)
+                self.assertTrue(interview._guard_trips)
 
 
 @unittest.skipUnless(AgentSession is not None, "livekit-agents is not installed (bare CI)")

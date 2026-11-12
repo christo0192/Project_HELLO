@@ -192,6 +192,11 @@ nothing but its log line (``r1_turn_reader``: the reader's labels beside today's
 and the ``session_facts`` record (``reader_shadow``, ``reader_agreement``) reads it, so a reply, a
 plan, a phase and a grade are exactly what they are without it.  ``R1_TURN_READER=off`` turns it
 off; the act mode is a later PR, after the owner has seen the labels.
+
+M032 S5 (owner go of 2026-11-11, test fda9e9f6): Christy's voice and delivery rider
+(``R1_INTERVIEWER_VOICE``), the icebreaker plan (``r1_icebreaker``, ``R1_ICEBREAKER_PLAN``) and the
+transition bridge (``_say_brief``, ``R1_TRANSITION_BRIDGE``, off by default): one guarded sentence
+reacting to the answer that ended the icebreaker, composed out of band, then L-TRANSITION-BRIDGED.
 """
 from __future__ import annotations
 
@@ -206,7 +211,7 @@ import time
 import unicodedata
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from observability import StructuredLogger
@@ -220,6 +225,25 @@ from r1_end_intent import (
     prefilter_hit,
 )
 from r1_guard import FALLBACK_REPLY, StreamGuard
+from r1_icebreaker import (
+    BRIDGE_NOTE,
+    BRIDGE_TIMEOUT_SEC,
+    FREE_RESTATE,
+    HOLD_MIN_BUDGET_SECONDS,
+    ICEBREAKER_HOLD_WAIT_SECONDS,
+    IcebreakerPlan,
+    bridge_wanted,
+    clean_bridge,
+    icebreaker_plan_enabled,
+    icebreaker_repair_enabled,
+    is_closed_question,
+    is_hold_request,
+    is_thinking,
+    presence_opener_note,
+    repeat_line,
+    reply_question,
+    transition_bridge_enabled,
+)
 from r1_latency import (
     GATE_PHASE,
     LatencyTracker,
@@ -249,9 +273,26 @@ from r1_replies import (
     llm_messages,
     session_facts_event,
 )
-from r1_prompts import ROLEPLAY_PHASE
+from r1_prompts import (
+    ROLEPLAY_PHASE,
+    assemble_messages,
+    control_prose,
+    interviewer_control_prose,
+    interviewer_prefix,
+    interviewer_reminder,
+    interviewer_voice_enabled,
+    select_context,
+)
 from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
-from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
+from r1_script import (
+    INTERVIEWER_NAME,
+    active_line_id,
+    is_candidate_free,
+    known_first_name,
+    line,
+    spoken_first_name,
+    transition_repair_enabled,
+)
 from r1_sarvam import current_speech_id
 from r1_text import normalize
 from r1_tracker import explicit_end_request
@@ -414,6 +455,31 @@ ICEBREAKER_HOLD_CEILING_SECONDS = 30.0
 # back and the next committed turn is the boundary, or, when the candidate says nothing more, this
 # much quiet after their last sign of speech; the hard S=4:30 cap still bounds the whole wait.
 ICEBREAKER_CONTINUATION_WAIT_SECONDS = 5.0
+# M032 S7C (SWEEP-34, ``R1_NO_AUDIO_LADDER``): after "I can't hear anything from you yet." a
+# candidate who was never heard gets this long to speak before the close (L-SIL-END-NOAUDIO).
+NO_AUDIO_END_SECONDS = 30.0
+# M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``): after the hello ("Can you hear me okay?") the
+# reply is awaited for this much candidate silence, within this much session time for the whole
+# sound check (the hello again included).  A final heard DURING the hello ("Hi") is followed by a
+# shorter quiet for the answer to the question; a reply this long (content words, once greetings,
+# courtesy and hearing words are out) is an early answer, and the agenda invites them to go on.
+OPEN_CHECK_SILENCE_SECONDS = 10.0
+OPEN_CHECK_HARD_SECONDS = 45.0
+OPEN_HELLO_FOLLOW_SECONDS = 1.5
+OPEN_CHECK_ANSWER_WORDS = 12
+# A whole-turn complaint ("Not really.", "It's a bit low.") is read as one only up to this length.
+OPEN_CHECK_COMPLAINT_MAX_WORDS = 6
+# Review of S7C: the never-heard ladder in the opening has no phase budget of its own, so it is
+# bounded from its start: its line (about 8 s) and ``NO_AUDIO_END_SECONDS`` of silence fit with
+# room to spare.  A candidate who mutes after the line, or a steady noise that keeps restarting the
+# silence window, gets the plain agenda at the end of it and the icebreaker's own budget, as on
+# main; the opening never waits out the session cap.
+OPEN_NO_AUDIO_HARD_SECONDS = 60.0
+# M032 S7C (SWEEP-36, ``R1_MUTE_ASIDE_V2``): the mute aside waits for a real mute (a blip that is
+# undone within this long gets no line), and never talks over a candidate turn in flight unless
+# the mute has lasted this long in all.
+MUTE_ASIDE_DEBOUNCE_SECONDS = 1.5
+MUTE_ASIDE_TURN_WAIT_SECONDS = 3.0
 ROLEPLAY_PROMPT_SECONDS = 20.0
 ROLEPLAY_FIRST_STEP_SECONDS = 20.0
 ROLEPLAY_ASIDE_STEP_SECONDS = 15.0
@@ -607,11 +673,21 @@ _LIVE_PHASES = frozenset(
 # Warming them would spend Sarvam requests, a budget shared with the phone lane, on audio nothing
 # can play (pr4c-rebase.md 4.1).
 _WARM_ORDER = (
+    # M032 S7C (SWEEP-35): the agendas and the hello again come first: they play a few seconds into
+    # the interview.  The hello itself carries the name and is spoken at once, like L-OPEN.
+    "L-OPEN-AGENDA",
+    "L-OPEN-AGENDA-PLAIN",
+    "L-OPEN-AGENDA-CONTINUE",
+    "L-OPEN-HELLO-AGAIN",
     "L-TRANSITION",
+    "L-TRANSITION-AGAIN",
+    "L-TRANSITION-RECAP",
+    "L-PRESENT",
     "L-TRANSITION-NUDGE",
     "L-TRANSITION-REASK",
     "L-TRANSITION-STEER",
     "L-TRANSITION-REASK-2",
+    "L-PICKUP-BRIDGE",
     "L-PICKUP",
     "L-EXIT",
     "L-WRAP",
@@ -622,7 +698,11 @@ _WARM_ORDER = (
     "L-ASIDE-WRAP-RESUME",
     "L-TIME-UP",
     "L-MUTE",
+    "L-MUTE-IV",
+    "L-MUTE-RP",
     "L-SIL-IB",
+    "L-SIL-NOAUDIO",
+    "L-SIL-END-NOAUDIO",
     "L-SIL-RP1",
     "L-SIL-RP2",
     "L-REJOIN",
@@ -630,6 +710,27 @@ _WARM_ORDER = (
     "L-SIL-END",
     "L-SYSTEM-STOP",
 )
+# M032 S5 item 4: the brief that follows Christy's reaction plays only behind the transition
+# bridge, which ships off, so it is warmed (right after L-TRANSITION) only while the bridge is on:
+# off, the warm-up spends exactly today's Sarvam requests (``R1Interview._warm_order``).
+_BRIDGED_BRIEF = "L-TRANSITION-BRIDGED"
+# M032 S6: the lines only the transition repair speaks (``R1_TRANSITION_REPAIR``).  With the flag
+# off they are not warmed, so the warm-up spends exactly revision 21's Sarvam requests (the Sarvam
+# quota is shared with the phone lane).  The tails (L-TRANSITION-ASK and its rotated forms) travel
+# inside Christy's answers and are never warmed.
+_TRANSITION_REPAIR_LINES = frozenset(
+    {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
+)
+# M032 S7C: the lines only each follow-up speaks, warmed only while its flag is on, so with all
+# three off the warm-up spends exactly revision 22's Sarvam requests.  With R1_MUTE_ASIDE_V2 on,
+# L-MUTE can no longer play, so it is not warmed either.
+_SOUND_CHECK_LINES = frozenset(
+    {"L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE", "L-OPEN-HELLO-AGAIN"}
+)
+_NO_AUDIO_LINES = frozenset({"L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"})
+_MUTE_V2_LINES = frozenset({"L-MUTE-IV", "L-MUTE-RP"})
+# The marker of the reaction sentence's speech (latency and line-cache lines; never its words).
+_BRIDGE_MARKER = "transition_bridge"
 # Line-cache events that mean something went wrong (logged as warnings).
 _LINE_CACHE_WARNINGS = frozenset(
     {
@@ -657,6 +758,19 @@ _SDK_METRICS = (
 # Why a committed icebreaker turn is not the boundary (``R1Interview._icebreaker_deferral``, A1).
 _DEFER_BARGE_IN = "barge_in"
 _DEFER_UNFINISHED = "unfinished"
+# M032 S6 (SWEEP-28, R1_ICEBREAKER_REPAIR): a request to repeat Christy's question, and a request
+# for a moment, once the soft exit is due.  Like the barge-in, each gets a reply (scripted here) and
+# is not the boundary; the next committed answer is.
+_DEFER_REPEAT = "repeat"
+_DEFER_HOLD = "hold"
+_ANSWERED_DEFERRALS = frozenset({_DEFER_BARGE_IN, _DEFER_REPEAT, _DEFER_HOLD})
+# Review of S6: "Okay." or "Thank you." right after the hold or the repeat line.  No reply, and not
+# the boundary: the answer they asked time for (or to hear the question for) is still to come.
+_DEFER_ACK = "ack"
+# What a hold request in the icebreaker gets (``R1Interview._ib_hold_route``): L-IB-HOLD and a
+# longer silence window, or (too little of the hard budget left to promise one) the boundary.
+_IB_HOLD = "hold"
+_IB_HOLD_BOUNDARY = "boundary"
 # What a committed transition turn gets (``R1Interview._transition_action``, M1).
 _TRANSITION_READY = "ready"
 _TRANSITION_BRIEF = "brief"
@@ -665,6 +779,23 @@ _TRANSITION_NUDGE = "nudge"
 _TRANSITION_STEER = "steer"
 _TRANSITION_INVITE = "invite"
 _TRANSITION_ANSWER = "answer"
+# M032 S6 (R1_TRANSITION_REPAIR): the short recap (L-TRANSITION-RECAP), "Yes, I'm here." and the
+# yes/no start question for a presence check, and the yes/no start question alone (a brief request
+# once the replay and the recaps are used).
+_TRANSITION_RECAP = "recap"
+_TRANSITION_PRESENCE = "presence"
+_TRANSITION_REASK = "reask"
+# SWEEP-29: one budget of recaps per session, shared by a request for a shorter brief, a brief
+# request once the replay was used and a question about the role-play; the full replay keeps its own
+# budget of one.
+RECAP_LIMIT = 2
+# The lines that are a brief: a pronoun request ("say it in short") is about the brief only right
+# after one of them (SWEEP-29).
+_BRIEF_LINES = frozenset(
+    {"L-TRANSITION", "L-TRANSITION-BRIDGED", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP"}
+)
+# SWEEP-32: the answers' start questions once the brief's either/or question has been heard.
+_ROTATED_TAILS = ("L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3")
 # What Christy's last start question asked (``R1Interview._start_question``, M1 review fix): a
 # short yes ("Yes.", "Okay.") agrees to start only after a yes/no question that finished playing
 # (L-TRANSITION-REASK, L-TRANSITION-STEER).  After an either/or one ("Shall we start now, or do
@@ -677,8 +808,20 @@ _EITHER_OR = "either_or"
 _SAY_READY = "say_ready"
 # Repair (round 2): the words that make a no-questions turn a refusal, not a thank-you.
 _BARE_NO_WORDS = frozenset({"no", "nope", "nah", "none", "nothing"})
+# Review of S6: a bare "No." (or "Not really.") that answers a question of Christy's own.
+_BARE_NO_REPLY_WORDS = frozenset({"no", "nope", "nah", "not", "really", "actually", "um", "uh"})
 _START_QUESTION_OF_LINE = {
     "L-TRANSITION": _EITHER_OR,
+    "L-TRANSITION-BRIDGED": _EITHER_OR,  # M032 S5: the same brief, after Christy's reaction
+    # M032 S6: the replay, the recap, the answers' rotated start questions and the rollback briefs
+    # all end with an either/or question.
+    "L-TRANSITION-AGAIN": _EITHER_OR,
+    "L-TRANSITION-RECAP": _EITHER_OR,
+    "L-TRANSITION-ASK": _EITHER_OR,
+    "L-TRANSITION-ASK-2": _EITHER_OR,
+    "L-TRANSITION-ASK-3": _EITHER_OR,
+    "L-TRANSITION-V20": _EITHER_OR,
+    "L-TRANSITION-BRIDGED-V20": _EITHER_OR,
     "L-TRANSITION-REASK": _YES_NO,
     "L-TRANSITION-STEER": _YES_NO,
     "L-TRANSITION-REASK-2": _SAY_READY,
@@ -733,6 +876,38 @@ def _env_seconds(raw: str | None, default: float, minimum: float, maximum: float
 def ack_hold_enabled() -> bool:
     """``R1_ACK_HOLD`` (default on): hold acknowledgements back from the SDK (``stt_node``)."""
     return _env_switch(os.getenv("R1_ACK_HOLD"))
+
+
+def icebreaker_ack_hold_enabled() -> bool:
+    """``R1_ICEBREAKER_ACK_HOLD`` (default on; M032 S6, SWEEP-31): in the icebreaker too, an "Okay"
+    or a reflexive "Thank you" over Christy's live reply is held back and never cuts her.
+
+    Only while ``R1_ACK_HOLD`` is on as well.  Rollback: ``fly secrets set
+    R1_ICEBREAKER_ACK_HOLD=0 -a project-hello-voice`` (the icebreaker as before: nothing held).
+    """
+    return _env_switch(os.getenv("R1_ICEBREAKER_ACK_HOLD"))
+
+
+def no_audio_ladder_enabled() -> bool:
+    """``R1_NO_AUDIO_LADDER`` (default on; M032 S7C, SWEEP-34): a candidate who was never heard (no
+    final, no speech) gets "I can't hear anything from you yet." and its close, not "Are you still
+    with me?" and the lost-connection close.  Rollback: ``fly secrets set R1_NO_AUDIO_LADDER=0 -a
+    project-hello-voice`` (every silence gets today's ladder)."""
+    return _env_switch(os.getenv("R1_NO_AUDIO_LADDER"))
+
+
+def opening_sound_check_enabled() -> bool:
+    """``R1_OPENING_SOUND_CHECK`` (default on; M032 S7C, SWEEP-35): the opening is a short hello
+    with a sound check ("Can you hear me okay?"), then a shorter agenda.  Rollback: ``fly secrets
+    set R1_OPENING_SOUND_CHECK=0 -a project-hello-voice`` (L-OPEN, exactly as before)."""
+    return _env_switch(os.getenv("R1_OPENING_SOUND_CHECK"))
+
+
+def mute_aside_v2_enabled() -> bool:
+    """``R1_MUTE_ASIDE_V2`` (default on; M032 S7C, SWEEP-36): the mute aside waits for a real mute,
+    never talks over a turn in flight, and fits the phase (L-MUTE-RP / L-MUTE-IV).  Rollback: ``fly
+    secrets set R1_MUTE_ASIDE_V2=0 -a project-hello-voice`` (today's immediate L-MUTE)."""
+    return _env_switch(os.getenv("R1_MUTE_ASIDE_V2"))
 
 
 def ack_resume_seconds() -> float:
@@ -826,6 +1001,25 @@ def _is_candidate_microphone(participant: Any, publication: Any, identity: str |
         and str(getattr(source, "name", source)).lower()
         in {"microphone", "source_microphone"}
     )
+
+
+def _loop_now() -> float:
+    """The running loop's clock (the one every wait here is measured in), or the monotonic clock."""
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
+
+
+def _is_subscribed(publication: Any) -> bool:
+    """M032 S7C (SWEEP-34): whether the worker holds a subscribed track of ``publication``.
+
+    ``RemoteTrackPublication.subscribed`` when it is there; else whether a track is attached.
+    """
+    subscribed = getattr(publication, "subscribed", None)
+    if isinstance(subscribed, bool):
+        return subscribed
+    return getattr(publication, "track", None) is not None
 
 
 def fold_speech(text: object) -> str:
@@ -1008,6 +1202,38 @@ _CLARIFICATION_RE = re.compile(
 )
 
 
+# M032 S6 (SWEEP-28, R1_ICEBREAKER_REPAIR): "Can you repeat that once again?" and "Sorry, I was not
+# able to hear you" were answers (owner test b419d478: the second counted as one of the icebreaker's
+# four), and "I'm sorry" was a content word.  The wider reader adds " once again" to the "again"
+# forms and the "not able / unable to hear" forms, and "I'm sorry" / "I am sorry" fold to "sorry".
+# With the flag off the reader is revision 21's exactly.
+_AGAIN_WIDE = r"(?: again| once again| once more| one more time)"
+_UNABLE_LEAD = r"(?:(?:i|we) (?:was|were|am|are)|i'm|im|we're) (?:not able|unable) to"
+_UNABLE_TO_HEAR = (
+    _UNABLE_LEAD + r" (?:hear|catch)" + _REPEAT_OBJECT + r"?(?: properly| clearly| well)?|"
+    + _UNABLE_LEAD + r" (?:follow|understand|get)" + _REPEAT_OBJECT
+)
+assert _CLARIFICATION_RE.pattern.endswith(r")\b")
+_CLARIFICATION_WIDE_RE = re.compile(
+    _CLARIFICATION_RE.pattern[: -len(r")\b")].replace(_AGAIN, _AGAIN_WIDE)
+    + "|" + _UNABLE_TO_HEAR + r")\b"
+)
+_SORRY_FOLD_RE = re.compile(r"\b(?:i'm|i am|im) sorry\b")
+
+
+def _repair_fold(text: str) -> str:
+    """``fold_speech``, with "I'm sorry" read as "sorry" while ``R1_ICEBREAKER_REPAIR`` is on."""
+    folded = fold_speech(text)
+    if icebreaker_repair_enabled():
+        folded = _SORRY_FOLD_RE.sub("sorry", folded)
+    return folded
+
+
+def _clarification_re() -> re.Pattern[str]:
+    """The clarification reader in force (the wider one while ``R1_ICEBREAKER_REPAIR`` is on)."""
+    return _CLARIFICATION_WIDE_RE if icebreaker_repair_enabled() else _CLARIFICATION_RE
+
+
 def content_word_count(text: str) -> int:
     """How many words of ``text`` answer something, on folded text.
 
@@ -1015,7 +1241,7 @@ def content_word_count(text: str) -> int:
     (``_BACKCHANNEL_WORDS``) are left out, so "Sorry, can you repeat that?" and "Yes, I can hear
     you" count 0 while "Sorry, I sell courses" counts 3.
     """
-    folded = _CLARIFICATION_RE.sub(" ", fold_speech(text))
+    folded = _clarification_re().sub(" ", _repair_fold(text))
     return sum(1 for word in folded.split() if word not in _BACKCHANNEL_WORDS)
 
 
@@ -1074,6 +1300,30 @@ def is_acknowledgement_turn(text: str) -> bool:
     return all(word in allowed for word in rest.split())
 
 
+# M032 S6 (SWEEP-31, owner test b58c7d9c #4-#6, paraphrased: a two-word thank-you cut Christy's
+# icebreaker reply and she restarted with a new reaction).  A reflexive courtesy said over her: every
+# word one of these, at least one "thank"/"thanks", and no question mark.  "Yes" is never one of
+# them (it can answer), and anything else ("Thank you, but what does it pay?") is a turn of its own.
+_ICEBREAKER_COURTESY_WORDS = frozenset(
+    {
+        "thank", "thanks", "you", "so", "much", "very", "okay", "ok", "yeah", "sure", "sir",
+        "maam", "ma'am", "mam", "madam",
+    }
+)
+
+
+def is_courtesy_turn(text: str) -> bool:
+    """True for "Thank you", "Thanks so much, sir", "Okay, thank you" (SWEEP-31)."""
+    if _has_question_mark(text):
+        return False
+    words = fold_speech(text).split()
+    return (
+        bool(words)
+        and all(word in _ICEBREAKER_COURTESY_WORDS for word in words)
+        and any(word in ("thank", "thanks") for word in words)
+    )
+
+
 def is_repair_turn(text: str) -> bool:
     """True for a turn that only asks to hear the learner again or checks she is there.
 
@@ -1082,15 +1332,241 @@ def is_repair_turn(text: str) -> bool:
     she says her point again (``RolePlayEngine.plan_turn(repair=...)``) instead of being told not
     to repeat herself.  A turn with any other word is an answer or a question of its own.
     """
-    folded = fold_speech(text)
+    folded = _repair_fold(text)
     if not folded:
         return False
-    stripped = _CLARIFICATION_RE.sub(" ", folded)
+    stripped = _clarification_re().sub(" ", folded)
     cue = stripped != folded or _STILL_THERE_RE.search(folded) is not None
     words = stripped.split()
     if not all(word in _REPAIR_WORDS for word in words):
         return False
     return cue or any(word in _REPAIR_CUES for word in words)
+
+
+# M032 S6 (SWEEP-28): of the repair turns, the ones that ask Christy to say her question again (the
+# repeat, rephrase, say-again, what-did-you-say/ask and didn't-catch forms, or a bare "Sorry?",
+# "Pardon?" or "Come again?").  An audio check ("Can you hear me?") or a presence check ("Are you
+# there?") asks for nothing to be repeated.
+_REPEAT_ASK_RE = re.compile(
+    r"\b(?:"
+    r"(?:can|could|would|will) you (?:please |just |kindly )?(?:repeat|rephrase)|"
+    r"(?:please )?(?:repeat|rephrase)" + _REPEAT_OBJECT + r"|"
+    r"please (?:repeat|rephrase)|"
+    r"(?:say|ask)" + _REPEAT_OBJECT + r"?" + _AGAIN_WIDE + r"|"
+    r"what (?:did|do) you (?:say|ask)|what (?:was|is) (?:that|the question|your question)|"
+    r"(?:i|we) (?:did not|didn't|didnt|could not|couldn't|couldnt|can not|cannot|can't|cant)"
+    r"(?: quite| really| properly| clearly| fully)? (?:catch|hear)|"
+    r"(?:i|we) (?:missed|lost)" + _REPEAT_OBJECT + r"|"
+    + _UNABLE_LEAD + r" (?:hear|catch)"
+    r")\b"
+)
+_BARE_REPEAT_RE = re.compile(
+    r"^(?:(?:sorry|um|uh|oh) )*(?:sorry|pardon(?: me)?|come again)(?: please)?$"
+)
+
+
+def is_repeat_request(text: str) -> bool:
+    """True for a turn that only asks Christy to say it again (``R1_ICEBREAKER_REPAIR``).
+
+    "Sorry, could you repeat the question?", "Can you repeat that once again?", "I didn't catch
+    that", "Sorry, I was not able to hear you", "Sorry?", "Pardon?".  Nothing else may be in the
+    turn (``is_repair_turn``), and "Sorry." without a question mark is an apology.
+    """
+    if not is_repair_turn(text):
+        return False
+    folded = _repair_fold(text)
+    if _REPEAT_ASK_RE.search(folded) is not None:
+        return True
+    return _has_question_mark(text) and _BARE_REPEAT_RE.match(folded) is not None
+
+
+# Review of S6: the icebreaker's repeat and presence readers (``R1_ICEBREAKER_REPAIR``) look past
+# how the candidate addresses Christy ("sir", "ma'am", her name) and past a leading "hold on" or
+# "wait": "Sorry ma'am, can you repeat the question?", "Christy, are you there?" and "Hold on, what
+# was the question?" are repair turns.  The role-play's own readers are unchanged.
+_IB_ADDRESS_WORDS = _INTERVIEWER_NAMES | frozenset({"sir", "ma'am", "maam", "mam", "madam"})
+_IB_HOLD_LEAD_RE = re.compile(
+    r"^(?:(?:sorry|okay|ok|um|uh|oh) )*(?:(?:hold on|wait)(?: (?:a|one) (?:minute|moment|second|"
+    r"sec))?|one (?:second|sec|moment)) "
+)
+
+
+def _ib_repair_view(text: str) -> str:
+    """``text`` as the icebreaker's repair readers see it: folded, without the address words and
+    a leading "hold on" / "wait", and with its question mark kept ("" when nothing is left)."""
+    words = [word for word in _repair_fold(text).split() if word not in _IB_ADDRESS_WORDS]
+    view = _IB_HOLD_LEAD_RE.sub("", " ".join(words) + " ").strip()
+    if view and _has_question_mark(str(text or "")):
+        return view + "?"
+    return view
+
+
+# After the hold line ("Of course, take a moment."), a turn of only these words answers nothing.
+_IB_QUIET_WORDS = _ACK_WORDS | _IB_ADDRESS_WORDS | frozenset(
+    {"yes", "fine", "great", "cool", "perfect", "please", "sorry", "thanks", "thank", "you", "so",
+     "much", "very", "sure"}
+)
+
+
+# M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``): the reply to the hello's "Can you hear me okay?",
+# read on folded text and never by the model.  Three readings:
+#
+# * ``SOUND_CANT_HEAR``: a directed complaint anywhere in the turn ("I can't hear you", "I can't
+#   hear your voice", "I can barely hear you", "not able to hear you", "you're breaking up", "your
+#   voice is little low", "voice is not clear", "the audio is breaking", "you sound a bit
+#   muffled", "I can hear you but not clearly", "can you speak up?", "can you increase the
+#   volume?"); a request to say it again ("Sorry?", "Could you repeat that?"); after the question
+#   only, a presence check or a bare questioning sound ("Hello? Are you there?", "Hello?",
+#   "What?", "Hmm?"); or, the whole turn of at most ``OPEN_CHECK_COMPLAINT_MAX_WORDS`` words, a
+#   bare negative or a quality complaint ("No.", "Not really.", "Barely.", "Not audible.", "Not
+#   clear.", "Low.", "It's a bit low.", "Volume is low.", "There's an echo.", "There is some
+#   disturbance.", "Louder, please.").  Directed on purpose: "our customers could not hear the
+#   offer" is an answer, not a complaint, and so is "No problem".
+# * ``SOUND_ANSWER``: an early answer, ``OPEN_CHECK_ANSWER_WORDS`` content words or more once the
+#   greetings, courtesy and hearing words are out (``content_word_count``), that tells something
+#   about the candidate (``_SOUND_ANSWER_CUE_RE``: "I have been working in", "my last job", "four
+#   years in sales") and does not end on a question to Christy.  Review of S7C: a long courtesy, a
+#   check-back ("I hope you can hear me as well") or a hold ("give me one second, I'm closing the
+#   door") is no answer to go on with: it gets the agenda, which asks the first question.
+# * ``SOUND_HEARD``: anything else ("Yes", "Hi Christy!", "Hello Christy?", "Can you hear me?": we
+#   just did).
+SOUND_CANT_HEAR = "cant_hear"
+SOUND_ANSWER = "answer"
+SOUND_HEARD = "heard"
+_NEG_AUX = (
+    r"(?:can not|cannot|can't|cant|could not|couldn't|couldnt|did not|didn't|didnt|do not|don't|"
+    r"dont)"
+)
+# Words a reply may open with before what it says ("Sorry, not audible.", "Yes, but it's low.").
+_SOUND_CHECK_LEAD = (
+    r"(?:(?:yes|yeah|okay|ok|um|uh|hmm|sorry|but|well|actually|so|hi|hello|christy|sir|ma'am|maam|"
+    r"mam|madam) )*"
+)
+# What may follow "hear" in a complaint: Christy ("you", "your voice", "the audio"), nothing at all
+# ("anything", "a thing"), or the end of the turn or an adverb or address word.  "We couldn't hear
+# the customer" is not one.
+_HEAR_OBJECT = (
+    r"(?: (?:you|anything|a thing|much|what you)\b|"
+    r" (?:your|the) (?:voice|audio|sound)\b|$| (?=(?:properly|clearly|well|at all|now|christy|"
+    r"sir|ma'am|maam|madam|sorry|please)\b))"
+)
+# How much: "a bit low", "little low", "very low", "slightly muffled".
+_SOUND_DEGREE = (
+    r"(?:(?:a (?:bit|little)|little|bit|very|too|quite|really|so|kind of|slightly|somewhat) )?"
+)
+# What is wrong with the sound.  Bare "breaking" and "cutting" only after a sound is named.
+_SOUND_FAULTS = (
+    r"breaking up|cutting (?:out|off)|low|faint|soft|quiet|muffled|unclear|inaudible|"
+    r"not (?:very |that |so )?(?:audible|clear|loud)|choppy|robotic|distorted|echoing|lagging"
+)
+_SOUND_CHECK_CANT_HEAR_RE = re.compile(
+    r"(?:^" + _SOUND_CHECK_LEAD + r"|\b(?:i|we) )(?:"
+    # "I can't hear you (properly)", "couldn't hear your voice", "I can barely hear you",
+    # "not able to hear you"
+    + _NEG_AUX + r"(?: really| quite| properly| clearly)? hear" + _HEAR_OBJECT + r"|"
+    r"(?:can|could) (?:barely|hardly|only just) hear" + _HEAR_OBJECT + r"|"
+    r"(?:(?:was|were|am|are) )?(?:not able|unable) to hear" + _HEAR_OBJECT
+    + r")|"
+    r"\b(?:i'm|im|we're) (?:not able|unable) to hear" + _HEAR_OBJECT + r"|"
+    # "you're breaking up", "you sound a bit muffled"
+    r"\byou(?:'re| are| sound| seem) " + _SOUND_DEGREE + r"(?:" + _SOUND_FAULTS + r")\b|"
+    # "your voice is little low", "voice is not clear", "the audio is breaking"
+    r"\b(?:(?:your|the) )?(?:voice|audio|sound|volume|mic|microphone)(?: quality)? "
+    r"(?:is|was|sounds|seems|keeps)(?: (?:getting|going))? " + _SOUND_DEGREE
+    + r"(?:" + _SOUND_FAULTS + r"|breaking|cutting|disturbed|fluctuating)\b|"
+    # "I can hear you but not clearly", "I can hear you, but it is very low"
+    r"\bhear(?: you| it)?(?: (?:now|okay|ok|fine))? but (?:(?:it(?:'s| is)|you(?:'re| are)) )?"
+    + _SOUND_DEGREE + r"(?:not (?:clearly|properly|very well|that well|well)|" + _SOUND_FAULTS
+    + r")\b|"
+    # "can you speak up?", "please speak louder", "can you increase the volume?"
+    r"\bspeak(?: a (?:little )?bit| a little)? (?:up|louder|more loudly)\b|"
+    r"\b(?:(?:can|could|would) you|please) (?:please |kindly )?(?:increase|raise|turn up)"
+    r"(?: the| your)? (?:volume|sound)\b"
+)
+_SOUND_CHECK_SHORT_RE = re.compile(
+    r"^" + _SOUND_CHECK_LEAD + r"(?:"
+    r"(?:no|nope|nah|nahi|nahin)(?: (?:no|not (?:really|clearly|properly|very well|much|quite|at "
+    r"all|yet)))*|"
+    r"not (?:really|clearly|properly|very well|much|quite|at all|yet|audible|clear|loud enough|"
+    r"(?:very|that|so) (?:clear|clearly|audible))|"
+    r"inaudible|barely|hardly|(?:very )?faintly|"
+    r"(?:(?:it(?:'s| is)|that(?:'s| is)|you(?:'re| are)|(?:the )?(?:sound|audio|voice|volume) is) )?"
+    + _SOUND_DEGREE
+    + r"(?:low|faint|soft|quiet|muffled|unclear|choppy|robotic|distorted|breaking|breaking up|"
+    r"echoing|lagging|not (?:audible|clear))|"
+    r"there(?:'s| is) (?:an |some |a lot of |a bit of )?(?:echo|noise|static|lag|delay|"
+    r"disturbance)|"
+    r"(?:a (?:little )?bit |a little |little )?louder(?: please)?|volume up(?: please)?"
+    r")(?: (?:sorry|please|sir|ma'am|maam|mam|madam|christy))?$"
+)
+# Review of S7C: what an early answer tells about the candidate.  First person with a work or
+# study verb ("I have been working in", "I handled", "we sell", "I started my career", "I did my
+# graduation"), "currently working", "from a sales background", a background noun of theirs ("my
+# last job", "my experience"), a role ("I'm a sales executive") or a span of time ("four years in
+# sales").  A courtesy, a check-back or a hold has none of these.
+_SOUND_ANSWER_CUE_RE = re.compile(
+    r"\b(?:"
+    r"(?:i|we)(?:'ve|'m|'d| have| had| am| was| were)?(?: been)?"
+    r"(?: (?:also|mostly|currently|recently|previously|just))? "
+    r"(?:work|works|worked|working|sell|selling|sold|handle|handling|handled|manage|managing|"
+    r"managed|lead|leading|led|run|running|ran|studied|study|studying|graduated|completed|joined|"
+    r"moved|switched|spent|started my|did my|done my|doing my)\b|"
+    r"(?:currently|presently) (?:working|employed|handling|selling|managing)\b|"
+    r"from an? (?:\w+ )?background\b|"
+    r"my (?:(?:last|previous|current|first|present) )?(?:background|experience|career|job|role|"
+    r"work|company|team|degree|graduation|education|profile|organisation|organization|employer)\b|"
+    r"(?:i'm|im|i am) (?:a|an) (?:\w+ )?(?:executive|manager|advisor|adviser|associate|counsellor|"
+    r"counselor|consultant|engineer|graduate|fresher|student|representative|officer|specialist|"
+    r"analyst|lead)\b|"
+    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|"
+    r"a couple of|a few|few|several) (?:\w+ )?(?:years?|months?)\b"
+    r")"
+)
+_HELLO_ONLY_WORDS = frozenset({"hello", "hi", "hey"}) | _IB_ADDRESS_WORDS
+# After the question, a bare questioning sound ("What?", "Hmm?", "Huh?") did not catch it.
+_SOUND_QUERY_WORDS = frozenset({"what", "hmm", "hm", "huh", "eh"}) | _IB_ADDRESS_WORDS
+
+
+def _ends_on_question(text: str) -> bool:
+    """True when the last thing said is a question ("..., so how long will this take?")."""
+    stripped = str(text or "").rstrip().rstrip("\"'”’)")
+    return stripped.endswith(("?", "？"))
+
+
+def sound_check_reading(text: str, *, after_question: bool = True) -> str:
+    """How the reply to the hello's "Can you hear me okay?" reads (see the comment above).
+
+    ``after_question`` is False when every word of ``text`` was said over the hello itself
+    (review of S7C): a "Hello?" or "Are you there?" on joining, before the question was heard,
+    says nothing about hearing it, and reads as heard.
+    """
+    folded = _repair_fold(text)
+    if not folded:
+        return SOUND_HEARD
+    view = _ib_repair_view(text)
+    if _SOUND_CHECK_CANT_HEAR_RE.search(folded) is not None:
+        return SOUND_CANT_HEAR
+    words = folded.split()
+    if len(words) <= OPEN_CHECK_COMPLAINT_MAX_WORDS and _SOUND_CHECK_SHORT_RE.match(folded):
+        return SOUND_CANT_HEAR
+    if view and is_repeat_request(view):
+        return SOUND_CANT_HEAR
+    if after_question and _has_question_mark(text):
+        if view and is_repair_turn(view) and _STILL_THERE_RE.search(view) is not None:
+            return SOUND_CANT_HEAR  # "Hello? Are you there?"
+        named = any(word in _INTERVIEWER_NAMES for word in words)  # "Hello Christy?" heard her
+        if not named and (
+            all(word in _HELLO_ONLY_WORDS for word in words)
+            or all(word in _SOUND_QUERY_WORDS for word in words)
+        ):
+            return SOUND_CANT_HEAR  # a bare "Hello?" or "What?" after the question
+    if (
+        content_word_count(text) >= OPEN_CHECK_ANSWER_WORDS
+        and _SOUND_ANSWER_CUE_RE.search(folded) is not None
+        and not _ends_on_question(text)
+    ):
+        return SOUND_ANSWER
+    return SOUND_HEARD
 
 
 # Owner test 1eb18cd4 (#14-#18; owner decision 2026-10-30): "Okay, could you please explain me
@@ -1149,32 +1625,261 @@ _BRIEF_ROLE_CHECK_RE = re.compile(
 )
 
 
-def is_brief_request(text: str) -> bool:
+def is_brief_request(text: str, *, wide: bool = False, lead_names: tuple[str, ...] = ()) -> bool:
     """True for a request to hear the role-play brief again ("Can you repeat that?", "Could you
     please explain me again ...", "I wanted to understand this round, the role play brief").
 
     A consent wins first (``is_transition_consent``): "Okay, ready, let's go." picks up.  A turn
     that asks something is no consent, so "Okay, ready, what do I say?" is a brief request.
+
+    M032 S6 item 1 (``wide``, R1_TRANSITION_REPAIR): also a summary, recap or overview of the
+    role-play, "tell me (more) about the role play (again)", more information or details about it,
+    and the learner's name as the thing asked about (``lead_names``; owner's call fda9e9f6 #24 and
+    #26 asked twice and were answered with "What would you like to know?" and the shift timings).
     """
     folded = fold_speech(text)
     if not folded or is_transition_consent(text):
         return False
     if _BRIEF_REQUEST_RE.search(folded) is not None or _BRIEF_SHORT_RE.match(folded):
         return True
+    if wide and _brief_wide_re(lead_names).search(folded) is not None:
+        return True
     return _has_question_mark(text) and _BRIEF_ROLE_CHECK_RE.search(folded) is not None
 
 
-# M032 S4: the presence part of ``is_repair_turn`` ("Hello?", "Are you there?", "Can you hear
-# me?"), for the turn reader's comparison only (its ``presence_check``; adversarial review
-# S4-ADV-2): "Sorry?", "Pardon?" and "Come again?" ask to hear her again and are no presence check.
+# M032 S6 item 1: the wider brief request (R1_TRANSITION_REPAIR), on folded text.  The object must be
+# the role-play's (``_BRIEF_OBJECT`` after "this/the/that", or the learner's own name): "a summary of
+# my experience", "tell me about the role", "just to recap everything, the course has six modules"
+# and every turn of the 2,136-turn advisor corpus stay negative.
+_BRIEF_DET_OBJECT = r"(?:this|the|that) " + _BRIEF_OBJECT
+_BRIEF_SUMMARY_WORD = r"(?:summary|summari[sz]e|recap|overview|rundown)"
+_BRIEF_INFO_WORD = r"(?:information|info|details?)"
+_BRIEF_ABOUT_WORD = r"(?:of|on|about|for|regarding)"
+
+
+def _lead_alternation(lead_names: tuple[str, ...]) -> str:
+    """The learner's names as one regex alternation (folded, longest first), or "" for none."""
+    names = sorted(
+        {fold_speech(name) for name in lead_names if fold_speech(name)}, key=len, reverse=True
+    )
+    return "|".join(re.escape(name) for name in names)
+
+
+_BRIEF_WIDE_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
+
+
+def _brief_wide_re(lead_names: tuple[str, ...]) -> re.Pattern[str]:
+    """The S6 item 1 forms, with the learner's names as a brief object (cached per name set)."""
+    key = tuple(lead_names)
+    pattern = _BRIEF_WIDE_CACHE.get(key)
+    if pattern is not None:
+        return pattern
+    leads = _lead_alternation(key)
+    obj = f"(?:{_BRIEF_DET_OBJECT}|{leads})" if leads else f"(?:{_BRIEF_DET_OBJECT})"
+    pattern = re.compile(
+        r"\b(?:"
+        # "a summary of this role play", "a quick overview of the scenario"
+        + _BRIEF_SUMMARY_WORD + r"(?: \S+){0,3}? " + _BRIEF_ABOUT_WORD + " " + obj + r"|"
+        # "summarise the role play", "recap the brief for me"
+        + r"(?:summari[sz]e|recap)(?: (?:me|us|again|quickly|once))? " + obj + r"|"
+        # "tell me about the role play again", "tell me a bit more about Meera"
+        + r"tell (?:me|us)(?: a (?:bit|little))?(?: more)? about " + obj + r"|"
+        # "more information on this role play", "details about the scenario"
+        + _BRIEF_INFO_WORD + " " + _BRIEF_ABOUT_WORD + " " + obj
+        + (r"|who is (?:" + leads + r")" if leads else "")
+        + r")\b"
+    )
+    if len(_BRIEF_WIDE_CACHE) < 32:
+        _BRIEF_WIDE_CACHE[key] = pattern
+    return pattern
+
+
+# SWEEP-29: a request for a SHORTER brief (R1_TRANSITION_REPAIR), on folded text, one sentence at a
+# time.  Owner tests 8f5bfefc #25-#28 (the instruction "in about four lines" got the nudge and then
+# the whole brief) and fda9e9f6 #24-#30 (a summary got "What would you like to know?").
+_SHORT_MARKER = (
+    r"(?:briefly|in brief|in short|short(?:er)? version|shorter|quick(?:ly)?|summary|"
+    r"summari[sz]e|sum (?:it|this|that|everything) up|in a nutshell|in simpler? words|simpler|"
+    r"(?:short|small) brief|in(?: (?:like|about|just|maybe|around|only|max|maximum)){0,2} "
+    r"(?:one|two|three|four|five|a few|\d+) (?:lines?|sentences?|points?|words?))"
+)
+_SHORT_MARKER_RE = re.compile(r"\b" + _SHORT_MARKER + r"\b")
+# The ask that must go with a marker and a brief object ("In short, I sold courses" asks nothing).
+_SHORT_ASK_RE = re.compile(
+    r"\b(?:(?:can|could|would|will) you|please|(?:give|tell|explain|say|put|repeat|summari[sz]e|"
+    r"describe|go over|brief)(?: me| us)?|(?:i|we) (?:want|need|would like)|(?:i'd|we'd) like)\b"
+)
+# "what I have to do" is a brief object as well.
+_SHORT_OBJECT_RE = re.compile(
+    r"\b(?:" + _BRIEF_DET_OBJECT
+    + r"|what (?:i|we) (?:have|need|am supposed|are supposed) to do)\b"
+)
+# Lazy filler a marker may sit behind ("say it like in four lines", "explain it again just briefly").
+_SHORT_FILLER = (
+    r"(?: (?:like|just|maybe|um|uh|please|a|bit|little|kind|of|sort|again|for|me|us|once|more|"
+    r"so|very|really|bit)){0,3}?"
+)
+# With Christy's brief the last thing said: the pronoun forms ("explain it again briefly", "say it
+# in short") and the bare ones ("Can you summarise?", "Give me the short version.").
+_SHORT_PRONOUN_RE = re.compile(
+    r"\b(?:say|put|explain|tell|give|repeat|go over|summari[sz]e)(?: me| us)?"
+    r"(?: it| this| that| everything| all that| all of (?:it|that))?"
+    r"(?: again| once more| one more time)?" + _SHORT_FILLER + " " + _SHORT_MARKER
+    + r"(?: please| for me| for us)?$|"
+    r"\b(?:can|could|would|will) you (?:please |just |kindly )?"
+    r"(?:summari[sz]e|sum (?:it|this|that|everything) up|shorten (?:it|this|that))"
+    r"(?: (?:it|this|that|everything|for me|for us|please|again))*$|"
+    r"\b(?:give|tell) (?:me|us) (?:a|the) (?:quick |short |brief |shorter )?"
+    r"(?:summary|short version|shorter version|recap|overview)(?: please| again)*$|"
+    r"^(?:(?:um|uh|okay|ok|so|sorry|please|just|can you|could you|maybe) )*"
+    r"(?:briefly|in short|in brief|shorter|(?:the )?short(?:er)? version|a summary|(?:a )?quick "
+    r"summary)(?: please)?$"
+)
+# The negative look: a summary "of" something that is not the brief ("a quick summary of the
+# salary") is no short-brief request, whatever was said last.
+_SHORT_OF_OTHER_RE = re.compile(r"\b(?:summary|recap|overview|version) (?:of|on|about) (?!" +
+                                _BRIEF_DET_OBJECT + r")")
+_SENTENCE_SPLIT_RE = re.compile(r"[.?!。？！]+")
+
+
+def is_short_brief_request(
+    text: str, *, after_brief: bool = False, lead_names: tuple[str, ...] = ()
+) -> bool:
+    """SWEEP-29: a request for the brief in SHORT ("summarise the role play", "say it in four
+    lines", "Can you explain it again briefly?"), on folded text, one sentence at a time.
+
+    A shortness marker with an ask and a brief object (``_SHORT_OBJECT_RE`` or the learner's
+    name), or, with Christy's brief the last thing said (``after_brief``), a pronoun or bare form
+    ("say it in short", "Can you summarise?").  A consent wins first.  "Shortly" (often "soon" in
+    Indian English) and a bare "brief" are never markers.
+    """
+    if not text or is_transition_consent(text):
+        return False
+    leads = _lead_alternation(tuple(lead_names))
+    lead_re = re.compile(r"\b(?:" + leads + r")\b") if leads else None
+    for part in _SENTENCE_SPLIT_RE.split(str(text)):
+        folded = fold_speech(part)
+        if not folded or _SHORT_MARKER_RE.search(folded) is None:
+            continue
+        if _SHORT_OF_OTHER_RE.search(folded) is not None:
+            continue
+        has_object = _SHORT_OBJECT_RE.search(folded) is not None or (
+            lead_re is not None and lead_re.search(folded) is not None
+        )
+        if has_object and _SHORT_ASK_RE.search(folded) is not None:
+            return True
+        if after_brief and _SHORT_PRONOUN_RE.search(folded) is not None:
+            return True
+    return False
+
+
+# Review of S6 (``R1_TRANSITION_REPAIR``): the generic asks of ``_BRIEF_REQUEST_RE`` ("can you
+# explain ...", "please clarify ...", "what do I need to do ...") name what they ask about.  A job
+# topic ("Could you explain the incentive structure?", "What do I need to do on the first day of
+# the job?") is a question about the job, and a bare pronoun ("Can you explain that briefly?") right
+# after an answer of Christy's asks about that answer: both go to the model like any question.
+_BRIEF_GENERIC_RE = re.compile(
+    r"\b(?:(?:can|could|would|will) you (?:please |just |kindly )?|please )"
+    r"(?:repeat|rephrase|explain|clarify|go over|brief)\b|"
+    r"\bwhat (?:exactly )?(?:do|should|shall) i (?:have to |need to )?(?:do|say)\b"
+)
+_JOB_TOPIC_RE = re.compile(
+    r"\b(?:salary|salaries|pay|ctc|compensation|package|incentives?|commissions?|bonus(?:es)?|"
+    r"perks|benefits|shifts?|timings?|hours|working|office|location|leaves?|holidays?|"
+    r"weekends?|training|onboarding|joining|probation|notice period|targets?|quotas?|"
+    r"appraisals?|promotions?|growth|team|manager|job|company|first day|day one|"
+    r"work from home|wfh|hybrid|remote|next steps?|selection|role(?! ?play)|position)\b"
+)
+# What a generic ask may have before its object without naming one ("explain to me again briefly").
+_GENERIC_FILLER = frozenset(
+    {"to", "me", "us", "a", "bit", "little", "quickly", "briefly", "simply", "more", "please",
+     "just", "kindly", "for", "once", "exactly", "now", "here", "in", "short", "brief"}
+)
+_GENERIC_PRONOUNS = frozenset({"it", "that", "this", "those", "these"})
+_BRIEF_AGAIN_RE = re.compile(r"\b(?:again|once more|one more time)\b")
+_BRIEF_NAMED_RE = re.compile(
+    r"\b(?:role ?play|roleplay|(?:the|this|that|your) brief|instructions?|scenario|task|round|"
+    r"exercise|setup|learner|lead|customer|prospect|course|call|she|her)\b"
+)
+
+
+def asks_about_the_job(
+    text: str, *, after_answer: bool = False, lead_names: tuple[str, ...] = ()
+) -> bool:
+    """True for a turn that ``is_brief_request`` reads only through a generic ask, and that asks
+    about a job topic, or (``after_answer``: Christy's answer was the last thing she said) about
+    "that" or nothing named at all (review of S6).
+
+    Never for a turn another brief form reads ("What is the brief?", "explain it again"), nor for
+    one that names the role-play, the learner or her name: those stay brief requests.
+    """
+    folded = fold_speech(text)
+    matches = list(_BRIEF_GENERIC_RE.finditer(folded)) if folded else []
+    if not matches:
+        return False
+    stripped = _BRIEF_GENERIC_RE.sub(" ~ ", folded)
+    if (
+        _BRIEF_REQUEST_RE.search(stripped) is not None
+        or _BRIEF_SHORT_RE.match(folded) is not None
+        or _brief_wide_re(tuple(lead_names)).search(folded) is not None
+        or _BRIEF_ROLE_CHECK_RE.search(folded) is not None
+        or _SHORT_OBJECT_RE.search(folded) is not None
+        or _BRIEF_NAMED_RE.search(folded) is not None
+    ):
+        return False
+    leads = _lead_alternation(tuple(lead_names))
+    if leads and re.search(r"\b(?:" + leads + r")\b", folded) is not None:
+        return False
+    if _JOB_TOPIC_RE.search(folded) is not None:
+        return True
+    if not after_answer or _BRIEF_AGAIN_RE.search(folded) is not None:
+        return False
+    for match in matches[:8]:
+        if match.group().startswith("what"):
+            return False  # "What do I need to do?" asks about the role-play, whatever came before
+        ahead = folded[match.end():match.end() + 120].split()  # its object comes first
+        rest = [word for word in ahead if word not in _GENERIC_FILLER]
+        if rest and rest[0] not in _GENERIC_PRONOUNS:
+            return False  # an object of its own, and not the job's: read as before
+    return True
+
+
+# M032 S6 item 3: "Are you there?", "Hello?", "Can you hear me?" (fda9e9f6 #28 got nothing at all:
+# every word of it is a backchannel word).  Only presence words around the check; a request to say
+# it again ("what", "again", "pardon") is a repeat request, not a presence check.
 _PRESENCE_RE = re.compile(
-    r"\b(?:hello|(?:are )?you (?:still )?there|(?:can|could) you (?:hear|see) me)\b"
+    r"\b(?:(?:are )?you (?:still )?there|hello|(?:can|could) you (?:hear|see) me(?: now)?|"
+    r"is (?:anyone|anybody|someone) there)\b"
+)
+_PRESENCE_WORDS = (
+    (_REPAIR_WORDS - {"what", "again", "huh", "pardon"})
+    | _INTERVIEWER_NAMES
+    | frozenset({"ma'am", "maam", "mam", "madam", "sir", "now", "um", "uh", "hmm"})
 )
 
 
 def is_presence_check(text: str) -> bool:
+    """True for a turn that only checks the interviewer is there ("Hello? Are you there?")."""
+    folded = fold_speech(text)
+    if not folded or _PRESENCE_RE.search(folded) is None:
+        return False
+    return all(word in _PRESENCE_WORDS for word in _PRESENCE_RE.sub(" ", folded).split())
+
+
+# Integration of M032 S4 and S6: S6's ``is_presence_check`` (only presence words around the check)
+# routes the transition and the icebreaker; the turn reader's shadow comparison keeps S4's
+# presence part of ``is_repair_turn`` under its own name, so each behaves exactly as on its branch.
+# M032 S4: the presence part of ``is_repair_turn`` ("Hello?", "Are you there?", "Can you hear
+# me?"), for the turn reader's comparison only (its ``presence_check``; adversarial review
+# S4-ADV-2): "Sorry?", "Pardon?" and "Come again?" ask to hear her again and are no presence check.
+_REPAIR_PRESENCE_RE = re.compile(
+    r"\b(?:hello|(?:are )?you (?:still )?there|(?:can|could) you (?:hear|see) me)\b"
+)
+
+
+def is_repair_presence_check(text: str) -> bool:
     """True for a repair turn (``is_repair_turn``) that checks someone is there or can hear."""
-    return is_repair_turn(text) and _PRESENCE_RE.search(fold_speech(text)) is not None
+    return is_repair_turn(text) and _REPAIR_PRESENCE_RE.search(fold_speech(text)) is not None
 
 
 # M032 S4: the session's own detectors that the turn reader's shadow record compares with
@@ -1183,9 +1888,74 @@ def is_presence_check(text: str) -> bool:
 _SESSION_READERS: dict[str, Callable[[str], bool]] = {
     "brief_request": is_brief_request,
     "repair": is_repair_turn,
-    "presence": is_presence_check,
+    "presence": is_repair_presence_check,
     "backchannel": is_backchannel_turn,
 }
+
+
+# M032 S6 item 2: a transition turn that is about the role-play itself (owner's call fda9e9f6 #26:
+# "tell me about the role play again" was answered with the JOB's shift timings).  It names the
+# role-play, the brief, the scenario, the learner or her name, and asks something.  Review of S6:
+# "the scenario" needs its article ("In what scenario would I work weekends?" is about the job),
+# and "the learner", "the lead" and "the prospect" must not be a modifier of a job noun ("the lead
+# generation", "the learner profile") or "the prospect of growth".
+_ROLEPLAY_PERSON_MODIFIED = (
+    r"(?! (?:generation|gen|quality|qualities|profile|profiles|base|pool|flow|sources?|sourcing|"
+    r"conversion|conversions|volume|volumes|count|counts|numbers?|data|lists?|pipeline|management|"
+    r"manager|managers|magnet|score|scoring|nurturing|assignment|allocation|distribution|journey|"
+    r"experience|support|success|retention|outcomes?|feedback|community|app|portal|satisfaction|"
+    r"team|teams|cycle|funnel|tracking|tracker|crm|system|systems|platform|dashboard|mix|types?|"
+    r"segments?|role|roles|position|positions|advisor|counsellor|counselor|of)\b)"
+)
+_ROLEPLAY_NAMED_RE = re.compile(
+    r"\b(?:role ?play|roleplay|(?:the|this|that|your) brief|(?:the|this|that) scenario|"
+    r"(?:the learner|the lead|the prospect)\b" + _ROLEPLAY_PERSON_MODIFIED + r")\b"
+)
+# Review of S6: questions about the scenario that name none of it ("Who will I be calling?",
+# "Which course is it about?", "Do I call her or does she call me?", "Is it a cold call?"): only as
+# a question (a question mark or an asking opener), so "I'll be calling her" says nothing.
+_ROLEPLAY_CUE_RE = re.compile(
+    r"\bwho (?:will|would|am|do|shall|should) i (?:be )?(?:call(?:ing)?|talk(?:ing)? to|"
+    r"speak(?:ing)? (?:to|with)|sell(?:ing)? to|pitch(?:ing)? to)\b|"
+    r"\b(?:which|what) course (?:is (?:it|this|she|the call) (?:about|for|on)|"
+    r"(?:am i|will i be|do i|should i|shall i|is she|did she|does she) "
+    r"(?:sell(?:ing)?|pitch(?:ing)?|talk(?:ing)? about|discuss(?:ing)?|offer(?:ing)?|"
+    r"interested|enquir(?:e|ed|ing)|inquir(?:e|ed|ing)|ask(?:ing|ed)? about))\b|"
+    r"\b(?:do|will|should|shall) i call her\b|\bdoes she call me\b|\bwho calls (?:whom|who)\b|"
+    r"\b(?:is|will) (?:it|this|that) (?:be )?a cold call\b"
+)
+_ROLEPLAY_ASK_RE = re.compile(
+    r"\b(?:(?:tell|explain|describe|clarify|give|share) (?:me|us)|what|what's|whats|how|how's|when|"
+    r"where|why|who|which|whether)\b|"
+    r"^(?:(?:so|and|but|okay|ok|um|uh|well|sorry|yes|yeah|also|just) )*"
+    r"(?:am|is|are|do|does|did|will|would|have|has|was|were|can|could|should|shall|may)"
+    r" (?:i|we|you|she|he|it|there|they)\b"
+)
+# "I don't have any questions about the role play": the mention is cut before the no-questions test.
+_ROLEPLAY_MENTION_RE = re.compile(
+    r"\b(?:about|on|regarding|for|of) (?:the|this|that) (?:role ?play|roleplay|brief|scenario)\b"
+)
+
+
+def names_the_roleplay(text: str, lead_names: tuple[str, ...] = ()) -> bool:
+    """True for a transition turn that asks about the role-play itself (S6 item 2)."""
+    folded = fold_speech(text)
+    if not folded:
+        return False
+    named = _ROLEPLAY_NAMED_RE.search(folded) is not None
+    if not named:
+        leads = _lead_alternation(tuple(lead_names))
+        named = bool(leads) and re.search(r"\b(?:" + leads + r")\b", folded) is not None
+    if not named:
+        named = _ROLEPLAY_CUE_RE.search(folded) is not None
+    if not named:
+        return False
+    return _has_question_mark(text) or _ROLEPLAY_ASK_RE.search(folded) is not None
+
+
+def no_questions_about_the_roleplay(text: str) -> bool:
+    """ "No questions about the role play." is a no-questions turn, not a role-play question."""
+    return is_no_questions(_ROLEPLAY_MENTION_RE.sub(" ", fold_speech(text)))
 
 
 # A1: the last word of a turn that stops in the middle of a sentence ("... to be added is. I.",
@@ -1710,6 +2480,10 @@ class _CandidateRow:
     # Epoch milliseconds the candidate stopped speaking this turn (``turn_ended_at_ms``), fixed when
     # the row closes (``_candidate_turn_end``), or None when that is not known.
     ended_at_ms: int | None = None
+    # M032 S6 (SWEEP-31): the row holds only acknowledgements held back from the SDK over
+    # Christy's icebreaker reply.  No turn of the SDK's is in flight for it, so it never keeps the
+    # candidate "mid-turn" (``_candidate_turn_open``); a real final joining it clears this.
+    held_only: bool = False
 
 
 # The recording's turn anchor (``transcript_turns.turn_started_at_ms``, migration 0026) must lie in
@@ -1765,6 +2539,7 @@ class R1Interview:
         rate_limits: RateLimitCounter | None = None,
         end_intent_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
         turn_reader_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
+        bridge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
     ) -> None:
         self.ctx = ctx
         self.context = context
@@ -1795,6 +2570,26 @@ class R1Interview:
         self._muted = False
         self._mute_resume_phase: R1Phase | None = None
         self._mute_announced = False
+        # M032 S7C (SWEEP-36): when the current mute began (loop time; None while unmuted).
+        self._muted_since: float | None = None
+        # Review of S7C: the candidate row whose turn was in flight at the mute (a final the SDK
+        # had not committed), kept until that commit or the unmute.  The role-play's move to ASIDE
+        # at the mute writes the open row, so ``_candidate_turn_open`` alone no longer sees it.
+        self._mute_turn_index: int | None = None
+        # M032 S7C (SWEEP-34): set at the candidate's first speech or first non-empty final and
+        # never reset (a rejoin included); the last candidate participant object seen, for the
+        # label of the r1_no_audio log; and whether that log was written (once per session).
+        self._candidate_ever_heard = False
+        self._candidate_seen: Any = None
+        self._no_audio_noted = False
+        # M032 S7C (SWEEP-35): while the opening's sound check runs, and the candidate rows heard in
+        # it (their reply is not an icebreaker answer, whenever its turn commits).
+        self._sound_check_open = False
+        self._sound_check_rows: set[int] = set()
+        self._sound_check_final_quiet = False
+        # Review of S7C: every non-empty final counts here, so the sound check's settle can tell a
+        # reply that goes on (a new final) from one that has ended.
+        self._finals_heard = 0
         self._pickup_spoken = False
         # M1 (owner decision 2026-11-03): how many of the candidate's questions Christy answered
         # before the role-play, whether L-TRANSITION-STEER was said, and the scripted lines the
@@ -1838,6 +2633,34 @@ class R1Interview:
         self._commit_floor: float = 0.0
         self._candidate_activity_at: float | None = None
         self._icebreaker_hold_since: float | None = None
+        # M032 S5: the icebreaker plan (``r1_icebreaker``; labels and counters only), the text of
+        # a turn whose reply was cancelled before any audio (read again with the turn after it,
+        # in memory only), and the current question, said if a reply to it fails outright.
+        self._icebreaker_plan = IcebreakerPlan()
+        self._icebreaker_carry = ""
+        # M032 S6 (SWEEP-28, R1_ICEBREAKER_REPAIR): the history entry of the carried answer (the
+        # transition bridge reacts to it when a repair turn ends the icebreaker); the deferred
+        # repeat requests (one per session) and whether the next answer is the boundary after
+        # one; the holds granted (one per session) and whether the next silence window is the
+        # hold's; the last question of Christy's own icebreaker replies (what a repeat request
+        # gets again); what kind of turn ended the icebreaker ("presence", "repair" or None) and
+        # the "Yes, I'm here." lines said at the boundary.
+        self._icebreaker_carry_entry: dict[str, Any] | None = None
+        self._ib_repeat_deferrals = 0
+        self._ib_repeat_answer_due = False
+        self._ib_holds = 0
+        self._ib_hold_window = False
+        self._ib_last_question: str | None = None
+        # Review of S6: after the hold or the repeat line, "Okay." or "Thank you." answers nothing
+        # ("hold" or "repeat" while that holds; ``_ib_quiet_turn``), and whether the repeated
+        # question was a yes/no one (then "Okay." or "Sure." can answer it).  The text of a repair
+        # request whose line nobody heard, read with the turn that cancelled it.
+        self._ib_quiet_after: str | None = None
+        self._ib_repeat_closed = False
+        self._ib_repair_carry = ""
+        self._icebreaker_boundary_kind: str | None = None
+        self._ib_boundary_presence_lines = 0
+        self._icebreaker_fallback = ""
         self._roleplay_end_hold_since: float | None = None  # M2: the closing's hold
         self._replies_cancelled_before_audio = 0
         # When (``_clock``) the candidate began waiting for a reply nobody has heard yet: set when
@@ -1931,6 +2754,7 @@ class R1Interview:
         # (``hold_ack_transcript``), and whether one arrived while the candidate was still speaking
         # (its monologue clock is judged when the speech stops, as a held-back fragment's is).
         self._acks_held = 0
+        self._icebreaker_acks_held = 0  # M032 S6 (SWEEP-31): held over Christy's icebreaker reply
         self._ack_unjudged = False
         # The end-intent classifier: the injectable runner (like ``judge_runner``; the default
         # asks R1's own judge client, and only when the session has an LLM, so no fake calls it),
@@ -1938,6 +2762,25 @@ class R1Interview:
         # spoken, the call started for them at the final, and a running number for the fence.
         self._end_intent_runner = end_intent_runner
         self._end_intent_unusable = False
+        # M032 S5: Christy's voice (``R1_INTERVIEWER_VOICE``), read once, so the interviewer
+        # prefix (the DeepSeek cache prefix) stays byte-stable for the whole session.
+        self._interviewer_voice = interviewer_voice_enabled()
+        # M032 S5 item 4, the transition bridge (``R1_TRANSITION_BRIDGE``, off by default): the
+        # injectable compose call (like ``end_intent_runner``; the default asks R1's own client,
+        # only when the session has an LLM), that client, and the history entries of the turns
+        # that ended the icebreaker with no reply of their own (the boundary answer).
+        self._bridge_runner = bridge_runner
+        self._bridge_llm: Any = None
+        self._icebreaker_boundary_entries: list[dict[str, Any]] = []
+        # While the brief is not yet queued (``_say_brief``: the compose and any wait after it) a
+        # transition turn is held like one spoken over the brief (``_transition_action``); a
+        # compose call ran; a candidate turn came in meanwhile, so the reaction is stale.
+        self._bridging = False
+        self._bridge_composed = False
+        self._bridge_superseded = False
+        # The brief the candidate heard (L-TRANSITION, or L-TRANSITION-BRIDGED after the
+        # bridge's reaction): what a request to hear it again replays (``_repeat_brief``).
+        self._brief_line = "L-TRANSITION"
         self._turn_finals: list[str] = []
         self._end_intent_call: _EndIntentCall | None = None
         self._end_intent_seq = 0
@@ -1966,6 +2809,22 @@ class R1Interview:
         # The brief on request: asked for during the transition, and replayed (once per session).
         self._brief_requested = False
         self._brief_repeated = False
+        # M032 S6 (R1_TRANSITION_REPAIR): the short recap asked for (latched like the replay) and
+        # how many were played (``RECAP_LIMIT``); the candidate row whose request the transcript
+        # latch already took (its turn hook queues nothing more); which brief is playing ("brief",
+        # "replay", "recap"; None) and the last line Christy finished in the transition; how many
+        # start-question tails the answers carried and whether the last answer went without one;
+        # where the "I'm ready" press came, what started the role-play, and the counts the
+        # session_facts row carries (labels and counts only).
+        self._recap_requested = False
+        self._recaps_played = 0
+        self._brief_latch_index: int | None = None
+        self._brief_playing: str | None = None
+        self._last_transition_line: str | None = None
+        self._answer_tails = 0
+        self._last_answer_tailless = False
+        self._pressed_during: str | None = None
+        self._start_by: str | None = None
         self._transition_started_at: float | None = None
         # Repair (round 2): seconds the transition spent in PAUSED_DISCONNECTED.  The 6:00 ceiling
         # is moved by them, so a candidate who rejoins in time is never closed for being away.
@@ -2068,9 +2927,13 @@ class R1Interview:
         _log.info("unknown_event", error_type="r1_spoken_name_adopted")
 
     def render_line(self, line_id: str) -> str:
-        """Render one pinned line; the persona supplies the lead name, city and pickup."""
+        """Render one pinned line; the persona supplies the lead name, city and pickup.
+
+        M032 S6: ``active_line_id`` picks the text, so ``R1_TRANSITION_REPAIR=0`` speaks revision
+        21's brief, pickup and coach aside under the same ids (warm-up, cache and logs follow).
+        """
         return line(
-            line_id,
+            active_line_id(line_id),
             first_name=self._first_name(),
             **self.persona.line_values,
         )
@@ -2311,6 +3174,8 @@ class R1Interview:
             return
         self._ready_latched = True
         self._awaiting_ready = False
+        # M032 S6 item 6: during a brief, the replay, the recap, or the wait (session_facts).
+        self._pressed_during = self._press_label()
         _log.info("unknown_event", error_type="r1_ready_button", phase="transition")
         self._wake()
 
@@ -2630,6 +3495,7 @@ class R1Interview:
                         first_audio_p95_ms=self._first_audio_p95_ms(),
                         # M032 S4: the turn reader's shadow record (labels only), if it ran.
                         reader=self._reader_facts(),
+                        extra=self._repair_facts(),
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - the record must never block the exit
@@ -2645,6 +3511,23 @@ class R1Interview:
         task = asyncio.ensure_future(self._post_fidelity(poster, events))
         self._turn_writes.add(task)
         task.add_done_callback(self._turn_writes.discard)
+
+    def _repair_facts(self) -> dict[str, Any]:
+        """M032 S6: the labels and counts the repairs add to ``session_facts`` (flags on only)."""
+        facts: dict[str, Any] = {}
+        if transition_repair_enabled():
+            if self._start_by is not None:
+                facts["start_by"] = self._start_by
+            if self._start_by == "button" and self._pressed_during is not None:
+                facts["pressed_during"] = self._pressed_during
+            facts["transition_recaps"] = self._recaps_played
+        if icebreaker_repair_enabled():
+            facts["icebreaker_repeat_deferrals"] = self._ib_repeat_deferrals
+            facts["boundary_presence_lines"] = self._ib_boundary_presence_lines
+            facts["ib_holds"] = self._ib_holds
+        if ack_hold_enabled() and icebreaker_ack_hold_enabled():
+            facts["icebreaker_acks_held"] = self._icebreaker_acks_held
+        return facts
 
     async def _post_fidelity(
         self, poster: Callable[..., Awaitable[Any]], events: list[dict[str, Any]]
@@ -2822,6 +3705,17 @@ class R1Interview:
         A line the cache holds is played from its stored audio (``say(audio=...)``): same
         text, same transcript row, no TTS round trip.  Anything else is spoken live.
         """
+        handle = self._start_text(text, interruptible=interruptible, marker=marker, voice=voice)
+        await self._await_playout(handle, marker, timeout)
+
+    def _start_text(
+        self, text: str, *, interruptible: bool, marker: str, voice: str
+    ) -> Any:
+        """Queue one scripted line with the SDK (no await) and return its speech handle.
+
+        ``_say_text``'s first half: lines queued one after another play in that order, so a turn
+        committed after the last of them is answered after it (M032 S5's reaction and brief).
+        """
         audio = self._cached_audio(text, marker, voice)
         if audio is None:
             handle = self.session.say(text, allow_interruptions=interruptible)
@@ -2831,6 +3725,10 @@ class R1Interview:
         if handle_id is not None:
             self._voices[str(handle_id)] = voice
             self._latency.say_created(str(handle_id), marker, self.machine.transcript_phase())
+        return handle
+
+    async def _await_playout(self, handle: Any, marker: str, timeout: float) -> None:
+        """``_say_text``'s second half: wait, at most ``timeout``, for the line to finish."""
         wait_for_playout = getattr(handle, "wait_for_playout", None)
         if not callable(wait_for_playout):
             return
@@ -2868,6 +3766,8 @@ class R1Interview:
         if line_id in _START_QUESTION_OF_LINE:
             # Set once the line has played: a short yes said over it answers nothing yet.
             self._start_question = _START_QUESTION_OF_LINE[line_id]
+        if self.machine.phase is R1Phase.TRANSITION:
+            self._last_transition_line = line_id  # M032 S6: "say it in short" after a brief
 
     # ------------------------------------------------------------ voices
 
@@ -2943,7 +3843,7 @@ class R1Interview:
         line is warmed in the voice ``say`` speaks it in (the learner's for ``_LEARNER_LINES``).
         """
         specs: list[LineSpec] = []
-        for line_id in _WARM_ORDER:
+        for line_id in self._warm_order():
             if is_candidate_free(line_id) is not candidate_free:
                 continue
             try:
@@ -2953,6 +3853,28 @@ class R1Interview:
             voice = LEARNER if line_id in _LEARNER_LINES else INTERVIEWER
             specs.append(LineSpec(line_id, text, persist=candidate_free, voice=voice))
         return specs
+
+    @staticmethod
+    def _warm_order() -> tuple[str, ...]:
+        """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on, and
+        without M032 S6's lines while the transition repair is off, nor S7C's while theirs are."""
+        order = _WARM_ORDER
+        dropped: set[str] = set()
+        if not transition_repair_enabled():
+            dropped |= _TRANSITION_REPAIR_LINES
+            if icebreaker_repair_enabled():
+                dropped.discard("L-PRESENT")  # M032 S6: said at a presence-check boundary too
+        if not opening_sound_check_enabled():
+            dropped |= _SOUND_CHECK_LINES
+        if not no_audio_ladder_enabled():
+            dropped |= _NO_AUDIO_LINES
+        dropped |= {"L-MUTE"} if mute_aside_v2_enabled() else _MUTE_V2_LINES
+        if dropped:
+            order = tuple(line_id for line_id in order if line_id not in dropped)
+        if not transition_bridge_enabled():
+            return order
+        index = order.index("L-TRANSITION") + 1
+        return (*order[:index], _BRIDGED_BRIEF, *order[index:])
 
     def _start_line_warmup(self, *, candidate_free: bool) -> None:
         """Warm one group of lines in the background.
@@ -3172,13 +4094,25 @@ class R1Interview:
             kind = str(getattr(kind, "value", kind) or "")
             if kind not in _HELD_STT_EVENTS:
                 return False
-            if self._exiting or self.machine.phase is not R1Phase.ROLEPLAY:
+            if self._exiting:
+                return False
+            icebreaker = self.machine.phase is R1Phase.ICEBREAKER
+            if not icebreaker and self.machine.phase is not R1Phase.ROLEPLAY:
+                return False
+            if icebreaker and not icebreaker_ack_hold_enabled():
                 return False
             alternatives = getattr(event, "alternatives", None) or ()
             text = str(getattr(alternatives[0], "text", "") or "").strip() if alternatives else ""
-            if not text or not is_acknowledgement_turn(text):
+            if not text:
                 return False
-            if not self._ack_holdable_speech():
+            if icebreaker:
+                # M032 S6 (SWEEP-31): an acknowledgement or a reflexive courtesy, and only over
+                # Christy's live, interruptible model reply (never a scripted line).
+                if not (is_acknowledgement_turn(text) or is_courtesy_turn(text)):
+                    return False
+                if not self._icebreaker_reply_holdable():
+                    return False
+            elif not is_acknowledgement_turn(text) or not self._ack_holdable_speech():
                 return False
         except Exception as exc:  # noqa: BLE001 - the speech-to-text path must never break
             _log.warn(
@@ -3191,7 +4125,7 @@ class R1Interview:
             # speech-to-text pump (``_STTPipeline``'s done-callback closes its event channel), and
             # no later transcript would reach the SDK or R1 for the rest of the interview.
             try:
-                self._note_held_ack(text, event)
+                self._note_held_ack(text, event, icebreaker=icebreaker)
             except Exception as exc:  # noqa: BLE001 - the speech-to-text path must never break
                 _log.warn(
                     "unknown_event",
@@ -3220,7 +4154,16 @@ class R1Interview:
         slot = self._speeches.get(getattr(speech, "id", None))
         return slot is None or not slot.cut_by_r1
 
-    def _note_held_ack(self, text: str, event: Any) -> None:
+    def _icebreaker_reply_holdable(self) -> bool:
+        """SWEEP-31: ``_ack_holdable_speech``, and the speech is a model reply of Christy's
+        (``generate_reply``), never a ``say`` line or a speech R1 does not track."""
+        if not self._ack_holdable_speech():
+            return False
+        speech = getattr(self.session, "current_speech", None)
+        slot = self._speeches.get(getattr(speech, "id", None))
+        return slot is not None and slot.source == "generate_reply"
+
+    def _note_held_ack(self, text: str, event: Any, *, icebreaker: bool = False) -> None:
         """Write a held acknowledgement into the candidate's row, and count it for nothing else.
 
         It joins the open row exactly as a final does (a row opened for it reserves its index
@@ -3229,9 +4172,18 @@ class R1Interview:
         next phase.  It is NOT queued for the driver, NOT counted toward the words the SDK holds
         (``_banked_words``: the SDK holds none of it), NOT a latency anchor and never planned.
         Like a held-back fragment it is no part of a monologue (``_judge_fragment``).
+
+        ``icebreaker`` (M032 S6, SWEEP-31): one held over Christy's icebreaker reply is counted on
+        its own (``icebreaker_acks_held``), does not move ``_candidate_activity_at`` (it must not
+        stretch the bounded hold at the S=4:30 cap) and opens a row of its own as ``held_only``.
+        It is written in the icebreaker as above, and it never reaches the plan, the carry, the
+        answer count or the soft exit, since no turn of the SDK's carries it.
         """
         self._acks_held += 1
-        self._candidate_activity_at = self._clock()
+        if icebreaker:
+            self._icebreaker_acks_held += 1
+        else:
+            self._candidate_activity_at = self._clock()
         if self._user_state == "speaking":
             self._ack_unjudged = True
             self._fragment_unjudged = True
@@ -3244,6 +4196,7 @@ class R1Interview:
                 self.machine.transcript_phase(),
                 [],
                 self._candidate_turn_anchor(event),
+                held_only=icebreaker,
             )
         row.parts.append(text)
         row.last_final_at = self._event_seconds(event)
@@ -3344,11 +4297,20 @@ class R1Interview:
             return True
         phase = self.machine.phase
         if phase is R1Phase.ICEBREAKER:
+            if self._ib_quiet_turn(text):
+                # Review of S6: "Okay." or "Thank you." right after the hold or the repeat line
+                # answers nothing: no reply (she just promised a moment, or just asked), and the
+                # turn is no boundary either (``_icebreaker_deferral``: ``_DEFER_ACK``).
+                return True
+            if self._ib_hold_route(text) == _IB_HOLD_BOUNDARY:
+                # M032 S6 (SWEEP-28): too little time left to promise a moment: this turn ends it.
+                return True
             if not self.machine.icebreaker_should_end():
                 return False
             # A1: a turn that cut Christy's reply goes on with the candidate's own point, so she
-            # answers it and the icebreaker ends at the turn after it.
-            return self._icebreaker_deferral(text) != _DEFER_BARGE_IN
+            # answers it and the icebreaker ends at the turn after it.  M032 S6: a request to
+            # repeat her question or for a moment is answered too (``_DEFER_REPEAT``, ``_DEFER_HOLD``).
+            return self._icebreaker_deferral(text) not in _ANSWERED_DEFERRALS
         if phase is R1Phase.TRANSITION:
             # M1: Christy answers the candidate's questions before the role-play; every other
             # turn there is the driver's (a consent, the brief again, a nudge, the steer).
@@ -3375,14 +4337,99 @@ class R1Interview:
             or self.machine.session_clock >= ICEBREAKER_HARD_SEC
         ):
             return None
+        if icebreaker_repair_enabled() and self.machine.icebreaker_should_end():
+            # M032 S6 (SWEEP-28): once per session, a request to repeat the question, and a hold
+            # request (before the thinking route), get their reply; the next answer is the
+            # boundary.  Review of S6: the repeat request is read first (with the half of a split
+            # request whose line nobody heard), and "Okay." after either line answers nothing.
+            if self._ib_quiet_turn(text):
+                return _DEFER_ACK
+            if self._ib_repeat_deferrals == 0 and self._ib_repeat_asked(text):
+                return _DEFER_REPEAT
+            route = self._ib_hold_route(text)
+            if route == _IB_HOLD:
+                return _DEFER_HOLD
+            if route == _IB_HOLD_BOUNDARY:
+                return None
         if is_unfinished_turn(text):
+            return _DEFER_UNFINISHED
+        if icebreaker_plan_enabled() and is_thinking(text):
+            # M032 S5: "Let me think." once the exit is due is not the last answer either: the
+            # answer is still coming, so it waits like an unfinished turn (hard cap unchanged).
             return _DEFER_UNFINISHED
         if (
             self._icebreaker_reply_cut
             and content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS
+            and not (self._ib_repeat_answer_due and icebreaker_repair_enabled())
         ):
-            return _DEFER_BARGE_IN  # a lone "Yes." that cut her is no point of their own
+            # A lone "Yes." that cut her is no point of their own.  M032 S6: nor is the answer that
+            # cut the question she repeated on request: that answer is the boundary.
+            return _DEFER_BARGE_IN
         return None
+
+    def _ib_hold_route(self, text: str) -> str | None:
+        """M032 S6 (SWEEP-28): what an icebreaker hold request gets, or None for no hold request.
+
+        ``_IB_HOLD`` (L-IB-HOLD and a longer silence window, once per session), or, with less than
+        ``HOLD_MIN_BUDGET_SECONDS`` of the hard budget left, ``_IB_HOLD_BOUNDARY``: nothing is
+        promised and the turn ends the icebreaker.  A second hold request is an ordinary turn.
+        """
+        if (
+            not text
+            or self.machine.phase is not R1Phase.ICEBREAKER
+            or not icebreaker_repair_enabled()
+        ):
+            return None
+        judged = self._ib_judged(text)
+        if not is_hold_request(judged) or self._ib_repeat_asked(text):
+            return None  # review of S6: "Hold on, sorry?" asks for the question again
+        if self.machine.remaining_icebreaker_seconds() < HOLD_MIN_BUDGET_SECONDS:
+            return _IB_HOLD_BOUNDARY
+        return _IB_HOLD if self._ib_holds == 0 else None
+
+    def _ib_judged(self, text: str) -> str:
+        """Review of S6: ``text`` with the request whose repair line nobody heard before it (a split
+        "Sorry, can you repeat" + "the question?"), as the icebreaker's repair readers judge it."""
+        carry = self._ib_repair_carry
+        return f"{carry} {text}" if carry and text else text
+
+    def _ib_repeat_asked(self, text: str) -> bool:
+        """``is_repeat_request`` on the icebreaker's view of the turn (``_ib_repair_view``)."""
+        return is_repeat_request(_ib_repair_view(self._ib_judged(text)))
+
+    def _ib_quiet_turn(self, text: str) -> bool:
+        """Review of S6: a turn that answers nothing right after the hold or the repeat line.
+
+        After L-IB-HOLD ("Of course, take a moment."): a backchannel ("Okay.", "Thank you.", a
+        bare "Yes." or "Sure."), or one more "one sec".  After "Of course. {question}": a
+        backchannel when the question was an open one, and only a courtesy ("Thank you.") when it
+        was a yes/no one ("Okay." or "Yes." can answer that).  Never a turn with a question mark,
+        a repair or a presence check.
+        """
+        after = self._ib_quiet_after
+        if (
+            not text
+            or after is None
+            or self.machine.phase is not R1Phase.ICEBREAKER
+            or not icebreaker_repair_enabled()
+        ):
+            return False
+        if (
+            _has_question_mark(text)
+            or is_repair_turn(_ib_repair_view(text))
+            or is_presence_check(text)
+        ):
+            return False
+        if after != "hold":
+            if self._ib_repeat_closed:
+                return is_courtesy_turn(text)
+            return is_backchannel_turn(text) or is_acknowledgement_turn(text)
+        if is_backchannel_turn(text) or is_acknowledgement_turn(text):
+            return True
+        words = fold_speech(text).split()
+        if words and all(word in _IB_QUIET_WORDS for word in words):
+            return True
+        return is_thinking(text) or is_hold_request(text)
 
     def _transition_action(self, text: str) -> str:
         """M1: what a committed transition turn gets (no side effects; ``_decide_turn`` acts).
@@ -3395,7 +4442,16 @@ class R1Interview:
         """
         if self._ready_latched or self._transition_consented or self._transition_consent(text):
             return _TRANSITION_READY
-        if self._brief_due() or (not self._brief_repeated and is_brief_request(text)):
+        if self._bridging:
+            # M032 S5 (review): the brief is not queued yet (the transition bridge is composing
+            # or waiting for the candidate): a turn now is held like one spoken over the brief,
+            # never answered ahead of it.  A brief request is still latched at the transcript.
+            return _TRANSITION_QUIET
+        if self._brief_due():
+            return _TRANSITION_BRIEF
+        if transition_repair_enabled():
+            return self._repaired_transition_action(text)
+        if not self._brief_repeated and is_brief_request(text):
             return _TRANSITION_BRIEF
         if (
             is_short_yes(text)
@@ -3424,6 +4480,156 @@ class R1Interview:
             return _TRANSITION_INVITE
         return _TRANSITION_ANSWER
 
+    def _repaired_transition_action(self, text: str) -> str:
+        """M032 S6 (``R1_TRANSITION_REPAIR``): ``_transition_action`` once no consent, bridge or
+        replay is pending.
+
+        * A recap already asked for holds every turn until it plays (as the replay does).
+        * A presence check ("Are you there?") gets "Yes, I'm here." and the yes/no start question
+          (item 3), before the backchannel test that used to swallow it.
+        * A brief request, or a request for a shorter one (SWEEP-29), gets what its budget gives
+          (``_brief_route``): the replay, the recap, or the yes/no start question once both are
+          used.  The nudge never answers a brief request.
+        * A question about the role-play itself never reaches the model (item 2): the replay if it
+          is unused, else the recap, else the nudge.  A question about the job does (review of
+          S6: ``asks_about_the_job``, and ``names_the_roleplay`` reads "the lead generation" as
+          the job's).
+        * Review of S6: a bare "Yes." or "No." to a question her answer ended with is answered
+          (``_answers_her_own_question``), never left to the 20 s reask.
+        * The rest is routed as before (the nudge, nothing at all, the steer, the invite, or an
+          answer from the role facts).
+        """
+        if self._recap_due():
+            return _TRANSITION_RECAP
+        if text and is_presence_check(text):
+            return _TRANSITION_PRESENCE
+        route = self._brief_route(text)
+        if route is not None:
+            return route
+        if text and self._answers_her_own_question(text):
+            # Review of S6: her answer ended with a question of its own (its start question was
+            # dropped), so a bare "Yes." or "No." answers HER, and is never dead air: the model
+            # replies (with a start question after it), or past the answer limit the yes/no
+            # start question is asked.
+            if self._transition_answers < TRANSITION_QUESTION_LIMIT:
+                return _TRANSITION_ANSWER
+            return _TRANSITION_REASK
+        if (
+            is_short_yes(text)
+            and self._start_question == _EITHER_OR
+            and self._agent_state in _QUIET_AGENT_STATES
+        ):
+            return _TRANSITION_NUDGE  # "Yes." to "now, or questions first?" says neither
+        if (
+            text
+            and self._agent_state in _QUIET_AGENT_STATES
+            and not is_short_yes(text)
+            and is_no_questions(text)
+            and _BARE_NO_WORDS.intersection(fold_speech(text).split())
+        ):
+            return _TRANSITION_NUDGE
+        if not text or is_backchannel_turn(text) or is_name_only(text):
+            return _TRANSITION_QUIET
+        if is_no_questions(text) or no_questions_about_the_roleplay(text):
+            return _TRANSITION_NUDGE
+        if names_the_roleplay(text, self._lead_names()) and not is_permission_to_ask(text):
+            if not self._brief_repeated:
+                return _TRANSITION_BRIEF
+            return _TRANSITION_RECAP if self._recaps_left() > 0 else _TRANSITION_NUDGE
+        if self._transition_answers >= TRANSITION_QUESTION_LIMIT:
+            return _TRANSITION_NUDGE if self._transition_steered else _TRANSITION_STEER
+        if is_permission_to_ask(text):
+            return _TRANSITION_INVITE
+        return _TRANSITION_ANSWER
+
+    def _press_label(self) -> str:
+        """M032 S6 item 6: what the "I'm ready" press came during (``pressed_during``).
+
+        "brief", "replay" or "recap" while one plays, and "brief" too while it is on its way
+        (review of S6: "Yes, I'm here." at a presence boundary and the bridge's compose come
+        first, ``_bridging``).  "answer" while Christy's answer to a question is playing (it ends
+        with a start question, or a question of her own).  "wait" otherwise.
+        """
+        if self._brief_playing is not None:
+            return self._brief_playing
+        if self._bridging:
+            return "brief"
+        speech = getattr(self.session, "current_speech", None)
+        slot = self._speeches.get(getattr(speech, "id", None))
+        done = getattr(speech, "done", None)
+        if (
+            slot is not None
+            and slot.source == "generate_reply"
+            and not (callable(done) and done())
+            and transition_repair_enabled()
+        ):
+            return "answer"
+        return "wait"
+
+    def _answers_her_own_question(self, text: str) -> bool:
+        """Review of S6: a bare yes or no right after Christy's answer that asked something itself
+        (``_drop_answer_tail``: no start question is open), with her quiet now."""
+        if (
+            self._start_question is not None
+            or not self._last_answer_tailless
+            or self._last_transition_line != "reply"
+            or self._brief_playing is not None
+            or self._agent_state not in _QUIET_AGENT_STATES
+        ):
+            return False
+        if is_short_yes(text):
+            return True
+        words = fold_speech(text).split()
+        return (
+            all(word in _BARE_NO_REPLY_WORDS for word in words)
+            and not {"no", "nope", "nah", "not"}.isdisjoint(words)
+        )
+
+    def _lead_names(self) -> tuple[str, ...]:
+        """The learner's full and first name (the brief's object in a request; never logged)."""
+        try:
+            persona = self.persona
+            return tuple(name for name in (persona.lead_name, persona.first_name) if name)
+        except Exception:  # noqa: BLE001 - a missing persona only narrows the detector
+            return ()
+
+    def _after_brief(self) -> bool:
+        """True while a brief is playing or was the last line Christy finished (SWEEP-29)."""
+        return self._brief_playing is not None or self._last_transition_line in _BRIEF_LINES
+
+    def _recaps_left(self) -> int:
+        """Recaps still to give (``RECAP_LIMIT``), counting one already asked for."""
+        return RECAP_LIMIT - self._recaps_played - (1 if self._recap_requested else 0)
+
+    def _brief_route(self, text: str) -> str | None:
+        """M032 S6: what a request for the brief gets now, or None when ``text`` asks for none.
+
+        A request for a SHORTER brief (``is_short_brief_request``, SWEEP-29) gets the recap while
+        one is left, else the replay while it is unused.  Any other brief request (the wider
+        ``is_brief_request``, item 1) gets the replay while it is unused, else the recap.  Once
+        both budgets are used: the yes/no start question (L-TRANSITION-REASK), never the nudge.
+        Review of S6: a generic ask about the job, or about "that" right after her answer
+        (``asks_about_the_job``), is no brief request: the model answers it.
+        """
+        if not text:
+            return None
+        leads = self._lead_names()
+        short = is_short_brief_request(text, after_brief=self._after_brief(), lead_names=leads)
+        if not short and not is_brief_request(text, wide=True, lead_names=leads):
+            return None
+        after_answer = self._brief_playing is None and self._last_transition_line == "reply"
+        if not short and asks_about_the_job(text, after_answer=after_answer, lead_names=leads):
+            return None  # review of S6: a question about the job (or her answer), not the brief
+        replay_left = not self._brief_repeated and not self._brief_requested
+        recap_left = self._recaps_left() > 0
+        if short and recap_left:
+            return _TRANSITION_RECAP
+        if replay_left:
+            return _TRANSITION_BRIEF
+        if recap_left:
+            return _TRANSITION_RECAP
+        return _TRANSITION_REASK
+
     def _transition_consent(self, text: str) -> bool:
         """M1: does this transition turn agree to start the role-play?
 
@@ -3443,7 +4649,7 @@ class R1Interview:
         # they were answered as questions, used up the three answers and got the steer).
         return is_acknowledgement_turn(text) and _YIELD_RE.search(fold_speech(text)) is not None
 
-    def _count_icebreaker_answer(self, text: str) -> None:
+    def _count_icebreaker_answer(self, text: str, index: int | None = None) -> None:
         """Count one COMMITTED candidate turn toward the icebreaker's soft exit, if it is an answer.
 
         The soft exit (``icebreaker_should_end``: four turns once S >= 3:30) used to count STT
@@ -3459,6 +4665,14 @@ class R1Interview:
         """
         if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
             return
+        if self._sound_check_open or (index is not None and index in self._sound_check_rows):
+            # M032 S7C (SWEEP-35): the reply to "Can you hear me okay?" answers no icebreaker
+            # question, whenever its turn commits; an early answer was counted once by the driver.
+            return
+        if icebreaker_plan_enabled() and is_thinking(text):
+            return  # M032 S5: "Let me think about that." answers nothing yet
+        if icebreaker_repair_enabled() and is_hold_request(text):
+            return  # M032 S6: "Can you give me a minute?" answers nothing either
         if content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS:
             self.machine.candidate_turns += 1
 
@@ -3618,6 +4832,11 @@ class R1Interview:
         row = self._close_candidate_row()
         index = self._latest_candidate_index
         self._latest_candidate_index = None
+        if self._mute_turn_index is not None:
+            # Review of S7C: the turn in flight at the mute is committed; the aside may be due.
+            self._mute_turn_index = None
+            if self._mute_pending():
+                self._wake()
         seconds = self._take_user_turn_seconds()
         self._turn_finals = []
         # Whatever the candidate says or transcribes from here on follows this turn (the settle).
@@ -3656,16 +4875,43 @@ class R1Interview:
         """Decide one opened turn (``_finish_turn`` writes its row afterwards)."""
         text, index, seconds = turn.text, turn.index, turn.seconds
         entry = self._note_candidate_turn(text, index) if text else None
-        if text:
-            self._count_icebreaker_answer(text)
+        # M032 S6 (SWEEP-28): how long the candidate had waited for a voice (read before the clear
+        # below), and whether this is a hold request in the icebreaker.
+        waited = None if self._unvoiced_since is None else self._clock() - self._unvoiced_since
+        hold_route = self._ib_hold_route(text) if text else None
+        # Review of S6: "Okay." right after the hold or the repeat line keeps both as they are.
+        quiet = bool(text) and self._ib_quiet_turn(text)
+        if text and hold_route != _IB_HOLD and not quiet:
+            self._ib_hold_window = False  # the candidate spoke: the hold's window is over
+        if text and not quiet:
+            self._ib_quiet_after = None
+        if quiet:
+            _log.info("unknown_event", error_type="r1_icebreaker_quiet_ack")
+        elif text:
+            self._count_icebreaker_answer(text, index)
             if not is_backchannel_turn(text):
                 # The candidate said something: their wait starts again from here.  A backchannel
                 # ("Sorry", "Thank you.") leaves the wait for the reply it cancelled running.
                 self._unvoiced_since = None
         phase = self.machine.phase
+        if (
+            self._bridging
+            and phase is R1Phase.TRANSITION
+            and text
+            and not is_backchannel_turn(text)
+        ):
+            self._bridge_superseded = True  # M032 S5: the reaction would answer an older turn
         deferral = self._icebreaker_deferral(text) if phase is R1Phase.ICEBREAKER else None
         action = self._transition_action(text) if phase is R1Phase.TRANSITION else None
         suppressed = self.reply_suppressed(text)
+        if not suppressed and index is not None and index in self._sound_check_rows:
+            # M032 S7C (SWEEP-35): a reply to the sound check whose turn commits after the agenda
+            # (in the icebreaker) was answered by the agenda; the model never answers it again.
+            suppressed = True
+        # Review of S6: the unheard half of a split repair request is read with this turn only.
+        judged = self._ib_judged(text)
+        if text:
+            self._ib_repair_carry = ""
         if phase in (R1Phase.OPENING, R1Phase.ICEBREAKER) and text:
             self._icebreaker_reply_cut = False  # this turn is the one that cut it, if any
         if suppressed or not text:
@@ -3674,8 +4920,15 @@ class R1Interview:
                     suppressed
                     and text
                     and phase is R1Phase.ICEBREAKER
-                    and self.machine.icebreaker_should_end()
+                    and deferral != _DEFER_ACK
+                    and (
+                        self.machine.icebreaker_should_end() or hold_route == _IB_HOLD_BOUNDARY
+                    )
                 ):
+                    if entry is not None:
+                        # M032 S5 item 4: part of the last answer, which no reply answers (the
+                        # transition bridge may react to it once the icebreaker is over).
+                        self._icebreaker_boundary_entries.append(entry)
                     if deferral == _DEFER_UNFINISHED:
                         # A1: not the last answer.  No reply (it would talk over the rest of the
                         # thought); the next committed turn, or a short quiet, ends the phase.
@@ -3687,13 +4940,14 @@ class R1Interview:
                         # this turn may end the phase early; a later wake-up (the interviewer's
                         # own question finishing, the candidate starting to answer) must not.
                         self._icebreaker_boundary_turn = True
+                        self._note_icebreaker_boundary(judged, entry)
                 # A phase that ended between this turn's transcript and its end of turn (the
                 # driver judged the transcript, this hook judges the end of turn) is over for
                 # the driver too: wake it, so it re-reads its budget and plays the boundary
                 # line now instead of waiting out a silence window for an answer nobody gave.
                 self._wake()
             elif action is not None and text:
-                self._queue_transition_line(action)
+                self._queue_transition_line(action, index)
             raise StopResponse()
         if phase is R1Phase.ICEBREAKER and deferral == _DEFER_BARGE_IN:
             _log.info("unknown_event", error_type="r1_icebreaker_barge_in_answered")
@@ -3714,10 +4968,25 @@ class R1Interview:
                 # M1: Christy's answer ends with the start question, in the same speech (so the
                 # candidate can cut in with "ready" or the next question at any point).
                 self._transition_answers += 1
-                reply.tail = self.render_line("L-TRANSITION-ASK")
+                reply.tail = self.render_line(self._answer_tail_id())
+                # M032 S6 item 7: dropped at the stream's end when her answer already ends with
+                # a question, unless the last answer went without one (SWEEP-32).
+                reply.tail_optional = (
+                    transition_repair_enabled() and not self._last_answer_tailless
+                )
                 self._start_question = _EITHER_OR
             elif action == _TRANSITION_INVITE:
                 self._start_question = None  # "of course, go ahead": no start question
+            elif text and self._icebreaker_repair_reply(reply, deferral, hold_route):
+                pass  # M032 S6: the scripted repeat or hold line; the plan is left as it was
+            elif (
+                text
+                and phase in (R1Phase.OPENING, R1Phase.ICEBREAKER)
+                and icebreaker_plan_enabled()
+            ):
+                self._plan_icebreaker_reply(reply, text, index)
+            if text and phase in (R1Phase.OPENING, R1Phase.ICEBREAKER) and not reply.scripted:
+                self._add_presence_opener(reply, text, waited)
         self._last_reply = self._latest_reply = reply
         if self.machine.phase is R1Phase.WRAPUP:
             self._wrapup_answer_owed = reply
@@ -3726,17 +4995,244 @@ class R1Interview:
             while len(self._replies) > _REPLIES_KEPT:
                 self._replies.pop(next(iter(self._replies)))
 
-    def _queue_transition_line(self, action: str) -> None:
-        """M1: hand the driver the scripted line a suppressed transition turn gets, if any."""
+    def _answer_tail_id(self) -> str:
+        """The start question an answer ends with (SWEEP-32, ``R1_TRANSITION_REPAIR``).
+
+        L-TRANSITION-ASK until the brief's either/or question has been heard; from then on the
+        shorter either/or forms in turn, so the same words are not repeated after every answer.
+        """
+        if not transition_repair_enabled():
+            return "L-TRANSITION-ASK"
+        heard = self._start_question == _EITHER_OR or self._last_transition_line in _BRIEF_LINES
+        if not heard:
+            return "L-TRANSITION-ASK"
+        line_id = _ROTATED_TAILS[self._answer_tails % len(_ROTATED_TAILS)]
+        self._answer_tails += 1
+        return line_id
+
+    def _drop_answer_tail(self, reply: Reply) -> None:
+        """M032 S6 item 7: the answer already asked the candidate something, so the start question
+        is not added: the answer is not counted, and no start question is open."""
+        self._transition_answers = max(0, self._transition_answers - 1)
+        if reply.tail in {self.render_line(line_id) for line_id in _ROTATED_TAILS}:
+            self._answer_tails = max(0, self._answer_tails - 1)
+        self._start_question = None
+        self._last_answer_tailless = True
+        _log.info("unknown_event", error_type="r1_transition_tail_dropped")
+
+    def _icebreaker_repair_reply(
+        self, reply: Reply, deferral: str | None, hold_route: str | None
+    ) -> bool:
+        """M032 S6 (SWEEP-28): make this icebreaker turn's reply the scripted hold or repeat line.
+
+        A hold request gets L-IB-HOLD ("Of course, take a moment. I'm here when you're ready.") and
+        the next silence window is ``ICEBREAKER_HOLD_WAIT_SECONDS`` (once per session).  A request to
+        repeat the question once the soft exit is due (``_DEFER_REPEAT``) gets "Of course." and the
+        last question of Christy's own replies (or the current objective's).  Neither calls the
+        model, neither counts as an answer, and the icebreaker plan is left as it was.
+        """
+        if self.machine.phase is not R1Phase.ICEBREAKER or not icebreaker_repair_enabled():
+            return False
+        if deferral == _DEFER_REPEAT:
+            self._ib_repeat_deferrals += 1
+            self._ib_repeat_answer_due = True
+            question = self._question_to_repeat()
+            reply.scripted = repeat_line(question)
+            reply.repair = "repeat"
+            self._ib_quiet_after = "repeat"
+            self._ib_repeat_closed = is_closed_question(question)
+            _log.info(
+                "unknown_event",
+                error_type="r1_icebreaker_repeat",
+                option_count=self._ib_repeat_deferrals,
+            )
+            return True
+        if hold_route == _IB_HOLD:
+            self._ib_holds += 1
+            self._ib_hold_window = True
+            reply.scripted = self.render_line("L-IB-HOLD")
+            reply.repair = "hold"
+            self._ib_quiet_after = "hold"
+            _log.info("unknown_event", error_type="r1_icebreaker_hold", option_count=self._ib_holds)
+            return True
+        return False
+
+    def _question_to_repeat(self) -> str:
+        """The question a repeat request gets again: the last one of Christy's own icebreaker
+        replies, else the plan's current question (the S5 restate)."""
+        if self._ib_last_question:
+            return self._ib_last_question
+        if self._icebreaker_fallback:
+            return self._icebreaker_fallback
+        current = self._icebreaker_plan.current
+        return FREE_RESTATE if current is None else current.restate
+
+    def _add_presence_opener(self, reply: Reply, text: str, waited: float | None) -> None:
+        """M032 S6 (SWEEP-28): a reply to "Are you there?" opens with "Yes, I'm here." (an
+        apology too after a wait of 6 s or more).  An opener only: the plan's job still decides
+        what she asks."""
+        if not icebreaker_repair_enabled():
+            return
+        view = _ib_repair_view(text)  # review of S6: "Christy, are you there?" too
+        if not is_repair_turn(view) or _PRESENCE_RE.search(_repair_fold(view)) is None:
+            return
+        base = reply.note or interviewer_reminder(reply.phase, rider=False) or ""
+        opener = presence_opener_note(waited=waited)
+        reply.note = f"{base}\n{opener}" if base else opener
+        _log.info("unknown_event", error_type="r1_icebreaker_presence_opener")
+
+    def _note_icebreaker_boundary(self, text: str, entry: dict[str, Any] | None) -> None:
+        """M032 S6 (SWEEP-28): what kind of turn ended the icebreaker.
+
+        A presence check ("presence") gets "Yes, I'm here." before the brief, and it or another
+        repair or hold turn ("repair") gets the brief without "Thank you, {first_name}." (it
+        answered nothing).  An answer lost before any audio (the carry) is what the transition
+        bridge reacts to then.
+        """
+        if not icebreaker_repair_enabled():
+            return
+        self._ib_repeat_answer_due = False
+        kind = None
+        if is_presence_check(text):
+            kind = "presence"
+        elif is_repair_turn(_ib_repair_view(text)) or is_hold_request(text):
+            kind = "repair"
+        self._icebreaker_boundary_kind = kind
+        carried = self._icebreaker_carry_entry
+        if kind is not None and self._icebreaker_carry and carried is not None:
+            entries = self._icebreaker_boundary_entries
+            if all(item is not carried for item in entries):
+                entries.insert(0, carried)
+
+    def _plan_icebreaker_reply(self, reply: Reply, text: str, index: int | None) -> None:
+        """M032 S5: decide what Christy's icebreaker reply is FOR (``r1_icebreaker``).
+
+        The plan reads the committed turn (with the text of a turn whose reply was cancelled
+        before any audio, when there is one: the two halves are one answer) and the reply gets
+        the plan's note, its question as the fallback line, or the scripted "Take your time."
+        instead of a model call.  One log line per decision, labels and counts only.
+        """
+        carried, self._icebreaker_carry = self._icebreaker_carry, ""
+        self._icebreaker_carry_entry = None
+        judged = f"{carried} {text}" if carried else text
+        job = self._icebreaker_plan.next_job(judged, content_words=content_word_count(judged))
+        reply.job = job
+        reply.note = job.note
+        reply.scripted = job.scripted
+        if not job.scripted:
+            reply.fallback = job.fallback
+            self._icebreaker_fallback = job.fallback
+        _log.info(
+            "unknown_event",
+            error_type="r1_icebreaker_job",
+            error_category=job.kind,
+            schema=job.disposition,
+            option_count=self._icebreaker_plan.cursor,
+            turn_index=index,
+        )
+
+    def _report_unheard_icebreaker(self, slot: _SpeechSlot) -> None:
+        """M032 S5: an icebreaker reply nobody heard is taken back from the plan.
+
+        It asked nothing, so the objective it moved on to was never put to the candidate; the
+        turn that follows (usually the rest of the same answer) is read together with this one.
+        """
+        reply = slot.reply
+        if reply is not None and reply.repair and not slot.used:
+            self._give_back_repair(reply)
+            return
+        job = None if reply is None else reply.job
+        if job is None or slot.used:
+            return
+        if self._icebreaker_plan.reply_lost(job):
+            self._icebreaker_carry = reply.candidate_text
+            self._icebreaker_carry_entry = reply.entry
+            _log.info(
+                "unknown_event",
+                error_type="r1_icebreaker_job_undone",
+                error_category=job.kind,
+                option_count=self._icebreaker_plan.cursor,
+            )
+
+    def _give_back_repair(self, reply: Reply) -> None:
+        """Review of S6: the hold or repeat line was cancelled before anyone heard it (the rest of
+        a split request cut in: "Sorry, can you repeat" + "the question?").  Its once-per-session
+        budget is given back, the window or the answer it promised is off, and the request is read
+        with the turn that cancelled it (``_ib_judged``), so that turn is not the boundary."""
+        if reply.repair == "repeat":
+            self._ib_repeat_deferrals = max(0, self._ib_repeat_deferrals - 1)
+            self._ib_repeat_answer_due = False
+        elif reply.repair == "hold":
+            self._ib_holds = max(0, self._ib_holds - 1)
+            self._ib_hold_window = False
+        self._ib_quiet_after = None
+        self._ib_repair_carry = reply.candidate_text
+        _log.info(
+            "unknown_event", error_type="r1_icebreaker_repair_undone", error_category=reply.repair
+        )
+
+    def _log_icebreaker_plan(self) -> None:
+        """M032 S5: one line when the icebreaker ends: how far the plan got (counts only)."""
+        if not icebreaker_plan_enabled():
+            return
+        category, schema = self._icebreaker_plan.log_labels()
+        _log.info(
+            "unknown_event",
+            error_type="r1_icebreaker_plan",
+            error_category=category,
+            schema=schema,
+            option_count=self._icebreaker_plan.cursor,
+        )
+
+    def _queue_transition_line(self, action: str, index: int | None = None) -> None:
+        """M1: hand the driver the scripted line a suppressed transition turn gets, if any.
+
+        M032 S6: "Yes, I'm here." with the yes/no start question for a presence check, the yes/no
+        start question alone, and the recap (latched like the replay: the driver plays it).  A turn
+        whose request the transcript latch already took (``_brief_latch_index``) gets nothing more:
+        the replay or the recap it asked for answers it, once.
+        """
+        if action in (_TRANSITION_BRIEF, _TRANSITION_RECAP, _TRANSITION_REASK) and (
+            index is not None and index == self._brief_latch_index
+        ):
+            return
         if action == _TRANSITION_STEER:
             self._transition_steered = True
-            line_id = "L-TRANSITION-STEER"
+            line_ids: tuple[str, ...] = ("L-TRANSITION-STEER",)
         elif action == _TRANSITION_NUDGE:
-            line_id = "L-TRANSITION-NUDGE"
+            line_ids = ("L-TRANSITION-NUDGE",)
+        elif action == _TRANSITION_PRESENCE:
+            line_ids = ("L-PRESENT", "L-TRANSITION-REASK")
+            _log.info("unknown_event", error_type="r1_transition_presence")
+        elif action == _TRANSITION_REASK:
+            line_ids = ("L-TRANSITION-REASK",)
+        elif action == _TRANSITION_RECAP:
+            self._latch_brief(_TRANSITION_RECAP, index)
+            return
+        elif action == _TRANSITION_BRIEF and transition_repair_enabled():
+            self._latch_brief(_TRANSITION_BRIEF, index)
+            return
         else:
             return  # the pickup, the replay or nothing at all: the driver handles those itself
-        if line_id not in self._transition_lines:
-            self._transition_lines.append(line_id)
+        for line_id in line_ids:
+            if line_id not in self._transition_lines:
+                self._transition_lines.append(line_id)
+        self._wake()
+
+    def _latch_brief(self, route: str, index: int | None) -> None:
+        """Ask the driver for the replay or the recap (once each while pending), and wake it."""
+        if route == _TRANSITION_BRIEF:
+            if self._brief_requested or self._brief_repeated:
+                return
+            self._brief_requested = True
+            _log.info("unknown_event", error_type="r1_brief_requested")
+        else:
+            if self._recap_requested or self._recaps_left() <= 0:
+                return
+            self._recap_requested = True
+            _log.info("unknown_event", error_type="r1_brief_recap_requested")
+        if index is not None:
+            self._brief_latch_index = index
         self._wake()
 
     def _plan_learner_reply(
@@ -4619,17 +6115,37 @@ class R1Interview:
         plan = reply.plan
         if plan is not None and plan.mode is TurnMode.SAY_ONLY:
             return self._single(plan.scripted_text)
+        if plan is None and reply.scripted:
+            # M032 S5: the icebreaker plan's "Take your time." is the whole reply (no model call).
+            return self._single(reply.scripted)
         if plan is not None:
             ctx = plan.guard_ctx
         else:
-            ctx = self.engine.guard_context(reply.phase, mode="reply", turn=reply.candidate_index)
+            ctx = self._interviewer_guard_context(reply)
         guard = StreamGuard(ctx)
-        messages = llm_messages(reply, self.persona, self._history)
+        messages = llm_messages(reply, self.persona, self._history, voice=self._interviewer_voice)
         if plan is not None and plan.mode is TurnMode.INTENT:
             source = self._intent_reply(lambda: provider(messages), guard, reply)
         else:
             source = self._screened(lambda: provider(messages), guard, reply)
         return self.guard_llm_stream(source)
+
+    def _interviewer_guard_context(self, reply: Reply) -> Any:
+        """The guard context of one of Christy's replies (M032 S5 on top of the engine's).
+
+        The praise check runs while her voice is on, and the icebreaker plan's question is the
+        line a reply with nothing usable left falls back to (``Reply.fallback``).  The echo check
+        is the engine's (the plain prefix's prose: the voice text holds nothing private and her
+        natural sentences reuse its wording).  With ``R1_INTERVIEWER_VOICE=0`` and no plan the
+        context is exactly the engine's.
+        """
+        ctx = self.engine.guard_context(reply.phase, mode="reply", turn=reply.candidate_index)
+        changes: dict[str, Any] = {}
+        if self._interviewer_voice:
+            changes["praise_check"] = True
+        if reply.fallback:
+            changes["interviewer_fallback"] = reply.fallback
+        return _dataclass_replace(ctx, **changes) if changes else ctx
 
     async def _screened(
         self,
@@ -4647,6 +6163,7 @@ class R1Interview:
 
         reported_before = self._llm_errors_reported
         spoke = False  # a sentence of the model's reply already reached the consumer
+        last_sentence = ""
         recover = False
         iterator: Any = None
         try:
@@ -4662,10 +6179,12 @@ class R1Interview:
                     self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
                         spoke = True
+                        last_sentence = sentence
                         self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
                 spoke = True
+                last_sentence = sentence
                 self._latency.mark("guard_release")
                 yield sentence + " "
         except Exception as exc:  # noqa: BLE001 - a failed model reply must not leave silence
@@ -4685,9 +6204,15 @@ class R1Interview:
             # only) chunk of this reply.  It is not an answer from the provider, so it must not
             # reset the failure count (the 3-failure abort stays reachable).
             self._skip_failure_reset = True
-            yield FALLBACK_REPLY + " "
+            # M032 S5: in the icebreaker the plan's current question, not "Sorry, what were you
+            # saying?" (the candidate was clear; the provider was not).
+            yield (reply.fallback or FALLBACK_REPLY) + " "
         elif spoke and reply.tail:
-            yield reply.tail + " "
+            if reply.tail_optional and _has_question_mark(last_sentence.rstrip()[-1:]):
+                self._drop_answer_tail(reply)  # M032 S6 item 7: never two questions in one turn
+            else:
+                self._last_answer_tailless = False
+                yield reply.tail + " "
 
     def _reply_failed(self, exc: BaseException, reported_before: int) -> bool:
         """Count one failed model reply and say whether a recovery line should be spoken.
@@ -5005,8 +6530,15 @@ class R1Interview:
             or phase not in _REPLY_PHASES
         ):
             return
+        text = FALLBACK_REPLY
+        if (
+            phase in (R1Phase.OPENING, R1Phase.ICEBREAKER)
+            and self._icebreaker_fallback
+            and icebreaker_plan_enabled()
+        ):
+            text = self._icebreaker_fallback  # M032 S5: the current question, not "say again"
         await self._say_text(
-            FALLBACK_REPLY,
+            text,
             interruptible=True,
             marker="llm_recovery",
             voice=voice if voice in VOICES else self._voice_for_phase(phase),
@@ -5121,6 +6653,8 @@ class R1Interview:
         text = str(getattr(event, "transcript", "") or "").strip()
         if not text:
             return
+        self._candidate_ever_heard = True  # M032 S7C (SWEEP-34): a final is proof of audio
+        self._finals_heard += 1
         self._latency.note_final()
         self._candidate_activity_at = self._clock()
         self._ack_unjudged = False  # a real final: the speech belongs to a real turn
@@ -5137,11 +6671,19 @@ class R1Interview:
                 [],
                 self._candidate_turn_anchor(event),
             )
+        row.held_only = False  # M032 S6: a real final, so a turn of the SDK's is in flight
+        if self._sound_check_open:
+            # M032 S7C: a reply to the sound check; one heard while Christy speaks is not waited for
+            # (the SDK drops a turn spoken over an uninterruptible line).
+            self._sound_check_rows.add(row.index)
+            self._sound_check_final_quiet = self._agent_state in _QUIET_AGENT_STATES
         row.parts.append(text)
         row.last_final_at = self._event_seconds(event)
         self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
         self._learn_spoken_name(" ".join(row.parts))
-        if (
+        if self.machine.phase is R1Phase.TRANSITION and transition_repair_enabled():
+            self._latch_brief_at_transcript(text, row)
+        elif (
             self.machine.phase is R1Phase.TRANSITION
             and not self._brief_repeated
             and not self._brief_requested
@@ -5162,6 +6704,31 @@ class R1Interview:
         self._speculate_end_intent()
         # M032 S4: the shadow turn reader reads the row so far (last, and it can never raise here).
         self._speculate_turn_reader(row)
+
+    def _latch_brief_at_transcript(self, text: str, row: _CandidateRow) -> None:
+        """M032 S6: latch a request for the brief (or a shorter one) at the transcript.
+
+        As before, because the SDK drops a turn spoken over an uninterruptible brief.  The latch
+        takes the budget the request would use (``_brief_route``: the replay or the recap), once per
+        candidate row (its turn hook then queues nothing more), and nothing while a replay or a
+        recap is already due.  Said over the replay or the recap only a request for a SHORTER brief
+        is latched (for the recap, if one is left); any other is dropped, as it always was.
+        """
+        if self._brief_due() or self._recap_due() or row.index == self._brief_latch_index:
+            return
+        joined = " ".join(row.parts)
+        route = self._brief_route(text) or self._brief_route(joined)
+        if route not in (_TRANSITION_BRIEF, _TRANSITION_RECAP):
+            return
+        if self._brief_playing in ("replay", "recap"):
+            leads = self._lead_names()
+            short = any(
+                is_short_brief_request(part, after_brief=True, lead_names=leads)
+                for part in (text, joined)
+            )
+            if route != _TRANSITION_RECAP or not short:
+                return
+        self._latch_brief(route, row.index)
 
     def _flush_candidate_row(self) -> None:
         """Write the open candidate row (all its finals, one space apart), once, then close it.
@@ -5186,6 +6753,8 @@ class R1Interview:
             self._raise_anchor_floor(row.last_final_at, commit=True)
             # M032 S4: its shadow reading is recorded for it, off the speech path.
             self._bind_turn_reader(row)
+            if self._mute_pending():
+                self._wake()  # M032 S7C (SWEEP-36): the turn in flight is over; the aside is due?
         return row
 
     def _candidate_turn_end(self, row: _CandidateRow) -> int | None:
@@ -5309,7 +6878,10 @@ class R1Interview:
 
     def _candidate_turn_open(self) -> bool:
         """True while the candidate is mid-turn: speaking, or a final heard whose turn has not committed."""
-        return self._user_state == "speaking" or self._open_row is not None
+        if self._user_state == "speaking":
+            return True
+        row = self._open_row
+        return row is not None and not row.held_only  # M032 S6: not for held acknowledgements
 
     def _on_speech_created(self, event: Any) -> None:
         """Track a speech; its transcript position is fixed when it starts speaking."""
@@ -5439,6 +7011,7 @@ class R1Interview:
             # reads.
             self._latency.reply_lost(slot.latency_turn)
         self._report_unheard_plan(slot)
+        self._report_unheard_icebreaker(slot)
         if (
             before_audio
             and self.machine.phase is R1Phase.ICEBREAKER
@@ -5446,6 +7019,10 @@ class R1Interview:
             and not self._candidate_turn_open()
         ):
             self._icebreaker_boundary_turn = True
+            if slot.reply is not None and slot.reply.repair and icebreaker_repair_enabled():
+                # Review of S6: that turn asked for the question again or for a moment; it
+                # answered nothing, so the brief has no "Thank you, {first_name}." for it.
+                self._icebreaker_boundary_kind = "repair"
             self._wake()
 
     def _report_unheard_plan(self, slot: _SpeechSlot) -> None:
@@ -5551,7 +7128,21 @@ class R1Interview:
                 and slot.source == "generate_reply"
                 and not slot.cut_by_r1
             )
+            if (
+                slot is not None
+                and slot.source == "generate_reply"
+                and icebreaker_repair_enabled()
+                and not (slot.reply is not None and slot.reply.scripted)
+            ):
+                # M032 S6 (SWEEP-28): the question a repeat request gets again, from her LAST
+                # model reply only (review of S6: an older reply's question was already
+                # answered).  A reply cut before its question, or one that asked nothing, leaves
+                # None, and the plan's current question is used.  Scripted replies ("Take your
+                # time.", the hold and repeat lines) and say lines never change it.
+                self._ib_last_question = reply_question(text, complete=not interrupted)
         self._note_wrapup_answer(phase, slot, interrupted)
+        if phase == "transition" and slot is not None and slot.source == "generate_reply":
+            self._last_transition_line = "reply"  # M032 S6: an answer, not a brief
         voice = self._remember_bot_turn(index, phase, text, slot)
         played = slot is not None and slot.finished_at is not None
         self._write_turn(
@@ -5736,6 +7327,7 @@ class R1Interview:
         self._latency.note_user_state(self._user_state)
         self._settle_change.set()  # the speech started or stopped (_settle_bare_yes)
         if self._user_state == "speaking":
+            self._candidate_ever_heard = True  # M032 S7C (SWEEP-34): the VAD heard them
             self._settle_speech.set()  # a bare yes the candidate went on from (_settle_bare_yes)
             spoke = getattr(event, "created_at", None)
             if isinstance(spoke, (int, float)) and not isinstance(spoke, bool):
@@ -5869,6 +7461,7 @@ class R1Interview:
             self._candidate_identity = str(identity) if identity else None
         if not self._candidate_matches(participant):
             return
+        self._candidate_seen = participant  # M032 S7C (SWEEP-34): its microphone, for a label
         self._candidate_present = True
         self._candidate_ever_present = True
         self._candidate_departed = False
@@ -5908,17 +7501,88 @@ class R1Interview:
         publications = getattr(participant, "track_publications", None)
         if publications is None:
             return
-        values = publications.values() if hasattr(publications, "values") else publications
-        microphones = [
-            publication
-            for publication in values
-            if _is_candidate_microphone(participant, publication, self._candidate_identity)
-        ]
+        self._candidate_seen = participant
+        microphones = self._microphones_of(participant)
         muted = bool(microphones) and all(
             bool(getattr(publication, "muted", False)) for publication in microphones
         )
         if muted != self._muted:
             self._set_muted(muted)
+
+    def _microphones_of(self, participant: Any) -> list[Any]:
+        """The candidate's microphone publications on ``participant`` (none for anyone else)."""
+        publications = getattr(participant, "track_publications", None) or {}
+        values = publications.values() if hasattr(publications, "values") else publications
+        return [
+            publication
+            for publication in values
+            if _is_candidate_microphone(participant, publication, self._candidate_identity)
+        ]
+
+    # -------------------------------------------------- M032 S7C (SWEEP-34): never heard
+
+    def _candidate_participant(self) -> Any:
+        """The candidate's participant: the room's own entry, else the last one an event carried."""
+        participants = getattr(getattr(self.ctx, "room", None), "remote_participants", None) or {}
+        values = participants.values() if hasattr(participants, "values") else participants
+        for participant in values:
+            if self._candidate_matches(participant):
+                return participant
+        return self._candidate_seen
+
+    def _no_audio_category(self) -> str:
+        """Why a candidate may never have been heard, as a label (never any text).
+
+        ``no_mic_track``: no microphone publication; ``not_subscribed``: one is published but the
+        worker holds no subscribed track of it; ``no_voice``: subscribed, but the VAD never heard
+        speech (a muted device, the wrong input, a server-side drop).
+        """
+        microphones = self._microphones_of(self._candidate_participant())
+        if not microphones:
+            return "no_mic_track"
+        if not any(_is_subscribed(publication) for publication in microphones):
+            return "not_subscribed"
+        return "no_voice"
+
+    def _note_no_audio(self) -> None:
+        """Log, once per session, that the candidate was never heard (a label only)."""
+        if self._no_audio_noted:
+            return
+        self._no_audio_noted = True
+        _log.warn(
+            "unknown_event",
+            error_type="r1_no_audio",
+            error_category=self._no_audio_category(),
+            phase=self.machine.transcript_phase(),
+        )
+
+    def _never_heard(self) -> bool:
+        """True when silence must get the no-audio ladder (``R1_NO_AUDIO_LADDER``): nothing of the
+        candidate's ever arrived (no speech, no final) and the microphone is not muted (a muted one
+        has its own aside)."""
+        return no_audio_ladder_enabled() and not self._candidate_ever_heard and not self._muted
+
+    async def _no_audio_ladder(self) -> str | None:
+        """The never-heard ladder: L-SIL-NOAUDIO, then L-SIL-END-NOAUDIO after more silence.
+
+        Spoken only in the opening and the icebreaker (the transition's own close is unchanged).
+        Returns what ``_silence_ladder`` returns: None once the candidate speaks.  The icebreaker
+        bounds it by its own budget; the opening, which has none, by ``OPEN_NO_AUDIO_HARD_SECONDS``
+        from here (review of S7C: muted after the line, it used to wait for the session cap), and
+        its ``phase_deadline`` then leads to the plain agenda and the icebreaker's budget.
+        """
+        self._note_no_audio()
+        bound: Callable[[], float] | None = None
+        if self.machine.phase is R1Phase.OPENING:
+            ends_at = self._clock() + OPEN_NO_AUDIO_HARD_SECONDS
+
+            def opening_left() -> float:
+                return ends_at - self._clock()
+
+            bound = opening_left
+        return await self._silence_ladder(
+            [("L-SIL-NOAUDIO", NO_AUDIO_END_SECONDS)], end_line="L-SIL-END-NOAUDIO", bound=bound
+        )
 
     def _set_muted(self, muted: bool) -> None:
         """Apply a microphone state change synchronously, at the room event.
@@ -5929,14 +7593,86 @@ class R1Interview:
         """
         self._muted = muted
         if muted:
+            if self._muted_since is None:
+                self._muted_since = _loop_now()  # M032 S7C (SWEEP-36): the episode's start
+                row = self._open_row
+                if row is not None and not row.held_only:
+                    # Review of S7C: a turn in flight, remembered before ASIDE writes its row.
+                    self._mute_turn_index = row.index
             if self.machine.phase is R1Phase.ROLEPLAY:
                 self._mute_resume_phase = R1Phase.ROLEPLAY
                 self._enter(R1Phase.ASIDE)
         else:
+            self._muted_since = None
+            self._mute_turn_index = None
             self._leave_mute_aside()
             self._mute_announced = False
             self._restart_silence_window()
         self._wake()
+
+    # -------------------------------------------------- M032 S7C (SWEEP-36): the mute aside
+
+    def _mute_pending(self) -> bool:
+        """A mute that has had no aside yet."""
+        return self._muted and not self._mute_announced
+
+    def _muted_for(self) -> float:
+        since = self._muted_since
+        return 0.0 if since is None else max(0.0, _loop_now() - since)
+
+    def _mute_turn_cap(self) -> float:
+        return max(MUTE_ASIDE_TURN_WAIT_SECONDS, MUTE_ASIDE_DEBOUNCE_SECONDS)
+
+    def _mute_turn_in_flight(self) -> bool:
+        """A candidate turn the aside must not talk over: one open now, or the one in flight at the
+        mute whose row the role-play's ASIDE wrote before the SDK committed it (review of S7C:
+        L-MUTE-RP is uninterruptible, and the SDK skips a turn that ends under such a line)."""
+        return self._candidate_turn_open() or self._mute_turn_index is not None
+
+    def _mute_due(self) -> bool:
+        """True when the mute aside must be spoken now.
+
+        With ``R1_MUTE_ASIDE_V2`` off: at once, as before.  On: the mute has lasted
+        ``MUTE_ASIDE_DEBOUNCE_SECONDS`` (a blip undone sooner gets nothing), the candidate is here
+        to hear it, and no candidate turn is in flight (speaking, or a final whose turn has not
+        committed), unless the mute has lasted ``MUTE_ASIDE_TURN_WAIT_SECONDS`` in all.
+        """
+        if not self._mute_pending():
+            return False
+        if not mute_aside_v2_enabled():
+            return True
+        if not self._candidate_present:
+            return False
+        muted_for = self._muted_for()
+        if muted_for < MUTE_ASIDE_DEBOUNCE_SECONDS:
+            return False
+        return not self._mute_turn_in_flight() or muted_for >= self._mute_turn_cap()
+
+    def _mute_wake_in(self) -> float | None:
+        """Seconds until a pending mute may become due (``_await_turn`` wakes then), or None.
+
+        The end of a turn in flight wakes the waiter itself (``_on_user_state_changed``, and
+        ``_close_candidate_row`` or ``_open_turn`` while a mute is pending), so only the debounce
+        and the cap are timed here.
+        """
+        if not mute_aside_v2_enabled() or not self._mute_pending() or not self._candidate_present:
+            return None
+        muted_for = self._muted_for()
+        if muted_for < MUTE_ASIDE_DEBOUNCE_SECONDS:
+            return MUTE_ASIDE_DEBOUNCE_SECONDS - muted_for
+        cap = self._mute_turn_cap()
+        if self._mute_turn_in_flight() and muted_for < cap:
+            return cap - muted_for
+        return None
+
+    def _mute_line_id(self) -> str:
+        """L-MUTE-RP in the role-play (Christy names herself: her voice replaces the learner's),
+        L-MUTE-IV in her own phases; L-MUTE with ``R1_MUTE_ASIDE_V2`` off."""
+        if not mute_aside_v2_enabled():
+            return "L-MUTE"
+        if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            return "L-MUTE-RP"
+        return "L-MUTE-IV"
 
     def _leave_mute_aside(self) -> None:
         """Resume role-play after a mute aside; a no-op for any other kind of aside."""
@@ -6047,7 +7783,7 @@ class R1Interview:
         return (
             self._stop_outcome() is not None
             or self._candidate_departed
-            or (self._muted and not self._mute_announced)
+            or self._mute_due()
             or self._aside_needs_restore()
         )
 
@@ -6099,6 +7835,9 @@ class R1Interview:
                 if silence_left <= 0:
                     return (SILENCE, None)
                 wait = silence_left if wait is None else min(wait, silence_left)
+            mute_wake = self._mute_wake_in()  # M032 S7C (SWEEP-36): wake when the aside is due
+            if mute_wake is not None:
+                wait = mute_wake if wait is None else min(wait, mute_wake)
             kind, text = await self._wait_for_turn_or_attention(wait)
             if kind == "turn" and text:
                 return (TURN, text)
@@ -6167,7 +7906,7 @@ class R1Interview:
             self._leave_mute_aside()
             self._mute_announced = False
             self._restart_silence_window()
-        if self._muted and not self._mute_announced:
+        if self._mute_due():
             await self._handle_mute()
         return None
 
@@ -6205,42 +7944,64 @@ class R1Interview:
         return None
 
     async def _handle_mute(self) -> None:
-        """Speak one microphone aside; the role-play clock is already paused by the event."""
+        """Speak one microphone aside; the role-play clock is already paused by the event.
+
+        M032 S7C (SWEEP-36, ``R1_MUTE_ASIDE_V2``): the mute is checked again first (it may have
+        been undone since the wake-up), and the episode counts as announced only when a line is
+        really spoken (never to a candidate who is not there).  Off: exactly as before.
+        """
         if self._mute_announced:
+            return
+        if not mute_aside_v2_enabled():
+            self._mute_announced = True
+            if self.machine.phase is R1Phase.ROLEPLAY:
+                self._mute_resume_phase = R1Phase.ROLEPLAY
+                self._enter(R1Phase.ASIDE)
+            if self._candidate_present:
+                await self.say("L-MUTE")
+            return
+        if not self._muted or not self._candidate_present:
             return
         self._mute_announced = True
         if self.machine.phase is R1Phase.ROLEPLAY:
             self._mute_resume_phase = R1Phase.ROLEPLAY
             self._enter(R1Phase.ASIDE)
-        if self._candidate_present:
-            await self.say("L-MUTE")
+        await self.say(self._mute_line_id())
 
     # --------------------------------------------------------------- ladder
 
-    async def _silence_ladder(self, prompts: list[tuple[str, float]]) -> str | None:
+    async def _silence_ladder(
+        self,
+        prompts: list[tuple[str, float]],
+        *,
+        end_line: str = "L-SIL-END",
+        bound: Callable[[], float] | None = None,
+    ) -> str | None:
         """Speak each (line, wait) prompt after real candidate silence (plan section 5.11).
 
         Returns None as soon as the candidate answers, a STOP outcome if one
         fires, ``phase_deadline`` when the phase budget runs out first, or
-        ``candidate_left`` once the final L-SIL-END has been spoken.
+        ``candidate_left`` once the final ``end_line`` (L-SIL-END unless the caller is the
+        never-heard ladder of M032 S7C) has been spoken.
 
         Non-aside steps are bounded by the phase budget and are skipped for the
         phase end when the budget cannot cover their wait.  The aside step
         (L-SIL-RP2) runs with role-play clock R PAUSED, so only the S=26:00 cap
-        bounds it, not the remaining R budget.
+        bounds it, not the remaining R budget.  ``bound`` stands in for the phase budget
+        where the phase has none (the opening's never-heard ladder, review of S7C).
         """
         for line_id, wait_seconds in prompts:
             phase = self.machine.phase
             aside = line_id == "L-SIL-RP2"
-            budget_left: Callable[[], float] | None = None
-            if phase is R1Phase.ICEBREAKER:
+            budget_left: Callable[[], float] | None = bound
+            if bound is None and phase is R1Phase.ICEBREAKER:
                 budget_left = self._icebreaker_budget_left
                 if self.machine.icebreaker_should_end():
                     # The soft exit is due and the candidate has said nothing for the whole
                     # silence window: move on to the transition rather than ask "Are you still
                     # with me?" in the seconds before it.
                     return "phase_deadline"
-            elif phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            elif bound is None and phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
                 budget_left = self._roleplay_budget_left
             if budget_left is not None:
                 budget = budget_left()
@@ -6262,7 +8023,7 @@ class R1Interview:
             if kind == DEADLINE:
                 return "phase_deadline"
         self._goodbye_spoken = True
-        await self.say("L-SIL-END")
+        await self.say(end_line)
         return "candidate_left"
 
     async def _roleplay_turn(self) -> str | None:
@@ -6462,6 +8223,146 @@ class R1Interview:
         ceiling = self._icebreaker_hold_since + ICEBREAKER_HOLD_CEILING_SECONDS
         return max(0.0, min(ceiling, last + grace) - now)
 
+    # ------------------------------------------------ M032 S7C (SWEEP-35): the opening
+
+    async def _run_opening(self) -> str | None:
+        """Speak the opening; return a STOP outcome, or None for the icebreaker to follow.
+
+        With ``R1_OPENING_SOUND_CHECK`` off, L-OPEN exactly as before.  On, the sound check
+        (``_sound_check``): a short hello that asks whether the candidate can hear Christy, their
+        reply read in code, then one agenda.  The reply is no icebreaker answer
+        (``_sound_check_open`` and ``_sound_check_rows``), and an early answer is counted once,
+        here.
+        """
+        if not opening_sound_check_enabled():
+            await self.say("L-OPEN")
+            return None
+        self._sound_check_open = True
+        try:
+            return await self._sound_check()
+        finally:
+            self._sound_check_open = False
+
+    def _take_queued_turns(self) -> list[str]:
+        """The finals the driver has not read yet (said over the line that just played)."""
+        texts: list[str] = []
+        while not self._turns.empty():
+            texts.append(self._turns.get_nowait())
+        return texts
+
+    def _sound_check_turn_open(self) -> bool:
+        """The reply is still in flight: the candidate is speaking, or its latest final came while
+        Christy was quiet and the SDK has not committed it yet.  A final heard over her line is not
+        waited for (the SDK drops a turn spoken over an uninterruptible line)."""
+        if self._user_state == "speaking":
+            return True
+        row = self._open_row
+        return row is not None and not row.held_only and self._sound_check_final_quiet
+
+    async def _settle_sound_check_reply(self, budget: float | None = None) -> list[str]:
+        """Wait for the reply to end, and return the finals heard meanwhile (oldest first).
+
+        Bounded the way the icebreaker's hold is (``_icebreaker_hold_left``, review of S7C): while
+        the reply is in flight (``_sound_check_turn_open``) it waits one endpointing maximum plus a
+        margin after the candidate's LAST sign of speech (speaking, or a new final), and never
+        longer than ``ICEBREAKER_HOLD_CEILING_SECONDS`` in all, nor than ``budget`` (the sound
+        check's own time left), though always that one grace.  A candidate who goes on after "Yes,
+        I can hear you." is then not talked over by the uninterruptible agenda, and the whole
+        reply is read, not its first final.
+        """
+        loop = asyncio.get_running_loop()
+        grace = endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+        ceiling = ICEBREAKER_HOLD_CEILING_SECONDS
+        if budget is not None:
+            ceiling = min(ceiling, budget)
+        started = last = loop.time()
+        ends_by = started + max(grace, ceiling)
+        finals = self._finals_heard
+        while self._sound_check_turn_open():
+            if self._stop_outcome() is not None:
+                break
+            now = loop.time()
+            if self._user_state == "speaking" or self._finals_heard != finals:
+                last, finals = now, self._finals_heard
+            if now >= min(ends_by, last + grace):
+                break
+            await asyncio.sleep(0.05)
+        return self._take_queued_turns()
+
+    async def _sound_check(self) -> str | None:
+        """L-OPEN-HELLO, the reply, then L-OPEN-AGENDA / -PLAIN / -CONTINUE (SWEEP-35).
+
+        * A can't-hear reply (``sound_check_reading``) gets L-OPEN-HELLO-AGAIN once; a second one
+          gets the plain agenda (it does not claim to hear them well).
+        * An early answer (``SOUND_ANSWER``) gets the agenda that invites them to carry on, and it
+          is counted as one icebreaker answer.
+        * Any other reply gets the agenda ("Good, I can hear you.").
+        * Silence: a candidate never heard gets the no-audio ladder (SWEEP-34; its close ends the
+          interview, a turn after it gets the plain agenda); one heard only by the VAD, or with the
+          ladder off, gets the plain agenda.  So does the end of the sound check's own budget.
+        A final heard during the hello ("Hi") is followed by a short quiet for the answer to the
+        question; when none comes, it is the reply.  Nothing here calls the model.
+        """
+        await self.say("L-OPEN-HELLO")
+        started = self._clock()
+
+        def left() -> float:
+            return OPEN_CHECK_HARD_SECONDS - (self._clock() - started)
+
+        cant_hear = 0
+        agenda = "L-OPEN-AGENDA-PLAIN"
+        reading = "silence"
+        while True:
+            queued = self._take_queued_turns()
+            timeout = OPEN_HELLO_FOLLOW_SECONDS if queued else OPEN_CHECK_SILENCE_SECONDS
+            kind, value = await self._await_turn(timeout, hard=left)
+            if kind == STOP:
+                return value
+            if kind == TURN:
+                texts = [*queued, value or ""]
+            elif queued:
+                texts = queued  # "Hi" over the hello, and then nothing: it is the reply
+            elif kind == SILENCE and self._never_heard():
+                stop = await self._no_audio_ladder()
+                if stop not in (None, "phase_deadline"):
+                    return stop
+                await self._settle_sound_check_reply()  # their first words: not talked over
+                reading = "no_audio" if stop is None else "no_audio_deadline"
+                break
+            else:
+                reading = "deadline" if kind == DEADLINE else "silence"
+                break
+            later = await self._settle_sound_check_reply(max(0.0, left()))
+            text = " ".join(part for part in (*texts, *later) if part)
+            # Review of S7C: a "Hello?" said only over the line (before the question was heard,
+            # often a line check on joining) does not say the question went unheard.
+            reading = sound_check_reading(text, after_question=kind == TURN or bool(later))
+            if reading == SOUND_CANT_HEAR:
+                cant_hear += 1
+                if cant_hear == 1 and left() > 0:
+                    await self.say("L-OPEN-HELLO-AGAIN")
+                    continue
+                break
+            if reading == SOUND_ANSWER:
+                agenda = "L-OPEN-AGENDA-CONTINUE"
+                self.machine.candidate_turns += 1  # the early answer, counted once (here)
+            else:
+                agenda = "L-OPEN-AGENDA"
+            break
+        _log.info(
+            "unknown_event",
+            error_type="r1_sound_check",
+            error_category=reading,
+            schema=agenda,
+            option_count=cant_hear,
+        )
+        # Review of S7C: the reply is read, so what is said from here on is no sound-check reply.
+        # The agenda asks the first icebreaker question, and an answer begun over its tail (whose
+        # turn commits in the icebreaker) is that answer, not a reply the agenda already answered.
+        self._sound_check_open = False
+        await self.say(agenda)
+        return None
+
     async def _run_icebreaker(self) -> str | None:
         """Ask-and-listen until a committed turn ends the phase, or the hard S=4:30 deadline.
 
@@ -6482,11 +8383,253 @@ class R1Interview:
             if kind == STOP:
                 return value
             if kind == SILENCE:
-                value = await self._silence_ladder([("L-SIL-IB", ICEBREAKER_END_SECONDS)])
+                if self._ib_hold_window:
+                    # M032 S6 (SWEEP-28): after "Can you give me a minute?" the window is longer
+                    # (once per session), never past the hard budget.
+                    self._ib_hold_window = False
+                    kind, value = await self._await_turn(
+                        max(ICEBREAKER_HOLD_WAIT_SECONDS, ICEBREAKER_PROMPT_SECONDS),
+                        hard=self._icebreaker_budget_left,
+                    )
+                    if kind == DEADLINE:
+                        return None
+                    if kind == STOP:
+                        return value
+                    if kind != SILENCE:
+                        continue
+                # Review of S6: after "Are you still with me?" a "Yes." answers HER, so the quiet
+                # reading of the hold or repeat line is over.
+                self._ib_quiet_after = None
+                if self._never_heard():
+                    # M032 S7C (SWEEP-34): nothing of theirs ever arrived: say so, not "Are you
+                    # still with me?" and "we seem to have lost the connection".
+                    value = await self._no_audio_ladder()
+                else:
+                    value = await self._silence_ladder([("L-SIL-IB", ICEBREAKER_END_SECONDS)])
                 if value == "phase_deadline":
                     return None
                 if value is not None:
                     return value
+
+    # ------------------------------------------------------- M032 S5: the transition bridge
+
+    async def _say_brief(self) -> None:
+        """The brief that opens the transition: L-TRANSITION, or a reaction and then the brief.
+
+        M032 S5 item 4 (``R1_TRANSITION_BRIDGE``, off by default).  When ``_transition_bridge``
+        has one clean sentence of Christy's own about the answer that ended the icebreaker, it is
+        spoken first and the brief follows without its "Thank you, {first_name}."
+        (L-TRANSITION-BRIDGED); both are uninterruptible, as the brief always was.  Otherwise
+        L-TRANSITION plays exactly as before.
+
+        Review of S5: until the brief is queued (``_bridging``) a transition turn is held like
+        one spoken over the brief, never answered ahead of it.  A turn that came in during the
+        compose makes the reaction stale (``_transition_bridge``: "superseded"), and after a
+        compose nothing starts while the candidate is mid-turn (bounded like the icebreaker's
+        hold).  The reaction and the brief are queued together, so a turn committed during the
+        reaction is answered after the brief, as one during L-TRANSITION always was.
+        """
+        # M032 S6 (SWEEP-28): a repair turn ended the icebreaker: "Yes, I'm here." first for a
+        # presence check (queued now, so it plays while the bridge composes), and the brief
+        # without "Thank you, {first_name}." for any repair turn.
+        kind, self._icebreaker_boundary_kind = self._icebreaker_boundary_kind, None
+        if not icebreaker_repair_enabled():
+            kind = None
+        if kind == "presence":
+            self._start_text(
+                self.render_line("L-PRESENT"),
+                interruptible=False,
+                marker="L-PRESENT",
+                voice=INTERVIEWER,
+            )
+            self._ib_boundary_presence_lines += 1
+            _log.info("unknown_event", error_type="r1_icebreaker_boundary_presence")
+        self._bridging = True
+        self._bridge_composed = False
+        self._bridge_superseded = False
+        try:
+            reaction = await self._transition_bridge()
+            if reaction is None and self._bridge_composed:
+                await self._wait_for_candidate_turn(
+                    endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+                )
+        except BaseException:
+            self._bridging = False
+            raise
+        if reaction is None:
+            self._bridging = False  # no await before the brief is queued
+            self._brief_line = self._brief_line_id(bridged=kind is not None)
+            self._brief_playing = "brief"
+            try:
+                await self.say(self._brief_line)
+            finally:
+                self._brief_playing = None
+            return
+        self._brief_line = self._brief_line_id(bridged=True)
+        self._brief_playing = "brief"
+        try:
+            spoken = self._start_text(
+                reaction, interruptible=False, marker=_BRIDGE_MARKER, voice=INTERVIEWER
+            )
+            brief = self._start_text(
+                self.render_line(self._brief_line),
+                interruptible=False,
+                marker=self._brief_line,
+                voice=INTERVIEWER,
+            )
+            self._bridging = False
+            await self._await_playout(spoken, _BRIDGE_MARKER, SAY_PLAYOUT_SECONDS)
+            await self._await_playout(brief, self._brief_line, SAY_PLAYOUT_SECONDS)
+        finally:
+            self._bridging = False
+            self._brief_playing = None
+        # Set once the brief has played, as ``say`` does: a short yes over it answers nothing.
+        self._start_question = _START_QUESTION_OF_LINE[self._brief_line]
+        self._last_transition_line = self._brief_line
+
+    def _brief_line_id(self, *, bridged: bool = False, replay: bool = False) -> str:
+        """M032 S6 (SWEEP-30): the ONE place the brief's line id is picked, for both ``say`` sites.
+
+        The first brief is L-TRANSITION, or L-TRANSITION-BRIDGED after Christy's own reaction (or,
+        SWEEP-28, after a boundary turn that answered nothing).  The replay is L-TRANSITION-AGAIN
+        ("Of course, here it is again.") while ``R1_TRANSITION_REPAIR`` is on, else the brief the
+        candidate heard, word for word.  ``render_line`` gives revision 21's text with the flag off.
+        """
+        if replay:
+            return "L-TRANSITION-AGAIN" if transition_repair_enabled() else self._brief_line
+        return _BRIDGED_BRIEF if bridged else "L-TRANSITION"
+
+    async def _wait_for_candidate_turn(self, limit: float) -> None:
+        """Wait, at most ``limit`` seconds, while the candidate is mid-turn (speaking, or a final
+        heard whose turn has not committed) or until a stop fires."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limit
+        while self._candidate_turn_open() and loop.time() < deadline:
+            if self._stop_outcome() is not None:
+                return
+            await asyncio.sleep(0.05)
+
+    def _bridge_runner_or_none(self) -> Callable[[list[dict[str, str]]], Awaitable[Any]] | None:
+        """The compose call, or None (an injected runner as it is; else R1's own client, and
+        only when the session has an LLM at all: the fakes have none, so they never call it)."""
+        if self._bridge_runner is not None:
+            return self._bridge_runner
+        if getattr(self.session, "llm", None) is not None:
+            return self._default_bridge
+        return None
+
+    async def _default_bridge(self, messages: list[dict[str, str]]) -> str:
+        """Compose on R1's OWN DeepSeek client (the interviewer's settings), never the session's.
+
+        Its failures and timings then never reach the SDK's error count (``_on_provider_error``)
+        or its per-turn metrics, which belong to the replies.  Built on first use; a client that
+        cannot be built raises, and the brief plays alone.
+        """
+        from r1_llm import assert_thinking_disabled, build_r1_llm
+
+        if self._bridge_llm is None:
+            self._bridge_llm = build_r1_llm()
+        parts: list[str] = []
+        async with self._bridge_llm.chat(chat_ctx=_chat_context_from(messages)) as stream:
+            async for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    assert_thinking_disabled(usage)
+                parts.append(delta_text(chunk))
+        return "".join(parts)
+
+    def _bridge_messages(self, text: str, entries: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """The compose call's messages: Christy's own byte-stable prefix (the DeepSeek cache
+        prefix), the icebreaker so far, ``BRIDGE_NOTE`` and the boundary answer (once)."""
+        skip = {id(entry) for entry in entries}
+        ordered = sorted(
+            (item for item in self._history if id(item) not in skip),
+            key=lambda item: item.get("seq", 0),
+        )
+        return assemble_messages(
+            interviewer_prefix(voice=self._interviewer_voice),
+            select_context(ordered, "icebreaker"),
+            text,
+            BRIDGE_NOTE,
+        )
+
+    def _bridge_guard_context(self) -> Any:
+        """The icebreaker's guard rules for the reaction, with the echo check over the prompts
+        this call used (the prefix's private prose and the bridge note)."""
+        ctx = self.engine.guard_context("icebreaker", mode="reply")
+        control = (interviewer_control_prose(), control_prose(BRIDGE_NOTE))
+        return _dataclass_replace(ctx, control_texts=control, praise_check=True)
+
+    async def _transition_bridge(self) -> str | None:
+        """One sentence reacting to the answer that ended the icebreaker, or None.
+
+        Owner's call fda9e9f6, #22 -> #23: the boundary turn gets no reply of its own (the brief
+        answers it), so a reflective last answer heard only "Thank you, {first_name}.".  With the
+        bridge on, a substantive boundary answer (``bridge_wanted``: not a fragment, a question
+        or a decline) gets ONE out-of-band compose call under ``BRIDGE_NOTE``, bounded by
+        ``BRIDGE_TIMEOUT_SEC`` from its start, and what comes back is spoken only when
+        ``clean_bridge`` passes it as it is.  A timeout, an error or a sentence that is not clean
+        says nothing extra.  One ``r1_latency`` line (``transition_bridge``): the compose time,
+        with ``spoken``, ``dropped``, ``superseded`` (the candidate went on meanwhile),
+        ``timeout`` or ``error`` as its category; never the words.
+        """
+        entries, self._icebreaker_boundary_entries = self._icebreaker_boundary_entries, []
+        if not entries or not transition_bridge_enabled() or self._stop_outcome() is not None:
+            return None
+        judged = [str(entry.get("text", "")) for entry in entries]
+        if icebreaker_repair_enabled():
+            # M032 S6 (SWEEP-28): a repair or hold turn among them ("Hello? Are you there?" after
+            # an answer whose reply was lost) says nothing to react to: the answer is judged alone.
+            judged = [
+                part
+                for part in judged
+                if not (is_repair_turn(_ib_repair_view(part)) or is_hold_request(part))
+            ]
+        text = " ".join(judged).strip()
+        if not bridge_wanted(text, content_words=content_word_count(text)):
+            return None
+        runner = self._bridge_runner_or_none()
+        if runner is None:
+            return None
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        reaction: str | None = None
+        self._bridge_composed = True
+        try:
+            raw = await asyncio.wait_for(
+                runner(self._bridge_messages(text, entries)), BRIDGE_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            outcome = "timeout"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the brief plays alone
+            outcome = "error"
+            _log.warn(
+                "unknown_event",
+                error_type="r1_transition_bridge_failed",
+                error_category=_error_type_of(exc),
+            )
+        else:
+            reaction = clean_bridge(raw, self._bridge_guard_context())
+            outcome = "dropped" if reaction is None else "spoken"
+            if reaction is not None and (
+                self._bridge_superseded or self._candidate_turn_open()
+            ):
+                # The candidate went on while it was composed: it reacts to an older turn and
+                # would start over them or after their new point.  Nothing extra is said.
+                reaction = None
+                outcome = "superseded"
+        self._emit_latency(
+            "transition_bridge",
+            loop.time() - started,
+            category=outcome,
+            phase=self.machine.transcript_phase(),
+            turn_index=None,
+        )
+        if self._stop_outcome() is not None:
+            return None
+        return reaction
 
     async def _run_transition(self) -> str | None:
         """Wait for the candidate's consent, answering their questions, then speak the pickup.
@@ -6514,6 +8657,27 @@ class R1Interview:
         approved text and cached audio), and the wait goes on from there.  Once per session: a
         later request gets the nudge.  A consent said during the replay picks up right after it,
         and so does the button; a press before the replay means no replay.
+
+        M032 S6 (``R1_TRANSITION_REPAIR``, default on; off restores all of the above exactly):
+
+        * The replay is L-TRANSITION-AGAIN ("Of course, here it is again." and the brief's body),
+          once.  A request for a SHORTER brief (``is_short_brief_request``) gets the short recap
+          L-TRANSITION-RECAP, and so does any later brief request once the replay is used; the
+          recaps share one budget of ``RECAP_LIMIT`` per session.  Once both budgets are used a
+          brief request gets L-TRANSITION-REASK: the nudge never answers a request for the brief.
+        * A question about the role-play itself (``names_the_roleplay``) never reaches the model:
+          the replay while it is unused, else the recap, else the nudge.
+        * "Are you there?" (``is_presence_check``) gets L-PRESENT ("Yes, I'm here.") and
+          L-TRANSITION-REASK.
+        * An answer that already ends with a question of its own carries no start question
+          (never two questions in one turn, and never two answers in a row without one); after the
+          brief's either/or question the answers' start questions rotate through shorter forms.
+        * The button pressed while a brief, the replay or the recap was playing gets
+          L-PICKUP-BRIDGE ("Great, here she is.") before the pickup; ``session_facts`` records
+          ``start_by`` and ``pressed_during`` (labels) and ``transition_recaps`` (a count).
+
+        Consent is unchanged throughout: only a spoken "ready" (or a start phrase,
+        ``is_transition_consent``) or the "I'm ready" button starts the role-play.
         """
         self._drop_stale_turns()
         self._transition_lines.clear()
@@ -6525,13 +8689,22 @@ class R1Interview:
             return ceiling + self._transition_paused_seconds - loop.time()
 
         def interrupted() -> bool:
-            return self._ready_latched or self._brief_due() or bool(self._transition_lines)
+            return (
+                self._ready_latched
+                or self._brief_due()
+                or self._recap_due()
+                or bool(self._transition_lines)
+            )
 
         step = 0  # the silence steps used since the candidate last spoke
         while not self._ready_latched:
             if self._brief_due():
                 if await self._repeat_brief():
                     break  # a consent during the replay
+                continue
+            if self._recap_due():
+                if await self._say_recap():
+                    break  # a consent during the recap (M032 S6)
                 continue
             if self._transition_lines:
                 await self.say(self._transition_lines.popleft())
@@ -6563,12 +8736,22 @@ class R1Interview:
         # learner is picking up), so the page is not asked and the handler ignores it.
         self._awaiting_ready = False
         self._transition_lines.clear()
+        self._start_by = "button" if self._ready_latched else "spoken"
+        # M032 S6 item 6: a press while a brief was playing gets a short bridge before the pickup,
+        # so the brief's either/or question does not hang unanswered.
+        bridge = (
+            self._ready_latched
+            and transition_repair_enabled()
+            and self._pressed_during in ("brief", "replay", "recap", "answer")
+        )
         # The pickup is uninterruptible: a candidate still speaking ("Yes, let's start, and ...")
         # is not talked over (aa166f09 review), within the endpointing maximum and a margin.
         await self._wait_while_candidate_speaks(
             endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
         )
         if self._candidate_present:
+            if bridge and not self._pickup_spoken:
+                await self.say("L-PICKUP-BRIDGE")
             await self._speak_pickup_once()
         return None
 
@@ -6593,22 +8776,54 @@ class R1Interview:
         """The candidate asked to hear the brief again, and it has not been replayed yet."""
         return self._brief_requested and not self._brief_repeated
 
-    async def _repeat_brief(self) -> bool:
-        """Replay L-TRANSITION once; True when the candidate said ready while it played.
+    def _recap_due(self) -> bool:
+        """M032 S6: the candidate asked for the short recap (SWEEP-29), and it has not played."""
+        return self._recap_requested
 
-        The line is the owner-approved one, verbatim (no new wording to approve), cached and
-        uninterruptible like the first time, and its second transcript row is the bot's own.
-        What the candidate said during it was queued: a ready counts, the rest is dropped.
+    async def _repeat_brief(self) -> bool:
+        """Replay the brief once; True when the candidate said ready while it played.
+
+        The line is the owner-approved one the candidate heard, verbatim (no new wording to
+        approve): L-TRANSITION, or L-TRANSITION-BRIDGED when the transition bridge's reaction
+        came first (M032 S5; its thanks is not added back mid-way through the transition).  It
+        is cached and uninterruptible like the first time, and its second transcript row is the
+        bot's own.  What the candidate said during it was queued: a ready counts, the rest is
+        dropped.
         """
         self._brief_repeated = True
         self._brief_requested = False
         _log.info("unknown_event", error_type="r1_brief_repeat")
-        await self.say("L-TRANSITION")
+        self._brief_playing = "replay"
+        try:
+            await self.say(self._brief_line_id(replay=True))
+        finally:
+            self._brief_playing = None
+        return self._consent_queued()
+
+    def _consent_queued(self) -> bool:
+        """Drain what the candidate said over a replay or a recap: True when a consent was in it."""
         ready = False
         while not self._turns.empty():
             if is_transition_consent(self._turns.get_nowait()):
                 ready = True
         return ready
+
+    async def _say_recap(self) -> bool:
+        """M032 S6 (item 2, SWEEP-29): the short recap; True when the candidate said ready over it.
+
+        L-TRANSITION-RECAP (public brief fields only, about 15 s, the either/or question at its
+        end), uninterruptible like the replay; at most ``RECAP_LIMIT`` per session.  A consent said
+        during it picks up right after it, as during the replay.
+        """
+        self._recap_requested = False
+        self._recaps_played += 1
+        _log.info("unknown_event", error_type="r1_brief_recap", option_count=self._recaps_played)
+        self._brief_playing = "recap"
+        try:
+            await self.say("L-TRANSITION-RECAP")
+        finally:
+            self._brief_playing = None
+        return self._consent_queued()
 
     async def _run_roleplay(self) -> str | None:
         """Run the learner role-play until R=20:00, its S cap, the candidate's end, or a stop.
@@ -6831,14 +9046,18 @@ class R1Interview:
             await self._start_recorder()
             # The driver, not on_enter, speaks the opening so the icebreaker clock and
             # its silence window begin only once the candidate has heard the question.
-            await self.say("L-OPEN")
+            stop = await self._run_opening()
+            if stop is not None:
+                outcome = await self._finish_stop(stop)
+                return outcome
             self._enter(R1Phase.ICEBREAKER)
             stop = await self._run_icebreaker()
+            self._log_icebreaker_plan()
             if stop is not None:
                 outcome = await self._finish_stop(stop)
                 return outcome
             self._enter(R1Phase.TRANSITION)
-            await self.say("L-TRANSITION")
+            await self._say_brief()
             stop = await self._run_transition()
             if stop is not None:
                 outcome = await self._finish_stop(stop)

@@ -127,7 +127,24 @@ import r1_world
 # revision, the learner: the card's call direction and work answers (M4, L4), three more curiosity
 # topics and a check-in-done note that never closes (L1), the intent shapes (L2), the F4 push's
 # refer-back and the decider and budget notes (L5, L7).
-PINNED_CONTENT_SHA256 = "9f5d7bf6a039aca045c1409247b2b693f7acaf57d4fcd621c937b7116e4edabc"
+# Revision 21 (M032 S5, owner go of 2026-11-11): Christy's voice text inside the interviewer prefix
+# and her delivery rider (R1_INTERVIEWER_VOICE).  The manifest pins the voiced prefix whatever the
+# flag says.  Same revision: the icebreaker plan's objectives, fallback questions, per-turn notes and
+# "Take your time." (r1_icebreaker, R1_ICEBREAKER_PLAN).  Same revision: the transition bridge's
+# note and limits and L-TRANSITION-BRIDGED, the brief without its thanks (R1_TRANSITION_BRIDGE).
+# Same revision (review fixes): the icebreaker note tail for a skip request and the notes once
+# every objective is reached (a decline, a repeat request, a skip request).
+# Revision 22 (M032 S6, R1_TRANSITION_REPAIR): the brief from one shared body, its replay and short
+# recap, "Yes, I'm here.", the pickup bridge, the rotated start questions, the new pickup and coach
+# aside, revision 21's texts under -V20 ids, and the transition note that asks nothing itself.
+# Same revision, the icebreaker repair (R1_ICEBREAKER_REPAIR): L-IB-HOLD, the repeated question's
+# template, the presence opener notes and the hold's limits.
+# Revision 23 (M032 S7C, the sweep's Christy follow-ups): the opening's hello with a sound check
+# and its agendas (L-OPEN-HELLO, -HELLO-AGAIN, L-OPEN-AGENDA, -PLAIN, -CONTINUE;
+# R1_OPENING_SOUND_CHECK), the never-heard ladder (L-SIL-NOAUDIO, L-SIL-END-NOAUDIO;
+# R1_NO_AUDIO_LADDER) and the mute aside by phase (L-MUTE-RP, L-MUTE-IV; R1_MUTE_ASIDE_V2).  L-OPEN
+# and L-MUTE are unchanged.
+PINNED_CONTENT_SHA256 = "261ad5751e99d64e1bcfebfcd5b21bc0f667c321ec48577fc8e2cacf54b1379c"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -140,6 +157,7 @@ CONTENT_MODULES = (
     "r1_tracker",
     "r1_end_intent",
     "r1_guard",
+    "r1_icebreaker",
     "r1_prompts",
     "r1_content",
     "r1_roleplay",

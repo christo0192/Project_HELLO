@@ -91,9 +91,9 @@ class TableTests(unittest.TestCase):
         self.assertIn("a sales role-play of up to twenty minutes", LINES["L-OPEN"])
         self.assertNotIn("twenty-minute", LINES["L-OPEN"])
         # The owner's ask: the role-play's length and the goal (convince the learner) are said
-        # plainly at its start.
-        self.assertIn("The role-play runs for up to twenty minutes", LINES["L-TRANSITION"])
-        self.assertIn("in that time your goal is to convince her", LINES["L-TRANSITION"])
+        # plainly at its start (M032 S6 / SWEEP-30 option A keeps "convince her").
+        self.assertIn("You'll have up to twenty minutes", LINES["L-TRANSITION"])
+        self.assertIn("your goal is to convince her as you would on a real call", LINES["L-TRANSITION"])
         self.assertNotIn("runs for twenty minutes", LINES["L-TRANSITION"])
         self.assertNotIn("fourteen", LINES["L-TRANSITION"])
         self.assertIn("'Let's pause the role-play here.'", LINES["L-TRANSITION"])
@@ -204,7 +204,7 @@ class RenderTests(unittest.TestCase):
         rendered = resolve_persona("p1_career_switcher", variant="v1")
         text = line("L-TRANSITION", first_name="Arjun", **rendered.line_values)
         self.assertIn("Thank you, Arjun.", text)
-        self.assertIn("The learner is Meera Iyer from Edison, New Jersey, who filled in", text)
+        self.assertIn("I'll play Meera Iyer from Edison, New Jersey, who filled in", text)
         self.assertNotIn("{", text)
 
     def test_every_persona_variant_renders_every_persona_line(self):
@@ -212,13 +212,20 @@ class RenderTests(unittest.TestCase):
             for variant in persona.variants:
                 rendered = resolve_persona(persona.id, variant=variant.id)
                 values = rendered.line_values
+                # M032 S6 item 8: no answer to a question nobody asked.
+                self.assertEqual(line("L-PICKUP", **values), f"Hello, {variant.first_name} speaking.")
                 self.assertEqual(
-                    line("L-PICKUP", **values),
+                    line("L-PICKUP-V20", **values),
                     f"Hello? Yes, this is {variant.first_name} speaking.",
                 )
                 self.assertEqual(rendered.pickup_line, line("L-PICKUP", **values))
+                # SWEEP-30: Christy says she is PLAYING the learner, never "I'm the learner ... She".
                 aside = line("L-ASIDE-COACH", **values)
-                self.assertIn(f"I'm the learner, {variant.full_name}.", aside)
+                self.assertIn(f"I'm playing the learner, {variant.full_name}, who enquired", aside)
+                self.assertNotIn("I'm the learner", aside)
+                self.assertIn(
+                    f"I'm the learner, {variant.full_name}.", line("L-ASIDE-COACH-V20", **values)
+                )
                 self.assertNotIn(", NJ", line("L-TRANSITION", first_name="A", **values))
                 for state in (", TX", ", NC", ", GA", ", MA"):
                     self.assertNotIn(state, line("L-TRANSITION", first_name="A", **values))
@@ -273,7 +280,11 @@ class UnknownNameTests(unittest.TestCase):
         values = self.persona_values()
         expected = {
             "L-OPEN": "Hi, I'm Christy, an AI interviewer from Interview Kickstart, and I'll",
-            "L-TRANSITION": "Thank you. We'll now move to the role-play. I'll play a prospective",
+            "L-OPEN-HELLO": "Hi, I'm Christy, an AI interviewer from Interview Kickstart. Can you",
+            "L-TRANSITION": "Thank you. Next, let's do a sales role-play. I'll play",
+            "L-TRANSITION-V20": (
+                "Thank you. We'll now move to the role-play. I'll play a prospective"
+            ),
             "L-CLOSE": (
                 "Thank you for your time today. The hiring team will review your interview and "
                 "get back to you. You can close this window now. Goodbye."
@@ -409,6 +420,264 @@ class ConsensualEndLineTests(unittest.TestCase):
             with self.subTest(word=word):
                 self.assertNotIn(word, text)
         self.assertNotIn("pause the role-play", LINES["L-ASIDE-WRAP-RESUME"].lower())
+
+
+class TransitionBridgeLineTests(unittest.TestCase):
+    """M032 S5 item 4: the brief after Christy's own reaction does not thank the candidate again.
+
+    L-TRANSITION-BRIDGED is L-TRANSITION without "Thank you, {first_name}." (the reaction sentence
+    took its place), so it carries no candidate name and can be kept on disk once per machine.
+    """
+
+    OPENER = "Thank you, {first_name}. "
+
+    def test_it_is_the_brief_without_its_thanks(self):
+        self.assertTrue(LINES["L-TRANSITION"].startswith(self.OPENER))
+        self.assertEqual(
+            LINES["L-TRANSITION-BRIDGED"], LINES["L-TRANSITION"][len(self.OPENER) :]
+        )
+        self.assertEqual(placeholders("L-TRANSITION-BRIDGED"), {"lead_name", "lead_city"})
+        self.assertIn("L-TRANSITION-BRIDGED", CANDIDATE_FREE_LINES)
+        self.assertNotIn("thank", LINES["L-TRANSITION-BRIDGED"].lower())
+        self.assertTrue(LINES["L-TRANSITION-BRIDGED"].endswith(
+            "Shall we start the role-play now, or do you have any questions first?"
+        ))
+
+
+class TransitionRepairLineTests(unittest.TestCase):
+    """M032 S6 (items 4, 5, 6, 8; SWEEP-29, -30, -32): the brief from one body, its replay and
+    recap, the presence and pickup lines, the rotated start questions, and the rollback ids."""
+
+    V20 = (
+        "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective "
+        "learner so we can evaluate how you handle a real sales call. The learner is "
+        "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
+        "Science course a few days ago. You're the Program Advisor calling her back. The "
+        "role-play runs for up to twenty minutes, and in that time your goal is to convince "
+        "her: understand her needs and help her decide to enrol, as you would on a real call, "
+        "using the course details from your preparation guide. I'll stay in character until I "
+        "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
+        "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
+    )
+    EITHER_OR = "Shall we start the role-play now, or do you have any questions first?"
+    BRIEFS = ("L-TRANSITION", "L-TRANSITION-BRIDGED", "L-TRANSITION-AGAIN")
+
+    @staticmethod
+    def words(text: str) -> int:
+        """Words, with each placeholder counted as one."""
+        return len(re.sub(r"\{[a-z_]+\}", "X", text).split())
+
+    def test_the_three_briefs_share_one_body(self):
+        thanks, body = "Thank you, {first_name}. ", LINES["L-TRANSITION-BRIDGED"]
+        self.assertEqual(LINES["L-TRANSITION"], thanks + body)
+        self.assertEqual(body, r1_script.BRIEF_BODY)
+        tail = body[body.index("I'll play {lead_name}"):]
+        self.assertEqual(LINES["L-TRANSITION-AGAIN"], "Of course, here it is again. " + tail)
+        self.assertIn(r1_script.BRIEF_GOAL, body)
+
+    def test_the_brief_says_less_once_and_keeps_what_the_candidate_needs(self):
+        text = LINES["L-TRANSITION"]
+        self.assertLessEqual(self.words(text), 105)
+        longest = 0
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                values = resolve_persona(persona.id, variant=variant.id).line_values
+                longest = max(longest, len(line("L-TRANSITION", first_name="Mary-Ann", **values).split()))
+        self.assertLessEqual(longest, 112)
+        for line_id in self.BRIEFS:
+            with self.subTest(line=line_id):
+                brief = LINES[line_id]
+                self.assertEqual(brief.count("twenty minutes"), 1)
+                self.assertNotIn("evaluate", brief)
+                self.assertNotIn("We'll now move", brief)
+                self.assertNotIn("she'll pick up", brief)
+                self.assertEqual(brief.count("just say 'ready'"), 1)
+                self.assertTrue(brief.endswith("To begin, just say 'ready'. " + self.EITHER_OR))
+                for kept in ("{lead_name}", "{lead_city}", "Data Science course", "calling her back",
+                             "help her decide to enrol",
+                             "using the course details from your preparation guide",
+                             f"'{EXIT_CUE}'", "convince her"):
+                    self.assertIn(kept, brief)
+        self.assertNotIn("first_name", placeholders("L-TRANSITION-AGAIN"))
+        self.assertIn("L-TRANSITION-AGAIN", CANDIDATE_FREE_LINES)
+
+    def test_the_rollback_ids_hold_revision_21s_text(self):
+        self.assertEqual(LINES["L-TRANSITION-V20"], self.V20)
+        self.assertEqual(
+            LINES["L-TRANSITION-BRIDGED-V20"], self.V20[len("Thank you, {first_name}. "):]
+        )
+        self.assertEqual(
+            r1_script.ROLLBACK_LINES,
+            {
+                "L-TRANSITION": "L-TRANSITION-V20",
+                "L-TRANSITION-BRIDGED": "L-TRANSITION-BRIDGED-V20",
+                "L-PICKUP": "L-PICKUP-V20",
+                "L-ASIDE-COACH": "L-ASIDE-COACH-V20",
+            },
+        )
+
+    def test_the_flag_picks_the_spoken_id(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.assertFalse(r1_script.transition_repair_enabled())
+            for line_id, old in r1_script.ROLLBACK_LINES.items():
+                self.assertEqual(r1_script.active_line_id(line_id), old)
+            self.assertEqual(r1_script.active_line_id("L-WRAP"), "L-WRAP")
+        for value in ("1", "on", "", "yes"):
+            with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": value}):
+                self.assertTrue(r1_script.transition_repair_enabled())
+                for line_id in r1_script.ROLLBACK_LINES:
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id)
+
+    def test_the_recap_is_short_public_and_ends_with_the_either_or_question(self):
+        recap = LINES["L-TRANSITION-RECAP"]
+        self.assertEqual(placeholders("L-TRANSITION-RECAP"), {"lead_name"})
+        self.assertIn("L-TRANSITION-RECAP", CANDIDATE_FREE_LINES)
+        self.assertTrue(recap.startswith("Of course, in short: I'll play {lead_name}"))
+        goal = r1_script.BRIEF_GOAL
+        self.assertIn(goal[:1].upper() + goal[1:], recap)
+        self.assertTrue(recap.endswith(self.EITHER_OR))
+        self.assertLessEqual(self.words(recap), 46)  # about 15 s
+        for private in ("$", "7,000", "budget", "husband", "worried", "price"):
+            self.assertNotIn(private, recap)
+
+    def test_the_short_lines(self):
+        self.assertEqual(LINES["L-PRESENT"], "Yes, I'm here.")
+        self.assertEqual(LINES["L-PICKUP-BRIDGE"], "Great, here she is.")
+        self.assertEqual(
+            LINES["L-IB-HOLD"], "Of course, take a moment. I'm here when you're ready."
+        )
+        for line_id in ("L-PRESENT", "L-PICKUP-BRIDGE", "L-IB-HOLD"):
+            self.assertIn(line_id, NAME_FREE_LINES)
+
+    def test_the_rotated_start_questions_stay_either_or(self):
+        # SWEEP-32: shorter forms after the brief's question was heard; a bare "yes" to an
+        # either/or question still gets the nudge, so every form offers both.
+        self.assertEqual(LINES["L-TRANSITION-ASK-2"], "Anything else, or shall we start?")
+        self.assertEqual(
+            LINES["L-TRANSITION-ASK-3"], "Any other questions, or shall we begin the role-play?"
+        )
+        for line_id in ("L-TRANSITION-ASK", "L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3"):
+            text = LINES[line_id]
+            self.assertIn(", or ", text)
+            self.assertTrue(text.endswith("?"))
+            self.assertIn(line_id, NAME_FREE_LINES)
+
+
+class OpeningSoundCheckLineTests(unittest.TestCase):
+    """M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``): a short hello with a sound check, then a
+    shorter agenda.  Every text is word for word the spec's (owner and HR review, D-M032-4)."""
+
+    AGENDAS = ("L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE")
+
+    def test_the_texts_word_for_word(self):
+        self.assertEqual(
+            LINES["L-OPEN-HELLO"],
+            "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart. Can you "
+            "hear me okay?",
+        )
+        self.assertEqual(
+            LINES["L-OPEN-HELLO-AGAIN"],
+            "Sorry about that. Please check your speaker or headphone volume. Can you hear me now?",
+        )
+        agenda = (
+            "This first-round interview takes about thirty minutes: we'll get to know each "
+            "other, then do a sales role-play of up to twenty minutes, and you can ask me "
+            "questions at the end."
+        )
+        first = "So, to begin, tell me a bit about yourself and your sales or customer-facing work."
+        self.assertEqual(LINES["L-OPEN-AGENDA"], f"Good, I can hear you. {agenda} {first}")
+        self.assertEqual(LINES["L-OPEN-AGENDA-PLAIN"], f"Let's get started. {agenda} {first}")
+        self.assertEqual(
+            LINES["L-OPEN-AGENDA-CONTINUE"],
+            f"Good, I can hear you. {agenda} Please, carry on with what you were telling me.",
+        )
+
+    def test_the_hello_carries_the_disclosure_and_the_name_and_reads_without_one(self):
+        self.assertEqual(placeholders("L-OPEN-HELLO"), {"first_name"})
+        self.assertIn("AI interviewer", LINES["L-OPEN-HELLO"])
+        self.assertFalse(is_candidate_free("L-OPEN-HELLO"))
+        self.assertTrue(
+            line("L-OPEN-HELLO", first_name="Arjun").startswith("Hi Arjun, I'm Christy, an AI")
+        )
+        self.assertEqual(
+            line("L-OPEN-HELLO", first_name=""),
+            "Hi, I'm Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?",
+        )
+
+    def test_every_agenda_keeps_the_owner_durations_once_and_is_short(self):
+        for line_id in self.AGENDAS:
+            text = LINES[line_id]
+            with self.subTest(line=line_id):
+                self.assertEqual(text.count("thirty minutes"), 1)
+                self.assertEqual(text.count("up to twenty minutes"), 1)
+                self.assertLessEqual(len(text.split()), 55)
+                for banned in ("short", "Let's start:", "{", "couple of minutes", "few minutes"):
+                    self.assertNotIn(banned, text)
+                self.assertIn(line_id, NAME_FREE_LINES)
+        self.assertIn("L-OPEN-HELLO-AGAIN", NAME_FREE_LINES)
+        # The plain agenda is the one said when nothing was heard in reply: no "I can hear you".
+        self.assertNotIn("hear you", LINES["L-OPEN-AGENDA-PLAIN"])
+        # The agenda asks the icebreaker plan's first objective (background and sales work), as
+        # L-OPEN did; the continue variant asks nothing new.
+        self.assertIn("sales or customer-facing work", LINES["L-OPEN-AGENDA"])
+        self.assertNotIn("?", LINES["L-OPEN-AGENDA-CONTINUE"])
+
+    def test_the_flag_off_opening_is_unchanged(self):
+        self.assertEqual(
+            LINES["L-OPEN"],
+            "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll "
+            "be running your first-round interview for the Sales Program Advisor role. It takes "
+            "about thirty minutes. We'll spend a few minutes getting to know you, then I'll switch "
+            "into a sales role-play of up to twenty minutes where I play a prospective learner, "
+            "and we'll finish with a couple of minutes for your questions. Let's start: could you "
+            "walk me through your background, especially any sales or customer-facing work "
+            "you've done?",
+        )
+
+
+class NoAudioAndMuteLineTests(unittest.TestCase):
+    """M032 S7C: the never-heard ladder (SWEEP-34) and the mute aside by phase (SWEEP-36)."""
+
+    def test_the_no_audio_texts_word_for_word(self):
+        self.assertEqual(
+            LINES["L-SIL-NOAUDIO"],
+            "I can't hear anything from you yet. If you're speaking, please check that "
+            "your microphone is switched on and selected.",
+        )
+        self.assertEqual(
+            LINES["L-SIL-END-NOAUDIO"],
+            "I still can't hear you, so I'll have to stop here for now. The hiring team will "
+            "be in touch. Goodbye.",
+        )
+        for line_id in ("L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"):
+            text = LINES[line_id]
+            self.assertIn(line_id, NAME_FREE_LINES)
+            # Hedged: no lost connection, no claim about whether the attempt counts.
+            for banned in ("lost", "connection", "count", "still with me"):
+                self.assertNotIn(banned, text)
+
+    def test_the_mute_texts_word_for_word_and_neither_says_ready(self):
+        self.assertEqual(
+            LINES["L-MUTE-RP"],
+            "This is Christy, your interviewer. Your microphone seems to be muted. Please "
+            "unmute it so we can carry on.",
+        )
+        self.assertEqual(
+            LINES["L-MUTE-IV"],
+            "Your microphone seems to be muted. Please unmute it so I can hear you.",
+        )
+        for line_id in ("L-MUTE-RP", "L-MUTE-IV"):
+            self.assertNotIn("ready", LINES[line_id].lower())
+            self.assertIn(line_id, NAME_FREE_LINES)
+        self.assertNotIn("Christy", LINES["L-MUTE-IV"])  # her own phase: no self-introduction
+        self.assertEqual(
+            LINES["L-MUTE"],
+            "This is Christy. It looks like your microphone may be muted. Please unmute when "
+            "you're ready.",
+        )
 
 
 if __name__ == "__main__":

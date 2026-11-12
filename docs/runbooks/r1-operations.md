@@ -1728,7 +1728,7 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   fails its letters-only test, and six scripted lines splice the name in after a comma ("Thank you,
   there."). `r1_script.known_first_name` treats an empty value, a rejected value, `there` (any case)
   and a single letter as unknown, and `r1_script.line` then deletes the `{first_name}` slot together
-  with its comma: "Thank you. We'll now move to the role-play", "Hi, I'm Christy", "Are you still
+  with its comma: "Thank you. Next, let's do a sales role-play", "Hi, I'm Christy", "Are you still
   with me?", "Welcome back.", "I'm sorry, we need to stop here". The API is unchanged. The provisional
   `r1_lines.py` mirrors it (the drift test pins both).
 * **The name the candidate gives.** While the record has no usable name, a self-introduction in the
@@ -2201,6 +2201,139 @@ Live check (labels only): per session `r1_turn_plan` is absent in the transition
 plan), the bot rows of phase `transition` show Christy's answers each ending with the start
 question, and the pickup row follows a candidate row that agrees. A session with
 `r1_transition_ceiling`, or one that ended `candidate_left` in the transition, is worth a look.
+
+### The brief and the transition, repaired (M032 S6, owner go 2026-11-11)
+
+Owner tests fda9e9f6 and 8f5bfefc: two requests for the brief got "What would you like to know?"
+and the job's shift timings, "Are you there?" got nothing, a request for the brief "in about four
+lines" got the nudge and then the whole 44 s brief again, the replay said "We'll now move to the
+role-play" three minutes in, the start question was heard four times in 2.5 minutes, and an answer
+asked a question of its own before the start question. `R1_TRANSITION_REPAIR` (default on) changes:
+
+* **One brief body** (`r1_script.BRIEF_BODY`): L-TRANSITION is "Thank you, {first_name}. " plus
+  the body, L-TRANSITION-BRIDGED the body alone, the replay L-TRANSITION-AGAIN "Of course, here it
+  is again. " plus the body from "I'll play", and the short recap L-TRANSITION-RECAP reuses the
+  goal clause (`BRIEF_GOAL`). No "We'll now move to the role-play", no "evaluate", one start prompt
+  ("To begin, just say 'ready'." and the either/or question). Consent is unchanged: only "ready"
+  (or a start phrase) or the button.
+* **Routing** (`R1Interview._repaired_transition_action`): a wider brief request (summary, recap,
+  overview, "tell me about the role play again", more details on it, the learner's name) gets the
+  replay once; a request for a shorter one (`is_short_brief_request`) gets the recap; the recaps
+  share a budget of 2 (`RECAP_LIMIT`); once both are used, L-TRANSITION-REASK, never the nudge. A
+  question about the role-play itself never goes to the model (replay, recap, then the nudge):
+  one that names it, the brief, "the scenario", the learner or her name, or asks who they will
+  call, which course it is, who calls whom or whether it is a cold call. "The lead generation",
+  "the learner profile", "the prospect of growth" and "in what scenario" are job questions, and
+  so is a generic ask about a job topic ("Could you explain the incentive structure?") or about
+  "that" right after Christy's answer (`asks_about_the_job`): the model answers them. A
+  presence check gets L-PRESENT ("Yes, I'm here.") and L-TRANSITION-REASK. When her answer ended
+  with a question of its own, a bare "Yes." or "No." is answered by the model too.
+* **Start questions**: the transition note (`TRANSITION_REMINDER_REPAIRED`) says "Of course, go
+  ahead." to a request to ask and never ends an answer with a question; an answer that asks anyway
+  drops the start question (not twice in a row; `r1_transition_tail_dropped`), and after the brief
+  the answers' start questions rotate (L-TRANSITION-ASK-2, -3).
+* **Pickup**: "Hello, {lead_first_name} speaking."; the button pressed during a brief (or while
+  it is on its way: "Yes, I'm here." or the bridge's compose), the replay, the recap or Christy's
+  answer to a question gets L-PICKUP-BRIDGE ("Great, here she is.") first. L-ASIDE-COACH says
+  Christy is playing the learner.
+* **session_facts** gains `start_by` (button/spoken), `pressed_during`
+  (brief/replay/recap/answer/wait, button only) and `transition_recaps` (a count); the API
+  parser reads none of them.
+
+Logs (labels only): `r1_brief_requested`, `r1_brief_recap_requested`, `r1_brief_recap`,
+`r1_brief_repeat`, `r1_transition_presence`, `r1_transition_tail_dropped`. Content revision 22;
+revision 21's lines stay pinned under -V20 ids. The four new `say` lines are warmed only while the
+flag is on. Rollback: `fly secrets set R1_TRANSITION_REPAIR=0 -a project-hello-voice` restores
+revision 21's brief, replay, nudge, pickup, aside, note and routing exactly.
+
+### Icebreaker repairs (M032 S6, owner go 2026-11-11)
+
+Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the
+soft exit got the brief instead, "Sorry, I was not able to hear you" counted as an answer, a request
+for a minute got "I can't pause" and a new question, and a two-word thank-you cut her reply.
+
+* **`R1_ICEBREAKER_REPAIR`** (default on). Once the soft exit is due and before S = 4:30, the
+  first request to repeat the question (`is_repeat_request`: repeat, rephrase, say it again, what
+  did you say, didn't catch or hear, a bare "Sorry?" or "Pardon?") gets "Of course. {question}"
+  (the last question of Christy's own reply; no model call, no answer counted, the S5 plan
+  unchanged) and the next answer is the boundary. "Are you there?" at the boundary gets L-PRESENT
+  ("Yes, I'm here.") before the brief; any repair turn at the boundary gets the brief without
+  "Thank you, {first_name}." (L-TRANSITION-BRIDGED). Mid-icebreaker, a reply to "Are you there?"
+  is told to open with "Yes, I'm here." (with an apology after a 6 s wait); the plan still decides
+  the question. A hold request ("Can you give me a minute?") gets L-IB-HOLD ("Of course, take a
+  moment. I'm here when you're ready."), is no answer, and the next silence window is 60 s (once
+  per session, never past S = 4:30); with under 15 s left nothing is promised and the turn ends
+  the icebreaker. The repair readers also read "once again", "not able to hear" and "I'm sorry",
+  and look past "sir", "ma'am", Christy's name and a leading "hold on" / "wait". A hold is a
+  directed request with nothing else in the turn: "I usually wait a minute and then call back"
+  is an answer, and "Hold on, what was the question?" a repeat request. The question repeated is
+  the one of Christy's LAST model reply (its imperative prompt if it asked with one; the plan's
+  current question when it was cut before its question). Right after the hold or the repeat
+  line, "Okay." or "Thank you." answers nothing (no reply, not the boundary; after a repeated
+  yes/no question, "Okay." or "Yes." is its answer). A hold or repeat line cancelled before any
+  audio gives its once-per-session budget back, and the request is read with the turn that cut
+  it. Counts: `icebreaker_repeat_deferrals`, `boundary_presence_lines`, `ib_holds`. Logs:
+  `r1_icebreaker_repeat`, `r1_icebreaker_hold`, `r1_icebreaker_presence_opener`,
+  `r1_icebreaker_boundary_presence`, `r1_icebreaker_quiet_ack`, `r1_icebreaker_repair_undone`.
+  Rollback: `fly secrets set R1_ICEBREAKER_REPAIR=0 -a project-hello-voice`.
+* **`R1_ICEBREAKER_ACK_HOLD`** (default on, only with `R1_ACK_HOLD`). An acknowledgement or a
+  courtesy-only "Thank you" said over Christy's live icebreaker model reply is held back from the
+  SDK like an "Okay" over the learner: written to the row in the icebreaker phase, never counted,
+  planned or carried, and it never stretches the hold at the S = 4:30 cap. Count:
+  `icebreaker_acks_held`. Rollback: `fly secrets set R1_ICEBREAKER_ACK_HOLD=0 -a
+  project-hello-voice`.
+
+### The opening, the never-heard ladder and the mute aside (M032 S7C, owner go 2026-11-11)
+
+Sweep patterns P33, P25 and P62: L-OPEN was one 79-word block of about 29 s with no greeting
+exchange and no hearing check; four sessions of 2026-10-13 in which no candidate audio ever reached
+the worker got "Are you still with me?" and "we seem to have lost the connection"; and "Please
+unmute when you're ready." came in Christy's own phase, after a sub-second blip, and was answered
+"I am ready".
+
+* **`R1_OPENING_SOUND_CHECK`** (default on). The driver says L-OPEN-HELLO ("Hi {first_name}, I'm
+  Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?") and reads the reply
+  in code (`sound_check_reading`; never the model, `reply_suppressed` in OPENING). A reply that
+  heard her gets L-OPEN-AGENDA ("Good, I can hear you." and the agenda, which asks the first
+  icebreaker question); a can't-hear reply (a directed complaint such as "I can't hear your
+  voice", "not able to hear you", "voice is not clear", "I can hear you but it's very low",
+  "Sorry?", "Could you repeat that?", after the question a bare "Hello?" / "What?" or "Are you
+  there?", or a whole-turn "No." / "Not audible." / "Little low." / "It's a bit low.") gets
+  L-OPEN-HELLO-AGAIN once, and a second one L-OPEN-AGENDA-PLAIN; an early answer (12 content words
+  or more that say something about the candidate, such as "I have been working in" or "four years
+  in sales", and do not end on a question to Christy) gets L-OPEN-AGENDA-CONTINUE and counts as one
+  icebreaker answer. Before the agenda the driver waits for the reply to end: one endpointing
+  maximum plus 1 s after the candidate's last speech or final, at most 30 s and the sound check's
+  budget. Silence (10 s) from a candidate who was never heard runs the never-heard ladder below
+  (bounded in the opening by 60 s from its start, `OPEN_NO_AUDIO_HARD_SECONDS`, then the plain
+  agenda); one heard only by the VAD gets the plain agenda, and so does the end of the sound
+  check's 45 s budget. A "Hi" said over the hello is followed by 1.5 s of quiet for the answer.
+  The reply is never an icebreaker answer, whenever its turn commits (`_sound_check_rows`); an
+  answer begun over the agenda is the icebreaker's. Log: `r1_sound_check` (the reading, the agenda
+  id, the can't-hear count; `no_audio_deadline` when the opening's ladder ran out). The hello costs about 5-10 s of S; the soft exit and S = 4:30 are unchanged.
+  Rollback: `fly secrets set R1_OPENING_SOUND_CHECK=0 -a project-hello-voice` (L-OPEN, exactly as
+  before).
+* **`R1_NO_AUDIO_LADDER`** (default on). A candidate who was never heard (no speech, no final;
+  `_candidate_ever_heard`, never reset) and is not muted gets L-SIL-NOAUDIO ("I can't hear anything
+  from you yet. If you're speaking, please check that your microphone is switched on and
+  selected.") and, 30 s later, L-SIL-END-NOAUDIO ("I still can't hear you, so I'll have to stop
+  here for now. The hiring team will be in touch. Goodbye."), in the opening or the icebreaker
+  only. The outcome stays `candidate_left` and attempt counting is unchanged. Log, once:
+  `r1_no_audio` with `no_mic_track`, `not_subscribed` or `no_voice` (labels only). A never-heard
+  close that does not count as an attempt needs its own web card (outside R1). Rollback: `fly
+  secrets set R1_NO_AUDIO_LADDER=0 -a project-hello-voice`.
+* **`R1_MUTE_ASIDE_V2`** (default on). The aside is due once the mute has lasted 1.5 s
+  (`MUTE_ASIDE_DEBOUNCE_SECONDS`) and no candidate turn is in flight (speaking, or a final the SDK
+  has not committed, the role-play's included although ASIDE wrote its row), or 3 s in all
+  (`MUTE_ASIDE_TURN_WAIT_SECONDS`); the mute is checked again before the line, and an episode
+  counts as announced only when a line is spoken. The role-play still enters ASIDE (R paused) at
+  the event. L-MUTE-RP ("This is Christy, your interviewer. Your microphone seems to be muted.
+  Please unmute it so we can carry on.") in the role-play, L-MUTE-IV ("Your microphone seems to be
+  muted. Please unmute it so I can hear you.") in Christy's phases; neither says "ready". Rollback:
+  `fly secrets set R1_MUTE_ASIDE_V2=0 -a project-hello-voice` (the immediate L-MUTE).
+
+Content revision 23; L-OPEN and L-MUTE are unchanged. The new name-free lines are warmed only while
+their flag is on (the agendas first); L-OPEN-HELLO carries the name and is spoken live, like L-OPEN.
 
 ### Leaving the role-play by consent (owner decisions 2026-11-03, M2)
 

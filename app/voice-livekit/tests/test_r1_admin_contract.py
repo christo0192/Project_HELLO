@@ -52,6 +52,7 @@ if str(HERE) not in sys.path:
 import r1_guard
 from r1_phases import R1Phase
 from r1_replies import (
+    EXTRA_FACT_KEYS,
     GUARD_KINDS,
     READER_FACT_KEYS,
     SESSION_FACT_KEYS,
@@ -475,8 +476,12 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         facts = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
         self.assertEqual(len(facts), 1)
         payload = facts[0]["payload"]
-        self.assertEqual(set(payload) - {"pins"}, API_PAYLOAD_KEYS["session_facts"])
+        # M032 S6: the repairs' labels and counts ride along under names the parser never reads.
+        self.assertEqual(
+            set(payload) - {"pins"} - set(EXTRA_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"]
+        )
         self.assertEqual(set(SESSION_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"])
+        self.assertEqual(set(EXTRA_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
         for key in SESSION_FACT_KEYS:
             value = payload[key]
             self.assertTrue(
@@ -519,6 +524,33 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
             source = API_ADMIN_LOG.read_text(encoding="utf-8")
             for key in READER_FACT_KEYS:
                 self.assertNotIn(key, source)
+    async def test_the_repair_facts_are_labels_and_counts_and_off_means_todays_row(self):
+        # M032 S6: start_by / pressed_during are closed labels, the rest counts; with every repair
+        # flag off the row is exactly the one of before.
+        import os
+        from unittest import mock
+
+        row = session_facts_event(
+            None,
+            {"content_sha256": "x"},
+            roleplay_seconds=10.0,
+            extra={"start_by": "button", "pressed_during": "replay", "transition_recaps": 1,
+                   "unknown_key": "dropped"},
+        )
+        self.assertEqual(row["payload"]["start_by"], "button")
+        self.assertEqual(row["payload"]["pressed_during"], "replay")
+        self.assertEqual(row["payload"]["transition_recaps"], 1)
+        self.assertNotIn("unknown_key", row["payload"])
+        off = {
+            "R1_TRANSITION_REPAIR": "0", "R1_ICEBREAKER_REPAIR": "0", "R1_ICEBREAKER_ACK_HOLD": "0",
+        }
+        with mock.patch.dict(os.environ, off):
+            rig = await fidelity_session()
+            rig.interview._begin_exit()
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        (facts,) = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
+        self.assertEqual(set(facts["payload"]) - {"pins"}, API_PAYLOAD_KEYS["session_facts"])
 
     async def test_first_audio_p95_is_the_role_play_p95_of_the_logged_headline_in_ms(self):
         with capture_r1_logs() as lines:

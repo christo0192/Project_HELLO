@@ -23,6 +23,7 @@ from typing import Any
 import r1_commitment
 import r1_end_intent
 import r1_guard
+import r1_icebreaker
 import r1_negotiation
 import r1_personas
 import r1_prompts
@@ -131,7 +132,40 @@ import r1_world
 #    has two shapes and two lengths and answers a dig first (L2); the F4 push refers back to a
 #    decision maker already named (L7), a free reply does not name them again, and a monthly figure
 #    above the card's budget is never "workable" (L5: BUDGET_OVER_NOTE, BUDGET_REPLACEMENT).
-CONTENT_REVISION = 20
+# 21: M032 S5, Christy as interviewer (owner go of 2026-11-11 after the RCA of test fda9e9f6): her
+#    persona and register inside the interviewer prefix (r1_prompts.INTERVIEWER_VOICE_TEXT) and a
+#    per-turn delivery rider on the opening, icebreaker, transition and wrap-up notes
+#    (INTERVIEWER_DELIVERY_RIDER), both behind R1_INTERVIEWER_VOICE.  The manifest pins the prefix
+#    WITH the voice text, whatever the flag says, so the digest never depends on the environment.
+#    Same revision: the icebreaker plan (r1_icebreaker, R1_ICEBREAKER_PLAN): its objectives, their
+#    fallback questions, the per-turn notes that take the getting-to-know-you note's place and
+#    "Take your time." for a candidate who is thinking.  Same revision: the transition bridge
+#    (R1_TRANSITION_BRIDGE, off by default): the note Christy's one-sentence reaction to the last
+#    icebreaker answer is composed under, its limits, and L-TRANSITION-BRIDGED, the brief without
+#    "Thank you, {first_name}." that follows the reaction.
+#    Same revision (review fixes): the note tail for a request to skip ahead
+#    (PLAN_NOTE_TAIL_SKIP) and the notes once every objective is reached (FREE_JOB_NOTES).
+# 22: M032 S6, the brief and the transition repaired (owner go of 2026-11-11, tests fda9e9f6 and
+#    8f5bfefc; R1_TRANSITION_REPAIR): one shared body for every brief (r1_script.BRIEF_BODY), so
+#    L-TRANSITION, L-TRANSITION-BRIDGED, the replay L-TRANSITION-AGAIN ("Of course, here it is
+#    again.") and the short recap L-TRANSITION-RECAP cannot drift apart, with no "We'll now move to
+#    the role-play", no "evaluate" and ONE start prompt; L-PRESENT ("Yes, I'm here."),
+#    L-PICKUP-BRIDGE, the rotated start questions L-TRANSITION-ASK-2/-3, the pickup "Hello, {lead}
+#    speaking.", and L-ASIDE-COACH saying Christy is PLAYING the learner.  Revision 21's texts stay
+#    pinned under their -V20 ids, which R1_TRANSITION_REPAIR=0 speaks.  The transition note that
+#    asks nothing itself (r1_prompts.TRANSITION_REMINDER_REPAIRED) joins the manifest.  Same
+#    revision, the icebreaker repair (r1_icebreaker, R1_ICEBREAKER_REPAIR): "Of course, take a
+#    moment. I'm here when you're ready." (L-IB-HOLD), the repeated question's template "Of course.
+#    {question}", the opener notes for a reply to "Are you there?" and the hold's limits.
+# 23: M032 S7C, the Christy follow-ups of the sweep (owner go of 2026-11-11).  The opening as a
+#    short hello with a sound check, then a shorter agenda from one shared body
+#    (R1_OPENING_SOUND_CHECK, SWEEP-35): L-OPEN-HELLO ("Can you hear me okay?"),
+#    L-OPEN-HELLO-AGAIN, L-OPEN-AGENDA, L-OPEN-AGENDA-PLAIN and L-OPEN-AGENDA-CONTINUE; L-OPEN is
+#    the flag-off line, unchanged.  A candidate who was never heard gets L-SIL-NOAUDIO and
+#    L-SIL-END-NOAUDIO (R1_NO_AUDIO_LADDER, SWEEP-34).  The mute aside by phase, neither with
+#    "ready" in it: L-MUTE-RP and L-MUTE-IV (R1_MUTE_ASIDE_V2, SWEEP-36); L-MUTE is the flag-off
+#    line, unchanged.
+CONTENT_REVISION = 23
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -318,10 +352,13 @@ def manifest() -> dict[str, Any]:
             "flag_threshold": r1_guard.HIT_FLAG_THRESHOLD,
         },
         "prompts": {
-            "interviewer_prefix": r1_prompts.interviewer_prefix(),
+            "interviewer_prefix": r1_prompts.interviewer_prefix(voice=True),
+            "interviewer_voice_text": r1_prompts.INTERVIEWER_VOICE_TEXT,
+            "interviewer_delivery_rider": r1_prompts.INTERVIEWER_DELIVERY_RIDER,
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,
+            "transition_reminder_repaired": r1_prompts.TRANSITION_REMINDER_REPAIRED,
             "getting_to_know_you_note": r1_prompts.GETTING_TO_KNOW_YOU_NOTE,
             "learner_prefixes": {
                 f"{p.id}.{v.id}": r1_prompts.learner_prefix(r1_personas.resolve_persona(
@@ -416,6 +453,43 @@ def manifest() -> dict[str, Any]:
             "react_how_it_lands": r1_prompts.REACT_HOW_IT_LANDS,
             "reaction_only_note": r1_prompts.REACTION_ONLY_NOTE,
             "forced_note": r1_prompts.FORCED_NOTE,
+        },
+        "icebreaker": {
+            "objectives": [
+                {"id": item.id, "goal": item.goal, "restate": item.restate}
+                for item in r1_icebreaker.OBJECTIVES
+            ],
+            "free_restate": r1_icebreaker.FREE_RESTATE,
+            "take_your_time": r1_icebreaker.TAKE_YOUR_TIME,
+            "plan_note_head": r1_icebreaker.PLAN_NOTE_HEAD,
+            "plan_note_tail": r1_icebreaker.PLAN_NOTE_TAIL,
+            "plan_note_tail_skip": r1_icebreaker.PLAN_NOTE_TAIL_SKIP,
+            "asked_note": r1_icebreaker.ASKED_NOTE,
+            "skip_note": r1_icebreaker.SKIP_NOTE,
+            "job_notes": dict(r1_icebreaker.JOB_NOTES),
+            "free_job_notes": dict(r1_icebreaker.FREE_JOB_NOTES),
+            "constants": {
+                "thin_words": r1_icebreaker.THIN_WORDS,
+                "decline_max_words": r1_icebreaker.DECLINE_MAX_WORDS,
+                "max_holds": r1_icebreaker.MAX_HOLDS,
+                "max_follow_ups": r1_icebreaker.MAX_FOLLOW_UPS,
+            },
+            "transition_bridge": {
+                "note": r1_icebreaker.BRIDGE_NOTE,
+                "timeout_sec": r1_icebreaker.BRIDGE_TIMEOUT_SEC,
+                "min_words": r1_icebreaker.BRIDGE_MIN_WORDS,
+                "max_words": r1_icebreaker.BRIDGE_MAX_WORDS,
+            },
+            # M032 S6 (SWEEP-28, R1_ICEBREAKER_REPAIR): the repeated question's template, the
+            # presence opener notes and the hold's limits (L-IB-HOLD and L-PRESENT are lines).
+            "repair": {
+                "repeat_template": r1_icebreaker.IB_REPEAT_TEMPLATE,
+                "presence_opener_note": r1_icebreaker.PRESENCE_OPENER_NOTE,
+                "presence_opener_note_late": r1_icebreaker.PRESENCE_OPENER_NOTE_LATE,
+                "presence_late_seconds": r1_icebreaker.PRESENCE_LATE_SECONDS,
+                "hold_wait_seconds": r1_icebreaker.ICEBREAKER_HOLD_WAIT_SECONDS,
+                "hold_min_budget_seconds": r1_icebreaker.HOLD_MIN_BUDGET_SECONDS,
+            },
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

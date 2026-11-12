@@ -920,14 +920,12 @@ class AckHygieneTests(unittest.TestCase):
         self.assertTrue(ledger.flagged)
 
     def test_only_hygiene_categories_are_outside_the_leak_categories(self):
-        self.assertEqual(
-            set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES),
-            {r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD},
-        )
-        self.assertEqual(
-            r1_guard.HYGIENE_CATEGORIES,
-            frozenset({r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD}),
-        )
+        # M032 S5: Christy's icebreaker praise is hygiene too.
+        hygiene = {
+            r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD, r1_guard.PRAISE
+        }
+        self.assertEqual(set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES), hygiene)
+        self.assertEqual(r1_guard.HYGIENE_CATEGORIES, frozenset(hygiene))
 
 
 def said_of(*sentences) -> tuple[str, ...]:
@@ -2588,6 +2586,238 @@ class LearnerS03GuardTests(unittest.TestCase):
             ).hits
         ]
         self.assertIn("over_budget_accepted", rules)
+
+
+class IcebreakerPraiseTests(unittest.TestCase):
+    """M032 S5 item 1: Christy never grades an answer in the getting-to-know-you part.
+
+    Owner's call fda9e9f6 (#3, #10, #13, #21): nearly every icebreaker reply opened with a verdict
+    ("... is solid experience", "... is a real asset", "That drive sounds useful") and no guard
+    looked, because feedback is only policed in the wrap-up.  The check is HYGIENE (counted, never
+    a leak, never posted) and only runs when the session turns it on (``praise_check``,
+    ``R1_INTERVIEWER_VOICE``).  The sentences here are synthetic.
+    """
+
+    PRAISE = (
+        "Eight years in insurance sales is solid experience.",
+        "Patience is a real asset in this work.",
+        "That persistence sounds useful.",
+        "That makes sense, it plays to your strengths.",
+        "That's impressive.",
+        "Impressive!",
+        "What a great achievement.",
+        "You clearly have a strong background in sales.",
+        "That shows real dedication.",
+        "Great answer.",
+        "Well done on hitting those numbers.",
+        "That's a big plus for this kind of work.",
+        "Your results sound outstanding.",
+        # Review of S5 (naturalness R7): verdict openers the first cut let through.
+        "That's an impressive streak.",
+        "That's a big achievement.",
+        "That's a solid number.",
+        "That's wonderful.",
+        "Perfect.",
+        "Nice one.",
+        "Good stuff.",
+    )
+    WARM = (
+        "Got it, so mostly inbound leads.",
+        "Thanks for sharing that.",
+        "That makes sense.",
+        "Okay, eight years in insurance, that's a long run.",
+        "Sounds like a busy day.",
+        "That sounds like a lot of calls to make.",
+        "No problem, we can skip that one.",
+        "Take your time.",
+        "I see.",
+        "Fair enough.",
+        "Good to know.",
+        "That sounds challenging.",
+        "Sounds like you enjoy talking to people.",
+        "That's a lot of variety.",
+        "That must have been a busy few years.",
+        "Right, so you were calling working parents.",
+        "Got it.",
+        "That's a big jump from teaching.",
+        "That's a long time in one company.",
+    )
+    QUESTION = "What does a normal working day look like for you?"
+
+    def on(self, phase="icebreaker", **kwargs) -> GuardContext:
+        return ctx(phase, praise_check=True, **kwargs)
+
+    def test_a_praise_sentence_is_dropped_and_the_question_stays(self):
+        for praise in self.PRAISE:
+            with self.subTest(praise=praise):
+                result = guard_text(f"{praise} {self.QUESTION}", self.on())
+                self.assertEqual(result.text, self.QUESTION)
+                self.assertEqual({hit.category for hit in result.hits}, {r1_guard.PRAISE})
+
+    def test_a_leading_praise_clause_is_cut_from_a_question(self):
+        result = guard_text("That's impressive, what made you move into edtech?", self.on())
+        self.assertEqual(result.text, "What made you move into edtech?")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        result = guard_text("What an impressive result, how did you get there?", self.on())
+        self.assertEqual(result.text, "How did you get there?")
+        # A question that only asks for an example keeps its words.
+        asked = "Could you share a great example of a deal you closed?"
+        self.assertEqual(guard_text(asked, self.on()).text, asked)
+        self.assertTrue(guard_text(asked, self.on()).clean)
+
+    def test_warm_acknowledgements_pass_untouched(self):
+        for phase in ("opening", "icebreaker"):
+            for warm in self.WARM:
+                with self.subTest(phase=phase, warm=warm):
+                    text = f"{warm} {self.QUESTION}"
+                    result = guard_text(text, self.on(phase))
+                    self.assertTrue(result.clean, [(h.category, h.rule) for h in result.hits])
+                    self.assertEqual(result.text, text)
+
+    def test_the_feedback_categories_do_not_fire_on_warm_acknowledgements(self):
+        for phase in ("roleplay_exit", "wrapup", "closing"):
+            for warm in self.WARM:
+                with self.subTest(phase=phase, warm=warm):
+                    self.assertNotIn("feedback", categories(warm, self.on(phase)))
+
+    def test_it_is_off_unless_the_session_turns_it_on_and_only_in_small_talk(self):
+        text = f"{self.PRAISE[0]} {self.QUESTION}"
+        self.assertEqual(guard_text(text, ctx("icebreaker")).text, text)  # the flag-off path
+        self.assertTrue(guard_text(text, ctx("icebreaker")).clean)
+        for phase in ("transition", "wrapup", "closing", "roleplay_exit"):
+            with self.subTest(phase=phase):
+                self.assertNotIn(r1_guard.PRAISE, categories(text, self.on(phase)))
+        # The learner may say whatever she likes about the advisor's course.
+        self.assertNotIn(r1_guard.PRAISE, categories("That's impressive.", self.on("roleplay")))
+
+    def test_praise_alone_falls_back_to_the_current_question_when_there_is_one(self):
+        restate = "What draws you to this role?"
+        result = guard_text("That's impressive.", self.on(interviewer_fallback=restate))
+        self.assertEqual(result.text, restate)
+        self.assertTrue(result.fallback_used)
+
+    def test_praise_alone_is_kept_rather_than_asking_them_to_repeat_themselves(self):
+        # Without a question to fall back on, "Sorry, what were you saying?" would be worse than
+        # the model's own line (the phone's lesson: never swap a natural line for a canned one).
+        result = guard_text("That's impressive.", self.on())
+        self.assertEqual(result.text, "That's impressive.")
+        self.assertNotEqual(result.text, FALLBACK_REPLY)
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_praise_is_hygiene_never_a_leak(self):
+        self.assertIn(r1_guard.PRAISE, r1_guard.CATEGORIES)
+        self.assertIn(r1_guard.PRAISE, r1_guard.HYGIENE_CATEGORIES)
+        self.assertNotIn(r1_guard.PRAISE, r1_guard.LEAK_CATEGORIES)
+        ledger = GuardLedger()
+        for praise in self.PRAISE:
+            ledger.record(guard_text(f"{praise} {self.QUESTION}", self.on()))
+        self.assertEqual(ledger.summary()["leak_hits"], 0)
+        self.assertFalse(ledger.flagged)
+
+    def test_a_fully_blocked_icebreaker_reply_restates_the_current_question(self):
+        # The plan's fallback replaces "Sorry, what were you saying?" (phone map, missed item).
+        restate = "What draws you to this role?"
+        blocked = "Great, let's move into the role-play now."
+        self.assertEqual(guard_text(blocked, ctx("icebreaker")).text, FALLBACK_REPLY)
+        self.assertEqual(
+            guard_text(blocked, ctx("icebreaker", interviewer_fallback=restate)).text, restate
+        )
+        # The learner's own fallbacks never change.
+        self.assertIn(
+            guard_text("", ctx("roleplay", interviewer_fallback=restate)).text, FALLBACK_REPLIES
+        )
+
+    def test_a_praising_sentence_that_also_leaks_counts_as_the_leak(self):
+        # Review of S5 (correctness R1): the praise cut ran first, so a sentence that praised AND
+        # leaked was logged as hygiene only, and the leak never reached the 3-hit gate.
+        restate = "What draws you to this role?"
+        for text, category in (
+            (f"Impressive answer, our rubric rewards that. {restate}", r1_guard.EVALUATION),
+            (f"Great answer, DeepSeek would agree. {restate}", r1_guard.VENDOR),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.on())
+                self.assertEqual(result.text, restate)
+                found = {hit.category for hit in result.hits}
+                self.assertIn(category, found)
+                self.assertNotIn(r1_guard.PRAISE, found)
+                ledger = GuardLedger()
+                ledger.record(result)
+                self.assertGreaterEqual(ledger.summary()["leak_hits"], 1)
+        # A sentence that only praises is still hygiene.
+        result = guard_text(f"That's impressive. {restate}", self.on())
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_a_praise_clause_after_an_acknowledgement_is_cut(self):
+        # Review of S5 (correctness R7): the clause loop stopped at the acknowledgement, so the
+        # commonest one-sentence verdict was spoken whole and never counted.
+        for text, kept in (
+            (
+                "Got it, that's solid experience, so what does a typical day look like?",
+                "Got it, so what does a typical day look like?",
+            ),
+            (
+                "Okay, six years is a real asset, what draws you to this role?",
+                "Okay, what draws you to this role?",
+            ),
+            (
+                "Thanks, that's impressive, what made you choose sales?",
+                "Thanks, what made you choose sales?",
+            ),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.on())
+                self.assertEqual(result.text, kept)
+                self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_an_asking_clause_without_a_question_mark_keeps_the_question(self):
+        # Review of S5 (correctness R6): "I'm curious what ..." asks; the praise before it goes,
+        # the question stays.  A request that names a quality ("a great result") is no praise.
+        result = guard_text(
+            "Got it. That's a strong background, and I'm curious what drew you to this role.",
+            self.on(),
+        )
+        self.assertEqual(result.text, "Got it. I'm curious what drew you to this role.")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        for asked in (
+            "Got it. I'd be curious to hear about a great result you've had with a customer.",
+            "Okay. I wonder what a great day at work looks like for you.",
+            "Right. Help me understand what a strong month looked like there.",
+        ):
+            with self.subTest(asked=asked):
+                result = guard_text(asked, self.on())
+                self.assertEqual(result.text, asked)
+                self.assertTrue(result.clean, [(h.category, h.rule) for h in result.hits])
+
+    def test_when_the_cut_leaves_no_question_the_current_question_follows(self):
+        # Review of S5 (correctness R6): an acknowledgement was spoken alone and the candidate
+        # waited for a question that never came.
+        restate = "What draws you to this role?"
+        result = guard_text(
+            "Got it. That's solid experience.", self.on(interviewer_fallback=restate)
+        )
+        self.assertEqual(result.text, f"Got it. {restate}")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        # A reply that still asks something gets nothing added.
+        text = f"Got it. That's solid experience. {self.QUESTION}"
+        self.assertEqual(
+            guard_text(text, self.on(interviewer_fallback=restate)).text,
+            f"Got it. {self.QUESTION}",
+        )
+        # Nor does a reply whose praise was not cut, or one with no current question.
+        self.assertEqual(guard_text("Got it.", self.on(interviewer_fallback=restate)).text,
+                         "Got it.")
+        self.assertEqual(guard_text("Got it. That's solid experience.", self.on()).text,
+                         "Got it.")
+
+    def test_the_detector_is_linear_on_long_input(self):
+        import time
+
+        long = ("solid " * 4000) + "experience " + ("is " * 4000) + "?"
+        start = time.perf_counter()
+        r1_guard.praise_detected(long)
+        r1_guard.without_praise(long)
+        self.assertLess(time.perf_counter() - start, 1.0)
 
 
 if __name__ == "__main__":
