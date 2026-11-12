@@ -128,12 +128,15 @@ from r1_commitment import (
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
+    COURSE_FACT,
     QUESTION_DIET_WINDOW,
     REPEAT,
     GuardContext,
     GuardLedger,
     GuardResult,
     StreamGuard,
+    course_length_unsaid,
+    durations_said,
     guard_text,
     has_concession,
     hours_said,
@@ -141,10 +144,29 @@ from r1_guard import (
 from r1_negotiation import (
     ANCHOR_USD,
     COMMIT_REACTION_BRIEF,
+    CONFLICT_RISE,
+    CONFLICT_WEBSITE,
     IMPLAUSIBLE_FREE,
     IMPLAUSIBLE_LOW,
+    IMPLAUSIBLE_NET_USD,
     KIND_COMMIT,
     KIND_STALL,
+    MIN_FRAMED_NET_USD,
+    N_PRICE_FIRST,
+    PRICE_CUE_BUDGET,
+    PRICE_FIRST_SPEC,
+    SITUATION_SHORT,
+    SITUATION_UNCLEAR,
+    YOUR_NUMBER_COUNTER_SUFFIX,
+    AnchorSituation,
+    anchor_after_free,
+    anchor_after_stated,
+    anchor_check,
+    asks_price,
+    conflict_counter,
+    money_spec,
+    price_cue,
+    stated_price_usd,
     OFFER_TERMS,
     TERM_FREE_EXTRA,
     TERM_INSTALMENTS,
@@ -200,6 +222,13 @@ from r1_prompts import (
     DECIDER_SAID_NOTE,
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
+    FIGURE_CHALLENGE_NOTE,
+    PRICE_CONFLICT_WEBSITE_NOTE,
+    PRICE_MET_NOTE_EARLY,
+    PRICE_REFLEX_BUDGET_NOTE,
+    PRICE_REFLEX_EXAMPLES,
+    PRICE_REFLEX_NOTE,
+    PRICE_RISE_NOTE,
     HINGE_USED_NOTE,
     HOLD_NOTE,
     HOLLOW_CONCERNS_NOTE,
@@ -274,9 +303,17 @@ from r1_scheduler import (
     REDIRECT_OPENERS,
     TIME_CUE,
     TIME_CUE_BRIEF_ALTERNATIVES,
+    PROBE_F1,
+    PROBE_F1_AGAIN,
+    PROBE_F1_CLARIFY,
+    PROBE_F2,
+    F2_PRIMARY_WORRY_V2,
     Moment,
     OwedMove,
     OwedMoveScheduler,
+    ProbeSpec,
+    asks_her_number,
+    probe_first_texts,
     answered_topics,
     answers_substantively,
     asks_her_directly,
@@ -359,6 +396,23 @@ MAX_CANDIDATE_CHARS = 4000
 KIND_OBJECTION = "objection"
 KIND_REDIRECT = "redirect"
 KIND_CUE = "cue"
+# M032 S2P (S2 item 10): a probe, the short price or time question before a family's owed point.
+KIND_PROBE = "probe"
+# Her price questions the advisor answered without a figure, before she checks the website's price.
+MAX_PRICE_DODGES = 2
+# A probe spends a turn only while every owed graded move can still land at this many turns each
+# (``RolePlayEngine._probe_slack``).  On the bunching grid (2026-11-12) 2.0, 2.5 and 3.0 gave the
+# same rows; with no slack check the probes at 35-65 s an exchange forced 13 more moves and made
+# F1 and F4 late for three patterns.
+PROBE_TURNS_PER_MOVE = 2.0
+# SWEEP-20: the early-close redirect's probe lines (scripted and pinned in ``r1_script``; a SAY_ONLY
+# plan's text, spoken in the learner's voice through the reply stream like the redirect before them,
+# so, like it, not warm-cached: only a ``session.say`` line can play cached audio).
+REDIRECT_PRICE_LINE = "L-REDIRECT-PRICE"
+REDIRECT_TIME_LINE = "L-REDIRECT-TIME"
+# SWEEP-22: at most this many price-reflex notes per session.
+PRICE_REFLEX_LIMIT = 2
+_PROBE_MARKERS = {"F1": PROBE_F1.markers, "F2": PROBE_F2.markers}
 # How many of the learner's last replies the style rules look back over (``r1_guard``).
 STYLE_HISTORY = 8
 # Situation notes that belong to a free reply: an intent has its own brief to voice.
@@ -538,6 +592,22 @@ FLAG_ACK_TURN_NOTE = "R1_ACK_TURN_NOTE"
 FLAG_TIC_V2 = "R1_TIC_V2"
 FLAG_OFFER_REALISM = "R1_OFFER_REALISM"
 FLAG_REPLY_LENGTH = "R1_REPLY_LENGTH"
+# M032 S2P, probe first (owner decision D-M032-7), each default ON with the same rollback:
+#
+# * R1_PROBE_FIRST (S2 item 10, SWEEP-2, 16, 17, 20, 22, 23): she knows no course fact (the card and
+#   the prefix say so, latched per session), asks before she states, reacts to the advisor's own
+#   figures, and raises the website price only as a check; the guard allows only figures that were
+#   said or are owed.
+# * R1_OFFER_READER_V2 (SWEEP-18): a dollar discount comes off the price the advisor named, an
+#   explicit net wins, and the base carries over a split turn.
+# * R1_COUNTER_V2 (SWEEP-19): the F1 counter matches the number on the table.
+# * R1_PRICE_CONFLICT (SWEEP-21): one check, as a question, when the advisor's price differs from
+#   the website or from his own earlier offer (latched per session: it changes one prefix
+#   clause).
+FLAG_PROBE_FIRST = "R1_PROBE_FIRST"
+FLAG_OFFER_READER_V2 = "R1_OFFER_READER_V2"
+FLAG_COUNTER_V2 = "R1_COUNTER_V2"
+FLAG_PRICE_CONFLICT = "R1_PRICE_CONFLICT"
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
 # One literal read per flag, so the repository's env-contract scanner (and
 # config/environment.schema.json) sees every one of them (review S1R-7).
@@ -554,6 +624,10 @@ _FLAG_READS = {
     FLAG_TIC_V2: lambda: os.getenv("R1_TIC_V2"),
     FLAG_OFFER_REALISM: lambda: os.getenv("R1_OFFER_REALISM"),
     FLAG_REPLY_LENGTH: lambda: os.getenv("R1_REPLY_LENGTH"),
+    FLAG_PROBE_FIRST: lambda: os.getenv("R1_PROBE_FIRST"),
+    FLAG_OFFER_READER_V2: lambda: os.getenv("R1_OFFER_READER_V2"),
+    FLAG_COUNTER_V2: lambda: os.getenv("R1_COUNTER_V2"),
+    FLAG_PRICE_CONFLICT: lambda: os.getenv("R1_PRICE_CONFLICT"),
 }
 
 
@@ -670,8 +744,31 @@ class _LostHalf:
     s2_undo: tuple[Any, ...] | None = None
 
 
-def challenges_learner(text: object) -> bool:
-    """The advisor pushes back on something the learner said or on how the learner asks."""
+# M032 SWEEP-17 item 6 (flag R1_PROBE_FIRST): the advisor says he never gave the figure she used
+# ("I never said six months", "I didn't mention eight months, I was talking about minutes"),
+# with the same negative lookahead as the other arm, so a sales point ("I didn't mention the six
+# months earlier, but there's also EMI") is none.
+_CHALLENGE_FIGURE = re.compile(
+    r"\bi (?:didn'?t|did not|never) (?:say|said|mention|mentioned|tell you|told you) "
+    r"(?:anything about )?(?:the )?(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|eighteen|twenty[- ]four|twenty)[\s-]+(?:months?|weeks?)\b"
+    r"(?!.*\b(?:but|earlier|before|yet|however|also)\b)",
+    re.IGNORECASE,
+)
+
+
+def challenges_figure(text: object) -> bool:
+    """The advisor says he never said the course length she used (SWEEP-17 item 6)."""
+    return any(_CHALLENGE_FIGURE.search(fold(sentence)) for sentence in split_sentences(text))
+
+
+def challenges_learner(text: object, *, figure: bool = False) -> bool:
+    """The advisor pushes back on something the learner said or on how the learner asks.
+
+    ``figure`` (M032 SWEEP-17, probe first) also reads "I never said six months".
+    """
+    if figure and challenges_figure(text):
+        return True
     return any(_CHALLENGE.search(fold(sentence)) for sentence in split_sentences(text))
 
 
@@ -734,6 +831,12 @@ class TurnPlan:
     offer_realism: bool = False
     # M032 SWEEP-13: this plan's reminder carries a careful-buyer note (counts and the trust theme).
     implausible: bool = False
+    # M032 S2P: the session's latched card and prefix sentences (``learner_prefix(probe_first=...,
+    # price_check=...)``, SWEEP-17 and SWEEP-21), and the probe this plan voices (S2.10: its family,
+    # or None), which delivers no graded move.
+    probe_first: bool = False
+    price_check: bool = False
+    probe: str | None = None
 
     @property
     def needs_llm(self) -> bool:
@@ -954,9 +1057,10 @@ class RolePlayEngine:
         # M032 S2 (learner voice).  SWEEP-13's prefix sentence is latched for the session (the
         # prefix is the DeepSeek cache prefix), and the guard's echo check reads that very prefix.
         self._offer_realism = flag_on(FLAG_OFFER_REALISM)
-        self._learner_control = control_prose(
-            learner_prefix(persona, offer_realism=self._offer_realism)
-        )
+        # M032 S2P (SWEEP-17, SWEEP-21): latched for the session as well (see below).
+        self._probe_first = flag_on(FLAG_PROBE_FIRST)
+        self._price_conflict = flag_on(FLAG_PRICE_CONFLICT)
+        self._learner_control = control_prose(self.learner_prefix_text())
         # Item 7: the coach aside just played (the next reply carries on, no new greeting).
         self._after_coach = False
         # Item 4: the topics (``PREEMPTED_LABELS`` keys) the advisor talked about so far, this turn
@@ -1014,8 +1118,59 @@ class RolePlayEngine:
         # Review S2R-6: what this turn's planning used up of the S2 state (the coach flag, the
         # careful-buyer and offer-terms notes, the note counts), given back when its reply is lost.
         self._turn_s2_undo: tuple[Any, ...] | None = None
+        # M032 S2P, probe first (D-M032-7).  R1_PROBE_FIRST and R1_PRICE_CONFLICT change the card
+        # and the prefix (the DeepSeek cache prefix), so both are latched for the session, like
+        # SWEEP-13's sentence; every probe-first behaviour reads the latched value, so a session is
+        # one release or the other from start to end (``self._probe_first`` and
+        # ``self._price_conflict`` are set above, before the prefix).  The state, ints and ids only:
+        # the learner turn on which she last asked the price (S2.10's probe, SWEEP-20's redirect
+        # probe, or her own question; SWEEP-22), her price questions the advisor answered with no
+        # figure, the probes she said per family, the course lengths the advisor said (months), the
+        # figures she was allowed to say (a check or a conflict) and said, and SWEEP-22's notes.
+        self._price_asked_turn: int | None = None
+        self._price_dodges = 0
+        self._probes: dict[str, int] = {}
+        self._advisor_months: set[float] = set()
+        self._figures_said: set[int] = set()
+        self._durations_said: set[float] = set()
+        self._allowed_extra: frozenset[int] = frozenset()
+        self._price_reflexes = 0
+        self._price_first_turns = 0
+        self._figure_challenges = 0
+        self._redirect_probes = 0
+        # The kind of the last price the advisor named that SWEEP-13's reader called far below
+        # ("low" or "free"; None after an ordinary offer), the family of the probe her last heard
+        # line asked, whether that line held a figure the advisor never said, and this turn's
+        # price conflict (SWEEP-21) with its note.
+        self._last_price_kind: str | None = None
+        self._last_probe_family: str | None = None
+        self._last_line_unsaid_figure = False
+        self._turn_conflict: tuple[str, int, int | None] | None = None
+        self._conflict_note = ""
+        self._asks_number_now = False  # SWEEP-19 item 6: this turn asked what number works for her
+        self._number_moment = False  # ... before the anchor, with probe first: the F1 step answers
 
     # ------------------------------------------------------------------- properties
+    def learner_prefix_text(self) -> str:
+        """The session's learner prefix, with the session's latched S2 and S2P sentences."""
+        return learner_prefix(
+            self.persona,
+            offer_realism=self._offer_realism,
+            probe_first=self._probe_first,
+            price_check=self._price_conflict,
+        )
+
+    def _price_probe_answer_due(self, turn: int) -> bool:
+        """SWEEP-19 item 4: her last heard line asked the price before the anchor, so an amount in
+        this advisor turn needs no pricing word ("It's around 6000 dollars"), as after the
+        anchor."""
+        return (
+            self._probe_first
+            and self._price_asked_turn is not None
+            and self._price_asked_turn == turn - 1
+            and not self.scheduler.is_delivered(F1_ANCHOR)
+        )
+
     @property
     def commitment_resolved(self) -> bool:
         return self.scheduler.commitment_resolved
@@ -1052,8 +1207,15 @@ class RolePlayEngine:
         free_reply: bool = False,
         carries_move: bool = False,
         reask: tuple[str, ...] = (),
+        must_say: tuple[str, ...] = (),
     ) -> GuardContext:
         """The guard context for an LLM reply now.
+
+        M032 S2P (SWEEP-17, the session's latched R1_PROBE_FIRST): the card's figures are gone, so
+        the context carries the amounts and course lengths this reply may say beyond it (the plan's
+        ``must_say`` on the check or conflict path, what she already said on such a path, this
+        turn's conflict figures, the advisor's lengths); and while a price rise is open (SWEEP-21)
+        ``offer_usd`` is the later of the latest total and the latest offer.
 
         M032 S2: ``carries_move`` says the plan voices or may complete an owed move (SWEEP-12 never
         trims a soft tic from such a reply); the S2 flags are read here, once per plan.
@@ -1082,6 +1244,10 @@ class RolePlayEngine:
                 control += (control_prose(reminder),)
         else:
             control = (self._interviewer_control,)
+        extra_amounts: frozenset[int] = frozenset()
+        extra_months: frozenset[float] = frozenset()
+        if self._probe_first and phase == "roleplay":
+            extra_amounts, extra_months = self._guard_extras(must_say)
         return GuardContext(
             phase=phase,
             persona=self.persona,
@@ -1101,7 +1267,7 @@ class RolePlayEngine:
             nothing_granted=self._nothing_granted,
             recent_styles=tuple(self._styles[-STYLE_HISTORY:]),
             confirm=confirm,
-            offer_usd=self.negotiation.best_offer_usd,
+            offer_usd=self._offer_on_table(),
             recent_questions=tuple(self._asked[-STYLE_HISTORY:]),
             phrase_counts=tuple(sorted(self._phrases.items())),
             free_reply=free_reply,
@@ -1119,7 +1285,16 @@ class RolePlayEngine:
             tic_v2=flag_on(FLAG_TIC_V2),
             carries_move=carries_move,
             reask=reask,
+            probe_first=self._probe_first,
+            allowed_extra=extra_amounts,
+            advisor_durations=extra_months,
         )
+
+    def _offer_on_table(self) -> int | None:
+        """The best offer; while a price rise is open (SWEEP-21 (d)), the latest price named."""
+        if self._price_conflict and self.negotiation.rise_open_turn is not None:
+            return self.negotiation.price_now_usd()
+        return self.negotiation.best_offer_usd
 
     def filler_text(self) -> str:
         """The learner's thinking filler: a 3-variant rotation seeded by the attempt id.
@@ -1444,11 +1619,35 @@ class RolePlayEngine:
         known = (len(self._advisor_amounts), len(self._answered))
         self._advisor_amounts.update(advisor_amounts_in(candidate_text))
         self._advisor_hours.update(hours_said(candidate_text))
+        if self._probe_first:
+            # SWEEP-17 item 4: the course lengths the advisor said, and a price he stated without
+            # a "$" ("the price is 9000"), are figures she may refer to.
+            self._advisor_months.update(durations_said(candidate_text))
+            stated = stated_price_usd(candidate_text)
+            if stated is not None:
+                self._advisor_amounts.add(stated)
         self._price_talk = quotes_price(reading)
         for topic in answered_topics(reading):
             if topic not in self._answered:
                 self._answered.append(topic)
         negotiated = self._observe_negotiation(candidate_text, turn)
+        self._turn_conflict = negotiated.conflict if self._price_conflict else None
+        if (
+            self._probe_first
+            and self._price_asked_turn is not None
+            and self._price_asked_turn == turn - 1
+            and not self._price_named()
+        ):
+            self._price_dodges += 1  # S2.10: her price question got no figure
+        number_question = asks_her_number(reading)
+        self._asks_number_now = flag_on(FLAG_COUNTER_V2) and number_question
+        self._number_moment = (
+            self._probe_first and number_question and not self.scheduler.is_delivered(F1_ANCHOR)
+        )
+        if self._number_moment:
+            # SWEEP-19 item 6: before the anchor, "which number works for you?" is a fresh moment
+            # for the F1 probe or anchor, so the question is answered by it, never left open.
+            self.scheduler.note_topic("F1")
         self._note_situation(negotiated)
         # Review S2R-6: a split answer's terms are read over both halves (S1 item 7).
         self._read_offer_extras(reading, negotiated, turn)
@@ -1536,6 +1735,9 @@ class RolePlayEngine:
                 # Ship restore: production's scripted redirect, "Oh wait, before you go..." and the
                 # owed line (a model-voiced redirect said its goodbye and then the opener).
                 reasons.append("close_attempt_redirect")
+                if self._probe_first:
+                    # M032 SWEEP-20: the probe-first step that is due, never "$9,000 is a lot".
+                    return self._redirect_plan(move, decision.prefix, reasons, r_sec)
                 text = f"{decision.prefix} {move.text}"
                 return self._plan(TurnMode.SAY_ONLY, reasons, scripted=text, move_id=move.id)
             reasons.append("close_attempt_stall")
@@ -1603,7 +1805,10 @@ class RolePlayEngine:
                 self._interrupt_deferred.add(move.id)
                 held_for_cut = True
                 reasons.append("owed_deferred_for_interrupt")
-            elif challenges_learner(reading) and self._may_hold_for_challenge(move, r_sec):
+            elif (
+                challenges_learner(reading, figure=self._probe_first)
+                and self._may_hold_for_challenge(move, r_sec)
+            ):
                 # The advisor pushed back on the learner's own words or on how it asks (owner test
                 # 7f2a25e6: "where did you get that number?" got a one-line answer and the F2 push).
                 # That is answered first and the owed move waits ONE turn; twice per session and
@@ -1615,7 +1820,7 @@ class RolePlayEngine:
                 self._challenge_deferred.append(move.id)
                 self._turn_hold = ("challenge", move.id, "")
                 challenged = True
-                self._notes.append(CHALLENGE_NOTE)
+                self._notes.append(self._challenge_note())
                 reasons.append("owed_deferred_for_challenge")
             elif (
                 move.id not in self._dig_deferred
@@ -1650,6 +1855,10 @@ class RolePlayEngine:
                 and kinds
                 and move.id not in self._respond_held
                 and not (move.family == "F1" and self._price_talk)
+                # M032 S2P: after her probe the owed point IS her response to the answer, and the
+                # F1 step is her answer to "which number works for you?" (SWEEP-19 item 6).
+                and not (self._probe_first and move.family == self._last_probe_family)
+                and not (self._number_moment and move.id == F1_ANCHOR)
                 and self._may_hold_s1(move, r_sec)
             ):
                 # M032 S1 item 2 (D-M032-1): the advisor made an offer, gave her time, asked her
@@ -1691,6 +1900,16 @@ class RolePlayEngine:
                 self._notes.append(PUSH_REACT_NOTE_V2 if voice_v2 else PUSH_REACT_NOTE)
                 reasons.append("owed_deferred_for_reaction")
             else:
+                probe = self._probe_step(move, r_sec) if self._probe_first else None
+                if probe is not None:
+                    # M032 S2P (S2.10): she asks before she states; the owed move stays owed.
+                    return self._probe_plan(
+                        probe,
+                        reasons,
+                        first_probes=first_probes,
+                        reveal_topics=reveal_topics,
+                        monologue=monologue,
+                    )
                 self.scheduler.issue(move)
                 self._turn_issued = move.id
                 reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
@@ -1752,6 +1971,20 @@ class RolePlayEngine:
         if cut:
             # The advisor cut in: what they said is answered, the cut line is not started again.
             self._notes.append(INTERRUPTED_NOTE)
+        if (
+            self._probe_first
+            and not challenged
+            and self._last_line_unsaid_figure
+            and challenges_figure(reading)
+        ):
+            # SWEEP-17 item 6: "I never said six months" with no owed move to hold: she still owns
+            # the mix-up instead of saying the figure again.
+            self._figure_challenges += 1
+            self._notes.append(FIGURE_CHALLENGE_NOTE)
+        reflex = "" if not self._probe_first else self._price_reflex_note(reading)
+        if reflex:
+            reasons.append("price_reflex")
+            self._notes.append(reflex)
         curiosity = ""
         # A challenge is only answered (``CHALLENGE_NOTE``): no curiosity question, no check-in.
         # Neither is the turn that cut the learner off while she was raising an owed move, nor
@@ -1769,11 +2002,12 @@ class RolePlayEngine:
             done = not curiosity and r_sec >= TIME_CUE_SEC
             self._notes.append(CHECKIN_DONE_NOTE if done else CHECKIN_NOTE)
         elif not quiet and not responding:
-            # M032 SWEEP-12: no hand-over on a turn that put a new price or offer on the table.
+            # M032 SWEEP-12: no hand-over on a turn that put a new price or offer on the table;
+            # SWEEP-22: the price reflex wins over a curiosity hand-over.
             figure = flag_on(FLAG_TIC_V2) and (
                 bool(negotiated.offers) or bool(self._implausible_note)
             )
-            curiosity = self._curiosity_for_free_reply(skip=figure)
+            curiosity = self._curiosity_for_free_reply(skip=figure or bool(reflex))
         return self._plan(
             TurnMode.LLM_REPLY,
             reasons,
@@ -2272,8 +2506,27 @@ class RolePlayEngine:
         self._implausible_note = ""
         self._turn_terms = ()
         found = None
-        if flag_on(FLAG_OFFER_REALISM):
+        realism = flag_on(FLAG_OFFER_REALISM)
+        if realism or self._probe_first or flag_on(FLAG_COUNTER_V2):
             found = implausible_offer_in(text, self.negotiation.own_amounts)
+        # M032 SWEEP-19: the kind of the last price named (far below or free, or an ordinary one),
+        # for the far-below counter and the free anchor; and a reader-confirmed figure under
+        # $1,000 is a low mention the anchor reacts to (probe first).
+        if found is not None:
+            self._last_price_kind = found[0]
+            usd = found[1]
+            if (
+                self._probe_first
+                and found[0] == IMPLAUSIBLE_LOW
+                and usd is not None
+                and 0 < usd < MIN_FRAMED_NET_USD
+                and (turn, usd) not in self.negotiation.low_mentions
+            ):
+                self.negotiation.low_mentions.append((turn, usd))
+        elif any(offer.net_usd > IMPLAUSIBLE_NET_USD for offer in seen.offers):
+            self._last_price_kind = None
+        if not realism:
+            found = None  # the careful-buyer note itself stays SWEEP-13's
         named = [offer.net_usd for offer in seen.offers]
         if found is not None and found[0] == IMPLAUSIBLE_LOW and found[1] is not None:
             named.append(found[1])
@@ -2640,7 +2893,12 @@ class RolePlayEngine:
         """Let the negotiation read this advisor turn (offers, callbacks, e-mail, check-ins)."""
         anchor = self.scheduler.deliveries_by_id().get(F1_ANCHOR)
         seen = self.negotiation.observe(
-            turn, candidate_text, anchor_turn=None if anchor is None else anchor.turn
+            turn,
+            candidate_text,
+            anchor_turn=None if anchor is None else anchor.turn,
+            reader_v2=flag_on(FLAG_OFFER_READER_V2),
+            probed=self._price_probe_answer_due(turn),
+            read_totals=self._probe_first or self._price_conflict,
         )
         if seen.price_answer:
             self.scheduler.note_price_answered()
@@ -2678,11 +2936,30 @@ class RolePlayEngine:
         # hoping for" at $6,000 and, one turn later, "still a stretch for me"; "that's better than
         # before" at an unchanged $7,500).  The anchor and the counter carry the price in their own
         # brief, and the wrap turn names it in the offer note, so they skip these.
-        if best is not None and self._price_talk:
+        # M032 SWEEP-21 (d): while a price rise is open the price notes would contradict it.
+        rise_open = self._price_conflict and self.negotiation.rise_open_turn is not None
+        if best is not None and self._price_talk and not rise_open:
             if best <= ANCHOR_USD:
-                self._price_notes.append(PRICE_MET_NOTE.format(amount=format_usd(best)))
+                # M032 SWEEP-2 (salvage): before the anchor she has asked for nothing yet.
+                early = self._probe_first and not self.scheduler.is_delivered(F1_ANCHOR)
+                note = PRICE_MET_NOTE_EARLY if early else PRICE_MET_NOTE
+                self._price_notes.append(note.format(amount=format_usd(best)))
             elif seen.lower_offer_usd is None:
                 self._price_notes.append(PRICE_UNCHANGED_NOTE.format(amount=format_usd(best)))
+        self._conflict_note = ""
+        self._allowed_extra = frozenset()
+        conflict = self._turn_conflict
+        if conflict is not None:
+            # SWEEP-21 (a) and (e): one check, as a question; the figures it names may be said.
+            kind, usd, earlier = conflict
+            if kind == CONFLICT_RISE and earlier is not None:
+                self._conflict_note = PRICE_RISE_NOTE.format(
+                    earlier=format_usd(earlier), amount=format_usd(usd)
+                )
+                self._allowed_extra = frozenset({earlier, usd})
+            elif kind == CONFLICT_WEBSITE:
+                self._conflict_note = PRICE_CONFLICT_WEBSITE_NOTE.format(amount=format_usd(usd))
+                self._allowed_extra = frozenset({9000, usd})
 
     def _standing_notes(
         self,
@@ -2878,7 +3155,18 @@ class RolePlayEngine:
             if not self.scheduler.commit_permitted(r_sec):
                 self._pending_ask = wants  # open until the close window (a farewell answers it)
                 owed = self.scheduler.select(r_sec)
-                if owed is not None and (owed.forced or owed.family == "F4"):
+                # M032 S2P: her price question went unanswered and F1-ANCHOR can be raised now, so
+                # the ask gets its probe-first step (the price asked again, or the website's price
+                # checked) instead of a money stall about a price nobody named; on the bunching grid
+                # that stall's spacing pushed the F1 pair onto the forced path.
+                price_unknown = (
+                    self._probe_first
+                    and owed is not None
+                    and owed.id == F1_ANCHOR
+                    and self._price_asked_turn is not None
+                    and not self._price_named()
+                )
+                if owed is not None and (owed.forced or owed.family == "F4" or price_unknown):
                     # The owed objection lands in context (the advisor just proposed a next
                     # step), and a deadline is never starved by an advisor who asks every turn.
                     # A forced move that is not the F4 stall is a different topic from the
@@ -2887,6 +3175,13 @@ class RolePlayEngine:
                     if owed.family != "F4":
                         self._notes.append(NEXT_STEP_PROPOSED_NOTE)
                     return None
+                if self._price_first_due():
+                    # M032 SWEEP-22: she asks the price before she worries about it.  No stall:
+                    # no reason voiced, no stall round, no objection for spacing; HOLD_NOTE stays.
+                    reasons.append("ask_before_close_window")
+                    reasons.append("price_first")
+                    self._price_first_turns += 1
+                    return self._spec_plan(PRICE_FIRST_SPEC, reasons, **layers)
                 self._stalls += 1
                 reasons.append("ask_before_close_window")
                 return self._reason_plan(reasons, ask=wants, **layers)
@@ -2985,7 +3280,17 @@ class RolePlayEngine:
         else:
             return None  # every reason is spent: react in a free reply (the next-step note)
         reasons.append(f"stall_reason:{spec.reason or spec.kind}")
-        if spec.kind == KIND_STALL:
+        price_unknown = (
+            self._probe_first
+            and spec.id == N_MONEY
+            and self._price_asked_turn is not None
+            and not self._price_named()
+            and not self.scheduler.is_delivered(F1_ANCHOR)
+        )
+        if spec.kind == KIND_STALL and not price_unknown:
+            # M032 S2P: the money stall about a price nobody named (SWEEP-22's "still don't know
+            # what it costs") leaves F1-ANCHOR's spacing alone: the anchor is its continuation, and
+            # on the bunching grid the gap it added pushed the F1 pair onto the forced path.
             self.scheduler.note_objection()
         return self._spec_plan(spec, reasons, **layers)
 
@@ -3004,6 +3309,16 @@ class RolePlayEngine:
         """
         if flag_on(FLAG_NO_COMMIT_LEDGER):
             spec = no_commit_spec(spec)
+        if self._probe_first and spec.id == N_MONEY:
+            # M032 SWEEP-22 item 4: the first money stall is about the price he named, or about
+            # not knowing it after her price question went unanswered.
+            first = money_spec(
+                price_named=self._price_named(),
+                price_asked=self._price_asked_turn is not None,
+                first=REASON_MONEY not in self.negotiation.voiced,
+            )
+            if first is not None:
+                spec = first
         dm = self.persona.decision_maker
         variants = tuple(fill_decision_maker(text, dm) for text in spec.variants)
         fallbacks = self._fallback_order(spec.id, variants)
@@ -3126,6 +3441,259 @@ class RolePlayEngine:
             monologue=monologue,
         )
 
+    # --------------------------------------------------------- M032 S2P: probe first
+    def _price_named(self) -> bool:
+        """SWEEP-22 item 1: the advisor named a course price (an offer, a stated total, a low
+        figure, or "free"); a figure-less "it costs money" is none.  Read from the negotiation
+        only."""
+        negotiation = self.negotiation
+        return (
+            negotiation.best_offer_usd is not None
+            or negotiation.latest_total_usd() is not None
+            or bool(negotiation.low_mentions)
+            or negotiation.low_cleared_turn is not None
+            or self._last_price_kind == IMPLAUSIBLE_FREE
+        )
+
+    def _time_known(self) -> bool:
+        """SWEEP-23: the advisor said how long the course runs or its weekly hours, or she already
+        asked the hours (an answer that only says "about two hours" counts)."""
+        return (
+            bool(self._advisor_months or self._advisor_hours)
+            or "weekly_hours" in self._answered
+            or "weekly_hours" in self._curiosity_asked
+        )
+
+    def _probe_allowed(self, move: OwedMove, r_sec: float) -> bool:
+        """S2.10: the probe deadline is the family's deadline less one exchange at the lookahead
+        pace, so the reaction to the answer still lands by the family's unchanged deadline.
+
+        The probe also spends a turn the plan must have (``_probe_slack``): on the bunching grid a
+        probe at 50-65 s an exchange, with no slack left, pushed the families after it onto the
+        forced path.  Without the slack the move itself is due (the check form for F1: "the
+        family's deadline forces it").
+        """
+        deadline = move.deadline_sec
+        return (
+            not move.forced
+            and deadline is not None
+            and r_sec + 2 * self.scheduler.lookahead_sec < deadline
+            and self._probe_slack(r_sec)
+        )
+
+    def _probe_slack(self, r_sec: float) -> bool:
+        """One more turn now still lets every owed graded move land by its family's deadline, and
+        all of them by R 10:00 (``S1_FINISH_BY_SEC``: from 10:00 a stop is scored only with every
+        family delivered, so a probe never makes such a stop unscored), at
+        ``PROBE_TURNS_PER_MOVE`` turns each and the slowest recent pace."""
+        pace = self.scheduler.cautious_lookahead_sec
+        owed = 0
+        for deadline, move_ids in _PACING_MAP:
+            left = sum(1 for move_id in move_ids if not self.scheduler.is_delivered(move_id))
+            owed += left
+            if left and r_sec + pace * (1 + PROBE_TURNS_PER_MOVE * owed) > deadline:
+                return False
+        return r_sec + pace * (1 + PROBE_TURNS_PER_MOVE * owed) <= S1_FINISH_BY_SEC
+
+    def _probe_step(self, move: OwedMove, r_sec: float) -> ProbeSpec | None:
+        """The probe S2.10 owes before ``move`` now, or None (the move itself is due).
+
+        F1-ANCHOR: while no price was named, before the probe deadline and until two of her price
+        questions went unanswered: the price question (a clarifying one after price talk without a
+        figure, a second one after a dodge).  F2-PRIMARY: once, while the advisor said nothing about
+        the time the course takes and she did not ask the hours.  F4-PRIMARY has no probe (its line
+        no longer presumes the cohort).
+        """
+        if move.id == F1_ANCHOR:
+            if (
+                self._price_named()
+                or self._price_dodges >= MAX_PRICE_DODGES
+                or not self._probe_allowed(move, r_sec)
+            ):
+                return None
+            if self._price_talk:
+                return PROBE_F1_CLARIFY
+            return PROBE_F1_AGAIN if self._price_dodges else PROBE_F1
+        if move.id == F2_PRIMARY:
+            if self._time_known() or self._probes.get("F2") or not self._probe_allowed(move, r_sec):
+                return None
+            return PROBE_F2
+        return None
+
+    def _probe_plan(
+        self,
+        probe: ProbeSpec,
+        reasons: list[str],
+        *,
+        first_probes: tuple[str, ...],
+        reveal_topics: tuple[str, ...],
+        monologue: float | None,
+    ) -> TurnPlan:
+        """The probe as an intent the model voices; its scripted questions are the fallback.
+
+        No graded move is issued: the owed move stays pending (its deadline, its enabled time and
+        its issued count are untouched) and reacts to the advisor's answer on a later turn.
+        """
+        key = f"probe:{probe.family}"
+        fallbacks = self._fallback_order(key, probe.variants)
+        self._intent_uses[key] = self._intent_uses.get(key, 0) + 1
+        intent = LearnerIntent(
+            kind=KIND_PROBE,
+            brief=probe.brief,
+            must_say=(),
+            markers=probe.markers,
+            fallback=fallbacks[0],
+            fallbacks=fallbacks,
+        )
+        reasons.append(f"probe:{probe.family}")
+        return self._plan(
+            TurnMode.INTENT,
+            reasons,
+            intent=intent,
+            probe=probe.family,
+            first_probes=first_probes,
+            reveal_topics=reveal_topics,
+            monologue=monologue,
+        )
+
+    def _far_below(self) -> bool:
+        """SWEEP-19: the best price is $3,000 or less, or the last price read was low or free."""
+        best = self.negotiation.best_offer_usd
+        return (best is not None and best <= IMPLAUSIBLE_NET_USD) or self._last_price_kind in (
+            IMPLAUSIBLE_LOW,
+            IMPLAUSIBLE_FREE,
+        )
+
+    def _anchor_situation(self) -> AnchorSituation:
+        """F1-ANCHOR under probe first: it reacts to the advisor's own number, read from the
+        negotiation only (SWEEP-19 item 4), or checks the website's price when nobody said one.
+
+        A price under the $7,000 not read as an offer: the unclear-low anchor; an offer: the
+        above / reached / below anchors; free: what is the catch; a stated total: his number (with
+        the one conflict check when it is $300 or more away from the website's); none: the check.
+        """
+        negotiation = self.negotiation
+        best = negotiation.best_offer_usd
+        unread = negotiation.unread_low_usd()
+        if unread is not None and (best is None or best > ANCHOR_USD):
+            return anchor_after_unclear_low(unread)
+        if best is not None:
+            return anchor_after_offer(
+                best, probe_first=True, counter_v2=flag_on(FLAG_COUNTER_V2)
+            )
+        if self._last_price_kind == IMPLAUSIBLE_FREE:
+            return anchor_after_free()
+        total = negotiation.latest_total_usd()
+        if total is not None:
+            return anchor_after_stated(total)
+        return anchor_check()
+
+    def _redirect_plan(
+        self, move: OwedMove, prefix: str, reasons: list[str], r_sec: float
+    ) -> TurnPlan:
+        """SWEEP-20: the early-close redirect speaks the probe-first step that is due.
+
+        The redirect is forced by the farewell, not by the family's deadline: that is NOT S2.10's
+        "the deadline forces it" exception, so a probe that is still due (no price or time known,
+        before the probe deadline) is what she says, and it delivers nothing (the move goes back to
+        pending, its deadline unchanged; the farewell still used up the one redirect).  Otherwise
+        the redirect speaks the move's probe-first form: the anchor that reacts to the advisor's
+        number or checks the website's, F2's and F4's lines without a course fact, and with
+        R1_COUNTER_V2 the counter that fits the number on the table.
+        """
+        probe = self._probe_step(replace(move, forced=False), r_sec)
+        if probe is not None:
+            self.scheduler.return_to_pending(move.id)
+            self._turn_issued = None
+            line_id = REDIRECT_TIME_LINE if probe.family == "F2" else REDIRECT_PRICE_LINE
+            reasons.append(f"redirect_probe:{probe.family}")
+            self._redirect_probes += 1
+            return self._plan(
+                TurnMode.SAY_ONLY, reasons, scripted=script_line(line_id), probe=probe.family
+            )
+        text = move.text
+        if move.id == F1_ANCHOR:
+            anchor = self._anchor_situation()
+            text = self._fallback_order(move.id, anchor.variants)[0]
+            self._intent_uses[move.id] = self._intent_uses.get(move.id, 0) + 1
+            self.negotiation.note_response(self.turn, f"anchor:{anchor.id}")
+        elif move.id in (F2_PRIMARY, F4_PRIMARY):
+            texts = probe_first_texts(move.id)
+            if texts is not None:
+                text = texts[2]
+        elif move.id == F1_COUNTER and flag_on(FLAG_COUNTER_V2):
+            situation = self.negotiation.counter_situation(
+                counter_v2=True, far_below=self._far_below()
+            )
+            text = self._fallback_order(move.id, situation.variants)[0]
+            self.negotiation.note_response(self.turn, f"counter:{situation.id}")
+        return self._plan(TurnMode.SAY_ONLY, reasons, scripted=f"{prefix} {text}", move_id=move.id)
+
+    def _guard_extras(self, must_say: tuple[str, ...]) -> tuple[frozenset[int], frozenset[float]]:
+        """SWEEP-17 item 4: the amounts and course lengths this reply may say beyond the card.
+
+        The figures the plan owes (its must-say: the check or conflict path), the figures she
+        already said on such a path (they stay allowed for the session), this turn's conflict
+        figures (SWEEP-21: the website's $9,000 and the earlier offer), and the course lengths the
+        advisor said.
+        """
+        owed = " ".join(must_say)
+        amounts = set(dollar_amounts(canonical_amounts(owed))) | self._figures_said
+        amounts |= self._allowed_extra
+        months = set(durations_said(owed)) | self._durations_said | self._advisor_months
+        return frozenset(amounts), frozenset(months)
+
+    def _price_first_due(self) -> bool:
+        """SWEEP-22 item 3: an early ask that would get the money stall gets N-PRICE-FIRST while no
+        price was named, she has not asked it, and F1-ANCHOR is still owed."""
+        return (
+            self._probe_first
+            and not self._price_named()
+            and self._price_asked_turn is None
+            and not self.scheduler.is_delivered(F1_ANCHOR)
+            and self.negotiation.next_reason(self._stall_skip()) == REASON_MONEY
+        )
+
+    def _challenge_note(self) -> str:
+        """CHALLENGE_NOTE, or with probe first FIGURE_CHALLENGE_NOTE when her last heard line held
+        a figure the advisor never said (SWEEP-17 item 6)."""
+        if self._probe_first and self._last_line_unsaid_figure:
+            self._figure_challenges += 1
+            return FIGURE_CHALLENGE_NOTE
+        return CHALLENGE_NOTE
+
+    def _price_reflex_note(self, reading: str) -> str:
+        """SWEEP-22 item 5: the cost or her budget came up with no figure and nobody told her the
+        price: after reacting she asks what the course costs (at most twice a call)."""
+        if (
+            self._price_reflexes >= PRICE_REFLEX_LIMIT
+            or self._price_named()
+            or self._price_asked_turn is not None
+            or self.scheduler.is_delivered(F1_ANCHOR)
+            or self.commitment_resolved
+            or self.last_r >= TIME_CUE_SEC
+            or not self._question_budget()
+        ):
+            return ""
+        cue = price_cue(reading)
+        if cue is None:
+            return ""
+        self._price_reflexes += 1
+        if cue == PRICE_CUE_BUDGET:
+            return PRICE_REFLEX_BUDGET_NOTE
+        example = pick_variant(PRICE_REFLEX_EXAMPLES, f"{self.seed}:reflex", self._price_reflexes)
+        return PRICE_REFLEX_NOTE.format(example=example)
+
+    def _unsaid_figure_in(self, spoken: str) -> bool:
+        """SWEEP-17 item 6: her line holds a figure the advisor never said (not her own $7,000,
+        her budget or her salary): an amount, or a course length."""
+        # The website's price she checked on an allowed path is "something I saw", not a mix-up.
+        own = {ANCHOR_USD, 500, 700, *self.persona.card_amounts, *self._figures_said}
+        amounts = set(dollar_amounts(canonical_amounts(spoken)))
+        if any(amount not in self._advisor_amounts and amount not in own for amount in amounts):
+            return True
+        return course_length_unsaid(spoken, frozenset(self._advisor_months))
+
     # ------------------------------------------------------------------- intents
     def _fallback_order(
         self, key: str, variants: tuple[str, ...], openers: tuple[str, ...] = ()
@@ -3164,10 +3732,29 @@ class RolePlayEngine:
         The price counter depends on how the advisor answered the anchor (R1-Q): push for a bit
         more after a concession short of the ask, "is there nothing at all?" after a refusal,
         "so what is the final price?" when the answer was unclear.
+
+        M032 S2P (probe first, the session's latched R1_PROBE_FIRST): F2-PRIMARY and F4-PRIMARY
+        are worded without a course fact, and F1-ANCHOR reacts to the advisor's own number or
+        checks the website's price (``_anchor_situation``); R1_COUNTER_V2 (SWEEP-19) words the
+        counter for the number on the table and R1_PRICE_CONFLICT (SWEEP-21) asks about a conflict.
+        Markers are unchanged on every path.
         """
+        if self._probe_first:
+            texts = probe_first_texts(move.id)
+            if texts is not None:
+                brief, _worry, line_text, variants = texts
+                move = replace(move, brief=brief, must_say=(), text=line_text, variants=variants)
         if move.id == F1_COUNTER:
-            situation = self.negotiation.counter_situation()
+            counter_v2 = flag_on(FLAG_COUNTER_V2)
+            situation = self.negotiation.counter_situation(
+                counter_v2=counter_v2, far_below=counter_v2 and self._far_below()
+            )
+            conflict = self._turn_conflict
+            if conflict is not None:
+                situation = conflict_counter(conflict[0], conflict[1], conflict[2])
             brief = situation.brief
+            if self._asks_number_now and situation.id in (SITUATION_SHORT, SITUATION_UNCLEAR):
+                brief += YOUR_NUMBER_COUNTER_SUFFIX  # SWEEP-19 item 6
             best = self.negotiation.best_offer_usd
             if best is not None:
                 # What is actually on the table, so the reaction names the real number (and never
@@ -3175,6 +3762,15 @@ class RolePlayEngine:
                 brief += f"; the advisor's best price so far is {format_usd(best)}"
             move = replace(move, brief=brief, variants=situation.variants)
             self.negotiation.note_response(self.turn, f"counter:{situation.id}")
+        elif move.id == F1_ANCHOR and self._probe_first:
+            # S2.10 and SWEEP-19 item 4: the anchor reacts to the advisor's number (from the
+            # negotiation only) or, nobody having said one, checks the website's price; it keeps
+            # its $7,000 marker and must-say and its request on every path.
+            anchor = self._anchor_situation()
+            move = replace(
+                move, brief=anchor.brief, must_say=anchor.must_say, variants=anchor.variants
+            )
+            self.negotiation.note_response(self.turn, f"anchor:{anchor.id}")
         elif move.id == F1_ANCHOR and (
             self.negotiation.best_offer_usd is not None
             or self.negotiation.unread_low_usd() is not None
@@ -3228,6 +3824,8 @@ class RolePlayEngine:
             # Review S2R-5: this turn's own words count (F3-PRIMARY fires when its topic is fresh),
             # the label names what was said, and never while she must say a figure he did not.
             brief = spec.worry
+            if self._probe_first and move.id == F2_PRIMARY:
+                brief = F2_PRIMARY_WORRY_V2  # S2.10: no "a course this long" she was never told
             label = self._preempted_label(spec.family) if spec.role == "primary" else ""
             if label and all(figure in self._advisor_figures for figure in move.must_say):
                 brief += PREEMPTED_SUFFIX.format(label=label)
@@ -3304,7 +3902,12 @@ class RolePlayEngine:
             quiet = [text for text in candidates if "?" not in text]
             stripped = [_without_questions(text) for text in candidates if "?" in text]
             stripped = [text for text in stripped if text and markers_match(intent.markers, text)]
-            if intent.markers and plan.move_id is None and plan.negotiation_id is not None:
+            if (
+                intent.markers
+                and plan.move_id is None
+                and (plan.negotiation_id is not None or plan.probe is not None)
+            ):
+                # M032 S2P: a probe is a question too, so it is never asked as a second one.
                 # When no variant proves a negotiation line without a question, nothing is appended
                 # (owner test 7f2a25e6 turn 32: "What exactly would I be getting for it? What
                 # exactly would that call involve?"); the stall reason stays unused.  A graded owed
@@ -3319,7 +3922,9 @@ class RolePlayEngine:
             else:
                 candidates = (*quiet, *stripped, *candidates)
         chosen = next((text for text in candidates if not _repeats(text, said)), candidates[0])
-        key = plan.move_id or plan.negotiation_id
+        key = plan.move_id or plan.negotiation_id or (
+            f"probe:{plan.probe}" if plan.probe is not None else None
+        )
         if key is not None:
             self._intent_fallbacks[key] = self._intent_fallbacks.get(key, 0) + 1
         # M032 S2 item 8 (counts only): how often a scripted tail was bolted on, and how often the
@@ -3427,6 +4032,7 @@ class RolePlayEngine:
         negotiation_id: str | None = None,
         line_id: str | None = None,
         credit_move_id: str | None = None,
+        probe: str | None = None,
     ) -> TurnPlan:
         reminder: str | None = None
         kind = None if aside else self._break_kind
@@ -3486,12 +4092,23 @@ class RolePlayEngine:
             implausible = bool(self._implausible_note) and not confirm and not reaction_only
             if not confirm and not reaction_only:
                 notes += self._offer_extra_notes()
+            # M032 SWEEP-21 (a): a free reply checks a price conflict once; its note replaces the
+            # new-offer note of the turn (one price note per turn).
+            conflict_note = (
+                self._conflict_note if mode is TurnMode.LLM_REPLY and not confirm else ""
+            )
+            if conflict_note:
+                notes += (conflict_note,)
             intent_join = ""
             if voice_v2 and intent is not None:
                 if move_id in (F1_ANCHOR, F1_COUNTER):
                     intent_join = "price"
                 elif negotiation_id is not None:
                     intent_join = "topic_fresh"  # it answers the advisor's own ask or offer
+                elif probe is not None:
+                    # M032 S2P: the probe grows out of what he said when its topic came up.
+                    fresh = self.scheduler._topic_fresh(probe)
+                    intent_join = "topic_fresh" if fresh else "new_topic"
                 else:
                     spec = MOVE_SPEC_BY_ID.get(move_id or "")
                     family = None if spec is None else spec.family
@@ -3531,11 +4148,14 @@ class RolePlayEngine:
                 must_say=() if intent is None else intent.must_say,
                 intent_forced=False if intent is None else intent.forced,
                 curiosity=curiosity,
-                offer_usd=self.negotiation.best_offer_usd,
+                offer_usd=self._offer_on_table(),
                 # The anchor already reacts to the price on the table: no "pleasant surprise"; and
-                # a careful-buyer note replaces the new-offer note on its turn (SWEEP-13).
+                # a careful-buyer note (SWEEP-13) or a conflict note (SWEEP-21) replaces the
+                # new-offer note on its turn.
                 new_offer_usd=(
-                    None if move_id == F1_ANCHOR or implausible else self._new_offer_usd
+                    None
+                    if move_id == F1_ANCHOR or implausible or conflict_note
+                    else self._new_offer_usd
                 ),
                 notes=notes,
                 reaction_only=reaction_only,
@@ -3563,6 +4183,7 @@ class RolePlayEngine:
                 carries_move=move_id is not None or credit_move_id is not None,
                 # Review S2R-4: ACK_TURN_NOTE asks her to ask her last question again.
                 reask=self._last_questions if ack and self._learner_asked_last() else (),
+                must_say=() if intent is None else intent.must_say,
             )
         else:
             implausible = False
@@ -3586,6 +4207,9 @@ class RolePlayEngine:
             credit_move_id=credit_move_id,
             offer_realism=self._offer_realism,
             implausible=implausible,
+            probe_first=self._probe_first,
+            price_check=self._price_conflict,
+            probe=probe,
         )
 
     # ---------------------------------------------------------------------- speech
@@ -3709,6 +4333,8 @@ class RolePlayEngine:
             self._volunteered_objections += 1
         if spoken_text.strip():
             self._note_not_today(plan, spoken_text, when, f4_owed=f4_owed)
+            if self._probe_first:
+                self._note_probe_first(plan, spoken_text)
         self.negotiation.note_learner_text(
             spoken_text,
             plan.turn,
@@ -3855,6 +4481,36 @@ class RolePlayEngine:
         if free and self._s1_slack(when):
             self.scheduler.note_objection(turn=plan.turn)
             self._volunteered_timing += 1
+
+    def _note_probe_first(self, plan: TurnPlan, spoken_text: str) -> None:
+        """M032 S2P: what her heard line did for probe first (ints and flags; no text is kept).
+
+        A probe she asked (its markers in the played text) is counted, and a price question of any
+        line (the probe, the redirect's, N-PRICE-FIRST or her own) sets ``_price_asked_turn``
+        (SWEEP-22 item 6), so the probe is never asked again and F1-ANCHOR reacts to the answer.  A
+        figure she said on an allowed path stays allowed for the session (SWEEP-17 item 4); and
+        whether the line held a figure the advisor never said is kept for a figure challenge.
+        """
+        probe = plan.probe
+        if probe is not None and markers_match(_PROBE_MARKERS[probe], spoken_text):
+            self._probes[probe] = self._probes.get(probe, 0) + 1
+            self._last_probe_family = probe
+            if probe == "F1":
+                self._price_asked_turn = plan.turn
+        else:
+            self._last_probe_family = None
+        if asks_price(spoken_text):
+            self._price_asked_turn = plan.turn
+        allowed = plan.guard_ctx.allowed_extra
+        if plan.mode is TurnMode.SAY_ONLY and plan.move_id == F1_ANCHOR:
+            allowed = allowed | frozenset(dollar_amounts(canonical_amounts(plan.scripted_text)))
+        for amount in dollar_amounts(canonical_amounts(spoken_text)):
+            if amount in allowed:
+                self._figures_said.add(amount)
+        for months in durations_said(spoken_text):
+            if months in plan.guard_ctx.advisor_durations:
+                self._durations_said.add(months)
+        self._last_line_unsaid_figure = self._unsaid_figure_in(spoken_text)
 
     def _credit_organic_push(self, plan: TurnPlan, spoken_text: str, when: float) -> None:
         """A push the learner already voiced in a free reply is not owed again.
@@ -4033,6 +4689,26 @@ class RolePlayEngine:
                 "soft_tic_trims": self._soft_tic_trims,
                 "implausible_offer_count": self._implausible_count,
             },
+            # M032 S2P, probe first (counts only; only in a session with R1_PROBE_FIRST on, so the
+            # log of a session with it off is the release before): the probes she asked per family,
+            # her price questions that got no figure, the redirects that asked instead of stating,
+            # the course lengths the guard dropped, the figure challenges, SWEEP-22's notes.
+            **(
+                {
+                    "probe_first": {
+                        "probes": dict(sorted(self._probes.items())),
+                        "price_dodges": self._price_dodges,
+                        "price_asked": self._price_asked_turn is not None,
+                        "redirect_probes": self._redirect_probes,
+                        "course_fact_unsaid_count": self.ledger.counts.get(COURSE_FACT, 0),
+                        "figure_challenges": self._figure_challenges,
+                        "price_reflex_notes": self._price_reflexes,
+                        "price_first_turns": self._price_first_turns,
+                    }
+                }
+                if self._probe_first
+                else {}
+            ),
             # Counts only (logged for the rehearsal metrics, not posted): replies that held a
             # question, the tracked phrase tics, and what the advisor already answered.
             "style": {

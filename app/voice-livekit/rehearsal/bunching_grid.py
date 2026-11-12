@@ -41,7 +41,10 @@ Run it from ``app/voice-livekit``::
     python -m rehearsal.bunching_grid --compare-s2    # S1 on and S2 off, then every flag on
 
 ``--compare-s2`` (M032 S2, learner voice) also reports every flag off (origin/main) against every
-flag on.  ``pushy`` (SWEEP-3) is an advisor who asks her to enrol today again and again, with a
+flag on.  ``--compare-s2p`` (M032 S2P, probe first) runs S1 and S2 on with the S2P flags off
+against every flag on, and every flag off against every flag on, with ``answerer`` (an advisor who
+names neither the price nor the length unasked and answers her probe on the next turn; run only
+when named, ``EXTRA_PATTERNS``).  ``pushy`` (SWEEP-3) is an advisor who asks her to enrol today again and again, with a
 learner who says in a free reply that she is not ready to commit today whenever she is asked: her
 volunteered stall spaces the next objection (``note_objection`` is global), so F1, F2 and F3
 lateness is reported for it.
@@ -56,6 +59,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +70,7 @@ _WORKER_DIR = str(Path(__file__).resolve().parents[1])
 if _WORKER_DIR not in sys.path:
     sys.path.insert(0, _WORKER_DIR)
 
+from r1_negotiation import asks_price  # noqa: E402
 from r1_personas import resolve_persona  # noqa: E402
 from r1_roleplay import RolePlayEngine, TurnMode  # noqa: E402
 from r1_scheduler import CURIOSITY_LABELS_V2, CURIOSITY_TOPICS  # noqa: E402
@@ -100,6 +105,14 @@ S2_FLAGS: tuple[str, ...] = (
     "R1_TIC_V2",
     "R1_OFFER_REALISM",
     "R1_REPLY_LENGTH",
+)
+# The M032 S2P rollback flags (probe first).  ``--compare-s2p`` runs S1 and S2 on with these off,
+# then every flag on, and reports every flag off (origin/main) against every flag on.
+S2P_FLAGS: tuple[str, ...] = (
+    "R1_PROBE_FIRST",
+    "R1_OFFER_READER_V2",
+    "R1_COUNTER_V2",
+    "R1_PRICE_CONFLICT",
 )
 # The S1 review's step rows: (fast pace, slow pace, R from which the slow pace applies).
 STEPS: tuple[tuple[float, float, float], ...] = (
@@ -328,6 +341,7 @@ class _Learner:
         self.names_decider = names_decider
         self.says_not_today = says_not_today
         self.advisor_text = ""  # the advisor's turn this reply answers
+        self.last_spoken = ""  # her last heard line (the ``answerer`` advisor answers its probe)
 
     def speak(self, plan: Any, r_sec: float, *, cut: bool = False) -> str:
         engine = self.engine
@@ -358,10 +372,12 @@ class _Learner:
             words = spoken.split()
             self.heard += 1
             engine.record_spoken(plan, " ".join(words[:3]), r_sec=r_sec, interrupted=True)
+            self.last_spoken = ""
             return ""
         if spoken:
             self.heard += 1
             engine.record_spoken(plan, spoken, r_sec=r_sec)
+        self.last_spoken = spoken
         return spoken
 
 
@@ -412,6 +428,31 @@ def _owner_shape(index: int, learner: _Learner) -> str:
     return _cycle(OWNER_SHAPE, index)
 
 
+# M032 S2P: an advisor who never names the price or the length unasked, and answers her probe (the
+# price, then how long it runs) on the very next turn: the probe-then-react path.  Reported.
+ANSWERER = (
+    "What made you start looking at data science right now?",
+    "Our curriculum covers python, sql and machine learning, with mentors from top companies.",
+    "Tell me more about how your week looks.",
+    "Our alumni have moved into analyst roles at good companies after the program.",
+    "Would anyone else be involved in the decision?",
+    "Mentorship and mock interviews are part of the program from the first month.",
+)
+ANSWERER_PRICE = "It's $9,500 for the full program."
+ANSWERER_TIME = "It runs for six months, about eight hours a week."
+_HOW_LONG = re.compile(r"\bhow (?:long|many hours|much time)\b", re.IGNORECASE)
+
+
+def _answerer(index: int, learner: _Learner) -> str:
+    if learner.last_question is not None:
+        return CURIOSITY_ANSWERS[learner.last_question]
+    if asks_price(learner.last_spoken):
+        return ANSWERER_PRICE
+    if _HOW_LONG.search(learner.last_spoken or ""):
+        return ANSWERER_TIME
+    return _cycle(ANSWERER, index)
+
+
 PATTERNS: dict[str, AdvisorFn] = {
     "cooperative": _cooperative,
     "pitcher": _pitcher,
@@ -423,7 +464,11 @@ PATTERNS: dict[str, AdvisorFn] = {
     "cutter_decider": _cutter,
     "owner_shape": _owner_shape,
     "pushy": _pushy,
+    "answerer": _answerer,
 }
+# Patterns run only when asked for by name (``--compare-s2p`` and the S2P grid test): the S1 and
+# S2 grids and their totals stay the ones those slices measured.
+EXTRA_PATTERNS = frozenset({"answerer"})
 # The patterns whose learner names her decision maker when asked who else decides.
 DECIDER_PATTERNS = frozenset({"decider", "cutter_decider"})
 # The patterns whose learner says she is not ready to commit today when asked to enrol today.
@@ -512,8 +557,9 @@ def run_grid(
     patterns: tuple[str, ...] | None = None,
     paces: tuple[float, ...] = PACES,
 ) -> list[RunResult]:
-    """Every pattern at every pace, with ``env`` (flag values) set for the duration."""
-    names = patterns or tuple(PATTERNS)
+    """Every pattern at every pace, with ``env`` (flag values) set for the duration (the
+    ``EXTRA_PATTERNS`` only when named in ``patterns``)."""
+    names = patterns or tuple(name for name in PATTERNS if name not in EXTRA_PATTERNS)
     with mock.patch.dict(os.environ, env or {}):
         return [run_one(name, pace) for name in names for pace in paces]
 
@@ -568,8 +614,13 @@ def s2_flags(value: str, *, s1: str = "1") -> dict[str, str]:
 
 
 def all_flags(value: str) -> dict[str, str]:
-    """Every S1 and S2 rollback flag set to ``value`` (all "0" is origin/main)."""
-    return s2_flags(value, s1=value)
+    """Every S1, S2 and S2P rollback flag set to ``value`` (all "0" is origin/main)."""
+    return {**s2_flags(value, s1=value), **{name: value for name in S2P_FLAGS}}
+
+
+def s2p_flags(value: str) -> dict[str, str]:
+    """Every S2P rollback flag set to ``value``, and every S1 and S2 flag on."""
+    return {**s2_flags("1"), **{name: value for name in S2P_FLAGS}}
 
 
 def totals(results: list[RunResult]) -> dict[str, Any]:
@@ -679,9 +730,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--compare-s2", action="store_true", help="S1 on and S2 off, then every flag on"
     )
+    parser.add_argument(
+        "--compare-s2p", action="store_true", help="S1 and S2 on with S2P off, then every flag on"
+    )
     parser.add_argument("--json", help="write the results to this file")
     args = parser.parse_args(argv)
     out: dict[str, Any] = {}
+    if args.compare_s2p:
+        return _compare_s2p(args.json)
     if args.compare_s2:
         return _compare_s2(args.json)
     settings = (("off", flags("0")), ("on", flags("1"))) if args.compare else (("env", None),)
@@ -734,8 +790,8 @@ def _compare_s2(json_path: str | None) -> int:
     out: dict[str, Any] = {}
     grids = {
         "main": run_grid(all_flags("0")),
-        "s1": run_grid(s2_flags("0")),
-        "s2": run_grid(all_flags("1")),
+        "s1": run_grid({**s2_flags("0"), **{name: "0" for name in S2P_FLAGS}}),
+        "s2": run_grid(s2p_flags("0")),
     }
     for label, results in grids.items():
         print(f"== {label}")
@@ -751,11 +807,53 @@ def _compare_s2(json_path: str | None) -> int:
     for label in grids:
         out[f"pushy_late_{label}"] = late_families(grids[label], "pushy")
         print(f"== pushy late or excluded ({label}): {json.dumps(out[f'pushy_late_{label}'])}")
-    steps = {"s1": run_steps(s2_flags("0")), "s2": run_steps(all_flags("1"))}
+    steps = {
+        "s1": run_steps({**s2_flags("0"), **{name: "0" for name in S2P_FLAGS}}),
+        "s2": run_steps(s2p_flags("0")),
+    }
     gate = gate_regressions(steps["s1"], steps["s2"])
     print("== step rows (s1 -> s2), scoring regressions: " + ("; ".join(gate) or "none"))
     out["step_gate_regressions"] = gate
     out["step_changes"] = regressions(steps["s1"], steps["s2"])
+    if json_path:
+        Path(json_path).write_text(json.dumps(out, indent=1), encoding="utf-8")
+    return 0
+
+
+def _compare_s2p(json_path: str | None) -> int:
+    """M032 S2P: S1 and S2 on with S2P off against every flag on, and every flag off against on.
+
+    The gate (the plan's S2 item 10): no family newly late and the forced path not used materially
+    more (``regressions``, ``FORCED_TOLERANCE``), and on the step rows no new exclusion or lost time
+    cue (``gate_regressions``).  The probe-then-react pattern (``answerer``) is reported.
+    """
+    out: dict[str, Any] = {}
+    every = tuple(PATTERNS)
+    grids = {
+        "main": run_grid(all_flags("0"), patterns=every),
+        "s2": run_grid(s2p_flags("0"), patterns=every),
+        "s2p": run_grid(all_flags("1"), patterns=every),
+    }
+    for label, results in grids.items():
+        print(f"== {label}")
+        print(table(results))
+        print(json.dumps(totals(results)))
+        out[label] = {"totals": totals(results), "runs": [item.as_dict() for item in results]}
+    for base in ("s2", "main"):
+        found = regressions(grids[base], grids["s2p"])
+        print(f"== last graded delivery R ({base} -> s2p)")
+        print(last_delivery_table(grids[base], grids["s2p"]))
+        print(f"== regressions ({base} -> s2p, gated patterns): " + ("; ".join(found) or "none"))
+        out[f"regressions_{base}"] = found
+    steps = {"s2": run_steps(s2p_flags("0")), "s2p": run_steps(all_flags("1"))}
+    gate = gate_regressions(steps["s2"], steps["s2p"])
+    other = regressions(steps["s2"], steps["s2p"])
+    print("== step rows (s2 -> s2p), scoring regressions: " + ("; ".join(gate) or "none"))
+    changes = "; ".join(other) or "none"
+    print("== step rows (s2 -> s2p), later or more forced (reported): " + changes)
+    out["step_gate_regressions"] = gate
+    out["step_changes"] = other
+    out["steps"] = {key: totals(value) for key, value in steps.items()}
     if json_path:
         Path(json_path).write_text(json.dumps(out, indent=1), encoding="utf-8")
     return 0

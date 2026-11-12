@@ -63,6 +63,14 @@ from r1_scheduler import F1_COUNTER, PLAN, SLIP_LIMIT_SEC
 from r1_script import line
 from r1_session import R1Agent, R1Interview, run_r1_session
 from r1_world import FACTS, SCORER_RULE, WORLD_VERSION
+
+# M032 S2P (probe first) rollback flags, all off: the release before it.
+S2P_OFF = {
+    "R1_PROBE_FIRST": "0",
+    "R1_OFFER_READER_V2": "0",
+    "R1_COUNTER_V2": "0",
+    "R1_PRICE_CONFLICT": "0",
+}
 from tests.test_r1_core import (
     ROOM_NAME,
     SESSION_ID,
@@ -577,13 +585,20 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(
                         {m["role"] for m in messages} <= {"system", "user", "assistant"}
                     )
-                    # The session's latched prefix (M032 SWEEP-13, R1_OFFER_REALISM default on).
+                    # The session's latched prefix (M032 SWEEP-13 R1_OFFER_REALISM, S2P
+                    # R1_PROBE_FIRST and R1_PRICE_CONFLICT, each default on).
                     self.assertTrue(plan.offer_realism)
+                    self.assertTrue(plan.probe_first)
                     self.assertEqual(
-                        messages[0]["content"], learner_prefix(rendered, offer_realism=True)
+                        messages[0]["content"],
+                        learner_prefix(
+                            rendered, offer_realism=True, probe_first=True, price_check=True
+                        ),
                     )
-                    self.assertIn(rendered.public_card_text(), blob)
-                    self.assertIn("$9,000", blob)  # all the learner knows of the product
+                    self.assertIn(rendered.public_card_text(probe_first=True), blob)
+                    # M032 S2P (D-M032-7): she knows no course figure; she asks the advisor.
+                    self.assertNotIn("$9,000", blob)
+                    self.assertNotIn("6 months", blob)
                     self.assertEqual(messages[-1], {"role": "user", "content": OPENER})
                     # Hidden needs: this persona's deep needs are not released yet.
                     for topic in ("H1", "H2", "H3"):
@@ -628,7 +643,12 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
         messages = rig.last_messages()
         self.assertEqual(
             messages[0],
-            {"role": "system", "content": learner_prefix(rig.persona, offer_realism=True)},
+            {
+                "role": "system",
+                "content": learner_prefix(
+                    rig.persona, offer_realism=True, probe_first=True, price_check=True
+                ),
+            },
         )
         self.assertEqual(messages[1], {"role": "assistant", "content": rig.persona.pickup_line})
         reminder = messages[-2]
@@ -1515,23 +1535,42 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     CALL_ASK = "Shall I send you the enrolment link so you can enrol today?"
 
     async def test_an_ask_before_the_window_gets_a_reason_and_never_a_commitment(self) -> None:
+        # The release before M032 S2P (probe first off): the money stall.
+        with mock.patch.dict(os.environ, S2P_OFF):
+            rig = Rig()
+            await rig.start_roleplay()
+            await rig.converse(OPENER, advance=20)
+            calls = len(rig.provider.calls)
+            spoken = await rig.converse(self.CALL_ASK, advance=100)
+            plan = rig.plan()
+            # R1-Q: no sanctioned stall line; the learner voices a reason in its own words (one model
+            # call, a scripted variant if the reply misses it) and agrees to nothing.
+            self.assertIs(plan.mode, TurnMode.INTENT)
+            # (Round 1: timing is the owed F4 pair's reason and is not voiced early as well, so the
+            # first reason an early ask meets is money.)
+            self.assertEqual(plan.negotiation_id, "N-MONEY")
+            self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+            self.assertEqual(len(rig.provider.calls), calls + 1)
+            self.assertFalse(rig.engine.commitment_resolved)
+            self.assertIn("ask_before_close_window", plan.reasons)
+            self.assertEqual(rig.engine.negotiation.voiced, {"money": plan.turn})
+            self.assertEqual(rig.engine.ledger.leak_total, 0)
+
+    async def test_with_probe_first_an_early_ask_gets_the_price_question_not_a_stall(
+        self,
+    ) -> None:
+        """M032 SWEEP-22: no price was named, so she asks it; no reason is voiced, no stall."""
         rig = Rig()
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
-        calls = len(rig.provider.calls)
         spoken = await rig.converse(self.CALL_ASK, advance=100)
         plan = rig.plan()
-        # R1-Q: no sanctioned stall line; the learner voices a reason in its own words (one model
-        # call, a scripted variant if the reply misses it) and agrees to nothing.
         self.assertIs(plan.mode, TurnMode.INTENT)
-        # (Round 1: timing is the owed F4 pair's reason and is not voiced early as well, so the
-        # first reason an early ask meets is money.)
-        self.assertEqual(plan.negotiation_id, "N-MONEY")
+        self.assertEqual(plan.negotiation_id, "N-PRICE-FIRST")
+        self.assertIn("?", spoken)
         self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
-        self.assertEqual(len(rig.provider.calls), calls + 1)
         self.assertFalse(rig.engine.commitment_resolved)
-        self.assertIn("ask_before_close_window", plan.reasons)
-        self.assertEqual(rig.engine.negotiation.voiced, {"money": plan.turn})
+        self.assertEqual(rig.engine.negotiation.voiced, {})
         self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_an_ask_in_the_window_gets_the_graded_line_verbatim(self) -> None:
@@ -1579,21 +1618,22 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     async def test_a_callback_proposal_before_the_window_is_met_with_a_reason_through_the_session(
         self,
     ) -> None:
-        rig = Rig()
-        await rig.start_roleplay()
-        await rig.converse(OPENER, advance=20)
-        spoken = await rig.converse(
-            "Can we schedule a call back tomorrow at 10:00 a.m.? I will email you the details.",
-            advance=100,
-            provider=FakeProvider("Okay."),
-        )
-        plan = rig.plan()
-        self.assertEqual(plan.negotiation_id, "N-MONEY")
-        self.assertTrue(spoken.startswith("Okay."))
-        self.assertNotIn("tomorrow", spoken.lower())
-        self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
-        self.assertEqual(rig.engine.negotiation.callbacks, [{"turn": 2, "has_slot": True}])
-        self.assertEqual(rig.engine.ledger.leak_total, 0)
+        with mock.patch.dict(os.environ, S2P_OFF):  # the release before M032 S2P
+            rig = Rig()
+            await rig.start_roleplay()
+            await rig.converse(OPENER, advance=20)
+            spoken = await rig.converse(
+                "Can we schedule a call back tomorrow at 10:00 a.m.? I will email you the details.",
+                advance=100,
+                provider=FakeProvider("Okay."),
+            )
+            plan = rig.plan()
+            self.assertEqual(plan.negotiation_id, "N-MONEY")
+            self.assertTrue(spoken.startswith("Okay."))
+            self.assertNotIn("tomorrow", spoken.lower())
+            self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+            self.assertEqual(rig.engine.negotiation.callbacks, [{"turn": 2, "has_slot": True}])
+            self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_the_same_conversation_gets_the_same_commitment_every_time(self) -> None:
         outcomes = []
@@ -3313,6 +3353,10 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
             ),
         )
+        # M032 SWEEP-20: the redirect probes are a SAY_ONLY plan's text, which travels inside the
+        # reply stream (``llm_node``), like the redirect before them: not warmed either.
+        for line_id in ("L-REDIRECT-PRICE", "L-REDIRECT-TIME"):
+            self.assertNotIn(line_id, r1_session._WARM_ORDER)
         rig, _cache, synth = self.build()
         specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
             candidate_free=False

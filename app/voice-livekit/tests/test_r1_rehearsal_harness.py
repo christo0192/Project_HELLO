@@ -2855,8 +2855,9 @@ class S2BunchingGridTests(unittest.TestCase):
         from rehearsal import bunching_grid
 
         cls.grid = bunching_grid
-        cls.s1 = bunching_grid.run_grid(bunching_grid.s2_flags("0"))
-        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"))
+        s2p_off = {name: "0" for name in bunching_grid.S2P_FLAGS}
+        cls.s1 = bunching_grid.run_grid({**bunching_grid.s2_flags("0"), **s2p_off})
+        cls.on = bunching_grid.run_grid(bunching_grid.s2p_flags("0"))
         cls.main = bunching_grid.run_grid(bunching_grid.all_flags("0"), patterns=("pushy",))
 
     def test_no_gated_run_gets_worse_than_with_s1_alone(self):
@@ -2883,6 +2884,44 @@ class S2BunchingGridTests(unittest.TestCase):
         for phrases in self.grid.CURIOSITY_LABELS_V2.values():
             for phrase in phrases:
                 self.assertIn(phrase, self.grid.CURIOSITY_LABEL_QUESTIONS)
+
+
+class S2PBunchingGridTests(unittest.TestCase):
+    """M032 S2P (probe first, S2 item 10): the probe adds an exchange per fact-based family, so the
+    grid with S1 and S2 on and the S2P flags off is compared with every flag on.  No gated run may
+    turn late or excluded or use the forced path more than ``FORCED_TOLERANCE`` times more, the
+    forced path is not used more in total, and the step rows lose no score.  ``answerer`` (an
+    advisor who answers her price and time questions) shows the probe-then-react path."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        every = tuple(bunching_grid.PATTERNS)
+        cls.s2 = bunching_grid.run_grid(bunching_grid.s2p_flags("0"), patterns=every)
+        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"), patterns=every)
+        cls.steps_s2 = bunching_grid.run_steps(bunching_grid.s2p_flags("0"))
+        cls.steps_on = bunching_grid.run_steps(bunching_grid.all_flags("1"))
+
+    def test_no_gated_run_gets_worse_and_the_forced_path_is_not_used_more(self):
+        self.assertEqual(self.grid.regressions(self.s2, self.on), [])
+        s2 = self.grid.totals(self.s2)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], s2[key])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        self.assertEqual(self.grid.gate_regressions(self.steps_s2, self.steps_on), [])
+
+    def test_the_probe_then_react_path_lands_every_family_at_the_owner_s_pace(self):
+        for item in self.on:
+            if item.pattern == "answerer" and item.pace <= 35:
+                with self.subTest(pace=item.pace):
+                    self.assertEqual(item.late, [])
+                    self.assertEqual(item.excluded, [])
+                    self.assertTrue(all(value is not None for value in item.delivered.values()))
 
 
 if __name__ == "__main__":
