@@ -2952,7 +2952,7 @@ _LATER_TOTAL_TIME_AFTER = re.compile(
 
 
 def _later_total(lowered: str, start: int, end: int) -> bool:
-    """The figure at ``start:end`` is what the price becomes after a deadline (``_LATER_TOTAL_*``)."""
+    """The figure at ``start:end`` is the price after a deadline (``_LATER_TOTAL_*``)."""
     clause = clause_before(lowered, start)
     return bool(
         _LATER_TOTAL_FRAME.search(clause)

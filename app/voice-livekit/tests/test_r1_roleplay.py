@@ -9723,7 +9723,8 @@ class ProbeFirstGradedMeaningTests(unittest.TestCase):
             if plan.move_id in self.PROBE_FIRST_MOVES and spoken
         }
         moves = {
-            move["id"]: move for move in eng.admin_log(final=True, r_end=1150.0)["schedule"]["moves"]
+            move["id"]: move
+            for move in eng.admin_log(final=True, r_end=1150.0)["schedule"]["moves"]
         }
         for move_id in self.PROBE_FIRST_MOVES:
             with self.subTest(move=move_id):

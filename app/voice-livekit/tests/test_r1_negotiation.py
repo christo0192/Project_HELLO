@@ -2987,12 +2987,18 @@ class ProbeFirstNegotiationTests(unittest.TestCase):
                     continue
                 entry = json.loads(line)
                 alone = neg.Negotiation("husband")
-                seen = alone.observe(5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True)
+                seen = alone.observe(
+                    5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True
+                )
                 if seen.conflict is not None:
                     website.append(entry["id"])
                 after = neg.Negotiation("husband")
-                after.observe(4, "I can do $8,000 for you.", anchor_turn=3, reader_v2=True, read_totals=True)
-                seen = after.observe(5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True)
+                after.observe(
+                    4, "I can do $8,000 for you.", anchor_turn=3, reader_v2=True, read_totals=True
+                )
+                seen = after.observe(
+                    5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True
+                )
                 if seen.conflict is not None and seen.conflict[0] == neg.CONFLICT_RISE:
                     rises.add(entry["id"])
         self.assertEqual(website, [])
