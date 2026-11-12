@@ -1127,5 +1127,107 @@ class LearnerBehaviourS03Tests(unittest.TestCase):
         self.assertIn("do not refuse", prefix)
 
 
+class LearnerVoiceS2PromptTests(unittest.TestCase):
+    """M032 S2 reminder texts (``turn_reminder(voice_v2=True, ...)``)."""
+
+    def v2_reminders(self):
+        import r1_prompts as p
+        from r1_scheduler import CURIOSITY_LABELS_V2
+
+        yield turn_reminder(
+            P1, r_sec=10, voice_v2=True, style_note=p.STYLE_NOTES_V2[1], length_note=p.LENGTH_ONE
+        )
+        yield turn_reminder(
+            P1,
+            r_sec=10,
+            voice_v2=True,
+            curiosity=CURIOSITY_LABELS_V2["format"][1],
+            curiosity_v2=True,
+            price_wrap=True,
+            offer_usd=6500,
+            new_offer_usd=6500,
+        )
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, price_wrap=True, offer_usd=8500)
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, new_offer_usd=8500)
+        for spec in PLAN:
+            if not spec.brief:
+                continue
+            for join in ("topic_fresh", "new_topic", "price"):
+                yield turn_reminder(
+                    P1,
+                    r_sec=300,
+                    intent_brief=spec.worry or spec.brief.replace("{decision_maker}", "husband"),
+                    intent_worry=spec.worry,
+                    must_say=spec.must_say,
+                    voice_v2=True,
+                    intent_join=join,
+                    style_note=p.INTENT_OPENER_NOTES[0],
+                )
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, confirm=True)
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, reaction_only=True)
+        notes = (
+            p.HINGE_USED_NOTE, p.VERDICT_USED_NOTE, p.NOT_ANSWERED_NOTE, p.COACH_RESUME_NOTE,
+            p.OFFER_MADE_NOTE_V2, p.ANSWERED_YOU_NOTE_V2, p.PUSH_REACT_NOTE_V2,
+            p.NOT_TODAY_RESERVED_NOTE, p.NO_COMMIT_INTENT_NOTE, p.ACK_TURN_NOTE,
+            p.ACK_TURN_CONCERNS_NOTE.format(concerns="that you want to think it over"),
+            p.SOFT_TIC_NOTE.format(words='"actually"'), p.IMPLAUSIBLE_FREE_NOTE,
+            p.IMPLAUSIBLE_PRICE_NOTE.format(amount="$500"),
+            " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS, p.OFFER_TERMS_FREE_EXTRA)),
+        )
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, notes=notes)
+
+    def test_no_v2_reminder_carries_rubric_vocabulary_or_an_owed_line(self):
+        for text in self.v2_reminders():
+            for word in RUBRIC_WORDS + ("grading", "grader", "graded"):
+                self.assertNotRegex(text, rf"\b{re.escape(word)}\b", word)
+            for spec in PLAN:
+                if spec.line:
+                    self.assertNotIn(spec.line.format(decision_maker="husband"), text)
+                for variant in (*spec.variants, *spec.worry_variants):
+                    self.assertNotIn(variant.format(decision_maker="husband"), text)
+
+    def test_the_rider_is_the_last_line_and_the_worry_is_quoted(self):
+        import r1_prompts as p
+
+        for text in self.v2_reminders():
+            self.assertIn(
+                text.splitlines()[-1], (p.LEARNER_DELIVERY_RIDER, p.LEARNER_DELIVERY_RIDER_BASE)
+            )
+        for spec in PLAN:
+            if spec.worry:
+                text = turn_reminder(
+                    P1, r_sec=300, intent_brief=spec.worry, intent_worry=spec.worry, voice_v2=True
+                )
+                self.assertIn(p.WORRY_LINE.format(worry=spec.worry), text)
+                self.assertNotIn(spec.worry, p.control_prose(text))  # voicing it is no echo
+
+    def test_with_every_s2_argument_at_its_default_the_reminder_is_unchanged(self):
+        import r1_prompts as p
+
+        for kwargs in (
+            {},
+            {"intent_brief": SPEC_BY_ID[F1_ANCHOR].brief, "must_say": ("$9,000",)},
+            {"price_wrap": True, "offer_usd": 8500, "new_offer_usd": 8500},
+            {"curiosity": "how many hours a week it takes"},
+            {"confirm": True},
+            {"reaction_only": True},
+        ):
+            with self.subTest(kwargs=kwargs):
+                text = turn_reminder(P1, r_sec=100, **kwargs)
+                for new in (
+                    p.LEARNER_DELIVERY_RIDER_BASE, p.FREE_REPLY_NOTE_V2, p.INTENT_SHAPE_TOPIC_FRESH,
+                    p.INTENT_SHAPE_NEW_TOPIC, p.INTENT_SHAPE_PRICE, "What is on your mind",
+                    "otherwise leave it for later", "Keep this reply",
+                    "and to anything that came with it", "still more than you hoped to pay",
+                ):
+                    self.assertNotIn(new, text)
+        free = turn_reminder(P1, r_sec=100)
+        self.assertIn(p.FREE_REPLY_NOTE, free)
+        self.assertIn(p.FREE_REPLY_NOTE_V2, turn_reminder(P1, r_sec=100, voice_v2=True))
+        self.assertEqual(learner_prefix(P1), learner_prefix(P1, offer_realism=False))
+        self.assertIn(p.PREFIX_OFFER_SENTENCE, learner_prefix(P1))
+        self.assertIn(p.PREFIX_OFFER_SENTENCE_V2, learner_prefix(P1, offer_realism=True))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -102,9 +102,13 @@ from r1_text import (
     PHRASE_STALL_CLOSER,
     STALL_CLOSER,
     canonical_amounts,
+    TIC_ACTUALLY,
+    TIC_GENUINELY,
     TIC_HMM,
     TIC_HONESTLY,
     TIC_PATTERNS,
+    TIC_PATTERNS_V2,
+    TIC_PROPERLY,
     clause_before,
     dollar_amounts,
     fold,
@@ -245,6 +249,34 @@ _TIC_STRIP = {
         re.compile(r"\s*,\s*" + _HONEST_ASIDE + r"\b[,]?", re.IGNORECASE),
     ),
 }
+# M032 SWEEP-12 (``GuardContext.tic_v2``): "I'll be honest, ..." and "If I'm honest, ..." are the
+# honesty tic too, taken out only before punctuation ("I'll be honest with myself" is the sentence).
+_TIC_STRIP_V2 = {
+    TIC_HMM: _TIC_STRIP[TIC_HMM],
+    TIC_HONESTLY: (
+        re.compile(
+            r"(?:^|(?<=[\s,;-]))i(?:'ll| will) be (?:honest|frank|upfront|straight)"
+            r"(?:\s+with\s+you)?\s*[,:;-]+\s*",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|(?<=[\s,;-]))if i'?m (?:being )?honest\s*[,:;-]+\s*", re.IGNORECASE),
+        *_TIC_STRIP[TIC_HONESTLY],
+    ),
+}
+# The soft tics: trimmed from a FREE reply that carries no owed move when the same tic was in one
+# of the learner's last ``SOFT_TIC_WINDOW`` replies.  "properly" goes only right after think,
+# weigh, look at, consider, read or go through (plus a short object) at a clause end; the
+# adjective "proper" is steered by a note, never cut.
+SOFT_TIC_WINDOW = 3
+_SOFT_TIC_STRIP = {
+    TIC_ACTUALLY: re.compile(r"\s{0,3},?\s{0,3}\bactually\b,?", re.IGNORECASE),
+    TIC_GENUINELY: re.compile(r"\s{0,3},?\s{0,3}\bgenuinely\b,?", re.IGNORECASE),
+}
+_PROPERLY_AFTER_VERB = re.compile(
+    r"\b((?:think|thinking|weigh|weighing|look at|looking at|consider|considering|read|reading|"
+    r"go through|going through)\b(?:\s[\w']+){0,3}?)\sproperly(?=\s{0,3}(?:[.,;:!?]|$))",
+    re.IGNORECASE,
+)
 # "Also, how many hours a week ...", "And before I commit ...": a connector whose sentence was
 # dropped is left hanging, so it goes with it.
 _LEAD_CONNECTOR = re.compile(
@@ -314,6 +346,8 @@ GRATITUDE_REPLACEMENT = "That would be good to know."
 # monthly", over the card's $500-700 a month).  A monthly figure above the card's budget is never
 # called workable; the learner says so instead.
 BUDGET_REPLACEMENT = "That's still more than I can manage each month, though."
+# M032 SWEEP-4 (flag R1_LEARNER_VOICE_V2, ``GuardContext.voice_v2``): without the trailing "though".
+BUDGET_REPLACEMENT_V2 = "That's still more than I can manage each month."
 _PAYMENT_OK = re.compile(
     r"\b(?:workable|doable|manageable|affordable)\b"
     r"|\b(?:that|this|it) (?:works|would work|could work)\b"
@@ -758,6 +792,13 @@ class GuardContext:
     # L5 (mock call aa166f09).  The latest monthly payment the advisor named (None: none): above
     # the card's budget it is never "workable" (``over_budget_accepted``).
     monthly_quote_usd: int | None = None
+    # M032 S2 (the engine's flags, read once per plan): ``voice_v2`` (R1_LEARNER_VOICE_V2) picks the
+    # S2 replacement lines; ``tic_v2`` (R1_TIC_V2, SWEEP-12) reads the wider honesty tic and trims a
+    # repeated soft tic in a free reply that carries no owed move (``carries_move``: the plan voices
+    # or may complete one, so "actually help" stays for F3-PUSH's markers).
+    voice_v2: bool = False
+    tic_v2: bool = False
+    carries_move: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -780,6 +821,8 @@ class GuardResult:
     fallback_used: bool
     truncated: bool = False
     style_edits: int = 0
+    # M032 SWEEP-12: soft tics trimmed from this reply (a count, logged in session_facts).
+    soft_tic_trims: int = 0
 
     @property
     def clean(self) -> bool:
@@ -1285,8 +1328,9 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
             return ANCHOR_REPLACEMENT
         if rule == "gratitude_for_nothing":
             return GRATITUDE_REPLACEMENT
-        if rule == "over_budget_accepted" and repeat_kind(BUDGET_REPLACEMENT, ctx.said) is None:
-            return BUDGET_REPLACEMENT
+        budget = BUDGET_REPLACEMENT_V2 if ctx.voice_v2 else BUDGET_REPLACEMENT
+        if rule == "over_budget_accepted" and repeat_kind(budget, ctx.said) is None:
+            return budget
     return ""
 
 
@@ -1343,6 +1387,7 @@ class StreamGuard:
         self._phrases_used: dict[str, int] = {}  # tracked phrases used so far in this reply
         self._last_dropped = False  # the sentence before this one was dropped
         self._anchor_seen = False  # an earlier sentence of this reply named the $7,000
+        self._soft_tic_trims = 0  # M032 SWEEP-12: soft tics taken out of this reply
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -1484,8 +1529,11 @@ class StreamGuard:
         if not ctx.is_learner or ctx.mode != "reply" or len(sentence) > STYLE_MAX_CHARS:
             return sentence
         text = sentence
-        for tic, patterns in _TIC_STRIP.items():
-            if TIC_PATTERNS[tic].search(text) is None:
+        strips, detect = (
+            (_TIC_STRIP_V2, TIC_PATTERNS_V2) if ctx.tic_v2 else (_TIC_STRIP, TIC_PATTERNS)
+        )
+        for tic, patterns in strips.items():
+            if detect[tic].search(text) is None:
                 continue
             if self._tic_allowed(tic):
                 self._reply_fillers += 1
@@ -1493,6 +1541,8 @@ class StreamGuard:
             for pattern in patterns:
                 text = pattern.sub(_filler_gap, text)
         text = self._single_filler(text)
+        if ctx.tic_v2 and ctx.free_reply and not ctx.carries_move:
+            text = self._trim_soft_tics(text)
         if self._reply_fillers >= 1:
             text = _INLINE_FILLER.sub(_filler_gap, text)
         if not self._emitted:
@@ -1528,6 +1578,24 @@ class StreamGuard:
         if self._drop_question(text):
             self._style_edits += 1
             return ""
+        return text
+
+    def _trim_soft_tics(self, text: str) -> str:
+        """SWEEP-12: a soft tic she used in one of her last ``SOFT_TIC_WINDOW`` replies is taken out
+        ("What would I actually work on?" -> "What would I work on?"); never down to one word."""
+        recent = self.ctx.recent_styles[-SOFT_TIC_WINDOW:]
+        for tic in (TIC_ACTUALLY, TIC_GENUINELY, TIC_PROPERLY):
+            if TIC_PATTERNS_V2[tic].search(text) is None:
+                continue
+            if not any(tic in tics for _opener, tics in recent):
+                continue
+            if tic == TIC_PROPERLY:
+                trimmed = _PROPERLY_AFTER_VERB.sub(r"\1", text)
+            else:
+                trimmed = _SOFT_TIC_STRIP[tic].sub(_filler_gap, text)
+            if trimmed != text and word_count(trimmed) >= 2:
+                text = trimmed
+                self._soft_tic_trims += 1
         return text
 
     def _single_filler(self, text: str) -> str:
@@ -1679,6 +1747,7 @@ class StreamGuard:
             fallback_used=self._fallback_used,
             truncated=self._truncated,
             style_edits=self._style_edits,
+            soft_tic_trims=self._soft_tic_trims,
         )
 
 

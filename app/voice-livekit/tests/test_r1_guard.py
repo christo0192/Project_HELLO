@@ -2590,5 +2590,92 @@ class LearnerS03GuardTests(unittest.TestCase):
         self.assertIn("over_budget_accepted", rules)
 
 
+class LearnerVoiceS2GuardTests(unittest.TestCase):
+    """M032 S2 in the guard: SWEEP-12's wider honesty tic and soft tics (``tic_v2``), SWEEP-4's
+    budget line without "though" (``voice_v2``), and SWEEP-13's careful-buyer reactions.  Every
+    line is synthetic."""
+
+    P1 = resolve_persona("p1_career_switcher", variant="v1")
+
+    def ctx(self, styles=(), **kwargs):
+        kwargs.setdefault("tic_v2", True)
+        kwargs.setdefault("free_reply", True)
+        return GuardContext(
+            phase="roleplay", persona=self.P1, mode="reply", seed="s", turn=4,
+            recent_styles=tuple(styles), **kwargs,
+        )
+
+    def test_ill_be_honest_is_the_honesty_tic_only_as_an_aside(self):
+        recent = [("i", ("honestly",))]
+        self.assertEqual(
+            guard_text("I'll be honest, the fee worries me.", self.ctx(recent)).text,
+            "The fee worries me.",
+        )
+        self.assertEqual(
+            guard_text("If I'm honest, it's a lot for me.", self.ctx(recent)).text,
+            "It's a lot for me.",
+        )
+        # The sentence itself, not an aside: kept.
+        text = "I'll be honest with myself about it."
+        self.assertEqual(guard_text(text, self.ctx(recent)).text, text)
+        # Flag off: the release before did not read "I'll be honest" at all.
+        text = "I'll be honest, the fee worries me."
+        self.assertEqual(guard_text(text, self.ctx(recent, tic_v2=False)).text, text)
+
+    def test_a_soft_tic_used_lately_is_taken_out_of_a_free_reply(self):
+        for tic, text, expected in (
+            ("actually", "What would I actually work on?", "What would I work on?"),
+            ("genuinely", "I'm genuinely unsure about the time.", "I'm unsure about the time."),
+            ("properly", "I need to weigh this properly.", "I need to weigh this."),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx([("i", (tic,))]))
+                self.assertEqual(result.text, expected)
+                self.assertEqual(result.soft_tic_trims, 1)
+                self.assertEqual(guard_text(text, self.ctx()).text, text)  # not used lately
+                off = guard_text(text, self.ctx([("i", (tic,))], tic_v2=False))
+                self.assertEqual(off.text, text)  # flag off: the release before
+                self.assertEqual(off.soft_tic_trims, 0)
+
+    def test_the_adjective_proper_and_a_properly_with_no_thinking_verb_stay(self):
+        recent = [("i", ("properly",))]
+        for text in ("I want to do it properly.", "I'll give it a proper look."):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(recent)).text, text)
+
+    def test_a_reply_that_carries_an_owed_move_keeps_its_words(self):
+        """A cut continuation credited to F3-PUSH: "actually help" is part of its proof."""
+        from r1_scheduler import F3_PUSH, SPEC_BY_ID, markers_match
+
+        text = "Would this actually help, given how few jobs there are?"
+        recent = [("i", ("actually",))]
+        kept = guard_text(text, self.ctx(recent, carries_move=True)).text
+        self.assertEqual(kept, text)
+        self.assertTrue(markers_match(SPEC_BY_ID[F3_PUSH].markers, kept))
+        intent = guard_text(text, self.ctx(recent, free_reply=False)).text
+        self.assertEqual(intent, text)  # an intent reply is never trimmed
+
+    def test_the_budget_line_drops_its_though_under_voice_v2(self):
+        text = "Okay, that's workable for me."
+        old = guard_text(text, ctx(monthly_quote_usd=1000)).text
+        new = guard_text(text, ctx(monthly_quote_usd=1000, voice_v2=True)).text
+        self.assertEqual(old, r1_guard.BUDGET_REPLACEMENT)
+        self.assertEqual(new, r1_guard.BUDGET_REPLACEMENT_V2)
+        self.assertNotIn("though", new)
+
+    def test_a_careful_buyers_reactions_pass_for_every_persona(self):
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                context = GuardContext(phase="roleplay", persona=rendered, mode="reply")
+                for line in (
+                    "Free? That surprises me. What's the catch?",
+                    "Wait, why is it so much lower than I expected?",
+                ):
+                    for sentence in line.replace("? ", "?\n").replace(". ", ".\n").splitlines():
+                        with self.subTest(persona=rendered.id, sentence=sentence):
+                            self.assertEqual(check_sentence(sentence, context), [])
+
+
 if __name__ == "__main__":
     unittest.main()

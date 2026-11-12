@@ -210,6 +210,8 @@ CONCERN_LABELS: tuple[tuple[str, str], ...] = (
     ("offended", "that their remark upset you"),
     ("think_over", "that you want to think it over"),
     ("trust", "that you would want proof before trusting it"),
+    # M032 SWEEP-3 (flag R1_NO_COMMIT_LEDGER; recorded only while it is on).
+    ("not_today", "that you are not ready to decide or commit today"),
 )
 VOICED_CONCERNS_NOTE = (
     "- You have already told the advisor {concerns}. Do not say that again in any words: "
@@ -283,6 +285,20 @@ STYLE_NOTES: tuple[str, ...] = (
     "- Start with the part of their answer you want to pick up on, in your own words.",
     '- Do not start with "That" or "That\'s" this time; start with the point itself.',
 )
+# M032 SWEEP-4 (flag R1_LEARNER_VOICE_V2): [1] no longer asks for an acknowledgement before the
+# point and [3] no longer for "how it landed"; the other six are unchanged (all eight unique).  An
+# intent turn draws from the six that fit an owed point: never [2] (a question back on top of an
+# owed point that is often a question) and never [1] (an acknowledgement, then the point as its
+# own sentence, is the hinge the intent shapes avoid).
+STYLE_NOTES_V2: tuple[str, ...] = (
+    STYLE_NOTES[0],
+    "- Start with a word or two of acknowledgement that you have not used in your last replies, "
+    "not a judgement of their answer, then make your point as its own sentence.",
+    STYLE_NOTES[2],
+    "- Start with what their answer means for you, in plain words and without a filler.",
+    *STYLE_NOTES[4:],
+)
+INTENT_OPENER_NOTES: tuple[str, ...] = (STYLE_NOTES_V2[0], STYLE_NOTES_V2[3], *STYLE_NOTES_V2[4:])
 REACTION_ONLY_NOTE = (
     "Reply as the learner with ONE short sentence that reacts to what the advisor just said, "
     "in terms of how it lands for you and without repeating any course detail. Nothing more: "
@@ -307,6 +323,213 @@ INTENT_PRICE_NOTE = (
     "- The advisor has now answered you twice on price: do not accept, concede or push on "
     "price again in this reply."
 )
+# The free reply's job line of the release before M032 S2 (flag R1_LEARNER_VOICE_V2 off).
+FREE_REPLY_NOTE = (
+    "Reply as the learner, naturally: react to what the advisor just said, "
+    f"{REACT_HOW_IT_LANDS}, then answer what they asked. Do not volunteer worries, "
+    "money or timing details the advisor did not ask about."
+)
+INTENT_ANSWERING_NOTE = (
+    "Reply as the learner, naturally: the advisor asked you something, so answer that "
+    "first, fully but briefly, from your card or backstory. Then let the point below come "
+    "out of your answer, linked to it, not as a new topic tacked on at the end."
+)
+
+# ----------------------------------------------------------------------------------------------
+# M032 S2, learner voice (owner decisions D-M032-4 and D-M032-7; flag R1_LEARNER_VOICE_V2 and the
+# sweep flags, read by ``r1_roleplay``).  New wording: every text below is listed word for word
+# in the slice report for owner and HR review.  None of it states a course fact, and the learner
+# prefix is untouched (all of it is per-turn reminder text, the DeepSeek prefix-cache rule).
+# ----------------------------------------------------------------------------------------------
+# SWEEP-4: a reaction picks up one thing the advisor said, as a feeling or a short question; it
+# never says a course detail back (the guard's product-statement rule) and never grades the answer
+# (fda9e9f6: 8 of 27 lines opened "That sounds reasonable", "Fair enough", ...).  No quoted example
+# acknowledgements anywhere: the model copies quoted examples.  The spec's "grading their answer"
+# is "judging their answer" here: the learner's context never carries the word "grading" (the
+# public-card test: no rubric, scorer or grading words reach her).
+REACT_SPECIFIC = (
+    "with a feeling or a short question about one specific thing they said, never by repeating "
+    "a course detail back to them and never by judging their answer"
+)
+FREE_REPLY_NOTE_V2 = (
+    "Reply as the learner, naturally: if the advisor asked you something, answer that first. "
+    "Otherwise pick up the one thing they said that matters most to you and react to it as one "
+    "thought, with a feeling or a short question about it, never by repeating a course detail "
+    "back to them and never by judging their answer. Do not volunteer worries, money or timing "
+    "details the advisor did not ask about."
+)
+# S2 item 1 (RCA LR-2, phone map spoken-style M1 and question-flow M2).  How an owed point joins
+# the reaction: out of what the advisor just said when its topic came up (as one thought, never
+# "[ack], but"), or as an honest change of subject once the reaction is done.  A price move is
+# naturally "X, but Y", so its shape has no "but" rule (verifier correction to M1).  The answering
+# shape (``INTENT_ANSWERING_NOTE``) is unchanged.
+INTENT_SHAPE_TOPIC_FRESH = (
+    "Reply as the learner, naturally, as one thought: react to what the advisor just said "
+    f"{REACT_SPECIFIC}, and let the point below grow straight out of that same thing. Do not "
+    'join the two with "but" or "though".'
+)
+INTENT_SHAPE_NEW_TOPIC = (
+    "Reply as the learner, naturally: first finish reacting to what the advisor just said, "
+    f"{REACT_SPECIFIC}. Then turn to the point below the way a person changes the subject, with a "
+    'few words that say something else is on your mind, never with "but" or "though".'
+)
+INTENT_SHAPE_PRICE = (
+    "Reply as the learner, naturally, in one flowing thought: react to what the advisor just "
+    f"said {REACT_SPECIFIC}, and let the point below come straight out of that reaction, with at "
+    "most one question in the whole reply."
+)
+# S2 item 3 (phone map spoken-style M10): an owed worry is an objective, not a sentence.
+WORRY_LINE = (
+    '- What is on your mind: "{worry}". Say it in your own words, however a real person would, '
+    "as a worry or as a question; do not read it out."
+)
+# S2 item 2 (phone map spoken-style M9): the per-turn delivery rider, the LAST line of every
+# learner reminder (the phone team measured that per-turn style rules hold on DeepSeek V4 Flash and
+# prefix rules do not).  At most 60 tokens.  Its second sentence is SWEEP-4's frequency rule, not
+# an absolute ban, and it goes on free and intent replies only; a confirmation and the one-sentence
+# reaction before a scripted line get the first sentence alone.
+LEARNER_DELIVERY_RIDER_BASE = (
+    "- Talk like a real person on the phone: contractions, everyday words, a comma where you "
+    "would breathe."
+)
+LEARNER_DELIVERY_RIDER = (
+    LEARNER_DELIVERY_RIDER_BASE
+    + " Do not make it a habit to judge or thank them and then turn it round with but or "
+    "though; open with what their point means for you, or with a question."
+)
+# SWEEP-4: the next reply after a hinge or a verdict opener is told so (never both, never on a
+# confirmation); steering only, nothing is trimmed.
+HINGE_USED_NOTE = (
+    "- Your last reply opened with a quick reaction and then turned it round with but or though. "
+    "Do not open that way this time: start with what is actually on your mind."
+)
+VERDICT_USED_NOTE = (
+    "- Your last reply opened by judging what the advisor said. Do not do that again: start this "
+    "one with what it means for you, or with a question."
+)
+# S2 item 5 (phone map question-flow, missed "anti-validation"): her last line raised a worry and
+# the advisor's turn did not touch it.
+NOT_ANSWERED_NOTE = (
+    "- The advisor has not really answered the worry you raised last. Do not open by calling their "
+    "reply reasonable, good, fair or helpful: respond to what they actually said."
+)
+# S2 item 7 (RCA critic, fda9e9f6 #34-#37): after the coach aside the aside turn is not in her
+# context, so to the model the advisor answered her greeting with "Okay, sure." and she greeted
+# again.  She carries on where the call was.
+COACH_RESUME_NOTE = (
+    "- The call was paused for a moment and has just resumed. Carry on from where the conversation "
+    "was: do not greet the advisor again, do not thank them for calling again and do not start the "
+    "call over."
+)
+# SWEEP-4: the S1 notes without "how it lands for you" (flag off: the S1 texts above).
+OFFER_MADE_NOTE_V2 = (
+    "- The advisor just offered you something. Respond to that offer first, in a few words, "
+    "saying what it would mean for you, without accepting a call, a day, a time or a payment."
+)
+ANSWERED_YOU_NOTE_V2 = (
+    "- The advisor just answered the question you asked. React to one specific thing in their "
+    "answer first, in a few words, with a feeling or a short follow-up question, not by calling it "
+    "good, fair or reassuring."
+)
+PUSH_REACT_NOTE_V2 = (
+    "- React to what the advisor just said before anything else: pick up one specific thing they "
+    "said and say what it means for you as a feeling, or ask one short follow-up question about "
+    "it. Do not repeat their promises (placement, guarantees, refunds, success rates) back as "
+    "facts, do not raise a new worry or a new topic this turn, and do not state course details "
+    "yourself."
+)
+# SWEEP-5 (S2.6): the price notes have one owner and one text each.  No quoted example sentence
+# (fda9e9f6 #65-66 said a near-copy of it), no "pleasantly surprised" (copied as "It's a pleasant
+# surprise"), no stall priming, and she reacts to the whole offer, not only the number.
+NEW_OFFER_NOTE_V2 = (
+    '- The advisor just lowered the price to "{amount}". You may sound a little pleased, in your '
+    "own words, but do not accept it or thank them into agreement."
+)
+NEW_OFFER_ABOVE_ASK_NOTE = (
+    '- The advisor just lowered the price to "{amount}". It is still more than you hoped to pay: '
+    "you may sound a little encouraged, in your own words, but do not accept it or thank them "
+    "into agreement."
+)
+OFFER_ON_TABLE_NOTE_V2 = (
+    '- The advisor has now answered you twice on price and has "{amount}" on the table. React in '
+    "your own words to that number and to anything that came with it. Do not accept it, agree to "
+    "it or push for more. If they ask whether it is fine with you, say it is still more than you "
+    "planned for."
+)
+OFFER_MET_NOTE_V2 = (
+    '- The advisor has now answered you twice on price and has "{amount}" on the table, at or '
+    "below the $7,000 you asked for. React in your own words to that number and to anything that "
+    "came with it, for example that it is no more than the $7,000 you heard people got it for: "
+    "never say it is too much, still a lot or out of reach, and never say it is fine, good or "
+    "acceptable. Do not accept it, and do not repeat a reason for waiting that you already gave."
+)
+OFFER_TERMS_HEADER = (
+    "- The advisor's offer also had a part besides the price: react to that part too, in a few "
+    "words of your own, not only to the number."
+)
+OFFER_TERMS_INSTALMENTS = (
+    "They offered monthly instalments. React in a few words, and if they named no monthly figure, "
+    "you may ask what it would come to each month; do not say why monthly would help, and do not "
+    "call it affordable or workable before you hear that figure."
+)
+OFFER_TERMS_FREE_EXTRA = (
+    "They added something for free. Acknowledge it briefly or ask one short question about it; do "
+    "not repeat its details back as a fact."
+)
+# SWEEP-13: a price far below anything she expected, or the course for free, gets a careful
+# buyer's surprise (the owner probed both: "a big drop, so it does catch my attention", and a
+# cost-management worry at $500).  On that turn only, at most twice a call.
+IMPLAUSIBLE_PRICE_NOTE = (
+    "- The advisor just put the price at {amount}, far below anything you expected to pay. A "
+    "careful buyer would be surprised and a little wary: say so in your own words, and you may ask "
+    "once why it is so much lower. Do not accept it, thank them for it or call it fine."
+)
+IMPLAUSIBLE_FREE_NOTE = (
+    "- The advisor just talked about giving you the course for free. A careful buyer would be "
+    "surprised and a little wary: say so in your own words, and you may ask once what the catch "
+    "is. Do not accept it, thank them for it or call it fine."
+)
+# SWEEP-3: the not-today stall belongs to F4-PRIMARY (aa166f09: about eleven free replies said it,
+# one right before F4-PRIMARY said it as news).
+NOT_TODAY_RESERVED_NOTE = (
+    "- Do not say in this reply whether you are ready to decide, or that you will think it over or "
+    "get back to them: respond to what the advisor just said."
+)
+NO_COMMIT_INTENT_NOTE = (
+    "- You have already told the advisor that you are not deciding today: do not add it again; "
+    "the point below is enough."
+)
+# SWEEP-11: a lone "okay" or "hmm" from the advisor (b419d478: she dropped her own question and
+# voiced a price worry again; 8f5bfefc: the stall again).
+ACK_TURN_NOTE = (
+    '- The advisor only said a word like "okay" or "hmm". Do not thank them, do not repeat or '
+    "reword what you already said, and add no new worry. If your last line asked them something, "
+    "do not drop it: ask it again in a few words. Otherwise ask one short question about something "
+    "you still want to know."
+)
+ACK_TURN_CONCERNS_NOTE = (
+    '- The advisor only said a word like "okay" or "hmm". You have already told them {concerns}, '
+    "so do not say that again in any words. Do not thank them and add no new worry. If your last "
+    "line asked them something, do not drop it: ask it again in a few words. Otherwise ask one "
+    "short question about something you still want to know."
+)
+# SWEEP-12: the soft tics ("actually", "genuinely", "properly", "I'd rather"); ``{words}`` is a
+# worker-built list of quoted words.
+SOFT_TIC_NOTE = "- You have leaned on {words} lately: leave them out of this reply."
+CURIOSITY_NOTE = (
+    '- You are curious about "{curiosity}". If the moment fits, ask the advisor one short question '
+    "about it in your own words."
+)
+CURIOSITY_NOTE_V2 = (
+    '- You are curious about "{curiosity}". If it connects to what the advisor just said, ask them '
+    "one short question about it, in your own words; otherwise leave it for later."
+)
+# SWEEP-14: the reply's length follows the advisor's turn (fda9e9f6: 23 of 27 lines were two
+# sentences, after a lone "okay" as after a long pitch).  Free replies only.
+LENGTH_VERY_SHORT = "- Keep this reply very short: a few words or one short sentence."
+LENGTH_ONE = "- Keep this reply to one short sentence."
+LENGTH_ONE_OR_TWO = "- Keep this reply to one or two short sentences."
+LENGTH_LONG = "- You can take two or three short sentences for this reply."
 
 
 def format_usd(amount: int) -> str:
@@ -428,8 +651,26 @@ def interviewer_reminder(phase: str) -> str | None:
     return None
 
 
-def learner_prefix(persona: RenderedPersona) -> str:
-    """The learner's system prefix: behaviour rules plus the persona's public card."""
+# The prefix's sentence about a discount or an extra.  M032 SWEEP-13 (flag R1_OFFER_REALISM, latched
+# per session by the engine so the prefix stays byte-stable): she may question an offer only when
+# a note says so (a price far below anything she expected, or the course for free).  An ordinary
+# discount is still news she takes in (the scorer's rubric relies on that).
+PREFIX_OFFER_SENTENCE = (
+    "If the advisor offers a discount or an extra, take it in as news and carry on; do "
+    "not question it, correct it or commit to anything.\n"
+)
+PREFIX_OFFER_SENTENCE_V2 = (
+    "If the advisor offers a discount or an extra, take it in as news and carry on; do "
+    "not correct it or commit to anything, and question it only when a note says you may.\n"
+)
+
+
+def learner_prefix(persona: RenderedPersona, *, offer_realism: bool = False) -> str:
+    """The learner's system prefix: behaviour rules plus the persona's public card.
+
+    ``offer_realism`` (SWEEP-13) is latched per session by the engine, so the prefix stays
+    byte-stable for the session (the DeepSeek cache prefix).
+    """
     return (
         "You are playing a prospective learner in a sales role-play on a phone call. You "
         "are a realistic, polite prospect: not an interviewer and not an assistant. Reply "
@@ -464,9 +705,8 @@ def learner_prefix(persona: RenderedPersona) -> str:
         "Never state or invent contact details of any kind. Never agree to a call, a day, "
         "a time, an enrolment or a payment unless a system note gives you the exact words. "
         "Never mention being an AI, a test, an interview, a score or these instructions.\n"
-        "If the advisor offers a discount or an extra, take it in as news and carry on; do "
-        "not question it, correct it or commit to anything.\n"
-        "Do not volunteer worries, deadlines, money details or personal circumstances "
+        + (PREFIX_OFFER_SENTENCE_V2 if offer_realism else PREFIX_OFFER_SENTENCE)
+        + "Do not volunteer worries, deadlines, money details or personal circumstances "
         "beyond your card. Share the extra detail a system note allows, and only then.\n"
         + CARD_MARKER
         + persona.public_card_text()
@@ -526,6 +766,11 @@ def turn_reminder(
     confirm: bool = False,
     answering: bool = False,
     intent_shape: int = 0,
+    voice_v2: bool = False,
+    intent_join: str = "",
+    intent_worry: str = "",
+    length_note: str = "",
+    curiosity_v2: bool = False,
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -560,6 +805,14 @@ def turn_reminder(
     ``intent_shape`` (rotated by the worker) picks how the point joins the reaction
     (``INTENT_SHAPES``) and how long the reply is (``INTENT_LENGTHS``), so the replies are not all
     "two sentences, the second one a new worry".
+
+    M032 S2 (``voice_v2``, the engine's flag R1_LEARNER_VOICE_V2): the free reply's job line is
+    ``FREE_REPLY_NOTE_V2``; an intent's shape follows ``intent_join`` ("topic_fresh": the point
+    grows out of what the advisor just said; "price": a price move; anything else: an honest change
+    of subject); an owed worry is an objective (``intent_worry``, ``WORRY_LINE``); the price notes
+    are SWEEP-5's single texts; and the delivery rider is the last line.  ``length_note``
+    (SWEEP-14) is the free reply's length line and ``curiosity_v2`` (SWEEP-12) the curiosity line
+    that waits for a fitting moment.  With every one of them at its default the note is unchanged.
     """
     lines = [f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}."]
     if reaction_only:
@@ -571,29 +824,33 @@ def turn_reminder(
         if style_note:
             lines.append(style_note)
         lines.extend(note for note in notes if note)
+        if voice_v2:
+            lines.append(LEARNER_DELIVERY_RIDER_BASE)
         return "\n".join(lines)
     if intent_brief and answering:
         # L2 (mock call aa166f09: 18 of 41 replies tacked a new worry onto a short acknowledgement,
         # and turn 52 answered "what ROI are you expecting?" with a question of her own).
-        lines.append(
-            "Reply as the learner, naturally: the advisor asked you something, so answer that "
-            "first, fully but briefly, from your card or backstory. Then let the point below come "
-            "out of your answer, linked to it, not as a new topic tacked on at the end."
-        )
+        lines.append(INTENT_ANSWERING_NOTE)
+    elif intent_brief and voice_v2:
+        if intent_join == "topic_fresh":
+            lines.append(INTENT_SHAPE_TOPIC_FRESH)
+        elif intent_join == "price":
+            lines.append(INTENT_SHAPE_PRICE)
+        else:
+            lines.append(INTENT_SHAPE_NEW_TOPIC)
     elif intent_brief:
         lines.append(INTENT_SHAPES[intent_shape % len(INTENT_SHAPES)])
     elif not reaction_only:
-        lines.append(
-            "Reply as the learner, naturally: react to what the advisor just said, "
-            f"{REACT_HOW_IT_LANDS}, then answer what they asked. Do not volunteer worries, "
-            "money or timing details the advisor did not ask about."
-        )
+        lines.append(FREE_REPLY_NOTE_V2 if voice_v2 else FREE_REPLY_NOTE)
     lines.append(IGNORE_RULE_NOTE)
     if intent_brief:
-        lines.append(
-            "- Raise this in your own words, as a real person would, without reading it out: "
-            f'"{intent_brief}".'
-        )
+        if intent_worry and voice_v2:
+            lines.append(WORRY_LINE.format(worry=intent_worry))
+        else:
+            lines.append(
+                "- Raise this in your own words, as a real person would, without reading it out: "
+                f'"{intent_brief}".'
+            )
         figures = tuple(must_say)
         if figures:
             # No quote marks around the figures: the model copied them into its reply ("$7,000"
@@ -634,23 +891,35 @@ def turn_reminder(
         if intent_brief:
             lines.append(INTENT_PRICE_NOTE)
         elif offer_usd is not None:
-            note = OFFER_MET_NOTE if offer_usd <= ANCHOR_PRICE_USD else OFFER_ON_TABLE_NOTE
+            if offer_usd <= ANCHOR_PRICE_USD:
+                note = OFFER_MET_NOTE_V2 if voice_v2 else OFFER_MET_NOTE
+            else:
+                note = OFFER_ON_TABLE_NOTE_V2 if voice_v2 else OFFER_ON_TABLE_NOTE
             lines.append(note.format(amount=format_usd(offer_usd)))
         else:
             lines.append(PRICE_WRAP_NOTE)
     if new_offer_usd is not None and not reaction_only and not (price_wrap and intent_brief):
-        lines.append(NEW_OFFER_NOTE.format(amount=format_usd(new_offer_usd)))
+        if not voice_v2:
+            note = NEW_OFFER_NOTE
+        elif new_offer_usd > ANCHOR_PRICE_USD:
+            note = NEW_OFFER_ABOVE_ASK_NOTE  # SWEEP-5: never "better than you expected"
+        else:
+            note = NEW_OFFER_NOTE_V2
+        lines.append(note.format(amount=format_usd(new_offer_usd)))
     lines.extend(note for note in notes if note)
     if curiosity and not intent_brief:
-        lines.append(
-            f'- You are curious about "{curiosity}". If the moment fits, ask the advisor one '
-            "short question about it in your own words."
-        )
+        template = CURIOSITY_NOTE_V2 if curiosity_v2 else CURIOSITY_NOTE
+        lines.append(template.format(curiosity=curiosity))
     if character_break:
         lines.append(CHARACTER_BREAK_NOTE)
     monologue = _monologue_line(monologue_sec)
     if monologue:
         lines.append(monologue)
+    if length_note and not intent_brief and not reaction_only:
+        lines.append(length_note)
+    if voice_v2:
+        # S2 item 2: the delivery rider is always the last line.
+        lines.append(LEARNER_DELIVERY_RIDER_BASE if reaction_only else LEARNER_DELIVERY_RIDER)
     return "\n".join(lines)
 
 
