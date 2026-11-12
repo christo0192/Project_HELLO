@@ -470,9 +470,12 @@ def make_live_learner_provider(
 
 
 def make_live_judge_runner(
-    env: Mapping[str, str], ledger: Ledger, *, judge_llm: Any = None
+    env: Mapping[str, str], ledger: Ledger, *, judge_llm: Any = None, role: str = "shadow_judge"
 ) -> Callable[[list], Any]:
-    """The shadow judge on R1's own judge client (temperature 0), as ``judge_runner``."""
+    """The shadow judge on R1's own judge client (temperature 0), as ``judge_runner``.
+
+    ``role`` names the ledger line (the full tier also runs the end-intent classifier on it).
+    """
     from r1_llm import build_r1_judge_llm
     from r1_session import _chat_context_from
 
@@ -493,9 +496,9 @@ def make_live_judge_runner(
         except Exception as exc:  # noqa: BLE001
             if is_insufficient_balance(exc):
                 ledger.mark_fatal("insufficient_balance", TOP_UP_MESSAGE)
-            ledger.note_error(f"shadow_judge: {describe_error(exc, scrub)}")
+            ledger.note_error(f"{role}: {describe_error(exc, scrub)}")
             raise
-        ledger.record("shadow_judge", usage_dict(usage), time.perf_counter() - started)
+        ledger.record(role, usage_dict(usage), time.perf_counter() - started)
         return "".join(parts)
 
     return run
