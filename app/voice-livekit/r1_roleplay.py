@@ -681,6 +681,24 @@ class RolePlayEngine:
     def commitment_level(self) -> Level | None:
         return self._commitment_level
 
+    def price_read_inputs(self, turn_index: int | None = None) -> tuple[frozenset[int], bool]:
+        """How the negotiation reads prices in a candidate row: ``(own_amounts, require_cue)``.
+
+        M032 S4, for the turn reader's shadow comparison only (read-only; nothing here plans or
+        changes a turn): the learner's own figures so far (the advisor repeating one makes no
+        offer) and whether a sentence needs a pricing word, which it does until the turn after the
+        learner's $7,000 anchor, exactly as ``_observe_negotiation`` passes them to
+        ``parse_price_offers``.  ``turn_index`` is the row's transcript index: the engine turn it
+        was planned as, else the next one.
+        """
+        turn = next(
+            (planned for planned, index in self._turn_map.items() if index == turn_index),
+            self.turn + 1,
+        )
+        anchor = self.scheduler.deliveries_by_id().get(F1_ANCHOR)
+        after_anchor = anchor is not None and turn > anchor.turn
+        return frozenset(self.negotiation.own_amounts), not after_anchor
+
     def _commitment_cap(self) -> Level:
         """The highest commitment level a model sentence may reach.
 
