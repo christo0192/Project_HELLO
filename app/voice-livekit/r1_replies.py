@@ -99,7 +99,7 @@ SESSION_FACT_KEYS = (
 # does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
 # learner's timing holds as counts only (no text), so the owner's next test shows how often each
 # fired.  The engine's ``admin_log()["intents"]`` keys it reads, each a count or counts by label:
-SESSION_FACT_WORKER_KEYS = ("learner_timing", "learner_voice")
+SESSION_FACT_WORKER_KEYS = ("learner_timing", "learner_voice", "learner_probe_first")
 _LEARNER_TIMING_COUNTS = ("moment_waits", "volunteered_objections", "split_replans")
 _LEARNER_TIMING_BY_LABEL = ("push_react_holds", "respond_first_holds", "concerns")
 # M032 S2 (learner voice): ``learner_voice`` reads the engine's ``admin_log()["voice"]``, counts
@@ -120,6 +120,20 @@ _LEARNER_VOICE_COUNTS = (
     "implausible_offer_count",
 )
 _LEARNER_VOICE_BY_LABEL = ("sentence_histogram", "stall_theme_counts", "offer_terms_counts")
+# M032 S2P (probe first; review S2P-R8): ``learner_probe_first`` reads the engine's
+# ``admin_log()["probe_first"]`` (present only in a session with R1_PROBE_FIRST on; otherwise every
+# count is None), counts only: the probes she asked per family, her price questions that got no
+# figure, the redirects that asked instead of stating, the course lengths the guard dropped, the
+# figure challenges and SWEEP-22's price-reflex notes and price-first turns.
+_LEARNER_PROBE_FIRST_COUNTS = (
+    "price_dodges",
+    "redirect_probes",
+    "course_fact_unsaid_count",
+    "figure_challenges",
+    "price_reflex_notes",
+    "price_first_turns",
+)
+_LEARNER_PROBE_FIRST_BY_LABEL = ("probes",)
 _LABEL_MAX_CHARS = 32
 _LABELS_MAX = 16
 
@@ -186,6 +200,15 @@ def _learner_voice(admin: Mapping[str, Any] | None) -> dict[str, Any]:
     """M032 S2: the learner's voice counts from the engine's admin log, bounded counts only."""
     return _bounded_counts(
         (admin or {}).get("voice"), _LEARNER_VOICE_BY_LABEL, _LEARNER_VOICE_COUNTS
+    )
+
+
+def _learner_probe_first(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S2P: the probe-first counts from the engine's admin log, bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("probe_first"),
+        _LEARNER_PROBE_FIRST_BY_LABEL,
+        _LEARNER_PROBE_FIRST_COUNTS,
     )
 
 
@@ -450,5 +473,6 @@ def session_facts_event(
             **facts,
             "learner_timing": _learner_timing(admin),
             "learner_voice": _learner_voice(admin),
+            "learner_probe_first": _learner_probe_first(admin),
         },
     }

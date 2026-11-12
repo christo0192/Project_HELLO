@@ -700,6 +700,42 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(voice["offer_terms_counts"], {})
                 self.assertIsNone(voice["soft_tic_trims"])
 
+    def test_the_probe_first_counts_ride_along_as_counts_only(self):
+        """M032 S2P (review S2P-R8): the probes she asked, the price dodges, the redirect probes,
+        the course lengths the guard dropped and SWEEP-22's notes go with the row, counts only."""
+        admin = {
+            "probe_first": {
+                "probes": {"F1": 2, "F2": 1},
+                "price_dodges": 1,
+                "price_asked": True,
+                "redirect_probes": 1,
+                "course_fact_unsaid_count": 3,
+                "figure_challenges": 0,
+                "price_reflex_notes": 2,
+                "price_first_turns": 1,
+                "last_line": "never sent",
+            }
+        }
+        facts = session_facts_event(admin, {}, roleplay_seconds=42.0)["payload"]
+        probe = facts["learner_probe_first"]
+        self.assertEqual(probe["probes"], {"F1": 2, "F2": 1})
+        self.assertEqual(probe["course_fact_unsaid_count"], 3)
+        self.assertEqual(probe["price_dodges"], 1)
+        self.assertEqual(probe["price_first_turns"], 1)
+        self.assertNotIn("last_line", probe)
+        self.assertNotIn("price_asked", probe)
+        self.assertNotIn("never sent", repr(probe))
+        bad = {"probe_first": {"price_dodges": "1", "probes": {"F1": -1, "x" * 99: 1}}}
+        probe = session_facts_event(bad, {}, roleplay_seconds=1.0)["payload"]["learner_probe_first"]
+        self.assertIsNone(probe["price_dodges"])
+        self.assertEqual(probe["probes"], {})
+        for admin in (None, {}, {"probe_first": None}):
+            with self.subTest(admin=admin):
+                probe = session_facts_event(admin, {}, roleplay_seconds=1.0)["payload"][
+                    "learner_probe_first"]
+                self.assertEqual(probe["probes"], {})
+                self.assertIsNone(probe["course_fact_unsaid_count"])
+
     def test_unmeasured_or_invalid_values_are_sent_as_null_never_as_a_guess(self):
         for admin in (None, {}, {"communication": {}},
                       {"communication": {"longest_candidate_turn_sec": 0.0}},
