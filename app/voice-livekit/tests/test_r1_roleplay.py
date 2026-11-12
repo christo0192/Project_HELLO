@@ -9479,6 +9479,28 @@ class ProbeFirstF2F4Tests(unittest.TestCase):
         self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
         self.assertIsNone(plan.probe)
 
+    def test_without_a_length_said_she_never_calls_the_course_long(self):
+        # Review S2P-R3 (naturalness): "a long course" is the forced path's wording (SWEEP-17
+        # item 7); a dodged time probe leaves her packed schedule without it.
+        s = Session(engine())
+        r = to_f2(s)
+        self.assertEqual(s.say(SUBSTANTIVE_PITCH, r).probe, "F2")
+        react = s.say("We can go into all of that later, first tell me about your goals.", r + 20)
+        if react.move_id != r1_roleplay.F2_PRIMARY:
+            react = s.say(ALUMNI, r + 40)
+        self.assertEqual(react.move_id, r1_roleplay.F2_PRIMARY)
+        self.assertFalse(react.intent.forced)
+        for text in react.intent.fallbacks:
+            self.assertNotIn("long course", text)
+            self.assertTrue(r1_scheduler.markers_match(react.intent.markers, text), text)
+        forced = Session(engine())
+        state = forced.eng.scheduler._states[r1_roleplay.F2_PRIMARY]
+        owed = forced.eng.scheduler._owed(state, 600.0, True)
+        plan = forced.eng._intent_plan(
+            owed, [], redirect=False, first_probes=(), reveal_topics=(), monologue=None
+        )
+        self.assertTrue(any("long course" in text for text in plan.intent.fallbacks))
+
     def test_no_f2_probe_once_she_asked_the_hours(self):
         """SWEEP-23: her own hours question was answered ("weekends, about two hours")."""
         eng = engine()

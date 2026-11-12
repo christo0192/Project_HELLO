@@ -3673,6 +3673,15 @@ class RolePlayEngine:
             return anchor_after_stated(stated)
         return anchor_check()
 
+    def _probe_first_variants(self, move: OwedMove, variants: tuple[str, ...]) -> tuple[str, ...]:
+        """F2-PRIMARY's probe-first line says "a long course", which is for the forced path
+        (SWEEP-17 item 7) or a length the advisor said; otherwise (review S2P-R3, naturalness: on a
+        turn with no slack for the probe) her packed schedule is said without calling the course
+        long."""
+        if move.id == F2_PRIMARY and not move.forced and not self._advisor_months:
+            return tuple(text for text in variants if " long course" not in text) or variants
+        return variants
+
     def _plan_anchor(self, anchor_id: str) -> None:
         """Remember the F1-ANCHOR form this turn planned, noted when the line is heard."""
         stated = (
@@ -3713,7 +3722,7 @@ class RolePlayEngine:
         elif move.id in (F2_PRIMARY, F4_PRIMARY):
             texts = probe_first_texts(move.id)
             if texts is not None:
-                text = texts[2]
+                text = self._probe_first_variants(replace(move, forced=False), texts[3])[0]
         elif move.id == F1_COUNTER and flag_on(FLAG_COUNTER_V2):
             situation = self.negotiation.counter_situation(
                 counter_v2=True, far_below=self._far_below()
@@ -3837,8 +3846,9 @@ class RolePlayEngine:
         if self._probe_first:
             texts = probe_first_texts(move.id)
             if texts is not None:
-                brief, _worry, line_text, variants = texts
-                move = replace(move, brief=brief, must_say=(), text=line_text, variants=variants)
+                brief, _worry, _line, variants = texts
+                variants = self._probe_first_variants(move, variants)
+                move = replace(move, brief=brief, must_say=(), text=variants[0], variants=variants)
         if move.id == F1_COUNTER:
             counter_v2 = flag_on(FLAG_COUNTER_V2)
             situation = self.negotiation.counter_situation(
