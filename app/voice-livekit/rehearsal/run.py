@@ -3,6 +3,7 @@
     python -m rehearsal --calls 20 --personas strong,average,weak,pushy,terse --out <dir>
     python -m rehearsal --offline --calls 20 --out <dir>      # scripted, no network, no key
     python -m rehearsal --matrix smoke                         # 4 strong calls, one per learner
+    python -m rehearsal --full --scenarios manual-replay --out <dir> [--offline]   # whole interviews
 
 ``--personas`` names the ADVISOR simulator behaviours (strong, average, weak, pushy or
 pushy-discounter, terse or short-answers); ``--learners`` picks the learner personas (default all
@@ -17,6 +18,11 @@ capped by ``--budget-usd`` (exit code 4).
 Artifacts under ``--out``: ``calls/<call-id>.json`` (the whole record), ``results.jsonl`` (one
 summary line per call), ``scorecard.json`` / ``scorecard.md`` and ``run.json`` (settings, ledger,
 stop reason).  The default ``--out`` is under ``.gsd/`` (gitignored).  Nothing written holds the key.
+
+``--full`` runs WHOLE interviews instead (OPENING to CLOSING, ``rehearsal.full_run``): the named
+``--scenarios`` (default: the manual replays, the manual mix and the synthetic edge scenarios), one
+call each unless ``--calls`` says otherwise, on a virtual clock.  It writes the same files plus
+``transcripts/<call-id>.txt``.
 
 Exit codes: 0 ok, 1 usage or unexpected error, 2 no key, 3 insufficient balance, 4 budget exceeded,
 5 hard fails or failed gates with ``--strict``.
@@ -154,6 +160,11 @@ def repo_root(start: Path | None = None) -> Path:
 def default_out_dir() -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return repo_root() / ".gsd" / "milestones" / "R1-Q" / "rehearsal" / "runs" / stamp
+
+
+def default_full_out_dir() -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return repo_root() / ".gsd" / "milestones" / "M032" / "sim" / "runs" / stamp
 
 
 # --------------------------------------------------------------------------- dependencies
@@ -551,7 +562,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-exchanges", type=int, default=86)
     parser.add_argument("--baseline", default="", help="a previous run directory: writes diff.md")
     parser.add_argument("--strict", action="store_true", help="exit 5 on any hard fail or failed gate")
+    full = parser.add_argument_group("whole interviews (--full)")
+    full.add_argument("--full", action="store_true", help="run whole interviews, OPENING to CLOSING")
+    full.add_argument(
+        "--scenarios",
+        default="default",
+        help="full-interview scenarios or groups, comma separated (default: manual replays, the "
+        "manual mix and the synthetic edge scenarios; groups: manual-replay, manual-mix, manual, "
+        "synthetic, early, price, wrapup ...)",
+    )
+    full.add_argument("--candidate-model", default=DEFAULT_ADVISOR_MODEL, help="the live candidate's model")
     return parser
+
+
+def full_settings_from_args(args: argparse.Namespace) -> Any:
+    from rehearsal.full_run import FullSettings
+    from rehearsal.scenarios import parse_scenarios
+
+    if args.calls is not None and args.calls < 1:
+        raise ValueError("--calls must be at least 1")
+    return FullSettings(
+        offline=bool(args.offline),
+        scenarios=parse_scenarios(args.scenarios),
+        calls=args.calls,
+        learners=parse_learners(args.learners),
+        budget_usd=float(args.budget_usd),
+        candidate_model=args.candidate_model,
+        judge_model=args.judge_model,
+        judge=not args.no_judge,
+        preflight=not args.no_preflight,
+        out=args.out,
+        strict=bool(args.strict),
+    )
+
+
+def main_full(args: argparse.Namespace) -> int:
+    from rehearsal import vloop
+    from rehearsal.full_run import run_full_all
+
+    try:
+        settings = full_settings_from_args(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    out = Path(settings.out) if settings.out else default_full_out_dir()
+    try:
+        return vloop.run_virtual(run_full_all(settings, out, print))
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return EXIT_ERROR
 
 
 def settings_from_args(args: argparse.Namespace) -> Settings:
@@ -586,6 +645,8 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.full:
+        return main_full(args)
     try:
         settings = settings_from_args(args)
     except ValueError as exc:

@@ -240,12 +240,19 @@ class ScriptedAdvisor:
         self._post_commit: str | None = None
         self._post_turns = 0
         self._turn = 0
+        self._mid_call = False
 
     # ----------------------------------------------------------------- protocol
     async def start(self, learner_pickup: str) -> None:
         match = re.search(r"this is (\w+)", learner_pickup, re.IGNORECASE)
         if match:
             self.name = match.group(1)
+
+    def resume_mid_call(self) -> None:
+        """Take over a call that is already under way (a replay's moves ran out, a live advisor
+        call failed): no greeting, the pushy script never opens with "Hi, quick call!" again."""
+        self._mid_call = True
+        self._turn = max(self._turn, 1)
 
     async def next_turn(self, learner_text: str | None, r_sec: float, exchange: int) -> AdvisorTurn:
         self._turn += 1
@@ -430,7 +437,10 @@ class ScriptedAdvisor:
 
     # -------------------------------------------------------------------- pushy
     def _pushy(self, text: str, r_sec: float) -> AdvisorTurn:
-        index = (self._turn - 1) % len(PUSHY_LINES)
+        if self._mid_call:  # PUSHY_LINES[0] is the opening greeting: never said mid-call
+            index = 1 + (self._turn - 2) % (len(PUSHY_LINES) - 1)
+        else:
+            index = (self._turn - 1) % len(PUSHY_LINES)
         intent = PUSHY_INTENTS[index]
         return AdvisorTurn(
             PUSHY_LINES[index], intent, "F1" if intent in ("price", "discount") else ""
