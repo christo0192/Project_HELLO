@@ -437,6 +437,12 @@ OPEN_HELLO_FOLLOW_SECONDS = 1.5
 OPEN_CHECK_ANSWER_WORDS = 12
 # A whole-turn complaint ("Not really.", "It's a bit low.") is read as one only up to this length.
 OPEN_CHECK_COMPLAINT_MAX_WORDS = 6
+# Review of S7C: the never-heard ladder in the opening has no phase budget of its own, so it is
+# bounded from its start: its line (about 8 s) and ``NO_AUDIO_END_SECONDS`` of silence fit with
+# room to spare.  A candidate who mutes after the line, or a steady noise that keeps restarting the
+# silence window, gets the plain agenda at the end of it and the icebreaker's own budget, as on
+# main; the opening never waits out the session cap.
+OPEN_NO_AUDIO_HARD_SECONDS = 60.0
 # M032 S7C (SWEEP-36, ``R1_MUTE_ASIDE_V2``): the mute aside waits for a real mute (a blip that is
 # undone within this long gets no line), and never talks over a candidate turn in flight unless
 # the mute has lasted this long in all.
@@ -2488,6 +2494,9 @@ class R1Interview:
         self._sound_check_open = False
         self._sound_check_rows: set[int] = set()
         self._sound_check_final_quiet = False
+        # Review of S7C: every non-empty final counts here, so the sound check's settle can tell a
+        # reply that goes on (a new final) from one that has ended.
+        self._finals_heard = 0
         self._pickup_spoken = False
         # M1 (owner decision 2026-11-03): how many of the candidate's questions Christy answered
         # before the role-play, whether L-TRANSITION-STEER was said, and the scripted lines the
@@ -6160,6 +6169,7 @@ class R1Interview:
         if not text:
             return
         self._candidate_ever_heard = True  # M032 S7C (SWEEP-34): a final is proof of audio
+        self._finals_heard += 1
         self._latency.note_final()
         self._candidate_activity_at = self._clock()
         self._ack_unjudged = False  # a real final: the speech belongs to a real turn
@@ -7058,11 +7068,22 @@ class R1Interview:
         """The never-heard ladder: L-SIL-NOAUDIO, then L-SIL-END-NOAUDIO after more silence.
 
         Spoken only in the opening and the icebreaker (the transition's own close is unchanged).
-        Returns what ``_silence_ladder`` returns: None once the candidate speaks.
+        Returns what ``_silence_ladder`` returns: None once the candidate speaks.  The icebreaker
+        bounds it by its own budget; the opening, which has none, by ``OPEN_NO_AUDIO_HARD_SECONDS``
+        from here (review of S7C: muted after the line, it used to wait for the session cap), and
+        its ``phase_deadline`` then leads to the plain agenda and the icebreaker's budget.
         """
         self._note_no_audio()
+        bound: Callable[[], float] | None = None
+        if self.machine.phase is R1Phase.OPENING:
+            ends_at = self._clock() + OPEN_NO_AUDIO_HARD_SECONDS
+
+            def opening_left() -> float:
+                return ends_at - self._clock()
+
+            bound = opening_left
         return await self._silence_ladder(
-            [("L-SIL-NOAUDIO", NO_AUDIO_END_SECONDS)], end_line="L-SIL-END-NOAUDIO"
+            [("L-SIL-NOAUDIO", NO_AUDIO_END_SECONDS)], end_line="L-SIL-END-NOAUDIO", bound=bound
         )
 
     def _set_muted(self, muted: bool) -> None:
@@ -7441,7 +7462,11 @@ class R1Interview:
     # --------------------------------------------------------------- ladder
 
     async def _silence_ladder(
-        self, prompts: list[tuple[str, float]], *, end_line: str = "L-SIL-END"
+        self,
+        prompts: list[tuple[str, float]],
+        *,
+        end_line: str = "L-SIL-END",
+        bound: Callable[[], float] | None = None,
     ) -> str | None:
         """Speak each (line, wait) prompt after real candidate silence (plan section 5.11).
 
@@ -7453,20 +7478,21 @@ class R1Interview:
         Non-aside steps are bounded by the phase budget and are skipped for the
         phase end when the budget cannot cover their wait.  The aside step
         (L-SIL-RP2) runs with role-play clock R PAUSED, so only the S=26:00 cap
-        bounds it, not the remaining R budget.
+        bounds it, not the remaining R budget.  ``bound`` stands in for the phase budget
+        where the phase has none (the opening's never-heard ladder, review of S7C).
         """
         for line_id, wait_seconds in prompts:
             phase = self.machine.phase
             aside = line_id == "L-SIL-RP2"
-            budget_left: Callable[[], float] | None = None
-            if phase is R1Phase.ICEBREAKER:
+            budget_left: Callable[[], float] | None = bound
+            if bound is None and phase is R1Phase.ICEBREAKER:
                 budget_left = self._icebreaker_budget_left
                 if self.machine.icebreaker_should_end():
                     # The soft exit is due and the candidate has said nothing for the whole
                     # silence window: move on to the transition rather than ask "Are you still
                     # with me?" in the seconds before it.
                     return "phase_deadline"
-            elif phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            elif bound is None and phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
                 budget_left = self._roleplay_budget_left
             if budget_left is not None:
                 budget = budget_left()
@@ -7724,16 +7750,35 @@ class R1Interview:
         row = self._open_row
         return row is not None and not row.held_only and self._sound_check_final_quiet
 
-    async def _settle_sound_check_reply(self, texts: list[str]) -> str:
-        """Wait for the reply to end (bounded), and join every final of it."""
+    async def _settle_sound_check_reply(self, budget: float | None = None) -> list[str]:
+        """Wait for the reply to end, and return the finals heard meanwhile (oldest first).
+
+        Bounded the way the icebreaker's hold is (``_icebreaker_hold_left``, review of S7C): while
+        the reply is in flight (``_sound_check_turn_open``) it waits one endpointing maximum plus a
+        margin after the candidate's LAST sign of speech (speaking, or a new final), and never
+        longer than ``ICEBREAKER_HOLD_CEILING_SECONDS`` in all, nor than ``budget`` (the sound
+        check's own time left), though always that one grace.  A candidate who goes on after "Yes,
+        I can hear you." is then not talked over by the uninterruptible agenda, and the whole
+        reply is read, not its first final.
+        """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
-        while self._sound_check_turn_open() and loop.time() < deadline:
+        grace = endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+        ceiling = ICEBREAKER_HOLD_CEILING_SECONDS
+        if budget is not None:
+            ceiling = min(ceiling, budget)
+        started = last = loop.time()
+        ends_by = started + max(grace, ceiling)
+        finals = self._finals_heard
+        while self._sound_check_turn_open():
             if self._stop_outcome() is not None:
                 break
+            now = loop.time()
+            if self._user_state == "speaking" or self._finals_heard != finals:
+                last, finals = now, self._finals_heard
+            if now >= min(ends_by, last + grace):
+                break
             await asyncio.sleep(0.05)
-        texts = texts + self._take_queued_turns()
-        return " ".join(text for text in texts if text)
+        return self._take_queued_turns()
 
     async def _sound_check(self) -> str | None:
         """L-OPEN-HELLO, the reply, then L-OPEN-AGENDA / -PLAIN / -CONTINUE (SWEEP-35).
@@ -7772,14 +7817,17 @@ class R1Interview:
                 stop = await self._no_audio_ladder()
                 if stop not in (None, "phase_deadline"):
                     return stop
-                await self._settle_sound_check_reply([])  # their first words: not talked over
-                reading = "no_audio"
+                await self._settle_sound_check_reply()  # their first words: not talked over
+                reading = "no_audio" if stop is None else "no_audio_deadline"
                 break
             else:
                 reading = "deadline" if kind == DEADLINE else "silence"
                 break
-            text = await self._settle_sound_check_reply(texts)
-            reading = sound_check_reading(text)
+            later = await self._settle_sound_check_reply(max(0.0, left()))
+            text = " ".join(part for part in (*texts, *later) if part)
+            # Review of S7C: a "Hello?" said only over the line (before the question was heard,
+            # often a line check on joining) does not say the question went unheard.
+            reading = sound_check_reading(text, after_question=kind == TURN or bool(later))
             if reading == SOUND_CANT_HEAR:
                 cant_hear += 1
                 if cant_hear == 1 and left() > 0:
@@ -7799,6 +7847,10 @@ class R1Interview:
             schema=agenda,
             option_count=cant_hear,
         )
+        # Review of S7C: the reply is read, so what is said from here on is no sound-check reply.
+        # The agenda asks the first icebreaker question, and an answer begun over its tail (whose
+        # turn commits in the icebreaker) is that answer, not a reply the agenda already answered.
+        self._sound_check_open = False
         await self.say(agenda)
         return None
 

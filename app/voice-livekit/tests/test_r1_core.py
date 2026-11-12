@@ -11086,6 +11086,129 @@ class TestTheOpeningSoundCheck(R1TestCase):
         self.assertEqual(await asyncio.wait_for(run.task, 10.0), "candidate_left")
         self.assertEqual(run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO"))
 
+    # ------------------------------------------------------------- review of S7C
+
+    async def test_a_reply_that_goes_on_is_not_talked_over_and_is_read_whole(self) -> None:
+        # The settle waited one fixed grace from the FIRST final: the uninterruptible agenda then
+        # played over a candidate still speaking, chosen from the first words of the reply.
+        rest = (
+            "I have been working in inside sales for five years, selling software subscriptions "
+            "to small business owners."
+        )
+        with mock.patch.object(
+            r1_session, "endpoint_max_delay_sec", lambda: 0.2
+        ), mock.patch.object(r1_session, "ICEBREAKER_HOLD_MARGIN_SECONDS", 0.0):
+            run = await self.opening()
+            await self.hello_played(run)
+            run.session.emit("user_state_changed", state_event("speaking"))
+            run.session.emit("user_input_transcribed", final_event("Yes, I can hear you."))
+            await asyncio.sleep(0.6)  # three graces, and still speaking
+            self.assertEqual(run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO"))
+            run.session.emit("user_input_transcribed", final_event(rest))
+            run.session.emit("user_state_changed", state_event("listening"))
+            await self.settle()
+            self.assertEqual(run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO"))
+            with self.assertRaises(r1_session.StopResponse):
+                await run.session.agent.on_user_turn_completed(
+                    None, SimpleNamespace(text_content=f"Yes, I can hear you. {rest}", id="m1")
+                )
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-AGENDA-CONTINUE")
+        )
+        self.assertEqual(run.interview.machine.candidate_turns, 1)
+
+    async def test_a_reply_that_never_ends_waits_no_longer_than_the_ceiling(self) -> None:
+        with mock.patch.object(
+            r1_session, "endpoint_max_delay_sec", lambda: 0.1
+        ), mock.patch.object(r1_session, "ICEBREAKER_HOLD_MARGIN_SECONDS", 0.0), mock.patch.object(
+            r1_session, "ICEBREAKER_HOLD_CEILING_SECONDS", 0.4
+        ):
+            run = await self.opening()
+            await self.hello_played(run)
+            loop = asyncio.get_running_loop()
+            run.session.emit("user_state_changed", state_event("speaking"))  # never stops
+            run.session.emit("user_input_transcribed", final_event("Yes, I can hear you."))
+            heard_at = loop.time()
+            await self.until(lambda: len(run.session.spoken) == 2, timeout=5.0)
+            self.assertGreaterEqual(loop.time() - heard_at, 0.35)
+        self.assertEqual(run.session.spoken[1], run.interview.render_line("L-OPEN-AGENDA"))
+
+    async def test_muted_after_the_no_audio_line_the_opening_still_ends(self) -> None:
+        # The opening's never-heard ladder had no budget: muted after L-SIL-NOAUDIO, its silence
+        # window never ran and the session waited for the S=30:00 cap (a system stop).  It now
+        # ends in the plain agenda, and the icebreaker's own budget follows, as on main.
+        with mock.patch.object(r1_session, "NO_AUDIO_END_SECONDS", 5.0), self.capture_logs() as logs:
+            run = await self.opening()
+            await self.until(lambda: self.played(run, "L-SIL-NOAUDIO"))
+            await self.settle()
+            run.context.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+            await self.until(lambda: self.played(run, "L-MUTE-IV"))
+            await self.settle()
+            self.assertIs(run.interview.machine.phase, R1Phase.OPENING)
+            run.clock.advance(r1_session.OPEN_NO_AUDIO_HARD_SECONDS + 1)
+            run.interview._wake()
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken,
+            self.spoken_ids(
+                run, "L-OPEN-HELLO", "L-SIL-NOAUDIO", "L-MUTE-IV", "L-OPEN-AGENDA-PLAIN"
+            ),
+        )
+        self.assertFalse(run.task.done())
+        (check,) = [line_ for line_ in logs if line_.get("error_type") == "r1_sound_check"]
+        self.assertEqual(check["error_category"], "no_audio_deadline")
+
+    async def test_an_answer_begun_over_the_agenda_is_an_icebreaker_answer(self) -> None:
+        # Finals over the agenda were tagged as sound-check replies, so the answer to the
+        # agenda's question, committed after it, got no reply and was not counted.
+        run = await self.opening(playout=0.3)
+        await self.hello_played(run)
+        await self.reply(run, "Yes.")
+        agenda = run.interview.render_line("L-OPEN-AGENDA")
+        await self.until(lambda: ("play_start", agenda) in self.order)
+        answer = "I work in inside sales at a software firm, four years now."
+        run.session.emit("user_input_transcribed", final_event(answer))  # over the agenda's tail
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        await self.settle()
+        await run.session.agent.on_user_turn_completed(  # no StopResponse: the model answers it
+            None, SimpleNamespace(text_content=answer, id="msg_after_agenda")
+        )
+        self.assertEqual(run.interview.machine.candidate_turns, 1)
+
+    async def test_a_hello_said_over_the_hello_and_then_nothing_gets_the_agenda(self) -> None:
+        run = await self.opening(playout=0.3)
+        hello = run.interview.render_line("L-OPEN-HELLO")
+        await self.until(lambda: ("play_start", hello) in self.order)
+        run.session.emit("user_input_transcribed", final_event("Hello?"))  # a line check
+        await self.hello_played(run)
+        await self.until(lambda: len(run.session.spoken) == 2, timeout=5.0)
+        self.assertEqual(run.session.spoken[1], run.interview.render_line("L-OPEN-AGENDA"))
+
+    async def test_a_hello_or_not_audible_after_the_question_gets_the_hello_again(self) -> None:
+        for text in ("Hello?", "Not audible."):
+            with self.subTest(text=text):
+                run = await self.opening()
+                await self.hello_played(run)
+                await self.reply(run, text)
+                await self.until(lambda: len(run.session.spoken) == 2, timeout=5.0)
+                self.assertEqual(
+                    run.session.spoken[1], run.interview.render_line("L-OPEN-HELLO-AGAIN")
+                )
+                await self.stop(run)
+
+    async def test_a_long_check_back_gets_the_agenda_and_is_not_counted(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        await self.reply(
+            run,
+            "Yes I can hear you perfectly fine, I hope you can hear me as well, my internet "
+            "connection is stable now.",
+        )
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-AGENDA"))
+        self.assertEqual(run.interview.machine.candidate_turns, 0)
+
     async def test_the_flag_off_speaks_l_open_and_goes_straight_on(self) -> None:
         with _s7c_env(R1_OPENING_SOUND_CHECK="0"):
             run = await self.opening()
