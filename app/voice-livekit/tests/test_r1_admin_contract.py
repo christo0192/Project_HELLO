@@ -53,6 +53,7 @@ import r1_guard
 from r1_phases import R1Phase
 from r1_replies import (
     GUARD_KINDS,
+    READER_FACT_KEYS,
     SESSION_FACT_KEYS,
     fidelity_events,
     fidelity_pins,
@@ -493,6 +494,31 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(payload["first_audio_p95_ms"], 0)
         self.assertEqual(facts[0]["turn_index"], None)
         self.assertEqual(facts[0]["family_id"], None)
+
+    def test_the_turn_readers_record_rides_along_unread_by_the_api(self):
+        # M032 S4: the shadow record is worker-only.  It sits in the same row, the parser reads
+        # none of it, and a session without it posts exactly the row of before.
+        from r1_turn_reader import ReaderReading, ReaderShadowLog
+
+        shadow = ReaderShadowLog()
+        shadow.record(12, "roleplay", "ok", ReaderReading(("closing",), "none", ()), ("dig",))
+        pins = {"content_version": "pin"}
+        plain = session_facts_event(None, pins, roleplay_seconds=700.0, first_audio_p95_ms=2100)
+        read = session_facts_event(
+            None, pins, roleplay_seconds=700.0, first_audio_p95_ms=2100, reader=shadow.payload()
+        )
+        self.assertEqual(set(read["payload"]) - set(plain["payload"]), set(READER_FACT_KEYS))
+        self.assertEqual(set(READER_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
+        self.assertEqual(parse_like_api(posted([read])), parse_like_api(posted([plain])))
+        self.assertEqual(
+            session_facts_event(None, pins, roleplay_seconds=700.0, first_audio_p95_ms=2100,
+                                reader={}),
+            plain,
+        )
+        if API_ADMIN_LOG.is_file():
+            source = API_ADMIN_LOG.read_text(encoding="utf-8")
+            for key in READER_FACT_KEYS:
+                self.assertNotIn(key, source)
 
     async def test_first_audio_p95_is_the_role_play_p95_of_the_logged_headline_in_ms(self):
         with capture_r1_logs() as lines:

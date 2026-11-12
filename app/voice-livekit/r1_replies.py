@@ -93,6 +93,10 @@ SESSION_FACT_KEYS = (
     "interruption_count",
     "first_audio_p95_ms",
 )
+# M032 S4: the turn reader's shadow record (``r1_turn_reader.ReaderShadowLog.payload``), carried in
+# the same row for the owner's comparison.  Worker-only: the API stores it with the payload and its
+# parser reads none of it, so no gate or score can depend on it.  Labels and counts only.
+READER_FACT_KEYS = ("reader_shadow", "reader_agreement")
 
 
 def guard_kind(category: object) -> str:
@@ -334,6 +338,7 @@ def session_facts_event(
     *,
     roleplay_seconds: float,
     first_audio_p95_ms: float | None = None,
+    reader: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The one ``session_facts`` row the plan 6.4 gate cannot pass without.
 
@@ -344,6 +349,9 @@ def session_facts_event(
     the PR-4c latency tracker, ``first_audio_p95_ms`` (milliseconds, role-play turns only; the
     caller passes ``None`` when fewer than 8 turns were measured, so the gate says
     ``latency_unknown`` instead of reading a number nobody measured).
+
+    ``reader`` is the turn reader's shadow record (M032 S4): only its ``READER_FACT_KEYS`` are
+    added, and only when it ran, so a session without it posts exactly the row of before.
     """
     communication = (admin or {}).get("communication", {})
     # The engine starts the longest turn at 0.0 and only raises it for a turn whose speaking
@@ -358,9 +366,10 @@ def session_facts_event(
         "interruption_count": None,
         "first_audio_p95_ms": _measured(first_audio_p95_ms),
     }
+    shadow = {key: reader[key] for key in READER_FACT_KEYS if key in (reader or {})}
     return {
         "event_type": "session_facts",
         "turn_index": None,
         "family_id": None,
-        "payload": {"pins": dict(pins), **facts},
+        "payload": {"pins": dict(pins), **facts, **shadow},
     }
