@@ -2355,5 +2355,203 @@ class AdvisorPriceS03Tests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------------------------
+# M032 S2 offer readers (SWEEP-5 ``offer_terms_in``, SWEEP-13 ``implausible_offer_in``) and the
+# stall briefs without "before you agree to anything" (SWEEP-3).  Every line below is synthetic.
+# ---------------------------------------------------------------------------------------------
+def _corpus_rows():
+    fixtures = HERE / "tests" / "fixtures"
+    for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+        for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+            if line:
+                yield json.loads(line)
+
+
+class OfferTermsReaderTests(unittest.TestCase):
+    """SWEEP-5: what an offer carried besides its price, in the advisor's own statement."""
+
+    def test_instalments_and_a_free_extra_are_read(self):
+        for text, expected in (
+            (
+                "I'll take $1,000 off, so $8,000, and you can pay it as a monthly EMI.",
+                {"instalments"},
+            ),
+            ("We've tied up with banks for EMI over 6 to 24 months.", {"instalments"}),
+            ("I can do $6,000 and throw in a free course.", {"free_extra"}),
+            ("If you enrol today you get the first month free.", {"free_extra"}),
+            ("You can pay in three or six monthly instalments.", {"instalments"}),
+            ("We have flexible payment plans that can help.", {"instalments"}),
+            ("I can split the rest into easy monthly payments.", {"instalments"}),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(set(neg.offer_terms_in(text)), expected)
+
+    def test_questions_negations_the_past_and_other_sellers_are_not_offers(self):
+        for text in (
+            "Would EMI help you?",
+            "We don't have EMI right now.",
+            "There's a free course on Coursera.",
+            "free courses on YouTube",
+            "Last year we had a free class.",
+            "Are you free this weekend?",
+            "Feel free to ask.",
+            "",
+            None,
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset())
+
+    def test_a_payment_plan_named_only_as_a_discount_condition_offers_no_instalments(self):
+        """The plan a discount depends on is no offer to pay monthly: the note would hand her a
+        course fact the advisor never said (D-M032-7)."""
+        for text in (
+            "The list price is $9,000, and we do have discounts of $500, $1,000 or $1,500 "
+            "depending on the payment plan.",
+            "Depending on the payment plan you choose, there are discounts of $500 or $1,000.",
+            "The course is $9,000 with discounts available depending on your payment plan.",
+            "With the biggest discount on a payment plan, it comes to $7,500.",
+            "The payment plan you pick sets the discount you get.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset())
+        # ... but an instalment word in the same turn still offers them.
+        self.assertEqual(
+            neg.offer_terms_in(
+                "Discounts depend on the payment plan you choose, and monthly instalments are an "
+                "option too."
+            ),
+            frozenset({"instalments"}),
+        )
+
+    def test_the_corpus_hits_are_the_reviewed_ones(self):
+        """The hits were read by hand (M032 S2): each tells her that paying over time is open to
+        her (EMI, instalments, monthly payments, a payment plan on offer).  A change that moves
+        the counts has to be read again."""
+        hits = {"instalments": 0, "free_extra": 0}
+        for row in _corpus_rows():
+            for term in neg.offer_terms_in(row["text"]):
+                hits[term] += 1
+        self.assertEqual(hits, PINNED_TERM_HITS)
+
+    def test_the_reader_is_linear(self):
+        started = time.perf_counter()
+        for text in (
+            "emi " * 12000,
+            "I can give you a free " * 3000,
+            "we can " * 8000 + "pay monthly",
+            "free month " * 6000,
+            "a" * 50000,
+            "depending on the payment plan " * 2000,
+        ):
+            neg.offer_terms_in(text)
+        self.assertLess(time.perf_counter() - started, 3.0)
+
+
+# 71 instalment hits, read by hand: 70 say paying over time is open to her; one (an e-mail that
+# "has the payment plan") is borderline.  Precision about 0.99 (SWEEP-5 asks at least 0.98).
+PINNED_TERM_HITS = {"instalments": 71, "free_extra": 0}
+
+
+class ImplausibleOfferReaderTests(unittest.TestCase):
+    """SWEEP-13: a price far below anything she expected, or the course for free."""
+
+    def test_far_below_and_free_offers_are_read(self):
+        for text, expected in (
+            ("Look, I'll give you the whole program for free.", ("free", None)),
+            ("The course would be completely free for you.", ("free", None)),
+            ("I'm giving this course to you for free.", ("free", None)),
+            ("You can have it free.", ("free", None)),
+            ("I can give it to you for just $500.", ("low", 500)),
+            ("the price of 200 dollars", ("low", 200)),
+            ("I'll just give the course for $100.", ("low", 100)),
+            ("Okay, I can do $3,000 for you.", ("low", 3000)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.implausible_offer_in(text), expected)
+
+    def test_free_material_deposits_monthly_figures_and_counts_are_not_the_price(self):
+        for text in (
+            "There's so much free content on YouTube",
+            "free courses online",
+            "You get a free trial month",
+            "Are you free on Saturday?",
+            "feel free",
+            "a $500 deposit",
+            "$500 off",
+            "$500 a month",
+            "EMIs of $500",
+            "500 learners",
+            "Is $500 a month okay for you?",
+            "I can do $8,000 for you.",
+            "",
+            None,
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.implausible_offer_in(text))
+
+    def test_the_corpus_hits_are_the_reviewed_far_below_prices(self):
+        found = sorted(
+            row["id"] for row in _corpus_rows() if neg.implausible_offer_in(row["text"]) is not None
+        )
+        self.assertEqual(found, PINNED_IMPLAUSIBLE_IDS)
+
+    def test_the_reader_is_linear(self):
+        started = time.perf_counter()
+        for text in (
+            "free " * 12000,
+            "I will give you the course for $100 " + " " * 40000,
+            "give it to you for free of " * 2000,
+            # ``parse_price_offers`` (unchanged, read first) bounds the cost of a long run of
+            # figures; the new framed-price and free readers add little to it.
+            "$1 " * 600,
+            "the price is $1 " * 1500,
+            "a" * 50000,
+        ):
+            neg.implausible_offer_in(text)
+        self.assertLess(time.perf_counter() - started, 3.0)
+
+
+# Read by hand: all seven put the course at $3,000 or less ($100 once).
+PINNED_IMPLAUSIBLE_IDS = ["c1977", "c1979", "c1981", "c1982", "c1988", "c1989", "c1990"]
+
+
+class NoCommitSpecTests(unittest.TestCase):
+    """SWEEP-3: the stall reasons and the next-step question without the stall priming."""
+
+    def test_every_new_variant_proves_its_spec_and_is_safe_for_every_persona(self):
+        for rendered in variants():
+            dm = rendered.decision_maker
+            # N-QUESTION is worded by ``question_spec`` (by the advisor's ask), not here.
+            specs = [neg.no_commit_spec(spec) for spec in neg.SPECS if spec.id != neg.N_QUESTION]
+            specs += [
+                neg.question_spec(AskKind.CALL, no_commit=True),
+                neg.question_spec(AskKind.ENROL, no_commit=True),
+            ]
+            for spec in specs:
+                self.assertNotIn("agree to anything", spec.brief)
+                brief = neg.fill_decision_maker(spec.brief, dm)
+                self.assertEqual(deep_need_topics_in(rendered, brief), frozenset(), spec.id)
+                markers = neg.filled_markers(spec.markers, dm)
+                for text in spec.variants:
+                    line = neg.fill_decision_maker(text, dm)
+                    with self.subTest(persona=rendered.id, spec=spec.id, line=line):
+                        self.assertNotIn("agree to anything", line)
+                        self.assertTrue(markers_match(markers, line))
+                        self.assertEqual(deep_need_topics_in(rendered, line), frozenset())
+                        context = GuardContext(phase="roleplay", persona=rendered, mode="reply")
+                        for sentence in split_sentences(line):
+                            self.assertEqual(check_sentence(sentence, context), [])
+
+    def test_ids_kinds_reasons_and_markers_are_unchanged(self):
+        for spec in neg.SPECS:
+            changed = neg.no_commit_spec(spec)
+            self.assertEqual(
+                (changed.id, changed.kind, changed.reason, changed.markers),
+                (spec.id, spec.kind, spec.reason, spec.markers),
+            )
+        timing = neg.SPEC_BY_ID[neg.N_TIMING]
+        self.assertIs(neg.no_commit_spec(timing), timing)
+
+
 if __name__ == "__main__":
     unittest.main()

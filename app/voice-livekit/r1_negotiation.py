@@ -353,11 +353,66 @@ N_QUESTION_ENROL_VARIANTS = (
 )
 
 
-def question_spec(ask: AskKind | None) -> NegotiationSpec:
-    """N-QUESTION worded for ``ask``: "the call" only when the advisor proposed a call."""
+# M032 SWEEP-3 (flag R1_NO_COMMIT_LEDGER, read by the engine).  The stall reasons and the question
+# about the next step no longer end "before you agree to anything" (aa166f09, 199e97c2: every reply
+# after one of them said the not-today stall again).  Ids, kinds, reasons and markers are unchanged;
+# N-DM needs its decision maker and a talk or check verb, N-QUESTION a what/how and the call, the
+# next step, involve, include or sign up, and every variant below proves them.
+NO_COMMIT_BRIEFS: dict[str, str] = {
+    N_MONEY: (
+        "you are still worried about the cost and would need to see how you could manage the "
+        "payment"
+    ),
+    N_DECISION_MAKER: "you would want to check with your {decision_maker} first",
+    N_QUESTION: "you ask the advisor what the next step or the call would actually involve",
+}
+NO_COMMIT_VARIANTS: dict[str, tuple[str, ...]] = {
+    N_DECISION_MAKER: (
+        "I'd really like to talk this over with my {decision_maker} first.",
+        "Let me run it by my {decision_maker} first, since we decide these things together.",
+        "I should check with my {decision_maker} before I say yes to a plan.",
+    ),
+    N_QUESTION: (
+        "What exactly would that call involve? I'd like to know that first.",
+        "What would the next step be, exactly?",
+        "What would we cover on that call, and how long would it take?",
+    ),
+}
+N_QUESTION_ENROL_BRIEF_V2 = (
+    "you ask the advisor what you would actually be signing up for and what is included"
+)
+N_QUESTION_ENROL_VARIANTS_V2 = (
+    "What exactly would I be signing up for? I'd like to know what's included first.",
+    "What's included in what I'd be signing up for?",
+    "What would I actually get for that, and what does it include?",
+)
+
+
+def no_commit_spec(spec: NegotiationSpec) -> NegotiationSpec:
+    """A stall reason's ``spec`` without the "before you agree to anything" priming (SWEEP-3).
+
+    N-QUESTION is left as it is: ``question_spec`` words it by the advisor's ask.
+    """
+    brief = NO_COMMIT_BRIEFS.get(spec.id)
+    if brief is None or spec.id == N_QUESTION:
+        return spec
+    return replace(spec, brief=brief, variants=NO_COMMIT_VARIANTS.get(spec.id, spec.variants))
+
+
+def question_spec(ask: AskKind | None, *, no_commit: bool = False) -> NegotiationSpec:
+    """N-QUESTION worded for ``ask``: "the call" only when the advisor proposed a call.
+
+    ``no_commit`` (SWEEP-3) drops the "before you agree to anything" priming.
+    """
     spec = SPEC_BY_ID[N_QUESTION]
     if ask is AskKind.CALL:
+        if no_commit:
+            return replace(
+                spec, brief=NO_COMMIT_BRIEFS[N_QUESTION], variants=NO_COMMIT_VARIANTS[N_QUESTION]
+            )
         return spec
+    if no_commit:
+        return replace(spec, brief=N_QUESTION_ENROL_BRIEF_V2, variants=N_QUESTION_ENROL_VARIANTS_V2)
     return replace(spec, brief=N_QUESTION_ENROL_BRIEF, variants=N_QUESTION_ENROL_VARIANTS)
 
 
@@ -2505,6 +2560,208 @@ def refuses_price(text: object) -> bool:
             return True
         previous_anchor = mentions
     return anchor_seen and list_price
+
+
+# ----------------------------------------------------------------------------------
+# M032 S2 offer readers (advisor text only; pure, tail-bounded, linear).
+# ----------------------------------------------------------------------------------
+# SWEEP-5 (flag R1_OFFER_TERMS): what an offer carried besides its price (fda9e9f6 #65-66: "$1,000
+# off and monthly EMI" got a reaction to the number alone).  A statement offering it, in the
+# advisor's own frame; never a question put to her ("Would EMI help you?"), a negated term ("We
+# don't have EMI right now"), the past ("Last year we had a free class") or a third party's free
+# material ("a free course on Coursera").
+TERM_INSTALMENTS = "instalments"
+TERM_FREE_EXTRA = "free_extra"
+OFFER_TERMS = (TERM_INSTALMENTS, TERM_FREE_EXTRA)
+_INSTALMENT_TERM = re.compile(
+    r"\b(?:emis?|instal+ments?|payment plans?|monthly payments?|"
+    r"pay (?:it |that |this )?(?:monthly|every month|per month|over (?:\d{1,2}|a few|several) "
+    r"months|in (?:monthly )?instal+ments)|split (?:the |your |it into )?(?:payments?|fees?|"
+    r"costs?|parts))\b",
+    re.IGNORECASE,
+)
+_INSTALMENT_OFFER = re.compile(
+    r"\b(?:can|could|will|'ll|offer\w*|have|has|give|provide\w*|allow\w*|available|option|"
+    r"tied up|opt|choose|let)\b",
+    re.IGNORECASE,
+)
+_FREE_EXTRA_TERM = re.compile(
+    r"\b(?:free|complimentary|bonus)\s(?:\w+\s){0,1}(?:trial|months?|weeks?|sessions?|class(?:es)?|"
+    r"courses?|modules?|access|mentoring|mentorship)\b"
+    r"|\b(?:a|one|two|first|the first) (?:month|week)s? (?:is |for )?free\b",
+    re.IGNORECASE,
+)
+_FREE_EXTRA_FRAME = re.compile(
+    r"\b(?:i|we)\b[^.?!]{0,40}?\b(?:give|giving|add|adding|throw(?:ing)? in|include|including|"
+    r"offer|offering|provide|providing)\b"
+    r"|\byou (?:get|will get|'ll get|can get|also get|would get)\b",
+    re.IGNORECASE,
+)
+_PLATFORMS = re.compile(r"\b(?:youtube|coursera|udemy|online|internet)\b", re.IGNORECASE)
+_PAST_TENSE = re.compile(r"\b(?:had|was|were|used to)\b", re.IGNORECASE)
+# A payment plan named only as what a discount depends on ("discounts of $500 or $1,000 depending
+# on the payment plan you choose") offers her no instalments: the note would hand her a course fact
+# the advisor never said (D-M032-7).  An instalment word in the same clause still counts.
+_PLAN_CONDITION_BEFORE = re.compile(
+    r"\b(?:depending|depends|depend|based|on)\s(?:on\s)?"
+    r"(?:(?:the|your|which|whichever|a|an|each)\s)?(?:\w+\s){0,2}$",
+    re.IGNORECASE,
+)
+_PLAN_CONDITION_AFTER = re.compile(
+    r"^\s(?:that\s)?(?:you|they)\s(?:choose|chose|pick|picked|select|go with|opt for)\b",
+    re.IGNORECASE,
+)
+_PLAN_CONDITION_CHARS = 60
+
+
+def _plan_as_condition(clause: str, term: re.Match[str]) -> bool:
+    """``term`` is "payment plan" named only as a discount's condition (see above)."""
+    if not term.group(0).lower().startswith("payment plan"):
+        return False
+    before = clause[max(0, term.start() - _PLAN_CONDITION_CHARS) : term.start()]
+    after = clause[term.end() : term.end() + _PLAN_CONDITION_CHARS]
+    return (
+        _PLAN_CONDITION_BEFORE.search(before) is not None
+        or _PLAN_CONDITION_AFTER.search(after) is not None
+    )
+
+
+def _offered_statement(sentence: str, start: int) -> bool:
+    """The term at ``start`` sits in an advisor statement and is not negated or in the past."""
+    if is_question_like(sentence) or "?" in sentence:
+        return False
+    if negated_before(sentence, start):
+        return False
+    return _PAST_TENSE.search(sentence) is None
+
+
+def _sold_by_someone_else(clause: str) -> bool:
+    """A capitalised name in a seller's role in ``clause`` ("Scaler gives a free class")."""
+    sellers = _named_sellers(clause)
+    return sellers is not None and sellers.search(clause.lower()) is not None
+
+
+def offer_terms_in(text: object) -> frozenset[str]:
+    """The non-price terms (``OFFER_TERMS``) an advisor turn offered her (SWEEP-5)."""
+    found: set[str] = set()
+    for sentence in split_sentences(_tail(text)):
+        for clause in _clauses(sentence):
+            term = next(
+                (
+                    match
+                    for match in _INSTALMENT_TERM.finditer(clause)
+                    if not _plan_as_condition(clause, match)
+                ),
+                None,
+            )
+            if (
+                term is not None
+                and _INSTALMENT_OFFER.search(clause) is not None
+                and _offered_statement(clause, term.start())
+            ):
+                found.add(TERM_INSTALMENTS)
+            extra = _FREE_EXTRA_TERM.search(clause)
+            if (
+                extra is not None
+                and _FREE_EXTRA_FRAME.search(clause) is not None
+                and _PLATFORMS.search(clause) is None
+                and not _sold_by_someone_else(clause)
+                and _offered_statement(clause, extra.start())
+            ):
+                found.add(TERM_FREE_EXTRA)
+    return frozenset(found)
+
+
+# SWEEP-13 (flag R1_OFFER_REALISM): a price far below anything she expected, or the course for
+# free, so she reacts as a careful buyer (8f5bfefc: $9,000 cut to $3,000; b419d478: a $500 price).
+# A net price read at this or less, or a framed course price under $1,000, is "low".
+IMPLAUSIBLE_NET_USD = 3000
+IMPLAUSIBLE_LOW = "low"
+IMPLAUSIBLE_FREE = "free"
+_COURSE_OBJECT = (
+    r"(?:it|(?:this|that|our|the)(?: (?:whole|entire|full))? (?:course|program(?:me)?)|this|that)"
+)
+_SMALL_PRICE = r"\$\s?(\d{1,3})(?!\d|[,.]\d)"
+_FRAMED_SMALL_PRICE = re.compile(
+    r"\b(?:give|gives|giving|offer|offering|sell|selling|let you have|do|doing)\s"
+    r"(?:you\s)?" + _COURSE_OBJECT + r"\s(?:to you\s)?(?:for|at)\s(?:just |only |a mere )?"
+    + _SMALL_PRICE
+    + r"|\b(?:price|cost|fee)\s(?:of|is|will be|would be|comes to)\s(?:just |only )?"
+    + _SMALL_PRICE,
+    re.IGNORECASE,
+)
+_NOT_A_COURSE_PRICE = re.compile(
+    r"\b(?:a|per|each|every|/)\s?(?:month|week)\b|\bmonthly\b|\bweekly\b|^\s*(?:off|discount)\b"
+    r"|\b(?:deposit|booking|registration|token|application|emis?|instal+ments?|upfront|down)\b",
+    re.IGNORECASE,
+)
+_FREE_COURSE = re.compile(
+    r"\b(?:give|gives|giving|gave|let you have|provide|providing|offer|offering)\s(?:you\s)?"
+    + _COURSE_OBJECT
+    + r"\s(?:to you\s)?(?:for\s)?(?:free|at no cost)\b"
+    r"|\b(?:have|get) it (?:for )?free\b"
+    r"|\b(?:course|program(?:me)?|it|this) for free\b"
+    r"|\b(?:course|program(?:me)?|it) (?:is|will be|would be|can be|could be) (?:completely |"
+    r"totally |entirely )?free\b"
+    r"|\bfree of (?:cost|charge)\b"
+    r"|\b(?:won'?t|will not|wouldn'?t|don'?t) (?:have to |need to )?pay anything\b",
+    re.IGNORECASE,
+)
+_FREE_TAIL_EXTRA = re.compile(
+    r"^\s*(?:of charge\s)?(?:(?:for|in|during) (?:a |the )?(?:first |initial )?"
+    r"(?:(?:\d+|one|two|three|seven|fourteen|thirty)[ -])?(?:days?|weeks?|months?|class(?:es)?|"
+    r"sessions?|trials?)\b|(?:trials?|months?|weeks?|days?|sessions?|class(?:es)?|demos?|"
+    r"webinars?|access|modules?|content|resources)\b)",
+    re.IGNORECASE,
+)
+_FREE_ELSEWHERE = re.compile(
+    r"\bfree (?:content|stuff|courses|videos|time|material)\b|\bare you free\b|\bfeel free\b"
+    r"|\bfor free on\b|\bfree online\b",
+    re.IGNORECASE,
+)
+
+
+def implausible_offer_in(
+    text: object, own_amounts: Iterable[int] = ()
+) -> tuple[str, int | None] | None:
+    """``("low", usd)``, ``("free", None)`` or None for one advisor turn (SWEEP-13).
+
+    A question phrased as an offer counts ("if I give it to you free, will you take it?"), as it
+    does for ``parse_price_offers``.  A monthly figure, a discount, a deposit or an instalment, a
+    third party's price, and a negated figure are never the course's price.
+    """
+    tail = _tail(text)
+    nets = [net for net, _conditional in parse_price_offers(tail, own_amounts)]
+    low = [net for net in nets if net <= IMPLAUSIBLE_NET_USD]
+    if low:
+        return IMPLAUSIBLE_LOW, min(low)
+    canonical = canonical_amounts(tail)
+    for sentence in split_sentences(canonical):
+        lowered = sentence.lower()
+        if _INQUIRY.search(lowered):
+            continue
+        for match in _FRAMED_SMALL_PRICE.finditer(lowered):
+            value = int(match.group(1) or match.group(2))
+            after = lowered[match.end() : match.end() + 40]
+            before = lowered[max(0, match.start() - 60) : match.start()]
+            if value <= 0 or _NOT_A_COURSE_PRICE.search(after) or _NOT_A_COURSE_PRICE.search(
+                before
+            ):
+                continue
+            if negated_before(lowered, match.start()) or _third_party_seller(
+                lowered, match.start(), _named_sellers(sentence)
+            ):
+                continue
+            return IMPLAUSIBLE_LOW, value
+        if _FREE_ELSEWHERE.search(lowered):
+            continue
+        for match in _FREE_COURSE.finditer(lowered):
+            if _FREE_TAIL_EXTRA.match(lowered[match.end() :]):
+                continue
+            if "pay anything" not in match.group(0) and negated_before(lowered, match.start()):
+                continue
+            return IMPLAUSIBLE_FREE, None
+    return None
 
 
 # ----------------------------------------------------------------------------------
