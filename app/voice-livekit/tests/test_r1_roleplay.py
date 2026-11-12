@@ -10234,6 +10234,38 @@ class S2PReviewPriceNamedTests(unittest.TestCase):
         self.assertIn("$9,000", result.text)
         self.assertFalse(any(hit.rule == "amount_off_card" for hit in result.hits))
 
+    def test_an_enrol_ask_right_after_her_price_question_gets_the_price_asked_again(self):
+        # Review S2P-R5 (correctness): the ask yielded to the owed F1 step and the step was then
+        # deferred for the ask, so a free reply said nothing about the price.
+        s = Session(engine())
+        plan, r = to_f1(s)
+        self.assertEqual(plan.probe, "F1")
+        ask = s.say("Would you like to move forward? Shall I send you the enrolment link?", r)
+        self.assertIn("ask_yields_to_owed_move", ask.reasons)
+        self.assertNotIn("owed_deferred_for_ask", ask.reasons)
+        self.assertEqual((ask.mode, ask.probe), (TurnMode.INTENT, "F1"))
+        self.assertTrue(NEG.asks_price(s.spoken[-1]), s.spoken[-1])
+        # Two dodges: the ask gets the check form, and F1 is delivered.
+        again = s.say("Shall I just send you the enrolment link now?", r + 20)
+        self.assertEqual(again.move_id, F1_ANCHOR)
+        self.assertEqual(again.intent.brief, NEG.anchor_check().brief)
+        self.assertTrue(s.eng.scheduler.is_delivered(F1_ANCHOR))
+
+    def test_the_first_money_stall_never_says_still_whatever_the_seed(self):
+        # Review S2P-R7: the lead variant was promoted, but the fallbacks rotate by seed.
+        seen = 0
+        for index in range(12):
+            s = Session(engine(seed=f"sess-{index}"))
+            s.say(OPENER, 20)
+            plan = s.say("The fee is $9,000. Shall I send you the enrolment link?", 180)
+            if plan.negotiation_id != NEG.N_MONEY:
+                continue
+            seen += 1
+            self.assertEqual(plan.intent.brief, NEG.N_MONEY_NAMED_BRIEF)
+            for text in plan.intent.fallbacks:
+                self.assertNotRegex(text, r"(?i)\bstill\b")
+        self.assertGreater(seen, 0)
+
     @s2p_off
     def test_flag_off_reads_no_shorthand(self):
         self.assertEqual(r1_roleplay.advisor_amounts_in("It's 9k for the whole program."), set())

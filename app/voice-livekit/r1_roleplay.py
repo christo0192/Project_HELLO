@@ -1784,11 +1784,14 @@ class RolePlayEngine:
             elif (
                 move.id in (F1_ANCHOR, F1_COUNTER)
                 and wants is not None
+                and "ask_yields_to_owed_move" not in reasons
                 and self._may_defer(move, r_sec)
             ):
                 # The advisor proposed a call or a time: that is answered first, and the price
                 # reaction waits one turn unless its deadline forces it (R1-Q final review round 1:
-                # "That's even below the $7,000 ..." answered "Does seven tomorrow work?").
+                # "That's even below the $7,000 ..." answered "Does seven tomorrow work?").  Not
+                # when the negotiation left the ask to this very move (M032 S2P, review S2P-R5: her
+                # price question went unanswered, so the F1 step that is due answers the ask).
                 reasons.append("owed_deferred_for_ask")
             elif (
                 (lone_backchannel or repeat_request)
@@ -3623,7 +3626,9 @@ class RolePlayEngine:
 
     def _plan_anchor(self, anchor_id: str) -> None:
         """Remember the F1-ANCHOR form this turn planned, noted when the line is heard."""
-        stated = self.negotiation.latest_stated_usd() if anchor_id == ANCHOR_STATED_CONFLICT else None
+        stated = (
+            self.negotiation.latest_stated_usd() if anchor_id == ANCHOR_STATED_CONFLICT else None
+        )
         self._anchor_planned = (self.turn, anchor_id, stated)
 
     def _redirect_plan(
@@ -4133,8 +4138,8 @@ class RolePlayEngine:
             # SWEEP-5 and SWEEP-13: what came with an offer, on a reply the model voices.
             if self._probe_first and move_id == F1_ANCHOR:
                 # Review S2P-R6 (naturalness): the anchor's own brief reacts to the price on the
-                # table ("below the $7,000 you heard ... no surprise"); SWEEP-13's careful-buyer note
-                # would contradict it on the same turn (the far-below counter is wary afterwards).
+                # table ("below the $7,000 you heard ... no surprise"); SWEEP-13's careful-buyer
+                # note would contradict it on the same turn (the far-below counter is wary later).
                 self._implausible_note = ""
             implausible = bool(self._implausible_note) and not confirm and not reaction_only
             if not confirm and not reaction_only:

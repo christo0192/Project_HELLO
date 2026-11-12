@@ -173,6 +173,8 @@ import r1_world
 #    L-REDIRECT-TIME) join the manifest.  The world's LEARNER_POLICY was reworded (world revision
 #    3).  Markers, deadlines and the scorer's facts are unchanged; with every flag off the card, the
 #    prefix and the reminders are the release before.
+#    After the S2P review (still revision 23, unreleased): the first money stall about a price the
+#    advisor named has its own three variants, none with "still" (they rotate by seed).
 CONTENT_REVISION = 23
 
 
@@ -361,6 +363,7 @@ def _probe_first(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         },
         "money_first_briefs": [n.N_MONEY_NAMED_BRIEF, n.N_MONEY_UNKNOWN_BRIEF],
         "money_unknown_variants": list(n.N_MONEY_UNKNOWN_VARIANTS),
+        "money_named_variants": list(n.N_MONEY_NAMED_VARIANTS),
         "notes": {
             "price_met_note_early": p.PRICE_MET_NOTE_EARLY,
             "figure_challenge_note": p.FIGURE_CHALLENGE_NOTE,

@@ -774,7 +774,8 @@ def _duration_known(value: float, known: frozenset[float]) -> bool:
 
 # SWEEP-17 item 5: the frames in which a learner sentence states a course length ("keep up for six
 # months", "the course runs for six months", "the data science course, roughly six months", "a
-# six-month program"), and two that may carry either kind of duration (``_AMBIGUOUS_LENGTH_FRAMES``).
+# six-month program"), and two that may carry either kind of duration
+# (``_AMBIGUOUS_LENGTH_FRAMES``).
 # Her own life's durations reach no frame in the persona's own words ("my contract renewal is
 # decided in about six months", "I quit a free course after three weeks", "I've been applying for
 # about three months"); the "for N months" frame with a course word skips a sentence about her past

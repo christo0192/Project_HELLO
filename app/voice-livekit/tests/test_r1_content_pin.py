@@ -146,7 +146,9 @@ import r1_world
 # N-PRICE-FIRST and the first-time money briefs, the new notes and the length probes), the two
 # redirect lines join the script (L-REDIRECT-PRICE, L-REDIRECT-TIME), and the world's
 # LEARNER_POLICY was reworded (world revision 3).  Markers, deadlines and scorer facts unchanged.
-PINNED_CONTENT_SHA256 = "df83548d730260d3b59dae94bfb3c38d9036f8fc79ec9a32ff215c4bcf06571b"
+# After the S2P review (still revision 23, unreleased): the first money stall about a named price
+# has its own variants, none with "still" (``N_MONEY_NAMED_VARIANTS``).
+PINNED_CONTENT_SHA256 = "5422c8cef25bcd54915af1025790e8a901b820c3515e3a4ef715f39c32cfd023"
 
 CONTENT_MODULES = (
     "r1_text",

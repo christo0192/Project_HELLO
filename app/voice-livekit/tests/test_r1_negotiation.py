@@ -3156,6 +3156,9 @@ class ProbeFirstNegotiationTests(unittest.TestCase):
         named = neg.money_spec(price_named=True, price_asked=False, first=True)
         self.assertEqual(named.brief, neg.N_MONEY_NAMED_BRIEF)
         self.assertTrue(named.variants[0].startswith("It's a lot of money to commit"))
+        # Review S2P-R7: the variants rotate by seed, so none of the first-time ones says "still".
+        for text in named.variants:
+            self.assertNotRegex(text, r"(?i)\bstill\b")
         unknown = neg.money_spec(price_named=False, price_asked=True, first=True)
         self.assertEqual(unknown.brief, neg.N_MONEY_UNKNOWN_BRIEF)
         self.assertIsNone(neg.money_spec(price_named=True, price_asked=True, first=False))

@@ -436,6 +436,13 @@ N_MONEY_UNKNOWN_BRIEF = (
     "you still don't know what it costs, and you couldn't agree to anything before knowing that "
     "and how you would manage the payment"
 )
+# Review S2P-R7: the first money stall about a price he named, with no "still" in any variant (the
+# fallbacks rotate by seed, so the lead variant alone cannot keep "still" out of a first worry).
+N_MONEY_NAMED_VARIANTS = (
+    "It's a lot of money to commit, so I'm not sure about the payment side yet.",
+    "The cost is weighing on me. I'd need to work out how I could manage the payment.",
+    "I'm worried about the cost, and I'd have to see how I could afford it.",
+)
 N_MONEY_UNKNOWN_VARIANTS = (
     "I still don't know what it would cost me, and I'd need to know that first.",
     "Without knowing the fee, I can't really agree to anything yet.",
@@ -447,17 +454,16 @@ def money_spec(*, price_named: bool, price_asked: bool, first: bool) -> Negotiat
     """N-MONEY worded for what she knows of the price (SWEEP-22 item 4), or None (unchanged).
 
     ``first``: the money stall was not voiced yet.  With a price named, the first stall is about
-    that price and leads with "It's a lot of money to commit"; with none named after her price
-    question went unanswered, it is about not knowing the cost.  A later money stall keeps the
-    release's "still worried about the cost".
+    that price and none of its variants says "still" (review S2P-R7: they rotate by seed, so a
+    promoted lead variant was not enough); with none named after her price question went
+    unanswered, it is about not knowing the cost.  A later money stall keeps the release's "still
+    worried about the cost".
     """
     if not first:
         return None
     spec = SPEC_BY_ID[N_MONEY]
     if price_named:
-        lead = spec.variants[1]
-        rest = tuple(text for text in spec.variants if text != lead)
-        return replace(spec, brief=N_MONEY_NAMED_BRIEF, variants=(lead, *rest))
+        return replace(spec, brief=N_MONEY_NAMED_BRIEF, variants=N_MONEY_NAMED_VARIANTS)
     if price_asked:
         return replace(spec, brief=N_MONEY_UNKNOWN_BRIEF, variants=N_MONEY_UNKNOWN_VARIANTS)
     return None
@@ -3969,7 +3975,9 @@ class Negotiation:
 
     def latest_stated_turn(self) -> int | None:
         """The turn of ``latest_stated_usd`` (None when no price was stated)."""
-        return next((turn for turn, _usd, kind in reversed(self.quotes) if kind in _STATED_KINDS), None)
+        return next(
+            (turn for turn, _usd, kind in reversed(self.quotes) if kind in _STATED_KINDS), None
+        )
 
     def note_anchor(self, anchor_id: str, stated_usd: int | None) -> None:
         """Her heard F1-ANCHOR checked the website's price (review S2P-R2, naturalness): the check
