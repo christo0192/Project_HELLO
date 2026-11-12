@@ -2764,17 +2764,19 @@ class BunchingGridTests(unittest.TestCase):
     off and on.  With them on no gated run may turn late or excluded, use the forced path more than
     ``FORCED_TOLERANCE`` times more, or lose the time cue; and the families spread later at the
     owner's pace instead of bunching on the first turn the rules allow.  Flags off is the behaviour
-    of origin/main (checked by hand against a main checkout when the grid was added)."""
+    of origin/main (checked by hand against a main checkout when the grid was added).  Since M032
+    S2 "off" is every S1 and S2 flag off and "on" every one on (``all_flags``): the S2 flags default
+    on, so the S1 flags alone off would no longer be origin/main."""
 
     @classmethod
     def setUpClass(cls):
         from rehearsal import bunching_grid
 
         cls.grid = bunching_grid
-        cls.off = bunching_grid.run_grid(bunching_grid.flags("0"))
-        cls.on = bunching_grid.run_grid(bunching_grid.flags("1"))
-        cls.steps_off = bunching_grid.run_steps(bunching_grid.flags("0"))
-        cls.steps_on = bunching_grid.run_steps(bunching_grid.flags("1"))
+        cls.off = bunching_grid.run_grid(bunching_grid.all_flags("0"))
+        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"))
+        cls.steps_off = bunching_grid.run_steps(bunching_grid.all_flags("0"))
+        cls.steps_on = bunching_grid.run_steps(bunching_grid.all_flags("1"))
 
     def test_no_gated_run_gets_worse(self):
         """Including the learner who names her decision maker when asked (review S1-R1: one stall
@@ -2839,6 +2841,48 @@ class BunchingGridTests(unittest.TestCase):
     def test_flags_off_waits_for_no_moment(self):
         self.assertEqual(sum(item.waits for item in self.off), 0)
         self.assertGreater(sum(item.waits for item in self.on), 0)
+
+
+class S2BunchingGridTests(unittest.TestCase):
+    """M032 S2 (learner voice): the grid with S1 on and the S2 flags off, against every flag on.
+    The S2 voice notes steer wording, but SWEEP-3's volunteered stall spaces the next objection
+    (``note_objection`` is global) and SWEEP-12 moves the curiosity hand-over, so no gated run may
+    get worse, the forced path is not used more, and the ``pushy`` advisor (she volunteers the
+    not-today stall when asked to enrol today) leaves no family late that main did not."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        cls.s1 = bunching_grid.run_grid(bunching_grid.s2_flags("0"))
+        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"))
+        cls.main = bunching_grid.run_grid(bunching_grid.all_flags("0"), patterns=("pushy",))
+
+    def test_no_gated_run_gets_worse_than_with_s1_alone(self):
+        self.assertEqual(self.grid.regressions(self.s1, self.on), [])
+        s1 = self.grid.totals(self.s1)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], s1[key])
+
+    def test_the_pushy_advisor_leaves_no_family_newly_late(self):
+        on = {item.pace: item for item in self.on if item.pattern == "pushy"}
+        for base in self.main:
+            with self.subTest(pace=base.pace):
+                item = on[base.pace]
+                self.assertLessEqual(
+                    set(item.late) | set(item.excluded), set(base.late) | set(base.excluded)
+                )
+                self.assertLessEqual(item.forced, base.forced + self.grid.FORCED_TOLERANCE)
+
+    def test_the_scripted_learner_still_asks_when_handed_a_rotated_label(self):
+        """SWEEP-12's phrases are mapped to the same questions, so the cooperative advisor still
+        answers her curiosity as before."""
+        for phrases in self.grid.CURIOSITY_LABELS_V2.values():
+            for phrase in phrases:
+                self.assertIn(phrase, self.grid.CURIOSITY_LABEL_QUESTIONS)
 
 
 if __name__ == "__main__":

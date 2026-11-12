@@ -38,6 +38,13 @@ Run it from ``app/voice-livekit``::
 
     python -m rehearsal.bunching_grid                 # the flags as the environment sets them
     python -m rehearsal.bunching_grid --compare       # every S1 flag off, then every one on
+    python -m rehearsal.bunching_grid --compare-s2    # S1 on and S2 off, then every flag on
+
+``--compare-s2`` (M032 S2, learner voice) also reports every flag off (origin/main) against every
+flag on.  ``pushy`` (SWEEP-3) is an advisor who asks her to enrol today again and again, with a
+learner who says in a free reply that she is not ready to commit today whenever she is asked: her
+volunteered stall spaces the next objection (``note_objection`` is global), so F1, F2 and F3
+lateness is reported for it.
 
 ``--compare`` also prints the runs where the flags made a family late or excluded that was not
 before, or used the forced path more than ``FORCED_TOLERANCE`` times more (``regressions``).
@@ -61,6 +68,7 @@ if _WORKER_DIR not in sys.path:
 
 from r1_personas import resolve_persona  # noqa: E402
 from r1_roleplay import RolePlayEngine, TurnMode  # noqa: E402
+from r1_scheduler import CURIOSITY_LABELS_V2, CURIOSITY_TOPICS  # noqa: E402
 
 PACES: tuple[float, ...] = (20.0, 25.0, 35.0, 50.0, 65.0)
 GRADED_MOVES: tuple[str, ...] = (
@@ -81,6 +89,17 @@ S1_FLAGS: tuple[str, ...] = (
     "R1_CONCERN_LEDGER",
     "R1_SPLIT_REPLAN",
     "R1_PUSH_AFTER_REACTION",
+)
+# The M032 S2 rollback flags (learner voice).  ``--compare-s2`` runs S1 on with these off, then
+# every flag on, and reports every flag off (origin/main) against every flag on.
+S2_FLAGS: tuple[str, ...] = (
+    "R1_LEARNER_VOICE_V2",
+    "R1_NO_COMMIT_LEDGER",
+    "R1_OFFER_TERMS",
+    "R1_ACK_TURN_NOTE",
+    "R1_TIC_V2",
+    "R1_OFFER_REALISM",
+    "R1_REPLY_LENGTH",
 )
 # The S1 review's step rows: (fast pace, slow pace, R from which the slow pace applies).
 STEPS: tuple[tuple[float, float, float], ...] = (
@@ -108,6 +127,8 @@ INTENT_ACK = "Okay, I see."
 FREE_REPLY = "I see, that helps."
 # The ``decider`` learners' free reply when the advisor asks who else decides (S1-R1).
 DECIDER_REPLY = "Honestly, I'd need to talk it through with my husband first."
+# The ``pushy`` learner's free reply when the advisor asks her to enrol today (SWEEP-3).
+NOT_TODAY_REPLY = "I'm not ready to commit to anything today."
 # What the scripted learner asks when a free reply is handed a curiosity topic (keyed by the label
 # the reminder quotes), and how a helpful advisor answers it.
 CURIOSITY_QUESTIONS: dict[str, str] = {
@@ -123,6 +144,22 @@ CURIOSITY_QUESTIONS: dict[str, str] = {
     "whether there is any help with the job search afterwards": (
         "Is there any help with the job search afterwards?"
     ),
+}
+# With R1_TIC_V2 (SWEEP-12) the reminder quotes a rotated phrase per topic: the scripted learner
+# asks the same question for any phrase of that topic.
+_TOPIC_QUESTIONS = {
+    topic: CURIOSITY_QUESTIONS[label]
+    for topic, label in CURIOSITY_TOPICS
+    if label in CURIOSITY_QUESTIONS
+}
+CURIOSITY_LABEL_QUESTIONS: dict[str, str] = {
+    **CURIOSITY_QUESTIONS,
+    **{
+        phrase: _TOPIC_QUESTIONS[topic]
+        for topic, phrases in CURIOSITY_LABELS_V2.items()
+        if topic in _TOPIC_QUESTIONS
+        for phrase in phrases
+    },
 }
 CURIOSITY_ANSWERS: dict[str, str] = {
     "Are the classes live or recorded?": (
@@ -193,6 +230,16 @@ OFFERER = (
     "I can share a few alumni stories with you over email after this.",
 )
 CHALLENGE = "Where did you get that number?"
+# SWEEP-3: an advisor who keeps asking her to enrol today, between short pitches.
+PUSHY = (
+    "Our curriculum covers python, sql and machine learning, with mentors from top companies.",
+    "Can you enrol today? Seats in this batch are filling fast.",
+    "The classes are live on weekends and every session is recorded, so you can catch up.",
+    "So shall I send you the enrolment link today?",
+    "The course is $9,000, and there are discounts depending on the payment plan you pick.",
+    "Would you like to lock in your seat today?",
+    "Our alumni have moved into analyst roles at good companies after the program.",
+)
 # The owner's call, in shape only (paraphrased; no line of it is copied).  Her own questions are
 # answered as the cooperative advisor answers them.
 OWNER_SHAPE = (
@@ -272,11 +319,14 @@ class RunResult:
 class _Learner:
     """The scripted learner model: an acknowledgement on intents, a question when handed one."""
 
-    def __init__(self, engine: RolePlayEngine, *, names_decider: bool = False) -> None:
+    def __init__(
+        self, engine: RolePlayEngine, *, names_decider: bool = False, says_not_today: bool = False
+    ) -> None:
         self.engine = engine
         self.last_question: str | None = None
         self.heard = 0  # learner lines the advisor heard (some or all of)
         self.names_decider = names_decider
+        self.says_not_today = says_not_today
         self.advisor_text = ""  # the advisor's turn this reply answers
 
     def speak(self, plan: Any, r_sec: float, *, cut: bool = False) -> str:
@@ -292,9 +342,11 @@ class _Learner:
             base = FREE_REPLY
             if self.names_decider and "anyone else" in self.advisor_text.lower():
                 base = DECIDER_REPLY  # a stall she volunteers (S1 item 3)
+            if self.says_not_today and "today" in self.advisor_text.lower():
+                base = NOT_TODAY_REPLY  # the not-today stall she volunteers (SWEEP-3)
             reply = base
             reminder = plan.reminder or ""
-            for label, question in CURIOSITY_QUESTIONS.items():
+            for label, question in CURIOSITY_LABEL_QUESTIONS.items():
                 if f'curious about "{label}"' in reminder:
                     reply = f"{base} {question}"
                     self.last_question = question
@@ -348,6 +400,12 @@ def _cutter(index: int, learner: _Learner) -> str:
     return _cooperative(index, learner)
 
 
+def _pushy(index: int, learner: _Learner) -> str:
+    if learner.last_question is not None:
+        return CURIOSITY_ANSWERS[learner.last_question]
+    return _cycle(PUSHY, index)
+
+
 def _owner_shape(index: int, learner: _Learner) -> str:
     if learner.last_question is not None:
         return CURIOSITY_ANSWERS[learner.last_question]
@@ -364,9 +422,12 @@ PATTERNS: dict[str, AdvisorFn] = {
     "decider": _cooperative,
     "cutter_decider": _cutter,
     "owner_shape": _owner_shape,
+    "pushy": _pushy,
 }
 # The patterns whose learner names her decision maker when asked who else decides.
 DECIDER_PATTERNS = frozenset({"decider", "cutter_decider"})
+# The patterns whose learner says she is not ready to commit today when asked to enrol today.
+NOT_TODAY_PATTERNS = frozenset({"pushy"})
 
 
 def run_one(
@@ -383,7 +444,11 @@ def run_one(
     advisor = PATTERNS[pattern]
     persona = resolve_persona("p1_career_switcher", variant="v1")
     engine = RolePlayEngine(persona, candidate_first_name="Alex", seed=f"{seed}:{pattern}:{pace}")
-    learner = _Learner(engine, names_decider=pattern in DECIDER_PATTERNS)
+    learner = _Learner(
+        engine,
+        names_decider=pattern in DECIDER_PATTERNS,
+        says_not_today=pattern in NOT_TODAY_PATTERNS,
+    )
     result = RunResult(pattern, pace, step)
     cut_moves: set[str] = set()
     line_of: dict[str, int] = {}  # the heard learner line that delivered each graded move
@@ -497,6 +562,16 @@ def flags(value: str) -> dict[str, str]:
     return {name: value for name in S1_FLAGS}
 
 
+def s2_flags(value: str, *, s1: str = "1") -> dict[str, str]:
+    """Every S2 rollback flag set to ``value``, and every S1 flag to ``s1``."""
+    return {**flags(s1), **{name: value for name in S2_FLAGS}}
+
+
+def all_flags(value: str) -> dict[str, str]:
+    """Every S1 and S2 rollback flag set to ``value`` (all "0" is origin/main)."""
+    return s2_flags(value, s1=value)
+
+
 def totals(results: list[RunResult]) -> dict[str, Any]:
     """The grid's headline numbers: late and excluded runs, forced moves, mean last delivery."""
     last = [item.last_r for item in results if item.last_r is not None]
@@ -601,9 +676,14 @@ def table(results: list[RunResult]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--compare", action="store_true", help="flags off, then flags on")
+    parser.add_argument(
+        "--compare-s2", action="store_true", help="S1 on and S2 off, then every flag on"
+    )
     parser.add_argument("--json", help="write the results to this file")
     args = parser.parse_args(argv)
     out: dict[str, Any] = {}
+    if args.compare_s2:
+        return _compare_s2(args.json)
     settings = (("off", flags("0")), ("on", flags("1"))) if args.compare else (("env", None),)
     grids: dict[str, list[RunResult]] = {}
     for label, env in settings:
@@ -637,6 +717,47 @@ def main(argv: list[str] | None = None) -> int:
         }
     if args.json:
         Path(args.json).write_text(json.dumps(out, indent=1), encoding="utf-8")
+    return 0
+
+
+def late_families(results: list[RunResult], pattern: str) -> dict[str, list[str]]:
+    """The families late or excluded per pace for ``pattern`` (the SWEEP-3 report)."""
+    return {
+        f"{item.pace:.0f}": sorted(set(item.late) | set(item.excluded))
+        for item in results
+        if item.pattern == pattern
+    }
+
+
+def _compare_s2(json_path: str | None) -> int:
+    """M032 S2: S1 on with S2 off against every flag on, and every flag off against every on."""
+    out: dict[str, Any] = {}
+    grids = {
+        "main": run_grid(all_flags("0")),
+        "s1": run_grid(s2_flags("0")),
+        "s2": run_grid(all_flags("1")),
+    }
+    for label, results in grids.items():
+        print(f"== {label}")
+        print(table(results))
+        print(json.dumps(totals(results)))
+        out[label] = {"totals": totals(results), "runs": [item.as_dict() for item in results]}
+    for base in ("s1", "main"):
+        found = regressions(grids[base], grids["s2"])
+        print(f"== last graded delivery R ({base} -> s2)")
+        print(last_delivery_table(grids[base], grids["s2"]))
+        print(f"== regressions ({base} -> s2, gated patterns): " + ("; ".join(found) or "none"))
+        out[f"regressions_{base}"] = found
+    for label in grids:
+        out[f"pushy_late_{label}"] = late_families(grids[label], "pushy")
+        print(f"== pushy late or excluded ({label}): {json.dumps(out[f'pushy_late_{label}'])}")
+    steps = {"s1": run_steps(s2_flags("0")), "s2": run_steps(all_flags("1"))}
+    gate = gate_regressions(steps["s1"], steps["s2"])
+    print("== step rows (s1 -> s2), scoring regressions: " + ("; ".join(gate) or "none"))
+    out["step_gate_regressions"] = gate
+    out["step_changes"] = regressions(steps["s1"], steps["s2"])
+    if json_path:
+        Path(json_path).write_text(json.dumps(out, indent=1), encoding="utf-8")
     return 0
 
 
