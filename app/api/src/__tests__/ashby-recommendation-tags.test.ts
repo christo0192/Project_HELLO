@@ -1339,6 +1339,11 @@ const workerDeps = (over: Partial<Parameters<typeof runClaimedAshbyOperation>[0]
   email: { providerApproved: false, domainVerified: false },
   owner: 'w1',
   leaseSeconds: 30,
+  // The frozen clock the claim fixture is dated against. Without it the worker
+  // reads the wall clock, and once the real date passed NOW + 7 days the
+  // fixture claim looked older than TAG_DEFER_AGE_LIMIT_MS, so defers turned
+  // into fails.
+  nowMs: () => NOW,
   ...over,
 });
 
