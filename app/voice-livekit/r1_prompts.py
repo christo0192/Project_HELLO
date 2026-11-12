@@ -536,8 +536,6 @@ CURIOSITY_NOTE_V2 = (
     '- You are curious about "{curiosity}". If it connects to what the advisor just said, ask them '
     "one short question about it, in your own words; otherwise leave it for later."
 )
-# SWEEP-14: the reply's length follows the advisor's turn (fda9e9f6: 23 of 27 lines were two
-# sentences, after a lone "okay" as after a long pitch).  Free replies only.
 # ----------------------------------------------------------------------------------------------
 # M032 S2P, probe first (owner decision D-M032-7; flags R1_PROBE_FIRST and R1_PRICE_CONFLICT, read
 # by ``r1_roleplay``).  New wording, listed word for word in the slice report.  Per-turn notes only:
@@ -577,6 +575,8 @@ PRICE_REFLEX_BUDGET_NOTE = (
     "- They asked about your budget, but nobody has told you the price yet. You may give your "
     "monthly budget from your card, then ask what the course costs. Never guess a figure."
 )
+# SWEEP-14: the reply's length follows the advisor's turn (fda9e9f6: 23 of 27 lines were two
+# sentences, after a lone "okay" as after a long pitch).  Free replies only.
 LENGTH_VERY_SHORT = "- Keep this reply very short: a few words or one short sentence."
 LENGTH_ONE = "- Keep this reply to one short sentence."
 LENGTH_ONE_OR_TWO = "- Keep this reply to one or two short sentences."

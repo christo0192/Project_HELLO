@@ -9481,6 +9481,23 @@ class ProbeFirstF2F4Tests(unittest.TestCase):
         self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
         self.assertIsNone(plan.probe)
 
+    def test_her_hours_question_answered_goes_straight_to_the_s2_4_reaction(self):
+        """SWEEP-23's own case: she asked the weekly hours and the advisor answered "weekends,
+        about two hours" (no "a week"); F2 is then due with no probe and the S2.4 react brief."""
+        eng = engine()
+        eng._curiosity_asked.add("weekly_hours")
+        session = Session(eng)
+        r = to_f2(session)
+        plan = session.say("Weekends, about two hours.", r)
+        self.assertEqual(plan.move_id, r1_roleplay.F2_PRIMARY)
+        self.assertIsNone(plan.probe)
+        self.assertNotIn("probe:F2", plan.reasons)
+        self.assertIn(
+            r1_scheduler.PREEMPTED_SUFFIX.format(label="the schedule"), plan.intent.brief
+        )
+        for text in plan.intent.fallbacks:
+            self.assertTrue(r1_scheduler.markers_match(plan.intent.markers, text), text)
+
     def test_f4_never_presumes_the_cohort(self):
         eng = engine()
         state = eng.scheduler._states[r1_roleplay.F4_PRIMARY]
@@ -9587,6 +9604,13 @@ class ProbeFirstInvariantTests(unittest.TestCase):
             NEG.anchor_after_offer(usd, probe_first=True, counter_v2=True).brief
             for usd in (8000, 7000, 6000)
         ]
+        # F1's counter under R1_COUNTER_V2 and R1_PRICE_CONFLICT is an S2P F1 brief too.
+        briefs += [item.brief for item in NEG.COUNTERS_V2]
+        briefs += [
+            NEG.conflict_counter("website", 9500, None).brief,
+            NEG.conflict_counter("rise", 9000, 6000).brief,
+            NEG.YOUR_NUMBER_COUNTER_SUFFIX,
+        ]
         for brief in briefs:
             with self.subTest(brief=brief):
                 self.assertIsNone(banned.search(brief))
@@ -9687,11 +9711,88 @@ class ProbeFirstGradedMeaningTests(unittest.TestCase):
         self.assertNotIn("family_missing:F1", log["exclusion_reasons"])
         return log
 
+    PROBE_FIRST_MOVES = (F1_ANCHOR, r1_roleplay.F2_PRIMARY, r1_roleplay.F4_PRIMARY)
+
+    def _assert_proven(self, session, *, forced: bool):
+        """Every probe-first family's move was played in a line that proves its own (unchanged)
+        markers, holds no course length she was never told, and was forced or not as asked."""
+        eng = session.eng
+        lines = {
+            plan.move_id: spoken
+            for plan, spoken in zip(session.plans, session.spoken)
+            if plan.move_id in self.PROBE_FIRST_MOVES and spoken
+        }
+        moves = {
+            move["id"]: move for move in eng.admin_log(final=True, r_end=1150.0)["schedule"]["moves"]
+        }
+        for move_id in self.PROBE_FIRST_MOVES:
+            with self.subTest(move=move_id):
+                spoken = lines[move_id]
+                markers = r1_scheduler.SPEC_BY_ID[move_id].markers
+                self.assertTrue(r1_scheduler.markers_match(markers, spoken), spoken)
+                self.assertIsNone(r1_scheduler.COURSE_LENGTH_FIGURE.search(spoken), spoken)
+                self.assertEqual(moves[move_id]["forced"], forced)
+
+    def _drive_session(self, advisor, pace, *, r_end=1150.0):
+        """``_drive``, keeping the session (its plans and what was played)."""
+        eng = engine(seed=f"s2p:{pace}")
+        s = Session(eng)
+        r, text, index = 20.0, OPENER, 0
+        while r <= r_end:
+            plan = s.say(text, r, turn_index=2 * index + 1, candidate_seconds=8.0)
+            if plan.mode is TurnMode.EXIT:
+                break
+            text = advisor(index, s.spoken[-1] if s.spoken else "")
+            index += 1
+            r += pace
+        return s, r
+
     def test_the_probe_path_delivers_every_family(self):
         eng, r = _drive(_answers_probes, 25.0)
         log = self._assert_graded(eng, r)
         self.assertGreaterEqual(log["probe_first"]["probes"].get("F1", 0), 1)
         self.assertIn("anchor:stated_conflict", [x["response"] for x in log["negotiation"]["responses"]])
+
+    def test_the_probe_path_proves_every_family_s_markers_in_what_was_played(self):
+        s, r = self._drive_session(_answers_probes, 25.0)
+        self._assert_graded(s.eng, r)
+        self._assert_proven(s, forced=False)
+        probes = s.eng.admin_log(final=True, r_end=r)["probe_first"]["probes"]
+        self.assertEqual((probes.get("F1", 0) >= 1, probes.get("F2", 0) >= 1), (True, True))
+
+    def test_the_forced_path_delivers_proves_and_scores_f1_f2_and_f4(self):
+        """An advisor who only acknowledges, at 65 s an exchange, gives her no natural moment and
+        no slack for a probe: F1-ANCHOR, F2-PRIMARY and F4-PRIMARY are all issued on the forced
+        path, in their probe-first wording (F1 checks the website's price as a question), and every
+        family is still delivered, proven and auto-scored."""
+
+        def acks(index, spoken):
+            return (SHORT_ACK, "Okay.", "Right.", "Mm-hmm.")[index % 4]
+
+        s, r = self._drive_session(acks, 65.0)
+        log = self._assert_graded(s.eng, r)
+        self.assertEqual(log["exclusion_reasons"], [])
+        self._assert_proven(s, forced=True)
+        self.assertEqual(log["probe_first"]["probes"], {})
+        responses = [x["response"] for x in log["negotiation"]["responses"]]
+        self.assertEqual(responses[0], "anchor:check")
+        anchor_line = next(
+            spoken for plan, spoken in zip(s.plans, s.spoken) if plan.move_id == F1_ANCHOR
+        )
+        self.assertIn("$9,000", anchor_line)
+        self.assertIn("?", anchor_line)  # the website's price is a check, never a statement
+
+    def test_after_the_check_the_website_price_stays_allowed(self):
+        """SWEEP-17 item 4: once she said $9,000 on the check path, a later reply may say it."""
+        s, r = self._drive_session(_never_names_a_price, 25.0)
+        self.assertIn(9000, s.eng._figures_said)
+        later = [
+            plan
+            for plan in s.plans
+            if plan.mode is TurnMode.LLM_REPLY and s.eng.scheduler.is_delivered(F1_ANCHOR)
+        ]
+        self.assertTrue(later)
+        self.assertIn(9000, later[-1].guard_ctx.allowed_extra)
 
     def test_the_dodged_and_forced_paths_deliver_every_family(self):
         for pace in (25.0, 50.0):
@@ -9835,6 +9936,26 @@ class Sweep21ConflictTests(unittest.TestCase):
         plan = early.say("For the analyst track we offer a $9,500 fee.", 60)
         self.assertNotIn(P2.PRICE_CONFLICT_WEBSITE_NOTE.format(amount="$9,500"), plan.reminder)
 
+    def test_a_deadline_or_the_discount_ladder_after_an_offer_is_no_rise(self):
+        # The corpus check: "Tomorrow it's back to $9000" is the offer's deadline, and the $9,000
+        # said with the $500 / $1,000 / $1,500 ladder keeps the $8,000 reachable.
+        for text in (
+            "That price is locked only if you deposit tonight. Tomorrow it's back to $9000.",
+            "The course is listed at $9,000, with discounts of $500, $1,000 or $1,500 by plan.",
+        ):
+            with self.subTest(text=text):
+                s = _anchor_done()
+                s.say("I can do $8,000 for you.", 60)
+                s.say(SHORT_ACK, 80)
+                plan = s.say(text, 100)
+                self.assertNotIn("Earlier the advisor offered you", plan.reminder or "")
+                self.assertIsNone(s.eng.negotiation.rise_open_turn)
+        s = _anchor_done()
+        s.say("I can do $8,000 for you.", 60)
+        s.say(SHORT_ACK, 80)
+        plan = s.say("Our course is $9,000 and I can't change that.", 100)
+        self.assertIn(P2.PRICE_RISE_NOTE.format(earlier="$8,000", amount="$9,000"), plan.reminder)
+
     @s2p_off
     def test_flag_off_has_no_conflict_note(self):
         s = _anchor_done()
@@ -9933,6 +10054,28 @@ class Sweep19CounterEngineTests(unittest.TestCase):
         self.assertIn("do not ask for less", plan.intent.brief)
         for text in plan.intent.fallbacks:
             self.assertNotRegex(text, r"(?i)best you can do|little better|lower|\bless\b|come down|still move|closer")
+
+    def test_a_ticket_size_before_the_anchor_is_the_number_she_reacts_to(self):
+        # SWEEP-19 item 4 (b419d478 #43-44, paraphrased): a ticket size named before the anchor
+        # is the price on the table; below the $7,000 she asks for nothing.
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("We usually see a ticket size of around 6000 USD for this course.", 40)
+        self.assertEqual(s.eng.negotiation.best_offer_usd, 6000)
+        self.assertEqual(plan.move_id, F1_ANCHOR)
+        self.assertIn("$6,000", plan.intent.brief)
+        self.assertNotIn("$9,000", plan.intent.brief)
+        for text in plan.intent.fallbacks:
+            self.assertNotRegex(text, r"(?i)can you do that|is that possible|could you do")
+        self.assertIn(
+            "anchor:reached", [x["response"] for x in s.eng.negotiation.log()["responses"]]
+        )
+        for text in ("This is a high ticket size program.", "We trained 6000 learners last year."):
+            with self.subTest(text=text):
+                other = Session(engine())
+                other.say(OPENER, 20)
+                other.say(text, 40)
+                self.assertIsNone(other.eng.negotiation.best_offer_usd)
 
     def test_a_far_below_price_gets_the_careful_buyer_counter(self):
         s = _anchor_done()
