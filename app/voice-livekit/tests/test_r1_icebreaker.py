@@ -642,6 +642,11 @@ class TestIcebreakerRepair(unittest.TestCase):
         "Sorry, hold on.",
         "Pause, please.",
         "Can I have a quick minute?",
+        "Can I take a minute to think?",
+        "Okay, just give me a minute, ma'am.",
+        "Please wait a minute.",
+        "Could you hold on for a second, please?",
+        "Give me a second, I'll be right back.",
     )
     NOT_HOLDS = (
         "Could you give me an example of what you mean?",
@@ -657,12 +662,35 @@ class TestIcebreakerRepair(unittest.TestCase):
         "One moment.",
         "",
     )
+    # Review of S6 (synthetic): a hold phrase used in an answer, and "hold on" / "wait a minute"
+    # in front of a question, a repair or a denial of their own.
+    NARRATIVE_NOT_HOLDS = (
+        "So when a client hesitates I usually wait a minute and then I follow up with the pricing.",
+        "I had to wait a bit for my promotion.",
+        "When a customer gets angry I hold on for a second and let them vent.",
+        "Honestly, my best moment was when a client said give me a minute and then signed.",
+        "Hold on, sorry, my phone was ringing. So I worked at an edtech firm.",
+        "I just wait a minute and then call them back.",
+        "Let me pause there.",
+    )
+    ASKING_NOT_HOLDS = (
+        "Hold on, what was the question?",
+        "Hold on, can you repeat the question?",
+        "Wait a minute, what do you mean?",
+        "Wait a minute, which role are you asking about?",
+        "Wait a minute, I didn't say that.",
+        "Pause, what do you mean by typical day?",
+        "Hold on, I didn't get you.",
+        "Hold on a sec, are you there?",
+        "Wait a second. Hello?",
+        "Hold on. Could you rephrase that?",
+    )
 
     def test_a_hold_request(self):
         for text in self.HOLDS:
             with self.subTest(text=text):
                 self.assertTrue(ib.is_hold_request(text))
-        for text in self.NOT_HOLDS:
+        for text in self.NOT_HOLDS + self.NARRATIVE_NOT_HOLDS + self.ASKING_NOT_HOLDS:
             with self.subTest(text=text):
                 self.assertFalse(ib.is_hold_request(text))
 
@@ -672,6 +700,8 @@ class TestIcebreakerRepair(unittest.TestCase):
             "can i " + "take " * 5000 + "a minute",
             "sorry " * 5000 + "hold on",
             "wait for " * 3000 + "a minute",
+            "please wait " * 3000 + "for a minute " * 2000,
+            "sorry " * 5000 + "wait a minute " + "this " * 3000,
         ):
             started = time.perf_counter()
             ib.is_hold_request(text)
@@ -693,6 +723,41 @@ class TestIcebreakerRepair(unittest.TestCase):
         for text in ("That sounds like a busy week.", "", "?", None):
             with self.subTest(text=text):
                 self.assertIsNone(ib.repeat_question(text))
+
+    def test_the_question_of_one_reply(self):
+        # Review of S6: read from ONE reply.  A reply cut before its question, or one that only
+        # reacted, gives None (the plan's question is used); an imperative prompt heard in full
+        # is said again.
+        self.assertEqual(
+            ib.reply_question("Got it. How do you follow up?", complete=False),
+            "How do you follow up?",
+        )
+        self.assertIsNone(ib.reply_question("That sounds like a busy week.", complete=False))
+        self.assertIsNone(ib.reply_question("That sounds like a busy week.", complete=True))
+        self.assertEqual(
+            ib.reply_question("Got it. Tell me about a customer you're proud of.", complete=True),
+            "Tell me about a customer you're proud of.",
+        )
+        self.assertIsNone(
+            ib.reply_question("Got it. Tell me about a customer you're proud of.", complete=False)
+        )
+        self.assertEqual(
+            ib.reply_question("Nice. So walk me through a typical day.", complete=True),
+            "So walk me through a typical day.",
+        )
+        self.assertIsNone(ib.reply_question("", complete=True))
+
+    def test_a_closed_question(self):
+        for text in ("Do you enjoy cold calls?", "And is that inbound?", "Have you led a team?"):
+            with self.subTest(text=text):
+                self.assertTrue(ib.is_closed_question(text))
+        for text in (
+            "How do you keep track of all your leads?",
+            "What did a typical day look like for you?",
+            "Tell me about a customer you're proud of.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(ib.is_closed_question(text))
 
     def test_the_repeat_line_and_the_presence_notes(self):
         self.assertEqual(

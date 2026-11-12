@@ -189,6 +189,10 @@ class Reply:
     scripted: str = ""
     fallback: str = ""
     job: Any = None
+    # M032 S6 (SWEEP-28, review): "hold" or "repeat" for the icebreaker's scripted repair line
+    # (L-IB-HOLD, "Of course. {question}"), so a line nobody heard gives its once-per-session
+    # budget back; "" for every other reply.
+    repair: str = ""
 
 
 def llm_messages(

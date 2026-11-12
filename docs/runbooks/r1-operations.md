@@ -2255,11 +2255,19 @@ for a minute got "I can't pause" and a new question, and a two-word thank-you cu
   the question. A hold request ("Can you give me a minute?") gets L-IB-HOLD ("Of course, take a
   moment. I'm here when you're ready."), is no answer, and the next silence window is 60 s (once
   per session, never past S = 4:30); with under 15 s left nothing is promised and the turn ends
-  the icebreaker. The repair readers also read "once again", "not able to hear" and "I'm sorry".
-  Counts: `icebreaker_repeat_deferrals`, `boundary_presence_lines`, `ib_holds`. Logs:
+  the icebreaker. The repair readers also read "once again", "not able to hear" and "I'm sorry",
+  and look past "sir", "ma'am", Christy's name and a leading "hold on" / "wait". A hold is a
+  directed request with nothing else in the turn: "I usually wait a minute and then call back"
+  is an answer, and "Hold on, what was the question?" a repeat request. The question repeated is
+  the one of Christy's LAST model reply (its imperative prompt if it asked with one; the plan's
+  current question when it was cut before its question). Right after the hold or the repeat
+  line, "Okay." or "Thank you." answers nothing (no reply, not the boundary; after a repeated
+  yes/no question, "Okay." or "Yes." is its answer). A hold or repeat line cancelled before any
+  audio gives its once-per-session budget back, and the request is read with the turn that cut
+  it. Counts: `icebreaker_repeat_deferrals`, `boundary_presence_lines`, `ib_holds`. Logs:
   `r1_icebreaker_repeat`, `r1_icebreaker_hold`, `r1_icebreaker_presence_opener`,
-  `r1_icebreaker_boundary_presence`. Rollback: `fly secrets set R1_ICEBREAKER_REPAIR=0 -a
-  project-hello-voice`.
+  `r1_icebreaker_boundary_presence`, `r1_icebreaker_quiet_ack`, `r1_icebreaker_repair_undone`.
+  Rollback: `fly secrets set R1_ICEBREAKER_REPAIR=0 -a project-hello-voice`.
 * **`R1_ICEBREAKER_ACK_HOLD`** (default on, only with `R1_ACK_HOLD`). An acknowledgement or a
   courtesy-only "Thank you" said over Christy's live icebreaker model reply is held back from the
   SDK like an "Okay" over the learner: written to the row in the icebreaker phase, never counted,

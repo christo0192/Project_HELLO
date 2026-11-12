@@ -3926,7 +3926,13 @@ class TestIcebreakerRepairWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rig.machine.candidate_turns, answers)
         self.assertEqual(self.plan_state(rig), plan)
         self.assertTrue(rig.interview._ib_hold_window)
-        # Once per session: a second one is an ordinary turn (still no answer).
+        # Review of S6: right after the line, one more "hold on a sec" answers nothing (no reply,
+        # and the moment is still theirs).
+        self.assertIsNone(await rig.converse("Hold on a sec, please."))
+        self.assertTrue(rig.interview._ib_hold_window)
+        # Once per session: after an answer, a second one is an ordinary turn (still no answer).
+        await rig.converse(IB_LAST)
+        answers = rig.machine.candidate_turns
         self.assertEqual(await rig.converse("Hold on a sec, please."), "Take your time.")
         self.assertEqual(rig.machine.candidate_turns, answers)
         self.assertFalse(rig.interview._ib_hold_window)
@@ -3973,6 +3979,202 @@ class TestIcebreakerRepairWiring(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+    # ---- review of S6 (synthetic text throughout)
+
+    async def converse_cut(self, rig: Rig, text: str, reply: str, heard: str) -> None:
+        """One turn whose model ``reply`` is cut after the words ``heard`` (the SDK forwards only
+        what was heard, and flags the item interrupted)."""
+        rig.final(text)
+        await rig.settle()
+        message_id = f"msg_{next(rig._ids)}"
+        await rig.agent.on_user_turn_completed(
+            None, SimpleNamespace(text_content=text, id=message_id)
+        )
+        handle = FakeSpeechHandle("reply")
+        rig.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
+        )
+        chat_ctx = SimpleNamespace(items=[SimpleNamespace(role="user", id=message_id)])
+        stream = rig.interview.llm_node_stream(chat_ctx, TokenProvider(reply))
+        "".join([chunk async for chunk in stream])
+        rig.session.current_speech = handle
+        message = FakeChatMessage(heard, interrupted=True)
+        handle.chat_items.append(message)
+        rig.session.emit("conversation_item_added", SimpleNamespace(item=message))
+        rig.session.current_speech = None
+        handle.finish()
+        await rig.settle()
+
+    async def commit_unheard(self, rig: Rig, text: str) -> None:
+        """``text`` commits, and its reply is cancelled before any audio by the candidate going
+        on speaking (the first half of a split request)."""
+        rig.final(text)
+        await rig.settle()
+        message_id = f"msg_{next(rig._ids)}"
+        await rig.agent.on_user_turn_completed(
+            None, SimpleNamespace(text_content=text, id=message_id)
+        )
+        handle = FakeSpeechHandle("reply")
+        rig.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
+        )
+        rig.session.emit("user_state_changed", state("speaking"))
+        handle.interrupted = True
+        handle.finish()  # cancelled before any audio
+        await rig.settle()
+        rig.session.emit("user_state_changed", state("listening"))
+
+    async def test_a_reply_cut_before_its_question_repeats_the_plans_question(self):
+        rig = await self.rig()
+        for _ in range(3):
+            await rig.converse(IB_ANSWER)
+        await self.converse_cut(
+            rig,
+            IB_ANSWER,
+            "That sounds like a busy week. What made you apply for this role?",
+            "That sounds like a busy week.",
+        )
+        rig.clock.advance(212)
+        self.assertTrue(rig.machine.icebreaker_should_end())
+        spoken = await rig.converse(IB_REPEAT)
+        # Not the question of an older reply, which was answered three times.
+        self.assertNotEqual(spoken, "Of course. How do you keep track of all your leads?")
+        self.assertEqual(spoken, "Of course. " + rig.interview._icebreaker_fallback)
+
+    async def test_an_imperative_prompt_heard_in_full_is_the_one_repeated(self):
+        rig = await self.rig()
+        for _ in range(3):
+            await rig.converse(IB_ANSWER)
+        prompt = "Got it. Tell me about a customer conversation you're proud of."
+        await rig.converse(IB_ANSWER, provider=TokenProvider(prompt))
+        rig.clock.advance(212)
+        spoken = await rig.converse(IB_REPEAT)
+        self.assertEqual(spoken, "Of course. " + prompt.removeprefix("Got it. "))
+
+    async def test_scripted_lines_never_replace_the_question(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse(IB_HOLD_TEXT)  # L-IB-HOLD is scripted
+        self.assertEqual(
+            rig.interview._ib_last_question, "How do you keep track of all your leads?"
+        )
+
+    async def test_a_split_repeat_request_is_read_whole(self):
+        rig = await self.rig()
+        await self.due(rig)
+        await self.commit_unheard(rig, "Sorry, can you repeat")
+        # The repeat line nobody heard gave its once-per-session budget back.
+        self.assertEqual(rig.interview._ib_repeat_deferrals, 0)
+        spoken = await rig.converse("the question?")
+        self.assertEqual(spoken, "Of course. How do you keep track of all your leads?")
+        self.assertFalse(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNone(await rig.converse(IB_LAST))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+
+    async def test_a_hold_line_nobody_heard_gives_the_hold_back(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await self.commit_unheard(rig, IB_HOLD_TEXT)
+        self.assertEqual(rig.interview._ib_holds, 0)
+        self.assertFalse(rig.interview._ib_hold_window)
+        self.assertEqual(await rig.converse(IB_HOLD_TEXT), rig.interview.render_line("L-IB-HOLD"))
+
+    async def test_a_hold_phrase_before_a_question_is_no_hold(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        calls = len(rig.provider.calls)
+        self.assertEqual(await rig.converse("Hold on, what was the question?"), IB_QUESTION_REPLY)
+        self.assertEqual(len(rig.provider.calls), calls + 1)
+        self.assertFalse(rig.interview._ib_hold_window)
+        self.assertEqual(rig.interview._ib_holds, 0)
+        # At the soft exit the repeat wins over the hold.
+        for _ in range(3):
+            await rig.converse(IB_ANSWER)
+        rig.clock.advance(212)
+        spoken = await rig.converse("Hold on, can you repeat the question?")
+        self.assertEqual(spoken, "Of course. How do you keep track of all your leads?")
+        self.assertEqual(rig.interview._ib_holds, 0)
+
+    async def test_a_hold_phrase_inside_an_answer_is_an_answer(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        calls, answers = len(rig.provider.calls), rig.machine.candidate_turns
+        narrative = "So when a client hesitates I usually wait a minute and then call them back."
+        self.assertEqual(await rig.converse(narrative), IB_QUESTION_REPLY)
+        self.assertEqual(len(rig.provider.calls), calls + 1)
+        self.assertEqual(rig.machine.candidate_turns, answers + 1)
+        self.assertFalse(rig.interview._ib_hold_window)
+
+    async def test_okay_after_the_hold_line_answers_nothing(self):
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse(IB_HOLD_TEXT)
+        calls, answers = len(rig.provider.calls), rig.machine.candidate_turns
+        for text in ("Okay.", "Thank you.", "Sure, thanks.", "Okay, one sec."):
+            with self.subTest(text=text):
+                self.assertIsNone(await rig.converse(text))
+                self.assertTrue(rig.interview._ib_hold_window)  # the moment is still theirs
+        self.assertEqual(len(rig.provider.calls), calls)
+        self.assertEqual(rig.machine.candidate_turns, answers)
+        self.assertEqual(await rig.converse(IB_LAST), IB_QUESTION_REPLY)  # the answer comes
+        self.assertFalse(rig.interview._ib_hold_window)
+        self.assertEqual(rig.machine.candidate_turns, answers + 1)
+
+    async def test_okay_after_the_hold_line_at_the_soft_exit_is_no_boundary(self):
+        rig = await self.rig()
+        await self.due(rig)
+        await rig.converse(IB_HOLD_TEXT)
+        for text in ("Okay.", "Thank you."):
+            with self.subTest(text=text):
+                self.assertIsNone(await rig.converse(text))
+                self.assertFalse(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNone(await rig.converse(IB_LAST))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+        self.assertEqual(await self.brief(rig), [rig.interview.render_line("L-TRANSITION")])
+
+    async def test_okay_after_an_open_repeated_question_is_no_boundary(self):
+        rig = await self.rig()
+        await self.due(rig)
+        await rig.converse(IB_REPEAT)
+        self.assertIsNone(await rig.converse("Okay."))
+        self.assertFalse(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNone(await rig.converse(IB_LAST))
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+
+    async def test_yes_after_a_yes_no_repeated_question_answers_it(self):
+        rig = await self.rig()
+        closed = TokenProvider("Got it. Do you enjoy the calling part of the job?")
+        rig.provider = closed
+        await self.due(rig)
+        spoken = await rig.converse(IB_REPEAT, provider=closed)
+        self.assertEqual(spoken, "Of course. Do you enjoy the calling part of the job?")
+        self.assertIsNone(await rig.converse("Thank you.", provider=closed))  # a courtesy
+        self.assertFalse(rig.interview._icebreaker_boundary_turn)
+        self.assertIsNone(await rig.converse("Yes.", provider=closed))  # the answer
+        self.assertTrue(rig.interview._icebreaker_boundary_turn)
+
+    async def test_a_repeat_request_that_addresses_christy_is_one(self):
+        for text in (
+            "Sorry ma'am, can you repeat the question?",
+            "Could you please repeat the question, Christy?",
+        ):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                await self.due(rig)
+                spoken = await rig.converse(text)
+                self.assertEqual(spoken, "Of course. How do you keep track of all your leads?")
+                self.assertFalse(rig.interview._icebreaker_boundary_turn)
+
+    async def test_a_presence_check_that_addresses_christy_gets_the_opener(self):
+        import r1_icebreaker as ib
+
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse("Christy, are you there?")
+        self.assertIn(ib.PRESENCE_OPENER_NOTE, rig.last_messages()[-2]["content"])
 
     async def test_the_flag_off_is_todays_icebreaker(self):
         rig = await self.rig(R1_ICEBREAKER_REPAIR="0")

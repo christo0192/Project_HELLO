@@ -8523,6 +8523,37 @@ class TestIcebreakerRepairReaders(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(r1_session.is_repeat_request(text))
 
+    def test_the_icebreaker_view_looks_past_how_christy_is_addressed(self) -> None:
+        # Review of S6: "sir", "ma'am" and her name, and a leading "hold on" / "wait", are not
+        # words of the request.  The role-play's own reader is unchanged.
+        repeats = (
+            "Could you please repeat the question, Christy?",
+            "Sorry ma'am, can you repeat the question?",
+            "Sir, can you repeat the question?",
+            "Can you please repeat the question once again, ma'am?",
+            "Hold on, can you repeat the question?",
+            "Wait, what was the question?",
+            "Pardon, madam?",
+        )
+        for text in repeats:
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_repeat_request(r1_session._ib_repair_view(text)))
+        for text in ("Christy, are you there?", "Hello ma'am, are you there?"):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_repair_turn(r1_session._ib_repair_view(text)))
+        self.assertFalse(r1_session.is_repair_turn("Sir, can you repeat the question?"))
+        for text in (
+            "Sir, I sold courses for five years.",
+            "Hold on, I worked in a bank before that.",
+            "Christy is a nice name.",
+            "Hold on.",
+            "",
+        ):
+            with self.subTest(text=text):
+                view = r1_session._ib_repair_view(text)
+                self.assertFalse(r1_session.is_repeat_request(view))
+                self.assertFalse(r1_session.is_repair_turn(view))
+
     def test_real_advisor_turns_read_the_same_but_for_a_folded_sorry(self) -> None:
         # The 2,136-turn advisor corpus and its held-out set (the role-play's barge-in repair reads
         # them too): no turn becomes or stops being a repair turn, none is a repeat request, and
@@ -8536,6 +8567,11 @@ class TestIcebreakerRepairReaders(unittest.TestCase):
                 text = json.loads(raw)["text"]
                 wide = (r1_session.content_word_count(text), r1_session.is_repair_turn(text))
                 self.assertFalse(r1_session.is_repeat_request(text))
+                # Review of S6: nor through the icebreaker's view, nor as a hold request.
+                view = r1_session._ib_repair_view(text)
+                self.assertFalse(r1_session.is_repeat_request(view))
+                self.assertEqual(r1_session.is_repair_turn(view), wide[1])
+                self.assertFalse(r1_session.is_hold_request(text))
                 with mock.patch.dict(os.environ, {"R1_ICEBREAKER_REPAIR": "0"}):
                     narrow = (r1_session.content_word_count(text), r1_session.is_repair_turn(text))
                 self.assertEqual(wide[1], narrow[1])

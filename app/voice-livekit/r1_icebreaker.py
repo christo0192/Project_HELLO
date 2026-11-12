@@ -687,36 +687,59 @@ PRESENCE_OPENER_NOTE_LATE = (
 )
 PRESENCE_LATE_SECONDS = 6.0
 
-# A request for a moment ("Can you give me a minute?", "Hold on a sec", "Can we pause?").  Narrow:
-# "give me", "wait" and "hold" need a time object ("give me an example", "wait for my answer" and
-# "hold that thought" are not holds); "pause" and "hold on" stand alone only as a request or at the
-# start of the turn ("there was a pause in my career", "I hold on to my customers" are answers).
+# A request for a moment ("Can you give me a minute?", "Hold on a sec", "Can we pause?").  Narrow
+# and DIRECTED (review of S6): "give me", "wait" and "hold" need a time object ("give me an
+# example", "wait for my answer" and "hold that thought" are not holds), and "wait"/"hold" a
+# request shape too: a modal ("can you wait a minute"), "please", or the start of the turn ("Wait
+# a minute, please.").  So "I usually wait a minute and then follow up" and "I hold on for a second
+# and let them vent" are answers, as are "there was a pause in my career" and "I hold on to my
+# customers".  "Pause" and "hold on" stand alone only as a request or at the start of the turn.
 _HOLD_TIME = r"(?:a|one|just a|a quick|a short) (?:minute|moment|second|sec|bit)"
+_HOLD_MODAL = r"(?:(?:can|could|would|will) you (?:please |just |kindly )?|please |just )"
 _HOLD_RE = re.compile(
     r"\b(?:"
-    r"give (?:me|us) " + _HOLD_TIME
-    + r"|(?:wait|hold)(?: on)?(?: for)? " + _HOLD_TIME
-    + r"|(?:can|could|may) (?:i|we) (?:have|take|get) a (?:quick |short )?"
+    + _HOLD_MODAL + r"?give (?:me|us) " + _HOLD_TIME
+    + r"|" + _HOLD_MODAL + r"(?:wait|hold(?: on)?)(?: for)? " + _HOLD_TIME
+    + r"|(?:can|could|may) (?:i|we) (?:please |just )?(?:have|take|get) a (?:quick |short )?"
     r"(?:minute|moment|second|sec|break)"
     r"|(?:can|could|would|will) (?:you|we) (?:please |just |quickly )?"
     r"(?:pause|take a (?:quick |short )?break)"
-    r"|(?:please|let's|let us|let me) (?:pause|take a (?:quick |short )?break)"
+    r"|(?:please|let's|let us) (?:pause|take a (?:quick |short )?break)"
     r")\b"
-    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy) )*(?:hold on|pause)\b"
+    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy|ma'am|madam|sir) )*"
+    r"(?:(?:wait|hold(?: on)?)(?: for)? " + _HOLD_TIME + r"|hold on|pause)\b"
+)
+# What may follow the hold phrase and keep the turn a hold request: its object and time ("pause
+# this for a minute"), thinking ("to think", "to gather my thoughts") and "I'll be right back".
+_HOLD_TAIL_RE = re.compile(
+    r"\b(?:(?:this|it|the interview|the call) )?(?:for )?" + _HOLD_TIME
+    + r"|(?:let me |i need to )?(?:to )?(?:think|gather my thoughts|collect my thoughts)"
+    r"(?: about it| about that)?"
+    r"|(?:i'll|i will) (?:just )?be (?:right )?back"
+    r"|(?:this|it)\b"
+)
+# The only words allowed around the hold phrase once the tail is cut (an allowlist, as in
+# ``is_thinking``): "Hold on, what was the question?", "Wait a minute, I didn't say that." and
+# "Hold on a sec, are you there?" ask or say something of their own, and get it answered.
+_HOLD_REST_WORDS = _FILLER_WORDS | frozenset(
+    {"thanks", "thank", "you", "for", "me", "us", "quick", "quickly", "kindly", "now", "maam",
+     "mam", "real"}
 )
 
 
 def is_hold_request(text: object) -> bool:
-    """True for a turn that asks Christy for a moment, and says little else.
+    """True for a turn that asks Christy for a moment, and says nothing else.
 
-    The rest of the turn (the hold phrase taken out) must have fewer than ``THIN_WORDS + 3``
-    substantive words: "Give me a moment to explain: I sold software for six years ..." is an
-    answer.  Checked before ``disposition``, so a hold never takes S5's "Take your time." route.
+    Every word left once the hold phrase and its tail (``_HOLD_TAIL_RE``) are cut must be a
+    filler or a courtesy (``_HOLD_REST_WORDS``): "Give me a moment to explain: I sold software
+    ..." is an answer, and "Hold on, can you repeat the question?" a repeat request.  Checked
+    before ``disposition``, so a hold never takes S5's "Take your time." route.
     """
     plain = _plain(text)
     if not plain or _HOLD_RE.search(plain) is None:
         return False
-    return substantive_words(_HOLD_RE.sub(" ", plain)) < THIN_WORDS + 3
+    rest = _HOLD_TAIL_RE.sub(" ", _HOLD_RE.sub(" ", plain))
+    return all(word in _HOLD_REST_WORDS for word in rest.split())
 
 
 # A lead-in before the last ":" or " - " of a question ("Here's my next question: how ...").  It is
@@ -747,6 +770,43 @@ def repeat_question(text: object) -> str | None:
     if not _plain(question):
         return None
     return question[:1].upper() + question[1:]
+
+
+# An imperative prompt that asks without a "?" ("Tell me about a customer conversation you're proud
+# of."), as the last sentence of a reply the candidate heard in full.
+_PROMPT_OPEN_RE = re.compile(
+    r"^(?:(?:so|and|now|okay|ok|then) )?(?:please )?"
+    r"(?:tell|describe|walk|share|talk|give|take) (?:me|us)\b"
+)
+
+
+def reply_question(text: object, *, complete: bool) -> str | None:
+    """What a request to repeat Christy's question gets again, read from ONE reply of hers.
+
+    Its last question (``repeat_question``), or, for a reply heard in full (``complete``) that
+    asks with an imperative instead ("Tell me about ..."), that last sentence.  None for a reply
+    that asked nothing the candidate heard (cut before its question, or a reaction only): the
+    caller then falls back to the plan's current question.
+    """
+    question = repeat_question(text)
+    if question is not None or not complete:
+        return question
+    sentences = [sentence.strip() for sentence in split_sentences(text) if sentence.strip()]
+    if not sentences or _PROMPT_OPEN_RE.match(_plain(sentences[-1])) is None:
+        return None
+    last = sentences[-1]
+    return last[:1].upper() + last[1:]
+
+
+_CLOSED_OPEN_RE = re.compile(
+    r"^(?:(?:so|and|or|but|okay|ok) )?" + _ASK_AUX + r" (?:you|your|it|that|this|there|they)\b"
+)
+
+
+def is_closed_question(question: object) -> bool:
+    """True for a yes/no question ("Do you enjoy cold calls?"), which "Okay." or "Sure." can
+    answer; "How do you keep track of your leads?" is open."""
+    return _CLOSED_OPEN_RE.match(_plain(question)) is not None
 
 
 def repeat_line(question: str) -> str:
