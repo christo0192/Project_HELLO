@@ -659,6 +659,47 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(timing["push_react_holds"], {})
                 self.assertIsNone(timing["moment_waits"])
 
+    def test_the_learner_voice_counts_ride_along_as_counts_only(self):
+        """M032 S2: how her replies opened, their sentence counts, the scripted tails bolted onto
+        intents and each S2 note go with the row, counts only and bounded; never any text."""
+        admin = {
+            "voice": {
+                "learner_replies": 20,
+                "learner_ack_hinge_replies": 3,
+                "learner_verdict_openers": 2,
+                "learner_doubt_opener_replies": 0,
+                "sentence_histogram": {"1": 8, "2": 11, "3": 1},
+                "intent_turns": 9,
+                "intent_tails_appended": 2,
+                "intent_tails_after_question": 1,
+                "stall_theme_counts": {"not_today": 1, "decider": 1},
+                "no_commit_notes": 6,
+                "volunteered_timing_stalls": 1,
+                "offer_terms_counts": {"instalments": 1},
+                "ack_turn_notes": 2,
+                "soft_tic_trims": 1,
+                "implausible_offer_count": 0,
+                "last_reply": "never sent",
+            }
+        }
+        voice = session_facts_event(admin, {}, roleplay_seconds=42.0)["payload"]["learner_voice"]
+        self.assertEqual(voice["sentence_histogram"], {"1": 8, "2": 11, "3": 1})
+        self.assertEqual(voice["stall_theme_counts"], {"decider": 1, "not_today": 1})
+        self.assertEqual(voice["learner_ack_hinge_replies"], 3)
+        self.assertEqual(voice["intent_tails_appended"], 2)
+        self.assertNotIn("last_reply", voice)
+        self.assertNotIn("never sent", repr(voice))
+        bad = {"voice": {"learner_replies": "20", "sentence_histogram": {"2": -1, "x" * 99: 1}}}
+        voice = session_facts_event(bad, {}, roleplay_seconds=1.0)["payload"]["learner_voice"]
+        self.assertIsNone(voice["learner_replies"])
+        self.assertEqual(voice["sentence_histogram"], {})
+        for admin in (None, {}, {"voice": None}):
+            with self.subTest(admin=admin):
+                voice = session_facts_event(admin, {}, roleplay_seconds=1.0)["payload"][
+                    "learner_voice"]
+                self.assertEqual(voice["offer_terms_counts"], {})
+                self.assertIsNone(voice["soft_tic_trims"])
+
     def test_unmeasured_or_invalid_values_are_sent_as_null_never_as_a_guess(self):
         for admin in (None, {}, {"communication": {}},
                       {"communication": {"longest_candidate_turn_sec": 0.0}},
