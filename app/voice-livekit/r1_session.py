@@ -2483,6 +2483,10 @@ class R1Interview:
         self._mute_announced = False
         # M032 S7C (SWEEP-36): when the current mute began (loop time; None while unmuted).
         self._muted_since: float | None = None
+        # Review of S7C: the candidate row whose turn was in flight at the mute (a final the SDK
+        # had not committed), kept until that commit or the unmute.  The role-play's move to ASIDE
+        # at the mute writes the open row, so ``_candidate_turn_open`` alone no longer sees it.
+        self._mute_turn_index: int | None = None
         # M032 S7C (SWEEP-34): set at the candidate's first speech or first non-empty final and
         # never reset (a rejoin included); the last candidate participant object seen, for the
         # label of the r1_no_audio log; and whether that log was written (once per session).
@@ -4720,6 +4724,11 @@ class R1Interview:
         row = self._close_candidate_row()
         index = self._latest_candidate_index
         self._latest_candidate_index = None
+        if self._mute_turn_index is not None:
+            # Review of S7C: the turn in flight at the mute is committed; the aside may be due.
+            self._mute_turn_index = None
+            if self._mute_pending():
+                self._wake()
         seconds = self._take_user_turn_seconds()
         self._turn_finals = []
         # Whatever the candidate says or transcribes from here on follows this turn (the settle).
@@ -7097,11 +7106,16 @@ class R1Interview:
         if muted:
             if self._muted_since is None:
                 self._muted_since = _loop_now()  # M032 S7C (SWEEP-36): the episode's start
+                row = self._open_row
+                if row is not None and not row.held_only:
+                    # Review of S7C: a turn in flight, remembered before ASIDE writes its row.
+                    self._mute_turn_index = row.index
             if self.machine.phase is R1Phase.ROLEPLAY:
                 self._mute_resume_phase = R1Phase.ROLEPLAY
                 self._enter(R1Phase.ASIDE)
         else:
             self._muted_since = None
+            self._mute_turn_index = None
             self._leave_mute_aside()
             self._mute_announced = False
             self._restart_silence_window()
@@ -7120,6 +7134,12 @@ class R1Interview:
     def _mute_turn_cap(self) -> float:
         return max(MUTE_ASIDE_TURN_WAIT_SECONDS, MUTE_ASIDE_DEBOUNCE_SECONDS)
 
+    def _mute_turn_in_flight(self) -> bool:
+        """A candidate turn the aside must not talk over: one open now, or the one in flight at the
+        mute whose row the role-play's ASIDE wrote before the SDK committed it (review of S7C:
+        L-MUTE-RP is uninterruptible, and the SDK skips a turn that ends under such a line)."""
+        return self._candidate_turn_open() or self._mute_turn_index is not None
+
     def _mute_due(self) -> bool:
         """True when the mute aside must be spoken now.
 
@@ -7137,14 +7157,14 @@ class R1Interview:
         muted_for = self._muted_for()
         if muted_for < MUTE_ASIDE_DEBOUNCE_SECONDS:
             return False
-        return not self._candidate_turn_open() or muted_for >= self._mute_turn_cap()
+        return not self._mute_turn_in_flight() or muted_for >= self._mute_turn_cap()
 
     def _mute_wake_in(self) -> float | None:
         """Seconds until a pending mute may become due (``_await_turn`` wakes then), or None.
 
         The end of a turn in flight wakes the waiter itself (``_on_user_state_changed``, and
-        ``_close_candidate_row`` while a mute is pending), so only the debounce and the cap are
-        timed here.
+        ``_close_candidate_row`` or ``_open_turn`` while a mute is pending), so only the debounce
+        and the cap are timed here.
         """
         if not mute_aside_v2_enabled() or not self._mute_pending() or not self._candidate_present:
             return None
@@ -7152,7 +7172,7 @@ class R1Interview:
         if muted_for < MUTE_ASIDE_DEBOUNCE_SECONDS:
             return MUTE_ASIDE_DEBOUNCE_SECONDS - muted_for
         cap = self._mute_turn_cap()
-        if self._candidate_turn_open() and muted_for < cap:
+        if self._mute_turn_in_flight() and muted_for < cap:
             return cap - muted_for
         return None
 

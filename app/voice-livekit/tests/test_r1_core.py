@@ -10524,6 +10524,40 @@ class TestTheMuteAsideV2(R1TestCase):
             await self.commit_turn("I was saying that")
         await self.until(lambda: self.spoken_and_played("L-MUTE-IV"))
 
+    async def test_a_role_play_final_waiting_for_its_commit_is_a_turn_in_flight(self) -> None:
+        # Review of S7C: the mute moves the role-play to ASIDE, which writes the open row, so the
+        # aside started at the debounce and the SDK skipped the turn that ended under it (the
+        # learner never heard the advisor's last turn).
+        self.enter_roleplay()
+
+        async def keep_waiting() -> None:
+            while True:
+                await self.interview._await_turn(30.0)
+
+        task = asyncio.create_task(keep_waiting())
+        self.addCleanup(task.cancel)
+        await self.settle()
+        self.final_transcript("So the course runs for six months")
+        await self.settle()
+        self.mute()
+        self.assertIs(self.interview.machine.phase, R1Phase.ASIDE)
+        self.assertIsNone(self.interview._open_row)  # written by the move to ASIDE
+        await asyncio.sleep(0.45)  # past the debounce, the turn not committed yet
+        self.assertEqual(self.mute_lines(), [])
+        with contextlib.suppress(r1_session.StopResponse):
+            await self.commit_turn("So the course runs for six months")
+        await self.until(lambda: self.spoken_and_played("L-MUTE-RP"))
+        self.assertIsNone(self.interview._mute_turn_index)
+
+    async def test_an_unmute_forgets_the_turn_in_flight(self) -> None:
+        self.enter_roleplay()
+        self.final_transcript("So the course runs for six months")
+        await self.settle()
+        self.mute()
+        self.assertIsNotNone(self.interview._mute_turn_index)
+        self.unmute()
+        self.assertIsNone(self.interview._mute_turn_index)
+
     async def test_a_turn_that_never_ends_waits_no_longer_than_the_cap(self) -> None:
         await self.waiting()
         self.user_state("speaking")
