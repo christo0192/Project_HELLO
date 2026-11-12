@@ -440,6 +440,25 @@ def _concern(pattern: str) -> re.Pattern[str]:
     return re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE)
 
 
+# The think-it-over stall: the think_over theme's reader AND one arm of ``not_deciding`` (SWEEP-3:
+# "have S1.5's think_over theme use the same reader, so the two cannot disagree"; review S2R-5: "Let
+# me sleep on it" set only think_over, so F4-PRIMARY later said the stall again as news).  Taking
+# or needing time counts only as time to think or before deciding ("I need some time to think",
+# "I'll need some time before I decide"), never "some time off work" or "time to finish a project".
+_THINK_OVER = _concern(
+    r"think (?:it|this|that|things) (?:over|through)|"
+    r"get(?:ting)? back to you(?=\s*(?:[.,;!]|$|later|after|once|when|tomorrow|next week|soon|"
+    r"in a (?:few|couple of) days))|"
+    r"(?:give|put) (?:it|this) (?:some )?(?:proper |more |real |serious )?thought|"
+    r"sit with (?:it|this)|sleep on (?:it|this)|mull (?:it|this) over|"
+    r"(?:take|need|needs|taking|needing) (?:some|a (?:bit|little)(?: (?:of|more))?|a few days'?|"
+    r"a day or two|a couple of days|more) (?:time\s?)?"
+    r"(?=\s*(?:[.,;!]|$|to (?:think|decide|consider|process|weigh)|before (?:i |we )?"
+    r"(?:decid|commit|sign|enrol|agree|say)|for (?:this|it|that)\b|on my own\b|to myself\b|"
+    r"first\b|alone\b))"
+)
+
+
 # Per theme: the words a negation turns around ("I'm not offended", "there's no hurry", "I don't
 # need proof": review S1-R3, a false "you have already told the advisor ..." for the rest of the
 # session), then the phrasings that voice the concern whatever precedes them (None: none).  Trust is
@@ -458,6 +477,8 @@ _CONCERNS: tuple[tuple[str, re.Pattern[str], re.Pattern[str] | None], ...] = (
         ),
         _concern(r"caught me off guard|sour (?:taste|note)"),
     ),
+    # S1.5's own reader (R1_NO_COMMIT_LEDGER off); with it on, ``concern_themes(...,
+    # shared_think_over=True)`` reads the theme with ``_THINK_OVER`` instead.
     (
         CONCERN_THINK_OVER,
         _concern(
@@ -517,11 +538,21 @@ def _negated(folded: str, start: int) -> bool:
     return _IMPERATIVE.search(clause) is None and _STILL_VOICED.search(window) is None
 
 
-def concern_themes(text: object) -> frozenset[str]:
-    """The concern themes the learner's own ``text`` voices (worker-side labels only)."""
+def concern_themes(text: object, *, shared_think_over: bool = False) -> frozenset[str]:
+    """The concern themes the learner's own ``text`` voices (worker-side labels only).
+
+    ``shared_think_over`` (the engine passes R1_NO_COMMIT_LEDGER): the think_over theme is read
+    with the reader ``not_deciding`` shares (SWEEP-3), else with S1.5's own, so the flag's rollback
+    gives back S1's ledger exactly.
+    """
     folded = fold(text)
     found: set[str] = set()
     for theme, turned, fixed in _CONCERNS:
+        if theme == CONCERN_THINK_OVER and shared_think_over:
+            # SWEEP-3: the very reader ``not_deciding`` uses, so the two never disagree.
+            if any(_says_think_over(sentence) for sentence in split_sentences(folded)):
+                found.add(theme)
+            continue
         if (fixed is not None and fixed.search(folded)) or any(
             not _negated(folded, match.start()) for match in turned.finditer(folded)
         ):
@@ -679,16 +710,32 @@ def doubt_opener(text: object) -> bool:
 
 
 # SWEEP-3: the not-today stall ("I'm not ready to commit to anything today", "I'd want to think
-# it over before deciding").  Never "pay" (a payment-capacity line is the money worry), and never a
-# sentence about time, the schedule, a batch or money ("I'm not ready to commit to six months yet",
-# "I can't commit that much time right now").
+# it over before deciding"), and its think-it-over form (``_THINK_OVER``, the think_over theme's own
+# reader, so a think-over line is always a not-today line too).  Never "pay" (a payment-capacity
+# line is the money worry), and never a stall whose object is time, the schedule, a batch or money
+# ("I'm not ready to commit to six months yet", "I can't commit that much time right now").  Review
+# S2R-5/S2R-7: the exclusion reads only that object (the words between the verb and "today", and
+# the rest of its clause), never the whole sentence, so "Four to six hours sounds manageable, but
+# I'm not ready to decide today" is the stall; and the common phrasings count ("I don't want to
+# decide today", "I won't be signing up today", "I'm not in a position to decide today", "I can't
+# give you an answer today", a leading "Not today, ...").
+_NOT_TODAY_TIME = (
+    r"(?:today|tonight|yet|right now|just now|now|right away|immediately|on the spot|"
+    r"on (?:this|the) call|over the phone|at the moment|this (?:minute|second))"
+)
 _NOT_DECIDING = re.compile(
-    r"(?:\bnot|n't)\s{1,3}(?:(?:quite|really|yet|even)\s{1,3})?"
-    r"(?:(?:ready|going|gonna|about|able)\s{1,3})?(?:to\s{1,3})?"
-    r"(?:decid\w*|commit\w*|enrol\w*|sign(?:ing)? up|move forward|make (?:a|the|any) decision)"
-    r"[^.?!]{0,30}?\b(?:today|yet|right now|just now|on the spot|tonight)\b"
-    r"|\b(?:think (?:it|this|things) (?:over|through)|sleep on (?:it|this)|sit with (?:it|this))\b"
-    r"[^.?!]{0,30}?\bbefore (?:i |we )?(?:decid\w*|commit\w*|agree\w*|sign\w*|say(?:ing)? yes)",
+    r"(?:\bnot|n't)\s{1,3}(?:(?:quite|really|yet|even|actually)\s{1,3})?"
+    r"(?:(?:ready|going|gonna|about|able|want|wanting|wanna|planning|looking|be|"
+    r"in a position|sure (?:that |if )?(?:i|we) (?:can|could|will|'ll|would|'d|should))\s{1,3})?"
+    r"(?:to\s{1,3})?(?:be\s{1,3})?"
+    r"(?:decid\w*|commit\w*|enrol\w*|sign(?:ing)? up|move forward|"
+    r"mak(?:e|ing) (?:a|the|any|my|that|this) (?:final )?decisions?)"
+    r"(?P<obj>[^.?!]{0,30}?)\b" + _NOT_TODAY_TIME + r"\b"
+    r"|(?:\bcan't|\bcannot|\bwon't|\bwill not)\s{1,3}(?:give|get)\s{1,3}(?:you\s{1,3})?"
+    r"(?:an?|my|any|a final)\s{1,3}(?:answer|decision)\b(?P<obj2>[^.?!]{0,20}?)\b"
+    + _NOT_TODAY_TIME
+    + r"\b"
+    r"|^\W{0,3}(?:(?:no|um|uh|well|so|sorry|okay|look)\b,?\s{1,3}){0,2}not today\b(?!\s{0,3}\?)",
     re.IGNORECASE,
 )
 _NOT_DECIDING_EXCLUDED = re.compile(
@@ -697,13 +744,46 @@ _NOT_DECIDING_EXCLUDED = re.compile(
     r"pay\w*|money|price|fees?|cost\w*|emi|instal\w*|afford\w*|budget|dollars?)\b|\$",
     re.IGNORECASE,
 )
+# The rest of the stall's clause: up to a comma or a clause word ("..., but", "because").
+_STALL_CLAUSE_END = re.compile(
+    r"[,;:]|\b(?:but|because|since|though|although|so)\b", re.IGNORECASE
+)
+_STALL_TAIL_CHARS = 40
 
 
-def not_deciding(text: object) -> bool:
-    """Her line says she is not deciding or committing today (SWEEP-3), sentence by sentence."""
-    for sentence in split_sentences(text):
-        if _NOT_DECIDING.search(sentence) and not _NOT_DECIDING_EXCLUDED.search(sentence):
+def _stall_tail(sentence: str, end: int) -> str:
+    """The rest of the clause after a stall that ends at ``end`` (its object, if any)."""
+    tail = sentence[end : end + _STALL_TAIL_CHARS]
+    return _STALL_CLAUSE_END.split(tail, maxsplit=1)[0]
+
+
+def _says_think_over(sentence: str) -> bool:
+    """``sentence`` (folded) voices the think-it-over stall, not negated, with no time or money
+    object."""
+    for match in _THINK_OVER.finditer(sentence):
+        if _negated(sentence, match.start()):
+            continue
+        if _NOT_DECIDING_EXCLUDED.search(_stall_tail(sentence, match.end())) is None:
             return True
+    return False
+
+
+def not_deciding(text: object, *, think_over: bool = True) -> bool:
+    """Her line says she is not deciding or committing today (SWEEP-3), sentence by sentence.
+
+    Every think-it-over line (the think_over theme of ``concern_themes``) is one too, unless
+    ``think_over`` is False: then only the not-today stall in its own words counts (the concern
+    ledger names a think-over line by its own theme, never twice).
+    """
+    for sentence in split_sentences(text):
+        if think_over and _says_think_over(sentence):
+            return True
+        for match in _NOT_DECIDING.finditer(sentence):
+            scope = (match.group("obj") or match.group("obj2") or "") + _stall_tail(
+                sentence, match.end()
+            )
+            if _NOT_DECIDING_EXCLUDED.search(scope) is None:
+                return True
     return False
 
 

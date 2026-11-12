@@ -140,7 +140,7 @@ import r1_world
 # moves, F4-PRIMARY's "like I said" texts, the pre-empted suffix, the rotated curiosity labels, the
 # stall briefs without "before you agree to anything", BUDGET_REPLACEMENT_V2).  No graded meaning,
 # marker, must-say, deadline or scripted line of the release before changed.
-PINNED_CONTENT_SHA256 = "06f96f364cd2c25430e5cb8e352a15cda83ad0296482a238cf16752a73f462d4"
+PINNED_CONTENT_SHA256 = "b9de3afe4fce5e8f59181823850320c0aab85fbac156ebac229d300da0f87585"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -327,6 +327,7 @@ class PinTests(unittest.TestCase):
             (r1_prompts, "COACH_RESUME_NOTE", "- x"),
             (r1_prompts, "OFFER_ON_TABLE_NOTE_V2", "- {amount}"),
             (r1_prompts, "OFFER_TERMS_INSTALMENTS", "x"),
+            (r1_prompts, "OFFER_TERMS_IN_PARTS", "x"),
             (r1_prompts, "IMPLAUSIBLE_FREE_NOTE", "- x"),
             (r1_prompts, "NOT_TODAY_RESERVED_NOTE", "- x"),
             (r1_prompts, "ACK_TURN_NOTE", "- x"),

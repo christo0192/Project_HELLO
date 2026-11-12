@@ -974,10 +974,35 @@ PREEMPTED_SUFFIX = (
     "; the advisor already told you something about {label}, so say in your own words why it "
     "still worries you after what you were told, without repeating their details as facts"
 )
+# Keyed by what the advisor talked about (``preempting_topics``), so the label names only that
+# (review S2R-5: live or recorded classes alone were labelled "the schedule and the time it
+# takes", and with F2's must-say "six months" she was told the advisor had said how long it is).
+PREEMPTED_F2_FORMAT = "F2-format"
 PREEMPTED_LABELS: tuple[tuple[str, str], ...] = (
     ("F3", "what the course gives you"),
-    ("F2", "the schedule and the time it takes"),
+    ("F2", "the schedule"),
+    (PREEMPTED_F2_FORMAT, "how the classes are run"),
 )
+
+
+def preempting_topics(text: object) -> frozenset[str]:
+    """What an advisor turn already talked about in a statement, as ``PREEMPTED_LABELS`` keys.
+
+    F3: free material, worth or outcomes (``_VALUE_TALK``), never a pitch alone; F2: the schedule
+    (``_SCHEDULE_TALK``); ``PREEMPTED_F2_FORMAT``: live or recorded delivery only.  A question
+    about the topic pre-empts nothing.
+    """
+    found: set[str] = set()
+    for sentence in _sentences(text):
+        if is_question_like(sentence):
+            continue
+        if any(pattern.search(sentence) for pattern in _VALUE_TALK):
+            found.add("F3")
+        if any(pattern.search(sentence) for pattern in _SCHEDULE_TALK):
+            found.add("F2")
+    if covers_format(text):
+        found.add(PREEMPTED_F2_FORMAT)
+    return frozenset(found)
 
 
 def preempting_families(text: object) -> frozenset[str]:
@@ -986,17 +1011,44 @@ def preempting_families(text: object) -> frozenset[str]:
     Narrower than ``topics_in``: F3 is free material, worth or outcomes (``_VALUE_TALK``), never a
     pitch alone; F2 is the format or the schedule.  A question about the topic pre-empts nothing.
     """
-    found: set[str] = set()
-    if covers_format(text):
-        found.add("F2")
-    for sentence in _sentences(text):
-        if is_question_like(sentence):
-            continue
-        if any(pattern.search(sentence) for pattern in _VALUE_TALK):
-            found.add("F3")
-        if any(pattern.search(sentence) for pattern in _SCHEDULE_TALK):
-            found.add("F2")
-    return frozenset(found)
+    return frozenset(
+        "F2" if topic == PREEMPTED_F2_FORMAT else topic for topic in preempting_topics(text)
+    )
+
+
+# M032 S2 item 5 (review S2R-1): the advisor's turn took up the worry her last line raised, in any
+# words.  Wider than ``topics_in``, which reads what INVITES an objection, not what answers one
+# ("our learners still get hired every month" after the layoffs worry, "every class is recorded,
+# you can catch up anytime" after the falling-behind worry).  A miss only costs the anti-validation
+# note; a false "not answered" would tell her to say a handled worry was not handled, so the lists
+# are wide.  F2 and F3 only: an F4 or stall worry is answered by a back-off, never by a topic.
+_WORRY_ANSWER: dict[str, tuple[re.Pattern[str], ...]] = {
+    "F3": _compile(
+        r"\b(?:jobs?|hired|hiring|hires?|placements?|placed|alumni|careers?|guarantee\w*|"
+        r"interviews?|mentors?|mentorship|mentoring|projects?|portfolios?|support\w*|outcomes?|"
+        r"salar(?:y|ies)|transition\w*|switch\w*|worth|value|structured?|feedback|certificat\w*|"
+        r"recruit\w*|compan(?:y|ies)|network\w*|industry|market|layoffs?|roles?|offers?|"
+        r"success\w*|refund\w*|free|youtube|coursera|udemy|curriculum|learners?|students?|"
+        r"graduates?|recession|economy|demand|skills?)\b",
+    ),
+    "F2": _compile(
+        r"\b(?:record(?:ed|ings?)?|catch(?:ing)? up|miss(?:ed|es|ing)?|mentors?|weekends?|"
+        r"evenings?|weekdays?|hours?|flexib\w+|schedules?|pace|self[- ]paced|working "
+        r"professionals?|famil(?:y|ies)|jobs?|extend\w*|extensions?|pause\w*|defer\w*|"
+        r"batch(?:es)?|cohorts?|time|support\w*|doubts?|live|convenien\w*|whenever|anytime|"
+        r"any time|later|busy|manag\w*|balanc\w*|behind|backup|buddy|months?|weeks?|deadlines?|"
+        r"replay|rewatch|re-watch|on[- ]demand)\b",
+    ),
+}
+
+
+def worry_answered(family: str | None, text: object) -> bool:
+    """The advisor's turn took up the worry of ``family`` (F2 or F3; any other: True)."""
+    patterns = _WORRY_ANSWER.get(family or "")
+    if patterns is None:
+        return True
+    lowered = fold(text).lower()
+    return any(pattern.search(lowered) for pattern in patterns)
 
 
 def f4_push_said(decision_maker: str) -> tuple[str, tuple[str, ...]]:

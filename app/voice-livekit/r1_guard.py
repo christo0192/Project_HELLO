@@ -799,6 +799,10 @@ class GuardContext:
     voice_v2: bool = False
     tic_v2: bool = False
     carries_move: bool = False
+    # Review S2R-4 (SWEEP-11): on a lone "okay" after her question she is told to ask it again in a
+    # few words.  ``reask`` is that question's normalised sentences: a question of this reply that
+    # repeats one of them is the asked-for re-ask, so it is neither a repeat nor cut by the diet.
+    reask: tuple[str, ...] = ()
 
     @property
     def is_learner(self) -> bool:
@@ -1449,6 +1453,7 @@ class StreamGuard:
             ctx.free_reply
             and self._emitted
             and any(ctx.recent_questions[-QUESTION_DIET_WINDOW:])
+            and not ctx.reask
             # "Okay." and the question is the whole reply: dropping the question would leave a bare
             # acknowledgement, so the question stays.
             and word_count(" ".join(self._emitted)) > THIN_REPLY_WORDS
@@ -1494,7 +1499,10 @@ class StreamGuard:
             and re.search(r"\b" + re.escape(persona.decision_maker) + r"\b", out, re.IGNORECASE)
         ):
             return None  # the advisor asked who else decides: the same answer is the right answer
-        kind = repeat_kind(out, self.ctx.said)
+        said = self.ctx.said
+        if self.ctx.reask and "?" in out:
+            said = tuple(prior for prior in said if prior not in self.ctx.reask)
+        kind = repeat_kind(out, said)
         return None if kind is None else self._repeat_hit(kind, out)
 
     def _drop_repeat(self, hit: Hit, *, blocked: bool) -> list[str]:

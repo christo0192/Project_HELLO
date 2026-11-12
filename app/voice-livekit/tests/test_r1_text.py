@@ -573,7 +573,7 @@ class IterationThreeTextTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(is_closer(text), text)
         for text in (
-            "I'll think it over and get back to you.",
+            "I'll think this through and then get back to you.",
             "What would I actually build in the course?",
             "Thanks, that helps with the schedule worry.",
             "I need to talk to my husband first.",
@@ -679,7 +679,7 @@ class ConcernThemeTests(unittest.TestCase):
                 "I'm a bit offended by that.",
             ),
             CONCERN_THINK_OVER: (
-                "I'll think it over and get back to you.",
+                "I'll think this through and then get back to you.",
                 "I want to give it some proper thought on my end.",
                 "Let me sit with it for a bit.",
                 "I'd like to sleep on it.",
@@ -867,10 +867,68 @@ class LearnerVoiceReaderTests(unittest.TestCase):
             "I can't commit that much time right now.",
             "I can't commit to ten hours a week yet.",
             "I'm not ready to commit the money right now.",
+            "I can't commit today to ten hours a week.",
+            "I'd have to take some time off work for the classes.",
+            "I need some time to finish my current project first, then the course.",
+            "I don't need to think it over.",
+            "Not today?",
             "",
         ):
             with self.subTest(text=text):
                 self.assertFalse(not_deciding(text))
+
+    def test_not_deciding_reads_the_common_stall_phrasings(self):
+        """Review S2R-5 and S2R-7: the phrasings a slipped stall comes in.  The time-or-money
+        exclusion reads only the stall's own object, so a sentence that also mentions hours or the
+        price elsewhere is still the stall."""
+        from r1_text import not_deciding
+
+        for text in (
+            "Let me sleep on it.",
+            "I'll think this through and then get back to you.",
+            "I need some time to think about it.",
+            "I can't give you an answer today.",
+            "I won't be signing up today.",
+            "I'm not going to decide on this call.",
+            "I'm not sure I can decide right away.",
+            "I don't want to decide today.",
+            "I won't be deciding today.",
+            "I'm not making any decision today.",
+            "I'm not in a position to decide today.",
+            "Not today, I need some time.",
+            "I'll need some time before I decide.",
+            "I'm not ready to decide yet, the price is still a lot for me.",
+            "Ten hours a week seems doable, but I'm not ready to decide today.",
+            "I'll get back to you.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(not_deciding(text))
+
+    def test_every_think_over_line_is_a_not_today_line(self):
+        """SWEEP-3: the think_over theme and the not-today stall share one reader, so a line that
+        voices the theme always sets the not-today stall too (the two never disagree)."""
+        from r1_text import CONCERN_THINK_OVER, concern_themes, not_deciding
+
+        for text, themed in (
+            ("Let me sleep on it.", True),
+            ("I want to think it over.", True),
+            ("I'd like to give it some proper thought.", True),
+            ("I need to take some time on my own first.", True),
+            ("I'll think this through and get back to you later.", True),
+            ("I need to think it over, the hours are a lot.", True),
+            ("I don't need to think it over.", False),
+            ("I'd have to take some time off work.", False),
+            ("That makes sense.", False),
+        ):
+            with self.subTest(text=text):
+                shared = CONCERN_THINK_OVER in concern_themes(text, shared_think_over=True)
+                self.assertEqual(shared, themed)
+                self.assertEqual(not_deciding(text), themed)
+        # R1_NO_COMMIT_LEDGER off: S1.5's own reader, exactly as before (its rollback).
+        self.assertNotIn(CONCERN_THINK_OVER, concern_themes("I'll get back to you."))
+        self.assertIn(
+            CONCERN_THINK_OVER, concern_themes("I'll get back to you.", shared_think_over=True)
+        )
 
     def test_the_v2_tics_read_the_honest_clause_and_the_soft_tics(self):
         from r1_text import (

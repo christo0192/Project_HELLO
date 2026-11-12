@@ -158,6 +158,9 @@ import r1_world
 #    SWEEP-13's careful-buyer notes and the prefix sentence it latches, SWEEP-14's length lines and
 #    BUDGET_REPLACEMENT without "though".  No graded meaning, marker, must-say, deadline or
 #    scripted line of the release before changed; with every flag off the reminders are the same.
+#    After the S2 review (still revision 22, unreleased): OFFER_TERMS_IN_PARTS for a split that is
+#    not monthly, the new-topic shape without "something else is on your mind", and the pre-empted
+#    labels keyed by what the advisor said ("the schedule", "how the classes are run").
 CONTENT_REVISION = 22
 
 
@@ -226,7 +229,12 @@ def _learner_voice_v2(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         "new_offer_above_ask_note": p.NEW_OFFER_ABOVE_ASK_NOTE,
         "offer_on_table_note_v2": p.OFFER_ON_TABLE_NOTE_V2,
         "offer_met_note_v2": p.OFFER_MET_NOTE_V2,
-        "offer_terms": [p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS, p.OFFER_TERMS_FREE_EXTRA],
+        "offer_terms": [
+            p.OFFER_TERMS_HEADER,
+            p.OFFER_TERMS_INSTALMENTS,
+            p.OFFER_TERMS_IN_PARTS,
+            p.OFFER_TERMS_FREE_EXTRA,
+        ],
         "implausible_notes": [p.IMPLAUSIBLE_PRICE_NOTE, p.IMPLAUSIBLE_FREE_NOTE],
         "not_today_reserved_note": p.NOT_TODAY_RESERVED_NOTE,
         "no_commit_intent_note": p.NO_COMMIT_INTENT_NOTE,

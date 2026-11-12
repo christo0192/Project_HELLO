@@ -368,10 +368,12 @@ INTENT_SHAPE_TOPIC_FRESH = (
     f"{REACT_SPECIFIC}, and let the point below grow straight out of that same thing. Do not "
     'join the two with "but" or "though".'
 )
+# Review S2R-11: no gloss on how to change the subject ("a few words that say something else is
+# on your mind" nearly handed her a stock line for every new-topic point).
 INTENT_SHAPE_NEW_TOPIC = (
     "Reply as the learner, naturally: first finish reacting to what the advisor just said, "
-    f"{REACT_SPECIFIC}. Then turn to the point below the way a person changes the subject, with a "
-    'few words that say something else is on your mind, never with "but" or "though".'
+    f"{REACT_SPECIFIC}. Then turn to the point below the way a person changes the subject, in "
+    'your own words, never with "but" or "though".'
 )
 INTENT_SHAPE_PRICE = (
     "Reply as the learner, naturally, in one flowing thought: react to what the advisor just "
@@ -474,6 +476,13 @@ OFFER_TERMS_INSTALMENTS = (
     "They offered monthly instalments. React in a few words, and if they named no monthly figure, "
     "you may ask what it would come to each month; do not say why monthly would help, and do not "
     "call it affordable or workable before you hear that figure."
+)
+# Review S2R-8: a split that is not monthly ("two halves", "half now and half later") gets no
+# monthly wording, which would hand her a course fact the advisor never said (D-M032-7).
+OFFER_TERMS_IN_PARTS = (
+    "They offered a way to pay in parts. React in a few words, and you may ask how it would work; "
+    "do not say why it would help, and do not call it affordable or workable before you hear the "
+    "figures."
 )
 OFFER_TERMS_FREE_EXTRA = (
     "They added something for free. Acknowledge it briefly or ask one short question about it; do "
