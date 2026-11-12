@@ -2295,15 +2295,22 @@ unmute when you're ready." came in Christy's own phase, after a sub-second blip,
   Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?") and reads the reply
   in code (`sound_check_reading`; never the model, `reply_suppressed` in OPENING). A reply that
   heard her gets L-OPEN-AGENDA ("Good, I can hear you." and the agenda, which asks the first
-  icebreaker question); a can't-hear reply (a directed complaint, "Sorry?", "Hello? Are you
-  there?", or a whole-turn "No." / "Not really." / "It's a bit low.") gets L-OPEN-HELLO-AGAIN once,
-  and a second one L-OPEN-AGENDA-PLAIN; an early answer (12 content words or more) gets
-  L-OPEN-AGENDA-CONTINUE and counts as one icebreaker answer. Silence (10 s) from a candidate who
-  was never heard runs the never-heard ladder below; one heard only by the VAD gets the plain
-  agenda, and so does the end of the sound check's 45 s budget. A "Hi" said over the hello is
-  followed by 1.5 s of quiet for the answer. The reply is never an icebreaker answer, whenever its
-  turn commits (`_sound_check_rows`). Log: `r1_sound_check` (the reading, the agenda id, the
-  can't-hear count). The hello costs about 5-10 s of S; the soft exit and S = 4:30 are unchanged.
+  icebreaker question); a can't-hear reply (a directed complaint such as "I can't hear your
+  voice", "not able to hear you", "voice is not clear", "I can hear you but it's very low",
+  "Sorry?", "Could you repeat that?", after the question a bare "Hello?" / "What?" or "Are you
+  there?", or a whole-turn "No." / "Not audible." / "Little low." / "It's a bit low.") gets
+  L-OPEN-HELLO-AGAIN once, and a second one L-OPEN-AGENDA-PLAIN; an early answer (12 content words
+  or more that say something about the candidate, such as "I have been working in" or "four years
+  in sales", and do not end on a question to Christy) gets L-OPEN-AGENDA-CONTINUE and counts as one
+  icebreaker answer. Before the agenda the driver waits for the reply to end: one endpointing
+  maximum plus 1 s after the candidate's last speech or final, at most 30 s and the sound check's
+  budget. Silence (10 s) from a candidate who was never heard runs the never-heard ladder below
+  (bounded in the opening by 60 s from its start, `OPEN_NO_AUDIO_HARD_SECONDS`, then the plain
+  agenda); one heard only by the VAD gets the plain agenda, and so does the end of the sound
+  check's 45 s budget. A "Hi" said over the hello is followed by 1.5 s of quiet for the answer.
+  The reply is never an icebreaker answer, whenever its turn commits (`_sound_check_rows`); an
+  answer begun over the agenda is the icebreaker's. Log: `r1_sound_check` (the reading, the agenda
+  id, the can't-hear count; `no_audio_deadline` when the opening's ladder ran out). The hello costs about 5-10 s of S; the soft exit and S = 4:30 are unchanged.
   Rollback: `fly secrets set R1_OPENING_SOUND_CHECK=0 -a project-hello-voice` (L-OPEN, exactly as
   before).
 * **`R1_NO_AUDIO_LADDER`** (default on). A candidate who was never heard (no speech, no final;
@@ -2316,7 +2323,8 @@ unmute when you're ready." came in Christy's own phase, after a sub-second blip,
   close that does not count as an attempt needs its own web card (outside R1). Rollback: `fly
   secrets set R1_NO_AUDIO_LADDER=0 -a project-hello-voice`.
 * **`R1_MUTE_ASIDE_V2`** (default on). The aside is due once the mute has lasted 1.5 s
-  (`MUTE_ASIDE_DEBOUNCE_SECONDS`) and no candidate turn is in flight, or 3 s in all
+  (`MUTE_ASIDE_DEBOUNCE_SECONDS`) and no candidate turn is in flight (speaking, or a final the SDK
+  has not committed, the role-play's included although ASIDE wrote its row), or 3 s in all
   (`MUTE_ASIDE_TURN_WAIT_SECONDS`); the mute is checked again before the line, and an episode
   counts as announced only when a line is spoken. The role-play still enters ASIDE (R paused) at
   the event. L-MUTE-RP ("This is Christy, your interviewer. Your microphone seems to be muted.
