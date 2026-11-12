@@ -38,6 +38,7 @@ T = TypeVar("T")
 
 FROZEN_WATCHDOG_SEC = 90.0
 FROZEN_POLL_SEC = 0.5
+CLOCK_RESOLUTION_SEC = 1e-6
 EPOCH_LAG_SEC = 30 * 86_400.0  # a whole sweep runs on one loop: room for hundreds of calls
 
 
@@ -101,6 +102,8 @@ class VirtualTimeLoop(asyncio.SelectorEventLoop):
         self._watchdog_open = False
         self._epoch_base = time.time() - EPOCH_LAG_SEC - self._vtime
         self._selector = _VirtualSelector(self._selector, self)  # type: ignore[assignment]
+        # A virtual clock has no tick: timers may fire at most this much before their deadline.
+        self._clock_resolution = CLOCK_RESOLUTION_SEC
 
     def time(self) -> float:  # noqa: D401 - the loop's clock
         return self._vtime
@@ -109,12 +112,17 @@ class VirtualTimeLoop(asyncio.SelectorEventLoop):
         # asyncio runs a timer up to one clock resolution EARLY.  A real clock has moved on by the
         # time the callback reads it; a virtual one has not, so a caller that re-reads "seconds
         # left" (the driver does after every wake-up) would wait the same sub-resolution sliver
-        # forever.  A timer that fires early therefore moves the clock to its own deadline.
-        heap = self._scheduled
-        if heap:
-            when = heap[0]._when
-            if self._vtime < when < self._vtime + self._clock_resolution:
-                self._vtime = when
+        # forever.  A timer that fires early therefore moves the clock to its own deadline.  The
+        # heap is scanned (it is small): a cancelled handle asyncio has not dropped yet may sit at
+        # its head and hide the one that fires.
+        horizon = self._vtime + self._clock_resolution
+        due = [
+            handle._when
+            for handle in self._scheduled
+            if not handle._cancelled and self._vtime < handle._when < horizon
+        ]
+        if due:
+            self._vtime = max(due)
         super()._run_once()  # type: ignore[misc]
 
     def epoch(self) -> float:

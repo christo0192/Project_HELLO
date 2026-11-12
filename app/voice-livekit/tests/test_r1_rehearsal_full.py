@@ -139,6 +139,27 @@ class VirtualLoopTests(unittest.TestCase):
 
         self.assertLess(vloop.run_virtual(main()), 5)
 
+    def test_a_cancelled_timer_at_the_head_of_the_heap_cannot_hide_an_early_one(self) -> None:
+        # The same sliver, with a stale cancelled handle at the head of the timer heap (asyncio
+        # drops those lazily): the clock must still move to the deadline of the timer that fires.
+        async def main() -> int:
+            loop = asyncio.get_running_loop()
+            await asyncio.sleep(2378.0191085329716)
+            deadline = loop.time() + 3.0
+            await asyncio.sleep(3.0 - 2.5e-13)
+            spins = 0
+            while deadline - loop.time() > 0:
+                spins += 1
+                if spins > 1000:
+                    break
+                loop.call_at(loop.time(), lambda: None).cancel()
+                waiter = asyncio.ensure_future(asyncio.Event().wait())
+                await asyncio.wait({waiter}, timeout=deadline - loop.time())
+                waiter.cancel()
+            return spins
+
+        self.assertLess(vloop.run_virtual(main()), 5)
+
     def test_a_wait_that_nothing_can_end_is_a_stall_not_a_hang(self) -> None:
         async def main() -> None:
             await asyncio.get_running_loop().create_future()
