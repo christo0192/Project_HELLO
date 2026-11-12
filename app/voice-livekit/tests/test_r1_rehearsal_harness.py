@@ -2792,14 +2792,26 @@ class BunchingGridTests(unittest.TestCase):
 
     def test_every_family_lands_by_ten_minutes_at_the_owner_s_pace(self):
         """Review S1R-4: a stop from R 10:00 is scored only with every family delivered, so where
-        the release before S1 finished by 10:00, S1 does too."""
+        the release before S1 finished by 10:00, S1 does too.
+
+        M032 S2P (review S2P-R3, D-M032-7): a probe costs an exchange by design, and R 10:00 no
+        longer switches the probes off (only the family deadlines do), so a run in which she asked
+        a probe may finish after 10:00; those runs are listed, not gated (2026-11-12: questioner
+        and pushy at 35 s, R 580 and 545 -> 650; reported to the owner).  No family is late in
+        them (``test_no_gated_run_gets_worse``)."""
+        later = []
         for item in self.on:
             base = next(
                 r for r in self.off if (r.pattern, r.pace) == (item.pattern, item.pace)
             )
             if base.last_r is not None and base.last_r <= 600:
+                if item.probes and (item.last_r is None or item.last_r > 600):
+                    later.append(f"{item.pattern}@{item.pace:.0f}: {base.last_r:.0f} -> {item.last_r}")
+                    continue
                 with self.subTest(pattern=item.pattern, pace=item.pace):
                     self.assertLessEqual(item.last_r, 600)
+        print("\nprobe runs finishing after R 10:00: " + ("; ".join(later) or "none"))
+        self.assertLessEqual(len(later), 3)
 
     def test_the_forced_path_is_not_used_more_often(self):
         off = self.grid.totals(self.off)
