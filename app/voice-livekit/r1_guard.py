@@ -462,6 +462,10 @@ ACK_FORMAT = "ack_format"
 REPEAT = "repeat"
 REOPEN = "reopen"
 MISREAD = "misread"
+# M032 SWEEP-17 (flag R1_PROBE_FIRST): a course length she says that the advisor never said.
+# Hygiene, never posted to the 3-hit gate: the sentence is dropped and counted
+# (``course_fact_unsaid``).
+COURSE_FACT = "course_fact"
 CATEGORIES = (
     CONTROL,
     VENDOR,
@@ -481,9 +485,10 @@ CATEGORIES = (
     REPEAT,
     REOPEN,
     MISREAD,
+    COURSE_FACT,
 )
 # Hygiene is counted and logged but is not a leak and is never posted to the API.
-HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT, REOPEN, MISREAD})
+HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT, REOPEN, MISREAD, COURSE_FACT})
 # Categories that count toward the 3-hit gate: everything except hygiene.
 LEAK_CATEGORIES = frozenset(CATEGORIES) - HYGIENE_CATEGORIES
 
@@ -704,6 +709,135 @@ _CLAIM_WORDS = _ci(
 )
 _CARD_AMOUNTS = frozenset({9000, 7000, 500, 700})
 _CARD_DURATION = _ci(r"\b(?:6|six) months\b")
+# M032 SWEEP-17 (flag R1_PROBE_FIRST, ``GuardContext.probe_first``): the card holds no course
+# figure, so the website's $9,000 leaves the amounts she may always say; the $7,000 she heard
+# and her monthly budget stay.  A figure on the check or conflict path comes in through
+# ``allowed_extra``.
+_CARD_AMOUNTS_V2 = frozenset({7000, 500, 700})
+# A course length or duration, as months ("six months", "a six-month program", "24 weeks", "half a
+# year"); weeks count as weeks / 4.33 months.
+_DURATION_NUMBERS = {
+    "one": 1.0,
+    "two": 2.0,
+    "three": 3.0,
+    "four": 4.0,
+    "five": 5.0,
+    "six": 6.0,
+    "seven": 7.0,
+    "eight": 8.0,
+    "nine": 9.0,
+    "ten": 10.0,
+    "eleven": 11.0,
+    "twelve": 12.0,
+    "fifteen": 15.0,
+    "sixteen": 16.0,
+    "eighteen": 18.0,
+    "twenty": 20.0,
+    "twenty four": 24.0,
+}
+_DURATION = re.compile(
+    r"\b(?P<num>\d{1,2}(?:\.\d)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"fifteen|sixteen|eighteen|twenty[- ]four|twenty)[\s-]+(?P<unit>months?|weeks?)\b"
+    r"|\b(?P<half>half a year|half-year)\b",
+    re.IGNORECASE,
+)
+WEEKS_PER_MONTH = 4.33
+
+
+def durations_said(text: object) -> frozenset[float]:
+    """The course-length figures in ``text``, as months (M032 SWEEP-17)."""
+    found: set[float] = set()
+    for match in _DURATION.finditer(fold(text)):
+        if match.group("half"):
+            found.add(6.0)
+            continue
+        token = match.group("num").lower().replace("-", " ")
+        value = _DURATION_NUMBERS.get(token)
+        if value is None:
+            try:
+                value = float(token)
+            except ValueError:
+                continue
+        if match.group("unit").lower().startswith("week"):
+            value = round(value / WEEKS_PER_MONTH, 2)
+        found.add(value)
+    return frozenset(found)
+
+
+def _duration_known(value: float, known: frozenset[float]) -> bool:
+    """``value`` (months) is one the advisor said; a figure from weeks matches within a month."""
+    return any(
+        abs(value - other) < 0.01 or (abs(value - other) <= 1.0 and (value % 1 or other % 1))
+        for other in known
+    )
+
+
+# SWEEP-17 item 5: the frames in which a learner sentence states a course length ("keep up for six
+# months", "it runs for six months", "six months is a long commitment", "the data science course,
+# roughly six months", "a six-month program").  Her own life's durations are not in them:
+# "my contract renewal is decided in about six months", "I quit a free course after three
+# weeks", "I've been applying for about three months" (only the "for N months" frame with a
+# course word could reach those, and it skips a sentence about her past or her own plans).
+_DUR_RE = (
+    r"(?:(?:\d{1,2}(?:\.\d)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"fifteen|sixteen|eighteen|twenty[- ]four|twenty)[\s-]+(?:months?|weeks?)\b|half a year\b)"
+)
+_APPROX = r"(?:about |around |roughly |nearly |almost |like |over |a good |only |just )?"
+_COURSE_LENGTH_FRAMES = (
+    re.compile(
+        r"\bkeep(?:ing)? up\b[^.?!]{0,40}?\b(?:for|over|across|through)\s+(?:a |the )?" + _APPROX
+        + _DUR_RE,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:course|program(?:me)?|class(?:es)?|bootcamp|it)\s+(?:is|runs?|takes?|lasts?|goes on|"
+        r"would (?:take|run|last|be)|will (?:take|run|last|be))\b[^.?!]{0,25}?" + _DUR_RE,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^|[^\w])" + _DUR_RE + r"\s+(?:is|feels|sounds|seems|would be)\s+(?:like\s+)?"
+        r"(?:a\s+|really\s+|quite\s+|pretty\s+|so\s+)?(?:long|a lot|lot|too long|forever|big)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:course|program(?:me)?|bootcamp)\b[^.?!]{0,30}?,?\s*(?:roughly|about|around|nearly|"
+        r"almost)\s+" + _DUR_RE,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|eighteen|"
+        r"twenty[- ]four)[\s-]+(?:months?|weeks?)[\s-]+(?:long\s+)?(?:course|program(?:me)?|"
+        r"bootcamp)\b",
+        re.IGNORECASE,
+    ),
+)
+_FOR_DURATION = re.compile(r"\b(?:for|over)\s+" + _APPROX + _DUR_RE, re.IGNORECASE)
+_COURSE_WORD = re.compile(
+    r"\b(?:course|program(?:me)?|class(?:es)?|bootcamp|studying|study|learning)\b", re.IGNORECASE
+)
+# Her own past or plans: the "for N months" frame never reads them as a course length.
+_OWN_LIFE = re.compile(
+    r"\b(?:ago|last|took|tried|did|quit|was|were|been|had|used to|renewal|contract|funding|opening|"
+    r"applying|applied|postdoc|position|job|role|start in|starting in|could start)\b",
+    re.IGNORECASE,
+)
+
+
+def course_length_unsaid(sentence: object, known: frozenset[float] = frozenset()) -> bool:
+    """``sentence`` states a course length that is not one of the ``known`` (advisor) durations.
+
+    M032 SWEEP-17 item 5: the product-statement form and the course-length frames above; a question
+    is no exemption ("I can't keep up for six months, can I?").  Every figure in a matched frame
+    must be known for the sentence to pass.
+    """
+    folded = fold(sentence)
+    spans = [match.group(0) for frame in _COURSE_LENGTH_FRAMES for match in frame.finditer(folded)]
+    if _COURSE_WORD.search(folded) and not _OWN_LIFE.search(folded):
+        spans.extend(match.group(0) for match in _FOR_DURATION.finditer(folded))
+    for span in spans:
+        if any(not _duration_known(value, known) for value in durations_said(span)):
+            return True
+    return False
 _ACK_WORDS = _ci(
     r"\b(?:course|program|programme|curriculum|class(?:es)?|price|cost|discount|schedule|"
     r"hours?|weeks?|months?|projects?|cohort|capstone|instructors?|mentors?|live|"
@@ -803,6 +937,14 @@ class GuardContext:
     # few words.  ``reask`` is that question's normalised sentences: a question of this reply that
     # repeats one of them is the asked-for re-ask, so it is neither a repeat nor cut by the diet.
     reask: tuple[str, ...] = ()
+    # M032 S2P (SWEEP-17; the engine's latched R1_PROBE_FIRST): the card holds no course figure, so
+    # the $9,000 is no longer an amount she may always say and "six months" no longer passes as a
+    # card fact.  ``allowed_extra``: the amounts this reply may say all the same (a check or a
+    # conflict the plan owes, or one she already said on such a path); ``advisor_durations``: the
+    # course lengths, in months, the advisor said (or the plan owes), which she may refer to.
+    probe_first: bool = False
+    allowed_extra: frozenset[int] = frozenset()
+    advisor_durations: frozenset[float] = frozenset()
 
     @property
     def is_learner(self) -> bool:
@@ -1029,27 +1171,45 @@ def _number_value(token: str) -> float:
         return -1.0
 
 
-def _card_fact_only(sentence: str, allowed: frozenset[int]) -> bool:
-    """True when every number in ``sentence`` is a public-card fact (9,000 / six months)."""
+def _card_fact_only(
+    sentence: str, allowed: frozenset[int], durations: frozenset[float] | None = None
+) -> bool:
+    """True when every number in ``sentence`` is a public-card fact (9,000 / six months).
+
+    M032 SWEEP-17: with ``durations`` (probe first) a course length passes only when the advisor
+    said it (its months are in ``durations``); without, "six months" is the card's, as before.
+    """
     amounts = dollar_amounts(sentence)
     if any(amount not in allowed for amount in amounts):
         return False
-    without = _CARD_DURATION.sub(" ", sentence)
+    if durations is None:
+        without = _CARD_DURATION.sub(" ", sentence)
+        said_length = _CARD_DURATION.search(sentence) is not None
+    else:
+        lengths = durations_said(sentence)
+        if any(not _duration_known(value, durations) for value in lengths):
+            return False
+        without = _DURATION.sub(" ", sentence)
+        said_length = bool(lengths)
     without = re.sub(r"\$\s?[\d,]+(?:\.\d+)?\s*k?", " ", without)
-    return not re.search(r"\d", without) and bool(amounts or _CARD_DURATION.search(sentence))
+    return not re.search(r"\d", without) and bool(amounts or said_length)
 
 
-def _is_product_statement(sentence: str, allowed: frozenset[int]) -> bool:
+def _is_product_statement(
+    sentence: str, allowed: frozenset[int], durations: frozenset[float] | None = None
+) -> bool:
     """A declarative about the product.  Only the website's price and duration pass.
 
     "The course is around $9,000" and "about six months" are on the card.  Any other
     subject (capstone, classes, instructors, cohort ...) or any other number is a fact
-    the learner must not assert, even when it happens to agree with the deck.
+    the learner must not assert, even when it happens to agree with the deck.  M032 SWEEP-17
+    (``durations``, probe first): the card holds neither, so only the figures the advisor said
+    (or a note allows) pass.
     """
     match = _PRODUCT_SUBJECT.search(sentence)
     if match is None or _OPINION.search(sentence):
         return False
-    if match.group("noun").lower() in _CARD_NOUNS and _card_fact_only(sentence, allowed):
+    if match.group("noun").lower() in _CARD_NOUNS and _card_fact_only(sentence, allowed, durations):
         return False
     if _NOT_ASSERTED.search(clause_before(sentence, match.start())) is not None:
         return False  # "knowing whether the classes are live would help": a wish, not a claim
@@ -1168,16 +1328,33 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     if has_concession(sentence):
         hits.append(_hit(CONCESSION, "resolution_phrasing", sentence))
     question = is_question_like(sentence)
-    allowed = _CARD_AMOUNTS | ctx.advisor_amounts
+    card = _CARD_AMOUNTS_V2 if ctx.probe_first else _CARD_AMOUNTS
+    allowed = card | ctx.advisor_amounts | ctx.allowed_extra
     if persona is not None:
         allowed = allowed | persona.card_amounts  # her salary (M4)
+    durations = ctx.advisor_durations if ctx.probe_first else None
+    length_unsaid = False
     if not question:
         if _FORMAT_FACT.search(sentence):
             hits.append(_hit(INVENTED_FACT, "format_or_schedule_claim", sentence))
-        elif _is_product_statement(sentence, allowed):
-            hits.append(_hit(INVENTED_FACT, "product_statement", sentence))
+        elif _is_product_statement(sentence, allowed, durations):
+            if durations is not None and not _is_product_statement(
+                sentence, allowed, durations | durations_said(sentence)
+            ):
+                # M032 SWEEP-17 item 5: its only offending figure is a course length the advisor
+                # never said ("The course is about six months long."): hygiene, not a leak.
+                length_unsaid = True
+            else:
+                hits.append(_hit(INVENTED_FACT, "product_statement", sentence))
         elif _CLAIM_WORDS.search(sentence):
             hits.append(_hit(INVENTED_FACT, "outcome_or_policy_claim", sentence))
+    if ctx.probe_first and not length_unsaid and len(sentence) <= MISREAD_MAX_CHARS:
+        # SWEEP-17 item 5: a course-length frame ("keep up for six months"; questions too).
+        length_unsaid = not any(
+            hit.rule == "product_statement" for hit in hits
+        ) and course_length_unsaid(sentence, ctx.advisor_durations)
+    if length_unsaid:
+        hits.append(_hit(COURSE_FACT, "course_length_unsaid", sentence))
     if _HOURS_A_WEEK.search(sentence) and not question and not _hours_are_advisors(sentence, ctx):
         hits.append(_hit(INVENTED_FACT, "own_availability_figure", sentence))
     elif any(amount not in allowed for amount in dollar_amounts(sentence)):
@@ -1364,6 +1541,19 @@ def _fallback(ctx: GuardContext, *, only_repeats: bool = False) -> str:
     return FALLBACK_REPLY
 
 
+# M032 SWEEP-17: what an emptied free reply asks instead of the course length it was dropped for.
+LENGTH_PROBES = ("How long does the course run?", "How long is the course, by the way?")
+
+
+def _length_probe(ctx: GuardContext) -> str:
+    """A rotated length question the learner has not asked yet (the first if both were asked)."""
+    for offset in range(len(LENGTH_PROBES)):
+        candidate = pick_variant(LENGTH_PROBES, ctx.seed, ctx.variant + offset)
+        if repeat_kind(candidate, ctx.said) is None:
+            return candidate
+    return pick_variant(LENGTH_PROBES, ctx.seed, ctx.variant)
+
+
 class StreamGuard:
     """Vet an LLM reply sentence by sentence, as it streams.
 
@@ -1392,6 +1582,7 @@ class StreamGuard:
         self._last_dropped = False  # the sentence before this one was dropped
         self._anchor_seen = False  # an earlier sentence of this reply named the $7,000
         self._soft_tic_trims = 0  # M032 SWEEP-12: soft tics taken out of this reply
+        self._length_drops = 0  # M032 SWEEP-17: sentences dropped for a course length unsaid
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -1659,6 +1850,8 @@ class StreamGuard:
         if hits:
             self._hits.extend(hits)
             self._replaced = True
+            if any(hit.category == COURSE_FACT for hit in hits):
+                self._length_drops += 1
             out = _replacement(hits, self.ctx, sentence)
             final = out == NO_FEEDBACK_LINE
             if out in self._replacements:
@@ -1742,7 +1935,12 @@ class StreamGuard:
         if not self._emitted and not self.ctx.quiet_empty:
             self._fallback_used = True
             only_repeats = self._repeat_drops > 0 and self._other_drops == 0
-            self._emitted.append(_fallback(self.ctx, only_repeats=only_repeats))
+            if self._length_drops and self.ctx.free_reply and self.ctx.is_learner:
+                # M032 SWEEP-17: a free reply emptied by a course length she was never told asks
+                # for it instead ("How long does the course run?"), never "Give me a second".
+                self._emitted.append(_length_probe(self.ctx))
+            else:
+                self._emitted.append(_fallback(self.ctx, only_repeats=only_repeats))
             out.append(self._emitted[-1])
         return out
 

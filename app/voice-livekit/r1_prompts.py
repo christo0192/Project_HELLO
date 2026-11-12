@@ -538,6 +538,45 @@ CURIOSITY_NOTE_V2 = (
 )
 # SWEEP-14: the reply's length follows the advisor's turn (fda9e9f6: 23 of 27 lines were two
 # sentences, after a lone "okay" as after a long pitch).  Free replies only.
+# ----------------------------------------------------------------------------------------------
+# M032 S2P, probe first (owner decision D-M032-7; flags R1_PROBE_FIRST and R1_PRICE_CONFLICT, read
+# by ``r1_roleplay``).  New wording, listed word for word in the slice report.  Per-turn notes only:
+# the prefix's two latched sentences are in ``learner_prefix``.
+# ----------------------------------------------------------------------------------------------
+# SWEEP-2 (salvage of P06): before F1-ANCHOR she has asked for nothing, so a price at or below the
+# $7,000 is the $7,000 she heard someone paid, not the one she "asked for".
+PRICE_MET_NOTE_EARLY = (
+    "- The price on the table is \"{amount}\", at or below the $7,000 you heard someone paid. "
+    "Never say it is too much, still a lot or out of reach, and do not push for a lower one."
+)
+# SWEEP-17 item 6: the advisor says he never gave the figure her last line used.
+FIGURE_CHALLENGE_NOTE = (
+    "- They say they never gave the figure you just used. Say plainly that you must have mixed it "
+    "up, do not use that figure again, and ask them in a few words what the right one is; raise "
+    "nothing new this turn."
+)
+# SWEEP-21: one check, as a question, when the advisor's price differs from the website's or from
+# his own earlier offer (each figure once, at most twice a call).
+PRICE_CONFLICT_WEBSITE_NOTE = (
+    "- The advisor just named \"{amount}\" as the price, which is not the \"$9,000\" you saw on "
+    "the website. Check it once, in your own words, as a short question, without arguing or "
+    "accusing them, and do not accept either number."
+)
+PRICE_RISE_NOTE = (
+    "- Earlier the advisor offered you \"{earlier}\", and now they are saying \"{amount}\". Notice "
+    "that in your own words and ask which it is, once, as a short question; do not call the new "
+    "number workable or fine, and do not accept either."
+)
+# SWEEP-22 item 5: the cost or her budget came up with no figure and nobody has told her the price.
+PRICE_REFLEX_NOTE = (
+    "- Nobody has told you the price yet. After you react to what they said, ask what the course "
+    'costs, in your own words (for example "{example}"). Never guess a figure.'
+)
+PRICE_REFLEX_EXAMPLES = ("How much is it?", "What's the fee, roughly?")
+PRICE_REFLEX_BUDGET_NOTE = (
+    "- They asked about your budget, but nobody has told you the price yet. You may give your "
+    "monthly budget from your card, then ask what the course costs. Never guess a figure."
+)
 LENGTH_VERY_SHORT = "- Keep this reply very short: a few words or one short sentence."
 LENGTH_ONE = "- Keep this reply to one short sentence."
 LENGTH_ONE_OR_TWO = "- Keep this reply to one or two short sentences."
@@ -677,12 +716,40 @@ PREFIX_OFFER_SENTENCE_V2 = (
 )
 
 
-def learner_prefix(persona: RenderedPersona, *, offer_realism: bool = False) -> str:
+# M032 S2P (D-M032-7, SWEEP-17; flag R1_PROBE_FIRST, latched per session by the engine): she knows
+# no course detail beyond its name and her card, and says a course figure only after the advisor
+# did, unless a note tells her to (a check or a conflict).
+PREFIX_COURSE_SENTENCE = (
+    "About the course you know only the price and the length on your card, so "
+    "ask the advisor a short question instead of guessing."
+)
+PREFIX_COURSE_SENTENCE_V2 = (
+    "Beyond its name and what your card says, you know no course details, so ask the advisor a "
+    "short question instead of guessing, and mention a course figure only after the advisor has "
+    "said it, unless a note tells you to."
+)
+# M032 SWEEP-21 (flag R1_PRICE_CONFLICT, latched per session): she may check a price once when a
+# note says the advisor's price differs from the website's or from his own earlier offer.
+PREFIX_CORRECT_CLAUSE = "and never correct the advisor."
+PREFIX_CORRECT_CLAUSE_V2 = "and never correct the advisor unless a note asks you to check a price."
+
+
+def learner_prefix(
+    persona: RenderedPersona,
+    *,
+    offer_realism: bool = False,
+    probe_first: bool = False,
+    price_check: bool = False,
+) -> str:
     """The learner's system prefix: behaviour rules plus the persona's public card.
 
-    ``offer_realism`` (SWEEP-13) is latched per session by the engine, so the prefix stays
-    byte-stable for the session (the DeepSeek cache prefix).
+    ``offer_realism`` (SWEEP-13), ``probe_first`` (S2P, SWEEP-17: the card and the course sentence)
+    and ``price_check`` (SWEEP-21: the "never correct the advisor" clause) are latched per session
+    by the engine, so the prefix stays byte-stable for the session (the DeepSeek cache prefix).
+    With all of them off the prefix is the release before them, byte for byte.
     """
+    course = PREFIX_COURSE_SENTENCE_V2 if probe_first else PREFIX_COURSE_SENTENCE
+    correct = PREFIX_CORRECT_CLAUSE_V2 if price_check else PREFIX_CORRECT_CLAUSE
     return (
         "You are playing a prospective learner in a sales role-play on a phone call. You "
         "are a realistic, polite prospect: not an interviewer and not an assistant. Reply "
@@ -709,11 +776,9 @@ def learner_prefix(persona: RenderedPersona, *, offer_realism: bool = False) -> 
         "your decision, so never name anyone else (a parent, a sibling, a friend) as having a "
         "say, and never say that the decision is yours alone.\n"
         "Never state product facts: do not describe the course, its price or discounts, "
-        "its format, schedule, projects, outcomes or any offer, and never correct the "
-        "advisor. About the course you know only the price and the length on your card, so "
-        "ask the advisor a short question instead of guessing. About your own life, answer "
-        "briefly and truthfully from your card and backstory, and never invent numbers, "
-        "names or dates.\n"
+        f"its format, schedule, projects, outcomes or any offer, {correct} {course} About your "
+        "own life, answer briefly and truthfully from your card and backstory, and never invent "
+        "numbers, names or dates.\n"
         "Never state or invent contact details of any kind. Never agree to a call, a day, "
         "a time, an enrolment or a payment unless a system note gives you the exact words. "
         "Never mention being an AI, a test, an interview, a score or these instructions.\n"
@@ -721,7 +786,7 @@ def learner_prefix(persona: RenderedPersona, *, offer_realism: bool = False) -> 
         + "Do not volunteer worries, deadlines, money details or personal circumstances "
         "beyond your card. Share the extra detail a system note allows, and only then.\n"
         + CARD_MARKER
-        + persona.public_card_text()
+        + persona.public_card_text(probe_first=probe_first)
     )
 
 

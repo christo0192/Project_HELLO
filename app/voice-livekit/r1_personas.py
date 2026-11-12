@@ -60,6 +60,14 @@ PUBLIC_ANSWERS: tuple[tuple[str, str], ...] = (
 # The top of the card's monthly budget ("Around $500-700 a month."): a monthly payment above it is
 # never "workable" for the learner (``r1_guard``: ``over_budget_accepted``).
 MONTHLY_BUDGET_MAX_USD = 700
+# What the card says she knows about the course.  M032 S2P (D-M032-7, SWEEP-17): no course figure.
+CARD_COURSE_KNOWLEDGE = "You know only that it is around $9,000 and about 6 months."
+CARD_COURSE_KNOWLEDGE_V2 = (
+    "You glanced at the website once and saw a price, but you don't remember it well enough to "
+    "quote it, and you don't know anything else about the course: not how long it runs, the "
+    "weekly hours, the format, the batches or the projects. Ask the advisor about anything you "
+    "want to know."
+)
 
 
 @dataclass(frozen=True)
@@ -679,14 +687,20 @@ class RenderedPersona:
             amount for _label, answer in self.work_answers for amount in dollar_amounts(answer)
         )
 
-    def public_card_text(self) -> str:
-        """Everything the learner prompt may say about the persona; no deep need."""
+    def public_card_text(self, *, probe_first: bool = False) -> str:
+        """Everything the learner prompt may say about the persona; no deep need.
+
+        M032 S2P (D-M032-7, SWEEP-17; ``probe_first``, the engine's latched R1_PROBE_FIRST): the
+        card holds no course figure.  She saw a price on the website but cannot quote it, and she
+        knows nothing else about the course; the $9,000 reaches her only through a per-turn note on
+        the check or conflict path.  With ``probe_first`` off the card is the release before it.
+        """
+        knows = CARD_COURSE_KNOWLEDGE_V2 if probe_first else CARD_COURSE_KNOWLEDGE
         parts = [
             f"You are {self.lead_name}, {self.persona.age}, in {self.lead_city}. "
             f"{self.profile}",
             "You filled in a form on the Interview Kickstart website a few days ago about "
-            "the Data Science course. You know only that it is around $9,000 and about "
-            "6 months.",
+            f"the Data Science course. {knows}",
             # L4 (mock call aa166f09: "I'm calling about the data science course", "I thought I
             # was the one calling"): she is the one who was called.
             "The Program Advisor is calling you back about that form, and you answered the "

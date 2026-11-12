@@ -24,7 +24,11 @@ from r1_script import LINES
 from r1_text import dollar_amounts, fold, negated_before, split_sentences
 
 # 2: the learner's catch-all deflection line is replaced by a policy (R1-Q).
-WORLD_REVISION = 2
+# 3: M032 S2P (owner decision D-M032-7, SWEEP-17 item 8): the policy no longer says she knows the
+#    price and the duration; she knows no course detail and says a course figure only after the
+#    advisor did.  Documentation only: the policy is pinned here, never sent to a model (the card
+#    and the prefix carry it, behind R1_PROBE_FIRST).  No deck fact, scorer rule or figure changed.
+WORLD_REVISION = 3
 DECK_TITLE = "Interview Kickstart (IK) Sales Mock Preparation Guide"
 DECK_FILENAME = "Copy of Sales Mock Call Prep Document_Updated.pdf"
 DECK_PAGES = 3
@@ -227,9 +231,9 @@ UNSTATED_TOPICS: tuple[UnstatedTopic, ...] = (
 # about that." was spoken verbatim after unrelated questions and read as a non-answer
 # (R1-Q).  This policy tells the model what to do instead of what to say.
 LEARNER_POLICY = (
-    "About the course you know only the price and the duration: ask the advisor for "
-    "anything else instead of guessing. About your own life, answer briefly from your "
-    "backstory and never invent numbers, names or dates."
+    "Beyond its name, you know no course details: ask the advisor for any course detail instead "
+    "of guessing, and mention a course figure only after the advisor has said it. About your own "
+    "life, answer briefly from your backstory and never invent numbers, names or dates."
 )
 INTERVIEWER_DEFLECTION = LINES["L-FAQ-DEFER"]
 SCORER_RULE = (

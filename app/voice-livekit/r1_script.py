@@ -111,6 +111,11 @@ LINES: dict[str, str] = {
     # M2: the end of the role-play's time (R = 20:00, or its S cap) is never abrupt: after the
     # 17:00 time cue, the learner closes in role with this line, and then L-EXIT follows.
     "L-TIME-UP": "I'm sorry, I really have to go now. Thank you for your time.",
+    # M032 SWEEP-20 (flag R1_PROBE_FIRST): an early farewell before she knows the price or the
+    # time the course takes is stopped with the probe that is due, never "$9,000 is a lot".  In the
+    # learner's voice; they deliver nothing graded (the owed move stays owed).
+    "L-REDIRECT-PRICE": "Oh wait, before you go... what would the course cost me?",
+    "L-REDIRECT-TIME": "Oh wait, before you go... how much time would this take each week?",
     "L-MUTE": (
         "This is Christy. It looks like your microphone may be muted. Please unmute when "
         "you're ready."

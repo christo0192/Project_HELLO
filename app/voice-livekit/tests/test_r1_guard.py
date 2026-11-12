@@ -920,14 +920,16 @@ class AckHygieneTests(unittest.TestCase):
         self.assertTrue(ledger.flagged)
 
     def test_only_hygiene_categories_are_outside_the_leak_categories(self):
-        self.assertEqual(
-            set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES),
-            {r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD},
-        )
-        self.assertEqual(
-            r1_guard.HYGIENE_CATEGORIES,
-            frozenset({r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD}),
-        )
+        # M032 SWEEP-17: a course length she was never told is hygiene, never posted to the gate.
+        hygiene = {
+            r1_guard.ACK_FORMAT,
+            r1_guard.REPEAT,
+            r1_guard.REOPEN,
+            r1_guard.MISREAD,
+            r1_guard.COURSE_FACT,
+        }
+        self.assertEqual(set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES), hygiene)
+        self.assertEqual(r1_guard.HYGIENE_CATEGORIES, frozenset(hygiene))
 
 
 def said_of(*sentences) -> tuple[str, ...]:
@@ -2676,6 +2678,92 @@ class LearnerVoiceS2GuardTests(unittest.TestCase):
                         with self.subTest(persona=rendered.id, sentence=sentence):
                             self.assertEqual(check_sentence(sentence, context), [])
 
+
+class ProbeFirstGuardTests(unittest.TestCase):
+    """M032 SWEEP-17 items 4 and 5 (``GuardContext.probe_first``, the engine's latched
+    R1_PROBE_FIRST): only figures that were said or are owed pass, and a course length the advisor
+    never said is dropped as hygiene.  Synthetic sentences."""
+
+    LENGTH_HITS = (
+        "I'm not sure I could keep up for six months.",
+        "I just know it's the data science course, roughly six months.",
+        "Six months is a long commitment for me, so what happens if I fall behind?",
+        "Can I really keep up for six months?",
+        "A six-month program is a lot for me.",
+    )
+    ALWAYS_CLEAN = (
+        "How long does the course run?",
+        "My contract renewal is decided in about six months.",
+        "My funding ends in about eight months.",
+        "I quit a free Python course after three weeks.",
+        "I've been applying for about three months",
+        "I could start in about two months",
+    )
+
+    def on(self, **kwargs):
+        return ctx(probe_first=True, **kwargs)
+
+    def test_the_website_price_is_no_longer_always_allowed(self):
+        sentence = "It was around $9,000 on the website."
+        self.assertIn("amount_off_card", {hit.rule for hit in check_sentence(sentence, self.on())})
+        self.assertEqual(check_sentence(sentence, self.on(allowed_extra=frozenset({9000}))), [])
+        self.assertEqual(check_sentence(sentence, self.on(advisor_amounts=frozenset({9000}))), [])
+        self.assertEqual(check_sentence(sentence, ctx()), [])  # flag off: the card's figure
+        for amount in (7000, 500, 700):
+            self.assertEqual(
+                check_sentence(f"I heard someone paid ${amount:,}.", self.on()), [], amount
+            )
+
+    def test_a_course_length_she_was_never_told_is_hygiene(self):
+        for sentence in self.LENGTH_HITS:
+            with self.subTest(sentence=sentence):
+                hits = check_sentence(sentence, self.on())
+                self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+                self.assertTrue(all(hit.category in r1_guard.HYGIENE_CATEGORIES for hit in hits))
+                self.assertEqual(check_sentence(sentence, self.on(advisor_durations=frozenset({6.0}))), [])
+                self.assertNotIn(
+                    "course_length_unsaid", {hit.rule for hit in check_sentence(sentence, ctx())}
+                )
+
+    def test_her_own_life_and_questions_without_a_figure_are_clean(self):
+        # (p1's quit course is a deep need; told, it is hers to say: the topic is released here.)
+        context = self.on(released_topics=frozenset({"H1", "H2", "H3"}))
+        for sentence in self.ALWAYS_CLEAN:
+            with self.subTest(sentence=sentence):
+                self.assertEqual(check_sentence(sentence, context), [])
+
+    def test_the_product_statement_with_an_unsaid_length_is_hygiene_not_a_leak(self):
+        sentence = "The course is about six months long."
+        hits = check_sentence(sentence, self.on())
+        self.assertEqual({hit.rule for hit in hits}, {"course_length_unsaid"})
+        self.assertEqual(check_sentence(sentence, ctx()), [])  # flag off: the card's length
+        said = self.on(advisor_durations=frozenset({6.0}))
+        self.assertEqual(check_sentence(sentence, said), [])
+
+    def test_weeks_and_half_a_year_are_read_as_months(self):
+        self.assertEqual(r1_guard.durations_said("a six-month program"), frozenset({6.0}))
+        self.assertEqual(r1_guard.durations_said("half a year"), frozenset({6.0}))
+        self.assertEqual(r1_guard.durations_said("24 weeks"), frozenset({5.54}))
+        weeks = self.on(advisor_durations=r1_guard.durations_said("It runs for 24 weeks."))
+        self.assertEqual(check_sentence("I'm not sure I could keep up for six months.", weeks), [])
+        eight = self.on(advisor_durations=frozenset({6.0}))
+        self.assertTrue(check_sentence("I'm not sure I could keep up for eight months.", eight))
+
+    def test_an_emptied_free_reply_asks_the_length_never_give_me_a_second(self):
+        context = self.on(free_reply=True, seed="s")
+        result = guard_text("I'm not sure I could keep up for six months.", context)
+        self.assertIn(result.text, r1_guard.LENGTH_PROBES)
+        intent = self.on(quiet_empty=True)
+        self.assertEqual(guard_text("I'm not sure I could keep up for six months.", intent).text, "")
+
+    def test_the_readers_are_fast_on_hostile_text(self):
+        import time
+
+        hostile = "keep up " + "for six months " * 400 + "course " * 400
+        start = time.perf_counter()
+        r1_guard.course_length_unsaid(hostile)
+        r1_guard.durations_said(hostile)
+        self.assertLess(time.perf_counter() - start, 2.0)
 
 if __name__ == "__main__":
     unittest.main()

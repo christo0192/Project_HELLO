@@ -161,7 +161,19 @@ import r1_world
 #    After the S2 review (still revision 22, unreleased): OFFER_TERMS_IN_PARTS for a split that is
 #    not monthly, the new-topic shape without "something else is on your mind", and the pre-empted
 #    labels keyed by what the advisor said ("the schedule", "how the classes are run").
-CONTENT_REVISION = 22
+# 23: M032 S2P, probe first (owner decision D-M032-7; rollback flags R1_PROBE_FIRST,
+#    R1_OFFER_READER_V2, R1_COUNTER_V2, R1_PRICE_CONFLICT).  The card's course knowledge and the
+#    prefix's course sentence and "never correct the advisor" clause have a second wording each
+#    (latched per session); the probes (price, again, clarifying, time), F2's and F4's texts without
+#    a course fact, the anchors that react to the advisor's number or check the website's (stated,
+#    stated with the conflict check, check, free) and the objective offer-anchor briefs, the v2
+#    counters (met, far below, hinge-free short and refused, conflict, her number), N-PRICE-FIRST
+#    and the first-time money briefs, the early met-price, figure-challenge, conflict, rise and
+#    price-reflex notes, the guard's length probes and the two redirect lines (L-REDIRECT-PRICE,
+#    L-REDIRECT-TIME) join the manifest.  The world's LEARNER_POLICY was reworded (world revision
+#    3).  Markers, deadlines and the scorer's facts are unchanged; with every flag off the card, the
+#    prefix and the reminders are the release before.
+CONTENT_REVISION = 23
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -272,6 +284,99 @@ def _learner_voice_v2(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         "reaction_only_sample": p.turn_reminder(
             sample, r_sec=0, reaction_only=True, voice_v2=True
         ),
+    }
+
+
+def _anchor_entry(item: Any) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "brief": item.brief,
+        "must_say": list(item.must_say),
+        "variants": list(item.variants),
+    }
+
+
+def _probe_first(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
+    """M032 S2P (revision 23): every new probe-first text, and the latched prefix with it on."""
+    p = r1_prompts
+    s = r1_scheduler
+    n = r1_negotiation
+    return {
+        "card_course_knowledge": [
+            r1_personas.CARD_COURSE_KNOWLEDGE,
+            r1_personas.CARD_COURSE_KNOWLEDGE_V2,
+        ],
+        "prefix_course_sentences": [p.PREFIX_COURSE_SENTENCE, p.PREFIX_COURSE_SENTENCE_V2],
+        "prefix_correct_clauses": [p.PREFIX_CORRECT_CLAUSE, p.PREFIX_CORRECT_CLAUSE_V2],
+        "learner_prefix_probe_first_sample": p.learner_prefix(
+            sample, offer_realism=True, probe_first=True, price_check=True
+        ),
+        "probes": [
+            {
+                "family": probe.family,
+                "brief": probe.brief,
+                "markers": [list(group) for group in probe.markers],
+                "variants": list(probe.variants),
+            }
+            for probe in s.PROBES
+        ],
+        "f2_primary": {
+            "brief": s.F2_PRIMARY_BRIEF_V2,
+            "worry": s.F2_PRIMARY_WORRY_V2,
+            "line": s.F2_PRIMARY_LINE_V2,
+            "variants": list(s.F2_PRIMARY_VARIANTS_V2),
+        },
+        "f4_primary": {
+            "brief": s.F4_PRIMARY_BRIEF_V2,
+            "line": s.F4_PRIMARY_LINE_V2,
+            "variants": list(s.F4_PRIMARY_VARIANTS_V2),
+        },
+        "anchors": [
+            _anchor_entry(item)
+            for item in (
+                n.anchor_after_stated(9000),
+                n.anchor_after_stated(10000),
+                n.anchor_check(),
+                n.anchor_after_free(),
+                n.anchor_after_offer(8500, probe_first=True, counter_v2=True),
+                n.anchor_after_offer(7000, probe_first=True, counter_v2=True),
+                n.anchor_after_offer(6500, probe_first=True, counter_v2=True),
+            )
+        ],
+        "counters_v2": [
+            {"id": item.id, "brief": item.brief, "variants": list(item.variants)}
+            for item in n.COUNTERS_V2
+        ],
+        "conflict_counter": {
+            "brief": n.SITUATION_CONFLICT_BRIEF,
+            "website_variants": list(n.SITUATION_CONFLICT_WEBSITE_VARIANTS),
+            "rise_variants": list(n.SITUATION_CONFLICT_RISE_VARIANTS),
+        },
+        "your_number_counter_suffix": n.YOUR_NUMBER_COUNTER_SUFFIX,
+        "price_first": {
+            "id": n.PRICE_FIRST_SPEC.id,
+            "brief": n.PRICE_FIRST_SPEC.brief,
+            "markers": [list(group) for group in n.PRICE_FIRST_SPEC.markers],
+            "variants": list(n.PRICE_FIRST_SPEC.variants),
+        },
+        "money_first_briefs": [n.N_MONEY_NAMED_BRIEF, n.N_MONEY_UNKNOWN_BRIEF],
+        "money_unknown_variants": list(n.N_MONEY_UNKNOWN_VARIANTS),
+        "notes": {
+            "price_met_note_early": p.PRICE_MET_NOTE_EARLY,
+            "figure_challenge_note": p.FIGURE_CHALLENGE_NOTE,
+            "price_conflict_website_note": p.PRICE_CONFLICT_WEBSITE_NOTE,
+            "price_rise_note": p.PRICE_RISE_NOTE,
+            "price_reflex_note": p.PRICE_REFLEX_NOTE,
+            "price_reflex_examples": list(p.PRICE_REFLEX_EXAMPLES),
+            "price_reflex_budget_note": p.PRICE_REFLEX_BUDGET_NOTE,
+        },
+        "length_probes": list(r1_guard.LENGTH_PROBES),
+        "constants": {
+            "stated_carry_turns": n.STATED_CARRY_TURNS,
+            "conflict_min_gap_usd": n.CONFLICT_MIN_GAP_USD,
+            "max_conflicts": n.MAX_CONFLICTS,
+            "rise_min_usd": n.RISE_MIN_USD,
+        },
     }
 
 
@@ -551,6 +656,7 @@ def manifest() -> dict[str, Any]:
             "voiced_concerns_asked_note": r1_prompts.VOICED_CONCERNS_ASKED_NOTE,
             "hollow_concerns_note": r1_prompts.HOLLOW_CONCERNS_NOTE,
             "learner_voice_v2": _learner_voice_v2(sample),
+            "probe_first": _probe_first(sample),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

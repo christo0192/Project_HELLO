@@ -30,7 +30,9 @@ from r1_world import (
 # Review pin: editing any fact changes WORLD_SHA256.  Update this constant, WORLD_REVISION
 # and tests/test_r1_content_pin.py together, in the same reviewed change.
 # Revision 2 (R1-Q): the learner's catch-all deflection line became a policy text.
-PINNED_WORLD_SHA256 = "24e7bdf88197e29b3527fd2df1e29145ce866ce5430d5c6aab92168eb61eb4a2"
+# Revision 3 (M032 S2P, SWEEP-17 item 8): the policy no longer says she knows the price and the
+# duration (documentation only; the card and the prefix carry it behind R1_PROBE_FIRST).
+PINNED_WORLD_SHA256 = "a959b163b2268cef5162c00c1728fe9f07f341209e4c1eeb5e3adf24b6c9e1c5"
 
 
 class DeckFactsTests(unittest.TestCase):

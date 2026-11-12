@@ -490,6 +490,144 @@ PLAN: tuple[MoveSpec, ...] = (
     ),
 )
 FAMILIES = ("F3", "F2", "F1", "F4")
+
+
+# ----------------------------------------------------------------------------------------------
+# M032 S2P, probe first (owner decision D-M032-7, S2 item 10; flag R1_PROBE_FIRST, read and latched
+# by the engine).  The learner never states a course fact the advisor has not said.  F2's and F4's
+# owed moves are worded without one (the markers are unchanged and prove every text below), and
+# the F1 and F2 families may open with a PROBE: a short question about the price or the time the
+# course takes, which delivers nothing graded (the move stays owed and reacts to the answer).
+# ----------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ProbeSpec:
+    """A probe step (S2.10): what she asks before the family's owed point, and its fallbacks.
+
+    ``markers`` prove the question was asked (a reply that asked it gets no scripted tail);
+    ``variants`` are the scripted questions, tried in a seeded rotation.
+    """
+
+    family: str
+    brief: str
+    markers: tuple[tuple[str, ...], ...]
+    variants: tuple[str, ...]
+
+
+PROBE_F1 = ProbeSpec(
+    "F1",
+    "you want to know what the course costs before you think about anything else; ask the advisor "
+    "in a short question of your own, and do not say or guess any figure yourself",
+    (
+        (r"\bhow much\b", r"\bcosts?\b", r"\bfees?\b", r"\bprice\b", r"\bcharge\b"),
+        (r"\?",),
+    ),
+    (
+        "How much is the course, by the way?",
+        "What's the fee like?",
+        "And what would the course cost me?",
+    ),
+)
+# Her second price question after the advisor did not name a figure (the first dodge).
+PROBE_F1_AGAIN = ProbeSpec(
+    "F1",
+    "you asked what the course costs and the advisor has not told you yet; ask once more, briefly "
+    "and politely, in your own words, and do not say or guess any figure yourself",
+    PROBE_F1.markers,
+    (
+        "Sorry, I didn't catch it. What would the course actually cost?",
+        "And the fee itself, how much would that be?",
+        "Just so I know, what's the price of the course?",
+    ),
+)
+# The advisor talked about the price but named no figure: she asks what it comes to (SWEEP-19).
+PROBE_F1_CLARIFY = ProbeSpec(
+    "F1",
+    "the advisor talked about the price but did not say a figure; ask in a short question what it "
+    "would actually come to, and do not say or guess any figure yourself",
+    PROBE_F1.markers,
+    (
+        "So what would it actually cost?",
+        "And what's the actual fee, roughly?",
+        "So how much would I be paying?",
+    ),
+)
+PROBE_F2 = ProbeSpec(
+    "F2",
+    "you want to know how much time the course would take; ask the advisor in a short question how "
+    "long it runs or how many hours a week it needs, and do not say or guess any figure yourself",
+    (
+        (
+            r"\bhow long\b",
+            r"\bhow many hours\b",
+            r"\bhow much time\b",
+            r"\bhours\b",
+            r"\bweeks?\b",
+            r"\bmonths?\b",
+            r"\bduration\b",
+        ),
+        (r"\?",),
+    ),
+    (
+        "How long does the course run?",
+        "How many hours a week would it take?",
+        "How much time would it take each week?",
+    ),
+)
+PROBES: tuple[ProbeSpec, ...] = (PROBE_F1, PROBE_F1_AGAIN, PROBE_F1_CLARIFY, PROBE_F2)
+# F2-PRIMARY and F4-PRIMARY without a course fact (the line, then the variants; S2.10).  F2: her
+# packed schedule against a course of any length ("a long course" on the forced path, SWEEP-17 item
+# 7).  F4: not ready to decide today, without the cohort she knows nothing about.
+F2_PRIMARY_BRIEF_V2 = (
+    "you are worried that your schedule is already packed and that you could not keep up with the "
+    "course on top of it"
+)
+F2_PRIMARY_WORRY_V2 = (
+    "your days are already full with work and home, and you are not sure you could keep up with "
+    "the course on top of them"
+)
+F2_PRIMARY_LINE_V2 = (
+    "My schedule is already packed; I'm not sure I could keep up with a long course."
+)
+F2_PRIMARY_VARIANTS_V2 = (
+    "I'm quite busy as it is, so I'm worried about keeping up with a course on top of everything.",
+    "My days are already full with work, so I'm not sure I could manage the course as well.",
+)
+F4_PRIMARY_BRIEF_V2 = (
+    "you are not ready to decide today and want some time to think it over before you decide"
+)
+F4_PRIMARY_LINE_V2 = "I'm not ready to decide today; I need some time to think it over."
+F4_PRIMARY_VARIANTS_V2 = (
+    "I don't think I can decide today. I want some time to think about it first.",
+    "I'm not ready to make a decision today, so let me think it over.",
+)
+# The owed moves whose texts change under probe first, and the course figures her scripted texts
+# never hold then (SWEEP-17 item 7; the invariant test reads every learner text against it).
+COURSE_LENGTH_FIGURE = re.compile(
+    r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty-four)"
+    r"[\s-]+(?:months?|weeks?)\b|\bhalf a year\b",
+    re.IGNORECASE,
+)
+
+
+def probe_first_texts(move_id: str) -> tuple[str, str, str, tuple[str, ...]] | None:
+    """(brief, worry, line, variants) of ``move_id`` under probe first, or None if unchanged."""
+    if move_id == F2_PRIMARY:
+        return (
+            F2_PRIMARY_BRIEF_V2,
+            F2_PRIMARY_WORRY_V2,
+            F2_PRIMARY_LINE_V2,
+            (F2_PRIMARY_LINE_V2, *F2_PRIMARY_VARIANTS_V2),
+        )
+    if move_id == F4_PRIMARY:
+        return (
+            F4_PRIMARY_BRIEF_V2,
+            "",
+            F4_PRIMARY_LINE_V2,
+            (F4_PRIMARY_LINE_V2, *F4_PRIMARY_VARIANTS_V2),
+        )
+    return None
+
+
 # R1-Q iteration 3.  "before my (own) next call" came back verbatim in 8 of 20 calls, also from a
 # learner who was at home after work.  The cue is the same move said three ways (rotated by the
 # attempt id); the markers accept all three.
@@ -705,6 +843,25 @@ THANKS_TRAILING_WORDS = 3
 
 def _sentences(text: object) -> list[str]:
     return [fold(sentence).lower() for sentence in split_sentences(text)]
+
+
+# M032 SWEEP-19 item 6: the advisor asks what number or price works for her ("Which number would
+# suit you?", "How much could you pay?"), in a question.  Narrow on purpose (SWEEP-6 may widen it).
+_ASKS_HER_NUMBER = _compile(
+    r"\b(?:what|which) (?:number|price|figure|amount)\b[^.?!]{0,40}\b(?:work|works|suit|suits|fit|"
+    r"fits|good|okay|ok|comfortable|in mind|best)\b",
+    r"\bhow much (?:can|could|would|are) you (?:able to )?(?:pay|afford|spend|do|manage)\b",
+    r"\bwhat (?:were|are) you (?:hoping|looking|expecting|planning) to (?:pay|spend)\b",
+    r"\bwhat(?:'s| is) your (?:number|price)\b",
+)
+
+
+def asks_her_number(text: object) -> bool:
+    """The advisor asks what number would work for her (M032 SWEEP-19 item 6)."""
+    return any(
+        is_question_like(sentence) and any(pattern.search(sentence) for pattern in _ASKS_HER_NUMBER)
+        for sentence in _sentences(text)
+    )
 
 
 def is_pitch_statement(text: object) -> bool:
@@ -1502,8 +1659,9 @@ class Delivery:
 class CloseDecision:
     """Response to an early close attempt: redirect with a move, stall, or exit.
 
-    ``prefix`` is always empty since R1-Q (the redirect is a brief the model voices; the
-    scripted openers are ``REDIRECT_OPENERS``).  The field stays for the contract.
+    ``prefix`` is the scripted opener a redirect is spoken with (``REDIRECT_OPENERS[0]``, "Oh
+    wait, before you go..."; the ship restore plays it before the owed line, or with R1_PROBE_FIRST
+    before the probe-first step that is due, SWEEP-20); it is empty for a stall or an exit.
     """
 
     action: str
@@ -1566,6 +1724,9 @@ class OwedMoveScheduler:
         self._last_objection_turn: int | None = None
         self._topic_turn: dict[str, int] = {}
         self._turn_answered = False
+        # M032 SWEEP-20: (move id, issued, forced_when_issued, enabled_sec) before the last
+        # redirect.
+        self._redirect_undo: tuple[str, int, bool, float | None] | None = None
 
     # ------------------------------------------------------------------ observation
     @property
@@ -1729,6 +1890,11 @@ class OwedMoveScheduler:
             and self.price_answered_turn is None
         ):
             self.price_answered_turn = self.turn
+
+    def note_topic(self, family: str) -> None:
+        """This advisor turn touched ``family``'s topic (M032 SWEEP-19: a number question before
+        the anchor is a fresh moment for the F1 probe or anchor), as ``topics_in`` would mark it."""
+        self._topic_turn[family] = self.turn
 
     def note_objection(self, *, turn: int | None = None) -> None:
         """A learner objection that is not a scheduled move (a stall reason) just landed.
@@ -2064,10 +2230,36 @@ class OwedMoveScheduler:
             state = self._states[spec.id]
             if state.status != "pending":
                 continue
+            # M032 SWEEP-20: what a probing redirect gives back (``return_to_pending``).
+            self._redirect_undo = (
+                spec.id, state.issued, state.forced_when_issued, state.enabled_sec
+            )
             if state.enabled_sec is None:
                 state.enabled_sec = r_sec
             return self._owed(state, r_sec, True)
         return None
+
+    def return_to_pending(self, move_id: str) -> bool:
+        """Undo the redirect's ``issue`` of ``move_id``: it stays owed as if never redirected.
+
+        M032 SWEEP-20 (flag R1_PROBE_FIRST): an early-close redirect that speaks a probe (a short
+        price or time question) delivers nothing graded, so the move's issued count, its forced flag
+        and its enabled time go back to what they were before the farewell; its deadline is
+        unchanged, and the farewell still used up the one redirect (``close_attempts``).  True when
+        the state was restored.
+        """
+        undo = self._redirect_undo
+        if undo is None or undo[0] != move_id:
+            return False
+        state = self._states[move_id]
+        if state.status != "pending":
+            return False
+        _move, issued, forced, enabled = undo
+        state.issued = issued
+        state.forced_when_issued = forced
+        state.enabled_sec = enabled
+        self._redirect_undo = None
+        return True
 
     def register_close_attempt(self, r_sec: float) -> CloseDecision:
         """Handle a farewell: redirect once before R = 14:00, otherwise exit.

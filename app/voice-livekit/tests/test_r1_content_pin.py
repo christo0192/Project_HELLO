@@ -140,7 +140,13 @@ import r1_world
 # moves, F4-PRIMARY's "like I said" texts, the pre-empted suffix, the rotated curiosity labels, the
 # stall briefs without "before you agree to anything", BUDGET_REPLACEMENT_V2).  No graded meaning,
 # marker, must-say, deadline or scripted line of the release before changed.
-PINNED_CONTENT_SHA256 = "b9de3afe4fce5e8f59181823850320c0aab85fbac156ebac229d300da0f87585"
+# Revision 23 (M032 S2P, probe first): the probe-first texts join the manifest
+# (``r1_content._probe_first``: the card's and the prefix's second wordings, the probes, F2's and
+# F4's texts without a course fact, the reacting and checking anchors, the v2 counters,
+# N-PRICE-FIRST and the first-time money briefs, the new notes and the length probes), the two
+# redirect lines join the script (L-REDIRECT-PRICE, L-REDIRECT-TIME), and the world's
+# LEARNER_POLICY was reworded (world revision 3).  Markers, deadlines and scorer facts unchanged.
+PINNED_CONTENT_SHA256 = "df83548d730260d3b59dae94bfb3c38d9036f8fc79ec9a32ff215c4bcf06571b"
 
 CONTENT_MODULES = (
     "r1_text",

@@ -2099,5 +2099,64 @@ class LearnerVoiceS2SchedulerTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - start, 5.0)
 
 
+class ProbeFirstSchedulerTests(unittest.TestCase):
+    """M032 S2P in the scheduler: the probe texts, the redirect's give-back, the number question."""
+
+    def test_the_probe_questions_prove_their_markers(self):
+        for probe in sched.PROBES:
+            for text in probe.variants:
+                with self.subTest(text=text):
+                    self.assertTrue(sched.markers_match(probe.markers, text))
+                    self.assertIn("?", text)
+
+    def test_f2_and_f4_texts_without_a_course_fact_prove_the_unchanged_markers(self):
+        for move_id in (sched.F2_PRIMARY, sched.F4_PRIMARY):
+            brief, _worry, line_text, variants = sched.probe_first_texts(move_id)
+            markers = sched.SPEC_BY_ID[move_id].markers
+            self.assertEqual(variants[0], line_text)
+            for text in variants:
+                with self.subTest(move=move_id, text=text):
+                    self.assertTrue(sched.markers_match(markers, text))
+                    self.assertNotRegex(text, r"(?i)\b(?:six|6) months\b|\bcohort\b|\bbatch\b")
+        self.assertIsNone(sched.probe_first_texts(sched.F3_PRIMARY))
+
+    def test_return_to_pending_gives_back_exactly_what_the_redirect_took(self):
+        scheduler = sched.OwedMoveScheduler("husband")
+        scheduler.observe_candidate_turn("Our mentors review every project.", 300.0)
+        before = {
+            move_id: (state.issued, state.forced_when_issued, state.enabled_sec)
+            for move_id, state in scheduler._states.items()
+        }
+        decision = scheduler.register_close_attempt(300.0)
+        self.assertEqual(decision.action, "redirect")
+        self.assertEqual(decision.prefix, sched.REDIRECT_OPENERS[0])
+        move = decision.move
+        scheduler.issue(move)
+        self.assertTrue(scheduler.return_to_pending(move.id))
+        after = {
+            move_id: (state.issued, state.forced_when_issued, state.enabled_sec)
+            for move_id, state in scheduler._states.items()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(scheduler.close_attempts, 1)
+        self.assertEqual(scheduler._states[move.id].spec.deadline_sec, move.deadline_sec)
+        self.assertFalse(scheduler.return_to_pending(move.id))  # once
+
+    def test_a_number_question_is_read_narrowly(self):
+        for text in (
+            "So which number would suit you?",
+            "What price works for you?",
+            "How much could you pay?",
+            "What were you hoping to pay?",
+        ):
+            self.assertTrue(sched.asks_her_number(text), text)
+        for text in (
+            "The number of students is high.",
+            "Which batch would suit you?",
+            "How much time do you have?",
+            "That number works for us.",
+        ):
+            self.assertFalse(sched.asks_her_number(text), text)
+
 if __name__ == "__main__":
     unittest.main()
