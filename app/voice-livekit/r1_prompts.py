@@ -426,10 +426,13 @@ OFFER_MADE_NOTE_V2 = (
     "- The advisor just offered you something. Respond to that offer first, in a few words, "
     "saying what it would mean for you, without accepting a call, a day, a time or a payment."
 )
+# SWEEP-4's wording, plus the S1 review's rule that the spec text left out: never the advisor's
+# promises said back as facts (a verdict-free "So you place everyone, then?" is still a promise).
 ANSWERED_YOU_NOTE_V2 = (
     "- The advisor just answered the question you asked. React to one specific thing in their "
     "answer first, in a few words, with a feeling or a short follow-up question, not by calling it "
-    "good, fair or reassuring."
+    "good, fair or reassuring, and without repeating their promises (placement, guarantees, "
+    "refunds, success rates) back as facts."
 )
 PUSH_REACT_NOTE_V2 = (
     "- React to what the advisor just said before anything else: pick up one specific thing they "

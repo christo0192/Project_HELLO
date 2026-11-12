@@ -140,7 +140,7 @@ import r1_world
 # moves, F4-PRIMARY's "like I said" texts, the pre-empted suffix, the rotated curiosity labels, the
 # stall briefs without "before you agree to anything", BUDGET_REPLACEMENT_V2).  No graded meaning,
 # marker, must-say, deadline or scripted line of the release before changed.
-PINNED_CONTENT_SHA256 = "d34b13b5bb502dfb1f514d3293462c57ee8f944fb11d7b2f96ef3645824e63de"
+PINNED_CONTENT_SHA256 = "06f96f364cd2c25430e5cb8e352a15cda83ad0296482a238cf16752a73f462d4"
 
 CONTENT_MODULES = (
     "r1_text",

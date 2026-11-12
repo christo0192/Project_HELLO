@@ -8411,6 +8411,11 @@ class LearnerVoiceShapeTests(unittest.TestCase):
         self.assertNotIn("how it lands", P2.OFFER_MADE_NOTE_V2)
         self.assertNotIn("how it lands", P2.ANSWERED_YOU_NOTE_V2)
         self.assertNotIn("how it lands", P2.PUSH_REACT_NOTE_V2)
+        # The S1 review's rule stays in both: never the advisor's promises said back as facts.
+        promises = "promises (placement, guarantees, refunds, success rates) back as facts"
+        self.assertIn(promises, P2.ANSWERED_YOU_NOTE)
+        self.assertIn(promises, P2.ANSWERED_YOU_NOTE_V2)
+        self.assertIn(promises, P2.PUSH_REACT_NOTE_V2)
 
     def test_the_guard_still_drops_an_invented_course_fact_under_v2(self):
         """Item 9: no attributed echo; the invented-fact checks are as strict as before."""
