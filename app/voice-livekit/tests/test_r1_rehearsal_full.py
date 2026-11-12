@@ -160,6 +160,28 @@ class VirtualLoopTests(unittest.TestCase):
 
         self.assertLess(vloop.run_virtual(main()), 5)
 
+    def test_a_wait_below_the_clocks_float_step_still_moves_the_clock(self) -> None:
+        # The role-play clock R lives in a lower binade than the loop clock S, so "R seconds left"
+        # can be half a float step of S: now + left rounds back to now, the timer fires at once
+        # and the clock never moves.  A firing timer must move the clock at least one step.
+        async def main() -> int:
+            loop = asyncio.get_running_loop()
+            await asyncio.sleep(2000.0)
+            start = loop.time()
+            await asyncio.sleep(1219.3906603621754)
+            deadline_r = (loop.time() - start) + 2.0**-42
+            spins = 0
+            while deadline_r - (loop.time() - start) > 0:
+                spins += 1
+                if spins > 1000:
+                    break
+                waiter = asyncio.ensure_future(asyncio.Event().wait())
+                await asyncio.wait({waiter}, timeout=deadline_r - (loop.time() - start))
+                waiter.cancel()
+            return spins
+
+        self.assertLess(vloop.run_virtual(main()), 5)
+
     def test_a_wait_that_nothing_can_end_is_a_stall_not_a_hang(self) -> None:
         async def main() -> None:
             await asyncio.get_running_loop().create_future()

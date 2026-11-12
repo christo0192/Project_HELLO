@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import math
 import selectors
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Coroutine, TypeVar
@@ -112,17 +113,19 @@ class VirtualTimeLoop(asyncio.SelectorEventLoop):
         # asyncio runs a timer up to one clock resolution EARLY.  A real clock has moved on by the
         # time the callback reads it; a virtual one has not, so a caller that re-reads "seconds
         # left" (the driver does after every wake-up) would wait the same sub-resolution sliver
-        # forever.  A timer that fires early therefore moves the clock to its own deadline.  The
+        # forever.  A timer that fires early therefore moves the clock to its own deadline, and at
+        # least one float step: "now + left" can round back to now when "left" was measured on a
+        # clock of a lower binade (R against S), and a real clock would still have moved.  The
         # heap is scanned (it is small): a cancelled handle asyncio has not dropped yet may sit at
         # its head and hide the one that fires.
         horizon = self._vtime + self._clock_resolution
         due = [
             handle._when
             for handle in self._scheduled
-            if not handle._cancelled and self._vtime < handle._when < horizon
+            if not handle._cancelled and handle._when < horizon
         ]
         if due:
-            self._vtime = max(due)
+            self._vtime = max(max(due), math.nextafter(self._vtime, math.inf))
         super()._run_once()  # type: ignore[misc]
 
     def epoch(self) -> float:
