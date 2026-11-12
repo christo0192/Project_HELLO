@@ -2585,16 +2585,34 @@ _INSTALMENT_OFFER = re.compile(
     r"tied up|opt|choose|let)\b",
     re.IGNORECASE,
 )
+# Review S2R-10: up to two words between "free" and the noun ("a free mock interview session"),
+# the thing named first ("the recordings for free"), and a free period ("free for a month", "try
+# it free").
 _FREE_EXTRA_TERM = re.compile(
-    r"\b(?:free|complimentary|bonus)\s(?:\w+\s){0,1}(?:trial|months?|weeks?|sessions?|class(?:es)?|"
-    r"courses?|modules?|access|mentoring|mentorship)\b"
-    r"|\b(?:a|one|two|first|the first) (?:month|week)s? (?:is |for )?free\b",
+    r"\b(?:free|complimentary|bonus)\s(?:[\w-]+\s){0,2}?(?:trial|months?|weeks?|sessions?|"
+    r"class(?:es)?|courses?|modules?|access|mentoring|mentorship)\b"
+    r"|\b(?:a|one|two|first|the first) (?:month|week)s? (?:is |for )?free\b"
+    r"|\bfree for (?:a|one|two|the first|the next) (?:(?:few|couple of) )?"
+    r"(?:months?|weeks?|days?)\b"
+    r"|\btry (?:it|this|that|the (?:course|program(?:me)?|classes)) (?:out )?(?:for )?free\b"
+    r"|\b(?:recordings?|sessions?|class(?:es)?|modules?|access|mentoring|mentorship|trial) "
+    r"(?:for )?free\b",
     re.IGNORECASE,
 )
 _FREE_EXTRA_FRAME = re.compile(
     r"\b(?:i|we)\b[^.?!]{0,40}?\b(?:give|giving|add|adding|throw(?:ing)? in|include|including|"
     r"offer|offering|provide|providing)\b"
-    r"|\byou (?:get|will get|'ll get|can get|also get|would get)\b",
+    r"|\byou (?:get|will get|'ll get|can get|also get|would get|can try|could try|can have)\b",
+    re.IGNORECASE,
+)
+# "no-cost EMI" is an instalment offer, not a negated one ("We offer no-cost EMI").
+_NO_COST = re.compile(r"\bno[- ]cost\b", re.IGNORECASE)
+# Review S2R-8: a monthly plan, as against a payment split in parts ("two halves", "half now and
+# half in two months"): only the monthly one gets the "what would it come to each month" clause.
+_MONTHLY_TERM = re.compile(
+    r"\b(?:emis?|monthly|every month|per month|a month|each month|over (?:\d{1,2}|a few|several|"
+    r"(?:three|six|nine|twelve|eighteen|twenty-four)) months|(?:\d{1,2}|three|six|nine|twelve)"
+    r"[- ]months?\b)",
     re.IGNORECASE,
 )
 _PLATFORMS = re.compile(r"\b(?:youtube|coursera|udemy|online|internet)\b", re.IGNORECASE)
@@ -2643,9 +2661,23 @@ def _sold_by_someone_else(clause: str) -> bool:
 
 def offer_terms_in(text: object) -> frozenset[str]:
     """The non-price terms (``OFFER_TERMS``) an advisor turn offered her (SWEEP-5)."""
+    return _offer_terms(text)[0]
+
+
+def instalments_are_monthly(text: object) -> bool:
+    """The instalments an advisor turn offered are monthly (EMI, "monthly", "over N months").
+
+    Review S2R-8: "split the payment into two halves" offers instalments, but not monthly ones.
+    """
+    return _offer_terms(text)[1]
+
+
+def _offer_terms(text: object) -> tuple[frozenset[str], bool]:
     found: set[str] = set()
+    monthly = False
     for sentence in split_sentences(_tail(text)):
         for clause in _clauses(sentence):
+            clause = _NO_COST.sub("zero-cost", clause)
             term = next(
                 (
                     match
@@ -2660,6 +2692,7 @@ def offer_terms_in(text: object) -> frozenset[str]:
                 and _offered_statement(clause, term.start())
             ):
                 found.add(TERM_INSTALMENTS)
+                monthly = monthly or _MONTHLY_TERM.search(clause) is not None
             extra = _FREE_EXTRA_TERM.search(clause)
             if (
                 extra is not None
@@ -2669,7 +2702,7 @@ def offer_terms_in(text: object) -> frozenset[str]:
                 and _offered_statement(clause, extra.start())
             ):
                 found.add(TERM_FREE_EXTRA)
-    return frozenset(found)
+    return frozenset(found), monthly
 
 
 # SWEEP-13 (flag R1_OFFER_REALISM): a price far below anything she expected, or the course for
@@ -2691,32 +2724,56 @@ _FRAMED_SMALL_PRICE = re.compile(
     re.IGNORECASE,
 )
 _NOT_A_COURSE_PRICE = re.compile(
-    r"\b(?:a|per|each|every|/)\s?(?:month|week)\b|\bmonthly\b|\bweekly\b|^\s*(?:off|discount)\b"
+    r"\b(?:a|per|each|every|/)\s?(?:month|week|day)\b|\bmonthly\b|\bweekly\b|\bdaily\b"
+    r"|^\s*(?:off|discount)\b"
     r"|\b(?:deposit|booking|registration|token|application|emis?|instal+ments?|upfront|down)\b",
     re.IGNORECASE,
 )
+# Review S2R-2: the figure right after a framed price is no course price when it is a difference
+# ("$500 less", "$500 more for the premium track", "$500 lower than the last batch") or the head of
+# a bigger number ("$9 thousand", "$8.5 thousand", which ``canonical_amounts`` writes "$8 $1000").
+_NOT_A_PRICE_TAIL = re.compile(
+    r"^\s*(?:less|more|lower|higher|cheaper|dearer|extra|off|discount|thousand|grand|hundred|"
+    r"lakhs?|lacs?|k\b)|^\s*(?:\.\d|\$\s?\d|\d)",
+    re.IGNORECASE,
+)
+# The course itself for free.  Review S2R-2 and S2R-3: a bare "it is free", "it for free" or "free
+# of charge" is nearly always something else (a recording to rewatch, a masterclass, the placement
+# support), so "is free", "for free" and "free of cost / charge" need the course or programme as
+# their subject; "it" counts only as the object of an offering verb ("give it to you for free", "you
+# can have it free").  "won't pay anything" is a free course only at the end of its clause: never
+# "until you're placed", "upfront", "today", "extra for the mentors" or "more than $6,000".
 _FREE_COURSE = re.compile(
     r"\b(?:give|gives|giving|gave|let you have|provide|providing|offer|offering)\s(?:you\s)?"
     + _COURSE_OBJECT
     + r"\s(?:to you\s)?(?:for\s)?(?:free|at no cost)\b"
     r"|\b(?:have|get) it (?:for )?free\b"
-    r"|\b(?:course|program(?:me)?|it|this) for free\b"
-    r"|\b(?:course|program(?:me)?|it) (?:is|will be|would be|can be|could be) (?:completely |"
-    r"totally |entirely )?free\b"
-    r"|\bfree of (?:cost|charge)\b"
-    r"|\b(?:won'?t|will not|wouldn'?t|don'?t) (?:have to |need to )?pay anything\b",
+    r"|\b(?:course|program(?:me)?) for free\b"
+    r"|\b(?:course|program(?:me)?) (?:is|will be|would be|can be|could be) (?:completely |"
+    r"totally |entirely )?(?:free|at no cost)\b"
+    r"|\b(?:course|program(?:me)?) (?:(?:is|will be|would be|comes) )?(?:completely |totally |"
+    r"entirely )?free of (?:cost|charge)\b"
+    r"|\b(?:won'?t|will not|wouldn'?t|don'?t) (?:have to |need to )?pay anything"
+    r"(?= at all\b| for (?:it|this|that|the (?:whole |entire |full )?(?:course|program(?:me)?))\b"
+    r"|\s*(?:[.,;!]|$))",
     re.IGNORECASE,
 )
 _FREE_TAIL_EXTRA = re.compile(
     r"^\s*(?:of charge\s)?(?:(?:for|in|during) (?:a |the )?(?:first |initial )?"
     r"(?:(?:\d+|one|two|three|seven|fourteen|thirty)[ -])?(?:days?|weeks?|months?|class(?:es)?|"
     r"sessions?|trials?)\b|(?:trials?|months?|weeks?|days?|sessions?|class(?:es)?|demos?|"
-    r"webinars?|access|modules?|content|resources)\b)",
+    r"webinars?|access|modules?|content|resources)\b|to\s\w)",
     re.IGNORECASE,
 )
 _FREE_ELSEWHERE = re.compile(
     r"\bfree (?:content|stuff|courses|videos|time|material)\b|\bare you free\b|\bfeel free\b"
-    r"|\bfor free on\b|\bfree online\b",
+    r"|\bfor free on\b|\bfree online\b|\b(?:youtube|coursera|udemy|edx)\b",
+    re.IGNORECASE,
+)
+# A free part of the offer said in the same sentence ("you won't pay anything, the first month is
+# on us"): that is a free extra (``offer_terms_in``), not the whole course for free.
+_FREE_PART = re.compile(
+    r"\b(?:first|one|a) (?:month|week)\b|\btrial\b|\bdemo\b",
     re.IGNORECASE,
 )
 
@@ -2735,8 +2792,15 @@ def implausible_offer_in(
     low = [net for net in nets if net <= IMPLAUSIBLE_NET_USD]
     if low:
         return IMPLAUSIBLE_LOW, min(low)
-    canonical = canonical_amounts(tail)
-    for sentence in split_sentences(canonical):
+    for raw in split_sentences(tail):
+        # Review S2R-2: a sentence whose net price is read above the far-below line ("The fee is
+        # $500 less if you pay before Friday" is $8,500) is an ordinary offer: its "$500" is no
+        # framed price, and nothing in it is the course for free.
+        if any(
+            net > IMPLAUSIBLE_NET_USD for net, _conditional in parse_price_offers(raw, own_amounts)
+        ):
+            continue
+        sentence = canonical_amounts(raw)
         lowered = sentence.lower()
         if _INQUIRY.search(lowered):
             continue
@@ -2744,8 +2808,11 @@ def implausible_offer_in(
             value = int(match.group(1) or match.group(2))
             after = lowered[match.end() : match.end() + 40]
             before = lowered[max(0, match.start() - 60) : match.start()]
-            if value <= 0 or _NOT_A_COURSE_PRICE.search(after) or _NOT_A_COURSE_PRICE.search(
-                before
+            if (
+                value <= 0
+                or _NOT_A_PRICE_TAIL.match(after)
+                or _NOT_A_COURSE_PRICE.search(after)
+                or _NOT_A_COURSE_PRICE.search(before)
             ):
                 continue
             if negated_before(lowered, match.start()) or _third_party_seller(
@@ -2758,7 +2825,10 @@ def implausible_offer_in(
         for match in _FREE_COURSE.finditer(lowered):
             if _FREE_TAIL_EXTRA.match(lowered[match.end() :]):
                 continue
-            if "pay anything" not in match.group(0) and negated_before(lowered, match.start()):
+            pays = "pay anything" in match.group(0)
+            if pays and _FREE_PART.search(lowered):
+                continue
+            if not pays and negated_before(lowered, match.start()):
                 continue
             return IMPLAUSIBLE_FREE, None
     return None

@@ -2423,6 +2423,53 @@ class OfferTermsReaderTests(unittest.TestCase):
             frozenset({"instalments"}),
         )
 
+    def test_the_wider_free_extra_and_no_cost_emi_are_read(self):
+        """Review S2R-10: a free-month offer, a free extra with words between "free"
+        and the noun, the thing named first, and "no-cost EMI" (no negation)."""
+        for text, expected in (
+            (
+                "Join this week and we'll give you full access free for a month before you choose.",
+                {"free_extra"},
+            ),
+            ("You can try it free for a month.", {"free_extra"}),
+            ("I'll throw in a free mock interview session.", {"free_extra"}),
+            ("You get the recordings for free.", {"free_extra"}),
+            ("We offer no-cost EMI.", {"instalments"}),
+            ("You can take a no cost EMI.", {"instalments"}),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(set(neg.offer_terms_in(text)), expected)
+        for text in (
+            "There is a free mock interview session on Coursera.",
+            "You get free time on weekends.",
+            "Last year we had a no-cost EMI.",
+            "Would you like to try it free?",
+            "Students can try it free on Udemy.",
+            "If you miss a class you can rewatch it for free.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset())
+
+    def test_only_a_monthly_plan_is_read_as_monthly(self):
+        """Review S2R-8: two halves, or half now and half later, are instalments but not monthly
+        ones, so the note never asks what they come to each month."""
+        for text in (
+            "You can split the payment into two halves.",
+            "We have a payment plan, half now and half in two months.",
+            "You can pay in instalments.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset({"instalments"}))
+                self.assertFalse(neg.instalments_are_monthly(text))
+        for text in (
+            "I can do $8,000 and you can pay it in monthly EMI.",
+            "We've tied up with banks for EMI over 6 to 24 months.",
+            "You can pay in three or six monthly instalments.",
+            "We offer no-cost EMI.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.instalments_are_monthly(text))
+
     def test_the_corpus_hits_are_the_reviewed_ones(self):
         """The hits were read by hand (M032 S2): each tells her that paying over time is open to
         her (EMI, instalments, monthly payments, a payment plan on offer).  A change that moves
@@ -2448,8 +2495,10 @@ class OfferTermsReaderTests(unittest.TestCase):
 
 
 # 71 instalment hits, read by hand: 70 say paying over time is open to her; one (an e-mail that
-# "has the payment plan") is borderline.  Precision about 0.99 (SWEEP-5 asks at least 0.98).
-PINNED_TERM_HITS = {"instalments": 71, "free_extra": 0}
+# "has the payment plan") is borderline.  Precision about 0.99 (SWEEP-5 asks at least 0.98).  The
+# one free-extra hit (review S2R-10, words between "free" and the noun) was read by hand too: the
+# advisor offers a free counselling session with the course.
+PINNED_TERM_HITS = {"instalments": 71, "free_extra": 1}
 
 
 class ImplausibleOfferReaderTests(unittest.TestCase):
@@ -2488,6 +2537,43 @@ class ImplausibleOfferReaderTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(neg.implausible_offer_in(text))
+
+    def test_ordinary_sales_phrasing_is_neither_free_nor_far_below(self):
+        """Review S2R-2 and S2R-3: a payment term, a free extra or a difference in price is not
+        the course for free or a $500 course."""
+        for text in (
+            "You don't have to pay anything upfront, the EMI starts next month.",
+            "You won't need to pay anything today.",
+            "You don't need to pay anything extra for the mentorship.",
+            "You won't have to pay anything until you're placed.",
+            "You won't need to pay anything extra for the mentors.",
+            "You won't pay anything more than $6,000.",
+            "It is free to attend the demo class.",
+            "It is free to cancel within seven days.",
+            "The webinar is free of cost.",
+            "The placement support is free of charge.",
+            "If you miss a class you can rewatch it for free.",
+            "There is a masterclass on Saturday, and it is free.",
+            "Try the first module, it is free.",
+            "The fee is $500 less if you pay before Friday.",
+            "The cost is $500 more for the premium track.",
+            "The price is $500 lower than the last batch.",
+            "The price is $9 thousand.",
+            "The cost is $8.5 thousand.",
+            "The price is just $25 a day.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.implausible_offer_in(text))
+        for text, expected in (
+            ("You won't have to pay anything.", ("free", None)),
+            ("You won't have to pay anything for the course.", ("free", None)),
+            ("The whole course is free of charge for you.", ("free", None)),
+            ("If I give it to you free, will you take it?", ("free", None)),
+            ("I can give you a price of $500.", ("low", 500)),
+            ("The actual cost is $100.", ("low", 100)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.implausible_offer_in(text), expected)
 
     def test_the_corpus_hits_are_the_reviewed_far_below_prices(self):
         found = sorted(
