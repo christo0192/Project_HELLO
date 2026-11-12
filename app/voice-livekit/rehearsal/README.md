@@ -140,11 +140,56 @@ means a live sweep of 20 or more calls with every applicable gate measured and m
 6. `final_price_asked_twice` is a hard fail: the learner asking "is that the final price?" twice
    within three exchanges (the pleased anchor and the met counter used to).
 
+## Whole interviews (`--full`, M032 S8)
+
+```
+python -m rehearsal --full --offline --out <dir>                                  # every default scenario, scripted
+python -m rehearsal --full --scenarios manual-replay --out <dir> --budget-usd 2   # live: the 10 manual replays
+python -m rehearsal --full --scenarios manual-M01 --out <dir> --budget-usd 0.50   # one live smoke call
+```
+
+One call runs the WHOLE interview, OPENING to CLOSING, through the production phase driver
+(`R1Interview.run`): L-OPEN, the icebreaker and its exit, the brief, "ready" or the button, the
+role-play, the exit, the wrap-up and L-CLOSE.
+
+* CLOCK (`vloop.py`): a virtual-time event loop. The driver's silence windows and caps take no real
+  time (a 25-minute interview runs in about a second offline); a production model call (Christy, the
+  learner, the shadow judge, the end-intent classifier) takes its real seconds on the clock; a harness
+  call (the simulated candidate, the rubric judge) stands the clock still. S is the interview clock, R
+  the role-play clock, both read from the session's own phase machine.
+* SDK SIDE (`sim.py`): scripted lines play for their words at the voice's pace; a candidate turn is
+  `user_state_changed`, the STT finals, the endpoint, `on_user_turn_completed`, the reply through
+  `llm_node`; the "I'm ready" button is the server-sent `data_received` packet the API relays
+  (`TestReadyButton`). Not emulated: barge-in, VAD fragments, the acknowledgement hold, TTS audio.
+* CANDIDATE (`candidate.py`): one person through the whole interview, phase-aware: a job candidate to
+  Christy (icebreaker answers, brief questions, "ready", wrap-up questions), the Program Advisor to the
+  learner (`advisor.py` behaviours), and out of role when Christy steps in (an end question, the offer
+  to wrap up). Live, DeepSeek plays it; offline, scripted banks.
+* SCENARIOS (`scenarios.py`, `manual.py`): the synthetic edge scenarios (strong, average,
+  terse-nervous, brief-repair, button-mid-brief, roleplay-question, icebreaker-skip, early-end,
+  early-end-late, abuse-once, price-dodge, price-never, pushy-discounter, wrapup-question, wrapup-none,
+  silent) and the owner's manual tests (`scenarios/manual_tests.json`, paraphrased, the candidate is
+  "Alex"): `manual-M01`..`manual-M10` replay a session's moves in order (live, DeepSeek rewords each
+  move to fit what was said; offline, the paraphrase), `manual-mix` samples the catalogue. Groups:
+  `default` (all of them), `manual-replay`, `manual`, `synthetic`, `early`, `price`, `wrapup`.
+* CHECKS (`full_metrics.py`): phase order, the close, the icebreaker exit window, the role-play start
+  only on "ready" or the button, the transition ceiling, no in-role exit before R 14:00 without
+  agreement, the end-request consent, the abuse path (feature-detected), brief repair, the wrap-up
+  answered, the hiring team named once, Christy's repeats, one goodbye, no learner after the exit,
+  dead air. Optional M032 behaviours are feature-detected (`session_facts.start_by`, an abuse path, any
+  extra `*_runner` seam of `R1Interview`), so the same harness runs on main and on the M032 branch.
+
+Files: `calls/<id>.json` (rows in the export schema with `phase`, `speaker`, `voice`, `ai_voice`,
+`text`, the timing columns, S and R, the candidate's ground-truth `act` and the library `intent`; the
+role-play exchanges; the events; the phase trace; the administration log and rows; `session_facts`;
+the per-phase checks), `transcripts/<id>.txt` (one line per turn: S, R, phase, speaker, text),
+`results.jsonl`, `scorecard.md` / `scorecard.json` (the per-phase checks and the role-play gates) and
+`run.json`. Offline is never "ready for an owner test".
+
 ## Not measured here
 
-STT fragmentation and end-of-turn detection, TTS and first-audio latency, the interviewer phases (dead
-air, double goodbye, the name fallback, the wrap-up wording: `metrics.interviewer_metrics` runs on real
-exports and on a full-flow tier that does not exist yet), the scenario card and the live UI.
+STT fragmentation and end-of-turn detection, barge-in, TTS and first-audio latency, the scenario card
+and the live UI.
 
 ## Drift risks
 

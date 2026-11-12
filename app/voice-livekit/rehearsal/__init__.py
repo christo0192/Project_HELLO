@@ -19,6 +19,10 @@ What it does, call by call:
 * deterministic metrics (``metrics``) and an LLM rubric judge (``judge``) score each call, and
   ``scorecard`` aggregates them against pass thresholds.
 
+``python -m rehearsal --full`` runs WHOLE interviews instead (``full`` / ``full_run``, M032 S8):
+OPENING to CLOSING through ``R1Interview.run`` on a virtual clock (``vloop``), with a phase-aware
+candidate (``candidate``) and the named scenarios, the owner's manual tests among them (``manual``).
+
 This package is NOT named ``r1_*``, is not copied into the worker image and never runs in CI
 against the network.  Its unit tests (``tests/test_r1_rehearsal_*.py``) are offline.  The
 API key (``DEEPSEEK_API_KEY`` in ``app/api/.env``) is read into an in-memory dict only; it is
