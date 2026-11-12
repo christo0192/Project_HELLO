@@ -10119,6 +10119,26 @@ class Sweep17EngineTests(unittest.TestCase):
         self.assertTrue(any(hit.category == r1_guard.COURSE_FACT for hit in result.hits))
         self.assertEqual(s.eng.admin_log()["probe_first"]["course_fact_unsaid_count"], 1)
 
+    def test_her_own_life_duration_reveals_the_deep_need(self):
+        # Review S2P-R1: a paraphrased H1 reveal with an uncontracted "It is ... until" frame was
+        # dropped as a course length, the emptied reply became a length probe and H1 was never
+        # revealed.  Synthetic lines, p2 and p4.
+        for persona_id, line in (
+            ("p4_research_scholar", "It is about eight months until my funding ends."),
+            ("p4_research_scholar", "Eight months is a lot less time than it sounds, that's when my funding ends."),
+            ("p2_recent_grad", "It will be six months before my contract renewal is decided."),
+        ):
+            with self.subTest(persona=persona_id, line=line):
+                eng = engine(persona=resolve_persona(persona_id, variant="v1"))
+                s = Session(eng, reply="Things at work feel a bit uncertain right now.")
+                s.say(H1_PROBE, 20)
+                s.reply = line
+                s.say(FOLLOWUP, 40)
+                self.assertEqual(s.spoken[-1], line)
+                self.assertNotIn(s.spoken[-1], LENGTH_PROBES)
+                self.assertEqual(eng.ledger.counts.get(r1_guard.COURSE_FACT, 0), 0)
+                self.assertEqual(eng.tracker.gate.state("H1"), r1_roleplay.NeedState.REVEALED)
+
     def test_a_figure_challenge_gets_the_mix_up_note(self):
         s = Session(engine())
         s.say(OPENER, 20)

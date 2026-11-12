@@ -2756,12 +2756,75 @@ class ProbeFirstGuardTests(unittest.TestCase):
         intent = self.on(quiet_empty=True)
         self.assertEqual(guard_text("I'm not sure I could keep up for six months.", intent).text, "")
 
+    # Review S2P-R1 (correctness): her own life's durations, paraphrased the way a model says them
+    # (uncontracted "It is ... until", "It will be ... before", "N months is a lot ... that's when"),
+    # are the deep-need reveals of p2, p3 and p4, never a course length.
+    OWN_LIFE = {
+        "p2_recent_grad": (
+            "It is about six months until my contract renewal is decided.",
+            "It will be six months before my contract renewal is decided.",
+            "Six months is not long, and that's when my contract renewal is decided.",
+            "Six months is all I have before the renewal decision.",
+        ),
+        "p3_data_analyst": (
+            "It is six to eight months until the next opening.",
+            "It will be six to eight months before the next opening.",
+        ),
+        "p4_research_scholar": (
+            "It is about eight months until my funding ends.",
+            "It will be eight months before my funding runs out.",
+            "Eight months is a lot less time than it sounds, that's when my funding ends.",
+        ),
+    }
+    OWN_LIFE_ANY = (
+        "It will take me two weeks to decide.",
+        "It will be twelve months before my visa comes through.",
+    )
+    # The same frames about the course still trip, for every persona.
+    COURSE_STILL_HITS = (
+        "It will take six months of evenings and weekends for me.",
+        "It would take six months before I could switch.",
+        "It is six months, which is a lot for me.",
+        "Six months is a long time with my job.",
+    )
+
+    def test_her_own_life_durations_pass_in_every_frame(self):
+        for persona_id, lines in self.OWN_LIFE.items():
+            persona = resolve_persona(persona_id, variant="v1")
+            context = self.on(persona=persona, released_topics=frozenset({"H1", "H2", "H3"}))
+            for sentence in (*lines, *self.OWN_LIFE_ANY):
+                with self.subTest(persona=persona_id, sentence=sentence):
+                    self.assertEqual(check_sentence(sentence, context), [])
+                    self.assertFalse(r1_guard.course_length_unsaid(sentence, persona=persona))
+        for sentence in self.OWN_LIFE_ANY:
+            self.assertFalse(r1_guard.course_length_unsaid(sentence))
+        for persona_id in self.OWN_LIFE:
+            persona = resolve_persona(persona_id, variant="v1")
+            for sentence in self.COURSE_STILL_HITS:
+                with self.subTest(persona=persona_id, sentence=sentence):
+                    self.assertTrue(r1_guard.course_length_unsaid(sentence, persona=persona))
+
+    def test_two_modifiers_before_long_still_trip_the_length_frame(self):
+        # Review S2P-R8 (naturalness): "a really long", "quite a long" got through.
+        for sentence in (
+            "Honestly, six months feels like a really long commitment for someone like me.",
+            "Six months is quite a long time.",
+            "Six months sounds like a very big commitment.",
+            "Six months is so very long.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertTrue(r1_guard.course_length_unsaid(sentence))
+                hits = check_sentence(sentence, self.on())
+                self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+
     def test_the_readers_are_fast_on_hostile_text(self):
         import time
 
         hostile = "keep up " + "for six months " * 400 + "course " * 400
+        hostile += " six months is " + "really quite a " * 300 + " it is " * 300 + "until my " * 300
         start = time.perf_counter()
         r1_guard.course_length_unsaid(hostile)
+        r1_guard.course_length_unsaid(hostile, persona=resolve_persona("p4_research_scholar"))
         r1_guard.durations_said(hostile)
         self.assertLess(time.perf_counter() - start, 2.0)
 

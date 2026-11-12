@@ -773,11 +773,12 @@ def _duration_known(value: float, known: frozenset[float]) -> bool:
 
 
 # SWEEP-17 item 5: the frames in which a learner sentence states a course length ("keep up for six
-# months", "it runs for six months", "six months is a long commitment", "the data science course,
-# roughly six months", "a six-month program").  Her own life's durations are not in them:
-# "my contract renewal is decided in about six months", "I quit a free course after three
-# weeks", "I've been applying for about three months" (only the "for N months" frame with a
-# course word could reach those, and it skips a sentence about her past or her own plans).
+# months", "the course runs for six months", "the data science course, roughly six months", "a
+# six-month program"), and two that may carry either kind of duration (``_AMBIGUOUS_LENGTH_FRAMES``).
+# Her own life's durations reach no frame in the persona's own words ("my contract renewal is
+# decided in about six months", "I quit a free course after three weeks", "I've been applying for
+# about three months"); the "for N months" frame with a course word skips a sentence about her past
+# or her own plans (``_OWN_LIFE``).
 _DUR_RE = (
     r"(?:(?:\d{1,2}(?:\.\d)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
     r"fifteen|sixteen|eighteen|twenty[- ]four|twenty)[\s-]+(?:months?|weeks?)\b|half a year\b)"
@@ -790,13 +791,8 @@ _COURSE_LENGTH_FRAMES = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:course|program(?:me)?|class(?:es)?|bootcamp|it)\s+(?:is|runs?|takes?|lasts?|goes on|"
+        r"\b(?:course|program(?:me)?|class(?:es)?|bootcamp)\s+(?:is|runs?|takes?|lasts?|goes on|"
         r"would (?:take|run|last|be)|will (?:take|run|last|be))\b[^.?!]{0,25}?" + _DUR_RE,
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:^|[^\w])" + _DUR_RE + r"\s+(?:is|feels|sounds|seems|would be)\s+(?:like\s+)?"
-        r"(?:a\s+|really\s+|quite\s+|pretty\s+|so\s+)?(?:long|a lot|lot|too long|forever|big)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -811,6 +807,36 @@ _COURSE_LENGTH_FRAMES = (
         re.IGNORECASE,
     ),
 )
+# Review S2P-R1: an "it" subject ("it will take six months") and "N months is a lot / feels like a
+# really long ..." (review S2P-R8: up to two modifiers before "long") state a course length, but
+# a model also says her own life's durations that way: "It is about eight months until my funding
+# ends", "It will be six months before my contract renewal is decided", "Eight months is a lot
+# less time than it sounds, that's when my funding ends", "It will take me two weeks to decide".
+# These two frames skip a sentence about her own timeline (``_own_life_duration``).
+_AMBIGUOUS_LENGTH_FRAMES = (
+    re.compile(
+        r"\bit\s+(?:is|runs?|takes?|lasts?|goes on|would (?:take|run|last|be)|"
+        r"will (?:take|run|last|be))\b[^.?!]{0,25}?" + _DUR_RE,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^|[^\w])" + _DUR_RE + r"\s+(?:is|feels|sounds|seems|would be)\s+(?:like\s+)?"
+        r"(?:(?:a|really|quite|pretty|so|very)\s+){0,2}(?:long|a lot|lot|too long|forever|big)\b",
+        re.IGNORECASE,
+    ),
+)
+# Her own timeline: a duration counted up to her own event ("until my funding ends", "before my
+# contract renewal", "that's when my funding ends"; never "before I could switch", which is the
+# course's length again), or the time she needs to decide ("it will take me two weeks to decide").
+_OWN_LIFE_TIME = re.compile(
+    r"\b(?:until|till|before|by the time|that'?s when|that is when|which is when)\s+(?:my|our)\b",
+    re.IGNORECASE,
+)
+_OWN_LIFE_DECIDE = re.compile(
+    r"\btake me\b[^.?!]{0,30}?\bto (?:decide|think|sort|talk|figure|make up my mind|save|discuss|"
+    r"check|get back)\b",
+    re.IGNORECASE,
+)
 _FOR_DURATION = re.compile(r"\b(?:for|over)\s+" + _APPROX + _DUR_RE, re.IGNORECASE)
 _COURSE_WORD = re.compile(
     r"\b(?:course|program(?:me)?|class(?:es)?|bootcamp|studying|study|learning)\b", re.IGNORECASE
@@ -823,15 +849,38 @@ _OWN_LIFE = re.compile(
 )
 
 
-def course_length_unsaid(sentence: object, known: frozenset[float] = frozenset()) -> bool:
+def _own_life_duration(folded: str, persona: RenderedPersona | None) -> bool:
+    """``folded`` counts a duration on her own timeline (review S2P-R1): up to her own event, the
+    time she needs to decide, or a "why now" event of the session's persona (her H1 deep need's
+    markers: p2's contract renewal, p3's next opening, p4's funding), read with every duration
+    masked so a persona marker that is itself a duration ("eight months") exempts nothing."""
+    if _OWN_LIFE_TIME.search(folded) or _OWN_LIFE_DECIDE.search(folded):
+        return True
+    if persona is None:
+        return False
+    masked = _DURATION.sub(" ", folded)
+    return any(pattern.search(masked) for pattern in persona.markers("H1"))
+
+
+def course_length_unsaid(
+    sentence: object,
+    known: frozenset[float] = frozenset(),
+    *,
+    persona: RenderedPersona | None = None,
+) -> bool:
     """``sentence`` states a course length that is not one of the ``known`` (advisor) durations.
 
     M032 SWEEP-17 item 5: the product-statement form and the course-length frames above; a question
     is no exemption ("I can't keep up for six months, can I?").  Every figure in a matched frame
-    must be known for the sentence to pass.
+    must be known for the sentence to pass.  ``persona`` (the session's): her own timeline's
+    durations pass the ambiguous frames (review S2P-R1).
     """
     folded = fold(sentence)
     spans = [match.group(0) for frame in _COURSE_LENGTH_FRAMES for match in frame.finditer(folded)]
+    if not _own_life_duration(folded, persona):
+        spans.extend(
+            match.group(0) for frame in _AMBIGUOUS_LENGTH_FRAMES for match in frame.finditer(folded)
+        )
     if _COURSE_WORD.search(folded) and not _OWN_LIFE.search(folded):
         spans.extend(match.group(0) for match in _FOR_DURATION.finditer(folded))
     for span in spans:
@@ -1352,7 +1401,7 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         # SWEEP-17 item 5: a course-length frame ("keep up for six months"; questions too).
         length_unsaid = not any(
             hit.rule == "product_statement" for hit in hits
-        ) and course_length_unsaid(sentence, ctx.advisor_durations)
+        ) and course_length_unsaid(sentence, ctx.advisor_durations, persona=persona)
     if length_unsaid:
         hits.append(_hit(COURSE_FACT, "course_length_unsaid", sentence))
     if _HOURS_A_WEEK.search(sentence) and not question and not _hours_are_advisors(sentence, ctx):

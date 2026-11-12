@@ -3692,7 +3692,9 @@ class RolePlayEngine:
         amounts = set(dollar_amounts(canonical_amounts(spoken)))
         if any(amount not in self._advisor_amounts and amount not in own for amount in amounts):
             return True
-        return course_length_unsaid(spoken, frozenset(self._advisor_months))
+        return course_length_unsaid(
+            spoken, frozenset(self._advisor_months), persona=self.persona
+        )
 
     # ------------------------------------------------------------------- intents
     def _fallback_order(
