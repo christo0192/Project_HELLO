@@ -266,6 +266,27 @@ TIC_PATTERNS = {
     TIC_HMM: re.compile(r"(?<![a-z-])hmm+\b|(?<![a-z-])hm\b", re.IGNORECASE),
     TIC_HONESTLY: re.compile(r"\b(?:honestly|to be honest|frankly)\b", re.IGNORECASE),
 }
+# M032 SWEEP-12 (flag R1_TIC_V2, read by the engine): "I'll be honest, ..." and "if I'm honest" are
+# the honesty tic too, but only as an aside before punctuation ("I'll be honest with myself about
+# it" is the sentence itself); and three soft tics the model moved on to ("actually" in 7 of 17
+# lines of one call, "genuinely", "properly").  The soft tics are a separate guard pass, outside
+# the one-filler budget, and only in a free reply (``r1_guard``).
+TIC_ACTUALLY = "actually"
+TIC_GENUINELY = "genuinely"
+TIC_PROPERLY = "properly"
+SOFT_TICS = (TIC_ACTUALLY, TIC_GENUINELY, TIC_PROPERLY)
+TIC_PATTERNS_V2 = {
+    TIC_HMM: TIC_PATTERNS[TIC_HMM],
+    TIC_HONESTLY: re.compile(
+        r"\b(?:honestly|to be honest|frankly)\b"
+        r"|\bi(?:'ll| will) be (?:honest|frank|upfront|straight)(?:\s+with\s+you)?(?=\s*[,:;.-])"
+        r"|\bif i'?m (?:being )?honest\b(?=\s*[,:;-])",
+        re.IGNORECASE,
+    ),
+    TIC_ACTUALLY: re.compile(r"\bactually\b", re.IGNORECASE),
+    TIC_GENUINELY: re.compile(r"\bgenuinely\b", re.IGNORECASE),
+    TIC_PROPERLY: re.compile(r"\bproper(?:ly)?\b", re.IGNORECASE),
+}
 _FIRST_WORD = re.compile(r"[a-z]+")
 
 
@@ -275,10 +296,14 @@ def reply_opener(text: object) -> str:
     return words[0] if words else ""
 
 
-def reply_tics(text: object) -> tuple[str, ...]:
-    """The tic words ("hmm", "honestly") that ``text`` contains, in a fixed order."""
+def reply_tics(text: object, *, v2: bool = False) -> tuple[str, ...]:
+    """The tic words ("hmm", "honestly") that ``text`` contains, in a fixed order.
+
+    ``v2`` (SWEEP-12) reads the wider honesty forms and the soft tics as well.
+    """
     folded = fold(text)
-    return tuple(tic for tic, pattern in TIC_PATTERNS.items() if pattern.search(folded))
+    patterns = TIC_PATTERNS_V2 if v2 else TIC_PATTERNS
+    return tuple(tic for tic, pattern in patterns.items() if pattern.search(folded))
 
 
 # ----------------------------------------------------------------------------------
@@ -406,6 +431,9 @@ CONCERN_PRESSURE = "pressure"
 CONCERN_OFFENDED = "offended"
 CONCERN_THINK_OVER = "think_over"
 CONCERN_TRUST = "trust"
+# M032 SWEEP-3: the not-today stall (``not_deciding``), recorded by the engine while the flag
+# R1_NO_COMMIT_LEDGER is on; it is not one of ``concern_themes``.
+CONCERN_NOT_TODAY = "not_today"
 
 
 def _concern(pattern: str) -> re.Pattern[str]:
@@ -504,6 +532,179 @@ def concern_themes(text: object) -> frozenset[str]:
 def is_closer(text: object) -> bool:
     """True when ``text`` is the learner closing the call itself (``CLOSER``)."""
     return CLOSER.search(fold(text)) is not None
+
+
+# ----------------------------------------------------------------------------------
+# M032 S2 (owner decision D-M032-4): readers of the LEARNER's own lines, for the next reply's
+# steering notes and for counts.  None of them ever trims a reply (SWEEP-4: a trimmed reply can be
+# emptied, and an emptied free reply speaks "Give me a second ...").  Every quantifier is bounded.
+# ----------------------------------------------------------------------------------
+# SWEEP-4 (fda9e9f6: 11 of 27 learner lines were a token reaction turned round with "but" or
+# "though", 8 of 27 opened by grading the advisor).  A reaction clause is short and judges or
+# acknowledges what the advisor said; a clause about her own life ("I have a good job") or a
+# negated one is not a reaction.
+ACK_HINGE_MAX_WORDS = 12
+HINGE_TAIL_WORDS = 15
+_REACTION_ADJ = (
+    r"(?:good|great|reasonable|reassuring|fair|helpful|useful|nice|encouraging|manageable|fine|"
+    r"generous|decent|interesting|tempting|better|clear|doable|sensible|positive|a relief|"
+    r"a (?:big |real )?help|a pleasant surprise)"
+)
+# On ``normalize``d text (lower case, apostrophes dropped: "that's" is "thats").
+_GRADES = re.compile(
+    r"\b(?:sounds?|seems?|looks?|feels?|is|are|was|thats|its|helps|helped)\b(?: \w+){0,2}? "
+    + _REACTION_ADJ
+    + r"\b"
+    r"|^(?:sounds?|seems?|looks?) (?:\w+ ){0,2}?" + _REACTION_ADJ + r"\b"
+    r"|\bmakes sense\b|\b(?:helps?|helped)$"
+    r"|^(?:fair enough|fair point|good to (?:hear|know)|glad to hear(?: that| it)?|nice to hear|"
+    r"great|good|perfect|nice|cool|fine)$"
+)
+_ACKNOWLEDGES = re.compile(
+    r"^(?:got it|thank you|thanks(?: \w+){0,3}|noted|understood|i see|right|okay|ok)$"
+    r"|^i (?:really |do |totally |completely )?(?:appreciate|get|understand|hear you|see)\b"
+)
+_LEAD_ACK_WORDS = frozenset(
+    "okay ok oh right yeah well alright sure great good cool fine so hmm hm ah".split()
+)
+_NEGATING_WORDS = frozenset(
+    "not never hardly no nothing none nobody neither nor dont doesnt isnt arent wasnt werent "
+    "wont cant couldnt wouldnt shouldnt didnt".split()
+)
+_FIRST_PERSON_WORDS = frozenset("i im ive id ill my me mine myself our us".split())
+_QUANTITY_PHRASE = re.compile(r"\ba (?:fair bit|good (?:chunk|amount|deal|bit)|great deal)\b")
+_HINGE_JOIN = re.compile(
+    r"(?:\s{0,3}(?:,|;|:|\s-+|\.\.\.)\s{0,3}|\s{1,3})(?:(?:honestly|frankly)\s{0,2},?\s{0,3})?"
+    r"(?:but|though|although|however)\b",
+    re.IGNORECASE,
+)
+_LEADING_TURN = re.compile(r"^\W{0,3}(?:but|though|although|however)\b", re.IGNORECASE)
+_TRAILING_THOUGH = re.compile(r"[\s,](?:though|tho)\W{0,3}$", re.IGNORECASE)
+_VERDICT_LEAD = re.compile(
+    r"^\W{0,3}(?:(?:okay|ok|oh|right|yeah|well|alright|all right|so|hmm|ah)\b[\s,.!-]{0,4}){0,3}",
+    re.IGNORECASE,
+)
+_CLAUSE_END = re.compile(
+    r"[,;:]|\s-+\s|\.\.\.|\b(?:but|though|although|however|and|so)\b", re.IGNORECASE
+)
+
+
+def _reaction_words(clause: str) -> tuple[list[str], list[str]] | None:
+    """The clause's words, and the same without its lead interjections; None when the clause is
+    too long or negated to be a reaction."""
+    words = normalize(clause).split()
+    if not words or len(words) > ACK_HINGE_MAX_WORDS:
+        return None
+    if any(word in _NEGATING_WORDS for word in words):
+        return None
+    rest = words
+    while rest and rest[0] in _LEAD_ACK_WORDS:
+        rest = rest[1:]
+    return words, rest
+
+
+def _grades(clause: str) -> bool:
+    """A short clause that judges what the advisor said ("That sounds reasonable")."""
+    read = _reaction_words(clause)
+    if read is None:
+        return False
+    words, rest = read
+    text = " ".join(words)
+    if any(word in _FIRST_PERSON_WORDS for word in words) or _QUANTITY_PHRASE.search(text):
+        return False
+    # "Good to hear" is a grade whole; "Okay, that sounds fine" once its "Okay" is off.
+    return _GRADES.search(text) is not None or (
+        bool(rest) and _GRADES.search(" ".join(rest)) is not None
+    )
+
+
+def _reacts(clause: str) -> bool:
+    """A short clause that judges or only acknowledges what the advisor said ("I get it")."""
+    read = _reaction_words(clause)
+    if read is None:
+        return False
+    _words, rest = read
+    if not rest:
+        return True  # nothing but an interjection: "Okay, but ..."
+    if _ACKNOWLEDGES.search(" ".join(rest)):
+        return True
+    return _grades(clause)
+
+
+def ack_hinge(text: object) -> bool:
+    """Her reply opens with a token reaction turned round with "but" or "though" (SWEEP-4).
+
+    "Sounds useful, but ...", "That helps. But ...", "Makes sense. I keep worrying about it
+    though.".  Not a contrast about her own life ("I've applied on my own, but nothing landed")
+    and not the conflict check ("I saw $9,000 on the website, but you're saying ten?").
+    """
+    sentences = split_sentences(text)
+    if not sentences:
+        return False
+    first = sentences[0]
+    join = _HINGE_JOIN.search(first)
+    if join is not None and join.start() > 0:
+        return _reacts(first[: join.start()])
+    if len(sentences) < 2 or not _reacts(first):
+        return False
+    second = sentences[1]
+    return _LEADING_TURN.match(second) is not None or (
+        word_count(second) <= HINGE_TAIL_WORDS and _TRAILING_THOUGH.search(second) is not None
+    )
+
+
+def reply_verdict(text: object) -> bool:
+    """Her reply's first sentence opens by grading the advisor ("Fair enough.", "That sounds
+    reasonable.") (SWEEP-4).  A negated grade ("That's not reasonable for me"), a quantity ("a
+    fair bit more", "a good chunk of money") and a line about her own life are no verdict."""
+    sentences = split_sentences(text)
+    if not sentences or "?" in sentences[0]:
+        return False
+    first = _VERDICT_LEAD.sub("", fold(sentences[0]), count=1)
+    clause = _CLAUSE_END.split(first, maxsplit=1)[0]
+    return _grades(clause)
+
+
+_DOUBT_OPENER = re.compile(
+    r"^\W{0,3}(?:(?:okay|ok|so|well|honestly|but|and|still)\b[\s,]{0,3}){0,2}"
+    r"(?:my (?:main |biggest |only |real |one )?(?:worry|concern) (?:is|would be)|"
+    r"what (?:really |still )?worries me)\b",
+    re.IGNORECASE,
+)
+
+
+def doubt_opener(text: object) -> bool:
+    """Her reply opens "My worry is ..." / "What worries me ..." (a replacement tic, SWEEP-4)."""
+    return _DOUBT_OPENER.search(fold(text)) is not None
+
+
+# SWEEP-3: the not-today stall ("I'm not ready to commit to anything today", "I'd want to think
+# it over before deciding").  Never "pay" (a payment-capacity line is the money worry), and never a
+# sentence about time, the schedule, a batch or money ("I'm not ready to commit to six months yet",
+# "I can't commit that much time right now").
+_NOT_DECIDING = re.compile(
+    r"(?:\bnot|n't)\s{1,3}(?:(?:quite|really|yet|even)\s{1,3})?"
+    r"(?:(?:ready|going|gonna|about|able)\s{1,3})?(?:to\s{1,3})?"
+    r"(?:decid\w*|commit\w*|enrol\w*|sign(?:ing)? up|move forward|make (?:a|the|any) decision)"
+    r"[^.?!]{0,30}?\b(?:today|yet|right now|just now|on the spot|tonight)\b"
+    r"|\b(?:think (?:it|this|things) (?:over|through)|sleep on (?:it|this)|sit with (?:it|this))\b"
+    r"[^.?!]{0,30}?\bbefore (?:i |we )?(?:decid\w*|commit\w*|agree\w*|sign\w*|say(?:ing)? yes)",
+    re.IGNORECASE,
+)
+_NOT_DECIDING_EXCLUDED = re.compile(
+    r"\b(?:months?|weeks?|hours?|schedules?|weekends?|weekdays?|evenings?|keep(?:ing)? up|"
+    r"batch(?:es)?|class (?:timings?|times?)|(?:that much|this much|enough|more|the) time|"
+    r"pay\w*|money|price|fees?|cost\w*|emi|instal\w*|afford\w*|budget|dollars?)\b|\$",
+    re.IGNORECASE,
+)
+
+
+def not_deciding(text: object) -> bool:
+    """Her line says she is not deciding or committing today (SWEEP-3), sentence by sentence."""
+    for sentence in split_sentences(text):
+        if _NOT_DECIDING.search(sentence) and not _NOT_DECIDING_EXCLUDED.search(sentence):
+            return True
+    return False
 
 
 def is_hollow_turn(text: object) -> bool:

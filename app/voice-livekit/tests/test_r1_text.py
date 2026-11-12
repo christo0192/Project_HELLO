@@ -762,5 +762,160 @@ class ConcernThemeTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - start, 1.0)
 
 
+class LearnerVoiceReaderTests(unittest.TestCase):
+    """M032 S2 readers (SWEEP-3, SWEEP-4, SWEEP-12): steering and counts only, synthetic text."""
+
+    def test_ack_hinge_reads_a_token_reaction_turned_round(self):
+        from r1_text import ack_hinge
+
+        for text in (
+            "Sounds useful, but I'm unsure about cost.",
+            "That helps. But what if I can't keep up?",
+            "Makes sense. I keep hearing about layoffs though.",
+            "Good to hear, though I'm still unsure about the time.",
+            "Okay, but what about the cost?",
+            "I appreciate that, but it's still a lot for me.",
+            "The projects sound genuinely useful. But how much time would they take?",
+            "That's a generous offer, but I'd need to think.",
+            "Weekend classes sound manageable, but my lab runs late.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(ack_hinge(text))
+
+    def test_ack_hinge_leaves_her_own_contrasts_and_the_conflict_check_alone(self):
+        from r1_text import ack_hinge
+
+        for text in (
+            "I've applied on my own, but nothing's landed yet.",
+            "I saw $9,000 on the website, but you're saying ten?",
+            "I have a good job, but my hours are long.",
+            "That's not reasonable, but I understand why.",
+            "My days are packed. I'm not sure I could keep up.",
+            "What would I build in the course?",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(ack_hinge(text))
+
+    def test_reply_verdict_reads_a_judgement_of_their_answer(self):
+        from r1_text import reply_verdict
+
+        for text in (
+            "Fair enough.",
+            "Okay, that sounds reasonable.",
+            "Weekend classes sound manageable, but my lab runs late.",
+            "That's a generous offer.",
+            "Good to hear. What about the hours?",
+            "Having the recordings helps.",
+            "That makes sense.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(reply_verdict(text))
+
+    def test_reply_verdict_rejects_negated_and_quantity_forms(self):
+        from r1_text import reply_verdict
+
+        for text in (
+            "That's really not reasonable for me.",
+            "Nothing about this is reassuring.",
+            "None of that is helpful to me right now.",
+            "I do not think it is manageable with my job.",
+            "That's a fair bit more than I planned for.",
+            "It's a good chunk of money for me.",
+            "That's a great deal of money.",
+            "My schedule is packed most weeks.",
+            "How many hours a week would it take?",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(reply_verdict(text))
+
+    def test_doubt_opener_reads_the_replacement_tic(self):
+        from r1_text import doubt_opener
+
+        self.assertTrue(doubt_opener("My worry is the time it takes."))
+        self.assertTrue(doubt_opener("What worries me is falling behind."))
+        self.assertTrue(doubt_opener("So my main concern is the cost."))
+        self.assertFalse(doubt_opener("I worry a bit about the time."))
+        self.assertFalse(doubt_opener("Is that a worry for most people?"))
+
+    def test_not_deciding_reads_the_not_today_stall(self):
+        from r1_text import not_deciding
+
+        for text in (
+            "I'm not ready to commit to anything today.",
+            "I'd rather not commit to enrolling today.",
+            "I'd want to think it over before deciding anything.",
+            "I can\u2019t commit right now.",
+            "I can't commit right now.",
+            "I'm not going to decide today.",
+            "Good to hear. I'm not ready to commit to anything today, though.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(not_deciding(text))
+
+    def test_not_deciding_leaves_capacity_money_and_plans_alone(self):
+        from r1_text import not_deciding
+
+        for text in (
+            "I can't pay it all at once right now",
+            "I'm not ready to commit to six months yet",
+            "I'm not going to commit to anything I can't keep up with",
+            "I'd rather not enrol in the weekend batch yet, my weekends are packed",
+            "I'd put in the effort if I commit",
+            "Once I'm ready to decide, I'll call you",
+            "I can't commit that much time right now.",
+            "I can't commit to ten hours a week yet.",
+            "I'm not ready to commit the money right now.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(not_deciding(text))
+
+    def test_the_v2_tics_read_the_honest_clause_and_the_soft_tics(self):
+        from r1_text import (
+            TIC_ACTUALLY,
+            TIC_GENUINELY,
+            TIC_HONESTLY,
+            TIC_PROPERLY,
+            reply_tics,
+        )
+
+        self.assertIn(TIC_HONESTLY, reply_tics("I'll be honest, the fee worries me.", v2=True))
+        self.assertIn(TIC_HONESTLY, reply_tics("If I'm honest, it's a lot.", v2=True))
+        self.assertNotIn(
+            TIC_HONESTLY, reply_tics("I'll be honest with myself about it.", v2=True)
+        )
+        self.assertNotIn(TIC_HONESTLY, reply_tics("I'll be honest, the fee worries me."))
+        tics = reply_tics(
+            "What would I actually work on, genuinely? I'd think it through properly.", v2=True
+        )
+        self.assertEqual(tics[-3:], (TIC_ACTUALLY, TIC_GENUINELY, TIC_PROPERLY))
+        # Flag off: the release before (hmm and honestly only).
+        self.assertEqual(reply_tics("What would I actually work on?"), ())
+
+    def test_the_new_readers_are_linear(self):
+        import time
+
+        from r1_text import ack_hinge, doubt_opener, not_deciding, reply_tics, reply_verdict
+
+        start = time.perf_counter()
+        for text in (
+            "a" * 50000,
+            "not " * 12000,
+            "sounds good, " * 4000,
+            "I'm not ready to " * 3000,
+            "think it over " * 4000,
+            ", , , " * 8000,
+            "honest " * 8000,
+        ):
+            ack_hinge(text)
+            reply_verdict(text)
+            doubt_opener(text)
+            not_deciding(text)
+            reply_tics(text, v2=True)
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
