@@ -2639,5 +2639,279 @@ class NoCommitSpecTests(unittest.TestCase):
         self.assertIs(neg.no_commit_spec(timing), timing)
 
 
+class OfferReaderV2Tests(unittest.TestCase):
+    """M032 SWEEP-18 (flag R1_OFFER_READER_V2): the discount comes off the price the advisor named,
+    an explicit net wins, and the base carries over a split turn (synthetic advisor turns)."""
+
+    def v2(self, text, **kwargs):
+        return neg.parse_price_offers(text, v2=True, **kwargs)
+
+    def test_a_dollar_discount_comes_off_the_price_the_advisor_named(self):
+        self.assertEqual(self.v2("Normally it's $10,000, but I can give you $2,000 off."), [(8000, False)])
+        self.assertEqual(self.v2("The fee is $9,500. I can give you $1,000 off."), [(8500, False)])
+        # The release before: always off the list price.
+        self.assertEqual(
+            neg.parse_price_offers("Normally it's $10,000, but I can give you $2,000 off."),
+            [(7000, False)],
+        )
+
+    def test_a_net_at_or_above_the_list_price_is_a_restatement(self):
+        text = (
+            "The list price is really $12,000. You get a $3,000 discount, so for you it is $9,000."
+        )
+        self.assertEqual(self.v2(text), [])
+        unframed = "the cost you are looking at is 12000. You get a $3,000 discount."
+        self.assertNotIn(6000, [net for net, _ in self.v2(unframed)])
+
+    def test_an_explicit_net_wins_over_the_derived_one(self):
+        text = "The fee is $9,500, and I can take $1,000 off, which brings it to 8.5k."
+        self.assertEqual(self.v2(text), [(8500, False)])
+        rather = "We could do $6,000 for you rather than $12,000, a straight 50% discount."
+        self.assertEqual(self.v2(rather), [(6000, False)])
+        self.assertEqual(neg.stated_price_usd(rather, v2=True), 12000)
+        self.assertIsNone(neg.stated_price_usd(rather))
+
+    def test_a_threat_is_never_the_base(self):
+        text = "I can give you $1,000 off today. If you wait, you'll pay $13000."
+        self.assertEqual([net for net, _ in self.v2(text)], [8000])
+        self.assertIsNone(neg.stated_price_usd(text, v2=True))
+        batch = "I can give $1,000 off. If you start with a new batch, you'd have to end up paying $12000."
+        self.assertEqual([net for net, _ in self.v2(batch)], [8000])
+
+    def test_unchanged_readings(self):
+        self.assertEqual(self.v2("I can give you $1,000 off."), [(8000, False)])
+        self.assertEqual(self.v2("I can give you 10% off."), [(8100, False)])
+        self.assertEqual(self.v2("We have discounts of $500, $1000 and $1500."), [])
+        self.assertEqual(self.v2("I can do $8,500 for you."), [(8500, False)])
+
+    def test_the_stated_price_carries_over_one_advisor_turn(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "The program is $9,500.", reader_v2=True)
+        state.observe(6, "I can do $1,000 off for you.", reader_v2=True)
+        self.assertEqual(state.best_offer_usd, 8500)
+        later = neg.Negotiation("husband")
+        later.observe(5, "The program is $9,500.", reader_v2=True)
+        later.observe(6, "Okay.", reader_v2=True)
+        later.observe(7, "Sure.", reader_v2=True)
+        later.observe(8, "I can do $1,000 off for you.", reader_v2=True)
+        self.assertEqual(later.best_offer_usd, 8000)
+        before = neg.Negotiation("husband")
+        before.observe(5, "The program is $9,500.")
+        before.observe(6, "I can do $1,000 off for you.")
+        self.assertEqual(before.best_offer_usd, 8000)
+
+    def test_a_threat_figure_is_never_carried(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "If you wait, you will have to pay $13000.", reader_v2=True)
+        state.observe(6, "I can do $1,000 off for you.", reader_v2=True)
+        self.assertEqual(state.best_offer_usd, 8000)
+
+    def test_an_amount_right_after_her_price_question_needs_no_pricing_word(self):
+        asked = neg.Negotiation("husband")
+        asked.observe(5, "It's around 6000 dollars.", probed=True)
+        self.assertEqual(asked.best_offer_usd, 6000)
+        cold = neg.Negotiation("husband")
+        cold.observe(5, "It's around 6000 dollars.")
+        self.assertIsNone(cold.best_offer_usd)
+
+    def test_the_v2_readers_are_fast_on_hostile_text(self):
+        hostile = ("so for you it is " * 400) + "$9,000 " + ("brings it to " * 300)
+        start = time.perf_counter()
+        self.v2(hostile)
+        neg.stated_price_usd(hostile, v2=True)
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+    def test_the_corpus_readings_are_unchanged(self):
+        # Every labelled advisor turn that names a figure (the tuned corpus and the held-out set):
+        # v2 relabels none of them (2026-11-12: 0 changed of 2,160 turns), so best_offer_usd
+        # accuracy cannot drop.
+        figure = re.compile(r"\d|thousand|hundred|grand", re.IGNORECASE)
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                if not figure.search(entry["text"]):
+                    continue
+                after = entry["phase_hint"] != "pre_anchor"
+                readings = [
+                    neg.read_advisor_turn(entry["text"], after_anchor=after, reader_v2=v2)
+                    for v2 in (False, True)
+                ]
+                self.assertEqual(
+                    readings[0].best_offer_usd, readings[1].best_offer_usd, entry["id"]
+                )
+
+
+class ProbeFirstNegotiationTests(unittest.TestCase):
+    """M032 S2P texts and readers in the negotiation (S2.10, SWEEP-16, 19, 21, 22; synthetic)."""
+
+    ANCHOR_MARKERS = MOVE_BY_ID["F1-ANCHOR"].markers
+    COUNTER_MARKERS = MOVE_BY_ID[F1_COUNTER].markers
+
+    def test_the_stated_anchor_checks_a_conflict_only_300_away(self):
+        self.assertEqual(neg.anchor_after_stated(9000).id, neg.ANCHOR_STATED)
+        self.assertEqual(neg.anchor_after_stated(9200).id, neg.ANCHOR_STATED)
+        self.assertEqual(neg.anchor_after_stated(9300).id, neg.ANCHOR_STATED_CONFLICT)
+        conflict = neg.anchor_after_stated(10000)
+        self.assertEqual(conflict.must_say, ("$10,000", "$9,000", "$7,000"))
+        self.assertEqual(neg.anchor_check().must_say, ("$9,000", "$7,000"))
+        self.assertEqual(neg.anchor_after_free().must_say, ("$7,000",))
+        for anchor in (conflict, neg.anchor_after_stated(9000), neg.anchor_check(), neg.anchor_after_free()):
+            for text in anchor.variants:
+                self.assertTrue(markers_match(self.ANCHOR_MARKERS, text), text)
+
+    def test_the_offer_anchors_keep_their_figures_with_objective_briefs(self):
+        for usd in (8000, 7000, 6000):
+            before = neg.anchor_after_offer(usd)
+            after = neg.anchor_after_offer(usd, probe_first=True, counter_v2=True)
+            with self.subTest(usd=usd):
+                self.assertEqual(before.must_say, after.must_say)
+                self.assertEqual(before.id, after.id)
+                self.assertNotIn("has already", after.brief)
+        above = neg.anchor_after_offer(8000, counter_v2=True)
+        self.assertEqual(
+            above.variants[2],
+            "I heard it went for around $7,000, and $8,000 is still a big number for me. "
+            "Can you match that?",
+        )
+        self.assertEqual(neg.anchor_after_offer(8000), neg.anchor_after_offer(8000, probe_first=False))
+
+    def test_the_v2_counters(self):
+        met = neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_MET]
+        for text in met.variants:
+            self.assertNotRegex(
+                text, r"(?i)best you can do|little better|lower|\bless\b|come down|still move|closer"
+            )
+        far = neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_FAR_BELOW]
+        self.assertNotRegex(far.brief + " ".join(far.variants), r"(?i)\brelief\b|\bhelp\b")
+        self.assertEqual(
+            neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_SHORT].variants[0],
+            "I was hoping for a bit less than that. Can you go a little lower?",
+        )
+        self.assertEqual(
+            neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_REFUSED].variants[1],
+            "Would anything at all make it easier, like a payment plan?",
+        )
+        for counter in neg.COUNTERS_V2:
+            for text in counter.variants:
+                self.assertTrue(markers_match(self.COUNTER_MARKERS, text), text)
+        for kind, earlier in (("website", None), ("rise", 6000)):
+            counter = neg.conflict_counter(kind, 9500, earlier)
+            for text in counter.variants:
+                self.assertTrue(markers_match(self.COUNTER_MARKERS, text), text)
+                self.assertIn("?", text)
+
+    def test_the_counter_situation_with_counter_v2(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "I can do $6,500 for you.", anchor_turn=4, read_totals=True)
+        self.assertEqual(state.counter_situation(counter_v2=True).id, neg.SITUATION_MET)
+        self.assertEqual(
+            state.counter_situation(counter_v2=True, far_below=True).id, neg.SITUATION_FAR_BELOW
+        )
+        self.assertIs(state.counter_situation(), neg.COUNTER_BY_SITUATION[neg.SITUATION_MET])
+        held = neg.Negotiation("husband")
+        held.observe(5, "No, the price is $9,000 for everyone.", anchor_turn=4, read_totals=True)
+        self.assertEqual(held.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        self.assertEqual(held.price_situation(), neg.SITUATION_UNCLEAR)
+        self.assertEqual(held.refusals, 0)
+        fixed = neg.Negotiation("husband")
+        fixed.observe(5, "The fee is fixed, I'm afraid.", anchor_turn=4, read_totals=True)
+        self.assertEqual(fixed.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        self.assertTrue(neg.holds_price("The price is non-negotiable."))
+        self.assertFalse(neg.holds_price("Is the price fixed?"))
+
+    def test_stated_totals(self):
+        cases = {
+            "Alright, for the analyst track we offer a $9,500 fee.": [9500],
+            "It's the same $9,000 over nine months, $1,000 a month.": [9000],
+            "We can do $6,000 instead of $12,000.": [12000],
+            "It's valued at $12,000.": [],
+            "If you wait, you'll pay $13,000.": [],
+            "A new batch would be $12,000.": [],
+            "Analysts earn $15,000 more.": [],
+            "Is it $9,000?": [],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.stated_totals(text), expected)
+
+    def test_the_price_conflicts(self):
+        state = neg.Negotiation("husband")
+        before = state.observe(3, "For the analyst track we offer a $9,500 fee.", read_totals=True)
+        self.assertIsNone(before.conflict)  # before the anchor S2.10 owns the check
+        website = state.observe(5, "The fee is $9,500.", anchor_turn=4, read_totals=True)
+        self.assertEqual(website.conflict, ("website", 9500, None))
+        self.assertIsNone(state.observe(6, "Yes, $9,500 fee.", anchor_turn=4, read_totals=True).conflict)
+        rise = neg.Negotiation("husband")
+        rise.observe(5, "We can do $6,000 for you.", anchor_turn=4, read_totals=True)
+        seen = rise.observe(
+            6, "It's the same $9,000 over nine months.", anchor_turn=4, read_totals=True
+        )
+        self.assertEqual(seen.conflict, ("rise", 9000, 6000))
+        self.assertEqual(rise.rise_open_turn, 6)
+        self.assertEqual(rise.price_now_usd(), 9000)
+        rise.observe(7, "Fine, $7,000 then.", anchor_turn=4, read_totals=True)
+        self.assertIsNone(rise.rise_open_turn)
+        option = neg.Negotiation("husband")
+        option.observe(5, "We can do $6,000 for you.", anchor_turn=4, read_totals=True)
+        seen = option.observe(
+            6, "$6,000 upfront or $9,000 over nine months.", anchor_turn=4, read_totals=True
+        )
+        self.assertIsNone(seen.conflict)
+        capped = neg.Negotiation("husband")
+        for turn, text in enumerate(("The fee is $9,500.", "The fee is $10,000.", "The fee is $11,000."), 5):
+            capped.observe(turn, text, anchor_turn=4, read_totals=True)
+        self.assertEqual(len(capped.conflicts), neg.MAX_CONFLICTS)
+
+    def test_the_quote_record_is_logged_only_when_read(self):
+        off = neg.Negotiation("husband")
+        off.observe(5, "The fee is $9,500.", anchor_turn=4)
+        self.assertNotIn("quotes", off.log())
+        on = neg.Negotiation("husband")
+        on.observe(5, "The fee is $9,500.", anchor_turn=4, read_totals=True)
+        self.assertEqual(on.log()["quotes"], [{"turn": 5, "usd": 9500, "kind": "total"}])
+        self.assertEqual(on.latest_total_usd(), 9500)
+
+    def test_the_price_first_readers(self):
+        for text in ("So how much is it?", "What's the fee like?", "And what would the course cost me?"):
+            self.assertTrue(neg.asks_price(text), text)
+        for text in (
+            "How much time outside class?",
+            "is there any extra cost for the recordings?",
+            "I'm worried about the cost.",
+        ):
+            self.assertFalse(neg.asks_price(text), text)
+        self.assertEqual(
+            neg.price_cue("Honestly it is a bit expensive, because the quality is high."), "cost"
+        )
+        self.assertIsNone(neg.price_cue("It's $9,000, a bit expensive but worth it."))
+        self.assertEqual(neg.price_cue("What's your budget for this?"), "budget")
+        self.assertEqual(neg.price_cue("If I give you this course for free, would you take it?"), "cost")
+        for text in (
+            "There are free resources on YouTube.",
+            "it's expensive to switch careers",
+            "it is costly to wait",
+        ):
+            self.assertIsNone(neg.price_cue(text), text)
+        for text in neg.PRICE_FIRST_SPEC.variants:
+            self.assertTrue(markers_match(neg.PRICE_FIRST_SPEC.markers, text))
+            self.assertTrue(neg.asks_price(text))
+
+    def test_the_first_money_stall_follows_what_she_knows(self):
+        named = neg.money_spec(price_named=True, price_asked=False, first=True)
+        self.assertEqual(named.brief, neg.N_MONEY_NAMED_BRIEF)
+        self.assertTrue(named.variants[0].startswith("It's a lot of money to commit"))
+        unknown = neg.money_spec(price_named=False, price_asked=True, first=True)
+        self.assertEqual(unknown.brief, neg.N_MONEY_UNKNOWN_BRIEF)
+        self.assertIsNone(neg.money_spec(price_named=True, price_asked=True, first=False))
+        self.assertIsNone(neg.money_spec(price_named=False, price_asked=False, first=True))
+        money = neg.SPEC_BY_ID[neg.N_MONEY]
+        for spec in (named, unknown):
+            for text in spec.variants:
+                self.assertTrue(markers_match(money.markers, text), text)
+                self.assertNotIn("agree to anything before", text)
+
 if __name__ == "__main__":
     unittest.main()

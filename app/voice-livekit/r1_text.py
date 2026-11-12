@@ -1139,3 +1139,61 @@ def clause_after(text: str, pos: int) -> str:
     """The clause of ``text`` that starts at ``pos`` and runs to the next clause break."""
     stop = _CLAUSE_BREAK.search(text, pos)
     return text[pos : stop.start() if stop else len(text)]
+
+
+# M032 SWEEP-18 (offer reader v2) and SWEEP-21 (price conflict).  A later-price threat or another
+# batch's price is never the price on the table: "decide now or later you will have to pay $13000",
+# "if you wait, you will have to pay $13000", "a new batch would be $12000".  The first form is
+# ``r1_tracker._later_price_threat`` (L6) copied here, because the negotiation must not import the
+# tracker (which feeds grading and is not changed); the other two forms are new.  Each needs a
+# figure above the list price in the sentence.
+_LATER_PRICE = re.compile(
+    r"\blater\b[^.?!]{0,40}?\b(?:you|it)\b(?P<verb>[^.?!]{0,20}?)\b"
+    r"(?:pay(?:ing)?|cost(?:s|ing)?|charged?)\b(?P<tail>[^.?!]{0,30})",
+    re.IGNORECASE,
+)
+_LATER_MUST = re.compile(r"\b(?:have to|has to|need to|must|end up)\b", re.IGNORECASE)
+_LATER_MORE = re.compile(
+    r"(?<!\bno )(?<!\bnothing )(?<!\bany )\b(?:more|higher)\b",
+    re.IGNORECASE,
+)
+_LATER_SURCHARGE = re.compile(
+    r"\b(?:interest|in total|emis?|instal+ments?|add-?ons?|"
+    r"for (?:the |an? |this |that )?(?:\w+ )?(?:plans?|modules?|mentor(?:ing|ship)|options?|"
+    r"add-?ons?|sessions?|packages?|emis?|instal+ments?))\b",
+    re.IGNORECASE,
+)
+_LATER_FIGURE = re.compile(r"\$(\d+)")
+_IF_YOU_WAIT = re.compile(
+    r"\bif (?:you|u) (?:wait|delay|hold off|postpone|miss (?:this|the) (?:batch|cohort|offer)|"
+    r"(?:do not|don'?t) (?:join|enrol+\w*|decide|sign up|book)(?: (?:now|today))?)\b"
+    r"[^.?!]{0,60}?\b(?:pay|paying|cost|costs|be|charged?)\b",
+    re.IGNORECASE,
+)
+_OTHER_BATCH = re.compile(
+    r"\b(?:new|next|later|upcoming|another|future|following) (?:batch|cohort|intake)\b"
+    r"[^.?!]{0,60}?\b(?:is|be|costs?|pay|paying|priced|charged?|goes up)\b",
+    re.IGNORECASE,
+)
+THREAT_LIST_USD = 9000
+
+
+def later_price_threat(sentence: object, list_usd: int = THREAT_LIST_USD) -> bool:
+    """A later-price threat or another batch's price in ``sentence`` (SWEEP-18, SWEEP-21).
+
+    "later you will have to pay $13000" (the tracker's L6 reading, copied), "if you wait, you will
+    have to pay $13000", "a new batch would be $12000".  The figure must be above ``list_usd``.
+    """
+    canonical = canonical_amounts(sentence)
+    for match in _LATER_PRICE.finditer(canonical):
+        tail = match.group("tail")
+        if _LATER_MORE.search(tail) and _LATER_SURCHARGE.search(canonical[match.start():]) is None:
+            return True
+        if _LATER_MUST.search(match.group("verb")) and any(
+            int(figure) > list_usd for figure in _LATER_FIGURE.findall(tail)
+        ):
+            return True
+    above = any(int(figure) > list_usd for figure in _LATER_FIGURE.findall(canonical))
+    if not above:
+        return False
+    return bool(_IF_YOU_WAIT.search(canonical) or _OTHER_BATCH.search(canonical))

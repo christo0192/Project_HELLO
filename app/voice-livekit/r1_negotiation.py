@@ -56,6 +56,7 @@ from r1_text import (
     dollar_amounts,
     fold,
     is_question_like,
+    later_price_threat,
     negated_before,
     parse_amount,
     split_sentences,
@@ -68,6 +69,16 @@ MAX_TEXT_CHARS = 12000
 # Stall rounds the learner may spend on reasons inside the close window before it gives its
 # (scripted) WEAK resolution.
 MAX_STALL_ROUNDS = 2
+# M032 SWEEP-18: a price stated on the advisor turn before is the base of a dollar discount.
+STATED_CARRY_TURNS = 1
+# M032 SWEEP-21: the quote record's kinds, the conflicts, at most this many per session, and how far
+# above the best offer a total is a rise.
+QUOTE_OFFER = "offer"
+QUOTE_TOTAL = "total"
+CONFLICT_WEBSITE = "website"
+CONFLICT_RISE = "rise"
+MAX_CONFLICTS = 2
+RISE_MIN_USD = 500
 ANCHOR_USD = 7000
 MIN_NET_USD = 4500
 # A net price below MIN_NET_USD counts only in an explicit net-price frame ("I will give it to you
@@ -388,6 +399,137 @@ N_QUESTION_ENROL_VARIANTS_V2 = (
 )
 
 
+# M032 SWEEP-22 (flag R1_PROBE_FIRST): she asks the price before she worries about it.  On an early
+# enrolment or call ask with no price named and none asked, N-PRICE-FIRST replaces the money stall:
+# a price question that is no stall (no reason voiced, no stall round, no objection for spacing).
+KIND_PRICE_FIRST = "price_first"
+N_PRICE_FIRST = "N-PRICE-FIRST"
+PRICE_FIRST_SPEC = NegotiationSpec(
+    N_PRICE_FIRST,
+    KIND_PRICE_FIRST,
+    None,
+    "you cannot think about signing up before you know what it costs, so ask the advisor what the "
+    "fee is, in your own words, without saying anything about the cost yourself",
+    (
+        (r"\bhow much\b", r"\bcosts?\b", r"\bfees?\b", r"\bprice\b", r"\bcharge\b"),
+        (r"\?",),
+    ),
+    (
+        "I'd need to know the fee first. What does the course cost?",
+        "Before I think about that, how much is the course?",
+        "What would it cost me? I'd need to know that first.",
+    ),
+)
+SPEC_BY_ID[N_PRICE_FIRST] = PRICE_FIRST_SPEC
+# SWEEP-22 item 4: the first money stall (REASON_MONEY not voiced yet), without SWEEP-3's tail:
+# about the price the advisor named, or, after her price question was dodged, about not knowing
+# it.
+N_MONEY_NAMED_BRIEF = (
+    "you are worried about the price the advisor mentioned and would need to see how you could "
+    "manage the payment"
+)
+N_MONEY_UNKNOWN_BRIEF = (
+    "you still don't know what it costs, and you couldn't agree to anything before knowing that "
+    "and how you would manage the payment"
+)
+N_MONEY_UNKNOWN_VARIANTS = (
+    "I still don't know what it would cost me, and I'd need to know that first.",
+    "Without knowing the fee, I can't really agree to anything yet.",
+    "I'd have to know the cost first, and how I could manage the payment.",
+)
+
+
+def money_spec(*, price_named: bool, price_asked: bool, first: bool) -> NegotiationSpec | None:
+    """N-MONEY worded for what she knows of the price (SWEEP-22 item 4), or None (unchanged).
+
+    ``first``: the money stall was not voiced yet.  With a price named, the first stall is about
+    that price and leads with "It's a lot of money to commit"; with none named after her price
+    question went unanswered, it is about not knowing the cost.  A later money stall keeps the
+    release's "still worried about the cost".
+    """
+    if not first:
+        return None
+    spec = SPEC_BY_ID[N_MONEY]
+    if price_named:
+        lead = spec.variants[1]
+        rest = tuple(text for text in spec.variants if text != lead)
+        return replace(spec, brief=N_MONEY_NAMED_BRIEF, variants=(lead, *rest))
+    if price_asked:
+        return replace(spec, brief=N_MONEY_UNKNOWN_BRIEF, variants=N_MONEY_UNKNOWN_VARIANTS)
+    return None
+
+
+# SWEEP-22 item 2: her own question about the course price (never the time or an extra's cost).
+_ASKS_PRICE = re.compile(
+    r"\bhow much (?:is|does|would|will|did) (?:it|this|that|the course|the program(?:me)?|"
+    r"the fee|the whole thing)(?: (?:actually|really|roughly|exactly))?(?: cost| be| come to)?\b"
+    r"|\bwhat(?:'s| is| would be| will be) (?:the |your )?(?:actual |total |final |course )?"
+    r"(?:fee|price|cost|tuition)\b(?! (?:of|for) (?:the |a |an )?(?:recordings?|extra|add-?on|"
+    r"materials?|exam|certificate))"
+    r"|\bwhat (?:does|would|will|did) (?:it|this|that|the course|the program(?:me)?) "
+    r"(?:actually |really )?(?:cost|come to)\b"
+    r"|\bhow much (?:do|would|will) (?:you|they) charge\b"
+    r"|\bhow much (?:would|will|do|am) i (?:be )?pay(?:ing)?\b"
+    r"|\bwhat would i (?:actually )?(?:be )?pay(?:ing)?\b",
+    re.IGNORECASE,
+)
+_NOT_PRICE_QUESTION = re.compile(
+    r"\bhow much (?:time|effort|work|homework|study|practice)\b|\bextra cost for\b",
+    re.IGNORECASE,
+)
+
+
+def asks_price(learner_text: object) -> bool:
+    """Her line asks what the course costs ("So how much is it?"), in a question (SWEEP-22)."""
+    for sentence in split_sentences(learner_text):
+        if not (is_question_like(sentence) or "?" in sentence):
+            continue
+        folded = fold(sentence)
+        if _NOT_PRICE_QUESTION.search(folded):
+            continue
+        if _ASKS_PRICE.search(folded):
+            return True
+    return False
+
+
+# SWEEP-22 item 5: the advisor talked about the cost or her budget without any figure.
+PRICE_CUE_BUDGET = "budget"
+PRICE_CUE_COST = "cost"
+_BUDGET_QUESTION = re.compile(
+    r"\bwhat(?:'s| is| would be) your budget\b|\bwhat (?:kind of |sort of )?budget\b"
+    r"|\bhow much (?:can|could|would|are) you (?:able to )?(?:afford|spend|invest|pay|put in)\b"
+    r"|\bdo you have (?:a|any) budget\b|\bcan you afford\b|\byour budget (?:for|is)\b",
+    re.IGNORECASE,
+)
+_COST_TALK = re.compile(
+    r"\b(?:it|this|that|the course|the program(?:me)?|this course|our course|this program(?:me)?)"
+    r"(?:'s| is| will be| would be| can be| might be)? (?:a bit |a little |quite |very |really |"
+    r"slightly |definitely |somewhat |kind of )?(?:expensive|pricey|costly|not cheap)\b(?!\s+to\b)"
+    r"|\b(?:it|this|the course|the program(?:me)?) costs? (?:some |a lot of |good |real )?money\b"
+    r"|\bcan(?:'?t|not) (?:give|offer|provide|do) (?:it|this|the course|you the course|you this)"
+    r"(?: to you)? (?:for )?free\b"
+    r"|\bif i (?:give|gave|offer|offered) (?:it|this|you (?:the course|this course|it)|the course)"
+    r"(?: to you)? (?:for )?free\b",
+    re.IGNORECASE,
+)
+_ANY_FIGURE = re.compile(r"\$\s?\d|\b\d[\d,]{2,}\b|\b\d+(?:\.\d+)?\s?k\b", re.IGNORECASE)
+
+
+def price_cue(advisor_text: object) -> str | None:
+    """"budget", "cost" or None: the advisor raised her budget or the cost with no figure."""
+    canonical = canonical_amounts(advisor_text)
+    if _ANY_FIGURE.search(canonical):
+        return None
+    found: str | None = None
+    for sentence in split_sentences(_tail(advisor_text)):
+        folded = fold(sentence)
+        if (is_question_like(sentence) or "?" in sentence) and _BUDGET_QUESTION.search(folded):
+            return PRICE_CUE_BUDGET
+        if _COST_TALK.search(folded):
+            found = PRICE_CUE_COST
+    return found
+
+
 def no_commit_spec(spec: NegotiationSpec) -> NegotiationSpec:
     """A stall reason's ``spec`` without the "before you agree to anything" priming (SWEEP-3).
 
@@ -479,6 +621,100 @@ COUNTERS: tuple[CounterSituation, ...] = (
 )
 COUNTER_BY_SITUATION = {item.id: item for item in COUNTERS}
 
+# M032 SWEEP-19 (flag R1_COUNTER_V2): the counter matches the number actually on the table.  A met
+# price is checked as the final price and never pushed lower (PRICE_MET_NOTE says so on every other
+# turn); a price far below anything she expected, or free, is met with a careful buyer's surprise,
+# never relief; the scripted counters lose their "[ack], but" hinge.  ``COUNTERS`` stays for the
+# flag off.  Every variant proves F1-COUNTER's markers (r1_scheduler: "final price", "final
+# number", "lower", "better", "room", "anything at all" ...).
+SITUATION_FAR_BELOW = "far_below"
+SITUATION_CONFLICT = "conflict"
+COUNTERS_V2: tuple[CounterSituation, ...] = (
+    CounterSituation(
+        SITUATION_SHORT,
+        COUNTER_BY_SITUATION[SITUATION_SHORT].brief,
+        (
+            "I was hoping for a bit less than that. Can you go a little lower?",
+            "Could you do a little better than that for me?",
+            "It's still more than I planned for. Is there any more room on the price?",
+        ),
+    ),
+    CounterSituation(
+        SITUATION_MET,
+        "the advisor's price is at or below your ask; sound relieved, check it is the final price "
+        "with nothing added later, and do not ask for less or accept it",
+        (
+            "Oh, that would really help. And is that the final price, with nothing added on top "
+            "later?",
+            "That's a relief. Just so I'm sure, is that the final price, all in?",
+            "Okay, that helps a lot. Is that the final number, or would anything get added later?",
+        ),
+    ),
+    CounterSituation(
+        SITUATION_REFUSED,
+        COUNTER_BY_SITUATION[SITUATION_REFUSED].brief,
+        (
+            COUNTER_BY_SITUATION[SITUATION_REFUSED].variants[0],
+            "Would anything at all make it easier, like a payment plan?",
+            COUNTER_BY_SITUATION[SITUATION_REFUSED].variants[2],
+        ),
+    ),
+    COUNTER_BY_SITUATION[SITUATION_UNCLEAR],
+    CounterSituation(
+        SITUATION_FAR_BELOW,
+        "the advisor's price is far below anything you expected; sound surprised and a little "
+        "wary rather than relieved, check it is really the final price with nothing added later, "
+        "and do not accept it",
+        (
+            "Wait, that's far lower than I expected. Is that really the final price, with nothing "
+            "added later?",
+            "That's a lot less than I thought. Is that the final number, all in?",
+            "Really? That surprises me. Is that the final price, or is there a catch?",
+        ),
+    ),
+)
+COUNTER_V2_BY_SITUATION = {item.id: item for item in COUNTERS_V2}
+# SWEEP-19 item 6: the advisor asked what number works for her while the counter is planned (only on
+# a short or unclear answer): she names the $7,000 she heard as her hope.
+YOUR_NUMBER_COUNTER_SUFFIX = (
+    "; they asked what number works for you, so say you were hoping for something close to the "
+    "$7,000 you heard and ask if they can come down to that"
+)
+# SWEEP-21: the advisor's price differs from the website's or from his own earlier offer while the
+# counter is planned: one check, as a question.  ``{expected}`` and ``{source}`` are filled by
+# ``conflict_counter``.
+SITUATION_CONFLICT_BRIEF = (
+    "the advisor named {amount}, which is not the {expected} you {source}; ask about the "
+    "difference in your own words, as a question, and do not accept either number"
+)
+SITUATION_CONFLICT_WEBSITE_VARIANTS = (
+    "Wait, didn't the website say $9,000? So what's the actual price for me?",
+    "Sorry, I'm a bit lost. Is it $9,000 or {amount}? What's the final price?",
+)
+SITUATION_CONFLICT_RISE_VARIANTS = (
+    "Hold on, earlier you said {earlier}. So what's the actual price now?",
+    "Sorry, I'm a bit lost. Is it {earlier} or {amount}? What's the final price?",
+)
+
+
+def conflict_counter(kind: str, amount_usd: int, earlier_usd: int | None) -> CounterSituation:
+    """F1-COUNTER for a price conflict (SWEEP-21): ``kind`` is "website" or "rise"."""
+    amount = _usd(amount_usd)
+    if kind == "rise" and earlier_usd is not None:
+        earlier = _usd(earlier_usd)
+        brief = SITUATION_CONFLICT_BRIEF.format(
+            amount=amount, expected=earlier, source="heard from them earlier"
+        )
+        variants = tuple(
+            text.format(amount=amount, earlier=earlier) for text in SITUATION_CONFLICT_RISE_VARIANTS
+        )
+    else:
+        brief = SITUATION_CONFLICT_BRIEF.format(
+            amount=amount, expected=WEBSITE_PRICE, source="saw on the website"
+        )
+        variants = tuple(text.format(amount=amount) for text in SITUATION_CONFLICT_WEBSITE_VARIANTS)
+    return CounterSituation(SITUATION_CONFLICT, brief, variants)
+
 
 @dataclass(frozen=True)
 class AnchorSituation:
@@ -503,23 +739,44 @@ def _usd(amount: int) -> str:
     return f"${int(amount):,}"
 
 
-def anchor_after_offer(offer_usd: int) -> AnchorSituation:
-    """The anchor that reacts to ``offer_usd``, the best price already on the table."""
+def anchor_after_offer(
+    offer_usd: int, *, probe_first: bool = False, counter_v2: bool = False
+) -> AnchorSituation:
+    """The anchor that reacts to ``offer_usd``, the best price already on the table.
+
+    M032: ``probe_first`` (S2P, SWEEP-16 item 2) words the briefs as objectives in the form of the
+    probe-first anchor (no "has already come down", which presumes a discount, and no banned
+    phrase); ``counter_v2`` (SWEEP-19 item 5) takes the "[ack], but" hinge out of the third ABOVE
+    variant.  Must-say figures, the $7,000 marker and the request are unchanged.
+    """
     amount = _usd(offer_usd)
     if offer_usd > ANCHOR_USD:
+        third = (
+            f"I heard it went for around $7,000, and {amount} is still a big number for me. "
+            "Can you match that?"
+            if counter_v2
+            else f"Okay, but {amount} is still a big number for me, and I heard it went for "
+            "around $7,000. Can you match that?"
+        )
+        brief = (
+            f"the advisor's price is {amount}, still more than you planned to spend; say so in "
+            "your own words, say you heard someone got it for around $7,000, and ask whether they "
+            "could match that"
+            if probe_first
+            else f"the advisor has already come down to {amount}; tell the advisor that is still a "
+            "lot for you, that you heard people got it for around $7,000, and ask if they can "
+            "do that"
+        )
         return AnchorSituation(
             ANCHOR_ABOVE,
-            f"the advisor has already come down to {amount}; tell the advisor that is still a "
-            "lot for you, that you heard people got it for around $7,000, and ask if they can "
-            "do that",
+            brief,
             (amount, "$7,000"),
             (
                 f"{amount} is still a lot for me, and I heard people got it for around $7,000. "
                 "Can you do that?",
                 f"{amount} is still more than I planned for, and I read some people paid about "
                 "$7,000. Is that possible?",
-                f"Okay, but {amount} is still a big number for me, and I heard it went for "
-                "around $7,000. Can you match that?",
+                third,
             ),
         )
     # The price is already at (or below) the ask.  The learner notes calmly that it is in line with
@@ -536,7 +793,10 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
     if offer_usd == ANCHOR_USD:
         return AnchorSituation(
             ANCHOR_REACHED,
-            f"the advisor has already put {amount} on the table, the very price you heard "
+            f"the advisor's price is {amount}, which is the very figure you heard someone paid; "
+            f"{brief_tail}"
+            if probe_first
+            else f"the advisor has already put {amount} on the table, the very price you heard "
             f"people got it for; {brief_tail}",
             (amount,),
             (
@@ -555,8 +815,10 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
     )
     return AnchorSituation(
         ANCHOR_REACHED,
-        f"the advisor has already put {amount} on the table, below the $7,000 you heard people "
-        f"got it for; {below_tail}",
+        f"the advisor's price is {amount}, below the $7,000 you heard someone paid; {below_tail}"
+        if probe_first
+        else f"the advisor has already put {amount} on the table, below the $7,000 you heard "
+        f"people got it for; {below_tail}",
         (amount, "$7,000"),
         (
             f"{amount} is even below the $7,000 I heard people got it for. What exactly does "
@@ -591,6 +853,92 @@ def anchor_after_unclear_low(amount_usd: int) -> AnchorSituation:
             f"Sorry, just so I follow: is {amount} what I'd pay in total? I'd heard around $7,000.",
             f"Hold on, {amount}? I heard people paid around $7,000. What would the total be for "
             "me?",
+        ),
+    )
+
+
+# M032 S2P (D-M032-7, S2 item 10): F1-ANCHOR when no lower price is on the table.  The advisor
+# STATED a price (``ANCHOR_STATED``: she reacts to his number; a number at least $300 away from the
+# website's adds the one conflict check, ``ANCHOR_STATED_CONFLICT``), or nobody told her the price
+# after two price questions, past the probe deadline or on the forced path (``ANCHOR_CHECK``: the
+# $9,000 she thinks she saw is a check, never a statement), or he talked about giving it for free
+# (``ANCHOR_FREE``, SWEEP-19).  Every form keeps the $7,000 marker and must-say and a request.
+ANCHOR_STATED = "stated"
+ANCHOR_STATED_CONFLICT = "stated_conflict"
+ANCHOR_CHECK = "check"
+ANCHOR_FREE = "free"
+WEBSITE_PRICE = "$9,000"
+# The website's $9,000 and a stated price at least this far from it are a conflict (SWEEP-21).
+CONFLICT_MIN_GAP_USD = 300
+
+
+def anchor_after_stated(stated_usd: int) -> AnchorSituation:
+    """The anchor that reacts to the course price the advisor stated (S2.10, probe first)."""
+    amount = _usd(stated_usd)
+    if abs(stated_usd - PRICE_USD) >= CONFLICT_MIN_GAP_USD:
+        return AnchorSituation(
+            ANCHOR_STATED_CONFLICT,
+            f"the advisor said the price is {amount}, but you thought the website said around "
+            "$9,000; check that once in your own words as a short question, then say you heard "
+            "someone got it for around $7,000 and ask whether they could do that for you; do not "
+            "accept either number",
+            (amount, WEBSITE_PRICE, "$7,000"),
+            (
+                f"Oh, {amount}? I thought the website said around $9,000. Either way, I heard "
+                "someone paid about $7,000. Could you do that?",
+                f"Wait, I thought I saw about $9,000 on the website, not {amount}. Someone told me "
+                "they paid around $7,000. Is that possible?",
+                f"Hmm, {amount}? I had around $9,000 in my head from the website. I heard of "
+                "someone paying about $7,000, could you do that?",
+            ),
+        )
+    return AnchorSituation(
+        ANCHOR_STATED,
+        f"the advisor said the price is {amount}, more than you planned to spend; say so in your "
+        "own words, say you heard someone got it for around $7,000, and ask whether they could do "
+        "that for you",
+        (amount, "$7,000"),
+        (
+            f"{amount} is more than I planned to spend. I heard someone got it for around $7,000. "
+            "Could you do that for me?",
+            f"Hmm, {amount} is a lot for me. Someone told me they paid about $7,000. Is that "
+            "possible?",
+            f"{amount} is more than I was expecting to pay. I heard about $7,000 from someone, "
+            "could you do that?",
+        ),
+    )
+
+
+def anchor_check() -> AnchorSituation:
+    """The anchor when nobody has told her the price (S2.10's check form, probe first)."""
+    return AnchorSituation(
+        ANCHOR_CHECK,
+        "nobody has told you the price yet; say you think you saw about $9,000 on the website and "
+        "check whether that is right, then say you heard someone got it for around $7,000 and ask "
+        "whether they could do that for you",
+        (WEBSITE_PRICE, "$7,000"),
+        (
+            "I think I saw about $9,000 on the website, is that right? I heard someone got it for "
+            "around $7,000. Could you do that?",
+            "Is it about $9,000? That's what I think I saw on the website. Someone told me they "
+            "paid around $7,000, is that possible?",
+            "I think the website said around $9,000, is that right? I heard of someone paying "
+            "about $7,000, could you do that for me?",
+        ),
+    )
+
+
+def anchor_after_free() -> AnchorSituation:
+    """The anchor when the advisor talked about giving the course for free (SWEEP-19)."""
+    return AnchorSituation(
+        ANCHOR_FREE,
+        "the advisor talked about giving you the course for free; say that surprises you, that you "
+        "had heard people paid around $7,000, and ask what the catch is; do not accept anything",
+        ("$7,000",),
+        (
+            "Wait, free? I'd heard people paid around $7,000 for it, so what's the catch?",
+            "Free? That surprises me, I heard it was around $7,000. What's the catch?",
+            "Hold on, free? I'd heard about $7,000. What would I end up paying?",
         ),
     )
 
@@ -1597,6 +1945,13 @@ _COURSE_PRICE_CUE = re.compile(
     r"holds|valid|good) (?:tonight|today|at midnight|till|until|by))\b",
     re.IGNORECASE,
 )
+# M032 SWEEP-19 item 4 (with SWEEP-18's reader, one corpus run): "a ticket size of around 6000 USD",
+# "it's priced at 6000", "our pricing is 6000" name the course price too.
+_COURSE_PRICE_CUE_V2 = re.compile(
+    _COURSE_PRICE_CUE.pattern[:-3] + r"|ticket(?:[- ]size)?|priced|pricing)\b",
+    re.IGNORECASE,
+)
+_PRICE_WORD_V2 = re.compile(r"\b(?:ticket(?:[- ]size)?|priced|pricing)\b", re.IGNORECASE)
 # Said while a figure is hedged: "I'll try for $8,000", "let me see if I can do $8,000".
 _HEDGE_BEFORE = re.compile(
     r"\b(?:might|may|maybe|perhaps|possibly|probably|hopefully|try(?:ing)?|see (?:if|what|"
@@ -1967,6 +2322,37 @@ def _pieces(sentence: str) -> list[str]:
     return pieces
 
 
+@dataclass(frozen=True)
+class _PieceReading:
+    """What one piece of an advisor sentence put on the table (M032 SWEEP-18).
+
+    ``explicit``: nets the advisor named as the price; ``derived``: nets worked out from a discount
+    (a dollar amount off the base, or a percentage off it); ``total``: the piece names a resulting
+    total at or above the list price ("so for you it is $9,000"), which is explicit too.
+    """
+
+    explicit: dict[int, bool]
+    derived: dict[int, bool]
+    total: bool = False
+
+
+# M032 SWEEP-18: a resulting total named after a discount ("which brings it to 8.5k", "so for you
+# it is $9,000", "it comes to $8,500"): it is the net, and it wins over the net worked out from the
+# discount.  Read on the text just before the figure.
+_RESULT_TOTAL_BEFORE = re.compile(
+    r"\b(?:brings?|bringing|makes?|making|takes?|taking|puts?|putting)\s+"
+    r"(?:it|that|this|the (?:price|fee|total|cost|course|program|programme))\s+"
+    r"(?:down\s+|back\s+)?to\s+(?:just\s+|only\s+|about\s+|around\s+)?$"
+    r"|\bso\s+(?:for you\s+)?(?:it(?:'s| is| will be| would be| comes to)|that(?:'s| is| comes to)|"
+    r"you(?:'d| would| will|'ll)? pay)\s+(?:just\s+|only\s+)?$"
+    r"|\b(?:comes?|coming)\s+(?:down\s+)?to\s+(?:just\s+|only\s+|about\s+|around\s+)?$"
+    r"|\b(?:net|final|total|effective)\s+(?:price|fee|cost|amount)?\s*(?:of|is|would be|will be|"
+    r"comes to)\s+$",
+    re.IGNORECASE,
+)
+_RESULT_TOTAL_CHARS = 60
+
+
 def _piece_offers(
     piece: str,
     own: frozenset[int] = frozenset(),
@@ -1976,6 +2362,33 @@ def _piece_offers(
     rest_owed: bool = False,
     base_usd: int = PRICE_USD,
 ) -> dict[int, bool]:
+    """Net prices (and whether each is conditional) offered in one piece of a sentence.
+
+    The release before M032 SWEEP-18: a dollar discount always comes off the list price, and a
+    derived net is added beside an explicit one (``_piece_reading`` with ``v2`` False).
+    """
+    reading = _piece_reading(
+        piece,
+        own,
+        require_cue=require_cue,
+        rest_later=rest_later,
+        rest_owed=rest_owed,
+        base_usd=base_usd,
+    )
+    return {**reading.explicit, **reading.derived}
+
+
+def _piece_reading(
+    piece: str,
+    own: frozenset[int] = frozenset(),
+    *,
+    require_cue: bool = False,
+    rest_later: bool = False,
+    rest_owed: bool = False,
+    base_usd: int = PRICE_USD,
+    v2: bool = False,
+    dollar_base_usd: int | None = None,
+) -> _PieceReading:
     """Net prices (and whether each is conditional) offered in one piece of a sentence.
 
     ``own`` are the figures the learner said (the anchor among them): the advisor repeating
@@ -1990,18 +2403,25 @@ def _piece_offers(
     A competitor named as the seller ("Scaler sells it for 3000") is never the advisor's offer.
     ``base_usd`` is the price a percentage comes off (``stated_price_usd``; the list price when
     the turn names none).
+
+    M032 SWEEP-18 (``v2``, flag R1_OFFER_READER_V2): a dollar discount comes off
+    ``dollar_base_usd`` (the price the advisor named, else the list price) instead of always the
+    list price, and its net counts only below the list price (at or above it is a restatement); a
+    resulting total named after the discount ("which brings it to 8.5k", "so for you it is $9,000")
+    is explicit, and the caller keeps a derived net only when the sentence names no explicit one.
     """
+    empty = _PieceReading({}, {})
     # "$6500, which is ..." keeps its comma: the amount grammar would swallow it, and with it the
     # clause boundary the refusal and hedge checks read.
     lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", piece)).lower()
     asked = is_question_like(piece)
     if asked and _INQUIRY.search(lowered):
-        return {}
+        return empty
     # A question phrased as an offer promises the figure itself, so it needs no further promise;
     # any other question that names a figure is the advisor asking about it, not offering it.
     asked_as_offer = asked and _question_is_an_offer(lowered)
     if asked and not asked_as_offer:
-        return {}
+        return empty
     plain_acceptance = bare_acceptance(lowered)
     sellers = _named_sellers(piece)
 
@@ -2066,15 +2486,17 @@ def _piece_offers(
         value < MIN_NET_USD and _OFF_AFTER.match(lowered[end:]) is not None
         for value, _start, end in bare
     )
+    cue_pattern = _COURSE_PRICE_CUE_V2 if v2 else _COURSE_PRICE_CUE
     if (
         require_cue and not asked_as_offer and not framed_any and not bare_off
-        and _COURSE_PRICE_CUE.search(lowered) is None
+        and cue_pattern.search(lowered) is None
     ):
-        return {}
+        return empty
     conditional = _CONDITIONAL.search(lowered) is not None
     found: dict[int, bool] = {}
     discounts: set[int] = set()
     small: set[int] = set()
+    percent_nets: dict[int, int] = {}  # SWEEP-18: a percentage's discount -> the net it leaves
 
     def admitted(value: int, start: int, end: int) -> bool:
         said = value in own
@@ -2114,14 +2536,19 @@ def _piece_offers(
             # percentage off a higher stated price that leaves the list price or more is no offer.
             if net >= MIN_NET_USD and discount > 0:
                 discounts.add(discount)
-    if _PRICE_CUE.search(lowered) or asked_as_offer or plain_acceptance or framed_any or bare_off:
+                percent_nets[discount] = net
+    # SWEEP-19 item 4 (v2): "it's priced at 6000", "the ticket size is 6000" name a bare price too.
+    price_cue = _PRICE_CUE.search(lowered) is not None or (
+        v2 and _PRICE_WORD_V2.search(lowered) is not None
+    )
+    if price_cue or asked_as_offer or plain_acceptance or framed_any or bare_off:
         for value, start, end in bare:
             if not admitted(value, start, end):
                 continue
             if low_net(value, start, end):
                 found[value] = conditional
             elif MIN_NET_USD <= value < PRICE_USD and (
-                _PRICE_CUE.search(lowered) or asked_as_offer or plain_acceptance or framed_any
+                price_cue or asked_as_offer or plain_acceptance or framed_any
             ):
                 found[value] = conditional
             elif 0 < value < MIN_NET_USD and as_discount_at(start, end):
@@ -2129,13 +2556,42 @@ def _piece_offers(
                 if not _described_discount(lowered, start):
                     discounts.add(value)
     # Several small amounts in one sentence are a LIST of the deck's discounts, not an offer.
-    if len(discounts) == 1 and small <= discounts:
-        found[PRICE_USD - next(iter(discounts))] = conditional
-    return found
+    derived: dict[int, bool] = {}
+    single = len(discounts) == 1 and small <= discounts
+    if not v2:
+        if single:
+            derived[PRICE_USD - next(iter(discounts))] = conditional
+        return _PieceReading(found, derived)
+    if single:
+        discount = next(iter(discounts))
+        if discount in percent_nets:
+            net = percent_nets[discount]
+        else:
+            # SWEEP-18: a dollar discount comes off the price the advisor named.
+            net = (dollar_base_usd or PRICE_USD) - discount
+        if MIN_NET_USD <= net < PRICE_USD:
+            derived[net] = conditional
+    total = False
+    for value, start, end in bare + dollars:
+        if value is None:
+            continue
+        before = lowered[max(0, start - _RESULT_TOTAL_CHARS) : start]
+        if _RESULT_TOTAL_BEFORE.search(before) is None or theirs(start) or part(value, start, end):
+            continue
+        if MIN_NET_USD <= value < PRICE_USD and admitted(value, start, end):
+            found[value] = conditional  # "which brings it to 8.5k": the net, said
+        elif PRICE_USD <= value <= MAX_LIST_USD:
+            total = True  # "so for you it is $9,000": a total, not a lower price
+    return _PieceReading(found, derived, total)
 
 
 def parse_price_offers(
-    text: object, own_amounts: Iterable[int] = (), *, require_cue: bool = False
+    text: object,
+    own_amounts: Iterable[int] = (),
+    *,
+    require_cue: bool = False,
+    v2: bool = False,
+    base_usd: int | None = None,
 ) -> list[tuple[int, bool]]:
     """Net prices the advisor put on the table, as ``(net_usd, conditional)`` pairs.
 
@@ -2149,7 +2605,16 @@ def parse_price_offers(
     $7,000", "Sure, it's yours for $7,000").  ``require_cue`` is for the turns before the
     learner's anchor: a sentence then needs a pricing word ("price", "discount", "for you" ...)
     before any amount in it counts.
+
+    M032 SWEEP-18 (``v2``, flag R1_OFFER_READER_V2): a dollar discount comes off the price the
+    advisor named in this turn (``stated_price_usd(..., v2=True)``: never a later-price threat or
+    another batch's price), else ``base_usd`` (the negotiation's carry-over of the previous turn's
+    stated price), else the list price; and a sentence that names its net (or a resulting total)
+    keeps only that, never the net worked out from its discount as well.  A percentage still comes
+    off the price ``stated_price_usd`` reads (L5), as before.
     """
+    if v2:
+        return _parse_price_offers_v2(text, own_amounts, require_cue=require_cue, base_usd=base_usd)
     own = frozenset({ANCHOR_USD, *own_amounts})
     offers: dict[int, bool] = {}
     base = stated_price_usd(text) or PRICE_USD
@@ -2172,7 +2637,46 @@ def parse_price_offers(
     return sorted(offers.items(), reverse=True)
 
 
-def stated_price_usd(text: object) -> int | None:
+def _parse_price_offers_v2(
+    text: object,
+    own_amounts: Iterable[int] = (),
+    *,
+    require_cue: bool = False,
+    base_usd: int | None = None,
+) -> list[tuple[int, bool]]:
+    """``parse_price_offers`` with M032 SWEEP-18's reading (see there)."""
+    own = frozenset({ANCHOR_USD, *own_amounts})
+    offers: dict[int, bool] = {}
+    percent_base = stated_price_usd(text) or PRICE_USD
+    dollar_base = stated_price_usd(text, v2=True) or base_usd or PRICE_USD
+    for sentence in split_sentences(_tail(text)):
+        rest_later = _PART_LATER.search(sentence) is not None
+        rest_owed = _REST_OWED.search(sentence) is not None
+        explicit: dict[int, bool] = {}
+        derived: dict[int, bool] = {}
+        total = False
+        for clause in _clauses(sentence):
+            for piece in _pieces(clause):
+                reading = _piece_reading(
+                    piece,
+                    own,
+                    require_cue=require_cue,
+                    rest_later=rest_later,
+                    rest_owed=rest_owed,
+                    base_usd=percent_base,
+                    v2=True,
+                    dollar_base_usd=dollar_base,
+                )
+                explicit.update(reading.explicit)
+                derived.update(reading.derived)
+                total = total or reading.total
+        offers.update(explicit)
+        if not explicit and not total:
+            offers.update(derived)
+    return sorted(offers.items(), reverse=True)
+
+
+def stated_price_usd(text: object, *, v2: bool = False) -> int | None:
     """The course price the advisor states in this turn at or above the list price, if any.
 
     L5 (mock call aa166f09, turn 99: "it's coming with a 50% discount. If you start with a new
@@ -2184,9 +2688,16 @@ def stated_price_usd(text: object) -> int | None:
     (``_STATED_FRAME``: "the fee is", "you would end up paying", "costs", "normally", "off",
     "instead of"), and a saving, a value or an add-on ("You will save $10,000", "the $10,000
     masterclass is included") is none.
+
+    M032 SWEEP-18 (``v2``): "rather than" frames the price as "instead of" does, and a sentence
+    with a later-price threat or another batch's price (``r1_text.later_price_threat``) states
+    none: "if you wait, you will have to pay $13000" is no base for a discount.
     """
     found: list[int] = []
+    frame = _STATED_FRAME_V2 if v2 else _STATED_FRAME
     for sentence in split_sentences(_tail(text)):
+        if v2 and later_price_threat(sentence, PRICE_USD):
+            continue
         for clause in _clauses(sentence):
             for piece in _pieces(clause):
                 lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", piece)).lower()
@@ -2208,7 +2719,7 @@ def stated_price_usd(text: object) -> int | None:
                         and not negated_before(lowered, start, 8)
                         and not _PRICE_NO.search(clause_after(lowered, end))
                         and not _PART_AFTER.match(_UNIT_WORD.sub("", lowered[end:], count=1))
-                        and _STATED_FRAME.search(lowered[max(0, start - _STATED_SPAN) : start])
+                        and frame.search(lowered[max(0, start - _STATED_SPAN) : start])
                         and not _STATED_NOT_PRICE.search(
                             lowered[max(0, start - _STATED_SPAN) : end + _STATED_SPAN]
                         )
@@ -2225,6 +2736,13 @@ _STATED_FRAME = re.compile(
     r"\b(?:fees?|price[sd]?|pricing|costs?|costing|course|program(?:me)?|pays?|paying|paid|"
     r"normally|usually|originally|regularly|list|off|instead of|(?:it|that|this)(?:'s| is| was| "
     r"would be| will be))\b[^$]{0,25}$",
+    re.IGNORECASE,
+)
+# M032 SWEEP-18: "$6,000 for you rather than $12,000" names $12,000 as the price, like "instead of".
+_STATED_FRAME_V2 = re.compile(
+    r"\b(?:fees?|price[sd]?|pricing|costs?|costing|course|program(?:me)?|pays?|paying|paid|"
+    r"normally|usually|originally|regularly|list|off|instead of|rather than|(?:it|that|this)"
+    r"(?:'s| is| was| would be| will be))\b[^$]{0,25}$",
     re.IGNORECASE,
 )
 # A saving, a value, an add-on or a scholarship around the figure is no price for the course.
@@ -2309,7 +2827,9 @@ _ROUGH_BEFORE = re.compile(
 )
 
 
-def unread_low_figures(text: object, own_amounts: Iterable[int] = ()) -> list[int]:
+def unread_low_figures(
+    text: object, own_amounts: Iterable[int] = (), *, v2: bool = False
+) -> list[int]:
     """Figures under the $7,000 anchor the advisor named as a possible price, offered or not.
 
     The anchor's backstop (owner test 8f5bfefc review): a low price worded in a way
@@ -2333,7 +2853,7 @@ def unread_low_figures(text: object, own_amounts: Iterable[int] = ()) -> list[in
                 if is_question_like(piece) and _INQUIRY.search(lowered):
                     continue
                 cued = bool(
-                    _COURSE_PRICE_CUE.search(lowered)
+                    (_COURSE_PRICE_CUE_V2 if v2 else _COURSE_PRICE_CUE).search(lowered)
                     or _PRICE_CUE.search(lowered)
                     or _FIRST_PERSON_OFFER.search(lowered)
                     or _GRANT.search(lowered)
@@ -2371,6 +2891,109 @@ def unread_low_figures(text: object, own_amounts: Iterable[int] = ()) -> list[in
                         continue
                     found.append(value)
     return found
+
+
+# M032 SWEEP-21: a total said with its frame after the figure ("we offer a $9,500 fee", "the $9,000
+# program") or as the same total spread out ("the same $9,000 over nine months").
+_TOTAL_AFTER = re.compile(
+    r"^\s*(?:dollars?|usd)?\s*(?:course\s+|program(?:me)?\s+|tuition\s+)?"
+    r"(?:fees?|price|tuition|total|in total|all in|overall|course|program(?:me)?)\b"
+    r"|^\s*(?:dollars?|usd)?\s*(?:over|across|spread over|for)\s+(?:\w+\s+){0,2}?months?\b",
+    re.IGNORECASE,
+)
+_TOTAL_BEFORE = re.compile(
+    r"\b(?:the same|same|a total of|total of|in total|all in|overall)\s+(?:of\s+)?$",
+    re.IGNORECASE,
+)
+# A figure the turn calls a value, a saving or an add-on, a scholarship ... is no total.
+_TOTAL_NOT_PRICE_RE = re.compile(
+    r"\b(?:save|saves|saving|savings|value|valued|worth|included|includes|including|scholarships?|"
+    r"masterclass(?:es)?|bonus|cheaper|less than|more than|salary|salaries|earn\w*|hike)\b",
+    re.IGNORECASE,
+)
+# Someone else's figure before a total, without ``_NOT_OURS_BEFORE``'s job nouns: "for the analyst
+# track we offer a $9,500 fee" is the advisor's own price.
+_TOTAL_NOT_OURS = re.compile(
+    r"\b(?:salary|salaries|earn\w*|income|incomes|hike|ctc|lpa|stipend|take-home|compensation|"
+    r"compared (?:with|to)|versus|vs|other (?:programs?|programmes?|courses?|bootcamps?|"
+    r"institutes?|providers?|platforms?|universities)|competitors?|elsewhere|"
+    r"(?:students?|alumni|alumnus|learners?|someone|somebody|people|others|candidates?|"
+    r"professionals?|folks|they|he|she)\s+(?:\w+\s+){0,2}?(?:paid|got|took|"
+    r"enrolled|joined|saved|received|availed|used|bought|spent)|"
+    r"last (?:year|month|quarter|cohort|batch)|previously|used to|in the past|"
+    r"(?:previous|prior|earlier|old|last) (?:cohort|batch|class|intake)|"
+    r"bootcamps?|institutes?|universit\w+|colleges?|degrees?|market|industry|companies|"
+    r"employers?|recruiters?|raise|typical\w*|average)\b",
+    re.IGNORECASE,
+)
+
+
+def stated_totals(text: object) -> list[int]:
+    """The course totals at or above the list price the advisor names in ``text`` (SWEEP-21).
+
+    The figures ``states_full_price`` accepts, plus a frame after the figure ("a $9,500 fee") and
+    the same total spread out ("the same $9,000 over nine months").  A later-price threat or another
+    batch's price, a value, a saving, an add-on, a salary, a refused or negated figure and someone
+    else's price are none.  Ints only, in the order said.
+    """
+    found: list[int] = []
+    for sentence in split_sentences(_tail(text)):
+        if later_price_threat(sentence, PRICE_USD):
+            continue
+        for clause in _clauses(sentence):
+            for piece in _pieces(clause):
+                if is_question_like(piece):
+                    continue
+                lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", piece)).lower()
+                cue = _COURSE_PRICE_CUE.search(lowered) is not None
+                sellers = _named_sellers(piece)
+                figures = [
+                    (parse_amount(match.group(1), bool(match.group(2))), match)
+                    for match in _DOLLARS.finditer(lowered)
+                ] + [
+                    (parse_amount(match.group(1)), match)
+                    for match in _BARE_WHOLE.finditer(lowered)
+                ]
+                for value, match in figures:
+                    start, end = match.start(), match.end()
+                    if value is None or not PRICE_USD <= value <= MAX_LIST_USD:
+                        continue
+                    window = lowered[max(0, start - _STATED_SPAN) : end + _STATED_SPAN]
+                    after = lowered[end:]
+                    framed = (
+                        cue
+                        or _STATED_FRAME_V2.search(lowered[max(0, start - _STATED_SPAN) : start])
+                        or _TOTAL_BEFORE.search(lowered[max(0, start - _STATED_SPAN) : start])
+                        or _TOTAL_AFTER.match(after)
+                    )
+                    if (
+                        framed
+                        and not _TOTAL_NOT_PRICE_RE.search(window)
+                        and not _TOTAL_NOT_OURS.search(clause_before(lowered, start))
+                        and not _NOT_OURS_AFTER.match(after)
+                        and not _third_party_seller(lowered, start, sellers)
+                        and not negated_before(lowered, start, 8)
+                        and not _PRICE_NO.search(clause_after(lowered, end))
+                        and value not in found
+                    ):
+                        found.append(value)
+    return found
+
+
+# M032 SWEEP-19: the advisor says the price does not move ("the price is fixed", "the fee is the
+# same for everyone"); a statement only.
+_HELD_PRICE = re.compile(
+    r"\b(?:price|fee|cost)(?: is|'s) (?:fixed|final|non-?negotiable|the same for everyone)\b",
+    re.IGNORECASE,
+)
+
+
+def holds_price(text: object) -> bool:
+    """The advisor says in a statement that the course price is fixed (SWEEP-19's restatement)."""
+    return any(
+        not is_question_like(sentence) and _HELD_PRICE.search(fold(sentence)) is not None
+        for sentence in split_sentences(_tail(text))
+    )
 
 
 def states_full_price(text: object) -> bool:
@@ -2432,17 +3055,18 @@ class AdvisorActs:
 
 
 def read_advisor_turn(
-    text: object, *, after_anchor: bool = True, r_sec: float = 345.0
+    text: object, *, after_anchor: bool = True, r_sec: float = 345.0, reader_v2: bool = False
 ) -> AdvisorActs:
     """Read one advisor turn the way ``RolePlayEngine.plan_turn`` does.
 
     ``after_anchor`` says the learner's $7,000 anchor was already delivered: an amount then answers
     it, while before it an amount needs a pricing word.  ``r_sec`` is the role-play clock for the
-    farewell rule (a courtesy such as "thanks for your time" only counts from 4:00).
+    farewell rule (a courtesy such as "thanks for your time" only counts from 4:00).  ``reader_v2``
+    reads the offers with M032 SWEEP-18's reader (the corpus comparison).
     """
     acts = ask_acts(text)
     state = Negotiation("husband")
-    seen = state.observe(5, text, anchor_turn=4 if after_anchor else None)
+    seen = state.observe(5, text, anchor_turn=4 if after_anchor else None, reader_v2=reader_v2)
     return AdvisorActs(
         enrol=AskKind.ENROL in acts,
         call=AskKind.CALL in acts or seen.callback is not None,
@@ -2868,6 +3492,10 @@ class NegotiationTurn:
     # turn named as a price (an instalment option above the best offer is no better than it).
     email_listed: bool = False
     lower_offer_usd: int | None = None
+    # M032 SWEEP-21: the stated totals of this turn (ints), and the price conflict it raised, if
+    # any: (kind, usd, earlier usd) with kind "website" or "rise" (``Negotiation.price_conflict``).
+    totals: tuple[int, ...] = ()
+    conflict: tuple[str, int, int | None] | None = None
 
     @property
     def offer_added(self) -> bool:
@@ -2936,10 +3564,31 @@ class Negotiation:
         # $8,000 offer): a low figure named before it is stale (review round 2: "$2,000 in
         # credits" at turn 56 made the anchor after "The program costs $9,000" ask about $2,000).
         self.low_cleared_turn: int | None = None
+        # M032 SWEEP-18 (reader v2): the latest price the advisor stated at or above the list price,
+        # as (turn, usd); a dollar discount on the very next advisor turn comes off it ("The program
+        # is $9,500." then "I can do $1,000 off for you."), never a threat or another batch's price.
+        self._stated: tuple[int, int] | None = None
+        # M032 SWEEP-21 (quote record, ints only): every offer and every stated total the advisor
+        # named, as (turn, usd, kind) with kind "offer" or "total"; the conflicts already checked
+        # (kind, usd), and the turn of a price rise still open (no figure named since).
+        self.quotes: list[tuple[int, int, str]] = []
+        self.conflicts: list[tuple[str, int]] = []
+        self.rise_open_turn: int | None = None
+        # M032 SWEEP-19: the latest turn after the anchor that restated the full price with no
+        # offer, or said the price is fixed ("No, the price is $9,000 for everyone.").
+        self.full_price_turn: int | None = None
+        self._totals_read = False
 
     # ------------------------------------------------------------------ observation
     def observe(
-        self, turn: int, text: object, *, anchor_turn: int | None = None
+        self,
+        turn: int,
+        text: object,
+        *,
+        anchor_turn: int | None = None,
+        reader_v2: bool = False,
+        probed: bool = False,
+        read_totals: bool = False,
     ) -> NegotiationTurn:
         """Read one advisor turn.  ``anchor_turn`` is the learner turn of the $7,000 ask.
 
@@ -2947,6 +3596,14 @@ class Negotiation:
         the learner asked for $7,000 is on the table, so the anchor can react to it and a later
         restatement of it is never "new".  A refusal only answers the anchor, so it counts after
         it.
+
+        M032: ``reader_v2`` (SWEEP-18, flag R1_OFFER_READER_V2) reads the offers with
+        ``parse_price_offers(..., v2=True)`` and carries the previous advisor turn's stated price
+        over as the base of a dollar discount (``STATED_CARRY_TURNS``); ``probed`` (SWEEP-19, flag
+        R1_PROBE_FIRST) says the learner just asked the price, so an amount needs no pricing word,
+        as after the anchor ("It's around 6000 dollars"); ``read_totals`` (S2P, SWEEP-19, SWEEP-21)
+        keeps the quote record (every offer and stated total), the price conflict of the turn and
+        the turn that restated the full price after the anchor.
         """
         callback = detect_callback(text)
         if callback is not None:
@@ -2966,18 +3623,57 @@ class Negotiation:
         mentioned = False
         prior_best = self.best_offer_usd
         # Before the anchor nobody has asked for a price, so an amount needs a pricing word.
-        for net, conditional in parse_price_offers(
-            text, self.own_amounts, require_cue=not after_anchor
-        ):
+        carry: int | None = None
+        stated_now: int | None = None
+        if reader_v2:
+            stated_now = stated_price_usd(text, v2=True)
+            previous = self._stated
+            if (
+                stated_now is None
+                and previous is not None
+                and 0 < turn - previous[0] <= STATED_CARRY_TURNS
+            ):
+                carry = previous[1]
+        read_offers = parse_price_offers(
+            text,
+            self.own_amounts,
+            require_cue=not after_anchor and not probed,
+            v2=reader_v2,
+            base_usd=carry,
+        )
+        if stated_now is not None:
+            self._stated = (turn, stated_now)
+        for net, conditional in read_offers:
             mentioned = True
             if all(item.net_usd != net for item in self.offers + offers):
                 offers.append(PriceOffer(turn, net, conditional))
         read = {item.net_usd for item in self.offers + offers}
-        if any(item.net_usd >= ANCHOR_USD for item in offers) or states_full_price(text):
+        full_price = states_full_price(text)
+        if any(item.net_usd >= ANCHOR_USD for item in offers) or full_price:
             self.low_cleared_turn = turn
-        for usd in unread_low_figures(text, self.own_amounts):
+        for usd in unread_low_figures(text, self.own_amounts, v2=reader_v2):
             if usd not in read:
                 self.low_mentions.append((turn, usd))
+        # M032 SWEEP-21 and SWEEP-19 (only when the engine reads them: ``read_totals``).
+        totals: tuple[int, ...] = ()
+        conflict: tuple[str, int, int | None] | None = None
+        if read_totals:
+            self._totals_read = True
+            totals = tuple(stated_totals(text))
+            nets_now = {net for net, _conditional in read_offers}
+            for item in offers:
+                self.quotes.append((turn, item.net_usd, QUOTE_OFFER))
+            for usd in totals:
+                self.quotes.append((turn, usd, QUOTE_TOTAL))
+            if nets_now or totals:
+                self.rise_open_turn = None
+            conflict = self._price_conflict(totals, nets_now, prior_best, after_anchor)
+            if conflict is not None:
+                self.conflicts.append((conflict[0], conflict[1]))
+                if conflict[0] == CONFLICT_RISE:
+                    self.rise_open_turn = turn
+            if after_anchor and not read_offers and (full_price or holds_price(text)):
+                self.full_price_turn = turn
         lowest_now = min((item.net_usd for item in offers), default=None)
         lower = lowest_now if lowest_now is not None and (
             prior_best is None or lowest_now < prior_best
@@ -3013,7 +3709,49 @@ class Negotiation:
             decider_asked=asks_decider(text),
             email_listed=email and lists_email_contents(text),
             lower_offer_usd=lower,
+            totals=totals,
+            conflict=conflict,
         )
+
+    def _price_conflict(
+        self,
+        totals: tuple[int, ...],
+        nets_now: set[int],
+        prior_best: int | None,
+        after_anchor: bool,
+    ) -> tuple[str, int, int | None] | None:
+        """SWEEP-21: the price conflict this turn raises, each (kind, usd) once, at most twice.
+
+        WEBSITE: after the anchor, a total of $9,000 or more at least $300 away from the website's
+        $9,000 (before the anchor S2.10's anchor owns the check).  RISE: a total at least $500 above
+        the best offer on the table, unless this turn keeps the lower figure as an option ("$6,000
+        upfront or $9,000 over nine months").
+        """
+        if len(self.conflicts) >= MAX_CONFLICTS:
+            return None
+        for usd in totals:
+            key = (CONFLICT_WEBSITE, usd)
+            if (
+                after_anchor
+                and abs(usd - PRICE_USD) >= CONFLICT_MIN_GAP_USD
+                and key not in self.conflicts
+            ):
+                return CONFLICT_WEBSITE, usd, None
+        if prior_best is None or any(net <= prior_best for net in nets_now):
+            return None
+        for usd in totals:
+            key = (CONFLICT_RISE, usd)
+            if usd >= prior_best + RISE_MIN_USD and key not in self.conflicts:
+                return CONFLICT_RISE, usd, prior_best
+        return None
+
+    def latest_total_usd(self) -> int | None:
+        """The latest course total the advisor stated (SWEEP-21's quote record), or None."""
+        return next((usd for _t, usd, kind in reversed(self.quotes) if kind == QUOTE_TOTAL), None)
+
+    def price_now_usd(self) -> int | None:
+        """The latest price named, a total or an offer (the later by turn; SWEEP-21)."""
+        return self.quotes[-1][1] if self.quotes else None
 
     def note_learner_text(
         self, spoken: object, turn: int | None = None, *, stall: bool = False
@@ -3101,21 +3839,42 @@ class Negotiation:
             None,
         )
 
-    def price_situation(self) -> str:
+    def price_situation(self, *, counter_v2: bool = False) -> str:
         """How the advisor answered the anchor: short of the ask, met it, refused, or unclear.
 
         The best price on the table counts, whenever it was offered; but an advisor who only
-        REFUSED after the anchor (an earlier offer is not repeated) has refused.
+        REFUSED after the anchor (an earlier offer is not repeated) has refused.  M032 SWEEP-19
+        (``counter_v2``): with no offer and no refusal, an advisor who restated the full price or
+        said it is fixed after the anchor (``full_price_turn``) has refused too; the refusal count
+        and the turn the anchor was answered are not touched, so the counter's timing is unchanged.
         """
         best = self.best_offer_usd
         if best is not None and (self.answer_offer or not self.refusals):
             return SITUATION_MET if best <= ANCHOR_USD else SITUATION_SHORT
         if self.refusals:
             return SITUATION_REFUSED
+        if counter_v2 and best is None and self.full_price_turn is not None:
+            return SITUATION_REFUSED
         return SITUATION_UNCLEAR
 
-    def counter_situation(self) -> CounterSituation:
-        return COUNTER_BY_SITUATION[self.price_situation()]
+    def counter_situation(
+        self, *, counter_v2: bool = False, far_below: bool = False
+    ) -> CounterSituation:
+        """The counter for how the advisor answered the anchor.
+
+        M032 SWEEP-19 (``counter_v2``): the v2 texts; a met price that is far below anything she
+        expected (``far_below``: the best offer is $3,000 or less, or the last price read was low or
+        free) gets the careful-buyer counter instead of relief.
+        """
+        situation = self.price_situation(counter_v2=counter_v2)
+        if not counter_v2:
+            return COUNTER_BY_SITUATION[situation]
+        best = self.best_offer_usd
+        if situation == SITUATION_MET and (
+            far_below or (best is not None and best <= IMPLAUSIBLE_NET_USD)
+        ):
+            return COUNTER_V2_BY_SITUATION[SITUATION_FAR_BELOW]
+        return COUNTER_V2_BY_SITUATION[situation]
 
     def next_reason(self, skip: Iterable[str] = ()) -> str | None:
         """The first stall reason the learner has not raised yet, in ``REASONS`` order.
@@ -3266,4 +4025,19 @@ class Negotiation:
             "wait_said_turn": self.wait_said_turn,
             "decider_handled_turn": self.decider_handled_turn,
             "decider_said_turn": self.decider_said_turn,
+            # M032 S2P (ints and ids only, and only once the engine reads them, so the log of a
+            # session with the S2P flags off is the release before): the quote record, the
+            # conflicts checked, and the turn the full price was restated after the anchor.
+            **(
+                {
+                    "quotes": [
+                        {"turn": turn, "usd": usd, "kind": kind}
+                        for turn, usd, kind in self.quotes
+                    ],
+                    "conflicts": [{"kind": kind, "usd": usd} for kind, usd in self.conflicts],
+                    "full_price_turn": self.full_price_turn,
+                }
+                if self._totals_read
+                else {}
+            ),
         }
