@@ -259,7 +259,15 @@ from r1_prompts import (
     select_context,
 )
 from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
-from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
+from r1_script import (
+    INTERVIEWER_NAME,
+    active_line_id,
+    is_candidate_free,
+    known_first_name,
+    line,
+    spoken_first_name,
+    transition_repair_enabled,
+)
 from r1_sarvam import current_speech_id
 from r1_text import normalize
 from r1_tracker import explicit_end_request
@@ -599,10 +607,14 @@ _LIVE_PHASES = frozenset(
 # can play (pr4c-rebase.md 4.1).
 _WARM_ORDER = (
     "L-TRANSITION",
+    "L-TRANSITION-AGAIN",
+    "L-TRANSITION-RECAP",
+    "L-PRESENT",
     "L-TRANSITION-NUDGE",
     "L-TRANSITION-REASK",
     "L-TRANSITION-STEER",
     "L-TRANSITION-REASK-2",
+    "L-PICKUP-BRIDGE",
     "L-PICKUP",
     "L-EXIT",
     "L-WRAP",
@@ -625,6 +637,13 @@ _WARM_ORDER = (
 # bridge, which ships off, so it is warmed (right after L-TRANSITION) only while the bridge is on:
 # off, the warm-up spends exactly today's Sarvam requests (``R1Interview._warm_order``).
 _BRIDGED_BRIEF = "L-TRANSITION-BRIDGED"
+# M032 S6: the lines only the transition repair speaks (``R1_TRANSITION_REPAIR``).  With the flag
+# off they are not warmed, so the warm-up spends exactly revision 21's Sarvam requests (the Sarvam
+# quota is shared with the phone lane).  The tails (L-TRANSITION-ASK and its rotated forms) travel
+# inside Christy's answers and are never warmed.
+_TRANSITION_REPAIR_LINES = frozenset(
+    {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
+)
 # The marker of the reaction sentence's speech (latency and line-cache lines; never its words).
 _BRIDGE_MARKER = "transition_bridge"
 # Line-cache events that mean something went wrong (logged as warnings).
@@ -662,6 +681,23 @@ _TRANSITION_NUDGE = "nudge"
 _TRANSITION_STEER = "steer"
 _TRANSITION_INVITE = "invite"
 _TRANSITION_ANSWER = "answer"
+# M032 S6 (R1_TRANSITION_REPAIR): the short recap (L-TRANSITION-RECAP), "Yes, I'm here." and the
+# yes/no start question for a presence check, and the yes/no start question alone (a brief request
+# once the replay and the recaps are used).
+_TRANSITION_RECAP = "recap"
+_TRANSITION_PRESENCE = "presence"
+_TRANSITION_REASK = "reask"
+# SWEEP-29: one budget of recaps per session, shared by a request for a shorter brief, a brief
+# request once the replay was used and a question about the role-play; the full replay keeps its own
+# budget of one.
+RECAP_LIMIT = 2
+# The lines that are a brief: a pronoun request ("say it in short") is about the brief only right
+# after one of them (SWEEP-29).
+_BRIEF_LINES = frozenset(
+    {"L-TRANSITION", "L-TRANSITION-BRIDGED", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP"}
+)
+# SWEEP-32: the answers' start questions once the brief's either/or question has been heard.
+_ROTATED_TAILS = ("L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3")
 # What Christy's last start question asked (``R1Interview._start_question``, M1 review fix): a
 # short yes ("Yes.", "Okay.") agrees to start only after a yes/no question that finished playing
 # (L-TRANSITION-REASK, L-TRANSITION-STEER).  After an either/or one ("Shall we start now, or do
@@ -677,6 +713,15 @@ _BARE_NO_WORDS = frozenset({"no", "nope", "nah", "none", "nothing"})
 _START_QUESTION_OF_LINE = {
     "L-TRANSITION": _EITHER_OR,
     "L-TRANSITION-BRIDGED": _EITHER_OR,  # M032 S5: the same brief, after Christy's reaction
+    # M032 S6: the replay, the recap, the answers' rotated start questions and the rollback briefs
+    # all end with an either/or question.
+    "L-TRANSITION-AGAIN": _EITHER_OR,
+    "L-TRANSITION-RECAP": _EITHER_OR,
+    "L-TRANSITION-ASK": _EITHER_OR,
+    "L-TRANSITION-ASK-2": _EITHER_OR,
+    "L-TRANSITION-ASK-3": _EITHER_OR,
+    "L-TRANSITION-V20": _EITHER_OR,
+    "L-TRANSITION-BRIDGED-V20": _EITHER_OR,
     "L-TRANSITION-REASK": _YES_NO,
     "L-TRANSITION-STEER": _YES_NO,
     "L-TRANSITION-REASK-2": _SAY_READY,
@@ -1147,19 +1192,213 @@ _BRIEF_ROLE_CHECK_RE = re.compile(
 )
 
 
-def is_brief_request(text: str) -> bool:
+def is_brief_request(text: str, *, wide: bool = False, lead_names: tuple[str, ...] = ()) -> bool:
     """True for a request to hear the role-play brief again ("Can you repeat that?", "Could you
     please explain me again ...", "I wanted to understand this round, the role play brief").
 
     A consent wins first (``is_transition_consent``): "Okay, ready, let's go." picks up.  A turn
     that asks something is no consent, so "Okay, ready, what do I say?" is a brief request.
+
+    M032 S6 item 1 (``wide``, R1_TRANSITION_REPAIR): also a summary, recap or overview of the
+    role-play, "tell me (more) about the role play (again)", more information or details about it,
+    and the learner's name as the thing asked about (``lead_names``; owner's call fda9e9f6 #24 and
+    #26 asked twice and were answered with "What would you like to know?" and the shift timings).
     """
     folded = fold_speech(text)
     if not folded or is_transition_consent(text):
         return False
     if _BRIEF_REQUEST_RE.search(folded) is not None or _BRIEF_SHORT_RE.match(folded):
         return True
+    if wide and _brief_wide_re(lead_names).search(folded) is not None:
+        return True
     return _has_question_mark(text) and _BRIEF_ROLE_CHECK_RE.search(folded) is not None
+
+
+# M032 S6 item 1: the wider brief request (R1_TRANSITION_REPAIR), on folded text.  The object must be
+# the role-play's (``_BRIEF_OBJECT`` after "this/the/that", or the learner's own name): "a summary of
+# my experience", "tell me about the role", "just to recap everything, the course has six modules"
+# and every turn of the 2,136-turn advisor corpus stay negative.
+_BRIEF_DET_OBJECT = r"(?:this|the|that) " + _BRIEF_OBJECT
+_BRIEF_SUMMARY_WORD = r"(?:summary|summari[sz]e|recap|overview|rundown)"
+_BRIEF_INFO_WORD = r"(?:information|info|details?)"
+_BRIEF_ABOUT_WORD = r"(?:of|on|about|for|regarding)"
+
+
+def _lead_alternation(lead_names: tuple[str, ...]) -> str:
+    """The learner's names as one regex alternation (folded, longest first), or "" for none."""
+    names = sorted(
+        {fold_speech(name) for name in lead_names if fold_speech(name)}, key=len, reverse=True
+    )
+    return "|".join(re.escape(name) for name in names)
+
+
+_BRIEF_WIDE_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
+
+
+def _brief_wide_re(lead_names: tuple[str, ...]) -> re.Pattern[str]:
+    """The S6 item 1 forms, with the learner's names as a brief object (cached per name set)."""
+    key = tuple(lead_names)
+    pattern = _BRIEF_WIDE_CACHE.get(key)
+    if pattern is not None:
+        return pattern
+    leads = _lead_alternation(key)
+    obj = f"(?:{_BRIEF_DET_OBJECT}|{leads})" if leads else f"(?:{_BRIEF_DET_OBJECT})"
+    pattern = re.compile(
+        r"\b(?:"
+        # "a summary of this role play", "a quick overview of the scenario"
+        + _BRIEF_SUMMARY_WORD + r"(?: \S+){0,3}? " + _BRIEF_ABOUT_WORD + " " + obj + r"|"
+        # "summarise the role play", "recap the brief for me"
+        + r"(?:summari[sz]e|recap)(?: (?:me|us|again|quickly|once))? " + obj + r"|"
+        # "tell me about the role play again", "tell me a bit more about Meera"
+        + r"tell (?:me|us)(?: a (?:bit|little))?(?: more)? about " + obj + r"|"
+        # "more information on this role play", "details about the scenario"
+        + _BRIEF_INFO_WORD + " " + _BRIEF_ABOUT_WORD + " " + obj
+        + (r"|who is (?:" + leads + r")" if leads else "")
+        + r")\b"
+    )
+    if len(_BRIEF_WIDE_CACHE) < 32:
+        _BRIEF_WIDE_CACHE[key] = pattern
+    return pattern
+
+
+# SWEEP-29: a request for a SHORTER brief (R1_TRANSITION_REPAIR), on folded text, one sentence at a
+# time.  Owner tests 8f5bfefc #25-#28 (the instruction "in about four lines" got the nudge and then
+# the whole brief) and fda9e9f6 #24-#30 (a summary got "What would you like to know?").
+_SHORT_MARKER = (
+    r"(?:briefly|in brief|in short|short(?:er)? version|shorter|quick(?:ly)?|summary|"
+    r"summari[sz]e|sum (?:it|this|that|everything) up|in a nutshell|in simpler? words|simpler|"
+    r"(?:short|small) brief|in(?: (?:like|about|just|maybe|around|only|max|maximum)){0,2} "
+    r"(?:one|two|three|four|five|a few|\d+) (?:lines?|sentences?|points?|words?))"
+)
+_SHORT_MARKER_RE = re.compile(r"\b" + _SHORT_MARKER + r"\b")
+# The ask that must go with a marker and a brief object ("In short, I sold courses" asks nothing).
+_SHORT_ASK_RE = re.compile(
+    r"\b(?:(?:can|could|would|will) you|please|(?:give|tell|explain|say|put|repeat|summari[sz]e|"
+    r"describe|go over|brief)(?: me| us)?|(?:i|we) (?:want|need|would like)|(?:i'd|we'd) like)\b"
+)
+# "what I have to do" is a brief object as well.
+_SHORT_OBJECT_RE = re.compile(
+    r"\b(?:" + _BRIEF_DET_OBJECT
+    + r"|what (?:i|we) (?:have|need|am supposed|are supposed) to do)\b"
+)
+# Lazy filler a marker may sit behind ("say it like in four lines", "explain it again just briefly").
+_SHORT_FILLER = (
+    r"(?: (?:like|just|maybe|um|uh|please|a|bit|little|kind|of|sort|again|for|me|us|once|more|"
+    r"so|very|really|bit)){0,3}?"
+)
+# With Christy's brief the last thing said: the pronoun forms ("explain it again briefly", "say it
+# in short") and the bare ones ("Can you summarise?", "Give me the short version.").
+_SHORT_PRONOUN_RE = re.compile(
+    r"\b(?:say|put|explain|tell|give|repeat|go over|summari[sz]e)(?: me| us)?"
+    r"(?: it| this| that| everything| all that| all of (?:it|that))?"
+    r"(?: again| once more| one more time)?" + _SHORT_FILLER + " " + _SHORT_MARKER
+    + r"(?: please| for me| for us)?$|"
+    r"\b(?:can|could|would|will) you (?:please |just |kindly )?"
+    r"(?:summari[sz]e|sum (?:it|this|that|everything) up|shorten (?:it|this|that))"
+    r"(?: (?:it|this|that|everything|for me|for us|please|again))*$|"
+    r"\b(?:give|tell) (?:me|us) (?:a|the) (?:quick |short |brief |shorter )?"
+    r"(?:summary|short version|shorter version|recap|overview)(?: please| again)*$|"
+    r"^(?:(?:um|uh|okay|ok|so|sorry|please|just|can you|could you|maybe) )*"
+    r"(?:briefly|in short|in brief|shorter|(?:the )?short(?:er)? version|a summary|(?:a )?quick "
+    r"summary)(?: please)?$"
+)
+# The negative look: a summary "of" something that is not the brief ("a quick summary of the
+# salary") is no short-brief request, whatever was said last.
+_SHORT_OF_OTHER_RE = re.compile(r"\b(?:summary|recap|overview|version) (?:of|on|about) (?!" +
+                                _BRIEF_DET_OBJECT + r")")
+_SENTENCE_SPLIT_RE = re.compile(r"[.?!。？！]+")
+
+
+def is_short_brief_request(
+    text: str, *, after_brief: bool = False, lead_names: tuple[str, ...] = ()
+) -> bool:
+    """SWEEP-29: a request for the brief in SHORT ("summarise the role play", "say it in four
+    lines", "Can you explain it again briefly?"), on folded text, one sentence at a time.
+
+    A shortness marker with an ask and a brief object (``_SHORT_OBJECT_RE`` or the learner's
+    name), or, with Christy's brief the last thing said (``after_brief``), a pronoun or bare form
+    ("say it in short", "Can you summarise?").  A consent wins first.  "Shortly" (often "soon" in
+    Indian English) and a bare "brief" are never markers.
+    """
+    if not text or is_transition_consent(text):
+        return False
+    leads = _lead_alternation(tuple(lead_names))
+    lead_re = re.compile(r"\b(?:" + leads + r")\b") if leads else None
+    for part in _SENTENCE_SPLIT_RE.split(str(text)):
+        folded = fold_speech(part)
+        if not folded or _SHORT_MARKER_RE.search(folded) is None:
+            continue
+        if _SHORT_OF_OTHER_RE.search(folded) is not None:
+            continue
+        has_object = _SHORT_OBJECT_RE.search(folded) is not None or (
+            lead_re is not None and lead_re.search(folded) is not None
+        )
+        if has_object and _SHORT_ASK_RE.search(folded) is not None:
+            return True
+        if after_brief and _SHORT_PRONOUN_RE.search(folded) is not None:
+            return True
+    return False
+
+
+# M032 S6 item 3: "Are you there?", "Hello?", "Can you hear me?" (fda9e9f6 #28 got nothing at all:
+# every word of it is a backchannel word).  Only presence words around the check; a request to say
+# it again ("what", "again", "pardon") is a repeat request, not a presence check.
+_PRESENCE_RE = re.compile(
+    r"\b(?:(?:are )?you (?:still )?there|hello|(?:can|could) you (?:hear|see) me(?: now)?|"
+    r"is (?:anyone|anybody|someone) there)\b"
+)
+_PRESENCE_WORDS = (
+    (_REPAIR_WORDS - {"what", "again", "huh", "pardon"})
+    | _INTERVIEWER_NAMES
+    | frozenset({"ma'am", "maam", "mam", "madam", "sir", "now", "um", "uh", "hmm"})
+)
+
+
+def is_presence_check(text: str) -> bool:
+    """True for a turn that only checks the interviewer is there ("Hello? Are you there?")."""
+    folded = fold_speech(text)
+    if not folded or _PRESENCE_RE.search(folded) is None:
+        return False
+    return all(word in _PRESENCE_WORDS for word in _PRESENCE_RE.sub(" ", folded).split())
+
+
+# M032 S6 item 2: a transition turn that is about the role-play itself (owner's call fda9e9f6 #26:
+# "tell me about the role play again" was answered with the JOB's shift timings).  It names the
+# role-play, the brief, the scenario, the learner or her name, and asks something.
+_ROLEPLAY_NAMED_RE = re.compile(
+    r"\b(?:role ?play|roleplay|(?:the|this|that|your) brief|scenario|the learner|the lead|"
+    r"the prospect)\b"
+)
+_ROLEPLAY_ASK_RE = re.compile(
+    r"\b(?:(?:tell|explain|describe|clarify|give|share) (?:me|us)|what|what's|whats|how|how's|when|"
+    r"where|why|who|which|whether)\b|"
+    r"^(?:(?:so|and|but|okay|ok|um|uh|well|sorry|yes|yeah|also|just) )*"
+    r"(?:am|is|are|do|does|did|will|would|have|has|was|were|can|could|should|shall|may)"
+    r" (?:i|we|you|she|he|it|there|they)\b"
+)
+# "I don't have any questions about the role play": the mention is cut before the no-questions test.
+_ROLEPLAY_MENTION_RE = re.compile(
+    r"\b(?:about|on|regarding|for|of) (?:the|this|that) (?:role ?play|roleplay|brief|scenario)\b"
+)
+
+
+def names_the_roleplay(text: str, lead_names: tuple[str, ...] = ()) -> bool:
+    """True for a transition turn that asks about the role-play itself (S6 item 2)."""
+    folded = fold_speech(text)
+    if not folded:
+        return False
+    named = _ROLEPLAY_NAMED_RE.search(folded) is not None
+    if not named:
+        leads = _lead_alternation(tuple(lead_names))
+        named = bool(leads) and re.search(r"\b(?:" + leads + r")\b", folded) is not None
+    if not named:
+        return False
+    return _has_question_mark(text) or _ROLEPLAY_ASK_RE.search(folded) is not None
+
+
+def no_questions_about_the_roleplay(text: str) -> bool:
+    """ "No questions about the role play." is a no-questions turn, not a role-play question."""
+    return is_no_questions(_ROLEPLAY_MENTION_RE.sub(" ", fold_speech(text)))
 
 
 # A1: the last word of a turn that stops in the middle of a sentence ("... to be added is. I.",
@@ -1919,6 +2158,22 @@ class R1Interview:
         # The brief on request: asked for during the transition, and replayed (once per session).
         self._brief_requested = False
         self._brief_repeated = False
+        # M032 S6 (R1_TRANSITION_REPAIR): the short recap asked for (latched like the replay) and
+        # how many were played (``RECAP_LIMIT``); the candidate row whose request the transcript
+        # latch already took (its turn hook queues nothing more); which brief is playing ("brief",
+        # "replay", "recap"; None) and the last line Christy finished in the transition; how many
+        # start-question tails the answers carried and whether the last answer went without one;
+        # where the "I'm ready" press came, what started the role-play, and the counts the
+        # session_facts row carries (labels and counts only).
+        self._recap_requested = False
+        self._recaps_played = 0
+        self._brief_latch_index: int | None = None
+        self._brief_playing: str | None = None
+        self._last_transition_line: str | None = None
+        self._answer_tails = 0
+        self._last_answer_tailless = False
+        self._pressed_during: str | None = None
+        self._start_by: str | None = None
         self._transition_started_at: float | None = None
         # Repair (round 2): seconds the transition spent in PAUSED_DISCONNECTED.  The 6:00 ceiling
         # is moved by them, so a candidate who rejoins in time is never closed for being away.
@@ -2021,9 +2276,13 @@ class R1Interview:
         _log.info("unknown_event", error_type="r1_spoken_name_adopted")
 
     def render_line(self, line_id: str) -> str:
-        """Render one pinned line; the persona supplies the lead name, city and pickup."""
+        """Render one pinned line; the persona supplies the lead name, city and pickup.
+
+        M032 S6: ``active_line_id`` picks the text, so ``R1_TRANSITION_REPAIR=0`` speaks revision
+        21's brief, pickup and coach aside under the same ids (warm-up, cache and logs follow).
+        """
         return line(
-            line_id,
+            active_line_id(line_id),
             first_name=self._first_name(),
             **self.persona.line_values,
         )
@@ -2264,6 +2523,8 @@ class R1Interview:
             return
         self._ready_latched = True
         self._awaiting_ready = False
+        # M032 S6 item 6: during a brief, the replay, the recap, or the wait (session_facts).
+        self._pressed_during = self._brief_playing or "wait"
         _log.info("unknown_event", error_type="r1_ready_button", phase="transition")
         self._wake()
 
@@ -2581,6 +2842,7 @@ class R1Interview:
                         pins,
                         roleplay_seconds=self.machine.roleplay_elapsed,
                         first_audio_p95_ms=self._first_audio_p95_ms(),
+                        extra=self._repair_facts(),
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - the record must never block the exit
@@ -2596,6 +2858,17 @@ class R1Interview:
         task = asyncio.ensure_future(self._post_fidelity(poster, events))
         self._turn_writes.add(task)
         task.add_done_callback(self._turn_writes.discard)
+
+    def _repair_facts(self) -> dict[str, Any]:
+        """M032 S6: the labels and counts the repairs add to ``session_facts`` (flags on only)."""
+        facts: dict[str, Any] = {}
+        if transition_repair_enabled():
+            if self._start_by is not None:
+                facts["start_by"] = self._start_by
+            if self._start_by == "button" and self._pressed_during is not None:
+                facts["pressed_during"] = self._pressed_during
+            facts["transition_recaps"] = self._recaps_played
+        return facts
 
     async def _post_fidelity(
         self, poster: Callable[..., Awaitable[Any]], events: list[dict[str, Any]]
@@ -2834,6 +3107,8 @@ class R1Interview:
         if line_id in _START_QUESTION_OF_LINE:
             # Set once the line has played: a short yes said over it answers nothing yet.
             self._start_question = _START_QUESTION_OF_LINE[line_id]
+        if self.machine.phase is R1Phase.TRANSITION:
+            self._last_transition_line = line_id  # M032 S6: "say it in short" after a brief
 
     # ------------------------------------------------------------ voices
 
@@ -2922,11 +3197,15 @@ class R1Interview:
 
     @staticmethod
     def _warm_order() -> tuple[str, ...]:
-        """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on."""
+        """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on, and
+        without M032 S6's lines while the transition repair is off."""
+        order = _WARM_ORDER
+        if not transition_repair_enabled():
+            order = tuple(line_id for line_id in order if line_id not in _TRANSITION_REPAIR_LINES)
         if not transition_bridge_enabled():
-            return _WARM_ORDER
-        index = _WARM_ORDER.index("L-TRANSITION") + 1
-        return (*_WARM_ORDER[:index], _BRIDGED_BRIEF, *_WARM_ORDER[index:])
+            return order
+        index = order.index("L-TRANSITION") + 1
+        return (*order[:index], _BRIDGED_BRIEF, *order[index:])
 
     def _start_line_warmup(self, *, candidate_free: bool) -> None:
         """Warm one group of lines in the background.
@@ -3378,7 +3657,11 @@ class R1Interview:
             # or waiting for the candidate): a turn now is held like one spoken over the brief,
             # never answered ahead of it.  A brief request is still latched at the transcript.
             return _TRANSITION_QUIET
-        if self._brief_due() or (not self._brief_repeated and is_brief_request(text)):
+        if self._brief_due():
+            return _TRANSITION_BRIEF
+        if transition_repair_enabled():
+            return self._repaired_transition_action(text)
+        if not self._brief_repeated and is_brief_request(text):
             return _TRANSITION_BRIEF
         if (
             is_short_yes(text)
@@ -3406,6 +3689,96 @@ class R1Interview:
         if is_permission_to_ask(text):
             return _TRANSITION_INVITE
         return _TRANSITION_ANSWER
+
+    def _repaired_transition_action(self, text: str) -> str:
+        """M032 S6 (``R1_TRANSITION_REPAIR``): ``_transition_action`` once no consent, bridge or
+        replay is pending.
+
+        * A recap already asked for holds every turn until it plays (as the replay does).
+        * A presence check ("Are you there?") gets "Yes, I'm here." and the yes/no start question
+          (item 3), before the backchannel test that used to swallow it.
+        * A brief request, or a request for a shorter one (SWEEP-29), gets what its budget gives
+          (``_brief_route``): the replay, the recap, or the yes/no start question once both are
+          used.  The nudge never answers a brief request.
+        * A question about the role-play itself never reaches the model (item 2): the replay if it
+          is unused, else the recap, else the nudge.
+        * The rest is routed as before (the nudge, nothing at all, the steer, the invite, or an
+          answer from the role facts).
+        """
+        if self._recap_due():
+            return _TRANSITION_RECAP
+        if text and is_presence_check(text):
+            return _TRANSITION_PRESENCE
+        route = self._brief_route(text)
+        if route is not None:
+            return route
+        if (
+            is_short_yes(text)
+            and self._start_question == _EITHER_OR
+            and self._agent_state in _QUIET_AGENT_STATES
+        ):
+            return _TRANSITION_NUDGE  # "Yes." to "now, or questions first?" says neither
+        if (
+            text
+            and self._agent_state in _QUIET_AGENT_STATES
+            and not is_short_yes(text)
+            and is_no_questions(text)
+            and _BARE_NO_WORDS.intersection(fold_speech(text).split())
+        ):
+            return _TRANSITION_NUDGE
+        if not text or is_backchannel_turn(text) or is_name_only(text):
+            return _TRANSITION_QUIET
+        if is_no_questions(text) or no_questions_about_the_roleplay(text):
+            return _TRANSITION_NUDGE
+        if names_the_roleplay(text, self._lead_names()) and not is_permission_to_ask(text):
+            if not self._brief_repeated:
+                return _TRANSITION_BRIEF
+            return _TRANSITION_RECAP if self._recaps_left() > 0 else _TRANSITION_NUDGE
+        if self._transition_answers >= TRANSITION_QUESTION_LIMIT:
+            return _TRANSITION_NUDGE if self._transition_steered else _TRANSITION_STEER
+        if is_permission_to_ask(text):
+            return _TRANSITION_INVITE
+        return _TRANSITION_ANSWER
+
+    def _lead_names(self) -> tuple[str, ...]:
+        """The learner's full and first name (the brief's object in a request; never logged)."""
+        try:
+            persona = self.persona
+            return tuple(name for name in (persona.lead_name, persona.first_name) if name)
+        except Exception:  # noqa: BLE001 - a missing persona only narrows the detector
+            return ()
+
+    def _after_brief(self) -> bool:
+        """True while a brief is playing or was the last line Christy finished (SWEEP-29)."""
+        return self._brief_playing is not None or self._last_transition_line in _BRIEF_LINES
+
+    def _recaps_left(self) -> int:
+        """Recaps still to give (``RECAP_LIMIT``), counting one already asked for."""
+        return RECAP_LIMIT - self._recaps_played - (1 if self._recap_requested else 0)
+
+    def _brief_route(self, text: str) -> str | None:
+        """M032 S6: what a request for the brief gets now, or None when ``text`` asks for none.
+
+        A request for a SHORTER brief (``is_short_brief_request``, SWEEP-29) gets the recap while
+        one is left, else the replay while it is unused.  Any other brief request (the wider
+        ``is_brief_request``, item 1) gets the replay while it is unused, else the recap.  Once
+        both budgets are used: the yes/no start question (L-TRANSITION-REASK), never the nudge.
+        """
+        if not text:
+            return None
+        leads = self._lead_names()
+        short = is_short_brief_request(text, after_brief=self._after_brief(), lead_names=leads)
+        if not short and not is_brief_request(text, wide=True, lead_names=leads):
+            return None
+        replay_left = not self._brief_repeated and not self._brief_requested
+        recap_left = self._recaps_left() > 0
+        if short and recap_left:
+            return _TRANSITION_RECAP
+        if replay_left:
+            return _TRANSITION_BRIEF
+        if recap_left:
+            return _TRANSITION_RECAP
+        return _TRANSITION_REASK
 
     def _transition_consent(self, text: str) -> bool:
         """M1: does this transition turn agree to start the role-play?
@@ -3689,7 +4062,7 @@ class R1Interview:
                 # line now instead of waiting out a silence window for an answer nobody gave.
                 self._wake()
             elif action is not None and text:
-                self._queue_transition_line(action)
+                self._queue_transition_line(action, index)
             raise StopResponse()
         if phase is R1Phase.ICEBREAKER and deferral == _DEFER_BARGE_IN:
             _log.info("unknown_event", error_type="r1_icebreaker_barge_in_answered")
@@ -3710,7 +4083,12 @@ class R1Interview:
                 # M1: Christy's answer ends with the start question, in the same speech (so the
                 # candidate can cut in with "ready" or the next question at any point).
                 self._transition_answers += 1
-                reply.tail = self.render_line("L-TRANSITION-ASK")
+                reply.tail = self.render_line(self._answer_tail_id())
+                # M032 S6 item 7: dropped at the stream's end when her answer already ends with
+                # a question, unless the last answer went without one (SWEEP-32).
+                reply.tail_optional = (
+                    transition_repair_enabled() and not self._last_answer_tailless
+                )
                 self._start_question = _EITHER_OR
             elif action == _TRANSITION_INVITE:
                 self._start_question = None  # "of course, go ahead": no start question
@@ -3727,6 +4105,31 @@ class R1Interview:
             self._replies[str(message_id)] = reply
             while len(self._replies) > _REPLIES_KEPT:
                 self._replies.pop(next(iter(self._replies)))
+
+    def _answer_tail_id(self) -> str:
+        """The start question an answer ends with (SWEEP-32, ``R1_TRANSITION_REPAIR``).
+
+        L-TRANSITION-ASK until the brief's either/or question has been heard; from then on the
+        shorter either/or forms in turn, so the same words are not repeated after every answer.
+        """
+        if not transition_repair_enabled():
+            return "L-TRANSITION-ASK"
+        heard = self._start_question == _EITHER_OR or self._last_transition_line in _BRIEF_LINES
+        if not heard:
+            return "L-TRANSITION-ASK"
+        line_id = _ROTATED_TAILS[self._answer_tails % len(_ROTATED_TAILS)]
+        self._answer_tails += 1
+        return line_id
+
+    def _drop_answer_tail(self, reply: Reply) -> None:
+        """M032 S6 item 7: the answer already asked the candidate something, so the start question
+        is not added: the answer is not counted, and no start question is open."""
+        self._transition_answers = max(0, self._transition_answers - 1)
+        if reply.tail in {self.render_line(line_id) for line_id in _ROTATED_TAILS}:
+            self._answer_tails = max(0, self._answer_tails - 1)
+        self._start_question = None
+        self._last_answer_tailless = True
+        _log.info("unknown_event", error_type="r1_transition_tail_dropped")
 
     def _plan_icebreaker_reply(self, reply: Reply, text: str, index: int | None) -> None:
         """M032 S5: decide what Christy's icebreaker reply is FOR (``r1_icebreaker``).
@@ -3786,17 +4189,55 @@ class R1Interview:
             option_count=self._icebreaker_plan.cursor,
         )
 
-    def _queue_transition_line(self, action: str) -> None:
-        """M1: hand the driver the scripted line a suppressed transition turn gets, if any."""
+    def _queue_transition_line(self, action: str, index: int | None = None) -> None:
+        """M1: hand the driver the scripted line a suppressed transition turn gets, if any.
+
+        M032 S6: "Yes, I'm here." with the yes/no start question for a presence check, the yes/no
+        start question alone, and the recap (latched like the replay: the driver plays it).  A turn
+        whose request the transcript latch already took (``_brief_latch_index``) gets nothing more:
+        the replay or the recap it asked for answers it, once.
+        """
+        if action in (_TRANSITION_BRIEF, _TRANSITION_RECAP, _TRANSITION_REASK) and (
+            index is not None and index == self._brief_latch_index
+        ):
+            return
         if action == _TRANSITION_STEER:
             self._transition_steered = True
-            line_id = "L-TRANSITION-STEER"
+            line_ids: tuple[str, ...] = ("L-TRANSITION-STEER",)
         elif action == _TRANSITION_NUDGE:
-            line_id = "L-TRANSITION-NUDGE"
+            line_ids = ("L-TRANSITION-NUDGE",)
+        elif action == _TRANSITION_PRESENCE:
+            line_ids = ("L-PRESENT", "L-TRANSITION-REASK")
+            _log.info("unknown_event", error_type="r1_transition_presence")
+        elif action == _TRANSITION_REASK:
+            line_ids = ("L-TRANSITION-REASK",)
+        elif action == _TRANSITION_RECAP:
+            self._latch_brief(_TRANSITION_RECAP, index)
+            return
+        elif action == _TRANSITION_BRIEF and transition_repair_enabled():
+            self._latch_brief(_TRANSITION_BRIEF, index)
+            return
         else:
             return  # the pickup, the replay or nothing at all: the driver handles those itself
-        if line_id not in self._transition_lines:
-            self._transition_lines.append(line_id)
+        for line_id in line_ids:
+            if line_id not in self._transition_lines:
+                self._transition_lines.append(line_id)
+        self._wake()
+
+    def _latch_brief(self, route: str, index: int | None) -> None:
+        """Ask the driver for the replay or the recap (once each while pending), and wake it."""
+        if route == _TRANSITION_BRIEF:
+            if self._brief_requested or self._brief_repeated:
+                return
+            self._brief_requested = True
+            _log.info("unknown_event", error_type="r1_brief_requested")
+        else:
+            if self._recap_requested or self._recaps_left() <= 0:
+                return
+            self._recap_requested = True
+            _log.info("unknown_event", error_type="r1_brief_recap_requested")
+        if index is not None:
+            self._brief_latch_index = index
         self._wake()
 
     def _plan_learner_reply(
@@ -4359,6 +4800,7 @@ class R1Interview:
 
         reported_before = self._llm_errors_reported
         spoke = False  # a sentence of the model's reply already reached the consumer
+        last_sentence = ""
         recover = False
         iterator: Any = None
         try:
@@ -4374,10 +4816,12 @@ class R1Interview:
                     self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
                         spoke = True
+                        last_sentence = sentence
                         self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
                 spoke = True
+                last_sentence = sentence
                 self._latency.mark("guard_release")
                 yield sentence + " "
         except Exception as exc:  # noqa: BLE001 - a failed model reply must not leave silence
@@ -4401,7 +4845,11 @@ class R1Interview:
             # saying?" (the candidate was clear; the provider was not).
             yield (reply.fallback or FALLBACK_REPLY) + " "
         elif spoke and reply.tail:
-            yield reply.tail + " "
+            if reply.tail_optional and _has_question_mark(last_sentence.rstrip()[-1:]):
+                self._drop_answer_tail(reply)  # M032 S6 item 7: never two questions in one turn
+            else:
+                self._last_answer_tailless = False
+                yield reply.tail + " "
 
     def _reply_failed(self, exc: BaseException, reported_before: int) -> bool:
         """Count one failed model reply and say whether a recovery line should be spoken.
@@ -4862,7 +5310,9 @@ class R1Interview:
         row.last_final_at = self._event_seconds(event)
         self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
         self._learn_spoken_name(" ".join(row.parts))
-        if (
+        if self.machine.phase is R1Phase.TRANSITION and transition_repair_enabled():
+            self._latch_brief_at_transcript(text, row)
+        elif (
             self.machine.phase is R1Phase.TRANSITION
             and not self._brief_repeated
             and not self._brief_requested
@@ -4881,6 +5331,31 @@ class R1Interview:
         self._settle_final.set()
         self._settle_change.set()
         self._speculate_end_intent()
+
+    def _latch_brief_at_transcript(self, text: str, row: _CandidateRow) -> None:
+        """M032 S6: latch a request for the brief (or a shorter one) at the transcript.
+
+        As before, because the SDK drops a turn spoken over an uninterruptible brief.  The latch
+        takes the budget the request would use (``_brief_route``: the replay or the recap), once per
+        candidate row (its turn hook then queues nothing more), and nothing while a replay or a
+        recap is already due.  Said over the replay or the recap only a request for a SHORTER brief
+        is latched (for the recap, if one is left); any other is dropped, as it always was.
+        """
+        if self._brief_due() or self._recap_due() or row.index == self._brief_latch_index:
+            return
+        joined = " ".join(row.parts)
+        route = self._brief_route(text) or self._brief_route(joined)
+        if route not in (_TRANSITION_BRIEF, _TRANSITION_RECAP):
+            return
+        if self._brief_playing in ("replay", "recap"):
+            leads = self._lead_names()
+            short = any(
+                is_short_brief_request(part, after_brief=True, lead_names=leads)
+                for part in (text, joined)
+            )
+            if route != _TRANSITION_RECAP or not short:
+                return
+        self._latch_brief(route, row.index)
 
     def _flush_candidate_row(self) -> None:
         """Write the open candidate row (all its finals, one space apart), once, then close it.
@@ -5265,6 +5740,8 @@ class R1Interview:
                 and not slot.cut_by_r1
             )
         self._note_wrapup_answer(phase, slot, interrupted)
+        if phase == "transition" and slot is not None and slot.source == "generate_reply":
+            self._last_transition_line = "reply"  # M032 S6: an answer, not a brief
         voice = self._remember_bot_turn(index, phase, text, slot)
         played = slot is not None and slot.finished_at is not None
         self._write_turn(
@@ -6229,23 +6706,45 @@ class R1Interview:
             raise
         if reaction is None:
             self._bridging = False  # no await before the brief is queued
-            await self.say("L-TRANSITION")
+            self._brief_playing = "brief"
+            try:
+                await self.say(self._brief_line_id())
+            finally:
+                self._brief_playing = None
             return
-        self._brief_line = _BRIDGED_BRIEF
-        spoken = self._start_text(
-            reaction, interruptible=False, marker=_BRIDGE_MARKER, voice=INTERVIEWER
-        )
-        brief = self._start_text(
-            self.render_line(_BRIDGED_BRIEF),
-            interruptible=False,
-            marker=_BRIDGED_BRIEF,
-            voice=INTERVIEWER,
-        )
-        self._bridging = False
-        await self._await_playout(spoken, _BRIDGE_MARKER, SAY_PLAYOUT_SECONDS)
-        await self._await_playout(brief, _BRIDGED_BRIEF, SAY_PLAYOUT_SECONDS)
+        self._brief_line = self._brief_line_id(bridged=True)
+        self._brief_playing = "brief"
+        try:
+            spoken = self._start_text(
+                reaction, interruptible=False, marker=_BRIDGE_MARKER, voice=INTERVIEWER
+            )
+            brief = self._start_text(
+                self.render_line(self._brief_line),
+                interruptible=False,
+                marker=self._brief_line,
+                voice=INTERVIEWER,
+            )
+            self._bridging = False
+            await self._await_playout(spoken, _BRIDGE_MARKER, SAY_PLAYOUT_SECONDS)
+            await self._await_playout(brief, self._brief_line, SAY_PLAYOUT_SECONDS)
+        finally:
+            self._bridging = False
+            self._brief_playing = None
         # Set once the brief has played, as ``say`` does: a short yes over it answers nothing.
-        self._start_question = _START_QUESTION_OF_LINE[_BRIDGED_BRIEF]
+        self._start_question = _START_QUESTION_OF_LINE[self._brief_line]
+        self._last_transition_line = self._brief_line
+
+    def _brief_line_id(self, *, bridged: bool = False, replay: bool = False) -> str:
+        """M032 S6 (SWEEP-30): the ONE place the brief's line id is picked, for both ``say`` sites.
+
+        The first brief is L-TRANSITION, or L-TRANSITION-BRIDGED after Christy's own reaction (or,
+        SWEEP-28, after a boundary turn that answered nothing).  The replay is L-TRANSITION-AGAIN
+        ("Of course, here it is again.") while ``R1_TRANSITION_REPAIR`` is on, else the brief the
+        candidate heard, word for word.  ``render_line`` gives revision 21's text with the flag off.
+        """
+        if replay:
+            return "L-TRANSITION-AGAIN" if transition_repair_enabled() else self._brief_line
+        return _BRIDGED_BRIEF if bridged else "L-TRANSITION"
 
     async def _wait_for_candidate_turn(self, limit: float) -> None:
         """Wait, at most ``limit`` seconds, while the candidate is mid-turn (speaking, or a final
@@ -6396,6 +6895,27 @@ class R1Interview:
         approved text and cached audio), and the wait goes on from there.  Once per session: a
         later request gets the nudge.  A consent said during the replay picks up right after it,
         and so does the button; a press before the replay means no replay.
+
+        M032 S6 (``R1_TRANSITION_REPAIR``, default on; off restores all of the above exactly):
+
+        * The replay is L-TRANSITION-AGAIN ("Of course, here it is again." and the brief's body),
+          once.  A request for a SHORTER brief (``is_short_brief_request``) gets the short recap
+          L-TRANSITION-RECAP, and so does any later brief request once the replay is used; the
+          recaps share one budget of ``RECAP_LIMIT`` per session.  Once both budgets are used a
+          brief request gets L-TRANSITION-REASK: the nudge never answers a request for the brief.
+        * A question about the role-play itself (``names_the_roleplay``) never reaches the model:
+          the replay while it is unused, else the recap, else the nudge.
+        * "Are you there?" (``is_presence_check``) gets L-PRESENT ("Yes, I'm here.") and
+          L-TRANSITION-REASK.
+        * An answer that already ends with a question of its own carries no start question
+          (never two questions in one turn, and never two answers in a row without one); after the
+          brief's either/or question the answers' start questions rotate through shorter forms.
+        * The button pressed while a brief, the replay or the recap was playing gets
+          L-PICKUP-BRIDGE ("Great, here she is.") before the pickup; ``session_facts`` records
+          ``start_by`` and ``pressed_during`` (labels) and ``transition_recaps`` (a count).
+
+        Consent is unchanged throughout: only a spoken "ready" (or a start phrase,
+        ``is_transition_consent``) or the "I'm ready" button starts the role-play.
         """
         self._drop_stale_turns()
         self._transition_lines.clear()
@@ -6407,13 +6927,22 @@ class R1Interview:
             return ceiling + self._transition_paused_seconds - loop.time()
 
         def interrupted() -> bool:
-            return self._ready_latched or self._brief_due() or bool(self._transition_lines)
+            return (
+                self._ready_latched
+                or self._brief_due()
+                or self._recap_due()
+                or bool(self._transition_lines)
+            )
 
         step = 0  # the silence steps used since the candidate last spoke
         while not self._ready_latched:
             if self._brief_due():
                 if await self._repeat_brief():
                     break  # a consent during the replay
+                continue
+            if self._recap_due():
+                if await self._say_recap():
+                    break  # a consent during the recap (M032 S6)
                 continue
             if self._transition_lines:
                 await self.say(self._transition_lines.popleft())
@@ -6445,12 +6974,22 @@ class R1Interview:
         # learner is picking up), so the page is not asked and the handler ignores it.
         self._awaiting_ready = False
         self._transition_lines.clear()
+        self._start_by = "button" if self._ready_latched else "spoken"
+        # M032 S6 item 6: a press while a brief was playing gets a short bridge before the pickup,
+        # so the brief's either/or question does not hang unanswered.
+        bridge = (
+            self._ready_latched
+            and transition_repair_enabled()
+            and self._pressed_during in ("brief", "replay", "recap")
+        )
         # The pickup is uninterruptible: a candidate still speaking ("Yes, let's start, and ...")
         # is not talked over (aa166f09 review), within the endpointing maximum and a margin.
         await self._wait_while_candidate_speaks(
             endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
         )
         if self._candidate_present:
+            if bridge and not self._pickup_spoken:
+                await self.say("L-PICKUP-BRIDGE")
             await self._speak_pickup_once()
         return None
 
@@ -6475,6 +7014,10 @@ class R1Interview:
         """The candidate asked to hear the brief again, and it has not been replayed yet."""
         return self._brief_requested and not self._brief_repeated
 
+    def _recap_due(self) -> bool:
+        """M032 S6: the candidate asked for the short recap (SWEEP-29), and it has not played."""
+        return self._recap_requested
+
     async def _repeat_brief(self) -> bool:
         """Replay the brief once; True when the candidate said ready while it played.
 
@@ -6488,12 +7031,37 @@ class R1Interview:
         self._brief_repeated = True
         self._brief_requested = False
         _log.info("unknown_event", error_type="r1_brief_repeat")
-        await self.say(self._brief_line)
+        self._brief_playing = "replay"
+        try:
+            await self.say(self._brief_line_id(replay=True))
+        finally:
+            self._brief_playing = None
+        return self._consent_queued()
+
+    def _consent_queued(self) -> bool:
+        """Drain what the candidate said over a replay or a recap: True when a consent was in it."""
         ready = False
         while not self._turns.empty():
             if is_transition_consent(self._turns.get_nowait()):
                 ready = True
         return ready
+
+    async def _say_recap(self) -> bool:
+        """M032 S6 (item 2, SWEEP-29): the short recap; True when the candidate said ready over it.
+
+        L-TRANSITION-RECAP (public brief fields only, about 15 s, the either/or question at its
+        end), uninterruptible like the replay; at most ``RECAP_LIMIT`` per session.  A consent said
+        during it picks up right after it, as during the replay.
+        """
+        self._recap_requested = False
+        self._recaps_played += 1
+        _log.info("unknown_event", error_type="r1_brief_recap", option_count=self._recaps_played)
+        self._brief_playing = "recap"
+        try:
+            await self.say("L-TRANSITION-RECAP")
+        finally:
+            self._brief_playing = None
+        return self._consent_queued()
 
     async def _run_roleplay(self) -> str | None:
         """Run the learner role-play until R=20:00, its S cap, the candidate's end, or a stop.

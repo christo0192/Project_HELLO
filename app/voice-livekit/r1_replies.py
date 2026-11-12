@@ -176,6 +176,9 @@ class Reply:
     # A scripted sentence spoken after the model's reply in the same speech (M1: Christy's
     # L-TRANSITION-ASK after an answer before the role-play); "" for none.
     tail: str = ""
+    # M032 S6 item 7: the tail is left out when the model's reply already ends with a question
+    # (never two questions in one turn); False keeps it whatever the reply says.
+    tail_optional: bool = False
     # M032 S5, the icebreaker plan (``r1_icebreaker``): the per-turn note that takes the
     # getting-to-know-you note's place ("" for the phase's own note), the line spoken INSTEAD of
     # a model call ("Take your time."; "" for a model reply), the line a reply with nothing usable
@@ -344,12 +347,27 @@ def fidelity_events(
     return events
 
 
+# M032 S6: what the transition and the icebreaker repairs add to the ``session_facts`` row (labels
+# and counts only; the API's parser reads none of them, so the gate is unchanged).  ``start_by`` is
+# "button" or "spoken"; ``pressed_during`` is "brief", "replay", "recap" or "wait".
+EXTRA_FACT_KEYS = (
+    "start_by",
+    "pressed_during",
+    "transition_recaps",
+    "icebreaker_repeat_deferrals",
+    "boundary_presence_lines",
+    "ib_holds",
+    "icebreaker_acks_held",
+)
+
+
 def session_facts_event(
     admin: Mapping[str, Any] | None,
     pins: Mapping[str, Any],
     *,
     roleplay_seconds: float,
     first_audio_p95_ms: float | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The one ``session_facts`` row the plan 6.4 gate cannot pass without.
 
@@ -360,6 +378,9 @@ def session_facts_event(
     the PR-4c latency tracker, ``first_audio_p95_ms`` (milliseconds, role-play turns only; the
     caller passes ``None`` when fewer than 8 turns were measured, so the gate says
     ``latency_unknown`` instead of reading a number nobody measured).
+
+    ``extra`` (M032 S6) adds only its ``EXTRA_FACT_KEYS``, and only those it has, so a session with
+    the repairs off posts exactly the row of before.
     """
     communication = (admin or {}).get("communication", {})
     # The engine starts the longest turn at 0.0 and only raises it for a turn whose speaking
@@ -374,9 +395,10 @@ def session_facts_event(
         "interruption_count": None,
         "first_audio_p95_ms": _measured(first_audio_p95_ms),
     }
+    added = {key: extra[key] for key in EXTRA_FACT_KEYS if key in (extra or {})}
     return {
         "event_type": "session_facts",
         "turn_index": None,
         "family_id": None,
-        "payload": {"pins": dict(pins), **facts},
+        "payload": {"pins": dict(pins), **facts, **added},
     }

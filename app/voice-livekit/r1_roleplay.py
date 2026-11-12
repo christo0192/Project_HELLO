@@ -235,7 +235,7 @@ from r1_scheduler import (
     markers_match,
     quotes_price,
 )
-from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS
+from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS, active_line_id
 from r1_script import line as script_line
 from r1_text import (
     PHRASE_STRETCH,
@@ -1484,7 +1484,8 @@ class RolePlayEngine:
         return self._plan(
             TurnMode.SAY_ONLY,
             ["aside_coach", f"character_break:{kind}"],
-            scripted=script_line("L-ASIDE-COACH", **self.persona.line_values),
+            # M032 S6 (SWEEP-30): the reworded aside, or revision 21's with R1_TRANSITION_REPAIR=0.
+            scripted=script_line(active_line_id("L-ASIDE-COACH"), **self.persona.line_values),
             voice="interviewer",
             aside=True,
             line_id="L-ASIDE-COACH",

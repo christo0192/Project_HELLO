@@ -1728,7 +1728,7 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   fails its letters-only test, and six scripted lines splice the name in after a comma ("Thank you,
   there."). `r1_script.known_first_name` treats an empty value, a rejected value, `there` (any case)
   and a single letter as unknown, and `r1_script.line` then deletes the `{first_name}` slot together
-  with its comma: "Thank you. We'll now move to the role-play", "Hi, I'm Christy", "Are you still
+  with its comma: "Thank you. Next, let's do a sales role-play", "Hi, I'm Christy", "Are you still
   with me?", "Welcome back.", "I'm sorry, we need to stop here". The API is unchanged. The provisional
   `r1_lines.py` mirrors it (the drift test pins both).
 * **The name the candidate gives.** While the record has no usable name, a self-introduction in the
@@ -2201,6 +2201,42 @@ Live check (labels only): per session `r1_turn_plan` is absent in the transition
 plan), the bot rows of phase `transition` show Christy's answers each ending with the start
 question, and the pickup row follows a candidate row that agrees. A session with
 `r1_transition_ceiling`, or one that ended `candidate_left` in the transition, is worth a look.
+
+### The brief and the transition, repaired (M032 S6, owner go 2026-11-11)
+
+Owner tests fda9e9f6 and 8f5bfefc: two requests for the brief got "What would you like to know?"
+and the job's shift timings, "Are you there?" got nothing, a request for the brief "in about four
+lines" got the nudge and then the whole 44 s brief again, the replay said "We'll now move to the
+role-play" three minutes in, the start question was heard four times in 2.5 minutes, and an answer
+asked a question of its own before the start question. `R1_TRANSITION_REPAIR` (default on) changes:
+
+* **One brief body** (`r1_script.BRIEF_BODY`): L-TRANSITION is "Thank you, {first_name}. " plus
+  the body, L-TRANSITION-BRIDGED the body alone, the replay L-TRANSITION-AGAIN "Of course, here it
+  is again. " plus the body from "I'll play", and the short recap L-TRANSITION-RECAP reuses the
+  goal clause (`BRIEF_GOAL`). No "We'll now move to the role-play", no "evaluate", one start prompt
+  ("To begin, just say 'ready'." and the either/or question). Consent is unchanged: only "ready"
+  (or a start phrase) or the button.
+* **Routing** (`R1Interview._repaired_transition_action`): a wider brief request (summary, recap,
+  overview, "tell me about the role play again", more details on it, the learner's name) gets the
+  replay once; a request for a shorter one (`is_short_brief_request`) gets the recap; the recaps
+  share a budget of 2 (`RECAP_LIMIT`); once both are used, L-TRANSITION-REASK, never the nudge. A
+  question about the role-play itself never goes to the model (replay, recap, then the nudge). A
+  presence check gets L-PRESENT ("Yes, I'm here.") and L-TRANSITION-REASK.
+* **Start questions**: the transition note (`TRANSITION_REMINDER_REPAIRED`) says "Of course, go
+  ahead." to a request to ask and never ends an answer with a question; an answer that asks anyway
+  drops the start question (not twice in a row; `r1_transition_tail_dropped`), and after the brief
+  the answers' start questions rotate (L-TRANSITION-ASK-2, -3).
+* **Pickup**: "Hello, {lead_first_name} speaking."; the button pressed during a brief, the replay
+  or the recap gets L-PICKUP-BRIDGE ("Great, here she is.") first. L-ASIDE-COACH says Christy is
+  playing the learner.
+* **session_facts** gains `start_by` (button/spoken), `pressed_during` (brief/replay/recap/wait,
+  button only) and `transition_recaps` (a count); the API parser reads none of them.
+
+Logs (labels only): `r1_brief_requested`, `r1_brief_recap_requested`, `r1_brief_recap`,
+`r1_brief_repeat`, `r1_transition_presence`, `r1_transition_tail_dropped`. Content revision 22;
+revision 21's lines stay pinned under -V20 ids. The four new `say` lines are warmed only while the
+flag is on. Rollback: `fly secrets set R1_TRANSITION_REPAIR=0 -a project-hello-voice` restores
+revision 21's brief, replay, nudge, pickup, aside, note and routing exactly.
 
 ### Leaving the role-play by consent (owner decisions 2026-11-03, M2)
 

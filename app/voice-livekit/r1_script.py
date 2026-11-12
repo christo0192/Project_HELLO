@@ -23,11 +23,38 @@ Invariants:
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import string
 from typing import Any
 
 INTERVIEWER_NAME = "Christy"
+
+# M032 S6 (owner go of 2026-11-11, test fda9e9f6 #23-#31; SWEEP-30): ONE body for every brief, so
+# the first brief, the brief after Christy's own reaction (S5's bridge), the replay and the short
+# recap can never drift apart.  ``BRIEF_GOAL`` is the goal clause the recap reuses word for word.
+# No "We'll now move to the role-play" (the move was announced as decided, then asked about), no
+# "evaluate", no second "just say 'ready' and she'll pick up": "To begin, just say 'ready'." and the
+# either/or question are the brief's ONE start prompt (S6.5).  Consent is unchanged: only a spoken
+# "ready" (``is_transition_consent``) or the "I'm ready" button starts the role-play.
+BRIEF_GOAL = "understand her needs and help her decide to enrol"
+BRIEF_START_PROMPT = (
+    "To begin, just say 'ready'. Shall we start the role-play now, or do you have any questions "
+    "first?"
+)
+BRIEF_SCENARIO = (
+    "I'll play {lead_name} from {lead_city}, who filled in a form on our website about the Data "
+    "Science course a few days ago. You're the Program Advisor calling her back. You'll have up "
+    "to twenty minutes, and your goal is to convince her as you would on a real call: "
+    + BRIEF_GOAL
+    + ", using the course details from your preparation guide. I'll stay in character until I "
+    "say, 'Let's pause the role-play here.' "
+    + BRIEF_START_PROMPT
+)
+BRIEF_LEAD_IN = "Next, let's do a sales role-play. "
+BRIEF_BODY = BRIEF_LEAD_IN + BRIEF_SCENARIO
+BRIEF_THANKS = "Thank you, {first_name}. "
+BRIEF_AGAIN = "Of course, here it is again. "
 
 LINES: dict[str, str] = {
     "L-OPEN": (
@@ -40,7 +67,35 @@ LINES: dict[str, str] = {
         "you walk me through your background, especially any sales or customer-facing work "
         "you've done?"
     ),
-    "L-TRANSITION": (
+    # M032 S6 item 5 and SWEEP-30: the brief, from the shared body above.
+    "L-TRANSITION": BRIEF_THANKS + BRIEF_BODY,
+    # M032 S5 item 4: the brief after Christy's own one-sentence reaction to the last icebreaker
+    # answer (R1_TRANSITION_BRIDGE, off by default).  L-TRANSITION without "Thank you,
+    # {first_name}.", so it carries no candidate name and is cached once per machine.  M032 S6
+    # (SWEEP-28): also the brief after a boundary turn that answered nothing (a presence check or
+    # a request to repeat), which has nothing to be thanked for.
+    "L-TRANSITION-BRIDGED": BRIEF_BODY,
+    # M032 S6 item 4 (reverses the 2026-10-30 word-for-word replay under D-M032-4): the brief once
+    # more on request, without the thanks and the lead-in, which said it as if for the first time.
+    "L-TRANSITION-AGAIN": BRIEF_AGAIN + BRIEF_SCENARIO,
+    # M032 S6 item 2 and SWEEP-29: the short recap (public brief fields only, about 15 s) for a
+    # request for a shorter brief, a question about the role-play, or a request after the replay.
+    "L-TRANSITION-RECAP": (
+        "Of course, in short: I'll play {lead_name}, and you're the Program Advisor calling her "
+        "back about the Data Science course. "
+        + BRIEF_GOAL[:1].upper()
+        + BRIEF_GOAL[1:]
+        + ", using your preparation guide. Shall we start the role-play now, or do you have any "
+        "questions first?"
+    ),
+    # M032 S6 item 3 and SWEEP-28 (one id): the answer to "Are you there?".
+    "L-PRESENT": "Yes, I'm here.",
+    # M032 S6 item 6: the "I'm ready" button pressed while a brief was playing; said before the
+    # pickup, so the brief's either/or question does not hang unanswered.
+    "L-PICKUP-BRIDGE": "Great, here she is.",
+    # The briefs as they were before M032 S6 (content revision 21): R1_TRANSITION_REPAIR=0 speaks
+    # these in their place (``ROLLBACK_LINES``).
+    "L-TRANSITION-V20": (
         "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective "
         "learner so we can evaluate how you handle a real sales call. The learner is "
         "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
@@ -51,11 +106,7 @@ LINES: dict[str, str] = {
         "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
         "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
     ),
-    # M032 S5 item 4: the brief after Christy's own one-sentence reaction to the last icebreaker
-    # answer (R1_TRANSITION_BRIDGE, off by default).  L-TRANSITION without "Thank you,
-    # {first_name}.", word for word otherwise, so it carries no candidate name and is cached once
-    # per machine.
-    "L-TRANSITION-BRIDGED": (
+    "L-TRANSITION-BRIDGED-V20": (
         "We'll now move to the role-play. I'll play a prospective "
         "learner so we can evaluate how you handle a real sales call. The learner is "
         "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
@@ -71,6 +122,11 @@ LINES: dict[str, str] = {
     # gives before the role-play (it travels inside her reply); the two re-asks follow candidate
     # silence; L-TRANSITION-STEER answers a question past the limit of three.
     "L-TRANSITION-ASK": "Shall we start the role-play now, or do you have another question?",
+    # M032 S6 (SWEEP-32): once the brief's either/or question has been heard, the answers' start
+    # question rotates through these shorter forms, so the candidate never hears the same words
+    # after every answer.  Both stay either/or: a bare "yes" to them still gets the nudge.
+    "L-TRANSITION-ASK-2": "Anything else, or shall we start?",
+    "L-TRANSITION-ASK-3": "Any other questions, or shall we begin the role-play?",
     "L-TRANSITION-REASK": (
         "Shall we start the role-play now? Just say 'ready' when you are, or ask me a question "
         "first if you have one."
@@ -83,7 +139,9 @@ LINES: dict[str, str] = {
         "Let's keep any other questions for the end of the interview; there'll be time for them "
         "then. Shall we start the role-play now?"
     ),
-    "L-PICKUP": "Hello? Yes, this is {lead_first_name} speaking.",
+    # M032 S6 item 8: "Hello? Yes, this is X speaking." answered a question nobody had asked.
+    "L-PICKUP": "Hello, {lead_first_name} speaking.",
+    "L-PICKUP-V20": "Hello? Yes, this is {lead_first_name} speaking.",
     "L-TIME-CUE": "Just so you know, I've only got a couple of minutes before my next call.",
     "L-EXIT": (
         "Let's pause the role-play here. I'm stepping out of the learner's role now; this "
@@ -98,7 +156,15 @@ LINES: dict[str, str] = {
         "Thank you for your time today, {first_name}. The hiring team will review your "
         "interview and get back to you. You can close this window now. Goodbye."
     ),
+    # M032 S6 (SWEEP-30): in Christy's own voice, "I'm the learner ... She" mixed the two people up,
+    # and it is played exactly when a candidate is confused about roles.  The first-person
+    # "playing" framing of L-OPEN and the brief is kept.
     "L-ASIDE-COACH": (
+        "Quick note from Christy, your interviewer: in this role-play you're the Program "
+        "Advisor, and I'm playing the learner, {lead_name}, who enquired about the Data Science "
+        "course; you're calling her back. Please carry on as you would on a real call."
+    ),
+    "L-ASIDE-COACH-V20": (
         "Quick note from Christy, your interviewer: in this role-play you're the Program "
         "Advisor and I'm the learner, {lead_name}. She enquired about the Data Science "
         "course and you're calling her back. Please carry on as you would on a real call."
@@ -150,7 +216,41 @@ LINES: dict[str, str] = {
     "L-FILLER": "Let me think about that for a second.",
     "L-FILLER-INTERVIEWER": "Let me think about that for a second.",
     "L-FILLER-LEARNER": "One second...",
+    # M032 S6 (SWEEP-28): Christy's scripted reply to "Can you give me a minute?" in the
+    # getting-to-know-you part (R1_ICEBREAKER_REPAIR); it is not counted as an answer.
+    "L-IB-HOLD": "Of course, take a moment. I'm here when you're ready.",
 }
+
+# M032 S6: ``R1_TRANSITION_REPAIR=0`` (the rollback) speaks each of these lines as it was before
+# S6, under its old text's id.  ``active_line_id`` is the one place that choice is made: the
+# session's ``render_line`` and the role-play engine's coach aside both go through it, so the warm
+# order, the cache and the transcript all follow the flag together.
+ROLLBACK_LINES = {
+    "L-TRANSITION": "L-TRANSITION-V20",
+    "L-TRANSITION-BRIDGED": "L-TRANSITION-BRIDGED-V20",
+    "L-PICKUP": "L-PICKUP-V20",
+    "L-ASIDE-COACH": "L-ASIDE-COACH-V20",
+}
+_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+
+
+def transition_repair_enabled() -> bool:
+    """``R1_TRANSITION_REPAIR`` (default on): M032 S6's brief and transition repair.
+
+    The reworded brief and its replay and recap, the wider brief request, the presence answer,
+    the rotated start question, the pickup bridge and line, and the coach aside's wording.  Read
+    at use.  Rollback: ``fly secrets set R1_TRANSITION_REPAIR=0 -a project-hello-voice`` gives back
+    content revision 21's lines and routing exactly.
+    """
+    return (os.getenv("R1_TRANSITION_REPAIR") or "1").strip().lower() not in _OFF_VALUES
+
+
+def active_line_id(line_id: str) -> str:
+    """The id whose text is spoken for ``line_id`` now (``ROLLBACK_LINES`` while S6 is off)."""
+    if line_id in ROLLBACK_LINES and not transition_repair_enabled():
+        return ROLLBACK_LINES[line_id]
+    return line_id
+
 
 # The learner's thinking filler rotates through three variants so a slow model never makes the
 # learner say the same words twice in a row.  The first is ``L-FILLER-LEARNER``; the rotation

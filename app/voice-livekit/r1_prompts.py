@@ -25,7 +25,7 @@ from typing import Iterable, Mapping, Sequence
 
 from r1_guard import REPLY_WORD_CAP
 from r1_personas import TOPIC_LABELS, RenderedPersona
-from r1_script import INTERVIEWER_NAME
+from r1_script import INTERVIEWER_NAME, transition_repair_enabled
 from r1_world import AUDIENCE_INTERVIEWER_FAQ, INTERVIEWER_DEFLECTION, facts_for
 
 MONOLOGUE_THRESHOLD_SEC = 60
@@ -310,6 +310,24 @@ TRANSITION_REMINDER = (
     "the brief, never give tips on how to sell, and never ask whether they are ready to start: "
     "the interview asks that itself."
 )
+# M032 S6 item 7 (owner's call fda9e9f6 #25: "What would you like to know? Shall we start the
+# role-play now, or do you have another question?"): with ``R1_TRANSITION_REPAIR`` on, a request to
+# ask gets "Of course, go ahead." and nothing else, and no answer ends with a question of its own;
+# the session's start question follows it (and is left out when an answer asks anyway).  Questions
+# about the role-play itself never reach the model then (the session's routing), so the ban on
+# describing it stays as it was.
+TRANSITION_REMINDER_REPAIRED = (
+    "INTERVIEW NOTE (not spoken; never mention it). The role-play brief has been given and the "
+    "candidate may ask you questions before the role-play starts. Answer in one or two short, "
+    "friendly sentences, truthfully, using only the facts about the role you were given; for "
+    "anything else (pay, work mode, training, next steps, timelines, how they will be assessed) "
+    "say the hiring team will follow up on it. Never invent a fact, a number or an outcome. If "
+    'they only ask whether they may ask something, say "Of course, go ahead." and stop. Never '
+    "end your reply with a question: the interview asks its own question after you. Never "
+    "start, announce or describe the role-play, never speak as the learner, never repeat the "
+    "brief, never give tips on how to sell, and never ask whether they are ready to start: the "
+    "interview asks that itself."
+)
 _TRANSITION_PHASES = frozenset({"transition"})
 
 # M032 S5 item 1 (owner's call fda9e9f6, #3-#21: every icebreaker reply opened with a verdict on
@@ -447,7 +465,7 @@ def _phase_reminder(phase: str) -> str | None:
     if phase in _WRAPUP_PHASES:
         return WRAPUP_REMINDER
     if phase in _TRANSITION_PHASES:
-        return TRANSITION_REMINDER
+        return TRANSITION_REMINDER_REPAIRED if transition_repair_enabled() else TRANSITION_REMINDER
     return None
 
 

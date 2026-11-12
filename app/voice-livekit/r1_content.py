@@ -145,7 +145,16 @@ import r1_world
 #    "Thank you, {first_name}." that follows the reaction.
 #    Same revision (review fixes): the note tail for a request to skip ahead
 #    (PLAN_NOTE_TAIL_SKIP) and the notes once every objective is reached (FREE_JOB_NOTES).
-CONTENT_REVISION = 21
+# 22: M032 S6, the brief and the transition repaired (owner go of 2026-11-11, tests fda9e9f6 and
+#    8f5bfefc; R1_TRANSITION_REPAIR): one shared body for every brief (r1_script.BRIEF_BODY), so
+#    L-TRANSITION, L-TRANSITION-BRIDGED, the replay L-TRANSITION-AGAIN ("Of course, here it is
+#    again.") and the short recap L-TRANSITION-RECAP cannot drift apart, with no "We'll now move to
+#    the role-play", no "evaluate" and ONE start prompt; L-PRESENT ("Yes, I'm here."),
+#    L-PICKUP-BRIDGE, the rotated start questions L-TRANSITION-ASK-2/-3, the pickup "Hello, {lead}
+#    speaking.", and L-ASIDE-COACH saying Christy is PLAYING the learner.  Revision 21's texts stay
+#    pinned under their -V20 ids, which R1_TRANSITION_REPAIR=0 speaks.  The transition note that
+#    asks nothing itself (r1_prompts.TRANSITION_REMINDER_REPAIRED) joins the manifest.
+CONTENT_REVISION = 22
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -338,6 +347,7 @@ def manifest() -> dict[str, Any]:
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,
+            "transition_reminder_repaired": r1_prompts.TRANSITION_REMINDER_REPAIRED,
             "getting_to_know_you_note": r1_prompts.GETTING_TO_KNOW_YOU_NOTE,
             "learner_prefixes": {
                 f"{p.id}.{v.id}": r1_prompts.learner_prefix(r1_personas.resolve_persona(

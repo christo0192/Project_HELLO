@@ -3292,15 +3292,21 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # spend the Sarvam budget it shares with the phone lane on audio nothing can play.
         # M1: L-TRANSITION-ASK travels inside Christy's answers before the role-play, so it is
         # not warmed either; the re-asks and the steer are ``say`` lines and are.
-        unreachable = ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-OPEN", "L-TRANSITION-ASK")
+        # M032 S6: the rotated start questions travel inside Christy's answers too, and Christy's
+        # "Of course, take a moment." for a hold request is a reply, not a ``say`` line.
+        unreachable = (
+            "L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-OPEN", "L-TRANSITION-ASK",
+            "L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3", "L-IB-HOLD",
+        )
         for line_id in unreachable:
             self.assertNotIn(line_id, r1_session._WARM_ORDER)
         self.assertEqual(
             r1_session._WARM_ORDER,
             (
-                "L-TRANSITION", "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-STEER",
-                "L-TRANSITION-REASK-2", "L-PICKUP", "L-EXIT", "L-WRAP", "L-CLOSE",
-                "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
+                "L-TRANSITION", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT",
+                "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-STEER",
+                "L-TRANSITION-REASK-2", "L-PICKUP-BRIDGE", "L-PICKUP", "L-EXIT", "L-WRAP",
+                "L-CLOSE", "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
                 "L-TIME-UP", "L-MUTE", "L-SIL-IB", "L-SIL-RP1",
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
             ),
@@ -3309,10 +3315,41 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
             candidate_free=False
         )
-        self.assertEqual(len(specs), 22)  # M2 adds the offer, its resume line and L-TIME-UP
+        # M2 adds the offer, its resume line and L-TIME-UP; M032 S6 the replay, the recap,
+        # "Yes, I'm here." and the pickup bridge.
+        self.assertEqual(len(specs), 26)
         warmed = {spec.text for spec in specs}
-        for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-TRANSITION-ASK"):
-            self.assertNotIn(rig.interview.render_line(line_id), warmed)
+        for line_id in unreachable:
+            if line_id != "L-OPEN":
+                self.assertNotIn(rig.interview.render_line(line_id), warmed)
+
+    async def test_the_transition_repair_lines_are_warmed_only_while_it_is_on(self) -> None:
+        # M032 S6: R1_TRANSITION_REPAIR=0 warms revision 21's set exactly (the Sarvam quota is
+        # shared with the phone lane), with revision 21's texts.
+        rig, _cache, _synth = self.build()
+        with _env(R1_TRANSITION_REPAIR="0"):
+            off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
+                candidate_free=False
+            )
+            self.assertEqual(
+                [spec.line_id for spec in off if spec.line_id == "L-TRANSITION"], ["L-TRANSITION"]
+            )
+            brief = next(spec for spec in off if spec.line_id == "L-TRANSITION")
+            self.assertIn("We'll now move to the role-play", brief.text)
+            pickup = next(spec for spec in off if spec.line_id == "L-PICKUP")
+            self.assertTrue(pickup.text.startswith("Hello? Yes, this is "))
+        self.assertEqual(len(off), 22)
+        self.assertFalse(
+            {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
+            & {spec.line_id for spec in off}
+        )
+        on = rig.interview._warm_specs(candidate_free=True)
+        self.assertEqual(
+            [spec.line_id for spec in on][:4],
+            ["L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-TRANSITION-NUDGE"],
+        )
+        for spec in on:
+            self.assertNotIn("Asha", spec.text)
 
     async def test_the_bridged_brief_is_warmed_only_while_the_bridge_is_on(self) -> None:
         # M032 S5 item 4: L-TRANSITION-BRIDGED can only play behind the bridge, which ships off.
@@ -3324,12 +3361,12 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
                 candidate_free=False
             )
-        self.assertEqual(len(off), 22)
+        self.assertEqual(len(off), 26)  # M032 S6 adds four lines (R1_TRANSITION_REPAIR on)
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 23)
+        self.assertEqual(len(free) + len(named), 27)
         self.assertEqual(free[0].line_id, "L-TRANSITION-BRIDGED")
         self.assertTrue(free[0].persist)
         self.assertNotIn("Asha", free[0].text)
@@ -3340,8 +3377,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         rig, cache, synth = self.build()
         rig.interview._start_line_warmup(candidate_free=True)
         rig.interview._start_line_warmup(candidate_free=False)
-        await rig.until(lambda: cache.size == len(r1_session._WARM_ORDER))
-        self.assertEqual(len(synth.texts), len(r1_session._WARM_ORDER))
+        await rig.until(lambda: cache.size == len(rig.interview._warm_order()))
+        self.assertEqual(len(synth.texts), len(rig.interview._warm_order()))
         await rig.interview._drain_background()
         self.assertEqual(synth.closed, 1)
         self.assertIsNone(rig.interview._line_cache)
@@ -3827,9 +3864,10 @@ class TestTransitionBridgeWiring(R1TestCase):
     async def test_a_replay_after_the_reaction_is_the_brief_that_was_heard(self):
         # The candidate asks for the brief again after the bridged one: the replay is the brief
         # they heard, word for word (no "Thank you, {first_name}." appearing mid-way through the
-        # transition), and the reaction is not composed or spoken again.
+        # transition), and the reaction is not composed or spoken again.  (M032 S6: with
+        # R1_TRANSITION_REPAIR off; on, the replay is L-TRANSITION-AGAIN, below.)
         runner = BridgeRunner(BRIDGE_REACTION)
-        run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
+        run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1", R1_TRANSITION_REPAIR="0")
         await self.brief_played(run, "L-TRANSITION-BRIDGED")
         run.session.emit("user_input_transcribed", final_event("Can you repeat that?"))
         brief = run.interview.render_line("L-TRANSITION-BRIDGED")
@@ -3837,6 +3875,23 @@ class TestTransitionBridgeWiring(R1TestCase):
         await self.settle()
         self.assertNotIn(run.interview.render_line("L-TRANSITION"), run.session.spoken)
         self.assertEqual(run.session.spoken.count(BRIDGE_REACTION), 1)
+        self.assertEqual(len(runner.calls), 1)
+        await self.drain_cancel(run)
+
+    async def test_with_the_repair_on_the_replay_after_the_reaction_is_the_again_brief(self):
+        # M032 S6 (SWEEP-30 flag matrix): bridge on and repair on, the replay opens "Of course,
+        # here it is again." whichever brief came first, and never thanks the candidate mid-way.
+        runner = BridgeRunner(BRIDGE_REACTION)
+        run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1", R1_TRANSITION_REPAIR="1")
+        await self.brief_played(run, "L-TRANSITION-BRIDGED")
+        run.session.emit("user_input_transcribed", final_event("Can you repeat that?"))
+        again = run.interview.render_line("L-TRANSITION-AGAIN")
+        await self.until(lambda: again in run.session.spoken)
+        await self.settle()
+        bridged = run.interview.render_line("L-TRANSITION-BRIDGED")
+        self.assertEqual(run.session.spoken.count(bridged), 1)
+        self.assertTrue(again.startswith("Of course, here it is again. I'll play "))
+        self.assertNotIn("Thank you", again)
         self.assertEqual(len(runner.calls), 1)
         await self.drain_cancel(run)
 

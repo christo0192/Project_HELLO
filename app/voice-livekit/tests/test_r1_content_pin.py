@@ -134,7 +134,10 @@ import r1_world
 # note and limits and L-TRANSITION-BRIDGED, the brief without its thanks (R1_TRANSITION_BRIDGE).
 # Same revision (review fixes): the icebreaker note tail for a skip request and the notes once
 # every objective is reached (a decline, a repeat request, a skip request).
-PINNED_CONTENT_SHA256 = "e4e769e2d728905fc39b53cd527ff4bdb64d31212ea76e0d975fef72f5fade04"
+# Revision 22 (M032 S6, R1_TRANSITION_REPAIR): the brief from one shared body, its replay and short
+# recap, "Yes, I'm here.", the pickup bridge, the rotated start questions, the new pickup and coach
+# aside, revision 21's texts under -V20 ids, and the transition note that asks nothing itself.
+PINNED_CONTENT_SHA256 = "d9c1215ea8c4957d0d0b48ccb058e969798e28c24db8a65e6ee8ecea91fe4380"
 
 CONTENT_MODULES = (
     "r1_text",

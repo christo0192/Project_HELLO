@@ -807,10 +807,39 @@ class TransitionReminderTests(unittest.TestCase):
     """M1 (owner decision 2026-11-03): Christy answers questions before the role-play starts."""
 
     def test_the_transition_gets_its_own_note(self):
+        import os
+        from unittest import mock
+
         from r1_prompts import TRANSITION_REMINDER, interviewer_reminder
         from r1_replies import Reply, llm_messages
 
+        # M032 S6: R1_TRANSITION_REPAIR=0 gives back the M1 note exactly.
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self._check_transition_note(TRANSITION_REMINDER, interviewer_reminder, Reply, llm_messages)
+
+    def test_the_repaired_transition_note_asks_nothing_itself(self):
+        # M032 S6 item 7 (fda9e9f6 #25: "What would you like to know?" and the start question in one
+        # breath): a request to ask gets "Of course, go ahead." and stops, and no answer ends with a
+        # question of its own; every M1 rule is kept.
+        from r1_prompts import (
+            TRANSITION_REMINDER,
+            TRANSITION_REMINDER_REPAIRED,
+            interviewer_reminder,
+        )
+        from r1_replies import Reply, llm_messages
+
+        self._check_transition_note(
+            TRANSITION_REMINDER_REPAIRED, interviewer_reminder, Reply, llm_messages
+        )
+        lowered = TRANSITION_REMINDER_REPAIRED.lower()
+        self.assertIn('say "of course, go ahead." and stop', lowered)
+        self.assertIn("never end your reply with a question", lowered)
+        self.assertNotIn("invite the question", lowered)
+        self.assertIn("invite the question", TRANSITION_REMINDER.lower())
+
+    def _check_transition_note(self, note, interviewer_reminder, Reply, llm_messages):
         # M032 S5: the delivery rider follows the note when R1_INTERVIEWER_VOICE is on.
+        TRANSITION_REMINDER = note
         self.assertEqual(interviewer_reminder("transition", rider=False), TRANSITION_REMINDER)
         messages = llm_messages(
             Reply(phase="transition", candidate_text="What are the working days?"), P1, []
@@ -1271,7 +1300,7 @@ class InterviewerVoiceTests(unittest.TestCase):
         from r1_prompts import (
             GETTING_TO_KNOW_YOU_NOTE,
             INTERVIEWER_DELIVERY_RIDER,
-            TRANSITION_REMINDER,
+            TRANSITION_REMINDER_REPAIRED,
             WRAPUP_REMINDER,
             interviewer_reminder,
         )
@@ -1279,7 +1308,7 @@ class InterviewerVoiceTests(unittest.TestCase):
         expected = {
             "opening": GETTING_TO_KNOW_YOU_NOTE,
             "icebreaker": GETTING_TO_KNOW_YOU_NOTE,
-            "transition": TRANSITION_REMINDER,
+            "transition": TRANSITION_REMINDER_REPAIRED,  # M032 S6 (R1_TRANSITION_REPAIR on)
             "wrapup": WRAPUP_REMINDER,
             "closing": WRAPUP_REMINDER,
         }
@@ -1305,7 +1334,10 @@ class InterviewerVoiceTests(unittest.TestCase):
 
         from r1_prompts import interviewer_reminder
 
-        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "off"}):
+        # M032 S6: the transition note is the repair's too, so both flags go off for today's notes.
+        with mock.patch.dict(
+            os.environ, {"R1_INTERVIEWER_VOICE": "off", "R1_TRANSITION_REPAIR": "0"}
+        ):
             for phase, digest in PRE_M032_NOTE_SHA256.items():
                 with self.subTest(phase=phase):
                     self.assertEqual(_sha(interviewer_reminder(phase)), digest)

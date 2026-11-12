@@ -2183,17 +2183,25 @@ class TestPhaseDriver(R1TestCase):
     async def test_christy_answers_three_questions_then_steers_back_to_the_start(self) -> None:
         # M1: each question is the model's to answer (no StopResponse), with the start question
         # appended to the answer; the fourth gets the scripted steer and the fifth the nudge.
+        # M032 S6 (SWEEP-32): once the either/or question has been heard (here, in the first
+        # answer's tail), the later answers end with its shorter either/or forms in turn.
         self.interview.machine.transition(R1Phase.TRANSITION)
         task = asyncio.create_task(self.interview._run_transition())
         await self.settle()
-        ask = self.spoken_line("L-TRANSITION-ASK")
-        for question in (
-            "What are the working days for this role?",
-            "Is this a night shift?",
-            "How many rounds are there after this one?",
+        tails = [
+            self.spoken_line(line_id)
+            for line_id in ("L-TRANSITION-ASK", "L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3")
+        ]
+        for question, tail in zip(
+            (
+                "What are the working days for this role?",
+                "Is this a night shift?",
+                "How many rounds are there after this one?",
+            ),
+            tails,
         ):
             self.assertFalse(await self.answer(question))
-            self.assertEqual(self.interview._last_reply.tail, ask)
+            self.assertEqual(self.interview._last_reply.tail, tail)
             self.assertEqual(self.interview._last_reply.phase, "transition")
         self.assertEqual(self.interview._transition_answers, 3)
         self.assertTrue(await self.answer("And what about the salary?"))
@@ -4211,7 +4219,7 @@ class TestUnknownAndSpokenFirstName(R1TestCase):
     async def test_the_placeholder_name_is_dropped_from_every_line(self) -> None:
         rendered = self.spoken_lines()
         self.assertTrue(rendered["L-OPEN"].startswith("Hi, I'm Christy,"))
-        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you. We'll now move"))
+        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you. Next, let's do a sales"))
         self.assertIn("for your time today. The hiring team", rendered["L-CLOSE"])
         self.assertEqual(rendered["L-SIL-IB"], "Are you still with me?")
         self.assertEqual(rendered["L-REJOIN"], "Welcome back. Let's pick up where we left off.")
@@ -4237,7 +4245,7 @@ class TestUnknownAndSpokenFirstName(R1TestCase):
         await self.answer("Yeah, so my name is Cristo, and I have eleven years in sales.")
         rendered = self.spoken_lines()
         self.assertEqual(rendered["L-SIL-IB"], "Are you still with me, Cristo?")
-        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you, Cristo. We'll now move"))
+        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you, Cristo. Next, let's do"))
         self.assertIn("for your time today, Cristo. The hiring team", rendered["L-CLOSE"])
         self.assertEqual(
             rendered["L-REJOIN"], "Welcome back, Cristo. Let's pick up where we left off."
@@ -8650,7 +8658,17 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
 
 
 class TestBriefRepeatOnRequest(R1TestCase):
-    """Owner decision 2026-10-30 item 4 (owner test 1eb18cd4 #13-#18): the brief once more."""
+    """Owner decision 2026-10-30 item 4 (owner test 1eb18cd4 #13-#18): the brief once more.
+
+    M032 S6: these pin the rollback (``R1_TRANSITION_REPAIR=0``): the brief replayed word for word,
+    once, and the nudge for a later request.  ``TestBriefRepairOnRequest`` pins the repair.
+    """
+
+    async def asyncSetUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        await super().asyncSetUp()
 
     OWNER_14 = (
         "But yeah, for my personal growth, I wanted to switch so that I'll get a new environment. "
@@ -8845,6 +8863,500 @@ class TestBriefRepeatOnRequest(R1TestCase):
         self.assertTrue(await self.commit_turn(text))
         await self.until(lambda: self.spoken_and_played("L-ASIDE-COACH"))
         self.assertNotIn(self.spoken_line("L-TRANSITION"), self.session.spoken)
+
+
+class TestBriefRepairOnRequest(R1TestCase):
+    """M032 S6 (R1_TRANSITION_REPAIR on, the default): the brief and the transition, repaired.
+
+    The owner's call fda9e9f6 #23-#31, paraphrased: two requests for the brief were answered with
+    "What would you like to know?" and the JOB's shift timings, "Are you there?" got nothing, and
+    the replay said "Thank you ... We'll now move to the role-play." again three minutes in.  Owner
+    test 8f5bfefc #25-#28: the brief "in about four lines" got the nudge and then the whole brief.
+    All texts here are synthetic.
+    """
+
+    LEADS = ("Meera Iyer", "Meera")
+
+    def press(self) -> None:
+        self.ctx.room.emit("data_received", ready_packet())
+
+    async def start_transition(self) -> asyncio.Task:
+        self.interview._enter(R1Phase.TRANSITION)
+        task = asyncio.create_task(self.interview._run_transition())
+        await self.settle()
+        return task
+
+    def count(self, line_id: str) -> int:
+        return self.session.spoken.count(self.spoken_line(line_id))
+
+    def test_the_brief_ids_for_every_flag_combination(self) -> None:
+        # SWEEP-30 item 6: one helper picks the first brief and the replay for both ``say`` sites;
+        # R1_TRANSITION_REPAIR=0 speaks revision 21's texts (bridged or not) byte for byte.
+        import r1_script
+
+        values = dict(first_name=self.interview._first_name(), **self.interview.persona.line_values)
+        for bridged in (False, True):
+            heard = "L-TRANSITION-BRIDGED" if bridged else "L-TRANSITION"
+            self.interview._brief_line = heard
+            for repair in ("0", "1"):
+                with self.subTest(bridged=bridged, repair=repair), mock.patch.dict(
+                    os.environ, {"R1_TRANSITION_REPAIR": repair}
+                ):
+                    first = self.interview._brief_line_id(bridged=bridged)
+                    replay = self.interview._brief_line_id(replay=True)
+                    self.assertEqual(first, heard)
+                    if repair == "0":
+                        self.assertEqual(replay, heard)  # word for word, as before
+                        old = r1_script.line(f"{heard}-V20", **values)
+                        self.assertEqual(self.interview.render_line(first), old)
+                        self.assertEqual(self.interview.render_line(replay), old)
+                        self.assertIn("We'll now move to the role-play.", old)
+                    else:
+                        self.assertEqual(replay, "L-TRANSITION-AGAIN")
+                        for line_id in (first, replay):
+                            text = self.interview.render_line(line_id)
+                            self.assertNotIn("We'll now move", text)
+                            self.assertTrue(text.endswith(
+                                "Shall we start the role-play now, or do you have any questions "
+                                "first?"
+                            ))
+                        self.assertEqual(
+                            self.interview.render_line(first).startswith("Thank you"), not bridged
+                        )
+
+    def test_the_wider_brief_request(self) -> None:
+        for text in (
+            "Can you give me a quick summary of this role play again?",
+            "Tell me about the role play again.",
+            "Could you tell me a bit more about the role play?",
+            "I'd like more details about the scenario.",
+            "Can I get more information on this role play?",
+            "Tell me a little more about Meera.",
+            "Who is Meera Iyer?",
+            "Please recap the brief for me.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS))
+                self.assertFalse(r1_session.is_brief_request(text))  # revision 21 missed them
+        for text in (
+            "And yeah, I would like to understand more about this role.",
+            "Just to recap everything one more time, the course has six modules.",
+            "That is a summary of my experience.",
+            "Tell me about the role.",
+            "Can you give me more details about the salary?",
+            "I want more information on this.",
+            "Okay, ready, let's go.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS))
+
+    def test_the_shorter_brief_request(self) -> None:
+        # SWEEP-29: a marker plus an ask plus a brief object, or (right after a brief) a pronoun or
+        # bare form; never "shortly", a bare "brief", or a summary of something else.
+        for text, after_brief in (
+            ("Can you say this instruction, like, in about four lines?", False),
+            ("Can you explain it again briefly?", True),
+            ("Just give me a quick summary of the role play.", False),
+            ("Can you summarise?", True),
+            ("Give me the short version.", True),
+            ("Say it in short, please.", True),
+            ("Could you quickly tell me what I have to do?", False),
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_short_brief_request(
+                    text, after_brief=after_brief, lead_names=self.LEADS
+                ))
+        for text, after_brief in (
+            ("Can you repeat the brief?", True),
+            ("What is the brief?", True),
+            ("I'll keep it short.", True),
+            ("That is a summary of my experience.", True),
+            ("In short, I sold courses for five years.", True),
+            ("Can you quickly tell me the salary?", True),
+            ("Just quickly, what are the shifts?", True),
+            ("Can you explain that briefly?", False),  # after a shift-timings answer
+            ("Can you give me a quick summary of the salary structure?", True),
+            ("Shortly I will be ready.", True),
+            ("Okay, ready, let's go.", True),
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_short_brief_request(
+                    text, after_brief=after_brief, lead_names=self.LEADS
+                ))
+
+    def test_presence_and_role_play_questions(self) -> None:
+        for text in ("Hello? Are you there?", "Are you still there?", "Hello?", "Can you hear me?",
+                     "Christy, are you there?", "Sorry, are you there?"):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_presence_check(text))
+        for text in ("Hello? What?", "Yes, I can hear you.", "Sorry, can you repeat that?",
+                     "Pardon?", "Are you there to help me with the course?"):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_presence_check(text))
+        for text in ("How long does the role play last?", "What does Meera do for a living?",
+                     "Is the learner the one who pays?", "Can I take notes during the role play?"):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.names_the_roleplay(text, self.LEADS))
+        for text in ("I understood the role play.", "What are the shift timings?",
+                     "The role play sounds good."):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.names_the_roleplay(text, self.LEADS))
+        self.assertTrue(
+            r1_session.no_questions_about_the_roleplay("No questions about the role play.")
+        )
+
+    def test_real_advisor_turns_are_none_of_the_new_requests(self) -> None:
+        # The 2,136-turn advisor corpus and its held-out set: no wider brief request, no shorter
+        # brief request (even right after a brief), no presence check among them.
+        from r1_personas import PERSONAS, resolve_persona
+
+        leads: list[str] = []
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                leads += [rendered.lead_name, rendered.first_name]
+        leads_t = tuple(leads)
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        hits: list[str] = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for raw in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if not raw:
+                    continue
+                text = json.loads(raw)["text"]
+                if (
+                    r1_session.is_brief_request(text, wide=True, lead_names=leads_t)
+                    or r1_session.is_short_brief_request(text, after_brief=True, lead_names=leads_t)
+                    or r1_session.is_presence_check(text)
+                ):
+                    hits.append(text[:60])
+        self.assertEqual(hits, [])
+
+    def test_the_new_detectors_are_linear_on_long_input(self) -> None:
+        # ReDoS fuzz: long runs of the words the patterns repeat must stay fast.
+        import time as _time
+
+        for text in (
+            "say " + "like " * 4000 + "x",
+            "tell me " + "a bit more " * 3000,
+            "summary " * 5000 + "of my day",
+            "hello " * 5000 + "are you there what",
+            "in " + "about " * 5000 + "four",
+        ):
+            started = _time.perf_counter()
+            r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+            r1_session.is_short_brief_request(text, after_brief=True, lead_names=self.LEADS)
+            r1_session.is_presence_check(text)
+            r1_session.names_the_roleplay(text, self.LEADS)
+            self.assertLess(_time.perf_counter() - started, 1.0)
+
+    async def test_a_request_during_the_briefing_gets_the_again_brief_once(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript("Sorry, I missed that. Could you explain the scenario again?")
+        self.assertTrue(self.interview._brief_requested)  # over L-TRANSITION
+        task = asyncio.create_task(self.interview._run_transition())
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-AGAIN"))
+        await self.settle()
+        self.assertFalse(task.done())
+        again = self.spoken_line("L-TRANSITION-AGAIN")
+        self.assertTrue(again.startswith("Of course, here it is again. I'll play "))
+        self.assertNotIn("Thank you", again)
+        self.assertNotIn(self.spoken_line("L-TRANSITION"), self.session.spoken)
+        self.final_transcript("ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [again, self.spoken_line("L-PICKUP")])
+
+    async def test_after_the_replay_requests_get_two_recaps_then_the_start_question(self) -> None:
+        # SWEEP-29 budgets: one replay, then the recap twice, then L-TRANSITION-REASK; the nudge
+        # never answers a request for the brief.
+        task = await self.start_transition()
+        self.final_transcript("Can you repeat that?")
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-AGAIN"))
+        await self.settle()
+        for expected in (1, 2):
+            self.assertTrue(await self.answer("Sorry, could you explain the scenario again?"))
+            await self.until(lambda: self.count("L-TRANSITION-RECAP") == expected)
+            await self.until(lambda: self.spoken_and_played("L-TRANSITION-RECAP"))
+            await self.settle()
+        self.assertTrue(await self.answer("Can you go over the task once more?"))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-REASK"))
+        await self.settle()
+        self.assertEqual(self.count("L-TRANSITION-AGAIN"), 1)
+        self.assertEqual(self.count("L-TRANSITION-RECAP"), 2)
+        self.assertEqual(self.count("L-TRANSITION-NUDGE"), 0)
+        self.assertEqual(self.interview._transition_answers, 0)
+        self.final_transcript("Okay, ready.")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.interview._repair_facts()["transition_recaps"], 2)
+
+    async def test_a_request_for_a_shorter_brief_gets_the_recap_and_a_later_repeat_the_replay(
+        self,
+    ) -> None:
+        task = await self.start_transition()
+        self.interview._last_transition_line = "L-TRANSITION"  # the brief was the last line
+        self.assertTrue(await self.answer("Can you explain it again briefly?"))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-RECAP"))
+        await self.settle()
+        self.assertEqual(self.count("L-TRANSITION-AGAIN"), 0)
+        self.assertTrue(await self.answer("Sorry, can you repeat that?"))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-AGAIN"))
+        await self.settle()
+        self.assertEqual(self.count("L-TRANSITION-AGAIN"), 1)
+        self.assertEqual(self.count("L-TRANSITION-RECAP"), 1)
+        self.final_transcript("ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_four_lines_with_fillers_gets_the_recap(self) -> None:
+        # 8f5bfefc #25 (paraphrased): the instruction "in about four lines".
+        task = await self.start_transition()
+        self.assertTrue(
+            await self.answer("Um, can you say this instruction in, like, about four lines?")
+        )
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-RECAP"))
+        await self.settle()
+        self.assertEqual(self.count("L-TRANSITION-NUDGE"), 0)
+        self.assertEqual(self.count("L-TRANSITION-AGAIN"), 0)
+        self.final_transcript("ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_ready_said_during_the_recap_picks_up_right_after_it(self) -> None:
+        self.session.playout_seconds = 0.2
+        task = await self.start_transition()
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.assertTrue(await self.answer("Just give me a quick summary of the role play."))
+        recap = self.spoken_line("L-TRANSITION-RECAP")
+        await self.until(lambda: ("play_start", recap) in self.order)
+        self.final_transcript("Okay, ready.")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [recap, self.spoken_line("L-PICKUP")])
+
+    async def test_a_role_play_question_never_reaches_the_model(self) -> None:
+        # fda9e9f6 #26 (paraphrased): a question about the role-play got the job's shift timings.
+        task = await self.start_transition()
+        self.assertTrue(await self.answer("How long does the role play last?"))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-AGAIN"))
+        await self.settle()
+        lead = self.interview.persona.first_name  # the learner's name is the role-play's too
+        self.assertTrue(await self.answer(f"And what does {lead} do for a living?"))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-RECAP"))
+        await self.settle()
+        self.assertTrue(await self.answer("Is the learner the one who decides?"))
+        await self.until(lambda: self.count("L-TRANSITION-RECAP") == 2)
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-RECAP"))
+        await self.settle()
+        self.assertTrue(await self.answer("Can I take notes during the role play?"))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-NUDGE"))
+        self.assertEqual(self.interview._transition_answers, 0)
+        # A question about the job is still Christy's to answer.
+        self.assertFalse(await self.answer("What are the working days?"))
+        self.final_transcript("ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_no_questions_about_the_role_play_is_the_nudge(self) -> None:
+        task = await self.start_transition()
+        self.assertTrue(await self.answer("I don't have any questions about the role play."))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-NUDGE"))
+        self.assertEqual(self.count("L-TRANSITION-AGAIN"), 0)
+        self.final_transcript("ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_a_presence_check_gets_yes_im_here_and_the_start_question(self) -> None:
+        # fda9e9f6 #28: "Are you there?" got 12 s of nothing.
+        task = await self.start_transition()
+        self.assertTrue(await self.answer("Hello? Are you there?"))
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-REASK"))
+        await self.settle()
+        self.assertEqual(
+            self.session.spoken,
+            [self.spoken_line("L-PRESENT"), self.spoken_line("L-TRANSITION-REASK")],
+        )
+        self.assertEqual(self.spoken_line("L-PRESENT"), "Yes, I'm here.")
+        self.assertEqual(self.interview._start_question, r1_session._YES_NO)
+        self.assertEqual(self.interview._transition_answers, 0)
+        self.final_transcript("Yes, let's start.")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_with_the_repair_off_a_presence_check_gets_nothing(self) -> None:
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.assertEqual(
+                self.interview._transition_action("Hello? Are you there?"),
+                r1_session._TRANSITION_QUIET,
+            )
+            self.assertEqual(
+                self.interview._transition_action("Tell me about the role play again."),
+                r1_session._TRANSITION_ANSWER,
+            )
+
+    async def test_the_same_request_through_the_transcript_and_the_hook_is_answered_once(
+        self,
+    ) -> None:
+        # The RCA's latent double prompt: the latch replays, then the hook judged the same turn
+        # again (the nudge on revision 21, a recap now).  The latched row gets nothing more.
+        task = await self.start_transition()
+        self.final_transcript("Can you repeat that?")
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-AGAIN"))
+        await self.settle()
+        self.assertTrue(await self.commit_turn("Can you repeat that?"))
+        await asyncio.sleep(0.05)
+        await self.settle()
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-TRANSITION-AGAIN")])
+        self.final_transcript("ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_the_button_during_the_replay_gets_the_bridge_before_the_pickup(self) -> None:
+        self.session.playout_seconds = 0.2
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript("What do I do?")
+        task = asyncio.create_task(self.interview._run_transition())
+        again = self.spoken_line("L-TRANSITION-AGAIN")
+        await self.until(lambda: ("play_start", again) in self.order)
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [
+            again, self.spoken_line("L-PICKUP-BRIDGE"), self.spoken_line("L-PICKUP")
+        ])
+        self.assertEqual(self.spoken_line("L-PICKUP-BRIDGE"), "Great, here she is.")
+        self.assertEqual(
+            self.interview._repair_facts(),
+            {"start_by": "button", "pressed_during": "replay", "transition_recaps": 0},
+        )
+
+    async def test_the_button_during_the_first_brief_gets_the_bridge(self) -> None:
+        self.session.playout_seconds = 0.2
+        self.interview._enter(R1Phase.TRANSITION)
+        brief = asyncio.create_task(self.interview._say_brief())
+        await self.until(lambda: ("play_start", self.spoken_line("L-TRANSITION")) in self.order)
+        self.press()
+        await brief
+        self.assertIsNone(await asyncio.wait_for(self.interview._run_transition(), 10.0))
+        self.assertEqual(self.session.spoken[-2:], [
+            self.spoken_line("L-PICKUP-BRIDGE"), self.spoken_line("L-PICKUP")
+        ])
+        self.assertEqual(self.interview._pressed_during, "brief")
+
+    async def test_the_button_in_the_wait_and_a_spoken_ready_get_no_bridge(self) -> None:
+        task = await self.start_transition()
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+        self.assertEqual(
+            self.interview._repair_facts(),
+            {"start_by": "button", "pressed_during": "wait", "transition_recaps": 0},
+        )
+
+    async def test_a_spoken_ready_is_recorded_as_spoken(self) -> None:
+        task = await self.start_transition()
+        self.final_transcript("Ready.")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+        lead = self.interview.persona.first_name
+        self.assertEqual(self.spoken_line("L-PICKUP"), f"Hello, {lead} speaking.")
+        self.assertEqual(
+            self.interview._repair_facts(), {"start_by": "spoken", "transition_recaps": 0}
+        )
+
+    async def test_with_the_repair_off_the_button_during_the_replay_gets_no_bridge(self) -> None:
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.session.playout_seconds = 0.2
+            self.interview._enter(R1Phase.TRANSITION)
+            self.final_transcript("What do I do?")
+            task = asyncio.create_task(self.interview._run_transition())
+            brief = self.spoken_line("L-TRANSITION")
+            await self.until(lambda: ("play_start", brief) in self.order)
+            self.press()
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+            self.assertEqual(self.session.spoken, [brief, self.spoken_line("L-PICKUP")])
+            self.assertTrue(self.spoken_line("L-PICKUP").startswith("Hello? Yes, this is "))
+            self.assertEqual(self.interview._repair_facts(), {})
+
+    async def test_answers_rotate_the_start_question_and_a_bare_yes_still_gets_the_nudge(
+        self,
+    ) -> None:
+        # SWEEP-32: after the brief's either/or question, two answers in a row end with two
+        # different shorter either/or questions; a bare "Yes." after each is no consent.
+        task = await self.start_transition()
+        self.interview._start_question = r1_session._EITHER_OR  # the brief has been heard
+        self.interview._last_transition_line = "L-TRANSITION"
+        tails = []
+        for question in ("What are the working days?", "Is it a night shift?"):
+            self.assertFalse(await self.answer(question))
+            tails.append(self.interview._last_reply.tail)
+            self.agent_state("listening")
+            self.assertEqual(
+                self.interview._transition_action("Yes."), r1_session._TRANSITION_NUDGE
+            )
+        self.assertEqual(
+            tails,
+            [self.spoken_line("L-TRANSITION-ASK-2"), self.spoken_line("L-TRANSITION-ASK-3")],
+        )
+        self.final_transcript("ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_an_answer_that_asks_drops_the_tail_but_never_twice_in_a_row(self) -> None:
+        # S6 item 7 (fda9e9f6 #25: two questions in one breath).
+        self.interview._enter(R1Phase.TRANSITION)
+        guard = StreamGuard(self.interview.engine.guard_context("transition", mode="reply"))
+
+        async def spoken(answer: str) -> str:
+            reply = self.interview._last_reply
+            chunks = [
+                chunk async for chunk in self.interview._screened(
+                    lambda: self_stream(answer), guard, reply
+                )
+            ]
+            return "".join(chunks).strip()
+
+        self.assertFalse(await self.answer("Can I ask about the shifts and the team?"))
+        self.assertEqual(self.interview._transition_answers, 1)
+        text = await spoken("Of course, which one first?")
+        self.assertEqual(text, "Of course, which one first?")
+        self.assertEqual(self.interview._transition_answers, 0)
+        self.assertIsNone(self.interview._start_question)
+        self.assertFalse(await self.answer("What are the working days, and the shift?"))
+        text = await spoken("It's five and a half days a week. Does that help?")
+        self.assertTrue(text.endswith(self.interview._last_reply.tail))  # not twice in a row
+        self.assertEqual(self.interview._transition_answers, 1)
+        self.assertFalse(await self.answer("Is it a night shift?"))
+        text = await spoken("Yes, it runs overnight India time.")
+        self.assertTrue(text.endswith(self.interview._last_reply.tail))
+
+    async def test_with_the_repair_off_the_tail_is_always_today_s(self) -> None:
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._start_question = r1_session._EITHER_OR
+            guard = StreamGuard(self.interview.engine.guard_context("transition", mode="reply"))
+            self.assertFalse(await self.answer("What are the working days?"))
+            reply = self.interview._last_reply
+            self.assertEqual(reply.tail, self.spoken_line("L-TRANSITION-ASK"))
+            self.assertFalse(reply.tail_optional)
+            chunks = [
+                chunk async for chunk in self.interview._screened(
+                    lambda: self_stream("Which part would you like first?"), guard, reply
+                )
+            ]
+            self.assertTrue("".join(chunks).strip().endswith(self.spoken_line("L-TRANSITION-ASK")))
+            self.assertEqual(self.interview._transition_answers, 1)
+
+    async def test_the_owners_transition_through_the_real_driver(self) -> None:
+        # 1eb18cd4 #14 asked for the role-play "in a small brief kind of thing": a request for a
+        # SHORTER brief, so it gets the recap (SWEEP-29), and the replay stays for a later ask.
+        self.assertTrue(r1_session.is_short_brief_request(TestBriefRepeatOnRequest.OWNER_14))
+        run = await self.start_interview()
+        run.clock.advance(271)
+        run.interview._wake()
+        await self.until(lambda: run.interview.machine.phase is R1Phase.TRANSITION)
+        run.session.emit("user_input_transcribed", final_event(TestBriefRepeatOnRequest.OWNER_14))
+        recap = run.interview.render_line("L-TRANSITION-RECAP")
+        await self.until(lambda: ("play_end", recap) in self.order)
+        await self.settle()
+        brief = run.interview.render_line("L-TRANSITION")
+        self.assertEqual(run.session.spoken.count(brief), 1)
+        self.assertNotIn(run.interview.render_line("L-TRANSITION-AGAIN"), run.session.spoken)
+        self.assertNotIn("We'll now move", brief)
+        run.session.emit("user_input_transcribed", final_event("ready"))
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ROLEPLAY)
+        self.assertEqual(run.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+        await self.drain_cancel(run)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -9232,14 +9744,16 @@ class TestTransitionConsent(R1TestCase):
         self.interview._brief_requested = True
         real_say = self.interview.say
 
+        replay = self.interview._brief_line_id(replay=True)  # M032 S6: L-TRANSITION-AGAIN
+
         async def say_and_ack(line_id: str, **kwargs) -> None:
             await real_say(line_id, **kwargs)
-            if line_id == "L-TRANSITION":
+            if line_id == replay:
                 self.final_transcript("Okay.")  # said over the replay
 
         with mock.patch.object(self.interview, "say", side_effect=say_and_ack):
             task = asyncio.create_task(self.interview._run_transition())
-            await self.until(lambda: self.spoken_and_played("L-TRANSITION"))
+            await self.until(lambda: self.spoken_and_played(replay))
             await asyncio.sleep(0.3)
             self.assertFalse(task.done())
             self.assertNotIn(self.spoken_line("L-PICKUP"), self.session.spoken)
