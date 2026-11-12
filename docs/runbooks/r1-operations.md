@@ -2283,6 +2283,50 @@ for a minute got "I can't pause" and a new question, and a two-word thank-you cu
   `icebreaker_acks_held`. Rollback: `fly secrets set R1_ICEBREAKER_ACK_HOLD=0 -a
   project-hello-voice`.
 
+### The opening, the never-heard ladder and the mute aside (M032 S7C, owner go 2026-11-11)
+
+Sweep patterns P33, P25 and P62: L-OPEN was one 79-word block of about 29 s with no greeting
+exchange and no hearing check; four sessions of 2026-10-13 in which no candidate audio ever reached
+the worker got "Are you still with me?" and "we seem to have lost the connection"; and "Please
+unmute when you're ready." came in Christy's own phase, after a sub-second blip, and was answered
+"I am ready".
+
+* **`R1_OPENING_SOUND_CHECK`** (default on). The driver says L-OPEN-HELLO ("Hi {first_name}, I'm
+  Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?") and reads the reply
+  in code (`sound_check_reading`; never the model, `reply_suppressed` in OPENING). A reply that
+  heard her gets L-OPEN-AGENDA ("Good, I can hear you." and the agenda, which asks the first
+  icebreaker question); a can't-hear reply (a directed complaint, "Sorry?", "Hello? Are you
+  there?", or a whole-turn "No." / "Not really." / "It's a bit low.") gets L-OPEN-HELLO-AGAIN once,
+  and a second one L-OPEN-AGENDA-PLAIN; an early answer (12 content words or more) gets
+  L-OPEN-AGENDA-CONTINUE and counts as one icebreaker answer. Silence (10 s) from a candidate who
+  was never heard runs the never-heard ladder below; one heard only by the VAD gets the plain
+  agenda, and so does the end of the sound check's 45 s budget. A "Hi" said over the hello is
+  followed by 1.5 s of quiet for the answer. The reply is never an icebreaker answer, whenever its
+  turn commits (`_sound_check_rows`). Log: `r1_sound_check` (the reading, the agenda id, the
+  can't-hear count). The hello costs about 5-10 s of S; the soft exit and S = 4:30 are unchanged.
+  Rollback: `fly secrets set R1_OPENING_SOUND_CHECK=0 -a project-hello-voice` (L-OPEN, exactly as
+  before).
+* **`R1_NO_AUDIO_LADDER`** (default on). A candidate who was never heard (no speech, no final;
+  `_candidate_ever_heard`, never reset) and is not muted gets L-SIL-NOAUDIO ("I can't hear anything
+  from you yet. If you're speaking, please check that your microphone is switched on and
+  selected.") and, 30 s later, L-SIL-END-NOAUDIO ("I still can't hear you, so I'll have to stop
+  here for now. The hiring team will be in touch. Goodbye."), in the opening or the icebreaker
+  only. The outcome stays `candidate_left` and attempt counting is unchanged. Log, once:
+  `r1_no_audio` with `no_mic_track`, `not_subscribed` or `no_voice` (labels only). A never-heard
+  close that does not count as an attempt needs its own web card (outside R1). Rollback: `fly
+  secrets set R1_NO_AUDIO_LADDER=0 -a project-hello-voice`.
+* **`R1_MUTE_ASIDE_V2`** (default on). The aside is due once the mute has lasted 1.5 s
+  (`MUTE_ASIDE_DEBOUNCE_SECONDS`) and no candidate turn is in flight, or 3 s in all
+  (`MUTE_ASIDE_TURN_WAIT_SECONDS`); the mute is checked again before the line, and an episode
+  counts as announced only when a line is spoken. The role-play still enters ASIDE (R paused) at
+  the event. L-MUTE-RP ("This is Christy, your interviewer. Your microphone seems to be muted.
+  Please unmute it so we can carry on.") in the role-play, L-MUTE-IV ("Your microphone seems to be
+  muted. Please unmute it so I can hear you.") in Christy's phases; neither says "ready". Rollback:
+  `fly secrets set R1_MUTE_ASIDE_V2=0 -a project-hello-voice` (the immediate L-MUTE).
+
+Content revision 23; L-OPEN and L-MUTE are unchanged. The new name-free lines are warmed only while
+their flag is on (the agendas first); L-OPEN-HELLO carries the name and is spoken live, like L-OPEN.
+
 ### Leaving the role-play by consent (owner decisions 2026-11-03, M2)
 
 Mock call aa166f09: the learner's scripted WEAK line ("Let me think about it. I'll read through the
