@@ -1717,6 +1717,10 @@ class TestReplyPolicy(R1TestCase):
         "Can you rephrase that?",
         "Sorry I missed the last part",
         "Hello, can you hear me now?",
+        # M032 S6 (SWEEP-28, R1_ICEBREAKER_REPAIR on): "once again", "not able to hear", "I'm sorry".
+        "Can you repeat that once again?",
+        "Sorry, I was not able to hear you.",
+        "I'm sorry, could you repeat that?",
     )
 
     async def test_a_request_to_repeat_or_an_audio_check_is_not_an_answer(self) -> None:

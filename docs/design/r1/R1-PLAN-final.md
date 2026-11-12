@@ -449,6 +449,9 @@ Clocks:
 | L-TRANSITION-STEER | "Let's keep any other questions for the end of the interview; there'll be time for them then. Shall we start the role-play now?" |
 | L-PICKUP | Per persona, e.g. "Hello, Meera speaking." (M032 S6; before it, "Hello? Yes, this is Meera speaking.") |
 | L-PICKUP-BRIDGE (the button pressed during a brief, M032 S6) | "Great, here she is." |
+| L-IB-HOLD (a request for a moment in the icebreaker, M032 S6) | "Of course, take a moment. I'm here when you're ready." |
+| L-IB-REPEAT (runtime template: a request to repeat the question at the soft exit, M032 S6) | "Of course. {question}" ({question}: the last question of Christy's own icebreaker reply) |
+| L-TRANSITION-BRIDGED (M032 S5; M032 S6 also after a repair turn ends the icebreaker) | L-TRANSITION without "Thank you, {first_name}. " |
 | L-TIME-CUE (learner, R ≈ 17:00) | "Just so you know, I've only got a couple of minutes before my next call." |
 | L-TIME-UP (learner, at the end of the time, M2) | "I'm sorry, I really have to go now. Thank you for your time." |
 | L-ASIDE-WRAP (interviewer aside, R ≥ 14:00, M2) | "This is Christy, your interviewer, stepping in for a moment. We're well into the role-play now, so would you like to wrap it up here? If you'd rather keep going, just carry on with {lead_first_name}." |
