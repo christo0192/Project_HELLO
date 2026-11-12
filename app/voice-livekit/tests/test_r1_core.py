@@ -9304,6 +9304,168 @@ class TestBriefRepairOnRequest(R1TestCase):
             r1_session.no_questions_about_the_roleplay("No questions about the role play.")
         )
 
+    # Review of S6: paraphrased transition questions about the JOB that use the words "lead",
+    # "learner", "prospect" or "scenario", and scenario questions that name none of the brief.
+    JOB_QUESTIONS = (
+        "How does the lead generation work for this role?",
+        "Will the lead quality be good?",
+        "What is the learner profile we usually sell to?",
+        "What is the prospect of growth in this role?",
+        "In what scenario would I have to work weekends?",
+        "Who handles the learner support after a sale?",
+        "Is the lead allocation done by the team lead?",
+        "What course will I be trained on?",
+        "Will I have to make cold calls in this job?",
+        "Do I have to do a cold call every day?",
+        "Who will I report to?",
+    )
+    SCENARIO_QUESTIONS = (
+        "Who will I be calling?",
+        "Which course is it about?",
+        "What course am I selling?",
+        "Do I call her or does she call me?",
+        "Okay. Is it a cold call?",
+        "Who is the lead?",
+        "What's the lead's background?",
+        "Is the learner a working professional?",
+        "What is the scenario?",
+    )
+
+    def test_job_questions_are_not_about_the_role_play(self) -> None:
+        for text in self.JOB_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.names_the_roleplay(text, self.LEADS))
+        for text in self.SCENARIO_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.names_the_roleplay(text, self.LEADS))
+        for text in ("I'll be calling her.", "It is a cold call."):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.names_the_roleplay(text, self.LEADS))
+
+    def test_a_generic_ask_about_the_job_is_no_brief_request(self) -> None:
+        # Review of S6: "can you explain / clarify ..." and "what do I need to do ..." name what
+        # they ask about; a job topic, or "that" right after Christy's answer, is not the brief.
+        for text in (
+            "Could you explain the incentive structure?",
+            "Can you clarify the working hours?",
+            "Please explain the salary part.",
+            "What do I need to do on the first day of the job?",
+            "Can you explain the role?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_brief_request(text, wide=True))
+                for after_answer in (False, True):
+                    self.assertTrue(r1_session.asks_about_the_job(
+                        text, after_answer=after_answer, lead_names=self.LEADS
+                    ))
+        for text in ("Can you explain that briefly?", "Can you repeat that?", "Can you explain?"):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.asks_about_the_job(text, after_answer=True))
+                self.assertFalse(r1_session.asks_about_the_job(text, after_answer=False))
+        for text in (
+            "Can you explain the role play?",
+            "Could you explain the scenario again?",
+            "Can you explain that again?",
+            "What do I need to do?",
+            "What do I say when she picks up?",
+            "Can you explain how I should start the call?",
+            "Who is the learner?",
+            "Can you explain what I have to do?",
+            "Can you tell me about Meera?",
+            "Could you explain how the incentives work in this role play?",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.asks_about_the_job(
+                    text, after_answer=True, lead_names=self.LEADS
+                ))
+
+    async def test_job_questions_reach_the_model_and_never_use_the_brief_budget(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.interview._last_transition_line = "reply"  # Christy just answered about the shifts
+        self.agent_state("listening")
+        asks = self.JOB_QUESTIONS + (
+            "Could you explain the incentive structure?",
+            "Can you clarify the working hours?",
+            "Can you explain that briefly?",  # SWEEP-29's negative, at the route
+        )
+        for replay_used in (False, True):
+            self.interview._brief_repeated = replay_used
+            for text in asks:
+                with self.subTest(text=text, replay_used=replay_used):
+                    self.assertEqual(
+                        self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                    )
+        self.interview._brief_repeated = False
+        for text in self.SCENARIO_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_BRIEF
+                )
+        # Right after the brief, "Can you explain that briefly?" asks for the short recap.
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.assertEqual(
+            self.interview._transition_action("Can you explain that briefly?"),
+            r1_session._TRANSITION_RECAP,
+        )
+
+    async def test_a_bare_yes_or_no_to_her_own_question_is_answered(self) -> None:
+        # Review of S6: her answer ended with a question, so its start question was dropped; a
+        # bare "Yes." is answered by the model, never 20 s of dead air.  It is no consent.
+        self.interview._enter(R1Phase.TRANSITION)
+        guard = StreamGuard(self.interview.engine.guard_context("transition", mode="reply"))
+        self.assertFalse(await self.answer("What are the shifts like?"))
+        reply = self.interview._last_reply
+        asked = "They run at night. Do you mean the weekly hours?"
+        chunks = [
+            chunk async for chunk in self.interview._screened(
+                lambda: self_stream(asked), guard, reply
+            )
+        ]
+        self.assertEqual("".join(chunks).strip(), asked)  # no start question after hers
+        self.assertIsNone(self.interview._start_question)
+        self.interview._last_transition_line = "reply"  # her answer finished playing
+        self.agent_state("listening")
+        for text in ("Yes.", "Yeah, okay.", "No.", "Not really."):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                )
+        self.assertEqual(self.interview._transition_action("Hmm."), r1_session._TRANSITION_QUIET)
+        self.assertFalse(await self.answer("Yes."))  # the model replies
+        self.assertIs(self.interview.machine.phase, R1Phase.TRANSITION)
+        self.assertFalse(self.interview._transition_consented)
+        self.assertFalse(self.interview._ready_latched)
+        # Past the answer limit the yes/no start question is asked instead.
+        self.interview._start_question = None
+        self.interview._transition_answers = r1_session.TRANSITION_QUESTION_LIMIT
+        self.assertEqual(self.interview._transition_action("Yes."), r1_session._TRANSITION_REASK)
+
+    async def test_the_button_while_the_brief_is_on_its_way_or_her_answer_plays(self) -> None:
+        # Review of S6: "Yes, I'm here." and the bridge's compose come before the brief, and her
+        # answer ends with a question too: a press then gets "Great, here she is." first.
+        self.interview._bridging = True
+        self.assertEqual(self.interview._press_label(), "brief")
+        self.interview._bridging = False
+        self.assertEqual(self.interview._press_label(), "wait")
+        task = await self.start_transition()
+        self.assertFalse(await self.answer("What are the working days?"))
+        handle = FakeSpeechHandle("reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
+        )
+        self.session.current_speech = handle
+        self.press()
+        self.session.current_speech = None
+        handle.finish()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken[-2:], [
+            self.spoken_line("L-PICKUP-BRIDGE"), self.spoken_line("L-PICKUP")
+        ])
+        self.assertEqual(self.transition_facts()["pressed_during"], "answer")
+
     def test_real_advisor_turns_are_none_of_the_new_requests(self) -> None:
         # The 2,136-turn advisor corpus and its held-out set: no wider brief request, no shorter
         # brief request (even right after a brief), no presence check among them.
@@ -9340,12 +9502,18 @@ class TestBriefRepairOnRequest(R1TestCase):
             "summary " * 5000 + "of my day",
             "hello " * 5000 + "are you there what",
             "in " + "about " * 5000 + "four",
+            "can you explain " * 3000 + "that",
+            "can you explain that " * 3000,
+            "who will i be " * 3000 + "calling",
+            "which course " * 3000 + "is it about",
+            "the lead " * 4000,
         ):
             started = _time.perf_counter()
             r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
             r1_session.is_short_brief_request(text, after_brief=True, lead_names=self.LEADS)
             r1_session.is_presence_check(text)
             r1_session.names_the_roleplay(text, self.LEADS)
+            r1_session.asks_about_the_job(text, after_answer=True, lead_names=self.LEADS)
             self.assertLess(_time.perf_counter() - started, 1.0)
 
     async def test_a_request_during_the_briefing_gets_the_again_brief_once(self) -> None:

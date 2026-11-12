@@ -2220,17 +2220,25 @@ asked a question of its own before the start question. `R1_TRANSITION_REPAIR` (d
   overview, "tell me about the role play again", more details on it, the learner's name) gets the
   replay once; a request for a shorter one (`is_short_brief_request`) gets the recap; the recaps
   share a budget of 2 (`RECAP_LIMIT`); once both are used, L-TRANSITION-REASK, never the nudge. A
-  question about the role-play itself never goes to the model (replay, recap, then the nudge). A
-  presence check gets L-PRESENT ("Yes, I'm here.") and L-TRANSITION-REASK.
+  question about the role-play itself never goes to the model (replay, recap, then the nudge):
+  one that names it, the brief, "the scenario", the learner or her name, or asks who they will
+  call, which course it is, who calls whom or whether it is a cold call. "The lead generation",
+  "the learner profile", "the prospect of growth" and "in what scenario" are job questions, and
+  so is a generic ask about a job topic ("Could you explain the incentive structure?") or about
+  "that" right after Christy's answer (`asks_about_the_job`): the model answers them. A
+  presence check gets L-PRESENT ("Yes, I'm here.") and L-TRANSITION-REASK. When her answer ended
+  with a question of its own, a bare "Yes." or "No." is answered by the model too.
 * **Start questions**: the transition note (`TRANSITION_REMINDER_REPAIRED`) says "Of course, go
   ahead." to a request to ask and never ends an answer with a question; an answer that asks anyway
   drops the start question (not twice in a row; `r1_transition_tail_dropped`), and after the brief
   the answers' start questions rotate (L-TRANSITION-ASK-2, -3).
-* **Pickup**: "Hello, {lead_first_name} speaking."; the button pressed during a brief, the replay
-  or the recap gets L-PICKUP-BRIDGE ("Great, here she is.") first. L-ASIDE-COACH says Christy is
-  playing the learner.
-* **session_facts** gains `start_by` (button/spoken), `pressed_during` (brief/replay/recap/wait,
-  button only) and `transition_recaps` (a count); the API parser reads none of them.
+* **Pickup**: "Hello, {lead_first_name} speaking."; the button pressed during a brief (or while
+  it is on its way: "Yes, I'm here." or the bridge's compose), the replay, the recap or Christy's
+  answer to a question gets L-PICKUP-BRIDGE ("Great, here she is.") first. L-ASIDE-COACH says
+  Christy is playing the learner.
+* **session_facts** gains `start_by` (button/spoken), `pressed_during`
+  (brief/replay/recap/answer/wait, button only) and `transition_recaps` (a count); the API
+  parser reads none of them.
 
 Logs (labels only): `r1_brief_requested`, `r1_brief_recap_requested`, `r1_brief_recap`,
 `r1_brief_repeat`, `r1_transition_presence`, `r1_transition_tail_dropped`. Content revision 22;

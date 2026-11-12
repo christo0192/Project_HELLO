@@ -733,6 +733,8 @@ _EITHER_OR = "either_or"
 _SAY_READY = "say_ready"
 # Repair (round 2): the words that make a no-questions turn a refusal, not a thank-you.
 _BARE_NO_WORDS = frozenset({"no", "nope", "nah", "none", "nothing"})
+# Review of S6: a bare "No." (or "Not really.") that answers a question of Christy's own.
+_BARE_NO_REPLY_WORDS = frozenset({"no", "nope", "nah", "not", "really", "actually", "um", "uh"})
 _START_QUESTION_OF_LINE = {
     "L-TRANSITION": _EITHER_OR,
     "L-TRANSITION-BRIDGED": _EITHER_OR,  # M032 S5: the same brief, after Christy's reaction
@@ -1494,6 +1496,77 @@ def is_short_brief_request(
     return False
 
 
+# Review of S6 (``R1_TRANSITION_REPAIR``): the generic asks of ``_BRIEF_REQUEST_RE`` ("can you
+# explain ...", "please clarify ...", "what do I need to do ...") name what they ask about.  A job
+# topic ("Could you explain the incentive structure?", "What do I need to do on the first day of
+# the job?") is a question about the job, and a bare pronoun ("Can you explain that briefly?") right
+# after an answer of Christy's asks about that answer: both go to the model like any question.
+_BRIEF_GENERIC_RE = re.compile(
+    r"\b(?:(?:can|could|would|will) you (?:please |just |kindly )?|please )"
+    r"(?:repeat|rephrase|explain|clarify|go over|brief)\b|"
+    r"\bwhat (?:exactly )?(?:do|should|shall) i (?:have to |need to )?(?:do|say)\b"
+)
+_JOB_TOPIC_RE = re.compile(
+    r"\b(?:salary|salaries|pay|ctc|compensation|package|incentives?|commissions?|bonus(?:es)?|"
+    r"perks|benefits|shifts?|timings?|hours|working|office|location|leaves?|holidays?|"
+    r"weekends?|training|onboarding|joining|probation|notice period|targets?|quotas?|"
+    r"appraisals?|promotions?|growth|team|manager|job|company|first day|day one|"
+    r"work from home|wfh|hybrid|remote|next steps?|selection|role(?! ?play)|position)\b"
+)
+# What a generic ask may have before its object without naming one ("explain to me again briefly").
+_GENERIC_FILLER = frozenset(
+    {"to", "me", "us", "a", "bit", "little", "quickly", "briefly", "simply", "more", "please",
+     "just", "kindly", "for", "once", "exactly", "now", "here", "in", "short", "brief"}
+)
+_GENERIC_PRONOUNS = frozenset({"it", "that", "this", "those", "these"})
+_BRIEF_AGAIN_RE = re.compile(r"\b(?:again|once more|one more time)\b")
+_BRIEF_NAMED_RE = re.compile(
+    r"\b(?:role ?play|roleplay|(?:the|this|that|your) brief|instructions?|scenario|task|round|"
+    r"exercise|setup|learner|lead|customer|prospect|course|call|she|her)\b"
+)
+
+
+def asks_about_the_job(
+    text: str, *, after_answer: bool = False, lead_names: tuple[str, ...] = ()
+) -> bool:
+    """True for a turn that ``is_brief_request`` reads only through a generic ask, and that asks
+    about a job topic, or (``after_answer``: Christy's answer was the last thing she said) about
+    "that" or nothing named at all (review of S6).
+
+    Never for a turn another brief form reads ("What is the brief?", "explain it again"), nor for
+    one that names the role-play, the learner or her name: those stay brief requests.
+    """
+    folded = fold_speech(text)
+    matches = list(_BRIEF_GENERIC_RE.finditer(folded)) if folded else []
+    if not matches:
+        return False
+    stripped = _BRIEF_GENERIC_RE.sub(" ~ ", folded)
+    if (
+        _BRIEF_REQUEST_RE.search(stripped) is not None
+        or _BRIEF_SHORT_RE.match(folded) is not None
+        or _brief_wide_re(tuple(lead_names)).search(folded) is not None
+        or _BRIEF_ROLE_CHECK_RE.search(folded) is not None
+        or _SHORT_OBJECT_RE.search(folded) is not None
+        or _BRIEF_NAMED_RE.search(folded) is not None
+    ):
+        return False
+    leads = _lead_alternation(tuple(lead_names))
+    if leads and re.search(r"\b(?:" + leads + r")\b", folded) is not None:
+        return False
+    if _JOB_TOPIC_RE.search(folded) is not None:
+        return True
+    if not after_answer or _BRIEF_AGAIN_RE.search(folded) is not None:
+        return False
+    for match in matches[:8]:
+        if match.group().startswith("what"):
+            return False  # "What do I need to do?" asks about the role-play, whatever came before
+        ahead = folded[match.end():match.end() + 120].split()  # its object comes first
+        rest = [word for word in ahead if word not in _GENERIC_FILLER]
+        if rest and rest[0] not in _GENERIC_PRONOUNS:
+            return False  # an object of its own, and not the job's: read as before
+    return True
+
+
 # M032 S6 item 3: "Are you there?", "Hello?", "Can you hear me?" (fda9e9f6 #28 got nothing at all:
 # every word of it is a backchannel word).  Only presence words around the check; a request to say
 # it again ("what", "again", "pardon") is a repeat request, not a presence check.
@@ -1518,10 +1591,34 @@ def is_presence_check(text: str) -> bool:
 
 # M032 S6 item 2: a transition turn that is about the role-play itself (owner's call fda9e9f6 #26:
 # "tell me about the role play again" was answered with the JOB's shift timings).  It names the
-# role-play, the brief, the scenario, the learner or her name, and asks something.
+# role-play, the brief, the scenario, the learner or her name, and asks something.  Review of S6:
+# "the scenario" needs its article ("In what scenario would I work weekends?" is about the job),
+# and "the learner", "the lead" and "the prospect" must not be a modifier of a job noun ("the lead
+# generation", "the learner profile") or "the prospect of growth".
+_ROLEPLAY_PERSON_MODIFIED = (
+    r"(?! (?:generation|gen|quality|qualities|profile|profiles|base|pool|flow|sources?|sourcing|"
+    r"conversion|conversions|volume|volumes|count|counts|numbers?|data|lists?|pipeline|management|"
+    r"manager|managers|magnet|score|scoring|nurturing|assignment|allocation|distribution|journey|"
+    r"experience|support|success|retention|outcomes?|feedback|community|app|portal|satisfaction|"
+    r"team|teams|cycle|funnel|tracking|tracker|crm|system|systems|platform|dashboard|mix|types?|"
+    r"segments?|role|roles|position|positions|advisor|counsellor|counselor|of)\b)"
+)
 _ROLEPLAY_NAMED_RE = re.compile(
-    r"\b(?:role ?play|roleplay|(?:the|this|that|your) brief|scenario|the learner|the lead|"
-    r"the prospect)\b"
+    r"\b(?:role ?play|roleplay|(?:the|this|that|your) brief|(?:the|this|that) scenario|"
+    r"(?:the learner|the lead|the prospect)\b" + _ROLEPLAY_PERSON_MODIFIED + r")\b"
+)
+# Review of S6: questions about the scenario that name none of it ("Who will I be calling?",
+# "Which course is it about?", "Do I call her or does she call me?", "Is it a cold call?"): only as
+# a question (a question mark or an asking opener), so "I'll be calling her" says nothing.
+_ROLEPLAY_CUE_RE = re.compile(
+    r"\bwho (?:will|would|am|do|shall|should) i (?:be )?(?:call(?:ing)?|talk(?:ing)? to|"
+    r"speak(?:ing)? (?:to|with)|sell(?:ing)? to|pitch(?:ing)? to)\b|"
+    r"\b(?:which|what) course (?:is (?:it|this|she|the call) (?:about|for|on)|"
+    r"(?:am i|will i be|do i|should i|shall i|is she|did she|does she) "
+    r"(?:sell(?:ing)?|pitch(?:ing)?|talk(?:ing)? about|discuss(?:ing)?|offer(?:ing)?|"
+    r"interested|enquir(?:e|ed|ing)|inquir(?:e|ed|ing)|ask(?:ing|ed)? about))\b|"
+    r"\b(?:do|will|should|shall) i call her\b|\bdoes she call me\b|\bwho calls (?:whom|who)\b|"
+    r"\b(?:is|will) (?:it|this|that) (?:be )?a cold call\b"
 )
 _ROLEPLAY_ASK_RE = re.compile(
     r"\b(?:(?:tell|explain|describe|clarify|give|share) (?:me|us)|what|what's|whats|how|how's|when|"
@@ -1545,6 +1642,8 @@ def names_the_roleplay(text: str, lead_names: tuple[str, ...] = ()) -> bool:
     if not named:
         leads = _lead_alternation(tuple(lead_names))
         named = bool(leads) and re.search(r"\b(?:" + leads + r")\b", folded) is not None
+    if not named:
+        named = _ROLEPLAY_CUE_RE.search(folded) is not None
     if not named:
         return False
     return _has_question_mark(text) or _ROLEPLAY_ASK_RE.search(folded) is not None
@@ -2705,7 +2804,7 @@ class R1Interview:
         self._ready_latched = True
         self._awaiting_ready = False
         # M032 S6 item 6: during a brief, the replay, the recap, or the wait (session_facts).
-        self._pressed_during = self._brief_playing or "wait"
+        self._pressed_during = self._press_label()
         _log.info("unknown_event", error_type="r1_ready_button", phase="transition")
         self._wake()
 
@@ -4012,7 +4111,11 @@ class R1Interview:
           (``_brief_route``): the replay, the recap, or the yes/no start question once both are
           used.  The nudge never answers a brief request.
         * A question about the role-play itself never reaches the model (item 2): the replay if it
-          is unused, else the recap, else the nudge.
+          is unused, else the recap, else the nudge.  A question about the job does (review of
+          S6: ``asks_about_the_job``, and ``names_the_roleplay`` reads "the lead generation" as
+          the job's).
+        * Review of S6: a bare "Yes." or "No." to a question her answer ended with is answered
+          (``_answers_her_own_question``), never left to the 20 s reask.
         * The rest is routed as before (the nudge, nothing at all, the steer, the invite, or an
           answer from the role facts).
         """
@@ -4023,6 +4126,14 @@ class R1Interview:
         route = self._brief_route(text)
         if route is not None:
             return route
+        if text and self._answers_her_own_question(text):
+            # Review of S6: her answer ended with a question of its own (its start question was
+            # dropped), so a bare "Yes." or "No." answers HER, and is never dead air: the model
+            # replies (with a start question after it), or past the answer limit the yes/no
+            # start question is asked.
+            if self._transition_answers < TRANSITION_QUESTION_LIMIT:
+                return _TRANSITION_ANSWER
+            return _TRANSITION_REASK
         if (
             is_short_yes(text)
             and self._start_question == _EITHER_OR
@@ -4051,6 +4162,49 @@ class R1Interview:
             return _TRANSITION_INVITE
         return _TRANSITION_ANSWER
 
+    def _press_label(self) -> str:
+        """M032 S6 item 6: what the "I'm ready" press came during (``pressed_during``).
+
+        "brief", "replay" or "recap" while one plays, and "brief" too while it is on its way
+        (review of S6: "Yes, I'm here." at a presence boundary and the bridge's compose come
+        first, ``_bridging``).  "answer" while Christy's answer to a question is playing (it ends
+        with a start question, or a question of her own).  "wait" otherwise.
+        """
+        if self._brief_playing is not None:
+            return self._brief_playing
+        if self._bridging:
+            return "brief"
+        speech = getattr(self.session, "current_speech", None)
+        slot = self._speeches.get(getattr(speech, "id", None))
+        done = getattr(speech, "done", None)
+        if (
+            slot is not None
+            and slot.source == "generate_reply"
+            and not (callable(done) and done())
+            and transition_repair_enabled()
+        ):
+            return "answer"
+        return "wait"
+
+    def _answers_her_own_question(self, text: str) -> bool:
+        """Review of S6: a bare yes or no right after Christy's answer that asked something itself
+        (``_drop_answer_tail``: no start question is open), with her quiet now."""
+        if (
+            self._start_question is not None
+            or not self._last_answer_tailless
+            or self._last_transition_line != "reply"
+            or self._brief_playing is not None
+            or self._agent_state not in _QUIET_AGENT_STATES
+        ):
+            return False
+        if is_short_yes(text):
+            return True
+        words = fold_speech(text).split()
+        return (
+            all(word in _BARE_NO_REPLY_WORDS for word in words)
+            and not {"no", "nope", "nah", "not"}.isdisjoint(words)
+        )
+
     def _lead_names(self) -> tuple[str, ...]:
         """The learner's full and first name (the brief's object in a request; never logged)."""
         try:
@@ -4074,6 +4228,8 @@ class R1Interview:
         one is left, else the replay while it is unused.  Any other brief request (the wider
         ``is_brief_request``, item 1) gets the replay while it is unused, else the recap.  Once
         both budgets are used: the yes/no start question (L-TRANSITION-REASK), never the nudge.
+        Review of S6: a generic ask about the job, or about "that" right after her answer
+        (``asks_about_the_job``), is no brief request: the model answers it.
         """
         if not text:
             return None
@@ -4081,6 +4237,9 @@ class R1Interview:
         short = is_short_brief_request(text, after_brief=self._after_brief(), lead_names=leads)
         if not short and not is_brief_request(text, wide=True, lead_names=leads):
             return None
+        after_answer = self._brief_playing is None and self._last_transition_line == "reply"
+        if not short and asks_about_the_job(text, after_answer=after_answer, lead_names=leads):
+            return None  # review of S6: a question about the job (or her answer), not the brief
         replay_left = not self._brief_repeated and not self._brief_requested
         recap_left = self._recaps_left() > 0
         if short and recap_left:
@@ -7485,7 +7644,7 @@ class R1Interview:
         bridge = (
             self._ready_latched
             and transition_repair_enabled()
-            and self._pressed_during in ("brief", "replay", "recap")
+            and self._pressed_during in ("brief", "replay", "recap", "answer")
         )
         # The pickup is uninterruptible: a candidate still speaking ("Yes, let's start, and ...")
         # is not talked over (aa166f09 review), within the endpointing maximum and a margin.

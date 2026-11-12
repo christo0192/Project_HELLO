@@ -353,7 +353,7 @@ def fidelity_events(
 
 # M032 S6: what the transition and the icebreaker repairs add to the ``session_facts`` row (labels
 # and counts only; the API's parser reads none of them, so the gate is unchanged).  ``start_by`` is
-# "button" or "spoken"; ``pressed_during`` is "brief", "replay", "recap" or "wait".
+# "button" or "spoken"; ``pressed_during`` is "brief", "replay", "recap", "answer" or "wait".
 EXTRA_FACT_KEYS = (
     "start_by",
     "pressed_during",
