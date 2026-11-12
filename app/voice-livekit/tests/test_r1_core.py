@@ -562,10 +562,41 @@ class R1TestCase(unittest.IsolatedAsyncioTestCase):
             recorder_finish=lambda: append(self.order, "recording"),
         )
         task = asyncio.create_task(interview.run())
+        await self.pass_sound_check(session, interview)
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
         return SimpleNamespace(
             interview=interview, context=context, session=session, clock=clock, task=task
         )
+
+    async def pass_sound_check(
+        self, session=None, interview=None, *, reply: str = "Yes, I can hear you."
+    ) -> None:
+        """M032 S7C (SWEEP-35): answer the hello's "Can you hear me okay?" as a candidate would.
+
+        A no-op with ``R1_OPENING_SOUND_CHECK`` off (L-OPEN is followed by the icebreaker at once).
+        """
+        if not r1_session.opening_sound_check_enabled():
+            return
+        session = session or self.session
+        await self.until(lambda: session.agent is not None)
+        interview = interview or session.agent.interview
+        hello = interview.render_line("L-OPEN-HELLO")
+        await self.until(lambda: ("play_end", hello) in session.log)
+        await self.settle()
+        session.emit("user_input_transcribed", final_event(reply))
+        await self.settle()
+        with contextlib.suppress(r1_session.StopResponse):
+            await session.agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content=reply, id=f"msg_{next(_IDS)}")
+            )
+        await self.settle()
+
+    @staticmethod
+    def opening_line_ids() -> tuple[str, ...]:
+        """What the driver says before the icebreaker (M032 S7C: the hello, then the agenda)."""
+        if r1_session.opening_sound_check_enabled():
+            return ("L-OPEN-HELLO", "L-OPEN-AGENDA")
+        return ("L-OPEN",)
 
     async def advance_to_transition(self, run: SimpleNamespace) -> None:
         """Skip the icebreaker clock; the driver speaks L-TRANSITION and waits for READY."""
@@ -1192,6 +1223,7 @@ class TestPhaseAndConfiguration(unittest.TestCase):
 class TestCandidateAndStopEvents(R1TestCase):
     """Event tests prove that non-candidate room traffic cannot control R1."""
 
+    @mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0)  # M032 S7C: at once
     async def test_only_candidate_microphone_mute_enters_and_exits_aside_silently(self) -> None:
         self.enter_roleplay()
         camera = FakePublication(kind=VIDEO, source=CAMERA)
@@ -1221,6 +1253,7 @@ class TestCandidateAndStopEvents(R1TestCase):
         self.assertFalse(self.interview._needs_attention())
         self.assertEqual(self.session.spoken, [])
 
+    @mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0)  # M032 S7C: at once
     async def test_mute_then_disconnect_then_rejoin_with_a_live_microphone_restores_roleplay(
         self,
     ) -> None:
@@ -1229,7 +1262,7 @@ class TestCandidateAndStopEvents(R1TestCase):
         await self.settle()
         self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
         self.assertIs(self.interview.machine.phase, R1Phase.ASIDE)  # entered by the event itself
-        await self.until(lambda: self.spoken_and_played("L-MUTE"))
+        await self.until(lambda: self.spoken_and_played("L-MUTE-RP"))
         self.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
         await self.until(lambda: self.interview.machine.phase is R1Phase.PAUSED_DISCONNECTED)
         # A page refresh: a NEW, unmuted microphone publication; no track_unmuted event.
@@ -1940,14 +1973,15 @@ class TestSilenceWindows(R1TestCase):
         self.assertGreaterEqual(self.interview._quiet_since, before)
         self.assertEqual(await asyncio.wait_for(waiter, 10.0), (SILENCE, None))
 
+    @mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0)  # M032 S7C: at once
     async def test_a_muted_microphone_pauses_the_countdown(self) -> None:
         self.enter_roleplay()
         self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
         turn = asyncio.create_task(self.interview._await_turn(0.05))
-        await self.until(lambda: self.spoken_and_played("L-MUTE"))
+        await self.until(lambda: self.spoken_and_played("L-MUTE-RP"))
         await asyncio.sleep(0.2)  # four windows' worth of muted time
         self.assertFalse(turn.done())
-        self.assertEqual(self.session.spoken.count(self.spoken_line("L-MUTE")), 1)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-MUTE-RP")), 1)
         self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
         self.assertEqual(await asyncio.wait_for(turn, 10.0), (SILENCE, None))
 
@@ -2097,18 +2131,19 @@ class TestSilenceWindows(R1TestCase):
             self.assertEqual(await asyncio.wait_for(turn, 10.0), "candidate_left")
         self.assertNotIn(self.spoken_line("L-SIL-RP1"), self.session.spoken)
 
+    @mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0)  # M032 S7C: at once
     async def test_roleplay_mute_speaks_aside_and_never_counts_down_silence(self) -> None:
         self.enter_roleplay()
         turn = asyncio.create_task(self.interview._roleplay_turn())
         await self.settle()
         self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
-        await self.until(lambda: self.spoken_and_played("L-MUTE"))
+        await self.until(lambda: self.spoken_and_played("L-MUTE-RP"))
         self.assertIs(self.interview.machine.phase, R1Phase.ASIDE)
         self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
         self.assertIs(self.interview.machine.phase, R1Phase.ROLEPLAY)  # left by the event
         self.final_transcript("back now")
         self.assertIsNone(await asyncio.wait_for(turn, 10.0))
-        self.assertEqual(self.session.spoken.count(self.spoken_line("L-MUTE")), 1)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-MUTE-RP")), 1)
         self.assertNotIn(self.spoken_line("L-SIL-RP1"), self.session.spoken)
 
 
@@ -2548,6 +2583,7 @@ class TestPhaseDriver(R1TestCase):
         started = asyncio.get_running_loop().time()
         return lambda: max(0.0, seconds - (asyncio.get_running_loop().time() - started))
 
+    @mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0)  # M032 S7C: at once
     async def test_a_muted_candidate_cannot_stall_the_icebreaker_past_its_deadline(self) -> None:
         self.mute_candidate()
         budget = self.shrinking(0.15)
@@ -2557,8 +2593,9 @@ class TestPhaseDriver(R1TestCase):
             self.interview.machine, "icebreaker_should_end", lambda: budget() <= 0
         ):
             self.assertIsNone(await asyncio.wait_for(self.interview._run_icebreaker(), 10.0))
-        self.assertEqual(self.session.spoken.count(self.spoken_line("L-MUTE")), 1)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-MUTE-IV")), 1)
 
+    @mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0)  # M032 S7C: at once
     async def test_a_muted_candidate_cannot_stall_the_transition(self) -> None:
         # Muted, the silence steps never run; the transition's ceiling ends the wait, and the
         # role-play is still never started without the candidate's consent (M1).
@@ -2567,7 +2604,7 @@ class TestPhaseDriver(R1TestCase):
         with mock.patch.object(r1_session, "TRANSITION_MAX_SECONDS", 0.1):
             outcome = await asyncio.wait_for(self.interview._run_transition(), 10.0)
         self.assertEqual(outcome, "candidate_left")
-        self.assertIn(self.spoken_line("L-MUTE"), self.session.spoken)
+        self.assertIn(self.spoken_line("L-MUTE-IV"), self.session.spoken)
         self.assertEqual(self.session.spoken[-1], self.spoken_line("L-SIL-END"))
         self.assertNotIn(self.spoken_line("L-PICKUP"), self.session.spoken)
 
@@ -2722,6 +2759,7 @@ class TestTranscript(R1TestCase):
             clock=Clock(),
         )
         task = asyncio.create_task(interview.run())
+        await self.pass_sound_check(session, interview)
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
         session.emit("user_input_transcribed", final_event("an answer given just before the end"))
         await self.until(lambda: len(interview._turn_writes) > 0)
@@ -2996,15 +3034,17 @@ class TestExitInvariant(R1TestCase):
         context = FakeContext(self.order)
         context.room.remote_participants["candidate"] = FakeParticipant("candidate")
         run_clock = Clock()
+        session = FakeSession(log=self.order)
         interview = R1Interview(
             context,
             {"first_name": "Asha", "candidate_identity": "candidate"},
-            FakeSession(log=self.order),
+            session,
             self.writer,
             clock=run_clock,
             recorder_finish=lambda: append(self.order, "recording"),
         )
         task = asyncio.create_task(interview.run())
+        await self.pass_sound_check(session, interview)
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
         run_clock.advance(271)
         interview._wake()
@@ -3030,7 +3070,8 @@ class TestExitInvariant(R1TestCase):
             clock=Clock(),
         )
         task = asyncio.create_task(interview.run())
-        await self.until(lambda: ("play_start", self.spoken_line("L-OPEN")) in self.order)
+        first = self.spoken_line(self.opening_line_ids()[0])
+        await self.until(lambda: ("play_start", first) in self.order)
         context.room.emit("participant_disconnected", FakeParticipant("candidate"))
         context.room.emit("disconnected", "room closed")
         task.cancel()
@@ -3334,13 +3375,15 @@ class TestRunFlow(R1TestCase):
         task = asyncio.create_task(
             run_r1_session(self.ctx, session_factory=self.session_factory)
         )
-        # OPENING: activation happened first, the session started, and the driver spoke L-OPEN.
-        await self.until(lambda: self.spoken_and_played("L-OPEN"))
+        # OPENING: activation happened first, the session started, and the driver spoke the opening
+        # (M032 S7C: the hello, the candidate's "yes", then the agenda).
+        await self.until(lambda: self.spoken_and_played(self.opening_line_ids()[0]))
         names = [item if isinstance(item, str) else item[0] for item in self.order]
         self.assertLess(names.index("activate"), names.index("start"))
         self.assertLess(names.index("start"), names.index("play_start"))
         self.assertNotIn("terminal", names)  # nothing settles before the interview ran
         self.assertIsInstance(self.session.agent, R1Agent)
+        await self.pass_sound_check()
         # ICEBREAKER: four committed candidate answers at S >= 3:30 end it at the boundary turn.
         await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
         self.clock.advance(215)
@@ -3358,15 +3401,16 @@ class TestRunFlow(R1TestCase):
             await self.candidate_replies_after("L-WRAP", "No questions, thanks")
             self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
 
+        opening = list(self.opening_line_ids())
         expected_lines = [
-            "L-OPEN", "L-TRANSITION", "L-PICKUP", "L-TIME-UP", "L-EXIT", "L-WRAP", "L-CLOSE",
+            *opening, "L-TRANSITION", "L-PICKUP", "L-TIME-UP", "L-EXIT", "L-WRAP", "L-CLOSE",
         ]
         self.assertEqual(self.session.spoken, [self.spoken_line(name) for name in expected_lines])
         phases = {row["text"]: row["phase"] for row in self.bot_rows()}
         self.assertEqual(
             [phases[self.spoken_line(name)] for name in expected_lines],
-            ["opening", "transition", "transition", "roleplay", "roleplay_exit", "wrapup",
-             "closing"],
+            ["opening"] * len(opening)
+            + ["transition", "transition", "roleplay", "roleplay_exit", "wrapup", "closing"],
         )
         # Exactly once each, with strictly increasing indices.
         self.assertEqual(len(self.bot_rows()), len(expected_lines))
@@ -3408,6 +3452,7 @@ class TestRunFlow(R1TestCase):
         task = asyncio.create_task(
             run_r1_session(self.ctx, session_factory=self.session_factory)
         )
+        await self.pass_sound_check()
         await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
         self.clock.advance(215)
         await self.four_icebreaker_answers()
@@ -3443,6 +3488,7 @@ class TestRunFlow(R1TestCase):
         task = asyncio.create_task(
             run_r1_session(self.ctx, session_factory=self.session_factory)
         )
+        await self.pass_sound_check()
         await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
         self.clock.advance(215)
         await self.four_icebreaker_answers()
@@ -3459,6 +3505,7 @@ class TestRunFlow(R1TestCase):
         task = asyncio.create_task(
             run_r1_session(self.ctx, session_factory=self.session_factory)
         )
+        await self.pass_sound_check()
         await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
         self.clock.advance(215)
         await self.four_icebreaker_answers()
@@ -3529,12 +3576,13 @@ class TestRunFlow(R1TestCase):
             task = asyncio.create_task(
                 run_r1_session(self.ctx, session_factory=self.session_factory)
             )
+            await self.pass_sound_check()  # M032 S7C: heard, so the prompt is "Are you still ...?"
             await self.until(lambda: self.spoken_line("L-SIL-IB") in self.session.spoken)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
         events = [item for item in self.order if not isinstance(item, str)]
-        open_end = events.index(("play_end", self.spoken_line("L-OPEN")))
+        open_end = events.index(("play_end", self.spoken_line(self.opening_line_ids()[-1])))
         prompt_start = events.index(("play_start", self.spoken_line("L-SIL-IB")))
         self.assertLess(open_end, prompt_start)
 
@@ -4387,6 +4435,7 @@ class TestIcebreakerEndRace(R1TestCase):
             clock=clock,
         )
         task = asyncio.create_task(interview.run())
+        await self.pass_sound_check(session, interview)
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
         clock.advance(209.6)
         agent = R1Agent(interview)
@@ -5431,6 +5480,9 @@ class TestWhatTheCandidateCanCut(R1TestCase):
         "L-OPEN", "L-PICKUP", "L-TRANSITION", "L-TRANSITION-NUDGE", "L-SIL-IB", "L-SIL-RP1",
         "L-SIL-RP2", "L-SIL-END", "L-MUTE", "L-REJOIN", "L-REJOIN-RP", "L-EXIT", "L-WRAP",
         "L-CLOSE", "L-SYSTEM-STOP",
+        # M032 S7C: the sound check and its agendas, the never-heard ladder, the mute asides.
+        "L-OPEN-HELLO", "L-OPEN-HELLO-AGAIN", "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN",
+        "L-OPEN-AGENDA-CONTINUE", "L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO", "L-MUTE-RP", "L-MUTE-IV",
     )
 
     async def test_every_scripted_line_is_spoken_uninterruptible(self) -> None:
@@ -7099,6 +7151,7 @@ class TestRecordingSeams(R1TestCase):
         return SimpleNamespace(interview=interview, context=ctx, session=session, task=task)
 
     async def to_icebreaker(self, run: SimpleNamespace) -> None:
+        await self.pass_sound_check(run.session, run.interview)
         await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
 
     def names(self) -> list:
@@ -7114,7 +7167,7 @@ class TestRecordingSeams(R1TestCase):
 
         run = self.seam_run(recorder_start=start)
         await self.to_icebreaker(run)
-        opening = ("play_start", self.spoken_line("L-OPEN"))
+        opening = ("play_start", self.spoken_line(self.opening_line_ids()[0]))
         await self.until(lambda: opening in self.order)
         order = self.order
         self.assertLess(order.index(("start", None)), order.index(("recorder_start", "candidate")))
@@ -7148,7 +7201,8 @@ class TestRecordingSeams(R1TestCase):
         self.writer.save_hangs = True  # a transcript write that never ends: the drain waits it out
         run = self.seam_run(recorder_stop=stop)
         await self.to_icebreaker(run)
-        await self.until(lambda: ("play_end", self.spoken_line("L-OPEN")) in self.order)
+        first = self.spoken_line(self.opening_line_ids()[0])
+        await self.until(lambda: ("play_end", first) in self.order)
         with mock.patch.object(r1_session, "TRANSCRIPT_DRAIN_SECONDS", 0.4):
             await self.drain_cancel(run)
         self.assertGreaterEqual(stamps["ledger"] - stamps["stop"], 0.3)
@@ -7160,12 +7214,13 @@ class TestRecordingSeams(R1TestCase):
         run = self.seam_run(recorder_start=start)
         with self.capture_logs() as logs:
             await self.to_icebreaker(run)
-            await self.until(lambda: ("play_end", self.spoken_line("L-OPEN")) in self.order)
+            first = self.spoken_line(self.opening_line_ids()[0])
+            await self.until(lambda: ("play_end", first) in self.order)
             await self.drain_cancel(run)
         failed = [l for l in logs if l["error_type"] == "r1_recorder_start_failed"]
         self.assertEqual([l["error_category"] for l in failed], ["RuntimeError"])
         self.assertNotIn("X-Amz-Signature", json.dumps(logs))
-        self.assertIn(("play_start", self.spoken_line("L-OPEN")), self.order)
+        self.assertIn(("play_start", self.spoken_line(self.opening_line_ids()[0])), self.order)
 
     async def test_a_start_that_never_returns_is_bounded_and_skipped(self) -> None:
         release = asyncio.Event()
@@ -7178,7 +7233,8 @@ class TestRecordingSeams(R1TestCase):
             run = self.seam_run(recorder_start=start)
             with self.capture_logs() as logs:
                 await self.to_icebreaker(run)
-                await self.until(lambda: ("play_end", self.spoken_line("L-OPEN")) in self.order)
+                first = self.spoken_line(self.opening_line_ids()[0])
+                await self.until(lambda: ("play_end", first) in self.order)
                 await self.drain_cancel(run)
         self.assertIn("r1_recorder_start_failed", error_types(logs))
 
@@ -7966,7 +8022,7 @@ class TestVoicePerSpeech(R1TestCase):
     async def test_warm_specs_carry_each_lines_voice(self) -> None:
         free = self.interview._warm_specs(candidate_free=True)
         named = self.interview._warm_specs(candidate_free=False)
-        order = list(r1_session._WARM_ORDER)
+        order = list(self.interview._warm_order())  # M032 S7C: L-MUTE gives way to the v2 asides
         self.assertEqual(sorted(spec.line_id for spec in free + named), sorted(order))
         for group in (free, named):
             ids = [spec.line_id for spec in group]
@@ -10250,3 +10306,682 @@ class TestTransitionConsent(R1TestCase):
         blob = " ".join(message["content"] for message in messages)
         self.assertNotIn(self.interview.persona.lead_name, blob)
         self.assertNotIn(self.spoken_line("L-TRANSITION"), blob)
+
+
+# --------------------------------------------------------------- M032 S7C: the Christy follow-ups
+
+
+@dataclass
+class FakeMicPublication(FakePublication):
+    """A microphone publication with the subscription state ``RemoteTrackPublication`` exposes."""
+
+    subscribed: bool = False
+
+
+def _s7c_env(**values: str):
+    """Patch the S7C flags (and any other variable) for one block."""
+    return mock.patch.dict(os.environ, values)
+
+
+class TestTheNoAudioLadder(R1TestCase):
+    """M032 S7C (SWEEP-34, ``R1_NO_AUDIO_LADDER``, pattern P25).  Four sessions on 2026-10-13 each
+    had only the opening, then "Are you still with me?" and the lost-connection close: no candidate
+    audio ever reached the worker.  A candidate who was never heard (no final, no speech) is told
+    Christy cannot hear them; one heard even once keeps today's ladder.  Synthetic text only."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        for name, value in (
+            ("ICEBREAKER_PROMPT_SECONDS", 0.05),
+            ("ICEBREAKER_END_SECONDS", 0.05),
+            ("NO_AUDIO_END_SECONDS", 0.05),
+            ("MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0),
+        ):
+            patcher = mock.patch.object(r1_session, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def lines(self, *line_ids: str) -> list[str]:
+        return [self.spoken_line(line_id) for line_id in line_ids]
+
+    async def run_icebreaker(self) -> str | None:
+        return await asyncio.wait_for(self.interview._run_icebreaker(), 10.0)
+
+    async def test_a_candidate_never_heard_is_told_christy_cannot_hear_them(self) -> None:
+        with self.capture_logs() as logs:
+            self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.lines("L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"))
+        self.assertTrue(self.interview._goodbye_spoken)  # no L-CLOSE after it
+        (noted,) = [line_ for line_ in logs if line_.get("error_type") == "r1_no_audio"]
+        self.assertEqual(noted["error_category"], "no_mic_track")
+        self.assertNotIn("Asha", json.dumps(logs))
+
+    async def test_an_answer_after_the_no_audio_line_keeps_the_icebreaker_going(self) -> None:
+        with mock.patch.object(r1_session, "NO_AUDIO_END_SECONDS", 5.0):
+            task = asyncio.create_task(self.interview._run_icebreaker())
+            await self.until(lambda: self.spoken_and_played("L-SIL-NOAUDIO"))
+            await self.settle()
+            self.final_transcript("Sorry, my microphone was off.")
+            await self.settle()
+            self.assertFalse(task.done())
+            self.assertNotIn(self.spoken_line("L-SIL-END-NOAUDIO"), self.session.spoken)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def test_one_final_then_silence_is_todays_ladder(self) -> None:
+        self.final_transcript("Hello")
+        self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.lines("L-SIL-IB", "L-SIL-END"))
+
+    async def test_speaking_then_listening_with_no_final_counts_as_heard(self) -> None:
+        self.user_state("speaking")
+        self.user_state("listening")
+        self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.lines("L-SIL-IB", "L-SIL-END"))
+
+    async def test_away_alone_is_not_heard(self) -> None:
+        self.user_state("away")
+        self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.lines("L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"))
+
+    async def test_heard_is_never_reset_by_a_rejoin(self) -> None:
+        self.user_state("speaking")
+        self.user_state("listening")
+        self.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+        self.ctx.room.emit("participant_connected", FakeParticipant("candidate"))
+        self.assertTrue(self.interview._candidate_ever_heard)
+
+    async def test_a_muted_candidate_gets_only_the_mute_aside(self) -> None:
+        self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+        budget = TestPhaseDriver.shrinking(0.3)
+        with mock.patch.object(
+            self.interview.machine, "remaining_icebreaker_seconds", budget
+        ), mock.patch.object(
+            self.interview.machine, "icebreaker_should_end", lambda: budget() <= 0
+        ):
+            self.assertIsNone(await self.run_icebreaker())
+        self.assertEqual(self.session.spoken, self.lines("L-MUTE-IV"))
+
+    async def test_the_microphone_state_is_logged_as_a_label(self) -> None:
+        cases = (
+            ({}, "no_mic_track"),
+            ({"TR_mic": FakeMicPublication(subscribed=False)}, "not_subscribed"),
+            ({"TR_mic": FakeMicPublication(subscribed=True)}, "no_voice"),
+            ({"TR_cam": FakeMicPublication(kind=VIDEO, source=CAMERA, subscribed=True)},
+             "no_mic_track"),
+        )
+        for publications, expected in cases:
+            with self.subTest(expected=expected):
+                self.ctx.room.remote_participants["candidate"] = FakeParticipant(
+                    "candidate", track_publications=publications
+                )
+                self.assertEqual(self.interview._no_audio_category(), expected)
+
+    async def test_it_is_logged_once_per_session(self) -> None:
+        with self.capture_logs() as logs:
+            self.interview._note_no_audio()
+            self.interview._note_no_audio()
+        self.assertEqual(error_types(logs).count("r1_no_audio"), 1)
+
+    async def test_the_transition_close_is_still_the_lost_connection_line(self) -> None:
+        self.interview.machine.transition(R1Phase.TRANSITION)
+        self.assertEqual(await self.interview._end_transition_unstarted(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.lines("L-SIL-END"))
+
+    async def test_the_flag_off_is_todays_ladder(self) -> None:
+        with _s7c_env(R1_NO_AUDIO_LADDER="0"), self.capture_logs() as logs:
+            self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.lines("L-SIL-IB", "L-SIL-END"))
+        self.assertNotIn("r1_no_audio", error_types(logs))
+
+    async def test_the_new_lines_are_uninterruptible(self) -> None:
+        for line_id in ("L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"):
+            with self.subTest(line=line_id):
+                await self.interview.say(line_id)
+                self.assertFalse(self.session.handles[-1].allow_interruptions)
+
+
+class TestTheMuteAsideV2(R1TestCase):
+    """M032 S7C (SWEEP-36, ``R1_MUTE_ASIDE_V2``, pattern P62).  b419d478: "Please unmute when you're
+    ready." came in Christy's own phase and was answered "I am ready"; a sub-second blip got the
+    uninterruptible line after the candidate had unmuted.  The aside waits for a real mute (the
+    debounce), never talks over a turn in flight (up to a cap), and fits the phase."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        for name, value in (
+            ("MUTE_ASIDE_DEBOUNCE_SECONDS", 0.3),
+            ("MUTE_ASIDE_TURN_WAIT_SECONDS", 0.6),
+        ):
+            patcher = mock.patch.object(r1_session, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def mute(self) -> None:
+        self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+
+    def unmute(self) -> None:
+        self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
+
+    def mute_lines(self) -> list[str]:
+        ids = ("L-MUTE", "L-MUTE-RP", "L-MUTE-IV")
+        texts = {self.spoken_line(line_id) for line_id in ids}
+        return [text for text in self.session.spoken if text in texts]
+
+    async def waiting(self, timeout: float = 30.0) -> asyncio.Task:
+        task = asyncio.create_task(self.interview._await_turn(timeout))
+        self.addCleanup(task.cancel)
+        await self.settle()
+        return task
+
+    async def test_a_blip_undone_within_the_debounce_gets_no_line(self) -> None:
+        self.enter_roleplay()
+        await self.waiting()
+        self.mute()
+        self.assertIs(self.interview.machine.phase, R1Phase.ASIDE)  # R paused at the event
+        await asyncio.sleep(0.1)
+        self.unmute()
+        self.assertIs(self.interview.machine.phase, R1Phase.ROLEPLAY)
+        await asyncio.sleep(0.5)
+        self.assertEqual(self.mute_lines(), [])
+        self.assertFalse(self.interview._mute_announced)
+
+    async def test_a_real_mute_gets_one_line_once_the_debounce_has_passed(self) -> None:
+        self.enter_roleplay()
+        await self.waiting()
+        loop = asyncio.get_running_loop()
+        muted_at = loop.time()
+        self.mute()
+        await self.settle()
+        self.assertEqual(self.mute_lines(), [])  # not at the first wake-up
+        await self.until(lambda: self.spoken_and_played("L-MUTE-RP"))
+        self.assertGreaterEqual(loop.time() - muted_at, 0.25)
+        await asyncio.sleep(0.4)
+        self.assertEqual(self.mute_lines(), [self.spoken_line("L-MUTE-RP")])  # one per episode
+        self.unmute()
+        self.mute()
+        await self.until(lambda: len(self.mute_lines()) == 2)  # a new episode, a new line
+
+    async def test_a_mute_over_a_turn_in_flight_waits_for_it_to_end(self) -> None:
+        await self.waiting()
+        self.user_state("speaking")
+        self.mute()
+        await asyncio.sleep(0.45)  # past the debounce, the candidate still mid-turn
+        self.assertEqual(self.mute_lines(), [])
+        self.user_state("listening")
+        await self.until(lambda: self.spoken_and_played("L-MUTE-IV"))
+
+    async def test_a_final_waiting_for_its_commit_is_a_turn_in_flight(self) -> None:
+        task = asyncio.create_task(self.interview._run_icebreaker())  # waits on through turns
+        self.addCleanup(task.cancel)
+        await self.settle()
+        self.final_transcript("I was saying that")
+        self.mute()
+        await asyncio.sleep(0.45)
+        self.assertEqual(self.mute_lines(), [])
+        with contextlib.suppress(r1_session.StopResponse):
+            await self.commit_turn("I was saying that")
+        await self.until(lambda: self.spoken_and_played("L-MUTE-IV"))
+
+    async def test_a_turn_that_never_ends_waits_no_longer_than_the_cap(self) -> None:
+        await self.waiting()
+        self.user_state("speaking")
+        loop = asyncio.get_running_loop()
+        muted_at = loop.time()
+        self.mute()
+        await self.until(lambda: self.spoken_and_played("L-MUTE-IV"))
+        self.assertGreaterEqual(loop.time() - muted_at, 0.55)
+
+    async def test_the_line_fits_the_phase(self) -> None:
+        for phases, expected in (
+            ((), "L-MUTE-IV"),  # the icebreaker
+            ((R1Phase.TRANSITION,), "L-MUTE-IV"),
+            ((R1Phase.TRANSITION, R1Phase.ROLEPLAY), "L-MUTE-RP"),
+            (
+                (R1Phase.TRANSITION, R1Phase.ROLEPLAY, R1Phase.ROLEPLAY_EXIT, R1Phase.WRAPUP),
+                "L-MUTE-IV",
+            ),
+        ):
+            with self.subTest(expected=expected, phases=phases):
+                await self.asyncSetUp()  # a fresh interview (it patches the debounce again)
+                for phase in phases:
+                    self.interview.machine.transition(phase)
+                with mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0):
+                    self.mute()
+                    await self.interview._handle_attention()
+                self.assertEqual(self.mute_lines(), [self.spoken_line(expected)])
+
+    async def test_the_opening_gets_the_interviewers_line(self) -> None:
+        interview = R1Interview(
+            self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer, clock=self.clock
+        )
+        interview.wire_events()
+        self.ctx.room.emit("participant_connected", FakeParticipant("candidate"))
+        interview.machine.transition(R1Phase.OPENING)
+        with mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0):
+            self.mute()
+            await interview._handle_attention()
+        self.assertIn(self.spoken_line("L-MUTE-IV"), self.session.spoken)
+
+    async def test_it_rechecks_the_mute_before_speaking(self) -> None:
+        self.mute()
+        self.interview._muted = False  # unmuted between the wake-up and the line
+        await self.interview._handle_mute()
+        self.assertEqual(self.mute_lines(), [])
+        self.assertFalse(self.interview._mute_announced)
+
+    async def test_nothing_is_announced_to_a_candidate_who_is_not_there(self) -> None:
+        with mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0):
+            self.mute()
+            self.interview._candidate_present = False
+            self.assertFalse(self.interview._needs_attention())
+            await self.interview._handle_mute()
+        self.assertEqual(self.mute_lines(), [])
+        self.assertFalse(self.interview._mute_announced)
+
+    async def test_an_unmute_echo_in_the_transition_never_starts_the_role_play(self) -> None:
+        self.interview.machine.transition(R1Phase.TRANSITION)
+        with mock.patch.object(r1_session, "MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0):
+            task = asyncio.create_task(self.interview._run_transition())
+            self.addCleanup(task.cancel)
+            await self.settle()
+            self.mute()
+            await self.until(lambda: self.spoken_and_played("L-MUTE-IV"))
+            self.assertNotIn("ready", self.spoken_line("L-MUTE-IV").lower())
+            self.unmute()
+            await self.settle()
+            self.final_transcript("Okay, I have unmuted now.")
+            await asyncio.sleep(0.2)
+            self.assertFalse(task.done())
+            self.assertNotIn(self.spoken_line("L-PICKUP"), self.session.spoken)
+            self.final_transcript("Ready.")
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
+    async def test_the_new_lines_are_uninterruptible(self) -> None:
+        for line_id in ("L-MUTE-RP", "L-MUTE-IV"):
+            with self.subTest(line=line_id):
+                await self.interview.say(line_id)
+                self.assertFalse(self.session.handles[-1].allow_interruptions)
+
+    async def test_the_flag_off_is_todays_immediate_l_mute(self) -> None:
+        with _s7c_env(R1_MUTE_ASIDE_V2="0"):
+            self.enter_roleplay()
+            self.user_state("speaking")
+            self.mute()
+            self.assertTrue(self.interview._needs_attention())
+            await self.interview._handle_attention()
+            self.assertEqual(self.mute_lines(), [self.spoken_line("L-MUTE")])
+            self.assertTrue(self.interview._mute_announced)
+            self.assertIs(self.interview.machine.phase, R1Phase.ASIDE)
+
+
+class TestTheSoundCheckReader(unittest.TestCase):
+    """M032 S7C (SWEEP-35): how the reply to "Can you hear me okay?" is read.  Synthetic text."""
+
+    CANT_HEAR = (
+        "Sorry, I can't hear you.",
+        "I cannot hear you properly.",
+        "I couldn't hear anything.",
+        "I can barely hear you.",
+        "I'm not able to hear you clearly.",
+        "No.",
+        "No, not really.",
+        "Not really.",
+        "Not clearly.",
+        "Nope.",
+        "Barely.",
+        "Hardly.",
+        "It's a bit low.",
+        "Yes, but it's a bit low.",
+        "It is very faint.",
+        "There's an echo.",
+        "You're breaking up.",
+        "Your voice is very low.",
+        "You sound a bit muffled, Christy.",
+        "Can you speak up a little?",
+        "Sorry?",
+        "Pardon?",
+        "Could you repeat that?",
+        "Hello? Are you there?",
+        "Hello?",
+        "Nahi.",
+    )
+    HEARD = (
+        "Yes, I can hear you.",
+        "Yes.",
+        "Yeah, loud and clear.",
+        "Hi Christy!",
+        "Hello.",
+        "Hi.",
+        "Can you hear me?",
+        "Yes I can, can you hear me?",
+        "Okay.",
+        "Yes, perfectly.",
+        "Hi, yes, all good.",
+        "Yes, I can hear you fine. Can you hear me?",
+        "Haan.",
+        "No problem.",
+        "",
+    )
+    ANSWERS = (
+        "Yes I can hear you. I have been working in inside sales for five years, selling software "
+        "subscriptions to small business owners.",
+        "Hi, yes. So I started my career in retail banking and then moved to an edtech company "
+        "where I handled admissions calls.",
+        # A long answer that mentions hearing is still an answer: the reading is directed.
+        "Yes. In my last job our customers often could not hear the offer clearly on the phone, "
+        "so I learned to follow up by email.",
+    )
+
+    def read(self, text: str) -> str:
+        return r1_session.sound_check_reading(text)
+
+    def test_a_cant_hear_reply(self) -> None:
+        for text in self.CANT_HEAR:
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), r1_session.SOUND_CANT_HEAR)
+
+    def test_a_reply_that_hears_us(self) -> None:
+        for text in self.HEARD:
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), r1_session.SOUND_HEARD)
+
+    def test_an_early_answer(self) -> None:
+        for text in self.ANSWERS:
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), r1_session.SOUND_ANSWER)
+
+    def test_a_long_reply_with_a_bare_no_inside_is_not_a_complaint(self) -> None:
+        self.assertNotEqual(
+            self.read("No, no, I can hear you, I was just getting my notes ready for this."),
+            r1_session.SOUND_CANT_HEAR,
+        )
+
+    def test_the_readers_are_linear_on_long_input(self) -> None:
+        for text in (
+            "no " * 5000,
+            "i can " * 4000 + "not hear",
+            "you are " + "a bit " * 4000 + "low",
+            "yes but " * 4000 + "it's low",
+            "hello " * 5000 + "?",
+        ):
+            started = time.perf_counter()
+            self.read(text)
+            self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_real_advisor_turns_are_rarely_a_complaint(self) -> None:
+        # The 2,136-turn advisor corpus and its held-out set are role-play turns, not replies to the
+        # sound check; the directed patterns that read anywhere in a turn must not fire on them.
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        hits: list[str] = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for raw in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if not raw:
+                    continue
+                text = json.loads(raw)["text"]
+                if len(text.split()) > r1_session.OPEN_CHECK_COMPLAINT_MAX_WORDS and (
+                    self.read(text) == r1_session.SOUND_CANT_HEAR
+                ):
+                    hits.append(text)
+        self.assertEqual(hits, [])
+
+
+class TestTheOpeningSoundCheck(R1TestCase):
+    """M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``, pattern P33).  L-OPEN was one 29 s block with
+    no greeting exchange and no hearing check.  The driver says a short hello ("Can you hear me
+    okay?"), reads the reply (never with the model), and then one shorter agenda that asks the first
+    icebreaker question.  Synthetic text only."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        for name, value in (
+            ("OPEN_CHECK_SILENCE_SECONDS", 0.2),
+            ("OPEN_HELLO_FOLLOW_SECONDS", 0.6),
+            ("NO_AUDIO_END_SECONDS", 0.2),
+            ("ICEBREAKER_PROMPT_SECONDS", 30.0),
+            ("MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0),
+        ):
+            patcher = mock.patch.object(r1_session, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def opening(self, *, playout: float = 0.0, context: dict | None = None):
+        ctx = FakeContext(self.order)
+        ctx.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        session = FakeSession(log=self.order, playout_seconds=playout)
+        clock = Clock()
+        interview = R1Interview(
+            ctx,
+            dict(context or {"first_name": "Asha", "candidate_identity": "candidate"}),
+            session,
+            self.writer,
+            clock=clock,
+        )
+        task = asyncio.create_task(interview.run())
+        run = SimpleNamespace(interview=interview, context=ctx, session=session, clock=clock,
+                              task=task)
+        self.addCleanup(self.stop, run)
+        await self.until(lambda: session.agent is not None)
+        return run
+
+    async def stop(self, run) -> None:
+        if not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await run.task
+
+    def played(self, run, line_id: str) -> bool:
+        return ("play_end", run.interview.render_line(line_id)) in self.order
+
+    async def hello_played(self, run) -> None:
+        await self.until(lambda: self.played(run, "L-OPEN-HELLO"))
+        await self.settle()
+
+    async def reply(self, run, text: str) -> None:
+        """A reply the way the SDK delivers it: the final, then the committed turn (no reply)."""
+        run.session.emit("user_input_transcribed", final_event(text))
+        await self.settle()
+        with self.assertRaises(r1_session.StopResponse):
+            await run.session.agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content=text, id=f"msg_{next(_IDS)}")
+            )
+        await self.settle()
+
+    def spoken_ids(self, run, *line_ids: str) -> list[str]:
+        return [run.interview.render_line(line_id) for line_id in line_ids]
+
+    async def test_a_yes_gets_the_agenda_with_no_model_and_no_answer_counted(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        with self.capture_logs() as logs:
+            await self.reply(run, "Yes, I can hear you.")
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-AGENDA"))
+        self.assertEqual(run.interview.machine.candidate_turns, 0)
+        self.assertEqual(run.session.generated, [])  # no model reply was asked for
+        await self.flush_run(run)
+        rows = [row for row in self.writer.saved if row["speaker"] == "candidate"]
+        self.assertEqual([(row["text"], row["phase"]) for row in rows],
+                         [("Yes, I can hear you.", "opening")])
+        (check,) = [line_ for line_ in logs if line_.get("error_type") == "r1_sound_check"]
+        self.assertEqual(check["error_category"], "heard")
+        self.assertNotIn("hear you", json.dumps(logs))
+
+    async def flush_run(self, run) -> None:
+        await run.interview._drain_background()
+
+    async def test_the_first_line_carries_the_ai_disclosure(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        self.assertIn("AI interviewer", run.session.spoken[0])
+        self.assertTrue(run.session.spoken[0].startswith("Hi Asha, I'm Christy"))
+        self.assertFalse(run.session.handles[0].allow_interruptions)
+
+    async def test_a_hi_during_the_hello_waits_for_the_answer_to_the_question(self) -> None:
+        run = await self.opening(playout=0.3)
+        hello = run.interview.render_line("L-OPEN-HELLO")
+        await self.until(lambda: ("play_start", hello) in self.order)
+        run.session.emit("user_input_transcribed", final_event("Hi."))  # over the hello
+        await self.hello_played(run)
+        await asyncio.sleep(0.3)  # within the follow-up quiet
+        self.assertEqual(run.session.spoken, [hello])
+        await self.reply(run, "Yes.")
+        await self.until(lambda: len(run.session.spoken) == 2)
+        self.assertEqual(run.session.spoken[1], run.interview.render_line("L-OPEN-AGENDA"))
+
+    async def test_a_hi_during_the_hello_and_then_nothing_is_still_heard(self) -> None:
+        run = await self.opening(playout=0.3)
+        hello = run.interview.render_line("L-OPEN-HELLO")
+        await self.until(lambda: ("play_start", hello) in self.order)
+        run.session.emit("user_input_transcribed", final_event("Hi."))
+        await self.hello_played(run)
+        await self.until(lambda: len(run.session.spoken) == 2, timeout=5.0)
+        self.assertEqual(run.session.spoken[1], run.interview.render_line("L-OPEN-AGENDA"))
+
+    async def test_a_long_early_answer_gets_the_continue_agenda_and_counts_once(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        answer = (
+            "Yes I can. I have spent four years in inside sales, mostly calling small business "
+            "owners about accounting software."
+        )
+        await self.reply(run, answer)
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-AGENDA-CONTINUE")
+        )
+        self.assertEqual(run.interview.machine.candidate_turns, 1)
+
+    async def test_a_late_commit_of_the_reply_is_not_counted_again(self) -> None:
+        with _s7c_env(R1_ENDPOINT_MAX_DELAY_SEC="1"), mock.patch.object(
+            r1_session, "ICEBREAKER_HOLD_MARGIN_SECONDS", 0.0
+        ):
+            run = await self.opening()
+            await self.hello_played(run)
+            answer = (
+                "Yes I can. I have spent four years in inside sales, mostly calling small business "
+                "owners about accounting software."
+            )
+            run.session.emit("user_input_transcribed", final_event(answer))
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+            self.assertEqual(run.interview.machine.candidate_turns, 1)
+            # Committed in the icebreaker: the agenda answered it, so no model reply, no count.
+            with self.assertRaises(r1_session.StopResponse):
+                await run.session.agent.on_user_turn_completed(
+                    None, SimpleNamespace(text_content=answer, id="msg_late")
+                )
+            self.assertEqual(run.interview.machine.candidate_turns, 1)
+
+    async def test_cant_hear_gets_the_hello_again_once_then_the_plain_agenda(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        await self.reply(run, "Sorry, I can't hear you.")
+        await self.until(lambda: self.played(run, "L-OPEN-HELLO-AGAIN"))
+        await self.settle()
+        await self.reply(run, "No.")
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken,
+            self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-HELLO-AGAIN", "L-OPEN-AGENDA-PLAIN"),
+        )
+        self.assertEqual(run.interview.machine.candidate_turns, 0)
+
+    async def test_cant_hear_then_a_yes_gets_the_agenda(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        await self.reply(run, "Not really.")
+        await self.until(lambda: self.played(run, "L-OPEN-HELLO-AGAIN"))
+        await self.settle()
+        await self.reply(run, "Yes, now I can.")
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken,
+            self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-HELLO-AGAIN", "L-OPEN-AGENDA"),
+        )
+
+    async def test_silence_from_a_candidate_never_heard_is_the_no_audio_ladder(self) -> None:
+        run = await self.opening()
+        self.assertEqual(await asyncio.wait_for(run.task, 10.0), "candidate_left")
+        self.assertEqual(
+            run.session.spoken,
+            self.spoken_ids(run, "L-OPEN-HELLO", "L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"),
+        )
+        phases = [a["phase"] for a in run.context.room.local_participant.attributes if "phase" in a]
+        self.assertNotIn("icebreaker", phases)
+        self.assertNotIn("transition", phases)
+        self.assertEqual(self.writer.terminals[0][0], "candidate_left")
+
+    async def test_a_turn_after_the_no_audio_line_gets_the_plain_agenda(self) -> None:
+        with mock.patch.object(r1_session, "NO_AUDIO_END_SECONDS", 5.0):
+            run = await self.opening()
+            await self.until(lambda: self.played(run, "L-SIL-NOAUDIO"))
+            await self.settle()
+            await self.reply(run, "Sorry, is it working now?")
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken,
+            self.spoken_ids(run, "L-OPEN-HELLO", "L-SIL-NOAUDIO", "L-OPEN-AGENDA-PLAIN"),
+        )
+
+    async def test_silence_after_speech_the_stt_never_finalised_gets_the_plain_agenda(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        run.session.emit("user_state_changed", state_event("speaking"))
+        run.session.emit("user_state_changed", state_event("listening"))
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-AGENDA-PLAIN")
+        )
+
+    async def test_silence_with_the_no_audio_ladder_off_gets_the_plain_agenda(self) -> None:
+        with _s7c_env(R1_NO_AUDIO_LADDER="0"):
+            run = await self.opening()
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO", "L-OPEN-AGENDA-PLAIN")
+        )
+
+    async def test_a_candidate_muted_at_the_hello_gets_the_mute_aside(self) -> None:
+        run = await self.opening()
+        run.context.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+        await self.until(lambda: self.played(run, "L-MUTE-IV"))
+        run.clock.advance(r1_session.OPEN_CHECK_HARD_SECONDS + 1)  # the sound check's budget
+        run.interview._wake()
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(
+            run.session.spoken,
+            self.spoken_ids(run, "L-OPEN-HELLO", "L-MUTE-IV", "L-OPEN-AGENDA-PLAIN"),
+        )
+
+    async def test_the_sound_check_is_bounded(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        run.session.emit("user_state_changed", state_event("speaking"))  # never stops
+        run.clock.advance(r1_session.OPEN_CHECK_HARD_SECONDS + 1)
+        run.interview._wake()
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(run.session.spoken[-1], run.interview.render_line("L-OPEN-AGENDA-PLAIN"))
+
+    async def test_a_name_said_in_the_reply_is_used_from_then_on(self) -> None:
+        run = await self.opening(context={"first_name": "there", "candidate_identity": "candidate"})
+        await self.hello_played(run)
+        self.assertTrue(run.session.spoken[0].startswith("Hi, I'm Christy"))
+        await self.reply(run, "Yes, hi, my name is Ravi.")
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(run.interview._first_name(), "Ravi")
+
+    async def test_the_room_closing_during_the_sound_check_stops_the_interview(self) -> None:
+        run = await self.opening()
+        await self.hello_played(run)
+        run.context.room.emit("participant_disconnected", FakeParticipant("candidate"))
+        run.context.room.emit("disconnected", "room closed")
+        self.assertEqual(await asyncio.wait_for(run.task, 10.0), "candidate_left")
+        self.assertEqual(run.session.spoken, self.spoken_ids(run, "L-OPEN-HELLO"))
+
+    async def test_the_flag_off_speaks_l_open_and_goes_straight_on(self) -> None:
+        with _s7c_env(R1_OPENING_SOUND_CHECK="0"):
+            run = await self.opening()
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        self.assertEqual(run.session.spoken, self.spoken_ids(run, "L-OPEN"))

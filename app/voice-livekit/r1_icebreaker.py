@@ -3,7 +3,8 @@
 The phone bot is scripted too; what makes it feel natural is the manners around the script.  Here
 code chooses what each of Christy's icebreaker questions is FOR (``OBJECTIVES``) and the model only
 words it, after a few words of reaction to what the candidate just said.  L-OPEN already asks the
-first objective (background and sales work), so the cursor starts there.
+first objective (background and sales work), so the cursor starts there; so does the opening's
+agenda (M032 S7C, ``R1_OPENING_SOUND_CHECK``), or it invites an early answer to carry on.
 
 One decision per committed icebreaker answer (``IcebreakerPlan.next_job``), read by
 ``disposition``:
@@ -525,7 +526,7 @@ class IcebreakerPlan:
     """The cursor over ``OBJECTIVES`` and the per-objective counters (no candidate text)."""
 
     def __init__(self) -> None:
-        self.cursor = 0  # OBJECTIVES[0] is asked by L-OPEN
+        self.cursor = 0  # OBJECTIVES[0] is asked by L-OPEN (or by the opening agenda, M032 S7C)
         self.follow_ups: dict[str, int] = {}
         self.holds: dict[str, int] = {}
         self.credited: list[str] = []

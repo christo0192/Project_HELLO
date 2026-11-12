@@ -139,7 +139,12 @@ import r1_world
 # aside, revision 21's texts under -V20 ids, and the transition note that asks nothing itself.
 # Same revision, the icebreaker repair (R1_ICEBREAKER_REPAIR): L-IB-HOLD, the repeated question's
 # template, the presence opener notes and the hold's limits.
-PINNED_CONTENT_SHA256 = "be387944eeccfd7870d9c70b5082c4fbb2f1cd622c44e0641961dae2bab8e5d9"
+# Revision 23 (M032 S7C, the sweep's Christy follow-ups): the opening's hello with a sound check
+# and its agendas (L-OPEN-HELLO, -HELLO-AGAIN, L-OPEN-AGENDA, -PLAIN, -CONTINUE;
+# R1_OPENING_SOUND_CHECK), the never-heard ladder (L-SIL-NOAUDIO, L-SIL-END-NOAUDIO;
+# R1_NO_AUDIO_LADDER) and the mute aside by phase (L-MUTE-RP, L-MUTE-IV; R1_MUTE_ASIDE_V2).  L-OPEN
+# and L-MUTE are unchanged.
+PINNED_CONTENT_SHA256 = "261ad5751e99d64e1bcfebfcd5b21bc0f667c321ec48577fc8e2cacf54b1379c"
 
 CONTENT_MODULES = (
     "r1_text",

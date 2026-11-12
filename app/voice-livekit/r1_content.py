@@ -157,7 +157,15 @@ import r1_world
 #    revision, the icebreaker repair (r1_icebreaker, R1_ICEBREAKER_REPAIR): "Of course, take a
 #    moment. I'm here when you're ready." (L-IB-HOLD), the repeated question's template "Of course.
 #    {question}", the opener notes for a reply to "Are you there?" and the hold's limits.
-CONTENT_REVISION = 22
+# 23: M032 S7C, the Christy follow-ups of the sweep (owner go of 2026-11-11).  The opening as a
+#    short hello with a sound check, then a shorter agenda from one shared body
+#    (R1_OPENING_SOUND_CHECK, SWEEP-35): L-OPEN-HELLO ("Can you hear me okay?"),
+#    L-OPEN-HELLO-AGAIN, L-OPEN-AGENDA, L-OPEN-AGENDA-PLAIN and L-OPEN-AGENDA-CONTINUE; L-OPEN is
+#    the flag-off line, unchanged.  A candidate who was never heard gets L-SIL-NOAUDIO and
+#    L-SIL-END-NOAUDIO (R1_NO_AUDIO_LADDER, SWEEP-34).  The mute aside by phase, neither with
+#    "ready" in it: L-MUTE-RP and L-MUTE-IV (R1_MUTE_ASIDE_V2, SWEEP-36); L-MUTE is the flag-off
+#    line, unchanged.
+CONTENT_REVISION = 23
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:

@@ -2456,9 +2456,10 @@ class TestEndToEnd(R1TestCase):
         task = asyncio.create_task(
             run_r1_session(self.ctx, session_factory=self.session_factory)
         )
-        await self.until(lambda: self.spoken_and_played("L-OPEN"))
+        await self.until(lambda: self.spoken_and_played(self.opening_line_ids()[0]))
         await self.until(lambda: self.session.agent is not None)
         interview = self.session.agent.interview
+        await self.pass_sound_check()  # M032 S7C: "Can you hear me okay?" gets its "yes"
         self.assertEqual(interview.persona_choice.label, "p1_career_switcher.v1")
         # Icebreaker: four committed answers at S >= 3:30 end it at the boundary turn.
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
@@ -2475,9 +2476,10 @@ class TestEndToEnd(R1TestCase):
         await self.until(lambda: self.spoken_and_played("L-PICKUP"))
         await self.until(lambda: interview.machine.phase is R1Phase.ROLEPLAY)
         persona = interview.persona
-        self.assertIn(persona.lead_name, self.session.spoken[1])
-        self.assertIn(persona.spoken_city, self.session.spoken[1])
-        self.assertEqual(self.session.spoken[2], persona.pickup_line)
+        brief_at = len(self.opening_line_ids())
+        self.assertIn(persona.lead_name, self.session.spoken[brief_at])
+        self.assertIn(persona.spoken_city, self.session.spoken[brief_at])
+        self.assertEqual(self.session.spoken[brief_at + 1], persona.pickup_line)
         # Role-play: the cooperative advisor script, COOPERATIVE_TURN_GAP s apart, through the SDK
         # seams.
         spoken = []
@@ -2505,8 +2507,9 @@ class TestEndToEnd(R1TestCase):
             await self.candidate_replies_after("L-WRAP", "No questions, thanks")
             self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
 
+        opening = list(self.opening_line_ids())  # M032 S7C: the hello, then the agenda
         expected_lines = [
-            "L-OPEN", "L-TRANSITION", "L-PICKUP", "L-TIME-UP", "L-EXIT", "L-WRAP", "L-CLOSE",
+            *opening, "L-TRANSITION", "L-PICKUP", "L-TIME-UP", "L-EXIT", "L-WRAP", "L-CLOSE",
         ]
         self.assertEqual(self.session.spoken, [self.spoken_line(name) for name in expected_lines])
         rows = self.bot_rows()
@@ -2514,8 +2517,8 @@ class TestEndToEnd(R1TestCase):
         self.assertEqual(phases.count("roleplay"), len(spoken) + 1)  # the replies and L-TIME-UP
         self.assertEqual(
             [row["phase"] for row in rows if row["text"] in self.session.spoken],
-            ["opening", "transition", "transition", "roleplay", "roleplay_exit", "wrapup",
-             "closing"],
+            ["opening"] * len(opening)
+            + ["transition", "transition", "roleplay", "roleplay_exit", "wrapup", "closing"],
         )
         # No learner line ever reached an interviewer phase and vice versa.
         for row in rows:
@@ -3272,9 +3275,11 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(spec.persist for spec in named))
         self.assertEqual(
             {spec.line_id for spec in free} | {spec.line_id for spec in named},
-            set(r1_session._WARM_ORDER),
+            set(rig.interview._warm_order()),
         )
         self.assertNotIn("L-OPEN", {spec.line_id for spec in free + named})
+        # M032 S7C: the hello carries the name and is spoken at once, like L-OPEN.
+        self.assertNotIn("L-OPEN-HELLO", {spec.line_id for spec in free + named})
         self.assertEqual(
             [spec.line_id for spec in named],
             ["L-TRANSITION", "L-CLOSE", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP"],
@@ -3294,20 +3299,24 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # not warmed either; the re-asks and the steer are ``say`` lines and are.
         # M032 S6: the rotated start questions travel inside Christy's answers too, and Christy's
         # "Of course, take a moment." for a hold request is a reply, not a ``say`` line.
+        # M032 S7C: L-OPEN-HELLO is spoken first, like L-OPEN, before anything could be warm.
         unreachable = (
             "L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-OPEN", "L-TRANSITION-ASK",
-            "L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3", "L-IB-HOLD",
+            "L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3", "L-IB-HOLD", "L-OPEN-HELLO",
         )
         for line_id in unreachable:
             self.assertNotIn(line_id, r1_session._WARM_ORDER)
         self.assertEqual(
             r1_session._WARM_ORDER,
             (
+                "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE",
+                "L-OPEN-HELLO-AGAIN",
                 "L-TRANSITION", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT",
                 "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-STEER",
                 "L-TRANSITION-REASK-2", "L-PICKUP-BRIDGE", "L-PICKUP", "L-EXIT", "L-WRAP",
                 "L-CLOSE", "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
-                "L-TIME-UP", "L-MUTE", "L-SIL-IB", "L-SIL-RP1",
+                "L-TIME-UP", "L-MUTE", "L-MUTE-IV", "L-MUTE-RP", "L-SIL-IB", "L-SIL-NOAUDIO",
+                "L-SIL-END-NOAUDIO", "L-SIL-RP1",
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
             ),
         )
@@ -3316,11 +3325,12 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             candidate_free=False
         )
         # M2 adds the offer, its resume line and L-TIME-UP; M032 S6 the replay, the recap,
-        # "Yes, I'm here." and the pickup bridge.
-        self.assertEqual(len(specs), 26)
+        # "Yes, I'm here." and the pickup bridge; M032 S7C the three agendas, the hello again,
+        # the two no-audio lines and the two mute asides, in place of L-MUTE.
+        self.assertEqual(len(specs), 33)
         warmed = {spec.text for spec in specs}
         for line_id in unreachable:
-            if line_id != "L-OPEN":
+            if line_id not in ("L-OPEN", "L-OPEN-HELLO"):
                 self.assertNotIn(rig.interview.render_line(line_id), warmed)
 
     async def test_the_transition_repair_lines_are_warmed_only_while_it_is_on(self) -> None:
@@ -3343,14 +3353,15 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertIn("We'll now move to the role-play", brief.text)
             pickup = next(spec for spec in off if spec.line_id == "L-PICKUP")
             self.assertTrue(pickup.text.startswith("Hello? Yes, this is "))
-        self.assertEqual(len(off), 22)
+        self.assertEqual(len(off), 29)  # revision 21's 22, and M032 S7C's 7 (their flags are on)
         self.assertFalse(
             {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
             & {spec.line_id for spec in off}
         )
         on = rig.interview._warm_specs(candidate_free=True)
+        # M032 S7C: the opening's agendas and the hello again lead the name-free group.
         self.assertEqual(
-            [spec.line_id for spec in on][:4],
+            [spec.line_id for spec in on][4:8],
             ["L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-TRANSITION-NUDGE"],
         )
         for spec in on:
@@ -3366,17 +3377,60 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
                 candidate_free=False
             )
-        self.assertEqual(len(off), 26)  # M032 S6 adds four lines (R1_TRANSITION_REPAIR on)
+        self.assertEqual(len(off), 33)  # M032 S6 adds four lines, M032 S7C seven
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 27)
-        self.assertEqual(free[0].line_id, "L-TRANSITION-BRIDGED")
-        self.assertTrue(free[0].persist)
-        self.assertNotIn("Asha", free[0].text)
-        self.assertEqual(free[0].text, rig.interview.render_line("L-TRANSITION-BRIDGED"))
+        self.assertEqual(len(free) + len(named), 34)
+        # M032 S7C: after the opening's four lines, the first name-free line of the transition.
+        bridged = free[4]
+        self.assertEqual(bridged.line_id, "L-TRANSITION-BRIDGED")
+        self.assertTrue(bridged.persist)
+        self.assertNotIn("Asha", bridged.text)
+        self.assertEqual(bridged.text, rig.interview.render_line("L-TRANSITION-BRIDGED"))
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in named})
+
+    async def test_the_s7c_lines_are_warmed_only_while_their_flags_are_on(self) -> None:
+        # M032 S7C: with the three follow-ups off, the warm-up is revision 22's exactly (the Sarvam
+        # quota is shared with the phone lane); each flag adds only its own lines, and the mute
+        # asides take L-MUTE's place.
+        rig, _cache, _synth = self.build()
+
+        def ids() -> list[str]:
+            return [
+                spec.line_id
+                for spec in rig.interview._warm_specs(candidate_free=True)
+                + rig.interview._warm_specs(candidate_free=False)
+            ]
+
+        off = {"R1_OPENING_SOUND_CHECK": "0", "R1_NO_AUDIO_LADDER": "0", "R1_MUTE_ASIDE_V2": "0"}
+        with _env(**off):
+            before = ids()
+        self.assertEqual(len(before), 26)
+        self.assertIn("L-MUTE", before)
+        for name in ("L-OPEN-AGENDA", "L-SIL-NOAUDIO", "L-MUTE-IV", "L-MUTE-RP"):
+            self.assertNotIn(name, before)
+        for flag, added, gone in (
+            ("R1_OPENING_SOUND_CHECK", {"L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN",
+                                        "L-OPEN-AGENDA-CONTINUE", "L-OPEN-HELLO-AGAIN"}, set()),
+            ("R1_NO_AUDIO_LADDER", {"L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"}, set()),
+            ("R1_MUTE_ASIDE_V2", {"L-MUTE-IV", "L-MUTE-RP"}, {"L-MUTE"}),
+        ):
+            with self.subTest(flag=flag), _env(**{**off, flag: "1"}):
+                now = ids()
+                self.assertEqual(set(now) - set(before), added)
+                self.assertEqual(set(before) - set(now), gone)
+        on = rig.interview._warm_specs(candidate_free=True)
+        self.assertEqual(
+            [spec.line_id for spec in on][:4],
+            [
+                "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE",
+                "L-OPEN-HELLO-AGAIN",
+            ],
+        )
+        for spec in on:
+            self.assertNotIn("Asha", spec.text)
 
     async def test_the_background_warm_up_fills_the_cache_and_is_released_at_exit(self) -> None:
         rig, cache, synth = self.build()
@@ -4273,6 +4327,7 @@ class TestTransitionBridgeWiring(R1TestCase):
         run = SimpleNamespace(
             interview=interview, context=context, session=session, clock=clock, task=task
         )
+        await self.pass_sound_check(session, interview)
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
         clock.advance(215)
         interview.machine.candidate_turns = 3
@@ -4284,6 +4339,10 @@ class TestTransitionBridgeWiring(R1TestCase):
             )
         await self.until(lambda: interview.machine.phase is R1Phase.TRANSITION)
         return run
+
+    def after_opening(self, run: SimpleNamespace) -> list[str]:
+        """What was spoken after the opening (M032 S7C: the hello and the agenda)."""
+        return run.session.spoken[len(self.opening_line_ids()):]
 
     async def brief_played(self, run: SimpleNamespace, line_id: str) -> None:
         text = run.interview.render_line(line_id)
@@ -4302,8 +4361,10 @@ class TestTransitionBridgeWiring(R1TestCase):
             run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
             await self.brief_played(run, "L-TRANSITION-BRIDGED")
         brief = run.interview.render_line("L-TRANSITION-BRIDGED")
-        self.assertEqual(run.session.spoken, [run.interview.render_line("L-OPEN"),
-                                              BRIDGE_REACTION, brief])
+        self.assertEqual(
+            run.session.spoken,
+            [*map(run.interview.render_line, self.opening_line_ids()), BRIDGE_REACTION, brief],
+        )
         self.assertNotIn("Thank you", brief)
         self.assertFalse(any(h.allow_interruptions for h in run.session.handles[1:]))
         self.assertEqual(run.interview._start_question, r1_session._EITHER_OR)  # same question
@@ -4369,7 +4430,7 @@ class TestTransitionBridgeWiring(R1TestCase):
                     run = await self.boundary(BridgeRunner(text), R1_TRANSITION_BRIDGE="1")
                     await self.brief_played(run, "L-TRANSITION")
                 brief = run.interview.render_line("L-TRANSITION")
-                self.assertEqual(run.session.spoken[1:], [brief])
+                self.assertEqual(self.after_opening(run), [brief])
                 (line_,) = self.bridge_lines(logs)
                 self.assertEqual(line_["error_category"], "dropped")
                 await self.drain_cancel(run)
@@ -4387,7 +4448,7 @@ class TestTransitionBridgeWiring(R1TestCase):
                     run = await self.boundary(runner, R1_TRANSITION_BRIDGE="1")
                     await self.brief_played(run, "L-TRANSITION")
                 brief = run.interview.render_line("L-TRANSITION")
-                self.assertEqual(run.session.spoken[1:], [brief])
+                self.assertEqual(self.after_opening(run), [brief])
                 (line_,) = self.bridge_lines(logs)
                 self.assertEqual(line_["error_category"], outcome)
                 self.assertLess(line_["duration_sec"], 1.0)
@@ -4405,7 +4466,7 @@ class TestTransitionBridgeWiring(R1TestCase):
                 await self.brief_played(run, "L-TRANSITION")
                 self.assertEqual(runner.calls, [])
                 brief = run.interview.render_line("L-TRANSITION")
-                self.assertEqual(run.session.spoken[1:], [brief])
+                self.assertEqual(self.after_opening(run), [brief])
                 await self.drain_cancel(run)
 
     async def test_the_hard_cap_with_no_boundary_answer_is_not_composed_for(self):
@@ -4417,7 +4478,7 @@ class TestTransitionBridgeWiring(R1TestCase):
         run.interview._bridge_runner = runner
         await self.advance_to_transition(run)
         self.assertEqual(runner.calls, [])
-        self.assertEqual(run.session.spoken[1:], [self.spoken_line("L-TRANSITION")])
+        self.assertEqual(self.after_opening(run), [self.spoken_line("L-TRANSITION")])
         await self.drain_cancel(run)
 
     async def test_a_transition_turn_during_the_compose_is_not_answered_ahead_of_the_brief(self):
@@ -4442,7 +4503,7 @@ class TestTransitionBridgeWiring(R1TestCase):
             runner.gate.set()
             await self.brief_played(run, "L-TRANSITION")
         brief = run.interview.render_line("L-TRANSITION")
-        self.assertEqual(run.session.spoken[1:], [brief])
+        self.assertEqual(self.after_opening(run), [brief])
         (line_,) = self.bridge_lines(logs)
         self.assertEqual(line_["error_category"], "superseded")
         await self.drain_cancel(run)
@@ -4457,11 +4518,11 @@ class TestTransitionBridgeWiring(R1TestCase):
                                                                new_state="speaking"))
         runner.gate.set()
         await self.settle()
-        self.assertEqual(run.session.spoken[1:], [])  # nothing over them, not even the brief
+        self.assertEqual(self.after_opening(run), [])  # nothing over them, not even the brief
         run.session.emit("user_state_changed", SimpleNamespace(old_state="speaking",
                                                                new_state="listening"))
         await self.brief_played(run, "L-TRANSITION")
-        self.assertEqual(run.session.spoken[1:], [run.interview.render_line("L-TRANSITION")])
+        self.assertEqual(self.after_opening(run), [run.interview.render_line("L-TRANSITION")])
         await self.drain_cancel(run)
 
     async def test_the_reaction_and_the_brief_are_queued_together(self):
@@ -4474,7 +4535,7 @@ class TestTransitionBridgeWiring(R1TestCase):
         runner.gate.set()
         await self.until(lambda: BRIDGE_REACTION in run.session.spoken)
         brief = run.interview.render_line("L-TRANSITION-BRIDGED")
-        self.assertEqual(run.session.spoken[1:], [BRIDGE_REACTION, brief])
+        self.assertEqual(self.after_opening(run), [BRIDGE_REACTION, brief])
         self.assertFalse(run.interview._bridging)
         await self.brief_played(run, "L-TRANSITION-BRIDGED")
         self.assertEqual(run.interview._start_question, r1_session._EITHER_OR)
@@ -4488,7 +4549,8 @@ class TestTransitionBridgeWiring(R1TestCase):
         self.assertEqual(runner.calls, [])
         self.assertEqual(
             run.session.spoken,
-            [run.interview.render_line("L-OPEN"), run.interview.render_line("L-TRANSITION")],
+            [*map(run.interview.render_line, self.opening_line_ids()),
+             run.interview.render_line("L-TRANSITION")],
         )
         self.assertEqual(self.bridge_lines(logs), [])
         await self.drain_cancel(run)

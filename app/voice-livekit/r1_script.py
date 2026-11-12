@@ -56,6 +56,23 @@ BRIEF_BODY = BRIEF_LEAD_IN + BRIEF_SCENARIO
 BRIEF_THANKS = "Thank you, {first_name}. "
 BRIEF_AGAIN = "Of course, here it is again. "
 
+# M032 S7C (SWEEP-35, R1_OPENING_SOUND_CHECK; owner go of 2026-11-11, pattern P33): L-OPEN was one
+# 79-word block of about 29 s with no greeting exchange and no hearing check.  The opening is now a
+# short hello that carries the AI disclosure and asks whether the candidate can hear Christy, then
+# ONE shorter agenda from this shared body.  The owner's durations are kept word for word ("about
+# thirty minutes", "up to twenty minutes"); the two filler durations are gone.  The agenda asks the
+# icebreaker plan's first objective, as L-OPEN did.
+OPEN_HEARD = "Good, I can hear you. "
+OPEN_PLAIN = "Let's get started. "
+OPEN_AGENDA = (
+    "This first-round interview takes about thirty minutes: we'll get to know each other, then do "
+    "a sales role-play of up to twenty minutes, and you can ask me questions at the end. "
+)
+OPEN_FIRST_QUESTION = (
+    "So, to begin, tell me a bit about yourself and your sales or customer-facing work."
+)
+OPEN_CARRY_ON = "Please, carry on with what you were telling me."
+
 LINES: dict[str, str] = {
     "L-OPEN": (
         "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and "
@@ -67,6 +84,19 @@ LINES: dict[str, str] = {
         "you walk me through your background, especially any sales or customer-facing work "
         "you've done?"
     ),
+    # M032 S7C (SWEEP-35): the hello and its sound check, then the agenda (L-OPEN is the flag-off
+    # line).  The hello is spoken live (it carries the name); the rest is name-free and warmed
+    # first.
+    "L-OPEN-HELLO": (
+        "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart. Can you hear me "
+        "okay?"
+    ),
+    "L-OPEN-HELLO-AGAIN": (
+        "Sorry about that. Please check your speaker or headphone volume. Can you hear me now?"
+    ),
+    "L-OPEN-AGENDA": OPEN_HEARD + OPEN_AGENDA + OPEN_FIRST_QUESTION,
+    "L-OPEN-AGENDA-PLAIN": OPEN_PLAIN + OPEN_AGENDA + OPEN_FIRST_QUESTION,
+    "L-OPEN-AGENDA-CONTINUE": OPEN_HEARD + OPEN_AGENDA + OPEN_CARRY_ON,
     # M032 S6 item 5 and SWEEP-30: the brief, from the shared body above.
     "L-TRANSITION": BRIEF_THANKS + BRIEF_BODY,
     # M032 S5 item 4: the brief after Christy's own one-sentence reaction to the last icebreaker
@@ -196,7 +226,29 @@ LINES: dict[str, str] = {
         "This is Christy. It looks like your microphone may be muted. Please unmute when "
         "you're ready."
     ),
+    # M032 S7C (SWEEP-36, R1_MUTE_ASIDE_V2; pattern P62): the mute aside by phase, neither with
+    # "ready" in it (b419d478: "Please unmute when you're ready." was answered "I am ready", and in
+    # the transition that is a start).  In the role-play Christy names herself, because her voice
+    # takes the learner's place; in her own phases she does not introduce herself again.  L-MUTE is
+    # the flag-off line, unchanged.
+    "L-MUTE-RP": (
+        "This is Christy, your interviewer. Your microphone seems to be muted. Please unmute it so "
+        "we can carry on."
+    ),
+    "L-MUTE-IV": "Your microphone seems to be muted. Please unmute it so I can hear you.",
     "L-SIL-IB": "Are you still with me, {first_name}?",
+    # M032 S7C (SWEEP-34, R1_NO_AUDIO_LADDER; pattern P25): a candidate who was never heard at all
+    # (no final, no speech) is told Christy cannot hear them, not "Are you still with me?" and "we
+    # seem to have lost the connection".  Hedged: in every observed case the fault was likely on our
+    # side, and it promises nothing about the attempt (the web card says the interview is complete).
+    "L-SIL-NOAUDIO": (
+        "I can't hear anything from you yet. If you're speaking, please check that your microphone "
+        "is switched on and selected."
+    ),
+    "L-SIL-END-NOAUDIO": (
+        "I still can't hear you, so I'll have to stop here for now. The hiring team will be in "
+        "touch. Goodbye."
+    ),
     "L-SIL-RP1": "Hello? Are you still there?",
     "L-SIL-RP2": (
         "This is Christy, your interviewer. It sounds like we may have lost you. I'll wait "

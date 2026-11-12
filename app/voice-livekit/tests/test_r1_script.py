@@ -280,6 +280,7 @@ class UnknownNameTests(unittest.TestCase):
         values = self.persona_values()
         expected = {
             "L-OPEN": "Hi, I'm Christy, an AI interviewer from Interview Kickstart, and I'll",
+            "L-OPEN-HELLO": "Hi, I'm Christy, an AI interviewer from Interview Kickstart. Can you",
             "L-TRANSITION": "Thank you. Next, let's do a sales role-play. I'll play",
             "L-TRANSITION-V20": (
                 "Thank you. We'll now move to the role-play. I'll play a prospective"
@@ -563,6 +564,120 @@ class TransitionRepairLineTests(unittest.TestCase):
             self.assertIn(", or ", text)
             self.assertTrue(text.endswith("?"))
             self.assertIn(line_id, NAME_FREE_LINES)
+
+
+class OpeningSoundCheckLineTests(unittest.TestCase):
+    """M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``): a short hello with a sound check, then a
+    shorter agenda.  Every text is word for word the spec's (owner and HR review, D-M032-4)."""
+
+    AGENDAS = ("L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE")
+
+    def test_the_texts_word_for_word(self):
+        self.assertEqual(
+            LINES["L-OPEN-HELLO"],
+            "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart. Can you "
+            "hear me okay?",
+        )
+        self.assertEqual(
+            LINES["L-OPEN-HELLO-AGAIN"],
+            "Sorry about that. Please check your speaker or headphone volume. Can you hear me now?",
+        )
+        agenda = (
+            "This first-round interview takes about thirty minutes: we'll get to know each "
+            "other, then do a sales role-play of up to twenty minutes, and you can ask me "
+            "questions at the end."
+        )
+        first = "So, to begin, tell me a bit about yourself and your sales or customer-facing work."
+        self.assertEqual(LINES["L-OPEN-AGENDA"], f"Good, I can hear you. {agenda} {first}")
+        self.assertEqual(LINES["L-OPEN-AGENDA-PLAIN"], f"Let's get started. {agenda} {first}")
+        self.assertEqual(
+            LINES["L-OPEN-AGENDA-CONTINUE"],
+            f"Good, I can hear you. {agenda} Please, carry on with what you were telling me.",
+        )
+
+    def test_the_hello_carries_the_disclosure_and_the_name_and_reads_without_one(self):
+        self.assertEqual(placeholders("L-OPEN-HELLO"), {"first_name"})
+        self.assertIn("AI interviewer", LINES["L-OPEN-HELLO"])
+        self.assertFalse(is_candidate_free("L-OPEN-HELLO"))
+        self.assertTrue(
+            line("L-OPEN-HELLO", first_name="Arjun").startswith("Hi Arjun, I'm Christy, an AI")
+        )
+        self.assertEqual(
+            line("L-OPEN-HELLO", first_name=""),
+            "Hi, I'm Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?",
+        )
+
+    def test_every_agenda_keeps_the_owner_durations_once_and_is_short(self):
+        for line_id in self.AGENDAS:
+            text = LINES[line_id]
+            with self.subTest(line=line_id):
+                self.assertEqual(text.count("thirty minutes"), 1)
+                self.assertEqual(text.count("up to twenty minutes"), 1)
+                self.assertLessEqual(len(text.split()), 55)
+                for banned in ("short", "Let's start:", "{", "couple of minutes", "few minutes"):
+                    self.assertNotIn(banned, text)
+                self.assertIn(line_id, NAME_FREE_LINES)
+        self.assertIn("L-OPEN-HELLO-AGAIN", NAME_FREE_LINES)
+        # The plain agenda is the one said when nothing was heard in reply: no "I can hear you".
+        self.assertNotIn("hear you", LINES["L-OPEN-AGENDA-PLAIN"])
+        # The agenda asks the icebreaker plan's first objective (background and sales work), as
+        # L-OPEN did; the continue variant asks nothing new.
+        self.assertIn("sales or customer-facing work", LINES["L-OPEN-AGENDA"])
+        self.assertNotIn("?", LINES["L-OPEN-AGENDA-CONTINUE"])
+
+    def test_the_flag_off_opening_is_unchanged(self):
+        self.assertEqual(
+            LINES["L-OPEN"],
+            "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll "
+            "be running your first-round interview for the Sales Program Advisor role. It takes "
+            "about thirty minutes. We'll spend a few minutes getting to know you, then I'll switch "
+            "into a sales role-play of up to twenty minutes where I play a prospective learner, "
+            "and we'll finish with a couple of minutes for your questions. Let's start: could you "
+            "walk me through your background, especially any sales or customer-facing work "
+            "you've done?",
+        )
+
+
+class NoAudioAndMuteLineTests(unittest.TestCase):
+    """M032 S7C: the never-heard ladder (SWEEP-34) and the mute aside by phase (SWEEP-36)."""
+
+    def test_the_no_audio_texts_word_for_word(self):
+        self.assertEqual(
+            LINES["L-SIL-NOAUDIO"],
+            "I can't hear anything from you yet. If you're speaking, please check that "
+            "your microphone is switched on and selected.",
+        )
+        self.assertEqual(
+            LINES["L-SIL-END-NOAUDIO"],
+            "I still can't hear you, so I'll have to stop here for now. The hiring team will "
+            "be in touch. Goodbye.",
+        )
+        for line_id in ("L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"):
+            text = LINES[line_id]
+            self.assertIn(line_id, NAME_FREE_LINES)
+            # Hedged: no lost connection, no claim about whether the attempt counts.
+            for banned in ("lost", "connection", "count", "still with me"):
+                self.assertNotIn(banned, text)
+
+    def test_the_mute_texts_word_for_word_and_neither_says_ready(self):
+        self.assertEqual(
+            LINES["L-MUTE-RP"],
+            "This is Christy, your interviewer. Your microphone seems to be muted. Please "
+            "unmute it so we can carry on.",
+        )
+        self.assertEqual(
+            LINES["L-MUTE-IV"],
+            "Your microphone seems to be muted. Please unmute it so I can hear you.",
+        )
+        for line_id in ("L-MUTE-RP", "L-MUTE-IV"):
+            self.assertNotIn("ready", LINES[line_id].lower())
+            self.assertIn(line_id, NAME_FREE_LINES)
+        self.assertNotIn("Christy", LINES["L-MUTE-IV"])  # her own phase: no self-introduction
+        self.assertEqual(
+            LINES["L-MUTE"],
+            "This is Christy. It looks like your microphone may be muted. Please unmute when "
+            "you're ready.",
+        )
 
 
 if __name__ == "__main__":

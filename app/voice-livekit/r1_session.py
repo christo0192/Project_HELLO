@@ -423,6 +423,25 @@ ICEBREAKER_HOLD_CEILING_SECONDS = 30.0
 # back and the next committed turn is the boundary, or, when the candidate says nothing more, this
 # much quiet after their last sign of speech; the hard S=4:30 cap still bounds the whole wait.
 ICEBREAKER_CONTINUATION_WAIT_SECONDS = 5.0
+# M032 S7C (SWEEP-34, ``R1_NO_AUDIO_LADDER``): after "I can't hear anything from you yet." a
+# candidate who was never heard gets this long to speak before the close (L-SIL-END-NOAUDIO).
+NO_AUDIO_END_SECONDS = 30.0
+# M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``): after the hello ("Can you hear me okay?") the
+# reply is awaited for this much candidate silence, within this much session time for the whole
+# sound check (the hello again included).  A final heard DURING the hello ("Hi") is followed by a
+# shorter quiet for the answer to the question; a reply this long (content words, once greetings,
+# courtesy and hearing words are out) is an early answer, and the agenda invites them to go on.
+OPEN_CHECK_SILENCE_SECONDS = 10.0
+OPEN_CHECK_HARD_SECONDS = 45.0
+OPEN_HELLO_FOLLOW_SECONDS = 1.5
+OPEN_CHECK_ANSWER_WORDS = 12
+# A whole-turn complaint ("Not really.", "It's a bit low.") is read as one only up to this length.
+OPEN_CHECK_COMPLAINT_MAX_WORDS = 6
+# M032 S7C (SWEEP-36, ``R1_MUTE_ASIDE_V2``): the mute aside waits for a real mute (a blip that is
+# undone within this long gets no line), and never talks over a candidate turn in flight unless
+# the mute has lasted this long in all.
+MUTE_ASIDE_DEBOUNCE_SECONDS = 1.5
+MUTE_ASIDE_TURN_WAIT_SECONDS = 3.0
 ROLEPLAY_PROMPT_SECONDS = 20.0
 ROLEPLAY_FIRST_STEP_SECONDS = 20.0
 ROLEPLAY_ASIDE_STEP_SECONDS = 15.0
@@ -616,6 +635,12 @@ _LIVE_PHASES = frozenset(
 # Warming them would spend Sarvam requests, a budget shared with the phone lane, on audio nothing
 # can play (pr4c-rebase.md 4.1).
 _WARM_ORDER = (
+    # M032 S7C (SWEEP-35): the agendas and the hello again come first: they play a few seconds into
+    # the interview.  The hello itself carries the name and is spoken at once, like L-OPEN.
+    "L-OPEN-AGENDA",
+    "L-OPEN-AGENDA-PLAIN",
+    "L-OPEN-AGENDA-CONTINUE",
+    "L-OPEN-HELLO-AGAIN",
     "L-TRANSITION",
     "L-TRANSITION-AGAIN",
     "L-TRANSITION-RECAP",
@@ -635,7 +660,11 @@ _WARM_ORDER = (
     "L-ASIDE-WRAP-RESUME",
     "L-TIME-UP",
     "L-MUTE",
+    "L-MUTE-IV",
+    "L-MUTE-RP",
     "L-SIL-IB",
+    "L-SIL-NOAUDIO",
+    "L-SIL-END-NOAUDIO",
     "L-SIL-RP1",
     "L-SIL-RP2",
     "L-REJOIN",
@@ -654,6 +683,14 @@ _BRIDGED_BRIEF = "L-TRANSITION-BRIDGED"
 _TRANSITION_REPAIR_LINES = frozenset(
     {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
 )
+# M032 S7C: the lines only each follow-up speaks, warmed only while its flag is on, so with all
+# three off the warm-up spends exactly revision 22's Sarvam requests.  With R1_MUTE_ASIDE_V2 on,
+# L-MUTE can no longer play, so it is not warmed either.
+_SOUND_CHECK_LINES = frozenset(
+    {"L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE", "L-OPEN-HELLO-AGAIN"}
+)
+_NO_AUDIO_LINES = frozenset({"L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO"})
+_MUTE_V2_LINES = frozenset({"L-MUTE-IV", "L-MUTE-RP"})
 # The marker of the reaction sentence's speech (latency and line-cache lines; never its words).
 _BRIDGE_MARKER = "transition_bridge"
 # Line-cache events that mean something went wrong (logged as warnings).
@@ -813,6 +850,28 @@ def icebreaker_ack_hold_enabled() -> bool:
     return _env_switch(os.getenv("R1_ICEBREAKER_ACK_HOLD"))
 
 
+def no_audio_ladder_enabled() -> bool:
+    """``R1_NO_AUDIO_LADDER`` (default on; M032 S7C, SWEEP-34): a candidate who was never heard (no
+    final, no speech) gets "I can't hear anything from you yet." and its close, not "Are you still
+    with me?" and the lost-connection close.  Rollback: ``fly secrets set R1_NO_AUDIO_LADDER=0 -a
+    project-hello-voice`` (every silence gets today's ladder)."""
+    return _env_switch(os.getenv("R1_NO_AUDIO_LADDER"))
+
+
+def opening_sound_check_enabled() -> bool:
+    """``R1_OPENING_SOUND_CHECK`` (default on; M032 S7C, SWEEP-35): the opening is a short hello
+    with a sound check ("Can you hear me okay?"), then a shorter agenda.  Rollback: ``fly secrets
+    set R1_OPENING_SOUND_CHECK=0 -a project-hello-voice`` (L-OPEN, exactly as before)."""
+    return _env_switch(os.getenv("R1_OPENING_SOUND_CHECK"))
+
+
+def mute_aside_v2_enabled() -> bool:
+    """``R1_MUTE_ASIDE_V2`` (default on; M032 S7C, SWEEP-36): the mute aside waits for a real mute,
+    never talks over a turn in flight, and fits the phase (L-MUTE-RP / L-MUTE-IV).  Rollback: ``fly
+    secrets set R1_MUTE_ASIDE_V2=0 -a project-hello-voice`` (today's immediate L-MUTE)."""
+    return _env_switch(os.getenv("R1_MUTE_ASIDE_V2"))
+
+
 def ack_resume_seconds() -> float:
     """``R1_ACK_RESUME_SEC`` (0.3, 0-2): the quicker resume after a held acknowledgement."""
     return _env_seconds(os.getenv("R1_ACK_RESUME_SEC"), ACK_RESUME_SECONDS, 0.0, 2.0)
@@ -904,6 +963,25 @@ def _is_candidate_microphone(participant: Any, publication: Any, identity: str |
         and str(getattr(source, "name", source)).lower()
         in {"microphone", "source_microphone"}
     )
+
+
+def _loop_now() -> float:
+    """The running loop's clock (the one every wait here is measured in), or the monotonic clock."""
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
+
+
+def _is_subscribed(publication: Any) -> bool:
+    """M032 S7C (SWEEP-34): whether the worker holds a subscribed track of ``publication``.
+
+    ``RemoteTrackPublication.subscribed`` when it is there; else whether a track is attached.
+    """
+    subscribed = getattr(publication, "subscribed", None)
+    if isinstance(subscribed, bool):
+        return subscribed
+    return getattr(publication, "track", None) is not None
 
 
 def fold_speech(text: object) -> str:
@@ -1290,6 +1368,94 @@ _IB_QUIET_WORDS = _ACK_WORDS | _IB_ADDRESS_WORDS | frozenset(
     {"yes", "fine", "great", "cool", "perfect", "please", "sorry", "thanks", "thank", "you", "so",
      "much", "very", "sure"}
 )
+
+
+# M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``): the reply to the hello's "Can you hear me okay?",
+# read on folded text and never by the model.  Three readings:
+#
+# * ``SOUND_CANT_HEAR``: a directed complaint anywhere in the turn ("I can't hear you", "I can
+#   barely hear you", "not able to hear you", "you're breaking up", "your voice is very low", "you
+#   sound a bit muffled", "can you speak up?"); a request to say it again or a presence check
+#   ("Sorry?", "Could you repeat that?", "Hello? Are you there?", a bare "Hello?"); or, the whole
+#   turn of at most ``OPEN_CHECK_COMPLAINT_MAX_WORDS`` words, a bare negative or a quality
+#   complaint ("No.", "Not really.", "Barely.", "It's a bit low.", "There's an echo.").  Directed
+#   on purpose: "our customers could not hear the offer" is an answer, not a complaint, and so is
+#   "No problem".
+# * ``SOUND_ANSWER``: an early answer, ``OPEN_CHECK_ANSWER_WORDS`` content words or more once the
+#   greetings, courtesy and hearing words are out (``content_word_count``).
+# * ``SOUND_HEARD``: anything else ("Yes", "Hi Christy!", "Can you hear me?": we just did).
+SOUND_CANT_HEAR = "cant_hear"
+SOUND_ANSWER = "answer"
+SOUND_HEARD = "heard"
+_NEG_AUX = (
+    r"(?:can not|cannot|can't|cant|could not|couldn't|couldnt|did not|didn't|didnt|do not|don't|"
+    r"dont)"
+)
+# What may follow "hear" in a complaint: Christy ("you"), nothing at all ("anything", "a thing"), or
+# the end of the turn or an adverb or address word.  "We couldn't hear the customer" is not one.
+_HEAR_OBJECT = (
+    r"(?: (?:you|anything|a thing|much|what you)\b|$| (?=(?:properly|clearly|well|at all|now|"
+    r"christy|sir|ma'am|maam|madam|sorry|please)\b))"
+)
+_SOUND_CHECK_CANT_HEAR_RE = re.compile(
+    r"(?:^|\b(?:i|we) )(?:"
+    # "I can't hear you (properly)", "couldn't hear anything", "I can barely hear you"
+    + _NEG_AUX + r"(?: really| quite| properly| clearly)? hear" + _HEAR_OBJECT + r"|"
+    r"(?:can|could) (?:barely|hardly|only just) hear" + _HEAR_OBJECT + r"|"
+    r"(?:was|were|am|are) (?:not able|unable) to hear" + _HEAR_OBJECT
+    + r")|"
+    r"\b(?:i'm|im|we're) (?:not able|unable) to hear" + _HEAR_OBJECT + r"|"
+    # "you're breaking up", "your voice is very low", "you sound a bit muffled"
+    r"\b(?:you(?:'re| are| sound| seem)|your (?:voice|audio|sound|volume|mic|microphone) "
+    r"(?:is|was|sounds|seems)|the (?:sound|audio|volume|voice) (?:is|was|sounds)) "
+    r"(?:(?:a (?:bit|little)|very|too|quite|really|so|kind of) )?"
+    r"(?:breaking up|cutting (?:out|off)|low|faint|soft|quiet|muffled|unclear|"
+    r"not (?:audible|clear)|choppy|robotic|distorted|echoing|lagging)\b|"
+    # "can you speak up?", "please speak louder"
+    r"\bspeak(?: a (?:little )?bit| a little)? (?:up|louder|more loudly)\b"
+)
+_SOUND_CHECK_LEAD = (
+    r"(?:(?:yes|yeah|okay|ok|um|uh|hmm|sorry|but|well|actually|so|hi|hello|christy|sir|ma'am|maam|"
+    r"mam|madam) )*"
+)
+_SOUND_CHECK_SHORT_RE = re.compile(
+    r"^" + _SOUND_CHECK_LEAD + r"(?:"
+    r"(?:no|nope|nah|nahi|nahin)(?: (?:no|not (?:really|clearly|properly|very well|much|quite|at "
+    r"all|yet)))*|"
+    r"not (?:really|clearly|properly|very well|much|quite|at all|yet)|"
+    r"barely|hardly|(?:very )?faintly|"
+    r"(?:it(?:'s| is)|that(?:'s| is)|you(?:'re| are)|the (?:sound|audio|voice|volume) is) "
+    r"(?:(?:a (?:bit|little)|very|too|quite|really|so) )?"
+    r"(?:low|faint|soft|quiet|muffled|unclear|choppy|robotic|distorted|breaking|breaking up|"
+    r"echoing|lagging)|"
+    r"there(?:'s| is) (?:an |some |a lot of |a bit of )?(?:echo|noise|static|lag|delay)|"
+    r"(?:a (?:bit|little)|very|too) (?:low|faint|quiet|soft)"
+    r")(?: sorry)?$"
+)
+_HELLO_ONLY_WORDS = frozenset({"hello", "hi", "hey"}) | _IB_ADDRESS_WORDS
+
+
+def sound_check_reading(text: str) -> str:
+    """How the reply to the hello's "Can you hear me okay?" reads (see the comment above)."""
+    folded = _repair_fold(text)
+    if not folded:
+        return SOUND_HEARD
+    view = _ib_repair_view(text)
+    if _SOUND_CHECK_CANT_HEAR_RE.search(folded) is not None:
+        return SOUND_CANT_HEAR
+    words = folded.split()
+    if len(words) <= OPEN_CHECK_COMPLAINT_MAX_WORDS and _SOUND_CHECK_SHORT_RE.match(folded):
+        return SOUND_CANT_HEAR
+    if view and (
+        is_repeat_request(view)
+        or (is_repair_turn(view) and _STILL_THERE_RE.search(view) is not None)
+    ):
+        return SOUND_CANT_HEAR
+    if _has_question_mark(text) and all(word in _HELLO_ONLY_WORDS for word in words):
+        return SOUND_CANT_HEAR  # a bare "Hello?" after the question: they did not hear it
+    if content_word_count(text) >= OPEN_CHECK_ANSWER_WORDS:
+        return SOUND_ANSWER
+    return SOUND_HEARD
 
 
 # Owner test 1eb18cd4 (#14-#18; owner decision 2026-10-30): "Okay, could you please explain me
@@ -2236,6 +2402,19 @@ class R1Interview:
         self._muted = False
         self._mute_resume_phase: R1Phase | None = None
         self._mute_announced = False
+        # M032 S7C (SWEEP-36): when the current mute began (loop time; None while unmuted).
+        self._muted_since: float | None = None
+        # M032 S7C (SWEEP-34): set at the candidate's first speech or first non-empty final and
+        # never reset (a rejoin included); the last candidate participant object seen, for the
+        # label of the r1_no_audio log; and whether that log was written (once per session).
+        self._candidate_ever_heard = False
+        self._candidate_seen: Any = None
+        self._no_audio_noted = False
+        # M032 S7C (SWEEP-35): while the opening's sound check runs, and the candidate rows heard in
+        # it (their reply is not an icebreaker answer, whenever its turn commits).
+        self._sound_check_open = False
+        self._sound_check_rows: set[int] = set()
+        self._sound_check_final_quiet = False
         self._pickup_spoken = False
         # M1 (owner decision 2026-11-03): how many of the candidate's questions Christy answered
         # before the role-play, whether L-TRANSITION-STEER was said, and the scripted lines the
@@ -3484,12 +3663,19 @@ class R1Interview:
     @staticmethod
     def _warm_order() -> tuple[str, ...]:
         """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on, and
-        without M032 S6's lines while the transition repair is off."""
+        without M032 S6's lines while the transition repair is off, nor S7C's while theirs are."""
         order = _WARM_ORDER
+        dropped: set[str] = set()
         if not transition_repair_enabled():
-            dropped = set(_TRANSITION_REPAIR_LINES)
+            dropped |= _TRANSITION_REPAIR_LINES
             if icebreaker_repair_enabled():
                 dropped.discard("L-PRESENT")  # M032 S6: said at a presence-check boundary too
+        if not opening_sound_check_enabled():
+            dropped |= _SOUND_CHECK_LINES
+        if not no_audio_ladder_enabled():
+            dropped |= _NO_AUDIO_LINES
+        dropped |= {"L-MUTE"} if mute_aside_v2_enabled() else _MUTE_V2_LINES
+        if dropped:
             order = tuple(line_id for line_id in order if line_id not in dropped)
         if not transition_bridge_enabled():
             return order
@@ -4269,7 +4455,7 @@ class R1Interview:
         # they were answered as questions, used up the three answers and got the steer).
         return is_acknowledgement_turn(text) and _YIELD_RE.search(fold_speech(text)) is not None
 
-    def _count_icebreaker_answer(self, text: str) -> None:
+    def _count_icebreaker_answer(self, text: str, index: int | None = None) -> None:
         """Count one COMMITTED candidate turn toward the icebreaker's soft exit, if it is an answer.
 
         The soft exit (``icebreaker_should_end``: four turns once S >= 3:30) used to count STT
@@ -4284,6 +4470,10 @@ class R1Interview:
         as it did.
         """
         if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
+            return
+        if self._sound_check_open or (index is not None and index in self._sound_check_rows):
+            # M032 S7C (SWEEP-35): the reply to "Can you hear me okay?" answers no icebreaker
+            # question, whenever its turn commits; an early answer was counted once by the driver.
             return
         if icebreaker_plan_enabled() and is_thinking(text):
             return  # M032 S5: "Let me think about that." answers nothing yet
@@ -4499,7 +4689,7 @@ class R1Interview:
         if quiet:
             _log.info("unknown_event", error_type="r1_icebreaker_quiet_ack")
         elif text:
-            self._count_icebreaker_answer(text)
+            self._count_icebreaker_answer(text, index)
             if not is_backchannel_turn(text):
                 # The candidate said something: their wait starts again from here.  A backchannel
                 # ("Sorry", "Thank you.") leaves the wait for the reply it cancelled running.
@@ -4515,6 +4705,10 @@ class R1Interview:
         deferral = self._icebreaker_deferral(text) if phase is R1Phase.ICEBREAKER else None
         action = self._transition_action(text) if phase is R1Phase.TRANSITION else None
         suppressed = self.reply_suppressed(text)
+        if not suppressed and index is not None and index in self._sound_check_rows:
+            # M032 S7C (SWEEP-35): a reply to the sound check whose turn commits after the agenda
+            # (in the icebreaker) was answered by the agenda; the model never answers it again.
+            suppressed = True
         # Review of S6: the unheard half of a split repair request is read with this turn only.
         judged = self._ib_judged(text)
         if text:
@@ -5892,6 +6086,7 @@ class R1Interview:
         text = str(getattr(event, "transcript", "") or "").strip()
         if not text:
             return
+        self._candidate_ever_heard = True  # M032 S7C (SWEEP-34): a final is proof of audio
         self._latency.note_final()
         self._candidate_activity_at = self._clock()
         self._ack_unjudged = False  # a real final: the speech belongs to a real turn
@@ -5909,6 +6104,11 @@ class R1Interview:
                 self._candidate_turn_anchor(event),
             )
         row.held_only = False  # M032 S6: a real final, so a turn of the SDK's is in flight
+        if self._sound_check_open:
+            # M032 S7C: a reply to the sound check; one heard while Christy speaks is not waited for
+            # (the SDK drops a turn spoken over an uninterruptible line).
+            self._sound_check_rows.add(row.index)
+            self._sound_check_final_quiet = self._agent_state in _QUIET_AGENT_STATES
         row.parts.append(text)
         row.last_final_at = self._event_seconds(event)
         self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
@@ -5981,6 +6181,8 @@ class R1Interview:
             row.ended_at_ms = self._candidate_turn_end(row)
             # The row is over: speech heard up to its last final is its own, never a later row's.
             self._raise_anchor_floor(row.last_final_at, commit=True)
+            if self._mute_pending():
+                self._wake()  # M032 S7C (SWEEP-36): the turn in flight is over; the aside is due?
         return row
 
     def _candidate_turn_end(self, row: _CandidateRow) -> int | None:
@@ -6548,6 +6750,7 @@ class R1Interview:
         self._latency.note_user_state(self._user_state)
         self._settle_change.set()  # the speech started or stopped (_settle_bare_yes)
         if self._user_state == "speaking":
+            self._candidate_ever_heard = True  # M032 S7C (SWEEP-34): the VAD heard them
             self._settle_speech.set()  # a bare yes the candidate went on from (_settle_bare_yes)
             spoke = getattr(event, "created_at", None)
             if isinstance(spoke, (int, float)) and not isinstance(spoke, bool):
@@ -6677,6 +6880,7 @@ class R1Interview:
             self._candidate_identity = str(identity) if identity else None
         if not self._candidate_matches(participant):
             return
+        self._candidate_seen = participant  # M032 S7C (SWEEP-34): its microphone, for a label
         self._candidate_present = True
         self._candidate_ever_present = True
         self._candidate_departed = False
@@ -6716,17 +6920,77 @@ class R1Interview:
         publications = getattr(participant, "track_publications", None)
         if publications is None:
             return
-        values = publications.values() if hasattr(publications, "values") else publications
-        microphones = [
-            publication
-            for publication in values
-            if _is_candidate_microphone(participant, publication, self._candidate_identity)
-        ]
+        self._candidate_seen = participant
+        microphones = self._microphones_of(participant)
         muted = bool(microphones) and all(
             bool(getattr(publication, "muted", False)) for publication in microphones
         )
         if muted != self._muted:
             self._set_muted(muted)
+
+    def _microphones_of(self, participant: Any) -> list[Any]:
+        """The candidate's microphone publications on ``participant`` (none for anyone else)."""
+        publications = getattr(participant, "track_publications", None) or {}
+        values = publications.values() if hasattr(publications, "values") else publications
+        return [
+            publication
+            for publication in values
+            if _is_candidate_microphone(participant, publication, self._candidate_identity)
+        ]
+
+    # -------------------------------------------------- M032 S7C (SWEEP-34): never heard
+
+    def _candidate_participant(self) -> Any:
+        """The candidate's participant: the room's own entry, else the last one an event carried."""
+        participants = getattr(getattr(self.ctx, "room", None), "remote_participants", None) or {}
+        values = participants.values() if hasattr(participants, "values") else participants
+        for participant in values:
+            if self._candidate_matches(participant):
+                return participant
+        return self._candidate_seen
+
+    def _no_audio_category(self) -> str:
+        """Why a candidate may never have been heard, as a label (never any text).
+
+        ``no_mic_track``: no microphone publication; ``not_subscribed``: one is published but the
+        worker holds no subscribed track of it; ``no_voice``: subscribed, but the VAD never heard
+        speech (a muted device, the wrong input, a server-side drop).
+        """
+        microphones = self._microphones_of(self._candidate_participant())
+        if not microphones:
+            return "no_mic_track"
+        if not any(_is_subscribed(publication) for publication in microphones):
+            return "not_subscribed"
+        return "no_voice"
+
+    def _note_no_audio(self) -> None:
+        """Log, once per session, that the candidate was never heard (a label only)."""
+        if self._no_audio_noted:
+            return
+        self._no_audio_noted = True
+        _log.warn(
+            "unknown_event",
+            error_type="r1_no_audio",
+            error_category=self._no_audio_category(),
+            phase=self.machine.transcript_phase(),
+        )
+
+    def _never_heard(self) -> bool:
+        """True when silence must get the no-audio ladder (``R1_NO_AUDIO_LADDER``): nothing of the
+        candidate's ever arrived (no speech, no final) and the microphone is not muted (a muted one
+        has its own aside)."""
+        return no_audio_ladder_enabled() and not self._candidate_ever_heard and not self._muted
+
+    async def _no_audio_ladder(self) -> str | None:
+        """The never-heard ladder: L-SIL-NOAUDIO, then L-SIL-END-NOAUDIO after more silence.
+
+        Spoken only in the opening and the icebreaker (the transition's own close is unchanged).
+        Returns what ``_silence_ladder`` returns: None once the candidate speaks.
+        """
+        self._note_no_audio()
+        return await self._silence_ladder(
+            [("L-SIL-NOAUDIO", NO_AUDIO_END_SECONDS)], end_line="L-SIL-END-NOAUDIO"
+        )
 
     def _set_muted(self, muted: bool) -> None:
         """Apply a microphone state change synchronously, at the room event.
@@ -6737,14 +7001,75 @@ class R1Interview:
         """
         self._muted = muted
         if muted:
+            if self._muted_since is None:
+                self._muted_since = _loop_now()  # M032 S7C (SWEEP-36): the episode's start
             if self.machine.phase is R1Phase.ROLEPLAY:
                 self._mute_resume_phase = R1Phase.ROLEPLAY
                 self._enter(R1Phase.ASIDE)
         else:
+            self._muted_since = None
             self._leave_mute_aside()
             self._mute_announced = False
             self._restart_silence_window()
         self._wake()
+
+    # -------------------------------------------------- M032 S7C (SWEEP-36): the mute aside
+
+    def _mute_pending(self) -> bool:
+        """A mute that has had no aside yet."""
+        return self._muted and not self._mute_announced
+
+    def _muted_for(self) -> float:
+        since = self._muted_since
+        return 0.0 if since is None else max(0.0, _loop_now() - since)
+
+    def _mute_turn_cap(self) -> float:
+        return max(MUTE_ASIDE_TURN_WAIT_SECONDS, MUTE_ASIDE_DEBOUNCE_SECONDS)
+
+    def _mute_due(self) -> bool:
+        """True when the mute aside must be spoken now.
+
+        With ``R1_MUTE_ASIDE_V2`` off: at once, as before.  On: the mute has lasted
+        ``MUTE_ASIDE_DEBOUNCE_SECONDS`` (a blip undone sooner gets nothing), the candidate is here
+        to hear it, and no candidate turn is in flight (speaking, or a final whose turn has not
+        committed), unless the mute has lasted ``MUTE_ASIDE_TURN_WAIT_SECONDS`` in all.
+        """
+        if not self._mute_pending():
+            return False
+        if not mute_aside_v2_enabled():
+            return True
+        if not self._candidate_present:
+            return False
+        muted_for = self._muted_for()
+        if muted_for < MUTE_ASIDE_DEBOUNCE_SECONDS:
+            return False
+        return not self._candidate_turn_open() or muted_for >= self._mute_turn_cap()
+
+    def _mute_wake_in(self) -> float | None:
+        """Seconds until a pending mute may become due (``_await_turn`` wakes then), or None.
+
+        The end of a turn in flight wakes the waiter itself (``_on_user_state_changed``, and
+        ``_close_candidate_row`` while a mute is pending), so only the debounce and the cap are
+        timed here.
+        """
+        if not mute_aside_v2_enabled() or not self._mute_pending() or not self._candidate_present:
+            return None
+        muted_for = self._muted_for()
+        if muted_for < MUTE_ASIDE_DEBOUNCE_SECONDS:
+            return MUTE_ASIDE_DEBOUNCE_SECONDS - muted_for
+        cap = self._mute_turn_cap()
+        if self._candidate_turn_open() and muted_for < cap:
+            return cap - muted_for
+        return None
+
+    def _mute_line_id(self) -> str:
+        """L-MUTE-RP in the role-play (Christy names herself: her voice replaces the learner's),
+        L-MUTE-IV in her own phases; L-MUTE with ``R1_MUTE_ASIDE_V2`` off."""
+        if not mute_aside_v2_enabled():
+            return "L-MUTE"
+        if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            return "L-MUTE-RP"
+        return "L-MUTE-IV"
 
     def _leave_mute_aside(self) -> None:
         """Resume role-play after a mute aside; a no-op for any other kind of aside."""
@@ -6855,7 +7180,7 @@ class R1Interview:
         return (
             self._stop_outcome() is not None
             or self._candidate_departed
-            or (self._muted and not self._mute_announced)
+            or self._mute_due()
             or self._aside_needs_restore()
         )
 
@@ -6907,6 +7232,9 @@ class R1Interview:
                 if silence_left <= 0:
                     return (SILENCE, None)
                 wait = silence_left if wait is None else min(wait, silence_left)
+            mute_wake = self._mute_wake_in()  # M032 S7C (SWEEP-36): wake when the aside is due
+            if mute_wake is not None:
+                wait = mute_wake if wait is None else min(wait, mute_wake)
             kind, text = await self._wait_for_turn_or_attention(wait)
             if kind == "turn" and text:
                 return (TURN, text)
@@ -6975,7 +7303,7 @@ class R1Interview:
             self._leave_mute_aside()
             self._mute_announced = False
             self._restart_silence_window()
-        if self._muted and not self._mute_announced:
+        if self._mute_due():
             await self._handle_mute()
         return None
 
@@ -7013,24 +7341,41 @@ class R1Interview:
         return None
 
     async def _handle_mute(self) -> None:
-        """Speak one microphone aside; the role-play clock is already paused by the event."""
+        """Speak one microphone aside; the role-play clock is already paused by the event.
+
+        M032 S7C (SWEEP-36, ``R1_MUTE_ASIDE_V2``): the mute is checked again first (it may have
+        been undone since the wake-up), and the episode counts as announced only when a line is
+        really spoken (never to a candidate who is not there).  Off: exactly as before.
+        """
         if self._mute_announced:
+            return
+        if not mute_aside_v2_enabled():
+            self._mute_announced = True
+            if self.machine.phase is R1Phase.ROLEPLAY:
+                self._mute_resume_phase = R1Phase.ROLEPLAY
+                self._enter(R1Phase.ASIDE)
+            if self._candidate_present:
+                await self.say("L-MUTE")
+            return
+        if not self._muted or not self._candidate_present:
             return
         self._mute_announced = True
         if self.machine.phase is R1Phase.ROLEPLAY:
             self._mute_resume_phase = R1Phase.ROLEPLAY
             self._enter(R1Phase.ASIDE)
-        if self._candidate_present:
-            await self.say("L-MUTE")
+        await self.say(self._mute_line_id())
 
     # --------------------------------------------------------------- ladder
 
-    async def _silence_ladder(self, prompts: list[tuple[str, float]]) -> str | None:
+    async def _silence_ladder(
+        self, prompts: list[tuple[str, float]], *, end_line: str = "L-SIL-END"
+    ) -> str | None:
         """Speak each (line, wait) prompt after real candidate silence (plan section 5.11).
 
         Returns None as soon as the candidate answers, a STOP outcome if one
         fires, ``phase_deadline`` when the phase budget runs out first, or
-        ``candidate_left`` once the final L-SIL-END has been spoken.
+        ``candidate_left`` once the final ``end_line`` (L-SIL-END unless the caller is the
+        never-heard ladder of M032 S7C) has been spoken.
 
         Non-aside steps are bounded by the phase budget and are skipped for the
         phase end when the budget cannot cover their wait.  The aside step
@@ -7070,7 +7415,7 @@ class R1Interview:
             if kind == DEADLINE:
                 return "phase_deadline"
         self._goodbye_spoken = True
-        await self.say("L-SIL-END")
+        await self.say(end_line)
         return "candidate_left"
 
     async def _roleplay_turn(self) -> str | None:
@@ -7270,6 +7615,120 @@ class R1Interview:
         ceiling = self._icebreaker_hold_since + ICEBREAKER_HOLD_CEILING_SECONDS
         return max(0.0, min(ceiling, last + grace) - now)
 
+    # ------------------------------------------------ M032 S7C (SWEEP-35): the opening
+
+    async def _run_opening(self) -> str | None:
+        """Speak the opening; return a STOP outcome, or None for the icebreaker to follow.
+
+        With ``R1_OPENING_SOUND_CHECK`` off, L-OPEN exactly as before.  On, the sound check
+        (``_sound_check``): a short hello that asks whether the candidate can hear Christy, their
+        reply read in code, then one agenda.  The reply is no icebreaker answer
+        (``_sound_check_open`` and ``_sound_check_rows``), and an early answer is counted once,
+        here.
+        """
+        if not opening_sound_check_enabled():
+            await self.say("L-OPEN")
+            return None
+        self._sound_check_open = True
+        try:
+            return await self._sound_check()
+        finally:
+            self._sound_check_open = False
+
+    def _take_queued_turns(self) -> list[str]:
+        """The finals the driver has not read yet (said over the line that just played)."""
+        texts: list[str] = []
+        while not self._turns.empty():
+            texts.append(self._turns.get_nowait())
+        return texts
+
+    def _sound_check_turn_open(self) -> bool:
+        """The reply is still in flight: the candidate is speaking, or its latest final came while
+        Christy was quiet and the SDK has not committed it yet.  A final heard over her line is not
+        waited for (the SDK drops a turn spoken over an uninterruptible line)."""
+        if self._user_state == "speaking":
+            return True
+        row = self._open_row
+        return row is not None and not row.held_only and self._sound_check_final_quiet
+
+    async def _settle_sound_check_reply(self, texts: list[str]) -> str:
+        """Wait for the reply to end (bounded), and join every final of it."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+        while self._sound_check_turn_open() and loop.time() < deadline:
+            if self._stop_outcome() is not None:
+                break
+            await asyncio.sleep(0.05)
+        texts = texts + self._take_queued_turns()
+        return " ".join(text for text in texts if text)
+
+    async def _sound_check(self) -> str | None:
+        """L-OPEN-HELLO, the reply, then L-OPEN-AGENDA / -PLAIN / -CONTINUE (SWEEP-35).
+
+        * A can't-hear reply (``sound_check_reading``) gets L-OPEN-HELLO-AGAIN once; a second one
+          gets the plain agenda (it does not claim to hear them well).
+        * An early answer (``SOUND_ANSWER``) gets the agenda that invites them to carry on, and it
+          is counted as one icebreaker answer.
+        * Any other reply gets the agenda ("Good, I can hear you.").
+        * Silence: a candidate never heard gets the no-audio ladder (SWEEP-34; its close ends the
+          interview, a turn after it gets the plain agenda); one heard only by the VAD, or with the
+          ladder off, gets the plain agenda.  So does the end of the sound check's own budget.
+        A final heard during the hello ("Hi") is followed by a short quiet for the answer to the
+        question; when none comes, it is the reply.  Nothing here calls the model.
+        """
+        await self.say("L-OPEN-HELLO")
+        started = self._clock()
+
+        def left() -> float:
+            return OPEN_CHECK_HARD_SECONDS - (self._clock() - started)
+
+        cant_hear = 0
+        agenda = "L-OPEN-AGENDA-PLAIN"
+        reading = "silence"
+        while True:
+            queued = self._take_queued_turns()
+            timeout = OPEN_HELLO_FOLLOW_SECONDS if queued else OPEN_CHECK_SILENCE_SECONDS
+            kind, value = await self._await_turn(timeout, hard=left)
+            if kind == STOP:
+                return value
+            if kind == TURN:
+                texts = [*queued, value or ""]
+            elif queued:
+                texts = queued  # "Hi" over the hello, and then nothing: it is the reply
+            elif kind == SILENCE and self._never_heard():
+                stop = await self._no_audio_ladder()
+                if stop not in (None, "phase_deadline"):
+                    return stop
+                await self._settle_sound_check_reply([])  # their first words: not talked over
+                reading = "no_audio"
+                break
+            else:
+                reading = "deadline" if kind == DEADLINE else "silence"
+                break
+            text = await self._settle_sound_check_reply(texts)
+            reading = sound_check_reading(text)
+            if reading == SOUND_CANT_HEAR:
+                cant_hear += 1
+                if cant_hear == 1 and left() > 0:
+                    await self.say("L-OPEN-HELLO-AGAIN")
+                    continue
+                break
+            if reading == SOUND_ANSWER:
+                agenda = "L-OPEN-AGENDA-CONTINUE"
+                self.machine.candidate_turns += 1  # the early answer, counted once (here)
+            else:
+                agenda = "L-OPEN-AGENDA"
+            break
+        _log.info(
+            "unknown_event",
+            error_type="r1_sound_check",
+            error_category=reading,
+            schema=agenda,
+            option_count=cant_hear,
+        )
+        await self.say(agenda)
+        return None
+
     async def _run_icebreaker(self) -> str | None:
         """Ask-and-listen until a committed turn ends the phase, or the hard S=4:30 deadline.
 
@@ -7307,7 +7766,12 @@ class R1Interview:
                 # Review of S6: after "Are you still with me?" a "Yes." answers HER, so the quiet
                 # reading of the hold or repeat line is over.
                 self._ib_quiet_after = None
-                value = await self._silence_ladder([("L-SIL-IB", ICEBREAKER_END_SECONDS)])
+                if self._never_heard():
+                    # M032 S7C (SWEEP-34): nothing of theirs ever arrived: say so, not "Are you
+                    # still with me?" and "we seem to have lost the connection".
+                    value = await self._no_audio_ladder()
+                else:
+                    value = await self._silence_ladder([("L-SIL-IB", ICEBREAKER_END_SECONDS)])
                 if value == "phase_deadline":
                     return None
                 if value is not None:
@@ -7948,7 +8412,10 @@ class R1Interview:
             await self._start_recorder()
             # The driver, not on_enter, speaks the opening so the icebreaker clock and
             # its silence window begin only once the candidate has heard the question.
-            await self.say("L-OPEN")
+            stop = await self._run_opening()
+            if stop is not None:
+                outcome = await self._finish_stop(stop)
+                return outcome
             self._enter(R1Phase.ICEBREAKER)
             stop = await self._run_icebreaker()
             self._log_icebreaker_plan()
