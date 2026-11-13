@@ -94,6 +94,18 @@ RULE_CONFIRMED_KINDS = {
 # A hollow advisor turn: four words or fewer and no question ("Sure.", "Okay.", "Mm-hmm.").
 HOLLOW_MAX_WORDS = 4
 
+# D2-HM1 (``REHEARSAL_CITED_MISFIRES``): what the rubric and the schema add to ask the judge to cite the
+# ADVISOR turn a misfire fails to follow.  With the switch OFF the judge is sent the previous rubric and
+# schema byte for byte (``LEGACY_RUBRIC``, ``LEGACY_SCHEMA_TEXT``), so a live sweep compares like with like.
+_MISFIRE_CITATION = (
+    ", the 'advisor_turn' (the number of the ADVISOR "
+    "line it fails to follow: the same turn or an earlier one) and a 'reason' of a few words saying "
+    "what in that ADVISOR line it ignores or contradicts. A reply that makes sense as an answer to a "
+    "confusing ADVISOR line is not a misfire, and a misfire of kind other without an advisor_turn and "
+    "a reason is not counted"
+)
+_SCHEMA_CITATION = ',"advisor_turn":0,"reason":""'
+
 RUBRIC = (
     "You are a strict reviewer of a sales role-play. ADVISOR is a job candidate playing a "
     "Program Advisor; LEARNER is a simulated prospective learner (an AI character). Judge ONLY "
@@ -110,11 +122,7 @@ RUBRIC = (
     "feeling (emotional). A need the learner volunteers with no question about it is a reveal "
     "with probe_turn null.\n"
     "3. misfires: LEARNER lines that the conversation did not warrant. Every misfire needs a short "
-    "'quote' copied from the LEARNER line it is about, the 'advisor_turn' (the number of the ADVISOR "
-    "line it fails to follow: the same turn or an earlier one) and a 'reason' of a few words saying "
-    "what in that ADVISOR line it ignores or contradicts. A reply that makes sense as an answer to a "
-    "confusing ADVISOR line is not a misfire, and a misfire of kind other without an advisor_turn and "
-    "a reason is not counted. unwarranted_gratitude: "
+    "'quote' copied from the LEARNER line it is about" + _MISFIRE_CITATION + ". unwarranted_gratitude: "
     "thanking or being pleasantly surprised about a discount nobody offered; NOT when the OFFER "
     "LEDGER shows the advisor named a price or a discount in that turn or the one before. "
     "no_one_leaving: 'before you go' when the advisor was not ending the call (and the learner had "
@@ -148,11 +156,20 @@ RUBRIC = (
 SCHEMA_TEXT = (
     '{"objections":[{"family":"F1|F2|F3|F4","turn":0,"in_context":true,"canned_verbatim":false,'
     '"why":""}],"disclosures":[{"need":"H1|H2|H3","probe_turn":null,"reveal_turn":null,'
-    '"emotional":false}],"misfires":[{"turn":0,"kind":"other","quote":"","advisor_turn":0,'
-    '"reason":""}],"stall_loop":false,'
+    '"emotional":false}],"misfires":[{"turn":0,"kind":"other","quote":""' + _SCHEMA_CITATION + '}],'
+    '"stall_loop":false,'
     '"style":{"reactions":3,"followups":3,"hesitation":3,"continuity":3,"variety":3},'
     '"ignored_advisor_offers":[{"turn":0,"offer":""}]}'
 )
+LEGACY_RUBRIC = RUBRIC.replace(_MISFIRE_CITATION, "", 1)
+LEGACY_SCHEMA_TEXT = SCHEMA_TEXT.replace(_SCHEMA_CITATION, "")
+
+
+def rubric_and_schema() -> tuple[str, str]:
+    """The rubric and schema the judge is sent: with the citation (D2-HM1) unless the switch is OFF."""
+    if flags.on(flags.CITED_MISFIRES):
+        return RUBRIC, SCHEMA_TEXT
+    return LEGACY_RUBRIC, LEGACY_SCHEMA_TEXT
 
 
 def transcript_for_judge(record: Mapping[str, Any]) -> str:
@@ -211,13 +228,14 @@ def ledger_text(record: Mapping[str, Any]) -> str:
 
 
 def judge_messages(record: Mapping[str, Any]) -> list[dict[str, str]]:
+    rubric, schema = rubric_and_schema()
     user = (
         f"LEARNER CARD (the learner does not tell the advisor the hidden needs unless probed):\n"
         f"{persona_brief(record)}\n\nCOURSE FACTS:\n{deck_brief()}\n\n"
         f"CALL FACTS:\n{ledger_text(record)}\n\n"
-        f"TRANSCRIPT:\n{transcript_for_judge(record)}\n\nSCHEMA:\n{SCHEMA_TEXT}"
+        f"TRANSCRIPT:\n{transcript_for_judge(record)}\n\nSCHEMA:\n{schema}"
     )
-    return [{"role": "system", "content": RUBRIC}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": rubric}, {"role": "user", "content": user}]
 
 
 def _int(value: Any) -> int | None:
@@ -258,18 +276,21 @@ def parse_verdict(raw: str) -> dict[str, Any]:
                     "emotional": bool(item.get("emotional")),
                 }
             )
+    # A verdict parsed with the citation switch OFF was asked for no citation, so it carries no
+    # ``advisor_turn`` key and a later re-score keeps the old rule for it (D2-HM1).
+    cited = flags.on(flags.CITED_MISFIRES)
     for item in data.get("misfires") or []:
         if isinstance(item, dict):
             kind = item.get("kind") if item.get("kind") in MISFIRE_KINDS else "other"
-            out["misfires"].append(
-                {
-                    "turn": _int(item.get("turn")),
-                    "kind": kind,
-                    "quote": str(item.get("quote") or "")[:160],
-                    "advisor_turn": _int(item.get("advisor_turn")),
-                    "reason": str(item.get("reason") or "")[:160],
-                }
-            )
+            misfire: dict[str, Any] = {
+                "turn": _int(item.get("turn")),
+                "kind": kind,
+                "quote": str(item.get("quote") or "")[:160],
+            }
+            if cited:
+                misfire["advisor_turn"] = _int(item.get("advisor_turn"))
+                misfire["reason"] = str(item.get("reason") or "")[:160]
+            out["misfires"].append(misfire)
     for item in data.get("ignored_advisor_offers") or []:
         if isinstance(item, dict):
             out["ignored_advisor_offers"].append(
@@ -307,8 +328,9 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
     agree with it, so it must cite the ADVISOR turn it fails to follow (a turn of the transcript, not
     after the misfire's own) and a reason; without them it is rejected as ``uncited`` (the judge marked
     12 of 14 lines of a chaotic replay ``other``, some of them sensible replies to an incoherent advisor).
-    ``parse_verdict`` always gives a misfire the ``advisor_turn`` key; a verdict stored before the
-    judge was asked to cite (no such key) cannot be held to it on a re-score and keeps the old rule.
+    ``parse_verdict`` gives a misfire the ``advisor_turn`` key while the switch is ON; a verdict stored
+    before the judge was asked to cite (no such key) cannot be held to it on a re-score and keeps the
+    old rule.
     """
     if verdict.get("error"):
         return dict(verdict)

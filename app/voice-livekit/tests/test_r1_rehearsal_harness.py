@@ -3086,5 +3086,171 @@ class DiagnosisTwoHarnessTests(unittest.TestCase):
         item = result["verdict"]["misfires"][0]
         self.assertEqual((item["advisor_turn"], item["reason"]), (2, "time_cue_reversed"))
 
+
+class DiagnosisTwoFollowUpTests(unittest.TestCase):
+    """Review of the diagnosis-2 harness checks (HM1, SC1, ND1, HF2).  Synthetic text only."""
+
+    # The rubric and schema the judge was sent before D2-HM1 (sha256 of the committed text).
+    LEGACY_RUBRIC_SHA = "d6231652d3b0e7bc7107a0098f571c7efa9eaae372ef5106ec180aa4564f1e14"
+    LEGACY_SCHEMA_SHA = "5092ac6fbd2b42ca8cf685866e3c275d7cb9b5fa5dd41d3ab23dce497e104158"
+
+    # --- HM1: the citation switch OFF sends the judge the previous prompt, byte for byte
+    @staticmethod
+    def _record():
+        return {
+            "header": {"persona_id": "p1_career_switcher", "persona_variant": "v1", "seed": "s"},
+            "exchanges": [exchange(1, 10.0, "The course is six months.", spoken="That's longer than I thought.")],
+        }
+
+    @staticmethod
+    def _sha(text):
+        import hashlib
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def test_the_citation_switch_off_sends_the_previous_rubric_and_schema(self) -> None:
+        with _env(REHEARSAL_CITED_MISFIRES="0"):
+            system, user = (m["content"] for m in judge.judge_messages(self._record()))
+        self.assertEqual(self._sha(system), self.LEGACY_RUBRIC_SHA)
+        self.assertNotIn("advisor_turn", system)
+        self.assertNotIn("not counted", system)
+        schema = user.split("SCHEMA:\n", 1)[1]
+        self.assertEqual(self._sha(schema), self.LEGACY_SCHEMA_SHA)
+
+    def test_the_citation_switch_on_asks_for_the_citation(self) -> None:
+        system, user = (m["content"] for m in judge.judge_messages(self._record()))
+        self.assertEqual(system, judge.RUBRIC)
+        self.assertIn("advisor_turn", system)
+        self.assertIn("advisor_turn", user.split("SCHEMA:\n", 1)[1])
+
+    def test_a_verdict_parsed_with_the_switch_off_is_not_held_to_a_citation_later(self) -> None:
+        raw = json.dumps(DiagnosisTwoHarnessTests._verdict(
+            {"turn": 1, "kind": "other", "quote": "longer than I thought"}))
+        with _env(REHEARSAL_CITED_MISFIRES="0"):
+            verdict = judge.parse_verdict(raw)
+        self.assertNotIn("advisor_turn", verdict["misfires"][0])
+        checked = judge.validate_misfires(verdict, self._record())  # re-scored with the switch ON
+        self.assertEqual(len(checked["misfires"]), 1)
+
+    # --- SC1: an end request or abuse hang-up after the window opened is no exclusion
+    @staticmethod
+    def _call(commitment, *, stop, seconds, hangups=0):
+        record = fake_record("strong", commitment=commitment, stop_reason=stop, roleplay_seconds=seconds)
+        record["metrics"]["abuse_hangups"] = hangups
+        return record
+
+    def test_an_end_request_after_the_window_opened_still_counts_as_a_miss(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("MEDIUM", stop="farewell_exit", seconds=1000.0),
+            self._call(None, stop="end_request", seconds=990.0),
+        ])
+        self.assertEqual(group["commitment_excluded"], 0)
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.5)
+
+    def test_an_abuse_hang_up_after_the_window_opened_still_counts_as_a_miss(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("MEDIUM", stop="farewell_exit", seconds=1000.0),
+            self._call(None, stop="wrap_accepted", seconds=900.0, hangups=1),
+        ])
+        self.assertEqual(group["commitment_excluded"], 0)
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.5)
+
+    def test_an_end_request_before_the_window_keeps_its_reason(self) -> None:
+        for stop, seconds, hangups, reason in (
+            ("end_request", 776.5, 0, "end_request"),
+            ("wrap_accepted", 383.0, 1, "abuse_hangup"),
+        ):
+            with self.subTest(stop=stop):
+                record = self._call(None, stop=stop, seconds=seconds, hangups=hangups)
+                self.assertEqual(scorecard.commitment_exclusion(record, record["metrics"]), reason)
+
+    # --- ND1: a compound dig keeps each clause's topic; the calendar needs a contact word
+    @staticmethod
+    def _dug(text):
+        return metrics.dug_topics({"text": text, "intent": "probe", "topic": ""})
+
+    def test_each_coordinated_question_keeps_its_topic(self) -> None:
+        for text, expected in (
+            ("What made you start looking, and is cost a worry?", ["H1", "H2"]),
+            ("When would you want to start, and how would you pay for it?", ["H1", "H3"]),
+            ("What got you interested, and does your wife support it?", ["H1", "H3"]),
+            ("What's your timeline, and what worries you most?", ["H1", "H2"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text), expected)
+
+    def test_one_clause_with_two_topics_stays_one_dig(self) -> None:
+        text = ("When you talk it over with your husband, what do you think his main concern would be, "
+                "the cost or the time?")
+        self.assertEqual(self._dug(text), ["H3"])
+        text = "Have you tried picking up data science before, or is this the first time you're looking into it?"
+        self.assertEqual(self._dug(text), ["H2"])
+
+    def test_the_int_live_2_questions_keep_their_topic(self) -> None:
+        for text, expected in (
+            ("Have you found free material actually got you interview-ready before?", ["H2"]),
+            ("While I've got you, is there anything else about the format you'd want spelled out?", []),
+            ("Let me check what's possible, but first, what's driving that number for you, is it a hard "
+             "budget ceiling or just what felt reasonable?", ["H3"]),
+            ("But just so I understand, is it the money side you want to sit with, or are you also "
+             "planning to talk it over with someone before deciding?", ["H3"]),
+            ("So is your husband the main one you'd want on board with this, and do you think he'd have "
+             "any particular concerns, like the cost or the time commitment?", ["H3"]),
+            ("Just so I'm not chasing you, roughly which day this week should I expect to hear back?", []),
+            ("What's driving this for you right now?", ["H1"]),
+            ("So what's really got you looking at a switch?", ["H1"]),
+            ("Okay, so what's brought you here, what's the friction or the blocker in your career?", ["H1"]),
+            ("Would that be useful to have in hand before you go?", []),
+            ("What worries you most about going back to studying?", ["H2"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text), expected)
+
+    def test_how_the_interest_began_is_an_h1_dig(self) -> None:
+        self.assertEqual(self._dug("How did you get interested in data science?"), ["H1"])
+        self.assertEqual(self._dug("Are you interested in switching careers?"), [])
+
+    def test_study_time_this_week_is_an_h3_dig_not_the_calendar(self) -> None:
+        self.assertEqual(self._dug("What time do you have free this week for studying?"), ["H3"])
+        self.assertNotIn("H3", self._dug("Is there a time this week that works for a quick chat with you both?"))
+
+    # --- HF2: the spoken backstop reads day bookings and a negation only near the verb
+    def test_the_spoken_backstop_reads_day_and_seat_bookings(self) -> None:
+        for spoken in (
+            "Sure, let's do Thursday at six.",
+            "Fine, put me down for the call on Friday.",
+            "Okay, book me in for Saturday.",
+            "That's fine, hold the seat for me.",
+            "Honestly I wouldn't mind a call on Monday.",
+            "Never mind, let's book a call on Friday.",
+            "I don't know, let's book a call for Tuesday.",
+        ):
+            with self.subTest(spoken=spoken):
+                self.assertGreaterEqual(metrics._spoken_agreement_level(spoken), metrics.Level.MEDIUM)
+
+    def test_a_negation_next_to_the_verb_still_voids_it(self) -> None:
+        for spoken in (
+            "I don't think we can book a call this week.",
+            "I'd rather not book a call yet.",
+            "Please don't put me down for Friday.",
+            "I'm not ready to set up a call just yet.",
+            "A call doesn't really work for me this week.",
+        ):
+            with self.subTest(spoken=spoken):
+                self.assertEqual(metrics._spoken_agreement_level(spoken), metrics.Level.NONE)
+
+    def test_a_blocked_sentence_with_a_both_miss_remainder_is_a_spoken_leak(self) -> None:
+        admin = {
+            "guard": {"hits": 1, "by_category": {"commitment": 1}, "flagged": False},
+            "commitment": {"level": "WEAK", "turn": 30},
+            "turn_map": [{"roleplay_turn": 12, "transcript_turn": 40}],
+        }
+        exchanges = [exchange(12, 800.0, "Shall we pick a day?", spoken="Okay, book me in for Saturday.")]
+        trips = [{"category": "commitment", "turn_index": 40}]
+        found = metrics.guard_metrics(admin, trips, exchanges)
+        self.assertEqual(found["commitment_spoken_leaks"], 1)
+        self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -123,25 +123,34 @@ Harness fixes of M032 diagnosis 2 (each behind a switch, see below):
   whose role-play ended on an end request, on the abuse hang-up (D-M032-3, `admin_log.endings.abuse_hangups`)
   or before 13:00 is excluded, and the gate shows the counts and the reasons beside its value ("4/6, 3
   excluded (abuse_hangup 1, end_request 2)"); the all-calls rate stays in the table. A call that reached a
-  level always counts, and so does a full call that reached none. The small-group cap slack counts the
-  calls with a window.
+  level always counts, and so does a full call that reached none, even when it then ended on an end
+  request or the abuse hang-up after 13:00 (the learner had its window). The small-group cap slack counts
+  the calls with a window.
 * D2-HF2 (`REHEARSAL_SPOKEN_LEAKS`): `guard_flagged` hard-fails on the guard's own flag or on a commitment
   that was still in the SPOKEN line of the trip's exchange (`commitment_spoken_leaks`: the engine's
   classifier and the harness's own regexes, above the cap on record; a trip that cannot be matched to a
-  spoken line counts, fail closed). A commitment the guard blocked is the info gate `commit_blocked`
+  spoken line counts, fail closed). The own regexes also read day and seat bookings ("let's do Thursday",
+  "book me in", "hold the seat for me", "I wouldn't mind a call on Monday"), and a negation voids a match
+  only in the same clause and within four words before it ("Never mind, let's book a call" agrees). A commitment the guard blocked is the info gate `commit_blocked`
   (blocked attempts per call <= 1). `post_commit` still gates.
 * D2-ND1 (`REHEARSAL_PROBE_VOCAB_V2`): the H1 vocabulary no longer takes "motivated", "looking into" or a
   bare "interested" (they matched H2/H3 questions), "what's driving / prompting / behind / making you"
-  match, "before I ..." is no H2 word and "first/last time" no H3 word; a question with two topics' words
-  counts for the one named first, and for H1 only when it names the timing or asks why; "a quick
-  follow-up", "a day this week" and "the best way to reach you" are the calendar, whoever is named. The
+  match, "how did you get interested" does, a bare "got you" / "bring you" does not ("while I've got
+  you"), "what's driving that number" is about money, "before I / you / deciding ..." is no H2 word, a
+  worry of his or hers is no H2 dig, and "first/last time" is no H3 word;
+  a question sentence is read per coordinated question ("What's your timeline, and what worries you
+  most?" digs H1 and H2), and one question with two topics' words counts for the one named first; "a
+  quick follow-up", "a day or time this week" to talk or call and "the best way to reach you" are the
+  calendar, whoever is named ("what time do you have free this week for studying?" is an H3 dig). The
   engine's needs ledger (`admin_log.needs[].followup_turn`) is reported beside the harness's digs
   (`harness_only_digs`, `engine_only_digs`, `disclosure_rate_engine_confirmed`, info gates); the
   disclosure gate keeps scoring every harness dig, because a dig the engine missed is a product failure
   its own detector cannot report.
 * D2-HM1 (`REHEARSAL_CITED_MISFIRES`): a judged misfire of kind `other` must cite the ADVISOR turn it fails
   to follow (`advisor_turn`, not after its own turn) and a `reason`, or it is rejected as `uncited` (a
-  verdict stored before the judge was asked to cite keeps the old rule on a re-score). The scorecard shows
+  verdict stored before the judge was asked to cite keeps the old rule on a re-score). With the switch OFF
+  the live judge is sent the previous rubric and schema byte for byte and its verdict carries no citation
+  keys. The scorecard shows
   judge, rejected and rule misfires as separate rows, and one call adds at most 5 to the misfire gate's
   mean (`misfires_uncapped` is the info row). Manual replays stay in the gate.
 

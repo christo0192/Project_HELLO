@@ -162,17 +162,19 @@ _PROBE_VOCAB_V2 = {
     "H1": re.compile(
         r"\b(?:why (?:now|this|that|are you|did you|do you|data science)|what (?:made (?:you|this|"
         r"that|now)|prompted|brought|changed|got you|motivated you|motivates you)|"
-        r"what(?:['’]s| is) (?:driving|prompting|behind|making you|bringing you|motivating you)|"
-        r"prompt\w*|got you|brought you|bring you|timeline|timeframe|deadline|trigger|urgency|"
+        r"what(?:['’]s| is) (?:(?:driving|behind)(?!\s+(?:that|this|the|your) (?:number|figure|price|"
+        r"amount|budget))|prompting|making you|bringing you|motivating you)|"
+        r"what(?:['’]s| has) (?:really )?(?:got|brought) you|"
+        r"prompt\w*|timeline|timeframe|deadline|trigger|urgency|"
         r"how soon|when (?:do|are|would) you (?:want|hope|need|plan)|looking now|"
-        r"start(?:ed)? looking)\b",
+        r"start(?:ed)? looking|how did you (?:get|become) interested)\b",
         re.IGNORECASE,
     ),
     "H2": re.compile(
         r"\b(?:concerns?|worr\w+|hesitat\w+|holding you back|held you back|stopping you|stopped you|"
         r"tried|struggl\w+|challenge\w*|obstacle|didn'?t work|not stick|didn'?t stick|stick|"
         r"went wrong|so far|biggest|afraid|nervous|doubts?|hurdle|blocker|friction|previous|"
-        r"before(?!\s+(?:i|we)\b)|keep you from|missing|tripped|(?:got|get|gets|getting) in the way|"
+        r"before(?!\s+(?:i|we|you|deciding|committing|signing|starting)\b)|keep you from|missing|tripped|(?:got|get|gets|getting) in the way|"
         r"last time|fizzl\w*|fell (?:apart|off|through)|gave up|give up)\b",
         re.IGNORECASE,
     ),
@@ -185,11 +187,14 @@ _PROBE_VOCAB_V2 = {
         re.IGNORECASE,
     ),
 }
-# When a question carries two topics' words it is about the topic of its main clause, which comes
-# first ("have you tried this before, or is this the first time you're looking into it?" is H2), and
-# it is about H1 only when it names the timing or asks why.
-_H1_TIMING = re.compile(
-    r"\b(?:now|why|timing|timeline|timeframe|how soon|deadline|urgency)\b", re.IGNORECASE
+# A question sentence can join two questions ("What's your timeline, and what worries you most?"):
+# each coordinated question that opens with a question word or an auxiliary is read on its own.
+# Within one question, two topics' words mean the topic of its main clause, which comes first ("when
+# you talk it over with your husband, what would his main concern be?" is H3, not H2).
+_COORDINATED_QUESTION = re.compile(
+    r",?\s+(?:and|or|but|also)\s+(?=(?:what|why|how|when|where|who|which|is|are|was|were|do|does|did|"
+    r"can|could|would|will|should|has|have|had)\b)",
+    re.IGNORECASE,
 )
 # A question about WHEN to talk again is about the calendar, not about the learner's time or money
 # ("when could you two talk?", "is there a good time later this week to reconnect?"); it is no dig
@@ -207,10 +212,15 @@ _SCHEDULING_QUESTION_V2 = re.compile(
     _SCHEDULING_QUESTION.pattern
     + r"|\bfollow(?:ing)?[- ]up\b"
     + r"|\b(?:is there|what|which) (?:a |the )?(?:good |better |best )?(?:day|time)\b[^?]{0,30}"
-    + r"\b(?:this|next) week\b"
+    + r"\b(?:this|next) week\b(?=[^?]*\b(?:call|talk|chat|speak|meet|connect|catch up|reconnect|hear|"
+    + r"get back)\w*\b)"
     + r"|\breach you\b",
     re.IGNORECASE,
 )
+# A worry of someone else's ("do you think he'd have any concerns?") is a question about who decides
+# (H3), not about what held the learner back (H2).
+_THIRD_PARTY = re.compile(r"\b(?:he|she|they|him|her|them|his|their)(?:['’]d)?\b", re.IGNORECASE)
+_FEELING_WORD = re.compile(r"(?:concern|worr|hesitat|doubt|afraid|nervous)", re.IGNORECASE)
 
 
 def _probe_vocab() -> Mapping[str, re.Pattern[str]]:
@@ -792,26 +802,31 @@ def dug_topics(advisor: Mapping[str, Any]) -> list[str]:
 
 
 def _question_topics(question: str) -> list[str]:
-    """The ONE need a question sentence is about (D2-ND1), or none.
+    """The needs a question sentence is about (D2-ND1): one per coordinated question, or none.
 
-    Every topic whose vocabulary the sentence carries is a candidate (H3 not when the sentence is
-    about the calendar).  With more than one, H1 drops out unless the sentence names the timing or
-    asks why, and the topic named first (the main clause) wins.
+    The sentence is split into its coordinated questions ("..., and what worries you most?").  In
+    each, every topic whose vocabulary it carries is a candidate (H3 not when that question is about
+    the calendar), and with more than one the topic named first (the main clause) wins.
     """
     vocab = _probe_vocab()
     scheduling = _scheduling_question()
-    hits: dict[str, int] = {}
-    for topic in H_TOPICS:
-        match = vocab[topic].search(question)
-        if match is None or (topic == "H3" and scheduling.search(question)):
-            continue
-        hits[topic] = match.start()
-    if len(hits) > 1 and "H1" in hits and _H1_TIMING.search(question) is None:
-        del hits["H1"]
-    if len(hits) > 1:
-        first = min(hits, key=lambda topic: hits[topic])
-        return [first]
-    return list(hits)
+    found: set[str] = set()
+    for clause in _COORDINATED_QUESTION.split(question):
+        hits: dict[str, int] = {}
+        for topic in H_TOPICS:
+            match = vocab[topic].search(clause)
+            if match is None or (topic == "H3" and scheduling.search(clause)):
+                continue
+            if (
+                topic == "H2"
+                and _FEELING_WORD.match(match.group(0))
+                and _THIRD_PARTY.search(clause[: match.start()])
+            ):
+                continue
+            hits[topic] = match.start()
+        if hits:
+            found.add(min(hits, key=lambda topic: hits[topic]))
+    return [topic for topic in H_TOPICS if topic in found]
 
 
 def engine_dig_metrics(
@@ -1157,6 +1172,8 @@ def guard_metrics(
 # D2-HF2: the learner agreeing to a call, a day or a seat, or to enrol, in what it SAID.  Own regexes
 # next to the engine's classifier: the guard blocks with ``classify_learner_commitment``, so a check
 # with that classifier alone could never see a commitment the classifier misses.
+_SPOKEN_DAY_WORDS = r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|tonight"
+_SPOKEN_DAY = r"(?:(?:this|next|on) )?(?:" + _SPOKEN_DAY_WORDS + r")\b"
 _SPOKEN_MEDIUM = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -1168,6 +1185,12 @@ _SPOKEN_MEDIUM = tuple(
         r"good|okay)\b",
         r"\b(?:sounds|works) (?:good|fine|great)\b[^.?!]{0,30}\b(?:call|monday|tuesday|wednesday|"
         r"thursday|friday|saturday|sunday|tomorrow)\b",
+        # Review of D2-HF2: day and seat bookings that the engine's classifier misses as well.
+        r"\b(?:let'?s|we can|we could|i can|i could) (?:do|say|go with|make it|pencil in)\s+"
+        + _SPOKEN_DAY,
+        r"\b(?:put|book|pencil|count|sign) me (?:down|in)\b",
+        r"\bhold (?:a |my |the )?(?:spot|seat|place)\b[^.?!]{0,15}\bfor me\b",
+        r"\bi wouldn['’]?t mind\b[^.?!]{0,20}\b(?:call|chat|meeting|seat|spot|" + _SPOKEN_DAY_WORDS + r")\b",
     )
 )
 _SPOKEN_STRONG = re.compile(
@@ -1175,15 +1198,26 @@ _SPOKEN_STRONG = re.compile(
     re.IGNORECASE,
 )
 _NEGATION = re.compile(r"\b(?:not|never)\b|n['’]t\b", re.IGNORECASE)
+# A negation voids an agreement only when it bears on it: in the same clause and within a few words
+# before it ("I don't think we can book a call", "I'd rather not book a call").  "Never mind, let's
+# book a call" and "I don't know, let's book a call" agree (the review of D2-HF2).
+_NEGATION_WINDOW_WORDS = 4
+_CLAUSE_BREAK = re.compile(r"[,;:\u2013\u2014]|\s-\s")
+
+
+def _negated(before: str) -> bool:
+    clause = _CLAUSE_BREAK.split(before)[-1]
+    window = " ".join(clause.split()[-_NEGATION_WINDOW_WORDS:])
+    return _NEGATION.search(window) is not None
 
 
 def _spoken_agreement_level(text: object) -> Level:
-    """The commitment the harness's own regexes read in ``text`` (a negation before it voids it)."""
+    """The commitment the harness's own regexes read in ``text`` (a negation just before it voids it)."""
     level = Level.NONE
     for sentence in split_sentences(text):
         for pattern, found in ((_SPOKEN_STRONG, Level.STRONG), *((p, Level.MEDIUM) for p in _SPOKEN_MEDIUM)):
             match = pattern.search(sentence)
-            if match is not None and _NEGATION.search(sentence[: match.start()]) is None:
+            if match is not None and not _negated(sentence[: match.start()]):
                 level = max(level, found)
     return level
 

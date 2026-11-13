@@ -367,8 +367,16 @@ def commitment_exclusion(record: Mapping[str, Any], m: Mapping[str, Any]) -> str
     Only a call with no commitment at all is excluded: its role-play ended on an end request, on the
     abuse hang-up (D-M032-3) or before the close window opened (13:00).  A call that reached a level
     always counts, and so does a full call that reached none (that is a miss, not an exclusion).
+
+    An end request or the abuse hang-up excludes a call only while the window was still shut: once
+    the role-play passed 13:00 the learner had its chance to commit (the advisor may have asked and
+    been stalled), so a late "let's stop here" (R1_LATE_END_REQUEST) leaves a miss counted.  Without
+    a role-play time the reason alone excludes, as before.
     """
     if m.get("commitment_level") is not None:
+        return None
+    seconds = m.get("roleplay_seconds")
+    if isinstance(seconds, (int, float)) and seconds >= COMMIT_PERMITTED_R_SEC:
         return None
     if m.get("stop_reason") == "end_request":
         return "end_request"
@@ -377,8 +385,7 @@ def commitment_exclusion(record: Mapping[str, Any], m: Mapping[str, Any]) -> str
         hangups = ((record.get("admin_log") or {}).get("endings") or {}).get("abuse_hangups")
     if isinstance(hangups, (int, float)) and hangups >= 1:
         return "abuse_hangup"
-    seconds = m.get("roleplay_seconds")
-    if isinstance(seconds, (int, float)) and seconds < COMMIT_PERMITTED_R_SEC:
+    if isinstance(seconds, (int, float)):
         return "ended_before_window"
     return None
 
