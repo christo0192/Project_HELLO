@@ -1115,21 +1115,45 @@ def anchor_after_foreign() -> AnchorSituation:
 # "3 lakh"), read on the text BEFORE ``canonical_amounts`` (which writes "fifteen thousand" as
 # "$15000").  A course-price frame must lead into it ("the fee is", "it costs", "the course is")
 # or follow it ("for the full course", "in total").
-_NUMBER_WORDS = (
+# Review D3R-4: a figure starts with a digit or a number word ("a" only as "a lakh" / "a crore"),
+# so "a rupee amount" is no figure; "and", "a" and "point" only continue one ("one and a half").
+_NUMBER_START = (
     r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
     r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
-    r"eighty|ninety|hundred|thousand|and|a|half|point)"
+    r"eighty|ninety|hundred|thousand|half)"
 )
-_FIGURE = r"(?:\d[\d,.]*|" + _NUMBER_WORDS + r")(?:[\s-]+(?:\d[\d,.]*|" + _NUMBER_WORDS + r"))*"
+_NUMBER_WORDS = r"(?:" + _NUMBER_START[3:-1] + r"|and|a|point)"
+_FIGURE = (
+    r"(?:\d[\d,.]*|" + _NUMBER_START + r"|a(?=\s+(?:lakhs?|lacs?|crores?)\b))"
+    r"(?:[\s-]+(?:\d[\d,.]*|" + _NUMBER_WORDS + r"))*"
+)
 _FOREIGN_FIGURE = re.compile(
     r"(?:(?:\u20b9|\brs\.?|\binr)\s*\d[\d,.]*(?:\s*(?:lakhs?|lacs?|crores?|k)\b)?"
     r"|\b" + _FIGURE + r"\s*(?:lakhs?|lacs?|crores?)\b(?:\s+(?:indian\s+)?(?:rupees?|inr))?"
     r"|\b" + _FIGURE + r"\s+(?:indian\s+)?(?:rupees?|inr)\b)",
     re.IGNORECASE,
 )
+# Review D3R-4: the price frame binds to the figure ("the fee is", "it costs", "the course is",
+# "you'll pay about"), with only hedges between them; "the course" thirty characters back ("after
+# the course you can earn 10 lakh") or a bare "pay" ("companies pay 12 lakh") frames nothing.
 _FOREIGN_FRAME_BEFORE = re.compile(
-    r"\b(?:fees?|price[sd]?|pricing|costs?|costing|course|program(?:me)?|pay|paying|total|"
-    r"comes? to|(?:it|that|this)(?:'s| is| was| would be| will be))\b[^.?!]{0,30}$",
+    r"(?:\b(?:fees?|price|pricing|costs?|costing|tuition|total)(?:'s)?"
+    r"|\b(?:course|program(?:me)?)(?:'s| is| was| costs?| comes to| would be| will be)"
+    r"|\b(?:it|that|this)(?:'s| is| was| would be| will be| costs?| comes to| would cost|"
+    r" will cost)"
+    r"|\b(?:you|you'll|you'd|you will|you would)(?: need to| have to| be)? (?:pay|paying|invest)"
+    r"|\bcomes? to)"
+    r"(?:\s+(?:is|are|was|of|would be|will be|comes to|come to|just|only|about|around|roughly|"
+    r"approximately|approx|nearly|like|for (?:the|this) (?:course|program(?:me)?)))*\s*$",
+    re.IGNORECASE,
+)
+# Review D3R-4: earnings ("earn 10 lakh", "20 lakh packages", "a salary of") are never the price.
+_EARNINGS_BEFORE = re.compile(
+    r"\b(?:earn\w*|salar\w*|packages?|ctc|income|make|makes|making|get paid|hike)\b[^.?!,]{0,25}$",
+    re.IGNORECASE,
+)
+_EARNINGS_AFTER = re.compile(
+    r"^\W*(?:packages?|salar\w*|ctc|per annum|p\.?a\.?\b|a year|per year|annually|jobs?|offers?)",
     re.IGNORECASE,
 )
 _FOREIGN_FRAME_AFTER = re.compile(
@@ -1152,9 +1176,10 @@ def foreign_price_in(text: object) -> str | None:
             before = lowered[: match.start()]
             if "$" in before or re.search(r"\bdollars?\b", before):
                 continue
-            if _FOREIGN_FRAME_BEFORE.search(before) or _FOREIGN_FRAME_AFTER.search(
-                lowered[match.end() :]
-            ):
+            after = lowered[match.end() :]
+            if _EARNINGS_BEFORE.search(before) or _EARNINGS_AFTER.search(after):
+                continue  # review D3R-4: a salary or a package, not the course price
+            if _FOREIGN_FRAME_BEFORE.search(before) or _FOREIGN_FRAME_AFTER.search(after):
                 return match.group(0).strip()
     return None
 

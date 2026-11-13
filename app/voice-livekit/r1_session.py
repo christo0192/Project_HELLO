@@ -249,7 +249,7 @@ from r1_roleplay import (
 )
 from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
 from r1_sarvam import current_speech_id
-from r1_text import normalize
+from r1_text import is_question_like, normalize, split_sentences
 from r1_tracker import explicit_end_request
 from r1_tts import (
     INTERVIEWER,
@@ -1015,25 +1015,46 @@ _WRAPUP_NEXT_RE = re.compile(
     r"today))\b|\bwhat(?:'s| is| are| will be| would be)? (?:the )?next (?:steps?|stage|round|process)\b|"
     r"\b(?:is there|are there) (?:a |any )?(?:next|another|second) (?:round|stage|step)s?\b|"
     r"\bis there anything (?:more|else) (?:to|in|after) (?:the|this) (?:interview|process)\b|"
-    r"\bwhen (?:will|would|do|can|should) i (?:hear|get|know|find out)\b|"
+    # Review D3R-3: "when ... I know / get" only about the outcome ("When would I know my shift
+    # timings?" and "When do I get paid?" are the model's to answer).
+    r"\bwhen (?:will|would|do|can|should|could) i (?:hear|find out)\b|"
+    r"\bwhen (?:will|would|do|can|should|could) i know(?=$|\s+(?:if|whether|anything|more|the "
+    r"(?:result|outcome|decision)|about (?:the |my )?(?:result|outcome|selection|decision|"
+    r"interview|application)))|"
+    r"\bwhen (?:will|would|do|can|should|could) i (?:get|receive) (?:the |my |an? |any )?(?:result|"
+    r"results|outcome|decision|update|response|answer|call ?back|offer letter)\b|"
     r"\bhow (?:long|soon) (?:until|before|till|will it be (?:until|before)) i (?:hear|know|get)\b|"
     r"\bhear back\b"
 )
+# Review D3R-3: a feedback ASK ("Can I get some feedback?", "Any feedback for me?"), never "I have
+# some feedback, the audio was laggy." or "Do advisors get feedback from managers?"; "my results /
+# rating" only as the outcome ("What's my score?"), never "How are my results measured?".
 _WRAPUP_FEEDBACK_RE = re.compile(
-    r"\bfeedback\b|\bhow (?:did|have) i (?:do|done|perform\w*)\b|\bhow did (?:i|it|that) go\b|"
+    r"\b(?:can|could|will|would|may|do|should) (?:i|you) (?:\w+ ){0,3}feedback\b|\bany feedback\b|"
+    r"\bfeedback (?:on|about|for|regarding) (?:me|my|today|the interview|this interview|how i)\b|"
+    r"\bhow (?:did|have) i (?:do|done|perform\w*)\b|\bhow did (?:i|it|that) go\b|"
     r"\bhow (?:was|is) my (?:performance|interview|role ?play)\b|"
     r"\b(?:will|would|am|could) i (?:be )?(?:selected|shortlisted|through|cleared?|passing|"
     r"qualif\w*|moving forward|getting (?:through|selected))\b|"
     r"\bdid i (?:pass|clear|qualify|do (?:well|okay|ok|good|alright|fine))\b|"
-    r"\bmy (?:score|scores|result|results|rating)\b"
+    r"\b(?:what's|what is|what was|how is|how was) my (?:score|scores|result|results|rating)\b"
+    r"(?! (?:measured|based|calculated|decided|tracked|judged|counted))|"
+    r"\b(?:can|could|will|would|do) (?:i|you) (?:know|get|see|share|tell me|give me) "
+    r"(?:my |the )?(?:score|scores|result|results|rating)\b"
 )
 
 
 # "What's the next step after joining, the training?" asks about the job, not about this interview.
 _WRAPUP_JOB_RE = re.compile(
     r"\b(?:after (?:i |we )?(?:join|joining|get hired|start)|once i (?:join|start)|onboarding|"
-    r"training|in the (?:role|job)|on the job|probation)\b"
+    r"training|in (?:the|this) (?:role(?! ?play)|job)|on the job|probation|"
+    # Review D3R-3: pay, incentives, shifts and the sales process are about the job.
+    r"sales (?:process|cycle|calls?|pipeline|targets?)|paid|pay ?day|salary|salaries|incentives?|"
+    r"commissions?|shifts?|timings?|start date|joining date|working (?:hours|days)|notice period|"
+    r"ctc|package|targets?)\b"
 )
+# Review D3R-3: "Can I ask something?" only asks leave; it is no other question in the turn.
+_ASK_LEAVE_RE = re.compile(r"^(?:so |okay |ok |and )?(?:can|could|may) i (?:ask|just ask)\b")
 
 
 def wrapup_ask_kind(text: str) -> str | None:
@@ -1041,11 +1062,27 @@ def wrapup_ask_kind(text: str) -> str | None:
     ask about feedback or the outcome, else None.  "When will I know if I'm selected?" asks what
     happens next (its true answer is the hiring team's review)."""
     folded = fold_speech(text)
-    if _WRAPUP_NEXT_RE.search(folded) is not None and _WRAPUP_JOB_RE.search(folded) is None:
-        return WRAPUP_NEXT
-    if _WRAPUP_FEEDBACK_RE.search(folded) is not None:
-        return WRAPUP_FEEDBACK
-    return None
+    if _WRAPUP_JOB_RE.search(folded) is not None:
+        return None  # review D3R-3: a question about the job is the model's, feedback too
+    if _WRAPUP_NEXT_RE.search(folded) is not None:
+        kind = WRAPUP_NEXT
+    elif _WRAPUP_FEEDBACK_RE.search(folded) is not None:
+        kind = WRAPUP_FEEDBACK
+    else:
+        return None
+    for sentence in split_sentences(text):
+        part = fold_speech(sentence)
+        if (
+            is_question_like(sentence)
+            and _WRAPUP_NEXT_RE.search(part) is None
+            and _WRAPUP_FEEDBACK_RE.search(part) is None
+            and _ASK_LEAVE_RE.match(part) is None
+            and not is_affirmation_only(sentence)
+        ):
+            # Review D3R-3: "What's the salary? And what happens next?" asks something else too: the
+            # model answers the whole turn, so no part of it is dropped.
+            return None
+    return kind
 
 
 # D3-WRAP1: the refusals for a feedback ask, in order; none is said twice in a session.
@@ -6590,10 +6627,21 @@ class R1Interview:
                 return stop
             scripted = self._wrapup_scripted_kind(text)
             if scripted == WRAPUP_NEXT:
-                # D3-WRAP1: the one true answer, then the close that does not name the team again.
+                # D3-WRAP1: the one true answer; the close will not name the team again.
                 await self.say("L-WRAP-NEXT")
                 self._close_short = True
-                return await self._end_wrapup()
+                questions += 1
+                if (
+                    questions >= WRAPUP_QUESTION_LIMIT
+                    or self._wrap_more_used
+                    or self.machine.remaining_wrapup_seconds() < WRAP_MORE_MIN_SECONDS
+                ):
+                    return await self._end_wrapup()
+                # Review D3R-3: the wrap-up goes on (one invitation), so a question about the role
+                # still gets its answer and another ask; "No, thanks." or silence closes it.
+                self._wrap_more_used = True
+                await self.say("L-WRAP-MORE")
+                continue
             if scripted == WRAPUP_FEEDBACK:
                 if self._wrapup_refusals >= len(WRAPUP_REFUSALS):
                     return await self._end_wrapup()  # never the same refusal twice: the close

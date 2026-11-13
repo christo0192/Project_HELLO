@@ -176,7 +176,9 @@ import r1_world
 # the rupee anchor, the one-statement last-point brief and the new notes join the manifest
 # (``r1_content._diag3_repairs`` and the script lines) beside the texts they replace while their
 # flags are on.  No graded meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "49975acdecacca878df8c1235219ac9bd1d0943ec7fd4540799edcba021df5b4"
+# After its review (still revision 29, unreleased): L-EXIT-WRAP opens with "Let's stop the role-play
+# here" (review D3R-8).  No graded meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "1fefd8c9aed07684a31851d1427934e85921cda151a4cfea3e153d9728541c92"
 
 CONTENT_MODULES = (
     "r1_text",

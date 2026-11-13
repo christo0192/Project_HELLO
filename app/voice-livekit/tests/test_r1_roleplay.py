@@ -13538,13 +13538,16 @@ class FarewellExitTests(unittest.TestCase):
             self.assertFalse(s.eng.exit_farewell)
             self.assertIsNone(s.eng.exit_bye)
 
-    def test_the_early_close_aside_follows_her_bye(self):
+    def test_the_early_close_aside_holds_her_bye_for_the_stop(self):
+        # Review D3R-8: her bye is held until the stop is taken (EarlyCloseByeReviewTests).
         s = Session(engine())
         s.say(OPENER, 20)
         deliver(s.eng, *ALL_MOVES, r=200)
         plan = s.say("Okay, thank you so much for your time, take care, bye.", 700)
         if plan.line_id is not None and plan.line_id.startswith("L-ASIDE-EARLY-CLOSE"):
-            self.assertIn(plan.prelude_line, r1_roleplay.LEARNER_BYE_LINES)
+            self.assertIsNone(plan.prelude_line)
+            if not s.eng._last_reply_closer:
+                self.assertIn(s.eng._early_close_bye, r1_roleplay.LEARNER_BYE_LINES)
             if plan.line_id == "L-ASIDE-EARLY-CLOSE-2":
                 self.assertIn("Shall we stop the role-play there", plan.scripted_text)
 
@@ -13571,6 +13574,269 @@ class FigureMemoryEngineTests(unittest.TestCase):
     def test_flag_off_is_the_release_before(self):
         self.assertFalse(self.run_repeat(R1_FIGURE_MEMORY="0"))
 
+
+class DigGateReviewTests(unittest.TestCase):
+    """Review D3R-1 (R1_DIG_GATE_V2): a real dig keeps its deep layer even when it also says
+    "sign up", "I'll send" or ends on a tag; only a turn that is all closing check digs for none."""
+
+    REAL_DIGS = (
+        "What's stopping you from signing up today?",
+        "What would make you ready to join?",
+        "Is that okay if I ask how you plan to fund it? What's your budget like?",
+        "I'll send the brochure, but first, what's really holding you back?",
+        "What's your main worry about the money, right?",
+        "How do you feel about the cost, okay?",
+    )
+    CLOSING_CHECKS = (
+        "Have a look with your husband and reach out whenever you're ready. Sound good?",
+        "Shall I book it for Monday?",
+        "I'll send everything over tonight. Does that work?",
+        "Are you ready to sign up today?",
+        "What time works for a call tomorrow? I'll send the invite.",
+        "I'll email the brochure. How does that sound?",
+    )
+
+    def gate_with_needs_waiting(self):
+        from r1_tracker import NeedState
+
+        gate = engine().tracker.gate
+        for topic in ("H1", "H2", "H3"):
+            record = gate._records[topic]
+            record.state = NeedState.UNLOCKED
+            record.released_turn = 1
+        gate.dig_gate_v2 = True
+        return gate
+
+    def test_a_real_dig_is_a_dig(self):
+        for text in self.REAL_DIGS:
+            with self.subTest(text=text):
+                gate = self.gate_with_needs_waiting()
+                update = gate.observe_candidate_turn(text, 9)
+                self.assertFalse(update.not_a_dig)
+                self.assertNotEqual(gate.deep_due(update), ())
+
+    def test_an_explicit_money_probe_gets_the_money_layer(self):
+        gate = self.gate_with_needs_waiting()
+        text = "Is that okay if I ask how you plan to fund it? What's your budget like?"
+        update = gate.observe_candidate_turn(text, 9)
+        self.assertIn("H3", gate.deep_due(update))
+
+    def test_a_turn_that_is_all_closing_check_still_digs_for_nothing(self):
+        for text in self.CLOSING_CHECKS:
+            with self.subTest(text=text):
+                gate = self.gate_with_needs_waiting()
+                update = gate.observe_candidate_turn(text, 9)
+                self.assertTrue(update.not_a_dig)
+                self.assertEqual(gate.deep_due(update), ())
+
+
+class FarewellExitReviewTests(unittest.TestCase):
+    """Review D3R-2 (R1_FAREWELL_EXIT_V2): a rescue after her sign-off is no mutual goodbye."""
+
+    RESCUES = (
+        "Wait, before you go, can I ask one more thing before we say goodbye?",
+        "Wait, wait, don't say bye!",
+        "Don't hang up yet, one more offer before you say bye.",
+        "Hold on, not yet, bye is too soon.",
+    )
+
+    def test_a_rescue_never_ends_on_a_farewell(self):
+        for text in self.RESCUES:
+            with self.subTest(text=text):
+                self.assertFalse(r1_roleplay.ends_on_farewell(text))
+        for text in (
+            "Thanks, you too. I'll send the invite. Good night.",
+            "Okay, talk soon!",
+            "Wait, one more thing, I'll send the brochure. Okay, bye.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_roleplay.ends_on_farewell(text))
+
+    def test_a_rescue_after_her_sign_off_reopens_the_call(self):
+        for text in self.RESCUES:
+            with self.subTest(text=text):
+                eng = done_session(r=700).eng
+                eng._last_reply_signoff = True
+                eng._enter_closing(r1_roleplay.CLOSING_WINDING)
+                reasons: list[str] = []
+                self.assertFalse(eng._read_close(text, False, reasons))
+                self.assertNotIn("mutual_goodbye", reasons)
+                self.assertEqual(eng._closing, r1_roleplay.CLOSING_OPEN)
+
+    def test_a_goodbye_after_her_sign_off_is_still_mutual(self):
+        eng = done_session(r=700).eng
+        eng._last_reply_signoff = True
+        reasons: list[str] = []
+        self.assertTrue(
+            eng._read_close("Thanks, you too. I'll send the invite. Good night.", False, reasons)
+        )
+        self.assertIn("mutual_goodbye", reasons)
+
+
+class ForeignPriceReviewTests(unittest.TestCase):
+    """Review D3R-4 (R1_FOREIGN_PRICE): a salary or package in lakhs is no course price."""
+
+    def test_a_salary_or_package_is_no_price(self):
+        from r1_negotiation import foreign_price_in
+
+        for text in (
+            "After the course you can earn 10 lakh a year.",
+            "The program has helped people get 20 lakh packages.",
+            "Companies pay 12 lakh for data scientists.",
+            "It's a rupee amount, not dollars.",
+            "It's like 20 lakh packages in the market now.",
+            "Our learners make about 15 lakh after the course.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(foreign_price_in(text))
+
+    def test_a_course_price_in_rupees_is_still_read(self):
+        from r1_negotiation import foreign_price_in
+
+        for text, want in (
+            ("The total fee is 3 lakh rupees.", "3 lakh rupees"),
+            ("You'll pay about 2 lakh for the course.", "2 lakh"),
+            ("The course costs one and a half lakh.", "one and a half lakh"),
+            ("It's around a lakh for the full program.", "a lakh"),
+            ("The price is ₹1,20,000 for the course.", "₹1,20,000"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(foreign_price_in(text), want)
+
+    def test_a_salary_pitch_leaves_the_price_unnamed(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("After the course you can earn 10 lakh a year, honestly.", 40)
+        self.assertFalse(s.eng._price_named())
+        self.assertFalse(s.eng.guard_context(free_reply=True).price_heard)
+
+
+class IntentTailTrimReviewTests(unittest.TestCase):
+    """Review D3R-5 (R1_INTENT_TAIL_V4): the trim keeps the tail's ask."""
+
+    MARKERS = IntentTailTrimTests.MARKERS
+
+    def test_the_anchor_tail_keeps_its_request(self):
+        from r1_negotiation import anchor_after_foreign
+        from r1_roleplay import _trim_tail
+
+        tail = anchor_after_foreign().variants[0]
+        spoken = "Rupees? I was thinking in dollars, I think the site said $9,000."
+        out = _trim_tail(tail, spoken, self.MARKERS)
+        self.assertIn("$7,000", out)
+        self.assertTrue(out.rstrip().endswith("Could you do that?"), out)
+
+    def test_only_sentences_said_again_go(self):
+        from r1_roleplay import _trim_tail
+
+        tail = (
+            "I thought I saw about $9,000 on the website. Someone told me they paid $7,000. "
+            "Is that something you could match?"
+        )
+        spoken = "I thought the website showed about $9,000."
+        out = _trim_tail(tail, spoken, self.MARKERS)
+        self.assertNotIn("website", out)
+        self.assertIn("Is that something you could match?", out)
+
+
+class FigureMemoryReviewTests(unittest.TestCase):
+    """Review D3R-6 (R1_FIGURE_MEMORY): taking up his $7,000 offer is no second comparison."""
+
+    def settled_session(self):
+        s = Session(engine(), reply="Okay, $7,000 works for me.")
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)
+        deliver(s.eng, "F1-ANCHOR", "F1-COUNTER", r=60)
+        s.eng._anchor_comments = 1  # she compared once already
+        s.eng._advisor_amounts.add(7000)
+        s.eng._reacted_figures.add(7000)
+        return s
+
+    def test_his_offer_of_the_anchor_unsettles_the_memory(self):
+        from r1_prompts import FIGURE_REACTED_NOTE
+
+        s = self.settled_session()
+        plan = s.say("Okay, I spoke to my manager, I can do $7,000.", 600)
+        self.assertFalse(s.eng.guard_context(free_reply=True).anchor_settled)
+        self.assertNotIn(FIGURE_REACTED_NOTE.split("{amount}")[0], plan.reminder)
+        if plan.mode is TurnMode.LLM_REPLY:
+            self.assertIn("$7,000 works for me", s.spoken[-1])
+
+    def test_a_comparison_on_another_figure_is_still_dropped(self):
+        s = self.settled_session()
+        s.say("The best I can do is $8,000.", 600)
+        self.assertTrue(s.eng.guard_context(free_reply=True).anchor_settled)
+
+
+class NoPriceHeardReviewTests(unittest.TestCase):
+    """Review D3R-7 (R1_FOREIGN_PRICE): only "nobody told me the price" itself goes."""
+
+    def test_unrelated_sentences_stay(self):
+        context = d3_ctx(free_reply=True, price_heard=True)
+        for text in (
+            "I haven't heard back from my husband about the cost.",
+            "I still don't know what the monthly fee would cost.",
+            "I haven't got a clear sense of whether the fee is worth it.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, context).text, text)
+
+    def test_the_contradiction_still_goes(self):
+        context = d3_ctx(free_reply=True, price_heard=True)
+        for text in (
+            "I haven't heard what it costs.",
+            "I haven't been told the price yet.",
+            "I still don't know how much it costs.",
+        ):
+            with self.subTest(text=text):
+                out = guard_text(f"{text} Is there a payment plan?", context).text
+                self.assertIn("payment plan", out)
+                self.assertNotIn(text, out)
+
+
+class EarlyCloseByeReviewTests(unittest.TestCase):
+    """Review D3R-8 (R1_FAREWELL_EXIT_V2): her bye before an early stop is said only once the
+    candidate accepts the stop, so a "keep going" never resumes a call she has said bye to."""
+
+    BYE = "Okay, thank you so much for your time, take care, bye."
+
+    def early_close(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        deliver(s.eng, *ALL_MOVES, r=200)
+        s.reply = "Sure, that works for me."
+        plan = s.say(self.BYE, 700)
+        self.assertEqual(plan.line_id, "L-ASIDE-EARLY-CLOSE-2")
+        return s, plan
+
+    def test_no_bye_before_the_question(self):
+        _, plan = self.early_close()
+        self.assertIsNone(plan.prelude_line)
+
+    def test_a_yes_carries_her_bye_into_the_exit(self):
+        s, _ = self.early_close()
+        plan = s.say("Yes, let's stop the role-play there.", 710)
+        self.assertIs(plan.mode, TurnMode.EXIT)
+        self.assertIn(s.eng.exit_bye, r1_roleplay.LEARNER_BYE_LINES)
+        self.assertTrue(s.eng.exit_farewell)
+
+    def test_a_no_resumes_with_no_bye(self):
+        s, _ = self.early_close()
+        plan = s.say("No, let's keep going.", 710)
+        self.assertEqual(plan.line_id, "L-ASIDE-WRAP-RESUME")
+        self.assertIsNone(s.eng.exit_bye)
+        self.assertFalse(s.eng.exit_farewell)
+
+    def test_flag_off_is_the_release_before(self):
+        with d3_flags(R1_FAREWELL_EXIT_V2="0"):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            deliver(s.eng, *ALL_MOVES, r=200)
+            plan = s.say(self.BYE, 700)
+            self.assertEqual(plan.line_id, "L-ASIDE-EARLY-CLOSE")
+            self.assertIsNone(plan.prelude_line)
+            s.say("Yes, let's stop the role-play there.", 710)
+            self.assertIsNone(s.eng.exit_bye)
 
 if __name__ == "__main__":
     unittest.main()

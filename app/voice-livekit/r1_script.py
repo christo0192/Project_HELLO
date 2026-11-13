@@ -162,7 +162,7 @@ LINES: dict[str, str] = {
     "L-LEARNER-BYE-2": "Thanks, bye.",
     "L-LEARNER-BYE-3": "Okay, bye for now.",
     "L-EXIT-WRAP": (
-        "Let's pause the role-play here. This is Christy again, thank you, that's the end of the "
+        "Let's stop the role-play here. This is Christy again, thank you, that's the end of the "
         "role-play. Before we finish, do you have any questions about the role or the next steps?"
     ),
     # D3-ASIDE1 (R1_END_ASIDE_V2): a yes/no question in place of L-ASIDE-END's magic phrase

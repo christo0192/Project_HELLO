@@ -3519,7 +3519,7 @@ class TestRunFlow(R1TestCase):
         tail = ["L-LEARNER-BYE-1", "L-EXIT-WRAP", "L-CLOSE"]
         self.assertEqual(spoken[-3:], [self.spoken_line(name) for name in tail])
         self.assertNotIn(self.spoken_line("L-WRAP"), spoken)
-        self.assertTrue(self.spoken_line("L-EXIT-WRAP").startswith("Let's pause the role-play here."))
+        self.assertTrue(self.spoken_line("L-EXIT-WRAP").startswith("Let's stop the role-play here."))
 
     async def test_an_explicit_first_request_ends_the_roleplay_with_no_question(self) -> None:
         # Owner test 1eb18cd4, 81: "Let's end the interview." names the interview, so it is taken
@@ -9455,8 +9455,16 @@ class TestWrapupNextStepsScripted(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(task, 5.0))
 
     async def test_whats_next_gets_the_scripted_answer_and_the_short_close(self) -> None:
-        await self.run_wrapup_with("Okay, and what happens next?")
+        # Review D3R-3: the wrap-up goes on after the answer (one invitation), so the candidate may
+        # still ask about the role; "No, that's all, thanks." closes it.
+        await self.run_wrapup_with("Okay, and what happens next?", "No, that's all, thanks.")
         self.assertIn(self.spoken_line("L-WRAP-NEXT"), self.session.spoken)
+        self.assertIn(self.spoken_line("L-WRAP-MORE"), self.session.spoken)
+        self.assertLess(
+            self.session.spoken.index(self.spoken_line("L-WRAP-NEXT")),
+            self.session.spoken.index(self.spoken_line("L-WRAP-MORE")),
+        )
+        self.assertTrue(self.interview._close_short)
         self.assertTrue(self.interview._close_short)
         self.assertEqual(self.session.generated, [])
         self.assertEqual(self.interview._wrapup_counts()["wrapup_next_scripted"], 1)
@@ -9491,3 +9499,41 @@ class TestWrapupNextStepsScripted(R1TestCase):
         self.assertEqual(kind("Can I get some feedback?"), r1_session.WRAPUP_FEEDBACK)
         self.assertIsNone(kind("What's the next step after joining, the training?"))
         self.assertIsNone(kind("What are the shift timings?"))
+
+    async def test_role_questions_are_not_read_as_next_steps_or_feedback(self) -> None:
+        # Review D3R-3: questions about the job are the model's to answer.
+        kind = r1_session.wrapup_ask_kind
+        for text in (
+            "When do I get paid?",
+            "When would I know my shift timings?",
+            "When would I get my first incentive?",
+            "What's the next step in the sales process here?",
+            "When do I get to start if selected?",
+            "What's the salary? And what happens next?",
+            "Do advisors get feedback from managers in this role?",
+            "How are my results measured?",
+            "What is my rating based on in the job?",
+            "I have some feedback, the audio was laggy.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(kind(text))
+        for text, want in (
+            ("When will I know if I'm selected?", r1_session.WRAPUP_NEXT),
+            ("When would I get the result?", r1_session.WRAPUP_NEXT),
+            ("When do I find out?", r1_session.WRAPUP_NEXT),
+            ("What happens next? When will I hear back?", r1_session.WRAPUP_NEXT),
+            ("How did I do?", r1_session.WRAPUP_FEEDBACK),
+            ("Could you give me feedback on my interview?", r1_session.WRAPUP_FEEDBACK),
+            ("Is there any feedback for me?", r1_session.WRAPUP_FEEDBACK),
+            ("What's my score?", r1_session.WRAPUP_FEEDBACK),
+            ("Will I be selected?", r1_session.WRAPUP_FEEDBACK),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(kind(text), want)
+
+    async def test_the_answer_closes_when_no_question_is_left(self) -> None:
+        # Review D3R-3: with the question limit reached the close follows the answer at once.
+        await self.run_wrapup_with("How did I do in the role-play?", "And what happens next?")
+        self.assertIn(self.spoken_line("L-WRAP-NEXT"), self.session.spoken)
+        self.assertNotIn(self.spoken_line("L-WRAP-MORE"), self.session.spoken)
+        self.assertTrue(self.interview._close_short)

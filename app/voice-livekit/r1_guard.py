@@ -487,10 +487,17 @@ _INCLUDED_QUESTION = re.compile(
 _NO_PRICE_HEARD = re.compile(
     r"\b(?:nobody|no one|no-one)(?:'s| has| had)? (?:actually |really |even |yet )?"
     r"(?:told|given|said|mentioned|quoted)\b[^.?!]{0,30}\b(?:price|cost|figure|fee|number)\b|"
-    r"\b(?:haven'?t|have not) (?:actually |really |yet )?"
-    r"(?:heard|been told|gotten|got|been given)\b[^.?!]{0,40}"
-    r"\b(?:price|cost|costs|fee|figure)\b|\bstill (?:don'?t|do not) know (?:what|how much)\b"
-    r"[^.?!]{0,30}\b(?:costs?|price|fee)\b",
+    # Review D3R-7: "heard / been told" binds to its object ("haven't heard what it costs"), never
+    # "heard back from my husband about the cost" or "what the monthly fee would cost".
+    r"\b(?:haven'?t|have not) (?:actually |really |yet |even )?"
+    r"(?:heard|been told|gotten|got|been given)(?! back\b) (?:about |of )?"
+    r"(?:the |a |any |an actual |a real )?(?:price|cost|fee|figure|number)\b|"
+    r"\b(?:haven'?t|have not) (?:actually |really |yet |even )?(?:heard|been told)(?! back\b) "
+    r"(?:what (?:it|the course|this|the program(?:me)?) (?:costs?|would cost|will cost|comes to)|"
+    r"how much (?:it|the course|this|the program(?:me)?) (?:costs?|is|would cost|will cost))\b|"
+    r"\bstill (?:don'?t|do not) know (?:what (?:it|the course|this|the program(?:me)?) "
+    r"(?:costs?|would cost|will cost|comes to)|how much (?:it|the course|this|the program(?:me)?) "
+    r"(?:costs?|is|would cost|will cost)|the (?:price|cost|fee))\b",
     re.IGNORECASE,
 )
 # D3-LRN-ACK1 (R1_EASED_ACK_V2): the stock thanks for easing off.

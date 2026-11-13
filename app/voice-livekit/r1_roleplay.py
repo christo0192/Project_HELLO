@@ -676,10 +676,29 @@ _FAREWELL_END = re.compile(
 )
 
 
+# Review D3R-2: a last sentence that holds her back ("Wait, wait, don't say bye!", "one more offer
+# before you say bye") is a rescue, never a goodbye.
+_FAREWELL_RESCUE = re.compile(
+    r"\b(?:don'?t|do not|wait|hold on|hang on|not yet|before (?:we|you|i)|one more|one last|"
+    r"another (?:thing|question|offer)|too soon|stay)\b",
+    re.IGNORECASE,
+)
+
+
 def ends_on_farewell(text: object) -> bool:
-    """D3-EXIT1: the last sentence of the advisor's turn takes leave ("..., good night.")."""
+    """D3-EXIT1: the last sentence of the advisor's turn takes leave ("..., good night.").
+
+    Review D3R-2: not a question and not a rescue ("Wait, before you go, can I ask one more thing
+    before we say goodbye?"): those keep the call going."""
     sentences = split_sentences(str(text or ""))
-    return bool(sentences) and _FAREWELL_END.search(fold(sentences[-1])) is not None
+    if not sentences:
+        return False
+    last = fold(sentences[-1])
+    return (
+        _FAREWELL_END.search(last) is not None
+        and "?" not in last
+        and _FAREWELL_RESCUE.search(last) is None
+    )
 HANGUP_ASIDE_LINE = "L-ASIDE-HANGUP"
 HANGUP_LIMIT = 2
 # M032 SWEEP-33 (R1_FLOOR_YIELD): at most this many scripted yields a session; the pairs rotate.
@@ -1527,6 +1546,10 @@ class RolePlayEngine:
         # notes that kept her off them (a count).
         self._reacted_figures: set[int] = set()
         self._figure_memory_notes = 0
+        # Review D3R-6: the advisor named the $7,000 (or less) this turn.
+        self._anchor_named_now = False
+        # Review D3R-8: her goodbye held back until the early-close stop is taken (a line id).
+        self._early_close_bye: str | None = None
         # D3-LRN-ACK1 (R1_EASED_ACK_V2): the turn of her last pressure worry.
         self._pressure_turn: int | None = None
         # D3-LRN-FIG1 (R1_FIGURE_NOT_MINE): challenges of a length she never said (a count).
@@ -1891,7 +1914,9 @@ class RolePlayEngine:
             figure_now=self._figure_turn == self.turn,
             figure_memory=flag_on(FLAG_FIGURE_MEMORY),
             anchor_settled=(
-                self.scheduler.is_delivered(F1_ANCHOR) and self.scheduler.is_delivered(F1_COUNTER)
+                self.scheduler.is_delivered(F1_ANCHOR)
+                and self.scheduler.is_delivered(F1_COUNTER)
+                and not self._price_met_or_offered()
             ),
             anchor_comments=self._anchor_comments,
             included_recent=(
@@ -2319,10 +2344,12 @@ class RolePlayEngine:
         self._advisor_hours.update(hours_said(candidate_text))
         if amounts_now or foreign is not None:
             self._figure_turn = turn  # D3: he put a figure on the table this turn
+        self._anchor_named_now = any(amount <= ANCHOR_USD for amount in amounts_now)
         if (
             amounts_now
             and flag_on(FLAG_FIGURE_MEMORY)
             and set(amounts_now) <= self._reacted_figures
+            and not self._price_met_or_offered()
         ):
             # D3-LRN-MONEY1: he said again a figure she already reacted to, and nothing new.
             amount = format_usd(max(amounts_now))
@@ -3294,6 +3321,14 @@ class RolePlayEngine:
             return False
         return flag_on(FLAG_PRICE_ASKED_ONCE)
 
+    def _price_met_or_offered(self) -> bool:
+        """Review D3R-6: the advisor named the $7,000 (or less) this turn, or his best offer
+        already meets it: her taking it up ("If you can do $7,000, I'm in.") is no comparison to
+        drop, and a note that she already reacted to the figure would contradict the price-met
+        note."""
+        best = self.negotiation.best_offer_usd
+        return self._anchor_named_now or (best is not None and best <= ANCHOR_USD)
+
     def _abuse_hangs_up(self, text: str) -> bool:
         """S3.4: ``text`` is abuse aimed at her that the hang-up below would answer now."""
         return (
@@ -3441,9 +3476,12 @@ class RolePlayEngine:
             }
         )
         plan = self._wrap_line_plan(line_id, [*reasons, "early_close:offer"])
+        self._early_close_bye = None
         if farewell_v2 and not self._last_reply_closer:
-            # D3-ASIDE1 (c): she says a short goodbye back before Christy steps in.
-            plan = replace(plan, prelude_line=self._learner_bye())
+            # D3-ASIDE1 (c), review D3R-8: her short goodbye back is said only once the candidate
+            # takes the stop (`_wrap_answer_plan`), so a "keep going" never resumes a call she
+            # has already said bye to.
+            self._early_close_bye = self._learner_bye()
         return plan
 
     def _hangup_plan(self, r_sec: float, turn_index: int | None, reasons: list[str]) -> TurnPlan:
@@ -4449,6 +4487,11 @@ class RolePlayEngine:
             reasons = ["wrap_offer_accepted"]
             if early:
                 reasons.append("early_close_accepted")
+                if self._early_close_bye is not None and flag_on(FLAG_FAREWELL_EXIT_V2):
+                    # Review D3R-8: her bye, then the one exit and wrap-up line.
+                    self.exit_farewell = True
+                    self.exit_bye = self._early_close_bye
+                    reasons.append("learner_bye")
             elif trigger == TRIGGER_ABUSE:
                 reasons.append("abuse_hangup_accepted")
             if end_intent == "end" and not accepts_wrap_offer(text):
@@ -7006,8 +7049,9 @@ def _trim_tail(tail: str, spoken_so_far: str, markers: tuple[tuple[str, ...], ..
 
     A sentence is dropped only when the rest of the tail, with her reply, still proves the move's
     unchanged markers (M04: "... the website seemed to show around $9,000 ... Wait, I thought I saw
-    about $9,000 on the website, not $12,000." said the check twice).  Then, from the end, every
-    sentence the markers do not need goes too, so only the missing part is added.
+    about $9,000 on the website, not $12,000." said the check twice).  Review D3R-5: nothing else
+    goes (the anchor's "Could you do that?" is needed though no marker asks for it), and the tail's
+    closing question is never dropped.
     """
     sentences = split_sentences(tail)
     if len(sentences) < 2 or not markers:
@@ -7017,17 +7061,19 @@ def _trim_tail(tail: str, spoken_so_far: str, markers: tuple[tuple[str, ...], ..
     def proves(kept: list[str]) -> bool:
         return markers_match(markers, f"{spoken_so_far} {' '.join(kept)}")
 
+    # Review D3R-5: the tail's closing question is its ask ("Could you do that?"); it always stays.
+    ask = sentences[-1] if "?" in sentences[-1] else None
     kept = list(sentences)
     for sentence in sentences:
+        if sentence is ask:
+            continue
         trial = [item for item in kept if item is not sentence]
         if trial and _says_again(sentence, spoken) and proves(trial):
             kept = trial
     if len(kept) == len(sentences):
         return tail
-    for sentence in reversed(list(kept)):
-        trial = [item for item in kept if item is not sentence]
-        if trial and proves(trial):
-            kept = trial
+    # Review D3R-5: only the sentences said again go; the rest of the tail (its ask with it) stays,
+    # since the markers alone do not carry the brief's meaning.
     return " ".join(kept)
 
 

@@ -160,6 +160,35 @@ _NOT_A_DIG = re.compile(
     r"(?:^|[,;.]\s*)(?:okay|ok|alright|right|deal|fair enough)\s*\?",
     re.IGNORECASE,
 )
+# Review D3R-1: an open question at the start of a clause ("What's stopping you from signing up?",
+# "I'll send the brochure, but first, what's really holding you back?", "How do you feel about the
+# cost, okay?") is a dig, whatever closing words the turn also has.  Only a turn whose questions
+# are all closing checks digs for nothing.  "What time works", "how does that sound", "how about"
+# and a bare "what do you think?" are the closing check itself.
+_OPEN_DIG_START = re.compile(
+    r"(?:^|[,;:.?!]\s*|\b(?:but|and|so|now|first|then|also|just|okay|ok|actually)\s+)"
+    r"(?P<wh>what|why|how|which|tell me|walk me|help me understand)\b",
+    re.IGNORECASE,
+)
+_OPEN_DIG_EXEMPT = re.compile(
+    r"(?:what time\b|how (?:does|did|would|do) (?:that|this|it) (?:sound|work|suit)|how about\b|"
+    r"what do you (?:think|say)(?=\s*(?:[?.!,]|$)))",
+    re.IGNORECASE,
+)
+
+
+def is_closing_check(text: object) -> bool:
+    """D3-LRN-DUMP1 and review D3R-1: the turn is a closing check, a confirmation, a promise to send
+    something or a commitment ask, and asks nothing open beside it."""
+    folded = fold(text)
+    if _NOT_A_DIG.search(folded) is None:
+        return False
+    for match in _OPEN_DIG_START.finditer(folded):
+        if _OPEN_DIG_EXEMPT.match(folded, match.start("wh")) is None:
+            return False
+    return True
+
+
 # A question about the return or result she wants is about her goal (H1), never her money (H3).
 _GOAL_DIG = re.compile(
     r"\b(?:what (?:kind of |sort of )?(?:return|roi|outcome|results?)\b|"
@@ -220,7 +249,7 @@ class DisclosureGate:
             probed=tuple(topic for topic in H_TOPICS if topic in probes),
             followup=generic,
             open_question=question and asks_open_question(text),
-            not_a_dig=self.dig_gate_v2 and _NOT_A_DIG.search(fold(text)) is not None,
+            not_a_dig=self.dig_gate_v2 and is_closing_check(text),
             goal_dig=self.dig_gate_v2 and _GOAL_DIG.search(fold(text)) is not None,
         )
 

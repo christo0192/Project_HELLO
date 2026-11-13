@@ -223,6 +223,8 @@ import r1_world
 #    the last-point brief and the new notes join the manifest (``_diag3_repairs``) beside the texts
 #    they replace while their flags are on.  No graded marker, must-say, meaning or deadline
 #    changed; with every flag off the lines, reminders and readers are the release before.
+#    After its review (still 29, unreleased): L-EXIT-WRAP opens with "Let's stop the role-play
+#    here" (D3R-8).
 CONTENT_REVISION = 29
 
 
