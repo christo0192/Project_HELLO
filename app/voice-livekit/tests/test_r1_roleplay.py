@@ -12602,7 +12602,9 @@ class FiguresSaidNoteTests(unittest.TestCase):
     def test_the_note_after_she_said_the_website_price(self):
         eng = engine()
         self.assertTrue(eng._probe_first)
+        eng._price_talk = True
         self.assertEqual(eng._figures_said_note(), "")
+        eng._website_said = True
         eng._figures_said.add(9000)
         note = eng._figures_said_note()
         self.assertIn("$9,000 on the website", note)
@@ -12611,8 +12613,89 @@ class FiguresSaidNoteTests(unittest.TestCase):
     def test_flag_off_is_the_release_before(self):
         with mock.patch.dict(r1_roleplay.os.environ, {"R1_PRICE_STORY": "0"}):
             eng = engine()
+            eng._website_said = True
             eng._figures_said.add(9000)
             self.assertEqual(eng._figures_said_note(), "")
+
+    def test_the_advisors_price_echoed_is_no_website_claim(self):
+        """Review of MF4: the advisor stated $9,000 and her anchor repeated it, so she never claims
+        the website for it or denies he told her."""
+        s = Session(
+            engine(),
+            reply="$9,000 is more than I planned to spend. I heard someone got it for around $7,000.",
+        )
+        _plan, r = to_f1(s)
+        s.say("The course is $9,000.", r)
+        self.assertIn(9000, s.eng._figures_said)
+        self.assertFalse(s.eng._website_said)
+        s.reply = "Okay."
+        plan = s.say("The price is $9,000, and the mentors are included.", r + 20)
+        self.assertNotIn("on the website", plan.reminder)
+
+    def test_the_note_only_when_the_price_comes_up(self):
+        """Review of MF4 (D-M032-7): the figures are given back only on a turn about the price."""
+        eng = engine()
+        eng._website_said = True
+        eng._price_talk = False
+        self.assertEqual(eng._figures_said_note(), "")
+        eng._price_talk = True
+        self.assertIn("$9,000 on the website", eng._figures_said_note())
+        eng._price_talk = False
+        self.assertIsNotNone(r1_roleplay._FIGURE_SOURCE_QUESTION.search("Where did you see that?"))
+        eng._figure_source_asked = True
+        self.assertIn("I saw it on the website", eng._figures_said_note())
+
+
+class LowOfferReaderThroughTheEngineTests(unittest.TestCase):
+    """Review of MF2 (R1_LOW_OFFER_READER): a discount share once a price is on the table is never
+    read as a $10 course price.  Synthetic advisor text."""
+
+    def test_ten_percent_off_is_no_ten_dollar_price(self):
+        s = Session(engine(), reply="Hmm, okay.")
+        _plan, r = to_f1(s)
+        s.say("The course is $9,000.", r)
+        plan = s.say("The best I can do is 10% off.", r + 20)
+        self.assertNotEqual(s.eng._latest_price_usd, 10)
+        self.assertNotEqual(s.eng._last_price_kind, r1_roleplay.IMPLAUSIBLE_LOW)
+        self.assertEqual(s.eng.negotiation.low_mentions, [])
+        self.assertNotIn("$10,", plan.reminder)
+        self.assertNotIn("$10 ", plan.reminder)
+
+
+class CompletionTailReviewTests(unittest.TestCase):
+    """Review of HF3 and U1 (R1_INTENT_TAIL_V3).  Synthetic text."""
+
+    def test_an_unrelated_question_gets_no_counter_completion(self):
+        import r1_negotiation
+
+        eng, plans = CompletionTailTests().plans()
+        counter = plans[F1_COUNTER]
+        completions = {
+            text for texts in r1_negotiation.COUNTER_COMPLETIONS.values() for text in texts
+        }
+        for text in ("Can I ask how the mentoring works?", "Hmm, and is there a weekend batch?"):
+            with self.subTest(text=text):
+                tail = eng.intent_tail(counter, text)
+                self.assertNotIn(tail, completions)
+
+    def test_a_theme_word_in_another_sense_is_no_point_made(self):
+        for move_id, text in (
+            (r1_scheduler.F2_PRIMARY, "Is that the full price?"),
+            (r1_scheduler.F2_PRIMARY, "I'd want the full picture before anything."),
+            (F4_PRIMARY, "I've decided I really like the mentoring part."),
+            (F4_PRIMARY, "Is the commitment about ten hours a week?"),
+            (r1_scheduler.F3_PRIMARY, "What would I be paying each month?"),
+        ):
+            with self.subTest(move_id=move_id, text=text):
+                self.assertFalse(r1_scheduler.tail_theme_hit(move_id, text, "husband"))
+        for move_id, text in (
+            (r1_scheduler.F2_PRIMARY, "My days are already full with the kids."),
+            (F4_PRIMARY, "I'm not ready to decide anything today."),
+            (F4_PRIMARY, "I don't want to commit right now."),
+            (r1_scheduler.F3_PRIMARY, "Is it worth paying for when so much is free?"),
+        ):
+            with self.subTest(move_id=move_id, text=text):
+                self.assertTrue(r1_scheduler.tail_theme_hit(move_id, text, "husband"))
 
 
 if __name__ == "__main__":

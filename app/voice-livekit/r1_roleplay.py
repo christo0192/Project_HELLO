@@ -278,6 +278,7 @@ from r1_prompts import (
     FIGURES_SAID_BOTH,
     FIGURES_SAID_HEARD,
     FIGURES_SAID_NOTE,
+    FIGURES_SAID_SOURCE_WEBSITE,
     FIGURES_SAID_WEBSITE,
     INTENT_OPENER_NOTES,
     INTERRUPTED_NOTE,
@@ -979,6 +980,13 @@ IMPLAUSIBLE_NOTE_LIMIT = 2
 CHEAP_PRICE_USD = 1000
 # MF4: the website's list price she may have checked aloud (``_figures_said_note``).
 LIST_PRICE_USD = 9000
+# Review of MF4: the advisor asks where her figure comes from ("how do you know?", "where did you
+# see that?"), so the figures she said are given back on that turn too.
+_FIGURE_SOURCE_QUESTION = re.compile(
+    r"\b(?:how (?:do|did) you (?:know|hear|find)|where (?:did|have) you (?:see|hear|get|find|read)|"
+    r"who told you|on (?:the|our) (?:website|site)|from (?:the|our) (?:website|site))\b",
+    re.IGNORECASE,
+)
 # SWEEP-14: an advisor turn this long gets the long length line.
 LONG_ADVISOR_WORDS = 60
 # The learner sentence-count histogram's last bucket (``SENTENCE_BUCKETS`` or more).
@@ -1453,6 +1461,11 @@ class RolePlayEngine:
         self._advisor_months: set[float] = set()
         self._figures_said: set[int] = set()
         self._figures_said_notes = 0  # MF4: replies reminded of the figures she said
+        # Review of MF4: she named the website's $9,000 before the advisor ever said it, so it is
+        # hers from the website; repeating his own $9,000 is no website claim.
+        self._website_said = False
+        self._anchor_after_advisor = False  # her anchor came after he named the $7,000 himself
+        self._figure_source_asked = False
         self._durations_said: set[float] = set()
         self._allowed_extra: frozenset[int] = frozenset()
         self._price_reflexes = 0
@@ -2126,6 +2139,7 @@ class RolePlayEngine:
             if stated is not None:
                 self._advisor_amounts.add(stated)
         self._price_talk = quotes_price(reading)
+        self._figure_source_asked = _FIGURE_SOURCE_QUESTION.search(fold(reading)) is not None
         for topic in answered_topics(reading):
             if topic not in self._answered:
                 self._answered.append(topic)
@@ -4912,8 +4926,13 @@ class RolePlayEngine:
         "I think I saw about $9,000 on the website")."""
         if not (self._probe_first and flag_on(FLAG_PRICE_STORY)):
             return ""
-        website = LIST_PRICE_USD in self._figures_said
-        heard = self.scheduler.is_delivered(F1_ANCHOR)
+        if not (self._price_talk or self._figure_source_asked):
+            # Review of MF4 (D-M032-7): only a turn about the price or about where her figure comes
+            # from gets the figures back; a standing reminder kept them in front of her all along.
+            return ""
+        website = self._website_said
+        # Review of MF4: a $7,000 the advisor named first is his, not something she heard.
+        heard = self.scheduler.is_delivered(F1_ANCHOR) and not self._anchor_after_advisor
         if website and heard:
             said = FIGURES_SAID_BOTH
         elif website:
@@ -4923,7 +4942,9 @@ class RolePlayEngine:
         else:
             return ""
         self._figures_said_notes += 1
-        return FIGURES_SAID_NOTE.format(said=said)
+        return FIGURES_SAID_NOTE.format(
+            said=said, source=FIGURES_SAID_SOURCE_WEBSITE if website else ""
+        )
 
     def _anchor_situation_kwargs(self) -> dict[str, bool]:
         """MF3 (R1_PRICE_STORY): what the below-$7,000 anchor reacts to.  The advisor named the
@@ -5399,25 +5420,23 @@ class RolePlayEngine:
         """Simulation diagnosis 2 (HF3, U1; R1_INTENT_TAIL_V3): the shortest completion that, with
         her reply, proves the move, or "".
 
-        Only when her reply already made the move's point in its own words (``tail_theme_hit``),
-        or, for F1-COUNTER (whose variants are all questions), already asked a question: then the
-        completion must prove the move alone, as a statement, never a second question.  Among the
-        candidates one she has not said yet comes first, then the one sharing the fewest content
-        words with her reply, then the shortest.
+        Only when her reply already made the move's point in its own words (``tail_theme_hit``);
+        after a question the completion is a statement, never a second question.  Review of HF3: a
+        question on another topic ("Can I ask how the mentoring works?") gets no completion, even
+        for F1-COUNTER: "A bit lower would really help." after it is a stray remark, so the
+        counter's own ask follows it (``intent_tail``).  Among the candidates one she has not said
+        yet comes first, then the one sharing the fewest content words with her reply, then the
+        shortest.
         """
         if not spoken_so_far.strip():
             return ""
-        themed = tail_theme_hit(move_id, spoken_so_far, self.persona.decision_maker)
-        asked = "?" in spoken_so_far
-        # Only the counter's variants are all questions: another move's statement variant already
-        # follows a question in full (below), so an unrelated reply keeps the whole point.
-        if not themed and not (asked and move_id == F1_COUNTER):
+        if not tail_theme_hit(move_id, spoken_so_far, self.persona.decision_maker):
             return ""
+        asked = "?" in spoken_so_far
         pool = [
             text
             for text in intent.completions
             if markers_match(intent.markers, f"{spoken_so_far} {text}")
-            and (themed or markers_match(intent.markers, text))
             and not (asked and "?" in text)
         ]
         if not pool:
@@ -6115,11 +6134,15 @@ class RolePlayEngine:
             self.negotiation.note_anchor(planned[1], planned[2])
             self._anchor_planned = None
         allowed = plan.guard_ctx.allowed_extra
+        if plan.move_id == F1_ANCHOR and ANCHOR_USD in self._advisor_amounts:
+            self._anchor_after_advisor = True
         if plan.mode is TurnMode.SAY_ONLY and plan.move_id == F1_ANCHOR:
             allowed = allowed | frozenset(dollar_amounts(canonical_amounts(plan.scripted_text)))
         for amount in dollar_amounts(canonical_amounts(spoken_text)):
             if amount in allowed:
                 self._figures_said.add(amount)
+                if amount == LIST_PRICE_USD and amount not in self._advisor_amounts:
+                    self._website_said = True
         for months in durations_said(spoken_text):
             if months in plan.guard_ctx.advisor_durations:
                 self._durations_said.add(months)

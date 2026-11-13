@@ -280,6 +280,7 @@
         "R1_PRICE_STORY": { "requiredInProduction": false, "secret": false },
         "R1_ASK_KIND_NOTE": { "requiredInProduction": false, "secret": false },
         "R1_NO_BARE_REPROACH": { "requiredInProduction": false, "secret": false },
+        "R1_REFUSED_CALL_READER": { "requiredInProduction": false, "secret": false },
         "R1_TTS_FLUSH_MIN_CHARS": { "requiredInProduction": false, "secret": false },
         "R1_LINE_CACHE": { "requiredInProduction": false, "secret": false },
         "R1_SYNTH_PER_MIN": { "requiredInProduction": false, "secret": false },

@@ -1136,6 +1136,14 @@ _OWN_LIFE_PAST = re.compile(
     r"\b(?:dropped|gave up|stopped|lasted|after (?:about|around|roughly|only|just))\b",
     re.IGNORECASE,
 )
+# Review of CF1: her own course is told with a verb of taking or leaving it ("I quit", "I tried",
+# "I took", "I did a ..."), never with a common auxiliary or a time word ("I was hoping the course
+# takes about three months", "I had hoped", "Last time I checked"): those are the product's length.
+_OWN_COURSE_TAKEN = re.compile(
+    r"\bi\s+(?:(?:once|already|also|actually|even)\s+)?(?:quit|tried|took|did (?:a|an|one|some)|"
+    r"finished|completed|attended|enrolled in|signed up for|joined)\b",
+    re.IGNORECASE,
+)
 
 
 def _another_course(folded: str, match: re.Match[str]) -> bool:
@@ -1145,19 +1153,6 @@ def _another_course(folded: str, match: re.Match[str]) -> bool:
         return False
     before = folded[: match.start() + noun.start()].split()[-3:]
     return any(_OTHER_COURSE_BEFORE.fullmatch(word.strip(",;:")) for word in before)
-
-
-def _own_life_any_topic(folded: str, persona: RenderedPersona | None) -> bool:
-    """CF1: a sentence on her own timeline, or one carrying any of her needs' markers (durations
-    masked, as in ``_own_life_duration``)."""
-    if _own_life_duration(folded, persona):
-        return True
-    if persona is None:
-        return False
-    masked = _DURATION.sub(" ", folded)
-    return any(
-        pattern.search(masked) for topic in H_TOPICS for pattern in persona.markers(topic)
-    )
 
 
 def course_length_unsaid(
@@ -1176,24 +1171,26 @@ def course_length_unsaid(
 
     ``own_course`` (simulation diagnosis 2, CF1; the engine's R1_OWN_COURSE): the two course-noun
     frames skip a course that is not THE course ("a free Python course") and a sentence about her
-    past ("quit", "gave up", "after about"); every need's markers, not only H1's, put a duration on
-    her own timeline.
+    own course taken or left ("I quit", "gave up", "after about"; review of CF1: never a common
+    auxiliary or "last", and the ambiguous frames keep H1's own-timeline exemption only).
     """
     folded = fold(sentence)
     if own_course:
-        past = _OWN_LIFE.search(folded) is not None or _OWN_LIFE_PAST.search(folded) is not None
+        past = (
+            _OWN_COURSE_TAKEN.search(folded) is not None
+            or _OWN_LIFE_PAST.search(folded) is not None
+        )
         spans = []
         for index, frame in enumerate(_COURSE_LENGTH_FRAMES):
             for match in frame.finditer(folded):
                 if index in (1, 2) and (past or _another_course(folded, match)):
                     continue
                 spans.append(match.group(0))
-        own_life = _own_life_any_topic(folded, persona)
     else:
         spans = [
             match.group(0) for frame in _COURSE_LENGTH_FRAMES for match in frame.finditer(folded)
         ]
-        own_life = _own_life_duration(folded, persona)
+    own_life = _own_life_duration(folded, persona)
     if not own_life:
         spans.extend(
             match.group(0) for frame in _AMBIGUOUS_LENGTH_FRAMES for match in frame.finditer(folded)

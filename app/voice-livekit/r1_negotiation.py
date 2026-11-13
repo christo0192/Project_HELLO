@@ -1580,11 +1580,18 @@ _DECLINES_CALL_MORE = re.compile(
 # exact monthly figures sent over", "I'll put the breakdown in writing", "the email will have
 # everything").
 # ``detect_email_offer`` reads an offer; this reads a promise the WEAK line must not ask for again.
+# Review of ST1: only a sending verb (send, e-mail, forward, write up) reads a promise from its
+# object alone; put, pop, drop, share and get send nothing without a written channel or a sending
+# word ("I'll get the figures sent over", "pop the details in an email", "share it by email"), so
+# "Let me put it this way", "Let me get your details first" and "I'll share my screen" are none.
 _PROMISES_SEND = re.compile(
-    r"\b(?:i(?:'ll| will)|let me|we(?:'ll| will))\s+(?:\w+\s+){0,2}?(?:send|e-?mail|put|pop|drop|"
-    r"share|forward|write up|get)\b(?!\s+back\b)[^.?!]{0,50}\b(?:figures|numbers|breakdown|"
-    r"details|summary|everything|it all|info\w*|e-?mail|brochure|curriculum|options|stories|"
-    r"in writing)\b"
+    r"\b(?:i(?:'ll| will)|let me|we(?:'ll| will))\s+(?:\w+\s+){0,2}?(?:send|e-?mail|forward|"
+    r"write up)\b(?!\s+back\b)[^.?!]{0,50}\b(?:figures|numbers|breakdown|details|summary|"
+    r"everything|it all|info\w*|e-?mail|brochure|curriculum|options|stories|in writing)\b"
+    r"|\b(?:i(?:'ll| will)|let me|we(?:'ll| will))\s+(?:\w+\s+){0,2}?(?:put|pop|drop|share|get)\b"
+    r"(?!\s+back\b)[^.?!]{0,50}\b(?:in writing|in (?:an?|the) (?:e-?mail|message|summary)|"
+    r"(?:by|via|over) e-?mail|in your inbox|(?:sent|emailed|e-mailed|forwarded) (?:over|across|"
+    r"through|to you|your way)|(?:over|across) to you by)\b"
     r"|\b(?:the|my|an?|that) (?:e-?mail|summary|write-?up)\b[^.?!]{0,25}\bwill (?:have|include|"
     r"cover|set out|lay out)\b",
     re.IGNORECASE,
@@ -1599,9 +1606,12 @@ def promises_to_send(text: object) -> bool:
 
 # Simulation diagnosis 2 (SC2): the advisor puts the call after what her decline was waiting for
 # ("once you've read it", "after you and your husband talk", "you can confirm or move it").
+# Review of SC2: "we" is never the subject ("after we talk" is the call itself), the call word must
+# stand outside the deferral ("After we talk, you'll feel better" names no call), and someone
+# else's call ("tell him to call us", "have her call our office") proposes none to her.
 _DEFERS_CALL = re.compile(
     r"\b(?:once|after|when|whenever)\s+(?:you(?:'ve| have)?|you and your \w+|you two|you both|"
-    r"both of you|he|she|they|we)\b[^.?!]{0,40}?\b(?:read|looked|look|gone|go|seen|see|talked|"
+    r"both of you|he|she|they)\b[^.?!]{0,40}?\b(?:read|looked|look|gone|go|seen|see|talked|"
     r"talk|spoken|speak|discussed|discuss|had a chance|reviewed|review|sat down|sit down)\b"
     r"|\b(?:confirm|move|change|cancel|reschedule|shift)\s+(?:it|that|the (?:call|time|slot|"
     r"day))\b",
@@ -1613,12 +1623,23 @@ _CALL_WORD = re.compile(
 )
 
 
+_THIRD_PARTY_CALLER = re.compile(
+    r"\b(?:him|her|them|he|she|they|your \w+)\s+(?:to\s+)?$", re.IGNORECASE
+)
+
+
 def defers_call_until_after(text: object) -> bool:
     """SC2: an advisor sentence that proposes a call AFTER her reading or her talk with the decider,
     or leaves it to her to confirm or move."""
     for sentence in split_sentences(_tail(text)):
-        if _DEFERS_CALL.search(sentence) and _CALL_WORD.search(sentence):
-            return True
+        deferral = _DEFERS_CALL.search(sentence)
+        if deferral is None:
+            continue
+        blank = " " * len(deferral.group(0))
+        rest = sentence[: deferral.start()] + blank + sentence[deferral.end() :]
+        for call in _CALL_WORD.finditer(rest):
+            if _THIRD_PARTY_CALLER.search(rest[: call.start()]) is None:
+                return True
     return False
 
 
@@ -1747,13 +1768,18 @@ YOUR_NUMBER_MONTHLY = "monthly"
 
 # Simulation diagnosis 2 (ST1 (4), the engine's R1_STALL_MEMORY): the same question with no "you"
 # ("What monthly amount would feel workable?"): a money noun and a "for her" predicate.
+# Review of ST1 (4): the predicate is about her: "feel / be / seem" with a judging word ("would be
+# comfortable"), or "work / suit / fit" ending the question or "for you"; never "work out to" or a
+# bare "would be" ("So what does the monthly payment work out to? About 600." quotes it himself).
 _HER_NUMBER_BARE = re.compile(
     r"^\W*(?:(?:so|and|okay|ok|then|right)\W+)*(?:what|how much)\b[^?]{0,30}\b(?:amount|number|"
-    r"figure|budget|payment|price|monthly|a month|per month|each month)\b[^?]{0,25}\b(?:feels?|"
-    r"would (?:feel|be|work)|seems?|works?)\s+(?:\w+\s+)?(?:workable|manageable|doable|"
-    r"comfortable|realistic|affordable|right|okay|ok|for you)?",
+    r"figure|budget|payment|price|monthly|a month|per month|each month)\b[^?]{0,25}\b(?:"
+    r"(?:feels?|would (?:feel|be|seem)|seems?|sounds?)\s+(?:\w+\s+)?(?:workable|manageable|doable|"
+    r"comfortable|realistic|affordable|right|okay|ok|for you)\b"
+    r"|(?:works?|would work|suits?|would suit|fits?|would fit)(?:\s+(?:best|for you))?\s*(?:\?|$))",
     re.IGNORECASE,
 )
+_SELF_ANSWER = re.compile(r"\$\s?\d|\b\d{2,}\b")
 
 
 def her_number_question(text: object, *, bare: bool = False) -> str | None:
@@ -1761,11 +1787,18 @@ def her_number_question(text: object, *, bare: bool = False) -> str | None:
 
     ``bare`` (ST1 (4)): a short money question with no "you" counts as put to her too.
     """
-    for sentence in split_sentences(text):
+    sentences = split_sentences(text)
+    for index, sentence in enumerate(sentences):
         lowered = fold(sentence).lower()
         if not is_question_like(lowered):
             continue
-        if bare and _HER_NUMBER_BARE.search(lowered) and not _NOT_HER_PRICE.search(lowered):
+        if (
+            bare
+            and _HER_NUMBER_BARE.search(lowered)
+            and not _NOT_HER_PRICE.search(lowered)
+            # A figure he gives right after the question answers it himself.
+            and not any(_SELF_ANSWER.search(later) for later in sentences[index + 1 :])
+        ):
             return YOUR_NUMBER_MONTHLY if _MONTHLY_CUE.search(lowered) else YOUR_NUMBER_TOTAL
         if not re.search(r"\byou(?:r)?\b", lowered):
             continue
@@ -3869,6 +3902,19 @@ _FREE_PACKAGE = re.compile(
     r"place|seat|spot|enrol+ment)\b",
     re.IGNORECASE,
 )
+# Review of MF2: the figure is a price only when nothing after it makes it a count or a share ("10%
+# off", "6 months of mentoring", "2 extra sessions", "for 2 people", "1 payment plan"): it ends the
+# clause, or a connective or a price word follows it.  A figure without a "$" or a currency word
+# (``canonical_amounts`` writes "500 USD" as "$500") is a price only from $100 up: "Okay, 30." is
+# hours a week far more often than a $30 course.
+_CURRENCY_AFTER = re.compile(r"\s*(?:usd|dollars?|bucks)\b", re.IGNORECASE)
+_PRICE_FIGURE_END = re.compile(
+    r"(?:\s*(?:usd|dollars?|bucks)\b)?\s*(?:[.,;:!?)]|-|$|(?:for|if|and|but|so|then|now|today|"
+    r"tops|max(?:imum)?|total|flat|all|only|on|with|as|which|because|since|or|is|that|including|"
+    r"plus|net|final|in total|all in|right|okay|ok)\b)",
+    re.IGNORECASE,
+)
+_UNMARKED_PRICE_MIN_USD = 100
 
 
 def _low_offer_wide(sentence: str, *, amount_only: bool) -> tuple[str, int | None] | None:
@@ -3884,6 +3930,13 @@ def _low_offer_wide(sentence: str, *, amount_only: bool) -> tuple[str, int | Non
         after = lowered[match.end() : match.end() + 40]
         before = lowered[max(0, match.start() - 60) : match.start()]
         if not 0 < value <= IMPLAUSIBLE_NET_USD:
+            continue
+        marked = lowered[: match.start(1)].rstrip().endswith("$") or bool(
+            _CURRENCY_AFTER.match(lowered[match.end(1) :])
+        )
+        if not marked and value < _UNMARKED_PRICE_MIN_USD:
+            continue
+        if _PRICE_FIGURE_END.match(lowered[match.end(1) :]) is None:
             continue
         if _NOT_A_COURSE_PRICE.search(after) or _NOT_A_COURSE_PRICE.search(before):
             continue

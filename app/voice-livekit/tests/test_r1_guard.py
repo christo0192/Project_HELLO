@@ -2847,6 +2847,11 @@ class OwnPastCourseGuardTests(unittest.TestCase):
         "I can't keep up for six months, can I?",
         "I just know it's the data science course, roughly six months.",
         "This program runs for about six months, right?",
+        # Review of CF1: a common past-tense word or a need's marker is no course of her own.
+        "I was hoping the course takes about three months.",
+        "I had hoped the course would take three months.",
+        "Last time I checked, the course runs about six months.",
+        "Will it take six months, with the kids and work?",
     )
 
     def on(self, **kwargs):

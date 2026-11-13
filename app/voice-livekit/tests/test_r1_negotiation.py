@@ -3390,6 +3390,10 @@ class DeclineScopeTests(unittest.TestCase):
             "Once you've read it, let me know what you think.",
             "Shall I call you on Friday?",
             "I'll send the email today.",
+            # Review of SC2: the talk is the deferral's own verb, or someone else's call.
+            "After we talk, you'll feel better.",
+            "When you talk to your husband, tell him to call us.",
+            "Once you've read it, have her call our office.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(neg.defers_call_until_after(text))
@@ -3412,9 +3416,23 @@ class StallMemoryReaderTests(unittest.TestCase):
             "Let me check with my team first.",
             "We'll send you the schedule once you enroll.",
             "I will walk you through it on the call.",
+            # Review of ST1: put, get, share and pop name no sending without a written channel.
+            "Let me put it this way, the options are simple.",
+            "Let me get your details first.",
+            "I'll share my screen and walk through the options.",
+            "We'll put everything in place for your start.",
+            "Let me just get the numbers right: it's $9,000.",
+            "I'll get you enrolled and we can go over the details later.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(neg.promises_to_send(text))
+        for text in (
+            "I'll get the exact monthly figures sent over to you today.",
+            "Let me pop the details in an email for you.",
+            "I'll share the breakdown with you by email.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.promises_to_send(text))
 
     def test_a_bare_money_question_is_put_to_her(self):
         self.assertEqual(
@@ -3422,9 +3440,19 @@ class StallMemoryReaderTests(unittest.TestCase):
             neg.YOUR_NUMBER_MONTHLY,
         )
         self.assertIsNone(neg.her_number_question("What monthly amount would feel workable?"))
-        for text in ("What amount of time feels doable?", "What day works?"):
+        for text in (
+            "What amount of time feels doable?",
+            "What day works?",
+            # Review of ST1 (4): a rhetorical question he answers himself asks her nothing.
+            "So what does the monthly payment work out to? About 600.",
+            "And what would the monthly payment be? Around $600.",
+            "What would the price be after the scholarship? It comes to $8,000.",
+        ):
             with self.subTest(text=text):
                 self.assertIsNone(neg.her_number_question(text, bare=True))
+        for text in ("What monthly payment works for you?", "So what budget feels comfortable?"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(neg.her_number_question(text, bare=True))
 
 
 class LowOfferAndAnchorSituationTests(unittest.TestCase):
@@ -3452,6 +3480,34 @@ class LowOfferAndAnchorSituationTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(neg.implausible_offer_in(text, wide=True, amount_only=True))
+
+    def test_a_count_or_a_share_is_no_price(self):
+        """Review of MF2: a percentage, months, sessions, people or a payment count after an offer
+        frame, and a small bare number once a price is on the table, are no course price."""
+        for text in (
+            "The best I can do is 10% off.",
+            "I can do it for 6 months of mentoring.",
+            "The most I can do is 3 months free.",
+            "The best I can do is 20 percent.",
+            "I can do it for 12 months of access.",
+            "The most I can do is 2 extra sessions.",
+            "The best I can do is 1 payment plan.",
+            "I can do it for 2 people.",
+            "12.",
+            "Okay, 30.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.implausible_offer_in(text, wide=True, amount_only=True))
+        for text, expected in (
+            ("I can do it for 800, if you sign today.", ("low", 800)),
+            ("The most I can do is 2,500 total.", ("low", 2500)),
+            ("Okay, 500.", ("low", 500)),
+            ("50 dollars.", ("low", 50)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    neg.implausible_offer_in(text, wide=True, amount_only=True), expected
+                )
 
     def test_monthly_figures_stay_non_offers(self):
         self.assertEqual(neg.parse_price_offers("That's $1,250 a month.", v2=True), [])

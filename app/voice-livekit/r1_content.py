@@ -206,6 +206,8 @@ import r1_world
 #    latest-price, figures-said and ask-kind notes join the manifest (``_sim2_repairs``) beside the
 #    texts they replace while their flags are on.  No graded marker, must-say, meaning or deadline
 #    changed; with every flag off the tails, the anchors and the reminders are the release before.
+#    After its review (still 27, unreleased): the figures-said note's website example only for the
+#    website's price she named herself (``figures_said_source_website``), and narrower tail themes.
 CONTENT_REVISION = 27
 
 
@@ -551,6 +553,7 @@ def _sim2_repairs() -> dict[str, Any]:
         "latest_price_note": p.LATEST_PRICE_NOTE,
         "voiced_concerns_other_q_note": p.VOICED_CONCERNS_OTHER_Q_NOTE,
         "figures_said_note": p.FIGURES_SAID_NOTE,
+        "figures_said_source_website": p.FIGURES_SAID_SOURCE_WEBSITE,
         "figures_said": [p.FIGURES_SAID_WEBSITE, p.FIGURES_SAID_HEARD, p.FIGURES_SAID_BOTH],
         "anchor_below_situations": below,
         "ask_kind_notes": [

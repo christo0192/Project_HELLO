@@ -591,8 +591,12 @@ FIGURES_SAID_HEARD = '"I heard someone paid about $7,000"'
 FIGURES_SAID_BOTH = f"{FIGURES_SAID_WEBSITE} and {FIGURES_SAID_HEARD}"
 FIGURES_SAID_NOTE = (
     "- You already told the advisor {said}. Stay consistent with that: never say you do not "
-    "remember it or that they told you. If they ask how you know, say so plainly, for example "
-    '"I saw it on the website when I filled in the form".'
+    "remember it or that they told you.{source}"
+)
+# Review of MF4: the website example only when she named the website's price herself.
+FIGURES_SAID_SOURCE_WEBSITE = (
+    ' If they ask how you know, say so plainly, for example "I saw it on the website when I '
+    'filled in the form".'
 )
 # Simulation diagnosis 2 (MF2, R1_LOW_OFFER_READER): a further low figure once the careful-buyer
 # note is spent (new wording under D-M032-4, listed for review).

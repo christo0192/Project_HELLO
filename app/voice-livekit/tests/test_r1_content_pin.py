@@ -163,7 +163,11 @@ import r1_world
 # completions, the below-$7,000 anchor situations and the latest-price, figures-said and ask-kind
 # notes join the manifest (``r1_content._sim2_repairs``) beside the texts they replace while their
 # flags are on.  No graded meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "155e8ac2b5d4012e1393ea445fbbf531de0a227a6e42a41b7ded62993dc0304d"
+# After the diagnosis 2 review (still revision 27, unreleased): the figures-said note keeps its
+# website example only for the website's price she named herself (FIGURES_SAID_SOURCE_WEBSITE),
+# and the tail themes need the worry's frame for "full", deciding, committing, "online" and
+# "paying".  No graded meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "f4401b2b81e03abebc63572f3d92534f6a073b517f2c95967eaf75a91e33a986"
 
 CONTENT_MODULES = (
     "r1_text",

@@ -1515,9 +1515,29 @@ class RefusedCallReaderTests(unittest.TestCase):
             "Why don't we book a call for Monday.",
             "No problem, schedule a call with both of us.",
             "I'm not sure about the price, but let's book a call.",
+            # Review of HF1: an acceptance worded with a negation is no refusal.
+            "I don't mind if we set up a call on Thursday.",
+            "I can't wait to book the call.",
+            "It's not a bad idea to book a call.",
+            "I wouldn't mind if you set up a call for Monday.",
+            "It wouldn't hurt to book a call.",
         ):
             with self.subTest(text=text):
                 self.assertEqual(classify_learner_commitment(text), Level.MEDIUM)
+
+    def test_its_own_flag_rolls_back_hf1_alone(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"R1_REFUSED_CALL_READER": "0"}):
+            self.assertEqual(
+                classify_learner_commitment("I'm not ready to set up a call just yet."),
+                Level.MEDIUM,
+            )
+            # The other R1_COMMIT_READER_V2 readings (L6) stay on.
+            self.assertLess(
+                classify_learner_commitment("Sure, reading it tonight works."), Level.MEDIUM
+            )
 
     def test_flag_off_restores_the_old_reading(self):
         import os

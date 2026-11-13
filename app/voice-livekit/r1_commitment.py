@@ -1077,17 +1077,36 @@ _SEAT_HOLD = _compile(
     r"\b" + _HOLD_OK + r"\b[^.?!]{0,30}\b" + _HOLD_VERB + r"\b[^.?!]{0,20}\b" + _SEAT + r"\b",
 )
 _HOLD_NEGATOR = re.compile(r"\b(?:not|never|no|don'?t|doesn'?t|won'?t|can'?t|isn'?t)\b")
-# Simulation diagnosis 2 (HF1, R1_COMMIT_READER_V2): a refusal that names a call ("I'm not ready to
-# set up a call just yet.", "I'd rather not book a call yet.") is no MEDIUM commitment.  The negator
-# must sit in the clause of the match, before it (``_SUBJECT_CLAUSE_BREAK``): "Sure, book the call,
-# but not before Friday." books it.  "Why don't we book a call" and "no problem" are no refusal.
+# Simulation diagnosis 2 (HF1, R1_COMMIT_READER_V2 and R1_REFUSED_CALL_READER): a refusal that
+# names a call ("I'm not ready to set up a call just yet.", "I'd rather not book a call yet.") is
+# no MEDIUM commitment.  The negator must sit in the clause of the match, before it
+# (``_SUBJECT_CLAUSE_BREAK``): "Sure, book the call, but not before Friday." books it.  "Why don't
+# we book a call" and "no problem" are no refusal.
 _CLAUSE_REFUSAL = re.compile(
     r"\b(?:not|never|don'?t|doesn'?t|won'?t|can'?t|cannot|isn'?t|wouldn'?t|shouldn'?t|"
     r"hold(?:ing)? off)\b"
     r"|\bno\b(?!\s+(?:problem|worries|rush|doubt)\b)",
     re.IGNORECASE,
 )
-_NOT_A_REFUSAL = re.compile(r"\bwhy (?:don'?t|not)\b", re.IGNORECASE)
+# Review of HF1: an acceptance worded with a negation ("I don't mind if we set up a call", "I can't
+# wait to book the call", "It's not a bad idea", "It wouldn't hurt to book one") is no refusal.
+_NOT_A_REFUSAL = re.compile(
+    r"\bwhy (?:don'?t|not)\b"
+    r"|\b(?:don'?t|do not|wouldn'?t|would not|won'?t|will not)\s+mind\b"
+    r"|\b(?:can'?t|cannot|can not)\s+wait\b"
+    r"|\bnot (?:a |such a )?(?:bad|terrible|crazy)\b"
+    r"|\b(?:not|never) (?:opposed|against)\b"
+    r"|\b(?:wouldn'?t|doesn'?t|won'?t|can'?t|couldn'?t|does not|would not) hurt\b"
+    r"|\b(?:don'?t|do not) see why not\b|\bno harm\b",
+    re.IGNORECASE,
+)
+
+
+def refused_call_reader() -> bool:
+    """Review of HF1 (R1_REFUSED_CALL_READER, read at use; default on): a refusal that names a call
+    is no MEDIUM.  Its own rollback switch, so HF1 rolls back without L4, L6 and U4 (1)."""
+    raw = os.getenv("R1_REFUSED_CALL_READER") or "1"
+    return raw.strip().lower() not in ("0", "off", "false", "no")
 # Only the booking patterns read the negator: "I'm not sure that Thursday works." stays MEDIUM as on
 # production (an accepted false positive, ``ClassifyTests``).
 _MEDIUM_BOOKING = (_MEDIUM[3], _MEDIUM[8])
@@ -1112,7 +1131,11 @@ def _medium_v2(lowered: str) -> bool | None:
         for match in pattern.finditer(lowered):
             if no_call and pattern in _MEDIUM_DAY_WORKS and _activity_is_subject(lowered, match):
                 continue
-            if pattern in _MEDIUM_BOOKING and _clause_refuses(lowered, match):
+            if (
+                pattern in _MEDIUM_BOOKING
+                and refused_call_reader()
+                and _clause_refuses(lowered, match)
+            ):
                 continue
             return True
     return False
