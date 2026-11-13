@@ -159,7 +159,11 @@ import r1_world
 # Revision 26 (simulation diagnosis 1, learner fixes): the new notes, wordings and wider delivery
 # markers join the manifest (``r1_content._sim_repairs``) beside the texts they replace while their
 # flags are on.  No graded meaning, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "e5296efca8b4500b20313ae90e45d420fc0f42d6dcc14b05709e38418e6c6e0c"
+# Revision 27 (simulation diagnosis 2, learner fixes): the short completion tails, the counter's
+# completions, the below-$7,000 anchor situations and the latest-price, figures-said and ask-kind
+# notes join the manifest (``r1_content._sim2_repairs``) beside the texts they replace while their
+# flags are on.  No graded meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "155e8ac2b5d4012e1393ea445fbbf531de0a227a6e42a41b7ded62993dc0304d"
 
 CONTENT_MODULES = (
     "r1_text",

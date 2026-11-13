@@ -2269,5 +2269,72 @@ class RoleConfusionTests(unittest.TestCase):
             role_confusion_in(text[:4000])
             self.assertLess(time.perf_counter() - started, 0.25)
 
+class RoleReversalSim2Tests(unittest.TestCase):
+    """Simulation diagnosis 2 (MF1, R1_ROLE_CONFUSION_V2): more first phrasings of a candidate who
+    casts themselves as the buyer.  Synthetic paraphrases."""
+
+    REVERSALS = (
+        "So I'd like a data science course, could you sell me one?",
+        "I'm looking to buy one of your company's programs.",
+        "Wait, I'm the one looking to buy here, not to sell.",
+        "Look, I am buying, not you.",
+        "No no, I am buying, not selling.",
+    )
+    IN_ROLE = (
+        "Can you sell me on why it's worth the money?",
+        "What product do you sell at your company?",
+        "Could you pitch it to your husband?",
+        "I'm planning to buy the product for my team.",
+        "I'm buying time, not making promises.",
+    )
+
+    def test_the_reversals_are_coach_breaks(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.REVERSALS:
+            with self.subTest(text=text):
+                self.assertTrue(role_confusion_in(text))
+                self.assertEqual(detect_character_break(text, role_v2=True), "coach")
+                self.assertFalse(role_confusion_in(text, v2=False))
+
+    def test_in_role_lines_are_not(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.IN_ROLE:
+            with self.subTest(text=text):
+                self.assertFalse(role_confusion_in(text))
+                self.assertIsNone(detect_character_break(text, role_v2=True))
+
+
+class DigFirstFollowupTests(unittest.TestCase):
+    """Simulation diagnosis 2 (ND2, R1_DIG_FIRST): a follow-up worded about her own account
+    releases the need she just hinted at.  Synthetic text."""
+
+    def test_the_wide_followups(self):
+        from r1_personas import detect_followup
+
+        for text in (
+            "What made it fizzle out?",
+            "Was it mostly that nobody kept you on track, or the material?",
+            "Why did that stop, do you think?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_followup(text, wide=True))
+                self.assertFalse(detect_followup(text))
+        for text in ("What made you fill in the form?", "It was mostly the price."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_followup(text, wide=True))
+
+    def test_the_gate_releases_on_the_wide_followup(self):
+        for wide, released in ((True, ("H2",)), (False, ())):
+            with self.subTest(wide=wide):
+                gate_ = gate()
+                gate_.wide_followup = wide
+                first = gate_.observe_candidate_turn("What held you back from starting before?", 1)
+                self.assertEqual(first.first_probes, ("H2",))
+                update = gate_.observe_candidate_turn("What made it fizzle out?", 2)
+                self.assertEqual(update.released, released)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1077,10 +1077,30 @@ _SEAT_HOLD = _compile(
     r"\b" + _HOLD_OK + r"\b[^.?!]{0,30}\b" + _HOLD_VERB + r"\b[^.?!]{0,20}\b" + _SEAT + r"\b",
 )
 _HOLD_NEGATOR = re.compile(r"\b(?:not|never|no|don'?t|doesn'?t|won'?t|can'?t|isn'?t)\b")
+# Simulation diagnosis 2 (HF1, R1_COMMIT_READER_V2): a refusal that names a call ("I'm not ready to
+# set up a call just yet.", "I'd rather not book a call yet.") is no MEDIUM commitment.  The negator
+# must sit in the clause of the match, before it (``_SUBJECT_CLAUSE_BREAK``): "Sure, book the call,
+# but not before Friday." books it.  "Why don't we book a call" and "no problem" are no refusal.
+_CLAUSE_REFUSAL = re.compile(
+    r"\b(?:not|never|don'?t|doesn'?t|won'?t|can'?t|cannot|isn'?t|wouldn'?t|shouldn'?t|"
+    r"hold(?:ing)? off)\b"
+    r"|\bno\b(?!\s+(?:problem|worries|rush|doubt)\b)",
+    re.IGNORECASE,
+)
+_NOT_A_REFUSAL = re.compile(r"\bwhy (?:don'?t|not)\b", re.IGNORECASE)
+# Only the booking patterns read the negator: "I'm not sure that Thursday works." stays MEDIUM as on
+# production (an accepted false positive, ``ClassifyTests``).
+_MEDIUM_BOOKING = (_MEDIUM[3], _MEDIUM[8])
+
+
+def _clause_refuses(lowered: str, match: re.Match[str]) -> bool:
+    """HF1: the clause the MEDIUM ``match`` sits in has a negator before it."""
+    head = _SUBJECT_CLAUSE_BREAK.split(lowered[: match.start()])[-1]
+    return _CLAUSE_REFUSAL.search(head) is not None and _NOT_A_REFUSAL.search(head) is None
 
 
 def _medium_v2(lowered: str) -> bool | None:
-    """L6 and U4 (1): the MEDIUM reading with R1_COMMIT_READER_V2 (None: the flag is off)."""
+    """L6, U4 (1) and HF1: the MEDIUM reading with R1_COMMIT_READER_V2 (None: the flag is off)."""
     if not reader_v2():
         return None
     for pattern in _SEAT_HOLD:
@@ -1089,12 +1109,12 @@ def _medium_v2(lowered: str) -> bool | None:
             return True
     no_call = _CALL_TALK.search(lowered) is None
     for pattern in _MEDIUM:
-        match = pattern.search(lowered)
-        if match is None:
-            continue
-        if no_call and pattern in _MEDIUM_DAY_WORKS and _activity_is_subject(lowered, match):
-            continue
-        return True
+        for match in pattern.finditer(lowered):
+            if no_call and pattern in _MEDIUM_DAY_WORKS and _activity_is_subject(lowered, match):
+                continue
+            if pattern in _MEDIUM_BOOKING and _clause_refuses(lowered, match):
+                continue
+            return True
     return False
 
 

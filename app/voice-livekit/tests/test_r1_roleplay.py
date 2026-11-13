@@ -658,6 +658,7 @@ class PlanModeTests(unittest.TestCase):
         self.assertNotEqual(now.intent.fallbacks[0], cut.intent.fallbacks[0])
         self.assertEqual(now.intent.fallbacks[-1], cut.intent.fallbacks[0])
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_INTENT_TAIL_V3": "0"})
     def test_the_tail_never_repeats_what_the_same_reply_just_said(self):
         eng = engine()
         eng.plan_turn(OPENER, 20)
@@ -3928,6 +3929,7 @@ class OwnerTest8f5bfefcPriceOfferTests(unittest.TestCase):
             plans[turn] = s.say(text, r, turn_index=turn)
         return s, plans
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_PRICE_STORY": "0"})
     def test_the_learner_reacts_to_the_three_thousand_and_never_asks_for_more(self):
         s, plans = self.replay()
         self.assertEqual(s.eng.negotiation.best_offer_usd, 3000)
@@ -4147,6 +4149,7 @@ class AskYieldsToAForcedMoveTests(unittest.TestCase):
         plans = [s.say(ASK, 185 + 60 * i) for i in range(4)]
         return s, plans[-1]
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_ASK_KIND_NOTE": "0"})
     def test_a_forced_non_f4_move_also_reacts_to_the_proposal(self):
         s, forced = self.forced_ask_session()
         self.assertEqual((forced.mode, forced.move_id), (TurnMode.INTENT, "F3-PRIMARY"))
@@ -4154,6 +4157,20 @@ class AskYieldsToAForcedMoveTests(unittest.TestCase):
         self.assertIn("The advisor just proposed a call or a next step", forced.reminder)
         self.assertIn("without agreeing to it", forced.reminder)
         self.assertNotRegex(forced.reminder, r"(?i)thursday|tomorrow|10:00")
+
+    def test_the_note_names_the_kind_of_ask(self):
+        # Simulation diagnosis 2 (MF5, R1_ASK_KIND_NOTE): a call is named as a call, an enrolment
+        # ask as signing up now, never "a call or a next step".
+        s, forced = self.forced_ask_session()  # ASK: the enrolment link
+        self.assertIn("ask_yields_to_owed_move", forced.reasons)
+        self.assertIn("The advisor just asked you to sign up now.", forced.reminder)
+        self.assertNotIn("The advisor just proposed a call or a next step", forced.reminder)
+        call = Session(engine())
+        call.say(OPENER, 20)
+        plans = [call.say(CALL_ASK, 185 + 60 * i) for i in range(4)]
+        yielded = [plan for plan in plans if "ask_yields_to_owed_move" in plan.reasons]
+        self.assertTrue(yielded)
+        self.assertIn("The advisor just proposed a call.", yielded[-1].reminder)
 
     def test_the_owed_f4_move_is_the_reaction_so_it_needs_no_extra_note(self):
         s = Session(engine())
@@ -8170,6 +8187,7 @@ class PushAfterReactionTests(unittest.TestCase):
                 return r
         self.fail("F4's primary was never raised")
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_F4_ORGANIC": "0"})
     def test_j_the_f4_push_waits_once_and_refers_back_to_a_decider_she_named(self):
         answer = "Plenty of our learners started with the same worry and found the weekend rhythm fine."
         s = Session(engine())
@@ -8372,6 +8390,7 @@ class S1ReviewFixTests(unittest.TestCase):
         s, answer = asked("Most learners spend about eight hours a week on it, alongside work.")
         self.assertIn(ANSWERED_YOU_NOTE, answer.reminder)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_STALL_MEMORY": "0"})
     def test_s1r2_the_ledger_never_contradicts_a_direct_question_or_the_price_notes(self):
         """S1R-2: "do not say that again in any words" sat next to "answer that first, plainly and
         honestly" and the price notes' "say ... you need to think"."""
@@ -12173,6 +12192,7 @@ class NoAcceptAndAskedOnceTests(unittest.TestCase):
 
     ASK = "Would you be free for a quick call with our senior counsellor tomorrow at six?"
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_ASK_KIND_NOTE": "0"})
     def test_an_f4_point_answering_a_proposal_is_told_not_to_accept_it(self):
         s, r = f4_primary_session()
         plan = s.say(self.ASK, r + 20)
@@ -12368,6 +12388,231 @@ class EchoGuardWiringTests(unittest.TestCase):
             plan = s.say("Okay.", 80, backchannel=True)
             self.assertIn(r1_roleplay.ACK_TURN_NOTE, plan.reminder)
             self.assertFalse(plan.guard_ctx.echo_guard)
+
+
+class _PushDeclines(Session):
+    """A scripted model whose owed F4-PUSH turns a check-in down (paraphrased, synthetic)."""
+
+    PUSH = "I'd talk it over with my husband first, and I'd rather reach out myself than have a call booked."
+
+    def say(self, text, r, **kwargs):
+        plan = self.eng.plan_turn(text, r, **kwargs)
+        self.plans.append(plan)
+        if plan.mode is TurnMode.SAY_ONLY:
+            spoken = self.eng.compose_speech(plan).text
+        elif plan.mode is TurnMode.INTENT:
+            raw = self.PUSH if plan.move_id == r1_scheduler.F4_PUSH else self.ack
+            spoken = self.eng.compose_speech(plan, raw).text
+        elif plan.mode is TurnMode.LLM_REPLY:
+            spoken = self.eng.sanitize_reply(plan, self.reply).text
+        else:
+            spoken = ""
+        self.spoken.append(spoken)
+        if spoken:
+            self.eng.record_spoken(plan, spoken, r_sec=r)
+        return plan
+
+
+class DeclineScopeThroughTheEngineTests(unittest.TestCase):
+    """Simulation diagnosis 2 (SC2, R1_DECLINE_SCOPE): the graded F4-PUSH worded as a refusal of a
+    call does not cap the strong advisor's in-window MEDIUM."""
+
+    def run_call(self):
+        eng = engine()
+        session = _PushDeclines(eng)
+        r = 20.0
+        for index, text in enumerate(strong_script()):
+            session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
+            r += 72.5
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        self.assertIn(r1_scheduler.F4_PUSH, [p.move_id for p in session.plans])
+        return session, r
+
+    def test_the_push_is_no_decline(self):
+        session, r = self.run_call()
+        self.assertIsNone(session.eng.negotiation.call_declined_turn)
+        plan = session.say(CALL_ASK, r)
+        self.assertGreaterEqual(plan.commitment_level, Level.MEDIUM)
+        self.assertNotIn("call_declined", plan.reasons)
+
+    def test_flag_off_is_the_release_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_DECLINE_SCOPE": "0"}):
+            session, r = self.run_call()
+            self.assertIsNotNone(session.eng.negotiation.call_declined_turn)
+            plan = session.say(CALL_ASK, r)
+            self.assertIn("call_declined", plan.reasons)
+
+
+class CompletionTailTests(unittest.TestCase):
+    """Simulation diagnosis 2 (HF3, U1; R1_INTENT_TAIL_V3): a reply that already made the owed
+    point gets a short completion, never the point again or a second question.  Synthetic text."""
+
+    def plans(self):
+        session, _r = run_cooperative()
+        by_move = {}
+        for plan in session.plans:
+            if plan.mode is TurnMode.INTENT and plan.move_id and plan.move_id not in by_move:
+                by_move[plan.move_id] = plan
+        return session.eng, by_move
+
+    def check(self, eng, plan, text):
+        from r1_text import split_sentences
+
+        tail = eng.intent_tail(plan, text)
+        self.assertTrue(tail)
+        self.assertNotIn("?", tail)
+        self.assertLessEqual(len(split_sentences(tail)), 1)
+        self.assertTrue(r1_scheduler.markers_match(plan.intent.markers, f"{text} {tail}"))
+        return tail
+
+    def test_a_worry_already_said_gets_a_completion(self):
+        eng, plans = self.plans()
+        f2 = plans[r1_scheduler.F2_PRIMARY]
+        text = "What still bothers me is fitting it around my job and the kids, my days are full."
+        tail = self.check(eng, f2, text)
+        self.assertIn(tail, r1_scheduler.TAIL_COMPLETIONS[r1_scheduler.F2_PRIMARY])
+
+    def test_a_price_question_gets_no_second_question(self):
+        eng, plans = self.plans()
+        counter = plans[F1_COUNTER]
+        text = "So what would all of it come to for me, after whatever scholarship you can do?"
+        tail = self.check(eng, counter, text)
+        self.assertNotIn("scholarship", tail.lower())
+
+    def test_a_think_over_without_a_when_gets_a_short_when(self):
+        eng, plans = self.plans()
+        f4 = plans[F4_PRIMARY]
+        text = "I need a bit of time to think this over properly before deciding anything."
+        tail = self.check(eng, f4, text)
+        self.assertLess(len(tail.split()), 6)
+
+    def test_an_unrelated_reply_keeps_the_full_variant(self):
+        eng, plans = self.plans()
+        f2 = plans[r1_scheduler.F2_PRIMARY]
+        tail = eng.intent_tail(f2, "Okay, I see.")
+        self.assertNotIn(tail, r1_scheduler.TAIL_COMPLETIONS[r1_scheduler.F2_PRIMARY])
+        self.assertTrue(r1_scheduler.markers_match(f2.intent.markers, tail))
+
+    def test_flag_off_is_the_release_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_INTENT_TAIL_V3": "0"}):
+            eng, plans = self.plans()
+            counter = plans[F1_COUNTER]
+            text = "So what would all of it come to for me, after whatever scholarship you can do?"
+            tail = eng.intent_tail(counter, text)
+            import r1_negotiation
+
+            unclear = r1_negotiation.COUNTER_COMPLETIONS[r1_negotiation.SITUATION_UNCLEAR]
+            self.assertNotIn(tail, unclear)
+
+
+class OrganicDeciderPushTests(unittest.TestCase):
+    """Simulation diagnosis 2 (DS1, R1_F4_ORGANIC): the decision-maker push she voiced in a free
+    reply after F4-PRIMARY is delivered, so it is not forced on her again."""
+
+    REPLY = "That makes sense, though I'd want to talk it over with my husband first."
+
+    def after_primary(self):
+        eng = engine()
+        session = Session(eng)
+        r = 20.0
+        for index, text in enumerate(cooperative_script()):
+            plan = session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
+            r += 72.5
+            if plan.move_id == F4_PRIMARY:
+                break
+        self.assertTrue(eng.scheduler.is_delivered(F4_PRIMARY))
+        self.assertFalse(eng.scheduler.is_delivered(r1_scheduler.F4_PUSH))
+        # The next candidate turn is read (the push is not yet planned), and her free reply to it
+        # (any LLM_REPLY plan carries no owed move) says the decider stall.
+        eng.scheduler.observe_candidate_turn("What else is on your mind about it?", r)
+        free = next(plan for plan in session.plans if plan.mode is TurnMode.LLM_REPLY)
+        return eng, free, r
+
+    def test_the_free_push_counts(self):
+        eng, free, r = self.after_primary()
+        self.assertIsNone(free.move_id)
+        eng._credit_organic_push(free, self.REPLY, r + 5)
+        self.assertTrue(eng.scheduler.is_delivered(r1_scheduler.F4_PUSH))
+        self.assertIn(r1_scheduler.F4_PUSH, eng._organic_pushes)
+        self.assertIn("decision_maker", eng.negotiation.voiced)
+
+    def test_flag_off_is_the_release_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_F4_ORGANIC": "0"}):
+            eng, free, r = self.after_primary()
+            eng._credit_organic_push(free, self.REPLY, r + 5)
+            self.assertFalse(eng.scheduler.is_delivered(r1_scheduler.F4_PUSH))
+
+
+class StallMemoryTests(unittest.TestCase):
+    """Simulation diagnosis 2 (ST1, R1_STALL_MEMORY).  Synthetic, paraphrased advisor text."""
+
+    PROMISE = "Of course, and I'll get the exact monthly figures sent over to you today."
+
+    def test_a_promised_email_is_not_asked_for_again(self):
+        eng = engine()
+        eng.plan_turn(self.PROMISE, 400.0, turn_index=1)
+        self.assertTrue(eng._weak_kwargs(call=True)["emailed"])
+
+    def test_flag_off_is_the_release_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_STALL_MEMORY": "0"}):
+            eng = engine()
+            eng.plan_turn(self.PROMISE, 400.0, turn_index=1)
+            self.assertFalse(eng._weak_kwargs(call=True)["emailed"])
+
+    def test_another_direct_question_is_answered_and_the_concern_left_out(self):
+        from r1_prompts import (
+            ASKED_DIRECTLY_NOTE,
+            VOICED_CONCERNS_ASKED_NOTE,
+            VOICED_CONCERNS_NOTE,
+            VOICED_CONCERNS_OTHER_Q_NOTE,
+        )
+
+        s = Session(engine(), reply="I'll think it over and get back to you later.")
+        s.say(OPENER, 20)
+        s.say(SHORT_ACK, 40)
+        s.reply = "I see."
+        plan = s.say("So what do you want from me?", 60)
+        concerns = "that you want to think it over"
+        self.assertIn(ASKED_DIRECTLY_NOTE, plan.reminder)
+        self.assertIn(VOICED_CONCERNS_OTHER_Q_NOTE.format(concerns=concerns), plan.reminder)
+        self.assertNotIn(VOICED_CONCERNS_ASKED_NOTE.format(concerns=concerns), plan.reminder)
+        self.assertNotIn(VOICED_CONCERNS_NOTE.format(concerns=concerns), plan.reminder)
+
+    def test_only_a_question_about_the_decision_reopens_a_said_concern(self):
+        for text in (
+            "So what's holding you back from deciding?",
+            "When would you be ready to start?",
+            "Does that timing work for you?",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNotNone(r1_roleplay._DECISION_QUESTION.search(text))
+        for text in (
+            "Would seeing the weekly breakdown in writing help you judge it?",
+            "Does that picture feel manageable?",
+            "What did you study at university?",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(r1_roleplay._DECISION_QUESTION.search(text))
+
+
+class FiguresSaidNoteTests(unittest.TestCase):
+    """Simulation diagnosis 2 (MF4, probe first with R1_PRICE_STORY): the figures she already said
+    are given back to her, so she never feigns to have forgotten them."""
+
+    def test_the_note_after_she_said_the_website_price(self):
+        eng = engine()
+        self.assertTrue(eng._probe_first)
+        self.assertEqual(eng._figures_said_note(), "")
+        eng._figures_said.add(9000)
+        note = eng._figures_said_note()
+        self.assertIn("$9,000 on the website", note)
+        self.assertIn("never say you do not remember it", note)
+
+    def test_flag_off_is_the_release_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PRICE_STORY": "0"}):
+            eng = engine()
+            eng._figures_said.add(9000)
+            self.assertEqual(eng._figures_said_note(), "")
 
 
 if __name__ == "__main__":

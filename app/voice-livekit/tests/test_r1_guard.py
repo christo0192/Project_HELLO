@@ -2831,6 +2831,108 @@ class ProbeFirstGuardTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - start, 2.0)
 
 
+class OwnPastCourseGuardTests(unittest.TestCase):
+    """Simulation diagnosis 2 (CF1, ``GuardContext.own_course``, the engine's R1_OWN_COURSE): a
+    course she took in the past is not THE course, so its length is hers to say; the product's
+    length the advisor never said is still hygiene.  Synthetic sentences."""
+
+    OWN_PAST = (
+        "Honestly, I quit a free Python course after about three weeks.",
+        "I tried an online course, about three weeks, and then I dropped it.",
+        "I did a YouTube course for about a month and gave up.",
+        "My old program lasted roughly two months before I stopped.",
+    )
+    STILL_HITS = (
+        "The course is about six months long.",
+        "I can't keep up for six months, can I?",
+        "I just know it's the data science course, roughly six months.",
+        "This program runs for about six months, right?",
+    )
+
+    def on(self, **kwargs):
+        return ctx(probe_first=True, own_course=True, **kwargs)
+
+    def test_her_own_past_course_passes(self):
+        context = self.on(released_topics=frozenset({"H2"}))
+        for sentence in self.OWN_PAST:
+            with self.subTest(sentence=sentence):
+                self.assertFalse(
+                    r1_guard.course_length_unsaid(sentence, persona=PERSONA, own_course=True)
+                )
+                self.assertNotIn(
+                    "course_length_unsaid", {hit.rule for hit in check_sentence(sentence, context)}
+                )
+
+    def test_the_products_length_still_trips(self):
+        for sentence in self.STILL_HITS:
+            with self.subTest(sentence=sentence):
+                self.assertTrue(
+                    r1_guard.course_length_unsaid(sentence, persona=PERSONA, own_course=True)
+                )
+                hits = check_sentence(sentence, self.on())
+                self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+
+    def test_flag_off_is_the_release_before(self):
+        sentence = self.OWN_PAST[0]
+        self.assertTrue(r1_guard.course_length_unsaid(sentence, persona=PERSONA))
+        hits = check_sentence(sentence, ctx(probe_first=True, released_topics=frozenset({"H2"})))
+        self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+
+    def test_a_refused_call_is_not_dropped_as_a_commitment(self):
+        # HF1 at the guard: the refusal is in character and is kept whole.
+        result = guard_text("I'm not ready to set up a call just yet.", ctx())
+        self.assertEqual(result.text, "I'm not ready to set up a call just yet.")
+        self.assertEqual([hit for hit in result.hits if hit.category == "commitment"], [])
+
+
+class OrphanClauseGuardTests(unittest.TestCase):
+    """Simulation diagnosis 2 (ST1 (3), ``GuardContext.orphan_clause``): a subordinate clause whose
+    main clause the stall quota cut goes with it.  Synthetic text."""
+
+    TEXT = "Sounds fine, send it over. Whether we talk again after that, I'll let you know later."
+
+    def test_the_orphaned_subordinate_clause_goes_too(self):
+        over = ctx(free_reply=True, phrase_counts=(("stall_closer", 2),), orphan_clause=True)
+        result = guard_text(self.TEXT, over)
+        self.assertEqual(result.text, "Sounds fine, send it over.")
+        self.assertNotIn("Whether", result.text)
+
+    def test_a_kept_main_clause_keeps_its_subordinate(self):
+        over = ctx(free_reply=True, phrase_counts=(("stall_closer", 2),), orphan_clause=True)
+        text = "Once I've read it, the figures will make more sense, I'll let you know."
+        self.assertEqual(
+            guard_text(text, over).text, "Once I've read it, the figures will make more sense."
+        )
+
+    def test_flag_off_is_the_release_before(self):
+        over = ctx(free_reply=True, phrase_counts=(("stall_closer", 2),))
+        self.assertIn("Whether we talk again after that.", guard_text(self.TEXT, over).text)
+
+
+class BareReproachGuardTests(unittest.TestCase):
+    """Simulation diagnosis 2 (NAT1, ``GuardContext.bare_reproach``): the question diet never
+    leaves a curt reproach alone.  Synthetic text."""
+
+    TEXT = "That's not really what I meant, honestly. I came to hear about it, so what does it cover?"
+
+    def test_the_question_stays_beside_a_bare_reproach(self):
+        context = ctx(free_reply=True, recent_questions=(True,), bare_reproach=True)
+        result = guard_text(self.TEXT, context)
+        self.assertIn("what does it cover?", result.text)
+        self.assertEqual(result.bare_keeps, 1)
+
+    def test_a_reply_with_substance_still_loses_the_question(self):
+        context = ctx(free_reply=True, recent_questions=(True,), bare_reproach=True)
+        text = "The mentoring part sounds useful for the course. What does it cover?"
+        self.assertEqual(guard_text(text, context).text, "The mentoring part sounds useful for the course.")
+
+    def test_flag_off_is_the_release_before(self):
+        context = ctx(free_reply=True, recent_questions=(True,))
+        self.assertEqual(
+            guard_text(self.TEXT, context).text, "That's not really what I meant, honestly."
+        )
+
+
 class WrapupOneMentionGuardTests(unittest.TestCase):
     """M032 SWEEP-26 (R1_WRAPUP_ONE_MENTION): the hiring team is named once, by L-CLOSE.
 

@@ -199,7 +199,14 @@ import r1_world
 #    replace while their flags are on.  No graded meaning, must-say or deadline changed; the wider
 #    delivery markers are listed beside the old ones; with every flag off the reminders, the
 #    markers and the readers are the release before.
-CONTENT_REVISION = 26
+# 27: Simulation diagnosis 2, learner fixes (rollback flags R1_INTENT_TAIL_V3, R1_LOW_OFFER_READER,
+#    R1_PRICE_STORY and R1_ASK_KIND_NOTE carry new texts; R1_DECLINE_SCOPE, R1_OWN_COURSE,
+#    R1_DIG_FIRST, R1_F4_ORGANIC, R1_STALL_MEMORY and R1_NO_BARE_REPROACH change readers only).
+#    The short completion tails, the counter's completions, the below-$7,000 anchor situations, the
+#    latest-price, figures-said and ask-kind notes join the manifest (``_sim2_repairs``) beside the
+#    texts they replace while their flags are on.  No graded marker, must-say, meaning or deadline
+#    changed; with every flag off the tails, the anchors and the reminders are the release before.
+CONTENT_REVISION = 27
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -513,6 +520,48 @@ def _sim_repairs() -> dict[str, Any]:
     }
 
 
+def _sim2_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 2 (revision 27): the learner fixes' new texts."""
+    p = r1_prompts
+    neg = r1_negotiation
+    below = {
+        name: {
+            "brief": item.brief,
+            "must_say": list(item.must_say),
+            "variants": list(item.variants),
+        }
+        for name, item in (
+            ("echoed", neg.anchor_after_offer(3000, situational=True, advisor_said_anchor=True)),
+            ("reacted", neg.anchor_after_offer(5000, situational=True, reacted=True)),
+            ("wary", neg.anchor_after_offer(2500, situational=True)),
+            ("plain", neg.anchor_after_offer(6000, situational=True)),
+        )
+    }
+    return {
+        # HF3, U1 (R1_INTENT_TAIL_V3): the short completion tails.
+        "tail_completions": {
+            move_id: list(texts) for move_id, texts in r1_scheduler.TAIL_COMPLETIONS.items()
+        },
+        "tail_themes": dict(r1_scheduler.TAIL_THEMES),
+        "counter_completions": {key: list(texts) for key, texts in neg.COUNTER_COMPLETIONS.items()},
+        "negotiation_completions": {
+            key: list(texts) for key, texts in neg.NEGOTIATION_COMPLETIONS.items()
+        },
+        # MF2 (R1_LOW_OFFER_READER), MF4 and MF3 (R1_PRICE_STORY), MF5 (R1_ASK_KIND_NOTE).
+        "latest_price_note": p.LATEST_PRICE_NOTE,
+        "voiced_concerns_other_q_note": p.VOICED_CONCERNS_OTHER_Q_NOTE,
+        "figures_said_note": p.FIGURES_SAID_NOTE,
+        "figures_said": [p.FIGURES_SAID_WEBSITE, p.FIGURES_SAID_HEARD, p.FIGURES_SAID_BOTH],
+        "anchor_below_situations": below,
+        "ask_kind_notes": [
+            p.NEXT_STEP_PROPOSED_NOTE_ENROL,
+            p.NEXT_STEP_PROPOSED_NOTE_CALL,
+            p.PROPOSAL_UNANSWERED_NOTE_ENROL,
+            p.PROPOSAL_UNANSWERED_NOTE_CALL,
+        ],
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -793,6 +842,7 @@ def manifest() -> dict[str, Any]:
             "endings": _endings(),
             "learner_followups": _learner_followups(sample),
             "sim_repairs": _sim_repairs(),
+            "sim2_repairs": _sim2_repairs(),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

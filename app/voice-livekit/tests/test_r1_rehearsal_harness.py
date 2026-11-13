@@ -2949,5 +2949,32 @@ class S2PBunchingGridTests(unittest.TestCase):
                     self.assertTrue(all(value is not None for value in item.delivered.values()))
 
 
+class FinalPriceReaskSim2Tests(unittest.TestCase):
+    """Simulation diagnosis 2 (HF3, harness): the price asked twice in one reply is a repeat; a
+    re-ask right after an advisor turn that only acknowledged it is not.  Synthetic text."""
+
+    def test_twice_in_one_reply_and_a_reask_after_a_non_answer(self) -> None:
+        found = metrics.final_price_metrics([
+            {"advisor": {"text": "Sure."}, "learner": {"spoken": (
+                "So what's the final price for me? Okay, so what would the final price be?"
+            )}},
+        ])
+        self.assertEqual(found["final_price_asked_twice"], 1)
+        reask = metrics.final_price_metrics([
+            {"advisor": {"text": "We have some scholarships."},
+             "learner": {"spoken": "So what's the final price for me?"}},
+            {"advisor": {"text": "Okay."},
+             "learner": {"spoken": "Sorry, what would the final number be?"}},
+        ])
+        self.assertEqual(reask["final_price_asked_twice"], 0)
+        answered = metrics.final_price_metrics([
+            {"advisor": {"text": "We have some scholarships."},
+             "learner": {"spoken": "So what's the final price for me?"}},
+            {"advisor": {"text": "It would be $8,000 after the scholarship."},
+             "learner": {"spoken": "Is that the final price, then?"}},
+        ])
+        self.assertEqual(answered["final_price_asked_twice"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1135,18 +1135,32 @@ def _is_probe_shaped(lowered: str) -> bool:
     )
 
 
-def detect_followup(text: object) -> bool:
+# Simulation diagnosis 2 (ND2; the engine's R1_DIG_FIRST, ``detect_followup(wide=True)``): "What
+# made it fizzle out?" and "was it mostly that nobody checked in on you?" pick up what she just
+# said.
+_FOLLOWUP_WIDE = re.compile(
+    r"\bwhat made (?:it|that|this)\b"
+    r"|\b(?:was|is) it (?:mostly|mainly|more|really|just) (?:the|that|because|about)\b"
+    r"|\bwhat went wrong\b|\bwhy did (?:it|that) (?:stop|fizzle|fall apart|not work|end)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_followup(text: object, *, wide: bool = False) -> bool:
     """True when the candidate asks the learner to say more about what they just said.
 
     Only a question or an imperative addressed to the learner counts; a statement that
-    happens to contain "an example" or "elaborate" is the advisor's pitch.
+    happens to contain "an example" or "elaborate" is the advisor's pitch.  ``wide`` (ND2) reads
+    the follow-ups worded about her own account (``_FOLLOWUP_WIDE``) as well.
     """
     for sentence in split_sentences(text):
         folded = fold(sentence)
         if _FOLLOWUP_IMPERATIVE.match(folded.strip()):
             return True
         if is_question_like(folded) and (
-            _FOLLOWUP.search(folded) or _FOLLOWUP_REFERENCING.search(folded)
+            _FOLLOWUP.search(folded)
+            or _FOLLOWUP_REFERENCING.search(folded)
+            or (wide and _FOLLOWUP_WIDE.search(folded))
         ):
             return True
     return False

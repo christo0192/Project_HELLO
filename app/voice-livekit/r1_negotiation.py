@@ -718,6 +718,31 @@ UNCLEAR_COUNTER_V3 = CounterSituation(
     "all in",
     COUNTER_BY_SITUATION[SITUATION_UNCLEAR].variants,
 )
+# Simulation diagnosis 2 (HF3, U1; the engine's R1_INTENT_TAIL_V3): F1-COUNTER's completion
+# statements per situation (``r1_scheduler.TAIL_COMPLETIONS``).  A reply that already asked about
+# the price gets one of these, never a second question; each proves F1-COUNTER's unchanged markers.
+_COUNTER_FINAL_COMPLETIONS = (
+    "That final number is what I need.",
+    "I'd still need the final price, all in.",
+)
+_COUNTER_MET_COMPLETIONS = (
+    "I'd just want to know that's the final price.",
+    "As long as that's the final number.",
+)
+# The same for the negotiation lines whose tail most often said her point again (the e-mail yes
+# after "sending a summary would help", the price asked twice in other words).
+NEGOTIATION_COMPLETIONS: dict[str, tuple[str, ...]] = {
+    N_PRICE_FIRST: ("So how much is it?",),
+    N_EMAIL_YES: ("Please do send it.", "Please send it over."),
+}
+COUNTER_COMPLETIONS: dict[str, tuple[str, ...]] = {
+    SITUATION_SHORT: ("Even a little lower would help.", "A bit lower would really help."),
+    SITUATION_MET: _COUNTER_MET_COMPLETIONS,
+    SITUATION_FAR_BELOW: _COUNTER_MET_COMPLETIONS,
+    SITUATION_REFUSED: ("Even a payment plan would help.", "Anything at all would help."),
+    SITUATION_UNCLEAR: _COUNTER_FINAL_COMPLETIONS,
+    SITUATION_CONFLICT: _COUNTER_FINAL_COMPLETIONS,
+}
 # SWEEP-19 item 6: the advisor asked what number works for her while the counter is planned (only on
 # a short or unclear answer): she names the $7,000 she heard as her hope.
 YOUR_NUMBER_COUNTER_SUFFIX = (
@@ -784,7 +809,13 @@ def _usd(amount: int) -> str:
 
 
 def anchor_after_offer(
-    offer_usd: int, *, probe_first: bool = False, counter_v2: bool = False
+    offer_usd: int,
+    *,
+    probe_first: bool = False,
+    counter_v2: bool = False,
+    situational: bool = False,
+    advisor_said_anchor: bool = False,
+    reacted: bool = False,
 ) -> AnchorSituation:
     """The anchor that reacts to ``offer_usd``, the best price already on the table.
 
@@ -792,6 +823,9 @@ def anchor_after_offer(
     probe-first anchor (no "has already come down", which presumes a discount, and no banned
     phrase); ``counter_v2`` (SWEEP-19 item 5) takes the "[ack], but" hinge out of the third ABOVE
     variant.  Must-say figures, the $7,000 marker and the request are unchanged.
+
+    ``situational`` (simulation diagnosis 2, MF3; the engine's R1_PRICE_STORY): a price under
+    the $7,000 is answered for the situation (``_below_anchor_situation``).
     """
     amount = _usd(offer_usd)
     if offer_usd > ANCHOR_USD:
@@ -850,6 +884,12 @@ def anchor_after_offer(
                 "I heard about $7,000, so that is in line with what I read.",
             ),
         )
+    if situational:
+        picked = _below_anchor_situation(
+            offer_usd, advisor_said_anchor=advisor_said_anchor, reacted=reacted
+        )
+        if picked is not None:
+            return picked
     # Below the $7,000: it is NOT "in line with what you heard" (the live sweep: "That lines up with
     # what I'd heard ... $4,500 is under the $7,000 I read about", one reply, two opinions).
     below_tail = (
@@ -857,6 +897,8 @@ def anchor_after_offer(
         "thanks, and you may ask what is included at that price; you do not ask whether it is the "
         "final price"
     )
+    if situational:
+        below_tail += "; you never call it good news or good to know"  # MF3
     return AnchorSituation(
         ANCHOR_REACHED,
         f"the advisor's price is {amount}, below the $7,000 you heard someone paid; {below_tail}"
@@ -871,6 +913,63 @@ def anchor_after_offer(
             f"I heard people paid about $7,000, and {amount} is below that.",
         ),
     )
+
+
+# Simulation diagnosis 2 (MF3): the anchor below the $7,000 had one brief ("note calmly that it is
+# even below the $7,000 you heard") whatever had happened: the advisor had named the $7,000 himself
+# ("3000, better than 7000"), she had already reacted to this very price ("a price that low makes me
+# suspicious"), or the price was a fraction of it, and the model said "which is good to know" in the
+# middle of a price objection.  Each keeps the $7,000 marker and the must-say figures (new wording
+# under D-M032-4, listed for review).
+ANCHOR_FAR_BELOW_SHARE = 0.5
+ANCHOR_ECHOED = "echoed"
+ANCHOR_REACTED = "reacted"
+ANCHOR_WARY = "wary"
+
+
+def _below_anchor_situation(
+    offer_usd: int, *, advisor_said_anchor: bool, reacted: bool
+) -> AnchorSituation | None:
+    """MF3: the anchor for a price under the $7,000 in a situation, or None (the default)."""
+    if offer_usd >= ANCHOR_USD:
+        return None
+    amount = _usd(offer_usd)
+    if advisor_said_anchor:
+        return AnchorSituation(
+            ANCHOR_ECHOED,
+            f"the advisor named {amount} and mentioned the $7,000 himself; agree that you had "
+            f"heard about $7,000 too, and say that is why {amount} makes you want to know what is "
+            "included; never pleased, never thankful",
+            (amount, "$7,000"),
+            (
+                f"I'd heard about $7,000 too, so {amount} makes me want to know what's included.",
+                f"I'd heard $7,000 as well, which is why {amount} makes me ask what's in it.",
+            ),
+        )
+    if reacted:
+        return AnchorSituation(
+            ANCHOR_REACTED,
+            f"you already reacted to {amount}; give the $7,000 you heard as the reason for that "
+            f"reaction (since you had heard about $7,000, {amount} makes you wonder what is left "
+            "out), without repeating the reaction itself; never pleased, never thankful",
+            (amount, "$7,000"),
+            (
+                f"Since I'd heard about $7,000, {amount} makes me wonder what's left out.",
+                f"I'd heard about $7,000, so {amount} has me wondering what's missing.",
+            ),
+        )
+    if offer_usd < ANCHOR_USD * ANCHOR_FAR_BELOW_SHARE:
+        return AnchorSituation(
+            ANCHOR_WARY,
+            f"{amount} is far below the $7,000 you heard someone paid; sound wary, never pleased "
+            "or thankful and never call it good news, and ask what is left out at that price",
+            (amount, "$7,000"),
+            (
+                f"{amount} is well below the $7,000 I heard someone paid, so what's left out?",
+                f"I heard about $7,000, so {amount} makes me wary. What's not included?",
+            ),
+        )
+    return None
 
 
 ANCHOR_UNCLEAR = "unclear"
@@ -1477,6 +1576,52 @@ _DECLINES_CALL_MORE = re.compile(
     r"[^.?!]{0,30}\b(?:myself|on my own|rather than|instead)\b",
     re.IGNORECASE,
 )
+# Simulation diagnosis 2 (ST1 (2)): the advisor promised to send it in writing ("I'll get the
+# exact monthly figures sent over", "I'll put the breakdown in writing", "the email will have
+# everything").
+# ``detect_email_offer`` reads an offer; this reads a promise the WEAK line must not ask for again.
+_PROMISES_SEND = re.compile(
+    r"\b(?:i(?:'ll| will)|let me|we(?:'ll| will))\s+(?:\w+\s+){0,2}?(?:send|e-?mail|put|pop|drop|"
+    r"share|forward|write up|get)\b(?!\s+back\b)[^.?!]{0,50}\b(?:figures|numbers|breakdown|"
+    r"details|summary|everything|it all|info\w*|e-?mail|brochure|curriculum|options|stories|"
+    r"in writing)\b"
+    r"|\b(?:the|my|an?|that) (?:e-?mail|summary|write-?up)\b[^.?!]{0,25}\bwill (?:have|include|"
+    r"cover|set out|lay out)\b",
+    re.IGNORECASE,
+)
+
+
+def promises_to_send(text: object) -> bool:
+    """ST1 (2): the advisor promised to send her the details in writing ("I'll get the exact
+    figures sent over", "I'll put the breakdown in writing", "the email will have everything")."""
+    return any(_PROMISES_SEND.search(sentence) for sentence in split_sentences(_tail(text)))
+
+
+# Simulation diagnosis 2 (SC2): the advisor puts the call after what her decline was waiting for
+# ("once you've read it", "after you and your husband talk", "you can confirm or move it").
+_DEFERS_CALL = re.compile(
+    r"\b(?:once|after|when|whenever)\s+(?:you(?:'ve| have)?|you and your \w+|you two|you both|"
+    r"both of you|he|she|they|we)\b[^.?!]{0,40}?\b(?:read|looked|look|gone|go|seen|see|talked|"
+    r"talk|spoken|speak|discussed|discuss|had a chance|reviewed|review|sat down|sit down)\b"
+    r"|\b(?:confirm|move|change|cancel|reschedule|shift)\s+(?:it|that|the (?:call|time|slot|"
+    r"day))\b",
+    re.IGNORECASE,
+)
+_CALL_WORD = re.compile(
+    r"\b(?:call|chat|check[- ]?in|catch up|follow[- ]?up|speak|talk|meet|pencil)\w*\b",
+    re.IGNORECASE,
+)
+
+
+def defers_call_until_after(text: object) -> bool:
+    """SC2: an advisor sentence that proposes a call AFTER her reading or her talk with the decider,
+    or leaves it to her to confirm or move."""
+    for sentence in split_sentences(_tail(text)):
+        if _DEFERS_CALL.search(sentence) and _CALL_WORD.search(sentence):
+            return True
+    return False
+
+
 # A day or a part of the day the learner called difficult: "Tomorrow evening's tricky for me".
 _SLOT_REFUSAL = re.compile(
     r"\b(?:tricky|awkward|tough|difficult|hard|unpredictable|busy|doesn'?t work|won'?t work|"
@@ -1600,11 +1745,29 @@ YOUR_NUMBER_TOTAL = "total"
 YOUR_NUMBER_MONTHLY = "monthly"
 
 
-def her_number_question(text: object) -> str | None:
-    """``"monthly"`` or ``"total"`` when the advisor asks what she could pay, else None."""
+# Simulation diagnosis 2 (ST1 (4), the engine's R1_STALL_MEMORY): the same question with no "you"
+# ("What monthly amount would feel workable?"): a money noun and a "for her" predicate.
+_HER_NUMBER_BARE = re.compile(
+    r"^\W*(?:(?:so|and|okay|ok|then|right)\W+)*(?:what|how much)\b[^?]{0,30}\b(?:amount|number|"
+    r"figure|budget|payment|price|monthly|a month|per month|each month)\b[^?]{0,25}\b(?:feels?|"
+    r"would (?:feel|be|work)|seems?|works?)\s+(?:\w+\s+)?(?:workable|manageable|doable|"
+    r"comfortable|realistic|affordable|right|okay|ok|for you)?",
+    re.IGNORECASE,
+)
+
+
+def her_number_question(text: object, *, bare: bool = False) -> str | None:
+    """``"monthly"`` or ``"total"`` when the advisor asks what she could pay, else None.
+
+    ``bare`` (ST1 (4)): a short money question with no "you" counts as put to her too.
+    """
     for sentence in split_sentences(text):
         lowered = fold(sentence).lower()
-        if not is_question_like(lowered) or not re.search(r"\byou(?:r)?\b", lowered):
+        if not is_question_like(lowered):
+            continue
+        if bare and _HER_NUMBER_BARE.search(lowered) and not _NOT_HER_PRICE.search(lowered):
+            return YOUR_NUMBER_MONTHLY if _MONTHLY_CUE.search(lowered) else YOUR_NUMBER_TOTAL
+        if not re.search(r"\byou(?:r)?\b", lowered):
             continue
         if any(pattern.search(lowered) for pattern in _CHECKIN):
             continue
@@ -3685,15 +3848,84 @@ _FREE_PART = re.compile(
 )
 
 
+# Simulation diagnosis 2 (MF2; the engine's R1_LOW_OFFER_READER): a very low price said without a
+# dollar sign or a pricing word ("the most I can do is maybe 500 USD", "I can let you have it at
+# 500", "I can do it for 800"), a bare amount-only reply after a price exchange ("200 dollars."),
+# and a free package offered to her.  Monthly figures, discounts and deposits stay no price.
+_LOW_FRAMED_BARE = re.compile(
+    r"\b(?:(?:the )?(?:most|best|lowest)(?: price)? i can (?:do|go|offer)(?: is| would be)?|"
+    r"let you have (?:it|this|that|the course|the program(?:me)?) (?:at|for)|"
+    r"i can do (?:it|this|that) (?:at|for))\s(?:maybe |about |around |just |only |a mere )?"
+    r"\$?\s?(\d{1,3}(?:,\d{3})?|\d{1,4})(?!\d)(?![,.]\d)",
+    re.IGNORECASE,
+)
+_AMOUNT_ONLY = re.compile(
+    r"^\W*(?:(?:um+|uh+|okay|ok|so|fine|alright|right),?\s+)*\$?\s?(\d{1,3}(?:,\d{3})?|\d{1,4})"
+    r"\s?(?:usd|dollars?|bucks)?\W*$",
+    re.IGNORECASE,
+)
+_FREE_PACKAGE = re.compile(
+    r"\b(?:give|offer|let you have|get)\b[^.?!]{0,15}\ba free (?:package|course|program(?:me)?|"
+    r"place|seat|spot|enrol+ment)\b",
+    re.IGNORECASE,
+)
+
+
+def _low_offer_wide(sentence: str, *, amount_only: bool) -> tuple[str, int | None] | None:
+    """MF2: the wider low-price and free readings of one sentence."""
+    lowered = canonical_amounts(sentence).lower()
+    if _INQUIRY.search(lowered):
+        return None
+    matches = list(_LOW_FRAMED_BARE.finditer(lowered))
+    if amount_only:
+        matches += list(_AMOUNT_ONLY.finditer(lowered))
+    for match in matches:
+        value = int(match.group(1).replace(",", ""))
+        after = lowered[match.end() : match.end() + 40]
+        before = lowered[max(0, match.start() - 60) : match.start()]
+        if not 0 < value <= IMPLAUSIBLE_NET_USD:
+            continue
+        if _NOT_A_COURSE_PRICE.search(after) or _NOT_A_COURSE_PRICE.search(before):
+            continue
+        if negated_before(lowered, match.start()):
+            continue
+        return IMPLAUSIBLE_LOW, value
+    match = _FREE_PACKAGE.search(lowered)
+    if match is not None and not negated_before(lowered, match.start()):
+        return IMPLAUSIBLE_FREE, None
+    return None
+
+
 def implausible_offer_in(
-    text: object, own_amounts: Iterable[int] = ()
+    text: object,
+    own_amounts: Iterable[int] = (),
+    *,
+    wide: bool = False,
+    amount_only: bool = False,
 ) -> tuple[str, int | None] | None:
     """``("low", usd)``, ``("free", None)`` or None for one advisor turn (SWEEP-13).
 
     A question phrased as an offer counts ("if I give it to you free, will you take it?"), as it
     does for ``parse_price_offers``.  A monthly figure, a discount, a deposit or an instalment, a
     third party's price, and a negated figure are never the course's price.
+
+    ``wide`` (simulation diagnosis 2, MF2): also the bare low price in an offer frame and a free
+    package; ``amount_only`` (a price was already on the table): a reply that is only an amount.
     """
+    found = _implausible_offer_in(text, own_amounts)
+    if found is not None or not wide:
+        return found
+    for sentence in split_sentences(_tail(text)):
+        wider = _low_offer_wide(sentence, amount_only=amount_only)
+        if wider is not None:
+            return wider
+    return None
+
+
+def _implausible_offer_in(
+    text: object, own_amounts: Iterable[int] = ()
+) -> tuple[str, int | None] | None:
+    """SWEEP-13's reading (``implausible_offer_in`` without ``wide``)."""
     tail = _tail(text)
     nets = [net for net, _conditional in parse_price_offers(tail, own_amounts)]
     low = [net for net in nets if net <= IMPLAUSIBLE_NET_USD]
@@ -3833,6 +4065,12 @@ class Negotiation:
         # proposed on, and what the learner said about its priorities (cost called secondary: no
         # money stall).
         self.call_declined_turn: int | None = None
+        # Simulation diagnosis 2 (SC2, the engine's R1_DECLINE_SCOPE): a decline in a free reply
+        # before the close window, and the latest advisor turn after it that answered its reason
+        # (deferred the call until after the reading or the talk, or handled the timing or the
+        # decision maker).  It caps the in-window grade only while it stands unanswered.
+        self.pre_window_decline_turn: int | None = None
+        self.pre_window_answered_turn: int | None = None
         self.refused_slots: list[Slot] = []
         self.last_slot_turn: int | None = None
         self.money_secondary = False
@@ -4011,6 +4249,12 @@ class Negotiation:
         addressed = reasons_handled_in(text, self.decision_maker)
         if REASON_DECISION_MAKER in addressed:
             self.decider_handled_turn = turn
+        early = self.pre_window_decline_turn
+        if early is not None and turn > early and (
+            defers_call_until_after(text)
+            or addressed & {REASON_TIMING, REASON_DECISION_MAKER}
+        ):
+            self.pre_window_answered_turn = turn  # SC2: the reason of her early decline answered
         for reason in addressed:
             voiced_at = self.voiced.get(reason)
             if voiced_at is not None and voiced_at < turn and reason not in self.handled:
@@ -4143,19 +4387,36 @@ class Negotiation:
         return self.quotes[-1][1] if self.quotes else None
 
     def note_learner_text(
-        self, spoken: object, turn: int | None = None, *, stall: bool = False
+        self,
+        spoken: object,
+        turn: int | None = None,
+        *,
+        stall: bool = False,
+        objection: bool = False,
+        in_window: bool = False,
+        scoped: bool = False,
     ) -> None:
         """Remember what the learner said: the figures (so the advisor repeating one is not an
         offer) and, at ``turn``, that it has to talk to its decision maker first.  ``stall`` marks
         the owed timing objection ("maybe the next cohort"): that is the objection the advisor is
-        meant to answer, not a decision to wait."""
+        meant to answer, not a decision to wait.
+
+        ``scoped`` (simulation diagnosis 2, SC2; the engine's R1_DECLINE_SCOPE): a decline in the
+        graded objection itself (``objection``: F4-PRIMARY, F4-PUSH or a stall reason) is the
+        thing the advisor must handle, not a decision; one in a free reply before the close
+        window (``in_window`` False) is recorded as ``pre_window_decline_turn``; only one inside
+        the window is ``call_declined_turn``."""
         for amount in dollar_amounts(spoken):
             if 0 < amount <= PRICE_USD:
                 self.own_amounts.add(amount)
         if turn is not None and self._says_decider_first(spoken):
             self.decider_said_turn = turn
-        if turn is not None and self.call_declined_turn is None and declines_call(spoken):
-            self.call_declined_turn = turn
+        if turn is not None and declines_call(spoken):
+            if not scoped or in_window:
+                if self.call_declined_turn is None:
+                    self.call_declined_turn = turn
+            elif not objection:
+                self.pre_window_decline_turn = turn
         refused = refused_slot(spoken)
         if refused is not None and refused not in self.refused_slots:
             self.refused_slots.append(refused)
@@ -4319,8 +4580,18 @@ class Negotiation:
         )
 
     def call_declined(self) -> bool:
-        """The learner turned a call down in so many words (it holds for the rest of the call)."""
-        return self.call_declined_turn is not None
+        """The learner turned a call down in so many words (it holds for the rest of the call).
+
+        SC2 (R1_DECLINE_SCOPE): a decline before the close window holds only until an advisor turn
+        after it answered its reason (``pre_window_answered_turn``).
+        """
+        if self.call_declined_turn is not None:
+            return True
+        early = self.pre_window_decline_turn
+        if early is None:
+            return False
+        answered = self.pre_window_answered_turn
+        return answered is None or answered <= early
 
     def decider_unresolved(self) -> bool:
         """The learner said it must talk to its decision maker first and the advisor did not
@@ -4424,6 +4695,8 @@ class Negotiation:
             "slot_moved": None if self.chosen_slot is None else self.chosen_slot.moved,
             "slot_deferred": None if self.chosen_slot is None else self.chosen_slot.deferred,
             "call_declined_turn": self.call_declined_turn,
+            "pre_window_decline_turn": self.pre_window_decline_turn,
+            "pre_window_answered_turn": self.pre_window_answered_turn,
             "refused_slots": len(self.refused_slots),
             "money_secondary": self.money_secondary,
             "wait_said_turn": self.wait_said_turn,

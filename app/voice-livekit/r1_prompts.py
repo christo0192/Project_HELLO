@@ -220,6 +220,16 @@ NEXT_STEP_PROPOSED_NOTE = (
     "- The advisor just proposed a call or a next step. React to that in a few words, without "
     "agreeing to it and without naming a day or a time, and then carry on."
 )
+# Simulation diagnosis 2 (MF5, R1_ASK_KIND_NOTE): the note names what the advisor asked for, so an
+# enrolment ask is never answered "I don't want to lock in a call yet" (new wording under D-M032-4).
+NEXT_STEP_PROPOSED_NOTE_ENROL = (
+    "- The advisor just asked you to sign up now. React to that in a few words, without agreeing "
+    "to it, and then carry on."
+)
+NEXT_STEP_PROPOSED_NOTE_CALL = (
+    "- The advisor just proposed a call. React to that in a few words, without agreeing to it and "
+    "without naming a day or a time, and then carry on."
+)
 # M032 S1 (owner decision D-M032-1: she responds first).  The advisor's turn left something open
 # for her (an offer, a question put to her, an answer to her own question, or time given): the
 # reply's job is to respond to that, and an owed move that no deadline forces waits a turn
@@ -291,6 +301,12 @@ VOICED_CONCERNS_NOTE = (
 VOICED_CONCERNS_ASKED_NOTE = (
     "- You have already told the advisor {concerns}. They asked you directly: if that is still "
     "your honest answer, you may say it once more in a few fresh words, without dwelling on it."
+)
+# Simulation diagnosis 2 (ST1 (1), R1_STALL_MEMORY): a direct question about something other than
+# her decision is answered, and the concern is not brought up again (new wording under D-M032-4).
+VOICED_CONCERNS_OTHER_Q_NOTE = (
+    "- You have already told the advisor {concerns}. They asked you about something else: answer "
+    "that, and leave it out of this reply."
 )
 HOLLOW_CONCERNS_NOTE = (
     "- The advisor said almost nothing. You have already told them {concerns}, so do not say "
@@ -565,6 +581,25 @@ IMPLAUSIBLE_PRICE_NOTE = (
     "careful buyer would be surprised and a little wary: say so in your own words, and you may ask "
     "once why it is so much lower. Do not accept it, thank them for it or call it fine."
 )
+# Simulation diagnosis 2 (MF4, probe first with R1_PRICE_STORY): the figures she already said, given
+# back so she stays consistent; a direct question about how she knows gets the honest answer (new
+# wording under D-M032-4, listed for review).
+# The figures are quoted: they are hers to say, so the guard's echo check never reads them as
+# instruction prose (``control_prose``).
+FIGURES_SAID_WEBSITE = '"I saw about $9,000 on the website"'
+FIGURES_SAID_HEARD = '"I heard someone paid about $7,000"'
+FIGURES_SAID_BOTH = f"{FIGURES_SAID_WEBSITE} and {FIGURES_SAID_HEARD}"
+FIGURES_SAID_NOTE = (
+    "- You already told the advisor {said}. Stay consistent with that: never say you do not "
+    "remember it or that they told you. If they ask how you know, say so plainly, for example "
+    '"I saw it on the website when I filled in the form".'
+)
+# Simulation diagnosis 2 (MF2, R1_LOW_OFFER_READER): a further low figure once the careful-buyer
+# note is spent (new wording under D-M032-4, listed for review).
+LATEST_PRICE_NOTE = (
+    "- The advisor's latest figure is {amount}. If you mention the price, react to that number, "
+    "not to an earlier one, and do not accept it."
+)
 IMPLAUSIBLE_FREE_NOTE = (
     "- The advisor just talked about giving you the course for free. A careful buyer would be "
     "surprised and a little wary: say so in your own words, and you may ask once what the catch "
@@ -620,6 +655,15 @@ FINAL_ASKED_NOTE = (
 PROPOSAL_UNANSWERED_NOTE = (
     "- The advisor also proposed a call or a next step. Do not agree to it and do not name a day "
     "or a time in this reply: make only the point below."
+)
+# MF5 (R1_ASK_KIND_NOTE): the same, naming what was asked for.
+PROPOSAL_UNANSWERED_NOTE_ENROL = (
+    "- The advisor also asked you to sign up now. Do not agree to it in this reply: make only the "
+    "point below."
+)
+PROPOSAL_UNANSWERED_NOTE_CALL = (
+    "- The advisor also proposed a call. Do not agree to it and do not name a day or a time in "
+    "this reply: make only the point below."
 )
 # SWEEP-12: the soft tics ("actually", "genuinely", "properly", "I'd rather"); ``{words}`` is a
 # worker-built list of quoted words.

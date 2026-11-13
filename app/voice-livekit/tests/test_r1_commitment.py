@@ -1493,5 +1493,42 @@ class CommitReaderV2Tests(unittest.TestCase):
                 self.assertLess(classify_learner_commitment(text), Level.MEDIUM)
 
 
+class RefusedCallReaderTests(unittest.TestCase):
+    """Simulation diagnosis 2 (HF1, R1_COMMIT_READER_V2): a refusal that names a call is not a
+    MEDIUM commitment, so the guard never drops it as one.  Synthetic text."""
+
+    def test_a_negated_booking_is_not_medium(self):
+        for text in (
+            "I'm not ready to set up a call just yet.",
+            "I'd rather not book a call yet.",
+            "I don't want to schedule a meeting before I've read it.",
+            "I won't book the call today.",
+            "Honestly, I'm holding off on setting up a call, I'm not going to book a call this week.",
+        ):
+            with self.subTest(text=text):
+                self.assertLess(classify_learner_commitment(text), Level.MEDIUM)
+
+    def test_a_booking_stays_medium(self):
+        for text in (
+            "Let's set up a call.",
+            "Sure, book the call, but not before Friday.",
+            "Why don't we book a call for Monday.",
+            "No problem, schedule a call with both of us.",
+            "I'm not sure about the price, but let's book a call.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.MEDIUM)
+
+    def test_flag_off_restores_the_old_reading(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"R1_COMMIT_READER_V2": "0"}):
+            self.assertEqual(
+                classify_learner_commitment("I'm not ready to set up a call just yet."),
+                Level.MEDIUM,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
