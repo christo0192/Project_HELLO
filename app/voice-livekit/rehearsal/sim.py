@@ -534,6 +534,9 @@ class SdkDriver:
         previous = getattr(interview, "_last_reply", None)
         recorder.take()
         message_id = f"msg_{next(_IDS)}"
+        # The R at which the session hands the turn to the engine: the learner's line is decided
+        # (and its window rules judged) at this moment, not when the advisor began speaking.
+        decided_r_sec = rt.clocks()[2]
         rt.replying += 1
         try:
             try:
@@ -559,6 +562,7 @@ class SdkDriver:
             "span": span,
             "calls": recorder.take(),
             "plan": reply.plan if (reply is not None and reply is not previous) else None,
+            "decided_r_sec": decided_r_sec,
         }
 
     async def driven_reply(self, handle: Any) -> None:

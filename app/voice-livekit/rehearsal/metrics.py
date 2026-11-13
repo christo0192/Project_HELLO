@@ -38,6 +38,8 @@ from r1_personas import H_TOPICS, deep_need_topics_in, resolve_persona
 from r1_text import canonical_amounts, fuzzy_contains, split_sentences
 from r1_world import DURATION_MONTHS, NET_PRICES_USD, PRICE_USD, DISCOUNTS_USD, claims_guarantee
 
+from rehearsal import flags
+
 ROLEPLAY = "roleplay"
 BOT = "bot"
 CANDIDATE = "candidate"
@@ -600,6 +602,18 @@ def _advisor(ex: Mapping[str, Any]) -> Mapping[str, Any]:
     return ex.get("advisor") or {}
 
 
+def _learner_r(ex: Mapping[str, Any]) -> float:
+    """The R of an exchange's learner line: when the engine decided it (``learner.r_sec``, which
+    the full tier records), else the exchange's own R (the advisor turn's start).  A window check
+    (13:00 commitments, 14:00 time cues) asks when the LEARNER spoke, and an advisor turn can start
+    before 13:00 and end after it (diagnosis-1 L2).  ``REHEARSAL_LEARNER_CLOCK=0``: the old timing.
+    """
+    decided = _learner(ex).get("r_sec")
+    if isinstance(decided, (int, float)) and flags.on(flags.LEARNER_CLOCK):
+        return float(decided)
+    return float(ex.get("r_sec") or 0.0)
+
+
 def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """M6 need disclosure after a genuine probe, M6b unprompted dump.
 
@@ -751,7 +765,7 @@ def commitment_metrics(
     for ex in exchanges:
         plan = _learner(ex).get("plan") or {}
         if plan.get("commitment_level") in ("MEDIUM", "STRONG") and _spoke_commitment(ex):
-            if float(ex.get("r_sec") or 0.0) < COMMIT_PERMITTED_R_SEC:
+            if _learner_r(ex) < COMMIT_PERMITTED_R_SEC:
                 premature += 1
     return {
         "commitment_level": level,
@@ -878,7 +892,7 @@ def misfire_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             intent == "farewell" or _ADVISOR_FAREWELL.search(advisor_text)
         ):
             found.append({"exchange": index + 1, "kind": "no_one_leaving"})
-        if _TIME_CUE_WORDS.search(text) and float(ex.get("r_sec") or 0.0) < 840:
+        if _TIME_CUE_WORDS.search(text) and _learner_r(ex) < 840:
             found.append({"exchange": index + 1, "kind": "time_cue_too_early"})
         if intent in ASK_INTENTS and (
             fuzzy_contains(text, WEAK_LINE) or fuzzy_contains(text, LEGACY_DEFLECTION)

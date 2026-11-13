@@ -562,6 +562,9 @@ def _note_turn(
         "tokens": _tokens(calls),
         "plan": _plan_summary(plan, spoken) if plan is not None else None,
         "suppressed": None,
+        # When the engine decided the line (the window checks time it by this, not by the
+        # advisor turn's start: ``rehearsal.metrics._learner_r``).
+        "r_sec": None if result.get("decided_r_sec") is None else round(float(result["decided_r_sec"]), 1),
     }
     if spoken is None:
         learner["suppressed"] = _suppressed_why(

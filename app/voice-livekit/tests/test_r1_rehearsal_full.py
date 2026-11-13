@@ -1350,5 +1350,53 @@ class FullCliTests(unittest.TestCase):
         self.assertEqual("end_intent_runner" in kwargs, "end_intent_runner" in runner_names())
 
 
+# ---------------------------------------------------------------- diagnosis-1 harness fixes
+def _switch(name: str, value: str):
+    return unittest.mock.patch.dict("os.environ", {name: value})
+
+
+class LearnerClockTests(unittest.TestCase):
+    """L2: a learner line is timed by the R the engine decided it at (synthetic text)."""
+
+    @staticmethod
+    def _exchange(r_sec, learner_r):
+        learner = {"spoken": "Let's book a call with my husband so we can decide.",
+                   "plan": {"resolves": True, "commitment_level": "MEDIUM", "delivered_commitment": True}}
+        if learner_r is not None:
+            learner["r_sec"] = learner_r
+        return {"n": 1, "r_sec": r_sec, "advisor": {"text": "Shall we book a call?", "intent": "close_ask"},
+                "learner": learner}
+
+    def test_a_commitment_decided_after_13_00_is_not_premature(self) -> None:
+        from rehearsal import metrics
+
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        self.assertEqual(metrics.commitment_metrics([self._exchange(775.0, 787.0)], admin)["premature_commit_count"], 0)
+        self.assertEqual(metrics.commitment_metrics([self._exchange(775.0, None)], admin)["premature_commit_count"], 1)
+        self.assertEqual(metrics.commitment_metrics([self._exchange(700.0, 760.0)], admin)["premature_commit_count"], 1)
+
+    def test_off_times_the_line_by_the_advisor_turn(self) -> None:
+        from rehearsal import metrics
+        from rehearsal.flags import LEARNER_CLOCK
+
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        with _switch(LEARNER_CLOCK, "0"):
+            self.assertEqual(metrics.commitment_metrics([self._exchange(775.0, 787.0)], admin)["premature_commit_count"], 1)
+
+    def test_every_exchange_records_when_the_learner_line_was_decided(self) -> None:
+        records = offline_records()
+        seen = 0
+        for name, record in records.items():
+            for ex in record["exchanges"]:
+                decided = ex["learner"].get("r_sec")
+                if ex.get("r_sec") is None or ex["learner"].get("spoken") is None:
+                    continue  # no learner line (a suppressed turn: nothing was decided)
+                with self.subTest(scenario=name, exchange=ex["n"]):
+                    self.assertIsNotNone(decided)
+                    self.assertGreaterEqual(decided, ex["r_sec"])
+                seen += 1
+        self.assertGreater(seen, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
