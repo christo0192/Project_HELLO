@@ -240,7 +240,9 @@ from r1_prompts import (
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
     FIGURE_CHALLENGE_NOTE,
+    FINAL_ASKED_NOTE,
     FLOOR_NOTE,
+    PROPOSAL_UNANSWERED_NOTE,
     HOW_ARE_YOU_EXAMPLES,
     HOW_ARE_YOU_NOTE,
     NO_REPEAT_REASK_NOTE,
@@ -251,6 +253,7 @@ from r1_prompts import (
     OPEN_QUESTION_NOTE,
     PRICE_CONFLICT_WEBSITE_NOTE,
     PRICE_MET_NOTE_EARLY,
+    PRICE_MET_NOTE_EARLY_V2,
     PRICE_REFLEX_BUDGET_NOTE,
     PRICE_REFLEX_EXAMPLES,
     PRICE_REFLEX_NOTE,
@@ -766,6 +769,13 @@ FLAG_PRICE_ASKED_ONCE = "R1_PRICE_ASKED_ONCE"
 FLAG_NO_ACCEPT_NOTES = "R1_NO_ACCEPT_NOTES"
 # The advisor turns whose words she may echo (R1_ECHO_GUARD).
 ADVISOR_TERM_TURNS = 4
+# R1_PRICE_ASKED_ONCE: the replies after her final-price question that are told not to ask it again.
+FINAL_ASKED_TURNS = 3
+_FINAL_PRICE_QUESTION = re.compile(
+    r"\b(?:final|real|actual|total|full)\b[^.?!]{0,25}\b(?:price|number|figure|cost)\b"
+    r"|\b(?:price|number|figure)\b[^.?!]{0,20}\bfinal\b",
+    re.IGNORECASE,
+)
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
 # The flags that are OFF unless set (every other flag is on unless set to 0/off/false/no).
 _FLAG_DEFAULT_OFF = frozenset({FLAG_WRAPUP_NEXT_ROUND})
@@ -1189,6 +1199,9 @@ class RolePlayEngine:
         # (memory only, never logged), and whether this turn's question offered her a choice.
         self._advisor_term_turns: list[frozenset[str]] = []
         self._choice_offered = False
+        # Simulation diagnosis 1 (R1_PRICE_ASKED_ONCE, L3): the turn of her last final-price
+        # question and how many offers the negotiation held then (None: none asked).
+        self._final_asked: tuple[int, int] | None = None
         self._answered: list[str] = []
         self._dig_deferred: set[str] = set()
         self._call_ask_now = False
@@ -2864,6 +2877,19 @@ class RolePlayEngine:
         """How often the learner hung up on abuse (S3.4)."""
         return sum(1 for offer in self._wrap_offers if offer["trigger"] == TRIGGER_ABUSE)
 
+    def _final_price_asked(self, move_id: str | None) -> bool:
+        """L3 (R1_PRICE_ASKED_ONCE): she asked for the final price lately and no offer came since.
+
+        The F1 pair carry the price in their own brief and are never told this.
+        """
+        if self._final_asked is None or move_id in (F1_ANCHOR, F1_COUNTER):
+            return False
+        turn, offers = self._final_asked
+        if len(self.negotiation.offers) != offers or self.turn - turn > FINAL_ASKED_TURNS:
+            self._final_asked = None  # a new figure, or long enough ago: she may ask again
+            return False
+        return flag_on(FLAG_PRICE_ASKED_ONCE)
+
     def _abuse_hangs_up(self, text: str) -> bool:
         """S3.4: ``text`` is abuse aimed at her that the hang-up below would answer now."""
         return (
@@ -4039,6 +4065,8 @@ class RolePlayEngine:
                 # M032 SWEEP-2 (salvage): before the anchor she has asked for nothing yet.
                 early = self._probe_first and not self.scheduler.is_delivered(F1_ANCHOR)
                 note = PRICE_MET_NOTE_EARLY if early else PRICE_MET_NOTE
+                if early and flag_on(FLAG_NO_ACCEPT_NOTES):
+                    note = PRICE_MET_NOTE_EARLY_V2  # simulation diagnosis 1 (U4 (2))
                 self._price_notes.append(note.format(amount=format_usd(best)))
             elif seen.lower_offer_usd is None:
                 self._price_notes.append(PRICE_UNCHANGED_NOTE.format(amount=format_usd(best)))
@@ -4158,6 +4186,8 @@ class RolePlayEngine:
             notes.append(
                 DECIDER_SAID_NOTE.format(decision_maker=self.persona.decision_maker)
             )
+        if self._final_price_asked(move_id):
+            notes.append(FINAL_ASKED_NOTE)  # simulation diagnosis 1 (L3)
         if self._phrases.get(PHRASE_STRETCH, 0) >= 1:
             notes.append(STRETCH_USED_NOTE)
         if self._phrases.get(PHRASE_TEMPLATE_Q, 0) >= 1:
@@ -4297,6 +4327,10 @@ class RolePlayEngine:
                     reasons.append("ask_yields_to_owed_move")
                     if owed.family != "F4":
                         self._notes.append(NEXT_STEP_PROPOSED_NOTE)
+                    elif flag_on(FLAG_NO_ACCEPT_NOTES):
+                        # Simulation diagnosis 1 (L7): the F4 point answers the turn, and the
+                        # proposal is still not hers to accept before the window.
+                        self._notes.append(PROPOSAL_UNANSWERED_NOTE)
                     return None
                 if self._price_first_due():
                     # M032 SWEEP-22: she asks the price before she worries about it.  No stall:
@@ -4812,7 +4846,9 @@ class RolePlayEngine:
                 text = self._probe_first_variants(replace(move, forced=False), texts[3])[0]
         elif move.id == F1_COUNTER and flag_on(FLAG_COUNTER_V2):
             situation = self.negotiation.counter_situation(
-                counter_v2=True, far_below=self._far_below()
+                counter_v2=True,
+                far_below=self._far_below(),
+                asked_once=flag_on(FLAG_PRICE_ASKED_ONCE),
             )
             text = self._fallback_order(move.id, situation.variants)[0]
             self.negotiation.note_response(self.turn, f"counter:{situation.id}")
@@ -4943,7 +4979,9 @@ class RolePlayEngine:
         if move.id == F1_COUNTER:
             counter_v2 = flag_on(FLAG_COUNTER_V2)
             situation = self.negotiation.counter_situation(
-                counter_v2=counter_v2, far_below=counter_v2 and self._far_below()
+                counter_v2=counter_v2,
+                far_below=counter_v2 and self._far_below(),
+                asked_once=flag_on(FLAG_PRICE_ASKED_ONCE),
             )
             conflict = self._turn_conflict
             if conflict is not None:
@@ -5562,6 +5600,11 @@ class RolePlayEngine:
                 norm for norm in (normalize(question) for question in questions) if norm
             )
             self._asked_yes_no = bool(questions) and _NOT_YES_NO.search(questions[-1]) is None
+            if flag_on(FLAG_PRICE_ASKED_ONCE) and any(
+                _FINAL_PRICE_QUESTION.search(question) for question in questions
+            ):
+                # Simulation diagnosis 1 (L3): her final-price question, and the offers it saw.
+                self._final_asked = (self.turn, len(self.negotiation.offers))
             self._note_voice(plan, spoken_text, tics)
             if (
                 plan.commitment_level is None

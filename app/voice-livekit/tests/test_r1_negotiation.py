@@ -3292,5 +3292,41 @@ class HerNumberQuestionTests(unittest.TestCase):
             her_number_question(text)
             self.assertLess(time.perf_counter() - started, 0.25)
 
+
+class PriceAskedOnceTests(unittest.TestCase):
+    """Simulation diagnosis 1, L3 (R1_PRICE_ASKED_ONCE): a challenged anchor is no unclear price."""
+
+    def _challenged(self) -> Negotiation:
+        state = neg.Negotiation("husband")
+        state.observe(3, "Pricing, yes, the price is $9000 and it runs for six months.", read_totals=True)
+        state.observe(5, "Who told you that? Can you name anyone who paid that?", anchor_turn=4,
+                      read_totals=True)
+        return state
+
+    def test_a_full_price_named_before_the_challenge_counts_as_held(self):
+        state = self._challenged()
+        self.assertEqual(state.price_situation(counter_v2=True), neg.SITUATION_UNCLEAR)
+        self.assertEqual(
+            state.price_situation(counter_v2=True, asked_once=True), neg.SITUATION_REFUSED
+        )
+
+    def test_a_tentative_answer_stays_unclear(self):
+        state = neg.Negotiation("husband")
+        state.observe(3, "The course costs $9000.", read_totals=True)
+        state.observe(5, "Yeah, we can see what we can do about that.", anchor_turn=4,
+                      read_totals=True)
+        self.assertEqual(
+            state.price_situation(counter_v2=True, asked_once=True), neg.SITUATION_UNCLEAR
+        )
+
+    def test_with_no_price_named_it_stays_unclear_and_the_brief_never_says_unclear(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "Who told you that?", anchor_turn=4, read_totals=True)
+        counter = state.counter_situation(counter_v2=True, asked_once=True)
+        self.assertEqual(counter.id, neg.SITUATION_UNCLEAR)
+        self.assertNotIn("clear", counter.brief)
+        self.assertIn("clear", state.counter_situation(counter_v2=True).brief)
+
+
 if __name__ == "__main__":
     unittest.main()

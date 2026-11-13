@@ -692,6 +692,32 @@ COUNTERS_V2: tuple[CounterSituation, ...] = (
     ),
 )
 COUNTER_V2_BY_SITUATION = {item.id: item for item in COUNTERS_V2}
+# Simulation diagnosis 1 (L3): the advisor questions where her $7,000 came from ("Who told you
+# that?", "Where did you hear that?", "those figures aren't verified").
+_FIGURE_SOURCE_CHALLENGE = re.compile(
+    r"\bwho (?:told|said|gave) (?:you|that)\b"
+    r"|\bwhere did you (?:get|hear|read|see|find) (?:that|this|it|those|these|the)\b"
+    r"|\b(?:not|aren'?t|isn'?t|weren'?t|wasn'?t) (?:verified|true|real|accurate|correct)\b"
+    r"|\bsupposedly\b"
+    r"|\bname (?:anyone|someone|the (?:people|person))\b",
+    re.IGNORECASE,
+)
+
+
+def challenges_her_figure(text: object) -> bool:
+    """L3: an advisor turn that questions the source of her figure."""
+    return _FIGURE_SOURCE_CHALLENGE.search(fold(text)) is not None
+
+
+# Simulation diagnosis 1 (L3, flag R1_PRICE_ASKED_ONCE): the unclear counter's brief read "the
+# advisor's answer on price was not clear", and the model said so out loud ("your answer wasn't
+# clear to me") to an advisor who had named the price.  Same variants, no verdict on his answer.
+UNCLEAR_COUNTER_V3 = CounterSituation(
+    SITUATION_UNCLEAR,
+    "you still do not know what the price would come to for you, so ask what it would come to, "
+    "all in",
+    COUNTER_BY_SITUATION[SITUATION_UNCLEAR].variants,
+)
 # SWEEP-19 item 6: the advisor asked what number works for her while the counter is planned (only on
 # a short or unclear answer): she names the $7,000 she heard as her hope.
 YOUR_NUMBER_COUNTER_SUFFIX = (
@@ -3836,6 +3862,9 @@ class Negotiation:
         # M032 SWEEP-19: the latest turn after the anchor that restated the full price with no
         # offer, or said the price is fixed ("No, the price is $9,000 for everyone.").
         self.full_price_turn: int | None = None
+        # Simulation diagnosis 1 (L3): the advisor turn after the anchor that questioned where her
+        # figure came from ("Who told you that?"), or None.
+        self.figure_challenged_turn: int | None = None
         self._totals_read = False
         # Review S2P-R2 (naturalness): her heard anchor asked about the website's price (the check
         # form), so no WEBSITE conflict is checked after it (``note_anchor``).
@@ -3975,6 +4004,8 @@ class Negotiation:
             refusal = refuses_price(text)
             if refusal:
                 self.refusals += 1
+            if self.figure_challenged_turn is None and challenges_her_figure(text):
+                self.figure_challenged_turn = turn  # L3: "Who told you that?"
         self.offers.extend(offers)
         newly: set[str] = set()
         addressed = reasons_handled_in(text, self.decision_maker)
@@ -4197,7 +4228,7 @@ class Negotiation:
             None,
         )
 
-    def price_situation(self, *, counter_v2: bool = False) -> str:
+    def price_situation(self, *, counter_v2: bool = False, asked_once: bool = False) -> str:
         """How the advisor answered the anchor: short of the ask, met it, refused, or unclear.
 
         The best price on the table counts, whenever it was offered; but an advisor who only
@@ -4205,6 +4236,10 @@ class Negotiation:
         (``counter_v2``): with no offer and no refusal, an advisor who restated the full price or
         said it is fixed after the anchor (``full_price_turn``) has refused too; the refusal count
         and the turn the anchor was answered are not touched, so the counter's timing is unchanged.
+        Simulation diagnosis 1 (L3, ``asked_once``: R1_PRICE_ASKED_ONCE): so has an advisor who
+        named the full price and then, after the anchor, only challenged her figure ("Who told you
+        that?", ``figure_challenged_turn``): she knows his price, so asking what it would be is the
+        same question twice.  A tentative answer ("we can see what we can do") stays unclear.
         """
         best = self.best_offer_usd
         if best is not None and (self.answer_offer or not self.refusals):
@@ -4213,20 +4248,31 @@ class Negotiation:
             return SITUATION_REFUSED
         if counter_v2 and best is None and self.full_price_turn is not None:
             return SITUATION_REFUSED
+        if (
+            counter_v2
+            and asked_once
+            and best is None
+            and self.figure_challenged_turn is not None
+            and any(usd >= ANCHOR_USD for _turn, usd, _kind in self.quotes)
+        ):
+            return SITUATION_REFUSED
         return SITUATION_UNCLEAR
 
     def counter_situation(
-        self, *, counter_v2: bool = False, far_below: bool = False
+        self, *, counter_v2: bool = False, far_below: bool = False, asked_once: bool = False
     ) -> CounterSituation:
         """The counter for how the advisor answered the anchor.
 
         M032 SWEEP-19 (``counter_v2``): the v2 texts; a met price that is far below anything she
         expected (``far_below``: the best offer is $3,000 or less, or the last price read was low or
-        free) gets the careful-buyer counter instead of relief.
+        free) gets the careful-buyer counter instead of relief.  ``asked_once`` (L3,
+        R1_PRICE_ASKED_ONCE): see ``price_situation``, and the unclear brief has no verdict.
         """
-        situation = self.price_situation(counter_v2=counter_v2)
+        situation = self.price_situation(counter_v2=counter_v2, asked_once=asked_once)
         if not counter_v2:
             return COUNTER_BY_SITUATION[situation]
+        if asked_once and situation == SITUATION_UNCLEAR:
+            return UNCLEAR_COUNTER_V3
         best = self.best_offer_usd
         if situation == SITUATION_MET and (
             far_below or (best is not None and best <= IMPLAUSIBLE_NET_USD)

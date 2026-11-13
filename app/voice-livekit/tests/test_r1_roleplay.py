@@ -3412,7 +3412,9 @@ class PriceNegotiationThroughTheEngineTests(unittest.TestCase):
         counter = s.say(NEUTRAL, 140)  # its two-turn fallback
         self.assertEqual(counter.move_id, "F1-COUNTER")
         self.assertEqual(s.eng.negotiation.price_situation(), "unclear")
-        self.assertIn("what the final price would actually be", counter.intent.brief)
+        # Simulation diagnosis 1 (L3, R1_PRICE_ASKED_ONCE): the brief has no verdict on his answer.
+        self.assertIn("ask what it would come to", counter.intent.brief)
+        self.assertNotIn("clear", counter.intent.brief)
         self.assertIn(counter.intent.fallbacks[0], neg_variants("unclear"))
 
     @s2p_off
@@ -10177,13 +10179,21 @@ class Sweep2PriceMetEarlyTests(unittest.TestCase):
         s.say(OPENER, 20)
         s.say(PITCH, 40)  # F3 opens, so F1 cannot fire on the price turn
         plan = s.say("I can do $6,500 for you.", 60)
-        self.assertIn(P2.PRICE_MET_NOTE_EARLY.format(amount="$6,500"), plan.reminder)
+        # Simulation diagnosis 1 (U4 (2), R1_NO_ACCEPT_NOTES): the early note's second wording.
+        self.assertIn(P2.PRICE_MET_NOTE_EARLY_V2.format(amount="$6,500"), plan.reminder)
         after = _anchor_done()
         after.say(SHORT_ACK, 60)
         plan = after.say("Okay, I can do $6,500 for you.", 80)
         if plan.move_id in (F1_ANCHOR, F1_COUNTER):
             plan = after.say("Yes, $6,500 is the price for you.", 100)
+        self.assertNotIn(P2.PRICE_MET_NOTE_EARLY_V2.format(amount="$6,500"), plan.reminder)
         self.assertNotIn(P2.PRICE_MET_NOTE_EARLY.format(amount="$6,500"), plan.reminder)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_NO_ACCEPT_NOTES": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.say(PITCH, 40)
+            plan = s.say("I can do $6,500 for you.", 60)
+        self.assertIn(P2.PRICE_MET_NOTE_EARLY.format(amount="$6,500"), plan.reminder)
 
 
 @s2p_on
@@ -12156,6 +12166,57 @@ class AbuseBeforeEndRequestTests(unittest.TestCase):
             s.say(OPENER, 20)
             plan = s.say("Come on, stop wasting my time, you idiot.", 360, end_intent="maybe")
         self.assertEqual(plan.line_id, "L-ASIDE-END")
+
+
+class NoAcceptAndAskedOnceTests(unittest.TestCase):
+    """Simulation diagnosis 1: L7, U4 (2) (R1_NO_ACCEPT_NOTES) and L3 (R1_PRICE_ASKED_ONCE)."""
+
+    ASK = "Would you be free for a quick call with our senior counsellor tomorrow at six?"
+
+    def test_an_f4_point_answering_a_proposal_is_told_not_to_accept_it(self):
+        s, r = f4_primary_session()
+        plan = s.say(self.ASK, r + 20)
+        self.assertEqual(plan.move_id, r1_scheduler.F4_PUSH)
+        self.assertIn("ask_yields_to_owed_move", plan.reasons)
+        self.assertIn(P2.PROPOSAL_UNANSWERED_NOTE, plan.reminder)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_NO_ACCEPT_NOTES": "0"}):
+            s, r = f4_primary_session()
+            plan = s.say(self.ASK, r + 20)
+        self.assertNotIn(P2.PROPOSAL_UNANSWERED_NOTE, plan.reminder)
+
+    def test_the_early_price_met_note_has_no_sayable_phrase(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)
+        plan = s.say("I can do $6,500 for you.", 60)
+        self.assertIn(P2.PRICE_MET_NOTE_EARLY_V2.format(amount="$6,500"), plan.reminder)
+        self.assertNotIn("heard someone paid", plan.reminder)
+
+    STATEMENT = "Our mentors come from top companies and the live classes are small."
+
+    def _asked_final(self):
+        """A session whose last free reply asked for the final price; the R it reached."""
+        s = Session(engine(), reply="Okay.")
+        s.say(OPENER, 20)
+        s.say("I can do $6,500 for you.", 40)
+        s.reply = "Okay. Is that the final price, all in?"
+        r = 60
+        while s.eng._final_asked is None and r < 400:
+            s.say(self.STATEMENT, r)
+            r += 20
+        s.reply = "Okay."
+        return s, r
+
+    def test_her_final_price_question_is_not_asked_again_until_a_new_offer(self):
+        s, r = self._asked_final()
+        self.assertIsNotNone(s.eng._final_asked)
+        plan = s.say(self.STATEMENT, r)
+        self.assertIn(P2.FINAL_ASKED_NOTE, plan.reminder)
+        fresh = s.say("Actually, I can go to $6,000 for you.", r + 20)
+        self.assertNotIn(P2.FINAL_ASKED_NOTE, fresh.reminder or "")
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PRICE_ASKED_ONCE": "0"}):
+            s, r = self._asked_final()
+            self.assertIsNone(s.eng._final_asked)
 
 
 class MarkersV2EngineTests(unittest.TestCase):

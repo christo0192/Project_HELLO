@@ -609,6 +609,18 @@ ACK_TURN_CONCERNS_NOTE_V2 = (
     'before (for example "So, the mentors?"). Otherwise ask one short question about something '
     "you still want to know."
 )
+# Simulation diagnosis 1 (L3, flag R1_PRICE_ASKED_ONCE): she asked "is that the final price?" and,
+# two exchanges later with no new offer, asked it again.
+FINAL_ASKED_NOTE = (
+    "- You already asked whether that is the final price: do not ask it again unless they name a "
+    "new figure."
+)
+# Simulation diagnosis 1 (L7, flag R1_NO_ACCEPT_NOTES): the advisor proposed a next step on a turn
+# her owed F4 point answers; she made the point and accepted the callback as well.
+PROPOSAL_UNANSWERED_NOTE = (
+    "- The advisor also proposed a call or a next step. Do not agree to it and do not name a day "
+    "or a time in this reply: make only the point below."
+)
 # SWEEP-12: the soft tics ("actually", "genuinely", "properly", "I'd rather"); ``{words}`` is a
 # worker-built list of quoted words.
 SOFT_TIC_NOTE = "- You have leaned on {words} lately: leave them out of this reply."
@@ -630,6 +642,13 @@ CURIOSITY_NOTE_V2 = (
 PRICE_MET_NOTE_EARLY = (
     "- The price on the table is \"{amount}\", at or below the $7,000 you heard someone paid. "
     "Never say it is too much, still a lot or out of reach, and do not push for a lower one."
+)
+# Simulation diagnosis 1 (U4 (2), flag R1_NO_ACCEPT_NOTES): the note's own phrase was read back
+# ("no more than what I heard people paid, so").  The stance, with no sayable phrase.
+PRICE_MET_NOTE_EARLY_V2 = (
+    "- The price on the table is \"{amount}\". It is not more than you expected to pay: never say "
+    "it is too much, still a lot or out of reach, and do not push for a lower one. If you react to "
+    "it, say how it feels in your own words."
 )
 # SWEEP-17 item 6: the advisor says he never gave the figure her last line used.
 FIGURE_CHALLENGE_NOTE = (

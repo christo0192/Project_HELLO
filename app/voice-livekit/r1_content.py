@@ -496,6 +496,15 @@ def _sim_repairs() -> dict[str, Any]:
     return {
         # L5 (R1_ECHO_GUARD): the re-ask is shorter and in other words.
         "ack_turn_notes_v2": [p.ACK_TURN_NOTE_V2, p.ACK_TURN_CONCERNS_NOTE_V2],
+        # L3 (R1_PRICE_ASKED_ONCE): the final price asked once, and the unclear counter's brief.
+        "final_asked_note": p.FINAL_ASKED_NOTE,
+        "unclear_counter_v3": {
+            "brief": r1_negotiation.UNCLEAR_COUNTER_V3.brief,
+            "variants": list(r1_negotiation.UNCLEAR_COUNTER_V3.variants),
+        },
+        # L7, U4 (2) (R1_NO_ACCEPT_NOTES).
+        "proposal_unanswered_note": p.PROPOSAL_UNANSWERED_NOTE,
+        "price_met_note_early_v2": p.PRICE_MET_NOTE_EARLY_V2,
         # U1, U2 (R1_MARKERS_V2): the alternatives added to each marker group.
         "extra_markers_v2": {
             move_id: [list(group) for group in groups]
