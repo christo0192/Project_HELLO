@@ -1453,6 +1453,45 @@ class CommitReaderV2Tests(unittest.TestCase):
             )
             self.assertLess(classify_learner_commitment("Holding a spot for me is fine."), Level.MEDIUM)
 
+    def test_review_a_link_handed_over_is_still_an_enrol_ask(self):
+        import r1_commitment
+
+        for text in (
+            "Here's the payment link.",
+            "Here is the enrollment link.",
+            "I've shared the payment link with you.",
+            "I just dropped the payment link in the chat.",
+            "I've put the payment link in your WhatsApp.",
+            "I'm attaching the payment link now.",
+            "You'll get the payment link in a minute.",
+            "Payment link is on its way to your inbox right now.",
+            "Payment link below, enrol today.",
+            "Here's the brochure and the payment link.",
+        ):
+            with self.subTest(text=text):
+                ask = r1_commitment.detect_ask(text)
+                self.assertIsNotNone(ask)
+                self.assertEqual(ask.kind, AskKind.ENROL)
+
+    def test_review_an_activity_must_be_the_subject_of_works(self):
+        for text in (
+            "Tomorrow works, I'll check my calendar.",
+            "Checking in tomorrow works for me.",
+            "Friday works for me, I can read it before then.",
+            "7 pm works, I'll check my diary.",
+            "Reviewing it together on Thursday works for me.",
+            "Going over it with you tomorrow works.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.MEDIUM)
+        for text in (
+            "Reading it tonight works for me.",
+            "Looking over it tomorrow suits me.",
+            "Sure, reading it tonight works.",
+        ):
+            with self.subTest(text=text):
+                self.assertLess(classify_learner_commitment(text), Level.MEDIUM)
+
 
 if __name__ == "__main__":
     unittest.main()

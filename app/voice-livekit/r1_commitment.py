@@ -904,19 +904,33 @@ _BARE_LINK = re.compile(
     r"\b(?:payment|enrol+ment|registration|sign-?up|invoice) link\b", re.IGNORECASE
 )
 _LINK_ACTOR = re.compile(
-    r"\b(?:send|sending|sent|share|sharing|email|emailing|e-mail|text|forward|resend|drop)\b"
+    r"\b(?:send|sending|sent|share|sharing|shared|email|emailing|emailed|e-mail|text|texted|"
+    r"forward|forwarded|resend|drop|dropped|dropping|put|putting|pop|popped|popping|attach|"
+    r"attached|attaching|post|posted|paste|pasted)\b"
     r"|\b(?:i|we)(?:'ll|'d| will| would| can| could| shall| should)?\s+(?:\w+\s+){0,2}?"
     r"(?:give|get|whatsapp)\b"
+    r"|\byou(?:'ll| will| should| would)?\s+(?:\w+\s+)?(?:get|receive|see|find it|have)\b"
+    r"|\bhere(?:'s| is| are|\b)|\bon (?:its|the) way\b|\bbelow\b|\babove\b"
     r"|\blet(?:'s| me| us)\b"
     r"|\b(?:grab|click|use|open|follow|tap|complete|fill|pay (?:through|via|with|on))\b",
+    re.IGNORECASE,
+)
+# Review of L4: the e-mail-content shape the diagnosis named, a link noun inside a list of content
+# nouns ("the price, the course details, the payment link, all of it"; "the fee and the payment
+# link").  A link named on its own is still handed over.
+_LINK_IN_LIST = re.compile(
+    r"(?:,|\band\b)\s*(?:the\s+|a\s+)?(?:payment|enrol+ment|registration|sign-?up|invoice) link\b"
+    r"|\b(?:payment|enrol+ment|registration|sign-?up|invoice) link\s*(?:,|\band\b)\s*"
+    r"(?:the|a|all|everything)\b",
     re.IGNORECASE,
 )
 
 
 def _link_listed(sentence: object, lowered: str) -> bool:
-    """L4: the sentence names a payment link that nobody sends, asks about or tells her to use."""
+    """L4: the sentence lists a payment link among the e-mail's contents, and nobody sends it,
+    hands it over, asks about it or tells her to use it."""
     return (
-        _BARE_LINK.search(lowered) is not None
+        _LINK_IN_LIST.search(lowered) is not None
         and "?" not in str(sentence)
         and _LINK_ACTOR.search(lowered) is None
     )
@@ -1031,15 +1045,27 @@ _MEDIUM = _compile(
 # activity is its subject ("Reading it tonight works for me." agrees to read an e-mail), unless a
 # call, a chat or a meeting is named all the same.
 _MEDIUM_DAY_WORKS = (_MEDIUM[1], _MEDIUM[7])
-_ACTIVITY = re.compile(
-    r"\b(?:read(?:ing)?|look(?:ing)? (?:at|over|through)|go(?:ing)? (?:over|through)|"
-    r"review(?:ing)?|check(?:ing)?|think(?:ing)? (?:it|this|that) over|sleep(?:ing)? on|"
-    r"discuss(?:ing)?|talk(?:ing)? (?:it|this|that) (?:over|through))\b",
+_CALL_TALK = re.compile(
+    r"\b(?:call|chat|meeting|talk|speak|catch up|connect|follow[- ]?up|check(?:ing)?[- ]in|"
+    r"together|with you|with me|with us)\b",
     re.IGNORECASE,
 )
-_CALL_TALK = re.compile(
-    r"\b(?:call|chat|meeting|talk|speak|catch up|connect|follow[- ]?up)\b", re.IGNORECASE
+# Review of L6: the activity must be the subject of "works": a gerund that opens the clause the
+# day or clock time is in ("Reading it tonight works for me."), not an activity anywhere in the
+# sentence ("Tomorrow works, I'll check my calendar." accepts tomorrow).
+_ACTIVITY_SUBJECT = re.compile(
+    r"\W*(?:(?:sure|yes|yeah|okay|ok|fine|alright|right)\W+)*(?:reading|looking (?:at|over|"
+    r"through)|going (?:over|through)|reviewing|checking|thinking (?:it|this|that) over|"
+    r"sleeping on|discussing|talking (?:it|this|that) (?:over|through))\b",
+    re.IGNORECASE,
 )
+_SUBJECT_CLAUSE_BREAK = re.compile(r"[,;:]|\s-+\s|\b(?:and|but|so|then|because)\b", re.IGNORECASE)
+
+
+def _activity_is_subject(lowered: str, match: re.Match[str]) -> bool:
+    """L6: the day-or-time "works" at ``match`` has a reading or doing activity as its subject."""
+    head = _SUBJECT_CLAUSE_BREAK.split(lowered[: match.start()])[-1]
+    return _ACTIVITY_SUBJECT.match(head) is not None
 # U4 (1) (R1_COMMIT_READER_V2): accepting a seat or a spot held for her is a step toward enrolling,
 # capped before the window like a callback ("Setting a seat aside while I read the terms, I can
 # live with that.").
@@ -1061,11 +1087,12 @@ def _medium_v2(lowered: str) -> bool | None:
         match = pattern.search(lowered)
         if match is not None and _HOLD_NEGATOR.search(lowered[: match.end()]) is None:
             return True
-    activity = _ACTIVITY.search(lowered) is not None and _CALL_TALK.search(lowered) is None
+    no_call = _CALL_TALK.search(lowered) is None
     for pattern in _MEDIUM:
-        if pattern.search(lowered) is None:
+        match = pattern.search(lowered)
+        if match is None:
             continue
-        if activity and pattern in _MEDIUM_DAY_WORKS:
+        if no_call and pattern in _MEDIUM_DAY_WORKS and _activity_is_subject(lowered, match):
             continue
         return True
     return False
