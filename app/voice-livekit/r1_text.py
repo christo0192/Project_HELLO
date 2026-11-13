@@ -1330,3 +1330,95 @@ def later_price_threat(sentence: object, list_usd: int = THREAT_LIST_USD) -> boo
     if not above:
         return False
     return bool(_IF_YOU_WAIT.search(canonical) or _OTHER_BATCH.search(canonical))
+
+
+# ------------------------------------------------------------------------------------------------
+# M032 SWEEP-9 (flag R1_CALL_OPENING, read by ``r1_roleplay``): the call opening.  Pure, narrow and
+# linear.  ``caller_introduced``: whether the advisor's first turns said where they call from or why
+# ("known"), only their name ("name_only"), or neither ("").  ``asks_how_she_is``: a greeting
+# question, never "how are you planning to pay?".  ``asked_who_is_calling``: HER question.
+# ------------------------------------------------------------------------------------------------
+CALLER_KNOWN = "known"
+CALLER_NAME_ONLY = "name_only"
+_CALLER_COMPANY = re.compile(
+    r"\binterview\s*(?:kick|geek|kik|quick)\s*start\b|\bkick\s*start\b", re.IGNORECASE
+)
+_CALLER_COMPANY_CASED = re.compile(r"\bIK\b")
+_CALLER_PURPOSE = re.compile(
+    r"\bforms?\b|\b(?:enquiry|inquiry|enquiries|inquiries)\b|\bwebinars?\b|\bdata science\b"
+    r"|\b(?:the|our|this|a) (?:courses?|programs?|programmes?|bootcamps?)\b"
+    r"|\bcalling (?:about|regarding|back|from|because)\b|\bfollow(?:ing)?[- ]?up\b"
+    r"|\b(?:program|programme|course|admissions?|career) (?:advisor|adviser|counsell?or|team|"
+    r"consultant)s?\b"
+    r"|\breaching out\b|\byour (?:interest|details|profile|application|registration)\b"
+    r"|\b(?:our|the) website\b|\bsigned up\b|\bregistered\b|\b(?:enquired|inquired)\b",
+    re.IGNORECASE,
+)
+_NAME_WORD = r"([A-Z][a-z]{1,23})"
+_GREETING_LEAD = r"(?:(?:hi|hello|hey|good (?:morning|afternoon|evening))\b[\s,.!-]*)?"
+_CALLER_NAMED = (
+    re.compile(
+        r"(?:^|[.!?,]\s*)(?i:" + _GREETING_LEAD + r"(?:[a-z]+[\s,.!-]+)?this is)\s+"
+        + _NAME_WORD
+        + r"\b"
+    ),
+    re.compile(
+        r"\b(?i:i'?m|i am)\s+" + _NAME_WORD + r"(?=\s*(?:,|from\b|here\b|with\b|calling\b))"
+    ),
+    re.compile(r"(?:^|[.!?,]\s*)" + _NAME_WORD + r"\s+(?i:here|this side)\b"),
+    re.compile(r"\b(?i:it'?s)\s+" + _NAME_WORD + r"\s+(?i:from|here)\b"),
+    re.compile(r"\b" + _NAME_WORD + r"\s+(?i:from (?:the|our))\s+[A-Za-z]"),
+)
+_NOT_A_CALLER_NAME = frozenset(
+    "hi hello hey good yes yeah okay ok so well sure great thanks thank this that it what how "
+    "the our your my we you i sorry just".split()
+)
+
+
+def caller_introduced(text: object, names: tuple[str, ...] = ()) -> str:
+    """``CALLER_KNOWN``, ``CALLER_NAME_ONLY`` or "" for the advisor's opening ``text``.
+
+    ``names``: her own first name (a vocative, "Hi Alex", is never the caller's name).
+    """
+    raw = fold(text)
+    if _CALLER_COMPANY.search(raw) or _CALLER_COMPANY_CASED.search(raw):
+        return CALLER_KNOWN
+    if _CALLER_PURPOSE.search(raw):
+        return CALLER_KNOWN
+    own = {name.lower() for name in names if name}
+    for pattern in _CALLER_NAMED:
+        for match in pattern.finditer(raw):
+            word = match.group(1).lower()
+            if word not in _NOT_A_CALLER_NAME and word not in own:
+                return CALLER_NAME_ONLY
+    return ""
+
+
+_HOW_ARE_YOU = re.compile(
+    r"\bhow (?:are|r) (?:you|u)\b(?! (?:planning|going|thinking|hoping|looking|managing|paying|"
+    r"finding|able|feeling about)\b)(?! doing (?:with|on|in|at|about)\b)"
+    r"|\bhow(?:'s| is) (?:it going|your day|everything|life)\b|\bhow have you been\b"
+    r"|\bhow are things\b",
+    re.IGNORECASE,
+)
+
+
+def asks_how_she_is(text: object) -> bool:
+    """The advisor asks how she is ("how are you?", "how's your day going?")."""
+    return _HOW_ARE_YOU.search(fold(text)) is not None
+
+
+_WHO_IS_CALLING = re.compile(
+    r"\bwho(?:'s| is| am i)\b[^.?!]{0,30}\b(?:this|calling|speaking|there|with)\b"
+    r"|\bwhere (?:are you|is this|are you guys) calling from\b|\bwhich company\b"
+    r"|\bwhere are you (?:from|calling)\b",
+    re.IGNORECASE,
+)
+
+
+def asked_who_is_calling(text: object) -> bool:
+    """HER line asks who is calling or from where (a question-like sentence)."""
+    return any(
+        is_question_like(sentence) and _WHO_IS_CALLING.search(fold(sentence)) is not None
+        for sentence in split_sentences(text)
+    )

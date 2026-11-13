@@ -218,6 +218,10 @@ from r1_prompts import (
     ASKED_DIRECTLY_NOTE,
     BACKCHANNEL_CUT_NOTE,
     CHALLENGE_NOTE,
+    CALLER_NAME_ONLY_EXAMPLES,
+    CALLER_NAME_ONLY_NOTE,
+    CALLER_UNKNOWN_EXAMPLES,
+    CALLER_UNKNOWN_NOTE,
     CHECKIN_DONE_NOTE,
     BUDGET_OVER_NOTE,
     CHECKIN_NOTE,
@@ -233,6 +237,8 @@ from r1_prompts import (
     EMAIL_OFFER_NOTE,
     FIGURE_CHALLENGE_NOTE,
     FLOOR_NOTE,
+    HOW_ARE_YOU_EXAMPLES,
+    HOW_ARE_YOU_NOTE,
     NO_REPEAT_REASK_NOTE,
     YOUR_NUMBER_MET_NOTE,
     YOUR_NUMBER_MONTHLY_NOTE,
@@ -368,7 +374,12 @@ from r1_scheduler import (
 from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
 from r1_text import (
+    CALLER_KNOWN,
+    CALLER_NAME_ONLY,
+    asked_who_is_calling,
     asks_for_email,
+    asks_how_she_is,
+    caller_introduced,
     PHRASE_DECIDER_STALL,
     PHRASE_STRETCH,
     PHRASE_TEMPLATE_Q,
@@ -1391,6 +1402,12 @@ class RolePlayEngine:
         self._last_heard_turn: int | None = None
         # SWEEP-6: the "what number works for you?" notes given.
         self._your_number_notes = 0
+        # SWEEP-9: who is calling is known (latched), she asked, and the opening notes used.
+        self._caller_known = False
+        self._caller_intro = ""
+        self._asked_who = False
+        self._opening_notes: dict[str, int] = {}
+        self._how_spent = False
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -2005,6 +2022,7 @@ class RolePlayEngine:
         # never heard counts too (fda9e9f6 #58/#59: the answer to her question was in the half that
         # was lost).
         self._read_open_question(reading, turn)
+        self._read_call_opening(reading, turn)
         natural = flag_on(FLAG_NATURAL_TIMING)
         respond = flag_on(FLAG_RESPOND_FIRST)
         kinds: frozenset[str] = frozenset()
@@ -2359,6 +2377,10 @@ class RolePlayEngine:
         if your_number:
             reasons.append("your_number")
         come_back = not your_number and self._come_back_note(reading, quiet=quiet_turn)
+        # M032 SWEEP-9: her first or second reply, when the opening left something to ask.
+        opening = "" if your_number or come_back else self._call_opening_note(reading, quiet_turn)
+        if opening:
+            reasons.append(f"call_opening:{opening}")
         if come_back:
             reasons.append("come_back")
         if cut:
@@ -2387,9 +2409,9 @@ class RolePlayEngine:
         # M032 S1 item 4: a turn that left something open for her hands over no curiosity topic;
         # her reply answers it (a check-in still asks for one real question).
         responding = respond and bool(kinds) and not self._force_curiosity
-        if come_back or your_number:
-            # M032 SWEEP-7: the come-back is this reply's one question, and SWEEP-6's answer is
-            # its one job; no curiosity hand-over (a check-in is answered by them too).
+        if come_back or your_number or opening:
+            # M032 SWEEP-7: the come-back is this reply's one question, and SWEEP-6's answer and
+            # SWEEP-9's opening are its one job; no curiosity hand-over or check-in note.
             pass
         elif self._force_curiosity and not quiet:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
@@ -3153,7 +3175,10 @@ class RolePlayEngine:
         if open_q["asked_turn"] != turn - 1:
             self._open_q = None
             return
-        if not dodged_question(reading, (topic,)):
+        if challenges_learner(reading, figure=self._probe_first) or not dodged_question(
+            reading, (topic,)
+        ):
+            # A challenge ("where did you get that number?") answers her line, with its own hold.
             self._open_q = None
             return
         self._dodge_now = True
@@ -3232,6 +3257,51 @@ class RolePlayEngine:
         self._notes.append(note)
         self._your_number_notes += 1
         return True
+
+    def _read_call_opening(self, reading: str, turn: int) -> None:
+        """M032 SWEEP-9: who is calling, read on the advisor's first two turns (latched)."""
+        if turn > 2 or self._caller_known or not flag_on(FLAG_CALL_OPENING):
+            self._caller_intro = ""
+            return
+        self._caller_intro = caller_introduced(reading, names=(self.persona.first_name,))
+        if self._caller_intro == CALLER_KNOWN:
+            self._caller_known = True
+
+    def _call_opening_note(self, reading: str, quiet: bool) -> str:
+        """M032 SWEEP-9 (R1_CALL_OPENING): her first or second reply asks who is calling.
+
+        A free reply only (a move always wins), never a quiet one.  Unknown caller: she answers the
+        greeting and asks who is calling, once a session, unless she already asked.  A name only:
+        she asks where from, once.  Otherwise, asked how she is: she says and asks back, once; a
+        caller note on a turn that also asked how she is spends it (she answered it then).
+        """
+        if self.turn > 2 or quiet or not flag_on(FLAG_CALL_OPENING):
+            return ""
+        how = asks_how_she_is(reading)
+        kind = ""
+        if not self._caller_known and not self._asked_who:
+            if self._caller_intro == "" and not self._opening_notes.get("unknown"):
+                kind = "unknown"
+                template, examples = CALLER_UNKNOWN_NOTE, CALLER_UNKNOWN_EXAMPLES
+            elif self._caller_intro == CALLER_NAME_ONLY and not self._opening_notes.get(
+                "name_only"
+            ):
+                kind = "name_only"
+                template, examples = CALLER_NAME_ONLY_NOTE, CALLER_NAME_ONLY_EXAMPLES
+        if kind:
+            self._how_spent = self._how_spent or how
+        elif how and not self._how_spent:
+            kind = "reciprocal"
+            template, examples = HOW_ARE_YOU_NOTE, HOW_ARE_YOU_EXAMPLES
+            self._how_spent = True
+        else:
+            return ""
+        example = pick_variant(examples, f"{self.seed}:opening", 0)
+        if kind != "reciprocal" and ASKED_DIRECTLY_NOTE in self._notes:
+            self._notes.remove(ASKED_DIRECTLY_NOTE)
+        self._notes.append(template.format(example=example))
+        self._opening_notes[kind] = self._opening_notes.get(kind, 0) + 1
+        return kind
 
     def _mark_come_back(self, open_q: dict[str, Any]) -> None:
         """SWEEP-7: she came back to it; a further dodge closes it for good."""
@@ -5407,6 +5477,8 @@ class RolePlayEngine:
         self.tracker.note_learner_text(spoken_text, plan.turn)
         if spoken_text.strip():
             self._note_open_question(plan, spoken_text)  # M032 SWEEP-7
+            if asked_who_is_calling(spoken_text):
+                self._asked_who = True  # M032 SWEEP-9: she asked already
             self._last_heard_turn = plan.turn
         # L1: her own questions.
         self._curiosity_asked.update(curiosity_asked_in(spoken_text, wide=tic_v2))
@@ -5731,6 +5803,9 @@ class RolePlayEngine:
             "open_q_dodged": self._open_q_dodged,
             "open_q_reasked": self._open_q_reasked,
             "your_number_notes": self._your_number_notes,
+            "call_opening_unknown_note": self._opening_notes.get("unknown", 0),
+            "call_opening_name_only_note": self._opening_notes.get("name_only", 0),
+            "call_opening_reciprocal_note": self._opening_notes.get("reciprocal", 0),
         }
 
     def admin_log(self, *, final: bool = False, r_end: float | None = None) -> dict[str, Any]:

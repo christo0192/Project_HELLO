@@ -3654,6 +3654,27 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(facts["abuse_hangups"], 1)
         self.assertNotIn("last_point", facts)  # counts only
 
+    async def test_the_session_facts_carry_the_followup_counts(self) -> None:
+        """M032 S7L: ``learner_followups`` is counts only, through the real worker."""
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse("Hey, what's up?", advance=5)
+        await rig.converse("Can I talk?", advance=20)
+        facts = r1_session.session_facts_event(
+            rig.engine.admin_log(), {}, roleplay_seconds=30.0
+        )["payload"]["learner_followups"]
+        self.assertEqual(facts["call_opening_unknown_note"], 1)
+        self.assertEqual(facts["floor_yields"], 1)
+        self.assertEqual(
+            set(facts),
+            {
+                "role_confusion_turns", "floor_yields", "open_q_dodged", "open_q_reasked",
+                "call_opening_unknown_note", "call_opening_name_only_note",
+                "call_opening_reciprocal_note", "your_number_notes",
+            },
+        )
+        self.assertTrue(all(isinstance(value, int) for value in facts.values()))
+
 
 if __name__ == "__main__":
     unittest.main()

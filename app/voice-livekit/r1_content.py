@@ -467,6 +467,13 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         "open_question_note": p.OPEN_QUESTION_NOTE,
         "open_question_after_ask_note": p.OPEN_QUESTION_AFTER_ASK_NOTE,
         "no_repeat_reask_note": p.NO_REPEAT_REASK_NOTE,
+        # SWEEP-9: the call-opening notes and their rotated examples.
+        "caller_unknown_note": p.CALLER_UNKNOWN_NOTE,
+        "caller_unknown_examples": list(p.CALLER_UNKNOWN_EXAMPLES),
+        "caller_name_only_note": p.CALLER_NAME_ONLY_NOTE,
+        "caller_name_only_examples": list(p.CALLER_NAME_ONLY_EXAMPLES),
+        "how_are_you_note": p.HOW_ARE_YOU_NOTE,
+        "how_are_you_examples": list(p.HOW_ARE_YOU_EXAMPLES),
         # SWEEP-6: her own number, total, monthly and already met.
         "your_number_total_note": p.YOUR_NUMBER_TOTAL_NOTE,
         "your_number_monthly_note": p.YOUR_NUMBER_MONTHLY_NOTE,

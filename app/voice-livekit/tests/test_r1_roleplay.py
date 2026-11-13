@@ -11818,6 +11818,13 @@ class ComeBackEngineTests(unittest.TestCase):
                 self.assertNotIn("come_back", plan.reasons)
                 self.assertNotIn("have not really answered", plan.reminder or "")
 
+    def test_a_challenge_is_not_a_dodge(self):
+        s = self.asked("How many hours a week would I need?")
+        plan = s.eng.plan_turn("Where did you get that number?", 60)
+        self.assertNotIn("come_back", plan.reasons)
+        self.assertIsNone(s.eng._open_q)
+        self.assertEqual(s.eng.admin_log()["followups"]["open_q_dodged"], 0)
+
     def test_an_owed_move_fires_first_and_the_come_back_waits(self):
         s = self.asked("How many hours a week would I need?")
         owed = s.say(
@@ -11957,6 +11964,80 @@ class YourNumberEngineTests(unittest.TestCase):
         ):
             ctx = GuardContext(persona=P1, phase="roleplay", control_texts=(control_prose(note),))
             self.assertTrue(guard_text(said, ctx).clean, said)
+
+
+class CallOpeningEngineTests(unittest.TestCase):
+    """M032 SWEEP-9 (R1_CALL_OPENING): she asks who is calling, and asks back "and you?"."""
+
+    @staticmethod
+    def name():
+        return P1.first_name
+
+    def test_an_unknown_caller_gets_the_who_is_calling_note_only(self):
+        from r1_prompts import CALLER_UNKNOWN_EXAMPLES, HOW_ARE_YOU_NOTE
+
+        s = Session(engine())
+        plan = s.say(f"Hey {self.name()}, what's up?", 5)
+        self.assertIn("call_opening:unknown", plan.reasons)
+        self.assertIn("ask who is calling", plan.reminder)
+        self.assertTrue(any(example in plan.reminder for example in CALLER_UNKNOWN_EXAMPLES))
+        self.assertNotIn(HOW_ARE_YOU_NOTE.split("(")[0], plan.reminder)
+        self.assertNotIn("You are curious about", plan.reminder)
+        self.assertEqual(s.eng.admin_log()["followups"]["call_opening_unknown_note"], 1)
+
+    def test_a_name_only_gets_the_where_from_note_and_never_who_is_this(self):
+        s = Session(engine())
+        plan = s.say(f"Hi {self.name()}, this is Sam, how are you?", 5)
+        self.assertIn("call_opening:name_only", plan.reasons)
+        self.assertIn("ask where they are calling from", plan.reminder)
+        self.assertNotIn("ask who is calling", plan.reminder)
+
+    def test_a_full_introduction_with_how_are_you_gets_the_reciprocal_note(self):
+        s = Session(engine())
+        plan = s.say(
+            f"Hi {self.name()}, this is Sam from Interview Kick Start. How are you doing?", 5
+        )
+        self.assertIn("call_opening:reciprocal", plan.reasons)
+        self.assertIn("ask how they are", plan.reminder)
+        self.assertNotIn("ask who is calling", plan.reminder)
+
+    def test_a_purpose_alone_gets_no_note(self):
+        s = Session(engine())
+        plan = s.say("Hi, I'm calling about the form you filled in on our website.", 5)
+        self.assertFalse(any(reason.startswith("call_opening") for reason in plan.reasons))
+
+    def test_how_are_you_is_spent_by_a_caller_note_on_the_same_turn(self):
+        s = Session(engine())
+        first = s.say(f"Hi {self.name()}, how are you?", 5)
+        self.assertIn("call_opening:unknown", first.reasons)
+        second = s.say("Good, good.", 15)
+        self.assertFalse(any(reason.startswith("call_opening") for reason in second.reasons))
+
+    def test_no_note_once_she_asked_or_outside_the_window(self):
+        s = Session(engine(), reply="Sorry, who's this?")
+        s.say("Hello?", 5)
+        s.reply = "Okay."
+        s.eng._opening_notes.clear()  # as if the first note had not been given
+        again = s.say("Yeah, so, about the thing.", 15)
+        self.assertNotIn("call_opening:unknown", again.reasons)
+        s = Session(engine())
+        s.say(OPENER, 5)
+        s.say("I see, thanks for sharing that with me.", 20)
+        late = s.say(f"So {self.name()}, how are you doing?", 40)
+        self.assertFalse(any(reason.startswith("call_opening") for reason in late.reasons))
+
+    def test_the_guard_keeps_her_question_on_the_first_reply(self):
+        s = Session(engine())
+        plan = s.eng.plan_turn(f"Hey {self.name()}, what's up?", 5)
+        result = s.eng.sanitize_reply(plan, "Hi! Sorry, who's this?")
+        self.assertIn("who's this?", result.text)
+
+    def test_flag_off_gives_no_note(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_CALL_OPENING": "0"}):
+            s = Session(engine())
+            plan = s.say(f"Hey {self.name()}, what's up?", 5)
+        self.assertFalse(any(reason.startswith("call_opening") for reason in plan.reasons))
+        self.assertNotIn("ask who is calling", plan.reminder)
 
 if __name__ == "__main__":
     unittest.main()

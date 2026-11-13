@@ -664,6 +664,36 @@ NO_REPEAT_NOTE = (
     "- Do not repeat anything you already said earlier in this call: say something new "
     "or move on."
 )
+# M032 SWEEP-9 (flag R1_CALL_OPENING): her first or second role-play reply, a free reply only.  The
+# advisor said neither who they are nor why they call: she asks who is calling; only a name: she
+# asks where from; asked how she is: she says and asks back.  ``{example}`` rotates by seed.  The
+# card, the prefix and the "I called" guard are unchanged.  New wording under D-M032-4.
+CALLER_UNKNOWN_NOTE = (
+    "- The advisor has not said who they are or why they are calling, so you do not know yet. "
+    "Answer their greeting in a few words, then ask who is calling, in your own words (for example "
+    '"{example}"). Ask nothing else, and do not mention your form, the course or a callback until '
+    "they say who they are."
+)
+CALLER_UNKNOWN_EXAMPLES = (
+    "Sorry, who's this?",
+    "Sorry, who am I speaking with?",
+    "Hi, who's calling?",
+)
+CALLER_NAME_ONLY_NOTE = (
+    "- The advisor gave their name but not where they are calling from or why. Answer their "
+    "greeting in a few words, then ask where they are calling from, in your own words (for example "
+    '"{example}"). Ask nothing else, and do not mention your form or the course until they say.'
+)
+CALLER_NAME_ONLY_EXAMPLES = (
+    "Sorry, which company is this?",
+    "Sorry, where are you calling from?",
+)
+HOW_ARE_YOU_NOTE = (
+    "- The advisor asked how you are. Say how you are in a few words and ask how they are (for "
+    'example "{example}"). If they also asked you something else, answer that briefly first. Ask '
+    "no other question."
+)
+HOW_ARE_YOU_EXAMPLES = ("And you?", "How about you?", "How are you doing?")
 # M032 SWEEP-6 (flag R1_PRICE_MEMORY): once F1-ANCHOR is delivered, "what number works for you?"
 # on a free reply gets her own figure from the card (it replaces ASKED_DIRECTLY_NOTE; no curiosity
 # that turn).  The figures are in quotes and come from the card (the $7,000 she heard people paid,
