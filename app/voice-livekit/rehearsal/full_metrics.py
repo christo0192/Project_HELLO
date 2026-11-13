@@ -24,8 +24,11 @@ phase, the questions the owner's rules and the plan ask (M032 S8):
   question; a declined request resumed the role-play, an agreed one exited it;
 * ``abuse``: what followed an insult to the learner (a hang-up path counts only where the code
   base has one: feature-detected);
-* ``brief_repair``: a brief request got the brief (or a recap) again, a shorter-brief request a
-  shorter one, a presence check a short answer;
+* ``brief_repair``: a brief request got Christy's scripted brief line again (the full brief or a
+  recap: it names the Program Advisor or the learner), a shorter-brief request a brief line under
+  60 % of the brief's length, a presence check a short answer;
+* ``icebreaker_repeat``: a request in the transition to hear an icebreaker question again got one
+  of Christy's icebreaker questions back;
 * ``wrapup_answered``: every wrap-up question got an answer before the close;
 * ``hiring_team_once``: the wrap-up and the close mention the hiring team once (M032 S3 item 5);
 * ``christy_repeats``: Christy says no sentence of six words or more three times outside the role-play;
@@ -42,6 +45,8 @@ from __future__ import annotations
 import importlib
 import re
 from typing import Any, Iterable, Mapping, Sequence
+
+from rehearsal import flags
 
 PHASE_RANK = {
     "pre_join": -1,
@@ -76,6 +81,7 @@ CHECK_IDS = (
     "end_consent",
     "abuse",
     "brief_repair",
+    "icebreaker_repeat",
     "wrapup_answered",
     "hiring_team_once",
     "christy_repeats",
@@ -395,7 +401,19 @@ def _abuse(record: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict
     }
 
 
-def _brief_repair(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _is_brief_line(row: Mapping[str, Any], learner: str | None) -> bool:
+    """Christy's scripted brief (or its recap): a ``say`` line naming the role or the learner."""
+    if row.get("source") != "say":
+        return False
+    text = str(row.get("text") or "")
+    if re.search(r"program advisor", text, re.IGNORECASE):
+        return True
+    return bool(learner) and re.search(rf"\b{re.escape(str(learner))}\b", text) is not None
+
+
+def _brief_repair(rows: Sequence[Mapping[str, Any]], record: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    v2 = flags.on(flags.TRANSITION_ACTS_V2)
+    learner = ((record or {}).get("header") or {}).get("learner_first_name")
     brief = _first(rows, speaker="bot", phase="transition")
     brief_words = _words(brief.get("text")) if brief else 0
     items = []
@@ -410,8 +428,13 @@ def _brief_repair(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         words = _words(reply.get("text")) if reply else 0
         if reply is None:
             good = False
+        elif act == "brief_request" and v2:
+            # The brief again, as Christy's scripted line (a long refusal is not a brief).
+            good = _is_brief_line(reply, learner)
         elif act == "brief_request":
             good = words >= 25 or bool(re.search(r"program advisor|calling (?:her|him) back", str(reply.get("text")), re.I))
+        elif act == "short_brief_request" and v2:
+            good = _is_brief_line(reply, learner) and 0 < words < brief_words * 0.6
         elif act == "short_brief_request":
             good = 0 < words < max(25, int(brief_words * 0.6))
         else:
@@ -419,6 +442,49 @@ def _brief_repair(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         items.append({"act": act, "reply_words": words, "ok": good})
         ok = good if ok is None else (ok and good)
     return {"ok": ok, "brief_words": brief_words, "requests": items}
+
+
+_COMMON_WORDS = frozenset(
+    "about and any are can did does for from had has have how into its just like that the their them "
+    "then there they this was were what when where which who why will with would you your".split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9']+", text.lower()) if len(w) >= 3 and w not in _COMMON_WORDS}
+
+
+def _asks_again(question: str, reply: str) -> bool:
+    """The reply holds the question again (most of its own words; the wording may change a little)."""
+    wanted = _content_words(question)
+    if len(wanted) < 2:
+        return " ".join(re.findall(r"[a-z0-9']+", question.lower())) in " ".join(re.findall(r"[a-z0-9']+", reply.lower()))
+    return len(wanted & _content_words(reply)) >= 0.6 * len(wanted)
+
+
+def _icebreaker_repeat(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    if not flags.on(flags.TRANSITION_ACTS_V2):
+        return {"ok": None}
+    questions: list[str] = []
+    for row in rows:
+        if row.get("speaker") != "bot" or row.get("voice") == "learner":
+            continue
+        if row.get("phase") not in ("opening", "icebreaker"):
+            continue
+        for sentence in _SENTENCE.split(str(row.get("text") or "")):
+            if sentence.strip().endswith("?") and not re.search(r"\bhear me\b", sentence, re.IGNORECASE):
+                questions.append(sentence.strip())
+    items = []
+    ok: bool | None = None
+    for index, row in enumerate(rows):
+        if row.get("speaker") != "candidate" or row.get("phase") != "transition" or row.get("act") != "repeat_request":
+            continue
+        reply = _next_bot(rows, index)
+        text = str((reply or {}).get("text") or "")
+        good = bool(text) and any(_asks_again(question, text) for question in questions)
+        items.append({"reply_words": _words(text), "ok": good})
+        ok = good if ok is None else (ok and good)
+    return {"ok": ok, "questions_asked": len(questions), "requests": items}
 
 
 def _wrapup_answered(rows: Sequence[Mapping[str, Any]], phases: Sequence[str]) -> dict[str, Any]:
@@ -558,7 +624,8 @@ def phase_checks(record: Mapping[str, Any]) -> dict[str, Any]:
         "roleplay_end": _roleplay_end(record, phases, consent),
         "end_consent": consent,
         "abuse": _abuse(record, rows),
-        "brief_repair": _brief_repair(rows),
+        "brief_repair": _brief_repair(rows, record),
+        "icebreaker_repeat": _icebreaker_repeat(rows),
         "wrapup_answered": _wrapup_answered(rows, phases),
         "hiring_team_once": _hiring_team_once(rows, phases),
         "christy_repeats": _christy_repeats(rows),

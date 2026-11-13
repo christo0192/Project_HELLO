@@ -187,7 +187,10 @@ role-play, the exit, the wrap-up and L-CLOSE.
   early-end-late, abuse-once, price-dodge, price-never, pushy-discounter, wrapup-question, wrapup-none,
   silent) and the owner's manual tests (`scenarios/manual_tests.json`, paraphrased, the candidate is
   "Alex"): `manual-M01`..`manual-M10` replay a session's moves in order (live, DeepSeek rewords each
-  move to fit what was said; offline, the paraphrase; moves that shared one bot turn are one turn, and a
+  move to fit what was said, except a move whose act a check scores, such as an end request, an
+  insult, "ready" or a brief request, which is said as written; offline, the paraphrase; a transition
+  request to hear an icebreaker question again is a `repeat_request`, not a brief request, and
+  "repeats the request" is the move before it again; moves that shared one bot turn are one turn, and a
   role-play move waits until R is within 15 s of when it was made), `manual-mix` samples the catalogue
   (its call id says `mix`; the header has the level it drew). Groups:
   `default` (all of them), `manual-replay`, `manual`, `synthetic`, `early`, `price`, `wrapup`.
@@ -195,7 +198,9 @@ role-play, the exit, the wrap-up and L-CLOSE.
   the way the scenario started it (no fallback to the button, the button only when shown), the
   transition ceiling, no in-role exit before R 14:00 without agreement, every end request heard
   (asked, or an at-once exit the design allows; an ignored request also fails a time-cap end), the
-  abuse path (feature-detected), brief repair, the wrap-up answered, the hiring team named once,
+  abuse path (feature-detected), brief repair (Christy's scripted brief line again, or a shorter
+  one under 60 % of the brief), an icebreaker question asked again when the candidate asks for it,
+  the wrap-up answered, the hiring team named once,
   Christy's repeats, one goodbye, no learner after the exit, dead air, no two bot lines at once. Optional M032 behaviours are feature-detected (`session_facts.start_by`, an abuse path, any
   extra `*_runner` seam of `R1Interview`), so the same harness runs on main and on the M032 branch.
 
@@ -205,6 +210,15 @@ role-play exchanges; the events; the phase trace; the administration log and row
 the per-phase checks), `transcripts/<id>.txt` (one line per turn: S, R, phase, speaker, text),
 `results.jsonl`, `scorecard.md` / `scorecard.json` (the per-phase checks and the role-play gates) and
 `run.json`. Offline is never "ready for an owner test".
+
+Each role-play exchange records `learner.r_sec`, the R at which the engine decided the learner's line;
+the window checks (no commitment before 13:00, no time cue before 14:00) use it, since an advisor turn
+can start before 13:00 and end after it.
+
+Harness switches (`rehearsal/flags.py`, default ON; `0` restores the previous behaviour):
+`REHEARSAL_KEEP_CONTROL_ACTS` (scored acts are never reworded), `REHEARSAL_TRANSITION_ACTS_V2` (the
+transition labels, the brief-line rule and the `icebreaker_repeat` check), `REHEARSAL_LEARNER_CLOCK`
+(window checks time the learner's line by its decision).
 
 ## Not measured here
 

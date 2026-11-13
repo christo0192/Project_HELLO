@@ -71,6 +71,16 @@ CONTROL_ACTS = frozenset({
     "end_request", "end_agree", "end_decline", "insult", "ready", "ready_button", "brief_request",
     "short_brief_request", "presence_check", "skip_request", "repeat_request", "hold_request",
 })
+# A transition request about an icebreaker question (to hear it again), not about the brief.
+_EARLIER_QUESTION = re.compile(
+    r"\bicebreaker\b|\b(?:earlier|previous|second[- ]last|last) (?:\w+ ){0,2}question|"
+    r"\bquestion before\b|\bearlier one\b"
+)
+# What a brief request asks for again: the brief itself (the role-play, its scenario, the round ...).
+_BRIEF_OBJECT = re.compile(
+    r"role-?\s?play|\bbrief\b|scenario|instructions|\bround\b|summary|sum up|\blearner\b"
+)
+_REPEATS_REQUEST = re.compile(r"^repeats the request\b", re.IGNORECASE)
 
 _PRESS = re.compile(r"^\s*\[(?:silence, then )?presses (?:the )?I'm-ready", re.IGNORECASE)
 _STAGE = re.compile(
@@ -144,8 +154,12 @@ def act_of(phase: str, intent: str, text: str) -> str:
             return "short_brief_request"
         if re.search(r"presence|are you there", what):
             return "presence_check"
+        v2 = flags.on(flags.TRANSITION_ACTS_V2)
+        if v2 and _EARLIER_QUESTION.search(what):
+            return "repeat_request"
         if re.search(r"brief|again|repeat|go over|instructions|sum up|summary|role-play part", what):
-            return "brief_request"
+            if not v2 or _BRIEF_OBJECT.search(what):
+                return "brief_request"
         if re.search(r"question|asks|ask about|role", intent.lower()):
             return "roleplay_question"
         return "transition_other"
@@ -284,13 +298,18 @@ def merge_shared_turns(moves: Sequence[Move]) -> list[Move]:
 def replay_moves(replay: Mapping[str, Any]) -> list[Move]:
     """A replay's moves in order, with the moves that shared one bot turn merged."""
     phases = {"opening": "icebreaker"}  # the driver enters the icebreaker right after L-OPEN
-    moves = []
+    moves: list[Move] = []
     for turn in replay.get("turns") or []:
         phase = phases.get(turn["phase"], turn["phase"])
-        moves.append(
-            Move(phase, str(turn.get("at", "")), str(turn["intent"]), str(turn["text"]),
-                 act_of(phase, str(turn["intent"]), str(turn["text"])), str(turn.get("notes") or ""))
-        )
+        intent, text = str(turn["intent"]), str(turn["text"])
+        act = act_of(phase, intent, text)
+        if phase == "transition" and _REPEATS_REQUEST.search(intent) and flags.on(flags.TRANSITION_ACTS_V2):
+            # "repeats the request": the same request as the transition move before it (asking to
+            # ask questions, asked again, is still that; not a brief request).
+            before = [m for m in moves if m.phase == "transition" and m.act not in ("ready", "ready_button")]
+            if before:
+                act = before[-1].act
+        moves.append(Move(phase, str(turn.get("at", "")), intent, text, act, str(turn.get("notes") or "")))
     return merge_shared_turns(moves)
 
 

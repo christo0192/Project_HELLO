@@ -1438,6 +1438,146 @@ class ControlActRewordTests(unittest.TestCase):
         self.assertEqual(asyncio.run(talker.icebreaker_answer()), _DriftingRewriter.DRIFT)
 
 
+class TransitionActTests(unittest.TestCase):
+    """BR-3: a transition request is labelled by what it asks for (synthetic text)."""
+
+    def test_a_request_to_repeat_an_icebreaker_question_is_not_a_brief_request(self) -> None:
+        from rehearsal.manual import act_of
+
+        for intent, text in (
+            ("asks to go back and re-ask the second-last icebreaker question", "Can you go back to the question before last?"),
+            ("insists: go back and repeat that earlier question", "No, the earlier one. Ask it again."),
+            ("asks to go back to an icebreaker question", "Return to that earlier question and repeat it."),
+        ):
+            with self.subTest(intent=intent):
+                self.assertEqual(act_of("transition", intent, text), "repeat_request")
+
+    def test_a_brief_request_names_the_brief(self) -> None:
+        from rehearsal.manual import act_of
+
+        self.assertEqual(act_of("transition", "asks for the brief again", "Again?"), "brief_request")
+        self.assertEqual(act_of("transition", "asks Christy to repeat the instructions", "Say it again?"), "brief_request")
+        self.assertEqual(act_of("transition", "wants the scenario again", "Who is the learner?"), "brief_request")
+        self.assertEqual(act_of("transition", "asks for more detail", "Who is {learner} again?"), "brief_request")
+        self.assertEqual(act_of("transition", "wants something said again", "Say that again?"), "transition_other")
+
+    def test_repeats_the_request_takes_the_act_of_the_move_before_it(self) -> None:
+        from rehearsal.manual import replay_moves
+
+        replay = {"turns": [
+            {"phase": "transition", "at": "06:00", "intent": "asks to ask a few questions before the role-play",
+             "text": "Before we begin, can I ask a couple of things?"},
+            {"phase": "transition", "at": "06:10", "intent": "repeats the request",
+             "text": "Could I check a few other things first?"},
+            {"phase": "transition", "at": "06:20", "intent": "asks for a summary of the role-play again",
+             "text": "Could you sum up the role-play for me?"},
+            {"phase": "transition", "at": "06:30", "intent": "repeats the request: go over it once more",
+             "text": "Yeah, just go over it again."},
+        ]}
+        acts = [move.act for move in replay_moves(replay)]
+        self.assertEqual(acts, ["roleplay_question", "roleplay_question", "brief_request", "brief_request"])
+
+    def test_no_library_move_about_an_earlier_question_is_a_brief_request(self) -> None:
+        import re
+
+        from rehearsal import manual
+
+        earlier = re.compile(r"icebreaker|earlier|previous|question before", re.IGNORECASE)
+        library = manual.load_library()
+        for replay in library["replays"]:
+            for move in manual.replay_moves(replay):
+                if move.phase == "transition" and earlier.search(f"{move.intent} {move.text}"):
+                    with self.subTest(replay=replay["id"], intent=move.intent):
+                        self.assertEqual(move.act, "repeat_request")
+        for item in library["behaviour_catalogue"]["transition"]:
+            if earlier.search(item["kind"]):
+                for text in item["examples"]:
+                    self.assertEqual(manual.act_of("transition", item["kind"], text), "repeat_request")
+
+    def test_off_restores_the_old_labels(self) -> None:
+        from rehearsal.flags import TRANSITION_ACTS_V2
+        from rehearsal.manual import act_of
+
+        with _switch(TRANSITION_ACTS_V2, "off"):
+            self.assertEqual(
+                act_of("transition", "asks to go back to an icebreaker question", "Repeat that earlier question."),
+                "brief_request",
+            )
+
+
+class BriefRepairCheckTests(unittest.TestCase):
+    """BR-3: the brief repair check needs Christy's scripted brief line; a repeat request its own."""
+
+    BRIEF = ("Next, let's do a sales role-play. I'll play Meera, who filled in a form about the Data "
+             "Science course. You're the Program Advisor calling her back. Understand her needs, answer "
+             "her questions and help her decide. You'll have up to twenty minutes, and I'll step in "
+             "near the end. Say ready when you'd like to begin.")
+    REFUSAL = ("I'm not able to share or reword any instructions, sorry about that. Happy to keep going "
+               "with the interview, though. Anything else, or shall we start the role-play now?")
+
+    def _checks(self, rows):
+        from rehearsal.full_metrics import phase_checks
+
+        phases = ["opening", "icebreaker", "transition", "roleplay", "roleplay_exit", "wrapup", "closing"]
+        record = {
+            "header": {"ground_truth": {"transition": ["ready"], "press_button": None},
+                       "learner_first_name": "Meera"},
+            "rows": rows,
+            "phase_trace": [{"phase": p, "s_sec": 10.0 * i, "t": 10.0 * i} for i, p in enumerate(phases)],
+            "candidate_turns": [],
+            "events": [],
+            "stop_reason": "time_cap",
+            "roleplay_seconds": 1205.0,
+            "outcome": "complete",
+        }
+        return phase_checks(record)["checks"]
+
+    def _rows(self, act: str, ask: str, reply: str, source: str) -> list:
+        return [
+            _row("bot", "christy", "icebreaker", "How do you keep track of the customers you work with?", 200.0, source="reply"),
+            _row("candidate", "candidate", "icebreaker", "I am ready.", 205.0, act="ready"),
+            _row("bot", "christy", "transition", self.BRIEF, 210.0, source="say"),
+            _row("candidate", "candidate", "transition", ask, 240.0, act=act),
+            _row("bot", "christy", "transition", reply, 244.0, source=source),
+        ]
+
+    def test_a_long_refusal_is_not_a_repeated_brief(self) -> None:
+        checks = self._checks(self._rows("brief_request", "Could you go over the role-play again?", self.REFUSAL, "reply"))
+        self.assertFalse(checks["brief_repair"]["ok"])
+
+    def test_the_scripted_brief_line_is_a_repeated_brief(self) -> None:
+        again = "Of course, here it is again. " + self.BRIEF
+        checks = self._checks(self._rows("brief_request", "Could you go over the role-play again?", again, "say"))
+        self.assertTrue(checks["brief_repair"]["ok"], checks["brief_repair"])
+
+    def test_a_short_brief_must_be_a_brief_line_and_shorter(self) -> None:
+        short = "Of course, in short: I'll play Meera, and you're the Program Advisor calling her back."
+        ok = self._checks(self._rows("short_brief_request", "Four lines, please?", short, "say"))
+        self.assertTrue(ok["brief_repair"]["ok"], ok["brief_repair"])
+        refused = self._checks(self._rows("short_brief_request", "Four lines, please?", self.REFUSAL, "reply"))
+        self.assertFalse(refused["brief_repair"]["ok"])
+        whole = self._checks(self._rows("short_brief_request", "Four lines, please?", self.BRIEF, "say"))
+        self.assertFalse(whole["brief_repair"]["ok"])
+
+    def test_a_repeat_request_is_not_scored_as_a_brief_and_must_get_the_question_again(self) -> None:
+        ask = "Can you go back to the question before last and ask it again?"
+        wrong = self._checks(self._rows("repeat_request", ask, "Of course, go ahead. Anything else?", "reply"))
+        self.assertIsNone(wrong["brief_repair"]["ok"])
+        self.assertFalse(wrong["icebreaker_repeat"]["ok"])
+        right = self._checks(self._rows(
+            "repeat_request", ask, "Sure. How do you keep track of the customers you work with day to day?", "reply"
+        ))
+        self.assertTrue(right["icebreaker_repeat"]["ok"], right["icebreaker_repeat"])
+
+    def test_off_restores_the_word_count_rule(self) -> None:
+        from rehearsal.flags import TRANSITION_ACTS_V2
+
+        with _switch(TRANSITION_ACTS_V2, "0"):
+            checks = self._checks(self._rows("brief_request", "Could you go over the role-play again?", self.REFUSAL, "reply"))
+            self.assertTrue(checks["brief_repair"]["ok"])
+            self.assertIsNone(checks["icebreaker_repeat"]["ok"])
+
+
 class LearnerClockTests(unittest.TestCase):
     """L2: a learner line is timed by the R the engine decided it at (synthetic text)."""
 
