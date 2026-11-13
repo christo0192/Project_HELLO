@@ -468,7 +468,13 @@ async def _speak_watching_cut_ins(
                 current is not None and not current.done() and getattr(current, "allow_interruptions", False)
             )
             if sim.interrupt_due(phase, reply, played, total, interruptible):
-                view = _view(rt, since, 0.0)
+                # Heard since the candidate's own turn ended (not since before it: those lines
+                # were already answered, and a live advisor must not be fed them again).
+                turn_end = max(
+                    (s.t_end for s in rt.spans if s.speaker == "candidate" and s.t_end is not None),
+                    default=since,
+                )
+                view = _view(rt, max(since, turn_end), 0.0)
                 second = await sim.interrupt_action(view, phase, played_part(reply.text, played, total))
                 second_task = asyncio.ensure_future(
                     driver.speak(second.text, wps=second.wps, act=second.act, role=second.role, intent=second.intent)

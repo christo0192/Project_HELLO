@@ -237,6 +237,38 @@ class AdaptOfflineInterviewTests(unittest.TestCase):
         numbers = [exchange["n"] for exchange in record["exchanges"]]
         self.assertEqual(numbers, sorted(set(numbers)))
 
+    def test_a_cut_in_feeds_the_advisor_only_the_line_it_cut(self) -> None:
+        # The advisor hears the learner's cut line (its played part), never a line it already
+        # answered in its own turn before the cut-in.
+        from rehearsal.adapt import ROLEPLAY_CUT_INS
+        from rehearsal.full import run_full_call
+        from rehearsal.full_run import FullSettings, OfflineFullFactory, plan_full_specs
+
+        settings = FullSettings(offline=True, scenarios=("interrupter",), judge=False)
+        factory = OfflineFullFactory(settings)
+        spec = plan_full_specs(("interrupter",), settings.learners)[0]
+        deps = factory.make(spec)
+        fed: list[tuple[str | None, str]] = []
+        from rehearsal import candidate as candidate_module
+
+        original = candidate_module.ScenarioAdvisor.cut_in
+
+        def spy(self, learner_part, text, act, traits=()):
+            fed.append((learner_part, text))
+            return original(self, learner_part, text, act, traits)
+
+        candidate_module.ScenarioAdvisor.cut_in = spy
+        try:
+            record = vloop.run_virtual(run_full_call(spec, deps))
+        finally:
+            candidate_module.ScenarioAdvisor.cut_in = original
+        learner_lines = [r["text"].strip() for r in _rows(record) if r.get("voice") == "learner"]
+        roleplay_fed = [part for part, text in fed if text in ROLEPLAY_CUT_INS]
+        self.assertGreaterEqual(len(roleplay_fed), 3)
+        for part in roleplay_fed:
+            self.assertIsNotNone(part)
+            self.assertTrue(any(line.startswith(part.strip()) for line in learner_lines), part)
+
     def test_the_off_script_and_manipulative_advisors_say_their_lines(self) -> None:
         from rehearsal.scenarios import SCENARIOS
 
