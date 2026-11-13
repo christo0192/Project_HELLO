@@ -19,6 +19,12 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
 * ``REHEARSAL_CITED_MISFIRES`` (D2-HM1): the judge is asked to cite the advisor turn a misfire fails to
   follow (OFF sends the previous rubric and schema), a judged misfire of kind ``other`` counts only when
   it cites that turn and a reason, and one call adds at most 5 to a level's mean.
+* ``REHEARSAL_IB_REPEAT_INSISTED`` (D2-IB1, integration): a repeat request that turns down ("no, I
+  mean ...") the right question it just got also passes with the question before that one, as
+  Christy's insisted-repeat line offers it.
+* ``REHEARSAL_SAME_TURN_FRAGMENTS`` (integration, rambler): a candidate row the session saved with no
+  span, written while the candidate's turn was still being said, is a fragment of that turn, not the
+  candidate's next turn, when a check looks for the bot's reply to it.
 """
 from __future__ import annotations
 
@@ -30,7 +36,9 @@ LEARNER_CLOCK = "REHEARSAL_LEARNER_CLOCK"
 COMMIT_WINDOW = "REHEARSAL_COMMIT_WINDOW"
 SPOKEN_LEAKS = "REHEARSAL_SPOKEN_LEAKS"
 PROBE_VOCAB_V2 = "REHEARSAL_PROBE_VOCAB_V2"
+SAME_TURN_FRAGMENTS = "REHEARSAL_SAME_TURN_FRAGMENTS"
 CITED_MISFIRES = "REHEARSAL_CITED_MISFIRES"
+IB_REPEAT_INSISTED = "REHEARSAL_IB_REPEAT_INSISTED"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -43,9 +51,11 @@ def on(name: str) -> bool:
 __all__ = [
     "CITED_MISFIRES",
     "COMMIT_WINDOW",
+    "IB_REPEAT_INSISTED",
     "KEEP_CONTROL_ACTS",
     "LEARNER_CLOCK",
     "PROBE_VOCAB_V2",
+    "SAME_TURN_FRAGMENTS",
     "SPOKEN_LEAKS",
     "TRANSITION_ACTS_V2",
     "on",

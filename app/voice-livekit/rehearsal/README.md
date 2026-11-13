@@ -257,7 +257,12 @@ Harness switches (`rehearsal/flags.py`, default ON; `0` restores the previous be
 `REHEARSAL_KEEP_CONTROL_ACTS` (scored acts are never reworded), `REHEARSAL_TRANSITION_ACTS_V2` (the
 transition labels, the brief-line rule and the `icebreaker_repeat` check), `REHEARSAL_LEARNER_CLOCK`
 (window checks time the learner's line by its decision), `REHEARSAL_COMMIT_WINDOW`,
-`REHEARSAL_SPOKEN_LEAKS`, `REHEARSAL_PROBE_VOCAB_V2` and `REHEARSAL_CITED_MISFIRES` (diagnosis 2, above).
+`REHEARSAL_SPOKEN_LEAKS`, `REHEARSAL_PROBE_VOCAB_V2` and `REHEARSAL_CITED_MISFIRES` (diagnosis 2, above),
+`REHEARSAL_IB_REPEAT_INSISTED` (a repeat request that turns down, "no, I mean ...", the right question it
+just got also passes with the question before that one, as Christy's insisted-repeat line offers it,
+D2-IB1) and `REHEARSAL_SAME_TURN_FRAGMENTS` (a candidate row the session saved with no span while the
+candidate's turn was still being said is part of that turn, not the next one, when a check looks for
+the reply to it).
 
 ## Adaptability scenarios and the flow judge (`--scenarios adapt`, D-M032-10)
 
