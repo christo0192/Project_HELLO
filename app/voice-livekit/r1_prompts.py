@@ -884,18 +884,29 @@ TRANSITION_REMINDER = (
 # ask gets "Of course, go ahead." and nothing else, and no answer ends with a question of its own;
 # the session's start question follows it (and is left out when an answer asks anyway).  Questions
 # about the role-play itself never reach the model then (the session's routing), so the ban on
-# describing it stays as it was.
+# describing it stays as it was.  M032 live simulation, diagnosis 1 (BR-2): a request to repeat
+# something was answered with that permission line ("Of course, go ahead."), so the note says when
+# it is for, with an example, and that a repeat request gets the repeat.
 TRANSITION_REMINDER_REPAIRED = (
     "INTERVIEW NOTE (not spoken; never mention it). The role-play brief has been given and the "
     "candidate may ask you questions before the role-play starts. Answer in one or two short, "
     "friendly sentences, truthfully, using only the facts about the role you were given; for "
     "anything else (pay, work mode, training, next steps, timelines, how they will be assessed) "
     "say the hiring team will follow up on it. Never invent a fact, a number or an outcome. If "
-    'they only ask whether they may ask something, say "Of course, go ahead." and stop. Never '
+    'they only ask whether they may ask something ("Can I ask a few questions?"), say "Of course, '
+    'go ahead." and stop. If they ask you to repeat or explain something you said, never answer '
+    '"go ahead": repeat or explain it in one sentence. Never '
     "end your reply with a question: the interview asks its own question after you. Never "
     "start, announce or describe the role-play, never speak as the learner, never repeat the "
     "brief, never give tips on how to sell, and never ask whether they are ready to start: the "
     "interview asks that itself."
+)
+# Review of diagnosis 1 (BR-2): the turn after her repeated icebreaker question answers HER
+# question, so the note above ("they may ask you questions ... the hiring team will follow up")
+# gets one line more for that turn only.  The session's start question follows the reaction.
+TRANSITION_IB_ANSWER_NOTE = (
+    "This turn: they are answering your earlier question, which you just asked again. React in "
+    "one short sentence to what they said, and ask nothing."
 )
 _TRANSITION_PHASES = frozenset({"transition"})
 

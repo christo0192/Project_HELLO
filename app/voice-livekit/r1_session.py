@@ -203,6 +203,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import itertools
 import json
 import math
 import os
@@ -275,6 +276,7 @@ from r1_replies import (
 )
 from r1_prompts import (
     ROLEPLAY_PHASE,
+    TRANSITION_IB_ANSWER_NOTE,
     assemble_messages,
     control_prose,
     interviewer_control_prose,
@@ -356,6 +358,11 @@ FILLER_ANCHOR_MAX_SECONDS = 20.0
 # role-play's own S cap is counted from the pickup (``r1_phases.roleplay_cap_sec``).
 TRANSITION_QUESTION_LIMIT = 3
 TRANSITION_SILENCE_LADDER = ((20.0, "L-TRANSITION-REASK"), (30.0, "L-TRANSITION-REASK-2"))
+# M032 live simulation, diagnosis 1 (DA-1, R1_TRANSITION_REPAIR): a committed turn that answers
+# nothing ("So bye.", "Hmm.") after an either/or start question that finished playing restarted the
+# 20 s window, so the candidate heard 20 s of nothing.  It gets L-TRANSITION-REASK this many seconds
+# after the turn instead (the ladder's first rung only; pure silence keeps 20 s and 30 s).
+TRANSITION_QUIET_TURN_REASK_SECONDS = 6.0
 TRANSITION_SILENCE_END_SECONDS = 30.0
 TRANSITION_MAX_SECONDS = 360.0
 SAY_PLAYOUT_SECONDS = 90.0
@@ -806,6 +813,13 @@ _TRANSITION_ANSWER = "answer"
 _TRANSITION_RECAP = "recap"
 _TRANSITION_PRESENCE = "presence"
 _TRANSITION_REASK = "reask"
+# M032 live simulation, diagnosis 1 (BR-2, R1_TRANSITION_REPAIR): a request to hear one of Christy's
+# icebreaker questions again gets "Of course. {question}" (scripted, no model call), at most
+# ``TRANSITION_IB_REPEAT_LIMIT`` times; the answer to it is the model's, with a start question.
+_TRANSITION_IB_REPEAT = "ib_repeat"
+TRANSITION_IB_REPEAT_LIMIT = 2
+# Icebreaker questions kept for that repeat (her latest model replies' questions, newest last).
+_IB_QUESTIONS_KEPT = 8
 # SWEEP-29: one budget of recaps per session, shared by a request for a shorter brief, a brief
 # request once the replay was used and a question about the role-play; the full replay keeps its own
 # budget of one.
@@ -860,6 +874,19 @@ PRESSED = "pressed"
 # secret scan drop anything else, and every call below names an exception TYPE (never
 # its message), so an utterance, a first name or a presigned URL cannot reach a log.
 _log = StructuredLogger("r1")
+
+
+_DIGIT_RUN_RE = re.compile(r"\d{10,}")
+
+
+def content_log_label(sha: str) -> str:
+    """The content pin's log label: the SHA's first 12 hex characters, or, when they hold ten
+    digits in a row (the structured logger drops such a value as a possible phone number: content
+    revision 24's SHA starts with 12 digits), the same 12 split by a dot after the sixth."""
+    label = sha[:12]
+    if _DIGIT_RUN_RE.search(label) is None:
+        return label
+    return f"{label[:6]}.{label[6:]}"
 
 
 def _error_type_of(exc: BaseException) -> str:
@@ -1716,6 +1743,8 @@ def is_brief_request(text: str, *, wide: bool = False, lead_names: tuple[str, ..
         return True
     if wide and _brief_wide_re(lead_names).search(folded) is not None:
         return True
+    if wide and _go_over_ask(text, obj=_go_over_object_re(lead_names), again=True):
+        return True  # BR-1, aimed at Christy (review of diagnosis 1)
     return _has_question_mark(text) and _BRIEF_ROLE_CHECK_RE.search(folded) is not None
 
 
@@ -1727,6 +1756,11 @@ _BRIEF_DET_OBJECT = r"(?:this|the|that) " + _BRIEF_OBJECT
 _BRIEF_SUMMARY_WORD = r"(?:summary|summari[sz]e|recap|overview|rundown)"
 _BRIEF_INFO_WORD = r"(?:information|info|details?)"
 _BRIEF_ABOUT_WORD = r"(?:of|on|about|for|regarding)"
+# M032 live simulation, diagnosis 1 (BR-1): "just go over the role play again for me" and "run me
+# through the scenario once more" missed every detector (the verb-and-again form of
+# ``_BRIEF_REQUEST_RE`` takes only a pronoun before "again") and reached the model, which answered
+# "Of course, go ahead.".  The brief's object between the verb and the "again" (``_go_over_ask``
+# with ``_go_over_object_re``; review of diagnosis 1: aimed at Christy, never a start or a plan).
 
 
 def _lead_alternation(lead_names: tuple[str, ...]) -> str:
@@ -1763,6 +1797,24 @@ def _brief_wide_re(lead_names: tuple[str, ...]) -> re.Pattern[str]:
     )
     if len(_BRIEF_WIDE_CACHE) < 32:
         _BRIEF_WIDE_CACHE[key] = pattern
+    return pattern
+
+
+_GO_OVER_OBJECT_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
+
+
+def _go_over_object_re(lead_names: tuple[str, ...]) -> re.Pattern[str]:
+    """BR-1: the brief's object right after a go-over verb ("go over THE ROLE PLAY again for me"),
+    with what may follow it before the "again" (cached per name set)."""
+    key = tuple(lead_names)
+    pattern = _GO_OVER_OBJECT_CACHE.get(key)
+    if pattern is not None:
+        return pattern
+    leads = _lead_alternation(key)
+    obj = f"(?:{_BRIEF_DET_OBJECT}|{leads})" if leads else f"(?:{_BRIEF_DET_OBJECT})"
+    pattern = re.compile(r" " + obj + r"\b(?: (?:for (?:me|us)|please|quickly|briefly))?")
+    if len(_GO_OVER_OBJECT_CACHE) < 32:
+        _GO_OVER_OBJECT_CACHE[key] = pattern
     return pattern
 
 
@@ -1894,6 +1946,7 @@ def asks_about_the_job(
         _BRIEF_REQUEST_RE.search(stripped) is not None
         or _BRIEF_SHORT_RE.match(folded) is not None
         or _brief_wide_re(tuple(lead_names)).search(folded) is not None
+        or _go_over_ask(text, obj=_go_over_object_re(tuple(lead_names)), again=True)
         or _BRIEF_ROLE_CHECK_RE.search(folded) is not None
         or _SHORT_OBJECT_RE.search(folded) is not None
         or _BRIEF_NAMED_RE.search(folded) is not None
@@ -1965,6 +2018,99 @@ _SESSION_READERS: dict[str, Callable[[str], bool]] = {
 }
 
 
+# M032 live simulation, diagnosis 1 (BR-2): in the transition, a request to hear one of Christy's
+# icebreaker questions again ("can we go back to that earlier question? just repeat it", "go back
+# to the question before the last one and ask it again") reached the model, which answered "Of
+# course, go ahead.".  The question must be one from before (earlier, previous, icebreaker, before
+# the last one, the one she asked earlier, or one they go back to), and the turn must ask for it
+# again; a turn that names the brief or the role-play is a brief request instead.
+#
+# Review of diagnosis 1: the question must be HERS ("the/that/your earlier question", "the question
+# you asked me earlier"), and the ask must be aimed at her ("can you repeat", "ask me that again",
+# "what was your earlier question", "remind me of"): "My first question is, what is the training
+# period?", "One other question: what is the shift timing?" and "Going back to the previous
+# question, what's the salary?" answer "do you have any questions first?" and are the model's.
+_IB_QUESTION_ADJ = r"(?:earlier|previous|prior|icebreaker|first|older|other|opening|very first)"
+_IB_QUESTION_REF_RE = re.compile(
+    r"\b(?:"
+    r"(?:the|that|this|your) " + _IB_QUESTION_ADJ + r"(?: \w+)? questions?|"
+    r"questions? (?:that )?you (?:asked|were asking|had asked)(?: me)? "
+    r"(?:earlier|before|at the start|first|in the beginning)|"
+    r"questions? from (?:before|earlier|the start)|"
+    r"questions? before (?:the |that )?last(?: one)?"
+    r")\b"
+)
+# The ask, aimed at Christy.  A bare "what is" and "back to" are no ask ("going back to the previous
+# question, what's the salary?").
+_IB_QUESTION_ASK_RE = re.compile(
+    r"\b(?:"
+    r"(?:can|could|would|will) you (?:please |just |kindly )?(?:repeat|ask|say|read|tell)|"
+    r"(?:please|just) (?:repeat|ask|say|read)|"
+    r"^(?:(?:okay|ok|so|sorry|um|uh|hmm|wait|actually|christy|ma'am|maam|madam|sir) )*repeat|"
+    r"repeat (?:it|that|this|your|the)|"
+    r"(?:ask|say|tell|read|give)(?: me| us)?(?: it| that| this| the question| your question|"
+    r" (?:the|that|your) \w+ question)? (?:again|once more|one more time)|"
+    r"what(?: was| were| is|'s) (?:the |that |your )?(?:\w+ ){0,2}questions?|"
+    r"remind me(?: of| what)?(?: (?:the|that|your))?(?: \w+){0,2}? questions?"
+    r")\b"
+)
+# The candidate's own question: "my (first) question", "one other question", "I have another
+# question", a turn that opens with "first question", or a self-repeat ("I'll repeat my ...").
+_IB_OWN_QUESTION_RE = re.compile(
+    r"\bmy(?: \w+){0,2}? questions?\b|"
+    r"\b(?:i have|i've got|ive got|i had|i do have|i've|there's|theres|there is) "
+    r"(?:one|another|a|one more|one other|a quick|a small|a couple of|a few|some|two)"
+    r"(?: \w+){0,2}? questions?\b|"
+    r"\b(?:one|another|one more|one other|a quick|a small) (?:other |more |quick |small )?"
+    r"questions?\b|"
+    r"^(?:(?:okay|ok|so|and|um|uh|yes|yeah|sure|alright|well|also|actually|then|right) )*"
+    r"(?:first|second|next|last|one) questions?\b|"
+    r"\b(?:let me|i'll|i will|i can|i'd|i would|i want to|i need to) repeat\b"
+)
+# A question of the candidate's own in the turn (with her question's own words cut out first): a
+# job topic, or a question word with a subject of its own ("what is the work mode").
+_IB_QUESTION_ABOUT_RE = re.compile(
+    r"\bquestions?(?: (?:that )?you (?:asked|were asking|had asked)(?: me)?"
+    r"(?: earlier| before| at the start| first)?)? (?:about|on|regarding|related to)(?: \S+){1,5}"
+)
+_IB_OTHER_ASK_RE = re.compile(
+    r"\b(?:what(?:'s| is| are| about)|how (?:much|many|long|often)|when (?:is|do|does|will|can)|"
+    r"where (?:is|do|will)|which|is there|are there|do (?:i|we) (?:get|have|need)|"
+    r"will (?:i|we|there))\b(?! (?:it|that|this)\b)"
+)
+
+
+def is_icebreaker_question_request(text: str) -> bool:
+    """BR-2: a transition turn that asks to hear one of Christy's earlier questions again.
+
+    Review of diagnosis 1: the question is hers and the ask is aimed at her; a turn that names a
+    question of the candidate's own, or that also asks about the job, is none.
+    """
+    folded = fold_speech(text)
+    if not folded or is_transition_consent(text):
+        return False
+    if _IB_QUESTION_REF_RE.search(folded) is None or _IB_QUESTION_ASK_RE.search(folded) is None:
+        return False
+    if _IB_BRIEF_OBJECT_RE.search(folded) is not None:
+        return False
+    if _IB_OWN_QUESTION_RE.search(folded) is not None:
+        return False
+    rest = _IB_QUESTION_ABOUT_RE.sub(" ", _IB_QUESTION_ASK_RE.sub(" ", folded))
+    return _JOB_TOPIC_RE.search(rest) is None and _IB_OTHER_ASK_RE.search(rest) is None
+
+
+# "Before the last one": the question before her last (``R1Interview._transition_question_to_repeat``).
+_BEFORE_LAST_RE = re.compile(
+    r"\b(?:before (?:the |that )?last(?: one)?|second (?:to|from) (?:the )?last|penultimate|"
+    r"one before (?:that|the last))\b"
+)
+# Review of diagnosis 1: "the first question", "your opening question" is her FIRST question.
+_FIRST_QUESTION_RE = re.compile(r"\b(?:first|opening|very first) questions?\b")
+
+
+_IB_BRIEF_OBJECT_RE = re.compile(r"\b(?:role ?play|roleplay|brief|instructions?|scenario)\b")
+
+
 # M032 S6 item 2: a transition turn that is about the role-play itself (owner's call fda9e9f6 #26:
 # "tell me about the role play again" was answered with the JOB's shift timings).  It names the
 # role-play, the brief, the scenario, the learner or her name, and asks something.  Review of S6:
@@ -2009,8 +2155,115 @@ _ROLEPLAY_MENTION_RE = re.compile(
 )
 
 
+# M032 live simulation, diagnosis 1 (BR-1): asks with no question mark and no question word ("the
+# role play brief, I wanted to get a handle on that", "just go over the role play again for me").
+_ROLEPLAY_UNDERSTAND_RE = re.compile(
+    r"\b(?:get a (?:handle|grip) on|be (?:clear|clearer) (?:on|about)|make sense of|"
+    r"(?:i|we) (?:want|wanted|need|needed|would like) to understand|"
+    r"(?:i'd|we'd) like to understand)\b"
+)
+# Review of diagnosis 1: what an understand-ask is about, in the words right after it: the brief,
+# a pronoun for it, or nothing at all ("I want to get a handle on it", "I'd like to understand the
+# role play").  "be clear about the fees" and "understand her needs first" are the candidate's plan
+# for the call; so is anything "before I pitch" or "during the call".
+_UNDERSTAND_OBJECT_RE = re.compile(
+    r"(?: (?:a|bit|little|better|more|properly|fully|clearly|first|please|again|now))*"
+    r"(?:$| (?:(?:this|the|that|my) " + _BRIEF_OBJECT
+    + r"|it|this|that|everything|all (?:this|that|of it)"
+    r"|what (?:i|we) (?:have|need|am supposed|are supposed) to do)\b)"
+)
+_PLAN_WORDS_RE = re.compile(
+    r"\b(?:before (?:i|we)|during the (?:role ?play|roleplay|call)|on the call|"
+    r"in the (?:role ?play|roleplay|call) (?:i|we)|when i (?:call|pitch|talk|speak))\b"
+)
+# Review of diagnosis 1: a go-over ask must be aimed at Christy.  "Sure, I can go through the role
+# play now", "Alright, let me go through the role play then", "I'll go through the scenario once
+# more in my head" and a bare "Yes, go through the role play." are a start or a plan, not a request
+# to hear the brief again.
+_GO_OVER_VERB_RE = re.compile(
+    r"\b(?:repeat|explain|describe|go over|go through|(?:run|walk|take) (?:me |us )?through)\b"
+)
+_GO_OVER_YOU_RE = re.compile(
+    r"\b(?:(?:can|could|would|will) you|please|kindly)(?: (?:please|just|kindly|quickly|briefly|"
+    r"once more|again))*$"
+)
+_GO_OVER_FOR_ME_RE = re.compile(r"\b(?:for (?:me|us)|please)\b")
+_IMPERATIVE_FILLER = frozenset(
+    {"okay", "ok", "so", "just", "sorry", "um", "uh", "hmm", "yeah", "yes", "alright", "right",
+     "then", "and", "well", "actually", "christy", "ma'am", "maam", "madam", "sir", "please",
+     "also", "now", "quickly", "briefly", "hang", "on", "wait", "again", "once", "more"}
+)
+
+
+def _go_over_ask(
+    text: str, *, obj: re.Pattern[str] | None = None, again: bool = False
+) -> bool:
+    """Review of diagnosis 1 (BR-1): a go-over ask aimed at Christy, sentence by sentence.
+
+    Aimed at her: "can/could you ...", "please ...", "run/walk/take me through", or an imperative
+    at the start of the sentence ("Okay, just go over the role play again for me.") with "for me",
+    "please" or an "again" after the verb.  ``obj`` must match right after the verb (and, with
+    ``again``, an "again" must close the ask, as the wide brief form has it).
+    """
+    for part in _SENTENCE_SPLIT_RE.split(str(text or "")):
+        folded = fold_speech(part)
+        if not folded:
+            continue
+        # Linear on long input: the last "again" and "for me" are found once, and only the first
+        # verbs of a sentence are read, each with a short window before it.
+        last_again = max((m.start() for m in _BRIEF_AGAIN_RE.finditer(folded)), default=-1)
+        last_for_me = max((m.start() for m in _GO_OVER_FOR_ME_RE.finditer(folded)), default=-1)
+        for match in itertools.islice(_GO_OVER_VERB_RE.finditer(folded), 8):
+            before = folded[max(0, match.start() - 80):match.start()].strip()
+            if obj is not None:
+                tail = obj.match(folded, match.end())
+                if tail is None:
+                    continue
+                if again and _BRIEF_AGAIN_RE.match(folded, tail.end() + 1) is None:
+                    continue
+            elif again and last_again < match.end():
+                continue
+            if (
+                " me through" in match.group()
+                or " us through" in match.group()
+                or _GO_OVER_YOU_RE.search(before) is not None
+            ):
+                return True
+            words = before.split()
+            if (
+                match.start() <= 80
+                and len(words) <= 6
+                and all(word in _IMPERATIVE_FILLER for word in words)
+                and max(last_again, last_for_me) >= match.end()
+            ):
+                return True
+    return False
+
+
+def _asks_without_a_question(text: str, lead_names: tuple[str, ...] = ()) -> bool:
+    """BR-1: an understand-ask about the brief (review of diagnosis 1: its object right after it,
+    and no plan words), or a go-over ask aimed at Christy (``_go_over_ask``)."""
+    folded = fold_speech(text)
+    if _PLAN_WORDS_RE.search(folded) is None:
+        leads = _lead_alternation(tuple(lead_names))
+        lead_re = re.compile(r" (?:" + leads + r")\b") if leads else None
+        for match in itertools.islice(_ROLEPLAY_UNDERSTAND_RE.finditer(folded), 8):
+            if _UNDERSTAND_OBJECT_RE.match(folded, match.end()) is not None:
+                return True
+            if lead_re is not None and lead_re.match(folded, match.end()) is not None:
+                return True
+    return _go_over_ask(text)
+
+
 def names_the_roleplay(text: str, lead_names: tuple[str, ...] = ()) -> bool:
-    """True for a transition turn that asks about the role-play itself (S6 item 2)."""
+    """True for a transition turn that asks about the role-play itself (S6 item 2).
+
+    Diagnosis 1 (BR-1): "get a handle on", "be clear on", "make sense of", "want to understand"
+    (with the brief or a pronoun for it right after, and no plan words such as "before I pitch"),
+    and "go over / go through / run me through / walk me through" aimed at Christy (review of
+    diagnosis 1: "can you ...", "please ...", "walk me through", or an imperative with "for me" or
+    "again") ask as well, with no question mark.
+    """
     folded = fold_speech(text)
     if not folded:
         return False
@@ -2022,7 +2275,11 @@ def names_the_roleplay(text: str, lead_names: tuple[str, ...] = ()) -> bool:
         named = _ROLEPLAY_CUE_RE.search(folded) is not None
     if not named:
         return False
-    return _has_question_mark(text) or _ROLEPLAY_ASK_RE.search(folded) is not None
+    return (
+        _has_question_mark(text)
+        or _ROLEPLAY_ASK_RE.search(folded) is not None
+        or _asks_without_a_question(text, lead_names)
+    )
 
 
 def no_questions_about_the_roleplay(text: str) -> bool:
@@ -2674,6 +2931,13 @@ class R1Interview:
         # spoken consent (so the turn hook agrees with it when that turn commits).
         self._start_question: str | None = None
         self._transition_consented = False
+        # M032 live simulation, diagnosis 1 (R1_TRANSITION_REPAIR): BR-2, how many icebreaker
+        # questions were repeated in the transition and whether the answer to the last is still
+        # to come; DA-1, a committed turn that answered nothing asks the driver for the short
+        # reask window.
+        self._transition_ib_repeats = 0
+        self._transition_ib_repeat_open = False
+        self._quiet_reask_pending = False
         # True once a candidate turn was answered by the icebreaker's end (``prepare_turn``
         # suppressed its reply because the soft exit was due): the boundary line answers it.
         self._icebreaker_boundary_turn = False
@@ -2723,6 +2987,9 @@ class R1Interview:
         self._ib_holds = 0
         self._ib_hold_window = False
         self._ib_last_question: str | None = None
+        # Diagnosis 1 (BR-2): the questions of her icebreaker model replies, newest last (at most
+        # ``_IB_QUESTIONS_KEPT``), for "go back to the question before the last one".
+        self._ib_questions: list[str] = []
         # Review of S6: after the hold or the repeat line, "Okay." or "Thank you." answers nothing
         # ("hold" or "repeat" while that holds; ``_ib_quiet_turn``), and whether the repeated
         # question was a yes/no one (then "Okay." or "Sure." can answer it).  The text of a repair
@@ -3029,7 +3296,7 @@ class R1Interview:
         _log.info(
             "unknown_event",
             error_type="r1_fidelity_content",
-            error_category=CONTENT_SHA256[:12],
+            error_category=content_log_label(CONTENT_SHA256),
         )
 
     # ------------------------------------------------------------------ exit
@@ -4394,7 +4661,10 @@ class R1Interview:
         if phase is R1Phase.TRANSITION:
             # M1: Christy answers the candidate's questions before the role-play; every other
             # turn there is the driver's (a consent, the brief again, a nudge, the steer).
-            return self._transition_action(text) not in (_TRANSITION_ANSWER, _TRANSITION_INVITE)
+            # Diagnosis 1 (BR-2): the repeated icebreaker question is a reply too (scripted).
+            return self._transition_action(text) not in (
+                _TRANSITION_ANSWER, _TRANSITION_INVITE, _TRANSITION_IB_REPEAT
+            )
         if phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
             return self._roleplay_over()
         if phase is R1Phase.WRAPUP:
@@ -4583,9 +4853,20 @@ class R1Interview:
             return _TRANSITION_RECAP
         if text and is_presence_check(text):
             return _TRANSITION_PRESENCE
+        if (
+            text
+            and self._transition_ib_repeats < TRANSITION_IB_REPEAT_LIMIT
+            and is_icebreaker_question_request(text)
+        ):
+            return _TRANSITION_IB_REPEAT  # diagnosis 1 (BR-2): before the brief's route
         route = self._brief_route(text)
         if route is not None:
             return route
+        if self._answers_her_repeated_question(text):
+            # Diagnosis 1 (BR-2): the answer to her repeated icebreaker question is answered
+            # (a short reaction and the start question), never the steer or the nudge.  Review
+            # of diagnosis 1: a turn that asks something is one of their questions instead.
+            return _TRANSITION_ANSWER
         if text and self._answers_her_own_question(text):
             # Review of S6: her answer ended with a question of its own (its start question was
             # dropped), so a bare "Yes." or "No." answers HER, and is never dead air: the model
@@ -4984,6 +5265,11 @@ class R1Interview:
         deferral = self._icebreaker_deferral(text) if phase is R1Phase.ICEBREAKER else None
         action = self._transition_action(text) if phase is R1Phase.TRANSITION else None
         suppressed = self.reply_suppressed(text)
+        # Diagnosis 1 (BR-2): this turn answers her repeated icebreaker question (it is not one of
+        # the candidate's questions); any turn but one that answers nothing closes that.
+        ib_answer = action == _TRANSITION_ANSWER and self._answers_her_repeated_question(text)
+        if action is not None and text and action != _TRANSITION_QUIET:
+            self._transition_ib_repeat_open = False
         if not suppressed and index is not None and index in self._sound_check_rows:
             # M032 S7C (SWEEP-35): a reply to the sound check whose turn commits after the agenda
             # (in the icebreaker) was answered by the agenda; the model never answers it again.
@@ -5047,7 +5333,10 @@ class R1Interview:
             if action == _TRANSITION_ANSWER:
                 # M1: Christy's answer ends with the start question, in the same speech (so the
                 # candidate can cut in with "ready" or the next question at any point).
-                self._transition_answers += 1
+                if not ib_answer:
+                    self._transition_answers += 1
+                else:
+                    self._note_ib_answer(reply)  # review of diagnosis 1: react, ask nothing
                 reply.tail = self.render_line(self._answer_tail_id())
                 # M032 S6 item 7: dropped at the stream's end when her answer already ends with
                 # a question, unless the last answer went without one (SWEEP-32).
@@ -5057,6 +5346,8 @@ class R1Interview:
                 self._start_question = _EITHER_OR
             elif action == _TRANSITION_INVITE:
                 self._start_question = None  # "of course, go ahead": no start question
+            elif action == _TRANSITION_IB_REPEAT:
+                self._transition_ib_repeat_reply(reply, text)
             elif text and self._icebreaker_repair_reply(reply, deferral, hold_route):
                 pass  # M032 S6: the scripted repeat or hold line; the plan is left as it was
             elif (
@@ -5151,6 +5442,70 @@ class R1Interview:
             return self._icebreaker_fallback
         current = self._icebreaker_plan.current
         return FREE_RESTATE if current is None else current.restate
+
+    def _transition_question_to_repeat(self, text: str) -> str:
+        """Diagnosis 1 (BR-2): the icebreaker question a transition request asks for again.
+
+        The last question of her icebreaker replies, or the one before it when the turn says
+        "before the last (one)", or her first kept one when it says "the first (opening) question"
+        (review of diagnosis 1); with no reply question kept, the icebreaker repair's own choice
+        (``_question_to_repeat``).
+        """
+        history = self._ib_questions
+        if history:
+            folded = fold_speech(text)
+            if len(history) >= 2 and _BEFORE_LAST_RE.search(folded) is not None:
+                return history[-2]
+            if _FIRST_QUESTION_RE.search(folded) is not None:
+                return history[0]
+            return history[-1]
+        return self._question_to_repeat()
+
+    def _answers_her_repeated_question(self, text: str) -> bool:
+        """Diagnosis 1 (BR-2): this turn answers her repeated icebreaker question.
+
+        Review of diagnosis 1: only a turn that asks nothing itself (no question mark, no job
+        question, no question word with a subject of its own); "No, I meant what is the training
+        period?" is one of the candidate's questions, routed and counted like any other.
+        """
+        if (
+            not text
+            or not self._transition_ib_repeat_open
+            or is_backchannel_turn(text)
+            or is_name_only(text)
+        ):
+            return False
+        if _has_question_mark(text):
+            return False
+        folded = fold_speech(text)
+        return (
+            _IB_OTHER_ASK_RE.search(folded) is None
+            and not asks_about_the_job(text, after_answer=False, lead_names=self._lead_names())
+        )
+
+    def _note_ib_answer(self, reply: Reply) -> None:
+        """Review of diagnosis 1 (BR-2): the turn answers her repeated icebreaker question, so the
+        transition note gets one line more: react in one short sentence and ask nothing (the start
+        question follows it)."""
+        base = reply.note or interviewer_reminder(reply.phase, rider=False) or ""
+        reply.note = f"{base}\n{TRANSITION_IB_ANSWER_NOTE}" if base else TRANSITION_IB_ANSWER_NOTE
+
+    def _transition_ib_repeat_reply(self, reply: Reply, text: str) -> None:
+        """Diagnosis 1 (BR-2, ``R1_TRANSITION_REPAIR``): "Of course. {question}" for a request to
+        hear an icebreaker question again.  Scripted (no model call), with no start question after
+        it: the question is hers, so the candidate's next turn is its answer (a short reaction and
+        the start question, ``_TRANSITION_ANSWER``) and is not counted as one of their questions.
+        """
+        self._transition_ib_repeats += 1
+        reply.scripted = repeat_line(self._transition_question_to_repeat(text))
+        self._start_question = None
+        self._last_answer_tailless = True  # a bare yes or no answers her question
+        self._transition_ib_repeat_open = True
+        _log.info(
+            "unknown_event",
+            error_type="r1_transition_question_repeat",
+            option_count=self._transition_ib_repeats,
+        )
 
     def _add_presence_opener(self, reply: Reply, text: str, waited: float | None) -> None:
         """M032 S6 (SWEEP-28): a reply to "Are you there?" opens with "Yes, I'm here." (an
@@ -5305,6 +5660,13 @@ class R1Interview:
             index is not None and index == self._brief_latch_index
         ):
             return
+        if action == _TRANSITION_QUIET:
+            if self._quiet_turn_reask_due():
+                # Diagnosis 1 (DA-1): the driver's next window is the short one.
+                self._quiet_reask_pending = True
+                _log.info("unknown_event", error_type="r1_transition_quiet_turn_reask")
+                self._wake()
+            return
         if action == _TRANSITION_STEER:
             self._transition_steered = True
             line_ids: tuple[str, ...] = ("L-TRANSITION-STEER",)
@@ -5327,6 +5689,19 @@ class R1Interview:
             if line_id not in self._transition_lines:
                 self._transition_lines.append(line_id)
         self._wake()
+
+    def _quiet_turn_reask_due(self) -> bool:
+        """Diagnosis 1 (DA-1, ``R1_TRANSITION_REPAIR``): a committed turn that answered nothing
+        came after an either/or start question that finished playing (so no reask has followed
+        it yet), with Christy quiet and no brief playing or on its way.  A backchannel said over
+        her line, or one the ack hold kept back, never gets here with her quiet."""
+        return (
+            transition_repair_enabled()
+            and self._start_question == _EITHER_OR
+            and self._agent_state in _QUIET_AGENT_STATES
+            and self._brief_playing is None
+            and not self._bridging
+        )
 
     def _latch_brief(self, route: str, index: int | None) -> None:
         """Ask the driver for the replay or the recap (once each while pending), and wake it."""
@@ -6910,6 +7285,8 @@ class R1Interview:
         if self._brief_due() or self._recap_due() or row.index == self._brief_latch_index:
             return
         joined = " ".join(row.parts)
+        if is_icebreaker_question_request(text) or is_icebreaker_question_request(joined):
+            return  # diagnosis 1 (BR-2): "repeat your previous question" asks for no brief
         route = self._brief_route(text) or self._brief_route(joined)
         if route not in (_TRANSITION_BRIEF, _TRANSITION_RECAP):
             return
@@ -7324,7 +7701,6 @@ class R1Interview:
             if (
                 slot is not None
                 and slot.source == "generate_reply"
-                and icebreaker_repair_enabled()
                 and not (slot.reply is not None and slot.reply.scripted)
             ):
                 # M032 S6 (SWEEP-28): the question a repeat request gets again, from her LAST
@@ -7332,7 +7708,12 @@ class R1Interview:
                 # answered).  A reply cut before its question, or one that asked nothing, leaves
                 # None, and the plan's current question is used.  Scripted replies ("Take your
                 # time.", the hold and repeat lines) and say lines never change it.
-                self._ib_last_question = reply_question(text, complete=not interrupted)
+                question = reply_question(text, complete=not interrupted)
+                if icebreaker_repair_enabled():
+                    self._ib_last_question = question
+                if question:
+                    # Diagnosis 1 (BR-2): every question she asked, for the transition's repeat.
+                    self._ib_questions = (self._ib_questions + [question])[-_IB_QUESTIONS_KEPT:]
         self._note_wrapup_answer(phase, slot, interrupted)
         if phase == "transition" and slot is not None and slot.source == "generate_reply":
             self._last_transition_line = "reply"  # M032 S6: an answer, not a brief
@@ -8871,6 +9252,10 @@ class R1Interview:
         * The button pressed while a brief, the replay or the recap was playing gets
           L-PICKUP-BRIDGE ("Great, here she is.") before the pickup; ``session_facts`` records
           ``start_by`` and ``pressed_during`` (labels) and ``transition_recaps`` (a count).
+        * Diagnosis 1: a request to hear an icebreaker question again gets "Of course.
+          {question}" (BR-2), and a committed turn that answers nothing after an either/or start
+          question that finished playing gets L-TRANSITION-REASK after
+          ``TRANSITION_QUIET_TURN_REASK_SECONDS``, not the ladder's 20 s (DA-1).
 
         Consent is unchanged throughout: only a spoken "ready" (or a start phrase,
         ``is_transition_consent``) or the "I'm ready" button starts the role-play.
@@ -8890,23 +9275,33 @@ class R1Interview:
                 or self._brief_due()
                 or self._recap_due()
                 or bool(self._transition_lines)
+                or self._quiet_reask_pending  # diagnosis 1 (DA-1): the short window is due
             )
 
         step = 0  # the silence steps used since the candidate last spoke
+        quiet_window = False  # DA-1: the first rung waits TRANSITION_QUIET_TURN_REASK_SECONDS
         while not self._ready_latched:
             if self._brief_due():
+                self._quiet_reask_pending = quiet_window = False
                 if await self._repeat_brief():
                     break  # a consent during the replay
                 continue
             if self._recap_due():
+                self._quiet_reask_pending = quiet_window = False
                 if await self._say_recap():
                     break  # a consent during the recap (M032 S6)
                 continue
             if self._transition_lines:
+                self._quiet_reask_pending = quiet_window = False
                 await self.say(self._transition_lines.popleft())
                 continue
+            if self._quiet_reask_pending:
+                self._quiet_reask_pending = False
+                quiet_window = step == 0
             if step < len(TRANSITION_SILENCE_LADDER):
                 window = TRANSITION_SILENCE_LADDER[step][0]
+                if quiet_window:
+                    window = min(window, TRANSITION_QUIET_TURN_REASK_SECONDS)
             else:
                 window = TRANSITION_SILENCE_END_SECONDS
             kind, value = await self._await_turn(window, hard=left, until=interrupted)
@@ -8918,12 +9313,14 @@ class R1Interview:
                 _log.info("unknown_event", error_type="r1_transition_ceiling")
                 return await self._end_transition_unstarted()
             if kind == SILENCE:
+                quiet_window = False
                 if step < len(TRANSITION_SILENCE_LADDER):
                     await self.say(TRANSITION_SILENCE_LADDER[step][1])
                     step += 1
                     continue
                 return await self._end_transition_unstarted()
             step = 0
+            quiet_window = False
             if self._transition_consent(value or ""):
                 self._transition_consented = True
                 break

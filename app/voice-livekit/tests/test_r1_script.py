@@ -538,7 +538,10 @@ class TransitionRepairLineTests(unittest.TestCase):
         self.assertTrue(recap.startswith("Of course, in short: I'll play {lead_name}"))
         goal = r1_script.BRIEF_GOAL
         self.assertIn(goal[:1].upper() + goal[1:], recap)
-        self.assertTrue(recap.endswith(self.EITHER_OR))
+        # Diagnosis 1 (CR-1): its own either/or question, not the brief's word for word.
+        self.assertTrue(recap.endswith(r1_script.RECAP_START_PROMPT))
+        self.assertNotIn(self.EITHER_OR, recap)
+        self.assertIn(", or ", r1_script.RECAP_START_PROMPT)
         self.assertLessEqual(self.words(recap), 46)  # about 15 s
         for private in ("$", "7,000", "budget", "husband", "worried", "price"):
             self.assertNotIn(private, recap)

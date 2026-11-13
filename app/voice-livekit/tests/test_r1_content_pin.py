@@ -179,11 +179,19 @@ import r1_world
 # (``r1_content._learner_followups``) beside the texts they replace while their flags are on.  No
 # graded meaning, marker, must-say or deadline changed.
 # Learner lane revision 26 (simulation diagnosis 1, learner fixes): the new notes, wordings and
-# wider delivery markers join the manifest (``r1_content._sim_repairs``) beside the texts they replace while their
-# flags are on.  No graded meaning, must-say or deadline changed.
+# wider delivery markers join the manifest (``r1_content._sim_repairs``) beside the texts they
+# replace while their flags are on.  No graded meaning, must-say or deadline changed.
 # Revision 27 (second merge of the M032 lanes): the learner lane's 25..26 on top of revision 25;
 # no text changed in the merge.  CONTENT_REVISION = max(25, 26) + 1.
-PINNED_CONTENT_SHA256 = "ca70d5c4b75f287fb8ab660ef48d1b5c5ab690e809533faee086a40cf22a9779"
+# Christy lane (feat/m032-christy), its own revisions 24..25 after the first integration:
+# Christy lane revision 24 (M032 live simulation, diagnosis 1): L-TRANSITION-RECAP's own
+# either/or question (CR-1) and the repaired transition note on "Of course, go ahead." and repeat
+# requests (BR-2).
+# Christy lane revision 25 (review of diagnosis 1): the one-line note for the answer to her
+# repeated icebreaker question (TRANSITION_IB_ANSWER_NOTE, BR-2).
+# Revision 28 (third merge of the M032 lanes): the Christy lane's 24..25 on top of revision 27;
+# no text changed in the merge.  CONTENT_REVISION = max(27, 25) + 1.
+PINNED_CONTENT_SHA256 = "a97e762683d2dbde62655d1acba5afdf3a076bb3022c4ebc99ce4717df4cac98"
 
 CONTENT_MODULES = (
     "r1_text",

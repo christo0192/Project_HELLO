@@ -244,7 +244,19 @@ import r1_world
 #    markers and the readers are the release before.
 # 27: M032 integration 2 (the learner lane's 25-26 merged onto revision 25): every text of both
 #    lanes in one manifest.  No text changed in the merge; CONTENT_REVISION = max(25, 26) + 1.
-CONTENT_REVISION = 27
+# Christy lane (feat/m032-christy, its revisions 24-25, after the first integration):
+# Lane 24: M032 live simulation, diagnosis 1 (R1_TRANSITION_REPAIR): the short recap
+#    L-TRANSITION-RECAP ends with its own either/or question ("Would you like to begin now, or ask
+#    me something first?", r1_script.RECAP_START_PROMPT), so the brief's start question is never
+#    heard three times (CR-1), and the repaired transition note says when "Of course, go ahead."
+#    is for, with an example, and that a request to repeat or explain gets that, in one sentence
+#    (BR-2).  No other pinned text changed.
+# Lane 25: review of diagnosis 1 (BR-2): the turn that answers her repeated icebreaker question
+#    gets one more line in the transition note, r1_prompts.TRANSITION_IB_ANSWER_NOTE ("react in
+#    one short sentence ... and ask nothing").  No other pinned text changed.
+# 28: M032 integration 3 (the Christy lane's 24-25 merged onto revision 27): every text of both
+#    lanes in one manifest.  No text changed in the merge; CONTENT_REVISION = max(27, 25) + 1.
+CONTENT_REVISION = 28
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -733,6 +745,7 @@ def manifest() -> dict[str, Any]:
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,
             "transition_reminder_repaired": r1_prompts.TRANSITION_REMINDER_REPAIRED,
+            "transition_ib_answer_note": r1_prompts.TRANSITION_IB_ANSWER_NOTE,
             "getting_to_know_you_note": r1_prompts.GETTING_TO_KNOW_YOU_NOTE,
             "learner_prefixes": {
                 f"{p.id}.{v.id}": r1_prompts.learner_prefix(r1_personas.resolve_persona(

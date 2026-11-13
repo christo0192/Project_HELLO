@@ -51,6 +51,9 @@ BRIEF_SCENARIO = (
     "say, 'Let's pause the role-play here.' "
     + BRIEF_START_PROMPT
 )
+# Diagnosis 1 (CR-1): the recap's own either/or start question (still either/or: a bare "yes" to it
+# gets the nudge, as after the brief's).
+RECAP_START_PROMPT = "Would you like to begin now, or ask me something first?"
 BRIEF_LEAD_IN = "Next, let's do a sales role-play. "
 BRIEF_BODY = BRIEF_LEAD_IN + BRIEF_SCENARIO
 BRIEF_THANKS = "Thank you, {first_name}. "
@@ -110,13 +113,14 @@ LINES: dict[str, str] = {
     "L-TRANSITION-AGAIN": BRIEF_AGAIN + BRIEF_SCENARIO,
     # M032 S6 item 2 and SWEEP-29: the short recap (public brief fields only, about 15 s) for a
     # request for a shorter brief, a question about the role-play, or a request after the replay.
+    # M032 live simulation, diagnosis 1 (CR-1): its own either/or closing question, so a candidate
+    # who hears the brief, the replay and the recap never hears one sentence three times.
     "L-TRANSITION-RECAP": (
         "Of course, in short: I'll play {lead_name}, and you're the Program Advisor calling her "
         "back about the Data Science course. "
         + BRIEF_GOAL[:1].upper()
         + BRIEF_GOAL[1:]
-        + ", using your preparation guide. Shall we start the role-play now, or do you have any "
-        "questions first?"
+        + ", using your preparation guide. " + RECAP_START_PROMPT
     ),
     # M032 S6 item 3 and SWEEP-28 (one id): the answer to "Are you there?".
     "L-PRESENT": "Yes, I'm here.",
