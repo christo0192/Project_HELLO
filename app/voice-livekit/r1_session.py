@@ -1652,8 +1652,10 @@ def is_brief_request(text: str, *, wide: bool = False, lead_names: tuple[str, ..
 # and every turn of the 2,136-turn advisor corpus stay negative.
 # M032 live simulation, diagnosis 2 (D2-BR1): "Could you give me THOSE instructions in, like, just 4
 # lines?" missed every detector, reached the model and was refused as a request for its own rules;
-# "these", "those" and "your" name the brief as well (only the repaired transition reads this).
-_BRIEF_DET_OBJECT = r"(?:this|the|that|these|those|your) " + _BRIEF_OBJECT
+# "these" and "those" name the brief as well (only the repaired transition reads this).  Review of
+# diagnosis 2 (D2-BR1-R1): never "your", which names the company's ("tell me about your setup, is
+# it hybrid?", "summarise your round of hiring for this job") as often as the brief.
+_BRIEF_DET_OBJECT = r"(?:this|the|that|these|those) " + _BRIEF_OBJECT
 _BRIEF_SUMMARY_WORD = r"(?:summary|summari[sz]e|recap|overview|rundown)"
 _BRIEF_INFO_WORD = r"(?:information|info|details?)"
 _BRIEF_ABOUT_WORD = r"(?:of|on|about|for|regarding)"
@@ -1948,6 +1950,23 @@ _IB_INSIST_RE = re.compile(
     r"that one|what i (?:meant|mean|asked))|"
     r"wrong question)\b"
 )
+# Review of diagnosis 2 (D2-IB1-R1): "No, I mean, not really, I mostly helped at my dad's shop.",
+# "The other one was harder for me" and "No, I mean, can we just start?" open like an insist and
+# are answers, declines or start requests.  An insist turn names a question and says nothing else:
+# once the opener, her question's references and the repeat ask are cut out, only these words may
+# be left, and a "No, I mean" opener needs one of ``_IB_INSIST_REF_WORDS`` after it.
+_IB_INSIST_REF_WORDS = frozenset(
+    {"one", "ones", "question", "questions", "before", "earlier", "previous", "prior", "other",
+     "first", "older", "opening", "icebreaker", "last"}
+)
+_IB_INSIST_WORDS = _IB_INSIST_REF_WORDS | frozenset(
+    {"the", "that", "this", "your", "very", "you", "asked", "had", "were", "asking", "me", "us",
+     "i", "mean", "meant", "no", "not", "nope", "it", "is", "it's", "its", "that's", "thats",
+     "wrong", "please", "sorry", "um", "uh", "oh", "wait", "actually", "christy", "ma'am", "maam",
+     "madam", "sir", "go", "back", "to", "and", "ask", "repeat", "say", "read", "put", "again",
+     "once", "more", "time", "from", "just"}
+)
+_IB_INSIST_NEEDS_REF_RE = re.compile(r"(?:no|nope) (?:i mean|i meant)$")
 # The candidate's own question: "my (first) question", "one other question", "I have another
 # question", a turn that opens with "first question", or a self-repeat ("I'll repeat my ...").
 _IB_OWN_QUESTION_RE = re.compile(
@@ -1999,17 +2018,31 @@ def is_icebreaker_question_insist(text: str) -> bool:
 
     Only with the insist opener (``_IB_INSIST_RE``; a bare "No," or "I mean," opens many an
     answer), and never a turn that names the brief, a question of the candidate's own, a job topic
-    or an ask of its own ("No, I meant what is the training period?").
+    or an ask of its own ("No, I meant what is the training period?").  Review of diagnosis 2
+    (D2-IB1-R1): the turn names a question and nothing else ("No, I mean, not really, I mostly
+    helped at the shop" and "No, I mean, can we just start?" are an answer and a start request).
     """
     folded = fold_speech(text)
-    if not folded or is_transition_consent(text) or _IB_INSIST_RE.search(folded) is None:
+    if not folded or is_transition_consent(text):
+        return False
+    opener = _IB_INSIST_RE.search(folded)
+    if opener is None:
         return False
     if _IB_BRIEF_OBJECT_RE.search(folded) is not None:
         return False
     if _IB_OWN_QUESTION_RE.search(folded) is not None:
         return False
     rest = _IB_QUESTION_ABOUT_RE.sub(" ", _IB_QUESTION_ASK_RE.sub(" ", folded))
-    return _JOB_TOPIC_RE.search(rest) is None and _IB_OTHER_ASK_RE.search(rest) is None
+    if _JOB_TOPIC_RE.search(rest) is not None or _IB_OTHER_ASK_RE.search(rest) is not None:
+        return False
+    tail = folded[opener.end():]
+    has_ref = _IB_QUESTION_REF_RE.search(tail) is not None
+    words = _IB_QUESTION_REF_RE.sub(" ", _IB_QUESTION_ASK_RE.sub(" ", tail)).split()
+    if any(word not in _IB_INSIST_WORDS for word in words):
+        return False
+    if _IB_INSIST_NEEDS_REF_RE.search(opener.group()) is None:
+        return True  # "Not that one", "The other one", "That's not what I asked" name it already
+    return has_ref or any(word in _IB_INSIST_REF_WORDS for word in words)
 
 
 # "Before the last one": the question before her last (``R1Interview._transition_question_to_repeat``).
@@ -5366,10 +5399,11 @@ class R1Interview:
         if _has_question_mark(text):
             return False
         folded = fold_speech(text)
-        if _IB_QUESTION_REF_RE.search(folded) is not None or _IB_INSIST_RE.search(folded):
+        if _IB_QUESTION_REF_RE.search(folded) is not None or is_icebreaker_question_insist(text):
             # Diagnosis 2 (D2-IB1): a turn that names one of her questions ("the question before
-            # last") or turns the repeat down ("No, I mean ...") asks for a question; it answers
-            # none.
+            # last") or turns the repeat down ("No, I mean the earlier one") asks for a question;
+            # it answers none.  Review of diagnosis 2 (D2-IB1-R1): "No, I mean, not really, ..."
+            # opens an answer, and is one.
             return False
         return (
             _IB_OTHER_ASK_RE.search(folded) is None

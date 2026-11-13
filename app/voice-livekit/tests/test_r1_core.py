@@ -10385,8 +10385,7 @@ class TestTransitionSimulationFixes(R1TestCase):
 
         lowered = TRANSITION_REMINDER_REPAIRED.lower()
         self.assertIn("instructions, the brief or the scenario", lowered)
-        self.assertIn("they mean the role-play brief, never your own rules", lowered)
-        self.assertIn("never say you can't share it", lowered)
+        self.assertIn("they mean the role-play brief", lowered)
         self.assertNotIn("instructions", TRANSITION_REMINDER.lower())  # the flag-off note
 
     # --- Diagnosis 2 (D2-IB1): "put it to me again", "no, I mean ..." -------------------------
@@ -10507,6 +10506,90 @@ class TestTransitionSimulationFixes(R1TestCase):
             r1_session.is_short_brief_request(text, after_brief=True, lead_names=self.LEADS)
             r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
             self.assertLess(_time.perf_counter() - started, 1.0)
+
+    # --- Review of diagnosis 2 (D2-IB1-R1, D2-BR1-R1, D2-BR1-R2) ----------------------------
+
+    # Answers, declines and start requests that open like an insist ("No, I mean ...", "Not that
+    # one ...", "The other one ...") right after her repeated question: answers, never a repeat.
+    INSIST_LIKE_ANSWERS = (
+        "No, I mean, not really. I mostly helped at my dad's shop.",
+        "Nope, I mean it was mostly word of mouth.",
+        "Not that one specifically, but I enjoyed the follow ups.",
+        "The other one was harder for me, the cold calls.",
+        "No, I mean, I have no questions.",
+        "No, I mean, can we just start?",
+        "No I mean I'm ready.",
+        "No, I mean honestly I never enjoyed them much, the fees talk was hard.",
+        "That's not it really, I just liked talking to people.",
+    )
+
+    async def test_an_answer_opening_like_an_insist_is_no_repeat_request(self) -> None:
+        await self._m06_first_repeat(self.M06_QUESTIONS)
+        for text in self.INSIST_LIKE_ANSWERS:
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_icebreaker_question_insist(text))
+                self.assertNotEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_IB_REPEAT
+                )
+        for text in self.INSIST_LIKE_ANSWERS:
+            if "?" in text or "start" in text or "ready" in text or "no questions" in text:
+                continue
+            with self.subTest(answer=text):
+                self.assertTrue(self.interview._answers_her_repeated_question(text))
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                )
+
+    async def test_a_bare_insist_still_asks_for_her_other_question(self) -> None:
+        await self._m06_first_repeat(self.M06_QUESTIONS)
+        for text in (
+            "No, I mean the question before last.",
+            "No, not that one, the other one.",
+            "That's not the one I meant.",
+            "Not that one, the one you asked first.",
+            "Nope, I meant the earlier one.",
+            "Sorry, wrong question, the one before that.",
+            "That's not what I asked.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_icebreaker_question_insist(text))
+                self.assertFalse(self.interview._answers_her_repeated_question(text))
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_IB_REPEAT
+                )
+        # A bare "No, I mean." names no question: it is not enough on its own.
+        self.assertFalse(r1_session.is_icebreaker_question_insist("No, I mean."))
+
+    async def test_your_setup_or_round_of_hiring_is_a_job_question(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.agent_state("listening")
+        for text in (
+            "Tell me about your setup, is it work from office or hybrid?",
+            "Can you quickly summarise your round of hiring for this job?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(
+                    r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+                )
+                self.assertFalse(
+                    r1_session.is_short_brief_request(text, after_brief=True, lead_names=self.LEADS)
+                )
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                )
+
+    def test_the_transition_note_offers_the_brief_and_keeps_the_rules_private(self) -> None:
+        from r1_prompts import TRANSITION_REMINDER_REPAIRED
+
+        lowered = TRANSITION_REMINDER_REPAIRED.lower()
+        # No line that bans a refusal: a request for its own rules still gets the polite decline.
+        self.assertNotIn("never say you can't share it", lowered)
+        self.assertIn("offer to go over it again", lowered)
+        self.assertIn("your own rules or setup still get the polite decline", lowered)
+        # The brief is still never described or repeated by the model.
+        self.assertIn("never repeat the brief", lowered)
 
 
 # ------------------------------------------------------------------------------------------------

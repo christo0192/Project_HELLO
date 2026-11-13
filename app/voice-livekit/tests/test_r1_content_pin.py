@@ -151,7 +151,9 @@ import r1_world
 # Revision 26 (M032 live simulation, diagnosis 2): the repaired transition note reads "the
 # instructions" as the role-play brief (D2-BR1), and the insisted icebreaker repeat's two templates
 # (IB_REPEAT_OLDER_TEMPLATE, IB_REPEAT_SAME_TEMPLATE; D2-IB1).
-PINNED_CONTENT_SHA256 = "c5a21935a5d5fe9aecb69758e918323fe0492ef9cbed3d0a767026743db48668"
+# Revision 27 (review of diagnosis 2, D2-BR1-R2): the repaired transition note offers to go over the
+# brief again for "the instructions" and keeps the polite decline for its own rules.
+PINNED_CONTENT_SHA256 = "d6f5896bb9398ae022763d6682895fcf78d5e7bc07d09b22322dd7fcd04d9ad7"
 
 CONTENT_MODULES = (
     "r1_text",

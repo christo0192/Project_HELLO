@@ -2287,19 +2287,25 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   no plan words ("before I pitch", "in the role play I ..."): "I will be clear about the fees" and
   "I'd like to understand her needs first" are the candidate's plan, answered by the model.
 
-**Live simulation fixes (diagnosis 2, same flag, content revision 26):**
+**Live simulation fixes (diagnosis 2, same flag, content revisions 26 and 27):**
 
-* **D2-BR1**: "these", "those" and "your" name the brief like "this/the/that" do, so "Could you give
-  me those instructions in, like, just 4 lines?" gets the recap and "Can you repeat your
+* **D2-BR1**: "these" and "those" name the brief like "this/the/that" do, so "Could you give me
+  those instructions in, like, just 4 lines?" gets the recap and "Can you repeat your
   instructions?" the replay ("What are the instructions for the first day of the job?" is still a
-  job question). The transition note says a request for the instructions, the brief or the
-  scenario means the role-play brief, never the model's own rules, and is never refused.
+  job question). "Your" is never a brief determiner (review of diagnosis 2): "Tell me about your
+  setup, is it work from office or hybrid?" and "Can you quickly summarise your round of hiring for
+  this job?" are job questions. The transition note (content revision 27) says a request for the
+  instructions, the brief or the scenario means the role-play brief: say it has just been given and
+  offer to go over it again; asks about the model's own rules or setup still get the polite decline.
 * **D2-IB1**: "put it to me again", "pose that question to me again" and "go back to ... and ask me
   that" ask for her question again. Right after a repeat, a turn that turns it down ("No, I mean the
   question before last", "Not that one, the other one") is another repeat request, never the answer
   to her question; when it asks for the question just given, it gets the one before it ("Sure, the
   one before that: ..."), or, with none older kept, "That one was: ...". A plain "No, not really,
-  ..." still answers her question. `TRANSITION_IB_REPEAT_LIMIT` stays 2.
+  ..." still answers her question. `TRANSITION_IB_REPEAT_LIMIT` stays 2. Review of diagnosis 2: the
+  insist turn names a question and says nothing else, so "No, I mean, not really. I mostly helped at
+  my dad's shop.", "The other one was harder for me, the cold calls." and "No, I mean, can we just
+  start?" are an answer and a start request, never a repeat; "No, I mean." alone names no question.
 
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 

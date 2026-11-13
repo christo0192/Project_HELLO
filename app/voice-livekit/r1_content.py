@@ -180,7 +180,11 @@ import r1_world
 #    icebreaker question down gets the one before it, "Sure, the one before that: {question}"
 #    (r1_icebreaker.IB_REPEAT_OLDER_TEMPLATE), or with none older kept "That one was: {question}"
 #    (IB_REPEAT_SAME_TEMPLATE) (D2-IB1).  No other pinned text changed.
-CONTENT_REVISION = 26
+# 27: review of diagnosis 2 (D2-BR1-R2): the repaired transition note says what to do with a
+#    request for the instructions (say the brief has just been given and offer to go over it
+#    again) and keeps the polite decline for asks about the model's own rules or setup, with no
+#    line that bans a refusal.  No other pinned text changed.
+CONTENT_REVISION = 27
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
