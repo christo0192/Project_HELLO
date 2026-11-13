@@ -12114,5 +12114,44 @@ class CallOpeningEngineTests(unittest.TestCase):
         self.assertFalse(any(reason.startswith("call_opening") for reason in plan.reasons))
         self.assertNotIn("ask who is calling", plan.reminder)
 
+
+class AbuseBeforeEndRequestTests(unittest.TestCase):
+    """Simulation diagnosis 1, AB-1 (R1_ABUSE_HANGUP): an insult that also says "stop" or "end"
+    is abuse first, so she hangs up in role instead of Christy's L-ASIDE-END question.  In the
+    simulation the end-intent model read "stop wasting my time" as a "maybe" request."""
+
+    def test_an_insult_with_stop_in_it_hangs_up(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Come on, stop wasting my time, you idiot.", 360, end_intent="maybe")
+        self.assertEqual(plan.prelude_line, "L-LEARNER-HANGUP")
+        self.assertNotEqual(plan.line_id, "L-ASIDE-END")
+        log = s.eng.admin_log()["endings"]
+        self.assertEqual((log["abuse_count"], log["abuse_hangups"]), (1, 1))
+
+    def test_a_plain_request_to_stop_still_gets_the_end_question(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Can we stop the role-play?", 360)
+        self.assertEqual(plan.line_id, "L-ASIDE-END")
+        self.assertIsNone(plan.prelude_line)
+
+    def test_end_the_interview_with_an_insult_hangs_up_and_end_words_then_exit(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("End the interview, you idiot.", 360)
+        self.assertEqual(plan.prelude_line, "L-LEARNER-HANGUP")
+        s.eng.hangup_prelude_done()
+        answer = s.say("End the interview.", 365)
+        self.assertEqual(answer.mode, TurnMode.EXIT)
+
+    def test_flag_off_is_the_release_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_ABUSE_HANGUP": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("Come on, stop wasting my time, you idiot.", 360, end_intent="maybe")
+        self.assertEqual(plan.line_id, "L-ASIDE-END")
+
+
 if __name__ == "__main__":
     unittest.main()

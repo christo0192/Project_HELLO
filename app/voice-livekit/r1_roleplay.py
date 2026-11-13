@@ -1767,6 +1767,13 @@ class RolePlayEngine:
         permission = late_on and end_intent not in END_INTENT_LEVELS
         end_level = end_intent_level(candidate_text, end_intent, permission=permission)
         lexical_level = end_intent_level(candidate_text, None, permission=permission)
+        if end_level != "no" and self._abuse_hangs_up(candidate_text):
+            # Simulation diagnosis 1, AB-1 (R1_ABUSE_HANGUP): abuse that also says "stop" or "end"
+            # ("stop wasting my time, you idiot") is abuse first.  It is no end request here, so
+            # the turn goes on to the hang-up below (said to her, it stays evidence), and
+            # L-LEARNER-HANGUP's own question covers ending.  Past the hang-up limit, or with a
+            # question open, the end path is unchanged.
+            end_level = lexical_level = "no"
         # Reviewed fix (2026-10-30): once the question has been asked and has closed (declined, or
         # answered by talk about the sale), a "later request" that confirms the stop at once must
         # be the candidate's own words, never a model-only "maybe": after a declined aside, "At the
@@ -2804,6 +2811,15 @@ class RolePlayEngine:
     def _hangups(self) -> int:
         """How often the learner hung up on abuse (S3.4)."""
         return sum(1 for offer in self._wrap_offers if offer["trigger"] == TRIGGER_ABUSE)
+
+    def _abuse_hangs_up(self, text: str) -> bool:
+        """S3.4: ``text`` is abuse aimed at her that the hang-up below would answer now."""
+        return (
+            flag_on(FLAG_ABUSE_HANGUP)
+            and self._hangups() < HANGUP_LIMIT
+            and not self._question_open()
+            and detect_abuse(text, names=(self.persona.first_name,))
+        )
 
     def _enter_closing(self, state: str) -> None:
         """S3.2: move the closing state (counted per state entered; no text)."""
