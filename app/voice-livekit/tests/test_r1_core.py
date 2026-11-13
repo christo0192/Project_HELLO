@@ -10315,6 +10315,199 @@ class TestTransitionSimulationFixes(R1TestCase):
         self.assertTrue(await self.commit_turn("So bye."))
         self.assertTrue(self.interview._quiet_reask_pending)
 
+    # --- Diagnosis 2 (D2-BR1): "those instructions", "your instructions" ---------------------
+
+    # manual-M03 (S 4:31): refused as a prompt-extraction attempt and answered with job facts.
+    M03_SHORT = "Could you give me those instructions in, like, just 4 lines?"
+    DETERMINER_ASKS = (
+        "Can you repeat your instructions?",
+        "Could you go over your instructions again?",
+        "Go over those instructions once more for me.",
+        "Can you give me a summary of these instructions?",
+    )
+
+    def test_those_instructions_in_four_lines_is_a_short_brief_request(self) -> None:
+        for after_brief in (False, True):
+            with self.subTest(after_brief=after_brief):
+                self.assertTrue(
+                    r1_session.is_short_brief_request(
+                        self.M03_SHORT, after_brief=after_brief, lead_names=self.LEADS
+                    )
+                )
+        for text in self.DETERMINER_ASKS:
+            with self.subTest(text=text):
+                self.assertTrue(
+                    r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+                    or r1_session.is_short_brief_request(text, lead_names=self.LEADS)
+                )
+                self.assertFalse(r1_session.asks_about_the_job(text, lead_names=self.LEADS))
+
+    def test_instructions_about_the_job_stay_a_job_question(self) -> None:
+        for text in (
+            "What are the instructions for the first day of the job?",
+            "Could you give me a quick summary of those incentives?",
+            "Those instructions were clear, thank you.",
+            "In short, your instructions were clear.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(
+                    r1_session.is_short_brief_request(text, after_brief=True, lead_names=self.LEADS)
+                )
+                self.assertFalse(
+                    r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+                )
+
+    async def test_those_instructions_get_the_recap_and_your_instructions_the_replay(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.agent_state("listening")
+        self.assertEqual(
+            self.interview._transition_action(self.M03_SHORT), r1_session._TRANSITION_RECAP
+        )
+        self.assertEqual(
+            self.interview._transition_action("Can you repeat your instructions?"),
+            r1_session._TRANSITION_BRIEF,
+        )
+        self.assertEqual(
+            self.interview._transition_action(
+                "What are the instructions for the first day of the job?"
+            ),
+            r1_session._TRANSITION_ANSWER,
+        )
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.assertEqual(
+                self.interview._transition_action(self.M03_SHORT), r1_session._TRANSITION_ANSWER
+            )
+
+    def test_the_transition_note_reads_instructions_as_the_brief(self) -> None:
+        from r1_prompts import TRANSITION_REMINDER, TRANSITION_REMINDER_REPAIRED
+
+        lowered = TRANSITION_REMINDER_REPAIRED.lower()
+        self.assertIn("instructions, the brief or the scenario", lowered)
+        self.assertIn("they mean the role-play brief, never your own rules", lowered)
+        self.assertIn("never say you can't share it", lowered)
+        self.assertNotIn("instructions", TRANSITION_REMINDER.lower())  # the flag-off note
+
+    # --- Diagnosis 2 (D2-IB1): "put it to me again", "no, I mean ..." -------------------------
+
+    # manual-M06 (S 4:17 and S 4:32): the second was taken as the answer to her repeated question.
+    M06_FIRST = "Can you jump back to the question before the last one and ask me it again?"
+    M06_INSIST = (
+        "No, I mean go back to that earlier one, the question before last, and put it to me again."
+    )
+    M06_QUESTIONS = [
+        "And before that introduction, how did you usually find your customers?",
+        "Which of those did you find people asked the most about?",
+        "What did you enjoy most about the customer conversations themselves?",
+    ]
+
+    def test_put_it_to_me_again_is_a_request_for_her_question(self) -> None:
+        for text in (
+            self.M06_FIRST,
+            self.M06_INSIST,
+            "Could you pose that earlier question to me again?",
+            "Go back to your previous question and ask me that again.",
+            "Can you throw the question before last at me again? Put it to me again.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_icebreaker_question_request(text))
+        for text in self.OWN_QUESTIONS + (
+            "Let me put it again, what is the salary?",
+            "I'll put that to you again later.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_icebreaker_question_request(text))
+
+    async def _m06_first_repeat(self, questions: list[str]) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.agent_state("listening")
+        self.interview._ib_questions = list(questions)
+        self.assertEqual(
+            self.interview._transition_action(self.M06_FIRST), r1_session._TRANSITION_IB_REPEAT
+        )
+        reply = r1_session.Reply(phase="transition", candidate_text=self.M06_FIRST)
+        self.interview._transition_ib_repeat_reply(reply, self.M06_FIRST)
+        self.assertEqual(reply.scripted, f"Of course. {questions[-2]}")
+
+    async def test_an_insisted_request_offers_the_one_before(self) -> None:
+        await self._m06_first_repeat(self.M06_QUESTIONS)
+        self.assertEqual(
+            self.interview._transition_action(self.M06_INSIST), r1_session._TRANSITION_IB_REPEAT
+        )
+        self.assertFalse(self.interview._answers_her_repeated_question(self.M06_INSIST))
+        reply = r1_session.Reply(phase="transition", candidate_text=self.M06_INSIST)
+        self.interview._transition_ib_repeat_reply(reply, self.M06_INSIST)
+        self.assertEqual(reply.scripted, f"Sure, the one before that: {self.M06_QUESTIONS[0]}")
+        # TRANSITION_IB_REPEAT_LIMIT stays 2: a third ask is no scripted repeat.
+        self.assertNotEqual(
+            self.interview._transition_action(self.M06_INSIST), r1_session._TRANSITION_IB_REPEAT
+        )
+
+    async def test_an_insisted_request_with_no_older_question_names_it_again(self) -> None:
+        await self._m06_first_repeat(self.M06_QUESTIONS[1:])
+        reply = r1_session.Reply(phase="transition", candidate_text=self.M06_INSIST)
+        self.interview._transition_ib_repeat_reply(reply, self.M06_INSIST)
+        self.assertEqual(reply.scripted, f"That one was: {self.M06_QUESTIONS[1]}")
+
+    async def test_the_other_one_after_a_repeat_is_her_other_question(self) -> None:
+        await self._m06_first_repeat(self.M06_QUESTIONS)
+        text = "No, not that one, the other one."
+        self.assertEqual(self.interview._transition_action(text), r1_session._TRANSITION_IB_REPEAT)
+        reply = r1_session.Reply(phase="transition", candidate_text=text)
+        self.interview._transition_ib_repeat_reply(reply, text)
+        self.assertEqual(reply.scripted, f"Of course. {self.M06_QUESTIONS[-1]}")
+
+    async def test_a_plain_no_still_answers_her_repeated_question(self) -> None:
+        await self._m06_first_repeat(self.M06_QUESTIONS)
+        for text in (
+            "No, not really, I never tracked that.",
+            "I mean, mostly the fees and the placement support.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(self.interview._answers_her_repeated_question(text))
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                )
+        # Naming one of her questions, or turning the repeat down, is no answer.
+        for text in (
+            "No, I mean the question before last.",
+            "That's not the one I meant.",
+            "The earlier question, the one before that.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(self.interview._answers_her_repeated_question(text))
+
+    async def test_an_own_question_after_a_repeat_is_still_theirs(self) -> None:
+        await self._m06_first_repeat(self.M06_QUESTIONS)
+        for text in (
+            "No, I meant what is the training period?",
+            "Going back to the previous question, what's the salary?",
+            "No, I mean, what are the shift timings",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_IB_REPEAT
+                )
+
+    def test_the_new_repeat_forms_are_linear_on_long_input(self) -> None:
+        import time as _time
+
+        for text in (
+            "go back to " * 4000 + "and ask it",
+            "no i mean " * 4000 + "the question before last",
+            "put it " * 4000 + "to me again",
+            "could you give me those " * 3000 + "instructions in 4 lines",
+        ):
+            started = _time.perf_counter()
+            r1_session.is_icebreaker_question_request(text)
+            r1_session.is_icebreaker_question_insist(text)
+            r1_session.is_short_brief_request(text, after_brief=True, lead_names=self.LEADS)
+            r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+            self.assertLess(_time.perf_counter() - started, 1.0)
+
 
 # ------------------------------------------------------------------------------------------------
 # Owner and manager decisions of 2026-11-03 (mock call aa166f09): the icebreaker's last answer (A1)

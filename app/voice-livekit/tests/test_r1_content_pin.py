@@ -148,7 +148,10 @@ import r1_world
 # (CR-1) and the repaired transition note on "Of course, go ahead." and repeat requests (BR-2).
 # Revision 25 (review of diagnosis 1): the one-line note for the answer to her repeated icebreaker
 # question (TRANSITION_IB_ANSWER_NOTE, BR-2).
-PINNED_CONTENT_SHA256 = "ad2f292f9861bff8458bf7dd8d094811ee86a03223fb6b5d48076b3b97dec7a1"
+# Revision 26 (M032 live simulation, diagnosis 2): the repaired transition note reads "the
+# instructions" as the role-play brief (D2-BR1), and the insisted icebreaker repeat's two templates
+# (IB_REPEAT_OLDER_TEMPLATE, IB_REPEAT_SAME_TEMPLATE; D2-IB1).
+PINNED_CONTENT_SHA256 = "c5a21935a5d5fe9aecb69758e918323fe0492ef9cbed3d0a767026743db48668"
 
 CONTENT_MODULES = (
     "r1_text",

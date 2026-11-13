@@ -216,6 +216,8 @@ from r1_icebreaker import (
     BRIDGE_TIMEOUT_SEC,
     FREE_RESTATE,
     HOLD_MIN_BUDGET_SECONDS,
+    IB_REPEAT_OLDER_TEMPLATE,
+    IB_REPEAT_SAME_TEMPLATE,
     ICEBREAKER_HOLD_WAIT_SECONDS,
     IcebreakerPlan,
     bridge_wanted,
@@ -1648,7 +1650,10 @@ def is_brief_request(text: str, *, wide: bool = False, lead_names: tuple[str, ..
 # the role-play's (``_BRIEF_OBJECT`` after "this/the/that", or the learner's own name): "a summary of
 # my experience", "tell me about the role", "just to recap everything, the course has six modules"
 # and every turn of the 2,136-turn advisor corpus stay negative.
-_BRIEF_DET_OBJECT = r"(?:this|the|that) " + _BRIEF_OBJECT
+# M032 live simulation, diagnosis 2 (D2-BR1): "Could you give me THOSE instructions in, like, just 4
+# lines?" missed every detector, reached the model and was refused as a request for its own rules;
+# "these", "those" and "your" name the brief as well (only the repaired transition reads this).
+_BRIEF_DET_OBJECT = r"(?:this|the|that|these|those|your) " + _BRIEF_OBJECT
 _BRIEF_SUMMARY_WORD = r"(?:summary|summari[sz]e|recap|overview|rundown)"
 _BRIEF_INFO_WORD = r"(?:information|info|details?)"
 _BRIEF_ABOUT_WORD = r"(?:of|on|about|for|regarding)"
@@ -1920,8 +1925,28 @@ _IB_QUESTION_ASK_RE = re.compile(
     r"(?:ask|say|tell|read|give)(?: me| us)?(?: it| that| this| the question| your question|"
     r" (?:the|that|your) \w+ question)? (?:again|once more|one more time)|"
     r"what(?: was| were| is|'s) (?:the |that |your )?(?:\w+ ){0,2}questions?|"
-    r"remind me(?: of| what)?(?: (?:the|that|your))?(?: \w+){0,2}? questions?"
+    r"remind me(?: of| what)?(?: (?:the|that|your))?(?: \w+){0,2}? questions?|"
+    # Diagnosis 2 (D2-IB1): "put it to me again", "pose that question to me again", "throw the
+    # question before last at me again", "go back to your previous question and ask me that".
+    r"(?:put|throw|pose)(?: it| that| the question| your question| (?:the|that|your) \w+ "
+    r"question)?(?: \w+){0,3}? (?:to|at) (?:me|us) (?:again|once more|one more time)|"
+    r"(?:put|pose) (?:it|that|the question|your question) (?:to (?:me|us) )?"
+    r"(?:again|once more|one more time)|"
+    r"go back to(?: \S+){1,8}? (?:and|then) (?:ask|say|repeat|put|read)(?: (?:me|us))? "
+    r"(?:it|that|this|the question)"
     r")\b"
+)
+# Diagnosis 2 (D2-IB1): a turn that turns her repeated question down ("No, I mean ...", "Not that
+# one", "The other one", "That's not the one I meant").  A bare "No," or "I mean," opens many an
+# answer ("No, not really, I never tracked that."), so neither is enough on its own.
+_IB_INSIST_RE = re.compile(
+    r"^(?:(?:um|uh|oh|sorry|wait|actually|christy|ma'am|maam|madam|sir|no|nope) )*"
+    r"(?:no (?:i mean|i meant)|nope (?:i mean|i meant)|"
+    r"(?:no )?not (?:that|this)(?: one| question)|"
+    r"(?:no )?(?:the|that) other (?:one|question)|"
+    r"(?:that's|thats|that is|it's|its|it is) not (?:it|the one|the right one|the question|"
+    r"that one|what i (?:meant|mean|asked))|"
+    r"wrong question)\b"
 )
 # The candidate's own question: "my (first) question", "one other question", "I have another
 # question", a turn that opens with "first question", or a self-repeat ("I'll repeat my ...").
@@ -1959,6 +1984,25 @@ def is_icebreaker_question_request(text: str) -> bool:
     if not folded or is_transition_consent(text):
         return False
     if _IB_QUESTION_REF_RE.search(folded) is None or _IB_QUESTION_ASK_RE.search(folded) is None:
+        return False
+    if _IB_BRIEF_OBJECT_RE.search(folded) is not None:
+        return False
+    if _IB_OWN_QUESTION_RE.search(folded) is not None:
+        return False
+    rest = _IB_QUESTION_ABOUT_RE.sub(" ", _IB_QUESTION_ASK_RE.sub(" ", folded))
+    return _JOB_TOPIC_RE.search(rest) is None and _IB_OTHER_ASK_RE.search(rest) is None
+
+
+def is_icebreaker_question_insist(text: str) -> bool:
+    """Diagnosis 2 (D2-IB1): right after her repeated icebreaker question, a turn that turns it
+    down ("No, I mean the question before last.", "Not that one, the other one.").
+
+    Only with the insist opener (``_IB_INSIST_RE``; a bare "No," or "I mean," opens many an
+    answer), and never a turn that names the brief, a question of the candidate's own, a job topic
+    or an ask of its own ("No, I meant what is the training period?").
+    """
+    folded = fold_speech(text)
+    if not folded or is_transition_consent(text) or _IB_INSIST_RE.search(folded) is None:
         return False
     if _IB_BRIEF_OBJECT_RE.search(folded) is not None:
         return False
@@ -2776,6 +2820,9 @@ class R1Interview:
         # reask window.
         self._transition_ib_repeats = 0
         self._transition_ib_repeat_open = False
+        # Diagnosis 2 (D2-IB1): the question the last repeat gave, until a turn that is not
+        # another repeat request; "No, I mean the question before last" then gets the one before.
+        self._transition_ib_last_question: str | None = None
         self._quiet_reask_pending = False
         # True once a candidate turn was answered by the icebreaker's end (``prepare_turn``
         # suppressed its reply because the soft exit was due): the boundary line answers it.
@@ -4668,7 +4715,12 @@ class R1Interview:
         if (
             text
             and self._transition_ib_repeats < TRANSITION_IB_REPEAT_LIMIT
-            and is_icebreaker_question_request(text)
+            and (
+                is_icebreaker_question_request(text)
+                # Diagnosis 2 (D2-IB1): "No, I mean the question before last." turns her
+                # repeated question down; it is never the answer to it.
+                or (self._transition_ib_repeat_open and is_icebreaker_question_insist(text))
+            )
         ):
             return _TRANSITION_IB_REPEAT  # diagnosis 1 (BR-2): before the brief's route
         route = self._brief_route(text)
@@ -5082,6 +5134,8 @@ class R1Interview:
         ib_answer = action == _TRANSITION_ANSWER and self._answers_her_repeated_question(text)
         if action is not None and text and action != _TRANSITION_QUIET:
             self._transition_ib_repeat_open = False
+            if action != _TRANSITION_IB_REPEAT:
+                self._transition_ib_last_question = None  # D2-IB1: only a request right after
         if not suppressed and index is not None and index in self._sound_check_rows:
             # M032 S7C (SWEEP-35): a reply to the sound check whose turn commits after the agenda
             # (in the icebreaker) was answered by the agenda; the model never answers it again.
@@ -5268,6 +5322,33 @@ class R1Interview:
             return history[-1]
         return self._question_to_repeat()
 
+    def _transition_repeat_line(self, text: str) -> str:
+        """The line for a transition request to hear one of her icebreaker questions again.
+
+        "Of course. {question}" (``_transition_question_to_repeat``).  Diagnosis 2 (D2-IB1): when
+        the turn turns the repeat just given down ("No, I mean the question before last") and asks
+        for that same question, the candidate means another: the one before it ("Sure, the one
+        before that: ..."), or, with none older kept, the same one named once more ("That one
+        was: ...").
+        """
+        question = self._transition_question_to_repeat(text)
+        last, self._transition_ib_last_question = self._transition_ib_last_question, None
+        history = self._ib_questions
+        if (
+            last is not None
+            and question == last
+            and question in history
+            and _IB_INSIST_RE.search(fold_speech(text)) is not None
+        ):
+            index = len(history) - 1 - history[::-1].index(question)
+            if index >= 1:
+                self._transition_ib_last_question = history[index - 1]
+                return IB_REPEAT_OLDER_TEMPLATE.format(question=history[index - 1])
+            self._transition_ib_last_question = question
+            return IB_REPEAT_SAME_TEMPLATE.format(question=question)
+        self._transition_ib_last_question = question
+        return repeat_line(question)
+
     def _answers_her_repeated_question(self, text: str) -> bool:
         """Diagnosis 1 (BR-2): this turn answers her repeated icebreaker question.
 
@@ -5285,6 +5366,11 @@ class R1Interview:
         if _has_question_mark(text):
             return False
         folded = fold_speech(text)
+        if _IB_QUESTION_REF_RE.search(folded) is not None or _IB_INSIST_RE.search(folded):
+            # Diagnosis 2 (D2-IB1): a turn that names one of her questions ("the question before
+            # last") or turns the repeat down ("No, I mean ...") asks for a question; it answers
+            # none.
+            return False
         return (
             _IB_OTHER_ASK_RE.search(folded) is None
             and not asks_about_the_job(text, after_answer=False, lead_names=self._lead_names())
@@ -5304,7 +5390,7 @@ class R1Interview:
         the start question, ``_TRANSITION_ANSWER``) and is not counted as one of their questions.
         """
         self._transition_ib_repeats += 1
-        reply.scripted = repeat_line(self._transition_question_to_repeat(text))
+        reply.scripted = self._transition_repeat_line(text)
         self._start_question = None
         self._last_answer_tailless = True  # a bare yes or no answers her question
         self._transition_ib_repeat_open = True

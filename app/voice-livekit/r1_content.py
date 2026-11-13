@@ -174,7 +174,13 @@ import r1_world
 # 25: review of diagnosis 1 (BR-2): the turn that answers her repeated icebreaker question gets one
 #    more line in the transition note, r1_prompts.TRANSITION_IB_ANSWER_NOTE ("react in one short
 #    sentence ... and ask nothing").  No other pinned text changed.
-CONTENT_REVISION = 25
+# 26: M032 live simulation, diagnosis 2 (Christy lane, R1_TRANSITION_REPAIR): the repaired
+#    transition note says a request for the instructions, the brief or the scenario means the
+#    role-play brief, never the model's own rules (D2-BR1), and a request that turns her repeated
+#    icebreaker question down gets the one before it, "Sure, the one before that: {question}"
+#    (r1_icebreaker.IB_REPEAT_OLDER_TEMPLATE), or with none older kept "That one was: {question}"
+#    (IB_REPEAT_SAME_TEMPLATE) (D2-IB1).  No other pinned text changed.
+CONTENT_REVISION = 26
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -494,6 +500,8 @@ def manifest() -> dict[str, Any]:
             # presence opener notes and the hold's limits (L-IB-HOLD and L-PRESENT are lines).
             "repair": {
                 "repeat_template": r1_icebreaker.IB_REPEAT_TEMPLATE,
+                "repeat_older_template": r1_icebreaker.IB_REPEAT_OLDER_TEMPLATE,
+                "repeat_same_template": r1_icebreaker.IB_REPEAT_SAME_TEMPLATE,
                 "presence_opener_note": r1_icebreaker.PRESENCE_OPENER_NOTE,
                 "presence_opener_note_late": r1_icebreaker.PRESENCE_OPENER_NOTE_LATE,
                 "presence_late_seconds": r1_icebreaker.PRESENCE_LATE_SECONDS,
