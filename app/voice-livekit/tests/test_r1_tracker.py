@@ -2160,5 +2160,114 @@ class EndingsTrackerTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - start, 2.0)
 
 
+
+def advisor_corpus_texts() -> list[str]:
+    """The tuned advisor corpus plus the held-out set (M032 S7L corpus checks)."""
+    texts: list[str] = []
+    for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+        path = HERE / "tests" / "fixtures" / name
+        texts.extend(
+            json.loads(row)["text"] for row in path.read_text(encoding="utf-8").splitlines() if row
+        )
+    return texts
+
+
+class RoleConfusionTests(unittest.TestCase):
+    """M032 SWEEP-10 (flag R1_ROLE_CONFUSION_V2): role reversals are read on the first phrasing."""
+
+    REVERSALS = (
+        "Can you sell this to me?",
+        "Could you pitch the course to me.",
+        "Sell me the course",
+        "I'm interested to purchase a course",
+        "I'm looking to buy a product, not to sell",
+        "I want to buy, not sell",
+        "what program do you sell",
+        "Okay, so what product are you selling?",
+        "Can you sell this to me, please?",
+        "Could you pitch me the program?",
+    )
+    IN_ROLE = (
+        "Can you sell this to your husband?",
+        "Could you pitch it to your husband tonight?",
+        "Can you sell this course to your family?",
+        "Can you pitch this to your manager for sponsorship?",
+        "Would you pitch that to your company for reimbursement?",
+        "If you're interested to purchase, I can send the link.",
+        "No hard sell, I promise.",
+        "I'm not here to sell you anything.",
+        "Are you looking to buy the course this month?",
+        "Let me sell you the course.",
+        "Can you sell me on why this is worth it?",
+        "We never sell your data.",
+        # Review S7L-R1: a filler comma, a split sentence, a bare pronoun and her own job.
+        "Could you pitch it, um, to your husband?",
+        "Can you sell this, um, to your husband?",
+        "Would you pitch it, maybe to your boss, for sponsorship?",
+        "Can you pitch it? To your husband, I mean.",
+        "Can you pitch the course? To your husband, I mean.",
+        "Could you pitch the course, um, to your manager?",
+        "Could you just pitch it.",
+        "Can you sell it?",
+        "What product do you sell at your current company?",
+        "So what product do you sell?",
+        "I'm planning to buy the product for my team.",
+    )
+
+    def test_the_first_phrasings_are_coach_breaks_and_role_confusion(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.REVERSALS:
+            with self.subTest(text=text):
+                self.assertEqual(detect_character_break(text, role_v2=True), "coach")
+                self.assertTrue(role_confusion_in(text))
+
+    def test_in_role_sales_lines_are_neither(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.IN_ROLE:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_character_break(text, role_v2=True))
+                self.assertFalse(role_confusion_in(text))
+
+    def test_flag_off_reads_none_of_the_new_forms(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.REVERSALS[:7]:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_character_break(text))
+                self.assertFalse(role_confusion_in(text, v2=False))
+        # The role forms of the release before are still role confusion either way.
+        for text in ("I'm the buyer here.", "So, are you selling the course to me?"):
+            self.assertEqual(detect_character_break(text), "coach")
+            self.assertTrue(role_confusion_in(text, v2=False))
+        self.assertFalse(role_confusion_in("I'm confused."))
+
+    def test_no_corpus_turn_is_a_new_coach_hit(self):
+        texts = advisor_corpus_texts()
+        self.assertGreater(len(texts), 2000)
+        new_hits = [
+            text
+            for text in texts
+            if detect_character_break(text, role_v2=True) == "coach"
+            and detect_character_break(text) != "coach"
+        ]
+        self.assertEqual(new_hits, [])
+
+    def test_the_readers_stay_linear_on_long_turns(self):
+        from r1_tracker import role_confusion_in
+
+        for text in (
+            "can you sell " * 1000,
+            "i'm really interested to " * 400,
+            "i want to buy " + "x" * 4000,
+            "okay, " * 1000 + "sell me",
+            "what course " * 800,
+        ):
+            started = time.perf_counter()
+            detect_character_break(text[:4000], role_v2=True)
+            role_confusion_in(text[:4000])
+            self.assertLess(time.perf_counter() - started, 0.25)
+
 if __name__ == "__main__":
     unittest.main()

@@ -65,6 +65,7 @@ from r1_script import LINES
 from r1_text import (
     fold,
     fuzzy_contains,
+    is_hollow_turn,
     is_question_like,
     normalize,
     split_sentences,
@@ -699,6 +700,58 @@ REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
 _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
 
+# Simulation diagnosis 1 (U1, U2; flag R1_MARKERS_V2, latched per session by the engine): more
+# any-of alternatives per marker group (by group index), so the worry in the model's new words
+# proves the move and the scripted tail does not say it a second time in the same reply ("...run
+# it past my husband. I'd also need to talk to my husband.").  Every marker of the release before
+# stays; with the flag off the markers are exactly the release before.
+EXTRA_MARKERS_V2: dict[str, tuple[tuple[str, ...], ...]] = {
+    F2_PRIMARY: (
+        (
+            r"\bdays?\b",
+            r"\bhome\b",
+            r"\bkids\b",
+            r"\bworkload\b",
+            r"\bjob\b",
+            r"\bevenings?\b",
+            r"\bweekends?\b",
+        ),
+        (
+            r"\bkeep(?:ing)? (?:pace|going)\b",
+            r"\bon top of\b",
+            r"\bsqueez\w*",
+            r"\bfit (?:it|this|that) in\b",
+        ),
+    ),
+    F2_PUSH: (
+        (
+            r"\b(?:fall|falls|falling|fell|fallen|get|gets|getting|got) (?:\w+ ){1,3}behind\b",
+            r"\bpick (?:it |things )?(?:back )?up where\b",
+            r"\bwhat happens (?:if|when)\b[^.?!]{0,40}\b(?:busy|miss\w*|behind|swamped|piles? up|"
+            r"can'?t keep)\b",
+        ),
+    ),
+    F4_PUSH: (
+        (),
+        (
+            r"\brun (?:it|this|that|all of this|all this|everything) past\b",
+            r"\bgo (?:over|through) (?:it|this|that|everything)\b",
+        ),
+    ),
+    F1_COUNTER: ((r"\bfull price\b", r"\bnothing (?:added|extra)\b"),),
+}
+
+
+def widened_markers(
+    move_id: str, markers: tuple[tuple[str, ...], ...]
+) -> tuple[tuple[str, ...], ...]:
+    """``markers`` with ``EXTRA_MARKERS_V2`` added to each group (R1_MARKERS_V2)."""
+    extra = EXTRA_MARKERS_V2.get(move_id, ())
+    return tuple(
+        (*group, *(extra[index] if index < len(extra) else ()))
+        for index, group in enumerate(markers)
+    )
+
 
 def _compile(*patterns: str) -> tuple[re.Pattern[str], ...]:
     return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
@@ -980,6 +1033,8 @@ _CURIOSITY_COVERED = {
         r"\bcareer (?:support|services|coach\w*)\b",
         r"\bjob (?:search|placement|assistance|support)\b",
         r"\bresume (?:review|reviews|building)\b|\bmock interviews?\b|\breferrals?\b",
+        # Review S7L-R3: "we have placement support for a full year".
+        r"\bplacements?\b|\binterview prep(?:aration)?\b",
     ),
     "weekly_hours": _compile(
         r"\bhours? (?:a|per|each|every) (?:week|day)\b",
@@ -1105,6 +1160,131 @@ def answered_topics(text: object) -> frozenset[str]:
     if any(pattern.search(lowered) for pattern in _FALL_BEHIND_ANSWERED):
         found.add("fall_behind")
     return frozenset(found)
+
+
+# M032 SWEEP-7 (flag R1_COME_BACK): her own question the advisor dodged gets one come-back.  The
+# topics she can be owed an answer on are the curiosity topics (as ``curiosity_asked_in`` reads
+# them, ``wide``) and two more forms: "what if I fall behind / miss a class?" and "could I pay it
+# month by month?".  Price figures stay with F1 and S2P.
+OPEN_QUESTION_LABELS: dict[str, tuple[str, ...]] = {
+    **CURIOSITY_LABELS_V2,
+    "fall_behind": ("what happens if you fall behind",),
+}
+_OPEN_QUESTION_ASKED = {
+    "fall_behind": _compile(
+        r"\bfall(?:s|ing)? behind\b", r"\bmiss (?:a |some )?(?:class|classes|session|sessions)\b"
+    ),
+    "payment": _compile(
+        r"\bmonth by month\b",
+        r"\bpay (?:it |that |for it )?(?:off )?(?:each|every|per|a) month\b",
+    ),
+}
+# A deferral ("I'll get to that in a minute", "we can talk about that later", "hold that thought")
+# and a vague non-answer ("it's very flexible", "it depends", "don't worry about that").  Read
+# only on the advisor turn right after her question, and only when it left her topic uncovered.
+_DEFERS = _compile(
+    r"\b(?:i'?ll|i will|we'?ll|we will|let me|let's|let us|i can|we can) (?:get|come(?: back)?|"
+    r"circle back|return) to (?:that|it|this|those|your question)\b",
+    r"\b(?:we can|let's|let us|i'?ll|we'?ll|we will|i will) (?:discuss|talk about|cover|go over|"
+    r"get into|look at) (?:that|it|this|those)\b[^.?!]{0,20}\b(?:later|afterwards|in a (?:bit|"
+    r"minute|moment|second)|at the end|next time|another time)\b",
+    r"\bhold (?:on to )?that (?:thought|question)\b",
+    r"\b(?:that'?s|that is) (?:something|a question) (?:for|we can (?:cover|discuss)) later\b",
+)
+_VAGUE = _compile(
+    r"\b(?:it'?s|it is|that'?s|that is|timing is|the timing is|the schedule is|it'?s all) "
+    r"(?:very |quite |pretty |completely |totally |really |super )?flexible\b",
+    r"\bit (?:all )?(?:depends|varies)\b",
+    r"\bwhatever (?:works|suits) (?:for )?you\b",
+    r"\b(?:that'?s|that is|it'?s|it is) (?:very |quite |totally )?manageable\b",
+)
+# Review S7L-R3: a reassuring opener ("Don't worry about it, the recordings are always there") is
+# often followed by the real answer, so it counts as a dodge only when the turn says little else.
+_REASSURE = _compile(
+    r"\b(?:don'?t|do not) worry about (?:that|it|this)\b",
+    r"\bwe'?ll (?:figure|sort|work) (?:it|that|something) out\b",
+    r"\b(?:that'?s|that is|it'?s|it is) (?:not|never) (?:a |an )?(?:problem|issue|concern)"
+    r"(?: at all)?\b",
+)
+REASSURE_REST_MAX_WORDS = 8
+
+
+def open_question_topics(text: object, *, wide: bool = True) -> frozenset[str]:
+    """The topics a question of the LEARNER's ``text`` asks the advisor about (SWEEP-7)."""
+    found = set(curiosity_asked_in(text, wide=wide))
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        for topic, patterns in _OPEN_QUESTION_ASKED.items():
+            if any(pattern.search(lowered) for pattern in patterns):
+                found.add(topic)
+    return frozenset(found)
+
+
+# Review S7L-R3: what answers HER "what if I fall behind?" right after she asked it ("every class
+# is recorded so you can watch it later", "you can rewatch any session").  Wider than
+# ``_FALL_BEHIND_ANSWERED``, which a pitch must not trip ("classes are live and recorded").
+_FALL_BEHIND_COVERED = (
+    *_FALL_BEHIND_ANSWERED,
+    *_compile(
+        r"\bcatch[- ]up\b",
+        r"\brecord(?:ed|ing|ings)?\b",
+        r"\bre-?watch\b|\breplay(?:s|ed)?\b",
+        r"\bwatch (?:it|them|the (?:class|classes|session|sessions|recording|recordings)) "
+        r"(?:later|again|any ?time)\b",
+        r"\b(?:backup|back-up|extra|doubt(?:[- ]clearing)?) (?:class|classes|session|sessions)\b",
+    ),
+)
+
+
+def open_question_covered(topic: str, text: object) -> bool:
+    """The advisor's ``text`` answers the open-question ``topic`` (``curiosity_covered``)."""
+    if topic == "fall_behind":
+        lowered = fold(text).lower()
+        return any(pattern.search(lowered) for pattern in _FALL_BEHIND_COVERED)
+    return curiosity_covered(topic, text)
+
+
+def defers_or_vague(text: object) -> bool:
+    """The advisor put her question off or answered it with nothing (SWEEP-7, counts only).
+
+    A reassurance ("that's not a problem") counts only when at most ``REASSURE_REST_MAX_WORDS``
+    words of the turn are not part of it (review S7L-R3)."""
+    sentences = _sentences(text)
+    if any(pattern.search(sentence) for sentence in sentences for pattern in (*_DEFERS, *_VAGUE)):
+        return True
+    for sentence in sentences:
+        for pattern in _REASSURE:
+            match = pattern.search(sentence)
+            if match is None:
+                continue
+            rest = word_count(text) - word_count(match.group(0))
+            if rest <= REASSURE_REST_MAX_WORDS:
+                return True
+    return False
+
+
+def dodged_question(text: object, topics: frozenset[str] | tuple[str, ...]) -> bool:
+    """The advisor's turn dodged her question about ``topics`` (M032 SWEEP-7).
+
+    True when no topic is covered, the turn is not hollow ("Okay."), and it defers ("I'll get to
+    that"), answers vaguely ("it's very flexible") or pivots to a question of their own.  A pivot
+    whose own question names her topic ("How many hours could you give it?") is discovery, and a
+    plain pitch that misses the topic is not a dodge either.
+    """
+    if not topics or not isinstance(text, str) or is_hollow_turn(text):
+        return False
+    if any(open_question_covered(topic, text) for topic in topics):
+        return False
+    if defers_or_vague(text):
+        return True
+    if not asks_her_directly(text):
+        return False
+    questions = " ".join(
+        sentence for sentence in split_sentences(text) if is_question_like(sentence)
+    )
+    return not (set(topics) & open_question_topics(questions))
 
 
 # The F4 push when a call was proposed in the same turn: the learner must talk to its decision
@@ -1489,6 +1669,74 @@ def offers_floor(text: object) -> bool:
     )
 
 
+# M032 SWEEP-33 (flag R1_FLOOR_YIELD): the advisor asks for the floor ("Can I talk?", "Sorry, let me
+# finish.", "Please just listen to me.").  The turn is read word by word: softeners are stripped
+# from both ends, and what is left must be one of these forms IN FULL, so "Can I talk to your
+# husband?", "Let me explain the fee, it is nine thousand", a bare "Listen." and "Let me explain."
+# are never a request for the floor.
+_FLOOR_SOFTENERS = frozenset("sorry please just okay ok hey no wait".split())
+# Review S7L-R2: "Hold on, let me finish.", "One second, let me finish.", "Just a second, ...".
+_FLOOR_SOFTENER_PAIRS = frozenset(
+    (
+        ("excuse", "me"),
+        ("hold", "on"),
+        ("hang", "on"),
+        ("one", "second"),
+        ("one", "sec"),
+        ("one", "minute"),
+        ("a", "second"),
+        ("a", "sec"),
+        ("a", "minute"),
+    )
+)
+# Review S7L-R2: "listen what I am saying" (speech-to-text drops the "to"), "let me complete my
+# point".
+_FLOOR_LISTEN = r"listen (?:to )?(?:me|what i(?:'m| am) saying)"
+_FLOOR_REQUEST = re.compile(
+    r"(?:"
+    r"(?:can|could|may) i (?:please )?(?:talk|speak|finish|complete|say something|explain)"
+    r"(?: (?:first|now|please))?"
+    r"|let me (?:finish|complete|speak|talk)(?: (?:my point|my thought|this|what i(?:'m| am) "
+    r"saying))?(?: (?:first|please))?"
+    rf"|(?:can|could) you (?:please )?(?:just )?(?:{_FLOOR_LISTEN}|hear me out)(?: first)?"
+    rf"|(?:please )?(?:just )?(?:{_FLOOR_LISTEN}|hear me out)(?: first)?"
+    r")"
+)
+FLOOR_REQUEST_MAX_WORDS = 12
+
+
+def asks_for_floor(text: object, names: tuple[str, ...] = ()) -> bool:
+    """The advisor asks her to let them speak, and the turn says nothing else (M032 SWEEP-33).
+
+    ``names``: her first name, a softener like "sorry" when said around the request ("Meera, let me
+    finish.").  At most ``FLOOR_REQUEST_MAX_WORDS`` words; linear in the text.
+    """
+    if not isinstance(text, str):
+        return False
+    folded = text.lower().replace("\u2019", "'")
+    words = [word.strip("'") for word in _WORD_TOKEN.findall(folded)]
+    words = [word for word in words if word]
+    if not words or len(words) > FLOOR_REQUEST_MAX_WORDS:
+        return False
+    soft = _FLOOR_SOFTENERS | {name.lower() for name in names if name}
+    start, end = 0, len(words)
+    while start < end:
+        if words[start] in soft:
+            start += 1
+        elif start + 1 < end and (words[start], words[start + 1]) in _FLOOR_SOFTENER_PAIRS:
+            start += 2
+        else:
+            break
+    while end > start:
+        if words[end - 1] in soft:
+            end -= 1
+        elif end - 2 >= start and (words[end - 2], words[end - 1]) in _FLOOR_SOFTENER_PAIRS:
+            end -= 2
+        else:
+            break
+    return start < end and _FLOOR_REQUEST.fullmatch(" ".join(words[start:end])) is not None
+
+
 def _asks_something(sentence: str) -> bool:
     """A question that is not itself a farewell ("Have a great day." opens like one)."""
     if "?" in sentence:
@@ -1609,6 +1857,13 @@ _HANDOVER_CLOSE = _compile(
     r"\bcall (?:me|us) back" + _HANDOVER_WHEN + _HANDOVER_TAIL,
     r"\bget back to (?:me|us)" + _HANDOVER_WHEN + _HANDOVER_TAIL,
 )
+# A hand-over that is a condition, not a close ("if you have any doubts, get back to me", "in case
+# of questions, call us back"): read in the sentence before the hand-over itself.
+_CONDITIONAL_HANDOVER = re.compile(
+    r"\b(?:if|in case|should you|incase)\b|\bany (?:more |other |further )?"
+    r"(?:questions?|doubts?|queries|query|concerns?|issues?|problems?)\b",
+    re.IGNORECASE,
+)
 # The whole sentence is the wait ("Sure, take your time.", "Take your time, no rush."): "Just a
 # quick check-in, no pressure." is the advisor still talking.
 _WAIT_PHRASE = r"(?:take (?:all )?your time|no rush|no hurry|no pressure)"
@@ -1644,8 +1899,12 @@ def hands_over_close(text: object, *, after_sign_off: bool = False) -> bool:
     if not sentences or "?" in sentences[-1]:
         return False
     last = sentences[-1]
-    if any(pattern.search(last) for pattern in _HANDOVER_CLOSE):
-        return True
+    for pattern in _HANDOVER_CLOSE:
+        match = pattern.search(last)
+        # Review S3R-1 (naturalness): "If you have any doubts, just get back to me." keeps the
+        # door open mid-pitch; only an unconditional hand-over closes the call.
+        if match is not None and _CONDITIONAL_HANDOVER.search(last[: match.start()]) is None:
+            return True
     return after_sign_off and any(pattern.search(last) for pattern in _WAIT_FOR_HER)
 
 
@@ -1670,6 +1929,20 @@ def courtesy_only(text: object) -> bool:
         0 < len(words) <= COURTESY_TURN_MAX_WORDS
         and all(word in _COURTESY_TURN_WORDS for word in words)
     )
+
+
+# Review S3R-3 / S3R-1 (naturalness): a mutual goodbye takes leave.  "Hmm.", "Okay.", "No.",
+# "Right.", "Got it." or "Okay, so" after her "I'll think it over." are the advisor thinking or
+# about to go on, never a goodbye (each one locked a WEAK commitment from 14:00).
+_LEAVE_TAKING = re.compile(
+    r"\b(?:bye|goodbye|thanks?|thank you|take care|talk (?:to you )?soon|see you|cheers"
+    r"|have a (?:nice|good|great) (?:day|evening|one)|all the best)\b"
+)
+
+
+def courtesy_goodbye(text: object) -> bool:
+    """S3.1: a courtesy-only advisor turn that takes leave ("Sure. Thank you.", "Okay, bye.")."""
+    return courtesy_only(text) and _LEAVE_TAKING.search(normalize(fold(text))) is not None
 
 
 def _is_closing_tail(sentence: str) -> bool:
@@ -1789,7 +2062,8 @@ class _MoveState:
 class OwedMoveScheduler:
     """Per-session schedule of the learner's owed moves (see the module docstring)."""
 
-    def __init__(self, decision_maker: str) -> None:
+    def __init__(self, decision_maker: str, *, markers_v2: bool = False) -> None:
+        """``markers_v2``: R1_MARKERS_V2 (simulation diagnosis 1), the wider delivery markers."""
         self.decision_maker = decision_maker
         self._states: dict[str, _MoveState] = {}
         for spec in PLAN:
@@ -1797,13 +2071,14 @@ class OwedMoveScheduler:
                 text = commitment_line(Level.WEAK, decision_maker)
             else:
                 text = _fill(spec.line, decision_maker)
+            markers = widened_markers(spec.id, spec.markers) if markers_v2 else spec.markers
             self._states[spec.id] = _MoveState(
                 spec,
                 text,
                 brief=_fill(spec.brief, decision_maker),
                 markers=tuple(
                     tuple(_fill(pattern, decision_maker, regex=True) for pattern in group)
-                    for group in spec.markers
+                    for group in markers
                 ),
                 variants=(text, *(_fill(item, decision_maker) for item in spec.variants))
                 if spec.variants

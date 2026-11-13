@@ -86,8 +86,10 @@ from r1_personas import (
     MONTHLY_BUDGET_MAX_USD,
     PERSONAS,
     PUBLIC_ANSWERS,
+    SUCCESS_ANSWER_V2,
     RenderedPersona,
 )
+from r1_scheduler import open_question_topics
 from r1_script import EXIT_CUE, LINES
 from r1_text import (
     CLOSER,
@@ -881,6 +883,241 @@ _DURATION = re.compile(
 )
 WEEKS_PER_MONTH = 4.33
 
+# ----------------------------------------------------------------------------------------------
+# Simulation diagnosis 1 (flag R1_ECHO_GUARD, ``GuardContext.echo_guard``).  The probe-first notes
+# make her pick up what the advisor just said ("recorded sessions help", "live mock interviews
+# sound useful"), and every such echo was a LEAK hit: three echoes flagged a call.  A word she
+# repeats from the advisor's latest turns is no invention; one he never said still hits.
+# ----------------------------------------------------------------------------------------------
+_TERM = re.compile(r"[a-z0-9]+")
+_TERM_SUFFIXES = ("ings", "ing", "ed", "s")
+# The words that make a sentence a format or schedule claim (``_FORMAT_FACT``), matched as whole
+# words and compared as stems (review: "evenings" stems to "even", so a stem list never held it).
+_FORMAT_WORD = re.compile(
+    r"\b(?:live|record(?:ed|ing|ings|s)?|evenings?|mornings?|weekends?|weekdays?|hours?)\b"
+)
+# A priority or a wish about a policy ("the refund policy matters most to me", "the refund terms
+# are the main thing I'd want to look at") states nothing about the course.
+_POLICY_WISH = re.compile(
+    r"\b(?:matters?|mattering|main thing|most to me|worried about|concerned about|care about|"
+    r"curious about|ask(?:ing)? about|look(?:ing)? (?:at|into|over)|read(?:ing)? (?:through|up on)|"
+    r"(?:want|need|like|have) to (?:look at|see|know|check|read|understand|hear about))\b",
+    re.IGNORECASE,
+)
+# Review of L1 (c): the wish governs a claim word only in the claim's own clause, either before it
+# ("I'd want to see placement numbers") or with the claim as its subject ("the refund policy
+# matters most to me").  A new subject after a conjunction starts a new clause ("..., and you
+# guarantee placement"), and the subject is a bare noun phrase: no "you", "there's" or verb.
+_NEW_SUBJECT = re.compile(
+    r"\b(?:and|so|which|because|then)\s+(?=(?:you|they|there|we|it|that|this|he|she)\b)",
+    re.IGNORECASE,
+)
+_WISH_CLAUSE_END = re.compile(
+    r"[.?!,;:\n]|\s-+\s|\b(?:but|so|which|because|though|although|while)\b|"
+    r"\band\s+(?=(?:you|they|there|we|it|that|this|he|she|i)\b)",
+    re.IGNORECASE,
+)
+_CLAIM_SUBJECT_LEAD = re.compile(
+    r"\W*(?:(?:the|your|a|an|any|some|their|that|this|my|our|full|real|actual|whole|job|clear|"
+    r"solid|decent|proper|and|or|money-back|placements?|refunds?|guarantees?|success|rate)\s+)*",
+    re.IGNORECASE,
+)
+# How her course work is graded is a question about the course, not about this interview's score.
+_SOFT_EVALUATION = re.compile(
+    r"(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|rated|ratings?)", re.IGNORECASE
+)
+_COURSE_NOUN = (
+    r"(?:capstones?|projects?|assignments?|exams?|quiz(?:zes)?|modules?|homework|coursework|"
+    r"submissions?)"
+)
+_COURSE_WORK = re.compile(r"\b" + _COURSE_NOUN + r"\b", re.IGNORECASE)
+# Review of L1 (d): the course work is what is graded, as the subject ("How is the capstone
+# graded?", "Is the project reviewed and graded by mentors?") or the object ("How do you grade the
+# assignments?") of the grading word.
+_GRADE_WORD = (
+    r"(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|rat(?:e|es|ed|ing)|mark(?:s|ed|ing)?)\b"
+)
+_COURSE_WORK_GRADED = re.compile(
+    r"\b" + _COURSE_NOUN + r"(?:\s+\w+){0,2}?\s+(?:(?:is|are|get|gets|getting|be|being|was|were)"
+    r"\s+)?(?:\w+\s+(?:and|or)\s+)?(?:scored|graded|rated|marked)\b"
+    r"|\b(?:scor|grad|mark)(?:e|es|ed|ing|s)?\s+(?:the|my|our|their|each|every|all|all the)?\s*"
+    r"(?:\w+\s+)?" + _COURSE_NOUN + r"\b",
+    re.IGNORECASE,
+)
+# ... while grading her, the advisor or this call stays a leak ("Are you scoring me ...?", "Is this
+# call graded like a project?", "Am I being graded on this ...?").
+_SELF_GRADED = re.compile(
+    r"\b" + _GRADE_WORD + r"\s+(?:me|us|you|your|this|on this|the (?:call|interview|"
+    r"conversation))\b"
+    r"|\b(?:am i|are we|are you|is this|is it|i'?m|i am|we'?re|you'?re)\b[^.?!]{0,25}?\b"
+    + _GRADE_WORD
+    + r"|\bthis (?:call|interview|conversation|chat)\b"
+    r"|\byour (?:score|scores|grade|grades|marks|rating)\b",
+    re.IGNORECASE,
+)
+# Fillers of an echo question ("Wait, $1,000?", "Really?", "Sorry, the mentors?").
+_ECHO_FILLER = frozenset(
+    {"wait", "really", "sorry", "oh", "so", "hmm", "huh", "what", "the", "a", "that", "is", "it",
+     "seriously", "okay", "ok"}
+)
+ECHO_QUESTION_WORDS = 4
+# A clause she keeps only with what it points at ("..., that suits me better" after the clause
+# was cut): a short sentence led by "that" or "this", or "it suits / works / sounds".
+_POINTS_BACK = re.compile(
+    r"^\W*(?:(?:that|this)\b|it (?:suits|works|sounds|helps)\b)", re.IGNORECASE
+)
+POINTS_BACK_WORDS = 6
+_DANGLING_CONJUNCTION = re.compile(r"[,;]?\s*\b(?:so|and|but|though)\W*$", re.IGNORECASE)
+# The asked-for re-ask, shortened (L5): "Does the course include time with mentors?" -> "So, time
+# with mentors?".
+_REASK_TAIL = re.compile(
+    r"\b(?:include|includes|cover|covers|offer|offers|have|has|get|give|gives|come with|"
+    r"comes with|about)\s+(?P<tail>[^?]{3,60})\?\s*$",
+    re.IGNORECASE,
+)
+REASK_TAIL_WORDS = 5
+# Review of L5: a tail that holds a clause is no noun phrase, and a leading conjunction or "so" goes
+# before "So, ...".
+_REASK_CLAUSE = re.compile(
+    r"\b(?:if|when|whenever|how|whether|why|where|what|who|which|that|i|you|we|they|it|is|are|"
+    r"do|does|did|can|will|would|should|to)\b",
+    re.IGNORECASE,
+)
+_REASK_LEAD = re.compile(r"^(?:(?:and|so|but|then|okay|ok|sorry)\b[,\s]*)+", re.IGNORECASE)
+
+
+def _stem(word: str) -> str:
+    for suffix in _TERM_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _stems(text: object) -> list[str]:
+    return [_stem(word) for word in _TERM.findall(fold(text).lower())]
+
+
+def advisor_terms_in(text: object) -> frozenset[str]:
+    """The word stems of an advisor turn, for ``GuardContext.advisor_terms`` (memory only)."""
+    return frozenset(_stems(text))
+
+
+def advisor_text_of(text: object) -> str:
+    """An advisor turn as the deep-need markers read it, for ``GuardContext.advisor_said``."""
+    return fold(text)
+
+
+def _format_echoed(sentence: str, terms: frozenset[str]) -> bool:
+    """Every format or schedule word of ``sentence`` (and an hours figure) is the advisor's."""
+    lowered = fold(sentence).lower()
+    needed = {_stem(word) for word in _FORMAT_WORD.findall(lowered)}
+    if "hour" in needed:
+        needed |= {word for word in _stems(sentence) if word.isdigit() or word in _SPELLED}
+    return bool(needed) and needed <= terms
+
+
+def _marker_echoed(
+    pattern: re.Pattern[str], match: re.Match[str], advisor_said: tuple[str, ...]
+) -> bool:
+    """L1 (b): the marker is a phrase ("evenings and weekends") the advisor's own words match.
+
+    A one-word marker ("kids", "loans") is never an echo: her own deep need is told in it whether
+    or not he said the word.
+    """
+    return len(match.group(0).split()) >= 2 and any(
+        pattern.search(said) is not None for said in advisor_said
+    )
+
+
+def echoed_need_topics(
+    persona: RenderedPersona, text: object, advisor_said: tuple[str, ...]
+) -> frozenset[str]:
+    """The deep-need topics whose every marker in ``text`` echoes the advisor (L1 (b)).
+
+    The guard lets such an echo through, so the reveal bookkeeping must not count it as a need
+    told before it was asked about (``NeedGate.note_learner_text``'s ``echoed``).
+    """
+    folded = fold(text)
+    topics: set[str] = set()
+    for topic in H_TOPICS:
+        found = [
+            (pattern, match)
+            for pattern in persona.markers(topic)
+            for match in pattern.finditer(folded)
+        ]
+        if found and all(_marker_echoed(p, m, advisor_said) for p, m in found):
+            topics.add(topic)
+    return frozenset(topics)
+
+
+def _wish_governs(sentence: str, match: re.Match[str]) -> bool:
+    """Review of L1 (c): a wish or an indirect question governs this claim word in its clause."""
+    before = _NEW_SUBJECT.split(clause_before(sentence, match.start()))[-1]
+    if _NOT_ASSERTED.search(before) is not None or _POLICY_WISH.search(before) is not None:
+        return True
+    if _CLAIM_SUBJECT_LEAD.fullmatch(before) is None:
+        return False  # "You guarantee ...", "There's a full refund ...": the claim is asserted
+    after = _WISH_CLAUSE_END.split(sentence[match.end() :], maxsplit=1)[0]
+    return _POLICY_WISH.search(after) is not None
+
+
+def _claim_not_asserted(sentence: str) -> bool:
+    """A policy or outcome word in a wish, a priority or an indirect question (L1 (c)).
+
+    Every claim word of the sentence must be governed: a priority clause beside a claim ("You
+    guarantee placement, and that matters most to me.") covers nothing.
+    """
+    matches = list(_CLAIM_WORDS.finditer(sentence))
+    return bool(matches) and all(_wish_governs(sentence, match) for match in matches)
+
+
+def _course_work_graded(sentence: str) -> bool:
+    """L1 (d): only grading words, about how her course work is graded ("How is the capstone
+    graded?"), never about her, the advisor or this call."""
+    if _COURSE_WORK_GRADED.search(sentence) is None or _SELF_GRADED.search(sentence) is not None:
+        return False
+    return all(
+        _SOFT_EVALUATION.fullmatch(match.group(0)) is not None
+        for match in _EVALUATION.finditer(sentence)
+    )
+
+
+def is_echo_question(text: str, terms: frozenset[str]) -> bool:
+    """U2: "Wait, $1,000?", "Really?": a few words of fillers, figures or the advisor's words."""
+    if "?" not in text or word_count(text) > ECHO_QUESTION_WORDS:
+        return False
+    words = [word for word in _stems(text) if word not in _ECHO_FILLER]
+    return all(word.isdigit() or word in terms for word in words)
+
+
+def offers_choice(text: object) -> bool:
+    """U5: an advisor question that offers her a choice ("a call next week, or would you rather
+    reach out yourself?")."""
+    return any(
+        "?" in sentence and re.search(r"\bor\b", sentence, re.IGNORECASE) is not None
+        for sentence in split_sentences(text)
+    )
+
+
+def short_reask(question: str) -> str:
+    """L5: her question asked again in fewer words ("So, time with mentors?").
+
+    Only a noun-phrase tail is shortened ("What do I get if I finish early?" keeps its "if"
+    clause: "So, if I finish early?" asks something else); otherwise she asks it again whole, as
+    her own re-ask ("So, is there any refund if I drop out?"), never asking him to repeat himself.
+    """
+    match = _REASK_TAIL.search(question)
+    if match is not None:
+        tail = match.group("tail").strip().rstrip(",")
+        if 1 <= word_count(tail) <= REASK_TAIL_WORDS and _REASK_CLAUSE.search(tail) is None:
+            return f"So, {tail}?"
+    body = _REASK_LEAD.sub("", question.strip(), count=1)
+    if not body:
+        return question
+    if not re.match(r"I\b", body):
+        body = body[:1].lower() + body[1:]
+    return f"So, {body}"
+
 
 def durations_said(text: object) -> frozenset[float]:
     """The course-length figures in ``text``, as months (M032 SWEEP-17)."""
@@ -1131,6 +1368,14 @@ class GuardContext:
     # few words.  ``reask`` is that question's normalised sentences: a question of this reply that
     # repeats one of them is the asked-for re-ask, so it is neither a repeat nor cut by the diet.
     reask: tuple[str, ...] = ()
+    # M032 SWEEP-7 (R1_COME_BACK): the reply comes back once to her question the advisor dodged.
+    # A question of this reply that asks about that topic (``open_question_topics``) is the
+    # asked-for come-back: the question diet and the near-repeat drop let it through (one question
+    # still).
+    reask_topic: str = ""
+    # M032 SWEEP-6 (R1_PRICE_MEMORY): "I'll take the price as it stands" is a misreading (hygiene,
+    # never a concession): she never says she will take the price.
+    price_memory: bool = False
     # M032 S2P (SWEEP-17; the engine's latched R1_PROBE_FIRST): the card holds no course figure, so
     # the $9,000 is no longer an amount she may always say and "six months" no longer passes as a
     # card fact.  ``allowed_extra``: the amounts this reply may say all the same (a check or a
@@ -1153,6 +1398,19 @@ class GuardContext:
     # sentence of it that says goodbye, that she has to go, that she will think it over or get back
     # to them, or asks for an e-mail is dropped (the WEAK line says that, once).
     reaction_only: bool = False
+    # Simulation diagnosis 1 (R1_ECHO_GUARD, the engine's flag; off restores the release before).
+    # ``advisor_terms``: the word stems of the advisor's latest turns (``advisor_terms_in``), so a
+    # format, schedule or deep-need word she echoes from them is no invention (L1);
+    # ``asked_her``: the advisor asked her something, or to enrol or book (an emptied reply may then
+    # be the "thinking" line, U3); ``choice_offered``: the advisor's question offered her a choice,
+    # so "I'll reach out myself" answers it and is no stall closer (U5).
+    echo_guard: bool = False
+    advisor_terms: frozenset[str] = frozenset()
+    # The advisor's latest turns, folded (``advisor_text_of``; memory only): a deep-need marker
+    # phrase is an echo only when his own words match it (review of L1 (b)).
+    advisor_said: tuple[str, ...] = ()
+    asked_her: bool = False
+    choice_offered: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -1298,7 +1556,9 @@ def _shared_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     if _VENDOR.search(sentence):
         hits.append(_hit(VENDOR, "vendor_name", sentence))
     evaluation = _EVALUATION_LEAK if ctx.phase in SMALL_TALK_PHASES else _EVALUATION
-    if evaluation.search(sentence):
+    if evaluation.search(sentence) and not (
+        ctx.echo_guard and ctx.is_learner and _course_work_graded(sentence)
+    ):
         hits.append(_hit(EVALUATION, "scoring_vocabulary", sentence))
     if has_contact_detail(sentence):
         hits.append(_hit(CONTACT, "contact_detail", sentence))
@@ -1511,9 +1771,41 @@ def _reopens(sentence: str) -> bool:
     return _DOUBT.search(sentence) is not None and _HOLDS_THE_PLAN.search(sentence) is None
 
 
+# M032 SWEEP-6: she says she will take the price ("so it's fine, I'll take the price as it
+# stands").  Not "I'll take the price list home", not a negated or questioned one, and not taking
+# it somewhere ("I'll take that number to my husband", "I'll take the figure back to Rohan": the
+# decision-maker talk of review S7L-R5).
+_PRICE_ACCEPTED = re.compile(
+    r"\bi'?ll (?:take|accept|go with|pay) (?:the|that|your|this) "
+    r"(?:price|number|figure|amount|rate)\b(?!\s*(?:list|sheet|breakdown|details|back|home|to|"
+    r"with|by|into|in|down|away|over|up|and (?:think|talk|discuss|check|run|chat|share))\b)",
+    re.IGNORECASE,
+)
+
+
+def _price_accepted(sentence: str, ctx: GuardContext) -> bool:
+    """SWEEP-6 (``price_memory``): an unconditional "I'll take the price" in her reply.
+
+    Like ``has_concession`` it honours a negator or a doubt frame earlier in the clause and a
+    question; it is skipped on a confirmation and once a STRONG commitment is on record.
+    """
+    if not ctx.price_memory or ctx.confirm or ctx.commitment_cap >= Level.STRONG:
+        return False
+    if is_question_like(sentence):
+        return False
+    folded = fold(sentence)
+    return any(
+        not negated_before(folded, match.start())
+        and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        for match in _PRICE_ACCEPTED.finditer(folded)
+    )
+
+
 def _iteration_three_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
     """Misreadings the third live sweep found (hygiene hits: never posted, never a leak)."""
     hits: list[Hit] = []
+    if _price_accepted(sentence, ctx):
+        hits.append(_hit(MISREAD, "price_accepted", sentence))
     if ctx.hollow and not ctx.winding and CLOSER.search(sentence) is not None:
         # M032 S3.2: while the advisor closes the call her one goodbye is the reply's job.
         hits.append(_hit(MISREAD, "closer_again", sentence))
@@ -1539,7 +1831,18 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
             # revealed at ex8, and the sentence that leaned on it was left dangling).
             if topic in ctx.released_topics or topic in ctx.spent_topics:
                 continue
-            if any(pattern.search(sentence) for pattern in persona.markers(topic)):
+            matches = [
+                (pattern, match)
+                for pattern in persona.markers(topic)
+                for match in pattern.finditer(sentence)
+            ]
+            if ctx.echo_guard and matches:
+                # Simulation diagnosis 1 (L1 (b)): "evenings and weekends" right after the advisor
+                # said that phrase is his schedule echoed, not her deep need told.
+                matches = [
+                    (p, m) for p, m in matches if not _marker_echoed(p, m, ctx.advisor_said)
+                ]
+            if matches:
                 hits.append(_hit(VOLUNTEERED_NEED, topic, sentence))
                 break
     level = classify_learner_commitment(sentence)
@@ -1555,7 +1858,10 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     durations = ctx.advisor_durations if ctx.probe_first else None
     length_unsaid = False
     if not question:
-        if _FORMAT_FACT.search(sentence):
+        echo = ctx.echo_guard
+        if _FORMAT_FACT.search(sentence) and not (
+            echo and _format_echoed(sentence, ctx.advisor_terms)
+        ):
             hits.append(_hit(INVENTED_FACT, "format_or_schedule_claim", sentence))
         elif _is_product_statement(sentence, allowed, durations):
             if durations is not None and not _is_product_statement(
@@ -1566,7 +1872,7 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
                 length_unsaid = True
             else:
                 hits.append(_hit(INVENTED_FACT, "product_statement", sentence))
-        elif _CLAIM_WORDS.search(sentence):
+        elif _CLAIM_WORDS.search(sentence) and not (echo and _claim_not_asserted(sentence)):
             hits.append(_hit(INVENTED_FACT, "outcome_or_policy_claim", sentence))
     if ctx.probe_first and not length_unsaid and len(sentence) <= MISREAD_MAX_CHARS:
         # SWEEP-17 item 5: a course-length frame ("keep up for six months"; questions too).
@@ -1640,7 +1946,9 @@ def _is_card_answer(sentence: str, persona: RenderedPersona | None) -> bool:
 
 
 def _card_texts(persona: RenderedPersona) -> list[str]:
+    # M032 SWEEP-8: both card wordings stay allowed, so a session on either release is clean.
     answers = [answer for _, answer in PUBLIC_ANSWERS]
+    answers.append(SUCCESS_ANSWER_V2)
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)
     answers.append(persona.decider_answer)
@@ -1843,13 +2151,23 @@ class StreamGuard:
             if key == PHRASE_DECIDER_STALL and ctx.decider_asked:
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
                 continue
-            if key == PHRASE_STALL_CLOSER and ctx.closing_exempt:
+            if key == PHRASE_STALL_CLOSER and (
+                ctx.closing_exempt or (ctx.echo_guard and ctx.choice_offered)
+            ):
                 # M032 S3.2: the advisor closed the call, so "I'll get back to you, bye" is her
-                # plain goodbye for this one reply, not the stall loop.
+                # plain goodbye for this one reply, not the stall loop.  Simulation diagnosis 1
+                # (U5): his question offered her a choice, so "I'll reach out myself" answers it.
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
                 continue
             if self._stall_blocked(key):
+                cut_first = _first_clause_matches(text, pattern)
                 text = _without_clauses(text, pattern)
+                if text and ctx.echo_guard and cut_first and _points_back(text):
+                    # U5: "I'll reach out myself ..., that suits me better." leaves "That suits me
+                    # better." pointing at the clause just cut before it.  A "that" clause the cut
+                    # came after ("That's too much for me, I'll get back to you.") points at what
+                    # the advisor said and is her reaction: it stays (review of U5).
+                    text = ""
                 if not text:
                     return ""
             else:
@@ -1874,6 +2192,10 @@ class StreamGuard:
         if template and self._phrase_count(PHRASE_TEMPLATE_Q) >= PHRASE_QUOTA[PHRASE_TEMPLATE_Q]:
             self._repeat_drops += 1
             return True
+        if ctx.echo_guard and is_echo_question(text, ctx.advisor_terms):
+            # Simulation diagnosis 1 (U2): "Wait, $1,000?" repeats his words back; it is not the
+            # reply's one question, so the real one after it is still asked.
+            return False
         if self._questions_kept >= 1:
             return True
         if (
@@ -1881,6 +2203,7 @@ class StreamGuard:
             and self._emitted
             and any(ctx.recent_questions[-QUESTION_DIET_WINDOW:])
             and not ctx.reask
+            and not self._comes_back(text)
             # "Okay." and the question is the whole reply: dropping the question would leave a bare
             # acknowledgement, so the question stays.
             and word_count(" ".join(self._emitted)) > THIN_REPLY_WORDS
@@ -1893,6 +2216,11 @@ class StreamGuard:
         if template:
             self._phrases_used[PHRASE_TEMPLATE_Q] = self._phrases_used.get(PHRASE_TEMPLATE_Q, 0) + 1
         return False
+
+    def _comes_back(self, text: str) -> bool:
+        """M032 SWEEP-7: ``text`` is a question about the topic the reply comes back to."""
+        topic = self.ctx.reask_topic
+        return bool(topic) and "?" in text and topic in open_question_topics(text)
 
     def _repeat_hit(self, kind: str, sentence: str) -> Hit:
         """A ``repeat`` hit for ``sentence`` (digest always; excerpt only if opted in)."""
@@ -1926,6 +2254,8 @@ class StreamGuard:
             and re.search(r"\b" + re.escape(persona.decision_maker) + r"\b", out, re.IGNORECASE)
         ):
             return None  # the advisor asked who else decides: the same answer is the right answer
+        if self._comes_back(out):
+            return None  # M032 SWEEP-7: the come-back the reply was asked for
         said = self.ctx.said
         if self.ctx.reask and "?" in out:
             said = tuple(prior for prior in said if prior not in self.ctx.reask)
@@ -1992,7 +2322,7 @@ class StreamGuard:
                 self._phrases_used[PHRASE_STRETCH] = self._phrases_used.get(PHRASE_STRETCH, 0) + 1
         if CONCESSION_TAG.search(text) is not None:
             if self._phrase_count(PHRASE_CONCESSION_TAG) >= PHRASE_QUOTA[PHRASE_CONCESSION_TAG]:
-                text = _strip_concession_tag(text)
+                text = _strip_concession_tag(text, tidy=ctx.echo_guard)
             else:
                 key = PHRASE_CONCESSION_TAG
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
@@ -2127,13 +2457,16 @@ class StreamGuard:
             if any(hit.category == COURSE_FACT for hit in hits):
                 self._length_drops += 1
             out = _replacement(hits, self.ctx, sentence)
+            categories = {hit.category for hit in hits}
             if (
                 out == FAQ_DEFER_WRAP_LINE
-                and {hit.category for hit in hits} == {HIRING_MENTION}
+                and HIRING_MENTION in categories
+                and categories <= {HIRING_MENTION, HIRING_COMP, INVENTED_FACT}
                 and any(_has_own_content(said) for said in self._emitted)
             ):
                 # M032 SWEEP-26: "Great, that's all from my side." already said something, so its
-                # "The hiring team will follow up ..." is dropped, not answered with a deflection.
+                # "The hiring team will follow up ..." is dropped, not answered with a deflection
+                # (review S3R-7, naturalness: also when it names the selection or the pay).
                 out = ""
             final = out == NO_FEEDBACK_LINE
             if out in self._replacements:
@@ -2143,6 +2476,18 @@ class StreamGuard:
         if out and self.ctx.is_learner and _STILL_MORE.search(out) is not None:
             if any(_STILL_MORE.search(said) for said in self._emitted):
                 out = ""  # "more than I planned for" is said once in a reply
+        if (
+            out
+            and not hits
+            and self.ctx.echo_guard
+            and self.ctx.reask
+            and "?" in out
+            and repeat_kind(out, self.ctx.reask) == "exact"
+        ):
+            # Simulation diagnosis 1 (L5): the asked-for re-ask word for word sounds scripted; a
+            # person asks it again in fewer words.
+            out = short_reask(out)
+            self._style_edits += 1
         if out and not hits:
             # A sentence the learner already said is a repeat in the words it was WRITTEN in: the
             # style rules below change a few words ("That's" -> "It's"), and a changed copy of an
@@ -2152,7 +2497,9 @@ class StreamGuard:
                 return self._drop_repeat(written, blocked=False)
             out = self._vary(out)
             if out and self._last_dropped and self.ctx.is_learner:
-                if _DANGLING_REFERENCE.match(out) is not None:
+                if _DANGLING_REFERENCE.match(out) is not None or (
+                    self.ctx.echo_guard and _points_back(out)
+                ):
                     # The sentence before this one was dropped and this one points back at it
                     # ("He'd probably ask about that first."): it goes with it.
                     out = ""
@@ -2246,10 +2593,24 @@ class StreamGuard:
         if not self._emitted and not self.ctx.quiet_empty:
             self._fallback_used = True
             only_repeats = self._repeat_drops > 0 and self._other_drops == 0
-            if self._length_drops and self.ctx.free_reply and self.ctx.is_learner:
+            ctx = self.ctx
+            if self._length_drops and ctx.free_reply and ctx.is_learner:
                 # M032 SWEEP-17: a free reply emptied by a course length she was never told asks
                 # for it instead ("How long does the course run?"), never "Give me a second".
-                self._emitted.append(_length_probe(self.ctx))
+                self._emitted.append(_length_probe(ctx))
+            elif (
+                ctx.echo_guard
+                and ctx.is_learner
+                and ctx.free_reply
+                and ctx.mode == "reply"
+                and not ctx.confirm
+                and not ctx.asked_her
+                and {hit.category for hit in self._hits} <= {INVENTED_FACT, COURSE_FACT}
+            ):
+                # Simulation diagnosis 1 (U3): a reply emptied of a fact she may not state, after a
+                # turn that asked her nothing: "I'm thinking that over" answers nothing he said, so
+                # a neutral back-channel lets him go on.
+                self._emitted.append(NEUTRAL_ACKS[ctx.turn % len(NEUTRAL_ACKS)])
             else:
                 self._emitted.append(_fallback(self.ctx, only_repeats=only_repeats))
             out.append(self._emitted[-1])
@@ -2334,15 +2695,29 @@ def _without_clauses(text: str, pattern: re.Pattern[str]) -> str:
     return out[0].upper() + out[1:] + end
 
 
-def _strip_concession_tag(text: str) -> str:
+def _first_clause_matches(text: str, pattern: re.Pattern[str]) -> bool:
+    """U5: the first comma-separated clause of ``text`` is one ``_without_clauses`` cuts."""
+    parts = [part for part in _CLAUSE_SPLIT.split(text.rstrip().rstrip(".?!")) if part.strip()]
+    return bool(parts) and pattern.search(parts[0]) is not None
+
+
+def _points_back(text: str) -> bool:
+    """U5: a short sentence that only points at something said before it ("That suits me.")."""
+    return word_count(text) <= POINTS_BACK_WORDS and _POINTS_BACK.match(text) is not None
+
+
+def _strip_concession_tag(text: str, *, tidy: bool = False) -> str:
     """``text`` without the concession tag ("..., I'll give you that.", "I'll admit, ...").
 
     What is left keeps its closing mark; a tag that is the whole sentence leaves nothing, which
-    ``_vary`` turns into a neutral acknowledgement.
+    ``_vary`` turns into a neutral acknowledgement.  ``tidy`` (simulation diagnosis 1, U4 (3)):
+    a conjunction left dangling before the tag ("..., so, I'll give you that") goes with it.
     """
     end = text.rstrip()[-1:] if text.rstrip()[-1:] in (".", "?", "!") else ""
     out = CONCESSION_TAG_LEADING.sub("", text, count=1)
     out = CONCESSION_TAG_TRAILING.sub("", out).rstrip(" ,;:-")
+    if tidy:
+        out = _DANGLING_CONJUNCTION.sub("", out).rstrip(" ,;:-")
     if word_count(out) < 2:
         return ""
     if out and out[-1] not in ".?!":

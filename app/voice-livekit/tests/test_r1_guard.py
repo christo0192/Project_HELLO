@@ -3116,6 +3116,28 @@ class WrapupOneMentionGuardTests(unittest.TestCase):
         self.assertEqual(result.text, "Great, that's all from my side.")
         self.assertEqual([hit.category for hit in result.hits], [r1_guard.HIRING_MENTION])
 
+    def test_a_hiring_team_sentence_that_also_names_the_outcome_is_dropped_after_content(self):
+        """Review S3R-7 (naturalness): no refusal tacked onto a complete answer."""
+        for text, kept in (
+            (
+                "That's everything for today's interview. The hiring team will let you know if "
+                "you're selected.",
+                "That's everything for today's interview.",
+            ),
+            (
+                "The role is a sales role in Bangalore. The hiring team will share the salary "
+                "details.",
+                "The role is a sales role in Bangalore.",
+            ),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx())
+                self.assertEqual(result.text, kept)
+                self.assertNotIn(self.WRAP, result.text)
+        # With nothing said before it, the refusal still answers.
+        result = guard_text("The hiring team will let you know if you're selected.", self.ctx())
+        self.assertEqual(result.text, self.WRAP)
+
     def test_after_an_acknowledgement_alone_it_is_replaced(self):
         result = guard_text(
             "That's a good question. The hiring team will follow up on that.", self.ctx()
@@ -3214,6 +3236,384 @@ class CommitReactionGuardTests(unittest.TestCase):
         for _ in range(4):
             ledger.record(guard_text("I should go now, bye.", self.ctx()))
         self.assertFalse(ledger.flagged)
+
+
+
+class PersonaTimelineGuardTests(unittest.TestCase):
+    """M032 SWEEP-8: both card wordings stay allowed, and the v2 card's own words are clean."""
+
+    def test_both_success_answers_pass_in_an_acknowledgement(self):
+        context = ctx(mode="ack")
+        for answer in ("A data role within a year.", "Moving into a data role."):
+            with self.subTest(answer=answer):
+                self.assertTrue(guard_text(answer, context).clean, answer)
+
+    def test_her_home_line_passes_with_the_v2_prefix(self):
+        from r1_prompts import control_prose, learner_prefix
+
+        context = ctx(control_texts=(control_prose(learner_prefix(PERSONA, timeline_v2=True)),))
+        for allowed in (
+            "Honestly, I'm at home after work.",
+            "I went to one of your webinars last month.",
+            "Moving into a data role.",
+        ):
+            with self.subTest(allowed=allowed):
+                self.assertTrue(guard_text(allowed, context).clean, allowed)
+
+
+class ComeBackGuardTests(unittest.TestCase):
+    """M032 SWEEP-7: her come-back question passes the diet and the near-repeat drop."""
+
+    ASKED = "How many hours a week would I need?"
+    REPLY = (
+        "Sorry, just going back to what I asked earlier. Roughly how many hours a week would I "
+        "need?"
+    )
+
+    def context(self, topic):
+        return ctx(
+            free_reply=True,
+            recent_questions=(True,),
+            said=said_of(self.ASKED),
+            reask_topic=topic,
+        )
+
+    def test_the_come_back_is_kept_with_its_topic_and_dropped_without(self):
+        kept = guard_text(self.REPLY, self.context("weekly_hours")).text
+        self.assertIn("how many hours a week", kept.lower())
+        dropped = guard_text(self.REPLY, self.context("")).text
+        self.assertNotIn("how many hours a week", dropped.lower())
+
+    def test_another_topic_gets_no_pass_and_one_question_still_holds(self):
+        other = guard_text(self.REPLY, self.context("payment")).text
+        self.assertNotIn("how many hours a week", other.lower())
+        two = "How many hours a week would I need? And how many hours a week is the live part?"
+        self.assertEqual(guard_text(two, self.context("weekly_hours")).text.count("?"), 1)
+
+
+class PriceAcceptedTests(unittest.TestCase):
+    """M032 SWEEP-6 (R1_PRICE_MEMORY): she never says she will take the price."""
+
+    def test_taking_the_price_is_dropped_as_a_misreading_not_a_leak(self):
+        result = guard_text("So it's fine, I'll take the price as it stands.", ctx(price_memory=True))
+        self.assertIn("price_accepted", {hit.rule for hit in result.hits})
+        self.assertNotIn("take the price", result.text.lower())
+        ledger = GuardLedger()
+        ledger.record(result)
+        self.assertEqual(ledger.leak_total, 0)
+
+    def test_lookalikes_negations_and_questions_are_kept(self):
+        for text in (
+            "I'll take the price list home and read it.",
+            "I won't take that price, honestly.",
+            "I don't think I'll take that price.",
+            "Should I just say I'll take the price?",
+            # Review S7L-R5: taking it to the decision maker is the opposite of accepting it.
+            "I'll take the figure back to Rohan before I decide anything.",
+            "Let me think, I'll take that price to my manager for sponsorship.",
+            "Okay, I'll take that number to my husband and we'll talk tonight.",
+            "I'll take that number home and think it over.",
+            "I'll take the price into account.",
+        ):
+            with self.subTest(text=text):
+                rules = {hit.rule for hit in guard_text(text, ctx(price_memory=True)).hits}
+                self.assertNotIn("price_accepted", rules)
+
+    def test_skipped_on_a_confirmation_after_a_strong_commitment_and_with_the_flag_off(self):
+        from r1_commitment import Level
+
+        text = "So it's fine, I'll take the price as it stands."
+        for context in (
+            ctx(price_memory=True, confirm=True),
+            ctx(price_memory=True, commitment_cap=Level.STRONG),
+            ctx(),
+        ):
+            rules = {hit.rule for hit in guard_text(text, context).hits}
+            self.assertNotIn("price_accepted", rules)
+
+
+def echo_ctx(advisor="", **kwargs) -> GuardContext:
+    """Simulation diagnosis 1 (R1_ECHO_GUARD): a probe-first learner context after ``advisor``."""
+    kwargs.setdefault("probe_first", True)
+    return ctx(
+        echo_guard=True,
+        advisor_terms=r1_guard.advisor_terms_in(advisor),
+        advisor_said=(r1_guard.advisor_text_of(advisor),) if advisor else (),
+        **kwargs,
+    )
+
+
+def rules_of(text, context) -> set[str]:
+    return {hit.rule for hit in guard_text(text, context).hits}
+
+
+class EchoAwareGuardTests(unittest.TestCase):
+    """Simulation diagnosis 1, L1: what she echoes from the advisor's own words is no invention.
+
+    Synthetic sentences only.  Every echo below hit a LEAK category, and three of them flagged
+    the call; an invented fact the advisor never said still hits.
+    """
+
+    def test_a_format_or_schedule_echo_passes(self):
+        cases = (
+            ("Sessions are recorded too, so weekends work.", "Recorded sessions help a lot."),
+            ("The mock interviews are live as well.", "Live mock interviews sound useful."),
+            ("Our classes are live, on weekday evenings.", "Live classes on weekday evenings, okay."),
+        )
+        for advisor, learner in cases:
+            with self.subTest(learner=learner):
+                self.assertNotIn("format_or_schedule_claim", rules_of(learner, echo_ctx(advisor)))
+                self.assertIn("format_or_schedule_claim", rules_of(learner, echo_ctx("")))
+
+    def test_a_format_word_the_advisor_never_said_still_hits(self):
+        context = echo_ctx("The sessions are recorded.")
+        self.assertIn("format_or_schedule_claim", rules_of("It's mostly live, I think.", context))
+
+    def test_a_deep_need_marker_the_advisor_said_first_is_an_echo(self):
+        context = echo_ctx("It's flexible, mostly evenings and weekends.", released_topics=frozenset())
+        self.assertNotIn("volunteered_need", categories("Evenings and weekends, okay.", context))
+        # Her own deep need ("two kids") is still hers to hold back.
+        self.assertIn(
+            "volunteered_need", categories("I have two kids, so evenings and weekends.", context)
+        )
+        self.assertIn(
+            "volunteered_need",
+            categories("Evenings and weekends, okay.", echo_ctx("", released_topics=frozenset())),
+        )
+
+    def test_a_policy_priority_or_wish_is_no_claim(self):
+        for text in (
+            "The refund policy matters most to me.",
+            "The refund terms are the main thing I'd want to look at.",
+            "I'd want to see placement numbers first.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+        for text in ("You guarantee placement.", "There's a full refund in the first month."):
+            with self.subTest(text=text):
+                self.assertIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+
+    def test_how_course_work_is_graded_is_no_scoring_leak(self):
+        for text in ("How is the capstone graded?", "Is the project reviewed and graded by mentors?"):
+            with self.subTest(text=text):
+                self.assertNotIn("evaluation", categories(text, echo_ctx()))
+        for text in ("Is this call being scored?", "What's on the rubric for the capstone?"):
+            with self.subTest(text=text):
+                self.assertIn("evaluation", categories(text, echo_ctx()))
+
+    def test_flag_off_is_the_release_before(self):
+        context = ctx(probe_first=True, advisor_terms=r1_guard.advisor_terms_in("Sessions are recorded."))
+        self.assertIn("format_or_schedule_claim", rules_of("Recorded sessions help.", context))
+        self.assertIn("outcome_or_policy_claim", rules_of("The refund policy matters most to me.", context))
+        self.assertIn("evaluation", categories("How is the capstone graded?", context))
+
+
+class EmptiedReplyTests(unittest.TestCase):
+    """Simulation diagnosis 1, U3: an emptied free reply is no "let me think" filler."""
+
+    def test_her_question_after_a_dropped_claim_is_still_asked(self):
+        context = echo_ctx(free_reply=True, recent_questions=(True,))
+        text = "You guarantee placement. And how long is the access to the recordings?"
+        result = guard_text(text, context)
+        self.assertNotIn(result.text, FALLBACK_REPLIES)
+        self.assertIn("?", result.text)
+
+    def test_an_emptied_reply_to_a_statement_is_a_back_channel(self):
+        result = guard_text("You guarantee placement.", echo_ctx(free_reply=True))
+        self.assertIn(result.text, NEUTRAL_ACKS)
+
+    def test_a_decision_asked_for_keeps_the_thinking_line(self):
+        result = guard_text(
+            "You guarantee placement.", echo_ctx(free_reply=True, asked_her=True)
+        )
+        self.assertIn(result.text, FALLBACK_REPLIES)
+
+    def test_flag_off_keeps_the_thinking_line(self):
+        result = guard_text("You guarantee placement.", ctx(probe_first=True, free_reply=True))
+        self.assertIn(result.text, FALLBACK_REPLIES)
+
+
+class EchoQuestionQuotaTests(unittest.TestCase):
+    """Simulation diagnosis 1, U2: "Wait, $1,000?" is an echo, not the reply's one question."""
+
+    RAW = "Wait, $1,000? That seems awfully low. Is that really the full price, with nothing added?"
+
+    def test_the_real_question_is_kept(self):
+        context = echo_ctx("I can do it for $1,000.", advisor_amounts=frozenset({1000}))
+        result = guard_text(self.RAW, context)
+        self.assertIn("full price", result.text)
+
+    def test_flag_off_drops_it(self):
+        context = ctx(probe_first=True, advisor_amounts=frozenset({1000}))
+        self.assertNotIn("full price", guard_text(self.RAW, context).text)
+
+
+class ExactReaskTests(unittest.TestCase):
+    """Simulation diagnosis 1, L5: the asked-for re-ask is never her question word for word."""
+
+    QUESTION = "Does the course include time with mentors?"
+
+    def test_an_exact_reask_is_shortened(self):
+        said = said_of(self.QUESTION)
+        context = echo_ctx(said=said, reask=said)
+        result = guard_text(f"{self.QUESTION} I'd still like to know that.", context)
+        self.assertNotIn(self.QUESTION, result.text)
+        self.assertIn("mentors?", result.text)
+
+    def test_flag_off_lets_it_through(self):
+        said = said_of(self.QUESTION)
+        result = guard_text(self.QUESTION, ctx(said=said, reask=said))
+        self.assertEqual(result.text, self.QUESTION)
+
+
+class DanglingAfterCutTests(unittest.TestCase):
+    """Simulation diagnosis 1, U5 and U4 (3): what is left after a cut must still say something."""
+
+    def test_her_choice_between_options_is_an_answer_not_a_closer(self):
+        context = echo_ctx(
+            free_reply=True,
+            phrase_counts=(("stall_closer", 3),),
+            choice_offered=True,
+        )
+        result = guard_text("I'll reach out myself once I've read it, that suits me better.", context)
+        self.assertIn("reach out", result.text)
+
+    def test_a_short_that_sentence_goes_with_the_clause_it_pointed_at(self):
+        context = echo_ctx(free_reply=True, phrase_counts=(("stall_closer", 3),))
+        result = guard_text(
+            "I'll get back to you once I've read it, that suits me better. "
+            "How long is the access to the recordings?",
+            context,
+        )
+        self.assertNotIn("suits me better", result.text)
+
+    def test_a_dangling_conjunction_goes_with_the_concession_tag(self):
+        self.assertEqual(
+            r1_guard._strip_concession_tag("That's about what I heard, so, I'll give you that.", tidy=True),
+            "That's about what I heard.",
+        )
+
+
+SPENT_STALLS = (("stall_closer", 3), ("decider_stall", 3), ("money_strain", 3))
+
+
+class EchoGuardReviewTests(unittest.TestCase):
+    """Review of the simulation diagnosis 1 learner fixes (R1_ECHO_GUARD), synthetic text only."""
+
+    def test_l1b_a_single_word_marker_is_never_an_echo(self):
+        context = echo_ctx(
+            "A lot of our learners have kids and full-time jobs.", released_topics=frozenset()
+        )
+        self.assertIn(
+            "volunteered_need", categories("I have two kids myself, so time is tight.", context)
+        )
+
+    def test_l1b_a_marker_phrase_needs_the_advisor_s_whole_phrase(self):
+        # He said "evenings" and "weekends" apart, never the phrase: her phrase is her own.
+        context = echo_ctx(
+            "Some evenings work, and weekends are optional.", released_topics=frozenset()
+        )
+        self.assertIn("volunteered_need", categories("Evenings and weekends, okay.", context))
+        said = echo_ctx(
+            "It's flexible, mostly evenings and weekends.", released_topics=frozenset()
+        )
+        self.assertNotIn("volunteered_need", categories("Evenings and weekends, okay.", said))
+
+    def test_l1b_echoed_topics_for_the_tracker(self):
+        advisor = (r1_guard.advisor_text_of("It's flexible, mostly evenings and weekends."),)
+        self.assertEqual(
+            r1_guard.echoed_need_topics(PERSONA, "Evenings and weekends, okay.", advisor),
+            frozenset({"H3"}),
+        )
+        # Her own marker beside the echo is still hers.
+        self.assertEqual(
+            r1_guard.echoed_need_topics(
+                PERSONA, "Evenings and weekends, with my kids at home.", advisor
+            ),
+            frozenset(),
+        )
+        kids = (r1_guard.advisor_text_of("A lot of our learners have kids."),)
+        self.assertEqual(
+            r1_guard.echoed_need_topics(PERSONA, "I have two kids myself.", kids), frozenset()
+        )
+
+    def test_l1c_a_priority_clause_does_not_cover_a_claim_beside_it(self):
+        for text in (
+            "You guarantee placement, and that matters most to me.",
+            "There's a full refund in the first month, which I care about.",
+            "You offer a money-back guarantee, so I'd want to look at that.",
+            "You guarantee placement and that matters most to me.",
+            "I'd want to see the refund terms, and you guarantee placement.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+        for text in (
+            "The refund policy matters most to me.",
+            "The refund terms are the main thing I'd want to look at.",
+            "I'd want to see placement numbers first.",
+            "Placement support is what I care about.",
+            "I'm worried about the refund terms.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+
+    def test_l1a_evening_and_morning_echoes_are_compared(self):
+        cases = (
+            ("We have live classes.", "Live classes in the evenings would suit me.", True),
+            ("Sessions are recorded.", "Recorded sessions in the mornings help.", True),
+            ("Classes are in the evenings.", "Classes in the evenings would suit me.", False),
+            ("Sessions are recorded, some in the mornings.", "Recorded sessions in the mornings help.", False),
+        )
+        for advisor, learner, hits in cases:
+            with self.subTest(learner=learner):
+                rules = rules_of(learner, echo_ctx(advisor))
+                self.assertEqual("format_or_schedule_claim" in rules, hits)
+
+    def test_l1d_grading_the_call_or_her_is_still_a_leak(self):
+        for text in (
+            "Am I being graded on this like an assignment?",
+            "Is this call graded like a project?",
+            "Are you scoring me the way you score the projects?",
+            "Are you being graded on this call?",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("evaluation", categories(text, echo_ctx()))
+        for text in (
+            "How is the capstone graded?",
+            "Is the project reviewed and graded by mentors?",
+            "How do you grade the assignments?",
+            "Are the projects graded by mentors?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("evaluation", categories(text, echo_ctx()))
+
+    def test_u5_a_that_clause_is_kept_unless_the_cut_clause_came_first(self):
+        context = lambda: echo_ctx(free_reply=True, phrase_counts=SPENT_STALLS)  # noqa: E731
+        for text, kept in (
+            ("That's too much for me, I'll get back to you.", "That's too much for me."),
+            ("That's a lot, and I need to talk it over with my husband.", "That's a lot."),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, context()).text, kept)
+        result = guard_text(
+            "I'll get back to you once I've read it, that suits me better.", context()
+        )
+        self.assertNotIn("suits me better", result.text)
+
+    def test_l5_the_short_reask_keeps_the_question_s_meaning(self):
+        cases = {
+            "Does the course include time with mentors?": "So, time with mentors?",
+            "What do I get if I finish early?": "So, what do I get if I finish early?",
+            "Is there any refund if I drop out?": "So, is there any refund if I drop out?",
+            "And does the price include the mock interviews and the career coaching sessions?": (
+                "So, does the price include the mock interviews and the career coaching sessions?"
+            ),
+            "So how long do I keep the recordings?": "So, how long do I keep the recordings?",
+            "I'm asking, does it come with a certificate?": "So, a certificate?",
+        }
+        for question, short in cases.items():
+            with self.subTest(question=question):
+                self.assertEqual(r1_guard.short_reask(question), short)
 
 
 if __name__ == "__main__":

@@ -2233,5 +2233,199 @@ class EndingsSchedulerTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - start, 2.0)
 
 
+
+class FloorRequestTests(unittest.TestCase):
+    """M032 SWEEP-33: "Can I talk?" asks for the floor; a sales line that starts alike does not."""
+
+    POSITIVES = (
+        "Can I talk?",
+        "Sorry, let me finish.",
+        "Can you listen to what I am saying first?",
+        "Please just listen to me.",
+        "Meera, could I please speak?",
+        "Excuse me, can I finish?",
+        "No no, hear me out.",
+        # Review S7L-R2: the cited turn as speech-to-text wrote it, and everyday forms.
+        "Can you listen what I am saying first?",
+        "Please listen what I'm saying.",
+        "Wait, let me finish.",
+        "Hold on, let me finish.",
+        "One second, let me finish.",
+        "Just a second, let me finish.",
+        "Let me complete my point.",
+    )
+    NEGATIVES = (
+        "Wait.",
+        "Hold on.",
+        "Hold on, let me check the fee for you.",
+        "One second, let me pull up the curriculum.",
+        "Can I talk to your husband?",
+        "Let me explain the fee, it is nine thousand",
+        "Listen, the batch starts Monday",
+        "Listen.",
+        "Let me explain.",
+        "Can I explain the fee? It is nine thousand",
+        "Can you speak to your father tonight?",
+        "Can I talk? I want to tell you about the mentors and the placement support we offer.",
+        "",
+    )
+
+    def test_the_requests_for_the_floor_are_read(self):
+        for text in self.POSITIVES:
+            with self.subTest(text=text):
+                self.assertTrue(sched.asks_for_floor(text, names=("Meera",)))
+
+    def test_lines_that_say_more_are_not(self):
+        for text in self.NEGATIVES:
+            with self.subTest(text=text):
+                self.assertFalse(sched.asks_for_floor(text, names=("Meera",)))
+        self.assertFalse(sched.asks_for_floor(None))
+
+    def test_the_corpus_hit_rate_is_small(self):
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if sched.asks_for_floor(text)]
+        self.assertLessEqual(len(hits), len(texts) * 0.005, hits)
+
+    def test_the_reader_stays_linear_on_long_turns(self):
+        import time
+
+        for text in ("sorry " * 2000, "can i " * 1000, "let me finish " * 600, "x" * 4000):
+            started = time.perf_counter()
+            sched.asks_for_floor(text)
+            self.assertLess(time.perf_counter() - started, 0.25)
+
+
+
+class DodgedQuestionTests(unittest.TestCase):
+    """M032 SWEEP-7: a deferral, a vague answer or a pivot dodges her question."""
+
+    def test_her_open_question_topics(self):
+        self.assertEqual(sched.open_question_topics("Could I pay it off month by month?"), {"payment"})
+        self.assertEqual(sched.open_question_topics("What happens if I fall behind?"), {"fall_behind"})
+        self.assertEqual(
+            sched.open_question_topics("How many hours a week would I need?"), {"weekly_hours"}
+        )
+        self.assertEqual(sched.open_question_topics("I might fall behind."), frozenset())
+
+    def test_dodges(self):
+        for text, topic in (
+            ("Sure, I'll get to that in a minute. First, which modules interest you?", "payment"),
+            ("Timing is very flexible, you choose your own days.", "weekly_hours"),
+            ("We can talk about that later. Tell me about your goals.", "format"),
+            ("Don't worry about that. What made you look at data science?", "fall_behind"),
+            ("That's not a problem at all.", "job_search"),
+            ("Don't worry about it, we'll sort it out.", "fall_behind"),
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.dodged_question(text, (topic,)))
+
+    def test_answers_pitches_and_discovery_are_not_dodges(self):
+        for text, topic in (
+            ("About six to eight hours a week.", "weekly_hours"),
+            ("Our mentors come from top companies.", "format"),
+            ("How many hours could you give it each week?", "weekly_hours"),
+            ("Yes, you can pay in monthly instalments. Which modules interest you?", "payment"),
+            ("If you miss a class, the recordings help you catch up.", "fall_behind"),
+            ("Okay.", "weekly_hours"),
+            # Review S7L-R3: a reassuring opener followed by the real answer.
+            (
+                "Don't worry about it, the recordings are always there and you can rewatch any "
+                "session.",
+                "fall_behind",
+            ),
+            (
+                "That's not a problem at all, every class is recorded so you can watch it later.",
+                "fall_behind",
+            ),
+            (
+                "Yes, it's not a problem, we have placement support for a full year.",
+                "job_search",
+            ),
+            ("No problem, we run doubt sessions every weekend.", "fall_behind"),
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.dodged_question(text, (topic,)))
+        self.assertFalse(sched.dodged_question("It depends.", ()))
+
+    def test_defer_and_vague_corpus_rates(self):
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if sched.defers_or_vague(text)]
+        # Read only on the turn right after her question, and only when it left her topic
+        # uncovered; the raw rate is reported (15 of 2,160 when written, all "it's flexible").
+        self.assertLessEqual(len(hits), len(texts) * 0.01)
+
+    def test_the_readers_stay_linear_on_long_turns(self):
+        import time
+
+        for text in (
+            "we can talk about that " * 300,
+            "it's very " * 800,
+            "how many hours " * 500 + "?",
+            "fall " * 2000,
+        ):
+            started = time.perf_counter()
+            sched.dodged_question(text[:4000], ("weekly_hours",))
+            sched.open_question_topics(text[:4000])
+            self.assertLess(time.perf_counter() - started, 0.25)
+
+
+class MarkersV2Tests(unittest.TestCase):
+    """Simulation diagnosis 1, U1 and U2 (R1_MARKERS_V2): the worry in new words proves the move.
+
+    Synthetic text: the model voiced the point, the markers missed it, and the scripted tail said
+    it a second time in the same reply.
+    """
+
+    PROVEN = {
+        sched.F2_PRIMARY: (
+            "My days are already full with experiments, and I'm not sure I could keep up on top "
+            "of that.",
+            "Between the kids and the workload, I don't know how I'd squeeze this in.",
+        ),
+        sched.F2_PUSH: (
+            "If work suddenly gets busy and I fall a few weeks behind, what happens then?",
+            "What happens if I miss a month when work piles up?",
+            "Could I pick it back up where I left off?",
+        ),
+        sched.F4_PUSH: ("I'd want to run it past my husband before I go any further.",),
+        # ("..., with nothing added on later?" already proved it through "nothing".)
+        sched.F1_COUNTER: ("Is that really the full price for me?",),
+    }
+
+    def test_the_wider_markers_prove_the_move(self):
+        wide = OwedMoveScheduler("husband", markers_v2=True)
+        old = OwedMoveScheduler("husband")
+        for move_id, texts in self.PROVEN.items():
+            for text in texts:
+                with self.subTest(move=move_id, text=text):
+                    self.assertTrue(wide.spoken_proves(move_id, text))
+                    self.assertFalse(old.spoken_proves(move_id, text))
+
+    def test_unrelated_lines_still_prove_nothing(self):
+        wide = OwedMoveScheduler("husband", markers_v2=True)
+        for move_id, text in (
+            (sched.F2_PUSH, "What happens if I don't like the course?"),
+            (sched.F4_PUSH, "Let me go over the email tonight."),
+            (sched.F2_PRIMARY, "On top of that, the price worries me."),
+        ):
+            with self.subTest(move=move_id, text=text):
+                self.assertFalse(wide.spoken_proves(move_id, text))
+
+    def test_every_scripted_variant_still_proves_its_move(self):
+        wide = OwedMoveScheduler("husband", markers_v2=True)
+        for state in wide._states.values():
+            for text in state.variants:
+                with self.subTest(move=state.spec.id, text=text):
+                    self.assertTrue(wide.spoken_proves(state.spec.id, text))
+
+
 if __name__ == "__main__":
     unittest.main()

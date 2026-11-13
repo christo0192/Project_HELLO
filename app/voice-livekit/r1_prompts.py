@@ -100,6 +100,17 @@ CLOSE_NOTE = (
     "- The advisor is wrapping up the call. Reply with one short, warm goodbye in your own words "
     "and nothing else: no question and nothing new."
 )
+# Review S3R-6 (naturalness): after a resumed hang-up (``COOL_NOTE``: "no warmth") the goodbye is
+# polite and brief, never warm.  New wording under D-M032-4, listed for review.
+CLOSE_NOTE_COOL = (
+    "- The advisor is wrapping up the call. Reply with one short, polite goodbye in your own "
+    "words and nothing else: no question and nothing new."
+)
+# The job line of a reply while the advisor closes the call (S3.2): no "react with a feeling or a
+# short question", which pulled against the goodbye.  New wording under D-M032-4.
+WINDING_REPLY_NOTE = (
+    "Reply as the learner, naturally: the advisor is ending the call, so you end it with them."
+)
 # M032 S3.3 (R1_EARLY_CLOSE_ASIDE): the advisor said no to stopping, so the learner picks the call
 # up again right after Christy's aside (she did not hear the aside: interviewer lines are not in her
 # context).  New wording under D-M032-4, listed for review.
@@ -184,6 +195,20 @@ CUT_REPEAT_NOTE = (
     "they asked whether you are there, say briefly that you are; then say your point again in one "
     "or two short sentences, in your own words; raise nothing new."
 )
+# M032 SWEEP-15 (flag R1_LEARNER_VOICE_V2; 1eb18cd4 #27): the two notes above gave her a frame to
+# narrate ("you cut in while I was mid-sentence"), so their openings no longer describe the cut.  No
+# forbidden phrase is quoted (quoting primes it).  New wording under D-M032-4, listed for review.
+CUT_REPEAT_OPENING = (
+    "- The advisor cut in only to ask you to say that again, or to check you are still there."
+)
+CUT_REPEAT_OPENING_V2 = (
+    "- The advisor only asked you to say that again, or checked you are still there."
+)
+INTERRUPTED_NOTE_V2 = (
+    "- Answer what the advisor just said first, in your own words. Do not mention that you were "
+    "still talking, and do not start again what you were saying."
+)
+CUT_REPEAT_NOTE_V2 = CUT_REPEAT_NOTE.replace(CUT_REPEAT_OPENING, CUT_REPEAT_OPENING_V2, 1)
 EMAIL_AGAIN_NOTE = (
     "- You already told the advisor they can e-mail you the details. Do not say it again and "
     "do not ask for the e-mail again: acknowledge in a few words and carry on."
@@ -570,6 +595,33 @@ ACK_TURN_CONCERNS_NOTE = (
     "line asked them something, do not drop it: ask it again in a few words. Otherwise ask one "
     "short question about something you still want to know."
 )
+# Simulation diagnosis 1 (L5, flag R1_ECHO_GUARD): the re-ask came back word for word.
+ACK_TURN_NOTE_V2 = (
+    '- The advisor only said a word like "okay" or "hmm". Do not thank them, do not repeat or '
+    "reword what you already said, and add no new worry. If your last line asked them something, "
+    "do not drop it: ask it again, shorter and in different words than before (for example "
+    '"So, the mentors?"). Otherwise ask one short question about something you still want to '
+    "know."
+)
+ACK_TURN_CONCERNS_NOTE_V2 = (
+    '- The advisor only said a word like "okay" or "hmm". You have already told them {concerns}, '
+    "so do not say that again in any words. Do not thank them and add no new worry. If your last "
+    "line asked them something, do not drop it: ask it again, shorter and in different words than "
+    'before (for example "So, the mentors?"). Otherwise ask one short question about something '
+    "you still want to know."
+)
+# Simulation diagnosis 1 (L3, flag R1_PRICE_ASKED_ONCE): she asked "is that the final price?" and,
+# two exchanges later with no new offer, asked it again.
+FINAL_ASKED_NOTE = (
+    "- You already asked whether that is the final price: do not ask it again unless they name a "
+    "new figure."
+)
+# Simulation diagnosis 1 (L7, flag R1_NO_ACCEPT_NOTES): the advisor proposed a next step on a turn
+# her owed F4 point answers; she made the point and accepted the callback as well.
+PROPOSAL_UNANSWERED_NOTE = (
+    "- The advisor also proposed a call or a next step. Do not agree to it and do not name a day "
+    "or a time in this reply: make only the point below."
+)
 # SWEEP-12: the soft tics ("actually", "genuinely", "properly", "I'd rather"); ``{words}`` is a
 # worker-built list of quoted words.
 SOFT_TIC_NOTE = "- You have leaned on {words} lately: leave them out of this reply."
@@ -591,6 +643,13 @@ CURIOSITY_NOTE_V2 = (
 PRICE_MET_NOTE_EARLY = (
     "- The price on the table is \"{amount}\", at or below the $7,000 you heard someone paid. "
     "Never say it is too much, still a lot or out of reach, and do not push for a lower one."
+)
+# Simulation diagnosis 1 (U4 (2), flag R1_NO_ACCEPT_NOTES): the note's own phrase was read back
+# ("no more than what I heard people paid, so").  The stance, with no sayable phrase.
+PRICE_MET_NOTE_EARLY_V2 = (
+    "- The price on the table is \"{amount}\". It is not more than you expected to pay: never say "
+    "it is too much, still a lot or out of reach, and do not push for a lower one. If you react to "
+    "it, say how it feels in your own words."
 )
 # SWEEP-17 item 6: the advisor says he never gave the figure her last line used.
 FIGURE_CHALLENGE_NOTE = (
@@ -640,10 +699,98 @@ NO_REPEAT_NOTE = (
     "- Do not repeat anything you already said earlier in this call: say something new "
     "or move on."
 )
+# M032 SWEEP-9 (flag R1_CALL_OPENING): her first or second role-play reply, a free reply only.  The
+# advisor said neither who they are nor why they call: she asks who is calling; only a name: she
+# asks where from; asked how she is: she says and asks back.  ``{example}`` rotates by seed.  The
+# card, the prefix and the "I called" guard are unchanged.  New wording under D-M032-4.
+CALLER_UNKNOWN_NOTE = (
+    "- The advisor has not said who they are or why they are calling, so you do not know yet. "
+    "Answer their greeting in a few words, then ask who is calling, in your own words (for example "
+    '"{example}"). Ask nothing else, and do not mention your form, the course or a callback until '
+    "they say who they are."
+)
+CALLER_UNKNOWN_EXAMPLES = (
+    "Sorry, who's this?",
+    "Sorry, who am I speaking with?",
+    "Hi, who's calling?",
+)
+CALLER_NAME_ONLY_NOTE = (
+    "- The advisor gave their name but not where they are calling from or why. Answer their "
+    "greeting in a few words, then ask where they are calling from, in your own words (for example "
+    '"{example}"). Ask nothing else, and do not mention your form or the course until they say.'
+)
+CALLER_NAME_ONLY_EXAMPLES = (
+    "Sorry, which company is this?",
+    "Sorry, where are you calling from?",
+)
+HOW_ARE_YOU_NOTE = (
+    "- The advisor asked how you are. Say how you are in a few words and ask how they are (for "
+    'example "{example}"). If they also asked you something else, answer that briefly first. Ask '
+    "no other question."
+)
+HOW_ARE_YOU_EXAMPLES = ("And you?", "How about you?", "How are you doing?")
+# M032 SWEEP-6 (flag R1_PRICE_MEMORY): once F1-ANCHOR is delivered, "what number works for you?"
+# on a free reply gets her own figure from the card (it replaces ASKED_DIRECTLY_NOTE; no curiosity
+# that turn).  The figures are in quotes and come from the card (the $7,000 she heard people paid,
+# the $500-700 a month she could manage).  New wording under D-M032-4.
+YOUR_NUMBER_TOTAL_NOTE = (
+    "- The advisor asked what price would work for you. Answer that plainly, once: you were "
+    'hoping for something close to the "$7,000" you heard people paid. Do not push for a lower '
+    "price than that, do not accept anything, and answer before you raise anything else."
+)
+YOUR_NUMBER_MONTHLY_NOTE = (
+    "- The advisor asked what you could pay each month. Answer that plainly, once: about "
+    '"$500-700" a month is what you could manage. Do not accept anything, and answer before you '
+    "raise anything else."
+)
+YOUR_NUMBER_MET_NOTE = (
+    "- The advisor asked what price would work for you. What they have offered is already about "
+    "what you hoped for: say so plainly, without accepting it, and do not name a new, lower number."
+)
+# M032 SWEEP-7 (flag R1_COME_BACK): her own question the advisor dodged (a deferral, a vague answer
+# or a pivot to a question of their own) gets one come-back on her next free reply.  ``{label}``
+# is a rotated noun phrase in quotes (``control_prose`` drops it).  With the come-back,
+# NO_REPEAT_NOTE is swapped for NO_REPEAT_REASK_NOTE.  New wording under D-M032-4.
+OPEN_QUESTION_NOTE = (
+    '- Earlier you asked the advisor about "{label}", and they have not really answered it. Come '
+    "back to it once, briefly and politely, in different words, and ask nothing else in this "
+    "reply; if they already said yes, ask how it would work. This is not repeating yourself."
+)
+OPEN_QUESTION_AFTER_ASK_NOTE = (
+    "- The advisor asked you something: answer that first, briefly. Then come back once to what "
+    'you asked earlier, "{label}", which they have not really answered, in different words; if '
+    "they already said yes, ask how it would work. Ask nothing else."
+)
+NO_REPEAT_REASK_NOTE = (
+    "- Apart from the question you are coming back to, do not repeat anything you already said "
+    "earlier in this call."
+)
 CHARACTER_BREAK_NOTE = (
     "- The advisor asked whether you are an AI, whether this is a test, or what you should "
     "do. Do not answer that. Say once, in character, that you are just a person looking "
     "at courses, and carry on."
+)
+# M032 SWEEP-10 (flag R1_ROLE_CONFUSION_V2): after the one-off coach aside, a candidate who still
+# has the roles the wrong way round ("sell it to me") gets this note instead of
+# CHARACTER_BREAK_NOTE, which talks about AI and test questions.  ``{example}`` rotates by seed.
+# New wording under D-M032-4, listed for review.
+ROLE_CONFUSION_NOTE = (
+    "- The advisor seems to have mixed up who is who on this call. Stay yourself and set it "
+    'straight in one short, friendly sentence in your own words, for example "{example}" Do not '
+    "agree that you are selling anything, do not talk about buyers or sellers, and do not "
+    "apologise. If you already set it straight earlier in this call, do not explain it again: "
+    "just carry on with what they said, or ask them one short question about the course."
+)
+# M032 SWEEP-33 (flag R1_FLOOR_YIELD): the advisor asked her to let them speak, but the owed move is
+# forced (its deadline is near), so she still makes it, briefly.  New wording under D-M032-4.
+FLOOR_NOTE = (
+    "- They asked you to let them speak. Say sorry in two or three words, then make your point "
+    "briefly and stop."
+)
+ROLE_CONFUSION_EXAMPLES = (
+    "Oh, I think we've got our wires crossed: I filled in the form, and you're calling me back "
+    "about the course.",
+    "Hang on, I'm the one who enquired about the course, and you called me about it, right?",
 )
 
 GETTING_TO_KNOW_YOU_NOTE = (
@@ -952,12 +1099,14 @@ def learner_prefix(
     offer_realism: bool = False,
     probe_first: bool = False,
     price_check: bool = False,
+    timeline_v2: bool = False,
 ) -> str:
     """The learner's system prefix: behaviour rules plus the persona's public card.
 
     ``offer_realism`` (SWEEP-13), ``probe_first`` (S2P, SWEEP-17: the card and the course sentence)
     and ``price_check`` (SWEEP-21: the "never correct the advisor" clause) are latched per session
     by the engine, so the prefix stays byte-stable for the session (the DeepSeek cache prefix).
+    ``timeline_v2`` (SWEEP-8, latched the same way) is the card's timeline wording.
     With all of them off the prefix is the release before them, byte for byte.
     """
     course = PREFIX_COURSE_SENTENCE_V2 if probe_first else PREFIX_COURSE_SENTENCE
@@ -998,7 +1147,7 @@ def learner_prefix(
         + "Do not volunteer worries, deadlines, money details or personal circumstances "
         "beyond your card. Share the extra detail a system note allows, and only then.\n"
         + CARD_MARKER
-        + persona.public_card_text(probe_first=probe_first)
+        + persona.public_card_text(probe_first=probe_first, timeline_v2=timeline_v2)
     )
 
 
@@ -1060,6 +1209,9 @@ def turn_reminder(
     intent_worry: str = "",
     length_note: str = "",
     curiosity_v2: bool = False,
+    winding: bool = False,
+    role_confusion: str = "",
+    come_back: bool = False,
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -1102,7 +1254,21 @@ def turn_reminder(
     are SWEEP-5's single texts; and the delivery rider is the last line.  ``length_note``
     (SWEEP-14) is the free reply's length line and ``curiosity_v2`` (SWEEP-12) the curiosity line
     that waits for a fitting moment.  With every one of them at its default the note is unchanged.
+
+    ``winding`` (M032 S3.2, review S3R-6): the advisor is closing the call and the free reply is
+    one goodbye (``CLOSE_NOTE`` in ``notes``), so its job line is ``WINDING_REPLY_NOTE``, it gets no
+    opening-style, curiosity or length line, and the rider has no "or with a question".
+
+    ``role_confusion`` (M032 SWEEP-10): the rendered ``ROLE_CONFUSION_NOTE``, given in place of
+    ``CHARACTER_BREAK_NOTE`` when the advisor has the roles the wrong way round.
+
+    ``come_back`` (M032 SWEEP-7): the reply comes back to her dodged question (its note is in
+    ``notes``), so ``NO_REPEAT_REASK_NOTE`` takes the place of ``NO_REPEAT_NOTE``.
     """
+    if winding and not intent_brief and not reaction_only and not confirm:
+        style_note = ""
+        length_note = ""
+        curiosity = ""
     lines = [f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}."]
     if reaction_only:
         lines.append(REACTION_ONLY_NOTE)
@@ -1129,6 +1295,8 @@ def turn_reminder(
             lines.append(INTENT_SHAPE_NEW_TOPIC)
     elif intent_brief:
         lines.append(INTENT_SHAPES[intent_shape % len(INTENT_SHAPES)])
+    elif winding and not reaction_only:
+        lines.append(WINDING_REPLY_NOTE)
     elif not reaction_only:
         lines.append(FREE_REPLY_NOTE_V2 if voice_v2 else FREE_REPLY_NOTE)
     lines.append(IGNORE_RULE_NOTE)
@@ -1173,7 +1341,7 @@ def turn_reminder(
             f"{stems}. Do not read the facts out like a list."
         )
     lines.append(NEXT_STEP_NOTE)
-    lines.append(NO_REPEAT_NOTE)
+    lines.append(NO_REPEAT_REASK_NOTE if come_back else NO_REPEAT_NOTE)
     if style_note:
         lines.append(style_note)
     if price_wrap and not reaction_only:
@@ -1199,7 +1367,9 @@ def turn_reminder(
     if curiosity and not intent_brief:
         template = CURIOSITY_NOTE_V2 if curiosity_v2 else CURIOSITY_NOTE
         lines.append(template.format(curiosity=curiosity))
-    if character_break:
+    if role_confusion:
+        lines.append(role_confusion)
+    elif character_break:
         lines.append(CHARACTER_BREAK_NOTE)
     monologue = _monologue_line(monologue_sec)
     if monologue:
@@ -1208,7 +1378,8 @@ def turn_reminder(
         lines.append(length_note)
     if voice_v2:
         # S2 item 2: the delivery rider is always the last line.
-        lines.append(LEARNER_DELIVERY_RIDER_BASE if reaction_only else LEARNER_DELIVERY_RIDER)
+        plain = reaction_only or (winding and not intent_brief)
+        lines.append(LEARNER_DELIVERY_RIDER_BASE if plain else LEARNER_DELIVERY_RIDER)
     return "\n".join(lines)
 
 

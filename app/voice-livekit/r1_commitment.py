@@ -11,10 +11,13 @@ Plan 5.8.  The worker, not the LLM, decides whether and how the learner commits:
   that reaches a level above WEAK is a violation (``classify_learner_commitment`` is the
   detector ``r1_guard`` uses).
 
-The module holds only pure functions and constants.
+The module holds only pure functions and constants, and reads one rollback flag at use
+(``R1_COMMIT_READER_V2``, simulation diagnosis 1; default on, 0/off/false/no restores the release
+before it).
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -887,15 +890,65 @@ _CALL_ASK = _compile(
 )
 
 
+def reader_v2() -> bool:
+    """Simulation diagnosis 1 (R1_COMMIT_READER_V2, read at use): L4, L6 and U4 (1) below."""
+    raw = os.getenv("R1_COMMIT_READER_V2") or "1"
+    return raw.strip().lower() not in ("0", "off", "false", "no")
+
+
+# L4 (R1_COMMIT_READER_V2): "the payment link" is an ask only with someone acting on it (WHO ACTS):
+# the advisor sending or sharing it, a question to her, or an imperative.  A noun list answering
+# "what will be in the e-mail?" ("the price, the course details, the payment link, all of it") is
+# the e-mail's content.
+_BARE_LINK = re.compile(
+    r"\b(?:payment|enrol+ment|registration|sign-?up|invoice) link\b", re.IGNORECASE
+)
+_LINK_ACTOR = re.compile(
+    r"\b(?:send|sending|sent|share|sharing|shared|email|emailing|emailed|e-mail|text|texted|"
+    r"forward|forwarded|resend|drop|dropped|dropping|put|putting|pop|popped|popping|attach|"
+    r"attached|attaching|post|posted|paste|pasted)\b"
+    r"|\b(?:i|we)(?:'ll|'d| will| would| can| could| shall| should)?\s+(?:\w+\s+){0,2}?"
+    r"(?:give|get|whatsapp)\b"
+    r"|\byou(?:'ll| will| should| would)?\s+(?:\w+\s+)?(?:get|receive|see|find it|have)\b"
+    r"|\bhere(?:'s| is| are|\b)|\bon (?:its|the) way\b|\bbelow\b|\babove\b"
+    r"|\blet(?:'s| me| us)\b"
+    r"|\b(?:grab|click|use|open|follow|tap|complete|fill|pay (?:through|via|with|on))\b",
+    re.IGNORECASE,
+)
+# Review of L4: the e-mail-content shape the diagnosis named, a link noun inside a list of content
+# nouns ("the price, the course details, the payment link, all of it"; "the fee and the payment
+# link").  A link named on its own is still handed over.
+_LINK_IN_LIST = re.compile(
+    r"(?:,|\band\b)\s*(?:the\s+|a\s+)?(?:payment|enrol+ment|registration|sign-?up|invoice) link\b"
+    r"|\b(?:payment|enrol+ment|registration|sign-?up|invoice) link\s*(?:,|\band\b)\s*"
+    r"(?:the|a|all|everything)\b",
+    re.IGNORECASE,
+)
+
+
+def _link_listed(sentence: object, lowered: str) -> bool:
+    """L4: the sentence lists a payment link among the e-mail's contents, and nobody sends it,
+    hands it over, asks about it or tells her to use it."""
+    return (
+        _LINK_IN_LIST.search(lowered) is not None
+        and "?" not in str(sentence)
+        and _LINK_ACTOR.search(lowered) is None
+    )
+
+
 def enrol_ask_in(sentence: object) -> str | None:
     """The phrase that asks the learner to enrol or pay in one advisor sentence, or None.
 
     Production's reading, verbatim (origin/main ``detect_ask``): the first ``_ENROL_ASK`` match.
+    With R1_COMMIT_READER_V2 a payment link that is only listed (``_link_listed``) is no ask.
     """
     lowered = fold(sentence).lower()
+    listed = reader_v2() and _link_listed(sentence, lowered)
     for pattern in _ENROL_ASK:
         match = pattern.search(lowered)
         if match:
+            if listed and _BARE_LINK.fullmatch(match.group(0)):
+                continue
             return match.group(0)[:40]
     return None
 
@@ -988,6 +1041,63 @@ _MEDIUM = _compile(
     r"\b(?:book|booked|schedule|scheduled|set up) (?:a|the|that|our|this) (?:call|chat|"
     r"meeting)\b",
 )
+# L6 (R1_COMMIT_READER_V2): "a day or a clock time works" is a call only when no reading or doing
+# activity is its subject ("Reading it tonight works for me." agrees to read an e-mail), unless a
+# call, a chat or a meeting is named all the same.
+_MEDIUM_DAY_WORKS = (_MEDIUM[1], _MEDIUM[7])
+_CALL_TALK = re.compile(
+    r"\b(?:call|chat|meeting|talk|speak|catch up|connect|follow[- ]?up|check(?:ing)?[- ]in|"
+    r"together|with you|with me|with us)\b",
+    re.IGNORECASE,
+)
+# Review of L6: the activity must be the subject of "works": a gerund that opens the clause the
+# day or clock time is in ("Reading it tonight works for me."), not an activity anywhere in the
+# sentence ("Tomorrow works, I'll check my calendar." accepts tomorrow).
+_ACTIVITY_SUBJECT = re.compile(
+    r"\W*(?:(?:sure|yes|yeah|okay|ok|fine|alright|right)\W+)*(?:reading|looking (?:at|over|"
+    r"through)|going (?:over|through)|reviewing|checking|thinking (?:it|this|that) over|"
+    r"sleeping on|discussing|talking (?:it|this|that) (?:over|through))\b",
+    re.IGNORECASE,
+)
+_SUBJECT_CLAUSE_BREAK = re.compile(r"[,;:]|\s-+\s|\b(?:and|but|so|then|because)\b", re.IGNORECASE)
+
+
+def _activity_is_subject(lowered: str, match: re.Match[str]) -> bool:
+    """L6: the day-or-time "works" at ``match`` has a reading or doing activity as its subject."""
+    head = _SUBJECT_CLAUSE_BREAK.split(lowered[: match.start()])[-1]
+    return _ACTIVITY_SUBJECT.match(head) is not None
+# U4 (1) (R1_COMMIT_READER_V2): accepting a seat or a spot held for her is a step toward enrolling,
+# capped before the window like a callback ("Setting a seat aside while I read the terms, I can
+# live with that.").
+_HOLD_VERB = r"(?:hold|holding|set(?:ting)?|keep(?:ing)?|reserv\w*|sav(?:e|ing)|block(?:ing)?)"
+_SEAT = r"(?:seat|spot|place)"
+_HOLD_OK = r"(?:fine|okay|ok|can live with|works?|go ahead|sounds good|alright|all right)"
+_SEAT_HOLD = _compile(
+    r"\b" + _HOLD_VERB + r"\b[^.?!]{0,20}\b" + _SEAT + r"\b[^.?!]{0,40}\b" + _HOLD_OK + r"\b",
+    r"\b" + _HOLD_OK + r"\b[^.?!]{0,30}\b" + _HOLD_VERB + r"\b[^.?!]{0,20}\b" + _SEAT + r"\b",
+)
+_HOLD_NEGATOR = re.compile(r"\b(?:not|never|no|don'?t|doesn'?t|won'?t|can'?t|isn'?t)\b")
+
+
+def _medium_v2(lowered: str) -> bool | None:
+    """L6 and U4 (1): the MEDIUM reading with R1_COMMIT_READER_V2 (None: the flag is off)."""
+    if not reader_v2():
+        return None
+    for pattern in _SEAT_HOLD:
+        match = pattern.search(lowered)
+        if match is not None and _HOLD_NEGATOR.search(lowered[: match.end()]) is None:
+            return True
+    no_call = _CALL_TALK.search(lowered) is None
+    for pattern in _MEDIUM:
+        match = pattern.search(lowered)
+        if match is None:
+            continue
+        if no_call and pattern in _MEDIUM_DAY_WORKS and _activity_is_subject(lowered, match):
+            continue
+        return True
+    return False
+
+
 _WEAK = _compile(
     r"\blet me think (?:about it|it over)\b",
     r"\bemail me\b",
@@ -1011,7 +1121,10 @@ def classify_learner_commitment(text: object) -> Level:
         return Level.STRONG
     if fuzzy_contains(folded, COMMITMENT_LINES[Level.STRONG]):
         return Level.STRONG
-    if any(pattern.search(lowered) for pattern in _MEDIUM):
+    medium = _medium_v2(lowered)
+    if medium is None:
+        medium = any(pattern.search(lowered) for pattern in _MEDIUM)
+    if medium:
         return Level.MEDIUM
     medium_line = COMMITMENT_LINES[Level.MEDIUM].replace("{decision_maker}", "")
     medium_line = medium_line.replace("{slot}", DEFAULT_SLOT)

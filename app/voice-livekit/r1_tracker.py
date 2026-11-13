@@ -326,8 +326,15 @@ class DisclosureGate:
         record.released_turn = self.turn
         record.probe_source = record.probe_source or source
 
-    def note_learner_text(self, text: object, turn: int | None = None) -> tuple[str, ...]:
-        """Record deep-need markers in what the learner actually said."""
+    def note_learner_text(
+        self, text: object, turn: int | None = None, echoed: frozenset[str] = frozenset()
+    ) -> tuple[str, ...]:
+        """Record deep-need markers in what the learner actually said.
+
+        ``echoed`` (simulation diagnosis 1, R1_ECHO_GUARD): topics whose markers only repeat the
+        advisor's own phrase ("evenings and weekends" right after he said it).  The guard lets that
+        echo through, so it tells no need that was never asked about.
+        """
         now = turn if turn is not None else self.turn
         revealed: list[str] = []
         for topic in deep_need_topics_in(self.persona, text):
@@ -337,7 +344,7 @@ class DisclosureGate:
                     record.state = NeedState.REVEALED
                     record.revealed_turn = now
                     revealed.append(topic)
-            else:
+            elif topic not in echoed:
                 record.revealed_unreleased = True
         # An offer whose reply did not tell the need is given back: the layer is still owed, so the
         # next dig on the topic offers it again (up to ``MAX_DEEP_MISSES`` times).
@@ -687,6 +694,62 @@ _CONFUSED = r"\b(?:i'?m|i am) (?:really |so |a bit |totally |still |very )?(?:co
 # lead" is a job, "as a buyer, you'd want..." is a sales point), and only the sale ITSELF is asked
 # about ("what course are you most interested in?" is discovery).
 _ROLE_END = r"(?: here| now)?(?=\s*(?:[,.!?;:]|$|and\b|right\b|so\b))"
+# The role-confusion patterns of the release before M032 SWEEP-10 (they stay in _COACH_REQUEST too).
+_ROLE_CONFUSION_V1 = (
+    rf"\b(?:i'?m|i am) (?:the )?(?:buyer|customer|learner|student){_ROLE_END}",
+    r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?buying\b",
+    rf"\byou(?:'re| are) (?:the )?(?:seller|advisor|salesperson|sales person){_ROLE_END}",
+    r"\bwhat (?:course|program|programme) are you selling\b",
+    r"\bare you selling (?:the|this|a|that) (?:course|program|programme)\b",
+    r"\bare you (?:actually |really )?selling(?: (?:it|this|that|anything|something))?"
+    r"(?: to me)?" + _SENTENCE_END,
+)
+# M032 SWEEP-10 (flag R1_ROLE_CONFUSION_V2, passed in by the engine): the candidate casts
+# themselves as the buyer on the first phrasing ("can you sell this to me?", "sell me the course",
+# "I want to buy, not sell", "what program do you sell"), which went answered in role until the
+# third phrasing.  The object of "sell it" must end its clause, so "can you sell this to your
+# husband?" and "pitch it to your manager for sponsorship" (F4-PUSH and sponsorship talk) are never
+# read as role confusion.
+_SALE_OBJECT = r"(?:course|program|programme|product)"
+# Review S7L-R1: the course words alone ("product" is her own job: "what product do you sell at
+# your company?", "I'm planning to buy the product for my team").
+_COURSE_OBJECT = r"(?:course|program|programme)"
+# A real clause end: never a comma, which speech-to-text puts at every filler ("Could you pitch
+# it, um, to your husband?").
+_CLAUSE_END = r"(?=\s*(?:[.!?;:]|$))"
+# "to me" may be followed by a comma ("Can you sell this to me, please?").
+_TO_ME_END = r" to me(?=\s*(?:[,.!?;:]|$))"
+# Her own job, not the course: "what product do you sell at your company?".
+_NOT_HER_JOB = (
+    r"(?![^.?!]{0,40}\b(?:at|in|for|with) (?:your|the|that|this) (?:current |own )?(?:company|"
+    r"role|job|work|office|firm|team|organi[sz]ation|business)\b)"
+)
+_ROLE_CONFUSION_V2 = (
+    # Review S7L-R1: "it/this/that" needs "to me" ("Could you just pitch it." and "Can you sell
+    # it?" are sponsorship talk as often as a reversal); "the course" may end its clause instead.
+    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) (?:(?:it|this|that)"
+    + _TO_ME_END
+    + rf"|(?:the|your) {_SALE_OBJECT}(?:{_TO_ME_END}|{_CLAUSE_END}))",
+    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) me (?:the|this|your|a) "
+    rf"{_SALE_OBJECT}\b",
+    r"^(?:(?:okay|ok|so|then|now|just|please|yeah),? )*(?:sell|pitch) (?:(?:it|this|that|the "
+    rf"{_SALE_OBJECT}) to me|me (?:the|this|your|a) {_SALE_OBJECT})\b",
+    r"\b(?:i'?m|i am) (?:really |very |actually |just )?(?:interested|planning|looking|keen|ready)"
+    r"(?: (?:to|in))? (?:buy|buying|purchase|purchasing) (?:a |the |this |that |your |one )?"
+    rf"(?:data science )?{_COURSE_OBJECT}\b",
+    rf"\bwhat {_COURSE_OBJECT} (?:do )?you sell\b{_NOT_HER_JOB}",
+    rf"\bwhat {_SALE_OBJECT} are you selling\b{_NOT_HER_JOB}",
+    r"\bi(?:'m| am)? (?:looking|trying|here|want(?:ing)?|going|planning|need) to (?:buy|purchase)"
+    r"\b[^.?!]{0,40}\bnot (?:to )?sell\b",
+)
+# Review S7L-R1: "Can you pitch the course? To your husband, I mean." names someone else in the
+# next sentence, so the first one is no reversal.
+_SOMEONE_ELSE_NEXT = re.compile(
+    r"^(?:(?:um+|uh+|er+m?|like|i mean|sorry|no|yeah|well),?\s+)*(?:to|for) (?!me\b)\w",
+    re.IGNORECASE,
+)
+_ROLE_CONFUSION_V1_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V1)
+_ROLE_CONFUSION_V2_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V2)
 _COACH_REQUEST = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -707,13 +770,7 @@ _COACH_REQUEST = tuple(
         r"\bgive me a hint\b",
         r"\bwho are you (?:supposed|meant) to be\b",
         r"\bwhat do you want me to do(?: now| here| next)?" + _SENTENCE_END,
-        rf"\b(?:i'?m|i am) (?:the )?(?:buyer|customer|learner|student){_ROLE_END}",
-        r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?buying\b",
-        rf"\byou(?:'re| are) (?:the )?(?:seller|advisor|salesperson|sales person){_ROLE_END}",
-        r"\bwhat (?:course|program|programme) are you selling\b",
-        r"\bare you selling (?:the|this|a|that) (?:course|program|programme)\b",
-        r"\bare you (?:actually |really )?selling(?: (?:it|this|that|anything|something))?"
-        r"(?: to me)?" + _SENTENCE_END,
+        *_ROLE_CONFUSION_V1,
         # Owner test 1eb18cd4 (#14-#18, owner decision 2026-10-30): a request to have the brief
         # explained again once the learner has picked up ("I wanted to understand this, uh, this
         # round, the role play brief.").  It must name the exercise within 40 characters of the
@@ -741,16 +798,47 @@ _INSULT = (
     r"(?:idiot|moron|stupid|dumb(?:ass)?|bitch|bastard|asshole|arsehole|jerk|fool|loser|imbecile|"
     r"cunt|dick|prick|slut|whore|retard)"
 )
-_ABUSE_DIRECTED = re.compile(
+_INSULT_FILLERS = (
+    r"(?:(?:an?|such an?|so|a bloody|a fucking|bloody|fucking|stupid|dumb|little)\s+){0,2}"
+)
+# Review S3R-2 / S3R-5 (naturalness): each branch is read where it is aimed at her, never in a
+# reassurance or about somebody else ("nobody here is going to screw you over", "I don't want to
+# piss off your husband", "it doesn't make you stupid", "I told the stupid girl at the desk").
+_ABUSE_SWEAR = re.compile(
     r"\b(?:fuck|f\*+k|f\*+|screw) (?:you|off|yourself)\b"
-    r"|\b(?:piss|bugger|sod) off\b"
-    r"|\b(?:you|you're|youre|you are|ur|u r)\s+(?:(?:an?|such an?|so|a bloody|a fucking|"
-    r"bloody|fucking|stupid|dumb|little)\s+){0,2}" + _INSULT + r"s?\b"
-    r"|\b(?:stupid|dumb|bloody|fucking) (?:woman|girl|lady|bitch|idiot|fool|cow)\b"
-    r"|\b(?:chutiy[ae]|chutiya|madarchod|maderchod|bhenchod|behenchod|bhen chod|bsdk|"
+    r"(?!\s+(?:over|around|on|with|out\b|up|in\b|for\b|about|like|guys))",
+    re.IGNORECASE,
+)
+# "Piss off." / "Bugger off, lady.": the dismissal ends its clause.
+_ABUSE_OFF = re.compile(r"\b(?:piss|bugger|sod) off(?=\s*(?:[,.;!?]|$))", re.IGNORECASE)
+# "You're an idiot", "you are so dumb": the insult is said OF her.
+_ABUSE_PREDICATE = re.compile(
+    r"\b(?:you're|youre|you are|ur|u r|are you|r u)\s+" + _INSULT_FILLERS + _INSULT + r"s?\b",
+    re.IGNORECASE,
+)
+# "You idiot!", "Thanks, you stupid woman.", "Stupid woman.": a vocative, at the start of its
+# clause (after the opener words a speaker puts before it).
+_ABUSE_VOCATIVE = re.compile(
+    r"^(?:(?:oh|hey|listen|look|shut up|okay|ok|just|and|yes|yeah|no|well)[,\s]+){0,2}"
+    r"(?:you\s+" + _INSULT_FILLERS + r"(?:" + _INSULT + r"s?|woman|girl|lady|cow)"
+    r"|(?:stupid|dumb|bloody|fucking) (?:woman|girl|lady|bitch|idiot|fool|cow))\b",
+    re.IGNORECASE,
+)
+_ABUSE_SLUR = re.compile(
+    r"\b(?:chutiy[ae]|chutiya|madarchod|maderchod|bhenchod|behenchod|bhen chod|bsdk|"
     r"bhosdi(?:ke|ka|wale)|gaandu|gandu|kutiya|haramzad[ie])\b",
     re.IGNORECASE,
 )
+# A negation or a reassuring frame earlier in the clause turns the words around ("we won't screw
+# you", "I'm not calling you stupid", "nobody thinks you're a loser").
+_ABUSE_NEGATED = re.compile(
+    r"\b(?:not|never|no one|nobody|noone|nothing|won't|wont|don't|dont|doesn't|doesnt|didn't|"
+    r"didnt|isn't|isnt|wasn't|aren't|wouldn't|wouldnt|shouldn't|can't|cant|cannot|without)\b"
+    r"|n't\b",
+    re.IGNORECASE,
+)
+_ABUSE_CLAUSE_BREAK = re.compile(r"[,.;:!?]|\s-\s|\b(?:but|and then|so)\b", re.IGNORECASE)
+ABUSE_NEGATION_WORDS = 6
 _ABUSE_OPENER = (
     r"(?:(?:oh|just|please|now|so|okay|ok|hey|look|listen|lady|you|yaar|arre|bas|madam|"
     r"ma'?am)[,\s]+){0,3}"
@@ -759,35 +847,110 @@ _ABUSE_DISMISSAL = re.compile(
     r"^" + _ABUSE_OPENER
     + r"(?:shut up|shut your mouth|get lost|go away|buzz off|chup kar(?:o)?|chup ho ja(?:o)?|"
     r"nikal (?:yahan se|ja(?:o)?)|bhaag ja(?:o)?|dimag mat kha(?:o)?|bakwas band kar(?:o)?)"
-    r"(?:[,\s]+(?:now|already|please|lady|madam|ma'?am|yaar|and (?:listen|let me (?:talk|speak|"
-    r"finish))|[a-z]{2,15}))?[\s.!]*$",
+    # Review S3R-5 (naturalness): only an address term may follow ("Go away tonight." is no
+    # dismissal of her).
+    r"(?:[,\s]+(?:now|already|please|lady|madam|ma'?am|yaar|woman|girl|man|ji|"
+    r"and (?:listen|let me (?:talk|speak|finish))|(?:you )?" + _INSULT + r"))?[\s.!]*$",
+    re.IGNORECASE,
+)
+# "Shut up! You got promoted? That's amazing.": surprise at good news, not a dismissal.
+_GOOD_NEWS = re.compile(
+    r"\b(?:amazing|awesome|incredible|wow|no way|really|seriously|congrat\w*|great news|"
+    r"fantastic|wonderful|kidding)\b",
     re.IGNORECASE,
 )
 ABUSE_MAX_CHARS = 4000
 
 
-def detect_abuse(text: object) -> bool:
-    """M032 S3.4: abuse aimed at the learner (see ``_ABUSE_DIRECTED`` and ``_ABUSE_DISMISSAL``)."""
+def _abuse_negated(folded: str, start: int) -> bool:
+    """A negation or a reassuring frame in the clause just before ``start`` (review S3R-2)."""
+    clause = _ABUSE_CLAUSE_BREAK.split(folded[max(0, start - 120) : start])[-1]
+    window = " ".join(clause.split()[-ABUSE_NEGATION_WORDS:])
+    return _ABUSE_NEGATED.search(window) is not None
+
+
+def _clause_starts(folded: str) -> list[str]:
+    """The clauses of ``folded`` (split at punctuation), each stripped."""
+    return [part.strip() for part in re.split(r"[,.;:!?]|\s-\s", folded) if part.strip()]
+
+
+def detect_abuse(text: object, names: tuple[str, ...] = ()) -> bool:
+    """M032 S3.4: abuse aimed at the learner (see ``_ABUSE_SWEAR`` .. ``_ABUSE_DISMISSAL``).
+
+    Reviews S3R-2 and S3R-5 (naturalness): a swear word or an insult counts only where it is aimed
+    at her (not negated or reassuring, not about a third party, not "make you stupid"), and a
+    dismissal only as its whole sentence ("Go away, Meera.": ``names`` are her names, which may
+    end it), never "Shut up!" before good news.
+    """
     folded = fold(text)[-ABUSE_MAX_CHARS:]
-    if _ABUSE_DIRECTED.search(folded) is not None:
+    if _ABUSE_SLUR.search(folded) is not None:
         return True
-    return any(
-        _ABUSE_DISMISSAL.match(sentence.strip()) is not None
-        for sentence in split_sentences(folded)
-    )
+    for pattern in (_ABUSE_SWEAR, _ABUSE_OFF, _ABUSE_PREDICATE):
+        for match in pattern.finditer(folded):
+            if not _abuse_negated(folded, match.start()):
+                return True
+    if any(_ABUSE_VOCATIVE.match(clause) is not None for clause in _clause_starts(folded)):
+        return True
+    sentences = [sentence.strip() for sentence in split_sentences(folded)]
+    for index, sentence in enumerate(sentences):
+        for name in names:
+            if name:
+                sentence = re.sub(
+                    rf"[,\s]+{re.escape(name)}(?=[\s.!]*$)", "", sentence, flags=re.IGNORECASE
+                )
+        if _ABUSE_DISMISSAL.match(sentence) is None:
+            continue
+        rest = " ".join(sentences[index + 1 : index + 3])
+        if re.search(r"\bshut up\b", sentence, re.IGNORECASE) and rest and (
+            "?" in rest or _GOOD_NEWS.search(rest) is not None
+        ):
+            continue
+        return True
+    return False
 
 
-def detect_character_break(text: object) -> str | None:
+def role_confusion_in(text: object, *, v2: bool = True) -> bool:
+    """The candidate has the roles the wrong way round (M032 SWEEP-10), read sentence by sentence.
+
+    ``v2`` (the engine's R1_ROLE_CONFUSION_V2) adds the first-phrasing forms; without it only the
+    role patterns of the release before are read.
+    """
+    sentences = split_sentences(fold(text))
+    for index, sentence in enumerate(sentences):
+        stripped = sentence.strip()
+        if any(pattern.search(stripped) for pattern in _ROLE_CONFUSION_V1_RE):
+            return True
+        if v2 and _role_v2_in(sentences, index):
+            return True
+    return False
+
+
+def _role_v2_in(sentences: list[str], index: int) -> bool:
+    """A first-phrasing reversal (SWEEP-10) in ``sentences[index]``, unless the next sentence names
+    someone else it is for ("Can you pitch the course? To your husband, I mean."; review S7L-R1)."""
+    if not any(pattern.search(sentences[index].strip()) for pattern in _ROLE_CONFUSION_V2_RE):
+        return False
+    following = sentences[index + 1].strip() if index + 1 < len(sentences) else ""
+    return _SOMEONE_ELSE_NEXT.search(following) is None
+
+
+def detect_character_break(text: object, *, role_v2: bool = False) -> str | None:
     """Classify a character break (plan 5.10): ``coach``, ``ai`` or None.
 
     ``coach`` means the candidate asks to be coached or says they are confused; ``ai``
     means they ask whether this is an AI or a test.  Deterministic and lexical: it only
     chooses between an in-character deflection and the one-off out-of-character aside.
     It can never end the call or change a phase.
+
+    ``role_v2`` (M032 SWEEP-10, the engine's R1_ROLE_CONFUSION_V2): the first phrasings of a role
+    reversal ("can you sell this to me?") are a coaching break too.
     """
     folded = fold(text)
-    for sentence in split_sentences(folded):
+    sentences = split_sentences(folded)
+    for index, sentence in enumerate(sentences):
         if any(pattern.search(sentence) for pattern in _COACH_REQUEST):
+            return "coach"
+        if role_v2 and _role_v2_in(sentences, index):
             return "coach"
     if _AI_QUESTION.search(folded):
         return "ai"
@@ -1710,9 +1873,13 @@ class CoverageTracker:
             injection=injection,
         )
 
-    def note_learner_text(self, text: object, turn: int | None = None) -> tuple[str, ...]:
-        """Record reveals in what the learner actually said."""
-        return self.gate.note_learner_text(text, turn if turn is not None else self.turn)
+    def note_learner_text(
+        self, text: object, turn: int | None = None, echoed: frozenset[str] = frozenset()
+    ) -> tuple[str, ...]:
+        """Record reveals in what the learner actually said (``echoed``: see the gate's)."""
+        return self.gate.note_learner_text(
+            text, turn if turn is not None else self.turn, echoed=echoed
+        )
 
     def apply_judge(self, result: JudgeResult | None, judged_turn: int) -> bool:
         """Merge a validated judge result for ``judged_turn``; None changes nothing."""

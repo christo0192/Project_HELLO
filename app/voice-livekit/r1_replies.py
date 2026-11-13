@@ -114,6 +114,7 @@ SESSION_FACT_WORKER_KEYS = (
     "learner_voice",
     "learner_probe_first",
     "learner_endings",
+    "learner_followups",
     "wrapup",
 )
 _LEARNER_TIMING_COUNTS = ("moment_waits", "volunteered_objections", "split_replans")
@@ -173,6 +174,19 @@ _LEARNER_ENDINGS_COUNTS = (
     "short_on_time_notes",
 )
 _LEARNER_ENDINGS_BY_LABEL = ("closing_states",)
+# M032 S7L (learner follow-ups): ``learner_followups`` reads the engine's
+# ``admin_log()["followups"]``, counts only: role-confusion notes (SWEEP-10), floor yields (SWEEP-33), questions dodged and asked
+# again (SWEEP-7), call-opening notes (SWEEP-9) and her-number notes (SWEEP-6).
+_LEARNER_FOLLOWUPS_COUNTS = (
+    "role_confusion_turns",
+    "floor_yields",
+    "open_q_dodged",
+    "open_q_reasked",
+    "call_opening_unknown_note",
+    "call_opening_name_only_note",
+    "call_opening_reciprocal_note",
+    "your_number_notes",
+)
 _WRAPUP_COUNTS = (
     "wrapup_more_asked",
     "wrapup_hiring_team_drops",
@@ -262,6 +276,11 @@ def _learner_endings(admin: Mapping[str, Any] | None) -> dict[str, Any]:
     return _bounded_counts(
         (admin or {}).get("endings"), _LEARNER_ENDINGS_BY_LABEL, _LEARNER_ENDINGS_COUNTS
     )
+
+
+def _learner_followups(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S7L: the learner follow-ups' counts from the engine's admin log, bounded counts only."""
+    return _bounded_counts((admin or {}).get("followups"), (), _LEARNER_FOLLOWUPS_COUNTS)
 
 
 def _wrapup_counts(wrapup: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -375,13 +394,14 @@ def llm_messages(
     )
     if reply.plan is not None:
         return assemble_messages(
-            # M032 SWEEP-13, SWEEP-17 and SWEEP-21: the session's latched prefix (byte-stable for
-            # the whole session).
+            # M032 SWEEP-8, SWEEP-13, SWEEP-17 and SWEEP-21: the session's latched prefix
+            # (byte-stable for the whole session).
             learner_prefix(
                 persona,
                 offer_realism=reply.plan.offer_realism,
                 probe_first=reply.plan.probe_first,
                 price_check=reply.plan.price_check,
+                timeline_v2=reply.plan.timeline_v2,
             ),
             select_context(ordered, ROLEPLAY_PHASE),
             reply.candidate_text,
@@ -590,6 +610,7 @@ def session_facts_event(
             "learner_voice": _learner_voice(admin),
             "learner_probe_first": _learner_probe_first(admin),
             "learner_endings": _learner_endings(admin),
+            "learner_followups": _learner_followups(admin),
             "wrapup": _wrapup_counts(wrapup),
             **shadow,
             **added,

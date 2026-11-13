@@ -631,6 +631,22 @@ LEARNER_EMAIL_REQUEST = re.compile(
     r"|\bby e-?mail instead\b",
     re.IGNORECASE,
 )
+# Review S3R-8 (naturalness): "Can you send me the details on WhatsApp?" asks for no e-mail.
+_OTHER_CHANNEL = re.compile(
+    r"^\s*(?:(?:on|over|via|through|by|in|as)\s+(?:an?\s+)?)?"
+    r"(?:whats\s?app|text(?:\s+message)?s?|sms|messages?|dms?|chat|phone|call)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_email(text: object) -> bool:
+    """SWEEP-25 A2: her own request for the details by e-mail (``LEARNER_EMAIL_REQUEST``), never
+    one that names another channel right after it ("send me the details on WhatsApp")."""
+    folded = fold(text)
+    return any(
+        _OTHER_CHANNEL.match(folded[match.end() :]) is None
+        for match in LEARNER_EMAIL_REQUEST.finditer(folded)
+    )
 
 
 def says_goodbye_or_sends(text: object) -> bool:
@@ -1314,3 +1330,126 @@ def later_price_threat(sentence: object, list_usd: int = THREAT_LIST_USD) -> boo
     if not above:
         return False
     return bool(_IF_YOU_WAIT.search(canonical) or _OTHER_BATCH.search(canonical))
+
+
+# ------------------------------------------------------------------------------------------------
+# M032 SWEEP-9 (flag R1_CALL_OPENING, read by ``r1_roleplay``): the call opening.  Pure, narrow and
+# linear.  ``caller_introduced``: whether the advisor's first turns said where they call from or why
+# ("known"), only their name ("name_only"), or neither ("").  ``asks_how_she_is``: a greeting
+# question, never "how are you planning to pay?".  ``asked_who_is_calling``: HER question.
+# ------------------------------------------------------------------------------------------------
+CALLER_KNOWN = "known"
+CALLER_NAME_ONLY = "name_only"
+# Review S7L-R1: "Kick-start", "Kickstarter" and "kick star" as speech-to-text writes them, and a
+# lowercase "from ik".
+_CALLER_COMPANY = re.compile(
+    r"\binterview[\s-]*(?:kick|geek|kik|quick)[\s-]*star(?:t(?:er)?)?\b"
+    r"|\bkick[\s-]*star(?:t(?:er)?)?\b|\b(?:from|with) (?:the )?ik\b",
+    re.IGNORECASE,
+)
+_CALLER_COMPANY_CASED = re.compile(r"\bIK\b")
+# A named caller who also said where they are from ("Sam from Upgrade Academy"), in any form.
+_CALLER_FROM_ORG = re.compile(r"\b(?i:from|with)\s+(?:(?i:the)\s+)?[A-Z][A-Za-z]")
+_CALLER_PURPOSE = re.compile(
+    r"\bforms?\b|\b(?:enquiry|inquiry|enquiries|inquiries)\b|\bwebinars?\b|\bdata science\b"
+    r"|\b(?:the|our|this|a) (?:courses?|programs?|programmes?|bootcamps?)\b"
+    r"|\bcalling (?:about|regarding|back|from|because)\b|\bfollow(?:ing)?[- ]?up\b"
+    r"|\b(?:program|programme|course|admissions?|career) (?:advisor|adviser|counsell?or|team|"
+    r"consultant)s?\b"
+    r"|\breaching out\b|\byour (?:interest|details|profile|application|registration)\b"
+    r"|\b(?:our|the) website\b|\bsigned up\b|\bregistered\b|\b(?:enquired|inquired)\b",
+    re.IGNORECASE,
+)
+_NAME_WORD = r"([A-Z][a-z]{1,23})"
+_ANY_NAME_WORD = r"([A-Za-z][a-z]{1,23})"
+_GREETING_LEAD = r"(?:(?:hi|hello|hey|good (?:morning|afternoon|evening))\b[\s,.!-]*)?"
+_CALLER_NAMED = (
+    re.compile(
+        r"(?:^|[.!?,]\s*)(?i:" + _GREETING_LEAD + r"(?:[a-z]+[\s,.!-]+)?this is)\s+"
+        + _NAME_WORD
+        + r"\b"
+    ),
+    re.compile(
+        r"\b(?i:i'?m|i am)\s+" + _NAME_WORD + r"(?=\s*(?:,|from\b|here\b|with\b|calling\b))"
+    ),
+    re.compile(r"(?:^|[.!?,]\s*)" + _NAME_WORD + r"\s+(?i:here|this side)\b"),
+    re.compile(r"\b(?i:it'?s)\s+" + _NAME_WORD + r"\s+(?i:from|here)\b"),
+    re.compile(r"\b" + _NAME_WORD + r"\s+(?i:from (?:the|our))\s+[A-Za-z]"),
+    # Review S7L-R1 (SWEEP-9): the commonest self-introductions.  After these cue words a
+    # lowercase name counts too (speech-to-text often writes "my name is priya").
+    re.compile(r"\b(?i:my name is|my name's)\s+" + _ANY_NAME_WORD + r"\b"),
+    re.compile(
+        r"(?:^|[.!?,]\s*)(?i:" + _GREETING_LEAD + r"myself)\s+" + _ANY_NAME_WORD + r"\b"
+    ),
+    re.compile(
+        r"\b(?i:i'?m|i am)\s+" + _NAME_WORD + r"(?=\s*(?:[.!?]|$|(?i:and|speaking|calling)\b))"
+    ),
+    re.compile(r"\b(?i:it'?s)\s+" + _NAME_WORD + r"(?=\s*(?:[.!?]|$))"),
+    re.compile(r"(?:^|[.!?,]\s*)" + _NAME_WORD + r"\s+(?i:calling|speaking)\b"),
+    re.compile(
+        r"(?:^|[.!?,]\s*)(?i:" + _GREETING_LEAD + r"(?:[a-z]+[\s,.!-]+)?this is)\s+"
+        + r"([a-z]{2,23})(?=\s*(?:[.!?,]|$|(?:from|here|calling|speaking)\b))"
+    ),
+)
+_NOT_A_CALLER_NAME = frozenset(
+    "hi hello hey good yes yeah okay ok so well sure great thanks thank this that it what how "
+    "the our your my we you i sorry just "
+    # Review S7L-R1: words the lowercase and clause-end forms could catch ("this is fine.", "it's
+    # Monday.", "I'm Fine.", "myself and my team").
+    "a an and am also not me here there fine nice right correct true real really important "
+    "interesting amazing awesome perfect wonderful helpful fun cool exciting different easy hard "
+    "new calling speaking regarding about actually basically glad happy back done ready "
+    "monday tuesday wednesday thursday friday saturday sunday today tomorrow".split()
+)
+
+
+def caller_introduced(text: object, names: tuple[str, ...] = ()) -> str:
+    """``CALLER_KNOWN``, ``CALLER_NAME_ONLY`` or "" for the advisor's opening ``text``.
+
+    ``names``: her own first name (a vocative, "Hi Alex", is never the caller's name).
+    """
+    raw = fold(text)
+    if _CALLER_COMPANY.search(raw) or _CALLER_COMPANY_CASED.search(raw):
+        return CALLER_KNOWN
+    if _CALLER_PURPOSE.search(raw):
+        return CALLER_KNOWN
+    own = {name.lower() for name in names if name}
+    for pattern in _CALLER_NAMED:
+        for match in pattern.finditer(raw):
+            word = match.group(1).lower()
+            if word not in _NOT_A_CALLER_NAME and word not in own:
+                # Review S7L-R1: "Sam from Interview Kickstarter" misheard is still a where-from.
+                if _CALLER_FROM_ORG.search(raw):
+                    return CALLER_KNOWN
+                return CALLER_NAME_ONLY
+    return ""
+
+
+_HOW_ARE_YOU = re.compile(
+    r"\bhow (?:are|r) (?:you|u)\b(?! (?:planning|going|thinking|hoping|looking|managing|paying|"
+    r"finding|able|feeling about)\b)(?! doing (?:with|on|in|at|about)\b)"
+    r"|\bhow(?:'s| is) (?:it going|your day|everything|life)\b|\bhow have you been\b"
+    r"|\bhow are things\b",
+    re.IGNORECASE,
+)
+
+
+def asks_how_she_is(text: object) -> bool:
+    """The advisor asks how she is ("how are you?", "how's your day going?")."""
+    return _HOW_ARE_YOU.search(fold(text)) is not None
+
+
+_WHO_IS_CALLING = re.compile(
+    r"\bwho(?:'s| is| am i)\b[^.?!]{0,30}\b(?:this|calling|speaking|there|with)\b"
+    r"|\bwhere (?:are you|is this|are you guys) calling from\b|\bwhich company\b"
+    r"|\bwhere are you (?:from|calling)\b",
+    re.IGNORECASE,
+)
+
+
+def asked_who_is_calling(text: object) -> bool:
+    """HER line asks who is calling or from where (a question-like sentence)."""
+    return any(
+        is_question_like(sentence) and _WHO_IS_CALLING.search(fold(sentence)) is not None
+        for sentence in split_sentences(text)
+    )

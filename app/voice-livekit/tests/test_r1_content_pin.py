@@ -174,7 +174,16 @@ import r1_world
 # Revision 25 (merge of the M032 lanes on feat/m032-integration): every text of the Christy
 # lane's 21..23 and of the learner lane's 21..24 in one manifest; no text changed in the merge.
 # CONTENT_REVISION = max(23, 24) + 1, as revision 9 did for an earlier merge.
-PINNED_CONTENT_SHA256 = "7c1c09ad005942897e2cf93a8a3b79c319a8eb7212c0abd438b4d1474fee51a3"
+# Learner lane revision 25 (M032 S7L, learner follow-ups): the follow-up notes, the card's
+# timeline wording, the learner's yield lines and the role-confusion examples join the manifest
+# (``r1_content._learner_followups``) beside the texts they replace while their flags are on.  No
+# graded meaning, marker, must-say or deadline changed.
+# Learner lane revision 26 (simulation diagnosis 1, learner fixes): the new notes, wordings and
+# wider delivery markers join the manifest (``r1_content._sim_repairs``) beside the texts they replace while their
+# flags are on.  No graded meaning, must-say or deadline changed.
+# Revision 27 (second merge of the M032 lanes): the learner lane's 25..26 on top of revision 25;
+# no text changed in the merge.  CONTENT_REVISION = max(25, 26) + 1.
+PINNED_CONTENT_SHA256 = "ca70d5c4b75f287fb8ab660ef48d1b5c5ab690e809533faee086a40cf22a9779"
 
 CONTENT_MODULES = (
     "r1_text",

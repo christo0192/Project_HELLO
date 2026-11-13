@@ -586,16 +586,24 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                         {m["role"] for m in messages} <= {"system", "user", "assistant"}
                     )
                     # The session's latched prefix (M032 SWEEP-13 R1_OFFER_REALISM, S2P
-                    # R1_PROBE_FIRST and R1_PRICE_CONFLICT, each default on).
+                    # R1_PROBE_FIRST and R1_PRICE_CONFLICT, S7L R1_PERSONA_TIMELINE_V2, each
+                    # default on).
                     self.assertTrue(plan.offer_realism)
                     self.assertTrue(plan.probe_first)
+                    self.assertTrue(plan.timeline_v2)
                     self.assertEqual(
                         messages[0]["content"],
                         learner_prefix(
-                            rendered, offer_realism=True, probe_first=True, price_check=True
+                            rendered,
+                            offer_realism=True,
+                            probe_first=True,
+                            price_check=True,
+                            timeline_v2=True,
                         ),
                     )
-                    self.assertIn(rendered.public_card_text(probe_first=True), blob)
+                    self.assertIn(
+                        rendered.public_card_text(probe_first=True, timeline_v2=True), blob
+                    )
                     # M032 S2P (D-M032-7): she knows no course figure; she asks the advisor.
                     self.assertNotIn("$9,000", blob)
                     self.assertNotIn("6 months", blob)
@@ -646,7 +654,11 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
             {
                 "role": "system",
                 "content": learner_prefix(
-                    rig.persona, offer_realism=True, probe_first=True, price_check=True
+                    rig.persona,
+                    offer_realism=True,
+                    probe_first=True,
+                    price_check=True,
+                    timeline_v2=True,
                 ),
             },
         )
@@ -3399,6 +3411,12 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # reply stream (``llm_node``), like the redirect before them: not warmed either.
         for line_id in ("L-REDIRECT-PRICE", "L-REDIRECT-TIME"):
             self.assertNotIn(line_id, r1_session._WARM_ORDER)
+        # M032 SWEEP-33: her yield lines are a SAY_ONLY plan's text too (``llm_node``), so warming
+        # them would spend the shared Sarvam budget on audio nothing can play.
+        for line_id in (
+            "L-LEARNER-YIELD", "L-LEARNER-YIELD-2", "L-LEARNER-YIELD-SORRY", "L-LEARNER-YIELD-SORRY-2"
+        ):
+            self.assertNotIn(line_id, r1_session._WARM_ORDER)
         rig, _cache, synth = self.build()
         specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
             candidate_free=False
@@ -3695,6 +3713,8 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["phase"] for item in learner], ["roleplay"])
         self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # the abuse is evidence
         self.assertTrue(rig.engine.wrap_question_open)
+        # Review S3R-5: once her line is over, a turn answers Christy's question.
+        self.assertFalse(rig.engine._hangup_prelude)
         self.assertIsNone(await rig.converse("No, sorry, let's continue.", advance=3))
         await rig.until_spoken("L-ASIDE-WRAP-RESUME")
         self.assertEqual(rig.session.generated, [])  # the advisor calls her back: he speaks next
@@ -3715,6 +3735,30 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await asyncio.wait_for(rig.interview._roleplay_turn(), 5.0))
         self.assertTrue(rig.interview._roleplay_over())
 
+    async def test_the_answer_to_her_last_point_stays_a_roleplay_row(self) -> None:
+        """Review S3R-4: the advisor answers her last objection in role: it is evidence."""
+        rig = await self.done_rig(keep=("F4-PUSH",))
+        self.assertIsNone(await rig.converse("End the interview.", advance=830))
+        await rig.until_spoken("L-ASIDE-LAST-POINT")
+        await self.generated(rig)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")  # the request: to Christy
+        answer = "Totally understand, shall we set up a call with both of you tomorrow at six?"
+        self.assertIsNone(await rig.converse(answer, advance=10))
+        self.assertTrue(rig.interview._roleplay_over())
+        row = rig.candidate_rows()[-1]
+        self.assertEqual((row["text"], row["phase"]), (answer, "roleplay"))
+
+    async def test_no_resume_line_after_a_turn_planned_during_the_aside(self) -> None:
+        """Review S3R-7: two learner lines in a row would bunch the owed moves."""
+        rig = await self.done_rig()
+        rig.engine._continuation_due = ("resume", None)
+        rig.interview._speak_continuation(rig.engine.turn - 1)  # a turn was planned since
+        self.assertEqual(rig.session.generated, [])
+        self.assertIsNone(rig.engine.continuation_plan(400.0))  # dropped, not left owed
+        rig.engine._continuation_due = ("resume", None)
+        rig.interview._speak_continuation(rig.engine.turn)
+        self.assertEqual(len(rig.session.generated), 1)
+
     async def test_the_new_asides_are_warmed_and_her_line_is_hers(self) -> None:
         for line_id in ("L-ASIDE-EARLY-CLOSE", "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-LAST-POINT",
                         "L-LEARNER-HANGUP", "L-ASIDE-HANGUP"):
@@ -3734,6 +3778,27 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(facts["abuse_count"], 1)
         self.assertEqual(facts["abuse_hangups"], 1)
         self.assertNotIn("last_point", facts)  # counts only
+
+    async def test_the_session_facts_carry_the_followup_counts(self) -> None:
+        """M032 S7L: ``learner_followups`` is counts only, through the real worker."""
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse("Hey, what's up?", advance=5)
+        await rig.converse("Can I talk?", advance=20)
+        facts = r1_session.session_facts_event(
+            rig.engine.admin_log(), {}, roleplay_seconds=30.0
+        )["payload"]["learner_followups"]
+        self.assertEqual(facts["call_opening_unknown_note"], 1)
+        self.assertEqual(facts["floor_yields"], 1)
+        self.assertEqual(
+            set(facts),
+            {
+                "role_confusion_turns", "floor_yields", "open_q_dodged", "open_q_reasked",
+                "call_opening_unknown_note", "call_opening_name_only_note",
+                "call_opening_reciprocal_note", "your_number_notes",
+            },
+        )
+        self.assertTrue(all(isinstance(value, int) for value in facts.values()))
 
 
 # ----------------------------------------------------------------- M032 S5: Christy as interviewer

@@ -221,11 +221,30 @@ import r1_world
 #    (L-FAQ-DEFER-WRAP) join the script; the wrap-up reminder's flagged sentences and the endings'
 #    notes join the manifest (``_endings``).  Markers, deadlines, the scorer's facts and every text
 #    of the release before are unchanged; with every flag off the reminders are the release before.
+#    After the S3 review (still revision 24, unreleased): a goodbye while she is cool is polite, not
+#    warm (CLOSE_NOTE_COOL), and a winding reply has its own job line (WINDING_REPLY_NOTE) with no
+#    question, opener or length line.
 # 25: M032 integration (the simulator, the Christy lane and the learner lane together): every
 #    text of the Christy lane's 21-23 and of the learner lane's 21-24 in one manifest.  No text
 #    changed in the merge; CONTENT_REVISION = max(23, 24) + 1, as revision 9 did for an earlier
 #    merge.
-CONTENT_REVISION = 25
+# Learner lane (feat/m032-learner, its revisions 25-26, after the first integration):
+# Lane 25: M032 S7L, learner follow-ups from the transcript sweep (owner decisions D-M032-4 and
+#    D-M032-7; rollback flags R1_LEARNER_VOICE_V2 for SWEEP-15, R1_PRICE_MEMORY, R1_COME_BACK,
+#    R1_PERSONA_TIMELINE_V2, R1_CALL_OPENING, R1_ROLE_CONFUSION_V2 and R1_FLOOR_YIELD).  The new
+#    notes, the card's timeline wording, the learner's yield lines and the role-confusion examples
+#    join the manifest (``_learner_followups``) beside the texts they replace while their flags are
+#    on.  No graded meaning, marker, must-say or deadline changed; with every flag off the card,
+#    the prefix and the reminders are the release before.
+# Lane 26: Simulation diagnosis 1, learner fixes (rollback flags R1_ECHO_GUARD, R1_MARKERS_V2,
+#    R1_PRICE_ASKED_ONCE, R1_NO_ACCEPT_NOTES and R1_COMMIT_READER_V2).  The shorter re-ask notes and
+#    the other new notes and wordings join the manifest (``_sim_repairs``) beside the texts they
+#    replace while their flags are on.  No graded meaning, must-say or deadline changed; the wider
+#    delivery markers are listed beside the old ones; with every flag off the reminders, the
+#    markers and the readers are the release before.
+# 27: M032 integration 2 (the learner lane's 25-26 merged onto revision 25): every text of both
+#    lanes in one manifest.  No text changed in the merge; CONTENT_REVISION = max(25, 26) + 1.
+CONTENT_REVISION = 27
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -454,6 +473,8 @@ def _endings() -> dict[str, Any]:
         },
         # S3.2, S3.3, S3.4 and SWEEP-24.
         "close_note": p.CLOSE_NOTE,
+        "close_note_cool": p.CLOSE_NOTE_COOL,
+        "winding_reply_note": p.WINDING_REPLY_NOTE,
         "hold_note_v2": p.HOLD_NOTE_V2,
         "continue_note": p.CONTINUE_NOTE,
         "cool_note": p.COOL_NOTE,
@@ -465,6 +486,75 @@ def _endings() -> dict[str, Any]:
         "time_cue_brief_v2": r1_scheduler.TIME_CUE_BRIEF_V2,
         "short_on_time_note": p.SHORT_ON_TIME_NOTE,
         "short_on_time_concerns_note": p.SHORT_ON_TIME_CONCERNS_NOTE,
+    }
+
+
+def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
+    """M032 S7L (revision 25): the learner follow-ups' new texts, beside the ones they replace."""
+    p = r1_prompts
+    return {
+        # SWEEP-8: the card's timeline wording (latched per session) and a prefix rendered with it.
+        "backstory_timeline_v2": dict(r1_personas.BACKSTORY_TIMELINE_V2),
+        "success_answer_v2": r1_personas.SUCCESS_ANSWER_V2,
+        "learner_prefix_timeline_v2_sample": p.learner_prefix(
+            sample, offer_realism=True, probe_first=True, price_check=True, timeline_v2=True
+        ),
+        # SWEEP-10: the role note, its rotated examples, and a reminder rendered with it.
+        "role_confusion_note": p.ROLE_CONFUSION_NOTE,
+        "role_confusion_examples": list(p.ROLE_CONFUSION_EXAMPLES),
+        "role_confusion_reminder_sample": p.turn_reminder(
+            sample,
+            r_sec=0,
+            character_break=True,
+            voice_v2=True,
+            role_confusion=p.ROLE_CONFUSION_NOTE.format(example=p.ROLE_CONFUSION_EXAMPLES[0]),
+        ),
+        # SWEEP-15: the cut notes without a frame to narrate.
+        "interrupted_note_v2": p.INTERRUPTED_NOTE_V2,
+        "cut_repeat_note_v2": p.CUT_REPEAT_NOTE_V2,
+        # SWEEP-33: the forced-move note (the yield lines are in ``script.lines``).
+        "floor_note": p.FLOOR_NOTE,
+        # SWEEP-7: the come-back notes, the swapped no-repeat line and the topic labels.
+        "open_question_note": p.OPEN_QUESTION_NOTE,
+        "open_question_after_ask_note": p.OPEN_QUESTION_AFTER_ASK_NOTE,
+        "no_repeat_reask_note": p.NO_REPEAT_REASK_NOTE,
+        # SWEEP-9: the call-opening notes and their rotated examples.
+        "caller_unknown_note": p.CALLER_UNKNOWN_NOTE,
+        "caller_unknown_examples": list(p.CALLER_UNKNOWN_EXAMPLES),
+        "caller_name_only_note": p.CALLER_NAME_ONLY_NOTE,
+        "caller_name_only_examples": list(p.CALLER_NAME_ONLY_EXAMPLES),
+        "how_are_you_note": p.HOW_ARE_YOU_NOTE,
+        "how_are_you_examples": list(p.HOW_ARE_YOU_EXAMPLES),
+        # SWEEP-6: her own number, total, monthly and already met.
+        "your_number_total_note": p.YOUR_NUMBER_TOTAL_NOTE,
+        "your_number_monthly_note": p.YOUR_NUMBER_MONTHLY_NOTE,
+        "your_number_met_note": p.YOUR_NUMBER_MET_NOTE,
+        "open_question_labels": {
+            topic: list(labels) for topic, labels in r1_scheduler.OPEN_QUESTION_LABELS.items()
+        },
+    }
+
+
+def _sim_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 1 (revision 26): the learner fixes' new texts and markers."""
+    p = r1_prompts
+    return {
+        # L5 (R1_ECHO_GUARD): the re-ask is shorter and in other words.
+        "ack_turn_notes_v2": [p.ACK_TURN_NOTE_V2, p.ACK_TURN_CONCERNS_NOTE_V2],
+        # L3 (R1_PRICE_ASKED_ONCE): the final price asked once, and the unclear counter's brief.
+        "final_asked_note": p.FINAL_ASKED_NOTE,
+        "unclear_counter_v3": {
+            "brief": r1_negotiation.UNCLEAR_COUNTER_V3.brief,
+            "variants": list(r1_negotiation.UNCLEAR_COUNTER_V3.variants),
+        },
+        # L7, U4 (2) (R1_NO_ACCEPT_NOTES).
+        "proposal_unanswered_note": p.PROPOSAL_UNANSWERED_NOTE,
+        "price_met_note_early_v2": p.PRICE_MET_NOTE_EARLY_V2,
+        # U1, U2 (R1_MARKERS_V2): the alternatives added to each marker group.
+        "extra_markers_v2": {
+            move_id: [list(group) for group in groups]
+            for move_id, groups in r1_scheduler.EXTRA_MARKERS_V2.items()
+        },
     }
 
 
@@ -749,6 +839,8 @@ def manifest() -> dict[str, Any]:
             "learner_voice_v2": _learner_voice_v2(sample),
             "probe_first": _probe_first(sample),
             "endings": _endings(),
+            "learner_followups": _learner_followups(sample),
+            "sim_repairs": _sim_repairs(),
         },
         "icebreaker": {
             "objectives": [

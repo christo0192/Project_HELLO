@@ -2753,6 +2753,7 @@ class R1Interview:
         # invitation (L-WRAP-MORE) was spoken, the candidate turns heard in the beat after L-EXIT,
         # and the affirmations ("Yes.", "Can I ask one more?") that did not count as a question.
         self._wrap_more_used = False
+        self._wrapup_questions_prepared = 0  # review S3R-6: wrap-up questions answered so far
         self._wrap_beat_turns = 0
         self._wrapup_affirmations = 0
         # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
@@ -5274,13 +5275,21 @@ class R1Interview:
         Once per session, only after a real question (not a refusal, a lead-in, her name alone or
         a bare yes) and only while ``WRAP_MORE_MIN_SECONDS`` of the wrap-up are left.
         """
+        if not flag_on(FLAG_WRAPUP_ANSWERS) or (
+            is_no_questions(text)
+            or is_lead_in_only(text)
+            or is_name_only(text)
+            or is_affirmation_only(text)
+        ):
+            return False
+        # Review S3R-6: never on the answer to the last question the wrap-up takes
+        # (``WRAPUP_QUESTION_LIMIT``): L-CLOSE follows it at once, so the invitation would go
+        # unanswered.  Counted here, where the answer is prepared, so a first answer cut before its
+        # tail (or one that already asked) cannot hand the invitation to the last one.
+        self._wrapup_questions_prepared += 1
         return (
-            flag_on(FLAG_WRAPUP_ANSWERS)
-            and not self._wrap_more_used
-            and not is_no_questions(text)
-            and not is_lead_in_only(text)
-            and not is_name_only(text)
-            and not is_affirmation_only(text)
+            not self._wrap_more_used
+            and self._wrapup_questions_prepared < WRAPUP_QUESTION_LIMIT
             and self.machine.remaining_wrapup_seconds() >= WRAP_MORE_MIN_SECONDS
         )
 
@@ -5411,15 +5420,13 @@ class R1Interview:
                 self._spawn(self._play_aside(plan))
             raise StopResponse()
         if plan.exit_roleplay:
-            if (
-                "end_confirmed" in plan.reasons
-                or "wrap_offer_accepted" in plan.reasons
-                or "end_request_late_exit" in plan.reasons
-            ):
+            if "end_confirmed" in plan.reasons or "wrap_offer_accepted" in plan.reasons:
                 # An out-of-role stop is said to the interviewer, not to the learner: like the
                 # turns of an aside it stays out of the learner's context (plan 5.10), and its
                 # transcript row is written as ``aside`` too (``prepare_turn``), so the API gate
-                # reads the same role-play turns as the engine's ``fidelity``.
+                # reads the same role-play turns as the engine's ``fidelity``.  Review S3R-4: the
+                # turn that answers her last point (``end_request_late_exit``) was said to her in
+                # role and stays a role-play row (evidence; the engine counts it too).
                 if entry is not None:
                     entry["phase"] = "aside"
                 self._candidate_row_phase = "aside"
@@ -5452,6 +5459,9 @@ class R1Interview:
             await self.say(prelude)
             if self._stop_outcome() is not None:
                 return
+        if prelude and self._engine is not None:
+            # Review S3R-5: from here a turn answers Christy's question (until now it waited).
+            self._engine.hangup_prelude_done()
         resume = self.machine.phase is R1Phase.ROLEPLAY
         if resume:
             self._enter(R1Phase.ASIDE)
@@ -5466,9 +5476,9 @@ class R1Interview:
             if resume:
                 self._close_coach_aside()
         if getattr(plan, "continuation", False):
-            self._speak_continuation()
+            self._speak_continuation(getattr(plan, "turn", None))
 
-    def _speak_continuation(self) -> None:
+    def _speak_continuation(self, aside_turn: int | None = None) -> None:
         """M032 S3.3 and SWEEP-24: the learner carries on right after the aside (one reply).
 
         Her line answers no new candidate turn: it is planned by the engine
@@ -5486,6 +5496,13 @@ class R1Interview:
             or self._roleplay_over()
         ):
             return
+        if (
+            aside_turn is not None and engine.turn != aside_turn
+        ) or self._open_replies:
+            # Review S3R-7: a turn said during the aside was planned and answered already (a reply
+            # is in flight): the resume line would be a second learner line in a row.
+            if engine.drop_resume_continuation():
+                return
         entry = next(
             (
                 item

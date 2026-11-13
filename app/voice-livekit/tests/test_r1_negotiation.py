@@ -3235,5 +3235,98 @@ class EmailOfferV2Tests(unittest.TestCase):
         self.assertEqual(negotiation.email_offers, [3])
 
 
+
+class HerNumberQuestionTests(unittest.TestCase):
+    """M032 SWEEP-6: the advisor asks what she could pay (total or monthly)."""
+
+    def test_the_questions_and_their_kind(self):
+        from r1_negotiation import her_number_question
+
+        for text, kind in (
+            ("Okay, what number works for you?", "total"),
+            ("What price would work for you?", "total"),
+            ("What's your budget?", "total"),
+            ("How much are you willing to pay?", "total"),
+            ("What could you pay each month?", "monthly"),
+            ("So what amount works for your monthly budget?", "monthly"),
+            ("What figure would work for your budget?", "total"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(her_number_question(text), kind)
+
+    def test_time_effort_and_check_ins_are_not(self):
+        from r1_negotiation import her_number_question
+
+        for text in (
+            "How much can you manage each week?",
+            "What number of hours works for you?",
+            "How much are you willing to put in?",
+            "Does that work for you?",
+            "The number that works for most people is six thousand.",
+            # Review S7L-R6/R4: a contact number, a callback, a count, someone else's figure.
+            "Great. What number works for you for the follow-up call?",
+            "And what number would work for you to call on?",
+            "What number of sessions works for you?",
+            "What figure would work for your manager?",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(her_number_question(text))
+
+    def test_the_corpus_and_long_turns(self):
+        import json
+        import time
+
+        from r1_negotiation import her_number_question
+
+        here = Path(__file__).resolve().parents[1]
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = here / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if her_number_question(text)]
+        self.assertEqual(hits, [])  # none in the corpus when written; any new hit is listed
+        for text in ("what number " * 600 + "works?", "how much can you " * 400, "x" * 4000):
+            started = time.perf_counter()
+            her_number_question(text)
+            self.assertLess(time.perf_counter() - started, 0.25)
+
+
+class PriceAskedOnceTests(unittest.TestCase):
+    """Simulation diagnosis 1, L3 (R1_PRICE_ASKED_ONCE): a challenged anchor is no unclear price."""
+
+    def _challenged(self) -> Negotiation:
+        state = neg.Negotiation("husband")
+        state.observe(3, "Pricing, yes, the price is $9000 and it runs for six months.", read_totals=True)
+        state.observe(5, "Who told you that? Can you name anyone who paid that?", anchor_turn=4,
+                      read_totals=True)
+        return state
+
+    def test_a_full_price_named_before_the_challenge_counts_as_held(self):
+        state = self._challenged()
+        self.assertEqual(state.price_situation(counter_v2=True), neg.SITUATION_UNCLEAR)
+        self.assertEqual(
+            state.price_situation(counter_v2=True, asked_once=True), neg.SITUATION_REFUSED
+        )
+
+    def test_a_tentative_answer_stays_unclear(self):
+        state = neg.Negotiation("husband")
+        state.observe(3, "The course costs $9000.", read_totals=True)
+        state.observe(5, "Yeah, we can see what we can do about that.", anchor_turn=4,
+                      read_totals=True)
+        self.assertEqual(
+            state.price_situation(counter_v2=True, asked_once=True), neg.SITUATION_UNCLEAR
+        )
+
+    def test_with_no_price_named_it_stays_unclear_and_the_brief_never_says_unclear(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "Who told you that?", anchor_turn=4, read_totals=True)
+        counter = state.counter_situation(counter_v2=True, asked_once=True)
+        self.assertEqual(counter.id, neg.SITUATION_UNCLEAR)
+        self.assertNotIn("clear", counter.brief)
+        self.assertIn("clear", state.counter_situation(counter_v2=True).brief)
+
+
 if __name__ == "__main__":
     unittest.main()

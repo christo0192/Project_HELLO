@@ -469,7 +469,9 @@ class HeldOutCorpusTests(unittest.TestCase):
 # means the reading is no longer production's.
 PRODUCTION_ENROL_PATTERNS_SHA256 = "e0be65282070c59f08fe49e43be7cb627167a9246ca68ba1df368ec389aae731"
 PRODUCTION_ENROL_COUNTS = {  # (tp, fp, fn)
-    "hand": (47, 23, 13),
+    # +9 tp: simulation diagnosis 1 review (c2006-c2014, a payment link handed over); production
+    # reads them too.
+    "hand": (56, 23, 13),
     "sim": (76, 13, 35),
     "heldout": (7, 3, 7),
 }

@@ -1042,5 +1042,96 @@ class EndingsReaderTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - start, 2.0)
 
 
+
+class CallOpeningReaderTests(unittest.TestCase):
+    """M032 SWEEP-9: who is calling, how she is, and her own who-is-this question."""
+
+    def test_caller_introduced(self):
+        from r1_text import CALLER_KNOWN, CALLER_NAME_ONLY, caller_introduced
+
+        for text, expected in (
+            ("Hey Alex, what's up?", ""),
+            ("Hi Alex, this is Sam, how are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, this is Sam from Interview Kick Start. How are you doing?", CALLER_KNOWN),
+            ("Hi, I'm calling about the form you filled in on our website.", CALLER_KNOWN),
+            ("Hi Alex, Interview Geek Start here.", CALLER_KNOWN),
+            ("Hello, this is IK.", CALLER_KNOWN),
+            ("Sam this side.", CALLER_NAME_ONLY),
+            ("Sam here, hi Alex.", CALLER_NAME_ONLY),
+            ("I'm reaching out about your interest in our courses.", CALLER_KNOWN),
+            ("Hi Alex, this is great.", ""),
+            ("Hello Alex, good morning!", ""),
+            ("Alex here?", ""),
+            # Review S7L-R1 (SWEEP-9): the commonest self-introductions.
+            ("Hello Alex, my name is Rahul.", CALLER_NAME_ONLY),
+            ("Hi Alex, my name is Sam. How are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, I'm Neha.", CALLER_NAME_ONLY),
+            ("Hi Alex, I'm Sam. How are you doing?", CALLER_NAME_ONLY),
+            ("Hey Alex, good evening, I am Rahul.", CALLER_NAME_ONLY),
+            ("Hello Alex, myself Sam. How are you?", CALLER_NAME_ONLY),
+            ("Hi, it's Neha.", CALLER_NAME_ONLY),
+            ("Hi Alex, Rahul calling.", CALLER_NAME_ONLY),
+            ("Priya speaking.", CALLER_NAME_ONLY),
+            ("I am Priya and I'm a senior advisor.", CALLER_NAME_ONLY),
+            ("hi alex this is priya", CALLER_NAME_ONLY),
+            ("hello, my name is priya, how are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, this is Sam from Interview Kick-start.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from Interview Kickstarter.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from ik.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from Upgrade Academy.", CALLER_KNOWN),
+            ("Hi Alex, it's Alex?", ""),
+            ("Hi Alex, it's Monday.", ""),
+            ("Hi Alex, this is fine.", ""),
+            ("Hi Alex, I'm Fine.", ""),
+            ("I myself am not sure.", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(caller_introduced(text, names=("Alex",)), expected)
+
+    def test_asks_how_she_is(self):
+        from r1_text import asks_how_she_is
+
+        self.assertTrue(asks_how_she_is("Hi Alex, how are you doing?"))
+        self.assertTrue(asks_how_she_is("How's your day going so far?"))
+        for text in (
+            "Hi Alex, how are you doing with your studies?",
+            "How are you planning to pay for it?",
+            "How are you finding the course material?",
+            "Hey Alex, what's up?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(asks_how_she_is(text))
+
+    def test_asked_who_is_calling(self):
+        from r1_text import asked_who_is_calling
+
+        for text in ("Sorry, who's this?", "Sorry, who am I speaking with?", "Hi, who's calling?",
+                     "Sorry, which company is this?", "Sorry, where are you calling from?"):
+            with self.subTest(text=text):
+                self.assertTrue(asked_who_is_calling(text))
+        self.assertFalse(asked_who_is_calling("I'm good, thanks. And you?"))
+
+    def test_the_corpus_greetings_and_long_turns(self):
+        import json
+        import time
+
+        from r1_text import asks_how_she_is, caller_introduced
+
+        here = Path(__file__).resolve().parents[1]
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = here / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if asks_how_she_is(text)]
+        self.assertTrue(hits)
+        for text in hits:  # greetings only: each one opens the call
+            self.assertRegex(text, r"^(?:Hi|Hello|Hey)\b")
+        for text in ("this is " * 800, "Sam here " * 400, "how are you " * 300, "I'm " * 1000):
+            started = time.perf_counter()
+            caller_introduced(text[:4000], names=("Alex",))
+            asks_how_she_is(text[:4000])
+            self.assertLess(time.perf_counter() - started, 0.25)
+
 if __name__ == "__main__":
     unittest.main()

@@ -4309,9 +4309,20 @@ class TestWrapupEndingsM032(R1TestCase):
         self.enter_wrapup()
         asked = await self.answered("What is the role like?", "It is a sales role. Does that help?")
         self.assertEqual(asked, "It is a sales role. Does that help?")
-        self.assertFalse(self.interview._wrap_more_used)  # not used up: the next answer gets it
+        self.assertFalse(self.interview._wrap_more_used)  # not used up
+        # Review S3R-6: but the next answer is the last the wrap-up takes (L-CLOSE follows it at
+        # once), so it never invites a question nobody would answer.
         later = await self.answered("Yes. And the shift?", "Nights, Monday to Friday.")
-        self.assertTrue(later.endswith(self.MORE))
+        self.assertEqual(later, "Nights, Monday to Friday.")
+        self.assertFalse(self.interview._wrap_more_used)
+
+    async def test_an_answer_cut_before_its_tail_hands_no_invitation_to_the_last_one(self) -> None:
+        """Review S3R-6: Q1's answer is cut before its first sentence by the follow-up."""
+        self.enter_wrapup()
+        self.interview.prepare_turn("What is the role like?", f"msg_{next(_IDS)}")  # never heard
+        last = await self.answered("And the shift?", "Nights, Monday to Friday.")
+        self.assertEqual(last, "Nights, Monday to Friday.")
+        self.assertFalse(self.interview._wrap_more_used)
 
     async def test_no_invitation_late_in_the_wrapup_or_with_the_flag_off(self) -> None:
         self.enter_wrapup()
@@ -5523,7 +5534,7 @@ class TestInterruptedLearnerRowKeepsOnlyWhatWasHeard(R1TestCase):
             [(r["speaker"], r["interrupted"]) for r in rows[-2:]],
             [("bot", True), ("candidate", False)],
         )
-        from r1_prompts import INTERRUPTED_NOTE
+        from r1_prompts import INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         self.assertIn(INTERRUPTED_NOTE, self.interview._last_reply.plan.reminder)
 
@@ -5580,7 +5591,7 @@ class TestInterruptedLearnerRowKeepsOnlyWhatWasHeard(R1TestCase):
                 self.assertIn("backchannel_continuation", plan.reasons)
 
     async def test_a_denial_or_a_yes_that_cut_her_is_answered_first(self) -> None:
-        from r1_prompts import BACKCHANNEL_CUT_NOTE, INTERRUPTED_NOTE
+        from r1_prompts import BACKCHANNEL_CUT_NOTE, INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         for text in ("No, no, no.", "Yes.", "Really?"):
             with self.subTest(text=text):
