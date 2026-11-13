@@ -2287,6 +2287,20 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   no plan words ("before I pitch", "in the role play I ..."): "I will be clear about the fees" and
   "I'd like to understand her needs first" are the candidate's plan, answered by the model.
 
+**Live simulation fixes (diagnosis 2, same flag, content revision 26):**
+
+* **D2-BR1**: "these", "those" and "your" name the brief like "this/the/that" do, so "Could you give
+  me those instructions in, like, just 4 lines?" gets the recap and "Can you repeat your
+  instructions?" the replay ("What are the instructions for the first day of the job?" is still a
+  job question). The transition note says a request for the instructions, the brief or the
+  scenario means the role-play brief, never the model's own rules, and is never refused.
+* **D2-IB1**: "put it to me again", "pose that question to me again" and "go back to ... and ask me
+  that" ask for her question again. Right after a repeat, a turn that turns it down ("No, I mean the
+  question before last", "Not that one, the other one") is another repeat request, never the answer
+  to her question; when it asks for the question just given, it gets the one before it ("Sure, the
+  one before that: ..."), or, with none older kept, "That one was: ...". A plain "No, not really,
+  ..." still answers her question. `TRANSITION_IB_REPEAT_LIMIT` stays 2.
+
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 
 Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the
