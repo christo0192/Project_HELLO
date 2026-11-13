@@ -212,6 +212,7 @@ from r1_end_intent import (
 )
 from r1_guard import FALLBACK_REPLY, StreamGuard, guard_story_echo_enabled
 from r1_icebreaker import (
+    ANSWERED,
     BRIDGE_NOTE,
     BRIDGE_TIMEOUT_SEC,
     FREE_RESTATE,
@@ -225,6 +226,7 @@ from r1_icebreaker import (
     IcebreakerPlan,
     bridge_wanted,
     clean_bridge,
+    disposition,
     ib_reask_v2_enabled,
     icebreaker_plan_enabled,
     icebreaker_repair_enabled,
@@ -780,6 +782,10 @@ _TRANSITION_ANSWER = "answer"
 _TRANSITION_RECAP = "recap"
 _TRANSITION_PRESENCE = "presence"
 _TRANSITION_REASK = "reask"
+# Review of diagnosis 3 (D3-BRIEF1-REASK-ROTATION): a bare yes or no to a question Christy's own
+# answer ended with, past the answer limit, gets L-TRANSITION-REASK itself (a yes/no start
+# question, so the next bare "Yes." consents), never a line of the brief requests' rotation.
+_TRANSITION_REASK_YES_NO = "reask_yes_no"
 # M032 live simulation, diagnosis 1 (BR-2, R1_TRANSITION_REPAIR): a request to hear one of Christy's
 # icebreaker questions again gets "Of course. {question}" (scripted, no model call), at most
 # ``TRANSITION_IB_REPEAT_LIMIT`` times; the answer to it is the model's, with a start question.
@@ -810,11 +816,16 @@ _BRIEF_LINES = frozenset(
 )
 # D3-ICE1 (R1_REACTION_VARIETY): the first brief's thanks, one per session, picked by its seed.
 _THANKED_BRIEFS = ("L-TRANSITION-THANKS-A", "L-TRANSITION-THANKS-B", "L-TRANSITION-THANKS-C")
+# Review of diagnosis 3 (D3-ICE1-THANKS-CONTEXT): B thanks them "for walking me through that", so it
+# needs a real last answer; A ("Thanks, {first_name}.") takes its place otherwise.
+_THANKS_AFTER_ANSWER = "L-TRANSITION-THANKS-B"
+_THANKS_NEUTRAL = "L-TRANSITION-THANKS-A"
 # D3-BRIEF1 (R1_BRIEF_VARIETY): the recaps in the order they are played, and the start prompts a
 # brief request past every budget gets, each said at most once while another is unheard.
 _RECAP_LINES = ("L-TRANSITION-RECAP", "L-TRANSITION-RECAP-2")
-_REASK_ROTATION = ("L-TRANSITION-REASK", "L-TRANSITION-REASK-2", "L-TRANSITION-NUDGE")
-_PRESENCE_REASKS = ("L-TRANSITION-REASK", "L-TRANSITION-NUDGE")
+# Review of diagnosis 3 (D3-BRIEF1-REASK-ROTATION): never L-TRANSITION-REASK-2 ("I'm still here
+# whenever you're ready."), which answers a silence, in reply to anything the candidate said.
+_REASK_ROTATION = ("L-TRANSITION-REASK", "L-TRANSITION-NUDGE")
 # D3-BRIEF1: "Are you there?" this soon after a start question finished playing gets "Yes, I'm
 # here." and L-TRANSITION-TAKE-TIME, never the start question again (int-live-3 M01: the reask
 # followed the recap's own start question by 20 s).
@@ -1481,6 +1492,11 @@ def _ib_repair_view(text: str) -> str:
 _IB_QUIET_WORDS = _ACK_WORDS | _IB_ADDRESS_WORDS | frozenset(
     {"yes", "fine", "great", "cool", "perfect", "please", "sorry", "thanks", "thank", "you", "so",
      "much", "very", "sure"}
+)
+# Review of diagnosis 3 (D3-IB-REASK1-QUIET-YESNO): a turn with any of these can answer Christy's
+# open question ("No." = none, "Good." to "How's your day going?"), so it is never a quiet turn.
+_IB_OPEN_ANSWER_WORDS = frozenset(
+    {"yes", "no", "nope", "nah", "great", "good", "fine", "cool", "perfect"}
 )
 
 
@@ -3169,6 +3185,10 @@ class R1Interview:
         # full and no turn has answered it yet; when it finished (``_clock``); and the question an
         # "Are you there?" already got "Yes, I'm here. Take your time." for (once per question).
         self._ib_question_open = False
+        # Review of diagnosis 3 (D3-ICE1-THANKS-CONTEXT): the candidate's last icebreaker turn was a
+        # real answer that no reply of Christy's came after (``_note_last_ib_answer``), so the
+        # brief may thank them "for walking me through that".
+        self._ib_last_answer_substantive = False
         self._ib_question_heard_at: float | None = None
         self._ib_presence_held: str | None = None
         self._icebreaker_boundary_kind: str | None = None
@@ -4374,9 +4394,15 @@ class R1Interview:
         """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on, and
         without M032 S6's lines while the transition repair is off, nor S7C's while theirs are,
         nor L-TRANSITION-ASK-PAUSE while ``R1_START_ASK_ONCE`` is.  D3-ICE1: L-TRANSITION is the
-        session's thanked brief while ``R1_REACTION_VARIETY`` picks one (``_thanked_brief_id``)."""
-        first = self._thanked_brief_id()
-        order = tuple(first if line_id == "L-TRANSITION" else line_id for line_id in _WARM_ORDER)
+        session's thanked brief while ``R1_REACTION_VARIETY`` picks one (``_seeded_thanks_id``),
+        with the neutral A beside a seeded B (D3-ICE1-THANKS-CONTEXT: B needs a real answer)."""
+        first = self._seeded_thanks_id()
+        firsts = (first, _THANKS_NEUTRAL) if first == _THANKS_AFTER_ANSWER else (first,)
+        order = tuple(
+            itertools.chain.from_iterable(
+                firsts if line_id == "L-TRANSITION" else (line_id,) for line_id in _WARM_ORDER
+            )
+        )
         dropped: set[str] = set()
         if not transition_repair_enabled():
             dropped |= _TRANSITION_REPAIR_LINES
@@ -4972,9 +4998,14 @@ class R1Interview:
         if after == "question":
             # D3-IB-REASK1 (int-live-3 M10: "Sorry, thank you." got the question again): a
             # backchannel to an open question, or a courtesy to a yes/no one ("Okay." or "Yes."
-            # can answer that), answers nothing, so it gets nothing.
+            # can answer that), answers nothing, so it gets nothing.  Review of diagnosis 3
+            # (D3-IB-REASK1-QUIET-YESNO): never a bare yes, no or verdict word ("No." to "Tell me
+            # about a time ..." means they have none; "Good." answers "How's your day going?").
             if is_closed_question(self._ib_last_question or ""):
                 return is_courtesy_turn(text)
+            words = fold_speech(text).split()
+            if any(word in _IB_OPEN_ANSWER_WORDS for word in words):
+                return False
             return is_backchannel_turn(text) or is_acknowledgement_turn(text)
         if after != "hold":
             if self._ib_repeat_closed:
@@ -5085,7 +5116,7 @@ class R1Interview:
             # start question is asked.
             if self._transition_answers < TRANSITION_QUESTION_LIMIT:
                 return _TRANSITION_ANSWER
-            return _TRANSITION_REASK
+            return _TRANSITION_REASK_YES_NO
         if (
             is_short_yes(text)
             and self._start_question == _EITHER_OR
@@ -5479,6 +5510,8 @@ class R1Interview:
             _log.info("unknown_event", error_type="r1_icebreaker_quiet_ack")
         elif text:
             self._count_icebreaker_answer(text, index)
+            if self.machine.phase is R1Phase.ICEBREAKER:
+                self._note_last_ib_answer(text)
             if not is_backchannel_turn(text):
                 # The candidate said something: their wait starts again from here.  A backchannel
                 # ("Sorry", "Thank you.") leaves the wait for the reply it cancelled running.
@@ -5686,6 +5719,16 @@ class R1Interview:
             return True
         return False
 
+    def _note_last_ib_answer(self, text: str | None) -> None:
+        """D3-ICE1-THANKS-CONTEXT: a committed icebreaker turn (``text``) or a reply of Christy's
+        after it (None): only a real answer (``r1_icebreaker.disposition`` ANSWERED: no decline,
+        nothing terse) that nothing of hers followed earns "Thanks for walking me through that"."""
+        if not text:
+            self._ib_last_answer_substantive = False
+            return
+        reading = disposition(text, content_words=content_word_count(text))
+        self._ib_last_answer_substantive = reading.kind == ANSWERED
+
     def _note_ib_question(self, question: str | None, interrupted: bool) -> None:
         """D3-IB-REASK1: her icebreaker line just finished: it opens a question when it asked one
         and was heard in full (``_ib_question_open``, ``_ib_question_heard_at``)."""
@@ -5726,8 +5769,10 @@ class R1Interview:
         """D3-IB-REASK1 (``R1_IB_REASK_V2``): a request to hear her question again, before the
         soft exit, gets that question word for word ("Of course. {question}", scripted), never the
         model's paraphrase of the plan's objective (int-live-3 M03: "Of course. I was asking what a
-        typical day ... looks like", a question asked two turns earlier).  The plan's hold is kept,
-        so it still counts as the one re-ask."""
+        typical day ... looks like", a question asked two turns earlier).  Review of diagnosis 3
+        (D3-IB-REASK1-SECOND-REPEAT): such a request does not use up the plan's one hold
+        (``REASK_V2_MAX_REPEATS`` of them per question), so a second one is answered the same
+        way."""
         job = reply.job
         question = self._ib_last_question
         if (
@@ -5901,7 +5946,16 @@ class R1Interview:
         carried, self._icebreaker_carry = self._icebreaker_carry, ""
         self._icebreaker_carry_entry = None
         judged = f"{carried} {text}" if carried else text
-        job = self._icebreaker_plan.next_job(judged, content_words=content_word_count(judged))
+        # Review of diagnosis 3 (D3-IB-REASK1-SECOND-REPEAT): a request to hear her question again
+        # does not use up the one re-ask (``_ib_literal_repeat`` then says it word for word).
+        repeat_asked = (
+            ib_reask_v2_enabled()
+            and self.machine.phase is R1Phase.ICEBREAKER
+            and self._ib_repeat_asked(text)
+        )
+        job = self._icebreaker_plan.next_job(
+            judged, content_words=content_word_count(judged), repeat_asked=repeat_asked
+        )
         reply.job = job
         reply.note = job.note
         reply.scripted = job.scripted
@@ -5999,6 +6053,8 @@ class R1Interview:
             _log.info("unknown_event", error_type="r1_transition_presence")
         elif action == _TRANSITION_REASK:
             line_ids = (self._reask_line(),)
+        elif action == _TRANSITION_REASK_YES_NO:
+            line_ids = ("L-TRANSITION-REASK",)
         elif action == _TRANSITION_RECAP:
             self._latch_brief(_TRANSITION_RECAP, index)
             return
@@ -6043,18 +6099,20 @@ class R1Interview:
                 return ("L-PRESENT",)
             return ("L-PRESENT", "L-TRANSITION-TAKE-TIME")
         # After "Yes, I'm here." never "I'm still here whenever you're ready." (REASK-2).
-        return ("L-PRESENT", self._reask_line(rotation=_PRESENCE_REASKS))
+        return ("L-PRESENT", self._reask_line())
 
-    def _reask_line(self, rotation: tuple[str, ...] = _REASK_ROTATION) -> str:
+    def _reask_line(self) -> str:
         """The yes/no start question a brief request past every budget (or a presence check) gets.
 
-        L-TRANSITION-REASK as before; with ``R1_BRIEF_VARIETY`` on, the first of ``rotation`` the
-        candidate has not heard in this transition, else the one heard longest ago, so no request
-        gets the line it just got (D3-BRIEF1).
+        L-TRANSITION-REASK as before; with ``R1_BRIEF_VARIETY`` on, the first of
+        ``_REASK_ROTATION`` the candidate has not heard in this transition, else the one heard
+        longest ago, so no request gets the line it just got (D3-BRIEF1).  Never REASK-2, a silence
+        line (review of diagnosis 3, D3-BRIEF1-REASK-ROTATION).
         """
         if not brief_variety_enabled():
             return "L-TRANSITION-REASK"
         said = self._transition_said
+        rotation = _REASK_ROTATION
         for line_id in rotation:
             if line_id not in said:
                 return line_id
@@ -6628,8 +6686,10 @@ class R1Interview:
             # D3-ICE1: the summary trim, and her last reply's opener for the same-shape check.
             changes["reaction_check"] = True
             changes["previous_opening"] = self._previous_interviewer_opening()
-        if guard_story_echo_enabled():
+        if guard_story_echo_enabled() and reply.phase in ("opening", "icebreaker"):
             # D3-GUARD-IB1: the turn this reply answers, for the story echo and the deflection.
+            # Review of diagnosis 3 (D3-GUARD-IB1-LEAK): the small talk only; in the transition and
+            # the wrap-up a pay, offer or timeline sentence is always deflected, as before.
             changes["story_echo"] = True
             changes["candidate_text"] = reply.candidate_text or ""
         return _dataclass_replace(ctx, **changes) if changes else ctx
@@ -7622,6 +7682,8 @@ class R1Interview:
                 and slot.source == "generate_reply"
                 and not slot.cut_by_r1
             )
+            if slot is not None and slot.source == "generate_reply" and phase == "icebreaker":
+                self._note_last_ib_answer(None)  # D3-ICE1-THANKS-CONTEXT: she replied to it
             if (
                 slot is not None
                 and slot.source == "generate_reply"
@@ -9015,13 +9077,23 @@ class R1Interview:
             return "L-TRANSITION-AGAIN" if transition_repair_enabled() else self._brief_line
         return _BRIDGED_BRIEF if bridged else self._thanked_brief_id()
 
-    def _thanked_brief_id(self) -> str:
-        """The first brief's id: L-TRANSITION, or (D3-ICE1, ``R1_REACTION_VARIETY`` with the
+    def _seeded_thanks_id(self) -> str:
+        """The session's thanked brief: L-TRANSITION, or (D3-ICE1, ``R1_REACTION_VARIETY`` with the
         transition repair) one of ``_THANKED_BRIEFS``, the same for the whole session (its seed),
-        so the warm-up synthesises exactly the one that plays."""
+        so the warm-up synthesises the one that plays."""
         if not (self._reaction_variety and transition_repair_enabled()):
             return "L-TRANSITION"
         return pick_variant(_THANKED_BRIEFS, self._seed(), 0)
+
+    def _thanked_brief_id(self) -> str:
+        """The first brief's id, when it plays: the seeded one (``_seeded_thanks_id``), except that
+        "Thanks for walking me through that" (B) needs a real last answer (review of diagnosis 3,
+        D3-ICE1-THANKS-CONTEXT: not after a decline, a terse turn or a time cap on her own
+        question); otherwise the neutral A, warmed beside B."""
+        seeded = self._seeded_thanks_id()
+        if seeded == _THANKS_AFTER_ANSWER and not self._ib_last_answer_substantive:
+            return _THANKS_NEUTRAL
+        return seeded
 
     async def _wait_for_candidate_turn(self, limit: float) -> None:
         """Wait, at most ``limit`` seconds, while the candidate is mid-turn (speaking, or a final

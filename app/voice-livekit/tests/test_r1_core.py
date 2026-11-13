@@ -504,6 +504,11 @@ class R1TestCase(unittest.IsolatedAsyncioTestCase):
         """
         interview = R1Interview(self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer)
         if line_id == "L-TRANSITION":
+            # D3-ICE1-THANKS-CONTEXT: the seeded B needs the case's own real last answer.
+            live = getattr(self, "interview", None)
+            interview._ib_last_answer_substantive = bool(
+                getattr(live, "_ib_last_answer_substantive", False)
+            )
             line_id = interview._thanked_brief_id()
         return interview.render_line(line_id)
 
@@ -9511,7 +9516,9 @@ class TestBriefRepairOnRequest(R1TestCase):
         # Past the answer limit the yes/no start question is asked instead.
         self.interview._start_question = None
         self.interview._transition_answers = r1_session.TRANSITION_QUESTION_LIMIT
-        self.assertEqual(self.interview._transition_action("Yes."), r1_session._TRANSITION_REASK)
+        self.assertEqual(
+            self.interview._transition_action("Yes."), r1_session._TRANSITION_REASK_YES_NO
+        )
 
     async def test_the_button_while_the_brief_is_on_its_way_or_her_answer_plays(self) -> None:
         # Review of S6: "Yes, I'm here." and the bridge's compose come before the brief, and her
@@ -12403,16 +12410,42 @@ class TestBriefVariety(R1TestCase):
         await self.heard("L-TRANSITION-RECAP")
         self.assertTrue(await self.answer(request))
         await self.heard("L-TRANSITION-RECAP-2")
-        for line_id in ("L-TRANSITION-REASK", "L-TRANSITION-REASK-2", "L-TRANSITION-NUDGE"):
+        # Review of diagnosis 3 (D3-BRIEF1-REASK-ROTATION): never "I'm still here whenever you're
+        # ready." (REASK-2, a silence line) in reply to something the candidate just said.
+        for line_id in ("L-TRANSITION-REASK", "L-TRANSITION-NUDGE"):
             self.assertTrue(await self.answer(request))
             await self.heard(line_id)
         self.assertTrue(await self.answer(request))  # all heard: the one heard longest ago
         await self.heard("L-TRANSITION-REASK", times=2)
         spoken = self.session.spoken
         self.assertTrue(all(a != b for a, b in zip(spoken, spoken[1:])))
-        self.assertEqual(len(set(spoken[:6])), 6)
+        self.assertEqual(len(set(spoken[:5])), 5)
+        self.assertEqual(self.count("L-TRANSITION-REASK-2"), 0)
         self.final_transcript("ready")
         self.assertIsNone(await asyncio.wait_for(task, 10.0))
+
+    async def test_a_yes_to_her_own_question_gets_the_yes_no_start_question(self) -> None:
+        # Review of diagnosis 3 (D3-BRIEF1-REASK-ROTATION): the silence ladder already played the
+        # reask; her answer then ended with a question of its own, past the answer limit.  "Yes."
+        # to it gets the yes/no start question again (never REASK-2 or the nudge, after which a
+        # bare "Yes." is no consent), and the next "Yes." starts the role-play.
+        task = await self.start_transition()
+        self.interview._transition_said.append("L-TRANSITION-REASK")
+        self.interview._start_question = None
+        self.interview._last_answer_tailless = True
+        self.interview._last_transition_line = "reply"
+        self.interview._transition_answers = r1_session.TRANSITION_QUESTION_LIMIT
+        self.agent_state("listening")
+        self.assertEqual(
+            self.interview._transition_action("Yes."), r1_session._TRANSITION_REASK_YES_NO
+        )
+        self.assertTrue(await self.answer("Yes."))
+        await self.heard("L-TRANSITION-REASK")
+        self.assertEqual(self.count("L-TRANSITION-REASK-2"), 0)
+        self.assertEqual(self.count("L-TRANSITION-NUDGE"), 0)
+        self.final_transcript("Yes.")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertTrue(self.interview._transition_consented or self.interview._ready_latched)
 
     async def test_a_presence_check_long_after_the_start_question_gets_it_again(self) -> None:
         task = await self.start_transition()

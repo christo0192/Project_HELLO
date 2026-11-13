@@ -2963,6 +2963,44 @@ class TestStoryEchoIsNoPayClaim(unittest.TestCase):
                 result = guard_text("The salary is three lakh.", self.story_ctx(phase, told))
                 self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
 
+    def test_a_claim_about_the_role_is_never_their_story(self) -> None:
+        # Review of diagnosis 3 (D3-GUARD-IB1-LEAK): the figure is theirs, the claim is not.
+        for text in (
+            "The role pays three lakh.",
+            "This role can offer three lakh.",
+            "You'll earn three lakh here.",
+            "It pays three lakh a year.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.echoes_candidate_story(text, self.STORY))
+                result = guard_text(text, self.story_ctx())
+                self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+                self.assertNotIn("three lakh", result.text.lower())
+
+    def test_a_bare_number_word_is_no_story_figure(self) -> None:
+        told = "I have one more round with another company."
+        for text in ("We'll make an offer in one week.", "You'll hear back in one week."):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.echoes_candidate_story(text, told))
+                result = guard_text(text, self.story_ctx(told=told))
+                self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+                self.assertNotIn("one week", result.text)
+
+    def test_the_echo_exemption_is_only_in_the_small_talk(self) -> None:
+        # The session sets story_echo in every interviewer phase only through a mistake; the guard
+        # itself honours it in the opening and the icebreaker alone.
+        for phase, told, text in (
+            ("transition", "My expected CTC is seven lakh.", "This role can offer seven lakh."),
+            ("transition", "My last CTC was seven lakh.", "Seven lakh, okay."),
+            ("wrapup", "I have one more round with another company.",
+             "We'll make an offer in one week."),
+            ("wrapup", "I have one more round with another company.",
+             "You'll hear back in one week."),
+        ):
+            with self.subTest(phase=phase, text=text):
+                result = guard_text(text, self.story_ctx(phase, told))
+                self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
     def test_the_rollback_flag(self) -> None:
         import os
         from unittest import mock

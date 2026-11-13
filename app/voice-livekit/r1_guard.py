@@ -1113,7 +1113,11 @@ def _interviewer_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     if (
         not question
         and _states_hiring_or_pay(sentence)
-        and not (ctx.story_echo and echoes_candidate_story(sentence, ctx.candidate_text))
+        and not (
+            ctx.story_echo
+            and ctx.phase in SMALL_TALK_PHASES
+            and echoes_candidate_story(sentence, ctx.candidate_text)
+        )
     ):
         hits.append(_hit(HIRING_COMP, "hiring_or_compensation", sentence))
     elif not question and _unapproved_role_fact(sentence):
@@ -1141,11 +1145,24 @@ def _states_hiring_or_pay(sentence: str) -> bool:
 # D3-GUARD-IB1 (int-live-3 mix t15): the candidate's own story ("around three lakh rupees, so my
 # manager approved a scholarship") echoed back tripped the pay rule, and the reply opened with
 # "That's a good question for the hiring team" to a turn that asked nothing.  The money figures and
-# the scholarship words an echo may carry; bounded quantifiers only.
+# the scholarship words an echo may carry; bounded quantifiers only.  Review of diagnosis 3
+# (D3-GUARD-IB1-LEAK): a number is a money figure only with a currency sign or a money unit, never
+# bare ("one more round" must not license "in one week").
+_STORY_NUMBER = (
+    r"(?:\d[\d,.]{0,12}|one|two|three|four|five|six|seven|eight|nine|ten|twenty|fifty|hundred|a)"
+)
 _STORY_TERM = _ci(
-    r"(?:\$\s?)?\b(?:\d[\d,.]{0,12}|one|two|three|four|five|six|seven|eight|nine|ten|twenty|fifty|"
-    r"hundred)(?: (?:lakhs?|lacs?|crores?|thousand|k|rupees|dollars))?\b",
+    r"(?:\$|\u20b9|\brs\.?|\binr)\s?\d[\d,.]{0,12}(?:\s?(?:lakhs?|lacs?|crores?|thousand|k)\b)?",
+    r"\b" + _STORY_NUMBER + r" (?:lakhs?|lacs?|crores?|thousand|rupees|dollars)\b",
+    r"\b\d[\d,.]{0,12}k\b",
     r"\b(?:lakhs?|lacs?|crores?|rupees?|inr|scholarships?)\b",
+)
+# A sentence about THIS role, the future or a rate of pay is never an echo of the candidate's
+# story, whatever figure it repeats ("The role pays three lakh.", "Three lakh a year here.").
+_NOT_THEIR_STORY = _ci(
+    r"\b(?:a|per|each|every) (?:year|month|annum)\b|\b(?:monthly|yearly|annually|annual)\b",
+    r"\bhere\b|\bin[- ]hand\b|\btake[- ]home\b|\bearns?\b|\bearning\b|\bpackage\b|\boffer\w*\b",
+    r"\byou (?:get|make|take)\b|\bpays?\b|\bpaying\b|\bctc\b|\bsalar(?:y|ies)\b",
 )
 # What an echo of the candidate's story is answered with when the sentence that went before the
 # question was dropped (the question alone after a story sounds abrupt).
@@ -1170,10 +1187,15 @@ def echoes_candidate_story(sentence: str, candidate_text: str) -> bool:
     own turn named (a turn that asked nothing: their story), and without them it states no hiring
     or pay fact (``_states_hiring_or_pay``).
     "Three lakh for one course." after "around three lakh rupees" is their story; "The role pays
-    three lakh." is not, and neither is a "salary" they never said."""
+    three lakh." is not, and neither is a "salary" they never said.  Review of diagnosis 3
+    (D3-GUARD-IB1-LEAK): a sentence with any cue that it is about the role, the future or a rate of
+    pay (``_ABOUT_THE_ROLE_OR_FUTURE``, ``_NOT_THEIR_STORY``) is never exempt, and a bare number
+    word is no figure (only a currency sign or a money unit makes one)."""
     if not candidate_text or _turn_asks(candidate_text):
         return False  # a figure they ASKED about is never echoed back unguarded
     folded = fold(sentence)
+    if _ABOUT_THE_ROLE_OR_FUTURE.search(folded) or _NOT_THEIR_STORY.search(folded):
+        return False
     terms = {normalize(match.group(0)) for match in _STORY_TERM.finditer(folded)}
     terms.discard("")
     if not terms:

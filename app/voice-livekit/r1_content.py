@@ -201,7 +201,11 @@ import r1_world
 #    a broad job question a one-sentence overview and says times the way people say them (only
 #    R1_TRANSITION_REPAIR=0 gives a note without it).  Every other text of revision 28 is unchanged
 #    and pinned beside the new ones (each flag off speaks it).
-CONTENT_REVISION = 29
+# 30: review of diagnosis 3 (Christy lane).  L-TRANSITION-THANKS-A is "Thanks, {first_name}." (no
+#    "that's helpful", a verdict on the answer; D3-ICE1-THANKS-CONTEXT), and the icebreaker repair
+#    pins REASK_V2_MAX_REPEATS (2: an explicit request to hear the question again does not use up
+#    the one re-ask; D3-IB-REASK1-SECOND-REPEAT).  No other pinned text changed.
+CONTENT_REVISION = 30
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -539,6 +543,8 @@ def manifest() -> dict[str, Any]:
                 "presence_hold": r1_icebreaker.IB_PRESENCE_HOLD,
                 "presence_hold_seconds": r1_icebreaker.IB_PRESENCE_HOLD_SECONDS,
                 "reask_v2_max_holds": r1_icebreaker.REASK_V2_MAX_HOLDS,
+                # Revision 30 (review of diagnosis 3, D3-IB-REASK1-SECOND-REPEAT).
+                "reask_v2_max_repeats": r1_icebreaker.REASK_V2_MAX_REPEATS,
             },
         },
         "end_intent": {

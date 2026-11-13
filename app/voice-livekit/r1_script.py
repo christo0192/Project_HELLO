@@ -106,7 +106,9 @@ LINES: dict[str, str] = {
     # of "Thank you, {first_name}." (int-live-3 M04, terse, M07: a flat "Thank you, Alex." right
     # after a long personal story read as robotic), picked by the session's seed.  Zero latency
     # (scripted and warmed per name, like L-TRANSITION); the body is the same shared brief.
-    "L-TRANSITION-THANKS-A": "Thanks, {first_name}, that's helpful. " + BRIEF_BODY,
+    # Review of diagnosis 3 (D3-ICE1-THANKS-CONTEXT): A is neutral (no "that's helpful", a verdict
+    # on the answer), and it takes B's place when the icebreaker did not end on a real answer.
+    "L-TRANSITION-THANKS-A": "Thanks, {first_name}. " + BRIEF_BODY,
     "L-TRANSITION-THANKS-B": (
         "Thanks for walking me through that, {first_name}. " + BRIEF_BODY
     ),

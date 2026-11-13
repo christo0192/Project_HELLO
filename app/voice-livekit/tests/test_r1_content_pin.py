@@ -159,7 +159,9 @@ import r1_world
 # take-time line (R1_BRIEF_VARIETY), the reworded react clause and the thanked briefs
 # (R1_REACTION_VARIETY), the presence hold (R1_IB_REASK_V2), "Got it." (R1_GUARD_STORY_ECHO) and the
 # broad job question line of the repaired transition note.
-PINNED_CONTENT_SHA256 = "7cd479e7417a7a20fec543e924b2167676d289b57dad4f1cabd78a14d64586d8"
+# Revision 30 (review of diagnosis 3, Christy lane): L-TRANSITION-THANKS-A without "that's helpful",
+# and the icebreaker repair's REASK_V2_MAX_REPEATS.
+PINNED_CONTENT_SHA256 = "a5a616eca589b3672b2d5000b8660d20b52b515902fa87cc91869e239a46fca7"
 
 CONTENT_MODULES = (
     "r1_text",

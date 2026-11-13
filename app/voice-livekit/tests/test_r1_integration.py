@@ -4805,7 +4805,42 @@ class TestIcebreakerReaskV2(unittest.IsolatedAsyncioTestCase):
             "to finish?",
         )
         self.assertEqual(len(rig.provider.calls), calls)  # scripted
-        self.assertEqual(rig.interview._last_reply.job.kind, "reask")  # the one re-ask, counted
+        self.assertEqual(rig.interview._last_reply.job.kind, "reask")  # a re-ask of that question
+
+    async def test_a_second_request_to_repeat_still_gets_the_question(self) -> None:
+        # Review of diagnosis 3 (D3-IB-REASK1-SECOND-REPEAT): a candidate on a bad line who asks
+        # twice hears the same question twice, never a different one.
+        rig = await self.rig(reply=IB_WALK_Q)
+        await rig.converse(IB_ANSWER)
+        calls = len(rig.provider.calls)
+        again = (
+            "Of course. Could you walk me through one recent conversation with a customer, start "
+            "to finish?"
+        )
+        self.assertEqual(await rig.converse("Sorry, could you repeat the question?"), again)
+        self.assertEqual(await rig.converse("Sorry, can you say that again?"), again)
+        self.assertEqual(rig.interview._last_reply.job.kind, "reask")
+        self.assertEqual(len(rig.provider.calls), calls)  # both scripted
+        # The one hold is still there for a turn that answers nothing.
+        await rig.converse("What do you mean?")
+        self.assertEqual(rig.interview._last_reply.job.kind, "reask")
+
+    async def test_a_bare_yes_or_no_to_her_open_question_is_answered(self) -> None:
+        # Review of diagnosis 3 (D3-IB-REASK1-QUIET-YESNO): "No." can be a real answer to an open
+        # question ("Tell me about a time ..."; they have none), so it is never met with silence.
+        # A courtesy or an acknowledgement still gets nothing.
+        for text in ("No.", "Yes.", "No no.", "Great.", "Good."):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                await rig.converse(IB_ANSWER)
+                calls = len(rig.provider.calls)
+                self.assertIsNotNone(await rig.converse(text))
+                self.assertEqual(len(rig.provider.calls), calls + 1)
+        for text in ("Sorry, thank you.", "Okay.", "Mm-hmm.", "Thank you so much."):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                await rig.converse(IB_ANSWER)
+                self.assertIsNone(await rig.converse(text))
 
     async def test_a_question_is_never_asked_a_third_time(self) -> None:
         rig = await self.rig()
@@ -4899,7 +4934,8 @@ class TestReactionVarietyWiring(unittest.IsolatedAsyncioTestCase):
         rig = Rig()
         name = rig.interview._first_name()
         texts = {line_id: rig.interview.render_line(line_id) for line_id in r1_session._THANKED_BRIEFS}
-        self.assertTrue(texts["L-TRANSITION-THANKS-A"].startswith(f"Thanks, {name}, that's helpful."))
+        # Review of diagnosis 3 (D3-ICE1-THANKS-CONTEXT): no "that's helpful" (a verdict).
+        self.assertTrue(texts["L-TRANSITION-THANKS-A"].startswith(f"Thanks, {name}. Next"))
         self.assertTrue(
             texts["L-TRANSITION-THANKS-B"].startswith(f"Thanks for walking me through that, {name}.")
         )
@@ -4907,10 +4943,62 @@ class TestReactionVarietyWiring(unittest.IsolatedAsyncioTestCase):
         body = r1_script.line("L-TRANSITION-BRIDGED", **rig.persona.line_values)
         for text in texts.values():
             self.assertTrue(text.endswith(body))
+            self.assertNotIn("helpful", text)
         self.assertEqual(
             r1_script.line("L-TRANSITION-THANKS-A", first_name="", **rig.persona.line_values),
-            "Thanks, that's helpful. " + body,
+            "Thanks. " + body,
         )
+
+    def seeded(self, line_id: str, **kwargs: object) -> Rig:
+        for n in range(60):
+            rig = Rig(context={**P1_CONTEXT, "attempt_id": f"thanks-{n}"}, **kwargs)
+            if rig.interview._seeded_thanks_id() == line_id:
+                return rig
+        self.fail(f"no attempt seeds {line_id}")
+
+    async def test_walking_me_through_that_only_after_a_real_answer(self) -> None:
+        # Review of diagnosis 3 (D3-ICE1-THANKS-CONTEXT): after a terse answer, a decline or an
+        # icebreaker the time cap ended on her own question, B's "Thanks for walking me through
+        # that" thanks for nothing, so the session's B is then the neutral A (warmed with it).
+        rig = self.seeded("L-TRANSITION-THANKS-B")
+        order = rig.interview._warm_order()
+        self.assertIn("L-TRANSITION-THANKS-B", order)
+        self.assertIn("L-TRANSITION-THANKS-A", order)
+        self.assertEqual(rig.interview._brief_line_id(), "L-TRANSITION-THANKS-A")  # no answer yet
+        for text, line_id in (
+            (IB_ANSWER, "L-TRANSITION-THANKS-B"),
+            ("I'd rather not say.", "L-TRANSITION-THANKS-A"),
+            ("Yes.", "L-TRANSITION-THANKS-A"),
+            (IB_LAST, "L-TRANSITION-THANKS-B"),
+        ):
+            with self.subTest(text=text):
+                rig.interview._note_last_ib_answer(text)
+                self.assertEqual(rig.interview._brief_line_id(), line_id)
+        rig.interview._note_last_ib_answer(None)  # her question came after it (the time cap)
+        self.assertEqual(rig.interview._brief_line_id(), "L-TRANSITION-THANKS-A")
+        for line_id in ("L-TRANSITION-THANKS-A", "L-TRANSITION-THANKS-C"):
+            with self.subTest(line_id=line_id):
+                other = self.seeded(line_id)
+                self.assertEqual(other.interview._brief_line_id(), line_id)  # always fitting
+                self.assertNotIn(
+                    "L-TRANSITION-THANKS-B", other.interview._warm_order()
+                )
+
+    async def test_the_last_icebreaker_answer_is_tracked_through_the_session(self) -> None:
+        rig = self.seeded("L-TRANSITION-THANKS-B", provider=TokenProvider(IB_QUESTION_REPLY))
+        await rig.interview.say("L-OPEN")
+        seen: list[tuple[object, bool]] = []
+        note = rig.interview._note_last_ib_answer
+
+        def record(text: object) -> None:
+            note(text)
+            seen.append((text, rig.interview._ib_last_answer_substantive))
+
+        rig.interview._note_last_ib_answer = record
+        await rig.converse(IB_ANSWER)  # answered by her next question: nothing left to thank for
+        self.assertEqual(seen[0], (IB_ANSWER, True))  # the answer itself was a real one
+        self.assertEqual(seen[-1], (None, False))  # and her reply came after it
+        self.assertFalse(rig.interview._ib_last_answer_substantive)
 
     async def test_with_the_flag_off_the_brief_is_thank_you_as_before(self) -> None:
         with _env(R1_REACTION_VARIETY="0"):
@@ -4940,3 +5028,18 @@ class TestStoryEchoWiring(unittest.IsolatedAsyncioTestCase):
             rig = Rig(provider=TokenProvider(self.ECHO))
             spoken = await rig.converse(self.STORY)
         self.assertTrue(spoken.startswith("That's a good question for the hiring team"))
+
+    async def test_only_the_small_talk_carries_the_story_echo(self) -> None:
+        # Review of diagnosis 3 (D3-GUARD-IB1-LEAK): in the transition and the wrap-up a pay, offer
+        # or timeline sentence is always the deflection, whatever the candidate said before it.
+        rig = Rig()
+        told = "My expected CTC is seven lakh."
+        for phase, echo in (
+            ("opening", True), ("icebreaker", True), ("transition", False), ("wrapup", False)
+        ):
+            with self.subTest(phase=phase):
+                ctx = rig.interview._interviewer_guard_context(
+                    Reply(phase=phase, candidate_text=told)
+                )
+                self.assertEqual(ctx.story_echo, echo)
+                self.assertEqual(ctx.candidate_text, told if echo else "")

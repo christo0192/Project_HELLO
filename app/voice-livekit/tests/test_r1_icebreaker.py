@@ -357,6 +357,55 @@ class TestPlan(unittest.TestCase):
                 self.assertEqual((moved.kind, moved.objective.id), (ib.JOB_ASK, "I3"))  # no loop
         self.assertEqual(ib.REASK_V2_MAX_HOLDS, 1)  # a question is never put a third time
 
+    def test_an_explicit_repeat_request_does_not_use_up_the_one_hold(self):
+        # Review of diagnosis 3 (D3-IB-REASK1-SECOND-REPEAT): a candidate on a bad line who asks
+        # twice to hear the question gets it twice; the one hold is still there for a turn that
+        # answers nothing, and the repeats are bounded too (no loop).
+        repeat = "Sorry, can you say that again?"
+        with mock.patch.dict(os.environ, {"R1_IB_REASK_V2": "1"}):
+            plan = ib.IcebreakerPlan()
+            job(plan, SUBSTANTIVE)
+            kinds = [
+                plan.next_job(repeat, content_words=0, repeat_asked=True).kind
+                for _ in range(ib.REASK_V2_MAX_REPEATS)
+            ]
+            self.assertEqual(kinds, [ib.JOB_REASK] * ib.REASK_V2_MAX_REPEATS)
+            held = job(plan, "What do you mean?", content_words=0)
+            self.assertEqual((held.kind, held.objective.id), (ib.JOB_REASK, "I2"))  # the hold
+            moved = plan.next_job(repeat, content_words=0, repeat_asked=True)
+            self.assertEqual((moved.kind, moved.objective.id), (ib.JOB_ASK, "I3"))
+            # Taken back with the rest of the plan's state when a reply is never heard.
+            plan = ib.IcebreakerPlan()
+            job(plan, SUBSTANTIVE)
+            lost = plan.next_job(repeat, content_words=0, repeat_asked=True)
+            self.assertTrue(plan.reply_lost(lost))
+            self.assertEqual(plan.repeats, {})
+        self.assertEqual(ib.REASK_V2_MAX_REPEATS, 2)
+
+    def test_with_the_flag_off_a_repeat_request_is_an_ordinary_hold(self):
+        with mock.patch.dict(os.environ, {"R1_IB_REASK_V2": "0"}):
+            plan = ib.IcebreakerPlan()
+            job(plan, SUBSTANTIVE)
+            kinds = [
+                plan.next_job("Sorry, again?", content_words=0, repeat_asked=True).kind
+                for _ in range(ib.MAX_HOLDS + 1)
+            ]
+        self.assertEqual(kinds, [ib.JOB_REASK] * ib.MAX_HOLDS + [ib.JOB_ASK])
+
+    def test_repeats_after_every_objective_are_bounded_as_well(self):
+        with mock.patch.dict(os.environ, {"R1_IB_REASK_V2": "1"}):
+            plan = ib.IcebreakerPlan()
+            while plan.current is not None:
+                job(plan, SUBSTANTIVE)
+            kinds = [
+                plan.next_job("Sorry, again?", content_words=0, repeat_asked=True).kind
+                for _ in range(ib.REASK_V2_MAX_REPEATS + ib.REASK_V2_MAX_HOLDS + 1)
+            ]
+        self.assertEqual(
+            kinds,
+            [ib.JOB_REASK] * (ib.REASK_V2_MAX_REPEATS + ib.REASK_V2_MAX_HOLDS) + [ib.JOB_FREE],
+        )
+
     def test_a_question_to_christy_is_answered_first_then_the_objective_again(self):
         plan = ib.IcebreakerPlan()
         job(plan, SUBSTANTIVE)
