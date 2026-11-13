@@ -981,6 +981,8 @@ _CURIOSITY_COVERED = {
         r"\bcareer (?:support|services|coach\w*)\b",
         r"\bjob (?:search|placement|assistance|support)\b",
         r"\bresume (?:review|reviews|building)\b|\bmock interviews?\b|\breferrals?\b",
+        # Review S7L-R3: "we have placement support for a full year".
+        r"\bplacements?\b|\binterview prep(?:aration)?\b",
     ),
     "weekly_hours": _compile(
         r"\bhours? (?:a|per|each|every) (?:week|day)\b",
@@ -1141,12 +1143,18 @@ _VAGUE = _compile(
     r"\b(?:it'?s|it is|that'?s|that is|timing is|the timing is|the schedule is|it'?s all) "
     r"(?:very |quite |pretty |completely |totally |really |super )?flexible\b",
     r"\bit (?:all )?(?:depends|varies)\b",
-    r"\b(?:don'?t|do not) worry about (?:that|it|this)\b",
-    r"\bwe'?ll (?:figure|sort|work) (?:it|that|something) out\b",
-    r"\b(?:that'?s|that is|it'?s|it is) (?:not|never) (?:a |an )?(?:problem|issue|concern)\b",
     r"\bwhatever (?:works|suits) (?:for )?you\b",
     r"\b(?:that'?s|that is|it'?s|it is) (?:very |quite |totally )?manageable\b",
 )
+# Review S7L-R3: a reassuring opener ("Don't worry about it, the recordings are always there") is
+# often followed by the real answer, so it counts as a dodge only when the turn says little else.
+_REASSURE = _compile(
+    r"\b(?:don'?t|do not) worry about (?:that|it|this)\b",
+    r"\bwe'?ll (?:figure|sort|work) (?:it|that|something) out\b",
+    r"\b(?:that'?s|that is|it'?s|it is) (?:not|never) (?:a |an )?(?:problem|issue|concern)"
+    r"(?: at all)?\b",
+)
+REASSURE_REST_MAX_WORDS = 8
 
 
 def open_question_topics(text: object, *, wide: bool = True) -> frozenset[str]:
@@ -1162,19 +1170,47 @@ def open_question_topics(text: object, *, wide: bool = True) -> frozenset[str]:
     return frozenset(found)
 
 
+# Review S7L-R3: what answers HER "what if I fall behind?" right after she asked it ("every class
+# is recorded so you can watch it later", "you can rewatch any session").  Wider than
+# ``_FALL_BEHIND_ANSWERED``, which a pitch must not trip ("classes are live and recorded").
+_FALL_BEHIND_COVERED = (
+    *_FALL_BEHIND_ANSWERED,
+    *_compile(
+        r"\bcatch[- ]up\b",
+        r"\brecord(?:ed|ing|ings)?\b",
+        r"\bre-?watch\b|\breplay(?:s|ed)?\b",
+        r"\bwatch (?:it|them|the (?:class|classes|session|sessions|recording|recordings)) "
+        r"(?:later|again|any ?time)\b",
+        r"\b(?:backup|back-up|extra|doubt(?:[- ]clearing)?) (?:class|classes|session|sessions)\b",
+    ),
+)
+
+
 def open_question_covered(topic: str, text: object) -> bool:
     """The advisor's ``text`` answers the open-question ``topic`` (``curiosity_covered``)."""
     if topic == "fall_behind":
         lowered = fold(text).lower()
-        return any(pattern.search(lowered) for pattern in _FALL_BEHIND_ANSWERED)
+        return any(pattern.search(lowered) for pattern in _FALL_BEHIND_COVERED)
     return curiosity_covered(topic, text)
 
 
 def defers_or_vague(text: object) -> bool:
-    """The advisor put her question off or answered it with nothing (SWEEP-7, counts only)."""
-    return any(
-        pattern.search(sentence) for sentence in _sentences(text) for pattern in (*_DEFERS, *_VAGUE)
-    )
+    """The advisor put her question off or answered it with nothing (SWEEP-7, counts only).
+
+    A reassurance ("that's not a problem") counts only when at most ``REASSURE_REST_MAX_WORDS``
+    words of the turn are not part of it (review S7L-R3)."""
+    sentences = _sentences(text)
+    if any(pattern.search(sentence) for sentence in sentences for pattern in (*_DEFERS, *_VAGUE)):
+        return True
+    for sentence in sentences:
+        for pattern in _REASSURE:
+            match = pattern.search(sentence)
+            if match is None:
+                continue
+            rest = word_count(text) - word_count(match.group(0))
+            if rest <= REASSURE_REST_MAX_WORDS:
+                return True
+    return False
 
 
 def dodged_question(text: object, topics: frozenset[str] | tuple[str, ...]) -> bool:
@@ -1586,15 +1622,32 @@ def offers_floor(text: object) -> bool:
 # from both ends, and what is left must be one of these forms IN FULL, so "Can I talk to your
 # husband?", "Let me explain the fee, it is nine thousand", a bare "Listen." and "Let me explain."
 # are never a request for the floor.
-_FLOOR_SOFTENERS = frozenset("sorry please just okay ok hey no".split())
+_FLOOR_SOFTENERS = frozenset("sorry please just okay ok hey no wait".split())
+# Review S7L-R2: "Hold on, let me finish.", "One second, let me finish.", "Just a second, ...".
+_FLOOR_SOFTENER_PAIRS = frozenset(
+    (
+        ("excuse", "me"),
+        ("hold", "on"),
+        ("hang", "on"),
+        ("one", "second"),
+        ("one", "sec"),
+        ("one", "minute"),
+        ("a", "second"),
+        ("a", "sec"),
+        ("a", "minute"),
+    )
+)
+# Review S7L-R2: "listen what I am saying" (speech-to-text drops the "to"), "let me complete my
+# point".
+_FLOOR_LISTEN = r"listen (?:to )?(?:me|what i(?:'m| am) saying)"
 _FLOOR_REQUEST = re.compile(
     r"(?:"
     r"(?:can|could|may) i (?:please )?(?:talk|speak|finish|complete|say something|explain)"
     r"(?: (?:first|now|please))?"
-    r"|let me (?:finish|complete|speak|talk)(?: (?:first|please))?"
-    r"|(?:can|could) you (?:please )?(?:just )?(?:listen to me|listen to what i(?:'m| am) saying"
-    r"|hear me out)(?: first)?"
-    r"|(?:please )?(?:just )?(?:listen to me|hear me out)(?: first)?"
+    r"|let me (?:finish|complete|speak|talk)(?: (?:my point|my thought|this|what i(?:'m| am) "
+    r"saying))?(?: (?:first|please))?"
+    rf"|(?:can|could) you (?:please )?(?:just )?(?:{_FLOOR_LISTEN}|hear me out)(?: first)?"
+    rf"|(?:please )?(?:just )?(?:{_FLOOR_LISTEN}|hear me out)(?: first)?"
     r")"
 )
 FLOOR_REQUEST_MAX_WORDS = 12
@@ -1618,14 +1671,14 @@ def asks_for_floor(text: object, names: tuple[str, ...] = ()) -> bool:
     while start < end:
         if words[start] in soft:
             start += 1
-        elif words[start] == "excuse" and start + 1 < end and words[start + 1] == "me":
+        elif start + 1 < end and (words[start], words[start + 1]) in _FLOOR_SOFTENER_PAIRS:
             start += 2
         else:
             break
     while end > start:
         if words[end - 1] in soft:
             end -= 1
-        elif words[end - 1] == "me" and end - 2 >= start and words[end - 2] == "excuse":
+        elif end - 2 >= start and (words[end - 2], words[end - 1]) in _FLOOR_SOFTENER_PAIRS:
             end -= 2
         else:
             break

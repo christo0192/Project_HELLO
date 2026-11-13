@@ -3074,6 +3074,12 @@ class PriceAcceptedTests(unittest.TestCase):
             "I won't take that price, honestly.",
             "I don't think I'll take that price.",
             "Should I just say I'll take the price?",
+            # Review S7L-R5: taking it to the decision maker is the opposite of accepting it.
+            "I'll take the figure back to Rohan before I decide anything.",
+            "Let me think, I'll take that price to my manager for sponsorship.",
+            "Okay, I'll take that number to my husband and we'll talk tonight.",
+            "I'll take that number home and think it over.",
+            "I'll take the price into account.",
         ):
             with self.subTest(text=text):
                 rules = {hit.rule for hit in guard_text(text, ctx(price_memory=True)).hits}

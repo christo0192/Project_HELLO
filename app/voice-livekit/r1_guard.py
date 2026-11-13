@@ -1400,10 +1400,13 @@ def _reopens(sentence: str) -> bool:
 
 
 # M032 SWEEP-6: she says she will take the price ("so it's fine, I'll take the price as it
-# stands").  Not "I'll take the price list home", not a negated or questioned one.
+# stands").  Not "I'll take the price list home", not a negated or questioned one, and not taking
+# it somewhere ("I'll take that number to my husband", "I'll take the figure back to Rohan": the
+# decision-maker talk of review S7L-R5).
 _PRICE_ACCEPTED = re.compile(
     r"\bi'?ll (?:take|accept|go with|pay) (?:the|that|your|this) "
-    r"(?:price|number|figure|amount|rate)\b(?!\s*(?:list|sheet|breakdown|details))",
+    r"(?:price|number|figure|amount|rate)\b(?!\s*(?:list|sheet|breakdown|details|back|home|to|"
+    r"with|by|into|in|down|away|over|up|and (?:think|talk|discuss|check|run|chat|share))\b)",
     re.IGNORECASE,
 )
 

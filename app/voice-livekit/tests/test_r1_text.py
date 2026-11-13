@@ -1062,6 +1062,28 @@ class CallOpeningReaderTests(unittest.TestCase):
             ("Hi Alex, this is great.", ""),
             ("Hello Alex, good morning!", ""),
             ("Alex here?", ""),
+            # Review S7L-R1 (SWEEP-9): the commonest self-introductions.
+            ("Hello Alex, my name is Rahul.", CALLER_NAME_ONLY),
+            ("Hi Alex, my name is Sam. How are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, I'm Neha.", CALLER_NAME_ONLY),
+            ("Hi Alex, I'm Sam. How are you doing?", CALLER_NAME_ONLY),
+            ("Hey Alex, good evening, I am Rahul.", CALLER_NAME_ONLY),
+            ("Hello Alex, myself Sam. How are you?", CALLER_NAME_ONLY),
+            ("Hi, it's Neha.", CALLER_NAME_ONLY),
+            ("Hi Alex, Rahul calling.", CALLER_NAME_ONLY),
+            ("Priya speaking.", CALLER_NAME_ONLY),
+            ("I am Priya and I'm a senior advisor.", CALLER_NAME_ONLY),
+            ("hi alex this is priya", CALLER_NAME_ONLY),
+            ("hello, my name is priya, how are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, this is Sam from Interview Kick-start.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from Interview Kickstarter.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from ik.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from Upgrade Academy.", CALLER_KNOWN),
+            ("Hi Alex, it's Alex?", ""),
+            ("Hi Alex, it's Monday.", ""),
+            ("Hi Alex, this is fine.", ""),
+            ("Hi Alex, I'm Fine.", ""),
+            ("I myself am not sure.", ""),
         ):
             with self.subTest(text=text):
                 self.assertEqual(caller_introduced(text, names=("Alex",)), expected)

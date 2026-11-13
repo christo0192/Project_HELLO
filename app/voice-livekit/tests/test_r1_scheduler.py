@@ -2245,8 +2245,20 @@ class FloorRequestTests(unittest.TestCase):
         "Meera, could I please speak?",
         "Excuse me, can I finish?",
         "No no, hear me out.",
+        # Review S7L-R2: the cited turn as speech-to-text wrote it, and everyday forms.
+        "Can you listen what I am saying first?",
+        "Please listen what I'm saying.",
+        "Wait, let me finish.",
+        "Hold on, let me finish.",
+        "One second, let me finish.",
+        "Just a second, let me finish.",
+        "Let me complete my point.",
     )
     NEGATIVES = (
+        "Wait.",
+        "Hold on.",
+        "Hold on, let me check the fee for you.",
+        "One second, let me pull up the curriculum.",
         "Can I talk to your husband?",
         "Let me explain the fee, it is nine thousand",
         "Listen, the batch starts Monday",
@@ -2305,6 +2317,8 @@ class DodgedQuestionTests(unittest.TestCase):
             ("Timing is very flexible, you choose your own days.", "weekly_hours"),
             ("We can talk about that later. Tell me about your goals.", "format"),
             ("Don't worry about that. What made you look at data science?", "fall_behind"),
+            ("That's not a problem at all.", "job_search"),
+            ("Don't worry about it, we'll sort it out.", "fall_behind"),
         ):
             with self.subTest(text=text):
                 self.assertTrue(sched.dodged_question(text, (topic,)))
@@ -2317,6 +2331,21 @@ class DodgedQuestionTests(unittest.TestCase):
             ("Yes, you can pay in monthly instalments. Which modules interest you?", "payment"),
             ("If you miss a class, the recordings help you catch up.", "fall_behind"),
             ("Okay.", "weekly_hours"),
+            # Review S7L-R3: a reassuring opener followed by the real answer.
+            (
+                "Don't worry about it, the recordings are always there and you can rewatch any "
+                "session.",
+                "fall_behind",
+            ),
+            (
+                "That's not a problem at all, every class is recorded so you can watch it later.",
+                "fall_behind",
+            ),
+            (
+                "Yes, it's not a problem, we have placement support for a full year.",
+                "job_search",
+            ),
+            ("No problem, we run doubt sessions every weekend.", "fall_behind"),
         ):
             with self.subTest(text=text):
                 self.assertFalse(sched.dodged_question(text, (topic,)))

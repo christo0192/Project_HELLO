@@ -1984,6 +1984,9 @@ class RolePlayEngine:
             # Review S2P-R5 (naturalness): the conflict the lost first half raised (given back
             # with it) is this continuation's to check, read over both halves.
             self._turn_conflict = self.negotiation.reapply_conflict(split.conflict, turn)
+        # Review S7L-R2: what the per-turn readers below may count or close, so a floor yield
+        # (SWEEP-33) can leave it as it was.
+        before_readers = self._yield_snapshot()
         if self._price_probe_answer_due(turn, before_anchor=False) and not self._price_named():
             self._price_dodges += 1  # S2.10: her price question got no figure
         number_question = asks_her_number(reading)
@@ -2037,6 +2040,7 @@ class RolePlayEngine:
             owed = self.scheduler.select(r_sec)
             if owed is None or self._may_defer(owed, r_sec):
                 self._worry_family = worry  # the yield answers nothing: still the next turn's
+                self._yield_restore(before_readers, turn)
                 return self._floor_yield_plan(
                     reasons, cut=cut, cut_move=cut_move, live=lost is not None, split=split
                 )
@@ -2834,6 +2838,41 @@ class RolePlayEngine:
             self._enter_closing(CLOSING_OPEN)  # the advisor said something real: the call goes on
         return close_attempt or handover or mutual
 
+    def _yield_snapshot(self) -> tuple[Any, ...]:
+        """Review S7L-R2: the state this turn's readers may change before the floor check."""
+        open_q = None if self._open_q is None else dict(self._open_q)
+        return (
+            self._price_dodges,
+            open_q,
+            self._open_q_dodged,
+            frozenset(self._come_back_spent),
+            self._dodge_now,
+        )
+
+    def _yield_restore(self, snapshot: tuple[Any, ...], turn: int) -> None:
+        """Review S7L-R2: a floor-yield turn is transparent ("Sure, go ahead." asked nothing).
+
+        Its readers counted no price dodge and closed no open question, and the windows that
+        expect the answer on the turn right after her question (her price probe, her SWEEP-7
+        question, a dodge's come-back window) move on by one turn, so the advisor's real answer on
+        the next turn is read as the answer it is.
+        """
+        dodges, open_q, dodged, spent, dodge_now = snapshot
+        self._price_dodges = dodges
+        self._open_q_dodged = dodged
+        self._come_back_spent = set(spent)
+        self._dodge_now = dodge_now
+        if self._price_asked_turn is not None and self._price_asked_turn == turn - 1:
+            self._price_asked_turn = turn
+        if open_q is not None:
+            if open_q["asked_turn"] == turn - 1:
+                # The line that asked it is still the one she was last heard on.
+                open_q.setdefault("heard_turn", open_q["asked_turn"])
+                open_q["asked_turn"] = turn
+            if open_q["dodged_turn"] is not None:
+                open_q["dodged_turn"] += 1
+        self._open_q = open_q
+
     def _floor_yield_plan(
         self,
         reasons: list[str],
@@ -3216,7 +3255,8 @@ class RolePlayEngine:
         ):
             return False
         if self._ack_turn():
-            if self._learner_asked_last() and self._last_heard_turn == open_q["asked_turn"]:
+            heard = open_q.get("heard_turn", open_q["asked_turn"])  # review S7L-R2: a yield
+            if self._learner_asked_last() and self._last_heard_turn == heard:
                 self._mark_come_back(open_q)
             return False
         asked = RESPOND_QUESTION in self._turn_kinds or asks_her_directly(reading)
@@ -3328,6 +3368,7 @@ class RolePlayEngine:
             if open_q["topic"] in open_question_topics(spoken_text):
                 self._mark_come_back(open_q)
                 open_q["asked_turn"] = plan.turn
+                open_q.pop("heard_turn", None)
             else:
                 self._come_back_spent.add(open_q["topic"])  # the guard cut it: let it go
                 self._open_q = None
@@ -5258,7 +5299,9 @@ class RolePlayEngine:
                 character_break=kind is not None,
                 role_confusion=role_note,
                 come_back=bool(self._come_back_topic) and mode is TurnMode.LLM_REPLY,
-                price_wrap=price_wrap,
+                # Review S7L-R3: her own number is this reply's one price note; "do not push on
+                # price again" would contradict "answer with your figure" on the same turn.
+                price_wrap=price_wrap and "your_number" not in reasons,
                 intent_brief="" if intent is None else intent.brief,
                 must_say=() if intent is None else intent.must_say,
                 intent_forced=False if intent is None else intent.forced,

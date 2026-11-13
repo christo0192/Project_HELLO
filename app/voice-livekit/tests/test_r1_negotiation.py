@@ -3249,6 +3249,7 @@ class HerNumberQuestionTests(unittest.TestCase):
             ("How much are you willing to pay?", "total"),
             ("What could you pay each month?", "monthly"),
             ("So what amount works for your monthly budget?", "monthly"),
+            ("What figure would work for your budget?", "total"),
         ):
             with self.subTest(text=text):
                 self.assertEqual(her_number_question(text), kind)
@@ -3262,6 +3263,11 @@ class HerNumberQuestionTests(unittest.TestCase):
             "How much are you willing to put in?",
             "Does that work for you?",
             "The number that works for most people is six thousand.",
+            # Review S7L-R6/R4: a contact number, a callback, a count, someone else's figure.
+            "Great. What number works for you for the follow-up call?",
+            "And what number would work for you to call on?",
+            "What number of sessions works for you?",
+            "What figure would work for your manager?",
             "",
         ):
             with self.subTest(text=text):

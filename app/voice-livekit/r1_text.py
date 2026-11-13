@@ -1340,10 +1340,16 @@ def later_price_threat(sentence: object, list_usd: int = THREAT_LIST_USD) -> boo
 # ------------------------------------------------------------------------------------------------
 CALLER_KNOWN = "known"
 CALLER_NAME_ONLY = "name_only"
+# Review S7L-R1: "Kick-start", "Kickstarter" and "kick star" as speech-to-text writes them, and a
+# lowercase "from ik".
 _CALLER_COMPANY = re.compile(
-    r"\binterview\s*(?:kick|geek|kik|quick)\s*start\b|\bkick\s*start\b", re.IGNORECASE
+    r"\binterview[\s-]*(?:kick|geek|kik|quick)[\s-]*star(?:t(?:er)?)?\b"
+    r"|\bkick[\s-]*star(?:t(?:er)?)?\b|\b(?:from|with) (?:the )?ik\b",
+    re.IGNORECASE,
 )
 _CALLER_COMPANY_CASED = re.compile(r"\bIK\b")
+# A named caller who also said where they are from ("Sam from Upgrade Academy"), in any form.
+_CALLER_FROM_ORG = re.compile(r"\b(?i:from|with)\s+(?:(?i:the)\s+)?[A-Z][A-Za-z]")
 _CALLER_PURPOSE = re.compile(
     r"\bforms?\b|\b(?:enquiry|inquiry|enquiries|inquiries)\b|\bwebinars?\b|\bdata science\b"
     r"|\b(?:the|our|this|a) (?:courses?|programs?|programmes?|bootcamps?)\b"
@@ -1355,6 +1361,7 @@ _CALLER_PURPOSE = re.compile(
     re.IGNORECASE,
 )
 _NAME_WORD = r"([A-Z][a-z]{1,23})"
+_ANY_NAME_WORD = r"([A-Za-z][a-z]{1,23})"
 _GREETING_LEAD = r"(?:(?:hi|hello|hey|good (?:morning|afternoon|evening))\b[\s,.!-]*)?"
 _CALLER_NAMED = (
     re.compile(
@@ -1368,10 +1375,31 @@ _CALLER_NAMED = (
     re.compile(r"(?:^|[.!?,]\s*)" + _NAME_WORD + r"\s+(?i:here|this side)\b"),
     re.compile(r"\b(?i:it'?s)\s+" + _NAME_WORD + r"\s+(?i:from|here)\b"),
     re.compile(r"\b" + _NAME_WORD + r"\s+(?i:from (?:the|our))\s+[A-Za-z]"),
+    # Review S7L-R1 (SWEEP-9): the commonest self-introductions.  After these cue words a
+    # lowercase name counts too (speech-to-text often writes "my name is priya").
+    re.compile(r"\b(?i:my name is|my name's)\s+" + _ANY_NAME_WORD + r"\b"),
+    re.compile(
+        r"(?:^|[.!?,]\s*)(?i:" + _GREETING_LEAD + r"myself)\s+" + _ANY_NAME_WORD + r"\b"
+    ),
+    re.compile(
+        r"\b(?i:i'?m|i am)\s+" + _NAME_WORD + r"(?=\s*(?:[.!?]|$|(?i:and|speaking|calling)\b))"
+    ),
+    re.compile(r"\b(?i:it'?s)\s+" + _NAME_WORD + r"(?=\s*(?:[.!?]|$))"),
+    re.compile(r"(?:^|[.!?,]\s*)" + _NAME_WORD + r"\s+(?i:calling|speaking)\b"),
+    re.compile(
+        r"(?:^|[.!?,]\s*)(?i:" + _GREETING_LEAD + r"(?:[a-z]+[\s,.!-]+)?this is)\s+"
+        + r"([a-z]{2,23})(?=\s*(?:[.!?,]|$|(?:from|here|calling|speaking)\b))"
+    ),
 )
 _NOT_A_CALLER_NAME = frozenset(
     "hi hello hey good yes yeah okay ok so well sure great thanks thank this that it what how "
-    "the our your my we you i sorry just".split()
+    "the our your my we you i sorry just "
+    # Review S7L-R1: words the lowercase and clause-end forms could catch ("this is fine.", "it's
+    # Monday.", "I'm Fine.", "myself and my team").
+    "a an and am also not me here there fine nice right correct true real really important "
+    "interesting amazing awesome perfect wonderful helpful fun cool exciting different easy hard "
+    "new calling speaking regarding about actually basically glad happy back done ready "
+    "monday tuesday wednesday thursday friday saturday sunday today tomorrow".split()
 )
 
 
@@ -1390,6 +1418,9 @@ def caller_introduced(text: object, names: tuple[str, ...] = ()) -> str:
         for match in pattern.finditer(raw):
             word = match.group(1).lower()
             if word not in _NOT_A_CALLER_NAME and word not in own:
+                # Review S7L-R1: "Sam from Interview Kickstarter" misheard is still a where-from.
+                if _CALLER_FROM_ORG.search(raw):
+                    return CALLER_KNOWN
                 return CALLER_NAME_ONLY
     return ""
 

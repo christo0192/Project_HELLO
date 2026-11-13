@@ -11623,6 +11623,15 @@ class RoleConfusionEngineTests(unittest.TestCase):
         self.assertIn("mixed up who is who", plan.reminder)
         self.assertNotIn(CHARACTER_BREAK_NOTE, plan.reminder)
 
+    def test_a_sponsorship_question_with_a_filler_comma_is_answered_in_role(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)
+        plan = s.say("That makes sense. Could you pitch it, um, to your husband tonight?", 400)
+        self.assertNotEqual(plan.line_id, "L-ASIDE-COACH")
+        self.assertIsNone(plan.character_break)
+        self.assertFalse(any(r.startswith("character_break") for r in plan.reasons))
+
     def test_flag_off_answers_the_new_forms_in_role(self):
         with mock.patch.dict(r1_roleplay.os.environ, {"R1_ROLE_CONFUSION_V2": "0"}):
             s = Session(engine())
@@ -11755,6 +11764,54 @@ class FloorYieldEngineTests(unittest.TestCase):
         self.assertNotIn("floor_yield", plan.reasons)
         self.assertEqual((plan.mode, plan.reasons), (TurnMode.LLM_REPLY, ("free_reply",)))
         self.assertEqual(s.eng.admin_log()["followups"]["floor_yields"], 0)
+
+    def test_the_cited_turn_as_speech_to_text_wrote_it_yields(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Can you listen what I am saying first?", 40)
+        self.assertIn("floor_yield", plan.reasons)
+
+
+@s2p_on
+class FloorYieldTransparencyTests(unittest.TestCase):
+    """Review S7L-R2: the yield turn is transparent to her price probe and her open question."""
+
+    def _figure_after(self, figure, *, yielded):
+        s = Session(engine())
+        _plan, r = to_f1(s)
+        if yielded:
+            plan = s.say("Sorry, let me finish.", r)
+            self.assertIn("floor_yield", plan.reasons)
+            self.assertEqual(s.eng._price_dodges, 0)
+        return s, s.say(figure, r + 20)
+
+    def test_a_figure_after_a_yield_is_read_as_the_answer_to_her_price_probe(self):
+        for figure in ("It's around 6000 dollars.", "It's around 6000."):
+            with self.subTest(figure=figure):
+                base_s, base = self._figure_after(figure, yielded=False)
+                s, plan = self._figure_after(figure, yielded=True)
+                self.assertEqual((plan.mode, plan.move_id), (base.mode, base.move_id))
+                self.assertEqual(
+                    s.eng.negotiation.best_offer_usd, base_s.eng.negotiation.best_offer_usd
+                )
+                self.assertEqual(
+                    None if plan.intent is None else plan.intent.brief,
+                    None if base.intent is None else base.intent.brief,
+                )
+                self.assertEqual(plan.reasons, base.reasons)
+                self.assertEqual(s.eng._price_dodges, base_s.eng._price_dodges)
+
+    def test_her_open_question_survives_a_yield_and_a_dodge_after_it_gets_the_come_back(self):
+        for request, dodge in (
+            ("Sorry, let me finish.", "Don't worry about that. So what do you do currently?"),
+            ("Can I explain?", "Timing is very flexible, you choose your own days."),
+        ):
+            with self.subTest(request=request):
+                s = ComeBackEngineTests.asked("How many hours a week would I need?")
+                self.assertIn("floor_yield", s.say(request, 60).reasons)
+                self.assertIsNotNone(s.eng._open_q)
+                plan = s.eng.plan_turn(dodge, 80)
+                self.assertIn("come_back", plan.reasons)
 
 
 
@@ -11910,7 +11967,14 @@ class YourNumberEngineTests(unittest.TestCase):
         self.assertIn(YOUR_NUMBER_TOTAL_NOTE, plan.reminder)
         self.assertNotIn(ASKED_DIRECTLY_NOTE, plan.reminder)
         self.assertNotIn("You are curious about", plan.reminder)
+        # Review S7L-R3: no price-wrap note ("do not push on price again") beside it.
+        self.assertNotIn("answered you twice on price", plan.reminder)
         self.assertEqual(s.eng.admin_log()["followups"]["your_number_notes"], 1)
+
+    def test_a_callback_number_question_is_not_her_price(self):
+        s = self.after_the_anchor()
+        plan = s.eng.plan_turn("Great. What number works for you for the follow-up call?", 100)
+        self.assertNotIn("your_number", plan.reasons)
 
     def test_a_monthly_question_gets_the_monthly_note(self):
         from r1_prompts import YOUR_NUMBER_MONTHLY_NOTE
@@ -11991,6 +12055,17 @@ class CallOpeningEngineTests(unittest.TestCase):
         self.assertIn("call_opening:name_only", plan.reasons)
         self.assertIn("ask where they are calling from", plan.reminder)
         self.assertNotIn("ask who is calling", plan.reminder)
+
+    def test_the_common_self_introductions_never_get_who_is_this(self):
+        for opener in (
+            f"Hi {self.name()}, my name is Sam. How are you?",
+            f"Hi {self.name()}, I'm Sam. How are you doing?",
+            f"Hello {self.name()}, myself Sam. How are you?",
+        ):
+            with self.subTest(opener=opener):
+                plan = Session(engine()).say(opener, 5)
+                self.assertIn("call_opening:name_only", plan.reasons)
+                self.assertNotIn("ask who is calling", plan.reminder)
 
     def test_a_full_introduction_with_how_are_you_gets_the_reciprocal_note(self):
         s = Session(engine())

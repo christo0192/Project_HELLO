@@ -1559,6 +1559,16 @@ _MONEY_CUE = re.compile(
     re.IGNORECASE,
 )
 _TIME_CUE_WORDS = re.compile(r"\b(?:hours?|week|weekly|weeks|time|evenings?)\b", re.IGNORECASE)
+# Review S7L-R6/R4: with no money word, "number" is a contact number, a callback or a count ("What
+# number works for you for the follow-up call?", "What number of sessions works for you?"), and a
+# figure that works for someone else is theirs ("What figure would work for your manager?").
+_NOT_HER_PRICE = re.compile(
+    r"\b(?:number|amount|figure) of\b"
+    r"|\b(?:call|calls|calling|callback|phone|mobile|whatsapp|reach|contact|text|message|"
+    r"follow[- ]?up|sessions?|classes|modules?|students?|people|days?)\b"
+    r"|\b(?:works?|work|suits?|fits?) for your\b",
+    re.IGNORECASE,
+)
 _MONTHLY_CUE = re.compile(r"\b(?:month|months|monthly|emi|instal+ments?)\b", re.IGNORECASE)
 YOUR_NUMBER_TOTAL = "total"
 YOUR_NUMBER_MONTHLY = "monthly"
@@ -1577,6 +1587,7 @@ def her_number_question(text: object) -> str | None:
         money = _MONEY_CUE.search(lowered) is not None
         if not money and (
             _TIME_CUE_WORDS.search(lowered) is not None
+            or _NOT_HER_PRICE.search(lowered) is not None
             or any(pattern.search(lowered) for pattern in _HER_NUMBER_NEEDS_MONEY)
         ):
             continue

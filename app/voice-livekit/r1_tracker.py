@@ -704,20 +704,42 @@ _ROLE_CONFUSION_V1 = (
 # husband?" and "pitch it to your manager for sponsorship" (F4-PUSH and sponsorship talk) are never
 # read as role confusion.
 _SALE_OBJECT = r"(?:course|program|programme|product)"
+# Review S7L-R1: the course words alone ("product" is her own job: "what product do you sell at
+# your company?", "I'm planning to buy the product for my team").
+_COURSE_OBJECT = r"(?:course|program|programme)"
+# A real clause end: never a comma, which speech-to-text puts at every filler ("Could you pitch
+# it, um, to your husband?").
+_CLAUSE_END = r"(?=\s*(?:[.!?;:]|$))"
+# "to me" may be followed by a comma ("Can you sell this to me, please?").
+_TO_ME_END = r" to me(?=\s*(?:[,.!?;:]|$))"
+# Her own job, not the course: "what product do you sell at your company?".
+_NOT_HER_JOB = (
+    r"(?![^.?!]{0,40}\b(?:at|in|for|with) (?:your|the|that|this) (?:current |own )?(?:company|"
+    r"role|job|work|office|firm|team|organi[sz]ation|business)\b)"
+)
 _ROLE_CONFUSION_V2 = (
-    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) (?:it|this|that|the "
-    rf"{_SALE_OBJECT}|your {_SALE_OBJECT})(?: to me)?(?=\s*(?:[,.!?;:]|$))",
+    # Review S7L-R1: "it/this/that" needs "to me" ("Could you just pitch it." and "Can you sell
+    # it?" are sponsorship talk as often as a reversal); "the course" may end its clause instead.
+    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) (?:(?:it|this|that)"
+    + _TO_ME_END
+    + rf"|(?:the|your) {_SALE_OBJECT}(?:{_TO_ME_END}|{_CLAUSE_END}))",
     r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) me (?:the|this|your|a) "
     rf"{_SALE_OBJECT}\b",
     r"^(?:(?:okay|ok|so|then|now|just|please|yeah),? )*(?:sell|pitch) (?:(?:it|this|that|the "
     rf"{_SALE_OBJECT}) to me|me (?:the|this|your|a) {_SALE_OBJECT})\b",
     r"\b(?:i'?m|i am) (?:really |very |actually |just )?(?:interested|planning|looking|keen|ready)"
     r"(?: (?:to|in))? (?:buy|buying|purchase|purchasing) (?:a |the |this |that |your |one )?"
-    rf"(?:data science )?{_SALE_OBJECT}\b",
-    rf"\bwhat {_SALE_OBJECT} (?:do )?you sell\b",
-    rf"\bwhat {_SALE_OBJECT} are you selling\b",
+    rf"(?:data science )?{_COURSE_OBJECT}\b",
+    rf"\bwhat {_COURSE_OBJECT} (?:do )?you sell\b{_NOT_HER_JOB}",
+    rf"\bwhat {_SALE_OBJECT} are you selling\b{_NOT_HER_JOB}",
     r"\bi(?:'m| am)? (?:looking|trying|here|want(?:ing)?|going|planning|need) to (?:buy|purchase)"
     r"\b[^.?!]{0,40}\bnot (?:to )?sell\b",
+)
+# Review S7L-R1: "Can you pitch the course? To your husband, I mean." names someone else in the
+# next sentence, so the first one is no reversal.
+_SOMEONE_ELSE_NEXT = re.compile(
+    r"^(?:(?:um+|uh+|er+m?|like|i mean|sorry|no|yeah|well),?\s+)*(?:to|for) (?!me\b)\w",
+    re.IGNORECASE,
 )
 _ROLE_CONFUSION_V1_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V1)
 _ROLE_CONFUSION_V2_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V2)
@@ -886,12 +908,23 @@ def role_confusion_in(text: object, *, v2: bool = True) -> bool:
     ``v2`` (the engine's R1_ROLE_CONFUSION_V2) adds the first-phrasing forms; without it only the
     role patterns of the release before are read.
     """
-    patterns = _ROLE_CONFUSION_V1_RE + (_ROLE_CONFUSION_V2_RE if v2 else ())
-    for sentence in split_sentences(fold(text)):
+    sentences = split_sentences(fold(text))
+    for index, sentence in enumerate(sentences):
         stripped = sentence.strip()
-        if any(pattern.search(stripped) for pattern in patterns):
+        if any(pattern.search(stripped) for pattern in _ROLE_CONFUSION_V1_RE):
+            return True
+        if v2 and _role_v2_in(sentences, index):
             return True
     return False
+
+
+def _role_v2_in(sentences: list[str], index: int) -> bool:
+    """A first-phrasing reversal (SWEEP-10) in ``sentences[index]``, unless the next sentence names
+    someone else it is for ("Can you pitch the course? To your husband, I mean."; review S7L-R1)."""
+    if not any(pattern.search(sentences[index].strip()) for pattern in _ROLE_CONFUSION_V2_RE):
+        return False
+    following = sentences[index + 1].strip() if index + 1 < len(sentences) else ""
+    return _SOMEONE_ELSE_NEXT.search(following) is None
 
 
 def detect_character_break(text: object, *, role_v2: bool = False) -> str | None:
@@ -906,12 +939,11 @@ def detect_character_break(text: object, *, role_v2: bool = False) -> str | None
     reversal ("can you sell this to me?") are a coaching break too.
     """
     folded = fold(text)
-    for sentence in split_sentences(folded):
+    sentences = split_sentences(folded)
+    for index, sentence in enumerate(sentences):
         if any(pattern.search(sentence) for pattern in _COACH_REQUEST):
             return "coach"
-        if role_v2 and any(
-            pattern.search(sentence.strip()) for pattern in _ROLE_CONFUSION_V2_RE
-        ):
+        if role_v2 and _role_v2_in(sentences, index):
             return "coach"
     if _AI_QUESTION.search(folded):
         return "ai"

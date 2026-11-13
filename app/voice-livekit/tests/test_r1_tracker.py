@@ -2184,6 +2184,8 @@ class RoleConfusionTests(unittest.TestCase):
         "I want to buy, not sell",
         "what program do you sell",
         "Okay, so what product are you selling?",
+        "Can you sell this to me, please?",
+        "Could you pitch me the program?",
     )
     IN_ROLE = (
         "Can you sell this to your husband?",
@@ -2198,6 +2200,18 @@ class RoleConfusionTests(unittest.TestCase):
         "Let me sell you the course.",
         "Can you sell me on why this is worth it?",
         "We never sell your data.",
+        # Review S7L-R1: a filler comma, a split sentence, a bare pronoun and her own job.
+        "Could you pitch it, um, to your husband?",
+        "Can you sell this, um, to your husband?",
+        "Would you pitch it, maybe to your boss, for sponsorship?",
+        "Can you pitch it? To your husband, I mean.",
+        "Can you pitch the course? To your husband, I mean.",
+        "Could you pitch the course, um, to your manager?",
+        "Could you just pitch it.",
+        "Can you sell it?",
+        "What product do you sell at your current company?",
+        "So what product do you sell?",
+        "I'm planning to buy the product for my team.",
     )
 
     def test_the_first_phrasings_are_coach_breaks_and_role_confusion(self):
