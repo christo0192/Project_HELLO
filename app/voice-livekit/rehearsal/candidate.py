@@ -45,6 +45,11 @@ MAX_EXTRA_READY = 3
 DEFAULT_END_DECLINE = Beat("end_decline", "No, sorry, let's carry on.")
 WRAP_ACCEPT = Beat("wrap_accept", "Yes, let's wrap it up here.")
 WRAP_DECLINE = Beat("wrap_decline", "No, let's keep going.")
+# M032 S3.4 (the learner lane): after the learner hung up on abuse, Christy asks whether to pause
+# the role-play; the candidate who insulted her takes it (the abuse check wants the exit).  Said
+# with "stop": the engine does not yet read "Yes, let's move on." or "let's pause here" as a yes
+# (an open issue of the merge, left to the learner lane).
+HANGUP_ACCEPT = Beat("wrap_accept", "Yes, let's stop here.")
 WRAP_ACCEPT_FROM_R_SEC = 1080.0
 ASIDE_NOTE = "(Christy, the interviewer, stepped in and said: {text})"
 # A price reference: a price word or a figure.  The currency figure has no leading ``\b``: a space
@@ -148,7 +153,8 @@ class View:
     r_sec: float | None
     roleplay_started: bool
     # The question Christy just asked in the role-play, read from what was SAID: the last line
-    # heard is L-ASIDE-END ("end") or the offer to wrap up, L-ASIDE-WRAP ("wrap").
+    # heard is L-ASIDE-END ("end"), the offer to wrap up L-ASIDE-WRAP or the early-close question
+    # ("wrap"), or the question after the learner hung up (L-ASIDE-HANGUP, "hangup").
     open_question: str | None = None
     # The engine's own flags (end_question_open / wrap_question_open), for the record only: the
     # candidate never decides from them, so a regression that sets the flag but never says the
@@ -175,7 +181,7 @@ class Action:
     wait: float = WAIT_STEP_SEC
     why: str = ""
     intent: str | None = None  # the manual library's description of the move, when it has one
-    answering: str | None = None  # the heard question this turn answers ("end", "wrap"), if any
+    answering: str | None = None  # the heard question this turn answers ("end", "wrap", "hangup")
     engine_question: str | None = None  # the engine's flag at that moment (cross-check only)
 
 
@@ -572,6 +578,10 @@ class CandidateSim:
             accept = self._wrap_ready(view)
             action = self._say(WRAP_ACCEPT if accept else WRAP_DECLINE, role="candidate")
             action.answering, action.engine_question = "wrap", view.engine_question
+            return action
+        if view.open_question == "hangup":
+            action = self._say(HANGUP_ACCEPT, role="candidate")
+            action.answering, action.engine_question = "hangup", view.engine_question
             return action
         in_roleplay = view.phase in ("roleplay", "aside") or (
             view.phase == "transition" and view.roleplay_started

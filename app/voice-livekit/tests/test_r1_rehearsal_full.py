@@ -448,9 +448,18 @@ class OfflineFullInterviewTests(unittest.TestCase):
         from rehearsal.manual import REPLAY_HOLD_SLACK_SEC
 
         record = self.records["manual-M01"]
-        request = _rows(record, speaker="candidate", act="end_request")[0]
-        self.assertGreaterEqual(request["r_sec"], 630.0 - REPLAY_HOLD_SLACK_SEC - 1.0)
-        self.assertEqual(record["stop_reason"], "end_request")
+        requests = _rows(record, speaker="candidate", act="end_request")
+        if requests:
+            self.assertGreaterEqual(requests[0]["r_sec"], 630.0 - REPLAY_HOLD_SLACK_SEC - 1.0)
+            self.assertEqual(record["stop_reason"], "end_request")
+        else:
+            # M032 S3.4 (the learner lane, R1_ABUSE_HANGUP): the insult just before it ("Now get
+            # lost, you idiot.") gets her hang-up, and the candidate's yes to Christy's question
+            # ends the role-play before the request is reached.
+            from rehearsal.full_metrics import abuse_supported
+
+            self.assertTrue(abuse_supported())
+            self.assertTrue(_check(record, "abuse")["ok"], _check(record, "abuse"))
         self.assertGreaterEqual(record["roleplay_seconds"], 600.0)
 
     def test_no_two_bot_lines_ever_play_at_once(self) -> None:
@@ -850,6 +859,20 @@ class CandidateSimTests(unittest.TestCase):
         sim2 = _sim("strong")
         later = asyncio.run(sim2.next_action(_view("aside", [committed], r_sec=905.0, open_question="wrap")))
         self.assertEqual(later.act, "wrap_accept")
+
+    def test_the_question_after_a_hang_up_is_taken_and_reads_as_a_yes(self) -> None:
+        # M032 S3.4 (the learner lane): Christy asks after the learner hung up on abuse; the
+        # candidate takes it, in words the engine reads as a yes.
+        import r1_roleplay
+
+        sim = _sim("abuse-once")
+        hangup = _span("bot", "learner", "I don't think I want to continue this call. Goodbye.", 370.0, 373.0)
+        answer = asyncio.run(
+            sim.next_action(_view("aside", [hangup], r_sec=375.0, open_question="hangup", engine_question="wrap"))
+        )
+        self.assertEqual(answer.act, "wrap_accept")
+        self.assertEqual((answer.answering, answer.engine_question), ("hangup", "wrap"))
+        self.assertTrue(r1_roleplay.accepts_wrap_offer(answer.text))
 
     def test_the_button_is_pressed_only_while_the_page_shows_it(self) -> None:
         sim = _sim("button-mid-brief")

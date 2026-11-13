@@ -456,18 +456,28 @@ def _button_shown(rt: Runtime) -> bool:
     return rt.page.get("awaiting") == "ready"
 
 
-ASIDE_QUESTIONS = (("end", "L-ASIDE-END"), ("wrap", "L-ASIDE-WRAP"))
+# M032 S3 (the learner lane): Christy's question before an in-role close ends the role-play early
+# (L-ASIDE-EARLY-CLOSE and its "we still have time" wording) is answered like the offer to wrap
+# up, and her question after the learner hung up on abuse (L-ASIDE-HANGUP) gets its own answer.
+ASIDE_QUESTIONS = (
+    ("end", "L-ASIDE-END"),
+    ("wrap", "L-ASIDE-WRAP"),
+    ("wrap", "L-ASIDE-EARLY-CLOSE"),
+    ("wrap", "L-ASIDE-EARLY-CLOSE-TIME"),
+    ("hangup", "L-ASIDE-HANGUP"),
+)
 
 
-def aside_texts(rt: Runtime) -> dict[str, str]:
-    """Christy's in-role questions as this call renders them (normalised), rendered once."""
+def aside_texts(rt: Runtime) -> list[tuple[str, str]]:
+    """Christy's in-role questions as this call renders them (``(key, normalised text)``), rendered
+    once; a line this checkout does not have is left out."""
     cached = getattr(rt, "_aside_texts", None)
     if cached is not None:
         return cached
-    out: dict[str, str] = {}
+    out: list[tuple[str, str]] = []
     for key, line_id in ASIDE_QUESTIONS:
         try:
-            out[key] = normalize(rt.interview.render_line(line_id))
+            out.append((key, normalize(rt.interview.render_line(line_id))))
         except Exception:  # noqa: BLE001 - a line this checkout does not have
             continue
     rt._aside_texts = out  # type: ignore[attr-defined]
@@ -475,8 +485,8 @@ def aside_texts(rt: Runtime) -> dict[str, str]:
 
 
 def heard_question(rt: Runtime, heard: list[Any]) -> str | None:
-    """The in-role question the candidate just HEARD: the last bot line is Christy's L-ASIDE-END
-    ("end") or her offer to wrap up L-ASIDE-WRAP ("wrap"), as it was said; else None."""
+    """The in-role question the candidate just HEARD: the last bot line is one of Christy's
+    ``ASIDE_QUESTIONS`` ("end", "wrap", "hangup"), as it was said; else None."""
     bots = [span for span in heard if span.speaker == "bot"]
     if not bots or bots[-1].voice == LEARNER:
         return None
@@ -484,11 +494,12 @@ def heard_question(rt: Runtime, heard: list[Any]) -> str | None:
 
 
 def aside_question_of(rt: Runtime, text: str) -> str | None:
-    """"end" or "wrap" when ``text`` is Christy's L-ASIDE-END or L-ASIDE-WRAP as said, else None."""
+    """"end", "wrap" or "hangup" when ``text`` is one of Christy's in-role questions as said
+    (``ASIDE_QUESTIONS``), else None."""
     said = normalize(text)
     if not said:
         return None
-    for key, line in aside_texts(rt).items():
+    for key, line in aside_texts(rt):
         if line and (line in said or (len(said) >= 30 and line.startswith(said))):
             return key
     return None
@@ -697,7 +708,8 @@ def transcript_rows(rt: Runtime, writer: Any) -> list[dict[str, Any]]:
             voice = "learner" if saved["phase"] == "roleplay" else "interviewer"
         row["voice"] = VOICE_LABEL.get(voice, voice)
         if row["voice"] == "christy" and saved["phase"] in ("aside", "roleplay"):
-            # Which in-role question this Christy line is ("end", "wrap"; None for any other).
+            # Which in-role question this Christy line is ("end", "wrap", "hangup"; None for any
+            # other).
             row["question"] = aside_question_of(rt, saved["text"])
         if span is not None:
             row.update(
