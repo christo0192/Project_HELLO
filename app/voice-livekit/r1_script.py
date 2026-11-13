@@ -152,6 +152,15 @@ LINES: dict[str, str] = {
     # learner's voice; they deliver nothing graded (the owed move stays owed).
     "L-REDIRECT-PRICE": "Oh wait, before you go... what would the course cost me?",
     "L-REDIRECT-TIME": "Oh wait, before you go... how much time would this take each week?",
+    # M032 SWEEP-33 (flag R1_FLOOR_YIELD): the advisor asks for the floor ("Can I talk?", "Let me
+    # finish."), so she yields in a few words and makes no point.  The apologetic pair when the
+    # request cut her line (or her reply never got out), the plain pair otherwise; rotated.  In the
+    # learner's voice; they deliver nothing graded (the owed move stays owed).  New wording under
+    # D-M032-4, listed for review.
+    "L-LEARNER-YIELD-SORRY": "Sorry, go ahead.",
+    "L-LEARNER-YIELD-SORRY-2": "Oh, sorry. Go on.",
+    "L-LEARNER-YIELD": "Sure, go ahead.",
+    "L-LEARNER-YIELD-2": "Of course, go on.",
     "L-MUTE": (
         "This is Christy. It looks like your microphone may be muted. Please unmute when "
         "you're ready."

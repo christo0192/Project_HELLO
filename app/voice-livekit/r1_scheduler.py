@@ -1489,6 +1489,57 @@ def offers_floor(text: object) -> bool:
     )
 
 
+# M032 SWEEP-33 (flag R1_FLOOR_YIELD): the advisor asks for the floor ("Can I talk?", "Sorry, let me
+# finish.", "Please just listen to me.").  The turn is read word by word: softeners are stripped
+# from both ends, and what is left must be one of these forms IN FULL, so "Can I talk to your
+# husband?", "Let me explain the fee, it is nine thousand", a bare "Listen." and "Let me explain."
+# are never a request for the floor.
+_FLOOR_SOFTENERS = frozenset("sorry please just okay ok hey no".split())
+_FLOOR_REQUEST = re.compile(
+    r"(?:"
+    r"(?:can|could|may) i (?:please )?(?:talk|speak|finish|complete|say something|explain)"
+    r"(?: (?:first|now|please))?"
+    r"|let me (?:finish|complete|speak|talk)(?: (?:first|please))?"
+    r"|(?:can|could) you (?:please )?(?:just )?(?:listen to me|listen to what i(?:'m| am) saying"
+    r"|hear me out)(?: first)?"
+    r"|(?:please )?(?:just )?(?:listen to me|hear me out)(?: first)?"
+    r")"
+)
+FLOOR_REQUEST_MAX_WORDS = 12
+
+
+def asks_for_floor(text: object, names: tuple[str, ...] = ()) -> bool:
+    """The advisor asks her to let them speak, and the turn says nothing else (M032 SWEEP-33).
+
+    ``names``: her first name, a softener like "sorry" when said around the request ("Meera, let me
+    finish.").  At most ``FLOOR_REQUEST_MAX_WORDS`` words; linear in the text.
+    """
+    if not isinstance(text, str):
+        return False
+    folded = text.lower().replace("\u2019", "'")
+    words = [word.strip("'") for word in _WORD_TOKEN.findall(folded)]
+    words = [word for word in words if word]
+    if not words or len(words) > FLOOR_REQUEST_MAX_WORDS:
+        return False
+    soft = _FLOOR_SOFTENERS | {name.lower() for name in names if name}
+    start, end = 0, len(words)
+    while start < end:
+        if words[start] in soft:
+            start += 1
+        elif words[start] == "excuse" and start + 1 < end and words[start + 1] == "me":
+            start += 2
+        else:
+            break
+    while end > start:
+        if words[end - 1] in soft:
+            end -= 1
+        elif words[end - 1] == "me" and end - 2 >= start and words[end - 2] == "excuse":
+            end -= 2
+        else:
+            break
+    return start < end and _FLOOR_REQUEST.fullmatch(" ".join(words[start:end])) is not None
+
+
 def _asks_something(sentence: str) -> bool:
     """A question that is not itself a farewell ("Have a great day." opens like one)."""
     if "?" in sentence:

@@ -461,6 +461,8 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         # SWEEP-15: the cut notes without a frame to narrate.
         "interrupted_note_v2": p.INTERRUPTED_NOTE_V2,
         "cut_repeat_note_v2": p.CUT_REPEAT_NOTE_V2,
+        # SWEEP-33: the forced-move note (the yield lines are in ``script.lines``).
+        "floor_note": p.FLOOR_NOTE,
     }
 
 

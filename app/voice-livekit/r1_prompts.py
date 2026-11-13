@@ -680,6 +680,12 @@ ROLE_CONFUSION_NOTE = (
     "apologise. If you already set it straight earlier in this call, do not explain it again: "
     "just carry on with what they said, or ask them one short question about the course."
 )
+# M032 SWEEP-33 (flag R1_FLOOR_YIELD): the advisor asked her to let them speak, but the owed move is
+# forced (its deadline is near), so she still makes it, briefly.  New wording under D-M032-4.
+FLOOR_NOTE = (
+    "- They asked you to let them speak. Say sorry in two or three words, then make your point "
+    "briefly and stop."
+)
 ROLE_CONFUSION_EXAMPLES = (
     "Oh, I think we've got our wires crossed: I filled in the form, and you're calling me back "
     "about the course.",

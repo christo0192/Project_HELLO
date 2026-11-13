@@ -2233,5 +2233,59 @@ class EndingsSchedulerTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - start, 2.0)
 
 
+
+class FloorRequestTests(unittest.TestCase):
+    """M032 SWEEP-33: "Can I talk?" asks for the floor; a sales line that starts alike does not."""
+
+    POSITIVES = (
+        "Can I talk?",
+        "Sorry, let me finish.",
+        "Can you listen to what I am saying first?",
+        "Please just listen to me.",
+        "Meera, could I please speak?",
+        "Excuse me, can I finish?",
+        "No no, hear me out.",
+    )
+    NEGATIVES = (
+        "Can I talk to your husband?",
+        "Let me explain the fee, it is nine thousand",
+        "Listen, the batch starts Monday",
+        "Listen.",
+        "Let me explain.",
+        "Can I explain the fee? It is nine thousand",
+        "Can you speak to your father tonight?",
+        "Can I talk? I want to tell you about the mentors and the placement support we offer.",
+        "",
+    )
+
+    def test_the_requests_for_the_floor_are_read(self):
+        for text in self.POSITIVES:
+            with self.subTest(text=text):
+                self.assertTrue(sched.asks_for_floor(text, names=("Meera",)))
+
+    def test_lines_that_say_more_are_not(self):
+        for text in self.NEGATIVES:
+            with self.subTest(text=text):
+                self.assertFalse(sched.asks_for_floor(text, names=("Meera",)))
+        self.assertFalse(sched.asks_for_floor(None))
+
+    def test_the_corpus_hit_rate_is_small(self):
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if sched.asks_for_floor(text)]
+        self.assertLessEqual(len(hits), len(texts) * 0.005, hits)
+
+    def test_the_reader_stays_linear_on_long_turns(self):
+        import time
+
+        for text in ("sorry " * 2000, "can i " * 1000, "let me finish " * 600, "x" * 4000):
+            started = time.perf_counter()
+            sched.asks_for_floor(text)
+            self.assertLess(time.perf_counter() - started, 0.25)
+
+
 if __name__ == "__main__":
     unittest.main()

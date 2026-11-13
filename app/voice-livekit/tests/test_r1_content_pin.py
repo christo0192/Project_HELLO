@@ -156,7 +156,7 @@ import r1_world
 # learner's yield lines and the role-confusion examples join the manifest
 # (``r1_content._learner_followups``) beside the texts they replace while their flags are on.  No
 # graded meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "93d37facd636fede999ed0492659b0101bd5eb434e7dfb4ea2276f0be110189b"
+PINNED_CONTENT_SHA256 = "07cadc955a71fbbeda0ede113af58d2a24a6d5768f8e8aeb3d3a675b0da248c2"
 
 CONTENT_MODULES = (
     "r1_text",

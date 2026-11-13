@@ -3389,6 +3389,12 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # reply stream (``llm_node``), like the redirect before them: not warmed either.
         for line_id in ("L-REDIRECT-PRICE", "L-REDIRECT-TIME"):
             self.assertNotIn(line_id, r1_session._WARM_ORDER)
+        # M032 SWEEP-33: her yield lines are a SAY_ONLY plan's text too (``llm_node``), so warming
+        # them would spend the shared Sarvam budget on audio nothing can play.
+        for line_id in (
+            "L-LEARNER-YIELD", "L-LEARNER-YIELD-2", "L-LEARNER-YIELD-SORRY", "L-LEARNER-YIELD-SORRY-2"
+        ):
+            self.assertNotIn(line_id, r1_session._WARM_ORDER)
         rig, _cache, synth = self.build()
         specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
             candidate_free=False

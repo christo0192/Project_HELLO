@@ -230,6 +230,7 @@ from r1_prompts import (
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
     FIGURE_CHALLENGE_NOTE,
+    FLOOR_NOTE,
     PRICE_CONFLICT_WEBSITE_NOTE,
     PRICE_MET_NOTE_EARLY,
     PRICE_REFLEX_BUDGET_NOTE,
@@ -333,6 +334,7 @@ from r1_scheduler import (
     probe_first_texts,
     answered_topics,
     answers_substantively,
+    asks_for_floor,
     asks_her_directly,
     backs_off,
     courtesy_goodbye,
@@ -589,6 +591,10 @@ LAST_POINT_LINE = "L-ASIDE-LAST-POINT"
 HANGUP_LINE = "L-LEARNER-HANGUP"
 HANGUP_ASIDE_LINE = "L-ASIDE-HANGUP"
 HANGUP_LIMIT = 2
+# M032 SWEEP-33 (R1_FLOOR_YIELD): at most this many scripted yields a session; the pairs rotate.
+FLOOR_YIELD_LIMIT = 3
+FLOOR_YIELD_LINES = ("L-LEARNER-YIELD", "L-LEARNER-YIELD-2")
+FLOOR_YIELD_SORRY_LINES = ("L-LEARNER-YIELD-SORRY", "L-LEARNER-YIELD-SORRY-2")
 TRIGGER_EARLY_CLOSE = "early_close"
 TRIGGER_ABUSE = "abuse"
 # The asides whose triggering turn was said to the learner, in role: its row stays a role-play row.
@@ -1352,6 +1358,11 @@ class RolePlayEngine:
         # the roles the wrong way round, and the reminders that got the role note.
         self._role_confused = False
         self._role_confusion_turns = 0
+        # SWEEP-33: the scripted yields, the cut they re-arm for the next real turn, and a carried
+        # first half (S1 item 7) kept for it.
+        self._floor_yields = 0
+        self._floor_rearm: tuple[bool, str | None] | None = None
+        self._floor_half: _LostHalf | None = None
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -1806,6 +1817,11 @@ class RolePlayEngine:
         split = carried if carried is not None and flag_on(FLAG_SPLIT_REPLAN) else None
         if split is not None:
             self._give_back_lost(split)
+        # M032 SWEEP-33: a first half kept through a scripted yield is this real turn's to carry
+        # (what it used up was given back on the yield turn).
+        kept_half, self._floor_half = self._floor_half, None
+        if split is None and kept_half is not None and carried is None:
+            split = kept_half
         if self._wants_aside(break_kind):
             return self._aside_plan(break_kind or "ai", r_sec, turn_index)
         # M032 S2 item 7: the first turn after the coach aside (its turn is not in her context).
@@ -1961,6 +1977,21 @@ class RolePlayEngine:
         if natural or respond:
             kinds = self._respond_kinds(reading, negotiated, wants, carried=carried)
         self._turn_kinds = kinds
+        if (
+            flag_on(FLAG_FLOOR_YIELD)
+            and self._floor_yields < FLOOR_YIELD_LIMIT
+            and asks_for_floor(candidate_text, names=(self.persona.first_name,))
+        ):
+            owed = self.scheduler.select(r_sec)
+            if owed is None or self._may_defer(owed, r_sec):
+                self._worry_family = worry  # the yield answers nothing: still the next turn's
+                return self._floor_yield_plan(
+                    reasons, cut=cut, cut_move=cut_move, live=lost is not None, split=split
+                )
+            # A forced move (or the time cue or the stall past its grace) still fires: she says
+            # sorry in a few words and makes her point briefly.
+            self._notes.append(FLOOR_NOTE)
+            reasons.append("floor_request_forced")
         if respond and kinds:
             self._respond_notes(kinds)
         decision = None
@@ -2729,6 +2760,36 @@ class RolePlayEngine:
         elif not close_attempt and not courtesy and self._closing != CLOSING_OPEN:
             self._enter_closing(CLOSING_OPEN)  # the advisor said something real: the call goes on
         return close_attempt or handover or mutual
+
+    def _floor_yield_plan(
+        self,
+        reasons: list[str],
+        *,
+        cut: bool,
+        cut_move: str | None,
+        live: bool,
+        split: _LostHalf | None,
+    ) -> TurnPlan:
+        """M032 SWEEP-33: the advisor asked for the floor, so she yields in a few scripted words.
+
+        Nothing is issued and no hold budget is spent: the owed move simply stays owed (it was not
+        forced, ``_may_defer``).  The cut this turn consumed is re-armed for the next real turn
+        (which gets the cut-move hold and the interrupted note as it would have), never counted in
+        ``_interrupt_deferred``; a carried first half (S1 item 7) is kept for that turn too.  The
+        apologetic pair when the request cut her line or her reply never got out.
+        """
+        self._floor_yields += 1
+        self._learner_cut, self._cut_move = cut, cut_move
+        self._floor_rearm = (cut, cut_move)
+        if split is not None:
+            self._floor_half = split
+            self._split_replans = max(0, self._split_replans - 1)  # counted on the real turn
+        self._turn_kinds = frozenset()
+        self._notes = []
+        pair = FLOOR_YIELD_SORRY_LINES if cut or live else FLOOR_YIELD_LINES
+        line_id = pick_variant(pair, self.seed, self._floor_yields - 1)
+        reasons.append("floor_yield")
+        return self._plan(TurnMode.SAY_ONLY, reasons, scripted=script_line(line_id))
 
     def _winding_plan(self, reasons: list[str]) -> TurnPlan:
         """S3.2: the advisor is closing the call: one short, warm goodbye in her own words."""
@@ -5062,6 +5123,18 @@ class RolePlayEngine:
         """
         if plan.aside:
             return  # the interviewer's aside is scripted and excluded from evidence
+        rearm, self._floor_rearm = self._floor_rearm, None
+        if "floor_yield" in plan.reasons:
+            # M032 SWEEP-33: "Sure, go ahead." raises, proves and asks nothing, so it leaves her
+            # memory of the last real line (its primary, its worry, its question) as it was; the
+            # cut its turn consumed, and the move that cut line carried, are still the next real
+            # turn's to answer.
+            self._spoken.add(spoken_text)
+            cut_now = interrupted and by_candidate and bool(spoken_text.strip())
+            if rearm is not None:
+                self._learner_cut = rearm[0] or cut_now
+                self._cut_move = rearm[1]
+            return
         when = self.last_r if r_sec is None else r_sec
         cap = self._commitment_cap()  # the level on record BEFORE this turn's line
         # SWEEP-1: the primaries already delivered before this line, to tell which one it delivered.
@@ -5444,6 +5517,7 @@ class RolePlayEngine:
         """M032 S7L: the learner follow-ups' counts, no text."""
         return {
             "role_confusion_turns": self._role_confusion_turns,
+            "floor_yields": self._floor_yields,
         }
 
     def admin_log(self, *, final: bool = False, r_end: float | None = None) -> dict[str, Any]:

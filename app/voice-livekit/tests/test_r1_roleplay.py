@@ -11644,5 +11644,118 @@ class RoleConfusionEngineTests(unittest.TestCase):
             ctx = GuardContext(persona=P1, phase="roleplay", control_texts=(prose,))
             self.assertTrue(guard_text(example, ctx).clean, example)
 
+
+class FloorYieldEngineTests(unittest.TestCase):
+    """M032 SWEEP-33 (R1_FLOOR_YIELD): "Can I talk?" gets a scripted yield, not her point."""
+
+    FIRST_HALF = (
+        f"{SUBSTANTIVE_PITCH} {H3_PROBE} And you will learn python, sql and machine learning."
+    )
+    FRAGMENT = "And our team supports you right up to the job offer."
+
+    @staticmethod
+    def yields():
+        from r1_script import line as script_line
+
+        plain = {script_line("L-LEARNER-YIELD"), script_line("L-LEARNER-YIELD-2")}
+        sorry = {script_line("L-LEARNER-YIELD-SORRY"), script_line("L-LEARNER-YIELD-SORRY-2")}
+        return plain, sorry
+
+    @staticmethod
+    def budgets(eng):
+        return (
+            set(eng._respond_held),
+            set(eng._interrupt_deferred),
+            set(eng._dig_deferred),
+            list(eng._challenge_deferred),
+            dict(eng._discovery_holds),
+        )
+
+    def test_an_unforced_owed_move_waits_and_she_yields(self):
+        plain, _sorry = self.yields()
+        s = Session(engine())
+        s.say(OPENER, 20)
+        before = self.budgets(s.eng)
+        plan = s.say("Can I talk?", 40)
+        self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
+        self.assertIn(plan.scripted_text, plain)
+        self.assertIn("floor_yield", plan.reasons)
+        self.assertIsNone(plan.move_id)
+        self.assertIsNone(plan.reminder)
+        self.assertEqual(s.eng.scheduler._states[F3_PRIMARY].status, "pending")
+        self.assertEqual(self.budgets(s.eng), before)
+        after = s.say(PITCH, 60)
+        self.assertEqual((after.mode, after.move_id), (TurnMode.INTENT, F3_PRIMARY))
+        self.assertEqual(s.eng.admin_log()["followups"]["floor_yields"], 1)
+
+    def test_a_forced_move_still_fires_with_the_floor_note(self):
+        from r1_prompts import FLOOR_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Let me finish.", 390)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        self.assertTrue(plan.reasons[-1].endswith(":forced"), plan.reasons)
+        self.assertIn(FLOOR_NOTE, plan.reminder)
+        self.assertNotIn("floor_yield", plan.reasons)
+
+    def test_a_request_that_cut_her_gets_the_sorry_pair_and_the_cut_is_re_armed(self):
+        _plain, sorry = self.yields()
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(PITCH, 40)
+        eng.record_spoken(plan, "Okay, I see. Hmm.", r_sec=41, interrupted=True)
+        yielded = eng.plan_turn("Sorry, let me finish.", 45)
+        self.assertIn(eng.compose_speech(yielded).text, sorry)
+        eng.record_spoken(yielded, eng.compose_speech(yielded).text, r_sec=46)
+        self.assertEqual(eng._interrupt_deferred, set())
+        held = eng.plan_turn(NEUTRAL, 60)
+        self.assertIn("owed_deferred_for_interrupt", held.reasons)
+        self.assertEqual(held.mode, TurnMode.LLM_REPLY)
+
+    def test_a_request_that_cut_nothing_gets_the_plain_pair(self):
+        plain, _sorry = self.yields()
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(PITCH, 40)
+        eng.record_spoken(plan, plan.intent.fallback, r_sec=41)
+        yielded = eng.plan_turn("Can you listen to what I am saying first?", 60)
+        self.assertIn(eng.compose_speech(yielded).text, plain)
+
+    def test_a_carried_first_half_survives_the_yield(self):
+        _plain, sorry = self.yields()
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)
+        first = s.eng.plan_turn(self.FIRST_HALF, 100, candidate_seconds=58.0)
+        s.eng.reply_lost(first)
+        yielded = s.say("Can I talk?", 104, candidate_seconds=1.0)
+        self.assertIn(yielded.scripted_text, sorry)  # her reply never got out
+        second = s.eng.plan_turn(self.FRAGMENT, 110, candidate_seconds=4.0)
+        self.assertIn("split_replan", second.reasons)
+        self.assertIn("CANDIDATE_MONOLOGUE=62", second.reminder)
+        self.assertIn("first real question about", second.reminder)
+        self.assertEqual(s.eng._split_replans, 1)
+
+    def test_the_fourth_request_is_planned_as_before(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        for r in (40, 50, 60):
+            self.assertIn("floor_yield", s.say("Can I talk?", r).reasons)
+        fourth = s.say("Can I talk?", 70)
+        self.assertNotIn("floor_yield", fourth.reasons)
+        self.assertEqual(fourth.mode, TurnMode.LLM_REPLY)
+        self.assertEqual(s.eng.admin_log()["followups"]["floor_yields"], 3)
+
+    def test_flag_off_plans_the_request_as_before(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_FLOOR_YIELD": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("Can I talk?", 40)
+        self.assertNotIn("floor_yield", plan.reasons)
+        self.assertEqual((plan.mode, plan.reasons), (TurnMode.LLM_REPLY, ("free_reply",)))
+        self.assertEqual(s.eng.admin_log()["followups"]["floor_yields"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
