@@ -184,7 +184,11 @@ import r1_world
 #    request for the instructions (say the brief has just been given and offer to go over it
 #    again) and keeps the polite decline for asks about the model's own rules or setup, with no
 #    line that bans a refusal.  No other pinned text changed.
-CONTENT_REVISION = 27
+# 28: M032 christy-ready (R1_START_ASK_ONCE): L-TRANSITION-ASK-PAUSE ("If that covers everything,
+#    shall we begin the role-play? Just say 'ready' whenever you like."), the one start prompt a
+#    quiet pause gets once Christy's answers before the role-play end without a start question.
+#    No other pinned text changed.
+CONTENT_REVISION = 28
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:

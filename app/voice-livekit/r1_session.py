@@ -662,6 +662,7 @@ _WARM_ORDER = (
     "L-PRESENT",
     "L-TRANSITION-NUDGE",
     "L-TRANSITION-REASK",
+    "L-TRANSITION-ASK-PAUSE",
     "L-TRANSITION-STEER",
     "L-TRANSITION-REASK-2",
     "L-PICKUP-BRIDGE",
@@ -807,6 +808,8 @@ _START_QUESTION_OF_LINE = {
     "L-TRANSITION-V20": _EITHER_OR,
     "L-TRANSITION-BRIDGED-V20": _EITHER_OR,
     "L-TRANSITION-REASK": _YES_NO,
+    # M032 christy-ready: the one start prompt after answers that went without one (a yes starts).
+    "L-TRANSITION-ASK-PAUSE": _YES_NO,
     "L-TRANSITION-STEER": _YES_NO,
     "L-TRANSITION-REASK-2": _SAY_READY,
     "L-TRANSITION-NUDGE": _SAY_READY,
@@ -905,6 +908,23 @@ def mute_aside_v2_enabled() -> bool:
     never talks over a turn in flight, and fits the phase (L-MUTE-RP / L-MUTE-IV).  Rollback: ``fly
     secrets set R1_MUTE_ASIDE_V2=0 -a project-hello-voice`` (today's immediate L-MUTE)."""
     return _env_switch(os.getenv("R1_MUTE_ASIDE_V2"))
+
+
+def consent_wide_enabled() -> bool:
+    """``R1_CONSENT_WIDE`` (default on; M032 christy-ready): a spoken "ready" counts wherever it
+    sits in the turn ("Got it. Okay, I'm ready.", "Haan, theek hai, I'm ready."), never a question,
+    a negation or a readiness put off.  Rollback: ``fly secrets set R1_CONSENT_WIDE=0 -a
+    project-hello-voice`` (only a start phrase with nothing but filler around it, as before)."""
+    return _env_switch(os.getenv("R1_CONSENT_WIDE"))
+
+
+def start_ask_once_enabled() -> bool:
+    """``R1_START_ASK_ONCE`` (default on; M032 christy-ready): before the role-play, only the first
+    answer Christy gives ends with a start question; later answers end without one, and a quiet
+    pause after one gets a single start prompt (L-TRANSITION-ASK-PAUSE).  Only with
+    ``R1_TRANSITION_REPAIR``.  Rollback: ``fly secrets set R1_START_ASK_ONCE=0 -a
+    project-hello-voice`` (a start question after every answer, rotated, as before)."""
+    return transition_repair_enabled() and _env_switch(os.getenv("R1_START_ASK_ONCE"))
 
 
 def ack_resume_seconds() -> float:
@@ -2389,10 +2409,22 @@ def is_transition_consent(text: str) -> bool:
     Never a turn that asks something (``_CONSENT_QUESTION_RE``: "What do I need to have ready?"),
     a negated one ("Not ready yet."), or a short yes alone (``is_short_yes``): that one is
     ``R1Interview._transition_consent``'s, which knows what Christy asked last.
+
+    M032 christy-ready (``R1_CONSENT_WIDE``, default on): also a clear readiness statement wherever
+    it sits in the turn (``_is_wide_consent``: "Got it. Okay, I'm ready.", "Haan, theek hai, I'm
+    ready.", a long run-up that ends "so let's do it, I'm ready.").  Where the turn may be read is
+    unchanged: only after the start question, or the button.
     """
     folded = fold_speech(text)
     if not folded or is_short_yes(text) or is_acknowledgement_turn(text):
         return False
+    if _is_strict_consent(folded):
+        return True
+    return consent_wide_enabled() and _is_wide_consent(text, folded)
+
+
+def _is_strict_consent(folded: str) -> bool:
+    """M1: a start phrase with nothing but filler around it (the reading before christy-ready)."""
     rest = _NO_QUESTIONS_FIRST_RE.sub(" ", folded)
     if _READY_NEGATION_RE.search(rest) is not None:
         return False
@@ -2402,6 +2434,111 @@ def is_transition_consent(text: str) -> bool:
         return False
     rest = _WHEN_YOU_ARE_RE.sub(" ", _START_RE.sub(" ", rest))
     return all(word in _CONSENT_FILLER for word in rest.split())
+
+
+# M032 christy-ready (R1_CONSENT_WIDE): the readiness statements the wide reading looks for, on
+# folded text.  "I'm ready", "we are all set", "let's start", "let's do it", "we can begin", or a
+# bare "ready" that follows nothing or a filler (``_READY_LEAD_WORDS``): "be ready", "get ready",
+# "almost ready", "you ready", "am I ready" are no readiness of the speaker's.
+_WIDE_READY_RE = re.compile(
+    r"\b(?:(?:i'm|im|i am|we're|we are)"
+    r"(?: (?:now|all|so|totally|fully|really|pretty|quite|definitely|absolutely|finally))?"
+    r" (?:ready|good to go|all set)"
+    r"|(?:let's|lets|let us) (?:start|begin|go|get started|get going|get on with it|"
+    r"do (?:it|this|that|the role ?play|the roleplay))"
+    r"|(?:we can|we could) (?:start|begin)"
+    r"|ready)\b"
+)
+_READY_LEAD_WORDS = frozenset(
+    {
+        "okay", "ok", "alright", "yes", "yeah", "yep", "yup", "sure", "so", "then", "now", "um",
+        "uh", "well", "right", "fine", "good", "great", "perfect", "cool", "and", "oh", "ah",
+        "hmm", "totally", "fully", "absolutely", "definitely", "really", "haan", "han", "haa",
+        "haanji", "ji", "achha", "acha", "accha", "hai", "theek", "thik", "chalo", "bas",
+        "thanks", "christy", "ma'am", "madam", "sir",
+    }
+)
+# A readiness the turn takes back, puts off or makes depend on something, or a turn that still asks
+# for something: never a consent, wherever it sits ("I'll be ready in a minute", "ready, but first
+# one question", "I'm ready, can you repeat the goal").  "If you are" is the idiom, cut out first.
+_WIDE_CONSENT_HOLD_RE = re.compile(
+    r"\b(?:if|unless|once|until|till|later|soon|almost|nearly|yet|wait|hold on|hang on|"
+    r"in a (?:bit|sec|second|minute|moment|while)|one (?:sec|second|minute|moment)|give me|"
+    r"need (?:a|some|more)|before (?:we|i|that|starting|the)|after|first|questions?|ask|asking|"
+    r"doubts?|clarify|clarification|explain|repeat|again|tell me|remind me|go over|recap|"
+    r"summar\w*|want to know|wanted to know|wondering|curious|maybe|might|probably|kind of|"
+    r"kinda|sort of|unsure)\b"
+)
+# "Ready when you are.", "I'm ready if you are.", "whenever you're ready": the courtesy, not a
+# condition (``_WHEN_YOU_ARE_RE`` is the strict reading's).
+_WIDE_WHEN_YOU_ARE_RE = re.compile(
+    r"\b(?:when|whenever|if) (?:you are|you're|youre)(?: ready)?\b"
+)
+# "Thanks for answering my questions" closes the questions; it asks none.
+_ANSWERED_QUESTIONS_RE = re.compile(
+    r"\b(?:answer(?:ing|ed)?|for|clearing|cleared) (?:all )?(?:my|the|those|these) "
+    r"(?:questions?|doubts?)\b"
+)
+# A clause that opens as a question, punctuated or not ("ready? what do I do", "am I ready",
+# "are you ready", "can you say it again").  A wh-word inside a statement ("I see how it works")
+# asks nothing.
+_WIDE_ASK_START_RE = re.compile(
+    r"^(?:(?:so|and|but|okay|ok|um|uh|well|sorry|yes|yeah|haan|then|christy) )*"
+    r"(?:what|what's|whats|how|how's|when|where|why|who|whom|whose|which|whether|"
+    r"(?:am|is|are|do|does|did|will|would|have|has|was|were|can|could|should|shall|may) "
+    r"(?:i|we|you|she|he|it|there|they))\b"
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[.?!;,。？！]+")
+# What may follow the readiness statement: filler, courtesy, another start phrase, and these
+# send-offs ("Let's get it over with.", "Bring it on.").
+_READY_SEND_OFF_RE = re.compile(
+    r"\b(?:(?:let's |lets )?get (?:it|this) over with|(?:let's |lets )?get on with it|"
+    r"bring it on|(?:let's |lets )?roll|here we go|i guess|i suppose|i think)\b"
+)
+_READY_TAIL_FILLER = _CONSENT_FILLER | frozenset({"theek", "thik", "hai", "chalo", "bas", "now"})
+
+
+def _wide_ready_match(folded: str) -> re.Match[str] | None:
+    """The last readiness statement in ``folded`` (``_WIDE_READY_RE``), or None."""
+    last = None
+    for match in _WIDE_READY_RE.finditer(folded):
+        if match.group(0) == "ready":
+            before = folded[: match.start()].split()
+            thanked = before[-2:] == ["thank", "you"]  # "Thank you. Ready."
+            if before and before[-1] not in _READY_LEAD_WORDS and not thanked:
+                continue
+        last = match
+    return last
+
+
+def _is_wide_consent(text: str, folded: str) -> bool:
+    """M032 christy-ready (``R1_CONSENT_WIDE``): a clear readiness statement wherever it sits.
+
+    Whatever the turn says before it ("Got it.", "Okay, I think I get it now.", "Haan, theek
+    hai,", a run-up about the scenario), and nothing after it but filler, courtesy, a start
+    phrase or a send-off ("Let's get it over with.").  Never a turn with a question mark or a
+    clause that opens as a question, a negation anywhere ("I'm not ready", "I don't think I'm
+    ready"), a readiness put off or made to depend on something ("I'll be ready in a minute",
+    "ready once I've read it"), or one that still asks for something ("ready, but one question").
+    False negatives cost a nudge; a false positive would start the role-play, so in doubt: no.
+    """
+    if _has_question_mark(text):
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(str(text)):
+        if _WIDE_ASK_START_RE.search(fold_speech(clause)) is not None:
+            return False
+    rest = _NO_QUESTIONS_FIRST_RE.sub(" ", _ANSWERED_QUESTIONS_RE.sub(" ", folded))
+    rest = " ".join(_WIDE_WHEN_YOU_ARE_RE.sub(" ", rest).split())
+    if _READY_NEGATION_RE.search(rest) is not None:
+        return False
+    if _WIDE_CONSENT_HOLD_RE.search(rest) is not None:
+        return False
+    match = _wide_ready_match(rest)
+    if match is None:
+        return False
+    tail = _READY_SEND_OFF_RE.sub(" ", rest[match.end():])
+    tail = _START_RE.sub(" ", _WIDE_READY_RE.sub(" ", tail))
+    return all(word in _READY_TAIL_FILLER for word in tail.split())
 
 
 def lead_display_name(value: object) -> str:
@@ -3064,6 +3201,11 @@ class R1Interview:
         self._last_transition_line: str | None = None
         self._answer_tails = 0
         self._last_answer_tailless = False
+        # M032 christy-ready (R1_START_ASK_ONCE): an answer before the role-play has ended with a
+        # start question the candidate heard, so later answers end without one; and one of those
+        # went out since the last start question, so a quiet pause gets L-TRANSITION-ASK-PAUSE.
+        self._start_asked_after_answer = False
+        self._start_prompt_owed = False
         self._pressed_during: str | None = None
         self._start_by: str | None = None
         self._transition_started_at: float | None = None
@@ -4005,6 +4147,7 @@ class R1Interview:
         if line_id in _START_QUESTION_OF_LINE:
             # Set once the line has played: a short yes said over it answers nothing yet.
             self._start_question = _START_QUESTION_OF_LINE[line_id]
+            self._start_prompt_owed = False  # christy-ready: a start question has been heard
         if self.machine.phase is R1Phase.TRANSITION:
             self._last_transition_line = line_id  # M032 S6: "say it in short" after a brief
 
@@ -4096,7 +4239,8 @@ class R1Interview:
     @staticmethod
     def _warm_order() -> tuple[str, ...]:
         """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on, and
-        without M032 S6's lines while the transition repair is off, nor S7C's while theirs are."""
+        without M032 S6's lines while the transition repair is off, nor S7C's while theirs are,
+        nor L-TRANSITION-ASK-PAUSE while ``R1_START_ASK_ONCE`` is."""
         order = _WARM_ORDER
         dropped: set[str] = set()
         if not transition_repair_enabled():
@@ -4108,6 +4252,8 @@ class R1Interview:
         if not no_audio_ladder_enabled():
             dropped |= _NO_AUDIO_LINES
         dropped |= {"L-MUTE"} if mute_aside_v2_enabled() else _MUTE_V2_LINES
+        if not start_ask_once_enabled():
+            dropped.add("L-TRANSITION-ASK-PAUSE")  # christy-ready: only its pause speaks it
         if dropped:
             order = tuple(line_id for line_id in order if line_id not in dropped)
         if not transition_bridge_enabled():
@@ -5236,13 +5382,16 @@ class R1Interview:
                     self._transition_answers += 1
                 else:
                     self._note_ib_answer(reply)  # review of diagnosis 1: react, ask nothing
-                reply.tail = self.render_line(self._answer_tail_id())
-                # M032 S6 item 7: dropped at the stream's end when her answer already ends with
-                # a question, unless the last answer went without one (SWEEP-32).
-                reply.tail_optional = (
-                    transition_repair_enabled() and not self._last_answer_tailless
-                )
-                self._start_question = _EITHER_OR
+                if self._withhold_answer_tail():
+                    self._start_question = None
+                else:
+                    reply.tail = self.render_line(self._answer_tail_id())
+                    # M032 S6 item 7: dropped at the stream's end when her answer already ends
+                    # with a question, unless the last answer went without one (SWEEP-32).
+                    reply.tail_optional = (
+                        transition_repair_enabled() and not self._last_answer_tailless
+                    )
+                    self._start_question = _EITHER_OR
             elif action == _TRANSITION_INVITE:
                 self._start_question = None  # "of course, go ahead": no start question
             elif action == _TRANSITION_IB_REPEAT:
@@ -5264,6 +5413,23 @@ class R1Interview:
             self._replies[str(message_id)] = reply
             while len(self._replies) > _REPLIES_KEPT:
                 self._replies.pop(next(iter(self._replies)))
+
+    def _withhold_answer_tail(self) -> bool:
+        """M032 christy-ready (``R1_START_ASK_ONCE``): this answer ends without a start question.
+
+        The candidate already heard one at the end of an earlier answer (with the brief's own,
+        that is twice), so asking again after every answer only repeats it.  The start question is
+        owed instead: a quiet pause after this answer (``TRANSITION_QUIET_TURN_REASK_SECONDS``)
+        gets the single start prompt L-TRANSITION-ASK-PAUSE, and "ready" or the button start the
+        role-play at any time as before.
+        """
+        if not start_ask_once_enabled() or not self._start_asked_after_answer:
+            return False
+        self._start_prompt_owed = True
+        self._quiet_reask_pending = True  # the driver's next window is the short one
+        _log.info("unknown_event", error_type="r1_transition_tail_withheld")
+        self._wake()
+        return True
 
     def _answer_tail_id(self) -> str:
         """The start question an answer ends with (SWEEP-32, ``R1_TRANSITION_REPAIR``).
@@ -5600,7 +5766,8 @@ class R1Interview:
         her line, or one the ack hold kept back, never gets here with her quiet."""
         return (
             transition_repair_enabled()
-            and self._start_question == _EITHER_OR
+            # christy-ready: or an answer went out without its start question (it is owed).
+            and (self._start_question == _EITHER_OR or self._start_prompt_owed)
             and self._agent_state in _QUIET_AGENT_STATES
             and self._brief_playing is None
             and not self._bridging
@@ -6231,6 +6398,8 @@ class R1Interview:
                 self._drop_answer_tail(reply)  # M032 S6 item 7: never two questions in one turn
             else:
                 self._last_answer_tailless = False
+                self._start_asked_after_answer = True  # christy-ready: asked once after an answer
+                self._start_prompt_owed = False
                 yield reply.tail + " "
 
     def _reply_failed(self, exc: BaseException, reported_before: int) -> bool:
@@ -8691,6 +8860,10 @@ class R1Interview:
           {question}" (BR-2), and a committed turn that answers nothing after an either/or start
           question that finished playing gets L-TRANSITION-REASK after
           ``TRANSITION_QUIET_TURN_REASK_SECONDS``, not the ladder's 20 s (DA-1).
+        * christy-ready (``R1_START_ASK_ONCE``): only the first answer ends with a start question;
+          after a later one the first silence rung is that short window, and it speaks
+          L-TRANSITION-ASK-PAUSE in place of L-TRANSITION-REASK, once.  ``R1_CONSENT_WIDE``: a
+          readiness statement anywhere in the turn is a consent (``is_transition_consent``).
 
         Consent is unchanged throughout: only a spoken "ready" (or a start phrase,
         ``is_transition_consent``) or the "I'm ready" button starts the role-play.
@@ -8735,7 +8908,9 @@ class R1Interview:
                 quiet_window = step == 0
             if step < len(TRANSITION_SILENCE_LADDER):
                 window = TRANSITION_SILENCE_LADDER[step][0]
-                if quiet_window:
+                # christy-ready: a start question is owed (an answer went without one), so the
+                # first rung is the short pause, whichever of the turn and its commit came first.
+                if quiet_window or (step == 0 and self._start_prompt_owed):
                     window = min(window, TRANSITION_QUIET_TURN_REASK_SECONDS)
             else:
                 window = TRANSITION_SILENCE_END_SECONDS
@@ -8750,7 +8925,11 @@ class R1Interview:
             if kind == SILENCE:
                 quiet_window = False
                 if step < len(TRANSITION_SILENCE_LADDER):
-                    await self.say(TRANSITION_SILENCE_LADDER[step][1])
+                    line_id = TRANSITION_SILENCE_LADDER[step][1]
+                    if step == 0 and self._start_prompt_owed:
+                        # christy-ready: the start question the answers went without, once.
+                        line_id = "L-TRANSITION-ASK-PAUSE"
+                    await self.say(line_id)
                     step += 1
                     continue
                 return await self._end_transition_unstarted()

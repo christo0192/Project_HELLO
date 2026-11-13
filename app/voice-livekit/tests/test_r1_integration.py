@@ -3333,8 +3333,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE",
                 "L-OPEN-HELLO-AGAIN",
                 "L-TRANSITION", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT",
-                "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-STEER",
-                "L-TRANSITION-REASK-2", "L-PICKUP-BRIDGE", "L-PICKUP", "L-EXIT", "L-WRAP",
+                "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-ASK-PAUSE",
+                "L-TRANSITION-STEER", "L-TRANSITION-REASK-2",
+                "L-PICKUP-BRIDGE", "L-PICKUP", "L-EXIT", "L-WRAP",
                 "L-CLOSE", "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
                 "L-TIME-UP", "L-MUTE", "L-MUTE-IV", "L-MUTE-RP", "L-SIL-IB", "L-SIL-NOAUDIO",
                 "L-SIL-END-NOAUDIO", "L-SIL-RP1",
@@ -3347,8 +3348,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         )
         # M2 adds the offer, its resume line and L-TIME-UP; M032 S6 the replay, the recap,
         # "Yes, I'm here." and the pickup bridge; M032 S7C the three agendas, the hello again,
-        # the two no-audio lines and the two mute asides, in place of L-MUTE.
-        self.assertEqual(len(specs), 33)
+        # the two no-audio lines and the two mute asides, in place of L-MUTE; christy-ready the
+        # pause prompt (a ``say`` line, R1_START_ASK_ONCE).
+        self.assertEqual(len(specs), 34)
         warmed = {spec.text for spec in specs}
         for line_id in unreachable:
             if line_id not in ("L-OPEN", "L-OPEN-HELLO"):
@@ -3388,6 +3390,21 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         for spec in on:
             self.assertNotIn("Asha", spec.text)
 
+    async def test_the_pause_prompt_is_warmed_only_while_ask_once_is_on(self) -> None:
+        # M032 christy-ready: L-TRANSITION-ASK-PAUSE plays only behind R1_START_ASK_ONCE (and so
+        # R1_TRANSITION_REPAIR); off, the warm-up spends exactly the previous revision's requests.
+        rig, _cache, _synth = self.build()
+        on = [spec.line_id for spec in rig.interview._warm_specs(candidate_free=True)]
+        self.assertIn("L-TRANSITION-ASK-PAUSE", on)
+        self.assertEqual(on[on.index("L-TRANSITION-REASK") + 1], "L-TRANSITION-ASK-PAUSE")
+        for env in ({"R1_START_ASK_ONCE": "0"}, {"R1_TRANSITION_REPAIR": "0"}):
+            with self.subTest(env=env), _env(**env):
+                ids = [spec.line_id for spec in rig.interview._warm_specs(candidate_free=True)]
+                self.assertNotIn("L-TRANSITION-ASK-PAUSE", ids)
+                if "R1_START_ASK_ONCE" in env:
+                    kept = [line_id for line_id in on if line_id != "L-TRANSITION-ASK-PAUSE"]
+                    self.assertEqual(ids, kept)
+
     async def test_the_bridged_brief_is_warmed_only_while_the_bridge_is_on(self) -> None:
         # M032 S5 item 4: L-TRANSITION-BRIDGED can only play behind the bridge, which ships off.
         # Off, the warm-up is today's exactly (no Sarvam request for audio nothing plays); on, it
@@ -3398,12 +3415,13 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
                 candidate_free=False
             )
-        self.assertEqual(len(off), 33)  # M032 S6 adds four lines, M032 S7C seven
+        # M032 S6 adds four lines, M032 S7C seven, christy-ready the pause prompt.
+        self.assertEqual(len(off), 34)
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 34)
+        self.assertEqual(len(free) + len(named), 35)
         # M032 S7C: after the opening's four lines, the first name-free line of the transition.
         bridged = free[4]
         self.assertEqual(bridged.line_id, "L-TRANSITION-BRIDGED")
@@ -3425,7 +3443,10 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 + rig.interview._warm_specs(candidate_free=False)
             ]
 
-        off = {"R1_OPENING_SOUND_CHECK": "0", "R1_NO_AUDIO_LADDER": "0", "R1_MUTE_ASIDE_V2": "0"}
+        off = {
+            "R1_OPENING_SOUND_CHECK": "0", "R1_NO_AUDIO_LADDER": "0", "R1_MUTE_ASIDE_V2": "0",
+            "R1_START_ASK_ONCE": "0",  # christy-ready's pause prompt is not S7C's
+        }
         with _env(**off):
             before = ids()
         self.assertEqual(len(before), 26)

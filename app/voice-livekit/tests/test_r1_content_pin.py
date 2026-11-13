@@ -153,7 +153,9 @@ import r1_world
 # (IB_REPEAT_OLDER_TEMPLATE, IB_REPEAT_SAME_TEMPLATE; D2-IB1).
 # Revision 27 (review of diagnosis 2, D2-BR1-R2): the repaired transition note offers to go over the
 # brief again for "the instructions" and keeps the polite decline for its own rules.
-PINNED_CONTENT_SHA256 = "d6f5896bb9398ae022763d6682895fcf78d5e7bc07d09b22322dd7fcd04d9ad7"
+# Revision 28 (M032 christy-ready, R1_START_ASK_ONCE): L-TRANSITION-ASK-PAUSE, the one start
+# prompt a quiet pause gets once the answers before the role-play end without a start question.
+PINNED_CONTENT_SHA256 = "49df39f8ac3cf77ebc9c3ecc52d6835562e09f89ebdc30ced0a8374a0f74794e"
 
 CONTENT_MODULES = (
     "r1_text",
