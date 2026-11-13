@@ -152,7 +152,7 @@ import r1_world
 # learner's hang-up line and the wrap-up's invitation and deflection join the script; the wrap-up
 # reminder's flagged sentences and the endings' notes join the manifest (``r1_content._endings``).
 # No graded meaning, marker, must-say, deadline or text of the release before changed.
-PINNED_CONTENT_SHA256 = "66843016bc2faccefb8fe55fd8cedf2d7928b2e0e990f95e29b2bcf70a36be87"
+PINNED_CONTENT_SHA256 = "a7ce0705a6929948dfb7a21bee8a6609007c67b51662928bfb38314505bb76b8"
 
 CONTENT_MODULES = (
     "r1_text",

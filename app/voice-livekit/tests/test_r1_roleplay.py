@@ -348,6 +348,8 @@ class Session:
     def say(self, text, r, **kwargs):
         plan = self.eng.plan_turn(text, r, **kwargs)
         self.plans.append(plan)
+        if getattr(plan, "prelude_line", None):
+            self.eng.hangup_prelude_done()  # the session said her hang-up line (``_play_aside``)
         if plan.mode is TurnMode.SAY_ONLY:
             spoken = self.eng.compose_speech(plan).text
         elif plan.mode is TurnMode.INTENT:
@@ -10840,6 +10842,48 @@ class InRoleFarewellTests(unittest.TestCase):
         plan = s.say("Sure, take your time.", 320)
         self.assertIn("handover_close", plan.reasons)
 
+    def test_a_hollow_or_acknowledging_turn_after_her_sign_off_is_no_goodbye(self):
+        """Reviews S3R-3 and S3R-1 (naturalness): the advisor thinking ("Hmm.", "Okay.") or going
+        on ("Okay, so", "We have EMI options.") never locks a WEAK commitment or asks Christy."""
+        cases = (
+            ("Hmm.", {"backchannel": True}),
+            ("Okay.", {}),
+            ("No.", {}),
+            ("Right.", {}),
+            ("Got it.", {}),
+            ("Okay, so", {}),
+            ("We have EMI options.", {}),
+            ("What about the EMI", {}),
+            ("Let me explain.", {}),
+        )
+        for r in (880.0, 320.0):
+            for text, kwargs in cases:
+                with self.subTest(text=text, r=r):
+                    s = done_session(r=200 if r < 840 else 700)
+                    s.reply = "I'll think it over."
+                    s.say("The mentors are there every week.", r)
+                    self.assertTrue(s.eng._last_reply_signoff)
+                    plan = s.say(text, r + 20, **kwargs)
+                    self.assertNotIn("mutual_goodbye", plan.reasons)
+                    self.assertFalse(plan.aside)
+                    self.assertIsNone(s.eng.commitment_level)
+                    self.assertFalse(s.eng.exit_requested)
+                    self.assertEqual(s.eng.scheduler.close_attempts, 0)
+
+    def test_a_conditional_hand_over_is_no_close(self):
+        """Review S3R-1 (naturalness): "if you have any doubts, get back to me" mid-pitch."""
+        s = done_session(r=700)
+        plan = s.say(
+            "We have weekend batches and a mentor for every learner. If you have any doubts, "
+            "just get back to me.",
+            900,
+        )
+        self.assertNotIn("handover_close", plan.reasons)
+        self.assertIsNone(s.eng.commitment_level)
+        self.assertEqual(s.eng.scheduler.close_attempts, 0)
+        self.assertTrue(r1_roleplay.hands_over_close("Talk to him and get back to us."))
+        self.assertFalse(r1_roleplay.hands_over_close("In case of questions, call us back."))
+
     def test_a_sign_off_on_an_owed_line_never_arms_it(self):
         s = Session(engine(), ack="Okay. I'll think it over and get back to you.")
         s.say(OPENER, 20)
@@ -10897,6 +10941,18 @@ class ClosingStateTests(unittest.TestCase):
         self.assertEqual(s.eng._closing, r1_roleplay.CLOSING_OPEN)
         self.assertNotIn(r1_roleplay.CLOSE_NOTE, plan.reminder or "")
 
+    def test_the_goodbye_reminder_asks_for_no_question(self):
+        """Review S3R-6 (naturalness): no "short question about it", no opener rotation."""
+        s, r = self.asked_out()
+        plan = s.say("Okay then, bye for now.", r)
+        reminder = plan.reminder
+        self.assertIn(r1_roleplay.CLOSE_NOTE, reminder)
+        self.assertIn(P2.WINDING_REPLY_NOTE, reminder)
+        self.assertNotIn("short question about it", reminder)
+        self.assertNotIn("or with a question", reminder)
+        for note in P2.STYLE_NOTES_V2:
+            self.assertNotIn(note, reminder)
+
     def test_the_hold_note_no_longer_keeps_the_conversation_going(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -10952,7 +11008,7 @@ class EarlyCloseAsideTests(unittest.TestCase):
         for answer, kwargs in (
             ("Yes, let's stop here.", {}),
             ("Okay, bye.", {}),
-            ("Yes.", {"confirmed_yes": True}),
+            ("Let's stop the role-play.", {}),
         ):
             with self.subTest(answer=answer):
                 s = done_session()
@@ -10968,10 +11024,28 @@ class EarlyCloseAsideTests(unittest.TestCase):
         s = done_session()
         s.say("Thanks for your time, bye.", 650)
         self.assertFalse(s.eng.settles_as_yes("Okay."))
-        self.assertTrue(s.eng.settles_as_yes("Yes."))
         plan = s.say("Okay.", 655, confirmed_yes=True)
         self.assertFalse(plan.exit_roleplay)
         self.assertTrue(s.eng.wrap_question_open)  # still waiting for the answer
+
+    def test_a_bare_yes_sure_or_go_ahead_never_stops_it(self):
+        """Review S3R-2 (naturalness): "keep going, or ... just say so" is either/or, so a bare
+        yes says neither; the choice is put again once, then a bare yes waits."""
+        for answer in ("Go ahead.", "Sure.", "Yes."):
+            with self.subTest(answer=answer):
+                s = done_session()
+                s.say("Thanks for your time, bye.", 650)
+                self.assertFalse(s.eng.settles_as_yes(answer))
+                again = s.say(answer, 655, confirmed_yes=True)
+                self.assertFalse(again.exit_roleplay)
+                self.assertIn("early_close_unclear", again.reasons)
+                self.assertEqual(again.line_id, "L-ASIDE-EARLY-CLOSE")
+                held = s.say(answer, 660, confirmed_yes=True)
+                self.assertFalse(held.exit_roleplay)
+                self.assertIn("wrap_offer_pending", held.reasons)
+                self.assertFalse(s.eng.exit_requested)
+                stop = s.say("Let's stop here.", 665)
+                self.assertEqual(stop.mode, TurnMode.EXIT)
 
     def test_a_no_resumes_and_the_learner_carries_on_with_a_real_point(self):
         s = done_session()
@@ -11095,6 +11169,42 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertFalse(resumed.exit_roleplay)
         self.assertFalse(s.eng.exit_requested)
         self.assertEqual(s.eng.admin_log()["endings"]["last_point"]["answer"], "resumed")
+
+    def test_a_last_point_lost_before_any_audio_is_said_again(self):
+        """Review S3R-1: an "Okay." in the think gap cancelled the point before any audio."""
+        for text, kwargs in (("Okay.", {"backchannel": True}), ("Sure, I understand that.", {})):
+            with self.subTest(text=text):
+                s = self.only_f4_push_owed()
+                s.eng._pending_ask = AskKind.CALL  # an ask the turn before the request left open
+                ask = s.eng._pending_ask
+                attempts = s.eng.scheduler.close_attempts
+                s.say("End the interview.", 845)
+                point = s.eng.continuation_plan(846)
+                s.eng.reply_lost(point)
+                self.assertIsNone(s.eng._lost_undo)  # the continuation answered no turn
+                again = s.eng.plan_turn(text, 848, **kwargs)
+                self.assertEqual((again.mode, again.move_id), (TurnMode.INTENT, "F4-PUSH"))
+                self.assertIn("replanned_after_lost_reply", again.reasons)
+                self.assertFalse(s.eng.exit_requested)
+                # Nothing of the turn before the request is given back.
+                self.assertEqual(s.eng._pending_ask, ask)
+                self.assertEqual(s.eng.scheduler.close_attempts, attempts)
+                s.eng.record_spoken(again, s.eng.compose_speech(again, "").text, r_sec=852)
+                self.assertTrue(s.eng.scheduler.is_delivered("F4-PUSH"))
+                bye = s.say("Totally fair, thank you so much for your time.", 860)
+                self.assertIn("end_request_late_exit", bye.reasons)
+                self.assertTrue(s.eng.fidelity()["checks"]["all_families_delivered"])
+
+    def test_the_answer_to_the_last_point_is_a_roleplay_turn(self):
+        """Review S3R-4: it answers her objection in role, so it is counted as evidence."""
+        s = self.only_f4_push_owed()
+        s.say("End the interview.", 845)
+        point = s.eng.continuation_plan(846)
+        s.eng.record_spoken(point, s.eng.compose_speech(point, "").text, r_sec=850)
+        before = len(s.eng._word_counts)
+        s.say("Totally understand, shall we set up a call with both of you tomorrow?", 860)
+        self.assertEqual(len(s.eng._word_counts), before + 1)
+        self.assertEqual(len(s.eng._stt_word_counts), before + 1)
 
     def test_a_quiet_after_the_last_point_ends_it(self):
         s = self.only_f4_push_owed()
@@ -11223,6 +11333,72 @@ class AbuseHangUpTests(unittest.TestCase):
         log = s.eng.admin_log()["endings"]
         self.assertEqual((log["abuse_count"], log["abuse_hangups"]), (3, 2))
 
+    def test_reassurance_and_third_parties_are_no_abuse(self):
+        """Reviews S3R-2 and S3R-5 (naturalness): synthetic sentences only."""
+        for text in (
+            "Nobody here is going to screw you over.",
+            "I promise we won't screw you on the price.",
+            "We will not fuck you over with hidden fees.",
+            "I don't want to piss off your husband.",
+            "I told the stupid girl at the desk.",
+            "Switching careers late doesn't make you a fool.",
+            "It doesn't make you stupid.",
+            "Nobody will call you dumb for asking questions.",
+            "I'm not calling you stupid.",
+            "Nobody thinks you a loser for asking.",
+            "Nobody thinks you're a loser.",
+            "Shut up! You got promoted? That's amazing.",
+            "Go away tonight.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_roleplay.detect_abuse(text))
+        for text in (
+            "Oh just shut up.", "Get lost, lady.", "You're an idiot.", "Fuck off.", "Screw you!",
+            "Piss off.", "You idiot!", "Thanks, you stupid woman.", "You are so dumb.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_roleplay.detect_abuse(text))
+        self.assertTrue(r1_roleplay.detect_abuse("Go away, Meera.", names=("Meera",)))
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Honestly nobody here is going to screw you over, the fee is fixed.", 300)
+        self.assertFalse(plan.aside)
+        self.assertIsNone(plan.prelude_line)
+        self.assertEqual(s.eng.admin_log()["endings"]["abuse_count"], 0)
+        s = Session(engine())
+        s.say(OPENER, 20)
+        self.assertTrue(s.say("Go away, Meera.", 300).aside)  # her own name may end it
+
+    def test_a_turn_during_her_hang_up_line_waits_for_christys_question(self):
+        """Review S3R-5: nothing answers a question Christy has not asked yet."""
+        eng = engine()
+        Session(eng).say(OPENER, 20)
+        plan = eng.plan_turn(self.ABUSE, 300)
+        self.assertEqual(plan.prelude_line, "L-LEARNER-HANGUP")
+        during = eng.plan_turn("Sorry, sorry, I didn't mean that, okay?", 302)
+        self.assertTrue(during.aside)
+        self.assertIn("hangup_prelude", during.reasons)
+        self.assertEqual(during.scripted_text, "")
+        rude = eng.plan_turn("You're an idiot.", 303)
+        self.assertIsNone(rude.prelude_line)  # no second hang-up straight away
+        self.assertTrue(eng.wrap_question_open)
+        eng.hangup_prelude_done()
+        answer = eng.plan_turn("Yes, let's stop here.", 306)
+        self.assertEqual(answer.mode, TurnMode.EXIT)
+        self.assertIn("abuse_hangup_accepted", answer.reasons)
+
+    def test_cool_notes_never_ask_for_warmth(self):
+        """Review S3R-6 (naturalness): COOL_NOTE never sits beside a warm note."""
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("Shall we book a call tomorrow at six?", 100)
+        s.say(self.ABUSE, 300)
+        s.say("No, sorry, let's continue.", 303)
+        plan = s.say("I'm sorry. Take your time, talk to your husband, no pressure at all.", 320)
+        self.assertIn(r1_roleplay.COOL_NOTE, plan.reminder or "")
+        self.assertNotIn(r1_roleplay.PRESSURE_EASED_NOTE, plan.reminder or "")
+        self.assertNotIn("warm", (plan.reminder or "").replace("no warmth", ""))
+
     def test_banter_is_no_abuse_and_the_flag_off_is_the_release_before(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -11234,6 +11410,42 @@ class AbuseHangUpTests(unittest.TestCase):
             plan = s.say(self.ABUSE, 300)
         self.assertFalse(plan.aside)
         self.assertEqual(s.eng.admin_log()["endings"]["abuse_count"], 1)  # counted all the same
+
+
+
+class EmailReaderReviewTests(unittest.TestCase):
+    """Review S3R-8 (correctness and naturalness): SWEEP-25's e-mail readers."""
+
+    def test_paperwork_is_no_information_offer(self):
+        from r1_negotiation import detect_email_offer
+
+        for text in (
+            "I'll send you the enrollment documents now.",
+            "I'll send you the registration documents and you can sign them.",
+            "Let me send you the KYC documents.",
+            "I'll send you the documents to be signed.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_email_offer(text, v2=True))
+        for text in (
+            "I'll send you the documents and the road map.",
+            "I'll send you the course documents tonight.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_email_offer(text, v2=True))
+
+    def test_a_request_on_another_channel_asks_for_no_email(self):
+        from r1_text import asks_for_email
+
+        self.assertFalse(asks_for_email("Can you send me the details on WhatsApp?"))
+        self.assertFalse(asks_for_email("Send it over WhatsApp."))
+        self.assertTrue(asks_for_email("Could you just e-mail me the details?"))
+        self.assertTrue(asks_for_email("Can you send me the details?"))
+        s = done_session(r=700)
+        s.reply = "Can you send me the details on WhatsApp?"
+        s.say(PITCH, 880)
+        s.say("Sure.", 900)
+        self.assertFalse(s.eng._learner_asked_email)
 
 
 if __name__ == "__main__":

@@ -631,6 +631,22 @@ LEARNER_EMAIL_REQUEST = re.compile(
     r"|\bby e-?mail instead\b",
     re.IGNORECASE,
 )
+# Review S3R-8 (naturalness): "Can you send me the details on WhatsApp?" asks for no e-mail.
+_OTHER_CHANNEL = re.compile(
+    r"^\s*(?:(?:on|over|via|through|by|in|as)\s+(?:an?\s+)?)?"
+    r"(?:whats\s?app|text(?:\s+message)?s?|sms|messages?|dms?|chat|phone|call)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_email(text: object) -> bool:
+    """SWEEP-25 A2: her own request for the details by e-mail (``LEARNER_EMAIL_REQUEST``), never
+    one that names another channel right after it ("send me the details on WhatsApp")."""
+    folded = fold(text)
+    return any(
+        _OTHER_CHANNEL.match(folded[match.end() :]) is None
+        for match in LEARNER_EMAIL_REQUEST.finditer(folded)
+    )
 
 
 def says_goodbye_or_sends(text: object) -> bool:

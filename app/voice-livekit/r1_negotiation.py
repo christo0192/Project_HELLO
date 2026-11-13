@@ -1246,9 +1246,19 @@ _EMAIL_OFFER = _compile(
 # first frame of ``_EMAIL_OFFER`` also takes documents, brochures, PDFs and road maps, and no object
 # the learner is to sign or that is for the enrolment, the registration, a payment or KYC ("I'll
 # send you the documents to sign for enrolment" is paperwork, not information).
-_MAIL_INFO_V2 = r"(?:" + _MAIL_INFO + r"|documents?|brochures?|pdfs?|road ?maps?)"
+# Review S3R-8: the paperwork word may come first too ("the enrollment documents", "the KYC
+# documents"), and "to be signed" / "and you can sign them" follow it.
+_PAPERWORK_BEFORE = (
+    r"(?<!enrolment )(?<!enrollment )(?<!enrolement )(?<!registration )(?<!kyc )(?<!admission )"
+    r"(?<!payment )(?<!signing )(?<!onboarding )"
+)
+_MAIL_INFO_V2 = (
+    r"(?:" + _MAIL_INFO + r"|" + _PAPERWORK_BEFORE + r"documents?|brochures?|pdfs?|road ?maps?)"
+)
 _NOT_PAPERWORK = (
-    r"(?!\s+(?:to sign|for (?:the |your )?(?:enrol\w*|registration|payment|kyc))\b)"
+    r"(?!\s+(?:to (?:be )?sign(?:ed)?|that (?:you )?(?:need to |have to |must )?sign|"
+    r"for (?:you to sign|(?:the |your )?(?:enrol\w*|registration|payment|kyc|admission))|"
+    r"and (?:you can |then |just )?sign)\b)"
 )
 _EMAIL_OFFER_V2 = (
     re.compile(

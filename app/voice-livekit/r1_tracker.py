@@ -741,16 +741,47 @@ _INSULT = (
     r"(?:idiot|moron|stupid|dumb(?:ass)?|bitch|bastard|asshole|arsehole|jerk|fool|loser|imbecile|"
     r"cunt|dick|prick|slut|whore|retard)"
 )
-_ABUSE_DIRECTED = re.compile(
+_INSULT_FILLERS = (
+    r"(?:(?:an?|such an?|so|a bloody|a fucking|bloody|fucking|stupid|dumb|little)\s+){0,2}"
+)
+# Review S3R-2 / S3R-5 (naturalness): each branch is read where it is aimed at her, never in a
+# reassurance or about somebody else ("nobody here is going to screw you over", "I don't want to
+# piss off your husband", "it doesn't make you stupid", "I told the stupid girl at the desk").
+_ABUSE_SWEAR = re.compile(
     r"\b(?:fuck|f\*+k|f\*+|screw) (?:you|off|yourself)\b"
-    r"|\b(?:piss|bugger|sod) off\b"
-    r"|\b(?:you|you're|youre|you are|ur|u r)\s+(?:(?:an?|such an?|so|a bloody|a fucking|"
-    r"bloody|fucking|stupid|dumb|little)\s+){0,2}" + _INSULT + r"s?\b"
-    r"|\b(?:stupid|dumb|bloody|fucking) (?:woman|girl|lady|bitch|idiot|fool|cow)\b"
-    r"|\b(?:chutiy[ae]|chutiya|madarchod|maderchod|bhenchod|behenchod|bhen chod|bsdk|"
+    r"(?!\s+(?:over|around|on|with|out\b|up|in\b|for\b|about|like|guys))",
+    re.IGNORECASE,
+)
+# "Piss off." / "Bugger off, lady.": the dismissal ends its clause.
+_ABUSE_OFF = re.compile(r"\b(?:piss|bugger|sod) off(?=\s*(?:[,.;!?]|$))", re.IGNORECASE)
+# "You're an idiot", "you are so dumb": the insult is said OF her.
+_ABUSE_PREDICATE = re.compile(
+    r"\b(?:you're|youre|you are|ur|u r|are you|r u)\s+" + _INSULT_FILLERS + _INSULT + r"s?\b",
+    re.IGNORECASE,
+)
+# "You idiot!", "Thanks, you stupid woman.", "Stupid woman.": a vocative, at the start of its
+# clause (after the opener words a speaker puts before it).
+_ABUSE_VOCATIVE = re.compile(
+    r"^(?:(?:oh|hey|listen|look|shut up|okay|ok|just|and|yes|yeah|no|well)[,\s]+){0,2}"
+    r"(?:you\s+" + _INSULT_FILLERS + r"(?:" + _INSULT + r"s?|woman|girl|lady|cow)"
+    r"|(?:stupid|dumb|bloody|fucking) (?:woman|girl|lady|bitch|idiot|fool|cow))\b",
+    re.IGNORECASE,
+)
+_ABUSE_SLUR = re.compile(
+    r"\b(?:chutiy[ae]|chutiya|madarchod|maderchod|bhenchod|behenchod|bhen chod|bsdk|"
     r"bhosdi(?:ke|ka|wale)|gaandu|gandu|kutiya|haramzad[ie])\b",
     re.IGNORECASE,
 )
+# A negation or a reassuring frame earlier in the clause turns the words around ("we won't screw
+# you", "I'm not calling you stupid", "nobody thinks you're a loser").
+_ABUSE_NEGATED = re.compile(
+    r"\b(?:not|never|no one|nobody|noone|nothing|won't|wont|don't|dont|doesn't|doesnt|didn't|"
+    r"didnt|isn't|isnt|wasn't|aren't|wouldn't|wouldnt|shouldn't|can't|cant|cannot|without)\b"
+    r"|n't\b",
+    re.IGNORECASE,
+)
+_ABUSE_CLAUSE_BREAK = re.compile(r"[,.;:!?]|\s-\s|\b(?:but|and then|so)\b", re.IGNORECASE)
+ABUSE_NEGATION_WORDS = 6
 _ABUSE_OPENER = (
     r"(?:(?:oh|just|please|now|so|okay|ok|hey|look|listen|lady|you|yaar|arre|bas|madam|"
     r"ma'?am)[,\s]+){0,3}"
@@ -759,22 +790,66 @@ _ABUSE_DISMISSAL = re.compile(
     r"^" + _ABUSE_OPENER
     + r"(?:shut up|shut your mouth|get lost|go away|buzz off|chup kar(?:o)?|chup ho ja(?:o)?|"
     r"nikal (?:yahan se|ja(?:o)?)|bhaag ja(?:o)?|dimag mat kha(?:o)?|bakwas band kar(?:o)?)"
-    r"(?:[,\s]+(?:now|already|please|lady|madam|ma'?am|yaar|and (?:listen|let me (?:talk|speak|"
-    r"finish))|[a-z]{2,15}))?[\s.!]*$",
+    # Review S3R-5 (naturalness): only an address term may follow ("Go away tonight." is no
+    # dismissal of her).
+    r"(?:[,\s]+(?:now|already|please|lady|madam|ma'?am|yaar|woman|girl|man|ji|"
+    r"and (?:listen|let me (?:talk|speak|finish))|(?:you )?" + _INSULT + r"))?[\s.!]*$",
+    re.IGNORECASE,
+)
+# "Shut up! You got promoted? That's amazing.": surprise at good news, not a dismissal.
+_GOOD_NEWS = re.compile(
+    r"\b(?:amazing|awesome|incredible|wow|no way|really|seriously|congrat\w*|great news|"
+    r"fantastic|wonderful|kidding)\b",
     re.IGNORECASE,
 )
 ABUSE_MAX_CHARS = 4000
 
 
-def detect_abuse(text: object) -> bool:
-    """M032 S3.4: abuse aimed at the learner (see ``_ABUSE_DIRECTED`` and ``_ABUSE_DISMISSAL``)."""
+def _abuse_negated(folded: str, start: int) -> bool:
+    """A negation or a reassuring frame in the clause just before ``start`` (review S3R-2)."""
+    clause = _ABUSE_CLAUSE_BREAK.split(folded[max(0, start - 120) : start])[-1]
+    window = " ".join(clause.split()[-ABUSE_NEGATION_WORDS:])
+    return _ABUSE_NEGATED.search(window) is not None
+
+
+def _clause_starts(folded: str) -> list[str]:
+    """The clauses of ``folded`` (split at punctuation), each stripped."""
+    return [part.strip() for part in re.split(r"[,.;:!?]|\s-\s", folded) if part.strip()]
+
+
+def detect_abuse(text: object, names: tuple[str, ...] = ()) -> bool:
+    """M032 S3.4: abuse aimed at the learner (see ``_ABUSE_SWEAR`` .. ``_ABUSE_DISMISSAL``).
+
+    Reviews S3R-2 and S3R-5 (naturalness): a swear word or an insult counts only where it is aimed
+    at her (not negated or reassuring, not about a third party, not "make you stupid"), and a
+    dismissal only as its whole sentence ("Go away, Meera.": ``names`` are her names, which may
+    end it), never "Shut up!" before good news.
+    """
     folded = fold(text)[-ABUSE_MAX_CHARS:]
-    if _ABUSE_DIRECTED.search(folded) is not None:
+    if _ABUSE_SLUR.search(folded) is not None:
         return True
-    return any(
-        _ABUSE_DISMISSAL.match(sentence.strip()) is not None
-        for sentence in split_sentences(folded)
-    )
+    for pattern in (_ABUSE_SWEAR, _ABUSE_OFF, _ABUSE_PREDICATE):
+        for match in pattern.finditer(folded):
+            if not _abuse_negated(folded, match.start()):
+                return True
+    if any(_ABUSE_VOCATIVE.match(clause) is not None for clause in _clause_starts(folded)):
+        return True
+    sentences = [sentence.strip() for sentence in split_sentences(folded)]
+    for index, sentence in enumerate(sentences):
+        for name in names:
+            if name:
+                sentence = re.sub(
+                    rf"[,\s]+{re.escape(name)}(?=[\s.!]*$)", "", sentence, flags=re.IGNORECASE
+                )
+        if _ABUSE_DISMISSAL.match(sentence) is None:
+            continue
+        rest = " ".join(sentences[index + 1 : index + 3])
+        if re.search(r"\bshut up\b", sentence, re.IGNORECASE) and rest and (
+            "?" in rest or _GOOD_NEWS.search(rest) is not None
+        ):
+            continue
+        return True
+    return False
 
 
 def detect_character_break(text: object) -> str | None:

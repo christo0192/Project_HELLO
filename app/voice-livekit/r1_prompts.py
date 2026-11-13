@@ -99,6 +99,17 @@ CLOSE_NOTE = (
     "- The advisor is wrapping up the call. Reply with one short, warm goodbye in your own words "
     "and nothing else: no question and nothing new."
 )
+# Review S3R-6 (naturalness): after a resumed hang-up (``COOL_NOTE``: "no warmth") the goodbye is
+# polite and brief, never warm.  New wording under D-M032-4, listed for review.
+CLOSE_NOTE_COOL = (
+    "- The advisor is wrapping up the call. Reply with one short, polite goodbye in your own "
+    "words and nothing else: no question and nothing new."
+)
+# The job line of a reply while the advisor closes the call (S3.2): no "react with a feeling or a
+# short question", which pulled against the goodbye.  New wording under D-M032-4.
+WINDING_REPLY_NOTE = (
+    "Reply as the learner, naturally: the advisor is ending the call, so you end it with them."
+)
 # M032 S3.3 (R1_EARLY_CLOSE_ASIDE): the advisor said no to stopping, so the learner picks the call
 # up again right after Christy's aside (she did not hear the aside: interviewer lines are not in her
 # context).  New wording under D-M032-4, listed for review.
@@ -946,6 +957,7 @@ def turn_reminder(
     intent_worry: str = "",
     length_note: str = "",
     curiosity_v2: bool = False,
+    winding: bool = False,
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -988,7 +1000,15 @@ def turn_reminder(
     are SWEEP-5's single texts; and the delivery rider is the last line.  ``length_note``
     (SWEEP-14) is the free reply's length line and ``curiosity_v2`` (SWEEP-12) the curiosity line
     that waits for a fitting moment.  With every one of them at its default the note is unchanged.
+
+    ``winding`` (M032 S3.2, review S3R-6): the advisor is closing the call and the free reply is
+    one goodbye (``CLOSE_NOTE`` in ``notes``), so its job line is ``WINDING_REPLY_NOTE``, it gets no
+    opening-style, curiosity or length line, and the rider has no "or with a question".
     """
+    if winding and not intent_brief and not reaction_only and not confirm:
+        style_note = ""
+        length_note = ""
+        curiosity = ""
     lines = [f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}."]
     if reaction_only:
         lines.append(REACTION_ONLY_NOTE)
@@ -1015,6 +1035,8 @@ def turn_reminder(
             lines.append(INTENT_SHAPE_NEW_TOPIC)
     elif intent_brief:
         lines.append(INTENT_SHAPES[intent_shape % len(INTENT_SHAPES)])
+    elif winding and not reaction_only:
+        lines.append(WINDING_REPLY_NOTE)
     elif not reaction_only:
         lines.append(FREE_REPLY_NOTE_V2 if voice_v2 else FREE_REPLY_NOTE)
     lines.append(IGNORE_RULE_NOTE)
@@ -1094,7 +1116,8 @@ def turn_reminder(
         lines.append(length_note)
     if voice_v2:
         # S2 item 2: the delivery rider is always the last line.
-        lines.append(LEARNER_DELIVERY_RIDER_BASE if reaction_only else LEARNER_DELIVERY_RIDER)
+        plain = reaction_only or (winding and not intent_brief)
+        lines.append(LEARNER_DELIVERY_RIDER_BASE if plain else LEARNER_DELIVERY_RIDER)
     return "\n".join(lines)
 
 

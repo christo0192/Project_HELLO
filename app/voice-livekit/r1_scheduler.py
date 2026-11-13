@@ -1609,6 +1609,13 @@ _HANDOVER_CLOSE = _compile(
     r"\bcall (?:me|us) back" + _HANDOVER_WHEN + _HANDOVER_TAIL,
     r"\bget back to (?:me|us)" + _HANDOVER_WHEN + _HANDOVER_TAIL,
 )
+# A hand-over that is a condition, not a close ("if you have any doubts, get back to me", "in case
+# of questions, call us back"): read in the sentence before the hand-over itself.
+_CONDITIONAL_HANDOVER = re.compile(
+    r"\b(?:if|in case|should you|incase)\b|\bany (?:more |other |further )?"
+    r"(?:questions?|doubts?|queries|query|concerns?|issues?|problems?)\b",
+    re.IGNORECASE,
+)
 # The whole sentence is the wait ("Sure, take your time.", "Take your time, no rush."): "Just a
 # quick check-in, no pressure." is the advisor still talking.
 _WAIT_PHRASE = r"(?:take (?:all )?your time|no rush|no hurry|no pressure)"
@@ -1644,8 +1651,12 @@ def hands_over_close(text: object, *, after_sign_off: bool = False) -> bool:
     if not sentences or "?" in sentences[-1]:
         return False
     last = sentences[-1]
-    if any(pattern.search(last) for pattern in _HANDOVER_CLOSE):
-        return True
+    for pattern in _HANDOVER_CLOSE:
+        match = pattern.search(last)
+        # Review S3R-1 (naturalness): "If you have any doubts, just get back to me." keeps the
+        # door open mid-pitch; only an unconditional hand-over closes the call.
+        if match is not None and _CONDITIONAL_HANDOVER.search(last[: match.start()]) is None:
+            return True
     return after_sign_off and any(pattern.search(last) for pattern in _WAIT_FOR_HER)
 
 
@@ -1670,6 +1681,20 @@ def courtesy_only(text: object) -> bool:
         0 < len(words) <= COURTESY_TURN_MAX_WORDS
         and all(word in _COURTESY_TURN_WORDS for word in words)
     )
+
+
+# Review S3R-3 / S3R-1 (naturalness): a mutual goodbye takes leave.  "Hmm.", "Okay.", "No.",
+# "Right.", "Got it." or "Okay, so" after her "I'll think it over." are the advisor thinking or
+# about to go on, never a goodbye (each one locked a WEAK commitment from 14:00).
+_LEAVE_TAKING = re.compile(
+    r"\b(?:bye|goodbye|thanks?|thank you|take care|talk (?:to you )?soon|see you|cheers"
+    r"|have a (?:nice|good|great) (?:day|evening|one)|all the best)\b"
+)
+
+
+def courtesy_goodbye(text: object) -> bool:
+    """S3.1: a courtesy-only advisor turn that takes leave ("Sure. Thank you.", "Okay, bye.")."""
+    return courtesy_only(text) and _LEAVE_TAKING.search(normalize(fold(text))) is not None
 
 
 def _is_closing_tail(sentence: str) -> bool:

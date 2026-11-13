@@ -183,6 +183,9 @@ import r1_world
 #    (L-FAQ-DEFER-WRAP) join the script; the wrap-up reminder's flagged sentences and the endings'
 #    notes join the manifest (``_endings``).  Markers, deadlines, the scorer's facts and every text
 #    of the release before are unchanged; with every flag off the reminders are the release before.
+#    After the S3 review (still revision 24, unreleased): a goodbye while she is cool is polite, not
+#    warm (CLOSE_NOTE_COOL), and a winding reply has its own job line (WINDING_REPLY_NOTE) with no
+#    question, opener or length line.
 CONTENT_REVISION = 24
 
 
@@ -412,6 +415,8 @@ def _endings() -> dict[str, Any]:
         },
         # S3.2, S3.3, S3.4 and SWEEP-24.
         "close_note": p.CLOSE_NOTE,
+        "close_note_cool": p.CLOSE_NOTE_COOL,
+        "winding_reply_note": p.WINDING_REPLY_NOTE,
         "hold_note_v2": p.HOLD_NOTE_V2,
         "continue_note": p.CONTINUE_NOTE,
         "cool_note": p.COOL_NOTE,

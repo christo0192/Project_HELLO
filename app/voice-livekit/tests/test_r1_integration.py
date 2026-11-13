@@ -3570,6 +3570,8 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["phase"] for item in learner], ["roleplay"])
         self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # the abuse is evidence
         self.assertTrue(rig.engine.wrap_question_open)
+        # Review S3R-5: once her line is over, a turn answers Christy's question.
+        self.assertFalse(rig.engine._hangup_prelude)
         self.assertIsNone(await rig.converse("No, sorry, let's continue.", advance=3))
         await rig.until_spoken("L-ASIDE-WRAP-RESUME")
         self.assertEqual(rig.session.generated, [])  # the advisor calls her back: he speaks next
@@ -3589,6 +3591,30 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(r1_session, "ROLEPLAY_PROMPT_SECONDS", 0.05):
             self.assertIsNone(await asyncio.wait_for(rig.interview._roleplay_turn(), 5.0))
         self.assertTrue(rig.interview._roleplay_over())
+
+    async def test_the_answer_to_her_last_point_stays_a_roleplay_row(self) -> None:
+        """Review S3R-4: the advisor answers her last objection in role: it is evidence."""
+        rig = await self.done_rig(keep=("F4-PUSH",))
+        self.assertIsNone(await rig.converse("End the interview.", advance=830))
+        await rig.until_spoken("L-ASIDE-LAST-POINT")
+        await self.generated(rig)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")  # the request: to Christy
+        answer = "Totally understand, shall we set up a call with both of you tomorrow at six?"
+        self.assertIsNone(await rig.converse(answer, advance=10))
+        self.assertTrue(rig.interview._roleplay_over())
+        row = rig.candidate_rows()[-1]
+        self.assertEqual((row["text"], row["phase"]), (answer, "roleplay"))
+
+    async def test_no_resume_line_after_a_turn_planned_during_the_aside(self) -> None:
+        """Review S3R-7: two learner lines in a row would bunch the owed moves."""
+        rig = await self.done_rig()
+        rig.engine._continuation_due = ("resume", None)
+        rig.interview._speak_continuation(rig.engine.turn - 1)  # a turn was planned since
+        self.assertEqual(rig.session.generated, [])
+        self.assertIsNone(rig.engine.continuation_plan(400.0))  # dropped, not left owed
+        rig.engine._continuation_due = ("resume", None)
+        rig.interview._speak_continuation(rig.engine.turn)
+        self.assertEqual(len(rig.session.generated), 1)
 
     async def test_the_new_asides_are_warmed_and_her_line_is_hers(self) -> None:
         for line_id in ("L-ASIDE-EARLY-CLOSE", "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-LAST-POINT",
