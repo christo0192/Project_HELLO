@@ -2307,6 +2307,28 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   my dad's shop.", "The other one was harder for me, the cold calls." and "No, I mean, can we just
   start?" are an answer and a start request, never a repeat; "No, I mean." alone names no question.
 
+**Spoken ready and the start question (M032 christy-ready, content revision 28):**
+
+* **`R1_CONSENT_WIDE`** (default on). A clear readiness statement counts wherever it sits in the
+  turn: "Got it. Okay, I'm ready.", "Haan, theek hai, I'm ready.", "Fine. I'm ready. Let's get it
+  over with.", a long run-up that ends "so let's do it, I'm ready." (the simulation's candidates said
+  these and Christy answered them as questions). Never a consent: a question mark or a clause that
+  opens as a question ("am I ready", "are you ready", "ready? what do I do"), a negation anywhere
+  ("I'm not ready", "I don't think I'm ready"), a readiness put off or made to depend on something
+  ("I'll be ready in a minute", "ready once I've read the guide"; "if you are" is the idiom), or a
+  turn that still asks for something ("I'm ready but I have one question"). Where consent is read is
+  unchanged: the transition only, after the start question, or the button. Rollback: `fly secrets
+  set R1_CONSENT_WIDE=0 -a project-hello-voice` (a start phrase with only filler around it).
+* **`R1_START_ASK_ONCE`** (default on, only with `R1_TRANSITION_REPAIR`). Only the first answer
+  Christy gives before the role-play ends with a start question (the rotated either/or form);
+  later answers end without one, and a quiet pause after one (`TRANSITION_QUIET_TURN_REASK_SECONDS`,
+  6 s; an "Okay" in between keeps it short) gets L-TRANSITION-ASK-PAUSE once: "If that covers
+  everything, shall we begin the role-play? Just say 'ready' whenever you like." (a yes/no
+  question: a bare "yes" starts). The ladder's second rung (L-TRANSITION-REASK-2, 30 s) follows as
+  before. The line is warmed only while the flag is on. Log line: `r1_transition_tail_withheld`.
+  Rollback: `fly secrets set R1_START_ASK_ONCE=0 -a project-hello-voice` (a start question after
+  every answer, rotated, as before).
+
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 
 Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the
