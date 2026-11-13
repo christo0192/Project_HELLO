@@ -2461,13 +2461,29 @@ _READY_LEAD_WORDS = frozenset(
 # A readiness the turn takes back, puts off or makes depend on something, or a turn that still asks
 # for something: never a consent, wherever it sits ("I'll be ready in a minute", "ready, but first
 # one question", "I'm ready, can you repeat the goal").  "If you are" is the idiom, cut out first.
+# christy-ready review: also an exception ("one query, otherwise I'm ready"), a query or concern,
+# time asked for ("two seconds", "just a moment", "allow me a minute") or something the candidate
+# means to do first ("let me check my notes", "one more thing", "I need to know the fee").
 _WIDE_CONSENT_HOLD_RE = re.compile(
     r"\b(?:if|unless|once|until|till|later|soon|almost|nearly|yet|wait|hold on|hang on|"
     r"in a (?:bit|sec|second|minute|moment|while)|one (?:sec|second|minute|moment)|give me|"
-    r"need (?:a|some|more)|before (?:we|i|that|starting|the)|after|first|questions?|ask|asking|"
-    r"doubts?|clarify|clarification|explain|repeat|again|tell me|remind me|go over|recap|"
-    r"summar\w*|want to know|wanted to know|wondering|curious|maybe|might|probably|kind of|"
-    r"kinda|sort of|unsure)\b"
+    r"need (?:a|some|more|to)|before (?:we|i|that|starting|the)|after|first|questions?|ask|"
+    r"asking|doubts?|clarify|clarification|explain\w*|repeat\w*|again|tell me|remind me|go over|"
+    r"recap|summar\w*|want to know|wanted to know|wondering|curious|maybe|might|probably|"
+    r"kind of|kinda|sort of|unsure|otherwise|except|apart from|quer(?:y|ies)|concerns?|"
+    r"let me|allow me|one more thing|"
+    r"(?:a|one|two|three|four|five|ten|few|couple(?: of)?) (?:more )?"
+    r"(?:secs?|seconds?|mins?|minutes?|moments?))\b"
+)
+# christy-ready review: a readiness after "then" ("Let me check my notes, then let's start.") is
+# put off behind whatever came first, unless that was only filler or an acknowledgement ("Okay
+# then, let's start.", "Got it. Okay then, I'm ready.", "Okay, that's clear, then let's do it.").
+_WIDE_THEN_RE = re.compile(r"\bthen\b")
+_WIDE_THEN_LEAD_OK = frozenset(
+    {
+        "got", "get", "gotcha", "understood", "understand", "clear", "that's", "thats", "makes",
+        "sense", "see", "noted",
+    }
 )
 # "Ready when you are.", "I'm ready if you are.", "whenever you're ready": the courtesy, not a
 # condition (``_WHEN_YOU_ARE_RE`` is the strict reading's).
@@ -2476,7 +2492,7 @@ _WIDE_WHEN_YOU_ARE_RE = re.compile(
 )
 # "Thanks for answering my questions" closes the questions; it asks none.
 _ANSWERED_QUESTIONS_RE = re.compile(
-    r"\b(?:answer(?:ing|ed)?|for|clearing|cleared) (?:all )?(?:my|the|those|these) "
+    r"\b(?:answer(?:ing|ed)|for|clearing|cleared) (?:all )?(?:my|the|those|these) "
     r"(?:questions?|doubts?)\b"
 )
 # A clause that opens as a question, punctuated or not ("ready? what do I do", "am I ready",
@@ -2486,7 +2502,9 @@ _WIDE_ASK_START_RE = re.compile(
     r"^(?:(?:so|and|but|okay|ok|um|uh|well|sorry|yes|yeah|haan|then|christy) )*"
     r"(?:what|what's|whats|how|how's|when|where|why|who|whom|whose|which|whether|"
     r"(?:am|is|are|do|does|did|will|would|have|has|was|were|can|could|should|shall|may) "
-    r"(?:i|we|you|she|he|it|there|they))\b"
+    r"(?:i|we|you|she|he|it|there|they|"
+    # christy-ready review: "Is the course online.", "Does the learner know the fee."
+    r"the|a|an|this|that|these|those|my|your|our|his|her|their|its|everything|anything))\b"
 )
 _CLAUSE_SPLIT_RE = re.compile(r"[.?!;,。？！]+")
 # What may follow the readiness statement: filler, courtesy, another start phrase, and these
@@ -2519,7 +2537,8 @@ def _is_wide_consent(text: str, folded: str) -> bool:
     phrase or a send-off ("Let's get it over with.").  Never a turn with a question mark or a
     clause that opens as a question, a negation anywhere ("I'm not ready", "I don't think I'm
     ready"), a readiness put off or made to depend on something ("I'll be ready in a minute",
-    "ready once I've read it"), or one that still asks for something ("ready, but one question").
+    "ready once I've read it", "let me check my notes, then let's start"), or one that still asks
+    for something ("ready, but one question", "one query, otherwise I'm ready").
     False negatives cost a nudge; a false positive would start the role-play, so in doubt: no.
     """
     if _has_question_mark(text):
@@ -2536,6 +2555,11 @@ def _is_wide_consent(text: str, folded: str) -> bool:
     match = _wide_ready_match(rest)
     if match is None:
         return False
+    thens = list(_WIDE_THEN_RE.finditer(rest, 0, match.start()))
+    if thens:
+        allowed = _READY_LEAD_WORDS | _READY_TAIL_FILLER | _WIDE_THEN_LEAD_OK
+        if any(word not in allowed for word in rest[: thens[-1].start()].split()):
+            return False  # christy-ready review: a readiness put off behind "then"
     tail = _READY_SEND_OFF_RE.sub(" ", rest[match.end():])
     tail = _START_RE.sub(" ", _WIDE_READY_RE.sub(" ", tail))
     return all(word in _READY_TAIL_FILLER for word in tail.split())
@@ -3206,6 +3230,9 @@ class R1Interview:
         # went out since the last start question, so a quiet pause gets L-TRANSITION-ASK-PAUSE.
         self._start_asked_after_answer = False
         self._start_prompt_owed = False
+        # christy-ready review: L-TRANSITION-ASK-PAUSE has been said; a later owed pause gets the
+        # ladder's L-TRANSITION-REASK instead, so the candidate never hears it word for word twice.
+        self._ask_pause_spoken = False
         self._pressed_during: str | None = None
         self._start_by: str | None = None
         self._transition_started_at: float | None = None
@@ -8926,9 +8953,11 @@ class R1Interview:
                 quiet_window = False
                 if step < len(TRANSITION_SILENCE_LADDER):
                     line_id = TRANSITION_SILENCE_LADDER[step][1]
-                    if step == 0 and self._start_prompt_owed:
-                        # christy-ready: the start question the answers went without, once.
+                    if step == 0 and self._start_prompt_owed and not self._ask_pause_spoken:
+                        # christy-ready: the start question the answers went without, once per
+                        # transition; a later owed pause keeps the rung's L-TRANSITION-REASK.
                         line_id = "L-TRANSITION-ASK-PAUSE"
+                        self._ask_pause_spoken = True
                     await self.say(line_id)
                     step += 1
                     continue

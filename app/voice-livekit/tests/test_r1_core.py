@@ -11996,6 +11996,9 @@ class TestTransitionReadyAnywhere(R1TestCase):
         "It sounds a bit tricky but yeah, I suppose I'm ready, let's do it.",
         "Achha, theek hai. I'm ready, chalo.", "Alright, makes sense. I'm all set.",
         "Got it, thanks Christy. Ready when you are.", "Right, that's clear. I'm ready to start.",
+        # christy-ready review: a "then" after nothing but filler or an acknowledgement.
+        "Okay then, let's start.", "Alright then, I'm ready.", "Got it. Okay then, I'm ready.",
+        "So then, let's begin.", "Okay, that's clear, then let's do it.",
     )
     # A question, a conditional or deferral, a negation, or a turn that still asks for something.
     NOT_READY = (
@@ -12010,6 +12013,20 @@ class TestTransitionReadyAnywhere(R1TestCase):
         "I'll be ready soon.", "Not yet, but I'll be ready after this.",
         "I'm ready if I can ask one more thing.", "Hang on, I'm nearly ready.",
         "Could you say it again? I'm ready after that.", "What do I do once I'm ready?",
+    )
+    # christy-ready review: a readiness put off behind "then" / "otherwise", a query or concern
+    # still pending, time asked for, or a question without a question mark.
+    NOT_READY_DEFERRED = (
+        "Just one query, otherwise I'm ready.",
+        "I have a query regarding the fee, otherwise I'm ready.",
+        "Let me check my notes, then let's start.", "Let me quickly read it, then I'm ready.",
+        "Allow me a minute, then let's start.", "Two seconds, I'm ready.",
+        "Just a moment, I'm ready", "Let me unmute and then let's start.",
+        "One more thing and then let's begin", "I need to know the fee, then I'm ready",
+        "Please answer my question, then I'm ready", "Finish explaining the card, then I'm ready",
+        "Is the course online. Okay, let's start.", "I have one concern otherwise let's start",
+        "Let me get some water and then let's start", "Two minutes, then let's start",
+        "Let me grab a pen, I'm ready.", "Does the learner know the fee. Okay, I'm ready.",
     )
     # The simulation's other transition turns: none of them becomes a consent.
     SIM_NOT_READY = (
@@ -12045,6 +12062,15 @@ class TestTransitionReadyAnywhere(R1TestCase):
         for text in self.NOT_READY + self.SIM_NOT_READY:
             with self.subTest(text=text):
                 self.assertFalse(r1_session.is_transition_consent(text))
+
+    def test_a_ready_put_off_or_with_something_pending_is_never_a_consent(self) -> None:
+        for text in self.NOT_READY_DEFERRED:
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_transition_consent(text))
+        with mock.patch.dict(os.environ, {"R1_CONSENT_WIDE": "0"}):
+            for text in self.NOT_READY_DEFERRED:
+                with self.subTest(text=text, wide="0"):
+                    self.assertFalse(r1_session.is_transition_consent(text))
 
     def test_the_flag_off_restores_the_strict_reading(self) -> None:
         with mock.patch.dict(os.environ, {"R1_CONSENT_WIDE": "0"}):
@@ -12171,6 +12197,32 @@ class TestTransitionStartAskedOnce(R1TestCase):
             self.assertEqual(self.count("L-TRANSITION-ASK-PAUSE"), 1)
             self.assertEqual(self.count("L-TRANSITION-REASK-2"), 0)
             self.final_transcript("Yes.")
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+            self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
+    async def test_a_second_quiet_pause_gets_the_reask_never_the_pause_prompt_again(self) -> None:
+        # christy-ready review: L-TRANSITION-ASK-PAUSE is said once per transition; a later
+        # tailless answer's pause gets the ladder's own L-TRANSITION-REASK, worded differently.
+        with mock.patch.object(
+            r1_session,
+            "TRANSITION_SILENCE_LADDER",
+            ((5.0, "L-TRANSITION-REASK"), (5.0, "L-TRANSITION-REASK-2")),
+        ), mock.patch.object(r1_session, "TRANSITION_QUIET_TURN_REASK_SECONDS", 0.05):
+            task = await self.start_transition()
+            self.interview._start_asked_after_answer = True  # one answer already ended with it
+            for question, line_id in zip(
+                self.QUESTIONS[1:], ("L-TRANSITION-ASK-PAUSE", "L-TRANSITION-REASK")
+            ):
+                self.assertFalse(await self.answer(question))
+                self.assertEqual(self.interview._last_reply.tail, "")
+                self.agent_state("listening")
+                await self.until(
+                    lambda: self.count(line_id) == 1 and not self.interview._start_prompt_owed,
+                    timeout=2.0,
+                )
+            self.assertEqual(self.count("L-TRANSITION-ASK-PAUSE"), 1)
+            self.assertEqual(self.count("L-TRANSITION-REASK-2"), 0)
+            self.final_transcript("ready")
             self.assertIsNone(await asyncio.wait_for(task, 10.0))
             self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
 
