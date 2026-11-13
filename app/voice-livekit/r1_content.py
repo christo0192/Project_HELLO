@@ -448,6 +448,16 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         "learner_prefix_timeline_v2_sample": p.learner_prefix(
             sample, offer_realism=True, probe_first=True, price_check=True, timeline_v2=True
         ),
+        # SWEEP-10: the role note, its rotated examples, and a reminder rendered with it.
+        "role_confusion_note": p.ROLE_CONFUSION_NOTE,
+        "role_confusion_examples": list(p.ROLE_CONFUSION_EXAMPLES),
+        "role_confusion_reminder_sample": p.turn_reminder(
+            sample,
+            r_sec=0,
+            character_break=True,
+            voice_v2=True,
+            role_confusion=p.ROLE_CONFUSION_NOTE.format(example=p.ROLE_CONFUSION_EXAMPLES[0]),
+        ),
         # SWEEP-15: the cut notes without a frame to narrate.
         "interrupted_note_v2": p.INTERRUPTED_NOTE_V2,
         "cut_repeat_note_v2": p.CUT_REPEAT_NOTE_V2,

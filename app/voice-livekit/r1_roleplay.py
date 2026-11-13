@@ -268,6 +268,8 @@ from r1_prompts import (
     PUSH_REACT_NOTE,
     PUSH_REACT_NOTE_V2,
     RESOLVED_NOTE,
+    ROLE_CONFUSION_EXAMPLES,
+    ROLE_CONFUSION_NOTE,
     SHORT_ON_TIME_CONCERNS_NOTE,
     SHORT_ON_TIME_NOTE,
     SOFT_TIC_NOTE,
@@ -394,6 +396,7 @@ from r1_tracker import (
     declines_wrap_offer,
     detect_abuse,
     detect_character_break,
+    role_confusion_in,
     end_intent_level,
     is_bare_yes,
     is_short_wrap_yes,
@@ -1345,6 +1348,10 @@ class RolePlayEngine:
         self._cool = False
         self._hangup_prelude = False
         self._unclear_offer = 0  # review S3R-2: the early-close question a bare yes heard again
+        # M032 S7L, learner follow-ups (ints and booleans only).  SWEEP-10: whether this turn has
+        # the roles the wrong way round, and the reminders that got the role note.
+        self._role_confused = False
+        self._role_confusion_turns = 0
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -1770,7 +1777,12 @@ class RolePlayEngine:
             self._end_pending = False
             self._restore_lost(lost_undo)
             return self._late_end_request(turn_index, r_sec=r_sec, by_model=by_model)
-        break_kind = detect_character_break(candidate_text)
+        # M032 SWEEP-10: a role reversal is read on its first phrasing ("can you sell this to me?").
+        role_v2 = flag_on(FLAG_ROLE_CONFUSION_V2)
+        break_kind = detect_character_break(candidate_text, role_v2=role_v2)
+        self._role_confused = (
+            role_v2 and break_kind == "coach" and role_confusion_in(candidate_text)
+        )
         if lost is not None:
             if (
                 (backchannel or repair or answers_nothing)
@@ -4890,6 +4902,16 @@ class RolePlayEngine:
                 and RESPOND_QUESTION in self._turn_kinds
                 and flag_on(FLAG_RESPOND_FIRST)
             )
+            # M032 SWEEP-10: after the coach aside a role reversal gets the role note, never the
+            # AI or test note (an AI or test break keeps CHARACTER_BREAK_NOTE).
+            role_note = ""
+            if self._role_confused and kind == "coach" and not confirm:
+                role_note = ROLE_CONFUSION_NOTE.format(
+                    example=pick_variant(
+                        ROLE_CONFUSION_EXAMPLES, self.seed, self._role_confusion_turns
+                    )
+                )
+                self._role_confusion_turns += 1
             reminder = turn_reminder(
                 self.persona,
                 r_sec=self.last_r,
@@ -4897,6 +4919,7 @@ class RolePlayEngine:
                 unlocked_topics=reveal_topics,
                 monologue_sec=monologue,
                 character_break=kind is not None,
+                role_confusion=role_note,
                 price_wrap=price_wrap,
                 intent_brief="" if intent is None else intent.brief,
                 must_say=() if intent is None else intent.must_say,
@@ -5417,6 +5440,12 @@ class RolePlayEngine:
             "short_on_time_notes": self._short_on_time_notes,
         }
 
+    def _followups_log(self) -> dict[str, Any]:
+        """M032 S7L: the learner follow-ups' counts, no text."""
+        return {
+            "role_confusion_turns": self._role_confusion_turns,
+        }
+
     def admin_log(self, *, final: bool = False, r_end: float | None = None) -> dict[str, Any]:
         """The trusted administration log (turn indices, counts and booleans only)."""
         schedule = self.scheduler.summary(final=final)
@@ -5532,6 +5561,8 @@ class RolePlayEngine:
             ),
             # M032 S3, endings and abuse (counts and booleans; ``session_facts.learner_endings``).
             "endings": self._endings_log(),
+            # M032 S7L, learner follow-ups (counts only; ``session_facts.learner_followups``).
+            "followups": self._followups_log(),
             # Counts only (logged for the rehearsal metrics, not posted): replies that held a
             # question, the tracked phrase tics, and what the advisor already answered.
             "style": {

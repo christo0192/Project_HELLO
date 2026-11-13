@@ -2541,7 +2541,20 @@ class EndRequestTests(unittest.TestCase):
         again = s.say("Oh, I thought I am the one buying here.", 120)
         self.assertFalse(again.aside)  # one-off: the learner deflects in character
         self.assertEqual(again.character_break, "coach")
-        self.assertIn(CHARACTER_BREAK_NOTE, again.reminder)
+        # M032 SWEEP-10: a repeated reversal gets the role note, not the AI or test note.
+        self.assertIn("mixed up who is who", again.reminder)
+        self.assertNotIn(CHARACTER_BREAK_NOTE, again.reminder)
+
+    def test_role_reversals_keep_the_character_break_note_with_the_flag_off(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_ROLE_CONFUSION_V2": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            first = s.say("I am the buyer here. So which course are you selling?", 60)
+            self.assertEqual(first.line_id, "L-ASIDE-COACH")
+            again = s.say("Oh, I thought I am the one buying here.", 120)
+            self.assertEqual(again.character_break, "coach")
+            self.assertIn(CHARACTER_BREAK_NOTE, again.reminder)
+            self.assertNotIn("mixed up who is who", again.reminder)
 
 
 class EchoThroughTheEngineTests(unittest.TestCase):
@@ -11572,6 +11585,64 @@ class PersonaTimelineLatchTests(unittest.TestCase):
             learner_prefix(P1, offer_realism=True, probe_first=True, price_check=True),
         )
         self.assertIn("You are calling from home after work", eng.learner_prefix_text())
+
+
+class RoleConfusionEngineTests(unittest.TestCase):
+    """M032 SWEEP-10: the first reversal gets the coach aside; a repeat gets the role note."""
+
+    def test_first_reversal_plays_the_aside_and_a_repeat_gets_the_role_note(self):
+        from r1_prompts import ROLE_CONFUSION_EXAMPLES
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        first = s.say("Can you sell this to me?", 40)
+        self.assertEqual(first.line_id, "L-ASIDE-COACH")
+        s.say(PITCH, 60)
+        again = s.say("I want to buy, not sell.", 80)
+        self.assertNotIn(CHARACTER_BREAK_NOTE, again.reminder or "")
+        self.assertIn("mixed up who is who", again.reminder)
+        self.assertTrue(any(example in again.reminder for example in ROLE_CONFUSION_EXAMPLES))
+        self.assertEqual(s.eng.admin_log()["followups"]["role_confusion_turns"], 1)
+
+    def test_an_ai_question_after_the_aside_keeps_the_character_break_note(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("Sell me the course.", 40)
+        s.say(PITCH, 60)
+        ai = s.say("Wait, are you an AI?", 80)
+        self.assertIn(CHARACTER_BREAK_NOTE, ai.reminder)
+        self.assertNotIn("mixed up who is who", ai.reminder)
+
+    def test_a_forced_move_still_issues_on_a_reversal(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("Can you sell this to me?", 40)  # the aside
+        plan = s.say("Could you pitch the course to me.", 390)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        self.assertTrue(plan.reasons[-1].endswith(":forced"), plan.reasons)
+        self.assertIn("mixed up who is who", plan.reminder)
+        self.assertNotIn(CHARACTER_BREAK_NOTE, plan.reminder)
+
+    def test_flag_off_answers_the_new_forms_in_role(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_ROLE_CONFUSION_V2": "0"}):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("Can you sell this to me?", 40)
+            self.assertIsNone(plan.line_id)
+            self.assertIsNone(plan.character_break)
+            self.assertNotIn("mixed up who is who", plan.reminder or "")
+
+    def test_the_note_is_clean_with_the_guard_and_states_no_course_fact(self):
+        from r1_guard import GuardContext, guard_text
+        from r1_prompts import ROLE_CONFUSION_EXAMPLES, ROLE_CONFUSION_NOTE, control_prose
+
+        for example in ROLE_CONFUSION_EXAMPLES:
+            note = ROLE_CONFUSION_NOTE.format(example=example)
+            self.assertNotRegex(note, r"\$|\d|months?|weeks?")
+            prose = control_prose(note)
+            self.assertNotIn(example, prose)
+            ctx = GuardContext(persona=P1, phase="roleplay", control_texts=(prose,))
+            self.assertTrue(guard_text(example, ctx).clean, example)
 
 if __name__ == "__main__":
     unittest.main()

@@ -669,6 +669,22 @@ CHARACTER_BREAK_NOTE = (
     "do. Do not answer that. Say once, in character, that you are just a person looking "
     "at courses, and carry on."
 )
+# M032 SWEEP-10 (flag R1_ROLE_CONFUSION_V2): after the one-off coach aside, a candidate who still
+# has the roles the wrong way round ("sell it to me") gets this note instead of
+# CHARACTER_BREAK_NOTE, which talks about AI and test questions.  ``{example}`` rotates by seed.
+# New wording under D-M032-4, listed for review.
+ROLE_CONFUSION_NOTE = (
+    "- The advisor seems to have mixed up who is who on this call. Stay yourself and set it "
+    'straight in one short, friendly sentence in your own words, for example "{example}" Do not '
+    "agree that you are selling anything, do not talk about buyers or sellers, and do not "
+    "apologise. If you already set it straight earlier in this call, do not explain it again: "
+    "just carry on with what they said, or ask them one short question about the course."
+)
+ROLE_CONFUSION_EXAMPLES = (
+    "Oh, I think we've got our wires crossed: I filled in the form, and you're calling me back "
+    "about the course.",
+    "Hang on, I'm the one who enquired about the course, and you called me about it, right?",
+)
 
 GETTING_TO_KNOW_YOU_NOTE = (
     "INTERVIEW NOTE (not spoken; never mention it). This is the getting-to-know-you part. "
@@ -974,6 +990,7 @@ def turn_reminder(
     length_note: str = "",
     curiosity_v2: bool = False,
     winding: bool = False,
+    role_confusion: str = "",
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -1020,6 +1037,9 @@ def turn_reminder(
     ``winding`` (M032 S3.2, review S3R-6): the advisor is closing the call and the free reply is
     one goodbye (``CLOSE_NOTE`` in ``notes``), so its job line is ``WINDING_REPLY_NOTE``, it gets no
     opening-style, curiosity or length line, and the rider has no "or with a question".
+
+    ``role_confusion`` (M032 SWEEP-10): the rendered ``ROLE_CONFUSION_NOTE``, given in place of
+    ``CHARACTER_BREAK_NOTE`` when the advisor has the roles the wrong way round.
     """
     if winding and not intent_brief and not reaction_only and not confirm:
         style_note = ""
@@ -1123,7 +1143,9 @@ def turn_reminder(
     if curiosity and not intent_brief:
         template = CURIOSITY_NOTE_V2 if curiosity_v2 else CURIOSITY_NOTE
         lines.append(template.format(curiosity=curiosity))
-    if character_break:
+    if role_confusion:
+        lines.append(role_confusion)
+    elif character_break:
         lines.append(CHARACTER_BREAK_NOTE)
     monologue = _monologue_line(monologue_sec)
     if monologue:

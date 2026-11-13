@@ -687,6 +687,40 @@ _CONFUSED = r"\b(?:i'?m|i am) (?:really |so |a bit |totally |still |very )?(?:co
 # lead" is a job, "as a buyer, you'd want..." is a sales point), and only the sale ITSELF is asked
 # about ("what course are you most interested in?" is discovery).
 _ROLE_END = r"(?: here| now)?(?=\s*(?:[,.!?;:]|$|and\b|right\b|so\b))"
+# The role-confusion patterns of the release before M032 SWEEP-10 (they stay in _COACH_REQUEST too).
+_ROLE_CONFUSION_V1 = (
+    rf"\b(?:i'?m|i am) (?:the )?(?:buyer|customer|learner|student){_ROLE_END}",
+    r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?buying\b",
+    rf"\byou(?:'re| are) (?:the )?(?:seller|advisor|salesperson|sales person){_ROLE_END}",
+    r"\bwhat (?:course|program|programme) are you selling\b",
+    r"\bare you selling (?:the|this|a|that) (?:course|program|programme)\b",
+    r"\bare you (?:actually |really )?selling(?: (?:it|this|that|anything|something))?"
+    r"(?: to me)?" + _SENTENCE_END,
+)
+# M032 SWEEP-10 (flag R1_ROLE_CONFUSION_V2, passed in by the engine): the candidate casts
+# themselves as the buyer on the first phrasing ("can you sell this to me?", "sell me the course",
+# "I want to buy, not sell", "what program do you sell"), which went answered in role until the
+# third phrasing.  The object of "sell it" must end its clause, so "can you sell this to your
+# husband?" and "pitch it to your manager for sponsorship" (F4-PUSH and sponsorship talk) are never
+# read as role confusion.
+_SALE_OBJECT = r"(?:course|program|programme|product)"
+_ROLE_CONFUSION_V2 = (
+    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) (?:it|this|that|the "
+    rf"{_SALE_OBJECT}|your {_SALE_OBJECT})(?: to me)?(?=\s*(?:[,.!?;:]|$))",
+    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) me (?:the|this|your|a) "
+    rf"{_SALE_OBJECT}\b",
+    r"^(?:(?:okay|ok|so|then|now|just|please|yeah),? )*(?:sell|pitch) (?:(?:it|this|that|the "
+    rf"{_SALE_OBJECT}) to me|me (?:the|this|your|a) {_SALE_OBJECT})\b",
+    r"\b(?:i'?m|i am) (?:really |very |actually |just )?(?:interested|planning|looking|keen|ready)"
+    r"(?: (?:to|in))? (?:buy|buying|purchase|purchasing) (?:a |the |this |that |your |one )?"
+    rf"(?:data science )?{_SALE_OBJECT}\b",
+    rf"\bwhat {_SALE_OBJECT} (?:do )?you sell\b",
+    rf"\bwhat {_SALE_OBJECT} are you selling\b",
+    r"\bi(?:'m| am)? (?:looking|trying|here|want(?:ing)?|going|planning|need) to (?:buy|purchase)"
+    r"\b[^.?!]{0,40}\bnot (?:to )?sell\b",
+)
+_ROLE_CONFUSION_V1_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V1)
+_ROLE_CONFUSION_V2_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V2)
 _COACH_REQUEST = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -707,13 +741,7 @@ _COACH_REQUEST = tuple(
         r"\bgive me a hint\b",
         r"\bwho are you (?:supposed|meant) to be\b",
         r"\bwhat do you want me to do(?: now| here| next)?" + _SENTENCE_END,
-        rf"\b(?:i'?m|i am) (?:the )?(?:buyer|customer|learner|student){_ROLE_END}",
-        r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?buying\b",
-        rf"\byou(?:'re| are) (?:the )?(?:seller|advisor|salesperson|sales person){_ROLE_END}",
-        r"\bwhat (?:course|program|programme) are you selling\b",
-        r"\bare you selling (?:the|this|a|that) (?:course|program|programme)\b",
-        r"\bare you (?:actually |really )?selling(?: (?:it|this|that|anything|something))?"
-        r"(?: to me)?" + _SENTENCE_END,
+        *_ROLE_CONFUSION_V1,
         # Owner test 1eb18cd4 (#14-#18, owner decision 2026-10-30): a request to have the brief
         # explained again once the learner has picked up ("I wanted to understand this, uh, this
         # round, the role play brief.").  It must name the exercise within 40 characters of the
@@ -852,17 +880,38 @@ def detect_abuse(text: object, names: tuple[str, ...] = ()) -> bool:
     return False
 
 
-def detect_character_break(text: object) -> str | None:
+def role_confusion_in(text: object, *, v2: bool = True) -> bool:
+    """The candidate has the roles the wrong way round (M032 SWEEP-10), read sentence by sentence.
+
+    ``v2`` (the engine's R1_ROLE_CONFUSION_V2) adds the first-phrasing forms; without it only the
+    role patterns of the release before are read.
+    """
+    patterns = _ROLE_CONFUSION_V1_RE + (_ROLE_CONFUSION_V2_RE if v2 else ())
+    for sentence in split_sentences(fold(text)):
+        stripped = sentence.strip()
+        if any(pattern.search(stripped) for pattern in patterns):
+            return True
+    return False
+
+
+def detect_character_break(text: object, *, role_v2: bool = False) -> str | None:
     """Classify a character break (plan 5.10): ``coach``, ``ai`` or None.
 
     ``coach`` means the candidate asks to be coached or says they are confused; ``ai``
     means they ask whether this is an AI or a test.  Deterministic and lexical: it only
     chooses between an in-character deflection and the one-off out-of-character aside.
     It can never end the call or change a phase.
+
+    ``role_v2`` (M032 SWEEP-10, the engine's R1_ROLE_CONFUSION_V2): the first phrasings of a role
+    reversal ("can you sell this to me?") are a coaching break too.
     """
     folded = fold(text)
     for sentence in split_sentences(folded):
         if any(pattern.search(sentence) for pattern in _COACH_REQUEST):
+            return "coach"
+        if role_v2 and any(
+            pattern.search(sentence.strip()) for pattern in _ROLE_CONFUSION_V2_RE
+        ):
             return "coach"
     if _AI_QUESTION.search(folded):
         return "ai"
