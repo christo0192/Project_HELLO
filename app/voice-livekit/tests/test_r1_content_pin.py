@@ -146,7 +146,9 @@ import r1_world
 # and L-MUTE are unchanged.
 # Revision 24 (M032 live simulation, diagnosis 1): L-TRANSITION-RECAP's own either/or question
 # (CR-1) and the repaired transition note on "Of course, go ahead." and repeat requests (BR-2).
-PINNED_CONTENT_SHA256 = "571473820258471ed5965d8f7c66bba68fa20e7246befc6014af813c2d792f77"
+# Revision 25 (review of diagnosis 1): the one-line note for the answer to her repeated icebreaker
+# question (TRANSITION_IB_ANSWER_NOTE, BR-2).
+PINNED_CONTENT_SHA256 = "ad2f292f9861bff8458bf7dd8d094811ee86a03223fb6b5d48076b3b97dec7a1"
 
 CONTENT_MODULES = (
     "r1_text",

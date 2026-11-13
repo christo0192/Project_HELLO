@@ -9987,6 +9987,11 @@ class TestTransitionSimulationFixes(R1TestCase):
             "i want to understand " * 3000 + "the role play",
             "go back to the earlier question " * 2000,
             "the question before the last one " * 2000,
+            # Review of diagnosis 1: the aimed go-over, the understand object, own questions.
+            "okay just go over the role play " * 2000 + "again",
+            "i want to understand meera " * 3000,
+            "can you repeat your previous question about the " * 1500 + "salary",
+            "my first question is what is the " * 2000,
         ):
             started = _time.perf_counter()
             r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
@@ -10084,6 +10089,153 @@ class TestTransitionSimulationFixes(R1TestCase):
         self.assertIn("only ask whether they may ask something", lowered)
         self.assertIn('never answer "go ahead"', lowered)
         self.assertIn("repeat or explain it in one sentence", lowered)
+
+    # --- Review of diagnosis 1 (BR-2): the candidate's own questions ------------------------
+
+    # Answers to "do you have any questions first?" that name a "first", "other" or "previous"
+    # question of the candidate's own: none asks to hear an icebreaker question again.
+    OWN_QUESTIONS = (
+        "My first question is, what is the training period?",
+        "One other question: what is the shift timing?",
+        "I have one other question, what is the dress code?",
+        "First question, what is the work mode?",
+        "Going back to the previous question, what's the salary?",
+        "Okay, another question, how many leaves do we get?",
+        "Can we go back to the first question? What is the work mode?",
+        "My previous question was about the incentives, can you repeat the answer?",
+        "I'll repeat my first question, what is the notice period?",
+    )
+
+    def test_a_candidate_question_is_never_an_icebreaker_repeat(self) -> None:
+        for text in self.OWN_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_icebreaker_question_request(text))
+        # Her questions asked for again, in other words, still are.
+        for text in (
+            "Can you repeat the first question?",
+            "Could you ask me that earlier question again?",
+            "Remind me of your previous question.",
+            "What was your earlier question again?",
+            "Can you repeat the question you asked me earlier about my targets?",
+            "Please repeat your opening question.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_icebreaker_question_request(text))
+
+    async def test_a_candidate_question_is_answered_not_given_her_question(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.agent_state("listening")
+        for text in self.OWN_QUESTIONS[:5]:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                )
+
+    async def test_a_question_after_her_repeated_question_is_counted_as_one(self) -> None:
+        # The repeat is open, but the next turn asks about the job: it is one of their questions.
+        self.interview._enter(R1Phase.TRANSITION)
+        self.agent_state("listening")
+        self.interview._transition_ib_repeat_open = True
+        self.assertFalse(
+            self.interview._answers_her_repeated_question(
+                "No, I meant what is the training period?"
+            )
+        )
+        self.assertFalse(
+            self.interview._answers_her_repeated_question("Sorry, what are the shift timings")
+        )
+        self.assertTrue(
+            self.interview._answers_her_repeated_question(
+                "I usually read the lead's notes and plan two questions before I dial."
+            )
+        )
+
+    async def test_the_first_question_gets_her_first_question(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        questions = [
+            "How do you usually prepare before a call?",
+            "How do you keep track of your customers each day?",
+            "What do you do when a customer goes quiet?",
+        ]
+        self.interview._ib_questions = list(questions)
+        for text in ("Can you repeat the first question?", "Please repeat your opening question."):
+            with self.subTest(text=text):
+                self.assertEqual(self.interview._transition_question_to_repeat(text), questions[0])
+        self.assertEqual(
+            self.interview._transition_question_to_repeat("Can you repeat your previous question?"),
+            questions[-1],
+        )
+
+    async def test_the_answer_to_her_repeated_question_gets_a_reaction_note(self) -> None:
+        from r1_prompts import TRANSITION_IB_ANSWER_NOTE, TRANSITION_REMINDER_REPAIRED
+
+        self.interview._enter(R1Phase.TRANSITION)
+        self.agent_state("listening")
+        self.interview._ib_questions = ["How do you usually prepare before a call?"]
+        reply = r1_session.Reply(phase="transition", candidate_text="x")
+        self.interview._transition_ib_repeat_reply(reply, "Can you repeat your previous question?")
+        self.assertTrue(self.interview._transition_ib_repeat_open)
+        answer = "I read the lead's notes and plan my first two questions."
+        self.assertEqual(self.interview._transition_action(answer), r1_session._TRANSITION_ANSWER)
+        reply = r1_session.Reply(phase="transition", candidate_text=answer)
+        self.interview._note_ib_answer(reply)
+        self.assertTrue(reply.note.startswith(TRANSITION_REMINDER_REPAIRED))
+        self.assertTrue(reply.note.endswith(TRANSITION_IB_ANSWER_NOTE))
+        lowered = TRANSITION_IB_ANSWER_NOTE.lower()
+        self.assertIn("answering your earlier question", lowered)
+        self.assertIn("one short sentence", lowered)
+        self.assertIn("ask nothing", lowered)
+
+    # --- Review of diagnosis 1 (BR-1): a start or a plan is no brief request ----------------
+
+    # Said by a candidate who is ready to start, or who describes their plan for the call.
+    STARTS_AND_PLANS = (
+        "Sure, I can go through the role play now.",
+        "No questions, I'd like to go through the role play now.",
+        "Fine, I'm happy to go through the role play.",
+        "Yes, go through the role play.",
+        "Alright, let me go through the role play then.",
+        "I think I can go through the scenario now.",
+        "In the role play, I will be clear about the fees.",
+        "In the role play I would like to understand her needs first.",
+        "I want to understand Meera's background before I pitch.",
+        "I'll go through the scenario once more in my head.",
+    )
+
+    def test_a_start_or_a_plan_is_never_a_brief_request(self) -> None:
+        for text in self.STARTS_AND_PLANS:
+            with self.subTest(text=text):
+                self.assertFalse(
+                    r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+                )
+                self.assertFalse(r1_session.names_the_roleplay(text, self.LEADS))
+        # Asks aimed at Christy still are, with or without "again".
+        for text in (
+            "Can you walk me through the role play?",
+            "Could you go through the scenario for me?",
+            "Go over the role play again for me, please.",
+            "Sorry, I missed some of that. Go through the scenario again.",
+            "I want to understand the role play first.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(
+                    r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+                    or r1_session.names_the_roleplay(text, self.LEADS)
+                )
+
+    async def test_a_start_or_a_plan_never_replays_the_brief(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.agent_state("listening")
+        for text in self.STARTS_AND_PLANS:
+            with self.subTest(text=text):
+                self.assertNotIn(
+                    self.interview._transition_action(text),
+                    (r1_session._TRANSITION_BRIEF, r1_session._TRANSITION_RECAP),
+                )
 
     # --- CR-1 -------------------------------------------------------------------------------
 

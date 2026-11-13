@@ -171,7 +171,10 @@ import r1_world
 #    heard three times (CR-1), and the repaired transition note says when "Of course, go ahead."
 #    is for, with an example, and that a request to repeat or explain gets that, in one sentence
 #    (BR-2).  No other pinned text changed.
-CONTENT_REVISION = 24
+# 25: review of diagnosis 1 (BR-2): the turn that answers her repeated icebreaker question gets one
+#    more line in the transition note, r1_prompts.TRANSITION_IB_ANSWER_NOTE ("react in one short
+#    sentence ... and ask nothing").  No other pinned text changed.
+CONTENT_REVISION = 25
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -365,6 +368,7 @@ def manifest() -> dict[str, Any]:
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,
             "transition_reminder_repaired": r1_prompts.TRANSITION_REMINDER_REPAIRED,
+            "transition_ib_answer_note": r1_prompts.TRANSITION_IB_ANSWER_NOTE,
             "getting_to_know_you_note": r1_prompts.GETTING_TO_KNOW_YOU_NOTE,
             "learner_prefixes": {
                 f"{p.id}.{v.id}": r1_prompts.learner_prefix(r1_personas.resolve_persona(

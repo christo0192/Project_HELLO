@@ -332,6 +332,13 @@ TRANSITION_REMINDER_REPAIRED = (
     "brief, never give tips on how to sell, and never ask whether they are ready to start: the "
     "interview asks that itself."
 )
+# Review of diagnosis 1 (BR-2): the turn after her repeated icebreaker question answers HER
+# question, so the note above ("they may ask you questions ... the hiring team will follow up")
+# gets one line more for that turn only.  The session's start question follows the reaction.
+TRANSITION_IB_ANSWER_NOTE = (
+    "This turn: they are answering your earlier question, which you just asked again. React in "
+    "one short sentence to what they said, and ask nothing."
+)
 _TRANSITION_PHASES = frozenset({"transition"})
 
 # M032 S5 item 1 (owner's call fda9e9f6, #3-#21: every icebreaker reply opened with a verdict on

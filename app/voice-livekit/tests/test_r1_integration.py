@@ -46,7 +46,13 @@ from r1_linecache import (
 from r1_persistence import R1TurnWriter
 from r1_personas import PERSONA_IDS, PERSONAS, resolve_persona
 from r1_phases import R1Phase, R1PhaseMachine
-from r1_prompts import WRAPUP_NOTE, WRAPUP_REMINDER, interviewer_prefix, learner_prefix
+from r1_prompts import (
+    TRANSITION_IB_ANSWER_NOTE,
+    WRAPUP_NOTE,
+    WRAPUP_REMINDER,
+    interviewer_prefix,
+    learner_prefix,
+)
 from r1_replies import (
     SOURCE_ATTEMPT,
     SOURCE_SEED,
@@ -4311,6 +4317,30 @@ class TestTransitionQuestionRepeatWiring(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(spoken.endswith(tail))
         self.assertEqual(rig.interview._transition_answers, 0)
         self.assertEqual(rig.interview._start_question, r1_session._EITHER_OR)
+        # Review of diagnosis 1: the model is told this turn answers HER question.
+        sent = "\n".join(message["content"] for message in answer.calls[-1])
+        self.assertIn(TRANSITION_IB_ANSWER_NOTE, sent)
+
+    async def test_a_question_after_the_repeat_is_one_of_theirs(self):
+        # Review of diagnosis 1: a job question after the repeat is counted, with the usual note.
+        rig = await self.rig()
+        await rig.converse(TR_REPEAT_EARLIER)
+        answer = TokenProvider("The hiring team will follow up on that.")
+        await rig.converse("No, I meant, what is the training period?", provider=answer)
+        self.assertEqual(rig.interview._transition_answers, 1)
+        sent = "\n".join(message["content"] for message in answer.calls[-1])
+        self.assertNotIn(TRANSITION_IB_ANSWER_NOTE, sent)
+
+    async def test_a_candidate_question_naming_a_first_question_reaches_the_model(self):
+        # Review of diagnosis 1: "My first question is ..." is theirs, never her question again.
+        rig = await self.rig()
+        answer = TokenProvider("The hiring team will follow up on that.")
+        spoken = await rig.converse(
+            "My first question is, what is the training period?", provider=answer
+        )
+        self.assertTrue(spoken.startswith("The hiring team will follow up on that."))
+        self.assertEqual(rig.interview._transition_answers, 1)
+        self.assertFalse(rig.interview._transition_ib_repeat_open)
 
     async def test_the_question_before_the_last_one(self):
         rig = await self.rig()
