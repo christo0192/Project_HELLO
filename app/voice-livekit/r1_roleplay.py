@@ -2411,8 +2411,10 @@ class RolePlayEngine:
         responding = respond and bool(kinds) and not self._force_curiosity
         if come_back or your_number or opening:
             # M032 SWEEP-7: the come-back is this reply's one question, and SWEEP-6's answer and
-            # SWEEP-9's opening are its one job; no curiosity hand-over or check-in note.
-            pass
+            # SWEEP-9's opening are its one job; no curiosity hand-over or check-in note.  The
+            # free reply still counts toward the hand-over's cadence, as it did before them.
+            if not quiet and (self._force_curiosity or not responding):
+                self._curiosity_for_free_reply(skip=True)
         elif self._force_curiosity and not quiet:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
             # reaction and one real question, never the stall.
