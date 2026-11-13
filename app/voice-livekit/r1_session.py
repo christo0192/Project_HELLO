@@ -210,18 +210,22 @@ from r1_end_intent import (
     parse_end_intent,
     prefilter_hit,
 )
-from r1_guard import FALLBACK_REPLY, StreamGuard
+from r1_guard import FALLBACK_REPLY, StreamGuard, guard_story_echo_enabled
 from r1_icebreaker import (
     BRIDGE_NOTE,
     BRIDGE_TIMEOUT_SEC,
     FREE_RESTATE,
     HOLD_MIN_BUDGET_SECONDS,
+    IB_PRESENCE_HOLD,
+    IB_PRESENCE_HOLD_SECONDS,
     IB_REPEAT_OLDER_TEMPLATE,
     IB_REPEAT_SAME_TEMPLATE,
     ICEBREAKER_HOLD_WAIT_SECONDS,
+    JOB_REASK,
     IcebreakerPlan,
     bridge_wanted,
     clean_bridge,
+    ib_reask_v2_enabled,
     icebreaker_plan_enabled,
     icebreaker_repair_enabled,
     is_closed_question,
@@ -270,12 +274,14 @@ from r1_prompts import (
     interviewer_prefix,
     interviewer_reminder,
     interviewer_voice_enabled,
+    reaction_variety_enabled,
     select_context,
 )
 from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
 from r1_script import (
     INTERVIEWER_NAME,
     active_line_id,
+    brief_variety_enabled,
     is_candidate_free,
     known_first_name,
     line,
@@ -283,7 +289,7 @@ from r1_script import (
     transition_repair_enabled,
 )
 from r1_sarvam import current_speech_id
-from r1_text import normalize
+from r1_text import normalize, pick_variant, split_sentences
 from r1_tracker import explicit_end_request
 from r1_tts import (
     INTERVIEWER,
@@ -324,6 +330,9 @@ TRANSITION_SILENCE_LADDER = ((20.0, "L-TRANSITION-REASK"), (30.0, "L-TRANSITION-
 # 20 s window, so the candidate heard 20 s of nothing.  It gets L-TRANSITION-REASK this many seconds
 # after the turn instead (the ladder's first rung only; pure silence keeps 20 s and 30 s).
 TRANSITION_QUIET_TURN_REASK_SECONDS = 6.0
+# D3-PICKUP1 (R1_CONSENT_ECHO_DROP): a consent committed this soon after the pickup finished (or on
+# a row from before it) is the late commit of the "ready" that started the role-play.
+ROLEPLAY_CONSENT_ECHO_SECONDS = 3.0
 TRANSITION_SILENCE_END_SECONDS = 30.0
 TRANSITION_MAX_SECONDS = 360.0
 SAY_PLAYOUT_SECONDS = 90.0
@@ -658,8 +667,11 @@ _WARM_ORDER = (
     "L-OPEN-HELLO-AGAIN",
     "L-TRANSITION",
     "L-TRANSITION-AGAIN",
+    "L-TRANSITION-AGAIN-PLAIN",
     "L-TRANSITION-RECAP",
+    "L-TRANSITION-RECAP-2",
     "L-PRESENT",
+    "L-TRANSITION-TAKE-TIME",
     "L-TRANSITION-NUDGE",
     "L-TRANSITION-REASK",
     "L-TRANSITION-ASK-PAUSE",
@@ -698,6 +710,11 @@ _BRIDGED_BRIEF = "L-TRANSITION-BRIDGED"
 # inside Christy's answers and are never warmed.
 _TRANSITION_REPAIR_LINES = frozenset(
     {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
+)
+# M032 diagnosis 3 (D3-BRIEF1): the lines only ``R1_BRIEF_VARIETY`` speaks, warmed only while it is
+# on; with it on, the verbatim replay L-TRANSITION-AGAIN can no longer play, so it is not warmed.
+_BRIEF_VARIETY_LINES = frozenset(
+    {"L-TRANSITION-AGAIN-PLAIN", "L-TRANSITION-RECAP-2", "L-TRANSITION-TAKE-TIME"}
 )
 # M032 S7C: the lines only each follow-up speaks, warmed only while its flag is on, so with all
 # three off the warm-up spends exactly revision 22's Sarvam requests.  With R1_MUTE_ASIDE_V2 on,
@@ -777,8 +794,31 @@ RECAP_LIMIT = 2
 # The lines that are a brief: a pronoun request ("say it in short") is about the brief only right
 # after one of them (SWEEP-29).
 _BRIEF_LINES = frozenset(
-    {"L-TRANSITION", "L-TRANSITION-BRIDGED", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP"}
+    {
+        "L-TRANSITION",
+        "L-TRANSITION-BRIDGED",
+        "L-TRANSITION-AGAIN",
+        "L-TRANSITION-RECAP",
+        # D3-BRIEF1 (R1_BRIEF_VARIETY): the re-explained replay and the second recap.
+        "L-TRANSITION-AGAIN-PLAIN",
+        "L-TRANSITION-RECAP-2",
+        # D3-ICE1 (R1_REACTION_VARIETY): the brief with a seeded thanks.
+        "L-TRANSITION-THANKS-A",
+        "L-TRANSITION-THANKS-B",
+        "L-TRANSITION-THANKS-C",
+    }
 )
+# D3-ICE1 (R1_REACTION_VARIETY): the first brief's thanks, one per session, picked by its seed.
+_THANKED_BRIEFS = ("L-TRANSITION-THANKS-A", "L-TRANSITION-THANKS-B", "L-TRANSITION-THANKS-C")
+# D3-BRIEF1 (R1_BRIEF_VARIETY): the recaps in the order they are played, and the start prompts a
+# brief request past every budget gets, each said at most once while another is unheard.
+_RECAP_LINES = ("L-TRANSITION-RECAP", "L-TRANSITION-RECAP-2")
+_REASK_ROTATION = ("L-TRANSITION-REASK", "L-TRANSITION-REASK-2", "L-TRANSITION-NUDGE")
+_PRESENCE_REASKS = ("L-TRANSITION-REASK", "L-TRANSITION-NUDGE")
+# D3-BRIEF1: "Are you there?" this soon after a start question finished playing gets "Yes, I'm
+# here." and L-TRANSITION-TAKE-TIME, never the start question again (int-live-3 M01: the reask
+# followed the recap's own start question by 20 s).
+PRESENCE_TAKE_TIME_SECONDS = 30.0
 # SWEEP-32: the answers' start questions once the brief's either/or question has been heard.
 _ROTATED_TAILS = ("L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3")
 # What Christy's last start question asked (``R1Interview._start_question``, M1 review fix): a
@@ -797,6 +837,10 @@ _BARE_NO_WORDS = frozenset({"no", "nope", "nah", "none", "nothing"})
 _BARE_NO_REPLY_WORDS = frozenset({"no", "nope", "nah", "not", "really", "actually", "um", "uh"})
 _START_QUESTION_OF_LINE = {
     "L-TRANSITION": _EITHER_OR,
+    # D3-ICE1: the same brief with a seeded thanks (R1_REACTION_VARIETY).
+    "L-TRANSITION-THANKS-A": _EITHER_OR,
+    "L-TRANSITION-THANKS-B": _EITHER_OR,
+    "L-TRANSITION-THANKS-C": _EITHER_OR,
     "L-TRANSITION-BRIDGED": _EITHER_OR,  # M032 S5: the same brief, after Christy's reaction
     # M032 S6: the replay, the recap, the answers' rotated start questions and the rollback briefs
     # all end with an either/or question.
@@ -813,6 +857,11 @@ _START_QUESTION_OF_LINE = {
     "L-TRANSITION-STEER": _YES_NO,
     "L-TRANSITION-REASK-2": _SAY_READY,
     "L-TRANSITION-NUDGE": _SAY_READY,
+    # D3-BRIEF1 (R1_BRIEF_VARIETY): the re-explained replay, the second recap and the take-time line
+    # end with "just say 'ready'", no question.
+    "L-TRANSITION-AGAIN-PLAIN": _SAY_READY,
+    "L-TRANSITION-RECAP-2": _SAY_READY,
+    "L-TRANSITION-TAKE-TIME": _SAY_READY,
 }
 
 # Results of ``R1Interview._await_turn``.
@@ -916,6 +965,16 @@ def consent_wide_enabled() -> bool:
     a negation or a readiness put off.  Rollback: ``fly secrets set R1_CONSENT_WIDE=0 -a
     project-hello-voice`` (only a start phrase with nothing but filler around it, as before)."""
     return _env_switch(os.getenv("R1_CONSENT_WIDE"))
+
+
+def consent_echo_drop_enabled() -> bool:
+    """``R1_CONSENT_ECHO_DROP`` (default on; M032 diagnosis 3, D3-PICKUP1): the SDK's late commit
+    of the "ready" that started the role-play (heard at its final, before the pickup) is dropped
+    in the role-play, never answered by the learner as her first turn ("Hello, Meera speaking."
+    then "Hi, who's calling?" with no advisor turn between).  Read at use.  Rollback: ``fly
+    secrets set R1_CONSENT_ECHO_DROP=0 -a project-hello-voice`` (that commit is a role-play turn,
+    as before)."""
+    return _env_switch(os.getenv("R1_CONSENT_ECHO_DROP"))
 
 
 def start_ask_once_enabled() -> bool:
@@ -1817,6 +1876,35 @@ def is_short_brief_request(
             return True
         if after_brief and _SHORT_PRONOUN_RE.search(folded) is not None:
             return True
+    return False
+
+
+# D3-BRIEF1 (R1_BRIEF_VARIETY): a request for the brief in FULL or in more detail, the sibling of
+# ``is_short_brief_request``.  It keeps the replay for a candidate who asks for it even after a
+# recap; any other repeat request after a recap gets the next recap.
+_DETAIL_MARKER_RE = re.compile(
+    r"\b(?:more detail(?:s|ed)?|in (?:more |full |greater |a bit more )?detail|detailed|"
+    r"(?:the )?(?:full|whole|complete|long|longer) (?:version|brief|thing|details?|explanation|"
+    r"instructions?|scenario)|from the (?:start|beginning|top))\b"
+)
+_DETAIL_NEGATION_RE = re.compile(
+    r"\b(?:no|not|don't|dont|do not|without|no need for)(?: \S+){0,2}$"
+)
+
+
+def is_detail_brief_request(text: str) -> bool:
+    """D3-BRIEF1: does ``text`` ask for MORE detail or the FULL version ("I'd like a bit more
+    detail", "the whole thing again", "from the start")?  On folded text, one sentence at a time;
+    a consent wins first, and a negated marker ("not the full version") is none."""
+    if not text or is_transition_consent(text):
+        return False
+    for part in _SENTENCE_SPLIT_RE.split(str(text)):
+        folded = fold_speech(part)
+        if not folded:
+            continue
+        for match in _DETAIL_MARKER_RE.finditer(folded):
+            if _DETAIL_NEGATION_RE.search(folded[: match.start()].rstrip()) is None:
+                return True
     return False
 
 
@@ -3077,6 +3165,12 @@ class R1Interview:
         self._ib_quiet_after: str | None = None
         self._ib_repeat_closed = False
         self._ib_repair_carry = ""
+        # D3-IB-REASK1 (R1_IB_REASK_V2): her last icebreaker line asked a question that played in
+        # full and no turn has answered it yet; when it finished (``_clock``); and the question an
+        # "Are you there?" already got "Yes, I'm here. Take your time." for (once per question).
+        self._ib_question_open = False
+        self._ib_question_heard_at: float | None = None
+        self._ib_presence_held: str | None = None
         self._icebreaker_boundary_kind: str | None = None
         self._ib_boundary_presence_lines = 0
         self._icebreaker_fallback = ""
@@ -3184,6 +3278,9 @@ class R1Interview:
         # M032 S5: Christy's voice (``R1_INTERVIEWER_VOICE``), read once, so the interviewer
         # prefix (the DeepSeek cache prefix) stays byte-stable for the whole session.
         self._interviewer_voice = interviewer_voice_enabled()
+        # D3-ICE1 (``R1_REACTION_VARIETY``), read once for the same reason: the react clause of the
+        # voice text and the rider, the guard's summary trim, and the brief's seeded thanks.
+        self._reaction_variety = reaction_variety_enabled()
         # M032 S5 item 4, the transition bridge (``R1_TRANSITION_BRIDGE``, off by default): the
         # injectable compose call (like ``end_intent_runner``; the default asks R1's own client,
         # only when the session has an LLM), that client, and the history entries of the turns
@@ -3233,6 +3330,14 @@ class R1Interview:
         # christy-ready review: L-TRANSITION-ASK-PAUSE has been said; a later owed pause gets the
         # ladder's L-TRANSITION-REASK instead, so the candidate never hears it word for word twice.
         self._ask_pause_spoken = False
+        # D3-BRIEF1 (R1_BRIEF_VARIETY): when a start prompt last finished playing (session clock),
+        # and the transition lines Christy finished, in order (ids only).
+        self._start_prompt_heard_at: float | None = None
+        self._transition_said: list[str] = []
+        # D3-PICKUP1 (R1_CONSENT_ECHO_DROP): the last candidate row before the pickup, and when the
+        # pickup finished (``_clock``).
+        self._pickup_cutoff_index: int | None = None
+        self._pickup_ended_at: float | None = None
         self._pressed_during: str | None = None
         self._start_by: str | None = None
         self._transition_started_at: float | None = None
@@ -4175,8 +4280,10 @@ class R1Interview:
             # Set once the line has played: a short yes said over it answers nothing yet.
             self._start_question = _START_QUESTION_OF_LINE[line_id]
             self._start_prompt_owed = False  # christy-ready: a start question has been heard
+            self._start_prompt_heard_at = self._clock()  # D3-BRIEF1
         if self.machine.phase is R1Phase.TRANSITION:
             self._last_transition_line = line_id  # M032 S6: "say it in short" after a brief
+            self._transition_said.append(line_id)  # D3-BRIEF1: never the same reask twice
 
     # ------------------------------------------------------------ voices
 
@@ -4263,12 +4370,13 @@ class R1Interview:
             specs.append(LineSpec(line_id, text, persist=candidate_free, voice=voice))
         return specs
 
-    @staticmethod
-    def _warm_order() -> tuple[str, ...]:
+    def _warm_order(self) -> tuple[str, ...]:
         """``_WARM_ORDER``, with the bridged brief after L-TRANSITION while the bridge is on, and
         without M032 S6's lines while the transition repair is off, nor S7C's while theirs are,
-        nor L-TRANSITION-ASK-PAUSE while ``R1_START_ASK_ONCE`` is."""
-        order = _WARM_ORDER
+        nor L-TRANSITION-ASK-PAUSE while ``R1_START_ASK_ONCE`` is.  D3-ICE1: L-TRANSITION is the
+        session's thanked brief while ``R1_REACTION_VARIETY`` picks one (``_thanked_brief_id``)."""
+        first = self._thanked_brief_id()
+        order = tuple(first if line_id == "L-TRANSITION" else line_id for line_id in _WARM_ORDER)
         dropped: set[str] = set()
         if not transition_repair_enabled():
             dropped |= _TRANSITION_REPAIR_LINES
@@ -4281,11 +4389,14 @@ class R1Interview:
         dropped |= {"L-MUTE"} if mute_aside_v2_enabled() else _MUTE_V2_LINES
         if not start_ask_once_enabled():
             dropped.add("L-TRANSITION-ASK-PAUSE")  # christy-ready: only its pause speaks it
+        # D3-BRIEF1: the varied replay, recap and take-time line only while R1_BRIEF_VARIETY is on,
+        # and then not the verbatim replay they replace.
+        dropped |= {"L-TRANSITION-AGAIN"} if brief_variety_enabled() else _BRIEF_VARIETY_LINES
         if dropped:
             order = tuple(line_id for line_id in order if line_id not in dropped)
         if not transition_bridge_enabled():
             return order
-        index = order.index("L-TRANSITION") + 1
+        index = order.index(first) + 1
         return (*order[:index], _BRIDGED_BRIEF, *order[index:])
 
     def _start_line_warmup(self, *, candidate_free: bool) -> None:
@@ -4693,7 +4804,28 @@ class R1Interview:
         if self._pickup_spoken:
             return
         self._pickup_spoken = True
+        # D3-PICKUP1: the candidate rows from before the pickup, and when it finished.
+        self._pickup_cutoff_index = self._latest_candidate_index
         await self.say("L-PICKUP")
+        self._pickup_ended_at = self._clock()
+
+    def _consent_echo(self, text: str, index: int | None) -> bool:
+        """D3-PICKUP1 (``R1_CONSENT_ECHO_DROP``): a role-play turn that is only the late commit of
+        the consent heard before the pickup: a consent (``is_transition_consent``) on a candidate
+        row from before the pickup, or committed within ``ROLEPLAY_CONSENT_ECHO_SECONDS`` of its
+        end.  An advisor's real opening is never a consent, and a "ready" said later is theirs."""
+        if (
+            not consent_echo_drop_enabled()
+            or self.machine.phase is not R1Phase.ROLEPLAY
+            or not text
+            or not is_transition_consent(text)
+        ):
+            return False
+        cutoff = self._pickup_cutoff_index
+        if cutoff is not None and index is not None and index <= cutoff:
+            return True
+        ended = self._pickup_ended_at
+        return ended is not None and self._clock() - ended <= ROLEPLAY_CONSENT_ECHO_SECONDS
 
     # -------------------------------------------------------- reply policy
 
@@ -4822,6 +4954,8 @@ class R1Interview:
         a repair or a presence check.
         """
         after = self._ib_quiet_after
+        if after is None and self._ib_question_open and ib_reask_v2_enabled():
+            after = "question"  # D3-IB-REASK1: right after her question, as after the repeat line
         if (
             not text
             or after is None
@@ -4835,6 +4969,13 @@ class R1Interview:
             or is_presence_check(text)
         ):
             return False
+        if after == "question":
+            # D3-IB-REASK1 (int-live-3 M10: "Sorry, thank you." got the question again): a
+            # backchannel to an open question, or a courtesy to a yes/no one ("Okay." or "Yes."
+            # can answer that), answers nothing, so it gets nothing.
+            if is_closed_question(self._ib_last_question or ""):
+                return is_courtesy_turn(text)
+            return is_backchannel_turn(text) or is_acknowledgement_turn(text)
         if after != "hold":
             if self._ib_repeat_closed:
                 return is_courtesy_turn(text)
@@ -5053,6 +5194,19 @@ class R1Interview:
             return None  # review of S6: a question about the job (or her answer), not the brief
         replay_left = not self._brief_repeated and not self._brief_requested
         recap_left = self._recaps_left() > 0
+        if brief_variety_enabled():
+            # D3-BRIEF1: the replay answers the FIRST request (no recap yet) or one for more
+            # detail; once a recap was heard, a plain repeat gets the next recap, never the full
+            # brief again, longer than what the candidate had just asked to shorten.
+            if replay_left and is_detail_brief_request(text):
+                return _TRANSITION_BRIEF
+            if short and recap_left:
+                return _TRANSITION_RECAP
+            if replay_left and self._recaps_played == 0 and not self._recap_requested:
+                return _TRANSITION_BRIEF
+            if recap_left:
+                return _TRANSITION_RECAP
+            return _TRANSITION_BRIEF if replay_left else _TRANSITION_REASK
         if short and recap_left:
             return _TRANSITION_RECAP
         if replay_left:
@@ -5316,6 +5470,11 @@ class R1Interview:
             self._ib_hold_window = False  # the candidate spoke: the hold's window is over
         if text and not quiet:
             self._ib_quiet_after = None
+            # D3-IB-REASK1: a turn that says something closes her open question (the presence
+            # hold opens it again: it answered nothing).
+            ib_question_was_open, self._ib_question_open = self._ib_question_open, False
+        else:
+            ib_question_was_open = self._ib_question_open
         if quiet:
             _log.info("unknown_event", error_type="r1_icebreaker_quiet_ack")
         elif text:
@@ -5332,6 +5491,10 @@ class R1Interview:
             and not is_backchannel_turn(text)
         ):
             self._bridge_superseded = True  # M032 S5: the reaction would answer an older turn
+        if phase is R1Phase.ROLEPLAY and self._consent_echo(text, index):
+            # D3-PICKUP1: the learner already picked up; this "ready" was the transition's.
+            _log.info("unknown_event", error_type="r1_consent_echo_dropped", turn_index=index)
+            raise StopResponse()
         deferral = self._icebreaker_deferral(text) if phase is R1Phase.ICEBREAKER else None
         action = self._transition_action(text) if phase is R1Phase.TRANSITION else None
         suppressed = self.reply_suppressed(text)
@@ -5425,12 +5588,15 @@ class R1Interview:
                 self._transition_ib_repeat_reply(reply, text)
             elif text and self._icebreaker_repair_reply(reply, deferral, hold_route):
                 pass  # M032 S6: the scripted repeat or hold line; the plan is left as it was
+            elif text and self._ib_presence_hold(reply, text, ib_question_was_open):
+                pass  # D3-IB-REASK1: "Yes, I'm here. Take your time."; the plan is left as it was
             elif (
                 text
                 and phase in (R1Phase.OPENING, R1Phase.ICEBREAKER)
                 and icebreaker_plan_enabled()
             ):
                 self._plan_icebreaker_reply(reply, text, index)
+                self._ib_literal_repeat(reply, text)
             if text and phase in (R1Phase.OPENING, R1Phase.ICEBREAKER) and not reply.scripted:
                 self._add_presence_opener(reply, text, waited)
         self._last_reply = self._latest_reply = reply
@@ -5519,6 +5685,66 @@ class R1Interview:
             _log.info("unknown_event", error_type="r1_icebreaker_hold", option_count=self._ib_holds)
             return True
         return False
+
+    def _note_ib_question(self, question: str | None, interrupted: bool) -> None:
+        """D3-IB-REASK1: her icebreaker line just finished: it opens a question when it asked one
+        and was heard in full (``_ib_question_open``, ``_ib_question_heard_at``)."""
+        if not ib_reask_v2_enabled():
+            return
+        if question and not interrupted:
+            self._ib_question_open = True
+            self._ib_question_heard_at = self._clock()
+        else:
+            self._ib_question_open = False
+
+    def _ib_presence_hold(self, reply: Reply, text: str, question_open: bool) -> bool:
+        """D3-IB-REASK1 (``R1_IB_REASK_V2``): "Are you there?" under
+        ``IB_PRESENCE_HOLD_SECONDS`` after her question finished playing, with nothing said to it
+        since, gets "Yes, I'm here. Take your time." (scripted, no question, the plan left as it
+        was), once per question; the question stays open.  int-live-3 M05 and M10: "Yes, I'm here."
+        and the same question again, seconds after it was asked."""
+        heard_at = self._ib_question_heard_at
+        question = self._ib_last_question
+        if (
+            not ib_reask_v2_enabled()
+            or self.machine.phase is not R1Phase.ICEBREAKER
+            or not question_open
+            or heard_at is None
+            or not question
+            or self._ib_presence_held == question
+            or self._clock() - heard_at >= IB_PRESENCE_HOLD_SECONDS
+            or not is_presence_check(text)
+        ):
+            return False
+        self._ib_presence_held = question
+        self._ib_question_open = True
+        reply.scripted = IB_PRESENCE_HOLD
+        _log.info("unknown_event", error_type="r1_icebreaker_presence_hold")
+        return True
+
+    def _ib_literal_repeat(self, reply: Reply, text: str) -> None:
+        """D3-IB-REASK1 (``R1_IB_REASK_V2``): a request to hear her question again, before the
+        soft exit, gets that question word for word ("Of course. {question}", scripted), never the
+        model's paraphrase of the plan's objective (int-live-3 M03: "Of course. I was asking what a
+        typical day ... looks like", a question asked two turns earlier).  The plan's hold is kept,
+        so it still counts as the one re-ask."""
+        job = reply.job
+        question = self._ib_last_question
+        if (
+            not ib_reask_v2_enabled()
+            or self.machine.phase is not R1Phase.ICEBREAKER
+            or job is None
+            or job.kind != JOB_REASK
+            or not question
+            or not self._ib_repeat_asked(text)
+        ):
+            return
+        reply.scripted = repeat_line(question)
+        reply.note = ""
+        reply.fallback = ""
+        self._ib_quiet_after = "repeat"
+        self._ib_repeat_closed = is_closed_question(question)
+        _log.info("unknown_event", error_type="r1_icebreaker_literal_repeat")
 
     def _question_to_repeat(self) -> str:
         """The question a repeat request gets again: the last one of Christy's own icebreaker
@@ -5769,10 +5995,10 @@ class R1Interview:
         elif action == _TRANSITION_NUDGE:
             line_ids = ("L-TRANSITION-NUDGE",)
         elif action == _TRANSITION_PRESENCE:
-            line_ids = ("L-PRESENT", "L-TRANSITION-REASK")
+            line_ids = self._presence_lines()
             _log.info("unknown_event", error_type="r1_transition_presence")
         elif action == _TRANSITION_REASK:
-            line_ids = ("L-TRANSITION-REASK",)
+            line_ids = (self._reask_line(),)
         elif action == _TRANSITION_RECAP:
             self._latch_brief(_TRANSITION_RECAP, index)
             return
@@ -5799,6 +6025,40 @@ class R1Interview:
             and self._brief_playing is None
             and not self._bridging
         )
+
+    def _presence_lines(self) -> tuple[str, ...]:
+        """What "Are you there?" gets in the transition (M032 S6, D3-BRIEF1).
+
+        "Yes, I'm here." and the yes/no start question, as before.  With ``R1_BRIEF_VARIETY`` on,
+        a start prompt that finished playing under ``PRESENCE_TAKE_TIME_SECONDS`` ago is not asked
+        again: "Yes, I'm here." and L-TRANSITION-TAKE-TIME (once; a second such check gets "Yes,
+        I'm here." alone), and otherwise the start question is one the candidate has not heard
+        (``_reask_line``).
+        """
+        if not brief_variety_enabled():
+            return ("L-PRESENT", "L-TRANSITION-REASK")
+        heard_at = self._start_prompt_heard_at
+        if heard_at is not None and self._clock() - heard_at < PRESENCE_TAKE_TIME_SECONDS:
+            if "L-TRANSITION-TAKE-TIME" in self._transition_said:
+                return ("L-PRESENT",)
+            return ("L-PRESENT", "L-TRANSITION-TAKE-TIME")
+        # After "Yes, I'm here." never "I'm still here whenever you're ready." (REASK-2).
+        return ("L-PRESENT", self._reask_line(rotation=_PRESENCE_REASKS))
+
+    def _reask_line(self, rotation: tuple[str, ...] = _REASK_ROTATION) -> str:
+        """The yes/no start question a brief request past every budget (or a presence check) gets.
+
+        L-TRANSITION-REASK as before; with ``R1_BRIEF_VARIETY`` on, the first of ``rotation`` the
+        candidate has not heard in this transition, else the one heard longest ago, so no request
+        gets the line it just got (D3-BRIEF1).
+        """
+        if not brief_variety_enabled():
+            return "L-TRANSITION-REASK"
+        said = self._transition_said
+        for line_id in rotation:
+            if line_id not in said:
+                return line_id
+        return min(rotation, key=lambda line_id: len(said) - 1 - said[::-1].index(line_id))
 
     def _latch_brief(self, route: str, index: int | None) -> None:
         """Ask the driver for the replay or the recap (once each while pending), and wake it."""
@@ -6336,7 +6596,13 @@ class R1Interview:
         else:
             ctx = self._interviewer_guard_context(reply)
         guard = StreamGuard(ctx)
-        messages = llm_messages(reply, self.persona, self._history, voice=self._interviewer_voice)
+        messages = llm_messages(
+            reply,
+            self.persona,
+            self._history,
+            voice=self._interviewer_voice,
+            reactions=self._reaction_variety,
+        )
         if plan is not None and plan.mode is TurnMode.INTENT:
             source = self._intent_reply(lambda: provider(messages), guard, reply)
         else:
@@ -6358,7 +6624,27 @@ class R1Interview:
             changes["praise_check"] = True
         if reply.fallback:
             changes["interviewer_fallback"] = reply.fallback
+        if self._reaction_variety and reply.phase in ("opening", "icebreaker"):
+            # D3-ICE1: the summary trim, and her last reply's opener for the same-shape check.
+            changes["reaction_check"] = True
+            changes["previous_opening"] = self._previous_interviewer_opening()
+        if guard_story_echo_enabled():
+            # D3-GUARD-IB1: the turn this reply answers, for the story echo and the deflection.
+            changes["story_echo"] = True
+            changes["candidate_text"] = reply.candidate_text or ""
         return _dataclass_replace(ctx, **changes) if changes else ctx
+
+    def _previous_interviewer_opening(self) -> str:
+        """D3-ICE1: the first sentence of Christy's last model reply in the opening or the
+        icebreaker ("" for none; scripted lines are not hers to vary)."""
+        for entry in reversed(self._history):
+            if entry.get("role") != "bot" or entry.get("phase") not in ("opening", "icebreaker"):
+                continue
+            if entry.get("voice") != INTERVIEWER or entry.get("scripted"):
+                continue
+            sentences = split_sentences(str(entry.get("text") or ""))
+            return sentences[0] if sentences else ""
+        return ""
 
     async def _screened(
         self,
@@ -7352,9 +7638,27 @@ class R1Interview:
                 if question:
                     # Diagnosis 1 (BR-2): every question she asked, for the transition's repeat.
                     self._ib_questions = (self._ib_questions + [question])[-_IB_QUESTIONS_KEPT:]
+                self._note_ib_question(question, interrupted)
+            elif (
+                slot is not None
+                and slot.source == "generate_reply"
+                and ib_reask_v2_enabled()
+            ):
+                # D3-IB-REASK1: a scripted reply of hers ("Of course. {question}") asks too; one
+                # that asks nothing ("Take your time.", the hold) leaves her last question as it is.
+                question = reply_question(text, complete=not interrupted)
+                if question:
+                    self._ib_last_question = question
+                    if question not in self._ib_questions[-1:]:
+                        self._ib_questions = (self._ib_questions + [question])[
+                            -_IB_QUESTIONS_KEPT:
+                        ]
+                    self._note_ib_question(question, interrupted)
         self._note_wrapup_answer(phase, slot, interrupted)
         if phase == "transition" and slot is not None and slot.source == "generate_reply":
             self._last_transition_line = "reply"  # M032 S6: an answer, not a brief
+            if not interrupted and self._start_question is not None:
+                self._start_prompt_heard_at = self._clock()  # D3-BRIEF1: its tail was heard
         voice = self._remember_bot_turn(index, phase, text, slot)
         played = slot is not None and slot.finished_at is not None
         self._write_turn(
@@ -8693,7 +8997,9 @@ class R1Interview:
             self._brief_playing = None
         # Set once the brief has played, as ``say`` does: a short yes over it answers nothing.
         self._start_question = _START_QUESTION_OF_LINE[self._brief_line]
+        self._start_prompt_heard_at = self._clock()  # D3-BRIEF1
         self._last_transition_line = self._brief_line
+        self._transition_said.append(self._brief_line)
 
     def _brief_line_id(self, *, bridged: bool = False, replay: bool = False) -> str:
         """M032 S6 (SWEEP-30): the ONE place the brief's line id is picked, for both ``say`` sites.
@@ -8704,8 +9010,18 @@ class R1Interview:
         candidate heard, word for word.  ``render_line`` gives revision 21's text with the flag off.
         """
         if replay:
+            if brief_variety_enabled():
+                return "L-TRANSITION-AGAIN-PLAIN"  # D3-BRIEF1: re-explained, not word for word
             return "L-TRANSITION-AGAIN" if transition_repair_enabled() else self._brief_line
-        return _BRIDGED_BRIEF if bridged else "L-TRANSITION"
+        return _BRIDGED_BRIEF if bridged else self._thanked_brief_id()
+
+    def _thanked_brief_id(self) -> str:
+        """The first brief's id: L-TRANSITION, or (D3-ICE1, ``R1_REACTION_VARIETY`` with the
+        transition repair) one of ``_THANKED_BRIEFS``, the same for the whole session (its seed),
+        so the warm-up synthesises exactly the one that plays."""
+        if not (self._reaction_variety and transition_repair_enabled()):
+            return "L-TRANSITION"
+        return pick_variant(_THANKED_BRIEFS, self._seed(), 0)
 
     async def _wait_for_candidate_turn(self, limit: float) -> None:
         """Wait, at most ``limit`` seconds, while the candidate is mid-turn (speaking, or a final
@@ -8755,7 +9071,7 @@ class R1Interview:
             key=lambda item: item.get("seq", 0),
         )
         return assemble_messages(
-            interviewer_prefix(voice=self._interviewer_voice),
+            interviewer_prefix(voice=self._interviewer_voice, reactions=self._reaction_variety),
             select_context(ordered, "icebreaker"),
             text,
             BRIDGE_NOTE,
@@ -9052,11 +9368,17 @@ class R1Interview:
         during it picks up right after it, as during the replay.
         """
         self._recap_requested = False
+        # D3-BRIEF1 (R1_BRIEF_VARIETY): the recaps rotate, so the second is not the first again.
+        line_id = (
+            _RECAP_LINES[min(self._recaps_played, len(_RECAP_LINES) - 1)]
+            if brief_variety_enabled()
+            else "L-TRANSITION-RECAP"
+        )
         self._recaps_played += 1
         _log.info("unknown_event", error_type="r1_brief_recap", option_count=self._recaps_played)
         self._brief_playing = "recap"
         try:
-            await self.say("L-TRANSITION-RECAP")
+            await self.say(line_id)
         finally:
             self._brief_playing = None
         return self._consent_queued()

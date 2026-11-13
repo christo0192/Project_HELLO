@@ -85,6 +85,32 @@ def icebreaker_plan_enabled() -> bool:
     return (os.getenv("R1_ICEBREAKER_PLAN") or "1").strip().lower() not in _OFF_VALUES
 
 
+# M032 live simulation, diagnosis 3 (D3-IB-REASK1): int-live-3 M10 heard one question three times in
+# 30 s ("Sorry, thank you." and "Hey, are you there?" each got it again).  With ``R1_IB_REASK_V2``
+# a question is re-asked once at most: a second turn that does not answer it moves the plan on.
+REASK_V2_MAX_HOLDS = 1
+
+
+def ib_reask_v2_enabled() -> bool:
+    """``R1_IB_REASK_V2`` (default on, only with ``R1_ICEBREAKER_REPAIR``; D3-IB-REASK1).
+
+    One re-ask per question (``REASK_V2_MAX_HOLDS``), a backchannel or courtesy right after her
+    question gets no reply, "Are you there?" just after it gets "Yes, I'm here. Take your time."
+    (no question), and a request to repeat it gets that question word for word ("Of course.
+    {question}"), scripted.  Read at use.  Rollback: ``fly secrets set R1_IB_REASK_V2=0 -a
+    project-hello-voice`` (content revision 28's re-asks).
+    """
+    return icebreaker_repair_enabled() and (
+        (os.getenv("R1_IB_REASK_V2") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
+def max_holds() -> int:
+    """How often one question is asked again before the plan moves on (``MAX_HOLDS``, or
+    ``REASK_V2_MAX_HOLDS`` with ``R1_IB_REASK_V2``)."""
+    return REASK_V2_MAX_HOLDS if ib_reask_v2_enabled() else MAX_HOLDS
+
+
 @dataclass(frozen=True)
 class Objective:
     """One thing an icebreaker question is for.
@@ -560,7 +586,7 @@ class IcebreakerPlan:
 
     def _hold(self, current: Objective, reading: Reading, text: str) -> str:
         """The same objective again (bounded), or on to the next one once the holds are used."""
-        if self.holds.get(current.id, 0) < MAX_HOLDS:
+        if self.holds.get(current.id, 0) < max_holds():
             self.holds[current.id] = self.holds.get(current.id, 0) + 1
             return JOB_SKIP if reading.kind == SKIP else JOB_REASK
         self._advance(text)
@@ -571,7 +597,7 @@ class IcebreakerPlan:
         that did not answer still gets the last question again (bounded like a hold)."""
         if reading.kind == DECLINED:
             return JOB_DECLINED
-        if reading.kind in (NONANSWER, SKIP) and self.holds.get(_FREE_HOLDS, 0) < MAX_HOLDS:
+        if reading.kind in (NONANSWER, SKIP) and self.holds.get(_FREE_HOLDS, 0) < max_holds():
             self.holds[_FREE_HOLDS] = self.holds.get(_FREE_HOLDS, 0) + 1
             return JOB_SKIP if reading.kind == SKIP else JOB_REASK
         return JOB_FREE
@@ -692,6 +718,10 @@ PRESENCE_OPENER_NOTE_LATE = (
     'If they asked whether you are there, start with "Sorry about that, yes, I\'m here."'
 )
 PRESENCE_LATE_SECONDS = 6.0
+# D3-IB-REASK1 (R1_IB_REASK_V2): "Are you there?" this soon after her question finished playing gets
+# this, scripted, once per question: the question is still fresh, so it is not asked again.
+IB_PRESENCE_HOLD = "Yes, I'm here. Take your time."
+IB_PRESENCE_HOLD_SECONDS = 20.0
 
 # A request for a moment ("Can you give me a minute?", "Hold on a sec", "Can we pause?").  Narrow
 # and DIRECTED (review of S6): "give me", "wait" and "hold" need a time object ("give me an

@@ -201,6 +201,7 @@ def llm_messages(
     history: Sequence[Mapping[str, Any]],
     *,
     voice: bool | None = None,
+    reactions: bool | None = None,
 ) -> list[dict[str, str]]:
     """The only messages the model may see for ``reply`` (the llm_node context filter).
 
@@ -208,7 +209,8 @@ def llm_messages(
     picks from it by phase and voice.  The reminder is a ``system`` message because
     DeepSeek rejects ``developer``.  ``voice`` (M032 S5) is the session's reading of
     ``R1_INTERVIEWER_VOICE`` (``None`` reads it now): Christy's voice text in the prefix and
-    the delivery rider on the note.
+    the delivery rider on the note.  ``reactions`` (D3-ICE1) is its reading of
+    ``R1_REACTION_VARIETY`` (``None`` reads it now): the reworded react clause in both.
     """
     ordered = sorted(
         (item for item in history if item is not reply.entry),
@@ -222,10 +224,12 @@ def llm_messages(
             reply.plan.reminder,
         )
     return assemble_messages(
-        interviewer_prefix(voice=voice),
+        interviewer_prefix(voice=voice, reactions=reactions),
         select_context(ordered, reply.phase),
         reply.candidate_text,
-        interviewer_reminder(reply.phase, note=reply.note or None, rider=voice),
+        interviewer_reminder(
+            reply.phase, note=reply.note or None, rider=voice, reactions=reactions
+        ),
     )
 
 

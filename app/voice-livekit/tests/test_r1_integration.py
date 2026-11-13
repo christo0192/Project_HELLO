@@ -3224,6 +3224,15 @@ class TestProviderRateLimits(unittest.IsolatedAsyncioTestCase):
 
 
 class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self) -> None:
+        # M032 diagnosis 3: these pin content revision 28's behaviour (each new flag off); the
+        # flags' own tests are TestBriefVariety, TestReactionVarietyWiring and
+        # TestIcebreakerReaskV2.
+        patcher = mock.patch.dict(os.environ, DIAG3_FLAGS_OFF)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
     def build(self, synthesizer=None) -> tuple[Rig, LineCache, FakeSynthesizer]:
         source = FakeTime()
         synth = synthesizer or FakeSynthesizer()
@@ -3332,7 +3341,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             (
                 "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE",
                 "L-OPEN-HELLO-AGAIN",
-                "L-TRANSITION", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT",
+                "L-TRANSITION", "L-TRANSITION-AGAIN", "L-TRANSITION-AGAIN-PLAIN",
+                "L-TRANSITION-RECAP", "L-TRANSITION-RECAP-2", "L-PRESENT",
+                "L-TRANSITION-TAKE-TIME",  # D3-BRIEF1: warmed only with R1_BRIEF_VARIETY
                 "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-ASK-PAUSE",
                 "L-TRANSITION-STEER", "L-TRANSITION-REASK-2",
                 "L-PICKUP-BRIDGE", "L-PICKUP", "L-EXIT", "L-WRAP",
@@ -3587,6 +3598,10 @@ class TestLineCacheBuiltByTheRunner(unittest.IsolatedAsyncioTestCase):
 # ----------------------------------------------------------------- M032 S5: Christy as interviewer
 
 
+# M032 diagnosis 3: every flag it added, off (the older wiring tests pin revision 28 with it).
+DIAG3_FLAGS_OFF = {"R1_BRIEF_VARIETY": "0", "R1_REACTION_VARIETY": "0", "R1_IB_REASK_V2": "0"}
+
+
 def _env(**values: str):
     """``os.environ`` with these R1 flags set for the block (and none of the others changed)."""
     return mock.patch.dict(os.environ, values)
@@ -3616,6 +3631,15 @@ class TestChristyVoiceWiring(unittest.IsolatedAsyncioTestCase):
     on the answer before its question.  ``R1_INTERVIEWER_VOICE=0`` gives back today's prefix, notes
     and guard exactly.
     """
+
+    def setUp(self) -> None:
+        # M032 diagnosis 3: these pin content revision 28's behaviour (each new flag off); the
+        # flags' own tests are TestBriefVariety, TestReactionVarietyWiring and
+        # TestIcebreakerReaskV2.
+        patcher = mock.patch.dict(os.environ, DIAG3_FLAGS_OFF)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
 
     async def icebreaker_reply(self, provider: FakeProvider, **flags: str) -> tuple[Rig, str]:
         with _env(R1_ICEBREAKER_PLAN="0", **flags):
@@ -3694,6 +3718,15 @@ class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
     skip request (#6) got the note's own label back (#7), and one answer committed as two turns
     (#8/#9).  ``R1_ICEBREAKER_PLAN=0`` gives back today's icebreaker exactly.
     """
+
+    def setUp(self) -> None:
+        # M032 diagnosis 3: these pin content revision 28's behaviour (each new flag off); the
+        # flags' own tests are TestBriefVariety, TestReactionVarietyWiring and
+        # TestIcebreakerReaskV2.
+        patcher = mock.patch.dict(os.environ, DIAG3_FLAGS_OFF)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
 
     async def rig(self, provider: FakeProvider | None = None, **flags: str) -> Rig:
         with _env(**flags):
@@ -3853,6 +3886,15 @@ class TestIcebreakerRepairWiring(unittest.IsolatedAsyncioTestCase):
     the soft exit gets the question again, a presence check gets "Yes, I'm here.", and a request for
     a moment gets one.  The soft exit (S >= 3:30 with four answers) and the S=4:30 cap are as they
     were; ``R1_ICEBREAKER_REPAIR=0`` is today's icebreaker exactly."""
+
+    def setUp(self) -> None:
+        # M032 diagnosis 3: these pin content revision 28's behaviour (each new flag off); the
+        # flags' own tests are TestBriefVariety, TestReactionVarietyWiring and
+        # TestIcebreakerReaskV2.
+        patcher = mock.patch.dict(os.environ, DIAG3_FLAGS_OFF)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
 
     async def rig(self, *, bridge_runner=None, **flags: str) -> Rig:
         kwargs = {} if bridge_runner is None else {"bridge_runner": bridge_runner}
@@ -4435,6 +4477,15 @@ class TestTransitionBridgeWiring(R1TestCase):
     vetted), then the brief without its thanks.  Off (the default) is today's transition exactly.
     """
 
+    def setUp(self) -> None:
+        # M032 diagnosis 3: these pin content revision 28's behaviour (each new flag off); the
+        # flags' own tests are TestBriefVariety, TestReactionVarietyWiring and
+        # TestIcebreakerReaskV2.
+        patcher = mock.patch.dict(os.environ, DIAG3_FLAGS_OFF)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
     async def boundary(
         self, runner: BridgeRunner | None, last: str = BRIDGE_LAST, **flags: str
     ) -> SimpleNamespace:
@@ -4700,3 +4751,192 @@ class TestTransitionBridgeWiring(R1TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+IB_HESITATION_Q = (
+    "Finding out where the hesitation comes from makes sense. And what do you actually ask them?"
+)
+IB_WALK_Q = (
+    "Sounds like you're thinking it over. Could you walk me through one recent conversation with "
+    "a customer, start to finish?"
+)
+
+
+class TestIcebreakerReaskV2(unittest.IsolatedAsyncioTestCase):
+    """M032 diagnosis 3 (D3-IB-REASK1, ``R1_IB_REASK_V2`` on, the default).  int-live-3 M10 asked
+    one question three times in 30 s; M03's "say the question again" got a question from two turns
+    before.  Synthetic texts."""
+
+    async def rig(self, reply: str = IB_HESITATION_Q, **flags: str) -> Rig:
+        with _env(**flags):
+            rig = Rig(provider=TokenProvider(reply))
+            await rig.interview.say("L-OPEN")
+        return rig
+
+    def askings(self, rig: Rig, question: str) -> int:
+        return sum(question in line for line in rig.session.spoken)
+
+    async def test_the_m10_sequence_asks_the_hesitation_question_at_most_twice(self) -> None:
+        rig = await self.rig()
+        heard = [await rig.converse(IB_ANSWER)]
+        self.assertEqual(heard[0], IB_HESITATION_Q)
+        calls = len(rig.provider.calls)
+        rig.clock.advance(11)
+        heard.append(await rig.converse("Sorry, thank you."))
+        self.assertIsNone(heard[-1])  # quiet: no reply at all
+        rig.clock.advance(8)
+        heard.append(await rig.converse("Hey, are you there?"))
+        self.assertEqual(heard[-1], "Yes, I'm here. Take your time.")
+        self.assertEqual(len(rig.provider.calls), calls)  # neither called the model
+        question = "And what do you actually ask them?"
+        askings = sum(question in (line or "") for line in heard)
+        self.assertLessEqual(askings, 2)
+        self.assertEqual(askings, 1)
+
+    async def test_the_m03_repeat_gets_the_question_she_asked_word_for_word(self) -> None:
+        rig = await self.rig(reply=IB_WALK_Q)
+        await rig.converse(IB_ANSWER)
+        calls = len(rig.provider.calls)
+        spoken = await rig.converse("Sorry, could you say the question again?")
+        self.assertEqual(
+            spoken,
+            "Of course. Could you walk me through one recent conversation with a customer, start "
+            "to finish?",
+        )
+        self.assertEqual(len(rig.provider.calls), calls)  # scripted
+        self.assertEqual(rig.interview._last_reply.job.kind, "reask")  # the one re-ask, counted
+
+    async def test_a_question_is_never_asked_a_third_time(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse("What do you mean?")
+        self.assertEqual(rig.interview._last_reply.job.kind, "reask")  # the one re-ask
+        await rig.converse("Sorry, which part?")
+        self.assertNotEqual(rig.interview._last_reply.job.kind, "reask")  # the plan moved on
+        with _env(R1_IB_REASK_V2="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            await rig.converse("What do you mean?")
+            await rig.converse("Sorry, which part?")
+            self.assertEqual(rig.interview._last_reply.job.kind, "reask")  # two re-asks before
+
+    async def test_a_presence_check_long_after_the_question_is_the_model_s(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        calls = len(rig.provider.calls)
+        rig.clock.advance(25)
+        self.assertEqual(await rig.converse("Hello? Are you there?"), IB_HESITATION_Q)
+        self.assertEqual(len(rig.provider.calls), calls + 1)
+
+    async def test_an_answer_after_a_quiet_ack_is_answered(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        self.assertIsNone(await rig.converse("Okay."))
+        self.assertEqual(await rig.converse(IB_LAST), IB_HESITATION_Q)
+        self.assertIsNone(await rig.converse("Okay."))  # her next question is open again
+
+    async def test_with_the_flag_off_the_re_asks_are_revision_28_s(self) -> None:
+        with _env(R1_IB_REASK_V2="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            calls = len(rig.provider.calls)
+            self.assertEqual(await rig.converse("Sorry, thank you."), IB_HESITATION_Q)
+            self.assertEqual(await rig.converse("Hey, are you there?"), IB_HESITATION_Q)
+            self.assertEqual(len(rig.provider.calls), calls + 2)
+            spoken = await rig.converse("Sorry, could you say the question again?")
+            self.assertEqual(spoken, IB_HESITATION_Q)  # the model's, as before
+
+
+class TestReactionVarietyWiring(unittest.IsolatedAsyncioTestCase):
+    """M032 diagnosis 3 (D3-ICE1, ``R1_REACTION_VARIETY``): the session sends the reworded react
+    clause, trims summary reactions in her icebreaker replies, and thanks the candidate in one of
+    three seeded ways before the brief."""
+
+    async def test_the_session_sends_the_reworded_prefix_and_rider(self) -> None:
+        import r1_prompts
+
+        rig = Rig(provider=TokenProvider(IB_QUESTION_REPLY))
+        await rig.converse(IB_ANSWER)
+        messages = rig.last_messages()
+        self.assertEqual(messages[0]["content"], interviewer_prefix(voice=True, reactions=True))
+        self.assertIn(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS, messages[-2]["content"])
+        with _env(R1_REACTION_VARIETY="0"):
+            off = Rig(provider=TokenProvider(IB_QUESTION_REPLY))
+        await off.converse(IB_ANSWER)
+        self.assertEqual(
+            off.last_messages()[0]["content"], interviewer_prefix(voice=True, reactions=False)
+        )
+
+    async def test_a_summary_reaction_is_trimmed_and_a_second_shape_dropped(self) -> None:
+        rig = Rig(
+            provider=TokenProvider(
+                "Six years in insurance, that's a good stretch. What does a typical day look like?"
+            )
+        )
+        self.assertEqual(await rig.converse(IB_ANSWER), "What does a typical day look like?")
+        shaped = "Young families, which sounds demanding. How did you find them?"
+        first = await rig.converse(IB_LAST, provider=TokenProvider(shaped))
+        self.assertEqual(first, shaped)  # one in a row is a reaction
+        second = await rig.converse(
+            IB_LAST, provider=TokenProvider("A sheet, which sounds tidy. Who else uses it?")
+        )
+        self.assertEqual(second, "Who else uses it?")
+
+    async def test_the_brief_opens_with_a_seeded_thanks(self) -> None:
+        import r1_script
+
+        seen = set()
+        for attempt in ("a-1", "a-2", "a-3", "a-4", "a-5", "a-6", "a-7", "a-8"):
+            rig = Rig(context={**P1_CONTEXT, "attempt_id": attempt})
+            line_id = rig.interview._brief_line_id()
+            self.assertIn(line_id, r1_session._THANKED_BRIEFS)
+            self.assertEqual(rig.interview._brief_line_id(), line_id)  # one per session
+            self.assertIn(line_id, rig.interview._warm_order())
+            self.assertNotIn("L-TRANSITION", rig.interview._warm_order())
+            seen.add(line_id)
+        self.assertGreater(len(seen), 1)
+        rig = Rig()
+        name = rig.interview._first_name()
+        texts = {line_id: rig.interview.render_line(line_id) for line_id in r1_session._THANKED_BRIEFS}
+        self.assertTrue(texts["L-TRANSITION-THANKS-A"].startswith(f"Thanks, {name}, that's helpful."))
+        self.assertTrue(
+            texts["L-TRANSITION-THANKS-B"].startswith(f"Thanks for walking me through that, {name}.")
+        )
+        self.assertTrue(texts["L-TRANSITION-THANKS-C"].startswith(f"Got it, thank you, {name}."))
+        body = r1_script.line("L-TRANSITION-BRIDGED", **rig.persona.line_values)
+        for text in texts.values():
+            self.assertTrue(text.endswith(body))
+        self.assertEqual(
+            r1_script.line("L-TRANSITION-THANKS-A", first_name="", **rig.persona.line_values),
+            "Thanks, that's helpful. " + body,
+        )
+
+    async def test_with_the_flag_off_the_brief_is_thank_you_as_before(self) -> None:
+        with _env(R1_REACTION_VARIETY="0"):
+            rig = Rig()
+        self.assertEqual(rig.interview._brief_line_id(), "L-TRANSITION")
+        self.assertIn("L-TRANSITION", rig.interview._warm_order())
+        with _env(R1_TRANSITION_REPAIR="0"):
+            self.assertEqual(Rig().interview._brief_line_id(), "L-TRANSITION")
+
+
+class TestStoryEchoWiring(unittest.IsolatedAsyncioTestCase):
+    """M032 diagnosis 3 (D3-GUARD-IB1, ``R1_GUARD_STORY_ECHO``): the session hands the guard the
+    candidate's turn, so an echo of their own story is not deflected.  Synthetic texts."""
+
+    STORY = (
+        "One client wanted a course, around three lakh rupees, so my manager approved a "
+        "scholarship and he signed."
+    )
+    ECHO = "Three lakh for one course. How did you handle the back-and-forth?"
+
+    async def test_an_echo_of_the_story_is_spoken_as_it_is(self) -> None:
+        rig = Rig(provider=TokenProvider(self.ECHO))
+        self.assertEqual(await rig.converse(self.STORY), self.ECHO)
+
+    async def test_with_the_flag_off_it_is_deflected_as_before(self) -> None:
+        with _env(R1_GUARD_STORY_ECHO="0"):
+            rig = Rig(provider=TokenProvider(self.ECHO))
+            spoken = await rig.converse(self.STORY)
+        self.assertTrue(spoken.startswith("That's a good question for the hiring team"))

@@ -286,6 +286,10 @@ class UnknownNameTests(unittest.TestCase):
             "L-TRANSITION-V20": (
                 "Thank you. We'll now move to the role-play. I'll play a prospective"
             ),
+            # M032 diagnosis 3 (D3-ICE1): the thanked briefs.
+            "L-TRANSITION-THANKS-A": "Thanks, that's helpful. Next, let's do a sales role-play.",
+            "L-TRANSITION-THANKS-B": "Thanks for walking me through that. Next, let's do a sales",
+            "L-TRANSITION-THANKS-C": "Got it, thank you. Next, let's do a sales role-play.",
             "L-CLOSE": (
                 "Thank you for your time today. The hiring team will review your interview and "
                 "get back to you. You can close this window now. Goodbye."

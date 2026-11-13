@@ -155,7 +155,11 @@ import r1_world
 # brief again for "the instructions" and keeps the polite decline for its own rules.
 # Revision 28 (M032 christy-ready, R1_START_ASK_ONCE): L-TRANSITION-ASK-PAUSE, the one start
 # prompt a quiet pause gets once the answers before the role-play end without a start question.
-PINNED_CONTENT_SHA256 = "49df39f8ac3cf77ebc9c3ecc52d6835562e09f89ebdc30ced0a8374a0f74794e"
+# Revision 29 (M032 live simulation, diagnosis 3, Christy lane): the varied replay, second recap and
+# take-time line (R1_BRIEF_VARIETY), the reworded react clause and the thanked briefs
+# (R1_REACTION_VARIETY), the presence hold (R1_IB_REASK_V2), "Got it." (R1_GUARD_STORY_ECHO) and the
+# broad job question line of the repaired transition note.
+PINNED_CONTENT_SHA256 = "7cd479e7417a7a20fec543e924b2167676d289b57dad4f1cabd78a14d64586d8"
 
 CONTENT_MODULES = (
     "r1_text",

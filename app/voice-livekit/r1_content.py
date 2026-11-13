@@ -188,7 +188,20 @@ import r1_world
 #    shall we begin the role-play? Just say 'ready' whenever you like."), the one start prompt a
 #    quiet pause gets once Christy's answers before the role-play end without a start question.
 #    No other pinned text changed.
-CONTENT_REVISION = 28
+# 29: M032 live simulation, diagnosis 3 (Christy lane).  R1_BRIEF_VARIETY (D3-BRIEF1): the replay
+#    re-explained (L-TRANSITION-AGAIN-PLAIN, "Sure. Think of it as a real sales call. ..."), a
+#    second recap (L-TRANSITION-RECAP-2, "No problem, the short version: ..."), and
+#    L-TRANSITION-TAKE-TIME ("Take your time, just say 'ready' when you are.").
+#    R1_REACTION_VARIETY (D3-ICE1): the voice text's and the rider's react clause
+#    (r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS, INTERVIEWER_DELIVERY_RIDER_REACTIONS, and the
+#    prefix with it) and three thanked briefs (L-TRANSITION-THANKS-A/-B/-C).  R1_IB_REASK_V2
+#    (D3-IB-REASK1): "Yes, I'm here. Take your time." (r1_icebreaker.IB_PRESENCE_HOLD), its 20 s
+#    window and one re-ask per question.  R1_GUARD_STORY_ECHO (D3-GUARD-IB1): "Got it."
+#    (r1_guard.STORY_ACK).  R1_TRANSITION_REPAIR (D3-TRANS-JOB1): the repaired transition note gives
+#    a broad job question a one-sentence overview and says times the way people say them (only
+#    R1_TRANSITION_REPAIR=0 gives a note without it).  Every other text of revision 28 is unchanged
+#    and pinned beside the new ones (each flag off speaks it).
+CONTENT_REVISION = 29
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -356,6 +369,7 @@ def manifest() -> dict[str, Any]:
             "contact": r1_guard.CONTACT_REPLACEMENT,
             "neutral_acks": list(r1_guard.NEUTRAL_ACKS),
             "anchor_replacement": r1_guard.ANCHOR_REPLACEMENT,
+            "story_ack": r1_guard.STORY_ACK,  # revision 29 (D3-GUARD-IB1)
             "gratitude_replacement": r1_guard.GRATITUDE_REPLACEMENT,
             "budget_replacement": r1_guard.BUDGET_REPLACEMENT,
             "confirm_fallbacks": list(r1_guard.CONFIRM_FALLBACKS),
@@ -375,9 +389,15 @@ def manifest() -> dict[str, Any]:
             "flag_threshold": r1_guard.HIT_FLAG_THRESHOLD,
         },
         "prompts": {
-            "interviewer_prefix": r1_prompts.interviewer_prefix(voice=True),
+            "interviewer_prefix": r1_prompts.interviewer_prefix(voice=True, reactions=False),
             "interviewer_voice_text": r1_prompts.INTERVIEWER_VOICE_TEXT,
             "interviewer_delivery_rider": r1_prompts.INTERVIEWER_DELIVERY_RIDER,
+            # Revision 29 (D3-ICE1, R1_REACTION_VARIETY): the reworded react clause.
+            "interviewer_prefix_reactions": r1_prompts.interviewer_prefix(
+                voice=True, reactions=True
+            ),
+            "interviewer_voice_text_reactions": r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS,
+            "interviewer_delivery_rider_reactions": r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS,
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,
@@ -515,6 +535,10 @@ def manifest() -> dict[str, Any]:
                 "presence_late_seconds": r1_icebreaker.PRESENCE_LATE_SECONDS,
                 "hold_wait_seconds": r1_icebreaker.ICEBREAKER_HOLD_WAIT_SECONDS,
                 "hold_min_budget_seconds": r1_icebreaker.HOLD_MIN_BUDGET_SECONDS,
+                # Revision 29 (D3-IB-REASK1, R1_IB_REASK_V2).
+                "presence_hold": r1_icebreaker.IB_PRESENCE_HOLD,
+                "presence_hold_seconds": r1_icebreaker.IB_PRESENCE_HOLD_SECONDS,
+                "reask_v2_max_holds": r1_icebreaker.REASK_V2_MAX_HOLDS,
             },
         },
         "end_intent": {
