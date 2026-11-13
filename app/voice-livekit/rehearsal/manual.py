@@ -33,6 +33,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from rehearsal import flags
 from rehearsal.advisor import AdvisorTurn
 from rehearsal.scenarios import (
     GROUPS,
@@ -63,6 +64,13 @@ REPLAY_LEVEL = {
     "M10": "average",
 }
 END_AGREE = Beat("end_agree", "Yes, please end it here.")
+# Acts a check scores: the live rewriter never rewords them (``REHEARSAL_KEEP_CONTROL_ACTS``), so
+# a request stays the request the check counts (diagnosis-1 EC-1: "tells her to hang up" came out
+# as an answer to the learner's question, and the check scored an end request nobody made).
+CONTROL_ACTS = frozenset({
+    "end_request", "end_agree", "end_decline", "insult", "ready", "ready_button", "brief_request",
+    "short_brief_request", "presence_check", "skip_request", "repeat_request", "hold_request",
+})
 
 _PRESS = re.compile(r"^\s*\[(?:silence, then )?presses (?:the )?I'm-ready", re.IGNORECASE)
 _STAGE = re.compile(
@@ -103,6 +111,13 @@ def render(text: str, names: Mapping[str, str]) -> str:
 
 def is_press(text: str) -> bool:
     return bool(_PRESS.search(text or ""))
+
+
+def keeps_words(act: str | None) -> bool:
+    """Whether the live rewriter leaves a move of this act as the library wrote it."""
+    if act == "insult":
+        return True
+    return flags.on(flags.KEEP_CONTROL_ACTS) and act in CONTROL_ACTS
 
 
 def act_of(phase: str, intent: str, text: str) -> str:
@@ -555,7 +570,7 @@ class ReplayTalker:
 
     async def _say(self, beat: Beat) -> str:
         text = render(beat.text, self.names)
-        if self.rewriter is None or not text:
+        if self.rewriter is None or not text or keeps_words(beat.act):
             return text
         return await self.rewriter.reword("candidate", beat.intent or beat.act, text, self.history, self.names)
 
@@ -633,7 +648,7 @@ class ReplayAdvisor:
         move = self._moves.pop(0)
         self.replayed += 1
         text = render(move.text, self.names) or "Mm-hmm."
-        if self.rewriter is not None and move.act != "insult":
+        if self.rewriter is not None and not keeps_words(move.act):
             text = await self.rewriter.reword("advisor", move.intent, text, self._chat, self.names)
         intent, topic = advisor_tags(move.intent, text)
         turn = AdvisorTurn(text, intent, topic)
@@ -700,6 +715,7 @@ def candidate_parts(
 
 
 __all__ = [
+    "CONTROL_ACTS",
     "CandidateParts",
     "Move",
     "ReplayAdvisor",
@@ -708,6 +724,7 @@ __all__ = [
     "act_of",
     "advisor_tags",
     "candidate_parts",
+    "keeps_words",
     "load_library",
     "mix_scenario",
     "register",

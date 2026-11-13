@@ -1351,8 +1351,91 @@ class FullCliTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- diagnosis-1 harness fixes
+class _DriftingRewriter:
+    """A live rewriter stand-in that answers the conversation instead of saying the move."""
+
+    DRIFT = "Uh, it's, you know, I'm not totally sure on that one, honestly."
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.failures = 0
+
+    async def reword(self, role, intent, text, history, names) -> str:
+        self.calls += 1
+        return self.DRIFT
+
+
 def _switch(name: str, value: str):
     return unittest.mock.patch.dict("os.environ", {name: value})
+
+
+class ControlActRewordTests(unittest.TestCase):
+    """EC-1: a move whose act a check scores is said as written, live too (synthetic text)."""
+
+    END = "Look, I give up, you can hang up now."
+
+    def _replay(self, rewriter):
+        from rehearsal.manual import Move, ReplayAdvisor
+        from rehearsal.scripted_advisor import ScriptedAdvisor
+
+        moves = [
+            Move("roleplay", "05:00 | R 0:05", "greets", "Hi there, quick call.", "advisor_turn"),
+            Move("roleplay", "09:20 | R 4:20", "gives up: tells her to hang up", self.END, "end_request"),
+        ]
+        replay = ReplayAdvisor(moves, ScriptedAdvisor("pushy", "t"), rewriter=rewriter)
+
+        async def main():
+            await replay.start("Hello? Yes, this is Meera speaking.")
+            first = await replay.next_turn(None, 3.0, 1)
+            end = await replay.next_turn("Is it one-on-one or in a group?", 260.0, 2)
+            return first, end, replay.last_act
+
+        return asyncio.run(main())
+
+    def test_a_replayed_end_request_is_not_reworded_into_an_answer(self) -> None:
+        rewriter = _DriftingRewriter()
+        first, end, act = self._replay(rewriter)
+        self.assertEqual(first.text, _DriftingRewriter.DRIFT)  # plain talk is still reworded
+        self.assertEqual(end.text, self.END)
+        self.assertEqual(act, "end_request")
+        self.assertEqual(rewriter.calls, 1)
+
+    def test_off_restores_the_rewording_of_every_move_but_the_insult(self) -> None:
+        from rehearsal.flags import KEEP_CONTROL_ACTS
+
+        with _switch(KEEP_CONTROL_ACTS, "0"):
+            _first, end, _act = self._replay(_DriftingRewriter())
+        self.assertEqual(end.text, _DriftingRewriter.DRIFT)
+
+    def test_a_scenario_beat_with_a_control_act_is_said_as_written(self) -> None:
+        from rehearsal.candidate import ScenarioAdvisor
+        from rehearsal.scenarios import RoleplayBeat, Scenario
+        from rehearsal.scripted_advisor import ScriptedAdvisor
+
+        rewriter = _DriftingRewriter()
+        advisor = ScenarioAdvisor(ScriptedAdvisor("average", "t"), Scenario("x", "", "average", "average"), rewriter=rewriter)
+        end = RoleplayBeat("end_request", self.END, 300.0, "asks to end the role-play")
+        tactic = RoleplayBeat("tactic", "We have weekend batches too.", 300.0, "pitches the schedule")
+        self.assertEqual(asyncio.run(advisor._beat_text(end)), self.END)
+        self.assertEqual(asyncio.run(advisor._beat_text(tactic)), _DriftingRewriter.DRIFT)
+
+    def test_the_talkers_control_beats_are_said_as_written(self) -> None:
+        from rehearsal.manual import ReplayTalker
+        from rehearsal.scenarios import Beat
+
+        rewriter = _DriftingRewriter()
+        talker = ReplayTalker([Beat("icebreaker_answer", "I sell term plans.", "answers")], None, rewriter=rewriter)
+        for act, text in (
+            ("brief_request", "Could you go over the role-play once more?"),
+            ("short_brief_request", "Can I get that in four lines?"),
+            ("presence_check", "Are you there?"),
+            ("ready", "Okay, I'm ready."),
+            ("skip_request", "Can we skip straight to the role-play?"),
+            ("repeat_request", "Go back to the question before last and ask it again."),
+        ):
+            with self.subTest(act=act):
+                self.assertEqual(asyncio.run(talker.reword(Beat(act, text, "the move"))), text)
+        self.assertEqual(asyncio.run(talker.icebreaker_answer()), _DriftingRewriter.DRIFT)
 
 
 class LearnerClockTests(unittest.TestCase):
