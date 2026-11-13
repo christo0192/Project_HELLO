@@ -170,7 +170,9 @@ import r1_world
 # Revision 28 (simulation adaptability): the tangent notes and the stall-gap voiced-concerns note
 # join the manifest (``r1_content._adapt_repairs``) beside the texts they replace while their flags
 # are on.  No graded meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "18c7513dd22b7ea10a9263f422ccfa86f6650608180d3972a01a7a9b23090891"
+# After its review (still revision 28, unreleased): the 19:00 stall's reaction-only tangent note
+# (TANGENT_REACT_NOTE).  No graded meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "02b1b47e4a5d6a21a8f824ab9d1f6af42cc3fe91f4b7e8c1d3fbd62521e01575"
 
 CONTENT_MODULES = (
     "r1_text",

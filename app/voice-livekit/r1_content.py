@@ -212,7 +212,8 @@ import r1_world
 #    R1_STALL_GAP).  The tangent notes (a free reply and an owed point on small talk) and the
 #    voiced-concerns note for a stall said a moment ago join the manifest (``_adapt_repairs``).
 #    No graded marker, must-say, meaning or deadline changed; with both flags off the reminders
-#    are the release before.
+#    are the release before.  After its review (still 28, unreleased): the 19:00 stall's reaction-
+#    only tangent note (``tangent_react_note``).
 CONTENT_REVISION = 28
 
 
@@ -576,6 +577,7 @@ def _adapt_repairs() -> dict[str, Any]:
     return {
         "tangent_note": p.TANGENT_NOTE,
         "tangent_intent_note": p.TANGENT_INTENT_NOTE,
+        "tangent_react_note": p.TANGENT_REACT_NOTE,
         "voiced_concerns_recent_note": p.VOICED_CONCERNS_RECENT_NOTE,
     }
 

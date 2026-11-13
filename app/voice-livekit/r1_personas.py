@@ -1107,17 +1107,38 @@ _COURSE_TALK = re.compile(
     r"interview kickstart)\b|\$\s?\d|\d[\d,]{2,}",
     re.IGNORECASE,
 )
-_SMALL_TALK = re.compile(
+# The small-talk OBJECTS: food, sport, weather, pets and films (review TANGENT-R1/R2).  Only these
+# make a question small talk ("have you tried that new biryani place?").  "match" is not one ("does
+# that match what you were hoping for?"), nor is "eat into" ("would it eat into your evenings?").
+_SMALL_TALK_OBJECT = re.compile(
     r"\b(?:weather|rain\w*|pour\w*|drizzl\w*|sunny|snow\w*|monsoon|humid\w*|storm\w*|"
-    r"cold outside|hot (?:today|outside|out there)|match|game|cricket|football|soccer|ipl|"
-    r"world cup|tennis|food|lunch|dinner|breakfast|snacks?|biryani|pizza|dosa|restaurant|"
-    r"cafe|coffee|tea|chai|hungry|starving|eat|ate|eaten|cook\w*|recipe|dogs?|cats?|pets?|"
-    r"puppy|neighbou?rs?|traffic|commute|weekend|holidays?|vacation|trip|travel\w*|festival|"
-    r"diwali|christmas|movies?|films?|series|netflix|songs?|music|concert|hobb(?:y|ies)|"
-    r"for fun|jok(?:e|es|ing)|kidding|haha|lol|funny|laugh\w*|off[- ]topic|unrelated|"
-    r"random (?:question|thought)|side note|on a different note|changing the subject|"
-    r"drifting|sidetracked|tangent|how(?:'s| is| was) your day|plans for|where are you from|"
-    r"where do you live)\b",
+    r"cold outside|hot (?:today|outside|out there)|game(?! plan| changer)|cricket|football|"
+    r"soccer|ipl|world cup|tennis|food|snacks?|biryani|pizza|dosa|restaurant|cafe|coffee|tea|"
+    r"chai|hungry|starving|eat(?! into| up)|ate|eaten|cook\w*|recipe|dogs?|cats?|pets?|puppy|"
+    r"movies?|films?|netflix|songs?|music|concert)\b",
+    re.IGNORECASE,
+)
+# The softer signs of a tangent: a time of day, the weekend, travel, a festival, an aside marker.
+# They make a TURN a tangent only when no sentence of it asks about her situation or her time (a
+# probe, a dig or ``_ABOUT_HER_TIME``): "Over the weekend, how much time could you put in?" is
+# discovery.  A laugh word ("haha", "lol", "funny", "kidding") is a filler and no sign at all.
+_SMALL_TALK_SOFT = re.compile(
+    r"\b(?:lunch|dinner|breakfast|neighbou?rs?|traffic|commute|weekend|holidays?|vacation|trip|"
+    r"travel\w*|festival|diwali|christmas|hobb(?:y|ies)|for fun|a joke|off[- ]topic|unrelated|"
+    r"random (?:question|thought)|side note|on a different note|changing the subject|drifting|"
+    r"sidetracked|tangent|how(?:'s| is| was) your (?:day|weekend|morning|evening)|plans for|"
+    r"where are you from|where do you live)\b",
+    re.IGNORECASE,
+)
+# A question about her week, her time or a slot: scheduling or discovery, never small talk.
+_ABOUT_HER_TIME = re.compile(
+    r"\bhow (?:much|many) (?:time|hours?|days?|evenings?|nights?)\b|\b(?:free|spare) time\b|"
+    r"\bhours?\b|\b(?:in|per|a) (?:week|day)\b|\bset aside\b|\bcarve out\b|\bsqueeze\b|"
+    r"\bfit (?:it|this|that) in\b|\bget in the way\b|\b(?:are|be|is) you free\b|"
+    r"\bfree (?:on|this|next|in|at|for|after|before)\b|\bslots?\b|\bavailab\w*|"
+    r"\b(?:mon|tues|wednes|thurs|fri|satur|sun)days?\b|\bworks? (?:for|best)\b|\bsuits? you\b|"
+    r"\byour (?:week|weeks|weekdays?|evenings?|mornings?|days?|routine|calendar)\b|"
+    r"\bwhat time\b|\bwhen (?:are|would|could|can|will) you\b",
     re.IGNORECASE,
 )
 _STEERS_BACK = re.compile(
@@ -1128,16 +1149,36 @@ _STEERS_BACK = re.compile(
 
 
 def is_small_talk(text: object) -> bool:
-    """True when ``text`` has a small-talk word and no word of the course, the sale or her
-    decision."""
+    """True when ``text`` (one question) is about a small-talk object (``_SMALL_TALK_OBJECT``:
+    food, sport, weather, pets, films), with no word of the course, the sale or her decision and
+    nothing about her time (``_ABOUT_HER_TIME``)."""
     folded = fold(text)
-    return _SMALL_TALK.search(folded) is not None and _COURSE_TALK.search(folded) is None
+    return (
+        _SMALL_TALK_OBJECT.search(folded) is not None
+        and _COURSE_TALK.search(folded) is None
+        and _ABOUT_HER_TIME.search(folded) is None
+    )
 
 
 def is_tangent(text: object) -> bool:
-    """True when the advisor's whole turn left the sale for a moment (``is_small_talk``) and did
-    not steer back to it ("Anyway, where were we?")."""
-    return is_small_talk(text) and _STEERS_BACK.search(fold(text)) is None
+    """True when the advisor's whole turn left the sale for a moment and did not steer back to it
+    ("Anyway, where were we?").
+
+    The turn has a small-talk object or a softer sign (``_SMALL_TALK_SOFT``; a laugh word alone is
+    none), no word of the course, the sale or her decision, and no question about her situation:
+    no probe or dig (``detect_probes`` and ``asks_about_learner``, small-talk objects skipped) and
+    no question about her week, her time or a slot (``_ABOUT_HER_TIME``).  Review TANGENT-R2:
+    "Haha, fair enough. So what worries you most?", "Does that match what you were hoping for?"
+    and "Would a weekend slot make it easier at home?" are the sale.
+    """
+    folded = fold(text)
+    if _COURSE_TALK.search(folded) is not None or _STEERS_BACK.search(folded) is not None:
+        return False
+    if _SMALL_TALK_OBJECT.search(folded) is None and _SMALL_TALK_SOFT.search(folded) is None:
+        return False
+    if _ABOUT_HER_TIME.search(folded) is not None:
+        return False  # "check with him over the weekend, and we'll book Monday or Tuesday"
+    return not (detect_probes(text, small_talk=True) or asks_about_learner(text, small_talk=True))
 
 
 def detect_probes(text: object, *, small_talk: bool = False) -> frozenset[str]:

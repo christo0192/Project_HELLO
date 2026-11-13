@@ -332,6 +332,13 @@ TANGENT_INTENT_NOTE = (
     "joke). Respond to that first, as yourself, in a few words; then make your point as an honest "
     "change of subject."
 )
+# Review TANGENT-R3: the 19:00 stall's reply is ONE short reaction and its closing line is spoken
+# separately, so on a tangent she gives it a word and nothing more (never "make your point").
+TANGENT_REACT_NOTE = (
+    "- The advisor has gone off the subject for a moment (small talk, a personal question or a "
+    "joke). Your one short sentence may react to that as yourself, a word about it and nothing "
+    "more."
+)
 HOLLOW_CONCERNS_NOTE = (
     "- The advisor said almost nothing. You have already told them {concerns}, so do not say "
     "that again in any words. Do not say goodbye, thank them for the call or say that you will "

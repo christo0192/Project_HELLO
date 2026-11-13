@@ -12863,5 +12863,173 @@ class StallGapTests(unittest.TestCase):
         self.assertNotIn(self.RECENT, first.reminder)
         self.assertIn(VOICED_CONCERNS_ASKED_NOTE.split("{concerns}")[1], first.reminder)
 
+    def mixed(self, *, flip_last=False, **env):
+        """She voiced a trust worry, then a stall (or, ``flip_last``, only the trust worry while
+        the stall memory says she stalled), then a decision question."""
+        with flags(**env):
+            s = Session(
+                engine(),
+                reply="Honestly, I'd want to see some proof it actually works before I trust it.",
+            )
+            s.say(OPENER, 20)
+            if flip_last:
+                s.reply = s.ack = "I see."
+                s.say(PITCH, 40)
+                s.eng._stall_said[-1] = True
+            else:
+                s.reply = s.ack = "I am just not ready to decide anything today."
+                s.say(PITCH, 40)
+            s.reply = s.ack = "I see."
+            return s.say("So what would help you decide?", 60)
+
+    def test_the_recent_note_covers_only_the_stall_she_said(self):
+        # Review STALLGAP-R4: the trust worry is the honest answer to "what would help you
+        # decide?", so only the stall is kept out; the other themes keep the asked wording.
+        from r1_prompts import VOICED_CONCERNS_ASKED_NOTE
+
+        plan = self.mixed()
+        lines = [line for line in plan.reminder.splitlines() if "already told" in line]
+        recent = [line for line in lines if self.RECENT in line]
+        self.assertEqual(len(recent), 1)
+        self.assertIn("not ready to decide", recent[0])
+        self.assertNotIn("proof", recent[0])
+        asked = VOICED_CONCERNS_ASKED_NOTE.split("{concerns}")[1]
+        asked_lines = [line for line in lines if asked in line]
+        self.assertEqual(len(asked_lines), 1)
+        self.assertIn("proof", asked_lines[0])
+        self.assertNotIn("not ready to decide", asked_lines[0])
+
+    def test_no_recent_note_when_no_stall_is_in_the_ledger(self):
+        # Its premise ("you said it again a moment ago") would be false for the other themes.
+        from r1_prompts import VOICED_CONCERNS_ASKED_NOTE
+
+        plan = self.mixed(flip_last=True)
+        self.assertNotIn(self.RECENT, plan.reminder)
+        self.assertIn(VOICED_CONCERNS_ASKED_NOTE.split("{concerns}")[1], plan.reminder)
+
+
+# Review of the adaptability fixes (TANGENT-R1/R2): friendly discovery wording ("Haha, so what's
+# stopping you?", "Over the weekend, how much time could you put in?") is a probe and a dig as
+# before, and a sales turn with a laugh, a weekend or "match" in it is no tangent.  Synthetic.
+FRIENDLY_PROBES = (
+    ("Lol fair, what's holding you back?", {"H2"}),
+    ("Haha okay, so what's stopping you?", {"H2"}),
+    ("Funny you say that, what made you look into this now?", {"H1"}),
+    ("Haha, what made you reach out to us?", {"H1"}),
+    ("Haha, have you tried anything like this before?", {"H2"}),
+    ("Over the weekend, how much time could you realistically put in?", {"H3"}),
+    ("How many hours on a weekend could you give it?", {"H3"}),
+    ("After dinner, how much time do you usually have free?", {"H3"}),
+    ("With the commute, how many hours do you really have in a week?", {"H3"}),
+    ("Does your family travel a lot, would that get in the way?", {"H2", "H3"}),
+)
+SALES_NOT_TANGENTS = (
+    "Haha, fair enough. So what worries you most?",
+    "Haha that's fair. What's holding you back?",
+    "Does that match what you were hoping for?",
+    "I hear you, the traffic must make evenings hard. How much time could you set aside?",
+    "So looking at your week, are there evenings or a weekend block where you could carve out "
+    "that kind of time, or would it be more of a squeeze wherever you put it?",
+    "Tuesday evening then, after your weekend reading?",
+    "Would a weekend slot make it easier at home?",
+    "Are you free this weekend?",
+    "Haha, okay.",
+    "Lol, fair enough.",
+)
+
+
+class TangentReviewReaderTests(unittest.TestCase):
+    def test_friendly_discovery_wording_is_still_a_probe_and_a_dig(self):
+        from r1_personas import asks_about_learner, detect_probes
+
+        for text, topics in FRIENDLY_PROBES:
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset(topics))  # the release before
+                self.assertEqual(detect_probes(text, small_talk=True), frozenset(topics))
+                self.assertTrue(asks_about_learner(text, small_talk=True))
+
+    def test_a_small_talk_object_question_is_still_skipped(self):
+        from r1_personas import asks_about_learner, detect_probes
+
+        for text in (
+            "Have you tried that new biryani place near you?",
+            "Have you been to that new dosa place everyone keeps raving about?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text, small_talk=True), frozenset())
+                self.assertFalse(asks_about_learner(text, small_talk=True))
+
+    def test_a_sales_turn_with_a_laugh_or_a_weekend_is_no_tangent(self):
+        from r1_personas import is_tangent
+
+        for text in SALES_NOT_TANGENTS:
+            with self.subTest(text=text):
+                self.assertFalse(is_tangent(text))
+        for text in (*TANGENTS, "How was your weekend?"):
+            with self.subTest(text=text):
+                self.assertTrue(is_tangent(text))
+
+
+class TangentReviewEngineTests(unittest.TestCase):
+    def say_after_f3(self, text, **env):
+        with flags(R1_NATURAL_TIMING="0", **env):
+            s = Session(engine())
+            r = after_f3(s)
+            return s.say(text, r)
+
+    def test_a_probe_with_a_laugh_gets_its_reveal_and_no_tangent_note(self):
+        from r1_prompts import TANGENT_INTENT_NOTE, TANGENT_NOTE
+
+        plan = self.say_after_f3("Haha, fair enough. So what worries you most?")
+        self.assertNotIn("tangent", plan.reasons)
+        self.assertIn("owed_deferred_for_reveal", plan.reasons)
+        self.assertNotIn(TANGENT_NOTE, plan.reminder)
+        self.assertNotIn(TANGENT_INTENT_NOTE, plan.reminder)
+
+    def test_a_scheduling_question_holds_nothing_for_a_tangent(self):
+        from r1_prompts import TANGENT_NOTE
+
+        for text in (
+            "Does that match what you were hoping for?",
+            "Would a weekend slot make it easier at home?",
+        ):
+            with self.subTest(text=text):
+                plan = self.say_after_f3(text)
+                self.assertNotIn("owed_deferred_for_tangent", plan.reasons)
+                self.assertNotIn(TANGENT_NOTE, plan.reminder)
+
+    def test_a_turn_that_hands_over_a_disclosure_layer_is_never_a_tangent(self):
+        # Even if the tangent reader misread it, the reveal wins: never both notes.
+        from r1_prompts import TANGENT_NOTE
+
+        with flags(R1_NATURAL_TIMING="0"):
+            s = Session(engine())
+            r = after_f3(s)
+            with mock.patch.object(r1_roleplay, "is_tangent", lambda text: True):
+                plan = s.say("So what worries you most?", r)
+        self.assertIn("owed_deferred_for_reveal", plan.reasons)
+        self.assertNotIn("tangent", plan.reasons)
+        self.assertNotIn(TANGENT_NOTE, plan.reminder)
+        self.assertNotIn(r1_roleplay.LENGTH_ONE_OR_TWO, plan.reminder)
+
+    def test_the_19_minute_stall_gets_a_reaction_only_word_on_the_tangent(self):
+        # Review TANGENT-R3: the stall's brief allows ONE short reaction; "make your point" would
+        # invite her own stall before the scripted WEAK line.
+        from r1_prompts import TANGENT_INTENT_NOTE, TANGENT_NOTE, TANGENT_REACT_NOTE
+
+        cricket = "Totally off topic, but did you catch the cricket match yesterday?"
+        for flag in ("1", "0"):
+            with self.subTest(flag=flag), flags(R1_TANGENT=flag):
+                session, _ = run_cooperative(62.5)
+                plan = session.say(cricket, COMMIT_STALL_R_SEC + 10.0)
+                self.assertEqual(plan.move_id, COMMIT_STALL)
+                self.assertNotIn(TANGENT_INTENT_NOTE, plan.reminder)
+                self.assertNotIn(TANGENT_NOTE, plan.reminder)
+                if flag == "1":
+                    self.assertIn(TANGENT_REACT_NOTE, plan.reminder)
+                else:
+                    self.assertNotIn(TANGENT_REACT_NOTE, plan.reminder)
+
+
 if __name__ == "__main__":
     unittest.main()

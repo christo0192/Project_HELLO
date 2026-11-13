@@ -322,6 +322,7 @@ from r1_prompts import (
     VOICED_CONCERNS_RECENT_NOTE,
     TANGENT_INTENT_NOTE,
     TANGENT_NOTE,
+    TANGENT_REACT_NOTE,
     VOICED_CONCERNS_NOTE,
     control_prose,
     format_usd,
@@ -2364,6 +2365,12 @@ class RolePlayEngine:
                 resolves=True,
             )
         reveal_due = bool(first_probes) or bool(reveal_topics)
+        if reveal_due and self._tangent_now:
+            # Review TANGENT-R2: a turn that hands over a disclosure layer is the sale, never a
+            # tangent; the reveal note and TANGENT_NOTE would contradict each other.
+            self._tangent_now = False
+            self._tangent_turns -= 1
+            reasons.remove("tangent")
         challenged = False
         held_for_cut = False
         reacting = False  # SWEEP-1: the push waits for her reaction (quiet, like a challenge)
@@ -2533,9 +2540,11 @@ class RolePlayEngine:
                 self._notes.append(PUSH_REACT_NOTE_V2 if voice_v2 else PUSH_REACT_NOTE)
                 reasons.append("owed_deferred_for_reaction")
             else:
-                if tangent:
+                if tangent and move.id != COMMIT_STALL:
                     # R1_TANGENT: the move lands anyway (forced, no slack, or already held once):
                     # a few words about the tangent first, then the point as a change of subject.
+                    # The 19:00 stall is a reaction only (``_commit_stall_plan``; review
+                    # TANGENT-R3).
                     self._notes.append(TANGENT_INTENT_NOTE)
                 probe = self._probe_step(move, r_sec) if self._probe_first else None
                 if probe is not None:
@@ -4384,15 +4393,26 @@ class RolePlayEngine:
                 and _DECISION_QUESTION.search(self._turn_reading or "") is None
             )
             note = VOICED_CONCERNS_OTHER_Q_NOTE if other else VOICED_CONCERNS_ASKED_NOTE
+            recent = ""
             if (
                 not other
                 and flag_on(FLAG_STALL_GAP)
                 and any(self._stall_said[-STALL_GAP_REPLIES:])
             ):
                 # Simulation adaptability (R1_STALL_GAP): she said the stall a moment ago, so a
-                # decision question gets its answer, not the stall once more.
-                note = VOICED_CONCERNS_RECENT_NOTE
-            notes.append(note.format(concerns=concerns))
+                # decision question gets its answer, not the stall once more.  Review
+                # STALLGAP-R4: only the stall themes in this very ledger; any other worry keeps
+                # the asked wording ("some proof it works" is the honest answer to "what would
+                # help you decide?").
+                stall_themes = {CONCERN_NOT_TODAY, CONCERN_THINK_OVER}
+                others = frozenset(theme for theme, _ in CONCERN_LABELS) - stall_themes
+                recent = self._voiced_concerns(skip=frozenset(skip) | others)
+                if recent:
+                    concerns = self._voiced_concerns(skip=frozenset(skip | stall_themes))
+            if concerns:
+                notes.append(note.format(concerns=concerns))
+            if recent:
+                notes.append(VOICED_CONCERNS_RECENT_NOTE.format(concerns=recent))
         elif concerns:
             notes.append(VOICED_CONCERNS_NOTE.format(concerns=concerns))
         if (
@@ -4856,6 +4876,10 @@ class RolePlayEngine:
             fallbacks=(text,),
         )
         self.negotiation.note_response(self.turn, "commit:weak_at_stall")
+        if self._tangent_now:
+            # Review TANGENT-R3 (R1_TANGENT): her one reaction may be a word on the tangent, and
+            # nothing more (never "make your point": the WEAK line follows separately).
+            self._notes.append(TANGENT_REACT_NOTE)
         return self._plan(
             TurnMode.INTENT,
             reasons,
