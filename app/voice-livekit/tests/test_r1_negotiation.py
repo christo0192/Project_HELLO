@@ -3328,5 +3328,210 @@ class PriceAskedOnceTests(unittest.TestCase):
         self.assertIn("clear", state.counter_situation(counter_v2=True).brief)
 
 
+class DeclineScopeTests(unittest.TestCase):
+    """Simulation diagnosis 2 (SC2, the engine's R1_DECLINE_SCOPE): only a decline that is her
+    decision, and that still stands, caps the in-window MEDIUM.  Synthetic, paraphrased text."""
+
+    def test_the_graded_objection_is_no_declined_call(self):
+        n = Negotiation("husband")
+        # The owed F4-PUSH worded as a refusal of a check-in (paraphrased).
+        n.note_learner_text(
+            "Send the numbers and I'll go over them with my husband. I'd rather reach out once "
+            "we've talked than have a follow-up booked.",
+            22,
+            objection=True,
+            scoped=True,
+        )
+        self.assertFalse(n.call_declined())
+        self.assertIsNone(n.log()["call_declined_turn"])
+        n.observe(31, "Could we pencil in a short call once you two have looked at the figures?")
+        self.assertFalse(n.call_declined())
+
+    def test_a_decline_before_the_window_holds_until_its_reason_is_answered(self):
+        n = Negotiation("husband")
+        n.note_learner_text(
+            "Better if you just send the email and I'll be in touch after we've read it.",
+            24,
+            scoped=True,
+        )
+        self.assertTrue(n.call_declined())
+        self.assertEqual(n.log()["pre_window_decline_turn"], 24)
+        n.observe(26, "Would a monthly figure be the clearest place to start?")
+        self.assertTrue(n.call_declined())
+        n.observe(
+            30,
+            "Could we pencil in a short call for early next week, and you can confirm or move it "
+            "once you've read the email?",
+        )
+        self.assertFalse(n.call_declined())
+
+    def test_a_decline_inside_the_window_still_holds(self):
+        n = Negotiation("husband")
+        n.note_learner_text("I'd rather keep it to email for now.", 31, in_window=True, scoped=True)
+        self.assertTrue(n.call_declined())
+        n.observe(32, "Shall I call you once you've read it? You can always move it.")
+        self.assertTrue(n.call_declined())
+
+    def test_unscoped_is_the_release_before(self):
+        n = Negotiation("husband")
+        n.note_learner_text("I'd rather reach out once we've talked.", 22, objection=True)
+        self.assertTrue(n.call_declined())
+        self.assertEqual(n.log()["call_declined_turn"], 22)
+
+    def test_the_deferral_reader(self):
+        for text in (
+            "Would you be open to a short call once you've read it?",
+            "When you and your husband have talked, could I give you both a quick call?",
+            "Let's pencil in Tuesday, and you can always move it after you've seen the email.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.defers_call_until_after(text))
+        for text in (
+            "Once you've read it, let me know what you think.",
+            "Shall I call you on Friday?",
+            "I'll send the email today.",
+            # Review of SC2: the talk is the deferral's own verb, or someone else's call.
+            "After we talk, you'll feel better.",
+            "When you talk to your husband, tell him to call us.",
+            "Once you've read it, have her call our office.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(neg.defers_call_until_after(text))
+
+
+class StallMemoryReaderTests(unittest.TestCase):
+    """Simulation diagnosis 2 (ST1 (2) and (4)): the promise reader and the bare money question."""
+
+    def test_the_promise_reader(self):
+        for text in (
+            "I'll send the figures today and you reach out whenever you're ready.",
+            "I'll put the breakdown and the monthly numbers in writing for you.",
+            "Absolutely, and I'll get the exact figures sent over.",
+            "The email will have everything in it, so take your time.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.promises_to_send(text))
+        for text in (
+            "I'll get back to you on the discount.",
+            "Let me check with my team first.",
+            "We'll send you the schedule once you enroll.",
+            "I will walk you through it on the call.",
+            # Review of ST1: put, get, share and pop name no sending without a written channel.
+            "Let me put it this way, the options are simple.",
+            "Let me get your details first.",
+            "I'll share my screen and walk through the options.",
+            "We'll put everything in place for your start.",
+            "Let me just get the numbers right: it's $9,000.",
+            "I'll get you enrolled and we can go over the details later.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(neg.promises_to_send(text))
+        for text in (
+            "I'll get the exact monthly figures sent over to you today.",
+            "Let me pop the details in an email for you.",
+            "I'll share the breakdown with you by email.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.promises_to_send(text))
+
+    def test_a_bare_money_question_is_put_to_her(self):
+        self.assertEqual(
+            neg.her_number_question("What monthly amount would feel workable?", bare=True),
+            neg.YOUR_NUMBER_MONTHLY,
+        )
+        self.assertIsNone(neg.her_number_question("What monthly amount would feel workable?"))
+        for text in (
+            "What amount of time feels doable?",
+            "What day works?",
+            # Review of ST1 (4): a rhetorical question he answers himself asks her nothing.
+            "So what does the monthly payment work out to? About 600.",
+            "And what would the monthly payment be? Around $600.",
+            "What would the price be after the scholarship? It comes to $8,000.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.her_number_question(text, bare=True))
+        for text in ("What monthly payment works for you?", "So what budget feels comfortable?"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(neg.her_number_question(text, bare=True))
+
+
+class LowOfferAndAnchorSituationTests(unittest.TestCase):
+    """Simulation diagnosis 2 (MF2, MF3).  Synthetic advisor text and ledgers."""
+
+    def test_the_wide_low_offer_reader(self):
+        cases = (
+            ("Honestly the most I can do is maybe 400 USD for you.", ("low", 400)),
+            ("Fine, I can let you have it at 600.", ("low", 600)),
+            ("I could maybe give you a free package for a month.", ("free", None)),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(neg.implausible_offer_in(text, wide=True), expected)
+                self.assertIsNone(neg.implausible_offer_in(text))
+        self.assertEqual(
+            neg.implausible_offer_in("300 dollars.", wide=True, amount_only=True), ("low", 300)
+        )
+        self.assertIsNone(neg.implausible_offer_in("300 dollars.", wide=True))
+        for text in (
+            "I can let you have it at 500 a month.",
+            "The most I can do is a $500 discount.",
+            "It comes to 1,250 a month.",
+            "What's 500 dollars to you?",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.implausible_offer_in(text, wide=True, amount_only=True))
+
+    def test_a_count_or_a_share_is_no_price(self):
+        """Review of MF2: a percentage, months, sessions, people or a payment count after an offer
+        frame, and a small bare number once a price is on the table, are no course price."""
+        for text in (
+            "The best I can do is 10% off.",
+            "I can do it for 6 months of mentoring.",
+            "The most I can do is 3 months free.",
+            "The best I can do is 20 percent.",
+            "I can do it for 12 months of access.",
+            "The most I can do is 2 extra sessions.",
+            "The best I can do is 1 payment plan.",
+            "I can do it for 2 people.",
+            "12.",
+            "Okay, 30.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.implausible_offer_in(text, wide=True, amount_only=True))
+        for text, expected in (
+            ("I can do it for 800, if you sign today.", ("low", 800)),
+            ("The most I can do is 2,500 total.", ("low", 2500)),
+            ("Okay, 500.", ("low", 500)),
+            ("50 dollars.", ("low", 50)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    neg.implausible_offer_in(text, wide=True, amount_only=True), expected
+                )
+
+    def test_monthly_figures_stay_non_offers(self):
+        self.assertEqual(neg.parse_price_offers("That's $1,250 a month.", v2=True), [])
+
+    def test_the_anchor_situations(self):
+        echoed = neg.anchor_after_offer(3000, situational=True, advisor_said_anchor=True)
+        reacted = neg.anchor_after_offer(5000, situational=True, reacted=True)
+        wary = neg.anchor_after_offer(2500, situational=True)
+        plain = neg.anchor_after_offer(6000, situational=True)
+        self.assertEqual(echoed.id, neg.ANCHOR_ECHOED)
+        self.assertEqual(reacted.id, neg.ANCHOR_REACTED)
+        self.assertEqual(wary.id, neg.ANCHOR_WARY)
+        self.assertEqual(plain.id, neg.ANCHOR_REACHED)
+        self.assertIn("good to know", plain.brief)  # named only to forbid it
+        for situation in (echoed, reacted, wary, plain):
+            with self.subTest(situation=situation.id):
+                self.assertIn("$7,000", situation.must_say)
+                for variant in situation.variants:
+                    self.assertTrue(markers_match(MOVE_BY_ID["F1-ANCHOR"].markers, variant))
+                    self.assertNotIn("good to know", variant.lower())
+        # Flag off (no ``situational``): the release before.
+        self.assertEqual(neg.anchor_after_offer(3000, advisor_said_anchor=True).id, neg.ANCHOR_REACHED)
+        self.assertNotIn("good to know", neg.anchor_after_offer(6000).brief)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -221,6 +221,16 @@ NEXT_STEP_PROPOSED_NOTE = (
     "- The advisor just proposed a call or a next step. React to that in a few words, without "
     "agreeing to it and without naming a day or a time, and then carry on."
 )
+# Simulation diagnosis 2 (MF5, R1_ASK_KIND_NOTE): the note names what the advisor asked for, so an
+# enrolment ask is never answered "I don't want to lock in a call yet" (new wording under D-M032-4).
+NEXT_STEP_PROPOSED_NOTE_ENROL = (
+    "- The advisor just asked you to sign up now. React to that in a few words, without agreeing "
+    "to it, and then carry on."
+)
+NEXT_STEP_PROPOSED_NOTE_CALL = (
+    "- The advisor just proposed a call. React to that in a few words, without agreeing to it and "
+    "without naming a day or a time, and then carry on."
+)
 # M032 S1 (owner decision D-M032-1: she responds first).  The advisor's turn left something open
 # for her (an offer, a question put to her, an answer to her own question, or time given): the
 # reply's job is to respond to that, and an owed move that no deadline forces waits a turn
@@ -292,6 +302,43 @@ VOICED_CONCERNS_NOTE = (
 VOICED_CONCERNS_ASKED_NOTE = (
     "- You have already told the advisor {concerns}. They asked you directly: if that is still "
     "your honest answer, you may say it once more in a few fresh words, without dwelling on it."
+)
+# Simulation diagnosis 2 (ST1 (1), R1_STALL_MEMORY): a direct question about something other than
+# her decision is answered, and the concern is not brought up again (new wording under D-M032-4).
+VOICED_CONCERNS_OTHER_Q_NOTE = (
+    "- You have already told the advisor {concerns}. They asked you about something else: answer "
+    "that, and leave it out of this reply."
+)
+# Simulation adaptability (R1_STALL_GAP): three decision questions in a row ("What would help you
+# decide?", "Is that pushing your timeline?", "When would you talk to him?") each let her say "not
+# ready today" once more.  Said in one of her last two replies, it is not said again: she answers
+# what they asked (new wording under D-M032-4).
+VOICED_CONCERNS_RECENT_NOTE = (
+    "- You have already told the advisor {concerns}, and you said it again only a moment ago. "
+    "Answer what they actually asked, in fresh words, and do not say it again in this reply."
+)
+# Simulation adaptability (R1_TANGENT; the live tangent smoke): the advisor went off the subject
+# for a moment (small talk, a personal question, a joke).  A real prospect engages with it briefly,
+# as herself, and lets the call come back; she never snaps straight back to a worry.  New wording
+# under D-M032-4 and D-M032-10, listed for review; no course fact (D-M032-7).
+TANGENT_NOTE = (
+    "- The advisor has gone off the subject for a moment (small talk, a personal question or a "
+    "joke). Respond to that as yourself, the way you would with anyone: a real reaction, or a "
+    "short answer from your own life, in one or two short sentences. Do not bring up the course, "
+    "the price or any of your worries in this reply, say nothing about the course, and ask "
+    "nothing about it: let the conversation come back to it."
+)
+TANGENT_INTENT_NOTE = (
+    "- The advisor has gone off the subject for a moment (small talk, a personal question or a "
+    "joke). Respond to that first, as yourself, in a few words; then make your point as an honest "
+    "change of subject."
+)
+# Review TANGENT-R3: the 19:00 stall's reply is ONE short reaction and its closing line is spoken
+# separately, so on a tangent she gives it a word and nothing more (never "make your point").
+TANGENT_REACT_NOTE = (
+    "- The advisor has gone off the subject for a moment (small talk, a personal question or a "
+    "joke). Your one short sentence may react to that as yourself, a word about it and nothing "
+    "more."
 )
 HOLLOW_CONCERNS_NOTE = (
     "- The advisor said almost nothing. You have already told them {concerns}, so do not say "
@@ -566,6 +613,29 @@ IMPLAUSIBLE_PRICE_NOTE = (
     "careful buyer would be surprised and a little wary: say so in your own words, and you may ask "
     "once why it is so much lower. Do not accept it, thank them for it or call it fine."
 )
+# Simulation diagnosis 2 (MF4, probe first with R1_PRICE_STORY): the figures she already said, given
+# back so she stays consistent; a direct question about how she knows gets the honest answer (new
+# wording under D-M032-4, listed for review).
+# The figures are quoted: they are hers to say, so the guard's echo check never reads them as
+# instruction prose (``control_prose``).
+FIGURES_SAID_WEBSITE = '"I saw about $9,000 on the website"'
+FIGURES_SAID_HEARD = '"I heard someone paid about $7,000"'
+FIGURES_SAID_BOTH = f"{FIGURES_SAID_WEBSITE} and {FIGURES_SAID_HEARD}"
+FIGURES_SAID_NOTE = (
+    "- You already told the advisor {said}. Stay consistent with that: never say you do not "
+    "remember it or that they told you.{source}"
+)
+# Review of MF4: the website example only when she named the website's price herself.
+FIGURES_SAID_SOURCE_WEBSITE = (
+    ' If they ask how you know, say so plainly, for example "I saw it on the website when I '
+    'filled in the form".'
+)
+# Simulation diagnosis 2 (MF2, R1_LOW_OFFER_READER): a further low figure once the careful-buyer
+# note is spent (new wording under D-M032-4, listed for review).
+LATEST_PRICE_NOTE = (
+    "- The advisor's latest figure is {amount}. If you mention the price, react to that number, "
+    "not to an earlier one, and do not accept it."
+)
 IMPLAUSIBLE_FREE_NOTE = (
     "- The advisor just talked about giving you the course for free. A careful buyer would be "
     "surprised and a little wary: say so in your own words, and you may ask once what the catch "
@@ -621,6 +691,15 @@ FINAL_ASKED_NOTE = (
 PROPOSAL_UNANSWERED_NOTE = (
     "- The advisor also proposed a call or a next step. Do not agree to it and do not name a day "
     "or a time in this reply: make only the point below."
+)
+# MF5 (R1_ASK_KIND_NOTE): the same, naming what was asked for.
+PROPOSAL_UNANSWERED_NOTE_ENROL = (
+    "- The advisor also asked you to sign up now. Do not agree to it in this reply: make only the "
+    "point below."
+)
+PROPOSAL_UNANSWERED_NOTE_CALL = (
+    "- The advisor also proposed a call. Do not agree to it and do not name a day or a time in "
+    "this reply: make only the point below."
 )
 # SWEEP-12: the soft tics ("actually", "genuinely", "properly", "I'd rather"); ``{words}`` is a
 # worker-built list of quoted words.

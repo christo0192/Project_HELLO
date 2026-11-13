@@ -256,7 +256,26 @@ import r1_world
 #    one short sentence ... and ask nothing").  No other pinned text changed.
 # 28: M032 integration 3 (the Christy lane's 24-25 merged onto revision 27): every text of both
 #    lanes in one manifest.  No text changed in the merge; CONTENT_REVISION = max(27, 25) + 1.
-CONTENT_REVISION = 28
+# Learner lane (feat/m032-learner, its revisions 27-28, after the third integration):
+# Lane 27: Simulation diagnosis 2, learner fixes (rollback flags R1_INTENT_TAIL_V3,
+#    R1_LOW_OFFER_READER, R1_PRICE_STORY and R1_ASK_KIND_NOTE carry new texts; R1_DECLINE_SCOPE,
+#    R1_OWN_COURSE, R1_DIG_FIRST, R1_F4_ORGANIC, R1_STALL_MEMORY and R1_NO_BARE_REPROACH change
+#    readers only).
+#    The short completion tails, the counter's completions, the below-$7,000 anchor situations, the
+#    latest-price, figures-said and ask-kind notes join the manifest (``_sim2_repairs``) beside the
+#    texts they replace while their flags are on.  No graded marker, must-say, meaning or deadline
+#    changed; with every flag off the tails, the anchors and the reminders are the release before.
+#    After its review (still 27, unreleased): the figures-said note's website example only for the
+#    website's price she named herself (``figures_said_source_website``), and narrower tail themes.
+# Lane 28: Simulation adaptability (owner decision D-M032-10; rollback flags R1_TANGENT and
+#    R1_STALL_GAP).  The tangent notes (a free reply and an owed point on small talk) and the
+#    voiced-concerns note for a stall said a moment ago join the manifest (``_adapt_repairs``).
+#    No graded marker, must-say, meaning or deadline changed; with both flags off the reminders
+#    are the release before.  After its review (still 28, unreleased): the 19:00 stall's reaction-
+#    only tangent note (``tangent_react_note``).
+# 29: M032 integration 4 (the learner lane's 27-28 merged onto revision 28): every text of both
+#    lanes in one manifest.  No text changed in the merge; CONTENT_REVISION = max(28, 28) + 1.
+CONTENT_REVISION = 29
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -570,6 +589,60 @@ def _sim_repairs() -> dict[str, Any]:
     }
 
 
+def _sim2_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 2 (revision 27): the learner fixes' new texts."""
+    p = r1_prompts
+    neg = r1_negotiation
+    below = {
+        name: {
+            "brief": item.brief,
+            "must_say": list(item.must_say),
+            "variants": list(item.variants),
+        }
+        for name, item in (
+            ("echoed", neg.anchor_after_offer(3000, situational=True, advisor_said_anchor=True)),
+            ("reacted", neg.anchor_after_offer(5000, situational=True, reacted=True)),
+            ("wary", neg.anchor_after_offer(2500, situational=True)),
+            ("plain", neg.anchor_after_offer(6000, situational=True)),
+        )
+    }
+    return {
+        # HF3, U1 (R1_INTENT_TAIL_V3): the short completion tails.
+        "tail_completions": {
+            move_id: list(texts) for move_id, texts in r1_scheduler.TAIL_COMPLETIONS.items()
+        },
+        "tail_themes": dict(r1_scheduler.TAIL_THEMES),
+        "counter_completions": {key: list(texts) for key, texts in neg.COUNTER_COMPLETIONS.items()},
+        "negotiation_completions": {
+            key: list(texts) for key, texts in neg.NEGOTIATION_COMPLETIONS.items()
+        },
+        # MF2 (R1_LOW_OFFER_READER), MF4 and MF3 (R1_PRICE_STORY), MF5 (R1_ASK_KIND_NOTE).
+        "latest_price_note": p.LATEST_PRICE_NOTE,
+        "voiced_concerns_other_q_note": p.VOICED_CONCERNS_OTHER_Q_NOTE,
+        "figures_said_note": p.FIGURES_SAID_NOTE,
+        "figures_said_source_website": p.FIGURES_SAID_SOURCE_WEBSITE,
+        "figures_said": [p.FIGURES_SAID_WEBSITE, p.FIGURES_SAID_HEARD, p.FIGURES_SAID_BOTH],
+        "anchor_below_situations": below,
+        "ask_kind_notes": [
+            p.NEXT_STEP_PROPOSED_NOTE_ENROL,
+            p.NEXT_STEP_PROPOSED_NOTE_CALL,
+            p.PROPOSAL_UNANSWERED_NOTE_ENROL,
+            p.PROPOSAL_UNANSWERED_NOTE_CALL,
+        ],
+    }
+
+
+def _adapt_repairs() -> dict[str, Any]:
+    """Simulation adaptability (revision 28): the tangent and stall-gap notes."""
+    p = r1_prompts
+    return {
+        "tangent_note": p.TANGENT_NOTE,
+        "tangent_intent_note": p.TANGENT_INTENT_NOTE,
+        "tangent_react_note": p.TANGENT_REACT_NOTE,
+        "voiced_concerns_recent_note": p.VOICED_CONCERNS_RECENT_NOTE,
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -854,6 +927,8 @@ def manifest() -> dict[str, Any]:
             "endings": _endings(),
             "learner_followups": _learner_followups(sample),
             "sim_repairs": _sim_repairs(),
+            "sim2_repairs": _sim2_repairs(),
+            "adapt_repairs": _adapt_repairs(),
         },
         "icebreaker": {
             "objectives": [

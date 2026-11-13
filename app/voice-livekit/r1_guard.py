@@ -1238,11 +1238,45 @@ def _own_life_duration(folded: str, persona: RenderedPersona | None) -> bool:
     return any(pattern.search(masked) for pattern in persona.markers("H1"))
 
 
+# Simulation diagnosis 2 (CF1, ``own_course``): a course she took herself is not THE course ("I quit
+# a free Python course after about three weeks" is her H2 backstory).  The product is always "the",
+# "this" or "your" course; a course noun with one of these words among the three before it is
+# another course.
+_OTHER_COURSE_BEFORE = re.compile(
+    r"\b(?:a|an|one|another|that|some|free|online|python|youtube|coursera|udemy|old|previous|"
+    r"earlier|other|first)\b",
+    re.IGNORECASE,
+)
+_COURSE_NOUN = re.compile(r"\b(?:course|program(?:me)?|class(?:es)?|bootcamp)\b", re.IGNORECASE)
+_OWN_LIFE_PAST = re.compile(
+    r"\b(?:dropped|gave up|stopped|lasted|after (?:about|around|roughly|only|just))\b",
+    re.IGNORECASE,
+)
+# Review of CF1: her own course is told with a verb of taking or leaving it ("I quit", "I tried",
+# "I took", "I did a ..."), never with a common auxiliary or a time word ("I was hoping the course
+# takes about three months", "I had hoped", "Last time I checked"): those are the product's length.
+_OWN_COURSE_TAKEN = re.compile(
+    r"\bi\s+(?:(?:once|already|also|actually|even)\s+)?(?:quit|tried|took|did (?:a|an|one|some)|"
+    r"finished|completed|attended|enrolled in|signed up for|joined)\b",
+    re.IGNORECASE,
+)
+
+
+def _another_course(folded: str, match: re.Match[str]) -> bool:
+    """CF1: the course noun of a course-noun frame ``match`` names another course than THE one."""
+    noun = _COURSE_NOUN.search(match.group(0))
+    if noun is None:
+        return False
+    before = folded[: match.start() + noun.start()].split()[-3:]
+    return any(_OTHER_COURSE_BEFORE.fullmatch(word.strip(",;:")) for word in before)
+
+
 def course_length_unsaid(
     sentence: object,
     known: frozenset[float] = frozenset(),
     *,
     persona: RenderedPersona | None = None,
+    own_course: bool = False,
 ) -> bool:
     """``sentence`` states a course length that is not one of the ``known`` (advisor) durations.
 
@@ -1250,10 +1284,30 @@ def course_length_unsaid(
     is no exemption ("I can't keep up for six months, can I?").  Every figure in a matched frame
     must be known for the sentence to pass.  ``persona`` (the session's): her own timeline's
     durations pass the ambiguous frames (review S2P-R1).
+
+    ``own_course`` (simulation diagnosis 2, CF1; the engine's R1_OWN_COURSE): the two course-noun
+    frames skip a course that is not THE course ("a free Python course") and a sentence about her
+    own course taken or left ("I quit", "gave up", "after about"; review of CF1: never a common
+    auxiliary or "last", and the ambiguous frames keep H1's own-timeline exemption only).
     """
     folded = fold(sentence)
-    spans = [match.group(0) for frame in _COURSE_LENGTH_FRAMES for match in frame.finditer(folded)]
-    if not _own_life_duration(folded, persona):
+    if own_course:
+        past = (
+            _OWN_COURSE_TAKEN.search(folded) is not None
+            or _OWN_LIFE_PAST.search(folded) is not None
+        )
+        spans = []
+        for index, frame in enumerate(_COURSE_LENGTH_FRAMES):
+            for match in frame.finditer(folded):
+                if index in (1, 2) and (past or _another_course(folded, match)):
+                    continue
+                spans.append(match.group(0))
+    else:
+        spans = [
+            match.group(0) for frame in _COURSE_LENGTH_FRAMES for match in frame.finditer(folded)
+        ]
+    own_life = _own_life_duration(folded, persona)
+    if not own_life:
         spans.extend(
             match.group(0) for frame in _AMBIGUOUS_LENGTH_FRAMES for match in frame.finditer(folded)
         )
@@ -1382,6 +1436,15 @@ class GuardContext:
     # conflict the plan owes, or one she already said on such a path); ``advisor_durations``: the
     # course lengths, in months, the advisor said (or the plan owes), which she may refer to.
     probe_first: bool = False
+    # Simulation diagnosis 2 (CF1; the engine's R1_OWN_COURSE): a course she took herself is no
+    # course length (``course_length_unsaid``).
+    own_course: bool = False
+    # Simulation diagnosis 2 (ST1 (3); the engine's R1_STALL_MEMORY): a subordinate clause left
+    # alone by a stall-quota cut goes with the clause it hung on (``_without_clauses``).
+    orphan_clause: bool = False
+    # Simulation diagnosis 2 (NAT1; the engine's R1_NO_BARE_REPROACH): the question diet never
+    # leaves a bare reproach alone (``_bare_reproach``).
+    bare_reproach: bool = False
     allowed_extra: frozenset[int] = frozenset()
     advisor_durations: frozenset[float] = frozenset()
     # M032 SWEEP-26 (R1_WRAPUP_ONE_MENTION; Christy in the wrap-up and the closing only): the hiring
@@ -1435,6 +1498,8 @@ class GuardResult:
     style_edits: int = 0
     # M032 SWEEP-12: soft tics trimmed from this reply (a count, logged in session_facts).
     soft_tic_trims: int = 0
+    # Simulation diagnosis 2 (NAT1): questions kept because only a bare reproach was left (a count).
+    bare_keeps: int = 0
 
     @property
     def clean(self) -> bool:
@@ -1457,9 +1522,11 @@ class GuardLedger:
     total: int = 0
     leak_total: int = 0
     style_edits: int = 0
+    bare_keeps: int = 0
 
     def record(self, result: GuardResult) -> None:
         self.style_edits += result.style_edits
+        self.bare_keeps += result.bare_keeps
         for hit in result.hits:
             self.counts[hit.category] = self.counts.get(hit.category, 0) + 1
             self.total += 1
@@ -1479,6 +1546,8 @@ class GuardLedger:
             "flagged": self.flagged,
             # Filler words and repeated openers the style rules took out (counts only).
             "style_edits": self.style_edits,
+            # NAT1: questions kept beside a bare reproach (counts only).
+            "bare_keeps": self.bare_keeps,
         }
 
 
@@ -1878,7 +1947,9 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         # SWEEP-17 item 5: a course-length frame ("keep up for six months"; questions too).
         length_unsaid = not any(
             hit.rule == "product_statement" for hit in hits
-        ) and course_length_unsaid(sentence, ctx.advisor_durations, persona=persona)
+        ) and course_length_unsaid(
+            sentence, ctx.advisor_durations, persona=persona, own_course=ctx.own_course
+        )
     if length_unsaid:
         hits.append(_hit(COURSE_FACT, "course_length_unsaid", sentence))
     if _HOURS_A_WEEK.search(sentence) and not question and not _hours_are_advisors(sentence, ctx):
@@ -2121,6 +2192,7 @@ class StreamGuard:
         self._praise_dropped: list[str] = []
         self._praise_off = False
         self._soft_tic_trims = 0  # M032 SWEEP-12: soft tics taken out of this reply
+        self._bare_keeps = 0  # Simulation diagnosis 2 (NAT1): questions kept beside a bare reproach
         self._length_drops = 0  # M032 SWEEP-17: sentences dropped for a course length unsaid
 
     def _phrase_count(self, key: str) -> int:
@@ -2161,7 +2233,7 @@ class StreamGuard:
                 continue
             if self._stall_blocked(key):
                 cut_first = _first_clause_matches(text, pattern)
-                text = _without_clauses(text, pattern)
+                text = _without_clauses(text, pattern, orphans=ctx.orphan_clause)
                 if text and ctx.echo_guard and cut_first and _points_back(text):
                     # U5: "I'll reach out myself ..., that suits me better." leaves "That suits me
                     # better." pointing at the clause just cut before it.  A "that" clause the cut
@@ -2211,6 +2283,12 @@ class StreamGuard:
             # always stays (R1-Q iteration 3: "what the total cost actually comes to?" was dropped).
             and not (ctx.offer_usd is None and _PRICE_QUESTION.search(text) is not None)
         ):
+            if ctx.bare_reproach and _bare_reproach(" ".join(self._emitted)):
+                # Simulation diagnosis 2 (NAT1): dropping it would leave a curt reproach alone
+                # ("That's not really what I was asking about, honestly."), so her question stays.
+                self._bare_keeps += 1
+                self._questions_kept += 1
+                return False
             return True
         self._questions_kept += 1
         if template:
@@ -2626,6 +2704,7 @@ class StreamGuard:
             truncated=self._truncated,
             style_edits=self._style_edits,
             soft_tic_trims=self._soft_tic_trims,
+            bare_keeps=self._bare_keeps,
         )
 
 
@@ -2675,17 +2754,56 @@ def _swap_that(text: str) -> str:
     return text
 
 
-def _without_clauses(text: str, pattern: re.Pattern[str]) -> str:
+# Simulation diagnosis 2 (ST1 (3), ``GuardContext.orphan_clause``): a clause that opens with a
+# subordinator ("Whether we do a call after that, I'll let you know ...") cannot stand without the
+# main clause after it.
+BARE_REPROACH_WORDS = 10
+_BARE_REPROACH_OPENER = re.compile(
+    r"^\W*(?:that'?s not|that is not|it'?s not|it is not|that isn'?t|not really|no,|no\b|"
+    r"you(?:'re| are) not)",
+    re.IGNORECASE,
+)
+_SUBORDINATE_OPENER = re.compile(
+    r"^\s*(?:whether|if|once|when|whenever|after|before|until|till|since|because|although|"
+    r"though|as soon as|unless)\b",
+    re.IGNORECASE,
+)
+
+
+def _bare_reproach(text: str) -> bool:
+    """NAT1: ``text`` is only a short complaint or reaction ("That's not really what I was asking
+    about, honestly."): ten words or fewer, opening with a negative pointer, and no course word."""
+    stripped = text.strip()
+    return (
+        bool(stripped)
+        and word_count(stripped) <= BARE_REPROACH_WORDS
+        and _BARE_REPROACH_OPENER.match(stripped) is not None
+        and _ACK_WORDS.search(stripped) is None
+    )
+
+
+def _without_clauses(text: str, pattern: re.Pattern[str], *, orphans: bool = False) -> str:
     """``text`` without the comma-separated clauses that match ``pattern`` ("" if little is left).
 
     "That helps, but it's still more than I planned for." keeps "That helps."; a sentence whose
-    only substance was the clause (fewer than three words left) is dropped whole.
+    only substance was the clause (fewer than three words left) is dropped whole.  ``orphans``
+    (ST1 (3)): a subordinate clause whose next clause was cut goes with it.
     """
     stripped = text.rstrip()
     end = stripped[-1:] if stripped[-1:] in (".", "?", "!") else "."
     body = stripped.rstrip(".?!")
-    kept = [part for part in _CLAUSE_SPLIT.split(body) if part.strip()]
-    kept = [part for part in kept if pattern.search(part) is None]
+    parts = [part for part in _CLAUSE_SPLIT.split(body) if part.strip()]
+    cut = [pattern.search(part) is not None for part in parts]
+    if orphans:
+        for index, part in enumerate(parts):
+            if (
+                not cut[index]
+                and index + 1 < len(parts)
+                and cut[index + 1]
+                and _SUBORDINATE_OPENER.match(part)
+            ):
+                cut[index] = True
+    kept = [part for part, gone in zip(parts, cut) if not gone]
     if not kept:
         return ""
     out = ", ".join(kept)

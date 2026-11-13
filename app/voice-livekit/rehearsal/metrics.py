@@ -974,17 +974,38 @@ def final_price_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any
     whose learner line asks it, and flags two within ``FINAL_PRICE_NEAR_EXCHANGES`` of each other.
     """
     asked: list[int] = []
+    in_one_reply = 0
     for index, ex in enumerate(exchanges):
         spoken = str(_learner(ex).get("spoken") or "")
-        if any("?" in sentence and _FINAL_PRICE_QUESTION.search(sentence)
-               for sentence in split_sentences(spoken)):
+        hits = [
+            sentence for sentence in split_sentences(spoken)
+            if "?" in sentence and _FINAL_PRICE_QUESTION.search(sentence)
+        ]
+        if hits:
             asked.append(index + 1)
-    near = [(a, b) for a, b in zip(asked, asked[1:]) if b - a <= FINAL_PRICE_NEAR_EXCHANGES]
+        if len(hits) >= 2:
+            in_one_reply += 1  # simulation diagnosis 2 (HF3): the same question twice in one reply
+    near = [
+        (a, b) for a, b in zip(asked, asked[1:])
+        if b - a <= FINAL_PRICE_NEAR_EXCHANGES
+        # Simulation diagnosis 2 (HF3): a re-ask right after an advisor turn that only
+        # acknowledged it ("Okay.") asks a question nobody answered; it is no repeat.
+        and not _non_answer(str(_advisor(exchanges[b - 1]).get("text") or ""))
+    ]
     return {
         "final_price_questions": len(asked),
         "final_price_question_exchanges": asked,
-        "final_price_asked_twice": len(near),
+        "final_price_asked_twice": len(near) + in_one_reply,
     }
+
+
+# HF3: an advisor turn of a few words with no figure and no question ("Okay.", "Yeah, okay, sure.").
+NON_ANSWER_WORDS = 4
+
+
+def _non_answer(text: str) -> bool:
+    words = re.findall(r"[A-Za-z0-9']+", text)
+    return bool(words) and len(words) <= NON_ANSWER_WORDS and not re.search(r"\d|\?", text)
 
 
 def guard_metrics(

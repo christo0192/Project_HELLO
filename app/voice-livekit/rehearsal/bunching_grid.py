@@ -462,6 +462,23 @@ def _answerer(index: int, learner: _Learner) -> str:
     return _cycle(ANSWERER, index)
 
 
+# Simulation adaptability (R1_TANGENT): the cooperative advisor who goes off the subject every third
+# turn (small talk, a personal question, a joke; synthetic lines).  Run when named
+# (``--compare-tangent``): the tangent hold must leave no family late or excluded.
+TANGENT_LINES = (
+    "Totally off topic, but did you catch the cricket match yesterday?",
+    "Random question, is it pouring where you are too? It hasn't stopped here all week.",
+    "Haha, sorry, my dog keeps barking at the neighbours, I can barely hear myself.",
+    "Have you been to that new dosa place everyone keeps raving about?",
+)
+
+
+def _tangent(index: int, learner: _Learner) -> str:
+    if index % 3 == 2:
+        return _cycle(TANGENT_LINES, index // 3)
+    return _cooperative(index, learner)
+
+
 PATTERNS: dict[str, AdvisorFn] = {
     "cooperative": _cooperative,
     "pitcher": _pitcher,
@@ -474,10 +491,13 @@ PATTERNS: dict[str, AdvisorFn] = {
     "owner_shape": _owner_shape,
     "pushy": _pushy,
     "answerer": _answerer,
+    "tangent": _tangent,
 }
 # Patterns run only when asked for by name (``--compare-s2p`` and the S2P grid test): the S1 and
 # S2 grids and their totals stay the ones those slices measured.
-EXTRA_PATTERNS = frozenset({"answerer"})
+EXTRA_PATTERNS = frozenset({"answerer", "tangent"})
+# The simulation adaptability rollback flags (``--compare-tangent``).
+ADAPT_FLAGS: tuple[str, ...] = ("R1_TANGENT", "R1_STALL_GAP")
 # The patterns whose learner names her decision maker when asked who else decides.
 DECIDER_PATTERNS = frozenset({"decider", "cutter_decider"})
 # The patterns whose learner says she is not ready to commit today when asked to enrol today.
@@ -771,9 +791,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--compare-s2p", action="store_true", help="S1 and S2 on with S2P off, then every flag on"
     )
+    parser.add_argument(
+        "--compare-tangent",
+        action="store_true",
+        help="the adaptability flags off, then on (gated patterns and the tangent advisor)",
+    )
     parser.add_argument("--json", help="write the results to this file")
     args = parser.parse_args(argv)
     out: dict[str, Any] = {}
+    if args.compare_tangent:
+        return _compare_tangent(args.json)
     if args.compare_s2p:
         return _compare_s2p(args.json)
     if args.compare_s2:
@@ -821,6 +848,37 @@ def late_families(results: list[RunResult], pattern: str) -> dict[str, list[str]
         for item in results
         if item.pattern == pattern
     }
+
+
+def _compare_tangent(json_path: str | None) -> int:
+    """Simulation adaptability: every other flag on, the adaptability flags off against on."""
+    out: dict[str, Any] = {}
+    names = (*GATED_PATTERNS, "tangent")
+    grids = {
+        label: run_grid({name: value for name in ADAPT_FLAGS}, patterns=names)
+        for label, value in (("off", "0"), ("on", "1"))
+    }
+    for label, results in grids.items():
+        print(f"== adaptability flags {label}")
+        print(table(results))
+        print(json.dumps(totals(results)))
+        out[label] = {"totals": totals(results), "runs": [item.as_dict() for item in results]}
+    found = regressions(grids["off"], grids["on"], patterns=names)
+    print("== regressions (off -> on): " + ("; ".join(found) or "none"))
+    out["regressions"] = found
+    steps = {
+        label: run_steps({name: value for name in ADAPT_FLAGS}, patterns=names)
+        for label, value in (("off", "0"), ("on", "1"))
+    }
+    gate = gate_regressions(steps["off"], steps["on"])
+    print("== step rows (off -> on), scoring regressions: " + ("; ".join(gate) or "none"))
+    out["step_gate_regressions"] = gate
+    out["step_changes"] = regressions(steps["off"], steps["on"], patterns=names)
+    changes = "; ".join(out["step_changes"]) or "none"
+    print("== step rows, later or more forced (reported): " + changes)
+    if json_path:
+        Path(json_path).write_text(json.dumps(out, indent=1), encoding="utf-8")
+    return 0
 
 
 def _compare_s2(json_path: str | None) -> int:

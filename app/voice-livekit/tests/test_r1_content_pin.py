@@ -1,4 +1,4 @@
-"""Content-package pin, isolation and style tests for the R1 content modules (PR-4b).
+﻿"""Content-package pin, isolation and style tests for the R1 content modules (PR-4b).
 
 ``CONTENT_SHA256`` pins every text the role-play speaks or prompts with.  Editing any of
 it fails ``test_the_content_sha_is_pinned`` until a reviewer bumps ``CONTENT_REVISION`` and
@@ -191,7 +191,23 @@ import r1_world
 # repeated icebreaker question (TRANSITION_IB_ANSWER_NOTE, BR-2).
 # Revision 28 (third merge of the M032 lanes): the Christy lane's 24..25 on top of revision 27;
 # no text changed in the merge.  CONTENT_REVISION = max(27, 25) + 1.
-PINNED_CONTENT_SHA256 = "a97e762683d2dbde62655d1acba5afdf3a076bb3022c4ebc99ce4717df4cac98"
+# Learner lane (feat/m032-learner), its own revisions 27..28 after the third integration:
+# Learner lane revision 27 (simulation diagnosis 2, learner fixes): the short completion tails, the counter's
+# completions, the below-$7,000 anchor situations and the latest-price, figures-said and ask-kind
+# notes join the manifest (``r1_content._sim2_repairs``) beside the texts they replace while their
+# flags are on.  No graded meaning, marker, must-say or deadline changed.
+# After the diagnosis 2 review (still revision 27, unreleased): the figures-said note keeps its
+# website example only for the website's price she named herself (FIGURES_SAID_SOURCE_WEBSITE),
+# and the tail themes need the worry's frame for "full", deciding, committing, "online" and
+# "paying".  No graded meaning, marker, must-say or deadline changed.
+# Learner lane revision 28 (simulation adaptability): the tangent notes and the stall-gap voiced-concerns note
+# join the manifest (``r1_content._adapt_repairs``) beside the texts they replace while their flags
+# are on.  No graded meaning, marker, must-say or deadline changed.
+# After its review (still revision 28, unreleased): the 19:00 stall's reaction-only tangent note
+# (TANGENT_REACT_NOTE).  No graded meaning, marker, must-say or deadline changed.
+# Revision 29 (fourth merge of the M032 lanes): the learner lane's 27..28 on top of revision 28;
+# no text changed in the merge.  CONTENT_REVISION = max(28, 28) + 1.
+PINNED_CONTENT_SHA256 = "1ded7263f76da9df923fbb949c55d18337aa2a84b15e0b23c0bf27fca4fe70b7"
 
 CONTENT_MODULES = (
     "r1_text",

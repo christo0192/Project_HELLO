@@ -741,6 +741,80 @@ EXTRA_MARKERS_V2: dict[str, tuple[tuple[str, ...], ...]] = {
     F1_COUNTER: ((r"\bfull price\b", r"\bnothing (?:added|extra)\b"),),
 }
 
+# Simulation diagnosis 2 (HF3, U1; the engine's R1_INTENT_TAIL_V3).  Her reply already made an owed
+# point in its own words but missed a marker ("fitting the course around work and the kids"), so
+# the scripted tail said the point a second time.  The tail is now the shortest of these statements
+# that completes the markers together with her reply: a few words, never a second question.  Each
+# carries the move's unchanged markers (new wording under D-M032-4, listed for review); F1-COUNTER's
+# are per situation (``r1_negotiation.COUNTER_COMPLETIONS``).
+TAIL_COMPLETIONS: dict[str, tuple[str, ...]] = {
+    F2_PRIMARY: ("I'm just not sure I could keep up.", "I'm not sure how I'd fit it into my week."),
+    F3_PRIMARY: (
+        "I'm just not sure it's worth paying for.",
+        "There's so much free online, I'm not sure it's worth it.",
+    ),
+    F3_PUSH: (
+        "I'm just not sure it would lead to a job.",
+        "I'm not sure it would really get me a job.",
+    ),
+    F4_PRIMARY: ("Not today, anyway.", "So I won't decide today."),
+    F4_PUSH: (
+        "I'd want my {decision_maker}'s input first.",
+        "I'd need to talk to my {decision_maker} too.",
+    ),
+}
+# The point of each move in words other than its markers: a reply that hits its theme already made
+# the point, so only a completion is added (``{decision_maker}`` is filled, escaped).  Review of U1:
+# the words that also have another sense need their worry's frame: "full" only as a full day or
+# week ("the full price" is no busy week), deciding and committing only as not doing it now ("I've
+# decided I really like the mentoring part" defers nothing), "online" only as free material, and
+# "paying" only for whether it is worth it ("What would I be paying each month?" asks the price).
+TAIL_THEMES: dict[str, str] = {
+    F2_PRIMARY: (
+        r"\b(?:fit(?:ting)?|juggl\w*|packed|busy|schedule|keep(?:ing)? up|on top of|squeez\w*|"
+        r"stretched|(?:days?|weeks?|evenings?|weekends?|plate|hands|life) (?:is |are )?"
+        r"(?:already |so |pretty |really )?full|full plate|hands full|"
+        r"around (?:work|my|the kids|the family|everything))\b"
+    ),
+    F4_PRIMARY: (
+        r"\b(?:think(?:ing)? (?:it|this|that|things) (?:over|through)|not ready|"
+        r"(?:not|never|\w+n'?t) (?:\w+ )?(?:to )?(?:decid\w*|commit\w*)|"
+        r"(?:decid\w*|commit\w*) (?:anything |to anything )?(?:today|now|right now|yet|just yet|"
+        r"right away|on the spot)|before (?:i |we )?(?:decid\w*|commit\w*)|"
+        r"sleep on|mull\w*|rush\w*|take (?:my|some|a bit of|a little) time)\b"
+    ),
+    F4_PUSH: r"\b(?:{decision_maker}|husband|wife|partner|father|mother|dad|mum|mom|parents?)\b",
+    F3_PRIMARY: (
+        r"\b(?:free|youtube|coursera|udemy|worth|online (?:courses?|content|videos?|material|"
+        r"resources|tutorials?|for free))\b"
+    ),
+    F3_PUSH: (
+        r"\b(?:jobs?|hired|hiring|interviews?|offers?|lay ?offs?|laid off|market|placements?|"
+        r"career)\b"
+    ),
+    # Negotiation lines (``r1_negotiation.NEGOTIATION_COMPLETIONS``).
+    "N-PRICE-FIRST": r"\b(?:price|cost|fees?|how much|charge|number|figure)\b",
+    "N-EMAIL-YES": r"\b(?:e-?mail\w*|summary|send\w*|details|writing)\b",
+    F1_COUNTER: (
+        r"\b(?:price|cost|pay(?:ing)?|total|final|all in|come to|number|figure|scholarship|"
+        r"discount|cheaper|lower|afford\w*|budget|room)\b"
+    ),
+}
+
+
+def tail_theme_hit(move_id: str, text: object, decision_maker: str) -> bool:
+    """HF3, U1: ``text`` already makes ``move_id``'s point in some words (``TAIL_THEMES``)."""
+    theme = TAIL_THEMES.get(move_id)
+    if theme is None:
+        return False
+    pattern = re.compile(_fill(theme, decision_maker, regex=True), re.IGNORECASE)
+    return pattern.search(fold(text)) is not None
+
+
+def tail_completions(move_id: str, decision_maker: str) -> tuple[str, ...]:
+    """HF3, U1: the move's completion statements, the decision maker filled in."""
+    return tuple(_fill(text, decision_maker) for text in TAIL_COMPLETIONS.get(move_id, ()))
+
 
 def widened_markers(
     move_id: str, markers: tuple[tuple[str, ...], ...]

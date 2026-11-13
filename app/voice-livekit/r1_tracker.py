@@ -150,14 +150,18 @@ class DisclosureGate:
         self.persona = persona
         self.turn = 0
         self._records = {topic: NeedRecord(topic) for topic in H_TOPICS}
+        # Simulation diagnosis 2 (ND2): the engine's R1_DIG_FIRST, set before each observation.
+        self.wide_followup = False
+        # Simulation adaptability: the engine's R1_TANGENT (a small-talk question is no probe).
+        self.small_talk = False
 
     # ------------------------------------------------------------------ observation
     def observe_candidate_turn(self, text: object, turn: int | None = None) -> GateUpdate:
         """Advance every need from one candidate turn (rule-based probes only)."""
         self.turn = turn if turn is not None else self.turn + 1
         question = has_question(text)
-        probes = detect_probes(text)
-        generic = detect_followup(text)
+        probes = detect_probes(text, small_talk=self.small_talk)
+        generic = detect_followup(text, wide=self.wide_followup)
         first: list[str] = []
         released: list[str] = []
         for topic in H_TOPICS:
@@ -741,6 +745,15 @@ _ROLE_CONFUSION_V2 = (
     rf"\bwhat {_SALE_OBJECT} are you selling\b{_NOT_HER_JOB}",
     r"\bi(?:'m| am)? (?:looking|trying|here|want(?:ing)?|going|planning|need) to (?:buy|purchase)"
     r"\b[^.?!]{0,40}\bnot (?:to )?sell\b",
+    # Simulation diagnosis 2 (MF1): "can you sell me one?", "I'm the one trying to buy here, not
+    # sell", "I'm buying, not you", "I'm planning to buy one of your company's products".  "Sell me
+    # on it" is persuasion, not a sale; "the product" stays her own job's (review S7L-R1).
+    r"\b(?:can|could|will|would) you (?:please |just )?sell me (?:one|it|something)\b(?! on\b)",
+    r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?(?:trying|looking|here|going|planning|wanting) to "
+    r"(?:buy|purchase)\b[^.?!]{0,40}\bnot (?:to )?sell\b",
+    r"\b(?:i'?m|i am) (?:the one )?buying\b[^.?!]{0,15}\bnot (?:you|selling)\b",
+    r"\b(?:i'?m|i am) (?:planning|looking|trying|going|here) to buy (?:one of )?your "
+    r"(?:company'?s )?(?:courses?|programs?|programmes?|products?)\b" + _NOT_HER_JOB,
 )
 # Review S7L-R1: "Can you pitch the course? To your husband, I mean." names someone else in the
 # next sentence, so the first one is no reversal.
