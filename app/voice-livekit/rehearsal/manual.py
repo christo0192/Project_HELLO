@@ -71,15 +71,34 @@ CONTROL_ACTS = frozenset({
     "end_request", "end_agree", "end_decline", "insult", "ready", "ready_button", "brief_request",
     "short_brief_request", "presence_check", "skip_request", "repeat_request", "hold_request",
 })
-# A transition request about an icebreaker question (to hear it again), not about the brief.
+# A transition request about an icebreaker question (to hear it again), not about the brief: an
+# earlier question named together with a go-back or ask-again verb. "A question before we begin" or
+# "one last question: ..." only mention a question in passing.
 _EARLIER_QUESTION = re.compile(
     r"\bicebreaker\b|\b(?:earlier|previous|second[- ]last|last) (?:\w+ ){0,2}question|"
-    r"\bquestion before\b|\bearlier one\b"
+    r"\bquestion before (?:the )?last\b|\b(?:earlier|previous) one\b|\bone before (?:the )?last\b"
+)
+_GO_BACK = re.compile(
+    r"\b(?:go|going|jump|jumping|come|get|take me) back\b|\breturn to\b|\brepeat|\bre-?ask|"
+    r"\bask (?:me )?(?:(?:it|that|this|them) )?again\b|\bsay (?:it|that|this) again\b|\bonce more\b"
 )
 # What a brief request asks for again: the brief itself (the role-play, its scenario, the round ...).
 _BRIEF_OBJECT = re.compile(
     r"role-?\s?play|\bbrief\b|scenario|instructions|\bround\b|summary|sum up|\blearner\b"
 )
+# "Before the role-play" says when, not what: it names no brief.
+_BEFORE_THE_ROLEPLAY = re.compile(r"\bbefore (?:we (?:start|begin|do) )?(?:the |this )?role-?\s?play\b")
+# A bare pronoun repeat right after the brief ("repeat that", "say it again") asks for the brief (the
+# session's own SWEEP-29 pronoun rule), unless it names an earlier question.
+_PRONOUN_REPEAT = re.compile(r"\brepeat (?:that|it|this)\b|\bsay (?:that|it|this) again\b")
+
+
+def _asks_for_an_earlier_question(intent: str, text: str) -> bool:
+    """A request to hear an icebreaker question again; a brief named in the text wins."""
+    what = f"{intent} || {text}".lower()
+    if not (_EARLIER_QUESTION.search(what) and _GO_BACK.search(what)):
+        return False
+    return not _BRIEF_OBJECT.search(_BEFORE_THE_ROLEPLAY.sub(" ", text.lower()))
 _REPEATS_REQUEST = re.compile(r"^repeats the request\b", re.IGNORECASE)
 
 _PRESS = re.compile(r"^\s*\[(?:silence, then )?presses (?:the )?I'm-ready", re.IGNORECASE)
@@ -155,10 +174,10 @@ def act_of(phase: str, intent: str, text: str) -> str:
         if re.search(r"presence|are you there", what):
             return "presence_check"
         v2 = flags.on(flags.TRANSITION_ACTS_V2)
-        if v2 and _EARLIER_QUESTION.search(what):
+        if v2 and _asks_for_an_earlier_question(intent, text):
             return "repeat_request"
         if re.search(r"brief|again|repeat|go over|instructions|sum up|summary|role-play part", what):
-            if not v2 or _BRIEF_OBJECT.search(what):
+            if not v2 or _BRIEF_OBJECT.search(what) or _PRONOUN_REPEAT.search(text.lower()):
                 return "brief_request"
         if re.search(r"question|asks|ask about|role", intent.lower()):
             return "roleplay_question"
