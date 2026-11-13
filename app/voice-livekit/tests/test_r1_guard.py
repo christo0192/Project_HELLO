@@ -2882,6 +2882,28 @@ class WrapupOneMentionGuardTests(unittest.TestCase):
         self.assertEqual(result.text, "Great, that's all from my side.")
         self.assertEqual([hit.category for hit in result.hits], [r1_guard.HIRING_MENTION])
 
+    def test_a_hiring_team_sentence_that_also_names_the_outcome_is_dropped_after_content(self):
+        """Review S3R-7 (naturalness): no refusal tacked onto a complete answer."""
+        for text, kept in (
+            (
+                "That's everything for today's interview. The hiring team will let you know if "
+                "you're selected.",
+                "That's everything for today's interview.",
+            ),
+            (
+                "The role is a sales role in Bangalore. The hiring team will share the salary "
+                "details.",
+                "The role is a sales role in Bangalore.",
+            ),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx())
+                self.assertEqual(result.text, kept)
+                self.assertNotIn(self.WRAP, result.text)
+        # With nothing said before it, the refusal still answers.
+        result = guard_text("The hiring team will let you know if you're selected.", self.ctx())
+        self.assertEqual(result.text, self.WRAP)
+
     def test_after_an_acknowledgement_alone_it_is_replaced(self):
         result = guard_text(
             "That's a good question. The hiring team will follow up on that.", self.ctx()

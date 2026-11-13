@@ -1963,13 +1963,16 @@ class StreamGuard:
             if any(hit.category == COURSE_FACT for hit in hits):
                 self._length_drops += 1
             out = _replacement(hits, self.ctx, sentence)
+            categories = {hit.category for hit in hits}
             if (
                 out == FAQ_DEFER_WRAP_LINE
-                and {hit.category for hit in hits} == {HIRING_MENTION}
+                and HIRING_MENTION in categories
+                and categories <= {HIRING_MENTION, HIRING_COMP, INVENTED_FACT}
                 and any(_has_own_content(said) for said in self._emitted)
             ):
                 # M032 SWEEP-26: "Great, that's all from my side." already said something, so its
-                # "The hiring team will follow up ..." is dropped, not answered with a deflection.
+                # "The hiring team will follow up ..." is dropped, not answered with a deflection
+                # (review S3R-7, naturalness: also when it names the selection or the pay).
                 out = ""
             final = out == NO_FEEDBACK_LINE
             if out in self._replacements:
