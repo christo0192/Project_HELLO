@@ -3725,3 +3725,189 @@ class EchoGuardReviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestSummaryReactionTrim(unittest.TestCase):
+    """M032 diagnosis 3 (D3-ICE1, ``R1_REACTION_VARIETY``): Christy's echo-and-verdict reactions in
+    the opening and the icebreaker.  int-live-3 (synthetic paraphrases): "Six years in edtech,
+    that's a good stretch.", "Eleven years in sales is a long run.", terse: three in a row."""
+
+    def check(self, **kwargs) -> GuardContext:
+        return ctx("icebreaker", praise_check=True, reaction_check=True, **kwargs)
+
+    def test_the_label_goes_and_the_question_stays(self) -> None:
+        for text, kept in (
+            ("Six years in edtech, that's a good stretch. What does a typical day look like?",
+             "What does a typical day look like?"),
+            ("Eleven years in sales is a long run. What kept you there?", "What kept you there?"),
+            ("Making a study plan together, that's hands-on, so how did it go?",
+             "So how did it go?"),
+            ("Eight years in edtech - that's a long stretch in one space. What drew you to sales?",
+             "What drew you to sales?"),
+            ("Seeing it from their side, that's a useful instinct. Was there a customer where it "
+             "helped?", "Was there a customer where it helped?"),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.check())
+                self.assertEqual(result.text, kept)
+                self.assertEqual(result.hits, ())  # a style trim, never a hit
+
+    def test_a_reaction_is_never_the_only_thing_left_out(self) -> None:
+        text = "Helping a friend study, that's a nice one."
+        self.assertEqual(guard_text(text, self.check()).text, text)
+
+    def test_plain_reactions_pass(self) -> None:
+        for text in (
+            "Right. What does a typical day look like?",
+            "Got it, so you open the calls. Walk me through one of them.",
+            "Talking to parents all day takes patience. What drew you to this role?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.check()).text, text)
+
+    def test_the_terse_sequence_has_at_most_one_echo_and_verdict_opener(self) -> None:
+        import r1_text
+
+        replies = (
+            "Helping a friend study, that's a nice one. What did you enjoy about it?",
+            "Making a study plan together, that's hands-on. How did that go?",
+            "Apologizing first, which sounds kind. What happened after that?",
+            "Staying calm on the call, which sounds sensible. And then what?",
+        )
+        previous = ""
+        openers = 0
+        for reply in replies:
+            spoken = guard_text(reply, self.check(previous_opening=previous)).text
+            first = r1_text.split_sentences(spoken)[0]
+            openers += r1_guard.summary_shape(first) or r1_guard.summary_verdict_detected(first)
+            previous = first
+        self.assertLessEqual(openers, 1)
+
+    def test_the_same_shape_twice_drops_the_second_opener(self) -> None:
+        context = self.check(previous_opening="Helping a friend, which sounds kind.")
+        self.assertEqual(
+            guard_text("Apologizing first, which sounds thoughtful. What happened next?", context).text,
+            "What happened next?",
+        )
+        once = self.check(previous_opening="Right, what happened next?")
+        text = "Apologizing first, which sounds thoughtful. What happened next?"
+        self.assertEqual(guard_text(text, once).text, text)  # one in a row is a reaction
+
+    def test_only_christy_in_her_small_talk_with_the_check_on(self) -> None:
+        text = "Six years in edtech, that's a good stretch. What does a typical day look like?"
+        self.assertEqual(guard_text(text, ctx("icebreaker", praise_check=True)).text, text)
+        self.assertEqual(
+            guard_text(text, ctx("wrapup", praise_check=True, reaction_check=True)).text, text
+        )
+
+    def test_the_patterns_are_linear_on_long_input(self) -> None:
+        import time as _time
+
+        for text in ("that's a " * 4000 + "good stretch", "x" * 20000 + ", that's", "a, " * 5000):
+            started = _time.perf_counter()
+            r1_guard.summary_verdict_detected(text)
+            r1_guard.summary_shape(text)
+            r1_guard.echoes_candidate_story(text, text)
+            self.assertLess(_time.perf_counter() - started, 1.0)
+
+
+class TestStoryEchoIsNoPayClaim(unittest.TestCase):
+    """M032 diagnosis 3 (D3-GUARD-IB1, ``R1_GUARD_STORY_ECHO``).  int-live-3 mix (paraphrased): a
+    proud moment about a three-lakh course and a scholarship got "That's a good question for the
+    hiring team; they'll follow up with you on it." though nobody had asked anything."""
+
+    STORY = (
+        "Yeah, so, one client wanted a course, around three lakh rupees, so my manager approved a "
+        "scholarship and he signed."
+    )
+
+    def story_ctx(self, phase: str = "icebreaker", told: str | None = None) -> GuardContext:
+        return ctx(phase, story_echo=True, candidate_text=self.STORY if told is None else told)
+
+    def test_an_echo_of_their_own_story_is_not_deflected(self) -> None:
+        for text in (
+            "A scholarship that got him over the line. How did you handle the back-and-forth?",
+            "Three lakh for one course, and a scholarship got him over the line. How did you "
+            "handle the back-and-forth?",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.story_ctx())
+                self.assertEqual(result.text, text)
+                self.assertNotIn(INTERVIEWER_DEFLECTION, result.text)
+
+    def test_with_the_flag_off_the_echo_is_deflected_as_before(self) -> None:
+        text = "Three lakh for one course. How did you handle the back-and-forth?"
+        result = guard_text(text, ctx("icebreaker"))
+        self.assertTrue(result.text.startswith(INTERVIEWER_DEFLECTION))
+
+    def test_a_pay_claim_after_a_turn_that_asked_nothing_is_dropped_with_an_ack(self) -> None:
+        text = "This role pays a good salary too. How did you handle the back-and-forth?"
+        result = guard_text(text, self.story_ctx())
+        self.assertEqual(result.text, "Got it. How did you handle the back-and-forth?")
+        self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+
+    def test_a_figure_they_asked_about_is_still_deflected(self) -> None:
+        told = "Is the salary three lakh?"
+        result = guard_text("Three lakh is about right for this role.", self.story_ctx(told=told))
+        self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_a_figure_they_never_said_is_still_a_claim(self) -> None:
+        result = guard_text("Five lakh for one course. How did you handle it?", self.story_ctx())
+        self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+        self.assertEqual(result.text, "Got it. How did you handle it?")  # nobody asked: dropped
+
+    def test_the_transition_and_wrap_up_deflection_is_unchanged(self) -> None:
+        for phase, told in (
+            ("transition", "What's the salary for this role?"),
+            ("wrapup", "And the salary, what is it?"),
+        ):
+            with self.subTest(phase=phase):
+                result = guard_text("The salary is three lakh.", self.story_ctx(phase, told))
+                self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_a_claim_about_the_role_is_never_their_story(self) -> None:
+        # Review of diagnosis 3 (D3-GUARD-IB1-LEAK): the figure is theirs, the claim is not.
+        for text in (
+            "The role pays three lakh.",
+            "This role can offer three lakh.",
+            "You'll earn three lakh here.",
+            "It pays three lakh a year.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.echoes_candidate_story(text, self.STORY))
+                result = guard_text(text, self.story_ctx())
+                self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+                self.assertNotIn("three lakh", result.text.lower())
+
+    def test_a_bare_number_word_is_no_story_figure(self) -> None:
+        told = "I have one more round with another company."
+        for text in ("We'll make an offer in one week.", "You'll hear back in one week."):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.echoes_candidate_story(text, told))
+                result = guard_text(text, self.story_ctx(told=told))
+                self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+                self.assertNotIn("one week", result.text)
+
+    def test_the_echo_exemption_is_only_in_the_small_talk(self) -> None:
+        # The session sets story_echo in every interviewer phase only through a mistake; the guard
+        # itself honours it in the opening and the icebreaker alone.
+        for phase, told, text in (
+            ("transition", "My expected CTC is seven lakh.", "This role can offer seven lakh."),
+            ("transition", "My last CTC was seven lakh.", "Seven lakh, okay."),
+            ("wrapup", "I have one more round with another company.",
+             "We'll make an offer in one week."),
+            ("wrapup", "I have one more round with another company.",
+             "You'll hear back in one week."),
+        ):
+            with self.subTest(phase=phase, text=text):
+                result = guard_text(text, self.story_ctx(phase, told))
+                self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_the_rollback_flag(self) -> None:
+        import os
+        from unittest import mock
+
+        self.assertTrue(r1_guard.guard_story_echo_enabled())
+        with mock.patch.dict(os.environ, {"R1_GUARD_STORY_ECHO": "0"}):
+            self.assertFalse(r1_guard.guard_story_echo_enabled())

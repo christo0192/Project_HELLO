@@ -102,6 +102,17 @@ LINES: dict[str, str] = {
     "L-OPEN-AGENDA-CONTINUE": OPEN_HEARD + OPEN_AGENDA + OPEN_CARRY_ON,
     # M032 S6 item 5 and SWEEP-30: the brief, from the shared body above.
     "L-TRANSITION": BRIEF_THANKS + BRIEF_BODY,
+    # M032 diagnosis 3 (D3-ICE1, R1_REACTION_VARIETY): the brief with one of three thanks in place
+    # of "Thank you, {first_name}." (int-live-3 M04, terse, M07: a flat "Thank you, Alex." right
+    # after a long personal story read as robotic), picked by the session's seed.  Zero latency
+    # (scripted and warmed per name, like L-TRANSITION); the body is the same shared brief.
+    # Review of diagnosis 3 (D3-ICE1-THANKS-CONTEXT): A is neutral (no "that's helpful", a verdict
+    # on the answer), and it takes B's place when the icebreaker did not end on a real answer.
+    "L-TRANSITION-THANKS-A": "Thanks, {first_name}. " + BRIEF_BODY,
+    "L-TRANSITION-THANKS-B": (
+        "Thanks for walking me through that, {first_name}. " + BRIEF_BODY
+    ),
+    "L-TRANSITION-THANKS-C": "Got it, thank you, {first_name}. " + BRIEF_BODY,
     # M032 S5 item 4: the brief after Christy's own one-sentence reaction to the last icebreaker
     # answer (R1_TRANSITION_BRIDGE, off by default).  L-TRANSITION without "Thank you,
     # {first_name}.", so it carries no candidate name and is cached once per machine.  M032 S6
@@ -122,6 +133,26 @@ LINES: dict[str, str] = {
         + BRIEF_GOAL[1:]
         + ", using your preparation guide. " + RECAP_START_PROMPT
     ),
+    # M032 live simulation, diagnosis 3 (D3-BRIEF1, R1_BRIEF_VARIETY): the replay re-explained in
+    # other words, not the brief word for word (int-live-3 M01: "Of course, here it is again." and
+    # the same 110 words), and a second recap, so a candidate who asks three times never hears one
+    # text twice.  Neither opens with "Of course".  L-TRANSITION-AGAIN and L-TRANSITION-RECAP stay
+    # for the flag off (and the recap is still the first one).
+    "L-TRANSITION-AGAIN-PLAIN": (
+        "Sure. Think of it as a real sales call. I'll play {lead_name} from {lead_city}, who "
+        "filled in a form about our Data Science course, and you're the Program Advisor calling "
+        "her back. Find out what she needs and help her decide to enrol, using your preparation "
+        "guide. You'll have up to twenty minutes, and I'll stay in character until I say, 'Let's "
+        "pause the role-play here.' Whenever you're ready, just say 'ready'."
+    ),
+    "L-TRANSITION-RECAP-2": (
+        "No problem, the short version: you're calling {lead_first_name} back about the Data "
+        "Science course she asked about. Understand what she needs and help her decide. Say "
+        "'ready' when you'd like to start."
+    ),
+    # D3-BRIEF1: "Are you there?" seconds after a start question finished playing: "Yes, I'm here."
+    # and this, never the start question again.
+    "L-TRANSITION-TAKE-TIME": "Take your time, just say 'ready' when you are.",
     # M032 S6 item 3 and SWEEP-28 (one id): the answer to "Are you there?".
     "L-PRESENT": "Yes, I'm here.",
     # M032 S6 item 6: the "I'm ready" button pressed while a brief was playing; said before the
@@ -395,6 +426,20 @@ def transition_repair_enabled() -> bool:
     content revision 21's lines and routing exactly.
     """
     return (os.getenv("R1_TRANSITION_REPAIR") or "1").strip().lower() not in _OFF_VALUES
+
+
+def brief_variety_enabled() -> bool:
+    """``R1_BRIEF_VARIETY`` (default on, only with ``R1_TRANSITION_REPAIR``; M032 diagnosis 3,
+    D3-BRIEF1): the replay is re-explained (L-TRANSITION-AGAIN-PLAIN), the recaps rotate
+    (L-TRANSITION-RECAP, then L-TRANSITION-RECAP-2), a repeat request after a recap gets the next
+    recap, a presence check just after a start question gets L-TRANSITION-TAKE-TIME, and a brief
+    request past every budget never gets a line it already heard.  Read at use.  Rollback:
+    ``fly secrets set R1_BRIEF_VARIETY=0 -a project-hello-voice`` (content revision 28's lines and
+    routing exactly).
+    """
+    return transition_repair_enabled() and (
+        (os.getenv("R1_BRIEF_VARIETY") or "1").strip().lower() not in _OFF_VALUES
+    )
 
 
 def active_line_id(line_id: str) -> str:

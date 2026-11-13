@@ -1230,7 +1230,14 @@ class InterviewerVoiceTests(unittest.TestCase):
 
     The owner's call fda9e9f6 (#3-#21): every icebreaker reply opened with a verdict on the answer
     and read as an interrogation.  The phone Christy has a persona and register; R1's had none.
+    With ``R1_REACTION_VARIETY`` off: diagnosis 3 rewords the react clause (D3-ICE1,
+    ``TestReactionVarietyPrompt``), and these pin S5's text as the flag-off prefix and rider.
     """
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {"R1_REACTION_VARIETY": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_the_voice_text_is_appended_inside_the_prefix_and_is_byte_stable(self):
         from r1_prompts import INTERVIEWER_VOICE_TEXT
@@ -1587,3 +1594,68 @@ class WrapupAnswersReminderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+class TestReactionVarietyPrompt(unittest.TestCase):
+    """M032 diagnosis 3 (D3-ICE1, ``R1_REACTION_VARIETY``): the react clause of the voice text and
+    the delivery rider, and (D3-TRANS-JOB1) the broad-question line of the transition note."""
+
+    def test_the_voice_text_asks_for_a_reaction_not_a_summary(self) -> None:
+        import r1_prompts
+
+        new = r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS
+        self.assertNotIn("react in a few words to one specific thing", new)
+        for phrase in ('"Right"', '"Got it"', "never sum up or label what they said",
+                       "that's a good stretch", "that's a clear path", "that's hands-on",
+                       "that's a long run"):
+            self.assertIn(phrase, new)
+        # The rest of the voice text is unchanged.
+        old = r1_prompts.INTERVIEWER_VOICE_TEXT
+        self.assertTrue(new.startswith(old.split("Before you ask something")[0]))
+        self.assertTrue(new.endswith(old.split("Take in what they say")[1]))
+
+    def test_the_prefix_and_rider_follow_the_flag_and_off_is_byte_identical(self) -> None:
+        import r1_prompts
+
+        plain = interviewer_prefix(voice=False)
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=False),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT,
+        )
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=True),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS,
+        )
+        self.assertEqual(interviewer_prefix(voice=False, reactions=True), plain)
+        for phase in ("icebreaker", "transition", "wrapup"):
+            with self.subTest(phase=phase):
+                on = r1_prompts.interviewer_reminder(phase, rider=True, reactions=True)
+                off = r1_prompts.interviewer_reminder(phase, rider=True, reactions=False)
+                self.assertTrue(on.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS))
+                self.assertTrue(off.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER))
+        with mock.patch.dict(os.environ, {"R1_REACTION_VARIETY": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_enabled())
+            self.assertEqual(
+                interviewer_prefix(voice=True), plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT
+            )
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_enabled())
+        self.assertTrue(r1_prompts.reaction_variety_enabled())
+
+    def test_a_broad_question_about_the_job_gets_an_overview(self) -> None:
+        import r1_prompts
+
+        sentence = (
+            'If the question is broad ("tell me about the job"), give a one-sentence overview in '
+            "plain words (what the advisor does) and offer the detail"
+        )
+        self.assertIn(sentence, r1_prompts.TRANSITION_REMINDER_REPAIRED)
+        self.assertIn('"10 at night to 8 in the morning"', r1_prompts.TRANSITION_REMINDER_REPAIRED)
+        self.assertNotIn(sentence, r1_prompts.TRANSITION_REMINDER)
+        on = r1_prompts.interviewer_reminder("transition", rider=False)
+        self.assertIn(sentence, on)
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            off = r1_prompts.interviewer_reminder("transition", rider=False)
+        self.assertEqual(off, r1_prompts.TRANSITION_REMINDER)  # byte-identical with the flag off

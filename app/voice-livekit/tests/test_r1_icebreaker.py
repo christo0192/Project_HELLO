@@ -342,15 +342,69 @@ class TestPlan(unittest.TestCase):
         self.assertNotIn("getting-to-know-you", skip.note)
 
     def test_a_nonanswer_reasks_the_same_objective_a_bounded_number_of_times(self):
-        plan = ib.IcebreakerPlan()
-        job(plan, SUBSTANTIVE)
-        asked = []
-        for _ in range(ib.MAX_HOLDS):
-            reask = job(plan, "Sorry, can you repeat that?", content_words=0)
-            asked.append((reask.kind, reask.objective.id))
-        self.assertEqual(asked, [(ib.JOB_REASK, "I2")] * ib.MAX_HOLDS)
-        moved = job(plan, "Sorry, can you repeat that?", content_words=0)
-        self.assertEqual((moved.kind, moved.objective.id), (ib.JOB_ASK, "I3"))  # never loops
+        # D3-IB-REASK1 (R1_IB_REASK_V2, the default): once; with it off, MAX_HOLDS times.
+        for flag, holds in (("1", ib.REASK_V2_MAX_HOLDS), ("0", ib.MAX_HOLDS)):
+            with self.subTest(flag=flag), mock.patch.dict(os.environ, {"R1_IB_REASK_V2": flag}):
+                self.assertEqual(ib.max_holds(), holds)
+                plan = ib.IcebreakerPlan()
+                job(plan, SUBSTANTIVE)
+                asked = []
+                for _ in range(holds):
+                    reask = job(plan, "Sorry, can you repeat that?", content_words=0)
+                    asked.append((reask.kind, reask.objective.id))
+                self.assertEqual(asked, [(ib.JOB_REASK, "I2")] * holds)
+                moved = job(plan, "Sorry, can you repeat that?", content_words=0)
+                self.assertEqual((moved.kind, moved.objective.id), (ib.JOB_ASK, "I3"))  # no loop
+        self.assertEqual(ib.REASK_V2_MAX_HOLDS, 1)  # a question is never put a third time
+
+    def test_an_explicit_repeat_request_does_not_use_up_the_one_hold(self):
+        # Review of diagnosis 3 (D3-IB-REASK1-SECOND-REPEAT): a candidate on a bad line who asks
+        # twice to hear the question gets it twice; the one hold is still there for a turn that
+        # answers nothing, and the repeats are bounded too (no loop).
+        repeat = "Sorry, can you say that again?"
+        with mock.patch.dict(os.environ, {"R1_IB_REASK_V2": "1"}):
+            plan = ib.IcebreakerPlan()
+            job(plan, SUBSTANTIVE)
+            kinds = [
+                plan.next_job(repeat, content_words=0, repeat_asked=True).kind
+                for _ in range(ib.REASK_V2_MAX_REPEATS)
+            ]
+            self.assertEqual(kinds, [ib.JOB_REASK] * ib.REASK_V2_MAX_REPEATS)
+            held = job(plan, "What do you mean?", content_words=0)
+            self.assertEqual((held.kind, held.objective.id), (ib.JOB_REASK, "I2"))  # the hold
+            moved = plan.next_job(repeat, content_words=0, repeat_asked=True)
+            self.assertEqual((moved.kind, moved.objective.id), (ib.JOB_ASK, "I3"))
+            # Taken back with the rest of the plan's state when a reply is never heard.
+            plan = ib.IcebreakerPlan()
+            job(plan, SUBSTANTIVE)
+            lost = plan.next_job(repeat, content_words=0, repeat_asked=True)
+            self.assertTrue(plan.reply_lost(lost))
+            self.assertEqual(plan.repeats, {})
+        self.assertEqual(ib.REASK_V2_MAX_REPEATS, 2)
+
+    def test_with_the_flag_off_a_repeat_request_is_an_ordinary_hold(self):
+        with mock.patch.dict(os.environ, {"R1_IB_REASK_V2": "0"}):
+            plan = ib.IcebreakerPlan()
+            job(plan, SUBSTANTIVE)
+            kinds = [
+                plan.next_job("Sorry, again?", content_words=0, repeat_asked=True).kind
+                for _ in range(ib.MAX_HOLDS + 1)
+            ]
+        self.assertEqual(kinds, [ib.JOB_REASK] * ib.MAX_HOLDS + [ib.JOB_ASK])
+
+    def test_repeats_after_every_objective_are_bounded_as_well(self):
+        with mock.patch.dict(os.environ, {"R1_IB_REASK_V2": "1"}):
+            plan = ib.IcebreakerPlan()
+            while plan.current is not None:
+                job(plan, SUBSTANTIVE)
+            kinds = [
+                plan.next_job("Sorry, again?", content_words=0, repeat_asked=True).kind
+                for _ in range(ib.REASK_V2_MAX_REPEATS + ib.REASK_V2_MAX_HOLDS + 1)
+            ]
+        self.assertEqual(
+            kinds,
+            [ib.JOB_REASK] * (ib.REASK_V2_MAX_REPEATS + ib.REASK_V2_MAX_HOLDS) + [ib.JOB_FREE],
+        )
 
     def test_a_question_to_christy_is_answered_first_then_the_objective_again(self):
         plan = ib.IcebreakerPlan()
@@ -440,17 +494,20 @@ class TestPlan(unittest.TestCase):
 
     def test_a_repeat_request_after_the_plan_is_through_asks_the_last_question_again(self):
         # Review of S5: "Can you repeat the question?" got a NEW follow-up question.
-        plan = self.through()
-        kinds = []
-        for _ in range(ib.MAX_HOLDS):
-            again = job(plan, "Sorry, can you repeat the question?", content_words=0)
-            kinds.append(again.kind)
-            self.assertIn("ask your last question again", again.note)
-            self.assertNotIn(
-                "follow-up question about something they already told you", again.note
-            )
-        self.assertEqual(kinds, [ib.JOB_REASK] * ib.MAX_HOLDS)
-        self.assertEqual(job(plan, "Sorry, what?", content_words=0).kind, ib.JOB_FREE)  # bounded
+        for flag in ("1", "0"):  # D3-IB-REASK1: R1_IB_REASK_V2 on (one re-ask) and off
+            with self.subTest(flag=flag), mock.patch.dict(os.environ, {"R1_IB_REASK_V2": flag}):
+                plan = self.through()
+                kinds = []
+                for _ in range(ib.max_holds()):
+                    again = job(plan, "Sorry, can you repeat the question?", content_words=0)
+                    kinds.append(again.kind)
+                    self.assertIn("ask your last question again", again.note)
+                    self.assertNotIn(
+                        "follow-up question about something they already told you", again.note
+                    )
+                self.assertEqual(kinds, [ib.JOB_REASK] * ib.max_holds())
+                bounded = job(plan, "Sorry, what?", content_words=0)
+                self.assertEqual(bounded.kind, ib.JOB_FREE)
         skip = job(self.through(), "Can we go straight to the role play?")
         self.assertEqual(skip.kind, ib.JOB_SKIP)
         self.assertIn("get there soon", skip.note)

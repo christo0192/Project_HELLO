@@ -85,6 +85,37 @@ def icebreaker_plan_enabled() -> bool:
     return (os.getenv("R1_ICEBREAKER_PLAN") or "1").strip().lower() not in _OFF_VALUES
 
 
+# M032 live simulation, diagnosis 3 (D3-IB-REASK1): int-live-3 M10 heard one question three times in
+# 30 s ("Sorry, thank you." and "Hey, are you there?" each got it again).  With ``R1_IB_REASK_V2``
+# a question is re-asked once at most: a second turn that does not answer it moves the plan on.
+REASK_V2_MAX_HOLDS = 1
+# Review of diagnosis 3 (D3-IB-REASK1-SECOND-REPEAT): an explicit request to hear the question again
+# ("Sorry, can you say that again?") is not a turn that answered nothing: up to this many per
+# question get it word for word without using up the one hold (revision 28 repeated it twice too).
+REASK_V2_MAX_REPEATS = 2
+
+
+def ib_reask_v2_enabled() -> bool:
+    """``R1_IB_REASK_V2`` (default on, only with ``R1_ICEBREAKER_REPAIR``; D3-IB-REASK1).
+
+    One re-ask per question (``REASK_V2_MAX_HOLDS``; an explicit repeat request does not use it up,
+    ``REASK_V2_MAX_REPEATS``), a backchannel or courtesy right after her question gets no reply (a
+    bare yes, no or verdict word does), "Are you there?" just after it gets "Yes, I'm here. Take
+    your time." (no question), and a request to repeat it gets that question word for word ("Of
+    course. {question}"), scripted.  Read at use.  Rollback: ``fly secrets set R1_IB_REASK_V2=0 -a
+    project-hello-voice`` (content revision 28's re-asks).
+    """
+    return icebreaker_repair_enabled() and (
+        (os.getenv("R1_IB_REASK_V2") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
+def max_holds() -> int:
+    """How often one question is asked again before the plan moves on (``MAX_HOLDS``, or
+    ``REASK_V2_MAX_HOLDS`` with ``R1_IB_REASK_V2``)."""
+    return REASK_V2_MAX_HOLDS if ib_reask_v2_enabled() else MAX_HOLDS
+
+
 @dataclass(frozen=True)
 class Objective:
     """One thing an icebreaker question is for.
@@ -529,6 +560,7 @@ class IcebreakerPlan:
         self.cursor = 0  # OBJECTIVES[0] is asked by L-OPEN (or by the opening agenda, M032 S7C)
         self.follow_ups: dict[str, int] = {}
         self.holds: dict[str, int] = {}
+        self.repeats: dict[str, int] = {}  # D3-IB-REASK1-SECOND-REPEAT, per objective
         self.credited: list[str] = []
         self.jobs: dict[str, int] = {}
         self.serial = 0
@@ -545,6 +577,7 @@ class IcebreakerPlan:
             dict(self.holds),
             list(self.credited),
             dict(self.jobs),
+            dict(self.repeats),
         )
 
     def _advance(self, text: str) -> None:
@@ -560,31 +593,52 @@ class IcebreakerPlan:
 
     def _hold(self, current: Objective, reading: Reading, text: str) -> str:
         """The same objective again (bounded), or on to the next one once the holds are used."""
-        if self.holds.get(current.id, 0) < MAX_HOLDS:
+        if self.holds.get(current.id, 0) < max_holds():
             self.holds[current.id] = self.holds.get(current.id, 0) + 1
             return JOB_SKIP if reading.kind == SKIP else JOB_REASK
         self._advance(text)
         return JOB_ASK
 
-    def _free_job(self, reading: Reading) -> str:
+    def _repeat(self, key: str, reading: Reading, repeat_asked: bool) -> bool:
+        """D3-IB-REASK1-SECOND-REPEAT (``R1_IB_REASK_V2``): an explicit request to hear the question
+        again is re-asked without using up the hold, ``REASK_V2_MAX_REPEATS`` times per question;
+        past that it is an ordinary turn that answered nothing (the hold, then the next one)."""
+        if not (repeat_asked and reading.kind == NONANSWER and ib_reask_v2_enabled()):
+            return False
+        if self.repeats.get(key, 0) >= REASK_V2_MAX_REPEATS:
+            return False
+        self.repeats[key] = self.repeats.get(key, 0) + 1
+        return True
+
+    def _free_job(self, reading: Reading, repeat_asked: bool = False) -> str:
         """The reply once every objective is reached: a decline is still accepted, and a turn
         that did not answer still gets the last question again (bounded like a hold)."""
         if reading.kind == DECLINED:
             return JOB_DECLINED
-        if reading.kind in (NONANSWER, SKIP) and self.holds.get(_FREE_HOLDS, 0) < MAX_HOLDS:
+        if self._repeat(_FREE_HOLDS, reading, repeat_asked):
+            return JOB_REASK
+        if reading.kind in (NONANSWER, SKIP) and self.holds.get(_FREE_HOLDS, 0) < max_holds():
             self.holds[_FREE_HOLDS] = self.holds.get(_FREE_HOLDS, 0) + 1
             return JOB_SKIP if reading.kind == SKIP else JOB_REASK
         return JOB_FREE
 
-    def next_job(self, text: str, *, content_words: int) -> IcebreakerJob:
-        """Decide what Christy's reply to this committed icebreaker turn is for."""
+    def next_job(
+        self, text: str, *, content_words: int, repeat_asked: bool = False
+    ) -> IcebreakerJob:
+        """Decide what Christy's reply to this committed icebreaker turn is for.
+
+        ``repeat_asked``: the session read the turn as a request to hear her question again
+        (``r1_session.is_repeat_request``); with ``R1_IB_REASK_V2`` it does not use up the hold.
+        """
         undo = self._snapshot()
         reading = disposition(text, content_words=content_words)
         current = self.current
         if reading.kind == THINKING:
             kind = JOB_TAKE_TIME
         elif current is None:
-            kind = self._free_job(reading)
+            kind = self._free_job(reading, repeat_asked)
+        elif self._repeat(current.id, reading, repeat_asked):
+            kind = JOB_REASK
         elif reading.kind == ANSWERED:
             self._advance(text)
             kind = JOB_ASK
@@ -624,10 +678,11 @@ class IcebreakerPlan:
         """
         if job.serial != self.serial or not job.undo:
             return False
-        cursor, follow_ups, holds, credited, jobs = job.undo
+        cursor, follow_ups, holds, credited, jobs, repeats = job.undo
         self.cursor = cursor
         self.follow_ups = dict(follow_ups)
         self.holds = dict(holds)
+        self.repeats = dict(repeats)
         self.credited = list(credited)
         self.jobs = dict(jobs)
         self.serial += 1
@@ -692,6 +747,10 @@ PRESENCE_OPENER_NOTE_LATE = (
     'If they asked whether you are there, start with "Sorry about that, yes, I\'m here."'
 )
 PRESENCE_LATE_SECONDS = 6.0
+# D3-IB-REASK1 (R1_IB_REASK_V2): "Are you there?" this soon after her question finished playing gets
+# this, scripted, once per question: the question is still fresh, so it is not asked again.
+IB_PRESENCE_HOLD = "Yes, I'm here. Take your time."
+IB_PRESENCE_HOLD_SECONDS = 20.0
 
 # A request for a moment ("Can you give me a minute?", "Hold on a sec", "Can we pause?").  Narrow
 # and DIRECTED (review of S6): "give me", "wait" and "hold" need a time object ("give me an

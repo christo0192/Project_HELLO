@@ -220,15 +220,22 @@ import r1_world
 # Revision 30 (fifth merge of the M032 lanes): the Christy lane's 26..28 on top of revision 29; no
 # text changed in the merge.  CONTENT_REVISION = max(29, 28) + 1.
 # Learner lane (feat/m032-learner), its own revision 29 after the fifth integration:
-# Learner lane revision 29 (simulation diagnosis 3): the new wrap-up, exit and aside lines, her short goodbyes,
-# the rupee anchor, the one-statement last-point brief and the new notes join the manifest
-# (``r1_content._diag3_repairs`` and the script lines) beside the texts they replace while their
-# flags are on.  No graded meaning, marker, must-say or deadline changed.
+# Learner lane revision 29 (simulation diagnosis 3): the new wrap-up, exit and aside lines, her
+# short goodbyes, the rupee anchor, the one-statement last-point brief and the new notes join the
+# manifest (``r1_content._diag3_repairs`` and the script lines) beside the texts they replace while
+# their flags are on.  No graded meaning, marker, must-say or deadline changed.
 # After its review (still revision 29, unreleased): L-EXIT-WRAP opens with "Let's stop the role-play
 # here" (review D3R-8).  No graded meaning, marker, must-say or deadline changed.
-# Revision 31 (sixth merge of the M032 lanes): the learner lane's 29 on top of revision 30; no
-# text changed in the merge.  CONTENT_REVISION = max(30, 29) + 1.
-PINNED_CONTENT_SHA256 = "6d1a269da39e418e7d3dbfc59695c25f5eda2470588f92a76e75e92c0c5232e1"
+# Christy lane (feat/m032-christy), its own revisions 29..30 after the fifth integration:
+# Christy lane revision 29 (M032 live simulation, diagnosis 3): the varied replay, second recap and
+# take-time line (R1_BRIEF_VARIETY), the reworded react clause and the thanked briefs
+# (R1_REACTION_VARIETY), the presence hold (R1_IB_REASK_V2), "Got it." (R1_GUARD_STORY_ECHO) and the
+# broad job question line of the repaired transition note.
+# Christy lane revision 30 (review of diagnosis 3): L-TRANSITION-THANKS-A without "that's helpful",
+# and the icebreaker repair's REASK_V2_MAX_REPEATS.
+# Revision 31 (sixth merge of the M032 lanes): the learner lane's 29 and the Christy lane's 29..30
+# on top of revision 30; no text changed in the merge.  CONTENT_REVISION = max(30, 29, 30) + 1.
+PINNED_CONTENT_SHA256 = "d74aff07d6e982b3a51132471e0bff417cf7c295b8094bf5633d27166952d0ea"
 
 CONTENT_MODULES = (
     "r1_text",

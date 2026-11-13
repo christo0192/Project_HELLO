@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import os
 import re
 from dataclasses import dataclass, field, replace
 from typing import Iterable
@@ -809,6 +810,58 @@ def without_praise(sentence: str) -> str:
             parts.append(sentence[ends[index - 1] : bounds[index]])  # the original separator
         parts.append(clauses[index])
     rest = _KEPT_LEAD_CONNECTOR.sub("", "".join(parts).strip(), count=1)
+    if word_count(rest) < PRAISE_KEEP_MIN_WORDS:
+        return ""
+    return rest[0].upper() + rest[1:]
+
+
+# M032 diagnosis 3 (D3-ICE1): Christy's echo-and-verdict reaction, "Six years in edtech, that's a
+# good stretch.", "Eleven years in sales is a long run.", "Making a study plan together, that's
+# hands-on."  Not praise (``_PRAISE`` passes "a long run" on purpose) but a stock summary label, in
+# 9 of 15 judged calls of int-live-3.  Every quantifier is bounded (no ReDoS).
+_SUMMARY_VERDICT = _ci(
+    r"\b(?:that's|that is|is|sounds like) (?:a |an )?(?:good|long|fair|busy|clear|decent|nice|"
+    r"natural|real|useful|smart|helpful|big) (?:stretch|run|path|one|instinct|amount|bit|jump|"
+    r"leap|habit|journey|mix)\b",
+    r"\bthat's (?:hands-on|a lot of [a-z]+)\b",
+)
+# The echo-and-verdict SHAPE, whatever the words: a short echo, then "that's", "that is", "which
+# sounds" ...  Two in a row are the pattern the judges called robotic; one is a reaction.
+_SUMMARY_SHAPE = _ci(r"^[^,.?!]{3,60}(?:,| -) (?:that|which)(?:'s| is| sounds)\b")
+
+
+def summary_verdict_detected(sentence: object) -> bool:
+    """True when ``sentence`` labels what the candidate said (``_SUMMARY_VERDICT``)."""
+    return _SUMMARY_VERDICT.search(fold(sentence)) is not None
+
+
+def summary_shape(sentence: object) -> bool:
+    """True when ``sentence`` opens with a short echo and "that's ..." (``_SUMMARY_SHAPE``)."""
+    return _SUMMARY_SHAPE.search(fold(sentence).strip()) is not None
+
+
+def without_summary(sentence: str, *, shape: bool = False) -> str:
+    """``sentence`` without its echo-and-verdict reaction (D3-ICE1).
+
+    A statement is dropped whole ("" back).  A sentence that asks keeps what asks: the clauses
+    before the first asking one go ("Six years in edtech, that's a good stretch, so what does a day
+    look like?" -> "So what does a day look like?").  ``shape`` cuts the echo-and-verdict shape
+    (``summary_shape``) in place of the verdict words.  What would keep fewer than
+    ``PRAISE_KEEP_MIN_WORDS`` words is dropped too.
+    """
+    if not (summary_shape(sentence) if shape else summary_verdict_detected(sentence)):
+        return sentence
+    breaks = list(_CLAUSE_BREAK.finditer(sentence))
+    bounds = [0, *(match.end() for match in breaks)]
+    ends = [*(match.start() for match in breaks), len(sentence)]
+    clauses = [sentence[begin:end] for begin, end in zip(bounds, ends)]
+    asking = next((index for index, clause in enumerate(clauses) if _asks(clause)), None)
+    if asking is None:
+        return ""
+    if asking == 0:
+        return sentence  # the label is part of the question itself: left to the model's words
+    rest = sentence[bounds[asking] :].strip()
+    rest = _KEPT_LEAD_CONNECTOR.sub("", rest, count=1)
     if word_count(rest) < PRAISE_KEEP_MIN_WORDS:
         return ""
     return rest[0].upper() + rest[1:]
@@ -1560,6 +1613,17 @@ class GuardContext:
     # dollars or in rupees), so "nobody has told me the price" / "I still haven't heard what it
     # costs" contradicts the call and is taken out.
     price_heard: bool = False
+    # M032 diagnosis 3 (D3-ICE1).  Christy's echo-and-verdict reactions are trimmed in the opening
+    # and the icebreaker (a style trim; the session sets it from ``R1_REACTION_VARIETY``), and the
+    # first sentence of her last reply there ("" for none), for the same-shape check.
+    reaction_check: bool = False
+    previous_opening: str = ""
+    # M032 diagnosis 3 (D3-GUARD-IB1, ``R1_GUARD_STORY_ECHO``; the session sets both).  The
+    # candidate's turn this reply answers: a money figure or "scholarship" Christy echoes from it is
+    # their story, not a claim about pay, and in the opening and the icebreaker a hiring or pay
+    # sentence after a turn that asked nothing is dropped, never answered with the deflection.
+    story_echo: bool = False
+    candidate_text: str = ""
 
     @property
     def is_learner(self) -> bool:
@@ -1738,7 +1802,15 @@ def _interviewer_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     question = is_question_like(sentence)
     # Only STATEMENTS assert a hiring, pay, work-mode or timeline fact; a question such as
     # "Have you worked in a hybrid team?" asks about the candidate's own experience.
-    if not question and _states_hiring_or_pay(sentence):
+    if (
+        not question
+        and _states_hiring_or_pay(sentence)
+        and not (
+            ctx.story_echo
+            and ctx.phase in SMALL_TALK_PHASES
+            and echoes_candidate_story(sentence, ctx.candidate_text)
+        )
+    ):
         hits.append(_hit(HIRING_COMP, "hiring_or_compensation", sentence))
     elif not question and _unapproved_role_fact(sentence):
         hits.append(_hit(INVENTED_FACT, "role_fact_beyond_deck", sentence))
@@ -1766,6 +1838,75 @@ def _states_hiring_or_pay(sentence: str) -> bool:
     return bool(
         _HIRING_ROLE_TERMS.search(sentence) and _ABOUT_THE_ROLE_OR_FUTURE.search(sentence)
     )
+
+
+# D3-GUARD-IB1 (int-live-3 mix t15): the candidate's own story ("around three lakh rupees, so my
+# manager approved a scholarship") echoed back tripped the pay rule, and the reply opened with
+# "That's a good question for the hiring team" to a turn that asked nothing.  The money figures and
+# the scholarship words an echo may carry; bounded quantifiers only.  Review of diagnosis 3
+# (D3-GUARD-IB1-LEAK): a number is a money figure only with a currency sign or a money unit, never
+# bare ("one more round" must not license "in one week").
+_STORY_NUMBER = (
+    r"(?:\d[\d,.]{0,12}|one|two|three|four|five|six|seven|eight|nine|ten|twenty|fifty|hundred|a)"
+)
+_STORY_TERM = _ci(
+    r"(?:\$|\u20b9|\brs\.?|\binr)\s?\d[\d,.]{0,12}(?:\s?(?:lakhs?|lacs?|crores?|thousand|k)\b)?",
+    r"\b" + _STORY_NUMBER + r" (?:lakhs?|lacs?|crores?|thousand|rupees|dollars)\b",
+    r"\b\d[\d,.]{0,12}k\b",
+    r"\b(?:lakhs?|lacs?|crores?|rupees?|inr|scholarships?)\b",
+)
+# A sentence about THIS role, the future or a rate of pay is never an echo of the candidate's
+# story, whatever figure it repeats ("The role pays three lakh.", "Three lakh a year here.").
+_NOT_THEIR_STORY = _ci(
+    r"\b(?:a|per|each|every) (?:year|month|annum)\b|\b(?:monthly|yearly|annually|annual)\b",
+    r"\bhere\b|\bin[- ]hand\b|\btake[- ]home\b|\bearns?\b|\bearning\b|\bpackage\b|\boffer\w*\b",
+    r"\byou (?:get|make|take)\b|\bpays?\b|\bpaying\b|\bctc\b|\bsalar(?:y|ies)\b",
+)
+# What an echo of the candidate's story is answered with when the sentence that went before the
+# question was dropped (the question alone after a story sounds abrupt).
+STORY_ACK = "Got it."
+
+
+def guard_story_echo_enabled() -> bool:
+    """``R1_GUARD_STORY_ECHO`` (default on; M032 diagnosis 3, D3-GUARD-IB1): Christy's echo of the
+    candidate's own money figure or scholarship is not a pay claim, and in the opening and the
+    icebreaker a hiring or pay sentence after a turn that asked nothing is dropped (with "Got it."
+    before the question that follows), never answered with "That's a good question for the hiring
+    team".  Read at use.  Rollback: ``fly secrets set R1_GUARD_STORY_ECHO=0 -a
+    project-hello-voice`` (every such sentence gets the deflection, as before)."""
+    return (os.getenv("R1_GUARD_STORY_ECHO") or "1").strip().lower() not in {
+        "0", "off", "false", "no"
+    }
+_ACK_OPENER = _ci(r"^(?:got it|okay|ok|right|i see|sure|mm-?hmm|thanks|thank you|understood)\b")
+
+
+def echoes_candidate_story(sentence: str, candidate_text: str) -> bool:
+    """D3-GUARD-IB1: ``sentence`` names only money figures or scholarship words the candidate's
+    own turn named (a turn that asked nothing: their story), and without them it states no hiring
+    or pay fact (``_states_hiring_or_pay``).
+    "Three lakh for one course." after "around three lakh rupees" is their story; "The role pays
+    three lakh." is not, and neither is a "salary" they never said.  Review of diagnosis 3
+    (D3-GUARD-IB1-LEAK): a sentence with any cue that it is about the role, the future or a rate of
+    pay (``_ABOUT_THE_ROLE_OR_FUTURE``, ``_NOT_THEIR_STORY``) is never exempt, and a bare number
+    word is no figure (only a currency sign or a money unit makes one)."""
+    if not candidate_text or _turn_asks(candidate_text):
+        return False  # a figure they ASKED about is never echoed back unguarded
+    folded = fold(sentence)
+    if _ABOUT_THE_ROLE_OR_FUTURE.search(folded) or _NOT_THEIR_STORY.search(folded):
+        return False
+    terms = {normalize(match.group(0)) for match in _STORY_TERM.finditer(folded)}
+    terms.discard("")
+    if not terms:
+        return False
+    told = f" {normalize(candidate_text)} "
+    if any(f" {term} " not in told for term in terms):
+        return False
+    return not _states_hiring_or_pay(_STORY_TERM.sub(" ", folded))
+
+
+def _turn_asks(text: str) -> bool:
+    """The candidate's turn asks something (a question mark, or a question without one)."""
+    return "?" in text or any(is_question_like(part) for part in split_sentences(text))
 
 
 def _unapproved_role_fact(sentence: str) -> bool:
@@ -2188,6 +2329,13 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
     ):
         return FAQ_DEFER_WRAP_LINE  # M032 SWEEP-26: L-CLOSE is the one mention of the hiring team
     if not ctx.is_learner and categories & {HIRING_COMP, INVENTED_FACT}:
+        if (
+            ctx.story_echo
+            and ctx.phase in SMALL_TALK_PHASES
+            and ctx.candidate_text
+            and not _turn_asks(ctx.candidate_text)
+        ):
+            return ""  # D3-GUARD-IB1: nobody asked, so there is nothing to defer: dropped
         return INTERVIEWER_DEFLECTION
     if ctx.is_learner and ctx.persona is not None:
         need = next((hit for hit in hits if hit.category == VOLUNTEERED_NEED), None)
@@ -2281,6 +2429,15 @@ class StreamGuard:
         self._bare_keeps = 0  # Simulation diagnosis 2 (NAT1): questions kept beside a bare reproach
         self._length_drops = 0  # M032 SWEEP-17: sentences dropped for a course length unsaid
         self._anchor_comments = 0  # D3-LRN-MONEY1: settled-price comparisons kept in this reply
+        # D3-ICE1: the summary reactions this reply lost whole (``_cut_summary``; never the only
+        # sentence, ``flush`` gives them back), whether that trim is off for the rest of the reply,
+        # and how many sentences were vetted (the first is the reply's opener).
+        self._summary_dropped: list[str] = []
+        self._summary_off = False
+        self._vetted = 0
+        # D3-GUARD-IB1: the reply's first sentence was a pay echo dropped after a turn that asked
+        # nothing, so the next sentence kept opens with ``STORY_ACK``.
+        self._story_ack_owed = False
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -2650,10 +2807,45 @@ class StreamGuard:
             self._style_edits += 1
         return kept
 
+    def _cut_summary(self, sentence: str) -> str:
+        """D3-ICE1: ``sentence`` without Christy's echo-and-verdict reaction ("" when none is left).
+
+        Only in the opening and the icebreaker and only when the session turned the check on
+        (``reaction_check``).  A summary label ("that's a good stretch", ``_SUMMARY_VERDICT``) is
+        trimmed wherever it is; the bare shape ("X, that's ...") only when it opens this reply and
+        her last reply opened the same way.  A style trim (no hit).  A sentence dropped whole is
+        kept for ``flush``: it is never the only thing a reply says.
+        """
+        ctx = self.ctx
+        if (
+            not ctx.reaction_check
+            or self._summary_off
+            or ctx.is_learner
+            or ctx.phase not in SMALL_TALK_PHASES
+        ):
+            return sentence
+        kept = without_summary(sentence)
+        if (
+            kept == sentence
+            and self._vetted == 1
+            and ctx.previous_opening
+            and summary_shape(ctx.previous_opening)
+        ):
+            kept = without_summary(sentence, shape=True)
+        if kept == sentence:
+            return sentence
+        self._style_edits += 1
+        if not kept:
+            self._summary_dropped.append(sentence)
+        return kept
+
     def _vet(self, sentence: str) -> list[str]:
         if self._done:
             return []
+        self._vetted += 1
         sentence = self._cut_praise(sentence)
+        if sentence:
+            sentence = self._cut_summary(sentence)
         if not sentence:
             self._last_dropped = True
             return []
@@ -2754,9 +2946,24 @@ class StreamGuard:
                 self._repeat_drops += 1  # a second goodbye is a repeat: a back-channel replaces it
             elif hits:
                 self._other_drops += 1
+            if (
+                hits
+                and not out
+                and not self._emitted
+                and self.ctx.story_echo
+                and any(hit.category in (HIRING_COMP, INVENTED_FACT) for hit in hits)
+            ):
+                self._story_ack_owed = True  # D3-GUARD-IB1: the reply's opener was dropped
             self._last_dropped = True
             return []
         self._last_dropped = False
+        if self._story_ack_owed and not self._emitted:
+            # D3-GUARD-IB1: a short acknowledgement takes the dropped opener's place, so the
+            # question does not follow the candidate's story cold.
+            if _ACK_OPENER.match(out) is None:
+                out = STORY_ACK + " " + out
+                self._style_edits += 1
+        self._story_ack_owed = False
         cap = self.ctx.word_cap
         if cap is not None:
             room = cap - self._used
@@ -2795,6 +3002,12 @@ class StreamGuard:
         for sentence in split_sentences(self._buffer):
             out.extend(self._vet(sentence))
         self._buffer = ""
+        if not self._emitted and self._summary_dropped and self._other_drops == 0:
+            # D3-ICE1: the reaction was all the reply said, so it stays (a reaction with no
+            # question beats a canned line): vetted again without the summary trim.
+            self._summary_off = True
+            for sentence in self._summary_dropped:
+                out.extend(self._vet(sentence))
         if (
             not self._emitted
             and self._praise_dropped

@@ -1005,7 +1005,10 @@ TRANSITION_REMINDER = (
 # M032 S6 item 7 (owner's call fda9e9f6 #25: "What would you like to know? Shall we start the
 # role-play now, or do you have another question?"): with ``R1_TRANSITION_REPAIR`` on, a request to
 # ask gets "Of course, go ahead." and nothing else, and no answer ends with a question of its own;
-# the session's start question follows it (and is left out when an answer asks anyway).  Questions
+# the session's start question follows it (and is left out when an answer asks anyway).  Diagnosis 3
+# (D3-TRANS-JOB1, int-live-3 M02): "I'd like to know more about the job itself" got the shift table
+# read out in IST clock times, so a broad question gets a one-sentence overview and an offer of the
+# detail, with times said the way people say them.  Questions
 # about the role-play itself never reach the model then (the session's routing), so the ban on
 # describing it stays as it was.  M032 live simulation, diagnosis 1 (BR-2): a request to repeat
 # something was answered with that permission line ("Of course, go ahead."), so the note says when
@@ -1021,6 +1024,9 @@ TRANSITION_REMINDER_REPAIRED = (
     "friendly sentences, truthfully, using only the facts about the role you were given; for "
     "anything else (pay, work mode, training, next steps, timelines, how they will be assessed) "
     "say the hiring team will follow up on it. Never invent a fact, a number or an outcome. If "
+    'the question is broad ("tell me about the job"), give a one-sentence overview in plain words '
+    '(what the advisor does) and offer the detail, for example "happy to go into the hours or '
+    'anything else"; say times the way people say them ("10 at night to 8 in the morning"). If '
     'they only ask whether they may ask something ("Can I ask a few questions?"), say "Of course, '
     'go ahead." and stop. If they ask you to repeat or explain something you said, never answer '
     '"go ahead": repeat or explain it in one sentence. If they ask for the instructions, the '
@@ -1065,6 +1071,28 @@ INTERVIEWER_DELIVERY_RIDER = (
     "where you'd breathe. A few words of reaction, then your point. Open differently from your "
     "last replies, and never praise or judge their answer."
 )
+# M032 live simulation, diagnosis 3 (D3-ICE1, ``R1_REACTION_VARIETY``): "react in a few words to one
+# specific thing they just said" made every icebreaker reply open with an echo and a verdict ("Six
+# years in edtech, that's a good stretch.", "Helping a friend study, that's a nice one."), in 9 of
+# 15 judged calls.  The react clause asks for a person's reaction instead, often a bare "Right" or
+# "Got it", and names the summaries to avoid.  The rest of the text is unchanged.
+INTERVIEWER_VOICE_TEXT_REACTIONS = (
+    "Your manner: you are relaxed, curious and friendly, and you put people at ease; the "
+    "exchange should feel natural and two-way, never like a checklist. Talk the way people talk "
+    "on a call: contractions, short sentences, one idea per turn. Before you ask, react the way "
+    'a person would, often just "Right", or "Got it", or one short line that picks up a detail; '
+    'never sum up or label what they said (no "that\'s a good stretch", "that\'s a clear path", '
+    '"that\'s hands-on", "that\'s a long run"). Then ask, and start each reply with a different '
+    "word from your last ones. Take in what they say without judging it: never praise or rate an "
+    'answer or the candidate (no "solid experience", "a real asset", "impressive" or "great '
+    'answer"), never start with "I understand, but", and no jokes.'
+)
+INTERVIEWER_DELIVERY_RIDER_REACTIONS = (
+    "- Delivery: speak as you would on a call, with contractions, short sentences and a comma "
+    'where you\'d breathe. React the way a person would, often just "Right" or "Got it", then '
+    "your point; never sum up or label what they said. Open differently from your last replies, "
+    "and never praise or judge their answer."
+)
 # The phases whose notes carry the rider.
 _RIDER_PHASES = _GETTING_TO_KNOW_YOU_PHASES | _TRANSITION_PHASES | _WRAPUP_PHASES
 _OFF_VALUES = frozenset({"0", "off", "false", "no"})
@@ -1079,6 +1107,20 @@ def interviewer_voice_enabled() -> bool:
     return (os.getenv("R1_INTERVIEWER_VOICE") or "1").strip().lower() not in _OFF_VALUES
 
 
+def reaction_variety_enabled() -> bool:
+    """``R1_REACTION_VARIETY`` (default on, only with ``R1_INTERVIEWER_VOICE``; M032 diagnosis 3,
+    D3-ICE1): the voice text's and the rider's react clause ask for a person's reaction, not an
+    echo and a verdict; the guard trims a summary verdict ("that's a good stretch") and a second
+    echo-and-verdict opener in a row from Christy's opening and icebreaker replies; and the brief
+    opens with one of three seeded thanks in place of "Thank you, {first_name}.".  The session
+    reads it once (the prefix is byte-stable).  Rollback: ``fly secrets set R1_REACTION_VARIETY=0
+    -a project-hello-voice`` (content revision 28's prefix, notes, guard and brief).
+    """
+    return interviewer_voice_enabled() and (
+        (os.getenv("R1_REACTION_VARIETY") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
 ROLEPLAY_PHASE = "roleplay"
 _INTERVIEW_CONTEXT_PHASES = {
     "opening": ("opening", "icebreaker"),
@@ -1090,17 +1132,23 @@ _INTERVIEW_CONTEXT_PHASES = {
 }
 
 
-def interviewer_prefix(*, voice: bool | None = None) -> str:
+def interviewer_prefix(*, voice: bool | None = None, reactions: bool | None = None) -> str:
     """The interviewer's system prefix (byte-stable; the deck's shift timings are its FAQ).
 
     ``voice`` (M032 S5) appends ``INTERVIEWER_VOICE_TEXT``; ``None`` reads
-    ``R1_INTERVIEWER_VOICE``.  The session reads the flag once and passes it, so the prefix is
-    byte-stable for the whole session (the DeepSeek cache prefix).
+    ``R1_INTERVIEWER_VOICE``.  ``reactions`` (D3-ICE1) appends ``INTERVIEWER_VOICE_TEXT_REACTIONS``
+    in its place; ``None`` reads ``R1_REACTION_VARIETY``.  The session reads both flags once and
+    passes them, so the prefix is byte-stable for the whole session (the DeepSeek cache prefix).
     """
     if voice is None:
         voice = interviewer_voice_enabled()
     plain = _plain_interviewer_prefix()
-    return plain + "\n" + INTERVIEWER_VOICE_TEXT if voice else plain
+    if not voice:
+        return plain
+    if reactions is None:
+        reactions = reaction_variety_enabled()
+    text = INTERVIEWER_VOICE_TEXT_REACTIONS if reactions else INTERVIEWER_VOICE_TEXT
+    return plain + "\n" + text
 
 
 def interviewer_control_prose() -> str:
@@ -1143,14 +1191,17 @@ def interviewer_reminder(
     wrapup_one_mention: bool = False,
     wrapup_next_round: bool = False,
     wrapup_next_steps: bool = False,
+    reactions: bool | None = None,
 ) -> str | None:
     """The ephemeral note for an interviewer-phase reply (``None`` where the prefix is enough).
 
     M032 S5: ``note`` (the icebreaker plan's per-turn note) takes the phase note's place, and
     ``rider`` appends ``INTERVIEWER_DELIVERY_RIDER`` as the last line in the opening, icebreaker,
-    transition and wrap-up (``None`` reads ``R1_INTERVIEWER_VOICE``).  Without either, the notes
-    are exactly what they were.  M032 SWEEP-26: the wrap-up's flags go to the wrap-up's own note
-    (``_phase_reminder``); the rider, when on, still comes last.
+    transition and wrap-up (``None`` reads ``R1_INTERVIEWER_VOICE``).  ``reactions`` (D3-ICE1)
+    appends ``INTERVIEWER_DELIVERY_RIDER_REACTIONS`` in its place (``None`` reads
+    ``R1_REACTION_VARIETY``).  Without either, the notes are exactly what they were.  M032
+    SWEEP-26: the wrap-up's flags go to the wrap-up's own note (``_phase_reminder``); the rider,
+    when on, still comes last.
     """
     base = note or _phase_reminder(
         phase,
@@ -1164,7 +1215,10 @@ def interviewer_reminder(
     if rider is None:
         rider = interviewer_voice_enabled()
     if rider and phase in _RIDER_PHASES:
-        return base + "\n" + INTERVIEWER_DELIVERY_RIDER
+        if reactions is None:
+            reactions = reaction_variety_enabled()
+        tail = INTERVIEWER_DELIVERY_RIDER_REACTIONS if reactions else INTERVIEWER_DELIVERY_RIDER
+        return base + "\n" + tail
     return base
 
 
