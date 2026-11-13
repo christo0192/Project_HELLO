@@ -1016,6 +1016,9 @@ class GuardContext:
     # asked-for come-back: the question diet and the near-repeat drop let it through (one question
     # still).
     reask_topic: str = ""
+    # M032 SWEEP-6 (R1_PRICE_MEMORY): "I'll take the price as it stands" is a misreading (hygiene,
+    # never a concession): she never says she will take the price.
+    price_memory: bool = False
     # M032 S2P (SWEEP-17; the engine's latched R1_PROBE_FIRST): the card holds no course figure, so
     # the $9,000 is no longer an amount she may always say and "six months" no longer passes as a
     # card fact.  ``allowed_extra``: the amounts this reply may say all the same (a check or a
@@ -1396,9 +1399,38 @@ def _reopens(sentence: str) -> bool:
     return _DOUBT.search(sentence) is not None and _HOLDS_THE_PLAN.search(sentence) is None
 
 
+# M032 SWEEP-6: she says she will take the price ("so it's fine, I'll take the price as it
+# stands").  Not "I'll take the price list home", not a negated or questioned one.
+_PRICE_ACCEPTED = re.compile(
+    r"\bi'?ll (?:take|accept|go with|pay) (?:the|that|your|this) "
+    r"(?:price|number|figure|amount|rate)\b(?!\s*(?:list|sheet|breakdown|details))",
+    re.IGNORECASE,
+)
+
+
+def _price_accepted(sentence: str, ctx: GuardContext) -> bool:
+    """SWEEP-6 (``price_memory``): an unconditional "I'll take the price" in her reply.
+
+    Like ``has_concession`` it honours a negator or a doubt frame earlier in the clause and a
+    question; it is skipped on a confirmation and once a STRONG commitment is on record.
+    """
+    if not ctx.price_memory or ctx.confirm or ctx.commitment_cap >= Level.STRONG:
+        return False
+    if is_question_like(sentence):
+        return False
+    folded = fold(sentence)
+    return any(
+        not negated_before(folded, match.start())
+        and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        for match in _PRICE_ACCEPTED.finditer(folded)
+    )
+
+
 def _iteration_three_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
     """Misreadings the third live sweep found (hygiene hits: never posted, never a leak)."""
     hits: list[Hit] = []
+    if _price_accepted(sentence, ctx):
+        hits.append(_hit(MISREAD, "price_accepted", sentence))
     if ctx.hollow and not ctx.winding and CLOSER.search(sentence) is not None:
         # M032 S3.2: while the advisor closes the call her one goodbye is the reply's job.
         hits.append(_hit(MISREAD, "closer_again", sentence))

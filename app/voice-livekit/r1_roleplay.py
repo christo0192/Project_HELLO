@@ -161,6 +161,7 @@ from r1_negotiation import (
     SITUATION_SHORT,
     SITUATION_UNCLEAR,
     YOUR_NUMBER_COUNTER_SUFFIX,
+    YOUR_NUMBER_MONTHLY,
     AnchorSituation,
     anchor_after_free,
     anchor_after_stated,
@@ -191,6 +192,7 @@ from r1_negotiation import (
     declines_call,
     fill_decision_maker,
     filled_markers,
+    her_number_question,
     implausible_offer_in,
     monthly_amounts,
     instalments_are_monthly,
@@ -232,6 +234,9 @@ from r1_prompts import (
     FIGURE_CHALLENGE_NOTE,
     FLOOR_NOTE,
     NO_REPEAT_REASK_NOTE,
+    YOUR_NUMBER_MET_NOTE,
+    YOUR_NUMBER_MONTHLY_NOTE,
+    YOUR_NUMBER_TOTAL_NOTE,
     OPEN_QUESTION_AFTER_ASK_NOTE,
     OPEN_QUESTION_NOTE,
     PRICE_CONFLICT_WEBSITE_NOTE,
@@ -1384,6 +1389,8 @@ class RolePlayEngine:
         self._dodge_now = False
         self._come_back_topic = ""
         self._last_heard_turn: int | None = None
+        # SWEEP-6: the "what number works for you?" notes given.
+        self._your_number_notes = 0
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -1542,6 +1549,7 @@ class RolePlayEngine:
             closing_exempt=closing_exempt,
             reaction_only=reaction_only,
             reask_topic=reask_topic,
+            price_memory=flag_on(FLAG_PRICE_MEMORY),
         )
 
     def _offer_on_table(self) -> int | None:
@@ -2342,9 +2350,15 @@ class RolePlayEngine:
             reasons.append(f"wrap_offer:{trigger}")
             return self._wrap_offer_plan(r_sec, trigger, turn_index, reasons=reasons)
         reasons.append("free_reply")
-        come_back = self._come_back_note(reading, quiet=(
+        quiet_turn = (
             reveal_due or break_kind is not None or challenged or held_for_cut or reacting
-        ))
+        )
+        # M032 SWEEP-6: his question about her own number is answered from her card; it is this
+        # reply's one job (no come-back, no curiosity hand-over that turn).
+        your_number = self._your_number_note(reading, negotiated, quiet=quiet_turn)
+        if your_number:
+            reasons.append("your_number")
+        come_back = not your_number and self._come_back_note(reading, quiet=quiet_turn)
         if come_back:
             reasons.append("come_back")
         if cut:
@@ -2373,9 +2387,9 @@ class RolePlayEngine:
         # M032 S1 item 4: a turn that left something open for her hands over no curiosity topic;
         # her reply answers it (a check-in still asks for one real question).
         responding = respond and bool(kinds) and not self._force_curiosity
-        if come_back:
-            # M032 SWEEP-7: the come-back is this reply's one question; no curiosity hand-over (a
-            # check-in is answered by it too).
+        if come_back or your_number:
+            # M032 SWEEP-7: the come-back is this reply's one question, and SWEEP-6's answer is
+            # its one job; no curiosity hand-over (a check-in is answered by them too).
             pass
         elif self._force_curiosity and not quiet:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
@@ -3184,6 +3198,39 @@ class RolePlayEngine:
         template = OPEN_QUESTION_AFTER_ASK_NOTE if asked else OPEN_QUESTION_NOTE
         self._notes.append(template.format(label=open_q["label"]))
         self._come_back_topic = open_q["topic"]
+        return True
+
+    def _your_number_note(self, reading: str, negotiated: NegotiationTurn, *, quiet: bool) -> bool:
+        """M032 SWEEP-6 (R1_PRICE_MEMORY): he asked what she could pay; the note is added.
+
+        Only once F1-ANCHOR is delivered (before it, SWEEP-19 makes the question a moment for the
+        F1 probe or anchor), on a free reply that is not quiet, a confirmation, a check-in or a
+        challenge.  The met form when the best offer is already at or below what she hoped for.
+        It replaces ASKED_DIRECTLY_NOTE (never both).
+        """
+        if (
+            quiet
+            or not flag_on(FLAG_PRICE_MEMORY)
+            or not self.scheduler.is_delivered(F1_ANCHOR)
+            or self._confirming()
+            or negotiated.checkin
+            or challenges_learner(reading, figure=self._probe_first)
+        ):
+            return False
+        kind = her_number_question(reading)
+        if kind is None:
+            return False
+        best = self.negotiation.best_offer_usd
+        if best is not None and best <= ANCHOR_USD:
+            note = YOUR_NUMBER_MET_NOTE
+        elif kind == YOUR_NUMBER_MONTHLY:
+            note = YOUR_NUMBER_MONTHLY_NOTE
+        else:
+            note = YOUR_NUMBER_TOTAL_NOTE
+        if ASKED_DIRECTLY_NOTE in self._notes:
+            self._notes.remove(ASKED_DIRECTLY_NOTE)
+        self._notes.append(note)
+        self._your_number_notes += 1
         return True
 
     def _mark_come_back(self, open_q: dict[str, Any]) -> None:
@@ -5683,6 +5730,7 @@ class RolePlayEngine:
             "floor_yields": self._floor_yields,
             "open_q_dodged": self._open_q_dodged,
             "open_q_reasked": self._open_q_reasked,
+            "your_number_notes": self._your_number_notes,
         }
 
     def admin_log(self, *, final: bool = False, r_end: float | None = None) -> dict[str, Any]:

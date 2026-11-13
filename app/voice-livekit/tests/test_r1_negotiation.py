@@ -3235,5 +3235,56 @@ class EmailOfferV2Tests(unittest.TestCase):
         self.assertEqual(negotiation.email_offers, [3])
 
 
+
+class HerNumberQuestionTests(unittest.TestCase):
+    """M032 SWEEP-6: the advisor asks what she could pay (total or monthly)."""
+
+    def test_the_questions_and_their_kind(self):
+        from r1_negotiation import her_number_question
+
+        for text, kind in (
+            ("Okay, what number works for you?", "total"),
+            ("What price would work for you?", "total"),
+            ("What's your budget?", "total"),
+            ("How much are you willing to pay?", "total"),
+            ("What could you pay each month?", "monthly"),
+            ("So what amount works for your monthly budget?", "monthly"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(her_number_question(text), kind)
+
+    def test_time_effort_and_check_ins_are_not(self):
+        from r1_negotiation import her_number_question
+
+        for text in (
+            "How much can you manage each week?",
+            "What number of hours works for you?",
+            "How much are you willing to put in?",
+            "Does that work for you?",
+            "The number that works for most people is six thousand.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(her_number_question(text))
+
+    def test_the_corpus_and_long_turns(self):
+        import json
+        import time
+
+        from r1_negotiation import her_number_question
+
+        here = Path(__file__).resolve().parents[1]
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = here / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if her_number_question(text)]
+        self.assertEqual(hits, [])  # none in the corpus when written; any new hit is listed
+        for text in ("what number " * 600 + "works?", "how much can you " * 400, "x" * 4000):
+            started = time.perf_counter()
+            her_number_question(text)
+            self.assertLess(time.perf_counter() - started, 0.25)
+
 if __name__ == "__main__":
     unittest.main()

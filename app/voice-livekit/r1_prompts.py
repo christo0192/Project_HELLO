@@ -664,6 +664,24 @@ NO_REPEAT_NOTE = (
     "- Do not repeat anything you already said earlier in this call: say something new "
     "or move on."
 )
+# M032 SWEEP-6 (flag R1_PRICE_MEMORY): once F1-ANCHOR is delivered, "what number works for you?"
+# on a free reply gets her own figure from the card (it replaces ASKED_DIRECTLY_NOTE; no curiosity
+# that turn).  The figures are in quotes and come from the card (the $7,000 she heard people paid,
+# the $500-700 a month she could manage).  New wording under D-M032-4.
+YOUR_NUMBER_TOTAL_NOTE = (
+    "- The advisor asked what price would work for you. Answer that plainly, once: you were "
+    'hoping for something close to the "$7,000" you heard people paid. Do not push for a lower '
+    "price than that, do not accept anything, and answer before you raise anything else."
+)
+YOUR_NUMBER_MONTHLY_NOTE = (
+    "- The advisor asked what you could pay each month. Answer that plainly, once: about "
+    '"$500-700" a month is what you could manage. Do not accept anything, and answer before you '
+    "raise anything else."
+)
+YOUR_NUMBER_MET_NOTE = (
+    "- The advisor asked what price would work for you. What they have offered is already about "
+    "what you hoped for: say so plainly, without accepting it, and do not name a new, lower number."
+)
 # M032 SWEEP-7 (flag R1_COME_BACK): her own question the advisor dodged (a deferral, a vague answer
 # or a pivot to a question of their own) gets one come-back on her next free reply.  ``{label}``
 # is a rotated noun phrase in quotes (``control_prose`` drops it).  With the come-back,

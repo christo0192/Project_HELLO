@@ -467,6 +467,10 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         "open_question_note": p.OPEN_QUESTION_NOTE,
         "open_question_after_ask_note": p.OPEN_QUESTION_AFTER_ASK_NOTE,
         "no_repeat_reask_note": p.NO_REPEAT_REASK_NOTE,
+        # SWEEP-6: her own number, total, monthly and already met.
+        "your_number_total_note": p.YOUR_NUMBER_TOTAL_NOTE,
+        "your_number_monthly_note": p.YOUR_NUMBER_MONTHLY_NOTE,
+        "your_number_met_note": p.YOUR_NUMBER_MET_NOTE,
         "open_question_labels": {
             topic: list(labels) for topic, labels in r1_scheduler.OPEN_QUESTION_LABELS.items()
         },

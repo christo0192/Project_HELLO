@@ -1534,6 +1534,56 @@ def refused_slot(spoken: object) -> Slot | None:
     return None
 
 
+# M032 SWEEP-6 (flag R1_PRICE_MEMORY): the advisor asks HER what price or what monthly amount
+# would work ("Okay, what number works for you?", "What could you pay each month?", "What's your
+# budget?").  A question-like sentence addressed to her; a check-in is not one.  The forms that
+# could be about effort ("how much can you manage?") need a money word, and so does a sentence
+# with a time word ("What number of hours works for you?").  The engine reads it only once the F1
+# anchor is delivered, so "what number works for you?" alone is about the price.
+_HER_NUMBER = _compile(
+    r"\bwhat (?:number|price|amount|figure|budget)\b[^.?!]{0,40}\b(?:works?|would work|suits?|"
+    r"fits?|in mind|comfortable|(?:can|could|would) you (?:do|afford|pay|manage|spend))\b",
+    r"\bwhat(?:'s| is) your (?:budget|number|price range|range|price)\b",
+    r"\bhow much (?:can|could|would|are) you (?:pay|afford|spend|manage|willing|able|comfortable|"
+    r"looking)\b",
+    r"\bwhat (?:can|could|would) you (?:pay|afford|spend|manage)\b",
+    r"\bwhat (?:were|are) you (?:hoping|looking|expecting|planning) to (?:pay|spend)\b",
+)
+_HER_NUMBER_NEEDS_MONEY = _compile(
+    r"\bhow much (?:can|could|would|are) you (?:manage|willing|able|comfortable|looking)\b",
+    r"\bwhat (?:can|could|would) you manage\b",
+)
+_MONEY_CUE = re.compile(
+    r"\$|\b(?:pay|paying|afford|spend|budget|price|fee|fees|invest|dollars?|cost|money|emi|"
+    r"instal+ments?)\b",
+    re.IGNORECASE,
+)
+_TIME_CUE_WORDS = re.compile(r"\b(?:hours?|week|weekly|weeks|time|evenings?)\b", re.IGNORECASE)
+_MONTHLY_CUE = re.compile(r"\b(?:month|months|monthly|emi|instal+ments?)\b", re.IGNORECASE)
+YOUR_NUMBER_TOTAL = "total"
+YOUR_NUMBER_MONTHLY = "monthly"
+
+
+def her_number_question(text: object) -> str | None:
+    """``"monthly"`` or ``"total"`` when the advisor asks what she could pay, else None."""
+    for sentence in split_sentences(text):
+        lowered = fold(sentence).lower()
+        if not is_question_like(lowered) or not re.search(r"\byou(?:r)?\b", lowered):
+            continue
+        if any(pattern.search(lowered) for pattern in _CHECKIN):
+            continue
+        if not any(pattern.search(lowered) for pattern in _HER_NUMBER):
+            continue
+        money = _MONEY_CUE.search(lowered) is not None
+        if not money and (
+            _TIME_CUE_WORDS.search(lowered) is not None
+            or any(pattern.search(lowered) for pattern in _HER_NUMBER_NEEDS_MONEY)
+        ):
+            continue
+        return YOUR_NUMBER_MONTHLY if _MONTHLY_CUE.search(lowered) else YOUR_NUMBER_TOTAL
+    return None
+
+
 def detect_checkin(text: object) -> bool:
     """The advisor checks in ("what do you think?", "anything else?", "is that fine?")."""
     for sentence in split_sentences(_tail(text).lower()):

@@ -11882,5 +11882,81 @@ class ComeBackEngineTests(unittest.TestCase):
                     self.assertNotRegex(note, r"\$|\d")
                     self.assertNotIn(label, control_prose(note))
 
+
+class YourNumberEngineTests(unittest.TestCase):
+    """M032 SWEEP-6 (R1_PRICE_MEMORY): "what number works for you?" gets her own figure."""
+
+    @staticmethod
+    def after_the_anchor():
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("I see, thanks for sharing that with me.", 40)
+        deliver(s.eng, *ALL_MOVES, r=60)
+        return s
+
+    def test_a_total_question_gets_the_total_note_and_nothing_else(self):
+        from r1_prompts import ASKED_DIRECTLY_NOTE, YOUR_NUMBER_TOTAL_NOTE
+
+        s = self.after_the_anchor()
+        plan = s.eng.plan_turn("Okay, what number works for you?", 100)
+        self.assertIn("your_number", plan.reasons)
+        self.assertIn(YOUR_NUMBER_TOTAL_NOTE, plan.reminder)
+        self.assertNotIn(ASKED_DIRECTLY_NOTE, plan.reminder)
+        self.assertNotIn("You are curious about", plan.reminder)
+        self.assertEqual(s.eng.admin_log()["followups"]["your_number_notes"], 1)
+
+    def test_a_monthly_question_gets_the_monthly_note(self):
+        from r1_prompts import YOUR_NUMBER_MONTHLY_NOTE
+
+        plan = self.after_the_anchor().eng.plan_turn("What could you pay each month?", 100)
+        self.assertIn(YOUR_NUMBER_MONTHLY_NOTE, plan.reminder)
+
+    def test_an_offer_already_at_her_hope_gets_the_met_note(self):
+        from r1_prompts import YOUR_NUMBER_MET_NOTE, YOUR_NUMBER_TOTAL_NOTE
+
+        s = self.after_the_anchor()
+        s.say("I can bring the total down to $6,500 for you.", 90)
+        self.assertEqual(s.eng.negotiation.best_offer_usd, 6500)
+        plan = s.eng.plan_turn("So what number works for you?", 110)
+        self.assertIn(YOUR_NUMBER_MET_NOTE, plan.reminder)
+        self.assertNotIn(YOUR_NUMBER_TOTAL_NOTE, plan.reminder)
+
+    def test_no_note_before_the_anchor_or_on_time_questions(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        before = s.eng.plan_turn("Okay, what number works for you?", 40)
+        self.assertNotIn("your_number", before.reasons)
+        for text in ("How much can you manage each week?", "What number of hours works for you?"):
+            with self.subTest(text=text):
+                plan = self.after_the_anchor().eng.plan_turn(text, 100)
+                self.assertNotIn("your_number", plan.reasons)
+
+    def test_flag_off_gives_no_note(self):
+        from r1_prompts import YOUR_NUMBER_TOTAL_NOTE
+
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PRICE_MEMORY": "0"}):
+            s = self.after_the_anchor()
+            plan = s.eng.plan_turn("Okay, what number works for you?", 100)
+        self.assertNotIn("your_number", plan.reasons)
+        self.assertNotIn(YOUR_NUMBER_TOTAL_NOTE, plan.reminder)
+        self.assertFalse(plan.guard_ctx.price_memory)
+
+    def test_the_notes_are_clean_with_the_guard(self):
+        from r1_guard import GuardContext, guard_text
+        from r1_prompts import (
+            YOUR_NUMBER_MET_NOTE,
+            YOUR_NUMBER_MONTHLY_NOTE,
+            YOUR_NUMBER_TOTAL_NOTE,
+            control_prose,
+        )
+
+        for note, said in (
+            (YOUR_NUMBER_TOTAL_NOTE, "I was hoping for something close to $7,000."),
+            (YOUR_NUMBER_MONTHLY_NOTE, "About $500-700 a month is what I could manage."),
+            (YOUR_NUMBER_MET_NOTE, "Honestly, that's about what I was hoping for."),
+        ):
+            ctx = GuardContext(persona=P1, phase="roleplay", control_texts=(control_prose(note),))
+            self.assertTrue(guard_text(said, ctx).clean, said)
+
 if __name__ == "__main__":
     unittest.main()

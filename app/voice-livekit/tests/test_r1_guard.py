@@ -3056,5 +3056,40 @@ class ComeBackGuardTests(unittest.TestCase):
         two = "How many hours a week would I need? And how many hours a week is the live part?"
         self.assertEqual(guard_text(two, self.context("weekly_hours")).text.count("?"), 1)
 
+
+class PriceAcceptedTests(unittest.TestCase):
+    """M032 SWEEP-6 (R1_PRICE_MEMORY): she never says she will take the price."""
+
+    def test_taking_the_price_is_dropped_as_a_misreading_not_a_leak(self):
+        result = guard_text("So it's fine, I'll take the price as it stands.", ctx(price_memory=True))
+        self.assertIn("price_accepted", {hit.rule for hit in result.hits})
+        self.assertNotIn("take the price", result.text.lower())
+        ledger = GuardLedger()
+        ledger.record(result)
+        self.assertEqual(ledger.leak_total, 0)
+
+    def test_lookalikes_negations_and_questions_are_kept(self):
+        for text in (
+            "I'll take the price list home and read it.",
+            "I won't take that price, honestly.",
+            "I don't think I'll take that price.",
+            "Should I just say I'll take the price?",
+        ):
+            with self.subTest(text=text):
+                rules = {hit.rule for hit in guard_text(text, ctx(price_memory=True)).hits}
+                self.assertNotIn("price_accepted", rules)
+
+    def test_skipped_on_a_confirmation_after_a_strong_commitment_and_with_the_flag_off(self):
+        from r1_commitment import Level
+
+        text = "So it's fine, I'll take the price as it stands."
+        for context in (
+            ctx(price_memory=True, confirm=True),
+            ctx(price_memory=True, commitment_cap=Level.STRONG),
+            ctx(),
+        ):
+            rules = {hit.rule for hit in guard_text(text, context).hits}
+            self.assertNotIn("price_accepted", rules)
+
 if __name__ == "__main__":
     unittest.main()
