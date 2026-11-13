@@ -194,6 +194,20 @@ CUT_REPEAT_NOTE = (
     "they asked whether you are there, say briefly that you are; then say your point again in one "
     "or two short sentences, in your own words; raise nothing new."
 )
+# M032 SWEEP-15 (flag R1_LEARNER_VOICE_V2; 1eb18cd4 #27): the two notes above gave her a frame to
+# narrate ("you cut in while I was mid-sentence"), so their openings no longer describe the cut.  No
+# forbidden phrase is quoted (quoting primes it).  New wording under D-M032-4, listed for review.
+CUT_REPEAT_OPENING = (
+    "- The advisor cut in only to ask you to say that again, or to check you are still there."
+)
+CUT_REPEAT_OPENING_V2 = (
+    "- The advisor only asked you to say that again, or checked you are still there."
+)
+INTERRUPTED_NOTE_V2 = (
+    "- Answer what the advisor just said first, in your own words. Do not mention that you were "
+    "still talking, and do not start again what you were saying."
+)
+CUT_REPEAT_NOTE_V2 = CUT_REPEAT_NOTE.replace(CUT_REPEAT_OPENING, CUT_REPEAT_OPENING_V2, 1)
 EMAIL_AGAIN_NOTE = (
     "- You already told the advisor they can e-mail you the details. Do not say it again and "
     "do not ask for the e-mail again: acknowledge in a few words and carry on."

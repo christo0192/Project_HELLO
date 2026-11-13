@@ -6211,7 +6211,7 @@ class BargeInThroughTheEngineTests(unittest.TestCase):
         return plan
 
     def test_a_cut_owed_move_waits_one_turn_and_the_advisor_is_answered_first(self):
-        from r1_prompts import INTERRUPTED_NOTE
+        from r1_prompts import INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         eng = engine()
         self._cut_pitch(eng)
@@ -6271,7 +6271,7 @@ class BargeInThroughTheEngineTests(unittest.TestCase):
         self.assertNotEqual(nxt.move_id, F3_PRIMARY)
 
     def test_a_line_that_played_to_the_end_holds_nothing_back(self):
-        from r1_prompts import BACKCHANNEL_CUT_NOTE, INTERRUPTED_NOTE
+        from r1_prompts import BACKCHANNEL_CUT_NOTE, INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         eng = engine()
         eng.plan_turn(OPENER, 20)
@@ -6300,7 +6300,7 @@ class BargeInThroughTheEngineTests(unittest.TestCase):
                 self.assertNotIn("owed_deferred_for_interrupt", again.reasons)
 
     def test_a_cut_free_reply_is_answered_without_starting_it_again(self):
-        from r1_prompts import INTERRUPTED_NOTE
+        from r1_prompts import INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         eng = engine()
         eng.plan_turn(OPENER, 20)
@@ -6506,7 +6506,7 @@ class BargeInReviewFixTests(unittest.TestCase):
 
     # ---------------------------------------------------- "Sorry?" asks for the line again
     def test_a_repair_request_that_cut_her_gets_her_point_again(self):
-        from r1_prompts import BACKCHANNEL_CUT_NOTE, CUT_REPEAT_NOTE, INTERRUPTED_NOTE
+        from r1_prompts import BACKCHANNEL_CUT_NOTE, CUT_REPEAT_NOTE_V2 as CUT_REPEAT_NOTE, INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         eng = engine()
         eng.plan_turn(OPENER, 20)
@@ -6530,7 +6530,7 @@ class BargeInReviewFixTests(unittest.TestCase):
         self.assertEqual(eng._interrupt_deferred, set())
 
     def test_a_repair_request_with_nobody_cut_is_an_ordinary_turn(self):
-        from r1_prompts import CUT_REPEAT_NOTE
+        from r1_prompts import CUT_REPEAT_NOTE_V2 as CUT_REPEAT_NOTE
 
         eng = engine()
         eng.plan_turn(OPENER, 20)
@@ -6695,7 +6695,7 @@ class BargeInReviewFixTests(unittest.TestCase):
 
     # ---------------------------------------------------- a cut R1 made itself
     def test_a_line_r1_cut_itself_is_not_answered_as_a_barge_in(self):
-        from r1_prompts import INTERRUPTED_NOTE
+        from r1_prompts import INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         eng = engine()
         eng.plan_turn(OPENER, 20)
@@ -11162,7 +11162,7 @@ class LateEndRequestTests(unittest.TestCase):
         s.eng.record_spoken(point, s.eng.compose_speech(point, "").text, r_sec=850)
         again = s.say("Sorry?", 855, repair=True)
         self.assertIn("last_point_repeat", again.reasons)
-        self.assertIn(r1_roleplay.CUT_REPEAT_NOTE, again.reminder)
+        self.assertIn(r1_roleplay.CUT_REPEAT_NOTE_V2, again.reminder)
         held = s.say("Okay.", 857, backchannel=True)
         self.assertFalse(held.exit_roleplay)
         resumed = s.say("No, wait, let's carry on, I want to answer that.", 860)
@@ -11447,6 +11447,99 @@ class EmailReaderReviewTests(unittest.TestCase):
         s.say("Sure.", 900)
         self.assertFalse(s.eng._learner_asked_email)
 
+
+
+# ------------------------------------------------------------------------------------------------
+# M032 S7L, learner follow-ups from the transcript sweep (SWEEP-6, 7, 8, 9, 10, 15 and 33).
+# ------------------------------------------------------------------------------------------------
+# SWEEP-15's report-only reader: a learner sentence that narrates the cut ("you cut in", "I was
+# mid-sentence").  Counted from test code over the rehearsal's cutting advisor, never dropped.
+META_CUT_RE = re.compile(
+    r"\b(?:you (?:cut|jumped|butted) in|you interrupted me|(?:i was|i'm|i am) mid[- ]sentence|"
+    r"let me finish)\b",
+    re.IGNORECASE,
+)
+
+
+class CutNoteFrameTests(unittest.TestCase):
+    """SWEEP-15 (flag R1_LEARNER_VOICE_V2): the cut notes give her no frame to narrate."""
+
+    def _cut(self, eng):
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(PITCH, 40)
+        eng.record_spoken(plan, "Okay, I see. Hmm.", r_sec=41, interrupted=True)
+
+    def _cut_free(self, eng):
+        """Her free reply (no owed move) is cut, so "Sorry?" asks for that line again."""
+        plan = eng.plan_turn(OPENER, 20)
+        assert plan.move_id is None, plan
+        eng.record_spoken(plan, "Hi, yes, I have a few", r_sec=21, interrupted=True)
+
+    def test_a_barge_in_free_reply_carries_the_frame_free_note(self):
+        from r1_prompts import INTERRUPTED_NOTE, INTERRUPTED_NOTE_V2
+
+        eng = engine()
+        self._cut(eng)
+        held = eng.plan_turn(NEUTRAL, 60)
+        self.assertIn(INTERRUPTED_NOTE_V2, held.reminder)
+        self.assertNotIn(INTERRUPTED_NOTE, held.reminder)
+        self.assertNotIn("cut in", held.reminder)
+
+    def test_flag_off_gives_the_notes_of_the_release_before(self):
+        from r1_prompts import CUT_REPEAT_NOTE, INTERRUPTED_NOTE, INTERRUPTED_NOTE_V2
+
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_LEARNER_VOICE_V2": "0"}):
+            eng = engine()
+            self._cut(eng)
+            held = eng.plan_turn(NEUTRAL, 60)
+            self.assertIn(INTERRUPTED_NOTE, held.reminder)
+            self.assertNotIn(INTERRUPTED_NOTE_V2, held.reminder)
+            eng2 = engine()
+            self._cut_free(eng2)
+            again = eng2.plan_turn("Sorry?", 30, repair=True)
+            self.assertIn(CUT_REPEAT_NOTE, again.reminder)
+
+    def test_the_repeat_note_keeps_its_behaviour_and_drops_only_the_frame(self):
+        from r1_prompts import CUT_REPEAT_NOTE, CUT_REPEAT_NOTE_V2
+
+        self.assertTrue(CUT_REPEAT_NOTE_V2.startswith(
+            "- The advisor only asked you to say that again, or checked you are still there."
+        ))
+        self.assertEqual(
+            CUT_REPEAT_NOTE.split(" there.", 1)[1], CUT_REPEAT_NOTE_V2.split(" there.", 1)[1]
+        )
+        eng = engine()
+        self._cut_free(eng)
+        again = eng.plan_turn("Sorry?", 30, repair=True)
+        self.assertIn(CUT_REPEAT_NOTE_V2, again.reminder)
+        self.assertNotIn("cut in", again.reminder)
+
+    def test_no_v2_note_quotes_or_primes_a_narration(self):
+        from r1_prompts import CUT_REPEAT_NOTE_V2, INTERRUPTED_NOTE_V2
+
+        for note in (INTERRUPTED_NOTE_V2, CUT_REPEAT_NOTE_V2):
+            self.assertIsNone(META_CUT_RE.search(note))
+            self.assertNotIn('"', note)
+
+    def test_report_only_meta_cut_count_over_the_cutting_advisor(self):
+        """Report-only (SWEEP-15): learner sentences narrating the cut in the cutter scenario."""
+        from rehearsal import bunching_grid
+
+        spoken: list[str] = []
+        original = RolePlayEngine.record_spoken
+
+        def keep(self_, plan, text, **kwargs):
+            spoken.append(text)
+            return original(self_, plan, text, **kwargs)
+
+        with mock.patch.object(RolePlayEngine, "record_spoken", keep):
+            bunching_grid.run_one("cutter", 40.0)
+        hits = sum(
+            1 for line_ in spoken for sentence in re.split(r"(?<=[.!?])\s+", line_)
+            if META_CUT_RE.search(sentence)
+        )
+        print(f"\nSWEEP-15 report: {hits} META_CUT sentence(s) in {len(spoken)} learner lines")
+        self.assertEqual(hits, 0)
 
 if __name__ == "__main__":
     unittest.main()

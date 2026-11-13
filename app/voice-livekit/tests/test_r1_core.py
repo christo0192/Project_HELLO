@@ -5473,7 +5473,7 @@ class TestInterruptedLearnerRowKeepsOnlyWhatWasHeard(R1TestCase):
             [(r["speaker"], r["interrupted"]) for r in rows[-2:]],
             [("bot", True), ("candidate", False)],
         )
-        from r1_prompts import INTERRUPTED_NOTE
+        from r1_prompts import INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         self.assertIn(INTERRUPTED_NOTE, self.interview._last_reply.plan.reminder)
 
@@ -5530,7 +5530,7 @@ class TestInterruptedLearnerRowKeepsOnlyWhatWasHeard(R1TestCase):
                 self.assertIn("backchannel_continuation", plan.reasons)
 
     async def test_a_denial_or_a_yes_that_cut_her_is_answered_first(self) -> None:
-        from r1_prompts import BACKCHANNEL_CUT_NOTE, INTERRUPTED_NOTE
+        from r1_prompts import BACKCHANNEL_CUT_NOTE, INTERRUPTED_NOTE_V2 as INTERRUPTED_NOTE
 
         for text in ("No, no, no.", "Yes.", "Really?"):
             with self.subTest(text=text):

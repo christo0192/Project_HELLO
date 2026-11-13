@@ -186,7 +186,14 @@ import r1_world
 #    After the S3 review (still revision 24, unreleased): a goodbye while she is cool is polite, not
 #    warm (CLOSE_NOTE_COOL), and a winding reply has its own job line (WINDING_REPLY_NOTE) with no
 #    question, opener or length line.
-CONTENT_REVISION = 24
+# 25: M032 S7L, learner follow-ups from the transcript sweep (owner decisions D-M032-4 and D-M032-7;
+#    rollback flags R1_LEARNER_VOICE_V2 for SWEEP-15, R1_PRICE_MEMORY, R1_COME_BACK,
+#    R1_PERSONA_TIMELINE_V2, R1_CALL_OPENING, R1_ROLE_CONFUSION_V2 and R1_FLOOR_YIELD).  The new
+#    notes, the card's timeline wording, the learner's yield lines and the role-confusion examples
+#    join the manifest (``_learner_followups``) beside the texts they replace while their flags are
+#    on.  No graded meaning, marker, must-say or deadline changed; with every flag off the card,
+#    the prefix and the reminders are the release before.
+CONTENT_REVISION = 25
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -428,6 +435,16 @@ def _endings() -> dict[str, Any]:
         "time_cue_brief_v2": r1_scheduler.TIME_CUE_BRIEF_V2,
         "short_on_time_note": p.SHORT_ON_TIME_NOTE,
         "short_on_time_concerns_note": p.SHORT_ON_TIME_CONCERNS_NOTE,
+    }
+
+
+def _learner_followups() -> dict[str, Any]:
+    """M032 S7L (revision 25): the learner follow-ups' new texts, beside the ones they replace."""
+    p = r1_prompts
+    return {
+        # SWEEP-15: the cut notes without a frame to narrate.
+        "interrupted_note_v2": p.INTERRUPTED_NOTE_V2,
+        "cut_repeat_note_v2": p.CUT_REPEAT_NOTE_V2,
     }
 
 
@@ -709,6 +726,7 @@ def manifest() -> dict[str, Any]:
             "learner_voice_v2": _learner_voice_v2(sample),
             "probe_first": _probe_first(sample),
             "endings": _endings(),
+            "learner_followups": _learner_followups(),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

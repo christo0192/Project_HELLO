@@ -152,7 +152,11 @@ import r1_world
 # learner's hang-up line and the wrap-up's invitation and deflection join the script; the wrap-up
 # reminder's flagged sentences and the endings' notes join the manifest (``r1_content._endings``).
 # No graded meaning, marker, must-say, deadline or text of the release before changed.
-PINNED_CONTENT_SHA256 = "a7ce0705a6929948dfb7a21bee8a6609007c67b51662928bfb38314505bb76b8"
+# Revision 25 (M032 S7L, learner follow-ups): the follow-up notes, the card's timeline wording, the
+# learner's yield lines and the role-confusion examples join the manifest
+# (``r1_content._learner_followups``) beside the texts they replace while their flags are on.  No
+# graded meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "47c5c77dadebbb0e2c5790c0c53bf83d68416263cf6914d71ae58dcffe3242a3"
 
 CONTENT_MODULES = (
     "r1_text",

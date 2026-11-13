@@ -242,10 +242,12 @@ from r1_prompts import (
     HOLLOW_CONCERNS_NOTE,
     HOLLOW_NOTE,
     CUT_REPEAT_NOTE,
+    CUT_REPEAT_NOTE_V2,
     IMPLAUSIBLE_FREE_NOTE,
     IMPLAUSIBLE_PRICE_NOTE,
     INTENT_OPENER_NOTES,
     INTERRUPTED_NOTE,
+    INTERRUPTED_NOTE_V2,
     LENGTH_LONG,
     LENGTH_ONE,
     LENGTH_ONE_OR_TWO,
@@ -681,6 +683,27 @@ FLAG_WRAPUP_DECLINE_V2 = "R1_WRAPUP_DECLINE_V2"
 FLAG_WRAPUP_ANSWERS = "R1_WRAPUP_ANSWERS"
 FLAG_WRAPUP_ONE_MENTION = "R1_WRAPUP_ONE_MENTION"
 FLAG_WRAPUP_NEXT_ROUND = "R1_WRAPUP_NEXT_ROUND"
+# M032 S7L, learner follow-ups from the transcript sweep (owner decisions D-M032-4 and D-M032-7),
+# each default ON with the same rollback (SWEEP-15's notes ride on R1_LEARNER_VOICE_V2):
+#
+# * R1_PRICE_MEMORY (SWEEP-6): "what number works for you?" after her anchor gets her own figure
+#   from the card (total, monthly, or "what you offered is about what I hoped"), and the guard drops
+#   "I'll take the price" (a MISREAD hygiene rule).
+# * R1_COME_BACK (SWEEP-7): a question of hers the advisor dodged is asked again once, in other
+#   words (at most twice a session); a dodge is no answer for the respond-first notes.
+# * R1_PERSONA_TIMELINE_V2 (SWEEP-8): the card says she is at home when they call, the webinars are
+#   dated, and her goal has no competing deadline (latched per session: it changes the card).
+# * R1_CALL_OPENING (SWEEP-9): when the advisor has not said who is calling she asks, and she asks
+#   back "and you?" when asked how she is.
+# * R1_ROLE_CONFUSION_V2 (SWEEP-10): "sell it to me" and "I want to buy, not sell" are read as the
+#   advisor mixing up the roles; after the coach aside a repeat gets a role note, not the AI note.
+# * R1_FLOOR_YIELD (SWEEP-33): "Can I talk?" or "Let me finish" gets a scripted yield and no point.
+FLAG_PRICE_MEMORY = "R1_PRICE_MEMORY"
+FLAG_COME_BACK = "R1_COME_BACK"
+FLAG_PERSONA_TIMELINE_V2 = "R1_PERSONA_TIMELINE_V2"
+FLAG_CALL_OPENING = "R1_CALL_OPENING"
+FLAG_ROLE_CONFUSION_V2 = "R1_ROLE_CONFUSION_V2"
+FLAG_FLOOR_YIELD = "R1_FLOOR_YIELD"
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
 # The flags that are OFF unless set (every other flag is on unless set to 0/off/false/no).
 _FLAG_DEFAULT_OFF = frozenset({FLAG_WRAPUP_NEXT_ROUND})
@@ -714,7 +737,18 @@ _FLAG_READS = {
     FLAG_WRAPUP_ANSWERS: lambda: os.getenv("R1_WRAPUP_ANSWERS"),
     FLAG_WRAPUP_ONE_MENTION: lambda: os.getenv("R1_WRAPUP_ONE_MENTION"),
     FLAG_WRAPUP_NEXT_ROUND: lambda: os.getenv("R1_WRAPUP_NEXT_ROUND"),
+    FLAG_PRICE_MEMORY: lambda: os.getenv("R1_PRICE_MEMORY"),
+    FLAG_COME_BACK: lambda: os.getenv("R1_COME_BACK"),
+    FLAG_PERSONA_TIMELINE_V2: lambda: os.getenv("R1_PERSONA_TIMELINE_V2"),
+    FLAG_CALL_OPENING: lambda: os.getenv("R1_CALL_OPENING"),
+    FLAG_ROLE_CONFUSION_V2: lambda: os.getenv("R1_ROLE_CONFUSION_V2"),
+    FLAG_FLOOR_YIELD: lambda: os.getenv("R1_FLOOR_YIELD"),
 }
+
+
+def _cut_repeat_note() -> str:
+    """CUT_REPEAT_NOTE, frame-free with R1_LEARNER_VOICE_V2 (M032 SWEEP-15)."""
+    return CUT_REPEAT_NOTE_V2 if flag_on(FLAG_LEARNER_VOICE_V2) else CUT_REPEAT_NOTE
 
 
 def flag_on(name: str) -> bool:
@@ -2208,7 +2242,7 @@ class RolePlayEngine:
             # "Sorry?" gets her point said again.  Either way the move her cut line carried counts
             # as delivered if what she says now proves it (``credit_move_id``).
             reasons.append("backchannel_continuation" if lone_backchannel else "repeat_after_cut")
-            self._notes.append(BACKCHANNEL_CUT_NOTE if lone_backchannel else CUT_REPEAT_NOTE)
+            self._notes.append(BACKCHANNEL_CUT_NOTE if lone_backchannel else _cut_repeat_note())
             return self._plan(
                 TurnMode.LLM_REPLY,
                 reasons,
@@ -2236,7 +2270,8 @@ class RolePlayEngine:
         reasons.append("free_reply")
         if cut:
             # The advisor cut in: what they said is answered, the cut line is not started again.
-            self._notes.append(INTERRUPTED_NOTE)
+            # M032 SWEEP-15: with R1_LEARNER_VOICE_V2 the note gives her no frame to narrate.
+            self._notes.append(INTERRUPTED_NOTE_V2 if voice_v2 else INTERRUPTED_NOTE)
         if (
             self._probe_first
             and not challenged
@@ -2792,7 +2827,7 @@ class RolePlayEngine:
             point["answer"] = "resumed"
             return None
         if repair and not backchannel:
-            self._notes = [CUT_REPEAT_NOTE]
+            self._notes = [_cut_repeat_note()]
             self._price_notes = []
             return self._plan(TurnMode.LLM_REPLY, ["last_point_repeat"])
         if backchannel or word_count(text) <= END_FRAGMENT_WORDS:
