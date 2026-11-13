@@ -2287,5 +2287,65 @@ class FloorRequestTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - started, 0.25)
 
 
+
+class DodgedQuestionTests(unittest.TestCase):
+    """M032 SWEEP-7: a deferral, a vague answer or a pivot dodges her question."""
+
+    def test_her_open_question_topics(self):
+        self.assertEqual(sched.open_question_topics("Could I pay it off month by month?"), {"payment"})
+        self.assertEqual(sched.open_question_topics("What happens if I fall behind?"), {"fall_behind"})
+        self.assertEqual(
+            sched.open_question_topics("How many hours a week would I need?"), {"weekly_hours"}
+        )
+        self.assertEqual(sched.open_question_topics("I might fall behind."), frozenset())
+
+    def test_dodges(self):
+        for text, topic in (
+            ("Sure, I'll get to that in a minute. First, which modules interest you?", "payment"),
+            ("Timing is very flexible, you choose your own days.", "weekly_hours"),
+            ("We can talk about that later. Tell me about your goals.", "format"),
+            ("Don't worry about that. What made you look at data science?", "fall_behind"),
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.dodged_question(text, (topic,)))
+
+    def test_answers_pitches_and_discovery_are_not_dodges(self):
+        for text, topic in (
+            ("About six to eight hours a week.", "weekly_hours"),
+            ("Our mentors come from top companies.", "format"),
+            ("How many hours could you give it each week?", "weekly_hours"),
+            ("Yes, you can pay in monthly instalments. Which modules interest you?", "payment"),
+            ("If you miss a class, the recordings help you catch up.", "fall_behind"),
+            ("Okay.", "weekly_hours"),
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.dodged_question(text, (topic,)))
+        self.assertFalse(sched.dodged_question("It depends.", ()))
+
+    def test_defer_and_vague_corpus_rates(self):
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if sched.defers_or_vague(text)]
+        # Read only on the turn right after her question, and only when it left her topic
+        # uncovered; the raw rate is reported (15 of 2,160 when written, all "it's flexible").
+        self.assertLessEqual(len(hits), len(texts) * 0.01)
+
+    def test_the_readers_stay_linear_on_long_turns(self):
+        import time
+
+        for text in (
+            "we can talk about that " * 300,
+            "it's very " * 800,
+            "how many hours " * 500 + "?",
+            "fall " * 2000,
+        ):
+            started = time.perf_counter()
+            sched.dodged_question(text[:4000], ("weekly_hours",))
+            sched.open_question_topics(text[:4000])
+            self.assertLess(time.perf_counter() - started, 0.25)
+
 if __name__ == "__main__":
     unittest.main()

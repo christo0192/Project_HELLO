@@ -463,6 +463,13 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
         "cut_repeat_note_v2": p.CUT_REPEAT_NOTE_V2,
         # SWEEP-33: the forced-move note (the yield lines are in ``script.lines``).
         "floor_note": p.FLOOR_NOTE,
+        # SWEEP-7: the come-back notes, the swapped no-repeat line and the topic labels.
+        "open_question_note": p.OPEN_QUESTION_NOTE,
+        "open_question_after_ask_note": p.OPEN_QUESTION_AFTER_ASK_NOTE,
+        "no_repeat_reask_note": p.NO_REPEAT_REASK_NOTE,
+        "open_question_labels": {
+            topic: list(labels) for topic, labels in r1_scheduler.OPEN_QUESTION_LABELS.items()
+        },
     }
 
 

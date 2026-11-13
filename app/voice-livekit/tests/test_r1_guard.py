@@ -3026,5 +3026,35 @@ class PersonaTimelineGuardTests(unittest.TestCase):
             with self.subTest(allowed=allowed):
                 self.assertTrue(guard_text(allowed, context).clean, allowed)
 
+
+class ComeBackGuardTests(unittest.TestCase):
+    """M032 SWEEP-7: her come-back question passes the diet and the near-repeat drop."""
+
+    ASKED = "How many hours a week would I need?"
+    REPLY = (
+        "Sorry, just going back to what I asked earlier. Roughly how many hours a week would I "
+        "need?"
+    )
+
+    def context(self, topic):
+        return ctx(
+            free_reply=True,
+            recent_questions=(True,),
+            said=said_of(self.ASKED),
+            reask_topic=topic,
+        )
+
+    def test_the_come_back_is_kept_with_its_topic_and_dropped_without(self):
+        kept = guard_text(self.REPLY, self.context("weekly_hours")).text
+        self.assertIn("how many hours a week", kept.lower())
+        dropped = guard_text(self.REPLY, self.context("")).text
+        self.assertNotIn("how many hours a week", dropped.lower())
+
+    def test_another_topic_gets_no_pass_and_one_question_still_holds(self):
+        other = guard_text(self.REPLY, self.context("payment")).text
+        self.assertNotIn("how many hours a week", other.lower())
+        two = "How many hours a week would I need? And how many hours a week is the live part?"
+        self.assertEqual(guard_text(two, self.context("weekly_hours")).text.count("?"), 1)
+
 if __name__ == "__main__":
     unittest.main()

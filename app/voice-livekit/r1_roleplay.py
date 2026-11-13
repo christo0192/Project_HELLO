@@ -231,6 +231,9 @@ from r1_prompts import (
     EMAIL_OFFER_NOTE,
     FIGURE_CHALLENGE_NOTE,
     FLOOR_NOTE,
+    NO_REPEAT_REASK_NOTE,
+    OPEN_QUESTION_AFTER_ASK_NOTE,
+    OPEN_QUESTION_NOTE,
     PRICE_CONFLICT_WEBSITE_NOTE,
     PRICE_MET_NOTE_EARLY,
     PRICE_REFLEX_BUDGET_NOTE,
@@ -293,6 +296,7 @@ from r1_scheduler import (
     COMMIT_STALL,
     CURIOSITY_EVERY,
     CURIOSITY_LABELS_V2,
+    OPEN_QUESTION_LABELS,
     CURIOSITY_TOPICS,
     EARLY_CLOSE_BEFORE_SEC,
     CloseDecision,
@@ -336,6 +340,7 @@ from r1_scheduler import (
     answers_substantively,
     asks_for_floor,
     asks_her_directly,
+    dodged_question,
     backs_off,
     courtesy_goodbye,
     courtesy_only,
@@ -348,6 +353,8 @@ from r1_scheduler import (
     markers_match,
     offers_floor,
     offers_something,
+    open_question_covered,
+    open_question_topics,
     preempting_topics,
     quotes_price,
     tells_something,
@@ -593,6 +600,10 @@ HANGUP_ASIDE_LINE = "L-ASIDE-HANGUP"
 HANGUP_LIMIT = 2
 # M032 SWEEP-33 (R1_FLOOR_YIELD): at most this many scripted yields a session; the pairs rotate.
 FLOOR_YIELD_LIMIT = 3
+# M032 SWEEP-7 (R1_COME_BACK): at most this many come-backs a session (one per topic), given on a
+# free reply within this many learner turns of the dodge.
+COME_BACK_LIMIT = 2
+COME_BACK_WINDOW_TURNS = 2
 FLOOR_YIELD_LINES = ("L-LEARNER-YIELD", "L-LEARNER-YIELD-2")
 FLOOR_YIELD_SORRY_LINES = ("L-LEARNER-YIELD-SORRY", "L-LEARNER-YIELD-SORRY-2")
 TRIGGER_EARLY_CLOSE = "early_close"
@@ -1363,6 +1374,16 @@ class RolePlayEngine:
         self._floor_yields = 0
         self._floor_rearm: tuple[bool, str | None] | None = None
         self._floor_half: _LostHalf | None = None
+        # SWEEP-7: her open question (topic, label, the turn that asked it, the turn that dodged
+        # it, whether she already came back to it), the topics spent, the counts, and this turn's
+        # come-back (its topic for the guard).
+        self._open_q: dict[str, Any] | None = None
+        self._come_back_spent: set[str] = set()
+        self._open_q_dodged = 0
+        self._open_q_reasked = 0
+        self._dodge_now = False
+        self._come_back_topic = ""
+        self._last_heard_turn: int | None = None
 
     # ------------------------------------------------------------------- properties
     def learner_prefix_text(self) -> str:
@@ -1429,6 +1450,7 @@ class RolePlayEngine:
         winding: bool = False,
         closing_exempt: bool = False,
         reaction_only: bool = False,
+        reask_topic: str = "",
     ) -> GuardContext:
         """The guard context for an LLM reply now.
 
@@ -1519,6 +1541,7 @@ class RolePlayEngine:
             winding=winding,
             closing_exempt=closing_exempt,
             reaction_only=reaction_only,
+            reask_topic=reask_topic,
         )
 
     def _offer_on_table(self) -> int | None:
@@ -1858,6 +1881,8 @@ class RolePlayEngine:
         self._price_notes = []
         self._nothing_granted = False
         self._force_curiosity = False
+        self._dodge_now = False
+        self._come_back_topic = ""
         voice_v2 = flag_on(FLAG_LEARNER_VOICE_V2)
         if resumed and voice_v2:
             self._notes.append(COACH_RESUME_NOTE)
@@ -1971,6 +1996,7 @@ class RolePlayEngine:
         # M032 S1 items 1, 2 and 6: what this turn left open for her.  A first half whose reply was
         # never heard counts too (fda9e9f6 #58/#59: the answer to her question was in the half that
         # was lost).
+        self._read_open_question(reading, turn)
         natural = flag_on(FLAG_NATURAL_TIMING)
         respond = flag_on(FLAG_RESPOND_FIRST)
         kinds: frozenset[str] = frozenset()
@@ -2316,6 +2342,11 @@ class RolePlayEngine:
             reasons.append(f"wrap_offer:{trigger}")
             return self._wrap_offer_plan(r_sec, trigger, turn_index, reasons=reasons)
         reasons.append("free_reply")
+        come_back = self._come_back_note(reading, quiet=(
+            reveal_due or break_kind is not None or challenged or held_for_cut or reacting
+        ))
+        if come_back:
+            reasons.append("come_back")
         if cut:
             # The advisor cut in: what they said is answered, the cut line is not started again.
             # M032 SWEEP-15: with R1_LEARNER_VOICE_V2 the note gives her no frame to narrate.
@@ -2342,7 +2373,11 @@ class RolePlayEngine:
         # M032 S1 item 4: a turn that left something open for her hands over no curiosity topic;
         # her reply answers it (a check-in still asks for one real question).
         responding = respond and bool(kinds) and not self._force_curiosity
-        if self._force_curiosity and not quiet:
+        if come_back:
+            # M032 SWEEP-7: the come-back is this reply's one question; no curiosity hand-over (a
+            # check-in is answered by it too).
+            pass
+        elif self._force_curiosity and not quiet:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
             # reaction and one real question, never the stall.
             curiosity = self._curiosity_for_free_reply(force=True)
@@ -3080,6 +3115,125 @@ class RolePlayEngine:
         """The learner's last line asked the advisor something: the next words are theirs."""
         return bool(self._asked) and self._asked[-1]
 
+    # ------------------------------------------------- M032 SWEEP-7: the come-back
+    def _read_open_question(self, reading: str, turn: int) -> None:
+        """Whether this advisor turn answered, dodged or left her open question (R1_COME_BACK).
+
+        Read on the advisor turn right after the line that asked it (``asked_turn``): an answer on
+        the topic closes it, a dodge (``dodged_question``) opens the come-back window, and anything
+        else closes it (a plain pitch is no dodge).  A second dodge after the come-back closes it
+        for good (course facts after two dodges are S2P's), and so does a dodge once the session's
+        come-backs are spent.  A window that passed with no free reply closes it.
+        """
+        open_q = self._open_q
+        if open_q is None or not flag_on(FLAG_COME_BACK):
+            return
+        topic = open_q["topic"]
+        if open_question_covered(topic, reading):
+            self._open_q = None
+            return
+        if open_q["dodged_turn"] is not None:
+            if turn - open_q["dodged_turn"] >= COME_BACK_WINDOW_TURNS:
+                self._open_q = None  # the window passed with no free reply
+            return
+        if open_q["asked_turn"] != turn - 1:
+            self._open_q = None
+            return
+        if not dodged_question(reading, (topic,)):
+            self._open_q = None
+            return
+        self._dodge_now = True
+        self._open_q_dodged += 1
+        if open_q["reasked"] or self._open_q_reasked >= COME_BACK_LIMIT:
+            self._come_back_spent.add(topic)
+            self._open_q = None
+            return
+        open_q["dodged_turn"] = turn
+
+    def _come_back_note(self, reading: str, *, quiet: bool) -> bool:
+        """SWEEP-7: this free reply comes back once to her dodged question; the note is added.
+
+        Never while she is winding up or closed, on a confirmation, after a commitment, when the
+        advisor handed the decision back or backed off, nor on a quiet turn (a challenge, a cut, a
+        disclosure).  On a lone "okay" SWEEP-11's note keeps her last question, and that counts as
+        the come-back when her last line asked it.  The note replaces ASKED_DIRECTLY_NOTE (the
+        after-ask form answers his question first) and S2's not-answered note.
+        """
+        open_q = self._open_q
+        if open_q is None or open_q["dodged_turn"] is None or open_q["reasked"]:
+            return False
+        if (
+            quiet
+            or self._closing != CLOSING_OPEN
+            or self._confirming()
+            or self.commitment_resolved
+            or self._commitment_level is not None
+            or RESPOND_BACK_OFF in self._turn_kinds
+            or backs_off(reading)
+            or hands_over_close(reading)
+            or self._open_q_reasked >= COME_BACK_LIMIT
+        ):
+            return False
+        if self._ack_turn():
+            if self._learner_asked_last() and self._last_heard_turn == open_q["asked_turn"]:
+                self._mark_come_back(open_q)
+            return False
+        asked = RESPOND_QUESTION in self._turn_kinds or asks_her_directly(reading)
+        if ASKED_DIRECTLY_NOTE in self._notes:
+            self._notes.remove(ASKED_DIRECTLY_NOTE)
+        template = OPEN_QUESTION_AFTER_ASK_NOTE if asked else OPEN_QUESTION_NOTE
+        self._notes.append(template.format(label=open_q["label"]))
+        self._come_back_topic = open_q["topic"]
+        return True
+
+    def _mark_come_back(self, open_q: dict[str, Any]) -> None:
+        """SWEEP-7: she came back to it; a further dodge closes it for good."""
+        open_q["reasked"] = True
+        open_q["dodged_turn"] = None
+        self._open_q_reasked += 1
+        self._come_back_spent.add(open_q["topic"])
+
+    def _note_open_question(self, plan: TurnPlan, spoken_text: str) -> None:
+        """SWEEP-7: what her heard line asked, read in ``record_spoken`` (free replies only)."""
+        if not flag_on(FLAG_COME_BACK):
+            return
+        free = (
+            plan.mode is TurnMode.LLM_REPLY
+            and plan.move_id is None
+            and plan.negotiation_id is None
+            and plan.credit_move_id is None
+            and plan.commitment_level is None
+        )
+        open_q = self._open_q
+        if "come_back" in plan.reasons and open_q is not None:
+            if open_q["topic"] in open_question_topics(spoken_text):
+                self._mark_come_back(open_q)
+                open_q["asked_turn"] = plan.turn
+            else:
+                self._come_back_spent.add(open_q["topic"])  # the guard cut it: let it go
+                self._open_q = None
+            return
+        if not free:
+            return
+        topics = [
+            topic
+            for topic in OPEN_QUESTION_LABELS
+            if topic in open_question_topics(spoken_text) and topic not in self._come_back_spent
+        ]
+        if not topics:
+            if open_q is not None and open_q["dodged_turn"] is None:
+                self._open_q = None
+            return
+        topic = topics[0]
+        labels = OPEN_QUESTION_LABELS[topic]
+        self._open_q = {
+            "topic": topic,
+            "label": pick_variant(labels, f"{self.seed}:{topic}", 0),
+            "asked_turn": plan.turn,
+            "dodged_turn": None,
+            "reasked": False,
+        }
+
     # ------------------------------------------------- M032 S1: respond first, natural moments
     def _respond_kinds(
         self,
@@ -3121,6 +3275,8 @@ class RolePlayEngine:
         """Her last line asked something of her own (not an owed move) and this turn answers it."""
         if not self._learner_asked_last() or self._last_owed_line or is_hollow_turn(text):
             return False
+        if self._dodge_now:
+            return False  # M032 SWEEP-7: a deferral, a vague answer or a pivot answers nothing
         if self._her_question_topics:
             # Her question had a topic: only an answer on it counts (review S1R-3: "our alumni
             # work at big tech" after "how many hours a week?" is no answer, and telling her it
@@ -3779,7 +3935,8 @@ class RolePlayEngine:
         if voice_v2 and not commit_line:
             # Item 5 (anti-validation): her worry was not answered, so she does not call the reply
             # reasonable or good (a lone acknowledgement has its own note).
-            unanswered = self._unanswered_worry and not ack_turn
+            # M032 SWEEP-7: the come-back is the one note about what went unanswered.
+            unanswered = self._unanswered_worry and not ack_turn and not self._come_back_topic
             if unanswered:
                 notes.append(NOT_ANSWERED_NOTE)
             # SWEEP-4: steering only, never both, and never on a confirmation (not called then).
@@ -4981,6 +5138,7 @@ class RolePlayEngine:
                 monologue_sec=monologue,
                 character_break=kind is not None,
                 role_confusion=role_note,
+                come_back=bool(self._come_back_topic) and mode is TurnMode.LLM_REPLY,
                 price_wrap=price_wrap,
                 intent_brief="" if intent is None else intent.brief,
                 must_say=() if intent is None else intent.must_say,
@@ -5033,6 +5191,8 @@ class RolePlayEngine:
                 # stall-closer quota is lifted for this one reply).
                 winding=winding,
                 closing_exempt=winding,
+                # M032 SWEEP-7: her come-back question passes the diet and the near-repeat drop.
+                reask_topic=self._come_back_topic if mode is TurnMode.LLM_REPLY else "",
             )
         else:
             implausible = False
@@ -5198,6 +5358,9 @@ class RolePlayEngine:
             for key in phrases:
                 self._phrases[key] = self._phrases.get(key, 0) + 1
         self.tracker.note_learner_text(spoken_text, plan.turn)
+        if spoken_text.strip():
+            self._note_open_question(plan, spoken_text)  # M032 SWEEP-7
+            self._last_heard_turn = plan.turn
         # L1: her own questions.
         self._curiosity_asked.update(curiosity_asked_in(spoken_text, wide=tic_v2))
         if self._decider_said_turn is None and self.scheduler.spoken_proves(F4_PUSH, spoken_text):
@@ -5518,6 +5681,8 @@ class RolePlayEngine:
         return {
             "role_confusion_turns": self._role_confusion_turns,
             "floor_yields": self._floor_yields,
+            "open_q_dodged": self._open_q_dodged,
+            "open_q_reasked": self._open_q_reasked,
         }
 
     def admin_log(self, *, final: bool = False, r_end: float | None = None) -> dict[str, Any]:

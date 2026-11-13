@@ -65,6 +65,7 @@ from r1_script import LINES
 from r1_text import (
     fold,
     fuzzy_contains,
+    is_hollow_turn,
     is_question_like,
     normalize,
     split_sentences,
@@ -1105,6 +1106,97 @@ def answered_topics(text: object) -> frozenset[str]:
     if any(pattern.search(lowered) for pattern in _FALL_BEHIND_ANSWERED):
         found.add("fall_behind")
     return frozenset(found)
+
+
+# M032 SWEEP-7 (flag R1_COME_BACK): her own question the advisor dodged gets one come-back.  The
+# topics she can be owed an answer on are the curiosity topics (as ``curiosity_asked_in`` reads
+# them, ``wide``) and two more forms: "what if I fall behind / miss a class?" and "could I pay it
+# month by month?".  Price figures stay with F1 and S2P.
+OPEN_QUESTION_LABELS: dict[str, tuple[str, ...]] = {
+    **CURIOSITY_LABELS_V2,
+    "fall_behind": ("what happens if you fall behind",),
+}
+_OPEN_QUESTION_ASKED = {
+    "fall_behind": _compile(
+        r"\bfall(?:s|ing)? behind\b", r"\bmiss (?:a |some )?(?:class|classes|session|sessions)\b"
+    ),
+    "payment": _compile(
+        r"\bmonth by month\b",
+        r"\bpay (?:it |that |for it )?(?:off )?(?:each|every|per|a) month\b",
+    ),
+}
+# A deferral ("I'll get to that in a minute", "we can talk about that later", "hold that thought")
+# and a vague non-answer ("it's very flexible", "it depends", "don't worry about that").  Read
+# only on the advisor turn right after her question, and only when it left her topic uncovered.
+_DEFERS = _compile(
+    r"\b(?:i'?ll|i will|we'?ll|we will|let me|let's|let us|i can|we can) (?:get|come(?: back)?|"
+    r"circle back|return) to (?:that|it|this|those|your question)\b",
+    r"\b(?:we can|let's|let us|i'?ll|we'?ll|we will|i will) (?:discuss|talk about|cover|go over|"
+    r"get into|look at) (?:that|it|this|those)\b[^.?!]{0,20}\b(?:later|afterwards|in a (?:bit|"
+    r"minute|moment|second)|at the end|next time|another time)\b",
+    r"\bhold (?:on to )?that (?:thought|question)\b",
+    r"\b(?:that'?s|that is) (?:something|a question) (?:for|we can (?:cover|discuss)) later\b",
+)
+_VAGUE = _compile(
+    r"\b(?:it'?s|it is|that'?s|that is|timing is|the timing is|the schedule is|it'?s all) "
+    r"(?:very |quite |pretty |completely |totally |really |super )?flexible\b",
+    r"\bit (?:all )?(?:depends|varies)\b",
+    r"\b(?:don'?t|do not) worry about (?:that|it|this)\b",
+    r"\bwe'?ll (?:figure|sort|work) (?:it|that|something) out\b",
+    r"\b(?:that'?s|that is|it'?s|it is) (?:not|never) (?:a |an )?(?:problem|issue|concern)\b",
+    r"\bwhatever (?:works|suits) (?:for )?you\b",
+    r"\b(?:that'?s|that is|it'?s|it is) (?:very |quite |totally )?manageable\b",
+)
+
+
+def open_question_topics(text: object, *, wide: bool = True) -> frozenset[str]:
+    """The topics a question of the LEARNER's ``text`` asks the advisor about (SWEEP-7)."""
+    found = set(curiosity_asked_in(text, wide=wide))
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        for topic, patterns in _OPEN_QUESTION_ASKED.items():
+            if any(pattern.search(lowered) for pattern in patterns):
+                found.add(topic)
+    return frozenset(found)
+
+
+def open_question_covered(topic: str, text: object) -> bool:
+    """The advisor's ``text`` answers the open-question ``topic`` (``curiosity_covered``)."""
+    if topic == "fall_behind":
+        lowered = fold(text).lower()
+        return any(pattern.search(lowered) for pattern in _FALL_BEHIND_ANSWERED)
+    return curiosity_covered(topic, text)
+
+
+def defers_or_vague(text: object) -> bool:
+    """The advisor put her question off or answered it with nothing (SWEEP-7, counts only)."""
+    return any(
+        pattern.search(sentence) for sentence in _sentences(text) for pattern in (*_DEFERS, *_VAGUE)
+    )
+
+
+def dodged_question(text: object, topics: frozenset[str] | tuple[str, ...]) -> bool:
+    """The advisor's turn dodged her question about ``topics`` (M032 SWEEP-7).
+
+    True when no topic is covered, the turn is not hollow ("Okay."), and it defers ("I'll get to
+    that"), answers vaguely ("it's very flexible") or pivots to a question of their own.  A pivot
+    whose own question names her topic ("How many hours could you give it?") is discovery, and a
+    plain pitch that misses the topic is not a dodge either.
+    """
+    if not topics or not isinstance(text, str) or is_hollow_turn(text):
+        return False
+    if any(open_question_covered(topic, text) for topic in topics):
+        return False
+    if defers_or_vague(text):
+        return True
+    if not asks_her_directly(text):
+        return False
+    questions = " ".join(
+        sentence for sentence in split_sentences(text) if is_question_like(sentence)
+    )
+    return not (set(topics) & open_question_topics(questions))
 
 
 # The F4 push when a call was proposed in the same turn: the learner must talk to its decision

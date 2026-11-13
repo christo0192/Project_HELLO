@@ -11757,5 +11757,130 @@ class FloorYieldEngineTests(unittest.TestCase):
         self.assertEqual(s.eng.admin_log()["followups"]["floor_yields"], 0)
 
 
+
+class ComeBackEngineTests(unittest.TestCase):
+    """M032 SWEEP-7 (R1_COME_BACK): she comes back once to a question the advisor dodged."""
+
+    CHAT = "I see, thanks for sharing that with me."
+
+    @staticmethod
+    def asked(question, eng=None):
+        s = Session(eng or engine())
+        s.say(OPENER, 20)
+        s.reply = question
+        s.say(ComeBackEngineTests.CHAT, 40)
+        s.reply = "Okay."
+        return s
+
+    def test_a_deferral_with_a_question_gets_the_after_ask_note_and_no_curiosity(self):
+        from r1_prompts import (
+            ASKED_DIRECTLY_NOTE,
+            NO_REPEAT_NOTE,
+            NO_REPEAT_REASK_NOTE,
+            OPEN_QUESTION_AFTER_ASK_NOTE,
+        )
+
+        s = self.asked("Could I pay it off month by month?")
+        plan = s.eng.plan_turn(
+            "Sure, I'll get to that in a minute. First, which modules interest you?", 60
+        )
+        self.assertIn("come_back", plan.reasons)
+        label = s.eng._open_q["label"]
+        self.assertIn(OPEN_QUESTION_AFTER_ASK_NOTE.format(label=label), plan.reminder)
+        self.assertNotIn(ASKED_DIRECTLY_NOTE, plan.reminder)
+        self.assertIn(NO_REPEAT_REASK_NOTE, plan.reminder)
+        self.assertNotIn(NO_REPEAT_NOTE, plan.reminder)
+        self.assertNotIn("You are curious about", plan.reminder)
+        self.assertEqual(plan.guard_ctx.reask_topic, "payment")
+
+    def test_a_vague_answer_gets_the_note_and_is_not_an_answer(self):
+        from r1_prompts import ANSWERED_YOU_NOTE, ANSWERED_YOU_NOTE_V2, OPEN_QUESTION_NOTE
+
+        s = self.asked("How many hours a week would I need?")
+        plan = s.eng.plan_turn("Timing is very flexible, you choose your own days.", 60)
+        self.assertIn(OPEN_QUESTION_NOTE.format(label=s.eng._open_q["label"]), plan.reminder)
+        self.assertNotIn(ANSWERED_YOU_NOTE, plan.reminder)
+        self.assertNotIn(ANSWERED_YOU_NOTE_V2, plan.reminder)
+        reply = "Sorry, going back to it: roughly how many hours a week would I need?"
+        s.eng.record_spoken(plan, reply, r_sec=61)
+        counts = s.eng.admin_log()["followups"]
+        self.assertEqual((counts["open_q_dodged"], counts["open_q_reasked"]), (1, 1))
+
+    def test_an_answer_a_pitch_or_discovery_gets_no_note(self):
+        for question, advisor in (
+            ("How many hours a week would I need?", "About six to eight hours a week."),
+            ("Are the classes live or recorded?", "Our mentors come from top companies."),
+            ("How many hours a week would I need?", "How many hours could you give it each week?"),
+        ):
+            with self.subTest(advisor=advisor):
+                s = self.asked(question)
+                plan = s.say(advisor, 60)
+                self.assertNotIn("come_back", plan.reasons)
+                self.assertNotIn("have not really answered", plan.reminder or "")
+
+    def test_an_owed_move_fires_first_and_the_come_back_waits(self):
+        s = self.asked("How many hours a week would I need?")
+        owed = s.say(
+            "We can talk about that later. Our curriculum covers python, sql and machine learning "
+            "modules with mentorship.",
+            60,
+        )
+        self.assertEqual(owed.move_id, F3_PRIMARY)
+        later = s.say("Right, that makes sense to me.", 80)
+        self.assertIn("come_back", later.reasons)
+
+    def test_a_second_dodge_closes_it_and_two_come_backs_is_the_limit(self):
+        s = self.asked("How many hours a week would I need?")
+        plan = s.eng.plan_turn("Timing is very flexible, you choose your own days.", 60)
+        s.eng.record_spoken(plan, "Sorry, roughly how many hours a week, though?", r_sec=61)
+        again = s.say("Honestly, don't worry about that. It's all manageable.", 80)
+        self.assertNotIn("come_back", again.reasons)
+        self.assertIsNone(s.eng._open_q)
+        self.assertEqual(s.eng.admin_log()["followups"]["open_q_dodged"], 2)
+        s.eng._open_q_reasked = 2  # the session's come-backs are spent
+        s.reply = "Are the classes live or recorded?"
+        s.say(self.CHAT, 100)
+        s.reply = "Okay."
+        third = s.say("It depends, really. Tell me about your goals.", 120)
+        self.assertNotIn("come_back", third.reasons)
+
+    def test_never_while_winding_or_after_a_commitment(self):
+        from r1_commitment import Level
+
+        s = self.asked("How many hours a week would I need?")
+        s.eng._open_q["dodged_turn"] = s.eng.turn  # as if this turn had dodged it
+        s.eng._closing = r1_roleplay.CLOSING_WINDING
+        self.assertFalse(s.eng._come_back_note("Okay, sure.", quiet=False))
+        s.eng._closing = r1_roleplay.CLOSING_OPEN
+        self.assertFalse(s.eng._come_back_note("Okay, sure.", quiet=True))
+        s = self.asked("How many hours a week would I need?")
+        s.eng._commitment_level = Level.MEDIUM
+        plan = s.say("Timing is very flexible, you choose your own days.", 60)
+        self.assertNotIn("come_back", plan.reasons)
+
+    def test_flag_off_gives_no_note(self):
+        from r1_prompts import ASKED_DIRECTLY_NOTE, NO_REPEAT_NOTE
+
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_COME_BACK": "0"}):
+            s = self.asked("Could I pay it off month by month?")
+            plan = s.say(
+                "Sure, I'll get to that in a minute. First, which modules interest you?", 60
+            )
+        self.assertNotIn("come_back", plan.reasons)
+        self.assertIn(ASKED_DIRECTLY_NOTE, plan.reminder)
+        self.assertIn(NO_REPEAT_NOTE, plan.reminder)
+        self.assertEqual(plan.guard_ctx.reask_topic, "")
+        self.assertEqual(s.eng.admin_log()["followups"]["open_q_dodged"], 0)
+
+    def test_the_notes_are_clean_with_the_guard_and_state_no_course_fact(self):
+        from r1_prompts import OPEN_QUESTION_AFTER_ASK_NOTE, OPEN_QUESTION_NOTE, control_prose
+
+        for template in (OPEN_QUESTION_NOTE, OPEN_QUESTION_AFTER_ASK_NOTE):
+            for labels in r1_roleplay.OPEN_QUESTION_LABELS.values():
+                for label in labels:
+                    note = template.format(label=label)
+                    self.assertNotRegex(note, r"\$|\d")
+                    self.assertNotIn(label, control_prose(note))
+
 if __name__ == "__main__":
     unittest.main()

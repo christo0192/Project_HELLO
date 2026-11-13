@@ -89,6 +89,7 @@ from r1_personas import (
     SUCCESS_ANSWER_V2,
     RenderedPersona,
 )
+from r1_scheduler import open_question_topics
 from r1_script import EXIT_CUE, LINES
 from r1_text import (
     CLOSER,
@@ -1010,6 +1011,11 @@ class GuardContext:
     # few words.  ``reask`` is that question's normalised sentences: a question of this reply that
     # repeats one of them is the asked-for re-ask, so it is neither a repeat nor cut by the diet.
     reask: tuple[str, ...] = ()
+    # M032 SWEEP-7 (R1_COME_BACK): the reply comes back once to her question the advisor dodged.
+    # A question of this reply that asks about that topic (``open_question_topics``) is the
+    # asked-for come-back: the question diet and the near-repeat drop let it through (one question
+    # still).
+    reask_topic: str = ""
     # M032 S2P (SWEEP-17; the engine's latched R1_PROBE_FIRST): the card holds no course figure, so
     # the $9,000 is no longer an amount she may always say and "six months" no longer passes as a
     # card fact.  ``allowed_extra``: the amounts this reply may say all the same (a check or a
@@ -1758,6 +1764,7 @@ class StreamGuard:
             and self._emitted
             and any(ctx.recent_questions[-QUESTION_DIET_WINDOW:])
             and not ctx.reask
+            and not self._comes_back(text)
             # "Okay." and the question is the whole reply: dropping the question would leave a bare
             # acknowledgement, so the question stays.
             and word_count(" ".join(self._emitted)) > THIN_REPLY_WORDS
@@ -1770,6 +1777,11 @@ class StreamGuard:
         if template:
             self._phrases_used[PHRASE_TEMPLATE_Q] = self._phrases_used.get(PHRASE_TEMPLATE_Q, 0) + 1
         return False
+
+    def _comes_back(self, text: str) -> bool:
+        """M032 SWEEP-7: ``text`` is a question about the topic the reply comes back to."""
+        topic = self.ctx.reask_topic
+        return bool(topic) and "?" in text and topic in open_question_topics(text)
 
     def _repeat_hit(self, kind: str, sentence: str) -> Hit:
         """A ``repeat`` hit for ``sentence`` (digest always; excerpt only if opted in)."""
@@ -1803,6 +1815,8 @@ class StreamGuard:
             and re.search(r"\b" + re.escape(persona.decision_maker) + r"\b", out, re.IGNORECASE)
         ):
             return None  # the advisor asked who else decides: the same answer is the right answer
+        if self._comes_back(out):
+            return None  # M032 SWEEP-7: the come-back the reply was asked for
         said = self.ctx.said
         if self.ctx.reask and "?" in out:
             said = tuple(prior for prior in said if prior not in self.ctx.reask)

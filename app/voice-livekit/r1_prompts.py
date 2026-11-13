@@ -664,6 +664,24 @@ NO_REPEAT_NOTE = (
     "- Do not repeat anything you already said earlier in this call: say something new "
     "or move on."
 )
+# M032 SWEEP-7 (flag R1_COME_BACK): her own question the advisor dodged (a deferral, a vague answer
+# or a pivot to a question of their own) gets one come-back on her next free reply.  ``{label}``
+# is a rotated noun phrase in quotes (``control_prose`` drops it).  With the come-back,
+# NO_REPEAT_NOTE is swapped for NO_REPEAT_REASK_NOTE.  New wording under D-M032-4.
+OPEN_QUESTION_NOTE = (
+    '- Earlier you asked the advisor about "{label}", and they have not really answered it. Come '
+    "back to it once, briefly and politely, in different words, and ask nothing else in this "
+    "reply; if they already said yes, ask how it would work. This is not repeating yourself."
+)
+OPEN_QUESTION_AFTER_ASK_NOTE = (
+    "- The advisor asked you something: answer that first, briefly. Then come back once to what "
+    'you asked earlier, "{label}", which they have not really answered, in different words; if '
+    "they already said yes, ask how it would work. Ask nothing else."
+)
+NO_REPEAT_REASK_NOTE = (
+    "- Apart from the question you are coming back to, do not repeat anything you already said "
+    "earlier in this call."
+)
 CHARACTER_BREAK_NOTE = (
     "- The advisor asked whether you are an AI, whether this is a test, or what you should "
     "do. Do not answer that. Say once, in character, that you are just a person looking "
@@ -997,6 +1015,7 @@ def turn_reminder(
     curiosity_v2: bool = False,
     winding: bool = False,
     role_confusion: str = "",
+    come_back: bool = False,
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -1046,6 +1065,9 @@ def turn_reminder(
 
     ``role_confusion`` (M032 SWEEP-10): the rendered ``ROLE_CONFUSION_NOTE``, given in place of
     ``CHARACTER_BREAK_NOTE`` when the advisor has the roles the wrong way round.
+
+    ``come_back`` (M032 SWEEP-7): the reply comes back to her dodged question (its note is in
+    ``notes``), so ``NO_REPEAT_REASK_NOTE`` takes the place of ``NO_REPEAT_NOTE``.
     """
     if winding and not intent_brief and not reaction_only and not confirm:
         style_note = ""
@@ -1123,7 +1145,7 @@ def turn_reminder(
             f"{stems}. Do not read the facts out like a list."
         )
     lines.append(NEXT_STEP_NOTE)
-    lines.append(NO_REPEAT_NOTE)
+    lines.append(NO_REPEAT_REASK_NOTE if come_back else NO_REPEAT_NOTE)
     if style_note:
         lines.append(style_note)
     if price_wrap and not reaction_only:
