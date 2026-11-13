@@ -380,6 +380,7 @@ from r1_text import (
     word_count,
 )
 from r1_tracker import (
+    END_INTENT_LEVELS,
     CoverageTracker,
     NeedState,
     accepts_wrap_offer,
@@ -1636,10 +1637,13 @@ class RolePlayEngine:
         # ``end_level``; the end-intent model's verdict (``end_intent``) may raise it within the
         # rails of ``end_intent_level`` (owner decision 2026-10-30).  A first request at level
         # "end" is confirmed at once, one at "maybe" gets the question.
-        # M032 SWEEP-24 (c): "You can disconnect the call." is a request too ("maybe" only).
+        # M032 SWEEP-24 (c): "You can disconnect the call." is a request too ("maybe" only), and
+        # only in place of the end-intent model's verdict (a timeout, a failure, a prefilter miss
+        # or the model's flag off): a verdict the model did give is its reading of the turn.
         late_on = flag_on(FLAG_LATE_END_REQUEST)
-        end_level = end_intent_level(candidate_text, end_intent, permission=late_on)
-        lexical_level = end_intent_level(candidate_text, None, permission=late_on)
+        permission = late_on and end_intent not in END_INTENT_LEVELS
+        end_level = end_intent_level(candidate_text, end_intent, permission=permission)
+        lexical_level = end_intent_level(candidate_text, None, permission=permission)
         # Reviewed fix (2026-10-30): once the question has been asked and has closed (declined, or
         # answered by talk about the sale), a "later request" that confirms the stop at once must
         # be the candidate's own words, never a model-only "maybe": after a declined aside, "At the

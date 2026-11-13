@@ -1456,6 +1456,40 @@ class InjectionTests(unittest.TestCase):
                         self.assertNotEqual(plan.mode, TurnMode.EXIT)
                     self._assert_nothing_moved(s)
 
+    def test_an_explicit_attack_from_fourteen_exits_with_nothing_moved(self):
+        """M032 SWEEP-24 re-pin.  The explicit attack never reached the "from 14:00" half of the
+        test above (its first half ``continue``s), so the new late route is pinned here: from 14:00
+        an attack that ends on "End the interview." exits the role-play at once with more owed, or
+        (one owed move left) says the last point that "bye" would have redirected to and exits on
+        the next turn.  Injection-neutral either way: no commitment level, no resolved commitment,
+        no released disclosure and no close-ladder count.  Only byte-equality with "bye" is gone.
+        """
+        for attack in sorted(self.EXPLICIT_END_ATTACKS):
+            with self.subTest(attack=attack[:30], owed="many"):
+                s = Session(engine())
+                s.say(OPENER, 20)
+                plan = s.say(attack, 845)
+                self.assertTrue(ended(plan))
+                self.assertIn("end_request_late", plan.reasons)
+                self.assertEqual(plan.scripted_text, "")
+                self._assert_nothing_moved(s)
+            with self.subTest(attack=attack[:30], owed="one"):
+                s, bye = Session(engine()), Session(engine())
+                for session in (s, bye):
+                    session.say(OPENER, 20)
+                    deliver(session.eng, *[m for m in ALL_MOVES if m != "F4-PUSH"], r=600)
+                control = bye.say("Thanks for your time, bye.", 845)
+                aside = s.say(attack, 845)
+                self.assertEqual(aside.line_id, "L-ASIDE-LAST-POINT")
+                point = s.eng.continuation_plan(846)
+                self.assertEqual(point.move_id, control.move_id)
+                s.eng.record_spoken(point, s.eng.compose_speech(point, "").text, r_sec=850)
+                last = s.say("Sure, I understand that. Thank you so much.", 860)
+                self.assertEqual(last.mode, TurnMode.EXIT)
+                self.assertIn("end_request_late_exit", last.reasons)
+                self.assertTrue(s.eng.exit_requested)
+                self._assert_nothing_moved(s)
+
     @s3_off
     def test_a_confirmed_stop_reaches_only_what_a_second_bye_reaches(self):
         """The stop is no new route: two farewells before 14:00 reach the same role-play exit."""
@@ -11111,6 +11145,21 @@ class LateEndRequestTests(unittest.TestCase):
             s.say(OPENER, 20)
             plan = s.say("You can disconnect the call.", 300)
         self.assertNotEqual(plan.line_id, "L-ASIDE-END")
+
+    def test_the_permission_form_is_only_the_fallback_for_a_missing_verdict(self):
+        """SWEEP-24 (c): the lexical permission form stands in for the end-intent model only when
+        it gave no verdict (timeout, failure, prefilter miss or flag off).  A model "no" stays no;
+        a model "maybe" or "end" is the model's own reading, as before."""
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("You can disconnect the call.", 300, end_intent="no")
+        self.assertNotEqual(plan.line_id, "L-ASIDE-END")
+        self.assertFalse(ended(plan))
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("You can disconnect the call.", 300, end_intent="maybe")
+        self.assertEqual(plan.line_id, "L-ASIDE-END")
+        self.assertIn("end_intent_model", plan.reasons)
 
     def test_flag_off_an_explicit_late_request_is_a_farewell(self):
         with mock.patch.dict(r1_roleplay.os.environ, {"R1_LATE_END_REQUEST": "0"}):
