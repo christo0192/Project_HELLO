@@ -594,6 +594,21 @@ ACK_TURN_CONCERNS_NOTE = (
     "line asked them something, do not drop it: ask it again in a few words. Otherwise ask one "
     "short question about something you still want to know."
 )
+# Simulation diagnosis 1 (L5, flag R1_ECHO_GUARD): the re-ask came back word for word.
+ACK_TURN_NOTE_V2 = (
+    '- The advisor only said a word like "okay" or "hmm". Do not thank them, do not repeat or '
+    "reword what you already said, and add no new worry. If your last line asked them something, "
+    "do not drop it: ask it again, shorter and in different words than before (for example "
+    '"So, the mentors?"). Otherwise ask one short question about something you still want to '
+    "know."
+)
+ACK_TURN_CONCERNS_NOTE_V2 = (
+    '- The advisor only said a word like "okay" or "hmm". You have already told them {concerns}, '
+    "so do not say that again in any words. Do not thank them and add no new worry. If your last "
+    "line asked them something, do not drop it: ask it again, shorter and in different words than "
+    'before (for example "So, the mentors?"). Otherwise ask one short question about something '
+    "you still want to know."
+)
 # SWEEP-12: the soft tics ("actually", "genuinely", "properly", "I'd rather"); ``{words}`` is a
 # worker-built list of quoted words.
 SOFT_TIC_NOTE = "- You have leaned on {words} lately: leave them out of this reply."

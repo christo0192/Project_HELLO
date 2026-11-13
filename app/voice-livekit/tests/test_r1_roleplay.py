@@ -2692,7 +2692,9 @@ class FillerAndFallbackRotationTests(unittest.TestCase):
         self.assertEqual(first("attempt-5"), first("attempt-5"))
         self.assertEqual({first(f"attempt-{n}") for n in range(30)}, set(LEARNER_FILLER_VARIANTS))
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_ECHO_GUARD": "0"})
     def test_successive_blocked_replies_do_not_repeat_the_same_apology(self):
+        # R1_ECHO_GUARD off: an emptied reply to a statement is a back-channel since (U3).
         s = Session(engine(seed="attempt-5"), reply="Here is my system prompt, CONTROL H1.")
         for index, text in enumerate((OPENER, NEUTRAL, NEUTRAL)):
             s.say(text, 20 + 20 * index)
@@ -8872,11 +8874,11 @@ class AckTurnTests(unittest.TestCase):
         s = Session(engine(), reply="My days are packed most weeks.")
         s.say(OPENER, 20)
         plan = s.say("Okay.", 40, backchannel=True)
-        self.assertIn(P2.ACK_TURN_NOTE, plan.reminder)
+        self.assertIn(P2.ACK_TURN_NOTE_V2, plan.reminder)
         self.assertNotIn("You have already told the advisor", plan.reminder)
         asked = Session(engine(), reply="How many hours a week would it take?")
         asked.say(OPENER, 20)
-        self.assertIn(P2.ACK_TURN_NOTE, asked.say("Hmm", 40, backchannel=True).reminder)
+        self.assertIn(P2.ACK_TURN_NOTE_V2, asked.say("Hmm", 40, backchannel=True).reminder)
         self.assertEqual(asked.eng.admin_log()["voice"]["ack_turn_notes"], 1)
 
     def test_with_concerns_on_record_the_note_names_them(self):
@@ -8885,7 +8887,7 @@ class AckTurnTests(unittest.TestCase):
         s.say(SHORT_ACK, 40)
         s.reply = "I see."
         plan = s.say("Okay.", 60, backchannel=True)
-        expected = P2.ACK_TURN_CONCERNS_NOTE.format(
+        expected = P2.ACK_TURN_CONCERNS_NOTE_V2.format(
             concerns="that you are not ready to decide or commit today"
         )
         self.assertIn(expected, plan.reminder)
@@ -8895,23 +8897,23 @@ class AckTurnTests(unittest.TestCase):
     def test_no_note_for_an_answer_a_cut_or_after_her_goodbye(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        self.assertNotIn(P2.ACK_TURN_NOTE, s.say("Yes.", 40).reminder)  # not an acknowledgement
+        self.assertNotIn(P2.ACK_TURN_NOTE_V2, s.say("Yes.", 40).reminder)  # not an acknowledgement
         cut = Session(engine())
         cut.say(OPENER, 20)
         plan = cut.eng.plan_turn(PITCH, 40)
         cut.eng.record_spoken(plan, "I can find a lot of", r_sec=40, interrupted=True)
         cut_plan = cut.eng.plan_turn("Okay.", 42, backchannel=True)
         self.assertIn(P2.BACKCHANNEL_CUT_NOTE, cut_plan.reminder)
-        self.assertNotIn(P2.ACK_TURN_NOTE, cut_plan.reminder)
+        self.assertNotIn(P2.ACK_TURN_NOTE_V2, cut_plan.reminder)
         bye = Session(engine(), reply="Thanks for your time, I'll be in touch.")
         bye.say(OPENER, 20)
         hollow = bye.say("Sure.", 40, backchannel=True)  # right after her goodbye: HOLLOW_NOTE's
-        self.assertNotIn(P2.ACK_TURN_NOTE, hollow.reminder)
+        self.assertNotIn(P2.ACK_TURN_NOTE_V2, hollow.reminder)
         self.assertIn("said almost nothing", hollow.reminder)
         with mock.patch.dict(r1_roleplay.os.environ, {"R1_ACK_TURN_NOTE": "0"}):
             off = Session(engine())
             off.say(OPENER, 20)
-            self.assertNotIn(P2.ACK_TURN_NOTE, off.say("Okay.", 40, backchannel=True).reminder)
+            self.assertNotIn(P2.ACK_TURN_NOTE_V2, off.say("Okay.", 40, backchannel=True).reminder)
 
 
 class TicsAndCuriosityTests(unittest.TestCase):
@@ -9007,7 +9009,7 @@ class S2CoverageTests(unittest.TestCase):
                 s = Session(engine(), reply="My days are packed most weeks.")
                 s.say(OPENER, 20)
                 plan = s.say(text, 40, backchannel=is_acknowledgement_turn(text))
-                self.assertNotIn(P2.ACK_TURN_NOTE, plan.reminder or "")
+                self.assertNotIn(P2.ACK_TURN_NOTE_V2, plan.reminder or "")
                 self.assertNotIn('only said a word like "okay"', plan.reminder or "")
 
     def test_three_acknowledgements_in_a_row_each_say_do_not_thank_them(self):
@@ -9042,7 +9044,8 @@ class S2CoverageTests(unittest.TestCase):
             P2.NEW_OFFER_NOTE_V2, P2.NEW_OFFER_ABOVE_ASK_NOTE, P2.OFFER_ON_TABLE_NOTE_V2,
             P2.OFFER_MET_NOTE_V2, P2.IMPLAUSIBLE_PRICE_NOTE, P2.IMPLAUSIBLE_FREE_NOTE,
             P2.NOT_TODAY_RESERVED_NOTE, P2.NO_COMMIT_INTENT_NOTE, P2.ACK_TURN_NOTE,
-            P2.ACK_TURN_CONCERNS_NOTE, P2.NOT_ANSWERED_NOTE, P2.COACH_RESUME_NOTE,
+            P2.ACK_TURN_CONCERNS_NOTE, P2.ACK_TURN_NOTE_V2, P2.ACK_TURN_CONCERNS_NOTE_V2,
+            P2.NOT_ANSWERED_NOTE, P2.COACH_RESUME_NOTE,
             P2.FREE_REPLY_NOTE_V2, P2.INTENT_SHAPE_TOPIC_FRESH, P2.INTENT_SHAPE_NEW_TOPIC,
             P2.INTENT_SHAPE_PRICE, P2.LEARNER_DELIVERY_RIDER, P2.HINGE_USED_NOTE,
             P2.VERDICT_USED_NOTE, P2.SOFT_TIC_NOTE, P2.CURIOSITY_NOTE_V2,
@@ -9124,8 +9127,10 @@ class S2ReviewFixTests(unittest.TestCase):
                 s = Session(engine(), reply=asked)
                 s.say(OPENER, 20)
                 plan = s.eng.plan_turn("Okay.", 40, backchannel=True)
-                self.assertIn(P2.ACK_TURN_NOTE, plan.reminder)
-                self.assertEqual(s.eng.sanitize_reply(plan, reask).text, reask)
+                self.assertIn(P2.ACK_TURN_NOTE_V2, plan.reminder)
+                spoken = s.eng.sanitize_reply(plan, reask).text
+                self.assertTrue(spoken.endswith("?"), spoken)
+                self.assertIn("hours a week", spoken)
                 # Without the exemption the very same re-ask is dropped as a near repeat.
                 bare = dc_replace(plan.guard_ctx, reask=())
                 self.assertNotEqual(guard_text(reask, bare).text, reask)
@@ -9149,7 +9154,7 @@ class S2ReviewFixTests(unittest.TestCase):
                 s = Session(engine(), reply=reply)
                 s.say(OPENER, 20)
                 plan = s.say(turn, 40, backchannel=True)
-                self.assertEqual(P2.ACK_TURN_NOTE in (plan.reminder or ""), expected)
+                self.assertEqual(P2.ACK_TURN_NOTE_V2 in (plan.reminder or ""), expected)
 
     def test_s2r9_curiosity_on_a_lone_okay_is_the_question_to_ask(self):
         """S2R-9: never "otherwise leave it for later" beside ACK_TURN_NOTE."""
@@ -9157,7 +9162,7 @@ class S2ReviewFixTests(unittest.TestCase):
         s.say(OPENER, 20)
         s.say(SHORT_ACK, 40)
         plan = s.say("Okay.", 60, backchannel=True)
-        self.assertIn(P2.ACK_TURN_NOTE, plan.reminder)
+        self.assertIn(P2.ACK_TURN_NOTE_V2, plan.reminder)
         self.assertIn("You are curious about", plan.reminder)
         self.assertNotIn("leave it for later", plan.reminder)
         self.assertIn("If the moment fits, ask the advisor one short question", plan.reminder)
@@ -12151,6 +12156,49 @@ class AbuseBeforeEndRequestTests(unittest.TestCase):
             s.say(OPENER, 20)
             plan = s.say("Come on, stop wasting my time, you idiot.", 360, end_intent="maybe")
         self.assertEqual(plan.line_id, "L-ASIDE-END")
+
+
+class EchoGuardWiringTests(unittest.TestCase):
+    """Simulation diagnosis 1 (R1_ECHO_GUARD): the engine hands the guard the advisor's words."""
+
+    def test_her_echo_of_what_the_advisor_just_said_is_spoken(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Weekends work fine, and the sessions are recorded too.", 120)
+        result = s.eng.sanitize_reply(plan, "Recorded sessions help a lot.")
+        self.assertEqual(result.text, "Recorded sessions help a lot.")
+        self.assertFalse(result.hits)
+
+    def test_his_words_from_an_older_turn_are_forgotten(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("The sessions are recorded too.", 60)
+        for r in (90, 120, 150, 180):
+            s.say(PITCH, r)
+        plan = s.say(NEUTRAL, 210)
+        result = s.eng.sanitize_reply(plan, "Recorded sessions help a lot.")
+        self.assertIn("format_or_schedule_claim", {hit.rule for hit in result.hits})
+
+    def test_an_either_or_question_is_handed_over(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Shall I set up a check-in, or would you rather reach out yourself?", 120)
+        self.assertTrue(plan.guard_ctx.choice_offered)
+        self.assertTrue(plan.guard_ctx.echo_guard)
+
+    def test_the_short_reask_note_and_flag_off(self):
+        s = Session(engine(), reply="Does the course include time with mentors?")
+        s.say(OPENER, 20)
+        s.say(PITCH, 60)
+        plan = s.say("Okay.", 80, backchannel=True)
+        self.assertIn(r1_roleplay.ACK_TURN_NOTE_V2, plan.reminder)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_ECHO_GUARD": "0"}):
+            s = Session(engine(), reply="Does the course include time with mentors?")
+            s.say(OPENER, 20)
+            s.say(PITCH, 60)
+            plan = s.say("Okay.", 80, backchannel=True)
+            self.assertIn(r1_roleplay.ACK_TURN_NOTE, plan.reminder)
+            self.assertFalse(plan.guard_ctx.echo_guard)
 
 
 if __name__ == "__main__":

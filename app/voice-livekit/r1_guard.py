@@ -767,6 +767,136 @@ _DURATION = re.compile(
 )
 WEEKS_PER_MONTH = 4.33
 
+# ----------------------------------------------------------------------------------------------
+# Simulation diagnosis 1 (flag R1_ECHO_GUARD, ``GuardContext.echo_guard``).  The probe-first notes
+# make her pick up what the advisor just said ("recorded sessions help", "live mock interviews
+# sound useful"), and every such echo was a LEAK hit: three echoes flagged a call.  A word she
+# repeats from the advisor's latest turns is no invention; one he never said still hits.
+# ----------------------------------------------------------------------------------------------
+_TERM = re.compile(r"[a-z0-9]+")
+_TERM_SUFFIXES = ("ings", "ing", "ed", "s")
+# The words that make a sentence a format or schedule claim (``_FORMAT_FACT``), as stems.
+_FORMAT_TERMS = frozenset({"live", "record", "evening", "weekend", "weekday", "morning", "hour"})
+# Words of a deep-need marker that carry no content of their own.
+_MARKER_FILLER = frozenset({"and", "or", "the", "a", "an", "my", "i", "of", "in", "to", "only"})
+# A priority or a wish about a policy ("the refund policy matters most to me", "the refund terms
+# are the main thing I'd want to look at") states nothing about the course.
+_POLICY_WISH = re.compile(
+    r"\b(?:matters?|mattering|main thing|most to me|worried about|concerned about|care about|"
+    r"curious about|ask(?:ing)? about|look(?:ing)? (?:at|into|over)|read(?:ing)? (?:through|up on)|"
+    r"(?:want|need|like|have) to (?:look at|see|know|check|read|understand|hear about))\b",
+    re.IGNORECASE,
+)
+# How her course work is graded is a question about the course, not about this interview's score.
+_SOFT_EVALUATION = re.compile(
+    r"(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|rated|ratings?)", re.IGNORECASE
+)
+_COURSE_WORK = re.compile(
+    r"\b(?:capstone|projects?|assignments?|exams?|quiz(?:zes)?|modules?|homework|coursework|"
+    r"submissions?)\b",
+    re.IGNORECASE,
+)
+# Fillers of an echo question ("Wait, $1,000?", "Really?", "Sorry, the mentors?").
+_ECHO_FILLER = frozenset(
+    {"wait", "really", "sorry", "oh", "so", "hmm", "huh", "what", "the", "a", "that", "is", "it",
+     "seriously", "okay", "ok"}
+)
+ECHO_QUESTION_WORDS = 4
+# A clause she keeps only with what it points at ("..., that suits me better" after the clause
+# was cut): a short sentence led by "that" or "this", or "it suits / works / sounds".
+_POINTS_BACK = re.compile(
+    r"^\W*(?:(?:that|this)\b|it (?:suits|works|sounds|helps)\b)", re.IGNORECASE
+)
+POINTS_BACK_WORDS = 6
+_DANGLING_CONJUNCTION = re.compile(r"[,;]?\s*\b(?:so|and|but|though)\W*$", re.IGNORECASE)
+# The asked-for re-ask, shortened (L5): "Does the course include time with mentors?" -> "So, time
+# with mentors?".
+_REASK_TAIL = re.compile(
+    r"\b(?:include|includes|cover|covers|offer|offers|have|has|get|give|gives|come with|"
+    r"comes with|about)\s+(?P<tail>[^?]{3,60})\?\s*$",
+    re.IGNORECASE,
+)
+REASK_TAIL_WORDS = 5
+
+
+def _stem(word: str) -> str:
+    for suffix in _TERM_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _stems(text: object) -> list[str]:
+    return [_stem(word) for word in _TERM.findall(fold(text).lower())]
+
+
+def advisor_terms_in(text: object) -> frozenset[str]:
+    """The word stems of an advisor turn, for ``GuardContext.advisor_terms`` (memory only)."""
+    return frozenset(_stems(text))
+
+
+def _format_echoed(sentence: str, terms: frozenset[str]) -> bool:
+    """Every format or schedule word of ``sentence`` (and an hours figure) is the advisor's."""
+    words = _stems(sentence)
+    needed = {word for word in words if word in _FORMAT_TERMS}
+    if "hour" in needed:
+        needed |= {word for word in words if word.isdigit() or word in _SPELLED}
+    return bool(needed) and needed <= terms
+
+
+def _marker_echoed(match: re.Match[str], terms: frozenset[str]) -> bool:
+    """The deep-need marker's own words ("evenings and weekends") are all the advisor's."""
+    words = {word for word in _stems(match.group(0)) if word not in _MARKER_FILLER}
+    return bool(words) and words <= terms
+
+
+def _claim_not_asserted(sentence: str) -> bool:
+    """A policy or outcome word in a wish, a priority or an indirect question (L1 (c))."""
+    if _POLICY_WISH.search(sentence) is not None:
+        return True
+    match = _CLAIM_WORDS.search(sentence)
+    if match is None:
+        return False
+    return _NOT_ASSERTED.search(clause_before(sentence, match.start())) is not None
+
+
+def _course_work_graded(sentence: str) -> bool:
+    """L1 (d): only grading words, about her course work ("How is the capstone graded?")."""
+    if _COURSE_WORK.search(sentence) is None:
+        return False
+    return all(
+        _SOFT_EVALUATION.fullmatch(match.group(0)) is not None
+        for match in _EVALUATION.finditer(sentence)
+    )
+
+
+def is_echo_question(text: str, terms: frozenset[str]) -> bool:
+    """U2: "Wait, $1,000?", "Really?": a few words of fillers, figures or the advisor's words."""
+    if "?" not in text or word_count(text) > ECHO_QUESTION_WORDS:
+        return False
+    words = [word for word in _stems(text) if word not in _ECHO_FILLER]
+    return all(word.isdigit() or word in terms for word in words)
+
+
+def offers_choice(text: object) -> bool:
+    """U5: an advisor question that offers her a choice ("a call next week, or would you rather
+    reach out yourself?")."""
+    return any(
+        "?" in sentence and re.search(r"\bor\b", sentence, re.IGNORECASE) is not None
+        for sentence in split_sentences(text)
+    )
+
+
+def short_reask(question: str) -> str:
+    """L5: her question asked again in fewer words ("So, time with mentors?")."""
+    match = _REASK_TAIL.search(question)
+    if match is not None:
+        tail = match.group("tail").strip().rstrip(",")
+        if 1 <= word_count(tail) <= REASK_TAIL_WORDS:
+            return f"So, {tail}?"
+    body = question.strip()
+    return "Sorry, just that one again: " + body[:1].lower() + body[1:]
+
 
 def durations_said(text: object) -> frozenset[float]:
     """The course-length figures in ``text``, as months (M032 SWEEP-17)."""
@@ -1041,6 +1171,16 @@ class GuardContext:
     # sentence of it that says goodbye, that she has to go, that she will think it over or get back
     # to them, or asks for an e-mail is dropped (the WEAK line says that, once).
     reaction_only: bool = False
+    # Simulation diagnosis 1 (R1_ECHO_GUARD, the engine's flag; off restores the release before).
+    # ``advisor_terms``: the word stems of the advisor's latest turns (``advisor_terms_in``), so a
+    # format, schedule or deep-need word she echoes from them is no invention (L1);
+    # ``asked_her``: the advisor asked her something, or to enrol or book (an emptied reply may then
+    # be the "thinking" line, U3); ``choice_offered``: the advisor's question offered her a choice,
+    # so "I'll reach out myself" answers it and is no stall closer (U5).
+    echo_guard: bool = False
+    advisor_terms: frozenset[str] = frozenset()
+    asked_her: bool = False
+    choice_offered: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -1186,7 +1326,9 @@ def _shared_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     if _VENDOR.search(sentence):
         hits.append(_hit(VENDOR, "vendor_name", sentence))
     evaluation = _EVALUATION_LEAK if ctx.phase in SMALL_TALK_PHASES else _EVALUATION
-    if evaluation.search(sentence):
+    if evaluation.search(sentence) and not (
+        ctx.echo_guard and ctx.is_learner and _course_work_graded(sentence)
+    ):
         hits.append(_hit(EVALUATION, "scoring_vocabulary", sentence))
     if has_contact_detail(sentence):
         hits.append(_hit(CONTACT, "contact_detail", sentence))
@@ -1459,7 +1601,16 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
             # revealed at ex8, and the sentence that leaned on it was left dangling).
             if topic in ctx.released_topics or topic in ctx.spent_topics:
                 continue
-            if any(pattern.search(sentence) for pattern in persona.markers(topic)):
+            matches = [
+                match
+                for match in (pattern.search(sentence) for pattern in persona.markers(topic))
+                if match is not None
+            ]
+            if ctx.echo_guard and matches:
+                # Simulation diagnosis 1 (L1 (b)): "evenings and weekends" right after the advisor
+                # said it is his schedule echoed, not her deep need told.
+                matches = [m for m in matches if not _marker_echoed(m, ctx.advisor_terms)]
+            if matches:
                 hits.append(_hit(VOLUNTEERED_NEED, topic, sentence))
                 break
     level = classify_learner_commitment(sentence)
@@ -1475,7 +1626,10 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     durations = ctx.advisor_durations if ctx.probe_first else None
     length_unsaid = False
     if not question:
-        if _FORMAT_FACT.search(sentence):
+        echo = ctx.echo_guard
+        if _FORMAT_FACT.search(sentence) and not (
+            echo and _format_echoed(sentence, ctx.advisor_terms)
+        ):
             hits.append(_hit(INVENTED_FACT, "format_or_schedule_claim", sentence))
         elif _is_product_statement(sentence, allowed, durations):
             if durations is not None and not _is_product_statement(
@@ -1486,7 +1640,7 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
                 length_unsaid = True
             else:
                 hits.append(_hit(INVENTED_FACT, "product_statement", sentence))
-        elif _CLAIM_WORDS.search(sentence):
+        elif _CLAIM_WORDS.search(sentence) and not (echo and _claim_not_asserted(sentence)):
             hits.append(_hit(INVENTED_FACT, "outcome_or_policy_claim", sentence))
     if ctx.probe_first and not length_unsaid and len(sentence) <= MISREAD_MAX_CHARS:
         # SWEEP-17 item 5: a course-length frame ("keep up for six months"; questions too).
@@ -1761,13 +1915,19 @@ class StreamGuard:
             if key == PHRASE_DECIDER_STALL and ctx.decider_asked:
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
                 continue
-            if key == PHRASE_STALL_CLOSER and ctx.closing_exempt:
+            if key == PHRASE_STALL_CLOSER and (
+                ctx.closing_exempt or (ctx.echo_guard and ctx.choice_offered)
+            ):
                 # M032 S3.2: the advisor closed the call, so "I'll get back to you, bye" is her
-                # plain goodbye for this one reply, not the stall loop.
+                # plain goodbye for this one reply, not the stall loop.  Simulation diagnosis 1
+                # (U5): his question offered her a choice, so "I'll reach out myself" answers it.
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
                 continue
             if self._stall_blocked(key):
                 text = _without_clauses(text, pattern)
+                if text and ctx.echo_guard and _points_back(text):
+                    # U5: "That suits me better." is left pointing at the clause just cut.
+                    text = ""
                 if not text:
                     return ""
             else:
@@ -1792,6 +1952,10 @@ class StreamGuard:
         if template and self._phrase_count(PHRASE_TEMPLATE_Q) >= PHRASE_QUOTA[PHRASE_TEMPLATE_Q]:
             self._repeat_drops += 1
             return True
+        if ctx.echo_guard and is_echo_question(text, ctx.advisor_terms):
+            # Simulation diagnosis 1 (U2): "Wait, $1,000?" repeats his words back; it is not the
+            # reply's one question, so the real one after it is still asked.
+            return False
         if self._questions_kept >= 1:
             return True
         if (
@@ -1918,7 +2082,7 @@ class StreamGuard:
                 self._phrases_used[PHRASE_STRETCH] = self._phrases_used.get(PHRASE_STRETCH, 0) + 1
         if CONCESSION_TAG.search(text) is not None:
             if self._phrase_count(PHRASE_CONCESSION_TAG) >= PHRASE_QUOTA[PHRASE_CONCESSION_TAG]:
-                text = _strip_concession_tag(text)
+                text = _strip_concession_tag(text, tidy=ctx.echo_guard)
             else:
                 key = PHRASE_CONCESSION_TAG
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
@@ -2034,6 +2198,18 @@ class StreamGuard:
         if out and self.ctx.is_learner and _STILL_MORE.search(out) is not None:
             if any(_STILL_MORE.search(said) for said in self._emitted):
                 out = ""  # "more than I planned for" is said once in a reply
+        if (
+            out
+            and not hits
+            and self.ctx.echo_guard
+            and self.ctx.reask
+            and "?" in out
+            and repeat_kind(out, self.ctx.reask) == "exact"
+        ):
+            # Simulation diagnosis 1 (L5): the asked-for re-ask word for word sounds scripted; a
+            # person asks it again in fewer words.
+            out = short_reask(out)
+            self._style_edits += 1
         if out and not hits:
             # A sentence the learner already said is a repeat in the words it was WRITTEN in: the
             # style rules below change a few words ("That's" -> "It's"), and a changed copy of an
@@ -2043,7 +2219,9 @@ class StreamGuard:
                 return self._drop_repeat(written, blocked=False)
             out = self._vary(out)
             if out and self._last_dropped and self.ctx.is_learner:
-                if _DANGLING_REFERENCE.match(out) is not None:
+                if _DANGLING_REFERENCE.match(out) is not None or (
+                    self.ctx.echo_guard and _points_back(out)
+                ):
                     # The sentence before this one was dropped and this one points back at it
                     # ("He'd probably ask about that first."): it goes with it.
                     out = ""
@@ -2108,10 +2286,24 @@ class StreamGuard:
         if not self._emitted and not self.ctx.quiet_empty:
             self._fallback_used = True
             only_repeats = self._repeat_drops > 0 and self._other_drops == 0
-            if self._length_drops and self.ctx.free_reply and self.ctx.is_learner:
+            ctx = self.ctx
+            if self._length_drops and ctx.free_reply and ctx.is_learner:
                 # M032 SWEEP-17: a free reply emptied by a course length she was never told asks
                 # for it instead ("How long does the course run?"), never "Give me a second".
-                self._emitted.append(_length_probe(self.ctx))
+                self._emitted.append(_length_probe(ctx))
+            elif (
+                ctx.echo_guard
+                and ctx.is_learner
+                and ctx.free_reply
+                and ctx.mode == "reply"
+                and not ctx.confirm
+                and not ctx.asked_her
+                and {hit.category for hit in self._hits} <= {INVENTED_FACT, COURSE_FACT}
+            ):
+                # Simulation diagnosis 1 (U3): a reply emptied of a fact she may not state, after a
+                # turn that asked her nothing: "I'm thinking that over" answers nothing he said, so
+                # a neutral back-channel lets him go on.
+                self._emitted.append(NEUTRAL_ACKS[ctx.turn % len(NEUTRAL_ACKS)])
             else:
                 self._emitted.append(_fallback(self.ctx, only_repeats=only_repeats))
             out.append(self._emitted[-1])
@@ -2196,15 +2388,23 @@ def _without_clauses(text: str, pattern: re.Pattern[str]) -> str:
     return out[0].upper() + out[1:] + end
 
 
-def _strip_concession_tag(text: str) -> str:
+def _points_back(text: str) -> bool:
+    """U5: a short sentence that only points at something said before it ("That suits me.")."""
+    return word_count(text) <= POINTS_BACK_WORDS and _POINTS_BACK.match(text) is not None
+
+
+def _strip_concession_tag(text: str, *, tidy: bool = False) -> str:
     """``text`` without the concession tag ("..., I'll give you that.", "I'll admit, ...").
 
     What is left keeps its closing mark; a tag that is the whole sentence leaves nothing, which
-    ``_vary`` turns into a neutral acknowledgement.
+    ``_vary`` turns into a neutral acknowledgement.  ``tidy`` (simulation diagnosis 1, U4 (3)):
+    a conjunction left dangling before the tag ("..., so, I'll give you that") goes with it.
     """
     end = text.rstrip()[-1:] if text.rstrip()[-1:] in (".", "?", "!") else ""
     out = CONCESSION_TAG_LEADING.sub("", text, count=1)
     out = CONCESSION_TAG_TRAILING.sub("", out).rstrip(" ,;:-")
+    if tidy:
+        out = _DANGLING_CONJUNCTION.sub("", out).rstrip(" ,;:-")
     if word_count(out) < 2:
         return ""
     if out and out[-1] not in ".?!":

@@ -136,11 +136,13 @@ from r1_guard import (
     GuardLedger,
     GuardResult,
     StreamGuard,
+    advisor_terms_in,
     course_length_unsaid,
     durations_said,
     guard_text,
     has_concession,
     hours_said,
+    offers_choice,
 )
 from r1_negotiation import (
     ANCHOR_STATED_CONFLICT,
@@ -210,7 +212,9 @@ from r1_personas import (
 )
 from r1_prompts import (
     ACK_TURN_CONCERNS_NOTE,
+    ACK_TURN_CONCERNS_NOTE_V2,
     ACK_TURN_NOTE,
+    ACK_TURN_NOTE_V2,
     ANCHOR_NOT_OFFERED_NOTE,
     ANSWERED_NOTE,
     ANSWERED_YOU_NOTE,
@@ -740,6 +744,28 @@ FLAG_PERSONA_TIMELINE_V2 = "R1_PERSONA_TIMELINE_V2"
 FLAG_CALL_OPENING = "R1_CALL_OPENING"
 FLAG_ROLE_CONFUSION_V2 = "R1_ROLE_CONFUSION_V2"
 FLAG_FLOOR_YIELD = "R1_FLOOR_YIELD"
+# Simulation diagnosis 1 (the live full-interview run of the integration branch), learner fixes,
+# each default ON with the same rollback:
+#
+# * R1_ECHO_GUARD (L1, U2, U3, U5, L5, U4 (3)): what she echoes from the advisor's latest turns (a
+#   format, schedule or deep-need word), a wish about a policy and how her course work is graded
+#   are no leak; an echo question ("Wait, $1,000?") is not the reply's one question; an emptied free
+#   reply is a back-channel unless she was asked to decide; the asked-for re-ask is shortened; a
+#   clause answering his either/or question is no stall closer, and a short "that" sentence goes
+#   with the clause it pointed at.
+# * R1_MARKERS_V2 (U1, U2, L4): wider delivery markers for F2, F4 and F1-COUNTER (latched per
+#   session: the schedule's markers), a tail never repeats the reply's opener, and the e-mail tail
+#   asks nothing when she already asked.
+# * R1_PRICE_ASKED_ONCE (L3): a challenged anchor is no unclear price, and the final price is asked
+#   once until a new figure is named.
+# * R1_NO_ACCEPT_NOTES (L7, U4 (2)): an owed move that answers a proposal she may not accept yet
+#   says so in its prompt, and the early price-met note gives no sayable phrase.
+FLAG_ECHO_GUARD = "R1_ECHO_GUARD"
+FLAG_MARKERS_V2 = "R1_MARKERS_V2"
+FLAG_PRICE_ASKED_ONCE = "R1_PRICE_ASKED_ONCE"
+FLAG_NO_ACCEPT_NOTES = "R1_NO_ACCEPT_NOTES"
+# The advisor turns whose words she may echo (R1_ECHO_GUARD).
+ADVISOR_TERM_TURNS = 4
 _FLAG_OFF_VALUES = frozenset({"0", "off", "false", "no"})
 # The flags that are OFF unless set (every other flag is on unless set to 0/off/false/no).
 _FLAG_DEFAULT_OFF = frozenset({FLAG_WRAPUP_NEXT_ROUND})
@@ -779,6 +805,10 @@ _FLAG_READS = {
     FLAG_CALL_OPENING: lambda: os.getenv("R1_CALL_OPENING"),
     FLAG_ROLE_CONFUSION_V2: lambda: os.getenv("R1_ROLE_CONFUSION_V2"),
     FLAG_FLOOR_YIELD: lambda: os.getenv("R1_FLOOR_YIELD"),
+    FLAG_ECHO_GUARD: lambda: os.getenv("R1_ECHO_GUARD"),
+    FLAG_MARKERS_V2: lambda: os.getenv("R1_MARKERS_V2"),
+    FLAG_PRICE_ASKED_ONCE: lambda: os.getenv("R1_PRICE_ASKED_ONCE"),
+    FLAG_NO_ACCEPT_NOTES: lambda: os.getenv("R1_NO_ACCEPT_NOTES"),
 }
 
 
@@ -1153,6 +1183,10 @@ class RolePlayEngine:
         self._asked: list[bool] = []
         self._phrases: dict[str, int] = {}
         self._advisor_hours: set[float] = set()
+        # Simulation diagnosis 1 (R1_ECHO_GUARD): the word stems of the advisor's latest turns
+        # (memory only, never logged), and whether this turn's question offered her a choice.
+        self._advisor_term_turns: list[frozenset[str]] = []
+        self._choice_offered = False
         self._answered: list[str] = []
         self._dig_deferred: set[str] = set()
         self._call_ask_now = False
@@ -1567,6 +1601,17 @@ class RolePlayEngine:
             reaction_only=reaction_only,
             reask_topic=reask_topic,
             price_memory=flag_on(FLAG_PRICE_MEMORY),
+            echo_guard=flag_on(FLAG_ECHO_GUARD),
+            advisor_terms=(
+                frozenset().union(*self._advisor_term_turns) if phase == "roleplay" else frozenset()
+            ),
+            asked_her=(
+                self._turn_ask is not None
+                or RESPOND_QUESTION in self._turn_kinds
+                or "?" in str(self._turn_reading or "")
+                or asks_her_directly(self._turn_reading)
+            ),
+            choice_offered=self._choice_offered,
         )
 
     def _offer_on_table(self) -> int | None:
@@ -1968,6 +2013,11 @@ class RolePlayEngine:
             advisor_amounts_in(candidate_text, shorthand=self._probe_first)
         )
         self._advisor_hours.update(hours_said(candidate_text))
+        self._advisor_term_turns = [
+            *self._advisor_term_turns[-(ADVISOR_TERM_TURNS - 1) :],
+            advisor_terms_in(reading),
+        ]
+        self._choice_offered = offers_choice(reading)
         if self._probe_first:
             # SWEEP-17 item 4: the course lengths the advisor said, and a price he stated without
             # a "$" ("the price is 9000"), are figures she may refer to.
@@ -4084,8 +4134,13 @@ class RolePlayEngine:
             )
         elif ack_turn:
             # SWEEP-11: never together with VOICED_CONCERNS_NOTE (its concerns clause is merged in).
+            # Simulation diagnosis 1 (L5, R1_ECHO_GUARD): the re-ask is shorter and in other words.
+            short = flag_on(FLAG_ECHO_GUARD)
+            with_concerns = ACK_TURN_CONCERNS_NOTE_V2 if short else ACK_TURN_CONCERNS_NOTE
             notes.append(
-                ACK_TURN_CONCERNS_NOTE.format(concerns=concerns) if concerns else ACK_TURN_NOTE
+                with_concerns.format(concerns=concerns)
+                if concerns
+                else (ACK_TURN_NOTE_V2 if short else ACK_TURN_NOTE)
             )
             self._ack_turn_notes += 1
         elif concerns and RESPOND_QUESTION in self._turn_kinds:

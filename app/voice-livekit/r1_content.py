@@ -193,7 +193,13 @@ import r1_world
 #    join the manifest (``_learner_followups``) beside the texts they replace while their flags are
 #    on.  No graded meaning, marker, must-say or deadline changed; with every flag off the card,
 #    the prefix and the reminders are the release before.
-CONTENT_REVISION = 25
+# 26: Simulation diagnosis 1, learner fixes (rollback flags R1_ECHO_GUARD, R1_MARKERS_V2,
+#    R1_PRICE_ASKED_ONCE, R1_NO_ACCEPT_NOTES and R1_COMMIT_READER_V2).  The shorter re-ask notes and
+#    the other new notes and wordings join the manifest (``_sim_repairs``) beside the texts they
+#    replace while their flags are on.  No graded meaning, must-say or deadline changed; the wider
+#    delivery markers are listed beside the old ones; with every flag off the reminders, the
+#    markers and the readers are the release before.
+CONTENT_REVISION = 26
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -484,6 +490,15 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
     }
 
 
+def _sim_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 1 (revision 26): the learner fixes' new texts and markers."""
+    p = r1_prompts
+    return {
+        # L5 (R1_ECHO_GUARD): the re-ask is shorter and in other words.
+        "ack_turn_notes_v2": [p.ACK_TURN_NOTE_V2, p.ACK_TURN_CONCERNS_NOTE_V2],
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -763,6 +778,7 @@ def manifest() -> dict[str, Any]:
             "probe_first": _probe_first(sample),
             "endings": _endings(),
             "learner_followups": _learner_followups(sample),
+            "sim_repairs": _sim_repairs(),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,
