@@ -1104,7 +1104,9 @@ class RolePlayEngine:
         self.keep_excerpts = keep_excerpts
         self.candidate_first_name = candidate_first_name
         self.seed = seed or "r1"
-        self.scheduler = OwedMoveScheduler(persona.decision_maker)
+        # Simulation diagnosis 1 (R1_MARKERS_V2, latched per session): the wider delivery markers.
+        self._markers_v2 = flag_on(FLAG_MARKERS_V2)
+        self.scheduler = OwedMoveScheduler(persona.decision_maker, markers_v2=self._markers_v2)
         self.tracker = CoverageTracker(persona, seed=self.seed)
         self.ledger = GuardLedger()
         self.turn = 0
@@ -5121,6 +5123,18 @@ class RolePlayEngine:
             else:
                 candidates = (*quiet, *stripped, *candidates)
         chosen = next((text for text in candidates if not _repeats(text, said)), candidates[0])
+        opener = _first_word(spoken_so_far)
+        if self._markers_v2 and opener and _first_word(chosen) == opener:
+            # Simulation diagnosis 1 (U2): "Wait, $1,000? ... Wait, that's far lower than I
+            # expected." A tail never opens with the word her reply opened with.
+            chosen = next(
+                (
+                    text
+                    for text in candidates
+                    if _first_word(text) != opener and not _repeats(text, said)
+                ),
+                chosen,
+            )
         key = plan.move_id or plan.negotiation_id or (
             f"probe:{plan.probe}" if plan.probe is not None else None
         )
@@ -6109,3 +6123,9 @@ def _without_questions(text: str) -> str:
 def _repeats(text: str, said: tuple[str, ...]) -> bool:
     """True when any sentence of ``text`` repeats something in ``said`` (``repeat_kind``)."""
     return any(repeat_kind(sentence, said) is not None for sentence in split_sentences(text))
+
+
+def _first_word(text: object) -> str:
+    """The first word of ``text``, lower-cased ("" when there is none)."""
+    match = re.match(r"\W*([A-Za-z']+)", str(text or ""))
+    return match.group(1).lower() if match else ""

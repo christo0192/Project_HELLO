@@ -496,6 +496,11 @@ def _sim_repairs() -> dict[str, Any]:
     return {
         # L5 (R1_ECHO_GUARD): the re-ask is shorter and in other words.
         "ack_turn_notes_v2": [p.ACK_TURN_NOTE_V2, p.ACK_TURN_CONCERNS_NOTE_V2],
+        # U1, U2 (R1_MARKERS_V2): the alternatives added to each marker group.
+        "extra_markers_v2": {
+            move_id: [list(group) for group in groups]
+            for move_id, groups in r1_scheduler.EXTRA_MARKERS_V2.items()
+        },
     }
 
 

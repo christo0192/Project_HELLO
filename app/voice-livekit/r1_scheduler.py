@@ -700,6 +700,58 @@ REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
 _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
 
+# Simulation diagnosis 1 (U1, U2; flag R1_MARKERS_V2, latched per session by the engine): more
+# any-of alternatives per marker group (by group index), so the worry in the model's new words
+# proves the move and the scripted tail does not say it a second time in the same reply ("...run
+# it past my husband. I'd also need to talk to my husband.").  Every marker of the release before
+# stays; with the flag off the markers are exactly the release before.
+EXTRA_MARKERS_V2: dict[str, tuple[tuple[str, ...], ...]] = {
+    F2_PRIMARY: (
+        (
+            r"\bdays?\b",
+            r"\bhome\b",
+            r"\bkids\b",
+            r"\bworkload\b",
+            r"\bjob\b",
+            r"\bevenings?\b",
+            r"\bweekends?\b",
+        ),
+        (
+            r"\bkeep(?:ing)? (?:pace|going)\b",
+            r"\bon top of\b",
+            r"\bsqueez\w*",
+            r"\bfit (?:it|this|that) in\b",
+        ),
+    ),
+    F2_PUSH: (
+        (
+            r"\b(?:fall|falls|falling|fell|fallen|get|gets|getting|got) (?:\w+ ){1,3}behind\b",
+            r"\bpick (?:it |things )?(?:back )?up where\b",
+            r"\bwhat happens (?:if|when)\b[^.?!]{0,40}\b(?:busy|miss\w*|behind|swamped|piles? up|"
+            r"can'?t keep)\b",
+        ),
+    ),
+    F4_PUSH: (
+        (),
+        (
+            r"\brun (?:it|this|that|all of this|all this|everything) past\b",
+            r"\bgo (?:over|through) (?:it|this|that|everything)\b",
+        ),
+    ),
+    F1_COUNTER: ((r"\bfull price\b", r"\bnothing (?:added|extra)\b"),),
+}
+
+
+def widened_markers(
+    move_id: str, markers: tuple[tuple[str, ...], ...]
+) -> tuple[tuple[str, ...], ...]:
+    """``markers`` with ``EXTRA_MARKERS_V2`` added to each group (R1_MARKERS_V2)."""
+    extra = EXTRA_MARKERS_V2.get(move_id, ())
+    return tuple(
+        (*group, *(extra[index] if index < len(extra) else ()))
+        for index, group in enumerate(markers)
+    )
+
 
 def _compile(*patterns: str) -> tuple[re.Pattern[str], ...]:
     return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
@@ -2010,7 +2062,8 @@ class _MoveState:
 class OwedMoveScheduler:
     """Per-session schedule of the learner's owed moves (see the module docstring)."""
 
-    def __init__(self, decision_maker: str) -> None:
+    def __init__(self, decision_maker: str, *, markers_v2: bool = False) -> None:
+        """``markers_v2``: R1_MARKERS_V2 (simulation diagnosis 1), the wider delivery markers."""
         self.decision_maker = decision_maker
         self._states: dict[str, _MoveState] = {}
         for spec in PLAN:
@@ -2018,13 +2071,14 @@ class OwedMoveScheduler:
                 text = commitment_line(Level.WEAK, decision_maker)
             else:
                 text = _fill(spec.line, decision_maker)
+            markers = widened_markers(spec.id, spec.markers) if markers_v2 else spec.markers
             self._states[spec.id] = _MoveState(
                 spec,
                 text,
                 brief=_fill(spec.brief, decision_maker),
                 markers=tuple(
                     tuple(_fill(pattern, decision_maker, regex=True) for pattern in group)
-                    for group in spec.markers
+                    for group in markers
                 ),
                 variants=(text, *(_fill(item, decision_maker) for item in spec.variants))
                 if spec.variants

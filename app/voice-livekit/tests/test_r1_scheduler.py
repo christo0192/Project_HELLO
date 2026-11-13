@@ -2376,5 +2376,56 @@ class DodgedQuestionTests(unittest.TestCase):
             sched.open_question_topics(text[:4000])
             self.assertLess(time.perf_counter() - started, 0.25)
 
+
+class MarkersV2Tests(unittest.TestCase):
+    """Simulation diagnosis 1, U1 and U2 (R1_MARKERS_V2): the worry in new words proves the move.
+
+    Synthetic text: the model voiced the point, the markers missed it, and the scripted tail said
+    it a second time in the same reply.
+    """
+
+    PROVEN = {
+        sched.F2_PRIMARY: (
+            "My days are already full with experiments, and I'm not sure I could keep up on top "
+            "of that.",
+            "Between the kids and the workload, I don't know how I'd squeeze this in.",
+        ),
+        sched.F2_PUSH: (
+            "If work suddenly gets busy and I fall a few weeks behind, what happens then?",
+            "What happens if I miss a month when work piles up?",
+            "Could I pick it back up where I left off?",
+        ),
+        sched.F4_PUSH: ("I'd want to run it past my husband before I go any further.",),
+        # ("..., with nothing added on later?" already proved it through "nothing".)
+        sched.F1_COUNTER: ("Is that really the full price for me?",),
+    }
+
+    def test_the_wider_markers_prove_the_move(self):
+        wide = OwedMoveScheduler("husband", markers_v2=True)
+        old = OwedMoveScheduler("husband")
+        for move_id, texts in self.PROVEN.items():
+            for text in texts:
+                with self.subTest(move=move_id, text=text):
+                    self.assertTrue(wide.spoken_proves(move_id, text))
+                    self.assertFalse(old.spoken_proves(move_id, text))
+
+    def test_unrelated_lines_still_prove_nothing(self):
+        wide = OwedMoveScheduler("husband", markers_v2=True)
+        for move_id, text in (
+            (sched.F2_PUSH, "What happens if I don't like the course?"),
+            (sched.F4_PUSH, "Let me go over the email tonight."),
+            (sched.F2_PRIMARY, "On top of that, the price worries me."),
+        ):
+            with self.subTest(move=move_id, text=text):
+                self.assertFalse(wide.spoken_proves(move_id, text))
+
+    def test_every_scripted_variant_still_proves_its_move(self):
+        wide = OwedMoveScheduler("husband", markers_v2=True)
+        for state in wide._states.values():
+            for text in state.variants:
+                with self.subTest(move=state.spec.id, text=text):
+                    self.assertTrue(wide.spoken_proves(state.spec.id, text))
+
+
 if __name__ == "__main__":
     unittest.main()

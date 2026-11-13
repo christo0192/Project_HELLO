@@ -12158,6 +12158,54 @@ class AbuseBeforeEndRequestTests(unittest.TestCase):
         self.assertEqual(plan.line_id, "L-ASIDE-END")
 
 
+class MarkersV2EngineTests(unittest.TestCase):
+    """Simulation diagnosis 1, U1 and U2 (R1_MARKERS_V2): no owed point said twice in a reply."""
+
+    def test_the_engine_latches_the_wider_markers(self):
+        eng = engine()
+        self.assertTrue(eng.scheduler.spoken_proves(
+            "F4-PUSH", "I'd want to run it past my husband before I go any further."
+        ))
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_MARKERS_V2": "0"}):
+            eng = engine()
+        self.assertFalse(eng.scheduler.spoken_proves(
+            "F4-PUSH", "I'd want to run it past my husband before I go any further."
+        ))
+
+    def _tail(self, eng, spoken):
+        from dataclasses import replace as dc_replace
+
+        plan = eng.plan_turn(PITCH, 60)
+        intent = r1_roleplay.LearnerIntent(
+            kind="objection",
+            brief="",
+            must_say=(),
+            markers=((r"\bunmatched\b",),),
+            fallback="Wait, that's far lower than I expected.",
+            fallbacks=(
+                "Wait, that's far lower than I expected.",
+                "That's far lower than I expected, honestly.",
+            ),
+        )
+        return eng.intent_tail(dc_replace(plan, intent=intent, move_id="F1-COUNTER"), spoken)
+
+    def test_a_tail_never_opens_with_her_reply_s_first_word(self):
+        self.assertEqual(
+            self._tail(engine(), "Wait, $1,000? That seems awfully low."),
+            "That's far lower than I expected, honestly.",
+        )
+        self.assertEqual(
+            self._tail(engine(), "Hmm, $1,000? That seems awfully low."),
+            "Wait, that's far lower than I expected.",
+        )
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_MARKERS_V2": "0"}):
+            eng = engine()
+        self.assertEqual(
+            self._tail(eng, "Wait, $1,000? That seems awfully low."),
+            "Wait, that's far lower than I expected.",
+        )
+
+
 class EchoGuardWiringTests(unittest.TestCase):
     """Simulation diagnosis 1 (R1_ECHO_GUARD): the engine hands the guard the advisor's words."""
 
