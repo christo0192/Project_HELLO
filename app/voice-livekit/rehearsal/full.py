@@ -46,6 +46,7 @@ from rehearsal.sim import (
     ModelledLatency,
     Runtime,
     SdkDriver,
+    barge_in_sec,
     build_context,
     build_session,
     build_writer,
@@ -394,13 +395,14 @@ async def _candidate_loop(
             return
         view = _view(rt, since, waited)
         if cut is not None:
-            # The interrupter cuts in over the line that is playing (the SDK cuts it at the turn's
-            # end, as ``SdkDriver.speak`` does with an interruptible speech that is current).
+            # The interrupter cuts in over the line that is playing, and its voice cuts that line
+            # (voice barge-in, ``SdkDriver.speak(barge_in=True)``).
             playing, heard_part, phase = cut
             action = await sim.interrupt_action(view, phase, heard_part)
             since_before = since
             result = await driver.speak(
-                action.text, wps=action.wps, act=action.act, role=action.role, intent=action.intent
+                action.text, wps=action.wps, act=action.act, role=action.role, intent=action.intent,
+                barge_in=True,
             )
             span = result.get("span")
             ends = [rt.now() if span is None or span.t_end is None else span.t_end]
@@ -450,8 +452,8 @@ async def _speak_watching_cut_ins(
     rt: Runtime, driver: SdkDriver, sim: CandidateSim, record: dict[str, Any], action: Any, since: float
 ) -> float:
     """The interrupter's turn: the reply to it plays inside ``driver.speak``, so the cut-in is
-    watched for while that turn is still waiting on its reply, and said over the reply (the SDK
-    cuts an interruptible current speech when the cut-in's turn ends).  Returns the new ``since``."""
+    watched for while that turn is still waiting on its reply, and said over the reply, which its
+    voice cuts (voice barge-in, ``SdkDriver.speak(barge_in=True)``).  Returns the new ``since``."""
     exchange = sim.exchanges
     task = asyncio.ensure_future(
         driver.speak(action.text, wps=action.wps, act=action.act, role=action.role, intent=action.intent)
@@ -475,9 +477,12 @@ async def _speak_watching_cut_ins(
                     default=since,
                 )
                 view = _view(rt, max(since, turn_end), 0.0)
-                second = await sim.interrupt_action(view, phase, played_part(reply.text, played, total))
+                second = await sim.interrupt_action(view, phase, _heard_before_cut(reply.text, played, total))
                 second_task = asyncio.ensure_future(
-                    driver.speak(second.text, wps=second.wps, act=second.act, role=second.role, intent=second.intent)
+                    driver.speak(
+                        second.text, wps=second.wps, act=second.act, role=second.role, intent=second.intent,
+                        barge_in=True,
+                    )
                 )
                 cut = (second, second_task, sim.exchanges, rt.now())
         await asyncio.sleep(FLOOR_POLL_SEC)
@@ -493,6 +498,13 @@ async def _speak_watching_cut_ins(
         new_since = max(ends)
         _note_turn(rt, sim, record, second, second_result, started, exchange=second_exchange)
     return new_since
+
+
+def _heard_before_cut(text: str, played: float, total: float) -> str:
+    """The part of a line the candidate will have heard when their cut-in's voice cuts it (the
+    cut-in starts now, and the line stops ``barge_in_sec`` later: ``SdkDriver.speak``).  At the
+    ``min_words`` rollback no voice cuts it, and the part played so far is what was heard."""
+    return played_part(text, played + (barge_in_sec() or 0.0), total)
 
 
 async def _wait_floor(
@@ -522,7 +534,7 @@ async def _wait_floor(
                 current is not None and not current.done() and getattr(current, "allow_interruptions", False)
             )
             if sim.interrupt_due(phase, reply, played, total, interruptible):
-                return reply, played_part(reply.text, played, total), phase
+                return reply, _heard_before_cut(reply.text, played, total), phase
         if rt.floor_free:
             if quiet_since is None:
                 quiet_since = rt.now()

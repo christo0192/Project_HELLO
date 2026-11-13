@@ -225,12 +225,13 @@ transition labels, the brief-line rule and the `icebreaker_repeat` check), `REHE
 ```
 python -m rehearsal --full --offline --scenarios adapt --out <dir>                  # every adapt scenario, scripted
 python -m rehearsal --full --scenarios tangent --out <dir> --budget-usd 0.30         # one live call, judged
-python -m rehearsal --full --scenarios all --out <dir> --budget-usd 6                # default + adapt, live
+python -m rehearsal --full --scenarios default+adapt --out <dir> --budget-usd 6      # default + adapt, live (41 calls)
 ```
 
 The owner's goal is a bot with excellent conversational flow that adapts to every kind of
 conversation while sticking to its objective. `rehearsal/adapt.py` adds fourteen named candidates
-(group `adapt`; `all` is `default` plus `adapt`, and `default` is unchanged): `tangent`, `confused`,
+(group `adapt`; `default+adapt` is `default` plus `adapt`, the same as `--scenarios default,adapt`;
+`default` and `all`, the 16 synthetic scenarios, are unchanged): `tangent`, `confused`,
 `rambler`, `one-worder`, `hinglish`, `rude-not-abusive`, `interrupter`, `off-script-advisor`,
 `manipulative-advisor`, `over-discounter`, `gives-up-midway`, `mid-roleplay-glitch`,
 `argues-with-christy` and `late-ready`. Each is phase-aware: offline the talk is scripted (answer
@@ -243,9 +244,12 @@ ground-truth `act` (new: `tangent`, `confused_question`, `interrupt`, `off_scrip
 the behaviour.
 
 The interrupter cuts in while a generated bot reply is still playing (every third long learner
-reply, Christy's second icebreaker reply), and the SDK side cuts that reply when the cut-in's turn
-ends (`SdkDriver.speak` interrupts an interruptible current speech): a barge-in cut at the turn's
-end, not at voice onset.
+reply, Christy's second icebreaker reply), and its voice cuts that reply as R1's voice barge-in
+does: once the voice has lasted the interruption `min_duration` (0.8 s, `r1_latency`; read at use)
+the line stops, keeping the words played until then (`SdkDriver.speak(barge_in=True)`). A line
+with less than that plus 0.4 s left is not cut in on (it would play to its end), and the advisor is
+fed the part of the learner line played before the cut. At the `R1_INTERRUPT_MIN_WORDS` rollback
+the voice cuts nothing and the committed turn does, as in production.
 
 New per-phase check `ready_taken`: every spoken "ready" in the transition starts the role-play (the
 learner picks up before the candidate speaks again). A "ready" Christy answers as a question, or
@@ -260,7 +264,8 @@ candidate line or from no line is rejected, listed under `evidence_rejected`) an
 worst moments to `scorecard.md` / `scorecard.json` (`flow`). Gates: naturalness mean >= 4.3,
 adaptability mean >= 4.3, objective_kept minimum >= 4, and no call below 3 on any axis. A failed
 gate or a call without a verdict keeps a live run from being ready, and `--strict` exits 5 on a
-failed flow gate. The judge uses `--judge-model` (as the rubric judge); `--no-judge` turns both off.
+failed flow gate and on a live judged run where a call has no verdict (a judge error) or no call was
+judged (`strict_failures`; offline `n/a` and `--no-judge` are not failures). The judge uses `--judge-model` (as the rubric judge); `--no-judge` turns both off.
 
 ## Not measured here
 

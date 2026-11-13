@@ -83,7 +83,12 @@ class AdaptRegistrationTests(unittest.TestCase):
         default = parse_scenarios("default")
         self.assertEqual(default, (*GROUPS["manual-replay"], manual.MIX, *SCENARIO_NAMES))
         self.assertFalse(set(default) & set(ADAPT))
-        self.assertEqual(parse_scenarios("all"), (*default, *ADAPT))
+        # ``all`` keeps its meaning (the synthetic scenarios: a live sweep sized for it must not
+        # grow), and default plus adapt is a group of its own.
+        self.assertEqual(parse_scenarios("all"), SCENARIO_NAMES)
+        self.assertEqual(len(parse_scenarios("all")), 16)
+        self.assertEqual(parse_scenarios("default+adapt"), (*default, *ADAPT))
+        self.assertEqual(parse_scenarios("default,adapt"), (*default, *ADAPT))
         self.assertEqual(parse_scenarios("Tangent,one-worder"), ("tangent", "one-worder"))
 
     def test_every_adapt_scenario_carries_its_ground_truth(self) -> None:
@@ -231,8 +236,29 @@ class AdaptOfflineInterviewTests(unittest.TestCase):
             ]
             overlapping += bool(playing)
         self.assertGreaterEqual(overlapping, 3)
+        # Barge-in at voice onset: the line the candidate cut in over is really cut (marked
+        # interrupted) within the SDK's interruption duration of the cut-in's start, for every
+        # cut-in, in the icebreaker (Christy) and in the role-play (the learner).
+        from rehearsal.sim import BARGE_IN_SEC
+
+        uncut = []
+        for row in rows:
+            if row.get("act") != "interrupt":
+                continue
+            over = [
+                bot for bot in rows
+                if bot["speaker"] == "bot" and bot.get("t_start") is not None and bot.get("t_end") is not None
+                and bot["t_start"] < row["t_start"] < bot["t_end"]
+            ]
+            if not over or not over[0]["interrupted"] or over[0]["t_end"] > row["t_start"] + BARGE_IN_SEC + 0.2:
+                uncut.append((row.get("phase"), row["t_start"], [(b["t_start"], b["t_end"], b["interrupted"]) for b in over]))
+        self.assertEqual(uncut, [])
         cut_learner = [r for r in rows if r.get("voice") == "learner" and r["interrupted"]]
-        self.assertGreaterEqual(len(cut_learner), 2)
+        self.assertGreaterEqual(len(cut_learner), phases.count("roleplay"))
+        cut_christy = [
+            r for r in rows if r.get("phase") == "icebreaker" and r["speaker"] == "bot" and r["interrupted"]
+        ]
+        self.assertGreaterEqual(len(cut_christy), phases.count("icebreaker"))
         # A cut-in is an exchange of its own: numbered in order, no number twice.
         numbers = [exchange["n"] for exchange in record["exchanges"]]
         self.assertEqual(numbers, sorted(set(numbers)))
@@ -268,6 +294,12 @@ class AdaptOfflineInterviewTests(unittest.TestCase):
         for part in roleplay_fed:
             self.assertIsNotNone(part)
             self.assertTrue(any(line.startswith(part.strip()) for line in learner_lines), part)
+        # What the advisor was fed ends with the cut line's own played part: no word the candidate
+        # never heard, none it did hear left out.
+        cut_lines = [r["text"].strip() for r in _rows(record) if r.get("voice") == "learner" and r["interrupted"]]
+        self.assertGreaterEqual(len(cut_lines), len(roleplay_fed))
+        for part in roleplay_fed:
+            self.assertTrue(any(part.strip().endswith(line) for line in cut_lines), part)
 
     def test_the_off_script_and_manipulative_advisors_say_their_lines(self) -> None:
         from rehearsal.scenarios import SCENARIOS
@@ -379,22 +411,33 @@ class InterrupterTests(unittest.TestCase):
         fired = []
         for index in range(1, 25):
             span = self._span("learner")
-            self.assertFalse(cutter.due("roleplay", span, 0.3, 1.0))  # too early
-            first = cutter.due("roleplay", span, 0.5, 1.0)
-            again = cutter.due("roleplay", span, 0.9, 1.0)
+            self.assertFalse(cutter.due("roleplay", span, 1.5, 5.0))  # too early
+            first = cutter.due("roleplay", span, 2.5, 5.0)
+            again = cutter.due("roleplay", span, 3.0, 5.0)
             self.assertFalse(again)  # once per line
             if first:
                 fired.append(index)
         self.assertEqual(fired, [3, 6, 9, 12, 15, 18])  # every third, at most six
-        self.assertFalse(cutter.due("roleplay", self._span("learner", "Too short."), 0.9, 1.0))
-        self.assertFalse(cutter.due("roleplay", self._span("learner", source="say"), 0.9, 1.0))
-        self.assertFalse(cutter.due("roleplay", self._span("interviewer"), 0.9, 1.0))
+        self.assertFalse(cutter.due("roleplay", self._span("learner", "Too short."), 3.0, 5.0))
+        self.assertFalse(cutter.due("roleplay", self._span("learner", source="say"), 3.0, 5.0))
+        self.assertFalse(cutter.due("roleplay", self._span("interviewer"), 3.0, 5.0))
+
+    def test_no_cut_in_when_the_line_ends_before_a_barge_in_could_cut_it(self) -> None:
+        # The SDK cuts a line once the candidate's voice has lasted ``BARGE_IN_SEC``: a cut-in
+        # that late would talk over a line that then plays to its end, with nothing cut.
+        from rehearsal.adapt import Interrupter
+        from rehearsal.sim import BARGE_IN_SEC
+
+        cutter = Interrupter()
+        late = [cutter.due("roleplay", self._span("learner"), 5.0 - BARGE_IN_SEC, 5.0) for _ in range(3)]
+        self.assertEqual(late, [False, False, False])
+        self.assertEqual(cutter.fired["roleplay"], 0)
 
     def test_christys_second_icebreaker_reply_is_cut_once(self) -> None:
         from rehearsal.adapt import Interrupter
 
         cutter = Interrupter()
-        results = [cutter.due("icebreaker", self._span("interviewer"), 0.6, 1.0) for _ in range(4)]
+        results = [cutter.due("icebreaker", self._span("interviewer"), 3.0, 5.0) for _ in range(4)]
         self.assertEqual(results, [False, True, False, False])
         act, text, traits = cutter.line("icebreaker")
         self.assertEqual((act, traits), ("interrupt", ("interrupt",)))
@@ -645,6 +688,27 @@ class FlowGateTests(unittest.TestCase):
 
 
 class FlowSweepTests(unittest.TestCase):
+    def test_strict_fails_when_the_judge_was_on_but_gave_no_verdict(self) -> None:
+        from rehearsal.full_metrics import build_full_scorecard
+        from rehearsal.full_run import FullSettings, strict_failures
+
+        def failures(settings, records, offline=False):
+            return strict_failures(settings, records, build_full_scorecard(records, offline=offline))
+
+        on = FullSettings(offline=False, judge=True, strict=True)
+        broken = [_record(ROWS, flow={"source": "llm", "status": "error", "error": "no_json"})]
+        self.assertIn("flow_unjudged", failures(on, broken))
+        # No verdict recorded at all although the judge was on.
+        silent = [_record(ROWS)]
+        self.assertIn("flow_unjudged", failures(on, silent))
+        # --no-judge and offline (n/a) are not unjudged runs; a judged run is not either.
+        self.assertNotIn("flow_unjudged", failures(FullSettings(judge=False, strict=True), silent))
+        na = [_record(ROWS, flow={"source": "offline", "status": "n/a"})]
+        self.assertNotIn("flow_unjudged", failures(FullSettings(offline=True, judge=True, strict=True), na, True))
+        judged = [FlowGateTests._judged("a")]
+        self.assertNotIn("flow_unjudged", failures(on, judged))
+        self.assertEqual(failures(on, [FlowGateTests._judged("a", naturalness=2)]), ["flow_gates"])
+
     def test_a_sweep_writes_the_flow_scores_and_strict_fails_on_a_flow_gate(self) -> None:
         from rehearsal.full_run import EXIT_OK, EXIT_STRICT, FullSettings, OfflineFullFactory, run_full_all
 

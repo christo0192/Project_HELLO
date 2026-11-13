@@ -26,7 +26,8 @@ the candidate with the behaviour in its system prompt (``christy_style``) and as
 advisor (``advisor_overlay``), and the beats are said word for word, so the behaviour always happens.
 Every text here is synthetic.
 
-Groups: ``adapt`` is every scenario of this module; ``all`` is ``default`` plus ``adapt``.
+Groups: ``adapt`` is every scenario of this module; ``default+adapt`` is ``default`` plus ``adapt``
+(``all`` is unchanged: the synthetic scenarios).
 """
 from __future__ import annotations
 
@@ -45,7 +46,7 @@ from rehearsal.scenarios import (
     RoleplayBeat,
     Scenario,
 )
-from rehearsal.sim import LEARNER
+from rehearsal.sim import LEARNER, barge_in_sec
 
 ADAPT_TAG = "adapt"
 HINDI_WORDS = (
@@ -386,10 +387,13 @@ class Interrupter:
 
     A reply of ten words or more is eligible: in the role-play every third learner reply (at most
     ``MAX_ROLEPLAY``), in the icebreaker Christy's second reply (once).  The cut-in comes once the
-    reply has played ``AT_FRACTION`` of its length.
+    reply has played ``AT_FRACTION`` of its length, and only while enough of it is left for the
+    voice to cut it (``barge_in_sec`` plus ``CUT_MARGIN_SEC``): a later cut-in would talk over a
+    line that plays to its end, so that line is not cut in on at all.
     """
 
     AT_FRACTION = 0.4
+    CUT_MARGIN_SEC = 0.4
     MIN_WORDS = 10
     EVERY = 3
     MAX_ROLEPLAY = 6
@@ -427,6 +431,9 @@ class Interrupter:
         if not getattr(span, self.MARK) or played / total < self.AT_FRACTION:
             return False
         setattr(span, self.MARK, False)  # once per line
+        cut_after = barge_in_sec()
+        if cut_after is not None and total - played < cut_after + self.CUT_MARGIN_SEC:
+            return False  # too late for the voice to cut it: the line plays to its end
         self.fired[kind] += 1
         return True
 
@@ -689,7 +696,8 @@ _REGISTERED = False
 
 
 def register() -> tuple[str, ...]:
-    """Add the adapt scenarios, their styles and the ``adapt`` and ``all`` groups (idempotent)."""
+    """Add the adapt scenarios, their styles and the ``adapt`` and ``default+adapt`` groups
+    (idempotent)."""
     global ADAPT_NAMES, _REGISTERED
     from rehearsal import candidate, manual
 
@@ -706,7 +714,8 @@ def register() -> tuple[str, ...]:
         names.append(scenario.name)
     ADAPT_NAMES = tuple(names)
     GROUPS["adapt"] = ADAPT_NAMES
-    GROUPS["all"] = (*GROUPS["default"], *ADAPT_NAMES)
+    # ``all`` keeps its meaning (the synthetic scenarios): a live sweep sized for it must not grow.
+    GROUPS["default+adapt"] = (*GROUPS["default"], *ADAPT_NAMES)
     _REGISTERED = True
     return ADAPT_NAMES
 

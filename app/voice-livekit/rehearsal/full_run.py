@@ -307,6 +307,30 @@ def full_summary(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def strict_failures(
+    settings: FullSettings, records: Sequence[dict[str, Any]], card: dict[str, Any]
+) -> list[str]:
+    """Why ``--strict`` fails this run (empty: it passes).
+
+    ``flow_unjudged``: the flow judge was on for a live run but a call has no verdict (a judge
+    error: unreadable JSON twice, a bad model, the budget stop) or no call was judged at all.  A
+    gate without a verdict is ``ok: None``, never a pass, so strict must not exit 0 on it.  Offline
+    (``n/a``) and ``--no-judge`` runs have no flow gate to pass.
+    """
+    out: list[str] = []
+    if any(r.get("hard_fails") for r in records):
+        out.append("hard_fails")
+    if card.get("phase_checks_failed"):
+        out.append("phase_checks")
+    flow = card.get("flow") or {}
+    if flow.get("gates_failed"):
+        out.append("flow_gates")
+    if settings.judge and not settings.offline and records and not flow.get("offline"):
+        if flow.get("unjudged") or not flow.get("judged"):
+            out.append("flow_unjudged")
+    return out
+
+
 def flow_line(record: dict[str, Any]) -> dict[str, Any]:
     """The flow judge's per-call scores for ``results.jsonl`` (``status`` n/a offline, or error)."""
     flow = record.get("flow")
@@ -432,12 +456,7 @@ async def run_full_all(
         say("")
         say(markdown)
         if settings.strict and code == EXIT_OK:
-            failed = (
-                any(r.get("hard_fails") for r in records)
-                or bool(card.get("phase_checks_failed"))
-                or bool((card.get("flow") or {}).get("gates_failed"))
-            )
-            code = EXIT_STRICT if failed else EXIT_OK
+            code = EXIT_STRICT if strict_failures(settings, records, card) else EXIT_OK
     (out / "run.json").write_text(json.dumps(run, indent=1, default=str), encoding="utf-8", newline="\n")
     if run["stopped"]:
         say(f"STOPPED: {run['stopped']}. {run['message']}")

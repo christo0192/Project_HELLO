@@ -19,8 +19,8 @@ Selection: ``parse_scenarios("strong,early-end")``; ``synthetic`` is every scena
 ``wrapup`` both wrap-up runs, ``price`` both price runs, ``early`` both early ends.  The manual
 library (``rehearsal.manual``) adds ``manual-M01`` .. ``manual-M10``, ``manual-mix`` and the groups
 ``manual-replay``, ``manual`` and ``default`` (the manual scenarios, then the synthetic ones).  The
-adaptability scenarios (``rehearsal.adapt``) add the group ``adapt``, and ``all`` is ``default``
-plus ``adapt``.
+adaptability scenarios (``rehearsal.adapt``) add the group ``adapt``, and ``default+adapt`` is
+``default`` plus ``adapt``.  ``all`` stays the synthetic scenarios.
 """
 from __future__ import annotations
 
@@ -356,7 +356,7 @@ _add(
 
 SCENARIO_NAMES = tuple(SCENARIOS)  # the synthetic edge scenarios (the manual library adds more)
 GROUPS = {
-    "all": SCENARIO_NAMES,  # replaced by default + adapt once both are registered (rehearsal.adapt)
+    "all": SCENARIO_NAMES,
     "synthetic": SCENARIO_NAMES,
     "wrapup": ("wrapup-question", "wrapup-none"),
     "price": ("price-dodge", "price-never"),
