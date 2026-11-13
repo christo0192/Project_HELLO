@@ -326,8 +326,15 @@ class DisclosureGate:
         record.released_turn = self.turn
         record.probe_source = record.probe_source or source
 
-    def note_learner_text(self, text: object, turn: int | None = None) -> tuple[str, ...]:
-        """Record deep-need markers in what the learner actually said."""
+    def note_learner_text(
+        self, text: object, turn: int | None = None, echoed: frozenset[str] = frozenset()
+    ) -> tuple[str, ...]:
+        """Record deep-need markers in what the learner actually said.
+
+        ``echoed`` (simulation diagnosis 1, R1_ECHO_GUARD): topics whose markers only repeat the
+        advisor's own phrase ("evenings and weekends" right after he said it).  The guard lets that
+        echo through, so it tells no need that was never asked about.
+        """
         now = turn if turn is not None else self.turn
         revealed: list[str] = []
         for topic in deep_need_topics_in(self.persona, text):
@@ -337,7 +344,7 @@ class DisclosureGate:
                     record.state = NeedState.REVEALED
                     record.revealed_turn = now
                     revealed.append(topic)
-            else:
+            elif topic not in echoed:
                 record.revealed_unreleased = True
         # An offer whose reply did not tell the need is given back: the layer is still owed, so the
         # next dig on the topic offers it again (up to ``MAX_DEEP_MISSES`` times).
@@ -1866,9 +1873,13 @@ class CoverageTracker:
             injection=injection,
         )
 
-    def note_learner_text(self, text: object, turn: int | None = None) -> tuple[str, ...]:
-        """Record reveals in what the learner actually said."""
-        return self.gate.note_learner_text(text, turn if turn is not None else self.turn)
+    def note_learner_text(
+        self, text: object, turn: int | None = None, echoed: frozenset[str] = frozenset()
+    ) -> tuple[str, ...]:
+        """Record reveals in what the learner actually said (``echoed``: see the gate's)."""
+        return self.gate.note_learner_text(
+            text, turn if turn is not None else self.turn, echoed=echoed
+        )
 
     def apply_judge(self, result: JudgeResult | None, judged_turn: int) -> bool:
         """Merge a validated judge result for ``judged_turn``; None changes nothing."""

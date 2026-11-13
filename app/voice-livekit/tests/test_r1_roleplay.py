@@ -12266,6 +12266,66 @@ class MarkersV2EngineTests(unittest.TestCase):
             "Wait, that's far lower than I expected.",
         )
 
+    def _question_tail(self, eng, spoken, fallbacks):
+        from dataclasses import replace as dc_replace
+
+        plan = eng.plan_turn(PITCH, 60)
+        intent = r1_roleplay.LearnerIntent(
+            kind="objection",
+            brief="",
+            must_say=(),
+            markers=((r"\b(?:far lower|less than)\b",),),
+            fallback=fallbacks[0],
+            fallbacks=fallbacks,
+        )
+        return eng.intent_tail(dc_replace(plan, intent=intent, move_id="F1-COUNTER"), spoken)
+
+    def test_review_the_opener_rule_never_picks_a_second_question(self):
+        # The reply already asked; every quiet option opens with her word: the quiet one stays.
+        tail = self._question_tail(
+            engine(),
+            "Wait, $1,000? Is there some catch?",
+            (
+                "Wait, that's far lower than I expected.",
+                "Okay. Is that really the final number, all in?",
+            ),
+        )
+        self.assertEqual(tail, "Wait, that's far lower than I expected.")
+
+    def test_review_the_opener_rule_is_for_interjections_only(self):
+        tail = self._question_tail(
+            engine(),
+            "I'm surprised by $1,000.",
+            (
+                "I'm surprised, that's far lower than I expected.",
+                "That's a lot less than I thought, honestly.",
+            ),
+        )
+        self.assertEqual(tail, "I'm surprised, that's far lower than I expected.")
+
+
+class EchoedNeedFidelityTests(unittest.TestCase):
+    """Review of simulation diagnosis 1, L1 (b): an echo the guard lets through is no reveal."""
+
+    def _run(self, advisor, reply):
+        s = Session(engine(), reply=reply)
+        s.say(OPENER, 20)
+        s.say(advisor, 120)
+        return s
+
+    def test_his_schedule_phrase_echoed_keeps_fidelity(self):
+        s = self._run("It's flexible, mostly evenings and weekends.", "Evenings and weekends, okay.")
+        self.assertEqual(s.spoken[-1], "Evenings and weekends, okay.")
+        self.assertTrue(s.eng.fidelity()["checks"]["no_unprobed_reveal"])
+
+    def test_her_own_kids_after_his_kids_are_still_held_back(self):
+        s = self._run(
+            "A lot of our learners have kids and full-time jobs.",
+            "I have two kids myself, so time is tight.",
+        )
+        self.assertNotIn("two kids", s.spoken[-1])
+        self.assertTrue(s.eng.fidelity()["checks"]["no_unprobed_reveal"])
+
 
 class EchoGuardWiringTests(unittest.TestCase):
     """Simulation diagnosis 1 (R1_ECHO_GUARD): the engine hands the guard the advisor's words."""

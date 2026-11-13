@@ -3102,7 +3102,10 @@ def echo_ctx(advisor="", **kwargs) -> GuardContext:
     """Simulation diagnosis 1 (R1_ECHO_GUARD): a probe-first learner context after ``advisor``."""
     kwargs.setdefault("probe_first", True)
     return ctx(
-        echo_guard=True, advisor_terms=r1_guard.advisor_terms_in(advisor), **kwargs
+        echo_guard=True,
+        advisor_terms=r1_guard.advisor_terms_in(advisor),
+        advisor_said=(r1_guard.advisor_text_of(advisor),) if advisor else (),
+        **kwargs,
     )
 
 
@@ -3255,6 +3258,128 @@ class DanglingAfterCutTests(unittest.TestCase):
             r1_guard._strip_concession_tag("That's about what I heard, so, I'll give you that.", tidy=True),
             "That's about what I heard.",
         )
+
+
+SPENT_STALLS = (("stall_closer", 3), ("decider_stall", 3), ("money_strain", 3))
+
+
+class EchoGuardReviewTests(unittest.TestCase):
+    """Review of the simulation diagnosis 1 learner fixes (R1_ECHO_GUARD), synthetic text only."""
+
+    def test_l1b_a_single_word_marker_is_never_an_echo(self):
+        context = echo_ctx(
+            "A lot of our learners have kids and full-time jobs.", released_topics=frozenset()
+        )
+        self.assertIn(
+            "volunteered_need", categories("I have two kids myself, so time is tight.", context)
+        )
+
+    def test_l1b_a_marker_phrase_needs_the_advisor_s_whole_phrase(self):
+        # He said "evenings" and "weekends" apart, never the phrase: her phrase is her own.
+        context = echo_ctx(
+            "Some evenings work, and weekends are optional.", released_topics=frozenset()
+        )
+        self.assertIn("volunteered_need", categories("Evenings and weekends, okay.", context))
+        said = echo_ctx(
+            "It's flexible, mostly evenings and weekends.", released_topics=frozenset()
+        )
+        self.assertNotIn("volunteered_need", categories("Evenings and weekends, okay.", said))
+
+    def test_l1b_echoed_topics_for_the_tracker(self):
+        advisor = (r1_guard.advisor_text_of("It's flexible, mostly evenings and weekends."),)
+        self.assertEqual(
+            r1_guard.echoed_need_topics(PERSONA, "Evenings and weekends, okay.", advisor),
+            frozenset({"H3"}),
+        )
+        # Her own marker beside the echo is still hers.
+        self.assertEqual(
+            r1_guard.echoed_need_topics(
+                PERSONA, "Evenings and weekends, with my kids at home.", advisor
+            ),
+            frozenset(),
+        )
+        kids = (r1_guard.advisor_text_of("A lot of our learners have kids."),)
+        self.assertEqual(
+            r1_guard.echoed_need_topics(PERSONA, "I have two kids myself.", kids), frozenset()
+        )
+
+    def test_l1c_a_priority_clause_does_not_cover_a_claim_beside_it(self):
+        for text in (
+            "You guarantee placement, and that matters most to me.",
+            "There's a full refund in the first month, which I care about.",
+            "You offer a money-back guarantee, so I'd want to look at that.",
+            "You guarantee placement and that matters most to me.",
+            "I'd want to see the refund terms, and you guarantee placement.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+        for text in (
+            "The refund policy matters most to me.",
+            "The refund terms are the main thing I'd want to look at.",
+            "I'd want to see placement numbers first.",
+            "Placement support is what I care about.",
+            "I'm worried about the refund terms.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+
+    def test_l1a_evening_and_morning_echoes_are_compared(self):
+        cases = (
+            ("We have live classes.", "Live classes in the evenings would suit me.", True),
+            ("Sessions are recorded.", "Recorded sessions in the mornings help.", True),
+            ("Classes are in the evenings.", "Classes in the evenings would suit me.", False),
+            ("Sessions are recorded, some in the mornings.", "Recorded sessions in the mornings help.", False),
+        )
+        for advisor, learner, hits in cases:
+            with self.subTest(learner=learner):
+                rules = rules_of(learner, echo_ctx(advisor))
+                self.assertEqual("format_or_schedule_claim" in rules, hits)
+
+    def test_l1d_grading_the_call_or_her_is_still_a_leak(self):
+        for text in (
+            "Am I being graded on this like an assignment?",
+            "Is this call graded like a project?",
+            "Are you scoring me the way you score the projects?",
+            "Are you being graded on this call?",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("evaluation", categories(text, echo_ctx()))
+        for text in (
+            "How is the capstone graded?",
+            "Is the project reviewed and graded by mentors?",
+            "How do you grade the assignments?",
+            "Are the projects graded by mentors?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("evaluation", categories(text, echo_ctx()))
+
+    def test_u5_a_that_clause_is_kept_unless_the_cut_clause_came_first(self):
+        context = lambda: echo_ctx(free_reply=True, phrase_counts=SPENT_STALLS)  # noqa: E731
+        for text, kept in (
+            ("That's too much for me, I'll get back to you.", "That's too much for me."),
+            ("That's a lot, and I need to talk it over with my husband.", "That's a lot."),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, context()).text, kept)
+        result = guard_text(
+            "I'll get back to you once I've read it, that suits me better.", context()
+        )
+        self.assertNotIn("suits me better", result.text)
+
+    def test_l5_the_short_reask_keeps_the_question_s_meaning(self):
+        cases = {
+            "Does the course include time with mentors?": "So, time with mentors?",
+            "What do I get if I finish early?": "So, what do I get if I finish early?",
+            "Is there any refund if I drop out?": "So, is there any refund if I drop out?",
+            "And does the price include the mock interviews and the career coaching sessions?": (
+                "So, does the price include the mock interviews and the career coaching sessions?"
+            ),
+            "So how long do I keep the recordings?": "So, how long do I keep the recordings?",
+            "I'm asking, does it come with a certificate?": "So, a certificate?",
+        }
+        for question, short in cases.items():
+            with self.subTest(question=question):
+                self.assertEqual(r1_guard.short_reask(question), short)
 
 
 if __name__ == "__main__":

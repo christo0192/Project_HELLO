@@ -775,10 +775,11 @@ WEEKS_PER_MONTH = 4.33
 # ----------------------------------------------------------------------------------------------
 _TERM = re.compile(r"[a-z0-9]+")
 _TERM_SUFFIXES = ("ings", "ing", "ed", "s")
-# The words that make a sentence a format or schedule claim (``_FORMAT_FACT``), as stems.
-_FORMAT_TERMS = frozenset({"live", "record", "evening", "weekend", "weekday", "morning", "hour"})
-# Words of a deep-need marker that carry no content of their own.
-_MARKER_FILLER = frozenset({"and", "or", "the", "a", "an", "my", "i", "of", "in", "to", "only"})
+# The words that make a sentence a format or schedule claim (``_FORMAT_FACT``), matched as whole
+# words and compared as stems (review: "evenings" stems to "even", so a stem list never held it).
+_FORMAT_WORD = re.compile(
+    r"\b(?:live|record(?:ed|ing|ings|s)?|evenings?|mornings?|weekends?|weekdays?|hours?)\b"
+)
 # A priority or a wish about a policy ("the refund policy matters most to me", "the refund terms
 # are the main thing I'd want to look at") states nothing about the course.
 _POLICY_WISH = re.compile(
@@ -787,13 +788,55 @@ _POLICY_WISH = re.compile(
     r"(?:want|need|like|have) to (?:look at|see|know|check|read|understand|hear about))\b",
     re.IGNORECASE,
 )
+# Review of L1 (c): the wish governs a claim word only in the claim's own clause, either before it
+# ("I'd want to see placement numbers") or with the claim as its subject ("the refund policy
+# matters most to me").  A new subject after a conjunction starts a new clause ("..., and you
+# guarantee placement"), and the subject is a bare noun phrase: no "you", "there's" or verb.
+_NEW_SUBJECT = re.compile(
+    r"\b(?:and|so|which|because|then)\s+(?=(?:you|they|there|we|it|that|this|he|she)\b)",
+    re.IGNORECASE,
+)
+_WISH_CLAUSE_END = re.compile(
+    r"[.?!,;:\n]|\s-+\s|\b(?:but|so|which|because|though|although|while)\b|"
+    r"\band\s+(?=(?:you|they|there|we|it|that|this|he|she|i)\b)",
+    re.IGNORECASE,
+)
+_CLAIM_SUBJECT_LEAD = re.compile(
+    r"\W*(?:(?:the|your|a|an|any|some|their|that|this|my|our|full|real|actual|whole|job|clear|"
+    r"solid|decent|proper|and|or|money-back|placements?|refunds?|guarantees?|success|rate)\s+)*",
+    re.IGNORECASE,
+)
 # How her course work is graded is a question about the course, not about this interview's score.
 _SOFT_EVALUATION = re.compile(
     r"(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|rated|ratings?)", re.IGNORECASE
 )
-_COURSE_WORK = re.compile(
-    r"\b(?:capstone|projects?|assignments?|exams?|quiz(?:zes)?|modules?|homework|coursework|"
-    r"submissions?)\b",
+_COURSE_NOUN = (
+    r"(?:capstones?|projects?|assignments?|exams?|quiz(?:zes)?|modules?|homework|coursework|"
+    r"submissions?)"
+)
+_COURSE_WORK = re.compile(r"\b" + _COURSE_NOUN + r"\b", re.IGNORECASE)
+# Review of L1 (d): the course work is what is graded, as the subject ("How is the capstone
+# graded?", "Is the project reviewed and graded by mentors?") or the object ("How do you grade the
+# assignments?") of the grading word.
+_GRADE_WORD = (
+    r"(?:scor(?:e|es|ed|ing)|grad(?:e|es|ed|ing)|rat(?:e|es|ed|ing)|mark(?:s|ed|ing)?)\b"
+)
+_COURSE_WORK_GRADED = re.compile(
+    r"\b" + _COURSE_NOUN + r"(?:\s+\w+){0,2}?\s+(?:(?:is|are|get|gets|getting|be|being|was|were)"
+    r"\s+)?(?:\w+\s+(?:and|or)\s+)?(?:scored|graded|rated|marked)\b"
+    r"|\b(?:scor|grad|mark)(?:e|es|ed|ing|s)?\s+(?:the|my|our|their|each|every|all|all the)?\s*"
+    r"(?:\w+\s+)?" + _COURSE_NOUN + r"\b",
+    re.IGNORECASE,
+)
+# ... while grading her, the advisor or this call stays a leak ("Are you scoring me ...?", "Is this
+# call graded like a project?", "Am I being graded on this ...?").
+_SELF_GRADED = re.compile(
+    r"\b" + _GRADE_WORD + r"\s+(?:me|us|you|your|this|on this|the (?:call|interview|"
+    r"conversation))\b"
+    r"|\b(?:am i|are we|are you|is this|is it|i'?m|i am|we'?re|you'?re)\b[^.?!]{0,25}?\b"
+    + _GRADE_WORD
+    + r"|\bthis (?:call|interview|conversation|chat)\b"
+    r"|\byour (?:score|scores|grade|grades|marks|rating)\b",
     re.IGNORECASE,
 )
 # Fillers of an echo question ("Wait, $1,000?", "Really?", "Sorry, the mentors?").
@@ -817,6 +860,14 @@ _REASK_TAIL = re.compile(
     re.IGNORECASE,
 )
 REASK_TAIL_WORDS = 5
+# Review of L5: a tail that holds a clause is no noun phrase, and a leading conjunction or "so" goes
+# before "So, ...".
+_REASK_CLAUSE = re.compile(
+    r"\b(?:if|when|whenever|how|whether|why|where|what|who|which|that|i|you|we|they|it|is|are|"
+    r"do|does|did|can|will|would|should|to)\b",
+    re.IGNORECASE,
+)
+_REASK_LEAD = re.compile(r"^(?:(?:and|so|but|then|okay|ok|sorry)\b[,\s]*)+", re.IGNORECASE)
 
 
 def _stem(word: str) -> str:
@@ -835,34 +886,79 @@ def advisor_terms_in(text: object) -> frozenset[str]:
     return frozenset(_stems(text))
 
 
+def advisor_text_of(text: object) -> str:
+    """An advisor turn as the deep-need markers read it, for ``GuardContext.advisor_said``."""
+    return fold(text)
+
+
 def _format_echoed(sentence: str, terms: frozenset[str]) -> bool:
     """Every format or schedule word of ``sentence`` (and an hours figure) is the advisor's."""
-    words = _stems(sentence)
-    needed = {word for word in words if word in _FORMAT_TERMS}
+    lowered = fold(sentence).lower()
+    needed = {_stem(word) for word in _FORMAT_WORD.findall(lowered)}
     if "hour" in needed:
-        needed |= {word for word in words if word.isdigit() or word in _SPELLED}
+        needed |= {word for word in _stems(sentence) if word.isdigit() or word in _SPELLED}
     return bool(needed) and needed <= terms
 
 
-def _marker_echoed(match: re.Match[str], terms: frozenset[str]) -> bool:
-    """The deep-need marker's own words ("evenings and weekends") are all the advisor's."""
-    words = {word for word in _stems(match.group(0)) if word not in _MARKER_FILLER}
-    return bool(words) and words <= terms
+def _marker_echoed(
+    pattern: re.Pattern[str], match: re.Match[str], advisor_said: tuple[str, ...]
+) -> bool:
+    """L1 (b): the marker is a phrase ("evenings and weekends") the advisor's own words match.
+
+    A one-word marker ("kids", "loans") is never an echo: her own deep need is told in it whether
+    or not he said the word.
+    """
+    return len(match.group(0).split()) >= 2 and any(
+        pattern.search(said) is not None for said in advisor_said
+    )
+
+
+def echoed_need_topics(
+    persona: RenderedPersona, text: object, advisor_said: tuple[str, ...]
+) -> frozenset[str]:
+    """The deep-need topics whose every marker in ``text`` echoes the advisor (L1 (b)).
+
+    The guard lets such an echo through, so the reveal bookkeeping must not count it as a need
+    told before it was asked about (``NeedGate.note_learner_text``'s ``echoed``).
+    """
+    folded = fold(text)
+    topics: set[str] = set()
+    for topic in H_TOPICS:
+        found = [
+            (pattern, match)
+            for pattern in persona.markers(topic)
+            for match in pattern.finditer(folded)
+        ]
+        if found and all(_marker_echoed(p, m, advisor_said) for p, m in found):
+            topics.add(topic)
+    return frozenset(topics)
+
+
+def _wish_governs(sentence: str, match: re.Match[str]) -> bool:
+    """Review of L1 (c): a wish or an indirect question governs this claim word in its clause."""
+    before = _NEW_SUBJECT.split(clause_before(sentence, match.start()))[-1]
+    if _NOT_ASSERTED.search(before) is not None or _POLICY_WISH.search(before) is not None:
+        return True
+    if _CLAIM_SUBJECT_LEAD.fullmatch(before) is None:
+        return False  # "You guarantee ...", "There's a full refund ...": the claim is asserted
+    after = _WISH_CLAUSE_END.split(sentence[match.end() :], maxsplit=1)[0]
+    return _POLICY_WISH.search(after) is not None
 
 
 def _claim_not_asserted(sentence: str) -> bool:
-    """A policy or outcome word in a wish, a priority or an indirect question (L1 (c))."""
-    if _POLICY_WISH.search(sentence) is not None:
-        return True
-    match = _CLAIM_WORDS.search(sentence)
-    if match is None:
-        return False
-    return _NOT_ASSERTED.search(clause_before(sentence, match.start())) is not None
+    """A policy or outcome word in a wish, a priority or an indirect question (L1 (c)).
+
+    Every claim word of the sentence must be governed: a priority clause beside a claim ("You
+    guarantee placement, and that matters most to me.") covers nothing.
+    """
+    matches = list(_CLAIM_WORDS.finditer(sentence))
+    return bool(matches) and all(_wish_governs(sentence, match) for match in matches)
 
 
 def _course_work_graded(sentence: str) -> bool:
-    """L1 (d): only grading words, about her course work ("How is the capstone graded?")."""
-    if _COURSE_WORK.search(sentence) is None:
+    """L1 (d): only grading words, about how her course work is graded ("How is the capstone
+    graded?"), never about her, the advisor or this call."""
+    if _COURSE_WORK_GRADED.search(sentence) is None or _SELF_GRADED.search(sentence) is not None:
         return False
     return all(
         _SOFT_EVALUATION.fullmatch(match.group(0)) is not None
@@ -888,14 +984,23 @@ def offers_choice(text: object) -> bool:
 
 
 def short_reask(question: str) -> str:
-    """L5: her question asked again in fewer words ("So, time with mentors?")."""
+    """L5: her question asked again in fewer words ("So, time with mentors?").
+
+    Only a noun-phrase tail is shortened ("What do I get if I finish early?" keeps its "if"
+    clause: "So, if I finish early?" asks something else); otherwise she asks it again whole, as
+    her own re-ask ("So, is there any refund if I drop out?"), never asking him to repeat himself.
+    """
     match = _REASK_TAIL.search(question)
     if match is not None:
         tail = match.group("tail").strip().rstrip(",")
-        if 1 <= word_count(tail) <= REASK_TAIL_WORDS:
+        if 1 <= word_count(tail) <= REASK_TAIL_WORDS and _REASK_CLAUSE.search(tail) is None:
             return f"So, {tail}?"
-    body = question.strip()
-    return "Sorry, just that one again: " + body[:1].lower() + body[1:]
+    body = _REASK_LEAD.sub("", question.strip(), count=1)
+    if not body:
+        return question
+    if not re.match(r"I\b", body):
+        body = body[:1].lower() + body[1:]
+    return f"So, {body}"
 
 
 def durations_said(text: object) -> frozenset[float]:
@@ -1179,6 +1284,9 @@ class GuardContext:
     # so "I'll reach out myself" answers it and is no stall closer (U5).
     echo_guard: bool = False
     advisor_terms: frozenset[str] = frozenset()
+    # The advisor's latest turns, folded (``advisor_text_of``; memory only): a deep-need marker
+    # phrase is an echo only when his own words match it (review of L1 (b)).
+    advisor_said: tuple[str, ...] = ()
     asked_her: bool = False
     choice_offered: bool = False
 
@@ -1602,14 +1710,16 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
             if topic in ctx.released_topics or topic in ctx.spent_topics:
                 continue
             matches = [
-                match
-                for match in (pattern.search(sentence) for pattern in persona.markers(topic))
-                if match is not None
+                (pattern, match)
+                for pattern in persona.markers(topic)
+                for match in pattern.finditer(sentence)
             ]
             if ctx.echo_guard and matches:
                 # Simulation diagnosis 1 (L1 (b)): "evenings and weekends" right after the advisor
-                # said it is his schedule echoed, not her deep need told.
-                matches = [m for m in matches if not _marker_echoed(m, ctx.advisor_terms)]
+                # said that phrase is his schedule echoed, not her deep need told.
+                matches = [
+                    (p, m) for p, m in matches if not _marker_echoed(p, m, ctx.advisor_said)
+                ]
             if matches:
                 hits.append(_hit(VOLUNTEERED_NEED, topic, sentence))
                 break
@@ -1924,9 +2034,13 @@ class StreamGuard:
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
                 continue
             if self._stall_blocked(key):
+                cut_first = _first_clause_matches(text, pattern)
                 text = _without_clauses(text, pattern)
-                if text and ctx.echo_guard and _points_back(text):
-                    # U5: "That suits me better." is left pointing at the clause just cut.
+                if text and ctx.echo_guard and cut_first and _points_back(text):
+                    # U5: "I'll reach out myself ..., that suits me better." leaves "That suits me
+                    # better." pointing at the clause just cut before it.  A "that" clause the cut
+                    # came after ("That's too much for me, I'll get back to you.") points at what
+                    # the advisor said and is her reaction: it stays (review of U5).
                     text = ""
                 if not text:
                     return ""
@@ -2386,6 +2500,12 @@ def _without_clauses(text: str, pattern: re.Pattern[str]) -> str:
     if word_count(out) < 3:
         return ""
     return out[0].upper() + out[1:] + end
+
+
+def _first_clause_matches(text: str, pattern: re.Pattern[str]) -> bool:
+    """U5: the first comma-separated clause of ``text`` is one ``_without_clauses`` cuts."""
+    parts = [part for part in _CLAUSE_SPLIT.split(text.rstrip().rstrip(".?!")) if part.strip()]
+    return bool(parts) and pattern.search(parts[0]) is not None
 
 
 def _points_back(text: str) -> bool:

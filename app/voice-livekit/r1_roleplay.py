@@ -137,8 +137,10 @@ from r1_guard import (
     GuardResult,
     StreamGuard,
     advisor_terms_in,
+    advisor_text_of,
     course_length_unsaid,
     durations_said,
+    echoed_need_topics,
     guard_text,
     has_concession,
     hours_said,
@@ -1198,6 +1200,7 @@ class RolePlayEngine:
         # Simulation diagnosis 1 (R1_ECHO_GUARD): the word stems of the advisor's latest turns
         # (memory only, never logged), and whether this turn's question offered her a choice.
         self._advisor_term_turns: list[frozenset[str]] = []
+        self._advisor_said_turns: list[str] = []
         self._choice_offered = False
         # Simulation diagnosis 1 (R1_PRICE_ASKED_ONCE, L3): the turn of her last final-price
         # question and how many offers the negotiation held then (None: none asked).
@@ -1620,6 +1623,7 @@ class RolePlayEngine:
             advisor_terms=(
                 frozenset().union(*self._advisor_term_turns) if phase == "roleplay" else frozenset()
             ),
+            advisor_said=tuple(self._advisor_said_turns) if phase == "roleplay" else (),
             asked_her=(
                 self._turn_ask is not None
                 or RESPOND_QUESTION in self._turn_kinds
@@ -2031,6 +2035,10 @@ class RolePlayEngine:
         self._advisor_term_turns = [
             *self._advisor_term_turns[-(ADVISOR_TERM_TURNS - 1) :],
             advisor_terms_in(reading),
+        ]
+        self._advisor_said_turns = [
+            *self._advisor_said_turns[-(ADVISOR_TERM_TURNS - 1) :],
+            advisor_text_of(reading),
         ]
         self._choice_offered = offers_choice(reading)
         if self._probe_first:
@@ -5162,13 +5170,20 @@ class RolePlayEngine:
                 candidates = (*quiet, *stripped, *candidates)
         chosen = next((text for text in candidates if not _repeats(text, said)), candidates[0])
         opener = _first_word(spoken_so_far)
-        if self._markers_v2 and opener and _first_word(chosen) == opener:
+        if self._markers_v2 and opener in _TAIL_OPENERS and _first_word(chosen) == opener:
             # Simulation diagnosis 1 (U2): "Wait, $1,000? ... Wait, that's far lower than I
-            # expected." A tail never opens with the word her reply opened with.
+            # expected." A tail never opens with the interjection her reply opened with.  Review:
+            # a reply that already asked keeps to the question-free options (no second question
+            # comes back through this rule); with none left the first choice stands.
+            pool = (
+                tuple(text for text in candidates if "?" not in text)
+                if "?" in spoken_so_far
+                else candidates
+            )
             chosen = next(
                 (
                     text
-                    for text in candidates
+                    for text in pool
                     if _first_word(text) != opener and not _repeats(text, said)
                 ),
                 chosen,
@@ -5647,7 +5662,14 @@ class RolePlayEngine:
             self._phrase_history.append(phrases)
             for key in phrases:
                 self._phrases[key] = self._phrases.get(key, 0) + 1
-        self.tracker.note_learner_text(spoken_text, plan.turn)
+        # Review of simulation diagnosis 1, L1 (b): a deep-need phrase the guard let through as
+        # the advisor's own words echoed is no need told before it was asked about.
+        echoed = (
+            echoed_need_topics(self.persona, spoken_text, tuple(self._advisor_said_turns))
+            if flag_on(FLAG_ECHO_GUARD)
+            else frozenset()
+        )
+        self.tracker.note_learner_text(spoken_text, plan.turn, echoed=echoed)
         if spoken_text.strip():
             self._note_open_question(plan, spoken_text)  # M032 SWEEP-7
             if asked_who_is_calling(spoken_text):
@@ -6166,6 +6188,14 @@ def _without_questions(text: str) -> str:
 def _repeats(text: str, said: tuple[str, ...]) -> bool:
     """True when any sentence of ``text`` repeats something in ``said`` (``repeat_kind``)."""
     return any(repeat_kind(sentence, said) is not None for sentence in split_sentences(text))
+
+
+# Simulation diagnosis 1 (U2), review: the interjections a tail must not open with twice ("Wait,
+# ... Wait, ..."); a common opener such as "I'm" or "That's" is no tic.
+_TAIL_OPENERS = frozenset(
+    {"wait", "okay", "ok", "really", "oh", "hmm", "hm", "so", "well", "right", "sorry", "alright",
+     "look", "huh", "um", "uh"}
+)
 
 
 def _first_word(text: object) -> str:
