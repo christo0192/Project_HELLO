@@ -863,12 +863,14 @@ def learner_prefix(
     offer_realism: bool = False,
     probe_first: bool = False,
     price_check: bool = False,
+    timeline_v2: bool = False,
 ) -> str:
     """The learner's system prefix: behaviour rules plus the persona's public card.
 
     ``offer_realism`` (SWEEP-13), ``probe_first`` (S2P, SWEEP-17: the card and the course sentence)
     and ``price_check`` (SWEEP-21: the "never correct the advisor" clause) are latched per session
     by the engine, so the prefix stays byte-stable for the session (the DeepSeek cache prefix).
+    ``timeline_v2`` (SWEEP-8, latched the same way) is the card's timeline wording.
     With all of them off the prefix is the release before them, byte for byte.
     """
     course = PREFIX_COURSE_SENTENCE_V2 if probe_first else PREFIX_COURSE_SENTENCE
@@ -909,7 +911,7 @@ def learner_prefix(
         + "Do not volunteer worries, deadlines, money details or personal circumstances "
         "beyond your card. Share the extra detail a system note allows, and only then.\n"
         + CARD_MARKER
-        + persona.public_card_text(probe_first=probe_first)
+        + persona.public_card_text(probe_first=probe_first, timeline_v2=timeline_v2)
     )
 
 

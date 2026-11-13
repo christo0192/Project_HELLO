@@ -348,13 +348,14 @@ def llm_messages(
     )
     if reply.plan is not None:
         return assemble_messages(
-            # M032 SWEEP-13, SWEEP-17 and SWEEP-21: the session's latched prefix (byte-stable for
+            # M032 SWEEP-8, SWEEP-13, SWEEP-17 and SWEEP-21: the session's latched prefix (byte-stable for
             # the whole session).
             learner_prefix(
                 persona,
                 offer_realism=reply.plan.offer_realism,
                 probe_first=reply.plan.probe_first,
                 price_check=reply.plan.price_check,
+                timeline_v2=reply.plan.timeline_v2,
             ),
             select_context(ordered, ROLEPLAY_PHASE),
             reply.candidate_text,

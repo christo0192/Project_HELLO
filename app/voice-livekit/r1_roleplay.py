@@ -991,6 +991,8 @@ class TurnPlan:
     probe_first: bool = False
     price_check: bool = False
     probe: str | None = None
+    # M032 SWEEP-8: the session's latched card timeline (``learner_prefix(timeline_v2=...)``).
+    timeline_v2: bool = False
     # M032 S3: a scripted LEARNER line the session says before this aside (S3.4: her one-line
     # hang-up before Christy's question), and whether the learner carries on right after the aside
     # (S3.3's resume and SWEEP-24's last point: the session asks ``continuation_plan``).
@@ -1219,6 +1221,8 @@ class RolePlayEngine:
         # M032 S2P (SWEEP-17, SWEEP-21): latched for the session as well (see below).
         self._probe_first = flag_on(FLAG_PROBE_FIRST)
         self._price_conflict = flag_on(FLAG_PRICE_CONFLICT)
+        # M032 SWEEP-8: the card's timeline wording, latched for the session as well.
+        self._timeline_v2 = flag_on(FLAG_PERSONA_TIMELINE_V2)
         self._learner_control = control_prose(self.learner_prefix_text())
         # Item 7: the coach aside just played (the next reply carries on, no new greeting).
         self._after_coach = False
@@ -1350,6 +1354,7 @@ class RolePlayEngine:
             offer_realism=self._offer_realism,
             probe_first=self._probe_first,
             price_check=self._price_conflict,
+            timeline_v2=self._timeline_v2,
         )
 
     def _price_probe_answer_due(self, turn: int, *, before_anchor: bool = True) -> bool:
@@ -4970,6 +4975,7 @@ class RolePlayEngine:
             probe_first=self._probe_first,
             price_check=self._price_conflict,
             probe=probe,
+            timeline_v2=self._timeline_v2,
         )
 
     # ---------------------------------------------------------------------- speech

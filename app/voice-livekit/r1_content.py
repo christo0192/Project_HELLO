@@ -438,10 +438,16 @@ def _endings() -> dict[str, Any]:
     }
 
 
-def _learner_followups() -> dict[str, Any]:
+def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
     """M032 S7L (revision 25): the learner follow-ups' new texts, beside the ones they replace."""
     p = r1_prompts
     return {
+        # SWEEP-8: the card's timeline wording (latched per session) and a prefix rendered with it.
+        "backstory_timeline_v2": dict(r1_personas.BACKSTORY_TIMELINE_V2),
+        "success_answer_v2": r1_personas.SUCCESS_ANSWER_V2,
+        "learner_prefix_timeline_v2_sample": p.learner_prefix(
+            sample, offer_realism=True, probe_first=True, price_check=True, timeline_v2=True
+        ),
         # SWEEP-15: the cut notes without a frame to narrate.
         "interrupted_note_v2": p.INTERRUPTED_NOTE_V2,
         "cut_repeat_note_v2": p.CUT_REPEAT_NOTE_V2,
@@ -726,7 +732,7 @@ def manifest() -> dict[str, Any]:
             "learner_voice_v2": _learner_voice_v2(sample),
             "probe_first": _probe_first(sample),
             "endings": _endings(),
-            "learner_followups": _learner_followups(),
+            "learner_followups": _learner_followups(sample),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

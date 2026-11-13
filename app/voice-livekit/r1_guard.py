@@ -86,6 +86,7 @@ from r1_personas import (
     MONTHLY_BUDGET_MAX_USD,
     PERSONAS,
     PUBLIC_ANSWERS,
+    SUCCESS_ANSWER_V2,
     RenderedPersona,
 )
 from r1_script import EXIT_CUE, LINES
@@ -1518,7 +1519,9 @@ def _is_card_answer(sentence: str, persona: RenderedPersona | None) -> bool:
 
 
 def _card_texts(persona: RenderedPersona) -> list[str]:
+    # M032 SWEEP-8: both card wordings stay allowed, so a session on either release is clean.
     answers = [answer for _, answer in PUBLIC_ANSWERS]
+    answers.append(SUCCESS_ANSWER_V2)
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)
     answers.append(persona.decider_answer)

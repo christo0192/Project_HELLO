@@ -9385,7 +9385,10 @@ class ProbeFirstCardAndPrefixTests(unittest.TestCase):
         with mock.patch.dict(r1_roleplay.os.environ, S2P_OFF):
             eng = engine()
         offer_realism = eng._offer_realism
-        self.assertEqual(eng.learner_prefix_text(), P2.learner_prefix(P1, offer_realism=offer_realism))
+        self.assertEqual(
+            eng.learner_prefix_text(),
+            P2.learner_prefix(P1, offer_realism=offer_realism, timeline_v2=eng._timeline_v2),
+        )
         self.assertIn("You know only that it is around $9,000 and about 6 months.", P1.public_card_text())
         self.assertIn(P2.PREFIX_COURSE_SENTENCE, eng.learner_prefix_text())
         self.assertIn("any offer, and never correct the advisor. About the course", eng.learner_prefix_text())
@@ -9403,6 +9406,7 @@ class ProbeFirstCardAndPrefixTests(unittest.TestCase):
             offer_realism=plan.offer_realism,
             probe_first=plan.probe_first,
             price_check=plan.price_check,
+            timeline_v2=plan.timeline_v2,
         )
         self.assertEqual(rebuilt, before)
 
@@ -11540,6 +11544,34 @@ class CutNoteFrameTests(unittest.TestCase):
         )
         print(f"\nSWEEP-15 report: {hits} META_CUT sentence(s) in {len(spoken)} learner lines")
         self.assertEqual(hits, 0)
+
+
+class PersonaTimelineLatchTests(unittest.TestCase):
+    """M032 SWEEP-8 (flag R1_PERSONA_TIMELINE_V2): read once when the engine is built."""
+
+    def test_the_card_timeline_is_latched_for_the_session(self):
+        eng = engine()
+        prefix = eng.learner_prefix_text()
+        self.assertIn("You are at home after work when they call", prefix)
+        self.assertIn('"Moving into a data role."', prefix)
+        plan = eng.plan_turn(OPENER, 20)
+        self.assertTrue(plan.timeline_v2)
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PERSONA_TIMELINE_V2": "0"}):
+            later = eng.plan_turn(PITCH, 40)
+            self.assertTrue(later.timeline_v2)  # latched: the prefix stays byte-stable
+            self.assertEqual(eng.learner_prefix_text(), prefix)
+
+    def test_flag_off_builds_the_card_of_the_release_before(self):
+        from r1_prompts import learner_prefix
+
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PERSONA_TIMELINE_V2": "0"}):
+            eng = engine()
+        self.assertFalse(eng.plan_turn(OPENER, 20).timeline_v2)
+        self.assertEqual(
+            eng.learner_prefix_text(),
+            learner_prefix(P1, offer_realism=True, probe_first=True, price_check=True),
+        )
+        self.assertIn("You are calling from home after work", eng.learner_prefix_text())
 
 if __name__ == "__main__":
     unittest.main()

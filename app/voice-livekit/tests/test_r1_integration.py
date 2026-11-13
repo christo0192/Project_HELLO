@@ -586,16 +586,24 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                         {m["role"] for m in messages} <= {"system", "user", "assistant"}
                     )
                     # The session's latched prefix (M032 SWEEP-13 R1_OFFER_REALISM, S2P
-                    # R1_PROBE_FIRST and R1_PRICE_CONFLICT, each default on).
+                    # R1_PROBE_FIRST and R1_PRICE_CONFLICT, S7L R1_PERSONA_TIMELINE_V2, each
+                    # default on).
                     self.assertTrue(plan.offer_realism)
                     self.assertTrue(plan.probe_first)
+                    self.assertTrue(plan.timeline_v2)
                     self.assertEqual(
                         messages[0]["content"],
                         learner_prefix(
-                            rendered, offer_realism=True, probe_first=True, price_check=True
+                            rendered,
+                            offer_realism=True,
+                            probe_first=True,
+                            price_check=True,
+                            timeline_v2=True,
                         ),
                     )
-                    self.assertIn(rendered.public_card_text(probe_first=True), blob)
+                    self.assertIn(
+                        rendered.public_card_text(probe_first=True, timeline_v2=True), blob
+                    )
                     # M032 S2P (D-M032-7): she knows no course figure; she asks the advisor.
                     self.assertNotIn("$9,000", blob)
                     self.assertNotIn("6 months", blob)
@@ -646,7 +654,11 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
             {
                 "role": "system",
                 "content": learner_prefix(
-                    rig.persona, offer_realism=True, probe_first=True, price_check=True
+                    rig.persona,
+                    offer_realism=True,
+                    probe_first=True,
+                    price_check=True,
+                    timeline_v2=True,
                 ),
             },
         )

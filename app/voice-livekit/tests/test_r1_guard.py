@@ -3004,5 +3004,27 @@ class CommitReactionGuardTests(unittest.TestCase):
         self.assertFalse(ledger.flagged)
 
 
+
+class PersonaTimelineGuardTests(unittest.TestCase):
+    """M032 SWEEP-8: both card wordings stay allowed, and the v2 card's own words are clean."""
+
+    def test_both_success_answers_pass_in_an_acknowledgement(self):
+        context = ctx(mode="ack")
+        for answer in ("A data role within a year.", "Moving into a data role."):
+            with self.subTest(answer=answer):
+                self.assertTrue(guard_text(answer, context).clean, answer)
+
+    def test_her_home_line_passes_with_the_v2_prefix(self):
+        from r1_prompts import control_prose, learner_prefix
+
+        context = ctx(control_texts=(control_prose(learner_prefix(PERSONA, timeline_v2=True)),))
+        for allowed in (
+            "Honestly, I'm at home after work.",
+            "I went to one of your webinars last month.",
+            "Moving into a data role.",
+        ):
+            with self.subTest(allowed=allowed):
+                self.assertTrue(guard_text(allowed, context).clean, allowed)
+
 if __name__ == "__main__":
     unittest.main()

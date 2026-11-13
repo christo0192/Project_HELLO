@@ -57,6 +57,24 @@ PUBLIC_ANSWERS: tuple[tuple[str, str], ...] = (
     ("hours a week you could give it", AVAILABILITY_ANSWER),
     ("your e-mail, phone number or any contact detail", CONTACT_ANSWER),
 )
+# M032 SWEEP-8 (flag R1_PERSONA_TIMELINE_V2, latched per session by the engine: it changes the card,
+# which is in the DeepSeek cache prefix).  "A data role within a year." competed with p2's own
+# deadline (a contract renewal in about six months) and handed the model a timeline for a pinned H1
+# probe, so the goal names no time span and no urgency.  New wording under D-M032-4, listed for
+# review.
+SUCCESS_ANSWER = "A data role within a year."
+SUCCESS_ANSWER_V2 = "Moving into a data role."
+PUBLIC_ANSWERS_V2: tuple[tuple[str, str], ...] = tuple(
+    (label, SUCCESS_ANSWER_V2 if answer == SUCCESS_ANSWER else answer)
+    for label, answer in PUBLIC_ANSWERS
+)
+
+
+def public_answers(*, timeline_v2: bool = False) -> tuple[tuple[str, str], ...]:
+    """The card's shared short answers (SWEEP-8: ``timeline_v2`` swaps in the timeless goal)."""
+    return PUBLIC_ANSWERS_V2 if timeline_v2 else PUBLIC_ANSWERS
+
+
 # The top of the card's monthly budget ("Around $500-700 a month."): a monthly payment above it is
 # never "workable" for the learner (``r1_guard``: ``over_budget_accepted``).
 MONTHLY_BUDGET_MAX_USD = 700
@@ -687,13 +705,16 @@ class RenderedPersona:
             amount for _label, answer in self.work_answers for amount in dollar_amounts(answer)
         )
 
-    def public_card_text(self, *, probe_first: bool = False) -> str:
+    def public_card_text(self, *, probe_first: bool = False, timeline_v2: bool = False) -> str:
         """Everything the learner prompt may say about the persona; no deep need.
 
         M032 S2P (D-M032-7, SWEEP-17; ``probe_first``, the engine's latched R1_PROBE_FIRST): the
         card holds no course figure.  She saw a price on the website but cannot quote it, and she
         knows nothing else about the course; the $9,000 reaches her only through a per-turn note on
         the check or conflict path.  With ``probe_first`` off the card is the release before it.
+
+        M032 SWEEP-8 (``timeline_v2``, the engine's latched R1_PERSONA_TIMELINE_V2): she is at home
+        when they call, her webinar is dated, and her goal names no deadline.
         """
         knows = CARD_COURSE_KNOWLEDGE_V2 if probe_first else CARD_COURSE_KNOWLEDGE
         parts = [
@@ -706,17 +727,18 @@ class RenderedPersona:
             "The Program Advisor is calling you back about that form, and you answered the "
             "phone: you did not call them.",
         ]
-        if self.persona.backstory:
+        backstory = backstory_lines(self.persona, timeline_v2=timeline_v2)
+        if backstory:
             parts.append(
                 "Your backstory (all true; use it in your own words for small talk or when "
                 "the advisor asks about you, and never recite it):"
             )
-            parts.extend(f"- {fact}" for fact in self.persona.backstory)
+            parts.extend(f"- {fact}" for fact in backstory)
         parts.append("Short answers, to give only when asked and never to expand on:")
         for topic in H_TOPICS:
             parts.append(f'- {TOPIC_LABELS[topic]}: "{self.surface(topic)}"')
         parts.append(f'- what you have studied so far: "{self.persona.prior_learning}"')
-        for label, answer in PUBLIC_ANSWERS:
+        for label, answer in public_answers(timeline_v2=timeline_v2):
             parts.append(f'- {label}: "{answer}"')
         parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
         for label, answer in self.work_answers:
@@ -733,6 +755,32 @@ class RenderedPersona:
             "the course: you do not know it, so ask the advisor."
         )
         return "\n".join(parts)
+
+
+# M032 SWEEP-8 (flag R1_PERSONA_TIMELINE_V2): the backstory lines that contradicted the card or had
+# no time anchor, and their replacements.  p1 said she was "calling from home" on the same card that
+# says she did not call them, and talked as if she had called; p1's and p3's webinars had no date,
+# unlike p2's and p4's.  p1 uses "last month", never "weeks": her H2 marker is "three weeks".
+BACKSTORY_TIMELINE_V2: dict[str, str] = {
+    "You saw the Interview Kickstart webinar announcement on LinkedIn and registered.": (
+        "You went to an Interview Kickstart webinar last month, after seeing it on "
+        "LinkedIn."
+    ),
+    "You are calling from home after work, a bit tired but friendly.": (
+        "You are at home after work when they call, a bit tired but friendly."
+    ),
+    "You registered for an Interview Kickstart webinar after a colleague mentioned it.": (
+        "You went to an Interview Kickstart webinar a few weeks ago, after a colleague "
+        "mentioned it."
+    ),
+}
+
+
+def backstory_lines(persona: Persona, *, timeline_v2: bool = False) -> tuple[str, ...]:
+    """The persona's public backstory (SWEEP-8: ``timeline_v2`` swaps in the timeline lines)."""
+    if not timeline_v2:
+        return persona.backstory
+    return tuple(BACKSTORY_TIMELINE_V2.get(fact, fact) for fact in persona.backstory)
 
 
 _MARKER_CACHE: dict[tuple[str, str], tuple[re.Pattern[str], ...]] = {}
