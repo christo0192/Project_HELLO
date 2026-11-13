@@ -1705,5 +1705,533 @@ class PushAnsweredByTopicTests(unittest.TestCase):
                         self.assertLessEqual(delivery.slip_sec, 60.0, delivery)
 
 
+# M032 S1 (owner decision D-M032-1): while the plan has slack, an owed primary whose topic did not
+# come up waits for a natural moment.  Synthetic advisor turns, shaped like the owner's session
+# (fda9e9f6 #49: an offer to put the husband on the call got the F2 primary on the idle fuse).
+OFFER_TURN = "Sure, if he is around, I can bring him into a joint call and go over it all with him."
+BACKOFF_TURN = "Fine, discuss it with your family and come back to me whenever you are ready."
+DIRECT_QUESTION = "So which number would suit you?"
+
+
+def idle_three(s: OwedMoveScheduler) -> float:
+    """F3 done, then two quiet turns: the third quiet turn is F2's idle-fuse turn (returns its R)."""
+    r = through_f3(s)
+    turn(s, NEUTRAL, r)
+    turn(s, NEUTRAL, r + 40)
+    return r + 80
+
+
+class NaturalMomentTests(unittest.TestCase):
+    """D-M032-1: the idle path of a primary waits for a natural moment while the plan has slack."""
+
+    def test_the_idle_gap_constants(self):
+        self.assertEqual(sched.IDLE_GAP_TURNS, 3)  # SLACK_TURNS_PER_MOVE derives from it
+        self.assertEqual(sched.IDLE_GAP_SLACK_TURNS, 5)
+
+    def test_no_moment_is_today_s_idle_fuse(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(OFFER_TURN, r)
+        self.assertEqual(s.select(r).id, F2_PRIMARY)
+        self.assertEqual(s.select(r, moment=None).id, F2_PRIMARY)
+
+    def test_an_open_thread_holds_the_idle_primary_while_there_is_slack(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(OFFER_TURN, r)
+        self.assertIsNone(s.select(r, moment=sched.Moment(slack_ok=True, thread_open=True)))
+        # Without slack the idle fuse fires exactly as before, open thread or not.
+        moment = sched.Moment(slack_ok=False, thread_open=True)
+        self.assertEqual(s.select(r, moment=moment).id, F2_PRIMARY)
+
+    def test_a_closed_thread_or_a_handed_floor_fires_the_idle_primary(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(PITCH, r)
+        for moment in (
+            sched.Moment(slack_ok=True, thread_closed=True),
+            sched.Moment(slack_ok=True, floor_offered=True),
+            sched.Moment(slack_ok=True, floor_offered=True, thread_open=True),
+        ):
+            with self.subTest(moment=moment):
+                self.assertEqual(s.select(r, moment=moment).id, F2_PRIMARY)
+
+    def test_with_slack_and_no_moment_the_primary_waits_for_the_longer_gap(self):
+        s = make()
+        r = idle_three(s)  # gap 3
+        quiet = sched.Moment(slack_ok=True)
+        s.observe_candidate_turn(SHORT, r)
+        self.assertIsNone(s.select(r, moment=quiet))
+        s.observe_candidate_turn(SHORT, r + 40)  # gap 4
+        self.assertIsNone(s.select(r + 40, moment=quiet))
+        # An open thread holds it below the longer gap ...
+        held = sched.Moment(slack_ok=True, thread_open=True)
+        self.assertIsNone(s.select(r + 40, moment=held))
+        s.observe_candidate_turn(SHORT, r + 80)  # gap 5
+        self.assertEqual(s.select(r + 80, moment=quiet).id, F2_PRIMARY)
+        # ... and no longer (review S1-R2): an advisor who puts something to her every turn keeps a
+        # thread open on every turn, and an unbounded wait spent the plan's whole buffer.
+        self.assertEqual(s.select(r + 80, moment=held).id, F2_PRIMARY)
+
+    def test_the_cautious_pace_is_the_slowest_recent_turn(self):
+        """Review S1-R2: the S1 waits judge slack at the slowest of the last four turns, so the
+        first slow exchange after a fast stretch counts at once."""
+        s = make()
+        for r in (20, 40, 60, 80):
+            s.observe_candidate_turn(SHORT, r)
+        self.assertEqual((s.lookahead_sec, s.cautious_lookahead_sec), (20.0, 20.0))
+        s.observe_candidate_turn(SHORT, 145)  # one 65 s exchange
+        self.assertEqual(s.lookahead_sec, (20 + 20 + 20 + 65) / 4)
+        self.assertEqual(s.cautious_lookahead_sec, 65.0)
+        s.observe_candidate_turn(SHORT, 400)  # clamped like the average
+        self.assertEqual(s.cautious_lookahead_sec, sched.LOOKAHEAD_MAX_SEC)
+
+    def test_a_fresh_topic_still_fires_even_on_an_open_thread(self):
+        s = make()
+        r = idle_three(s)
+        s.observe_candidate_turn(SCHEDULE_TALK, r)
+        moment = sched.Moment(slack_ok=True, thread_open=True)
+        self.assertEqual(s.select(r, moment=moment).id, F2_PRIMARY)
+
+    def test_spacing_and_the_forced_path_are_unchanged(self):
+        s = make()
+        r = through_f3(s)
+        s.observe_candidate_turn(SCHEDULE_TALK, r)  # topic fresh but one turn after the push
+        self.assertIsNone(s.select(r, moment=sched.Moment(slack_ok=True, floor_offered=True)))
+        late = make()
+        turn(late, OPENER, 20)
+        turn(late, PITCH, 60)  # F3 primary
+        self.assertEqual(turn(late, NEUTRAL, 490).id, F3_PUSH)
+        late.observe_candidate_turn(OFFER_TURN, 600)
+        move = late.select(600, moment=sched.Moment(slack_ok=True, thread_open=True))
+        self.assertEqual((move.id, move.forced), (F2_PRIMARY, True))
+
+    def test_a_push_is_not_held_by_the_moment(self):
+        s = make()
+        turn(s, OPENER, 20)
+        turn(s, PITCH, 60)  # F3 primary
+        s.observe_candidate_turn(OFFER_TURN, 100)
+        move = s.select(100, moment=sched.Moment(slack_ok=True, thread_open=True))
+        self.assertEqual(move.id, F3_PUSH)
+
+    def test_unissue_gives_back_one_issue(self):
+        s = make()
+        turn(s, OPENER, 20)
+        s.observe_candidate_turn(PITCH, 60)
+        move = s.next_move(60)
+        self.assertEqual(s._states[move.id].issued, 1)
+        s.unissue(move.id)
+        self.assertEqual(s._states[move.id].issued, 0)
+        s.unissue(move.id)  # never below zero
+        self.assertEqual(s._states[move.id].issued, 0)
+        s.unissue("NOT-A-MOVE")  # unknown ids are ignored
+
+
+class AdvisorTurnReaderTests(unittest.TestCase):
+    """M032 S1 readers of the advisor's turn: an offer, a back-off and a question put to her."""
+
+    def test_offers(self):
+        for text in (
+            OFFER_TURN,
+            "I can send you the recordings of a sample class.",
+            "If you like, I can share a few alumni stories with you.",
+            "Let me set up a demo class for you this week.",
+            "Would you like me to set up a demo class for you?",
+            "I'll put your husband on the call as well, no problem.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.offers_something(text))
+
+    def test_not_offers(self):
+        for text in (
+            PITCH,
+            NEUTRAL,
+            SCHEDULE_TALK,
+            "We send you the recordings after every class.",
+            "We will send you a certificate at the end of the program.",
+            "You'll build three portfolio projects.",
+            "We can coach you for interviews at top companies.",
+            # The programme described ("we can ..."), as the advisor corpus nearly always means it.
+            "We can arrange a short session with one of our mentors for you.",
+            "If you miss a class, we can set up a quick catch-up session for you on Sunday.",
+            # Price, a discount, a free trial or enrolling: the negotiation reads these.
+            "I can't go down to $7,000, but I can take $1,000 off on the upfront plan.",
+            "I can throw in a free month if you sign up this week.",
+            "I can offer you a scholarship of ten percent.",
+            "I can get you exact numbers on the monthly plan if you're leaning toward it.",
+            # An e-mail, the details or a link: the negotiation's e-mail offer.
+            "Would you like me to send you the curriculum?",
+            "Sure, I can send those over. What's the best email for you?",
+            "I can understand that, it's a big decision.",
+            "I'll get back to you on that tomorrow.",
+            "Can I send you the enrolment link?",
+            # A discourse phrase said with an offer verb (review S1R-5): nothing waits for her.
+            "Let me put it this way, the course pays for itself within a year.",
+            "Let me add one more thing: our mentors are all senior engineers.",
+            "Let me add that our mentors are senior engineers.",
+            "I will give you an example. One of our learners moved into analytics.",
+            "I can give you an idea of how a typical week looks.",
+            "I will show you why this matters for your career.",
+            "I can put it simply: you learn by building.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.offers_something(text))
+
+    def test_offers_of_something_real_with_the_same_verbs(self):
+        for text in (
+            "I can show you a sample project from the last batch.",
+            "I can give you a demo of the platform this week.",
+            "I'll send it over right after this call.",
+            "Let me put you in touch with one of our alumni.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.offers_something(text))
+
+    def test_back_offs(self):
+        for text in (
+            BACKOFF_TURN,
+            "No hurry at all. Mull it over and come back to me whenever you like.",
+            "There's no pressure at all, think it over.",
+            "Whenever you're ready, just let me know.",
+            "Take your time.",
+            "No hurry, you can discuss it with your husband and let me know.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.backs_off(text))
+
+    def test_not_back_offs(self):
+        for text in (
+            PITCH,
+            NEUTRAL,
+            "I'll call you back tomorrow at six.",
+            "The program is self-paced, so you can take your time with each module.",
+            "If you miss a class you can catch up and get back on track.",
+            "You can always reach out to your mentor with doubts.",
+            "No pressure, but the offer ends today.",
+            "Take your time, but seats are limited, so decide by tonight.",
+            "Totally fair, take your time. The discount window won't wait, so decide soon.",
+            "No pressure, though waiting for the next cohort usually means a higher price.",
+            "Let me know if you have any questions.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.backs_off(text))
+
+    def test_questions_put_to_her(self):
+        for text in (
+            DIRECT_QUESTION,
+            "So tell me, what are you hoping to get from me?",
+            "We have weekend batches too. Which timing would suit you better?",
+            "How does your week usually look",  # speech-to-text dropped the question mark
+            "Does that work for you?",
+            "Have you looked at any other courses before?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.asks_her_directly(text))
+
+    def test_not_questions_put_to_her(self):
+        for text in (
+            NEUTRAL,  # an open invitation hands her the floor
+            "Any questions?",
+            "What do you think?",
+            "Does that make sense?",
+            "Does that make sense to you?",
+            "You know what I mean, right?",
+            "It is worth it, right?",
+            # A discourse marker said as a question, then a statement.
+            "Okay, you know what? I will explain it once more.",
+            "Guess what? The next batch has weekend classes.",
+            "Can you hear me?",
+            "Are you there?",
+            "Can you disconnect the call?",
+            "What I do is call learners every day.",
+            "Shall we look at the next steps?",
+            # A pitch said as a question (the advisor corpus has dozens).
+            "Do you know you can book a slot with a mentor whenever you want?",
+            "Did you know you can book a one-on-one session with a mentor anytime?",
+            "Would it help to know that you can book a session with a mentor anytime?",
+            "Why do you think our students book a mentor call every month?",
+            "Isn't it great that you can schedule a mock interview anytime?",
+            "Don't you think that is worth it for your career?",
+            PITCH,
+            OFFER_TURN,
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(sched.asks_her_directly(text))
+
+    def test_floor_offers(self):
+        for text in (NEUTRAL, "Anything else you want to know?", "Any other concerns?"):
+            with self.subTest(text=text):
+                self.assertTrue(sched.offers_floor(text))
+        for text in (PITCH, DIRECT_QUESTION, OFFER_TURN, "We have no other fees."):
+            with self.subTest(text=text):
+                self.assertFalse(sched.offers_floor(text))
+
+    def test_the_readers_are_quick_on_hostile_text(self):
+        import time
+
+        for text in ("you " * 4000, "I can " * 3000, "take " * 4000 + "?", "a" * 20000):
+            start = time.perf_counter()
+            for reader in (sched.offers_something, sched.backs_off, sched.asks_her_directly):
+                reader(text)
+            self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_a_long_run_of_commas_before_the_question_mark_is_read_in_linear_time(self):
+        """Review S1-R6: the tag reader was quadratic in a run of commas and spaces (0.2 s at the
+        engine's 4,000-character cap, 26 s at 40,000); bounded now, so 20,000 is instant."""
+        import time
+
+        text = "So is it you" + " ," * 10000 + " ?"
+        start = time.perf_counter()
+        sched.asks_her_directly(text)
+        self.assertLess(time.perf_counter() - start, 0.5)
+        # A tag after a short run is still a tag; a long run before it is not one.
+        self.assertFalse(sched.asks_her_directly("It is worth it , , right?"))
+
+
+class AdvisorTurnReaderCorpusTests(unittest.TestCase):
+    """The new readers on the labelled advisor corpus and the held-out set (2,160 phrasings).
+
+    The corpus's ``pitch_only`` label is derived (no ask, offer, price or farewell), so many of its
+    rows ARE questions put to the learner ("Have you tried learning on your own?") or back-offs
+    ("Take your time, no rush."), which these readers are meant to see.  So the counts are pinned
+    instead, per reader, after the hits were read by hand (M032 S1): a change to a reader that moves
+    them has to be looked at again.  The e-mail offers, call proposals and enrolment asks among the
+    offers and questions go to the negotiation first in the engine (``RolePlayEngine``), which only
+    reads an offer or a question put to her on a turn with no ask, callback or e-mail offer.
+    """
+
+    PINNED = {"offers_something": 70, "backs_off": 45, "asks_her_directly": 680}
+
+    @staticmethod
+    def _rows():
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if line:
+                    yield json.loads(line)
+
+    def test_the_hit_counts_are_the_reviewed_ones(self):
+        counts = {name: 0 for name in self.PINNED}
+        for row in self._rows():
+            for reader in (sched.offers_something, sched.backs_off, sched.asks_her_directly):
+                if reader(row["text"]):
+                    counts[reader.__name__] += 1
+        self.assertEqual(counts, self.PINNED)
+
+    def test_no_pitch_only_row_is_an_offer_unless_it_offers_in_the_first_person(self):
+        for row in self._rows():
+            if row["labels"].get("pitch_only") and sched.offers_something(row["text"]):
+                with self.subTest(id=row["id"]):
+                    self.assertRegex(
+                        row["text"].lower(), r"\b(?:i can|i'll|i will|want me to|would you like me)"
+                    )
+
+    def test_every_corpus_row_is_read_quickly(self):
+        import time
+
+        start = time.perf_counter()
+        for row in self._rows():
+            for reader in (sched.offers_something, sched.backs_off, sched.asks_her_directly):
+                reader(row["text"])
+        self.assertLess(time.perf_counter() - start, 10.0)
+
+
+class LearnerVoiceS2SchedulerTests(unittest.TestCase):
+    """M032 S2 texts in the plan: the worry objectives (item 3), the pre-empted suffix (item 4), the
+    rotated curiosity labels (SWEEP-12) and F4-PRIMARY's said-back variants (SWEEP-3)."""
+
+    def test_every_rotated_curiosity_label_asked_back_uses_its_topic_up(self):
+        for topic, labels in sched.CURIOSITY_LABELS_V2.items():
+            self.assertEqual(len(labels), 3, topic)
+            for label in labels:
+                for question in (f"What about {label}?", f"Could you tell me about {label}?"):
+                    with self.subTest(question=question):
+                        self.assertIn(topic, sched.curiosity_asked_in(question, wide=True))
+        self.assertEqual(set(sched.CURIOSITY_LABELS_V2), {t for t, _ in sched.CURIOSITY_TOPICS})
+        # Her own wording still counts, and a statement asks nothing.
+        self.assertIn("build", sched.curiosity_asked_in("What kind of projects would I work on?"))
+        self.assertIn(
+            "build", sched.curiosity_asked_in("What kind of projects would I work on?", wide=True)
+        )
+        self.assertEqual(
+            sched.curiosity_asked_in("I like the hands-on project work.", wide=True), frozenset()
+        )
+
+    def test_the_worry_variants_prove_their_move_and_are_statements(self):
+        for spec in sched.PLAN:
+            if not spec.worry:
+                continue
+            self.assertIn(spec.family, ("F2", "F3"), spec.id)
+            for text in spec.worry_variants:
+                with self.subTest(move=spec.id, text=text):
+                    self.assertTrue(markers_match(spec.markers, text))
+                    self.assertNotIn("?", text)
+        self.assertFalse(any(spec.worry for spec in sched.PLAN if spec.family in ("F1", "F4")))
+
+    def test_the_said_back_variants_prove_f4_primary(self):
+        spec = sched.SPEC_BY_ID[sched.F4_PRIMARY]
+        for text in sched.F4_PRIMARY_SAID_VARIANTS:
+            with self.subTest(text=text):
+                self.assertTrue(markers_match(spec.markers, text))
+
+    def test_the_preempting_reader_needs_a_statement_about_the_topic(self):
+        self.assertEqual(
+            sched.preempting_families("We have live classes on weekends and recordings too."),
+            frozenset({"F2"}),
+        )
+        self.assertEqual(
+            sched.preempting_families(
+                "Free videos won't give you mentors or feedback, that is what you pay for."
+            ),
+            frozenset({"F3"}),
+        )
+        for text in ("Do you have weekends free?", "Our program is great.", "", None):
+            with self.subTest(text=text):
+                self.assertEqual(sched.preempting_families(text), frozenset())
+
+    def test_the_new_readers_are_linear(self):
+        import time
+
+        start = time.perf_counter()
+        for text in ("weekly time " * 5000, "what about the class format? " * 2000, "a" * 50000):
+            sched.curiosity_asked_in(text, wide=True)
+            sched.preempting_families(text)
+        self.assertLess(time.perf_counter() - start, 5.0)
+
+
+class ProbeFirstSchedulerTests(unittest.TestCase):
+    """M032 S2P in the scheduler: the probe texts, the redirect's give-back, the number question."""
+
+    def test_the_probe_questions_prove_their_markers(self):
+        for probe in sched.PROBES:
+            for text in probe.variants:
+                with self.subTest(text=text):
+                    self.assertTrue(sched.markers_match(probe.markers, text))
+                    self.assertIn("?", text)
+
+    def test_f2_and_f4_texts_without_a_course_fact_prove_the_unchanged_markers(self):
+        for move_id in (sched.F2_PRIMARY, sched.F4_PRIMARY):
+            brief, _worry, line_text, variants = sched.probe_first_texts(move_id)
+            markers = sched.SPEC_BY_ID[move_id].markers
+            self.assertEqual(variants[0], line_text)
+            for text in variants:
+                with self.subTest(move=move_id, text=text):
+                    self.assertTrue(sched.markers_match(markers, text))
+                    self.assertNotRegex(text, r"(?i)\b(?:six|6) months\b|\bcohort\b|\bbatch\b")
+        self.assertIsNone(sched.probe_first_texts(sched.F3_PRIMARY))
+
+    def test_return_to_pending_gives_back_exactly_what_the_redirect_took(self):
+        scheduler = sched.OwedMoveScheduler("husband")
+        scheduler.observe_candidate_turn("Our mentors review every project.", 300.0)
+        before = {
+            move_id: (state.issued, state.forced_when_issued, state.enabled_sec)
+            for move_id, state in scheduler._states.items()
+        }
+        decision = scheduler.register_close_attempt(300.0)
+        self.assertEqual(decision.action, "redirect")
+        self.assertEqual(decision.prefix, sched.REDIRECT_OPENERS[0])
+        move = decision.move
+        scheduler.issue(move)
+        self.assertTrue(scheduler.return_to_pending(move.id))
+        after = {
+            move_id: (state.issued, state.forced_when_issued, state.enabled_sec)
+            for move_id, state in scheduler._states.items()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(scheduler.close_attempts, 1)
+        self.assertEqual(scheduler._states[move.id].spec.deadline_sec, move.deadline_sec)
+        self.assertFalse(scheduler.return_to_pending(move.id))  # once
+
+    def test_a_number_question_is_read_narrowly(self):
+        for text in (
+            "So which number would suit you?",
+            "What price works for you?",
+            "How much could you pay?",
+            "What were you hoping to pay?",
+        ):
+            self.assertTrue(sched.asks_her_number(text), text)
+        for text in (
+            "The number of students is high.",
+            "Which batch would suit you?",
+            "How much time do you have?",
+            "That number works for us.",
+        ):
+            self.assertFalse(sched.asks_her_number(text), text)
+
+class EndingsSchedulerTests(unittest.TestCase):
+    """M032 S3.1 readers of an in-role close, and SWEEP-24's pure peeks (synthetic text)."""
+
+    @staticmethod
+    def corpus():
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if line:
+                    yield json.loads(line)
+
+    def test_hand_over_closes_end_the_turn(self):
+        for text in ("Take your time and call me back later.", "Talk to him and get back to us.",
+                     "Sure, call me back whenever you're ready. Thank you.",
+                     "Okay, get back to me once you've decided. Bye."):
+            with self.subTest(text=text):
+                self.assertTrue(sched.hands_over_close(text))
+        for text in ("Call me back in ten minutes. Three seats left!",
+                     "Feel free to call me back whenever you have questions.",
+                     "Get back to me by tonight, deal?",
+                     "Once you check with him, get back to me and we'll talk about the EMI options."):
+            with self.subTest(text=text):
+                self.assertFalse(sched.hands_over_close(text))
+
+    def test_waiting_for_her_closes_only_after_her_sign_off(self):
+        for text in ("Take your time.", "Of course, take your time.", "No rush, no pressure."):
+            with self.subTest(text=text):
+                self.assertFalse(sched.hands_over_close(text))
+                self.assertTrue(sched.hands_over_close(text, after_sign_off=True))
+
+    def test_courtesy_only_turns(self):
+        for text in ("Sure. Thank you.", "Yeah, sure.", "Okay.", "Okay, no problem, take care."):
+            with self.subTest(text=text):
+                self.assertTrue(sched.courtesy_only(text))
+        for text in ("Sure, but what is your budget?", "Okay, so the mentors are from Google.",
+                     "Thank you?"):
+            with self.subTest(text=text):
+                self.assertFalse(sched.courtesy_only(text))
+
+    def test_the_corpus_hand_over_hits_are_the_reviewed_ones(self):
+        rows = list(self.corpus())
+        hits = [row["id"] for row in rows if sched.hands_over_close(row["text"])]
+        # Three unscored "... and get back to me." turns; no turn labelled not-a-farewell.
+        self.assertEqual(hits, ["c1917", "c1919", "c1927"])
+        after = [
+            row["id"] for row in rows if sched.hands_over_close(row["text"], after_sign_off=True)
+        ]
+        # Right after her own sign-off a whole-sentence "take your time" or "no pressure" closes
+        # too (labelled not-a-farewell when read without that context).
+        self.assertEqual(after, ["c1104", "c1444", "c1448", "c1917", "c1919", "c1927"])
+
+    def test_the_peeks_change_nothing(self):
+        scheduler = sched.OwedMoveScheduler("husband")
+        before = scheduler.summary()
+        peek = scheduler.next_forced_peek(500)
+        self.assertEqual(peek.id, sched.F3_PRIMARY)
+        self.assertEqual(scheduler.summary(), before)
+        self.assertIsNone(scheduler._states[sched.F3_PRIMARY].enabled_sec)
+        self.assertEqual(len(scheduler.required_pending()), 8)
+        for move_id in scheduler.required_pending()[:-1]:
+            scheduler.confirm_delivered(move_id, 600)
+        self.assertEqual(scheduler.required_pending(), (sched.F4_PUSH,))
+        self.assertEqual(scheduler.next_forced_peek(860).id, sched.F4_PUSH)
+
+    def test_the_readers_stay_linear(self):
+        import time
+
+        for hostile in ("call me back " * 3000, "thank you. " * 3000, "sure " * 5000,
+                        "get back to us" + ", thanks" * 3000):
+            start = time.perf_counter()
+            sched.hands_over_close(hostile, after_sign_off=True)
+            sched.courtesy_only(hostile)
+            self.assertLess(time.perf_counter() - start, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

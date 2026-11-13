@@ -29,6 +29,7 @@ from r1_guard import GuardContext, check_sentence, has_concession
 from r1_personas import PERSONAS, deep_need_topics_in, resolve_persona
 from r1_scheduler import F1_COUNTER, SPEC_BY_ID as MOVE_BY_ID, markers_match
 from r1_text import split_sentences
+from r1_negotiation import Negotiation, detect_email_offer
 
 # The real advisor turns of owner session b58c7d9c (the candidate rows, merged per learner turn).
 T56 = (
@@ -2353,6 +2354,885 @@ class AdvisorPriceS03Tests(unittest.TestCase):
         self.assertEqual(
             unread_low_figures("I can give you $6,000, monthly EMI available."), [6000]
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# M032 S2 offer readers (SWEEP-5 ``offer_terms_in``, SWEEP-13 ``implausible_offer_in``) and the
+# stall briefs without "before you agree to anything" (SWEEP-3).  Every line below is synthetic.
+# ---------------------------------------------------------------------------------------------
+def _corpus_rows():
+    fixtures = HERE / "tests" / "fixtures"
+    for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+        for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+            if line:
+                yield json.loads(line)
+
+
+class OfferTermsReaderTests(unittest.TestCase):
+    """SWEEP-5: what an offer carried besides its price, in the advisor's own statement."""
+
+    def test_instalments_and_a_free_extra_are_read(self):
+        for text, expected in (
+            (
+                "I'll take $1,000 off, so $8,000, and you can pay it as a monthly EMI.",
+                {"instalments"},
+            ),
+            ("We've tied up with banks for EMI over 6 to 24 months.", {"instalments"}),
+            ("I can do $6,000 and throw in a free course.", {"free_extra"}),
+            ("If you enrol today you get the first month free.", {"free_extra"}),
+            ("You can pay in three or six monthly instalments.", {"instalments"}),
+            ("We have flexible payment plans that can help.", {"instalments"}),
+            ("I can split the rest into easy monthly payments.", {"instalments"}),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(set(neg.offer_terms_in(text)), expected)
+
+    def test_questions_negations_the_past_and_other_sellers_are_not_offers(self):
+        for text in (
+            "Would EMI help you?",
+            "We don't have EMI right now.",
+            "There's a free course on Coursera.",
+            "free courses on YouTube",
+            "Last year we had a free class.",
+            "Are you free this weekend?",
+            "Feel free to ask.",
+            "",
+            None,
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset())
+
+    def test_a_payment_plan_named_only_as_a_discount_condition_offers_no_instalments(self):
+        """The plan a discount depends on is no offer to pay monthly: the note would hand her a
+        course fact the advisor never said (D-M032-7)."""
+        for text in (
+            "The list price is $9,000, and we do have discounts of $500, $1,000 or $1,500 "
+            "depending on the payment plan.",
+            "Depending on the payment plan you choose, there are discounts of $500 or $1,000.",
+            "The course is $9,000 with discounts available depending on your payment plan.",
+            "With the biggest discount on a payment plan, it comes to $7,500.",
+            "The payment plan you pick sets the discount you get.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset())
+        # ... but an instalment word in the same turn still offers them.
+        self.assertEqual(
+            neg.offer_terms_in(
+                "Discounts depend on the payment plan you choose, and monthly instalments are an "
+                "option too."
+            ),
+            frozenset({"instalments"}),
+        )
+
+    def test_the_wider_free_extra_and_no_cost_emi_are_read(self):
+        """Review S2R-10: a free-month offer, a free extra with words between "free"
+        and the noun, the thing named first, and "no-cost EMI" (no negation)."""
+        for text, expected in (
+            (
+                "Join this week and we'll give you full access free for a month before you choose.",
+                {"free_extra"},
+            ),
+            ("You can try it free for a month.", {"free_extra"}),
+            ("I'll throw in a free mock interview session.", {"free_extra"}),
+            ("You get the recordings for free.", {"free_extra"}),
+            ("We offer no-cost EMI.", {"instalments"}),
+            ("You can take a no cost EMI.", {"instalments"}),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(set(neg.offer_terms_in(text)), expected)
+        for text in (
+            "There is a free mock interview session on Coursera.",
+            "You get free time on weekends.",
+            "Last year we had a no-cost EMI.",
+            "Would you like to try it free?",
+            "Students can try it free on Udemy.",
+            "If you miss a class you can rewatch it for free.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset())
+
+    def test_only_a_monthly_plan_is_read_as_monthly(self):
+        """Review S2R-8: two halves, or half now and half later, are instalments but not monthly
+        ones, so the note never asks what they come to each month."""
+        for text in (
+            "You can split the payment into two halves.",
+            "We have a payment plan, half now and half in two months.",
+            "You can pay in instalments.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.offer_terms_in(text), frozenset({"instalments"}))
+                self.assertFalse(neg.instalments_are_monthly(text))
+        for text in (
+            "I can do $8,000 and you can pay it in monthly EMI.",
+            "We've tied up with banks for EMI over 6 to 24 months.",
+            "You can pay in three or six monthly instalments.",
+            "We offer no-cost EMI.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.instalments_are_monthly(text))
+
+    def test_the_corpus_hits_are_the_reviewed_ones(self):
+        """The hits were read by hand (M032 S2): each tells her that paying over time is open to
+        her (EMI, instalments, monthly payments, a payment plan on offer).  A change that moves
+        the counts has to be read again."""
+        hits = {"instalments": 0, "free_extra": 0}
+        for row in _corpus_rows():
+            for term in neg.offer_terms_in(row["text"]):
+                hits[term] += 1
+        self.assertEqual(hits, PINNED_TERM_HITS)
+
+    def test_the_reader_is_linear(self):
+        started = time.perf_counter()
+        for text in (
+            "emi " * 12000,
+            "I can give you a free " * 3000,
+            "we can " * 8000 + "pay monthly",
+            "free month " * 6000,
+            "a" * 50000,
+            "depending on the payment plan " * 2000,
+        ):
+            neg.offer_terms_in(text)
+        self.assertLess(time.perf_counter() - started, 3.0)
+
+
+# 71 instalment hits, read by hand: 70 say paying over time is open to her; one (an e-mail that
+# "has the payment plan") is borderline.  Precision about 0.99 (SWEEP-5 asks at least 0.98).  The
+# one free-extra hit (review S2R-10, words between "free" and the noun) was read by hand too: the
+# advisor offers a free counselling session with the course.
+PINNED_TERM_HITS = {"instalments": 71, "free_extra": 1}
+
+
+class ImplausibleOfferReaderTests(unittest.TestCase):
+    """SWEEP-13: a price far below anything she expected, or the course for free."""
+
+    def test_far_below_and_free_offers_are_read(self):
+        for text, expected in (
+            ("Look, I'll give you the whole program for free.", ("free", None)),
+            ("The course would be completely free for you.", ("free", None)),
+            ("I'm giving this course to you for free.", ("free", None)),
+            ("You can have it free.", ("free", None)),
+            ("I can give it to you for just $500.", ("low", 500)),
+            ("the price of 200 dollars", ("low", 200)),
+            ("I'll just give the course for $100.", ("low", 100)),
+            ("Okay, I can do $3,000 for you.", ("low", 3000)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.implausible_offer_in(text), expected)
+
+    def test_free_material_deposits_monthly_figures_and_counts_are_not_the_price(self):
+        for text in (
+            "There's so much free content on YouTube",
+            "free courses online",
+            "You get a free trial month",
+            "Are you free on Saturday?",
+            "feel free",
+            "a $500 deposit",
+            "$500 off",
+            "$500 a month",
+            "EMIs of $500",
+            "500 learners",
+            "Is $500 a month okay for you?",
+            "I can do $8,000 for you.",
+            "",
+            None,
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.implausible_offer_in(text))
+
+    def test_ordinary_sales_phrasing_is_neither_free_nor_far_below(self):
+        """Review S2R-2 and S2R-3: a payment term, a free extra or a difference in price is not
+        the course for free or a $500 course."""
+        for text in (
+            "You don't have to pay anything upfront, the EMI starts next month.",
+            "You won't need to pay anything today.",
+            "You don't need to pay anything extra for the mentorship.",
+            "You won't have to pay anything until you're placed.",
+            "You won't need to pay anything extra for the mentors.",
+            "You won't pay anything more than $6,000.",
+            "It is free to attend the demo class.",
+            "It is free to cancel within seven days.",
+            "The webinar is free of cost.",
+            "The placement support is free of charge.",
+            "If you miss a class you can rewatch it for free.",
+            "There is a masterclass on Saturday, and it is free.",
+            "Try the first module, it is free.",
+            "The fee is $500 less if you pay before Friday.",
+            "The cost is $500 more for the premium track.",
+            "The price is $500 lower than the last batch.",
+            "The price is $9 thousand.",
+            "The cost is $8.5 thousand.",
+            "The price is just $25 a day.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.implausible_offer_in(text))
+        for text, expected in (
+            ("You won't have to pay anything.", ("free", None)),
+            ("You won't have to pay anything for the course.", ("free", None)),
+            ("The whole course is free of charge for you.", ("free", None)),
+            ("If I give it to you free, will you take it?", ("free", None)),
+            ("I can give you a price of $500.", ("low", 500)),
+            ("The actual cost is $100.", ("low", 100)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.implausible_offer_in(text), expected)
+
+    def test_the_corpus_hits_are_the_reviewed_far_below_prices(self):
+        found = sorted(
+            row["id"] for row in _corpus_rows() if neg.implausible_offer_in(row["text"]) is not None
+        )
+        self.assertEqual(found, PINNED_IMPLAUSIBLE_IDS)
+
+    def test_the_reader_is_linear(self):
+        started = time.perf_counter()
+        for text in (
+            "free " * 12000,
+            "I will give you the course for $100 " + " " * 40000,
+            "give it to you for free of " * 2000,
+            # ``parse_price_offers`` (unchanged, read first) bounds the cost of a long run of
+            # figures; the new framed-price and free readers add little to it.
+            "$1 " * 600,
+            "the price is $1 " * 1500,
+            "a" * 50000,
+        ):
+            neg.implausible_offer_in(text)
+        self.assertLess(time.perf_counter() - started, 3.0)
+
+
+# Read by hand: all seven put the course at $3,000 or less ($100 once).
+PINNED_IMPLAUSIBLE_IDS = ["c1977", "c1979", "c1981", "c1982", "c1988", "c1989", "c1990"]
+
+
+class NoCommitSpecTests(unittest.TestCase):
+    """SWEEP-3: the stall reasons and the next-step question without the stall priming."""
+
+    def test_every_new_variant_proves_its_spec_and_is_safe_for_every_persona(self):
+        for rendered in variants():
+            dm = rendered.decision_maker
+            # N-QUESTION is worded by ``question_spec`` (by the advisor's ask), not here.
+            specs = [neg.no_commit_spec(spec) for spec in neg.SPECS if spec.id != neg.N_QUESTION]
+            specs += [
+                neg.question_spec(AskKind.CALL, no_commit=True),
+                neg.question_spec(AskKind.ENROL, no_commit=True),
+            ]
+            for spec in specs:
+                self.assertNotIn("agree to anything", spec.brief)
+                brief = neg.fill_decision_maker(spec.brief, dm)
+                self.assertEqual(deep_need_topics_in(rendered, brief), frozenset(), spec.id)
+                markers = neg.filled_markers(spec.markers, dm)
+                for text in spec.variants:
+                    line = neg.fill_decision_maker(text, dm)
+                    with self.subTest(persona=rendered.id, spec=spec.id, line=line):
+                        self.assertNotIn("agree to anything", line)
+                        self.assertTrue(markers_match(markers, line))
+                        self.assertEqual(deep_need_topics_in(rendered, line), frozenset())
+                        context = GuardContext(phase="roleplay", persona=rendered, mode="reply")
+                        for sentence in split_sentences(line):
+                            self.assertEqual(check_sentence(sentence, context), [])
+
+    def test_ids_kinds_reasons_and_markers_are_unchanged(self):
+        for spec in neg.SPECS:
+            changed = neg.no_commit_spec(spec)
+            self.assertEqual(
+                (changed.id, changed.kind, changed.reason, changed.markers),
+                (spec.id, spec.kind, spec.reason, spec.markers),
+            )
+        timing = neg.SPEC_BY_ID[neg.N_TIMING]
+        self.assertIs(neg.no_commit_spec(timing), timing)
+
+
+class OfferReaderV2Tests(unittest.TestCase):
+    """M032 SWEEP-18 (flag R1_OFFER_READER_V2): the discount comes off the price the advisor named,
+    an explicit net wins, and the base carries over a split turn (synthetic advisor turns)."""
+
+    def v2(self, text, **kwargs):
+        return neg.parse_price_offers(text, v2=True, **kwargs)
+
+    def test_a_dollar_discount_comes_off_the_price_the_advisor_named(self):
+        self.assertEqual(self.v2("Normally it's $10,000, but I can give you $2,000 off."), [(8000, False)])
+        self.assertEqual(self.v2("The fee is $9,500. I can give you $1,000 off."), [(8500, False)])
+        # The release before: always off the list price.
+        self.assertEqual(
+            neg.parse_price_offers("Normally it's $10,000, but I can give you $2,000 off."),
+            [(7000, False)],
+        )
+
+    def test_a_net_at_or_above_the_list_price_is_a_restatement(self):
+        text = (
+            "The list price is really $12,000. You get a $3,000 discount, so for you it is $9,000."
+        )
+        self.assertEqual(self.v2(text), [])
+        unframed = "the cost you are looking at is 12000. You get a $3,000 discount."
+        self.assertNotIn(6000, [net for net, _ in self.v2(unframed)])
+
+    def test_an_explicit_net_wins_over_the_derived_one(self):
+        text = "The fee is $9,500, and I can take $1,000 off, which brings it to 8.5k."
+        self.assertEqual(self.v2(text), [(8500, False)])
+        rather = "We could do $6,000 for you rather than $12,000, a straight 50% discount."
+        self.assertEqual(self.v2(rather), [(6000, False)])
+        self.assertEqual(neg.stated_price_usd(rather, v2=True), 12000)
+        self.assertIsNone(neg.stated_price_usd(rather))
+
+    def test_a_threat_is_never_the_base(self):
+        text = "I can give you $1,000 off today. If you wait, you'll pay $13000."
+        self.assertEqual([net for net, _ in self.v2(text)], [8000])
+        self.assertIsNone(neg.stated_price_usd(text, v2=True))
+        batch = "I can give $1,000 off. If you start with a new batch, you'd have to end up paying $12000."
+        self.assertEqual([net for net, _ in self.v2(batch)], [8000])
+
+    def test_unchanged_readings(self):
+        self.assertEqual(self.v2("I can give you $1,000 off."), [(8000, False)])
+        self.assertEqual(self.v2("I can give you 10% off."), [(8100, False)])
+        self.assertEqual(self.v2("We have discounts of $500, $1000 and $1500."), [])
+        self.assertEqual(self.v2("I can do $8,500 for you."), [(8500, False)])
+
+    def test_the_stated_price_carries_over_one_advisor_turn(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "The program is $9,500.", reader_v2=True)
+        state.observe(6, "I can do $1,000 off for you.", reader_v2=True)
+        self.assertEqual(state.best_offer_usd, 8500)
+        later = neg.Negotiation("husband")
+        later.observe(5, "The program is $9,500.", reader_v2=True)
+        later.observe(6, "Okay.", reader_v2=True)
+        later.observe(7, "Sure.", reader_v2=True)
+        later.observe(8, "I can do $1,000 off for you.", reader_v2=True)
+        self.assertEqual(later.best_offer_usd, 8000)
+        before = neg.Negotiation("husband")
+        before.observe(5, "The program is $9,500.")
+        before.observe(6, "I can do $1,000 off for you.")
+        self.assertEqual(before.best_offer_usd, 8000)
+
+    def test_a_threat_figure_is_never_carried(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "If you wait, you will have to pay $13000.", reader_v2=True)
+        state.observe(6, "I can do $1,000 off for you.", reader_v2=True)
+        self.assertEqual(state.best_offer_usd, 8000)
+
+    def test_an_amount_right_after_her_price_question_needs_no_pricing_word(self):
+        asked = neg.Negotiation("husband")
+        asked.observe(5, "It's around 6000 dollars.", probed=True)
+        self.assertEqual(asked.best_offer_usd, 6000)
+        cold = neg.Negotiation("husband")
+        cold.observe(5, "It's around 6000 dollars.")
+        self.assertIsNone(cold.best_offer_usd)
+
+    def test_ticket_size_priced_and_pricing_name_the_course_price_before_the_anchor(self):
+        # SWEEP-19 item 4 (b419d478 #43-44, paraphrased): "ticket size" and "priced" are course
+        # price cues for the v2 reader, before the anchor too; the v1 reader is unchanged.
+        for text in (
+            "We usually see a ticket size of around 6000 USD for this course.",
+            "It's priced at 6000 dollars.",
+            "Our pricing is 6000.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    neg.read_advisor_turn(text, after_anchor=False, reader_v2=True).best_offer_usd,
+                    6000,
+                )
+                self.assertIsNone(
+                    neg.read_advisor_turn(text, after_anchor=False, reader_v2=False).best_offer_usd
+                )
+        for text in (
+            "This is a high ticket size program.",
+            "We trained 6000 learners last year.",
+            "Our ticket size is high because the mentors are senior.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    neg.read_advisor_turn(text, after_anchor=False, reader_v2=True).best_offer_usd
+                )
+                self.assertEqual(neg.unread_low_figures(text, set(), v2=True), [])
+
+    def test_the_v2_readers_are_fast_on_hostile_text(self):
+        hostile = ("so for you it is " * 400) + "$9,000 " + ("brings it to " * 300)
+        start = time.perf_counter()
+        self.v2(hostile)
+        neg.stated_price_usd(hostile, v2=True)
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+    def test_the_corpus_readings_are_unchanged(self):
+        # Every labelled advisor turn that names a figure (the tuned corpus and the held-out set):
+        # v2 relabels none of them (2026-11-12: 0 changed of 2,160 turns), so best_offer_usd
+        # accuracy cannot drop.
+        figure = re.compile(r"\d|thousand|hundred|grand", re.IGNORECASE)
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                if not figure.search(entry["text"]):
+                    continue
+                after = entry["phase_hint"] != "pre_anchor"
+                readings = [
+                    neg.read_advisor_turn(entry["text"], after_anchor=after, reader_v2=v2)
+                    for v2 in (False, True)
+                ]
+                self.assertEqual(
+                    readings[0].best_offer_usd, readings[1].best_offer_usd, entry["id"]
+                )
+
+
+class ProbeFirstNegotiationTests(unittest.TestCase):
+    """M032 S2P texts and readers in the negotiation (S2.10, SWEEP-16, 19, 21, 22; synthetic)."""
+
+    ANCHOR_MARKERS = MOVE_BY_ID["F1-ANCHOR"].markers
+    COUNTER_MARKERS = MOVE_BY_ID[F1_COUNTER].markers
+
+    def test_the_stated_anchor_checks_a_conflict_only_300_away(self):
+        self.assertEqual(neg.anchor_after_stated(9000).id, neg.ANCHOR_STATED)
+        self.assertEqual(neg.anchor_after_stated(9200).id, neg.ANCHOR_STATED)
+        self.assertEqual(neg.anchor_after_stated(9300).id, neg.ANCHOR_STATED_CONFLICT)
+        conflict = neg.anchor_after_stated(10000)
+        self.assertEqual(conflict.must_say, ("$10,000", "$9,000", "$7,000"))
+        self.assertEqual(neg.anchor_check().must_say, ("$9,000", "$7,000"))
+        self.assertEqual(neg.anchor_after_free().must_say, ("$7,000",))
+        for anchor in (conflict, neg.anchor_after_stated(9000), neg.anchor_check(), neg.anchor_after_free()):
+            for text in anchor.variants:
+                self.assertTrue(markers_match(self.ANCHOR_MARKERS, text), text)
+
+    def test_the_offer_anchors_keep_their_figures_with_objective_briefs(self):
+        for usd in (8000, 7000, 6000):
+            before = neg.anchor_after_offer(usd)
+            after = neg.anchor_after_offer(usd, probe_first=True, counter_v2=True)
+            with self.subTest(usd=usd):
+                self.assertEqual(before.must_say, after.must_say)
+                self.assertEqual(before.id, after.id)
+                self.assertNotIn("has already", after.brief)
+        above = neg.anchor_after_offer(8000, counter_v2=True)
+        self.assertEqual(
+            above.variants[2],
+            "I heard it went for around $7,000, and $8,000 is still a big number for me. "
+            "Can you match that?",
+        )
+        self.assertEqual(neg.anchor_after_offer(8000), neg.anchor_after_offer(8000, probe_first=False))
+
+    def test_the_v2_counters(self):
+        met = neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_MET]
+        for text in met.variants:
+            self.assertNotRegex(
+                text, r"(?i)best you can do|little better|lower|\bless\b|come down|still move|closer"
+            )
+        far = neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_FAR_BELOW]
+        self.assertNotRegex(far.brief + " ".join(far.variants), r"(?i)\brelief\b|\bhelp\b")
+        self.assertEqual(
+            neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_SHORT].variants[0],
+            "I was hoping for a bit less than that. Can you go a little lower?",
+        )
+        self.assertEqual(
+            neg.COUNTER_V2_BY_SITUATION[neg.SITUATION_REFUSED].variants[1],
+            "Would anything at all make it easier, like a payment plan?",
+        )
+        for counter in neg.COUNTERS_V2:
+            for text in counter.variants:
+                self.assertTrue(markers_match(self.COUNTER_MARKERS, text), text)
+        for kind, earlier in (("website", None), ("rise", 6000)):
+            counter = neg.conflict_counter(kind, 9500, earlier)
+            for text in counter.variants:
+                self.assertTrue(markers_match(self.COUNTER_MARKERS, text), text)
+                self.assertIn("?", text)
+
+    def test_the_counter_situation_with_counter_v2(self):
+        state = neg.Negotiation("husband")
+        state.observe(5, "I can do $6,500 for you.", anchor_turn=4, read_totals=True)
+        self.assertEqual(state.counter_situation(counter_v2=True).id, neg.SITUATION_MET)
+        self.assertEqual(
+            state.counter_situation(counter_v2=True, far_below=True).id, neg.SITUATION_FAR_BELOW
+        )
+        self.assertIs(state.counter_situation(), neg.COUNTER_BY_SITUATION[neg.SITUATION_MET])
+        held = neg.Negotiation("husband")
+        held.observe(5, "No, the price is $9,000 for everyone.", anchor_turn=4, read_totals=True)
+        self.assertEqual(held.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        self.assertEqual(held.price_situation(), neg.SITUATION_UNCLEAR)
+        self.assertEqual(held.refusals, 0)
+        fixed = neg.Negotiation("husband")
+        fixed.observe(5, "The fee is fixed, I'm afraid.", anchor_turn=4, read_totals=True)
+        self.assertEqual(fixed.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        self.assertTrue(neg.holds_price("The price is non-negotiable."))
+        self.assertFalse(neg.holds_price("Is the price fixed?"))
+
+    def test_stated_totals(self):
+        cases = {
+            "Alright, for the analyst track we offer a $9,500 fee.": [9500],
+            "It's the same $9,000 over nine months, $1,000 a month.": [9000],
+            "We can do $6,000 instead of $12,000.": [12000],
+            "It's valued at $12,000.": [],
+            "If you wait, you'll pay $13,000.": [],
+            "A new batch would be $12,000.": [],
+            "Analysts earn $15,000 more.": [],
+            "Is it $9,000?": [],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.stated_totals(text), expected)
+
+    def test_the_price_conflicts(self):
+        state = neg.Negotiation("husband")
+        before = state.observe(3, "For the analyst track we offer a $9,500 fee.", read_totals=True)
+        self.assertIsNone(before.conflict)  # before the anchor S2.10 owns the check
+        website = state.observe(5, "The fee is $9,500.", anchor_turn=4, read_totals=True)
+        self.assertEqual(website.conflict, ("website", 9500, None))
+        self.assertIsNone(state.observe(6, "Yes, $9,500 fee.", anchor_turn=4, read_totals=True).conflict)
+        rise = neg.Negotiation("husband")
+        rise.observe(5, "We can do $6,000 for you.", anchor_turn=4, read_totals=True)
+        seen = rise.observe(
+            6, "It's the same $9,000 over nine months.", anchor_turn=4, read_totals=True
+        )
+        self.assertEqual(seen.conflict, ("rise", 9000, 6000))
+        self.assertEqual(rise.rise_open_turn, 6)
+        self.assertEqual(rise.price_now_usd(), 9000)
+        rise.observe(7, "Fine, $7,000 then.", anchor_turn=4, read_totals=True)
+        self.assertIsNone(rise.rise_open_turn)
+        option = neg.Negotiation("husband")
+        option.observe(5, "We can do $6,000 for you.", anchor_turn=4, read_totals=True)
+        seen = option.observe(
+            6, "$6,000 upfront or $9,000 over nine months.", anchor_turn=4, read_totals=True
+        )
+        self.assertIsNone(seen.conflict)
+        capped = neg.Negotiation("husband")
+        for turn, text in enumerate(("The fee is $9,500.", "The fee is $10,000.", "The fee is $11,000."), 5):
+            capped.observe(turn, text, anchor_turn=4, read_totals=True)
+        self.assertEqual(len(capped.conflicts), neg.MAX_CONFLICTS)
+
+    def test_a_price_after_a_deadline_is_a_later_price_not_a_total(self):
+        # The S2P corpus check: "back to $9000 tomorrow" is the offer's deadline (an urgency lever
+        # while the lower price stands), not the advisor contradicting his offer.
+        for text in (
+            "That price is locked only if you deposit tonight. Tomorrow it's back to $9000.",
+            "In a week the price is back to $9000 and the seats will be gone.",
+            "After tonight it goes back up to $9,000.",
+            "From tomorrow the fee goes up to $9,500.",
+            "Next week it will be $9,000 again.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.stated_totals(text), [])
+                state = neg.Negotiation("husband")
+                state.observe(5, "I can do $8,000 for you.", anchor_turn=4, read_totals=True)
+                self.assertIsNone(state.observe(6, text, anchor_turn=4, read_totals=True).conflict)
+        # A price stated now is still a total.
+        for text, expected in {
+            "The course is $9,000 and I can't change that.": [9000],
+            "It's back in the budget at $9,000.": [9000],
+            "Tomorrow we can talk, but the course is $9,000.": [9000],
+        }.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.stated_totals(text), expected)
+
+    def test_a_list_price_with_a_discount_down_to_the_offer_is_no_rise(self):
+        # The same turn keeps a price at or below the earlier offer reachable (SWEEP-21's "keeps
+        # the lower figure as an option"), so she has nothing to ask "which is it?" about.
+        for text in (
+            "The course is listed at $9,000. Depending on the plan, discounts of $500, $1,000 or "
+            "$1,500 apply.",
+            "It's $9000, with discounts up to $1500.",
+            "The course is $9,000, and I can take $1,000 off if you pay upfront.",
+        ):
+            with self.subTest(text=text):
+                state = neg.Negotiation("husband")
+                state.observe(5, "I can do $8,000 for you.", anchor_turn=4, read_totals=True)
+                self.assertIsNone(state.observe(6, text, anchor_turn=4, read_totals=True).conflict)
+        # The discount ladder in its other shapes (paraphrased from the corpus check).
+        ladders = {
+            "The email has the $9,000 price with the $500, $1,000 or $1,500 plan discounts.": [
+                500, 1000, 1500,
+            ],
+            "The fee is 9000 dollars, with discounts of 500, 1000 or 1500 depending on the plan.": [
+                500, 1000, 1500,
+            ],
+            "It's $9,000 with the payment plans and their $500 to $1,500 discounts.": [500, 1500],
+            "We can take $500, $1000, or even $1500 off the $9000.": [500, 1000, 1500],
+            "I can do $1,000 off for you.": [1000],
+        }
+        for text, expected in ladders.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.discount_amounts(text), expected)
+        for text in (
+            "We have 750 instructors and it's $9,000.",
+            "It's $9,000 or $1,000 a month.",
+            "I can't give you $1,000 off.",
+            "There's no $1,000 discount on this one.",
+            "You'll only pay 2,000 upfront and the rest in instalments.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.discount_amounts(text), [])
+        self.assertEqual(
+            neg.stated_totals("The discount resets to $9000 tomorrow, so I can hold the seat."), []
+        )
+        # A discount that still leaves the total above the earlier offer is a rise.
+        state = neg.Negotiation("husband")
+        state.observe(5, "I can do $8,000 for you.", anchor_turn=4, read_totals=True)
+        seen = state.observe(
+            6, "The course is $9,000 and there is a $500 discount.", anchor_turn=4, read_totals=True
+        )
+        self.assertEqual(seen.conflict, ("rise", 9000, 8000))
+
+    # The SWEEP-21 corpus check (2026-11-12): every labelled advisor turn read after the anchor,
+    # once on its own (WEBSITE) and once after "I can do $8,000 for you." (RISE).  No turn names a
+    # total $300 or more from the website's.  The 20 RISE turns all say the $9,000 again after the
+    # offer, with no discount or one that still leaves it above $8,000 ("a five hundred dollar
+    # discount", "discounts available" with no figure).  Before the corpus check 82 fired: 4 were
+    # a deadline's later price ("Tomorrow it's back to $9000", "resets to $9000 tomorrow", "In a
+    # week the price is back to $9000", the next cohort's price) and 58 named the $500 / $1,000 /
+    # $1,500 ladder, which keeps the $8,000 reachable.
+    CORPUS_RISES = frozenset(
+        "c0195 c0350 c0435 c0569 c0616 c0644 c0664 c0700 c0736 c0755 c0986 c1012 c1013 c1014 "
+        "c1325 c1626 c1781 c1983 c1992 h0165".split()
+    )
+
+    def test_the_corpus_conflicts_are_the_reviewed_ones(self):
+        website: list[str] = []
+        rises: set[str] = set()
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = HERE / "tests" / "fixtures" / name
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                alone = neg.Negotiation("husband")
+                seen = alone.observe(
+                    5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True
+                )
+                if seen.conflict is not None:
+                    website.append(entry["id"])
+                after = neg.Negotiation("husband")
+                after.observe(
+                    4, "I can do $8,000 for you.", anchor_turn=3, reader_v2=True, read_totals=True
+                )
+                seen = after.observe(
+                    5, entry["text"], anchor_turn=3, reader_v2=True, read_totals=True
+                )
+                if seen.conflict is not None and seen.conflict[0] == neg.CONFLICT_RISE:
+                    rises.add(entry["id"])
+        self.assertEqual(website, [])
+        self.assertEqual(sorted(rises), sorted(self.CORPUS_RISES))
+
+    def test_the_conflict_readers_are_fast_on_hostile_text(self):
+        hostile = (
+            ("discounts of $500, " * 300) + ("tomorrow it's back to " * 200) + "$9,000 "
+            + ("plan discounts " * 200) + ("500, 1000 or " * 300)
+        )
+        start = time.perf_counter()
+        neg.discount_amounts(hostile)
+        neg.stated_totals(hostile)
+        neg.named_prices(hostile)
+        neg.named_prices("9k " * 2000 + "nine grand " * 2000 + "you'd be looking at " * 300)
+        self.assertLess(time.perf_counter() - start, 3.0)
+
+    # Review S2P-R2 (correctness): the price named in any frame, and the thousands shorthand
+    # (review S2P-R6).  Synthetic sentences.
+    NAMED = {
+        "We charge $9,000 for the full program.": [9000],
+        "The total is $9,000.": [9000],
+        "The investment is $9,000.": [9000],
+        "Ours is $9,000.": [9000],
+        "You'd be looking at $9,000.": [9000],
+        "We're at $9,500 for this cohort.": [9500],
+        "It's 9k for the whole program.": [9000],
+        "It's nine grand all in.": [9000],
+        "Another platform sells it for 3000. Ours is $9,000.": [9000],
+    }
+    NOT_NAMED = (
+        "Other bootcamps charge $15,000.",
+        "You will save $10,000.",
+        "Analysts earn $15,000 more.",
+        "If you wait, you'll pay $13,000.",
+        "A new batch would be $12,000.",
+        "I can give you $5,000 off.",
+        "We have 10k learners.",
+        "Is it $9,000 for you?",
+        "It's not $9,000.",
+        "Tomorrow it's back to $9000.",
+        "Salaries go up to $20,000 a month.",
+        "If you were quoted $7,200 by someone else, that was not us.",
+        "Roughly $7,000 is what people say they paid.",
+        "Maybe I can look into $8,000, but I can't promise.",
+        "I wish I could do $7,000, truly.",
+    )
+
+    def test_a_price_named_in_any_frame(self):
+        for text, expected in self.NAMED.items():
+            with self.subTest(text=text):
+                self.assertEqual(neg.named_prices(text), expected)
+        for text in self.NOT_NAMED:
+            with self.subTest(text=text):
+                self.assertEqual(neg.named_prices(text), [])
+        self.assertEqual(neg.stated_totals("We charge $9,000 for the full program."), [])
+
+    def test_a_named_price_is_on_record_and_clears_a_low_mention(self):
+        state = neg.Negotiation("husband")
+        state.observe(2, "There's a $2,000 scholarship some people get.", read_totals=True)
+        seen = state.observe(3, "We charge $9,000 for the full program.", read_totals=True)
+        self.assertEqual(seen.named, (9000,))
+        self.assertEqual(state.latest_stated_usd(), 9000)
+        self.assertIsNone(state.latest_total_usd())  # the conflict reader is unchanged
+        self.assertIsNone(state.unread_low_usd())
+        low = neg.Negotiation("husband")
+        low.observe(3, "Ours is $6,000.", read_totals=True)
+        self.assertEqual(low.unread_low_usd(), 6000)
+        off = neg.Negotiation("husband")
+        off.observe(3, "We charge $9,000 for the full program.")
+        self.assertIsNone(off.latest_stated_usd())  # only when the engine reads the totals
+
+    def test_the_website_price_said_on_the_same_turn_is_the_price(self):
+        # Review S2P-R4 (naturalness): "$9,000 and the advanced track is $11,000" is $9,000.
+        for text in (
+            "The fee is $9,000 and the advanced track is $11,000.",
+            "It's $9,000, or $9,600 in total if you take the EMI.",
+            "The list price is really $12,000. You get a $3,000 discount, so for you it is $9,000.",
+        ):
+            with self.subTest(text=text):
+                state = neg.Negotiation("husband")
+                state.observe(3, text, read_totals=True)
+                self.assertEqual(state.latest_stated_usd(), 9000)
+                after = neg.Negotiation("husband")
+                seen = after.observe(5, text, anchor_turn=4, read_totals=True)
+                self.assertIsNone(seen.conflict)
+        offered = neg.Negotiation("husband")
+        seen = offered.observe(
+            5,
+            "We could do $6,000 for you rather than $12,000, a straight 50% discount.",
+            anchor_turn=4,
+            read_totals=True,
+        )
+        self.assertIsNone(seen.conflict)
+
+    def test_the_website_check_is_asked_once(self):
+        # Review S2P-R2 (naturalness): after the check form his next figure is the answer, and
+        # the stated-conflict form already checked its figure.
+        checked = neg.Negotiation("husband")
+        checked.note_anchor(neg.ANCHOR_CHECK, None)
+        seen = checked.observe(
+            5, "No, it's actually $9,500 for the full program.", anchor_turn=4, read_totals=True
+        )
+        self.assertIsNone(seen.conflict)
+        self.assertEqual(checked.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        self.assertEqual(checked.refusals, 0)
+        stated = neg.Negotiation("husband")
+        stated.note_anchor(neg.ANCHOR_STATED_CONFLICT, 9500)
+        seen = stated.observe(
+            5, "The fee is $9,500, that's the price.", anchor_turn=4, read_totals=True
+        )
+        self.assertIsNone(seen.conflict)
+        self.assertEqual(stated.price_situation(counter_v2=True), neg.SITUATION_REFUSED)
+        # A different figure after the stated-conflict anchor is still checked once.
+        other = neg.Negotiation("husband")
+        other.note_anchor(neg.ANCHOR_STATED_CONFLICT, 9500)
+        seen = other.observe(5, "The fee is $12,000.", anchor_turn=4, read_totals=True)
+        self.assertEqual(seen.conflict, ("website", 12000, None))
+
+    def test_the_quote_record_is_logged_only_when_read(self):
+        off = neg.Negotiation("husband")
+        off.observe(5, "The fee is $9,500.", anchor_turn=4)
+        self.assertNotIn("quotes", off.log())
+        on = neg.Negotiation("husband")
+        on.observe(5, "The fee is $9,500.", anchor_turn=4, read_totals=True)
+        self.assertEqual(on.log()["quotes"], [{"turn": 5, "usd": 9500, "kind": "total"}])
+        self.assertEqual(on.latest_total_usd(), 9500)
+
+    def test_the_price_first_readers(self):
+        for text in ("So how much is it?", "What's the fee like?", "And what would the course cost me?"):
+            self.assertTrue(neg.asks_price(text), text)
+        for text in (
+            "How much time outside class?",
+            "is there any extra cost for the recordings?",
+            "I'm worried about the cost.",
+        ):
+            self.assertFalse(neg.asks_price(text), text)
+        self.assertEqual(
+            neg.price_cue("Honestly it is a bit expensive, because the quality is high."), "cost"
+        )
+        self.assertIsNone(neg.price_cue("It's $9,000, a bit expensive but worth it."))
+        self.assertEqual(neg.price_cue("What's your budget for this?"), "budget")
+        self.assertEqual(neg.price_cue("If I give you this course for free, would you take it?"), "cost")
+        for text in (
+            "There are free resources on YouTube.",
+            "it's expensive to switch careers",
+            "it is costly to wait",
+        ):
+            self.assertIsNone(neg.price_cue(text), text)
+        for text in neg.PRICE_FIRST_SPEC.variants:
+            self.assertTrue(markers_match(neg.PRICE_FIRST_SPEC.markers, text))
+            self.assertTrue(neg.asks_price(text))
+
+    def test_the_first_money_stall_follows_what_she_knows(self):
+        named = neg.money_spec(price_named=True, price_asked=False, first=True)
+        self.assertEqual(named.brief, neg.N_MONEY_NAMED_BRIEF)
+        self.assertTrue(named.variants[0].startswith("It's a lot of money to commit"))
+        # Review S2P-R7: the variants rotate by seed, so none of the first-time ones says "still".
+        for text in named.variants:
+            self.assertNotRegex(text, r"(?i)\bstill\b")
+        unknown = neg.money_spec(price_named=False, price_asked=True, first=True)
+        self.assertEqual(unknown.brief, neg.N_MONEY_UNKNOWN_BRIEF)
+        self.assertIsNone(neg.money_spec(price_named=True, price_asked=True, first=False))
+        self.assertIsNone(neg.money_spec(price_named=False, price_asked=False, first=True))
+        money = neg.SPEC_BY_ID[neg.N_MONEY]
+        for spec in (named, unknown):
+            for text in spec.variants:
+                self.assertTrue(markers_match(money.markers, text), text)
+                self.assertNotIn("agree to anything before", text)
+
+class EmailOfferV2Tests(unittest.TestCase):
+    """M032 SWEEP-25 A1 (R1_WEAK_EMAIL_V2): documents, brochures, PDFs and road maps are e-mail
+    offers too; paperwork to sign or for the enrolment is not (synthetic advisor turns)."""
+
+    def test_documents_and_road_maps_are_offers_with_v2_only(self):
+        for text in (
+            "I'll send you the documents once we finish the call.",
+            "I can send over the road map and the brochures after this.",
+            "Let me email you the PDFs tonight.",
+            "I will share the documents on WhatsApp today.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_email_offer(text, v2=True))
+        self.assertFalse(detect_email_offer("I'll send you the documents once we finish the call."))
+
+    def test_paperwork_is_never_an_offer(self):
+        for text in (
+            "I'll send you the documents to sign for enrolment.",
+            "I'll send you the document to sign for enrolment.",
+            "I will email you the documents for the registration.",
+            "We'll send the documents for payment and KYC.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_email_offer(text, v2=True))
+        # The release before read the singular "document" as information even there.
+        self.assertTrue(detect_email_offer("I'll send you the document to sign for enrolment."))
+
+    def test_a_programme_description_is_still_no_offer(self):
+        for text in (
+            "We send you the documents every week once you enroll.",
+            "You will get the road map in the first class.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_email_offer(text, v2=True))
+
+    def test_the_corpus_gains_one_unlabelled_row_and_loses_none(self):
+        gained, lost = [], []
+        for row in _corpus_rows():
+            before = detect_email_offer(row["text"])
+            after = detect_email_offer(row["text"], v2=True)
+            if after and not before:
+                gained.append((row["id"], row["labels"].get("email_offer")))
+            if before and not after:
+                lost.append(row["id"])
+        self.assertEqual(gained, [("c1677", None)])
+        self.assertEqual(lost, [])
+
+    def test_the_wider_reader_stays_linear(self):
+        import time
+
+        hostile = "I'll send you the " + "documents and the " * 2000 + "road map"
+        start = time.perf_counter()
+        detect_email_offer(hostile, v2=True)
+        detect_email_offer("I will email " + "you " * 3000, v2=True)
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+    def test_the_negotiation_reads_it_only_when_asked(self):
+        seen = Negotiation("husband").observe(3, "I'll send you the documents tonight.")
+        self.assertFalse(seen.email_offer)
+        negotiation = Negotiation("husband")
+        seen = negotiation.observe(3, "I'll send you the documents tonight.", email_v2=True)
+        self.assertTrue(seen.email_offer)
+        self.assertEqual(negotiation.email_offers, [3])
 
 
 if __name__ == "__main__":

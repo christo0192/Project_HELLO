@@ -2759,5 +2759,195 @@ class FinalReviewRoundOneHarnessTests(unittest.TestCase):
         self.assertEqual(first["unprompted_dump_count"], 1)  # only the first telling is a dump
 
 
+class BunchingGridTests(unittest.TestCase):
+    """M032 S1 item 8: the bunching grid (advisor patterns x 20-65 s an exchange) with the S1 flags
+    off and on.  With them on no gated run may turn late or excluded, use the forced path more than
+    ``FORCED_TOLERANCE`` times more, or lose the time cue; and the families spread later at the
+    owner's pace instead of bunching on the first turn the rules allow.  Flags off is the behaviour
+    of origin/main (checked by hand against a main checkout when the grid was added).  Since M032
+    S2 "off" is every S1 and S2 flag off and "on" every one on (``all_flags``): the S2 flags default
+    on, so the S1 flags alone off would no longer be origin/main."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        cls.off = bunching_grid.run_grid(bunching_grid.all_flags("0"))
+        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"))
+        cls.steps_off = bunching_grid.run_steps(bunching_grid.all_flags("0"))
+        cls.steps_on = bunching_grid.run_steps(bunching_grid.all_flags("1"))
+
+    def test_no_gated_run_gets_worse(self):
+        """Including the learner who names her decision maker when asked (review S1-R1: one stall
+        she volunteered at 50-65 s an exchange pushed F2 past its slip limit)."""
+        self.assertIn("decider", self.grid.GATED_PATTERNS)
+        self.assertEqual(self.grid.regressions(self.off, self.on), [])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        """Review S1-R2: the S1 waits spend slack at the owner's pace, so a candidate who then slows
+        to 55-80 s an exchange may land a family later than before, but never so late that the
+        attempt loses its score (no new exclusion) or its time cue."""
+        self.assertEqual(self.grid.gate_regressions(self.steps_off, self.steps_on), [])
+
+    def test_every_family_lands_by_ten_minutes_at_the_owner_s_pace(self):
+        """Review S1R-4: a stop from R 10:00 is scored only with every family delivered, so where
+        the release before S1 finished by 10:00, S1 does too.
+
+        M032 S2P (review S2P-R3, D-M032-7): a probe costs an exchange by design, and R 10:00 no
+        longer switches the probes off (only the family deadlines do), so a run in which she asked
+        a probe may finish after 10:00; those runs are listed, not gated (2026-11-12: questioner
+        and pushy at 35 s, R 580 and 545 -> 650; reported to the owner).  No family is late in
+        them (``test_no_gated_run_gets_worse``)."""
+        later = []
+        for item in self.on:
+            base = next(
+                r for r in self.off if (r.pattern, r.pace) == (item.pattern, item.pace)
+            )
+            if base.last_r is not None and base.last_r <= 600:
+                if item.probes and (item.last_r is None or item.last_r > 600):
+                    later.append(f"{item.pattern}@{item.pace:.0f}: {base.last_r:.0f} -> {item.last_r}")
+                    continue
+                with self.subTest(pattern=item.pattern, pace=item.pace):
+                    self.assertLessEqual(item.last_r, 600)
+        print("\nprobe runs finishing after R 10:00: " + ("; ".join(later) or "none"))
+        self.assertLessEqual(len(later), 3)
+
+    def test_the_forced_path_is_not_used_more_often(self):
+        off = self.grid.totals(self.off)
+        on = self.grid.totals(self.on)
+        self.assertLessEqual(on["forced_moves"], off["forced_moves"])
+        self.assertLessEqual(on["late_runs"], off["late_runs"])
+        self.assertLessEqual(on["excluded_runs"], off["excluded_runs"])
+        self.assertLessEqual(on["cue_missing"], off["cue_missing"])
+
+    def test_the_families_spread_later_at_the_owner_s_pace(self):
+        def last(results, pattern, pace):
+            return next(r.last_r for r in results if (r.pattern, r.pace) == (pattern, pace))
+
+        for pattern in ("questioner", "offerer", "owner_shape"):
+            for pace in (20.0, 25.0):
+                with self.subTest(pattern=pattern, pace=pace):
+                    self.assertGreater(last(self.on, pattern, pace), last(self.off, pattern, pace))
+        for item in self.on:
+            with self.subTest(pattern=item.pattern, pace=item.pace):
+                self.assertGreaterEqual(item.last_r, last(self.off, item.pattern, item.pace))
+
+    def test_an_unforced_push_follows_a_reaction_where_the_plan_has_slack(self):
+        """SWEEP-1 (R1_PUSH_AFTER_REACTION): with the flags on far fewer unforced pushes come on the
+        line right after their primary at 35 s or faster, and at 20-25 s none does for the
+        patterns that leave the plan its slack.  The offerer's respond-first holds spend the slack
+        (its F3 push at 25 s has no turn to spare), and at 35 s the plan often has none
+        (``_may_hold``): there the push is raised at once, as before."""
+        off = self.grid.pushes_without_reaction(self.off)
+        on = self.grid.pushes_without_reaction(self.on)
+        self.assertLess(len(on), len(off) // 2)
+        slack = ("cooperative", "pitcher", "terse", "questioner")
+        fast = [
+            item
+            for item in on
+            if item.split("@")[0] in slack and float(item.split("@")[1].split(":")[0]) <= 25
+        ]
+        self.assertEqual(fast, [])
+
+    def test_flags_off_waits_for_no_moment(self):
+        self.assertEqual(sum(item.waits for item in self.off), 0)
+        self.assertGreater(sum(item.waits for item in self.on), 0)
+
+
+class S2BunchingGridTests(unittest.TestCase):
+    """M032 S2 (learner voice): the grid with S1 on and the S2 flags off, against every flag on.
+    The S2 voice notes steer wording, but SWEEP-3's volunteered stall spaces the next objection
+    (``note_objection`` is global) and SWEEP-12 moves the curiosity hand-over, so no gated run may
+    get worse, the forced path is not used more, and the ``pushy`` advisor (she volunteers the
+    not-today stall when asked to enrol today) leaves no family late that main did not."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        s2p_off = {name: "0" for name in bunching_grid.S2P_FLAGS}
+        cls.s1 = bunching_grid.run_grid({**bunching_grid.s2_flags("0"), **s2p_off})
+        cls.on = bunching_grid.run_grid(bunching_grid.s2p_flags("0"))
+        cls.main = bunching_grid.run_grid(bunching_grid.all_flags("0"), patterns=("pushy",))
+
+    def test_no_gated_run_gets_worse_than_with_s1_alone(self):
+        self.assertEqual(self.grid.regressions(self.s1, self.on), [])
+        s1 = self.grid.totals(self.s1)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], s1[key])
+
+    def test_the_pushy_advisor_leaves_no_family_newly_late(self):
+        on = {item.pace: item for item in self.on if item.pattern == "pushy"}
+        for base in self.main:
+            with self.subTest(pace=base.pace):
+                item = on[base.pace]
+                self.assertLessEqual(
+                    set(item.late) | set(item.excluded), set(base.late) | set(base.excluded)
+                )
+                self.assertLessEqual(item.forced, base.forced + self.grid.FORCED_TOLERANCE)
+
+    def test_the_scripted_learner_still_asks_when_handed_a_rotated_label(self):
+        """SWEEP-12's phrases are mapped to the same questions, so the cooperative advisor still
+        answers her curiosity as before."""
+        for phrases in self.grid.CURIOSITY_LABELS_V2.values():
+            for phrase in phrases:
+                self.assertIn(phrase, self.grid.CURIOSITY_LABEL_QUESTIONS)
+
+
+class S2PBunchingGridTests(unittest.TestCase):
+    """M032 S2P (probe first, S2 item 10): the probe adds an exchange per fact-based family, so the
+    grid with S1 and S2 on and the S2P flags off is compared with every flag on.  No gated run may
+    turn late or excluded or use the forced path more than ``FORCED_TOLERANCE`` times more, the
+    forced path is not used more in total, and the step rows lose no score.  ``answerer`` (an
+    advisor who answers her price and time questions) shows the probe-then-react path."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        every = tuple(bunching_grid.PATTERNS)
+        cls.s2 = bunching_grid.run_grid(bunching_grid.s2p_flags("0"), patterns=every)
+        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"), patterns=every)
+        cls.steps_s2 = bunching_grid.run_steps(bunching_grid.s2p_flags("0"))
+        cls.steps_on = bunching_grid.run_steps(bunching_grid.all_flags("1"))
+
+    def test_no_gated_run_gets_worse_and_the_forced_path_is_not_used_more(self):
+        self.assertEqual(self.grid.regressions(self.s2, self.on), [])
+        s2 = self.grid.totals(self.s2)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], s2[key])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        self.assertEqual(self.grid.gate_regressions(self.steps_s2, self.steps_on), [])
+
+    def test_she_still_probes_at_slower_paces(self):
+        """Review S2P-R3: the R 10:00 bound switched the probe off from 35 s an exchange (0 F1 and
+        F2 probes in 33 runs) and the anchor checked the website's price unprompted instead."""
+        print("\n" + self.grid.probe_table(self.on))
+        at = {pace: [item for item in self.on if item.pace == pace] for pace in self.grid.PACES}
+        self.assertTrue(any(item.probes.get("F1") for item in at[35.0]))
+        self.assertTrue(any(item.probes.get("F2") for item in at[35.0]))
+        for pace in (20.0, 25.0):
+            with self.subTest(pace=pace):
+                self.assertEqual([i.pattern for i in at[pace] if i.unprompted_check], [])
+        slow = [item for pace in (35.0, 50.0, 65.0) for item in at[pace]]
+        self.assertLessEqual(sum(1 for item in slow if item.unprompted_check), 5)
+
+    def test_the_probe_then_react_path_lands_every_family_at_the_owner_s_pace(self):
+        for item in self.on:
+            if item.pattern == "answerer" and item.pace <= 35:
+                with self.subTest(pace=item.pace):
+                    self.assertEqual(item.late, [])
+                    self.assertEqual(item.excluded, [])
+                    self.assertTrue(all(value is not None for value in item.delivered.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

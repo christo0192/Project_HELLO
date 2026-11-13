@@ -23,7 +23,9 @@ so the isolation rules are unit-testable without a session:
   ``parseR1AdministrationLog`` (``app/api/src/lib/r1/admin-log.ts``) reads exactly the names
   below; any other name parses as unknown, the scorer is told ``NOT PROBED`` / ``slip not
   reported``, and the gate fails closed.  ``tests/test_r1_admin_contract.py`` mirrors that key
-  set and fails when either side drifts.
+  set and fails when either side drifts.  The one exception is ``SESSION_FACT_WORKER_KEYS``:
+  counts the worker adds to ``session_facts`` for the owner (the learner's timing holds), which
+  the API stores with the row and never parses.
 
 No I/O, no logging, no clock and no candidate text is kept beyond what the caller passes in.
 """
@@ -45,7 +47,13 @@ from r1_prompts import (
     learner_prefix,
     select_context,
 )
-from r1_roleplay import TurnPlan
+from r1_roleplay import (
+    FLAG_WRAPUP_ANSWERS,
+    FLAG_WRAPUP_NEXT_ROUND,
+    FLAG_WRAPUP_ONE_MENTION,
+    TurnPlan,
+    flag_on,
+)
 from r1_world import WORLD_VERSION
 
 SOURCE_ATTEMPT = "attempt"
@@ -97,6 +105,82 @@ SESSION_FACT_KEYS = (
 # the same row for the owner's comparison.  Worker-only: the API stores it with the payload and its
 # parser reads none of it, so no gate or score can depend on it.  Labels and counts only.
 READER_FACT_KEYS = ("reader_shadow", "reader_agreement")
+# Worker-only ``session_facts`` keys (M032 S1 and SWEEP-1): the API stores them with the row and
+# does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
+# learner's timing holds as counts only (no text), so the owner's next test shows how often each
+# fired.  The engine's ``admin_log()["intents"]`` keys it reads, each a count or counts by label:
+SESSION_FACT_WORKER_KEYS = (
+    "learner_timing",
+    "learner_voice",
+    "learner_probe_first",
+    "learner_endings",
+    "wrapup",
+)
+_LEARNER_TIMING_COUNTS = ("moment_waits", "volunteered_objections", "split_replans")
+_LEARNER_TIMING_BY_LABEL = ("push_react_holds", "respond_first_holds", "concerns")
+# M032 S2 (learner voice): ``learner_voice`` reads the engine's ``admin_log()["voice"]``, counts
+# only: how her replies opened (SWEEP-4), their sentence counts (SWEEP-14), the scripted tails
+# bolted onto intent replies (item 8) and how often each S2 note or trim fired.
+_LEARNER_VOICE_COUNTS = (
+    "learner_replies",
+    "learner_ack_hinge_replies",
+    "learner_verdict_openers",
+    "learner_doubt_opener_replies",
+    "intent_turns",
+    "intent_tails_appended",
+    "intent_tails_after_question",
+    "no_commit_notes",
+    "volunteered_timing_stalls",
+    "ack_turn_notes",
+    "soft_tic_trims",
+    "implausible_offer_count",
+)
+_LEARNER_VOICE_BY_LABEL = ("sentence_histogram", "stall_theme_counts", "offer_terms_counts")
+# M032 S2P (probe first; review S2P-R8): ``learner_probe_first`` reads the engine's
+# ``admin_log()["probe_first"]`` (present only in a session with R1_PROBE_FIRST on; otherwise every
+# count is None), counts only: the probes she asked per family, her price questions that got no
+# figure, the redirects that asked instead of stating, the course lengths the guard dropped, the
+# figure challenges and SWEEP-22's price-reflex notes and price-first turns.
+_LEARNER_PROBE_FIRST_COUNTS = (
+    "price_dodges",
+    "redirect_probes",
+    "course_fact_unsaid_count",
+    "figure_challenges",
+    "price_reflex_notes",
+    "price_first_turns",
+)
+_LEARNER_PROBE_FIRST_BY_LABEL = ("probes",)
+# M032 S3 (endings and abuse): ``learner_endings`` reads the engine's ``admin_log()["endings"]``,
+# counts only: the closes read in role (hand-over closes, mutual goodbyes), the replies told to say
+# one short goodbye, the early-close asides and how they were answered, the late end requests and
+# the last-point asides (SWEEP-24), the abuse hits and hang-ups (S3.4, D-M032-3: scoring is
+# unchanged), the 19:00 reactions the guard cut a goodbye from (SWEEP-25) and the replies after
+# the time cue (SWEEP-27).  ``wrapup`` is the session's own counts of the wrap-up (S3.5 and
+# SWEEP-26): the one invitation asked, the hiring-team sentences taken out, the turns said in the
+# beat after L-EXIT and the affirmations that did not count as a question.
+_LEARNER_ENDINGS_COUNTS = (
+    "handover_closes",
+    "mutual_goodbyes",
+    "winding_replies",
+    "early_close_asks",
+    "early_close_accepted",
+    "early_close_declined",
+    "late_end_requests",
+    "last_point_asides",
+    "abuse_count",
+    "abuse_hangups",
+    "commit_reaction_dropped",
+    "short_on_time_notes",
+)
+_LEARNER_ENDINGS_BY_LABEL = ("closing_states",)
+_WRAPUP_COUNTS = (
+    "wrapup_more_asked",
+    "wrapup_hiring_team_drops",
+    "wrap_beat_turns",
+    "wrapup_affirmations",
+)
+_LABEL_MAX_CHARS = 32
+_LABELS_MAX = 16
 
 
 def guard_kind(category: object) -> str:
@@ -115,6 +199,74 @@ def _measured(value: object) -> int | float | None:
     if not math.isfinite(value) or value < 0:
         return None
     return value
+
+
+def _count(value: object) -> int | None:
+    """A non-negative whole count, or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _bounded_counts(
+    section: object, by_label: tuple[str, ...], counts: tuple[str, ...]
+) -> dict[str, Any]:
+    """``section``'s counts by label and plain counts, bounded; anything else is dropped."""
+    if not isinstance(section, Mapping):
+        section = {}
+    out: dict[str, Any] = {}
+    for key in by_label:
+        raw = section.get(key)
+        labelled: dict[str, int] = {}
+        if isinstance(raw, Mapping):
+            for label, value in sorted(
+                (item for item in raw.items() if isinstance(item[0], str)), key=lambda x: x[0]
+            ):
+                count = _count(value)
+                if count is None or len(label) > _LABEL_MAX_CHARS:
+                    continue
+                if len(labelled) >= _LABELS_MAX:
+                    break
+                labelled[label] = count
+        out[key] = labelled
+    for key in counts:
+        out[key] = _count(section.get(key))
+    return out
+
+
+def _learner_timing(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The learner's timing holds from the engine's admin log, as bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("intents"), _LEARNER_TIMING_BY_LABEL, _LEARNER_TIMING_COUNTS
+    )
+
+
+def _learner_voice(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S2: the learner's voice counts from the engine's admin log, bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("voice"), _LEARNER_VOICE_BY_LABEL, _LEARNER_VOICE_COUNTS
+    )
+
+
+def _learner_probe_first(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S2P: the probe-first counts from the engine's admin log, bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("probe_first"),
+        _LEARNER_PROBE_FIRST_BY_LABEL,
+        _LEARNER_PROBE_FIRST_COUNTS,
+    )
+
+
+def _learner_endings(admin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S3: the endings and abuse counts from the engine's admin log, bounded counts only."""
+    return _bounded_counts(
+        (admin or {}).get("endings"), _LEARNER_ENDINGS_BY_LABEL, _LEARNER_ENDINGS_COUNTS
+    )
+
+
+def _wrapup_counts(wrapup: Mapping[str, Any] | None) -> dict[str, Any]:
+    """M032 S3.5 and SWEEP-26: the session's wrap-up counts, bounded counts only."""
+    return _bounded_counts(wrapup, (), _WRAPUP_COUNTS)
 
 
 @dataclass(frozen=True)
@@ -197,6 +349,9 @@ class Reply:
     # (L-IB-HOLD, "Of course. {question}"), so a line nobody heard gives its once-per-session
     # budget back; "" for every other reply.
     repair: str = ""
+    # The line id of ``tail`` (M032 SWEEP-26: the wrap-up's L-WRAP-MORE is counted, and used up,
+    # only when it is actually spoken); "" for none.
+    tail_id: str = ""
 
 
 def llm_messages(
@@ -220,7 +375,14 @@ def llm_messages(
     )
     if reply.plan is not None:
         return assemble_messages(
-            learner_prefix(persona),
+            # M032 SWEEP-13, SWEEP-17 and SWEEP-21: the session's latched prefix (byte-stable for
+            # the whole session).
+            learner_prefix(
+                persona,
+                offer_realism=reply.plan.offer_realism,
+                probe_first=reply.plan.probe_first,
+                price_check=reply.plan.price_check,
+            ),
             select_context(ordered, ROLEPLAY_PHASE),
             reply.candidate_text,
             reply.plan.reminder,
@@ -229,7 +391,15 @@ def llm_messages(
         interviewer_prefix(voice=voice),
         select_context(ordered, reply.phase),
         reply.candidate_text,
-        interviewer_reminder(reply.phase, note=reply.note or None, rider=voice),
+        interviewer_reminder(
+            reply.phase,
+            note=reply.note or None,
+            rider=voice,
+            # M032 SWEEP-26: the wrap-up's sentences, by their rollback flags (read per reply).
+            wrapup_answers=flag_on(FLAG_WRAPUP_ANSWERS),
+            wrapup_one_mention=flag_on(FLAG_WRAPUP_ONE_MENTION),
+            wrapup_next_round=flag_on(FLAG_WRAPUP_NEXT_ROUND),
+        ),
     )
 
 
@@ -377,6 +547,7 @@ def session_facts_event(
     first_audio_p95_ms: float | None = None,
     reader: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
+    wrapup: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The one ``session_facts`` row the plan 6.4 gate cannot pass without.
 
@@ -412,5 +583,15 @@ def session_facts_event(
         "event_type": "session_facts",
         "turn_index": None,
         "family_id": None,
-        "payload": {"pins": dict(pins), **facts, **shadow, **added},
+        "payload": {
+            "pins": dict(pins),
+            **facts,
+            "learner_timing": _learner_timing(admin),
+            "learner_voice": _learner_voice(admin),
+            "learner_probe_first": _learner_probe_first(admin),
+            "learner_endings": _learner_endings(admin),
+            "wrapup": _wrapup_counts(wrapup),
+            **shadow,
+            **added,
+        },
     }

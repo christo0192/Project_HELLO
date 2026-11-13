@@ -2080,6 +2080,85 @@ class CoerciveS03Tests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(urgency_levers(text)[1])
 
+class EndingsTrackerTests(unittest.TestCase):
+    """M032 S3: the abuse reader (S3.4) and the permission form of an end request (SWEEP-24 (c)).
+
+    Every line is synthetic; the corpus checks read the 2,136 labelled advisor turns.
+    """
+
+    @staticmethod
+    def corpus():
+        fixtures = HERE / "tests" / "fixtures"
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if line:
+                    yield json.loads(line)["text"]
+
+    def test_abuse_aimed_at_her(self):
+        from r1_tracker import detect_abuse
+
+        for text in ("Fuck off.", "Screw you, I'm done with this.", "You are an idiot.",
+                     "You stupid woman, listen to me.", "Shut up.", "Oh just go away.",
+                     "Get lost, lady.", "Chup karo.", "Tu chutiya hai kya", "Are you stupid?",
+                     "Okay. Shut up and let me talk."):
+            with self.subTest(text=text):
+                self.assertTrue(detect_abuse(text))
+
+    def test_banter_and_talk_about_others_is_no_abuse(self):
+        from r1_tracker import detect_abuse
+
+        for text in ("The doubts will go away once you start.",
+                     "They told me to shut up in my last job.",
+                     "Shut up, that is amazing news!", "My old boss was an idiot.",
+                     "What the hell, that's cheap.", "You are not stupid for asking.",
+                     "Get lost in the projects, they're fun.", "Stupid question, but what's "
+                     "your budget?", "I won't go away without answering you."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_abuse(text))
+
+    def test_no_real_advisor_turn_reads_as_abuse(self):
+        from r1_tracker import detect_abuse
+
+        self.assertEqual([text[:60] for text in self.corpus() if detect_abuse(text)], [])
+
+    def test_the_permission_form_is_a_maybe_request_only_when_asked(self):
+        from r1_tracker import detect_end_request, end_intent_level, explicit_end_request
+
+        for text in ("You can disconnect the call.", "Okay, you can end the call now.",
+                     "You may hang up the call now."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_end_request(text))
+                self.assertTrue(detect_end_request(text, permission=True))
+                self.assertEqual(end_intent_level(text, None, permission=True), "maybe")
+                self.assertFalse(explicit_end_request(text))
+        for text in ("you can end the call and I'll call you back tomorrow",
+                     "you can end the course early", "you can cut the cost with EMI",
+                     "You can end the call now, I will call you back tomorrow."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_end_request(text, permission=True))
+
+    def test_the_permission_form_adds_no_corpus_hit(self):
+        from r1_tracker import detect_end_request
+
+        gained = [
+            text[:60]
+            for text in self.corpus()
+            if detect_end_request(text, permission=True) and not detect_end_request(text)
+        ]
+        self.assertEqual(gained, [])
+
+    def test_the_readers_stay_linear(self):
+        import time
+
+        from r1_tracker import detect_abuse, detect_end_request
+
+        for hostile in ("you " * 4000 + "idiot", "shut up, " * 3000, "okay, " * 4000 + "go away",
+                        "you can " * 3000 + "end the call"):
+            start = time.perf_counter()
+            detect_abuse(hostile)
+            detect_end_request(hostile, permission=True)
+            self.assertLess(time.perf_counter() - start, 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

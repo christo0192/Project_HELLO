@@ -266,6 +266,27 @@ TIC_PATTERNS = {
     TIC_HMM: re.compile(r"(?<![a-z-])hmm+\b|(?<![a-z-])hm\b", re.IGNORECASE),
     TIC_HONESTLY: re.compile(r"\b(?:honestly|to be honest|frankly)\b", re.IGNORECASE),
 }
+# M032 SWEEP-12 (flag R1_TIC_V2, read by the engine): "I'll be honest, ..." and "if I'm honest" are
+# the honesty tic too, but only as an aside before punctuation ("I'll be honest with myself about
+# it" is the sentence itself); and three soft tics the model moved on to ("actually" in 7 of 17
+# lines of one call, "genuinely", "properly").  The soft tics are a separate guard pass, outside
+# the one-filler budget, and only in a free reply (``r1_guard``).
+TIC_ACTUALLY = "actually"
+TIC_GENUINELY = "genuinely"
+TIC_PROPERLY = "properly"
+SOFT_TICS = (TIC_ACTUALLY, TIC_GENUINELY, TIC_PROPERLY)
+TIC_PATTERNS_V2 = {
+    TIC_HMM: TIC_PATTERNS[TIC_HMM],
+    TIC_HONESTLY: re.compile(
+        r"\b(?:honestly|to be honest|frankly)\b"
+        r"|\bi(?:'ll| will) be (?:honest|frank|upfront|straight)(?:\s+with\s+you)?(?=\s*[,:;.-])"
+        r"|\bif i'?m (?:being )?honest\b(?=\s*[,:;-])",
+        re.IGNORECASE,
+    ),
+    TIC_ACTUALLY: re.compile(r"\bactually\b", re.IGNORECASE),
+    TIC_GENUINELY: re.compile(r"\bgenuinely\b", re.IGNORECASE),
+    TIC_PROPERLY: re.compile(r"\bproper(?:ly)?\b", re.IGNORECASE),
+}
 _FIRST_WORD = re.compile(r"[a-z]+")
 
 
@@ -275,10 +296,14 @@ def reply_opener(text: object) -> str:
     return words[0] if words else ""
 
 
-def reply_tics(text: object) -> tuple[str, ...]:
-    """The tic words ("hmm", "honestly") that ``text`` contains, in a fixed order."""
+def reply_tics(text: object, *, v2: bool = False) -> tuple[str, ...]:
+    """The tic words ("hmm", "honestly") that ``text`` contains, in a fixed order.
+
+    ``v2`` (SWEEP-12) reads the wider honesty forms and the soft tics as well.
+    """
     folded = fold(text)
-    return tuple(tic for tic, pattern in TIC_PATTERNS.items() if pattern.search(folded))
+    patterns = TIC_PATTERNS_V2 if v2 else TIC_PATTERNS
+    return tuple(tic for tic, pattern in patterns.items() if pattern.search(folded))
 
 
 # ----------------------------------------------------------------------------------
@@ -399,9 +424,448 @@ def reply_phrases(text: object) -> tuple[str, ...]:
     return tuple(found)
 
 
+# M032 S1 concern ledger (RCA END-5, phone map M8 / spoken-style M4).  The themes the learner
+# herself voiced, read from what she actually said: once said (twice for pressure), a free reply is
+# told not to say it again in any words.  Steering only: nothing is ever cut from a reply.
+CONCERN_PRESSURE = "pressure"
+CONCERN_OFFENDED = "offended"
+CONCERN_THINK_OVER = "think_over"
+CONCERN_TRUST = "trust"
+# M032 SWEEP-3: the not-today stall (``not_deciding``), recorded by the engine while the flag
+# R1_NO_COMMIT_LEDGER is on; it is not one of ``concern_themes``.
+CONCERN_NOT_TODAY = "not_today"
+
+
+def _concern(pattern: str) -> re.Pattern[str]:
+    return re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE)
+
+
+# The think-it-over stall: the think_over theme's reader AND one arm of ``not_deciding`` (SWEEP-3:
+# "have S1.5's think_over theme use the same reader, so the two cannot disagree"; review S2R-5: "Let
+# me sleep on it" set only think_over, so F4-PRIMARY later said the stall again as news).  Taking
+# or needing time counts only as time to think or before deciding ("I need some time to think",
+# "I'll need some time before I decide"), never "some time off work" or "time to finish a project".
+_THINK_OVER = _concern(
+    r"think (?:it|this|that|things) (?:over|through)|"
+    r"get(?:ting)? back to you(?=\s*(?:[.,;!]|$|later|after|once|when|tomorrow|next week|soon|"
+    r"in a (?:few|couple of) days))|"
+    r"(?:give|put) (?:it|this) (?:some )?(?:proper |more |real |serious )?thought|"
+    r"sit with (?:it|this)|sleep on (?:it|this)|mull (?:it|this) over|"
+    r"(?:take|need|needs|taking|needing) (?:some|a (?:bit|little)(?: (?:of|more))?|a few days'?|"
+    r"a day or two|a couple of days|more) (?:time\s?)?"
+    r"(?=\s*(?:[.,;!]|$|to (?:think|decide|consider|process|weigh)|before (?:i |we )?"
+    r"(?:decid|commit|sign|enrol|agree|say)|for (?:this|it|that)\b|on my own\b|to myself\b|"
+    r"first\b|alone\b))"
+)
+
+
+# Per theme: the words a negation turns around ("I'm not offended", "there's no hurry", "I don't
+# need proof": review S1-R3, a false "you have already told the advisor ..." for the rest of the
+# session), then the phrasings that voice the concern whatever precedes them (None: none).  Trust is
+# read in its doubting forms only ("I trust you on that" voices no doubt).
+_CONCERNS: tuple[tuple[str, re.Pattern[str], re.Pattern[str] | None], ...] = (
+    (
+        CONCERN_PRESSURE,
+        _concern(r"pressur(?:e|ed|es|ing)|rush(?:ed|ing)?|hurr(?:y|ied|ying)"),
+        _concern(r"pushed into|only chance|breathing room|back off|on the spot"),
+    ),
+    (
+        CONCERN_OFFENDED,
+        _concern(
+            r"uncalled for|offend(?:ed|s|ing)?|hurtful|disrespect\w*|"
+            r"(?:that was|that's|that is|pretty|quite|very|bit|really|so) rude"
+        ),
+        _concern(r"caught me off guard|sour (?:taste|note)"),
+    ),
+    # S1.5's own reader (R1_NO_COMMIT_LEDGER off); with it on, ``concern_themes(...,
+    # shared_think_over=True)`` reads the theme with ``_THINK_OVER`` instead.
+    (
+        CONCERN_THINK_OVER,
+        _concern(
+            r"think (?:it|this|that|things) (?:over|through)|"
+            r"get(?:ting)? back to you (?:later|after|once|when|tomorrow|next week|"
+            r"in a (?:few|couple of) days)|"
+            r"(?:give|put) (?:it|this) (?:some )?(?:proper |more |real |serious )?thought|"
+            r"sit with (?:it|this)|sleep on (?:it|this)|mull (?:it|this) over|"
+            r"take (?:some|a (?:bit|little) of|a few days'?|a day'?s?) (?:time|to think)"
+        ),
+        None,
+    ),
+    (
+        CONCERN_TRUST,
+        _concern(
+            r"proof|prove (?:it|that|this)|evidence|"
+            r"see (?:it|that|this|some of (?:that|it|this)|results) (?:for )?myself|"
+            r"see for myself|"
+            r"(?:see|know|check|hear about|look at|what's|what is) (?:your|the|their) track record"
+        ),
+        _concern(
+            r"(?:don't|do not|can't|cannot|couldn't|hard to|not sure(?: if)?(?: i)?(?: can| could)?"
+            r"|before) trust(?:ing)?|"
+            r"trust (?:it|that|this|you|them|those numbers) (?:yet|blindly|just like that)|"
+            r"too good to be true"
+        ),
+    ),
+)
+CONCERN_THEMES = tuple(theme for theme, _turned, _fixed in _CONCERNS)
+# A negation in the same clause, at most ``NEGATION_WINDOW_WORDS`` words before the concern word.
+NEGATION_WINDOW_WORDS = 3
+_NEGATOR = re.compile(
+    r"\b(?:not|no|never|nothing|cannot|dont|doesnt|didnt|isnt|wasnt|arent|cant|wont)\b|n't\b",
+    re.IGNORECASE,
+)
+# ... unless the negation still voices it: an imperative clause ("please don't rush me"), "I don't
+# like being rushed", "I'd rather not be rushed", "I won't be pressured".
+_IMPERATIVE = re.compile(
+    r"^\s*(?:(?:so|and|but|just|okay|look|please)\s+){0,2}(?:don'?t|do not|never)\b",
+    re.IGNORECASE,
+)
+_STILL_VOICED = re.compile(
+    r"(?:n't|\bnot|\bnever)\s+(?:\w+\s+)?(?:like|want|appreciate|enjoy|love)\b"
+    r"|\brather not\b"
+    r"|\b(?:can'?t|cannot|won'?t|will not|refuse to)\s+be\b",
+    re.IGNORECASE,
+)
+_CLAUSE_BREAK = re.compile(r"[,.;:!?()\"]|\s-\s")
+
+
+def _negated(folded: str, start: int) -> bool:
+    """A negation in the clause just before ``start`` turns the concern around (review S1-R3)."""
+    clause = _CLAUSE_BREAK.split(folded[max(0, start - 80) : start])[-1]
+    window = " ".join(clause.split()[-NEGATION_WINDOW_WORDS:])
+    if _NEGATOR.search(window) is None:
+        return False
+    return _IMPERATIVE.search(clause) is None and _STILL_VOICED.search(window) is None
+
+
+def concern_themes(text: object, *, shared_think_over: bool = False) -> frozenset[str]:
+    """The concern themes the learner's own ``text`` voices (worker-side labels only).
+
+    ``shared_think_over`` (the engine passes R1_NO_COMMIT_LEDGER): the think_over theme is read
+    with the reader ``not_deciding`` shares (SWEEP-3), else with S1.5's own, so the flag's rollback
+    gives back S1's ledger exactly.
+    """
+    folded = fold(text)
+    found: set[str] = set()
+    for theme, turned, fixed in _CONCERNS:
+        if theme == CONCERN_THINK_OVER and shared_think_over:
+            # SWEEP-3: the very reader ``not_deciding`` uses, so the two never disagree.
+            if any(_says_think_over(sentence) for sentence in split_sentences(folded)):
+                found.add(theme)
+            continue
+        if (fixed is not None and fixed.search(folded)) or any(
+            not _negated(folded, match.start()) for match in turned.finditer(folded)
+        ):
+            found.add(theme)
+    return frozenset(found)
+
+
 def is_closer(text: object) -> bool:
     """True when ``text`` is the learner closing the call itself (``CLOSER``)."""
     return CLOSER.search(fold(text)) is not None
+
+
+# ----------------------------------------------------------------------------------
+# M032 S3 (endings).  Readers of the learner's own sign-off and of what a reaction before the
+# scripted WEAK line must not say.  Every quantifier is bounded; nothing here trims a reply by
+# itself (the guard and the engine decide).
+# ----------------------------------------------------------------------------------
+# S3.1 (RCA END-1 missed item: her sign-offs #80-#90 matched neither CLOSER nor STALL_CLOSER): her
+# real sign-off forms, besides ``CLOSER``.  "I'll get back to you" and "let me think it over" are
+# also the stall (``STALL_CLOSER``), so they count as a sign-off only under the two-part rule of
+# ``is_sign_off`` (the phrase ends the line and the line asks nothing) and only on a line that
+# carried no owed move or negotiation line (the engine's rule).
+SIGN_OFF = re.compile(
+    r"\b(?:i(?:'ll| will)|let me|i(?:'d| would) like to|i need to|i want to|i should) "
+    r"(?:think (?:it|this|things) (?:over|through)|get back to you|give (?:it|this) (?:some )?"
+    r"(?:proper |real |more |serious )?thought|take (?:some|a (?:bit|little) of) time"
+    r"(?: (?:on|over|with) (?:it|this))?|sit with (?:it|this)|sleep on (?:it|this))"
+    r"(?: (?:first|properly|for a (?:bit|while|day or two)|on my (?:own|end)|tonight|"
+    r"and get back to you|and come back to you))?"
+    r"|\b(?:let'?s|i'?ll|i will|we can) leave it (?:there|at that)\b",
+    re.IGNORECASE,
+)
+# What may follow the sign-off phrase at the end of the line: courtesy only.
+_SIGN_OFF_TAIL = re.compile(
+    r"^(?:[\s,.!-]*(?:then|now|for now|thanks?(?: you)?(?: so much)?(?: again)?|bye|goodbye|"
+    r"take care|okay|ok|alright))*[\s,.!-]*$",
+    re.IGNORECASE,
+)
+
+
+def is_sign_off(text: object) -> bool:
+    """S3.1: the learner's line signs off (its last sentence ENDS on a sign-off; nothing asked).
+
+    ``CLOSER`` ("Thanks for your time.", "Take care.") or one of her real forms (``SIGN_OFF``: "I'll
+    think it over", "I'll get back to you", "let me give it some proper thought", "I'll take some
+    time", "I'll sit with it", "let's leave it there"), followed by courtesy alone.  A line with a
+    question mark is never a sign-off ("I'll think it over, but what about the EMI?").
+    """
+    folded = fold(text)
+    if "?" in folded:
+        return False
+    sentences = split_sentences(folded)
+    if not sentences:
+        return False
+    last = sentences[-1]
+    for pattern in (SIGN_OFF, CLOSER):
+        for match in pattern.finditer(last):
+            if _SIGN_OFF_TAIL.match(last[match.end():]) is not None:
+                return True
+    return False
+
+
+# SWEEP-25 B: "I should go now", "I need to get going": she is leaving.  ("I'll let you go" is a
+# ``CLOSER``.)  And A2: her own request for the details by e-mail ("Could you just e-mail me the
+# details instead?", "send those over").
+LEAVE_TAKING = re.compile(
+    r"\bi(?:'ve got to| (?:should|must|need to|have to|gotta|got to)) "
+    r"(?:go|run|head off|hop off|jump off|get going|leave)\b",
+    re.IGNORECASE,
+)
+LEARNER_EMAIL_REQUEST = re.compile(
+    r"\b(?:e-?mail|send) me (?:the |those |all the )?(?:details|info|information|documents?|"
+    r"brochures?|it|that)\b"
+    r"|\bsend (?:it|them|those|the details|the documents?) (?:over|across|by e-?mail|on e-?mail|"
+    r"to my (?:e-?mail|inbox))\b"
+    r"|\bby e-?mail instead\b",
+    re.IGNORECASE,
+)
+
+
+def says_goodbye_or_sends(text: object) -> bool:
+    """SWEEP-25 B: a sentence the 19:00 reaction must not say.
+
+    A goodbye or sign-off, the stall, that she has to go, or a request for the e-mail (the
+    scripted WEAK line says that, once).
+    """
+    folded = fold(text)
+    return any(
+        pattern.search(folded) is not None
+        for pattern in (CLOSER, SIGN_OFF, STALL_CLOSER, LEAVE_TAKING, LEARNER_EMAIL_REQUEST)
+    )
+
+
+# ----------------------------------------------------------------------------------
+# M032 S2 (owner decision D-M032-4): readers of the LEARNER's own lines, for the next reply's
+# steering notes and for counts.  None of them ever trims a reply (SWEEP-4: a trimmed reply can be
+# emptied, and an emptied free reply speaks "Give me a second ...").  Every quantifier is bounded.
+# ----------------------------------------------------------------------------------
+# SWEEP-4 (fda9e9f6: 11 of 27 learner lines were a token reaction turned round with "but" or
+# "though", 8 of 27 opened by grading the advisor).  A reaction clause is short and judges or
+# acknowledges what the advisor said; a clause about her own life ("I have a good job") or a
+# negated one is not a reaction.
+ACK_HINGE_MAX_WORDS = 12
+HINGE_TAIL_WORDS = 15
+_REACTION_ADJ = (
+    r"(?:good|great|reasonable|reassuring|fair|helpful|useful|nice|encouraging|manageable|fine|"
+    r"generous|decent|interesting|tempting|better|clear|doable|sensible|positive|a relief|"
+    r"a (?:big |real )?help|a pleasant surprise)"
+)
+# On ``normalize``d text (lower case, apostrophes dropped: "that's" is "thats").
+_GRADES = re.compile(
+    r"\b(?:sounds?|seems?|looks?|feels?|is|are|was|thats|its|helps|helped)\b(?: \w+){0,2}? "
+    + _REACTION_ADJ
+    + r"\b"
+    r"|^(?:sounds?|seems?|looks?) (?:\w+ ){0,2}?" + _REACTION_ADJ + r"\b"
+    r"|\bmakes sense\b|\b(?:helps?|helped)$"
+    r"|^(?:fair enough|fair point|good to (?:hear|know)|glad to hear(?: that| it)?|nice to hear|"
+    r"great|good|perfect|nice|cool|fine)$"
+)
+_ACKNOWLEDGES = re.compile(
+    r"^(?:got it|thank you|thanks(?: \w+){0,3}|noted|understood|i see|right|okay|ok)$"
+    r"|^i (?:really |do |totally |completely )?(?:appreciate|get|understand|hear you|see)\b"
+)
+_LEAD_ACK_WORDS = frozenset(
+    "okay ok oh right yeah well alright sure great good cool fine so hmm hm ah".split()
+)
+_NEGATING_WORDS = frozenset(
+    "not never hardly no nothing none nobody neither nor dont doesnt isnt arent wasnt werent "
+    "wont cant couldnt wouldnt shouldnt didnt".split()
+)
+_FIRST_PERSON_WORDS = frozenset("i im ive id ill my me mine myself our us".split())
+_QUANTITY_PHRASE = re.compile(r"\ba (?:fair bit|good (?:chunk|amount|deal|bit)|great deal)\b")
+_HINGE_JOIN = re.compile(
+    r"(?:\s{0,3}(?:,|;|:|\s-+|\.\.\.)\s{0,3}|\s{1,3})(?:(?:honestly|frankly)\s{0,2},?\s{0,3})?"
+    r"(?:but|though|although|however)\b",
+    re.IGNORECASE,
+)
+_LEADING_TURN = re.compile(r"^\W{0,3}(?:but|though|although|however)\b", re.IGNORECASE)
+_TRAILING_THOUGH = re.compile(r"[\s,](?:though|tho)\W{0,3}$", re.IGNORECASE)
+_VERDICT_LEAD = re.compile(
+    r"^\W{0,3}(?:(?:okay|ok|oh|right|yeah|well|alright|all right|so|hmm|ah)\b[\s,.!-]{0,4}){0,3}",
+    re.IGNORECASE,
+)
+_CLAUSE_END = re.compile(
+    r"[,;:]|\s-+\s|\.\.\.|\b(?:but|though|although|however|and|so)\b", re.IGNORECASE
+)
+
+
+def _reaction_words(clause: str) -> tuple[list[str], list[str]] | None:
+    """The clause's words, and the same without its lead interjections; None when the clause is
+    too long or negated to be a reaction."""
+    words = normalize(clause).split()
+    if not words or len(words) > ACK_HINGE_MAX_WORDS:
+        return None
+    if any(word in _NEGATING_WORDS for word in words):
+        return None
+    rest = words
+    while rest and rest[0] in _LEAD_ACK_WORDS:
+        rest = rest[1:]
+    return words, rest
+
+
+def _grades(clause: str) -> bool:
+    """A short clause that judges what the advisor said ("That sounds reasonable")."""
+    read = _reaction_words(clause)
+    if read is None:
+        return False
+    words, rest = read
+    text = " ".join(words)
+    if any(word in _FIRST_PERSON_WORDS for word in words) or _QUANTITY_PHRASE.search(text):
+        return False
+    # "Good to hear" is a grade whole; "Okay, that sounds fine" once its "Okay" is off.
+    return _GRADES.search(text) is not None or (
+        bool(rest) and _GRADES.search(" ".join(rest)) is not None
+    )
+
+
+def _reacts(clause: str) -> bool:
+    """A short clause that judges or only acknowledges what the advisor said ("I get it")."""
+    read = _reaction_words(clause)
+    if read is None:
+        return False
+    _words, rest = read
+    if not rest:
+        return True  # nothing but an interjection: "Okay, but ..."
+    if _ACKNOWLEDGES.search(" ".join(rest)):
+        return True
+    return _grades(clause)
+
+
+def ack_hinge(text: object) -> bool:
+    """Her reply opens with a token reaction turned round with "but" or "though" (SWEEP-4).
+
+    "Sounds useful, but ...", "That helps. But ...", "Makes sense. I keep worrying about it
+    though.".  Not a contrast about her own life ("I've applied on my own, but nothing landed")
+    and not the conflict check ("I saw $9,000 on the website, but you're saying ten?").
+    """
+    sentences = split_sentences(text)
+    if not sentences:
+        return False
+    first = sentences[0]
+    join = _HINGE_JOIN.search(first)
+    if join is not None and join.start() > 0:
+        return _reacts(first[: join.start()])
+    if len(sentences) < 2 or not _reacts(first):
+        return False
+    second = sentences[1]
+    return _LEADING_TURN.match(second) is not None or (
+        word_count(second) <= HINGE_TAIL_WORDS and _TRAILING_THOUGH.search(second) is not None
+    )
+
+
+def reply_verdict(text: object) -> bool:
+    """Her reply's first sentence opens by grading the advisor ("Fair enough.", "That sounds
+    reasonable.") (SWEEP-4).  A negated grade ("That's not reasonable for me"), a quantity ("a
+    fair bit more", "a good chunk of money") and a line about her own life are no verdict."""
+    sentences = split_sentences(text)
+    if not sentences or "?" in sentences[0]:
+        return False
+    first = _VERDICT_LEAD.sub("", fold(sentences[0]), count=1)
+    clause = _CLAUSE_END.split(first, maxsplit=1)[0]
+    return _grades(clause)
+
+
+_DOUBT_OPENER = re.compile(
+    r"^\W{0,3}(?:(?:okay|ok|so|well|honestly|but|and|still)\b[\s,]{0,3}){0,2}"
+    r"(?:my (?:main |biggest |only |real |one )?(?:worry|concern) (?:is|would be)|"
+    r"what (?:really |still )?worries me)\b",
+    re.IGNORECASE,
+)
+
+
+def doubt_opener(text: object) -> bool:
+    """Her reply opens "My worry is ..." / "What worries me ..." (a replacement tic, SWEEP-4)."""
+    return _DOUBT_OPENER.search(fold(text)) is not None
+
+
+# SWEEP-3: the not-today stall ("I'm not ready to commit to anything today", "I'd want to think
+# it over before deciding"), and its think-it-over form (``_THINK_OVER``, the think_over theme's own
+# reader, so a think-over line is always a not-today line too).  Never "pay" (a payment-capacity
+# line is the money worry), and never a stall whose object is time, the schedule, a batch or money
+# ("I'm not ready to commit to six months yet", "I can't commit that much time right now").  Review
+# S2R-5/S2R-7: the exclusion reads only that object (the words between the verb and "today", and
+# the rest of its clause), never the whole sentence, so "Four to six hours sounds manageable, but
+# I'm not ready to decide today" is the stall; and the common phrasings count ("I don't want to
+# decide today", "I won't be signing up today", "I'm not in a position to decide today", "I can't
+# give you an answer today", a leading "Not today, ...").
+_NOT_TODAY_TIME = (
+    r"(?:today|tonight|yet|right now|just now|now|right away|immediately|on the spot|"
+    r"on (?:this|the) call|over the phone|at the moment|this (?:minute|second))"
+)
+_NOT_DECIDING = re.compile(
+    r"(?:\bnot|n't)\s{1,3}(?:(?:quite|really|yet|even|actually)\s{1,3})?"
+    r"(?:(?:ready|going|gonna|about|able|want|wanting|wanna|planning|looking|be|"
+    r"in a position|sure (?:that |if )?(?:i|we) (?:can|could|will|'ll|would|'d|should))\s{1,3})?"
+    r"(?:to\s{1,3})?(?:be\s{1,3})?"
+    r"(?:decid\w*|commit\w*|enrol\w*|sign(?:ing)? up|move forward|"
+    r"mak(?:e|ing) (?:a|the|any|my|that|this) (?:final )?decisions?)"
+    r"(?P<obj>[^.?!]{0,30}?)\b" + _NOT_TODAY_TIME + r"\b"
+    r"|(?:\bcan't|\bcannot|\bwon't|\bwill not)\s{1,3}(?:give|get)\s{1,3}(?:you\s{1,3})?"
+    r"(?:an?|my|any|a final)\s{1,3}(?:answer|decision)\b(?P<obj2>[^.?!]{0,20}?)\b"
+    + _NOT_TODAY_TIME
+    + r"\b"
+    r"|^\W{0,3}(?:(?:no|um|uh|well|so|sorry|okay|look)\b,?\s{1,3}){0,2}not today\b(?!\s{0,3}\?)",
+    re.IGNORECASE,
+)
+_NOT_DECIDING_EXCLUDED = re.compile(
+    r"\b(?:months?|weeks?|hours?|schedules?|weekends?|weekdays?|evenings?|keep(?:ing)? up|"
+    r"batch(?:es)?|class (?:timings?|times?)|(?:that much|this much|enough|more|the) time|"
+    r"pay\w*|money|price|fees?|cost\w*|emi|instal\w*|afford\w*|budget|dollars?)\b|\$",
+    re.IGNORECASE,
+)
+# The rest of the stall's clause: up to a comma or a clause word ("..., but", "because").
+_STALL_CLAUSE_END = re.compile(
+    r"[,;:]|\b(?:but|because|since|though|although|so)\b", re.IGNORECASE
+)
+_STALL_TAIL_CHARS = 40
+
+
+def _stall_tail(sentence: str, end: int) -> str:
+    """The rest of the clause after a stall that ends at ``end`` (its object, if any)."""
+    tail = sentence[end : end + _STALL_TAIL_CHARS]
+    return _STALL_CLAUSE_END.split(tail, maxsplit=1)[0]
+
+
+def _says_think_over(sentence: str) -> bool:
+    """``sentence`` (folded) voices the think-it-over stall, not negated, with no time or money
+    object."""
+    for match in _THINK_OVER.finditer(sentence):
+        if _negated(sentence, match.start()):
+            continue
+        if _NOT_DECIDING_EXCLUDED.search(_stall_tail(sentence, match.end())) is None:
+            return True
+    return False
+
+
+def not_deciding(text: object, *, think_over: bool = True) -> bool:
+    """Her line says she is not deciding or committing today (SWEEP-3), sentence by sentence.
+
+    Every think-it-over line (the think_over theme of ``concern_themes``) is one too, unless
+    ``think_over`` is False: then only the not-today stall in its own words counts (the concern
+    ledger names a think-over line by its own theme, never twice).
+    """
+    for sentence in split_sentences(text):
+        if think_over and _says_think_over(sentence):
+            return True
+        for match in _NOT_DECIDING.finditer(sentence):
+            scope = (match.group("obj") or match.group("obj2") or "") + _stall_tail(
+                sentence, match.end()
+            )
+            if _NOT_DECIDING_EXCLUDED.search(scope) is None:
+                return True
+    return False
 
 
 def is_hollow_turn(text: object) -> bool:
@@ -752,7 +1216,101 @@ def canonical_amounts(text: object) -> str:
     return _DOLLAR.sub(_dollar_repl, folded)
 
 
+# M032 S2P (review S2P-R6): the advisor's thousands shorthand without a currency word, "9k", "9.5k",
+# "nine grand", "9 grand".  Read only where the advisor's own figures are collected
+# (``r1_roleplay.advisor_amounts_in``, ``r1_negotiation.named_prices``), never by the shared
+# grammar above, so no other reader changes.  A count is none ("10k learners", "5k followers").
+_SHORTHAND_K = re.compile(r"(?<![\w$.,])(\d{1,2}(?:\.\d{1,2})?)\s?k\b", re.IGNORECASE)
+_SHORTHAND_GRAND = re.compile(
+    r"\b(\d{1,2}(?:\.\d)?|" + "|".join(sorted(_SMALL, key=len, reverse=True)) + r")\s+grand\b",
+    re.IGNORECASE,
+)
+
+
+def _shorthand_value(token: str) -> float | None:
+    lowered = token.lower()
+    if lowered in _SMALL:
+        return float(_SMALL[lowered])
+    try:
+        return float(lowered)
+    except ValueError:
+        return None
+
+
+def expand_shorthand_amounts(text: object) -> str:
+    """``text`` with "9k" and "nine grand" written as "$9000" (review S2P-R6); counts stay."""
+
+    def repl(match: re.Match[str]) -> str:
+        if COUNT_NOUN_AFTER.match(match.string, match.end()) is not None:
+            return match.group(0)
+        value = _shorthand_value(match.group(1))
+        if value is None or value <= 0:
+            return match.group(0)
+        return f"${int(round(value * 1000))}"
+
+    folded = fold(text)
+    return _SHORTHAND_GRAND.sub(repl, _SHORTHAND_K.sub(repl, folded))
+
+
 def clause_after(text: str, pos: int) -> str:
     """The clause of ``text`` that starts at ``pos`` and runs to the next clause break."""
     stop = _CLAUSE_BREAK.search(text, pos)
     return text[pos : stop.start() if stop else len(text)]
+
+
+# M032 SWEEP-18 (offer reader v2) and SWEEP-21 (price conflict).  A later-price threat or another
+# batch's price is never the price on the table: "decide now or later you will have to pay $13000",
+# "if you wait, you will have to pay $13000", "a new batch would be $12000".  The first form is
+# ``r1_tracker._later_price_threat`` (L6) copied here, because the negotiation must not import the
+# tracker (which feeds grading and is not changed); the other two forms are new.  Each needs a
+# figure above the list price in the sentence.
+_LATER_PRICE = re.compile(
+    r"\blater\b[^.?!]{0,40}?\b(?:you|it)\b(?P<verb>[^.?!]{0,20}?)\b"
+    r"(?:pay(?:ing)?|cost(?:s|ing)?|charged?)\b(?P<tail>[^.?!]{0,30})",
+    re.IGNORECASE,
+)
+_LATER_MUST = re.compile(r"\b(?:have to|has to|need to|must|end up)\b", re.IGNORECASE)
+_LATER_MORE = re.compile(
+    r"(?<!\bno )(?<!\bnothing )(?<!\bany )\b(?:more|higher)\b",
+    re.IGNORECASE,
+)
+_LATER_SURCHARGE = re.compile(
+    r"\b(?:interest|in total|emis?|instal+ments?|add-?ons?|"
+    r"for (?:the |an? |this |that )?(?:\w+ )?(?:plans?|modules?|mentor(?:ing|ship)|options?|"
+    r"add-?ons?|sessions?|packages?|emis?|instal+ments?))\b",
+    re.IGNORECASE,
+)
+_LATER_FIGURE = re.compile(r"\$(\d+)")
+_IF_YOU_WAIT = re.compile(
+    r"\bif (?:you|u) (?:wait|delay|hold off|postpone|miss (?:this|the) (?:batch|cohort|offer)|"
+    r"(?:do not|don'?t) (?:join|enrol+\w*|decide|sign up|book)(?: (?:now|today))?)\b"
+    r"[^.?!]{0,60}?\b(?:pay|paying|cost|costs|be|charged?)\b",
+    re.IGNORECASE,
+)
+_OTHER_BATCH = re.compile(
+    r"\b(?:new|next|later|upcoming|another|future|following) (?:batch|cohort|intake)\b"
+    r"[^.?!]{0,60}?\b(?:is|be|costs?|pay|paying|priced|charged?|goes up)\b",
+    re.IGNORECASE,
+)
+THREAT_LIST_USD = 9000
+
+
+def later_price_threat(sentence: object, list_usd: int = THREAT_LIST_USD) -> bool:
+    """A later-price threat or another batch's price in ``sentence`` (SWEEP-18, SWEEP-21).
+
+    "later you will have to pay $13000" (the tracker's L6 reading, copied), "if you wait, you will
+    have to pay $13000", "a new batch would be $12000".  The figure must be above ``list_usd``.
+    """
+    canonical = canonical_amounts(sentence)
+    for match in _LATER_PRICE.finditer(canonical):
+        tail = match.group("tail")
+        if _LATER_MORE.search(tail) and _LATER_SURCHARGE.search(canonical[match.start():]) is None:
+            return True
+        if _LATER_MUST.search(match.group("verb")) and any(
+            int(figure) > list_usd for figure in _LATER_FIGURE.findall(tail)
+        ):
+            return True
+    above = any(int(figure) > list_usd for figure in _LATER_FIGURE.findall(canonical))
+    if not above:
+        return False
+    return bool(_IF_YOU_WAIT.search(canonical) or _OTHER_BATCH.search(canonical))

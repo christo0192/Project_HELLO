@@ -63,6 +63,14 @@ from r1_scheduler import F1_COUNTER, PLAN, SLIP_LIMIT_SEC
 from r1_script import line
 from r1_session import R1Agent, R1Interview, run_r1_session
 from r1_world import FACTS, SCORER_RULE, WORLD_VERSION
+
+# M032 S2P (probe first) rollback flags, all off: the release before it.
+S2P_OFF = {
+    "R1_PROBE_FIRST": "0",
+    "R1_OFFER_READER_V2": "0",
+    "R1_COUNTER_V2": "0",
+    "R1_PRICE_CONFLICT": "0",
+}
 from tests.test_r1_core import (
     ROOM_NAME,
     SESSION_ID,
@@ -190,9 +198,11 @@ class SlowIntentReplies(FakeProvider):
 
     def __call__(self, messages):
         self.calls.append([dict(message) for message in messages])
-        # Every intent reminder hands its brief over with this line (L2 changed the shapes).
-        owed = "Raise this in your own words, as a real person would"
-        if owed in "\n".join(m["content"] for m in messages):
+        # Every intent reminder hands its brief over with one of these lines (L2 changed the
+        # shapes; M032 S2 hands an owed worry over as an objective, ``WORRY_LINE``).
+        owed = ("Raise this in your own words, as a real person would", "- What is on your mind:")
+        blob = "\n".join(m["content"] for m in messages)
+        if any(line in blob for line in owed):
             return self._hang_forever()
         return self._stream("Okay, that makes sense.")
 
@@ -575,9 +585,20 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(
                         {m["role"] for m in messages} <= {"system", "user", "assistant"}
                     )
-                    self.assertEqual(messages[0]["content"], learner_prefix(rendered))
-                    self.assertIn(rendered.public_card_text(), blob)
-                    self.assertIn("$9,000", blob)  # all the learner knows of the product
+                    # The session's latched prefix (M032 SWEEP-13 R1_OFFER_REALISM, S2P
+                    # R1_PROBE_FIRST and R1_PRICE_CONFLICT, each default on).
+                    self.assertTrue(plan.offer_realism)
+                    self.assertTrue(plan.probe_first)
+                    self.assertEqual(
+                        messages[0]["content"],
+                        learner_prefix(
+                            rendered, offer_realism=True, probe_first=True, price_check=True
+                        ),
+                    )
+                    self.assertIn(rendered.public_card_text(probe_first=True), blob)
+                    # M032 S2P (D-M032-7): she knows no course figure; she asks the advisor.
+                    self.assertNotIn("$9,000", blob)
+                    self.assertNotIn("6 months", blob)
                     self.assertEqual(messages[-1], {"role": "user", "content": OPENER})
                     # Hidden needs: this persona's deep needs are not released yet.
                     for topic in ("H1", "H2", "H3"):
@@ -620,7 +641,15 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
         spoken = await rig.converse(OPENER, advance=20)
         self.assertEqual(spoken, "Just exploring options.")
         messages = rig.last_messages()
-        self.assertEqual(messages[0], {"role": "system", "content": learner_prefix(rig.persona)})
+        self.assertEqual(
+            messages[0],
+            {
+                "role": "system",
+                "content": learner_prefix(
+                    rig.persona, offer_realism=True, probe_first=True, price_check=True
+                ),
+            },
+        )
         self.assertEqual(messages[1], {"role": "assistant", "content": rig.persona.pickup_line})
         reminder = messages[-2]
         self.assertEqual(reminder["role"], "system")
@@ -708,7 +737,8 @@ class TestInterviewerContext(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, blob)
         for topic in ("H1", "H2", "H3"):
             self.assertNotIn(persona.deep(topic), blob)
-        self.assertNotIn(learner_prefix(persona), blob)
+        for realism in (False, True):  # either latched prefix (M032 SWEEP-13)
+            self.assertNotIn(learner_prefix(persona, offer_realism=realism), blob)
         for other in PERSONAS:
             for variant in other.variants:
                 self.assertNotIn(variant.first_name, blob)
@@ -1127,10 +1157,30 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         messages = wrap.last_messages()
         self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
         self.assertEqual(messages[1], {"role": "system", "content": WRAPUP_NOTE})
-        # M032 S5: Christy's delivery rider follows the note while R1_INTERVIEWER_VOICE is on.
-        self.assertTrue(messages[-2]["content"].startswith(WRAPUP_REMINDER))
-        self.assertEqual(messages[-2]["role"], "system")
+        # M032 SWEEP-26: with its flags on (the default) the reminder carries the what's-left and
+        # cannot-answer sentences; with them off it is WRAPUP_REMINDER exactly.  M032 S5: Christy's
+        # delivery rider follows the note while R1_INTERVIEWER_VOICE is on (the default).
+        from r1_prompts import INTERVIEWER_DELIVERY_RIDER, wrapup_reminder
+
+        self.assertEqual(
+            messages[-2],
+            {
+                "role": "system",
+                "content": wrapup_reminder(answers=True, one_mention=True)
+                + "\n"
+                + INTERVIEWER_DELIVERY_RIDER,
+            },
+        )
+        self.assertTrue(messages[-2]["content"].startswith(WRAPUP_REMINDER[:120]))
         self.assertIn("never say goodbye", messages[-2]["content"])
+        with mock.patch.dict(
+            os.environ, {"R1_WRAPUP_ANSWERS": "0", "R1_WRAPUP_ONE_MENTION": "0"}
+        ):
+            await wrap.converse("And what are the shift timings?")
+        self.assertEqual(
+            wrap.last_messages()[-2],
+            {"role": "system", "content": WRAPUP_REMINDER + "\n" + INTERVIEWER_DELIVERY_RIDER},
+        )
 
     async def test_the_phase_driver_keeps_waiting_through_an_injection(self) -> None:
         rig = Rig()
@@ -1507,23 +1557,42 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     CALL_ASK = "Shall I send you the enrolment link so you can enrol today?"
 
     async def test_an_ask_before_the_window_gets_a_reason_and_never_a_commitment(self) -> None:
+        # The release before M032 S2P (probe first off): the money stall.
+        with mock.patch.dict(os.environ, S2P_OFF):
+            rig = Rig()
+            await rig.start_roleplay()
+            await rig.converse(OPENER, advance=20)
+            calls = len(rig.provider.calls)
+            spoken = await rig.converse(self.CALL_ASK, advance=100)
+            plan = rig.plan()
+            # R1-Q: no sanctioned stall line; the learner voices a reason in its own words (one model
+            # call, a scripted variant if the reply misses it) and agrees to nothing.
+            self.assertIs(plan.mode, TurnMode.INTENT)
+            # (Round 1: timing is the owed F4 pair's reason and is not voiced early as well, so the
+            # first reason an early ask meets is money.)
+            self.assertEqual(plan.negotiation_id, "N-MONEY")
+            self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+            self.assertEqual(len(rig.provider.calls), calls + 1)
+            self.assertFalse(rig.engine.commitment_resolved)
+            self.assertIn("ask_before_close_window", plan.reasons)
+            self.assertEqual(rig.engine.negotiation.voiced, {"money": plan.turn})
+            self.assertEqual(rig.engine.ledger.leak_total, 0)
+
+    async def test_with_probe_first_an_early_ask_gets_the_price_question_not_a_stall(
+        self,
+    ) -> None:
+        """M032 SWEEP-22: no price was named, so she asks it; no reason is voiced, no stall."""
         rig = Rig()
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
-        calls = len(rig.provider.calls)
         spoken = await rig.converse(self.CALL_ASK, advance=100)
         plan = rig.plan()
-        # R1-Q: no sanctioned stall line; the learner voices a reason in its own words (one model
-        # call, a scripted variant if the reply misses it) and agrees to nothing.
         self.assertIs(plan.mode, TurnMode.INTENT)
-        # (Round 1: timing is the owed F4 pair's reason and is not voiced early as well, so the
-        # first reason an early ask meets is money.)
-        self.assertEqual(plan.negotiation_id, "N-MONEY")
+        self.assertEqual(plan.negotiation_id, "N-PRICE-FIRST")
+        self.assertIn("?", spoken)
         self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
-        self.assertEqual(len(rig.provider.calls), calls + 1)
         self.assertFalse(rig.engine.commitment_resolved)
-        self.assertIn("ask_before_close_window", plan.reasons)
-        self.assertEqual(rig.engine.negotiation.voiced, {"money": plan.turn})
+        self.assertEqual(rig.engine.negotiation.voiced, {})
         self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_an_ask_in_the_window_gets_the_graded_line_verbatim(self) -> None:
@@ -1571,21 +1640,22 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     async def test_a_callback_proposal_before_the_window_is_met_with_a_reason_through_the_session(
         self,
     ) -> None:
-        rig = Rig()
-        await rig.start_roleplay()
-        await rig.converse(OPENER, advance=20)
-        spoken = await rig.converse(
-            "Can we schedule a call back tomorrow at 10:00 a.m.? I will email you the details.",
-            advance=100,
-            provider=FakeProvider("Okay."),
-        )
-        plan = rig.plan()
-        self.assertEqual(plan.negotiation_id, "N-MONEY")
-        self.assertTrue(spoken.startswith("Okay."))
-        self.assertNotIn("tomorrow", spoken.lower())
-        self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
-        self.assertEqual(rig.engine.negotiation.callbacks, [{"turn": 2, "has_slot": True}])
-        self.assertEqual(rig.engine.ledger.leak_total, 0)
+        with mock.patch.dict(os.environ, S2P_OFF):  # the release before M032 S2P
+            rig = Rig()
+            await rig.start_roleplay()
+            await rig.converse(OPENER, advance=20)
+            spoken = await rig.converse(
+                "Can we schedule a call back tomorrow at 10:00 a.m.? I will email you the details.",
+                advance=100,
+                provider=FakeProvider("Okay."),
+            )
+            plan = rig.plan()
+            self.assertEqual(plan.negotiation_id, "N-MONEY")
+            self.assertTrue(spoken.startswith("Okay."))
+            self.assertNotIn("tomorrow", spoken.lower())
+            self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+            self.assertEqual(rig.engine.negotiation.callbacks, [{"turn": 2, "has_slot": True}])
+            self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_the_same_conversation_gets_the_same_commitment_every_time(self) -> None:
         outcomes = []
@@ -1897,6 +1967,9 @@ class TestRoleplayDriver(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await rig.converse("ready"))
         self.assertIsNone(rig.interview._engine)  # nothing planned, nothing created
 
+    # M032 S3.3 changes this before 14:00 (Christy asks instead of the second goodbye's exit:
+    # ``TestEndingsThroughTheSession``); with R1_EARLY_CLOSE_ASIDE off it is the release before.
+    @mock.patch.dict(os.environ, {"R1_EARLY_CLOSE_ASIDE": "0"})
     async def test_a_farewell_ends_the_roleplay_only_after_the_early_close_redirect(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
@@ -3315,19 +3388,26 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-STEER",
                 "L-TRANSITION-REASK-2", "L-PICKUP-BRIDGE", "L-PICKUP", "L-EXIT", "L-WRAP",
                 "L-CLOSE", "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
+                "L-ASIDE-EARLY-CLOSE", "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-LAST-POINT",
+                "L-LEARNER-HANGUP", "L-ASIDE-HANGUP",
                 "L-TIME-UP", "L-MUTE", "L-MUTE-IV", "L-MUTE-RP", "L-SIL-IB", "L-SIL-NOAUDIO",
                 "L-SIL-END-NOAUDIO", "L-SIL-RP1",
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
             ),
         )
+        # M032 SWEEP-20: the redirect probes are a SAY_ONLY plan's text, which travels inside the
+        # reply stream (``llm_node``), like the redirect before them: not warmed either.
+        for line_id in ("L-REDIRECT-PRICE", "L-REDIRECT-TIME"):
+            self.assertNotIn(line_id, r1_session._WARM_ORDER)
         rig, _cache, synth = self.build()
         specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
             candidate_free=False
         )
         # M2 adds the offer, its resume line and L-TIME-UP; M032 S6 the replay, the recap,
         # "Yes, I'm here." and the pickup bridge; M032 S7C the three agendas, the hello again,
-        # the two no-audio lines and the two mute asides, in place of L-MUTE.
-        self.assertEqual(len(specs), 33)
+        # the two no-audio lines and the two mute asides, in place of L-MUTE; M032 S3 the
+        # early-close (two wordings), last-point and hang-up asides and her hang-up line.
+        self.assertEqual(len(specs), 38)
         warmed = {spec.text for spec in specs}
         for line_id in unreachable:
             if line_id not in ("L-OPEN", "L-OPEN-HELLO"):
@@ -3353,7 +3433,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertIn("We'll now move to the role-play", brief.text)
             pickup = next(spec for spec in off if spec.line_id == "L-PICKUP")
             self.assertTrue(pickup.text.startswith("Hello? Yes, this is "))
-        self.assertEqual(len(off), 29)  # revision 21's 22, and M032 S7C's 7 (their flags are on)
+        # Revision 21's 22, M032 S7C's 7 (their flags are on) and M032 S3's 5 (the learner lane).
+        self.assertEqual(len(off), 34)
         self.assertFalse(
             {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
             & {spec.line_id for spec in off}
@@ -3377,12 +3458,12 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
                 candidate_free=False
             )
-        self.assertEqual(len(off), 33)  # M032 S6 adds four lines, M032 S7C seven
+        self.assertEqual(len(off), 38)  # M032 S6 adds four lines, M032 S7C seven, M032 S3 five
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 34)
+        self.assertEqual(len(free) + len(named), 39)
         # M032 S7C: after the opening's four lines, the first name-free line of the transition.
         bridged = free[4]
         self.assertEqual(bridged.line_id, "L-TRANSITION-BRIDGED")
@@ -3407,7 +3488,7 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         off = {"R1_OPENING_SOUND_CHECK": "0", "R1_NO_AUDIO_LADDER": "0", "R1_MUTE_ASIDE_V2": "0"}
         with _env(**off):
             before = ids()
-        self.assertEqual(len(before), 26)
+        self.assertEqual(len(before), 31)  # revision 22's 26 and M032 S3's 5 (the learner lane)
         self.assertIn("L-MUTE", before)
         for name in ("L-OPEN-AGENDA", "L-SIL-NOAUDIO", "L-MUTE-IV", "L-MUTE-RP"):
             self.assertNotIn(name, before)
@@ -3540,6 +3621,119 @@ class TestLineCacheBuiltByTheRunner(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(run_r1_session(ctx, session_factory=factory), 10.0)
         self.assertIn(sentinel, seen)
+
+S3_MOVES = (
+    "F3-PRIMARY",
+    "F3-PUSH",
+    "F2-PRIMARY",
+    "F2-PUSH",
+    "F1-ANCHOR",
+    "F1-COUNTER",
+    "F4-PRIMARY",
+    "F4-PUSH",
+)
+
+
+class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
+    """M032 S3 through the real session: Christy's asides, the learner's line after them, and her
+    hang-up before Christy (synthetic advisor turns)."""
+
+    async def done_rig(self, *, keep: tuple[str, ...] = ()) -> Rig:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        for move_id in S3_MOVES:
+            if move_id not in keep:
+                rig.engine.scheduler.confirm_delivered(move_id, 60)
+        return rig
+
+    async def generated(self, rig: Rig) -> None:
+        await rig.until(lambda: bool(rig.session.generated))
+
+    async def test_an_in_role_close_is_asked_and_a_no_resumes_with_her_point(self) -> None:
+        rig = await self.done_rig()
+        close = "Okay, take your time and call me back later."
+        self.assertIsNone(await rig.converse(close, advance=300))
+        await rig.until_spoken("L-ASIDE-EARLY-CLOSE-TIME")
+        self.assertFalse(rig.interview._roleplay_over())
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # said to her
+        self.assertIsNone(await rig.converse("No, let's keep going.", advance=3))
+        await rig.until_spoken("L-ASIDE-WRAP-RESUME")
+        await self.generated(rig)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")  # said to Christy
+        reply = rig.interview._last_reply
+        self.assertIn("continuation:resume", reply.plan.reasons)
+        self.assertEqual(reply.candidate_text, close)  # her context ends on the advisor's close
+        stream = rig.interview.llm_node_stream(SimpleNamespace(items=[]), rig.provider)
+        said = "".join([chunk async for chunk in stream]).strip()
+        self.assertTrue(said)
+        blob = blob_of(rig.last_messages())
+        self.assertIn(r1_roleplay.CONTINUE_NOTE, blob)
+        self.assertNotIn(rig.interview.render_line("L-ASIDE-WRAP-RESUME"), blob)
+        self.assertEqual(rig.last_messages()[-1], {"role": "user", "content": close})
+
+    async def test_a_yes_to_the_question_ends_the_roleplay_into_the_wrapup(self) -> None:
+        rig = await self.done_rig()
+        await rig.converse("Thanks for your time, bye.", advance=640)
+        await rig.until_spoken("L-ASIDE-EARLY-CLOSE")
+        self.assertIsNone(await rig.converse("Yes, let's stop here.", advance=3))
+        self.assertTrue(rig.interview._roleplay_over())
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")
+        self.assertEqual(rig.session.generated, [])
+
+    async def test_she_hangs_up_in_her_voice_before_christy_asks(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        self.assertIsNone(await rig.converse("Oh just shut up.", advance=60))
+        await rig.until_spoken("L-ASIDE-HANGUP")
+        hangup = rig.interview.render_line("L-LEARNER-HANGUP")
+        aside = rig.interview.render_line("L-ASIDE-HANGUP")
+        self.assertLess(rig.order.index(("play_end", hangup)), rig.order.index(("play_start", aside)))
+        learner = [item for item in rig.interview._history if item.get("text") == hangup]
+        self.assertEqual([item["voice"] for item in learner], ["learner"])
+        self.assertEqual([item["phase"] for item in learner], ["roleplay"])
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # the abuse is evidence
+        self.assertTrue(rig.engine.wrap_question_open)
+        self.assertIsNone(await rig.converse("No, sorry, let's continue.", advance=3))
+        await rig.until_spoken("L-ASIDE-WRAP-RESUME")
+        self.assertEqual(rig.session.generated, [])  # the advisor calls her back: he speaks next
+        self.assertFalse(rig.interview._roleplay_over())
+
+    async def test_the_last_point_follows_christy_and_a_quiet_then_ends_it(self) -> None:
+        rig = await self.done_rig(keep=("F4-PUSH",))
+        self.assertIsNone(await rig.converse("End the interview.", advance=830))
+        await rig.until_spoken("L-ASIDE-LAST-POINT")
+        await self.generated(rig)
+        plan = rig.interview._last_reply.plan
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, "F4-PUSH"))
+        self.assertIn("continuation:last_point", plan.reasons)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")  # said to Christy
+        self.assertFalse(rig.interview._roleplay_over())
+        rig.interview._drop_stale_turns()  # the request's own transcript is the driver's past
+        with mock.patch.object(r1_session, "ROLEPLAY_PROMPT_SECONDS", 0.05):
+            self.assertIsNone(await asyncio.wait_for(rig.interview._roleplay_turn(), 5.0))
+        self.assertTrue(rig.interview._roleplay_over())
+
+    async def test_the_new_asides_are_warmed_and_her_line_is_hers(self) -> None:
+        for line_id in ("L-ASIDE-EARLY-CLOSE", "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-LAST-POINT",
+                        "L-LEARNER-HANGUP", "L-ASIDE-HANGUP"):
+            self.assertIn(line_id, r1_session._WARM_ORDER)
+        self.assertIn("L-LEARNER-HANGUP", r1_session._LEARNER_LINES)
+        for line_id in ("L-WRAP-MORE", "L-FAQ-DEFER-WRAP"):  # inside a reply stream
+            self.assertNotIn(line_id, r1_session._WARM_ORDER)
+
+    async def test_the_session_facts_carry_the_endings_counts(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        await rig.converse("Oh just shut up.", advance=60)
+        facts = r1_session.session_facts_event(
+            rig.engine.admin_log(), {}, roleplay_seconds=80.0
+        )["payload"]["learner_endings"]
+        self.assertEqual(facts["abuse_count"], 1)
+        self.assertEqual(facts["abuse_hangups"], 1)
+        self.assertNotIn("last_point", facts)  # counts only
 
 
 # ----------------------------------------------------------------- M032 S5: Christy as interviewer

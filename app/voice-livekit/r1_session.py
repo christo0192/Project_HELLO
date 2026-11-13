@@ -224,7 +224,7 @@ from r1_end_intent import (
     parse_end_intent,
     prefilter_hit,
 )
-from r1_guard import FALLBACK_REPLY, StreamGuard
+from r1_guard import FALLBACK_REPLY, HIRING_MENTION, StreamGuard
 from r1_icebreaker import (
     BRIDGE_NOTE,
     BRIDGE_TIMEOUT_SEC,
@@ -283,7 +283,16 @@ from r1_prompts import (
     interviewer_voice_enabled,
     select_context,
 )
-from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
+from r1_roleplay import (
+    IN_ROLE_ASIDE_REASONS,
+    FLAG_WRAPUP_ANSWERS,
+    FLAG_WRAPUP_DECLINE_V2,
+    WRAP_OFFER_PAUSE_SEC,
+    RolePlayEngine,
+    TurnMode,
+    TurnPlan,
+    flag_on,
+)
 from r1_script import (
     INTERVIEWER_NAME,
     active_line_id,
@@ -496,6 +505,12 @@ WRAPUP_SETTLE_SECONDS = 1.5
 WRAPUP_SETTLE_ACK_FACTOR = 2.0
 WRAPUP_SETTLE_LEAD_IN_FACTOR = 2.5
 WRAPUP_QUESTION_LIMIT = 2
+# M032 S3.5 (flag R1_WRAPUP_DECLINE_V2; RCA END-7): a beat between L-EXIT and L-WRAP, which ran
+# straight into each other.  It is spent in ROLEPLAY_EXIT, so a turn said inside it gets no reply
+# of its own (L-WRAP invites the question); a candidate still mid-turn when it ends is let finish,
+# at most ``WRAP_BEAT_HOLD_SECONDS``, so the uninterruptible L-WRAP never talks over them.
+WRAP_BEAT_SECONDS = 0.7
+WRAP_BEAT_HOLD_SECONDS = 4.0
 # M2 (owner and manager decisions of 2026-11-03): the role-play never ends by itself before its
 # time.  The early exit of plan 5.1 (commitment resolved and R >= 14:00) is the interviewer's offer
 # to wrap up (``r1_roleplay``: L-ASIDE-WRAP), at a candidate turn that leaves a natural pause or
@@ -534,7 +549,7 @@ _HELD_STT_EVENTS = frozenset({"final_transcript", "interim_transcript", "preflig
 # Scripted lines the LEARNER speaks; every other line is the interviewer's.  The voice decides
 # which model call may later see the line (``r1_prompts.select_context``).
 _LEARNER_LINES = frozenset(
-    {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP"}
+    {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP", "L-LEARNER-HANGUP"}
 )
 _REPLIES_KEPT = 8
 _SESSION_ID_FROM_ROOM = re.compile(
@@ -696,6 +711,12 @@ _WARM_ORDER = (
     "L-ASIDE-END",
     "L-ASIDE-WRAP",
     "L-ASIDE-WRAP-RESUME",
+    # M032 S3: the early-close, last-point and hang-up asides and her hang-up line.
+    "L-ASIDE-EARLY-CLOSE",
+    "L-ASIDE-EARLY-CLOSE-TIME",
+    "L-ASIDE-LAST-POINT",
+    "L-LEARNER-HANGUP",
+    "L-ASIDE-HANGUP",
     "L-TIME-UP",
     "L-MUTE",
     "L-MUTE-IV",
@@ -1041,6 +1062,20 @@ def fold_speech(text: object) -> str:
     return " ".join(_EDGE_APOSTROPHES.sub(" ", "".join(folded)).split())
 
 
+# M032 S3.5 (flag R1_WRAPUP_DECLINE_V2; the RCA's missed item, fda9e9f6 #94): "No, we are good.",
+# "We're good." and "We're all set." refuse as "I'm good" does.  Read as that phrase, so every other
+# rule of ``is_no_questions`` (courtesy only around it, a question mark keeps the turn) still holds.
+_WE_ARE_GOOD_RE = re.compile(r"\bwe(?:'re| are) (?:all )?(?:good|set|fine|done|okay|ok)\b")
+
+
+def _refusal_folded(text: str) -> str:
+    """``fold_speech(text)``, with R1_WRAPUP_DECLINE_V2's "we're good" read as "I'm good"."""
+    folded = fold_speech(text)
+    if flag_on(FLAG_WRAPUP_DECLINE_V2):
+        folded = _WE_ARE_GOOD_RE.sub("i'm good", folded)
+    return folded
+
+
 def is_no_questions(text: str) -> bool:
     """Return true only for a refusal wrapped in nothing but courtesy ("no questions, thanks").
 
@@ -1051,10 +1086,11 @@ def is_no_questions(text: str) -> bool:
     opens with ("nothing else, the notice period", "no thanks, any idea when results come").
     A question mark keeps the turn too, even when the rest is courtesy ("no questions?"): the
     interviewer answers it, and an unneeded reply costs far less than a swallowed question.
+    M032 S3.5 (R1_WRAPUP_DECLINE_V2): "No, we are good." and "We're all set." refuse too.
     """
     if "?" in text or "？" in text:
         return False
-    folded = fold_speech(text)
+    folded = _refusal_folded(text)
     if _NO_QUESTIONS_RE.search(folded) is None:
         return False
     rest = _NO_QUESTIONS_RE.sub(" ", folded)
@@ -1093,7 +1129,7 @@ def wrapup_settle_seconds(text: str) -> float:
     waiting is a second or two before the closing line; the cost of not waiting is the closing
     line spoken, uninterruptibly, over the candidate's question.
     """
-    folded = fold_speech(text)
+    folded = _refusal_folded(text)
     words = folded.split()
     if words and words[-1] in _LEAD_IN_WORDS:
         return WRAPUP_SETTLE_SECONDS * WRAPUP_SETTLE_LEAD_IN_FACTOR
@@ -1137,6 +1173,42 @@ def is_name_only(text: str) -> bool:
     return any(word in _INTERVIEWER_NAMES for word in words) and all(
         word in _INTERVIEWER_NAMES or word in _CALLING_WORDS for word in words
     )
+
+
+# M032 SWEEP-26 (flag R1_WRAPUP_ANSWERS): a wrap-up turn that only says yes or asks leave to ask
+# ("Yes.", "Yeah, one more.", "Can I ask one more?", "Yes, I have a question.").  The question
+# comes next, so the turn does not count toward ``WRAPUP_QUESTION_LIMIT`` (the invited question is
+# never cut off); the model still answers it ("Of course, go ahead.").  Every word must be one of
+# these and one of them must say yes or ask.
+_AFFIRMATION_CORE = frozenset({"yes", "yeah", "yep", "yup", "sure", "haan", "ask", "one", "do"})
+_AFFIRMATION_WORDS = frozenset(
+    {
+        *_AFFIRMATION_CORE, "ok", "okay", "alright", "more", "another", "question", "questions",
+        "thing", "can", "could", "may", "i", "just", "quick", "small", "please", "actually",
+        "so", "um", "uh", "hmm", "well", "ji", "have", "a", "if", "that's", "fine", "would",
+        "like", "to", *_INTERVIEWER_NAMES,
+    }
+)
+# The wrap-up's invitation (L-WRAP-MORE) needs this much of the wrap-up budget left.
+WRAP_MORE_MIN_SECONDS = 30.0
+
+
+def is_affirmation_only(text: str) -> bool:
+    """A wrap-up turn that is only a yes, or leave to ask one more question (no question in it)."""
+    words = fold_speech(text).split()
+    return (
+        bool(words)
+        and any(word in _AFFIRMATION_CORE for word in words)
+        and all(word in _AFFIRMATION_WORDS for word in words)
+    )
+
+
+def ends_with_question(text: str) -> bool:
+    """The last sentence of ``text`` ends with a question mark (quote marks aside).
+
+    M032 SWEEP-26: the wrap-up's invitation is not added after an answer that already asked.
+    """
+    return str(text or "").rstrip().rstrip("\"')").endswith(("?", "？"))
 
 
 # Words that answer nothing: apology, thanks, greeting, "are you there?", hesitation and
@@ -2677,6 +2749,12 @@ class R1Interview:
         self._wrapup_answer_owed: Reply | None = None
         self._wrapup_answer_cut: Reply | None = None
         self._wrapup_retried = False
+        # M032 S3.5 and SWEEP-26 (counts only, ``session_facts.wrapup``): the wrap-up's one
+        # invitation (L-WRAP-MORE) was spoken, the candidate turns heard in the beat after L-EXIT,
+        # and the affirmations ("Yes.", "Can I ask one more?") that did not count as a question.
+        self._wrap_more_used = False
+        self._wrap_beat_turns = 0
+        self._wrapup_affirmations = 0
         # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
         # not had the "I'm ready" press yet (``_awaiting_ready``: what the data handler checks),
         # the page was told ``awaiting=ready`` and not yet that it is over, the press itself
@@ -3496,6 +3574,7 @@ class R1Interview:
                         # M032 S4: the turn reader's shadow record (labels only), if it ran.
                         reader=self._reader_facts(),
                         extra=self._repair_facts(),
+                        wrapup=self._wrapup_counts(),
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - the record must never block the exit
@@ -4987,6 +5066,11 @@ class R1Interview:
                 self._plan_icebreaker_reply(reply, text, index)
             if text and phase in (R1Phase.OPENING, R1Phase.ICEBREAKER) and not reply.scripted:
                 self._add_presence_opener(reply, text, waited)
+            elif phase is R1Phase.WRAPUP and self._wrap_more_due(text):
+                # M032 SWEEP-26: one invitation for another question after her answer, once per
+                # session (used up when it is spoken, ``_screened``).
+                reply.tail = self.render_line("L-WRAP-MORE")
+                reply.tail_id = "L-WRAP-MORE"
         self._last_reply = self._latest_reply = reply
         if self.machine.phase is R1Phase.WRAPUP:
             self._wrapup_answer_owed = reply
@@ -5184,6 +5268,22 @@ class R1Interview:
             option_count=self._icebreaker_plan.cursor,
         )
 
+    def _wrap_more_due(self, text: str) -> bool:
+        """M032 SWEEP-26 (R1_WRAPUP_ANSWERS): whether Christy's answer gets L-WRAP-MORE as its tail.
+
+        Once per session, only after a real question (not a refusal, a lead-in, her name alone or
+        a bare yes) and only while ``WRAP_MORE_MIN_SECONDS`` of the wrap-up are left.
+        """
+        return (
+            flag_on(FLAG_WRAPUP_ANSWERS)
+            and not self._wrap_more_used
+            and not is_no_questions(text)
+            and not is_lead_in_only(text)
+            and not is_name_only(text)
+            and not is_affirmation_only(text)
+            and self.machine.remaining_wrapup_seconds() >= WRAP_MORE_MIN_SECONDS
+        )
+
     def _queue_transition_line(self, action: str, index: int | None = None) -> None:
         """M1: hand the driver the scripted line a suppressed transition turn gets, if any.
 
@@ -5297,16 +5397,25 @@ class R1Interview:
             # M2: the turn the offer to wrap up follows was said to the learner, so it stays a
             # role-play turn (``wrap_offer:<trigger>``).  An answer to the offer is said to the
             # interviewer, as the turn that confirms a stop is: its row is ``aside`` too.
-            if not any(reason.startswith("wrap_offer:") for reason in plan.reasons):
+            # M032 S3: so was the in-role close Christy asks about and the abuse she hangs up on.
+            if not any(reason.startswith(IN_ROLE_ASIDE_REASONS) for reason in plan.reasons):
                 if entry is not None:
                     entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
-                if any(reason.startswith("wrap_offer_") for reason in plan.reasons):
+                if any(reason.startswith("wrap_offer_") for reason in plan.reasons) or (
+                    "last_point_aside" in plan.reasons or "last_point_pending" in plan.reasons
+                ):
+                    # M032 SWEEP-24: the late request to end is said to Christy, as a confirmed
+                    # stop is (the engine leaves it out of the role-play turns too).
                     self._candidate_row_phase = "aside"
             if plan.scripted_text:  # an answer that leaves the offer open says nothing
                 self._spawn(self._play_aside(plan))
             raise StopResponse()
         if plan.exit_roleplay:
-            if "end_confirmed" in plan.reasons or "wrap_offer_accepted" in plan.reasons:
+            if (
+                "end_confirmed" in plan.reasons
+                or "wrap_offer_accepted" in plan.reasons
+                or "end_request_late_exit" in plan.reasons
+            ):
                 # An out-of-role stop is said to the interviewer, not to the learner: like the
                 # turns of an aside it stays out of the learner's context (plan 5.10), and its
                 # transcript row is written as ``aside`` too (``prepare_turn``), so the API gate
@@ -5337,6 +5446,12 @@ class R1Interview:
         This runs off the SDK hook, not in the driver, so it is the one place besides the mute
         event that moves ROLEPLAY -> ASIDE, and it must guarantee the way back.
         """
+        prelude = getattr(plan, "prelude_line", None)
+        if prelude and self.machine.phase is R1Phase.ROLEPLAY:
+            # M032 S3.4: the learner hangs up in role first (her voice, R running), then Christy.
+            await self.say(prelude)
+            if self._stop_outcome() is not None:
+                return
         resume = self.machine.phase is R1Phase.ROLEPLAY
         if resume:
             self._enter(R1Phase.ASIDE)
@@ -5350,6 +5465,60 @@ class R1Interview:
         finally:
             if resume:
                 self._close_coach_aside()
+        if getattr(plan, "continuation", False):
+            self._speak_continuation()
+
+    def _speak_continuation(self) -> None:
+        """M032 S3.3 and SWEEP-24: the learner carries on right after the aside (one reply).
+
+        Her line answers no new candidate turn: it is planned by the engine
+        (``continuation_plan``) and spoken through the SDK's ``generate_reply``, paired with a
+        prepared Reply whose newest user message is the candidate's last role-play turn (the
+        aside's own turns are not in her context).  Nothing is said while the candidate is muted,
+        after a stop, or once the role-play is over.
+        """
+        engine = self._engine
+        if (
+            engine is None
+            or self.machine.phase is not R1Phase.ROLEPLAY
+            or self._muted
+            or self._stop_outcome() is not None
+            or self._roleplay_over()
+        ):
+            return
+        entry = next(
+            (
+                item
+                for item in reversed(self._history)
+                if item.get("role") == "candidate" and item.get("phase") == ROLEPLAY_PHASE
+            ),
+            None,
+        )
+        generate = getattr(self.session, "generate_reply", None)
+        if entry is None or not callable(generate):
+            return
+        r_sec = self.machine.roleplay_elapsed
+        plan = engine.continuation_plan(r_sec)
+        if plan is None:
+            return
+        reply = Reply(
+            phase=ROLEPLAY_PHASE,
+            candidate_text=str(entry.get("text") or ""),
+            entry=entry,
+            plan=plan,
+            r_sec=r_sec,
+        )
+        _log.info("unknown_event", error_type="r1_continuation", error_category=plan.mode.value)
+        self._last_reply = self._latest_reply = reply
+        try:
+            generate()  # a SpeechHandle: never awaited (that waits out its whole playout)
+        except Exception as exc:  # noqa: BLE001 - the role-play goes on without the line
+            self._latest_reply = None
+            _log.warn(
+                "unknown_event",
+                error_type="r1_continuation_failed",
+                error_category=_error_type_of(exc),
+            )
 
     def _close_coach_aside(self) -> None:
         """Return from the coach aside, or hand the return to the path that will see it.
@@ -6163,7 +6332,7 @@ class R1Interview:
 
         reported_before = self._llm_errors_reported
         spoke = False  # a sentence of the model's reply already reached the consumer
-        last_sentence = ""
+        last_sentence = ""  # the last sentence that reached it (M032 SWEEP-26)
         recover = False
         iterator: Any = None
         try:
@@ -6207,6 +6376,13 @@ class R1Interview:
             # M032 S5: in the icebreaker the plan's current question, not "Sorry, what were you
             # saying?" (the candidate was clear; the provider was not).
             yield (reply.fallback or FALLBACK_REPLY) + " "
+        elif spoke and reply.tail_id == "L-WRAP-MORE":
+            # M032 SWEEP-26: the one invitation, never after an answer that already asked, and
+            # used up only now that it is spoken.
+            if not self._wrap_more_used and not ends_with_question(last_sentence):
+                self._wrap_more_used = True
+                _log.info("unknown_event", error_type="r1_wrapup_more_asked")
+                yield reply.tail + " "
         elif spoke and reply.tail:
             if reply.tail_optional and _has_question_mark(last_sentence.rstrip()[-1:]):
                 self._drop_answer_tail(reply)  # M032 S6 item 7: never two questions in one turn
@@ -8059,6 +8235,9 @@ class R1Interview:
                 # there?" is not an answer to L-ASIDE-END.  Nor to the offer to wrap up (M2).
                 self._engine.end_question_lapsed()
                 self._engine.wrap_question_lapsed(self.machine.roleplay_elapsed)
+                if self._engine.last_point_lapsed():
+                    # M032 SWEEP-24: a quiet after her last point ends the role-play as asked.
+                    return None
             return await self._silence_ladder(
                 [
                     ("L-SIL-RP1", ROLEPLAY_FIRST_STEP_SECONDS),
@@ -8888,6 +9067,41 @@ class R1Interview:
             await self.say("L-TIME-UP")
         return None
 
+    def _wrapup_counts(self) -> dict[str, int]:
+        """M032 S3.5 and SWEEP-26: the wrap-up's counts for ``session_facts.wrapup`` (no text)."""
+        drops = sum(1 for trip in self._guard_trips if trip.get("category") == HIRING_MENTION)
+        return {
+            "wrapup_more_asked": int(self._wrap_more_used),
+            "wrapup_hiring_team_drops": drops,
+            "wrap_beat_turns": self._wrap_beat_turns,
+            "wrapup_affirmations": self._wrapup_affirmations,
+        }
+
+    async def _wrap_beat(self) -> None:
+        """M032 S3.5 (R1_WRAPUP_DECLINE_V2): a short beat after L-EXIT, before L-WRAP.
+
+        Spent in ROLEPLAY_EXIT, where a committed turn gets no reply (``reply_suppressed``); the
+        wrap-up forgets it (``_drop_stale_turns``) and L-WRAP invites the question.  A candidate
+        who is still mid-turn when the beat ends is let finish, bounded by
+        ``WRAP_BEAT_HOLD_SECONDS``, so L-WRAP is not said over them.  Counted, never logged.
+        """
+        if not flag_on(FLAG_WRAPUP_DECLINE_V2) or self._stop_outcome() is not None:
+            return
+        queued = self._turns.qsize()
+        heard = self._candidate_turn_open()
+        if WRAP_BEAT_SECONDS > 0:
+            await asyncio.sleep(WRAP_BEAT_SECONDS)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + WRAP_BEAT_HOLD_SECONDS
+        while self._candidate_turn_open() and loop.time() < deadline:
+            heard = True
+            if self._stop_outcome() is not None:
+                return
+            await asyncio.sleep(0.05)
+        if heard or self._turns.qsize() > queued:
+            self._wrap_beat_turns += 1
+            _log.info("unknown_event", error_type="r1_wrap_beat_turn")
+
     def _end_roleplay(self) -> None:
         """Leave role-play for ROLEPLAY_EXIT from whichever role-play phase is current."""
         if self.machine.phase is R1Phase.ASIDE:
@@ -8950,6 +9164,10 @@ class R1Interview:
                 return await self._end_wrapup()
             if is_name_only(text):
                 continue  # "Christie.": calling her again, not a new question
+            if flag_on(FLAG_WRAPUP_ANSWERS) and is_affirmation_only(text):
+                # M032 SWEEP-26: "Yes." / "Can I ask one more?" asks leave; the question follows.
+                self._wrapup_affirmations += 1
+                continue
             questions += 1
             if questions >= WRAPUP_QUESTION_LIMIT:
                 await self._wait_reply_settled(
@@ -8992,6 +9210,10 @@ class R1Interview:
         _log.info(
             "unknown_event", error_type="r1_wrapup_answer_retry", error_category="lost_reply"
         )
+        if owed.tail_id == "L-WRAP-MORE":
+            # M032 SWEEP-26: the answer said again closes the wrap-up: no invitation after it.
+            owed.tail = ""
+            owed.tail_id = ""
         self._last_reply = self._latest_reply = owed  # the new speech pairs with the owed reply
         try:
             generate()  # a SpeechHandle: never awaited (that waits out its whole playout)
@@ -9069,6 +9291,7 @@ class R1Interview:
                 return outcome
             self._end_roleplay()
             await self.say("L-EXIT")
+            await self._wrap_beat()
             self._enter(R1Phase.WRAPUP)
             await self.say("L-WRAP")
             stop = await self._run_wrapup()
