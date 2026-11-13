@@ -208,7 +208,12 @@ import r1_world
 #    changed; with every flag off the tails, the anchors and the reminders are the release before.
 #    After its review (still 27, unreleased): the figures-said note's website example only for the
 #    website's price she named herself (``figures_said_source_website``), and narrower tail themes.
-CONTENT_REVISION = 27
+# 28: Simulation adaptability (owner decision D-M032-10; rollback flags R1_TANGENT and
+#    R1_STALL_GAP).  The tangent notes (a free reply and an owed point on small talk) and the
+#    voiced-concerns note for a stall said a moment ago join the manifest (``_adapt_repairs``).
+#    No graded marker, must-say, meaning or deadline changed; with both flags off the reminders
+#    are the release before.
+CONTENT_REVISION = 28
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -565,6 +570,16 @@ def _sim2_repairs() -> dict[str, Any]:
     }
 
 
+def _adapt_repairs() -> dict[str, Any]:
+    """Simulation adaptability (revision 28): the tangent and stall-gap notes."""
+    p = r1_prompts
+    return {
+        "tangent_note": p.TANGENT_NOTE,
+        "tangent_intent_note": p.TANGENT_INTENT_NOTE,
+        "voiced_concerns_recent_note": p.VOICED_CONCERNS_RECENT_NOTE,
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -846,6 +861,7 @@ def manifest() -> dict[str, Any]:
             "learner_followups": _learner_followups(sample),
             "sim_repairs": _sim_repairs(),
             "sim2_repairs": _sim2_repairs(),
+            "adapt_repairs": _adapt_repairs(),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

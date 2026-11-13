@@ -214,6 +214,7 @@ from r1_personas import (
     asks_about_learner,
     detect_probes,
     has_question,
+    is_tangent,
 )
 from r1_prompts import (
     ACK_TURN_CONCERNS_NOTE,
@@ -318,6 +319,9 @@ from r1_prompts import (
     VERDICT_USED_NOTE,
     VOICED_CONCERNS_ASKED_NOTE,
     VOICED_CONCERNS_OTHER_Q_NOTE,
+    VOICED_CONCERNS_RECENT_NOTE,
+    TANGENT_INTENT_NOTE,
+    TANGENT_NOTE,
     VOICED_CONCERNS_NOTE,
     control_prose,
     format_usd,
@@ -820,6 +824,19 @@ FLAG_ASK_KIND_NOTE = "R1_ASK_KIND_NOTE"
 # * R1_NO_BARE_REPROACH (NAT1): the question diet never leaves a bare reproach alone ("That's not
 #   really what I was asking about, honestly."): her question stays.
 FLAG_NO_BARE_REPROACH = "R1_NO_BARE_REPROACH"
+# Simulation adaptability (owner decision D-M032-10; the live tangent smoke), each default ON with
+# the same rollback:
+# * R1_TANGENT: an advisor turn that leaves the sale for a moment (small talk, a personal question,
+#   a joke, ``r1_personas.is_tangent``) gets TANGENT_NOTE: she responds as herself in one or two
+#   short sentences and lets the call come back.  An unforced owed move waits ONE turn
+#   (``_may_hold_s1``, shared with the respond-first once-per-move budget); a forced move still
+#   lands, after a few words about the tangent (TANGENT_INTENT_NOTE).  A small-talk question is no
+#   probe and no dig ("have you tried that new biryani place?").
+# * R1_STALL_GAP: a question about the decision lets her say a stall she already voiced once more
+#   only when neither of her last ``STALL_GAP_REPLIES`` replies said it.
+FLAG_TANGENT = "R1_TANGENT"
+FLAG_STALL_GAP = "R1_STALL_GAP"
+STALL_GAP_REPLIES = 2
 # The advisor turns whose words she may echo (R1_ECHO_GUARD).
 ADVISOR_TERM_TURNS = 4
 # R1_PRICE_ASKED_ONCE: the replies after her final-price question that are told not to ask it again.
@@ -882,6 +899,8 @@ _FLAG_READS = {
     FLAG_PRICE_STORY: lambda: os.getenv("R1_PRICE_STORY"),
     FLAG_ASK_KIND_NOTE: lambda: os.getenv("R1_ASK_KIND_NOTE"),
     FLAG_NO_BARE_REPROACH: lambda: os.getenv("R1_NO_BARE_REPROACH"),
+    FLAG_TANGENT: lambda: os.getenv("R1_TANGENT"),
+    FLAG_STALL_GAP: lambda: os.getenv("R1_STALL_GAP"),
 }
 
 
@@ -1376,6 +1395,13 @@ class RolePlayEngine:
         # lost before any audio changes nothing), and the pushes held for her reaction, by family.
         self._heard_primary: str | None = None
         self._push_react_holds: dict[str, int] = {}
+        # Simulation adaptability (R1_TANGENT): this turn is a tangent; tangent turns and the owed
+        # moves held for one, by family (counts only).
+        self._tangent_now = False
+        self._tangent_turns = 0
+        self._tangent_holds: dict[str, int] = {}
+        # R1_STALL_GAP: per heard reply, whether it said a stall (not today, think it over).
+        self._stall_said: list[bool] = []
         # M032 S2 (learner voice).  SWEEP-13's prefix sentence is latched for the session (the
         # prefix is the DeepSeek cache prefix), and the guard's echo check reads that very prefix.
         self._offer_realism = flag_on(FLAG_OFFER_REALISM)
@@ -2116,6 +2142,8 @@ class RolePlayEngine:
             and not worry_answered(worry, reading)
         )
         self.tracker.gate.wide_followup = flag_on(FLAG_DIG_FIRST)
+        tangent_on = flag_on(FLAG_TANGENT)
+        self.tracker.gate.small_talk = tangent_on
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         known = (len(self._advisor_amounts), len(self._answered))
         self._advisor_amounts.update(
@@ -2176,7 +2204,7 @@ class RolePlayEngine:
         self._read_offer_extras(reading, negotiated, turn)
         self._note_curiosity_covered(reading)
         self._note_monthly_quote(candidate_text, turn)
-        self._dig_now = asks_about_learner(reading)
+        self._dig_now = asks_about_learner(reading, small_talk=tangent_on)
         # Nothing in the very first advisor turn is an ask: it is the greeting ("is now a good
         # time?", "I thought I'd give you a quick call"), and it gets a free reply.
         early = turn == 1 and r_sec < EARLY_ASK_IGNORE_SEC
@@ -2205,6 +2233,18 @@ class RolePlayEngine:
         if natural or respond:
             kinds = self._respond_kinds(reading, negotiated, wants, carried=carried)
         self._turn_kinds = kinds
+        # Simulation adaptability (R1_TANGENT): the advisor left the sale for a moment.
+        self._tangent_now = (
+            tangent_on
+            and turn > 1
+            and wants is None
+            and break_kind is None
+            and not (negotiated.offers or negotiated.email_offer or negotiated.checkin)
+            and is_tangent(reading)
+        )
+        if self._tangent_now:
+            self._tangent_turns += 1
+            reasons.append("tangent")
         if (
             flag_on(FLAG_FLOOR_YIELD)
             and self._floor_yields < FLOOR_YIELD_LIMIT
@@ -2285,7 +2325,7 @@ class RolePlayEngine:
             (len(self._advisor_amounts), len(self._answered)) != known
             or bool(first_probes)
             or bool(reveal_topics)
-            or asks_about_learner(reading)
+            or asks_about_learner(reading, small_talk=tangent_on)
             or self._wrap_engaged(negotiated)
         )
         self._stale_run = 0 if fresh else self._stale_run + 1
@@ -2327,6 +2367,7 @@ class RolePlayEngine:
         challenged = False
         held_for_cut = False
         reacting = False  # SWEEP-1: the push waits for her reaction (quiet, like a challenge)
+        tangent = self._tangent_now  # R1_TANGENT: quiet, like a challenge (no hand-over)
         # An ask the negotiation left to the owed move (``ask_yields_to_owed_move``) is answered by
         # the move it selected, with no moment to wait for.
         moment = (
@@ -2402,7 +2443,7 @@ class RolePlayEngine:
             elif (
                 move.id not in self._dig_deferred
                 and self._dig_key(reading) not in self._dig_deferred_topics
-                and asks_about_learner(reading)
+                and asks_about_learner(reading, small_talk=tangent_on)
                 and self._may_defer(move, r_sec)
             ):
                 # The advisor asked the learner a direct question about themselves (a dig the
@@ -2427,6 +2468,21 @@ class RolePlayEngine:
                 self._discovery_holds[move.id] = self._discovery_holds.get(move.id, 0) + 1
                 self._turn_hold = ("discovery", move.id, "")
                 reasons.append("owed_deferred_for_discovery")
+            elif (
+                tangent
+                and move.id not in self._respond_held
+                and self._may_hold_s1(move, r_sec)
+            ):
+                # Simulation adaptability (R1_TANGENT, D-M032-10): the advisor went off the subject
+                # for a moment.  She engages with it as herself and the owed move waits ONE turn:
+                # once per move, shared with the respond-first budget (``_respond_held``), only
+                # with slack (``_may_hold_s1``): never forced, never the time cue or the 19:00
+                # stall.  The next turn releases it as before.
+                self._respond_held.add(move.id)
+                family = move.family or move.id
+                self._tangent_holds[family] = self._tangent_holds.get(family, 0) + 1
+                self._turn_hold = ("tangent", move.id, family)
+                reasons.append("owed_deferred_for_tangent")
             elif (
                 respond
                 and kinds
@@ -2477,6 +2533,10 @@ class RolePlayEngine:
                 self._notes.append(PUSH_REACT_NOTE_V2 if voice_v2 else PUSH_REACT_NOTE)
                 reasons.append("owed_deferred_for_reaction")
             else:
+                if tangent:
+                    # R1_TANGENT: the move lands anyway (forced, no slack, or already held once):
+                    # a few words about the tangent first, then the point as a change of subject.
+                    self._notes.append(TANGENT_INTENT_NOTE)
                 probe = self._probe_step(move, r_sec) if self._probe_first else None
                 if probe is not None:
                     # M032 S2P (S2.10): she asks before she states; the owed move stays owed.
@@ -2546,7 +2606,12 @@ class RolePlayEngine:
             return self._wrap_offer_plan(r_sec, trigger, turn_index, reasons=reasons)
         reasons.append("free_reply")
         quiet_turn = (
-            reveal_due or break_kind is not None or challenged or held_for_cut or reacting
+            reveal_due
+            or break_kind is not None
+            or challenged
+            or held_for_cut
+            or reacting
+            or tangent
         )
         # M032 SWEEP-6: his question about her own number is answered from her card; it is this
         # reply's one job (no come-back, no curiosity hand-over that turn).
@@ -2582,7 +2647,16 @@ class RolePlayEngine:
         # A challenge is only answered (``CHALLENGE_NOTE``): no curiosity question, no check-in.
         # Neither is the turn that cut the learner off while she was raising an owed move, nor
         # (SWEEP-1) the turn whose reply reacts to the advisor's answer before the push.
-        quiet = reveal_due or break_kind is not None or challenged or held_for_cut or reacting
+        quiet = (
+            reveal_due
+            or break_kind is not None
+            or challenged
+            or held_for_cut
+            or reacting
+            or tangent
+        )
+        if tangent:
+            self._notes.append(TANGENT_NOTE)
         # M032 S1 item 4: a turn that left something open for her hands over no curiosity topic;
         # her reply answers it (a check-in still asks for one real question).
         responding = respond and bool(kinds) and not self._force_curiosity
@@ -3817,6 +3891,8 @@ class RolePlayEngine:
     def _length_note(self) -> str:
         """SWEEP-14: a free reply's length line, keyed to the advisor's turn."""
         reading = self._turn_reading
+        if self._tangent_now:
+            return LENGTH_ONE_OR_TWO  # R1_TANGENT: a short answer as herself
         if offers_floor(reading):
             return LENGTH_LONG
         if self._turn_backchannel:
@@ -3903,9 +3979,13 @@ class RolePlayEngine:
         if half.hold is None:
             return
         kind, move_id, counted = half.hold
-        if kind in ("respond", "push_react"):
+        if kind in ("respond", "push_react", "tangent"):
             self._respond_held.discard(move_id)
-            counts = self._respond_holds if kind == "respond" else self._push_react_holds
+            counts = {
+                "respond": self._respond_holds,
+                "push_react": self._push_react_holds,
+                "tangent": self._tangent_holds,
+            }[kind]
             left = counts.get(counted, 0) - 1
             if left > 0:
                 counts[counted] = left
@@ -4304,6 +4384,14 @@ class RolePlayEngine:
                 and _DECISION_QUESTION.search(self._turn_reading or "") is None
             )
             note = VOICED_CONCERNS_OTHER_Q_NOTE if other else VOICED_CONCERNS_ASKED_NOTE
+            if (
+                not other
+                and flag_on(FLAG_STALL_GAP)
+                and any(self._stall_said[-STALL_GAP_REPLIES:])
+            ):
+                # Simulation adaptability (R1_STALL_GAP): she said the stall a moment ago, so a
+                # decision question gets its answer, not the stall once more.
+                note = VOICED_CONCERNS_RECENT_NOTE
             notes.append(note.format(concerns=concerns))
         elif concerns:
             notes.append(VOICED_CONCERNS_NOTE.format(concerns=concerns))
@@ -4329,7 +4417,12 @@ class RolePlayEngine:
             # Item 5 (anti-validation): her worry was not answered, so she does not call the reply
             # reasonable or good (a lone acknowledgement has its own note).
             # M032 SWEEP-7: the come-back is the one note about what went unanswered.
-            unanswered = self._unanswered_worry and not ack_turn and not self._come_back_topic
+            unanswered = (
+                self._unanswered_worry
+                and not ack_turn
+                and not self._come_back_topic
+                and not self._tangent_now  # R1_TANGENT: small talk leaves her worry for later
+            )
             if unanswered:
                 notes.append(NOT_ANSWERED_NOTE)
             # SWEEP-4: steering only, never both, and never on a confirmation (not called then).
@@ -6076,6 +6169,11 @@ class RolePlayEngine:
         a voiced reason for grading and never delivers F4-PRIMARY.
         """
         said = not_deciding(spoken_text)
+        self._stall_said.append(
+            bool(said)
+            or CONCERN_THINK_OVER
+            in concern_themes(spoken_text, shared_think_over=flag_on(FLAG_NO_COMMIT_LEDGER))
+        )
         if said:
             self._stall_themes[CONCERN_NOT_TODAY] = self._stall_themes.get(CONCERN_NOT_TODAY, 0) + 1
         shared = flag_on(FLAG_NO_COMMIT_LEDGER)
@@ -6346,6 +6444,10 @@ class RolePlayEngine:
                 "split_replans": self._split_replans,
                 # SWEEP-1 (counts only): pushes held one turn for her reaction, by family.
                 "push_react_holds": dict(sorted(self._push_react_holds.items())),
+                # Simulation adaptability (R1_TANGENT, counts only): tangent turns, and the owed
+                # moves held one turn for one, by family.
+                "tangent_turns": self._tangent_turns,
+                "tangent_holds": dict(sorted(self._tangent_holds.items())),
             },
             # M032 S2, learner voice (counts only; ``session_facts.learner_voice``): how her replies
             # opened, how long they were, how often a scripted tail was bolted on, and how often

@@ -308,6 +308,30 @@ VOICED_CONCERNS_OTHER_Q_NOTE = (
     "- You have already told the advisor {concerns}. They asked you about something else: answer "
     "that, and leave it out of this reply."
 )
+# Simulation adaptability (R1_STALL_GAP): three decision questions in a row ("What would help you
+# decide?", "Is that pushing your timeline?", "When would you talk to him?") each let her say "not
+# ready today" once more.  Said in one of her last two replies, it is not said again: she answers
+# what they asked (new wording under D-M032-4).
+VOICED_CONCERNS_RECENT_NOTE = (
+    "- You have already told the advisor {concerns}, and you said it again only a moment ago. "
+    "Answer what they actually asked, in fresh words, and do not say it again in this reply."
+)
+# Simulation adaptability (R1_TANGENT; the live tangent smoke): the advisor went off the subject
+# for a moment (small talk, a personal question, a joke).  A real prospect engages with it briefly,
+# as herself, and lets the call come back; she never snaps straight back to a worry.  New wording
+# under D-M032-4 and D-M032-10, listed for review; no course fact (D-M032-7).
+TANGENT_NOTE = (
+    "- The advisor has gone off the subject for a moment (small talk, a personal question or a "
+    "joke). Respond to that as yourself, the way you would with anyone: a real reaction, or a "
+    "short answer from your own life, in one or two short sentences. Do not bring up the course, "
+    "the price or any of your worries in this reply, say nothing about the course, and ask "
+    "nothing about it: let the conversation come back to it."
+)
+TANGENT_INTENT_NOTE = (
+    "- The advisor has gone off the subject for a moment (small talk, a personal question or a "
+    "joke). Respond to that first, as yourself, in a few words; then make your point as an honest "
+    "change of subject."
+)
 HOLLOW_CONCERNS_NOTE = (
     "- The advisor said almost nothing. You have already told them {concerns}, so do not say "
     "that again in any words. Do not say goodbye, thank them for the call or say that you will "

@@ -167,7 +167,10 @@ import r1_world
 # website example only for the website's price she named herself (FIGURES_SAID_SOURCE_WEBSITE),
 # and the tail themes need the worry's frame for "full", deciding, committing, "online" and
 # "paying".  No graded meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "f4401b2b81e03abebc63572f3d92534f6a073b517f2c95967eaf75a91e33a986"
+# Revision 28 (simulation adaptability): the tangent notes and the stall-gap voiced-concerns note
+# join the manifest (``r1_content._adapt_repairs``) beside the texts they replace while their flags
+# are on.  No graded meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "18c7513dd22b7ea10a9263f422ccfa86f6650608180d3972a01a7a9b23090891"
 
 CONTENT_MODULES = (
     "r1_text",

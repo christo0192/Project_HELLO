@@ -2949,6 +2949,36 @@ class S2PBunchingGridTests(unittest.TestCase):
                     self.assertTrue(all(value is not None for value in item.delivered.values()))
 
 
+class AdaptBunchingGridTests(unittest.TestCase):
+    """Simulation adaptability (R1_TANGENT, R1_STALL_GAP): the gated patterns and the advisor who
+    goes off the subject every third turn (``tangent``), with the two flags off against on.  No
+    run may turn late or excluded or use the forced path more, and the step rows lose no score."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        cls.names = (*bunching_grid.GATED_PATTERNS, "tangent")
+        off = {name: "0" for name in bunching_grid.ADAPT_FLAGS}
+        on = {name: "1" for name in bunching_grid.ADAPT_FLAGS}
+        cls.off = bunching_grid.run_grid(off, patterns=cls.names)
+        cls.on = bunching_grid.run_grid(on, patterns=cls.names)
+        cls.steps_off = bunching_grid.run_steps(off, patterns=cls.names)
+        cls.steps_on = bunching_grid.run_steps(on, patterns=cls.names)
+
+    def test_no_run_gets_worse(self):
+        self.assertEqual(self.grid.regressions(self.off, self.on, patterns=self.names), [])
+        off = self.grid.totals(self.off)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], off[key])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        self.assertEqual(self.grid.gate_regressions(self.steps_off, self.steps_on), [])
+
+
 class FinalPriceReaskSim2Tests(unittest.TestCase):
     """Simulation diagnosis 2 (HF3, harness): the price asked twice in one reply is a repeat; a
     re-ask right after an advisor turn that only acknowledged it is not.  Synthetic text."""

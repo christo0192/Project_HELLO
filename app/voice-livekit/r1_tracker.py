@@ -152,13 +152,15 @@ class DisclosureGate:
         self._records = {topic: NeedRecord(topic) for topic in H_TOPICS}
         # Simulation diagnosis 2 (ND2): the engine's R1_DIG_FIRST, set before each observation.
         self.wide_followup = False
+        # Simulation adaptability: the engine's R1_TANGENT (a small-talk question is no probe).
+        self.small_talk = False
 
     # ------------------------------------------------------------------ observation
     def observe_candidate_turn(self, text: object, turn: int | None = None) -> GateUpdate:
         """Advance every need from one candidate turn (rule-based probes only)."""
         self.turn = turn if turn is not None else self.turn + 1
         question = has_question(text)
-        probes = detect_probes(text)
+        probes = detect_probes(text, small_talk=self.small_talk)
         generic = detect_followup(text, wide=self.wide_followup)
         first: list[str] = []
         released: list[str] = []

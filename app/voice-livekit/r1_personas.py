@@ -1085,15 +1085,74 @@ _FOLLOWUP_IMPERATIVE = re.compile(
 )
 
 
-def detect_probes(text: object) -> frozenset[str]:
+# Simulation adaptability (the live tangent smoke; the engine's R1_TANGENT).  An advisor turn that
+# leaves the sale for a moment: small talk, a personal question, a joke.  Narrow on purpose: a turn
+# is a tangent only when it has a small-talk word (``_SMALL_TALK``) and no word of the course, the
+# sale or her decision (``_COURSE_TALK``), and does not steer back itself ("Anyway, where were
+# we?").  "By the way, the course also has mentors" and "my tea's gone cold" after a pitch are no
+# tangent.
+_COURSE_TALK = re.compile(
+    r"\b(?:courses?|program(?:me)?s?|class(?:es)?|sessions?|cohorts?|batch(?:es)?|modules?|"
+    r"curriculum|syllabus|lessons?|lectures?|recordings?|mentor\w*|instructor\w*|"
+    r"tutor\w*|projects?|capstone|assignments?|homework|python|sql|data|machine learning|"
+    r"deep learning|statistic\w*|coding|code|programming|technical|skills?|learn\w*|stud(?:y|ies|"
+    r"ying)|careers?|jobs?|roles?|interview\w*|placements?|hir(?:e|es|ed|ing)|recruit\w*|"
+    r"salar(?:y|ies)|lay[- ]?offs?|laid off|employer|industry|field|alumni|certificat\w*|"
+    r"prices?|pricing|costs?|fees?|pay|paying|payments?|discounts?|offers?|deal|instal+ments?|"
+    r"emi|loan|financ\w*|budget|money|afford\w*|refund\w*|scholarship\w*|dollars?|rupees?|"
+    r"lakhs?|enrol+\w*|sign(?:ing)? up|regist\w*|seats?|spots?|deadlines?|applications?|apply|"
+    r"admissions?|next step|follow[- ]?up|call (?:you )?back|callback|e-?mail\w*|links?|"
+    r"brochure|demo|webinars?|husband|wife|partner|spouse|father|dad|mother|mom|parents|"
+    r"decid\w*|decision|commit\w*|timeline|move forward|ready|months|hours a week|schedule|"
+    r"interview kickstart)\b|\$\s?\d|\d[\d,]{2,}",
+    re.IGNORECASE,
+)
+_SMALL_TALK = re.compile(
+    r"\b(?:weather|rain\w*|pour\w*|drizzl\w*|sunny|snow\w*|monsoon|humid\w*|storm\w*|"
+    r"cold outside|hot (?:today|outside|out there)|match|game|cricket|football|soccer|ipl|"
+    r"world cup|tennis|food|lunch|dinner|breakfast|snacks?|biryani|pizza|dosa|restaurant|"
+    r"cafe|coffee|tea|chai|hungry|starving|eat|ate|eaten|cook\w*|recipe|dogs?|cats?|pets?|"
+    r"puppy|neighbou?rs?|traffic|commute|weekend|holidays?|vacation|trip|travel\w*|festival|"
+    r"diwali|christmas|movies?|films?|series|netflix|songs?|music|concert|hobb(?:y|ies)|"
+    r"for fun|jok(?:e|es|ing)|kidding|haha|lol|funny|laugh\w*|off[- ]topic|unrelated|"
+    r"random (?:question|thought)|side note|on a different note|changing the subject|"
+    r"drifting|sidetracked|tangent|how(?:'s| is| was) your day|plans for|where are you from|"
+    r"where do you live)\b",
+    re.IGNORECASE,
+)
+_STEERS_BACK = re.compile(
+    r"\bwhere were we\b|\b(?:back|get back|getting back|coming back|come back) to (?:the|what|"
+    r"you|it|business|our)\b|\banyway,? (?:so|back)\b",
+    re.IGNORECASE,
+)
+
+
+def is_small_talk(text: object) -> bool:
+    """True when ``text`` has a small-talk word and no word of the course, the sale or her
+    decision."""
+    folded = fold(text)
+    return _SMALL_TALK.search(folded) is not None and _COURSE_TALK.search(folded) is None
+
+
+def is_tangent(text: object) -> bool:
+    """True when the advisor's whole turn left the sale for a moment (``is_small_talk``) and did
+    not steer back to it ("Anyway, where were we?")."""
+    return is_small_talk(text) and _STEERS_BACK.search(fold(text)) is None
+
+
+def detect_probes(text: object, *, small_talk: bool = False) -> frozenset[str]:
     """Topics the candidate genuinely asked about in ``text``.
 
     Only question-like sentences are examined, so a statement such as "Interview
-    Kickstart was founded in 2014" or "Thanks for your time" can never match.
+    Kickstart was founded in 2014" or "Thanks for your time" can never match.  ``small_talk``
+    (simulation adaptability, the engine's R1_TANGENT) skips a small-talk question ("Have you
+    tried that new biryani place?" is no question about what she tried before).
     """
     found: set[str] = set()
     for sentence in split_sentences(text):
         if not is_question_like(sentence):
+            continue
+        if small_talk and is_small_talk(sentence):
             continue
         lowered = fold(sentence).lower()
         if not _is_probe_shaped(lowered):
@@ -1180,7 +1239,7 @@ _THIRD_PARTY = re.compile(
 )
 
 
-def asks_about_learner(text: object) -> bool:
+def asks_about_learner(text: object, *, small_talk: bool = False) -> bool:
     """True when the advisor digs: a question about the learner's situation or the people in it.
 
     A question counts when a probe rule reads it as one (``detect_probes``), when it asks the
@@ -1189,10 +1248,13 @@ def asks_about_learner(text: object) -> bool:
     advisor's own answer, an offer or a choice between plans.  It is wider than the probe rules on
     purpose: those miss the questions about the husband and the father that two owed objections
     answered in the live sweep (R1-Q iteration 2).  The engine holds back a move that no deadline
-    forces for ONE turn when this is true.
+    forces for ONE turn when this is true.  ``small_talk`` (the engine's R1_TANGENT) skips a
+    small-talk question (``is_small_talk``): "have you tried that new biryani place?" is no dig.
     """
     for sentence in split_sentences(text):
         if not is_question_like(sentence):
+            continue
+        if small_talk and is_small_talk(sentence):
             continue
         lowered = fold(sentence).lower()
         if not _is_probe_shaped(lowered) or call_proposal_in(sentence) is not None:

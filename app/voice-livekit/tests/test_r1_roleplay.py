@@ -8391,6 +8391,9 @@ class S1ReviewFixTests(unittest.TestCase):
         self.assertIn(ANSWERED_YOU_NOTE, answer.reminder)
 
     @mock.patch.dict(r1_roleplay.os.environ, {"R1_STALL_MEMORY": "0"})
+    # The stall was said a reply or two ago: R1_STALL_GAP (``StallGapTests``) gives the recent
+    # note there; this pins the release before it.
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_STALL_GAP": "0"})
     def test_s1r2_the_ledger_never_contradicts_a_direct_question_or_the_price_notes(self):
         """S1R-2: "do not say that again in any words" sat next to "answer that first, plainly and
         honestly" and the price notes' "say ... you need to think"."""
@@ -9207,6 +9210,9 @@ class S2ReviewFixTests(unittest.TestCase):
         self.assertNotIn("you need to think", wrap.reminder)
         self.assertIn(P2.NOT_TODAY_RESERVED_NOTE, wrap.reminder)
 
+    # The stall was said a reply or two ago: R1_STALL_GAP (``StallGapTests``) gives the recent
+    # note there; this pins the release before it.
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_STALL_GAP": "0"})
     def test_s2r1n_a_direct_question_about_deciding_is_answered_honestly(self):
         """S2R-1 (naturalness): ``detect_ask`` misses these; the reserved note never sits with
         "answer that first, plainly and honestly"."""
@@ -12697,6 +12703,165 @@ class CompletionTailReviewTests(unittest.TestCase):
             with self.subTest(move_id=move_id, text=text):
                 self.assertTrue(r1_scheduler.tail_theme_hit(move_id, text, "husband"))
 
+
+
+# ---------------------------------------------------------------------------------------------
+# Simulation adaptability (owner decision D-M032-10; the live tangent smoke, worst moments where
+# she answered small talk in one clause and snapped back to a worry).  Synthetic, paraphrased
+# advisor lines; no line of any call is copied.
+TANGENTS = (
+    "Totally off topic, but did you catch the cricket match yesterday?",
+    "Random question, is it pouring where you are too? It hasn't stopped here all week.",
+    "Have you been to that new dosa place everyone keeps raving about?",
+    "Haha, sorry, my dog keeps barking at the neighbours, I can barely hear myself.",
+    "Any fun plans for the weekend?",
+)
+NOT_TANGENTS = (
+    "By the way, the course also comes with weekly mentor sessions.",
+    "Our cohort starts next month. Anyway, my tea has gone cold, the real tragedy of this call.",
+    "Funny thing, my dog has been barking all morning. Anyway, where were we?",
+    "Does Thursday evening work for you?",
+    "Have you tried learning on your own before?",
+    "Is your husband around this weekend to join a call?",
+    "Okay.",
+)
+
+
+class TangentReaderTests(unittest.TestCase):
+    """R1_TANGENT's readers (``r1_personas.is_tangent``, ``detect_probes(small_talk=True)``)."""
+
+    def test_small_talk_with_no_course_word_is_a_tangent(self):
+        from r1_personas import is_tangent
+
+        for text in TANGENTS:
+            with self.subTest(text=text):
+                self.assertTrue(is_tangent(text))
+        for text in NOT_TANGENTS:
+            with self.subTest(text=text):
+                self.assertFalse(is_tangent(text))
+
+    def test_a_small_talk_question_is_no_probe_and_no_dig(self):
+        from r1_personas import asks_about_learner, detect_probes
+
+        place = "Have you tried that new biryani place near you?"
+        self.assertEqual(detect_probes(place), frozenset({"H2"}))  # the release before
+        self.assertEqual(detect_probes(place, small_talk=True), frozenset())
+        self.assertFalse(asks_about_learner(place, small_talk=True))
+        real = "Have you tried learning python on your own before?"
+        self.assertEqual(detect_probes(real, small_talk=True), frozenset({"H2"}))
+        self.assertTrue(asks_about_learner(real, small_talk=True))
+
+
+class TangentEngineTests(unittest.TestCase):
+    """R1_TANGENT: she engages with small talk as herself, and an unforced owed move waits ONE
+    turn (``_may_hold_s1``, the respond-first once-per-move budget); deadlines stay intact."""
+
+    TANGENT = TANGENTS[3]  # a statement: no question for respond-first to hold on
+
+    def held(self, **env):
+        with flags(R1_NATURAL_TIMING="0", **env):
+            s = Session(engine())
+            r = after_f3(s)
+            return s, s.say(self.TANGENT, r), r
+
+    def test_the_owed_move_waits_one_turn_and_the_reply_engages(self):
+        from r1_prompts import TANGENT_NOTE
+
+        s, plan, r = self.held()
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.LLM_REPLY, None))
+        self.assertIn("owed_deferred_for_tangent", plan.reasons)
+        self.assertIn(TANGENT_NOTE, plan.reminder)
+        self.assertNotIn("You are curious about", plan.reminder)
+        self.assertIn(r1_roleplay.LENGTH_ONE_OR_TWO, plan.reminder)
+        with flags(R1_NATURAL_TIMING="0"):
+            nxt = s.say(SUBSTANTIVE_PITCH, r + 20)
+        self.assertIn("probe:F2", nxt.reasons)  # released: F2's probe-first step
+        self.assertNotIn(TANGENT_NOTE, nxt.reminder)
+        intents = s.eng.admin_log()["intents"]
+        self.assertEqual(intents["tangent_turns"], 1)
+        self.assertEqual(intents["tangent_holds"], {"F2": 1})
+
+    def test_flag_off_is_the_release_before(self):
+        from r1_prompts import TANGENT_NOTE
+
+        s, plan, r = self.held(R1_TANGENT="0")
+        self.assertIn("probe:F2", plan.reasons)
+        self.assertNotIn(TANGENT_NOTE, plan.reminder)
+        self.assertNotIn("tangent", plan.reasons)
+
+    def test_once_per_move_a_second_tangent_gets_the_move_after_a_word_on_it(self):
+        from r1_prompts import TANGENT_INTENT_NOTE
+
+        s, plan, r = self.held()
+        with flags(R1_NATURAL_TIMING="0"):
+            again = s.say(TANGENTS[4], r + 20)
+        self.assertIn("probe:F2", again.reasons)
+        self.assertIn(TANGENT_INTENT_NOTE, again.reminder)
+
+    def test_a_forced_move_still_lands_on_a_tangent(self):
+        from r1_prompts import TANGENT_INTENT_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(self.TANGENT, 415)  # F3's deadline: forced
+        self.assertEqual(plan.move_id, F3_PRIMARY)
+        self.assertNotIn("owed_deferred_for_tangent", plan.reasons)
+        self.assertIn(TANGENT_INTENT_NOTE, plan.reminder)
+
+    def test_small_talk_hands_over_no_disclosure_layer(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Have you tried that new biryani place near you?", 40)
+        self.assertNotIn("owed_deferred_for_reveal", plan.reasons)
+        self.assertNotIn("what has held you back", plan.reminder)
+        with flags(R1_TANGENT="0"):
+            off = Session(engine())
+            off.say(OPENER, 20)
+            before = off.say("Have you tried that new biryani place near you?", 40)
+        self.assertIn("what has held you back", before.reminder)
+
+    def test_a_lost_reply_gives_the_hold_back(self):
+        s, plan, r = self.held()
+        s.eng.reply_lost(plan)
+        with flags(R1_NATURAL_TIMING="0"):
+            again = s.say(TANGENTS[4], r + 5)
+        self.assertIn("owed_deferred_for_tangent", again.reasons)
+        self.assertEqual(s.eng.admin_log()["intents"]["tangent_holds"], {"F2": 1})
+
+
+class StallGapTests(unittest.TestCase):
+    """R1_STALL_GAP: a decision question lets her say a stall once more only when neither of her
+    last two replies said it (the terse shape: three decision questions in a row, each answered
+    "not ready to commit today")."""
+
+    RECENT = "and you said it again only a moment ago"
+
+    def run_questions(self, **env):
+        with flags(**env):
+            s = Session(engine(), reply="Honestly, I'm not ready to decide anything today.")
+            s.say(OPENER, 20)  # her reply says the stall
+            s.reply = "I see, that helps."
+            first = s.say("What would help you decide?", 40)
+            s.say(PITCH, 60)
+            later = s.say("So what's your timeline looking like?", 80)
+        return first, later
+
+    def test_a_stall_said_a_moment_ago_is_not_invited_again(self):
+        from r1_prompts import VOICED_CONCERNS_ASKED_NOTE
+
+        first, later = self.run_questions()
+        asked = VOICED_CONCERNS_ASKED_NOTE.split("{concerns}")[1]
+        self.assertIn(self.RECENT, first.reminder)
+        self.assertNotIn(asked, first.reminder)
+        self.assertNotIn(self.RECENT, later.reminder)  # two replies without it: invited again
+        self.assertIn(asked, later.reminder)
+
+    def test_flag_off_is_the_release_before(self):
+        from r1_prompts import VOICED_CONCERNS_ASKED_NOTE
+
+        first, _ = self.run_questions(R1_STALL_GAP="0")
+        self.assertNotIn(self.RECENT, first.reminder)
+        self.assertIn(VOICED_CONCERNS_ASKED_NOTE.split("{concerns}")[1], first.reminder)
 
 if __name__ == "__main__":
     unittest.main()
