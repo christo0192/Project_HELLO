@@ -15,10 +15,12 @@ the ``ready_button`` event, ``advisor_turn``, ``end_request``, ``end_decline``, 
 ``wrapup_question``, ``wrapup_none`` and ``wrapup_done``; the manual library adds ``ready_button``,
 ``repeat_request``, ``backchannel``, ``transition_other``, ``wrapup_other`` and ``tactic``.
 
-Selection: ``parse_scenarios("strong,early-end")``; ``synthetic`` (or ``all``) is every scenario of
-this module, ``wrapup`` both wrap-up runs, ``price`` both price runs, ``early`` both early ends.  The
-manual library (``rehearsal.manual``) adds ``manual-M01`` .. ``manual-M10``, ``manual-mix`` and the
-groups ``manual-replay``, ``manual`` and ``default`` (the manual scenarios, then the synthetic ones).
+Selection: ``parse_scenarios("strong,early-end")``; ``synthetic`` is every scenario of this module,
+``wrapup`` both wrap-up runs, ``price`` both price runs, ``early`` both early ends.  The manual
+library (``rehearsal.manual``) adds ``manual-M01`` .. ``manual-M10``, ``manual-mix`` and the groups
+``manual-replay``, ``manual`` and ``default`` (the manual scenarios, then the synthetic ones).  The
+adaptability scenarios (``rehearsal.adapt``) add the group ``adapt``, and ``default+adapt`` is
+``default`` plus ``adapt``.  ``all`` stays the synthetic scenarios.
 """
 from __future__ import annotations
 
@@ -55,6 +57,16 @@ ACTS = (
     "tactic",
     "noise",
     "sound_check_answer",
+    # The adaptability scenarios (``rehearsal.adapt``): turns whose purpose a judge reads.
+    "tangent",
+    "confused_question",
+    "interrupt",
+    "off_script",
+    "pressure",
+    "discount_drop",
+    "glitch_check",
+    "glitch_lost",
+    "argue",
 )
 
 
@@ -65,6 +77,7 @@ class Beat:
     act: str
     text: str
     intent: str = ""  # the manual library's description of the move (replays and mixes)
+    traits: tuple[str, ...] = ()  # how the turn is said (``rehearsal.adapt``: tangent, ramble ...)
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,7 @@ class RoleplayBeat:
     text: str
     at_r: float
     intent: str = ""
+    traits: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +122,12 @@ class Scenario:
     # A manual replay's id (``M01`` ...) or a catalogue mix (``rehearsal.manual``).
     replay_id: str | None = None
     mix: bool = False
+    # An adaptability scenario's behaviour key (``rehearsal.adapt.BEHAVIOURS``), else None.
+    adapt: str | None = None
+    # What the candidate says to Christy's sound check, and to her offer to wrap up (accept,
+    # decline); None keeps the defaults (a one-word candidate answers in one word everywhere).
+    sound_check_text: str | None = None
+    wrap_texts: tuple[str, str] | None = None
 
 
 FREE = "<free>"
@@ -358,9 +378,10 @@ def parse_scenarios(text: str) -> tuple[str, ...]:
 
     Names are matched without regard to case (``manual-m01`` is ``manual-M01``).
     """
-    from rehearsal import manual  # registers the manual library's scenarios and groups
+    from rehearsal import adapt, manual  # register the manual library and the adapt scenarios
 
     manual.register()
+    adapt.register()
     lookup = {name.lower(): name for name in SCENARIOS}
     chosen: list[str] = []
     for token in (part.strip().lower() for part in (text or "").split(",") if part.strip()):

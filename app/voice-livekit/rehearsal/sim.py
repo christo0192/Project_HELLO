@@ -24,8 +24,13 @@ livekit-agents 1.6.4 does on a call, on the same seams the role-play tier's ``Ri
   it: a server-sent ``data_received`` packet on ``READY_TOPIC`` (``tests.test_r1_core``
   ``TestReadyButton``).
 
-Not emulated: barge-in (the simulated candidate waits for the floor), the STT node's acknowledgement
-hold, VAD fragments, TTS audio and the recording.  ``Span`` is the harness's own record of who spoke
+Voice barge-in is emulated for the adapt interrupter only (every other simulated candidate waits for
+the floor): its cut-in is said over a playing reply, and ``SdkDriver.speak(barge_in=True)`` cuts that
+reply once the voice has lasted R1's interruption ``min_duration`` (``barge_in_sec``).  The SDK
+pauses the line at that moment and the final transcript cuts it; a simulated turn always has a
+final, so the line is cut at the pause and keeps the words played until then.  Not emulated: the
+false-interruption resume, the STT node's acknowledgement hold, VAD fragments, TTS audio and the
+recording.  ``Span`` is the harness's own record of who spoke
 when (virtual seconds, the S and R clocks), which the transcript rows are joined with.
 """
 from __future__ import annotations
@@ -44,6 +49,7 @@ from typing import Any, Callable, Iterator
 
 from rehearsal import vloop
 from rehearsal.clock import TimingParams
+from r1_latency import INTERRUPT_MIN_DURATION_SEC, interrupt_min_duration_sec, interrupt_min_words
 from r1_replies import delta_text
 from r1_text import word_count
 
@@ -55,7 +61,19 @@ FINAL_MAX_WORDS = 28
 MIN_FINAL_SEC = 0.5
 SETTLE_TICKS = 40
 INTERRUPT_SETTLE_SEC = 5.0  # how long session.interrupt() waits for the cut speeches to finish
+# Voice barge-in (``r1_latency``): R1's interruption ``min_duration`` of the candidate's voice
+# pauses an interruptible line, and the final transcript that follows cuts it.
+BARGE_IN_SEC = INTERRUPT_MIN_DURATION_SEC
 _IDS = itertools.count(1)
+
+
+def barge_in_sec() -> float | None:
+    """Seconds of the candidate's voice after which an interruptible line stops, as R1 configures
+    the session (read at use, like ``r1_turn_handling``); None at the ``min_words`` rollback, where
+    the voice never cuts a line by itself and only the committed turn does."""
+    if interrupt_min_words() > 0:
+        return None
+    return interrupt_min_duration_sec()
 
 
 @dataclass(frozen=True)
@@ -194,6 +212,10 @@ class Runtime:
         self.candidate_speaking = False
         self.now_playing: Span | None = None
         self.now_playing_seconds = 0.0
+        # The generated reply that is playing (a ``say`` line is ``now_playing``): what an
+        # interrupting candidate can cut in over.
+        self.reply_playing: Span | None = None
+        self.reply_playing_seconds = 0.0
 
     # ------------------------------------------------------------------- clocks
     def now(self) -> float:
@@ -488,10 +510,30 @@ class SdkDriver:
         packet = SimpleNamespace(data=data, kind=0, participant=None, topic=READY_TOPIC)
         self.ctx.room.emit("data_received", packet)
 
+    def barge_in(self) -> bool:
+        """The candidate's voice cuts the current speech, if it is an interruptible one (voice
+        barge-in: a scripted ``say`` line is uninterruptible and plays on).  Returns whether it cut."""
+        current = getattr(self.session, "current_speech", None)
+        if current is None or current.done() or not getattr(current, "allow_interruptions", False):
+            return False
+        current.interrupt()
+        return True
+
     async def speak(
-        self, text: str, *, wps: float, act: str | None, role: str | None, intent: str | None = None
+        self,
+        text: str,
+        *,
+        wps: float,
+        act: str | None,
+        role: str | None,
+        intent: str | None = None,
+        barge_in: bool = False,
     ) -> dict[str, Any]:
-        """One candidate turn through the SDK seams; returns what happened to it."""
+        """One candidate turn through the SDK seams; returns what happened to it.
+
+        ``barge_in``: the turn is said over a playing line (the adapt interrupter), which is cut
+        once the voice has lasted ``barge_in_sec()`` (an interruptible line only), not when the
+        turn ends."""
         from r1_session import StopResponse
 
         rt = self.rt
@@ -499,14 +541,23 @@ class SdkDriver:
         finals = split_finals(text)
         if not finals:
             return {"suppressed": True, "why": "empty", "spoken": None}
+        cut_after = barge_in_sec() if barge_in else None
         rt.candidate_speaking = True
         span = rt.open_span(
             "candidate", CANDIDATE, " ".join(finals), "candidate", act=act, role=role, intent=intent
         )
         try:
             session.emit("user_state_changed", _state("listening", "speaking"))
+            voiced = 0.0
             for final in finals:
-                await asyncio.sleep(max(MIN_FINAL_SEC, word_count(final) / wps))
+                seconds = max(MIN_FINAL_SEC, word_count(final) / wps)
+                if cut_after is not None and voiced + seconds > cut_after:
+                    await asyncio.sleep(max(0.0, cut_after - voiced))
+                    self.barge_in()
+                    seconds -= max(0.0, cut_after - voiced)
+                    voiced, cut_after = cut_after, None
+                await asyncio.sleep(seconds)
+                voiced += seconds
                 session.emit(
                     "user_input_transcribed",
                     SimpleNamespace(is_final=True, transcript=final, created_at=vloop.epoch_now()),
@@ -600,7 +651,11 @@ class SdkDriver:
             session.emit("agent_state_changed", _state("thinking", "speaking"))
             span = rt.open_span("bot", voice, spoken, "reply")
             seconds = rt.timing.speak_seconds(spoken, voice)
-            played = await session.play_for(handle, seconds)
+            rt.reply_playing, rt.reply_playing_seconds = span, seconds
+            try:
+                played = await session.play_for(handle, seconds)
+            finally:
+                rt.reply_playing = None
             interrupted = handle.cut.is_set()
             said = played_part(spoken, played, seconds) if interrupted else spoken
             span.text = said

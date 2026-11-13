@@ -46,10 +46,12 @@ from rehearsal.sim import (
     ModelledLatency,
     Runtime,
     SdkDriver,
+    barge_in_sec,
     build_context,
     build_session,
     build_writer,
     capture_logs,
+    played_part,
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_scheduler import PLAN_VERSION
@@ -109,6 +111,9 @@ class FullDeps:
     models: dict[str, Any] = field(default_factory=dict)
     shadow: Any = None
     rubric: Any = None
+    # The whole-transcript conversation-flow judge (``rehearsal.flow_judge``): live, an LLM; offline,
+    # a stand-in that answers n/a.
+    flow_judge: Any = None
     # The call's own scenario when it differs from the registry's (a sampled manual mix).
     scenario: Any = None
     # Seams built per call from its runtime (the offline stand-ins: ``rehearsal.seams``), and how
@@ -227,6 +232,13 @@ async def run_full_call(spec: FullCallSpec, deps: FullDeps) -> dict[str, Any]:
             record["judge"] = {"error": type(exc).__name__}
         except Exception as exc:  # noqa: BLE001
             record["judge"] = {"error": describe_error(exc, deps.scrub, 200)}
+    if deps.flow_judge is not None and record["rows"] and not record["error"]:
+        try:
+            record["flow"] = await deps.flow_judge.judge(record)
+        except (InsufficientBalance, BudgetExceeded) as exc:
+            record["flow"] = {"source": "llm", "status": "error", "error": type(exc).__name__}
+        except Exception as exc:  # noqa: BLE001
+            record["flow"] = {"source": "llm", "status": "error", "error": describe_error(exc, deps.scrub, 200)}
     return record
 
 
@@ -362,6 +374,8 @@ def ground_truth(scenario: Any) -> dict[str, Any]:
         "expect_complete": scenario.expect_complete,
         "replay_id": scenario.replay_id,
         "mix": scenario.mix,
+        "adapt": getattr(scenario, "adapt", None),
+        "roleplay_beat_traits": sorted({t for beat in scenario.roleplay for t in getattr(beat, "traits", ())}),
     }
 
 
@@ -376,10 +390,27 @@ async def _candidate_loop(
     since = rt.now()
     waited = 0.0
     while not run_task.done():
-        await _wait_floor(rt, sim, driver, rt.rng.reaction(), run_task)
+        cut = await _wait_floor(rt, sim, driver, rt.rng.reaction(), run_task)
         if run_task.done():
             return
         view = _view(rt, since, waited)
+        if cut is not None:
+            # The interrupter cuts in over the line that is playing, and its voice cuts that line
+            # (voice barge-in, ``SdkDriver.speak(barge_in=True)``).
+            playing, heard_part, phase = cut
+            action = await sim.interrupt_action(view, phase, heard_part)
+            since_before = since
+            result = await driver.speak(
+                action.text, wps=action.wps, act=action.act, role=action.role, intent=action.intent,
+                barge_in=True,
+            )
+            span = result.get("span")
+            ends = [rt.now() if span is None or span.t_end is None else span.t_end]
+            if playing.t_end is not None:
+                ends.append(playing.t_end)  # the cut line is heard already: never fed again
+            since, waited = max(ends), 0.0
+            _note_turn(rt, sim, record, action, result, since_before)
+            continue
         action = await sim.next_action(view)
         if action.kind == "press":
             since, waited = rt.now(), 0.0
@@ -404,6 +435,10 @@ async def _candidate_loop(
             waited = 0.0 if heard else waited + (action.wait or 0.0)
             continue
         since_before = since
+        if sim.interrupter is not None:
+            since = await _speak_watching_cut_ins(rt, driver, sim, record, action, since_before)
+            waited = 0.0
+            continue
         result = await driver.speak(
             action.text, wps=action.wps, act=action.act, role=action.role, intent=action.intent
         )
@@ -413,28 +448,102 @@ async def _candidate_loop(
         _note_turn(rt, sim, record, action, result, since_before)
 
 
+async def _speak_watching_cut_ins(
+    rt: Runtime, driver: SdkDriver, sim: CandidateSim, record: dict[str, Any], action: Any, since: float
+) -> float:
+    """The interrupter's turn: the reply to it plays inside ``driver.speak``, so the cut-in is
+    watched for while that turn is still waiting on its reply, and said over the reply, which its
+    voice cuts (voice barge-in, ``SdkDriver.speak(barge_in=True)``).  Returns the new ``since``."""
+    exchange = sim.exchanges
+    task = asyncio.ensure_future(
+        driver.speak(action.text, wps=action.wps, act=action.act, role=action.role, intent=action.intent)
+    )
+    cut: tuple[Any, Any, int, float] | None = None
+    while not task.done():
+        reply = getattr(rt, "reply_playing", None)
+        if cut is None and reply is not None and not rt.candidate_speaking:
+            phase = rt.interview.machine.phase.value
+            played = rt.now() - reply.t_start
+            total = float(getattr(rt, "reply_playing_seconds", 0.0) or 0.0)
+            current = getattr(driver.session, "current_speech", None)
+            interruptible = bool(
+                current is not None and not current.done() and getattr(current, "allow_interruptions", False)
+            )
+            if sim.interrupt_due(phase, reply, played, total, interruptible):
+                # Heard since the candidate's own turn ended (not since before it: those lines
+                # were already answered, and a live advisor must not be fed them again).
+                turn_end = max(
+                    (s.t_end for s in rt.spans if s.speaker == "candidate" and s.t_end is not None),
+                    default=since,
+                )
+                view = _view(rt, max(since, turn_end), 0.0)
+                second = await sim.interrupt_action(view, phase, _heard_before_cut(reply.text, played, total))
+                second_task = asyncio.ensure_future(
+                    driver.speak(
+                        second.text, wps=second.wps, act=second.act, role=second.role, intent=second.intent,
+                        barge_in=True,
+                    )
+                )
+                cut = (second, second_task, sim.exchanges, rt.now())
+        await asyncio.sleep(FLOOR_POLL_SEC)
+    result = task.result()
+    span = result.get("span")
+    new_since = span.t_end if span is not None and span.t_end is not None else rt.now()
+    _note_turn(rt, sim, record, action, result, since, exchange=exchange)
+    if cut is not None:
+        second, second_task, second_exchange, started = cut
+        second_result = await second_task
+        second_span = second_result.get("span")
+        ends = [new_since, rt.now() if second_span is None or second_span.t_end is None else second_span.t_end]
+        new_since = max(ends)
+        _note_turn(rt, sim, record, second, second_result, started, exchange=second_exchange)
+    return new_since
+
+
+def _heard_before_cut(text: str, played: float, total: float) -> str:
+    """The part of a line the candidate will have heard when their cut-in's voice cuts it (the
+    cut-in starts now, and the line stops ``barge_in_sec`` later: ``SdkDriver.speak``).  At the
+    ``min_words`` rollback no voice cuts it, and the part played so far is what was heard."""
+    return played_part(text, played + (barge_in_sec() or 0.0), total)
+
+
 async def _wait_floor(
     rt: Runtime, sim: CandidateSim, driver: SdkDriver, reaction: float, run_task: asyncio.Future
-) -> None:
-    """Until nobody has spoken for ``reaction`` seconds (pressing the button when it is due)."""
+) -> tuple[Any, str, str] | None:
+    """Until nobody has spoken for ``reaction`` seconds (pressing the button when it is due).
+
+    Returns None, or ``(span, heard part, phase)`` when the interrupter cuts in over a bot line
+    that is still playing (``CandidateSim.interrupt_due``).
+    """
     quiet_since: float | None = None
     while not run_task.done():
         playing = rt.now_playing
         if playing is not None:
             phase = rt.interview.machine.phase.value
-            if sim.press_due(
-                phase, playing, rt.now() - playing.t_start, rt.now_playing_seconds, rt.page
-            ):
+            played = rt.now() - playing.t_start
+            if sim.press_due(phase, playing, played, rt.now_playing_seconds, rt.page):
                 sim.pressed = True
                 driver.press_ready("mid_brief")
+        reply = getattr(rt, "reply_playing", None)
+        if reply is not None and not rt.candidate_speaking:
+            phase = rt.interview.machine.phase.value
+            played = rt.now() - reply.t_start
+            total = float(getattr(rt, "reply_playing_seconds", 0.0) or 0.0)
+            current = getattr(driver.session, "current_speech", None)
+            interruptible = bool(
+                current is not None and not current.done() and getattr(current, "allow_interruptions", False)
+            )
+            if sim.interrupt_due(phase, reply, played, total, interruptible):
+                return reply, _heard_before_cut(reply.text, played, total), phase
         if rt.floor_free:
             if quiet_since is None:
                 quiet_since = rt.now()
             if rt.now() - quiet_since >= reaction:
-                return
+                return None
         else:
             quiet_since = None
         await asyncio.sleep(FLOOR_POLL_SEC)
+    return None
 
 
 async def _wait_new_speech(
@@ -537,6 +646,8 @@ def _note_turn(
     action: Any,
     result: Mapping[str, Any],
     since: float,
+    *,
+    exchange: int | None = None,
 ) -> None:
     span = result.get("span")
     interview = rt.interview
@@ -554,6 +665,10 @@ def _note_turn(
         "suppressed": result.get("why") if result.get("suppressed") else None,
         "reply": result.get("spoken"),
     }
+    if action.traits:
+        turn["traits"] = list(action.traits)
+    if action.cut_in:
+        turn["cut_in"] = True
     if action.answering is not None:
         # What the candidate answered (heard) next to the engine's own flag (cross-check).
         turn["answering"] = action.answering
@@ -583,13 +698,14 @@ def _note_turn(
         )
     record["exchanges"].append(
         {
-            "n": sim.exchanges,
+            "n": sim.exchanges if exchange is None else exchange,
             "r_sec": turn["r_sec"],
             "advisor": {
                 **action.advisor.as_dict(),
                 "text": action.text,
                 "words": word_count(action.text),
                 "act": action.act,
+                "traits": list(action.traits),
             },
             "learner": learner,
             "clock": {"s_sec": turn["s_sec"], "t_start": turn["t_start"]},
