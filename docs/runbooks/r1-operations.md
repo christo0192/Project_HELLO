@@ -2251,8 +2251,8 @@ revision 21's brief, replay, nudge, pickup, aside, note and routing exactly.
 * **BR-1**: a request that names the brief and asks with "go over / go through / run me through /
   walk me through ... again" is a brief request at the transcript too (`is_brief_request(wide=True)`),
   and a turn that names the role-play and says "get a handle on", "be clear on", "make sense of",
-  "want to understand" or a go-over verb (not after "let's", "we can" and the like, unless it says
-  "again") routes like a role-play question, with no question mark needed.
+  "want to understand" or a go-over verb (aimed at Christy since revision 25, see below) routes like
+  a role-play question, with no question mark needed.
 * **BR-2**: a request to hear one of Christy's icebreaker questions again ("go back to that earlier
   question", "the question before the last one", "your previous question";
   `is_icebreaker_question_request`) gets "Of course. {question}" (scripted, no model call, at most
@@ -2269,6 +2269,23 @@ revision 21's brief, replay, nudge, pickup, aside, note and routing exactly.
 Logs: `r1_transition_question_repeat` (with a count) and `r1_transition_quiet_turn_reask`. The
 content pin's log label (`r1_fidelity_content`) is split by a dot after its sixth character when
 its 12 characters hold ten digits in a row (revision 24's do), as the logger drops such a value.
+
+**Review of diagnosis 1 (same flag, content revision 25):**
+
+* **BR-2**: the question asked for again must be Christy's ("the/that/your earlier, previous, first
+  or opening question", "the question you asked me earlier") and the ask must be aimed at her ("can
+  you repeat", "ask me that again", "what was your earlier question", "remind me of"). A turn that
+  names a question of the candidate's own ("My first question is ...", "One other question: ..."),
+  or also asks about the job ("Going back to the previous question, what's the salary?"), goes to
+  the model as before. "The first question" gets her first kept question, not her last. The turn
+  after the repeat counts as its answer only when it asks nothing itself; it gets one more note line
+  (`TRANSITION_IB_ANSWER_NOTE`: react in one short sentence, ask nothing).
+* **BR-1**: a go-over ask must be aimed at Christy ("can/could you ...", "please ...", "walk/run me
+  through", or an imperative with "for me" or "again"), so "Sure, I can go through the role play
+  now", "Let me go through the role play then" or "I'll go through the scenario once more in my
+  head" no longer replay the brief. An understand-ask needs the brief (or "it") right after it and
+  no plan words ("before I pitch", "in the role play I ..."): "I will be clear about the fees" and
+  "I'd like to understand her needs first" are the candidate's plan, answered by the model.
 
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 
