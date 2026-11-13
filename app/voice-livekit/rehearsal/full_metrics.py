@@ -14,6 +14,8 @@ phase, the questions the owner's rules and the plan ask (M032 S8):
   the candidate never had to fall back to the button because a spoken "ready" was not taken (and,
   when the code base reports it, ``session_facts.start_by`` agrees);
 * ``transition_ceiling``: the role-play started within the transition's 6:00 ceiling;
+* ``ready_taken``: every spoken "ready" in the transition started the role-play (the learner picked
+  up before the candidate spoke again): a "ready" Christy answered as a question, or ignored, fails;
 * ``roleplay_end``: an in-role close (a farewell, the offer to wrap up) never exits before R 14:00
   unless the candidate agreed (D-M032-2); a time-cap exit falls inside 19:00-20:30 and never
   follows an end request that was ignored; an exit on the candidate's own end request is theirs;
@@ -79,6 +81,7 @@ CHECK_IDS = (
     "icebreaker_exit",
     "start_by",
     "transition_ceiling",
+    "ready_taken",
     "roleplay_end",
     "end_consent",
     "abuse",
@@ -261,6 +264,31 @@ def _transition_ceiling(record: Mapping[str, Any], rows: Sequence[Mapping[str, A
         return {"ok": None}
     took = float(pickup["s_sec"]) - s_trans
     return {"ok": took <= TRANSITION_CEILING_SEC, "transition_seconds": round(took, 1)}
+
+
+def _ready_taken(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Every spoken "ready" in the transition is taken: the learner picks up before the candidate's
+    next turn (a bridge line of Christy's before the pickup is fine)."""
+    readies = [
+        index
+        for index, row in enumerate(rows)
+        if row.get("speaker") == "candidate" and row.get("phase") == "transition" and row.get("act") == "ready"
+    ]
+    if not readies:
+        return {"ok": None}
+    missed = []
+    for index in readies:
+        bots = _bot_rows_until_candidate(rows, index)
+        if not any(row.get("voice") == "learner" for row in bots):
+            reply = bots[0] if bots else None
+            missed.append(
+                {
+                    "s_sec": _num(rows[index].get("s_sec")),
+                    "said": str(rows[index].get("text") or "")[:80],
+                    "reply": None if reply is None else str(reply.get("text") or "")[:80],
+                }
+            )
+    return {"ok": not missed, "readies": len(readies), "not_taken": missed}
 
 
 def _candidate_acts(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -643,6 +671,7 @@ def phase_checks(record: Mapping[str, Any]) -> dict[str, Any]:
         "icebreaker_exit": _icebreaker_exit(record, truth),
         "start_by": _start_by(record, rows, truth),
         "transition_ceiling": _transition_ceiling(record, rows),
+        "ready_taken": _ready_taken(rows),
         "roleplay_end": _roleplay_end(record, phases, consent),
         "end_consent": consent,
         "abuse": _abuse(record, rows),
@@ -689,6 +718,7 @@ def build_full_scorecard(
     records: Sequence[Mapping[str, Any]], *, offline: bool, header: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
     """The role-play scorecard of the calls that reached a role-play, plus the per-phase checks."""
+    from rehearsal.flow_judge import flow_summary
     from rehearsal.scorecard import build_scorecard
 
     with_roleplay = [record for record in records if record.get("exchanges")]
@@ -705,6 +735,14 @@ def build_full_scorecard(
     errors = [str((r.get("header") or {}).get("seed")) for r in records if r.get("error")]
     if errors:
         reasons.append(f"{len(errors)} call(s) broke")
+    flow = flow_summary(records)
+    if not offline:
+        if flow["gates_failed"]:
+            reasons.append("conversation-flow gate(s) failed: " + ", ".join(flow["gates_failed"]))
+        if flow["unjudged"]:
+            reasons.append(f"{len(flow['unjudged'])} call(s) without a flow verdict")
+        if not flow["judged"]:
+            reasons.append("no call has a flow verdict")
     return {
         "header": dict(header or {}),
         "tier": "full",
@@ -713,6 +751,7 @@ def build_full_scorecard(
         "roleplay": roleplay,
         "phase_checks": checks,
         "phase_checks_failed": failed,
+        "flow": flow,
         "errors": errors,
         "ready_for_owner_test": not reasons,
         "reasons": reasons,
@@ -753,6 +792,10 @@ def render_full_markdown(card: Mapping[str, Any], records: Sequence[Mapping[str,
             f"{_clock(record.get('session_seconds'))} | {_clock(record.get('roleplay_seconds'))} | "
             f"{', '.join(checks.get('failed') or []) or '-'} |"
         )
+    if card.get("flow") is not None:
+        from rehearsal.flow_judge import render_flow_markdown
+
+        lines += render_flow_markdown(card["flow"])
     if card.get("roleplay"):
         with_roleplay = [record for record in records if record.get("exchanges")]
         lines += ["", "## Role-play (the role-play tier's gates)", "", render_markdown(card["roleplay"], with_roleplay)]

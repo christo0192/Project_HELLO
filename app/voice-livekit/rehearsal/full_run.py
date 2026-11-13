@@ -119,6 +119,7 @@ class OfflineFullFactory:
         return {"mode": "offline"}
 
     def make(self, spec: FullCallSpec) -> FullDeps:
+        from rehearsal.flow_judge import ScriptedFlowJudge
         from rehearsal.judge import ScriptedRubricJudge
         from rehearsal.manual import candidate_parts
         from rehearsal.scripted_interviewer import PhaseRouter, ScriptedInterviewerLLM
@@ -152,6 +153,7 @@ class OfflineFullFactory:
             models={"candidate": "scripted", "christy": "scripted", "learner": "scripted"},
             shadow=shadow,
             rubric=ScriptedRubricJudge() if self.settings.judge else None,
+            flow_judge=ScriptedFlowJudge() if self.settings.judge else None,
         )
 
     async def aclose(self) -> None:
@@ -234,6 +236,7 @@ class LiveFullFactory:
         self._session = session
 
     def make(self, spec: FullCallSpec) -> FullDeps:
+        from rehearsal.flow_judge import FlowJudge
         from rehearsal.judge import RubricJudge
         from rehearsal.manual import candidate_parts
 
@@ -265,8 +268,10 @@ class LiveFullFactory:
                 "christy": "deepseek-flash (production client)",
                 "learner": "deepseek-flash (production client)",
                 "rubric_judge": self.judge_model if self.settings.judge else None,
+                "flow_judge": self.judge_model if self.settings.judge else None,
             },
             rubric=RubricJudge(self.client, self.judge_model) if self.settings.judge else None,
+            flow_judge=FlowJudge(self.client, self.judge_model) if self.settings.judge else None,
         )
 
     async def aclose(self) -> None:
@@ -297,8 +302,23 @@ def full_summary(record: dict[str, Any]) -> dict[str, Any]:
         "families_delivered": metrics.get("families_delivered"),
         "hard_fails": record.get("hard_fails"),
         "phase_checks_failed": checks.get("failed"),
+        "flow": flow_line(record),
         "error": record.get("error"),
     }
+
+
+def flow_line(record: dict[str, Any]) -> dict[str, Any]:
+    """The flow judge's per-call scores for ``results.jsonl`` (``status`` n/a offline, or error)."""
+    flow = record.get("flow")
+    if not flow:
+        return {"status": "absent"}
+    out: dict[str, Any] = {"status": flow.get("status")}
+    if flow.get("status") == "ok":
+        out["scores"] = flow.get("scores")
+        out["worst_turns"] = [item.get("turn") for item in flow.get("worst_moments") or []]
+    elif flow.get("error"):
+        out["error"] = flow.get("error")
+    return out
 
 
 def write_full_call(out: Path, record: dict[str, Any], scrub: Callable[[object], str]) -> None:
@@ -412,7 +432,11 @@ async def run_full_all(
         say("")
         say(markdown)
         if settings.strict and code == EXIT_OK:
-            failed = any(r.get("hard_fails") for r in records) or bool(card.get("phase_checks_failed"))
+            failed = (
+                any(r.get("hard_fails") for r in records)
+                or bool(card.get("phase_checks_failed"))
+                or bool((card.get("flow") or {}).get("gates_failed"))
+            )
             code = EXIT_STRICT if failed else EXIT_OK
     (out / "run.json").write_text(json.dumps(run, indent=1, default=str), encoding="utf-8", newline="\n")
     if run["stopped"]:

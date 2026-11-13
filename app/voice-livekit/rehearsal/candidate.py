@@ -177,6 +177,8 @@ class Action:
     intent: str | None = None  # the manual library's description of the move, when it has one
     answering: str | None = None  # the heard question this turn answers ("end", "wrap"), if any
     engine_question: str | None = None  # the engine's flag at that moment (cross-check only)
+    traits: tuple[str, ...] = ()  # how the turn is said (``rehearsal.adapt``), ground truth
+    cut_in: bool = False  # said while a bot line was still playing (the interrupter)
 
 
 # --------------------------------------------------------------------------- the talkers
@@ -360,6 +362,7 @@ class ScenarioAdvisor:
         self.failures = 0
         self.names: dict[str, str] = {}
         self.last_intent: str | None = None
+        self.last_traits: tuple[str, ...] = ()
         self._chat: list[dict[str, str]] = []
         self._pickup = ""
         self._fallback: Any = None
@@ -436,8 +439,10 @@ class ScenarioAdvisor:
         if learner_text is not None:
             self._chat.append({"role": "user", "content": learner_text})
         self.last_intent = None
+        self.last_traits = ()
         if self._beats and r_sec >= self._beats[0].at_r:
             beat = self._beats.pop(0)
+            self.last_traits = tuple(beat.traits)
             text = await self._beat_text(beat)
             if beat.intent:
                 from rehearsal.manual import advisor_tags
@@ -456,6 +461,7 @@ class ScenarioAdvisor:
             self._chat.append({"role": "assistant", "content": json.dumps({"text": turn.text})})
             return turn, "price_dodge"
         turn, base_act = await self._base_turn(learner_text, r_sec, exchange)
+        self.last_traits = tuple(getattr(self.base, "last_traits", ()) or ())
         if base_act:  # a replayed move carries its own ground truth
             self._chat.append({"role": "assistant", "content": json.dumps({"text": turn.text})})
             self.last_intent = getattr(self.base, "last_intent", None)
@@ -473,6 +479,19 @@ class ScenarioAdvisor:
             return held, "price_held"
         self._chat.append({"role": "assistant", "content": json.dumps({"text": turn.text})})
         return turn, "advisor_turn"
+
+
+    def cut_in(self, learner_part: str | None, text: str, act: str, traits: Sequence[str] = ()) -> AdvisorTurn:
+        """A short line said over the learner (the interrupter): kept in the advisor's history
+        like a beat, so a live advisor knows what it cut in with."""
+        if learner_part:
+            self._chat.append({"role": "user", "content": learner_part})
+        turn = AdvisorTurn(text, "other", "")
+        self._remember(learner_part, turn)
+        self._chat.append({"role": "assistant", "content": json.dumps({"text": text})})
+        self.last_intent = None
+        self.last_traits = tuple(traits)
+        return turn
 
 
 # ------------------------------------------------------------------------ the simulator
@@ -513,6 +532,12 @@ class CandidateSim:
         self.last_act: str | None = None
         self.pressed = False
         self.done = False
+        # The interrupter's cut-ins (``rehearsal.adapt``); None for every other scenario.
+        self.interrupter: Any = None
+        if scenario.adapt:
+            from rehearsal.adapt import interrupter_for
+
+            self.interrupter = interrupter_for(scenario)
 
     def bind(self, names: dict[str, str]) -> None:
         """The names the library texts fill in (the learner's, a wrong one, the candidate's)."""
@@ -547,6 +572,38 @@ class CandidateSim:
         if phase == "transition":
             self.button_missing = True
 
+    # ---------------------------------------------------------------------- cutting in
+    def interrupt_due(
+        self, phase: str, playing: Span | None, played: float, total: float, interruptible: bool
+    ) -> bool:
+        """Whether the interrupter cuts in now, over the bot line that is playing."""
+        if self.interrupter is None or self.done or not interruptible:
+            return False
+        return bool(self.interrupter.due(phase, playing, played, total))
+
+    async def interrupt_action(self, view: View, phase: str, heard_part: str) -> Action:
+        """The cut-in itself: a short line that changes direction (to the learner in the role-play,
+        to Christy in the icebreaker)."""
+        act, text, traits = self.interrupter.line(phase)
+        if phase not in ("roleplay", "aside"):
+            self.last_act = act
+            self.talker.said(text)
+            return Action(
+                "speak", text=text, act=act, role="candidate", wps=self.candidate_wps,
+                traits=tuple(traits), cut_in=True,
+            )
+        heard = " ".join(view.learner())
+        learner_part = " ".join(part for part in (heard, heard_part) if part).strip() or None
+        self.exchanges += 1
+        turn = self.advisor.cut_in(learner_part, text, act, traits)
+        if self.shadow is not None:
+            self.shadow.set_turn(turn.as_dict())
+        self.last_act = act
+        return Action(
+            "speak", text=text, act=act, role="advisor", advisor=turn, wps=self.advisor_wps,
+            traits=tuple(traits), cut_in=True,
+        )
+
     # ----------------------------------------------------------------------- deciding
     async def next_action(self, view: View) -> Action:
         # Only lines not heard before count and go to the talker: the view of a wait loop keeps
@@ -570,7 +627,11 @@ class CandidateSim:
             return action
         if view.open_question == "wrap":
             accept = self._wrap_ready(view)
-            action = self._say(WRAP_ACCEPT if accept else WRAP_DECLINE, role="candidate")
+            accept_beat, decline_beat = WRAP_ACCEPT, WRAP_DECLINE
+            if self.scenario.wrap_texts:
+                accept_beat = Beat(WRAP_ACCEPT.act, self.scenario.wrap_texts[0])
+                decline_beat = Beat(WRAP_DECLINE.act, self.scenario.wrap_texts[1])
+            action = self._say(accept_beat if accept else decline_beat, role="candidate")
             action.answering, action.engine_question = "wrap", view.engine_question
             return action
         in_roleplay = view.phase in ("roleplay", "aside") or (
@@ -591,7 +652,8 @@ class CandidateSim:
     def _say(self, beat: Beat, *, role: str) -> Action:
         self.last_act = beat.act
         return Action(
-            "speak", text=beat.text, act=beat.act, role=role, wps=self.candidate_wps, intent=beat.intent or None
+            "speak", text=beat.text, act=beat.act, role=role, wps=self.candidate_wps,
+            intent=beat.intent or None, traits=tuple(beat.traits),
         )
 
     async def _beat_text(self, beat: Beat) -> str:
@@ -631,7 +693,8 @@ class CandidateSim:
         if christy and is_sound_check(christy[-1].text):
             # "Can you hear me okay?" (the M032 opening hello): a short yes, which uses up no
             # icebreaker answer and no replay move.
-            return self._spoken(SOUND_CHECK_ANSWER.act, SOUND_CHECK_ANSWER.text, role="candidate")
+            text = self.scenario.sound_check_text or SOUND_CHECK_ANSWER.text
+            return self._spoken(SOUND_CHECK_ANSWER.act, text, role="candidate")
         if (
             self.scenario.silent_after_question is not None
             and not self._silence_done
@@ -648,10 +711,11 @@ class CandidateSim:
         text = await self.talker.icebreaker_answer()
         act = getattr(self.talker, "last_act", None) or "icebreaker_answer"
         intent = getattr(self.talker, "last_intent", None)
+        traits = tuple(getattr(self.talker, "last_traits", ()) or ())
         if act == "ready_button":
             self.pressed = True
             return Action("press", why="scenario", intent=intent)
-        return self._spoken(act, text, role="candidate", intent=intent)
+        return self._spoken(act, text, role="candidate", intent=intent, traits=traits)
 
     async def _transition_action(self, view: View) -> Action:
         if self.scenario.press_button == "mid_brief" and not self.button_missing:
@@ -671,7 +735,7 @@ class CandidateSim:
             text = await self._beat_text(beat)
             if not text:
                 return Action("wait")
-            return self._spoken(beat.act, text, role="candidate", intent=beat.intent or None)
+            return self._spoken(beat.act, text, role="candidate", intent=beat.intent or None, traits=beat.traits)
         fallbacks = self.scenario.ready_fallbacks
         if self._extra_ready < len(fallbacks) + MAX_EXTRA_READY:
             text = fallbacks[min(self._extra_ready, len(fallbacks) - 1)]
@@ -692,12 +756,16 @@ class CandidateSim:
         text = await self.talker.wrapup_question() if beat.text == FREE else await self._beat_text(beat)
         if not self._wrapup and beat.act in ("wrapup_none", "wrapup_done"):
             self.done = True
-        return self._spoken(beat.act, text, role="candidate", intent=beat.intent or None)
+        return self._spoken(beat.act, text, role="candidate", intent=beat.intent or None, traits=beat.traits)
 
-    def _spoken(self, act: str, text: str, *, role: str, intent: str | None = None) -> Action:
+    def _spoken(
+        self, act: str, text: str, *, role: str, intent: str | None = None, traits: Sequence[str] = ()
+    ) -> Action:
         self.last_act = act
         self.talker.said(text)
-        return Action("speak", text=text, act=act, role=role, wps=self.candidate_wps, intent=intent)
+        return Action(
+            "speak", text=text, act=act, role=role, wps=self.candidate_wps, intent=intent, traits=tuple(traits)
+        )
 
     async def _advisor_action(self, view: View) -> Action:
         learner = view.learner()
@@ -727,6 +795,7 @@ class CandidateSim:
             advisor=turn,
             wps=self.advisor_wps,
             intent=getattr(self.advisor, "last_intent", None),
+            traits=tuple(getattr(self.advisor, "last_traits", ()) or ()),
         )
 
 

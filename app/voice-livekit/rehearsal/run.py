@@ -569,7 +569,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="default",
         help="full-interview scenarios or groups, comma separated (default: manual replays, the "
         "manual mix and the synthetic edge scenarios; groups: manual-replay, manual-mix, manual, "
-        "synthetic, early, price, wrapup ...)",
+        "synthetic, adapt (the adaptability scenarios), all (default + adapt), early, price, wrapup ...)",
     )
     full.add_argument("--candidate-model", default=DEFAULT_ADVISOR_MODEL, help="the live candidate's model")
     return parser

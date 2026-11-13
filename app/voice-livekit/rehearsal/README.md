@@ -220,6 +220,48 @@ Harness switches (`rehearsal/flags.py`, default ON; `0` restores the previous be
 transition labels, the brief-line rule and the `icebreaker_repeat` check), `REHEARSAL_LEARNER_CLOCK`
 (window checks time the learner's line by its decision).
 
+## Adaptability scenarios and the flow judge (`--scenarios adapt`, D-M032-10)
+
+```
+python -m rehearsal --full --offline --scenarios adapt --out <dir>                  # every adapt scenario, scripted
+python -m rehearsal --full --scenarios tangent --out <dir> --budget-usd 0.30         # one live call, judged
+python -m rehearsal --full --scenarios all --out <dir> --budget-usd 6                # default + adapt, live
+```
+
+The owner's goal is a bot with excellent conversational flow that adapts to every kind of
+conversation while sticking to its objective. `rehearsal/adapt.py` adds fourteen named candidates
+(group `adapt`; `all` is `default` plus `adapt`, and `default` is unchanged): `tangent`, `confused`,
+`rambler`, `one-worder`, `hinglish`, `rude-not-abusive`, `interrupter`, `off-script-advisor`,
+`manipulative-advisor`, `over-discounter`, `gives-up-midway`, `mid-roleplay-glitch`,
+`argues-with-christy` and `late-ready`. Each is phase-aware: offline the talk is scripted (answer
+banks, transforms of the scripted advisor's turns, word-for-word beats); live, DeepSeek plays the
+candidate with the behaviour in its system prompt to Christy and as an overlay on the advisor, and
+the beats are said word for word, so the behaviour always happens. Every candidate turn carries its
+ground-truth `act` (new: `tangent`, `confused_question`, `interrupt`, `off_script`, `pressure`,
+`discount_drop`, `glitch_check`, `glitch_lost`, `argue`) and `traits` (how it was said: `tangent`,
+`ramble`, `one_word`, `hinglish`, `rude`, `interrupt` ...); the header's `ground_truth.adapt` names
+the behaviour.
+
+The interrupter cuts in while a generated bot reply is still playing (every third long learner
+reply, Christy's second icebreaker reply), and the SDK side cuts that reply when the cut-in's turn
+ends (`SdkDriver.speak` interrupts an interruptible current speech): a barge-in cut at the turn's
+end, not at voice onset.
+
+New per-phase check `ready_taken`: every spoken "ready" in the transition starts the role-play (the
+learner picks up before the candidate speaks again). A "ready" Christy answers as a question, or
+ignores, fails.
+
+The flow judge (`rehearsal/flow_judge.py`, live only; offline it records `status: n/a`) reads the
+whole transcript, the scenario's behaviour and the call's facts, and scores the BOT on six axes,
+1 to 5: `christy_flow`, `learner_flow`, `adaptability`, `objective_kept`, `repetition`,
+`naturalness`, with evidence quotes that must be in a CHRISTY or LEARNER line (a quote from a
+candidate line or from no line is rejected, listed under `evidence_rejected`) and the worst moments
+(turn, speaker, why). Per-call scores go to `results.jsonl` (`flow`), the means, minimums, gates and
+worst moments to `scorecard.md` / `scorecard.json` (`flow`). Gates: naturalness mean >= 4.3,
+adaptability mean >= 4.3, objective_kept minimum >= 4, and no call below 3 on any axis. A failed
+gate or a call without a verdict keeps a live run from being ready, and `--strict` exits 5 on a
+failed flow gate. The judge uses `--judge-model` (as the rubric judge); `--no-judge` turns both off.
+
 ## Not measured here
 
 STT fragmentation and end-of-turn detection, barge-in, TTS and first-audio latency, the scenario card

@@ -24,7 +24,8 @@ livekit-agents 1.6.4 does on a call, on the same seams the role-play tier's ``Ri
   it: a server-sent ``data_received`` packet on ``READY_TOPIC`` (``tests.test_r1_core``
   ``TestReadyButton``).
 
-Not emulated: barge-in (the simulated candidate waits for the floor), the STT node's acknowledgement
+Not emulated: barge-in at voice onset (the simulated candidate waits for the floor; only the adapt
+interrupter cuts in over a playing reply, which is cut when its turn ends), the STT node's acknowledgement
 hold, VAD fragments, TTS audio and the recording.  ``Span`` is the harness's own record of who spoke
 when (virtual seconds, the S and R clocks), which the transcript rows are joined with.
 """
@@ -194,6 +195,10 @@ class Runtime:
         self.candidate_speaking = False
         self.now_playing: Span | None = None
         self.now_playing_seconds = 0.0
+        # The generated reply that is playing (a ``say`` line is ``now_playing``): what an
+        # interrupting candidate can cut in over.
+        self.reply_playing: Span | None = None
+        self.reply_playing_seconds = 0.0
 
     # ------------------------------------------------------------------- clocks
     def now(self) -> float:
@@ -600,7 +605,11 @@ class SdkDriver:
             session.emit("agent_state_changed", _state("thinking", "speaking"))
             span = rt.open_span("bot", voice, spoken, "reply")
             seconds = rt.timing.speak_seconds(spoken, voice)
-            played = await session.play_for(handle, seconds)
+            rt.reply_playing, rt.reply_playing_seconds = span, seconds
+            try:
+                played = await session.play_for(handle, seconds)
+            finally:
+                rt.reply_playing = None
             interrupted = handle.cut.is_set()
             said = played_part(spoken, played, seconds) if interrupted else spoken
             span.text = said

@@ -724,7 +724,14 @@ def candidate_parts(
     from rehearsal.scripted_advisor import ScriptedAdvisor
 
     register()
+    from rehearsal import adapt
+
+    adapt.register()
     scenario = SCENARIOS[name]
+    if scenario.adapt:
+        return adapt.adapt_parts(
+            scenario, seed, level, offline=offline, client=client, model=model, candidate_name=candidate_name
+        )
     rewriter = None if offline else Rewriter(client, model)
 
     def fallback_talker(style: str) -> Any:
