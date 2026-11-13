@@ -2282,6 +2282,7 @@ class TestPhaseDriver(R1TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_question_in_a_later_final_of_the_same_turn_is_not_lost(self) -> None:
         # One user turn, two finals: "Nothing else." then the question itself.  Ending
         # wrap-up on the first would play L-CLOSE over a question being answered.
@@ -2311,6 +2312,7 @@ class TestPhaseDriver(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(task, 10.0))
         self.assertEqual(self.interview._turns.qsize(), 0)  # both finals were consumed
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_settle_window_does_not_run_while_the_candidate_is_talking(self) -> None:
         self.enter_wrapup()
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
@@ -2404,6 +2406,7 @@ class TestPhaseDriver(R1TestCase):
                 self.assertEqual(waits[0], r1_session.WRAPUP_SILENCE_SECONDS)
                 self.assertAlmostEqual(waits[1], plain * factor)
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_okay_so_and_a_pause_does_not_end_the_wrapup_over_the_question_that_follows(
         self,
     ) -> None:
@@ -3483,6 +3486,7 @@ class TestRunFlow(R1TestCase):
         self.assertFalse(fidelity["checks"]["r_reached_10_min"])
         self.assertFalse(fidelity["passes"])
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_confirmed_request_to_stop_ends_the_roleplay_into_the_wrapup(self) -> None:
         # Owner test 7f2a25e6: "can you disconnect the call?" gets the interviewer's question once.
         # Owner decision 2026-10-29 (owner test 1eb18cd4): "End the interview." then ends the
@@ -3496,6 +3500,26 @@ class TestRunFlow(R1TestCase):
         self.assertTrue(await self.answer("End the interview."))
         await self.finish_the_wrapup_after_a_stop(task)
         self.assertEqual(self.session.spoken.count(self.spoken_line("L-ASIDE-END")), 1)
+
+    async def test_a_farewell_exit_says_her_bye_then_one_exit_and_wrap_line(self) -> None:
+        """Simulation diagnosis 3 (D3-EXIT1, R1_FAREWELL_EXIT_V2): the advisor's goodbye ended the
+        call: her short bye, then L-EXIT-WRAP (no beat, no separate L-WRAP)."""
+        task = await self.drive_to_the_roleplay()
+        self.clock.advance(60)
+        interview = self.session.agent.interview
+        engine = interview.engine
+        engine.exit_farewell = True
+        engine.exit_bye = "L-LEARNER-BYE-1"
+        engine.exit_requested = True
+        interview._wake()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
+            await self.candidate_replies_after("L-EXIT-WRAP", "No questions, thanks")
+            self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
+        spoken = self.session.spoken
+        tail = ["L-LEARNER-BYE-1", "L-EXIT-WRAP", "L-CLOSE"]
+        self.assertEqual(spoken[-3:], [self.spoken_line(name) for name in tail])
+        self.assertNotIn(self.spoken_line("L-WRAP"), spoken)
+        self.assertTrue(self.spoken_line("L-EXIT-WRAP").startswith("Let's pause the role-play here."))
 
     async def test_an_explicit_first_request_ends_the_roleplay_with_no_question(self) -> None:
         # Owner test 1eb18cd4, 81: "Let's end the interview." names the interview, so it is taken
@@ -3888,6 +3912,7 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
                 self.assertEqual(self.session.spoken, [])
                 self.assertEqual(self.interview._turns.qsize(), 0)
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_real_question_is_still_answered_and_keeps_wrapup_open(self) -> None:
         for text in (
             "What is the notice period for this role?",
@@ -3990,6 +4015,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
             r["text"] for r in self.writer.saved if r["speaker"] == "bot" and r["phase"] == "wrapup"
         ]
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_session_8f5bfefc_the_next_step_question_is_answered_before_the_close(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2), mock.patch.object(
@@ -4042,6 +4068,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
         handle.finish()
         await self.settle()
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_an_answer_cut_before_audio_at_the_question_limit_is_said_again(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2):
@@ -4061,6 +4088,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
         self.assertEqual(self.wrapup_bot_rows(), ["Monday to Friday.", "It is 5.5 days a week."])
         self.assertIsNone(self.interview._wrapup_answer_owed)
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_heard_answer_at_the_question_limit_still_closes(self):
         self.enter_wrapup()
         task = asyncio.create_task(self.interview._run_wrapup())
@@ -4072,6 +4100,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
         self.assertIsNone(await asyncio.wait_for(task, 5.0))
         self.assertEqual(self.session.generated, [])
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_owed_answer_is_said_again_once_and_the_wrapup_stays_bounded(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2):
@@ -4083,6 +4112,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(task, 5.0))
         self.assertEqual(len(self.session.generated), 1)
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_no_retry_once_the_wrapup_budget_is_spent(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2), mock.patch.object(
@@ -4094,6 +4124,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(self.interview._end_wrapup(), 5.0))
         self.assertEqual(self.session.generated, [])
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_thank_you_after_a_lost_answer_gets_the_answer_before_the_close(self):
         """Review of the 8f5bfefc fix: "Thank you." cancels the reply before any audio (the
         logged 4/10 pattern), a refusal gets no reply of its own, and L-CLOSE followed."""
@@ -4124,6 +4155,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
         await self.settle()
         return handle
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_silence_after_a_lost_answer_gets_the_answer_before_the_close(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "WRAPUP_SILENCE_SECONDS", 0.1):
@@ -4136,6 +4168,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(task, 5.0))
         self.assertEqual(self.wrapup_bot_rows(), [self.DEFER])
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_an_answer_cut_after_two_words_at_the_limit_waits_for_the_barge_in(self):
         """Review of the 8f5bfefc fix: "That's a" counted as the answer, and the wrap-up closed
         while the candidate's barge-in was still mid-turn."""
@@ -4153,6 +4186,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
         self.assertEqual(self.session.generated, [])
         self.assertEqual(self.wrapup_bot_rows(), ["Monday to Friday.", "That's a", self.DEFER])
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_partly_heard_answer_is_not_said_again_after_a_refusal(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
@@ -4164,6 +4198,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(task, 5.0))
         self.assertEqual(self.session.generated, [])
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_lone_lead_in_is_still_a_question_when_nothing_follows(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
@@ -4176,6 +4211,7 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     def test_the_classifiers(self):
         for text in ("Christy, so.", "So.", "Um, and", "Christie, um, so"):
             with self.subTest(text=text):
@@ -7892,7 +7928,9 @@ class TestVoicePerSpeech(R1TestCase):
         self.assertEqual(
             r1_session._LEARNER_LINES,
             {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP",
-             "L-LEARNER-HANGUP"},  # M032 S3.4: her one-line hang-up is hers
+             "L-LEARNER-HANGUP",  # M032 S3.4: her one-line hang-up is hers
+             # Simulation diagnosis 3 (D3-EXIT1): her short goodbye back is hers too.
+             "L-LEARNER-BYE-1", "L-LEARNER-BYE-2", "L-LEARNER-BYE-3"},
         )
         for line_id in [*sorted(r1_session._LEARNER_LINES), "L-SIL-IB", "L-EXIT", "L-SIL-RP2"]:
             with self.subTest(line_id=line_id):
@@ -8067,7 +8105,8 @@ class TestVoicePerSpeech(R1TestCase):
                 self.assertEqual(spec.voice, "learner" if learner else "interviewer")
         self.assertEqual(
             {spec.line_id for spec in free + named if spec.voice == "learner"},
-            {"L-PICKUP", "L-SIL-RP1", "L-TIME-UP", "L-LEARNER-HANGUP"},
+            {"L-PICKUP", "L-SIL-RP1", "L-TIME-UP", "L-LEARNER-HANGUP",
+             "L-LEARNER-BYE-1", "L-LEARNER-BYE-2", "L-LEARNER-BYE-3"},
         )
 
     async def test_voices_are_forgotten_when_a_speech_ends(self) -> None:
@@ -8435,6 +8474,7 @@ class TestEndIntentClassification(R1TestCase):
         self.enter_roleplay()
         self.interview.engine  # built, as the first role-play turn builds it
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_call_starts_at_the_final_and_is_reused_at_the_hook(self) -> None:
         runner = self.use(EndIntentRunner())
         text = "Okay, we can wrap up the interview here."
@@ -8454,6 +8494,7 @@ class TestEndIntentClassification(R1TestCase):
         rows = [row for row in self.writer.saved if row["speaker"] == "candidate"]
         self.assertEqual([(row["text"], row["phase"]) for row in rows], [(text, "aside")])
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_call_reports_its_own_time_and_verdict(self) -> None:
         self.use(EndIntentRunner('{"intent": "maybe"}'))
         with self.capture_logs() as logs:
@@ -8465,6 +8506,7 @@ class TestEndIntentClassification(R1TestCase):
         self.assertIn(self.spoken_line("L-ASIDE-END"), self.session.spoken)
         self.assertTrue(self.interview.engine.end_question_open)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_changed_text_starts_a_fresh_call(self) -> None:
         runner = self.use(EndIntentRunner())
         self.final_transcript("Okay, so we can wrap up.")
@@ -8490,6 +8532,7 @@ class TestEndIntentClassification(R1TestCase):
         )
         self.assertEqual(len(runner_two.calls), 2)  # the hook's text differed: a call at the hook
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_timeout_an_error_or_nonsense_is_the_lexical_reading(self) -> None:
         for runner in (
             EndIntentRunner(hang=True),
@@ -8516,6 +8559,7 @@ class TestEndIntentClassification(R1TestCase):
                 self.assertIn("none", categories)
         self.assertEqual(self.use(EndIntentRunner(hang=True)).cancelled, 0)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_timed_out_call_is_cancelled(self) -> None:
         runner = self.use(EndIntentRunner(hang=True))
         with mock.patch.dict(os.environ, {"R1_END_INTENT_TIMEOUT_SEC": "0.3"}):
@@ -8523,6 +8567,7 @@ class TestEndIntentClassification(R1TestCase):
         await self.settle()
         self.assertEqual(runner.cancelled, 1)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_turns_the_model_is_never_asked_about(self) -> None:
         runner = self.use(EndIntentRunner())
         # A prefilter miss: no call, no wait.
@@ -8534,6 +8579,7 @@ class TestEndIntentClassification(R1TestCase):
         self.assertTrue(self.interview.engine.end_confirmed)
         self.assertEqual(runner.calls, [])
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_kill_switch_and_a_session_without_a_client(self) -> None:
         runner = self.use(EndIntentRunner())
         with mock.patch.dict(os.environ, {"R1_END_INTENT_LLM": "0"}):
@@ -8544,6 +8590,7 @@ class TestEndIntentClassification(R1TestCase):
         self.assertIsNone(getattr(self.session, "llm", None))
         self.assertIsNone(self.interview._end_intent_runner_or_none())
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_an_unbuildable_client_disables_the_classifier_once(self) -> None:
         self.session.llm = object()
         self.assertEqual(
@@ -8557,6 +8604,7 @@ class TestEndIntentClassification(R1TestCase):
         self.assertTrue(self.interview._end_intent_unusable)
         self.assertIsNone(self.interview._end_intent_runner_or_none())
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_final_during_the_wait_opens_the_next_row(self) -> None:
         gate = asyncio.Event()
         self.use(EndIntentRunner('{"intent": "no"}', gate=gate))
@@ -8588,6 +8636,7 @@ class TestEndIntentClassification(R1TestCase):
             [row["text"] for row in self.writer.saved if row["speaker"] == "candidate"], [text]
         )
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_owners_missed_phrasings_end_the_roleplay_with_the_model(self) -> None:
         from tests.test_r1_end_intent import OWNER_MISSED
 
@@ -8600,6 +8649,7 @@ class TestEndIntentClassification(R1TestCase):
                 self.assertTrue(await self.commit_turn(text))
                 self.assertTrue(self.interview.engine.end_confirmed, text)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_question_is_the_context_after_the_aside(self) -> None:
         runner = self.use(EndIntentRunner('{"intent": "maybe"}'))
         await self.commit_turn("Can you end the call?")  # lexical "maybe": the model may raise it
@@ -8622,6 +8672,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
         await self.settle()
         self.assertTrue(self.interview.engine.end_question_open)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_yes_that_stands_confirms_and_exits_into_the_wrap_up(self) -> None:
         await self.asked()
         for answer in ("Yes.",):
@@ -8635,6 +8686,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
         rows = [row for row in self.writer.saved if row["speaker"] == "candidate"]
         self.assertEqual((rows[-1]["text"], rows[-1]["phase"]), ("Yes.", "aside"))
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_owners_answers_confirm(self) -> None:
         for answer in ("yes please", "sure", "haan", "go ahead", "Haan ji."):
             with self.subTest(answer=answer):
@@ -8644,6 +8696,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
                     self.assertTrue(await self.commit_turn(answer))
                 self.assertTrue(self.interview.engine.end_confirmed)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_yes_the_candidate_goes_on_from_waits_for_the_next_turn(self) -> None:
         await self.asked()
         self.final_transcript("Yeah.")
@@ -8665,6 +8718,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
         self.assertFalse(engine.end_confirmed)
         self.assertFalse(engine.end_question_open)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_speech_without_a_transcript_was_noise_and_the_yes_stands(self) -> None:
         await self.asked()
         with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "1.0"}), mock.patch.object(
@@ -8677,6 +8731,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
             self.assertTrue(await asyncio.wait_for(hook, 3.0))
         self.assertTrue(self.interview.engine.end_confirmed)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_yes_never_confirms_while_the_candidate_is_still_speaking(self) -> None:
         # Reviewed fix: the transcript wait ran from when the speech STARTED, so a continuation
         # longer than it ("... no wait, I want to carry on") timed out as noise and Christy's
@@ -8704,6 +8759,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
         self.assertFalse(engine.end_confirmed)
         self.assertFalse(self.interview._roleplay_exit_requested())
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_speech_that_stops_with_no_transcript_was_noise_after_it_stopped(self) -> None:
         # The noise wait starts when the speech stops: a long noise still confirms, only later.
         await self.asked()
@@ -8719,6 +8775,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
             self.assertTrue(await asyncio.wait_for(hook, 3.0))
         self.assertTrue(self.interview.engine.end_confirmed)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_yes_to_the_learner_after_a_fragment_never_confirms(self) -> None:
         # Reviewed fix: "Okay." left the question open while the learner answered in role, so a
         # "Yes." to her confirmed the stop, and the model was still told "Christy has just asked".
@@ -8743,6 +8800,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
         self.assertFalse(engine.end_confirmed)
         self.assertFalse(self.interview._roleplay_exit_requested())
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_yes_with_no_question_open_is_an_ordinary_turn(self) -> None:
         self.enter_roleplay()
         loop = asyncio.get_running_loop()
@@ -9372,3 +9430,64 @@ class TestTransitionConsent(R1TestCase):
         blob = " ".join(message["content"] for message in messages)
         self.assertNotIn(self.interview.persona.lead_name, blob)
         self.assertNotIn(self.spoken_line("L-TRANSITION"), blob)
+
+
+class TestWrapupNextStepsScripted(R1TestCase):
+    """Simulation diagnosis 3 (D3-WRAP1, R1_WRAPUP_NEXT_STEPS): "what happens next?" gets the
+    scripted L-WRAP-NEXT and the close names nobody again; two feedback asks get two different
+    refusals; "No, no questions from me. Thanks." closes.  Synthetic text."""
+
+    def enter_wrapup(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()
+        self.interview.machine.transition(R1Phase.WRAPUP)
+
+    async def run_wrapup_with(self, *turns: str) -> None:
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            for text in turns:
+                self.final_transcript(text)
+                await self.settle()
+                self.assertTrue(await self.commit_turn(text))  # no model reply
+                await self.settle()
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+
+    async def test_whats_next_gets_the_scripted_answer_and_the_short_close(self) -> None:
+        await self.run_wrapup_with("Okay, and what happens next?")
+        self.assertIn(self.spoken_line("L-WRAP-NEXT"), self.session.spoken)
+        self.assertTrue(self.interview._close_short)
+        self.assertEqual(self.session.generated, [])
+        self.assertEqual(self.interview._wrapup_counts()["wrapup_next_scripted"], 1)
+        close = self.spoken_line("L-CLOSE-SHORT")
+        self.assertNotIn("hiring team", close.lower())
+        self.assertIn("hiring team", self.spoken_line("L-WRAP-NEXT").lower())
+
+    async def test_two_feedback_asks_get_two_different_refusals(self) -> None:
+        await self.run_wrapup_with("How did I do in the role-play?", "Will I be selected, though?")
+        first = self.spoken_line("L-NO-FEEDBACK-2")
+        second = self.spoken_line("L-FAQ-DEFER-WRAP-2")
+        self.assertIn(first, self.session.spoken)
+        self.assertIn(second, self.session.spoken)
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.interview._wrapup_refusals, 2)
+
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})
+    async def test_flag_off_is_the_release_before(self) -> None:
+        self.assertIsNone(self.interview._wrapup_scripted_kind("What happens next?"))
+        self.assertFalse(r1_session.is_no_questions("No, no questions from me. Thanks."))
+
+    async def test_no_questions_from_me_closes(self) -> None:
+        self.assertTrue(r1_session.is_no_questions("No, no questions from me. Thanks."))
+        self.assertTrue(r1_session.is_no_questions("No, no questions. Thanks, that was lovely."))
+        self.assertFalse(r1_session.is_no_questions("No questions from me, but what's the pay?"))
+
+    async def test_the_readers(self) -> None:
+        kind = r1_session.wrapup_ask_kind
+        self.assertEqual(kind("What's the next stage?"), r1_session.WRAPUP_NEXT)
+        self.assertEqual(kind("Is there anything more to the interview?"), r1_session.WRAPUP_NEXT)
+        self.assertEqual(kind("When will I hear back?"), r1_session.WRAPUP_NEXT)
+        self.assertEqual(kind("Can I get some feedback?"), r1_session.WRAPUP_FEEDBACK)
+        self.assertIsNone(kind("What's the next step after joining, the training?"))
+        self.assertIsNone(kind("What are the shift timings?"))

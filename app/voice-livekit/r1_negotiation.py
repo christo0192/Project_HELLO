@@ -1010,6 +1010,10 @@ ANCHOR_STATED = "stated"
 ANCHOR_STATED_CONFLICT = "stated_conflict"
 ANCHOR_CHECK = "check"
 ANCHOR_FREE = "free"
+# Simulation diagnosis 3 (D3-LRN-PRICE1, the engine's R1_FOREIGN_PRICE): the advisor named the
+# course price in rupees or lakhs; she is in the US, so she checks it in dollars (the website's
+# $9,000) and keeps the $7,000 marker and the request, like the check form.
+ANCHOR_FOREIGN = "foreign"
 WEBSITE_PRICE = "$9,000"
 # The website's $9,000 and a stated price at least this far from it are a conflict (SWEEP-21).
 CONFLICT_MIN_GAP_USD = 300
@@ -1084,6 +1088,81 @@ def anchor_after_free() -> AnchorSituation:
             "Hold on, free? I'd heard about $7,000. What would I end up paying?",
         ),
     )
+
+
+def anchor_after_foreign() -> AnchorSituation:
+    """The anchor when the advisor named the price in rupees (D3-LRN-PRICE1)."""
+    return AnchorSituation(
+        ANCHOR_FOREIGN,
+        "the advisor named the price in rupees; you are in the US, so say you were expecting "
+        "dollars and check whether it is about $9,000 as you think you saw on the website, then "
+        "say you heard someone got it for around $7,000 and ask whether they could do that",
+        (WEBSITE_PRICE, "$7,000"),
+        (
+            "Rupees? I'm in the US, so I was thinking in dollars. Is it about $9,000, like I saw "
+            "on the website? I heard someone paid around $7,000. Could you do that?",
+            "Oh, in rupees? I was expecting dollars, I'm in the US. Is it around $9,000? That's "
+            "what I think I saw on the website. Someone told me they paid about $7,000, is that "
+            "possible?",
+            "Sorry, rupees? I'm in the US, so I had dollars in mind. I think the website said "
+            "around $9,000, is that right? I heard of someone paying about $7,000, could you do "
+            "that for me?",
+        ),
+    )
+
+
+# D3-LRN-PRICE1: a figure in rupees, lakhs or crores ("fifteen thousand rupees", "Rs 1,20,000",
+# "3 lakh"), read on the text BEFORE ``canonical_amounts`` (which writes "fifteen thousand" as
+# "$15000").  A course-price frame must lead into it ("the fee is", "it costs", "the course is")
+# or follow it ("for the full course", "in total").
+_NUMBER_WORDS = (
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+    r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    r"eighty|ninety|hundred|thousand|and|a|half|point)"
+)
+_FIGURE = r"(?:\d[\d,.]*|" + _NUMBER_WORDS + r")(?:[\s-]+(?:\d[\d,.]*|" + _NUMBER_WORDS + r"))*"
+_FOREIGN_FIGURE = re.compile(
+    r"(?:(?:\u20b9|\brs\.?|\binr)\s*\d[\d,.]*(?:\s*(?:lakhs?|lacs?|crores?|k)\b)?"
+    r"|\b" + _FIGURE + r"\s*(?:lakhs?|lacs?|crores?)\b(?:\s+(?:indian\s+)?(?:rupees?|inr))?"
+    r"|\b" + _FIGURE + r"\s+(?:indian\s+)?(?:rupees?|inr)\b)",
+    re.IGNORECASE,
+)
+_FOREIGN_FRAME_BEFORE = re.compile(
+    r"\b(?:fees?|price[sd]?|pricing|costs?|costing|course|program(?:me)?|pay|paying|total|"
+    r"comes? to|(?:it|that|this)(?:'s| is| was| would be| will be))\b[^.?!]{0,30}$",
+    re.IGNORECASE,
+)
+_FOREIGN_FRAME_AFTER = re.compile(
+    r"^\W*(?:for (?:the )?(?:full |whole |entire )?(?:course|program(?:me)?)|in total|total|"
+    r"all in|all together|altogether)\b",
+    re.IGNORECASE,
+)
+
+
+def foreign_price_in(text: object) -> str | None:
+    """The course price the advisor named in rupees in ``text`` (its words, lower case), or None.
+
+    "The fee's fifteen thousand rupees for the full course" names a price; "my cousin earns two
+    lakh a month" (no price frame) and "$9,000, which is about seven lakh rupees" after a dollar
+    price in the same sentence stay a dollar price (the dollar figure is the price).
+    """
+    for sentence in split_sentences(str(text or "")):
+        lowered = fold(sentence).lower()
+        for match in _FOREIGN_FIGURE.finditer(lowered):
+            before = lowered[: match.start()]
+            if "$" in before or re.search(r"\bdollars?\b", before):
+                continue
+            if _FOREIGN_FRAME_BEFORE.search(before) or _FOREIGN_FRAME_AFTER.search(
+                lowered[match.end() :]
+            ):
+                return match.group(0).strip()
+    return None
+
+
+def mask_foreign_prices(text: str) -> str:
+    """``text`` with every rupee figure written as "a rupee figure", so the dollar readers never
+    take "fifteen thousand rupees" for $15,000 (D3-LRN-PRICE1)."""
+    return _FOREIGN_FIGURE.sub("a rupee figure", text)
 
 
 def fill_decision_maker(text: str, decision_maker: str, *, regex: bool = False) -> str:
@@ -4428,7 +4507,7 @@ class Negotiation:
         """Her heard F1-ANCHOR checked the website's price (review S2P-R2, naturalness): the check
         form asked "is it about $9,000?", so no WEBSITE conflict is checked after it (his next
         figure is the answer); the stated-conflict form already checked ``stated_usd``."""
-        if anchor_id == ANCHOR_CHECK:
+        if anchor_id in (ANCHOR_CHECK, ANCHOR_FOREIGN):
             self.website_checked = True
         elif anchor_id == ANCHOR_STATED_CONFLICT and stated_usd is not None:
             key = (CONFLICT_WEBSITE, stated_usd)

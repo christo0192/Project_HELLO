@@ -50,6 +50,7 @@ from r1_prompts import (
 from r1_roleplay import (
     FLAG_WRAPUP_ANSWERS,
     FLAG_WRAPUP_NEXT_ROUND,
+    FLAG_WRAPUP_NEXT_STEPS,
     FLAG_WRAPUP_ONE_MENTION,
     TurnPlan,
     flag_on,
@@ -390,6 +391,7 @@ def llm_messages(
             wrapup_answers=flag_on(FLAG_WRAPUP_ANSWERS),
             wrapup_one_mention=flag_on(FLAG_WRAPUP_ONE_MENTION),
             wrapup_next_round=flag_on(FLAG_WRAPUP_NEXT_ROUND),
+            wrapup_next_steps=flag_on(FLAG_WRAPUP_NEXT_STEPS),
         ),
     )
 

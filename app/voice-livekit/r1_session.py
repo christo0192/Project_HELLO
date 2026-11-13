@@ -239,6 +239,8 @@ from r1_roleplay import (
     IN_ROLE_ASIDE_REASONS,
     FLAG_WRAPUP_ANSWERS,
     FLAG_WRAPUP_DECLINE_V2,
+    FLAG_WRAPUP_NEXT_STEPS,
+    FLAG_FAREWELL_EXIT_V2,
     WRAP_OFFER_PAUSE_SEC,
     RolePlayEngine,
     TurnMode,
@@ -451,7 +453,18 @@ _HELD_STT_EVENTS = frozenset({"final_transcript", "interim_transcript", "preflig
 # Scripted lines the LEARNER speaks; every other line is the interviewer's.  The voice decides
 # which model call may later see the line (``r1_prompts.select_context``).
 _LEARNER_LINES = frozenset(
-    {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP", "L-LEARNER-HANGUP"}
+    {
+        "L-PICKUP",
+        "L-SIL-RP1",
+        "L-FILLER-LEARNER",
+        "L-TIME-CUE",
+        "L-TIME-UP",
+        "L-LEARNER-HANGUP",
+        # Simulation diagnosis 3 (D3-EXIT1, D3-ASIDE1): her short goodbye back.
+        "L-LEARNER-BYE-1",
+        "L-LEARNER-BYE-2",
+        "L-LEARNER-BYE-3",
+    }
 )
 _REPLIES_KEPT = 8
 _SESSION_ID_FROM_ROOM = re.compile(
@@ -552,6 +565,12 @@ _COURTESY_WORDS = frozenset(
         "mam", "madam", "hmm", "hm", "mm", "mhm", "none", "fine", *_INTERVIEWER_NAMES,
     }
 )
+# D3-WRAP1 (R1_WRAPUP_NEXT_STEPS): more trimmings of a polite refusal ("No questions from me.",
+# "Thanks, that was great.", "It was lovely, thank you.").  A request still carries a word that is
+# not on either list.
+_COURTESY_WORDS_V2 = frozenset(
+    {"me", "that", "it", "was", "lovely", "nice", "wonderful", "helpful", "all", "good", "really"}
+)
 # Every apostrophe look-alike folds to the ASCII one (Sarvam may emit U+2019).
 _APOSTROPHES = frozenset("'’‘ʼ`´")
 # An apostrophe that is not between two word characters is a quote mark, not part of a word.
@@ -609,6 +628,19 @@ _WARM_ORDER = (
     "L-ASIDE-LAST-POINT",
     "L-LEARNER-HANGUP",
     "L-ASIDE-HANGUP",
+    # Simulation diagnosis 3: the farewell exit, the reworded asides and the wrap-up's scripted
+    # answers (D3-EXIT1, D3-ASIDE1, D3-END1, D3-WRAP1).
+    "L-LEARNER-BYE-1",
+    "L-LEARNER-BYE-2",
+    "L-LEARNER-BYE-3",
+    "L-EXIT-WRAP",
+    "L-ASIDE-EARLY-CLOSE-2",
+    "L-ASIDE-LAST-POINT-2",
+    "L-ASIDE-END-2",
+    "L-WRAP-NEXT",
+    "L-NO-FEEDBACK-2",
+    "L-FAQ-DEFER-WRAP-2",
+    "L-CLOSE-SHORT",
     "L-TIME-UP",
     "L-MUTE",
     "L-SIL-IB",
@@ -868,7 +900,11 @@ def is_no_questions(text: str) -> bool:
     if _NO_QUESTIONS_RE.search(folded) is None:
         return False
     rest = _NO_QUESTIONS_RE.sub(" ", folded)
-    if not all(word in _COURTESY_WORDS for word in rest.split()):
+    courtesy = _COURTESY_WORDS
+    if flag_on(FLAG_WRAPUP_NEXT_STEPS):
+        # D3-WRAP1: "No, no questions from me. Thanks." and "..., that was lovely." refuse too.
+        courtesy = _COURTESY_WORDS | _COURTESY_WORDS_V2
+    if not all(word in courtesy for word in rest.split()):
         return False
     if _NO_QUESTIONS_RE.search(_SOFT_CLOSE_RE.sub(" ", folded)) is None:
         # Only a thank-you or an acknowledgement refuses here ("Thank you.", "Okay, thank you.",
@@ -965,6 +1001,55 @@ _AFFIRMATION_WORDS = frozenset(
 )
 # The wrap-up's invitation (L-WRAP-MORE) needs this much of the wrap-up budget left.
 WRAP_MORE_MIN_SECONDS = 30.0
+
+
+# Simulation diagnosis 3 (D3-WRAP1, flag R1_WRAPUP_NEXT_STEPS).  A wrap-up question about what
+# happens next, or an ask for feedback or the outcome, gets a scripted line and no model call: "What
+# happens next?" got "That's everything for today's interview", and two feedback asks got the same
+# refusal twice in other words.  Narrow on purpose (a question that only mentions "next" is the
+# model's to answer).
+WRAPUP_NEXT = "next"
+WRAPUP_FEEDBACK = "feedback"
+_WRAPUP_NEXT_RE = re.compile(
+    r"\bwhat (?:happens|comes|is happening|would happen|will happen) (?:next|now|after (?:this|that|"
+    r"today))\b|\bwhat(?:'s| is| are| will be| would be)? (?:the )?next (?:steps?|stage|round|process)\b|"
+    r"\b(?:is there|are there) (?:a |any )?(?:next|another|second) (?:round|stage|step)s?\b|"
+    r"\bis there anything (?:more|else) (?:to|in|after) (?:the|this) (?:interview|process)\b|"
+    r"\bwhen (?:will|would|do|can|should) i (?:hear|get|know|find out)\b|"
+    r"\bhow (?:long|soon) (?:until|before|till|will it be (?:until|before)) i (?:hear|know|get)\b|"
+    r"\bhear back\b"
+)
+_WRAPUP_FEEDBACK_RE = re.compile(
+    r"\bfeedback\b|\bhow (?:did|have) i (?:do|done|perform\w*)\b|\bhow did (?:i|it|that) go\b|"
+    r"\bhow (?:was|is) my (?:performance|interview|role ?play)\b|"
+    r"\b(?:will|would|am|could) i (?:be )?(?:selected|shortlisted|through|cleared?|passing|"
+    r"qualif\w*|moving forward|getting (?:through|selected))\b|"
+    r"\bdid i (?:pass|clear|qualify|do (?:well|okay|ok|good|alright|fine))\b|"
+    r"\bmy (?:score|scores|result|results|rating)\b"
+)
+
+
+# "What's the next step after joining, the training?" asks about the job, not about this interview.
+_WRAPUP_JOB_RE = re.compile(
+    r"\b(?:after (?:i |we )?(?:join|joining|get hired|start)|once i (?:join|start)|onboarding|"
+    r"training|in the (?:role|job)|on the job|probation)\b"
+)
+
+
+def wrapup_ask_kind(text: str) -> str | None:
+    """D3-WRAP1: ``WRAPUP_NEXT`` for a question about what happens next, ``WRAPUP_FEEDBACK`` for an
+    ask about feedback or the outcome, else None.  "When will I know if I'm selected?" asks what
+    happens next (its true answer is the hiring team's review)."""
+    folded = fold_speech(text)
+    if _WRAPUP_NEXT_RE.search(folded) is not None and _WRAPUP_JOB_RE.search(folded) is None:
+        return WRAPUP_NEXT
+    if _WRAPUP_FEEDBACK_RE.search(folded) is not None:
+        return WRAPUP_FEEDBACK
+    return None
+
+
+# D3-WRAP1: the refusals for a feedback ask, in order; none is said twice in a session.
+WRAPUP_REFUSALS = ("L-NO-FEEDBACK-2", "L-FAQ-DEFER-WRAP-2")
 
 
 def is_affirmation_only(text: str) -> bool:
@@ -1847,6 +1932,10 @@ class R1Interview:
         self._wrapup_questions_prepared = 0  # review S3R-6: wrap-up questions answered so far
         self._wrap_beat_turns = 0
         self._wrapup_affirmations = 0
+        # D3-WRAP1 (R1_WRAPUP_NEXT_STEPS; counts only): the scripted what's-next answer was said
+        # (so the close is L-CLOSE-SHORT: the hiring team is named once), and the scripted refusals.
+        self._close_short = False
+        self._wrapup_refusals = 0
         # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
         # not had the "I'm ready" press yet (``_awaiting_ready``: what the data handler checks),
         # the page was told ``awaiting=ready`` and not yet that it is over, the press itself
@@ -3331,8 +3420,23 @@ class R1Interview:
         if phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
             return self._roleplay_over()
         if phase is R1Phase.WRAPUP:
-            return is_no_questions(text) or self.machine.remaining_wrapup_seconds() <= 0
+            return (
+                is_no_questions(text)
+                or self.machine.remaining_wrapup_seconds() <= 0
+                # D3-WRAP1: the driver answers it with a scripted line (``_run_wrapup``).
+                or self._wrapup_scripted_kind(text) is not None
+            )
         return True
+
+    def _wrapup_scripted_kind(self, text: str) -> str | None:
+        """D3-WRAP1 (R1_WRAPUP_NEXT_STEPS): the scripted wrap-up answer this turn gets, or None.
+
+        Read from the text alone: the driver may have answered the turn already when the SDK's end
+        of turn asks (``reply_suppressed``), so no counter of the driver's decides it.
+        """
+        if not text or not flag_on(FLAG_WRAPUP_NEXT_STEPS):
+            return None
+        return wrapup_ask_kind(text)
 
     def _icebreaker_deferral(self, text: str) -> str | None:
         """A1: why a committed turn, once the soft exit is due, is not the icebreaker's last answer.
@@ -5350,6 +5454,10 @@ class R1Interview:
                 error_category=_error_type_of(exc),
             )
             return
+        if self.engine.exit_requested:
+            # D3-END1: her last point heard whole ended the role-play by itself; the driver's
+            # role-play wait re-reads its budget now instead of waiting out its window.
+            self._wake()
         move_id = reply.plan.move_id
         delivery = None if move_id is None else self.engine.scheduler.deliveries_by_id().get(move_id)
         if delivery is not None and move_id not in self._logged_moves:
@@ -6089,8 +6197,9 @@ class R1Interview:
             self._publish_abort()
         if self._candidate_present and not self._room_disconnected and not self._goodbye_spoken:
             try:
+                close = "L-CLOSE-SHORT" if self._close_short else "L-CLOSE"
                 await self.say(
-                    "L-SYSTEM-STOP" if system else "L-CLOSE",
+                    "L-SYSTEM-STOP" if system else close,
                     timeout=_scaled(CLOSING_PLAYOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -6394,6 +6503,8 @@ class R1Interview:
             "wrapup_hiring_team_drops": drops,
             "wrap_beat_turns": self._wrap_beat_turns,
             "wrapup_affirmations": self._wrapup_affirmations,
+            "wrapup_next_scripted": int(self._close_short),
+            "wrapup_refusals_scripted": self._wrapup_refusals,
         }
 
     async def _wrap_beat(self) -> None:
@@ -6477,6 +6588,21 @@ class R1Interview:
             stop, text = await self._complete_wrapup_turn(value or "")
             if stop is not None:
                 return stop
+            scripted = self._wrapup_scripted_kind(text)
+            if scripted == WRAPUP_NEXT:
+                # D3-WRAP1: the one true answer, then the close that does not name the team again.
+                await self.say("L-WRAP-NEXT")
+                self._close_short = True
+                return await self._end_wrapup()
+            if scripted == WRAPUP_FEEDBACK:
+                if self._wrapup_refusals >= len(WRAPUP_REFUSALS):
+                    return await self._end_wrapup()  # never the same refusal twice: the close
+                await self.say(WRAPUP_REFUSALS[self._wrapup_refusals])
+                self._wrapup_refusals += 1
+                questions += 1
+                if questions >= WRAPUP_QUESTION_LIMIT:
+                    return await self._end_wrapup()
+                continue
             if is_no_questions(text):
                 # "Thank you." also cancels a reply before any audio (the logged 4/10 pattern),
                 # and a refusal gets no reply of its own: the owed answer is said first.
@@ -6605,10 +6731,24 @@ class R1Interview:
                 outcome = await self._finish_stop(stop)
                 return outcome
             self._end_roleplay()
-            await self.say("L-EXIT")
-            await self._wrap_beat()
-            self._enter(R1Phase.WRAPUP)
-            await self.say("L-WRAP")
+            engine = self._engine
+            if (
+                engine is not None
+                and engine.exit_farewell
+                and flag_on(FLAG_FAREWELL_EXIT_V2)
+                and self._stop_outcome() is None
+            ):
+                # D3-EXIT1: the advisor's goodbye ended the call: her short bye back (when her last
+                # line was none), then one line that leaves the role-play and invites questions.
+                if engine.exit_bye:
+                    await self.say(engine.exit_bye)
+                await self.say("L-EXIT-WRAP")
+                self._enter(R1Phase.WRAPUP)
+            else:
+                await self.say("L-EXIT")
+                await self._wrap_beat()
+                self._enter(R1Phase.WRAPUP)
+                await self.say("L-WRAP")
             stop = await self._run_wrapup()
             if stop is not None:
                 outcome = await self._finish_stop(stop)

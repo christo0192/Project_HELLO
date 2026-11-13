@@ -128,6 +128,12 @@ REDIRECT_BRIEF = (
 LAST_POINT_BRIEF = (
     "the call is about to end, so raise this one last thing briefly, in a sentence or two; then"
 )
+# Simulation diagnosis 3 (D3-END1, the engine's R1_LAST_POINT_V2): the role-play ends right after
+# it, so it is one statement and asks nothing.
+LAST_POINT_BRIEF_V2 = (
+    "the call is about to end, so raise this one last thing briefly, as one statement, and do "
+    "not ask anything; then"
+)
 
 
 @dataclass(frozen=True)

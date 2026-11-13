@@ -172,7 +172,11 @@ import r1_world
 # are on.  No graded meaning, marker, must-say or deadline changed.
 # After its review (still revision 28, unreleased): the 19:00 stall's reaction-only tangent note
 # (TANGENT_REACT_NOTE).  No graded meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "02b1b47e4a5d6a21a8f824ab9d1f6af42cc3fe91f4b7e8c1d3fbd62521e01575"
+# Revision 29 (simulation diagnosis 3): the new wrap-up, exit and aside lines, her short goodbyes,
+# the rupee anchor, the one-statement last-point brief and the new notes join the manifest
+# (``r1_content._diag3_repairs`` and the script lines) beside the texts they replace while their
+# flags are on.  No graded meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "49975acdecacca878df8c1235219ac9bd1d0943ec7fd4540799edcba021df5b4"
 
 CONTENT_MODULES = (
     "r1_text",

@@ -735,7 +735,11 @@ class ContextFilterTests(unittest.TestCase):
 
 # M032 SWEEP-26: the wrap-up reminder's sentences, each behind its rollback flag (both off: the
 # release before).
-WRAPUP_FLAGS_OFF = {"R1_WRAPUP_ANSWERS": "0", "R1_WRAPUP_ONE_MENTION": "0"}
+WRAPUP_FLAGS_OFF = {
+    "R1_WRAPUP_ANSWERS": "0",
+    "R1_WRAPUP_ONE_MENTION": "0",
+    "R1_WRAPUP_NEXT_STEPS": "0",
+}
 
 
 class WrapupReminderTests(unittest.TestCase):
@@ -1304,16 +1308,24 @@ class WrapupAnswersReminderTests(unittest.TestCase):
 
         reply = Reply(phase="wrapup", candidate_text="Is anything left?")
         messages = llm_messages(reply, P1, [])
-        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True, one_mention=True))
+        self.assertEqual(
+            messages[-2]["content"],
+            wrapup_reminder(answers=True, one_mention=True, next_steps=True),
+        )
         with mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_ROUND": "1"}):
             messages = llm_messages(reply, P1, [])
         self.assertEqual(
             messages[-2]["content"],
-            wrapup_reminder(answers=True, one_mention=True, next_round=True),
+            wrapup_reminder(answers=True, one_mention=True, next_round=True, next_steps=True),
         )
         with mock.patch.dict(os.environ, {"R1_WRAPUP_ONE_MENTION": "0"}):
             messages = llm_messages(reply, P1, [])
-        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True))
+        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True, next_steps=True))
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"}):
+            messages = llm_messages(reply, P1, [])
+        # Simulation diagnosis 3 (D3-WRAP1): OFF restores "say it has been noted".
+        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True, one_mention=True))
+        self.assertIn("has been noted", messages[-2]["content"])
         self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
 
     def test_the_quoted_lines_are_dropped_from_the_echo_check(self):

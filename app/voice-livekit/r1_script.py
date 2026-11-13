@@ -137,6 +137,45 @@ LINES: dict[str, str] = {
         "This is Christy, your interviewer. Of course, we'll stop in just a moment; "
         "{lead_first_name} has one last thing she'd like to say first."
     ),
+    # Simulation diagnosis 3 (the int-live-3 flow judge; new wording under D-M032-4, listed word for
+    # word for owner and HR review; each behind its rollback flag).
+    # D3-END1 (R1_LAST_POINT_V2): the request to stop was heard; her one statement follows and the
+    # role-play ends after it by itself.
+    "L-ASIDE-LAST-POINT-2": (
+        "Of course, we'll stop here. {lead_first_name} just wants to add one quick thing."
+    ),
+    # D3-WRAP1 (R1_WRAPUP_NEXT_STEPS): "what happens next?" gets the one true answer, scripted, and
+    # the close that follows it names nobody again; a feedback ask gets a refusal that is never the
+    # same words twice.
+    "L-WRAP-NEXT": "Next, the hiring team will review today's interview and get back to you.",
+    "L-CLOSE-SHORT": (
+        "Thank you for your time today, {first_name}. You can close this window now. Goodbye."
+    ),
+    "L-NO-FEEDBACK-2": (
+        "I can't share how it went, I'm afraid. That isn't something I give during the interview."
+    ),
+    "L-FAQ-DEFER-WRAP-2": "That's decided after this round, so I can't say today.",
+    # D3-EXIT1 (R1_FAREWELL_EXIT_V2): the advisor's goodbye ends the call, so she says a short bye
+    # back (her voice, rotated), and the exit and the wrap-up invitation are one utterance that
+    # keeps the brief's cue phrase.
+    "L-LEARNER-BYE-1": "You too, bye!",
+    "L-LEARNER-BYE-2": "Thanks, bye.",
+    "L-LEARNER-BYE-3": "Okay, bye for now.",
+    "L-EXIT-WRAP": (
+        "Let's pause the role-play here. This is Christy again, thank you, that's the end of the "
+        "role-play. Before we finish, do you have any questions about the role or the next steps?"
+    ),
+    # D3-ASIDE1 (R1_END_ASIDE_V2): a yes/no question in place of L-ASIDE-END's magic phrase
+    # (L-ASIDE-END is owner-approved: this rewording is for review); "confirm before ending" holds.
+    "L-ASIDE-END-2": (
+        "This is Christy, your interviewer. Would you like to stop the role-play here and finish "
+        "the interview? Just say yes, or carry on with {lead_first_name}."
+    ),
+    # D3-ASIDE1 (c) (R1_FAREWELL_EXIT_V2): the early-close aside after her short goodbye.
+    "L-ASIDE-EARLY-CLOSE-2": (
+        "Christy here. It sounded like that was the end of your call with {lead_first_name}. "
+        "Shall we stop the role-play there, or would you like to keep going?"
+    ),
     # M032 S3.4 (owner decision D-M032-3, flag R1_ABUSE_HANGUP): abuse aimed at the learner.  She
     # ends the call in character in one line (her voice), then Christy asks (R paused); a yes ends
     # the role-play, a no resumes it (L-ASIDE-WRAP-RESUME) with her cool.  Scoring is unchanged.
