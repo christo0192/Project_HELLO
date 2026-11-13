@@ -165,7 +165,13 @@ import r1_world
 #    L-SIL-END-NOAUDIO (R1_NO_AUDIO_LADDER, SWEEP-34).  The mute aside by phase, neither with
 #    "ready" in it: L-MUTE-RP and L-MUTE-IV (R1_MUTE_ASIDE_V2, SWEEP-36); L-MUTE is the flag-off
 #    line, unchanged.
-CONTENT_REVISION = 23
+# 24: M032 live simulation, diagnosis 1 (Christy lane, R1_TRANSITION_REPAIR): the short recap
+#    L-TRANSITION-RECAP ends with its own either/or question ("Would you like to begin now, or ask
+#    me something first?", r1_script.RECAP_START_PROMPT), so the brief's start question is never
+#    heard three times (CR-1), and the repaired transition note says when "Of course, go ahead."
+#    is for, with an example, and that a request to repeat or explain gets that, in one sentence
+#    (BR-2).  No other pinned text changed.
+CONTENT_REVISION = 24
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:

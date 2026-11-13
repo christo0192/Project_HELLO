@@ -510,7 +510,22 @@ class TestPinsAreRecorded(unittest.IsolatedAsyncioTestCase):
             rig.interview._record_pins()
         by_type = {entry["error_type"]: entry for entry in lines}
         self.assertEqual(by_type["r1_fidelity_persona"]["error_category"], "p1_career_switcher.v1")
-        self.assertEqual(by_type["r1_fidelity_content"]["error_category"], CONTENT_SHA256[:12])
+        label = by_type["r1_fidelity_content"]["error_category"]
+        self.assertEqual(label, r1_session.content_log_label(CONTENT_SHA256))
+        self.assertEqual(label.replace(".", ""), CONTENT_SHA256[:12])
+
+    def test_a_content_label_with_ten_digits_in_a_row_is_still_logged(self) -> None:
+        # Revision 24's SHA starts with 12 digits: the logger drops 10+ digits in a row as a
+        # possible phone number, so the label is split after its sixth character.
+        self.assertEqual(r1_session.content_log_label("261ad5751e99d64e"), "261ad5751e99")
+        self.assertEqual(r1_session.content_log_label("571473820258471e"), "571473.820258")
+        with capture_r1_logs() as lines:
+            r1_session._log.info(
+                "unknown_event",
+                error_type="r1_fidelity_content",
+                error_category=r1_session.content_log_label("571473820258471e"),
+            )
+        self.assertEqual(lines[-1]["error_category"], "571473.820258")
 
     async def test_the_pins_name_the_persona_the_content_and_the_world_sheet(self) -> None:
         rig = Rig()
@@ -4251,6 +4266,71 @@ class TestIcebreakerRepairWiring(unittest.IsolatedAsyncioTestCase):
             facts = rig.interview._repair_facts()
             for key in ("icebreaker_repeat_deferrals", "boundary_presence_lines", "ib_holds"):
                 self.assertNotIn(key, facts)
+
+
+# M032 live simulation, diagnosis 1 (BR-2): synthetic transition turns that ask for one of
+# Christy's icebreaker questions again (paraphrased by shape only).
+TR_Q1_REPLY = "Got it. How do you usually prepare before a call?"
+TR_Q2_REPLY = "Makes sense. How do you keep track of your customers each day?"
+TR_REPEAT_EARLIER = "Hang on, can we go back to that earlier question? Just repeat it."
+TR_REPEAT_BEFORE_LAST = (
+    "Actually, could you go back to the question before the last one and ask it again?"
+)
+TR_ANSWER = "I mostly use a shared sheet and note where each person is."
+
+
+class TestTransitionQuestionRepeatWiring(unittest.IsolatedAsyncioTestCase):
+    """Diagnosis 1 (BR-2, ``R1_TRANSITION_REPAIR`` on): after the brief, a request to hear one of
+    Christy's icebreaker questions again gets "Of course. {question}" (no model call), never "Of
+    course, go ahead."; the answer to it gets the model's reaction with a start question."""
+
+    async def rig(self) -> Rig:
+        rig = Rig(provider=TokenProvider(TR_Q1_REPLY))
+        await rig.interview.say("L-OPEN")
+        await rig.converse(IB_ANSWER)
+        await rig.converse(IB_ANSWER, provider=TokenProvider(TR_Q2_REPLY))
+        rig.interview._enter(R1Phase.TRANSITION)
+        await rig.interview._say_brief()
+        return rig
+
+    async def test_the_earlier_question_is_asked_again_without_the_model(self):
+        rig = await self.rig()
+        calls = len(rig.provider.calls)
+        spoken = await rig.converse(TR_REPEAT_EARLIER)
+        self.assertEqual(spoken, "Of course. How do you keep track of your customers each day?")
+        self.assertEqual(len(rig.provider.calls), calls)
+        self.assertFalse(rig.interview._brief_requested)
+        self.assertIsNone(rig.interview._start_question)
+        self.assertEqual(rig.interview._transition_answers, 0)
+        # The answer is the model's, with a start question after it, and not one of their questions.
+        answer = TokenProvider("A shared sheet keeps it simple.")
+        spoken = await rig.converse(TR_ANSWER, provider=answer)
+        self.assertTrue(spoken.startswith("A shared sheet keeps it simple."))
+        tail = rig.interview._last_reply.tail
+        self.assertTrue(tail)
+        self.assertTrue(spoken.endswith(tail))
+        self.assertEqual(rig.interview._transition_answers, 0)
+        self.assertEqual(rig.interview._start_question, r1_session._EITHER_OR)
+
+    async def test_the_question_before_the_last_one(self):
+        rig = await self.rig()
+        spoken = await rig.converse(TR_REPEAT_BEFORE_LAST)
+        self.assertEqual(spoken, "Of course. How do you usually prepare before a call?")
+
+    async def test_a_bare_yes_to_the_repeated_question_is_answered(self):
+        rig = await self.rig()
+        await rig.converse(TR_REPEAT_EARLIER)
+        self.assertEqual(
+            rig.interview._transition_action("Yes."), r1_session._TRANSITION_ANSWER
+        )
+
+    async def test_with_the_repair_off_the_model_answers_as_before(self):
+        with _env(R1_TRANSITION_REPAIR="0"):
+            rig = await self.rig()
+            calls = len(rig.provider.calls)
+            await rig.converse(TR_REPEAT_EARLIER)
+            self.assertEqual(len(rig.provider.calls), calls + 1)
+            self.assertEqual(rig.interview._transition_answers, 1)
 
 
 class BridgeRunner:

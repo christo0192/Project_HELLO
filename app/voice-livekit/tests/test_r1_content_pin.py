@@ -144,7 +144,9 @@ import r1_world
 # R1_OPENING_SOUND_CHECK), the never-heard ladder (L-SIL-NOAUDIO, L-SIL-END-NOAUDIO;
 # R1_NO_AUDIO_LADDER) and the mute aside by phase (L-MUTE-RP, L-MUTE-IV; R1_MUTE_ASIDE_V2).  L-OPEN
 # and L-MUTE are unchanged.
-PINNED_CONTENT_SHA256 = "261ad5751e99d64e1bcfebfcd5b21bc0f667c321ec48577fc8e2cacf54b1379c"
+# Revision 24 (M032 live simulation, diagnosis 1): L-TRANSITION-RECAP's own either/or question
+# (CR-1) and the repaired transition note on "Of course, go ahead." and repeat requests (BR-2).
+PINNED_CONTENT_SHA256 = "571473820258471ed5965d8f7c66bba68fa20e7246befc6014af813c2d792f77"
 
 CONTENT_MODULES = (
     "r1_text",

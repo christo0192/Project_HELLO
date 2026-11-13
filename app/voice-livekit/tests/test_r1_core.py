@@ -9882,6 +9882,288 @@ class TestBriefRepairOnRequest(R1TestCase):
         await self.drain_cancel(run)
 
 
+class TestTransitionSimulationFixes(R1TestCase):
+    """M032 live simulation, diagnosis 1 (Christy lane, ``R1_TRANSITION_REPAIR`` on).
+
+    BR-1: a request for the brief that names it but asks with "go over ... again" or "get a handle
+    on" (no question mark) reached the model and got "Of course, go ahead." or "What would you like
+    to know?".  BR-2: a request to hear an icebreaker question again got "Of course, go ahead.".
+    CR-1: the brief, the replay and the recap all ended with the same start question.  DA-1: a
+    stray backchannel after the recap's either/or question restarted the 20 s silence window.
+    Every text here is synthetic.
+    """
+
+    LEADS = ("Meera Iyer", "Meera")
+
+    async def start_transition(self) -> asyncio.Task:
+        self.interview._enter(R1Phase.TRANSITION)
+        task = asyncio.create_task(self.interview._run_transition())
+        await self.settle()
+        return task
+
+    def count(self, line_id: str) -> int:
+        return self.session.spoken.count(self.spoken_line(line_id))
+
+    # --- BR-1 -------------------------------------------------------------------------------
+
+    # Paraphrased by shape: the brief named, asked for with a verb the detectors missed.
+    BRIEF_ASKS = (
+        "Okay, just go over the role play again for me.",
+        "Could you run me through the scenario once more?",
+        "Please walk me through the scenario again.",
+        "Yeah, so I'm clear on this round, the role play brief, I want to get a handle on it.",
+        "I'd like to understand the role play a bit better.",
+        "I need to make sense of the scenario first.",
+        "Just go through the role play one more time.",
+    )
+
+    def test_a_named_brief_asked_for_without_a_question_mark_is_a_brief_request(self) -> None:
+        for text in self.BRIEF_ASKS:
+            with self.subTest(text=text):
+                routed = r1_session.is_brief_request(
+                    text, wide=True, lead_names=self.LEADS
+                ) or r1_session.names_the_roleplay(text, self.LEADS)
+                self.assertTrue(routed)
+                self.assertFalse(
+                    r1_session.asks_about_the_job(text, after_answer=True, lead_names=self.LEADS)
+                )
+        # The "go over ... again" form is a brief request at the transcript too (said over a line).
+        for text in self.BRIEF_ASKS[:3] + (self.BRIEF_ASKS[-1],):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS))
+                self.assertFalse(r1_session.is_brief_request(text))  # revision 23 missed them
+
+    def test_the_new_brief_asks_leave_the_job_and_a_start_alone(self) -> None:
+        for text in (
+            "I want to get a handle on the sales targets.",
+            "I'd like to understand the incentive structure.",
+            "Let's go through the role play.",
+            "Okay, we can go over the role play now.",
+            "I'll be clear on the call, don't worry.",
+            "I went over my notes again.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS))
+                self.assertFalse(r1_session.names_the_roleplay(text, self.LEADS))
+        # A job topic asked "again" is still Christy's to answer.
+        text = "Can you go over the shift timings again?"
+        self.assertTrue(r1_session.asks_about_the_job(text, lead_names=self.LEADS))
+
+    async def test_the_brief_asks_route_to_the_replay_then_the_recap(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.interview._last_transition_line = "L-TRANSITION"
+        self.agent_state("listening")
+        for replay_used, expected in (
+            (False, r1_session._TRANSITION_BRIEF),
+            (True, r1_session._TRANSITION_RECAP),
+        ):
+            self.interview._brief_repeated = replay_used
+            for text in self.BRIEF_ASKS:
+                with self.subTest(text=text, replay_used=replay_used):
+                    self.assertEqual(self.interview._transition_action(text), expected)
+        self.interview._brief_repeated = False
+        self.assertEqual(
+            self.interview._transition_action("Can you go over the shift timings again?"),
+            r1_session._TRANSITION_ANSWER,
+        )
+
+    async def test_with_the_repair_off_the_new_brief_asks_are_answered_as_before(self) -> None:
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.interview._enter(R1Phase.TRANSITION)
+            for text in (self.BRIEF_ASKS[0], self.BRIEF_ASKS[3]):
+                with self.subTest(text=text):
+                    self.assertEqual(
+                        self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                    )
+
+    def test_the_new_brief_asks_are_linear_on_long_input(self) -> None:
+        import time as _time
+
+        for text in (
+            "go over " * 4000 + "the role play",
+            "run me through " * 3000 + "x",
+            "walk me through the brief " * 2000,
+            "i want to understand " * 3000 + "the role play",
+            "go back to the earlier question " * 2000,
+            "the question before the last one " * 2000,
+        ):
+            started = _time.perf_counter()
+            r1_session.is_brief_request(text, wide=True, lead_names=self.LEADS)
+            r1_session.names_the_roleplay(text, self.LEADS)
+            r1_session.is_icebreaker_question_request(text)
+            self.assertLess(_time.perf_counter() - started, 1.0)
+
+    # --- BR-2 -------------------------------------------------------------------------------
+
+    QUESTION_ASKS = (
+        "Hang on, can we go back to that earlier question? Just repeat it.",
+        "Wait, could you go back to the icebreaker question and say it again?",
+        "Actually, could you go back to the question before the last one and ask it again?",
+        "Sorry, what was the question you asked me earlier?",
+        "Can you repeat your previous question?",
+    )
+
+    def test_a_request_for_an_icebreaker_question_again(self) -> None:
+        for text in self.QUESTION_ASKS:
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_icebreaker_question_request(text))
+        for text in (
+            "Can you repeat that?",
+            "Can you repeat the brief?",
+            "Can you repeat the question about the role play?",
+            "Before we begin, can I ask a few questions?",
+            "I have a question before we start.",
+            "Do I ask the questions in the role play?",
+            "What was the last thing you said?",
+            "My earlier question was about the shifts.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_icebreaker_question_request(text))
+
+    async def test_the_question_asks_get_the_question_again_not_the_model(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.agent_state("listening")
+        for text in self.QUESTION_ASKS:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_IB_REPEAT
+                )
+                self.assertFalse(self.interview.reply_suppressed(text))
+        # A permission to ask is still invited, and a brief request still gets the brief.
+        self.assertEqual(
+            self.interview._transition_action("Before we begin, can I ask a few questions?"),
+            r1_session._TRANSITION_INVITE,
+        )
+        self.assertEqual(
+            self.interview._transition_action("Can you repeat the brief?"),
+            r1_session._TRANSITION_BRIEF,
+        )
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.assertEqual(
+                self.interview._transition_action(self.QUESTION_ASKS[0]),
+                r1_session._TRANSITION_ANSWER,
+            )
+
+    async def test_the_question_repeat_picks_the_last_or_the_one_before(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._ib_questions = [
+            "How do you usually prepare before a call?",
+            "How do you keep track of your customers each day?",
+        ]
+        self.assertEqual(
+            self.interview._transition_question_to_repeat(self.QUESTION_ASKS[0]),
+            "How do you keep track of your customers each day?",
+        )
+        self.assertEqual(
+            self.interview._transition_question_to_repeat(self.QUESTION_ASKS[2]),
+            "How do you usually prepare before a call?",
+        )
+        self.interview._ib_questions = ["How do you usually prepare before a call?"]
+        self.assertEqual(
+            self.interview._transition_question_to_repeat(self.QUESTION_ASKS[2]),
+            "How do you usually prepare before a call?",
+        )
+        self.interview._ib_questions = []
+        self.assertTrue(self.interview._transition_question_to_repeat(self.QUESTION_ASKS[0]))
+
+    async def test_a_question_ask_over_the_brief_is_never_latched_as_a_brief_request(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript("Can you repeat your previous question?")
+        await self.settle()
+        self.assertFalse(self.interview._brief_requested)
+        self.assertFalse(self.interview._recap_requested)
+
+    def test_the_transition_note_never_answers_a_repeat_request_with_go_ahead(self) -> None:
+        from r1_prompts import TRANSITION_REMINDER_REPAIRED
+
+        lowered = TRANSITION_REMINDER_REPAIRED.lower()
+        self.assertIn('say "of course, go ahead." and stop', lowered)
+        self.assertIn("only ask whether they may ask something", lowered)
+        self.assertIn('never answer "go ahead"', lowered)
+        self.assertIn("repeat or explain it in one sentence", lowered)
+
+    # --- CR-1 -------------------------------------------------------------------------------
+
+    def test_brief_replay_and_recap_never_say_one_sentence_three_times(self) -> None:
+        import re as _re
+
+        spoken = [
+            self.spoken_line(line_id)
+            for line_id in ("L-TRANSITION", "L-TRANSITION-AGAIN", "L-TRANSITION-RECAP")
+        ]
+        counts: dict[str, int] = {}
+        for text in spoken:
+            for sentence in _re.split(r"(?<=[.?!])\s+", text):
+                if len(sentence.split()) >= 6:
+                    counts[sentence] = counts.get(sentence, 0) + 1
+        self.assertEqual([s for s, n in counts.items() if n >= 3], [])
+        recap = self.spoken_line("L-TRANSITION-RECAP")
+        self.assertTrue(recap.endswith("Would you like to begin now, or ask me something first?"))
+        self.assertEqual(r1_session._START_QUESTION_OF_LINE["L-TRANSITION-RECAP"],
+                         r1_session._EITHER_OR)
+
+    # --- DA-1 -------------------------------------------------------------------------------
+
+    async def _after_the_recap(self, text: str | None, *, env: dict | None = None) -> float | None:
+        """The recap's either/or question has played; ``text`` (a stray backchannel) is said, or
+        nothing.  Returns how long the reask took, or None when none came within 0.3 s."""
+        with mock.patch.object(
+            r1_session,
+            "TRANSITION_SILENCE_LADDER",
+            ((5.0, "L-TRANSITION-REASK"), (5.0, "L-TRANSITION-REASK-2")),
+        ), mock.patch.object(
+            r1_session, "TRANSITION_QUIET_TURN_REASK_SECONDS", 0.05
+        ), mock.patch.dict(os.environ, env or {}):
+            task = await self.start_transition()
+            await self.interview.say("L-TRANSITION-RECAP")
+            self.assertEqual(self.interview._start_question, r1_session._EITHER_OR)
+            self.agent_state("listening")
+            started = asyncio.get_running_loop().time()
+            if text is not None:
+                self.assertTrue(await self.answer(text))
+            took = None
+            while asyncio.get_running_loop().time() - started < 0.3:
+                if self.count("L-TRANSITION-REASK"):
+                    took = asyncio.get_running_loop().time() - started
+                    break
+                await asyncio.sleep(0.005)
+            self.assertEqual(self.count("L-TRANSITION-REASK-2"), 0)
+            self.final_transcript("ready")
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+            return took
+
+    async def test_so_bye_after_the_recap_gets_the_reask_soon(self) -> None:
+        self.assertIsNotNone(await self._after_the_recap("So bye."))
+
+    async def test_a_hmm_after_the_recap_gets_the_reask_soon(self) -> None:
+        self.assertIsNotNone(await self._after_the_recap("Hmm."))
+
+    async def test_pure_silence_after_the_recap_keeps_the_long_window(self) -> None:
+        self.assertIsNone(await self._after_the_recap(None))
+
+    async def test_with_the_repair_off_a_stray_backchannel_keeps_the_long_window(self) -> None:
+        self.assertIsNone(
+            await self._after_the_recap("So bye.", env={"R1_TRANSITION_REPAIR": "0"})
+        )
+
+    async def test_a_backchannel_over_christy_or_without_an_open_question_waits(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.agent_state("speaking")  # said over her line
+        self.assertTrue(await self.commit_turn("So bye."))
+        self.assertFalse(self.interview._quiet_reask_pending)
+        self.agent_state("listening")
+        self.interview._start_question = r1_session._YES_NO  # the reask was already said
+        self.assertTrue(await self.commit_turn("So bye."))
+        self.assertFalse(self.interview._quiet_reask_pending)
+        self.interview._start_question = r1_session._EITHER_OR
+        self.assertTrue(await self.commit_turn("So bye."))
+        self.assertTrue(self.interview._quiet_reask_pending)
+
+
 # ------------------------------------------------------------------------------------------------
 # Owner and manager decisions of 2026-11-03 (mock call aa166f09): the icebreaker's last answer (A1)
 # and the consent transition into the role-play (M1).
