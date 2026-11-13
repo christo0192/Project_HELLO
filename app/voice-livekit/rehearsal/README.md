@@ -116,6 +116,35 @@ Harness fixes of R1-Q iteration 3 (H1-H6 of the analyst's second sweep):
   and after (`run.json` -> `balance`: `before`, `after`, `spent`, `ledger_estimate`, `gap`), and the
   "Done" line prints it, so the budget gate is checked against what the account was really charged.
 
+Harness fixes of M032 diagnosis 2 (each behind a switch, see below):
+
+* D2-SC1 (`REHEARSAL_COMMIT_WINDOW`): the commitment gates (`commit_medium`, `commit_strong`,
+  `commit_cap`, `no_strong`) count only the calls that had a commitment window. A call with NO commitment
+  whose role-play ended on an end request, on the abuse hang-up (D-M032-3, `admin_log.endings.abuse_hangups`)
+  or before 13:00 is excluded, and the gate shows the counts and the reasons beside its value ("4/6, 3
+  excluded (abuse_hangup 1, end_request 2)"); the all-calls rate stays in the table. A call that reached a
+  level always counts, and so does a full call that reached none. The small-group cap slack counts the
+  calls with a window.
+* D2-HF2 (`REHEARSAL_SPOKEN_LEAKS`): `guard_flagged` hard-fails on the guard's own flag or on a commitment
+  that was still in the SPOKEN line of the trip's exchange (`commitment_spoken_leaks`: the engine's
+  classifier and the harness's own regexes, above the cap on record; a trip that cannot be matched to a
+  spoken line counts, fail closed). A commitment the guard blocked is the info gate `commit_blocked`
+  (blocked attempts per call <= 1). `post_commit` still gates.
+* D2-ND1 (`REHEARSAL_PROBE_VOCAB_V2`): the H1 vocabulary no longer takes "motivated", "looking into" or a
+  bare "interested" (they matched H2/H3 questions), "what's driving / prompting / behind / making you"
+  match, "before I ..." is no H2 word and "first/last time" no H3 word; a question with two topics' words
+  counts for the one named first, and for H1 only when it names the timing or asks why; "a quick
+  follow-up", "a day this week" and "the best way to reach you" are the calendar, whoever is named. The
+  engine's needs ledger (`admin_log.needs[].followup_turn`) is reported beside the harness's digs
+  (`harness_only_digs`, `engine_only_digs`, `disclosure_rate_engine_confirmed`, info gates); the
+  disclosure gate keeps scoring every harness dig, because a dig the engine missed is a product failure
+  its own detector cannot report.
+* D2-HM1 (`REHEARSAL_CITED_MISFIRES`): a judged misfire of kind `other` must cite the ADVISOR turn it fails
+  to follow (`advisor_turn`, not after its own turn) and a `reason`, or it is rejected as `uncited` (a
+  verdict stored before the judge was asked to cite keeps the old rule on a re-score). The scorecard shows
+  judge, rejected and rule misfires as separate rows, and one call adds at most 5 to the misfire gate's
+  mean (`misfires_uncapped` is the info row). Manual replays stay in the gate.
+
 An OFFLINE scorecard checks the plumbing and the engine's decisions (schedule, negotiation, guard,
 repetition, disclosure layers), never the model: it can never be "ready for an owner test". Ready
 means a live sweep of 20 or more calls with every applicable gate measured and met.
@@ -218,7 +247,8 @@ can start before 13:00 and end after it.
 Harness switches (`rehearsal/flags.py`, default ON; `0` restores the previous behaviour):
 `REHEARSAL_KEEP_CONTROL_ACTS` (scored acts are never reworded), `REHEARSAL_TRANSITION_ACTS_V2` (the
 transition labels, the brief-line rule and the `icebreaker_repeat` check), `REHEARSAL_LEARNER_CLOCK`
-(window checks time the learner's line by its decision).
+(window checks time the learner's line by its decision), `REHEARSAL_COMMIT_WINDOW`,
+`REHEARSAL_SPOKEN_LEAKS`, `REHEARSAL_PROBE_VOCAB_V2` and `REHEARSAL_CITED_MISFIRES` (diagnosis 2, above).
 
 ## Adaptability scenarios and the flow judge (`--scenarios adapt`, D-M032-10)
 

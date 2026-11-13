@@ -1278,6 +1278,12 @@ def fake_record(level, *, fails=(), commitment="MEDIUM", slips=None, **extra):
         "exact_repeat_extra": 0,
         "needs_dug": ["H1"],
         "needs_disclosed_after_dig": ["H1"],
+        # The engine's needs ledger agrees (diagnosis 2, D2-ND1) and the guard blocked no commitment.
+        "needs_dug_confirmed": ["H1"],
+        "needs_disclosed_confirmed": ["H1"],
+        "harness_only_digs": [],
+        "commitment_guard_hits": 0,
+        "commitment_spoken_leaks": 0,
         "unprompted_dump_count": 0,
         "misfire_count": 0,
         "commitment_hits_after_commitment": 0,
@@ -2758,6 +2764,327 @@ class FinalReviewRoundOneHarnessTests(unittest.TestCase):
         first = metrics.disclosure_metrics(self.PERSONA, early)
         self.assertEqual(first["unprompted_dump_count"], 1)  # only the first telling is a dump
 
+
+
+
+def _env(**values):
+    return mock.patch.dict("os.environ", values)
+
+
+class DiagnosisTwoHarnessTests(unittest.TestCase):
+    """M032 diagnosis 2, the harness issues (D2-SC1, D2-HF2, D2-ND1, D2-HM1).  Synthetic text only."""
+
+    # --- D2-SC1: the commitment gates count only the calls that had a commitment window
+    @staticmethod
+    def _call(level, commitment, *, stop="farewell_exit", seconds=900.0, hangups=0, in_metrics=True):
+        record = fake_record(level, commitment=commitment, stop_reason=stop, roleplay_seconds=seconds)
+        if in_metrics:
+            record["metrics"]["abuse_hangups"] = hangups
+        else:
+            record["admin_log"] = {"endings": {"abuse_hangups": hangups}}
+        return record
+
+    def _strong_group(self):
+        return [
+            self._call("strong", "MEDIUM"),
+            self._call("strong", "WEAK", seconds=1000.0),
+            self._call("strong", None, stop="end_request", seconds=482.0),
+            self._call("strong", None, stop="wrap_accepted", seconds=383.0, hangups=1),
+        ]
+
+    def test_calls_with_no_commitment_window_leave_the_denominator_and_are_counted(self) -> None:
+        group = scorecard.aggregate_group(self._strong_group())
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.5)
+        self.assertEqual(group["commitment_window_calls"], 2)
+        self.assertEqual(group["commitment_excluded"], 2)
+        self.assertEqual(group["commitment_excluded_reasons"], {"end_request": 1, "abuse_hangup": 1})
+        self.assertAlmostEqual(group["medium_or_better_rate_all"], 0.25)
+
+    def test_the_excluded_count_stands_beside_the_gate(self) -> None:
+        card = scorecard.build_scorecard(self._strong_group(), offline=False)
+        gate = next(g for g in card["gates"] if g["gate"] == "commit_medium")
+        self.assertIn("1/2", gate["note"])
+        self.assertIn("2 excluded", gate["note"])
+        self.assertIn("2 excluded", scorecard.render_markdown(card))
+
+    def test_a_full_length_call_with_no_commitment_still_counts_as_a_miss(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("strong", "MEDIUM"),
+            self._call("strong", None, stop="farewell_exit", seconds=1100.0),
+            self._call("strong", "MEDIUM", stop="end_request", seconds=1000.0),  # booked, then ended
+        ])
+        self.assertEqual(group["commitment_excluded"], 0)
+        self.assertAlmostEqual(group["medium_or_better_rate"], 2 / 3)
+
+    def test_a_role_play_that_ended_before_the_window_is_excluded(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("strong", "MEDIUM"),
+            self._call("strong", None, stop="wrap_accepted", seconds=700.0),
+        ])
+        self.assertEqual(group["commitment_excluded_reasons"], {"ended_before_window": 1})
+        self.assertAlmostEqual(group["medium_or_better_rate"], 1.0)
+
+    def test_the_abuse_hang_up_is_read_from_the_admin_log_too(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("strong", "MEDIUM"),
+            self._call("strong", None, stop="wrap_accepted", seconds=383.0, hangups=1, in_metrics=False),
+        ])
+        self.assertEqual(group["commitment_excluded_reasons"], {"abuse_hangup": 1})
+
+    def test_the_cap_gates_use_the_same_denominator(self) -> None:
+        records = [
+            self._call("average", "MEDIUM"),
+            self._call("average", "MEDIUM"),
+            self._call("average", "WEAK"),
+            *[self._call("average", None, stop="end_request", seconds=400.0) for _ in range(2)],
+        ]
+        group = scorecard.aggregate_group(records)
+        # Stricter: the early ends no longer dilute it (2/5 = 0.4 passed the 0.6 cap; 2/3 does not).
+        self.assertAlmostEqual(group["medium_or_better_rate"], 2 / 3)
+        card = scorecard.build_scorecard(records, offline=False)
+        gate = next(g for g in card["gates"] if g["gate"] == "commit_cap")
+        self.assertEqual(gate["status"], "fail")
+        self.assertIn("2 excluded", gate["note"])
+
+    def test_the_small_group_slack_counts_the_calls_with_a_window(self) -> None:
+        records = [
+            self._call("pushy", "MEDIUM"),
+            *[self._call("pushy", "WEAK") for _ in range(3)],
+            *[self._call("pushy", None, stop="end_request", seconds=300.0) for _ in range(2)],
+        ]
+        gate = next(g for g in scorecard.build_scorecard(records, offline=False)["gates"] if g["gate"] == "commit_cap")
+        self.assertEqual((gate["status"], gate["held_to"]), ("pass", 0.25))
+
+    def test_no_window_at_all_is_not_measured_never_a_pass(self) -> None:
+        records = [self._call("strong", None, stop="end_request", seconds=400.0)]
+        gate = next(g for g in scorecard.build_scorecard(records, offline=False)["gates"] if g["gate"] == "commit_medium")
+        self.assertEqual(gate["status"], "n/a")
+
+    def test_the_commit_window_switch_off_restores_the_old_denominator(self) -> None:
+        with _env(REHEARSAL_COMMIT_WINDOW="0"):
+            group = scorecard.aggregate_group(self._strong_group())
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.25)
+
+    # --- D2-HF2: a blocked commitment is hygiene, a spoken one is the hard fail
+    @staticmethod
+    def _guarded(spoken, *, flagged=False, plan=None, commitment=None):
+        admin = {
+            "guard": {"hits": 1, "leak_hits": 1, "by_category": {"commitment": 1}, "flagged": flagged},
+            "commitment": commitment or {"level": "WEAK", "turn": 30},
+            "turn_map": [{"roleplay_turn": 12, "transcript_turn": 40}],
+        }
+        exchanges = [exchange(12, 600.0, "Would a short call with you both help?", spoken=spoken, plan=plan)]
+        trips = [{"category": "commitment", "turn_index": 40, "rule": "level_medium"}]
+        return metrics.guard_metrics(admin, trips, exchanges)
+
+    def test_a_blocked_commitment_the_candidate_never_heard_is_no_hard_fail(self) -> None:
+        found = self._guarded("I'll let you know after we've read the email. What would the call cover?")
+        self.assertEqual(found["commitment_spoken_leaks"], 0)
+        self.assertEqual(found["commitment_guard_hits"], 1)
+        self.assertNotIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_a_commitment_still_in_the_spoken_text_is_a_hard_fail(self) -> None:
+        for spoken in (
+            "Let's book a call for Thursday then.",
+            "I need to talk to my husband first, so holding a spot sounds fine as long as it doesn't lock me in.",
+            "A call with both of us could work once we've read it.",
+        ):
+            with self.subTest(spoken=spoken):
+                found = self._guarded(spoken)
+                self.assertEqual(found["commitment_spoken_leaks"], 1)
+                self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_the_harness_reader_does_not_read_a_refusal_as_agreement(self) -> None:
+        for spoken in ("I'm not ready to set up a call just yet.", "A call doesn't really work for me this week."):
+            with self.subTest(spoken=spoken):
+                self.assertEqual(metrics._spoken_agreement_level(spoken), metrics.Level.NONE)
+
+    def test_the_scripted_commitment_line_of_the_same_turn_is_within_the_cap(self) -> None:
+        plan = {"delivered_commitment": True, "commitment_level": "MEDIUM", "resolves": True}
+        found = self._guarded("Okay. Let's book a call for Thursday then.", plan=plan)
+        self.assertEqual(found["commitment_spoken_leaks"], 0)
+
+    def test_a_trip_that_cannot_be_matched_to_a_spoken_line_fails_closed(self) -> None:
+        admin = {"guard": {"by_category": {"commitment": 1}, "flagged": False}, "turn_map": []}
+        found = metrics.guard_metrics(admin, [{"category": "commitment", "turn_index": 40}], [])
+        self.assertEqual(found["commitment_spoken_leaks"], 1)
+        self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_the_guard_flag_itself_still_hard_fails(self) -> None:
+        found = self._guarded("I'll think about it.", flagged=True)
+        self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_metrics_without_the_spoken_check_keep_the_old_rule(self) -> None:
+        self.assertIn("guard_flagged", metrics.hard_fails({"commitment_guard_hits": 1}))
+
+    def test_the_spoken_leak_switch_off_restores_the_old_rule(self) -> None:
+        found = self._guarded("I'll let you know after we've read the email.")
+        with _env(REHEARSAL_SPOKEN_LEAKS="0"):
+            self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_blocked_commitment_attempts_are_an_info_gate(self) -> None:
+        records = [fake_record("strong", commitment_guard_hits=2), fake_record("strong", commitment_guard_hits=1)]
+        card = scorecard.build_scorecard(records, offline=False)
+        gate = next(g for g in card["gates"] if g["gate"] == "commit_blocked")
+        self.assertEqual((gate["severity"], gate["value"], gate["status"]), ("info", 1.5, "info-fail"))
+
+    # --- D2-ND1: a dig is attributed to the topic the question is about
+    @staticmethod
+    def _dug(text, intent="followup", topic=""):
+        return metrics.dug_topics({"text": text, "intent": intent, "topic": topic})
+
+    def test_the_misattributed_questions_of_the_sweep(self) -> None:
+        for text, expected in (
+            ("That makes sense. Have you tried picking up data science before, or is this the first "
+             "time you're seriously looking into it?", ["H2"]),
+            ("Self-study can be tough. What specifically made it fizzle out for you, was it staying "
+             "motivated, or not knowing what to focus on?", ["H2"]),
+            ("What do you think got in the way last time, was it staying consistent, or something else?", ["H2"]),
+            ("Before I get into the details, can I ask what's making you look at data science right now?", ["H1"]),
+            ("So before I dive in, just curious, what got you interested in data science in the first place?", ["H1"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text), expected)
+
+    def test_call_scheduling_questions_naming_the_husband_are_no_h3_dig(self) -> None:
+        for text in (
+            "And when you and your husband talk it through, is there a day this week that might work for a quick follow-up?",
+            "When you and your husband have looked it over, what's the best way to reach you?",
+            "Is there a time this week that works for a quick follow-up call, maybe after you've talked it over with your husband?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("H3", self._dug(text, topic="H3"))
+
+    def test_genuine_probes_keep_their_topic(self) -> None:
+        for text, topic in (
+            ("When you talk it over with your husband, what do you think his main concern would be, the cost or the time?", "H3"),
+            ("Roughly how many hours a week could you carve out?", "H3"),
+            ("Is budget the main thing your husband would want to look at?", "H3"),
+            ("What's driving this right now?", "H1"),
+            ("What is behind the move?", "H1"),
+            ("What's motivating you to do this now?", "H1"),
+            ("And why are you looking into it right now?", "H1"),
+            ("What held you back last time?", "H2"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text, intent="probe"), [topic])
+
+    def test_a_bare_interest_question_is_no_h1_dig(self) -> None:
+        self.assertEqual(self._dug("Are you interested in switching careers?", intent="probe"), [])
+
+    def test_the_old_vocabulary_is_back_with_the_switch_off(self) -> None:
+        text = "Have you tried picking up data science before, or is this the first time you're seriously looking into it?"
+        with _env(REHEARSAL_PROBE_VOCAB_V2="0"):
+            self.assertEqual(self._dug(text), ["H1", "H2", "H3"])
+
+    def test_harness_only_digs_are_reported_beside_the_engine_ledger(self) -> None:
+        admin = {"needs": [
+            {"topic": "H1", "followup_turn": None},
+            {"topic": "H2", "followup_turn": 4},
+            {"topic": "H3", "followup_turn": 9},
+        ]}
+        found = metrics.engine_dig_metrics(admin, ["H1", "H2"], ["H2"])
+        self.assertEqual(found["needs_dug_engine"], ["H2", "H3"])
+        self.assertEqual(found["harness_only_digs"], ["H1"])
+        self.assertEqual(found["engine_only_digs"], ["H3"])
+        self.assertEqual(found["needs_dug_confirmed"], ["H2"])
+        self.assertEqual(found["needs_disclosed_confirmed"], ["H2"])
+        self.assertIsNone(metrics.engine_dig_metrics({}, ["H1"], [])["harness_only_digs"])
+
+    def test_the_disclosure_gate_still_scores_every_harness_dig(self) -> None:
+        record = fake_record(
+            "strong", needs_dug=["H1", "H2"], needs_disclosed_after_dig=["H2"],
+            needs_dug_confirmed=["H2"], needs_disclosed_confirmed=["H2"], harness_only_digs=["H1"],
+        )
+        card = scorecard.build_scorecard([record], offline=False)
+        group = card["aggregate"]["strong"]
+        self.assertAlmostEqual(group["disclosure_rate"], 0.5)
+        self.assertAlmostEqual(group["disclosure_rate_engine_confirmed"], 1.0)
+        self.assertEqual(group["harness_only_digs_total"], 1)
+        self.assertIsNone(group["engine_only_digs_total"])  # the fixture has no engine-only field
+        statuses = {g["gate"]: (g["severity"], g["status"]) for g in card["gates"] if g["level"] == "strong"}
+        self.assertEqual(statuses["disclosure"], ("gate", "fail"))
+        self.assertEqual(statuses["harness_only_digs"], ("info", "info-fail"))
+        self.assertIn("harness-only digs", scorecard.render_markdown(card))
+
+    # --- D2-HM1: an "other" misfire must cite the advisor turn and a reason
+    @staticmethod
+    def _misfire_record():
+        return {
+            "header": {"persona_id": "p1_career_switcher", "persona_variant": "v1", "seed": "s"},
+            "exchanges": [
+                exchange(1, 10.0, "I'm the one buying here, not you.", spoken="So how would monthly instalments work?"),
+                exchange(2, 30.0, "The course is six months.", spoken="Six months is longer than I thought."),
+            ],
+        }
+
+    @staticmethod
+    def _verdict(*misfires):
+        return {
+            "objections": [], "disclosures": [], "ignored_advisor_offers": [], "stall_loop": False,
+            "style": {key: 3 for key in judge.STYLE_KEYS}, "misfires": list(misfires),
+        }
+
+    def test_an_uncited_other_misfire_is_rejected(self) -> None:
+        verdict = self._verdict(
+            {"turn": 1, "kind": "other", "quote": "monthly instalments", "advisor_turn": 1,
+             "reason": "ignores the role mix-up"},
+            {"turn": 2, "kind": "other", "quote": "longer than I thought", "advisor_turn": None, "reason": "x"},
+            {"turn": 2, "kind": "other", "quote": "longer than I thought", "advisor_turn": 2, "reason": ""},
+            {"turn": 1, "kind": "other", "quote": "monthly instalments", "advisor_turn": 2, "reason": "later turn"},
+        )
+        checked = judge.validate_misfires(verdict, self._misfire_record())
+        self.assertEqual([(m["turn"], m["advisor_turn"]) for m in checked["misfires"]], [(1, 1)])
+        self.assertEqual([m["rejected"] for m in checked["misfires_rejected"]], ["uncited"] * 3)
+
+    def test_a_live_verdict_without_a_citation_is_rejected_after_parsing(self) -> None:
+        raw = json.dumps(self._verdict({"turn": 2, "kind": "other", "quote": "longer than I thought"}))
+        checked = judge.validate_misfires(judge.parse_verdict(raw), self._misfire_record())
+        self.assertEqual([m["rejected"] for m in checked["misfires_rejected"]], ["uncited"])
+
+    def test_a_stored_verdict_from_before_the_citation_keeps_the_old_rule(self) -> None:
+        verdict = self._verdict({"turn": 2, "kind": "other", "quote": "longer than I thought"})
+        checked = judge.validate_misfires(verdict, self._misfire_record())
+        self.assertEqual(len(checked["misfires"]), 1)
+
+    def test_the_parser_keeps_the_citation_and_the_rubric_asks_for_it(self) -> None:
+        raw = json.dumps(self._verdict(
+            {"turn": 3, "kind": "other", "quote": "q", "advisor_turn": 3, "reason": "answers a different question"}))
+        item = judge.parse_verdict(raw)["misfires"][0]
+        self.assertEqual((item["advisor_turn"], item["reason"]), (3, "answers a different question"))
+        self.assertIn("advisor_turn", judge.SCHEMA_TEXT)
+        self.assertIn("advisor_turn", judge.RUBRIC)
+
+    def test_the_citation_switch_off_keeps_uncited_misfires(self) -> None:
+        verdict = judge.parse_verdict(json.dumps(self._verdict({"turn": 2, "kind": "other", "quote": "longer than I thought"})))
+        with _env(REHEARSAL_CITED_MISFIRES="0"):
+            checked = judge.validate_misfires(verdict, self._misfire_record())
+        self.assertEqual(len(checked["misfires"]), 1)
+
+    def test_judge_and_rule_misfires_are_separate_rows_and_one_call_is_capped(self) -> None:
+        heavy = fake_record("pushy", misfire_count=1)
+        heavy["judge"]["metrics"].update(judge_misfire_count=12, judge_misfires_rejected=2)
+        light = fake_record("pushy", misfire_count=0)
+        group = scorecard.aggregate_group([heavy, light])
+        self.assertAlmostEqual(group["misfires_per_call"], 2.5)  # 12 capped at 5, plus 0
+        self.assertAlmostEqual(group["misfires_per_call_uncapped"], 6.0)
+        self.assertAlmostEqual(group["judge_misfires_per_call"], 6.0)
+        self.assertAlmostEqual(group["rule_misfires_per_call"], 0.5)
+        self.assertAlmostEqual(group["judge_misfires_rejected_per_call"], 1.0)
+        card = scorecard.build_scorecard([heavy, light], offline=False)
+        statuses = {g["gate"]: (g["severity"], g["status"]) for g in card["gates"] if g["level"] == "pushy"}
+        self.assertEqual(statuses["misfires"], ("gate", "fail"))  # the cap never lets the group pass
+        self.assertEqual(statuses["misfires_uncapped"], ("info", "info-fail"))
+        text = scorecard.render_markdown(card)
+        self.assertIn("judge misfires / call", text)
+        self.assertIn("rule misfires / call", text)
+
+    def test_the_scripted_judge_cites_its_misfires(self) -> None:
+        record = self._misfire_record()
+        record["metrics"] = {"misfires": [{"exchange": 2, "kind": "time_cue_reversed"}]}
+        result = asyncio.run(judge.ScriptedRubricJudge().judge(record))
+        item = result["verdict"]["misfires"][0]
+        self.assertEqual((item["advisor_turn"], item["reason"]), (2, "time_cue_reversed"))
 
 if __name__ == "__main__":
     unittest.main()

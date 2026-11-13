@@ -10,7 +10,8 @@ persona's hidden needs, the deck facts) and must return ONE JSON object::
                       "emotional": bool}],
      "misfires":    [{"turn": N, "kind": "unwarranted_gratitude|no_one_leaving|ignored_offer|
                                            repeat|off_card_fact|time_cue_reversed|anchor_as_offer|
-                                           decider_inconsistent|reopened_after_commit|other"}],
+                                           decider_inconsistent|reopened_after_commit|other",
+                      "quote": "...", "advisor_turn": N, "reason": "..."}],
      "stall_loop": bool,
      "style": {"reactions": 1-5, "followups": 1-5, "hesitation": 1-5, "continuity": 1-5,
                "variety": 1-5},
@@ -34,6 +35,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
+from rehearsal import flags
 from rehearsal import metrics as rule_metrics
 from rehearsal.advisor import deck_brief
 from rehearsal.metrics import mean, norm
@@ -108,7 +110,11 @@ RUBRIC = (
     "feeling (emotional). A need the learner volunteers with no question about it is a reveal "
     "with probe_turn null.\n"
     "3. misfires: LEARNER lines that the conversation did not warrant. Every misfire needs a short "
-    "'quote' copied from the LEARNER line it is about. unwarranted_gratitude: "
+    "'quote' copied from the LEARNER line it is about, the 'advisor_turn' (the number of the ADVISOR "
+    "line it fails to follow: the same turn or an earlier one) and a 'reason' of a few words saying "
+    "what in that ADVISOR line it ignores or contradicts. A reply that makes sense as an answer to a "
+    "confusing ADVISOR line is not a misfire, and a misfire of kind other without an advisor_turn and "
+    "a reason is not counted. unwarranted_gratitude: "
     "thanking or being pleasantly surprised about a discount nobody offered; NOT when the OFFER "
     "LEDGER shows the advisor named a price or a discount in that turn or the one before. "
     "no_one_leaving: 'before you go' when the advisor was not ending the call (and the learner had "
@@ -142,7 +148,8 @@ RUBRIC = (
 SCHEMA_TEXT = (
     '{"objections":[{"family":"F1|F2|F3|F4","turn":0,"in_context":true,"canned_verbatim":false,'
     '"why":""}],"disclosures":[{"need":"H1|H2|H3","probe_turn":null,"reveal_turn":null,'
-    '"emotional":false}],"misfires":[{"turn":0,"kind":"other","quote":""}],"stall_loop":false,'
+    '"emotional":false}],"misfires":[{"turn":0,"kind":"other","quote":"","advisor_turn":0,'
+    '"reason":""}],"stall_loop":false,'
     '"style":{"reactions":3,"followups":3,"hesitation":3,"continuity":3,"variety":3},'
     '"ignored_advisor_offers":[{"turn":0,"offer":""}]}'
 )
@@ -259,6 +266,8 @@ def parse_verdict(raw: str) -> dict[str, Any]:
                     "turn": _int(item.get("turn")),
                     "kind": kind,
                     "quote": str(item.get("quote") or "")[:160],
+                    "advisor_turn": _int(item.get("advisor_turn")),
+                    "reason": str(item.get("reason") or "")[:160],
                 }
             )
     for item in data.get("ignored_advisor_offers") or []:
@@ -293,6 +302,13 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
     (``RULE_CHECKED_KINDS``) the rule detector, which does not guess, agrees on the same turn; a
     ``decider_inconsistent`` also needs a line where the learner says it decides alone.  The rejected
     ones are kept under ``misfires_rejected`` with the reason, so the scorecard can show them.
+
+    Diagnosis 2 (D2-HM1, ``REHEARSAL_CITED_MISFIRES``): a misfire of kind ``other`` has no rule to
+    agree with it, so it must cite the ADVISOR turn it fails to follow (a turn of the transcript, not
+    after the misfire's own) and a reason; without them it is rejected as ``uncited`` (the judge marked
+    12 of 14 lines of a chaotic replay ``other``, some of them sensible replies to an incoherent advisor).
+    ``parse_verdict`` always gives a misfire the ``advisor_turn`` key; a verdict stored before the
+    judge was asked to cite (no such key) cannot be held to it on a re-score and keeps the old rule.
     """
     if verdict.get("error"):
         return dict(verdict)
@@ -308,6 +324,7 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         exchange.get("n"): _hollow(str((exchange.get("advisor") or {}).get("text") or ""))
         for exchange in exchanges
     }
+    cited_only = flags.on(flags.CITED_MISFIRES)
     kept: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for item in verdict.get("misfires") or []:
@@ -315,6 +332,8 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         reason = ""
         if quote and turn in spoken and quote not in spoken[turn]:
             reason = "quote_not_found"
+        elif kind == "other" and cited_only and "advisor_turn" in item and not _cited(item, spoken):
+            reason = "uncited"
         elif kind == "decider_inconsistent" and not decides_alone:
             reason = "no_decides_alone_line"
         elif kind in RULE_CHECKED_KINDS and kind != "decider_inconsistent":
@@ -338,6 +357,16 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         else:
             kept.append(dict(item))
     return {**verdict, "misfires": kept, "misfires_rejected": rejected}
+
+
+def _cited(item: Mapping[str, Any], turns: Mapping[Any, Any]) -> bool:
+    """The misfire names an advisor turn of the transcript, not after its own turn, and a reason."""
+    advisor_turn, turn = item.get("advisor_turn"), item.get("turn")
+    if not isinstance(advisor_turn, int) or advisor_turn not in turns:
+        return False
+    if isinstance(turn, int) and advisor_turn > turn:
+        return False
+    return bool(str(item.get("reason") or "").strip())
 
 
 def judge_metrics(verdict: Mapping[str, Any]) -> dict[str, Any]:
@@ -441,7 +470,13 @@ class ScriptedRubricJudge:
             "objections": objections,
             "disclosures": [],
             "misfires": [
-                {"turn": item.get("exchange"), "kind": "other"} for item in (metrics.get("misfires") or [])
+                {
+                    "turn": item.get("exchange"),
+                    "kind": "other",
+                    "advisor_turn": item.get("exchange"),
+                    "reason": str(item.get("kind") or ""),
+                }
+                for item in (metrics.get("misfires") or [])
             ],
             "stall_loop": int(metrics.get("weak_line_count") or 0) > 1,
             "style": {
