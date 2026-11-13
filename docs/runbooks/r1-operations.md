@@ -2246,6 +2246,30 @@ revision 21's lines stay pinned under -V20 ids. The four new `say` lines are war
 flag is on. Rollback: `fly secrets set R1_TRANSITION_REPAIR=0 -a project-hello-voice` restores
 revision 21's brief, replay, nudge, pickup, aside, note and routing exactly.
 
+**Live simulation fixes (diagnosis 1, same flag, content revision 24):**
+
+* **BR-1**: a request that names the brief and asks with "go over / go through / run me through /
+  walk me through ... again" is a brief request at the transcript too (`is_brief_request(wide=True)`),
+  and a turn that names the role-play and says "get a handle on", "be clear on", "make sense of",
+  "want to understand" or a go-over verb (not after "let's", "we can" and the like, unless it says
+  "again") routes like a role-play question, with no question mark needed.
+* **BR-2**: a request to hear one of Christy's icebreaker questions again ("go back to that earlier
+  question", "the question before the last one", "your previous question";
+  `is_icebreaker_question_request`) gets "Of course. {question}" (scripted, no model call, at most
+  `TRANSITION_IB_REPEAT_LIMIT` = 2 times; the question before her last when the turn says so). The
+  answer to it gets the model's reaction and a start question and is not counted as one of the
+  candidate's questions. The transition note now says when "Of course, go ahead." is for, with an
+  example, and that a request to repeat or explain gets that, in one sentence.
+* **CR-1**: L-TRANSITION-RECAP ends with its own either/or question ("Would you like to begin now,
+  or ask me something first?"), so the brief's start question is never heard three times.
+* **DA-1**: a committed turn that answers nothing ("So bye.", "Hmm.") after an either/or start
+  question that finished playing, with Christy quiet, gets L-TRANSITION-REASK after
+  `TRANSITION_QUIET_TURN_REASK_SECONDS` (6 s), not 20 s. Pure silence keeps 20 s and 30 s.
+
+Logs: `r1_transition_question_repeat` (with a count) and `r1_transition_quiet_turn_reask`. The
+content pin's log label (`r1_fidelity_content`) is split by a dot after its sixth character when
+its 12 characters hold ten digits in a row (revision 24's do), as the logger drops such a value.
+
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 
 Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the
