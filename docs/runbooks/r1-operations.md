@@ -2338,8 +2338,10 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   plain repeat gets the next recap. "Are you there?" within 30 s of a start question that finished
   playing gets "Yes, I'm here." and L-TRANSITION-TAKE-TIME, never the start question again (once;
   a second gets "Yes, I'm here." alone). Past every budget a request gets the first of
-  L-TRANSITION-REASK, -REASK-2 and -NUDGE not yet heard. The new lines are warmed only with the
-  flag on (and then L-TRANSITION-AGAIN is not). Rollback: `fly secrets set R1_BRIEF_VARIETY=0 -a
+  L-TRANSITION-REASK and -NUDGE not yet heard (never -REASK-2, a silence line; review of
+  diagnosis 3), and a bare yes or no to a question her own answer ended with, past the answer
+  limit, always gets L-TRANSITION-REASK (so the next bare "yes" starts). The new lines are warmed
+  only with the flag on (and then L-TRANSITION-AGAIN is not). Rollback: `fly secrets set R1_BRIEF_VARIETY=0 -a
   project-hello-voice`.
 * **`R1_REACTION_VARIETY`** (default on, only with `R1_INTERVIEWER_VOICE`; read once per
   session, the prefix stays byte-stable). The voice text's and the delivery rider's react clause
@@ -2348,19 +2350,27 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   "that's hands-on") from Christy's opening and icebreaker replies, keeping the question, never the
   only sentence, and drops a second echo-and-verdict opener in a row (a style trim, no hit). The
   brief opens with one of three seeded thanks (L-TRANSITION-THANKS-A/-B/-C, warmed per name like
-  L-TRANSITION). Rollback: `fly secrets set R1_REACTION_VARIETY=0 -a project-hello-voice`.
+  L-TRANSITION). B ("Thanks for walking me through that") plays only when the icebreaker ended on a
+  real answer (no decline, nothing terse, no time cap on her own question); otherwise A ("Thanks,
+  {first_name}.", warmed beside a seeded B) plays. Content revision 30. Rollback: `fly secrets set
+  R1_REACTION_VARIETY=0 -a project-hello-voice`.
 * **`R1_IB_REASK_V2`** (default on, only with `R1_ICEBREAKER_REPAIR`). An icebreaker question is
   re-asked once at most (`REASK_V2_MAX_HOLDS`): the next turn that does not answer it moves the
-  plan on. A backchannel right after her question (a courtesy, for a yes/no one) gets no reply; "Are
+  plan on. A backchannel right after her question (a courtesy, for a yes/no one) gets no reply,
+  but a bare yes, no or verdict word ("No.", "Good.") is answered; "Are
   you there?" within 20 s of it gets "Yes, I'm here. Take your time." (once per question); a request
-  to repeat it gets the question word for word ("Of course. {question}"), scripted. Log lines:
+  to repeat it gets the question word for word ("Of course. {question}"), scripted, and does not use
+  up the one re-ask (`REASK_V2_MAX_REPEATS`, 2 per question). Log lines:
   `r1_icebreaker_presence_hold`, `r1_icebreaker_literal_repeat`. Rollback: `fly secrets set
   R1_IB_REASK_V2=0 -a project-hello-voice`.
 * **`R1_GUARD_STORY_ECHO`** (default on). Christy echoing a money figure or "scholarship" from
   the candidate's own turn (one that asked nothing) is no pay claim; in the opening and the
   icebreaker a hiring or pay sentence after a turn that asked nothing is dropped, with "Got it."
   before the question that follows, never "That's a good question for the hiring team". The
-  transition and the wrap-up deflect as before. Rollback: `fly secrets set R1_GUARD_STORY_ECHO=0 -a
+  transition and the wrap-up deflect as before (the session sets the echo context in the opening
+  and the icebreaker only). A sentence with any role, future or pay-rate cue ("The role pays three
+  lakh.", "a year", "here") is never an echo, and a bare number word ("one week") is no figure.
+  Rollback: `fly secrets set R1_GUARD_STORY_ECHO=0 -a
   project-hello-voice`.
 * **`R1_CONSENT_ECHO_DROP`** (default on). The SDK's late commit of the "ready" that started the
   role-play (heard at its final, before the pickup; its commit landed after the pickup) is
