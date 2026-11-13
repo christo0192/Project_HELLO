@@ -421,10 +421,10 @@ class ScenarioAdvisor:
         """A beat's words: word for word, or (a library beat, live) reworded to fit the call."""
         if not beat.intent:
             return beat.text
-        from rehearsal.manual import render
+        from rehearsal.manual import keeps_words, render
 
         text = render(beat.text, self.names) or "Mm-hmm."
-        if self.rewriter is not None and beat.act != "insult":
+        if self.rewriter is not None and not keeps_words(beat.act):
             text = await self.rewriter.reword("advisor", beat.intent, text, self._chat, self.names)
         return text
 

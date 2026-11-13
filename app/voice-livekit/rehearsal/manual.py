@@ -33,6 +33,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from rehearsal import flags
 from rehearsal.advisor import AdvisorTurn
 from rehearsal.scenarios import (
     GROUPS,
@@ -63,6 +64,42 @@ REPLAY_LEVEL = {
     "M10": "average",
 }
 END_AGREE = Beat("end_agree", "Yes, please end it here.")
+# Acts a check scores: the live rewriter never rewords them (``REHEARSAL_KEEP_CONTROL_ACTS``), so
+# a request stays the request the check counts (diagnosis-1 EC-1: "tells her to hang up" came out
+# as an answer to the learner's question, and the check scored an end request nobody made).
+CONTROL_ACTS = frozenset({
+    "end_request", "end_agree", "end_decline", "insult", "ready", "ready_button", "brief_request",
+    "short_brief_request", "presence_check", "skip_request", "repeat_request", "hold_request",
+})
+# A transition request about an icebreaker question (to hear it again), not about the brief: an
+# earlier question named together with a go-back or ask-again verb. "A question before we begin" or
+# "one last question: ..." only mention a question in passing.
+_EARLIER_QUESTION = re.compile(
+    r"\bicebreaker\b|\b(?:earlier|previous|second[- ]last|last) (?:\w+ ){0,2}question|"
+    r"\bquestion before (?:the )?last\b|\b(?:earlier|previous) one\b|\bone before (?:the )?last\b"
+)
+_GO_BACK = re.compile(
+    r"\b(?:go|going|jump|jumping|come|get|take me) back\b|\breturn to\b|\brepeat|\bre-?ask|"
+    r"\bask (?:me )?(?:(?:it|that|this|them) )?again\b|\bsay (?:it|that|this) again\b|\bonce more\b"
+)
+# What a brief request asks for again: the brief itself (the role-play, its scenario, the round ...).
+_BRIEF_OBJECT = re.compile(
+    r"role-?\s?play|\bbrief\b|scenario|instructions|\bround\b|summary|sum up|\blearner\b"
+)
+# "Before the role-play" says when, not what: it names no brief.
+_BEFORE_THE_ROLEPLAY = re.compile(r"\bbefore (?:we (?:start|begin|do) )?(?:the |this )?role-?\s?play\b")
+# A bare pronoun repeat right after the brief ("repeat that", "say it again") asks for the brief (the
+# session's own SWEEP-29 pronoun rule), unless it names an earlier question.
+_PRONOUN_REPEAT = re.compile(r"\brepeat (?:that|it|this)\b|\bsay (?:that|it|this) again\b")
+
+
+def _asks_for_an_earlier_question(intent: str, text: str) -> bool:
+    """A request to hear an icebreaker question again; a brief named in the text wins."""
+    what = f"{intent} || {text}".lower()
+    if not (_EARLIER_QUESTION.search(what) and _GO_BACK.search(what)):
+        return False
+    return not _BRIEF_OBJECT.search(_BEFORE_THE_ROLEPLAY.sub(" ", text.lower()))
+_REPEATS_REQUEST = re.compile(r"^repeats the request\b", re.IGNORECASE)
 
 _PRESS = re.compile(r"^\s*\[(?:silence, then )?presses (?:the )?I'm-ready", re.IGNORECASE)
 _STAGE = re.compile(
@@ -105,6 +142,13 @@ def is_press(text: str) -> bool:
     return bool(_PRESS.search(text or ""))
 
 
+def keeps_words(act: str | None) -> bool:
+    """Whether the live rewriter leaves a move of this act as the library wrote it."""
+    if act == "insult":
+        return True
+    return flags.on(flags.KEEP_CONTROL_ACTS) and act in CONTROL_ACTS
+
+
 def act_of(phase: str, intent: str, text: str) -> str:
     """The ground-truth act of a library move, read from its intent (and the text)."""
     what = f"{intent} || {text}".lower()
@@ -129,8 +173,12 @@ def act_of(phase: str, intent: str, text: str) -> str:
             return "short_brief_request"
         if re.search(r"presence|are you there", what):
             return "presence_check"
+        v2 = flags.on(flags.TRANSITION_ACTS_V2)
+        if v2 and _asks_for_an_earlier_question(intent, text):
+            return "repeat_request"
         if re.search(r"brief|again|repeat|go over|instructions|sum up|summary|role-play part", what):
-            return "brief_request"
+            if not v2 or _BRIEF_OBJECT.search(what) or _PRONOUN_REPEAT.search(text.lower()):
+                return "brief_request"
         if re.search(r"question|asks|ask about|role", intent.lower()):
             return "roleplay_question"
         return "transition_other"
@@ -269,13 +317,18 @@ def merge_shared_turns(moves: Sequence[Move]) -> list[Move]:
 def replay_moves(replay: Mapping[str, Any]) -> list[Move]:
     """A replay's moves in order, with the moves that shared one bot turn merged."""
     phases = {"opening": "icebreaker"}  # the driver enters the icebreaker right after L-OPEN
-    moves = []
+    moves: list[Move] = []
     for turn in replay.get("turns") or []:
         phase = phases.get(turn["phase"], turn["phase"])
-        moves.append(
-            Move(phase, str(turn.get("at", "")), str(turn["intent"]), str(turn["text"]),
-                 act_of(phase, str(turn["intent"]), str(turn["text"])), str(turn.get("notes") or ""))
-        )
+        intent, text = str(turn["intent"]), str(turn["text"])
+        act = act_of(phase, intent, text)
+        if phase == "transition" and _REPEATS_REQUEST.search(intent) and flags.on(flags.TRANSITION_ACTS_V2):
+            # "repeats the request": the same request as the transition move before it (asking to
+            # ask questions, asked again, is still that; not a brief request).
+            before = [m for m in moves if m.phase == "transition" and m.act not in ("ready", "ready_button")]
+            if before:
+                act = before[-1].act
+        moves.append(Move(phase, str(turn.get("at", "")), intent, text, act, str(turn.get("notes") or "")))
     return merge_shared_turns(moves)
 
 
@@ -555,7 +608,7 @@ class ReplayTalker:
 
     async def _say(self, beat: Beat) -> str:
         text = render(beat.text, self.names)
-        if self.rewriter is None or not text:
+        if self.rewriter is None or not text or keeps_words(beat.act):
             return text
         return await self.rewriter.reword("candidate", beat.intent or beat.act, text, self.history, self.names)
 
@@ -633,7 +686,7 @@ class ReplayAdvisor:
         move = self._moves.pop(0)
         self.replayed += 1
         text = render(move.text, self.names) or "Mm-hmm."
-        if self.rewriter is not None and move.act != "insult":
+        if self.rewriter is not None and not keeps_words(move.act):
             text = await self.rewriter.reword("advisor", move.intent, text, self._chat, self.names)
         intent, topic = advisor_tags(move.intent, text)
         turn = AdvisorTurn(text, intent, topic)
@@ -700,6 +753,7 @@ def candidate_parts(
 
 
 __all__ = [
+    "CONTROL_ACTS",
     "CandidateParts",
     "Move",
     "ReplayAdvisor",
@@ -708,6 +762,7 @@ __all__ = [
     "act_of",
     "advisor_tags",
     "candidate_parts",
+    "keeps_words",
     "load_library",
     "mix_scenario",
     "register",
