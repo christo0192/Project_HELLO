@@ -1678,6 +1678,49 @@ class BriefRepairCheckTests(unittest.TestCase):
         checks = self._checks(rows)
         self.assertEqual([item["ok"] for item in checks["icebreaker_repeat"]["requests"]], [False, True])
 
+    FIRST_Q = "What does a good first call with a new prospect look like for you?"
+
+    def _insisted_rows(self, second_reply: str) -> list:
+        # D2-IB1 (manual-M06): the first request got the question before the last; "no, I mean ..."
+        # turns that one down, and Christy offers the one before it ("Sure, the one before that: ...").
+        rows = [_row("bot", "christy", "icebreaker", self.FIRST_Q, 185.0, source="reply"),
+                _row("candidate", "candidate", "icebreaker", "I open with questions.", 188.0,
+                     act="icebreaker_answer")]
+        first_ask = "Can you jump back to the question before the last one and ask me it again?"
+        rows += self._rows("repeat_request", first_ask, "Of course. " + self.EARLIER_Q, "reply")
+        rows += [
+            _row("candidate", "candidate", "transition",
+                 "No, I mean go back to that earlier one, the question before last, and put it to me again.",
+                 250.0, act="repeat_request"),
+            _row("bot", "christy", "transition", second_reply, 254.0, source="reply"),
+        ]
+        return rows
+
+    def test_an_insisted_request_after_the_right_question_passes_with_the_one_before_it(self) -> None:
+        checks = self._checks(self._insisted_rows("Sure, the one before that: " + self.FIRST_Q))
+        self.assertEqual([item["ok"] for item in checks["icebreaker_repeat"]["requests"]], [True, True])
+        self.assertTrue(checks["icebreaker_repeat"]["ok"], checks["icebreaker_repeat"])
+        # With no older question kept, the same question again ("That one was: ...") still passes.
+        same = self._checks(self._insisted_rows("That one was: " + self.EARLIER_Q))
+        self.assertTrue(same["icebreaker_repeat"]["ok"], same["icebreaker_repeat"])
+        # Moving forward to the last question is still wrong.
+        forward = self._checks(self._insisted_rows("Sure, here it is again: " + self.LAST_Q))
+        self.assertFalse(forward["icebreaker_repeat"]["ok"], forward["icebreaker_repeat"])
+
+    def test_an_insisted_request_after_a_wrong_question_gets_no_older_question(self) -> None:
+        # The "no" corrects Christy's wrong question: the one before the last is still the target.
+        rows = self._insisted_rows("Sure, the one before that: " + self.FIRST_Q)
+        rows[-3] = dict(rows[-3], text="Of course. " + self.LAST_Q)
+        checks = self._checks(rows)
+        self.assertEqual([item["ok"] for item in checks["icebreaker_repeat"]["requests"]], [False, False])
+
+    def test_the_insisted_switch_off_keeps_the_old_target(self) -> None:
+        from rehearsal.flags import IB_REPEAT_INSISTED
+
+        with _switch(IB_REPEAT_INSISTED, "0"):
+            checks = self._checks(self._insisted_rows("Sure, the one before that: " + self.FIRST_Q))
+        self.assertEqual([item["ok"] for item in checks["icebreaker_repeat"]["requests"]], [True, False])
+
     def test_off_restores_the_word_count_rule(self) -> None:
         from rehearsal.flags import TRANSITION_ACTS_V2
 
@@ -1685,6 +1728,44 @@ class BriefRepairCheckTests(unittest.TestCase):
             checks = self._checks(self._rows("brief_request", "Could you go over the role-play again?", self.REFUSAL, "reply"))
             self.assertTrue(checks["brief_repair"]["ok"])
             self.assertIsNone(checks["icebreaker_repeat"]["ok"])
+
+
+class SameTurnFragmentTests(unittest.TestCase):
+    """Integration (rambler): a fragment of the same spoken turn that the session saved as its own row
+    (no span, written while the turn was still being said) is not the candidate's next turn."""
+
+    QUESTION = "Yes, one thing, and sorry if this is a long one, what does the next round look like here?"
+    TAIL = "And you know, the market right now is a bit up and down, so it is all about preparation."
+
+    def _rows(self, tail_at: float) -> list:
+        return [
+            _row("bot", "christy", "roleplay_exit", "Let's pause the role-play here.", 1000.0, source="say"),
+            dict(_row("candidate", "candidate", "wrapup", self.QUESTION, 1004.0, act="wrapup_question",
+                      source="candidate"), t_end=1027.0),
+            # The session's own row of the ramble's tail: no span, so no source and no end.
+            dict(_row("candidate", "candidate", "roleplay_exit", self.TAIL, tail_at), t_end=None, s_sec=None),
+            _row("bot", "christy", "wrapup", "Before we finish, do you have any questions?", 1006.0, source="say"),
+            _row("bot", "christy", "wrapup", "Your question is noted. Anything else?", 1030.0, source="reply"),
+        ]
+
+    def _checks(self, rows):
+        return BriefRepairCheckTests._checks(self, rows)
+
+    def test_a_fragment_inside_the_question_does_not_hide_christy_s_reply(self) -> None:
+        checks = self._checks(self._rows(1005.5))
+        self.assertTrue(checks["wrapup_answered"]["ok"], checks["wrapup_answered"])
+
+    def test_a_candidate_row_after_the_question_ended_is_still_the_next_turn(self) -> None:
+        rows = [row for row in self._rows(1028.0) if not str(row["text"]).startswith("Before we finish")]
+        checks = self._checks(rows)
+        self.assertFalse(checks["wrapup_answered"]["ok"], checks["wrapup_answered"])
+
+    def test_the_switch_off_keeps_the_old_reading(self) -> None:
+        from rehearsal.flags import SAME_TURN_FRAGMENTS
+
+        with _switch(SAME_TURN_FRAGMENTS, "0"):
+            checks = self._checks(self._rows(1005.5))
+        self.assertFalse(checks["wrapup_answered"]["ok"], checks["wrapup_answered"])
 
 
 class LearnerClockTests(unittest.TestCase):

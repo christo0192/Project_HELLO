@@ -141,9 +141,18 @@ def _first(rows: Sequence[Mapping[str, Any]], **match: Any) -> Mapping[str, Any]
 
 
 def _next_bot(rows: Sequence[Mapping[str, Any]], index: int) -> Mapping[str, Any] | None:
-    """The first bot row after ``rows[index]`` and before the candidate's next row."""
+    """The first bot row after ``rows[index]`` and before the candidate's next row.
+
+    A candidate row with no span (no ``source``) written before the candidate's own row ended is a
+    fragment of that same spoken turn the session saved apart, not the candidate's next turn.
+    """
+    asked_end = _num(rows[index].get("t_end")) if rows[index].get("speaker") == "candidate" else None
+    fragments = asked_end is not None and flags.on(flags.SAME_TURN_FRAGMENTS)
     for row in rows[index + 1 :]:
         if row.get("speaker") == "candidate":
+            started = _num(row.get("t_start"))
+            if fragments and row.get("source") is None and started is not None and started < asked_end:
+                continue
             return None
         if row.get("speaker") == "bot":
             return row
@@ -500,6 +509,8 @@ _SECOND_LAST = re.compile(
     r"\bbefore (?:the )?last\b|\bsecond[- ](?:to[- ])?last\b|\bpenultimate\b", re.IGNORECASE
 )
 _LAST = re.compile(r"\b(?:last|previous|latest) (?:\w+ ){0,2}question\b|\brepeat the question\b", re.IGNORECASE)
+# A request that turns down the question it just got ("No, I mean ...", "not that one").
+_TURNED_DOWN = re.compile(r"^\W*(?:no\b|nope\b|not (?:that|this) one\b|the other one\b)", re.IGNORECASE)
 
 
 def _icebreaker_repeat(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -517,9 +528,18 @@ def _icebreaker_repeat(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     items = []
     ok: bool | None = None
     target: str | None = None
+    insisted_on = flags.on(flags.IB_REPEAT_INSISTED)
     for index, row in enumerate(rows):
         if row.get("speaker") != "candidate" or row.get("phase") != "transition" or row.get("act") != "repeat_request":
             continue
+        # D2-IB1: "no, I mean ..." after the right question turns that one down, so the one before it
+        # (Christy's "Sure, the one before that: ...") also passes; after a wrong one it corrects her.
+        insisted = (
+            insisted_on
+            and bool(items)
+            and bool(items[-1]["ok"])
+            and _TURNED_DOWN.search(str(row.get("text") or "")) is not None
+        )
         # Which question it asks for: "the one before the last" the second-to-last; "the last" or "the
         # previous" the last; a request naming neither ("no, the earlier one") keeps the question the
         # request before it asked for, and a first such request means the last.
@@ -529,10 +549,13 @@ def _icebreaker_repeat(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         elif _LAST.search(what) or target is None:
             target = "last"
         wanted = questions[-2:-1] if target == "second_last" and len(questions) >= 2 else questions[-1:]
+        if insisted and wanted:
+            position = len(questions) - (2 if target == "second_last" and len(questions) >= 2 else 1)
+            wanted = questions[max(0, position - 1):position + 1]
         reply = _next_bot(rows, index)
         text = str((reply or {}).get("text") or "")
         good = bool(text) and any(_asks_again(question, text) for question in wanted)
-        items.append({"target": target, "reply_words": _words(text), "ok": good})
+        items.append({"target": target, "reply_words": _words(text), "ok": good, "insisted": insisted})
         ok = good if ok is None else (ok and good)
     return {"ok": ok, "questions_asked": len(questions), "requests": items}
 
