@@ -680,6 +680,11 @@ HOLD_MIN_BUDGET_SECONDS = 15.0
 # Christy's question again, for a request to repeat it once the soft exit is due (a runtime
 # template: ``{question}`` is the last question of her own last model reply).
 IB_REPEAT_TEMPLATE = "Of course. {question}"
+# M032 live simulation, diagnosis 2 (D2-IB1, R1_TRANSITION_REPAIR): in the transition, a request
+# that turns her repeated question down ("No, I mean the question before last") gets the one
+# before it, or, with none older kept, the same question named once more.
+IB_REPEAT_OLDER_TEMPLATE = "Sure, the one before that: {question}"
+IB_REPEAT_SAME_TEMPLATE = "That one was: {question}"
 # The opener of a model reply to a turn that checks she is there (the quoted words are dropped
 # from the guard's echo check), and its apology after a wait of ``PRESENCE_LATE_SECONDS`` or more.
 PRESENCE_OPENER_NOTE = 'If they asked whether you are there, start with "Yes, I\'m here."'

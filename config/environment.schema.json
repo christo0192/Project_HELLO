@@ -239,6 +239,8 @@
         "R1_TRANSITION_BRIDGE": { "requiredInProduction": false, "secret": false },
         "R1_TRANSITION_REPAIR": { "requiredInProduction": false, "secret": false },
         "R1_ICEBREAKER_ACK_HOLD": { "requiredInProduction": false, "secret": false },
+        "R1_CONSENT_WIDE": { "requiredInProduction": false, "secret": false },
+        "R1_START_ASK_ONCE": { "requiredInProduction": false, "secret": false },
         "R1_ICEBREAKER_REPAIR": { "requiredInProduction": false, "secret": false },
         "R1_NO_AUDIO_LADDER": { "requiredInProduction": false, "secret": false },
         "R1_OPENING_SOUND_CHECK": { "requiredInProduction": false, "secret": false },

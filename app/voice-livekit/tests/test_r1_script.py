@@ -107,6 +107,7 @@ class TableTests(unittest.TestCase):
         # M1: every line of the wait asks; none announces that the role-play is starting.
         for line_id in (
             "L-TRANSITION-ASK", "L-TRANSITION-REASK", "L-TRANSITION-REASK-2", "L-TRANSITION-STEER",
+            "L-TRANSITION-ASK-PAUSE",  # M032 christy-ready
         ):
             with self.subTest(line=line_id):
                 text = LINES[line_id]
@@ -567,6 +568,18 @@ class TransitionRepairLineTests(unittest.TestCase):
             self.assertIn(", or ", text)
             self.assertTrue(text.endswith("?"))
             self.assertIn(line_id, NAME_FREE_LINES)
+
+    def test_the_pause_prompt_word_for_word(self):
+        # M032 christy-ready (R1_START_ASK_ONCE): the one start prompt a quiet pause gets once the
+        # answers before the role-play end without one.  A yes/no question (a bare "yes" starts),
+        # worded unlike every other start question, and naming the spoken "ready".
+        self.assertEqual(
+            LINES["L-TRANSITION-ASK-PAUSE"],
+            "If that covers everything, shall we begin the role-play? Just say 'ready' whenever "
+            "you like.",
+        )
+        self.assertNotIn(", or ", LINES["L-TRANSITION-ASK-PAUSE"])
+        self.assertIn("L-TRANSITION-ASK-PAUSE", NAME_FREE_LINES)
 
 
 class OpeningSoundCheckLineTests(unittest.TestCase):

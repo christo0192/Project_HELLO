@@ -161,6 +161,13 @@ LINES: dict[str, str] = {
     # after every answer.  Both stay either/or: a bare "yes" to them still gets the nudge.
     "L-TRANSITION-ASK-2": "Anything else, or shall we start?",
     "L-TRANSITION-ASK-3": "Any other questions, or shall we begin the role-play?",
+    # M032 christy-ready (R1_START_ASK_ONCE): only the first answer ends with a start question;
+    # a quiet pause after a later one gets this, once.  A yes/no question (a bare "yes" starts),
+    # worded unlike the brief's, the answers' and the re-asks'.
+    "L-TRANSITION-ASK-PAUSE": (
+        "If that covers everything, shall we begin the role-play? Just say 'ready' whenever you "
+        "like."
+    ),
     "L-TRANSITION-REASK": (
         "Shall we start the role-play now? Just say 'ready' when you are, or ask me a question "
         "first if you have one."

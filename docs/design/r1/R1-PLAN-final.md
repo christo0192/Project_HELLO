@@ -449,6 +449,7 @@ Clocks:
 | L-TRANSITION-ASK | "Shall we start the role-play now, or do you have another question?" |
 | L-TRANSITION-ASK-2 (rotated, M032 S6) | "Anything else, or shall we start?" |
 | L-TRANSITION-ASK-3 (rotated, M032 S6) | "Any other questions, or shall we begin the role-play?" |
+| L-TRANSITION-ASK-PAUSE (M032 christy-ready; R1_START_ASK_ONCE) | "If that covers everything, shall we begin the role-play? Just say 'ready' whenever you like." |
 | L-TRANSITION-REASK | "Shall we start the role-play now? Just say 'ready' when you are, or ask me a question first if you have one." |
 | L-TRANSITION-REASK-2 | "I'm still here whenever you're ready. Just say 'ready', or press the I'm ready button, and she'll pick up." |
 | L-TRANSITION-STEER | "Let's keep any other questions for the end of the interview; there'll be time for them then. Shall we start the role-play now?" |

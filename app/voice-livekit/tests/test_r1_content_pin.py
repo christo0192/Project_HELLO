@@ -192,22 +192,34 @@ import r1_world
 # Revision 28 (third merge of the M032 lanes): the Christy lane's 24..25 on top of revision 27;
 # no text changed in the merge.  CONTENT_REVISION = max(27, 25) + 1.
 # Learner lane (feat/m032-learner), its own revisions 27..28 after the third integration:
-# Learner lane revision 27 (simulation diagnosis 2, learner fixes): the short completion tails, the counter's
-# completions, the below-$7,000 anchor situations and the latest-price, figures-said and ask-kind
-# notes join the manifest (``r1_content._sim2_repairs``) beside the texts they replace while their
-# flags are on.  No graded meaning, marker, must-say or deadline changed.
+# Learner lane revision 27 (simulation diagnosis 2, learner fixes): the short completion tails,
+# the counter's completions, the below-$7,000 anchor situations and the latest-price, figures-said
+# and ask-kind notes join the manifest (``r1_content._sim2_repairs``) beside the texts they
+# replace while their flags are on.  No graded meaning, marker, must-say or deadline changed.
 # After the diagnosis 2 review (still revision 27, unreleased): the figures-said note keeps its
 # website example only for the website's price she named herself (FIGURES_SAID_SOURCE_WEBSITE),
 # and the tail themes need the worry's frame for "full", deciding, committing, "online" and
 # "paying".  No graded meaning, marker, must-say or deadline changed.
-# Learner lane revision 28 (simulation adaptability): the tangent notes and the stall-gap voiced-concerns note
-# join the manifest (``r1_content._adapt_repairs``) beside the texts they replace while their flags
-# are on.  No graded meaning, marker, must-say or deadline changed.
+# Learner lane revision 28 (simulation adaptability): the tangent notes and the stall-gap
+# voiced-concerns note join the manifest (``r1_content._adapt_repairs``) beside the texts they
+# replace while their flags are on.  No graded meaning, marker, must-say or deadline changed.
 # After its review (still revision 28, unreleased): the 19:00 stall's reaction-only tangent note
 # (TANGENT_REACT_NOTE).  No graded meaning, marker, must-say or deadline changed.
 # Revision 29 (fourth merge of the M032 lanes): the learner lane's 27..28 on top of revision 28;
 # no text changed in the merge.  CONTENT_REVISION = max(28, 28) + 1.
-PINNED_CONTENT_SHA256 = "1ded7263f76da9df923fbb949c55d18337aa2a84b15e0b23c0bf27fca4fe70b7"
+# Christy lane (feat/m032-christy), its own revisions 26..28 after the third integration:
+# Christy lane revision 26 (M032 live simulation, diagnosis 2): the repaired transition note reads
+# "the instructions" as the role-play brief (D2-BR1), and the insisted icebreaker repeat's two
+# templates (IB_REPEAT_OLDER_TEMPLATE, IB_REPEAT_SAME_TEMPLATE; D2-IB1).
+# Christy lane revision 27 (review of diagnosis 2, D2-BR1-R2): the repaired transition note offers
+# to go over the brief again for "the instructions" and keeps the polite decline for its own
+# rules.
+# Christy lane revision 28 (M032 christy-ready, R1_START_ASK_ONCE): L-TRANSITION-ASK-PAUSE, the
+# one start prompt a quiet pause gets once the answers before the role-play end without a start
+# question.
+# Revision 30 (fifth merge of the M032 lanes): the Christy lane's 26..28 on top of revision 29; no
+# text changed in the merge.  CONTENT_REVISION = max(29, 28) + 1.
+PINNED_CONTENT_SHA256 = "04deae25dfe19e4b61ab2ee76a6ba385e2b78bf8f8386298ca6e163529b8cf18"
 
 CONTENT_MODULES = (
     "r1_text",
