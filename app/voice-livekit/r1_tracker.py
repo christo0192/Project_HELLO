@@ -141,6 +141,62 @@ class GateUpdate:
     # R1-Q final review round 1: the turn asks the learner an open question about themselves that
     # names no topic ("What would help you two decide?"); see ``DisclosureGate.deep_due``.
     open_question: bool = False
+    # Simulation diagnosis 3 (D3-LRN-DUMP1, the engine's R1_DIG_GATE_V2): the turn is a closing
+    # check, a yes/no confirmation, a promise to send something or a commitment ask (no dig at
+    # all), or a goal / return question (a dig for the goal need only).
+    not_a_dig: bool = False
+    goal_dig: bool = False
+
+
+# D3-LRN-DUMP1: "I'll send everything over ... Sound good?" and "Shall I book it?" dig for nothing.
+_NOT_A_DIG = re.compile(
+    r"\b(?:sounds? (?:good|okay|ok|fine|alright|fair)|does (?:that|this) (?:work|sound)|"
+    r"shall i|should i|can i (?:send|book|go ahead)|(?:is )?that (?:okay|ok|fine|alright)|"
+    r"(?:i'?ll|i will|let me|we'?ll|we will) (?:send|email|e-mail|share|forward|drop|whatsapp)|"
+    r"reach out (?:whenever|when(?:ever)? you)|ready to (?:enrol|enroll|sign up|join|pay|start)|"
+    r"(?:sign|signing) up|enrol(?:l)?(?:ing)? (?:today|now)|take (?:the )?payment|"
+    r"(?:a )?(?:follow-?up|call) (?:on|tomorrow|next|at)|what time (?:works|suits))\b|"
+    # A tag question only ("..., okay?"): "What would make it feel right?" is a real dig.
+    r"(?:^|[,;.]\s*)(?:okay|ok|alright|right|deal|fair enough)\s*\?",
+    re.IGNORECASE,
+)
+# Review D3R-1: an open question at the start of a clause ("What's stopping you from signing up?",
+# "I'll send the brochure, but first, what's really holding you back?", "How do you feel about the
+# cost, okay?") is a dig, whatever closing words the turn also has.  Only a turn whose questions
+# are all closing checks digs for nothing.  "What time works", "how does that sound", "how about"
+# and a bare "what do you think?" are the closing check itself.
+_OPEN_DIG_START = re.compile(
+    r"(?:^|[,;:.?!]\s*|\b(?:but|and|so|now|first|then|also|just|okay|ok|actually)\s+)"
+    r"(?P<wh>what|why|how|which|tell me|walk me|help me understand)\b",
+    re.IGNORECASE,
+)
+_OPEN_DIG_EXEMPT = re.compile(
+    r"(?:what time\b|how (?:does|did|would|do) (?:that|this|it) (?:sound|work|suit)|how about\b|"
+    r"what do you (?:think|say)(?=\s*(?:[?.!,]|$)))",
+    re.IGNORECASE,
+)
+
+
+def is_closing_check(text: object) -> bool:
+    """D3-LRN-DUMP1 and review D3R-1: the turn is a closing check, a confirmation, a promise to send
+    something or a commitment ask, and asks nothing open beside it."""
+    folded = fold(text)
+    if _NOT_A_DIG.search(folded) is None:
+        return False
+    for match in _OPEN_DIG_START.finditer(folded):
+        if _OPEN_DIG_EXEMPT.match(folded, match.start("wh")) is None:
+            return False
+    return True
+
+
+# A question about the return or result she wants is about her goal (H1), never her money (H3).
+_GOAL_DIG = re.compile(
+    r"\b(?:what (?:kind of |sort of )?(?:return|roi|outcome|results?)\b|"
+    r"what (?:do|would) you (?:want|hope|expect|like) to (?:get|gain|achieve|see)|"
+    r"what are you hoping (?:to|for)|what do you want (?:out of|from) (?:it|this|the course))",
+    re.IGNORECASE,
+)
+GOAL_NEED = "H1"
 
 
 class DisclosureGate:
@@ -154,6 +210,8 @@ class DisclosureGate:
         self.wide_followup = False
         # Simulation adaptability: the engine's R1_TANGENT (a small-talk question is no probe).
         self.small_talk = False
+        # Simulation diagnosis 3 (D3-LRN-DUMP1): the engine's R1_DIG_GATE_V2.
+        self.dig_gate_v2 = False
 
     # ------------------------------------------------------------------ observation
     def observe_candidate_turn(self, text: object, turn: int | None = None) -> GateUpdate:
@@ -191,6 +249,8 @@ class DisclosureGate:
             probed=tuple(topic for topic in H_TOPICS if topic in probes),
             followup=generic,
             open_question=question and asks_open_question(text),
+            not_a_dig=self.dig_gate_v2 and is_closing_check(text),
+            goal_dig=self.dig_gate_v2 and _GOAL_DIG.search(fold(text)) is not None,
         )
 
     # --------------------------------------------------------------------- the layers
@@ -211,6 +271,11 @@ class DisclosureGate:
         the advisor dug at it five more times ("What would help you two decide?").
         """
         due: list[str] = []
+        if update.not_a_dig:
+            # D3-LRN-DUMP1 (R1_DIG_GATE_V2): a closing check or a promise to send ("Have a look
+            # with your husband and reach out whenever you're ready. Sound good?") asks for no
+            # story, even when it names a need's words; the need waits for a real dig.
+            return ()
         for topic in H_TOPICS:
             record = self._records[topic]
             if not self._may_offer(record):
@@ -250,12 +315,14 @@ class DisclosureGate:
         """
         if update.probed or update.first_probes or not update.question:
             return None
-        if not update.open_question:
+        if not update.open_question or update.not_a_dig:
             return None
         waiting = [
             record
             for record in self._records.values()
-            if self._may_offer(record) and self.turn not in record.deep_offer_turns
+            if self._may_offer(record)
+            and self.turn not in record.deep_offer_turns
+            and (not update.goal_dig or record.topic == GOAL_NEED)
         ]
         if not waiting:
             return None

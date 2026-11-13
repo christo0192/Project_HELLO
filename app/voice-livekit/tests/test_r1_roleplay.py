@@ -1459,6 +1459,7 @@ class InjectionTests(unittest.TestCase):
                         self.assertNotEqual(plan.mode, TurnMode.EXIT)
                     self._assert_nothing_moved(s)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_an_explicit_attack_from_fourteen_exits_with_nothing_moved(self):
         """M032 SWEEP-24 re-pin.  The explicit attack never reached the "from 14:00" half of the
         test above (its first half ``continue``s), so the new late route is pinned here: from 14:00
@@ -1979,6 +1980,7 @@ class EndRequestTests(unittest.TestCase):
             default=str,
         )
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_turn_64_gets_the_interviewers_question_and_no_owed_move(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -2543,6 +2545,7 @@ class EndRequestTests(unittest.TestCase):
         self.assertFalse(log["excluded_from_auto_status"], log["exclusion_reasons"])
         self.assertIsNone(log["commitment"]["level"])  # nothing was granted for asking to stop
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_COACH_AFTER_INROLE": "0"})  # Simulation diagnosis 3: the release before
     def test_role_reversals_play_the_coach_aside_once(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -7780,6 +7783,7 @@ class RespondFirstEngineTests(unittest.TestCase):
         self.assertNotIn("owed_deferred_to_respond", plan.reasons)
 
     @s3_off
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_EASED_ACK_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_a_back_off_clears_the_hold_note_and_eases_the_pressure_once(self):
         from r1_prompts import HOLD_NOTE, PRESSURE_EASED_NOTE
 
@@ -8276,6 +8280,7 @@ class S1ReviewFixTests(unittest.TestCase):
     """The S1 reviews' findings, each as the shape that found it (synthetic advisor turns)."""
 
     @s3_off
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_EASED_ACK_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_s1r1_an_ask_after_the_f4_primary_gets_the_stall_at_once(self):
         """S1R-1 / S1-R4: the negotiation leaves a call or enrolment ask right after F4's primary to
         the F4 push (``ask_yields_to_owed_move``); the reaction hold took it and the stall then
@@ -8708,6 +8713,7 @@ class WorryAndPreemptedTests(unittest.TestCase):
 class CoachResumeAndCountsTests(unittest.TestCase):
     """S2 items 7 and 8 (R1_LEARNER_VOICE_V2; the counts always)."""
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_COACH_AFTER_INROLE": "0"})  # Simulation diagnosis 3: the release before
     def test_after_the_coach_aside_she_carries_on_without_a_new_greeting(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -9306,6 +9312,7 @@ class S2ReviewFixTests(unittest.TestCase):
         self.assertNotIn("six months", only._advisor_figures)
         self.assertEqual(only._preempted_label("F3"), "")
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_COACH_AFTER_INROLE": "0"})  # Simulation diagnosis 3: the release before
     def test_s2r6c_a_lost_reply_gives_its_s2_notes_back(self):
         """S2R-6: the heard reply after a lost one carries the notes nobody heard, counted once."""
         s = Session(engine())
@@ -11044,6 +11051,7 @@ class ClosingStateTests(unittest.TestCase):
 class EarlyCloseAsideTests(unittest.TestCase):
     """M032 S3.3 (D-M032-2): before 14:00 an in-role close never ends the role-play silently."""
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_FAREWELL_EXIT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_nothing_owed_gets_christys_question_with_r_paused(self):
         s = done_session()
         plan = s.say("Thanks for your time, bye.", 650)
@@ -11101,6 +11109,7 @@ class EarlyCloseAsideTests(unittest.TestCase):
         self.assertFalse(plan.exit_roleplay)
         self.assertTrue(s.eng.wrap_question_open)  # still waiting for the answer
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_FAREWELL_EXIT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_a_bare_yes_sure_or_go_ahead_never_stops_it(self):
         """Review S3R-2 (naturalness): "keep going, or ... just say so" is either/or, so a bare
         yes says neither; the choice is put again once, then a bare yes waits."""
@@ -11199,6 +11208,7 @@ class LateEndRequestTests(unittest.TestCase):
         deliver(s.eng, *[move for move in ALL_MOVES if move != "F4-PUSH"], r=600)
         return s
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_one_owed_move_gets_the_last_point_then_the_exit(self):
         s = self.only_f4_push_owed()
         aside = s.say("End the interview.", 845, turn_index=90)
@@ -11228,6 +11238,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertEqual(log["last_point"]["answer"], "exit")
         self.assertEqual(s.eng.scheduler.close_attempts, 0)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_after_the_last_point_a_no_resumes_and_sorry_hears_it_again(self):
         s = self.only_f4_push_owed()
         s.say("End the interview.", 845)
@@ -11243,6 +11254,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertFalse(s.eng.exit_requested)
         self.assertEqual(s.eng.admin_log()["endings"]["last_point"]["answer"], "resumed")
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_a_last_point_lost_before_any_audio_is_said_again(self):
         """Review S3R-1: an "Okay." in the think gap cancelled the point before any audio."""
         for text, kwargs in (("Okay.", {"backchannel": True}), ("Sure, I understand that.", {})):
@@ -11268,6 +11280,7 @@ class LateEndRequestTests(unittest.TestCase):
                 self.assertIn("end_request_late_exit", bye.reasons)
                 self.assertTrue(s.eng.fidelity()["checks"]["all_families_delivered"])
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_the_answer_to_the_last_point_is_a_roleplay_turn(self):
         """Review S3R-4: it answers her objection in role, so it is counted as evidence."""
         s = self.only_f4_push_owed()
@@ -11279,6 +11292,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertEqual(len(s.eng._word_counts), before + 1)
         self.assertEqual(len(s.eng._stt_word_counts), before + 1)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_a_quiet_after_the_last_point_ends_it(self):
         s = self.only_f4_push_owed()
         s.say("End the interview.", 845)
@@ -11287,6 +11301,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertTrue(s.eng.exit_requested)
         self.assertFalse(s.eng.last_point_lapsed())  # once
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_more_owed_exits_at_once(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -11297,6 +11312,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertIn("end_request_explicit", plan.reasons)
         self.assertEqual(s.eng.scheduler.close_attempts, 0)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_nothing_owed_exits_with_no_weak_line(self):
         s = done_session(r=700)
         plan = s.say("Can we end this role play?", 860)
@@ -11306,6 +11322,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertEqual(s.eng.scheduler.close_attempts, 0)
         self.assertFalse(s.eng.commitment_resolved)  # unresolved: the line is masked anyway
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_generic_requests_and_farewells_keep_the_ladder(self):
         for text in ("Can you disconnect the call?", "Thanks for your time, bye."):
             with self.subTest(text=text):
@@ -11315,6 +11332,7 @@ class LateEndRequestTests(unittest.TestCase):
                 self.assertIn("close_attempt_redirect", plan.reasons)
                 self.assertEqual(s.eng.scheduler.close_attempts, 1)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_the_permission_form_is_a_maybe_request(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -11329,6 +11347,7 @@ class LateEndRequestTests(unittest.TestCase):
             plan = s.say("You can disconnect the call.", 300)
         self.assertNotEqual(plan.line_id, "L-ASIDE-END")
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_the_permission_form_is_only_the_fallback_for_a_missing_verdict(self):
         """SWEEP-24 (c): the lexical permission form stands in for the end-intent model only when
         it gave no verdict (timeout, failure, prefilter miss or flag off).  A model "no" stays no;
@@ -11344,6 +11363,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertEqual(plan.line_id, "L-ASIDE-END")
         self.assertIn("end_intent_model", plan.reasons)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     def test_flag_off_an_explicit_late_request_is_a_farewell(self):
         with mock.patch.dict(r1_roleplay.os.environ, {"R1_LATE_END_REQUEST": "0"}):
             s = self.only_f4_push_owed()
@@ -11646,6 +11666,7 @@ class PersonaTimelineLatchTests(unittest.TestCase):
 class RoleConfusionEngineTests(unittest.TestCase):
     """M032 SWEEP-10: the first reversal gets the coach aside; a repeat gets the role note."""
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_COACH_AFTER_INROLE": "0"})  # Simulation diagnosis 3: the release before
     def test_first_reversal_plays_the_aside_and_a_repeat_gets_the_role_note(self):
         from r1_prompts import ROLE_CONFUSION_EXAMPLES
 
@@ -11669,6 +11690,7 @@ class RoleConfusionEngineTests(unittest.TestCase):
         self.assertIn(CHARACTER_BREAK_NOTE, ai.reminder)
         self.assertNotIn("mixed up who is who", ai.reminder)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_COACH_AFTER_INROLE": "0"})  # Simulation diagnosis 3: the release before
     def test_a_forced_move_still_issues_on_a_reversal(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -13046,6 +13068,791 @@ class TangentReviewEngineTests(unittest.TestCase):
                 else:
                     self.assertNotIn(TANGENT_REACT_NOTE, plan.reminder)
 
+
+# --------------------------------------------------------------------------------------------------
+# Simulation diagnosis 3 (the int-live-3 flow judge): learner, ending and wrap-up fixes behind
+# their rollback flags.  Every text here is synthetic or paraphrased: no session's verbatim line.
+import r1_guard  # noqa: E402
+from r1_guard import GuardContext, guard_text  # noqa: E402
+
+D3_PERSONA = P1
+
+
+def d3_ctx(phase="roleplay", **kwargs) -> GuardContext:
+    kwargs.setdefault("persona", D3_PERSONA)
+    return GuardContext(phase=phase, **kwargs)
+
+
+def d3_flags(**values):
+    return mock.patch.dict(r1_roleplay.os.environ, values)
+
+
+class ClauseSplitDigitsTests(unittest.TestCase):
+    """D3-LRN-TRUNC1: the money-quota clause cut never splits "$7,500" at its comma."""
+
+    TEXT = "I don't have a hard number in mind, just that $7,500 is more than I planned for."
+
+    def test_the_figure_is_never_cut_in_half(self):
+        over = d3_ctx(
+            free_reply=True, phrase_counts=(("money_strain", 3),), advisor_amounts=frozenset({7500})
+        )
+        out = guard_text(self.TEXT, over).text
+        self.assertNotIn("$7.", out)
+        self.assertEqual(out, "I don't have a hard number in mind.")
+
+    def test_a_list_comma_still_splits(self):
+        parts = r1_guard._CLAUSE_SPLIT.split("It's $7,500, and more than I planned for")
+        self.assertEqual(parts, ["It's $7,500", "and more than I planned for"])
+
+
+class QuestionDietV2Tests(unittest.TestCase):
+    """D3-LRN-QDIET (R1_QUESTION_DIET_V2): only a NEW-topic question is dropped by the diet."""
+
+    def base(self, **kwargs):
+        kwargs.setdefault("free_reply", True)
+        kwargs.setdefault("recent_questions", (True,))
+        return d3_ctx(**kwargs)
+
+    def test_a_follow_up_on_his_words_stays(self):
+        terms = r1_guard.advisor_terms_in(
+            "You'd get the first month free and the live classes are recorded too."
+        )
+        context = self.base(question_diet_v2=True, followup_terms=terms)
+        text = "Hmm, the free month is what's puzzling me. Why would that be on offer?"
+        self.assertIn("Why would that be on offer?", guard_text(text, context).text)
+
+    def test_a_new_topic_question_is_still_dropped(self):
+        terms = r1_guard.advisor_terms_in("The classes are live on weekends.")
+        context = self.base(question_diet_v2=True, followup_terms=terms)
+        text = "That sounds fine for my schedule. How big are the mentor groups?"
+        self.assertEqual(guard_text(text, context).text, "That sounds fine for my schedule.")
+
+    def test_a_question_after_a_restated_figure_stays(self):
+        said = ("Seven thousand is about what I'd heard, honestly.",)
+        context = self.base(question_diet_v2=True, said=said)
+        text = "Seven thousand is about what I'd heard. What would the monthly come to, roughly?"
+        self.assertIn("monthly come to", guard_text(text, context).text)
+
+    def test_a_money_question_on_his_new_figure_stays(self):
+        context = self.base(question_diet_v2=True, figure_now=True)
+        text = "Okay, that's a lot to take in at once. What would I pay after the first month?"
+        self.assertIn("What would I pay", guard_text(text, context).text)
+
+    def test_flag_off_is_the_release_before(self):
+        terms = r1_guard.advisor_terms_in("You'd get the first month free.")
+        context = self.base(followup_terms=terms)
+        text = "Hmm, the free month is what's puzzling me. Why would that be on offer?"
+        self.assertEqual(guard_text(text, context).text, "Hmm, the free month is what's puzzling me.")
+
+
+class FigureMemoryGuardTests(unittest.TestCase):
+    """D3-LRN-MONEY1 (R1_FIGURE_MEMORY): one comparison with the $7,000 after the counter."""
+
+    def test_a_second_comparison_is_dropped(self):
+        settled = d3_ctx(free_reply=True, figure_memory=True, anchor_settled=True, anchor_comments=1)
+        text = "Seven thousand is right where I'd braced myself for. What would the schedule be?"
+        out = guard_text(text, settled).text
+        self.assertNotIn("braced", out)
+        self.assertIn("schedule", out)
+
+    def test_the_first_comparison_after_the_counter_stays_once_per_reply(self):
+        settled = d3_ctx(free_reply=True, figure_memory=True, anchor_settled=True)
+        text = "That's in line with what I'd heard. And $7,000 is what someone paid, I think."
+        out = guard_text(text, settled).text
+        self.assertIn("in line with what I'd heard", out)
+        self.assertNotIn("someone paid", out)
+
+    def test_whats_included_is_not_asked_again_so_soon(self):
+        context = d3_ctx(free_reply=True, figure_memory=True, included_recent=True)
+        out = guard_text("Okay. So what's included for that money?", context).text
+        self.assertNotIn("included", out)
+
+    def test_flag_off_is_the_release_before(self):
+        settled = d3_ctx(free_reply=True, anchor_settled=True, anchor_comments=3)
+        text = "Seven thousand is right where I'd braced myself for."
+        self.assertEqual(guard_text(text, settled).text, text)
+
+
+class EasedAckGuardTests(unittest.TestCase):
+    """D3-LRN-ACK1 (R1_EASED_ACK_V2): no "thanks for giving me the time / room / space"."""
+
+    def test_the_stock_thanks_is_taken_out(self):
+        context = d3_ctx(free_reply=True, eased_ack_v2=True)
+        for text in (
+            "Thanks for giving me the room on that. I'll look at the details tonight.",
+            "Thank you for giving me some space on this. I'll look at the details tonight.",
+        ):
+            with self.subTest(text=text):
+                out = guard_text(text, context).text
+                self.assertNotIn("giving me", out)
+                self.assertIn("details tonight", out)
+
+    def test_flag_off_is_the_release_before(self):
+        text = "Thanks for giving me the room on that."
+        self.assertEqual(guard_text(text, d3_ctx(free_reply=True)).text, text)
+
+
+class NoPriceHeardGuardTests(unittest.TestCase):
+    """D3-LRN-PRICE1 (R1_FOREIGN_PRICE): never "nobody told me the price" once one was named."""
+
+    def test_the_contradiction_is_taken_out(self):
+        context = d3_ctx(free_reply=True, price_heard=True)
+        out = guard_text(
+            "Nobody has actually told me the price yet, so I'm not sure. Is there a payment plan?",
+            context,
+        ).text
+        self.assertNotIn("Nobody", out)
+        self.assertIn("payment plan", out)
+
+    def test_flag_off_is_the_release_before(self):
+        text = "Nobody has actually told me the price yet."
+        self.assertEqual(guard_text(text, d3_ctx(free_reply=True)).text, text)
+
+
+class WrapupLeadInGuardTests(unittest.TestCase):
+    """D3-WRAP1 (3): a lead-in is no answer, so the hiring-team sentence gets the deflection."""
+
+    TEXT = (
+        "Curious about that, so let me be straight with you. The hiring team will tell you how "
+        "you did."
+    )
+
+    def test_a_lead_in_alone_still_gets_the_deflection(self):
+        out = guard_text(self.TEXT, GuardContext(phase="wrapup", one_mention=True, next_steps=True))
+        self.assertIn(r1_guard.FAQ_DEFER_WRAP_LINE, out.text)
+
+    def test_real_content_still_drops_the_hiring_team_sentence(self):
+        text = "That's everything for today's interview. The hiring team will follow up with you."
+        out = guard_text(text, GuardContext(phase="wrapup", one_mention=True, next_steps=True))
+        self.assertEqual(out.text, "That's everything for today's interview.")
+
+    def test_flag_off_is_the_release_before(self):
+        out = guard_text(self.TEXT, GuardContext(phase="wrapup", one_mention=True))
+        self.assertEqual(out.text, "Curious about that, so let me be straight with you.")
+
+
+def d3_only_owed(move_id):
+    s = Session(engine())
+    s.say(OPENER, 20)
+    deliver(s.eng, *[move for move in ALL_MOVES if move != move_id], r=600)
+    return s
+
+
+class LastPointV2Tests(unittest.TestCase):
+    """D3-END1 (R1_LAST_POINT_V2): a late stop request plays the last point only for an
+    undelivered primary she has not voiced, and the role-play ends after it by itself."""
+
+    REQUEST = "End the interview."
+
+    def test_a_pending_push_exits_at_once(self):
+        s = d3_only_owed("F4-PUSH")
+        plan = s.say(self.REQUEST, 872)
+        self.assertEqual(plan.mode, TurnMode.EXIT)
+        self.assertIn("end_request_late", plan.reasons)
+        self.assertTrue(s.eng.exit_requested)
+
+    def test_a_pending_primary_gets_the_aside_then_exits_after_her_line(self):
+        s = d3_only_owed("F2-PRIMARY")
+        aside = s.say(self.REQUEST, 872)
+        self.assertEqual(aside.line_id, "L-ASIDE-LAST-POINT-2")
+        self.assertEqual(
+            aside.scripted_text,
+            "Of course, we'll stop here. Meera just wants to add one quick thing.",
+        )
+        point = s.eng.continuation_plan(873)
+        self.assertEqual(point.move_id, "F2-PRIMARY")
+        self.assertIn("do not ask anything", point.intent.brief)
+        s.eng.record_spoken(point, s.eng.compose_speech(point, "").text, r_sec=878)
+        self.assertTrue(s.eng.exit_requested)  # no second candidate turn needed
+        self.assertEqual(s.eng.admin_log()["endings"]["last_point"]["answer"], "auto")
+
+    def test_a_cut_last_point_still_lets_no_carry_on_resume(self):
+        s = d3_only_owed("F2-PRIMARY")
+        s.say(self.REQUEST, 872)
+        point = s.eng.continuation_plan(873)
+        s.eng.record_spoken(point, "I'm just", r_sec=875, interrupted=True)
+        self.assertFalse(s.eng.exit_requested)
+        resumed = s.say("No, wait, let's carry on, I want to answer that.", 878)
+        self.assertFalse(resumed.exit_roleplay)
+        self.assertFalse(s.eng.exit_requested)
+
+    def test_a_primary_she_already_voiced_exits_at_once(self):
+        s = d3_only_owed("F4-PRIMARY")
+        s.eng._decider_said_turn = 3
+        plan = s.say(self.REQUEST, 872)
+        self.assertEqual(plan.mode, TurnMode.EXIT)
+
+    def test_flag_off_is_the_release_before(self):
+        with d3_flags(R1_LAST_POINT_V2="0"):
+            s = d3_only_owed("F4-PUSH")
+            aside = s.say(self.REQUEST, 872)
+            self.assertEqual(aside.line_id, "L-ASIDE-LAST-POINT")
+            point = s.eng.continuation_plan(873)
+            s.eng.record_spoken(point, s.eng.compose_speech(point, "").text, r_sec=878)
+            self.assertFalse(s.eng.exit_requested)
+
+
+class FigureNotMineTests(unittest.TestCase):
+    """D3-LRN-FIG1 (R1_FIGURE_NOT_MINE): "I never said six months" when she never said it."""
+
+    CHALLENGE = "I never mentioned six months, where'd you get that from?"
+
+    def test_a_length_she_never_said_gets_the_not_mine_note(self):
+        from r1_prompts import FIGURE_CHALLENGE_NOTE, FIGURE_NOT_MINE_NOTE
+
+        eng = engine()
+        eng._spoken.add("I think I saw about $9,000 on the website.")
+        self.assertEqual(eng._figure_challenge_note(self.CHALLENGE), FIGURE_NOT_MINE_NOTE)
+        eng._spoken.add("Somebody said it runs about six months.")
+        self.assertEqual(eng._figure_challenge_note(self.CHALLENGE), FIGURE_CHALLENGE_NOTE)
+        with d3_flags(R1_FIGURE_NOT_MINE="0"):
+            fresh = engine()
+            self.assertEqual(fresh._figure_challenge_note(self.CHALLENGE), FIGURE_CHALLENGE_NOTE)
+
+
+class DigGateV2Tests(unittest.TestCase):
+    """D3-LRN-DUMP1 (R1_DIG_GATE_V2): a closing check or a goal question releases no money need."""
+
+    def gate_with_h3_waiting(self):
+        from r1_tracker import NeedState
+
+        gate = engine().tracker.gate
+        record = gate._records["H3"]
+        record.state = NeedState.UNLOCKED
+        record.released_turn = 1
+        return gate
+
+    def test_a_closing_check_and_a_goal_question_offer_nothing(self):
+        for text in (
+            "Have a look with your husband and reach out whenever you're ready. Sound good?",
+            "So what are you hoping for? What return do you want from the course?",
+        ):
+            with self.subTest(text=text):
+                gate = self.gate_with_h3_waiting()
+                gate.dig_gate_v2 = True
+                update = gate.observe_candidate_turn(text, 9)
+                self.assertEqual(gate.deep_due(update), ())
+
+    def test_a_real_open_dig_still_offers_it(self):
+        gate = self.gate_with_h3_waiting()
+        gate.dig_gate_v2 = True
+        update = gate.observe_candidate_turn("What would make it feel right for you?", 9)
+        self.assertEqual(gate.deep_due(update), ("H3",))
+
+    def test_flag_off_is_the_release_before(self):
+        for text in (
+            "Have a look with your husband and reach out whenever you're ready. Sound good?",
+            "So what are you hoping for? What return do you want from the course?",
+        ):
+            with self.subTest(text=text):
+                gate = self.gate_with_h3_waiting()
+                update = gate.observe_candidate_turn(text, 9)
+                self.assertEqual(gate.deep_due(update), ("H3",))
+
+
+class ForeignPriceTests(unittest.TestCase):
+    """D3-LRN-PRICE1 (R1_FOREIGN_PRICE): a price in rupees is a price named."""
+
+    TEXT = "The fee's fifteen thousand rupees for the full course, and the batches are small."
+
+    def test_the_reader(self):
+        from r1_negotiation import foreign_price_in
+
+        self.assertEqual(foreign_price_in(self.TEXT), "fifteen thousand rupees")
+        self.assertEqual(
+            foreign_price_in("It comes to about 1,20,000 rupees in total."), "1,20,000 rupees"
+        )
+        self.assertEqual(foreign_price_in("It costs 3 lakh."), "3 lakh")
+        self.assertIsNone(foreign_price_in("My cousin earns two lakh a month."))
+        self.assertIsNone(foreign_price_in("It's $9,000, which is about seven lakh rupees."))
+
+    def test_the_price_is_named_and_the_anchor_checks_the_currency(self):
+        from r1_negotiation import ANCHOR_FOREIGN
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(self.TEXT, 40)
+        self.assertTrue(s.eng._price_named())
+        self.assertEqual(s.eng._anchor_situation().id, ANCHOR_FOREIGN)
+        self.assertIsNone(s.eng.negotiation.latest_stated_usd())  # never read as $15,000
+        self.assertTrue(s.eng.guard_context(free_reply=True).price_heard)
+
+    def test_a_later_dollar_price_wins(self):
+        from r1_negotiation import ANCHOR_FOREIGN
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(self.TEXT, 40)
+        s.say("Sorry, in dollars the price is $9,000.", 60)
+        self.assertNotEqual(s.eng._anchor_situation().id, ANCHOR_FOREIGN)
+
+    def test_flag_off_is_the_release_before(self):
+        with d3_flags(R1_FOREIGN_PRICE="0"):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.say("It comes to about 1,20,000 rupees in total.", 40)
+            self.assertFalse(s.eng._price_named())
+
+
+class EasedAckEngineTests(unittest.TestCase):
+    """D3-LRN-ACK1 (R1_EASED_ACK_V2): the eased-off note only after real pressure, and never
+    beside a question or new urgency."""
+
+    BACK_OFF = "Take your time, there's no pressure at all."
+
+    def notes_after(self, pending, text, **env):
+        from r1_commitment import AskKind
+        from r1_prompts import PRESSURE_EASED_NOTE, PRESSURE_EASED_NOTE_V2
+
+        with d3_flags(**env):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.say(PITCH, 40)
+            s.eng._pending_ask = AskKind.ENROL if pending else None
+            plan = s.say(text, 60)
+        return PRESSURE_EASED_NOTE in plan.reminder, PRESSURE_EASED_NOTE_V2 in plan.reminder
+
+    def test_after_an_ask_a_plain_back_off_gets_the_short_note(self):
+        self.assertEqual(self.notes_after(True, self.BACK_OFF), (False, True))
+
+    def test_a_back_off_with_a_question_gets_none(self):
+        text = "Take your time going through it. So what do you think so far?"
+        self.assertEqual(self.notes_after(True, text), (False, False))
+
+    def test_no_pressure_to_ease_gets_none(self):
+        self.assertEqual(self.notes_after(False, self.BACK_OFF), (False, False))
+
+    def test_flag_off_is_the_release_before(self):
+        self.assertEqual(self.notes_after(True, self.BACK_OFF, R1_EASED_ACK_V2="0"), (True, False))
+
+
+class CuriosityTimingTests(unittest.TestCase):
+    """D3-LRN-CURIO1 (R1_CURIOSITY_TIMING): no curiosity topic on a scheduling ask, after a
+    commitment, or near the time cue."""
+
+    SLOT = "Great. So shall we say I call you tomorrow around ten, or would later suit you?"
+
+    def test_a_call_time_ask_hands_over_no_topic_and_gets_the_note(self):
+        from r1_prompts import NEXT_STEP_ANSWER_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.eng._free_replies = 50  # the cadence is due
+        plan = s.say(self.SLOT, 300)
+        self.assertNotIn("You are curious about", plan.reminder)
+        if plan.mode is TurnMode.LLM_REPLY:
+            self.assertIn(NEXT_STEP_ANSWER_NOTE, plan.reminder)
+
+    def test_after_a_commitment_and_late_in_the_call_nothing_new(self):
+        eng = engine()
+        self.assertFalse(eng._curiosity_closed(300))
+        self.assertTrue(eng._curiosity_closed(r1_roleplay.TIME_CUE_SEC - 60))
+        eng._commitment_level = Level.MEDIUM
+        self.assertTrue(eng._curiosity_closed(300))
+        with d3_flags(R1_CURIOSITY_TIMING="0"):
+            self.assertFalse(eng._curiosity_closed(r1_roleplay.TIME_CUE_SEC - 60))
+
+
+class IntentTailTrimTests(unittest.TestCase):
+    """D3-LRN-TAIL1 (R1_INTENT_TAIL_V4): the tail never says again what her reply said."""
+
+    MARKERS = ((r"\$?9,?000", r"\bnine thousand\b"), (r"\$?7,?000", r"\bseven thousand\b"))
+
+    def test_the_website_check_is_not_said_twice(self):
+        from r1_roleplay import _trim_tail
+
+        spoken = "The website said about $9,000 not $12,000, so I'm a bit confused by $12,000 now."
+        tail = (
+            "Wait, I thought I saw about $9,000 on the website, not $12,000. Someone told me they "
+            "paid around $7,000."
+        )
+        self.assertEqual(
+            _trim_tail(tail, spoken, self.MARKERS), "Someone told me they paid around $7,000."
+        )
+
+    def test_a_needed_sentence_stays(self):
+        from r1_roleplay import _trim_tail
+
+        tail = "I thought I saw about $9,000 on the website. Someone told me they paid $7,000."
+        self.assertEqual(_trim_tail(tail, "That's a lot to take in.", self.MARKERS), tail)
+
+
+class EndAsideV2Tests(unittest.TestCase):
+    """D3-ASIDE1 (a) (R1_END_ASIDE_V2): a yes/no question in place of the magic phrase."""
+
+    def test_the_end_aside_asks_yes_or_carry_on(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("You can disconnect the call.", 300)
+        self.assertEqual(plan.line_id, "L-ASIDE-END")
+        self.assertEqual(
+            plan.scripted_text,
+            "This is Christy, your interviewer. Would you like to stop the role-play here and "
+            "finish the interview? Just say yes, or carry on with Meera.",
+        )
+        self.assertNotIn("please say", plan.scripted_text)
+        with d3_flags(R1_END_ASIDE_V2="0"):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("You can disconnect the call.", 300)
+        self.assertIn("please say: end the interview", plan.scripted_text)
+
+
+class CoachAfterInRoleTests(unittest.TestCase):
+    """D3-ASIDE1 (b) (R1_COACH_AFTER_INROLE): she corrects a first role mix-up in role; the coach
+    aside plays only if it persists."""
+
+    MIXUP = "So what program are you selling?"
+
+    def test_first_mix_up_in_role_then_the_aside(self):
+        from r1_prompts import ROLE_CONFUSION_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        first = s.say(self.MIXUP, 40)
+        self.assertFalse(first.aside)
+        self.assertIn(ROLE_CONFUSION_NOTE.split("{example}")[0][:40], first.reminder)
+        second = s.say(self.MIXUP, 60)
+        self.assertTrue(second.aside)
+        self.assertEqual(second.line_id, "L-ASIDE-COACH")
+
+    def test_flag_off_is_the_release_before(self):
+        with d3_flags(R1_COACH_AFTER_INROLE="0"):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            self.assertTrue(s.say(self.MIXUP, 40).aside)
+
+
+class FarewellExitTests(unittest.TestCase):
+    """D3-EXIT1 (R1_FAREWELL_EXIT_V2): the advisor's goodbye ends the call with her bye back."""
+
+    def test_a_goodbye_that_ends_on_a_farewell_after_her_sign_off_is_mutual(self):
+        self.assertTrue(r1_roleplay.ends_on_farewell("Thanks, you too. I'll send the invite. Good night."))
+        self.assertTrue(r1_roleplay.ends_on_farewell("Okay, talk soon!"))
+        self.assertFalse(r1_roleplay.ends_on_farewell("Good night is when I study. Does that work?"))
+
+    BYE = "Okay, thank you so much for your time, take care, bye."
+
+    def exit_on_goodbyes(self, s):
+        for step in range(4):
+            plan = s.say(self.BYE, 900 + 10 * step)
+            if plan.mode is TurnMode.EXIT:
+                return plan
+        self.fail("the goodbyes never ended the role-play")
+
+    def test_the_exit_on_his_goodbye_carries_her_bye(self):
+        s = done_session(r=700)
+        s.reply = "Sure, that works for me."  # her last line is no goodbye
+        plan = self.exit_on_goodbyes(s)
+        self.assertIn("close_attempt_exit", plan.reasons)
+        self.assertTrue(s.eng.exit_farewell)
+        if not s.eng._last_reply_closer:
+            self.assertIn(s.eng.exit_bye, r1_roleplay.LEARNER_BYE_LINES)
+        with d3_flags(R1_FAREWELL_EXIT_V2="0"):
+            s = done_session(r=700)
+            self.exit_on_goodbyes(s)
+            self.assertFalse(s.eng.exit_farewell)
+            self.assertIsNone(s.eng.exit_bye)
+
+    def test_the_early_close_aside_holds_her_bye_for_the_stop(self):
+        # Review D3R-8: her bye is held until the stop is taken (EarlyCloseByeReviewTests).
+        s = Session(engine())
+        s.say(OPENER, 20)
+        deliver(s.eng, *ALL_MOVES, r=200)
+        plan = s.say("Okay, thank you so much for your time, take care, bye.", 700)
+        if plan.line_id is not None and plan.line_id.startswith("L-ASIDE-EARLY-CLOSE"):
+            self.assertIsNone(plan.prelude_line)
+            if not s.eng._last_reply_closer:
+                self.assertIn(s.eng._early_close_bye, r1_roleplay.LEARNER_BYE_LINES)
+            if plan.line_id == "L-ASIDE-EARLY-CLOSE-2":
+                self.assertIn("Shall we stop the role-play there", plan.scripted_text)
+
+
+class FigureMemoryEngineTests(unittest.TestCase):
+    """D3-LRN-MONEY1 (R1_FIGURE_MEMORY): a figure she already reacted to gets no new comment."""
+
+    def run_repeat(self, **env):
+        from r1_prompts import FIGURE_REACTED_NOTE
+
+        marker = FIGURE_REACTED_NOTE.split("{amount}")[0]
+        with d3_flags(**env):
+            s = Session(engine(), reply="Hmm, $8,000 is still a lot for me.")
+            s.say(OPENER, 20)
+            s.say(PITCH, 40)
+            s.say("The course is $8,000 all in.", 60)
+            s.reply = "I see."
+            plan = s.say("Like I said, it's $8,000, and the mentors are great.", 80)
+        return marker in plan.reminder
+
+    def test_a_repeated_figure_gets_the_note(self):
+        self.assertTrue(self.run_repeat())
+
+    def test_flag_off_is_the_release_before(self):
+        self.assertFalse(self.run_repeat(R1_FIGURE_MEMORY="0"))
+
+
+class DigGateReviewTests(unittest.TestCase):
+    """Review D3R-1 (R1_DIG_GATE_V2): a real dig keeps its deep layer even when it also says
+    "sign up", "I'll send" or ends on a tag; only a turn that is all closing check digs for none."""
+
+    REAL_DIGS = (
+        "What's stopping you from signing up today?",
+        "What would make you ready to join?",
+        "Is that okay if I ask how you plan to fund it? What's your budget like?",
+        "I'll send the brochure, but first, what's really holding you back?",
+        "What's your main worry about the money, right?",
+        "How do you feel about the cost, okay?",
+    )
+    CLOSING_CHECKS = (
+        "Have a look with your husband and reach out whenever you're ready. Sound good?",
+        "Shall I book it for Monday?",
+        "I'll send everything over tonight. Does that work?",
+        "Are you ready to sign up today?",
+        "What time works for a call tomorrow? I'll send the invite.",
+        "I'll email the brochure. How does that sound?",
+    )
+
+    def gate_with_needs_waiting(self):
+        from r1_tracker import NeedState
+
+        gate = engine().tracker.gate
+        for topic in ("H1", "H2", "H3"):
+            record = gate._records[topic]
+            record.state = NeedState.UNLOCKED
+            record.released_turn = 1
+        gate.dig_gate_v2 = True
+        return gate
+
+    def test_a_real_dig_is_a_dig(self):
+        for text in self.REAL_DIGS:
+            with self.subTest(text=text):
+                gate = self.gate_with_needs_waiting()
+                update = gate.observe_candidate_turn(text, 9)
+                self.assertFalse(update.not_a_dig)
+                self.assertNotEqual(gate.deep_due(update), ())
+
+    def test_an_explicit_money_probe_gets_the_money_layer(self):
+        gate = self.gate_with_needs_waiting()
+        text = "Is that okay if I ask how you plan to fund it? What's your budget like?"
+        update = gate.observe_candidate_turn(text, 9)
+        self.assertIn("H3", gate.deep_due(update))
+
+    def test_a_turn_that_is_all_closing_check_still_digs_for_nothing(self):
+        for text in self.CLOSING_CHECKS:
+            with self.subTest(text=text):
+                gate = self.gate_with_needs_waiting()
+                update = gate.observe_candidate_turn(text, 9)
+                self.assertTrue(update.not_a_dig)
+                self.assertEqual(gate.deep_due(update), ())
+
+
+class FarewellExitReviewTests(unittest.TestCase):
+    """Review D3R-2 (R1_FAREWELL_EXIT_V2): a rescue after her sign-off is no mutual goodbye."""
+
+    RESCUES = (
+        "Wait, before you go, can I ask one more thing before we say goodbye?",
+        "Wait, wait, don't say bye!",
+        "Don't hang up yet, one more offer before you say bye.",
+        "Hold on, not yet, bye is too soon.",
+    )
+
+    def test_a_rescue_never_ends_on_a_farewell(self):
+        for text in self.RESCUES:
+            with self.subTest(text=text):
+                self.assertFalse(r1_roleplay.ends_on_farewell(text))
+        for text in (
+            "Thanks, you too. I'll send the invite. Good night.",
+            "Okay, talk soon!",
+            "Wait, one more thing, I'll send the brochure. Okay, bye.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_roleplay.ends_on_farewell(text))
+
+    def test_a_rescue_after_her_sign_off_reopens_the_call(self):
+        for text in self.RESCUES:
+            with self.subTest(text=text):
+                eng = done_session(r=700).eng
+                eng._last_reply_signoff = True
+                eng._enter_closing(r1_roleplay.CLOSING_WINDING)
+                reasons: list[str] = []
+                self.assertFalse(eng._read_close(text, False, reasons))
+                self.assertNotIn("mutual_goodbye", reasons)
+                self.assertEqual(eng._closing, r1_roleplay.CLOSING_OPEN)
+
+    def test_a_goodbye_after_her_sign_off_is_still_mutual(self):
+        eng = done_session(r=700).eng
+        eng._last_reply_signoff = True
+        reasons: list[str] = []
+        self.assertTrue(
+            eng._read_close("Thanks, you too. I'll send the invite. Good night.", False, reasons)
+        )
+        self.assertIn("mutual_goodbye", reasons)
+
+
+class ForeignPriceReviewTests(unittest.TestCase):
+    """Review D3R-4 (R1_FOREIGN_PRICE): a salary or package in lakhs is no course price."""
+
+    def test_a_salary_or_package_is_no_price(self):
+        from r1_negotiation import foreign_price_in
+
+        for text in (
+            "After the course you can earn 10 lakh a year.",
+            "The program has helped people get 20 lakh packages.",
+            "Companies pay 12 lakh for data scientists.",
+            "It's a rupee amount, not dollars.",
+            "It's like 20 lakh packages in the market now.",
+            "Our learners make about 15 lakh after the course.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(foreign_price_in(text))
+
+    def test_a_course_price_in_rupees_is_still_read(self):
+        from r1_negotiation import foreign_price_in
+
+        for text, want in (
+            ("The total fee is 3 lakh rupees.", "3 lakh rupees"),
+            ("You'll pay about 2 lakh for the course.", "2 lakh"),
+            ("The course costs one and a half lakh.", "one and a half lakh"),
+            ("It's around a lakh for the full program.", "a lakh"),
+            ("The price is ₹1,20,000 for the course.", "₹1,20,000"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(foreign_price_in(text), want)
+
+    def test_a_salary_pitch_leaves_the_price_unnamed(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("After the course you can earn 10 lakh a year, honestly.", 40)
+        self.assertFalse(s.eng._price_named())
+        self.assertFalse(s.eng.guard_context(free_reply=True).price_heard)
+
+
+class IntentTailTrimReviewTests(unittest.TestCase):
+    """Review D3R-5 (R1_INTENT_TAIL_V4): the trim keeps the tail's ask."""
+
+    MARKERS = IntentTailTrimTests.MARKERS
+
+    def test_the_anchor_tail_keeps_its_request(self):
+        from r1_negotiation import anchor_after_foreign
+        from r1_roleplay import _trim_tail
+
+        tail = anchor_after_foreign().variants[0]
+        spoken = "Rupees? I was thinking in dollars, I think the site said $9,000."
+        out = _trim_tail(tail, spoken, self.MARKERS)
+        self.assertIn("$7,000", out)
+        self.assertTrue(out.rstrip().endswith("Could you do that?"), out)
+
+    def test_only_sentences_said_again_go(self):
+        from r1_roleplay import _trim_tail
+
+        tail = (
+            "I thought I saw about $9,000 on the website. Someone told me they paid $7,000. "
+            "Is that something you could match?"
+        )
+        spoken = "I thought the website showed about $9,000."
+        out = _trim_tail(tail, spoken, self.MARKERS)
+        self.assertNotIn("website", out)
+        self.assertIn("Is that something you could match?", out)
+
+
+class FigureMemoryReviewTests(unittest.TestCase):
+    """Review D3R-6 (R1_FIGURE_MEMORY): taking up his $7,000 offer is no second comparison."""
+
+    def settled_session(self):
+        s = Session(engine(), reply="Okay, $7,000 works for me.")
+        s.say(OPENER, 20)
+        s.say(PITCH, 40)
+        deliver(s.eng, "F1-ANCHOR", "F1-COUNTER", r=60)
+        s.eng._anchor_comments = 1  # she compared once already
+        s.eng._advisor_amounts.add(7000)
+        s.eng._reacted_figures.add(7000)
+        return s
+
+    def test_his_offer_of_the_anchor_unsettles_the_memory(self):
+        from r1_prompts import FIGURE_REACTED_NOTE
+
+        s = self.settled_session()
+        plan = s.say("Okay, I spoke to my manager, I can do $7,000.", 600)
+        self.assertFalse(s.eng.guard_context(free_reply=True).anchor_settled)
+        self.assertNotIn(FIGURE_REACTED_NOTE.split("{amount}")[0], plan.reminder)
+        if plan.mode is TurnMode.LLM_REPLY:
+            self.assertIn("$7,000 works for me", s.spoken[-1])
+
+    def test_a_comparison_on_another_figure_is_still_dropped(self):
+        s = self.settled_session()
+        s.say("The best I can do is $8,000.", 600)
+        self.assertTrue(s.eng.guard_context(free_reply=True).anchor_settled)
+
+
+class NoPriceHeardReviewTests(unittest.TestCase):
+    """Review D3R-7 (R1_FOREIGN_PRICE): only "nobody told me the price" itself goes."""
+
+    def test_unrelated_sentences_stay(self):
+        context = d3_ctx(free_reply=True, price_heard=True)
+        for text in (
+            "I haven't heard back from my husband about the cost.",
+            "I still don't know what the monthly fee would cost.",
+            "I haven't got a clear sense of whether the fee is worth it.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, context).text, text)
+
+    def test_the_contradiction_still_goes(self):
+        context = d3_ctx(free_reply=True, price_heard=True)
+        for text in (
+            "I haven't heard what it costs.",
+            "I haven't been told the price yet.",
+            "I still don't know how much it costs.",
+        ):
+            with self.subTest(text=text):
+                out = guard_text(f"{text} Is there a payment plan?", context).text
+                self.assertIn("payment plan", out)
+                self.assertNotIn(text, out)
+
+
+class EarlyCloseByeReviewTests(unittest.TestCase):
+    """Review D3R-8 (R1_FAREWELL_EXIT_V2): her bye before an early stop is said only once the
+    candidate accepts the stop, so a "keep going" never resumes a call she has said bye to."""
+
+    BYE = "Okay, thank you so much for your time, take care, bye."
+
+    def early_close(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        deliver(s.eng, *ALL_MOVES, r=200)
+        s.reply = "Sure, that works for me."
+        plan = s.say(self.BYE, 700)
+        self.assertEqual(plan.line_id, "L-ASIDE-EARLY-CLOSE-2")
+        return s, plan
+
+    def test_no_bye_before_the_question(self):
+        _, plan = self.early_close()
+        self.assertIsNone(plan.prelude_line)
+
+    def test_a_yes_carries_her_bye_into_the_exit(self):
+        s, _ = self.early_close()
+        plan = s.say("Yes, let's stop the role-play there.", 710)
+        self.assertIs(plan.mode, TurnMode.EXIT)
+        self.assertIn(s.eng.exit_bye, r1_roleplay.LEARNER_BYE_LINES)
+        self.assertTrue(s.eng.exit_farewell)
+
+    def test_a_no_resumes_with_no_bye(self):
+        s, _ = self.early_close()
+        plan = s.say("No, let's keep going.", 710)
+        self.assertEqual(plan.line_id, "L-ASIDE-WRAP-RESUME")
+        self.assertIsNone(s.eng.exit_bye)
+        self.assertFalse(s.eng.exit_farewell)
+
+    def test_flag_off_is_the_release_before(self):
+        with d3_flags(R1_FAREWELL_EXIT_V2="0"):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            deliver(s.eng, *ALL_MOVES, r=200)
+            plan = s.say(self.BYE, 700)
+            self.assertEqual(plan.line_id, "L-ASIDE-EARLY-CLOSE")
+            self.assertIsNone(plan.prelude_line)
+            s.say("Yes, let's stop the role-play there.", 710)
+            self.assertIsNone(s.eng.exit_bye)
 
 if __name__ == "__main__":
     unittest.main()

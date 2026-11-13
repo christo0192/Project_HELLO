@@ -290,6 +290,10 @@ class UnknownNameTests(unittest.TestCase):
                 "Thank you for your time today. The hiring team will review your interview and "
                 "get back to you. You can close this window now. Goodbye."
             ),
+            # Simulation diagnosis 3 (D3-WRAP1): the close after the scripted what's-next answer.
+            "L-CLOSE-SHORT": (
+                "Thank you for your time today. You can close this window now. Goodbye."
+            ),
             "L-SIL-IB": "Are you still with me?",
             "L-REJOIN": "Welcome back. Let's pick up where we left off.",
             "L-SYSTEM-STOP": (

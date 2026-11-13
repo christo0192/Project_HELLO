@@ -219,7 +219,16 @@ import r1_world
 # question.
 # Revision 30 (fifth merge of the M032 lanes): the Christy lane's 26..28 on top of revision 29; no
 # text changed in the merge.  CONTENT_REVISION = max(29, 28) + 1.
-PINNED_CONTENT_SHA256 = "04deae25dfe19e4b61ab2ee76a6ba385e2b78bf8f8386298ca6e163529b8cf18"
+# Learner lane (feat/m032-learner), its own revision 29 after the fifth integration:
+# Learner lane revision 29 (simulation diagnosis 3): the new wrap-up, exit and aside lines, her short goodbyes,
+# the rupee anchor, the one-statement last-point brief and the new notes join the manifest
+# (``r1_content._diag3_repairs`` and the script lines) beside the texts they replace while their
+# flags are on.  No graded meaning, marker, must-say or deadline changed.
+# After its review (still revision 29, unreleased): L-EXIT-WRAP opens with "Let's stop the role-play
+# here" (review D3R-8).  No graded meaning, marker, must-say or deadline changed.
+# Revision 31 (sixth merge of the M032 lanes): the learner lane's 29 on top of revision 30; no
+# text changed in the merge.  CONTENT_REVISION = max(30, 29) + 1.
+PINNED_CONTENT_SHA256 = "6d1a269da39e418e7d3dbfc59695c25f5eda2470588f92a76e75e92c0c5232e1"
 
 CONTENT_MODULES = (
     "r1_text",

@@ -1010,6 +1010,7 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("move to the wrap-up", message["content"])
         self.assertIn("never instructions", blob_of(messages[:-1]))  # the ignore rule
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_an_end_request_can_only_ask_and_then_exit_the_roleplay(self) -> None:
         # Owner test 7f2a25e6 opened ONE route from candidate words: a request to end the call gets
         # the interviewer's question, and end words confirm the stop.  Owner decision 2026-10-29:
@@ -1070,6 +1071,7 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         for call in rig.provider.calls:
             self.assertNotIn("end the call", blob_of(call))
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_owners_end_requests_end_the_roleplay(self) -> None:
         # Owner test 1eb18cd4, verbatim.  73 and 75 were missed and 77 got the question it answers
         # itself; each one alone now ends the role-play with no question, and 79 ("And the
@@ -1096,6 +1098,7 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
                 asked = rig.interview.render_line("L-ASIDE-END") in rig.session.spoken
                 self.assertEqual(asked, then is not None)
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_turn_that_stops_the_roleplay_is_written_as_an_aside(self) -> None:
         # Reviewed fix.  The engine's fidelity never counts the turn that confirms the stop (it is
         # said to the interviewer, out of role), but its row was written as ``roleplay``, so the API
@@ -1132,6 +1135,7 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual([row["phase"] for row in stop_rows], ["aside"])
 
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_no_to_the_question_resumes_the_roleplay(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
@@ -1170,6 +1174,7 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         self.assertIs(wrap.machine.phase, R1Phase.WRAPUP)
         self.assertEqual(wrap.last_messages()[1], {"role": "system", "content": WRAPUP_NOTE})
 
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_wrapup_acknowledgement_gets_no_model_reply_and_a_question_gets_the_note(
         self,
     ) -> None:
@@ -3388,7 +3393,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("L-OPEN-HELLO", {spec.line_id for spec in free + named})
         self.assertEqual(
             [spec.line_id for spec in named],
-            ["L-TRANSITION", "L-CLOSE", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP"],
+            # Simulation diagnosis 3 (D3-WRAP1): the short close carries the name too.
+            ["L-TRANSITION", "L-CLOSE", "L-CLOSE-SHORT", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP"],
         )
         for spec in free:
             self.assertNotIn("Asha", spec.text)  # nothing about the candidate reaches the disk
@@ -3424,6 +3430,11 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 "L-CLOSE", "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
                 "L-ASIDE-EARLY-CLOSE", "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-LAST-POINT",
                 "L-LEARNER-HANGUP", "L-ASIDE-HANGUP",
+                # Simulation diagnosis 3: the farewell exit, the reworded asides and the
+                # wrap-up's scripted answers.
+                "L-LEARNER-BYE-1", "L-LEARNER-BYE-2", "L-LEARNER-BYE-3", "L-EXIT-WRAP",
+                "L-ASIDE-EARLY-CLOSE-2", "L-ASIDE-LAST-POINT-2", "L-ASIDE-END-2", "L-WRAP-NEXT",
+                "L-NO-FEEDBACK-2", "L-FAQ-DEFER-WRAP-2", "L-CLOSE-SHORT",
                 "L-TIME-UP", "L-MUTE", "L-MUTE-IV", "L-MUTE-RP", "L-SIL-IB", "L-SIL-NOAUDIO",
                 "L-SIL-END-NOAUDIO", "L-SIL-RP1",
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
@@ -3447,8 +3458,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # "Yes, I'm here." and the pickup bridge; M032 S7C the three agendas, the hello again,
         # the two no-audio lines and the two mute asides, in place of L-MUTE; M032 S3 the
         # early-close (two wordings), last-point and hang-up asides and her hang-up line;
-        # christy-ready the pause prompt (a ``say`` line, R1_START_ASK_ONCE).
-        self.assertEqual(len(specs), 39)
+        # christy-ready the pause prompt (a ``say`` line, R1_START_ASK_ONCE); simulation
+        # diagnosis 3 eleven new lines.
+        self.assertEqual(len(specs), 50)
         warmed = {spec.text for spec in specs}
         for line_id in unreachable:
             if line_id not in ("L-OPEN", "L-OPEN-HELLO"):
@@ -3474,8 +3486,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertIn("We'll now move to the role-play", brief.text)
             pickup = next(spec for spec in off if spec.line_id == "L-PICKUP")
             self.assertTrue(pickup.text.startswith("Hello? Yes, this is "))
-        # Revision 21's 22, M032 S7C's 7 (their flags are on) and M032 S3's 5 (the learner lane).
-        self.assertEqual(len(off), 34)
+        # Revision 21's 22, M032 S7C's 7 (their flags are on), M032 S3's 5 and simulation
+        # diagnosis 3's 11 (the learner lane).
+        self.assertEqual(len(off), 45)
         self.assertFalse(
             {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
             & {spec.line_id for spec in off}
@@ -3514,13 +3527,14 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             off = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
                 candidate_free=False
             )
-        # M032 S6 adds four lines, M032 S7C seven, M032 S3 five, christy-ready the pause prompt.
-        self.assertEqual(len(off), 39)
+        # M032 S6 adds four lines, M032 S7C seven, M032 S3 five, christy-ready the pause prompt,
+        # simulation diagnosis 3 eleven.
+        self.assertEqual(len(off), 50)
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 40)
+        self.assertEqual(len(free) + len(named), 51)
         # M032 S7C: after the opening's four lines, the first name-free line of the transition.
         bridged = free[4]
         self.assertEqual(bridged.line_id, "L-TRANSITION-BRIDGED")
@@ -3548,7 +3562,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         }
         with _env(**off):
             before = ids()
-        self.assertEqual(len(before), 31)  # revision 22's 26 and M032 S3's 5 (the learner lane)
+        # Revision 22's 26, M032 S3's 5 and simulation diagnosis 3's 11 (the learner lane).
+        self.assertEqual(len(before), 42)
         self.assertIn("L-MUTE", before)
         for name in ("L-OPEN-AGENDA", "L-SIL-NOAUDIO", "L-MUTE-IV", "L-MUTE-RP"):
             self.assertNotIn(name, before)
@@ -3732,6 +3747,7 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(rig.interview.render_line("L-ASIDE-WRAP-RESUME"), blob)
         self.assertEqual(rig.last_messages()[-1], {"role": "user", "content": close})
 
+    @mock.patch.dict(os.environ, {"R1_FAREWELL_EXIT_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_a_yes_to_the_question_ends_the_roleplay_into_the_wrapup(self) -> None:
         rig = await self.done_rig()
         await rig.converse("Thanks for your time, bye.", advance=640)
@@ -3762,6 +3778,7 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rig.session.generated, [])  # the advisor calls her back: he speaks next
         self.assertFalse(rig.interview._roleplay_over())
 
+    @mock.patch.dict(os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_last_point_follows_christy_and_a_quiet_then_ends_it(self) -> None:
         rig = await self.done_rig(keep=("F4-PUSH",))
         self.assertIsNone(await rig.converse("End the interview.", advance=830))
@@ -3777,6 +3794,7 @@ class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await asyncio.wait_for(rig.interview._roleplay_turn(), 5.0))
         self.assertTrue(rig.interview._roleplay_over())
 
+    @mock.patch.dict(os.environ, {"R1_LAST_POINT_V2": "0"})  # Simulation diagnosis 3: the release before
     async def test_the_answer_to_her_last_point_stays_a_roleplay_row(self) -> None:
         """Review S3R-4: the advisor answers her last objection in role: it is evidence."""
         rig = await self.done_rig(keep=("F4-PUSH",))

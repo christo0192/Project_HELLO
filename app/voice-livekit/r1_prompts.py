@@ -269,6 +269,13 @@ PRESSURE_EASED_NOTE = (
     "- The advisor just gave you time. Acknowledge it warmly in a few words and do not bring up "
     "the earlier pressure again."
 )
+# Simulation diagnosis 3 (D3-LRN-ACK1, flag R1_EASED_ACK_V2): "Acknowledge it warmly" came out as
+# "Thanks for giving me the time / room / space" in three calls, also on turns that added urgency.
+PRESSURE_EASED_NOTE_V2 = (
+    "- The advisor eased off. You may let it go in two or three words (e.g. \"Okay, thanks.\"); "
+    "do not thank them for giving you time, space or room, and do not bring up the earlier "
+    "pressure again."
+)
 # M032 SWEEP-1 (flag R1_PUSH_AFTER_REACTION): the advisor just answered the objection her last
 # line raised, and its push waits a turn, so this reply reacts to that answer (in every role-play
 # the push came on the very next line, after a token "[ack], but").  It asks or says how it lands
@@ -736,6 +743,25 @@ FIGURE_CHALLENGE_NOTE = (
     "up, do not use that figure again, and ask them in a few words what the right one is; raise "
     "nothing new this turn."
 )
+# Simulation diagnosis 3 (D3-LRN-CURIO1, flag R1_CURIOSITY_TIMING): the advisor asked for the next
+# step (a call time, a payment, a commitment) or one is on record, and she answered with a new
+# curiosity question ("Before we get to timing, how many people are in a batch?").
+NEXT_STEP_ANSWER_NOTE = (
+    "- Answer their question about the next step in line with what you already decided; ask "
+    "nothing new."
+)
+# Simulation diagnosis 3 (D3-LRN-MONEY1, flag R1_FIGURE_MEMORY): he repeated a figure she already
+# reacted to ("$7,000 is in line with what I'd heard" four turns in a row).
+FIGURE_REACTED_NOTE = (
+    "- You already reacted to {amount}; do not comment on it or compare it with what you heard "
+    "again; respond to the rest of what they said or move the conversation on."
+)
+# Simulation diagnosis 3 (D3-LRN-FIG1, flag R1_FIGURE_NOT_MINE): he said she used a length that
+# neither of them said, and she apologised for a mix-up that never happened.
+FIGURE_NOT_MINE_NOTE = (
+    "- They say you used a figure you never mentioned. Say briefly and politely that you don't "
+    "think you said that, then carry on with what you were discussing."
+)
 # SWEEP-21: one check, as a question, when the advisor's price differs from the website's or from
 # his own earlier offer (each figure once, at most twice a call).
 PRICE_CONFLICT_WEBSITE_NOTE = (
@@ -921,13 +947,33 @@ WRAPUP_CANNOT_ANSWER_NOTE = (
 )
 
 
+# Simulation diagnosis 3 (D3-WRAP1, R1_WRAPUP_NEXT_STEPS): "say it has been noted" came back as
+# "noted" in the next reply too ("Noted, and thanks for saying so." to "No questions, thanks.").
+WRAPUP_NOTED_SENTENCE = (
+    "acknowledge how they feel in one warm sentence, thank them for saying so and say it has been "
+    "noted."
+)
+WRAPUP_NOTED_SENTENCE_V2 = (
+    "acknowledge it in one warm, specific sentence (e.g. that it felt rushed), without the word "
+    "noted."
+)
+
+
 def wrapup_reminder(
-    *, answers: bool = False, one_mention: bool = False, next_round: bool = False
+    *,
+    answers: bool = False,
+    one_mention: bool = False,
+    next_round: bool = False,
+    next_steps: bool = False,
 ) -> str:
     """The wrap-up reminder with the M032 SWEEP-26 sentences its flags turn on (all off: as before).
 
-    ``next_round`` only counts with ``answers`` (it picks the what's-left sentence).
+    ``next_round`` only counts with ``answers`` (it picks the what's-left sentence).  ``next_steps``
+    (D3-WRAP1) asks for a specific acknowledgement of a complaint instead of "it has been noted".
     """
+    base = WRAPUP_REMINDER
+    if next_steps:
+        base = base.replace(WRAPUP_NOTED_SENTENCE, WRAPUP_NOTED_SENTENCE_V2, 1)
     added: list[str] = []
     if answers:
         line = WRAPUP_NEXT_ROUND_LINE if next_round else WRAPUP_EVERYTHING_LINE
@@ -935,10 +981,8 @@ def wrapup_reminder(
     if one_mention:
         added.append(WRAPUP_CANNOT_ANSWER_NOTE.format(line=LINES["L-FAQ-DEFER-WRAP"]))
     if not added:
-        return WRAPUP_REMINDER
-    return WRAPUP_REMINDER.replace(
-        WRAPUP_ANSWER_SENTENCE, " ".join((WRAPUP_ANSWER_SENTENCE, *added)), 1
-    )
+        return base
+    return base.replace(WRAPUP_ANSWER_SENTENCE, " ".join((WRAPUP_ANSWER_SENTENCE, *added)), 1)
 
 
 # The phases whose replies answer the candidate's questions after the role-play.
@@ -1098,6 +1142,7 @@ def interviewer_reminder(
     wrapup_answers: bool = False,
     wrapup_one_mention: bool = False,
     wrapup_next_round: bool = False,
+    wrapup_next_steps: bool = False,
 ) -> str | None:
     """The ephemeral note for an interviewer-phase reply (``None`` where the prefix is enough).
 
@@ -1112,6 +1157,7 @@ def interviewer_reminder(
         wrapup_answers=wrapup_answers,
         wrapup_one_mention=wrapup_one_mention,
         wrapup_next_round=wrapup_next_round,
+        wrapup_next_steps=wrapup_next_steps,
     )
     if base is None:
         return None
@@ -1128,6 +1174,7 @@ def _phase_reminder(
     wrapup_answers: bool = False,
     wrapup_one_mention: bool = False,
     wrapup_next_round: bool = False,
+    wrapup_next_steps: bool = False,
 ) -> str | None:
     """The phase's own note, before M032 S5's rider.
 
@@ -1151,7 +1198,10 @@ def _phase_reminder(
         return GETTING_TO_KNOW_YOU_NOTE
     if phase in _WRAPUP_PHASES:
         return wrapup_reminder(
-            answers=wrapup_answers, one_mention=wrapup_one_mention, next_round=wrapup_next_round
+            answers=wrapup_answers,
+            one_mention=wrapup_one_mention,
+            next_round=wrapup_next_round,
+            next_steps=wrapup_next_steps,
         )
     if phase in _TRANSITION_PHASES:
         return TRANSITION_REMINDER_REPAIRED if transition_repair_enabled() else TRANSITION_REMINDER

@@ -138,6 +138,8 @@ from r1_guard import (
     StreamGuard,
     advisor_terms_in,
     advisor_text_of,
+    asks_whats_included,
+    compares_with_anchor,
     course_length_unsaid,
     durations_said,
     echoed_need_topics,
@@ -169,10 +171,13 @@ from r1_negotiation import (
     YOUR_NUMBER_COUNTER_SUFFIX,
     YOUR_NUMBER_MONTHLY,
     AnchorSituation,
+    anchor_after_foreign,
     anchor_after_free,
     anchor_after_stated,
     anchor_check,
     asks_price,
+    foreign_price_in,
+    mask_foreign_prices,
     conflict_counter,
     money_spec,
     price_cue,
@@ -246,6 +251,9 @@ from r1_prompts import (
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
     FIGURE_CHALLENGE_NOTE,
+    FIGURE_NOT_MINE_NOTE,
+    FIGURE_REACTED_NOTE,
+    NEXT_STEP_ANSWER_NOTE,
     FINAL_ASKED_NOTE,
     FLOOR_NOTE,
     PROPOSAL_UNANSWERED_NOTE,
@@ -301,6 +309,7 @@ from r1_prompts import (
     OFFER_TERMS_IN_PARTS,
     OFFER_TERMS_INSTALMENTS,
     PRESSURE_EASED_NOTE,
+    PRESSURE_EASED_NOTE_V2,
     PRICE_MET_NOTE,
     PRICE_UNCHANGED_NOTE,
     PUSH_REACT_NOTE,
@@ -358,6 +367,7 @@ from r1_scheduler import (
     TIME_CUE_SEC,
     IDLE_GAP_TURNS,
     LAST_POINT_BRIEF,
+    LAST_POINT_BRIEF_V2,
     PLAN,
     REDIRECT_BRIEF,
     REDIRECT_OPENERS,
@@ -429,6 +439,7 @@ from r1_text import (
     is_closer,
     is_hollow_turn,
     is_sign_off,
+    later_price_threat,
     normalize,
     not_deciding,
     pick_variant,
@@ -641,7 +652,53 @@ EARLY_CLOSE_ASK_LIMIT = 2
 EARLY_CLOSE_LINE = "L-ASIDE-EARLY-CLOSE"
 EARLY_CLOSE_TIME_LINE = "L-ASIDE-EARLY-CLOSE-TIME"
 LAST_POINT_LINE = "L-ASIDE-LAST-POINT"
+# D3-END1 (R1_LAST_POINT_V2): the reworded aside that shows the request was heard, and the
+# primaries a last point may raise.
+LAST_POINT_LINE_V2 = "L-ASIDE-LAST-POINT-2"
+_LAST_POINT_PRIMARIES = frozenset({F2_PRIMARY, F3_PRIMARY, F4_PRIMARY})
 HANGUP_LINE = "L-LEARNER-HANGUP"
+# D3-EXIT1 / D3-ASIDE1 (R1_FAREWELL_EXIT_V2): her short scripted goodbye (her voice, rotated), and
+# the reworded early-close aside; D3-ASIDE1 (a) (R1_END_ASIDE_V2): the yes/no end aside's text.
+LEARNER_BYE_LINES = ("L-LEARNER-BYE-1", "L-LEARNER-BYE-2", "L-LEARNER-BYE-3")
+LEARNER_BYE_YOU_TOO = "L-LEARNER-BYE-1"
+_WISHES_HER = re.compile(
+    r"\b(?:take care|have a (?:good|great|nice|lovely)|all the best|good luck|enjoy|"
+    r"nice (?:talking|speaking|chatting)|good night)\b",
+    re.IGNORECASE,
+)
+EARLY_CLOSE_LINE_V2 = "L-ASIDE-EARLY-CLOSE-2"
+END_ASIDE_TEXT_V2 = "L-ASIDE-END-2"
+_FAREWELL_END = re.compile(
+    r"\b(?:good ?night|good ?bye|bye(?: bye| now| for now)?|take care|talk (?:to you )?soon|"
+    r"speak (?:to you )?(?:soon|tomorrow|later)|see you|have a (?:good|great|nice|lovely) "
+    r"(?:day|evening|night|weekend|one))\W*$",
+    re.IGNORECASE,
+)
+
+
+# Review D3R-2: a last sentence that holds her back ("Wait, wait, don't say bye!", "one more offer
+# before you say bye") is a rescue, never a goodbye.
+_FAREWELL_RESCUE = re.compile(
+    r"\b(?:don'?t|do not|wait|hold on|hang on|not yet|before (?:we|you|i)|one more|one last|"
+    r"another (?:thing|question|offer)|too soon|stay)\b",
+    re.IGNORECASE,
+)
+
+
+def ends_on_farewell(text: object) -> bool:
+    """D3-EXIT1: the last sentence of the advisor's turn takes leave ("..., good night.").
+
+    Review D3R-2: not a question and not a rescue ("Wait, before you go, can I ask one more thing
+    before we say goodbye?"): those keep the call going."""
+    sentences = split_sentences(str(text or ""))
+    if not sentences:
+        return False
+    last = fold(sentences[-1])
+    return (
+        _FAREWELL_END.search(last) is not None
+        and "?" not in last
+        and _FAREWELL_RESCUE.search(last) is None
+    )
 HANGUP_ASIDE_LINE = "L-ASIDE-HANGUP"
 HANGUP_LIMIT = 2
 # M032 SWEEP-33 (R1_FLOOR_YIELD): at most this many scripted yields a session; the pairs rotate.
@@ -837,7 +894,62 @@ FLAG_NO_BARE_REPROACH = "R1_NO_BARE_REPROACH"
 #   only when neither of her last ``STALL_GAP_REPLIES`` replies said it.
 FLAG_TANGENT = "R1_TANGENT"
 FLAG_STALL_GAP = "R1_STALL_GAP"
+# Simulation diagnosis 3 (the int-live-3 flow judge; each defaults ON and OFF restores the release
+# before):
+# * R1_WRAPUP_NEXT_STEPS (D3-WRAP1): "what happens next?" in the wrap-up gets the scripted
+#   L-WRAP-NEXT and L-CLOSE-SHORT (no model call), a feedback ask a scripted refusal that is never
+#   said twice, a lead-in is no answer, and "No questions from me, thanks." closes.
+# * R1_LAST_POINT_V2 (D3-END1): the late end request plays the last point only for an undelivered
+#   family's primary whose reason she has not voiced, and the role-play ends after it by itself.
+# * R1_FAREWELL_EXIT_V2 (D3-EXIT1): a role-play ended by the advisor's goodbye gets her short
+#   scripted goodbye first and one merged L-EXIT-WRAP; a goodbye after her sign-off that ends on a
+#   farewell is mutual, and her own goodbye is kept after his courtesy-only turn.
+# * R1_FOREIGN_PRICE (D3-LRN-PRICE1): a course price named in rupees or lakhs is a price named.
+# * R1_INTENT_TAIL_V4 (D3-LRN-TAIL1): a scripted tail never restates what her reply already said.
+# * R1_QUESTION_DIET_V2 (D3-LRN-QDIET): the question diet drops only a new-topic question.
+# * R1_FIGURE_MEMORY (D3-LRN-MONEY1): no second comment on a figure she already reacted to.
+# * R1_CURIOSITY_TIMING (D3-LRN-CURIO1): no curiosity topic on a commitment, scheduling or payment
+#   ask, after a commitment is on record, while the call is closing or near the time cue.
+# * R1_EASED_ACK_V2 (D3-LRN-ACK1): the eased-off note only after real pressure, never beside new
+#   urgency or a question, and never "thanks for giving me the time".
+# * R1_DIG_GATE_V2 (D3-LRN-DUMP1): a deep need is released only by a genuine open dig.
+# * R1_FIGURE_NOT_MINE (D3-LRN-FIG1): "I never said six months" when she never said it either.
+# * R1_END_ASIDE_V2 and R1_COACH_AFTER_INROLE (D3-ASIDE1): a yes/no end aside, and the coach aside
+#   only when the role confusion persists after her own in-role correction.
+FLAG_WRAPUP_NEXT_STEPS = "R1_WRAPUP_NEXT_STEPS"
+FLAG_LAST_POINT_V2 = "R1_LAST_POINT_V2"
+FLAG_FAREWELL_EXIT_V2 = "R1_FAREWELL_EXIT_V2"
+FLAG_FOREIGN_PRICE = "R1_FOREIGN_PRICE"
+FLAG_INTENT_TAIL_V4 = "R1_INTENT_TAIL_V4"
+FLAG_QUESTION_DIET_V2 = "R1_QUESTION_DIET_V2"
+FLAG_FIGURE_MEMORY = "R1_FIGURE_MEMORY"
+FLAG_CURIOSITY_TIMING = "R1_CURIOSITY_TIMING"
+FLAG_EASED_ACK_V2 = "R1_EASED_ACK_V2"
+FLAG_DIG_GATE_V2 = "R1_DIG_GATE_V2"
+FLAG_FIGURE_NOT_MINE = "R1_FIGURE_NOT_MINE"
+FLAG_END_ASIDE_V2 = "R1_END_ASIDE_V2"
+FLAG_COACH_AFTER_INROLE = "R1_COACH_AFTER_INROLE"
 STALL_GAP_REPLIES = 2
+# D3-LRN-MONEY1 (R1_FIGURE_MEMORY): "what's included" is asked at most once in this many replies
+# unless the advisor named a new figure since.
+INCLUDED_REPLIES = 3
+# D3-LRN-ACK1 (R1_EASED_ACK_V2): a pressure worry of hers this many turns back or fewer is eased.
+EASED_PRESSURE_TURNS = 2
+# D3-ASIDE1 (b): after the coach aside, her next replies carry no role-confusion note (the aside
+# explained the roles already).
+COACH_QUIET_REPLIES = 2
+# D3-LRN-CURIO1 (R1_CURIOSITY_TIMING): no curiosity topic in the last two minutes before the time
+# cue, and one on a check-in after 14:00.
+CURIOSITY_CUTOFF_BEFORE_CUE_SEC = 120
+LATE_CHECKIN_SEC = 840
+
+
+def _adds_pressure(text: str) -> bool:
+    """D3-LRN-ACK1: the advisor's turn adds urgency (a lever, a coercive line, a later price)."""
+    levers, coercive = urgency_levers(text)
+    return bool(levers) or coercive or any(
+        later_price_threat(sentence) for sentence in split_sentences(text)
+    )
 # The advisor turns whose words she may echo (R1_ECHO_GUARD).
 ADVISOR_TERM_TURNS = 4
 # R1_PRICE_ASKED_ONCE: the replies after her final-price question that are told not to ask it again.
@@ -902,6 +1014,19 @@ _FLAG_READS = {
     FLAG_NO_BARE_REPROACH: lambda: os.getenv("R1_NO_BARE_REPROACH"),
     FLAG_TANGENT: lambda: os.getenv("R1_TANGENT"),
     FLAG_STALL_GAP: lambda: os.getenv("R1_STALL_GAP"),
+    FLAG_WRAPUP_NEXT_STEPS: lambda: os.getenv("R1_WRAPUP_NEXT_STEPS"),
+    FLAG_LAST_POINT_V2: lambda: os.getenv("R1_LAST_POINT_V2"),
+    FLAG_FAREWELL_EXIT_V2: lambda: os.getenv("R1_FAREWELL_EXIT_V2"),
+    FLAG_FOREIGN_PRICE: lambda: os.getenv("R1_FOREIGN_PRICE"),
+    FLAG_INTENT_TAIL_V4: lambda: os.getenv("R1_INTENT_TAIL_V4"),
+    FLAG_QUESTION_DIET_V2: lambda: os.getenv("R1_QUESTION_DIET_V2"),
+    FLAG_FIGURE_MEMORY: lambda: os.getenv("R1_FIGURE_MEMORY"),
+    FLAG_CURIOSITY_TIMING: lambda: os.getenv("R1_CURIOSITY_TIMING"),
+    FLAG_EASED_ACK_V2: lambda: os.getenv("R1_EASED_ACK_V2"),
+    FLAG_DIG_GATE_V2: lambda: os.getenv("R1_DIG_GATE_V2"),
+    FLAG_FIGURE_NOT_MINE: lambda: os.getenv("R1_FIGURE_NOT_MINE"),
+    FLAG_END_ASIDE_V2: lambda: os.getenv("R1_END_ASIDE_V2"),
+    FLAG_COACH_AFTER_INROLE: lambda: os.getenv("R1_COACH_AFTER_INROLE"),
 }
 
 
@@ -1243,6 +1368,16 @@ class RolePlayEngine:
         # holds nothing private and Christy's natural sentences reuse its wording).
         self._interviewer_control = interviewer_control_prose()
         self.exit_requested = False
+        # D3-EXIT1 (R1_FAREWELL_EXIT_V2): the role-play ended on the advisor's goodbye
+        # (``exit_farewell``: the session merges L-EXIT and L-WRAP), and her short goodbye that
+        # goes first when her last line was no goodbye (``exit_bye``, a line id).
+        self.exit_farewell = False
+        self.exit_bye: str | None = None
+        self._courtesy_after_signoff = False
+        # D3-ASIDE1 (b) (R1_COACH_AFTER_INROLE): the turn her in-role correction of a role mix-up
+        # was planned, and the turn the coach aside played.
+        self._inrole_corrected: int | None = None
+        self._coach_turn: int | None = None
         # Repetition control: every learner sentence actually played, so the guard can drop
         # a sentence the learner already said; and how often a rotating line was used.
         self._spoken = SpokenMemory()
@@ -1403,6 +1538,28 @@ class RolePlayEngine:
         self._tangent_now = False
         self._tangent_turns = 0
         self._tangent_holds: dict[str, int] = {}
+        # Simulation diagnosis 3: the turn the advisor last named a figure (D3-LRN-QDIET,
+        # D3-LRN-MONEY1), her comparisons with the $7,000 or what she heard once the price was
+        # settled, and the turn of her last "what's included" question (R1_FIGURE_MEMORY).
+        self._figure_turn = -1
+        self._anchor_comments = 0
+        self._included_turn: int | None = None
+        # The advisor's figures she has named back in a heard line (memory only: amounts), and the
+        # notes that kept her off them (a count).
+        self._reacted_figures: set[int] = set()
+        self._figure_memory_notes = 0
+        # Review D3R-6: the advisor named the $7,000 (or less) this turn.
+        self._anchor_named_now = False
+        # Review D3R-8: her goodbye held back until the early-close stop is taken (a line id).
+        self._early_close_bye: str | None = None
+        # D3-LRN-ACK1 (R1_EASED_ACK_V2): the turn of her last pressure worry.
+        self._pressure_turn: int | None = None
+        # D3-LRN-FIG1 (R1_FIGURE_NOT_MINE): challenges of a length she never said (a count).
+        self._figures_not_mine = 0
+        # D3-LRN-CURIO1: curiosity topics handed over on a check-in after LATE_CHECKIN_SEC.
+        self._late_checkin_topics = 0
+        # D3-LRN-PRICE1 (R1_FOREIGN_PRICE): the turn the advisor last named the price in rupees.
+        self._foreign_price_turn: int | None = None
         # R1_STALL_GAP: per heard reply, whether it said a stall (not today, think it over).
         self._stall_said: list[bool] = []
         # M032 S2 (learner voice).  SWEEP-13's prefix sentence is latched for the session (the
@@ -1440,6 +1597,7 @@ class RolePlayEngine:
         # Item 8 (counts only): scripted tails appended to an intent reply, and how many of them
         # followed model text that had already asked a question.
         self._tails_appended = 0
+        self._tails_trimmed = 0  # D3-LRN-TAIL1: tails cut to what her reply had not said
         self._tails_after_question = 0
         # Simulation diagnosis 2 (HF3, U1): how many of those tails were a short completion.
         self._completion_tails = 0
@@ -1767,6 +1925,31 @@ class RolePlayEngine:
                 or asks_her_directly(self._turn_reading)
             ),
             choice_offered=self._choice_offered,
+            question_diet_v2=flag_on(FLAG_QUESTION_DIET_V2),
+            followup_terms=(
+                self._advisor_term_turns[-1]
+                if phase == "roleplay" and self._advisor_term_turns
+                else frozenset()
+            ),
+            figure_now=self._figure_turn == self.turn,
+            figure_memory=flag_on(FLAG_FIGURE_MEMORY),
+            anchor_settled=(
+                self.scheduler.is_delivered(F1_ANCHOR)
+                and self.scheduler.is_delivered(F1_COUNTER)
+                and not self._price_met_or_offered()
+            ),
+            anchor_comments=self._anchor_comments,
+            included_recent=(
+                self._included_turn is not None
+                and self.turn - self._included_turn <= INCLUDED_REPLIES
+                and self._figure_turn <= self._included_turn
+            ),
+            eased_ack_v2=flag_on(FLAG_EASED_ACK_V2),
+            price_heard=(
+                phase == "roleplay" and flag_on(FLAG_FOREIGN_PRICE) and self._price_named()
+            ),
+            # D3-WRAP1: a lead-in is no answer in Christy's wrap-up and closing.
+            next_steps=phase in ONE_MENTION_PHASES and flag_on(FLAG_WRAPUP_NEXT_STEPS),
         )
 
     def _offer_on_table(self) -> int | None:
@@ -2077,7 +2260,7 @@ class RolePlayEngine:
         kept_half, self._floor_half = self._floor_half, None
         if split is None and kept_half is not None and carried is None:
             split = kept_half
-        if self._wants_aside(break_kind):
+        if self._wants_aside(break_kind) and not self._inrole_first(break_kind):
             return self._aside_plan(break_kind or "ai", r_sec, turn_index)
         # M032 S2 item 7: the first turn after the coach aside (its turn is not in her context).
         self._turn_s2_undo = (
@@ -2109,6 +2292,7 @@ class RolePlayEngine:
         self.turn += 1
         turn = self.turn
         self.last_r = r_sec
+        self._courtesy_after_signoff = False
         self._notes = []
         self._price_notes = []
         self._nothing_granted = False
@@ -2163,14 +2347,34 @@ class RolePlayEngine:
             and not worry_answered(worry, reading)
         )
         self.tracker.gate.wide_followup = flag_on(FLAG_DIG_FIRST)
+        self.tracker.gate.dig_gate_v2 = flag_on(FLAG_DIG_GATE_V2)
         tangent_on = flag_on(FLAG_TANGENT)
         self.tracker.gate.small_talk = tangent_on
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         known = (len(self._advisor_amounts), len(self._answered))
-        self._advisor_amounts.update(
-            advisor_amounts_in(candidate_text, shorthand=self._probe_first)
-        )
+        # D3-LRN-PRICE1 (R1_FOREIGN_PRICE): a price in rupees is a price named, and no dollar
+        # reader takes "fifteen thousand rupees" for $15,000.
+        priced = candidate_text
+        foreign = foreign_price_in(candidate_text) if flag_on(FLAG_FOREIGN_PRICE) else None
+        if foreign is not None:
+            self._foreign_price_turn = turn
+            priced = mask_foreign_prices(candidate_text)
+        amounts_now = advisor_amounts_in(priced, shorthand=self._probe_first)
+        self._advisor_amounts.update(amounts_now)
         self._advisor_hours.update(hours_said(candidate_text))
+        if amounts_now or foreign is not None:
+            self._figure_turn = turn  # D3: he put a figure on the table this turn
+        self._anchor_named_now = any(amount <= ANCHOR_USD for amount in amounts_now)
+        if (
+            amounts_now
+            and flag_on(FLAG_FIGURE_MEMORY)
+            and set(amounts_now) <= self._reacted_figures
+            and not self._price_met_or_offered()
+        ):
+            # D3-LRN-MONEY1: he said again a figure she already reacted to, and nothing new.
+            amount = format_usd(max(amounts_now))
+            self._notes.append(FIGURE_REACTED_NOTE.format(amount=amount))
+            self._figure_memory_notes += 1
         self._advisor_term_turns = [
             *self._advisor_term_turns[-(ADVISOR_TERM_TURNS - 1) :],
             advisor_terms_in(reading),
@@ -2184,7 +2388,7 @@ class RolePlayEngine:
             # SWEEP-17 item 4: the course lengths the advisor said, and a price he stated without
             # a "$" ("the price is 9000"), are figures she may refer to.
             self._advisor_months.update(durations_said(candidate_text))
-            stated = stated_price_usd(candidate_text)
+            stated = stated_price_usd(priced)
             if stated is not None:
                 self._advisor_amounts.add(stated)
         self._price_talk = quotes_price(reading)
@@ -2192,7 +2396,7 @@ class RolePlayEngine:
         for topic in answered_topics(reading):
             if topic not in self._answered:
                 self._answered.append(topic)
-        negotiated = self._observe_negotiation(candidate_text, turn)
+        negotiated = self._observe_negotiation(priced, turn)
         self._read_email_agreement(reading, negotiated, turn)
         if flag_on(FLAG_STALL_MEMORY) and promises_to_send(reading):
             self._advisor_promised_email = True
@@ -2325,6 +2529,13 @@ class RolePlayEngine:
             if decision.action == "exit":
                 self.exit_requested = True
                 reasons.append("close_attempt_exit")
+                if flag_on(FLAG_FAREWELL_EXIT_V2):
+                    # D3-EXIT1: the advisor's goodbye ended the call: she says bye back first
+                    # (unless her last line was one) and the exit and wrap-up are one line.
+                    self.exit_farewell = True
+                    if not self._last_reply_closer:
+                        self.exit_bye = self._learner_bye()
+                        reasons.append("learner_bye")
                 return self._plan(TurnMode.EXIT, reasons)
         if held_close:
             owed_now = self.scheduler.select(r_sec)
@@ -2667,7 +2878,7 @@ class RolePlayEngine:
             # SWEEP-17 item 6: "I never said six months" with no owed move to hold: she still owns
             # the mix-up instead of saying the figure again.
             self._figure_challenges += 1
-            self._notes.append(FIGURE_CHALLENGE_NOTE)
+            self._notes.append(self._figure_challenge_note(reading))
         reflex = "" if not self._probe_first else self._price_reflex_note(reading)
         if reflex:
             reasons.append("price_reflex")
@@ -2689,6 +2900,12 @@ class RolePlayEngine:
         # M032 S1 item 4: a turn that left something open for her hands over no curiosity topic;
         # her reply answers it (a check-in still asks for one real question).
         responding = respond and bool(kinds) and not self._force_curiosity
+        # D3-LRN-CURIO1 (R1_CURIOSITY_TIMING): no new curiosity topic while he asks for the next
+        # step or the call is closing; her reply answers in line with what she decided.
+        closed = not quiet and self._curiosity_closed(r_sec)
+        if closed and (self._turn_ask is not None or self._commitment_level is not None):
+            self._notes.append(NEXT_STEP_ANSWER_NOTE)
+            reasons.append("curiosity_closed")
         if come_back or your_number or opening:
             # M032 SWEEP-7: the come-back is this reply's one question, and SWEEP-6's answer and
             # SWEEP-9's opening are its one job; no curiosity hand-over or check-in note.  The
@@ -2698,7 +2915,9 @@ class RolePlayEngine:
         elif self._force_curiosity and not quiet:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
             # reaction and one real question, never the stall.
-            curiosity = self._curiosity_for_free_reply(force=True)
+            curiosity = self._curiosity_for_free_reply(force=True, skip=closed)
+            if curiosity and r_sec >= LATE_CHECKIN_SEC and flag_on(FLAG_CURIOSITY_TIMING):
+                self._late_checkin_topics += 1  # D3-LRN-CURIO1: one late check-in topic a call
             # L1: before the 17:00 time cue an empty pool still gets the ordinary check-in (an
             # honest reaction, a question only if she has one), never "say you have no more".
             # M032 SWEEP-27: after her time cue a check-in is told she has no more questions.
@@ -2710,7 +2929,7 @@ class RolePlayEngine:
             figure = flag_on(FLAG_TIC_V2) and (
                 bool(negotiated.offers) or bool(self._implausible_note)
             )
-            curiosity = self._curiosity_for_free_reply(skip=figure or bool(reflex))
+            curiosity = self._curiosity_for_free_reply(skip=figure or bool(reflex) or closed)
         return self._plan(
             TurnMode.LLM_REPLY,
             reasons,
@@ -2952,6 +3171,28 @@ class RolePlayEngine:
             return False
         return break_kind == "coach" or self._ai_questions >= 1
 
+    def _learner_bye(self) -> str:
+        """D3-EXIT1: her short goodbye back (a line id), rotated; "You too, bye!" only when he
+        wished her something ("take care", "have a good evening")."""
+        options = LEARNER_BYE_LINES
+        if _WISHES_HER.search(fold(str(self._turn_reading or ""))) is None:
+            options = tuple(item for item in LEARNER_BYE_LINES if item != LEARNER_BYE_YOU_TOO)
+        return pick_variant(options, self.seed, self.turn)
+
+    def _inrole_first(self, break_kind: str | None) -> bool:
+        """D3-ASIDE1 (b) (R1_COACH_AFTER_INROLE): a first role mix-up ("I'm planning to buy one of
+        your products") is corrected by her in role (ROLE_CONFUSION_NOTE); the coach aside plays
+        only when it persists on a later turn, so the roles are never explained twice in a row."""
+        if (
+            break_kind != "coach"
+            or not self._role_confused
+            or not flag_on(FLAG_COACH_AFTER_INROLE)
+            or self._inrole_corrected is not None
+        ):
+            return False
+        self._inrole_corrected = self.turn
+        return True
+
     def _aside_plan(self, kind: str, r_sec: float, turn_index: int | None) -> TurnPlan:
         """L-ASIDE-COACH, spoken by the interviewer; the turn is excluded from evidence.
 
@@ -2959,6 +3200,7 @@ class RolePlayEngine:
         role-play clock is the session's to pause, and nothing in the schedule moves.
         """
         self._coach_played = True
+        self._coach_turn = self.turn
         self._after_coach = True  # M032 S2 item 7: the next reply carries on, no new greeting
         self._asides.append(
             {"kind": kind, "after_roleplay_turn": self.turn, "transcript_turn": turn_index}
@@ -3001,7 +3243,12 @@ class RolePlayEngine:
         return self._plan(
             TurnMode.SAY_ONLY,
             ["aside_end_request"] + (["end_intent_model"] if by_model else []),
-            scripted=script_line("L-ASIDE-END", **self.persona.line_values),
+            # D3-ASIDE1 (a) (R1_END_ASIDE_V2): a yes/no question instead of the magic phrase; the
+            # line id (and its answer handling: a settled bare yes confirms) is unchanged.
+            scripted=script_line(
+                END_ASIDE_TEXT_V2 if flag_on(FLAG_END_ASIDE_V2) else "L-ASIDE-END",
+                **self.persona.line_values,
+            ),
             voice="interviewer",
             aside=True,
             line_id="L-ASIDE-END",
@@ -3095,6 +3342,14 @@ class RolePlayEngine:
             return False
         return flag_on(FLAG_PRICE_ASKED_ONCE)
 
+    def _price_met_or_offered(self) -> bool:
+        """Review D3R-6: the advisor named the $7,000 (or less) this turn, or his best offer
+        already meets it: her taking it up ("If you can do $7,000, I'm in.") is no comparison to
+        drop, and a note that she already reacted to the figure would contradict the price-met
+        note."""
+        best = self.negotiation.best_offer_usd
+        return self._anchor_named_now or (best is not None and best <= ANCHOR_USD)
+
     def _abuse_hangs_up(self, text: str) -> bool:
         """S3.4: ``text`` is abuse aimed at her that the hang-up below would answer now."""
         return (
@@ -3127,6 +3382,13 @@ class RolePlayEngine:
         mutual = (
             not close_attempt and not handover and signed_off and courtesy_goodbye(reading)
         )
+        if flag_on(FLAG_FAREWELL_EXIT_V2):
+            # D3-EXIT1: after her sign-off, a goodbye that recaps or promises first and ENDS on a
+            # farewell ("Thanks, you too. I'll send that invite right away. Good night.") is
+            # mutual too; and her reply to a courtesy-only turn keeps her own goodbye.
+            self._courtesy_after_signoff = signed_off and courtesy
+            if not close_attempt and not handover and signed_off and ends_on_farewell(reading):
+                mutual = True
         if handover:
             self._handover_closes += 1
             reasons.append("handover_close")
@@ -3219,6 +3481,9 @@ class RolePlayEngine:
         (``continuation_plan``); answered like L-ASIDE-WRAP (``_wrap_answer_plan``).
         """
         line_id = EARLY_CLOSE_TIME_LINE if r_sec < FIDELITY_MIN_R_SEC else EARLY_CLOSE_LINE
+        farewell_v2 = flag_on(FLAG_FAREWELL_EXIT_V2)
+        if farewell_v2 and line_id == EARLY_CLOSE_LINE:
+            line_id = EARLY_CLOSE_LINE_V2  # D3-ASIDE1 (c)
         self._enter_closing(CLOSING_WINDING)
         self._wrap_open = True
         self._wrap_offers.append(
@@ -3231,7 +3496,14 @@ class RolePlayEngine:
                 "line": line_id,
             }
         )
-        return self._wrap_line_plan(line_id, [*reasons, "early_close:offer"])
+        plan = self._wrap_line_plan(line_id, [*reasons, "early_close:offer"])
+        self._early_close_bye = None
+        if farewell_v2 and not self._last_reply_closer:
+            # D3-ASIDE1 (c), review D3R-8: her short goodbye back is said only once the candidate
+            # takes the stop (`_wrap_answer_plan`), so a "keep going" never resumes a call she
+            # has already said bye to.
+            self._early_close_bye = self._learner_bye()
+        return plan
 
     def _hangup_plan(self, r_sec: float, turn_index: int | None, reasons: list[str]) -> TurnPlan:
         """S3.4 (D-M032-3): she ends the call in role in one line, then Christy asks (R paused).
@@ -3279,9 +3551,27 @@ class RolePlayEngine:
             and self._last_point is None
         ):
             move = self.scheduler.next_forced_peek(r_sec)
-            if move is not None and move.id == pending[0]:
+            if (
+                move is not None
+                and move.id == pending[0]
+                and (not flag_on(FLAG_LAST_POINT_V2) or self._last_point_worth(move.id))
+            ):
                 return self._last_point_plan(move.id, r_sec, turn_index, by_model=by_model)
         return self._end_plan(turn_index, r_sec=r_sec, by_model=by_model, late=True)
+
+    def _last_point_worth(self, move_id: str) -> bool:
+        """D3-END1 (R1_LAST_POINT_V2): the last point is worth a stop request's delay only for a
+        family's primary she has not voiced: never a push (its point was made by the primary),
+        never F4 once she named her decision maker, and never a point she already made in a free
+        reply (M04: "Like I said, I'd need to talk it over with my father first" a second time)."""
+        if move_id not in _LAST_POINT_PRIMARIES:
+            return False
+        if move_id == F4_PRIMARY and (
+            self._decider_said_turn is not None or self._stall_themes.get("decider", 0) > 0
+        ):
+            return False
+        said = " ".join(self._spoken.snapshot())
+        return not (said and self.scheduler.spoken_proves(move_id, said))
 
     def _last_point_plan(
         self, move_id: str, r_sec: float, turn_index: int | None, *, by_model: bool
@@ -3299,7 +3589,8 @@ class RolePlayEngine:
         reasons = ["end_request_explicit", "end_request_late", "last_point_aside"]
         if by_model:
             reasons.append("end_intent_model")
-        plan = self._wrap_line_plan(LAST_POINT_LINE, reasons)
+        line_id = LAST_POINT_LINE_V2 if flag_on(FLAG_LAST_POINT_V2) else LAST_POINT_LINE
+        plan = self._wrap_line_plan(line_id, reasons)
         return replace(plan, continuation=True)
 
     def _after_last_point(
@@ -3410,7 +3701,9 @@ class RolePlayEngine:
                 monologue=None,
             )
         reasons.append("free_reply")
-        curiosity = self._curiosity_for_free_reply(force=True)
+        curiosity = self._curiosity_for_free_reply(
+            force=True, skip=self._curiosity_closed(r_sec)
+        )
         return self._plan(TurnMode.LLM_REPLY, reasons, curiosity=curiosity)
 
     # ------------------------------------------------------------- M2: the wrap-up offer
@@ -3756,16 +4049,32 @@ class RolePlayEngine:
             # RCA END-5: the advisor gave her time, so the proposed next step no longer stands
             # (HOLD_NOTE stops) and, if there was pressure to ease, she lets it go.  A new ask
             # later sets the hold again.
-            eased = (
-                self._pending_ask is not None
-                or self._concerns.get(CONCERN_PRESSURE, 0) > 0
-                or self.scheduler.is_delivered(F4_PRIMARY)
-            )
+            eased_v2 = flag_on(FLAG_EASED_ACK_V2)
+            if eased_v2:
+                # D3-LRN-ACK1: only real pressure is eased (an ask on the table, or a pressure
+                # worry of hers in the last two turns), never a delivered F4 alone; and a turn
+                # that also adds urgency or asks her something gets no "you eased off" note.
+                reading = str(self._turn_reading or "")
+                eased = (
+                    self._pending_ask is not None
+                    or (
+                        self._pressure_turn is not None
+                        and self.turn - self._pressure_turn <= EASED_PRESSURE_TURNS
+                    )
+                ) and not (
+                    RESPOND_QUESTION in kinds or "?" in reading or _adds_pressure(reading)
+                )
+            else:
+                eased = (
+                    self._pending_ask is not None
+                    or self._concerns.get(CONCERN_PRESSURE, 0) > 0
+                    or self.scheduler.is_delivered(F4_PRIMARY)
+                )
             self._pending_ask = None
             if eased and not self._cool:
                 # Review S3R-6 (naturalness): never "acknowledge it warmly" beside COOL_NOTE's
                 # "no warmth" after a resumed hang-up.
-                self._notes.append(PRESSURE_EASED_NOTE)
+                self._notes.append(PRESSURE_EASED_NOTE_V2 if eased_v2 else PRESSURE_EASED_NOTE)
         if RESPOND_QUESTION in kinds:
             self._notes.append(ASKED_DIRECTLY_NOTE)  # a free reply's; an intent answers it first
         if RESPOND_ANSWERED in kinds:
@@ -4199,6 +4508,11 @@ class RolePlayEngine:
             reasons = ["wrap_offer_accepted"]
             if early:
                 reasons.append("early_close_accepted")
+                if self._early_close_bye is not None and flag_on(FLAG_FAREWELL_EXIT_V2):
+                    # Review D3R-8: her bye, then the one exit and wrap-up line.
+                    self.exit_farewell = True
+                    self.exit_bye = self._early_close_bye
+                    reasons.append("learner_bye")
             elif trigger == TRIGGER_ABUSE:
                 reasons.append("abuse_hangup_accepted")
             if end_intent == "end" and not accepts_wrap_offer(text):
@@ -4927,7 +5241,22 @@ class RolePlayEngine:
             or negotiation.latest_stated_usd() is not None
             or bool(negotiation.low_mentions)
             or negotiation.low_cleared_turn is not None
+            or self._foreign_named()
         )
+
+    def _foreign_named(self) -> bool:
+        """D3-LRN-PRICE1 (R1_FOREIGN_PRICE): the advisor named the course price in rupees."""
+        return self._foreign_price_turn is not None and flag_on(FLAG_FOREIGN_PRICE)
+
+    def _foreign_latest(self) -> bool:
+        """The rupee price is the latest price talk: no dollar price, offer or total after it."""
+        if not self._foreign_named():
+            return False
+        negotiation = self.negotiation
+        usd_turns = [turn for turn, _usd, _kind in negotiation.quotes]
+        usd_turns += [offer.turn for offer in negotiation.offers]
+        usd_turns += [turn for turn, _usd in negotiation.low_mentions]
+        return self._foreign_price_turn > max(usd_turns, default=-1)
 
     def _free_fresh(self) -> bool:
         """The advisor's "free" is the latest price talk and was said this turn or the one before
@@ -5124,6 +5453,8 @@ class RolePlayEngine:
             )
         if self._free_fresh():
             return anchor_after_free()
+        if self._foreign_latest():
+            return anchor_after_foreign()  # D3-LRN-PRICE1: "Rupees? I'm in the US, ..."
         stated = negotiation.latest_stated_usd()
         if stated is not None:
             return anchor_after_stated(stated)
@@ -5219,8 +5550,22 @@ class RolePlayEngine:
         a figure the advisor never said (SWEEP-17 item 6)."""
         if self._probe_first and self._last_line_unsaid_figure:
             self._figure_challenges += 1
-            return FIGURE_CHALLENGE_NOTE
+            return self._figure_challenge_note(str(self._turn_reading or ""))
         return CHALLENGE_NOTE
+
+    def _figure_challenge_note(self, reading: str) -> str:
+        """FIGURE_CHALLENGE_NOTE, or (D3-LRN-FIG1, R1_FIGURE_NOT_MINE) FIGURE_NOT_MINE_NOTE when
+        the course length he says he never gave is one she never said either."""
+        if flag_on(FLAG_FIGURE_NOT_MINE):
+            challenged = durations_said(reading)
+            if challenged:
+                hers: set[float] = set()
+                for said in self._spoken.snapshot():
+                    hers.update(durations_said(said))
+                if not challenged & hers:
+                    self._figures_not_mine += 1
+                    return FIGURE_NOT_MINE_NOTE
+        return FIGURE_CHALLENGE_NOTE
 
     def _price_reflex_note(self, reading: str) -> str:
         """SWEEP-22 item 5: the cost or her budget came up with no figure and nobody told her the
@@ -5431,7 +5776,9 @@ class RolePlayEngine:
         self._intent_uses[move.id] = self._intent_uses.get(move.id, 0) + 1
         brief = f"{REDIRECT_BRIEF} {move.brief}" if redirect else move.brief
         if last_point:
-            brief = f"{LAST_POINT_BRIEF} {move.brief}"
+            # D3-END1: one statement, no question (nothing is left to answer it).
+            lead = LAST_POINT_BRIEF_V2 if flag_on(FLAG_LAST_POINT_V2) else LAST_POINT_BRIEF
+            brief = f"{lead} {move.brief}"
         kind = KIND_REDIRECT if redirect else (KIND_CUE if move.id == TIME_CUE else KIND_OBJECTION)
         intent = LearnerIntent(
             kind=kind,
@@ -5482,6 +5829,8 @@ class RolePlayEngine:
             and flag_on(FLAG_INTENT_TAIL_V3)
         ):
             completed = self._completion_tail(completion_key, intent, spoken_so_far, said)
+            if completed and flag_on(FLAG_INTENT_TAIL_V4):
+                completed = _trim_tail(completed, spoken_so_far, intent.markers)
             if completed:
                 self._intent_fallbacks[completion_key] = (
                     self._intent_fallbacks.get(completion_key, 0) + 1
@@ -5540,6 +5889,13 @@ class RolePlayEngine:
                 ),
                 chosen,
             )
+        if flag_on(FLAG_INTENT_TAIL_V4):
+            # D3-LRN-TAIL1: the sentences of the tail that her reply already said (in other words)
+            # go, as long as what is left still proves the move with her reply.
+            trimmed = _trim_tail(chosen, spoken_so_far, intent.markers)
+            if trimmed != chosen:
+                self._tails_trimmed += 1
+                chosen = trimmed
         key = plan.move_id or plan.negotiation_id or (
             f"probe:{plan.probe}" if plan.probe is not None else None
         )
@@ -5610,6 +5966,24 @@ class RolePlayEngine:
         self._monthly_quote_turn = turn
         if self._monthly_quote_usd > MONTHLY_BUDGET_MAX_USD:
             self._notes.append(BUDGET_OVER_NOTE.format(amount=format_usd(self._monthly_quote_usd)))
+
+    def _curiosity_closed(self, r_sec: float) -> bool:
+        """D3-LRN-CURIO1 (R1_CURIOSITY_TIMING): no curiosity topic is handed over this turn.
+
+        The advisor asks for a commitment, a call time or a payment (``_turn_ask``), a commitment
+        is on record, the call is closing, it is near the time cue, or (after 14:00) a check-in
+        already got its one late topic.  M10: "shall we say I call you tomorrow around 10?" got
+        "Before we get to timing, how many people are usually in a batch?".
+        """
+        if not flag_on(FLAG_CURIOSITY_TIMING):
+            return False
+        return (
+            self._turn_ask is not None
+            or self._commitment_level is not None
+            or self._closing != CLOSING_OPEN
+            or r_sec >= TIME_CUE_SEC - CURIOSITY_CUTOFF_BEFORE_CUE_SEC
+            or (r_sec >= LATE_CHECKIN_SEC and self._late_checkin_topics >= 1)
+        )
 
     def _short_on_time(self) -> bool:
         """M032 SWEEP-27 (R1_TIME_CUE_V2): she has said her time cue, so she opens nothing new.
@@ -5810,7 +6184,12 @@ class RolePlayEngine:
             # M032 SWEEP-10: after the coach aside a role reversal gets the role note, never the
             # AI or test note (an AI or test break keeps CHARACTER_BREAK_NOTE).
             role_note = ""
-            if self._role_confused and kind == "coach" and not confirm:
+            after_coach_aside = (
+                flag_on(FLAG_COACH_AFTER_INROLE)
+                and self._coach_turn is not None
+                and self.turn - self._coach_turn <= COACH_QUIET_REPLIES
+            )
+            if self._role_confused and kind == "coach" and not confirm and not after_coach_aside:
                 role_note = ROLE_CONFUSION_NOTE.format(
                     example=pick_variant(
                         ROLE_CONFUSION_EXAMPLES, self.seed, self._role_confusion_turns
@@ -5879,7 +6258,8 @@ class RolePlayEngine:
                 # M032 S3.2: one short goodbye passes the guard (no closer_again drop, and the
                 # stall-closer quota is lifted for this one reply).
                 winding=winding,
-                closing_exempt=winding,
+                closing_exempt=winding
+                or (self._courtesy_after_signoff and flag_on(FLAG_FAREWELL_EXIT_V2)),
                 # M032 SWEEP-7: her come-back question passes the diet and the near-repeat drop.
                 reask_topic=self._come_back_topic if mode is TurnMode.LLM_REPLY else "",
             )
@@ -6047,6 +6427,18 @@ class RolePlayEngine:
             shared = flag_on(FLAG_NO_COMMIT_LEDGER)
             for theme in concern_themes(spoken_text, shared_think_over=shared):
                 self._concerns[theme] = self._concerns.get(theme, 0) + 1
+                if theme == CONCERN_PRESSURE:
+                    self._pressure_turn = plan.turn  # D3-LRN-ACK1
+            if self.scheduler.is_delivered(F1_ANCHOR) and self.scheduler.is_delivered(F1_COUNTER):
+                if plan.move_id is None and compares_with_anchor(spoken_text):
+                    self._anchor_comments += 1  # D3-LRN-MONEY1 (memory only: a count)
+            if asks_whats_included(spoken_text):
+                self._included_turn = plan.turn
+            self._reacted_figures.update(
+                amount
+                for amount in dollar_amounts(canonical_amounts(spoken_text))
+                if amount in self._advisor_amounts
+            )
             phrases = reply_phrases(spoken_text)
             self._phrase_history.append(phrases)
             for key in phrases:
@@ -6184,6 +6576,19 @@ class RolePlayEngine:
             # SWEEP-13: the trust theme is on record once she VOICES it (``concern_themes`` above);
             # a careful-buyer note alone records nothing (review S2R-4: "Okay." after it put "you
             # would want proof before trusting it" in every later ledger note).
+            if (
+                "continuation:last_point" in plan.reasons
+                and not interrupted
+                and self._exit_after_last_point
+                and flag_on(FLAG_LAST_POINT_V2)
+            ):
+                # D3-END1: the candidate asked to stop; her last point heard whole ends the
+                # role-play by itself (M04: they had to ask a second time).  A cut line keeps the
+                # old path: the turn that cut it ("no, carry on") decides.
+                self._exit_after_last_point = False
+                if self._last_point is not None:
+                    self._last_point["answer"] = "auto"
+                self.exit_requested = True
 
     def _note_voice(self, plan: TurnPlan, spoken_text: str, tics: tuple[str, ...]) -> None:
         """M032 S2: how her heard line opened (SWEEP-4), its soft tics (SWEEP-12) and its sentence
@@ -6631,11 +7036,66 @@ _DECISION_QUESTION = re.compile(
 # and the e-mail yes).
 _COMPLETION_KINDS = frozenset({KIND_OBJECTION, "price_first", "email"})
 _CONTENT_WORD = re.compile(r"[a-z']{4,}")
+_FIGURE_WORD = re.compile(r"\$?\d[\d,]*")
 _NOT_CONTENT = frozenset(
     {"that", "this", "with", "what", "would", "could", "have", "just", "still", "about", "from",
      "they", "them", "then", "there", "it's", "i'd", "i'm", "i've", "that's", "your", "need",
      "want", "know", "like", "really", "some", "much", "more", "after", "before", "whatever"}
 )
+
+
+# D3-LRN-TAIL1 (R1_INTENT_TAIL_V4): a tail sentence that shares this share of its content words with
+# a sentence of her reply says it again.
+TAIL_OVERLAP_SHARE = 0.6
+
+
+def _says_again(sentence: str, spoken: Iterable[str]) -> bool:
+    """D3-LRN-TAIL1: ``sentence`` repeats one of ``spoken`` (content-word overlap, figures too)."""
+    own = _content_words(canonical_amounts(sentence)) | frozenset(
+        _FIGURE_WORD.findall(canonical_amounts(sentence))
+    )
+    if not own:
+        return False
+    for other in spoken:
+        theirs = _content_words(canonical_amounts(other)) | frozenset(
+            _FIGURE_WORD.findall(canonical_amounts(other))
+        )
+        if len(own & theirs) >= TAIL_OVERLAP_SHARE * len(own):
+            return True
+    return False
+
+
+def _trim_tail(tail: str, spoken_so_far: str, markers: tuple[tuple[str, ...], ...]) -> str:
+    """D3-LRN-TAIL1: ``tail`` without the sentences her reply already said, or ``tail`` itself.
+
+    A sentence is dropped only when the rest of the tail, with her reply, still proves the move's
+    unchanged markers (M04: "... the website seemed to show around $9,000 ... Wait, I thought I saw
+    about $9,000 on the website, not $12,000." said the check twice).  Review D3R-5: nothing else
+    goes (the anchor's "Could you do that?" is needed though no marker asks for it), and the tail's
+    closing question is never dropped.
+    """
+    sentences = split_sentences(tail)
+    if len(sentences) < 2 or not markers:
+        return tail
+    spoken = split_sentences(spoken_so_far)
+
+    def proves(kept: list[str]) -> bool:
+        return markers_match(markers, f"{spoken_so_far} {' '.join(kept)}")
+
+    # Review D3R-5: the tail's closing question is its ask ("Could you do that?"); it always stays.
+    ask = sentences[-1] if "?" in sentences[-1] else None
+    kept = list(sentences)
+    for sentence in sentences:
+        if sentence is ask:
+            continue
+        trial = [item for item in kept if item is not sentence]
+        if trial and _says_again(sentence, spoken) and proves(trial):
+            kept = trial
+    if len(kept) == len(sentences):
+        return tail
+    # Review D3R-5: only the sentences said again go; the rest of the tail (its ask with it) stays,
+    # since the markers alone do not carry the brief's meaning.
+    return " ".join(kept)
 
 
 def _content_words(text: object) -> frozenset[str]:

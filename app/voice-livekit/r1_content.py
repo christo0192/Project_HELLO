@@ -292,7 +292,21 @@ import r1_world
 #    question. No other pinned text changed.
 # 30: M032 integration 5 (the Christy lane's 26-28 merged onto revision 29): every text of both
 #    lanes in one manifest.  No text changed in the merge; CONTENT_REVISION = max(29, 28) + 1.
-CONTENT_REVISION = 30
+# Learner lane (feat/m032-learner, its revision 29, after the fifth integration):
+# Lane 29: Simulation diagnosis 3 (the int-live-3 flow judge; rollback flags R1_WRAPUP_NEXT_STEPS,
+#    R1_LAST_POINT_V2, R1_FAREWELL_EXIT_V2, R1_FOREIGN_PRICE, R1_INTENT_TAIL_V4,
+#    R1_QUESTION_DIET_V2, R1_FIGURE_MEMORY, R1_CURIOSITY_TIMING, R1_EASED_ACK_V2, R1_DIG_GATE_V2,
+#    R1_FIGURE_NOT_MINE, R1_END_ASIDE_V2 and R1_COACH_AFTER_INROLE).  New scripted lines (the
+#    what's-next answer and the short close, two feedback refusals, her short goodbyes, the merged
+#    exit and wrap-up line, the reworded last-point, end and early-close asides), the rupee anchor,
+#    the last-point brief and the new notes join the manifest (``_diag3_repairs``) beside the texts
+#    they replace while their flags are on.  No graded marker, must-say, meaning or deadline
+#    changed; with every flag off the lines, reminders and readers are the release before.
+#    After its review (still 29, unreleased): L-EXIT-WRAP opens with "Let's stop the role-play
+#    here" (D3R-8).
+# 31: M032 integration 6 (the learner lane's 29 merged onto revision 30): every text of both
+#    lanes in one manifest.  No text changed in the merge; CONTENT_REVISION = max(30, 29) + 1.
+CONTENT_REVISION = 31
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -660,6 +674,30 @@ def _adapt_repairs() -> dict[str, Any]:
     }
 
 
+def _diag3_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 3 (revision 29): the new notes, anchor, brief and wrap-up wording."""
+    p = r1_prompts
+    anchor = r1_negotiation.anchor_after_foreign()
+    return {
+        "pressure_eased_note_v2": p.PRESSURE_EASED_NOTE_V2,
+        "figure_not_mine_note": p.FIGURE_NOT_MINE_NOTE,
+        "next_step_answer_note": p.NEXT_STEP_ANSWER_NOTE,
+        "figure_reacted_note": p.FIGURE_REACTED_NOTE,
+        "wrapup_noted_sentence": p.WRAPUP_NOTED_SENTENCE,
+        "wrapup_noted_sentence_v2": p.WRAPUP_NOTED_SENTENCE_V2,
+        "wrapup_reminder_next_steps": p.wrapup_reminder(
+            answers=True, one_mention=True, next_steps=True
+        ),
+        "last_point_brief_v2": r1_scheduler.LAST_POINT_BRIEF_V2,
+        "anchor_foreign": {
+            "id": anchor.id,
+            "brief": anchor.brief,
+            "must_say": list(anchor.must_say),
+            "variants": list(anchor.variants),
+        },
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -946,6 +984,7 @@ def manifest() -> dict[str, Any]:
             "sim_repairs": _sim_repairs(),
             "sim2_repairs": _sim2_repairs(),
             "adapt_repairs": _adapt_repairs(),
+            "diag3_repairs": _diag3_repairs(),
         },
         "icebreaker": {
             "objectives": [

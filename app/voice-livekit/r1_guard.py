@@ -460,6 +460,65 @@ _ACK_ONLY_WORDS = frozenset(
     "and glad asked really very totally definitely happy to help".split()
 )
 OWN_CONTENT_WORDS = 3
+# D3-WRAP1 (R1_WRAPUP_NEXT_STEPS): a lead-in says it will answer without answering ("Curious about
+# that, so let me be straight with you.", "Good question."); with it taken out, a sentence that has
+# no content of its own is no answer, so a hiring-team sentence after it still gets
+# L-FAQ-DEFER-WRAP.
+_LEAD_IN_PHRASES = re.compile(
+    r"\b(?:let me be (?:straight|honest|clear|upfront|frank|direct)(?: with you)?|"
+    r"(?:that'?s a |what a )?(?:good|great|fair|lovely|nice) (?:question|one)|"
+    r"(?:i'?m )?(?:curious|glad) (?:about that|you asked)|thanks? (?:you )?for asking|"
+    r"happy to (?:answer|help)(?: with that)?|let me (?:see|think)|"
+    r"i(?:'d| would) love to (?:tell|share)(?: you)?|so)\b",
+    re.IGNORECASE,
+)
+# D3-LRN-MONEY1 (R1_FIGURE_MEMORY): a comparison with what she had heard or braced for.
+_HEARD_COMPARE = re.compile(
+    r"\bwhat i(?:'d| had)? (?:heard|been told)\b|\bbraced (?:myself )?for\b|"
+    r"\bwhere i was hoping it would land\b|\bwhat (?:someone|a friend|people) (?:paid|told me)\b",
+    re.IGNORECASE,
+)
+_INCLUDED_QUESTION = re.compile(
+    r"\bwhat(?:'s| is| would be| exactly is| exactly)? (?:actually )?(?:included|covered)\b|"
+    r"\bwhat (?:does|would|do) (?:that|it|this|i) (?:\w+ )?(?:include|cover|get for)\b",
+    re.IGNORECASE,
+)
+# D3-LRN-PRICE1 (R1_FOREIGN_PRICE): she says nobody told her the price after he named one.
+_NO_PRICE_HEARD = re.compile(
+    r"\b(?:nobody|no one|no-one)(?:'s| has| had)? (?:actually |really |even |yet )?"
+    r"(?:told|given|said|mentioned|quoted)\b[^.?!]{0,30}\b(?:price|cost|figure|fee|number)\b|"
+    # Review D3R-7: "heard / been told" binds to its object ("haven't heard what it costs"), never
+    # "heard back from my husband about the cost" or "what the monthly fee would cost".
+    r"\b(?:haven'?t|have not) (?:actually |really |yet |even )?"
+    r"(?:heard|been told|gotten|got|been given)(?! back\b) (?:about |of )?"
+    r"(?:the |a |any |an actual |a real )?(?:price|cost|fee|figure|number)\b|"
+    r"\b(?:haven'?t|have not) (?:actually |really |yet |even )?(?:heard|been told)(?! back\b) "
+    r"(?:what (?:it|the course|this|the program(?:me)?) (?:costs?|would cost|will cost|comes to)|"
+    r"how much (?:it|the course|this|the program(?:me)?) (?:costs?|is|would cost|will cost))\b|"
+    r"\bstill (?:don'?t|do not) know (?:what (?:it|the course|this|the program(?:me)?) "
+    r"(?:costs?|would cost|will cost|comes to)|how much (?:it|the course|this|the program(?:me)?) "
+    r"(?:costs?|is|would cost|will cost)|the (?:price|cost|fee))\b",
+    re.IGNORECASE,
+)
+# D3-LRN-ACK1 (R1_EASED_ACK_V2): the stock thanks for easing off.
+_THANKS_FOR_ROOM = re.compile(
+    r"\bthanks? (?:you )?for giving me (?:the |some |a bit of |a little )?(?:time|space|room)\b",
+    re.IGNORECASE,
+)
+# D3-LRN-QDIET (R1_QUESTION_DIET_V2): a follow-up shares a content word of this many letters or more
+# with the advisor's turn, none of these; or asks what she would pay after he named a figure.
+FOLLOWUP_MIN_LETTERS = 4
+_POINTING_WORD = re.compile(r"\b(?:that|this|it|those|these)\b", re.IGNORECASE)
+_FOLLOWUP_STOP = frozenset(
+    "what would that this with have about your there they does will just really actually then "
+    "when which much like know think mean make could should from into over more some them those "
+    "these been were said okay right sure well also still even only kind sort thing things "
+    "course program class learn data science tell want need sound good great".split()
+)
+_MONEY_FOLLOW_UP = re.compile(
+    r"\b(?:pay\w*|cost\w*|price|monthly|month|instal\w*|emis?|total|fee|discount\w*|offer)\b",
+    re.IGNORECASE,
+)
 PERSONA_REVEALED_PHASES = frozenset({"transition", "roleplay_exit", "wrapup", "closing"})
 
 CONTROL = "control"
@@ -1474,6 +1533,33 @@ class GuardContext:
     advisor_said: tuple[str, ...] = ()
     asked_her: bool = False
     choice_offered: bool = False
+    # Simulation diagnosis 3 (each the engine's flag; off restores the release before).
+    # ``question_diet_v2`` (R1_QUESTION_DIET_V2, D3-LRN-QDIET): the diet drops only a NEW-topic
+    # question; a follow-up on the advisor's current turn (``followup_terms``, its content stems),
+    # on a figure he put on the table this turn (``figure_now``), or a question whose statement
+    # would only restate what she said, stays.
+    question_diet_v2: bool = False
+    followup_terms: frozenset[str] = frozenset()
+    figure_now: bool = False
+    # ``figure_memory`` (R1_FIGURE_MEMORY, D3-LRN-MONEY1): once F1-ANCHOR and F1-COUNTER are
+    # delivered (``anchor_settled``), a second comparison with the $7,000 or with what she had
+    # heard (``anchor_comments`` counts hers since) is dropped, and "what's included" is asked once
+    # in three replies unless he named a new figure (``included_recent``).
+    figure_memory: bool = False
+    anchor_settled: bool = False
+    anchor_comments: int = 0
+    included_recent: bool = False
+    # ``eased_ack_v2`` (R1_EASED_ACK_V2, D3-LRN-ACK1): "thanks for giving me the time / space /
+    # room" is taken out of her reply.
+    eased_ack_v2: bool = False
+    # ``next_steps`` (R1_WRAPUP_NEXT_STEPS, D3-WRAP1; Christy's wrap-up and closing): a lead-in
+    # ("Curious about that, so let me be straight with you.") is no answer, so a hiring-team
+    # sentence after it still gets the deflection instead of leaving the reply hollow.
+    next_steps: bool = False
+    # ``price_heard`` (R1_FOREIGN_PRICE, D3-LRN-PRICE1): the advisor named a course price (in
+    # dollars or in rupees), so "nobody has told me the price" / "I still haven't heard what it
+    # costs" contradicts the call and is taken out.
+    price_heard: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -2194,6 +2280,7 @@ class StreamGuard:
         self._soft_tic_trims = 0  # M032 SWEEP-12: soft tics taken out of this reply
         self._bare_keeps = 0  # Simulation diagnosis 2 (NAT1): questions kept beside a bare reproach
         self._length_drops = 0  # M032 SWEEP-17: sentences dropped for a course length unsaid
+        self._anchor_comments = 0  # D3-LRN-MONEY1: settled-price comparisons kept in this reply
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -2282,6 +2369,9 @@ class StreamGuard:
             # A question about the price, asked before the advisor has put any price on the table,
             # always stays (R1-Q iteration 3: "what the total cost actually comes to?" was dropped).
             and not (ctx.offer_usd is None and _PRICE_QUESTION.search(text) is not None)
+            # Simulation diagnosis 3 (D3-LRN-QDIET): the diet is for a NEW topic; her follow-up
+            # on what he just said stays.
+            and not (ctx.question_diet_v2 and self._follow_up(text))
         ):
             if ctx.bare_reproach and _bare_reproach(" ".join(self._emitted)):
                 # Simulation diagnosis 2 (NAT1): dropping it would leave a curt reproach alone
@@ -2294,6 +2384,55 @@ class StreamGuard:
         if template:
             self._phrases_used[PHRASE_TEMPLATE_Q] = self._phrases_used.get(PHRASE_TEMPLATE_Q, 0) + 1
         return False
+
+    def _follow_up(self, question: str) -> bool:
+        """D3-LRN-QDIET: ``question`` reacts to the advisor's current turn, or without it the reply
+        would only restate what she already said.
+
+        (a) it shares a specific content word with his turn ("the free part ... why would that be
+        on the table?" after he offered a free month); (b) the statement before it repeats one of
+        her earlier lines, or names the $7,000 she already named; (c) he put a figure on the table
+        this turn and she asks what she would pay.
+        """
+        ctx = self.ctx
+        about = question
+        if self._emitted and _POINTING_WORD.search(question) is not None:
+            # "Why would that be on the table?" asks about the sentence before it ("the free
+            # month is what's throwing me"): that sentence's words are the question's subject.
+            about = f"{self._emitted[-1]} {question}"
+        own = {
+            stem
+            for stem in _stems(about)
+            if len(stem) >= FOLLOWUP_MIN_LETTERS and stem not in _FOLLOWUP_STOP
+        }
+        if own & ctx.followup_terms:
+            return True
+        if ctx.figure_now and _MONEY_FOLLOW_UP.search(question) is not None:
+            return True
+        before = " ".join(self._emitted)
+        if not before or not ctx.said:
+            return False
+        if repeat_kind(before, ctx.said) is not None:
+            return True
+        return mentions_anchor_figure(before) and any(
+            mentions_anchor_figure(said) for said in ctx.said
+        )
+
+    def _figure_memory(self, sentence: str) -> str:
+        """D3-LRN-MONEY1: ``sentence``, or "" when it compares the settled price with the $7,000 or
+        with what she heard once again, or asks "what's included" again too soon."""
+        ctx = self.ctx
+        if (
+            ctx.anchor_settled
+            and "?" not in sentence
+            and (mentions_anchor_figure(sentence) or _HEARD_COMPARE.search(sentence) is not None)
+        ):
+            if ctx.anchor_comments + self._anchor_comments >= 1:
+                return ""
+            self._anchor_comments += 1
+        if ctx.included_recent and "?" in sentence and _INCLUDED_QUESTION.search(sentence):
+            return ""
+        return sentence
 
     def _comes_back(self, text: str) -> bool:
         """M032 SWEEP-7: ``text`` is a question about the topic the reply comes back to."""
@@ -2540,7 +2679,10 @@ class StreamGuard:
                 out == FAQ_DEFER_WRAP_LINE
                 and HIRING_MENTION in categories
                 and categories <= {HIRING_MENTION, HIRING_COMP, INVENTED_FACT}
-                and any(_has_own_content(said) for said in self._emitted)
+                and any(
+                    _has_answer_content(said) if ctx.next_steps else _has_own_content(said)
+                    for said in self._emitted
+                )
             ):
                 # M032 SWEEP-26: "Great, that's all from my side." already said something, so its
                 # "The hiring team will follow up ..." is dropped, not answered with a deflection
@@ -2554,6 +2696,20 @@ class StreamGuard:
         if out and self.ctx.is_learner and _STILL_MORE.search(out) is not None:
             if any(_STILL_MORE.search(said) for said in self._emitted):
                 out = ""  # "more than I planned for" is said once in a reply
+        if out and not hits and self.ctx.is_learner and self.ctx.free_reply:
+            kept = out
+            if self.ctx.figure_memory:
+                kept = self._figure_memory(kept)
+            if kept and self.ctx.price_heard and _NO_PRICE_HEARD.search(kept) is not None:
+                kept = _without_clauses(kept, _NO_PRICE_HEARD)  # D3-LRN-PRICE1
+            if kept and self.ctx.eased_ack_v2 and _THANKS_FOR_ROOM.search(kept) is not None:
+                # D3-LRN-ACK1: "Thanks for giving me the room on that." is a stock phrase.
+                kept = _without_clauses(kept, _THANKS_FOR_ROOM)
+            if kept != out:
+                self._style_edits += 1
+                if not kept:
+                    self._repeat_drops += 1  # an emptied reply gets a back-channel, as a repeat
+                out = kept
         if (
             out
             and not hits
@@ -2722,6 +2878,29 @@ def _has_own_content(sentence: str) -> bool:
     return sum(1 for word in words if word not in _ACK_ONLY_WORDS) >= OWN_CONTENT_WORDS
 
 
+def compares_with_anchor(text: object) -> bool:
+    """D3-LRN-MONEY1: a statement of hers that compares a price with the $7,000 or with what she
+    had heard or braced for (memory only)."""
+    return any(
+        "?" not in sentence
+        and (mentions_anchor_figure(sentence) or _HEARD_COMPARE.search(sentence) is not None)
+        for sentence in split_sentences(str(text or ""))
+    )
+
+
+def asks_whats_included(text: object) -> bool:
+    """D3-LRN-MONEY1: her question about what the price includes."""
+    return any(
+        "?" in sentence and _INCLUDED_QUESTION.search(sentence) is not None
+        for sentence in split_sentences(str(text or ""))
+    )
+
+
+def _has_answer_content(sentence: str) -> bool:
+    """D3-WRAP1: ``_has_own_content`` once the lead-in phrases are taken out."""
+    return _has_own_content(_LEAD_IN_PHRASES.sub(" ", fold(sentence)))
+
+
 def _filler_gap(match: re.Match[str]) -> str:
     """What replaces a filler taken out of a sentence.
 
@@ -2740,7 +2919,8 @@ _DANGLING_REFERENCE = re.compile(
     r"^\W*(?:he|she|they)(?:'d|'ll|'s|'re| would| will| is| was| has| had| might| probably)\b",
     re.IGNORECASE,
 )
-_CLAUSE_SPLIT = re.compile(r"\s*[,;]\s*|\s+-+\s+")
+# D3-LRN-TRUNC1: never split "$7,500" at its thousands comma (it left "just that $7.").
+_CLAUSE_SPLIT = re.compile(r"\s*(?:(?<!\d),|,(?!\d{3}\b)|;)\s*|\s+-+\s+")
 
 
 def _swap_that(text: str) -> str:
