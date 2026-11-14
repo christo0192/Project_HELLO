@@ -178,7 +178,12 @@ import r1_world
 # flags are on.  No graded meaning, marker, must-say or deadline changed.
 # After its review (still revision 29, unreleased): L-EXIT-WRAP opens with "Let's stop the role-play
 # here" (review D3R-8).  No graded meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "1fefd8c9aed07684a31851d1427934e85921cda151a4cfea3e153d9728541c92"
+# Revision 30 (simulation diagnosis 4): one exit-and-wrap-up line per way the role-play ends
+# (L-EXIT-WRAP-2, -END, -TIME, -ASIDE), the short-on-time and come-back notes and the F3 worry
+# without brand names join the manifest (``r1_content._diag4_repairs`` and the script lines) beside
+# the texts they replace while their flags are on.  No graded meaning, marker, must-say or deadline
+# changed.
+PINNED_CONTENT_SHA256 = "2b8d598d8e408ba7bcfcdd608a8f20f9dc9b14bdd059381a442f7f75352f09bb"
 
 CONTENT_MODULES = (
     "r1_text",

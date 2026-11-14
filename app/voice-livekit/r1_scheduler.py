@@ -643,6 +643,22 @@ def probe_first_texts(move_id: str) -> tuple[str, str, str, tuple[str, ...]] | N
     return None
 
 
+# Simulation diagnosis 4 (D4-F3STOCK1, the engine's R1_F3_WORDING; new wording under D-M032-4):
+# the worry named "(YouTube, Coursera)" and the exact question "what this gives you that free
+# material does not", and 11 of 41 calls said the same three-part line ("Six months is a real
+# commitment. ... what would this give me that YouTube or Coursera doesn't?").  The worry keeps
+# its meaning (free material online; what paying would get her) without words to copy, and she
+# reacts to what the advisor just said, not to the course length.  The markers are unchanged
+# ("free", "worth", "pay" still prove it).
+F3_PRIMARY_WORRY_V3 = (
+    "you doubt it is worth paying when so much is free online, and you want to know what you "
+    "would get for the money; react first to the specific thing they just said, not to how long "
+    "the course is"
+)
+F3_PRIMARY_WORRY_VARIANTS_V3 = (
+    "I can find a lot of this for free online, so I'm not sure it's worth paying for.",
+    "There's so much free material out there that I'm not sure what paying would add.",
+)
 # R1-Q iteration 3.  "before my (own) next call" came back verbatim in 8 of 20 calls, also from a
 # learner who was at home after work.  The cue is the same move said three ways (rotated by the
 # attempt id); the markers accept all three.
@@ -973,6 +989,24 @@ _CLOSE_FAREWELL = _compile(
     r"[\s.!]*$",
     r"\bi think we'?re done(?: here)?\b[\s.!]*$",
     r"\bwe'?re (?:all )?done here\b[\s.!]*$",
+)
+# Simulation diagnosis 4 (D4-GOODBYE1, the engine's R1_FAREWELL_READ_V3): "Good night, Meera.",
+# "Talk tomorrow at seven.", "See you then." and "Night now." were never goodbyes, so 28 of them in
+# a row after the commitment never ended the role-play.  Each may carry a clock time ("at seven",
+# "around 7 pm") before the usual name and courtesy tail.
+TIME_TAIL = (
+    r"(?:\s+(?:at|around|by))?\s+(?:\d{1,2}(?::\d\d)?|one|two|three|four|five|six|seven|eight|nine|"
+    r"ten|eleven|twelve)(?:\s?(?:am|pm|a\.m\.|p\.m\.|o'?clock))?"
+)
+FAREWELL_V3_PHRASES = (
+    r"good ?night",
+    r"night now",
+    r"(?:talk|speak)(?: to you)? (?:tomorrow|then|later|next week|on \w+day)"
+    r"(?:" + TIME_TAIL + r")?",
+    r"see you (?:tomorrow|then|soon|next week|on \w+day)(?:" + TIME_TAIL + r")?",
+)
+_CLOSE_FAREWELL_V3 = _compile(
+    *(r"\b(?:" + phrase + r")\b" + _FAREWELL_TAIL for phrase in FAREWELL_V3_PHRASES)
 )
 # "Thanks for your time" is also a common OPENING courtesy, so it only counts as a
 # farewell once the call is well under way, and only as the end of the sentence.
@@ -1874,7 +1908,7 @@ def _strip_stt_bye_tail(text: object) -> str:
     return head
 
 
-def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
+def is_close_attempt(text: object, r_sec: float | None = None, *, wide: bool = False) -> bool:
     """A farewell or wrap-up phrase.  Never fires on "end the call" style instructions.
 
     With ``r_sec`` given, nothing counts before R = 1:00 and the courtesy "thanks for your
@@ -1886,6 +1920,9 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     courtesy "thanks for your time" only counts when the turn stops there: if a statement
     follows it ("Thanks for your time. So, coming to the fees, it's nine thousand.") the
     advisor is still talking.
+
+    ``wide`` (D4-GOODBYE1, the engine's R1_FAREWELL_READ_V3): "good night", "talk tomorrow (at
+    seven)", "see you then" and "night now" are farewells too (``_CLOSE_FAREWELL_V3``).
     """
     if r_sec is not None and r_sec < CLOSE_MIN_R_SEC:
         return False
@@ -1906,6 +1943,8 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
         if asks_after[index + 1]:
             continue
         if any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL):
+            return True
+        if wide and any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL_V3):
             return True
         if (
             thanks_allowed
@@ -2020,9 +2059,36 @@ _LEAVE_TAKING = re.compile(
 )
 
 
-def courtesy_goodbye(text: object) -> bool:
-    """S3.1: a courtesy-only advisor turn that takes leave ("Sure. Thank you.", "Okay, bye.")."""
-    return courtesy_only(text) and _LEAVE_TAKING.search(normalize(fold(text))) is not None
+# D4-GOODBYE1 (R1_FAREWELL_READ_V3): "You're welcome. Good night." and "See you tomorrow." take
+# leave too.
+_LEAVE_TAKING_V3 = re.compile(
+    r"\b(?:good ?night|night now|see you|talk (?:to you )?(?:tomorrow|then|later)|"
+    r"speak (?:to you )?(?:soon|tomorrow|then|later))\b"
+)
+_COURTESY_TURN_WORDS_V3 = frozenset(
+    {*_COURTESY_TURN_WORDS, "night", "goodnight", "welcome", "youre", "tomorrow", "see", "soon",
+     "speak", "cheers", "too", "same", "to"}
+)
+
+
+def courtesy_goodbye(text: object, *, wide: bool = False) -> bool:
+    """S3.1: a courtesy-only advisor turn that takes leave ("Sure. Thank you.", "Okay, bye.").
+
+    ``wide`` (D4-GOODBYE1): "You're welcome. Good night." and "See you tomorrow." as well."""
+    if not wide:
+        return courtesy_only(text) and _LEAVE_TAKING.search(normalize(fold(text))) is not None
+    folded = fold(text)
+    if "?" in folded:
+        return False
+    words = normalize(folded).split()
+    if not 0 < len(words) <= COURTESY_TURN_MAX_WORDS:
+        return False
+    if not all(word in _COURTESY_TURN_WORDS_V3 for word in words):
+        return False
+    lowered = normalize(folded)
+    return (
+        _LEAVE_TAKING.search(lowered) is not None or _LEAVE_TAKING_V3.search(lowered) is not None
+    )
 
 
 def _is_closing_tail(sentence: str) -> bool:
@@ -2174,6 +2240,10 @@ class OwedMoveScheduler:
         self.projects_covered_turn: int | None = None
         self.close_attempts = 0
         self.commitment_resolved = False
+        # Simulation diagnosis 4 (D4-TIMECUE1, the engine's R1_TIME_CUE_V3, set before each
+        # select): the call is already saying goodbye, so "I've only got a couple of minutes" is
+        # not raised now.
+        self.time_cue_held = False
         self._delivered_in_turn = -1
         self._last_objection_turn: int | None = None
         self._topic_turn: dict[str, int] = {}
@@ -2397,7 +2467,7 @@ class OwedMoveScheduler:
             # Only inside the 17:00-19:00 window: after the close window opens for the
             # WEAK stall, "I've only got a couple of minutes" would be meaningless.
             in_window = TIME_CUE_SEC <= r_sec < COMMIT_STALL_R_SEC
-            return in_window and self.open_family is None
+            return in_window and self.open_family is None and not self.time_cue_held
         if move_id == COMMIT_STALL:
             return (
                 r_sec >= COMMIT_STALL_R_SEC

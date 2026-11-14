@@ -102,6 +102,8 @@ from r1_text import (
     PHRASE_DECIDER_STALL,
     PHRASE_MONEY_STRAIN,
     PHRASE_STALL_CLOSER,
+    PHRASE_REAL_COMMITMENT,
+    REAL_COMMITMENT,
     STALL_CLOSER,
     canonical_amounts,
     TIC_ACTUALLY,
@@ -436,11 +438,54 @@ def mentions_anchor_figure(sentence: str) -> bool:
     return _ANCHOR_MENTION.search(_anchor_canon(sentence)) is not None
 
 
+# Simulation diagnosis 4 (D4-SEVEN1, R1_ANCHOR_TIME_AWARE): "Seven it is" answered "What time
+# suits you? ... seven" (a call at 7 pm) and was swapped for "So what would the actual price come
+# to?".  A bare "seven" is the $7,000 only with money words in the sentence or in the advisor's
+# turn, and never with a clock time in either.
+_SEVEN_MONEY = re.compile(
+    r"\$|\b(?:thousand|grand|k|price|pay|paying|fee|fees|cost|costs|dollars?|discount|"
+    r"7,?000|seven thousand)\b",
+    re.IGNORECASE,
+)
+_SEVEN_CLOCK = re.compile(
+    r"\b(?:at|around|by|about|till|until) (?:seven|7)\b|\b(?:seven|7) ?o'?clock\b"
+    r"|\b(?:seven|7)(?::\d\d)? ?(?:pm|am|p\.m\.|a\.m\.)|\b(?:tomorrow|tonight|this evening|"
+    r"evening|morning|what time|which time|time (?:suits|works)|o'?clock|call (?:at|back))\b",
+    re.IGNORECASE,
+)
+
+
+# D4-CONTACT1 (R1_CONTACT_READER_V2): the advisor's turn asked how to reach her, so the form line
+# answers it; otherwise a contact sentence is simply dropped ("You can use the email on my form."
+# after "Mentors help you catch up" was a non sequitur).
+_CONTACT_ASKED = re.compile(
+    r"\b(?:e-?mail|mail id|number|phone|mobile|whats ?app|contact|reach you|text you|"
+    r"call you (?:on|at))\b",
+    re.IGNORECASE,
+)
+
+
+def _contact_asked(ctx: "GuardContext") -> bool:
+    """D4-CONTACT1: the advisor's current turn asked for her contact details."""
+    advisor = ctx.advisor_said[-1] if ctx.advisor_said else ""
+    return _CONTACT_ASKED.search(advisor) is not None
+
+
+def _seven_is_money(sentence: str, ctx: "GuardContext") -> bool:
+    """D4-SEVEN1: a bare "seven" in ``sentence`` is the $7,000, not a clock time."""
+    advisor = ctx.advisor_said[-1] if ctx.advisor_said else ""
+    if _SEVEN_CLOCK.search(sentence) is not None or _SEVEN_CLOCK.search(advisor) is not None:
+        return False
+    return _SEVEN_MONEY.search(sentence) is not None or _SEVEN_MONEY.search(advisor) is not None
+
+
 def _anchor_taken_as_offer(sentence: str, ctx: "GuardContext") -> bool:
     """The learner treats the $7,000 as a price the advisor offered (it only raised it itself)."""
     canon = _anchor_canon(sentence)
-    if _ANCHOR_REACTION.search(canon) is not None or _SEVEN_CONFIRMED.search(sentence) is not None:
+    if _ANCHOR_REACTION.search(canon) is not None:
         return True
+    if _SEVEN_CONFIRMED.search(sentence) is not None:
+        return not ctx.anchor_time_aware or _seven_is_money(sentence, ctx)
     return ctx.anchor_in_reply and _RELIEF.search(sentence) is not None
 
 LEARNER_PHASE = "roleplay"
@@ -503,6 +548,23 @@ _NO_PRICE_HEARD = re.compile(
 # D3-LRN-ACK1 (R1_EASED_ACK_V2): the stock thanks for easing off.
 _THANKS_FOR_ROOM = re.compile(
     r"\bthanks? (?:you )?for giving me (?:the |some |a bit of |a little )?(?:time|space|room)\b",
+    re.IGNORECASE,
+)
+# Simulation diagnosis 4.  D4-TIMECUE1 (R1_TIME_CUE_V3): once her time cue was said, a free reply
+# does not say it again in other words.  D4-COMEBACK1 (R1_COME_BACK_V2): a come-back never points
+# at what the advisor said or how often ("You've said small a couple of times now").  D4-F3STOCK1
+# (R1_F3_WORDING): "<six months> is a real commitment" is said once a call.
+_TIME_CUE_AGAIN = re.compile(
+    r"\bonly (?:have|got|'ve got) (?:a couple of|a few|two|a few more) minutes\b"
+    r"|\b(?:need|have) to (?:wrap up|head out|get going|go|leave|hop off) in (?:a couple of|a few|"
+    r"two) minutes\b"
+    r"|\b(?:a couple of|a few|two) (?:more )?minutes (?:left|before i (?:need|have) to)\b",
+    re.IGNORECASE,
+)
+_REPETITION_REPROACH = re.compile(
+    r"\byou(?:'ve| have) (?:said|mentioned|told me)\b[^.?!]{0,40}\b(?:a couple of times|twice|"
+    r"a few times|again|already|more than once)\b"
+    r"|\byou keep (?:saying|telling me)\b",
     re.IGNORECASE,
 )
 # D3-LRN-QDIET (R1_QUESTION_DIET_V2): a follow-up shares a content word of this many letters or more
@@ -1438,6 +1500,27 @@ class GuardContext:
     # dollars or in rupees), so "nobody has told me the price" / "I still haven't heard what it
     # costs" contradicts the call and is taken out.
     price_heard: bool = False
+    # Simulation diagnosis 4 (each the engine's rollback flag, default ON):
+    # ``anchor_time_aware`` (R1_ANCHOR_TIME_AWARE, D4-SEVEN1): "seven it is" is the $7,000 only
+    # with money context and never a clock time; ``committed``: the commitment is on record, so a
+    # misread sentence is dropped and never swapped for the price question.
+    # ``contact_v2`` (R1_CONTACT_READER_V2, D4-CONTACT1): the narrow spoken e-mail reader, and the
+    # form line only when the advisor asked for contact details.
+    # ``short_on_time`` (R1_TIME_CUE_V3, D4-TIMECUE1): her time cue was said, so a free reply asks
+    # no new-topic question and does not say the cue again.
+    # ``decider_spacing`` (R1_DECIDER_SPACING, D4-DECIDER1): a commitment line that names her
+    # decision maker is coming, so a free reply's decider clause is cut (never the only sentence).
+    # ``clause_orphan_v2`` (R1_CLAUSE_ORPHAN_V2, D4-FRAG1): a cut never leaves "Since ..." alone.
+    # ``come_back_v2`` (R1_COME_BACK_V2, D4-COMEBACK1): no "you've said X a couple of times".
+    # ``f3_wording`` (R1_F3_WORDING, D4-F3STOCK1): "is a real commitment" once a call.
+    anchor_time_aware: bool = False
+    committed: bool = False
+    contact_v2: bool = False
+    short_on_time: bool = False
+    decider_spacing: bool = False
+    clause_orphan_v2: bool = False
+    come_back_v2: bool = False
+    f3_wording: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -1593,7 +1676,7 @@ def _shared_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         ctx.echo_guard and ctx.is_learner and _course_work_graded(sentence)
     ):
         hits.append(_hit(EVALUATION, "scoring_vocabulary", sentence))
-    if has_contact_detail(sentence):
+    if has_contact_detail(sentence, narrow=ctx.contact_v2):
         hits.append(_hit(CONTACT, "contact_detail", sentence))
     if fuzzy_contains(sentence, EXIT_CUE, 0.9) and word_count(sentence) <= 12:
         hits.append(_hit(SCRIPTED_CUE, "exit_line_imitation", sentence))
@@ -2072,10 +2155,14 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
         if need is not None:
             return "" if need.rule in ctx.spent_topics else ctx.persona.surface(need.rule)
     if ctx.is_learner and CONTACT in categories:
+        if ctx.contact_v2 and not _contact_asked(ctx):
+            return ""  # D4-CONTACT1: nobody asked for her details, so the sentence just goes
         return CONTACT_REPLACEMENT
     if ctx.is_learner and MISREAD in categories:
         rule = next(hit.rule for hit in hits if hit.category == MISREAD)
         if rule == "anchor_taken_as_offer":
+            if ctx.anchor_time_aware and (ctx.committed or ctx.confirm):
+                return ""  # D4-SEVEN1: the price is settled; never ask it again
             return ANCHOR_REPLACEMENT
         if rule == "gratitude_for_nothing":
             return GRATITUDE_REPLACEMENT
@@ -2182,6 +2269,17 @@ class StreamGuard:
             if pattern.search(text) is None:
                 continue
             if key == PHRASE_DECIDER_STALL and ctx.decider_asked:
+                recent = any(key in phrases for phrases in ctx.recent_phrases[-2:])
+                if ctx.decider_spacing and recent and self._emitted:
+                    # D4-DECIDER1: she said it in one of her last two lines (a push or a
+                    # commitment line too): asked again, the rest of her answer stands and the
+                    # stall is not said a third time; never the only sentence.
+                    text = _without_clauses(
+                        text, pattern, orphans=ctx.orphan_clause, orphan_tail=ctx.clause_orphan_v2
+                    )
+                    if not text:
+                        return ""
+                    continue
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
                 continue
             if key == PHRASE_STALL_CLOSER and (
@@ -2194,7 +2292,9 @@ class StreamGuard:
                 continue
             if self._stall_blocked(key):
                 cut_first = _first_clause_matches(text, pattern)
-                text = _without_clauses(text, pattern, orphans=ctx.orphan_clause)
+                text = _without_clauses(
+                    text, pattern, orphans=ctx.orphan_clause, orphan_tail=ctx.clause_orphan_v2
+                )
                 if text and ctx.echo_guard and cut_first and _points_back(text):
                     # U5: "I'll reach out myself ..., that suits me better." leaves "That suits me
                     # better." pointing at the clause just cut before it.  A "that" clause the cut
@@ -2411,6 +2511,18 @@ class StreamGuard:
                 )
             else:
                 self._phrases_used[PHRASE_STRETCH] = self._phrases_used.get(PHRASE_STRETCH, 0) + 1
+        if ctx.f3_wording and REAL_COMMITMENT.search(text) is not None:
+            # D4-F3STOCK1: "Six months is a real commitment." once a call; a second one goes (its
+            # clause, or the whole sentence when that was all of it).
+            key = PHRASE_REAL_COMMITMENT
+            if self._phrase_count(key) >= 1:
+                text = _without_clauses(text, REAL_COMMITMENT)
+                if not text:
+                    self._style_edits += 1
+                    self._repeat_drops += 1
+                    return ""
+            else:
+                self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
         if CONCESSION_TAG.search(text) is not None:
             if self._phrase_count(PHRASE_CONCESSION_TAG) >= PHRASE_QUOTA[PHRASE_CONCESSION_TAG]:
                 text = _strip_concession_tag(text, tidy=ctx.echo_guard)
@@ -2541,6 +2653,19 @@ class StreamGuard:
             if kept and self.ctx.eased_ack_v2 and _THANKS_FOR_ROOM.search(kept) is not None:
                 # D3-LRN-ACK1: "Thanks for giving me the room on that." is a stock phrase.
                 kept = _without_clauses(kept, _THANKS_FOR_ROOM)
+            if kept and self.ctx.short_on_time:
+                if _TIME_CUE_AGAIN.search(kept) is not None:
+                    kept = ""  # D4-TIMECUE1: her time cue was said once already
+                elif (
+                    "?" in kept
+                    and self._emitted
+                    and not self._follow_up(kept)
+                    and not self._comes_back(kept)
+                ):
+                    kept = ""  # D4-TIMECUE1: short on time, she opens no new topic
+            if kept and self.ctx.come_back_v2 and _REPETITION_REPROACH.search(kept) is not None:
+                # D4-COMEBACK1: no "you've said small a couple of times now": the question stays.
+                kept = _without_clauses(kept, _REPETITION_REPROACH)
             if kept != out:
                 self._style_edits += 1
                 if not kept:
@@ -2769,12 +2894,24 @@ def _bare_reproach(text: str) -> bool:
     )
 
 
-def _without_clauses(text: str, pattern: re.Pattern[str], *, orphans: bool = False) -> str:
+# D4-FRAG1 (R1_CLAUSE_ORPHAN_V2): a kept clause that opens with one of these leans on the clause
+# just cut before it ("Money's the part I'd go over with him, since it's a stretch." left "Since
+# it's a real stretch at home right now."), so it goes too.
+_DEPENDENT_OPENER = re.compile(
+    r"^\W*(?:since|because|'?cause|as|which|who|whereas)\b", re.IGNORECASE
+)
+
+
+def _without_clauses(
+    text: str, pattern: re.Pattern[str], *, orphans: bool = False, orphan_tail: bool = False
+) -> str:
     """``text`` without the comma-separated clauses that match ``pattern`` ("" if little is left).
 
     "That helps, but it's still more than I planned for." keeps "That helps."; a sentence whose
     only substance was the clause (fewer than three words left) is dropped whole.  ``orphans``
-    (ST1 (3)): a subordinate clause whose next clause was cut goes with it.
+    (ST1 (3)): a subordinate clause whose next clause was cut goes with it.  ``orphan_tail``
+    (D4-FRAG1): a clause that opens with "since", "because", "as" or "which" right after a cut
+    clause goes with it as well.
     """
     stripped = text.rstrip()
     end = stripped[-1:] if stripped[-1:] in (".", "?", "!") else "."
@@ -2789,6 +2926,10 @@ def _without_clauses(text: str, pattern: re.Pattern[str], *, orphans: bool = Fal
                 and cut[index + 1]
                 and _SUBORDINATE_OPENER.match(part)
             ):
+                cut[index] = True
+    if orphan_tail:
+        for index in range(1, len(parts)):
+            if not cut[index] and cut[index - 1] and _DEPENDENT_OPENER.match(parts[index]):
                 cut[index] = True
     kept = [part for part, gone in zip(parts, cut) if not gone]
     if not kept:

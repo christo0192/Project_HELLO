@@ -3321,6 +3321,7 @@ class TestRunFlow(R1TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    @mock.patch.dict(os.environ, {"R1_EXIT_WRAP_V2": "0"})  # Simulation diagnosis 4: the release before
     async def test_pre_join_to_complete_with_each_line_persisted_exactly_once(self) -> None:
         task = asyncio.create_task(
             run_r1_session(self.ctx, session_factory=self.session_factory)
@@ -3406,7 +3407,10 @@ class TestRunFlow(R1TestCase):
         await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
         self.clock.advance(1201)
         self.final_transcript("let me summarise the offer")
-        await self.until(lambda: self.spoken_and_played("L-WRAP"))
+        # Simulation diagnosis 4 (R1_EXIT_WRAP_V2): the time cap's one exit line asks the question.
+        await self.until(
+            lambda: self.spoken_and_played("L-WRAP") or self.spoken_and_played("L-EXIT-WRAP-TIME")
+        )
         await self.until(lambda: self._machine_phase() is R1Phase.WRAPUP)
         await self.settle()
         return task
@@ -3486,7 +3490,7 @@ class TestRunFlow(R1TestCase):
         self.assertFalse(fidelity["checks"]["r_reached_10_min"])
         self.assertFalse(fidelity["passes"])
 
-    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0"})  # Simulation diagnosis 3: the release before
+    @mock.patch.dict(os.environ, {"R1_END_ASIDE_V2": "0", "R1_EXIT_WRAP_V2": "0"})  # the release before
     async def test_a_confirmed_request_to_stop_ends_the_roleplay_into_the_wrapup(self) -> None:
         # Owner test 7f2a25e6: "can you disconnect the call?" gets the interviewer's question once.
         # Owner decision 2026-10-29 (owner test 1eb18cd4): "End the interview." then ends the
@@ -3501,6 +3505,7 @@ class TestRunFlow(R1TestCase):
         await self.finish_the_wrapup_after_a_stop(task)
         self.assertEqual(self.session.spoken.count(self.spoken_line("L-ASIDE-END")), 1)
 
+    @mock.patch.dict(os.environ, {"R1_EXIT_WRAP_V2": "0"})  # Simulation diagnosis 4: the release before
     async def test_a_farewell_exit_says_her_bye_then_one_exit_and_wrap_line(self) -> None:
         """Simulation diagnosis 3 (D3-EXIT1, R1_FAREWELL_EXIT_V2): the advisor's goodbye ended the
         call: her short bye, then L-EXIT-WRAP (no beat, no separate L-WRAP)."""
@@ -3521,6 +3526,7 @@ class TestRunFlow(R1TestCase):
         self.assertNotIn(self.spoken_line("L-WRAP"), spoken)
         self.assertTrue(self.spoken_line("L-EXIT-WRAP").startswith("Let's stop the role-play here."))
 
+    @mock.patch.dict(os.environ, {"R1_EXIT_WRAP_V2": "0"})  # Simulation diagnosis 4: the release before
     async def test_an_explicit_first_request_ends_the_roleplay_with_no_question(self) -> None:
         # Owner test 1eb18cd4, 81: "Let's end the interview." names the interview, so it is taken
         # as confirmed: no L-ASIDE-END (it would only ask the candidate to say exactly that).
@@ -3529,6 +3535,61 @@ class TestRunFlow(R1TestCase):
         self.assertTrue(await self.answer("Let's end the interview."))
         await self.finish_the_wrapup_after_a_stop(task)
         self.assertNotIn(self.spoken_line("L-ASIDE-END"), self.session.spoken)
+
+    # ------------------------------------------- Simulation diagnosis 4 (D4-EXIT1, R1_EXIT_WRAP_V2)
+    async def finish_after_one_exit_line(self, task: asyncio.Task, exit_line: str) -> list[str]:
+        """The role-play ended: ONE Christy line leaves it and asks the wrap-up question, then the
+        wrap-up and the close.  Returns the spoken line texts."""
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
+            await self.candidate_replies_after(exit_line, "No questions, thanks")
+            self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
+        spoken = self.session.spoken
+        self.assertEqual(spoken[-2:], [self.spoken_line(exit_line), self.spoken_line("L-CLOSE")])
+        for old in ("L-EXIT", "L-WRAP", "L-EXIT-WRAP"):
+            self.assertNotIn(self.spoken_line(old), spoken)
+        text = self.spoken_line(exit_line)
+        self.assertIn("let's pause the role-play here", text.lower())
+        self.assertIn("do you have any questions for me about the role or the next steps?", text)
+        self.assertEqual(text.count("Christy"), 0 if exit_line == "L-EXIT-WRAP-ASIDE" else 1)
+        phases = {row["text"]: row["phase"] for row in self.bot_rows()}
+        self.assertEqual(phases[text], "roleplay_exit")
+        return spoken
+
+    async def test_d4_the_time_cap_says_one_exit_line_after_her_time_up(self) -> None:
+        task = await self.drive_to_the_roleplay()
+        self.clock.advance(1201)
+        self.final_transcript("let me summarise the offer")
+        spoken = await self.finish_after_one_exit_line(task, "L-EXIT-WRAP-TIME")
+        self.assertEqual(spoken[-3], self.spoken_line("L-TIME-UP"))
+
+    async def test_d4_an_explicit_request_to_stop_gets_one_exit_line_that_answers_it(self) -> None:
+        task = await self.drive_to_the_roleplay()
+        self.clock.advance(60)
+        self.assertTrue(await self.answer("Let's end the interview."))
+        await self.finish_after_one_exit_line(task, "L-EXIT-WRAP-END")
+
+    async def test_d4_a_stop_confirmed_to_christys_question_needs_no_second_introduction(
+        self,
+    ) -> None:
+        task = await self.drive_to_the_roleplay()
+        self.clock.advance(60)
+        self.assertTrue(await self.answer("Okay, never mind, can you disconnect the call?"))
+        await self.until(lambda: self.spoken_and_played("L-ASIDE-END-2"))
+        await self.settle()
+        self.assertTrue(await self.answer("End the interview."))
+        await self.finish_after_one_exit_line(task, "L-EXIT-WRAP-ASIDE")
+
+    async def test_d4_a_farewell_exit_says_her_bye_a_beat_then_one_exit_line(self) -> None:
+        task = await self.drive_to_the_roleplay()
+        self.clock.advance(900)
+        engine = self.session.agent.interview.engine
+        engine.exit_farewell = True
+        engine._exit_via_close = True
+        engine.exit_bye = "L-LEARNER-BYE-1"
+        engine.exit_requested = True
+        self.session.agent.interview._wake()
+        spoken = await self.finish_after_one_exit_line(task, "L-EXIT-WRAP-2")
+        self.assertEqual(spoken[-3], self.spoken_line("L-LEARNER-BYE-1"))
 
     def _machine_phase(self):
         # run_r1_session builds its own interview; the agent holds a reference to it.

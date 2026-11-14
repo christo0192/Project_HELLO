@@ -537,6 +537,7 @@ class PlanModeTests(unittest.TestCase):
         self.assertEqual(eng.scheduler._states[F3_PRIMARY].status, "delivered")
         self.assertEqual(eng.admin_log()["intents"]["fallback_appended"], {F3_PRIMARY: 1})
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_CONTACT_READER_V2": "0"})  # Simulation diagnosis 4: the release before
     def test_guard_swallowing_cannot_lose_an_owed_move(self):
         """S0-B: guard replacements swallowed whole owed lines; a scripted variant cannot be."""
         eng = engine()
@@ -8191,7 +8192,7 @@ class PushAfterReactionTests(unittest.TestCase):
                 return r
         self.fail("F4's primary was never raised")
 
-    @mock.patch.dict(r1_roleplay.os.environ, {"R1_F4_ORGANIC": "0"})
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_F4_ORGANIC": "0", "R1_DECIDER_SPACING": "0"})
     def test_j_the_f4_push_waits_once_and_refers_back_to_a_decider_she_named(self):
         answer = "Plenty of our learners started with the same worry and found the weekend rhythm fine."
         s = Session(engine())
@@ -8603,6 +8604,7 @@ class LearnerVoiceShapeTests(unittest.TestCase):
 class WorryAndPreemptedTests(unittest.TestCase):
     """S2 items 3 and 4, SWEEP-16 (R1_LEARNER_VOICE_V2)."""
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_F3_WORDING": "0"})  # Simulation diagnosis 4: the release before
     def test_f3_and_f2_worries_are_objectives_with_statement_fallbacks_first(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -10753,6 +10755,7 @@ class TimeCueV2Tests(unittest.TestCase):
             _s, plan, _r = self.cued("cue-2")
         self.assertEqual(plan.intent.brief, SPEC_BY_ID[TIME_CUE].brief)
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_TIME_CUE_V3": "0"})  # Simulation diagnosis 4: the release before
     def test_after_the_cue_a_free_reply_is_short_and_asks_nothing_new(self):
         s, _plan, r = self.cued()
         replies = []
@@ -11891,6 +11894,7 @@ class ComeBackEngineTests(unittest.TestCase):
         s.reply = "Okay."
         return s
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_COME_BACK_V2": "0"})  # Simulation diagnosis 4: the release before
     def test_a_deferral_with_a_question_gets_the_after_ask_note_and_no_curiosity(self):
         from r1_prompts import (
             ASKED_DIRECTLY_NOTE,
@@ -11912,6 +11916,7 @@ class ComeBackEngineTests(unittest.TestCase):
         self.assertNotIn("You are curious about", plan.reminder)
         self.assertEqual(plan.guard_ctx.reask_topic, "payment")
 
+    @mock.patch.dict(r1_roleplay.os.environ, {"R1_COME_BACK_V2": "0"})  # Simulation diagnosis 4: the release before
     def test_a_vague_answer_gets_the_note_and_is_not_an_answer(self):
         from r1_prompts import ANSWERED_YOU_NOTE, ANSWERED_YOU_NOTE_V2, OPEN_QUESTION_NOTE
 
@@ -13840,3 +13845,430 @@ class EarlyCloseByeReviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------------------------------------------
+# Simulation diagnosis 4 (the full-interview flow judge).  Synthetic text only.
+# ------------------------------------------------------------------------------------------------
+import dataclasses  # noqa: E402
+import r1_text  # noqa: E402
+from r1_tracker import DisclosureGate  # noqa: E402
+
+
+def d4_flags(**values):
+    return mock.patch.dict(r1_roleplay.os.environ, values)
+
+
+def settled_session(r=200.0):
+    """Every graded move delivered and the commitment on record (the end game)."""
+    s = done_session(r=r)
+    s.eng.scheduler.commitment_resolved = True
+    return s
+
+
+class D4ExitKindTests(unittest.TestCase):
+    """D4-EXIT1 (R1_EXIT_WRAP_V2): her bye whenever her last line did not END on a farewell, and the
+    engine says how the role-play ended so the session picks its one exit line."""
+
+    def test_a_closer_that_is_no_goodbye_still_gets_her_bye_back(self):
+        s = settled_session()
+        s.reply = "I'll keep an eye out for the invite."
+        s.say("Great, I'll send the calendar invite for tomorrow then.", 880)
+        self.assertTrue(s.spoken[-1].endswith("keep an eye out for the invite."))
+        plan = s.say("Take care, bye for now!", 900)
+        self.assertIs(plan.mode, TurnMode.EXIT)
+        self.assertIn(s.eng.exit_bye, r1_roleplay.LEARNER_BYE_LINES)
+        self.assertEqual(s.eng.exit_kind(), r1_roleplay.EXIT_FAREWELL)
+
+    def test_flag_off_keeps_the_closer_rule(self):
+        with d4_flags(R1_EXIT_WRAP_V2="0"):
+            s = settled_session()
+            s.reply = "I'll keep an eye out for the invite."
+            s.say("Great, I'll send the calendar invite for tomorrow then.", 880)
+            plan = s.say("Take care, bye for now!", 900)
+            self.assertIs(plan.mode, TurnMode.EXIT)
+            self.assertIsNone(s.eng.exit_bye)
+
+    def test_a_line_that_ended_on_a_goodbye_gets_no_second_bye(self):
+        s = settled_session()
+        s.reply = "Thanks so much, bye!"
+        s.say("Great, I'll send the calendar invite for tomorrow then.", 880)
+        plan = s.say("Take care, bye for now!", 900)
+        self.assertIs(plan.mode, TurnMode.EXIT)
+        self.assertIsNone(s.eng.exit_bye)
+
+    def test_each_way_out_has_its_kind(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        self.assertEqual(s.eng.exit_kind(), r1_roleplay.EXIT_TIME)
+        plan = s.say("Let's end the interview.", 60)
+        self.assertIs(plan.mode, TurnMode.EXIT)
+        self.assertEqual(s.eng.exit_kind(), r1_roleplay.EXIT_END_REQUEST)
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say("Okay, never mind, can you disconnect the call?", 60)
+        plan = s.say("End the interview.", 80)
+        self.assertIs(plan.mode, TurnMode.EXIT)
+        self.assertEqual(s.eng.exit_kind(), r1_roleplay.EXIT_ASIDE)
+        s.eng.wrap_accepted = True
+        self.assertEqual(s.eng.exit_kind(), r1_roleplay.EXIT_ASIDE)
+
+
+class D4FarewellReaderTests(unittest.TestCase):
+    """D4-GOODBYE1 (R1_FAREWELL_READ_V3): "good night" and "talk tomorrow at seven" are goodbyes."""
+
+    def test_good_night_and_talk_tomorrow_are_close_attempts(self):
+        text = "Good night, Meera. Talk tomorrow at seven."
+        self.assertTrue(r1_scheduler.is_close_attempt(text, 900, wide=True))
+        self.assertFalse(r1_scheduler.is_close_attempt(text, 900))
+        self.assertTrue(r1_scheduler.is_close_attempt("See you then, Meera.", 900, wide=True))
+        self.assertFalse(
+            r1_scheduler.is_close_attempt("We can talk later about the fees.", 900, wide=True)
+        )
+        self.assertFalse(
+            r1_scheduler.is_close_attempt("Shall we talk tomorrow at seven?", 900, wide=True)
+        )
+
+    def test_her_good_night_line_is_a_sign_off(self):
+        line = "Good night, and thanks again. Looking forward to tomorrow at seven."
+        self.assertTrue(r1_text.is_sign_off(line, wide=True))
+        self.assertFalse(r1_text.is_sign_off(line))
+        self.assertTrue(r1_roleplay.ends_on_farewell("Okay, talk tomorrow at 7 pm.", wide=True))
+        self.assertFalse(r1_roleplay.ends_on_farewell("Okay, talk tomorrow at 7 pm.", wide=False))
+
+    def test_youre_welcome_good_night_ends_the_call_after_the_commitment(self):
+        s = settled_session()
+        s.reply = "Great, thanks so much."
+        s.say("Wonderful, you're all set for the call tomorrow.", 880)
+        plan = s.say("You're welcome. Good night.", 900)
+        self.assertIs(plan.mode, TurnMode.EXIT)
+        with d4_flags(R1_FAREWELL_READ_V3="0"):
+            s = settled_session()
+            s.reply = "Great, thanks so much."
+            s.say("Wonderful, you're all set for the call tomorrow.", 880)
+            plan = s.say("You're welcome. Good night.", 900)
+            self.assertIsNot(plan.mode, TurnMode.EXIT)
+
+    def test_two_courtesy_goodbyes_after_the_commitment_end_the_role_play(self):
+        s = settled_session()
+        s.eng._commitment_level = Level.MEDIUM
+        # Christy's offers to wrap up were asked out (the terse call): only the goodbyes are left.
+        s.eng._wrap_offers.extend({"trigger": "x", "answer": "no", "r_sec": 0.0} for _ in range(2))
+        first = s.say("Okay, thank you.", 900)
+        self.assertIsNot(first.mode, TurnMode.EXIT)
+        second = s.say("Sure, thanks.", 915)
+        self.assertIs(second.mode, TurnMode.EXIT)
+        self.assertIn("farewell_run_exit", second.reasons)
+
+    def test_before_14_00_the_run_never_ends_the_role_play(self):
+        s = settled_session()
+        s.say("Okay, thank you.", 600)
+        plan = s.say("Sure, thanks.", 615)
+        self.assertNotIn("farewell_run_exit", plan.reasons)
+
+
+class D4AnchorTimeTests(unittest.TestCase):
+    """D4-SEVEN1 (R1_ANCHOR_TIME_AWARE): "seven it is" as a clock time is no $7,000 misread."""
+
+    def ctx(self, advisor, **kwargs):
+        kwargs.setdefault("offer_usd", 8000)
+        return d3_ctx(free_reply=True, advisor_said=(fold_text(advisor),), **kwargs)
+
+    def test_a_clock_time_is_no_misread(self):
+        ctx = self.ctx("What time suits you both tomorrow? Maybe seven?", anchor_time_aware=True)
+        out = guard_text("Seven it is, and yes, the email would help.", ctx)
+        self.assertNotIn("anchor_taken_as_offer", [hit.rule for hit in out.hits])
+        self.assertNotIn("actual price", out.text)
+        off = self.ctx("What time suits you both tomorrow? Maybe seven?")
+        self.assertIn(
+            "anchor_taken_as_offer",
+            [hit.rule for hit in guard_text("Seven it is, and yes, the email would help.", off).hits],
+        )
+
+    def test_the_price_misread_is_still_caught(self):
+        ctx = self.ctx("The best I can do is $8,000, not $7,000.", anchor_time_aware=True)
+        out = guard_text("So seven it is then?", ctx)
+        self.assertIn("anchor_taken_as_offer", [hit.rule for hit in out.hits])
+        self.assertEqual(out.text, r1_guard.ANCHOR_REPLACEMENT)
+
+    def test_after_the_commitment_a_misread_is_dropped_not_replaced(self):
+        ctx = self.ctx(
+            "The best I can do is $8,000, not $7,000.", anchor_time_aware=True, committed=True
+        )
+        out = guard_text("Okay. So seven it is then.", ctx)
+        self.assertNotIn(r1_guard.ANCHOR_REPLACEMENT, out.text)
+
+
+def fold_text(text):
+    return r1_guard.advisor_text_of(text)
+
+
+class D4ContactReaderTests(unittest.TestCase):
+    """D4-CONTACT1 (R1_CONTACT_READER_V2): "be at a live one" is no spoken e-mail address."""
+
+    def test_the_narrow_reader(self):
+        for text in ("I can't always be at a live one.", "be at a live session"):
+            self.assertTrue(r1_text.has_contact_detail(text))
+            self.assertFalse(r1_text.has_contact_detail(text, narrow=True))
+        for text in ("it's priya at gmail dot com", "priya dot r at outlook dot com"):
+            self.assertTrue(r1_text.has_contact_detail(text, narrow=True))
+
+    def test_her_reply_about_live_sessions_is_kept(self):
+        advisor = "Mentors help you catch up; sessions are recorded too."
+        ctx = d3_ctx(
+            free_reply=True,
+            contact_v2=True,
+            echo_guard=True,
+            advisor_terms=r1_guard.advisor_terms_in(advisor),
+            advisor_said=(fold_text(advisor),),
+        )
+        text = "Recorded sessions would help, since I can't always be at a live one."
+        out = guard_text(text, ctx)
+        # No contact detail, so never the form line (the probe-first format rule may still drop
+        # "a live one", a format she was not told about).
+        self.assertNotIn("contact_detail", [hit.rule for hit in out.hits])
+        self.assertNotEqual(out.text, CONTACT_REPLACEMENT)
+        old = guard_text(text, dataclasses.replace(ctx, contact_v2=False))
+        self.assertEqual(old.text, CONTACT_REPLACEMENT)
+
+    def test_the_form_line_only_answers_a_request_for_details(self):
+        said = "It's great to hear that. It's priya at gmail dot com."
+        unasked = d3_ctx(
+            free_reply=True, contact_v2=True, advisor_said=(fold_text("We start next month."),)
+        )
+        self.assertNotIn(CONTACT_REPLACEMENT, guard_text(said, unasked).text)
+        asked = d3_ctx(
+            free_reply=True,
+            contact_v2=True,
+            advisor_said=(fold_text("What's the best email to send it to?"),),
+        )
+        self.assertIn(CONTACT_REPLACEMENT, guard_text(said, asked).text)
+
+
+class D4TimeCueTests(unittest.TestCase):
+    """D4-TIMECUE1 (R1_TIME_CUE_V3): no time cue during goodbyes; after it, short and nothing new."""
+
+    def test_no_cue_while_the_call_is_closing(self):
+        s = settled_session()
+        s.eng._enter_closing(r1_roleplay.CLOSING_WINDING)
+        plan = s.say("Okay, sure.", r1_scheduler.TIME_CUE_SEC + 10)
+        self.assertNotIn(f"owed:{r1_scheduler.TIME_CUE}", plan.reasons)
+        self.assertTrue(s.eng.scheduler.time_cue_held)
+        with d4_flags(R1_TIME_CUE_V3="0", R1_FAREWELL_READ_V3="0"):
+            s = settled_session()
+            s.eng._enter_closing(r1_roleplay.CLOSING_WINDING)
+            s.say("Okay, sure.", r1_scheduler.TIME_CUE_SEC + 10)
+            self.assertFalse(s.eng.scheduler.time_cue_held)
+
+    def test_a_goodbye_run_after_a_commitment_at_17_00_says_no_cue(self):
+        s = settled_session()
+        for step, text in enumerate(("Good night, Meera.", "Talk tomorrow at seven.")):
+            plan = s.say(text, 1020 + 5 * step)
+            self.assertNotIn(f"owed:{r1_scheduler.TIME_CUE}", plan.reasons)
+            if plan.mode is TurnMode.EXIT:
+                break
+        self.assertIs(plan.mode, TurnMode.EXIT)
+
+    def test_after_the_cue_the_cue_again_and_a_new_question_are_dropped(self):
+        ctx = d3_ctx(free_reply=True, short_on_time=True)
+        out = guard_text("Sure, that works. I've only got a couple of minutes left though.", ctx)
+        self.assertEqual(out.text, "Sure, that works.")
+        out = guard_text("Okay, that sounds fine to me. How big are the batches?", ctx)
+        self.assertEqual(out.text, "Okay, that sounds fine to me.")
+        off = d3_ctx(free_reply=True)
+        self.assertIn("batches", guard_text("Okay, that sounds fine to me. How big are the batches?", off).text)
+
+
+class D4DeciderTests(unittest.TestCase):
+    """D4-DECIDER1 and D4-FRAG1 (R1_DECIDER_SPACING, R1_CLAUSE_ORPHAN_V2)."""
+
+    def test_the_wide_decider_reader(self):
+        self.assertTrue(
+            r1_roleplay.asks_decider_wide(
+                "Is the decision mostly yours, or does your husband weigh in on the budget?"
+            )
+        )
+        self.assertFalse(r1_roleplay.asks_decider_wide("My husband weighs in on the budget."))
+
+    def test_a_cut_never_leaves_a_since_clause_alone(self):
+        text = "Money's the part I'd want to go over with him, since it's a real stretch at home right now."
+        over = dict(free_reply=True, phrase_counts=(("decider_stall", 3),))
+        out = guard_text(text, d3_ctx(clause_orphan_v2=True, **over)).text
+        self.assertNotIn("Since", out)
+        self.assertNotIn("since", out)
+        old = guard_text(text, d3_ctx(**over)).text
+        self.assertTrue(old.startswith("Since"))
+
+    def test_the_pushy_turn_keeps_her_whole_answer(self):
+        s = done_session()
+        s.eng._phrases["decider_stall"] = 3
+        s.reply = "Money's the part I'd want to go over with him, since it's a real stretch at home right now."
+        s.say("Okay. So is the decision mostly yours, or does your husband weigh in on the budget?", 400)
+        self.assertEqual(s.spoken[-1], s.reply)
+
+    def test_asked_again_right_after_she_said_it_the_stall_is_not_said_a_third_time(self):
+        ctx = d3_ctx(
+            free_reply=True,
+            decider_asked=True,
+            decider_spacing=True,
+            recent_phrases=(("decider_stall",),),
+        )
+        out = guard_text("Yes, he's involved. I'd need to talk it over with my husband first.", ctx)
+        self.assertEqual(out.text, "Yes, he's involved.")
+        alone = guard_text("I'd need to talk it over with my husband first.", ctx)
+        self.assertEqual(alone.text, "I'd need to talk it over with my husband first.")
+
+    def run_end_game(self, **env):
+        with d4_flags(**env):
+            s = Session(engine(), reply="I'd need to talk it over with my husband first, honestly.")
+            s.say(OPENER, 20)
+            deliver(
+                s.eng, F3_PRIMARY, "F3-PUSH", "F2-PRIMARY", "F2-PUSH", "F1-ANCHOR", "F1-COUNTER",
+                "F4-PRIMARY", r=200,
+            )
+            r = 300.0
+            for _ in range(14):
+                plan = s.say("Our mentors check in with every learner each week.", r)
+                r += 20
+                if s.eng.scheduler.is_delivered("F4-PUSH"):
+                    break
+            return s
+
+    def test_the_push_waits_after_a_line_that_voiced_the_stall_and_still_lands(self):
+        s = self.run_end_game()
+        self.assertTrue(s.eng.scheduler.is_delivered("F4-PUSH"))
+        voiced = [bool(r1_text.DECIDER_STALL.search(text)) for text in s.spoken]
+        for start in range(len(voiced) - 3):
+            self.assertLessEqual(sum(voiced[start : start + 4]), 2, s.spoken)
+        reasons = [reason for plan in s.plans for reason in plan.reasons]
+        self.assertIn("owed_deferred_for_decider", reasons)
+
+
+class D4DigGateTests(unittest.TestCase):
+    """D4-OPENDIG1 and D4-H3GATE1 (R1_DIG_GATE_V3)."""
+
+    def released_h1(self, v3=True):
+        gate = DisclosureGate(P1)
+        gate.dig_gate_v2 = True
+        gate.dig_gate_v3 = v3
+        gate.observe_candidate_turn(H1_PROBE)
+        gate.observe_candidate_turn(FOLLOWUP)  # released (a judge-only release is never told)
+        return gate
+
+    def test_a_price_quote_offers_no_untold_need(self):
+        quote = (
+            "It's $9000 for the whole programme, with discounts of $500, $1000 or $1500. "
+            "How does that sound to you?"
+        )
+        gate = self.released_h1()
+        self.assertEqual(gate.deep_due(gate.observe_candidate_turn(quote)), ())
+
+    def test_a_question_about_her_offers_it(self):
+        gate = self.released_h1()
+        update = gate.observe_candidate_turn("What's behind the timing for you?")
+        self.assertEqual(gate.deep_due(update), ("H1",))
+
+    def test_a_pitch_with_an_open_question_offers_nothing(self):
+        gate = self.released_h1()
+        pitch = "Batches are small and every learner gets a mentor. What would help you decide?"
+        self.assertEqual(gate.deep_due(gate.observe_candidate_turn(pitch)), ())
+        old = self.released_h1(v3=False)
+        self.assertNotEqual(old.deep_due(old.observe_candidate_turn(pitch)), ())
+
+    def h3_hinted(self, v3=True):
+        gate = DisclosureGate(P1)
+        gate.dig_gate_v2 = True
+        gate.dig_gate_v3 = v3
+        update = gate.observe_candidate_turn("How many hours a week could you set aside for this?")
+        self.assertIn("H3", update.first_probes)
+        gate.observe_candidate_turn("That's helpful, thanks for sharing.")
+        return gate
+
+    def test_a_question_about_the_hinted_subject_in_other_words_releases_it(self):
+        ask = (
+            "What's the main thing you'd want to nail down first - the monthly number or the "
+            "schedule?"
+        )
+        gate = self.h3_hinted()
+        update = gate.observe_candidate_turn(ask)
+        self.assertIn("H3", update.released)
+        self.assertIn("H3", gate.deep_due(update))
+        old = self.h3_hinted(v3=False)
+        self.assertNotIn("H3", old.observe_candidate_turn(ask).released)
+
+    def test_a_payment_offer_with_a_figure_releases_nothing(self):
+        gate = self.h3_hinted()
+        update = gate.observe_candidate_turn("Would $500 a month work for you?")
+        self.assertNotIn("H3", update.released)
+
+
+class D4ComeBackTests(unittest.TestCase):
+    """D4-COMEBACK1 (R1_COME_BACK_V2)."""
+
+    def test_an_answer_in_kind_closes_the_question(self):
+        self.assertTrue(
+            r1_roleplay.answers_in_kind(
+                "class_size", "Batches are kept fairly small so mentors can engage with everyone."
+            )
+        )
+        self.assertTrue(
+            r1_roleplay.answers_in_kind(
+                "class_size", "The team will confirm the exact batch size in writing."
+            )
+        )
+        self.assertFalse(r1_roleplay.answers_in_kind("class_size", "How many hours can you give it?"))
+
+    def test_a_small_answer_with_a_pivot_gets_no_come_back(self):
+        def run():
+            s = Session(engine())
+            s.say(OPENER, 20)
+            s.reply = "How many people are in a batch, roughly?"
+            s.say("Happy to help with any questions.", 40)
+            s.reply = "Okay."
+            s.say("It's very small, like an intimate group. How many hours can you give it?", 60)
+            return s
+
+        self.assertIsNone(run().eng._open_q)
+        with d4_flags(R1_COME_BACK_V2="0"):
+            self.assertIsNotNone(run().eng._open_q)
+
+    def test_the_come_back_never_quotes_his_repetition(self):
+        ctx = d3_ctx(free_reply=True, come_back_v2=True)
+        out = guard_text(
+            "You've said small a couple of times now, what number are we talking about?", ctx
+        )
+        self.assertEqual(out.text, "What number are we talking about?")
+
+
+class D4F3WordingTests(unittest.TestCase):
+    """D4-F3STOCK1 (R1_F3_WORDING): the F3 worry without words to copy, proven by its markers."""
+
+    def test_the_worry_names_no_brand_and_the_statements_prove_the_move(self):
+        self.assertNotIn("YouTube", r1_scheduler.F3_PRIMARY_WORRY_V3)
+        self.assertNotIn("Coursera", r1_scheduler.F3_PRIMARY_WORRY_V3)
+        spec = r1_scheduler.SPEC_BY_ID[F3_PRIMARY]
+        for text in r1_scheduler.F3_PRIMARY_WORRY_VARIANTS_V3:
+            self.assertNotIn("YouTube", text)
+            self.assertTrue(r1_scheduler.markers_match(spec.markers, text), text)
+
+    def test_the_intent_brief_uses_it(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = None
+        r = 40.0
+        for _ in range(12):
+            plan = s.say(PITCH, r)
+            r += 25
+            if plan.move_id == F3_PRIMARY:
+                break
+        self.assertEqual(plan.move_id, F3_PRIMARY)
+        self.assertNotIn("YouTube", plan.intent.brief)
+        self.assertIn("react first to the specific thing they just said", plan.intent.brief)
+
+    def test_a_real_commitment_is_said_once(self):
+        ctx = d3_ctx(free_reply=True, f3_wording=True, phrase_counts=(("real_commitment", 1),))
+        out = guard_text(
+            "Six months is a real commitment. I'm not sure it's worth paying for when so much is free.",
+            ctx,
+        )
+        self.assertEqual(out.text, "I'm not sure it's worth paying for when so much is free.")

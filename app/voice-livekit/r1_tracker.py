@@ -50,16 +50,19 @@ from enum import Enum
 from typing import Any, Mapping
 
 from r1_commitment import DISCOUNT_CAP_USD, FAMILIES, AskKind, CommitmentEvidence
+from r1_commitment import call_proposal_in
 from r1_personas import (
     H_TOPICS,
     RenderedPersona,
+    _is_probe_shaped,
+    asks_about_learner,
     asks_open_question,
     deep_need_topics_in,
     detect_followup,
     detect_probes,
     has_question,
 )
-from r1_scheduler import has_refusal, is_pitch_statement
+from r1_scheduler import has_refusal, is_pitch_statement, quotes_price
 from r1_text import (
     canonical_amounts,
     clause_after,
@@ -146,6 +149,9 @@ class GateUpdate:
     # all), or a goal / return question (a dig for the goal need only).
     not_a_dig: bool = False
     goal_dig: bool = False
+    # Simulation diagnosis 4 (D4-OPENDIG1, the engine's R1_DIG_GATE_V3): an open question may offer
+    # an untold need only when it is about her and the advisor put no figure or pitch on the table.
+    open_dig_ok: bool = True
 
 
 # D3-LRN-DUMP1: "I'll send everything over ... Sound good?" and "Shall I book it?" dig for nothing.
@@ -197,6 +203,69 @@ _GOAL_DIG = re.compile(
     re.IGNORECASE,
 )
 GOAL_NEED = "H1"
+# Simulation diagnosis 4 (the engine's R1_DIG_GATE_V3).
+# D4-OPENDIG1: an open question offers an untold need only when it asks about HER (her goal, work,
+# life, worries or decision), never on a turn that quotes a price, names a figure or pitches
+# ("$9,000 ... discounts of $500, $1000 or $1500, how does that sound?" got the age worry).
+_ABOUT_HER = re.compile(
+    r"\byou(?:r|'re|'d|'ve|'ll| are| were| would| have)?\b[^.?!]{0,50}\b(?:goals?|hop(?:e|ing)|"
+    r"want|plans?|work|job|career|role|life|family|kids|husband|worr\w*|concern\w*|decid\w*|"
+    r"decision|feel|felt|think|situation|timing|behind|reason|why|matter\w*|important|"
+    r"holding|stopping|struggl\w*|tried|day|week)\b",
+    re.IGNORECASE,
+)
+# D4-H3GATE1: once the H3 hint was told, a question about its subject in other words ("the
+# monthly number or the schedule?", "is there a rough monthly figure that would work?") within
+# ``SUBJECT_RELEASE_TURNS`` releases it, as long as it names no other need and no figure.  Probe
+# first (D-M032-7) is unchanged: the deep layer is her own constraint, never a course fact.
+SUBJECT_RELEASE_TURNS = 6
+_SUBJECT_WORDS = {
+    "H3": re.compile(
+        r"\b(?:monthly|a month|per month|month to month|afford\w*|budget\w*|money|financ\w*|"
+        r"instal+ments?|emi|payments?|schedule|hours?|weekly|each week|per week|a week|"
+        r"evenings?|weekends?|time|husband|wife|partner|spouse|family|decid\w*|decision|"
+        r"who else)\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def _sales_turn(text: object) -> bool:
+    """D4-OPENDIG1: the advisor put a price, a figure or a pitch on the table this turn."""
+    return (
+        quotes_price(text)
+        or is_pitch_statement(text)
+        or bool(dollar_amounts(canonical_amounts(fold(text))))
+    )
+
+
+def asks_about_her(text: object) -> bool:
+    """D4-OPENDIG1: a question of the advisor's turn is about her own situation."""
+    if asks_open_question(text) or asks_about_learner(text):
+        return True
+    for sentence in split_sentences(fold(text)):
+        if not is_question_like(sentence) and "?" not in sentence:
+            continue
+        if _ABOUT_HER.search(sentence) is not None:
+            return True
+    return False
+
+
+def asks_about_subject(text: object, topic: str) -> bool:
+    """D4-H3GATE1: a question (no closing check, no figure) about ``topic``'s subject."""
+    pattern = _SUBJECT_WORDS.get(topic)
+    if pattern is None:
+        return False
+    for sentence in split_sentences(fold(text)):
+        if not is_question_like(sentence) and "?" not in sentence:
+            continue
+        if is_closing_check(sentence) or dollar_amounts(canonical_amounts(sentence)):
+            continue
+        if not _is_probe_shaped(sentence.lower()) or call_proposal_in(sentence) is not None:
+            continue  # an offer, a choice of plans, a close or a call ask digs for nothing
+        if pattern.search(sentence) is not None:
+            return True
+    return False
 
 
 class DisclosureGate:
@@ -212,6 +281,8 @@ class DisclosureGate:
         self.small_talk = False
         # Simulation diagnosis 3 (D3-LRN-DUMP1): the engine's R1_DIG_GATE_V2.
         self.dig_gate_v2 = False
+        # Simulation diagnosis 4 (D4-OPENDIG1, D4-H3GATE1): the engine's R1_DIG_GATE_V3.
+        self.dig_gate_v3 = False
 
     # ------------------------------------------------------------------ observation
     def observe_candidate_turn(self, text: object, turn: int | None = None) -> GateUpdate:
@@ -239,7 +310,16 @@ class DisclosureGate:
                 next_turn_generic = (
                     generic and self.turn == record.probe_turn + 1 and not (probes - {topic})
                 )
-                if topic in probes or next_turn_generic:
+                # D4-H3GATE1 (R1_DIG_GATE_V3): a question about the hinted need's subject in other
+                # words, soon after the hint, is a dig at it too.
+                subject_dig = (
+                    self.dig_gate_v3
+                    and self.turn - record.probe_turn <= SUBJECT_RELEASE_TURNS
+                    and not (probes - {topic})
+                    and asks_about_subject(text, topic)
+                    and not _sales_turn(text)
+                )
+                if topic in probes or next_turn_generic or subject_dig:
                     self._release(record, "rule")
                     released.append(topic)
         return GateUpdate(
@@ -251,6 +331,7 @@ class DisclosureGate:
             open_question=question and asks_open_question(text),
             not_a_dig=self.dig_gate_v2 and is_closing_check(text),
             goal_dig=self.dig_gate_v2 and _GOAL_DIG.search(fold(text)) is not None,
+            open_dig_ok=not self.dig_gate_v3 or (asks_about_her(text) and not _sales_turn(text)),
         )
 
     # --------------------------------------------------------------------- the layers
@@ -315,7 +396,7 @@ class DisclosureGate:
         """
         if update.probed or update.first_probes or not update.question:
             return None
-        if not update.open_question or update.not_a_dig:
+        if not update.open_question or update.not_a_dig or not update.open_dig_ok:
             return None
         waiting = [
             record

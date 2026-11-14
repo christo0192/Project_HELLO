@@ -266,7 +266,9 @@ from r1_prompts import (
     YOUR_NUMBER_MONTHLY_NOTE,
     YOUR_NUMBER_TOTAL_NOTE,
     OPEN_QUESTION_AFTER_ASK_NOTE,
+    OPEN_QUESTION_AFTER_ASK_NOTE_V2,
     OPEN_QUESTION_NOTE,
+    OPEN_QUESTION_NOTE_V2,
     PRICE_CONFLICT_WEBSITE_NOTE,
     PRICE_MET_NOTE_EARLY,
     PRICE_MET_NOTE_EARLY_V2,
@@ -318,7 +320,9 @@ from r1_prompts import (
     ROLE_CONFUSION_EXAMPLES,
     ROLE_CONFUSION_NOTE,
     SHORT_ON_TIME_CONCERNS_NOTE,
+    SHORT_ON_TIME_CONCERNS_NOTE_V3,
     SHORT_ON_TIME_NOTE,
+    SHORT_ON_TIME_NOTE_V3,
     SOFT_TIC_NOTE,
     STRETCH_USED_NOTE,
     STYLE_NOTES,
@@ -364,7 +368,10 @@ from r1_scheduler import (
     F4_PUSH,
     F4_PUSH_CALL_SUFFIX,
     FAMILIES,
+    F3_PRIMARY_WORRY_V3,
+    F3_PRIMARY_WORRY_VARIANTS_V3,
     TIME_CUE_SEC,
+    TIME_TAIL,
     IDLE_GAP_TURNS,
     LAST_POINT_BRIEF,
     LAST_POINT_BRIEF_V2,
@@ -438,6 +445,7 @@ from r1_text import (
     fuzzy_contains,
     is_closer,
     is_hollow_turn,
+    is_question_like,
     is_sign_off,
     later_price_threat,
     normalize,
@@ -685,17 +693,80 @@ _FAREWELL_RESCUE = re.compile(
 )
 
 
-def ends_on_farewell(text: object) -> bool:
+# Simulation diagnosis 4 (D4-GOODBYE1, R1_FAREWELL_READ_V3): "Talk tomorrow at seven.", "See you
+# then, Meera." and "Night now." end on a farewell too (a clock time and a name may follow).
+_FAREWELL_END_V3 = re.compile(
+    r"\b(?:good ?night|night now|(?:talk|speak)(?: to you)? (?:soon|tomorrow|then|later|"
+    r"next week|on \w+day)|see you(?: (?:tomorrow|then|soon|later|next week|on \w+day))?)"
+    r"(?:" + TIME_TAIL + r")?(?:[\s,-]+[a-z']{2,15})?\W*$",
+    re.IGNORECASE,
+)
+
+
+# D4-COMEBACK1 (R1_COME_BACK_V2): an answer in kind ("kept fairly small", "not a lecture hall",
+# "one-on-one") to her class-size question, or a promise to confirm the detail (in writing, by
+# e-mail, "I'll get back to you on the exact ..."), answers it; neither is a dodge to press on.
+_SIZE_IN_KIND = re.compile(
+    r"\b(?:small|smaller|intimate|tight-?knit|a (?:few|couple of) dozen|a handful|not (?:huge|big|"
+    r"large|massive)|lecture hall|one[- ]on[- ]one|1:1|personal attention|cozy|cosy)\b",
+    re.IGNORECASE,
+)
+_CONFIRM_LATER = re.compile(
+    r"\b(?:confirm|send|share|email|e-mail|mail|get back to you|check)\b[^.?!]{0,50}\b(?:exact|"
+    r"details?|number|size|figure|in writing|by e-?mail|over e-?mail)\b"
+    r"|\bin writing\b",
+    re.IGNORECASE,
+)
+
+
+# D4-FRAG1 (R1_DECIDER_SPACING): "Is the decision mostly yours, or does your husband weigh in on the
+# budget?" asks who decides (the negotiation's reader missed it, so her answer was cut as an
+# over-quota stall).  Questions only.
+_DECIDER_ASKED_WIDE = re.compile(
+    r"\b(?:does|would|will|do|did|can|could) (?:your )?(?:husband|wife|partner|spouse|family|"
+    r"parents?|father|mother|dad|mum|mom) (?:also )?(?:weigh in|have a say|get a say|decide|"
+    r"need to|have to|want to|help (?:you )?decide|chip in|have an opinion)\b"
+    r"|\bis (?:the|this|that) (?:decision|call|choice) (?:mostly |all |entirely |just |only )?"
+    r"(?:yours|up to you|your own)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_decider_wide(text: object) -> bool:
+    """D4-FRAG1: a question of the advisor's that asks whether someone else weighs in."""
+    return any(
+        ("?" in sentence or is_question_like(sentence))
+        and _DECIDER_ASKED_WIDE.search(fold(sentence)) is not None
+        for sentence in split_sentences(str(text or ""))
+    )
+
+
+def answers_in_kind(topic: str, text: object) -> bool:
+    """D4-COMEBACK1: ``text`` answers her open question without a figure, or promises to confirm
+    it; either closes the question (no come-back)."""
+    folded = fold(text)
+    if _CONFIRM_LATER.search(folded) is not None:
+        return True
+    return topic == "class_size" and _SIZE_IN_KIND.search(folded) is not None
+
+
+def ends_on_farewell(text: object, *, wide: bool | None = None) -> bool:
     """D3-EXIT1: the last sentence of the advisor's turn takes leave ("..., good night.").
 
     Review D3R-2: not a question and not a rescue ("Wait, before you go, can I ask one more thing
-    before we say goodbye?"): those keep the call going."""
+    before we say goodbye?"): those keep the call going.  ``wide`` (D4-GOODBYE1; None reads
+    R1_FAREWELL_READ_V3): "Talk tomorrow at seven." and "See you then, Meera." as well."""
+    if wide is None:
+        wide = flag_on(FLAG_FAREWELL_READ_V3)
     sentences = split_sentences(str(text or ""))
     if not sentences:
         return False
     last = fold(sentences[-1])
     return (
-        _FAREWELL_END.search(last) is not None
+        (
+            _FAREWELL_END.search(last) is not None
+            or (wide and _FAREWELL_END_V3.search(last) is not None)
+        )
         and "?" not in last
         and _FAREWELL_RESCUE.search(last) is None
     )
@@ -929,6 +1000,53 @@ FLAG_DIG_GATE_V2 = "R1_DIG_GATE_V2"
 FLAG_FIGURE_NOT_MINE = "R1_FIGURE_NOT_MINE"
 FLAG_END_ASIDE_V2 = "R1_END_ASIDE_V2"
 FLAG_COACH_AFTER_INROLE = "R1_COACH_AFTER_INROLE"
+# Simulation diagnosis 4 (the full-interview flow judge; each defaults ON and OFF restores the
+# release before):
+# * R1_EXIT_WRAP_V2 (D4-EXIT1): every way the role-play ends gets ONE Christy line that keeps the
+#   brief's cue phrase and asks the wrap-up question (``exit_kind``), with no beat and no separate
+#   L-WRAP; her short goodbye goes first whenever her last line did not END on a farewell, and a
+#   short beat follows it.
+# * R1_FAREWELL_READ_V3 (D4-GOODBYE1): "good night", "talk tomorrow (at seven)", "see you then"
+#   and their time tails are farewells, and two farewell or courtesy turns in a row after the
+#   commitment (from R 14:00) end the role-play.
+# * R1_ANCHOR_TIME_AWARE (D4-SEVEN1): "seven it is" is the $7,000 only with money context, never
+#   a clock time, and a misread after the commitment is dropped, not replaced.
+# * R1_CONTACT_READER_V2 (D4-CONTACT1): "be at a live one" is no spoken e-mail address, and the
+#   form line replaces a contact detail only when the advisor asked for one.
+# * R1_TIME_CUE_V3 (D4-TIMECUE1): no time cue during goodbyes, a shorter reply after it, and the
+#   cue is said once.
+# * R1_DECIDER_SPACING (D4-DECIDER1, D4-FRAG1): the owed F4 push waits after a reply that voiced
+#   the decider stall, and "does your husband weigh in" asks who decides.
+# * R1_CLAUSE_ORPHAN_V2 (D4-FRAG1): a cut never leaves a "since ..." clause on its own.
+# * R1_DIG_GATE_V3 (D4-OPENDIG1, D4-H3GATE1): an untold need is offered only on a question about
+#   her, never on a price or a pitch; the F1 reaction is not held for it on a price turn; and a
+#   hinted H3 need is released by a question about its subject.
+# * R1_COME_BACK_V2 (D4-COMEBACK1): a qualitative answer or a promise to confirm answers her
+#   question, and the come-back never points at what he said or how often.
+# * R1_F3_WORDING (D4-F3STOCK1): the F3 worry without the brand names or the question to copy,
+#   and "is a real commitment" at most once a call.
+FLAG_EXIT_WRAP_V2 = "R1_EXIT_WRAP_V2"
+FLAG_FAREWELL_READ_V3 = "R1_FAREWELL_READ_V3"
+FLAG_ANCHOR_TIME_AWARE = "R1_ANCHOR_TIME_AWARE"
+FLAG_CONTACT_READER_V2 = "R1_CONTACT_READER_V2"
+FLAG_TIME_CUE_V3 = "R1_TIME_CUE_V3"
+FLAG_DECIDER_SPACING = "R1_DECIDER_SPACING"
+FLAG_CLAUSE_ORPHAN_V2 = "R1_CLAUSE_ORPHAN_V2"
+FLAG_DIG_GATE_V3 = "R1_DIG_GATE_V3"
+FLAG_COME_BACK_V2 = "R1_COME_BACK_V2"
+FLAG_F3_WORDING = "R1_F3_WORDING"
+# D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
+EXIT_FAREWELL = "farewell"
+EXIT_END_REQUEST = "end_request"
+EXIT_TIME = "time_cap"
+EXIT_ASIDE = "aside"
+# D4-GOODBYE1: this many farewell or courtesy advisor turns in a row end the role-play once the
+# commitment is on record (or she said goodbye) and R >= 14:00.
+FAREWELL_RUN_EXIT = 2
+# D4-DECIDER1: the owed F4 push waits this many exchanges after a reply that voiced the decider
+# stall, unless its deadline is this close.
+DECIDER_HOLD_TURNS = 3
+DECIDER_HOLD_DEADLINE_SEC = 60
 STALL_GAP_REPLIES = 2
 # D3-LRN-MONEY1 (R1_FIGURE_MEMORY): "what's included" is asked at most once in this many replies
 # unless the advisor named a new figure since.
@@ -1027,6 +1145,16 @@ _FLAG_READS = {
     FLAG_FIGURE_NOT_MINE: lambda: os.getenv("R1_FIGURE_NOT_MINE"),
     FLAG_END_ASIDE_V2: lambda: os.getenv("R1_END_ASIDE_V2"),
     FLAG_COACH_AFTER_INROLE: lambda: os.getenv("R1_COACH_AFTER_INROLE"),
+    FLAG_EXIT_WRAP_V2: lambda: os.getenv("R1_EXIT_WRAP_V2"),
+    FLAG_FAREWELL_READ_V3: lambda: os.getenv("R1_FAREWELL_READ_V3"),
+    FLAG_ANCHOR_TIME_AWARE: lambda: os.getenv("R1_ANCHOR_TIME_AWARE"),
+    FLAG_CONTACT_READER_V2: lambda: os.getenv("R1_CONTACT_READER_V2"),
+    FLAG_TIME_CUE_V3: lambda: os.getenv("R1_TIME_CUE_V3"),
+    FLAG_DECIDER_SPACING: lambda: os.getenv("R1_DECIDER_SPACING"),
+    FLAG_CLAUSE_ORPHAN_V2: lambda: os.getenv("R1_CLAUSE_ORPHAN_V2"),
+    FLAG_DIG_GATE_V3: lambda: os.getenv("R1_DIG_GATE_V3"),
+    FLAG_COME_BACK_V2: lambda: os.getenv("R1_COME_BACK_V2"),
+    FLAG_F3_WORDING: lambda: os.getenv("R1_F3_WORDING"),
 }
 
 
@@ -1447,6 +1575,18 @@ class RolePlayEngine:
         self._fresh_price = False
         self._hollow_run = 0
         self._last_reply_closer = False
+        # Simulation diagnosis 4.  D4-EXIT1: whether her last heard line ENDED on a farewell (her
+        # short goodbye back is said only when it did not), how the role-play ended, and whether a
+        # confirmed stop answered Christy's own question.  D4-GOODBYE1: the run of farewell or
+        # courtesy advisor turns.  D4-DECIDER1: the turn her last line voiced the decider stall.
+        self._last_reply_farewell = False
+        self._exit_via_close = False
+        self._end_explicit = False
+        self._farewell_run = 0
+        self._farewell_run_exits = 0
+        self._decider_voiced_turn: int | None = None
+        self._decider_holds = 0
+        self._cue_suppressed = 0
         self._decider_asked_now = False
         self._dig_deferred_topics: set[str] = set()
         # R1-Q final review round 1.  The tracked phrases of each reply (the guard's spacing window
@@ -1930,6 +2070,19 @@ class RolePlayEngine:
             ),
             # D3-WRAP1: a lead-in is no answer in Christy's wrap-up and closing.
             next_steps=phase in ONE_MENTION_PHASES and flag_on(FLAG_WRAPUP_NEXT_STEPS),
+            # Simulation diagnosis 4.
+            anchor_time_aware=flag_on(FLAG_ANCHOR_TIME_AWARE),
+            committed=self.commitment_resolved or self._commitment_level is not None,
+            contact_v2=flag_on(FLAG_CONTACT_READER_V2),
+            short_on_time=(
+                phase == "roleplay"
+                and flag_on(FLAG_TIME_CUE_V3)
+                and self.scheduler.is_delivered(TIME_CUE)
+            ),
+            decider_spacing=flag_on(FLAG_DECIDER_SPACING),
+            clause_orphan_v2=flag_on(FLAG_CLAUSE_ORPHAN_V2),
+            come_back_v2=flag_on(FLAG_COME_BACK_V2),
+            f3_wording=flag_on(FLAG_F3_WORDING),
         )
 
     def _offer_on_table(self) -> int | None:
@@ -2273,6 +2426,7 @@ class RolePlayEngine:
         turn = self.turn
         self.last_r = r_sec
         self._courtesy_after_signoff = False
+        self.scheduler.time_cue_held = False  # D4-TIMECUE1: read again below, every turn
         self._notes = []
         self._price_notes = []
         self._nothing_granted = False
@@ -2328,6 +2482,7 @@ class RolePlayEngine:
         )
         self.tracker.gate.wide_followup = flag_on(FLAG_DIG_FIRST)
         self.tracker.gate.dig_gate_v2 = flag_on(FLAG_DIG_GATE_V2)
+        self.tracker.gate.dig_gate_v3 = flag_on(FLAG_DIG_GATE_V3)
         tangent_on = flag_on(FLAG_TANGENT)
         self.tracker.gate.small_talk = tangent_on
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
@@ -2488,11 +2643,41 @@ class RolePlayEngine:
             if revoiced is not None:
                 return revoiced
         close_attempt = signals.close_attempt
+        read_v3 = flag_on(FLAG_FAREWELL_READ_V3)
+        if read_v3 and not close_attempt:
+            # D4-GOODBYE1: "Good night, Meera. Talk tomorrow at seven." is a goodbye.
+            close_attempt = is_close_attempt(candidate_text, r_sec, wide=True)
         if flag_on(FLAG_CLOSING_STATE):
             close_attempt = self._read_close(reading, close_attempt, reasons)
+        run_exit = read_v3 and self._farewell_run_due(reading, close_attempt, r_sec)
+        if flag_on(FLAG_TIME_CUE_V3):
+            # D4-TIMECUE1: no "I've only got a couple of minutes" while the call is saying goodbye
+            # (the commitment is on record and the close has begun, or this turn takes leave).
+            committed = self.scheduler.commitment_resolved or self._commitment_level is not None
+            held = (
+                (committed and self._closing != CLOSING_OPEN)
+                or close_attempt
+                or farewell_end
+                or ends_on_farewell(reading)
+                or courtesy_goodbye(reading, wide=read_v3)
+            )
+            self.scheduler.time_cue_held = held
+            if (
+                held
+                and TIME_CUE_SEC <= r_sec < COMMIT_STALL_R_SEC
+                and not self.scheduler.is_delivered(TIME_CUE)
+            ):
+                self._cue_suppressed += 1
         held_close = False
-        if close_attempt or farewell_end:
+        if close_attempt or farewell_end or run_exit:
             decision = self.scheduler.register_close_attempt(r_sec)
+            if run_exit and decision.action != "exit":
+                # D4-GOODBYE1: the commitment is on record and the advisor has said goodbye or
+                # courtesy twice in a row from 14:00: the call is over, whatever is still owed.
+                decision = CloseDecision("exit", None, "")
+            if run_exit:
+                self._farewell_run_exits += 1
+                reasons.append("farewell_run_exit")
             if (
                 decision.action == "exit"
                 and r_sec < EARLY_CLOSE_BEFORE_SEC
@@ -2508,12 +2693,13 @@ class RolePlayEngine:
                 decision = CloseDecision("held", None, "")
             if decision.action == "exit":
                 self.exit_requested = True
+                self._exit_via_close = True
                 reasons.append("close_attempt_exit")
                 if flag_on(FLAG_FAREWELL_EXIT_V2):
                     # D3-EXIT1: the advisor's goodbye ended the call: she says bye back first
                     # (unless her last line was one) and the exit and wrap-up are one line.
                     self.exit_farewell = True
-                    if not self._last_reply_closer:
+                    if self._bye_due():
                         self.exit_bye = self._learner_bye()
                         reasons.append("learner_bye")
                 return self._plan(TurnMode.EXIT, reasons)
@@ -2601,7 +2787,17 @@ class RolePlayEngine:
                 self._moment_waits += 1
                 reasons.append("owed_waits_for_moment")
         if move is not None:
-            if reveal_due and self._may_defer(move, r_sec):
+            if (
+                reveal_due
+                and self._may_defer(move, r_sec)
+                and not (
+                    move.family == "F1"
+                    and flag_on(FLAG_DIG_GATE_V3)
+                    and (quotes_price(reading) or self._figure_turn == self.turn)
+                )
+            ):
+                # D4-OPENDIG1 (R1_DIG_GATE_V3): never on a price turn for her F1 reaction: the
+                # price she was just quoted is what she reacts to, not a story he did not ask for.
                 reasons.append("owed_deferred_for_reveal")
             elif (
                 move.id in (F1_ANCHOR, F1_COUNTER)
@@ -2750,6 +2946,14 @@ class RolePlayEngine:
                 reacting = True
                 self._notes.append(PUSH_REACT_NOTE_V2 if voice_v2 else PUSH_REACT_NOTE)
                 reasons.append("owed_deferred_for_reaction")
+            elif self._decider_hold_due(move, r_sec):
+                # D4-DECIDER1 (R1_DECIDER_SPACING): she voiced the decider stall in one of her last
+                # ``DECIDER_HOLD_TURNS`` lines, so the F4 push ("Like I said, I'd need to talk it
+                # over with my husband") waits rather than say it again a turn later.  Never when
+                # its deadline is near or it is forced, nor when he asked about the decision
+                # maker (the push then answers him); graded meaning and deadlines are unchanged.
+                self._decider_holds += 1
+                reasons.append("owed_deferred_for_decider")
             else:
                 if tangent and move.id != COMMIT_STALL:
                     # R1_TANGENT: the move lands anyway (forced, no slack, or already held once):
@@ -3151,6 +3355,73 @@ class RolePlayEngine:
             return False
         return break_kind == "coach" or self._ai_questions >= 1
 
+    def _bye_due(self) -> bool:
+        """D3-EXIT1 / D4-EXIT1: her short goodbye back is owed before the exit line.
+
+        With R1_EXIT_WRAP_V2 only her last line ENDING on a farewell makes it unnecessary ("I'll
+        keep an eye out for the invite." is no goodbye, so his "Take care, bye for now!" gets one);
+        otherwise any closer did (the release before)."""
+        if flag_on(FLAG_EXIT_WRAP_V2):
+            return not self._last_reply_farewell
+        return not self._last_reply_closer
+
+    def _decider_hold_due(self, move: OwedMove, r_sec: float) -> bool:
+        """D4-DECIDER1: the owed F4 push waits after a line that voiced the decider stall."""
+        if move.id != F4_PUSH or not flag_on(FLAG_DECIDER_SPACING):
+            return False
+        if self._decider_voiced_turn is None or self._decider_asked_now:
+            return False
+        if self.turn - self._decider_voiced_turn > DECIDER_HOLD_TURNS:
+            return False
+        if move.forced or (
+            move.deadline_sec is not None
+            and move.deadline_sec - r_sec <= DECIDER_HOLD_DEADLINE_SEC
+        ):
+            return False
+        return True
+
+    def _farewell_run_due(self, reading: str, close_attempt: bool, r_sec: float) -> bool:
+        """D4-GOODBYE1 (R1_FAREWELL_READ_V3): the advisor's second farewell or courtesy turn in a
+        row, from R 14:00, once the commitment is on record or she has said her goodbye.
+
+        Before 14:00 the S3.3 early-close aside decides (consent rule unchanged)."""
+        farewellish = (
+            close_attempt
+            or courtesy_goodbye(reading, wide=True)
+            or ends_on_farewell(reading, wide=True)
+        )
+        self._farewell_run = self._farewell_run + 1 if farewellish else 0
+        settled = (
+            self.scheduler.commitment_resolved
+            or self._commitment_level is not None
+            or self._closing == CLOSING_CLOSED
+        )
+        return (
+            self._farewell_run >= FAREWELL_RUN_EXIT
+            and r_sec >= EARLY_CLOSE_BEFORE_SEC
+            and settled
+        )
+
+    def exit_kind(self) -> str:
+        """D4-EXIT1: how the role-play ended, for its one exit line (R1_EXIT_WRAP_V2).
+
+        ``farewell`` (the advisor's goodbye, the close ladder or an early close taken after her
+        bye), ``aside`` (a yes to Christy's own question: the wrap offer, the early close, the
+        hang-up, the end aside, or the stop after her last point), ``end_request`` (the candidate
+        asked to stop and no question was needed) and ``time_cap`` (R 20:00 or the S cap)."""
+        if self._exit_via_close or self.exit_farewell:
+            return EXIT_FAREWELL
+        if self.wrap_accepted:
+            return EXIT_ASIDE
+        point = self._last_point
+        if point is not None and point.get("answer") in ("exit", "quiet", "auto"):
+            return EXIT_ASIDE
+        if self.end_confirmed:
+            return EXIT_END_REQUEST if self._end_explicit else EXIT_ASIDE
+        if self.exit_requested:
+            return EXIT_END_REQUEST
+        return EXIT_TIME
+
     def _learner_bye(self) -> str:
         """D3-EXIT1: her short goodbye back (a line id), rotated; "You too, bye!" only when he
         wished her something ("take care", "have a good evening")."""
@@ -3275,6 +3546,9 @@ class RolePlayEngine:
         ``end_intent_model`` as well, which also marks a confirmation only the model heard).
         """
         reasons = ["end_confirmed"] + (["end_intent_model"] if by_model else [])
+        # D4-EXIT1: no question of Christy's was answered here, so her exit line answers the
+        # request itself ("Sure. Let's pause ...").
+        self._end_explicit = self._end_aside is None or late
         if self._end_aside is None or late:
             reasons.insert(0, "end_request_explicit")
         if late:
@@ -3359,7 +3633,10 @@ class RolePlayEngine:
         # a hollow or acknowledging turn ("Hmm.", "Okay, so", "We have EMI options.") is the
         # advisor thinking or going on, and only keeps the closing state where it is.
         mutual = (
-            not close_attempt and not handover and signed_off and courtesy_goodbye(reading)
+            not close_attempt
+            and not handover
+            and signed_off
+            and courtesy_goodbye(reading, wide=flag_on(FLAG_FAREWELL_READ_V3))
         )
         if flag_on(FLAG_FAREWELL_EXIT_V2):
             # D3-EXIT1: after her sign-off, a goodbye that recaps or promises first and ENDS on a
@@ -3477,7 +3754,7 @@ class RolePlayEngine:
         )
         plan = self._wrap_line_plan(line_id, [*reasons, "early_close:offer"])
         self._early_close_bye = None
-        if farewell_v2 and not self._last_reply_closer:
+        if farewell_v2 and self._bye_due():
             # D3-ASIDE1 (c), review D3R-8: her short goodbye back is said only once the candidate
             # takes the stop (`_wrap_answer_plan`), so a "keep going" never resumes a call she
             # has already said bye to.
@@ -3777,7 +4054,11 @@ class RolePlayEngine:
         if open_q is None or not flag_on(FLAG_COME_BACK):
             return
         topic = open_q["topic"]
-        if open_question_covered(topic, reading):
+        if open_question_covered(topic, reading) or (
+            flag_on(FLAG_COME_BACK_V2) and answers_in_kind(topic, reading)
+        ):
+            # D4-COMEBACK1: "Batches are kept fairly small" or "the team will confirm the exact
+            # size in writing" answers her question too: she does not press for a number.
             self._open_q = None
             return
         if open_q["dodged_turn"] is not None:
@@ -3833,7 +4114,10 @@ class RolePlayEngine:
         asked = RESPOND_QUESTION in self._turn_kinds or asks_her_directly(reading)
         if ASKED_DIRECTLY_NOTE in self._notes:
             self._notes.remove(ASKED_DIRECTLY_NOTE)
-        template = OPEN_QUESTION_AFTER_ASK_NOTE if asked else OPEN_QUESTION_NOTE
+        if flag_on(FLAG_COME_BACK_V2):
+            template = OPEN_QUESTION_AFTER_ASK_NOTE_V2 if asked else OPEN_QUESTION_NOTE_V2
+        else:
+            template = OPEN_QUESTION_AFTER_ASK_NOTE if asked else OPEN_QUESTION_NOTE
         self._notes.append(template.format(label=open_q["label"]))
         self._come_back_topic = open_q["topic"]
         return True
@@ -4565,7 +4849,9 @@ class RolePlayEngine:
         better than I expected" after raising it itself); and "I can check with my manager" grants
         nothing (the judge flagged the thanks that followed it).
         """
-        if seen.decider_asked:
+        if seen.decider_asked or (
+            flag_on(FLAG_DECIDER_SPACING) and asks_decider_wide(self._turn_reading)
+        ):
             self._decider_asked_now = True
             self._notes.append(DECIDER_ASKED_NOTE.format(answer=self.persona.decider_answer))
         best = self.negotiation.best_offer_usd
@@ -4674,10 +4960,14 @@ class RolePlayEngine:
             # Review S3R-6 (naturalness): polite, never warm, while she is cool (COOL_NOTE).
             notes.append(CLOSE_NOTE_COOL if self._cool else CLOSE_NOTE)
         elif short:
+            cue_v3 = flag_on(FLAG_TIME_CUE_V3)  # D4-TIMECUE1: one short sentence, nothing new
+            with_concerns = (
+                SHORT_ON_TIME_CONCERNS_NOTE_V3 if cue_v3 else SHORT_ON_TIME_CONCERNS_NOTE
+            )
             notes.append(
-                SHORT_ON_TIME_CONCERNS_NOTE.format(concerns=concerns)
+                with_concerns.format(concerns=concerns)
                 if concerns
-                else SHORT_ON_TIME_NOTE
+                else (SHORT_ON_TIME_NOTE_V3 if cue_v3 else SHORT_ON_TIME_NOTE)
             )
             self._short_on_time_notes += 1
         elif mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
@@ -5727,14 +6017,18 @@ class RolePlayEngine:
             # Review S2R-5: this turn's own words count (F3-PRIMARY fires when its topic is fresh),
             # the label names what was said, and never while she must say a figure he did not.
             brief = spec.worry
+            statements = spec.worry_variants
             if self._probe_first and move.id == F2_PRIMARY:
                 brief = F2_PRIMARY_WORRY_V2  # S2.10: no "a course this long" she was never told
+            if move.id == F3_PRIMARY and flag_on(FLAG_F3_WORDING):
+                # D4-F3STOCK1: no brand names or question to copy; react to what he just said.
+                brief = F3_PRIMARY_WORRY_V3
+                statements = F3_PRIMARY_WORRY_VARIANTS_V3
             label = self._preempted_label(spec.family) if spec.role == "primary" else ""
             if label and all(figure in self._advisor_figures for figure in move.must_say):
                 brief += PREEMPTED_SUFFIX.format(label=label)
             move = replace(move, brief=brief)
             worry = True
-            statements = spec.worry_variants
         variants = move.variants or (move.text,)
         if move.id == TIME_CUE:
             # The scripted cue never puts the learner on another call when a variant without it
@@ -6378,6 +6672,7 @@ class RolePlayEngine:
                 # commitment line); the advisor's next turn says whether he agreed.
                 self._email_request_turn = plan.turn
             closing_on = flag_on(FLAG_CLOSING_STATE)
+            read_v3 = flag_on(FLAG_FAREWELL_READ_V3)
             # M032 S3.1: her own sign-off ("I'll give it some proper thought", "let's leave it
             # there"), never on a line that carried an owed move, a negotiation line or a scripted
             # commitment (the stall wording of those is graded, not a goodbye).
@@ -6387,9 +6682,19 @@ class RolePlayEngine:
                 and plan.negotiation_id is None
                 and plan.credit_move_id is None
                 and plan.commitment_level is None
-                and is_sign_off(spoken_text)
+                and is_sign_off(spoken_text, wide=read_v3)
             )
-            self._last_reply_closer = is_closer(spoken_text) or self._last_reply_signoff
+            self._last_reply_closer = (
+                is_closer(spoken_text, wide=read_v3) or self._last_reply_signoff
+            )
+            # D4-EXIT1: did her line END on a farewell ("..., bye!")?  "I'll keep an eye out for the
+            # invite." is a closer but no goodbye: his goodbye after it still gets her bye back.
+            self._last_reply_farewell = ends_on_farewell(spoken_text, wide=read_v3)
+            if (
+                flag_on(FLAG_DECIDER_SPACING)
+                and PHRASE_DECIDER_STALL in reply_phrases(spoken_text)
+            ):
+                self._decider_voiced_turn = plan.turn  # D4-DECIDER1
             if closing_on and "closing_winding" in plan.reasons:
                 self._winding_replies += 1
                 self._enter_closing(CLOSING_CLOSED)  # S3.2: she said her goodbye

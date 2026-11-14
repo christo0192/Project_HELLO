@@ -264,6 +264,19 @@ SHORT_ON_TIME_CONCERNS_NOTE = (
     "they just said, answer anything they asked, and do not bring up a new question or a new "
     "worry."
 )
+# Simulation diagnosis 4 (D4-TIMECUE1, R1_TIME_CUE_V3; new wording under D-M032-4): after her
+# time cue the call moved on to new topics for minutes ("says only a couple of minutes left, but
+# the conversation continues").  One short sentence, nothing new, and she lets the call wind down.
+SHORT_ON_TIME_NOTE_V3 = (
+    "- You told the advisor you are short on time. Answer in one short sentence: respond to what "
+    "they just said, answer anything they asked, ask nothing new, and let the call move toward "
+    "its end."
+)
+SHORT_ON_TIME_CONCERNS_NOTE_V3 = (
+    "- You told the advisor you are short on time, and you have already told them {concerns}, so "
+    "do not say that again in any words. Answer in one short sentence: respond to what they just "
+    "said, answer anything they asked, ask nothing new, and let the call move toward its end."
+)
 PRESSURE_EASED_NOTE = (
     "- The advisor just gave you time. Acknowledge it warmly in a few words and do not bring up "
     "the earlier pressure again."
@@ -864,6 +877,20 @@ OPEN_QUESTION_AFTER_ASK_NOTE = (
     "- The advisor asked you something: answer that first, briefly. Then come back once to what "
     'you asked earlier, "{label}", which they have not really answered, in different words; if '
     "they already said yes, ask how it would work. Ask nothing else."
+)
+# Simulation diagnosis 4 (D4-COMEBACK1, R1_COME_BACK_V2; new wording under D-M032-4): the
+# come-back once quoted his repetition back ("You've said small a couple of times now, ...").
+OPEN_QUESTION_NOTE_V2 = (
+    '- Earlier you asked the advisor about "{label}", and they have not really answered it. Come '
+    "back to it once, briefly and politely, in different words, and ask nothing else in this "
+    "reply; do not point out what they said or how often they said it. If they already said yes, "
+    "ask how it would work. This is not repeating yourself."
+)
+OPEN_QUESTION_AFTER_ASK_NOTE_V2 = (
+    "- The advisor asked you something: answer that first, briefly. Then come back once to what "
+    'you asked earlier, "{label}", which they have not really answered, in different words, '
+    "without pointing out what they said or how often; if they already said yes, ask how it "
+    "would work. Ask nothing else."
 )
 NO_REPEAT_REASK_NOTE = (
     "- Apart from the question you are coming back to, do not repeat anything you already said "
