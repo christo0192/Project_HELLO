@@ -1020,6 +1020,17 @@ _NEXT_STEP = re.compile(
     r"payment link|enrol+ment link|get you started|move forward|next step)\b",
     re.IGNORECASE,
 )
+# D5-HF-UNEARNED2 (``REHEARSAL_NEXT_STEP_V2``): more ways to ask for the next step.  "Shall I pencil
+# you in for a weekend slot?" and "shall I pencil in a weekend call with your husband?" earned a
+# commitment that the words above missed.  A session needs a qualifier ("a live session" alone is how a
+# class is described, not an ask); "call it a day" and "that call was rough" stay out.
+_NEXT_STEP_V2 = re.compile(
+    r"\b(?:pencil (?:you |it |that |us )?in|"
+    r"(?:a|another|short|quick|brief|follow[- ]?up|weekend|\w+day|morning|evening) (?:\w+ )?(?:call|chat|meeting)|"
+    r"(?:short|quick|brief|follow[- ]?up|weekend|\w+day|morning|evening) (?:\w+ )?session|"
+    r"catch up (?:on|over) (?:a )?(?:call|the phone))\b",
+    re.IGNORECASE,
+)
 _OFFERING_VOICE = re.compile(
     r"\b(?:let'?s|i(?:'ll| will| can| could| would)|we(?:'ll| will| can| could| would)|shall|"
     r"how about|would you|do you want|want me to|can i|could i)\b",
@@ -1040,9 +1051,10 @@ def advisor_asked_next_step(advisor: Mapping[str, Any]) -> bool:
     if str(advisor.get("intent") or "") in ASK_INTENTS:
         return True
     for sentence in split_sentences(str(advisor.get("text") or "")):
-        if _NEXT_STEP.search(sentence) is not None and (
-            "?" in sentence or _OFFERING_VOICE.search(sentence) is not None
-        ):
+        named = _NEXT_STEP.search(sentence) is not None or (
+            flags.on(flags.NEXT_STEP_V2) and _NEXT_STEP_V2.search(sentence) is not None
+        )
+        if named and ("?" in sentence or _OFFERING_VOICE.search(sentence) is not None):
             return True
     return False
 

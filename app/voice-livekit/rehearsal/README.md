@@ -278,6 +278,22 @@ its question went unanswered), `REHEARSAL_CONTINUED_ROWS` (a candidate row saved
 the timing of its spoken turn, and a tail said over the brief joins that turn's row) and
 `REHEARSAL_BACKCHANNEL_GAP` (after a replayed icebreaker backchannel the answer comes within 10 s).
 
+Diagnosis 5 switches (all default ON; `0` restores the previous behaviour):
+`REHEARSAL_FLOW_AGENDA_RULES` (the design rules also say the agenda's "about thirty minutes" for the
+interview and "up to twenty" for the role-play are both right, and that Christy's one confirming ask on
+an end request, her wrap-up offer and her early-end note are policy; OFF sends the round-5 rubric),
+`REHEARSAL_FLOW_MIN_REPS` (the flow summary counts judged calls per scenario, and a live scenario judged
+on one call is a readiness reason: run `--calls` at twice the scenario count or more) and
+`REHEARSAL_NEXT_STEP_V2` ("pencil you in", "a weekend call", "a Tuesday or Friday call", "a quick
+evening session" and "catch up over the phone" are next-step asks that earn a commitment).
+
+Two rounds scored by different rubrics are not comparable.  Judge saved records again, flow judge
+only (no candidate, Christy or learner call; the records are not written), under the current rubric:
+
+```
+python -m rehearsal.rejudge C:\tmp\m032-sim-runs\int-live-4b C:\tmp\m032-sim-runs\int-live-5 --out <dir> --budget-usd 1
+```
+
 ## Adaptability scenarios and the flow judge (`--scenarios adapt`, D-M032-10)
 
 ```

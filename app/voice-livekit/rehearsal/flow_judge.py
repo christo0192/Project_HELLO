@@ -26,6 +26,12 @@ graded families came before that, and evidence is asked only for the axes below 
 ``REHEARSAL_FLOW_NA_AXES`` (default ON) a call with no learner line (no role-play) has learner_flow and
 objective_kept scored null: n/a, left out of the means, the minimums and the axis floor.
 
+Diagnosis 5 (D5-JUDGE1): ``REHEARSAL_FLOW_AGENDA_RULES`` (default ON) adds two design rules: the
+agenda's thirty minutes (interview) and twenty (role-play) are both right, and Christy's one confirming
+ask on an end request, her wrap-up offer and her early-end note are policy.  ``REHEARSAL_FLOW_MIN_REPS``
+(default ON) counts judged calls per scenario; a live scenario judged once is a readiness reason, since
+one call is noise.  ``rehearsal.rejudge`` judges saved records again under the current rubric.
+
 Live only: ``ScriptedFlowJudge`` (offline) returns ``status: "n/a"``, since a scripted model's
 transcript says nothing about flow.  The gates (``FLOW_GATES``): naturalness mean >= 4.3,
 adaptability mean >= 4.3, objective_kept min >= 4, and no call below 3 on any axis.
@@ -48,6 +54,8 @@ FLOW_GATES = {
     "objective_kept_min": 4.0,
     "axis_floor": 3.0,
 }
+# D5-JUDGE1 (``REHEARSAL_FLOW_MIN_REPS``): judged calls of each scenario the gates want.
+FLOW_MIN_REPS = 2
 FLOW_MAX_TOKENS = 2600
 MAX_TRANSCRIPT_CHARS = 60000
 MAX_QUOTE_WORDS = 16
@@ -121,6 +129,17 @@ _EVIDENCE_V2 = (
 _SCORE_HEAD = "Score each axis from 1 (poor) to 5 (excellent):\n"
 assert _EVIDENCE_V1 in RUBRIC and _SCORE_HEAD in RUBRIC
 RUBRIC_V2 = RUBRIC.replace(_SCORE_HEAD, DESIGN_RULES + _SCORE_HEAD).replace(_EVIDENCE_V1, _EVIDENCE_V2)
+# D5-JUDGE1 (``REHEARSAL_FLOW_AGENDA_RULES``): once the rules named 'up to twenty minutes', the agenda's
+# "about thirty minutes" (the whole interview) read as a contradiction in 28 of 40 calls; and the one
+# confirming ask on an end request, the wrap-up offer and the early-end note are policy too.
+AGENDA_RULES = (
+    "- The opening agenda says the whole interview takes about thirty minutes and the role-play up to "
+    "twenty: both are correct.\n"
+    "- Christy asks once to confirm an end request that does not name the end, and may offer to wrap up "
+    "or note an early end; these asides are policy.\n"
+)
+RUBRIC_V3 = RUBRIC_V2.replace(DESIGN_RULES, DESIGN_RULES + AGENDA_RULES)
+assert RUBRIC_V3 != RUBRIC_V2
 SCHEMA_TEXT_NA = SCHEMA_TEXT.replace('"learner_flow":3', '"learner_flow":null').replace(
     '"objective_kept":3', '"objective_kept":null'
 )
@@ -304,7 +323,14 @@ def flow_messages(record: Mapping[str, Any]) -> list[dict[str, str]]:
         f"CANDIDATE BEHAVIOUR:\n{behaviour_text(record)}\n\nCALL FACTS:\n{facts}\n\n{note}"
         f"TRANSCRIPT:\n{transcript_for_flow(turns)}\n\nSCHEMA:\n{SCHEMA_TEXT_NA if na else SCHEMA_TEXT}"
     )
-    return [{"role": "system", "content": RUBRIC_V2 if rules else RUBRIC}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": rubric_text()}, {"role": "user", "content": user}]
+
+
+def rubric_text() -> str:
+    """The system prompt the switches choose: the first rubric, the round-5 one or the agenda rules."""
+    if not flags.on(flags.FLOW_DESIGN_RULES):
+        return RUBRIC
+    return RUBRIC_V3 if flags.on(flags.FLOW_AGENDA_RULES) else RUBRIC_V2
 
 
 # ------------------------------------------------------------------------------ the verdict
@@ -505,7 +531,11 @@ def flow_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         scenario = (record.get("header") or {}).get("scenario")
         for item in (record.get("flow") or {}).get("worst_moments") or []:
             worst.append({"call": seed, "scenario": scenario, **item})
+    extra: dict[str, Any] = {}
+    if flags.on(flags.FLOW_MIN_REPS):
+        extra["reps"] = reps_summary(scored)
     return {
+        **extra,
         "judged": len(scored),
         "unjudged": unjudged,
         "judge_off": judge_off,
@@ -521,6 +551,33 @@ def flow_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "gates_failed": [name for name, item in gates.items() if item["ok"] is False],
         "worst_moments": worst,
     }
+
+
+def reps_summary(scored: Sequence[tuple[Mapping[str, Any], Any]]) -> dict[str, Any]:
+    """D5-JUDGE1: judged calls per scenario.  One call moves an axis mean by a whole point's share and
+    a byte-identical call swung by a point between two runs, so a gate wants ``FLOW_MIN_REPS``
+    judged calls of each scenario."""
+    counts: dict[str, int] = {}
+    for record, _scores in scored:
+        name = str((record.get("header") or {}).get("scenario"))
+        counts[name] = counts.get(name, 0) + 1
+    return {
+        "min_per_scenario": min(counts.values()) if counts else None,
+        "per_scenario": dict(sorted(counts.items())),
+        "single_call_scenarios": sorted(name for name, count in counts.items() if count < FLOW_MIN_REPS),
+        "wanted": FLOW_MIN_REPS,
+    }
+
+
+def single_call_reason(summary: Mapping[str, Any]) -> str | None:
+    """The readiness reason for a live run whose flow gates rest on one judged call of a scenario."""
+    thin = (summary.get("reps") or {}).get("single_call_scenarios") or []
+    if not thin:
+        return None
+    return (
+        f"flow gates rest on one judged call for {len(thin)} scenario(s) ({', '.join(thin)}): "
+        f"run at least {FLOW_MIN_REPS} per scenario"
+    )
 
 
 def render_flow_markdown(summary: Mapping[str, Any]) -> list[str]:
@@ -546,6 +603,10 @@ def render_flow_markdown(summary: Mapping[str, Any]) -> list[str]:
     for name, item in summary["gates"].items():
         mark = {True: "PASS", False: "FAIL", None: "n/a"}[item["ok"]]
         lines.append(f"| {name} | {item['value']} | {item['threshold']} | {mark} |")
+    thin = (summary.get("reps") or {}).get("single_call_scenarios") or []
+    if thin:
+        lines += ["", f"The gates rest on one judged call for: {', '.join(thin)} "
+                      f"(one call is noise; run at least {FLOW_MIN_REPS} per scenario)."]
     if summary.get("unjudged"):
         lines += ["", f"Unjudged calls (judge error): {', '.join(summary['unjudged'])}"]
     if summary.get("worst_moments"):
@@ -572,6 +633,7 @@ def _clock(seconds: Any) -> str:
 __all__ = [
     "AXES",
     "FLOW_GATES",
+    "FLOW_MIN_REPS",
     "FlowJudge",
     "ScriptedFlowJudge",
     "flow_messages",
@@ -581,5 +643,8 @@ __all__ = [
     "na_axes",
     "parse_flow",
     "render_flow_markdown",
+    "reps_summary",
+    "rubric_text",
+    "single_call_reason",
     "validate_flow",
 ]

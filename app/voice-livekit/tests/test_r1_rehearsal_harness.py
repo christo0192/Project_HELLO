@@ -2199,6 +2199,48 @@ class IterationTwoHarnessTests(unittest.TestCase):
                 ]
                 self.assertFalse(metrics.commitment_metrics(exchanges, admin)["commitment_earned"], text)
 
+    def test_a_pencilled_in_or_weekend_call_earns_the_commitment(self) -> None:
+        # D5-HF-UNEARNED2: "pencil you in" and "a weekend call" are next-step asks (synthetic text).
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        plan = {"resolves": True, "commitment_level": "MEDIUM", "delivered_commitment": True}
+        for text in (
+            "Seats go fast this month. Shall I pencil you in for a Sunday slot and confirm later?",
+            "Since that helps, shall I pencil in a weekend call with your sister so you can decide together?",
+            "Would a Tuesday or Friday call suit the two of you?",
+            "Could we catch up over the phone once your brother has had a look?",
+            "I can put you down for a quick evening session with a mentor, how does that sound?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(metrics.advisor_asked_next_step({"intent": "answer_objection", "text": text}), text)
+                exchanges = [
+                    exchange(1, 800, text, "answer_objection"),
+                    exchange(2, 820, "Great.", "other", spoken="Okay, let's do that.", plan=plan),
+                ]
+                found = metrics.commitment_metrics(exchanges, admin)
+                self.assertTrue(found["commitment_earned"], text)
+                self.assertNotIn("unearned_commitment", metrics.hard_fails(found))
+
+    def test_a_day_or_a_rough_call_is_still_no_ask(self) -> None:
+        for text in (
+            "I'll call it a day after this one, shall I?",
+            "That call was rough, would you agree?",
+            "I see, that sounds like a long week.",
+            "Our live classes run as a weekend session.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": text}), text)
+
+    def test_off_restores_the_previous_next_step_words(self) -> None:
+        import os
+        from unittest import mock
+
+        from rehearsal.flags import NEXT_STEP_V2
+
+        text = "Shall I pencil you in for a weekend slot and confirm later?"
+        with mock.patch.dict(os.environ, {NEXT_STEP_V2: "0"}):
+            self.assertFalse(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
+        self.assertTrue(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
+
     def test_the_advisor_tag_alone_is_still_enough(self) -> None:
         self.assertTrue(metrics.advisor_asked_next_step({"intent": "close_ask", "text": "Okay."}))
         self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": "Okay."}))

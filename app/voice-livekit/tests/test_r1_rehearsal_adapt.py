@@ -972,5 +972,118 @@ class FlowNoRoleplayTests(unittest.TestCase):
             self.assertNotIn("No role-play took place", flow_messages(_silent_record())[1]["content"])
 
 
+
+AGENDA_ROWS = [
+    {"speaker": "bot", "voice": "christy", "phase": "opening",
+     "text": "It takes about thirty minutes, with a sales role-play of up to twenty minutes in the middle.",
+     "t_start": 1.0, "s_sec": 1.0},
+    *EARLY_END_ROWS,
+]
+
+
+class FlowRound5Tests(unittest.TestCase):
+    """D5-JUDGE1: the rubric says the agenda's thirty and twenty are both right and that Christy's
+    end-request and wrap-up asides are policy; the gates say when they rest on one call per scenario;
+    saved records can be judged again with no candidate or learner call."""
+
+    def test_the_rubric_says_thirty_and_twenty_are_both_right(self) -> None:
+        from rehearsal.flow_judge import flow_messages
+
+        record = _early_end_record()
+        record["rows"] = AGENDA_ROWS
+        system = flow_messages(record)[0]["content"]
+        self.assertIn(
+            "- The opening agenda says the whole interview takes about thirty minutes and the role-play up "
+            "to twenty: both are correct.", system)
+        self.assertIn(
+            "- Christy asks once to confirm an end request that does not name the end, and may offer to wrap "
+            "up or note an early end; these asides are policy.", system)
+        self.assertLess(system.index("DESIGN RULES"), system.index("thirty minutes"))
+        self.assertLess(system.index("these asides are policy"), system.index("Score each axis"))
+
+    def test_off_sends_the_round_5_rubric(self) -> None:
+        from rehearsal.flags import FLOW_AGENDA_RULES
+        from rehearsal.flow_judge import RUBRIC_V2, flow_messages
+
+        with _flow_switch(FLOW_AGENDA_RULES, "0"):
+            self.assertEqual(flow_messages(_early_end_record())[0]["content"], RUBRIC_V2)
+
+    def test_the_design_rules_switch_off_still_sends_the_first_rubric(self) -> None:
+        from rehearsal.flags import FLOW_DESIGN_RULES
+        from rehearsal.flow_judge import RUBRIC, flow_messages
+
+        with _flow_switch(FLOW_DESIGN_RULES, "0"):
+            self.assertEqual(flow_messages(_early_end_record())[0]["content"], RUBRIC)
+
+    @staticmethod
+    def _judged(seed: str, scenario: str, **scores) -> dict:
+        record = FlowGateTests._judged(seed, naturalness=5, adaptability=5, **scores)
+        record["header"]["scenario"] = scenario
+        return record
+
+    def test_the_summary_says_which_scenarios_rest_on_one_call(self) -> None:
+        from rehearsal.flow_judge import flow_summary, render_flow_markdown
+
+        records = [self._judged("a1", "price-dodge"), self._judged("a2", "price-dodge"), self._judged("b1", "silent")]
+        summary = flow_summary(records)
+        self.assertEqual(summary["reps"], {"min_per_scenario": 1, "per_scenario": {"price-dodge": 2, "silent": 1},
+                                           "single_call_scenarios": ["silent"], "wanted": 2})
+        self.assertIn("rest on one judged call", "\n".join(render_flow_markdown(summary)))
+        self.assertEqual(summary["gates_failed"], [])
+        both = flow_summary(records[:2])
+        self.assertEqual(both["reps"]["single_call_scenarios"], [])
+        self.assertNotIn("rest on one judged call", "\n".join(render_flow_markdown(both)))
+
+    def test_a_live_scorecard_names_the_single_call_scenarios(self) -> None:
+        from rehearsal.full_metrics import build_full_scorecard
+
+        card = build_full_scorecard([self._judged("b1", "silent")], offline=False)
+        self.assertTrue(any("one judged call" in reason and "silent" in reason for reason in card["reasons"]))
+        two = build_full_scorecard([self._judged("a1", "silent"), self._judged("a2", "silent")], offline=False)
+        self.assertFalse(any("one judged call" in reason for reason in two["reasons"]))
+        offline = build_full_scorecard([_record(ROWS, flow={"source": "offline", "status": "n/a"})], offline=True)
+        self.assertFalse(any("one judged call" in reason for reason in offline["reasons"]))
+
+    def test_off_keeps_the_previous_summary(self) -> None:
+        from rehearsal.flags import FLOW_MIN_REPS
+        from rehearsal.flow_judge import flow_summary
+        from rehearsal.full_metrics import build_full_scorecard
+
+        with _flow_switch(FLOW_MIN_REPS, "0"):
+            summary = flow_summary([self._judged("b1", "silent")])
+            card = build_full_scorecard([self._judged("b1", "silent")], offline=False)
+        self.assertNotIn("reps", summary)
+        self.assertFalse(any("one judged call" in reason for reason in card["reasons"]))
+
+    def test_rejudge_runs_only_the_flow_judge_and_leaves_the_files_alone(self) -> None:
+        from rehearsal.flow_judge import FlowJudge
+        from rehearsal.rejudge import load_runs, rejudge_runs, render_rejudge_markdown
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for run, scenario in (("int-live-4b", "silent"), ("int-live-5", "silent")):
+                calls = root / run / scenario / "calls"
+                calls.mkdir(parents=True)
+                record = self._judged(f"{run}-call", scenario, christy_flow=4)
+                (calls / "full-silent-average-p1-v1-0.json").write_text(json.dumps(record), encoding="utf-8")
+            before = {path: path.read_bytes() for path in root.rglob("*.json")}
+            runs = load_runs([root / "int-live-4b", root / "int-live-5"])
+            self.assertEqual([name for name, _ in runs], ["int-live-4b", "int-live-5"])
+            self.assertEqual([len(records) for _, records in runs], [1, 1])
+            client = _FakeClient([_verdict(christy_flow=5), _verdict(christy_flow=3)])
+            report = asyncio.run(rejudge_runs(runs, FlowJudge(client, "judge-model")))
+            self.assertEqual(len(client.calls), 2)
+            self.assertEqual({call["role"] for call in client.calls}, {"flow_judge"})
+            self.assertEqual(report["runs"][0]["before"]["means"]["christy_flow"], 4.0)
+            self.assertEqual(report["runs"][0]["after"]["means"]["christy_flow"], 5.0)
+            self.assertEqual(report["runs"][1]["after"]["means"]["christy_flow"], 3.0)
+            self.assertIn("rubric", report)
+            self.assertEqual(report["runs"][0]["per_call"][0]["call"], "int-live-4b-call")
+            table = "\n".join(render_rejudge_markdown(report))
+            self.assertIn("int-live-4b", table)
+            self.assertIn("christy_flow", table)
+            self.assertEqual(before, {path: path.read_bytes() for path in root.rglob("*.json")})
+
+
 if __name__ == "__main__":
     unittest.main()
