@@ -2380,6 +2380,56 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
 * The repaired transition note (under `R1_TRANSITION_REPAIR`) gives a broad question about the
   job a one-sentence overview with an offer of the detail, and says times the way people say them.
 
+### M032 live simulation, diagnosis 4 (Christy lane)
+
+* **`R1_BRIEF_WORDING_V2`** (default on). The opening agenda and every brief in a person's words
+  (`r1_script.WORDING_LINES`: the *-W2 texts are spoken under the old ids, so markers, the warm-up
+  and the cache follow). Same facts (lead, city, Data Science, up to twenty minutes, the goal, the
+  preparation guide, the cue phrase, "ready"); the brief ends "Any questions before we start? If
+  not, just say 'ready' and she'll pick up." and keeps the either/or kind, so a bare "yes" or "no
+  questions" gets the nudge and only a spoken "ready" or the button starts. The briefs need
+  `R1_TRANSITION_REPAIR`. Rollback: `fly secrets set R1_BRIEF_WORDING_V2=0 -a project-hello-voice`.
+* **`R1_TRANSITION_ANSWERS`** (default on, only with `R1_TRANSITION_REPAIR`). A short question about
+  the role-play gets its own scripted answer (L-RP-ROLES, -COURSE, -LENGTH, -GUIDE, -GOAL, -NOTES,
+  -STUCK; at most two per turn) and the start question, with no model call and no step toward the
+  steer; a request for the brief itself ("again", "repeat", "the brief") still gets the replay. The
+  transition note (`TRANSITION_REMINDER_ANSWERS`) has no example phrase to copy; after a turn that
+  asked nothing, a blocked sentence is dropped (never "That's a good question for the hiring team"),
+  and an emptied reply says "Fair enough." and the start question; "happy to go over ..." is said
+  once a session. Log line: `r1_transition_field_answer`. Rollback: `fly secrets set
+  R1_TRANSITION_ANSWERS=0 -a project-hello-voice`.
+* Under `R1_BRIEF_VARIETY`: "Are you there?" just after a start prompt gets ONE line,
+  L-PRESENT-TAKE-TIME ("Yes, I'm here. Take your time, and just say 'ready' whenever you like."), and
+  a press during the brief or an answer is acknowledged with L-PICKUP-BRIDGE-2 ("Got it, you're
+  ready. Here's {lead_first_name}.").
+* **`R1_REACTION_VARIETY_V2`** (default on, only with `R1_REACTION_VARIETY`; read once per session).
+  The voice text, the rider and the icebreaker plan's notes say most turns need no reaction and
+  never to repeat the candidate's words back. The guard cuts an echo opener ("Right, <their
+  words>.") when one of her last two replies opened with an echo or a verdict (never the only
+  sentence) and trims a wider set of verdicts ("that's a habit", "says a lot", "must have felt").
+  Rollback: `fly secrets set R1_REACTION_VARIETY_V2=0 -a project-hello-voice`.
+* **`R1_IB_SKIP_V2`** (default on, only with `R1_ICEBREAKER_PLAN`). A skip request that also answers
+  is that answer; a pure skip moves past the current question to the next one ("we'll get there in a
+  couple of minutes"), never the same one again; a second skip request leaves one more question,
+  and the answer to it ends the icebreaker (`R1PhaseMachine.icebreaker_capped`, log line
+  `r1_icebreaker_skip_cap`). A thin answer's follow-up asks for one detail, never the original
+  question. Rollback: `fly secrets set R1_IB_SKIP_V2=0 -a project-hello-voice`.
+* **`R1_IB_QUIET_NUDGE`** (default on, only with `R1_IB_REASK_V2`). After a quiet ack ("Thank
+  you.") to her open question the silence window is `IB_QUIET_NUDGE_SECONDS` (10 s); then she
+  asks it once more, "So, {question}", using the question's one re-ask, once per question, never
+  with the soft exit due or under 30 s of the hard budget left. Log lines:
+  `r1_icebreaker_quiet_nudge_armed`, `r1_icebreaker_quiet_nudge`. Rollback: `fly secrets set
+  R1_IB_QUIET_NUDGE=0 -a project-hello-voice`.
+* **`R1_SIL_IB_RESTATE`** (default on, only with `R1_IB_REASK_V2`). The first silence after her
+  open icebreaker question restates it per objective (L-SIL-IB-I1..I4, "No rush. I was asking
+  ..."); "Are you still with me?" comes after a second silence; a question already nudged goes
+  straight to it. Rollback: `fly secrets set R1_SIL_IB_RESTATE=0 -a project-hello-voice`.
+* Under `R1_ICEBREAKER_REPAIR`: "could you just hold this for a minute?" (an object between the
+  verb and the time, or the last sentence of a turn) is a hold request, and the plan note says a
+  pause request is always granted.
+* Not done on this branch: the wrap-up items of D4-WRAP1 (feedback asks, role questions, the
+  joined next-steps line, the closing wording); that code lives on the learner branch.
+
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 
 Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the
