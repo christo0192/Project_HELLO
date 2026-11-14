@@ -560,10 +560,28 @@ def _icebreaker_repeat(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {"ok": ok, "questions_asked": len(questions), "requests": items}
 
 
+# Simulation diagnosis 3 (the learner lane, R1_FAREWELL_EXIT_V2): L-EXIT-WRAP asks the wrap-up's
+# question inside the exit line ("... Before we finish, do you have any questions about the role or
+# the next steps?"), so a Christy exit row that asks it counts as the wrap-up question asked.
+_WRAP_QUESTION = re.compile(r"\bdo you have any questions\b", re.IGNORECASE)
+
+
+def _asks_the_wrap_question(row: Mapping[str, Any]) -> bool:
+    if row.get("speaker") != "bot":
+        return False
+    if row.get("phase") == "wrapup":
+        return True
+    return (
+        row.get("phase") == "roleplay_exit"
+        and row.get("voice") == "christy"
+        and bool(_WRAP_QUESTION.search(str(row.get("text") or "")))
+    )
+
+
 def _wrapup_answered(rows: Sequence[Mapping[str, Any]], phases: Sequence[str]) -> dict[str, Any]:
     if "wrapup" not in phases:
         return {"ok": None}
-    asked = any(row.get("speaker") == "bot" and row.get("phase") == "wrapup" for row in rows)
+    asked = any(_asks_the_wrap_question(row) for row in rows)
     questions = []
     ok = asked
     for index, row in enumerate(rows):

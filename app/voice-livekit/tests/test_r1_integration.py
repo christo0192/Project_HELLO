@@ -1174,7 +1174,9 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         self.assertIs(wrap.machine.phase, R1Phase.WRAPUP)
         self.assertEqual(wrap.last_messages()[1], {"role": "system", "content": WRAPUP_NOTE})
 
-    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"})  # Simulation diagnosis 3: the release before
+    # Simulation diagnosis 3, both lanes: the release before (the learner's wrap-up next steps and
+    # Christy's reworded react clause in the rider, R1_REACTION_VARIETY).
+    @mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0", "R1_REACTION_VARIETY": "0"})
     async def test_a_wrapup_acknowledgement_gets_no_model_reply_and_a_question_gets_the_note(
         self,
     ) -> None:

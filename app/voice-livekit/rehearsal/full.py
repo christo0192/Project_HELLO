@@ -568,10 +568,14 @@ def _button_shown(rt: Runtime) -> bool:
 # M032 S3 (the learner lane): Christy's question before an in-role close ends the role-play early
 # (L-ASIDE-EARLY-CLOSE and its "we still have time" wording) is answered like the offer to wrap
 # up, and her question after the learner hung up on abuse (L-ASIDE-HANGUP) gets its own answer.
+# Simulation diagnosis 3 (the learner lane, R1_END_ASIDE_V2 and its early-close wording): the
+# reworded questions are the same questions, so they are read the same way while those flags are on.
 ASIDE_QUESTIONS = (
     ("end", "L-ASIDE-END"),
+    ("end", "L-ASIDE-END-2"),
     ("wrap", "L-ASIDE-WRAP"),
     ("wrap", "L-ASIDE-EARLY-CLOSE"),
+    ("wrap", "L-ASIDE-EARLY-CLOSE-2"),
     ("wrap", "L-ASIDE-EARLY-CLOSE-TIME"),
     ("hangup", "L-ASIDE-HANGUP"),
 )
