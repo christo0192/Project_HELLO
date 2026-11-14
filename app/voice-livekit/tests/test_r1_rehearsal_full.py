@@ -2278,3 +2278,37 @@ class LearnerClockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AsideQuestionTests(unittest.TestCase):
+    """M032 integration 9: the Christy lane's second wrap-up offer (L-ASIDE-WRAP-AGAIN,
+    R1_WRAP_OFFER_VARIANT) is the same question as L-ASIDE-WRAP, so the simulated candidate reads
+    it as the open "wrap" question (synthetic names only)."""
+
+    @staticmethod
+    def _render(line_id: str) -> str:
+        import r1_script
+
+        class Names(dict):
+            def __missing__(self, key: str) -> str:
+                return "Asha"
+
+        return r1_script.LINES[line_id].format_map(Names())
+
+    def _runtime(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(interview=SimpleNamespace(render_line=self._render))
+
+    def test_the_second_wrap_up_offer_is_the_wrap_question(self) -> None:
+        from rehearsal.full import aside_question_of
+
+        said = self._render("L-ASIDE-WRAP-AGAIN")
+        self.assertEqual(aside_question_of(self._runtime(), said), "wrap")
+
+    def test_the_first_offer_and_the_end_question_keep_their_keys(self) -> None:
+        from rehearsal.full import aside_question_of
+
+        rt = self._runtime()
+        self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-WRAP")), "wrap")
+        self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-END")), "end")

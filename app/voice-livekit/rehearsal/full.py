@@ -570,10 +570,13 @@ def _button_shown(rt: Runtime) -> bool:
 # up, and her question after the learner hung up on abuse (L-ASIDE-HANGUP) gets its own answer.
 # Simulation diagnosis 3 (the learner lane, R1_END_ASIDE_V2 and its early-close wording): the
 # reworded questions are the same questions, so they are read the same way while those flags are on.
+# Diagnosis 5 (the Christy lane, R1_WRAP_OFFER_VARIANT): a later offer to wrap up is
+# L-ASIDE-WRAP-AGAIN, the same question in other words, so it is read as "wrap" too.
 ASIDE_QUESTIONS = (
     ("end", "L-ASIDE-END"),
     ("end", "L-ASIDE-END-2"),
     ("wrap", "L-ASIDE-WRAP"),
+    ("wrap", "L-ASIDE-WRAP-AGAIN"),
     ("wrap", "L-ASIDE-EARLY-CLOSE"),
     ("wrap", "L-ASIDE-EARLY-CLOSE-2"),
     ("wrap", "L-ASIDE-EARLY-CLOSE-TIME"),
