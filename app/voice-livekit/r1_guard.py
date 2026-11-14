@@ -1384,6 +1384,40 @@ def turn_asks(text: str) -> bool:
     return _turn_asks(text)
 
 
+# Review of diagnosis 5 (D5-DEFLECT1-R2): a question the speech-to-text leaves unmarked, read only
+# by the deflection cut: Hindi question words ("Salary kya hoga is role mein"), an indirect ask
+# ("I have a question about the pay"), or a terse turn of a few words that names a role topic
+# ("and the pay").  The model said the deflection because it heard a question; the cut must not
+# overrule it.  A longer story that names pay ("The pay at my last job was really low") asks
+# nothing.
+_HINDI_QUESTION_WORD = re.compile(
+    r"\b(?:kya|kitna|kitni|kitne|kab|kaise|kaisa|kaisi|kaun|kaunsa|kaunsi|kahan|kidhar|kyun|"
+    r"kyon|kyu)\b"
+)
+_INDIRECT_ASK = re.compile(
+    r"\b(?:(?:a|one|some|few|couple of|quick|small) questions?|(?:want|wanted|would like|d like|"
+    r"like) to (?:ask|know|check|understand)|wondering|curious (?:about|to know)|(?:can|could|"
+    r"would) you (?:tell|explain|share|clarify)|tell me (?:more )?about (?:the|this|that)|"
+    r"i (?:need|want) to understand)\b"
+)
+_ROLE_TOPIC = re.compile(
+    r"\b(?:pay|salary|salaries|ctc|package|incentives?|commissions?|stipend|bonus|work mode|wfh|"
+    r"work from home|remote|hybrid|office|training|timelines?|next steps?|joining|shifts?|timings?|"
+    r"hours|leaves?|holidays?)\b"
+)
+_TERSE_ASK_WORDS = 5
+
+
+def _turn_may_ask(text: str) -> bool:
+    """D5-DEFLECT1 (review): ``_turn_asks``, or a question without the mark (see above)."""
+    if _turn_asks(text):
+        return True
+    said = normalize(text)
+    if _HINDI_QUESTION_WORD.search(said) or _INDIRECT_ASK.search(said):
+        return True
+    return word_count(text) <= _TERSE_ASK_WORDS and _ROLE_TOPIC.search(said) is not None
+
+
 def _unapproved_role_fact(sentence: str) -> bool:
     """A shift time, hours or day count for THIS role that the deck does not state.
 
@@ -2138,7 +2172,9 @@ class StreamGuard:
         """D5-DEFLECT1 (``story_echo``, ``R1_GUARD_STORY_ECHO``): in the opening and the icebreaker
         her own "That's a good question for the hiring team ..." after a turn that asked nothing is
         dropped ("" for gone): nobody asked her anything.  Never the only sentence: ``flush`` falls
-        back to the plan's question, or gives it back when there is none.  A style trim (no hit).
+        back to the plan's question, or gives it back when there is none; and when what is left
+        asks nothing ("Okay."), the plan's question follows it (review of diagnosis 5).  A turn
+        that may ask without a question mark (``_turn_may_ask``) keeps it.  A style trim (no hit).
         """
         ctx = self.ctx
         if (
@@ -2146,7 +2182,7 @@ class StreamGuard:
             or ctx.is_learner
             or ctx.phase not in SMALL_TALK_PHASES
             or not ctx.candidate_text
-            or _turn_asks(ctx.candidate_text)
+            or _turn_may_ask(ctx.candidate_text)
             or self._summary_off
             or not is_self_deflection(sentence)
         ):
@@ -2315,7 +2351,7 @@ class StreamGuard:
         restate = self.ctx.interviewer_fallback
         if (
             self._emitted
-            and self._praise_dropped
+            and (self._praise_dropped or self._deflection_dropped)
             and restate
             and not self._done
             and restate not in self._emitted
@@ -2324,7 +2360,8 @@ class StreamGuard:
         ):
             # M032 S5 (review): the praise cut took the reply's only question ("Got it. That's
             # solid experience."): the plan's current question follows the acknowledgement, so
-            # the candidate is never left waiting for a question that was never asked.
+            # the candidate is never left waiting for a question that was never asked.  Review of
+            # diagnosis 5 (D5-DEFLECT1-R1): the same after the deflection cut ("Okay.").
             self._emitted.append(restate)
             self._used += word_count(restate)
             self._style_edits += 1

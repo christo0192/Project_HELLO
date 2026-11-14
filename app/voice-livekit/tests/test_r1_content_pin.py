@@ -172,7 +172,9 @@ import r1_world
 # one "And with ..." opener (R1_REACTION_VARIETY_V2), the skip notes (R1_IB_SKIP_V2), the nudge's
 # "I was asking" form (R1_IB_QUIET_NUDGE) and the answers note's approach sentence
 # (R1_TRANSITION_ANSWERS).
-PINNED_CONTENT_SHA256 = "161352358870e2bec238647f823428cc10e592b56047768aa5041a6c45c923e6"
+# Revision 34 (review of diagnosis 5, Christy lane): the W3 agenda's heard line "Lovely, thanks."
+# (R1_AGENDA_W3) and the nudge's wh-word and instruction sets (R1_IB_QUIET_NUDGE).
+PINNED_CONTENT_SHA256 = "43ffad2705a610072c37e97b3410e233a8ebdf39201e7a55d5bb48b739f7916e"
 
 CONTENT_MODULES = (
     "r1_text",

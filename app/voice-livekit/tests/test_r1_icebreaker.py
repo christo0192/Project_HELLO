@@ -1087,6 +1087,38 @@ class TestDiagnosis4Icebreaker(unittest.TestCase):
                         re.findall(r"[a-z']+", question.lower()),
                     )
 
+    def test_the_cut_never_takes_the_asking_clause(self) -> None:
+        # Review of diagnosis 5 (D5-NUDGE1-R1): the elaboration cut ran before the asking clause
+        # was picked, so a question after ", say" or ", like" was lost; an instruction got a "?"
+        # and "I was asking, tell me ..." was said.
+        for question, said in (
+            (
+                "Thinking about your last job, say the toughest call, what did you do?",
+                "So, what did you do?",
+            ),
+            (
+                "When you say inbound, like what kind of leads?",
+                "So, when you say inbound, like what kind of leads?",
+            ),
+            (
+                "Tell me about a time you hit target, for example last quarter.",
+                "So, tell me about a time you hit target.",
+            ),
+            ("Well, tell me about your targets.", "So, tell me about your targets."),
+            ("And walk me through a normal day.", "So, walk me through a normal day."),
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(ib.quiet_nudge_line(question), said)
+
+    def test_only_a_verbatim_repeat_counts_as_a_repeat(self) -> None:
+        # Review of diagnosis 5 (D5-NUDGE1-R2): the session says the restate only for a nudge that
+        # would repeat her words, never for a question too short to nudge (revision 32: no nudge).
+        self.assertEqual(ib.quiet_nudge_line("So, tell me about your targets."), "")
+        self.assertTrue(ib.quiet_nudge_repeats("So, tell me about your targets."))
+        for question in ("And?", "Okay?", "", "What draws you to this role?"):
+            with self.subTest(question=question):
+                self.assertFalse(ib.quiet_nudge_repeats(question))
+
     def test_the_nudge_spends_the_question_s_one_re_ask(self) -> None:
         plan = ib.IcebreakerPlan()
         self.assertTrue(plan.can_hold())  # review of diagnosis 4: a peek spends nothing

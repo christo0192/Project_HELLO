@@ -5410,6 +5410,22 @@ class TestDiagnosis4Icebreaker(unittest.IsolatedAsyncioTestCase):
                     await task
         self.assertNotIn(rig.interview.render_line("L-SIL-IB"), rig.session.spoken)
 
+    async def test_the_restate_stands_in_only_for_a_repeat_and_only_with_its_flag(self) -> None:
+        # Review of diagnosis 5 (D5-NUDGE1-R2): R1_SIL_IB_RESTATE=0 drops the L-SIL-IB-<id> lines
+        # from the warm-up, so the nudge never says one then; and a question too short to nudge
+        # arms nothing, as in revision 32.
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        restate = rig.interview.render_line("L-SIL-IB-I2")
+        self.assertEqual(rig.interview._ib_nudge_text("So, tell me about your targets."), restate)
+        self.assertEqual(rig.interview._ib_nudge_text("And?"), "")
+        with _env(R1_SIL_IB_RESTATE="0"):
+            self.assertEqual(rig.interview._ib_nudge_text("So, tell me about your targets."), "")
+            self.assertEqual(
+                rig.interview._ib_nudge_text("What draws you to this role?"),
+                "So, what draws you to this role?",
+            )
+
     async def test_the_first_silence_restates_the_open_question(self) -> None:
         rig = await self.rig()
         await rig.converse(IB_ANSWER)  # I1 answered: her question is for I2
@@ -5547,6 +5563,60 @@ class TestDiagnosis5Transition(unittest.IsolatedAsyncioTestCase):
         with _env(R1_TRANSITION_ANSWERS="0"):
             self.assertFalse(r1_session.is_permission_to_ask(text))
             self.assertEqual(rig.interview._transition_action(text), r1_session._TRANSITION_ANSWER)
+
+    async def test_an_unrelated_second_question_gets_no_goal_line(self) -> None:
+        # Review of diagnosis 5 (D5-TRANS1-R1): the backstop added L-RP-GOAL after "Yes,
+        # absolutely." to "Can I take notes during the call? Is that allowed?".
+        goal_ids = ("L-RP-GOAL",)
+        for text, reply in (
+            ("Can I take notes during the call? Is that allowed?", "Yes, absolutely."),
+            ("Is that all? Is that it?", "That's it."),
+            ("Will she call me by name? Is that okay?", "Yes, that's right."),
+        ):
+            with self.subTest(text=text):
+                rig = await self.rig(reply=reply)
+                goal = rig.interview.render_line(goal_ids[0])
+                self.assertEqual(rig.interview._confirm_extra(text), "")
+                spoken = await rig.converse(text)
+                self.assertNotIn(goal, spoken)
+        rig = await self.rig()
+        self.assertEqual(
+            rig.interview._confirm_extra(
+                "Is this interview recorded? And what do I actually do in the role-play?"
+            ),
+            rig.interview.render_line("L-RP-GOAL"),
+        )
+
+    def test_a_check_about_starting_is_no_leave_to_ask(self) -> None:
+        # Review of diagnosis 5 (D5-TRANS1-R2): "Can I check if we can start now?" got "Of course,
+        # go ahead." and no start question.
+        for text in (
+            "Can I check if we can start now?",
+            "Can I check, can we start now?",
+            "Could I confirm we can begin now?",
+            "Can I confirm we start now?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_permission_to_ask(text))
+        for text in (
+            "Could I check a couple of other things first?",
+            "Could I check a couple of things before we start?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_permission_to_ask(text))
+
+    def test_a_setup_question_is_no_role_play_field(self) -> None:
+        # Review of diagnosis 5 (D5-TRANS1-R3): "How would I handle it if my mic drops?" got
+        # L-RP-GOAL; it is the model's to answer.
+        for text in (
+            "How would I handle it if my mic drops?",
+            "How do I handle it if the call disconnects?",
+            "What should I do if my internet connection is slow?",
+            "How do I handle it if the audio cuts out?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.roleplay_fields(text), ())
+        self.assertEqual(r1_session.roleplay_fields("How would I handle her?"), ("L-RP-GOAL",))
 
     def test_the_new_field_patterns_keep_the_job_veto(self) -> None:
         for text, fields in (

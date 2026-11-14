@@ -3351,3 +3351,72 @@ class TestSelfDeflectionAfterNoQuestion(unittest.TestCase):
     def test_the_transition_is_unchanged(self) -> None:
         context = ctx("transition", story_echo=True, candidate_text=self.TOLD)
         self.assertEqual(guard_text(self.REPLY, context).text, self.REPLY)
+
+    # Review of diagnosis 5 (D5-DEFLECT1-R1): the deflection after an acknowledgement left the
+    # acknowledgement alone and no question; the plan's question follows it, as after the praise
+    # cut.
+    def test_an_acknowledgement_left_alone_gets_the_plan_question(self) -> None:
+        told = "The pay at my last job was really low honestly."
+        for reply, said in (
+            (f"Okay. {INTERVIEWER_DEFLECTION}", "Okay. What draws you to this role?"),
+            (
+                f"Got it, thanks for sharing. {INTERVIEWER_DEFLECTION}",
+                "Got it, thanks for sharing. What draws you to this role?",
+            ),
+        ):
+            with self.subTest(reply=reply):
+                context = ctx(
+                    "icebreaker",
+                    story_echo=True,
+                    candidate_text=told,
+                    interviewer_fallback="What draws you to this role?",
+                )
+                self.assertEqual(guard_text(reply, context).text, said)
+
+    def test_a_kept_question_needs_no_plan_question(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text=self.TOLD,
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertEqual(
+            guard_text(self.REPLY, context).text,
+            "You mentioned leading a small team, how did you keep them going?",
+        )
+
+    def test_no_plan_question_leaves_the_acknowledgement(self) -> None:
+        context = ctx("icebreaker", story_echo=True, candidate_text=self.TOLD)
+        self.assertEqual(guard_text(f"Okay. {INTERVIEWER_DEFLECTION}", context).text, "Okay.")
+
+    # Review of diagnosis 5 (D5-DEFLECT1-R2): a question the speech-to-text left unmarked (Hinglish,
+    # terse, indirect) keeps her deflection: the model heard a question.
+    def test_an_unmarked_question_keeps_the_deflection(self) -> None:
+        for told in (
+            "Salary kya hoga is role mein",
+            "Training kitne din ki hai",
+            "and the pay",
+            "what about work from home",
+            "I have a question about the pay",
+            "I wanted to know about the next steps",
+        ):
+            with self.subTest(told=told):
+                context = ctx(
+                    "icebreaker",
+                    story_echo=True,
+                    candidate_text=told,
+                    interviewer_fallback="What draws you to this role?",
+                )
+                self.assertEqual(
+                    guard_text(f"Sure. {INTERVIEWER_DEFLECTION}", context).text,
+                    f"Sure. {INTERVIEWER_DEFLECTION}",
+                )
+
+    def test_a_story_that_names_pay_still_drops_it(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text="My salary at the bank was fine but the targets were brutal.",
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertNotIn("hiring team", guard_text(self.REPLY, context).text)

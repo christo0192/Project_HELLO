@@ -246,6 +246,7 @@ from r1_icebreaker import (
     is_thinking,
     presence_opener_note,
     quiet_nudge_line,
+    quiet_nudge_repeats,
     repeat_line,
     reply_question,
     sil_ib_restate_enabled,
@@ -2481,6 +2482,27 @@ _RP_GOAL_D5_RE = re.compile(
     r"\b(?:(?:what|how) (?:do|should|would) i (?:actually |really )?(?:do|handle|approach)|"
     r"what am i (?:supposed|meant) to do|what(?:'s| is) my (?:job|task))\b"
 )
+# Review of diagnosis 5 (D5-TRANS1-R3): a setup question ("How would I handle it if my mic drops?",
+# "How do I handle it if the call disconnects?") is no L-RP-GOAL: it goes to the model.
+_RP_SETUP_RE = re.compile(
+    r"\b(?:mic|mike|microphone|audio|volume|connection|connectivity|internet|network|wifi|wi fi|"
+    r"camera|video|browser|headphones?|headset|earphones?|speakers?|battery|power cut|"
+    r"disconnect\w*|(?:call|line|signal) (?:drops?|dropped|cuts? out|breaks? up)|lags?|lagging|"
+    r"freezes|frozen)\b"
+)
+# Review of diagnosis 5 (D5-TRANS1-R1): the confirmation backstop's L-RP-GOAL is said only after a
+# later question that asks how to do the role-play or what it is for ("And what is the hiring team
+# looking for in this?"); "Is that allowed?" or "Is that it?" gets no extra line.
+_CONFIRM_GOAL_RE = re.compile(
+    r"\b(?:(?:what|how) (?:do|should|would|can) i (?:actually |really )?(?:do|handle|approach|"
+    r"go about|play|start)|what am i (?:supposed|meant|expected) to do|what(?:'s| is) (?:my|the) "
+    r"(?:job|task|goal|aim|objective|point)|what (?:are|is) (?:you|they|the hiring team|the team|"
+    r"the panel) (?:looking for|expecting|testing|checking)|what do (?:you|they) want (?:me )?to "
+    r"(?:see|do))\b"
+)
+_CONFIRM_JOB_RE = re.compile(
+    r"\b(?:(?:this|the|that) (?:job|position|post|company)|(?:this|the|that) role\b(?! ?play))"
+)
 
 
 def roleplay_fields(text: str) -> tuple[str, ...]:
@@ -2497,7 +2519,11 @@ def roleplay_fields(text: str) -> tuple[str, ...]:
         match = pattern.search(folded)
         if match is not None:
             found.append((match.start(), line_id))
-    if all(line_id != "L-RP-GOAL" for _, line_id in found) and not is_brief_request(text):
+    if (
+        all(line_id != "L-RP-GOAL" for _, line_id in found)
+        and not is_brief_request(text)
+        and _RP_SETUP_RE.search(folded) is None  # review of diagnosis 5 (D5-TRANS1-R3)
+    ):
         match = _RP_GOAL_D5_RE.search(folded)  # D5-TRANS1
         if match is not None:
             found.append((match.start(), "L-RP-GOAL"))
@@ -2636,17 +2662,24 @@ def is_permission_to_ask(text: str) -> bool:
 _PERMISSION_CHECK_RE = re.compile(
     r"\b(?:can|could|may) i (?:\w+ ){0,2}?(?:check|clarify|confirm)\b"
 )
-_PERMISSION_CHECK_FILLER = _PERMISSION_FILLER | frozenset(
-    {"things", "thing", "something", "stuff", "points", "bits", "quickly", "few"}
-)
+# Review of diagnosis 5 (D5-TRANS1-R2): "Can I check if we can start now?" asks whether to START
+# (it got "Of course, go ahead." and no start question), so "can", "could", "may", "if", "now" and
+# "then" are no filler here, and a start word is filler only after "before" ("... things before we
+# start?").
+_PERMISSION_CHECK_FILLER = (
+    _PERMISSION_FILLER - frozenset({"can", "could", "may", "if", "now", "then"})
+) | frozenset({"things", "thing", "something", "stuff", "points", "bits", "quickly", "few"})
+_PERMISSION_CHECK_START_WORDS = frozenset({"start", "begin", "started"})
 
 
 def _is_leave_to_check(folded: str) -> bool:
     """D5-TRANS1: "could I check a couple of other things first?" (folded text), nothing else."""
     if _PERMISSION_CHECK_RE.search(folded) is None:
         return False
-    rest = _PERMISSION_CHECK_RE.sub(" ", folded, count=1)
-    return all(word in _PERMISSION_CHECK_FILLER for word in rest.split())
+    words = _PERMISSION_CHECK_RE.sub(" ", folded, count=1).split()
+    if _PERMISSION_CHECK_START_WORDS.intersection(words) and "before" not in words:
+        return False
+    return all(word in _PERMISSION_CHECK_FILLER for word in words)
 
 
 # M1: "No questions, let's start." and "No, I'm good, let's go." agree to start as plainly as "Yes,
@@ -5943,12 +5976,24 @@ class R1Interview:
         """D5-TRANS1 (``R1_TRANSITION_ANSWERS``): the scripted answer said after a transition reply
         the guard cut down to a bare confirmation, when ``text`` asks more than one question ("So
         I'm the one selling, and she's the student? What do I actually do?").  The L-RP-* line of
-        the questions after the first, else L-RP-GOAL; "" for a turn with one question or none."""
+        the questions after the first, else L-RP-GOAL for a later question that asks how to do the
+        role-play or what it is for (``_CONFIRM_GOAL_RE``; review of diagnosis 5, D5-TRANS1-R1:
+        never after "Is that allowed?"); "" otherwise, and for a turn with one question or none."""
         asks = [part for part in split_sentences(text) if turn_asks(part)]
         if len(asks) < 2:
             return ""
-        fields = roleplay_fields(" ".join(asks[1:]))
-        return self.render_line(fields[0] if fields else "L-RP-GOAL")
+        later = " ".join(asks[1:])
+        fields = roleplay_fields(later)
+        if fields:
+            return self.render_line(fields[0])
+        folded = fold_speech(later)
+        if (
+            _CONFIRM_GOAL_RE.search(folded) is None
+            or _CONFIRM_JOB_RE.search(folded) is not None
+            or _RP_SETUP_RE.search(folded) is not None
+        ):
+            return ""
+        return self.render_line("L-RP-GOAL")
 
     def _withhold_answer_tail(self) -> bool:
         """M032 christy-ready (``R1_START_ASK_ONCE``): this answer ends without a start question.
@@ -6088,9 +6133,16 @@ class R1Interview:
     def _ib_nudge_text(self, question: str) -> str:
         """The quiet nudge for ``question`` (``quiet_nudge_line``), or, D5-NUDGE1, when that would
         only repeat her words, the current objective's restate (L-SIL-IB-<id>, warmed); "" when
-        neither exists."""
+        neither exists.  Review of diagnosis 5 (D5-NUDGE1-R2): the restate only with
+        ``R1_SIL_IB_RESTATE`` (its rollback drops those lines from the warm-up), and never for a
+        question too short to nudge (no nudge, as in revision 32)."""
         text = quiet_nudge_line(question)
-        if text or not str(question or "").strip() or not icebreaker_plan_enabled():
+        if (
+            text
+            or not quiet_nudge_repeats(question)
+            or not sil_ib_restate_enabled()
+            or not icebreaker_plan_enabled()
+        ):
             return text
         current = self._icebreaker_plan.current
         if current is None:

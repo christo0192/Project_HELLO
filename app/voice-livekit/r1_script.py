@@ -113,8 +113,10 @@ OPEN_FIRST_QUESTION_2 = (
 # thirty minutes." in a sentence of its own, then "a sales role-play of up to twenty minutes", and
 # the judge read the two numbers as a contradiction (28 of 40 calls); "Great, I can hear you too."
 # was heard as a stock reaction.  One sentence now shows the parts make up the whole.  The owner's
-# durations are kept word for word.
-OPEN_HEARD_3 = "Good, I can hear you. "
+# durations are kept word for word.  Review of diagnosis 5 (D5-AGENDA1-R1): "Good, I can hear you."
+# was the echo of "Yes, I can hear you" that D4-BRIEF2 removed; the third heard line neither echoes
+# nor sounds stock.
+OPEN_HEARD_3 = "Lovely, thanks. "
 OPEN_AGENDA_3 = (
     "The whole interview takes about thirty minutes: a few minutes to get to know you, a sales "
     "role-play of up to twenty minutes, then time for your questions. "
@@ -515,7 +517,7 @@ def agenda_w3_enabled() -> bool:
     """``R1_AGENDA_W3`` (default on, only with ``R1_BRIEF_WORDING_V2``; M032 diagnosis 5,
     D5-AGENDA1): the opening agenda says the parts make up the whole in one sentence ("The whole
     interview takes about thirty minutes: a few minutes to get to know you, a sales role-play of up
-    to twenty minutes, then time for your questions."), after "Good, I can hear you.".  Read at use.
+    to twenty minutes, then time for your questions."), after "Lovely, thanks.".  Read at use.
     Rollback: ``fly secrets set R1_AGENDA_W3=0 -a project-hello-voice`` (revision 32's W2 agenda).
     """
     return brief_wording_v2_enabled() and (

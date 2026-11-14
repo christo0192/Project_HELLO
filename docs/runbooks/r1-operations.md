@@ -2453,7 +2453,7 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
 
 * **`R1_AGENDA_W3`** (default on, only with `R1_BRIEF_WORDING_V2`). The W2 agenda's "takes about
   thirty minutes." followed by "a sales role-play of up to twenty minutes" was read as a
-  contradiction. The agenda is now "Good, I can hear you. The whole interview takes about thirty
+  contradiction. The agenda is now "Lovely, thanks. The whole interview takes about thirty
   minutes: a few minutes to get to know you, a sales role-play of up to twenty minutes, then time
   for your questions." and W2's first question (L-OPEN-AGENDA-W3, -PLAIN-W3, -CONTINUE-W3).
   Rollback: `fly secrets set R1_AGENDA_W3=0 -a project-hello-voice` (the W2 agenda).
@@ -2473,6 +2473,27 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   "has just been given" for a request to hear the brief again.
 * Not done on this branch: D5-WRAP-NEXT1 and the L-FAQ-DEFER-WRAP rewording of D5-DEFLECT1; the
   wrap-up code (L-WRAP-NEXT, L-WRAP-MORE, L-FAQ-DEFER-WRAP) lives on the learner branch.
+
+#### Review of diagnosis 5 (Christy lane, content revision 34)
+
+No new flags; each change rides the flag of the fix it repairs.
+
+* `R1_AGENDA_W3`: the W3 agenda opens "Lovely, thanks." ("Good, I can hear you." echoed the
+  candidate's "Yes, I can hear you", the echo D4-BRIEF2 removed).
+* `R1_GUARD_STORY_ECHO`: when dropping her hiring-team deflection leaves a reply that asks nothing
+  ("Okay."), the plan's current question follows it, as after the praise cut. A turn that may ask
+  without a question mark keeps the deflection: Hindi question words ("kya", "kitna", "kab",
+  "kaise"), an indirect ask ("I have a question about the pay"), or five words or fewer that name
+  pay, salary, incentives, work mode, training, timelines, next steps, shifts or hours.
+* `R1_IB_QUIET_NUDGE`: an elaboration after ", say", ", like" or " - " that holds a wh-word holds
+  the question and is never cut; a cut keeps the question's own end punctuation; an instruction
+  ("Tell me about ...") keeps "So," and is never "I was asking, tell me ...". The objective's
+  restate stands in only for a nudge that would repeat her words, and only with
+  `R1_SIL_IB_RESTATE` (a question too short to nudge arms nothing, as in revision 32).
+* `R1_TRANSITION_ANSWERS`: the confirmation backstop adds L-RP-GOAL only after a later question that
+  asks how to do the role-play or what it is for (never after "Is that allowed?"); "Can I check if
+  we can start now?" is no leave to ask (it is answered, with the start question); a setup question
+  ("How would I handle it if my mic drops?") is no role-play field and goes to the model.
 
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 

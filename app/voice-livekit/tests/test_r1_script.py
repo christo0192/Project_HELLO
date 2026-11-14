@@ -803,11 +803,14 @@ class TestDiagnosis5Agenda(unittest.TestCase):
                 self.assertIn("thirty", sentence)
                 self.assertIn("up to twenty", sentence)
                 self.assertNotIn("Great, I can hear you too", text)
+                # Review of diagnosis 5 (D5-AGENDA1-R1): never the "I can hear you" echo that
+                # D4-BRIEF2 removed.
+                self.assertNotIn("I can hear you", text)
 
     def test_the_heard_line_and_the_first_question(self) -> None:
         self.assertEqual(
             r1_script.LINES["L-OPEN-AGENDA-W3"],
-            "Good, I can hear you. The whole interview takes about thirty minutes: a few minutes "
+            "Lovely, thanks. The whole interview takes about thirty minutes: a few minutes "
             "to get to know you, a sales role-play of up to twenty minutes, then time for your "
             "questions. To start, tell me a bit about yourself and the sales or customer-facing "
             "work you've done.",

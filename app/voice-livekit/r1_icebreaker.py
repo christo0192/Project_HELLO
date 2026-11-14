@@ -192,10 +192,57 @@ _NUDGE_ELABORATION_RE = re.compile(
     r"(?:, (?:say|like|for example|for instance|especially|maybe)\b| - ).*$", re.IGNORECASE
 )
 _NUDGE_RECALL_LEADS = frozenset({"so", "and", "now", "okay", "ok", "alright", "right", "well"})
+# Review of diagnosis 5 (D5-NUDGE1-R1): an elaboration that holds one of these words holds the
+# question itself ("Thinking about your last job, say the toughest call, what did you do?", "When
+# you say inbound, like what kind of leads?"), so it is never cut; and an instruction ("Tell me
+# about ...") is never brought back as "I was asking, tell me ...".
+_NUDGE_WH_WORDS = frozenset(
+    {"what", "how", "which", "why", "where", "when", "who", "whose", "whom"}
+)
+_NUDGE_INSTRUCTIONS = frozenset({"tell", "walk", "talk", "share", "describe"})
 
 
 def _nudge_words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9']+", str(text or "").lower())
+
+
+def _without_elaboration(text: str) -> str:
+    """``text`` without its elaboration tail (``_NUDGE_ELABORATION_RE``), keeping its own end
+    punctuation; ``text`` itself when the tail holds the question (a wh-word) or nothing that asks
+    would be left (review of diagnosis 5, D5-NUDGE1-R1)."""
+    match = _NUDGE_ELABORATION_RE.search(text)
+    if match is None:
+        return text
+    kept = text[: match.start()].rstrip(" ,.?!")
+    if _NUDGE_WH_WORDS.intersection(_nudge_words(text[match.start():])):
+        return text
+    if not _NUDGE_QUESTION_WORDS.intersection(_nudge_words(kept)):
+        return text
+    end = text.rstrip()[-1:]
+    return kept + (end if end in ".?!" else "?")
+
+
+def _quiet_nudge(question: str) -> tuple[str, bool]:
+    """``quiet_nudge_line``'s nudge, and whether "" means a verbatim repeat."""
+    original = str(question or "").strip()
+    lead = _first_word(original)
+    rest = _without_elaboration(_NUDGE_LEAD_RE.sub("", original).strip())
+    clauses = rest.split(", ")
+    for index in range(len(clauses) - 1, 0, -1):
+        if _first_word(clauses[index]) in _NUDGE_QUESTION_WORDS:
+            rest = ", ".join(clauses[index:])
+            break
+    if len(re.findall(r"[A-Za-z0-9']+", rest)) < _NUDGE_MIN_WORDS:
+        return "", False
+    head = rest.split()[0]
+    if head[:1].isupper() and not head.isupper() and _first_word(head) in _NUDGE_QUESTION_WORDS:
+        rest = rest[:1].lower() + rest[1:]
+    recall = lead in _NUDGE_RECALL_LEADS and _first_word(rest) not in _NUDGE_INSTRUCTIONS
+    template = IB_QUIET_NUDGE_RECALL if recall else IB_QUIET_NUDGE_TEMPLATE
+    said = template.format(question=rest)
+    if _nudge_words(said) == _nudge_words(original):
+        return "", True  # a verbatim repeat: the restate is said instead
+    return said, False
 
 
 def quiet_nudge_line(question: str) -> str:
@@ -204,33 +251,17 @@ def quiet_nudge_line(question: str) -> str:
     ..." -> "So, what ...").  Only a question word is lowered (never a name or an acronym), and a
     question with under two words left gives no nudge ("").
 
-    D5-NUDGE1: only the asking clause is kept (``_NUDGE_ELABORATION_RE``), a question that opened
-    with one of ``_NUDGE_RECALL_LEADS`` comes back as "I was asking, ..." (never "So, so ..."), and
-    a nudge whose words are the question's own words is no nudge (""; the session says the
-    objective's restate instead, ``silence_line_id``)."""
-    original = str(question or "").strip()
-    lead = _first_word(original)
-    rest = _NUDGE_LEAD_RE.sub("", original).strip()
-    cut = _NUDGE_ELABORATION_RE.sub("", rest).rstrip(" ,.?!")
-    if cut != rest.rstrip(" ,.?!"):
-        rest = cut + "?"
-    clauses = rest.split(", ")
-    for index in range(len(clauses) - 1, 0, -1):
-        if _first_word(clauses[index]) in _NUDGE_QUESTION_WORDS:
-            rest = ", ".join(clauses[index:])
-            break
-    if len(re.findall(r"[A-Za-z0-9']+", rest)) < _NUDGE_MIN_WORDS:
-        return ""
-    head = rest.split()[0]
-    if head[:1].isupper() and not head.isupper() and _first_word(head) in _NUDGE_QUESTION_WORDS:
-        rest = rest[:1].lower() + rest[1:]
-    template = (
-        IB_QUIET_NUDGE_RECALL if lead in _NUDGE_RECALL_LEADS else IB_QUIET_NUDGE_TEMPLATE
-    )
-    said = template.format(question=rest)
-    if _nudge_words(said) == _nudge_words(original):
-        return ""  # a verbatim repeat: the restate is said instead
-    return said
+    D5-NUDGE1: only the asking clause is kept (``_without_elaboration``), a question that opened
+    with one of ``_NUDGE_RECALL_LEADS`` comes back as "I was asking, ..." (never "So, so ..."; an
+    instruction keeps "So,"), and a nudge whose words are the question's own words is no nudge
+    (""; the session says the objective's restate instead, ``quiet_nudge_repeats``)."""
+    return _quiet_nudge(question)[0]
+
+
+def quiet_nudge_repeats(question: str) -> bool:
+    """Review of diagnosis 5 (D5-NUDGE1-R2): ``quiet_nudge_line`` is "" because the nudge would
+    repeat her words (never because the question is too short to nudge)."""
+    return _quiet_nudge(question)[1]
 
 
 # M032 live simulation, diagnosis 4 (D4-SIL-IB1): 30 s of silence after an open icebreaker question

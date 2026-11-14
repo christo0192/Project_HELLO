@@ -232,7 +232,12 @@ import r1_world
 #    R1_TRANSITION_ANSWERS (D5-TRANS1): the answers note keeps "has just been given" for a request
 #    to hear the brief again and says how to answer "how do I approach it?".  Every other text of
 #    revision 32 is unchanged.
-CONTENT_REVISION = 33
+# 34: review of diagnosis 5 (Christy lane).  R1_AGENDA_W3 (D5-AGENDA1-R1): the W3 agenda's heard
+#    line is "Lovely, thanks." ("Good, I can hear you." was the echo D4-BRIEF2 removed).
+#    R1_IB_QUIET_NUDGE (D5-NUDGE1-R1): an elaboration that holds a wh-word is never cut, the end
+#    punctuation is kept, and an instruction keeps "So," (r1_icebreaker._NUDGE_WH_WORDS,
+#    _NUDGE_INSTRUCTIONS).  No other pinned text changed.
+CONTENT_REVISION = 34
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -600,6 +605,9 @@ def manifest() -> dict[str, Any]:
                 "quiet_nudge_recall": r1_icebreaker.IB_QUIET_NUDGE_RECALL,
                 "quiet_nudge_elaboration": r1_icebreaker._NUDGE_ELABORATION_RE.pattern,
                 "quiet_nudge_recall_leads": sorted(r1_icebreaker._NUDGE_RECALL_LEADS),
+                # Revision 34 (review of diagnosis 5, D5-NUDGE1-R1).
+                "quiet_nudge_wh_words": sorted(r1_icebreaker._NUDGE_WH_WORDS),
+                "quiet_nudge_instructions": sorted(r1_icebreaker._NUDGE_INSTRUCTIONS),
             },
             # Revision 31 (D4-ICE-SKIP1, R1_IB_SKIP_V2; D4-ICE-ECHO1, R1_REACTION_VARIETY_V2).
             "skip_v2": {
