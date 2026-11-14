@@ -719,7 +719,9 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
         if later:
             dug.append(topic)
             # The role-play turn of each dig (the exchange's own number), for the engine's ledger.
-            dig_exchanges[topic] = [int(exchanges[i].get("n") or i + 1) for i in later]
+            # Review DIG-RELEASED-JUDGE-SOURCE: the engine's own role-play turn when the record has it
+            # (the harness count drifts when the session splits or joins candidate turns).
+            dig_exchanges[topic] = [_engine_turn(exchanges[i], i) for i in later]
             window_end = max(i for i, _intent in marks) + DEEP_WINDOW_TURNS
             if any(topic in deep_by_turn[i] for i in range(first_probe, min(window_end + 1, len(spoken)))):
                 disclosed.append(topic)
@@ -900,10 +902,25 @@ def engine_dig_metrics(
     return out
 
 
+def _engine_turn(exchange: Mapping[str, Any], index: int) -> int:
+    """The role-play turn of an exchange: the engine's own counter when recorded, else the harness's."""
+    turn = exchange.get("engine_turn")
+    if isinstance(turn, int) and not isinstance(turn, bool):
+        return turn
+    return int(exchange.get("n") or index + 1)
+
+
 def _released_turns(admin: Mapping[str, Any]) -> tuple[dict[str, int], dict[str, set[int]]]:
     """D4-H-DIG1: the dig turn by which the gate had released each need, and the turns of its deep
     offers that followed the hint."""
     release: dict[str, int] = {}
+    # ``probe_source`` names the source of a need's FIRST probe, not of its release: a need the rule
+    # probed can still be released by the shadow judge, so whenever a judge verdict was applied in the
+    # call a release one turn after the dig may be that dig's (review DIG-RELEASED-JUDGE-SOURCE).
+    tracker = admin.get("tracker") if isinstance(admin.get("tracker"), Mapping) else {}
+    judge = tracker.get("judge") if isinstance(tracker.get("judge"), Mapping) else {}
+    applied = judge.get("applied")
+    judge_ran = isinstance(applied, int) and not isinstance(applied, bool) and applied > 0
     for item in admin.get("needs") or []:
         if not isinstance(item, Mapping):
             continue
@@ -911,7 +928,8 @@ def _released_turns(admin: Mapping[str, Any]) -> tuple[dict[str, int], dict[str,
         turn = item.get("followup_turn") if turn is None else turn
         if isinstance(turn, int) and not isinstance(turn, bool):
             # The shadow judge's probe is folded in one turn after the dig it read.
-            release[str(item.get("topic"))] = turn - 1 if item.get("probe_source") == "judge" else turn
+            late = item.get("probe_source") == "judge" or judge_ran
+            release[str(item.get("topic"))] = turn - 1 if late else turn
     offers: dict[str, set[int]] = {}
     view_all = admin.get("disclosure") if isinstance(admin.get("disclosure"), Mapping) else {}
     for topic, view in view_all.items():
@@ -922,10 +940,13 @@ def _released_turns(admin: Mapping[str, Any]) -> tuple[dict[str, int], dict[str,
 
 
 # D4-H-DIG1: an open invitation to say what is on her mind, whatever the topic.
+# Review NEW-REGEX-BREADTH (3): a question that names its topic ("what's worrying you about the
+# schedule?", "what's holding you back from the fees?") is about that topic, not an open invitation.
+_ON_A_TOPIC = r"(?!\s+(?:about|with|from|regarding|around|on|in|when it comes to)\b)"
 _OPEN_INVITE = re.compile(
-    r"\bwhat(?:'|\u2019)?s (?:on your mind|worrying you|bothering you|holding you back)\b|"
+    r"\bwhat(?:(?:'|\u2019)?s| is) (?:on your mind|worrying you|bothering you|holding you back)\b" + _ON_A_TOPIC + "|"
     r"\bgo ahead,? i(?:'|\u2019)?m listening\b|"
-    r"\btell me what(?:'|\u2019)?s (?:worrying|bothering) you\b|\btell me what(?:'|\u2019)?s on your mind\b",
+    r"\btell me what(?:(?:'|\u2019)?s| is) (?:worrying you|bothering you|on your mind)\b" + _ON_A_TOPIC,
     re.IGNORECASE,
 )
 
@@ -1373,7 +1394,11 @@ def advisor_farewell_loop(exchanges: Sequence[Mapping[str, Any]]) -> int:
 
     def bye(ex: Mapping[str, Any]) -> bool:
         advisor = _advisor(ex)
-        return is_sign_off(AdvisorTurn(str(advisor.get("text") or ""), str(advisor.get("intent") or "other")))
+        r_sec = ex.get("r_sec")
+        return is_sign_off(
+            AdvisorTurn(str(advisor.get("text") or ""), str(advisor.get("intent") or "other")),
+            float(r_sec) if isinstance(r_sec, (int, float)) and not isinstance(r_sec, bool) else None,
+        )
 
     first = next(
         (i for i, ex in enumerate(exchanges) if bye(ex) and ends_on_goodbye((ex.get("learner") or {}).get("spoken"))),

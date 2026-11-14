@@ -30,6 +30,7 @@ from rehearsal.advisor import (
     is_sign_off,
     parse_advisor_output,
 )
+from rehearsal.full_metrics import SECOND_LAST_QUESTION
 from rehearsal.scenarios import (
     FALLBACK_THINKING_ANSWER,
     FREE,
@@ -45,16 +46,15 @@ THINK_PAUSE_SEC = 4.0
 # D4-H-REPLAY1: the longest silence after a replayed icebreaker backchannel before the answer it owes.
 BACKCHANNEL_GAP_SEC = 10.0
 ANSWER_ACTS = frozenset({"icebreaker_answer", "silence_answer"})
-# A repeat request that asks for an earlier question than the last ("that earlier question").
-_EARLIER = re.compile(
-    r"\bbefore (?:the )?last\b|\bsecond[- ](?:to[- ])?last\b|\bpenultimate\b|\bearlier\b|"
-    r"\b(?:go|going|jump|come) back\b|\breturn to\b",
-    re.IGNORECASE,
-)
+# A repeat request that asks for an earlier question than the last ("that earlier question"), read
+# exactly as the icebreaker-repeat check reads it (review NEW-REGEX-BREADTH: "I didn't catch it
+# earlier" asks for the last question).
+_EARLIER = SECOND_LAST_QUESTION
 ROLEPLAY_PATIENCE_SEC = 2.0
 WAIT_STEP_SEC = 1.0
 MAX_EXTRA_READY = 3
 DEFAULT_END_DECLINE = Beat("end_decline", "No, sorry, let's carry on.")
+FAREWELL_END_AGREE = Beat("end_agree", "Yes, please end it here.")  # after the farewell loop went quiet
 WRAP_ACCEPT = Beat("wrap_accept", "Yes, let's wrap it up here.")
 WRAP_DECLINE = Beat("wrap_decline", "No, let's keep going.")
 WRAP_ACCEPT_FROM_R_SEC = 1080.0
@@ -535,6 +535,7 @@ class CandidateSim:
         # D4-H-SIMLOOP1: mutual goodbyes in a row (the advisor's goodbye answered with one), and
         # whether the advisor has gone quiet for good after two of them.
         self._last_advisor: AdvisorTurn | None = None
+        self._last_advisor_r: float | None = None  # the role-play clock when it was said
         self._goodbyes_in_a_row = 0
         self._farewell_quiet = False
         # D4-H-REPLAY1: Christy's icebreaker questions in order, and whether each got an answer.
@@ -684,6 +685,10 @@ class CandidateSim:
         return beat.text
 
     def _end_answer(self) -> Beat:
+        if self._farewell_quiet:
+            # Review SIMLOOP-END-ANSWER: an advisor who said goodbye twice and went quiet has ended the
+            # call; asked whether to end it (L-ASIDE-END before R 14:00), it says yes.
+            return FAREWELL_END_AGREE
         if self._end_answers:
             return self._end_answers.pop(0)
         return DEFAULT_END_DECLINE
@@ -694,7 +699,7 @@ class CandidateSim:
         committed (never from the grader's hidden state)."""
         if (view.r_sec or 0.0) >= WRAP_ACCEPT_FROM_R_SEC:
             return True
-        return self._advisor_done or self._learner_committed
+        return self._advisor_done or self._learner_committed or self._farewell_quiet
 
     async def _icebreaker(self, view: View) -> Action:
         fresh = sum(1 for span in self._fresh if span.voice != LEARNER and is_icebreaker_question(span.text))
@@ -824,7 +829,7 @@ class CandidateSim:
             # simulator would otherwise keep making is not the product's.
             mutual = (
                 self._last_advisor is not None
-                and is_sign_off(self._last_advisor)
+                and is_sign_off(self._last_advisor, self._last_advisor_r)
                 and bool(learner)
                 and ends_on_goodbye(learner[-1])
             )
@@ -847,6 +852,7 @@ class CandidateSim:
         if turn.intent in WRAP_READY_INTENTS:
             self._advisor_done = True
         self._last_advisor = turn
+        self._last_advisor_r = view.r_sec
         if self.shadow is not None:
             self.shadow.set_turn(turn.as_dict())
         self.last_act = act

@@ -168,26 +168,64 @@ def is_farewell(turn: "AdvisorTurn") -> bool:
 
 
 # D4-H-SIMLOOP1: the wider set of ways a call is signed off ("Good night", "Talk tomorrow at seven",
-# "Thanks again"), read on the LAST sentence of a line only, for the farewell-loop rule.
-_SIGN_OFF = re.compile(
-    r"\b(?:good ?bye|bye|good ?night|take care|you too|"
-    r"(?:talk|speak) (?:to you )?(?:soon|later|tomorrow|then)|see you|until (?:then|tomorrow)|"
-    r"(?:look(?:ing)? forward to|ready for) (?:it|that|the call|tomorrow|\w+ tomorrow)|"
-    r"thanks? (?:you )?(?:so much|again|for (?:your|the) time|for tonight)|"
-    r"have a (?:good|great|nice|lovely) (?:night|evening|day|one))\b",
+# "See ya"), read on the LAST sentence of a line only, for the farewell-loop rule.  Review
+# SIMLOOP-REGEX-FP: a question is no sign-off (a tag such as ", okay?" aside), and the phrases that
+# also open ordinary sentences ("good night is when ...", "I see you have ...", "you too" in a
+# question, "thank you so much for sharing that") count only where they close the sentence.
+_TAG_QUESTION = re.compile(r",\s*(?:okay|ok|yeah|yes|alright|all right|right)\s*\?+\s*$", re.IGNORECASE)
+_NAME_TAIL = r"(?:\s*,?\s*[\w']+){0,2}"
+_SIGN_OFF_ANYWHERE = re.compile(
+    r"\b(?:good ?bye|bye(?:[- ]bye)?|take care|catch you later|see ya|cheerio)\b|"
+    r"\b(?:talk|speak) (?:to|with) you (?:soon|later|tomorrow|then|at|on)\b|"
+    r"\bthanks? (?:you )?(?:so much |again )?for (?:your time|the call|this call|calling|tonight)\b|"
+    r"\bhave a (?:good|great|nice|lovely|wonderful) (?:night|evening|day|one|weekend)\b",
     re.IGNORECASE,
 )
+_SIGN_OFF_CLOSING = re.compile(
+    r"(?:\bgood ?night" + _NAME_TAIL + r"|"
+    r"\bsee you(?:\s+(?:then|soon|later|tomorrow|there)" + _NAME_TAIL + r"|\s+(?:on|at)\s+[\w']+" + _NAME_TAIL + r")?"
+    r"(?:\s*,\s*[\w']+)?|"
+    r"\buntil (?:then|tomorrow)" + _NAME_TAIL + r")\W*$",
+    re.IGNORECASE,
+)
+_FORWARD = re.compile(
+    r"\blook(?:ing)? forward to (?:the call|our call|talking|speaking|tomorrow)" + _NAME_TAIL + r"\W*$",
+    re.IGNORECASE,
+)
+_SIGN_OFF_WHOLE = re.compile(
+    r"^\W*(?:(?:(?:thanks|thank you|and|okay|ok)\W+)?you too|cheers" + _NAME_TAIL + r")\W*$", re.IGNORECASE
+)
+# "Okay, talk tomorrow at seven." -- a short sentence only ("we can talk tomorrow about the fees" is no
+# goodbye).
+_SIGN_OFF_SHORT = re.compile(r"\b(?:talk|speak) (?:soon|later|tomorrow|then|at \w+|on \w+)\b", re.IGNORECASE)
+_NEGATED = re.compile(r"\b(?:not|never)\b|n't\b", re.IGNORECASE)
 
 
 def ends_on_goodbye(text: str | None) -> bool:
-    """True when the last sentence of a line signs the call off."""
+    """True when the last sentence of a line signs the call off (never a question)."""
     sentences = [part for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if part.strip()]
-    return bool(sentences) and _SIGN_OFF.search(sentences[-1]) is not None
+    if not sentences:
+        return False
+    last = _TAG_QUESTION.sub(".", sentences[-1].strip())
+    if last.endswith("?"):
+        return False
+    if _SIGN_OFF_ANYWHERE.search(last) or _SIGN_OFF_CLOSING.search(last) or _SIGN_OFF_WHOLE.search(last):
+        return True
+    if _FORWARD.search(last):
+        return _NEGATED.search(last) is None  # "I'm not looking forward to the call" is no goodbye
+    return len(re.findall(r"[\w']+", last)) <= 6 and _SIGN_OFF_SHORT.search(last) is not None
 
 
-def is_sign_off(turn: "AdvisorTurn") -> bool:
-    """An advisor goodbye for the farewell-loop rule: ``is_farewell`` or a sign-off last sentence."""
-    return is_farewell(turn) or ends_on_goodbye(turn.text)
+def is_sign_off(turn: "AdvisorTurn", r_sec: float | None = None) -> bool:
+    """An advisor goodbye for the farewell-loop rule: a turn the advisor tagged ``farewell``, or one
+    whose last sentence signs off when it confirmed a callback or comes at or after R 14:00 (before
+    that a goodbye is out of role, and a polite mid-call line must never count).  ``r_sec`` None (no
+    clock) keeps the text reading alone."""
+    if turn.intent == "farewell":
+        return True
+    if not ends_on_goodbye(turn.text):
+        return False
+    return turn.intent == "accept_callback" or r_sec is None or r_sec >= EARLIEST_FAREWELL_SEC
 
 
 def looks_inverted(text: str) -> bool:

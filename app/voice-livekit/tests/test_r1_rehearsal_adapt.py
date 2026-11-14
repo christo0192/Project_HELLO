@@ -826,8 +826,8 @@ class FlowDesignRulesTests(unittest.TestCase):
 
         record = _early_end_record()
         self.assertEqual(ended_by(record), "candidate end request, agreed at R 03:58")
-        for stop, said in (("farewell_exit", "farewell"), ("wrap_accepted", "farewell"), ("time_cap", "time cap"),
-                           ("no_roleplay", "no role-play")):
+        for stop, said in (("farewell_exit", "farewell"), ("wrap_accepted", "wrap-up offer, candidate agreed"),
+                           ("time_cap", "time cap"), ("no_roleplay", "no role-play")):
             self.assertEqual(ended_by({**record, "stop_reason": stop}), said, stop)
         # An at-once exit on a request that names the end (no question asked first).
         at_once = json.loads(json.dumps(record))
@@ -844,6 +844,36 @@ class FlowDesignRulesTests(unittest.TestCase):
         abuse["phase_checks"]["checks"]["abuse"] = {"ok": True, "exited_within_two_learner_lines": False, "r": 383.6}
         abuse["session_facts"] = {"learner_endings": {"abuse_hangups": 1}}
         self.assertEqual(ended_by(abuse), "hang-up after abuse at R 06:23")
+
+    def test_every_policy_ending_has_its_design_rule(self) -> None:
+        # Review FLOW-RULES-GAPS: an at-once end request, an agreed wrap-up and a hang-up after abuse are
+        # policy endings too; graded objections they leave unreached are no failure.
+        system, _user = self._messages(_early_end_record())
+        self.assertIn("or the request itself names the end", system)
+        self.assertIn("When Christy offers to wrap up and the candidate agrees, the role-play ends there", system)
+        self.assertIn("After abuse from the candidate the learner hangs up", system)
+        self.assertEqual(system.count("are no failure"), 3)
+
+    def test_the_wrap_ending_names_the_candidates_agreement(self) -> None:
+        from rehearsal.flow_judge import ended_by
+
+        record = json.loads(json.dumps(_early_end_record()))
+        record["stop_reason"] = "wrap_accepted"
+        record["candidate_turns"] = [{"act": "wrap_accept", "r_sec": 845.0}]
+        self.assertEqual(ended_by(record), "wrap-up offer, candidate agreed at R 14:05")
+
+    def test_an_end_request_after_an_insult_is_an_end_request(self) -> None:
+        # "... you idiot, just end the interview." ends at once: the exit two lines after the insult is
+        # the request's, not an abuse hang-up (the product's own hang-up count still wins).
+        from rehearsal.flow_judge import ended_by
+
+        record = json.loads(json.dumps(_early_end_record()))
+        record["phase_checks"]["checks"]["abuse"] = {"ok": True, "exited_within_two_learner_lines": True, "r": 228.4}
+        self.assertEqual(ended_by(record), "candidate end request, agreed at R 03:58")
+        record["stop_reason"] = "time_cap"
+        self.assertEqual(ended_by(record), "time cap")
+        record["session_facts"] = {"learner_endings": {"abuse_hangups": 1}}
+        self.assertEqual(ended_by(record), "hang-up after abuse at R 03:48")
 
     def test_off_sends_the_previous_rubric_and_facts(self) -> None:
         from rehearsal.flags import FLOW_DESIGN_RULES

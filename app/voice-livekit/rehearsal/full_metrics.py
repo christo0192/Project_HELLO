@@ -505,12 +505,23 @@ def _asks_again(question: str, reply: str) -> bool:
     return len(wanted & _content_words(reply)) >= 0.6 * len(wanted)
 
 
+# The question before the last one, read alike by this check and by the replaying candidate
+# (``rehearsal.candidate._EARLIER``; review NEW-REGEX-BREADTH): "earlier" as an adverb ("I didn't catch
+# it earlier") or a bare "go back" names no older question.
 _SECOND_LAST = re.compile(
-    r"\bbefore (?:the )?last\b|\bsecond[- ](?:to[- ])?last\b|\bpenultimate\b", re.IGNORECASE
+    r"\bbefore (?:the )?last\b|\bsecond[- ](?:to[- ])?last\b|\bpenultimate\b|"
+    r"\b(?:that|the) earlier question\b|\bthe question (?:from )?(?:earlier|before that)\b",
+    re.IGNORECASE,
 )
+SECOND_LAST_QUESTION = _SECOND_LAST
 _LAST = re.compile(r"\b(?:last|previous|latest) (?:\w+ ){0,2}question\b|\brepeat the question\b", re.IGNORECASE)
 # A request that turns down the question it just got ("No, I mean ...", "not that one").
-_TURNED_DOWN = re.compile(r"^\W*(?:no\b|nope\b|not (?:that|this) one\b|the other one\b)", re.IGNORECASE)
+# "No problem, ..." / "No worries, ..." turn nothing down (review NEW-REGEX-BREADTH).
+_TURNED_DOWN = re.compile(
+    r"^\W*(?:no\b(?!\W+(?:problem|problems|worries|worry|rush|hurry|issue|issues)\b)|nope\b|"
+    r"not (?:that|this) one\b|the other one\b)",
+    re.IGNORECASE,
+)
 
 
 def _icebreaker_repeat(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

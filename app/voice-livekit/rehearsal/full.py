@@ -688,6 +688,9 @@ def _note_turn(
     record["exchanges"].append(
         {
             "n": sim.exchanges if exchange is None else exchange,
+            # The engine's own role-play turn after this line (the needs ledger counts these; the
+            # harness count drifts when the session splits or joins candidate turns).
+            "engine_turn": _engine_turn(interview),
             "r_sec": turn["r_sec"],
             "advisor": {
                 **action.advisor.as_dict(),
@@ -700,6 +703,12 @@ def _note_turn(
             "clock": {"s_sec": turn["s_sec"], "t_start": turn["t_start"]},
         }
     )
+
+
+def _engine_turn(interview: Any) -> int | None:
+    """The role-play engine's own turn counter (None before the engine exists); never builds one."""
+    turn = getattr(getattr(interview, "_engine", None), "turn", None)
+    return turn if isinstance(turn, int) and not isinstance(turn, bool) else None
 
 
 def _first(calls: list[dict[str, Any]], key: str) -> float | None:
@@ -871,16 +880,21 @@ def _pieces(words: list[str], spans: list[tuple[Any, list[str]]]) -> list[tuple[
 
     out: list[tuple[Any, int, int]] = []
     pos, first = 0, 0
+    latest = len(spans) - 1
     while pos < len(words):
-        # The spoken turn (from the last one used on) that carries the longest run from here.
-        scored = [(run(pos, said), -index) for index, (_span, said) in enumerate(spans) if index >= first]
+        # The spoken turn (from the last one used on) that carries the longest run from here; on a tie
+        # the LATEST one, since a fragment belongs to the turn in progress (review
+        # CONTINUED-ROWS-EARLIEST-SPAN: "Yes." went to the opening sound check).
+        scored = [(run(pos, said), index) for index, (_span, said) in enumerate(spans) if index >= first]
         if not scored:
             return []
-        best, neg = max(scored)
+        best, index = max(scored)
         if not best or (best < 3 and pos + best < len(words)):
             return []
-        out.append((spans[-neg][0], pos, pos + best))
-        pos, first = pos + best, -neg
+        if best < 3 and index != latest:
+            return []  # one or two common words are no evidence for an older turn
+        out.append((spans[index][0], pos, pos + best))
+        pos, first = pos + best, index
     return out
 
 

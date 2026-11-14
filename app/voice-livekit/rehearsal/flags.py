@@ -32,10 +32,14 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
   learner_flow and objective_kept as null, and nulls stay out of the means, minimums and floor.
 * ``REHEARSAL_ADVISOR_FAREWELL_LOOP`` (D4-H-SIMLOOP1): after two exchanges in a row in which the
   simulated advisor said goodbye and the learner's reply ended on a goodbye too, the advisor goes quiet
-  for the rest of the role-play (the runner waits for the session's exit or the time cap).
+  for the rest of the role-play (the runner waits for the session's exit or the time cap).  A goodbye
+  is read on the last sentence, never a question; an advisor sign-off counts when it is tagged
+  ``farewell``, or confirms a callback, or comes from R 14:00.  Once quiet, the candidate agrees when
+  Christy asks to end the interview or to wrap up.
 * ``REHEARSAL_DIG_RELEASED`` (D4-H-DIG1): a harness dig is engine-confirmed only when the gate released
   that need at that exchange (its release turn, the judge's one turn later, or a deep offer after the
-  hint); the digs it did not honour are listed as ``probe_unreleased``.
+  hint); the digs it did not honour are listed as ``probe_unreleased``.  The judge's one-turn slack
+  holds whenever a judge verdict was applied in the call, and the dig turns are the engine's own.
 * ``REHEARSAL_OPEN_INVITE`` (D4-H-DIG1): a deep reveal that answers an open invitation ("what's on your
   mind?", "go ahead, I'm listening") is prompted, not an unprompted dump.
 * ``REHEARSAL_REPEAT_IF_UNANSWERED`` (D4-H-REPLAY1): a replayed request in the transition to hear an
@@ -43,7 +47,8 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
   "that earlier question", else the last) went unanswered; otherwise the next replayed line is said.
 * ``REHEARSAL_CONTINUED_ROWS`` (D4-H-REPLAY1): a candidate row the session saved without a span (a
   fragment of a longer spoken turn) carries the timing of the spoken turn it belongs to, and a part of
-  a turn spoken over the brief is merged into the row of that turn.
+  a turn spoken over the brief is merged into the row of that turn.  A fragment goes to the latest
+  matching turn, and a run of one or two words only to the turn in progress.
 * ``REHEARSAL_BACKCHANNEL_GAP`` (D4-H-REPLAY1): after a replayed icebreaker backchannel ("thanks") the
   candidate answers the question it still owes after at most 10 s of silence.
 """

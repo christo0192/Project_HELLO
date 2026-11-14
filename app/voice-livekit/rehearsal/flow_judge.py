@@ -20,7 +20,8 @@ fail closed: a reply without all six scores is an error, never a guess.
 
 Diagnosis 4 (``REHEARSAL_FLOW_DESIGN_RULES``, default ON): the rubric carries the DESIGN RULES fixed by
 policy (the judge scores their wording and timing, never that they exist), the facts say who ended the
-role-play (farewell, the candidate's agreed end request, the time cap or a hang-up after abuse) and which
+role-play (farewell, the candidate's agreed or at-once end request, an agreed wrap-up, the time cap or a
+hang-up after abuse) and which
 graded families came before that, and evidence is asked only for the axes below 5.  With
 ``REHEARSAL_FLOW_NA_AXES`` (default ON) a call with no learner line (no role-play) has learner_flow and
 objective_kept scored null: n/a, left out of the means, the minimums and the axis floor.
@@ -99,8 +100,13 @@ DESIGN_RULES = (
     "- The brief must give the learner's name, city, the course, 'up to twenty minutes', the "
     "preparation guide, the cue 'Let's pause the role-play here' and the instruction to say 'ready'.\n"
     "- The role-play starts only on a spoken 'ready' or the button.\n"
-    "- When the candidate asks to end the role-play and agrees when asked, the role-play ends at once: "
-    "that keeps the objective, and objections not reached because the candidate ended are no failure.\n"
+    "- When the candidate asks to end the role-play and agrees when asked, or the request itself names the "
+    "end, the role-play ends at once: that keeps the objective, and objections not reached because the "
+    "candidate ended are no failure.\n"
+    "- When Christy offers to wrap up and the candidate agrees, the role-play ends there: objections not "
+    "reached are no failure.\n"
+    "- After abuse from the candidate the learner hangs up: that keeps the objective, and objections not "
+    "reached are no failure.\n"
     "- Christy steps out of the role-play with the cue phrase 'Let's pause the role-play here'.\n"
 )
 _EVIDENCE_V1 = (
@@ -235,10 +241,16 @@ def ended_by(record: Mapping[str, Any]) -> str:
     abuse = checks.get("abuse") or {}
     endings = ((record.get("session_facts") or {}).get("learner_endings") or {})
     hung_up = endings.get("abuse_hangups") if isinstance(endings, Mapping) else None
-    if (isinstance(hung_up, int) and hung_up > 0) or abuse.get("exited_within_two_learner_lines"):
+    stop = record.get("stop_reason")
+    # The product's own hang-up count is the truth; an exit within two learner lines of an insult is a
+    # hang-up only when nothing else ended the role-play (review FLOW-RULES-GAPS: "... you idiot, just
+    # end the interview" is an end request, and the time cap is the time cap).
+    near_insult = bool(abuse.get("exited_within_two_learner_lines")) and stop not in (
+        "end_request", "time_cap", "wrap_accepted"
+    )
+    if (isinstance(hung_up, int) and hung_up > 0) or near_insult:
         at = abuse.get("r")
         return "hang-up after abuse" + (f" at R {_clock(at)}" if isinstance(at, (int, float)) else "")
-    stop = record.get("stop_reason")
     if stop == "end_request":
         agreed = _act_r(record, "end_agree")
         if agreed is not None:
@@ -251,9 +263,11 @@ def ended_by(record: Mapping[str, Any]) -> str:
                 + why.get(str(at_once.get("exit_basis")), "")
             )
         return f"candidate end request at R {_clock(_act_r(record, 'end_request'))}"
+    if stop == "wrap_accepted":
+        agreed = _act_r(record, "wrap_accept")
+        return "wrap-up offer, candidate agreed" + (f" at R {_clock(agreed)}" if agreed is not None else "")
     return {
         "farewell_exit": "farewell",
-        "wrap_accepted": "farewell",
         "time_cap": "time cap",
         "no_roleplay": "no role-play",
     }.get(str(stop), str(stop))

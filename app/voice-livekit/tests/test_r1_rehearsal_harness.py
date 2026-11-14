@@ -3289,6 +3289,26 @@ class DiagnosisFourDigTests(unittest.TestCase):
         self.assertEqual(metrics.engine_dig_metrics(self._admin(27, source="judge"), ["H3"], [], {"H3": [26]})["needs_dug_confirmed"], ["H3"])
         self.assertEqual(metrics.engine_dig_metrics(self._admin(27), ["H3"], [], {"H3": [26]})["needs_dug_confirmed"], [])
 
+    def test_a_judge_release_of_a_need_the_rule_probed_first_is_one_turn_late_too(self) -> None:
+        # Review DIG-RELEASED-JUDGE-SOURCE: probe_source names the FIRST probe's source, not the release's.
+        admin = self._admin(26)
+        admin["tracker"] = {"judge": {"applied": 9, "rejected": 0}}
+        found = metrics.engine_dig_metrics(admin, ["H3"], [], {"H3": [25]})
+        self.assertEqual((found["needs_dug_confirmed"], found["probe_unreleased"]), (["H3"], []))
+        # With no judge verdict applied in the call, a release one turn after the dig is still another question.
+        admin["tracker"] = {"judge": {"applied": 0, "rejected": 0}}
+        self.assertEqual(metrics.engine_dig_metrics(admin, ["H3"], [], {"H3": [25]})["needs_dug_confirmed"], [])
+
+    def test_the_dig_turns_are_the_engines_own_role_play_turns(self) -> None:
+        # The harness exchange count drifts from the engine's turn counter when the session splits or
+        # joins candidate turns; the exchange's engine_turn is the one the ledger speaks.
+        exchanges = [
+            tic_exchange(1, "What made you look into this now?", "Things feel uncertain.", intent="probe", topic="H1"),
+            tic_exchange(2, "Tell me more about that?", "Well.", intent="followup", topic="H1"),
+        ]
+        exchanges[0]["engine_turn"], exchanges[1]["engine_turn"] = 1, 3
+        self.assertEqual(metrics.disclosure_metrics(self.PERSONA, exchanges)["dig_exchanges"], {"H1": [3]})
+
     def test_a_hint_followed_by_a_deep_offer_at_the_dig_confirms_it(self) -> None:
         found = metrics.engine_dig_metrics(self._admin(33, offers=[25]), ["H3"], [], {"H3": [25]})
         self.assertEqual(found["needs_dug_confirmed"], ["H3"])
@@ -3320,6 +3340,15 @@ class DiagnosisFourDigTests(unittest.TestCase):
         with _env(REHEARSAL_OPEN_INVITE="0"):
             found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "Go ahead, I'm listening.", self.DEEP)])
         self.assertEqual(found["unprompted_dump_count"], 1)
+        # Review NEW-REGEX-BREADTH (3): "What is on your mind?" is open too; a question about one topic
+        # is no open invitation, so it excuses no reveal of another topic.
+        found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "What is on your mind?", self.DEEP)])
+        self.assertEqual((found["unprompted_dump_count"], found["unprompted_dump_excused"]), (0, 1))
+        for text in ("What's worrying you about the schedule?", "So what's holding you back from the fees?",
+                     "Tell me what's bothering you about the timings."):
+            with self.subTest(text=text):
+                found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, text, self.DEEP)])
+                self.assertEqual(found["unprompted_dump_excused"], 0)
         # A statement with no invitation still counts as a dump.
         found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "The program runs six months.", self.DEEP)])
         self.assertEqual(found["unprompted_dump_count"], 1)
