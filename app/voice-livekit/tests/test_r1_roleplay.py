@@ -14723,6 +14723,15 @@ class D5AckPressTests(unittest.TestCase):
         context = d5_ctx(free_reply=True, said=said, ack_press=True, advisor_hollow=True)
         self.assertEqual(guard_text(self.QUESTION, context).text, r1_guard.PRESS_REPLIES[2])
 
+    def test_each_press_line_is_said_once_per_call_then_a_neutral_ack(self):
+        # int-offline-7 terse-nervous: once all three were used, the first came back word for
+        # word (exact_repeat_sentence); after the third press she just acknowledges.
+        said = tuple(N(text) for text in (self.QUESTION, *r1_guard.PRESS_REPLIES))
+        context = d5_ctx(free_reply=True, said=said, ack_press=True, advisor_hollow=True)
+        out = guard_text(self.QUESTION, context).text
+        self.assertNotIn(out, r1_guard.PRESS_REPLIES)
+        self.assertIn(out, r1_guard.NEUTRAL_ACKS)
+
     def test_a_lone_okay_after_a_statement_still_gets_a_neutral_ack(self):
         line = "I've tried a bit of online stuff before."
         context = d5_ctx(free_reply=True, said=(N(line),), ack_press=True, advisor_hollow=True)

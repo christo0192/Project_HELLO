@@ -2750,13 +2750,14 @@ PRESS_REPLIES = (
 )
 
 
-def _press_line(ctx: GuardContext) -> str:
-    """D5-LRN-ACKFALL1: a rotated press line she has not said yet (the first if all were said)."""
+def _press_line(ctx: GuardContext) -> str | None:
+    """D5-LRN-ACKFALL1: a rotated press line she has not said yet, or None once each was said
+    (int-offline-7: the first came back word for word; after the third press she acknowledges)."""
     for offset in range(len(PRESS_REPLIES)):
         candidate = pick_variant(PRESS_REPLIES, ctx.seed, ctx.variant + offset)
         if repeat_kind(candidate, ctx.said) is None:
             return candidate
-    return pick_variant(PRESS_REPLIES, ctx.seed, ctx.variant)
+    return None
 
 
 # D5-LRN-ASSUME1 (R1_NO_ANSWER_READ): a first sentence that takes a contentless advisor turn as an
@@ -3749,10 +3750,11 @@ class StreamGuard:
                 and only_repeats
                 and self._repeat_question_dropped
                 and not ctx.confirm
+                and (press := _press_line(ctx)) is not None
             ):
                 # D5-LRN-ACKFALL1: her question met a lone "Okay." and its re-ask was a repeat; a
-                # bare "Mm-hmm." would drop her point, so she presses gently.
-                self._emitted.append(_press_line(ctx))
+                # bare "Mm-hmm." would drop her point, so she presses gently (each line once).
+                self._emitted.append(press)
             elif self._length_drops and ctx.free_reply and ctx.is_learner:
                 # M032 SWEEP-17: a free reply emptied by a course length she was never told asks
                 # for it instead ("How long does the course run?"), never "Give me a second".
