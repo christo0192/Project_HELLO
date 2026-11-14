@@ -4130,3 +4130,196 @@ class TestTransitionQuietDrop(unittest.TestCase):
             guard_text("It's mostly calls. I'd be happy to go over it again.", used).text,
             "It's mostly calls.",
         )
+
+
+class TestWithOpenerOncePerIcebreaker(unittest.TestCase):
+    """M032 diagnosis 5 (D5-ICE-AWITH1, ``R1_REACTION_VARIETY_V2``).  Round 5: the react clause's old
+    example taught "And with <their thing>, <question>?" as a template (about ten in 250 icebreaker
+    lines).  One is natural; the rest lose the clause.  Synthetic replies."""
+
+    REPLIES = (
+        "And with that many calls a week, how do you plan your mornings?",
+        "And with all that dialling, what's pulling you toward this role?",
+        "With learners like that, what usually makes them say yes?",
+        "Got it. And with those follow-ups, how do you keep track of them?",
+        "With so many leads, which ones do you call first?",
+        "And with the night shifts, what keeps you going?",
+    )
+
+    def run_six(self, **flags) -> list[str]:
+        said: list[str] = []
+        for reply in self.REPLIES:
+            used = any(
+                r1_guard.with_opener(part)
+                for text in said
+                for part in r1_guard.split_sentences(text)
+            )
+            context = ctx(
+                "icebreaker",
+                reaction_check=True,
+                candidate_text="I make a lot of calls every day.",
+                with_opener_used=used if flags.get("reaction_check_v2") else False,
+                **flags,
+            )
+            said.append(guard_text(reply, context).text)
+        return said
+
+    def test_a_six_question_icebreaker_keeps_at_most_one(self) -> None:
+        said = self.run_six(reaction_check_v2=True)
+        openers = sum(
+            1
+            for text in said
+            for part in r1_guard.split_sentences(text)
+            if r1_guard.with_opener(part)
+        )
+        self.assertEqual(openers, 1)
+        self.assertEqual(said[0], self.REPLIES[0])
+        self.assertEqual(said[1], "What's pulling you toward this role?")
+        self.assertEqual(said[2], "What usually makes them say yes?")
+        self.assertEqual(said[3], "Got it. How do you keep track of them?")
+        for text in said:
+            self.assertTrue(text.strip())
+            self.assertFalse(text.lower().startswith(("with ", "and with ")) and text != said[0])
+
+    def test_with_the_flag_off_nothing_changes(self) -> None:
+        self.assertEqual(self.run_six(reaction_check_v2=False), list(self.REPLIES))
+
+    def test_never_empties_a_sentence(self) -> None:
+        self.assertEqual(
+            r1_guard.without_with_opener("And with that many calls, why?"),
+            "And with that many calls, why?",
+        )
+        self.assertEqual(
+            r1_guard.without_with_opener("With that many calls, what helps you most?"),
+            "What helps you most?",
+        )
+
+    def test_only_the_stock_frame_matches(self) -> None:
+        for text in (
+            "What did you do with that client?",
+            "With whom did you work most?",
+            "And what about the evenings?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.with_opener(text))
+
+    def test_the_learner_and_the_transition_are_untouched(self) -> None:
+        reply = "And with all that dialling, what's pulling you toward this role?"
+        for context in (
+            ctx("transition", reaction_check=True, reaction_check_v2=True, with_opener_used=True),
+            ctx(reaction_check_v2=True, with_opener_used=True),
+        ):
+            with self.subTest(phase=context.phase):
+                self.assertIn("with all that dialling", guard_text(reply, context).text.lower())
+
+
+class TestSelfDeflectionAfterNoQuestion(unittest.TestCase):
+    """M032 diagnosis 5 (D5-DEFLECT1, ``R1_GUARD_STORY_ECHO``).  Round 5 interrupter (paraphrased): the
+    candidate said why they wanted the role, asked nothing, and heard "That's a good question for the
+    hiring team; they'll follow up with you on it." before her next question."""
+
+    TOLD = "I want this role because I like leading a small team and helping people decide."
+    REPLY = (
+        "That's a good question for the hiring team; they'll follow up with you on it. You "
+        "mentioned leading a small team, how did you keep them going?"
+    )
+
+    def test_the_deflection_after_a_statement_is_dropped(self) -> None:
+        result = guard_text(self.REPLY, ctx("icebreaker", story_echo=True, candidate_text=self.TOLD))
+        self.assertEqual(result.text, "You mentioned leading a small team, how did you keep them going?")
+
+    def test_the_deflection_alone_falls_back_to_the_plan_question(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text=self.TOLD,
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertEqual(
+            guard_text(INTERVIEWER_DEFLECTION, context).text, "What draws you to this role?"
+        )
+
+    def test_the_deflection_alone_with_no_plan_question_stays(self) -> None:
+        context = ctx("icebreaker", story_echo=True, candidate_text=self.TOLD)
+        self.assertEqual(guard_text(INTERVIEWER_DEFLECTION, context).text, INTERVIEWER_DEFLECTION)
+
+    def test_after_a_question_it_stays(self) -> None:
+        context = ctx("icebreaker", story_echo=True, candidate_text="What are the shift timings?")
+        self.assertEqual(guard_text(self.REPLY, context).text, self.REPLY)
+
+    def test_with_the_flag_off_it_stays(self) -> None:
+        context = ctx("icebreaker", candidate_text=self.TOLD)
+        self.assertEqual(guard_text(self.REPLY, context).text, self.REPLY)
+
+    def test_the_transition_is_unchanged(self) -> None:
+        context = ctx("transition", story_echo=True, candidate_text=self.TOLD)
+        self.assertEqual(guard_text(self.REPLY, context).text, self.REPLY)
+
+    # Review of diagnosis 5 (D5-DEFLECT1-R1): the deflection after an acknowledgement left the
+    # acknowledgement alone and no question; the plan's question follows it, as after the praise
+    # cut.
+    def test_an_acknowledgement_left_alone_gets_the_plan_question(self) -> None:
+        told = "The pay at my last job was really low honestly."
+        for reply, said in (
+            (f"Okay. {INTERVIEWER_DEFLECTION}", "Okay. What draws you to this role?"),
+            (
+                f"Got it, thanks for sharing. {INTERVIEWER_DEFLECTION}",
+                "Got it, thanks for sharing. What draws you to this role?",
+            ),
+        ):
+            with self.subTest(reply=reply):
+                context = ctx(
+                    "icebreaker",
+                    story_echo=True,
+                    candidate_text=told,
+                    interviewer_fallback="What draws you to this role?",
+                )
+                self.assertEqual(guard_text(reply, context).text, said)
+
+    def test_a_kept_question_needs_no_plan_question(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text=self.TOLD,
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertEqual(
+            guard_text(self.REPLY, context).text,
+            "You mentioned leading a small team, how did you keep them going?",
+        )
+
+    def test_no_plan_question_leaves_the_acknowledgement(self) -> None:
+        context = ctx("icebreaker", story_echo=True, candidate_text=self.TOLD)
+        self.assertEqual(guard_text(f"Okay. {INTERVIEWER_DEFLECTION}", context).text, "Okay.")
+
+    # Review of diagnosis 5 (D5-DEFLECT1-R2): a question the speech-to-text left unmarked (Hinglish,
+    # terse, indirect) keeps her deflection: the model heard a question.
+    def test_an_unmarked_question_keeps_the_deflection(self) -> None:
+        for told in (
+            "Salary kya hoga is role mein",
+            "Training kitne din ki hai",
+            "and the pay",
+            "what about work from home",
+            "I have a question about the pay",
+            "I wanted to know about the next steps",
+        ):
+            with self.subTest(told=told):
+                context = ctx(
+                    "icebreaker",
+                    story_echo=True,
+                    candidate_text=told,
+                    interviewer_fallback="What draws you to this role?",
+                )
+                self.assertEqual(
+                    guard_text(f"Sure. {INTERVIEWER_DEFLECTION}", context).text,
+                    f"Sure. {INTERVIEWER_DEFLECTION}",
+                )
+
+    def test_a_story_that_names_pay_still_drops_it(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text="My salary at the bank was fine but the targets were brutal.",
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertNotIn("hiring team", guard_text(self.REPLY, context).text)

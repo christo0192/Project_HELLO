@@ -109,6 +109,18 @@ OPEN_AGENDA_2 = (
 OPEN_FIRST_QUESTION_2 = (
     "To start, tell me a bit about yourself and the sales or customer-facing work you've done."
 )
+# M032 live simulation, diagnosis 5 (D5-AGENDA1, R1_AGENDA_W3): the W2 agenda put "takes about
+# thirty minutes." in a sentence of its own, then "a sales role-play of up to twenty minutes", and
+# the judge read the two numbers as a contradiction (28 of 40 calls); "Great, I can hear you too."
+# was heard as a stock reaction.  One sentence now shows the parts make up the whole.  The owner's
+# durations are kept word for word.  Review of diagnosis 5 (D5-AGENDA1-R1): "Good, I can hear you."
+# was the echo of "Yes, I can hear you" that D4-BRIEF2 removed; the third heard line neither echoes
+# nor sounds stock.
+OPEN_HEARD_3 = "Lovely, thanks. "
+OPEN_AGENDA_3 = (
+    "The whole interview takes about thirty minutes: a few minutes to get to know you, a sales "
+    "role-play of up to twenty minutes, then time for your questions. "
+)
 
 LINES: dict[str, str] = {
     "L-OPEN": (
@@ -138,6 +150,11 @@ LINES: dict[str, str] = {
     "L-OPEN-AGENDA-W2": OPEN_HEARD_2 + OPEN_AGENDA_2 + OPEN_FIRST_QUESTION_2,
     "L-OPEN-AGENDA-PLAIN-W2": OPEN_PLAIN + OPEN_AGENDA_2 + OPEN_FIRST_QUESTION_2,
     "L-OPEN-AGENDA-CONTINUE-W2": OPEN_HEARD_2 + OPEN_AGENDA_2 + OPEN_CARRY_ON,
+    # D5-AGENDA1 (R1_AGENDA_W3): the agenda as one sentence whose parts add up to the whole
+    # (``AGENDA_W3_LINES``); the first question and the carry-on are W2's.
+    "L-OPEN-AGENDA-W3": OPEN_HEARD_3 + OPEN_AGENDA_3 + OPEN_FIRST_QUESTION_2,
+    "L-OPEN-AGENDA-PLAIN-W3": OPEN_PLAIN + OPEN_AGENDA_3 + OPEN_FIRST_QUESTION_2,
+    "L-OPEN-AGENDA-CONTINUE-W3": OPEN_HEARD_3 + OPEN_AGENDA_3 + OPEN_CARRY_ON,
     # M032 S6 item 5 and SWEEP-30: the brief, from the shared body above.
     "L-TRANSITION": BRIEF_THANKS + BRIEF_BODY,
     # M032 diagnosis 3 (D3-ICE1, R1_REACTION_VARIETY): the brief with one of three thanks in place
@@ -428,6 +445,13 @@ LINES: dict[str, str] = {
     "L-ASIDE-HANGUP": (
         "{lead_first_name} has ended the call. Shall we pause the role-play here and move on?"
     ),
+    # M032 live simulation, diagnosis 5 (D5-ASIDE-WRAP2, R1_WRAP_OFFER_VARIANT): a second offer
+    # said L-ASIDE-WRAP word for word ("feels scripted").  Like L-ASIDE-WRAP it is not an either/or
+    # question, so a bare "yes" still means wrap up and is answered the same way.
+    "L-ASIDE-WRAP-AGAIN": (
+        "Christy again, just checking in. Would you like to wrap up the role-play here? If not, "
+        "just carry on with {lead_first_name}."
+    ),
     # M2: the end of the role-play's time (R = 20:00, or its S cap) is never abrupt: after the
     # 17:00 time cue, the learner closes in role with this line, and then L-EXIT follows.
     "L-TIME-UP": "I'm sorry, I really have to go now. Thank you for your time.",
@@ -572,6 +596,12 @@ WORDING_LINES = {
     "L-TRANSITION-AGAIN": "L-TRANSITION-AGAIN-W2",
 }
 _OPENING_WORDING = frozenset({"L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE"})
+# D5-AGENDA1 (``R1_AGENDA_W3``, only with ``R1_BRIEF_WORDING_V2``): the agendas' third wording.
+AGENDA_W3_LINES = {
+    "L-OPEN-AGENDA": "L-OPEN-AGENDA-W3",
+    "L-OPEN-AGENDA-PLAIN": "L-OPEN-AGENDA-PLAIN-W3",
+    "L-OPEN-AGENDA-CONTINUE": "L-OPEN-AGENDA-CONTINUE-W3",
+}
 # D4-TRANS-PRESENT1 (``R1_TRANSITION_PRESENCE_V2``): the pickup bridge that hears the press.
 VARIETY_LINES = {"L-PICKUP-BRIDGE": "L-PICKUP-BRIDGE-2"}
 
@@ -583,6 +613,27 @@ def brief_wording_v2_enabled() -> bool:
     (content revision 30's agenda and brief texts exactly).
     """
     return (os.getenv("R1_BRIEF_WORDING_V2") or "1").strip().lower() not in _OFF_VALUES
+
+
+def wrap_offer_variant_enabled() -> bool:
+    """``R1_WRAP_OFFER_VARIANT`` (default on; M032 diagnosis 5, D5-ASIDE-WRAP2): every offer to wrap
+    up after the first in a session is L-ASIDE-WRAP-AGAIN, never L-ASIDE-WRAP word for word; the
+    answer is handled exactly as before.  Read at use.  Rollback: ``fly secrets set
+    R1_WRAP_OFFER_VARIANT=0 -a project-hello-voice`` (L-ASIDE-WRAP for every offer).
+    """
+    return (os.getenv("R1_WRAP_OFFER_VARIANT") or "1").strip().lower() not in _OFF_VALUES
+
+
+def agenda_w3_enabled() -> bool:
+    """``R1_AGENDA_W3`` (default on, only with ``R1_BRIEF_WORDING_V2``; M032 diagnosis 5,
+    D5-AGENDA1): the opening agenda says the parts make up the whole in one sentence ("The whole
+    interview takes about thirty minutes: a few minutes to get to know you, a sales role-play of up
+    to twenty minutes, then time for your questions."), after "Lovely, thanks.".  Read at use.
+    Rollback: ``fly secrets set R1_AGENDA_W3=0 -a project-hello-voice`` (revision 32's W2 agenda).
+    """
+    return brief_wording_v2_enabled() and (
+        (os.getenv("R1_AGENDA_W3") or "1").strip().lower() not in _OFF_VALUES
+    )
 
 
 def transition_answers_enabled() -> bool:
@@ -605,6 +656,8 @@ def active_line_id(line_id: str) -> str:
     while ``R1_TRANSITION_PRESENCE_V2`` is)."""
     if line_id in ROLLBACK_LINES and not transition_repair_enabled():
         return ROLLBACK_LINES[line_id]
+    if line_id in AGENDA_W3_LINES and agenda_w3_enabled():
+        return AGENDA_W3_LINES[line_id]  # D5-AGENDA1
     if line_id in WORDING_LINES and brief_wording_v2_enabled():
         if line_id in _OPENING_WORDING or transition_repair_enabled():
             return WORDING_LINES[line_id]

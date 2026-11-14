@@ -423,7 +423,12 @@ from r1_scheduler import (
     tells_something,
     worry_answered,
 )
-from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS, active_line_id
+from r1_script import (
+    LEARNER_FILLER_SHORT,
+    LEARNER_FILLER_VARIANTS,
+    active_line_id,
+    wrap_offer_variant_enabled,
+)
 from r1_script import line as script_line
 from r1_text import (
     CALLER_KNOWN,
@@ -579,6 +584,9 @@ COMMITMENT_REVOICE_LIMIT = 2
 # and the closing line at 20:00 is close.
 WRAP_OFFER_LINE = "L-ASIDE-WRAP"
 WRAP_RESUME_LINE = "L-ASIDE-WRAP-RESUME"
+# M032 diagnosis 5 (D5-ASIDE-WRAP2, ``R1_WRAP_OFFER_VARIANT``): every offer after the first.
+WRAP_OFFER_AGAIN_LINE = "L-ASIDE-WRAP-AGAIN"
+_WRAP_OFFER_LINES = (WRAP_OFFER_LINE, WRAP_OFFER_AGAIN_LINE)
 WRAP_OFFER_FROM_R_SEC = float(EARLY_CLOSE_BEFORE_SEC)
 WRAP_OFFER_UNTIL_R_SEC = 1110.0
 WRAP_OFFER_LIMIT = 2
@@ -4318,7 +4326,25 @@ class RolePlayEngine:
         if not self._wrap_open:
             return None
         # M032 S3: the early-close and hang-up questions are answered like the offer.
+        return self._open_wrap_line()
+
+    def _open_wrap_line(self) -> str:
+        """The line of the offer now open (D5-ASIDE-WRAP2: L-ASIDE-WRAP or L-ASIDE-WRAP-AGAIN)."""
+        if not self._wrap_offers:
+            return WRAP_OFFER_LINE
         return str(self._wrap_offers[-1].get("line") or WRAP_OFFER_LINE)
+
+    def _next_wrap_offer_line(self) -> str:
+        """D5-ASIDE-WRAP2 (``R1_WRAP_OFFER_VARIANT``): L-ASIDE-WRAP-AGAIN once an offer to wrap up
+        was already made this session, else L-ASIDE-WRAP."""
+        if not wrap_offer_variant_enabled():
+            return WRAP_OFFER_LINE
+        made = any(
+            str(offer.get("line") or WRAP_OFFER_LINE) in _WRAP_OFFER_LINES
+            and str(offer.get("trigger") or "") not in ("early_close", "abuse")
+            for offer in self._wrap_offers
+        )
+        return WRAP_OFFER_AGAIN_LINE if made else WRAP_OFFER_LINE
 
     def settles_as_yes(self, text: object) -> bool:
         """True for a short yes to an open question: the session lets it settle before planning.
@@ -5050,7 +5076,9 @@ class RolePlayEngine:
     def _wrap_offer_plan(
         self, r_sec: float, trigger: str, turn_index: int | None, *, reasons: list[str]
     ) -> TurnPlan:
-        """L-ASIDE-WRAP, spoken by the interviewer with R paused; the next turn answers it."""
+        """L-ASIDE-WRAP, spoken by the interviewer with R paused; the next turn answers it
+        (D5-ASIDE-WRAP2: L-ASIDE-WRAP-AGAIN for a later offer, ``_next_wrap_offer_line``)."""
+        line_id = self._next_wrap_offer_line()
         self._wrap_open = True
         self._wrap_offers.append(
             {
@@ -5059,9 +5087,10 @@ class RolePlayEngine:
                 "after_roleplay_turn": self.turn,
                 "transcript_turn": turn_index,
                 "answer": None,
+                "line": line_id,
             }
         )
-        return self._wrap_line_plan(WRAP_OFFER_LINE, reasons)
+        return self._wrap_line_plan(line_id, reasons)
 
     def _wrap_line_plan(self, line_id: str | None, reasons: list[str]) -> TurnPlan:
         """An interviewer aside of the offer (``line_id`` None: nothing is said, the turn waits)."""
@@ -5156,8 +5185,7 @@ class RolePlayEngine:
             self._wrap_closed("no", r_sec, turn_index)
             return None
         if repair:
-            line_id = str(offer.get("line") or WRAP_OFFER_LINE)
-            return self._wrap_line_plan(line_id, ["wrap_offer_repeated"])
+            return self._wrap_line_plan(self._open_wrap_line(), ["wrap_offer_repeated"])
         if early and is_bare_yes(text) and self._unclear_offer != len(self._wrap_offers):
             # Review S3R-2 (naturalness): which option the yes meant is unknown, so the choice is
             # put again once per question; after that a bare yes waits like any fragment.

@@ -369,6 +369,23 @@ import r1_world
 #    After its review (still 31, unreleased): the learner's two cut-out lines (CUT_OUT_REPLIES),
 #    said when a reply to a turn that told her nothing was emptied only by its assumed answer
 #    (D5R-4).
+# Christy lane (feat/m032-christy, its revisions 33-34, after the eighth integration):
+# Lane 33: M032 live simulation, diagnosis 5 (Christy lane).  R1_AGENDA_W3 (D5-AGENDA1): the agenda
+#    as one sentence whose parts add up to the whole, after "Good, I can hear you."
+#    (L-OPEN-AGENDA-W3, -PLAIN-W3, -CONTINUE-W3; r1_script.AGENDA_W3_LINES).  R1_WRAP_OFFER_VARIANT
+#    (D5-ASIDE-WRAP2): L-ASIDE-WRAP-AGAIN for every offer to wrap up after the first.
+#    R1_REACTION_VARIETY_V2 (D5-ICE-AWITH1): the react clause without the quoted example the model
+#    copied, and the guard's "And with <their thing>," opener kept once (r1_guard._WITH_OPENER).
+#    R1_IB_SKIP_V2 (D5-SKIP1): the skip notes say one or two quick questions are left.
+#    R1_IB_QUIET_NUDGE (D5-NUDGE1): the nudge keeps the asking clause and says "I was asking,
+#    {question}" after a lead of her own. R1_TRANSITION_ANSWERS (D5-TRANS1): the answers note keeps
+#    "has just been given" for a request to hear the brief again and says how to answer "how do I
+#    approach it?".  Every other text of revision 32 is unchanged.
+# Lane 34: review of diagnosis 5 (Christy lane).  R1_AGENDA_W3 (D5-AGENDA1-R1): the W3 agenda's
+#    heard line is "Lovely, thanks." ("Good, I can hear you." was the echo D4-BRIEF2 removed).
+#    R1_IB_QUIET_NUDGE (D5-NUDGE1-R1): an elaboration that holds a wh-word is never cut, the end
+#    punctuation is kept, and an instruction keeps "So," (r1_icebreaker._NUDGE_WH_WORDS,
+#    _NUDGE_INSTRUCTIONS).  No other pinned text changed.
 # 35: M032 integration 9 (the learner lane's 31 and the Christy lane's 33-34 merged onto
 #    revision 33): every text of both lanes in one manifest.  No text changed in the merge;
 #    CONTENT_REVISION = max(33, 31, 34) + 1.
@@ -804,6 +821,8 @@ def manifest() -> dict[str, Any]:
             # Revision 31 (D4-BRIEF2, D4-TRANS-PRESENT1, D4-TRANS-Q1).
             "wording_lines": dict(r1_script.WORDING_LINES),
             "variety_lines": dict(r1_script.VARIETY_LINES),
+            # Revision 33 (D5-AGENDA1).
+            "agenda_w3_lines": dict(r1_script.AGENDA_W3_LINES),
             "transition_quiet_fallback": r1_script.TRANSITION_QUIET_FALLBACK,
             "learner_filler_variants": list(r1_script.LEARNER_FILLER_VARIANTS),
             "learner_filler_short": r1_script.LEARNER_FILLER_SHORT,
@@ -956,6 +975,8 @@ def manifest() -> dict[str, Any]:
                 "thin_reply_words": r1_guard.THIN_REPLY_WORDS,
                 "stretch_alternatives": list(r1_text.STRETCH_ALTERNATIVES),
                 "hollow_max_words": r1_text.HOLLOW_MAX_WORDS,
+                # Revision 33 (D5-ICE-AWITH1).
+                "with_opener": r1_guard._WITH_OPENER.pattern,
             },
             "reply_word_cap": r1_guard.REPLY_WORD_CAP,
             "ack_word_cap": r1_guard.ACK_WORD_CAP,
@@ -1149,6 +1170,13 @@ def manifest() -> dict[str, Any]:
                 "quiet_nudge_seconds": r1_icebreaker.IB_QUIET_NUDGE_SECONDS,
                 "quiet_nudge_min_budget_seconds": r1_icebreaker.IB_QUIET_NUDGE_MIN_BUDGET_SECONDS,
                 "hold_note": r1_icebreaker.HOLD_NOTE,
+                # Revision 33 (D5-NUDGE1).
+                "quiet_nudge_recall": r1_icebreaker.IB_QUIET_NUDGE_RECALL,
+                "quiet_nudge_elaboration": r1_icebreaker._NUDGE_ELABORATION_RE.pattern,
+                "quiet_nudge_recall_leads": sorted(r1_icebreaker._NUDGE_RECALL_LEADS),
+                # Revision 34 (review of diagnosis 5, D5-NUDGE1-R1).
+                "quiet_nudge_wh_words": sorted(r1_icebreaker._NUDGE_WH_WORDS),
+                "quiet_nudge_instructions": sorted(r1_icebreaker._NUDGE_INSTRUCTIONS),
             },
             # Revision 31 (D4-ICE-SKIP1, R1_IB_SKIP_V2; D4-ICE-ECHO1, R1_REACTION_VARIETY_V2).
             "skip_v2": {

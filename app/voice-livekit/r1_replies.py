@@ -380,6 +380,10 @@ class Reply:
     # Review D5R-6: which generation of this reply a speech belongs to (0 the first; the retry is
     # 1).  A speech of an earlier attempt (the hung reply's filler) never records the plan.
     attempt: int = 0
+    # M032 diagnosis 5 (D5-TRANS1, ``R1_TRANSITION_ANSWERS``): a scripted L-RP-* answer said after
+    # the model's reply when the guard cut that reply down to a bare confirmation ("That's right,
+    # yes.") and the candidate's turn asked a second question ("" for none).
+    confirm_extra: str = ""
 
 
 def llm_messages(

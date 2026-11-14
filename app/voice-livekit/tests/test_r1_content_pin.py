@@ -257,10 +257,18 @@ import r1_world
 # join the manifest (``r1_content._diag5_repairs``) beside the texts they replace while their flags
 # are on.  No graded meaning, marker, must-say or deadline changed.  After its review (still 31,
 # unreleased): the learner's two cut-out lines (``r1_guard.CUT_OUT_REPLIES``, review D5R-4).
+# Christy lane (feat/m032-christy), its own revisions 33-34 after the eighth integration:
+# Christy lane revision 33 (M032 live simulation, diagnosis 5): the W3 agenda (R1_AGENDA_W3),
+# L-ASIDE-WRAP-AGAIN (R1_WRAP_OFFER_VARIANT), the react clause without its example and the guard's
+# one "And with ..." opener (R1_REACTION_VARIETY_V2), the skip notes (R1_IB_SKIP_V2), the nudge's
+# "I was asking" form (R1_IB_QUIET_NUDGE) and the answers note's approach sentence
+# (R1_TRANSITION_ANSWERS).
+# Christy lane revision 34 (review of diagnosis 5): the W3 agenda's heard line "Lovely, thanks."
+# (R1_AGENDA_W3) and the nudge's wh-word and instruction sets (R1_IB_QUIET_NUDGE).
 # Revision 35 (ninth merge of the M032 lanes): the learner lane's 31 and the Christy lane's
 # 33-34 on top of revision 33; no text changed in the merge.  CONTENT_REVISION =
 # max(33, 31, 34) + 1.
-PINNED_CONTENT_SHA256 = "d6383db33c2797533a3d78f25d6d2f2a54cc3059e95fcc744978993666c9c7c0"
+PINNED_CONTENT_SHA256 = "d6069be2c1ef130b23934a4c7c1a8bee85560916b9ea80a7528f6605f458d31b"
 
 CONTENT_MODULES = (
     "r1_text",

@@ -919,8 +919,11 @@ class TestDiagnosis4Icebreaker(unittest.TestCase):
         self.assertEqual(result.kind, ib.JOB_SKIP)
         self.assertNotEqual(result.objective.id, asked)
         self.assertIn("couple of minutes", result.note)
+        # D5-SKIP1: the deferral says only one or two quick questions are left first.
+        self.assertIn("one or two quick questions", result.note)
         self.assertIn(result.objective.goal, result.note)
         self.assertFalse(result.last)
+        self.assertIn("one or two quick questions", ib.FREE_SKIP_V2_NOTE)
 
     def test_the_sequences_never_ask_an_objective_twice_after_a_skip(self) -> None:
         for turns in (
@@ -1034,8 +1037,12 @@ class TestDiagnosis4Icebreaker(unittest.TestCase):
                 "What does a typical day look like in your sales work?",
                 "So, what does a typical day look like in your sales work?",
             ),
-            ("And what do you actually ask them?", "So, what do you actually ask them?"),
-            ("Right, how do you keep track of leads?", "So, how do you keep track of leads?"),
+            # D5-NUDGE1: a question that opened with her own lead comes back as "I was asking".
+            ("And what do you actually ask them?", "I was asking, what do you actually ask them?"),
+            (
+                "Right, how do you keep track of leads?",
+                "I was asking, how do you keep track of leads?",
+            ),
             ("I'm curious, why sales?", "So, why sales?"),
             # Review of diagnosis 4 (NUDGE-LINE-CASING): only a question word is lowered, a lead
             # before the asking clause (a name, her reaction) is left out, and a question of lead
@@ -1051,6 +1058,66 @@ class TestDiagnosis4Icebreaker(unittest.TestCase):
         ):
             with self.subTest(question=question):
                 self.assertEqual(ib.quiet_nudge_line(question), said)
+
+    def test_the_nudge_is_never_a_verbatim_repeat(self) -> None:
+        # D5-NUDGE1 (round 5 M10, synthetic): "So what does a typical day look like for you, say
+        # the calls ...?" came back after "Thanks." with only a comma changed.
+        for question, said in (
+            (
+                "So what does a typical day look like for you, say the calls and conversations "
+                "with customers?",
+                "I was asking, what does a typical day look like for you?",
+            ),
+            ("Priya, what draws you to this role?", "So, what draws you to this role?"),
+            (
+                "What made you pick sales, especially after studying engineering?",
+                "So, what made you pick sales?",
+            ),
+            ("How do you open a call - do you use a script?", "So, how do you open a call?"),
+            ("Was it inbound, or mostly outbound?", "So, was it inbound, or mostly outbound?"),
+            ("I was asking, what draws you to this role?", "So, what draws you to this role?"),
+        ):
+            with self.subTest(question=question):
+                line = ib.quiet_nudge_line(question)
+                self.assertEqual(line, said)
+                self.assertFalse(line.lower().startswith("so, so"))
+                if line:
+                    self.assertNotEqual(
+                        re.findall(r"[a-z']+", line.lower()),
+                        re.findall(r"[a-z']+", question.lower()),
+                    )
+
+    def test_the_cut_never_takes_the_asking_clause(self) -> None:
+        # Review of diagnosis 5 (D5-NUDGE1-R1): the elaboration cut ran before the asking clause
+        # was picked, so a question after ", say" or ", like" was lost; an instruction got a "?"
+        # and "I was asking, tell me ..." was said.
+        for question, said in (
+            (
+                "Thinking about your last job, say the toughest call, what did you do?",
+                "So, what did you do?",
+            ),
+            (
+                "When you say inbound, like what kind of leads?",
+                "So, when you say inbound, like what kind of leads?",
+            ),
+            (
+                "Tell me about a time you hit target, for example last quarter.",
+                "So, tell me about a time you hit target.",
+            ),
+            ("Well, tell me about your targets.", "So, tell me about your targets."),
+            ("And walk me through a normal day.", "So, walk me through a normal day."),
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(ib.quiet_nudge_line(question), said)
+
+    def test_only_a_verbatim_repeat_counts_as_a_repeat(self) -> None:
+        # Review of diagnosis 5 (D5-NUDGE1-R2): the session says the restate only for a nudge that
+        # would repeat her words, never for a question too short to nudge (revision 32: no nudge).
+        self.assertEqual(ib.quiet_nudge_line("So, tell me about your targets."), "")
+        self.assertTrue(ib.quiet_nudge_repeats("So, tell me about your targets."))
+        for question in ("And?", "Okay?", "", "What draws you to this role?"):
+            with self.subTest(question=question):
+                self.assertFalse(ib.quiet_nudge_repeats(question))
 
     def test_the_nudge_spends_the_question_s_one_re_ask(self) -> None:
         plan = ib.IcebreakerPlan()
