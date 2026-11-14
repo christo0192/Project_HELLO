@@ -250,7 +250,8 @@ import r1_world
 # and the plan note's pause line (R1_ICEBREAKER_REPAIR).
 # Revision 32 (seventh merge of the M032 lanes): the learner lane's 30 and the Christy lane's 31
 # on top of revision 31; no text changed in the merge.  CONTENT_REVISION = max(31, 30, 31) + 1.
-PINNED_CONTENT_SHA256 = "ec9d3e094f539106e5ea7cae24721688bc277a17008cf4d035546c3bfb7003cc"
+# Revision 33 (eighth merge): the Christy lane's 32 (the quiet-nudge window is 7 s).
+PINNED_CONTENT_SHA256 = "ddcabee69a5b31c623efbea53f86e5fced91446c2eee7c1747bfa110484e5ffe"
 
 CONTENT_MODULES = (
     "r1_text",

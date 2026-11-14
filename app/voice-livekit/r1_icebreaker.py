@@ -146,7 +146,7 @@ def ib_skip_v2_enabled() -> bool:
 # no reply (D3-IB-REASK1) and then 30 s of silence and "Are you still with me?" seconds after the
 # candidate had spoken.  With ``R1_IB_QUIET_NUDGE`` the silence after such a quiet ack is shorter
 # and she asks the same question once more, short, using the question's one re-ask.
-IB_QUIET_NUDGE_SECONDS = 10.0
+IB_QUIET_NUDGE_SECONDS = 7.0
 IB_QUIET_NUDGE_TEMPLATE = "So, {question}"
 # The nudge is only promised with at least this much of the hard icebreaker budget left.
 IB_QUIET_NUDGE_MIN_BUDGET_SECONDS = 20.0
