@@ -3023,20 +3023,76 @@ class TestEchoOpenerVariety(unittest.TestCase):
         "Got it, a shared sheet for leads. How often did you follow up with each one?",
         "Okay, mostly evening calls. What does a good call look like for you?",
     )
+    # The candidate turn each reply answers: the echo plays their own words back.
+    TOLD = (
+        "I spent two years on the phones at a call centre.",
+        "I did eight years in program sales after that.",
+        "Honestly I want growth and a fresh team.",
+        "Before that it was insurance sales to families.",
+        "We kept a shared sheet for leads.",
+        "Mostly evening calls, after people got home.",
+    )
 
     def run_six(self, **flags) -> list[str]:
         said: list[str] = []
-        for reply in self.REPLIES:
+        for reply, told in zip(self.REPLIES, self.TOLD):
             openers = tuple(text.split(". ")[0] + "." for text in said[-2:])
             context = ctx(
                 "icebreaker",
                 reaction_check=True,
                 previous_opening=openers[-1] if openers else "",
                 previous_openings=openers,
+                candidate_text=told,
                 **flags,
             )
             said.append(guard_text(reply, context).text)
         return said
+
+    def test_an_answer_to_their_question_is_never_cut(self) -> None:
+        # Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): an ack-led statement after a turn that
+        # asked something is her answer or her deferral, not their words back.
+        asked = "Can I ask what the shift timings are?"
+        for reply in (
+            "Sure, the hiring team will share those details later. So what draws you to this role?",
+            "Right, the hiring team can walk you through the timings. What draws you to it?",
+            "Got it, we can come back to that at the end. What does a typical day look like?",
+        ):
+            with self.subTest(reply=reply):
+                context = ctx(
+                    "icebreaker",
+                    reaction_check=True,
+                    reaction_check_v2=True,
+                    previous_openings=("Right, two years on the phones.", "What draws you here?"),
+                    candidate_text=asked,
+                )
+                self.assertEqual(guard_text(reply, context).text, reply)
+
+    def test_an_ack_that_echoes_nothing_they_said_is_kept(self) -> None:
+        context = ctx(
+            "icebreaker",
+            reaction_check=True,
+            reaction_check_v2=True,
+            previous_openings=("Right, two years on the phones.",),
+            candidate_text="I'd rather not talk about my last job.",
+        )
+        reply = "Sure, we can leave that one. What draws you to this role?"
+        self.assertEqual(guard_text(reply, context).text, reply)
+
+    def test_an_echo_of_their_words_after_a_recent_echo_is_cut(self) -> None:
+        context = ctx(
+            "icebreaker",
+            reaction_check=True,
+            reaction_check_v2=True,
+            previous_openings=("Right, two years on the phones.",),
+            candidate_text="We kept a shared sheet for leads.",
+        )
+        self.assertEqual(
+            guard_text(
+                "Got it, a shared sheet for leads. How often did you follow up with each one?",
+                context,
+            ).text,
+            "How often did you follow up with each one?",
+        )
 
     def test_at_most_two_echo_openers_in_six_replies_and_never_two_in_a_row(self) -> None:
         said = self.run_six(reaction_check_v2=True)
@@ -3153,3 +3209,21 @@ class TestTransitionQuietDrop(unittest.TestCase):
         )
         self.assertTrue(r1_guard.offer_phrase_in("I'm happy to go over it again."))
         self.assertFalse(r1_guard.offer_phrase_in("Happy to help with the hours you prefer."))
+
+    def test_the_cut_offer_leaves_no_fragment(self) -> None:
+        # Review of diagnosis 4 (OFFER-TRIM-FRAGMENT): "I'd be." and "We're." were spoken.
+        for text, kept in (
+            ("I'd be happy to go over it again.", ""),
+            ("We're happy to go over the hours anytime.", ""),
+            ("I'll be happy to go over the brief again.", ""),
+            ("I would be more than happy to go over the hours.", ""),
+            ("It's mostly calls, and I'd be happy to go over the hours.", "It's mostly calls."),
+            ("Sure, we'd be happy to go into the hours later.", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_guard.without_offer_phrase(text), kept)
+        used = ctx("transition", offer_phrase_used=True)
+        self.assertEqual(
+            guard_text("It's mostly calls. I'd be happy to go over it again.", used).text,
+            "It's mostly calls.",
+        )

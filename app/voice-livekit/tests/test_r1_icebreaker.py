@@ -984,9 +984,49 @@ class TestDiagnosis4Icebreaker(unittest.TestCase):
     def test_the_plan_note_never_refuses_a_pause(self) -> None:
         plan = ib.IcebreakerPlan()
         self.assertIn(ib.HOLD_NOTE, self.next_job(plan, self.ANSWER).note)
-        with mock.patch.dict(os.environ, {"R1_ICEBREAKER_REPAIR": "0"}):
-            plan = ib.IcebreakerPlan()
-            self.assertNotIn(ib.HOLD_NOTE, self.next_job(plan, self.ANSWER).note)
+        for flag in ("R1_ICEBREAKER_REPAIR", "R1_IB_HOLD_V2"):
+            with self.subTest(flag=flag), mock.patch.dict(os.environ, {flag: "0"}):
+                plan = ib.IcebreakerPlan()
+                self.assertNotIn(ib.HOLD_NOTE, self.next_job(plan, self.ANSWER).note)
+
+    def test_the_hold_v2_flag_restores_revision_30_s_reader(self) -> None:
+        # Review of diagnosis 4 (NO-ISOLATED-ROLLBACK): R1_IB_HOLD_V2=0 rolls back D4-ICE-HOLD1
+        # alone; the rest of the icebreaker repair stays on.
+        with mock.patch.dict(os.environ, {"R1_IB_HOLD_V2": "0"}):
+            self.assertTrue(ib.icebreaker_repair_enabled())
+            self.assertFalse(ib.ib_hold_v2_enabled())
+            for text in (
+                "Never mentioned it to anyone, never. Hey, could you just hold this for a minute?",
+                "Could you hold this for a minute?",
+                "Can we hold on for a minute?",
+                "Hey, wait a minute.",
+            ):
+                with self.subTest(text=text):
+                    self.assertFalse(ib.is_hold_request(text))
+            for text in ("Can you give me a minute?", "Wait a minute, please.", "Hold on."):
+                with self.subTest(text=text):
+                    self.assertTrue(ib.is_hold_request(text))
+            self.assertEqual(ib.hold_request_answer("I sold loans. Could I have a moment?"), "")
+
+    def test_a_hold_after_an_answer_keeps_the_answer(self) -> None:
+        # Review of diagnosis 4 (HOLD-TAIL-DROPS-ANSWER).
+        told = (
+            "I sold home loans at a bank for three years, mostly walk-ins. Could I have a moment?"
+        )
+        self.assertTrue(ib.is_hold_request(told))
+        self.assertEqual(
+            ib.hold_request_answer(told),
+            "I sold home loans at a bank for three years, mostly walk-ins.",
+        )
+        for text in (
+            "Could you give me a minute?",
+            "Wait. Could you give me a minute?",
+            "Sorry, can you give me a moment to think?",
+            "I sold home loans at a bank.",
+            "Hold on, what was the question?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(ib.hold_request_answer(text), "")
 
     def test_the_quiet_nudge_line(self) -> None:
         for question, said in (
@@ -996,14 +1036,28 @@ class TestDiagnosis4Icebreaker(unittest.TestCase):
             ),
             ("And what do you actually ask them?", "So, what do you actually ask them?"),
             ("Right, how do you keep track of leads?", "So, how do you keep track of leads?"),
-            ("I'm curious, why sales?", "So, I'm curious, why sales?"),
+            ("I'm curious, why sales?", "So, why sales?"),
+            # Review of diagnosis 4 (NUDGE-LINE-CASING): only a question word is lowered, a lead
+            # before the asking clause (a name, her reaction) is left out, and a question of lead
+            # words alone gives no nudge.
+            ("Priya, what draws you to this role?", "So, what draws you to this role?"),
+            ("HDFC sounds busy, what did you sell?", "So, what did you sell?"),
+            ("Tell me about a hard call.", "So, tell me about a hard call."),
+            ("HDFC or ICICI, which bank was it?", "So, which bank was it?"),
+            ("IT sales for five years?", "So, IT sales for five years?"),
+            ("Okay?", ""),
+            ("Right, so?", ""),
+            ("", ""),
         ):
             with self.subTest(question=question):
                 self.assertEqual(ib.quiet_nudge_line(question), said)
 
     def test_the_nudge_spends_the_question_s_one_re_ask(self) -> None:
         plan = ib.IcebreakerPlan()
+        self.assertTrue(plan.can_hold())  # review of diagnosis 4: a peek spends nothing
+        self.assertTrue(plan.can_hold())
         self.assertTrue(plan.use_hold())
+        self.assertFalse(plan.can_hold())
         self.assertFalse(plan.use_hold())  # REASK_V2_MAX_HOLDS
         self.assertEqual(self.next_job(plan, "What do you mean?").kind, ib.JOB_ASK)  # moved on
 
@@ -1028,6 +1082,7 @@ class TestDiagnosis4Icebreaker(unittest.TestCase):
             ("R1_IB_SKIP_V2", ib.ib_skip_v2_enabled),
             ("R1_IB_QUIET_NUDGE", ib.ib_quiet_nudge_enabled),
             ("R1_SIL_IB_RESTATE", ib.sil_ib_restate_enabled),
+            ("R1_IB_HOLD_V2", ib.ib_hold_v2_enabled),
         ):
             with self.subTest(flag=flag):
                 self.assertTrue(reader())

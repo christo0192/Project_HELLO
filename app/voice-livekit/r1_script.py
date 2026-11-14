@@ -64,8 +64,9 @@ BRIEF_AGAIN = "Of course, here it is again. "
 # questions first?").  The facts are the same (the lead, her city, the Data Science course, up to
 # twenty minutes, the goal, the preparation guide, the cue phrase, "ready"); the order and the shape
 # are a person's.  Consent is unchanged: only a spoken "ready" or the button starts the role-play,
-# and a bare "yes" or "no questions" to "Any questions before we start?" gets the nudge (the prompt
-# keeps the brief's either/or kind in ``r1_session._START_QUESTION_OF_LINE``).
+# and a bare "yes" or "no questions" to "Any questions before we start?" never starts (the prompt
+# keeps the brief's either/or kind in ``r1_session._START_QUESTION_OF_LINE``): "no questions" gets
+# the nudge, and a bare "yes" (a question is coming) the invite (review of diagnosis 4).
 BRIEF_START_PROMPT_2 = "Any questions before we start? If not, just say 'ready' and she'll pick up."
 BRIEF_SCENARIO_2 = (
     "I'll play {lead_name} from {lead_city}. She filled in a form on our website about the Data "
@@ -432,6 +433,19 @@ def brief_variety_enabled() -> bool:
     )
 
 
+def transition_presence_v2_enabled() -> bool:
+    """``R1_TRANSITION_PRESENCE_V2`` (default on, only with ``R1_BRIEF_VARIETY``; M032 diagnosis 4,
+    D4-TRANS-PRESENT1, given its own flag by the review of diagnosis 4, NO-ISOLATED-ROLLBACK): a
+    presence check just after a start question gets ONE utterance (L-PRESENT-TAKE-TIME), and the
+    pickup bridge says the press was heard (L-PICKUP-BRIDGE-2).  Read at use.  Rollback: ``fly
+    secrets set R1_TRANSITION_PRESENCE_V2=0 -a project-hello-voice`` (revision 30's "Yes, I'm
+    here." with L-TRANSITION-TAKE-TIME, and L-PICKUP-BRIDGE; the rest of the variety stays on).
+    """
+    return brief_variety_enabled() and (
+        (os.getenv("R1_TRANSITION_PRESENCE_V2") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
 # D4-BRIEF2 (``R1_BRIEF_WORDING_V2``): the ids whose reworded text is spoken while the flag is on.
 # The agendas follow the flag alone; the briefs need ``R1_TRANSITION_REPAIR`` too (their body is the
 # repaired one).  Markers, the warm-up, the cache and the transcript keep the left-hand ids.
@@ -447,7 +461,7 @@ WORDING_LINES = {
     "L-TRANSITION-AGAIN": "L-TRANSITION-AGAIN-W2",
 }
 _OPENING_WORDING = frozenset({"L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE"})
-# D4-TRANS-PRESENT1 (``R1_BRIEF_VARIETY``): the pickup bridge that says the press was heard.
+# D4-TRANS-PRESENT1 (``R1_TRANSITION_PRESENCE_V2``): the pickup bridge that hears the press.
 VARIETY_LINES = {"L-PICKUP-BRIDGE": "L-PICKUP-BRIDGE-2"}
 
 
@@ -477,13 +491,13 @@ def transition_answers_enabled() -> bool:
 def active_line_id(line_id: str) -> str:
     """The id whose text is spoken for ``line_id`` now (``ROLLBACK_LINES`` while S6 is off, the
     reworded agenda and brief while ``R1_BRIEF_WORDING_V2`` is on, and the varied pickup bridge
-    while ``R1_BRIEF_VARIETY`` is)."""
+    while ``R1_TRANSITION_PRESENCE_V2`` is)."""
     if line_id in ROLLBACK_LINES and not transition_repair_enabled():
         return ROLLBACK_LINES[line_id]
     if line_id in WORDING_LINES and brief_wording_v2_enabled():
         if line_id in _OPENING_WORDING or transition_repair_enabled():
             return WORDING_LINES[line_id]
-    if line_id in VARIETY_LINES and brief_variety_enabled():
+    if line_id in VARIETY_LINES and transition_presence_v2_enabled():
         return VARIETY_LINES[line_id]
     return line_id
 

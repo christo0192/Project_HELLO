@@ -11007,6 +11007,11 @@ class TestTransitionConsent(R1TestCase):
 
     async def test_a_bare_yes_to_the_either_or_question_gets_the_nudge(self) -> None:
         # Review: "Shall we start now, or do you have any questions first?" - "Yes." says neither.
+        # (The reworded brief asks "Any questions before we start?": there "Yes." is invited,
+        # review of diagnosis 4; this pins the either/or brief, R1_BRIEF_WORDING_V2=0.)
+        patcher = mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.interview._enter(R1Phase.TRANSITION)
         await self.interview.say("L-TRANSITION")
         task = asyncio.create_task(self.interview._run_transition())

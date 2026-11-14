@@ -239,6 +239,7 @@ from r1_icebreaker import (
     ib_reask_v2_enabled,
     icebreaker_plan_enabled,
     icebreaker_repair_enabled,
+    hold_request_answer,
     is_closed_question,
     is_hold_request,
     is_thinking,
@@ -295,14 +296,17 @@ from r1_prompts import (
 from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
 from r1_script import (
     INTERVIEWER_NAME,
+    WORDING_LINES,
     active_line_id,
     brief_variety_enabled,
+    brief_wording_v2_enabled,
     is_candidate_free,
     known_first_name,
     line,
     spoken_first_name,
     TRANSITION_QUIET_FALLBACK,
     transition_answers_enabled,
+    transition_presence_v2_enabled,
     transition_repair_enabled,
 )
 from r1_sarvam import current_speech_id
@@ -910,9 +914,14 @@ _START_QUESTION_OF_LINE = {
     "L-TRANSITION-TAKE-TIME": _SAY_READY,
     "L-PRESENT-TAKE-TIME": _SAY_READY,  # D4-TRANS-PRESENT1: the same, after "Yes, I'm here."
     # D4-BRIEF2 (R1_BRIEF_WORDING_V2): the reworded briefs speak under the ids above, and their
-    # "Any questions before we start? If not, just say 'ready'" keeps the either/or kind on
-    # purpose: a bare "yes" (a question to come) or "no questions" gets the nudge, never a start.
+    # "Any questions before we start? If not, just say 'ready'" keeps the either/or kind: never a
+    # start on a bare "yes".  Review of diagnosis 4 (BRIEF2-BARE-YES-NUDGE): there "yes" means a
+    # question is coming, so it gets the invite (``_ANY_QUESTIONS_BRIEFS``); "no" gets the nudge.
 }
+# The briefs whose reworded text (``R1_BRIEF_WORDING_V2``) ends "Any questions before we start?".
+_ANY_QUESTIONS_BRIEFS = frozenset(
+    line_id for line_id in WORDING_LINES if line_id.startswith("L-TRANSITION")
+)
 
 # Results of ``R1Interview._await_turn``.
 TURN = "turn"
@@ -2393,9 +2402,12 @@ _RP_FIELDS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "L-RP-LENGTH",
         re.compile(
+            # Review of diagnosis 4 (RP-FIELDS-OVERMATCH): a bare "it" only ends the question
+            # ("How long will it take?"); "how long does it take to hear back" is the job's.
             r"\b(?:how long (?:will|does|is|would|should|can) (?:the |this |our )?(?:role ?play|"
-            r"roleplay|call|it|conversation)|how long do i (?:have|get)|how (?:much time|many "
-            r"minutes) (?:do i|will i|is|does) (?:have|get|the role ?play|it))\b"
+            r"roleplay|call|conversation|it(?: (?:take|last|run|go|be))?$)|how long do i (?:have|"
+            r"get)|how (?:much time|many minutes) (?:do i|will i|is|does) (?:have|get|the role ?"
+            r"play|it(?: (?:take|last))?$))\b"
         ),
     ),
     (
@@ -2403,7 +2415,8 @@ _RP_FIELDS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:how much (?:does|is|will|would) (?:the |this |our )?(?:course|program|"
             r"programme|it) cost|(?:what(?:'s| is| are)|tell me) (?:the )?(?:course )?(?:price|"
-            r"prices|pricing|fees?|cost)|(?:course|program|programme) (?:fees?|price|prices|"
+            r"prices|pricing|fees?|cost)(?! (?:of|for) (?!(?:the |this |our )?(?:course|program|"
+            r"programme)\b))|(?:course|program|programme) (?:fees?|price|prices|"
             r"pricing|cost|details|duration|syllabus|curriculum)|(?:any|what) discounts?|"
             r"(?:emi|instalment|installment) options?)\b"
         ),
@@ -2435,6 +2448,19 @@ _RP_FIELDS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
 )
+# Review of diagnosis 4 (RP-FIELDS-OVERMATCH): a question that names the job, the hiring or what
+# comes after the interview is never a role-play field ("How long does it take to hear back after
+# this interview?", "What's the target for this role?", "Will there be any discounts for
+# employees?", "Which program will I be working on if I'm hired?"): it goes to the model, whose
+# note defers hiring and timelines to the hiring team.  "My role" and "the role-play" are not
+# vetoed.
+_RP_JOB_RE = re.compile(
+    r"\b(?:(?:this|the|that) (?:job|position|post|opening|vacancy|company)|in (?:this|the) job|"
+    r"(?:this|the|that) role\b(?! ?play)|hired|hiring|joining|onboarding|offer letter|hear back|"
+    r"results?|next (?:steps?|round)|interview|salary|salaries|ctc|stipend|incentives?|"
+    r"relocat\w*|employees?|staff|shifts?|working hours|training|probation|my pay|the pay|paid|"
+    r"if i(?:'m| am| get) (?:selected|picked|chosen)|once i (?:join|start))\b"
+)
 # A turn that asks for the brief itself ("again", "repeat", "the whole thing") gets the replay.
 _RP_REPEAT_RE = re.compile(
     r"\b(?:again|repeat|once more|one more time|the whole thing|from the start|brief|"
@@ -2446,11 +2472,11 @@ _RP_FIELDS_KEPT = 2
 def roleplay_fields(text: str) -> tuple[str, ...]:
     """D4-TRANS-Q1: the L-RP-* lines that answer ``text``'s questions about the role-play, in the
     order asked (at most ``_RP_FIELDS_KEPT``), or () for a turn that asks none, asks for the brief
-    itself, or is no question."""
+    itself, names the job or the hiring (``_RP_JOB_RE``), or is no question."""
     folded = fold_speech(text)
     if not folded or _RP_REPEAT_RE.search(folded) is not None:
         return ()
-    if not turn_asks(text):
+    if not turn_asks(text) or _RP_JOB_RE.search(folded) is not None:
         return ()
     found: list[tuple[int, str]] = []
     for line_id, pattern in _RP_FIELDS:
@@ -3246,6 +3272,10 @@ class R1Interview:
         # her answers end with the either/or L-TRANSITION-ASK), and whether the driver took a
         # spoken consent (so the turn hook agrees with it when that turn commits).
         self._start_question: str | None = None
+        # Review of diagnosis 4 (BRIEF2-BARE-YES-NUDGE): the line that asked it ("answer" for an
+        # answer's start question), so a bare "yes" to the reworded brief's "Any questions before
+        # we start?" is told from one to an answer's "Anything else, or shall we start?".
+        self._start_question_line: str | None = None
         self._transition_consented = False
         # M032 live simulation, diagnosis 1 (R1_TRANSITION_REPAIR): BR-2, how many icebreaker
         # questions were repeated in the transition and whether the answer to the last is still
@@ -4442,6 +4472,7 @@ class R1Interview:
         if line_id in _START_QUESTION_OF_LINE:
             # Set once the line has played: a short yes said over it answers nothing yet.
             self._start_question = _START_QUESTION_OF_LINE[line_id]
+            self._start_question_line = line_id
             self._start_prompt_owed = False  # christy-ready: a start question has been heard
             self._start_prompt_heard_at = self._clock()  # D3-BRIEF1
         if self.machine.phase is R1Phase.TRANSITION:
@@ -4561,8 +4592,10 @@ class R1Interview:
         # D3-BRIEF1: the varied replay, recap and take-time line only while R1_BRIEF_VARIETY is on,
         # and then not the verbatim replay they replace.
         dropped |= {"L-TRANSITION-AGAIN"} if brief_variety_enabled() else _BRIEF_VARIETY_LINES
-        if brief_variety_enabled():
+        if transition_presence_v2_enabled():
             dropped.add("L-TRANSITION-TAKE-TIME")  # D4-TRANS-PRESENT1: one line in its place
+        else:
+            dropped.add("L-PRESENT-TAKE-TIME")  # review of diagnosis 4: revision 30's two lines
         if not sil_ib_restate_enabled():
             dropped |= _SIL_IB_RESTATE_LINES
         if dropped:
@@ -5192,6 +5225,8 @@ class R1Interview:
             and self._start_question == _EITHER_OR
             and self._agent_state in _QUIET_AGENT_STATES
         ):
+            if self._any_questions_asked():
+                return _TRANSITION_INVITE  # "Any questions?" "Yes.": a question is coming
             return _TRANSITION_NUDGE  # "Yes." to "now, or questions first?" says neither
         if (
             text
@@ -5213,6 +5248,19 @@ class R1Interview:
         if is_permission_to_ask(text):
             return _TRANSITION_INVITE
         return _TRANSITION_ANSWER
+
+    def _any_questions_asked(self) -> bool:
+        """Review of diagnosis 4 (BRIEF2-BARE-YES-NUDGE): the open start question is the reworded
+        brief's "Any questions before we start?" (``R1_BRIEF_WORDING_V2``), with the answer limit
+        not reached: a bare "yes" to it asks to ask, and is invited.  After an answer's either/or
+        start question (or with the flag off) it is the nudge, as before."""
+        return (
+            self._start_question == _EITHER_OR
+            and self._start_question_line in _ANY_QUESTIONS_BRIEFS
+            and brief_wording_v2_enabled()
+            and transition_repair_enabled()
+            and self._transition_answers < TRANSITION_QUESTION_LIMIT
+        )
 
     def _repaired_transition_action(self, text: str) -> str:
         """M032 S6 (``R1_TRANSITION_REPAIR``): ``_transition_action`` once no consent, bridge or
@@ -5271,6 +5319,8 @@ class R1Interview:
             and self._start_question == _EITHER_OR
             and self._agent_state in _QUIET_AGENT_STATES
         ):
+            if self._any_questions_asked():
+                return _TRANSITION_INVITE  # "Any questions?" "Yes.": a question is coming
             return _TRANSITION_NUDGE  # "Yes." to "now, or questions first?" says neither
         if (
             text
@@ -5437,7 +5487,11 @@ class R1Interview:
         if icebreaker_plan_enabled() and is_thinking(text):
             return  # M032 S5: "Let me think about that." answers nothing yet
         if icebreaker_repair_enabled() and is_hold_request(text):
-            return  # M032 S6: "Can you give me a minute?" answers nothing either
+            # M032 S6: "Can you give me a minute?" answers nothing either.  Review of diagnosis 4
+            # (HOLD-TAIL-DROPS-ANSWER): what the turn said before its closing request is counted.
+            text = hold_request_answer(text)
+            if not text:
+                return
         if content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS:
             self.machine.candidate_turns += 1
 
@@ -5770,6 +5824,7 @@ class R1Interview:
                         transition_repair_enabled() and not self._last_answer_tailless
                     )
                     self._start_question = _EITHER_OR
+                    self._start_question_line = "answer"
             elif action == _TRANSITION_INVITE:
                 self._start_question = None  # "of course, go ahead": no start question
             elif action == _TRANSITION_IB_REPEAT:
@@ -5809,6 +5864,7 @@ class R1Interview:
         else:
             parts.append(self.render_line(self._answer_tail_id()))
             self._start_question = _EITHER_OR
+            self._start_question_line = "answer"
             self._last_answer_tailless = False
             self._start_asked_after_answer = True
             self._start_prompt_owed = False
@@ -5893,6 +5949,13 @@ class R1Interview:
         if hold_route == _IB_HOLD:
             self._ib_holds += 1
             self._ib_hold_window = True
+            answer = hold_request_answer(reply.candidate_text)
+            if answer:
+                # Review of diagnosis 4 (HOLD-TAIL-DROPS-ANSWER): the answer before "Could I have
+                # a moment?" is read with the turn after the hold (the plan's carry), so the
+                # question it answered is never asked again.
+                carried = self._icebreaker_carry
+                self._icebreaker_carry = f"{carried} {answer}" if carried else answer
             reply.scripted = self.render_line("L-IB-HOLD")
             reply.repair = "hold"
             self._ib_quiet_after = "hold"
@@ -5926,7 +5989,10 @@ class R1Interview:
         ("Thank you.") arms the short window (``IB_QUIET_NUDGE_SECONDS``): on that silence she asks
         it once more.  Not after the hold or the repeat line, never twice for one question, never
         with the soft exit due or too little of the hard budget left.  The driver is woken, so a
-        window already running is shortened (``_await_turn``'s ``until``)."""
+        window already running is shortened (``_await_turn``'s ``until``).  Review of diagnosis 4
+        (QUIET-NUDGE-SHORT-LADDER): never once the question's one re-ask is spent
+        (``IcebreakerPlan.can_hold``) or the question gives no nudge line, so a nudge that cannot
+        be said never shortens the window."""
         question = self._ib_last_question
         if (
             not ib_quiet_nudge_enabled()
@@ -5935,6 +6001,8 @@ class R1Interview:
             or not self._ib_question_open
             or not question
             or self._ib_nudged == question
+            or not quiet_nudge_line(question)
+            or not self._icebreaker_plan.can_hold()
             or self.machine.icebreaker_should_end()
             or self.machine.remaining_icebreaker_seconds()
             < IB_QUIET_NUDGE_SECONDS + IB_QUIET_NUDGE_MIN_BUDGET_SECONDS
@@ -6179,8 +6247,10 @@ class R1Interview:
         kind = None
         if is_presence_check(text):
             kind = "presence"
-        elif is_repair_turn(_ib_repair_view(text)) or is_hold_request(text):
-            kind = "repair"
+        elif is_repair_turn(_ib_repair_view(text)) or (
+            is_hold_request(text) and not hold_request_answer(text)
+        ):
+            kind = "repair"  # review of diagnosis 4: an answer before the hold earns the thanks
         self._icebreaker_boundary_kind = kind
         carried = self._icebreaker_carry_entry
         if kind is not None and self._icebreaker_carry and carried is not None:
@@ -6351,6 +6421,8 @@ class R1Interview:
             said = self._transition_said
             if "L-TRANSITION-TAKE-TIME" in said or "L-PRESENT-TAKE-TIME" in said:
                 return ("L-PRESENT",)
+            if not transition_presence_v2_enabled():
+                return ("L-PRESENT", "L-TRANSITION-TAKE-TIME")  # R1_TRANSITION_PRESENCE_V2=0
             # D4-TRANS-PRESENT1: one utterance, not "Yes, I'm here." and a second line 1 s later.
             return ("L-PRESENT-TAKE-TIME",)
         # After "Yes, I'm here." never "I'm still here whenever you're ready." (REASK-2).
@@ -6946,6 +7018,9 @@ class R1Interview:
                 # D4-ICE-ECHO1: the wider verdicts, and her last two openers for the echo check.
                 changes["reaction_check_v2"] = True
                 changes["previous_openings"] = self._previous_interviewer_openings(2)
+                # Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): the echo cut needs the turn it
+                # answers (never her answer to their question, only their words back).
+                changes["candidate_text"] = reply.candidate_text or ""
         if guard_story_echo_enabled() and reply.phase in ("opening", "icebreaker"):
             # D3-GUARD-IB1: the turn this reply answers, for the story echo and the deflection.
             # Review of diagnosis 3 (D3-GUARD-IB1-LEAK): the small talk only; in the transition and
@@ -9268,8 +9343,21 @@ class R1Interview:
             if kind == STOP:
                 return value
             if kind == SILENCE:
-                if nudge and self._ib_nudge_question is not None:
-                    if await self._say_ib_quiet_nudge():
+                if nudge:
+                    if self._ib_nudge_question is not None and await self._say_ib_quiet_nudge():
+                        continue
+                    # Review of diagnosis 4 (QUIET-NUDGE-SHORT-LADDER): a nudge refused after the
+                    # short window (the re-ask spent meanwhile, the budget gone) leaves the rest
+                    # of the usual window before any silence prompt, never the ladder at 10 s.
+                    kind, value = await self._await_turn(
+                        max(0.0, ICEBREAKER_PROMPT_SECONDS - IB_QUIET_NUDGE_SECONDS),
+                        hard=self._icebreaker_budget_left,
+                    )
+                    if kind == DEADLINE:
+                        return None
+                    if kind == STOP:
+                        return value
+                    if kind != SILENCE:
                         continue
                 if self._ib_hold_window:
                     # M032 S6 (SWEEP-28): after "Can you give me a minute?" the window is longer
@@ -9378,6 +9466,7 @@ class R1Interview:
             self._brief_playing = None
         # Set once the brief has played, as ``say`` does: a short yes over it answers nothing.
         self._start_question = _START_QUESTION_OF_LINE[self._brief_line]
+        self._start_question_line = self._brief_line
         self._start_prompt_heard_at = self._clock()  # D3-BRIEF1
         self._last_transition_line = self._brief_line
         self._transition_said.append(self._brief_line)
@@ -9499,12 +9588,14 @@ class R1Interview:
         if icebreaker_repair_enabled():
             # M032 S6 (SWEEP-28): a repair or hold turn among them ("Hello? Are you there?" after
             # an answer whose reply was lost) says nothing to react to: the answer is judged alone.
+            # Review of diagnosis 4 (HOLD-TAIL-DROPS-ANSWER): an answer before a closing hold
+            # request is judged without the request.
             judged = [
-                part
+                hold_request_answer(part) if is_hold_request(part) else part
                 for part in judged
-                if not (is_repair_turn(_ib_repair_view(part)) or is_hold_request(part))
+                if not is_repair_turn(_ib_repair_view(part))
             ]
-        text = " ".join(judged).strip()
+        text = " ".join(part for part in judged if part).strip()
         if not bridge_wanted(text, content_words=content_word_count(text)):
             return None
         runner = self._bridge_runner_or_none()

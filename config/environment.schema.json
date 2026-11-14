@@ -250,6 +250,8 @@
         "R1_IB_SKIP_V2": { "requiredInProduction": false, "secret": false },
         "R1_IB_QUIET_NUDGE": { "requiredInProduction": false, "secret": false },
         "R1_SIL_IB_RESTATE": { "requiredInProduction": false, "secret": false },
+        "R1_IB_HOLD_V2": { "requiredInProduction": false, "secret": false },
+        "R1_TRANSITION_PRESENCE_V2": { "requiredInProduction": false, "secret": false },
         "R1_ICEBREAKER_REPAIR": { "requiredInProduction": false, "secret": false },
         "R1_NO_AUDIO_LADDER": { "requiredInProduction": false, "secret": false },
         "R1_OPENING_SOUND_CHECK": { "requiredInProduction": false, "secret": false },

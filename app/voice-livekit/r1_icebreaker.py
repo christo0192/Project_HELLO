@@ -154,7 +154,21 @@ _NUDGE_LEAD_RE = re.compile(
     r"^(?:(?:and|so|now|okay|ok|right|also|but|well|alright|got it|sure|then)\b[\s,]*)+",
     re.IGNORECASE,
 )
-_KEEP_CAPITAL_RE = re.compile(r"^(?:I\b|I'|Christy\b|Interview Kickstart\b)")
+# Review of diagnosis 4 (NUDGE-LINE-CASING): the words an asking clause opens with.  Only these are
+# lowered after "So," (a name or an acronym never is: "hDFC", "priya"), and a lead before the last
+# clause that opens with one (a name, her own reaction: "HDFC sounds busy, what did you sell?") is
+# left out of the nudge.
+_NUDGE_QUESTION_WORDS = frozenset(
+    {"what", "how", "which", "why", "where", "when", "who", "whose", "whom", "tell", "could", "can",
+     "would", "will", "should", "do", "did", "does", "is", "are", "was", "were", "have", "has",
+     "had", "walk", "talk", "share", "describe", "any", "anything"}
+)
+_NUDGE_MIN_WORDS = 2
+
+
+def _first_word(text: str) -> str:
+    words = re.findall(r"[a-z']+", text.lower())
+    return words[0] if words else ""
 
 
 def ib_quiet_nudge_enabled() -> bool:
@@ -168,11 +182,19 @@ def ib_quiet_nudge_enabled() -> bool:
 
 def quiet_nudge_line(question: str) -> str:
     """Her question once more, short: "So, what does a typical day look like?".  A lead-in word of
-    her own ("And", "Right,") is dropped and the first letter lowered (never "I" or a name)."""
+    her own ("And", "Right,") is dropped, and so is a lead before the asking clause ("Priya, what
+    ..." -> "So, what ...").  Only a question word is lowered (never a name or an acronym), and a
+    question with under two words left gives no nudge ("")."""
     rest = _NUDGE_LEAD_RE.sub("", str(question or "").strip()).strip()
-    if not rest:
+    clauses = rest.split(", ")
+    for index in range(len(clauses) - 1, 0, -1):
+        if _first_word(clauses[index]) in _NUDGE_QUESTION_WORDS:
+            rest = ", ".join(clauses[index:])
+            break
+    if len(re.findall(r"[A-Za-z0-9']+", rest)) < _NUDGE_MIN_WORDS:
         return ""
-    if _KEEP_CAPITAL_RE.match(rest) is None:
+    head = rest.split()[0]
+    if head[:1].isupper() and not head.isupper() and _first_word(head) in _NUDGE_QUESTION_WORDS:
         rest = rest[:1].lower() + rest[1:]
     return IB_QUIET_NUDGE_TEMPLATE.format(question=rest)
 
@@ -350,7 +372,7 @@ REACTION_V2_NOTES: dict[str, str] = {
         "never their words back."
     ),
 }
-# D4-ICE-HOLD1 (``R1_ICEBREAKER_REPAIR``): a request to wait was refused ("I'd rather keep us on
+# D4-ICE-HOLD1 (``R1_IB_HOLD_V2``): a request to wait was refused ("I'd rather keep us on
 # track"); a pause request is always granted.
 HOLD_NOTE = 'If they ask you to wait or pause, never refuse: say "Of course, take your time."'
 # Once every objective is reached (or the last one was declined) there is no objective to quote,
@@ -680,7 +702,7 @@ class IcebreakerJob:
             lines.append(SKIP_NOTE_V2 if skip_v2 else SKIP_NOTE)
         if self.asked and self.kind not in (JOB_REASK, JOB_SKIP):
             lines.append(ASKED_NOTE)
-        if icebreaker_repair_enabled():
+        if ib_hold_v2_enabled():
             lines.append(HOLD_NOTE)  # D4-ICE-HOLD1
         lines.append(PLAN_NOTE_TAIL_SKIP if self.skip or self.kind == JOB_SKIP else PLAN_NOTE_TAIL)
         return "\n".join(lines)
@@ -824,6 +846,13 @@ class IcebreakerPlan:
             last=skip_v2 and reading.skip and self.skips >= SKIP_V2_CAP_AFTER,
         )
 
+    def can_hold(self) -> bool:
+        """Review of diagnosis 4 (QUIET-NUDGE-SHORT-LADDER): the current question still has its
+        re-ask (``use_hold`` would spend it); a peek that spends nothing."""
+        current = self.current
+        key = _FREE_HOLDS if current is None else current.id
+        return self.holds.get(key, 0) < max_holds()
+
     def use_hold(self) -> bool:
         """D4-IB-QUIET-NUDGE: spend the current question's re-ask (``max_holds``) on a nudge after
         a quiet ack; False when it is used up (no nudge then)."""
@@ -893,6 +922,19 @@ def icebreaker_repair_enabled() -> bool:
     return (os.getenv("R1_ICEBREAKER_REPAIR") or "1").strip().lower() not in _OFF_VALUES
 
 
+def ib_hold_v2_enabled() -> bool:
+    """``R1_IB_HOLD_V2`` (default on, only with ``R1_ICEBREAKER_REPAIR``; M032 diagnosis 4,
+    D4-ICE-HOLD1, given its own flag by the review of diagnosis 4, NO-ISOLATED-ROLLBACK): the wider
+    hold reader ("could you just hold this for a minute?", "can we pause for a second?"), a turn
+    whose LAST sentence is a direct request for a moment, and the plan note's "never refuse a
+    pause" line (``HOLD_NOTE``).  Read at use.  Rollback: ``fly secrets set R1_IB_HOLD_V2=0 -a
+    project-hello-voice`` (revision 30's hold reader and plan notes exactly; the rest of the
+    icebreaker repair stays on)."""
+    return icebreaker_repair_enabled() and (
+        (os.getenv("R1_IB_HOLD_V2") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
 # After "Can you give me a minute?", the next silence window (once per session), never longer than
 # the icebreaker's hard budget; with less than ``HOLD_MIN_BUDGET_SECONDS`` of it left nothing is
 # promised and the turn ends the icebreaker.
@@ -944,6 +986,20 @@ _HOLD_RE = re.compile(
     r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy|ma'am|madam|sir|hey) )*"
     r"(?:(?:wait|hold(?: on)?)" + _HOLD_OBJECT + r"(?: for)? " + _HOLD_TIME + r"|hold on|pause)\b"
 )
+# Revision 30's reader exactly (``R1_IB_HOLD_V2=0``, review of diagnosis 4: NO-ISOLATED-ROLLBACK).
+_HOLD_RE_V1 = re.compile(
+    r"\b(?:"
+    + _HOLD_MODAL + r"?give (?:me|us) " + _HOLD_TIME
+    + r"|" + _HOLD_MODAL + r"(?:wait|hold(?: on)?)(?: for)? " + _HOLD_TIME
+    + r"|(?:can|could|may) (?:i|we) (?:please |just )?(?:have|take|get) a (?:quick |short )?"
+    r"(?:minute|moment|second|sec|break)"
+    r"|(?:can|could|would|will) (?:you|we) (?:please |just |quickly )?"
+    r"(?:pause|take a (?:quick |short )?break)"
+    r"|(?:please|let's|let us) (?:pause|take a (?:quick |short )?break)"
+    r")\b"
+    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy|ma'am|madam|sir) )*"
+    r"(?:(?:wait|hold(?: on)?)(?: for)? " + _HOLD_TIME + r"|hold on|pause)\b"
+)
 # The direct request shapes alone (a modal, "please", "let's"): the last sentence of a turn is read
 # as a hold only in one of these, so "I hold on for a second and let them vent." never is.
 _HOLD_DIRECT_RE = re.compile(
@@ -974,6 +1030,7 @@ _HOLD_REST_WORDS = _FILLER_WORDS | frozenset(
     {"thanks", "thank", "you", "for", "me", "us", "quick", "quickly", "kindly", "now", "maam",
      "mam", "real", "hey"}
 )
+_HOLD_REST_WORDS_V1 = _HOLD_REST_WORDS - {"hey"}
 
 
 def is_hold_request(text: object) -> bool:
@@ -982,20 +1039,53 @@ def is_hold_request(text: object) -> bool:
     Every word left once the hold phrase and its tail (``_HOLD_TAIL_RE``) are cut must be a
     filler or a courtesy (``_HOLD_REST_WORDS``): "Give me a moment to explain: I sold software
     ..." is an answer, and "Hold on, can you repeat the question?" a repeat request.  Checked
-    before ``disposition``, so a hold never takes S5's "Take your time." route.
+    before ``disposition``, so a hold never takes S5's "Take your time." route.  With
+    ``R1_IB_HOLD_V2`` (D4-ICE-HOLD1) a turn whose last sentence is a direct request for a moment
+    is one too; what it said before that is still an answer (``hold_request_answer``).
     """
     plain = _plain(text)
+    if not ib_hold_v2_enabled():
+        if not plain or _HOLD_RE_V1.search(plain) is None:
+            return False
+        rest = _HOLD_TAIL_RE.sub(" ", _HOLD_RE_V1.sub(" ", plain))
+        return all(word in _HOLD_REST_WORDS_V1 for word in rest.split())
     if not plain or _HOLD_RE.search(plain) is None:
         return False
     if _hold_only(plain):
         return True
     # D4-ICE-HOLD1: "Never mentioned it to anyone. Hey, could you just hold this for a minute?"
     # ends with a direct request for a moment; whatever came before it, the turn asks for one.
+    return _before_a_closing_hold(text) is not None
+
+
+def _before_a_closing_hold(text: object) -> str | None:
+    """The sentences before a LAST sentence that is a direct request for a moment, or None."""
     sentences = [sentence for sentence in split_sentences(text) if _plain(sentence)]
     if len(sentences) < 2:
-        return False
+        return None
     last = _plain(sentences[-1])
-    return _HOLD_DIRECT_RE.search(last) is not None and _hold_only(last)
+    if _HOLD_DIRECT_RE.search(last) is None or not _hold_only(last):
+        return None
+    return " ".join(sentence.strip() for sentence in sentences[:-1]).strip()
+
+
+def hold_request_answer(text: object) -> str:
+    """Review of diagnosis 4 (HOLD-TAIL-DROPS-ANSWER, ``R1_IB_HOLD_V2``): what a hold request said
+    before the direct request for a moment that ends it, or "" (a hold request alone, or a turn
+    that is no hold request).
+
+    "I sold home loans for three years. Could I have a moment?" asks for a moment AND answers: the
+    session counts the answer, carries it to the plan and lets the bridge react to it.
+    """
+    if not ib_hold_v2_enabled() or _hold_only(_plain(text)):
+        return ""
+    before = _before_a_closing_hold(text)
+    if not before or not is_hold_request(text):
+        return ""
+    words = _plain(before).split()
+    if all(word in _HOLD_REST_WORDS or word in ("wait", "sorry", "okay", "ok") for word in words):
+        return ""  # "Wait. Could you give me a minute?" said nothing else
+    return before
 
 
 def _hold_only(plain: str) -> bool:

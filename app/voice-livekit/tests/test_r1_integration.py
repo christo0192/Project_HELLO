@@ -5178,7 +5178,7 @@ class TestDiagnosis4Transition(unittest.IsolatedAsyncioTestCase):
         rig = await self.rig()
         brief = rig.interview.render_line(rig.interview._brief_line)
         self.assertTrue(brief.endswith("If not, just say 'ready' and she'll pick up."))
-        for text in ("No questions.", "No.", "Yes."):
+        for text in ("No questions.", "No."):
             with self.subTest(text=text):
                 rig = await self.rig()
                 self.assertIsNone(await rig.converse(text))
@@ -5186,6 +5186,92 @@ class TestDiagnosis4Transition(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rig.interview._transition_action(text), r1_session._TRANSITION_NUDGE)
         rig = await self.rig()
         self.assertEqual(rig.interview._transition_action("Ready."), r1_session._TRANSITION_READY)
+
+    async def test_a_bare_yes_to_any_questions_is_invited(self) -> None:
+        # Review of diagnosis 4 (BRIEF2-BARE-YES-NUDGE): "Any questions before we start?" "Yes."
+        # means a question is coming: "Of course, go ahead.", never "just say ready".  Never a start.
+        for text in ("Yes.", "Yeah."):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                self.assertEqual(
+                    rig.interview._transition_action(text), r1_session._TRANSITION_INVITE
+                )
+                await rig.converse(text)
+                self.assertFalse(rig.interview._transition_consented)
+                self.assertIsNone(rig.interview._start_question)
+                with _env(R1_BRIEF_WORDING_V2="0"):
+                    rig = await self.rig()
+                    self.assertEqual(
+                        rig.interview._transition_action(text), r1_session._TRANSITION_NUDGE
+                    )
+
+    async def test_a_bare_yes_after_an_answer_s_either_or_question_still_gets_the_nudge(
+        self,
+    ) -> None:
+        rig = await self.rig(reply="It's mostly calls with learners.")
+        await rig.converse("What are the shift timings?")
+        self.assertEqual(rig.interview._start_question, r1_session._EITHER_OR)
+        self.assertEqual(rig.interview._transition_action("Yes."), r1_session._TRANSITION_NUDGE)
+
+    def test_job_questions_never_get_a_role_play_field_answer(self) -> None:
+        # Review of diagnosis 4 (RP-FIELDS-OVERMATCH): timelines, the job's targets, perks and
+        # the program they would work on are the job's; they go to the model (the hiring team).
+        for text in (
+            "How long does it take to hear back after this interview?",
+            "How long will it take to get the results?",
+            "how long does it usually take for the offer letter",
+            "How long would it take to complete the course?",
+            "What's the target for this role, like monthly?",
+            "Do I have to sell over the phone in this job?",
+            "What's the cost of relocation, do you cover it?",
+            "Will there be any discounts for employees?",
+            "Which program will I be working on if I'm hired?",
+            "How long is the training?",
+            "What's the salary?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.roleplay_fields(text), ())
+        for text, line_id in (
+            ("How long will it take?", "L-RP-LENGTH"),
+            ("How long does the role-play last?", "L-RP-LENGTH"),
+            ("What's the price of the course?", "L-RP-GUIDE"),
+            ("Any discounts I can offer her?", "L-RP-GUIDE"),
+            ("What's my goal here?", "L-RP-GOAL"),
+            ("Do I need to get her to pay today?", "L-RP-GOAL"),
+            ("Which program is she asking about?", "L-RP-COURSE"),
+            ("What's my role?", "L-RP-ROLES"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.roleplay_fields(text), (line_id,))
+
+    async def test_a_job_timeline_question_is_answered_by_the_model(self) -> None:
+        rig = await self.rig(reply="The hiring team will follow up on that.")
+        calls = len(rig.provider.calls)
+        spoken = await rig.converse("How long does it take to hear back after this interview?")
+        self.assertEqual(len(rig.provider.calls), calls + 1)
+        self.assertNotIn(rig.interview.render_line("L-RP-LENGTH"), spoken)
+
+    async def test_the_presence_v2_flag_restores_revision_30(self) -> None:
+        # Review of diagnosis 4 (NO-ISOLATED-ROLLBACK): R1_TRANSITION_PRESENCE_V2=0 rolls back
+        # D4-TRANS-PRESENT1 alone; the rest of R1_BRIEF_VARIETY stays on.
+        import r1_script
+
+        rig = await self.rig()
+        self.assertEqual(r1_script.active_line_id("L-PICKUP-BRIDGE"), "L-PICKUP-BRIDGE-2")
+        order = set(rig.interview._warm_order())
+        self.assertIn("L-PRESENT-TAKE-TIME", order)
+        self.assertNotIn("L-TRANSITION-TAKE-TIME", order)
+        with _env(R1_TRANSITION_PRESENCE_V2="0"):
+            self.assertTrue(r1_script.brief_variety_enabled())
+            self.assertFalse(r1_script.transition_presence_v2_enabled())
+            self.assertEqual(
+                rig.interview._presence_lines(), ("L-PRESENT", "L-TRANSITION-TAKE-TIME")
+            )
+            self.assertEqual(r1_script.active_line_id("L-PICKUP-BRIDGE"), "L-PICKUP-BRIDGE")
+            order = set(rig.interview._warm_order())
+            self.assertIn("L-TRANSITION-TAKE-TIME", order)
+            self.assertNotIn("L-PRESENT-TAKE-TIME", order)
+            self.assertIn("L-TRANSITION-RECAP-2", order)  # the rest of the variety stays
 
 
 class TestDiagnosis4Icebreaker(unittest.IsolatedAsyncioTestCase):
@@ -5211,6 +5297,80 @@ class TestDiagnosis4Icebreaker(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rig.interview._icebreaker_plan.use_hold())
         # And the first silence then goes straight to "Are you still with me?".
         self.assertIsNone(rig.interview._ib_silence_restate_id())
+
+    async def test_no_nudge_is_armed_once_the_re_ask_is_used(self) -> None:
+        # Review of diagnosis 4 (QUIET-NUDGE-SHORT-LADDER): with the question's one re-ask spent,
+        # a quiet ack arms nothing, so the window stays the usual one.
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        self.assertTrue(rig.interview._icebreaker_plan.use_hold())
+        self.assertIsNone(await rig.converse("Okay."))
+        self.assertIsNone(rig.interview._ib_nudge_question)
+
+    async def test_a_refused_nudge_keeps_the_usual_window(self) -> None:
+        rig = await self.rig()
+        still = rig.interview.render_line("L-SIL-IB")
+        with mock.patch.object(r1_session, "IB_QUIET_NUDGE_SECONDS", 0.3), mock.patch.object(
+            r1_session, "ICEBREAKER_PROMPT_SECONDS", 1.5
+        ), mock.patch.object(r1_session, "ICEBREAKER_END_SECONDS", 0.05):
+            task = asyncio.create_task(rig.interview._run_icebreaker())
+            try:
+                await rig.converse(IB_ANSWER)
+                await rig.converse("Thank you.")
+                self.assertIsNotNone(rig.interview._ib_nudge_question)
+                # The re-ask is spent after the nudge was armed: the nudge is refused.
+                self.assertTrue(rig.interview._icebreaker_plan.use_hold())
+                await asyncio.sleep(0.9)  # past the short window, inside the usual one
+                restate = rig.interview._ib_silence_restate_id()
+                spoken = list(rig.session.spoken)
+                self.assertNotIn(still, spoken)
+                if restate is not None:
+                    self.assertNotIn(rig.interview.render_line(restate), spoken)
+                await rig.until(lambda: still in rig.session.spoken, timeout=5)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self.assertFalse(any(text.startswith("So, ") for text in rig.session.spoken))
+
+    async def test_the_echo_check_hears_the_turn_without_the_story_echo(self) -> None:
+        # Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): the echo cut reads the candidate's turn,
+        # so the session passes it whenever R1_REACTION_VARIETY_V2 is on.
+        rig = await self.rig()
+        with _env(R1_GUARD_STORY_ECHO="0"):
+            context = rig.interview._interviewer_guard_context(
+                Reply(phase="icebreaker", candidate_text="Can I ask about the shifts?")
+            )
+        self.assertTrue(context.reaction_check_v2)
+        self.assertEqual(context.candidate_text, "Can I ask about the shifts?")
+
+    async def test_a_hold_after_an_answer_counts_the_answer(self) -> None:
+        # Review of diagnosis 4 (HOLD-TAIL-DROPS-ANSWER): the hold line is said, and the answer
+        # before it counts toward the soft exit, reaches the plan and earns the thanks.
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        turns = rig.machine.candidate_turns
+        answer = (
+            "Mostly I ask what they want to change in their career and by when, and what is "
+            "stopping them."
+        )
+        told = f"{answer} Could I have a moment?"
+        spoken = await rig.converse(told)
+        self.assertEqual(spoken, rig.interview.render_line("L-IB-HOLD"))
+        self.assertEqual(rig.machine.candidate_turns, turns + 1)
+        self.assertEqual(rig.interview._icebreaker_carry, answer)
+        # Back from the moment: the answer before the hold counts, so the plan moves on (I3),
+        # never a follow-up to the question they already answered.
+        await rig.converse("Okay, I'm back.")
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I3")
+        rig.interview._note_icebreaker_boundary(told, None)
+        self.assertIsNone(rig.interview._icebreaker_boundary_kind)
+        rig.interview._note_icebreaker_boundary("Could I have a moment?", None)
+        self.assertEqual(rig.interview._icebreaker_boundary_kind, "repair")
+        with _env(R1_IB_HOLD_V2="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            self.assertEqual(rig.interview._icebreaker_carry, "")
 
     async def test_a_real_answer_cancels_the_nudge(self) -> None:
         rig = await self.rig()

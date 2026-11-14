@@ -724,6 +724,7 @@ _SUMMARY_VERDICT_V2 = _ci(
 _ECHO_OPENER = _ci(
     r"^(?:right|got it|okay|ok|mm|sure|makes sense|fair enough)[,.] [^.?!]{3,80}\.$"
 )
+_ECHO_OPENER_LEAD = _ci(r"^(?:right|got it|okay|ok|mm|sure|makes sense|fair enough)[,.] ")
 
 
 def summary_verdict_detected(sentence: object, *, wide: bool = False) -> bool:
@@ -740,6 +741,37 @@ def echo_opener(sentence: object) -> bool:
     return _ECHO_OPENER.search(fold(sentence).strip()) is not None
 
 
+# Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): the words an echo shares with the candidate's turn
+# are its content words (four letters or more, none of these), compared without a plural "s".
+_ECHO_FUNCTION_WORDS = frozenset(
+    {"that", "this", "those", "these", "then", "than", "there", "their", "they", "them", "with",
+     "from", "into", "about", "your", "yours", "what", "when", "which", "while", "have", "just",
+     "some", "very", "really", "also", "back", "over", "more", "most", "much", "will", "would",
+     "could", "should", "does", "done", "were", "been", "being", "here", "later", "come", "make",
+     "sure", "okay", "right", "makes", "sense", "fair", "enough"}
+)
+
+
+def _echo_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for word in normalize(fold(text)).split():
+        if len(word) < 4 or word in _ECHO_FUNCTION_WORDS:
+            continue
+        terms.add(word[:-1] if word.endswith("s") and len(word) > 4 else word)
+    return terms
+
+
+def echoes_their_turn(sentence: object, candidate_text: str) -> bool:
+    """Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): ``sentence`` is an echo opener that plays the
+    candidate's own words back: their turn asked nothing (an ack-led statement after a question is
+    her answer or her deferral) and the echo's body shares a content word with it ("Right, two
+    years on the phones." after "I spent two years on the phones")."""
+    if not candidate_text or _turn_asks(candidate_text) or not echo_opener(sentence):
+        return False
+    body = _ECHO_OPENER_LEAD.sub("", fold(sentence).strip(), count=1)
+    return bool(_echo_terms(body) & _echo_terms(candidate_text))
+
+
 def opens_with_reaction(sentence: object) -> bool:
     """D4-ICE-ECHO1: a reply opener that is an echo, a verdict or the echo-and-verdict shape."""
     return (
@@ -751,10 +783,19 @@ def opens_with_reaction(sentence: object) -> bool:
 
 # D4-TRANS-Q1 (``R1_TRANSITION_ANSWERS``): the offer the transition note's old example taught the
 # model ("Happy to go over the hours or anything else"), said once a session at most.
+# Review of diagnosis 4 (OFFER-TRIM-FRAGMENT): its subject goes with it ("I'd be", "I'll be",
+# "We're", "I would be more than"), so the cut never leaves "I'd be." to be spoken.
 _OFFER_PHRASE = re.compile(
-    r"[,;]?\s*(?:and\s+)?(?:i(?:'|\u2019)m\s+|i am\s+)?happy to go (?:over|into) "
+    r"[,;]?\s*(?:and\s+)?"
+    r"(?:(?:i|we)(?:(?:'|\u2019)(?:m|re|d|ll)| am| are| would| will)\s+(?:be\s+)?)?"
+    r"(?:(?:always|really|very|so|more than)\s+)*"
+    r"happy to go (?:over|into) "
     r"(?:the hours|the brief|it again)[^.?!]*",
     re.IGNORECASE,
+)
+# What may be left of a sentence whose one clause was the offer: no words of its own to say.
+_OFFER_LEFTOVER_WORDS = frozenset(
+    {"sure", "of", "course", "and", "also", "absolutely", "definitely", "yes", "yeah", "okay", "ok"}
 )
 
 
@@ -771,6 +812,8 @@ def without_offer_phrase(sentence: str) -> str:
     rest = rest.rstrip(" ,;:-")
     if word_count(rest) < 2:
         return ""
+    if all(word in _OFFER_LEFTOVER_WORDS for word in normalize(rest).split()):
+        return ""  # "Sure, of course." with the offer gone says nothing of its own
     if rest[-1] not in ".?!":
         rest += "."
     return rest[0].upper() + rest[1:]
@@ -1997,11 +2040,13 @@ class StreamGuard:
             kept == sentence
             and ctx.reaction_check_v2
             and self._vetted == 1
-            and echo_opener(sentence)
+            and echoes_their_turn(sentence, ctx.candidate_text)
             and any(opens_with_reaction(opening) for opening in ctx.previous_openings[-2:])
         ):
             # D4-ICE-ECHO1: one of her last two replies opened with an echo or a verdict, so this
-            # echo goes (never the only sentence: ``flush`` gives it back).
+            # echo goes (never the only sentence: ``flush`` gives it back).  Review of diagnosis 4
+            # (ECHO-CUT-EATS-ANSWERS): only their own words back after a turn that asked nothing;
+            # her answer to their question or her deferral is never cut.
             kept = ""
         if kept == sentence:
             return sentence
