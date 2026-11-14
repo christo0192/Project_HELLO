@@ -887,6 +887,421 @@ class CandidateSimTests(unittest.TestCase):
         self.assertEqual((action.kind, action.act), ("speak", "ready"))
 
 
+
+class AdvisorFarewellLoopTests(unittest.TestCase):
+    """D4-H-SIMLOOP1: after two mutual goodbyes in a row the simulated advisor goes quiet (synthetic text)."""
+
+    GOODBYE = "Good night, Meera. Talk tomorrow at seven."
+
+    def _sim(self, replies=None):
+        from rehearsal.advisor import AdvisorTurn
+
+        sim = _sim()
+
+        class RepeatingAdvisor:
+            calls = 0
+
+            async def start(self, pickup):
+                return None
+
+            async def next_turn(self, learner_text, r_sec, exchange):
+                RepeatingAdvisor.calls += 1
+                return AdvisorTurn(AdvisorFarewellLoopTests.GOODBYE, "farewell", ""), "advisor_turn"
+
+        sim.advisor = RepeatingAdvisor()
+        return sim
+
+    def _turn(self, sim, learner_line: str, at: float):
+        from rehearsal.sim import LEARNER
+
+        view = _view("roleplay", [_span("bot", LEARNER, learner_line, at, at + 2.0)], r_sec=at)
+        view.roleplay_started = True
+        return asyncio.run(sim.next_action(view))
+
+    def test_two_mutual_goodbyes_in_a_row_and_the_advisor_goes_quiet(self) -> None:
+        sim = self._sim()
+        first = self._turn(sim, "Hello? Yes, this is Meera.", 900.0)
+        self.assertEqual((first.kind, first.text), ("speak", self.GOODBYE))
+        second = self._turn(sim, "Thanks, good night.", 910.0)  # mutual goodbye 1
+        self.assertEqual(second.kind, "speak")
+        third = self._turn(sim, "Okay, talk tomorrow at seven.", 920.0)  # mutual goodbye 2
+        self.assertEqual((third.kind, third.why), ("silent", "advisor_farewell_loop"))
+        # No further advisor turn, whatever the learner says next.
+        fourth = self._turn(sim, "Hello? Are you still there?", 940.0)
+        self.assertEqual(fourth.kind, "silent")
+        self.assertEqual(sim.advisor.calls, 2)
+
+    def test_a_learner_reply_that_is_no_goodbye_breaks_the_run(self) -> None:
+        sim = self._sim()
+        self._turn(sim, "Hello? Yes, this is Meera.", 900.0)
+        self._turn(sim, "Thanks, good night.", 910.0)
+        middle = self._turn(sim, "Wait, before you go, is the course live or recorded?", 920.0)
+        self.assertEqual(middle.kind, "speak")
+        again = self._turn(sim, "Bye then.", 930.0)
+        self.assertEqual(again.kind, "speak")
+        self.assertEqual(self._turn(sim, "Good night.", 940.0).kind, "silent")
+
+    def test_off_keeps_the_advisor_talking(self) -> None:
+        from rehearsal.flags import ADVISOR_FAREWELL_LOOP
+
+        with _switch(ADVISOR_FAREWELL_LOOP, "0"):
+            sim = self._sim()
+            self._turn(sim, "Hello? Yes, this is Meera.", 900.0)
+            self._turn(sim, "Thanks, good night.", 910.0)
+            self.assertEqual(self._turn(sim, "Okay, talk tomorrow at seven.", 920.0).kind, "speak")
+
+    def test_the_loop_count_metric(self) -> None:
+        from rehearsal.metrics import advisor_farewell_loop
+
+        def ex(advisor: str, intent: str, learner: str | None) -> dict:
+            return {"advisor": {"text": advisor, "intent": intent}, "learner": {"spoken": learner}}
+
+        bye = (self.GOODBYE, "farewell")
+        self.assertEqual(advisor_farewell_loop([]), 0)
+        self.assertEqual(advisor_farewell_loop([ex("Sure.", "other", "Good night.")]), 0)
+        self.assertEqual(advisor_farewell_loop([ex(*bye, "Good night."), ex(*bye, "Bye.")]), 1)
+        loop = [ex("Is seven okay?", "close_ask", "Yes, seven works.")] + [ex(*bye, "Good night, thanks.")] * 28
+        self.assertEqual(advisor_farewell_loop(loop), 27)
+        # A goodbye the learner did not return is no mutual goodbye.
+        self.assertEqual(advisor_farewell_loop([ex(*bye, "Wait, one more question?"), ex(*bye, None)]), 0)
+
+    def test_the_scorecard_shows_it(self) -> None:
+        from rehearsal.full_metrics import render_full_markdown
+
+        record = {"header": {"seed": "loop-1", "scenario": "terse-nervous"}, "outcome": "complete",
+                  "stop_reason": "time_cap", "phase_checks": {"start_by": "spoken", "failed": []},
+                  "metrics": {"advisor_farewell_loop": 2}}
+        card = {"calls": 1, "offline": True, "ready_for_owner_test": False, "reasons": ["x"],
+                "phase_checks": {}, "roleplay": None}
+        markdown = render_full_markdown(card, [record])
+        self.assertIn("| farewell loop |", markdown)
+        self.assertIn("| loop-1 | terse-nervous | complete | time_cap | spoken | - | - | 2 | - |", markdown)
+
+
+class FarewellLoopReviewTests(unittest.TestCase):
+    """Review SIMLOOP-REGEX-FP / SIMLOOP-END-ANSWER: only real sign-offs feed the farewell-loop rule, and an
+    advisor who went quiet agrees to end or wrap up when Christy asks (synthetic text)."""
+
+    def test_ordinary_last_sentences_are_no_sign_off(self) -> None:
+        from rehearsal.advisor import ends_on_goodbye
+
+        for text in (
+            "Thank you so much for sharing that.",
+            "Are you ready for that?",
+            "Would that work for you too?",
+            "Okay, so I see you have two kids.",
+            "Okay, so I see you have kids.",
+            "Let's do a demo class. See you there?",
+            "Good night is when most of our learners study, after the kids sleep.",
+            "I'm not sure I'm ready for that.",
+            "I'd want to talk to my husband first. Can we talk tomorrow?",
+            "Thanks again.",
+            "Honestly I'm not looking forward to it.",
+            "Is it the same for you too?",
+            "Let me talk to my husband and then we can talk tomorrow about the fees.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(ends_on_goodbye(text))
+
+    def test_real_goodbyes_are_read(self) -> None:
+        from rehearsal.advisor import ends_on_goodbye
+
+        for text in (
+            "Talk to you at seven tomorrow",
+            "See ya!",
+            "Catch you later.",
+            "Cheers.",
+            "Good night, Meera.",
+            "Thanks, good night.",
+            "Okay, talk tomorrow at seven.",
+            "Good night, Meera. Talk tomorrow at seven.",
+            "Bye then.",
+            "You too.",
+            "Thanks, you too!",
+            "Take care!",
+            "See you then.",
+            "See you at seven tomorrow.",
+            "Until tomorrow.",
+            "Have a good evening.",
+            "Thank you for your time.",
+            "Talk tomorrow at seven, okay?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(ends_on_goodbye(text))
+
+    def _sim(self, advisor_text: str, intent: str):
+        from rehearsal.advisor import AdvisorTurn
+
+        sim = _sim()
+
+        class Advisor:
+            calls = 0
+
+            async def start(self, pickup):
+                return None
+
+            async def next_turn(self, learner_text, r_sec, exchange):
+                Advisor.calls += 1
+                return AdvisorTurn(advisor_text, intent, ""), "advisor_turn"
+
+        sim.advisor = Advisor()
+        return sim
+
+    def _turn(self, sim, learner_line: str, at: float, **extra):
+        from rehearsal.sim import LEARNER
+
+        view = _view("roleplay", [_span("bot", LEARNER, learner_line, at, at + 2.0)], r_sec=at, **extra)
+        view.roleplay_started = True
+        return asyncio.run(sim.next_action(view))
+
+    def test_polite_mid_call_lines_never_silence_the_advisor(self) -> None:
+        # The reviewer's failure scenario: R 9:00, a thanks that is no goodbye and an F4 stall.
+        sim = self._sim("Thank you so much for sharing that.", "other")
+        for step in range(5):
+            line = "I'd want to talk to my husband first. Can we talk tomorrow?"
+            self.assertEqual(self._turn(sim, line, 540.0 + 10 * step).kind, "speak")
+
+    def test_a_text_only_sign_off_counts_only_from_fourteen_minutes(self) -> None:
+        early = self._sim("Okay, talk to you tomorrow then.", "other")
+        for step in range(4):
+            self.assertEqual(self._turn(early, "Bye.", 540.0 + 10 * step).kind, "speak")
+        late = self._sim("Okay, talk to you tomorrow then.", "other")
+        self._turn(late, "Hello?", 900.0)
+        self._turn(late, "Bye.", 910.0)
+        self.assertEqual(self._turn(late, "Bye.", 920.0).why, "advisor_farewell_loop")
+        # A farewell the advisor tagged itself counts at any time.
+        tagged = self._sim("Okay, talk to you tomorrow then.", "farewell")
+        self._turn(tagged, "Hello?", 540.0)
+        self._turn(tagged, "Bye.", 550.0)
+        self.assertEqual(self._turn(tagged, "Bye.", 560.0).why, "advisor_farewell_loop")
+
+    def _quiet(self):
+        sim = self._sim("Good night, Meera. Talk tomorrow at seven.", "farewell")
+        self._turn(sim, "Hello?", 660.0)
+        self._turn(sim, "Good night.", 670.0)
+        self.assertEqual(self._turn(sim, "Bye.", 680.0).why, "advisor_farewell_loop")
+        return sim
+
+    def test_an_advisor_who_went_quiet_agrees_to_end_when_christy_asks(self) -> None:
+        sim = self._quiet()
+        action = self._turn(sim, "If you want to end the interview now, please say: end the interview.", 690.0,
+                            open_question="end")
+        self.assertEqual((action.kind, action.act, action.text), ("speak", "end_agree", "Yes, please end it here."))
+
+    def test_an_advisor_who_went_quiet_takes_the_wrap_offer(self) -> None:
+        sim = self._quiet()
+        action = self._turn(sim, "Shall we wrap up the role-play here?", 690.0, open_question="wrap")
+        self.assertEqual(action.act, "wrap_accept")
+
+    def test_an_end_question_before_any_loop_still_gets_the_scenario_answer(self) -> None:
+        sim = self._sim("Sure.", "other")
+        action = self._turn(sim, "If you want to end the interview now, please say: end the interview.", 600.0,
+                            open_question="end")
+        self.assertEqual(action.act, "end_decline")
+
+    def test_the_loop_metric_reads_the_same_bound(self) -> None:
+        from rehearsal.metrics import advisor_farewell_loop
+
+        def ex(advisor: str, intent: str, learner: str, r: float) -> dict:
+            return {"r_sec": r, "advisor": {"text": advisor, "intent": intent}, "learner": {"spoken": learner}}
+
+        thanks = [ex("Thank you so much for sharing that.", "other", "Can we talk tomorrow?", 540.0)] * 4
+        self.assertEqual(advisor_farewell_loop(thanks), 0)
+        early = [ex("Okay, talk to you tomorrow then.", "other", "Bye.", 540.0)] * 4
+        self.assertEqual(advisor_farewell_loop(early), 0)
+        late = [ex("Okay, talk to you tomorrow then.", "other", "Bye.", 900.0)] * 4
+        self.assertEqual(advisor_farewell_loop(late), 3)
+
+
+
+class ReplayContextTests(unittest.TestCase):
+    """D4-H-REPLAY1: replayed lines fit the conversation they land in (synthetic text)."""
+
+    Q1 = "What does a normal working day look like for you?"
+    Q2 = "How did you keep track of your follow-ups?"
+
+    def _sim(self, transition):
+        import dataclasses
+
+        sim = _sim()
+        sim.scenario = dataclasses.replace(sim.scenario, transition=tuple(transition))
+        sim._transition = list(transition)
+        return sim
+
+    def _icebreaker(self, sim, question: str, at: float, *, answer: bool = True):
+        action = asyncio.run(sim.next_action(_view("icebreaker", [_span("bot", "interviewer", question, at, at + 3.0)])))
+        if not answer:
+            return action
+        self.assertEqual(action.kind, "speak")
+        return action
+
+    def _transition(self, sim, at: float):
+        return asyncio.run(sim.next_action(_view("transition", [_span("bot", "interviewer", "Say ready when you are.", at, at + 3.0)])))
+
+    def test_a_repeat_request_for_an_answered_question_gives_way_to_the_next_line(self) -> None:
+        from rehearsal.scenarios import Beat
+
+        sim = self._sim([Beat("repeat_request", "No, return to that earlier question and repeat it."), Beat("ready", "Ready.")])
+        self._icebreaker(sim, self.Q1, 10.0)
+        self._icebreaker(sim, self.Q2, 30.0)
+        action = self._transition(sim, 60.0)
+        self.assertEqual((action.act, action.text), ("ready", "Ready."))
+
+    def test_a_repeat_request_for_an_unanswered_question_is_still_said(self) -> None:
+        from rehearsal.scenarios import Beat
+
+        sim = self._sim([Beat("repeat_request", "Can you go back to the question before the last one?"), Beat("ready", "Ready.")])
+        sim._ib_questions = [False, True]  # the one before the last went unanswered (a skip)
+        action = self._transition(sim, 60.0)
+        self.assertEqual(action.act, "repeat_request")
+
+    def test_off_says_every_replayed_repeat_request(self) -> None:
+        from rehearsal.flags import REPEAT_IF_UNANSWERED
+        from rehearsal.scenarios import Beat
+
+        with _switch(REPEAT_IF_UNANSWERED, "0"):
+            sim = self._sim([Beat("repeat_request", "No, return to that earlier question and repeat it."), Beat("ready", "Ready.")])
+            self._icebreaker(sim, self.Q1, 10.0)
+            self._icebreaker(sim, self.Q2, 30.0)
+            self.assertEqual(self._transition(sim, 60.0).act, "repeat_request")
+
+    def test_after_a_backchannel_the_candidate_answers_within_ten_seconds(self) -> None:
+        sim = _sim()
+        sim.last_act = "backchannel"
+        quiet = asyncio.run(sim.next_action(_view("icebreaker", [], waited=4.0)))
+        self.assertEqual(quiet.kind, "wait")
+        due = asyncio.run(sim.next_action(_view("icebreaker", [], waited=10.0)))
+        self.assertEqual((due.kind, due.act), ("speak", "icebreaker_answer"))
+        from rehearsal.flags import BACKCHANNEL_GAP
+
+        with _switch(BACKCHANNEL_GAP, "0"):
+            sim = _sim()
+            sim.last_act = "backchannel"
+            self.assertEqual(asyncio.run(sim.next_action(_view("icebreaker", [], waited=40.0))).kind, "wait")
+
+    # --- a turn the session saved as fragments
+    STORY = ("one customer had a hundred reasons why it would not work the money the hours the "
+             "family and in the end she signed up after we planned her week together")
+    QUESTION = "how long does the role play last"
+
+    def _rows(self):
+        from types import SimpleNamespace
+
+        from rehearsal.full import transcript_rows
+        from rehearsal.sim import Span
+
+        story = Span("candidate", "candidate", self.STORY, "candidate", 100.0, "icebreaker", 100.0, None,
+                     t_end=140.0, act="icebreaker_answer")
+        brief = Span("bot", "interviewer", "Next, let's do a sales role-play.", "say", 120.0, "transition", 120.0, None,
+                     t_end=150.0)
+        asked = Span("candidate", "candidate", self.QUESTION, "candidate", 155.0, "transition", 155.0, None,
+                     t_end=158.0, act="roleplay_question")
+        words = self.STORY.split()
+        saved = [
+            {"index": 1, "speaker": "candidate", "phase": "icebreaker", "text": " ".join(words[:8])},
+            {"index": 2, "speaker": "bot", "phase": "transition", "text": brief.text},
+            {"index": 3, "speaker": "candidate", "phase": "transition",
+             "text": " ".join(words[8:]) + " " + self.QUESTION},
+        ]
+        writer = SimpleNamespace(saved=saved, columns={1: {"written_at": 120.0}, 3: {"written_at": 158.5}})
+        rt = SimpleNamespace(spans=[story, brief, asked])
+        return transcript_rows(rt, writer)
+
+    def test_a_continuation_over_the_brief_is_merged_into_the_icebreaker_turn(self) -> None:
+        rows = self._rows()
+        self.assertEqual([row["phase"] for row in rows], ["icebreaker", "transition", "transition"])
+        story, _brief, asked = rows
+        self.assertEqual(story["text"], self.STORY)
+        self.assertEqual((story["s_sec"], story["act"]), (100.0, "icebreaker_answer"))
+        self.assertEqual(story["merged_turn_indexes"], [3])
+        self.assertEqual((asked["text"], asked["s_sec"], asked["act"]), (self.QUESTION, 155.0, "roleplay_question"))
+        self.assertTrue(all(row["s_sec"] is not None for row in rows))
+
+    def test_off_keeps_the_fragments_unstamped(self) -> None:
+        from rehearsal.flags import CONTINUED_ROWS
+
+        with _switch(CONTINUED_ROWS, "0"):
+            rows = self._rows()
+        self.assertEqual(len(rows), 3)
+        self.assertIsNone(rows[0]["s_sec"])
+        self.assertIsNone(rows[2]["s_sec"])
+
+
+class ContinuedRowsReviewTests(unittest.TestCase):
+    """Review CONTINUED-ROWS-EARLIEST-SPAN: a short span-less fragment belongs to the turn in progress,
+    never to an older turn that shares a word (synthetic spans)."""
+
+    @staticmethod
+    def _rows(spans: list, saved: list, written: dict):
+        from types import SimpleNamespace
+
+        from rehearsal.full import transcript_rows
+
+        writer = SimpleNamespace(saved=saved, columns={index: {"written_at": at} for index, at in written.items()})
+        return transcript_rows(SimpleNamespace(spans=spans), writer)
+
+    @staticmethod
+    def _span(speaker: str, text: str, at: float, end: float, phase: str, act: str | None = None):
+        from rehearsal.sim import Span
+
+        voice = "candidate" if speaker == "candidate" else "interviewer"
+        return Span(speaker, voice, text, speaker if speaker == "candidate" else "say", at, phase, at, None,
+                    t_end=end, act=act)
+
+    def test_a_yes_fragment_stays_with_the_ready_turn(self) -> None:
+        hello = self._span("bot", "Hi, can you hear me okay?", 1.0, 3.0, "opening")
+        check = self._span("candidate", "Yes, I can hear you fine.", 4.0, 6.0, "opening", act="sound_check")
+        prompt = self._span("bot", "Say ready when you are.", 100.0, 102.0, "transition")
+        ready = self._span("candidate", "Yes. I'm ready.", 104.0, 106.0, "transition", act="ready")
+        saved = [
+            {"index": 1, "speaker": "bot", "phase": "opening", "text": hello.text},
+            {"index": 2, "speaker": "candidate", "phase": "opening", "text": check.text},
+            {"index": 3, "speaker": "bot", "phase": "transition", "text": prompt.text},
+            {"index": 4, "speaker": "candidate", "phase": "transition", "text": "Yes."},
+            {"index": 5, "speaker": "candidate", "phase": "transition", "text": "I'm ready."},
+        ]
+        rows = self._rows([hello, check, prompt, ready], saved, {4: 104.6, 5: 106.2})
+        texts = [row["text"] for row in rows]
+        self.assertEqual(texts[1], "Yes, I can hear you fine.")
+        self.assertEqual(texts[-1], "Yes. I'm ready.")
+        self.assertEqual(rows[-1]["act"], "ready")
+
+    def test_a_ready_fragment_does_not_migrate_into_the_hold_request(self) -> None:
+        prompt = self._span("bot", "Say ready when you are.", 100.0, 102.0, "transition")
+        hold = self._span("candidate", "I'm not ready yet, give me a moment.", 104.0, 107.0, "transition",
+                          act="hold_request")
+        nudge = self._span("bot", "Take your time.", 108.0, 109.0, "transition")
+        ready = self._span("candidate", "Okay ready. Let's go then.", 120.0, 123.0, "transition", act="ready")
+        saved = [
+            {"index": 1, "speaker": "bot", "phase": "transition", "text": prompt.text},
+            {"index": 2, "speaker": "candidate", "phase": "transition", "text": hold.text},
+            {"index": 3, "speaker": "bot", "phase": "transition", "text": nudge.text},
+            {"index": 4, "speaker": "candidate", "phase": "transition", "text": "Ready."},
+            {"index": 5, "speaker": "candidate", "phase": "transition", "text": "Let's go then."},
+        ]
+        rows = self._rows([prompt, hold, nudge, ready], saved, {4: 121.0, 5: 123.2})
+        self.assertEqual(rows[1]["text"], hold.text)
+        self.assertNotIn("merged_turn_indexes", rows[1])
+        self.assertEqual(rows[-1]["text"], "Ready. Let's go then.")
+        self.assertEqual(rows[-1]["act"], "ready")
+
+    def test_a_short_fragment_only_an_older_turn_has_is_left_as_saved(self) -> None:
+        older = self._span("candidate", "Sure, sounds good to me.", 10.0, 12.0, "icebreaker", act="icebreaker_answer")
+        bot = self._span("bot", "Tell me about your last job.", 20.0, 22.0, "icebreaker")
+        latest = self._span("candidate", "I sold insurance for two years.", 24.0, 27.0, "icebreaker",
+                            act="icebreaker_answer")
+        saved = [
+            {"index": 1, "speaker": "candidate", "phase": "icebreaker", "text": older.text},
+            {"index": 2, "speaker": "bot", "phase": "icebreaker", "text": bot.text},
+            {"index": 3, "speaker": "candidate", "phase": "icebreaker", "text": "Sounds good."},
+        ]
+        rows = self._rows([older, bot, latest], saved, {3: 27.5})
+        self.assertEqual(rows[0]["text"], older.text)
+        self.assertEqual(rows[-1]["text"], "Sounds good.")
+        self.assertIsNone(rows[-1]["s_sec"])
+
+
+
 class ManualReplayTimingTests(unittest.TestCase):
     def test_moves_that_shared_one_turn_are_said_as_one(self) -> None:
         from rehearsal.manual import Move, merge_shared_turns
@@ -1728,6 +2143,41 @@ class BriefRepairCheckTests(unittest.TestCase):
         rows[-3] = dict(rows[-3], text="Of course. " + self.LAST_Q)
         checks = self._checks(rows)
         self.assertEqual([item["ok"] for item in checks["icebreaker_repeat"]["requests"]], [False, False])
+
+    def test_no_problem_is_no_turned_down_question(self) -> None:
+        # Review NEW-REGEX-BREADTH (1): "No problem, ..." / "No worries, ..." turn nothing down, so the
+        # older question is no accepted answer to a request for the last one.
+        for polite in ("No problem, can you repeat the last question?", "No worries, can you repeat the last question?"):
+            with self.subTest(polite=polite):
+                rows = self._rows("repeat_request", "Sorry, can you repeat the last question?", "Sure. " + self.LAST_Q, "reply")
+                rows += [
+                    _row("candidate", "candidate", "transition", polite, 250.0, act="repeat_request"),
+                    _row("bot", "christy", "transition", "Sure. " + self.EARLIER_Q, 254.0, source="reply"),
+                ]
+                requests = self._checks(rows)["icebreaker_repeat"]["requests"]
+                self.assertEqual([(item["insisted"], item["ok"]) for item in requests], [(False, True), (False, False)])
+
+    def test_the_checker_and_the_candidate_read_the_question_before_last_alike(self) -> None:
+        # Review NEW-REGEX-BREADTH (2): "earlier" as an adverb is the last question; "that earlier
+        # question" is the one before it, for both the checker and the replaying candidate.
+        from rehearsal.candidate import _EARLIER
+        from rehearsal.full_metrics import _SECOND_LAST
+
+        for text, second_last in (
+            ("Can you repeat that question? I didn't catch it earlier.", False),
+            ("Can we come back to this later?", False),
+            ("Please go back and say it again.", False),
+            ("Can you repeat that earlier question?", True),
+            ("No, return to that earlier question and repeat it.", True),
+            ("Can we jump back to the question before the last one?", True),
+            ("Go back to the second-last question, please.", True),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_EARLIER.search(text) is not None, second_last)
+                self.assertEqual(_SECOND_LAST.search(text) is not None, second_last)
+        ask = "Can you repeat that earlier question?"
+        right = self._checks(self._rows("repeat_request", ask, "Sure. " + self.EARLIER_Q, "reply"))
+        self.assertTrue(right["icebreaker_repeat"]["ok"], right["icebreaker_repeat"])
 
     def test_the_insisted_switch_off_keeps_the_old_target(self) -> None:
         from rehearsal.flags import IB_REPEAT_INSISTED

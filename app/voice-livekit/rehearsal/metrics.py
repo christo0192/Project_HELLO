@@ -703,6 +703,7 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
             touches[topic].append((index, intent))
     probed: list[str] = []
     dug: list[str] = []
+    dig_exchanges: dict[str, list[int]] = {}
     disclosed: list[str] = []
     deep_on_first_probe: list[str] = []
     for topic, marks in touches.items():
@@ -717,6 +718,10 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
         later = [i for i, _intent in marks if i > first_probe]
         if later:
             dug.append(topic)
+            # The role-play turn of each dig (the exchange's own number), for the engine's ledger.
+            # Review DIG-RELEASED-JUDGE-SOURCE: the engine's own role-play turn when the record has it
+            # (the harness count drifts when the session splits or joins candidate turns).
+            dig_exchanges[topic] = [_engine_turn(exchanges[i], i) for i in later]
             window_end = max(i for i, _intent in marks) + DEEP_WINDOW_TURNS
             if any(topic in deep_by_turn[i] for i in range(first_probe, min(window_end + 1, len(spoken)))):
                 disclosed.append(topic)
@@ -739,11 +744,15 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
             if _asked_in_window(topic, exchanges, index):
                 excused += 1  # the advisor asked about it in so many words; the simulator did not tag it
                 continue
+            if flags.on(flags.OPEN_INVITE) and _invited_in_window(exchanges, index):
+                excused += 1  # D4-H-DIG1: she was asked, openly, to say what is on her mind
+                continue
             unprompted.append({"exchange": index + 1, "topic": topic})
     return {
         "unprompted_dump_excused": excused,
         "needs_probed": sorted(probed),
         "needs_dug": sorted(dug),
+        "dig_exchanges": {topic: dig_exchanges[topic] for topic in sorted(dig_exchanges)},
         "needs_disclosed_after_dig": sorted(disclosed),
         "disclosure_rate": (len(disclosed) / len(dug)) if dug else None,
         "deep_on_first_probe": sorted(deep_on_first_probe),
@@ -830,7 +839,10 @@ def _question_topics(question: str) -> list[str]:
 
 
 def engine_dig_metrics(
-    admin: Mapping[str, Any], dug: Sequence[str], disclosed: Sequence[str]
+    admin: Mapping[str, Any],
+    dug: Sequence[str],
+    disclosed: Sequence[str],
+    dig_exchanges: Mapping[str, Sequence[int]] | None = None,
 ) -> dict[str, Any]:
     """The harness's digs next to the engine's own needs ledger (D2-ND1), for the record only.
 
@@ -839,6 +851,13 @@ def engine_dig_metrics(
     engine miss (the learner was never released to tell it), so both values are reported and the
     disclosure gate keeps scoring every harness dig: scoring it on the engine's detector would hide an
     engine miss (anti-circularity, research 4.5).  Without a ledger every field is None.
+
+    D4-H-DIG1 (``REHEARSAL_DIG_RELEASED``, with ``dig_exchanges``): a dig is engine-confirmed only when
+    the gate had released that need by a dig's exchange (its ``released_turn`` at or before the dig;
+    one turn later is still that dig when the shadow judge's probe released it, since the judge folds
+    in a turn late; or a deep offer on that turn after the hint), not when the need was released only
+    later, by another question.
+    ``probe_unreleased`` lists the harness digs the gate did not honour (a product signal).
     """
     ledger = admin.get("needs")
     if not isinstance(ledger, list) or not ledger:
@@ -856,13 +875,89 @@ def engine_dig_metrics(
             if isinstance(item, Mapping) and item.get("followup_turn") is not None
         }
     )
-    return {
+    confirmed = sorted(topic for topic in dug if topic in engine)
+    out: dict[str, Any] = {
         "needs_dug_engine": engine,
         "harness_only_digs": sorted(set(dug) - set(engine)),
         "engine_only_digs": sorted(set(engine) - set(dug)),
-        "needs_dug_confirmed": sorted(topic for topic in dug if topic in engine),
-        "needs_disclosed_confirmed": sorted(topic for topic in disclosed if topic in engine),
     }
+    if dig_exchanges is not None and flags.on(flags.DIG_RELEASED):
+        release, offers = _released_turns(admin)
+
+        def honoured(topic: str) -> bool:
+            at = release.get(topic)
+            return any(
+                (at is not None and at <= turn) or turn in offers.get(topic, set())
+                for turn in dig_exchanges.get(topic) or ()
+            )
+
+        confirmed = sorted(topic for topic in dug if honoured(topic))
+        out["probe_unreleased"] = [
+            {"topic": topic, "exchanges": list(dig_exchanges.get(topic) or [])}
+            for topic in sorted(dug)
+            if topic not in confirmed
+        ]
+    out["needs_dug_confirmed"] = confirmed
+    out["needs_disclosed_confirmed"] = sorted(topic for topic in disclosed if topic in confirmed)
+    return out
+
+
+def _engine_turn(exchange: Mapping[str, Any], index: int) -> int:
+    """The role-play turn of an exchange: the engine's own counter when recorded, else the harness's."""
+    turn = exchange.get("engine_turn")
+    if isinstance(turn, int) and not isinstance(turn, bool):
+        return turn
+    return int(exchange.get("n") or index + 1)
+
+
+def _released_turns(admin: Mapping[str, Any]) -> tuple[dict[str, int], dict[str, set[int]]]:
+    """D4-H-DIG1: the dig turn by which the gate had released each need, and the turns of its deep
+    offers that followed the hint."""
+    release: dict[str, int] = {}
+    # ``probe_source`` names the source of a need's FIRST probe, not of its release: a need the rule
+    # probed can still be released by the shadow judge, so whenever a judge verdict was applied in the
+    # call a release one turn after the dig may be that dig's (review DIG-RELEASED-JUDGE-SOURCE).
+    tracker = admin.get("tracker") if isinstance(admin.get("tracker"), Mapping) else {}
+    judge = tracker.get("judge") if isinstance(tracker.get("judge"), Mapping) else {}
+    applied = judge.get("applied")
+    judge_ran = isinstance(applied, int) and not isinstance(applied, bool) and applied > 0
+    for item in admin.get("needs") or []:
+        if not isinstance(item, Mapping):
+            continue
+        turn = item.get("released_turn")
+        turn = item.get("followup_turn") if turn is None else turn
+        if isinstance(turn, int) and not isinstance(turn, bool):
+            # The shadow judge's probe is folded in one turn after the dig it read.
+            late = item.get("probe_source") == "judge" or judge_ran
+            release[str(item.get("topic"))] = turn - 1 if late else turn
+    offers: dict[str, set[int]] = {}
+    view_all = admin.get("disclosure") if isinstance(admin.get("disclosure"), Mapping) else {}
+    for topic, view in view_all.items():
+        if isinstance(view, Mapping) and isinstance(view.get("hint_turn"), int):
+            hint = view["hint_turn"]
+            offers[str(topic)] = {t for t in view.get("deep_offer_turns") or [] if isinstance(t, int) and t > hint}
+    return release, offers
+
+
+# D4-H-DIG1: an open invitation to say what is on her mind, whatever the topic.
+# Review NEW-REGEX-BREADTH (3): a question that names its topic ("what's worrying you about the
+# schedule?", "what's holding you back from the fees?") is about that topic, not an open invitation.
+_ON_A_TOPIC = r"(?!\s+(?:about|with|from|regarding|around|on|in|when it comes to)\b)"
+_OPEN_INVITE = re.compile(
+    r"\bwhat(?:(?:'|\u2019)?s| is) (?:on your mind|worrying you|bothering you|holding you back)\b" + _ON_A_TOPIC + "|"
+    r"\bgo ahead,? i(?:'|\u2019)?m listening\b|"
+    r"\btell me what(?:(?:'|\u2019)?s| is) (?:worrying you|bothering you|on your mind)\b" + _ON_A_TOPIC,
+    re.IGNORECASE,
+)
+
+
+def _invited_in_window(exchanges: Sequence[Mapping[str, Any]], index: int) -> bool:
+    """True when an advisor turn within the deep window before ``index`` invites her to say what is on
+    her mind (an open invitation, not a question about one topic)."""
+    for i in range(max(0, index - DEEP_WINDOW_TURNS), index + 1):
+        if _OPEN_INVITE.search(str(_advisor(exchanges[i]).get("text") or "")):
+            return True
+    return False
 
 
 def _asked_in_window(topic: str, exchanges: Sequence[Mapping[str, Any]], index: int) -> bool:
@@ -1313,6 +1408,26 @@ def latency_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def advisor_farewell_loop(exchanges: Sequence[Mapping[str, Any]]) -> int:
+    """D4-H-SIMLOOP1: the advisor's goodbyes after the first mutual goodbye (an advisor goodbye the
+    learner's reply returned).  0-1 when the call ends after a goodbye; many when nobody hangs up."""
+    from rehearsal.advisor import AdvisorTurn, ends_on_goodbye, is_sign_off
+
+    def bye(ex: Mapping[str, Any]) -> bool:
+        advisor = _advisor(ex)
+        r_sec = ex.get("r_sec")
+        return is_sign_off(
+            AdvisorTurn(str(advisor.get("text") or ""), str(advisor.get("intent") or "other")),
+            float(r_sec) if isinstance(r_sec, (int, float)) and not isinstance(r_sec, bool) else None,
+        )
+
+    first = next(
+        (i for i, ex in enumerate(exchanges) if bye(ex) and ends_on_goodbye((ex.get("learner") or {}).get("spoken"))),
+        None,
+    )
+    return 0 if first is None else sum(1 for ex in exchanges[first + 1 :] if bye(ex))
+
+
 # --------------------------------------------------------------------------------- the call
 def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     """All deterministic metrics of one rehearsal call (``record`` as ``call.run_call`` returns)."""
@@ -1334,7 +1449,9 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
         avoid_first_name=str(header.get("candidate_name") or ""),
     )
     out.update(disclosure_metrics(persona, exchanges))
-    out.update(engine_dig_metrics(admin, out["needs_dug"], out["needs_disclosed_after_dig"]))
+    out.update(
+        engine_dig_metrics(admin, out["needs_dug"], out["needs_disclosed_after_dig"], out.get("dig_exchanges"))
+    )
     out.update(commitment_metrics(exchanges, admin))
     out["abuse_hangups"] = int((admin.get("endings") or {}).get("abuse_hangups") or 0)
     out.update(misfire_metrics(exchanges))
@@ -1344,6 +1461,7 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     out.update(guard_metrics(admin, record.get("guard_trips") or [], exchanges))
     out.update(latency_metrics(exchanges))
     out["exchanges"] = len(exchanges)
+    out["advisor_farewell_loop"] = advisor_farewell_loop(exchanges)
     out["roleplay_seconds"] = record.get("roleplay_seconds")
     out["stop_reason"] = record.get("stop_reason")
     out["error"] = record.get("error")

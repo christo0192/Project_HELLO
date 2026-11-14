@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
-from rehearsal import HARNESS_VERSION, vloop
+from rehearsal import HARNESS_VERSION, flags, vloop
 from rehearsal.call import _plan_summary, _suppressed_why, git_sha
 from rehearsal.candidate import CandidateSim, ScenarioAdvisor, View, heard_since
 from rehearsal.llm import (
@@ -703,6 +703,9 @@ def _note_turn(
     record["exchanges"].append(
         {
             "n": sim.exchanges if exchange is None else exchange,
+            # The engine's own role-play turn after this line (the needs ledger counts these; the
+            # harness count drifts when the session splits or joins candidate turns).
+            "engine_turn": _engine_turn(interview),
             "r_sec": turn["r_sec"],
             "advisor": {
                 **action.advisor.as_dict(),
@@ -715,6 +718,12 @@ def _note_turn(
             "clock": {"s_sec": turn["s_sec"], "t_start": turn["t_start"]},
         }
     )
+
+
+def _engine_turn(interview: Any) -> int | None:
+    """The role-play engine's own turn counter (None before the engine exists); never builds one."""
+    turn = getattr(getattr(interview, "_engine", None), "turn", None)
+    return turn if isinstance(turn, int) and not isinstance(turn, bool) else None
 
 
 def _first(calls: list[dict[str, Any]], key: str) -> float | None:
@@ -804,6 +813,7 @@ def transcript_rows(rt: Runtime, writer: Any) -> list[dict[str, Any]]:
         pools.setdefault((span.speaker, normalize(span.text)), []).append(span)
     columns = getattr(writer, "columns", {})
     rows: list[dict[str, Any]] = []
+    span_rows: dict[int, int] = {}  # id(span) -> index in ``rows`` of the row it was matched to
     exchange = 0
     for saved in sorted(writer.saved, key=lambda item: item["index"]):
         speaker = saved["speaker"]
@@ -824,6 +834,8 @@ def transcript_rows(rt: Runtime, writer: Any) -> list[dict[str, Any]]:
         }
         pool = pools.get((speaker, normalize(saved["text"])))
         span = pool.pop(0) if pool else None
+        if span is not None:
+            span_rows[id(span)] = len(rows)
         voice = row["ai_voice"] or (None if span is None else span.voice)
         if speaker == "candidate":
             voice = "candidate"
@@ -848,8 +860,108 @@ def transcript_rows(rt: Runtime, writer: Any) -> list[dict[str, Any]]:
             )
         else:
             row.update({"t_start": extra.get("written_at"), "t_end": None, "s_sec": None, "r_sec": None})
+            if speaker == "candidate" and flags.on(flags.CONTINUED_ROWS):
+                if not _continued_row(row, rows, rt.spans, span_rows):
+                    continue  # all of it belonged to turns that already have their rows
         rows.append(row)
     return rows
+
+
+def _span_timing(span: Any) -> dict[str, Any]:
+    return {
+        "t_start": round(span.t_start, 2),
+        "t_end": None if span.t_end is None else round(span.t_end, 2),
+        "s_sec": round(span.s_sec, 1),
+        "r_sec": None if span.r_sec is None else round(span.r_sec, 1),
+        "act": span.act,
+        "intent": span.intent,
+        "source": span.source,
+    }
+
+
+def _pieces(words: list[str], spans: list[tuple[Any, list[str]]]) -> list[tuple[Any, int, int]]:
+    """The row's words as consecutive runs of the candidate's spoken turns: ``(span, start, end)``."""
+    def run(pos: int, said: list[str]) -> int:
+        best = 0
+        for offset in range(len(said)):
+            length = 0
+            while (
+                pos + length < len(words)
+                and offset + length < len(said)
+                and said[offset + length] == words[pos + length]
+            ):
+                length += 1
+            best = max(best, length)
+        return best
+
+    out: list[tuple[Any, int, int]] = []
+    pos, first = 0, 0
+    latest = len(spans) - 1
+    while pos < len(words):
+        # The spoken turn (from the last one used on) that carries the longest run from here; on a tie
+        # the LATEST one, since a fragment belongs to the turn in progress (review
+        # CONTINUED-ROWS-EARLIEST-SPAN: "Yes." went to the opening sound check).
+        scored = [(run(pos, said), index) for index, (_span, said) in enumerate(spans) if index >= first]
+        if not scored:
+            return []
+        best, index = max(scored)
+        if not best or (best < 3 and pos + best < len(words)):
+            return []
+        if best < 3 and index != latest:
+            return []  # one or two common words are no evidence for an older turn
+        out.append((spans[index][0], pos, pos + best))
+        pos, first = pos + best, index
+    return out
+
+
+def _cut(text: str, counts: list[int]) -> list[str]:
+    """``text`` cut into parts of ``counts`` normalized words each, keeping its own spelling."""
+    tokens = text.split()
+    parts: list[list[str]] = [[] for _ in counts]
+    index, seen = 0, 0
+    for token in tokens:
+        if index < len(counts) - 1 and seen >= counts[index]:
+            index, seen = index + 1, 0
+        parts[index].append(token)
+        seen += len(normalize(token).split())
+    return [" ".join(part) for part in parts]
+
+
+def _continued_row(
+    row: dict[str, Any], rows: list[dict[str, Any]], spans: list[Any], span_rows: dict[int, int]
+) -> bool:
+    """D4-H-REPLAY1: a candidate row the session saved without a span is a fragment of a longer spoken
+    turn (a ramble, or a turn's tail joined to the next one).  Each part of it that belongs to a turn
+    which already has its row is merged into that row (a tail said over the brief joins the icebreaker
+    answer); the rest keeps this row, with the timing of the spoken turn it came from (no "S -" row).
+    Returns False when nothing is left of this row.  A row that matches no spoken turn is left as is.
+    """
+    words = normalize(row.get("text")).split()
+    written = row.get("t_start")
+    said = [
+        (span, normalize(span.text).split())
+        for span in sorted(spans, key=lambda item: item.t_start)
+        if span.speaker == "candidate" and (not isinstance(written, (int, float)) or span.t_start <= written + 1.0)
+    ]
+    pieces = _pieces(words, said) if words else []
+    if not pieces:
+        return True
+    parts = _cut(str(row.get("text") or ""), [end - start for _span, start, end in pieces])
+    kept: list[tuple[Any, str]] = []
+    for (span, _start, _end), part in zip(pieces, parts):
+        owner = span_rows.get(id(span))
+        if owner is not None and part:
+            target = rows[owner]
+            target["text"] = f"{target['text']} {part}".strip()
+            target.setdefault("merged_turn_indexes", []).append(row["turn_index"])
+        elif part:
+            kept.append((span, part))
+    if not kept:
+        return False
+    row["text"] = " ".join(part for _span, part in kept)
+    row.update(_span_timing(kept[0][0]))
+    span_rows[id(kept[0][0])] = len(rows)
+    return True
 
 
 # ------------------------------------------------------------------------------ rendering

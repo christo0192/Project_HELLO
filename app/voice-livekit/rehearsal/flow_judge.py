@@ -18,6 +18,14 @@ with their turn numbers; a quote that is not in a bot line is rejected (``eviden
 counted.  ``worst_moments`` lists the worst bot turns (turn, speaker, why).  Parsing is strict and
 fail closed: a reply without all six scores is an error, never a guess.
 
+Diagnosis 4 (``REHEARSAL_FLOW_DESIGN_RULES``, default ON): the rubric carries the DESIGN RULES fixed by
+policy (the judge scores their wording and timing, never that they exist), the facts say who ended the
+role-play (farewell, the candidate's agreed or at-once end request, an agreed wrap-up, the time cap or a
+hang-up after abuse) and which
+graded families came before that, and evidence is asked only for the axes below 5.  With
+``REHEARSAL_FLOW_NA_AXES`` (default ON) a call with no learner line (no role-play) has learner_flow and
+objective_kept scored null: n/a, left out of the means, the minimums and the axis floor.
+
 Live only: ``ScriptedFlowJudge`` (offline) returns ``status: "n/a"``, since a scripted model's
 transcript says nothing about flow.  The gates (``FLOW_GATES``): naturalness mean >= 4.3,
 adaptability mean >= 4.3, objective_kept min >= 4, and no call below 3 on any axis.
@@ -28,7 +36,12 @@ import json
 import re
 from typing import Any, Mapping, Sequence
 
+from rehearsal import flags
+
 AXES = ("christy_flow", "learner_flow", "adaptability", "objective_kept", "repetition", "naturalness")
+# The axes a call with no role-play (no learner line) cannot be scored on (D4-H-SILENT1).
+NO_ROLEPLAY_AXES = ("learner_flow", "objective_kept")
+FAMILY_IDS = ("F1", "F2", "F3", "F4")
 FLOW_GATES = {
     "naturalness_mean": 4.3,
     "adaptability_mean": 4.3,
@@ -78,6 +91,42 @@ SCHEMA_TEXT = (
     '"repetition":3,"naturalness":3},"evidence":{"christy_flow":[{"turn":0,"quote":""}],'
     '"learner_flow":[],"adaptability":[],"objective_kept":[],"repetition":[],"naturalness":[]},'
     '"worst_moments":[{"turn":0,"speaker":"CHRISTY|LEARNER","why":""}]}'
+)
+# D4-H-POLICY1: the rules the product is built to follow are not the judge's to mark down.
+DESIGN_RULES = (
+    "DESIGN RULES (fixed by policy, so judge only their wording and timing, never that they exist):\n"
+    "- Christy never gives performance feedback or hiring details in the interview: she declines, and "
+    "the hiring team is named once.\n"
+    "- The brief must give the learner's name, city, the course, 'up to twenty minutes', the "
+    "preparation guide, the cue 'Let's pause the role-play here' and the instruction to say 'ready'.\n"
+    "- The role-play starts only on a spoken 'ready' or the button.\n"
+    "- When the candidate asks to end the role-play and agrees when asked, or the request itself names the "
+    "end, the role-play ends at once: that keeps the objective, and objections not reached because the "
+    "candidate ended are no failure.\n"
+    "- When Christy offers to wrap up and the candidate agrees, the role-play ends there: objections not "
+    "reached are no failure.\n"
+    "- After abuse from the candidate the learner hangs up: that keeps the objective, and objections not "
+    "reached are no failure.\n"
+    "- Christy steps out of the role-play with the cue phrase 'Let's pause the role-play here'.\n"
+)
+_EVIDENCE_V1 = (
+    "For every axis give up to 3 evidence items: the turn number and a quote of at most 12 words "
+    "copied exactly from a CHRISTY or LEARNER line (never a CANDIDATE line). "
+)
+_EVIDENCE_V2 = (
+    "Evidence only for deductions: for each axis below 5, quote the BOT line(s) that cost the point; "
+    "for a 5 give no evidence. Each item is the turn number and a quote of at most 12 words copied "
+    "exactly from a CHRISTY or LEARNER line (never a CANDIDATE line), at most 3 per axis. "
+)
+_SCORE_HEAD = "Score each axis from 1 (poor) to 5 (excellent):\n"
+assert _EVIDENCE_V1 in RUBRIC and _SCORE_HEAD in RUBRIC
+RUBRIC_V2 = RUBRIC.replace(_SCORE_HEAD, DESIGN_RULES + _SCORE_HEAD).replace(_EVIDENCE_V1, _EVIDENCE_V2)
+SCHEMA_TEXT_NA = SCHEMA_TEXT.replace('"learner_flow":3', '"learner_flow":null').replace(
+    '"objective_kept":3', '"objective_kept":null'
+)
+NO_ROLEPLAY_NOTE = (
+    "No role-play took place: score learner_flow and objective_kept as null (there is no learner line "
+    "to judge); score the other four axes as usual."
 )
 RETRY_NUDGE = (
     "Your last reply could not be read as one complete JSON object with all six scores. Reply again "
@@ -150,8 +199,9 @@ def facts_text(record: Mapping[str, Any]) -> str:
     consent = checks.get("end_consent") or {}
     requests = consent.get("requests") or []
     delivered = metrics.get("families_delivered")
+    label = "stop reason" if flags.on(flags.FLOW_DESIGN_RULES) else "role-play ended by"
     lines = [
-        f"Outcome: {record.get('outcome')}; role-play ended by: {record.get('stop_reason')} at R "
+        f"Outcome: {record.get('outcome')}; {label}: {record.get('stop_reason')} at R "
         f"{_clock(record.get('roleplay_seconds'))}; started by: {(record.get('phase_checks') or {}).get('start_by')}.",
         f"Graded objection families the learner delivered: {delivered if delivered is not None else 'unknown'}.",
         f"End requests: {len(requests)}"
@@ -168,13 +218,93 @@ def facts_text(record: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _requests(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    checks = (record.get("phase_checks") or {}).get("checks") or {}
+    return list((checks.get("end_consent") or {}).get("requests") or [])
+
+
+def _act_r(record: Mapping[str, Any], act: str) -> float | None:
+    """The R of the candidate's last turn with this act (from its turns, else from its rows)."""
+    found = None
+    for item in list(record.get("candidate_turns") or []) + [
+        row for row in record.get("rows") or [] if row.get("speaker") == "candidate"
+    ]:
+        value = item.get("r_sec")
+        if item.get("act") == act and isinstance(value, (int, float)) and not isinstance(value, bool):
+            found = float(value)
+    return found
+
+
+def ended_by(record: Mapping[str, Any]) -> str:
+    """Who ended the role-play, in words the judge reads (D4-H-POLICY1)."""
+    checks = (record.get("phase_checks") or {}).get("checks") or {}
+    abuse = checks.get("abuse") or {}
+    endings = ((record.get("session_facts") or {}).get("learner_endings") or {})
+    hung_up = endings.get("abuse_hangups") if isinstance(endings, Mapping) else None
+    stop = record.get("stop_reason")
+    # The product's own hang-up count is the truth; an exit within two learner lines of an insult is a
+    # hang-up only when nothing else ended the role-play (review FLOW-RULES-GAPS: "... you idiot, just
+    # end the interview" is an end request, and the time cap is the time cap).
+    near_insult = bool(abuse.get("exited_within_two_learner_lines")) and stop not in (
+        "end_request", "time_cap", "wrap_accepted"
+    )
+    if (isinstance(hung_up, int) and hung_up > 0) or near_insult:
+        at = abuse.get("r")
+        return "hang-up after abuse" + (f" at R {_clock(at)}" if isinstance(at, (int, float)) else "")
+    if stop == "end_request":
+        agreed = _act_r(record, "end_agree")
+        if agreed is not None:
+            return f"candidate end request, agreed at R {_clock(agreed)}"
+        at_once = next((item for item in _requests(record) if item.get("exited_at_once") and not item.get("asked")), None)
+        if at_once is not None:
+            why = {"names_the_end": " (the request named the end)", "asked_before": " (Christy had asked before)"}
+            return (
+                f"candidate end request at R {_clock(at_once.get('r'))}, ended at once"
+                + why.get(str(at_once.get("exit_basis")), "")
+            )
+        return f"candidate end request at R {_clock(_act_r(record, 'end_request'))}"
+    if stop == "wrap_accepted":
+        agreed = _act_r(record, "wrap_accept")
+        return "wrap-up offer, candidate agreed" + (f" at R {_clock(agreed)}" if agreed is not None else "")
+    return {
+        "farewell_exit": "farewell",
+        "time_cap": "time cap",
+        "no_roleplay": "no role-play",
+    }.get(str(stop), str(stop))
+
+
+def _families_line(record: Mapping[str, Any]) -> str:
+    delivered = (record.get("metrics") or {}).get("families_delivered")
+    if delivered is None:
+        return "Graded objection families delivered before the end: unknown."
+    missing = [family for family in FAMILY_IDS if family not in delivered]
+    return (
+        f"Graded objection families delivered before the end: {', '.join(delivered) or 'none'}; "
+        f"not reached: {', '.join(missing) or 'none'}."
+    )
+
+
+def na_axes(record: Mapping[str, Any]) -> tuple[str, ...]:
+    """The axes this call cannot be scored on: learner_flow and objective_kept with no learner line."""
+    if not flags.on(flags.FLOW_NA_AXES):
+        return ()
+    has_learner = any(str(row.get("voice") or "") == "learner" for row in record.get("rows") or [])
+    return () if has_learner else NO_ROLEPLAY_AXES
+
+
 def flow_messages(record: Mapping[str, Any]) -> list[dict[str, str]]:
     turns = judged_turns(record)
+    rules = flags.on(flags.FLOW_DESIGN_RULES)
+    facts = facts_text(record)
+    if rules:
+        facts += f"\nRole-play ended by: {ended_by(record)}.\n{_families_line(record)}"
+    na = na_axes(record)
+    note = f"{NO_ROLEPLAY_NOTE}\n\n" if na else ""
     user = (
-        f"CANDIDATE BEHAVIOUR:\n{behaviour_text(record)}\n\nCALL FACTS:\n{facts_text(record)}\n\n"
-        f"TRANSCRIPT:\n{transcript_for_flow(turns)}\n\nSCHEMA:\n{SCHEMA_TEXT}"
+        f"CANDIDATE BEHAVIOUR:\n{behaviour_text(record)}\n\nCALL FACTS:\n{facts}\n\n{note}"
+        f"TRANSCRIPT:\n{transcript_for_flow(turns)}\n\nSCHEMA:\n{SCHEMA_TEXT_NA if na else SCHEMA_TEXT}"
     )
-    return [{"role": "system", "content": RUBRIC}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": RUBRIC_V2 if rules else RUBRIC}, {"role": "user", "content": user}]
 
 
 # ------------------------------------------------------------------------------ the verdict
@@ -182,9 +312,10 @@ def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def parse_flow(raw: str) -> dict[str, Any]:
+def parse_flow(raw: str, na_axes: Sequence[str] = ()) -> dict[str, Any]:
     """The judge's JSON as ``{"scores", "evidence", "worst_moments"}``; ``{"error": ...}`` when it is
-    not one object with all six integer scores 1-5 (fail closed)."""
+    not one object with all six integer scores 1-5 (fail closed).  Only the axes in ``na_axes`` (a call
+    with no role-play) may be null instead."""
     text = (raw or "").strip()
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
@@ -196,12 +327,14 @@ def parse_flow(raw: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {"error": "not_object"}
     raw_scores = data.get("scores")
-    scores: dict[str, int] = {}
+    scores: dict[str, int | None] = {}
     if isinstance(raw_scores, dict):
         for axis in AXES:
             value = _int(raw_scores.get(axis))
             if value is not None and 1 <= value <= 5:
                 scores[axis] = value
+            elif axis in na_axes and axis in raw_scores and raw_scores.get(axis) is None:
+                scores[axis] = None
     if len(scores) != len(AXES):
         return {"error": "bad_scores"}
     evidence: dict[str, list[dict[str, Any]]] = {axis: [] for axis in AXES}
@@ -289,19 +422,21 @@ class FlowJudge:
 
     async def judge(self, record: Mapping[str, Any]) -> dict[str, Any]:
         messages = flow_messages(record)
+        na = na_axes(record)
+        nudge = RETRY_NUDGE + (f" Score {' and '.join(na)} as null." if na else "")
         verdict: dict[str, Any] = {"error": "no_json"}
         attempts = 0
         for attempt in range(2):
             attempts += 1
             completion = await self.client.complete(
-                messages if attempt == 0 else [*messages, {"role": "user", "content": RETRY_NUDGE}],
+                messages if attempt == 0 else [*messages, {"role": "user", "content": nudge}],
                 model=self.model,
                 temperature=0.0,
                 max_tokens=FLOW_MAX_TOKENS,
                 json_mode=True,
                 role="flow_judge",
             )
-            verdict = parse_flow(completion.text)
+            verdict = parse_flow(completion.text, na_axes=na)
             if verdict.get("error") not in RETRYABLE:
                 break
         verdict = validate_flow(verdict, record)
@@ -318,7 +453,7 @@ class ScriptedFlowJudge:
 
 
 # ------------------------------------------------------------------------------ the scorecard
-def flow_scores(record: Mapping[str, Any]) -> dict[str, int] | None:
+def flow_scores(record: Mapping[str, Any]) -> dict[str, int | None] | None:
     flow = record.get("flow") or {}
     return dict(flow["scores"]) if flow.get("status") == "ok" and flow.get("scores") else None
 
@@ -337,14 +472,17 @@ def flow_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if not scores and record.get("flow") and (record.get("flow") or {}).get("status") != "n/a"
     ]
     judge_off = sum(1 for record in records if not record.get("flow"))
-    means = {axis: (sum(s[axis] for _, s in scored) / len(scored)) if scored else None for axis in AXES}
-    mins = {axis: (min(s[axis] for _, s in scored)) if scored else None for axis in AXES}
+    # A null score (an axis n/a for that call, D4-H-SILENT1) stays out of the means, mins and floor.
+    values = {axis: [s[axis] for _, s in scored if s.get(axis) is not None] for axis in AXES}
+    means = {axis: (sum(values[axis]) / len(values[axis])) if values[axis] else None for axis in AXES}
+    mins = {axis: min(values[axis]) if values[axis] else None for axis in AXES}
     below = [
         {"call": str((record.get("header") or {}).get("seed")), "axis": axis, "score": scores[axis]}
         for record, scores in scored
         for axis in AXES
-        if scores[axis] < FLOW_GATES["axis_floor"]
+        if scores.get(axis) is not None and scores[axis] < FLOW_GATES["axis_floor"]
     ]
+    known = [value for axis in AXES for value in values[axis]]
 
     def gate(value: float | None, threshold: float) -> dict[str, Any]:
         return {"value": None if value is None else round(value, 2), "threshold": threshold,
@@ -355,9 +493,9 @@ def flow_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "adaptability_mean": gate(means["adaptability"], FLOW_GATES["adaptability_mean"]),
         "objective_kept_min": gate(mins["objective_kept"], FLOW_GATES["objective_kept_min"]),
         "axis_floor": {
-            "value": None if not scored else min(min(s.values()) for _, s in scored),
+            "value": min(known) if known else None,
             "threshold": FLOW_GATES["axis_floor"],
-            "ok": None if not scored else not below,
+            "ok": None if not known else not below,
             "below": below,
         },
     }
@@ -401,9 +539,9 @@ def render_flow_markdown(summary: Mapping[str, Any]) -> list[str]:
     head = "| call | scenario | " + " | ".join(AXES) + " |"
     lines += [head, "|" + "---|" * (len(AXES) + 2)]
     for item in summary["per_call"]:
-        lines.append(f"| {item['call']} | {item['scenario']} | " + " | ".join(str(item["scores"][a]) for a in AXES) + " |")
-    lines.append("| **mean** | | " + " | ".join(f"{summary['means'][a]:.2f}" for a in AXES) + " |")
-    lines.append("| **min** | | " + " | ".join(str(summary["mins"][a]) for a in AXES) + " |")
+        lines.append(f"| {item['call']} | {item['scenario']} | " + " | ".join(_cell(item["scores"].get(a)) for a in AXES) + " |")
+    lines.append("| **mean** | | " + " | ".join(_cell(summary["means"][a], "{:.2f}") for a in AXES) + " |")
+    lines.append("| **min** | | " + " | ".join(_cell(summary["mins"][a]) for a in AXES) + " |")
     lines += ["", "| gate | value | threshold | ok |", "|---|---|---|---|"]
     for name, item in summary["gates"].items():
         mark = {True: "PASS", False: "FAIL", None: "n/a"}[item["ok"]]
@@ -420,6 +558,10 @@ def render_flow_markdown(summary: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _cell(value: Any, form: str = "{}") -> str:
+    return "n/a" if value is None else form.format(value)
+
+
 def _clock(seconds: Any) -> str:
     if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
         return "-"
@@ -433,8 +575,10 @@ __all__ = [
     "FlowJudge",
     "ScriptedFlowJudge",
     "flow_messages",
+    "ended_by",
     "flow_summary",
     "judged_turns",
+    "na_axes",
     "parse_flow",
     "render_flow_markdown",
     "validate_flow",

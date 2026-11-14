@@ -21,12 +21,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from rehearsal import flags
 from rehearsal.advisor import (
     AdvisorTurn,
     LLMAdvisor,
     advisor_messages,
+    ends_on_goodbye,
+    is_sign_off,
     parse_advisor_output,
 )
+from rehearsal.full_metrics import SECOND_LAST_QUESTION
 from rehearsal.scenarios import (
     FALLBACK_THINKING_ANSWER,
     FREE,
@@ -39,10 +43,18 @@ from rehearsal.scenarios import (
 from rehearsal.sim import INTERVIEWER, LEARNER, Span
 
 THINK_PAUSE_SEC = 4.0
+# D4-H-REPLAY1: the longest silence after a replayed icebreaker backchannel before the answer it owes.
+BACKCHANNEL_GAP_SEC = 10.0
+ANSWER_ACTS = frozenset({"icebreaker_answer", "silence_answer"})
+# A repeat request that asks for an earlier question than the last ("that earlier question"), read
+# exactly as the icebreaker-repeat check reads it (review NEW-REGEX-BREADTH: "I didn't catch it
+# earlier" asks for the last question).
+_EARLIER = SECOND_LAST_QUESTION
 ROLEPLAY_PATIENCE_SEC = 2.0
 WAIT_STEP_SEC = 1.0
 MAX_EXTRA_READY = 3
 DEFAULT_END_DECLINE = Beat("end_decline", "No, sorry, let's carry on.")
+FAREWELL_END_AGREE = Beat("end_agree", "Yes, please end it here.")  # after the farewell loop went quiet
 WRAP_ACCEPT = Beat("wrap_accept", "Yes, let's wrap it up here.")
 WRAP_DECLINE = Beat("wrap_decline", "No, let's keep going.")
 # M032 S3.4 (the learner lane): after the learner hung up on abuse, Christy asks whether to pause
@@ -526,6 +538,14 @@ class CandidateSim:
         self._fresh: list[Span] = []
         self._advisor_done = False  # the advisor said goodbye or confirmed the next step
         self._learner_committed = False  # the learner committed aloud (a call, the link ...)
+        # D4-H-SIMLOOP1: mutual goodbyes in a row (the advisor's goodbye answered with one), and
+        # whether the advisor has gone quiet for good after two of them.
+        self._last_advisor: AdvisorTurn | None = None
+        self._last_advisor_r: float | None = None  # the role-play clock when it was said
+        self._goodbyes_in_a_row = 0
+        self._farewell_quiet = False
+        # D4-H-REPLAY1: Christy's icebreaker questions in order, and whether each got an answer.
+        self._ib_questions: list[bool] = []
         self.button_missing = False  # a press was due but the page did not show the button
         self._silence_pending = False
         self._silence_done = False
@@ -675,6 +695,10 @@ class CandidateSim:
         return beat.text
 
     def _end_answer(self) -> Beat:
+        if self._farewell_quiet:
+            # Review SIMLOOP-END-ANSWER: an advisor who said goodbye twice and went quiet has ended the
+            # call; asked whether to end it (L-ASIDE-END before R 14:00), it says yes.
+            return FAREWELL_END_AGREE
         if self._end_answers:
             return self._end_answers.pop(0)
         return DEFAULT_END_DECLINE
@@ -685,18 +709,32 @@ class CandidateSim:
         committed (never from the grader's hidden state)."""
         if (view.r_sec or 0.0) >= WRAP_ACCEPT_FROM_R_SEC:
             return True
-        return self._advisor_done or self._learner_committed
+        return self._advisor_done or self._learner_committed or self._farewell_quiet
 
     async def _icebreaker(self, view: View) -> Action:
+        fresh = sum(1 for span in self._fresh if span.voice != LEARNER and is_icebreaker_question(span.text))
+        self._ib_questions.extend([False] * fresh)
+        action = await self._icebreaker_turn(view, fresh)
+        if action.kind == "speak" and action.act in ANSWER_ACTS and self._ib_questions:
+            self._ib_questions[-1] = True
+        return action
+
+    async def _icebreaker_turn(self, view: View, fresh: int) -> Action:
         if not view.heard:
             if self.last_act == "hold_request" and view.waited >= THINK_PAUSE_SEC:
                 text = await self.talker.icebreaker_answer(thinking=True)
                 return self._spoken("icebreaker_answer", text, role="candidate")
-            return Action("wait")
+            # D4-H-REPLAY1: a replayed "thanks" said over Christy's question still owes the answer; a
+            # real candidate gives it after a breath, not after half a minute of silence.
+            owed = (
+                self.last_act == "backchannel"
+                and view.waited >= BACKCHANNEL_GAP_SEC
+                and flags.on(flags.BACKCHANNEL_GAP)
+            )
+            if not owed:
+                return Action("wait")
         christy = [span for span in view.heard if span.speaker == "bot" and span.voice != LEARNER]
-        self._questions_heard += sum(
-            1 for span in self._fresh if span.voice != LEARNER and is_icebreaker_question(span.text)
-        )
+        self._questions_heard += fresh
         if self._silence_pending:
             self._silence_pending = False
             return self._spoken("silence_answer", self.scenario.silence_answer, role="candidate")
@@ -735,6 +773,10 @@ class CandidateSim:
             return Action("press", why="after_brief")
         if not view.heard:
             return Action("wait")
+        while self._transition and self._answered_repeat(self._transition[0]):
+            # D4-H-REPLAY1: the real tester asked to hear a question again that this candidate has
+            # answered already; the replay goes on with its next line instead.
+            self._transition.pop(0)
         if self._transition:
             beat = self._transition.pop(0)
             if beat.act == "ready_button" and not self.button_missing:
@@ -755,6 +797,16 @@ class CandidateSim:
             return Action("silent", why="ready_not_taken")
         self.pressed = True
         return Action("press", why="ready_not_taken")
+
+    def _answered_repeat(self, beat: Beat) -> bool:
+        """A replayed repeat request whose question (the one before the last for "that earlier
+        question", else the last) this candidate already answered."""
+        if beat.act != "repeat_request" or not self._ib_questions or not flags.on(flags.REPEAT_IF_UNANSWERED):
+            return False
+        back = 2 if _EARLIER.search(f"{beat.intent} {beat.text}") else 1
+        if len(self._ib_questions) < back:
+            return False
+        return self._ib_questions[-back]
 
     async def _wrapup_action(self, view: View) -> Action:
         if not view.heard:
@@ -780,6 +832,21 @@ class CandidateSim:
     async def _advisor_action(self, view: View) -> Action:
         learner = view.learner()
         christy = view.christy()
+        if self._farewell_quiet:
+            return Action("silent", why="advisor_farewell_loop")
+        if self.advisor_started and flags.on(flags.ADVISOR_FAREWELL_LOOP):
+            # A real advisor hangs up (or goes quiet) after a goodbye or two: the loop of goodbyes the
+            # simulator would otherwise keep making is not the product's.
+            mutual = (
+                self._last_advisor is not None
+                and is_sign_off(self._last_advisor, self._last_advisor_r)
+                and bool(learner)
+                and ends_on_goodbye(learner[-1])
+            )
+            self._goodbyes_in_a_row = self._goodbyes_in_a_row + 1 if mutual else 0
+            if self._goodbyes_in_a_row >= 2:
+                self._farewell_quiet = True
+                return Action("silent", why="advisor_farewell_loop")
         if not self.advisor_started:
             self.advisor_started = True
             await self.advisor.start(" ".join(learner) or "Hello?")
@@ -794,6 +861,8 @@ class CandidateSim:
         turn.text = text
         if turn.intent in WRAP_READY_INTENTS:
             self._advisor_done = True
+        self._last_advisor = turn
+        self._last_advisor_r = view.r_sec
         if self.shadow is not None:
             self.shadow.set_turn(turn.as_dict())
         self.last_act = act

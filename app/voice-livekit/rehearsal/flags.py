@@ -25,6 +25,32 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
 * ``REHEARSAL_SAME_TURN_FRAGMENTS`` (integration, rambler): a candidate row the session saved with no
   span, written while the candidate's turn was still being said, is a fragment of that turn, not the
   candidate's next turn, when a check looks for the bot's reply to it.
+* ``REHEARSAL_FLOW_DESIGN_RULES`` (diagnosis-4 D4-H-POLICY1): the flow judge's rubric states the fixed
+  design rules (judge their wording and timing, never that they exist), its facts say who ended the
+  role-play and which graded families came before that, and evidence is asked only for lost points.
+* ``REHEARSAL_FLOW_NA_AXES`` (D4-H-SILENT1): a call with no learner line (no role-play) scores
+  learner_flow and objective_kept as null, and nulls stay out of the means, minimums and floor.
+* ``REHEARSAL_ADVISOR_FAREWELL_LOOP`` (D4-H-SIMLOOP1): after two exchanges in a row in which the
+  simulated advisor said goodbye and the learner's reply ended on a goodbye too, the advisor goes quiet
+  for the rest of the role-play (the runner waits for the session's exit or the time cap).  A goodbye
+  is read on the last sentence, never a question; an advisor sign-off counts when it is tagged
+  ``farewell``, or confirms a callback, or comes from R 14:00.  Once quiet, the candidate agrees when
+  Christy asks to end the interview or to wrap up.
+* ``REHEARSAL_DIG_RELEASED`` (D4-H-DIG1): a harness dig is engine-confirmed only when the gate released
+  that need at that exchange (its release turn, the judge's one turn later, or a deep offer after the
+  hint); the digs it did not honour are listed as ``probe_unreleased``.  The judge's one-turn slack
+  holds whenever a judge verdict was applied in the call, and the dig turns are the engine's own.
+* ``REHEARSAL_OPEN_INVITE`` (D4-H-DIG1): a deep reveal that answers an open invitation ("what's on your
+  mind?", "go ahead, I'm listening") is prompted, not an unprompted dump.
+* ``REHEARSAL_REPEAT_IF_UNANSWERED`` (D4-H-REPLAY1): a replayed request in the transition to hear an
+  icebreaker question again is said only when the question it asks for (the one before the last for
+  "that earlier question", else the last) went unanswered; otherwise the next replayed line is said.
+* ``REHEARSAL_CONTINUED_ROWS`` (D4-H-REPLAY1): a candidate row the session saved without a span (a
+  fragment of a longer spoken turn) carries the timing of the spoken turn it belongs to, and a part of
+  a turn spoken over the brief is merged into the row of that turn.  A fragment goes to the latest
+  matching turn, and a run of one or two words only to the turn in progress.
+* ``REHEARSAL_BACKCHANNEL_GAP`` (D4-H-REPLAY1): after a replayed icebreaker backchannel ("thanks") the
+  candidate answers the question it still owes after at most 10 s of silence.
 """
 from __future__ import annotations
 
@@ -39,6 +65,14 @@ PROBE_VOCAB_V2 = "REHEARSAL_PROBE_VOCAB_V2"
 SAME_TURN_FRAGMENTS = "REHEARSAL_SAME_TURN_FRAGMENTS"
 CITED_MISFIRES = "REHEARSAL_CITED_MISFIRES"
 IB_REPEAT_INSISTED = "REHEARSAL_IB_REPEAT_INSISTED"
+FLOW_DESIGN_RULES = "REHEARSAL_FLOW_DESIGN_RULES"
+FLOW_NA_AXES = "REHEARSAL_FLOW_NA_AXES"
+ADVISOR_FAREWELL_LOOP = "REHEARSAL_ADVISOR_FAREWELL_LOOP"
+DIG_RELEASED = "REHEARSAL_DIG_RELEASED"
+OPEN_INVITE = "REHEARSAL_OPEN_INVITE"
+REPEAT_IF_UNANSWERED = "REHEARSAL_REPEAT_IF_UNANSWERED"
+CONTINUED_ROWS = "REHEARSAL_CONTINUED_ROWS"
+BACKCHANNEL_GAP = "REHEARSAL_BACKCHANNEL_GAP"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -49,12 +83,20 @@ def on(name: str) -> bool:
 
 
 __all__ = [
+    "ADVISOR_FAREWELL_LOOP",
+    "BACKCHANNEL_GAP",
     "CITED_MISFIRES",
     "COMMIT_WINDOW",
+    "CONTINUED_ROWS",
+    "DIG_RELEASED",
+    "FLOW_DESIGN_RULES",
+    "FLOW_NA_AXES",
     "IB_REPEAT_INSISTED",
     "KEEP_CONTROL_ACTS",
     "LEARNER_CLOCK",
+    "OPEN_INVITE",
     "PROBE_VOCAB_V2",
+    "REPEAT_IF_UNANSWERED",
     "SAME_TURN_FRAGMENTS",
     "SPOKEN_LEAKS",
     "TRANSITION_ACTS_V2",

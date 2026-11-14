@@ -748,5 +748,229 @@ class FlowSweepTests(unittest.TestCase):
         self.assertIn(codes["good"][0], (EXIT_OK, EXIT_STRICT))  # strict may still fail a per-phase check
 
 
+
+# ---------------------------------------------------------------------------- diagnosis 4 (judge)
+def _flow_switch(name: str, value: str):
+    import os
+    from unittest import mock
+
+    return mock.patch.dict(os.environ, {name: value})
+
+
+# A synthetic call shaped like manual-M06: the candidate asked to end at R 3:48, Christy asked, the
+# candidate agreed and the role-play ended at once with one graded family delivered.
+EARLY_END_ROWS = [
+    {"speaker": "bot", "voice": "christy", "phase": "transition", "text": "Say ready when you are.", "t_start": 1.0, "s_sec": 1.0},
+    {"speaker": "candidate", "voice": "candidate", "phase": "transition", "text": "Ready.", "t_start": 3.0, "act": "ready"},
+    {"speaker": "bot", "voice": "learner", "phase": "roleplay", "text": "Hello? Yes, this is Meera.", "t_start": 5.0, "s_sec": 5.0, "r_sec": 0.0},
+    {"speaker": "candidate", "voice": "candidate", "phase": "roleplay", "text": "You can end the call.", "t_start": 233.0, "r_sec": 228.4, "act": "end_request"},
+    {"speaker": "bot", "voice": "christy", "phase": "roleplay", "text": "Would you like to stop the role-play here?", "t_start": 236.0, "s_sec": 236.0, "r_sec": 231.0},
+    {"speaker": "candidate", "voice": "candidate", "phase": "roleplay", "text": "Yes, please end it here.", "t_start": 243.0, "r_sec": 238.7, "act": "end_agree"},
+    {"speaker": "bot", "voice": "christy", "phase": "roleplay_exit", "text": "Let's pause the role-play here.", "t_start": 246.0, "s_sec": 246.0},
+]
+
+
+def _early_end_record() -> dict:
+    record = _record(EARLY_END_ROWS)
+    record.update(
+        stop_reason="end_request",
+        roleplay_seconds=241.8,
+        candidate_turns=[{"act": "ready"}, {"act": "end_request", "r_sec": 228.4}, {"act": "end_agree", "r_sec": 238.7}],
+        metrics={"families_delivered": ["F1"]},
+        phase_checks={
+            "start_by": "spoken",
+            "failed": [],
+            "checks": {
+                "end_consent": {"ok": True, "requests": [
+                    {"r": 228.4, "asked": True, "exited_at_once": False, "answer": "end_agree", "exited": True}
+                ]},
+                "abuse": {"ok": None},
+            },
+        },
+    )
+    return record
+
+
+class FlowDesignRulesTests(unittest.TestCase):
+    """D4-H-POLICY1: the judge is told the fixed design rules, who ended the role-play and how, and asked
+    for evidence only where a point was lost."""
+
+    def _messages(self, record: dict) -> tuple[str, str]:
+        from rehearsal.flow_judge import flow_messages
+
+        messages = flow_messages(record)
+        return messages[0]["content"], messages[1]["content"]
+
+    def test_the_rubric_states_the_design_rules_and_asks_evidence_only_for_deductions(self) -> None:
+        system, _user = self._messages(_early_end_record())
+        self.assertIn("DESIGN RULES", system)
+        self.assertIn("judge only their wording and timing, never that they exist", system)
+        self.assertIn("never gives performance feedback or hiring details", system)
+        self.assertIn("'up to twenty minutes'", system)
+        self.assertIn("Let's pause the role-play here", system)
+        self.assertIn("say 'ready'", system)
+        self.assertIn("the role-play ends at once: that keeps the objective", system)
+        self.assertIn("objections not reached because the candidate ended are no failure", system)
+        self.assertIn("for each axis below 5, quote the BOT line(s) that cost the point; for a 5 give no evidence", system)
+        self.assertNotIn("For every axis give up to 3 evidence items", system)
+
+    def test_the_facts_say_who_ended_the_role_play_and_what_was_delivered_before(self) -> None:
+        _system, user = self._messages(_early_end_record())
+        self.assertIn("Role-play ended by: candidate end request, agreed at R 03:58", user)
+        self.assertIn("Graded objection families delivered before the end: F1; not reached: F2, F3, F4", user)
+        self.assertIn("stop reason: end_request", user)
+        self.assertNotIn("role-play ended by: end_request", user)
+
+    def test_each_way_the_role_play_ends(self) -> None:
+        from rehearsal.flow_judge import ended_by
+
+        record = _early_end_record()
+        self.assertEqual(ended_by(record), "candidate end request, agreed at R 03:58")
+        for stop, said in (("farewell_exit", "farewell"), ("wrap_accepted", "wrap-up offer, candidate agreed"),
+                           ("time_cap", "time cap"), ("no_roleplay", "no role-play")):
+            self.assertEqual(ended_by({**record, "stop_reason": stop}), said, stop)
+        # An at-once exit on a request that names the end (no question asked first).
+        at_once = json.loads(json.dumps(record))
+        at_once["phase_checks"]["checks"]["end_consent"]["requests"] = [
+            {"r": 228.4, "asked": False, "exited_at_once": True, "exit_basis": "names_the_end"}
+        ]
+        at_once["candidate_turns"] = [{"act": "end_request", "r_sec": 228.4}]
+        at_once["rows"] = [row for row in at_once["rows"] if row.get("act") != "end_agree"]
+        self.assertEqual(ended_by(at_once), "candidate end request at R 03:48, ended at once (the request named the end)")
+        abuse = json.loads(json.dumps(record))
+        abuse["phase_checks"]["checks"]["abuse"] = {"ok": True, "exited_within_two_learner_lines": True}
+        abuse["stop_reason"] = "farewell_exit"
+        self.assertEqual(ended_by(abuse), "hang-up after abuse")
+        abuse["phase_checks"]["checks"]["abuse"] = {"ok": True, "exited_within_two_learner_lines": False, "r": 383.6}
+        abuse["session_facts"] = {"learner_endings": {"abuse_hangups": 1}}
+        self.assertEqual(ended_by(abuse), "hang-up after abuse at R 06:23")
+
+    def test_every_policy_ending_has_its_design_rule(self) -> None:
+        # Review FLOW-RULES-GAPS: an at-once end request, an agreed wrap-up and a hang-up after abuse are
+        # policy endings too; graded objections they leave unreached are no failure.
+        system, _user = self._messages(_early_end_record())
+        self.assertIn("or the request itself names the end", system)
+        self.assertIn("When Christy offers to wrap up and the candidate agrees, the role-play ends there", system)
+        self.assertIn("After abuse from the candidate the learner hangs up", system)
+        self.assertEqual(system.count("are no failure"), 3)
+
+    def test_the_wrap_ending_names_the_candidates_agreement(self) -> None:
+        from rehearsal.flow_judge import ended_by
+
+        record = json.loads(json.dumps(_early_end_record()))
+        record["stop_reason"] = "wrap_accepted"
+        record["candidate_turns"] = [{"act": "wrap_accept", "r_sec": 845.0}]
+        self.assertEqual(ended_by(record), "wrap-up offer, candidate agreed at R 14:05")
+
+    def test_an_end_request_after_an_insult_is_an_end_request(self) -> None:
+        # "... you idiot, just end the interview." ends at once: the exit two lines after the insult is
+        # the request's, not an abuse hang-up (the product's own hang-up count still wins).
+        from rehearsal.flow_judge import ended_by
+
+        record = json.loads(json.dumps(_early_end_record()))
+        record["phase_checks"]["checks"]["abuse"] = {"ok": True, "exited_within_two_learner_lines": True, "r": 228.4}
+        self.assertEqual(ended_by(record), "candidate end request, agreed at R 03:58")
+        record["stop_reason"] = "time_cap"
+        self.assertEqual(ended_by(record), "time cap")
+        record["session_facts"] = {"learner_endings": {"abuse_hangups": 1}}
+        self.assertEqual(ended_by(record), "hang-up after abuse at R 03:48")
+
+    def test_off_sends_the_previous_rubric_and_facts(self) -> None:
+        from rehearsal.flags import FLOW_DESIGN_RULES
+        from rehearsal.flow_judge import RUBRIC
+
+        with _flow_switch(FLOW_DESIGN_RULES, "0"):
+            system, user = self._messages(_early_end_record())
+        self.assertEqual(system, RUBRIC)
+        self.assertNotIn("Role-play ended by:", user)
+        self.assertIn("role-play ended by: end_request", user)
+
+
+SILENT_ROWS = [
+    {"speaker": "bot", "voice": "christy", "phase": "opening", "text": "Hi, can you hear me?", "t_start": 1.0, "s_sec": 1.0},
+    {"speaker": "bot", "voice": "christy", "phase": "opening", "text": "I can't hear you yet. Please check your microphone.", "t_start": 20.0, "s_sec": 20.0},
+    {"speaker": "bot", "voice": "christy", "phase": "closing", "text": "I'll end the call here. Please rejoin from your link.", "t_start": 53.0, "s_sec": 53.0},
+]
+
+
+def _silent_record(**extra) -> dict:
+    record = _record(SILENT_ROWS, **extra)
+    record.update(stop_reason="no_roleplay", roleplay_seconds=None, candidate_turns=[], metrics={})
+    return record
+
+
+def _na_verdict(**scores) -> str:
+    base = {"christy_flow": 4, "learner_flow": None, "adaptability": 4, "objective_kept": None,
+            "repetition": 5, "naturalness": 5}
+    base.update(scores)
+    return json.dumps({"scores": base, "evidence": {"christy_flow": [{"turn": 2, "quote": "check your microphone"}]},
+                       "worst_moments": []})
+
+
+class FlowNoRoleplayTests(unittest.TestCase):
+    """D4-H-SILENT1: a call with no role-play scores learner_flow and objective_kept as null (n/a)."""
+
+    def test_the_judge_is_told_no_role_play_took_place(self) -> None:
+        from rehearsal.flow_judge import flow_messages, na_axes
+
+        record = _silent_record()
+        self.assertEqual(na_axes(record), ("learner_flow", "objective_kept"))
+        self.assertEqual(na_axes(_record(ROWS)), ())
+        user = flow_messages(record)[1]["content"]
+        self.assertIn("No role-play took place: score learner_flow and objective_kept as null", user)
+        self.assertIn('"learner_flow":null', user)
+        self.assertNotIn("No role-play took place", flow_messages(_record(ROWS))[1]["content"])
+
+    def test_a_null_parses_only_for_the_declared_axes(self) -> None:
+        from rehearsal.flow_judge import parse_flow
+
+        good = parse_flow(_na_verdict(), na_axes=("learner_flow", "objective_kept"))
+        self.assertNotIn("error", good)
+        self.assertIsNone(good["scores"]["learner_flow"])
+        self.assertIsNone(good["scores"]["objective_kept"])
+        # A record with role-play rows declares nothing n/a: a null still fails closed.
+        self.assertEqual(parse_flow(_na_verdict())["error"], "bad_scores")
+        # A null on an axis that is not n/a fails closed too.
+        self.assertEqual(parse_flow(_na_verdict(naturalness=None), na_axes=("learner_flow", "objective_kept"))["error"], "bad_scores")
+        # Scoring an n/a axis anyway is accepted as a number.
+        self.assertEqual(parse_flow(_na_verdict(learner_flow=3), na_axes=("learner_flow", "objective_kept"))["scores"]["learner_flow"], 3)
+
+    def test_the_live_judge_passes_the_silent_record(self) -> None:
+        from rehearsal.flow_judge import FlowJudge
+
+        result = asyncio.run(FlowJudge(_FakeClient([_na_verdict()]), "m").judge(_silent_record()))
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNone(result["scores"]["learner_flow"])
+        broken = asyncio.run(FlowJudge(_FakeClient([_na_verdict(), _na_verdict()]), "m").judge(_record(ROWS)))
+        self.assertEqual((broken["status"], broken["error"]), ("error", "bad_scores"))
+
+    def test_nulls_stay_out_of_the_means_mins_and_the_axis_floor(self) -> None:
+        from rehearsal.flow_judge import flow_summary, parse_flow, render_flow_markdown, validate_flow
+
+        silent = _silent_record(seed="silent")
+        verdict = validate_flow(parse_flow(_na_verdict(), na_axes=("learner_flow", "objective_kept")), silent)
+        silent["flow"] = {"source": "llm", "status": "ok", **verdict}
+        judged = FlowGateTests._judged("a", naturalness=5, adaptability=5, learner_flow=5, objective_kept=4)
+        summary = flow_summary([silent, judged])
+        self.assertEqual(summary["judged"], 2)
+        self.assertEqual(summary["means"]["learner_flow"], 5.0)
+        self.assertEqual(summary["mins"]["objective_kept"], 4)
+        self.assertEqual(summary["gates"]["axis_floor"]["below"], [])
+        self.assertEqual(summary["gates_failed"], [])
+        only = flow_summary([silent])
+        self.assertIsNone(only["means"]["learner_flow"])
+        self.assertIsNone(only["gates"]["objective_kept_min"]["ok"])
+        table = "\n".join(render_flow_markdown(summary))
+        self.assertIn("| silent | tangent | 4 | n/a | 4 | n/a | 5 | 5 |", table)
+
+    def test_off_keeps_six_scores_required(self) -> None:
+        from rehearsal.flags import FLOW_NA_AXES
+        from rehearsal.flow_judge import flow_messages, na_axes
+
+        with _flow_switch(FLOW_NA_AXES, "0"):
+            self.assertEqual(na_axes(_silent_record()), ())
+            self.assertNotIn("No role-play took place", flow_messages(_silent_record())[1]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()
