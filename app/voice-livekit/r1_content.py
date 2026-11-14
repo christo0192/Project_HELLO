@@ -212,13 +212,16 @@ import r1_world
 #    R1_TRANSITION_ANSWERS (D4-TRANS-Q1): the role-play field answers L-RP-*, "Fair enough."
 #    (r1_script.TRANSITION_QUIET_FALLBACK) and the transition note without a phrase to copy
 #    (r1_prompts.TRANSITION_REMINDER_ANSWERS).  R1_SIL_IB_RESTATE (D4-SIL-IB1): L-SIL-IB-I1..I4.
-#    R1_IB_QUIET_NUDGE (D4-IB-QUIET-NUDGE): "So, {question}" and its 10 s window.  R1_IB_SKIP_V2
+#    R1_IB_QUIET_NUDGE (D4-IB-QUIET-NUDGE): "So, {question}" and its 7 s window.  R1_IB_SKIP_V2
 #    (D4-ICE-SKIP1): the skip and follow-up notes and the cap after two skips.
 #    R1_REACTION_VARIETY_V2 (D4-ICE-ECHO1): the voice text's, the rider's and the plan notes' react
 #    clause (and the prefix with it).  R1_ICEBREAKER_REPAIR (D4-ICE-HOLD1): the plan note's
 #    "never refuse a pause" line.  Every text of revision 30 is unchanged and pinned beside the new
 #    ones (each flag off speaks it).
-CONTENT_REVISION = 31
+# 32: integration 7 offline sweep (dead_air): the quiet-nudge window is 7 s, not 10 s
+#    (r1_icebreaker.IB_QUIET_NUDGE_SECONDS), so a lone "Thank you." after her question is never
+#    followed by more than the harness's 8 s of dead air.  No spoken text changed.
+CONTENT_REVISION = 32
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:

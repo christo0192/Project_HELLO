@@ -167,7 +167,7 @@ import r1_world
 # (R1_TRANSITION_ANSWERS), the silence restates (R1_SIL_IB_RESTATE), the quiet nudge
 # (R1_IB_QUIET_NUDGE), the skip notes (R1_IB_SKIP_V2), the react clause v2 (R1_REACTION_VARIETY_V2)
 # and the plan note's pause line (R1_ICEBREAKER_REPAIR).
-PINNED_CONTENT_SHA256 = "9039b20b218e7facca3c559e4951c9d916d892501a3fedd578c0fdf018b7fc50"
+PINNED_CONTENT_SHA256 = "f57f54d4ace131567ed173f2bc5b53b033249472422b2a0b91c140788f72b1ff"
 
 CONTENT_MODULES = (
     "r1_text",
