@@ -502,6 +502,12 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             if any(m.get("engine_only_digs") is not None for m in calls)
             else None
         ),
+        # D4-H-DIG1: harness digs the gate did not release at that exchange (a product signal).
+        "probe_unreleased_total": (
+            sum(len(m.get("probe_unreleased") or []) for m in calls)
+            if any(m.get("probe_unreleased") is not None for m in calls)
+            else None
+        ),
         "unprompted_dump_call_rate": _rate(
             sum(1 for m in calls if (m.get("unprompted_dump_count") or 0) >= 1), n
         ),
@@ -718,6 +724,7 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("need disclosed, engine-confirmed digs", "disclosure_rate_engine_confirmed"),
         ("harness-only digs (engine saw no follow-up)", "harness_only_digs_total"),
         ("engine-only digs (harness counted none)", "engine_only_digs_total"),
+        ("digs the gate did not release at that exchange", "probe_unreleased_total"),
         ("calls with an unprompted dump", "unprompted_dump_call_rate"),
         ("MEDIUM or better (calls with a commitment window)", "medium_or_better_rate"),
         ("calls with no commitment window (excluded)", "commitment_excluded"),

@@ -3252,5 +3252,78 @@ class DiagnosisTwoFollowUpTests(unittest.TestCase):
         self.assertIn("guard_flagged", metrics.hard_fails(found))
 
 
+
+class DiagnosisFourDigTests(unittest.TestCase):
+    """D4-H-DIG1: a dig is engine-confirmed only when the gate released that need at that exchange, and
+    an open invitation to say what is on her mind excuses the reveal that answers it.  Synthetic text."""
+
+    PERSONA = resolve_persona("p1_career_switcher", variant="v1")
+    DEEP = "My plant is being consolidated next year, so I worry."
+
+    @staticmethod
+    def _admin(released: int | None, *, source: str = "rule", hint: int | None = 14, offers=()) -> dict:
+        return {
+            "needs": [
+                {"topic": "H1", "followup_turn": None, "released_turn": None, "probe_source": None},
+                {"topic": "H3", "followup_turn": released, "released_turn": released, "probe_source": source},
+            ],
+            "disclosure": {"H3": {"hint_turn": hint, "deep_offer_turns": list(offers)}},
+        }
+
+    def test_a_dig_the_gate_released_elsewhere_is_not_confirmed(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(33), ["H3"], [], {"H3": [25, 26]})
+        self.assertEqual(found["needs_dug_confirmed"], [])
+        self.assertEqual(found["probe_unreleased"], [{"topic": "H3", "exchanges": [25, 26]}])
+        self.assertEqual(found["needs_dug_engine"], ["H3"])  # the ledger view is unchanged
+
+    def test_a_release_at_the_dig_confirms_it(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(26), ["H3"], ["H3"], {"H3": [25, 26]})
+        self.assertEqual((found["needs_dug_confirmed"], found["needs_disclosed_confirmed"]), (["H3"], ["H3"]))
+        self.assertEqual(found["probe_unreleased"], [])
+
+    def test_a_need_already_released_before_the_dig_is_confirmed(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(12), ["H3"], [], {"H3": [13]})
+        self.assertEqual((found["needs_dug_confirmed"], found["probe_unreleased"]), (["H3"], []))
+
+    def test_the_judge_folds_a_probe_in_one_turn_late(self) -> None:
+        self.assertEqual(metrics.engine_dig_metrics(self._admin(27, source="judge"), ["H3"], [], {"H3": [26]})["needs_dug_confirmed"], ["H3"])
+        self.assertEqual(metrics.engine_dig_metrics(self._admin(27), ["H3"], [], {"H3": [26]})["needs_dug_confirmed"], [])
+
+    def test_a_hint_followed_by_a_deep_offer_at_the_dig_confirms_it(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(33, offers=[25]), ["H3"], [], {"H3": [25]})
+        self.assertEqual(found["needs_dug_confirmed"], ["H3"])
+        no_hint = metrics.engine_dig_metrics(self._admin(33, hint=None, offers=[25]), ["H3"], [], {"H3": [25]})
+        self.assertEqual(no_hint["needs_dug_confirmed"], [])
+
+    def test_the_disclosure_metrics_give_the_dig_exchanges(self) -> None:
+        exchanges = [
+            tic_exchange(1, "What made you look into this now?", "Things feel uncertain.", intent="probe", topic="H1"),
+            tic_exchange(2, "Tell me more about that?", "Well.", intent="followup", topic="H1"),
+        ]
+        self.assertEqual(metrics.disclosure_metrics(self.PERSONA, exchanges)["dig_exchanges"], {"H1": [2]})
+
+    def test_off_keeps_the_topic_level_count(self) -> None:
+        with _env(REHEARSAL_DIG_RELEASED="0"):
+            found = metrics.engine_dig_metrics(self._admin(33), ["H3"], [], {"H3": [25, 26]})
+        self.assertEqual(found["needs_dug_confirmed"], ["H3"])
+        self.assertNotIn("probe_unreleased", found)
+
+    def test_an_open_invitation_excuses_the_reveal(self) -> None:
+        for text in (
+            "I appreciate you being upfront, please go ahead, what's on your mind?",
+            "Go ahead, I'm listening.",
+            "Tell me what's worrying you.",
+        ):
+            with self.subTest(text=text):
+                found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, text, self.DEEP, intent="followup", topic="F4")])
+                self.assertEqual((found["unprompted_dump_count"], found["unprompted_dump_excused"]), (0, 1))
+        with _env(REHEARSAL_OPEN_INVITE="0"):
+            found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "Go ahead, I'm listening.", self.DEEP)])
+        self.assertEqual(found["unprompted_dump_count"], 1)
+        # A statement with no invitation still counts as a dump.
+        found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "The program runs six months.", self.DEEP)])
+        self.assertEqual(found["unprompted_dump_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

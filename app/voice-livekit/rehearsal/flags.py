@@ -33,6 +33,11 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
 * ``REHEARSAL_ADVISOR_FAREWELL_LOOP`` (D4-H-SIMLOOP1): after two exchanges in a row in which the
   simulated advisor said goodbye and the learner's reply ended on a goodbye too, the advisor goes quiet
   for the rest of the role-play (the runner waits for the session's exit or the time cap).
+* ``REHEARSAL_DIG_RELEASED`` (D4-H-DIG1): a harness dig is engine-confirmed only when the gate released
+  that need at that exchange (its release turn, the judge's one turn later, or a deep offer after the
+  hint); the digs it did not honour are listed as ``probe_unreleased``.
+* ``REHEARSAL_OPEN_INVITE`` (D4-H-DIG1): a deep reveal that answers an open invitation ("what's on your
+  mind?", "go ahead, I'm listening") is prompted, not an unprompted dump.
 """
 from __future__ import annotations
 
@@ -50,6 +55,8 @@ IB_REPEAT_INSISTED = "REHEARSAL_IB_REPEAT_INSISTED"
 FLOW_DESIGN_RULES = "REHEARSAL_FLOW_DESIGN_RULES"
 FLOW_NA_AXES = "REHEARSAL_FLOW_NA_AXES"
 ADVISOR_FAREWELL_LOOP = "REHEARSAL_ADVISOR_FAREWELL_LOOP"
+DIG_RELEASED = "REHEARSAL_DIG_RELEASED"
+OPEN_INVITE = "REHEARSAL_OPEN_INVITE"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -63,11 +70,13 @@ __all__ = [
     "ADVISOR_FAREWELL_LOOP",
     "CITED_MISFIRES",
     "COMMIT_WINDOW",
+    "DIG_RELEASED",
     "FLOW_DESIGN_RULES",
     "FLOW_NA_AXES",
     "IB_REPEAT_INSISTED",
     "KEEP_CONTROL_ACTS",
     "LEARNER_CLOCK",
+    "OPEN_INVITE",
     "PROBE_VOCAB_V2",
     "SAME_TURN_FRAGMENTS",
     "SPOKEN_LEAKS",
