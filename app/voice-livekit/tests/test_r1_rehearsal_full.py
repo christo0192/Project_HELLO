@@ -955,6 +955,120 @@ class AdvisorFarewellLoopTests(unittest.TestCase):
         self.assertIn("| loop-1 | terse-nervous | complete | time_cap | spoken | - | - | 2 | - |", markdown)
 
 
+
+class ReplayContextTests(unittest.TestCase):
+    """D4-H-REPLAY1: replayed lines fit the conversation they land in (synthetic text)."""
+
+    Q1 = "What does a normal working day look like for you?"
+    Q2 = "How did you keep track of your follow-ups?"
+
+    def _sim(self, transition):
+        import dataclasses
+
+        sim = _sim()
+        sim.scenario = dataclasses.replace(sim.scenario, transition=tuple(transition))
+        sim._transition = list(transition)
+        return sim
+
+    def _icebreaker(self, sim, question: str, at: float, *, answer: bool = True):
+        action = asyncio.run(sim.next_action(_view("icebreaker", [_span("bot", "interviewer", question, at, at + 3.0)])))
+        if not answer:
+            return action
+        self.assertEqual(action.kind, "speak")
+        return action
+
+    def _transition(self, sim, at: float):
+        return asyncio.run(sim.next_action(_view("transition", [_span("bot", "interviewer", "Say ready when you are.", at, at + 3.0)])))
+
+    def test_a_repeat_request_for_an_answered_question_gives_way_to_the_next_line(self) -> None:
+        from rehearsal.scenarios import Beat
+
+        sim = self._sim([Beat("repeat_request", "No, return to that earlier question and repeat it."), Beat("ready", "Ready.")])
+        self._icebreaker(sim, self.Q1, 10.0)
+        self._icebreaker(sim, self.Q2, 30.0)
+        action = self._transition(sim, 60.0)
+        self.assertEqual((action.act, action.text), ("ready", "Ready."))
+
+    def test_a_repeat_request_for_an_unanswered_question_is_still_said(self) -> None:
+        from rehearsal.scenarios import Beat
+
+        sim = self._sim([Beat("repeat_request", "Can you go back to the question before the last one?"), Beat("ready", "Ready.")])
+        sim._ib_questions = [False, True]  # the one before the last went unanswered (a skip)
+        action = self._transition(sim, 60.0)
+        self.assertEqual(action.act, "repeat_request")
+
+    def test_off_says_every_replayed_repeat_request(self) -> None:
+        from rehearsal.flags import REPEAT_IF_UNANSWERED
+        from rehearsal.scenarios import Beat
+
+        with _switch(REPEAT_IF_UNANSWERED, "0"):
+            sim = self._sim([Beat("repeat_request", "No, return to that earlier question and repeat it."), Beat("ready", "Ready.")])
+            self._icebreaker(sim, self.Q1, 10.0)
+            self._icebreaker(sim, self.Q2, 30.0)
+            self.assertEqual(self._transition(sim, 60.0).act, "repeat_request")
+
+    def test_after_a_backchannel_the_candidate_answers_within_ten_seconds(self) -> None:
+        sim = _sim()
+        sim.last_act = "backchannel"
+        quiet = asyncio.run(sim.next_action(_view("icebreaker", [], waited=4.0)))
+        self.assertEqual(quiet.kind, "wait")
+        due = asyncio.run(sim.next_action(_view("icebreaker", [], waited=10.0)))
+        self.assertEqual((due.kind, due.act), ("speak", "icebreaker_answer"))
+        from rehearsal.flags import BACKCHANNEL_GAP
+
+        with _switch(BACKCHANNEL_GAP, "0"):
+            sim = _sim()
+            sim.last_act = "backchannel"
+            self.assertEqual(asyncio.run(sim.next_action(_view("icebreaker", [], waited=40.0))).kind, "wait")
+
+    # --- a turn the session saved as fragments
+    STORY = ("one customer had a hundred reasons why it would not work the money the hours the "
+             "family and in the end she signed up after we planned her week together")
+    QUESTION = "how long does the role play last"
+
+    def _rows(self):
+        from types import SimpleNamespace
+
+        from rehearsal.full import transcript_rows
+        from rehearsal.sim import Span
+
+        story = Span("candidate", "candidate", self.STORY, "candidate", 100.0, "icebreaker", 100.0, None,
+                     t_end=140.0, act="icebreaker_answer")
+        brief = Span("bot", "interviewer", "Next, let's do a sales role-play.", "say", 120.0, "transition", 120.0, None,
+                     t_end=150.0)
+        asked = Span("candidate", "candidate", self.QUESTION, "candidate", 155.0, "transition", 155.0, None,
+                     t_end=158.0, act="roleplay_question")
+        words = self.STORY.split()
+        saved = [
+            {"index": 1, "speaker": "candidate", "phase": "icebreaker", "text": " ".join(words[:8])},
+            {"index": 2, "speaker": "bot", "phase": "transition", "text": brief.text},
+            {"index": 3, "speaker": "candidate", "phase": "transition",
+             "text": " ".join(words[8:]) + " " + self.QUESTION},
+        ]
+        writer = SimpleNamespace(saved=saved, columns={1: {"written_at": 120.0}, 3: {"written_at": 158.5}})
+        rt = SimpleNamespace(spans=[story, brief, asked])
+        return transcript_rows(rt, writer)
+
+    def test_a_continuation_over_the_brief_is_merged_into_the_icebreaker_turn(self) -> None:
+        rows = self._rows()
+        self.assertEqual([row["phase"] for row in rows], ["icebreaker", "transition", "transition"])
+        story, _brief, asked = rows
+        self.assertEqual(story["text"], self.STORY)
+        self.assertEqual((story["s_sec"], story["act"]), (100.0, "icebreaker_answer"))
+        self.assertEqual(story["merged_turn_indexes"], [3])
+        self.assertEqual((asked["text"], asked["s_sec"], asked["act"]), (self.QUESTION, 155.0, "roleplay_question"))
+        self.assertTrue(all(row["s_sec"] is not None for row in rows))
+
+    def test_off_keeps_the_fragments_unstamped(self) -> None:
+        from rehearsal.flags import CONTINUED_ROWS
+
+        with _switch(CONTINUED_ROWS, "0"):
+            rows = self._rows()
+        self.assertEqual(len(rows), 3)
+        self.assertIsNone(rows[0]["s_sec"])
+        self.assertIsNone(rows[2]["s_sec"])
+
+
 class ManualReplayTimingTests(unittest.TestCase):
     def test_moves_that_shared_one_turn_are_said_as_one(self) -> None:
         from rehearsal.manual import Move, merge_shared_turns

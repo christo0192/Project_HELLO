@@ -42,6 +42,15 @@ from rehearsal.scenarios import (
 from rehearsal.sim import INTERVIEWER, LEARNER, Span
 
 THINK_PAUSE_SEC = 4.0
+# D4-H-REPLAY1: the longest silence after a replayed icebreaker backchannel before the answer it owes.
+BACKCHANNEL_GAP_SEC = 10.0
+ANSWER_ACTS = frozenset({"icebreaker_answer", "silence_answer"})
+# A repeat request that asks for an earlier question than the last ("that earlier question").
+_EARLIER = re.compile(
+    r"\bbefore (?:the )?last\b|\bsecond[- ](?:to[- ])?last\b|\bpenultimate\b|\bearlier\b|"
+    r"\b(?:go|going|jump|come) back\b|\breturn to\b",
+    re.IGNORECASE,
+)
 ROLEPLAY_PATIENCE_SEC = 2.0
 WAIT_STEP_SEC = 1.0
 MAX_EXTRA_READY = 3
@@ -528,6 +537,8 @@ class CandidateSim:
         self._last_advisor: AdvisorTurn | None = None
         self._goodbyes_in_a_row = 0
         self._farewell_quiet = False
+        # D4-H-REPLAY1: Christy's icebreaker questions in order, and whether each got an answer.
+        self._ib_questions: list[bool] = []
         self.button_missing = False  # a press was due but the page did not show the button
         self._silence_pending = False
         self._silence_done = False
@@ -686,15 +697,29 @@ class CandidateSim:
         return self._advisor_done or self._learner_committed
 
     async def _icebreaker(self, view: View) -> Action:
+        fresh = sum(1 for span in self._fresh if span.voice != LEARNER and is_icebreaker_question(span.text))
+        self._ib_questions.extend([False] * fresh)
+        action = await self._icebreaker_turn(view, fresh)
+        if action.kind == "speak" and action.act in ANSWER_ACTS and self._ib_questions:
+            self._ib_questions[-1] = True
+        return action
+
+    async def _icebreaker_turn(self, view: View, fresh: int) -> Action:
         if not view.heard:
             if self.last_act == "hold_request" and view.waited >= THINK_PAUSE_SEC:
                 text = await self.talker.icebreaker_answer(thinking=True)
                 return self._spoken("icebreaker_answer", text, role="candidate")
-            return Action("wait")
+            # D4-H-REPLAY1: a replayed "thanks" said over Christy's question still owes the answer; a
+            # real candidate gives it after a breath, not after half a minute of silence.
+            owed = (
+                self.last_act == "backchannel"
+                and view.waited >= BACKCHANNEL_GAP_SEC
+                and flags.on(flags.BACKCHANNEL_GAP)
+            )
+            if not owed:
+                return Action("wait")
         christy = [span for span in view.heard if span.speaker == "bot" and span.voice != LEARNER]
-        self._questions_heard += sum(
-            1 for span in self._fresh if span.voice != LEARNER and is_icebreaker_question(span.text)
-        )
+        self._questions_heard += fresh
         if self._silence_pending:
             self._silence_pending = False
             return self._spoken("silence_answer", self.scenario.silence_answer, role="candidate")
@@ -733,6 +758,10 @@ class CandidateSim:
             return Action("press", why="after_brief")
         if not view.heard:
             return Action("wait")
+        while self._transition and self._answered_repeat(self._transition[0]):
+            # D4-H-REPLAY1: the real tester asked to hear a question again that this candidate has
+            # answered already; the replay goes on with its next line instead.
+            self._transition.pop(0)
         if self._transition:
             beat = self._transition.pop(0)
             if beat.act == "ready_button" and not self.button_missing:
@@ -753,6 +782,16 @@ class CandidateSim:
             return Action("silent", why="ready_not_taken")
         self.pressed = True
         return Action("press", why="ready_not_taken")
+
+    def _answered_repeat(self, beat: Beat) -> bool:
+        """A replayed repeat request whose question (the one before the last for "that earlier
+        question", else the last) this candidate already answered."""
+        if beat.act != "repeat_request" or not self._ib_questions or not flags.on(flags.REPEAT_IF_UNANSWERED):
+            return False
+        back = 2 if _EARLIER.search(f"{beat.intent} {beat.text}") else 1
+        if len(self._ib_questions) < back:
+            return False
+        return self._ib_questions[-back]
 
     async def _wrapup_action(self, view: View) -> Action:
         if not view.heard:

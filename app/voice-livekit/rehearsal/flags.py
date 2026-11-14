@@ -38,6 +38,14 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
   hint); the digs it did not honour are listed as ``probe_unreleased``.
 * ``REHEARSAL_OPEN_INVITE`` (D4-H-DIG1): a deep reveal that answers an open invitation ("what's on your
   mind?", "go ahead, I'm listening") is prompted, not an unprompted dump.
+* ``REHEARSAL_REPEAT_IF_UNANSWERED`` (D4-H-REPLAY1): a replayed request in the transition to hear an
+  icebreaker question again is said only when the question it asks for (the one before the last for
+  "that earlier question", else the last) went unanswered; otherwise the next replayed line is said.
+* ``REHEARSAL_CONTINUED_ROWS`` (D4-H-REPLAY1): a candidate row the session saved without a span (a
+  fragment of a longer spoken turn) carries the timing of the spoken turn it belongs to, and a part of
+  a turn spoken over the brief is merged into the row of that turn.
+* ``REHEARSAL_BACKCHANNEL_GAP`` (D4-H-REPLAY1): after a replayed icebreaker backchannel ("thanks") the
+  candidate answers the question it still owes after at most 10 s of silence.
 """
 from __future__ import annotations
 
@@ -57,6 +65,9 @@ FLOW_NA_AXES = "REHEARSAL_FLOW_NA_AXES"
 ADVISOR_FAREWELL_LOOP = "REHEARSAL_ADVISOR_FAREWELL_LOOP"
 DIG_RELEASED = "REHEARSAL_DIG_RELEASED"
 OPEN_INVITE = "REHEARSAL_OPEN_INVITE"
+REPEAT_IF_UNANSWERED = "REHEARSAL_REPEAT_IF_UNANSWERED"
+CONTINUED_ROWS = "REHEARSAL_CONTINUED_ROWS"
+BACKCHANNEL_GAP = "REHEARSAL_BACKCHANNEL_GAP"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -68,8 +79,10 @@ def on(name: str) -> bool:
 
 __all__ = [
     "ADVISOR_FAREWELL_LOOP",
+    "BACKCHANNEL_GAP",
     "CITED_MISFIRES",
     "COMMIT_WINDOW",
+    "CONTINUED_ROWS",
     "DIG_RELEASED",
     "FLOW_DESIGN_RULES",
     "FLOW_NA_AXES",
@@ -78,6 +91,7 @@ __all__ = [
     "LEARNER_CLOCK",
     "OPEN_INVITE",
     "PROBE_VOCAB_V2",
+    "REPEAT_IF_UNANSWERED",
     "SAME_TURN_FRAGMENTS",
     "SPOKEN_LEAKS",
     "TRANSITION_ACTS_V2",

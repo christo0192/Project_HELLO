@@ -264,6 +264,20 @@ D2-IB1) and `REHEARSAL_SAME_TURN_FRAGMENTS` (a candidate row the session saved w
 candidate's turn was still being said is part of that turn, not the next one, when a check looks for
 the reply to it).
 
+Diagnosis 4 switches (all default ON; `0` restores the previous behaviour):
+`REHEARSAL_FLOW_DESIGN_RULES` (the flow judge reads the design rules fixed by policy and judges only
+their wording and timing, the call facts say who ended the role-play and which graded families came
+before the end, and evidence is asked only for axes below 5), `REHEARSAL_FLOW_NA_AXES` (a call with no
+learner line scores learner_flow and objective_kept as null, left out of the means, minimums and the
+axis floor), `REHEARSAL_ADVISOR_FAREWELL_LOOP` (after two mutual goodbyes in a row the simulated advisor
+goes quiet; `advisor_farewell_loop` counts the advisor's goodbyes after the first mutual one),
+`REHEARSAL_DIG_RELEASED` (a dig is engine-confirmed only when the gate had released that need by the
+dig; `probe_unreleased` lists the rest), `REHEARSAL_OPEN_INVITE` (a deep reveal that answers "what's on
+your mind?" is prompted), `REHEARSAL_REPEAT_IF_UNANSWERED` (a replayed repeat request is said only when
+its question went unanswered), `REHEARSAL_CONTINUED_ROWS` (a candidate row saved without a span takes
+the timing of its spoken turn, and a tail said over the brief joins that turn's row) and
+`REHEARSAL_BACKCHANNEL_GAP` (after a replayed icebreaker backchannel the answer comes within 10 s).
+
 ## Adaptability scenarios and the flow judge (`--scenarios adapt`, D-M032-10)
 
 ```
