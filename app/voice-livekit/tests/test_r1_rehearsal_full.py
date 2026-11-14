@@ -864,6 +864,97 @@ class CandidateSimTests(unittest.TestCase):
         self.assertEqual((action.kind, action.act), ("speak", "ready"))
 
 
+
+class AdvisorFarewellLoopTests(unittest.TestCase):
+    """D4-H-SIMLOOP1: after two mutual goodbyes in a row the simulated advisor goes quiet (synthetic text)."""
+
+    GOODBYE = "Good night, Meera. Talk tomorrow at seven."
+
+    def _sim(self, replies=None):
+        from rehearsal.advisor import AdvisorTurn
+
+        sim = _sim()
+
+        class RepeatingAdvisor:
+            calls = 0
+
+            async def start(self, pickup):
+                return None
+
+            async def next_turn(self, learner_text, r_sec, exchange):
+                RepeatingAdvisor.calls += 1
+                return AdvisorTurn(AdvisorFarewellLoopTests.GOODBYE, "farewell", ""), "advisor_turn"
+
+        sim.advisor = RepeatingAdvisor()
+        return sim
+
+    def _turn(self, sim, learner_line: str, at: float):
+        from rehearsal.sim import LEARNER
+
+        view = _view("roleplay", [_span("bot", LEARNER, learner_line, at, at + 2.0)], r_sec=at)
+        view.roleplay_started = True
+        return asyncio.run(sim.next_action(view))
+
+    def test_two_mutual_goodbyes_in_a_row_and_the_advisor_goes_quiet(self) -> None:
+        sim = self._sim()
+        first = self._turn(sim, "Hello? Yes, this is Meera.", 900.0)
+        self.assertEqual((first.kind, first.text), ("speak", self.GOODBYE))
+        second = self._turn(sim, "Thanks, good night.", 910.0)  # mutual goodbye 1
+        self.assertEqual(second.kind, "speak")
+        third = self._turn(sim, "Okay, talk tomorrow at seven.", 920.0)  # mutual goodbye 2
+        self.assertEqual((third.kind, third.why), ("silent", "advisor_farewell_loop"))
+        # No further advisor turn, whatever the learner says next.
+        fourth = self._turn(sim, "Hello? Are you still there?", 940.0)
+        self.assertEqual(fourth.kind, "silent")
+        self.assertEqual(sim.advisor.calls, 2)
+
+    def test_a_learner_reply_that_is_no_goodbye_breaks_the_run(self) -> None:
+        sim = self._sim()
+        self._turn(sim, "Hello? Yes, this is Meera.", 900.0)
+        self._turn(sim, "Thanks, good night.", 910.0)
+        middle = self._turn(sim, "Wait, before you go, is the course live or recorded?", 920.0)
+        self.assertEqual(middle.kind, "speak")
+        again = self._turn(sim, "Bye then.", 930.0)
+        self.assertEqual(again.kind, "speak")
+        self.assertEqual(self._turn(sim, "Good night.", 940.0).kind, "silent")
+
+    def test_off_keeps_the_advisor_talking(self) -> None:
+        from rehearsal.flags import ADVISOR_FAREWELL_LOOP
+
+        with _switch(ADVISOR_FAREWELL_LOOP, "0"):
+            sim = self._sim()
+            self._turn(sim, "Hello? Yes, this is Meera.", 900.0)
+            self._turn(sim, "Thanks, good night.", 910.0)
+            self.assertEqual(self._turn(sim, "Okay, talk tomorrow at seven.", 920.0).kind, "speak")
+
+    def test_the_loop_count_metric(self) -> None:
+        from rehearsal.metrics import advisor_farewell_loop
+
+        def ex(advisor: str, intent: str, learner: str | None) -> dict:
+            return {"advisor": {"text": advisor, "intent": intent}, "learner": {"spoken": learner}}
+
+        bye = (self.GOODBYE, "farewell")
+        self.assertEqual(advisor_farewell_loop([]), 0)
+        self.assertEqual(advisor_farewell_loop([ex("Sure.", "other", "Good night.")]), 0)
+        self.assertEqual(advisor_farewell_loop([ex(*bye, "Good night."), ex(*bye, "Bye.")]), 1)
+        loop = [ex("Is seven okay?", "close_ask", "Yes, seven works.")] + [ex(*bye, "Good night, thanks.")] * 28
+        self.assertEqual(advisor_farewell_loop(loop), 27)
+        # A goodbye the learner did not return is no mutual goodbye.
+        self.assertEqual(advisor_farewell_loop([ex(*bye, "Wait, one more question?"), ex(*bye, None)]), 0)
+
+    def test_the_scorecard_shows_it(self) -> None:
+        from rehearsal.full_metrics import render_full_markdown
+
+        record = {"header": {"seed": "loop-1", "scenario": "terse-nervous"}, "outcome": "complete",
+                  "stop_reason": "time_cap", "phase_checks": {"start_by": "spoken", "failed": []},
+                  "metrics": {"advisor_farewell_loop": 2}}
+        card = {"calls": 1, "offline": True, "ready_for_owner_test": False, "reasons": ["x"],
+                "phase_checks": {}, "roleplay": None}
+        markdown = render_full_markdown(card, [record])
+        self.assertIn("| farewell loop |", markdown)
+        self.assertIn("| loop-1 | terse-nervous | complete | time_cap | spoken | - | - | 2 | - |", markdown)
+
+
 class ManualReplayTimingTests(unittest.TestCase):
     def test_moves_that_shared_one_turn_are_said_as_one(self) -> None:
         from rehearsal.manual import Move, merge_shared_turns

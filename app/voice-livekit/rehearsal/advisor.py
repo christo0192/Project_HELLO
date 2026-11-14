@@ -167,6 +167,29 @@ def is_farewell(turn: "AdvisorTurn") -> bool:
     return turn.intent == "farewell" or _FAREWELL_TEXT.search(turn.text or "") is not None
 
 
+# D4-H-SIMLOOP1: the wider set of ways a call is signed off ("Good night", "Talk tomorrow at seven",
+# "Thanks again"), read on the LAST sentence of a line only, for the farewell-loop rule.
+_SIGN_OFF = re.compile(
+    r"\b(?:good ?bye|bye|good ?night|take care|you too|"
+    r"(?:talk|speak) (?:to you )?(?:soon|later|tomorrow|then)|see you|until (?:then|tomorrow)|"
+    r"(?:look(?:ing)? forward to|ready for) (?:it|that|the call|tomorrow|\w+ tomorrow)|"
+    r"thanks? (?:you )?(?:so much|again|for (?:your|the) time|for tonight)|"
+    r"have a (?:good|great|nice|lovely) (?:night|evening|day|one))\b",
+    re.IGNORECASE,
+)
+
+
+def ends_on_goodbye(text: str | None) -> bool:
+    """True when the last sentence of a line signs the call off."""
+    sentences = [part for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if part.strip()]
+    return bool(sentences) and _SIGN_OFF.search(sentences[-1]) is not None
+
+
+def is_sign_off(turn: "AdvisorTurn") -> bool:
+    """An advisor goodbye for the farewell-loop rule: ``is_farewell`` or a sign-off last sentence."""
+    return is_farewell(turn) or ends_on_goodbye(turn.text)
+
+
 def looks_inverted(text: str) -> bool:
     """True when an advisor turn speaks as the learner (first-person learner phrasing)."""
     return any(pattern.search(text or "") for pattern in _INVERSION)

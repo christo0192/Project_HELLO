@@ -1292,6 +1292,22 @@ def latency_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def advisor_farewell_loop(exchanges: Sequence[Mapping[str, Any]]) -> int:
+    """D4-H-SIMLOOP1: the advisor's goodbyes after the first mutual goodbye (an advisor goodbye the
+    learner's reply returned).  0-1 when the call ends after a goodbye; many when nobody hangs up."""
+    from rehearsal.advisor import AdvisorTurn, ends_on_goodbye, is_sign_off
+
+    def bye(ex: Mapping[str, Any]) -> bool:
+        advisor = _advisor(ex)
+        return is_sign_off(AdvisorTurn(str(advisor.get("text") or ""), str(advisor.get("intent") or "other")))
+
+    first = next(
+        (i for i, ex in enumerate(exchanges) if bye(ex) and ends_on_goodbye((ex.get("learner") or {}).get("spoken"))),
+        None,
+    )
+    return 0 if first is None else sum(1 for ex in exchanges[first + 1 :] if bye(ex))
+
+
 # --------------------------------------------------------------------------------- the call
 def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     """All deterministic metrics of one rehearsal call (``record`` as ``call.run_call`` returns)."""
@@ -1323,6 +1339,7 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     out.update(guard_metrics(admin, record.get("guard_trips") or [], exchanges))
     out.update(latency_metrics(exchanges))
     out["exchanges"] = len(exchanges)
+    out["advisor_farewell_loop"] = advisor_farewell_loop(exchanges)
     out["roleplay_seconds"] = record.get("roleplay_seconds")
     out["stop_reason"] = record.get("stop_reason")
     out["error"] = record.get("error")

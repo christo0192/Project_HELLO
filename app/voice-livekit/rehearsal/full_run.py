@@ -300,6 +300,7 @@ def full_summary(record: dict[str, Any]) -> dict[str, Any]:
         "exchanges": metrics.get("exchanges"),
         "commitment_level": metrics.get("commitment_level"),
         "families_delivered": metrics.get("families_delivered"),
+        "advisor_farewell_loop": metrics.get("advisor_farewell_loop"),
         "hard_fails": record.get("hard_fails"),
         "phase_checks_failed": checks.get("failed"),
         "flow": flow_line(record),

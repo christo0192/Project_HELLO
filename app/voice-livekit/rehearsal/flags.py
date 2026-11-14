@@ -30,6 +30,9 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
   role-play and which graded families came before that, and evidence is asked only for lost points.
 * ``REHEARSAL_FLOW_NA_AXES`` (D4-H-SILENT1): a call with no learner line (no role-play) scores
   learner_flow and objective_kept as null, and nulls stay out of the means, minimums and floor.
+* ``REHEARSAL_ADVISOR_FAREWELL_LOOP`` (D4-H-SIMLOOP1): after two exchanges in a row in which the
+  simulated advisor said goodbye and the learner's reply ended on a goodbye too, the advisor goes quiet
+  for the rest of the role-play (the runner waits for the session's exit or the time cap).
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ CITED_MISFIRES = "REHEARSAL_CITED_MISFIRES"
 IB_REPEAT_INSISTED = "REHEARSAL_IB_REPEAT_INSISTED"
 FLOW_DESIGN_RULES = "REHEARSAL_FLOW_DESIGN_RULES"
 FLOW_NA_AXES = "REHEARSAL_FLOW_NA_AXES"
+ADVISOR_FAREWELL_LOOP = "REHEARSAL_ADVISOR_FAREWELL_LOOP"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -56,6 +60,7 @@ def on(name: str) -> bool:
 
 
 __all__ = [
+    "ADVISOR_FAREWELL_LOOP",
     "CITED_MISFIRES",
     "COMMIT_WINDOW",
     "FLOW_DESIGN_RULES",

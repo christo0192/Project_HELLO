@@ -812,8 +812,8 @@ def render_full_markdown(card: Mapping[str, Any], records: Sequence[Mapping[str,
         "",
         "## Calls",
         "",
-        "| call | scenario | outcome | role-play end | start | S | R | failed checks |",
-        "|---|---|---|---|---|---|---|---|",
+        "| call | scenario | outcome | role-play end | start | S | R | farewell loop | failed checks |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for record in records:
         head = record.get("header") or {}
@@ -822,6 +822,7 @@ def render_full_markdown(card: Mapping[str, Any], records: Sequence[Mapping[str,
             f"| {head.get('seed')} | {head.get('scenario')} | {record.get('outcome')} | "
             f"{record.get('stop_reason')} | {checks.get('start_by')} | "
             f"{_clock(record.get('session_seconds'))} | {_clock(record.get('roleplay_seconds'))} | "
+            f"{(record.get('metrics') or {}).get('advisor_farewell_loop', '-')} | "
             f"{', '.join(checks.get('failed') or []) or '-'} |"
         )
     if card.get("flow") is not None:

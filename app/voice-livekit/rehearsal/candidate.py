@@ -21,10 +21,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from rehearsal import flags
 from rehearsal.advisor import (
     AdvisorTurn,
     LLMAdvisor,
     advisor_messages,
+    ends_on_goodbye,
+    is_sign_off,
     parse_advisor_output,
 )
 from rehearsal.scenarios import (
@@ -520,6 +523,11 @@ class CandidateSim:
         self._fresh: list[Span] = []
         self._advisor_done = False  # the advisor said goodbye or confirmed the next step
         self._learner_committed = False  # the learner committed aloud (a call, the link ...)
+        # D4-H-SIMLOOP1: mutual goodbyes in a row (the advisor's goodbye answered with one), and
+        # whether the advisor has gone quiet for good after two of them.
+        self._last_advisor: AdvisorTurn | None = None
+        self._goodbyes_in_a_row = 0
+        self._farewell_quiet = False
         self.button_missing = False  # a press was due but the page did not show the button
         self._silence_pending = False
         self._silence_done = False
@@ -770,6 +778,21 @@ class CandidateSim:
     async def _advisor_action(self, view: View) -> Action:
         learner = view.learner()
         christy = view.christy()
+        if self._farewell_quiet:
+            return Action("silent", why="advisor_farewell_loop")
+        if self.advisor_started and flags.on(flags.ADVISOR_FAREWELL_LOOP):
+            # A real advisor hangs up (or goes quiet) after a goodbye or two: the loop of goodbyes the
+            # simulator would otherwise keep making is not the product's.
+            mutual = (
+                self._last_advisor is not None
+                and is_sign_off(self._last_advisor)
+                and bool(learner)
+                and ends_on_goodbye(learner[-1])
+            )
+            self._goodbyes_in_a_row = self._goodbyes_in_a_row + 1 if mutual else 0
+            if self._goodbyes_in_a_row >= 2:
+                self._farewell_quiet = True
+                return Action("silent", why="advisor_farewell_loop")
         if not self.advisor_started:
             self.advisor_started = True
             await self.advisor.start(" ".join(learner) or "Hello?")
@@ -784,6 +807,7 @@ class CandidateSim:
         turn.text = text
         if turn.intent in WRAP_READY_INTENTS:
             self._advisor_done = True
+        self._last_advisor = turn
         if self.shadow is not None:
             self.shadow.set_turn(turn.as_dict())
         self.last_act = act
