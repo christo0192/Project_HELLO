@@ -251,7 +251,16 @@ import r1_world
 # Revision 32 (seventh merge of the M032 lanes): the learner lane's 30 and the Christy lane's 31
 # on top of revision 31; no text changed in the merge.  CONTENT_REVISION = max(31, 30, 31) + 1.
 # Revision 33 (eighth merge): the Christy lane's 32 (the quiet-nudge window is 7 s).
-PINNED_CONTENT_SHA256 = "ddcabee69a5b31c623efbea53f86e5fced91446c2eee7c1747bfa110484e5ffe"
+# Learner lane (feat/m032-learner), its own revision 31 after the seventh integration:
+# Learner lane revision 31 (simulation diagnosis 5): the no-answer notes and intent shape for an
+# advisor turn that told her nothing, and the press lines after a lone "Okay." to her question,
+# join the manifest (``r1_content._diag5_repairs``) beside the texts they replace while their flags
+# are on.  No graded meaning, marker, must-say or deadline changed.  After its review (still 31,
+# unreleased): the learner's two cut-out lines (``r1_guard.CUT_OUT_REPLIES``, review D5R-4).
+# Revision 35 (ninth merge of the M032 lanes): the learner lane's 31 and the Christy lane's
+# 33-34 on top of revision 33; no text changed in the merge.  CONTENT_REVISION =
+# max(33, 31, 34) + 1.
+PINNED_CONTENT_SHA256 = "d6383db33c2797533a3d78f25d6d2f2a54cc3059e95fcc744978993666c9c7c0"
 
 CONTENT_MODULES = (
     "r1_text",

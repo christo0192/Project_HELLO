@@ -358,7 +358,21 @@ import r1_world
 #    changed.
 # 33: M032 integration 8 (the Christy lane's 32 merged onto revision 32): the quiet-nudge window
 #    only; CONTENT_REVISION = max(32, 32) + 1.
-CONTENT_REVISION = 33
+# Learner lane (feat/m032-learner, its revision 31, after the seventh integration):
+# Lane 31: Simulation diagnosis 5 (the full-interview flow judge, round 5; rollback flags
+#    R1_CONCESSION_READ_V2, R1_GUARD_TIDY_V3, R1_NO_ANSWER_READ, R1_ACK_PRESS, R1_ASK_VOICE_GATE,
+#    R1_TOPIC_REPEAT, R1_POST_BYE_QUIET and R1_LLM_RECOVERY_V2).  The no-answer notes and the intent
+#    shape for a turn that told her nothing, and the learner's press lines after a lone "Okay." to
+#    her question, join the manifest (``_diag5_repairs``) beside the texts they replace while their
+#    flags are on.  No graded marker, must-say, meaning or deadline changed; with every flag off the
+#    lines, reminders and readers are the release before.
+#    After its review (still 31, unreleased): the learner's two cut-out lines (CUT_OUT_REPLIES),
+#    said when a reply to a turn that told her nothing was emptied only by its assumed answer
+#    (D5R-4).
+# 35: M032 integration 9 (the learner lane's 31 and the Christy lane's 33-34 merged onto
+#    revision 33): every text of both lanes in one manifest.  No text changed in the merge;
+#    CONTENT_REVISION = max(33, 31, 34) + 1.
+CONTENT_REVISION = 35
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -763,6 +777,18 @@ def _diag4_repairs() -> dict[str, Any]:
     }
 
 
+def _diag5_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 5 (revision 31): the no-answer notes and the press lines."""
+    p = r1_prompts
+    return {
+        "no_answer_note": p.NO_ANSWER_NOTE,
+        "no_answer_intent_note": p.NO_ANSWER_INTENT_NOTE,
+        "intent_shape_no_answer": p.INTENT_SHAPE_NO_ANSWER,
+        "press_replies": list(r1_guard.PRESS_REPLIES),
+        "cut_out_replies": list(r1_guard.CUT_OUT_REPLIES),
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -1073,6 +1099,7 @@ def manifest() -> dict[str, Any]:
             "adapt_repairs": _adapt_repairs(),
             "diag3_repairs": _diag3_repairs(),
             "diag4_repairs": _diag4_repairs(),
+            "diag5_repairs": _diag5_repairs(),
         },
         "icebreaker": {
             "objectives": [

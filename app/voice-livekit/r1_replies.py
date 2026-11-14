@@ -372,6 +372,14 @@ class Reply:
     # The line id of ``tail`` (M032 SWEEP-26: the wrap-up's L-WRAP-MORE is counted, and used up,
     # only when it is actually spoken); "" for none.
     tail_id: str = ""
+    # D5-RELIAB1 (R1_LLM_RECOVERY_V2): this reply hung with nothing said and is being asked for once
+    # more (a 6 s deadline, never an answer from the provider); ``retry_text`` is the owed point's
+    # scripted variant to say instead of a model call ("" for a model retry).
+    retry: bool = False
+    retry_text: str = ""
+    # Review D5R-6: which generation of this reply a speech belongs to (0 the first; the retry is
+    # 1).  A speech of an earlier attempt (the hung reply's filler) never records the plan.
+    attempt: int = 0
 
 
 def llm_messages(

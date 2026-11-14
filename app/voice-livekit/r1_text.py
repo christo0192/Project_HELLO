@@ -352,6 +352,18 @@ CONCESSION_TAG_LEADING = re.compile(
     r"^\W*(?:" + _CONCESSION_CLAUSE + r")\b[,:]?\s*(?:(?:but|though|and)\b[,]?\s*)?",
     re.IGNORECASE,
 )
+# Simulation diagnosis 5 (D5-GUARD-GARBLE1, R1_GUARD_TIDY_V3): "I'll say that much" and "I'll say
+# that for it" are one tag, so the cut never strands "much" ("The direction feels right much.").
+_CONCESSION_CLAUSE_V3 = _CONCESSION_CLAUSE.replace(
+    "say that|", "say that(?: much| for (?:it|you))?|", 1
+)
+CONCESSION_TAG_TRAILING_V3 = re.compile(
+    r"\s*[,;-]*\s*(?:" + _CONCESSION_CLAUSE_V3 + r")\b[,.]?", re.IGNORECASE
+)
+CONCESSION_TAG_LEADING_V3 = re.compile(
+    r"^\W*(?:" + _CONCESSION_CLAUSE_V3 + r")\b[,:]?\s*(?:(?:but|though|and)\b[,]?\s*)?",
+    re.IGNORECASE,
+)
 # A goodbye: the learner closing the call itself.  "I'll let you know" and "I'll get back to you"
 # as the answer to a close are the stall; this is only counted while the advisor has said nothing.
 PHRASE_CLOSER = "closer"

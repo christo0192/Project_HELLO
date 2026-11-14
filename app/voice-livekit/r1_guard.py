@@ -96,7 +96,9 @@ from r1_text import (
     CLOSER,
     CONCESSION_TAG,
     CONCESSION_TAG_LEADING,
+    CONCESSION_TAG_LEADING_V3,
     CONCESSION_TAG_TRAILING,
+    CONCESSION_TAG_TRAILING_V3,
     DECIDER_STALL,
     MONEY_STRAIN,
     PHRASE_CONCESSION_TAG,
@@ -1068,8 +1070,7 @@ _DAYS_UNIT = re.compile(r"\b" + _UNIT_NUMBER + r"days?\b", re.IGNORECASE)
 _ALLOWED_HOURS = frozenset({10.0, 4.5})
 _ALLOWED_DAYS = frozenset({5.5})
 
-_CONCESSION = _ci(
-    r"\bconvinc",
+_CONCESSION_REST = (
     r"that (?:resolves|settles|addresses)",
     r"(?:resolves|addresses) my (?:concern|worry|question)",
     r"no (?:more|other) (?:concerns|worries)",
@@ -1080,6 +1081,42 @@ _CONCESSION = _ci(
     r"you'?ve (?:answered|addressed) (?:all|everything)",
     r"\bsounds like a deal\b|\bi'?ll take it\b(?!\s+from)|\bi accept\b",
 )
+_CONCESSION = _ci(r"\bconvinc", *_CONCESSION_REST)
+# Simulation diagnosis 5 (D5-HF-CONCESSION1, R1_CONCESSION_READ_V2): "convinc" only as being won
+# over ("you've convinced me", "I'm convinced", "that's convincing").  "It'd take some convincing"
+# and "I'd need more convincing" are scepticism, the opposite of a concession.  "I'm convinced
+# enough to ..." is still a concession; only "I'm convinced yet" (a dropped "not") is not.
+# Review D5R-2: a whitelist missed "That convinced me.", "You've got me convinced." and "I'm a
+# hundred percent convinced.", so the reading is the release before's ("convinced", "convinces",
+# "convincing") minus the shapes that are never her being won over (``_NOT_WON_OVER``): the base
+# form ("convince me", "you'll have to convince me") is never matched at all.
+_CONCESSION_V2 = _ci(r"\bconvinc(?:ed|es|ing)\b", *_CONCESSION_REST)
+# "(it'd) take some convincing", "I'd need more convincing": never a concession, whatever matched.
+_MORE_CONVINCING = re.compile(
+    r"\b(?:take|takes|took|taking|need|needs|want|wants|require|requires)\s+"
+    r"(?:(?:some|a lot of|a lot more|more|a bit of|a little|a bit more|a little more|real)\s+)?"
+    r"convincing\b",
+    re.IGNORECASE,
+)
+# Review D5R-2: never her being won over: having or trying to convince someone, convincing someone
+# other than her ("I'd have to convince my husband"), and "convinced yet" (a dropped "not").
+_NOT_WON_OVER = re.compile(
+    r"\b(?:have|has|had|need|needs|needed|got|going|gonna|try|tries|tried|trying|hope|hoping|"
+    r"want|wants)\s+to\s+convinc\w*"
+    r"|\bconvinc\w*\s+(?:my|his|her|their|our|him|them|everyone|anyone|somebody|someone|"
+    r"the family|the kids)\b"
+    r"|\bconvinced yet\b",
+    re.IGNORECASE,
+)
+
+
+def concession_read_v2() -> bool:
+    """D5-HF-CONCESSION1 (R1_CONCESSION_READ_V2, read at use; default ON, 0/off restores the
+    release before): "convinc" counts only as being won over."""
+    raw = os.getenv("R1_CONCESSION_READ_V2") or "1"
+    return raw.strip().lower() not in ("0", "off", "false", "no")
+
+
 _OPINION = _ci(
     r"\b(?:is|are|sounds?|seems?|looks?) (?:really |very |quite |pretty |so |super )?"
     r"(?:impressive|good|great|solid|interesting|helpful|expensive|steep|pricey|appealing|"
@@ -1828,6 +1865,25 @@ class GuardContext:
     # hiring-team deflection), and the "happy to go over ..." offer once made is cut.
     transition_quiet_drop: bool = False
     offer_phrase_used: bool = False
+    # Simulation diagnosis 5 (each the engine's rollback flag, default ON):
+    # ``guard_tidy_v3`` (R1_GUARD_TIDY_V3, D5-GUARD-GARBLE1): "I'll say that much" is cut whole, and
+    # a surface line that stood in for a blocked need is never said twice in one reply.
+    # ``contentless`` (R1_NO_ANSWER_READ, D5-LRN-ASSUME1): the advisor's turn told her nothing (a
+    # fragment, a filler or "let me clarify that"), so a first sentence that treats it as an answer
+    # ("Good to know ...", "Right, so it's ...") goes.
+    # ``ack_press`` (R1_ACK_PRESS, D5-LRN-ACKFALL1) and ``advisor_hollow``: his turn was a lone
+    # "Okay." after her question, so a reply emptied of its re-asked question presses gently
+    # (``PRESS_REPLIES``) instead of a bare "Mm-hmm.".
+    # ``topic_recent`` (R1_TOPIC_REPEAT, D5-LRN-TOPICREP1): the still-unanswered topics she raised
+    # in one of her last two replies; a free reply does not raise them again beside something else.
+    # ``bye_heard`` (R1_POST_BYE_QUIET, D5-LRN-POSTBYE1): the advisor said goodbye, so a free reply
+    # opens no new-topic question.
+    guard_tidy_v3: bool = False
+    contentless: bool = False
+    ack_press: bool = False
+    advisor_hollow: bool = False
+    topic_recent: frozenset[str] = frozenset()
+    bye_heard: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -2601,6 +2657,102 @@ def _fallback(ctx: GuardContext, *, only_repeats: bool = False) -> str:
     return ctx.interviewer_fallback or FALLBACK_REPLY
 
 
+# Simulation diagnosis 5 (D5-LRN-ACKFALL1, R1_ACK_PRESS): what she says when her question met a
+# lone "Okay." and her re-ask was dropped as a repeat.  Rotated; a line she already said is skipped.
+PRESS_REPLIES = (
+    "Sorry, did you catch my question?",
+    "So, any thoughts on that?",
+    "I'm still curious about that one.",
+)
+
+
+def _press_line(ctx: GuardContext) -> str:
+    """D5-LRN-ACKFALL1: a rotated press line she has not said yet (the first if all were said)."""
+    for offset in range(len(PRESS_REPLIES)):
+        candidate = pick_variant(PRESS_REPLIES, ctx.seed, ctx.variant + offset)
+        if repeat_kind(candidate, ctx.said) is None:
+            return candidate
+    return pick_variant(PRESS_REPLIES, ctx.seed, ctx.variant)
+
+
+# D5-LRN-ASSUME1 (R1_NO_ANSWER_READ): a first sentence that takes a contentless advisor turn as an
+# answer ("Good to know the class size is manageable", "Right, so it's more cohort-based").
+_ASSUMED_ANSWER = re.compile(
+    r"^\W*(?:(?:okay|oh|ah|ok)[,.]?\s+)?(?:(?:good|great|nice) to (?:know|hear)|glad to hear|"
+    r"that'?s (?:good|great|reassuring|nice) to (?:know|hear)|right,? so\b|so it'?s\b|"
+    r"sounds like (?:it'?s|you)\b)",
+    re.IGNORECASE,
+)
+# Review D5R-4: what NO_ANSWER_NOTE itself asks for (the line cut out) is never an assumed answer.
+_LINE_CUT = re.compile(
+    r"\b(?:cut (?:out|off)|broke up|break(?:ing)? up|dropp?(?:ed)? out|froze|frozen|lost you|"
+    r"(?:the )?(?:line|connection|signal|audio)\b|didn'?t (?:catch|hear|get) (?:that|it|you|the))",
+    re.IGNORECASE,
+)
+# Review D5R-4: a reply emptied only because its first sentence assumed an answer says the line cut
+# out (what NO_ANSWER_NOTE asks for) instead of a bare "Okay.".  Rotated; never "Sorry, what were
+# you saying?" (banned for her in R1-Q iteration 3).
+CUT_OUT_REPLIES = (
+    "Sorry, I think you cut out there.",
+    "Sorry, I lost you for a second there.",
+)
+
+
+def _cut_out_line(ctx: GuardContext) -> str:
+    """Review D5R-4: a rotated cut-out line she has not said yet (the first if both were said)."""
+    for offset in range(len(CUT_OUT_REPLIES)):
+        candidate = pick_variant(CUT_OUT_REPLIES, ctx.seed, ctx.variant + offset)
+        if repeat_kind(candidate, ctx.said) is None:
+            return candidate
+    return pick_variant(CUT_OUT_REPLIES, ctx.seed, ctx.variant)
+# D5-LRN-TOPICREP1 (R1_TOPIC_REPEAT): the topics she keeps raising while the advisor dodges them.
+TOPIC_PATTERNS = {
+    # Review D5R-3: "a month" only after money words ("pay a month", "how much a month"), never
+    # "I could start in a month or so"; "keep up" never "with my job"; "number" never "number of".
+    "monthly": re.compile(
+        r"\bmonthly\b|\b(?:per|each|every) month\b|\bmonth by month\b|"
+        r"\b(?:pay|paying|cost|costs|much|amount|figure|fee|emi|that|it|\d[\d,]*|thousand|"
+        r"hundred|rupees|dollars)\b[^.?!]{0,15}\ba month\b",
+        re.IGNORECASE,
+    ),
+    "price": re.compile(
+        r"\b(?:total|final|full|real|actual|exact|overall)\b[^.?!]{0,25}\b(?:price|cost|figure|"
+        r"number|amount|fee)s?\b(?!\s+of\b)|"
+        r"\bhow much\b[^.?!]{0,30}\b(?:cost|pay|is it|would it be|are we)\b",
+        re.IGNORECASE,
+    ),
+    "included": re.compile(
+        r"\bwhat(?:'s| is| would be| does it)? (?:actually |exactly |really )?(?:included|"
+        r"include)\b|\bwhat (?:do|would) i (?:actually |really )?get\b",
+        re.IGNORECASE,
+    ),
+    "class_size": re.compile(
+        r"\b(?:class|batch|cohort|group) sizes?\b|\bhow many (?:people|learners|students)\b|"
+        r"\bhow (?:big|large|small) (?:is|are) (?:the |a )?(?:class|batch|cohort|group)",
+        re.IGNORECASE,
+    ),
+    "fall_behind": re.compile(
+        r"\bfall(?:s|ing)? behind\b"
+        r"|\bkeep(?:ing)? up\b(?!\s+with\s+(?:my|our|his|her|their|the) (?:job|work|family|kids|"
+        r"bills|rent|life|day job|office))"
+        r"|\bmiss(?:ing)? (?:a |some )?"
+        r"(?:class|classes|session|sessions)\b",
+        re.IGNORECASE,
+    ),
+    "schedule": re.compile(
+        r"\bschedule\b[^.?!]{0,25}\b(?:packed|full|tight|busy|hectic)\b|"
+        r"\b(?:packed|tight|busy|hectic) schedule\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def topics_raised(text: object) -> frozenset[str]:
+    """D5-LRN-TOPICREP1: the topics (``TOPIC_PATTERNS``) the learner's ``text`` raises."""
+    folded = fold(text)
+    return frozenset(topic for topic, pattern in TOPIC_PATTERNS.items() if pattern.search(folded))
+
+
 # M032 SWEEP-17: what an emptied free reply asks instead of the course length it was dropped for.
 LENGTH_PROBES = ("How long does the course run?", "How long is the course, by the way?")
 
@@ -2658,6 +2810,10 @@ class StreamGuard:
         # D3-GUARD-IB1: the reply's first sentence was a pay echo dropped after a turn that asked
         # nothing, so the next sentence kept opens with ``STORY_ACK``.
         self._story_ack_owed = False
+        self._surfaces: list[str] = []  # D5-GUARD-GARBLE1: surface lines said in place of a need
+        self._repeat_question_dropped = False  # D5-LRN-ACKFALL1: a dropped repeat asked something
+        self._topic_held = ""  # D5-LRN-TOPICREP1: the first sentence held back as a topic repeat
+        self._assumed_drops = 0  # review D5R-4: first sentences dropped as an assumed answer
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -2824,6 +2980,16 @@ class StreamGuard:
             return ""
         return sentence
 
+    def _is_reask(self, text: str) -> bool:
+        """Review D5R-3: ``text`` is the re-ask this ack turn asked for (SWEEP-11): a question on
+        a topic of one of the re-asked questions, or a repeat of one of them."""
+        reask = self.ctx.reask
+        if not reask or "?" not in text:
+            return False
+        if topics_raised(text) & topics_raised(" ".join(reask)):
+            return True
+        return repeat_kind(text, reask) is not None
+
     def _comes_back(self, text: str) -> bool:
         """M032 SWEEP-7: ``text`` is a question about the topic the reply comes back to."""
         topic = self.ctx.reask_topic
@@ -2869,12 +3035,15 @@ class StreamGuard:
         kind = repeat_kind(out, said)
         return None if kind is None else self._repeat_hit(kind, out)
 
-    def _drop_repeat(self, hit: Hit, *, blocked: bool) -> list[str]:
+    def _drop_repeat(self, hit: Hit, *, blocked: bool, question: bool = False) -> list[str]:
         """Record the ``repeat`` hit of a dropped sentence.
 
         ``blocked``: the model's own sentence was blocked as well (the fallback is then the
-        "thinking" line, not a back-channel).
+        "thinking" line, not a back-channel).  ``question``: the dropped sentence asked something
+        (D5-LRN-ACKFALL1: an emptied reply then presses instead of a bare back-channel).
         """
+        if question and not blocked:
+            self._repeat_question_dropped = True
         self._hits.append(hit)
         self._replaced = True
         if blocked:
@@ -2942,7 +3111,9 @@ class StreamGuard:
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
         if CONCESSION_TAG.search(text) is not None:
             if self._phrase_count(PHRASE_CONCESSION_TAG) >= PHRASE_QUOTA[PHRASE_CONCESSION_TAG]:
-                text = _strip_concession_tag(text, tidy=ctx.echo_guard)
+                text = _strip_concession_tag(
+                    text, tidy=ctx.echo_guard, v3=ctx.guard_tidy_v3
+                )
             else:
                 key = PHRASE_CONCESSION_TAG
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
@@ -3097,6 +3268,33 @@ class StreamGuard:
             self._summary_dropped.append(sentence)
         return kept
 
+
+    def _is_surface(self, out: str, hits: list[Hit]) -> bool:
+        """D5-GUARD-GARBLE1: ``out`` is the persona's surface line for a blocked need."""
+        persona = self.ctx.persona
+        if persona is None or not self.ctx.is_learner:
+            return False
+        return any(
+            hit.category == VOLUNTEERED_NEED and out == persona.surface(hit.rule) for hit in hits
+        )
+
+    def _rest_after(self, sentence: str) -> str:
+        """The raw text received after ``sentence`` (``feed`` and ``flush`` vet from the buffer)."""
+        index = self._buffer.find(sentence)
+        return "" if index < 0 else self._buffer[index + len(sentence) :]
+
+    def _without_surfaces(self, text: str) -> str:
+        """D5-GUARD-GARBLE1: ``text`` without a clause that says a surface line of this reply."""
+        for surface in self._surfaces:
+            if repeat_kind(text, (surface,)) is not None:
+                return ""
+            pattern = _surface_pattern(surface)
+            if pattern is not None and _first_clause_matches(fold(text), pattern):
+                text = _without_clauses(text, pattern, orphans=True, orphan_tail=True)
+                if not text:
+                    return ""
+        return text
+
     def _vet(self, sentence: str) -> list[str]:
         if self._done:
             return []
@@ -3146,11 +3344,39 @@ class StreamGuard:
             final = out == NO_FEEDBACK_LINE
             if out in self._replacements:
                 out = ""
+            surface = out and self._is_surface(out, hits)
+            if surface and self.ctx.guard_tidy_v3:
+                # D5-GUARD-GARBLE1: the reply says the same worry in its own words already (before
+                # or after this sentence), so the surface line would be heard twice.
+                pattern = _surface_pattern(out)
+                around = " ".join((*self._emitted, self._rest_after(sentence)))
+                if pattern is not None and pattern.search(fold(around)) is not None:
+                    out = ""
             if out:
                 self._replacements.add(out)
+                if surface:
+                    self._surfaces.append(out)
         if out and self.ctx.is_learner and _STILL_MORE.search(out) is not None:
             if any(_STILL_MORE.search(said) for said in self._emitted):
                 out = ""  # "more than I planned for" is said once in a reply
+        if (
+            out
+            and not hits
+            and self.ctx.is_learner
+            and self.ctx.contentless
+            and not self._emitted
+            and "?" not in out
+            and _LINE_CUT.search(out) is None
+            and _ASSUMED_ANSWER.match(out) is not None
+        ):
+            # D5-LRN-ASSUME1: his turn told her nothing, so "Good to know ..." or "Right, so it's
+            # ..." reacts to an answer nobody gave; the rest of the reply stands.  Review D5R-4: a
+            # question ("Right, so how big are the batches?") or the cut-out line stays, and a
+            # reply left empty by this drop says the line cut out (``flush``).
+            self._style_edits += 1
+            self._assumed_drops += 1
+            self._last_dropped = True
+            return []
         if out and not hits and self.ctx.is_learner and self.ctx.free_reply:
             kept = out
             if self.ctx.figure_memory:
@@ -3170,6 +3396,30 @@ class StreamGuard:
                     and not self._comes_back(kept)
                 ):
                     kept = ""  # D4-TIMECUE1: short on time, she opens no new topic
+            if (
+                kept
+                and self.ctx.bye_heard
+                and not self.ctx.short_on_time
+                and "?" in kept
+                and self._emitted
+                and not self._follow_up(kept)
+                and not self._comes_back(kept)
+            ):
+                kept = ""  # D5-LRN-POSTBYE1: he said goodbye, so she opens no new topic
+            if kept and self.ctx.topic_recent and not self.ctx.carries_move:
+                raised = topics_raised(kept) & self.ctx.topic_recent
+                if (
+                    raised
+                    and not self._comes_back(kept)
+                    and not self._is_reask(kept)
+                    and (self._emitted or word_count(self._rest_after(sentence)) >= 3)
+                ):
+                    # D5-LRN-TOPICREP1: she raised this in one of her last two replies and he has
+                    # not answered it; beside something else to say, it is not said again.  Held
+                    # back, so a reply left with nothing says it after all (never emptied).
+                    if not self._topic_held:
+                        self._topic_held = kept
+                    kept = ""
             if kept and self.ctx.come_back_v2 and _REPETITION_REPROACH.search(kept) is not None:
                 # D4-COMEBACK1: no "you've said small a couple of times now": the question stays.
                 kept = _without_clauses(kept, _REPETITION_REPROACH)
@@ -3190,13 +3440,23 @@ class StreamGuard:
             # person asks it again in fewer words.
             out = short_reask(out)
             self._style_edits += 1
+        if out and not hits and self._surfaces and self.ctx.guard_tidy_v3:
+            # D5-GUARD-GARBLE1: a later sentence that says the surface line again loses the clause
+            # that repeats it; with nothing left it goes silently (no repeat, no back-channel).
+            trimmed = self._without_surfaces(out)
+            if trimmed != out:
+                self._style_edits += 1
+                if not trimmed:
+                    self._last_dropped = True
+                    return []
+                out = trimmed
         if out and not hits:
             # A sentence the learner already said is a repeat in the words it was WRITTEN in: the
             # style rules below change a few words ("That's" -> "It's"), and a changed copy of an
             # earlier sentence must not slip past the repeat check as a new one.
             written = self._repeated(out) if out not in self._emitted else None
             if written is not None:
-                return self._drop_repeat(written, blocked=False)
+                return self._drop_repeat(written, blocked=False, question="?" in out)
             out = self._vary(out)
             if out and self._last_dropped and self.ctx.is_learner:
                 if _DANGLING_REFERENCE.match(out) is not None or (
@@ -3216,7 +3476,7 @@ class StreamGuard:
         if out and out not in self._emitted:
             repeated = self._repeated(out)
             if repeated is not None:
-                return self._drop_repeat(repeated, blocked=bool(hits))
+                return self._drop_repeat(repeated, blocked=bool(hits), question="?" in out)
         if not out or out in self._emitted:
             if hits and all(hit.rule == "closer_again" for hit in hits):
                 self._repeat_drops += 1  # a second goodbye is a repeat: a back-channel replaces it
@@ -3317,7 +3577,31 @@ class StreamGuard:
             self._fallback_used = True
             only_repeats = self._repeat_drops > 0 and self._other_drops == 0
             ctx = self.ctx
-            if self._length_drops and ctx.free_reply and ctx.is_learner:
+            if self._topic_held and ctx.is_learner:
+                # D5-LRN-TOPICREP1: everything else went too, so the held sentence is the reply.
+                self._emitted.append(self._topic_held)
+            elif (
+                self._assumed_drops
+                and ctx.is_learner
+                and ctx.contentless
+                and self._other_drops == 0
+            ):
+                # Review D5R-4: the reply only assumed an answer nobody gave; a bare "Okay." to a
+                # broken-up line is unnatural, so she says the line cut out.
+                self._emitted.append(_cut_out_line(ctx))
+            elif (
+                ctx.ack_press
+                and ctx.is_learner
+                and ctx.mode == "reply"
+                and ctx.advisor_hollow
+                and only_repeats
+                and self._repeat_question_dropped
+                and not ctx.confirm
+            ):
+                # D5-LRN-ACKFALL1: her question met a lone "Okay." and its re-ask was a repeat; a
+                # bare "Mm-hmm." would drop her point, so she presses gently.
+                self._emitted.append(_press_line(ctx))
+            elif self._length_drops and ctx.free_reply and ctx.is_learner:
                 # M032 SWEEP-17: a free reply emptied by a course length she was never told asks
                 # for it instead ("How long does the course run?"), never "Give me a second".
                 self._emitted.append(_length_probe(ctx))
@@ -3498,6 +3782,28 @@ def _without_clauses(
     return out[0].upper() + out[1:] + end
 
 
+_SURFACE_STOP = frozenset(
+    {"that", "this", "with", "have", "just", "really", "about", "would", "there", "they", "them",
+     "what", "when", "your", "been", "from", "very", "will", "into", "than", "then", "also"}
+)
+
+
+@functools.lru_cache(maxsize=64)
+def _surface_pattern(surface: str) -> re.Pattern[str] | None:
+    """D5-GUARD-GARBLE1: the surface line's content words in order ("schedule ... pretty ...
+    packed"), within one clause; None when it has fewer than two of them."""
+    words = [
+        word
+        for word in re.findall(r"[a-z']+", fold(surface).lower())
+        if len(word) >= 4 and word not in _SURFACE_STOP
+    ]
+    if len(words) < 2:
+        return None
+    return re.compile(
+        r"\b" + r"\b[^,.;?!]*?\b".join(re.escape(word) for word in words) + r"\b", re.IGNORECASE
+    )
+
+
 def _first_clause_matches(text: str, pattern: re.Pattern[str]) -> bool:
     """U5: the first comma-separated clause of ``text`` is one ``_without_clauses`` cuts."""
     parts = [part for part in _CLAUSE_SPLIT.split(text.rstrip().rstrip(".?!")) if part.strip()]
@@ -3509,16 +3815,24 @@ def _points_back(text: str) -> bool:
     return word_count(text) <= POINTS_BACK_WORDS and _POINTS_BACK.match(text) is not None
 
 
-def _strip_concession_tag(text: str, *, tidy: bool = False) -> str:
+def _strip_concession_tag(text: str, *, tidy: bool = False, v3: bool = False) -> str:
     """``text`` without the concession tag ("..., I'll give you that.", "I'll admit, ...").
 
     What is left keeps its closing mark; a tag that is the whole sentence leaves nothing, which
     ``_vary`` turns into a neutral acknowledgement.  ``tidy`` (simulation diagnosis 1, U4 (3)):
     a conjunction left dangling before the tag ("..., so, I'll give you that") goes with it.
+    ``v3`` (D5-GUARD-GARBLE1, R1_GUARD_TIDY_V3): "I'll say that much" is one tag, so no "much"
+    is stranded; review D5R-5: a "much" left before the tag belongs to the sentence ("I like the
+    structure very much") and stays.
     """
     end = text.rstrip()[-1:] if text.rstrip()[-1:] in (".", "?", "!") else ""
-    out = CONCESSION_TAG_LEADING.sub("", text, count=1)
-    out = CONCESSION_TAG_TRAILING.sub("", out).rstrip(" ,;:-")
+    leading, trailing = (
+        (CONCESSION_TAG_LEADING_V3, CONCESSION_TAG_TRAILING_V3)
+        if v3
+        else (CONCESSION_TAG_LEADING, CONCESSION_TAG_TRAILING)
+    )
+    out = leading.sub("", text, count=1)
+    out = trailing.sub("", out).rstrip(" ,;:-")
     if tidy:
         out = _DANGLING_CONJUNCTION.sub("", out).rstrip(" ,;:-")
     if word_count(out) < 2:
@@ -3573,10 +3887,14 @@ def has_concession(text: object) -> bool:
     "I need to see if the price is fair").
     """
     folded = fold(text)
+    v2 = concession_read_v2()
+    if v2:
+        # D5-HF-CONCESSION1 and review D5R-2: scepticism and other people, never a yes.
+        folded = _NOT_WON_OVER.sub("", _MORE_CONVINCING.sub("", folded))
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
-        for match in _CONCESSION.finditer(folded)
+        for match in (_CONCESSION_V2 if v2 else _CONCESSION).finditer(folded)
     )
 
 

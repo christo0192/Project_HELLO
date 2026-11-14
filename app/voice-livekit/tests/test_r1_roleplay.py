@@ -14489,3 +14489,595 @@ class D4ReviewFarewellRunTests(unittest.TestCase):
         s = self.terse()
         s.say("Okay, thank you.", 870)
         self.assertIn("farewell_run_exit", s.say("Sure, take care.", 885).reasons)
+
+
+# --------------------------------------------------------------------------------------------------
+# Simulation diagnosis 5, learner lane (synthetic text only; no transcript words).  Each fix is
+# behind its own rollback flag (default ON; 0/off restores the release before): R1_CONCESSION_READ_V2,
+# R1_GUARD_TIDY_V3, R1_NO_ANSWER_READ, R1_ACK_PRESS, R1_ASK_VOICE_GATE, R1_TOPIC_REPEAT and
+# R1_POST_BYE_QUIET (R1_LLM_RECOVERY_V2 is tested in test_r1_core).
+# --------------------------------------------------------------------------------------------------
+import r1_guard  # noqa: E402
+import r1_prompts  # noqa: E402
+from r1_guard import GuardContext, guard_text, has_concession  # noqa: E402
+from r1_text import normalize as N  # noqa: E402
+
+
+def d5_flags(**values):
+    return mock.patch.dict(r1_roleplay.os.environ, values)
+
+
+def d5_ctx(**kwargs) -> GuardContext:
+    kwargs.setdefault("persona", D3_PERSONA)
+    kwargs.setdefault("phase", "roleplay")
+    return GuardContext(**kwargs)
+
+
+class D5ConcessionReadTests(unittest.TestCase):
+    """D5-HF-CONCESSION1 (R1_CONCESSION_READ_V2)."""
+
+    def test_scepticism_about_being_convinced_is_no_concession(self):
+        for text in (
+            "Seven and a half thousand is still more than I'd planned for, so it'd take some "
+            "convincing.",
+            "I'd need more convincing.",
+            "Honestly, it would take a lot of convincing.",
+        ):
+            self.assertFalse(has_concession(text), text)
+
+    def test_being_won_over_is_still_a_concession(self):
+        for text in ("You've convinced me.", "That's convincing.", "I'm convinced.", "Okay, you "
+                     "convinced me."):
+            self.assertTrue(has_concession(text), text)
+        self.assertFalse(has_concession("I'm not convinced yet."))
+
+    def test_the_guard_keeps_the_sceptical_sentence(self):
+        raw = (
+            "I'd need to run the numbers at home first. Seven and a half thousand is still more "
+            "than I'd planned for, so it'd take some convincing."
+        )
+        out = guard_text(raw, d5_ctx(free_reply=True, advisor_amounts=frozenset({7500})))
+        self.assertIn("take some convincing", out.text)
+        self.assertFalse(any(hit.category == r1_guard.CONCESSION for hit in out.hits))
+
+    def test_flag_off_reads_any_convinc_as_before(self):
+        with d5_flags(R1_CONCESSION_READ_V2="0"):
+            self.assertTrue(has_concession("It'd take some convincing."))
+
+
+class D5GuardTidyTests(unittest.TestCase):
+    """D5-GUARD-GARBLE1 (R1_GUARD_TIDY_V3)."""
+
+    def test_say_that_much_is_cut_whole(self):
+        out = r1_guard._strip_concession_tag(
+            "The direction feels right, I'll say that much.", tidy=True, v3=True
+        )
+        self.assertEqual(out, "The direction feels right.")
+        before = r1_guard._strip_concession_tag(
+            "The direction feels right, I'll say that much.", tidy=True
+        )
+        self.assertEqual(before, "The direction feels right much.")
+
+    def test_over_quota_tag_in_the_guard(self):
+        over = d5_ctx(free_reply=True, phrase_counts=(("concession_tag", 5),), echo_guard=True)
+        raw = "The direction feels right, I'll say that much."
+        self.assertEqual(guard_text(raw, r1_guard.replace(over, guard_tidy_v3=True)).text,
+                         "The direction feels right.")
+        self.assertEqual(guard_text(raw, over).text, "The direction feels right much.")
+
+    RAW = (
+        "Yes, I'm working full time, so evenings and weekends would be my only study time. "
+        "My schedule is pretty packed already, which is my main worry."
+    )
+
+    def test_the_surface_line_is_heard_once(self):
+        out = guard_text(self.RAW, d5_ctx(free_reply=True, guard_tidy_v3=True)).text
+        self.assertEqual(out.lower().count("schedule is pretty packed"), 1, out)
+        self.assertNotIn("evenings and weekends", out)
+
+    def test_a_later_sentence_loses_the_repeated_clause(self):
+        raw = (
+            "I have evenings and weekends only for this. My schedule is pretty packed, and I "
+            "worry about keeping up."
+        )
+        guard = r1_guard.StreamGuard(d5_ctx(free_reply=True, guard_tidy_v3=True))
+        spoken = []
+        for index, word in enumerate(raw.split(" ")):
+            spoken.extend(guard.feed(word if index == 0 else " " + word))
+        spoken.extend(guard.flush())
+        text = " ".join(spoken)
+        self.assertEqual(text.lower().count("schedule is pretty packed"), 1, text)
+        self.assertNotIn("evenings and weekends", text)
+        self.assertIn("I worry about keeping up.", text)
+
+    def test_flag_off_keeps_the_old_doubling(self):
+        out = guard_text(self.RAW, d5_ctx(free_reply=True)).text
+        self.assertEqual(out.lower().count("schedule is pretty packed"), 2, out)
+
+
+def d5_asked_session(question="How big are the classes, roughly?"):
+    """An engine whose learner's last heard line asked the advisor something."""
+    s = Session(engine())
+    s.say(OPENER, 20)
+    s.reply = question
+    s.say("Happy to help with any questions you have.", 40)
+    assert s.spoken[-1].endswith("?"), s.spoken[-1]
+    return s
+
+
+class D5NoAnswerReadTests(unittest.TestCase):
+    """D5-LRN-ASSUME1 (R1_NO_ANSWER_READ)."""
+
+    def test_the_reader(self):
+        self.assertTrue(r1_roleplay.no_answer_turn("Okay. Yeah, it is my."))
+        self.assertTrue(r1_roleplay.no_answer_turn("Okay, so let me clarify that."))
+        self.assertTrue(r1_roleplay.no_answer_turn("Yeah, okay, so...", after_question=True))
+        self.assertFalse(r1_roleplay.no_answer_turn("Sure."))
+        self.assertFalse(r1_roleplay.no_answer_turn("That is just how it is."))
+        self.assertFalse(r1_roleplay.no_answer_turn("Let me clarify: the batches are small."))
+        self.assertFalse(r1_roleplay.no_answer_turn("Okay, yeah, it is my?"))
+        self.assertFalse(
+            r1_roleplay.no_answer_turn("The course runs six months, with live classes and the")
+        )
+
+    def _reply_after(self, advisor, raw, *, question="How big are the classes, roughly?"):
+        s = d5_asked_session(question)
+        s.reply = raw
+        s.ack = raw
+        plan = s.say(advisor, 60)
+        return s, plan
+
+    def test_a_fragment_gets_the_note_and_no_good_to_know(self):
+        raw = "Good to know the class size is manageable. How many people is that, roughly?"
+        s, plan = self._reply_after("Okay. Yeah, it is my.", raw)
+        self.assertTrue(
+            r1_prompts.NO_ANSWER_NOTE in plan.reminder
+            or r1_prompts.NO_ANSWER_INTENT_NOTE in plan.reminder
+        )
+        self.assertNotIn("Good to know", s.spoken[-1])
+        self.assertTrue(s.spoken[-1])
+
+    def test_an_announcement_gets_no_right_so_its(self):
+        raw = "Right, so it's more cohort-based with some individual time. Okay."
+        s, plan = self._reply_after("Okay, so let me clarify that.", raw)
+        self.assertNotIn("Right, so it's", s.spoken[-1])
+        if plan.mode is TurnMode.INTENT:
+            self.assertIn(r1_prompts.INTENT_SHAPE_NO_ANSWER, plan.reminder)
+            for line in r1_prompts.INTENT_OPENER_NOTES:
+                self.assertNotIn(line, plan.reminder)
+
+    def test_an_owed_move_keeps_its_markers(self):
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        missed = eng.plan_turn(PITCH, 60)
+        eng.record_spoken(missed, "Okay, I see. Hmm.", r_sec=61)  # the owed point was not said
+        plan = eng.plan_turn("Okay, so let me clarify that.", 90)
+        self.assertIs(plan.mode, TurnMode.INTENT)
+        self.assertIn(r1_prompts.INTENT_SHAPE_NO_ANSWER, plan.reminder)
+        self.assertIn(r1_prompts.NO_ANSWER_INTENT_NOTE, plan.reminder)
+        spoken = eng.compose_speech(
+            plan, "Right, so it's more cohort-based with some individual time."
+        ).text
+        self.assertNotIn("Right, so it's", spoken)
+        eng.record_spoken(plan, spoken, r_sec=91)
+        self.assertTrue(eng.scheduler.is_delivered(plan.move_id), spoken)
+
+    def test_flag_off_is_unchanged(self):
+        with d5_flags(R1_NO_ANSWER_READ="0"):
+            raw = "Good to know the class size is manageable. How many people is that, roughly?"
+            s, plan = self._reply_after("Okay. Yeah, it is my.", raw)
+            self.assertNotIn(r1_prompts.NO_ANSWER_NOTE, plan.reminder or "")
+            self.assertNotIn(r1_prompts.NO_ANSWER_INTENT_NOTE, plan.reminder or "")
+            self.assertFalse(plan.guard_ctx.contentless)
+
+
+class D5AckPressTests(unittest.TestCase):
+    """D5-LRN-ACKFALL1 (R1_ACK_PRESS)."""
+
+    QUESTION = "What's actually included if I sign up?"
+
+    def test_a_dropped_re_ask_after_a_lone_okay_presses(self):
+        context = d5_ctx(
+            free_reply=True, said=(N(self.QUESTION),), ack_press=True, advisor_hollow=True
+        )
+        out = guard_text("You didn't answer my question, what's actually included if I sign up?",
+                         context)
+        self.assertIn(out.text, r1_guard.PRESS_REPLIES)
+
+    def test_a_press_line_already_said_is_skipped(self):
+        said = tuple(N(text) for text in (self.QUESTION, *r1_guard.PRESS_REPLIES[:2]))
+        context = d5_ctx(free_reply=True, said=said, ack_press=True, advisor_hollow=True)
+        self.assertEqual(guard_text(self.QUESTION, context).text, r1_guard.PRESS_REPLIES[2])
+
+    def test_a_lone_okay_after_a_statement_still_gets_a_neutral_ack(self):
+        line = "I've tried a bit of online stuff before."
+        context = d5_ctx(free_reply=True, said=(N(line),), ack_press=True, advisor_hollow=True)
+        self.assertIn(guard_text(line, context).text, r1_guard.NEUTRAL_ACKS)
+
+    def test_flag_off_keeps_the_back_channel(self):
+        context = d5_ctx(free_reply=True, said=(N(self.QUESTION),), advisor_hollow=True)
+        self.assertIn(guard_text(self.QUESTION, context).text, r1_guard.NEUTRAL_ACKS)
+
+    def test_the_engine_reads_the_lone_okay_and_widens_the_re_ask(self):
+        s = d5_asked_session("What's included in the fee, by the way?")
+        s.reply = "And how many hours a week would it take?"
+        s.say("Good question, it varies by learner.", 60)
+        plan = s.say("Okay.", 80, backchannel=True)
+        self.assertTrue(plan.guard_ctx.ack_press)
+        self.assertTrue(plan.guard_ctx.advisor_hollow)
+        self.assertIn(r1_roleplay.normalize("What's included in the fee, by the way?"),
+                      plan.guard_ctx.reask)
+        with d5_flags(R1_ACK_PRESS="0"):
+            s = d5_asked_session("What's included in the fee, by the way?")
+            s.reply = "And how many hours a week would it take?"
+            s.say("Good question, it varies by learner.", 60)
+            plan = s.say("Okay.", 80, backchannel=True)
+            self.assertNotIn(r1_roleplay.normalize("What's included in the fee, by the way?"),
+                             plan.guard_ctx.reask)
+
+    def test_the_m04_shape_never_ends_on_a_bare_okay(self):
+        s = d5_asked_session("So what would a typical week look like for me, week to week?")
+        s.reply = "So, what would a typical week actually look like for me?"
+        s.say("Sure, I can share more about that later.", 60)
+        s.reply = "So, what would a typical week actually look like for me?"
+        s.say("Yeah, okay.", 80, backchannel=True)
+        self.assertNotIn(s.spoken[-1], r1_guard.NEUTRAL_ACKS)
+
+
+class D5AskVoiceGateTests(unittest.TestCase):
+    """D5-HF-UNEARNED1 (R1_ASK_VOICE_GATE)."""
+
+    URGENCY = (
+        "Totally fair. Once you and your husband decide, it's worth moving fairly soon to lock in "
+        "a place and the discount."
+    )
+
+    def turn(self, text, r=853):
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(text, r)
+        return eng, plan
+
+    def test_an_urgency_remark_is_no_ask(self):
+        eng, plan = self.turn(self.URGENCY)
+        self.assertIsNone(eng._turn_ask)
+        self.assertIn("enrol_phrase_unvoiced", plan.reasons)
+        self.assertFalse(any(reason.startswith("ask_in_window") for reason in plan.reasons))
+        self.assertIsNone(plan.commitment_level)
+
+    def test_an_offer_or_a_suggestion_still_asks(self):
+        for text in ("Shall I lock in a place for you?", "Let's lock in your seat.",
+                     "Book your seat today, then."):
+            eng, plan = self.turn(text)
+            self.assertIs(eng._turn_ask, r1_roleplay.AskKind.ENROL, text)
+
+    def test_other_enrolment_phrases_keep_production_reading(self):
+        eng, _plan = self.turn("The payment link is in your inbox.")
+        from r1_commitment import detect_ask
+
+        expected = detect_ask("The payment link is in your inbox.")
+        self.assertEqual(eng._turn_ask, None if expected is None else expected.kind)
+
+    def test_flag_off_reads_the_remark_as_before(self):
+        with d5_flags(R1_ASK_VOICE_GATE="0"):
+            eng, plan = self.turn(self.URGENCY)
+            self.assertIs(eng._turn_ask, r1_roleplay.AskKind.ENROL)
+
+
+class D5TopicRepeatTests(unittest.TestCase):
+    """D5-LRN-TOPICREP1 (R1_TOPIC_REPEAT)."""
+
+    def test_the_guard_holds_a_raised_topic_beside_other_words(self):
+        context = d5_ctx(free_reply=True, topic_recent=frozenset({"monthly"}))
+        out = guard_text("That's still a lot for me. What's the actual monthly payment?", context)
+        self.assertEqual(out.text, "That's still a lot for me.")
+
+    def test_a_reply_is_never_emptied(self):
+        context = d5_ctx(free_reply=True, topic_recent=frozenset({"monthly"}))
+        out = guard_text("What's the actual monthly payment, though?", context)
+        self.assertEqual(out.text, "What's the actual monthly payment, though?")
+
+    def test_an_owed_move_keeps_its_words(self):
+        context = d5_ctx(carries_move=True, topic_recent=frozenset({"monthly"}))
+        out = guard_text("That's a lot. What's the monthly payment on that?", context)
+        self.assertIn("monthly payment", out.text)
+
+    def test_the_come_back_passes_once(self):
+        context = d5_ctx(free_reply=True, topic_recent=frozenset({"payment"}),
+                      reask_topic="payment")
+        out = guard_text("Okay, sure. Could I pay it month by month, then?", context)
+        self.assertIn("month by month", out.text)
+
+    FIRSTS = (
+        "Hmm, I hear you on the value.",
+        "I get that it's a good course.",
+        "That's fair enough as a pitch.",
+        "I understand there's a lot in it.",
+        "Okay, the mentors sound good.",
+        "Right, the projects sound useful.",
+        "I see what you mean about the career.",
+        "That makes sense for some people.",
+    )
+    ASKS = (
+        "I'd still need the actual monthly amount, though.",
+        "I really need to hear the real monthly figure.",
+        "The actual monthly payment is what matters to me.",
+        "Without a monthly amount I can't plan anything.",
+        "I'd want the monthly figure before anything else.",
+        "Knowing what I'd pay each month is the key thing.",
+        "The monthly cost is still the big unknown for me.",
+        "I still don't know what that is per month.",
+    )
+    DODGES = (
+        "The value you get is incredible, honestly.",
+        "Our learners love the program and the community.",
+        "It really pays for itself once you land a role.",
+        "Let's not worry about numbers just yet.",
+        "The mentors are fantastic, truly world class.",
+        "Think of it as an investment in yourself.",
+        "We have a lot of happy alumni.",
+        "It's about the outcome, not the cost.",
+    )
+
+    def run_dodges(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        r = 40
+        for first, ask, dodge in zip(self.FIRSTS, self.ASKS, self.DODGES):
+            s.reply = f"{first} {ask}"
+            s.say(dodge, r)
+            r += 25
+        return s
+
+    def monthly_window(self, s):
+        asks = [r1_guard.TOPIC_PATTERNS["monthly"].search(line) is not None for line in s.spoken]
+        return max(sum(asks[i : i + 4]) for i in range(max(1, len(asks) - 3)))
+
+    def test_the_price_never_sequence_asks_at_most_twice_in_four(self):
+        self.assertLessEqual(self.monthly_window(self.run_dodges()), 2)
+
+    def test_flag_off_asks_more(self):
+        with d5_flags(R1_TOPIC_REPEAT="0"):
+            self.assertGreater(self.monthly_window(self.run_dodges()), 2)
+
+
+class D5PostByeQuietTests(unittest.TestCase):
+    """D5-LRN-POSTBYE1 (R1_POST_BYE_QUIET)."""
+
+    def bye_session(self):
+        s = done_session()
+        # Christy's two early-close asks were answered "carry on" already: a close is held.
+        s.eng._wrap_offers.extend(
+            {"trigger": r1_roleplay.TRIGGER_EARLY_CLOSE, "answer": "no", "r_sec": 0.0}
+            for _ in range(2)
+        )
+        s.say("We'll go over the pricing again, no problem. Bye.", 771)
+        return s
+
+    def test_his_goodbye_sets_the_state_and_closes_curiosity(self):
+        s = self.bye_session()
+        self.assertTrue(s.eng._bye_heard)
+        self.assertTrue(s.eng._curiosity_closed(780))
+
+    def test_no_new_topic_question_after_his_bye(self):
+        s = self.bye_session()
+        s.reply = (
+            "Yeah, totally get it. Does any support continue after the course finishes, like help "
+            "with the job hunt?"
+        )
+        plan = s.say("Yeah, totally get it.", 790)
+        self.assertNotIn("?", s.spoken[-1])
+        self.assertTrue(plan.guard_ctx.bye_heard or plan.mode is not TurnMode.LLM_REPLY)
+
+    def test_a_bare_ack_after_the_bye_gets_her_goodbye(self):
+        s = self.bye_session()
+        plan = s.say("Okay.", 790)
+        self.assertIn("bye_heard_quiet", plan.reasons)
+        self.assertIn("closing_winding", plan.reasons)
+        with d5_flags(R1_POST_BYE_QUIET="0"):
+            s = self.bye_session()
+            self.assertNotIn("bye_heard_quiet", s.say("Okay.", 790).reasons)
+
+    def test_an_owed_forced_move_still_lands_after_the_bye(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.eng._wrap_offers.extend(
+            {"trigger": r1_roleplay.TRIGGER_EARLY_CLOSE, "answer": "no", "r_sec": 0.0}
+            for _ in range(2)
+        )
+        s.say("We'll go over the pricing again, no problem. Bye.", 771)
+        plan = s.say("Okay.", 790)
+        self.assertNotIn("bye_heard_quiet", plan.reasons)
+        self.assertIsNotNone(plan.move_id)
+
+    def test_a_question_releases_it(self):
+        s = self.bye_session()
+        s.say("Actually, wait, how many hours a week could you give it?", 790)
+        self.assertFalse(s.eng._bye_heard)
+
+    def test_flag_off_keeps_the_old_path(self):
+        with d5_flags(R1_POST_BYE_QUIET="0"):
+            s = self.bye_session()
+            self.assertFalse(s.eng._bye_heard)
+            s.reply = "Yeah. Does any support continue after the course finishes?"
+            plan = s.say("Yeah, totally get it.", 790)
+            self.assertFalse(plan.guard_ctx.bye_heard)
+
+
+# --------------------------------------------------------------------------------------------------
+# Simulation diagnosis 5, learner review follow-up (D5R-1..D5R-8; synthetic text only).
+# --------------------------------------------------------------------------------------------------
+class D5RAskVoiceGateTests(unittest.TestCase):
+    """D5R-1: a real enrolment ask is never read as unvoiced urgency."""
+
+    ASKS = (
+        "When you're ready, pay the deposit today.",
+        "Once you and your husband decide, pay the deposit to hold your seat.",
+        "It's best to pay the deposit now.",
+        "When you're ready, the payment link is in the email.",
+        "Alright, book your seat today.",
+        "Alright book your seat today.",
+        "Yeah, reserve your spot then.",
+        "Meera, lock in your seat today.",
+        "Honestly, just lock in your seat.",
+        "I'd suggest you reserve your seat today.",
+        "So my recommendation: book your seat today.",
+        "We're happy to hold a seat for you.",
+        "Seats fill up fast, so I'd book your seat this week.",
+        "Take a day to think, and book your seat by Friday.",
+        "Go ahead and lock in your seat.",
+    )
+
+    def test_every_real_ask_is_voiced(self):
+        for text in self.ASKS:
+            self.assertTrue(r1_roleplay.enrol_ask_voiced(text), text)
+
+    def test_the_urgency_remarks_stay_unvoiced(self):
+        for text in (
+            D5AskVoiceGateTests.URGENCY,
+            "Most people lock in a seat in the first week.",
+            "It's worth moving soon to lock in your seat.",
+        ):
+            self.assertFalse(r1_roleplay.enrol_ask_voiced(text), text)
+
+    def test_the_engine_keeps_the_ask(self):
+        for text in (
+            "When you're ready, pay the deposit today.",
+            "Meera, lock in your seat today.",
+        ):
+            eng = engine()
+            eng.plan_turn(OPENER, 20)
+            plan = eng.plan_turn(text, 853)
+            self.assertIs(eng._turn_ask, r1_roleplay.AskKind.ENROL, text)
+            self.assertNotIn("enrol_phrase_unvoiced", plan.reasons)
+
+
+class D5RConcessionReadTests(unittest.TestCase):
+    """D5R-2: every way of being won over is a concession with R1_CONCESSION_READ_V2 on."""
+
+    WON_OVER = (
+        "That convinced me.",
+        "That really convinced me, honestly.",
+        "Your answer convinced me.",
+        "Okay, the placement numbers convinced me.",
+        "Honestly, that's what convinced me.",
+        "You've got me convinced.",
+        "You're convincing me.",
+        "I'm now fully convinced.",
+        "I'm a hundred percent convinced.",
+    )
+
+    def test_won_over_reads_as_a_concession(self):
+        for text in self.WON_OVER:
+            self.assertTrue(has_concession(text), text)
+
+    def test_scepticism_and_other_people_stay_no_concession(self):
+        for text in (
+            "I'd need more convincing.",
+            "It'd take some convincing.",
+            "I'd need convincing on the price.",
+            "I'm not convinced yet.",
+            "That hasn't convinced me.",
+            "I'd have to convince my husband first.",
+            "You'll have to convince me.",
+            "Convince me, then.",
+            "Are you trying to convince me?",
+            "I'm convinced yet",
+        ):
+            self.assertFalse(has_concession(text), text)
+
+    def test_the_guard_blocks_an_unearned_won_over_line(self):
+        out = guard_text("Okay, the placement numbers convinced me.", d5_ctx(free_reply=True))
+        self.assertTrue(any(hit.category == r1_guard.CONCESSION for hit in out.hits), out.text)
+
+
+class D5RTopicRepeatTests(unittest.TestCase):
+    """D5R-3: the asked-for re-ask is never held back as a topic repeat, and the reader's false
+    positives are gone."""
+
+    def test_the_asked_for_re_ask_stays(self):
+        context = d5_ctx(
+            free_reply=True,
+            topic_recent=frozenset({"monthly"}),
+            reask=(N("What would the actual monthly amount be, roughly?"),),
+        )
+        out = guard_text("Sure. So what would the monthly amount come to, roughly?", context)
+        self.assertIn("monthly amount", out.text)
+
+    def test_the_engine_keeps_the_re_ask_after_a_lone_okay(self):
+        s = d5_asked_session("What would the actual monthly amount be, roughly?")
+        s.reply = "Sure. So what would the monthly amount come to, roughly?"
+        s.say("Okay.", 80, backchannel=True)
+        self.assertIn("monthly amount", s.spoken[-1])
+
+    def test_reader_false_positives(self):
+        self.assertNotIn("monthly", r1_guard.topics_raised("I could start in a month or so."))
+        self.assertNotIn("fall_behind", r1_guard.topics_raised("I can't keep up with my job."))
+        self.assertNotIn("price", r1_guard.topics_raised("What's the exact number of hours?"))
+        self.assertIn("monthly", r1_guard.topics_raised("How much would I pay a month?"))
+        self.assertIn("monthly", r1_guard.topics_raised("What is that per month?"))
+        self.assertIn("fall_behind", r1_guard.topics_raised("I worry about keeping up."))
+        self.assertIn("price", r1_guard.topics_raised("What's the exact number, then?"))
+
+
+class D5RAssumedAnswerTests(unittest.TestCase):
+    """D5R-4: after a turn that told her nothing, a re-ask or a cut-out remark stays, and a reply
+    emptied by the drop never falls back to a bare back-channel."""
+
+    def ctx(self):
+        return d5_ctx(free_reply=True, contentless=True)
+
+    def test_re_asks_and_cut_out_lines_stay(self):
+        for text in (
+            "Sounds like you cut out there.",
+            "Sounds like you got cut off, sorry.",
+            "Right, so how big are the batches?",
+            "So it's online, right?",
+        ):
+            self.assertEqual(guard_text(text, self.ctx()).text, text)
+
+    def test_an_emptied_reply_says_the_line_cut_out(self):
+        out = guard_text("Good to know the class size is manageable.", self.ctx())
+        self.assertIn(out.text, r1_guard.CUT_OUT_REPLIES)
+
+    def test_the_assumed_answer_still_goes_beside_more(self):
+        out = guard_text(
+            "Good to know the class size is manageable. How many people is that?", self.ctx()
+        )
+        self.assertEqual(out.text, "How many people is that?")
+
+
+class D5RGuardTidyTests(unittest.TestCase):
+    """D5R-5: a "much" that belongs to the sentence is never cut with the tag."""
+
+    def test_the_sentence_keeps_its_much(self):
+        cases = {
+            "I like the structure very much, I'll give you that.": (
+                "I like the structure very much."
+            ),
+            "I appreciate that very much, I'll admit.": "I appreciate that very much.",
+            "It doesn't cost that much, I'll give you that.": "It doesn't cost that much.",
+            "Not too much, I'll grant you that.": "Not too much.",
+            "The direction feels right, I'll say that much.": "The direction feels right.",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(
+                r1_guard._strip_concession_tag(raw, tidy=True, v3=True), expected, raw
+            )
+
+
+class D5RPostByeTests(unittest.TestCase):
+    """D5R-8: a substantive statement after his goodbye resumes the call."""
+
+    def test_a_statement_with_substance_releases_the_quiet(self):
+        s = D5PostByeQuietTests.bye_session(D5PostByeQuietTests())
+        s.say("Actually, one more thing, there's a scholarship this week.", 790)
+        self.assertFalse(s.eng._bye_heard)
+        self.assertFalse(s.eng._curiosity_closed(800))
+        plan = s.say("Okay.", 810)
+        self.assertNotIn("bye_heard_quiet", plan.reasons)
+
+    def test_a_bare_courtesy_keeps_it(self):
+        s = D5PostByeQuietTests.bye_session(D5PostByeQuietTests())
+        s.say("Yeah, totally get it.", 790)
+        self.assertTrue(s.eng._bye_heard)
