@@ -204,7 +204,7 @@ from r1_end_intent import (
     parse_end_intent,
     prefilter_hit,
 )
-from r1_guard import FALLBACK_REPLY, HIRING_MENTION, StreamGuard
+from r1_guard import FALLBACK_REPLIES, FALLBACK_REPLY, HIRING_MENTION, StreamGuard
 from r1_latency import (
     GATE_PHASE,
     LatencyTracker,
@@ -272,6 +272,17 @@ R1_RECORD = False
 NO_SHOW_SECONDS = 120.0
 ACTIVATION_SECONDS = 15.0
 TURN_DEADLINE_SECONDS = 12.0
+# Simulation diagnosis 5 (D5-RELIAB1, R1_LLM_RECOVERY_V2): a role-play reply that hung with nothing
+# said is asked for once more, on this shorter wall-clock deadline.
+LLM_RETRY_DEADLINE_SECONDS = 6.0
+
+
+def llm_recovery_v2() -> bool:
+    """D5-RELIAB1 (R1_LLM_RECOVERY_V2, read at use; default ON, 0/off restores the release before):
+    the first hung role-play reply in a row is retried once (its owed point's scripted variant, or
+    the same messages on a 6 s deadline), and the learner's recovery line is a holding line."""
+    raw = os.getenv("R1_LLM_RECOVERY_V2") or "1"
+    return raw.strip().lower() not in ("0", "off", "false", "no")
 FILLER_AFTER_SECONDS = 4.0
 # A reply the SDK cancelled before any audio, for a candidate who then only made a noise ("Sorry",
 # "Thank you."), leaves the candidate waiting from their real answer.  The next reply's filler is
@@ -2019,6 +2030,9 @@ class R1Interview:
         self._activated: bool | None = False
         self._failures = 0
         self._generation = 0
+        # D5-RELIAB1: holding lines said in place of a hung learner reply (count, and which).
+        self._holding_lines = 0
+        self._holding_said: set[str] = set()
         self._turn_index = 0
         self._closed = False
         self._exiting = False
@@ -4490,6 +4504,11 @@ class R1Interview:
                 phase=self.machine.transcript_phase(),
             )
             return self._single(FALLBACK_REPLY)
+        if reply.retry_text:
+            # D5-RELIAB1: the retry of a hung intent is its owed point's scripted variant, with no
+            # model call (and so never an answer from the provider).
+            text, reply.retry_text = reply.retry_text, ""
+            return self._single(text)
         plan = reply.plan
         if plan is not None and plan.mode is TurnMode.SAY_ONLY:
             return self._single(plan.scripted_text)
@@ -4503,7 +4522,7 @@ class R1Interview:
             source = self._intent_reply(lambda: provider(messages), guard, reply)
         else:
             source = self._screened(lambda: provider(messages), guard, reply)
-        return self.guard_llm_stream(source)
+        return self.guard_llm_stream(source, reply=reply)
 
     async def _screened(
         self,
@@ -4733,7 +4752,9 @@ class R1Interview:
             max(FILLER_RESTART_MIN_SECONDS, FILLER_AFTER_SECONDS - waited),
         )
 
-    async def guard_llm_stream(self, stream: Any) -> AsyncIterator[Any]:
+    async def guard_llm_stream(
+        self, stream: Any, *, reply: Reply | None = None
+    ) -> AsyncIterator[Any]:
         """Own one reply's deadlines: a 4 s filler and a 12 s wall clock (plan section 5.11).
 
         Everything here is scoped to THIS generation, so a slow turn can never
@@ -4743,6 +4764,11 @@ class R1Interview:
         (``_filler_delay``).  The 12 s deadline is wall clock on purpose: DeepSeek SSE
         keep-alives defeat read timeouts.  Only an LLM reply (its first chunk) resets the
         failure count; scripted lines, fillers included, never do.
+
+        D5-RELIAB1 (R1_LLM_RECOVERY_V2): ``reply`` is the prepared reply.  The first hung role-play
+        reply in a row with nothing said is asked for once more (``_retry_reply``) instead of the
+        recovery line; that retry runs on ``LLM_RETRY_DEADLINE_SECONDS``, never resets the failure
+        count and, when it hangs too, is not counted again: the holding line follows it.
         """
         from r1_llm import assert_thinking_disabled
 
@@ -4751,7 +4777,8 @@ class R1Interview:
         generation = self._generation
         started_phase = self.machine.phase
         started = loop.time()
-        deadline = started + TURN_DEADLINE_SECONDS
+        retrying = reply is not None and reply.retry
+        deadline = started + (LLM_RETRY_DEADLINE_SECONDS if retrying else TURN_DEADLINE_SECONDS)
         filler_at = started + self._filler_delay()
         filler_done = not self._candidate_present
         got_first_chunk = False
@@ -4777,6 +4804,8 @@ class R1Interview:
                     return
                 if not got_first_chunk:
                     got_first_chunk = True
+                    if retrying:
+                        self._skip_failure_reset = True  # D5-RELIAB1: a retry is no fresh answer
                     self._on_reply_started()
                 usage = getattr(item, "usage", None)
                 if usage is not None:
@@ -4787,7 +4816,10 @@ class R1Interview:
             # of the speech that is awaiting this very generator can never finish.
             # A stale generation still counts as a failure but must never interrupt
             # the session while a newer reply is the one being spoken.
-            self._record_generation_failure()
+            if retrying:
+                self._wake()  # D5-RELIAB1: the hung reply was counted already
+            else:
+                self._record_generation_failure()
             if generation == self._generation:
                 # Nothing of the model's reply was spoken (the filler is not one): once the
                 # hung speech is cut, the candidate hears the recovery line instead of dead air
@@ -4797,12 +4829,23 @@ class R1Interview:
                     and not self._exiting
                     and self._stop_outcome() is None
                 )
+                # D5-RELIAB1: the first hung role-play reply in a row is asked for once more.
+                retry = (
+                    recover
+                    and not retrying
+                    and reply is not None
+                    and reply.plan is not None
+                    and started_phase is R1Phase.ROLEPLAY
+                    and self._failures == 1
+                    and llm_recovery_v2()
+                )
                 # This runs inside the hung reply's own LLM task, so the bound voice is the
                 # hung reply's: the recovery line answers in the voice that was due to answer.
                 self._spawn(
                     self._interrupt_session(
                         recover_in=started_phase if recover else None,
                         recover_voice=self._bound_voice(),
+                        retry_reply=reply if retry else None,
                     )
                 )
             raise
@@ -4845,7 +4888,11 @@ class R1Interview:
         )
 
     async def _interrupt_session(
-        self, *, recover_in: R1Phase | None = None, recover_voice: str | None = None
+        self,
+        *,
+        recover_in: R1Phase | None = None,
+        recover_voice: str | None = None,
+        retry_reply: Reply | None = None,
     ) -> None:
         """Cut a hung generation's speech, but never a protected scripted line.
 
@@ -4868,8 +4915,75 @@ class R1Interview:
                         error_type="r1_generation_interrupt_failed",
                         error_category=_error_type_of(exc),
                     )
-        if recover_in is not None:
+        if recover_in is not None and retry_reply is not None:
+            await self._retry_reply(recover_in, retry_reply, voice=recover_voice)
+        elif recover_in is not None:
             await self._speak_recovery(recover_in, voice=recover_voice)
+
+    async def _retry_reply(self, phase: R1Phase, reply: Reply, voice: str | None = None) -> None:
+        """D5-RELIAB1: ask once more for the role-play reply that hung with nothing said.
+
+        An intent's retry is its owed point's scripted variant (no model call); a free reply's is
+        the same plan and messages again, on ``LLM_RETRY_DEADLINE_SECONDS``.  Either way it is a
+        reply the SDK generates for the same prepared ``Reply``, so the engine records it as the
+        plan's line.  Nothing is asked for once the phase moved on, an abort is due, the candidate
+        left or the session cannot generate; then the holding line is said instead.
+        """
+        if (
+            self._exiting
+            or not self._candidate_present
+            or self._stop_outcome() is not None
+            or self.machine.phase is not phase
+        ):
+            return
+        generate = getattr(self.session, "generate_reply", None)
+        if not callable(generate):
+            await self._speak_recovery(phase, voice=voice)
+            return
+        plan = reply.plan
+        scripted = ""
+        if plan is not None and plan.mode is TurnMode.INTENT:
+            try:
+                scripted = self.engine.intent_tail(plan, "")
+            except Exception:  # noqa: BLE001 - the model retry is the fallback
+                scripted = ""
+        reply.retry = True
+        reply.retry_text = scripted
+        reply.recorded = False  # a filler the hung reply played is not the plan's line
+        _log.info(
+            "unknown_event",
+            error_type="r1_llm_retry",
+            error_category="scripted" if scripted else "model",
+            phase=self.machine.transcript_phase(),
+        )
+        self._last_reply = self._latest_reply = reply  # the new speech pairs with this reply
+        try:
+            generate()  # a SpeechHandle: never awaited (that waits out its whole playout)
+        except Exception as exc:  # noqa: BLE001 - the candidate must still hear something
+            self._latest_reply = None
+            reply.retry_text = ""
+            _log.warn(
+                "unknown_event",
+                error_type="r1_llm_retry_failed",
+                error_category=_error_type_of(exc),
+            )
+            await self._speak_recovery(phase, voice=voice)
+
+    def _holding_line(self) -> str:
+        """D5-RELIAB1: the learner's recovery line, a rotated holding line never said before in
+        this session (``FALLBACK_REPLIES``); once all were said, the rotation goes on."""
+        seed = getattr(self.engine, "seed", "") or ""
+        start = sum(seed.encode("utf-8")) if seed else 0
+        count = len(FALLBACK_REPLIES)
+        for offset in range(count):
+            candidate = FALLBACK_REPLIES[(start + self._holding_lines + offset) % count]
+            if candidate not in self._holding_said:
+                break
+        else:
+            candidate = FALLBACK_REPLIES[(start + self._holding_lines) % count]
+        self._holding_lines += 1
+        self._holding_said.add(candidate)
+        return candidate
 
     async def _speak_recovery(self, phase: R1Phase, voice: str | None = None) -> None:
         """Say the safe fallback after a model reply that never spoke (the timeout path).
@@ -4889,11 +5003,23 @@ class R1Interview:
             or phase not in _REPLY_PHASES
         ):
             return
+        speaker = voice if voice in VOICES else self._voice_for_phase(phase)
+        text = FALLBACK_REPLY
+        if speaker == LEARNER and llm_recovery_v2():
+            # D5-RELIAB1: "Sorry, what were you saying?" was banned for the learner (R1-Q
+            # iteration 3); she holds the floor like a person thinking.  Christy keeps the line.
+            text = self._holding_line()
+        _log.info(
+            "unknown_event",
+            error_type="r1_llm_recovery",
+            error_category=speaker,
+            phase=self.machine.transcript_phase(),
+        )
         await self._say_text(
-            FALLBACK_REPLY,
+            text,
             interruptible=True,
             marker="llm_recovery",
-            voice=voice if voice in VOICES else self._voice_for_phase(phase),
+            voice=speaker,
         )
 
     def _record_generation_failure(self) -> None:

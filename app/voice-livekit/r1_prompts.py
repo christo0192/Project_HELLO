@@ -892,6 +892,22 @@ OPEN_QUESTION_AFTER_ASK_NOTE_V2 = (
     "without pointing out what they said or how often; if they already said yes, ask how it "
     "would work. Ask nothing else."
 )
+# Simulation diagnosis 5 (D5-LRN-ASSUME1, R1_NO_ANSWER_READ; new wording under D-M032-4): the
+# advisor's turn was a fragment, fillers or "let me clarify that", and she reacted to an answer
+# nobody gave ("Good to know the class size is manageable").
+NO_ANSWER_NOTE = (
+    "- They have not told you anything yet in this turn. Do not say or imply they answered or "
+    "explained anything; if you asked something, ask it again briefly in other words, or say the "
+    "line seems to have cut out."
+)
+NO_ANSWER_INTENT_NOTE = (
+    "- They have not told you anything yet in this turn. Do not say or imply they answered or "
+    "explained anything."
+)
+INTENT_SHAPE_NO_ANSWER = (
+    "Reply as the learner, naturally: they have not really said anything yet, so there is nothing "
+    "to react to. Bring in the point below in your own words, as one short thought."
+)
 NO_REPEAT_REASK_NOTE = (
     "- Apart from the question you are coming back to, do not repeat anything you already said "
     "earlier in this call."
@@ -1252,6 +1268,7 @@ def turn_reminder(
     winding: bool = False,
     role_confusion: str = "",
     come_back: bool = False,
+    no_answer: bool = False,
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -1304,6 +1321,9 @@ def turn_reminder(
 
     ``come_back`` (M032 SWEEP-7): the reply comes back to her dodged question (its note is in
     ``notes``), so ``NO_REPEAT_REASK_NOTE`` takes the place of ``NO_REPEAT_NOTE``.
+
+    ``no_answer`` (D5-LRN-ASSUME1): the advisor's turn told her nothing, so an intent's shape is
+    ``INTENT_SHAPE_NO_ANSWER`` (no reaction to open with).
     """
     if winding and not intent_brief and not reaction_only and not confirm:
         style_note = ""
@@ -1322,7 +1342,11 @@ def turn_reminder(
         if voice_v2:
             lines.append(LEARNER_DELIVERY_RIDER_BASE)
         return "\n".join(lines)
-    if intent_brief and answering:
+    if intent_brief and no_answer:
+        # D5-LRN-ASSUME1 (R1_NO_ANSWER_READ): his turn told her nothing, so the intent has no
+        # reaction to open with (``no_answer``; its note is in ``notes``).
+        lines.append(INTENT_SHAPE_NO_ANSWER)
+    elif intent_brief and answering:
         # L2 (mock call aa166f09: 18 of 41 replies tacked a new worry onto a short acknowledgement,
         # and turn 52 answered "what ROI are you expecting?" with a question of her own).
         lines.append(INTENT_ANSWERING_NOTE)

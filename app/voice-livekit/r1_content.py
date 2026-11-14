@@ -233,7 +233,14 @@ import r1_world
 #    notes and the F3 worry without brand names join the manifest (``_diag4_repairs``) beside the
 #    texts they replace while their flags are on.  No graded marker, must-say, meaning or deadline
 #    changed; with every flag off the lines, reminders and readers are the release before.
-CONTENT_REVISION = 30
+# 31: Simulation diagnosis 5 (the full-interview flow judge, round 5; rollback flags
+#    R1_CONCESSION_READ_V2, R1_GUARD_TIDY_V3, R1_NO_ANSWER_READ, R1_ACK_PRESS, R1_ASK_VOICE_GATE,
+#    R1_TOPIC_REPEAT, R1_POST_BYE_QUIET and R1_LLM_RECOVERY_V2).  The no-answer notes and the intent
+#    shape for a turn that told her nothing, and the learner's press lines after a lone "Okay." to
+#    her question, join the manifest (``_diag5_repairs``) beside the texts they replace while their
+#    flags are on.  No graded marker, must-say, meaning or deadline changed; with every flag off the
+#    lines, reminders and readers are the release before.
+CONTENT_REVISION = 31
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -638,6 +645,17 @@ def _diag4_repairs() -> dict[str, Any]:
     }
 
 
+def _diag5_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 5 (revision 31): the no-answer notes and the press lines."""
+    p = r1_prompts
+    return {
+        "no_answer_note": p.NO_ANSWER_NOTE,
+        "no_answer_intent_note": p.NO_ANSWER_INTENT_NOTE,
+        "intent_shape_no_answer": p.INTENT_SHAPE_NO_ANSWER,
+        "press_replies": list(r1_guard.PRESS_REPLIES),
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -922,6 +940,7 @@ def manifest() -> dict[str, Any]:
             "adapt_repairs": _adapt_repairs(),
             "diag3_repairs": _diag3_repairs(),
             "diag4_repairs": _diag4_repairs(),
+            "diag5_repairs": _diag5_repairs(),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

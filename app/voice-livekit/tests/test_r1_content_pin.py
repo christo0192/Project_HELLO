@@ -183,7 +183,11 @@ import r1_world
 # without brand names join the manifest (``r1_content._diag4_repairs`` and the script lines) beside
 # the texts they replace while their flags are on.  No graded meaning, marker, must-say or deadline
 # changed.
-PINNED_CONTENT_SHA256 = "2b8d598d8e408ba7bcfcdd608a8f20f9dc9b14bdd059381a442f7f75352f09bb"
+# Revision 31 (simulation diagnosis 5): the no-answer notes and intent shape for an advisor turn that
+# told her nothing, and the press lines after a lone "Okay." to her question, join the manifest
+# (``r1_content._diag5_repairs``) beside the texts they replace while their flags are on.  No graded
+# meaning, marker, must-say or deadline changed.
+PINNED_CONTENT_SHA256 = "99b781a211cd5848424790c8f80feae061166bba925c9dd03fc536602d7fab7d"
 
 CONTENT_MODULES = (
     "r1_text",

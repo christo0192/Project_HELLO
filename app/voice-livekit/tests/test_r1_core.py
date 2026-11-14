@@ -35,7 +35,7 @@ import r1_persistence
 import r1_phases
 import r1_routing
 import r1_session
-from r1_guard import FALLBACK_REPLY, StreamGuard
+from r1_guard import FALLBACK_REPLIES, FALLBACK_REPLY, StreamGuard
 from r1_prompts import ROLEPLAY_PHASE, select_context
 from r1_replies import Reply
 from r1_script import LEARNER_FILLER_VARIANTS
@@ -5706,8 +5706,12 @@ class TestWhatTheCandidateCanCut(R1TestCase):
     async def test_the_recovery_line_in_place_of_a_reply_may_be_cut(self) -> None:
         self.enter_roleplay()
         await self.interview._speak_recovery(R1Phase.ROLEPLAY)
-        self.assertEqual(self.session.spoken[-1], FALLBACK_REPLY)
+        # D5-RELIAB1 (R1_LLM_RECOVERY_V2): the learner's recovery line is a holding line.
+        self.assertIn(self.session.spoken[-1], FALLBACK_REPLIES)
         self.assertTrue(self.session.handles[-1].allow_interruptions)
+        with mock.patch.dict(os.environ, {"R1_LLM_RECOVERY_V2": "0"}):
+            await self.interview._speak_recovery(R1Phase.ROLEPLAY)
+        self.assertEqual(self.session.spoken[-1], FALLBACK_REPLY)
 
     def test_no_scripted_call_site_asks_for_an_interruptible_line(self) -> None:
         source = Path(r1_session.__file__).read_text(encoding="utf-8")
@@ -6131,7 +6135,7 @@ class TestLlmFailureRecovery(R1TestCase):
         self.enter_roleplay()
         with mock.patch.object(r1_session, "TURN_DEADLINE_SECONDS", 0.05), mock.patch.object(
             r1_session, "FILLER_AFTER_SECONDS", 5.0
-        ):
+        ), mock.patch.dict(os.environ, {"R1_LLM_RECOVERY_V2": "0"}):
             with self.assertRaises(TimeoutError):
                 await self.interview.guard_llm_stream(self.hung_stream()).__anext__()
         await self.until(lambda: ("play_end", self.FALLBACK) in self.order)
@@ -9598,3 +9602,101 @@ class TestWrapupNextStepsScripted(R1TestCase):
         self.assertIn(self.spoken_line("L-WRAP-NEXT"), self.session.spoken)
         self.assertNotIn(self.spoken_line("L-WRAP-MORE"), self.session.spoken)
         self.assertTrue(self.interview._close_short)
+
+
+class TestHungRolePlayRetry(R1TestCase):
+    """D5-RELIAB1 (R1_LLM_RECOVERY_V2): the first hung role-play reply in a row is asked for once
+    more; a retry that hangs too, and a second hang in a row, get the learner's holding line, and
+    the third hang in a row still aborts (synthetic text only)."""
+
+    @staticmethod
+    def hung(_messages):
+        async def stream():
+            await asyncio.Event().wait()
+            yield "never"
+
+        return stream()
+
+    async def hang(self, text: str = "Hi, this is the Program Advisor. Thanks for taking my call."):
+        """One role-play turn whose model reply hangs past its deadline (nothing said)."""
+        self.interview.prepare_turn(text, f"msg_{next(_IDS)}")
+        stream = self.interview.llm_node_stream(SimpleNamespace(items=[]), self.hung)
+        with self.assertRaises(TimeoutError):
+            async for _ in stream:
+                pass
+        return self.interview._last_reply
+
+    async def again(self) -> None:
+        """The SDK calls the LLM node for the retry speech: the same prepared reply hangs again."""
+        stream = self.interview.llm_node_stream(SimpleNamespace(items=[]), self.hung)
+        with self.assertRaises(TimeoutError):
+            async for _ in stream:
+                pass
+
+    def patched(self):
+        return (
+            mock.patch.object(r1_session, "TURN_DEADLINE_SECONDS", 0.05),
+            mock.patch.object(r1_session, "LLM_RETRY_DEADLINE_SECONDS", 0.05),
+            mock.patch.object(r1_session, "FILLER_AFTER_SECONDS", 5.0),
+        )
+
+    def holding(self) -> list[str]:
+        return [text for text in self.session.spoken if text in FALLBACK_REPLIES]
+
+    async def test_one_retry_then_the_holding_line(self) -> None:
+        self.enter_roleplay()
+        a, b, c = self.patched()
+        with a, b, c, self.capture_logs() as logs:
+            reply = await self.hang()
+            await self.until(lambda: len(self.session.generated) == 1)
+            self.assertTrue(reply.retry)
+            self.assertEqual(self.interview._failures, 1)
+            self.assertEqual(self.holding(), [])  # no recovery line: the retry is under way
+            self.assertNotIn(FALLBACK_REPLY, self.session.spoken)
+            await self.again()  # the retry hangs as well
+            await self.until(lambda: len(self.holding()) == 1)
+        self.assertEqual(self.interview._failures, 1)  # the retry is not counted again
+        self.assertIn("r1_llm_retry", error_types(logs))
+        self.assertIn("r1_llm_recovery", error_types(logs))
+        await self.flush()
+
+    async def test_a_second_hang_in_a_row_gets_the_holding_line_and_a_third_aborts(self) -> None:
+        self.enter_roleplay()
+        a, b, c = self.patched()
+        with a, b, c:
+            await self.hang()
+            await self.until(lambda: len(self.session.generated) == 1)
+            await self.again()
+            await self.until(lambda: len(self.holding()) == 1)
+            await self.hang("Okay, so what made you look into data science?")
+            self.assertEqual(self.interview._failures, 2)
+            await self.until(lambda: len(self.holding()) == 2)
+            self.assertEqual(len(self.session.generated), 1)  # no second retry
+            self.assertEqual(len(set(self.holding())), 2)  # never the same holding line twice
+            await self.hang("And how many hours a week could you give it?")
+        self.assertEqual(self.interview._failures, 3)
+        self.assertEqual(self.interview._stop_outcome(), "provider_error")
+        await self.flush()
+
+    async def test_a_retry_that_answers_never_resets_the_failure_count(self) -> None:
+        self.enter_roleplay()
+        a, b, c = self.patched()
+        with a, b, c:
+            await self.hang()
+            await self.until(lambda: len(self.session.generated) == 1)
+            stream = self.interview.llm_node_stream(
+                SimpleNamespace(items=[]), lambda _messages: self_stream("Just exploring for now.")
+            )
+            spoken = "".join([chunk async for chunk in stream]).strip()
+        self.assertEqual(spoken, "Just exploring for now.")
+        self.assertEqual(self.interview._failures, 1)
+        await self.flush()
+
+    async def test_flag_off_speaks_todays_line_and_never_retries(self) -> None:
+        self.enter_roleplay()
+        a, b, c = self.patched()
+        with a, b, c, mock.patch.dict(os.environ, {"R1_LLM_RECOVERY_V2": "0"}):
+            await self.hang()
+            await self.until(lambda: FALLBACK_REPLY in self.session.spoken)
+        self.assertEqual(self.session.generated, [])
+        await self.flush()

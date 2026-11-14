@@ -123,7 +123,9 @@ from r1_commitment import (
     Level,
     classify_learner_commitment,
     commitment_line,
+    ask_acts,
     detect_ask,
+    enrol_ask_in,
     grade,
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
@@ -147,6 +149,7 @@ from r1_guard import (
     has_concession,
     hours_said,
     offers_choice,
+    topics_raised,
 )
 from r1_negotiation import (
     ANCHOR_STATED_CONFLICT,
@@ -292,6 +295,8 @@ from r1_prompts import (
     FIGURES_SAID_SOURCE_WEBSITE,
     FIGURES_SAID_WEBSITE,
     INTENT_OPENER_NOTES,
+    NO_ANSWER_INTENT_NOTE,
+    NO_ANSWER_NOTE,
     INTERRUPTED_NOTE,
     INTERRUPTED_NOTE_V2,
     LENGTH_LONG,
@@ -789,6 +794,139 @@ def asks_decider_wide(text: object) -> bool:
     )
 
 
+# D5-LRN-ASSUME1 (R1_NO_ANSWER_READ): the vocabulary of a turn that says nothing yet.
+_NO_ANSWER_ACKS = frozenset(
+    {"okay", "ok", "yeah", "yes", "yep", "sure", "right", "alright", "hmm", "hm", "mm", "mhm",
+     "uh", "um", "oh", "ah", "well", "so", "see", "got", "fine", "great", "good", "cool"}
+)
+_NO_ANSWER_FUNCTION = frozenset(
+    {"it", "is", "its", "was", "a", "an", "the", "my", "your", "our", "their", "i", "you", "we",
+     "that", "this", "and", "but", "or", "to", "of", "for", "with", "like", "just", "be", "are",
+     "me", "let", "im", "thats", "there", "theres", "what", "mean", "know", "actually"}
+)
+# A turn that stops mid-phrase: the wrap-up's dangling words that cannot end a sentence, and the
+# possessives and fillers a cut-off advisor leaves behind ("Okay. Yeah, it is my.").
+_NO_ANSWER_DANGLING = frozenset(
+    {"and", "but", "or", "the", "a", "an", "of", "your", "my", "our", "their", "like", "um", "uh",
+     "with", "very", "i"}
+)
+_ANNOUNCEMENT_ONLY = re.compile(
+    r"^\W*(?:(?:okay|ok|so|yeah|right|alright|well|um|uh)\W+){0,3}"
+    r"(?:let me (?:clarify|explain|tell you|walk you through|break (?:it|that) down|"
+    r"put it this way)"
+    r"|here'?s the thing|so basically|basically)"
+    r"(?:\W+(?:that|this|it|for you|a bit|real quick|quickly))*\W*$",
+    re.IGNORECASE,
+)
+NO_ANSWER_MAX_WORDS = 8
+
+
+def no_answer_turn(text: object, *, after_question: bool = False) -> bool:
+    """D5-LRN-ASSUME1: the advisor's turn told her nothing she could react to.
+
+    (a) it stops on a word no sentence ends on ("Okay. Yeah, it is my.", "... and the") or a
+    trailing "...", with at most one content word; (b) after her question, eight words or fewer of
+    acknowledgement and function words only ("Okay, yeah, so."); (c) an announcement with nothing
+    after it ("Okay, so let me clarify that.").  Never a question.
+    """
+    raw = str(text or "").strip()
+    if not raw or "?" in raw:
+        return False
+    if _ANNOUNCEMENT_ONLY.match(fold(raw)) is not None:
+        return True
+    words = normalize(raw).split()
+    if not words:
+        return False
+    content = [w for w in words if w not in _NO_ANSWER_ACKS and w not in _NO_ANSWER_FUNCTION]
+    dangling = raw.endswith("...") or raw.endswith("\u2026") or words[-1] in _NO_ANSWER_DANGLING
+    if dangling and len(content) <= 1:
+        return True
+    return after_question and not content and len(words) <= NO_ANSWER_MAX_WORDS
+
+
+# D5-HF-UNEARNED1 (R1_ASK_VOICE_GATE): who acts in the sentence that holds an enrolment phrase.
+_ASK_OFFERING = re.compile(
+    r"\b(?:let'?s|let me|let us|shall (?:i|we)|should (?:i|we)|"
+    r"(?:can|could|would|will|may) (?:i|we)|"
+    r"want me to|would you like me to|how about|what about|i'?ll|we'?ll|i can|we can|i could|"
+    r"we could|i'?d like to|allow me to|i will|we will)\b",
+    re.IGNORECASE,
+)
+_ASK_ADDRESS = re.compile(
+    r"\b(?:you can|you could|would you|will you|do you want|you should|you'?ll want to|"
+    r"you might want to|you may want to|you need to|you have to|you must|please)\b",
+    re.IGNORECASE,
+)
+_ASK_IMPERATIVE = re.compile(
+    r"^\W*(?:(?:so|okay|ok|just|now|then|go ahead and|please)\W+){0,2}"
+    r"(?:book|reserve|secure|lock|hold|save|grab|enrol+|sign|register|pay|deposit|join|click|use|"
+    r"fill|complete)\b",
+    re.IGNORECASE,
+)
+_ASK_IMPERSONAL = re.compile(
+    r"\b(?:it'?s worth|it is worth|it (?:may|might|would|could|can|will) help|it helps|"
+    r"it'?s best to|it is best to|it'?s (?:a )?good idea to|it makes sense to|"
+    r"once you(?: and [a-z ]{1,30}?)? (?:decide|have decided|are ready|make up)|"
+    r"if you'?re leaning|when you'?re ready|people (?:usually|often|tend to)|"
+    r"most (?:people|learners|students))\b",
+    re.IGNORECASE,
+)
+_SEAT_PHRASE = re.compile(r"\b(?:spot|seat|place)\b", re.IGNORECASE)
+
+
+def enrol_ask_voiced(text: object) -> bool:
+    """D5-HF-UNEARNED1: an enrolment phrase in ``text`` is said as an ask: in a question, as an
+    offer or a suggestion ("Shall I lock in a place for you?", "Let's lock in your seat."), to her
+    ("you can reserve your seat now"), or as an instruction ("Book your seat today.").
+
+    An unvoiced phrase in an impersonal frame ("once you decide, it's worth moving soon to lock in
+    a place") or an unvoiced seat-locking remark is urgency, not an ask.  Any other unvoiced phrase
+    keeps production's reading (it is still an ask), so only the misread shape changes.
+    """
+    found = False
+    for sentence in split_sentences(str(text or "")):
+        phrase = enrol_ask_in(sentence)
+        if phrase is None:
+            continue
+        found = True
+        folded = fold(sentence)
+        if (
+            "?" in sentence
+            or _ASK_OFFERING.search(folded) is not None
+            or _ASK_ADDRESS.search(folded) is not None
+            or _ASK_IMPERATIVE.match(folded) is not None
+        ):
+            return True
+        if _ASK_IMPERSONAL.search(folded) is None and _SEAT_PHRASE.search(phrase) is None:
+            return True  # an unvoiced phrase of another shape: production's reading stands
+    return not found
+
+
+# D5-LRN-TOPICREP1 (R1_TOPIC_REPEAT): what in an advisor turn answers one of her topics.
+_TOPIC_ANSWERED = {
+    "included": re.compile(r"\b(?:includ\w*|comes with|you(?:'ll| will)? get)\b", re.IGNORECASE),
+    "schedule": re.compile(
+        r"\b(?:flexib\w*|weekends?|evenings?|recorded|recordings?|hours?|own pace|self-paced)\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def topics_answered(text: object) -> frozenset[str]:
+    """D5-LRN-TOPICREP1: the topics of ``r1_guard.TOPIC_PATTERNS`` the advisor's turn answers."""
+    found: set[str] = set()
+    if advisor_amounts_in(text) or quotes_price(text):
+        found |= {"monthly", "price"}
+    if answers_in_kind("class_size", text) or open_question_covered("class_size", text):
+        found.add("class_size")
+    if open_question_covered("fall_behind", text):
+        found.add("fall_behind")
+    for topic, pattern in _TOPIC_ANSWERED.items():
+        if pattern.search(fold(text)) is not None:
+            found.add(topic)
+    return frozenset(found)
+
+
 def answers_in_kind(topic: str, text: object) -> bool:
     """D4-COMEBACK1: ``text`` answers her open question without a figure, or promises to confirm
     it; either closes the question (no come-back)."""
@@ -1087,6 +1225,30 @@ FLAG_CLAUSE_ORPHAN_V2 = "R1_CLAUSE_ORPHAN_V2"
 FLAG_DIG_GATE_V3 = "R1_DIG_GATE_V3"
 FLAG_COME_BACK_V2 = "R1_COME_BACK_V2"
 FLAG_F3_WORDING = "R1_F3_WORDING"
+# Simulation diagnosis 5 (the full-interview flow judge, round 5; each defaults ON and OFF restores
+# the release before):
+# * R1_GUARD_TIDY_V3 (D5-GUARD-GARBLE1): "I'll say that much" is cut whole, and the surface line
+#   said for a blocked need is never heard twice in one reply.
+# * R1_NO_ANSWER_READ (D5-LRN-ASSUME1): a fragment ("Okay. Yeah, it is my."), a filler-only turn
+#   after her question, or a bare "let me clarify that" told her nothing: her reply is told so, an
+#   intent reply has no reaction opener, and the guard drops a first sentence that treats it as an
+#   answer ("Good to know ...", "Right, so it's ...").
+# * R1_ACK_PRESS (D5-LRN-ACKFALL1): her question met a lone "Okay." and her re-ask was a repeat, so
+#   she presses gently instead of "Mm-hmm."; the re-ask may repeat any question of her last two
+#   replies.
+# * R1_ASK_VOICE_GATE (D5-HF-UNEARNED1): an enrolment phrase in an impersonal urgency remark
+#   ("it's worth moving soon to lock in a place") or an unvoiced seat-locking remark is no ask; a
+#   question, an offer ("Shall I ...", "Let's ...") or a line to her still is.
+# * R1_TOPIC_REPEAT (D5-LRN-TOPICREP1): a topic she raised in one of her last two replies and he
+#   has not answered is not raised again in a free reply beside something else to say.
+# * R1_POST_BYE_QUIET (D5-LRN-POSTBYE1): after his goodbye she opens no new topic until he asks her
+#   something, and a bare acknowledgement then gets her short goodbye.
+FLAG_GUARD_TIDY_V3 = "R1_GUARD_TIDY_V3"
+FLAG_NO_ANSWER_READ = "R1_NO_ANSWER_READ"
+FLAG_ACK_PRESS = "R1_ACK_PRESS"
+FLAG_ASK_VOICE_GATE = "R1_ASK_VOICE_GATE"
+FLAG_TOPIC_REPEAT = "R1_TOPIC_REPEAT"
+FLAG_POST_BYE_QUIET = "R1_POST_BYE_QUIET"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1216,6 +1378,12 @@ _FLAG_READS = {
     FLAG_DIG_GATE_V3: lambda: os.getenv("R1_DIG_GATE_V3"),
     FLAG_COME_BACK_V2: lambda: os.getenv("R1_COME_BACK_V2"),
     FLAG_F3_WORDING: lambda: os.getenv("R1_F3_WORDING"),
+    FLAG_GUARD_TIDY_V3: lambda: os.getenv("R1_GUARD_TIDY_V3"),
+    FLAG_NO_ANSWER_READ: lambda: os.getenv("R1_NO_ANSWER_READ"),
+    FLAG_ACK_PRESS: lambda: os.getenv("R1_ACK_PRESS"),
+    FLAG_ASK_VOICE_GATE: lambda: os.getenv("R1_ASK_VOICE_GATE"),
+    FLAG_TOPIC_REPEAT: lambda: os.getenv("R1_TOPIC_REPEAT"),
+    FLAG_POST_BYE_QUIET: lambda: os.getenv("R1_POST_BYE_QUIET"),
 }
 
 
@@ -1819,6 +1987,17 @@ class RolePlayEngine:
         self._ack_turn_notes = 0
         self._asked_yes_no = False
         self._last_questions: tuple[str, ...] = ()
+        # Simulation diagnosis 5: this turn told her nothing (D5-LRN-ASSUME1); the question
+        # sentences of each heard reply (D5-LRN-ACKFALL1, memory only); the still-unanswered topics
+        # each heard reply raised (D5-LRN-TOPICREP1); the advisor said goodbye and has asked
+        # nothing since (D5-LRN-POSTBYE1); and counts (memory only).
+        self._turn_contentless = False
+        self._question_history: list[tuple[str, ...]] = []
+        self._topic_history: list[set[str]] = []
+        self._bye_heard = False
+        self._no_answer_turns = 0
+        self._unvoiced_asks = 0
+        self._bye_quiet_turns = 0
         # SWEEP-12: soft tics trimmed, and the soft tics (and "I'd rather") of each heard reply.
         self._soft_tic_trims = 0
         self._soft_history: list[tuple[str, ...]] = []
@@ -2145,6 +2324,17 @@ class RolePlayEngine:
             clause_orphan_v2=flag_on(FLAG_CLAUSE_ORPHAN_V2),
             come_back_v2=flag_on(FLAG_COME_BACK_V2),
             f3_wording=flag_on(FLAG_F3_WORDING),
+            # Simulation diagnosis 5.
+            guard_tidy_v3=flag_on(FLAG_GUARD_TIDY_V3),
+            contentless=phase == "roleplay" and self._turn_contentless,
+            ack_press=phase == "roleplay" and flag_on(FLAG_ACK_PRESS),
+            advisor_hollow=phase == "roleplay" and self._advisor_hollow(),
+            topic_recent=(
+                frozenset().union(*self._topic_history[-2:])
+                if phase == "roleplay" and flag_on(FLAG_TOPIC_REPEAT) and self._topic_history
+                else frozenset()
+            ),
+            bye_heard=phase == "roleplay" and flag_on(FLAG_POST_BYE_QUIET) and self._bye_heard,
         )
 
     def _offer_on_table(self) -> int | None:
@@ -2631,12 +2821,26 @@ class RolePlayEngine:
         # time?", "I thought I'd give you a quick call"), and it gets a free reply.
         early = turn == 1 and r_sec < EARLY_ASK_IGNORE_SEC
         ask = None if early else detect_ask(candidate_text)
+        unvoiced = False
+        if (
+            ask is not None
+            and ask.kind is AskKind.ENROL
+            and flag_on(FLAG_ASK_VOICE_GATE)
+            and not enrol_ask_voiced(candidate_text)
+        ):
+            # D5-HF-UNEARNED1: "it's worth moving soon to lock in a place" is urgency, not an ask;
+            # a call proposal in the same turn still stands.
+            ask = ask_acts(candidate_text).get(AskKind.CALL)
+            unvoiced = True
+            self._unvoiced_asks += 1
         wants = ask.kind if ask is not None else None
         if wants is None and negotiated.callback is not None and not early:
             wants = AskKind.CALL  # a concrete callback or time proposal is a call ask
         self._call_ask_now = wants is AskKind.CALL
         self._turn_ask = wants
         reasons: list[str] = []
+        if unvoiced:
+            reasons.append("enrol_phrase_unvoiced")
         if obs.injection:
             reasons.append("injection_phrase_flagged")
         if break_kind:
@@ -2649,6 +2853,15 @@ class RolePlayEngine:
         # was lost).
         self._read_open_question(reading, turn)
         self._read_call_opening(reading, turn)
+        if flag_on(FLAG_TOPIC_REPEAT) and self._topic_history:
+            # D5-LRN-TOPICREP1: what he answered now is no longer an open topic of hers.
+            answered = topics_answered(reading)
+            for topics in self._topic_history[-2:]:
+                topics -= answered
+        if self._bye_heard and (
+            "?" in str(reading or "") or asks_her_directly(reading) or self._turn_ask is not None
+        ):
+            self._bye_heard = False  # D5-LRN-POSTBYE1: he asked her something; the call goes on
         natural = flag_on(FLAG_NATURAL_TIMING)
         respond = flag_on(FLAG_RESPOND_FIRST)
         kinds: frozenset[str] = frozenset()
@@ -2712,6 +2925,10 @@ class RolePlayEngine:
         if flag_on(FLAG_CLOSING_STATE):
             close_attempt = self._read_close(reading, close_attempt, reasons)
         run_exit = read_v3 and self._farewell_run_due(reading, close_attempt, r_sec)
+        if flag_on(FLAG_POST_BYE_QUIET) and (
+            close_attempt or farewell_end or ends_on_farewell(reading, wide=True)
+        ):
+            self._bye_heard = True  # D5-LRN-POSTBYE1
         if flag_on(FLAG_TIME_CUE_V3):
             # D4-TIMECUE1: no "I've only got a couple of minutes" while the call is saying goodbye
             # (the commitment is on record and the close has begun, or this turn takes leave).
@@ -2770,6 +2987,20 @@ class RolePlayEngine:
             if owed_now is None or not owed_now.forced:
                 # S3.2: the advisor is closing and the question was asked out: one short, warm
                 # goodbye, no new question (a forced move still lands below).
+                return self._winding_plan(reasons)
+        elif (
+            self._bye_heard
+            and flag_on(FLAG_POST_BYE_QUIET)
+            and is_hollow_turn(reading)
+            and not close_attempt
+            and not self.exit_requested
+        ):
+            owed_now = self.scheduler.select(r_sec)
+            if owed_now is None or not owed_now.forced:
+                # D5-LRN-POSTBYE1: he said goodbye and now only acknowledges: her short goodbye,
+                # never a new topic (a forced move still lands below).
+                self._bye_quiet_turns += 1
+                reasons.append("bye_heard_quiet")
                 return self._winding_plan(reasons)
         # Disclosure is tied to the turn that asks about the topic: a first probe is answered
         # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
@@ -4107,6 +4338,24 @@ class RolePlayEngine:
             if offer["trigger"] not in (TRIGGER_EARLY_CLOSE, TRIGGER_ABUSE)
         )
 
+    def _reask_questions(self) -> tuple[str, ...]:
+        """SWEEP-11's re-ask may repeat her last questions; with R1_ACK_PRESS (D5-LRN-ACKFALL1) also
+        the questions of her two replies before, so the asked-for re-ask is never a repeat."""
+        if not flag_on(FLAG_ACK_PRESS):
+            return self._last_questions
+        recent = [q for questions in self._question_history[-3:] for q in questions]
+        return tuple(dict.fromkeys((*self._last_questions, *recent)))
+
+    def _advisor_hollow(self) -> bool:
+        """D5-LRN-ACKFALL1: his turn is a lone acknowledgement ("Okay.", "Yeah, okay.")."""
+        reading = str(self._turn_reading or "")
+        words = normalize(reading).split()
+        return (
+            is_hollow_turn(reading)
+            and bool(words)
+            and all(word in _NO_ANSWER_ACKS for word in words)
+        )
+
     def _learner_asked_last(self) -> bool:
         """The learner's last line asked the advisor something: the next words are theirs."""
         return bool(self._asked) and self._asked[-1]
@@ -4794,6 +5043,7 @@ class RolePlayEngine:
         self._wrap_declined_at = r_sec
         if offer["trigger"] == TRIGGER_EARLY_CLOSE:
             self._enter_closing(CLOSING_OPEN)  # M032 S3.3: they chose to carry on
+            self._bye_heard = False
         elif offer["trigger"] == TRIGGER_ABUSE:
             self._cool = True  # M032 S3.4: the call goes on, and she is cool
 
@@ -4920,6 +5170,22 @@ class RolePlayEngine:
         better than I expected" after raising it itself); and "I can check with my manager" grants
         nothing (the judge flagged the thanks that followed it).
         """
+        self._turn_contentless = False
+        if flag_on(FLAG_NO_ANSWER_READ):
+            # D5-LRN-ASSUME1.  A lone back-channel after her question has its own note (SWEEP-11),
+            # and "Yeah." after her yes/no question answers it.
+            yes_answer = (
+                self._learner_asked_last()
+                and self._asked_yes_no
+                and _YES_LIKE_TURN.match(self._turn_reading or "") is not None
+            )
+            self._turn_contentless = (
+                not yes_answer
+                and not self._ack_turn()
+                and no_answer_turn(self._turn_reading, after_question=self._learner_asked_last())
+            )
+            if self._turn_contentless:
+                self._no_answer_turns += 1
         if seen.decider_asked or (
             flag_on(FLAG_DECIDER_SPACING) and asks_decider_wide(self._turn_reading)
         ):
@@ -6319,6 +6585,8 @@ class RolePlayEngine:
         already got its one late topic.  M10: "shall we say I call you tomorrow around 10?" got
         "Before we get to timing, how many people are usually in a batch?".
         """
+        if self._bye_heard and flag_on(FLAG_POST_BYE_QUIET):
+            return True  # D5-LRN-POSTBYE1: he said goodbye; no new topic is handed over
         if not flag_on(FLAG_CURIOSITY_TIMING):
             return False
         return (
@@ -6456,6 +6724,10 @@ class RolePlayEngine:
                     reveal=bool(first_probes) or bool(reveal_topics),
                     winding=winding,
                 )
+            # D5-LRN-ASSUME1: his turn told her nothing; neither reply reacts to it as an answer.
+            no_answer = self._turn_contentless and not confirm and not reaction_only
+            if no_answer:
+                notes += (NO_ANSWER_NOTE if intent is None else NO_ANSWER_INTENT_NOTE,)
             if mode is TurnMode.LLM_REPLY:
                 style_note = pick_variant(
                     STYLE_NOTES_V2 if voice_v2 else STYLE_NOTES, self.seed, self.turn
@@ -6468,7 +6740,7 @@ class RolePlayEngine:
                     # Review S2R-8: "start with a word or two of acknowledgement" never sits with
                     # a note that tells her not to open with a quick reaction or a verdict.
                     style_note = pick_variant(INTENT_OPENER_NOTES, self.seed, self.turn)
-            elif voice_v2 and intent is not None and not reaction_only:
+            elif voice_v2 and intent is not None and not reaction_only and not no_answer:
                 style_note = pick_variant(INTENT_OPENER_NOTES, self.seed, self.turn)
             else:
                 style_note = ""
@@ -6585,6 +6857,7 @@ class RolePlayEngine:
                 curiosity_v2=flag_on(FLAG_TIC_V2) and not ack,
                 # Review S3R-6 (naturalness): a goodbye's reminder asks for no question.
                 winding=winding and mode is TurnMode.LLM_REPLY,
+                no_answer=no_answer and intent is not None,
             )
             ctx = self.guard_context(
                 mode="reply",
@@ -6595,7 +6868,7 @@ class RolePlayEngine:
                 free_reply=mode is TurnMode.LLM_REPLY and not confirm,
                 carries_move=move_id is not None or credit_move_id is not None,
                 # Review S2R-4: ACK_TURN_NOTE asks her to ask her last question again.
-                reask=self._last_questions if ack and self._learner_asked_last() else (),
+                reask=self._reask_questions() if ack and self._learner_asked_last() else (),
                 must_say=() if intent is None else intent.must_say,
                 # M032 SWEEP-25 B: the 19:00 reaction says no goodbye and asks for no e-mail.
                 reaction_only=reaction_only and flag_on(FLAG_COMMIT_REACTION_V2),
@@ -6727,6 +7000,8 @@ class RolePlayEngine:
             self._last_questions = tuple(
                 norm for norm in (normalize(question) for question in questions) if norm
             )
+            self._question_history.append(self._last_questions)  # D5-LRN-ACKFALL1
+            self._topic_history.append(set(topics_raised(spoken_text)))  # D5-LRN-TOPICREP1
             self._asked_yes_no = bool(questions) and _NOT_YES_NO.search(questions[-1]) is None
             if flag_on(FLAG_PRICE_ASKED_ONCE) and any(
                 _FINAL_PRICE_QUESTION.search(question) for question in questions
