@@ -856,6 +856,11 @@ class TransitionReminderTests(unittest.TestCase):
         self.assertIn("give one plain sentence", lowered)
         self.assertIn('say "of course, go ahead." and stop', lowered)
         self.assertIn("never end your reply with a question", lowered)
+        # D5-TRANS1: "has just been given" is only for a request to hear the brief again; how to
+        # approach the call gets one plain sentence.
+        self.assertIn("ask to hear the instructions, the brief or the scenario again", lowered)
+        self.assertIn("how to approach or handle the call", lowered)
+        self.assertIn("find out what she needs and help her decide", lowered)
 
     def _check_transition_note(self, note, interviewer_reminder, Reply, llm_messages):
         # M032 S5: the delivery rider follows the note when R1_INTERVIEWER_VOICE is on.

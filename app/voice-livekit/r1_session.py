@@ -216,6 +216,7 @@ from r1_guard import (
     guard_story_echo_enabled,
     offer_phrase_in,
     turn_asks,
+    with_opener,
 )
 from r1_icebreaker import (
     ANSWERED,
@@ -308,6 +309,7 @@ from r1_script import (
     transition_answers_enabled,
     transition_presence_v2_enabled,
     transition_repair_enabled,
+    wrap_offer_variant_enabled,
 )
 from r1_sarvam import current_speech_id
 from r1_text import normalize, pick_variant, split_sentences
@@ -707,6 +709,7 @@ _WARM_ORDER = (
     "L-ASIDE-COACH",
     "L-ASIDE-END",
     "L-ASIDE-WRAP",
+    "L-ASIDE-WRAP-AGAIN",
     "L-ASIDE-WRAP-RESUME",
     "L-TIME-UP",
     "L-MUTE",
@@ -2387,7 +2390,10 @@ _RP_FIELDS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"is calling (?:whom|who)|calls (?:whom|who)|is the caller|will you be|are you "
             r"playing|do you play)|what(?:'s| is) my role|(?:what|which) (?:role|part) (?:am i|do "
             r"i|will i) (?:playing|play|be playing)|(?:am i|do i) (?:calling her|call her|the one "
-            r"calling)|(?:is she|will she be|she's) calling me)\b"
+            r"calling)|(?:is she|will she be|she's) calling me|"
+            # D5-TRANS1: "So I'm the one selling the course, and she's the student?"
+            r"(?:i'm|i am) the one (?:selling|calling|pitching)|she(?:'s| is) the (?:student|"
+            r"learner|customer|prospect|lead))\b"
         ),
     ),
     (
@@ -2467,6 +2473,14 @@ _RP_REPEAT_RE = re.compile(
     r"instructions|scenario|in short|summar(?:y|ise|ize)|recap)\b"
 )
 _RP_FIELDS_KEPT = 2
+# M032 live simulation, diagnosis 5 (D5-TRANS1): "What do I actually do?" and "How should I approach
+# it?" got only "That's right, yes." (the explanation was guarded away) or "the brief has just
+# been given".  They get L-RP-GOAL, unless the turn is a request for the brief itself ("What do I
+# do?" keeps the re-explained replay, ``is_brief_request``).
+_RP_GOAL_D5_RE = re.compile(
+    r"\b(?:(?:what|how) (?:do|should|would) i (?:actually |really )?(?:do|handle|approach)|"
+    r"what am i (?:supposed|meant) to do|what(?:'s| is) my (?:job|task))\b"
+)
 
 
 def roleplay_fields(text: str) -> tuple[str, ...]:
@@ -2483,6 +2497,10 @@ def roleplay_fields(text: str) -> tuple[str, ...]:
         match = pattern.search(folded)
         if match is not None:
             found.append((match.start(), line_id))
+    if all(line_id != "L-RP-GOAL" for _, line_id in found) and not is_brief_request(text):
+        match = _RP_GOAL_D5_RE.search(folded)  # D5-TRANS1
+        if match is not None:
+            found.append((match.start(), "L-RP-GOAL"))
     return tuple(line_id for _, line_id in sorted(found))[:_RP_FIELDS_KEPT]
 
 
@@ -2578,6 +2596,22 @@ _PERMISSION_FILLER = frozenset(
 )
 
 
+# D5-TRANS1: the words a bare confirmation is made of ("That's right, yes.", "Exactly.").
+_CONFIRMATION_WORDS = frozenset(
+    {"that's", "thats", "that", "is", "it's", "its", "right", "yes", "yeah", "yep", "exactly",
+     "correct", "absolutely", "sure", "indeed", "true", "spot", "on", "you've", "got", "it",
+     "you're", "mm", "hmm", "okay", "ok"}
+)
+
+
+def is_bare_confirmation(text: object) -> bool:
+    """D5-TRANS1: ``text`` says only yes ("That's right, yes.", "Exactly, that's correct.")."""
+    words = fold_speech(str(text or "")).replace(",", " ").replace(".", " ").split()
+    words = [word.strip("!?;:") for word in words]
+    words = [word for word in words if word]
+    return bool(words) and all(word in _CONFIRMATION_WORDS for word in words)
+
+
 def is_permission_to_ask(text: str) -> bool:
     """True for a turn that only asks whether the candidate may ask something.
 
@@ -2588,9 +2622,31 @@ def is_permission_to_ask(text: str) -> bool:
     """
     folded = fold_speech(text)
     if _PERMISSION_RE.search(folded) is None:
+        if transition_answers_enabled():
+            return _is_leave_to_check(folded)
         return False
     rest = _PERMISSION_RE.sub(" ", folded, count=1)
     return all(word in _PERMISSION_FILLER for word in rest.split())
+
+
+# M032 live simulation, diagnosis 5 (D5-TRANS1, ``R1_TRANSITION_ANSWERS``): "could I check a couple
+# of other things first?" asks leave to ask as plainly as "Can I ask a few questions?", but was
+# answered (the model's "Sure, go ahead." with the start question after it, pushing to start in the
+# same breath).  It now gets the invite alone; the start question returns after the next answer.
+_PERMISSION_CHECK_RE = re.compile(
+    r"\b(?:can|could|may) i (?:\w+ ){0,2}?(?:check|clarify|confirm)\b"
+)
+_PERMISSION_CHECK_FILLER = _PERMISSION_FILLER | frozenset(
+    {"things", "thing", "something", "stuff", "points", "bits", "quickly", "few"}
+)
+
+
+def _is_leave_to_check(folded: str) -> bool:
+    """D5-TRANS1: "could I check a couple of other things first?" (folded text), nothing else."""
+    if _PERMISSION_CHECK_RE.search(folded) is None:
+        return False
+    rest = _PERMISSION_CHECK_RE.sub(" ", folded, count=1)
+    return all(word in _PERMISSION_CHECK_FILLER for word in rest.split())
 
 
 # M1: "No questions, let's start." and "No, I'm good, let's go." agree to start as plainly as "Yes,
@@ -4598,6 +4654,8 @@ class R1Interview:
             dropped.add("L-PRESENT-TAKE-TIME")  # review of diagnosis 4: revision 30's two lines
         if not sil_ib_restate_enabled():
             dropped |= _SIL_IB_RESTATE_LINES
+        if not wrap_offer_variant_enabled():
+            dropped.add("L-ASIDE-WRAP-AGAIN")  # D5-ASIDE-WRAP2: only a later offer speaks it
         if dropped:
             order = tuple(line_id for line_id in order if line_id not in dropped)
         if not transition_bridge_enabled():
@@ -5814,6 +5872,10 @@ class R1Interview:
                     # D4-TRANS-Q1: a comment or complaint whose reply the guard emptied gets "Fair
                     # enough." and the start question, never "Sorry, what were you saying?".
                     reply.fallback = TRANSITION_QUIET_FALLBACK
+                if transition_answers_enabled() and not ib_answer:
+                    # D5-TRANS1: a confirmation-only reply to a turn with a second question still
+                    # answers it (``_screened``).
+                    reply.confirm_extra = self._confirm_extra(text)
                 if self._withhold_answer_tail():
                     self._start_question = None
                 else:
@@ -5876,6 +5938,17 @@ class R1Interview:
             error_category=fields[0] if fields else None,
             option_count=self._transition_fields,
         )
+
+    def _confirm_extra(self, text: str) -> str:
+        """D5-TRANS1 (``R1_TRANSITION_ANSWERS``): the scripted answer said after a transition reply
+        the guard cut down to a bare confirmation, when ``text`` asks more than one question ("So
+        I'm the one selling, and she's the student? What do I actually do?").  The L-RP-* line of
+        the questions after the first, else L-RP-GOAL; "" for a turn with one question or none."""
+        asks = [part for part in split_sentences(text) if turn_asks(part)]
+        if len(asks) < 2:
+            return ""
+        fields = roleplay_fields(" ".join(asks[1:]))
+        return self.render_line(fields[0] if fields else "L-RP-GOAL")
 
     def _withhold_answer_tail(self) -> bool:
         """M032 christy-ready (``R1_START_ASK_ONCE``): this answer ends without a start question.
@@ -6001,7 +6074,7 @@ class R1Interview:
             or not self._ib_question_open
             or not question
             or self._ib_nudged == question
-            or not quiet_nudge_line(question)
+            or not self._ib_nudge_text(question)
             or not self._icebreaker_plan.can_hold()
             or self.machine.icebreaker_should_end()
             or self.machine.remaining_icebreaker_seconds()
@@ -6011,6 +6084,18 @@ class R1Interview:
         self._ib_nudge_question = question
         _log.info("unknown_event", error_type="r1_icebreaker_quiet_nudge_armed")
         self._wake()
+
+    def _ib_nudge_text(self, question: str) -> str:
+        """The quiet nudge for ``question`` (``quiet_nudge_line``), or, D5-NUDGE1, when that would
+        only repeat her words, the current objective's restate (L-SIL-IB-<id>, warmed); "" when
+        neither exists."""
+        text = quiet_nudge_line(question)
+        if text or not str(question or "").strip() or not icebreaker_plan_enabled():
+            return text
+        current = self._icebreaker_plan.current
+        if current is None:
+            return ""
+        return self.render_line(silence_line_id(current))
 
     def _ib_nudge_armed(self) -> bool:
         return self._ib_nudge_question is not None
@@ -6029,7 +6114,7 @@ class R1Interview:
             or self.machine.remaining_icebreaker_seconds() < IB_QUIET_NUDGE_MIN_BUDGET_SECONDS
         ):
             return False
-        text = quiet_nudge_line(question)
+        text = self._ib_nudge_text(question)
         if not text or not self._icebreaker_plan.use_hold():
             return False
         self._ib_nudged = question
@@ -7021,6 +7106,8 @@ class R1Interview:
                 # Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): the echo cut needs the turn it
                 # answers (never her answer to their question, only their words back).
                 changes["candidate_text"] = reply.candidate_text or ""
+                # D5-ICE-AWITH1: one "And with <their thing>," opener in the small talk.
+                changes["with_opener_used"] = self._with_opener_said()
         if guard_story_echo_enabled() and reply.phase in ("opening", "icebreaker"):
             # D3-GUARD-IB1: the turn this reply answers, for the story echo and the deflection.
             # Review of diagnosis 3 (D3-GUARD-IB1-LEAK): the small talk only; in the transition and
@@ -7043,6 +7130,19 @@ class R1Interview:
             and offer_phrase_in(entry.get("text"))
             for entry in self._history
         )
+
+    def _with_opener_said(self) -> bool:
+        """D5-ICE-AWITH1: one of Christy's model replies in the opening or the icebreaker already
+        had a sentence opening "And with <their thing>," (``with_opener``; scripted lines are not
+        hers)."""
+        for entry in self._history:
+            if entry.get("role") != "bot" or entry.get("phase") not in ("opening", "icebreaker"):
+                continue
+            if entry.get("voice") != INTERVIEWER or entry.get("scripted"):
+                continue
+            if any(with_opener(part) for part in split_sentences(str(entry.get("text") or ""))):
+                return True
+        return False
 
     def _previous_interviewer_openings(self, count: int) -> tuple[str, ...]:
         """D4-ICE-ECHO1: the first sentences of Christy's last ``count`` model replies in the
@@ -7088,6 +7188,7 @@ class R1Interview:
         reported_before = self._llm_errors_reported
         spoke = False  # a sentence of the model's reply already reached the consumer
         last_sentence = ""
+        spoken: list[str] = []  # D5-TRANS1: what the reply said, for the bare-confirmation check
         recover = False
         iterator: Any = None
         try:
@@ -7104,13 +7205,20 @@ class R1Interview:
                     for sentence in guard.feed(text):
                         spoke = True
                         last_sentence = sentence
+                        spoken.append(sentence)
                         self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
                 spoke = True
                 last_sentence = sentence
+                spoken.append(sentence)
                 self._latency.mark("guard_release")
                 yield sentence + " "
+            if spoke and reply.confirm_extra and is_bare_confirmation(" ".join(spoken)):
+                # D5-TRANS1: "That's right, yes." alone left their second question unanswered.
+                last_sentence = reply.confirm_extra
+                _log.info("unknown_event", error_type="r1_transition_confirm_extra")
+                yield reply.confirm_extra + " "
         except Exception as exc:  # noqa: BLE001 - a failed model reply must not leave silence
             if spoke:
                 raise  # part of the reply was already heard: nothing sensible can follow it

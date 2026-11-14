@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import unittest
@@ -7146,13 +7147,46 @@ class WrapUpOfferEngineTests(unittest.TestCase):
         self.assertFalse(s.say("Okay, great.", self.R + 5 + cool - 1).aside)
         with mock.patch.object(r1_roleplay, "WRAP_OFFER_UNTIL_R_SEC", 1200.0):
             second = s.say("Okay, great.", self.R + 5 + cool)
-            self.assertEqual(second.line_id, "L-ASIDE-WRAP")
+            self.assertEqual(second.line_id, "L-ASIDE-WRAP-AGAIN")  # D5-ASIDE-WRAP2
             s.say("Not yet.", self.R + 10 + cool)
             with mock.patch.object(r1_roleplay, "WRAP_OFFER_COOLDOWN_SEC", 0.0):
                 self.assertFalse(s.say("Okay, great.", self.R + 20 + cool).aside)  # the limit
         offers = s.eng.admin_log(final=True)["early_close"]["wrap_offers"]
         self.assertEqual([offer["answer"] for offer in offers], ["no", "no"])
         self.assertEqual(r1_roleplay.WRAP_OFFER_LIMIT, 2)
+
+    def test_a_second_offer_is_worded_differently_and_answered_the_same(self):
+        # M032 diagnosis 5 (D5-ASIDE-WRAP2, R1_WRAP_OFFER_VARIANT): round 5 one-worder heard
+        # L-ASIDE-WRAP word for word 38 turns after declining it.
+        cool = r1_roleplay.WRAP_OFFER_COOLDOWN_SEC
+        with mock.patch.object(r1_roleplay, "WRAP_OFFER_UNTIL_R_SEC", 1200.0):
+            s = self.offered()
+            s.say("No, continue.", self.R + 5)
+            second = s.say("Okay, great.", self.R + 5 + cool)
+            self.assertEqual((second.aside, second.line_id), (True, "L-ASIDE-WRAP-AGAIN"))
+            self.assertEqual(
+                second.scripted_text, line("L-ASIDE-WRAP-AGAIN", **P1.line_values)
+            )
+            self.assertNotEqual(second.scripted_text, line("L-ASIDE-WRAP", **P1.line_values))
+            self.assertEqual(s.eng.open_question_line, "L-ASIDE-WRAP-AGAIN")
+            again = s.say("Sorry?", self.R + 8 + cool, repair=True)
+            self.assertEqual(again.line_id, "L-ASIDE-WRAP-AGAIN")
+            self.assertEqual(
+                s.say("Yes, let's wrap it up here.", self.R + 10 + cool).mode, TurnMode.EXIT
+            )
+            # A no to it resumes as after the first offer.
+            s = self.offered()
+            s.say("No.", self.R + 5)
+            s.say("Okay, great.", self.R + 5 + cool)
+            plan = s.say("No, let's keep going.", self.R + 10 + cool)
+            self.assertEqual(plan.line_id, "L-ASIDE-WRAP-RESUME")
+            with mock.patch.dict(os.environ, {"R1_WRAP_OFFER_VARIANT": "0"}):
+                s = self.offered()
+                s.say("No.", self.R + 5)
+                self.assertEqual(s.say("Okay, great.", self.R + 5 + cool).line_id, "L-ASIDE-WRAP")
+        text = line("L-ASIDE-WRAP-AGAIN", **P1.line_values)
+        self.assertNotIn(", or ", text)  # not an either/or: a bare "yes" still means wrap up
+        self.assertIn(P1.line_values["lead_first_name"], text)
 
     def test_a_call_going_nowhere_gets_the_offer_without_a_commitment(self):
         s = Session(engine())

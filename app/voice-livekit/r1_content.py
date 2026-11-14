@@ -221,7 +221,18 @@ import r1_world
 # 32: integration 7 offline sweep (dead_air): the quiet-nudge window is 7 s, not 10 s
 #    (r1_icebreaker.IB_QUIET_NUDGE_SECONDS), so a lone "Thank you." after her question is never
 #    followed by more than the harness's 8 s of dead air.  No spoken text changed.
-CONTENT_REVISION = 32
+# 33: M032 live simulation, diagnosis 5 (Christy lane).  R1_AGENDA_W3 (D5-AGENDA1): the agenda as
+#    one sentence whose parts add up to the whole, after "Good, I can hear you." (L-OPEN-AGENDA-W3,
+#    -PLAIN-W3, -CONTINUE-W3; r1_script.AGENDA_W3_LINES).  R1_WRAP_OFFER_VARIANT (D5-ASIDE-WRAP2):
+#    L-ASIDE-WRAP-AGAIN for every offer to wrap up after the first.  R1_REACTION_VARIETY_V2
+#    (D5-ICE-AWITH1): the react clause without the quoted example the model copied, and the guard's
+#    "And with <their thing>," opener kept once (r1_guard._WITH_OPENER).  R1_IB_SKIP_V2 (D5-SKIP1):
+#    the skip notes say one or two quick questions are left.  R1_IB_QUIET_NUDGE (D5-NUDGE1): the
+#    nudge keeps the asking clause and says "I was asking, {question}" after a lead of her own.
+#    R1_TRANSITION_ANSWERS (D5-TRANS1): the answers note keeps "has just been given" for a request
+#    to hear the brief again and says how to answer "how do I approach it?".  Every other text of
+#    revision 32 is unchanged.
+CONTENT_REVISION = 33
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -276,6 +287,8 @@ def manifest() -> dict[str, Any]:
             # Revision 31 (D4-BRIEF2, D4-TRANS-PRESENT1, D4-TRANS-Q1).
             "wording_lines": dict(r1_script.WORDING_LINES),
             "variety_lines": dict(r1_script.VARIETY_LINES),
+            # Revision 33 (D5-AGENDA1).
+            "agenda_w3_lines": dict(r1_script.AGENDA_W3_LINES),
             "transition_quiet_fallback": r1_script.TRANSITION_QUIET_FALLBACK,
             "learner_filler_variants": list(r1_script.LEARNER_FILLER_VARIANTS),
             "learner_filler_short": r1_script.LEARNER_FILLER_SHORT,
@@ -407,6 +420,8 @@ def manifest() -> dict[str, Any]:
                 "thin_reply_words": r1_guard.THIN_REPLY_WORDS,
                 "stretch_alternatives": list(r1_text.STRETCH_ALTERNATIVES),
                 "hollow_max_words": r1_text.HOLLOW_MAX_WORDS,
+                # Revision 33 (D5-ICE-AWITH1).
+                "with_opener": r1_guard._WITH_OPENER.pattern,
             },
             "reply_word_cap": r1_guard.REPLY_WORD_CAP,
             "ack_word_cap": r1_guard.ACK_WORD_CAP,
@@ -581,6 +596,10 @@ def manifest() -> dict[str, Any]:
                 "quiet_nudge_seconds": r1_icebreaker.IB_QUIET_NUDGE_SECONDS,
                 "quiet_nudge_min_budget_seconds": r1_icebreaker.IB_QUIET_NUDGE_MIN_BUDGET_SECONDS,
                 "hold_note": r1_icebreaker.HOLD_NOTE,
+                # Revision 33 (D5-NUDGE1).
+                "quiet_nudge_recall": r1_icebreaker.IB_QUIET_NUDGE_RECALL,
+                "quiet_nudge_elaboration": r1_icebreaker._NUDGE_ELABORATION_RE.pattern,
+                "quiet_nudge_recall_leads": sorted(r1_icebreaker._NUDGE_RECALL_LEADS),
             },
             # Revision 31 (D4-ICE-SKIP1, R1_IB_SKIP_V2; D4-ICE-ECHO1, R1_REACTION_VARIETY_V2).
             "skip_v2": {

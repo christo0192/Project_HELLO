@@ -752,12 +752,14 @@ class TestDiagnosis4Wording(unittest.TestCase):
         self.assertTrue(r1_script.LINES["L-OPEN-AGENDA-W2"].startswith("Great, I can hear you too."))
 
     def test_the_flag_picks_the_text(self) -> None:
+        # D5-AGENDA1: the agendas' W2 text is what R1_AGENDA_W3=0 speaks.
         for line_id, reworded in r1_script.WORDING_LINES.items():
             with self.subTest(line_id=line_id):
-                self.assertEqual(r1_script.active_line_id(line_id), reworded)
+                with mock.patch.dict(os.environ, {"R1_AGENDA_W3": "0"}):
+                    self.assertEqual(r1_script.active_line_id(line_id), reworded)
                 with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
                     self.assertEqual(r1_script.active_line_id(line_id), line_id)
-        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0", "R1_AGENDA_W3": "0"}):
             self.assertEqual(r1_script.active_line_id("L-TRANSITION"), "L-TRANSITION-V20")
             self.assertEqual(r1_script.active_line_id("L-OPEN-AGENDA"), "L-OPEN-AGENDA-W2")
 
@@ -782,3 +784,46 @@ class TestDiagnosis4Wording(unittest.TestCase):
                 text = r1_script.line(line_id, **self.VALUES)
                 self.assertLessEqual(len(text.split()), 20)
                 self.assertNotIn("?", text)
+
+
+class TestDiagnosis5Agenda(unittest.TestCase):
+    """M032 live simulation, diagnosis 5 (D5-AGENDA1, R1_AGENDA_W3): the W2 agenda's "takes about
+    thirty minutes." then "a sales role-play of up to twenty minutes" was read as a contradiction;
+    one sentence now shows the parts make up the whole."""
+
+    IDS = ("L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE")
+
+    def test_the_whole_and_its_parts_are_one_sentence(self) -> None:
+        for line_id in r1_script.AGENDA_W3_LINES.values():
+            with self.subTest(line_id=line_id):
+                text = r1_script.LINES[line_id]
+                sentence = next(
+                    part for part in re.split(r"(?<=[.?!])\s+", text) if "whole interview" in part
+                )
+                self.assertIn("thirty", sentence)
+                self.assertIn("up to twenty", sentence)
+                self.assertNotIn("Great, I can hear you too", text)
+
+    def test_the_heard_line_and_the_first_question(self) -> None:
+        self.assertEqual(
+            r1_script.LINES["L-OPEN-AGENDA-W3"],
+            "Good, I can hear you. The whole interview takes about thirty minutes: a few minutes "
+            "to get to know you, a sales role-play of up to twenty minutes, then time for your "
+            "questions. To start, tell me a bit about yourself and the sales or customer-facing "
+            "work you've done.",
+        )
+        self.assertTrue(r1_script.LINES["L-OPEN-AGENDA-PLAIN-W3"].startswith("Let's get started. "))
+        self.assertTrue(
+            r1_script.LINES["L-OPEN-AGENDA-CONTINUE-W3"].endswith(r1_script.OPEN_CARRY_ON)
+        )
+
+    def test_the_flag_picks_the_text(self) -> None:
+        for line_id in self.IDS:
+            with self.subTest(line_id=line_id):
+                self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W3")
+                with mock.patch.dict(os.environ, {"R1_AGENDA_W3": "0"}):
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W2")
+                with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id)
+                    self.assertFalse(r1_script.agenda_w3_enabled())
+

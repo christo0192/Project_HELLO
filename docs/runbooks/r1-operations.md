@@ -2449,6 +2449,31 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
 * Not done on this branch: the wrap-up items of D4-WRAP1 (feedback asks, role questions, the
   joined next-steps line, the closing wording); that code lives on the learner branch.
 
+#### M032 live simulation, diagnosis 5 (Christy lane, content revision 33)
+
+* **`R1_AGENDA_W3`** (default on, only with `R1_BRIEF_WORDING_V2`). The W2 agenda's "takes about
+  thirty minutes." followed by "a sales role-play of up to twenty minutes" was read as a
+  contradiction. The agenda is now "Good, I can hear you. The whole interview takes about thirty
+  minutes: a few minutes to get to know you, a sales role-play of up to twenty minutes, then time
+  for your questions." and W2's first question (L-OPEN-AGENDA-W3, -PLAIN-W3, -CONTINUE-W3).
+  Rollback: `fly secrets set R1_AGENDA_W3=0 -a project-hello-voice` (the W2 agenda).
+* **`R1_WRAP_OFFER_VARIANT`** (default on). The second offer to wrap up the role-play is
+  L-ASIDE-WRAP-AGAIN ("Christy again, just checking in. Would you like to wrap up the role-play
+  here? If not, just carry on with {lead_first_name}."), never L-ASIDE-WRAP word for word. Like
+  L-ASIDE-WRAP it is not an either/or question, so a yes still means wrap up and every answer is
+  handled as before. Rollback: `fly secrets set R1_WRAP_OFFER_VARIANT=0 -a project-hello-voice`.
+* Under the round-4 flags: `R1_REACTION_VARIETY_V2` drops the react clause's quoted example (the
+  model copied "And with <their thing>, <question>?") and the guard keeps one such opener in the
+  small talk; `R1_GUARD_STORY_ECHO` drops her own hiring-team deflection after a turn that asked
+  nothing (never the only sentence); `R1_IB_SKIP_V2`'s notes say one or two quick questions are
+  left; `R1_IB_QUIET_NUDGE` keeps the asking clause and says "I was asking, {question}" after a
+  lead of her own; `R1_TRANSITION_ANSWERS` answers "What do I actually do?" and "How should I
+  approach it?" with L-RP-GOAL, adds the field answer after a reply cut to a bare "That's right,
+  yes.", invites "Could I check a couple of things first?" without a start question, and keeps
+  "has just been given" for a request to hear the brief again.
+* Not done on this branch: D5-WRAP-NEXT1 and the L-FAQ-DEFER-WRAP rewording of D5-DEFLECT1; the
+  wrap-up code (L-WRAP-NEXT, L-WRAP-MORE, L-FAQ-DEFER-WRAP) lives on the learner branch.
+
 ### Icebreaker repairs (M032 S6, owner go 2026-11-11)
 
 Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the

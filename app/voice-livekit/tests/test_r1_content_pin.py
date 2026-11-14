@@ -167,7 +167,12 @@ import r1_world
 # (R1_TRANSITION_ANSWERS), the silence restates (R1_SIL_IB_RESTATE), the quiet nudge
 # (R1_IB_QUIET_NUDGE), the skip notes (R1_IB_SKIP_V2), the react clause v2 (R1_REACTION_VARIETY_V2)
 # and the plan note's pause line (R1_ICEBREAKER_REPAIR).
-PINNED_CONTENT_SHA256 = "f57f54d4ace131567ed173f2bc5b53b033249472422b2a0b91c140788f72b1ff"
+# Revision 33 (M032 live simulation, diagnosis 5, Christy lane): the W3 agenda (R1_AGENDA_W3),
+# L-ASIDE-WRAP-AGAIN (R1_WRAP_OFFER_VARIANT), the react clause without its example and the guard's
+# one "And with ..." opener (R1_REACTION_VARIETY_V2), the skip notes (R1_IB_SKIP_V2), the nudge's
+# "I was asking" form (R1_IB_QUIET_NUDGE) and the answers note's approach sentence
+# (R1_TRANSITION_ANSWERS).
+PINNED_CONTENT_SHA256 = "161352358870e2bec238647f823428cc10e592b56047768aa5041a6c45c923e6"
 
 CONTENT_MODULES = (
     "r1_text",

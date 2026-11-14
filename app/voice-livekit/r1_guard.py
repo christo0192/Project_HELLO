@@ -772,6 +772,52 @@ def echoes_their_turn(sentence: object, candidate_text: str) -> bool:
     return bool(_echo_terms(body) & _echo_terms(candidate_text))
 
 
+# M032 live simulation, diagnosis 5 (D5-ICE-AWITH1, ``R1_REACTION_VARIETY_V2``): the react clause's
+# old example taught a stock frame, "And with <their thing>, <question>?" ("And with that playbook
+# routine, what's drawing you to this particular role?"), about ten times in 250 icebreaker lines.
+# One such opener in the small talk is natural; after that the clause is cut and the question kept.
+# Bounded quantifiers only.
+_WITH_OPENER = re.compile(
+    r"^(?:and )?with (?:that|those|this|these|all|a|the|learners|so)\b[^,?]{0,60},\s*",
+    re.IGNORECASE,
+)
+_WITH_OPENER_MIN_WORDS = 3
+
+
+def with_opener(sentence: object) -> bool:
+    """D5-ICE-AWITH1: ``sentence`` opens with the stock "And with <their thing>," frame."""
+    return _WITH_OPENER.match(str(sentence or "").strip()) is not None
+
+
+def without_with_opener(sentence: str) -> str:
+    """D5-ICE-AWITH1: ``sentence`` without its "And with <their thing>," clause, re-capitalised.
+
+    Never empty: with fewer than ``_WITH_OPENER_MIN_WORDS`` words left the sentence is kept whole.
+    """
+    text = str(sentence or "").strip()
+    match = _WITH_OPENER.match(text)
+    if match is None:
+        return sentence
+    rest = text[match.end():].strip()
+    if word_count(rest) < _WITH_OPENER_MIN_WORDS:
+        return sentence
+    return rest[:1].upper() + rest[1:]
+
+
+# D5-DEFLECT1: the core of her own deflection (``INTERVIEWER_DEFLECTION``), normalised.
+_DEFLECTION_CORE = "good question for the hiring team"
+
+
+def is_self_deflection(sentence: object) -> bool:
+    """D5-DEFLECT1: ``sentence`` is the interviewer's hiring-team deflection, in any wording that
+    keeps its core ("That's a good question for the hiring team; they'll follow up with you on
+    it.")."""
+    said = normalize(fold(sentence))
+    return bool(said) and (
+        said == normalize(fold(INTERVIEWER_DEFLECTION)) or _DEFLECTION_CORE in said
+    )
+
+
 def opens_with_reaction(sentence: object) -> bool:
     """D4-ICE-ECHO1: a reply opener that is an echo, a verdict or the echo-and-verdict shape."""
     return (
@@ -1055,6 +1101,10 @@ class GuardContext:
     # icebreaker (newest last), for the echo-opener check.
     reaction_check_v2: bool = False
     previous_openings: tuple[str, ...] = ()
+    # M032 diagnosis 5 (D5-ICE-AWITH1, ``R1_REACTION_VARIETY_V2``; the session sets it with
+    # ``reaction_check_v2``): one of her earlier small-talk replies already opened a sentence with
+    # "And with <their thing>," (``with_opener``), so any further one loses that clause.
+    with_opener_used: bool = False
     # D4-TRANS-Q1 (``R1_TRANSITION_ANSWERS``; the session sets both, with ``candidate_text``).  In
     # the transition a blocked sentence after a turn that asked nothing is dropped (never the
     # hiring-team deflection), and the "happy to go over ..." offer once made is cut.
@@ -1754,6 +1804,11 @@ class StreamGuard:
         # D3-GUARD-IB1: the reply's first sentence was a pay echo dropped after a turn that asked
         # nothing, so the next sentence kept opens with ``STORY_ACK``.
         self._story_ack_owed = False
+        # D5-ICE-AWITH1: a sentence of this reply already opened with "And with <their thing>,".
+        self._with_opener_seen = False
+        # D5-DEFLECT1: her own hiring-team deflection, dropped after a turn that asked nothing
+        # (``_cut_self_deflection``; never the only sentence, ``flush`` gives it back).
+        self._deflection_dropped: list[str] = []
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -2055,6 +2110,51 @@ class StreamGuard:
             self._summary_dropped.append(sentence)
         return kept
 
+    def _cap_with_opener(self, sentence: str) -> str:
+        """D5-ICE-AWITH1: the "And with <their thing>," opener is kept once in the small talk.
+
+        Only in the opening and the icebreaker and only with ``reaction_check_v2``.  The first
+        such opener (in the session, ``with_opener_used``, or in this reply) stays; any later one
+        loses the clause up to its comma, and the question is re-capitalised (never emptied:
+        ``without_with_opener``).  A style trim (no hit).
+        """
+        ctx = self.ctx
+        if (
+            not ctx.reaction_check_v2
+            or ctx.is_learner
+            or ctx.phase not in SMALL_TALK_PHASES
+            or not with_opener(sentence)
+        ):
+            return sentence
+        if not ctx.with_opener_used and not self._with_opener_seen:
+            self._with_opener_seen = True
+            return sentence
+        kept = without_with_opener(sentence)
+        if kept != sentence:
+            self._style_edits += 1
+        return kept
+
+    def _cut_self_deflection(self, sentence: str) -> str:
+        """D5-DEFLECT1 (``story_echo``, ``R1_GUARD_STORY_ECHO``): in the opening and the icebreaker
+        her own "That's a good question for the hiring team ..." after a turn that asked nothing is
+        dropped ("" for gone): nobody asked her anything.  Never the only sentence: ``flush`` falls
+        back to the plan's question, or gives it back when there is none.  A style trim (no hit).
+        """
+        ctx = self.ctx
+        if (
+            not ctx.story_echo
+            or ctx.is_learner
+            or ctx.phase not in SMALL_TALK_PHASES
+            or not ctx.candidate_text
+            or _turn_asks(ctx.candidate_text)
+            or self._summary_off
+            or not is_self_deflection(sentence)
+        ):
+            return sentence
+        self._style_edits += 1
+        self._deflection_dropped.append(sentence)
+        return ""
+
     def _vet(self, sentence: str) -> list[str]:
         if self._done:
             return []
@@ -2067,6 +2167,10 @@ class StreamGuard:
         sentence = self._cut_praise(sentence)
         if sentence:
             sentence = self._cut_summary(sentence)
+        if sentence:
+            sentence = self._cut_self_deflection(sentence)
+        if sentence:
+            sentence = self._cap_with_opener(sentence)
         if not sentence:
             self._last_dropped = True
             return []
@@ -2184,6 +2288,17 @@ class StreamGuard:
             # question beats a canned line): vetted again without the summary trim.
             self._summary_off = True
             for sentence in self._summary_dropped:
+                out.extend(self._vet(sentence))
+        if (
+            not self._emitted
+            and self._deflection_dropped
+            and self._other_drops == 0
+            and not self.ctx.interviewer_fallback
+        ):
+            # D5-DEFLECT1: the deflection was all the reply said and there is no question to fall
+            # back on: it stays, as before (vetted again without the trims).
+            self._summary_off = True
+            for sentence in self._deflection_dropped:
                 out.extend(self._vet(sentence))
         if (
             not self._emitted
