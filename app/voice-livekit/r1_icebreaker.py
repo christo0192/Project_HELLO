@@ -43,6 +43,14 @@ from typing import Any
 from r1_guard import GuardContext, check_sentence, praise_detected
 from r1_text import fold, split_sentences
 
+
+def _reaction_variety_v2() -> bool:
+    """``R1_REACTION_VARIETY_V2`` (``r1_prompts.reaction_variety_v2_enabled``), imported late:
+    r1_prompts is not needed for anything else here."""
+    from r1_prompts import reaction_variety_v2_enabled
+
+    return reaction_variety_v2_enabled()
+
 # Dispositions of one committed icebreaker answer.
 ANSWERED = "answered"
 THIN = "thin"
@@ -114,6 +122,78 @@ def max_holds() -> int:
     """How often one question is asked again before the plan moves on (``MAX_HOLDS``, or
     ``REASK_V2_MAX_HOLDS`` with ``R1_IB_REASK_V2``)."""
     return REASK_V2_MAX_HOLDS if ib_reask_v2_enabled() else MAX_HOLDS
+
+
+# M032 live simulation, diagnosis 4 (D4-ICE-SKIP1): "Can we skip ahead to the role-play?" got the
+# question just asked again, and "<an answer>. Now can we do the role-play?" threw the answer away
+# and asked the question it had just answered.  With ``R1_IB_SKIP_V2`` a skip request that also
+# answers is an answer (the plan moves on), a pure skip moves past the current question to the next
+# one (never the same one again), and a second skip request leaves one more question before the
+# brief.
+SKIP_V2_CAP_AFTER = 2
+
+
+def ib_skip_v2_enabled() -> bool:
+    """``R1_IB_SKIP_V2`` (default on, only with ``R1_ICEBREAKER_PLAN``; D4-ICE-SKIP1).  Read at use.
+    Rollback: ``fly secrets set R1_IB_SKIP_V2=0 -a project-hello-voice`` (content revision 30's skip
+    handling and follow-up note)."""
+    return icebreaker_plan_enabled() and (
+        (os.getenv("R1_IB_SKIP_V2") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
+# M032 live simulation, diagnosis 4 (D4-IB-QUIET-NUDGE): "Thank you." right after her question got
+# no reply (D3-IB-REASK1) and then 30 s of silence and "Are you still with me?" seconds after the
+# candidate had spoken.  With ``R1_IB_QUIET_NUDGE`` the silence after such a quiet ack is shorter
+# and she asks the same question once more, short, using the question's one re-ask.
+IB_QUIET_NUDGE_SECONDS = 10.0
+IB_QUIET_NUDGE_TEMPLATE = "So, {question}"
+# The nudge is only promised with at least this much of the hard icebreaker budget left.
+IB_QUIET_NUDGE_MIN_BUDGET_SECONDS = 20.0
+_NUDGE_LEAD_RE = re.compile(
+    r"^(?:(?:and|so|now|okay|ok|right|also|but|well|alright|got it|sure|then)\b[\s,]*)+",
+    re.IGNORECASE,
+)
+_KEEP_CAPITAL_RE = re.compile(r"^(?:I\b|I'|Christy\b|Interview Kickstart\b)")
+
+
+def ib_quiet_nudge_enabled() -> bool:
+    """``R1_IB_QUIET_NUDGE`` (default on, only with ``R1_IB_REASK_V2``; D4-IB-QUIET-NUDGE).  Read at
+    use.  Rollback: ``fly secrets set R1_IB_QUIET_NUDGE=0 -a project-hello-voice`` (the 30 s window
+    and "Are you still with me?" as before)."""
+    return ib_reask_v2_enabled() and (
+        (os.getenv("R1_IB_QUIET_NUDGE") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
+def quiet_nudge_line(question: str) -> str:
+    """Her question once more, short: "So, what does a typical day look like?".  A lead-in word of
+    her own ("And", "Right,") is dropped and the first letter lowered (never "I" or a name)."""
+    rest = _NUDGE_LEAD_RE.sub("", str(question or "").strip()).strip()
+    if not rest:
+        return ""
+    if _KEEP_CAPITAL_RE.match(rest) is None:
+        rest = rest[:1].lower() + rest[1:]
+    return IB_QUIET_NUDGE_TEMPLATE.format(question=rest)
+
+
+# M032 live simulation, diagnosis 4 (D4-SIL-IB1): 30 s of silence after an open icebreaker question
+# got only "Are you still with me?".  With ``R1_SIL_IB_RESTATE`` the first silence prompt restates
+# what she asked (one scripted line per objective, L-SIL-IB-<id>), and "Are you still with me?" is
+# kept for a second silence.
+def sil_ib_restate_enabled() -> bool:
+    """``R1_SIL_IB_RESTATE`` (default on, only with ``R1_IB_REASK_V2``, which tracks an open
+    question).  Read at use.  Rollback: ``fly secrets set R1_SIL_IB_RESTATE=0 -a
+    project-hello-voice`` (L-SIL-IB alone, as before)."""
+    return ib_reask_v2_enabled() and (
+        (os.getenv("R1_SIL_IB_RESTATE") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
+def silence_line_id(objective: Objective | None) -> str:
+    """The first silence prompt for an open question of ``objective`` (L-SIL-IB-<id>), or L-SIL-IB
+    once every objective is reached."""
+    return "L-SIL-IB" if objective is None else f"L-SIL-IB-{objective.id}"
 
 
 @dataclass(frozen=True)
@@ -234,6 +314,45 @@ JOB_NOTES: dict[str, str] = {
         "customer-facing work."
     ),
 }
+# D4-ICE-SKIP1 (``R1_IB_SKIP_V2``): a pure skip request moves on to the NEXT objective (never the
+# same one again), and a thin answer's follow-up asks for one detail of what they said, never the
+# original question again (int-live-4: "Just one more for now: walk me through a typical day").
+JOB_SKIP_V2_NOTE = (
+    "They asked to skip ahead. Say warmly, in one short clause, that you'll get there in a couple "
+    "of minutes, then ask one short question, in your own words, that gets at this: \"{goal}\". "
+    'Never start with "I understand, but".'
+)
+FREE_SKIP_V2_NOTE = (
+    "They asked to skip ahead. Say warmly, in one short clause, that you'll get there in a couple "
+    "of minutes, then ask one short follow-up question about something else they already told you "
+    'about their sales or customer-facing work. Never start with "I understand, but".'
+)
+SKIP_NOTE_V2 = (
+    "They also asked to skip ahead: say warmly, in one short clause, that you'll get there in a "
+    'couple of minutes, without naming any part of the interview. Never start with "I '
+    'understand, but".'
+)
+JOB_FOLLOW_UP_V2_NOTE = (
+    "Their answer was short. Ask for one concrete detail of what they just said, in one short "
+    'question; do not ask the original question again. The subject: "{goal}".'
+)
+# M032 live simulation, diagnosis 4 (D4-ICE-ECHO1, ``R1_REACTION_VARIETY_V2``): "React in a few
+# words to one specific thing they just said" made 57% of her icebreaker questions open with "Right,
+# <their words>.".  Most turns need no reaction: the question is tied to what they said instead.
+REACTION_V2_NOTES: dict[str, str] = {
+    JOB_ASK: (
+        "Ask one short question, in your own words, that gets at this: \"{goal}\". Tie it to one "
+        "specific thing they just said; a word or two of reaction at most, never their words back."
+    ),
+    JOB_FREE: (
+        "Ask one short follow-up question about something they already told you about their sales "
+        "or customer-facing work, tied to what they just said; a word or two of reaction at most, "
+        "never their words back."
+    ),
+}
+# D4-ICE-HOLD1 (``R1_ICEBREAKER_REPAIR``): a request to wait was refused ("I'd rather keep us on
+# track"); a pause request is always granted.
+HOLD_NOTE = 'If they ask you to wait or pause, never refuse: say "Of course, take your time."'
 # Once every objective is reached (or the last one was declined) there is no objective to quote,
 # but a decline is still accepted, and a request to hear the question again or to skip ahead still
 # gets the last question again (review of S5: the phone's "a decline never loops" and "a repeat
@@ -489,7 +608,10 @@ def disposition(text: object, *, content_words: int) -> Reading:
     skip = _SKIP_RE.search(plain) is not None
     if skip:
         rest = substantive_words(_SKIP_RE.sub(" ", plain))
-        if rest < THIN_WORDS + 3:
+        # D4-ICE-SKIP1 (``R1_IB_SKIP_V2``): a skip request that also answers (THIN_WORDS or more
+        # words outside the skip phrase) is that answer, read below with ``skip`` set.
+        limit = THIN_WORDS if ib_skip_v2_enabled() else THIN_WORDS + 3
+        if rest < limit:
             return Reading(SKIP, asked=asked, skip=True)
     if _DECLINE_RE.search(plain) is not None and content_words <= DECLINE_MAX_WORDS:
         return Reading(DECLINED, asked=asked)
@@ -522,6 +644,9 @@ class IcebreakerJob:
     skip: bool
     serial: int
     undo: tuple[Any, ...] = field(repr=False, default=())
+    # D4-ICE-SKIP1 (``R1_IB_SKIP_V2``): the second skip request's reply is the icebreaker's last
+    # question (the session ends the icebreaker at the answer to it).
+    last: bool = False
 
     @property
     def scripted(self) -> str:
@@ -533,15 +658,30 @@ class IcebreakerJob:
         """The reminder for this reply ("" for the scripted one)."""
         if self.kind == JOB_TAKE_TIME:
             return ""
+        skip_v2 = ib_skip_v2_enabled()
+        reactions_v2 = _reaction_variety_v2()
         if self.objective is not None:
-            body = JOB_NOTES[self.kind].format(goal=self.objective.goal)
+            template = JOB_NOTES[self.kind]
+            if skip_v2 and self.kind == JOB_SKIP:
+                template = JOB_SKIP_V2_NOTE
+            elif skip_v2 and self.kind == JOB_FOLLOW_UP:
+                template = JOB_FOLLOW_UP_V2_NOTE
+            elif reactions_v2 and self.kind in REACTION_V2_NOTES:
+                template = REACTION_V2_NOTES[self.kind]
+            body = template.format(goal=self.objective.goal)
+        elif skip_v2 and self.kind == JOB_SKIP:
+            body = FREE_SKIP_V2_NOTE
+        elif reactions_v2 and self.kind not in FREE_JOB_NOTES:
+            body = REACTION_V2_NOTES[JOB_FREE]
         else:
             body = FREE_JOB_NOTES.get(self.kind, JOB_NOTES[JOB_FREE])
         lines = [PLAN_NOTE_HEAD, body]
         if self.skip and self.kind != JOB_SKIP:
-            lines.append(SKIP_NOTE)
+            lines.append(SKIP_NOTE_V2 if skip_v2 else SKIP_NOTE)
         if self.asked and self.kind not in (JOB_REASK, JOB_SKIP):
             lines.append(ASKED_NOTE)
+        if icebreaker_repair_enabled():
+            lines.append(HOLD_NOTE)  # D4-ICE-HOLD1
         lines.append(PLAN_NOTE_TAIL_SKIP if self.skip or self.kind == JOB_SKIP else PLAN_NOTE_TAIL)
         return "\n".join(lines)
 
@@ -564,6 +704,7 @@ class IcebreakerPlan:
         self.credited: list[str] = []
         self.jobs: dict[str, int] = {}
         self.serial = 0
+        self.skips = 0  # D4-ICE-SKIP1: skip requests read so far
 
     @property
     def current(self) -> Objective | None:
@@ -578,6 +719,7 @@ class IcebreakerPlan:
             list(self.credited),
             dict(self.jobs),
             dict(self.repeats),
+            self.skips,
         )
 
     def _advance(self, text: str) -> None:
@@ -615,6 +757,8 @@ class IcebreakerPlan:
         that did not answer still gets the last question again (bounded like a hold)."""
         if reading.kind == DECLINED:
             return JOB_DECLINED
+        if reading.kind == SKIP and ib_skip_v2_enabled():
+            return JOB_SKIP  # D4-ICE-SKIP1: a follow-up about something else, never the same one
         if self._repeat(_FREE_HOLDS, reading, repeat_asked):
             return JOB_REASK
         if reading.kind in (NONANSWER, SKIP) and self.holds.get(_FREE_HOLDS, 0) < max_holds():
@@ -633,14 +777,24 @@ class IcebreakerPlan:
         undo = self._snapshot()
         reading = disposition(text, content_words=content_words)
         current = self.current
+        skip_v2 = ib_skip_v2_enabled()
+        if skip_v2 and reading.skip:
+            self.skips += 1
         if reading.kind == THINKING:
             kind = JOB_TAKE_TIME
+        elif skip_v2 and reading.kind == SKIP and current is not None:
+            # D4-ICE-SKIP1: past the current objective, never the same question again.
+            self._advance(text)
+            kind = JOB_SKIP
         elif current is None:
             kind = self._free_job(reading, repeat_asked)
         elif self._repeat(current.id, reading, repeat_asked):
             kind = JOB_REASK
         elif reading.kind == ANSWERED:
             self._advance(text)
+            kind = JOB_ASK
+        elif reading.kind == THIN and skip_v2 and reading.skip:
+            self._advance(text)  # D4-ICE-SKIP1: a short answer with a skip request moves on
             kind = JOB_ASK
         elif reading.kind == THIN:
             if self.follow_ups.get(current.id, 0) < MAX_FOLLOW_UPS:
@@ -667,7 +821,18 @@ class IcebreakerPlan:
             skip=reading.skip,
             serial=self.serial,
             undo=undo,
+            last=skip_v2 and reading.skip and self.skips >= SKIP_V2_CAP_AFTER,
         )
+
+    def use_hold(self) -> bool:
+        """D4-IB-QUIET-NUDGE: spend the current question's re-ask (``max_holds``) on a nudge after
+        a quiet ack; False when it is used up (no nudge then)."""
+        current = self.current
+        key = _FREE_HOLDS if current is None else current.id
+        if self.holds.get(key, 0) >= max_holds():
+            return False
+        self.holds[key] = self.holds.get(key, 0) + 1
+        return True
 
     def reply_lost(self, job: IcebreakerJob) -> bool:
         """Undo ``job`` when its reply was never heard and nothing was decided after it.
@@ -678,8 +843,9 @@ class IcebreakerPlan:
         """
         if job.serial != self.serial or not job.undo:
             return False
-        cursor, follow_ups, holds, credited, jobs, repeats = job.undo
+        cursor, follow_ups, holds, credited, jobs, repeats, skips = job.undo
         self.cursor = cursor
+        self.skips = skips
         self.follow_ups = dict(follow_ups)
         self.holds = dict(holds)
         self.repeats = dict(repeats)
@@ -761,18 +927,36 @@ IB_PRESENCE_HOLD_SECONDS = 20.0
 # customers".  "Pause" and "hold on" stand alone only as a request or at the start of the turn.
 _HOLD_TIME = r"(?:a|one|just a|a quick|a short) (?:minute|moment|second|sec|bit)"
 _HOLD_MODAL = r"(?:(?:can|could|would|will) you (?:please |just |kindly )?|please |just )"
+# D4-ICE-HOLD1: "could you just hold this for a minute?" has an object between the verb and the
+# time.
+_HOLD_OBJECT = r"(?: (?:this|it|that|on|things|the interview|the call))?"
 _HOLD_RE = re.compile(
     r"\b(?:"
     + _HOLD_MODAL + r"?give (?:me|us) " + _HOLD_TIME
-    + r"|" + _HOLD_MODAL + r"(?:wait|hold(?: on)?)(?: for)? " + _HOLD_TIME
+    + r"|(?:" + _HOLD_MODAL + r"|(?:can|could) we (?:please |just )?)(?:wait|hold(?: on)?|pause)"
+    + _HOLD_OBJECT + r"(?: for)? " + _HOLD_TIME
     + r"|(?:can|could|may) (?:i|we) (?:please |just )?(?:have|take|get) a (?:quick |short )?"
     r"(?:minute|moment|second|sec|break)"
     r"|(?:can|could|would|will) (?:you|we) (?:please |just |quickly )?"
     r"(?:pause|take a (?:quick |short )?break)"
     r"|(?:please|let's|let us) (?:pause|take a (?:quick |short )?break)"
     r")\b"
-    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy|ma'am|madam|sir) )*"
-    r"(?:(?:wait|hold(?: on)?)(?: for)? " + _HOLD_TIME + r"|hold on|pause)\b"
+    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy|ma'am|madam|sir|hey) )*"
+    r"(?:(?:wait|hold(?: on)?)" + _HOLD_OBJECT + r"(?: for)? " + _HOLD_TIME + r"|hold on|pause)\b"
+)
+# The direct request shapes alone (a modal, "please", "let's"): the last sentence of a turn is read
+# as a hold only in one of these, so "I hold on for a second and let them vent." never is.
+_HOLD_DIRECT_RE = re.compile(
+    r"\b(?:"
+    + _HOLD_MODAL + r"?give (?:me|us) " + _HOLD_TIME
+    + r"|(?:(?:can|could|would|will) you (?:please |just |kindly )?|please |(?:can|could) we "
+    r"(?:please |just )?)(?:wait|hold(?: on)?|pause)" + _HOLD_OBJECT + r"(?: for)? " + _HOLD_TIME
+    + r"|(?:can|could|may) (?:i|we) (?:please |just )?(?:have|take|get) a (?:quick |short )?"
+    r"(?:minute|moment|second|sec|break)"
+    r"|(?:can|could|would|will) (?:you|we) (?:please |just |quickly )?"
+    r"(?:pause|take a (?:quick |short )?break)"
+    r"|(?:please|let's|let us) (?:pause|take a (?:quick |short )?break)"
+    r")\b"
 )
 # What may follow the hold phrase and keep the turn a hold request: its object and time ("pause
 # this for a minute"), thinking ("to think", "to gather my thoughts") and "I'll be right back".
@@ -788,7 +972,7 @@ _HOLD_TAIL_RE = re.compile(
 # "Hold on a sec, are you there?" ask or say something of their own, and get it answered.
 _HOLD_REST_WORDS = _FILLER_WORDS | frozenset(
     {"thanks", "thank", "you", "for", "me", "us", "quick", "quickly", "kindly", "now", "maam",
-     "mam", "real"}
+     "mam", "real", "hey"}
 )
 
 
@@ -803,6 +987,19 @@ def is_hold_request(text: object) -> bool:
     plain = _plain(text)
     if not plain or _HOLD_RE.search(plain) is None:
         return False
+    if _hold_only(plain):
+        return True
+    # D4-ICE-HOLD1: "Never mentioned it to anyone. Hey, could you just hold this for a minute?"
+    # ends with a direct request for a moment; whatever came before it, the turn asks for one.
+    sentences = [sentence for sentence in split_sentences(text) if _plain(sentence)]
+    if len(sentences) < 2:
+        return False
+    last = _plain(sentences[-1])
+    return _HOLD_DIRECT_RE.search(last) is not None and _hold_only(last)
+
+
+def _hold_only(plain: str) -> bool:
+    """Every word of ``plain`` (folded) is the hold phrase, its tail or a filler."""
     rest = _HOLD_TAIL_RE.sub(" ", _HOLD_RE.sub(" ", plain))
     return all(word in _HOLD_REST_WORDS for word in rest.split())
 

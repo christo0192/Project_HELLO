@@ -202,6 +202,7 @@ def llm_messages(
     *,
     voice: bool | None = None,
     reactions: bool | None = None,
+    reactions_v2: bool | None = None,
 ) -> list[dict[str, str]]:
     """The only messages the model may see for ``reply`` (the llm_node context filter).
 
@@ -211,6 +212,7 @@ def llm_messages(
     ``R1_INTERVIEWER_VOICE`` (``None`` reads it now): Christy's voice text in the prefix and
     the delivery rider on the note.  ``reactions`` (D3-ICE1) is its reading of
     ``R1_REACTION_VARIETY`` (``None`` reads it now): the reworded react clause in both.
+    ``reactions_v2`` (D4-ICE-ECHO1) is its reading of ``R1_REACTION_VARIETY_V2``.
     """
     ordered = sorted(
         (item for item in history if item is not reply.entry),
@@ -224,11 +226,15 @@ def llm_messages(
             reply.plan.reminder,
         )
     return assemble_messages(
-        interviewer_prefix(voice=voice, reactions=reactions),
+        interviewer_prefix(voice=voice, reactions=reactions, reactions_v2=reactions_v2),
         select_context(ordered, reply.phase),
         reply.candidate_text,
         interviewer_reminder(
-            reply.phase, note=reply.note or None, rider=voice, reactions=reactions
+            reply.phase,
+            note=reply.note or None,
+            rider=voice,
+            reactions=reactions,
+            reactions_v2=reactions_v2,
         ),
     )
 

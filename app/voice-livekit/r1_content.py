@@ -205,7 +205,20 @@ import r1_world
 #    "that's helpful", a verdict on the answer; D3-ICE1-THANKS-CONTEXT), and the icebreaker repair
 #    pins REASK_V2_MAX_REPEATS (2: an explicit request to hear the question again does not use up
 #    the one re-ask; D3-IB-REASK1-SECOND-REPEAT).  No other pinned text changed.
-CONTENT_REVISION = 30
+# 31: M032 live simulation, diagnosis 4 (Christy lane).  R1_BRIEF_WORDING_V2 (D4-BRIEF2): the agenda
+#    and every brief in a person's words, "Great, I can hear you too.", "Any questions before we
+#    start? If not, just say 'ready' and she'll pick up." (r1_script *-W2 lines, WORDING_LINES).
+#    R1_BRIEF_VARIETY (D4-TRANS-PRESENT1): L-PRESENT-TAKE-TIME and L-PICKUP-BRIDGE-2.
+#    R1_TRANSITION_ANSWERS (D4-TRANS-Q1): the role-play field answers L-RP-*, "Fair enough."
+#    (r1_script.TRANSITION_QUIET_FALLBACK) and the transition note without a phrase to copy
+#    (r1_prompts.TRANSITION_REMINDER_ANSWERS).  R1_SIL_IB_RESTATE (D4-SIL-IB1): L-SIL-IB-I1..I4.
+#    R1_IB_QUIET_NUDGE (D4-IB-QUIET-NUDGE): "So, {question}" and its 10 s window.  R1_IB_SKIP_V2
+#    (D4-ICE-SKIP1): the skip and follow-up notes and the cap after two skips.
+#    R1_REACTION_VARIETY_V2 (D4-ICE-ECHO1): the voice text's, the rider's and the plan notes' react
+#    clause (and the prefix with it).  R1_ICEBREAKER_REPAIR (D4-ICE-HOLD1): the plan note's
+#    "never refuse a pause" line.  Every text of revision 30 is unchanged and pinned beside the new
+#    ones (each flag off speaks it).
+CONTENT_REVISION = 31
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -257,6 +270,10 @@ def manifest() -> dict[str, Any]:
             "interviewer_name": r1_script.INTERVIEWER_NAME,
             "exit_cue": r1_script.EXIT_CUE,
             "lines": dict(r1_script.LINES),
+            # Revision 31 (D4-BRIEF2, D4-TRANS-PRESENT1, D4-TRANS-Q1).
+            "wording_lines": dict(r1_script.WORDING_LINES),
+            "variety_lines": dict(r1_script.VARIETY_LINES),
+            "transition_quiet_fallback": r1_script.TRANSITION_QUIET_FALLBACK,
             "learner_filler_variants": list(r1_script.LEARNER_FILLER_VARIANTS),
             "learner_filler_short": r1_script.LEARNER_FILLER_SHORT,
         },
@@ -393,13 +410,24 @@ def manifest() -> dict[str, Any]:
             "flag_threshold": r1_guard.HIT_FLAG_THRESHOLD,
         },
         "prompts": {
-            "interviewer_prefix": r1_prompts.interviewer_prefix(voice=True, reactions=False),
+            "interviewer_prefix": r1_prompts.interviewer_prefix(
+                voice=True, reactions=False, reactions_v2=False
+            ),
             "interviewer_voice_text": r1_prompts.INTERVIEWER_VOICE_TEXT,
             "interviewer_delivery_rider": r1_prompts.INTERVIEWER_DELIVERY_RIDER,
             # Revision 29 (D3-ICE1, R1_REACTION_VARIETY): the reworded react clause.
             "interviewer_prefix_reactions": r1_prompts.interviewer_prefix(
-                voice=True, reactions=True
+                voice=True, reactions=True, reactions_v2=False
             ),
+            # Revision 31 (D4-ICE-ECHO1, R1_REACTION_VARIETY_V2; D4-TRANS-Q1).
+            "interviewer_prefix_reactions_v2": r1_prompts.interviewer_prefix(
+                voice=True, reactions=True, reactions_v2=True
+            ),
+            "interviewer_voice_text_reactions_v2": r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS_V2,
+            "interviewer_delivery_rider_reactions_v2": (
+                r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS_V2
+            ),
+            "transition_reminder_answers": r1_prompts.TRANSITION_REMINDER_ANSWERS,
             "interviewer_voice_text_reactions": r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS,
             "interviewer_delivery_rider_reactions": r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS,
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
@@ -545,7 +573,21 @@ def manifest() -> dict[str, Any]:
                 "reask_v2_max_holds": r1_icebreaker.REASK_V2_MAX_HOLDS,
                 # Revision 30 (review of diagnosis 3, D3-IB-REASK1-SECOND-REPEAT).
                 "reask_v2_max_repeats": r1_icebreaker.REASK_V2_MAX_REPEATS,
+                # Revision 31 (D4-IB-QUIET-NUDGE, D4-ICE-HOLD1).
+                "quiet_nudge_template": r1_icebreaker.IB_QUIET_NUDGE_TEMPLATE,
+                "quiet_nudge_seconds": r1_icebreaker.IB_QUIET_NUDGE_SECONDS,
+                "quiet_nudge_min_budget_seconds": r1_icebreaker.IB_QUIET_NUDGE_MIN_BUDGET_SECONDS,
+                "hold_note": r1_icebreaker.HOLD_NOTE,
             },
+            # Revision 31 (D4-ICE-SKIP1, R1_IB_SKIP_V2; D4-ICE-ECHO1, R1_REACTION_VARIETY_V2).
+            "skip_v2": {
+                "job_skip_note": r1_icebreaker.JOB_SKIP_V2_NOTE,
+                "free_skip_note": r1_icebreaker.FREE_SKIP_V2_NOTE,
+                "skip_note": r1_icebreaker.SKIP_NOTE_V2,
+                "follow_up_note": r1_icebreaker.JOB_FOLLOW_UP_V2_NOTE,
+                "cap_after": r1_icebreaker.SKIP_V2_CAP_AFTER,
+            },
+            "reaction_v2_notes": dict(r1_icebreaker.REACTION_V2_NOTES),
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,

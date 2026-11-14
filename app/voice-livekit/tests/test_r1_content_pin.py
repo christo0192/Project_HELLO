@@ -161,7 +161,13 @@ import r1_world
 # broad job question line of the repaired transition note.
 # Revision 30 (review of diagnosis 3, Christy lane): L-TRANSITION-THANKS-A without "that's helpful",
 # and the icebreaker repair's REASK_V2_MAX_REPEATS.
-PINNED_CONTENT_SHA256 = "a5a616eca589b3672b2d5000b8660d20b52b515902fa87cc91869e239a46fca7"
+# Revision 31 (M032 live simulation, diagnosis 4, Christy lane): the reworded agenda and briefs
+# (R1_BRIEF_WORDING_V2), L-PRESENT-TAKE-TIME and L-PICKUP-BRIDGE-2 (R1_BRIEF_VARIETY), the role-play
+# field answers, "Fair enough." and the transition note without a phrase to copy
+# (R1_TRANSITION_ANSWERS), the silence restates (R1_SIL_IB_RESTATE), the quiet nudge
+# (R1_IB_QUIET_NUDGE), the skip notes (R1_IB_SKIP_V2), the react clause v2 (R1_REACTION_VARIETY_V2)
+# and the plan note's pause line (R1_ICEBREAKER_REPAIR).
+PINNED_CONTENT_SHA256 = "9039b20b218e7facca3c559e4951c9d916d892501a3fedd578c0fdf018b7fc50"
 
 CONTENT_MODULES = (
     "r1_text",

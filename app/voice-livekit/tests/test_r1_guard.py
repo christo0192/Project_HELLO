@@ -2110,8 +2110,8 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
                 result = guard_text(text, self.ctx(free_reply=True))
                 self.assertEqual(result.text, text, result.hits)
 
-    # Ship-gate round 1: ordinary talk about the decision maker, as a free reply to "how does your family
-    # feel about this?" (the reviewer's sentences; main speaks every one as said).
+    # Ship-gate round 1: ordinary talk about the decision maker, as a free reply to "how does your
+    # family feel about this?" (the reviewer's sentences; main speaks every one as said).
     ORDINARY_DECIDER_TALK = (
         "My husband doesn't care what time I study, as long as dinner happens.",
         "My husband wouldn't mind if I studied on weekends.",
@@ -3008,3 +3008,148 @@ class TestStoryEchoIsNoPayClaim(unittest.TestCase):
         self.assertTrue(r1_guard.guard_story_echo_enabled())
         with mock.patch.dict(os.environ, {"R1_GUARD_STORY_ECHO": "0"}):
             self.assertFalse(r1_guard.guard_story_echo_enabled())
+
+
+class TestEchoOpenerVariety(unittest.TestCase):
+    """M032 diagnosis 4 (D4-ICE-ECHO1, ``R1_REACTION_VARIETY_V2``).  int-live-4: 57% of her icebreaker
+    questions opened with "<Right|Got it|Okay>, <their words back>." and more with a verdict the
+    D3-ICE1 trim missed.  Synthetic replies."""
+
+    REPLIES = (
+        "Right, two years on the phones. How did you plan your calls each morning?",
+        "Got it, eight years in program sales. What kind of learners did you speak to most?",
+        "Okay, growth and a fresh team. What made you look at this role now?",
+        "Right, insurance sales to families. How did you handle a customer who went quiet?",
+        "Got it, a shared sheet for leads. How often did you follow up with each one?",
+        "Okay, mostly evening calls. What does a good call look like for you?",
+    )
+
+    def run_six(self, **flags) -> list[str]:
+        said: list[str] = []
+        for reply in self.REPLIES:
+            openers = tuple(text.split(". ")[0] + "." for text in said[-2:])
+            context = ctx(
+                "icebreaker",
+                reaction_check=True,
+                previous_opening=openers[-1] if openers else "",
+                previous_openings=openers,
+                **flags,
+            )
+            said.append(guard_text(reply, context).text)
+        return said
+
+    def test_at_most_two_echo_openers_in_six_replies_and_never_two_in_a_row(self) -> None:
+        said = self.run_six(reaction_check_v2=True)
+        echoes = [r1_guard.echo_opener(text.split(". ")[0] + ".") for text in said]
+        self.assertLessEqual(sum(echoes), 2)
+        for first, second in zip(echoes, echoes[1:]):
+            self.assertFalse(first and second)
+        for text in said:
+            self.assertTrue(text.endswith("?"))  # every question stays
+
+    def test_with_the_flag_off_every_echo_stays(self) -> None:
+        said = self.run_six()
+        self.assertEqual(said, list(self.REPLIES))
+
+    def test_an_echo_alone_is_never_dropped(self) -> None:
+        context = ctx(
+            "icebreaker",
+            reaction_check=True,
+            reaction_check_v2=True,
+            previous_openings=("Right, two years on the phones.",),
+        )
+        self.assertEqual(
+            guard_text("Right, two years on the phones.", context).text,
+            "Right, two years on the phones.",
+        )
+
+    def test_the_wider_verdicts_are_trimmed(self) -> None:
+        context = ctx("icebreaker", reaction_check=True, reaction_check_v2=True)
+        for text, kept in (
+            (
+                "Same-day callbacks, that's a habit. Did you have a set time for them?",
+                "Did you have a set time for them?",
+            ),
+            (
+                "That email months later says a lot. What did you do next?",
+                "What did you do next?",
+            ),
+            (
+                "Notes on your phone, simple enough. How did you share them with the team?",
+                "How did you share them with the team?",
+            ),
+            (
+                "That call must have felt good. What did you learn from it?",
+                "What did you learn from it?",
+            ),
+            (
+                "Letting her vent first, that's not always easy. How long did that call run?",
+                "How long did that call run?",
+            ),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, context).text, kept)
+                off = ctx("icebreaker", reaction_check=True)
+                self.assertEqual(guard_text(text, off).text, text)  # D3-ICE1's list alone
+
+    def test_an_echo_and_verdict_inside_a_question_is_left(self) -> None:
+        context = ctx("icebreaker", reaction_check=True, reaction_check_v2=True)
+        text = "Is that something you still do with your current team?"
+        self.assertEqual(guard_text(text, context).text, text)
+
+    def test_the_flag_reads_the_environment(self) -> None:
+        import os
+        from unittest import mock
+
+        import r1_prompts
+
+        self.assertTrue(r1_prompts.reaction_variety_v2_enabled())
+        with mock.patch.dict(os.environ, {"R1_REACTION_VARIETY_V2": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_v2_enabled())
+        with mock.patch.dict(os.environ, {"R1_REACTION_VARIETY": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_v2_enabled())
+
+
+class TestTransitionQuietDrop(unittest.TestCase):
+    """M032 diagnosis 4 (D4-TRANS-Q1, ``R1_TRANSITION_ANSWERS``): a complaint that asked nothing ("I
+    got it the first time.") heard the hiring-team deflection; nothing was asked, so nothing is
+    deferred.  And the "happy to go over ..." offer is made once a session."""
+
+    TOLD = "I got it the first time. You didn't need to explain all that."
+
+    def test_a_blocked_sentence_after_a_turn_that_asked_nothing_is_dropped(self) -> None:
+        context = ctx("transition", transition_quiet_drop=True, candidate_text=self.TOLD)
+        result = guard_text("Right, I hear you. This role pays a good salary too.", context)
+        self.assertEqual(result.text, "Right, I hear you.")
+        self.assertNotIn(INTERVIEWER_DEFLECTION, result.text)
+
+    def test_a_question_is_still_deflected(self) -> None:
+        told = "What's the salary for this role?"
+        context = ctx("transition", transition_quiet_drop=True, candidate_text=told)
+        result = guard_text("This role pays a good salary too.", context)
+        self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_with_the_flag_off_the_deflection_is_as_before(self) -> None:
+        context = ctx("transition", candidate_text=self.TOLD)
+        result = guard_text("Right, I hear you. This role pays a good salary too.", context)
+        self.assertIn(INTERVIEWER_DEFLECTION, result.text)
+
+    def test_an_empty_reply_says_the_fallback(self) -> None:
+        context = ctx(
+            "transition",
+            transition_quiet_drop=True,
+            candidate_text=self.TOLD,
+            interviewer_fallback="Fair enough.",
+        )
+        self.assertEqual(guard_text("This role pays a good salary too.", context).text, "Fair enough.")
+
+    def test_the_offer_is_cut_once_made(self) -> None:
+        text = "It's mostly calls with learners, happy to go into the hours or anything else."
+        self.assertEqual(guard_text(text, ctx("transition")).text, text)
+        used = ctx("transition", offer_phrase_used=True)
+        self.assertEqual(guard_text(text, used).text, "It's mostly calls with learners.")
+        self.assertEqual(
+            guard_text("Sure. Happy to go over the brief again if that helps.", used).text, "Sure."
+        )
+        self.assertTrue(r1_guard.offer_phrase_in("I'm happy to go over it again."))
+        self.assertFalse(r1_guard.offer_phrase_in("Happy to help with the hours you prefer."))

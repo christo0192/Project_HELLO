@@ -168,6 +168,9 @@ class R1PhaseMachine:
         # Committed candidate answers in OPENING/ICEBREAKER (the session counts the SDK's turns of
         # three words or more, not STT finals): the soft exit needs four of them.
         self.candidate_turns = 0
+        # M032 diagnosis 4 (D4-ICE-SKIP1, R1_IB_SKIP_V2): a second request to skip ahead ended the
+        # icebreaker's plan; the answer to her next question is its last.
+        self.icebreaker_capped = False
 
     def transition(self, target: R1Phase) -> None:
         """Move only along an allowed edge and accurately maintain the paused role-play clock.
@@ -274,8 +277,10 @@ class R1PhaseMachine:
 
     def icebreaker_should_end(self) -> bool:
         """Apply the soft four-turn exit and absolute 4:30 icebreaker deadline (both on S)."""
-        return self.session_clock >= ICEBREAKER_HARD_SEC or (
-            self.session_clock >= 210 and self.candidate_turns >= 4
+        return (
+            self.icebreaker_capped
+            or self.session_clock >= ICEBREAKER_HARD_SEC
+            or (self.session_clock >= 210 and self.candidate_turns >= 4)
         )
 
     def remaining_icebreaker_seconds(self) -> float:

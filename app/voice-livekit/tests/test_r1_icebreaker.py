@@ -26,6 +26,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import r1_icebreaker as ib
+import r1_script
 from r1_guard import GuardContext, check_sentence, guard_text
 from r1_personas import ALL_PERSONA_NAMES
 
@@ -331,14 +332,24 @@ class TestPlan(unittest.TestCase):
     def test_a_skip_request_gets_one_warm_clause_then_the_same_question(self):
         # #6 -> #7: never "I understand, but", never the note's label, never a forward-looking
         # role-play sentence (the guard strips those in the icebreaker).
+        # D4-ICE-SKIP1: the same question again is revision 30's (R1_IB_SKIP_V2=0); with the flag
+        # on the next one is asked (``TestDiagnosis4Icebreaker``).
+        with mock.patch.dict(os.environ, {"R1_IB_SKIP_V2": "0"}):
+            plan = ib.IcebreakerPlan()
+            job(plan, SUBSTANTIVE)
+            skip = job(plan, "Can we go straight to the role play?")
+            self.assertEqual(skip.kind, ib.JOB_SKIP)
+            self.assertEqual(skip.objective.id, "I2")
+            self.assertIn("get there soon", skip.note)
+            self.assertIn('never start with "i understand, but"', skip.note.lower())
+            self.assertIn("without naming any part of the interview", skip.note)
+            self.assertNotIn("getting-to-know-you", skip.note)
         plan = ib.IcebreakerPlan()
         job(plan, SUBSTANTIVE)
         skip = job(plan, "Can we go straight to the role play?")
         self.assertEqual(skip.kind, ib.JOB_SKIP)
-        self.assertEqual(skip.objective.id, "I2")
-        self.assertIn("get there soon", skip.note)
+        self.assertEqual(skip.objective.id, "I3")
         self.assertIn('never start with "i understand, but"', skip.note.lower())
-        self.assertIn("without naming any part of the interview", skip.note)
         self.assertNotIn("getting-to-know-you", skip.note)
 
     def test_a_nonanswer_reasks_the_same_objective_a_bounded_number_of_times(self):
@@ -508,10 +519,15 @@ class TestPlan(unittest.TestCase):
                 self.assertEqual(kinds, [ib.JOB_REASK] * ib.max_holds())
                 bounded = job(plan, "Sorry, what?", content_words=0)
                 self.assertEqual(bounded.kind, ib.JOB_FREE)
-        skip = job(self.through(), "Can we go straight to the role play?")
+        with mock.patch.dict(os.environ, {"R1_IB_SKIP_V2": "0"}):
+            skip = job(self.through(), "Can we go straight to the role play?")
+            self.assertEqual(skip.kind, ib.JOB_SKIP)
+            self.assertIn("get there soon", skip.note)
+            self.assertIn("ask your last question again", skip.note)
+        skip = job(self.through(), "Can we go straight to the role play?")  # D4-ICE-SKIP1
         self.assertEqual(skip.kind, ib.JOB_SKIP)
-        self.assertIn("get there soon", skip.note)
-        self.assertIn("ask your last question again", skip.note)
+        self.assertIn("something else they already told you", skip.note)
+        self.assertNotIn("ask your last question again", skip.note)
 
     def test_the_skip_note_and_the_tail_never_contradict_each_other(self):
         # Review of S5 (naturalness R8): "say you will get there soon" and "never hint at the
@@ -859,3 +875,161 @@ class TestFlags(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiagnosis4Icebreaker(unittest.TestCase):
+    """M032 live simulation, diagnosis 4 (Christy lane): skip requests (D4-ICE-SKIP1), a request to
+    wait with an object (D4-ICE-HOLD1), the quiet nudge's line (D4-IB-QUIET-NUDGE), the silence
+    restates (D4-SIL-IB1) and the plan notes' react clause (D4-ICE-ECHO1).  Synthetic texts."""
+
+    ANSWER = (
+        "I sold insurance policies to young families for six years across three cities, mostly "
+        "over the phone."
+    )
+    RUDE_SKIP = (
+        "Guy landed a tech job after my pitch. Fine, that was satisfying. Now can we do the "
+        "role-play?"
+    )
+
+    def next_job(self, plan: ib.IcebreakerPlan, text: str) -> ib.IcebreakerJob:
+        return plan.next_job(text, content_words=words(text))
+
+    def test_a_skip_with_an_answer_moves_on_and_never_asks_again(self) -> None:
+        plan = ib.IcebreakerPlan()
+        plan.cursor = 3  # the proud-moment question was just asked
+        asked = plan.current.id
+        result = self.next_job(plan, self.RUDE_SKIP)
+        self.assertEqual(result.disposition, ib.ANSWERED)
+        self.assertTrue(result.skip)
+        self.assertNotEqual(result.kind, ib.JOB_SKIP)
+        self.assertNotEqual(getattr(result.objective, "id", None), asked)
+        self.assertIn("couple of minutes", result.note)
+        with mock.patch.dict(os.environ, {"R1_IB_SKIP_V2": "0"}):
+            plan = ib.IcebreakerPlan()
+            plan.cursor = 3
+            result = self.next_job(plan, self.RUDE_SKIP)
+            self.assertEqual(result.kind, ib.JOB_SKIP)  # revision 30: the same question again
+            self.assertEqual(result.objective.id, asked)
+
+    def test_a_pure_skip_asks_the_next_objective(self) -> None:
+        plan = ib.IcebreakerPlan()
+        self.next_job(plan, self.ANSWER)  # I2 asked
+        asked = plan.current.id
+        result = self.next_job(plan, "Sorry, can we skip ahead to the role-play?")
+        self.assertEqual(result.kind, ib.JOB_SKIP)
+        self.assertNotEqual(result.objective.id, asked)
+        self.assertIn("couple of minutes", result.note)
+        self.assertIn(result.objective.goal, result.note)
+        self.assertFalse(result.last)
+
+    def test_the_sequences_never_ask_an_objective_twice_after_a_skip(self) -> None:
+        for turns in (
+            (self.ANSWER, "Sorry, can we skip ahead to the role-play?", self.ANSWER),
+            (self.ANSWER, "Calls, follow-ups, closing. Same routine.", self.RUDE_SKIP),
+        ):
+            with self.subTest(turns=turns):
+                plan = ib.IcebreakerPlan()
+                asked: list[str] = [plan.current.id]
+                for text in turns:
+                    result = self.next_job(plan, text)
+                    if result.skip and result.objective is not None:
+                        self.assertNotIn(result.objective.id, asked)
+                    if result.objective is not None:
+                        asked.append(result.objective.id)
+
+    def test_a_second_skip_leaves_one_more_question(self) -> None:
+        plan = ib.IcebreakerPlan()
+        first = self.next_job(plan, "Can we skip ahead to the role-play?")
+        self.assertFalse(first.last)
+        second = self.next_job(plan, "Can we just go to the role-play?")
+        self.assertTrue(second.last)
+        plan.reply_lost(second)  # never heard: the count is given back
+        self.assertEqual(plan.skips, 1)
+        with mock.patch.dict(os.environ, {"R1_IB_SKIP_V2": "0"}):
+            plan = ib.IcebreakerPlan()
+            self.next_job(plan, "Can we skip ahead to the role-play?")
+            self.assertFalse(self.next_job(plan, "Can we skip ahead to the role-play?").last)
+
+    def test_a_thin_answer_s_follow_up_never_asks_the_original_question(self) -> None:
+        plan = ib.IcebreakerPlan()
+        self.next_job(plan, self.ANSWER)
+        result = self.next_job(plan, "Calls, follow-ups, closing. Same routine.")
+        self.assertEqual(result.kind, ib.JOB_FOLLOW_UP)
+        self.assertIn("do not ask the original question again", result.note)
+        with mock.patch.dict(os.environ, {"R1_IB_SKIP_V2": "0"}):
+            self.assertIn("for instance for one concrete example", result.note)
+
+    def test_the_m09_wait_request_is_a_hold(self) -> None:
+        self.assertTrue(
+            ib.is_hold_request(
+                "Never mentioned it to anyone, never. Hey, could you just hold this for a minute?"
+            )
+        )
+        for text in (
+            "Could you hold this for a minute?",
+            "Can you pause it for a second?",
+            "Can we hold on for a minute?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(ib.is_hold_request(text))
+        for text in (
+            "I hold on for a second and let them vent.",
+            "I usually wait a minute and then follow up.",
+            "I sold courses. Then I hold on for a second and let them vent.",
+            "Hold on, what was the question?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(ib.is_hold_request(text))
+
+    def test_the_plan_note_never_refuses_a_pause(self) -> None:
+        plan = ib.IcebreakerPlan()
+        self.assertIn(ib.HOLD_NOTE, self.next_job(plan, self.ANSWER).note)
+        with mock.patch.dict(os.environ, {"R1_ICEBREAKER_REPAIR": "0"}):
+            plan = ib.IcebreakerPlan()
+            self.assertNotIn(ib.HOLD_NOTE, self.next_job(plan, self.ANSWER).note)
+
+    def test_the_quiet_nudge_line(self) -> None:
+        for question, said in (
+            (
+                "What does a typical day look like in your sales work?",
+                "So, what does a typical day look like in your sales work?",
+            ),
+            ("And what do you actually ask them?", "So, what do you actually ask them?"),
+            ("Right, how do you keep track of leads?", "So, how do you keep track of leads?"),
+            ("I'm curious, why sales?", "So, I'm curious, why sales?"),
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(ib.quiet_nudge_line(question), said)
+
+    def test_the_nudge_spends_the_question_s_one_re_ask(self) -> None:
+        plan = ib.IcebreakerPlan()
+        self.assertTrue(plan.use_hold())
+        self.assertFalse(plan.use_hold())  # REASK_V2_MAX_HOLDS
+        self.assertEqual(self.next_job(plan, "What do you mean?").kind, ib.JOB_ASK)  # moved on
+
+    def test_the_silence_restate_lines(self) -> None:
+        for objective in ib.OBJECTIVES:
+            with self.subTest(objective=objective.id):
+                line_id = ib.silence_line_id(objective)
+                self.assertTrue(r1_script.LINES[line_id].startswith("No rush. I was asking "))
+        self.assertEqual(ib.silence_line_id(None), "L-SIL-IB")
+
+    def test_the_react_clause_of_the_notes(self) -> None:
+        plan = ib.IcebreakerPlan()
+        note = self.next_job(plan, self.ANSWER).note
+        self.assertIn("never their words back", note)
+        self.assertNotIn("React in a few words", note)
+        with mock.patch.dict(os.environ, {"R1_REACTION_VARIETY_V2": "0"}):
+            plan = ib.IcebreakerPlan()
+            self.assertIn("React in a few words", self.next_job(plan, self.ANSWER).note)
+
+    def test_the_flags_default_on(self) -> None:
+        for flag, reader in (
+            ("R1_IB_SKIP_V2", ib.ib_skip_v2_enabled),
+            ("R1_IB_QUIET_NUDGE", ib.ib_quiet_nudge_enabled),
+            ("R1_SIL_IB_RESTATE", ib.sil_ib_restate_enabled),
+        ):
+            with self.subTest(flag=flag):
+                self.assertTrue(reader())
+                with mock.patch.dict(os.environ, {flag: "0"}):
+                    self.assertFalse(reader())
