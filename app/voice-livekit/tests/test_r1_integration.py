@@ -3506,9 +3506,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertIn("We'll now move to the role-play", brief.text)
             pickup = next(spec for spec in off if spec.line_id == "L-PICKUP")
             self.assertTrue(pickup.text.startswith("Hello? Yes, this is "))
-        # Revision 21's 22, M032 S7C's 7 (their flags are on), M032 S3's 5 and simulation
-        # diagnosis 3's 11 (the learner lane).
-        self.assertEqual(len(off), 45)
+        # Revision 21's 22, M032 S7C's 7 (their flags are on), M032 S3's 5, simulation diagnosis
+        # 3's 11 and simulation diagnosis 4's 4 exit-and-wrap-up lines (the learner lane).
+        self.assertEqual(len(off), 49)
         self.assertFalse(
             {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
             & {spec.line_id for spec in off}
@@ -3548,13 +3548,13 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 candidate_free=False
             )
         # M032 S6 adds four lines, M032 S7C seven, M032 S3 five, christy-ready the pause prompt,
-        # simulation diagnosis 3 eleven.
-        self.assertEqual(len(off), 50)
+        # simulation diagnosis 3 eleven, simulation diagnosis 4 four.
+        self.assertEqual(len(off), 54)
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 51)
+        self.assertEqual(len(free) + len(named), 55)
         # M032 S7C: after the opening's four lines, the first name-free line of the transition.
         bridged = free[4]
         self.assertEqual(bridged.line_id, "L-TRANSITION-BRIDGED")
@@ -3582,8 +3582,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         }
         with _env(**off):
             before = ids()
-        # Revision 22's 26, M032 S3's 5 and simulation diagnosis 3's 11 (the learner lane).
-        self.assertEqual(len(before), 42)
+        # Revision 22's 26, M032 S3's 5, simulation diagnosis 3's 11 and simulation diagnosis 4's
+        # 4 (the learner lane).
+        self.assertEqual(len(before), 46)
         self.assertIn("L-MUTE", before)
         for name in ("L-OPEN-AGENDA", "L-SIL-NOAUDIO", "L-MUTE-IV", "L-MUTE-RP"):
             self.assertNotIn(name, before)
