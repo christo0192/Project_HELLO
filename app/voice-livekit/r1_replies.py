@@ -356,6 +356,9 @@ class Reply:
     # scripted variant to say instead of a model call ("" for a model retry).
     retry: bool = False
     retry_text: str = ""
+    # Review D5R-6: which generation of this reply a speech belongs to (0 the first; the retry is
+    # 1).  A speech of an earlier attempt (the hung reply's filler) never records the plan.
+    attempt: int = 0
 
 
 def llm_messages(

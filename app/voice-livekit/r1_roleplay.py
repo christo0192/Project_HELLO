@@ -849,7 +849,13 @@ _ASK_OFFERING = re.compile(
     r"\b(?:let'?s|let me|let us|shall (?:i|we)|should (?:i|we)|"
     r"(?:can|could|would|will|may) (?:i|we)|"
     r"want me to|would you like me to|how about|what about|i'?ll|we'?ll|i can|we can|i could|"
-    r"we could|i'?d like to|allow me to|i will|we will)\b",
+    r"we could|i'?d like to|allow me to|i will|we will|"
+    # Review D5R-1: advice and offers in the advisor's own voice.
+    r"(?:i'?d|i would|i) (?:suggest|recommend|advise|encourage|say)|"
+    r"i'?d (?:book|reserve|secure|lock|grab|hold|save|go ahead|sign|enrol+|register|pay)|"
+    r"my (?:recommendation|suggestion|advice)|"
+    r"(?:we'?re|we are|i'?m|i am) (?:happy|glad|able|more than happy) to|"
+    r"it'?s best to|it is best to|you'?d (?:be )?(?:best|better))\b",
     re.IGNORECASE,
 )
 _ASK_ADDRESS = re.compile(
@@ -857,31 +863,39 @@ _ASK_ADDRESS = re.compile(
     r"you might want to|you may want to|you need to|you have to|you must|please)\b",
     re.IGNORECASE,
 )
-_ASK_IMPERATIVE = re.compile(
-    r"^\W*(?:(?:so|okay|ok|just|now|then|go ahead and|please)\W+){0,2}"
-    r"(?:book|reserve|secure|lock|hold|save|grab|enrol+|sign|register|pay|deposit|join|click|use|"
-    r"fill|complete)\b",
-    re.IGNORECASE,
+# Review D5R-1: an instruction can open any clause ("When you're ready, pay ...", "Meera, lock in
+# ...", "Honestly, just lock in ..."), so the words between the clause start and the enrolment
+# phrase may only be discourse markers.
+_ASK_CLAUSE_SPLIT = re.compile(r"[,;:\u2014\u2013]|\s-\s")
+_ASK_MARKERS = frozenset(
+    {"so", "okay", "ok", "alright", "all", "right", "yeah", "yes", "well", "honestly", "just",
+     "now", "then", "go", "ahead", "and", "but", "please", "really", "definitely", "simply",
+     "maybe", "why", "not", "look", "listen", "great", "perfect", "sure", "cool"}
 )
-_ASK_IMPERSONAL = re.compile(
-    r"\b(?:it'?s worth|it is worth|it (?:may|might|would|could|can|will) help|it helps|"
-    r"it'?s best to|it is best to|it'?s (?:a )?good idea to|it makes sense to|"
-    r"once you(?: and [a-z ]{1,30}?)? (?:decide|have decided|are ready|make up)|"
-    r"if you'?re leaning|when you'?re ready|people (?:usually|often|tend to)|"
-    r"most (?:people|learners|students))\b",
-    re.IGNORECASE,
-)
+_ASK_MARKER_MAX = 4
 _SEAT_PHRASE = re.compile(r"\b(?:spot|seat|place)\b", re.IGNORECASE)
+
+
+def _phrase_opens_clause(folded: str, phrase: str) -> bool:
+    """Review D5R-1: the enrolment phrase opens its clause (an instruction to her)."""
+    at = folded.lower().find(phrase)
+    if at < 0:
+        return False
+    clause = _ASK_CLAUSE_SPLIT.split(folded[:at])[-1]
+    words = re.findall(r"[a-z']+", clause.lower())
+    return len(words) <= _ASK_MARKER_MAX and all(word in _ASK_MARKERS for word in words)
 
 
 def enrol_ask_voiced(text: object) -> bool:
     """D5-HF-UNEARNED1: an enrolment phrase in ``text`` is said as an ask: in a question, as an
-    offer or a suggestion ("Shall I lock in a place for you?", "Let's lock in your seat."), to her
-    ("you can reserve your seat now"), or as an instruction ("Book your seat today.").
+    offer, advice or a suggestion ("Shall I lock in a place for you?", "Let's lock in your seat.",
+    "I'd suggest you reserve your seat"), to her ("you can reserve your seat now"), or as an
+    instruction opening any clause ("Book your seat today.", "When you're ready, pay the
+    deposit.", "Meera, lock in your seat.").
 
-    An unvoiced phrase in an impersonal frame ("once you decide, it's worth moving soon to lock in
-    a place") or an unvoiced seat-locking remark is urgency, not an ask.  Any other unvoiced phrase
-    keeps production's reading (it is still an ask), so only the misread shape changes.
+    Only an unvoiced seat-locking remark is urgency, not an ask ("once you decide, it's worth
+    moving soon to lock in a place", "most people lock in a seat early").  Review D5R-1: any
+    other enrolment phrase (a deposit, a payment link) keeps production's reading: an ask.
     """
     found = False
     for sentence in split_sentences(str(text or "")):
@@ -894,11 +908,10 @@ def enrol_ask_voiced(text: object) -> bool:
             "?" in sentence
             or _ASK_OFFERING.search(folded) is not None
             or _ASK_ADDRESS.search(folded) is not None
-            or _ASK_IMPERATIVE.match(folded) is not None
+            or _phrase_opens_clause(folded, phrase)
+            or _SEAT_PHRASE.search(phrase) is None
         ):
             return True
-        if _ASK_IMPERSONAL.search(folded) is None and _SEAT_PHRASE.search(phrase) is None:
-            return True  # an unvoiced phrase of another shape: production's reading stands
     return not found
 
 
@@ -2859,7 +2872,13 @@ class RolePlayEngine:
             for topics in self._topic_history[-2:]:
                 topics -= answered
         if self._bye_heard and (
-            "?" in str(reading or "") or asks_her_directly(reading) or self._turn_ask is not None
+            "?" in str(reading or "")
+            or asks_her_directly(reading)
+            or self._turn_ask is not None
+            # Review D5R-8: like the closing state (``_read_close``), anything with substance
+            # ("Actually, one more thing, there's a scholarship this week.") resumes the call; a
+            # goodbye in this same turn sets the state again below.
+            or not (courtesy_only(reading) or is_hollow_turn(reading))
         ):
             self._bye_heard = False  # D5-LRN-POSTBYE1: he asked her something; the call goes on
         natural = flag_on(FLAG_NATURAL_TIMING)

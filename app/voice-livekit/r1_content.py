@@ -240,6 +240,9 @@ import r1_world
 #    her question, join the manifest (``_diag5_repairs``) beside the texts they replace while their
 #    flags are on.  No graded marker, must-say, meaning or deadline changed; with every flag off the
 #    lines, reminders and readers are the release before.
+#    After its review (still 31, unreleased): the learner's two cut-out lines (CUT_OUT_REPLIES),
+#    said when a reply to a turn that told her nothing was emptied only by its assumed answer
+#    (D5R-4).
 CONTENT_REVISION = 31
 
 
@@ -653,6 +656,7 @@ def _diag5_repairs() -> dict[str, Any]:
         "no_answer_intent_note": p.NO_ANSWER_INTENT_NOTE,
         "intent_shape_no_answer": p.INTENT_SHAPE_NO_ANSWER,
         "press_replies": list(r1_guard.PRESS_REPLIES),
+        "cut_out_replies": list(r1_guard.CUT_OUT_REPLIES),
     }
 
 

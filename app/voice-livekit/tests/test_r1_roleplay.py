@@ -14886,3 +14886,182 @@ class D5PostByeQuietTests(unittest.TestCase):
             s.reply = "Yeah. Does any support continue after the course finishes?"
             plan = s.say("Yeah, totally get it.", 790)
             self.assertFalse(plan.guard_ctx.bye_heard)
+
+
+# --------------------------------------------------------------------------------------------------
+# Simulation diagnosis 5, learner review follow-up (D5R-1..D5R-8; synthetic text only).
+# --------------------------------------------------------------------------------------------------
+class D5RAskVoiceGateTests(unittest.TestCase):
+    """D5R-1: a real enrolment ask is never read as unvoiced urgency."""
+
+    ASKS = (
+        "When you're ready, pay the deposit today.",
+        "Once you and your husband decide, pay the deposit to hold your seat.",
+        "It's best to pay the deposit now.",
+        "When you're ready, the payment link is in the email.",
+        "Alright, book your seat today.",
+        "Alright book your seat today.",
+        "Yeah, reserve your spot then.",
+        "Meera, lock in your seat today.",
+        "Honestly, just lock in your seat.",
+        "I'd suggest you reserve your seat today.",
+        "So my recommendation: book your seat today.",
+        "We're happy to hold a seat for you.",
+        "Seats fill up fast, so I'd book your seat this week.",
+        "Take a day to think, and book your seat by Friday.",
+        "Go ahead and lock in your seat.",
+    )
+
+    def test_every_real_ask_is_voiced(self):
+        for text in self.ASKS:
+            self.assertTrue(r1_roleplay.enrol_ask_voiced(text), text)
+
+    def test_the_urgency_remarks_stay_unvoiced(self):
+        for text in (
+            D5AskVoiceGateTests.URGENCY,
+            "Most people lock in a seat in the first week.",
+            "It's worth moving soon to lock in your seat.",
+        ):
+            self.assertFalse(r1_roleplay.enrol_ask_voiced(text), text)
+
+    def test_the_engine_keeps_the_ask(self):
+        for text in (
+            "When you're ready, pay the deposit today.",
+            "Meera, lock in your seat today.",
+        ):
+            eng = engine()
+            eng.plan_turn(OPENER, 20)
+            plan = eng.plan_turn(text, 853)
+            self.assertIs(eng._turn_ask, r1_roleplay.AskKind.ENROL, text)
+            self.assertNotIn("enrol_phrase_unvoiced", plan.reasons)
+
+
+class D5RConcessionReadTests(unittest.TestCase):
+    """D5R-2: every way of being won over is a concession with R1_CONCESSION_READ_V2 on."""
+
+    WON_OVER = (
+        "That convinced me.",
+        "That really convinced me, honestly.",
+        "Your answer convinced me.",
+        "Okay, the placement numbers convinced me.",
+        "Honestly, that's what convinced me.",
+        "You've got me convinced.",
+        "You're convincing me.",
+        "I'm now fully convinced.",
+        "I'm a hundred percent convinced.",
+    )
+
+    def test_won_over_reads_as_a_concession(self):
+        for text in self.WON_OVER:
+            self.assertTrue(has_concession(text), text)
+
+    def test_scepticism_and_other_people_stay_no_concession(self):
+        for text in (
+            "I'd need more convincing.",
+            "It'd take some convincing.",
+            "I'd need convincing on the price.",
+            "I'm not convinced yet.",
+            "That hasn't convinced me.",
+            "I'd have to convince my husband first.",
+            "You'll have to convince me.",
+            "Convince me, then.",
+            "Are you trying to convince me?",
+            "I'm convinced yet",
+        ):
+            self.assertFalse(has_concession(text), text)
+
+    def test_the_guard_blocks_an_unearned_won_over_line(self):
+        out = guard_text("Okay, the placement numbers convinced me.", d5_ctx(free_reply=True))
+        self.assertTrue(any(hit.category == r1_guard.CONCESSION for hit in out.hits), out.text)
+
+
+class D5RTopicRepeatTests(unittest.TestCase):
+    """D5R-3: the asked-for re-ask is never held back as a topic repeat, and the reader's false
+    positives are gone."""
+
+    def test_the_asked_for_re_ask_stays(self):
+        context = d5_ctx(
+            free_reply=True,
+            topic_recent=frozenset({"monthly"}),
+            reask=(N("What would the actual monthly amount be, roughly?"),),
+        )
+        out = guard_text("Sure. So what would the monthly amount come to, roughly?", context)
+        self.assertIn("monthly amount", out.text)
+
+    def test_the_engine_keeps_the_re_ask_after_a_lone_okay(self):
+        s = d5_asked_session("What would the actual monthly amount be, roughly?")
+        s.reply = "Sure. So what would the monthly amount come to, roughly?"
+        s.say("Okay.", 80, backchannel=True)
+        self.assertIn("monthly amount", s.spoken[-1])
+
+    def test_reader_false_positives(self):
+        self.assertNotIn("monthly", r1_guard.topics_raised("I could start in a month or so."))
+        self.assertNotIn("fall_behind", r1_guard.topics_raised("I can't keep up with my job."))
+        self.assertNotIn("price", r1_guard.topics_raised("What's the exact number of hours?"))
+        self.assertIn("monthly", r1_guard.topics_raised("How much would I pay a month?"))
+        self.assertIn("monthly", r1_guard.topics_raised("What is that per month?"))
+        self.assertIn("fall_behind", r1_guard.topics_raised("I worry about keeping up."))
+        self.assertIn("price", r1_guard.topics_raised("What's the exact number, then?"))
+
+
+class D5RAssumedAnswerTests(unittest.TestCase):
+    """D5R-4: after a turn that told her nothing, a re-ask or a cut-out remark stays, and a reply
+    emptied by the drop never falls back to a bare back-channel."""
+
+    def ctx(self):
+        return d5_ctx(free_reply=True, contentless=True)
+
+    def test_re_asks_and_cut_out_lines_stay(self):
+        for text in (
+            "Sounds like you cut out there.",
+            "Sounds like you got cut off, sorry.",
+            "Right, so how big are the batches?",
+            "So it's online, right?",
+        ):
+            self.assertEqual(guard_text(text, self.ctx()).text, text)
+
+    def test_an_emptied_reply_says_the_line_cut_out(self):
+        out = guard_text("Good to know the class size is manageable.", self.ctx())
+        self.assertIn(out.text, r1_guard.CUT_OUT_REPLIES)
+
+    def test_the_assumed_answer_still_goes_beside_more(self):
+        out = guard_text(
+            "Good to know the class size is manageable. How many people is that?", self.ctx()
+        )
+        self.assertEqual(out.text, "How many people is that?")
+
+
+class D5RGuardTidyTests(unittest.TestCase):
+    """D5R-5: a "much" that belongs to the sentence is never cut with the tag."""
+
+    def test_the_sentence_keeps_its_much(self):
+        cases = {
+            "I like the structure very much, I'll give you that.": (
+                "I like the structure very much."
+            ),
+            "I appreciate that very much, I'll admit.": "I appreciate that very much.",
+            "It doesn't cost that much, I'll give you that.": "It doesn't cost that much.",
+            "Not too much, I'll grant you that.": "Not too much.",
+            "The direction feels right, I'll say that much.": "The direction feels right.",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(
+                r1_guard._strip_concession_tag(raw, tidy=True, v3=True), expected, raw
+            )
+
+
+class D5RPostByeTests(unittest.TestCase):
+    """D5R-8: a substantive statement after his goodbye resumes the call."""
+
+    def test_a_statement_with_substance_releases_the_quiet(self):
+        s = D5PostByeQuietTests.bye_session(D5PostByeQuietTests())
+        s.say("Actually, one more thing, there's a scholarship this week.", 790)
+        self.assertFalse(s.eng._bye_heard)
+        self.assertFalse(s.eng._curiosity_closed(800))
+        plan = s.say("Okay.", 810)
+        self.assertNotIn("bye_heard_quiet", plan.reasons)
+
+    def test_a_bare_courtesy_keeps_it(self):
+        s = D5PostByeQuietTests.bye_session(D5PostByeQuietTests())
+        s.say("Yeah, totally get it.", 790)
+        self.assertTrue(s.eng._bye_heard)

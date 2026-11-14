@@ -1798,6 +1798,9 @@ class _SpeechSlot:
     # far.
     finished_at: float | None = None
     played_seconds: float = 0.0
+    # Review D5R-6: the ``Reply.attempt`` this speech was created for.  When the reply is asked for
+    # again (``_retry_reply``), a speech of the earlier attempt neither records nor loses the plan.
+    attempt: int = 0
 
 
 @dataclass
@@ -4780,7 +4783,8 @@ class R1Interview:
         retrying = reply is not None and reply.retry
         deadline = started + (LLM_RETRY_DEADLINE_SECONDS if retrying else TURN_DEADLINE_SECONDS)
         filler_at = started + self._filler_delay()
-        filler_done = not self._candidate_present
+        # Review D5R-7: the hung reply's filler was the one thinking sound; a retry adds none.
+        filler_done = retrying or not self._candidate_present
         got_first_chunk = False
         iterator = stream.__aiter__()
         pending: asyncio.Future[Any] | None = None
@@ -4839,6 +4843,10 @@ class R1Interview:
                     and self._failures == 1
                     and llm_recovery_v2()
                 )
+                if retry:
+                    # Review D5R-6: from now on the hung speech (its filler) is an earlier attempt:
+                    # the interrupt below neither records nor loses the plan through it.
+                    reply.attempt += 1
                 # This runs inside the hung reply's own LLM task, so the bound voice is the
                 # hung reply's: the recovery line answers in the voice that was due to answer.
                 self._spawn(
@@ -4928,6 +4936,11 @@ class R1Interview:
         reply the SDK generates for the same prepared ``Reply``, so the engine records it as the
         plan's line.  Nothing is asked for once the phase moved on, an abort is due, the candidate
         left or the session cannot generate; then the holding line is said instead.
+
+        Review D5R-6: the hung speech is an earlier attempt (``Reply.attempt``), so only the retry
+        records the plan, once; a retry that is never generated gives the plan back
+        (``_retry_abandoned``).  Review D5R-7: nothing is generated over a candidate who has
+        started a new turn ("Hello? Are you there?"): that turn gets the reply.
         """
         if (
             self._exiting
@@ -4935,9 +4948,20 @@ class R1Interview:
             or self._stop_outcome() is not None
             or self.machine.phase is not phase
         ):
+            self._retry_abandoned(reply)
+            return
+        if self._candidate_turn_open():
+            self._retry_abandoned(reply)
+            _log.info(
+                "unknown_event",
+                error_type="r1_llm_retry_skipped",
+                error_category="candidate_turn",
+                phase=self.machine.transcript_phase(),
+            )
             return
         generate = getattr(self.session, "generate_reply", None)
         if not callable(generate):
+            self._retry_abandoned(reply)
             await self._speak_recovery(phase, voice=voice)
             return
         plan = reply.plan
@@ -4949,7 +4973,6 @@ class R1Interview:
                 scripted = ""
         reply.retry = True
         reply.retry_text = scripted
-        reply.recorded = False  # a filler the hung reply played is not the plan's line
         _log.info(
             "unknown_event",
             error_type="r1_llm_retry",
@@ -4967,7 +4990,24 @@ class R1Interview:
                 error_type="r1_llm_retry_failed",
                 error_category=_error_type_of(exc),
             )
+            self._retry_abandoned(reply)
             await self._speak_recovery(phase, voice=voice)
+
+    def _retry_abandoned(self, reply: Reply) -> None:
+        """Review D5R-6: the retry of ``reply`` is not generated, so nobody heard the plan's line:
+        the engine gets it back (``reply_lost``; a no-op once a newer turn was planned)."""
+        plan = reply.plan
+        if plan is None or reply.recorded or self._engine is None:
+            return
+        reply.recorded = True
+        try:
+            self._engine.reply_lost(plan)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not stall the interview
+            _log.warn(
+                "unknown_event",
+                error_type="r1_reply_lost_failed",
+                error_category=_error_type_of(exc),
+            )
 
     def _holding_line(self) -> str:
         """D5-RELIAB1: the learner's recovery line, a rotated holding line never said before in
@@ -5325,6 +5365,7 @@ class R1Interview:
         if getattr(event, "source", None) == "generate_reply" and self._latest_reply is not None:
             # The SDK creates this speech right after the hook that prepared the reply.
             slot.reply, self._latest_reply = self._latest_reply, None
+            slot.attempt = getattr(slot.reply, "attempt", 0)
         if getattr(event, "source", None) == "generate_reply":
             # One voice per speech, fixed now: the learner's for a role-play reply (one planned
             # in ASIDE included), Christy's otherwise.  Its TTS, filler, recovery line and label
@@ -5467,6 +5508,8 @@ class R1Interview:
         plan = None if reply is None else reply.plan
         if plan is None or self._engine is None or slot.used or reply.recorded:
             return
+        if slot.attempt != reply.attempt:
+            return  # review D5R-6: the hung attempt's speech; the retry owns the plan now
         reply.recorded = True
         try:
             self._engine.reply_lost(plan)
@@ -5619,6 +5662,10 @@ class R1Interview:
         """Tell the engine what the learner actually said, so deliveries and reveals are exact."""
         reply = None if slot is None else slot.reply
         if reply is None or reply.plan is None or reply.recorded:
+            return
+        if slot.attempt != reply.attempt:
+            # Review D5R-6: the hung attempt's filler is not the plan's line; the retry records the
+            # plan (or gives it back when it is abandoned, ``_retry_abandoned``).
             return
         reply.recorded = True
         try:

@@ -810,20 +810,26 @@ _CONCESSION = _ci(r"\bconvinc", *_CONCESSION_REST)
 # over ("you've convinced me", "I'm convinced", "that's convincing").  "It'd take some convincing"
 # and "I'd need more convincing" are scepticism, the opposite of a concession.  "I'm convinced
 # enough to ..." is still a concession; only "I'm convinced yet" (a dropped "not") is not.
-_CONCESSION_V2 = _ci(
-    r"\byou(?:'ve| have)? (?:really |finally |just |now |pretty much )?convinced me\b",
-    r"\b(?:that|this) (?:really )?convinces me\b",
-    r"\bi(?:'m| am) (?:now |fully |pretty |pretty much |quite |totally |really |mostly |"
-    r"completely )?convinced\b(?! yet)",
-    r"\bconsider me convinced\b",
-    r"\b(?:that's|that is|it's|it is|this is|very|pretty|quite|really|sounds) convincing\b",
-    *_CONCESSION_REST,
-)
+# Review D5R-2: a whitelist missed "That convinced me.", "You've got me convinced." and "I'm a
+# hundred percent convinced.", so the reading is the release before's ("convinced", "convinces",
+# "convincing") minus the shapes that are never her being won over (``_NOT_WON_OVER``): the base
+# form ("convince me", "you'll have to convince me") is never matched at all.
+_CONCESSION_V2 = _ci(r"\bconvinc(?:ed|es|ing)\b", *_CONCESSION_REST)
 # "(it'd) take some convincing", "I'd need more convincing": never a concession, whatever matched.
 _MORE_CONVINCING = re.compile(
     r"\b(?:take|takes|took|taking|need|needs|want|wants|require|requires)\s+"
-    r"(?:some|a lot of|a lot more|more|a bit of|a little|a bit more|a little more|real)\s+"
+    r"(?:(?:some|a lot of|a lot more|more|a bit of|a little|a bit more|a little more|real)\s+)?"
     r"convincing\b",
+    re.IGNORECASE,
+)
+# Review D5R-2: never her being won over: having or trying to convince someone, convincing someone
+# other than her ("I'd have to convince my husband"), and "convinced yet" (a dropped "not").
+_NOT_WON_OVER = re.compile(
+    r"\b(?:have|has|had|need|needs|needed|got|going|gonna|try|tries|tried|trying|hope|hoping|"
+    r"want|wants)\s+to\s+convinc\w*"
+    r"|\bconvinc\w*\s+(?:my|his|her|their|our|him|them|everyone|anyone|somebody|someone|"
+    r"the family|the kids)\b"
+    r"|\bconvinced yet\b",
     re.IGNORECASE,
 )
 
@@ -2278,14 +2284,42 @@ _ASSUMED_ANSWER = re.compile(
     r"sounds like (?:it'?s|you)\b)",
     re.IGNORECASE,
 )
+# Review D5R-4: what NO_ANSWER_NOTE itself asks for (the line cut out) is never an assumed answer.
+_LINE_CUT = re.compile(
+    r"\b(?:cut (?:out|off)|broke up|break(?:ing)? up|dropp?(?:ed)? out|froze|frozen|lost you|"
+    r"(?:the )?(?:line|connection|signal|audio)\b|didn'?t (?:catch|hear|get) (?:that|it|you|the))",
+    re.IGNORECASE,
+)
+# Review D5R-4: a reply emptied only because its first sentence assumed an answer says the line cut
+# out (what NO_ANSWER_NOTE asks for) instead of a bare "Okay.".  Rotated; never "Sorry, what were
+# you saying?" (banned for her in R1-Q iteration 3).
+CUT_OUT_REPLIES = (
+    "Sorry, I think you cut out there.",
+    "Sorry, I lost you for a second there.",
+)
+
+
+def _cut_out_line(ctx: GuardContext) -> str:
+    """Review D5R-4: a rotated cut-out line she has not said yet (the first if both were said)."""
+    for offset in range(len(CUT_OUT_REPLIES)):
+        candidate = pick_variant(CUT_OUT_REPLIES, ctx.seed, ctx.variant + offset)
+        if repeat_kind(candidate, ctx.said) is None:
+            return candidate
+    return pick_variant(CUT_OUT_REPLIES, ctx.seed, ctx.variant)
 # D5-LRN-TOPICREP1 (R1_TOPIC_REPEAT): the topics she keeps raising while the advisor dodges them.
 TOPIC_PATTERNS = {
+    # Review D5R-3: "a month" only after money words ("pay a month", "how much a month"), never
+    # "I could start in a month or so"; "keep up" never "with my job"; "number" never "number of".
     "monthly": re.compile(
-        r"\bmonthly\b|\b(?:a|per|each|every) month\b|\bmonth by month\b", re.IGNORECASE
+        r"\bmonthly\b|\b(?:per|each|every) month\b|\bmonth by month\b|"
+        r"\b(?:pay|paying|cost|costs|much|amount|figure|fee|emi|that|it|\d[\d,]*|thousand|"
+        r"hundred|rupees|dollars)\b[^.?!]{0,15}\ba month\b",
+        re.IGNORECASE,
     ),
     "price": re.compile(
         r"\b(?:total|final|full|real|actual|exact|overall)\b[^.?!]{0,25}\b(?:price|cost|figure|"
-        r"number|amount|fee)s?\b|\bhow much\b[^.?!]{0,30}\b(?:cost|pay|is it|would it be|are we)\b",
+        r"number|amount|fee)s?\b(?!\s+of\b)|"
+        r"\bhow much\b[^.?!]{0,30}\b(?:cost|pay|is it|would it be|are we)\b",
         re.IGNORECASE,
     ),
     "included": re.compile(
@@ -2299,7 +2333,10 @@ TOPIC_PATTERNS = {
         re.IGNORECASE,
     ),
     "fall_behind": re.compile(
-        r"\bfall(?:s|ing)? behind\b|\bkeep(?:ing)? up\b|\bmiss(?:ing)? (?:a |some )?"
+        r"\bfall(?:s|ing)? behind\b"
+        r"|\bkeep(?:ing)? up\b(?!\s+with\s+(?:my|our|his|her|their|the) (?:job|work|family|kids|"
+        r"bills|rent|life|day job|office))"
+        r"|\bmiss(?:ing)? (?:a |some )?"
         r"(?:class|classes|session|sessions)\b",
         re.IGNORECASE,
     ),
@@ -2364,6 +2401,7 @@ class StreamGuard:
         self._surfaces: list[str] = []  # D5-GUARD-GARBLE1: surface lines said in place of a need
         self._repeat_question_dropped = False  # D5-LRN-ACKFALL1: a dropped repeat asked something
         self._topic_held = ""  # D5-LRN-TOPICREP1: the first sentence held back as a topic repeat
+        self._assumed_drops = 0  # review D5R-4: first sentences dropped as an assumed answer
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
@@ -2529,6 +2567,16 @@ class StreamGuard:
         if ctx.included_recent and "?" in sentence and _INCLUDED_QUESTION.search(sentence):
             return ""
         return sentence
+
+    def _is_reask(self, text: str) -> bool:
+        """Review D5R-3: ``text`` is the re-ask this ack turn asked for (SWEEP-11): a question on
+        a topic of one of the re-asked questions, or a repeat of one of them."""
+        reask = self.ctx.reask
+        if not reask or "?" not in text:
+            return False
+        if topics_raised(text) & topics_raised(" ".join(reask)):
+            return True
+        return repeat_kind(text, reask) is not None
 
     def _comes_back(self, text: str) -> bool:
         """M032 SWEEP-7: ``text`` is a question about the topic the reply comes back to."""
@@ -2814,12 +2862,16 @@ class StreamGuard:
             and self.ctx.is_learner
             and self.ctx.contentless
             and not self._emitted
+            and "?" not in out
+            and _LINE_CUT.search(out) is None
             and _ASSUMED_ANSWER.match(out) is not None
         ):
             # D5-LRN-ASSUME1: his turn told her nothing, so "Good to know ..." or "Right, so it's
-            # ..." reacts to an answer nobody gave; the rest of the reply stands.
+            # ..." reacts to an answer nobody gave; the rest of the reply stands.  Review D5R-4: a
+            # question ("Right, so how big are the batches?") or the cut-out line stays, and a
+            # reply left empty by this drop says the line cut out (``flush``).
             self._style_edits += 1
-            self._repeat_drops += 1
+            self._assumed_drops += 1
             self._last_dropped = True
             return []
         if out and not hits and self.ctx.is_learner and self.ctx.free_reply:
@@ -2856,6 +2908,7 @@ class StreamGuard:
                 if (
                     raised
                     and not self._comes_back(kept)
+                    and not self._is_reask(kept)
                     and (self._emitted or word_count(self._rest_after(sentence)) >= 3)
                 ):
                     # D5-LRN-TOPICREP1: she raised this in one of her last two replies and he has
@@ -2974,6 +3027,15 @@ class StreamGuard:
             if self._topic_held and ctx.is_learner:
                 # D5-LRN-TOPICREP1: everything else went too, so the held sentence is the reply.
                 self._emitted.append(self._topic_held)
+            elif (
+                self._assumed_drops
+                and ctx.is_learner
+                and ctx.contentless
+                and self._other_drops == 0
+            ):
+                # Review D5R-4: the reply only assumed an answer nobody gave; a bare "Okay." to a
+                # broken-up line is unnatural, so she says the line cut out.
+                self._emitted.append(_cut_out_line(ctx))
             elif (
                 ctx.ack_press
                 and ctx.is_learner
@@ -3206,8 +3268,9 @@ def _strip_concession_tag(text: str, *, tidy: bool = False, v3: bool = False) ->
     What is left keeps its closing mark; a tag that is the whole sentence leaves nothing, which
     ``_vary`` turns into a neutral acknowledgement.  ``tidy`` (simulation diagnosis 1, U4 (3)):
     a conjunction left dangling before the tag ("..., so, I'll give you that") goes with it.
-    ``v3`` (D5-GUARD-GARBLE1, R1_GUARD_TIDY_V3): "I'll say that much" is one tag, and an
-    "much" the cut left stranded at the end goes too.
+    ``v3`` (D5-GUARD-GARBLE1, R1_GUARD_TIDY_V3): "I'll say that much" is one tag, so no "much"
+    is stranded; review D5R-5: a "much" left before the tag belongs to the sentence ("I like the
+    structure very much") and stays.
     """
     end = text.rstrip()[-1:] if text.rstrip()[-1:] in (".", "?", "!") else ""
     leading, trailing = (
@@ -3216,22 +3279,14 @@ def _strip_concession_tag(text: str, *, tidy: bool = False, v3: bool = False) ->
         else (CONCESSION_TAG_LEADING, CONCESSION_TAG_TRAILING)
     )
     out = leading.sub("", text, count=1)
-    cut_end = trailing.search(out) is not None
     out = trailing.sub("", out).rstrip(" ,;:-")
     if tidy:
         out = _DANGLING_CONJUNCTION.sub("", out).rstrip(" ,;:-")
-    if v3 and cut_end:
-        out = _STRANDED_INTENSIFIER.sub("", out).rstrip(" ,;:-")
     if word_count(out) < 2:
         return ""
     if out and out[-1] not in ".?!":
         out += end or "."
     return out
-
-
-# D5-GUARD-GARBLE1: the word a tag cut can strand at the end of the sentence ("..., I'll say that
-# much" cut before "much").  "though" and "anyway" are left: "It's pricey, though." is natural.
-_STRANDED_INTENSIFIER = re.compile(r"[\s,]+much\s*$", re.IGNORECASE)
 
 
 def _tidy(text: str) -> str:
@@ -3280,8 +3335,9 @@ def has_concession(text: object) -> bool:
     """
     folded = fold(text)
     v2 = concession_read_v2()
-    if v2 and _MORE_CONVINCING.search(folded) is not None:
-        folded = _MORE_CONVINCING.sub("", folded)  # D5-HF-CONCESSION1: scepticism, never a yes
+    if v2:
+        # D5-HF-CONCESSION1 and review D5R-2: scepticism and other people, never a yes.
+        folded = _NOT_WON_OVER.sub("", _MORE_CONVINCING.sub("", folded))
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None

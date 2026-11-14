@@ -186,8 +186,9 @@ import r1_world
 # Revision 31 (simulation diagnosis 5): the no-answer notes and intent shape for an advisor turn that
 # told her nothing, and the press lines after a lone "Okay." to her question, join the manifest
 # (``r1_content._diag5_repairs``) beside the texts they replace while their flags are on.  No graded
-# meaning, marker, must-say or deadline changed.
-PINNED_CONTENT_SHA256 = "99b781a211cd5848424790c8f80feae061166bba925c9dd03fc536602d7fab7d"
+# meaning, marker, must-say or deadline changed.  After its review (still 31, unreleased): the
+# learner's two cut-out lines (``r1_guard.CUT_OUT_REPLIES``, review D5R-4).
+PINNED_CONTENT_SHA256 = "6114643f3f02142ad4848d686a9746f886c1258e8b88d5121535366f7153f612"
 
 CONTENT_MODULES = (
     "r1_text",
