@@ -1,10 +1,12 @@
 """Unit tests for ``r1_script``: the plan 5.2 scripted lines and their rendering."""
 from __future__ import annotations
 
+import os
 import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -290,6 +292,13 @@ class UnknownNameTests(unittest.TestCase):
             "L-TRANSITION-THANKS-A": "Thanks. Next, let's do a sales role-play.",
             "L-TRANSITION-THANKS-B": "Thanks for walking me through that. Next, let's do a sales",
             "L-TRANSITION-THANKS-C": "Got it, thank you. Next, let's do a sales role-play.",
+            # M032 diagnosis 4 (D4-BRIEF2): the reworded briefs.
+            "L-TRANSITION-W2": "Thank you. Next, let's do a sales role-play. I'll play",
+            "L-TRANSITION-THANKS-A-W2": "Thanks. Next, let's do a sales role-play.",
+            "L-TRANSITION-THANKS-B-W2": (
+                "Thanks for walking me through that. Next, let's do a sales"
+            ),
+            "L-TRANSITION-THANKS-C-W2": "Got it, thank you. Next, let's do a sales role-play.",
             "L-CLOSE": (
                 "Thank you for your time today. The hiring team will review your interview and "
                 "get back to you. You can close this window now. Goodbye."
@@ -535,7 +544,9 @@ class TransitionRepairLineTests(unittest.TestCase):
                 self.assertEqual(r1_script.active_line_id(line_id), old)
             self.assertEqual(r1_script.active_line_id("L-WRAP"), "L-WRAP")
         for value in ("1", "on", "", "yes"):
-            with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": value}):
+            with mock.patch.dict(
+                os.environ, {"R1_TRANSITION_REPAIR": value, "R1_BRIEF_WORDING_V2": "0"}
+            ):
                 self.assertTrue(r1_script.transition_repair_enabled())
                 for line_id in r1_script.ROLLBACK_LINES:
                     self.assertEqual(r1_script.active_line_id(line_id), line_id)
@@ -706,3 +717,72 @@ class NoAudioAndMuteLineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiagnosis4Wording(unittest.TestCase):
+    """M032 live simulation, diagnosis 4 (D4-BRIEF2, R1_BRIEF_WORDING_V2; D4-TRANS-PRESENT1): the agenda
+    and the brief in a person's words, same facts, same consent; one presence line; the pickup
+    bridge that hears the press."""
+
+    VALUES = {"lead_name": "Priya Shah", "lead_city": "Pune", "lead_first_name": "Priya"}
+
+    def test_the_brief_keeps_every_fact(self) -> None:
+        for line_id in r1_script.WORDING_LINES.values():
+            if not line_id.startswith("L-TRANSITION"):
+                continue
+            with self.subTest(line_id=line_id):
+                text = r1_script.line(line_id, first_name="Asha", **self.VALUES)
+                for fact in (
+                    "Priya Shah",
+                    "Pune",
+                    "Data Science",
+                    "twenty minutes",
+                    "preparation guide",
+                    "'Let's pause the role-play here.'",
+                    "just say 'ready'",
+                ):
+                    self.assertIn(fact, text)
+                self.assertNotIn(":", text.split("Treat it like a real call:")[0])
+                self.assertTrue(text.endswith(r1_script.BRIEF_START_PROMPT_2))
+                self.assertNotIn("Shall we start the role-play now", text)
+
+    def test_the_agenda_keeps_the_owner_s_durations(self) -> None:
+        for line_id in ("L-OPEN-AGENDA-W2", "L-OPEN-AGENDA-PLAIN-W2", "L-OPEN-AGENDA-CONTINUE-W2"):
+            with self.subTest(line_id=line_id):
+                text = r1_script.LINES[line_id]
+                self.assertIn("about thirty minutes", text)
+                self.assertIn("up to twenty minutes", text)
+                self.assertNotIn("minutes:", text)
+        self.assertTrue(r1_script.LINES["L-OPEN-AGENDA-W2"].startswith("Great, I can hear you too."))
+
+    def test_the_flag_picks_the_text(self) -> None:
+        for line_id, reworded in r1_script.WORDING_LINES.items():
+            with self.subTest(line_id=line_id):
+                self.assertEqual(r1_script.active_line_id(line_id), reworded)
+                with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id)
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.assertEqual(r1_script.active_line_id("L-TRANSITION"), "L-TRANSITION-V20")
+            self.assertEqual(r1_script.active_line_id("L-OPEN-AGENDA"), "L-OPEN-AGENDA-W2")
+
+    def test_the_presence_line_and_the_pickup_bridge(self) -> None:
+        self.assertEqual(
+            r1_script.LINES["L-PRESENT-TAKE-TIME"],
+            "Yes, I'm here. Take your time, and just say 'ready' whenever you like.",
+        )
+        self.assertEqual(r1_script.active_line_id("L-PICKUP-BRIDGE"), "L-PICKUP-BRIDGE-2")
+        self.assertEqual(
+            r1_script.line("L-PICKUP-BRIDGE-2", **self.VALUES), "Got it, you're ready. Here's Priya."
+        )
+        with mock.patch.dict(os.environ, {"R1_BRIEF_VARIETY": "0"}):
+            self.assertEqual(r1_script.active_line_id("L-PICKUP-BRIDGE"), "L-PICKUP-BRIDGE")
+
+    def test_the_field_answers_are_short_and_candidate_free(self) -> None:
+        for line_id in r1_script.LINES:
+            if not line_id.startswith("L-RP-"):
+                continue
+            with self.subTest(line_id=line_id):
+                self.assertTrue(r1_script.is_candidate_free(line_id))
+                text = r1_script.line(line_id, **self.VALUES)
+                self.assertLessEqual(len(text.split()), 20)
+                self.assertNotIn("?", text)

@@ -58,6 +58,29 @@ BRIEF_LEAD_IN = "Next, let's do a sales role-play. "
 BRIEF_BODY = BRIEF_LEAD_IN + BRIEF_SCENARIO
 BRIEF_THANKS = "Thank you, {first_name}. "
 BRIEF_AGAIN = "Of course, here it is again. "
+# M032 live simulation, diagnosis 4 (D4-BRIEF2, R1_BRIEF_WORDING_V2): the brief as one long chain
+# with a colon read as written text, and it ended with an instruction followed by a question that
+# ignored it ("To begin, just say 'ready'. Shall we start the role-play now, or do you have any
+# questions first?").  The facts are the same (the lead, her city, the Data Science course, up to
+# twenty minutes, the goal, the preparation guide, the cue phrase, "ready"); the order and the shape
+# are a person's.  Consent is unchanged: only a spoken "ready" or the button starts the role-play,
+# and a bare "yes" or "no questions" to "Any questions before we start?" never starts (the prompt
+# keeps the brief's either/or kind in ``r1_session._START_QUESTION_OF_LINE``): "no questions" gets
+# the nudge, and a bare "yes" (a question is coming) the invite (review of diagnosis 4).
+BRIEF_START_PROMPT_2 = "Any questions before we start? If not, just say 'ready' and she'll pick up."
+BRIEF_SCENARIO_2 = (
+    "I'll play {lead_name} from {lead_city}. She filled in a form on our website about the Data "
+    "Science course a few days ago, and you're the Program Advisor calling her back. You'll have "
+    "up to twenty minutes. Treat it like a real call: "
+    + BRIEF_GOAL
+    + ", using the course details from your preparation guide. I'll stay in character until I "
+    "say, 'Let's pause the role-play here.' "
+    + BRIEF_START_PROMPT_2
+)
+BRIEF_BODY_2 = BRIEF_LEAD_IN + BRIEF_SCENARIO_2
+# D4-TRANS-Q1 (R1_TRANSITION_ANSWERS): what Christy's answer to a comment or complaint before the
+# role-play says when the guard left nothing of it (then the start question follows).
+TRANSITION_QUIET_FALLBACK = "Fair enough."
 
 # M032 S7C (SWEEP-35, R1_OPENING_SOUND_CHECK; owner go of 2026-11-11, pattern P33): L-OPEN was one
 # 79-word block of about 29 s with no greeting exchange and no hearing check.  The opening is now a
@@ -75,6 +98,17 @@ OPEN_FIRST_QUESTION = (
     "So, to begin, tell me a bit about yourself and your sales or customer-facing work."
 )
 OPEN_CARRY_ON = "Please, carry on with what you were telling me."
+# D4-BRIEF2 (R1_BRIEF_WORDING_V2): "Good, I can hear you." echoed the candidate's "Yes, I can hear
+# you", and the agenda was a colon list.  The owner's durations are kept word for word.
+OPEN_HEARD_2 = "Great, I can hear you too. "
+OPEN_AGENDA_2 = (
+    "This first-round interview takes about thirty minutes. We'll get to know each other a little, "
+    "then do a sales role-play of up to twenty minutes, and you'll have time for your questions at "
+    "the end. "
+)
+OPEN_FIRST_QUESTION_2 = (
+    "To start, tell me a bit about yourself and the sales or customer-facing work you've done."
+)
 
 LINES: dict[str, str] = {
     "L-OPEN": (
@@ -100,6 +134,10 @@ LINES: dict[str, str] = {
     "L-OPEN-AGENDA": OPEN_HEARD + OPEN_AGENDA + OPEN_FIRST_QUESTION,
     "L-OPEN-AGENDA-PLAIN": OPEN_PLAIN + OPEN_AGENDA + OPEN_FIRST_QUESTION,
     "L-OPEN-AGENDA-CONTINUE": OPEN_HEARD + OPEN_AGENDA + OPEN_CARRY_ON,
+    # D4-BRIEF2 (R1_BRIEF_WORDING_V2): the agendas in a person's words (``WORDING_LINES``).
+    "L-OPEN-AGENDA-W2": OPEN_HEARD_2 + OPEN_AGENDA_2 + OPEN_FIRST_QUESTION_2,
+    "L-OPEN-AGENDA-PLAIN-W2": OPEN_PLAIN + OPEN_AGENDA_2 + OPEN_FIRST_QUESTION_2,
+    "L-OPEN-AGENDA-CONTINUE-W2": OPEN_HEARD_2 + OPEN_AGENDA_2 + OPEN_CARRY_ON,
     # M032 S6 item 5 and SWEEP-30: the brief, from the shared body above.
     "L-TRANSITION": BRIEF_THANKS + BRIEF_BODY,
     # M032 diagnosis 3 (D3-ICE1, R1_REACTION_VARIETY): the brief with one of three thanks in place
@@ -119,6 +157,16 @@ LINES: dict[str, str] = {
     # (SWEEP-28): also the brief after a boundary turn that answered nothing (a presence check or
     # a request to repeat), which has nothing to be thanked for.
     "L-TRANSITION-BRIDGED": BRIEF_BODY,
+    # D4-BRIEF2 (R1_BRIEF_WORDING_V2): every brief from the one reworded body (SWEEP-30), spoken
+    # under the ids above (``WORDING_LINES``).  The re-explained replay (L-TRANSITION-AGAIN-PLAIN)
+    # already ends with one "just say 'ready'" and stays as it is, so a replay is never the brief
+    # word for word.
+    "L-TRANSITION-W2": BRIEF_THANKS + BRIEF_BODY_2,
+    "L-TRANSITION-THANKS-A-W2": "Thanks, {first_name}. " + BRIEF_BODY_2,
+    "L-TRANSITION-THANKS-B-W2": "Thanks for walking me through that, {first_name}. " + BRIEF_BODY_2,
+    "L-TRANSITION-THANKS-C-W2": "Got it, thank you, {first_name}. " + BRIEF_BODY_2,
+    "L-TRANSITION-BRIDGED-W2": BRIEF_BODY_2,
+    "L-TRANSITION-AGAIN-W2": BRIEF_AGAIN + BRIEF_SCENARIO_2,
     # M032 S6 item 4 (reverses the 2026-10-30 word-for-word replay under D-M032-4): the brief once
     # more on request, without the thanks and the lead-in, which said it as if for the first time.
     "L-TRANSITION-AGAIN": BRIEF_AGAIN + BRIEF_SCENARIO,
@@ -155,9 +203,14 @@ LINES: dict[str, str] = {
     "L-TRANSITION-TAKE-TIME": "Take your time, just say 'ready' when you are.",
     # M032 S6 item 3 and SWEEP-28 (one id): the answer to "Are you there?".
     "L-PRESENT": "Yes, I'm here.",
+    # D4-TRANS-PRESENT1 (R1_BRIEF_VARIETY): "Yes, I'm here." and the take-time line were two
+    # utterances a second apart; one now.
+    "L-PRESENT-TAKE-TIME": "Yes, I'm here. Take your time, and just say 'ready' whenever you like.",
     # M032 S6 item 6: the "I'm ready" button pressed while a brief was playing; said before the
     # pickup, so the brief's either/or question does not hang unanswered.
     "L-PICKUP-BRIDGE": "Great, here she is.",
+    # D4-TRANS-PRESENT1 (R1_BRIEF_VARIETY): the press is acknowledged before the pickup.
+    "L-PICKUP-BRIDGE-2": "Got it, you're ready. Here's {lead_first_name}.",
     # The briefs as they were before M032 S6 (content revision 21): R1_TRANSITION_REPAIR=0 speaks
     # these in their place (``ROLLBACK_LINES``).
     "L-TRANSITION-V20": (
@@ -183,6 +236,23 @@ LINES: dict[str, str] = {
         "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
     ),
     "L-TRANSITION-NUDGE": "Whenever you're ready, just say ready.",
+    # M032 live simulation, diagnosis 4 (D4-TRANS-Q1, R1_TRANSITION_ANSWERS): a short question about
+    # the role-play gets its answer, scripted, then the start question (never the brief again).
+    "L-RP-ROLES": (
+        "You're the Program Advisor, and I'll be {lead_first_name}, the learner. You're calling "
+        "her back."
+    ),
+    "L-RP-COURSE": "She asked about our Data Science course.",
+    "L-RP-LENGTH": "Up to twenty minutes.",
+    "L-RP-GUIDE": (
+        "Use the course details and prices from your preparation guide, the way you would on a "
+        "real call."
+    ),
+    "L-RP-GOAL": (
+        "Treat it like a real call: understand what she needs and help her decide to enrol."
+    ),
+    "L-RP-NOTES": "Yes, of course.",
+    "L-RP-STUCK": "Just carry on the way you would on a real call; I'll stay in character.",
     # Owner decision 2026-11-03 (M1): no auto-start.  L-TRANSITION-ASK ends every answer Christy
     # gives before the role-play (it travels inside her reply); the two re-asks follow candidate
     # silence; L-TRANSITION-STEER answers a question past the limit of three.
@@ -390,6 +460,16 @@ LINES: dict[str, str] = {
     ),
     "L-MUTE-IV": "Your microphone seems to be muted. Please unmute it so I can hear you.",
     "L-SIL-IB": "Are you still with me, {first_name}?",
+    # M032 live simulation, diagnosis 4 (D4-SIL-IB1, R1_SIL_IB_RESTATE): the first silence after an
+    # open icebreaker question restates what she asked (per plan objective); "Are you still with
+    # me?" waits for a second silence.
+    "L-SIL-IB-I1": (
+        "No rush. I was asking about your background, especially any sales or customer-facing "
+        "work."
+    ),
+    "L-SIL-IB-I2": "No rush. I was asking what a typical day looks like in your sales work.",
+    "L-SIL-IB-I3": "No rush. I was asking what draws you to this role.",
+    "L-SIL-IB-I4": "No rush. I was asking about a moment with a customer that you're proud of.",
     # M032 S7C (SWEEP-34, R1_NO_AUDIO_LADDER; pattern P25): a candidate who was never heard at all
     # (no final, no speech) is told Christy cannot hear them, not "Are you still with me?" and "we
     # seem to have lost the connection".  Hedged: in every observed case the fault was likely on our
@@ -464,10 +544,72 @@ def brief_variety_enabled() -> bool:
     )
 
 
+def transition_presence_v2_enabled() -> bool:
+    """``R1_TRANSITION_PRESENCE_V2`` (default on, only with ``R1_BRIEF_VARIETY``; M032 diagnosis 4,
+    D4-TRANS-PRESENT1, given its own flag by the review of diagnosis 4, NO-ISOLATED-ROLLBACK): a
+    presence check just after a start question gets ONE utterance (L-PRESENT-TAKE-TIME), and the
+    pickup bridge says the press was heard (L-PICKUP-BRIDGE-2).  Read at use.  Rollback: ``fly
+    secrets set R1_TRANSITION_PRESENCE_V2=0 -a project-hello-voice`` (revision 30's "Yes, I'm
+    here." with L-TRANSITION-TAKE-TIME, and L-PICKUP-BRIDGE; the rest of the variety stays on).
+    """
+    return brief_variety_enabled() and (
+        (os.getenv("R1_TRANSITION_PRESENCE_V2") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
+# D4-BRIEF2 (``R1_BRIEF_WORDING_V2``): the ids whose reworded text is spoken while the flag is on.
+# The agendas follow the flag alone; the briefs need ``R1_TRANSITION_REPAIR`` too (their body is the
+# repaired one).  Markers, the warm-up, the cache and the transcript keep the left-hand ids.
+WORDING_LINES = {
+    "L-OPEN-AGENDA": "L-OPEN-AGENDA-W2",
+    "L-OPEN-AGENDA-PLAIN": "L-OPEN-AGENDA-PLAIN-W2",
+    "L-OPEN-AGENDA-CONTINUE": "L-OPEN-AGENDA-CONTINUE-W2",
+    "L-TRANSITION": "L-TRANSITION-W2",
+    "L-TRANSITION-THANKS-A": "L-TRANSITION-THANKS-A-W2",
+    "L-TRANSITION-THANKS-B": "L-TRANSITION-THANKS-B-W2",
+    "L-TRANSITION-THANKS-C": "L-TRANSITION-THANKS-C-W2",
+    "L-TRANSITION-BRIDGED": "L-TRANSITION-BRIDGED-W2",
+    "L-TRANSITION-AGAIN": "L-TRANSITION-AGAIN-W2",
+}
+_OPENING_WORDING = frozenset({"L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE"})
+# D4-TRANS-PRESENT1 (``R1_TRANSITION_PRESENCE_V2``): the pickup bridge that hears the press.
+VARIETY_LINES = {"L-PICKUP-BRIDGE": "L-PICKUP-BRIDGE-2"}
+
+
+def brief_wording_v2_enabled() -> bool:
+    """``R1_BRIEF_WORDING_V2`` (default on; M032 diagnosis 4, D4-BRIEF2): the opening agenda and
+    every brief in a person's words (``WORDING_LINES``), with the same facts and the same consent
+    rules.  Read at use.  Rollback: ``fly secrets set R1_BRIEF_WORDING_V2=0 -a project-hello-voice``
+    (content revision 30's agenda and brief texts exactly).
+    """
+    return (os.getenv("R1_BRIEF_WORDING_V2") or "1").strip().lower() not in _OFF_VALUES
+
+
+def transition_answers_enabled() -> bool:
+    """``R1_TRANSITION_ANSWERS`` (default on, only with ``R1_TRANSITION_REPAIR``; M032 diagnosis 4,
+    D4-TRANS-Q1): a short question about the role-play (who is who, which course, how long, prices,
+    the goal, notes, getting stuck) gets its own scripted answer (L-RP-*) and the start question,
+    never the brief again, and never counts toward the steer; the transition note no longer gives a
+    phrase to copy; a turn that asks nothing never hears the hiring-team deflection; and "happy to
+    go over ..." is said once a session.  Read at use.  Rollback: ``fly secrets set
+    R1_TRANSITION_ANSWERS=0 -a project-hello-voice`` (content revision 30's transition exactly).
+    """
+    return transition_repair_enabled() and (
+        (os.getenv("R1_TRANSITION_ANSWERS") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
 def active_line_id(line_id: str) -> str:
-    """The id whose text is spoken for ``line_id`` now (``ROLLBACK_LINES`` while S6 is off)."""
+    """The id whose text is spoken for ``line_id`` now (``ROLLBACK_LINES`` while S6 is off, the
+    reworded agenda and brief while ``R1_BRIEF_WORDING_V2`` is on, and the varied pickup bridge
+    while ``R1_TRANSITION_PRESENCE_V2`` is)."""
     if line_id in ROLLBACK_LINES and not transition_repair_enabled():
         return ROLLBACK_LINES[line_id]
+    if line_id in WORDING_LINES and brief_wording_v2_enabled():
+        if line_id in _OPENING_WORDING or transition_repair_enabled():
+            return WORDING_LINES[line_id]
+    if line_id in VARIETY_LINES and transition_presence_v2_enabled():
+        return VARIETY_LINES[line_id]
     return line_id
 
 

@@ -840,14 +840,32 @@ class TransitionReminderTests(unittest.TestCase):
         )
         from r1_replies import Reply, llm_messages
 
-        self._check_transition_note(
-            TRANSITION_REMINDER_REPAIRED, interviewer_reminder, Reply, llm_messages
-        )
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_ANSWERS": "0"}):  # D4-TRANS-Q1 off
+            self._check_transition_note(
+                TRANSITION_REMINDER_REPAIRED, interviewer_reminder, Reply, llm_messages
+            )
         lowered = TRANSITION_REMINDER_REPAIRED.lower()
         self.assertIn('say "of course, go ahead." and stop', lowered)
         self.assertIn("never end your reply with a question", lowered)
         self.assertNotIn("invite the question", lowered)
         self.assertIn("invite the question", TRANSITION_REMINDER.lower())
+
+    def test_the_answers_note_has_no_phrase_to_copy(self):
+        # M032 live simulation, diagnosis 4 (D4-TRANS-Q1, R1_TRANSITION_ANSWERS on, the default):
+        # "happy to go into the hours or anything else" and "offer to go over it again" were copied
+        # into answers nobody asked for; every other rule of the repaired note is kept.
+        from r1_prompts import TRANSITION_REMINDER_ANSWERS, interviewer_reminder
+        from r1_replies import Reply, llm_messages
+
+        self._check_transition_note(
+            TRANSITION_REMINDER_ANSWERS, interviewer_reminder, Reply, llm_messages
+        )
+        lowered = TRANSITION_REMINDER_ANSWERS.lower()
+        self.assertNotIn("happy to go into the hours", lowered)
+        self.assertNotIn("offer to go over it again", lowered)
+        self.assertIn("give one plain sentence", lowered)
+        self.assertIn('say "of course, go ahead." and stop', lowered)
+        self.assertIn("never end your reply with a question", lowered)
 
     def _check_transition_note(self, note, interviewer_reminder, Reply, llm_messages):
         # M032 S5: the delivery rider follows the note when R1_INTERVIEWER_VOICE is on.
@@ -1319,7 +1337,7 @@ class InterviewerVoiceTests(unittest.TestCase):
         from r1_prompts import (
             GETTING_TO_KNOW_YOU_NOTE,
             INTERVIEWER_DELIVERY_RIDER,
-            TRANSITION_REMINDER_REPAIRED,
+            TRANSITION_REMINDER_ANSWERS,
             WRAPUP_REMINDER,
             interviewer_reminder,
         )
@@ -1327,7 +1345,8 @@ class InterviewerVoiceTests(unittest.TestCase):
         expected = {
             "opening": GETTING_TO_KNOW_YOU_NOTE,
             "icebreaker": GETTING_TO_KNOW_YOU_NOTE,
-            "transition": TRANSITION_REMINDER_REPAIRED,  # M032 S6 (R1_TRANSITION_REPAIR on)
+            # M032 S6 and diagnosis 4 (R1_TRANSITION_REPAIR and R1_TRANSITION_ANSWERS on)
+            "transition": TRANSITION_REMINDER_ANSWERS,
             "wrapup": WRAPUP_REMINDER,
             "closing": WRAPUP_REMINDER,
         }
@@ -1625,13 +1644,26 @@ class TestReactionVarietyPrompt(unittest.TestCase):
             plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT,
         )
         self.assertEqual(
-            interviewer_prefix(voice=True, reactions=True),
+            interviewer_prefix(voice=True, reactions=True, reactions_v2=False),
             plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS,
+        )
+        # D4-ICE-ECHO1 (R1_REACTION_VARIETY_V2, the default): the v2 react clause in its place.
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=True),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS_V2,
+        )
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=False, reactions_v2=True),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT,
         )
         self.assertEqual(interviewer_prefix(voice=False, reactions=True), plain)
         for phase in ("icebreaker", "transition", "wrapup"):
             with self.subTest(phase=phase):
-                on = r1_prompts.interviewer_reminder(phase, rider=True, reactions=True)
+                v2 = r1_prompts.interviewer_reminder(phase, rider=True, reactions=True)
+                self.assertTrue(v2.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS_V2))
+                on = r1_prompts.interviewer_reminder(
+                    phase, rider=True, reactions=True, reactions_v2=False
+                )
                 off = r1_prompts.interviewer_reminder(phase, rider=True, reactions=False)
                 self.assertTrue(on.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS))
                 self.assertTrue(off.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER))
@@ -1654,7 +1686,8 @@ class TestReactionVarietyPrompt(unittest.TestCase):
         self.assertIn(sentence, r1_prompts.TRANSITION_REMINDER_REPAIRED)
         self.assertIn('"10 at night to 8 in the morning"', r1_prompts.TRANSITION_REMINDER_REPAIRED)
         self.assertNotIn(sentence, r1_prompts.TRANSITION_REMINDER)
-        on = r1_prompts.interviewer_reminder("transition", rider=False)
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_ANSWERS": "0"}):  # D4-TRANS-Q1 off
+            on = r1_prompts.interviewer_reminder("transition", rider=False)
         self.assertIn(sentence, on)
         with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
             off = r1_prompts.interviewer_reminder("transition", rider=False)

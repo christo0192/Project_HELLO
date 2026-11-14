@@ -3438,6 +3438,7 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 "L-TRANSITION", "L-TRANSITION-AGAIN", "L-TRANSITION-AGAIN-PLAIN",
                 "L-TRANSITION-RECAP", "L-TRANSITION-RECAP-2", "L-PRESENT",
                 "L-TRANSITION-TAKE-TIME",  # D3-BRIEF1: warmed only with R1_BRIEF_VARIETY
+                "L-PRESENT-TAKE-TIME",  # D4-TRANS-PRESENT1: in its place while it is on
                 "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-ASK-PAUSE",
                 "L-TRANSITION-STEER", "L-TRANSITION-REASK-2",
                 "L-PICKUP-BRIDGE", "L-PICKUP", "L-EXIT", "L-WRAP",
@@ -3451,7 +3452,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 "L-EXIT-WRAP-2", "L-EXIT-WRAP-END", "L-EXIT-WRAP-TIME", "L-EXIT-WRAP-ASIDE",
                 "L-ASIDE-EARLY-CLOSE-2", "L-ASIDE-LAST-POINT-2", "L-ASIDE-END-2", "L-WRAP-NEXT",
                 "L-NO-FEEDBACK-2", "L-FAQ-DEFER-WRAP-2", "L-CLOSE-SHORT",
-                "L-TIME-UP", "L-MUTE", "L-MUTE-IV", "L-MUTE-RP", "L-SIL-IB", "L-SIL-NOAUDIO",
+                "L-TIME-UP", "L-MUTE", "L-MUTE-IV", "L-MUTE-RP", "L-SIL-IB",
+                # D4-SIL-IB1: the silence restates, warmed only with R1_SIL_IB_RESTATE.
+                "L-SIL-IB-I1", "L-SIL-IB-I2", "L-SIL-IB-I3", "L-SIL-IB-I4", "L-SIL-NOAUDIO",
                 "L-SIL-END-NOAUDIO", "L-SIL-RP1",
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
             ),
@@ -4045,10 +4048,12 @@ class TestIcebreakerPlanWiring(unittest.IsolatedAsyncioTestCase):
         self.assertIn("selling scenarios", note)  # never a #5-style scenario question
 
     async def test_a_skip_request_gets_the_warm_clause_and_the_same_question(self):
-        rig = await self.rig()
-        await rig.converse(IB_ANSWER)
-        await rig.converse("Can we go straight to the role play?")
-        note = self.note(rig)
+        # Revision 30's skip (R1_IB_SKIP_V2=0); diagnosis 4 moves on (TestDiagnosis4Icebreaker).
+        with _env(R1_IB_SKIP_V2="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            await rig.converse("Can we go straight to the role play?")
+            note = self.note(rig)
         self.assertIn("get there soon", note)
         self.assertIn('Never start with "I understand, but"', note)
         self.assertNotIn("getting-to-know-you", note)
@@ -5177,7 +5182,20 @@ class TestReactionVarietyWiring(unittest.IsolatedAsyncioTestCase):
         rig = Rig(provider=TokenProvider(IB_QUESTION_REPLY))
         await rig.converse(IB_ANSWER)
         messages = rig.last_messages()
-        self.assertEqual(messages[0]["content"], interviewer_prefix(voice=True, reactions=True))
+        # D4-ICE-ECHO1: R1_REACTION_VARIETY_V2 (the default) sends its own react clause.
+        self.assertEqual(
+            messages[0]["content"],
+            interviewer_prefix(voice=True, reactions=True, reactions_v2=True),
+        )
+        self.assertIn(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS_V2, messages[-2]["content"])
+        with _env(R1_REACTION_VARIETY_V2="0"):
+            v1 = Rig(provider=TokenProvider(IB_QUESTION_REPLY))
+            await v1.converse(IB_ANSWER)
+        messages = v1.last_messages()
+        self.assertEqual(
+            messages[0]["content"],
+            interviewer_prefix(voice=True, reactions=True, reactions_v2=False),
+        )
         self.assertIn(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS, messages[-2]["content"])
         with _env(R1_REACTION_VARIETY="0"):
             off = Rig(provider=TokenProvider(IB_QUESTION_REPLY))
@@ -5223,12 +5241,16 @@ class TestReactionVarietyWiring(unittest.IsolatedAsyncioTestCase):
             texts["L-TRANSITION-THANKS-B"].startswith(f"Thanks for walking me through that, {name}.")
         )
         self.assertTrue(texts["L-TRANSITION-THANKS-C"].startswith(f"Got it, thank you, {name}."))
-        body = r1_script.line("L-TRANSITION-BRIDGED", **rig.persona.line_values)
+        # D4-BRIEF2: the body the session speaks (R1_BRIEF_WORDING_V2 picks the reworded one).
+        active = r1_script.active_line_id
+        body = r1_script.line(active("L-TRANSITION-BRIDGED"), **rig.persona.line_values)
         for text in texts.values():
             self.assertTrue(text.endswith(body))
             self.assertNotIn("helpful", text)
         self.assertEqual(
-            r1_script.line("L-TRANSITION-THANKS-A", first_name="", **rig.persona.line_values),
+            r1_script.line(
+                active("L-TRANSITION-THANKS-A"), first_name="", **rig.persona.line_values
+            ),
             "Thanks. " + body,
         )
 
@@ -5325,4 +5347,413 @@ class TestStoryEchoWiring(unittest.IsolatedAsyncioTestCase):
                     Reply(phase=phase, candidate_text=told)
                 )
                 self.assertEqual(ctx.story_echo, echo)
-                self.assertEqual(ctx.candidate_text, told if echo else "")
+                # D4-TRANS-Q1 (R1_TRANSITION_ANSWERS): the transition reads the turn too, for
+                # whether it asked anything (never for a story echo).
+                expected = told if echo or phase == "transition" else ""
+                self.assertEqual(ctx.candidate_text, expected)
+
+
+class TestDiagnosis4Transition(unittest.IsolatedAsyncioTestCase):
+    """M032 live simulation, diagnosis 4 (D4-TRANS-Q1, D4-TRANS-PRESENT1, D4-BRIEF2).  Synthetic texts
+    modelled on int-live-4's late-ready, roleplay-question, confused and rude calls."""
+
+    async def rig(self, reply: str = "The hiring team will follow up on that.") -> Rig:
+        rig = Rig(provider=TokenProvider(reply))
+        await rig.interview.say("L-OPEN")
+        await rig.converse(IB_ANSWER, provider=TokenProvider(TR_Q1_REPLY))
+        rig.interview._enter(R1Phase.TRANSITION)
+        await rig.interview._say_brief()
+        return rig
+
+    async def test_each_role_play_question_gets_its_answer_not_the_brief(self) -> None:
+        lead = None
+        for text, line_id in (
+            ("which course is she interested in?", "L-RP-COURSE"),
+            ("How long will the role-play take?", "L-RP-LENGTH"),
+            ("Who am I supposed to be in this?", "L-RP-ROLES"),
+            ("How much does the course cost, in case she asks?", "L-RP-GUIDE"),
+            ("What happens if I run out of things to say?", "L-RP-STUCK"),
+            ("Do I have to close her on this call?", "L-RP-GOAL"),
+            ("Can I take notes while we talk?", "L-RP-NOTES"),
+        ):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                lead = rig.persona.first_name
+                calls = len(rig.provider.calls)
+                spoken = await rig.converse(text)
+                answer = rig.interview.render_line(line_id)
+                self.assertTrue(spoken.startswith(answer), spoken)
+                self.assertEqual(len(rig.provider.calls), calls)  # scripted
+                self.assertFalse(rig.interview._brief_requested)
+                self.assertEqual(rig.interview._transition_answers, 0)  # not toward the steer
+                self.assertNotIn("Data Science course a few days ago", spoken)  # no replay
+                self.assertEqual(rig.interview._start_question, r1_session._EITHER_OR)
+                self.assertNotIn("hiring team", spoken)
+        self.assertIn(lead, Rig().interview.render_line("L-RP-ROLES"))
+
+    async def test_a_role_play_question_after_three_answers_is_still_answered(self) -> None:
+        rig = await self.rig()
+        for question in (
+            "What are the shift timings?",
+            "Is it remote?",
+            "What does the training look like?",
+        ):
+            await rig.converse(question)
+        self.assertEqual(rig.interview._transition_answers, 3)
+        spoken = await rig.converse("What happens if I run out of things to say?")
+        self.assertTrue(spoken.startswith(rig.interview.render_line("L-RP-STUCK")))
+        self.assertNotIn("keep any other questions for the end", spoken)
+
+    async def test_a_request_for_the_brief_still_gets_the_replay(self) -> None:
+        rig = await self.rig()
+        await rig.converse("Sorry, can you repeat the whole brief again?")
+        self.assertTrue(rig.interview._brief_requested)
+
+    async def test_with_the_flag_off_the_question_gets_the_brief_again(self) -> None:
+        with _env(R1_TRANSITION_ANSWERS="0"):
+            rig = await self.rig()
+            self.assertIsNone(await rig.converse("Who am I supposed to be in this?"))
+            self.assertTrue(rig.interview._brief_requested)
+
+    async def test_a_complaint_never_hears_the_hiring_team(self) -> None:
+        rig = await self.rig(reply="Right, I hear you. This role pays a good salary too.")
+        spoken = await rig.converse(
+            "I got it the first time. You didn't need to explain all that."
+        )
+        self.assertTrue(spoken.startswith("Right, I hear you."), spoken)
+        self.assertNotIn("hiring team", spoken)
+        rig = await self.rig(reply="This role pays a good salary too.")
+        spoken = await rig.converse(
+            "I got it the first time. You didn't need to explain all that."
+        )
+        self.assertTrue(spoken.startswith("Fair enough."), spoken)
+        self.assertNotIn("hiring team", spoken)
+
+    async def test_the_note_has_no_phrase_to_copy(self) -> None:
+        import r1_prompts
+
+        rig = await self.rig(reply="It's mostly calls with learners.")
+        await rig.converse("Tell me about the job itself.")
+        sent = "\n".join(message["content"] for message in rig.last_messages())
+        self.assertIn(r1_prompts.TRANSITION_REMINDER_ANSWERS, sent)
+        self.assertNotIn("happy to go into the hours", sent)
+
+    async def test_the_offer_is_made_once(self) -> None:
+        offer = "It's mostly calls with learners, happy to go into the hours or anything else."
+        rig = await self.rig(reply=offer)
+        first = await rig.converse("Tell me about the job itself.")
+        self.assertIn("happy to go into the hours", first)
+        second = await rig.converse("And what about the team?", provider=TokenProvider(offer))
+        self.assertNotIn("happy to go into the hours", second)
+        self.assertTrue(second.startswith("It's mostly calls with learners."))
+
+    async def test_a_presence_check_after_a_start_prompt_is_one_utterance(self) -> None:
+        rig = await self.rig()
+        self.assertEqual(rig.interview._presence_lines(), ("L-PRESENT-TAKE-TIME",))
+        rig.interview._transition_said.append("L-PRESENT-TAKE-TIME")
+        self.assertEqual(rig.interview._presence_lines(), ("L-PRESENT",))
+        self.assertEqual(
+            rig.interview.render_line("L-PRESENT-TAKE-TIME"),
+            "Yes, I'm here. Take your time, and just say 'ready' whenever you like.",
+        )
+
+    async def test_the_reworded_brief_keeps_consent(self) -> None:
+        rig = await self.rig()
+        brief = rig.interview.render_line(rig.interview._brief_line)
+        self.assertTrue(brief.endswith("If not, just say 'ready' and she'll pick up."))
+        for text in ("No questions.", "No."):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                self.assertIsNone(await rig.converse(text))
+                self.assertFalse(rig.interview._transition_consented)
+                self.assertEqual(rig.interview._transition_action(text), r1_session._TRANSITION_NUDGE)
+        rig = await self.rig()
+        self.assertEqual(rig.interview._transition_action("Ready."), r1_session._TRANSITION_READY)
+
+    async def test_a_bare_yes_to_any_questions_is_invited(self) -> None:
+        # Review of diagnosis 4 (BRIEF2-BARE-YES-NUDGE): "Any questions before we start?" "Yes."
+        # means a question is coming: "Of course, go ahead.", never "just say ready".  Never a start.
+        for text in ("Yes.", "Yeah."):
+            with self.subTest(text=text):
+                rig = await self.rig()
+                self.assertEqual(
+                    rig.interview._transition_action(text), r1_session._TRANSITION_INVITE
+                )
+                await rig.converse(text)
+                self.assertFalse(rig.interview._transition_consented)
+                self.assertIsNone(rig.interview._start_question)
+                with _env(R1_BRIEF_WORDING_V2="0"):
+                    rig = await self.rig()
+                    self.assertEqual(
+                        rig.interview._transition_action(text), r1_session._TRANSITION_NUDGE
+                    )
+
+    async def test_a_bare_yes_after_an_answer_s_either_or_question_still_gets_the_nudge(
+        self,
+    ) -> None:
+        rig = await self.rig(reply="It's mostly calls with learners.")
+        await rig.converse("What are the shift timings?")
+        self.assertEqual(rig.interview._start_question, r1_session._EITHER_OR)
+        self.assertEqual(rig.interview._transition_action("Yes."), r1_session._TRANSITION_NUDGE)
+
+    def test_job_questions_never_get_a_role_play_field_answer(self) -> None:
+        # Review of diagnosis 4 (RP-FIELDS-OVERMATCH): timelines, the job's targets, perks and
+        # the program they would work on are the job's; they go to the model (the hiring team).
+        for text in (
+            "How long does it take to hear back after this interview?",
+            "How long will it take to get the results?",
+            "how long does it usually take for the offer letter",
+            "How long would it take to complete the course?",
+            "What's the target for this role, like monthly?",
+            "Do I have to sell over the phone in this job?",
+            "What's the cost of relocation, do you cover it?",
+            "Will there be any discounts for employees?",
+            "Which program will I be working on if I'm hired?",
+            "How long is the training?",
+            "What's the salary?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.roleplay_fields(text), ())
+        for text, line_id in (
+            ("How long will it take?", "L-RP-LENGTH"),
+            ("How long does the role-play last?", "L-RP-LENGTH"),
+            ("What's the price of the course?", "L-RP-GUIDE"),
+            ("Any discounts I can offer her?", "L-RP-GUIDE"),
+            ("What's my goal here?", "L-RP-GOAL"),
+            ("Do I need to get her to pay today?", "L-RP-GOAL"),
+            ("Which program is she asking about?", "L-RP-COURSE"),
+            ("What's my role?", "L-RP-ROLES"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.roleplay_fields(text), (line_id,))
+
+    async def test_a_job_timeline_question_is_answered_by_the_model(self) -> None:
+        rig = await self.rig(reply="The hiring team will follow up on that.")
+        calls = len(rig.provider.calls)
+        spoken = await rig.converse("How long does it take to hear back after this interview?")
+        self.assertEqual(len(rig.provider.calls), calls + 1)
+        self.assertNotIn(rig.interview.render_line("L-RP-LENGTH"), spoken)
+
+    async def test_the_presence_v2_flag_restores_revision_30(self) -> None:
+        # Review of diagnosis 4 (NO-ISOLATED-ROLLBACK): R1_TRANSITION_PRESENCE_V2=0 rolls back
+        # D4-TRANS-PRESENT1 alone; the rest of R1_BRIEF_VARIETY stays on.
+        import r1_script
+
+        rig = await self.rig()
+        self.assertEqual(r1_script.active_line_id("L-PICKUP-BRIDGE"), "L-PICKUP-BRIDGE-2")
+        order = set(rig.interview._warm_order())
+        self.assertIn("L-PRESENT-TAKE-TIME", order)
+        self.assertNotIn("L-TRANSITION-TAKE-TIME", order)
+        with _env(R1_TRANSITION_PRESENCE_V2="0"):
+            self.assertTrue(r1_script.brief_variety_enabled())
+            self.assertFalse(r1_script.transition_presence_v2_enabled())
+            self.assertEqual(
+                rig.interview._presence_lines(), ("L-PRESENT", "L-TRANSITION-TAKE-TIME")
+            )
+            self.assertEqual(r1_script.active_line_id("L-PICKUP-BRIDGE"), "L-PICKUP-BRIDGE")
+            order = set(rig.interview._warm_order())
+            self.assertIn("L-TRANSITION-TAKE-TIME", order)
+            self.assertNotIn("L-PRESENT-TAKE-TIME", order)
+            self.assertIn("L-TRANSITION-RECAP-2", order)  # the rest of the variety stays
+
+
+class TestDiagnosis4Icebreaker(unittest.IsolatedAsyncioTestCase):
+    """M032 live simulation, diagnosis 4 (D4-IB-QUIET-NUDGE, D4-SIL-IB1, D4-ICE-SKIP1, D4-ICE-HOLD1,
+    D4-ICE-ECHO1).  Synthetic texts."""
+
+    async def rig(self, reply: str = IB_HESITATION_Q) -> Rig:
+        rig = Rig(provider=TokenProvider(reply))
+        await rig.interview.say("L-OPEN")
+        return rig
+
+    async def test_a_quiet_ack_arms_the_nudge_and_it_asks_the_question_once_more(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        self.assertIsNone(await rig.converse("Thank you."))
+        self.assertIsNotNone(rig.interview._ib_nudge_question)
+        self.assertTrue(await rig.interview._say_ib_quiet_nudge())
+        self.assertEqual(rig.session.spoken[-1], "So, what do you actually ask them?")
+        self.assertTrue(rig.interview._ib_question_open)
+        # Once per question: a second quiet ack arms nothing, and the re-ask is used up.
+        self.assertIsNone(await rig.converse("Okay."))
+        self.assertIsNone(rig.interview._ib_nudge_question)
+        self.assertFalse(rig.interview._icebreaker_plan.use_hold())
+        # And the first silence then goes straight to "Are you still with me?".
+        self.assertIsNone(rig.interview._ib_silence_restate_id())
+
+    async def test_no_nudge_is_armed_once_the_re_ask_is_used(self) -> None:
+        # Review of diagnosis 4 (QUIET-NUDGE-SHORT-LADDER): with the question's one re-ask spent,
+        # a quiet ack arms nothing, so the window stays the usual one.
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        self.assertTrue(rig.interview._icebreaker_plan.use_hold())
+        self.assertIsNone(await rig.converse("Okay."))
+        self.assertIsNone(rig.interview._ib_nudge_question)
+
+    async def test_a_refused_nudge_keeps_the_usual_window(self) -> None:
+        rig = await self.rig()
+        still = rig.interview.render_line("L-SIL-IB")
+        with mock.patch.object(r1_session, "IB_QUIET_NUDGE_SECONDS", 0.3), mock.patch.object(
+            r1_session, "ICEBREAKER_PROMPT_SECONDS", 1.5
+        ), mock.patch.object(r1_session, "ICEBREAKER_END_SECONDS", 0.05):
+            task = asyncio.create_task(rig.interview._run_icebreaker())
+            try:
+                await rig.converse(IB_ANSWER)
+                await rig.converse("Thank you.")
+                self.assertIsNotNone(rig.interview._ib_nudge_question)
+                # The re-ask is spent after the nudge was armed: the nudge is refused.
+                self.assertTrue(rig.interview._icebreaker_plan.use_hold())
+                await asyncio.sleep(0.9)  # past the short window, inside the usual one
+                restate = rig.interview._ib_silence_restate_id()
+                spoken = list(rig.session.spoken)
+                self.assertNotIn(still, spoken)
+                if restate is not None:
+                    self.assertNotIn(rig.interview.render_line(restate), spoken)
+                await rig.until(lambda: still in rig.session.spoken, timeout=5)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self.assertFalse(any(text.startswith("So, ") for text in rig.session.spoken))
+
+    async def test_the_echo_check_hears_the_turn_without_the_story_echo(self) -> None:
+        # Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): the echo cut reads the candidate's turn,
+        # so the session passes it whenever R1_REACTION_VARIETY_V2 is on.
+        rig = await self.rig()
+        with _env(R1_GUARD_STORY_ECHO="0"):
+            context = rig.interview._interviewer_guard_context(
+                Reply(phase="icebreaker", candidate_text="Can I ask about the shifts?")
+            )
+        self.assertTrue(context.reaction_check_v2)
+        self.assertEqual(context.candidate_text, "Can I ask about the shifts?")
+
+    async def test_a_hold_after_an_answer_counts_the_answer(self) -> None:
+        # Review of diagnosis 4 (HOLD-TAIL-DROPS-ANSWER): the hold line is said, and the answer
+        # before it counts toward the soft exit, reaches the plan and earns the thanks.
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        turns = rig.machine.candidate_turns
+        answer = (
+            "Mostly I ask what they want to change in their career and by when, and what is "
+            "stopping them."
+        )
+        told = f"{answer} Could I have a moment?"
+        spoken = await rig.converse(told)
+        self.assertEqual(spoken, rig.interview.render_line("L-IB-HOLD"))
+        self.assertEqual(rig.machine.candidate_turns, turns + 1)
+        self.assertEqual(rig.interview._icebreaker_carry, answer)
+        # Back from the moment: the answer before the hold counts, so the plan moves on (I3),
+        # never a follow-up to the question they already answered.
+        await rig.converse("Okay, I'm back.")
+        self.assertEqual(rig.interview._icebreaker_plan.current.id, "I3")
+        rig.interview._note_icebreaker_boundary(told, None)
+        self.assertIsNone(rig.interview._icebreaker_boundary_kind)
+        rig.interview._note_icebreaker_boundary("Could I have a moment?", None)
+        self.assertEqual(rig.interview._icebreaker_boundary_kind, "repair")
+        with _env(R1_IB_HOLD_V2="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            self.assertEqual(rig.interview._icebreaker_carry, "")
+
+    async def test_a_real_answer_cancels_the_nudge(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        await rig.converse("Thank you.")
+        await rig.converse(IB_LAST)
+        self.assertIsNone(rig.interview._ib_nudge_question)
+
+    async def test_with_the_flag_off_nothing_is_armed(self) -> None:
+        with _env(R1_IB_QUIET_NUDGE="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            await rig.converse("Thank you.")
+            self.assertIsNone(rig.interview._ib_nudge_question)
+
+    async def test_the_driver_nudges_after_the_short_window(self) -> None:
+        rig = await self.rig()
+        with mock.patch.object(r1_session, "IB_QUIET_NUDGE_SECONDS", 0.05):
+            task = asyncio.create_task(rig.interview._run_icebreaker())
+            try:
+                await rig.converse(IB_ANSWER)
+                await rig.converse("Thank you.")
+                await rig.until(
+                    lambda: "So, what do you actually ask them?" in rig.session.spoken, timeout=5
+                )
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self.assertNotIn(rig.interview.render_line("L-SIL-IB"), rig.session.spoken)
+
+    async def test_the_first_silence_restates_the_open_question(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)  # I1 answered: her question is for I2
+        self.assertEqual(rig.interview._ib_silence_restate_id(), "L-SIL-IB-I2")
+        self.assertEqual(
+            rig.interview.render_line("L-SIL-IB-I2"),
+            "No rush. I was asking what a typical day looks like in your sales work.",
+        )
+        with _env(R1_SIL_IB_RESTATE="0"):
+            self.assertIsNone(rig.interview._ib_silence_restate_id())
+
+    async def test_the_driver_restates_then_checks_presence(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        with mock.patch.object(r1_session, "ICEBREAKER_PROMPT_SECONDS", 0.05), mock.patch.object(
+            r1_session, "ICEBREAKER_END_SECONDS", 0.05
+        ):
+            task = asyncio.create_task(rig.interview._run_icebreaker())
+            restate = rig.interview.render_line("L-SIL-IB-I2")
+            still = rig.interview.render_line("L-SIL-IB")
+            try:
+                await rig.until(lambda: still in rig.session.spoken, timeout=5)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self.assertLess(rig.session.spoken.index(restate), rig.session.spoken.index(still))
+
+    async def test_the_m09_wait_request_gets_the_hold_line(self) -> None:
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        calls = len(rig.provider.calls)
+        spoken = await rig.converse(
+            "Never mentioned it to anyone, never. Hey, could you just hold this for a minute?"
+        )
+        self.assertEqual(spoken, rig.interview.render_line("L-IB-HOLD"))
+        self.assertEqual(len(rig.provider.calls), calls)
+
+    async def test_a_second_skip_caps_the_icebreaker_at_the_answer_after_it(self) -> None:
+        rig = await self.rig(reply="Sure, we'll get there in a couple of minutes. What draws you here?")
+        await rig.converse(IB_ANSWER)
+        await rig.converse("Can we skip ahead to the role-play?")
+        self.assertFalse(rig.machine.icebreaker_should_end())
+        await rig.converse("Can we just go to the role-play?")
+        self.assertTrue(rig.machine.icebreaker_capped)
+        self.assertTrue(rig.machine.icebreaker_should_end())
+        with _env(R1_IB_SKIP_V2="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            await rig.converse("Can we skip ahead to the role-play?")
+            await rig.converse("Can we just go to the role-play?")
+            self.assertFalse(rig.machine.icebreaker_capped)
+
+    async def test_the_session_sends_the_v2_react_clause(self) -> None:
+        import r1_prompts
+
+        rig = await self.rig()
+        await rig.converse(IB_ANSWER)
+        messages = rig.last_messages()
+        self.assertEqual(
+            messages[0]["content"],
+            interviewer_prefix(voice=True, reactions=True, reactions_v2=True),
+        )
+        self.assertIn(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS_V2, messages[-2]["content"])
+        with _env(R1_REACTION_VARIETY_V2="0"):
+            rig = await self.rig()
+            await rig.converse(IB_ANSWER)
+            messages = rig.last_messages()
+            self.assertEqual(
+                messages[0]["content"],
+                interviewer_prefix(voice=True, reactions=True, reactions_v2=False),
+            )

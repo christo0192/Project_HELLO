@@ -236,14 +236,21 @@ import r1_world
 # Revision 31 (sixth merge of the M032 lanes): the learner lane's 29 and the Christy lane's 29..30
 # on top of revision 30; no text changed in the merge.  CONTENT_REVISION = max(30, 29, 30) + 1.
 # Learner lane (feat/m032-learner), its own revision 30 after the sixth integration:
-# Learner lane revision 30 (simulation diagnosis 4): one exit-and-wrap-up line per way the role-play ends
-# (L-EXIT-WRAP-2, -END, -TIME, -ASIDE), the short-on-time and come-back notes and the F3 worry
+# Learner lane revision 30 (simulation diagnosis 4): one exit-and-wrap-up line per way the role-play
+# ends (L-EXIT-WRAP-2, -END, -TIME, -ASIDE), the short-on-time and come-back notes and the F3 worry
 # without brand names join the manifest (``r1_content._diag4_repairs`` and the script lines) beside
 # the texts they replace while their flags are on.  No graded meaning, marker, must-say or deadline
 # changed.
+# Christy lane (feat/m032-christy), its own revision 31 after the sixth integration:
+# Christy lane revision 31 (M032 live simulation, diagnosis 4): the reworded agenda and briefs
+# (R1_BRIEF_WORDING_V2), L-PRESENT-TAKE-TIME and L-PICKUP-BRIDGE-2 (R1_BRIEF_VARIETY), the role-play
+# field answers, "Fair enough." and the transition note without a phrase to copy
+# (R1_TRANSITION_ANSWERS), the silence restates (R1_SIL_IB_RESTATE), the quiet nudge
+# (R1_IB_QUIET_NUDGE), the skip notes (R1_IB_SKIP_V2), the react clause v2 (R1_REACTION_VARIETY_V2)
+# and the plan note's pause line (R1_ICEBREAKER_REPAIR).
 # Revision 32 (seventh merge of the M032 lanes): the learner lane's 30 and the Christy lane's 31
 # on top of revision 31; no text changed in the merge.  CONTENT_REVISION = max(31, 30, 31) + 1.
-PINNED_CONTENT_SHA256 = "959df188077d1cf1a1d94836a1a84b82c1b790871240a74b5c4578c49bca4cc8"
+PINNED_CONTENT_SHA256 = "ec9d3e094f539106e5ea7cae24721688bc277a17008cf4d035546c3bfb7003cc"
 
 CONTENT_MODULES = (
     "r1_text",

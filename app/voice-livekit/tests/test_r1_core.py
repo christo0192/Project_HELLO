@@ -5795,8 +5795,9 @@ class TestWhatTheCandidateCanCut(R1TestCase):
         # _play_aside: the asides; _say_brief: the transition bridge's reaction (M032 S5), which
         # comes right before the uninterruptible brief and cannot be cut either, and that brief
         # (L-TRANSITION-BRIDGED), queued together with the reaction (review of S5); and "Yes, I'm
-        # here." queued right before them after a presence check ends the icebreaker (M032 S6).
-        self.assertEqual(source.count("interruptible=False"), 4)
+        # here." queued right before them after a presence check ends the icebreaker (M032 S6);
+        # and the icebreaker's quiet nudge, "So, {question}" (M032 diagnosis 4, D4-IB-QUIET-NUDGE).
+        self.assertEqual(source.count("interruptible=False"), 5)
 
 
 class TestTransitionKeepsTheSessionsEndpointing(R1TestCase):
@@ -9556,7 +9557,12 @@ class TestBriefRepairOnRequest(R1TestCase):
             self.interview._brief_line = heard
             for repair in ("0", "1"):
                 with self.subTest(bridged=bridged, repair=repair), mock.patch.dict(
-                    os.environ, {"R1_TRANSITION_REPAIR": repair, "R1_BRIEF_VARIETY": "0"}
+                    os.environ,
+                    {
+                        "R1_TRANSITION_REPAIR": repair,
+                        "R1_BRIEF_VARIETY": "0",
+                        "R1_BRIEF_WORDING_V2": "0",  # D4-BRIEF2: revision 30's wording here
+                    },
                 ):
                     first = self.interview._brief_line_id(bridged=bridged)
                     replay = self.interview._brief_line_id(replay=True)
@@ -9767,9 +9773,17 @@ class TestBriefRepairOnRequest(R1TestCase):
         self.interview._brief_repeated = False
         for text in self.SCENARIO_QUESTIONS:
             with self.subTest(text=text):
-                self.assertEqual(
-                    self.interview._transition_action(text), r1_session._TRANSITION_BRIEF
+                # D4-TRANS-Q1 (R1_TRANSITION_ANSWERS): a field question gets its own answer.
+                expected = (
+                    r1_session._TRANSITION_FIELD
+                    if r1_session.roleplay_fields(text)
+                    else r1_session._TRANSITION_BRIEF
                 )
+                self.assertEqual(self.interview._transition_action(text), expected)
+                with mock.patch.dict(os.environ, {"R1_TRANSITION_ANSWERS": "0"}):
+                    self.assertEqual(
+                        self.interview._transition_action(text), r1_session._TRANSITION_BRIEF
+                    )
         # Right after the brief, "Can you explain that briefly?" asks for the short recap.
         self.interview._last_transition_line = "L-TRANSITION"
         self.assertEqual(
@@ -9974,7 +9988,9 @@ class TestBriefRepairOnRequest(R1TestCase):
     async def test_a_role_play_question_never_reaches_the_model(self) -> None:
         # fda9e9f6 #26 (paraphrased): a question about the role-play got the job's shift timings.
         task = await self.start_transition()
-        self.assertTrue(await self.answer("How long does the role play last?"))
+        # D4-TRANS-Q1 (R1_TRANSITION_ANSWERS): the length and the notes get their own answers
+        # (``TestDiagnosis4Transition`` in test_r1_integration); this is the brief route.
+        self.assertTrue(await self.answer("What is this role play about again?"))
         await self.until(lambda: self.spoken_and_played("L-TRANSITION-AGAIN-PLAIN"))
         await self.settle()
         lead = self.interview.persona.first_name  # the learner's name is the role-play's too
@@ -9985,7 +10001,7 @@ class TestBriefRepairOnRequest(R1TestCase):
         # D3-BRIEF1: the second recap is worded differently (R1_BRIEF_VARIETY).
         await self.until(lambda: self.spoken_and_played("L-TRANSITION-RECAP-2"))
         await self.settle()
-        self.assertTrue(await self.answer("Can I take notes during the role play?"))
+        self.assertTrue(await self.answer("Is the role play recorded?"))
         await self.until(lambda: self.spoken_and_played("L-TRANSITION-NUDGE"))
         self.assertEqual(self.interview._transition_answers, 0)
         # A question about the job is still Christy's to answer.
@@ -10057,7 +10073,9 @@ class TestBriefRepairOnRequest(R1TestCase):
         self.assertEqual(self.session.spoken, [
             again, self.spoken_line("L-PICKUP-BRIDGE"), self.spoken_line("L-PICKUP")
         ])
-        self.assertEqual(self.spoken_line("L-PICKUP-BRIDGE"), "Great, here she is.")
+        # D4-TRANS-PRESENT1 (R1_BRIEF_VARIETY): the press is acknowledged by name.
+        lead = self.interview.persona.first_name
+        self.assertEqual(self.spoken_line("L-PICKUP-BRIDGE"), f"Got it, you're ready. Here's {lead}.")
         self.assertEqual(
             self.transition_facts(),
             {"start_by": "button", "pressed_during": "replay", "transition_recaps": 0},
@@ -10490,7 +10508,8 @@ class TestTransitionSimulationFixes(R1TestCase):
         )
 
     async def test_the_answer_to_her_repeated_question_gets_a_reaction_note(self) -> None:
-        from r1_prompts import TRANSITION_IB_ANSWER_NOTE, TRANSITION_REMINDER_REPAIRED
+        from r1_prompts import TRANSITION_IB_ANSWER_NOTE
+        from r1_prompts import TRANSITION_REMINDER_ANSWERS as TRANSITION_REMINDER_REPAIRED
 
         self.interview._enter(R1Phase.TRANSITION)
         self.agent_state("listening")
@@ -11191,8 +11210,9 @@ class TestTransitionConsent(R1TestCase):
         run = await self.start_interview()
         await self.advance_to_transition(run)
         brief = self.spoken_line("L-TRANSITION")
+        # D4-BRIEF2 (R1_BRIEF_WORDING_V2): one start prompt, no instruction before a question.
         self.assertTrue(brief.endswith(
-            "Shall we start the role-play now, or do you have any questions first?"
+            "Any questions before we start? If not, just say 'ready' and she'll pick up."
         ))
         agent = R1Agent(run.interview)
         for text in (
@@ -11278,6 +11298,11 @@ class TestTransitionConsent(R1TestCase):
 
     async def test_a_bare_yes_to_the_either_or_question_gets_the_nudge(self) -> None:
         # Review: "Shall we start now, or do you have any questions first?" - "Yes." says neither.
+        # (The reworded brief asks "Any questions before we start?": there "Yes." is invited,
+        # review of diagnosis 4; this pins the either/or brief, R1_BRIEF_WORDING_V2=0.)
+        patcher = mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.interview._enter(R1Phase.TRANSITION)
         await self.interview.say("L-TRANSITION")
         task = asyncio.create_task(self.interview._run_transition())
@@ -12748,7 +12773,7 @@ class TestBriefVariety(R1TestCase):
         await self.heard("L-TRANSITION-RECAP")
         self.clock.advance(19)  # the recap's own start question finished 19 s ago
         self.assertTrue(await self.answer("Are you there?"))
-        await self.heard("L-TRANSITION-TAKE-TIME")
+        await self.heard("L-PRESENT-TAKE-TIME")  # D4-TRANS-PRESENT1: one line
         self.assertTrue(await self.answer(
             "No, I mean the role-play, the one with Meera. Can you say all that again? I zoned "
             "out a bit."
@@ -12759,8 +12784,7 @@ class TestBriefVariety(R1TestCase):
             for line_id in (
                 "L-TRANSITION-AGAIN-PLAIN",
                 "L-TRANSITION-RECAP",
-                "L-PRESENT",
-                "L-TRANSITION-TAKE-TIME",
+                "L-PRESENT-TAKE-TIME",  # D4-TRANS-PRESENT1: one line, not two
                 "L-TRANSITION-RECAP-2",
             )
         ]
@@ -12863,11 +12887,11 @@ class TestBriefVariety(R1TestCase):
         task = await self.start_transition()
         self.interview._start_prompt_heard_at = self.clock()
         self.assertTrue(await self.answer("Are you there?"))
-        await self.heard("L-TRANSITION-TAKE-TIME")
+        await self.heard("L-PRESENT-TAKE-TIME")  # D4-TRANS-PRESENT1: one line
         self.clock.advance(5)
         self.assertTrue(await self.answer("Hello? Are you there?"))
-        await self.heard("L-PRESENT", times=2)
-        self.assertEqual(self.count("L-TRANSITION-TAKE-TIME"), 1)
+        await self.heard("L-PRESENT")
+        self.assertEqual(self.count("L-PRESENT-TAKE-TIME"), 1)
         self.assertEqual(self.count("L-TRANSITION-REASK"), 0)
         self.final_transcript("ready")
         self.assertIsNone(await asyncio.wait_for(task, 10.0))
@@ -12910,13 +12934,15 @@ class TestBriefVariety(R1TestCase):
                 self.assertFalse(r1_session.is_detail_brief_request(text))
 
     def test_the_warm_order_follows_the_flag(self) -> None:
-        new = {"L-TRANSITION-AGAIN-PLAIN", "L-TRANSITION-RECAP-2", "L-TRANSITION-TAKE-TIME"}
+        # D4-TRANS-PRESENT1: L-PRESENT-TAKE-TIME takes L-TRANSITION-TAKE-TIME's place.
+        new = {"L-TRANSITION-AGAIN-PLAIN", "L-TRANSITION-RECAP-2", "L-PRESENT-TAKE-TIME"}
         order = set(self.interview._warm_order())
         self.assertTrue(new <= order)
+        self.assertNotIn("L-TRANSITION-TAKE-TIME", order)
         self.assertNotIn("L-TRANSITION-AGAIN", order)
         with mock.patch.dict(os.environ, {"R1_BRIEF_VARIETY": "0"}):
             order = set(self.interview._warm_order())
-        self.assertFalse(new & order)
+        self.assertFalse((new | {"L-TRANSITION-TAKE-TIME"}) & order)
         self.assertIn("L-TRANSITION-AGAIN", order)
 
     async def test_with_the_flag_off_the_lines_and_routing_are_revision_28_s(self) -> None:

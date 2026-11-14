@@ -895,9 +895,117 @@ _SUMMARY_VERDICT = _ci(
 _SUMMARY_SHAPE = _ci(r"^[^,.?!]{3,60}(?:,| -) (?:that|which)(?:'s| is| sounds)\b")
 
 
-def summary_verdict_detected(sentence: object) -> bool:
-    """True when ``sentence`` labels what the candidate said (``_SUMMARY_VERDICT``)."""
-    return _SUMMARY_VERDICT.search(fold(sentence)) is not None
+# M032 live simulation, diagnosis 4 (D4-ICE-ECHO1, ``R1_REACTION_VARIETY_V2``): the verdicts the
+# list above missed ("Same-day callbacks, that's a habit.", "That email months later says a lot.",
+# "Notes on your phone, simple enough.", "That call must have felt good.").  Bounded quantifiers
+# only.
+_SUMMARY_VERDICT_V2 = _ci(
+    r"\bthat'?s (?:a |an )?(?:habit|choice|practical|something|nice (?:reason|detail|one)|"
+    r"not always easy|a lot)\b",
+    r"\bsays (?:a lot|something)\b",
+    r"\bmust have (?:felt|been)\b",
+    r"\bisn'?t easy\b",
+    r"\bsimple enough\b",
+    r"\b(?:sounds like it|keeps things) [a-z]+\b",
+)
+# An echo opener: an acknowledgement word and their words back, as a whole statement ("Right,
+# insurance sales to individuals.", "Got it, eight years in sales program management.").
+_ECHO_OPENER = _ci(
+    r"^(?:right|got it|okay|ok|mm|sure|makes sense|fair enough)[,.] [^.?!]{3,80}\.$"
+)
+_ECHO_OPENER_LEAD = _ci(r"^(?:right|got it|okay|ok|mm|sure|makes sense|fair enough)[,.] ")
+
+
+def summary_verdict_detected(sentence: object, *, wide: bool = False) -> bool:
+    """True when ``sentence`` labels what the candidate said (``_SUMMARY_VERDICT``, and with
+    ``wide`` the D4-ICE-ECHO1 list too)."""
+    folded = fold(sentence)
+    if _SUMMARY_VERDICT.search(folded) is not None:
+        return True
+    return wide and _SUMMARY_VERDICT_V2.search(folded) is not None
+
+
+def echo_opener(sentence: object) -> bool:
+    """True when ``sentence`` is an acknowledgement and their words back (``_ECHO_OPENER``)."""
+    return _ECHO_OPENER.search(fold(sentence).strip()) is not None
+
+
+# Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): the words an echo shares with the candidate's turn
+# are its content words (four letters or more, none of these), compared without a plural "s".
+_ECHO_FUNCTION_WORDS = frozenset(
+    {"that", "this", "those", "these", "then", "than", "there", "their", "they", "them", "with",
+     "from", "into", "about", "your", "yours", "what", "when", "which", "while", "have", "just",
+     "some", "very", "really", "also", "back", "over", "more", "most", "much", "will", "would",
+     "could", "should", "does", "done", "were", "been", "being", "here", "later", "come", "make",
+     "sure", "okay", "right", "makes", "sense", "fair", "enough"}
+)
+
+
+def _echo_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for word in normalize(fold(text)).split():
+        if len(word) < 4 or word in _ECHO_FUNCTION_WORDS:
+            continue
+        terms.add(word[:-1] if word.endswith("s") and len(word) > 4 else word)
+    return terms
+
+
+def echoes_their_turn(sentence: object, candidate_text: str) -> bool:
+    """Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): ``sentence`` is an echo opener that plays the
+    candidate's own words back: their turn asked nothing (an ack-led statement after a question is
+    her answer or her deferral) and the echo's body shares a content word with it ("Right, two
+    years on the phones." after "I spent two years on the phones")."""
+    if not candidate_text or _turn_asks(candidate_text) or not echo_opener(sentence):
+        return False
+    body = _ECHO_OPENER_LEAD.sub("", fold(sentence).strip(), count=1)
+    return bool(_echo_terms(body) & _echo_terms(candidate_text))
+
+
+def opens_with_reaction(sentence: object) -> bool:
+    """D4-ICE-ECHO1: a reply opener that is an echo, a verdict or the echo-and-verdict shape."""
+    return (
+        echo_opener(sentence)
+        or summary_shape(sentence)
+        or summary_verdict_detected(sentence, wide=True)
+    )
+
+
+# D4-TRANS-Q1 (``R1_TRANSITION_ANSWERS``): the offer the transition note's old example taught the
+# model ("Happy to go over the hours or anything else"), said once a session at most.
+# Review of diagnosis 4 (OFFER-TRIM-FRAGMENT): its subject goes with it ("I'd be", "I'll be",
+# "We're", "I would be more than"), so the cut never leaves "I'd be." to be spoken.
+_OFFER_PHRASE = re.compile(
+    r"[,;]?\s*(?:and\s+)?"
+    r"(?:(?:i|we)(?:(?:'|\u2019)(?:m|re|d|ll)| am| are| would| will)\s+(?:be\s+)?)?"
+    r"(?:(?:always|really|very|so|more than)\s+)*"
+    r"happy to go (?:over|into) "
+    r"(?:the hours|the brief|it again)[^.?!]*",
+    re.IGNORECASE,
+)
+# What may be left of a sentence whose one clause was the offer: no words of its own to say.
+_OFFER_LEFTOVER_WORDS = frozenset(
+    {"sure", "of", "course", "and", "also", "absolutely", "definitely", "yes", "yeah", "okay", "ok"}
+)
+
+
+def offer_phrase_in(text: object) -> bool:
+    """True when ``text`` makes the transition's "happy to go over ..." offer."""
+    return _OFFER_PHRASE.search(str(text or "")) is not None
+
+
+def without_offer_phrase(sentence: str) -> str:
+    """``sentence`` without the "happy to go over ..." offer ("" when nothing else is left)."""
+    if _OFFER_PHRASE.search(sentence) is None:
+        return sentence
+    rest = _OFFER_PHRASE.sub("", sentence).strip()
+    rest = rest.rstrip(" ,;:-")
+    if word_count(rest) < 2:
+        return ""
+    if all(word in _OFFER_LEFTOVER_WORDS for word in normalize(rest).split()):
+        return ""  # "Sure, of course." with the offer gone says nothing of its own
+    if rest[-1] not in ".?!":
+        rest += "."
+    return rest[0].upper() + rest[1:]
 
 
 def summary_shape(sentence: object) -> bool:
@@ -905,7 +1013,7 @@ def summary_shape(sentence: object) -> bool:
     return _SUMMARY_SHAPE.search(fold(sentence).strip()) is not None
 
 
-def without_summary(sentence: str, *, shape: bool = False) -> str:
+def without_summary(sentence: str, *, shape: bool = False, wide: bool = False) -> str:
     """``sentence`` without its echo-and-verdict reaction (D3-ICE1).
 
     A statement is dropped whole ("" back).  A sentence that asks keeps what asks: the clauses
@@ -914,7 +1022,7 @@ def without_summary(sentence: str, *, shape: bool = False) -> str:
     (``summary_shape``) in place of the verdict words.  What would keep fewer than
     ``PRAISE_KEEP_MIN_WORDS`` words is dropped too.
     """
-    if not (summary_shape(sentence) if shape else summary_verdict_detected(sentence)):
+    if not (summary_shape(sentence) if shape else summary_verdict_detected(sentence, wide=wide)):
         return sentence
     breaks = list(_CLAUSE_BREAK.finditer(sentence))
     bounds = [0, *(match.end() for match in breaks)]
@@ -1710,6 +1818,16 @@ class GuardContext:
     clause_orphan_v2: bool = False
     come_back_v2: bool = False
     f3_wording: bool = False
+    # M032 diagnosis 4 (D4-ICE-ECHO1, ``R1_REACTION_VARIETY_V2``; the session sets both).  The wider
+    # verdict trim, and the first sentences of her last two replies in the opening and the
+    # icebreaker (newest last), for the echo-opener check.
+    reaction_check_v2: bool = False
+    previous_openings: tuple[str, ...] = ()
+    # D4-TRANS-Q1 (``R1_TRANSITION_ANSWERS``; the session sets both, with ``candidate_text``).  In
+    # the transition a blocked sentence after a turn that asked nothing is dropped (never the
+    # hiring-team deflection), and the "happy to go over ..." offer once made is cut.
+    transition_quiet_drop: bool = False
+    offer_phrase_used: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -1993,6 +2111,11 @@ def echoes_candidate_story(sentence: str, candidate_text: str) -> bool:
 def _turn_asks(text: str) -> bool:
     """The candidate's turn asks something (a question mark, or a question without one)."""
     return "?" in text or any(is_question_like(part) for part in split_sentences(text))
+
+
+def turn_asks(text: str) -> bool:
+    """Public ``_turn_asks`` (the session's D4-TRANS-Q1 fallback choice)."""
+    return _turn_asks(text)
 
 
 def _unapproved_role_fact(sentence: str) -> bool:
@@ -2422,6 +2545,13 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
             and not _turn_asks(ctx.candidate_text)
         ):
             return ""  # D3-GUARD-IB1: nobody asked, so there is nothing to defer: dropped
+        if (
+            ctx.transition_quiet_drop
+            and ctx.phase == "transition"
+            and ctx.candidate_text
+            and not _turn_asks(ctx.candidate_text)
+        ):
+            return ""  # D4-TRANS-Q1: a comment or complaint, not a question: nothing to defer
         return INTERVIEWER_DEFLECTION
     if ctx.is_learner and ctx.persona is not None:
         need = next((hit for hit in hits if hit.category == VOLUNTEERED_NEED), None)
@@ -2940,7 +3070,7 @@ class StreamGuard:
             or ctx.phase not in SMALL_TALK_PHASES
         ):
             return sentence
-        kept = without_summary(sentence)
+        kept = without_summary(sentence, wide=ctx.reaction_check_v2)
         if (
             kept == sentence
             and self._vetted == 1
@@ -2948,6 +3078,18 @@ class StreamGuard:
             and summary_shape(ctx.previous_opening)
         ):
             kept = without_summary(sentence, shape=True)
+        if (
+            kept == sentence
+            and ctx.reaction_check_v2
+            and self._vetted == 1
+            and echoes_their_turn(sentence, ctx.candidate_text)
+            and any(opens_with_reaction(opening) for opening in ctx.previous_openings[-2:])
+        ):
+            # D4-ICE-ECHO1: one of her last two replies opened with an echo or a verdict, so this
+            # echo goes (never the only sentence: ``flush`` gives it back).  Review of diagnosis 4
+            # (ECHO-CUT-EATS-ANSWERS): only their own words back after a turn that asked nothing;
+            # her answer to their question or her deferral is never cut.
+            kept = ""
         if kept == sentence:
             return sentence
         self._style_edits += 1
@@ -2959,6 +3101,11 @@ class StreamGuard:
         if self._done:
             return []
         self._vetted += 1
+        if self.ctx.offer_phrase_used and not self.ctx.is_learner and sentence:
+            trimmed = without_offer_phrase(sentence)  # D4-TRANS-Q1: the offer was made once
+            if trimmed != sentence:
+                self._style_edits += 1
+                sentence = trimmed
         sentence = self._cut_praise(sentence)
         if sentence:
             sentence = self._cut_summary(sentence)
