@@ -325,7 +325,19 @@ import r1_world
 # 31: M032 integration 6 (the learner lane's 29 and the Christy lane's 29-30 merged onto
 #    revision 30): every text of both lanes in one manifest.  No text changed in the merge;
 #    CONTENT_REVISION = max(30, 29, 30) + 1.
-CONTENT_REVISION = 31
+# Learner lane (feat/m032-learner, its revision 30, after the sixth integration):
+# Lane 30: Simulation diagnosis 4 (the full-interview flow judge; rollback flags R1_EXIT_WRAP_V2,
+#    R1_FAREWELL_READ_V3, R1_ANCHOR_TIME_AWARE, R1_CONTACT_READER_V2, R1_TIME_CUE_V3,
+#    R1_DECIDER_SPACING, R1_CLAUSE_ORPHAN_V2, R1_DIG_GATE_V3, R1_COME_BACK_V2 and R1_F3_WORDING).
+#    New scripted lines (one exit-and-wrap-up line per way the role-play ends: L-EXIT-WRAP-2,
+#    -END, -TIME and -ASIDE, each keeping the brief's cue phrase), the short-on-time and come-back
+#    notes and the F3 worry without brand names join the manifest (``_diag4_repairs``) beside the
+#    texts they replace while their flags are on.  No graded marker, must-say, meaning or deadline
+#    changed; with every flag off the lines, reminders and readers are the release before.
+# 32: M032 integration 7 (the learner lane's 30 and the Christy lane's 31 merged onto
+#    revision 31): every text of both lanes in one manifest.  No text changed in the merge;
+#    CONTENT_REVISION = max(31, 30, 31) + 1.
+CONTENT_REVISION = 32
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -717,6 +729,19 @@ def _diag3_repairs() -> dict[str, Any]:
     }
 
 
+def _diag4_repairs() -> dict[str, Any]:
+    """Simulation diagnosis 4 (revision 30): the new notes and the F3 worry wording."""
+    p = r1_prompts
+    return {
+        "short_on_time_note_v3": p.SHORT_ON_TIME_NOTE_V3,
+        "short_on_time_concerns_note_v3": p.SHORT_ON_TIME_CONCERNS_NOTE_V3,
+        "open_question_note_v2": p.OPEN_QUESTION_NOTE_V2,
+        "open_question_after_ask_note_v2": p.OPEN_QUESTION_AFTER_ASK_NOTE_V2,
+        "f3_primary_worry_v3": r1_scheduler.F3_PRIMARY_WORRY_V3,
+        "f3_primary_worry_variants_v3": list(r1_scheduler.F3_PRIMARY_WORRY_VARIANTS_V3),
+    }
+
+
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
@@ -1011,6 +1036,7 @@ def manifest() -> dict[str, Any]:
             "sim2_repairs": _sim2_repairs(),
             "adapt_repairs": _adapt_repairs(),
             "diag3_repairs": _diag3_repairs(),
+            "diag4_repairs": _diag4_repairs(),
         },
         "icebreaker": {
             "objectives": [

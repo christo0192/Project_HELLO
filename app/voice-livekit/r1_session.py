@@ -300,6 +300,11 @@ from r1_roleplay import (
     FLAG_WRAPUP_DECLINE_V2,
     FLAG_WRAPUP_NEXT_STEPS,
     FLAG_FAREWELL_EXIT_V2,
+    FLAG_EXIT_WRAP_V2,
+    EXIT_ASIDE,
+    EXIT_END_REQUEST,
+    EXIT_FAREWELL,
+    EXIT_TIME,
     WRAP_OFFER_PAUSE_SEC,
     RolePlayEngine,
     TurnMode,
@@ -533,6 +538,16 @@ WRAPUP_QUESTION_LIMIT = 2
 # at most ``WRAP_BEAT_HOLD_SECONDS``, so the uninterruptible L-WRAP never talks over them.
 WRAP_BEAT_SECONDS = 0.7
 WRAP_BEAT_HOLD_SECONDS = 4.0
+# Simulation diagnosis 4 (D4-EXIT1, R1_EXIT_WRAP_V2): the one exit-and-wrap-up line for each way
+# the role-play ends (``RolePlayEngine.exit_kind``), and the short beat after her goodbye back so
+# Christy does not cut straight in on it.
+EXIT_WRAP_LINES = {
+    EXIT_FAREWELL: "L-EXIT-WRAP-2",
+    EXIT_END_REQUEST: "L-EXIT-WRAP-END",
+    EXIT_TIME: "L-EXIT-WRAP-TIME",
+    EXIT_ASIDE: "L-EXIT-WRAP-ASIDE",
+}
+EXIT_BYE_BEAT_SECONDS = 0.8
 # M2 (owner and manager decisions of 2026-11-03): the role-play never ends by itself before its
 # time.  The early exit of plan 5.1 (commitment resolved and R >= 14:00) is the interviewer's offer
 # to wrap up (``r1_roleplay``: L-ASIDE-WRAP), at a candidate turn that leaves a natural pause or
@@ -766,6 +781,11 @@ _WARM_ORDER = (
     "L-LEARNER-BYE-2",
     "L-LEARNER-BYE-3",
     "L-EXIT-WRAP",
+    # Simulation diagnosis 4 (D4-EXIT1): one exit-and-wrap-up line per way the role-play ends.
+    "L-EXIT-WRAP-2",
+    "L-EXIT-WRAP-END",
+    "L-EXIT-WRAP-TIME",
+    "L-EXIT-WRAP-ASIDE",
     "L-ASIDE-EARLY-CLOSE-2",
     "L-ASIDE-LAST-POINT-2",
     "L-ASIDE-END-2",
@@ -10601,7 +10621,18 @@ class R1Interview:
                 return outcome
             self._end_roleplay()
             engine = self._engine
-            if (
+            if flag_on(FLAG_EXIT_WRAP_V2) and self._stop_outcome() is None:
+                # D4-EXIT1: one Christy line for every way the role-play ends (the brief's cue,
+                # her name once, one thanks, the wrap-up question); after the advisor's goodbye her
+                # short bye back goes first, then a short beat.  No separate L-WRAP, no beat after.
+                kind = engine.exit_kind() if engine is not None else EXIT_TIME
+                if engine is not None and engine.exit_bye and kind == EXIT_FAREWELL:
+                    await self.say(engine.exit_bye)
+                    if EXIT_BYE_BEAT_SECONDS > 0 and self._stop_outcome() is None:
+                        await asyncio.sleep(EXIT_BYE_BEAT_SECONDS)
+                await self.say(EXIT_WRAP_LINES.get(kind, "L-EXIT-WRAP-END"))
+                self._enter(R1Phase.WRAPUP)
+            elif (
                 engine is not None
                 and engine.exit_farewell
                 and flag_on(FLAG_FAREWELL_EXIT_V2)

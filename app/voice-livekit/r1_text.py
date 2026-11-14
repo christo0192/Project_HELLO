@@ -405,6 +405,16 @@ MONEY_STRAIN = re.compile(
 )
 
 
+# Simulation diagnosis 4 (D4-F3STOCK1, the guard's R1_F3_WORDING): "Six months is a real
+# commitment." opened the F3 objection in 11 of 41 calls; it is said once a call.  Review D4R-1:
+# only that stock phrase ("a big commitment" is how an F2 or F4 line says it).
+PHRASE_REAL_COMMITMENT = "real_commitment"
+REAL_COMMITMENT = re.compile(
+    r"\b(?:is|that'?s|it'?s|that is|it is) (?:a )?real commitment\b",
+    re.IGNORECASE,
+)
+
+
 def reply_phrases(text: object) -> tuple[str, ...]:
     """The tracked phrase tics ("a stretch", the "what would it involve" template ...)."""
     folded = fold(text)
@@ -421,6 +431,8 @@ def reply_phrases(text: object) -> tuple[str, ...]:
         found.append(PHRASE_STALL_CLOSER)
     if MONEY_STRAIN.search(folded):
         found.append(PHRASE_MONEY_STRAIN)
+    if REAL_COMMITMENT.search(folded):
+        found.append(PHRASE_REAL_COMMITMENT)
     return tuple(found)
 
 
@@ -560,9 +572,54 @@ def concern_themes(text: object, *, shared_think_over: bool = False) -> frozense
     return frozenset(found)
 
 
-def is_closer(text: object) -> bool:
-    """True when ``text`` is the learner closing the call itself (``CLOSER``)."""
-    return CLOSER.search(fold(text)) is not None
+# Simulation diagnosis 4 (D4-GOODBYE1, the engine's R1_FAREWELL_READ_V3): "Good night.", "Talk
+# tomorrow at seven." and "Looking forward to tomorrow at seven." are her goodbyes too (in the terse
+# call she said good night back 28 times and none of it was read as a sign-off).
+_CLOSER_TIME = (
+    r"(?:\s+(?:at|around|by))?\s+(?:\d{1,2}(?::\d\d)?|one|two|three|four|five|six|seven|eight|nine|"
+    r"ten|eleven|twelve)(?:\s?(?:am|pm|a\.m\.|p\.m\.|o'?clock))?"
+)
+CLOSER_V3 = re.compile(
+    r"\bgood ?night\b|\bnight now\b"
+    r"|\b(?:talk|speak)(?: to you)? (?:tomorrow|then|later|next week|on \w+day)\b"
+    r"(?:" + _CLOSER_TIME + r")?"
+    r"|\bsee you (?:tomorrow|then|soon|next week|on \w+day)\b(?:" + _CLOSER_TIME + r")?"
+    r"|\blooking forward to (?:tomorrow|then|it then|our (?:call|chat|talk)(?: tomorrow| then)?|"
+    r"(?:talking|speaking|hearing from you)(?: tomorrow| then)?)\b(?:" + _CLOSER_TIME + r")?",
+    re.IGNORECASE,
+)
+
+
+# Review D4R-6: what may follow a wide goodbye in its sentence (a name, courtesy, a time word):
+# "Good night, Rahul.", "Talk to you tomorrow at seven, take care."  Anything else ("talk tomorrow
+# with my husband and let you know", "looking forward to talking to the mentors") is no goodbye.
+_CLOSER_V3_TAIL = re.compile(
+    r"^(?:[\s,.!-]*(?:(?:and )?thanks?(?: you)?(?: so much)?(?: again)?(?: for everything)?|bye|"
+    r"goodbye|bye for now|take care|okay|ok|alright|then|now|for now|again|evening|night|morning|"
+    r"(?:have a )?(?:good|great|lovely|nice) (?:day|evening|night|one)|[A-Z][a-z']{1,15}))*"
+    r"[\s,.!-]*$"
+)
+
+
+def _closer_v3_in(folded: str) -> bool:
+    """Review D4R-6: a ``CLOSER_V3`` goodbye that ends its sentence (only a name or courtesy after
+    it), in a sentence that asks nothing."""
+    for sentence in split_sentences(folded):
+        if "?" in sentence:
+            continue
+        for match in CLOSER_V3.finditer(sentence):
+            if _CLOSER_V3_TAIL.match(sentence[match.end():]) is not None:
+                return True
+    return False
+
+
+def is_closer(text: object, *, wide: bool = False) -> bool:
+    """True when ``text`` is the learner closing the call itself (``CLOSER``).
+
+    ``wide`` (D4-GOODBYE1): "good night", "talk tomorrow" and their kin as well (``CLOSER_V3``),
+    each only where it ends a sentence that asks nothing (review D4R-6)."""
+    folded = fold(text)
+    return CLOSER.search(folded) is not None or (wide and _closer_v3_in(folded))
 
 
 # ----------------------------------------------------------------------------------
@@ -593,13 +650,16 @@ _SIGN_OFF_TAIL = re.compile(
 )
 
 
-def is_sign_off(text: object) -> bool:
+def is_sign_off(text: object, *, wide: bool = False) -> bool:
     """S3.1: the learner's line signs off (its last sentence ENDS on a sign-off; nothing asked).
 
     ``CLOSER`` ("Thanks for your time.", "Take care.") or one of her real forms (``SIGN_OFF``: "I'll
     think it over", "I'll get back to you", "let me give it some proper thought", "I'll take some
     time", "I'll sit with it", "let's leave it there"), followed by courtesy alone.  A line with a
     question mark is never a sign-off ("I'll think it over, but what about the EMI?").
+
+    ``wide`` (D4-GOODBYE1): "Good night.", "Talk tomorrow at seven." and "Looking forward to
+    tomorrow at seven." end a sign-off too (``CLOSER_V3``).
     """
     folded = fold(text)
     if "?" in folded:
@@ -608,7 +668,7 @@ def is_sign_off(text: object) -> bool:
     if not sentences:
         return False
     last = sentences[-1]
-    for pattern in (SIGN_OFF, CLOSER):
+    for pattern in (SIGN_OFF, CLOSER, *((CLOSER_V3,) if wide else ())):
         for match in pattern.finditer(last):
             if _SIGN_OFF_TAIL.match(last[match.end():]) is not None:
                 return True
@@ -933,10 +993,34 @@ _CONTACT_PATTERNS = (
 )
 
 
-def has_contact_detail(text: object) -> bool:
-    """True when ``text`` spells out an e-mail address, phone number, URL or handle."""
+# Simulation diagnosis 4 (D4-CONTACT1, the engine's R1_CONTACT_READER_V2): "I can't always be at a
+# live one." read as "<word> at <word> live" (a spoken address).  In the narrow reader the generic
+# provider words (live, example, email, mail) count only before "dot <tld>", and the optional word
+# between "at" and the provider may not be an article or a pronoun.
+_SPOKEN_LOCAL = r"\b[\w.]{1,40}(?:\s+(?:dot|underscore|dash)\s+\w{1,30}){0,6}"
+_SPOKEN_AT = r"\s+(?:at(?:\s+the\s+rate(?:\s+of)?)?|@)\s+"
+_SPOKEN_MIDDLE = r"(?:(?!(?:a|an|the|my|your|our|his|her|their|its|this|that)\b)\w{1,30}\s+)?"
+EMAIL_SPOKEN_V2 = re.compile(
+    _SPOKEN_LOCAL
+    + _SPOKEN_AT
+    + _SPOKEN_MIDDLE
+    + r"(?:(?:gmail|googlemail|yahoo|outlook|hotmail|icloud|proton\w{0,10}|rediff\w{0,10}|aol)\b"
+    r"(?:\s+dot\s+\w{1,10}){0,4}"
+    r"|(?:live|example|email|mail)\s+dot\s+\w{1,10}(?:\s+dot\s+\w{1,10}){0,3})",
+    re.IGNORECASE,
+)
+_CONTACT_PATTERNS_V2 = tuple(
+    EMAIL_SPOKEN_V2 if pattern is EMAIL_SPOKEN else pattern for pattern in _CONTACT_PATTERNS
+)
+
+
+def has_contact_detail(text: object, *, narrow: bool = False) -> bool:
+    """True when ``text`` spells out an e-mail address, phone number, URL or handle.
+
+    ``narrow`` (D4-CONTACT1): the spoken e-mail reader of ``EMAIL_SPOKEN_V2``."""
     folded = fold(text)
-    return any(pattern.search(folded) for pattern in _CONTACT_PATTERNS)
+    patterns = _CONTACT_PATTERNS_V2 if narrow else _CONTACT_PATTERNS
+    return any(pattern.search(folded) for pattern in patterns)
 
 
 def mask_contact(text: object, limit: int | None = None) -> str:

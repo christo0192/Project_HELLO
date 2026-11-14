@@ -2614,15 +2614,16 @@ class TestEndToEnd(R1TestCase):
         self.assertTrue(spoken[-1])
         self.assertIs(interview.machine.phase, R1Phase.ROLEPLAY)
         # ... and at R = 20:00 the turn in flight is the boundary: the learner closes in role
-        # (L-TIME-UP), then L-EXIT and the wrap-up.
+        # (L-TIME-UP), then Christy's one exit line that asks the wrap-up question (simulation
+        # diagnosis 4, R1_EXIT_WRAP_V2: L-EXIT-WRAP-TIME in place of L-EXIT, a beat and L-WRAP).
         self.assertIsNone(await self.converse("So the total comes to nine thousand.", 75))
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
-            await self.candidate_replies_after("L-WRAP", "No questions, thanks")
+            await self.candidate_replies_after("L-EXIT-WRAP-TIME", "No questions, thanks")
             self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
 
         opening = list(self.opening_line_ids())  # M032 S7C: the hello, then the agenda
         expected_lines = [
-            *opening, "L-TRANSITION", "L-PICKUP", "L-TIME-UP", "L-EXIT", "L-WRAP", "L-CLOSE",
+            *opening, "L-TRANSITION", "L-PICKUP", "L-TIME-UP", "L-EXIT-WRAP-TIME", "L-CLOSE",
         ]
         self.assertEqual(self.session.spoken, [self.spoken_line(name) for name in expected_lines])
         rows = self.bot_rows()
@@ -2631,7 +2632,7 @@ class TestEndToEnd(R1TestCase):
         self.assertEqual(
             [row["phase"] for row in rows if row["text"] in self.session.spoken],
             ["opening"] * len(opening)
-            + ["transition", "transition", "roleplay", "roleplay_exit", "wrapup", "closing"],
+            + ["transition", "transition", "roleplay", "roleplay_exit", "closing"],
         )
         # No learner line ever reached an interviewer phase and vice versa.
         for row in rows:
@@ -3446,6 +3447,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 # Simulation diagnosis 3: the farewell exit, the reworded asides and the
                 # wrap-up's scripted answers.
                 "L-LEARNER-BYE-1", "L-LEARNER-BYE-2", "L-LEARNER-BYE-3", "L-EXIT-WRAP",
+                # Simulation diagnosis 4: one exit-and-wrap-up line per way the role-play ends.
+                "L-EXIT-WRAP-2", "L-EXIT-WRAP-END", "L-EXIT-WRAP-TIME", "L-EXIT-WRAP-ASIDE",
                 "L-ASIDE-EARLY-CLOSE-2", "L-ASIDE-LAST-POINT-2", "L-ASIDE-END-2", "L-WRAP-NEXT",
                 "L-NO-FEEDBACK-2", "L-FAQ-DEFER-WRAP-2", "L-CLOSE-SHORT",
                 "L-TIME-UP", "L-MUTE", "L-MUTE-IV", "L-MUTE-RP", "L-SIL-IB", "L-SIL-NOAUDIO",
@@ -3472,8 +3475,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # the two no-audio lines and the two mute asides, in place of L-MUTE; M032 S3 the
         # early-close (two wordings), last-point and hang-up asides and her hang-up line;
         # christy-ready the pause prompt (a ``say`` line, R1_START_ASK_ONCE); simulation
-        # diagnosis 3 eleven new lines.
-        self.assertEqual(len(specs), 50)
+        # diagnosis 3 eleven new lines; simulation diagnosis 4 four more (the exit-and-wrap-up
+        # lines).
+        self.assertEqual(len(specs), 54)
         warmed = {spec.text for spec in specs}
         for line_id in unreachable:
             if line_id not in ("L-OPEN", "L-OPEN-HELLO"):

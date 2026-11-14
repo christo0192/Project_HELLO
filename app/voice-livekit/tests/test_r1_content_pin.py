@@ -235,7 +235,15 @@ import r1_world
 # and the icebreaker repair's REASK_V2_MAX_REPEATS.
 # Revision 31 (sixth merge of the M032 lanes): the learner lane's 29 and the Christy lane's 29..30
 # on top of revision 30; no text changed in the merge.  CONTENT_REVISION = max(30, 29, 30) + 1.
-PINNED_CONTENT_SHA256 = "d74aff07d6e982b3a51132471e0bff417cf7c295b8094bf5633d27166952d0ea"
+# Learner lane (feat/m032-learner), its own revision 30 after the sixth integration:
+# Learner lane revision 30 (simulation diagnosis 4): one exit-and-wrap-up line per way the role-play ends
+# (L-EXIT-WRAP-2, -END, -TIME, -ASIDE), the short-on-time and come-back notes and the F3 worry
+# without brand names join the manifest (``r1_content._diag4_repairs`` and the script lines) beside
+# the texts they replace while their flags are on.  No graded meaning, marker, must-say or deadline
+# changed.
+# Revision 32 (seventh merge of the M032 lanes): the learner lane's 30 and the Christy lane's 31
+# on top of revision 31; no text changed in the merge.  CONTENT_REVISION = max(31, 30, 31) + 1.
+PINNED_CONTENT_SHA256 = "959df188077d1cf1a1d94836a1a84b82c1b790871240a74b5c4578c49bca4cc8"
 
 CONTENT_MODULES = (
     "r1_text",

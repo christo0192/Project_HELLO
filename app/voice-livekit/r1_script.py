@@ -318,6 +318,28 @@ LINES: dict[str, str] = {
         "Let's stop the role-play here. This is Christy again, thank you, that's the end of the "
         "role-play. Before we finish, do you have any questions about the role or the next steps?"
     ),
+    # Simulation diagnosis 4 (D4-EXIT1, R1_EXIT_WRAP_V2; new wording under D-M032-4, listed word
+    # for word for owner review): one utterance per way the role-play ends.  Each keeps the brief's
+    # cue phrase ("Let's pause the role-play here"), names Christy once (not after an aside she
+    # is already speaking in), thanks once, then asks the wrap-up question.  The farewell form
+    # follows her short goodbye; the end-request form answers the candidate's own request; the
+    # time form follows her L-TIME-UP; the aside form follows a yes to Christy's own question.
+    "L-EXIT-WRAP-2": (
+        "And let's pause the role-play here. It's Christy again, thanks for that. Before we wrap "
+        "up, do you have any questions for me about the role or the next steps?"
+    ),
+    "L-EXIT-WRAP-END": (
+        "Sure. Let's pause the role-play here. It's Christy again, thanks for that. Before we wrap "
+        "up, do you have any questions for me about the role or the next steps?"
+    ),
+    "L-EXIT-WRAP-TIME": (
+        "That's our time, so let's pause the role-play here. It's Christy again, thanks for that. "
+        "Before we wrap up, do you have any questions for me about the role or the next steps?"
+    ),
+    "L-EXIT-WRAP-ASIDE": (
+        "Okay, let's pause the role-play here. Before we wrap up, do you have any questions for me "
+        "about the role or the next steps?"
+    ),
     # D3-ASIDE1 (R1_END_ASIDE_V2): a yes/no question in place of L-ASIDE-END's magic phrase
     # (L-ASIDE-END is owner-approved: this rewording is for review); "confirm before ending" holds.
     "L-ASIDE-END-2": (
