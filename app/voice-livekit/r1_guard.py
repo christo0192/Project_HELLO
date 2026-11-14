@@ -447,10 +447,13 @@ _SEVEN_MONEY = re.compile(
     r"7,?000|seven thousand)\b",
     re.IGNORECASE,
 )
+# Review D4R-3: only a time next to the seven ("at seven", "7 pm", "seven o'clock") or a question
+# about the time ("what time suits you? ... seven"); a deadline word beside a price ("$8,000 if you
+# enroll by tomorrow", "only till this evening") is no clock time.
 _SEVEN_CLOCK = re.compile(
     r"\b(?:at|around|by|about|till|until) (?:seven|7)\b|\b(?:seven|7) ?o'?clock\b"
-    r"|\b(?:seven|7)(?::\d\d)? ?(?:pm|am|p\.m\.|a\.m\.)|\b(?:tomorrow|tonight|this evening|"
-    r"evening|morning|what time|which time|time (?:suits|works)|o'?clock|call (?:at|back))\b",
+    r"|\b(?:seven|7)(?::\d\d)? ?(?:pm|am|p\.m\.|a\.m\.)"
+    r"|\b(?:what time|which time|time (?:suits|works)|call (?:you )?(?:at|back))\b",
     re.IGNORECASE,
 )
 
@@ -2513,9 +2516,10 @@ class StreamGuard:
                 self._phrases_used[PHRASE_STRETCH] = self._phrases_used.get(PHRASE_STRETCH, 0) + 1
         if ctx.f3_wording and REAL_COMMITMENT.search(text) is not None:
             # D4-F3STOCK1: "Six months is a real commitment." once a call; a second one goes (its
-            # clause, or the whole sentence when that was all of it).
+            # clause, or the whole sentence when that was all of it).  Review D4R-1: only from a
+            # free reply; a line that carries an owed move keeps it (its proof clause may be it).
             key = PHRASE_REAL_COMMITMENT
-            if self._phrase_count(key) >= 1:
+            if self._phrase_count(key) >= 1 and ctx.free_reply and not ctx.carries_move:
                 text = _without_clauses(text, REAL_COMMITMENT)
                 if not text:
                     self._style_edits += 1

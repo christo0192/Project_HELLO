@@ -1934,17 +1934,29 @@ def is_close_attempt(text: object, r_sec: float | None = None, *, wide: bool = F
     # sentence is a sign-off tail.
     asks_after = [False] * (count + 1)
     closing_after = [True] * (count + 1)
+    # Review D4R-2: "We'll talk tomorrow at seven." books the call-back; it takes leave only when
+    # nothing but sign-off tails (or another goodbye) follows it in the turn.
+    tail_after = [True] * (count + 1)
     for index in range(count - 1, -1, -1):
         asks_after[index] = asks_after[index + 1] or _asks_something(sentences[index])
         closing_after[index] = closing_after[index + 1] and (
             not thanks_allowed or _is_closing_tail(sentences[index])
         )
+        if wide:
+            tail_after[index] = tail_after[index + 1] and (
+                _is_closing_tail(sentences[index])
+                or any(pattern.search(sentences[index]) for pattern in _CLOSE_FAREWELL_V3)
+            )
     for index, sentence in enumerate(sentences):
         if asks_after[index + 1]:
             continue
         if any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL):
             return True
-        if wide and any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL_V3):
+        if (
+            wide
+            and tail_after[index + 1]
+            and any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL_V3)
+        ):
             return True
         if (
             thanks_allowed

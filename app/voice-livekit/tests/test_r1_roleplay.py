@@ -13956,7 +13956,8 @@ class D4FarewellReaderTests(unittest.TestCase):
         s.eng._wrap_offers.extend({"trigger": "x", "answer": "no", "r_sec": 0.0} for _ in range(2))
         first = s.say("Okay, thank you.", 900)
         self.assertIsNot(first.mode, TurnMode.EXIT)
-        second = s.say("Sure, thanks.", 915)
+        # Review D4R-7: one turn of the run takes leave (two plain thanks are acknowledgements).
+        second = s.say("Sure, thanks, take care.", 915)
         self.assertIs(second.mode, TurnMode.EXIT)
         self.assertIn("farewell_run_exit", second.reasons)
 
@@ -14272,3 +14273,203 @@ class D4F3WordingTests(unittest.TestCase):
             ctx,
         )
         self.assertEqual(out.text, "I'm not sure it's worth paying for when so much is free.")
+
+
+class D4ReviewF3WordingTests(unittest.TestCase):
+    """Review D4R-1: the once-a-call "real commitment" cut is for free replies only, and only that
+    phrase ("a big commitment" is how an F2 or F4 line says it, never the stock wording)."""
+
+    MOVE = dict(free_reply=False, carries_move=True, f3_wording=True)
+    OVER = (("real_commitment", 1),)
+
+    def test_a_line_that_carries_a_move_is_never_cut(self):
+        ctx = d3_ctx(phrase_counts=self.OVER, **self.MOVE)
+        for text in (
+            "Six months is a real commitment, and my schedule is already packed.",
+            "Honestly, six months is a real commitment with my job.",
+        ):
+            self.assertEqual(guard_text(text, ctx).text, text)
+
+    def test_a_big_commitment_is_not_the_stock_phrase(self):
+        text = "This is a big commitment and I'm not ready to decide today."
+        for ctx in (
+            d3_ctx(phrase_counts=self.OVER, **self.MOVE),
+            d3_ctx(free_reply=True, f3_wording=True, phrase_counts=self.OVER),
+        ):
+            self.assertEqual(guard_text(text, ctx).text, text)
+        self.assertIsNone(r1_text.REAL_COMMITMENT.search(text))
+
+    def test_the_move_line_still_spends_the_once(self):
+        said = "Six months is a real commitment, and my schedule is already packed."
+        self.assertIn("real_commitment", r1_text.reply_phrases(said))
+        self.assertNotIn("real_commitment", r1_text.reply_phrases("It's a big commitment."))
+
+
+class D4ReviewCloseReaderTests(unittest.TestCase):
+    """Review D4R-2: a booked call-back the advisor keeps talking past is no goodbye."""
+
+    def test_a_scheduling_statement_mid_turn_is_no_close(self):
+        for text in (
+            "Okay, so we'll talk tomorrow at seven. Before that, let me tell you about the EMI "
+            "options.",
+            "So we'll talk tomorrow at seven. And the batch starts on the 5th, the fee is $9,000 "
+            "with a discount for paying upfront.",
+        ):
+            self.assertFalse(r1_scheduler.is_close_attempt(text, 900, wide=True), text)
+
+    def test_it_still_closes_at_the_end_or_before_a_closing_tail(self):
+        for text in (
+            "Okay, so we'll talk tomorrow at seven.",
+            "Good night, Meera. Talk tomorrow at seven.",
+            "We'll talk tomorrow at seven. Bye.",
+            "See you then, Meera. Take care.",
+        ):
+            self.assertTrue(r1_scheduler.is_close_attempt(text, 900, wide=True), text)
+
+    def test_mid_turn_it_does_not_trip_the_engine_close(self):
+        s = settled_session()
+        plan = s.say(
+            "Okay, so we'll talk tomorrow at seven. Before that, let me tell you about the EMI "
+            "options, they start at five hundred a month.",
+            900,
+        )
+        self.assertIsNot(plan.mode, TurnMode.EXIT)
+
+
+class D4ReviewAnchorTimeTests(unittest.TestCase):
+    """Review D4R-3: a deadline word ("by tomorrow", "this evening") is no clock time beside a
+    price, so "seven it is" after "$8,000 if you enroll by tomorrow" is still the misread."""
+
+    def ctx(self, advisor):
+        return d3_ctx(
+            free_reply=True,
+            advisor_said=(fold_text(advisor),),
+            offer_usd=8000,
+            anchor_time_aware=True,
+        )
+
+    def test_a_deadline_beside_the_price_is_still_caught(self):
+        for advisor in (
+            "The best I can do is $8,000 if you enroll by tomorrow.",
+            "The best I can do is $8,000, only till this evening.",
+            "The best I can do is $8,000. Can you decide by tomorrow morning?",
+        ):
+            out = guard_text("Okay, seven it is.", self.ctx(advisor))
+            self.assertIn("anchor_taken_as_offer", [hit.rule for hit in out.hits], advisor)
+
+    def test_a_time_next_to_seven_is_a_clock_time(self):
+        for advisor in (
+            "Shall we do a call tomorrow at seven? The fee is $8,000 by the way.",
+            "What time suits you both tomorrow? Maybe seven?",
+            "I can call you back at 7 pm about the $8,000 plan.",
+        ):
+            out = guard_text("Seven it is.", self.ctx(advisor))
+            self.assertNotIn("anchor_taken_as_offer", [hit.rule for hit in out.hits], advisor)
+
+
+class D4ReviewComeBackTests(unittest.TestCase):
+    """Review D4R-4: a promise closes her question only about her topic or its exact figure, and
+    a size word only beside the batch."""
+
+    def test_pitch_and_pivot_wording_is_no_answer(self):
+        for topic, text in (
+            ("job_search", "I'll send you the details of the program. So what's your role?"),
+            ("mentor_time", "Let me share some details about our course."),
+            ("payment", "I'll email you the brochure with all the details. Anyway, what's your budget?"),
+            ("weekly_hours", "Let me check, what number of hours can you give?"),
+            ("class_size", "There's a small registration fee, let me explain the price."),
+            ("class_size", "We'll put everything in writing for you. What's your role?"),
+        ):
+            self.assertFalse(r1_roleplay.answers_in_kind(topic, text), text)
+
+    def test_a_promise_about_her_topic_or_the_exact_figure_answers_it(self):
+        for topic, text in (
+            ("class_size", "The team will confirm the exact batch size in writing."),
+            ("payment", "I'll email you the monthly payment plan tonight."),
+            ("mentor_time", "Let me check how many mentor hours you get and get back to you."),
+            ("class_size", "Batches are kept fairly small so mentors can engage with everyone."),
+            ("class_size", "It's very small, like an intimate group."),
+        ):
+            self.assertTrue(r1_roleplay.answers_in_kind(topic, text), text)
+
+    def test_a_dodge_with_a_brochure_promise_still_gets_the_come_back(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.reply = "How many people are in a batch, roughly?"
+        s.say("Happy to help with any questions.", 40)
+        s.reply = "Okay."
+        s.say("I'll send you the details later. It's very flexible. How many hours can you give?", 60)
+        self.assertIsNotNone(s.eng._open_q)
+
+
+class D4ReviewLastPointExitTests(unittest.TestCase):
+    """Review D4R-5: after her last point Christy comes back with her name and a thanks."""
+
+    def test_every_last_point_ending_uses_the_farewell_form(self):
+        s = settled_session()
+        for answer in ("exit", "quiet", "auto"):
+            s.eng._last_point = {"move_id": "F4-PRIMARY", "answer": answer}
+            s.eng.end_confirmed = True
+            self.assertEqual(s.eng.exit_kind(), r1_roleplay.EXIT_FAREWELL, answer)
+        self.assertIn("Christy again", line("L-EXIT-WRAP-2"))
+        self.assertIn("thanks", line("L-EXIT-WRAP-2"))
+
+
+class D4ReviewWideReaderTests(unittest.TestCase):
+    """Review D4R-6: the wide goodbye readers want a real goodbye, not the words inside a sentence."""
+
+    def test_her_stalls_and_questions_are_no_closer(self):
+        for text in (
+            "I'll talk tomorrow with my husband and let you know.",
+            "I'm looking forward to talking to the mentors.",
+            "I'll speak to you then about the EMI, but what about refunds?",
+        ):
+            self.assertFalse(r1_text.is_closer(text, wide=True), text)
+
+    def test_her_goodbyes_are_still_closers(self):
+        for text in (
+            "Good night, and thanks again.",
+            "Okay, talk to you tomorrow at seven.",
+            "Thanks so much, looking forward to tomorrow at seven.",
+            "See you then, Rahul.",
+        ):
+            self.assertTrue(r1_text.is_closer(text, wide=True), text)
+
+    def test_his_last_sentence_must_take_leave(self):
+        for text in ("Nice to see you again.", "I can see you there.", "We can talk later today."):
+            self.assertFalse(r1_roleplay.ends_on_farewell(text, wide=True), text)
+        for text in (
+            "Okay, talk tomorrow at 7 pm.",
+            "See you then, Meera.",
+            "Great, so we'll talk tomorrow at seven.",
+            "Thanks, Meera, talk soon.",
+        ):
+            self.assertTrue(r1_roleplay.ends_on_farewell(text, wide=True), text)
+
+
+class D4ReviewFarewellRunTests(unittest.TestCase):
+    """Review D4R-7: two plain thanks in a row are acknowledgements, not a goodbye run."""
+
+    def terse(self):
+        s = settled_session()
+        s.eng._commitment_level = Level.MEDIUM
+        s.eng._wrap_offers.extend({"trigger": "x", "answer": "no", "r_sec": 0.0} for _ in range(2))
+        return s
+
+    def test_two_thanks_do_not_end_the_role_play(self):
+        s = self.terse()
+        s.say("Yes, thanks.", 870)
+        plan = s.say("Sure, thank you.", 885)
+        self.assertNotIn("farewell_run_exit", plan.reasons)
+        self.assertIsNot(plan.mode, TurnMode.EXIT)
+
+    def test_a_run_with_a_real_leave_taking_still_ends_it(self):
+        s = self.terse()
+        first = s.say("You're welcome. See you.", 870)
+        self.assertIsNot(first.mode, TurnMode.EXIT)
+        second = s.say("Okay, thank you.", 885)
+        self.assertIs(second.mode, TurnMode.EXIT)
+        self.assertIn("farewell_run_exit", second.reasons)
+        s = self.terse()
+        s.say("Okay, thank you.", 870)
+        self.assertIn("farewell_run_exit", s.say("Sure, take care.", 885).reasons)

@@ -695,8 +695,12 @@ _FAREWELL_RESCUE = re.compile(
 
 # Simulation diagnosis 4 (D4-GOODBYE1, R1_FAREWELL_READ_V3): "Talk tomorrow at seven.", "See you
 # then, Meera." and "Night now." end on a farewell too (a clock time and a name may follow).
+# Review D4R-6: the farewell opens its sentence or clause (after "okay", "so", "we'll" and their
+# kin), so "Nice to see you again.", "I can see you there." and "We can talk later today." are none.
 _FAREWELL_END_V3 = re.compile(
-    r"\b(?:good ?night|night now|(?:talk|speak)(?: to you)? (?:soon|tomorrow|then|later|"
+    r"(?:^|[,;-]\s*)(?:(?:okay|ok|alright|all right|great|sure|perfect|right|so|and|then|yes|"
+    r"yeah|cool|wonderful|lovely|fine|thanks|thank you)[,\s]+)*(?:(?:i|we)(?:'ll| will) )?"
+    r"(?:good ?night|night now|(?:talk|speak)(?: to you)? (?:soon|tomorrow|then|later|"
     r"next week|on \w+day)|see you(?: (?:tomorrow|then|soon|later|next week|on \w+day))?)"
     r"(?:" + TIME_TAIL + r")?(?:[\s,-]+[a-z']{2,15})?\W*$",
     re.IGNORECASE,
@@ -706,17 +710,61 @@ _FAREWELL_END_V3 = re.compile(
 # D4-COMEBACK1 (R1_COME_BACK_V2): an answer in kind ("kept fairly small", "not a lecture hall",
 # "one-on-one") to her class-size question, or a promise to confirm the detail (in writing, by
 # e-mail, "I'll get back to you on the exact ..."), answers it; neither is a dodge to press on.
+# Review D4R-4: the size word sits beside the batch ("batches are kept small", "a small group"; "a
+# small registration fee" is no answer), and the promise names her topic or its exact figure in a
+# sentence that asks nothing ("I'll send you the details of the program. So what's your role?" is a
+# pivot, and she still comes back to what he dodged).
 _SIZE_IN_KIND = re.compile(
     r"\b(?:small|smaller|intimate|tight-?knit|a (?:few|couple of) dozen|a handful|not (?:huge|big|"
     r"large|massive)|lecture hall|one[- ]on[- ]one|1:1|personal attention|cozy|cosy)\b",
     re.IGNORECASE,
 )
-_CONFIRM_LATER = re.compile(
-    r"\b(?:confirm|send|share|email|e-mail|mail|get back to you|check)\b[^.?!]{0,50}\b(?:exact|"
-    r"details?|number|size|figure|in writing|by e-?mail|over e-?mail)\b"
-    r"|\bin writing\b",
+_SIZE_GROUP = re.compile(
+    r"\b(?:batch|batches|class|classes|cohort|cohorts|group|groups|size|sizes|room|people|"
+    r"students|learners|participants|lecture hall)\b",
     re.IGNORECASE,
 )
+SIZE_NEAR_CHARS = 40
+_CONFIRM_LATER = re.compile(
+    r"\b(?:confirm|send|share|email|e-mail|mail|get back to you|check|find out|look (?:it|that) up)"
+    r"\b",
+    re.IGNORECASE,
+)
+CONFIRM_NEAR_CHARS = 60
+# What each open-question topic is about, for a promise to confirm it.
+_CONFIRM_TOPIC = {
+    "format": r"format|live|recorded|recordings?|classes|sessions?|schedule|timings?",
+    "build": r"projects?|portfolio|hands-on|capstone|build",
+    "payment": r"payments?|instal?lments?|emi|monthly|per month|a month|financing|loan|plans?",
+    "mentor_time": r"mentors?|mentoring|mentorship|one[- ]on[- ]one|1:1",
+    "weekly_hours": r"hours|weekly|per week|a week|time commitment|workload",
+    "class_size": r"batch|batches|class size|cohort|group|size|students|learners|people",
+    "prerequisites": r"prerequisites?|background|level|preparation|prep|requirements?",
+    "job_search": r"job|jobs|placements?|career|interviews?|hiring|job search",
+    "fall_behind": r"catch(?:ing)? up|behind|miss(?:ed)?|recordings?|backup",
+}
+_CONFIRM_EXACT = r"exact|exactly|precise|specific"
+
+
+def _promises_her_topic(topic: str, sentence: str) -> bool:
+    """Review D4R-4: ``sentence`` promises to confirm ``topic`` or its exact figure."""
+    words = _CONFIRM_TOPIC.get(topic)
+    target = _CONFIRM_EXACT + (("|" + words) if words else "")
+    pattern = re.compile(r"\b(?:" + target + r")\b", re.IGNORECASE)
+    for match in _CONFIRM_LATER.finditer(sentence):
+        if pattern.search(sentence[match.end(): match.end() + CONFIRM_NEAR_CHARS]) is not None:
+            return True
+    return False
+
+
+def _size_beside_group(sentence: str) -> bool:
+    """Review D4R-4: a size word within ``SIZE_NEAR_CHARS`` of a batch word."""
+    for match in _SIZE_IN_KIND.finditer(sentence):
+        start = max(0, match.start() - SIZE_NEAR_CHARS)
+        window = sentence[start: match.end() + SIZE_NEAR_CHARS]
+        if _SIZE_GROUP.search(window) is not None:
+            return True
+    return False
 
 
 # D4-FRAG1 (R1_DECIDER_SPACING): "Is the decision mostly yours, or does your husband weigh in on the
@@ -744,10 +792,14 @@ def asks_decider_wide(text: object) -> bool:
 def answers_in_kind(topic: str, text: object) -> bool:
     """D4-COMEBACK1: ``text`` answers her open question without a figure, or promises to confirm
     it; either closes the question (no come-back)."""
-    folded = fold(text)
-    if _CONFIRM_LATER.search(folded) is not None:
-        return True
-    return topic == "class_size" and _SIZE_IN_KIND.search(folded) is not None
+    for sentence in split_sentences(fold(text)):
+        if "?" in sentence or is_question_like(sentence):
+            continue
+        if _promises_her_topic(topic, sentence):
+            return True
+        if topic == "class_size" and _size_beside_group(sentence):
+            return True
+    return False
 
 
 def ends_on_farewell(text: object, *, wide: bool | None = None) -> bool:
@@ -1043,6 +1095,15 @@ EXIT_ASIDE = "aside"
 # D4-GOODBYE1: this many farewell or courtesy advisor turns in a row end the role-play once the
 # commitment is on record (or she said goodbye) and R >= 14:00.
 FAREWELL_RUN_EXIT = 2
+# Review D4R-7: a run ends the role-play only when one of its turns really took leave ("bye", "good
+# night", "see you", "talk tomorrow"); "Yes, thanks." and "Sure, thank you." twice are the advisor
+# acknowledging her follow-up questions.
+_REAL_LEAVE_TAKING = re.compile(
+    r"\b(?:bye|goodbye|good ?night|night now|take care|see you|cheers|all the best|"
+    r"have a (?:nice|good|great|lovely) (?:day|evening|night|one|weekend)|"
+    r"(?:talk|speak)(?: to you)? (?:soon|tomorrow|then|later))\b",
+    re.IGNORECASE,
+)
 # D4-DECIDER1: the owed F4 push waits this many exchanges after a reply that voiced the decider
 # stall, unless its deadline is this close.
 DECIDER_HOLD_TURNS = 3
@@ -1583,6 +1644,7 @@ class RolePlayEngine:
         self._exit_via_close = False
         self._end_explicit = False
         self._farewell_run = 0
+        self._farewell_run_real = False
         self._farewell_run_exits = 0
         self._decider_voiced_turn: int | None = None
         self._decider_holds = 0
@@ -3391,6 +3453,11 @@ class RolePlayEngine:
             or ends_on_farewell(reading, wide=True)
         )
         self._farewell_run = self._farewell_run + 1 if farewellish else 0
+        # Review D4R-7: one turn of the run must take leave, not only thank her.
+        real = farewellish and _REAL_LEAVE_TAKING.search(fold(reading)) is not None
+        self._farewell_run_real = farewellish and (
+            real or (self._farewell_run > 1 and self._farewell_run_real)
+        )
         settled = (
             self.scheduler.commitment_resolved
             or self._commitment_level is not None
@@ -3398,6 +3465,7 @@ class RolePlayEngine:
         )
         return (
             self._farewell_run >= FAREWELL_RUN_EXIT
+            and self._farewell_run_real
             and r_sec >= EARLY_CLOSE_BEFORE_SEC
             and settled
         )
@@ -3406,16 +3474,19 @@ class RolePlayEngine:
         """D4-EXIT1: how the role-play ended, for its one exit line (R1_EXIT_WRAP_V2).
 
         ``farewell`` (the advisor's goodbye, the close ladder or an early close taken after her
-        bye), ``aside`` (a yes to Christy's own question: the wrap offer, the early close, the
-        hang-up, the end aside, or the stop after her last point), ``end_request`` (the candidate
-        asked to stop and no question was needed) and ``time_cap`` (R 20:00 or the S cap)."""
+        bye, and the stop after her last point), ``aside`` (a yes to Christy's own question: the
+        wrap offer, the early close, the hang-up or the end aside), ``end_request`` (the candidate
+        asked to stop and no question was needed) and ``time_cap`` (R 20:00 or the S cap).
+
+        Review D4R-5: after her last point the learner (or the candidate in role) spoke last, so
+        Christy comes back with her name and a thanks (the farewell form), never the aside form."""
         if self._exit_via_close or self.exit_farewell:
             return EXIT_FAREWELL
         if self.wrap_accepted:
             return EXIT_ASIDE
         point = self._last_point
         if point is not None and point.get("answer") in ("exit", "quiet", "auto"):
-            return EXIT_ASIDE
+            return EXIT_FAREWELL
         if self.end_confirmed:
             return EXIT_END_REQUEST if self._end_explicit else EXIT_ASIDE
         if self.exit_requested:

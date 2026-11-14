@@ -406,10 +406,11 @@ MONEY_STRAIN = re.compile(
 
 
 # Simulation diagnosis 4 (D4-F3STOCK1, the guard's R1_F3_WORDING): "Six months is a real
-# commitment." opened the F3 objection in 11 of 41 calls; it is said once a call.
+# commitment." opened the F3 objection in 11 of 41 calls; it is said once a call.  Review D4R-1:
+# only that stock phrase ("a big commitment" is how an F2 or F4 line says it).
 PHRASE_REAL_COMMITMENT = "real_commitment"
 REAL_COMMITMENT = re.compile(
-    r"\b(?:is|that'?s|it'?s|that is|it is) (?:a )?(?:real|big|serious|huge) commitment\b",
+    r"\b(?:is|that'?s|it'?s|that is|it is) (?:a )?real commitment\b",
     re.IGNORECASE,
 )
 
@@ -589,14 +590,36 @@ CLOSER_V3 = re.compile(
 )
 
 
+# Review D4R-6: what may follow a wide goodbye in its sentence (a name, courtesy, a time word):
+# "Good night, Rahul.", "Talk to you tomorrow at seven, take care."  Anything else ("talk tomorrow
+# with my husband and let you know", "looking forward to talking to the mentors") is no goodbye.
+_CLOSER_V3_TAIL = re.compile(
+    r"^(?:[\s,.!-]*(?:(?:and )?thanks?(?: you)?(?: so much)?(?: again)?(?: for everything)?|bye|"
+    r"goodbye|bye for now|take care|okay|ok|alright|then|now|for now|again|evening|night|morning|"
+    r"(?:have a )?(?:good|great|lovely|nice) (?:day|evening|night|one)|[A-Z][a-z']{1,15}))*"
+    r"[\s,.!-]*$"
+)
+
+
+def _closer_v3_in(folded: str) -> bool:
+    """Review D4R-6: a ``CLOSER_V3`` goodbye that ends its sentence (only a name or courtesy after
+    it), in a sentence that asks nothing."""
+    for sentence in split_sentences(folded):
+        if "?" in sentence:
+            continue
+        for match in CLOSER_V3.finditer(sentence):
+            if _CLOSER_V3_TAIL.match(sentence[match.end():]) is not None:
+                return True
+    return False
+
+
 def is_closer(text: object, *, wide: bool = False) -> bool:
     """True when ``text`` is the learner closing the call itself (``CLOSER``).
 
-    ``wide`` (D4-GOODBYE1): "good night", "talk tomorrow" and their kin as well (``CLOSER_V3``)."""
+    ``wide`` (D4-GOODBYE1): "good night", "talk tomorrow" and their kin as well (``CLOSER_V3``),
+    each only where it ends a sentence that asks nothing (review D4R-6)."""
     folded = fold(text)
-    return CLOSER.search(folded) is not None or (
-        wide and CLOSER_V3.search(folded) is not None
-    )
+    return CLOSER.search(folded) is not None or (wide and _closer_v3_in(folded))
 
 
 # ----------------------------------------------------------------------------------
