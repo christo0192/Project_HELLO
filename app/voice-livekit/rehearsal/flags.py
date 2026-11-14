@@ -59,9 +59,11 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
   on a live run, a scenario judged on one call only is a readiness reason (run at least 2 per
   scenario: one call moves an axis mean by a whole point's share, and one-sample swings are noise).
 * ``REHEARSAL_NEXT_STEP_V2`` (D5-HF-UNEARNED2): the advisor's next-step words also take "pencil (you)
-  in", a call, chat, meeting or session named by a day, the weekend, the morning or evening (or a
-  short / quick / follow-up one), "a(nother) ... call / chat / meeting", and "catch up over a call /
-  the phone".
+  in", "a(nother)" call, chat or meeting named by a closed qualifier (a day, the weekend, the morning,
+  afternoon or evening, phone, video, or a short / quick / brief / follow-up one; not "your Monday
+  meeting" or one the candidate already has), a named session only "for you", with a mentor or "put you
+  down for" (D5R-NS2-WILDCARD: "a smart call", "another sales call" and "every morning session" are no
+  asks), and "catch up over a call / the phone".
 """
 from __future__ import annotations
 

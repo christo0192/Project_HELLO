@@ -1084,6 +1084,103 @@ class FlowRound5Tests(unittest.TestCase):
             self.assertIn("christy_flow", table)
             self.assertEqual(before, {path: path.read_bytes() for path in root.rglob("*.json")})
 
+    def test_rejudge_turns_a_failed_judge_call_into_an_error_verdict_and_goes_on(self) -> None:
+        # D5R-REJUDGE-ABORT: one failed call (or a tripped budget) must not lose the other verdicts.
+        from rehearsal.flow_judge import FlowJudge
+        from rehearsal.llm import BudgetExceeded
+        from rehearsal.rejudge import rejudge_runs
+
+        class _Flaky(_FakeClient):
+            def __init__(self, answers, fail_at):
+                super().__init__(answers)
+                self.fail_at = dict(fail_at)
+
+            async def complete(self, messages, **kwargs):
+                index = len(self.calls)
+                if index in self.fail_at:
+                    self.calls.append({"messages": messages, **kwargs})
+                    raise self.fail_at[index]
+                return await super().complete(messages, **kwargs)
+
+        records = [self._judged(f"c{i}", "silent", christy_flow=4) for i in range(3)]
+        client = _Flaky([_verdict(christy_flow=5)], {0: RuntimeError("upstream 503 sk-abcdefghijkl"), 1: BudgetExceeded("over")})
+        seen = []
+        report = asyncio.run(
+            rejudge_runs([("int-live-5", records)], FlowJudge(client, "judge-model"), progress=seen.append)
+        )
+        per_call = report["runs"][0]["per_call"]
+        self.assertEqual([row["after"] for row in per_call][2]["christy_flow"], 5)
+        self.assertIsNone(per_call[0]["after"])
+        self.assertIsNone(per_call[1]["after"])
+        flows = report["runs"][0]["after_flow"]
+        self.assertEqual(flows[0]["status"], "error")
+        self.assertIn("RuntimeError", flows[0]["error"])
+        self.assertNotIn("sk-abcdefghijkl", flows[0]["error"])  # scrubbed
+        self.assertEqual(flows[1], {"source": "llm", "status": "error", "error": "BudgetExceeded"})
+        self.assertEqual(report["runs"][0]["after"]["means"]["christy_flow"], 5.0)
+        self.assertEqual(sorted(report["runs"][0]["after"]["unjudged"]), ["c0", "c1"])
+        self.assertEqual(len(seen), 3)  # the report is handed over after every record
+        self.assertTrue(seen[0]["partial"])
+        self.assertFalse(report["partial"])
+
+    def test_rejudge_skips_broken_or_empty_records_like_the_in_run_judge(self) -> None:
+        from rehearsal.flow_judge import FlowJudge
+        from rehearsal.rejudge import rejudge_runs
+
+        good = self._judged("good", "silent", christy_flow=4)
+        broken = _record(ROWS, seed="broken")
+        broken["error"] = "RuntimeError: the call broke"
+        empty = _record([], seed="empty")
+        client = _FakeClient([_verdict(christy_flow=5)])
+        report = asyncio.run(rejudge_runs([("int-live-4b", [good, broken, empty])], FlowJudge(client, "judge-model")))
+        self.assertEqual(len(client.calls), 1)
+        run = report["runs"][0]
+        self.assertEqual(run["skipped"], ["broken", "empty"])
+        self.assertEqual(run["before"]["judge_off"], run["after"]["judge_off"])
+        self.assertEqual(run["after"]["means"]["christy_flow"], 5.0)
+
+    def test_rejudge_main_writes_the_report_when_a_call_fails(self) -> None:
+        from unittest import mock
+
+        from rehearsal import rejudge
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / "int-live-5" / "silent" / "calls"
+            calls.mkdir(parents=True)
+            for i in range(2):
+                record = self._judged(f"c{i}", "silent", christy_flow=4)
+                (calls / f"full-silent-{i}.json").write_text(json.dumps(record), encoding="utf-8")
+
+            class _Judge:
+                def __init__(self, *_args):
+                    self.n = 0
+
+                async def judge(self, record):
+                    self.n += 1
+                    if self.n == 1:
+                        raise RuntimeError("timeout")
+                    return {"source": "llm", "status": "error", "error": "stub"}
+
+            class _Client:
+                def __init__(self, *_args):
+                    pass
+
+                async def aclose(self):
+                    pass
+
+            out = root / "out"
+            with mock.patch("rehearsal.flow_judge.FlowJudge", _Judge), \
+                    mock.patch("rehearsal.llm.HttpxDeepSeek", _Client), \
+                    mock.patch("rehearsal.llm.load_api_env", lambda: {"DEEPSEEK_API_KEY": "x" * 12}), \
+                    mock.patch("builtins.print"):
+                code = rejudge.main([str(root / "int-live-5"), "--out", str(out)])
+            self.assertEqual(code, 0)
+            saved = json.loads((out / "rejudge.json").read_text(encoding="utf-8"))
+            self.assertFalse(saved["partial"])
+            self.assertEqual(saved["runs"][0]["after_flow"][0]["status"], "error")
+            self.assertTrue((out / "rejudge.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

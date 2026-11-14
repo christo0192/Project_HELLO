@@ -2230,6 +2230,40 @@ class IterationTwoHarnessTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": text}), text)
 
+    def test_a_decision_call_or_a_class_description_is_no_ask_even_as_a_question(self) -> None:
+        # D5R-NS2-WILDCARD: these end in "?" or speak in the offering voice, so only the words decide.
+        # "call" as a decision, a past or sales call, a work meeting, and the way classes are described.
+        for text in (
+            "Honestly, joining this batch is a smart call, right?",
+            "Prices go up next month, so it is a wise call to decide now, no?",
+            "Was that a rough call with your manager?",
+            "Is this feeling like another sales call?",
+            "Do you have a team meeting every morning?",
+            "Is your Monday meeting the problem?",
+            "Do you have a Monday meeting at work?",
+            "I'll walk you through what a typical Saturday session looks like.",
+            "Every morning session is recorded, would that help?",
+            "I hear you, the weekday evening session timing is tough, right?",
+            "We run a weekend session every week, would that work around your shifts?",
+            "That was a good call, wasn't it?",
+        ):
+            for intent in ("pitch", "other"):
+                with self.subTest(text=text, intent=intent):
+                    self.assertFalse(metrics.advisor_asked_next_step({"intent": intent, "text": text}), text)
+
+    def test_a_named_call_or_a_session_for_you_still_earns_the_commitment(self) -> None:
+        # The closed qualifiers still take a real ask (synthetic text).
+        for text in (
+            "How about a quick phone call on Saturday morning?",
+            "Shall we fix a Saturday morning chat with your husband?",
+            "Would another weekend call help you both decide?",
+            "I'll put you down for a Sunday session.",
+            "Would a weekend session with one of our mentors help?",
+            "Can we try a short evening session for you this week?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(metrics.advisor_asked_next_step({"intent": "pitch", "text": text}), text)
+
     def test_off_restores_the_previous_next_step_words(self) -> None:
         import os
         from unittest import mock

@@ -17,10 +17,11 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from rehearsal import flags
 from rehearsal.flow_judge import AXES, flow_scores, flow_summary, rubric_text
+from rehearsal.llm import BudgetExceeded, InsufficientBalance, Scrubber, describe_error
 
 
 def load_runs(dirs: Sequence[Path | str]) -> list[tuple[str, list[dict[str, Any]]]]:
@@ -48,32 +49,74 @@ def _seed(record: Mapping[str, Any]) -> str:
     return str((record.get("header") or {}).get("seed"))
 
 
-async def rejudge_runs(runs: Sequence[tuple[str, Sequence[Mapping[str, Any]]]], judge: Any) -> dict[str, Any]:
-    """Ask ``judge`` (a ``FlowJudge``) once per record, on a copy; the means before and after per run."""
-    report: dict[str, Any] = {"rubric": rubric_info(), "runs": []}
+def judgeable(record: Mapping[str, Any]) -> bool:
+    """The in-run rule (``full.py``): only a call with rows and no error was ever flow-judged."""
+    return bool(record.get("rows")) and not record.get("error")
+
+
+async def judge_one(judge: Any, record: Mapping[str, Any], scrub: Callable[[object], str]) -> dict[str, Any]:
+    """One verdict; a failed call becomes an error verdict, as in the in-run judge (D5R-REJUDGE-ABORT)."""
+    try:
+        return await judge.judge(record)
+    except (InsufficientBalance, BudgetExceeded) as exc:
+        return {"source": "llm", "status": "error", "error": type(exc).__name__}
+    except Exception as exc:  # noqa: BLE001
+        return {"source": "llm", "status": "error", "error": describe_error(exc, scrub, 200)}
+
+
+def _run_entry(name: str, records: Sequence[Mapping[str, Any]], after: Sequence[Mapping[str, Any]],
+               skipped: Sequence[str]) -> dict[str, Any]:
+    done = list(records[: len(after)])
+    return {
+        "name": name,
+        "calls": len(records),
+        "done": len(after),
+        "skipped": list(skipped),
+        "before": flow_summary(done),
+        "after": flow_summary(after),
+        "after_flow": [new.get("flow") for new in after],
+        "per_call": [
+            {
+                "call": _seed(old),
+                "scenario": (old.get("header") or {}).get("scenario"),
+                "before": flow_scores(old),
+                "after": flow_scores(new),
+            }
+            for old, new in zip(done, after)
+        ],
+    }
+
+
+async def rejudge_runs(
+    runs: Sequence[tuple[str, Sequence[Mapping[str, Any]]]],
+    judge: Any,
+    *,
+    scrub: Callable[[object], str] | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Ask ``judge`` (a ``FlowJudge``) once per judgeable record, on a copy; the means before and after.
+
+    A record the in-run judge would not have judged (an error, no rows) is carried over unjudged, so
+    "before" and "after" cover the same calls.  A failed judge call is an error verdict and the run goes
+    on.  ``progress`` gets the report so far (``partial: True``) after every record.
+    """
+    scrub = scrub or Scrubber()
+    report: dict[str, Any] = {"rubric": rubric_info(), "partial": True, "runs": []}
     for name, records in runs:
-        after = []
+        after: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        report["runs"].append(_run_entry(name, records, after, skipped))
         for record in records:
             copy = json.loads(json.dumps(record))
-            copy["flow"] = await judge.judge(copy)
+            if judgeable(record):
+                copy["flow"] = await judge_one(judge, copy, scrub)
+            else:
+                skipped.append(_seed(record))
             after.append(copy)
-        report["runs"].append(
-            {
-                "name": name,
-                "calls": len(records),
-                "before": flow_summary(records),
-                "after": flow_summary(after),
-                "per_call": [
-                    {
-                        "call": _seed(old),
-                        "scenario": (old.get("header") or {}).get("scenario"),
-                        "before": flow_scores(old),
-                        "after": flow_scores(new),
-                    }
-                    for old, new in zip(records, after)
-                ],
-            }
-        )
+            report["runs"][-1] = _run_entry(name, records, after, skipped)
+            if progress is not None:
+                progress({**report, "runs": list(report["runs"])})  # a snapshot, not the live dict
+    report["partial"] = False
     return report
 
 
@@ -85,6 +128,14 @@ def _mean(summary: Mapping[str, Any], axis: str) -> str:
 def render_rejudge_markdown(report: Mapping[str, Any]) -> list[str]:
     rubric = report.get("rubric") or {}
     lines = ["# Flow re-judge", "", f"Rubric {rubric.get('sha256')} with switches {rubric.get('switches')}.", ""]
+    if report.get("partial"):
+        lines += ["PARTIAL: the re-judge has not finished; the means cover the records judged so far.", ""]
+    for run in report.get("runs") or []:
+        if run.get("skipped"):
+            lines.append(f"{run['name']}: {len(run['skipped'])} broken or empty call(s) carried over unjudged, "
+                         "as in the run.")
+    if any(run.get("skipped") for run in report.get("runs") or []):
+        lines.append("")
     lines += ["| run | calls | when | " + " | ".join(AXES) + " |", "|" + "---|" * (len(AXES) + 3)]
     for run in report.get("runs") or []:
         for when in ("before", "after"):
@@ -94,9 +145,9 @@ def render_rejudge_markdown(report: Mapping[str, Any]) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from rehearsal import llm
     from rehearsal.flow_judge import FlowJudge
     from rehearsal.full_run import DEFAULT_JUDGE_MODEL
-    from rehearsal.llm import HttpxDeepSeek, Ledger, MissingKey, load_api_env
 
     parser = argparse.ArgumentParser(prog="python -m rehearsal.rejudge")
     parser.add_argument("runs", nargs="+", help="run directories holding calls/*.json")
@@ -108,25 +159,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    ledger = llm.Ledger(budget_usd=args.budget_usd)
+    scrub: Callable[[object], str] = llm.Scrubber()
+    latest: dict[str, Any] = {}
+
+    def save(report: Mapping[str, Any]) -> str:
+        """Both files, scrubbed; written after every record so a stop never loses paid verdicts."""
+        full = {**report, "ledger": ledger.summary()}
+        latest.clear()
+        latest.update(full)
+        (out / "rejudge.json").write_text(
+            scrub(json.dumps(full, indent=1, default=str)), encoding="utf-8", newline="\n"
+        )
+        markdown = scrub("\n".join(render_rejudge_markdown(full)) + "\n")
+        (out / "rejudge.md").write_text(markdown, encoding="utf-8", newline="\n")
+        return markdown
+
     async def go() -> dict[str, Any]:
-        ledger = Ledger(budget_usd=args.budget_usd)
-        client = HttpxDeepSeek(load_api_env(), ledger)
+        nonlocal scrub
+        env = llm.load_api_env()
+        scrub = llm.Scrubber([env[llm.KEY_NAME]])
+        client = llm.HttpxDeepSeek(env, ledger)
         try:
-            report = await rejudge_runs(runs, FlowJudge(client, args.judge_model))
+            return await rejudge_runs(runs, FlowJudge(client, args.judge_model), scrub=scrub, progress=save)
         finally:
             await client.aclose()
-        report["ledger"] = ledger.summary()
-        return report
 
     try:
         report = asyncio.run(go())
-    except MissingKey as exc:
+    except llm.MissingKey as exc:
         print(f"STOPPED: {exc}")
         return 2
-    (out / "rejudge.json").write_text(json.dumps(report, indent=1, default=str), encoding="utf-8", newline="\n")
-    markdown = "\n".join(render_rejudge_markdown(report)) + "\n"
-    (out / "rejudge.md").write_text(markdown, encoding="utf-8", newline="\n")
-    print(markdown)
+    except BaseException:
+        if latest:  # what was judged before the stop is already on disk; say so
+            print(f"STOPPED after {sum(run.get('done', 0) for run in latest.get('runs') or [])} records; "
+                  f"partial report in {out}")
+        raise
+    print(save(report))
     return 0
 
 

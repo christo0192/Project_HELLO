@@ -285,7 +285,9 @@ an end request, her wrap-up offer and her early-end note are policy; OFF sends t
 `REHEARSAL_FLOW_MIN_REPS` (the flow summary counts judged calls per scenario, and a live scenario judged
 on one call is a readiness reason: run `--calls` at twice the scenario count or more) and
 `REHEARSAL_NEXT_STEP_V2` ("pencil you in", "a weekend call", "a Tuesday or Friday call", "a quick
-evening session" and "catch up over the phone" are next-step asks that earn a commitment).
+evening session with a mentor" and "catch up over the phone" are next-step asks that earn a commitment;
+the qualifier is a closed list, so "a smart call", "another sales call", "your Monday meeting" and
+"every morning session is recorded" are not).
 
 Two rounds scored by different rubrics are not comparable.  Judge saved records again, flow judge
 only (no candidate, Christy or learner call; the records are not written), under the current rubric:
@@ -293,6 +295,11 @@ only (no candidate, Christy or learner call; the records are not written), under
 ```
 python -m rehearsal.rejudge C:\tmp\m032-sim-runs\int-live-4b C:\tmp\m032-sim-runs\int-live-5 --out <dir> --budget-usd 1
 ```
+
+As in the run, only calls with rows and no error are judged (the others are carried over unjudged, so
+before and after cover the same calls), a failed judge call or a tripped budget becomes an error verdict
+and the rest go on, and `rejudge.json` / `rejudge.md` are rewritten after every record (`"partial":
+true` until the last one), so a stop never loses the verdicts already paid for.
 
 ## Adaptability scenarios and the flow judge (`--scenarios adapt`, D-M032-10)
 

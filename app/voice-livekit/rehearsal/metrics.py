@@ -1022,15 +1022,41 @@ _NEXT_STEP = re.compile(
 )
 # D5-HF-UNEARNED2 (``REHEARSAL_NEXT_STEP_V2``): more ways to ask for the next step.  "Shall I pencil
 # you in for a weekend slot?" and "shall I pencil in a weekend call with your husband?" earned a
-# commitment that the words above missed.  A session needs a qualifier ("a live session" alone is how a
-# class is described, not an ask); "call it a day" and "that call was rough" stay out.
+# commitment that the words above missed.  D5R-NS2-WILDCARD: the qualifier is a closed list (a free
+# middle word took "a smart call", "another sales call", "a team meeting"), a named call, chat or meeting
+# needs "a" / "another" before it ("your Monday meeting" is a fact, not an offer) and is not one the
+# candidate already has ("do you have a Monday meeting?"), and a named session needs "for you", a mentor
+# or "put you down for" ("a weekend session", "every morning session" is how a class is described).
+_NS_QUAL = (
+    r"(?:quick|short|brief|follow[- ]?up|weekend|phone|video|morning|evening|afternoon|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day)"
+)
+_NS_QUALS = rf"{_NS_QUAL}(?:(?: or| and)? {_NS_QUAL})?"
+_NS_ARTICLE = r"(?:a|an|another|one more)"
 _NEXT_STEP_V2 = re.compile(
-    r"\b(?:pencil (?:you |it |that |us )?in|"
-    r"(?:a|another|short|quick|brief|follow[- ]?up|weekend|\w+day|morning|evening) (?:\w+ )?(?:call|chat|meeting)|"
-    r"(?:short|quick|brief|follow[- ]?up|weekend|\w+day|morning|evening) (?:\w+ )?session|"
-    r"catch up (?:on|over) (?:a )?(?:call|the phone))\b",
+    rf"\b(?:pencil (?:you |it |that |us )?in|catch up (?:on|over) (?:a )?(?:call|the phone)|"
+    rf"put you down for {_NS_ARTICLE} {_NS_QUALS} session|"
+    rf"{_NS_ARTICLE} {_NS_QUALS} session (?:for you|with (?:a|an|one of our|our|my) "
+    rf"(?:mentors?|coach(?:es)?|counsell?ors?|advisors?|experts?|instructors?)))\b",
     re.IGNORECASE,
 )
+_NEXT_STEP_V2_NAMED_CALL = re.compile(rf"\b{_NS_ARTICLE} {_NS_QUALS} (?:call|chat|meeting)\b", re.IGNORECASE)
+# "Do you have a Monday meeting?" asks about a meeting the candidate already has.
+_ALREADY_HAS = re.compile(
+    r"\b(?:(?:do|did) you (?:have|had)|have you (?:got|had)|you (?:have|had|got)|there(?:'s| is| was))\s*$",
+    re.IGNORECASE,
+)
+
+
+def _next_step_v2(sentence: str) -> bool:
+    if _NEXT_STEP_V2.search(sentence) is not None:
+        return True
+    return any(
+        _ALREADY_HAS.search(sentence[: match.start()]) is None
+        for match in _NEXT_STEP_V2_NAMED_CALL.finditer(sentence)
+    )
+
+
 _OFFERING_VOICE = re.compile(
     r"\b(?:let'?s|i(?:'ll| will| can| could| would)|we(?:'ll| will| can| could| would)|shall|"
     r"how about|would you|do you want|want me to|can i|could i)\b",
@@ -1052,7 +1078,7 @@ def advisor_asked_next_step(advisor: Mapping[str, Any]) -> bool:
         return True
     for sentence in split_sentences(str(advisor.get("text") or "")):
         named = _NEXT_STEP.search(sentence) is not None or (
-            flags.on(flags.NEXT_STEP_V2) and _NEXT_STEP_V2.search(sentence) is not None
+            flags.on(flags.NEXT_STEP_V2) and _next_step_v2(sentence)
         )
         if named and ("?" in sentence or _OFFERING_VOICE.search(sentence) is not None):
             return True
