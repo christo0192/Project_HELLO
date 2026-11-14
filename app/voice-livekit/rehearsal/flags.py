@@ -25,6 +25,11 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
 * ``REHEARSAL_SAME_TURN_FRAGMENTS`` (integration, rambler): a candidate row the session saved with no
   span, written while the candidate's turn was still being said, is a fragment of that turn, not the
   candidate's next turn, when a check looks for the bot's reply to it.
+* ``REHEARSAL_FLOW_DESIGN_RULES`` (diagnosis-4 D4-H-POLICY1): the flow judge's rubric states the fixed
+  design rules (judge their wording and timing, never that they exist), its facts say who ended the
+  role-play and which graded families came before that, and evidence is asked only for lost points.
+* ``REHEARSAL_FLOW_NA_AXES`` (D4-H-SILENT1): a call with no learner line (no role-play) scores
+  learner_flow and objective_kept as null, and nulls stay out of the means, minimums and floor.
 """
 from __future__ import annotations
 
@@ -39,6 +44,8 @@ PROBE_VOCAB_V2 = "REHEARSAL_PROBE_VOCAB_V2"
 SAME_TURN_FRAGMENTS = "REHEARSAL_SAME_TURN_FRAGMENTS"
 CITED_MISFIRES = "REHEARSAL_CITED_MISFIRES"
 IB_REPEAT_INSISTED = "REHEARSAL_IB_REPEAT_INSISTED"
+FLOW_DESIGN_RULES = "REHEARSAL_FLOW_DESIGN_RULES"
+FLOW_NA_AXES = "REHEARSAL_FLOW_NA_AXES"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -51,6 +58,8 @@ def on(name: str) -> bool:
 __all__ = [
     "CITED_MISFIRES",
     "COMMIT_WINDOW",
+    "FLOW_DESIGN_RULES",
+    "FLOW_NA_AXES",
     "IB_REPEAT_INSISTED",
     "KEEP_CONTROL_ACTS",
     "LEARNER_CLOCK",
