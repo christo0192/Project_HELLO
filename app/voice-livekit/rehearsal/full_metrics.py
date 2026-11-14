@@ -615,7 +615,16 @@ def _closing_once(rows: Sequence[Mapping[str, Any]], phases: Sequence[str]) -> d
 
 
 def _learner_after_exit(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    exit_index = next((i for i, row in enumerate(rows) if row.get("phase") == "roleplay_exit"), None)
+    # The learner's in-role goodbye can land inside roleplay_exit just before Christy's exit line
+    # (R1_FAREWELL_EXIT_V2), so "after the exit" starts at Christy's first exit row.
+    exit_index = next(
+        (
+            i
+            for i, row in enumerate(rows)
+            if row.get("phase") == "roleplay_exit" and row.get("voice") == "christy"
+        ),
+        None,
+    )
     if exit_index is None:
         return {"ok": None}
     late = [row for row in rows[exit_index:] if row.get("voice") == "learner"]

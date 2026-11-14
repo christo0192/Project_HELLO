@@ -1246,6 +1246,21 @@ class PhaseCheckTests(unittest.TestCase):
         self.assertTrue(checks["end_consent"]["ok"], checks["end_consent"])
         self.assertEqual(checks["end_consent"]["requests"][0]["exit_basis"], "names_the_end")
 
+    def test_the_learner_in_role_goodbye_before_the_exit_line_is_not_late(self) -> None:
+        from rehearsal.full_metrics import phase_checks
+
+        goodbye = [
+            _row("candidate", "candidate", "roleplay", "Thanks, bye for now.", 900.0, act="farewell"),
+            _row("bot", "learner", "roleplay_exit", "Thank you, bye!", 903.0),
+            _row("bot", "christy", "roleplay_exit", "Let's pause the role-play here.", 906.0),
+        ]
+        checks = phase_checks(self._record(goodbye, stop="end_request", r_end=906.0))["checks"]
+        self.assertTrue(checks["learner_after_exit"]["ok"], checks["learner_after_exit"])
+        late = goodbye + [_row("bot", "learner", "roleplay_exit", "Oh, one more thing.", 910.0)]
+        checks = phase_checks(self._record(late, stop="end_request", r_end=910.0))["checks"]
+        self.assertFalse(checks["learner_after_exit"]["ok"])
+        self.assertEqual(checks["learner_after_exit"]["learner_lines_after_exit"], 1)
+
     def test_the_start_must_match_the_scenario_and_never_fall_back_to_the_button(self) -> None:
         from rehearsal.full_metrics import phase_checks
 
