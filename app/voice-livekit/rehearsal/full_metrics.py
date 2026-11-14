@@ -779,7 +779,7 @@ def build_full_scorecard(
     records: Sequence[Mapping[str, Any]], *, offline: bool, header: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
     """The role-play scorecard of the calls that reached a role-play, plus the per-phase checks."""
-    from rehearsal.flow_judge import flow_summary
+    from rehearsal.flow_judge import flow_summary, single_call_reason
     from rehearsal.scorecard import build_scorecard
 
     with_roleplay = [record for record in records if record.get("exchanges")]
@@ -804,6 +804,9 @@ def build_full_scorecard(
             reasons.append(f"{len(flow['unjudged'])} call(s) without a flow verdict")
         if not flow["judged"]:
             reasons.append("no call has a flow verdict")
+        thin = single_call_reason(flow)
+        if thin:
+            reasons.append(thin)
     return {
         "header": dict(header or {}),
         "tier": "full",

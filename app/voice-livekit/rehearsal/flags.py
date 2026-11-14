@@ -51,6 +51,19 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
   matching turn, and a run of one or two words only to the turn in progress.
 * ``REHEARSAL_BACKCHANNEL_GAP`` (D4-H-REPLAY1): after a replayed icebreaker backchannel ("thanks") the
   candidate answers the question it still owes after at most 10 s of silence.
+* ``REHEARSAL_FLOW_AGENDA_RULES`` (diagnosis-5 D5-JUDGE1): the flow judge's design rules also say that
+  the opening agenda's "about thirty minutes" (the interview) and "up to twenty" (the role-play) are
+  both right, and that Christy's one confirming ask on an end request that does not name the end, her
+  wrap-up offer and her early-end note are policy.  OFF sends the round-5 rubric (``RUBRIC_V2``).
+* ``REHEARSAL_FLOW_MIN_REPS`` (D5-JUDGE1): the flow summary counts the judged calls per scenario and,
+  on a live run, a scenario judged on one call only is a readiness reason (run at least 2 per
+  scenario: one call moves an axis mean by a whole point's share, and one-sample swings are noise).
+* ``REHEARSAL_NEXT_STEP_V2`` (D5-HF-UNEARNED2): the advisor's next-step words also take "pencil (you)
+  in", "a(nother)" call, chat or meeting named by a closed qualifier (a day, the weekend, the morning,
+  afternoon or evening, phone, video, or a short / quick / brief / follow-up one; not "your Monday
+  meeting" or one the candidate already has), a named session only "for you", with a mentor or "put you
+  down for" (D5R-NS2-WILDCARD: "a smart call", "another sales call" and "every morning session" are no
+  asks), and "catch up over a call / the phone".
 """
 from __future__ import annotations
 
@@ -73,6 +86,9 @@ OPEN_INVITE = "REHEARSAL_OPEN_INVITE"
 REPEAT_IF_UNANSWERED = "REHEARSAL_REPEAT_IF_UNANSWERED"
 CONTINUED_ROWS = "REHEARSAL_CONTINUED_ROWS"
 BACKCHANNEL_GAP = "REHEARSAL_BACKCHANNEL_GAP"
+FLOW_AGENDA_RULES = "REHEARSAL_FLOW_AGENDA_RULES"
+FLOW_MIN_REPS = "REHEARSAL_FLOW_MIN_REPS"
+NEXT_STEP_V2 = "REHEARSAL_NEXT_STEP_V2"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -89,11 +105,14 @@ __all__ = [
     "COMMIT_WINDOW",
     "CONTINUED_ROWS",
     "DIG_RELEASED",
+    "FLOW_AGENDA_RULES",
     "FLOW_DESIGN_RULES",
+    "FLOW_MIN_REPS",
     "FLOW_NA_AXES",
     "IB_REPEAT_INSISTED",
     "KEEP_CONTROL_ACTS",
     "LEARNER_CLOCK",
+    "NEXT_STEP_V2",
     "OPEN_INVITE",
     "PROBE_VOCAB_V2",
     "REPEAT_IF_UNANSWERED",
