@@ -13011,6 +13011,18 @@ class TestConsentEchoAtPickup(R1TestCase):
         )
         await self.drain_cancel(run)
 
+    async def test_an_advisor_opening_that_ends_in_let_s_begin_is_answered(self) -> None:
+        # Review of PR #429 (A1): the wide consent reading took "Hi Meera! Okay, let's begin."
+        # (committed inside the echo window) for the late consent and the learner said nothing.
+        run = await self.run_to_roleplay()
+        with self.capture_logs() as logs:
+            suppressed = await self.commit_turn(
+                "Hi Meera! Okay, let's begin.", agent=R1Agent(run.interview)
+            )
+        self.assertFalse(suppressed)
+        self.assertNotIn("r1_consent_echo_dropped", error_types(logs))
+        await self.drain_cancel(run)
+
     async def test_with_the_flag_off_the_consent_is_a_role_play_turn(self) -> None:
         with mock.patch.dict(os.environ, {"R1_CONSENT_ECHO_DROP": "0"}):
             run = await self.run_to_roleplay()

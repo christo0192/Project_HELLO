@@ -5463,12 +5463,19 @@ class R1Interview:
         """D3-PICKUP1 (``R1_CONSENT_ECHO_DROP``): a role-play turn that is only the late commit of
         the consent heard before the pickup: a consent (``is_transition_consent``) on a candidate
         row from before the pickup, or committed within ``ROLEPLAY_CONSENT_ECHO_SECONDS`` of its
-        end.  An advisor's real opening is never a consent, and a "ready" said later is theirs."""
+        end.  An advisor's real opening is never a consent, and a "ready" said later is theirs.
+
+        Review of PR #429 (A1): only the STRICT reading counts here (a start phrase with nothing
+        but filler around it), never ``R1_CONSENT_WIDE``'s: "Hi Meera! Okay, let's begin." is an
+        advisor's opening, and dropping it left the role-play's first 20 s silent."""
+        folded = fold_speech(text) if text else ""
         if (
             not consent_echo_drop_enabled()
             or self.machine.phase is not R1Phase.ROLEPLAY
-            or not text
-            or not is_transition_consent(text)
+            or not folded
+            or is_short_yes(text)
+            or is_acknowledgement_turn(text)
+            or not _is_strict_consent(folded)
         ):
             return False
         cutoff = self._pickup_cutoff_index
