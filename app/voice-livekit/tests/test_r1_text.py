@@ -573,7 +573,7 @@ class IterationThreeTextTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(is_closer(text), text)
         for text in (
-            "I'll think it over and get back to you.",
+            "I'll think this through and then get back to you.",
             "What would I actually build in the course?",
             "Thanks, that helps with the schedule worry.",
             "I need to talk to my husband first.",
@@ -651,6 +651,487 @@ class FinalReviewRoundOnePhraseTests(unittest.TestCase):
             self.assertGreaterEqual(r1_guard.PHRASE_QUOTA[phrase], 1)
             self.assertGreaterEqual(r1_guard.PHRASE_WINDOW[phrase], 3)
 
+
+class ConcernThemeTests(unittest.TestCase):
+    """M032 S1 concern ledger: the themes the learner herself voiced (paraphrased session lines)."""
+
+    def test_each_theme_is_read_from_her_own_words(self):
+        from r1_text import (
+            CONCERN_OFFENDED,
+            CONCERN_PRESSURE,
+            CONCERN_THINK_OVER,
+            CONCERN_TRUST,
+            concern_themes,
+        )
+
+        cases = {
+            CONCERN_PRESSURE: (
+                "That is a lot of pressure for one phone call.",
+                "I don't like being rushed into something this big.",
+                "Saying this is my only chance doesn't sit right with me.",
+                "I just need some breathing room to weigh it.",
+                "I'd rather not be put on the spot like this.",
+            ),
+            CONCERN_OFFENDED: (
+                "Wow, that caught me off guard.",
+                "That left a sour taste, honestly.",
+                "That was pretty rude.",
+                "I'm a bit offended by that.",
+            ),
+            CONCERN_THINK_OVER: (
+                "I'll think this through and then get back to you.",
+                "I want to give it some proper thought on my end.",
+                "Let me sit with it for a bit.",
+                "I'd like to sleep on it.",
+                "I need to take some time on my own first.",
+            ),
+            CONCERN_TRUST: (
+                "I'd want to see some of that myself before trusting it.",
+                "Is there any proof that people actually get hired?",
+                "It sounds a little too good to be true.",
+            ),
+        }
+        for theme, texts in cases.items():
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertIn(theme, concern_themes(text))
+
+    def test_ordinary_lines_voice_no_theme(self):
+        from r1_text import concern_themes
+
+        for text in (
+            "Are the classes live or recorded?",
+            "My schedule is already packed, so six months worries me.",
+            "I'm not ready to decide today, maybe the next cohort.",
+            "I'd need to talk to my husband first.",
+            "$9,000 feels like a lot, can you do $7,000?",
+            "What happens if I fall behind?",
+            "That sounds helpful, thanks.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(concern_themes(text), frozenset())
+
+    def test_a_negated_or_inverted_line_voices_no_theme(self):
+        """Review S1-R3: a reassurance is no concern (else every later free reply is told she
+        already said it)."""
+        from r1_text import concern_themes
+
+        for text in (
+            "I'm not offended, it's fine.",
+            "I trust you on that.",
+            "I don't need proof, that makes sense.",
+            "You clearly have a good track record.",
+            "There's no hurry on my end.",
+            "I'm not in a rush, honestly.",
+            "You're not pressuring me at all.",
+            "I don't feel rushed.",
+            "No pressure on my side, I'm just curious.",
+            "That wasn't rude at all.",
+            "I don't need to think it over, it sounds good.",
+            "Okay, I'll get back to you on the timing question in a second.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(concern_themes(text), frozenset())
+
+    def test_a_negation_that_still_voices_the_concern_counts(self):
+        from r1_text import CONCERN_PRESSURE, CONCERN_TRUST, concern_themes
+
+        for text, theme in (
+            ("Please don't rush me.", CONCERN_PRESSURE),
+            ("So please don't pressure me like that.", CONCERN_PRESSURE),
+            ("I don't want to be pushed into anything.", CONCERN_PRESSURE),
+            ("I won't be pressured into this.", CONCERN_PRESSURE),
+            ("No, I just feel rushed.", CONCERN_PRESSURE),
+            ("I don't trust that yet.", CONCERN_TRUST),
+            ("I'm not sure I can trust those numbers.", CONCERN_TRUST),
+            ("I'd want proof before I commit.", CONCERN_TRUST),
+            ("I'd need to know your track record first.", CONCERN_TRUST),
+        ):
+            with self.subTest(text=text):
+                self.assertIn(theme, concern_themes(text))
+
+    def test_the_theme_readers_are_quick(self):
+        import time
+
+        from r1_text import concern_themes
+
+        start = time.perf_counter()
+        for text in ("pressure " * 5000, "see " * 5000 + "myself", "take some " * 4000, "a" * 50000):
+            concern_themes(text)
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+
+class LearnerVoiceReaderTests(unittest.TestCase):
+    """M032 S2 readers (SWEEP-3, SWEEP-4, SWEEP-12): steering and counts only, synthetic text."""
+
+    def test_ack_hinge_reads_a_token_reaction_turned_round(self):
+        from r1_text import ack_hinge
+
+        for text in (
+            "Sounds useful, but I'm unsure about cost.",
+            "That helps. But what if I can't keep up?",
+            "Makes sense. I keep hearing about layoffs though.",
+            "Good to hear, though I'm still unsure about the time.",
+            "Okay, but what about the cost?",
+            "I appreciate that, but it's still a lot for me.",
+            "The projects sound genuinely useful. But how much time would they take?",
+            "That's a generous offer, but I'd need to think.",
+            "Weekend classes sound manageable, but my lab runs late.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(ack_hinge(text))
+
+    def test_ack_hinge_leaves_her_own_contrasts_and_the_conflict_check_alone(self):
+        from r1_text import ack_hinge
+
+        for text in (
+            "I've applied on my own, but nothing's landed yet.",
+            "I saw $9,000 on the website, but you're saying ten?",
+            "I have a good job, but my hours are long.",
+            "That's not reasonable, but I understand why.",
+            "My days are packed. I'm not sure I could keep up.",
+            "What would I build in the course?",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(ack_hinge(text))
+
+    def test_reply_verdict_reads_a_judgement_of_their_answer(self):
+        from r1_text import reply_verdict
+
+        for text in (
+            "Fair enough.",
+            "Okay, that sounds reasonable.",
+            "Weekend classes sound manageable, but my lab runs late.",
+            "That's a generous offer.",
+            "Good to hear. What about the hours?",
+            "Having the recordings helps.",
+            "That makes sense.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(reply_verdict(text))
+
+    def test_reply_verdict_rejects_negated_and_quantity_forms(self):
+        from r1_text import reply_verdict
+
+        for text in (
+            "That's really not reasonable for me.",
+            "Nothing about this is reassuring.",
+            "None of that is helpful to me right now.",
+            "I do not think it is manageable with my job.",
+            "That's a fair bit more than I planned for.",
+            "It's a good chunk of money for me.",
+            "That's a great deal of money.",
+            "My schedule is packed most weeks.",
+            "How many hours a week would it take?",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(reply_verdict(text))
+
+    def test_doubt_opener_reads_the_replacement_tic(self):
+        from r1_text import doubt_opener
+
+        self.assertTrue(doubt_opener("My worry is the time it takes."))
+        self.assertTrue(doubt_opener("What worries me is falling behind."))
+        self.assertTrue(doubt_opener("So my main concern is the cost."))
+        self.assertFalse(doubt_opener("I worry a bit about the time."))
+        self.assertFalse(doubt_opener("Is that a worry for most people?"))
+
+    def test_not_deciding_reads_the_not_today_stall(self):
+        from r1_text import not_deciding
+
+        for text in (
+            "I'm not ready to commit to anything today.",
+            "I'd rather not commit to enrolling today.",
+            "I'd want to think it over before deciding anything.",
+            "I can\u2019t commit right now.",
+            "I can't commit right now.",
+            "I'm not going to decide today.",
+            "Good to hear. I'm not ready to commit to anything today, though.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(not_deciding(text))
+
+    def test_not_deciding_leaves_capacity_money_and_plans_alone(self):
+        from r1_text import not_deciding
+
+        for text in (
+            "I can't pay it all at once right now",
+            "I'm not ready to commit to six months yet",
+            "I'm not going to commit to anything I can't keep up with",
+            "I'd rather not enrol in the weekend batch yet, my weekends are packed",
+            "I'd put in the effort if I commit",
+            "Once I'm ready to decide, I'll call you",
+            "I can't commit that much time right now.",
+            "I can't commit to ten hours a week yet.",
+            "I'm not ready to commit the money right now.",
+            "I can't commit today to ten hours a week.",
+            "I'd have to take some time off work for the classes.",
+            "I need some time to finish my current project first, then the course.",
+            "I don't need to think it over.",
+            "Not today?",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(not_deciding(text))
+
+    def test_not_deciding_reads_the_common_stall_phrasings(self):
+        """Review S2R-5 and S2R-7: the phrasings a slipped stall comes in.  The time-or-money
+        exclusion reads only the stall's own object, so a sentence that also mentions hours or the
+        price elsewhere is still the stall."""
+        from r1_text import not_deciding
+
+        for text in (
+            "Let me sleep on it.",
+            "I'll think this through and then get back to you.",
+            "I need some time to think about it.",
+            "I can't give you an answer today.",
+            "I won't be signing up today.",
+            "I'm not going to decide on this call.",
+            "I'm not sure I can decide right away.",
+            "I don't want to decide today.",
+            "I won't be deciding today.",
+            "I'm not making any decision today.",
+            "I'm not in a position to decide today.",
+            "Not today, I need some time.",
+            "I'll need some time before I decide.",
+            "I'm not ready to decide yet, the price is still a lot for me.",
+            "Ten hours a week seems doable, but I'm not ready to decide today.",
+            "I'll get back to you.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(not_deciding(text))
+
+    def test_every_think_over_line_is_a_not_today_line(self):
+        """SWEEP-3: the think_over theme and the not-today stall share one reader, so a line that
+        voices the theme always sets the not-today stall too (the two never disagree)."""
+        from r1_text import CONCERN_THINK_OVER, concern_themes, not_deciding
+
+        for text, themed in (
+            ("Let me sleep on it.", True),
+            ("I want to think it over.", True),
+            ("I'd like to give it some proper thought.", True),
+            ("I need to take some time on my own first.", True),
+            ("I'll think this through and get back to you later.", True),
+            ("I need to think it over, the hours are a lot.", True),
+            ("I don't need to think it over.", False),
+            ("I'd have to take some time off work.", False),
+            ("That makes sense.", False),
+        ):
+            with self.subTest(text=text):
+                shared = CONCERN_THINK_OVER in concern_themes(text, shared_think_over=True)
+                self.assertEqual(shared, themed)
+                self.assertEqual(not_deciding(text), themed)
+        # R1_NO_COMMIT_LEDGER off: S1.5's own reader, exactly as before (its rollback).
+        self.assertNotIn(CONCERN_THINK_OVER, concern_themes("I'll get back to you."))
+        self.assertIn(
+            CONCERN_THINK_OVER, concern_themes("I'll get back to you.", shared_think_over=True)
+        )
+
+    def test_the_v2_tics_read_the_honest_clause_and_the_soft_tics(self):
+        from r1_text import (
+            TIC_ACTUALLY,
+            TIC_GENUINELY,
+            TIC_HONESTLY,
+            TIC_PROPERLY,
+            reply_tics,
+        )
+
+        self.assertIn(TIC_HONESTLY, reply_tics("I'll be honest, the fee worries me.", v2=True))
+        self.assertIn(TIC_HONESTLY, reply_tics("If I'm honest, it's a lot.", v2=True))
+        self.assertNotIn(
+            TIC_HONESTLY, reply_tics("I'll be honest with myself about it.", v2=True)
+        )
+        self.assertNotIn(TIC_HONESTLY, reply_tics("I'll be honest, the fee worries me."))
+        tics = reply_tics(
+            "What would I actually work on, genuinely? I'd think it through properly.", v2=True
+        )
+        self.assertEqual(tics[-3:], (TIC_ACTUALLY, TIC_GENUINELY, TIC_PROPERLY))
+        # Flag off: the release before (hmm and honestly only).
+        self.assertEqual(reply_tics("What would I actually work on?"), ())
+
+    def test_the_new_readers_are_linear(self):
+        import time
+
+        from r1_text import ack_hinge, doubt_opener, not_deciding, reply_tics, reply_verdict
+
+        start = time.perf_counter()
+        for text in (
+            "a" * 50000,
+            "not " * 12000,
+            "sounds good, " * 4000,
+            "I'm not ready to " * 3000,
+            "think it over " * 4000,
+            ", , , " * 8000,
+            "honest " * 8000,
+        ):
+            ack_hinge(text)
+            reply_verdict(text)
+            doubt_opener(text)
+            not_deciding(text)
+            reply_tics(text, v2=True)
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+class EndingsReaderTests(unittest.TestCase):
+    """M032 S3 readers of the learner's own lines (synthetic or paraphrased text only)."""
+
+    def test_her_real_sign_offs_end_the_line(self):
+        from r1_text import is_sign_off
+
+        for text in (
+            "Okay, I'll get back to you.",
+            "Thanks, I'll give it some proper thought on my end.",
+            "I think I'll take some time on my own.",
+            "Let me sit with it for a bit.",
+            "Let's leave it there for now, thank you.",
+            "I'll think it over and get back to you. Bye.",
+            "Thanks for your time.",
+            "Take care.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_sign_off(text))
+
+    def test_a_question_or_more_after_it_is_no_sign_off(self):
+        from r1_text import is_sign_off
+
+        for text in (
+            "I'll think it over, but what about the EMI?",
+            "I'll get back to you. How long is the trial?",
+            "I'll get back to you once I know more about the mentors and the projects.",
+            "I want to think it through before I decide anything about the price.",
+            "Let me think. The mentors sound good.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_sign_off(text))
+
+    def test_leaving_and_her_own_email_request(self):
+        from r1_text import LEARNER_EMAIL_REQUEST, LEAVE_TAKING, says_goodbye_or_sends
+
+        for text in ("I should go now.", "I need to get going.", "I've got to run.",
+                     "I have to hop off soon."):
+            with self.subTest(text=text):
+                self.assertIsNotNone(LEAVE_TAKING.search(text))
+        self.assertIsNone(LEAVE_TAKING.search("You should go through the syllabus."))
+        for text in ("Could you just e-mail me the details instead?", "Email me the brochure.",
+                     "Can you send those over?", "Maybe by email instead.",
+                     "Send the documents to my inbox."):
+            with self.subTest(text=text):
+                self.assertIsNotNone(LEARNER_EMAIL_REQUEST.search(text))
+        self.assertIsNone(LEARNER_EMAIL_REQUEST.search("Do you send weekly updates?"))
+        self.assertTrue(says_goodbye_or_sends("Okay, bye for now."))
+        self.assertTrue(says_goodbye_or_sends("I'll get back to you."))
+        self.assertFalse(says_goodbye_or_sends("That sounds useful."))
+
+    def test_the_readers_stay_linear(self):
+        import time
+
+        from r1_text import is_sign_off, says_goodbye_or_sends
+
+        for hostile in (
+            "I'll get back to you" + ", thanks" * 4000,
+            "let me " * 3000 + "think it over",
+            ". " * 5000 + "bye",
+            "i should " * 3000,
+        ):
+            start = time.perf_counter()
+            is_sign_off(hostile)
+            says_goodbye_or_sends(hostile)
+            self.assertLess(time.perf_counter() - start, 2.0)
+
+
+
+class CallOpeningReaderTests(unittest.TestCase):
+    """M032 SWEEP-9: who is calling, how she is, and her own who-is-this question."""
+
+    def test_caller_introduced(self):
+        from r1_text import CALLER_KNOWN, CALLER_NAME_ONLY, caller_introduced
+
+        for text, expected in (
+            ("Hey Alex, what's up?", ""),
+            ("Hi Alex, this is Sam, how are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, this is Sam from Interview Kick Start. How are you doing?", CALLER_KNOWN),
+            ("Hi, I'm calling about the form you filled in on our website.", CALLER_KNOWN),
+            ("Hi Alex, Interview Geek Start here.", CALLER_KNOWN),
+            ("Hello, this is IK.", CALLER_KNOWN),
+            ("Sam this side.", CALLER_NAME_ONLY),
+            ("Sam here, hi Alex.", CALLER_NAME_ONLY),
+            ("I'm reaching out about your interest in our courses.", CALLER_KNOWN),
+            ("Hi Alex, this is great.", ""),
+            ("Hello Alex, good morning!", ""),
+            ("Alex here?", ""),
+            # Review S7L-R1 (SWEEP-9): the commonest self-introductions.
+            ("Hello Alex, my name is Rahul.", CALLER_NAME_ONLY),
+            ("Hi Alex, my name is Sam. How are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, I'm Neha.", CALLER_NAME_ONLY),
+            ("Hi Alex, I'm Sam. How are you doing?", CALLER_NAME_ONLY),
+            ("Hey Alex, good evening, I am Rahul.", CALLER_NAME_ONLY),
+            ("Hello Alex, myself Sam. How are you?", CALLER_NAME_ONLY),
+            ("Hi, it's Neha.", CALLER_NAME_ONLY),
+            ("Hi Alex, Rahul calling.", CALLER_NAME_ONLY),
+            ("Priya speaking.", CALLER_NAME_ONLY),
+            ("I am Priya and I'm a senior advisor.", CALLER_NAME_ONLY),
+            ("hi alex this is priya", CALLER_NAME_ONLY),
+            ("hello, my name is priya, how are you?", CALLER_NAME_ONLY),
+            ("Hi Alex, this is Sam from Interview Kick-start.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from Interview Kickstarter.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from ik.", CALLER_KNOWN),
+            ("Hi Alex, this is Sam from Upgrade Academy.", CALLER_KNOWN),
+            ("Hi Alex, it's Alex?", ""),
+            ("Hi Alex, it's Monday.", ""),
+            ("Hi Alex, this is fine.", ""),
+            ("Hi Alex, I'm Fine.", ""),
+            ("I myself am not sure.", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(caller_introduced(text, names=("Alex",)), expected)
+
+    def test_asks_how_she_is(self):
+        from r1_text import asks_how_she_is
+
+        self.assertTrue(asks_how_she_is("Hi Alex, how are you doing?"))
+        self.assertTrue(asks_how_she_is("How's your day going so far?"))
+        for text in (
+            "Hi Alex, how are you doing with your studies?",
+            "How are you planning to pay for it?",
+            "How are you finding the course material?",
+            "Hey Alex, what's up?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(asks_how_she_is(text))
+
+    def test_asked_who_is_calling(self):
+        from r1_text import asked_who_is_calling
+
+        for text in ("Sorry, who's this?", "Sorry, who am I speaking with?", "Hi, who's calling?",
+                     "Sorry, which company is this?", "Sorry, where are you calling from?"):
+            with self.subTest(text=text):
+                self.assertTrue(asked_who_is_calling(text))
+        self.assertFalse(asked_who_is_calling("I'm good, thanks. And you?"))
+
+    def test_the_corpus_greetings_and_long_turns(self):
+        import json
+        import time
+
+        from r1_text import asks_how_she_is, caller_introduced
+
+        here = Path(__file__).resolve().parents[1]
+        texts = []
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            path = here / "tests" / "fixtures" / name
+            rows = path.read_text(encoding="utf-8").splitlines()
+            texts.extend(json.loads(row)["text"] for row in rows if row)
+        hits = [text for text in texts if asks_how_she_is(text)]
+        self.assertTrue(hits)
+        for text in hits:  # greetings only: each one opens the call
+            self.assertRegex(text, r"^(?:Hi|Hello|Hey)\b")
+        for text in ("this is " * 800, "Sam here " * 400, "how are you " * 300, "I'm " * 1000):
+            started = time.perf_counter()
+            caller_introduced(text[:4000], names=("Alex",))
+            asks_how_she_is(text[:4000])
+            self.assertLess(time.perf_counter() - started, 0.25)
 
 if __name__ == "__main__":
     unittest.main()

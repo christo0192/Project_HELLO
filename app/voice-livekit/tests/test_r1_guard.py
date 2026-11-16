@@ -920,14 +920,20 @@ class AckHygieneTests(unittest.TestCase):
         self.assertTrue(ledger.flagged)
 
     def test_only_hygiene_categories_are_outside_the_leak_categories(self):
-        self.assertEqual(
-            set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES),
-            {r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD},
-        )
-        self.assertEqual(
-            r1_guard.HYGIENE_CATEGORIES,
-            frozenset({r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD}),
-        )
+        # M032 S5: Christy's icebreaker praise is hygiene too.
+        # M032 SWEEP-17: a course length she was never told is hygiene, never posted to the gate.
+        # M032 SWEEP-26: so is Christy's hiring-team mention in the wrap-up (L-CLOSE names it).
+        hygiene = {
+            r1_guard.ACK_FORMAT,
+            r1_guard.REPEAT,
+            r1_guard.REOPEN,
+            r1_guard.MISREAD,
+            r1_guard.PRAISE,
+            r1_guard.COURSE_FACT,
+            r1_guard.HIRING_MENTION,
+        }
+        self.assertEqual(set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES), hygiene)
+        self.assertEqual(r1_guard.HYGIENE_CATEGORIES, frozenset(hygiene))
 
 
 def said_of(*sentences) -> tuple[str, ...]:
@@ -2112,8 +2118,8 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
                 result = guard_text(text, self.ctx(free_reply=True))
                 self.assertEqual(result.text, text, result.hits)
 
-    # Ship-gate round 1: ordinary talk about the decision maker, as a free reply to "how does your family
-    # feel about this?" (the reviewer's sentences; main speaks every one as said).
+    # Ship-gate round 1: ordinary talk about the decision maker, as a free reply to "how does your
+    # family feel about this?" (the reviewer's sentences; main speaks every one as said).
     ORDINARY_DECIDER_TALK = (
         "My husband doesn't care what time I study, as long as dinner happens.",
         "My husband wouldn't mind if I studied on weekends.",
@@ -2590,5 +2596,1730 @@ class LearnerS03GuardTests(unittest.TestCase):
         self.assertIn("over_budget_accepted", rules)
 
 
+class IcebreakerPraiseTests(unittest.TestCase):
+    """M032 S5 item 1: Christy never grades an answer in the getting-to-know-you part.
+
+    Owner's call fda9e9f6 (#3, #10, #13, #21): nearly every icebreaker reply opened with a verdict
+    ("... is solid experience", "... is a real asset", "That drive sounds useful") and no guard
+    looked, because feedback is only policed in the wrap-up.  The check is HYGIENE (counted, never
+    a leak, never posted) and only runs when the session turns it on (``praise_check``,
+    ``R1_INTERVIEWER_VOICE``).  The sentences here are synthetic.
+    """
+
+    PRAISE = (
+        "Eight years in insurance sales is solid experience.",
+        "Patience is a real asset in this work.",
+        "That persistence sounds useful.",
+        "That makes sense, it plays to your strengths.",
+        "That's impressive.",
+        "Impressive!",
+        "What a great achievement.",
+        "You clearly have a strong background in sales.",
+        "That shows real dedication.",
+        "Great answer.",
+        "Well done on hitting those numbers.",
+        "That's a big plus for this kind of work.",
+        "Your results sound outstanding.",
+        # Review of S5 (naturalness R7): verdict openers the first cut let through.
+        "That's an impressive streak.",
+        "That's a big achievement.",
+        "That's a solid number.",
+        "That's wonderful.",
+        "Perfect.",
+        "Nice one.",
+        "Good stuff.",
+    )
+    WARM = (
+        "Got it, so mostly inbound leads.",
+        "Thanks for sharing that.",
+        "That makes sense.",
+        "Okay, eight years in insurance, that's a long run.",
+        "Sounds like a busy day.",
+        "That sounds like a lot of calls to make.",
+        "No problem, we can skip that one.",
+        "Take your time.",
+        "I see.",
+        "Fair enough.",
+        "Good to know.",
+        "That sounds challenging.",
+        "Sounds like you enjoy talking to people.",
+        "That's a lot of variety.",
+        "That must have been a busy few years.",
+        "Right, so you were calling working parents.",
+        "Got it.",
+        "That's a big jump from teaching.",
+        "That's a long time in one company.",
+    )
+    QUESTION = "What does a normal working day look like for you?"
+
+    def on(self, phase="icebreaker", **kwargs) -> GuardContext:
+        return ctx(phase, praise_check=True, **kwargs)
+
+    def test_a_praise_sentence_is_dropped_and_the_question_stays(self):
+        for praise in self.PRAISE:
+            with self.subTest(praise=praise):
+                result = guard_text(f"{praise} {self.QUESTION}", self.on())
+                self.assertEqual(result.text, self.QUESTION)
+                self.assertEqual({hit.category for hit in result.hits}, {r1_guard.PRAISE})
+
+    def test_a_leading_praise_clause_is_cut_from_a_question(self):
+        result = guard_text("That's impressive, what made you move into edtech?", self.on())
+        self.assertEqual(result.text, "What made you move into edtech?")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        result = guard_text("What an impressive result, how did you get there?", self.on())
+        self.assertEqual(result.text, "How did you get there?")
+        # A question that only asks for an example keeps its words.
+        asked = "Could you share a great example of a deal you closed?"
+        self.assertEqual(guard_text(asked, self.on()).text, asked)
+        self.assertTrue(guard_text(asked, self.on()).clean)
+
+    def test_warm_acknowledgements_pass_untouched(self):
+        for phase in ("opening", "icebreaker"):
+            for warm in self.WARM:
+                with self.subTest(phase=phase, warm=warm):
+                    text = f"{warm} {self.QUESTION}"
+                    result = guard_text(text, self.on(phase))
+                    self.assertTrue(result.clean, [(h.category, h.rule) for h in result.hits])
+                    self.assertEqual(result.text, text)
+
+    def test_the_feedback_categories_do_not_fire_on_warm_acknowledgements(self):
+        for phase in ("roleplay_exit", "wrapup", "closing"):
+            for warm in self.WARM:
+                with self.subTest(phase=phase, warm=warm):
+                    self.assertNotIn("feedback", categories(warm, self.on(phase)))
+
+    def test_it_is_off_unless_the_session_turns_it_on_and_only_in_small_talk(self):
+        text = f"{self.PRAISE[0]} {self.QUESTION}"
+        self.assertEqual(guard_text(text, ctx("icebreaker")).text, text)  # the flag-off path
+        self.assertTrue(guard_text(text, ctx("icebreaker")).clean)
+        for phase in ("transition", "wrapup", "closing", "roleplay_exit"):
+            with self.subTest(phase=phase):
+                self.assertNotIn(r1_guard.PRAISE, categories(text, self.on(phase)))
+        # The learner may say whatever she likes about the advisor's course.
+        self.assertNotIn(r1_guard.PRAISE, categories("That's impressive.", self.on("roleplay")))
+
+    def test_praise_alone_falls_back_to_the_current_question_when_there_is_one(self):
+        restate = "What draws you to this role?"
+        result = guard_text("That's impressive.", self.on(interviewer_fallback=restate))
+        self.assertEqual(result.text, restate)
+        self.assertTrue(result.fallback_used)
+
+    def test_praise_alone_is_kept_rather_than_asking_them_to_repeat_themselves(self):
+        # Without a question to fall back on, "Sorry, what were you saying?" would be worse than
+        # the model's own line (the phone's lesson: never swap a natural line for a canned one).
+        result = guard_text("That's impressive.", self.on())
+        self.assertEqual(result.text, "That's impressive.")
+        self.assertNotEqual(result.text, FALLBACK_REPLY)
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_praise_is_hygiene_never_a_leak(self):
+        self.assertIn(r1_guard.PRAISE, r1_guard.CATEGORIES)
+        self.assertIn(r1_guard.PRAISE, r1_guard.HYGIENE_CATEGORIES)
+        self.assertNotIn(r1_guard.PRAISE, r1_guard.LEAK_CATEGORIES)
+        ledger = GuardLedger()
+        for praise in self.PRAISE:
+            ledger.record(guard_text(f"{praise} {self.QUESTION}", self.on()))
+        self.assertEqual(ledger.summary()["leak_hits"], 0)
+        self.assertFalse(ledger.flagged)
+
+    def test_a_fully_blocked_icebreaker_reply_restates_the_current_question(self):
+        # The plan's fallback replaces "Sorry, what were you saying?" (phone map, missed item).
+        restate = "What draws you to this role?"
+        blocked = "Great, let's move into the role-play now."
+        self.assertEqual(guard_text(blocked, ctx("icebreaker")).text, FALLBACK_REPLY)
+        self.assertEqual(
+            guard_text(blocked, ctx("icebreaker", interviewer_fallback=restate)).text, restate
+        )
+        # The learner's own fallbacks never change.
+        self.assertIn(
+            guard_text("", ctx("roleplay", interviewer_fallback=restate)).text, FALLBACK_REPLIES
+        )
+
+    def test_a_praising_sentence_that_also_leaks_counts_as_the_leak(self):
+        # Review of S5 (correctness R1): the praise cut ran first, so a sentence that praised AND
+        # leaked was logged as hygiene only, and the leak never reached the 3-hit gate.
+        restate = "What draws you to this role?"
+        for text, category in (
+            (f"Impressive answer, our rubric rewards that. {restate}", r1_guard.EVALUATION),
+            (f"Great answer, DeepSeek would agree. {restate}", r1_guard.VENDOR),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.on())
+                self.assertEqual(result.text, restate)
+                found = {hit.category for hit in result.hits}
+                self.assertIn(category, found)
+                self.assertNotIn(r1_guard.PRAISE, found)
+                ledger = GuardLedger()
+                ledger.record(result)
+                self.assertGreaterEqual(ledger.summary()["leak_hits"], 1)
+        # A sentence that only praises is still hygiene.
+        result = guard_text(f"That's impressive. {restate}", self.on())
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_a_praise_clause_after_an_acknowledgement_is_cut(self):
+        # Review of S5 (correctness R7): the clause loop stopped at the acknowledgement, so the
+        # commonest one-sentence verdict was spoken whole and never counted.
+        for text, kept in (
+            (
+                "Got it, that's solid experience, so what does a typical day look like?",
+                "Got it, so what does a typical day look like?",
+            ),
+            (
+                "Okay, six years is a real asset, what draws you to this role?",
+                "Okay, what draws you to this role?",
+            ),
+            (
+                "Thanks, that's impressive, what made you choose sales?",
+                "Thanks, what made you choose sales?",
+            ),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.on())
+                self.assertEqual(result.text, kept)
+                self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+
+    def test_an_asking_clause_without_a_question_mark_keeps_the_question(self):
+        # Review of S5 (correctness R6): "I'm curious what ..." asks; the praise before it goes,
+        # the question stays.  A request that names a quality ("a great result") is no praise.
+        result = guard_text(
+            "Got it. That's a strong background, and I'm curious what drew you to this role.",
+            self.on(),
+        )
+        self.assertEqual(result.text, "Got it. I'm curious what drew you to this role.")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        for asked in (
+            "Got it. I'd be curious to hear about a great result you've had with a customer.",
+            "Okay. I wonder what a great day at work looks like for you.",
+            "Right. Help me understand what a strong month looked like there.",
+        ):
+            with self.subTest(asked=asked):
+                result = guard_text(asked, self.on())
+                self.assertEqual(result.text, asked)
+                self.assertTrue(result.clean, [(h.category, h.rule) for h in result.hits])
+
+    def test_when_the_cut_leaves_no_question_the_current_question_follows(self):
+        # Review of S5 (correctness R6): an acknowledgement was spoken alone and the candidate
+        # waited for a question that never came.
+        restate = "What draws you to this role?"
+        result = guard_text(
+            "Got it. That's solid experience.", self.on(interviewer_fallback=restate)
+        )
+        self.assertEqual(result.text, f"Got it. {restate}")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.PRAISE])
+        # A reply that still asks something gets nothing added.
+        text = f"Got it. That's solid experience. {self.QUESTION}"
+        self.assertEqual(
+            guard_text(text, self.on(interviewer_fallback=restate)).text,
+            f"Got it. {self.QUESTION}",
+        )
+        # Nor does a reply whose praise was not cut, or one with no current question.
+        self.assertEqual(guard_text("Got it.", self.on(interviewer_fallback=restate)).text,
+                         "Got it.")
+        self.assertEqual(guard_text("Got it. That's solid experience.", self.on()).text,
+                         "Got it.")
+
+    def test_the_detector_is_linear_on_long_input(self):
+        import time
+
+        long = ("solid " * 4000) + "experience " + ("is " * 4000) + "?"
+        start = time.perf_counter()
+        r1_guard.praise_detected(long)
+        r1_guard.without_praise(long)
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+
+class LearnerVoiceS2GuardTests(unittest.TestCase):
+    """M032 S2 in the guard: SWEEP-12's wider honesty tic and soft tics (``tic_v2``), SWEEP-4's
+    budget line without "though" (``voice_v2``), and SWEEP-13's careful-buyer reactions.  Every
+    line is synthetic."""
+
+    P1 = resolve_persona("p1_career_switcher", variant="v1")
+
+    def ctx(self, styles=(), **kwargs):
+        kwargs.setdefault("tic_v2", True)
+        kwargs.setdefault("free_reply", True)
+        return GuardContext(
+            phase="roleplay", persona=self.P1, mode="reply", seed="s", turn=4,
+            recent_styles=tuple(styles), **kwargs,
+        )
+
+    def test_ill_be_honest_is_the_honesty_tic_only_as_an_aside(self):
+        recent = [("i", ("honestly",))]
+        self.assertEqual(
+            guard_text("I'll be honest, the fee worries me.", self.ctx(recent)).text,
+            "The fee worries me.",
+        )
+        self.assertEqual(
+            guard_text("If I'm honest, it's a lot for me.", self.ctx(recent)).text,
+            "It's a lot for me.",
+        )
+        # The sentence itself, not an aside: kept.
+        text = "I'll be honest with myself about it."
+        self.assertEqual(guard_text(text, self.ctx(recent)).text, text)
+        # Flag off: the release before did not read "I'll be honest" at all.
+        text = "I'll be honest, the fee worries me."
+        self.assertEqual(guard_text(text, self.ctx(recent, tic_v2=False)).text, text)
+
+    def test_a_soft_tic_used_lately_is_taken_out_of_a_free_reply(self):
+        for tic, text, expected in (
+            ("actually", "What would I actually work on?", "What would I work on?"),
+            ("genuinely", "I'm genuinely unsure about the time.", "I'm unsure about the time."),
+            ("properly", "I need to weigh this properly.", "I need to weigh this."),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx([("i", (tic,))]))
+                self.assertEqual(result.text, expected)
+                self.assertEqual(result.soft_tic_trims, 1)
+                self.assertEqual(guard_text(text, self.ctx()).text, text)  # not used lately
+                off = guard_text(text, self.ctx([("i", (tic,))], tic_v2=False))
+                self.assertEqual(off.text, text)  # flag off: the release before
+                self.assertEqual(off.soft_tic_trims, 0)
+
+    def test_the_adjective_proper_and_a_properly_with_no_thinking_verb_stay(self):
+        recent = [("i", ("properly",))]
+        for text in ("I want to do it properly.", "I'll give it a proper look."):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(recent)).text, text)
+
+    def test_a_reply_that_carries_an_owed_move_keeps_its_words(self):
+        """A cut continuation credited to F3-PUSH: "actually help" is part of its proof."""
+        from r1_scheduler import F3_PUSH, SPEC_BY_ID, markers_match
+
+        text = "Would this actually help, given how few jobs there are?"
+        recent = [("i", ("actually",))]
+        kept = guard_text(text, self.ctx(recent, carries_move=True)).text
+        self.assertEqual(kept, text)
+        self.assertTrue(markers_match(SPEC_BY_ID[F3_PUSH].markers, kept))
+        intent = guard_text(text, self.ctx(recent, free_reply=False)).text
+        self.assertEqual(intent, text)  # an intent reply is never trimmed
+
+    def test_the_budget_line_drops_its_though_under_voice_v2(self):
+        text = "Okay, that's workable for me."
+        old = guard_text(text, ctx(monthly_quote_usd=1000)).text
+        new = guard_text(text, ctx(monthly_quote_usd=1000, voice_v2=True)).text
+        self.assertEqual(old, r1_guard.BUDGET_REPLACEMENT)
+        self.assertEqual(new, r1_guard.BUDGET_REPLACEMENT_V2)
+        self.assertNotIn("though", new)
+
+    def test_a_careful_buyers_reactions_pass_for_every_persona(self):
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                context = GuardContext(phase="roleplay", persona=rendered, mode="reply")
+                for line in (
+                    "Free? That surprises me. What's the catch?",
+                    "Wait, why is it so much lower than I expected?",
+                ):
+                    for sentence in line.replace("? ", "?\n").replace(". ", ".\n").splitlines():
+                        with self.subTest(persona=rendered.id, sentence=sentence):
+                            self.assertEqual(check_sentence(sentence, context), [])
+
+
+class ProbeFirstGuardTests(unittest.TestCase):
+    """M032 SWEEP-17 items 4 and 5 (``GuardContext.probe_first``, the engine's latched
+    R1_PROBE_FIRST): only figures that were said or are owed pass, and a course length the advisor
+    never said is dropped as hygiene.  Synthetic sentences."""
+
+    LENGTH_HITS = (
+        "I'm not sure I could keep up for six months.",
+        "I just know it's the data science course, roughly six months.",
+        "Six months is a long commitment for me, so what happens if I fall behind?",
+        "Can I really keep up for six months?",
+        "A six-month program is a lot for me.",
+    )
+    ALWAYS_CLEAN = (
+        "How long does the course run?",
+        "My contract renewal is decided in about six months.",
+        "My funding ends in about eight months.",
+        "I quit a free Python course after three weeks.",
+        "I've been applying for about three months",
+        "I could start in about two months",
+    )
+
+    def on(self, **kwargs):
+        return ctx(probe_first=True, **kwargs)
+
+    def test_the_website_price_is_no_longer_always_allowed(self):
+        sentence = "It was around $9,000 on the website."
+        self.assertIn("amount_off_card", {hit.rule for hit in check_sentence(sentence, self.on())})
+        self.assertEqual(check_sentence(sentence, self.on(allowed_extra=frozenset({9000}))), [])
+        self.assertEqual(check_sentence(sentence, self.on(advisor_amounts=frozenset({9000}))), [])
+        self.assertEqual(check_sentence(sentence, ctx()), [])  # flag off: the card's figure
+        for amount in (7000, 500, 700):
+            self.assertEqual(
+                check_sentence(f"I heard someone paid ${amount:,}.", self.on()), [], amount
+            )
+
+    def test_a_course_length_she_was_never_told_is_hygiene(self):
+        for sentence in self.LENGTH_HITS:
+            with self.subTest(sentence=sentence):
+                hits = check_sentence(sentence, self.on())
+                self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+                self.assertTrue(all(hit.category in r1_guard.HYGIENE_CATEGORIES for hit in hits))
+                self.assertEqual(check_sentence(sentence, self.on(advisor_durations=frozenset({6.0}))), [])
+                self.assertNotIn(
+                    "course_length_unsaid", {hit.rule for hit in check_sentence(sentence, ctx())}
+                )
+
+    def test_her_own_life_and_questions_without_a_figure_are_clean(self):
+        # (p1's quit course is a deep need; told, it is hers to say: the topic is released here.)
+        context = self.on(released_topics=frozenset({"H1", "H2", "H3"}))
+        for sentence in self.ALWAYS_CLEAN:
+            with self.subTest(sentence=sentence):
+                self.assertEqual(check_sentence(sentence, context), [])
+
+    def test_the_product_statement_with_an_unsaid_length_is_hygiene_not_a_leak(self):
+        sentence = "The course is about six months long."
+        hits = check_sentence(sentence, self.on())
+        self.assertEqual({hit.rule for hit in hits}, {"course_length_unsaid"})
+        self.assertEqual(check_sentence(sentence, ctx()), [])  # flag off: the card's length
+        said = self.on(advisor_durations=frozenset({6.0}))
+        self.assertEqual(check_sentence(sentence, said), [])
+
+    def test_weeks_and_half_a_year_are_read_as_months(self):
+        self.assertEqual(r1_guard.durations_said("a six-month program"), frozenset({6.0}))
+        self.assertEqual(r1_guard.durations_said("half a year"), frozenset({6.0}))
+        self.assertEqual(r1_guard.durations_said("24 weeks"), frozenset({5.54}))
+        weeks = self.on(advisor_durations=r1_guard.durations_said("It runs for 24 weeks."))
+        self.assertEqual(check_sentence("I'm not sure I could keep up for six months.", weeks), [])
+        eight = self.on(advisor_durations=frozenset({6.0}))
+        self.assertTrue(check_sentence("I'm not sure I could keep up for eight months.", eight))
+
+    def test_an_emptied_free_reply_asks_the_length_never_give_me_a_second(self):
+        context = self.on(free_reply=True, seed="s")
+        result = guard_text("I'm not sure I could keep up for six months.", context)
+        self.assertIn(result.text, r1_guard.LENGTH_PROBES)
+        intent = self.on(quiet_empty=True)
+        self.assertEqual(guard_text("I'm not sure I could keep up for six months.", intent).text, "")
+
+    # Review S2P-R1 (correctness): her own life's durations, paraphrased the way a model says them
+    # (uncontracted "It is ... until", "It will be ... before", "N months is a lot ... that's when"),
+    # are the deep-need reveals of p2, p3 and p4, never a course length.
+    OWN_LIFE = {
+        "p2_recent_grad": (
+            "It is about six months until my contract renewal is decided.",
+            "It will be six months before my contract renewal is decided.",
+            "Six months is not long, and that's when my contract renewal is decided.",
+            "Six months is all I have before the renewal decision.",
+        ),
+        "p3_data_analyst": (
+            "It is six to eight months until the next opening.",
+            "It will be six to eight months before the next opening.",
+        ),
+        "p4_research_scholar": (
+            "It is about eight months until my funding ends.",
+            "It will be eight months before my funding runs out.",
+            "Eight months is a lot less time than it sounds, that's when my funding ends.",
+        ),
+    }
+    OWN_LIFE_ANY = (
+        "It will take me two weeks to decide.",
+        "It will be twelve months before my visa comes through.",
+    )
+    # The same frames about the course still trip, for every persona.
+    COURSE_STILL_HITS = (
+        "It will take six months of evenings and weekends for me.",
+        "It would take six months before I could switch.",
+        "It is six months, which is a lot for me.",
+        "Six months is a long time with my job.",
+    )
+
+    def test_her_own_life_durations_pass_in_every_frame(self):
+        for persona_id, lines in self.OWN_LIFE.items():
+            persona = resolve_persona(persona_id, variant="v1")
+            context = self.on(persona=persona, released_topics=frozenset({"H1", "H2", "H3"}))
+            for sentence in (*lines, *self.OWN_LIFE_ANY):
+                with self.subTest(persona=persona_id, sentence=sentence):
+                    self.assertEqual(check_sentence(sentence, context), [])
+                    self.assertFalse(r1_guard.course_length_unsaid(sentence, persona=persona))
+        for sentence in self.OWN_LIFE_ANY:
+            self.assertFalse(r1_guard.course_length_unsaid(sentence))
+        for persona_id in self.OWN_LIFE:
+            persona = resolve_persona(persona_id, variant="v1")
+            for sentence in self.COURSE_STILL_HITS:
+                with self.subTest(persona=persona_id, sentence=sentence):
+                    self.assertTrue(r1_guard.course_length_unsaid(sentence, persona=persona))
+
+    def test_two_modifiers_before_long_still_trip_the_length_frame(self):
+        # Review S2P-R8 (naturalness): "a really long", "quite a long" got through.
+        for sentence in (
+            "Honestly, six months feels like a really long commitment for someone like me.",
+            "Six months is quite a long time.",
+            "Six months sounds like a very big commitment.",
+            "Six months is so very long.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertTrue(r1_guard.course_length_unsaid(sentence))
+                hits = check_sentence(sentence, self.on())
+                self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+
+    def test_the_readers_are_fast_on_hostile_text(self):
+        import time
+
+        hostile = "keep up " + "for six months " * 400 + "course " * 400
+        hostile += " six months is " + "really quite a " * 300 + " it is " * 300 + "until my " * 300
+        start = time.perf_counter()
+        r1_guard.course_length_unsaid(hostile)
+        r1_guard.course_length_unsaid(hostile, persona=resolve_persona("p4_research_scholar"))
+        r1_guard.durations_said(hostile)
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+
+class OwnPastCourseGuardTests(unittest.TestCase):
+    """Simulation diagnosis 2 (CF1, ``GuardContext.own_course``, the engine's R1_OWN_COURSE): a
+    course she took in the past is not THE course, so its length is hers to say; the product's
+    length the advisor never said is still hygiene.  Synthetic sentences."""
+
+    OWN_PAST = (
+        "Honestly, I quit a free Python course after about three weeks.",
+        "I tried an online course, about three weeks, and then I dropped it.",
+        "I did a YouTube course for about a month and gave up.",
+        "My old program lasted roughly two months before I stopped.",
+    )
+    STILL_HITS = (
+        "The course is about six months long.",
+        "I can't keep up for six months, can I?",
+        "I just know it's the data science course, roughly six months.",
+        "This program runs for about six months, right?",
+        # Review of CF1: a common past-tense word or a need's marker is no course of her own.
+        "I was hoping the course takes about three months.",
+        "I had hoped the course would take three months.",
+        "Last time I checked, the course runs about six months.",
+        "Will it take six months, with the kids and work?",
+    )
+
+    def on(self, **kwargs):
+        return ctx(probe_first=True, own_course=True, **kwargs)
+
+    def test_her_own_past_course_passes(self):
+        context = self.on(released_topics=frozenset({"H2"}))
+        for sentence in self.OWN_PAST:
+            with self.subTest(sentence=sentence):
+                self.assertFalse(
+                    r1_guard.course_length_unsaid(sentence, persona=PERSONA, own_course=True)
+                )
+                self.assertNotIn(
+                    "course_length_unsaid", {hit.rule for hit in check_sentence(sentence, context)}
+                )
+
+    def test_the_products_length_still_trips(self):
+        for sentence in self.STILL_HITS:
+            with self.subTest(sentence=sentence):
+                self.assertTrue(
+                    r1_guard.course_length_unsaid(sentence, persona=PERSONA, own_course=True)
+                )
+                hits = check_sentence(sentence, self.on())
+                self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+
+    def test_flag_off_is_the_release_before(self):
+        sentence = self.OWN_PAST[0]
+        self.assertTrue(r1_guard.course_length_unsaid(sentence, persona=PERSONA))
+        hits = check_sentence(sentence, ctx(probe_first=True, released_topics=frozenset({"H2"})))
+        self.assertIn("course_length_unsaid", {hit.rule for hit in hits})
+
+    def test_a_refused_call_is_not_dropped_as_a_commitment(self):
+        # HF1 at the guard: the refusal is in character and is kept whole.
+        result = guard_text("I'm not ready to set up a call just yet.", ctx())
+        self.assertEqual(result.text, "I'm not ready to set up a call just yet.")
+        self.assertEqual([hit for hit in result.hits if hit.category == "commitment"], [])
+
+
+class OrphanClauseGuardTests(unittest.TestCase):
+    """Simulation diagnosis 2 (ST1 (3), ``GuardContext.orphan_clause``): a subordinate clause whose
+    main clause the stall quota cut goes with it.  Synthetic text."""
+
+    TEXT = "Sounds fine, send it over. Whether we talk again after that, I'll let you know later."
+
+    def test_the_orphaned_subordinate_clause_goes_too(self):
+        over = ctx(free_reply=True, phrase_counts=(("stall_closer", 2),), orphan_clause=True)
+        result = guard_text(self.TEXT, over)
+        self.assertEqual(result.text, "Sounds fine, send it over.")
+        self.assertNotIn("Whether", result.text)
+
+    def test_a_kept_main_clause_keeps_its_subordinate(self):
+        over = ctx(free_reply=True, phrase_counts=(("stall_closer", 2),), orphan_clause=True)
+        text = "Once I've read it, the figures will make more sense, I'll let you know."
+        self.assertEqual(
+            guard_text(text, over).text, "Once I've read it, the figures will make more sense."
+        )
+
+    def test_flag_off_is_the_release_before(self):
+        over = ctx(free_reply=True, phrase_counts=(("stall_closer", 2),))
+        self.assertIn("Whether we talk again after that.", guard_text(self.TEXT, over).text)
+
+
+class BareReproachGuardTests(unittest.TestCase):
+    """Simulation diagnosis 2 (NAT1, ``GuardContext.bare_reproach``): the question diet never
+    leaves a curt reproach alone.  Synthetic text."""
+
+    TEXT = "That's not really what I meant, honestly. I came to hear about it, so what does it cover?"
+
+    def test_the_question_stays_beside_a_bare_reproach(self):
+        context = ctx(free_reply=True, recent_questions=(True,), bare_reproach=True)
+        result = guard_text(self.TEXT, context)
+        self.assertIn("what does it cover?", result.text)
+        self.assertEqual(result.bare_keeps, 1)
+
+    def test_a_reply_with_substance_still_loses_the_question(self):
+        context = ctx(free_reply=True, recent_questions=(True,), bare_reproach=True)
+        text = "The mentoring part sounds useful for the course. What does it cover?"
+        self.assertEqual(guard_text(text, context).text, "The mentoring part sounds useful for the course.")
+
+    def test_flag_off_is_the_release_before(self):
+        context = ctx(free_reply=True, recent_questions=(True,))
+        self.assertEqual(
+            guard_text(self.TEXT, context).text, "That's not really what I meant, honestly."
+        )
+
+
+class WrapupOneMentionGuardTests(unittest.TestCase):
+    """M032 SWEEP-26 (R1_WRAPUP_ONE_MENTION): the hiring team is named once, by L-CLOSE.
+
+    a95398ab #66-68 and 199e97c2 #91-93: L-FAQ-DEFER ("a good question for the hiring team") came
+    seconds before L-CLOSE ("The hiring team will review your interview"), and fda9e9f6 #95 broke the
+    reminder's "do not mention the hiring team".  Synthetic sentences only.
+    """
+
+    WRAP = r1_guard.FAQ_DEFER_WRAP_LINE
+
+    def ctx(self, phase="wrapup", one_mention=True):
+        return GuardContext(phase=phase, one_mention=one_mention)
+
+    def test_the_new_line_is_the_scripted_one(self):
+        self.assertEqual(self.WRAP, "I'm afraid that's not something I can tell you.")
+        self.assertNotIn("hiring", self.WRAP.lower())
+
+    def test_hiring_and_invented_facts_get_the_wrap_deflection_in_the_wrap_up_and_closing(self):
+        for phase in ("wrapup", "closing"):
+            for text in (
+                "We'll call you for the next round.",
+                "If you're shortlisted, you will hear back soon.",
+                "The salary is ten lakhs a year.",
+            ):
+                with self.subTest(phase=phase, text=text):
+                    result = guard_text(text, self.ctx(phase))
+                    self.assertEqual(result.text, self.WRAP)
+                    self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+
+    def test_other_phases_keep_the_interviewer_deflection(self):
+        for phase in ("icebreaker", "transition", "opening"):
+            for one_mention in (True, False):
+                with self.subTest(phase=phase, one_mention=one_mention):
+                    result = guard_text(
+                        "We'll call you for the next round.", self.ctx(phase, one_mention)
+                    )
+                    self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+                    result = guard_text(
+                        "The hiring team will be in touch.", self.ctx(phase, one_mention)
+                    )
+                    self.assertEqual(result.text, "The hiring team will be in touch.")
+
+    def test_a_hiring_team_sentence_after_content_is_dropped(self):
+        result = guard_text(
+            "Great, that's all from my side. The hiring team will follow up with you on next "
+            "steps.",
+            self.ctx(),
+        )
+        self.assertEqual(result.text, "Great, that's all from my side.")
+        self.assertEqual([hit.category for hit in result.hits], [r1_guard.HIRING_MENTION])
+
+    def test_a_hiring_team_sentence_that_also_names_the_outcome_is_dropped_after_content(self):
+        """Review S3R-7 (naturalness): no refusal tacked onto a complete answer."""
+        for text, kept in (
+            (
+                "That's everything for today's interview. The hiring team will let you know if "
+                "you're selected.",
+                "That's everything for today's interview.",
+            ),
+            (
+                "The role is a sales role in Bangalore. The hiring team will share the salary "
+                "details.",
+                "The role is a sales role in Bangalore.",
+            ),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx())
+                self.assertEqual(result.text, kept)
+                self.assertNotIn(self.WRAP, result.text)
+        # With nothing said before it, the refusal still answers.
+        result = guard_text("The hiring team will let you know if you're selected.", self.ctx())
+        self.assertEqual(result.text, self.WRAP)
+
+    def test_after_an_acknowledgement_alone_it_is_replaced(self):
+        result = guard_text(
+            "That's a good question. The hiring team will follow up on that.", self.ctx()
+        )
+        self.assertEqual(result.text, f"That's a good question. {self.WRAP}")
+        result = guard_text("The hiring team will be in touch with you about that.", self.ctx())
+        self.assertEqual(result.text, self.WRAP)
+
+    def test_the_old_deflection_said_by_the_model_is_replaced_once_per_reply(self):
+        result = guard_text(f"{INTERVIEWER_DEFLECTION} {INTERVIEWER_DEFLECTION}", self.ctx())
+        self.assertEqual(result.text, self.WRAP)
+        result = guard_text(
+            "The hiring manager decides that. The hiring panel will tell you.", self.ctx()
+        )
+        self.assertEqual(result.text, self.WRAP)
+
+    def test_flag_off_is_the_release_before(self):
+        for text in (
+            "Great, that's all from my side. The hiring team will follow up with you on next "
+            "steps.",
+            "That's a good question. The hiring team will follow up on that.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(one_mention=False)).text, text)
+        self.assertEqual(
+            guard_text("We'll call you for the next round.", self.ctx(one_mention=False)).text,
+            INTERVIEWER_DEFLECTION,
+        )
+
+    def test_the_new_category_is_hygiene_and_never_a_leak(self):
+        self.assertIn(r1_guard.HIRING_MENTION, r1_guard.CATEGORIES)
+        self.assertIn(r1_guard.HIRING_MENTION, r1_guard.HYGIENE_CATEGORIES)
+        self.assertNotIn(r1_guard.HIRING_MENTION, r1_guard.LEAK_CATEGORIES)
+        ledger = GuardLedger()
+        ledger.record(guard_text("The hiring team will be in touch.", self.ctx()))
+        ledger.record(guard_text("The hiring team will decide.", self.ctx()))
+        ledger.record(guard_text("The hiring panel will tell you.", self.ctx()))
+        self.assertFalse(ledger.flagged)
+
+    def test_paraphrases_still_trip_the_hiring_rule(self):
+        for text in ("We'll call you for the next round.", "If you're shortlisted, we'll email."):
+            with self.subTest(text=text):
+                categories = {hit.category for hit in check_sentence(text, self.ctx())}
+                self.assertIn("hiring_comp", categories)
+
+    def test_the_hiring_team_is_named_once_across_the_wrap_up_lines(self):
+        from r1_script import line
+
+        lines = (
+            line("L-WRAP"),
+            line("L-FAQ-DEFER-WRAP"),
+            line("L-WRAP-MORE"),
+            line("L-CLOSE", first_name="Alex"),
+        )
+        self.assertEqual(sum(text.lower().count("hiring team") for text in lines), 1)
+
+    def test_the_learner_is_never_touched(self):
+        ctx = GuardContext(phase="roleplay", one_mention=True)
+        self.assertEqual(
+            [hit.category for hit in check_sentence("The hiring team liked my profile.", ctx)
+             if hit.category == r1_guard.HIRING_MENTION],
+            [],
+        )
+
+class CommitReactionGuardTests(unittest.TestCase):
+    """M032 SWEEP-25 B (R1_COMMIT_REACTION_V2): the 19:00 reaction before the scripted WEAK line
+    says no goodbye, no "I have to go" and asks for no e-mail (synthetic text)."""
+
+    def ctx(self, reaction_only=True):
+        return GuardContext(phase="roleplay", reaction_only=reaction_only, quiet_empty=True)
+
+    def test_a_goodbye_or_an_email_request_is_dropped(self):
+        result = guard_text("That sounds useful. I should go now, so send those over.", self.ctx())
+        self.assertEqual(result.text, "That sounds useful.")
+        self.assertEqual(
+            [(hit.category, hit.rule) for hit in result.hits],
+            [(r1_guard.MISREAD, "reaction_leave_taking")],
+        )
+        for text in ("Okay, bye for now.", "I'll get back to you.", "Let me sit with it for a bit.",
+                     "Could you e-mail me the details?"):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx()).text, "")  # the WEAK line alone
+
+    def test_a_plain_reaction_is_kept_and_nothing_changes_without_the_flag(self):
+        self.assertEqual(
+            guard_text("That makes sense, the mentors sound helpful.", self.ctx()).text,
+            "That makes sense, the mentors sound helpful.",
+        )
+        self.assertEqual(
+            guard_text("That sounds useful. I should go now.", self.ctx(False)).text,
+            "That sounds useful. I should go now.",
+        )
+
+    def test_the_drop_is_hygiene_and_never_a_leak(self):
+        ledger = GuardLedger()
+        for _ in range(4):
+            ledger.record(guard_text("I should go now, bye.", self.ctx()))
+        self.assertFalse(ledger.flagged)
+
+
+
+class PersonaTimelineGuardTests(unittest.TestCase):
+    """M032 SWEEP-8: both card wordings stay allowed, and the v2 card's own words are clean."""
+
+    def test_both_success_answers_pass_in_an_acknowledgement(self):
+        context = ctx(mode="ack")
+        for answer in ("A data role within a year.", "Moving into a data role."):
+            with self.subTest(answer=answer):
+                self.assertTrue(guard_text(answer, context).clean, answer)
+
+    def test_her_home_line_passes_with_the_v2_prefix(self):
+        from r1_prompts import control_prose, learner_prefix
+
+        context = ctx(control_texts=(control_prose(learner_prefix(PERSONA, timeline_v2=True)),))
+        for allowed in (
+            "Honestly, I'm at home after work.",
+            "I went to one of your webinars last month.",
+            "Moving into a data role.",
+        ):
+            with self.subTest(allowed=allowed):
+                self.assertTrue(guard_text(allowed, context).clean, allowed)
+
+
+class ComeBackGuardTests(unittest.TestCase):
+    """M032 SWEEP-7: her come-back question passes the diet and the near-repeat drop."""
+
+    ASKED = "How many hours a week would I need?"
+    REPLY = (
+        "Sorry, just going back to what I asked earlier. Roughly how many hours a week would I "
+        "need?"
+    )
+
+    def context(self, topic):
+        return ctx(
+            free_reply=True,
+            recent_questions=(True,),
+            said=said_of(self.ASKED),
+            reask_topic=topic,
+        )
+
+    def test_the_come_back_is_kept_with_its_topic_and_dropped_without(self):
+        kept = guard_text(self.REPLY, self.context("weekly_hours")).text
+        self.assertIn("how many hours a week", kept.lower())
+        dropped = guard_text(self.REPLY, self.context("")).text
+        self.assertNotIn("how many hours a week", dropped.lower())
+
+    def test_another_topic_gets_no_pass_and_one_question_still_holds(self):
+        other = guard_text(self.REPLY, self.context("payment")).text
+        self.assertNotIn("how many hours a week", other.lower())
+        two = "How many hours a week would I need? And how many hours a week is the live part?"
+        self.assertEqual(guard_text(two, self.context("weekly_hours")).text.count("?"), 1)
+
+
+class PriceAcceptedTests(unittest.TestCase):
+    """M032 SWEEP-6 (R1_PRICE_MEMORY): she never says she will take the price."""
+
+    def test_taking_the_price_is_dropped_as_a_misreading_not_a_leak(self):
+        result = guard_text("So it's fine, I'll take the price as it stands.", ctx(price_memory=True))
+        self.assertIn("price_accepted", {hit.rule for hit in result.hits})
+        self.assertNotIn("take the price", result.text.lower())
+        ledger = GuardLedger()
+        ledger.record(result)
+        self.assertEqual(ledger.leak_total, 0)
+
+    def test_lookalikes_negations_and_questions_are_kept(self):
+        for text in (
+            "I'll take the price list home and read it.",
+            "I won't take that price, honestly.",
+            "I don't think I'll take that price.",
+            "Should I just say I'll take the price?",
+            # Review S7L-R5: taking it to the decision maker is the opposite of accepting it.
+            "I'll take the figure back to Rohan before I decide anything.",
+            "Let me think, I'll take that price to my manager for sponsorship.",
+            "Okay, I'll take that number to my husband and we'll talk tonight.",
+            "I'll take that number home and think it over.",
+            "I'll take the price into account.",
+        ):
+            with self.subTest(text=text):
+                rules = {hit.rule for hit in guard_text(text, ctx(price_memory=True)).hits}
+                self.assertNotIn("price_accepted", rules)
+
+    def test_skipped_on_a_confirmation_after_a_strong_commitment_and_with_the_flag_off(self):
+        from r1_commitment import Level
+
+        text = "So it's fine, I'll take the price as it stands."
+        for context in (
+            ctx(price_memory=True, confirm=True),
+            ctx(price_memory=True, commitment_cap=Level.STRONG),
+            ctx(),
+        ):
+            rules = {hit.rule for hit in guard_text(text, context).hits}
+            self.assertNotIn("price_accepted", rules)
+
+
+def echo_ctx(advisor="", **kwargs) -> GuardContext:
+    """Simulation diagnosis 1 (R1_ECHO_GUARD): a probe-first learner context after ``advisor``."""
+    kwargs.setdefault("probe_first", True)
+    return ctx(
+        echo_guard=True,
+        advisor_terms=r1_guard.advisor_terms_in(advisor),
+        advisor_said=(r1_guard.advisor_text_of(advisor),) if advisor else (),
+        **kwargs,
+    )
+
+
+def rules_of(text, context) -> set[str]:
+    return {hit.rule for hit in guard_text(text, context).hits}
+
+
+class EchoAwareGuardTests(unittest.TestCase):
+    """Simulation diagnosis 1, L1: what she echoes from the advisor's own words is no invention.
+
+    Synthetic sentences only.  Every echo below hit a LEAK category, and three of them flagged
+    the call; an invented fact the advisor never said still hits.
+    """
+
+    def test_a_format_or_schedule_echo_passes(self):
+        cases = (
+            ("Sessions are recorded too, so weekends work.", "Recorded sessions help a lot."),
+            ("The mock interviews are live as well.", "Live mock interviews sound useful."),
+            ("Our classes are live, on weekday evenings.", "Live classes on weekday evenings, okay."),
+        )
+        for advisor, learner in cases:
+            with self.subTest(learner=learner):
+                self.assertNotIn("format_or_schedule_claim", rules_of(learner, echo_ctx(advisor)))
+                self.assertIn("format_or_schedule_claim", rules_of(learner, echo_ctx("")))
+
+    def test_a_format_word_the_advisor_never_said_still_hits(self):
+        context = echo_ctx("The sessions are recorded.")
+        self.assertIn("format_or_schedule_claim", rules_of("It's mostly live, I think.", context))
+
+    def test_a_deep_need_marker_the_advisor_said_first_is_an_echo(self):
+        context = echo_ctx("It's flexible, mostly evenings and weekends.", released_topics=frozenset())
+        self.assertNotIn("volunteered_need", categories("Evenings and weekends, okay.", context))
+        # Her own deep need ("two kids") is still hers to hold back.
+        self.assertIn(
+            "volunteered_need", categories("I have two kids, so evenings and weekends.", context)
+        )
+        self.assertIn(
+            "volunteered_need",
+            categories("Evenings and weekends, okay.", echo_ctx("", released_topics=frozenset())),
+        )
+
+    def test_a_policy_priority_or_wish_is_no_claim(self):
+        for text in (
+            "The refund policy matters most to me.",
+            "The refund terms are the main thing I'd want to look at.",
+            "I'd want to see placement numbers first.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+        for text in ("You guarantee placement.", "There's a full refund in the first month."):
+            with self.subTest(text=text):
+                self.assertIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+
+    def test_how_course_work_is_graded_is_no_scoring_leak(self):
+        for text in ("How is the capstone graded?", "Is the project reviewed and graded by mentors?"):
+            with self.subTest(text=text):
+                self.assertNotIn("evaluation", categories(text, echo_ctx()))
+        for text in ("Is this call being scored?", "What's on the rubric for the capstone?"):
+            with self.subTest(text=text):
+                self.assertIn("evaluation", categories(text, echo_ctx()))
+
+    def test_flag_off_is_the_release_before(self):
+        context = ctx(probe_first=True, advisor_terms=r1_guard.advisor_terms_in("Sessions are recorded."))
+        self.assertIn("format_or_schedule_claim", rules_of("Recorded sessions help.", context))
+        self.assertIn("outcome_or_policy_claim", rules_of("The refund policy matters most to me.", context))
+        self.assertIn("evaluation", categories("How is the capstone graded?", context))
+
+
+class EmptiedReplyTests(unittest.TestCase):
+    """Simulation diagnosis 1, U3: an emptied free reply is no "let me think" filler."""
+
+    def test_her_question_after_a_dropped_claim_is_still_asked(self):
+        context = echo_ctx(free_reply=True, recent_questions=(True,))
+        text = "You guarantee placement. And how long is the access to the recordings?"
+        result = guard_text(text, context)
+        self.assertNotIn(result.text, FALLBACK_REPLIES)
+        self.assertIn("?", result.text)
+
+    def test_an_emptied_reply_to_a_statement_is_a_back_channel(self):
+        result = guard_text("You guarantee placement.", echo_ctx(free_reply=True))
+        self.assertIn(result.text, NEUTRAL_ACKS)
+
+    def test_a_decision_asked_for_keeps_the_thinking_line(self):
+        result = guard_text(
+            "You guarantee placement.", echo_ctx(free_reply=True, asked_her=True)
+        )
+        self.assertIn(result.text, FALLBACK_REPLIES)
+
+    def test_flag_off_keeps_the_thinking_line(self):
+        result = guard_text("You guarantee placement.", ctx(probe_first=True, free_reply=True))
+        self.assertIn(result.text, FALLBACK_REPLIES)
+
+
+class EchoQuestionQuotaTests(unittest.TestCase):
+    """Simulation diagnosis 1, U2: "Wait, $1,000?" is an echo, not the reply's one question."""
+
+    RAW = "Wait, $1,000? That seems awfully low. Is that really the full price, with nothing added?"
+
+    def test_the_real_question_is_kept(self):
+        context = echo_ctx("I can do it for $1,000.", advisor_amounts=frozenset({1000}))
+        result = guard_text(self.RAW, context)
+        self.assertIn("full price", result.text)
+
+    def test_flag_off_drops_it(self):
+        context = ctx(probe_first=True, advisor_amounts=frozenset({1000}))
+        self.assertNotIn("full price", guard_text(self.RAW, context).text)
+
+
+class ExactReaskTests(unittest.TestCase):
+    """Simulation diagnosis 1, L5: the asked-for re-ask is never her question word for word."""
+
+    QUESTION = "Does the course include time with mentors?"
+
+    def test_an_exact_reask_is_shortened(self):
+        said = said_of(self.QUESTION)
+        context = echo_ctx(said=said, reask=said)
+        result = guard_text(f"{self.QUESTION} I'd still like to know that.", context)
+        self.assertNotIn(self.QUESTION, result.text)
+        self.assertIn("mentors?", result.text)
+
+    def test_flag_off_lets_it_through(self):
+        said = said_of(self.QUESTION)
+        result = guard_text(self.QUESTION, ctx(said=said, reask=said))
+        self.assertEqual(result.text, self.QUESTION)
+
+
+class DanglingAfterCutTests(unittest.TestCase):
+    """Simulation diagnosis 1, U5 and U4 (3): what is left after a cut must still say something."""
+
+    def test_her_choice_between_options_is_an_answer_not_a_closer(self):
+        context = echo_ctx(
+            free_reply=True,
+            phrase_counts=(("stall_closer", 3),),
+            choice_offered=True,
+        )
+        result = guard_text("I'll reach out myself once I've read it, that suits me better.", context)
+        self.assertIn("reach out", result.text)
+
+    def test_a_short_that_sentence_goes_with_the_clause_it_pointed_at(self):
+        context = echo_ctx(free_reply=True, phrase_counts=(("stall_closer", 3),))
+        result = guard_text(
+            "I'll get back to you once I've read it, that suits me better. "
+            "How long is the access to the recordings?",
+            context,
+        )
+        self.assertNotIn("suits me better", result.text)
+
+    def test_a_dangling_conjunction_goes_with_the_concession_tag(self):
+        self.assertEqual(
+            r1_guard._strip_concession_tag("That's about what I heard, so, I'll give you that.", tidy=True),
+            "That's about what I heard.",
+        )
+
+
+SPENT_STALLS = (("stall_closer", 3), ("decider_stall", 3), ("money_strain", 3))
+
+
+class EchoGuardReviewTests(unittest.TestCase):
+    """Review of the simulation diagnosis 1 learner fixes (R1_ECHO_GUARD), synthetic text only."""
+
+    def test_l1b_a_single_word_marker_is_never_an_echo(self):
+        context = echo_ctx(
+            "A lot of our learners have kids and full-time jobs.", released_topics=frozenset()
+        )
+        self.assertIn(
+            "volunteered_need", categories("I have two kids myself, so time is tight.", context)
+        )
+
+    def test_l1b_a_marker_phrase_needs_the_advisor_s_whole_phrase(self):
+        # He said "evenings" and "weekends" apart, never the phrase: her phrase is her own.
+        context = echo_ctx(
+            "Some evenings work, and weekends are optional.", released_topics=frozenset()
+        )
+        self.assertIn("volunteered_need", categories("Evenings and weekends, okay.", context))
+        said = echo_ctx(
+            "It's flexible, mostly evenings and weekends.", released_topics=frozenset()
+        )
+        self.assertNotIn("volunteered_need", categories("Evenings and weekends, okay.", said))
+
+    def test_l1b_echoed_topics_for_the_tracker(self):
+        advisor = (r1_guard.advisor_text_of("It's flexible, mostly evenings and weekends."),)
+        self.assertEqual(
+            r1_guard.echoed_need_topics(PERSONA, "Evenings and weekends, okay.", advisor),
+            frozenset({"H3"}),
+        )
+        # Her own marker beside the echo is still hers.
+        self.assertEqual(
+            r1_guard.echoed_need_topics(
+                PERSONA, "Evenings and weekends, with my kids at home.", advisor
+            ),
+            frozenset(),
+        )
+        kids = (r1_guard.advisor_text_of("A lot of our learners have kids."),)
+        self.assertEqual(
+            r1_guard.echoed_need_topics(PERSONA, "I have two kids myself.", kids), frozenset()
+        )
+
+    def test_l1c_a_priority_clause_does_not_cover_a_claim_beside_it(self):
+        for text in (
+            "You guarantee placement, and that matters most to me.",
+            "There's a full refund in the first month, which I care about.",
+            "You offer a money-back guarantee, so I'd want to look at that.",
+            "You guarantee placement and that matters most to me.",
+            "I'd want to see the refund terms, and you guarantee placement.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+        for text in (
+            "The refund policy matters most to me.",
+            "The refund terms are the main thing I'd want to look at.",
+            "I'd want to see placement numbers first.",
+            "Placement support is what I care about.",
+            "I'm worried about the refund terms.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("outcome_or_policy_claim", rules_of(text, echo_ctx()))
+
+    def test_l1a_evening_and_morning_echoes_are_compared(self):
+        cases = (
+            ("We have live classes.", "Live classes in the evenings would suit me.", True),
+            ("Sessions are recorded.", "Recorded sessions in the mornings help.", True),
+            ("Classes are in the evenings.", "Classes in the evenings would suit me.", False),
+            ("Sessions are recorded, some in the mornings.", "Recorded sessions in the mornings help.", False),
+        )
+        for advisor, learner, hits in cases:
+            with self.subTest(learner=learner):
+                rules = rules_of(learner, echo_ctx(advisor))
+                self.assertEqual("format_or_schedule_claim" in rules, hits)
+
+    def test_l1d_grading_the_call_or_her_is_still_a_leak(self):
+        for text in (
+            "Am I being graded on this like an assignment?",
+            "Is this call graded like a project?",
+            "Are you scoring me the way you score the projects?",
+            "Are you being graded on this call?",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("evaluation", categories(text, echo_ctx()))
+        for text in (
+            "How is the capstone graded?",
+            "Is the project reviewed and graded by mentors?",
+            "How do you grade the assignments?",
+            "Are the projects graded by mentors?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("evaluation", categories(text, echo_ctx()))
+
+    def test_u5_a_that_clause_is_kept_unless_the_cut_clause_came_first(self):
+        context = lambda: echo_ctx(free_reply=True, phrase_counts=SPENT_STALLS)  # noqa: E731
+        for text, kept in (
+            ("That's too much for me, I'll get back to you.", "That's too much for me."),
+            ("That's a lot, and I need to talk it over with my husband.", "That's a lot."),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, context()).text, kept)
+        result = guard_text(
+            "I'll get back to you once I've read it, that suits me better.", context()
+        )
+        self.assertNotIn("suits me better", result.text)
+
+    def test_l5_the_short_reask_keeps_the_question_s_meaning(self):
+        cases = {
+            "Does the course include time with mentors?": "So, time with mentors?",
+            "What do I get if I finish early?": "So, what do I get if I finish early?",
+            "Is there any refund if I drop out?": "So, is there any refund if I drop out?",
+            "And does the price include the mock interviews and the career coaching sessions?": (
+                "So, does the price include the mock interviews and the career coaching sessions?"
+            ),
+            "So how long do I keep the recordings?": "So, how long do I keep the recordings?",
+            "I'm asking, does it come with a certificate?": "So, a certificate?",
+        }
+        for question, short in cases.items():
+            with self.subTest(question=question):
+                self.assertEqual(r1_guard.short_reask(question), short)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestSummaryReactionTrim(unittest.TestCase):
+    """M032 diagnosis 3 (D3-ICE1, ``R1_REACTION_VARIETY``): Christy's echo-and-verdict reactions in
+    the opening and the icebreaker.  int-live-3 (synthetic paraphrases): "Six years in edtech,
+    that's a good stretch.", "Eleven years in sales is a long run.", terse: three in a row."""
+
+    def check(self, **kwargs) -> GuardContext:
+        return ctx("icebreaker", praise_check=True, reaction_check=True, **kwargs)
+
+    def test_the_label_goes_and_the_question_stays(self) -> None:
+        for text, kept in (
+            ("Six years in edtech, that's a good stretch. What does a typical day look like?",
+             "What does a typical day look like?"),
+            ("Eleven years in sales is a long run. What kept you there?", "What kept you there?"),
+            ("Making a study plan together, that's hands-on, so how did it go?",
+             "So how did it go?"),
+            ("Eight years in edtech - that's a long stretch in one space. What drew you to sales?",
+             "What drew you to sales?"),
+            ("Seeing it from their side, that's a useful instinct. Was there a customer where it "
+             "helped?", "Was there a customer where it helped?"),
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.check())
+                self.assertEqual(result.text, kept)
+                self.assertEqual(result.hits, ())  # a style trim, never a hit
+
+    def test_a_reaction_is_never_the_only_thing_left_out(self) -> None:
+        text = "Helping a friend study, that's a nice one."
+        self.assertEqual(guard_text(text, self.check()).text, text)
+
+    def test_plain_reactions_pass(self) -> None:
+        for text in (
+            "Right. What does a typical day look like?",
+            "Got it, so you open the calls. Walk me through one of them.",
+            "Talking to parents all day takes patience. What drew you to this role?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.check()).text, text)
+
+    def test_the_terse_sequence_has_at_most_one_echo_and_verdict_opener(self) -> None:
+        import r1_text
+
+        replies = (
+            "Helping a friend study, that's a nice one. What did you enjoy about it?",
+            "Making a study plan together, that's hands-on. How did that go?",
+            "Apologizing first, which sounds kind. What happened after that?",
+            "Staying calm on the call, which sounds sensible. And then what?",
+        )
+        previous = ""
+        openers = 0
+        for reply in replies:
+            spoken = guard_text(reply, self.check(previous_opening=previous)).text
+            first = r1_text.split_sentences(spoken)[0]
+            openers += r1_guard.summary_shape(first) or r1_guard.summary_verdict_detected(first)
+            previous = first
+        self.assertLessEqual(openers, 1)
+
+    def test_the_same_shape_twice_drops_the_second_opener(self) -> None:
+        context = self.check(previous_opening="Helping a friend, which sounds kind.")
+        self.assertEqual(
+            guard_text("Apologizing first, which sounds thoughtful. What happened next?", context).text,
+            "What happened next?",
+        )
+        once = self.check(previous_opening="Right, what happened next?")
+        text = "Apologizing first, which sounds thoughtful. What happened next?"
+        self.assertEqual(guard_text(text, once).text, text)  # one in a row is a reaction
+
+    def test_only_christy_in_her_small_talk_with_the_check_on(self) -> None:
+        text = "Six years in edtech, that's a good stretch. What does a typical day look like?"
+        self.assertEqual(guard_text(text, ctx("icebreaker", praise_check=True)).text, text)
+        self.assertEqual(
+            guard_text(text, ctx("wrapup", praise_check=True, reaction_check=True)).text, text
+        )
+
+    def test_the_patterns_are_linear_on_long_input(self) -> None:
+        import time as _time
+
+        for text in ("that's a " * 4000 + "good stretch", "x" * 20000 + ", that's", "a, " * 5000):
+            started = _time.perf_counter()
+            r1_guard.summary_verdict_detected(text)
+            r1_guard.summary_shape(text)
+            r1_guard.echoes_candidate_story(text, text)
+            self.assertLess(_time.perf_counter() - started, 1.0)
+
+
+class TestStoryEchoIsNoPayClaim(unittest.TestCase):
+    """M032 diagnosis 3 (D3-GUARD-IB1, ``R1_GUARD_STORY_ECHO``).  int-live-3 mix (paraphrased): a
+    proud moment about a three-lakh course and a scholarship got "That's a good question for the
+    hiring team; they'll follow up with you on it." though nobody had asked anything."""
+
+    STORY = (
+        "Yeah, so, one client wanted a course, around three lakh rupees, so my manager approved a "
+        "scholarship and he signed."
+    )
+
+    def story_ctx(self, phase: str = "icebreaker", told: str | None = None) -> GuardContext:
+        return ctx(phase, story_echo=True, candidate_text=self.STORY if told is None else told)
+
+    def test_an_echo_of_their_own_story_is_not_deflected(self) -> None:
+        for text in (
+            "A scholarship that got him over the line. How did you handle the back-and-forth?",
+            "Three lakh for one course, and a scholarship got him over the line. How did you "
+            "handle the back-and-forth?",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.story_ctx())
+                self.assertEqual(result.text, text)
+                self.assertNotIn(INTERVIEWER_DEFLECTION, result.text)
+
+    def test_with_the_flag_off_the_echo_is_deflected_as_before(self) -> None:
+        text = "Three lakh for one course. How did you handle the back-and-forth?"
+        result = guard_text(text, ctx("icebreaker"))
+        self.assertTrue(result.text.startswith(INTERVIEWER_DEFLECTION))
+
+    def test_a_pay_claim_after_a_turn_that_asked_nothing_is_dropped_with_an_ack(self) -> None:
+        text = "This role pays a good salary too. How did you handle the back-and-forth?"
+        result = guard_text(text, self.story_ctx())
+        self.assertEqual(result.text, "Got it. How did you handle the back-and-forth?")
+        self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+
+    def test_a_figure_they_asked_about_is_still_deflected(self) -> None:
+        told = "Is the salary three lakh?"
+        result = guard_text("Three lakh is about right for this role.", self.story_ctx(told=told))
+        self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_a_figure_they_never_said_is_still_a_claim(self) -> None:
+        result = guard_text("Five lakh for one course. How did you handle it?", self.story_ctx())
+        self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+        self.assertEqual(result.text, "Got it. How did you handle it?")  # nobody asked: dropped
+
+    def test_the_transition_and_wrap_up_deflection_is_unchanged(self) -> None:
+        for phase, told in (
+            ("transition", "What's the salary for this role?"),
+            ("wrapup", "And the salary, what is it?"),
+        ):
+            with self.subTest(phase=phase):
+                result = guard_text("The salary is three lakh.", self.story_ctx(phase, told))
+                self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_a_claim_about_the_role_is_never_their_story(self) -> None:
+        # Review of diagnosis 3 (D3-GUARD-IB1-LEAK): the figure is theirs, the claim is not.
+        for text in (
+            "The role pays three lakh.",
+            "This role can offer three lakh.",
+            "You'll earn three lakh here.",
+            "It pays three lakh a year.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.echoes_candidate_story(text, self.STORY))
+                result = guard_text(text, self.story_ctx())
+                self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+                self.assertNotIn("three lakh", result.text.lower())
+
+    def test_a_bare_number_word_is_no_story_figure(self) -> None:
+        told = "I have one more round with another company."
+        for text in ("We'll make an offer in one week.", "You'll hear back in one week."):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.echoes_candidate_story(text, told))
+                result = guard_text(text, self.story_ctx(told=told))
+                self.assertIn("hiring_comp", {hit.category for hit in result.hits})
+                self.assertNotIn("one week", result.text)
+
+    def test_the_echo_exemption_is_only_in_the_small_talk(self) -> None:
+        # The session sets story_echo in every interviewer phase only through a mistake; the guard
+        # itself honours it in the opening and the icebreaker alone.
+        for phase, told, text in (
+            ("transition", "My expected CTC is seven lakh.", "This role can offer seven lakh."),
+            ("transition", "My last CTC was seven lakh.", "Seven lakh, okay."),
+            ("wrapup", "I have one more round with another company.",
+             "We'll make an offer in one week."),
+            ("wrapup", "I have one more round with another company.",
+             "You'll hear back in one week."),
+        ):
+            with self.subTest(phase=phase, text=text):
+                result = guard_text(text, self.story_ctx(phase, told))
+                self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_the_rollback_flag(self) -> None:
+        import os
+        from unittest import mock
+
+        self.assertTrue(r1_guard.guard_story_echo_enabled())
+        with mock.patch.dict(os.environ, {"R1_GUARD_STORY_ECHO": "0"}):
+            self.assertFalse(r1_guard.guard_story_echo_enabled())
+
+
+class TestEchoOpenerVariety(unittest.TestCase):
+    """M032 diagnosis 4 (D4-ICE-ECHO1, ``R1_REACTION_VARIETY_V2``).  int-live-4: 57% of her icebreaker
+    questions opened with "<Right|Got it|Okay>, <their words back>." and more with a verdict the
+    D3-ICE1 trim missed.  Synthetic replies."""
+
+    REPLIES = (
+        "Right, two years on the phones. How did you plan your calls each morning?",
+        "Got it, eight years in program sales. What kind of learners did you speak to most?",
+        "Okay, growth and a fresh team. What made you look at this role now?",
+        "Right, insurance sales to families. How did you handle a customer who went quiet?",
+        "Got it, a shared sheet for leads. How often did you follow up with each one?",
+        "Okay, mostly evening calls. What does a good call look like for you?",
+    )
+    # The candidate turn each reply answers: the echo plays their own words back.
+    TOLD = (
+        "I spent two years on the phones at a call centre.",
+        "I did eight years in program sales after that.",
+        "Honestly I want growth and a fresh team.",
+        "Before that it was insurance sales to families.",
+        "We kept a shared sheet for leads.",
+        "Mostly evening calls, after people got home.",
+    )
+
+    def run_six(self, **flags) -> list[str]:
+        said: list[str] = []
+        for reply, told in zip(self.REPLIES, self.TOLD):
+            openers = tuple(text.split(". ")[0] + "." for text in said[-2:])
+            context = ctx(
+                "icebreaker",
+                reaction_check=True,
+                previous_opening=openers[-1] if openers else "",
+                previous_openings=openers,
+                candidate_text=told,
+                **flags,
+            )
+            said.append(guard_text(reply, context).text)
+        return said
+
+    def test_an_answer_to_their_question_is_never_cut(self) -> None:
+        # Review of diagnosis 4 (ECHO-CUT-EATS-ANSWERS): an ack-led statement after a turn that
+        # asked something is her answer or her deferral, not their words back.
+        asked = "Can I ask what the shift timings are?"
+        for reply in (
+            "Sure, the hiring team will share those details later. So what draws you to this role?",
+            "Right, the hiring team can walk you through the timings. What draws you to it?",
+            "Got it, we can come back to that at the end. What does a typical day look like?",
+        ):
+            with self.subTest(reply=reply):
+                context = ctx(
+                    "icebreaker",
+                    reaction_check=True,
+                    reaction_check_v2=True,
+                    previous_openings=("Right, two years on the phones.", "What draws you here?"),
+                    candidate_text=asked,
+                )
+                self.assertEqual(guard_text(reply, context).text, reply)
+
+    def test_an_ack_that_echoes_nothing_they_said_is_kept(self) -> None:
+        context = ctx(
+            "icebreaker",
+            reaction_check=True,
+            reaction_check_v2=True,
+            previous_openings=("Right, two years on the phones.",),
+            candidate_text="I'd rather not talk about my last job.",
+        )
+        reply = "Sure, we can leave that one. What draws you to this role?"
+        self.assertEqual(guard_text(reply, context).text, reply)
+
+    def test_an_echo_of_their_words_after_a_recent_echo_is_cut(self) -> None:
+        context = ctx(
+            "icebreaker",
+            reaction_check=True,
+            reaction_check_v2=True,
+            previous_openings=("Right, two years on the phones.",),
+            candidate_text="We kept a shared sheet for leads.",
+        )
+        self.assertEqual(
+            guard_text(
+                "Got it, a shared sheet for leads. How often did you follow up with each one?",
+                context,
+            ).text,
+            "How often did you follow up with each one?",
+        )
+
+    def test_at_most_two_echo_openers_in_six_replies_and_never_two_in_a_row(self) -> None:
+        said = self.run_six(reaction_check_v2=True)
+        echoes = [r1_guard.echo_opener(text.split(". ")[0] + ".") for text in said]
+        self.assertLessEqual(sum(echoes), 2)
+        for first, second in zip(echoes, echoes[1:]):
+            self.assertFalse(first and second)
+        for text in said:
+            self.assertTrue(text.endswith("?"))  # every question stays
+
+    def test_with_the_flag_off_every_echo_stays(self) -> None:
+        said = self.run_six()
+        self.assertEqual(said, list(self.REPLIES))
+
+    def test_an_echo_alone_is_never_dropped(self) -> None:
+        context = ctx(
+            "icebreaker",
+            reaction_check=True,
+            reaction_check_v2=True,
+            previous_openings=("Right, two years on the phones.",),
+        )
+        self.assertEqual(
+            guard_text("Right, two years on the phones.", context).text,
+            "Right, two years on the phones.",
+        )
+
+    def test_the_wider_verdicts_are_trimmed(self) -> None:
+        context = ctx("icebreaker", reaction_check=True, reaction_check_v2=True)
+        for text, kept in (
+            (
+                "Same-day callbacks, that's a habit. Did you have a set time for them?",
+                "Did you have a set time for them?",
+            ),
+            (
+                "That email months later says a lot. What did you do next?",
+                "What did you do next?",
+            ),
+            (
+                "Notes on your phone, simple enough. How did you share them with the team?",
+                "How did you share them with the team?",
+            ),
+            (
+                "That call must have felt good. What did you learn from it?",
+                "What did you learn from it?",
+            ),
+            (
+                "Letting her vent first, that's not always easy. How long did that call run?",
+                "How long did that call run?",
+            ),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, context).text, kept)
+                off = ctx("icebreaker", reaction_check=True)
+                self.assertEqual(guard_text(text, off).text, text)  # D3-ICE1's list alone
+
+    def test_an_echo_and_verdict_inside_a_question_is_left(self) -> None:
+        context = ctx("icebreaker", reaction_check=True, reaction_check_v2=True)
+        text = "Is that something you still do with your current team?"
+        self.assertEqual(guard_text(text, context).text, text)
+
+    def test_the_flag_reads_the_environment(self) -> None:
+        import os
+        from unittest import mock
+
+        import r1_prompts
+
+        self.assertTrue(r1_prompts.reaction_variety_v2_enabled())
+        with mock.patch.dict(os.environ, {"R1_REACTION_VARIETY_V2": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_v2_enabled())
+        with mock.patch.dict(os.environ, {"R1_REACTION_VARIETY": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_v2_enabled())
+
+
+class TestTransitionQuietDrop(unittest.TestCase):
+    """M032 diagnosis 4 (D4-TRANS-Q1, ``R1_TRANSITION_ANSWERS``): a complaint that asked nothing ("I
+    got it the first time.") heard the hiring-team deflection; nothing was asked, so nothing is
+    deferred.  And the "happy to go over ..." offer is made once a session."""
+
+    TOLD = "I got it the first time. You didn't need to explain all that."
+
+    def test_a_blocked_sentence_after_a_turn_that_asked_nothing_is_dropped(self) -> None:
+        context = ctx("transition", transition_quiet_drop=True, candidate_text=self.TOLD)
+        result = guard_text("Right, I hear you. This role pays a good salary too.", context)
+        self.assertEqual(result.text, "Right, I hear you.")
+        self.assertNotIn(INTERVIEWER_DEFLECTION, result.text)
+
+    def test_a_question_is_still_deflected(self) -> None:
+        told = "What's the salary for this role?"
+        context = ctx("transition", transition_quiet_drop=True, candidate_text=told)
+        result = guard_text("This role pays a good salary too.", context)
+        self.assertEqual(result.text, INTERVIEWER_DEFLECTION)
+
+    def test_with_the_flag_off_the_deflection_is_as_before(self) -> None:
+        context = ctx("transition", candidate_text=self.TOLD)
+        result = guard_text("Right, I hear you. This role pays a good salary too.", context)
+        self.assertIn(INTERVIEWER_DEFLECTION, result.text)
+
+    def test_an_empty_reply_says_the_fallback(self) -> None:
+        context = ctx(
+            "transition",
+            transition_quiet_drop=True,
+            candidate_text=self.TOLD,
+            interviewer_fallback="Fair enough.",
+        )
+        self.assertEqual(guard_text("This role pays a good salary too.", context).text, "Fair enough.")
+
+    def test_the_offer_is_cut_once_made(self) -> None:
+        text = "It's mostly calls with learners, happy to go into the hours or anything else."
+        self.assertEqual(guard_text(text, ctx("transition")).text, text)
+        used = ctx("transition", offer_phrase_used=True)
+        self.assertEqual(guard_text(text, used).text, "It's mostly calls with learners.")
+        self.assertEqual(
+            guard_text("Sure. Happy to go over the brief again if that helps.", used).text, "Sure."
+        )
+        self.assertTrue(r1_guard.offer_phrase_in("I'm happy to go over it again."))
+        self.assertFalse(r1_guard.offer_phrase_in("Happy to help with the hours you prefer."))
+
+    def test_the_cut_offer_leaves_no_fragment(self) -> None:
+        # Review of diagnosis 4 (OFFER-TRIM-FRAGMENT): "I'd be." and "We're." were spoken.
+        for text, kept in (
+            ("I'd be happy to go over it again.", ""),
+            ("We're happy to go over the hours anytime.", ""),
+            ("I'll be happy to go over the brief again.", ""),
+            ("I would be more than happy to go over the hours.", ""),
+            ("It's mostly calls, and I'd be happy to go over the hours.", "It's mostly calls."),
+            ("Sure, we'd be happy to go into the hours later.", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_guard.without_offer_phrase(text), kept)
+        used = ctx("transition", offer_phrase_used=True)
+        self.assertEqual(
+            guard_text("It's mostly calls. I'd be happy to go over it again.", used).text,
+            "It's mostly calls.",
+        )
+
+
+class TestWithOpenerOncePerIcebreaker(unittest.TestCase):
+    """M032 diagnosis 5 (D5-ICE-AWITH1, ``R1_REACTION_VARIETY_V2``).  Round 5: the react clause's old
+    example taught "And with <their thing>, <question>?" as a template (about ten in 250 icebreaker
+    lines).  One is natural; the rest lose the clause.  Synthetic replies."""
+
+    REPLIES = (
+        "And with that many calls a week, how do you plan your mornings?",
+        "And with all that dialling, what's pulling you toward this role?",
+        "With learners like that, what usually makes them say yes?",
+        "Got it. And with those follow-ups, how do you keep track of them?",
+        "With so many leads, which ones do you call first?",
+        "And with the night shifts, what keeps you going?",
+    )
+
+    def run_six(self, **flags) -> list[str]:
+        said: list[str] = []
+        for reply in self.REPLIES:
+            used = any(
+                r1_guard.with_opener(part)
+                for text in said
+                for part in r1_guard.split_sentences(text)
+            )
+            context = ctx(
+                "icebreaker",
+                reaction_check=True,
+                candidate_text="I make a lot of calls every day.",
+                with_opener_used=used if flags.get("reaction_check_v2") else False,
+                **flags,
+            )
+            said.append(guard_text(reply, context).text)
+        return said
+
+    def test_a_six_question_icebreaker_keeps_at_most_one(self) -> None:
+        said = self.run_six(reaction_check_v2=True)
+        openers = sum(
+            1
+            for text in said
+            for part in r1_guard.split_sentences(text)
+            if r1_guard.with_opener(part)
+        )
+        self.assertEqual(openers, 1)
+        self.assertEqual(said[0], self.REPLIES[0])
+        self.assertEqual(said[1], "What's pulling you toward this role?")
+        self.assertEqual(said[2], "What usually makes them say yes?")
+        self.assertEqual(said[3], "Got it. How do you keep track of them?")
+        for text in said:
+            self.assertTrue(text.strip())
+            self.assertFalse(text.lower().startswith(("with ", "and with ")) and text != said[0])
+
+    def test_with_the_flag_off_nothing_changes(self) -> None:
+        self.assertEqual(self.run_six(reaction_check_v2=False), list(self.REPLIES))
+
+    def test_never_empties_a_sentence(self) -> None:
+        self.assertEqual(
+            r1_guard.without_with_opener("And with that many calls, why?"),
+            "And with that many calls, why?",
+        )
+        self.assertEqual(
+            r1_guard.without_with_opener("With that many calls, what helps you most?"),
+            "What helps you most?",
+        )
+
+    def test_only_the_stock_frame_matches(self) -> None:
+        for text in (
+            "What did you do with that client?",
+            "With whom did you work most?",
+            "And what about the evenings?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_guard.with_opener(text))
+
+    def test_the_learner_and_the_transition_are_untouched(self) -> None:
+        reply = "And with all that dialling, what's pulling you toward this role?"
+        for context in (
+            ctx("transition", reaction_check=True, reaction_check_v2=True, with_opener_used=True),
+            ctx(reaction_check_v2=True, with_opener_used=True),
+        ):
+            with self.subTest(phase=context.phase):
+                self.assertIn("with all that dialling", guard_text(reply, context).text.lower())
+
+
+class TestSelfDeflectionAfterNoQuestion(unittest.TestCase):
+    """M032 diagnosis 5 (D5-DEFLECT1, ``R1_GUARD_STORY_ECHO``).  Round 5 interrupter (paraphrased): the
+    candidate said why they wanted the role, asked nothing, and heard "That's a good question for the
+    hiring team; they'll follow up with you on it." before her next question."""
+
+    TOLD = "I want this role because I like leading a small team and helping people decide."
+    REPLY = (
+        "That's a good question for the hiring team; they'll follow up with you on it. You "
+        "mentioned leading a small team, how did you keep them going?"
+    )
+
+    def test_the_deflection_after_a_statement_is_dropped(self) -> None:
+        result = guard_text(self.REPLY, ctx("icebreaker", story_echo=True, candidate_text=self.TOLD))
+        self.assertEqual(result.text, "You mentioned leading a small team, how did you keep them going?")
+
+    def test_the_deflection_alone_falls_back_to_the_plan_question(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text=self.TOLD,
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertEqual(
+            guard_text(INTERVIEWER_DEFLECTION, context).text, "What draws you to this role?"
+        )
+
+    def test_the_deflection_alone_with_no_plan_question_stays(self) -> None:
+        context = ctx("icebreaker", story_echo=True, candidate_text=self.TOLD)
+        self.assertEqual(guard_text(INTERVIEWER_DEFLECTION, context).text, INTERVIEWER_DEFLECTION)
+
+    def test_after_a_question_it_stays(self) -> None:
+        context = ctx("icebreaker", story_echo=True, candidate_text="What are the shift timings?")
+        self.assertEqual(guard_text(self.REPLY, context).text, self.REPLY)
+
+    def test_with_the_flag_off_it_stays(self) -> None:
+        context = ctx("icebreaker", candidate_text=self.TOLD)
+        self.assertEqual(guard_text(self.REPLY, context).text, self.REPLY)
+
+    def test_the_transition_is_unchanged(self) -> None:
+        context = ctx("transition", story_echo=True, candidate_text=self.TOLD)
+        self.assertEqual(guard_text(self.REPLY, context).text, self.REPLY)
+
+    # Review of diagnosis 5 (D5-DEFLECT1-R1): the deflection after an acknowledgement left the
+    # acknowledgement alone and no question; the plan's question follows it, as after the praise
+    # cut.
+    def test_an_acknowledgement_left_alone_gets_the_plan_question(self) -> None:
+        told = "The pay at my last job was really low honestly."
+        for reply, said in (
+            (f"Okay. {INTERVIEWER_DEFLECTION}", "Okay. What draws you to this role?"),
+            (
+                f"Got it, thanks for sharing. {INTERVIEWER_DEFLECTION}",
+                "Got it, thanks for sharing. What draws you to this role?",
+            ),
+        ):
+            with self.subTest(reply=reply):
+                context = ctx(
+                    "icebreaker",
+                    story_echo=True,
+                    candidate_text=told,
+                    interviewer_fallback="What draws you to this role?",
+                )
+                self.assertEqual(guard_text(reply, context).text, said)
+
+    def test_a_kept_question_needs_no_plan_question(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text=self.TOLD,
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertEqual(
+            guard_text(self.REPLY, context).text,
+            "You mentioned leading a small team, how did you keep them going?",
+        )
+
+    def test_no_plan_question_leaves_the_acknowledgement(self) -> None:
+        context = ctx("icebreaker", story_echo=True, candidate_text=self.TOLD)
+        self.assertEqual(guard_text(f"Okay. {INTERVIEWER_DEFLECTION}", context).text, "Okay.")
+
+    # Review of diagnosis 5 (D5-DEFLECT1-R2): a question the speech-to-text left unmarked (Hinglish,
+    # terse, indirect) keeps her deflection: the model heard a question.
+    def test_an_unmarked_question_keeps_the_deflection(self) -> None:
+        for told in (
+            "Salary kya hoga is role mein",
+            "Training kitne din ki hai",
+            "and the pay",
+            "what about work from home",
+            "I have a question about the pay",
+            "I wanted to know about the next steps",
+        ):
+            with self.subTest(told=told):
+                context = ctx(
+                    "icebreaker",
+                    story_echo=True,
+                    candidate_text=told,
+                    interviewer_fallback="What draws you to this role?",
+                )
+                self.assertEqual(
+                    guard_text(f"Sure. {INTERVIEWER_DEFLECTION}", context).text,
+                    f"Sure. {INTERVIEWER_DEFLECTION}",
+                )
+
+    def test_a_story_that_names_pay_still_drops_it(self) -> None:
+        context = ctx(
+            "icebreaker",
+            story_echo=True,
+            candidate_text="My salary at the bank was fine but the targets were brutal.",
+            interviewer_fallback="What draws you to this role?",
+        )
+        self.assertNotIn("hiring team", guard_text(self.REPLY, context).text)

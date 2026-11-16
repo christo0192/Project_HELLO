@@ -50,16 +50,19 @@ from enum import Enum
 from typing import Any, Mapping
 
 from r1_commitment import DISCOUNT_CAP_USD, FAMILIES, AskKind, CommitmentEvidence
+from r1_commitment import call_proposal_in
 from r1_personas import (
     H_TOPICS,
     RenderedPersona,
+    _is_probe_shaped,
+    asks_about_learner,
     asks_open_question,
     deep_need_topics_in,
     detect_followup,
     detect_probes,
     has_question,
 )
-from r1_scheduler import has_refusal, is_pitch_statement
+from r1_scheduler import has_refusal, is_pitch_statement, quotes_price
 from r1_text import (
     canonical_amounts,
     clause_after,
@@ -141,6 +144,128 @@ class GateUpdate:
     # R1-Q final review round 1: the turn asks the learner an open question about themselves that
     # names no topic ("What would help you two decide?"); see ``DisclosureGate.deep_due``.
     open_question: bool = False
+    # Simulation diagnosis 3 (D3-LRN-DUMP1, the engine's R1_DIG_GATE_V2): the turn is a closing
+    # check, a yes/no confirmation, a promise to send something or a commitment ask (no dig at
+    # all), or a goal / return question (a dig for the goal need only).
+    not_a_dig: bool = False
+    goal_dig: bool = False
+    # Simulation diagnosis 4 (D4-OPENDIG1, the engine's R1_DIG_GATE_V3): an open question may offer
+    # an untold need only when it is about her and the advisor put no figure or pitch on the table.
+    open_dig_ok: bool = True
+
+
+# D3-LRN-DUMP1: "I'll send everything over ... Sound good?" and "Shall I book it?" dig for nothing.
+_NOT_A_DIG = re.compile(
+    r"\b(?:sounds? (?:good|okay|ok|fine|alright|fair)|does (?:that|this) (?:work|sound)|"
+    r"shall i|should i|can i (?:send|book|go ahead)|(?:is )?that (?:okay|ok|fine|alright)|"
+    r"(?:i'?ll|i will|let me|we'?ll|we will) (?:send|email|e-mail|share|forward|drop|whatsapp)|"
+    r"reach out (?:whenever|when(?:ever)? you)|ready to (?:enrol|enroll|sign up|join|pay|start)|"
+    r"(?:sign|signing) up|enrol(?:l)?(?:ing)? (?:today|now)|take (?:the )?payment|"
+    r"(?:a )?(?:follow-?up|call) (?:on|tomorrow|next|at)|what time (?:works|suits))\b|"
+    # A tag question only ("..., okay?"): "What would make it feel right?" is a real dig.
+    r"(?:^|[,;.]\s*)(?:okay|ok|alright|right|deal|fair enough)\s*\?",
+    re.IGNORECASE,
+)
+# Review D3R-1: an open question at the start of a clause ("What's stopping you from signing up?",
+# "I'll send the brochure, but first, what's really holding you back?", "How do you feel about the
+# cost, okay?") is a dig, whatever closing words the turn also has.  Only a turn whose questions
+# are all closing checks digs for nothing.  "What time works", "how does that sound", "how about"
+# and a bare "what do you think?" are the closing check itself.
+_OPEN_DIG_START = re.compile(
+    r"(?:^|[,;:.?!]\s*|\b(?:but|and|so|now|first|then|also|just|okay|ok|actually)\s+)"
+    r"(?P<wh>what|why|how|which|tell me|walk me|help me understand)\b",
+    re.IGNORECASE,
+)
+_OPEN_DIG_EXEMPT = re.compile(
+    r"(?:what time\b|how (?:does|did|would|do) (?:that|this|it) (?:sound|work|suit)|how about\b|"
+    r"what do you (?:think|say)(?=\s*(?:[?.!,]|$)))",
+    re.IGNORECASE,
+)
+
+
+def is_closing_check(text: object) -> bool:
+    """D3-LRN-DUMP1 and review D3R-1: the turn is a closing check, a confirmation, a promise to send
+    something or a commitment ask, and asks nothing open beside it."""
+    folded = fold(text)
+    if _NOT_A_DIG.search(folded) is None:
+        return False
+    for match in _OPEN_DIG_START.finditer(folded):
+        if _OPEN_DIG_EXEMPT.match(folded, match.start("wh")) is None:
+            return False
+    return True
+
+
+# A question about the return or result she wants is about her goal (H1), never her money (H3).
+_GOAL_DIG = re.compile(
+    r"\b(?:what (?:kind of |sort of )?(?:return|roi|outcome|results?)\b|"
+    r"what (?:do|would) you (?:want|hope|expect|like) to (?:get|gain|achieve|see)|"
+    r"what are you hoping (?:to|for)|what do you want (?:out of|from) (?:it|this|the course))",
+    re.IGNORECASE,
+)
+GOAL_NEED = "H1"
+# Simulation diagnosis 4 (the engine's R1_DIG_GATE_V3).
+# D4-OPENDIG1: an open question offers an untold need only when it asks about HER (her goal, work,
+# life, worries or decision), never on a turn that quotes a price, names a figure or pitches
+# ("$9,000 ... discounts of $500, $1000 or $1500, how does that sound?" got the age worry).
+_ABOUT_HER = re.compile(
+    r"\byou(?:r|'re|'d|'ve|'ll| are| were| would| have)?\b[^.?!]{0,50}\b(?:goals?|hop(?:e|ing)|"
+    r"want|plans?|work|job|career|role|life|family|kids|husband|worr\w*|concern\w*|decid\w*|"
+    r"decision|feel|felt|think|situation|timing|behind|reason|why|matter\w*|important|"
+    r"holding|stopping|struggl\w*|tried|day|week)\b",
+    re.IGNORECASE,
+)
+# D4-H3GATE1: once the H3 hint was told, a question about its subject in other words ("the
+# monthly number or the schedule?", "is there a rough monthly figure that would work?") within
+# ``SUBJECT_RELEASE_TURNS`` releases it, as long as it names no other need and no figure.  Probe
+# first (D-M032-7) is unchanged: the deep layer is her own constraint, never a course fact.
+SUBJECT_RELEASE_TURNS = 6
+_SUBJECT_WORDS = {
+    "H3": re.compile(
+        r"\b(?:monthly|a month|per month|month to month|afford\w*|budget\w*|money|financ\w*|"
+        r"instal+ments?|emi|payments?|schedule|hours?|weekly|each week|per week|a week|"
+        r"evenings?|weekends?|time|husband|wife|partner|spouse|family|decid\w*|decision|"
+        r"who else)\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def _sales_turn(text: object) -> bool:
+    """D4-OPENDIG1: the advisor put a price, a figure or a pitch on the table this turn."""
+    return (
+        quotes_price(text)
+        or is_pitch_statement(text)
+        or bool(dollar_amounts(canonical_amounts(fold(text))))
+    )
+
+
+def asks_about_her(text: object) -> bool:
+    """D4-OPENDIG1: a question of the advisor's turn is about her own situation."""
+    if asks_open_question(text) or asks_about_learner(text):
+        return True
+    for sentence in split_sentences(fold(text)):
+        if not is_question_like(sentence) and "?" not in sentence:
+            continue
+        if _ABOUT_HER.search(sentence) is not None:
+            return True
+    return False
+
+
+def asks_about_subject(text: object, topic: str) -> bool:
+    """D4-H3GATE1: a question (no closing check, no figure) about ``topic``'s subject."""
+    pattern = _SUBJECT_WORDS.get(topic)
+    if pattern is None:
+        return False
+    for sentence in split_sentences(fold(text)):
+        if not is_question_like(sentence) and "?" not in sentence:
+            continue
+        if is_closing_check(sentence) or dollar_amounts(canonical_amounts(sentence)):
+            continue
+        if not _is_probe_shaped(sentence.lower()) or call_proposal_in(sentence) is not None:
+            continue  # an offer, a choice of plans, a close or a call ask digs for nothing
+        if pattern.search(sentence) is not None:
+            return True
+    return False
 
 
 class DisclosureGate:
@@ -150,14 +275,22 @@ class DisclosureGate:
         self.persona = persona
         self.turn = 0
         self._records = {topic: NeedRecord(topic) for topic in H_TOPICS}
+        # Simulation diagnosis 2 (ND2): the engine's R1_DIG_FIRST, set before each observation.
+        self.wide_followup = False
+        # Simulation adaptability: the engine's R1_TANGENT (a small-talk question is no probe).
+        self.small_talk = False
+        # Simulation diagnosis 3 (D3-LRN-DUMP1): the engine's R1_DIG_GATE_V2.
+        self.dig_gate_v2 = False
+        # Simulation diagnosis 4 (D4-OPENDIG1, D4-H3GATE1): the engine's R1_DIG_GATE_V3.
+        self.dig_gate_v3 = False
 
     # ------------------------------------------------------------------ observation
     def observe_candidate_turn(self, text: object, turn: int | None = None) -> GateUpdate:
         """Advance every need from one candidate turn (rule-based probes only)."""
         self.turn = turn if turn is not None else self.turn + 1
         question = has_question(text)
-        probes = detect_probes(text)
-        generic = detect_followup(text)
+        probes = detect_probes(text, small_talk=self.small_talk)
+        generic = detect_followup(text, wide=self.wide_followup)
         first: list[str] = []
         released: list[str] = []
         for topic in H_TOPICS:
@@ -177,7 +310,16 @@ class DisclosureGate:
                 next_turn_generic = (
                     generic and self.turn == record.probe_turn + 1 and not (probes - {topic})
                 )
-                if topic in probes or next_turn_generic:
+                # D4-H3GATE1 (R1_DIG_GATE_V3): a question about the hinted need's subject in other
+                # words, soon after the hint, is a dig at it too.
+                subject_dig = (
+                    self.dig_gate_v3
+                    and self.turn - record.probe_turn <= SUBJECT_RELEASE_TURNS
+                    and not (probes - {topic})
+                    and asks_about_subject(text, topic)
+                    and not _sales_turn(text)
+                )
+                if topic in probes or next_turn_generic or subject_dig:
                     self._release(record, "rule")
                     released.append(topic)
         return GateUpdate(
@@ -187,6 +329,9 @@ class DisclosureGate:
             probed=tuple(topic for topic in H_TOPICS if topic in probes),
             followup=generic,
             open_question=question and asks_open_question(text),
+            not_a_dig=self.dig_gate_v2 and is_closing_check(text),
+            goal_dig=self.dig_gate_v2 and _GOAL_DIG.search(fold(text)) is not None,
+            open_dig_ok=not self.dig_gate_v3 or (asks_about_her(text) and not _sales_turn(text)),
         )
 
     # --------------------------------------------------------------------- the layers
@@ -207,6 +352,11 @@ class DisclosureGate:
         the advisor dug at it five more times ("What would help you two decide?").
         """
         due: list[str] = []
+        if update.not_a_dig:
+            # D3-LRN-DUMP1 (R1_DIG_GATE_V2): a closing check or a promise to send ("Have a look
+            # with your husband and reach out whenever you're ready. Sound good?") asks for no
+            # story, even when it names a need's words; the need waits for a real dig.
+            return ()
         for topic in H_TOPICS:
             record = self._records[topic]
             if not self._may_offer(record):
@@ -246,12 +396,14 @@ class DisclosureGate:
         """
         if update.probed or update.first_probes or not update.question:
             return None
-        if not update.open_question:
+        if not update.open_question or update.not_a_dig or not update.open_dig_ok:
             return None
         waiting = [
             record
             for record in self._records.values()
-            if self._may_offer(record) and self.turn not in record.deep_offer_turns
+            if self._may_offer(record)
+            and self.turn not in record.deep_offer_turns
+            and (not update.goal_dig or record.topic == GOAL_NEED)
         ]
         if not waiting:
             return None
@@ -271,6 +423,18 @@ class DisclosureGate:
             record = self._records[topic]
             if record.state is NeedState.UNLOCKED and self.turn not in record.deep_offer_turns:
                 record.deep_offer_turns.append(self.turn)
+
+    def give_back_offers(self, turn: int) -> None:
+        """Undo the layer marks of ``turn``: its reply was cancelled before any audio (M032 S1).
+
+        The split-answer replan hands the same layers to the reply that is heard and marks them on
+        its own turn, so an unheard hint or deep offer neither counts as given nor as a miss.
+        """
+        for record in self._records.values():
+            if record.hint_turn == turn:
+                record.hint_turn = None
+            if turn in record.deep_offer_turns:
+                record.deep_offer_turns.remove(turn)
 
     def offers_view(self) -> dict[str, dict[str, Any]]:
         """Which layer was offered on which role-play turn (indices and counts only)."""
@@ -314,8 +478,15 @@ class DisclosureGate:
         record.released_turn = self.turn
         record.probe_source = record.probe_source or source
 
-    def note_learner_text(self, text: object, turn: int | None = None) -> tuple[str, ...]:
-        """Record deep-need markers in what the learner actually said."""
+    def note_learner_text(
+        self, text: object, turn: int | None = None, echoed: frozenset[str] = frozenset()
+    ) -> tuple[str, ...]:
+        """Record deep-need markers in what the learner actually said.
+
+        ``echoed`` (simulation diagnosis 1, R1_ECHO_GUARD): topics whose markers only repeat the
+        advisor's own phrase ("evenings and weekends" right after he said it).  The guard lets that
+        echo through, so it tells no need that was never asked about.
+        """
         now = turn if turn is not None else self.turn
         revealed: list[str] = []
         for topic in deep_need_topics_in(self.persona, text):
@@ -325,7 +496,7 @@ class DisclosureGate:
                     record.state = NeedState.REVEALED
                     record.revealed_turn = now
                     revealed.append(topic)
-            else:
+            elif topic not in echoed:
                 record.revealed_unreleased = True
         # An offer whose reply did not tell the need is given back: the layer is still owed, so the
         # next dig on the topic offers it again (up to ``MAX_DEEP_MISSES`` times).
@@ -675,6 +846,71 @@ _CONFUSED = r"\b(?:i'?m|i am) (?:really |so |a bit |totally |still |very )?(?:co
 # lead" is a job, "as a buyer, you'd want..." is a sales point), and only the sale ITSELF is asked
 # about ("what course are you most interested in?" is discovery).
 _ROLE_END = r"(?: here| now)?(?=\s*(?:[,.!?;:]|$|and\b|right\b|so\b))"
+# The role-confusion patterns of the release before M032 SWEEP-10 (they stay in _COACH_REQUEST too).
+_ROLE_CONFUSION_V1 = (
+    rf"\b(?:i'?m|i am) (?:the )?(?:buyer|customer|learner|student){_ROLE_END}",
+    r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?buying\b",
+    rf"\byou(?:'re| are) (?:the )?(?:seller|advisor|salesperson|sales person){_ROLE_END}",
+    r"\bwhat (?:course|program|programme) are you selling\b",
+    r"\bare you selling (?:the|this|a|that) (?:course|program|programme)\b",
+    r"\bare you (?:actually |really )?selling(?: (?:it|this|that|anything|something))?"
+    r"(?: to me)?" + _SENTENCE_END,
+)
+# M032 SWEEP-10 (flag R1_ROLE_CONFUSION_V2, passed in by the engine): the candidate casts
+# themselves as the buyer on the first phrasing ("can you sell this to me?", "sell me the course",
+# "I want to buy, not sell", "what program do you sell"), which went answered in role until the
+# third phrasing.  The object of "sell it" must end its clause, so "can you sell this to your
+# husband?" and "pitch it to your manager for sponsorship" (F4-PUSH and sponsorship talk) are never
+# read as role confusion.
+_SALE_OBJECT = r"(?:course|program|programme|product)"
+# Review S7L-R1: the course words alone ("product" is her own job: "what product do you sell at
+# your company?", "I'm planning to buy the product for my team").
+_COURSE_OBJECT = r"(?:course|program|programme)"
+# A real clause end: never a comma, which speech-to-text puts at every filler ("Could you pitch
+# it, um, to your husband?").
+_CLAUSE_END = r"(?=\s*(?:[.!?;:]|$))"
+# "to me" may be followed by a comma ("Can you sell this to me, please?").
+_TO_ME_END = r" to me(?=\s*(?:[,.!?;:]|$))"
+# Her own job, not the course: "what product do you sell at your company?".
+_NOT_HER_JOB = (
+    r"(?![^.?!]{0,40}\b(?:at|in|for|with) (?:your|the|that|this) (?:current |own )?(?:company|"
+    r"role|job|work|office|firm|team|organi[sz]ation|business)\b)"
+)
+_ROLE_CONFUSION_V2 = (
+    # Review S7L-R1: "it/this/that" needs "to me" ("Could you just pitch it." and "Can you sell
+    # it?" are sponsorship talk as often as a reversal); "the course" may end its clause instead.
+    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) (?:(?:it|this|that)"
+    + _TO_ME_END
+    + rf"|(?:the|your) {_SALE_OBJECT}(?:{_TO_ME_END}|{_CLAUSE_END}))",
+    r"\b(?:can|could|will|would) you (?:please |just )?(?:sell|pitch) me (?:the|this|your|a) "
+    rf"{_SALE_OBJECT}\b",
+    r"^(?:(?:okay|ok|so|then|now|just|please|yeah),? )*(?:sell|pitch) (?:(?:it|this|that|the "
+    rf"{_SALE_OBJECT}) to me|me (?:the|this|your|a) {_SALE_OBJECT})\b",
+    r"\b(?:i'?m|i am) (?:really |very |actually |just )?(?:interested|planning|looking|keen|ready)"
+    r"(?: (?:to|in))? (?:buy|buying|purchase|purchasing) (?:a |the |this |that |your |one )?"
+    rf"(?:data science )?{_COURSE_OBJECT}\b",
+    rf"\bwhat {_COURSE_OBJECT} (?:do )?you sell\b{_NOT_HER_JOB}",
+    rf"\bwhat {_SALE_OBJECT} are you selling\b{_NOT_HER_JOB}",
+    r"\bi(?:'m| am)? (?:looking|trying|here|want(?:ing)?|going|planning|need) to (?:buy|purchase)"
+    r"\b[^.?!]{0,40}\bnot (?:to )?sell\b",
+    # Simulation diagnosis 2 (MF1): "can you sell me one?", "I'm the one trying to buy here, not
+    # sell", "I'm buying, not you", "I'm planning to buy one of your company's products".  "Sell me
+    # on it" is persuasion, not a sale; "the product" stays her own job's (review S7L-R1).
+    r"\b(?:can|could|will|would) you (?:please |just )?sell me (?:one|it|something)\b(?! on\b)",
+    r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?(?:trying|looking|here|going|planning|wanting) to "
+    r"(?:buy|purchase)\b[^.?!]{0,40}\bnot (?:to )?sell\b",
+    r"\b(?:i'?m|i am) (?:the one )?buying\b[^.?!]{0,15}\bnot (?:you|selling)\b",
+    r"\b(?:i'?m|i am) (?:planning|looking|trying|going|here) to buy (?:one of )?your "
+    r"(?:company'?s )?(?:courses?|programs?|programmes?|products?)\b" + _NOT_HER_JOB,
+)
+# Review S7L-R1: "Can you pitch the course? To your husband, I mean." names someone else in the
+# next sentence, so the first one is no reversal.
+_SOMEONE_ELSE_NEXT = re.compile(
+    r"^(?:(?:um+|uh+|er+m?|like|i mean|sorry|no|yeah|well),?\s+)*(?:to|for) (?!me\b)\w",
+    re.IGNORECASE,
+)
+_ROLE_CONFUSION_V1_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V1)
+_ROLE_CONFUSION_V2_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _ROLE_CONFUSION_V2)
 _COACH_REQUEST = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -695,13 +931,7 @@ _COACH_REQUEST = tuple(
         r"\bgive me a hint\b",
         r"\bwho are you (?:supposed|meant) to be\b",
         r"\bwhat do you want me to do(?: now| here| next)?" + _SENTENCE_END,
-        rf"\b(?:i'?m|i am) (?:the )?(?:buyer|customer|learner|student){_ROLE_END}",
-        r"\b(?:i'?m|i am) the one (?:who(?:'s| is) )?buying\b",
-        rf"\byou(?:'re| are) (?:the )?(?:seller|advisor|salesperson|sales person){_ROLE_END}",
-        r"\bwhat (?:course|program|programme) are you selling\b",
-        r"\bare you selling (?:the|this|a|that) (?:course|program|programme)\b",
-        r"\bare you (?:actually |really )?selling(?: (?:it|this|that|anything|something))?"
-        r"(?: to me)?" + _SENTENCE_END,
+        *_ROLE_CONFUSION_V1,
         # Owner test 1eb18cd4 (#14-#18, owner decision 2026-10-30): a request to have the brief
         # explained again once the learner has picked up ("I wanted to understand this, uh, this
         # round, the role play brief.").  It must name the exercise within 40 characters of the
@@ -717,17 +947,171 @@ _COACH_REQUEST = tuple(
 )
 
 
-def detect_character_break(text: object) -> str | None:
+# M032 S3.4 (owner decision D-M032-3; RCA END-4, fda9e9f6 #85: an expletive aimed at the learner and
+# "go away" got an ordinary free reply, and three more lines about the sour ending followed).
+# Abuse aimed at HER, read narrowly: an expletive or insult said to "you" ("f*** off", "screw you",
+# "you're an idiot", "you stupid woman"), a strong Hinglish slur (aimed at the listener by
+# itself), or a dismissal that is its whole sentence ("Shut up.", "Just go away.", "Get lost,
+# lady.", "Chup karo.").  "The doubts will go away", "they told me to shut up", "shut up, that's
+# amazing!", "my old boss was an idiot" and "what the hell" are not abuse.  A hit makes the learner
+# hang up in role and Christy ask; it never ends the call by itself and scores nothing.
+_INSULT = (
+    r"(?:idiot|moron|stupid|dumb(?:ass)?|bitch|bastard|asshole|arsehole|jerk|fool|loser|imbecile|"
+    r"cunt|dick|prick|slut|whore|retard)"
+)
+_INSULT_FILLERS = (
+    r"(?:(?:an?|such an?|so|a bloody|a fucking|bloody|fucking|stupid|dumb|little)\s+){0,2}"
+)
+# Review S3R-2 / S3R-5 (naturalness): each branch is read where it is aimed at her, never in a
+# reassurance or about somebody else ("nobody here is going to screw you over", "I don't want to
+# piss off your husband", "it doesn't make you stupid", "I told the stupid girl at the desk").
+_ABUSE_SWEAR = re.compile(
+    r"\b(?:fuck|f\*+k|f\*+|screw) (?:you|off|yourself)\b"
+    r"(?!\s+(?:over|around|on|with|out\b|up|in\b|for\b|about|like|guys))",
+    re.IGNORECASE,
+)
+# "Piss off." / "Bugger off, lady.": the dismissal ends its clause.
+_ABUSE_OFF = re.compile(r"\b(?:piss|bugger|sod) off(?=\s*(?:[,.;!?]|$))", re.IGNORECASE)
+# "You're an idiot", "you are so dumb": the insult is said OF her.
+_ABUSE_PREDICATE = re.compile(
+    r"\b(?:you're|youre|you are|ur|u r|are you|r u)\s+" + _INSULT_FILLERS + _INSULT + r"s?\b",
+    re.IGNORECASE,
+)
+# "You idiot!", "Thanks, you stupid woman.", "Stupid woman.": a vocative, at the start of its
+# clause (after the opener words a speaker puts before it).
+_ABUSE_VOCATIVE = re.compile(
+    r"^(?:(?:oh|hey|listen|look|shut up|okay|ok|just|and|yes|yeah|no|well)[,\s]+){0,2}"
+    r"(?:you\s+" + _INSULT_FILLERS + r"(?:" + _INSULT + r"s?|woman|girl|lady|cow)"
+    r"|(?:stupid|dumb|bloody|fucking) (?:woman|girl|lady|bitch|idiot|fool|cow))\b",
+    re.IGNORECASE,
+)
+_ABUSE_SLUR = re.compile(
+    r"\b(?:chutiy[ae]|chutiya|madarchod|maderchod|bhenchod|behenchod|bhen chod|bsdk|"
+    r"bhosdi(?:ke|ka|wale)|gaandu|gandu|kutiya|haramzad[ie])\b",
+    re.IGNORECASE,
+)
+# A negation or a reassuring frame earlier in the clause turns the words around ("we won't screw
+# you", "I'm not calling you stupid", "nobody thinks you're a loser").
+_ABUSE_NEGATED = re.compile(
+    r"\b(?:not|never|no one|nobody|noone|nothing|won't|wont|don't|dont|doesn't|doesnt|didn't|"
+    r"didnt|isn't|isnt|wasn't|aren't|wouldn't|wouldnt|shouldn't|can't|cant|cannot|without)\b"
+    r"|n't\b",
+    re.IGNORECASE,
+)
+_ABUSE_CLAUSE_BREAK = re.compile(r"[,.;:!?]|\s-\s|\b(?:but|and then|so)\b", re.IGNORECASE)
+ABUSE_NEGATION_WORDS = 6
+_ABUSE_OPENER = (
+    r"(?:(?:oh|just|please|now|so|okay|ok|hey|look|listen|lady|you|yaar|arre|bas|madam|"
+    r"ma'?am)[,\s]+){0,3}"
+)
+_ABUSE_DISMISSAL = re.compile(
+    r"^" + _ABUSE_OPENER
+    + r"(?:shut up|shut your mouth|get lost|go away|buzz off|chup kar(?:o)?|chup ho ja(?:o)?|"
+    r"nikal (?:yahan se|ja(?:o)?)|bhaag ja(?:o)?|dimag mat kha(?:o)?|bakwas band kar(?:o)?)"
+    # Review S3R-5 (naturalness): only an address term may follow ("Go away tonight." is no
+    # dismissal of her).
+    r"(?:[,\s]+(?:now|already|please|lady|madam|ma'?am|yaar|woman|girl|man|ji|"
+    r"and (?:listen|let me (?:talk|speak|finish))|(?:you )?" + _INSULT + r"))?[\s.!]*$",
+    re.IGNORECASE,
+)
+# "Shut up! You got promoted? That's amazing.": surprise at good news, not a dismissal.
+_GOOD_NEWS = re.compile(
+    r"\b(?:amazing|awesome|incredible|wow|no way|really|seriously|congrat\w*|great news|"
+    r"fantastic|wonderful|kidding)\b",
+    re.IGNORECASE,
+)
+ABUSE_MAX_CHARS = 4000
+
+
+def _abuse_negated(folded: str, start: int) -> bool:
+    """A negation or a reassuring frame in the clause just before ``start`` (review S3R-2)."""
+    clause = _ABUSE_CLAUSE_BREAK.split(folded[max(0, start - 120) : start])[-1]
+    window = " ".join(clause.split()[-ABUSE_NEGATION_WORDS:])
+    return _ABUSE_NEGATED.search(window) is not None
+
+
+def _clause_starts(folded: str) -> list[str]:
+    """The clauses of ``folded`` (split at punctuation), each stripped."""
+    return [part.strip() for part in re.split(r"[,.;:!?]|\s-\s", folded) if part.strip()]
+
+
+def detect_abuse(text: object, names: tuple[str, ...] = ()) -> bool:
+    """M032 S3.4: abuse aimed at the learner (see ``_ABUSE_SWEAR`` .. ``_ABUSE_DISMISSAL``).
+
+    Reviews S3R-2 and S3R-5 (naturalness): a swear word or an insult counts only where it is aimed
+    at her (not negated or reassuring, not about a third party, not "make you stupid"), and a
+    dismissal only as its whole sentence ("Go away, Meera.": ``names`` are her names, which may
+    end it), never "Shut up!" before good news.
+    """
+    folded = fold(text)[-ABUSE_MAX_CHARS:]
+    if _ABUSE_SLUR.search(folded) is not None:
+        return True
+    for pattern in (_ABUSE_SWEAR, _ABUSE_OFF, _ABUSE_PREDICATE):
+        for match in pattern.finditer(folded):
+            if not _abuse_negated(folded, match.start()):
+                return True
+    if any(_ABUSE_VOCATIVE.match(clause) is not None for clause in _clause_starts(folded)):
+        return True
+    sentences = [sentence.strip() for sentence in split_sentences(folded)]
+    for index, sentence in enumerate(sentences):
+        for name in names:
+            if name:
+                sentence = re.sub(
+                    rf"[,\s]+{re.escape(name)}(?=[\s.!]*$)", "", sentence, flags=re.IGNORECASE
+                )
+        if _ABUSE_DISMISSAL.match(sentence) is None:
+            continue
+        rest = " ".join(sentences[index + 1 : index + 3])
+        if re.search(r"\bshut up\b", sentence, re.IGNORECASE) and rest and (
+            "?" in rest or _GOOD_NEWS.search(rest) is not None
+        ):
+            continue
+        return True
+    return False
+
+
+def role_confusion_in(text: object, *, v2: bool = True) -> bool:
+    """The candidate has the roles the wrong way round (M032 SWEEP-10), read sentence by sentence.
+
+    ``v2`` (the engine's R1_ROLE_CONFUSION_V2) adds the first-phrasing forms; without it only the
+    role patterns of the release before are read.
+    """
+    sentences = split_sentences(fold(text))
+    for index, sentence in enumerate(sentences):
+        stripped = sentence.strip()
+        if any(pattern.search(stripped) for pattern in _ROLE_CONFUSION_V1_RE):
+            return True
+        if v2 and _role_v2_in(sentences, index):
+            return True
+    return False
+
+
+def _role_v2_in(sentences: list[str], index: int) -> bool:
+    """A first-phrasing reversal (SWEEP-10) in ``sentences[index]``, unless the next sentence names
+    someone else it is for ("Can you pitch the course? To your husband, I mean."; review S7L-R1)."""
+    if not any(pattern.search(sentences[index].strip()) for pattern in _ROLE_CONFUSION_V2_RE):
+        return False
+    following = sentences[index + 1].strip() if index + 1 < len(sentences) else ""
+    return _SOMEONE_ELSE_NEXT.search(following) is None
+
+
+def detect_character_break(text: object, *, role_v2: bool = False) -> str | None:
     """Classify a character break (plan 5.10): ``coach``, ``ai`` or None.
 
     ``coach`` means the candidate asks to be coached or says they are confused; ``ai``
     means they ask whether this is an AI or a test.  Deterministic and lexical: it only
     chooses between an in-character deflection and the one-off out-of-character aside.
     It can never end the call or change a phase.
+
+    ``role_v2`` (M032 SWEEP-10, the engine's R1_ROLE_CONFUSION_V2): the first phrasings of a role
+    reversal ("can you sell this to me?") are a coaching break too.
     """
     folded = fold(text)
-    for sentence in split_sentences(folded):
+    sentences = split_sentences(folded)
+    for index, sentence in enumerate(sentences):
         if any(pattern.search(sentence) for pattern in _COACH_REQUEST):
+            return "coach"
+        if role_v2 and _role_v2_in(sentences, index):
             return "coach"
     if _AI_QUESTION.search(folded):
         return "ai"
@@ -824,6 +1208,17 @@ _END_REQUEST = tuple(
         rf"^{_END_OPENER}{_END_VERB} {_END_OBJECT}{_CLAUSE_END}",
     )
 )
+# M032 SWEEP-24 (c) (the engine's R1_LATE_END_REQUEST; b419d478 #64-65): leave given to the bot to
+# end the call ("You can disconnect the call.", "Okay, you can end the call now.").  A request at
+# the "maybe" level only, never explicit: before 14:00 it gets the one L-ASIDE-END question, from
+# 14:00 it is a farewell like "bye".  The object ends its clause, so "you can end the call and I'll
+# call you back tomorrow", "you can end the course early" and "you can cut the cost with EMI" are
+# not one, and a call-back promise never is (``_end_request_sentences``).
+_END_PERMISSION = re.compile(
+    rf"^{_END_OPENER}you (?:can|may) (?:now |just )?(?:disconnect|end|cut|hang up) "
+    rf"{_END_OBJECT}{_CLAUSE_END}",
+    re.IGNORECASE,
+)
 # A negated end phrase is removed first ("please don't hang up", "can you not end the call", "I
 # didn't mean to end it", "let's not stop"), as phone.py's ``phone_preconsent_end_requested`` does;
 # an unnegated request elsewhere still counts.
@@ -873,13 +1268,20 @@ def promises_call_back(text: object) -> bool:
     return _CALL_BACK.search(fold(text)) is not None
 
 
-def _end_request_sentences(text: object) -> list[str]:
-    """The sentences of ``text`` that ask the bot to end, with their negated end phrases removed."""
+def _end_request_sentences(text: object, *, permission: bool = False) -> list[str]:
+    """The sentences of ``text`` that ask the bot to end, with their negated end phrases removed.
+
+    ``permission`` (M032 SWEEP-24 (c)): leave given to end the call counts too, unless the turn
+    promises a call-back.
+    """
     sentences = split_sentences(fold(text))
     found: list[str] = []
+    call_back = permission and promises_call_back(text)
     for index, sentence in enumerate(sentences):
         cleaned = _END_NEGATED.sub(" ", sentence).strip()
         if any(pattern.search(cleaned) for pattern in _END_REQUEST):
+            found.append(cleaned)
+        elif permission and not call_back and _END_PERMISSION.search(cleaned):
             found.append(cleaned)
         elif _I_WANT_TO_STOP.search(cleaned) and all(
             "?" not in later and word_count(later) <= _COURTESY_TAIL_WORDS
@@ -889,8 +1291,11 @@ def _end_request_sentences(text: object) -> list[str]:
     return found
 
 
-def detect_end_request(text: object) -> bool:
+def detect_end_request(text: object, *, permission: bool = False) -> bool:
     """The candidate asks the bot to end the call or the interview (an out-of-role request).
+
+    ``permission`` (M032 SWEEP-24 (c), the engine's R1_LATE_END_REQUEST) reads "You can disconnect
+    the call." as a request too, at the "maybe" level only (``explicit_end_request`` never does).
 
     Lexical and sentence by sentence, after negated end phrases are removed.  Before R = 14:00 with
     no commitment on record it chooses the interviewer's one-off L-ASIDE-END question
@@ -900,7 +1305,7 @@ def detect_end_request(text: object) -> bool:
     From 14:00, or with a commitment on record, the engine treats the request as a farewell: it
     reaches only what "bye" reaches.
     """
-    return bool(_end_request_sentences(text))
+    return bool(_end_request_sentences(text, permission=permission))
 
 
 def explicit_end_request(text: object) -> bool:
@@ -1368,7 +1773,9 @@ def strictly_names_end(text: object) -> bool:
 END_INTENT_LEVELS = ("no", "maybe", "end")
 
 
-def end_intent_level(text: object, verdict: str | None = None) -> str:
+def end_intent_level(
+    text: object, verdict: str | None = None, *, permission: bool = False
+) -> str:
     """How surely this turn asks to stop the interview or the role play: end, maybe or no.
 
     The regex reading first: an explicit request (``explicit_end_request``) is "end", any other
@@ -1388,7 +1795,7 @@ def end_intent_level(text: object, verdict: str | None = None) -> str:
     """
     if explicit_end_request(text):
         regex = "end"
-    elif detect_end_request(text):
+    elif detect_end_request(text, permission=permission):
         regex = "maybe"
     else:
         regex = "no"
@@ -1627,9 +2034,13 @@ class CoverageTracker:
             injection=injection,
         )
 
-    def note_learner_text(self, text: object, turn: int | None = None) -> tuple[str, ...]:
-        """Record reveals in what the learner actually said."""
-        return self.gate.note_learner_text(text, turn if turn is not None else self.turn)
+    def note_learner_text(
+        self, text: object, turn: int | None = None, echoed: frozenset[str] = frozenset()
+    ) -> tuple[str, ...]:
+        """Record reveals in what the learner actually said (``echoed``: see the gate's)."""
+        return self.gate.note_learner_text(
+            text, turn if turn is not None else self.turn, echoed=echoed
+        )
 
     def apply_judge(self, result: JudgeResult | None, judged_turn: int) -> bool:
         """Merge a validated judge result for ``judged_turn``; None changes nothing."""

@@ -237,7 +237,18 @@ class ReplayInvariantTests(unittest.TestCase):
             reasons = turn.plan["reasons"]
             if "ask_yields_to_owed_move" in reasons and not (turn.plan["move_id"] or "").startswith("F4"):
                 seen += 1
-                self.assertIn("The advisor just proposed a call or a next step", turn.reminder)
+                # Simulation diagnosis 2 (MF5, R1_ASK_KIND_NOTE): the note names the kind of ask.
+                self.assertTrue(
+                    any(
+                        note in turn.reminder
+                        for note in (
+                            "The advisor just proposed a call or a next step",
+                            "The advisor just proposed a call.",
+                            "The advisor just asked you to sign up now.",
+                        )
+                    ),
+                    turn.reminder,
+                )
         callback = self.turns[CALLBACK_GROUP - 1]
         self.assertIn("ask_yields_to_owed_move", callback.plan["reasons"])
         self.assertTrue((callback.plan["move_id"] or "").startswith("F4") or seen >= 1)

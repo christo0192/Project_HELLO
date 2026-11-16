@@ -2080,6 +2080,261 @@ class CoerciveS03Tests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(urgency_levers(text)[1])
 
+class EndingsTrackerTests(unittest.TestCase):
+    """M032 S3: the abuse reader (S3.4) and the permission form of an end request (SWEEP-24 (c)).
+
+    Every line is synthetic; the corpus checks read the 2,136 labelled advisor turns.
+    """
+
+    @staticmethod
+    def corpus():
+        fixtures = HERE / "tests" / "fixtures"
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if line:
+                    yield json.loads(line)["text"]
+
+    def test_abuse_aimed_at_her(self):
+        from r1_tracker import detect_abuse
+
+        for text in ("Fuck off.", "Screw you, I'm done with this.", "You are an idiot.",
+                     "You stupid woman, listen to me.", "Shut up.", "Oh just go away.",
+                     "Get lost, lady.", "Chup karo.", "Tu chutiya hai kya", "Are you stupid?",
+                     "Okay. Shut up and let me talk."):
+            with self.subTest(text=text):
+                self.assertTrue(detect_abuse(text))
+
+    def test_banter_and_talk_about_others_is_no_abuse(self):
+        from r1_tracker import detect_abuse
+
+        for text in ("The doubts will go away once you start.",
+                     "They told me to shut up in my last job.",
+                     "Shut up, that is amazing news!", "My old boss was an idiot.",
+                     "What the hell, that's cheap.", "You are not stupid for asking.",
+                     "Get lost in the projects, they're fun.", "Stupid question, but what's "
+                     "your budget?", "I won't go away without answering you."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_abuse(text))
+
+    def test_no_real_advisor_turn_reads_as_abuse(self):
+        from r1_tracker import detect_abuse
+
+        self.assertEqual([text[:60] for text in self.corpus() if detect_abuse(text)], [])
+
+    def test_the_permission_form_is_a_maybe_request_only_when_asked(self):
+        from r1_tracker import detect_end_request, end_intent_level, explicit_end_request
+
+        for text in ("You can disconnect the call.", "Okay, you can end the call now.",
+                     "You may hang up the call now."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_end_request(text))
+                self.assertTrue(detect_end_request(text, permission=True))
+                self.assertEqual(end_intent_level(text, None, permission=True), "maybe")
+                self.assertFalse(explicit_end_request(text))
+        for text in ("you can end the call and I'll call you back tomorrow",
+                     "you can end the course early", "you can cut the cost with EMI",
+                     "You can end the call now, I will call you back tomorrow."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_end_request(text, permission=True))
+
+    def test_the_permission_form_adds_no_corpus_hit(self):
+        from r1_tracker import detect_end_request
+
+        gained = [
+            text[:60]
+            for text in self.corpus()
+            if detect_end_request(text, permission=True) and not detect_end_request(text)
+        ]
+        self.assertEqual(gained, [])
+
+    def test_the_readers_stay_linear(self):
+        import time
+
+        from r1_tracker import detect_abuse, detect_end_request
+
+        for hostile in ("you " * 4000 + "idiot", "shut up, " * 3000, "okay, " * 4000 + "go away",
+                        "you can " * 3000 + "end the call"):
+            start = time.perf_counter()
+            detect_abuse(hostile)
+            detect_end_request(hostile, permission=True)
+            self.assertLess(time.perf_counter() - start, 2.0)
+
+
+
+def advisor_corpus_texts() -> list[str]:
+    """The tuned advisor corpus plus the held-out set (M032 S7L corpus checks)."""
+    texts: list[str] = []
+    for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+        path = HERE / "tests" / "fixtures" / name
+        texts.extend(
+            json.loads(row)["text"] for row in path.read_text(encoding="utf-8").splitlines() if row
+        )
+    return texts
+
+
+class RoleConfusionTests(unittest.TestCase):
+    """M032 SWEEP-10 (flag R1_ROLE_CONFUSION_V2): role reversals are read on the first phrasing."""
+
+    REVERSALS = (
+        "Can you sell this to me?",
+        "Could you pitch the course to me.",
+        "Sell me the course",
+        "I'm interested to purchase a course",
+        "I'm looking to buy a product, not to sell",
+        "I want to buy, not sell",
+        "what program do you sell",
+        "Okay, so what product are you selling?",
+        "Can you sell this to me, please?",
+        "Could you pitch me the program?",
+    )
+    IN_ROLE = (
+        "Can you sell this to your husband?",
+        "Could you pitch it to your husband tonight?",
+        "Can you sell this course to your family?",
+        "Can you pitch this to your manager for sponsorship?",
+        "Would you pitch that to your company for reimbursement?",
+        "If you're interested to purchase, I can send the link.",
+        "No hard sell, I promise.",
+        "I'm not here to sell you anything.",
+        "Are you looking to buy the course this month?",
+        "Let me sell you the course.",
+        "Can you sell me on why this is worth it?",
+        "We never sell your data.",
+        # Review S7L-R1: a filler comma, a split sentence, a bare pronoun and her own job.
+        "Could you pitch it, um, to your husband?",
+        "Can you sell this, um, to your husband?",
+        "Would you pitch it, maybe to your boss, for sponsorship?",
+        "Can you pitch it? To your husband, I mean.",
+        "Can you pitch the course? To your husband, I mean.",
+        "Could you pitch the course, um, to your manager?",
+        "Could you just pitch it.",
+        "Can you sell it?",
+        "What product do you sell at your current company?",
+        "So what product do you sell?",
+        "I'm planning to buy the product for my team.",
+    )
+
+    def test_the_first_phrasings_are_coach_breaks_and_role_confusion(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.REVERSALS:
+            with self.subTest(text=text):
+                self.assertEqual(detect_character_break(text, role_v2=True), "coach")
+                self.assertTrue(role_confusion_in(text))
+
+    def test_in_role_sales_lines_are_neither(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.IN_ROLE:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_character_break(text, role_v2=True))
+                self.assertFalse(role_confusion_in(text))
+
+    def test_flag_off_reads_none_of_the_new_forms(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.REVERSALS[:7]:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_character_break(text))
+                self.assertFalse(role_confusion_in(text, v2=False))
+        # The role forms of the release before are still role confusion either way.
+        for text in ("I'm the buyer here.", "So, are you selling the course to me?"):
+            self.assertEqual(detect_character_break(text), "coach")
+            self.assertTrue(role_confusion_in(text, v2=False))
+        self.assertFalse(role_confusion_in("I'm confused."))
+
+    def test_no_corpus_turn_is_a_new_coach_hit(self):
+        texts = advisor_corpus_texts()
+        self.assertGreater(len(texts), 2000)
+        new_hits = [
+            text
+            for text in texts
+            if detect_character_break(text, role_v2=True) == "coach"
+            and detect_character_break(text) != "coach"
+        ]
+        self.assertEqual(new_hits, [])
+
+    def test_the_readers_stay_linear_on_long_turns(self):
+        from r1_tracker import role_confusion_in
+
+        for text in (
+            "can you sell " * 1000,
+            "i'm really interested to " * 400,
+            "i want to buy " + "x" * 4000,
+            "okay, " * 1000 + "sell me",
+            "what course " * 800,
+        ):
+            started = time.perf_counter()
+            detect_character_break(text[:4000], role_v2=True)
+            role_confusion_in(text[:4000])
+            self.assertLess(time.perf_counter() - started, 0.25)
+
+class RoleReversalSim2Tests(unittest.TestCase):
+    """Simulation diagnosis 2 (MF1, R1_ROLE_CONFUSION_V2): more first phrasings of a candidate who
+    casts themselves as the buyer.  Synthetic paraphrases."""
+
+    REVERSALS = (
+        "So I'd like a data science course, could you sell me one?",
+        "I'm looking to buy one of your company's programs.",
+        "Wait, I'm the one looking to buy here, not to sell.",
+        "Look, I am buying, not you.",
+        "No no, I am buying, not selling.",
+    )
+    IN_ROLE = (
+        "Can you sell me on why it's worth the money?",
+        "What product do you sell at your company?",
+        "Could you pitch it to your husband?",
+        "I'm planning to buy the product for my team.",
+        "I'm buying time, not making promises.",
+    )
+
+    def test_the_reversals_are_coach_breaks(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.REVERSALS:
+            with self.subTest(text=text):
+                self.assertTrue(role_confusion_in(text))
+                self.assertEqual(detect_character_break(text, role_v2=True), "coach")
+                self.assertFalse(role_confusion_in(text, v2=False))
+
+    def test_in_role_lines_are_not(self):
+        from r1_tracker import role_confusion_in
+
+        for text in self.IN_ROLE:
+            with self.subTest(text=text):
+                self.assertFalse(role_confusion_in(text))
+                self.assertIsNone(detect_character_break(text, role_v2=True))
+
+
+class DigFirstFollowupTests(unittest.TestCase):
+    """Simulation diagnosis 2 (ND2, R1_DIG_FIRST): a follow-up worded about her own account
+    releases the need she just hinted at.  Synthetic text."""
+
+    def test_the_wide_followups(self):
+        from r1_personas import detect_followup
+
+        for text in (
+            "What made it fizzle out?",
+            "Was it mostly that nobody kept you on track, or the material?",
+            "Why did that stop, do you think?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_followup(text, wide=True))
+                self.assertFalse(detect_followup(text))
+        for text in ("What made you fill in the form?", "It was mostly the price."):
+            with self.subTest(text=text):
+                self.assertFalse(detect_followup(text, wide=True))
+
+    def test_the_gate_releases_on_the_wide_followup(self):
+        for wide, released in ((True, ("H2",)), (False, ())):
+            with self.subTest(wide=wide):
+                gate_ = gate()
+                gate_.wide_followup = wide
+                first = gate_.observe_candidate_turn("What held you back from starting before?", 1)
+                self.assertEqual(first.first_probes, ("H2",))
+                update = gate_.observe_candidate_turn("What made it fizzle out?", 2)
+                self.assertEqual(update.released, released)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,12 @@
 """Unit tests for ``r1_prompts``: separated prefixes, ephemeral reminders and the filter."""
 from __future__ import annotations
 
+import os
 import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -731,21 +733,35 @@ class ContextFilterTests(unittest.TestCase):
         self.assertEqual(select_context(items, "roleplay"), [])
 
 
+# M032 SWEEP-26: the wrap-up reminder's sentences, each behind its rollback flag (both off: the
+# release before).
+WRAPUP_FLAGS_OFF = {
+    "R1_WRAPUP_ANSWERS": "0",
+    "R1_WRAPUP_ONE_MENTION": "0",
+    "R1_WRAPUP_NEXT_STEPS": "0",
+}
+
+
 class WrapupReminderTests(unittest.TestCase):
     """R1-Q item 8: the model answered "Alright" with a goodbye, and L-CLOSE said it again."""
 
+    @mock.patch.dict(os.environ, WRAPUP_FLAGS_OFF)
     def test_the_wrapup_replies_carry_a_note_that_forbids_a_goodbye(self):
         from r1_prompts import WRAPUP_REMINDER, interviewer_reminder
         from r1_replies import Reply, llm_messages
 
         for phase in ("wrapup", "closing"):
             with self.subTest(phase=phase):
-                self.assertEqual(interviewer_reminder(phase), WRAPUP_REMINDER)
+                # M032 S5: the delivery rider follows the note when R1_INTERVIEWER_VOICE is on.
+                self.assertEqual(interviewer_reminder(phase, rider=False), WRAPUP_REMINDER)
                 messages = llm_messages(
                     Reply(phase=phase, candidate_text="What is the shift?"), P1, []
                 )
                 self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
-                self.assertEqual(messages[-2], {"role": "system", "content": WRAPUP_REMINDER})
+                self.assertEqual(
+                    messages[-2], {"role": "system", "content": interviewer_reminder(phase)}
+                )
+                self.assertTrue(messages[-2]["content"].startswith(WRAPUP_REMINDER))
                 self.assertEqual(messages[-1], {"role": "user", "content": "What is the shift?"})
         lowered = WRAPUP_REMINDER.lower()
         for phrase in ("never say goodbye", "have a great day", "never thank", "closes by itself"):
@@ -757,7 +773,8 @@ class WrapupReminderTests(unittest.TestCase):
 
         for phase in ("opening", "icebreaker", "transition", "roleplay_exit", "roleplay", ""):
             self.assertNotEqual(interviewer_reminder(phase), WRAPUP_REMINDER)
-        self.assertEqual(interviewer_reminder("icebreaker"), GETTING_TO_KNOW_YOU_NOTE)
+            self.assertNotIn(WRAPUP_REMINDER, interviewer_reminder(phase) or "")
+        self.assertEqual(interviewer_reminder("icebreaker", rider=False), GETTING_TO_KNOW_YOU_NOTE)
         self.assertIsNone(interviewer_reminder("roleplay_exit"))
         self.assertNotIn(WRAPUP_REMINDER, interviewer_prefix())
         self.assertEqual(interviewer_prefix(), interviewer_prefix())
@@ -802,15 +819,71 @@ class TransitionReminderTests(unittest.TestCase):
     """M1 (owner decision 2026-11-03): Christy answers questions before the role-play starts."""
 
     def test_the_transition_gets_its_own_note(self):
+        import os
+        from unittest import mock
+
         from r1_prompts import TRANSITION_REMINDER, interviewer_reminder
         from r1_replies import Reply, llm_messages
 
-        self.assertEqual(interviewer_reminder("transition"), TRANSITION_REMINDER)
+        # M032 S6: R1_TRANSITION_REPAIR=0 gives back the M1 note exactly.
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self._check_transition_note(TRANSITION_REMINDER, interviewer_reminder, Reply, llm_messages)
+
+    def test_the_repaired_transition_note_asks_nothing_itself(self):
+        # M032 S6 item 7 (fda9e9f6 #25: "What would you like to know?" and the start question in one
+        # breath): a request to ask gets "Of course, go ahead." and stops, and no answer ends with a
+        # question of its own; every M1 rule is kept.
+        from r1_prompts import (
+            TRANSITION_REMINDER,
+            TRANSITION_REMINDER_REPAIRED,
+            interviewer_reminder,
+        )
+        from r1_replies import Reply, llm_messages
+
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_ANSWERS": "0"}):  # D4-TRANS-Q1 off
+            self._check_transition_note(
+                TRANSITION_REMINDER_REPAIRED, interviewer_reminder, Reply, llm_messages
+            )
+        lowered = TRANSITION_REMINDER_REPAIRED.lower()
+        self.assertIn('say "of course, go ahead." and stop', lowered)
+        self.assertIn("never end your reply with a question", lowered)
+        self.assertNotIn("invite the question", lowered)
+        self.assertIn("invite the question", TRANSITION_REMINDER.lower())
+
+    def test_the_answers_note_has_no_phrase_to_copy(self):
+        # M032 live simulation, diagnosis 4 (D4-TRANS-Q1, R1_TRANSITION_ANSWERS on, the default):
+        # "happy to go into the hours or anything else" and "offer to go over it again" were copied
+        # into answers nobody asked for; every other rule of the repaired note is kept.
+        from r1_prompts import TRANSITION_REMINDER_ANSWERS, interviewer_reminder
+        from r1_replies import Reply, llm_messages
+
+        self._check_transition_note(
+            TRANSITION_REMINDER_ANSWERS, interviewer_reminder, Reply, llm_messages
+        )
+        lowered = TRANSITION_REMINDER_ANSWERS.lower()
+        self.assertNotIn("happy to go into the hours", lowered)
+        self.assertNotIn("offer to go over it again", lowered)
+        self.assertIn("give one plain sentence", lowered)
+        self.assertIn('say "of course, go ahead." and stop', lowered)
+        self.assertIn("never end your reply with a question", lowered)
+        # D5-TRANS1: "has just been given" is only for a request to hear the brief again; how to
+        # approach the call gets one plain sentence.
+        self.assertIn("ask to hear the instructions, the brief or the scenario again", lowered)
+        self.assertIn("how to approach or handle the call", lowered)
+        self.assertIn("find out what she needs and help her decide", lowered)
+
+    def _check_transition_note(self, note, interviewer_reminder, Reply, llm_messages):
+        # M032 S5: the delivery rider follows the note when R1_INTERVIEWER_VOICE is on.
+        TRANSITION_REMINDER = note
+        self.assertEqual(interviewer_reminder("transition", rider=False), TRANSITION_REMINDER)
         messages = llm_messages(
             Reply(phase="transition", candidate_text="What are the working days?"), P1, []
         )
         self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
-        self.assertEqual(messages[-2], {"role": "system", "content": TRANSITION_REMINDER})
+        self.assertEqual(
+            messages[-2], {"role": "system", "content": interviewer_reminder("transition")}
+        )
+        self.assertTrue(messages[-2]["content"].startswith(TRANSITION_REMINDER))
         lowered = TRANSITION_REMINDER.lower()
         for phrase in (
             "one or two short",
@@ -1127,5 +1200,500 @@ class LearnerBehaviourS03Tests(unittest.TestCase):
         self.assertIn("do not refuse", prefix)
 
 
+# SHA-256 of the interviewer prefix as it was before M032 S5 (content revision 20): the voice flag
+# OFF must give back exactly this text.
+PRE_M032_INTERVIEWER_PREFIX_SHA256 = (
+    "a2c77d230a44f3fa5f0eb89ee6fa65931f1b5065476d76ef51ade6c1b4ca84d2"
+)
+# ... and the three interviewer notes, which the rider flag OFF must give back exactly.
+PRE_M032_NOTE_SHA256 = {
+    "icebreaker": "d11a202592f2584912bf3de3907ed399e2326b5af7efe50ff6404cafcc66b5f3",
+    "transition": "ec62c9b595338e25e832975c21597d717ec06a1ed1010781bceb92093710eac6",
+    "wrapup": "8cdc911aedc783c727d595955eb046cdfe7f0a660537ce93b3a0a0a6a2992225",
+}
+# Warm interviewer lines of the kind the voice text asks for (synthetic): none may read as an echo
+# of the voice text, or the guard would block them as a leak.
+WARM_INTERVIEWER_LINES = (
+    "Got it, so mostly inbound leads.",
+    "Thanks for sharing that.",
+    "That makes sense.",
+    "Okay, eight years in insurance, that's a long run.",
+    "Sounds like a busy day.",
+    "No problem, we can skip that one.",
+    "Take your time.",
+    "Right, so you were calling working parents.",
+    "I'd love to hear a bit more about that.",
+    "This is meant to be a relaxed chat, so take it at your own pace.",
+    "Let's keep it conversational, there are no trick questions here.",
+    "I'm curious, what does a normal morning look like for you?",
+)
+# Natural answers in the transition and the wrap-up that reuse the voice text's everyday wording
+# (review of S5, correctness R5; synthetic): asked "how should I run the call?", Christy may well
+# say these.
+NATURAL_REGISTER_LINES = (
+    "Keep it natural and two-way, never like a checklist.",
+    "Just talk the way people talk on a call.",
+    "I'll react in a few words to what you say.",
+    "Use contractions, short sentences, one idea per turn.",
+    "It sounds like you put people at ease, the way a good advisor should.",
+    "Just take in what they say without judging it, then respond.",
+    "React to one specific thing they just said before you ask your next question.",
+    "Be relaxed, curious and friendly, and put people at ease.",
+)
+
+
+def _sha(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class InterviewerVoiceTests(unittest.TestCase):
+    """M032 S5 item 1: Christy's persona and register ride inside the byte-stable prefix.
+
+    The owner's call fda9e9f6 (#3-#21): every icebreaker reply opened with a verdict on the answer
+    and read as an interrogation.  The phone Christy has a persona and register; R1's had none.
+    With ``R1_REACTION_VARIETY`` off: diagnosis 3 rewords the react clause (D3-ICE1,
+    ``TestReactionVarietyPrompt``), and these pin S5's text as the flag-off prefix and rider.
+    """
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {"R1_REACTION_VARIETY": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_voice_text_is_appended_inside_the_prefix_and_is_byte_stable(self):
+        from r1_prompts import INTERVIEWER_VOICE_TEXT
+
+        plain = interviewer_prefix(voice=False)
+        voiced = interviewer_prefix(voice=True)
+        self.assertEqual(voiced, plain + "\n" + INTERVIEWER_VOICE_TEXT)
+        self.assertEqual(voiced, interviewer_prefix(voice=True))
+        lowered = INTERVIEWER_VOICE_TEXT.lower()
+        for phrase in (
+            "relaxed, curious",
+            "put people at ease",
+            "contractions",
+            "short sentences",
+            "one idea per turn",
+            "one specific thing they just said",
+            "a few words",
+            "different word",
+            "never praise or rate",
+            '"solid experience"',
+            '"a real asset"',
+            '"i understand, but"',
+            "no jokes",
+        ):
+            self.assertIn(phrase, lowered, phrase)
+
+    def test_the_flag_off_gives_back_todays_prefix_exactly(self):
+        import os
+        from unittest import mock
+
+        self.assertEqual(_sha(interviewer_prefix(voice=False)), PRE_M032_INTERVIEWER_PREFIX_SHA256)
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "0"}):
+            self.assertEqual(_sha(interviewer_prefix()), PRE_M032_INTERVIEWER_PREFIX_SHA256)
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "1"}):
+            self.assertEqual(interviewer_prefix(), interviewer_prefix(voice=True))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("R1_INTERVIEWER_VOICE", None)
+            self.assertEqual(interviewer_prefix(), interviewer_prefix(voice=True))  # default ON
+
+    def test_the_voice_text_holds_no_persona_secret_or_rubric_word(self):
+        from r1_prompts import INTERVIEWER_VOICE_TEXT
+
+        lowered = INTERVIEWER_VOICE_TEXT.lower()
+        for name in ALL_PERSONA_NAMES:
+            self.assertNotIn(name.lower(), lowered)
+        for word in ("price", "discount", "objection", "persona", "enrol", "learner", "role-play",
+                     "$", "score", "rubric", "grade"):
+            self.assertNotIn(word, lowered, word)
+
+    def test_warm_lines_never_read_as_an_echo_of_the_voice_text(self):
+        from r1_guard import echo_detected
+        from r1_prompts import interviewer_control_prose
+
+        control = (interviewer_control_prose(),)
+        for line in WARM_INTERVIEWER_LINES + NATURAL_REGISTER_LINES:
+            with self.subTest(line=line):
+                self.assertFalse(echo_detected(line, control))
+        # Not vacuous: the prefix's private instruction prose is still caught.
+        words = re.findall(r"[A-Za-z']+", interviewer_control_prose())
+        self.assertTrue(echo_detected(" ".join(words[10:20]) + ".", control))
+
+    def test_the_echo_check_leaves_the_voice_text_out_whatever_the_flag(self):
+        # Review of S5 (correctness R5): with the voice text in the echo check, natural answers
+        # in the transition and the wrap-up ("Just talk the way people talk on a call.") were
+        # blocked as control leaks and counted toward the 3-hit gate.  The voice text holds
+        # nothing private; the plain prefix's instruction prose is what the check guards.
+        import os
+        from unittest import mock
+
+        from r1_prompts import INTERVIEWER_VOICE_TEXT, interviewer_control_prose
+
+        expected = control_prose(interviewer_prefix(voice=False))
+        for value in ("1", "0"):
+            with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": value}):
+                self.assertEqual(interviewer_control_prose(), expected)
+        self.assertNotIn(INTERVIEWER_VOICE_TEXT[:40], interviewer_control_prose())
+
+    def test_the_rider_rides_the_opening_icebreaker_transition_and_wrapup_notes(self):
+        from r1_prompts import (
+            GETTING_TO_KNOW_YOU_NOTE,
+            INTERVIEWER_DELIVERY_RIDER,
+            TRANSITION_REMINDER_ANSWERS,
+            WRAPUP_REMINDER,
+            interviewer_reminder,
+        )
+
+        expected = {
+            "opening": GETTING_TO_KNOW_YOU_NOTE,
+            "icebreaker": GETTING_TO_KNOW_YOU_NOTE,
+            # M032 S6 and diagnosis 4 (R1_TRANSITION_REPAIR and R1_TRANSITION_ANSWERS on)
+            "transition": TRANSITION_REMINDER_ANSWERS,
+            "wrapup": WRAPUP_REMINDER,
+            "closing": WRAPUP_REMINDER,
+        }
+        for phase, note in expected.items():
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    interviewer_reminder(phase, rider=True),
+                    note + "\n" + INTERVIEWER_DELIVERY_RIDER,
+                )
+                self.assertEqual(interviewer_reminder(phase, rider=False), note)
+        self.assertIsNone(interviewer_reminder("roleplay_exit", rider=True))
+        self.assertIsNone(interviewer_reminder("roleplay", rider=True))
+        # A per-turn note (the icebreaker plan's) takes the phase note's place, rider last.
+        self.assertEqual(
+            interviewer_reminder("icebreaker", note="NOTE", rider=True),
+            "NOTE\n" + INTERVIEWER_DELIVERY_RIDER,
+        )
+        self.assertEqual(interviewer_reminder("icebreaker", note="NOTE", rider=False), "NOTE")
+
+    def test_the_rider_flag_off_gives_back_todays_notes_exactly(self):
+        import os
+        from unittest import mock
+
+        from r1_prompts import interviewer_reminder
+
+        # M032 S6: the transition note is the repair's too, so both flags go off for today's notes.
+        with mock.patch.dict(
+            os.environ, {"R1_INTERVIEWER_VOICE": "off", "R1_TRANSITION_REPAIR": "0"}
+        ):
+            for phase, digest in PRE_M032_NOTE_SHA256.items():
+                with self.subTest(phase=phase):
+                    self.assertEqual(_sha(interviewer_reminder(phase)), digest)
+            self.assertEqual(_sha(interviewer_reminder("opening")), PRE_M032_NOTE_SHA256["icebreaker"])
+            self.assertEqual(_sha(interviewer_reminder("closing")), PRE_M032_NOTE_SHA256["wrapup"])
+
+    def test_the_rider_is_short_and_says_how_to_sound(self):
+        from r1_prompts import INTERVIEWER_DELIVERY_RIDER
+
+        self.assertLessEqual(len(INTERVIEWER_DELIVERY_RIDER.split()), 45)  # about 60 tokens
+        lowered = INTERVIEWER_DELIVERY_RIDER.lower()
+        for phrase in ("contractions", "short sentences", "a few words of reaction", "praise"):
+            self.assertIn(phrase, lowered)
+        for word in RUBRIC_WORDS:
+            self.assertIsNone(re.search(rf"\b{re.escape(word)}\b", INTERVIEWER_DELIVERY_RIDER), word)
+
+    def test_an_interviewer_call_carries_the_voice_prefix_and_the_rider_last(self):
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE, INTERVIEWER_DELIVERY_RIDER
+        from r1_replies import Reply, llm_messages
+
+        messages = llm_messages(
+            Reply(phase="icebreaker", candidate_text="I sell courses."), P1, [], voice=True
+        )
+        self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix(voice=True)})
+        self.assertEqual(
+            messages[-2]["content"], GETTING_TO_KNOW_YOU_NOTE + "\n" + INTERVIEWER_DELIVERY_RIDER
+        )
+        quiet = llm_messages(
+            Reply(phase="icebreaker", candidate_text="I sell courses."), P1, [], voice=False
+        )
+        self.assertEqual(quiet[0], {"role": "system", "content": interviewer_prefix(voice=False)})
+        self.assertEqual(quiet[-2]["content"], GETTING_TO_KNOW_YOU_NOTE)
+        # The learner's call is untouched by the interviewer's voice.
+        self.assertNotIn("relaxed, curious", learner_prefix(P1))
+
+
+class LearnerVoiceS2PromptTests(unittest.TestCase):
+    """M032 S2 reminder texts (``turn_reminder(voice_v2=True, ...)``)."""
+
+    def v2_reminders(self):
+        import r1_prompts as p
+        from r1_scheduler import CURIOSITY_LABELS_V2
+
+        yield turn_reminder(
+            P1, r_sec=10, voice_v2=True, style_note=p.STYLE_NOTES_V2[1], length_note=p.LENGTH_ONE
+        )
+        yield turn_reminder(
+            P1,
+            r_sec=10,
+            voice_v2=True,
+            curiosity=CURIOSITY_LABELS_V2["format"][1],
+            curiosity_v2=True,
+            price_wrap=True,
+            offer_usd=6500,
+            new_offer_usd=6500,
+        )
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, price_wrap=True, offer_usd=8500)
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, new_offer_usd=8500)
+        for spec in PLAN:
+            if not spec.brief:
+                continue
+            for join in ("topic_fresh", "new_topic", "price"):
+                yield turn_reminder(
+                    P1,
+                    r_sec=300,
+                    intent_brief=spec.worry or spec.brief.replace("{decision_maker}", "husband"),
+                    intent_worry=spec.worry,
+                    must_say=spec.must_say,
+                    voice_v2=True,
+                    intent_join=join,
+                    style_note=p.INTENT_OPENER_NOTES[0],
+                )
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, confirm=True)
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, reaction_only=True)
+        notes = (
+            p.HINGE_USED_NOTE, p.VERDICT_USED_NOTE, p.NOT_ANSWERED_NOTE, p.COACH_RESUME_NOTE,
+            p.OFFER_MADE_NOTE_V2, p.ANSWERED_YOU_NOTE_V2, p.PUSH_REACT_NOTE_V2,
+            p.NOT_TODAY_RESERVED_NOTE, p.NO_COMMIT_INTENT_NOTE, p.ACK_TURN_NOTE,
+            p.ACK_TURN_CONCERNS_NOTE.format(concerns="that you want to think it over"),
+            p.SOFT_TIC_NOTE.format(words='"actually"'), p.IMPLAUSIBLE_FREE_NOTE,
+            p.IMPLAUSIBLE_PRICE_NOTE.format(amount="$500"),
+            " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS, p.OFFER_TERMS_FREE_EXTRA)),
+            " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_IN_PARTS)),
+        )
+        yield turn_reminder(P1, r_sec=10, voice_v2=True, notes=notes)
+
+    def test_no_v2_reminder_carries_rubric_vocabulary_or_an_owed_line(self):
+        for text in self.v2_reminders():
+            for word in RUBRIC_WORDS + ("grading", "grader", "graded"):
+                self.assertNotRegex(text, rf"\b{re.escape(word)}\b", word)
+            for spec in PLAN:
+                if spec.line:
+                    self.assertNotIn(spec.line.format(decision_maker="husband"), text)
+                for variant in (*spec.variants, *spec.worry_variants):
+                    self.assertNotIn(variant.format(decision_maker="husband"), text)
+
+    def test_the_rider_is_the_last_line_and_the_worry_is_quoted(self):
+        import r1_prompts as p
+
+        for text in self.v2_reminders():
+            self.assertIn(
+                text.splitlines()[-1], (p.LEARNER_DELIVERY_RIDER, p.LEARNER_DELIVERY_RIDER_BASE)
+            )
+        for spec in PLAN:
+            if spec.worry:
+                text = turn_reminder(
+                    P1, r_sec=300, intent_brief=spec.worry, intent_worry=spec.worry, voice_v2=True
+                )
+                self.assertIn(p.WORRY_LINE.format(worry=spec.worry), text)
+                self.assertNotIn(spec.worry, p.control_prose(text))  # voicing it is no echo
+
+    def test_with_every_s2_argument_at_its_default_the_reminder_is_unchanged(self):
+        import r1_prompts as p
+
+        for kwargs in (
+            {},
+            {"intent_brief": SPEC_BY_ID[F1_ANCHOR].brief, "must_say": ("$9,000",)},
+            {"price_wrap": True, "offer_usd": 8500, "new_offer_usd": 8500},
+            {"curiosity": "how many hours a week it takes"},
+            {"confirm": True},
+            {"reaction_only": True},
+        ):
+            with self.subTest(kwargs=kwargs):
+                text = turn_reminder(P1, r_sec=100, **kwargs)
+                for new in (
+                    p.LEARNER_DELIVERY_RIDER_BASE, p.FREE_REPLY_NOTE_V2, p.INTENT_SHAPE_TOPIC_FRESH,
+                    p.INTENT_SHAPE_NEW_TOPIC, p.INTENT_SHAPE_PRICE, "What is on your mind",
+                    "otherwise leave it for later", "Keep this reply",
+                    "and to anything that came with it", "still more than you hoped to pay",
+                ):
+                    self.assertNotIn(new, text)
+        free = turn_reminder(P1, r_sec=100)
+        self.assertIn(p.FREE_REPLY_NOTE, free)
+        self.assertIn(p.FREE_REPLY_NOTE_V2, turn_reminder(P1, r_sec=100, voice_v2=True))
+        self.assertEqual(learner_prefix(P1), learner_prefix(P1, offer_realism=False))
+        self.assertIn(p.PREFIX_OFFER_SENTENCE, learner_prefix(P1))
+        self.assertIn(p.PREFIX_OFFER_SENTENCE_V2, learner_prefix(P1, offer_realism=True))
+
+
+class WrapupAnswersReminderTests(unittest.TestCase):
+    """M032 SWEEP-26 (S3.5): one merged wrap-up reminder, by flag.
+
+    a95398ab #66-68: asked whether any part of the interview was left, Christy deferred to the
+    hiring team and L-CLOSE named it again.  With R1_WRAPUP_ANSWERS a what's-left question gets a
+    sentence that adds no fact; with R1_WRAPUP_ONE_MENTION a question she cannot answer gets
+    L-FAQ-DEFER-WRAP; R1_WRAPUP_NEXT_ROUND (default off) swaps in the second-round sentence.
+    """
+
+    EVERYTHING = (
+        'If they ask what happens next or whether anything is left, say exactly: "That\'s '
+        'everything for today\'s interview."'
+    )
+    CANNOT = (
+        "If you cannot answer a question (pay, work mode, training, timelines, whether they will "
+        "be selected), say exactly: \"I'm afraid that's not something I can tell you.\" instead "
+        "of the line in your instructions, and do not say who will follow up."
+    )
+    ANSWER = "Answer the question in one or two short sentences."
+
+    def test_all_four_flag_combinations(self):
+        from r1_prompts import WRAPUP_REMINDER, wrapup_reminder
+
+        self.assertEqual(wrapup_reminder(), WRAPUP_REMINDER)
+        self.assertEqual(
+            wrapup_reminder(answers=True),
+            WRAPUP_REMINDER.replace(self.ANSWER, f"{self.ANSWER} {self.EVERYTHING}"),
+        )
+        self.assertEqual(
+            wrapup_reminder(one_mention=True),
+            WRAPUP_REMINDER.replace(self.ANSWER, f"{self.ANSWER} {self.CANNOT}"),
+        )
+        both = wrapup_reminder(answers=True, one_mention=True)
+        self.assertEqual(
+            both,
+            WRAPUP_REMINDER.replace(self.ANSWER, f"{self.ANSWER} {self.EVERYTHING} {self.CANNOT}"),
+        )
+        # What's left comes first (its own sentence), then what she cannot answer.
+        self.assertLess(both.index("whether anything is left"), both.index("cannot answer"))
+
+    def test_the_second_round_sentence_waits_for_its_own_flag(self):
+        from r1_prompts import WRAPUP_NEXT_ROUND_LINE, wrapup_reminder
+
+        on = wrapup_reminder(answers=True, next_round=True)
+        self.assertIn(f'"{WRAPUP_NEXT_ROUND_LINE}"', on)
+        self.assertNotIn("everything for today", on)
+        # Without the what's-left flag it is not said at all.
+        self.assertNotIn(WRAPUP_NEXT_ROUND_LINE, wrapup_reminder(next_round=True))
+
+    def test_the_second_round_sentence_restates_the_role_process(self):
+        # It restates role.process, deliberately kept out of the interviewer's FAQ: if the process
+        # changes, this sentence must change with it (owner and HR first).
+        from r1_prompts import WRAPUP_NEXT_ROUND_LINE
+        from r1_world import AUDIENCE_INTERVIEWER_FAQ, fact, facts_for
+
+        process = fact("role.process").text.lower()
+        self.assertIn("round 2 is a functional and culture interview", process)
+        self.assertIn("functional and culture interview", WRAPUP_NEXT_ROUND_LINE.lower())
+        self.assertNotIn("role.process", {item.id for item in facts_for(AUDIENCE_INTERVIEWER_FAQ)})
+
+    def test_the_session_flags_reach_the_wrap_up_reply(self):
+        from r1_prompts import wrapup_reminder
+        from r1_replies import Reply, llm_messages
+
+        reply = Reply(phase="wrapup", candidate_text="Is anything left?")
+        # Christy's delivery rider (M032 S5, R1_INTERVIEWER_VOICE) is off here: it follows the
+        # wrap-up's note when on (``InterviewerVoiceTests``); this test is about the note itself.
+        messages = llm_messages(reply, P1, [], voice=False)
+        self.assertEqual(
+            messages[-2]["content"],
+            wrapup_reminder(answers=True, one_mention=True, next_steps=True),
+        )
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_ROUND": "1"}):
+            messages = llm_messages(reply, P1, [], voice=False)
+        self.assertEqual(
+            messages[-2]["content"],
+            wrapup_reminder(answers=True, one_mention=True, next_round=True, next_steps=True),
+        )
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_ONE_MENTION": "0"}):
+            messages = llm_messages(reply, P1, [], voice=False)
+        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True, next_steps=True))
+        with mock.patch.dict(os.environ, {"R1_WRAPUP_NEXT_STEPS": "0"}):
+            messages = llm_messages(reply, P1, [], voice=False)
+        # Simulation diagnosis 3 (D3-WRAP1): OFF restores "say it has been noted".
+        self.assertEqual(messages[-2]["content"], wrapup_reminder(answers=True, one_mention=True))
+        self.assertIn("has been noted", messages[-2]["content"])
+        self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix(voice=False)})
+
+    def test_the_quoted_lines_are_dropped_from_the_echo_check(self):
+        from r1_prompts import wrapup_reminder
+
+        prose = control_prose(wrapup_reminder(answers=True, one_mention=True))
+        self.assertNotIn("everything for today", prose)
+        self.assertNotIn("not something I can tell you", prose)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+class TestReactionVarietyPrompt(unittest.TestCase):
+    """M032 diagnosis 3 (D3-ICE1, ``R1_REACTION_VARIETY``): the react clause of the voice text and
+    the delivery rider, and (D3-TRANS-JOB1) the broad-question line of the transition note."""
+
+    def test_the_voice_text_asks_for_a_reaction_not_a_summary(self) -> None:
+        import r1_prompts
+
+        new = r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS
+        self.assertNotIn("react in a few words to one specific thing", new)
+        for phrase in ('"Right"', '"Got it"', "never sum up or label what they said",
+                       "that's a good stretch", "that's a clear path", "that's hands-on",
+                       "that's a long run"):
+            self.assertIn(phrase, new)
+        # The rest of the voice text is unchanged.
+        old = r1_prompts.INTERVIEWER_VOICE_TEXT
+        self.assertTrue(new.startswith(old.split("Before you ask something")[0]))
+        self.assertTrue(new.endswith(old.split("Take in what they say")[1]))
+
+    def test_the_prefix_and_rider_follow_the_flag_and_off_is_byte_identical(self) -> None:
+        import r1_prompts
+
+        plain = interviewer_prefix(voice=False)
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=False),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT,
+        )
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=True, reactions_v2=False),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS,
+        )
+        # D4-ICE-ECHO1 (R1_REACTION_VARIETY_V2, the default): the v2 react clause in its place.
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=True),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS_V2,
+        )
+        self.assertEqual(
+            interviewer_prefix(voice=True, reactions=False, reactions_v2=True),
+            plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT,
+        )
+        self.assertEqual(interviewer_prefix(voice=False, reactions=True), plain)
+        for phase in ("icebreaker", "transition", "wrapup"):
+            with self.subTest(phase=phase):
+                v2 = r1_prompts.interviewer_reminder(phase, rider=True, reactions=True)
+                self.assertTrue(v2.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS_V2))
+                on = r1_prompts.interviewer_reminder(
+                    phase, rider=True, reactions=True, reactions_v2=False
+                )
+                off = r1_prompts.interviewer_reminder(phase, rider=True, reactions=False)
+                self.assertTrue(on.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS))
+                self.assertTrue(off.endswith(r1_prompts.INTERVIEWER_DELIVERY_RIDER))
+        with mock.patch.dict(os.environ, {"R1_REACTION_VARIETY": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_enabled())
+            self.assertEqual(
+                interviewer_prefix(voice=True), plain + "\n" + r1_prompts.INTERVIEWER_VOICE_TEXT
+            )
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "0"}):
+            self.assertFalse(r1_prompts.reaction_variety_enabled())
+        self.assertTrue(r1_prompts.reaction_variety_enabled())
+
+    def test_a_broad_question_about_the_job_gets_an_overview(self) -> None:
+        import r1_prompts
+
+        sentence = (
+            'If the question is broad ("tell me about the job"), give a one-sentence overview in '
+            "plain words (what the advisor does) and offer the detail"
+        )
+        self.assertIn(sentence, r1_prompts.TRANSITION_REMINDER_REPAIRED)
+        self.assertIn('"10 at night to 8 in the morning"', r1_prompts.TRANSITION_REMINDER_REPAIRED)
+        self.assertNotIn(sentence, r1_prompts.TRANSITION_REMINDER)
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_ANSWERS": "0"}):  # D4-TRANS-Q1 off
+            on = r1_prompts.interviewer_reminder("transition", rider=False)
+        self.assertIn(sentence, on)
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            off = r1_prompts.interviewer_reminder("transition", rider=False)
+        self.assertEqual(off, r1_prompts.TRANSITION_REMINDER)  # byte-identical with the flag off

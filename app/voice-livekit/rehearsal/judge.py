@@ -10,7 +10,8 @@ persona's hidden needs, the deck facts) and must return ONE JSON object::
                       "emotional": bool}],
      "misfires":    [{"turn": N, "kind": "unwarranted_gratitude|no_one_leaving|ignored_offer|
                                            repeat|off_card_fact|time_cue_reversed|anchor_as_offer|
-                                           decider_inconsistent|reopened_after_commit|other"}],
+                                           decider_inconsistent|reopened_after_commit|other",
+                      "quote": "...", "advisor_turn": N, "reason": "..."}],
      "stall_loop": bool,
      "style": {"reactions": 1-5, "followups": 1-5, "hesitation": 1-5, "continuity": 1-5,
                "variety": 1-5},
@@ -34,6 +35,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
+from rehearsal import flags
 from rehearsal import metrics as rule_metrics
 from rehearsal.advisor import deck_brief
 from rehearsal.metrics import mean, norm
@@ -92,6 +94,18 @@ RULE_CONFIRMED_KINDS = {
 # A hollow advisor turn: four words or fewer and no question ("Sure.", "Okay.", "Mm-hmm.").
 HOLLOW_MAX_WORDS = 4
 
+# D2-HM1 (``REHEARSAL_CITED_MISFIRES``): what the rubric and the schema add to ask the judge to cite the
+# ADVISOR turn a misfire fails to follow.  With the switch OFF the judge is sent the previous rubric and
+# schema byte for byte (``LEGACY_RUBRIC``, ``LEGACY_SCHEMA_TEXT``), so a live sweep compares like with like.
+_MISFIRE_CITATION = (
+    ", the 'advisor_turn' (the number of the ADVISOR "
+    "line it fails to follow: the same turn or an earlier one) and a 'reason' of a few words saying "
+    "what in that ADVISOR line it ignores or contradicts. A reply that makes sense as an answer to a "
+    "confusing ADVISOR line is not a misfire, and a misfire of kind other without an advisor_turn and "
+    "a reason is not counted"
+)
+_SCHEMA_CITATION = ',"advisor_turn":0,"reason":""'
+
 RUBRIC = (
     "You are a strict reviewer of a sales role-play. ADVISOR is a job candidate playing a "
     "Program Advisor; LEARNER is a simulated prospective learner (an AI character). Judge ONLY "
@@ -108,7 +122,7 @@ RUBRIC = (
     "feeling (emotional). A need the learner volunteers with no question about it is a reveal "
     "with probe_turn null.\n"
     "3. misfires: LEARNER lines that the conversation did not warrant. Every misfire needs a short "
-    "'quote' copied from the LEARNER line it is about. unwarranted_gratitude: "
+    "'quote' copied from the LEARNER line it is about" + _MISFIRE_CITATION + ". unwarranted_gratitude: "
     "thanking or being pleasantly surprised about a discount nobody offered; NOT when the OFFER "
     "LEDGER shows the advisor named a price or a discount in that turn or the one before. "
     "no_one_leaving: 'before you go' when the advisor was not ending the call (and the learner had "
@@ -142,10 +156,20 @@ RUBRIC = (
 SCHEMA_TEXT = (
     '{"objections":[{"family":"F1|F2|F3|F4","turn":0,"in_context":true,"canned_verbatim":false,'
     '"why":""}],"disclosures":[{"need":"H1|H2|H3","probe_turn":null,"reveal_turn":null,'
-    '"emotional":false}],"misfires":[{"turn":0,"kind":"other","quote":""}],"stall_loop":false,'
+    '"emotional":false}],"misfires":[{"turn":0,"kind":"other","quote":""' + _SCHEMA_CITATION + '}],'
+    '"stall_loop":false,'
     '"style":{"reactions":3,"followups":3,"hesitation":3,"continuity":3,"variety":3},'
     '"ignored_advisor_offers":[{"turn":0,"offer":""}]}'
 )
+LEGACY_RUBRIC = RUBRIC.replace(_MISFIRE_CITATION, "", 1)
+LEGACY_SCHEMA_TEXT = SCHEMA_TEXT.replace(_SCHEMA_CITATION, "")
+
+
+def rubric_and_schema() -> tuple[str, str]:
+    """The rubric and schema the judge is sent: with the citation (D2-HM1) unless the switch is OFF."""
+    if flags.on(flags.CITED_MISFIRES):
+        return RUBRIC, SCHEMA_TEXT
+    return LEGACY_RUBRIC, LEGACY_SCHEMA_TEXT
 
 
 def transcript_for_judge(record: Mapping[str, Any]) -> str:
@@ -204,13 +228,14 @@ def ledger_text(record: Mapping[str, Any]) -> str:
 
 
 def judge_messages(record: Mapping[str, Any]) -> list[dict[str, str]]:
+    rubric, schema = rubric_and_schema()
     user = (
         f"LEARNER CARD (the learner does not tell the advisor the hidden needs unless probed):\n"
         f"{persona_brief(record)}\n\nCOURSE FACTS:\n{deck_brief()}\n\n"
         f"CALL FACTS:\n{ledger_text(record)}\n\n"
-        f"TRANSCRIPT:\n{transcript_for_judge(record)}\n\nSCHEMA:\n{SCHEMA_TEXT}"
+        f"TRANSCRIPT:\n{transcript_for_judge(record)}\n\nSCHEMA:\n{schema}"
     )
-    return [{"role": "system", "content": RUBRIC}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": rubric}, {"role": "user", "content": user}]
 
 
 def _int(value: Any) -> int | None:
@@ -251,16 +276,21 @@ def parse_verdict(raw: str) -> dict[str, Any]:
                     "emotional": bool(item.get("emotional")),
                 }
             )
+    # A verdict parsed with the citation switch OFF was asked for no citation, so it carries no
+    # ``advisor_turn`` key and a later re-score keeps the old rule for it (D2-HM1).
+    cited = flags.on(flags.CITED_MISFIRES)
     for item in data.get("misfires") or []:
         if isinstance(item, dict):
             kind = item.get("kind") if item.get("kind") in MISFIRE_KINDS else "other"
-            out["misfires"].append(
-                {
-                    "turn": _int(item.get("turn")),
-                    "kind": kind,
-                    "quote": str(item.get("quote") or "")[:160],
-                }
-            )
+            misfire: dict[str, Any] = {
+                "turn": _int(item.get("turn")),
+                "kind": kind,
+                "quote": str(item.get("quote") or "")[:160],
+            }
+            if cited:
+                misfire["advisor_turn"] = _int(item.get("advisor_turn"))
+                misfire["reason"] = str(item.get("reason") or "")[:160]
+            out["misfires"].append(misfire)
     for item in data.get("ignored_advisor_offers") or []:
         if isinstance(item, dict):
             out["ignored_advisor_offers"].append(
@@ -293,6 +323,14 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
     (``RULE_CHECKED_KINDS``) the rule detector, which does not guess, agrees on the same turn; a
     ``decider_inconsistent`` also needs a line where the learner says it decides alone.  The rejected
     ones are kept under ``misfires_rejected`` with the reason, so the scorecard can show them.
+
+    Diagnosis 2 (D2-HM1, ``REHEARSAL_CITED_MISFIRES``): a misfire of kind ``other`` has no rule to
+    agree with it, so it must cite the ADVISOR turn it fails to follow (a turn of the transcript, not
+    after the misfire's own) and a reason; without them it is rejected as ``uncited`` (the judge marked
+    12 of 14 lines of a chaotic replay ``other``, some of them sensible replies to an incoherent advisor).
+    ``parse_verdict`` gives a misfire the ``advisor_turn`` key while the switch is ON; a verdict stored
+    before the judge was asked to cite (no such key) cannot be held to it on a re-score and keeps the
+    old rule.
     """
     if verdict.get("error"):
         return dict(verdict)
@@ -308,6 +346,7 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         exchange.get("n"): _hollow(str((exchange.get("advisor") or {}).get("text") or ""))
         for exchange in exchanges
     }
+    cited_only = flags.on(flags.CITED_MISFIRES)
     kept: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for item in verdict.get("misfires") or []:
@@ -315,6 +354,8 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         reason = ""
         if quote and turn in spoken and quote not in spoken[turn]:
             reason = "quote_not_found"
+        elif kind == "other" and cited_only and "advisor_turn" in item and not _cited(item, spoken):
+            reason = "uncited"
         elif kind == "decider_inconsistent" and not decides_alone:
             reason = "no_decides_alone_line"
         elif kind in RULE_CHECKED_KINDS and kind != "decider_inconsistent":
@@ -338,6 +379,16 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         else:
             kept.append(dict(item))
     return {**verdict, "misfires": kept, "misfires_rejected": rejected}
+
+
+def _cited(item: Mapping[str, Any], turns: Mapping[Any, Any]) -> bool:
+    """The misfire names an advisor turn of the transcript, not after its own turn, and a reason."""
+    advisor_turn, turn = item.get("advisor_turn"), item.get("turn")
+    if not isinstance(advisor_turn, int) or advisor_turn not in turns:
+        return False
+    if isinstance(turn, int) and advisor_turn > turn:
+        return False
+    return bool(str(item.get("reason") or "").strip())
 
 
 def judge_metrics(verdict: Mapping[str, Any]) -> dict[str, Any]:
@@ -441,7 +492,13 @@ class ScriptedRubricJudge:
             "objections": objections,
             "disclosures": [],
             "misfires": [
-                {"turn": item.get("exchange"), "kind": "other"} for item in (metrics.get("misfires") or [])
+                {
+                    "turn": item.get("exchange"),
+                    "kind": "other",
+                    "advisor_turn": item.get("exchange"),
+                    "reason": str(item.get("kind") or ""),
+                }
+                for item in (metrics.get("misfires") or [])
             ],
             "stall_loop": int(metrics.get("weak_line_count") or 0) > 1,
             "style": {

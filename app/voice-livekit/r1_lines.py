@@ -21,18 +21,26 @@ LINES = {
         "you walk me through your background, especially any sales or customer-facing work "
         "you've done?"
     ),
+    # M032 S6: the reworded brief (one shared body in ``r1_script``; copied here word for word).
     "L-TRANSITION": (
-        "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective "
-        "learner so we can evaluate how you handle a real sales call. The learner is "
-        "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
-        "Science course a few days ago. You're the Program Advisor calling her back. The "
-        "role-play runs for up to twenty minutes, and in that time your goal is to convince "
-        "her: understand her needs and help her decide to enrol, as you would on a real call, "
-        "using the course details from your preparation guide. I'll stay in character until I "
-        "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
-        "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
+        "Thank you, {first_name}. Next, let's do a sales role-play. I'll play {lead_name} from "
+        "{lead_city}, who filled in a form on our website about the Data Science course a few "
+        "days ago. You're the Program Advisor calling her back. You'll have up to twenty minutes, "
+        "and your goal is to convince her as you would on a real call: understand her needs and "
+        "help her decide to enrol, using the course details from your preparation guide. I'll "
+        "stay in character until I say, 'Let's pause the role-play here.' To begin, just say "
+        "'ready'. Shall we start the role-play now, or do you have any questions first?"
     ),
-    "L-PICKUP": "Hello? Yes, this is Meera speaking.",
+    "L-TRANSITION-BRIDGED": (
+        "Next, let's do a sales role-play. I'll play {lead_name} from "
+        "{lead_city}, who filled in a form on our website about the Data Science course a few "
+        "days ago. You're the Program Advisor calling her back. You'll have up to twenty minutes, "
+        "and your goal is to convince her as you would on a real call: understand her needs and "
+        "help her decide to enrol, using the course details from your preparation guide. I'll "
+        "stay in character until I say, 'Let's pause the role-play here.' To begin, just say "
+        "'ready'. Shall we start the role-play now, or do you have any questions first?"
+    ),
+    "L-PICKUP": "Hello, Meera speaking.",
     "L-TRANSITION-NUDGE": "Whenever you're ready, just say ready.",
     "L-TIME-CUE": "Just so you know, I've only got a couple of minutes before my next call.",
     "L-EXIT": (
@@ -48,8 +56,8 @@ LINES = {
     ),
     "L-ASIDE-COACH": (
         "Quick note from Christy, your interviewer: in this role-play you're the Program "
-        "Advisor and I'm the learner, {lead_name}. She enquired about the Data Science "
-        "course and you're calling her back. Please carry on as you would on a real call."
+        "Advisor, and I'm playing the learner, {lead_name}, who enquired about the Data Science "
+        "course; you're calling her back. Please carry on as you would on a real call."
     ),
     "L-ASIDE-END": (
         "This is Christy, your interviewer. If you want to end the interview now, please say: end "

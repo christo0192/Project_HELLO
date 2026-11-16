@@ -44,9 +44,10 @@ VOICED: dict[str, tuple[str, ...]] = {
         "And with all these layoffs in the news, will this really help me land a job?",
         "I keep reading about layoffs everywhere. Do people actually get a job after a program?",
     ),
+    # M032 S2P (probe first): no course length she was never told (the guard drops one).
     "F2-PRIMARY": (
-        "Six months is a long stretch, and my schedule is already packed. Can I keep up?",
-        "I'm pretty busy with work, so keeping up for six months worries me a bit.",
+        "That sounds like a long stretch, and my schedule is already packed. Can I keep up?",
+        "I'm pretty busy with work, so keeping up with the course worries me a bit.",
     ),
     "F2-PUSH": (
         "What happens if I fall behind on the classes?",

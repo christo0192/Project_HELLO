@@ -32,11 +32,13 @@ import unicodedata
 from collections import Counter
 from typing import Any, Iterable, Mapping, Sequence
 
-from r1_commitment import COMMIT_PERMITTED_R_SEC, stall_line
+from r1_commitment import COMMIT_PERMITTED_R_SEC, Level, classify_learner_commitment, stall_line
 from r1_guard import FALLBACK_REPLIES, NEUTRAL_ACKS, REPLY_WORD_CAP
 from r1_personas import H_TOPICS, deep_need_topics_in, resolve_persona
 from r1_text import canonical_amounts, fuzzy_contains, split_sentences
 from r1_world import DURATION_MONTHS, NET_PRICES_USD, PRICE_USD, DISCOUNTS_USD, claims_guarantee
+
+from rehearsal import flags
 
 ROLEPLAY = "roleplay"
 BOT = "bot"
@@ -150,6 +152,50 @@ _PROBE_VOCAB = {
         re.IGNORECASE,
     ),
 }
+# Diagnosis 2 (D2-ND1, ``REHEARSAL_PROBE_VOCAB_V2``).  The H1 vocabulary above matched H2 and H3
+# questions: "staying motivated" (what made it fizzle out), "looking into it" (have you tried this
+# before) and a bare "interested" are no question about WHY NOW, and "what's driving" never matched
+# (the alternatives wanted a space before the apostrophe).  "before I dive in" is no question about the
+# past, "first time" / "last time" no question about the learner's time, and "what got in the way last
+# time" is the H2 question it reads as.
+_PROBE_VOCAB_V2 = {
+    "H1": re.compile(
+        r"\b(?:why (?:now|this|that|are you|did you|do you|data science)|what (?:made (?:you|this|"
+        r"that|now)|prompted|brought|changed|got you|motivated you|motivates you)|"
+        r"what(?:['’]s| is) (?:(?:driving|behind)(?!\s+(?:that|this|the|your) (?:number|figure|price|"
+        r"amount|budget))|prompting|making you|bringing you|motivating you)|"
+        r"what(?:['’]s| has) (?:really )?(?:got|brought) you|"
+        r"prompt\w*|timeline|timeframe|deadline|trigger|urgency|"
+        r"how soon|when (?:do|are|would) you (?:want|hope|need|plan)|looking now|"
+        r"start(?:ed)? looking|how did you (?:get|become) interested)\b",
+        re.IGNORECASE,
+    ),
+    "H2": re.compile(
+        r"\b(?:concerns?|worr\w+|hesitat\w+|holding you back|held you back|stopping you|stopped you|"
+        r"tried|struggl\w+|challenge\w*|obstacle|didn'?t work|not stick|didn'?t stick|stick|"
+        r"went wrong|so far|biggest|afraid|nervous|doubts?|hurdle|blocker|friction|previous|"
+        r"before(?!\s+(?:i|we|you|deciding|committing|signing|starting)\b)|keep you from|missing|tripped|(?:got|get|gets|getting) in the way|"
+        r"last time|fizzl\w*|fell (?:apart|off|through)|gave up|give up)\b",
+        re.IGNORECASE,
+    ),
+    "H3": re.compile(
+        r"\b(?:hours?|schedule|week|budget|afford\w*|money|pay\w*|instal\w+|husband|wife|partner|"
+        r"spouse|family|kids|parents|father|mother|decid\w+|anyone else|someone else|"
+        r"(?<!first )(?<!last )(?<!next )(?<!same )time|"
+        r"commitments?|workload|finances?|help (?:with )?decisions?|cover\w* (?:part|some|any)|"
+        r"employer|sponsor\w*|open to (?:it|this|that)|weigh in)\b",
+        re.IGNORECASE,
+    ),
+}
+# A question sentence can join two questions ("What's your timeline, and what worries you most?"):
+# each coordinated question that opens with a question word or an auxiliary is read on its own.
+# Within one question, two topics' words mean the topic of its main clause, which comes first ("when
+# you talk it over with your husband, what would his main concern be?" is H3, not H2).
+_COORDINATED_QUESTION = re.compile(
+    r",?\s+(?:and|or|but|also)\s+(?=(?:what|why|how|when|where|who|which|is|are|was|were|do|does|did|"
+    r"can|could|would|will|should|has|have|had)\b)",
+    re.IGNORECASE,
+)
 # A question about WHEN to talk again is about the calendar, not about the learner's time or money
 # ("when could you two talk?", "is there a good time later this week to reconnect?"); it is no dig
 # at the H3 need (the live sweep counted two such questions as H3 digs).
@@ -159,6 +205,30 @@ _SCHEDULING_QUESTION = re.compile(
     r"would|do) (?:you|we|i)[^?]{0,20}\b(?:talk|chat|speak|meet|connect))\b",
     re.IGNORECASE,
 )
+# D2-ND1: "a quick follow-up" (the hyphen), "is there a day this week ...", "what's the best way to
+# reach you" are the calendar too, whoever the sentence names (two such questions about the husband
+# were counted as H3 digs).
+_SCHEDULING_QUESTION_V2 = re.compile(
+    _SCHEDULING_QUESTION.pattern
+    + r"|\bfollow(?:ing)?[- ]up\b"
+    + r"|\b(?:is there|what|which) (?:a |the )?(?:good |better |best )?(?:day|time)\b[^?]{0,30}"
+    + r"\b(?:this|next) week\b(?=[^?]*\b(?:call|talk|chat|speak|meet|connect|catch up|reconnect|hear|"
+    + r"get back)\w*\b)"
+    + r"|\breach you\b",
+    re.IGNORECASE,
+)
+# A worry of someone else's ("do you think he'd have any concerns?") is a question about who decides
+# (H3), not about what held the learner back (H2).
+_THIRD_PARTY = re.compile(r"\b(?:he|she|they|him|her|them|his|their)(?:['’]d)?\b", re.IGNORECASE)
+_FEELING_WORD = re.compile(r"(?:concern|worr|hesitat|doubt|afraid|nervous)", re.IGNORECASE)
+
+
+def _probe_vocab() -> Mapping[str, re.Pattern[str]]:
+    return _PROBE_VOCAB_V2 if flags.on(flags.PROBE_VOCAB_V2) else _PROBE_VOCAB
+
+
+def _scheduling_question() -> re.Pattern[str]:
+    return _SCHEDULING_QUESTION_V2 if flags.on(flags.PROBE_VOCAB_V2) else _SCHEDULING_QUESTION
 # M9 misfire shapes added in iteration 1 (the live misfires of the sweeps).
 _TIME_CUE_REVERSED = re.compile(
     r"\byou(?:'ve| have)? (?:just |only )?(?:mentioned|said|told me)\b[^.?!]{0,40}"
@@ -600,6 +670,18 @@ def _advisor(ex: Mapping[str, Any]) -> Mapping[str, Any]:
     return ex.get("advisor") or {}
 
 
+def _learner_r(ex: Mapping[str, Any]) -> float:
+    """The R of an exchange's learner line: when the engine decided it (``learner.r_sec``, which
+    the full tier records), else the exchange's own R (the advisor turn's start).  A window check
+    (13:00 commitments, 14:00 time cues) asks when the LEARNER spoke, and an advisor turn can start
+    before 13:00 and end after it (diagnosis-1 L2).  ``REHEARSAL_LEARNER_CLOCK=0``: the old timing.
+    """
+    decided = _learner(ex).get("r_sec")
+    if isinstance(decided, (int, float)) and flags.on(flags.LEARNER_CLOCK):
+        return float(decided)
+    return float(ex.get("r_sec") or 0.0)
+
+
 def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """M6 need disclosure after a genuine probe, M6b unprompted dump.
 
@@ -621,6 +703,7 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
             touches[topic].append((index, intent))
     probed: list[str] = []
     dug: list[str] = []
+    dig_exchanges: dict[str, list[int]] = {}
     disclosed: list[str] = []
     deep_on_first_probe: list[str] = []
     for topic, marks in touches.items():
@@ -635,6 +718,10 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
         later = [i for i, _intent in marks if i > first_probe]
         if later:
             dug.append(topic)
+            # The role-play turn of each dig (the exchange's own number), for the engine's ledger.
+            # Review DIG-RELEASED-JUDGE-SOURCE: the engine's own role-play turn when the record has it
+            # (the harness count drifts when the session splits or joins candidate turns).
+            dig_exchanges[topic] = [_engine_turn(exchanges[i], i) for i in later]
             window_end = max(i for i, _intent in marks) + DEEP_WINDOW_TURNS
             if any(topic in deep_by_turn[i] for i in range(first_probe, min(window_end + 1, len(spoken)))):
                 disclosed.append(topic)
@@ -657,11 +744,15 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
             if _asked_in_window(topic, exchanges, index):
                 excused += 1  # the advisor asked about it in so many words; the simulator did not tag it
                 continue
+            if flags.on(flags.OPEN_INVITE) and _invited_in_window(exchanges, index):
+                excused += 1  # D4-H-DIG1: she was asked, openly, to say what is on her mind
+                continue
             unprompted.append({"exchange": index + 1, "topic": topic})
     return {
         "unprompted_dump_excused": excused,
         "needs_probed": sorted(probed),
         "needs_dug": sorted(dug),
+        "dig_exchanges": {topic: dig_exchanges[topic] for topic in sorted(dig_exchanges)},
         "needs_disclosed_after_dig": sorted(disclosed),
         "disclosure_rate": (len(disclosed) / len(dug)) if dug else None,
         "deep_on_first_probe": sorted(deep_on_first_probe),
@@ -694,15 +785,21 @@ def dug_topics(advisor: Mapping[str, Any]) -> list[str]:
     text = str(advisor.get("text") or "")
     tag = str(advisor.get("topic") or "")
     questions = [sentence for sentence in split_sentences(text) if "?" in sentence]
-    found = [
-        topic
-        for topic in H_TOPICS
-        if any(
-            _PROBE_VOCAB[topic].search(question)
-            and not (topic == "H3" and _SCHEDULING_QUESTION.search(question))
-            for question in questions
-        )
-    ]
+    if flags.on(flags.PROBE_VOCAB_V2):
+        topics: set[str] = set()
+        for question in questions:
+            topics.update(_question_topics(question))
+        found = [topic for topic in H_TOPICS if topic in topics]
+    else:
+        found = [
+            topic
+            for topic in H_TOPICS
+            if any(
+                _PROBE_VOCAB[topic].search(question)
+                and not (topic == "H3" and _SCHEDULING_QUESTION.search(question))
+                for question in questions
+            )
+        ]
     if (
         str(advisor.get("intent") or "") == "followup"
         and tag in H_TOPICS
@@ -713,6 +810,156 @@ def dug_topics(advisor: Mapping[str, Any]) -> list[str]:
     return found
 
 
+def _question_topics(question: str) -> list[str]:
+    """The needs a question sentence is about (D2-ND1): one per coordinated question, or none.
+
+    The sentence is split into its coordinated questions ("..., and what worries you most?").  In
+    each, every topic whose vocabulary it carries is a candidate (H3 not when that question is about
+    the calendar), and with more than one the topic named first (the main clause) wins.
+    """
+    vocab = _probe_vocab()
+    scheduling = _scheduling_question()
+    found: set[str] = set()
+    for clause in _COORDINATED_QUESTION.split(question):
+        hits: dict[str, int] = {}
+        for topic in H_TOPICS:
+            match = vocab[topic].search(clause)
+            if match is None or (topic == "H3" and scheduling.search(clause)):
+                continue
+            if (
+                topic == "H2"
+                and _FEELING_WORD.match(match.group(0))
+                and _THIRD_PARTY.search(clause[: match.start()])
+            ):
+                continue
+            hits[topic] = match.start()
+        if hits:
+            found.add(min(hits, key=lambda topic: hits[topic]))
+    return [topic for topic in H_TOPICS if topic in found]
+
+
+def engine_dig_metrics(
+    admin: Mapping[str, Any],
+    dug: Sequence[str],
+    disclosed: Sequence[str],
+    dig_exchanges: Mapping[str, Sequence[int]] | None = None,
+) -> dict[str, Any]:
+    """The harness's digs next to the engine's own needs ledger (D2-ND1), for the record only.
+
+    ``admin_log.needs[].followup_turn`` is the turn at which the ENGINE saw a follow-up on a need.  A
+    dig the harness counts and the engine did not ("harness-only") is either a harness misread or an
+    engine miss (the learner was never released to tell it), so both values are reported and the
+    disclosure gate keeps scoring every harness dig: scoring it on the engine's detector would hide an
+    engine miss (anti-circularity, research 4.5).  Without a ledger every field is None.
+
+    D4-H-DIG1 (``REHEARSAL_DIG_RELEASED``, with ``dig_exchanges``): a dig is engine-confirmed only when
+    the gate had released that need by a dig's exchange (its ``released_turn`` at or before the dig;
+    one turn later is still that dig when the shadow judge's probe released it, since the judge folds
+    in a turn late; or a deep offer on that turn after the hint), not when the need was released only
+    later, by another question.
+    ``probe_unreleased`` lists the harness digs the gate did not honour (a product signal).
+    """
+    ledger = admin.get("needs")
+    if not isinstance(ledger, list) or not ledger:
+        return {
+            "needs_dug_engine": None,
+            "harness_only_digs": None,
+            "engine_only_digs": None,
+            "needs_dug_confirmed": None,
+            "needs_disclosed_confirmed": None,
+        }
+    engine = sorted(
+        {
+            str(item.get("topic"))
+            for item in ledger
+            if isinstance(item, Mapping) and item.get("followup_turn") is not None
+        }
+    )
+    confirmed = sorted(topic for topic in dug if topic in engine)
+    out: dict[str, Any] = {
+        "needs_dug_engine": engine,
+        "harness_only_digs": sorted(set(dug) - set(engine)),
+        "engine_only_digs": sorted(set(engine) - set(dug)),
+    }
+    if dig_exchanges is not None and flags.on(flags.DIG_RELEASED):
+        release, offers = _released_turns(admin)
+
+        def honoured(topic: str) -> bool:
+            at = release.get(topic)
+            return any(
+                (at is not None and at <= turn) or turn in offers.get(topic, set())
+                for turn in dig_exchanges.get(topic) or ()
+            )
+
+        confirmed = sorted(topic for topic in dug if honoured(topic))
+        out["probe_unreleased"] = [
+            {"topic": topic, "exchanges": list(dig_exchanges.get(topic) or [])}
+            for topic in sorted(dug)
+            if topic not in confirmed
+        ]
+    out["needs_dug_confirmed"] = confirmed
+    out["needs_disclosed_confirmed"] = sorted(topic for topic in disclosed if topic in confirmed)
+    return out
+
+
+def _engine_turn(exchange: Mapping[str, Any], index: int) -> int:
+    """The role-play turn of an exchange: the engine's own counter when recorded, else the harness's."""
+    turn = exchange.get("engine_turn")
+    if isinstance(turn, int) and not isinstance(turn, bool):
+        return turn
+    return int(exchange.get("n") or index + 1)
+
+
+def _released_turns(admin: Mapping[str, Any]) -> tuple[dict[str, int], dict[str, set[int]]]:
+    """D4-H-DIG1: the dig turn by which the gate had released each need, and the turns of its deep
+    offers that followed the hint."""
+    release: dict[str, int] = {}
+    # ``probe_source`` names the source of a need's FIRST probe, not of its release: a need the rule
+    # probed can still be released by the shadow judge, so whenever a judge verdict was applied in the
+    # call a release one turn after the dig may be that dig's (review DIG-RELEASED-JUDGE-SOURCE).
+    tracker = admin.get("tracker") if isinstance(admin.get("tracker"), Mapping) else {}
+    judge = tracker.get("judge") if isinstance(tracker.get("judge"), Mapping) else {}
+    applied = judge.get("applied")
+    judge_ran = isinstance(applied, int) and not isinstance(applied, bool) and applied > 0
+    for item in admin.get("needs") or []:
+        if not isinstance(item, Mapping):
+            continue
+        turn = item.get("released_turn")
+        turn = item.get("followup_turn") if turn is None else turn
+        if isinstance(turn, int) and not isinstance(turn, bool):
+            # The shadow judge's probe is folded in one turn after the dig it read.
+            late = item.get("probe_source") == "judge" or judge_ran
+            release[str(item.get("topic"))] = turn - 1 if late else turn
+    offers: dict[str, set[int]] = {}
+    view_all = admin.get("disclosure") if isinstance(admin.get("disclosure"), Mapping) else {}
+    for topic, view in view_all.items():
+        if isinstance(view, Mapping) and isinstance(view.get("hint_turn"), int):
+            hint = view["hint_turn"]
+            offers[str(topic)] = {t for t in view.get("deep_offer_turns") or [] if isinstance(t, int) and t > hint}
+    return release, offers
+
+
+# D4-H-DIG1: an open invitation to say what is on her mind, whatever the topic.
+# Review NEW-REGEX-BREADTH (3): a question that names its topic ("what's worrying you about the
+# schedule?", "what's holding you back from the fees?") is about that topic, not an open invitation.
+_ON_A_TOPIC = r"(?!\s+(?:about|with|from|regarding|around|on|in|when it comes to)\b)"
+_OPEN_INVITE = re.compile(
+    r"\bwhat(?:(?:'|\u2019)?s| is) (?:on your mind|worrying you|bothering you|holding you back)\b" + _ON_A_TOPIC + "|"
+    r"\bgo ahead,? i(?:'|\u2019)?m listening\b|"
+    r"\btell me what(?:(?:'|\u2019)?s| is) (?:worrying you|bothering you|on your mind)\b" + _ON_A_TOPIC,
+    re.IGNORECASE,
+)
+
+
+def _invited_in_window(exchanges: Sequence[Mapping[str, Any]], index: int) -> bool:
+    """True when an advisor turn within the deep window before ``index`` invites her to say what is on
+    her mind (an open invitation, not a question about one topic)."""
+    for i in range(max(0, index - DEEP_WINDOW_TURNS), index + 1):
+        if _OPEN_INVITE.search(str(_advisor(exchanges[i]).get("text") or "")):
+            return True
+    return False
+
+
 def _asked_in_window(topic: str, exchanges: Sequence[Mapping[str, Any]], index: int) -> bool:
     """True when an advisor QUESTION about ``topic`` stands within the deep window before ``index``.
 
@@ -721,7 +968,7 @@ def _asked_in_window(topic: str, exchanges: Sequence[Mapping[str, Any]], index: 
     question (a question sentence with the topic's own vocabulary, in this exchange or the
     ``DEEP_WINDOW_TURNS`` before it) is a prompted one.
     """
-    pattern = _PROBE_VOCAB.get(topic)
+    pattern = _probe_vocab().get(topic)
     if pattern is None:
         return False
     for i in range(max(0, index - DEEP_WINDOW_TURNS), index + 1):
@@ -751,7 +998,7 @@ def commitment_metrics(
     for ex in exchanges:
         plan = _learner(ex).get("plan") or {}
         if plan.get("commitment_level") in ("MEDIUM", "STRONG") and _spoke_commitment(ex):
-            if float(ex.get("r_sec") or 0.0) < COMMIT_PERMITTED_R_SEC:
+            if _learner_r(ex) < COMMIT_PERMITTED_R_SEC:
                 premature += 1
     return {
         "commitment_level": level,
@@ -773,6 +1020,43 @@ _NEXT_STEP = re.compile(
     r"payment link|enrol+ment link|get you started|move forward|next step)\b",
     re.IGNORECASE,
 )
+# D5-HF-UNEARNED2 (``REHEARSAL_NEXT_STEP_V2``): more ways to ask for the next step.  "Shall I pencil
+# you in for a weekend slot?" and "shall I pencil in a weekend call with your husband?" earned a
+# commitment that the words above missed.  D5R-NS2-WILDCARD: the qualifier is a closed list (a free
+# middle word took "a smart call", "another sales call", "a team meeting"), a named call, chat or meeting
+# needs "a" / "another" before it ("your Monday meeting" is a fact, not an offer) and is not one the
+# candidate already has ("do you have a Monday meeting?"), and a named session needs "for you", a mentor
+# or "put you down for" ("a weekend session", "every morning session" is how a class is described).
+_NS_QUAL = (
+    r"(?:quick|short|brief|follow[- ]?up|weekend|phone|video|morning|evening|afternoon|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day)"
+)
+_NS_QUALS = rf"{_NS_QUAL}(?:(?: or| and)? {_NS_QUAL})?"
+_NS_ARTICLE = r"(?:a|an|another|one more)"
+_NEXT_STEP_V2 = re.compile(
+    rf"\b(?:pencil (?:you |it |that |us )?in|catch up (?:on|over) (?:a )?(?:call|the phone)|"
+    rf"put you down for {_NS_ARTICLE} {_NS_QUALS} session|"
+    rf"{_NS_ARTICLE} {_NS_QUALS} session (?:for you|with (?:a|an|one of our|our|my) "
+    rf"(?:mentors?|coach(?:es)?|counsell?ors?|advisors?|experts?|instructors?)))\b",
+    re.IGNORECASE,
+)
+_NEXT_STEP_V2_NAMED_CALL = re.compile(rf"\b{_NS_ARTICLE} {_NS_QUALS} (?:call|chat|meeting)\b", re.IGNORECASE)
+# "Do you have a Monday meeting?" asks about a meeting the candidate already has.
+_ALREADY_HAS = re.compile(
+    r"\b(?:(?:do|did) you (?:have|had)|have you (?:got|had)|you (?:have|had|got)|there(?:'s| is| was))\s*$",
+    re.IGNORECASE,
+)
+
+
+def _next_step_v2(sentence: str) -> bool:
+    if _NEXT_STEP_V2.search(sentence) is not None:
+        return True
+    return any(
+        _ALREADY_HAS.search(sentence[: match.start()]) is None
+        for match in _NEXT_STEP_V2_NAMED_CALL.finditer(sentence)
+    )
+
+
 _OFFERING_VOICE = re.compile(
     r"\b(?:let'?s|i(?:'ll| will| can| could| would)|we(?:'ll| will| can| could| would)|shall|"
     r"how about|would you|do you want|want me to|can i|could i)\b",
@@ -793,9 +1077,10 @@ def advisor_asked_next_step(advisor: Mapping[str, Any]) -> bool:
     if str(advisor.get("intent") or "") in ASK_INTENTS:
         return True
     for sentence in split_sentences(str(advisor.get("text") or "")):
-        if _NEXT_STEP.search(sentence) is not None and (
-            "?" in sentence or _OFFERING_VOICE.search(sentence) is not None
-        ):
+        named = _NEXT_STEP.search(sentence) is not None or (
+            flags.on(flags.NEXT_STEP_V2) and _next_step_v2(sentence)
+        )
+        if named and ("?" in sentence or _OFFERING_VOICE.search(sentence) is not None):
             return True
     return False
 
@@ -878,7 +1163,7 @@ def misfire_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             intent == "farewell" or _ADVISOR_FAREWELL.search(advisor_text)
         ):
             found.append({"exchange": index + 1, "kind": "no_one_leaving"})
-        if _TIME_CUE_WORDS.search(text) and float(ex.get("r_sec") or 0.0) < 840:
+        if _TIME_CUE_WORDS.search(text) and _learner_r(ex) < 840:
             found.append({"exchange": index + 1, "kind": "time_cue_too_early"})
         if intent in ASK_INTENTS and (
             fuzzy_contains(text, WEAK_LINE) or fuzzy_contains(text, LEGACY_DEFLECTION)
@@ -960,17 +1245,38 @@ def final_price_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any
     whose learner line asks it, and flags two within ``FINAL_PRICE_NEAR_EXCHANGES`` of each other.
     """
     asked: list[int] = []
+    in_one_reply = 0
     for index, ex in enumerate(exchanges):
         spoken = str(_learner(ex).get("spoken") or "")
-        if any("?" in sentence and _FINAL_PRICE_QUESTION.search(sentence)
-               for sentence in split_sentences(spoken)):
+        hits = [
+            sentence for sentence in split_sentences(spoken)
+            if "?" in sentence and _FINAL_PRICE_QUESTION.search(sentence)
+        ]
+        if hits:
             asked.append(index + 1)
-    near = [(a, b) for a, b in zip(asked, asked[1:]) if b - a <= FINAL_PRICE_NEAR_EXCHANGES]
+        if len(hits) >= 2:
+            in_one_reply += 1  # simulation diagnosis 2 (HF3): the same question twice in one reply
+    near = [
+        (a, b) for a, b in zip(asked, asked[1:])
+        if b - a <= FINAL_PRICE_NEAR_EXCHANGES
+        # Simulation diagnosis 2 (HF3): a re-ask right after an advisor turn that only
+        # acknowledged it ("Okay.") asks a question nobody answered; it is no repeat.
+        and not _non_answer(str(_advisor(exchanges[b - 1]).get("text") or ""))
+    ]
     return {
         "final_price_questions": len(asked),
         "final_price_question_exchanges": asked,
-        "final_price_asked_twice": len(near),
+        "final_price_asked_twice": len(near) + in_one_reply,
     }
+
+
+# HF3: an advisor turn of a few words with no figure and no question ("Okay.", "Yeah, okay, sure.").
+NON_ANSWER_WORDS = 4
+
+
+def _non_answer(text: str) -> bool:
+    words = re.findall(r"[A-Za-z0-9']+", text)
+    return bool(words) and len(words) <= NON_ANSWER_WORDS and not re.search(r"\d|\?", text)
 
 
 def guard_metrics(
@@ -997,7 +1303,10 @@ def guard_metrics(
     raw_over_cap = sum(
         1 for ex in exchanges if words_of(_learner(ex).get("raw") or "") > REPLY_WORD_CAP
     )
+    spoken_leaks = commitment_spoken_leaks(admin, guard_trips, exchanges)
     return {
+        "commitment_spoken_leaks": len(spoken_leaks),
+        "commitment_spoken_leak_turns": spoken_leaks,
         "guard_hits_total": int(guard.get("hits") or 0),
         "guard_leak_hits": int(guard.get("leak_hits") or 0),
         "guard_hygiene_hits": int(guard.get("hygiene_hits") or 0),
@@ -1012,6 +1321,109 @@ def guard_metrics(
             name for name, ok in (fidelity.get("checks") or {}).items() if not ok
         ),
     }
+
+
+# D2-HF2: the learner agreeing to a call, a day or a seat, or to enrol, in what it SAID.  Own regexes
+# next to the engine's classifier: the guard blocks with ``classify_learner_commitment``, so a check
+# with that classifier alone could never see a commitment the classifier misses.
+_SPOKEN_DAY_WORDS = r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|tonight"
+_SPOKEN_DAY = r"(?:(?:this|next|on) )?(?:" + _SPOKEN_DAY_WORDS + r")\b"
+_SPOKEN_MEDIUM = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\b(?:let'?s|we can|we could|i can|i could|happy to|glad to)\s+(?:book|schedule|set up|do|"
+        r"have|arrange|plan)\b[^.?!]{0,30}\b(?:call|chat|meeting)\b",
+        r"\b(?:call|chat|meeting)\b[^.?!]{0,40}\b(?:could work|would work|works for|works|"
+        r"sounds (?:good|fine|great|okay))\b",
+        r"\bhold(?:ing)? (?:a |my |the )?(?:spot|seat|place)\b[^.?!]{0,30}\b(?:sounds|works|fine|"
+        r"good|okay)\b",
+        r"\b(?:sounds|works) (?:good|fine|great)\b[^.?!]{0,30}\b(?:call|monday|tuesday|wednesday|"
+        r"thursday|friday|saturday|sunday|tomorrow)\b",
+        # Review of D2-HF2: day and seat bookings that the engine's classifier misses as well.
+        r"\b(?:let'?s|we can|we could|i can|i could) (?:do|say|go with|make it|pencil in)\s+"
+        + _SPOKEN_DAY,
+        r"\b(?:put|book|pencil|count|sign) me (?:down|in)\b",
+        r"\bhold (?:a |my |the )?(?:spot|seat|place)\b[^.?!]{0,15}\bfor me\b",
+        r"\bi wouldn['’]?t mind\b[^.?!]{0,20}\b(?:call|chat|meeting|seat|spot|" + _SPOKEN_DAY_WORDS + r")\b",
+    )
+)
+_SPOKEN_STRONG = re.compile(
+    r"\b(?:sign me up|i'?ll (?:enrol+|sign up|pay|join)|send (?:me )?the (?:payment|enrol+\w*) link)\b",
+    re.IGNORECASE,
+)
+_NEGATION = re.compile(r"\b(?:not|never)\b|n['’]t\b", re.IGNORECASE)
+# A negation voids an agreement only when it bears on it: in the same clause and within a few words
+# before it ("I don't think we can book a call", "I'd rather not book a call").  "Never mind, let's
+# book a call" and "I don't know, let's book a call" agree (the review of D2-HF2).
+_NEGATION_WINDOW_WORDS = 4
+_CLAUSE_BREAK = re.compile(r"[,;:\u2013\u2014]|\s-\s")
+
+
+def _negated(before: str) -> bool:
+    clause = _CLAUSE_BREAK.split(before)[-1]
+    window = " ".join(clause.split()[-_NEGATION_WINDOW_WORDS:])
+    return _NEGATION.search(window) is not None
+
+
+def _spoken_agreement_level(text: object) -> Level:
+    """The commitment the harness's own regexes read in ``text`` (a negation just before it voids it)."""
+    level = Level.NONE
+    for sentence in split_sentences(text):
+        for pattern, found in ((_SPOKEN_STRONG, Level.STRONG), *((p, Level.MEDIUM) for p in _SPOKEN_MEDIUM)):
+            match = pattern.search(sentence)
+            if match is not None and not _negated(sentence[: match.start()]):
+                level = max(level, found)
+    return level
+
+
+def _level_named(name: object) -> Level | None:
+    return Level[name] if isinstance(name, str) and name in Level.__members__ else None
+
+
+def commitment_spoken_leaks(
+    admin: Mapping[str, Any],
+    guard_trips: Sequence[Mapping[str, Any]],
+    exchanges: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """The commitment guard trips whose line still carried a commitment when it was SPOKEN (D2-HF2).
+
+    A trip means the guard blocked a sentence; the candidate heard the rest.  It is a leak when what
+    the learner said (``learner.spoken`` of the trip's exchange) is still above the cap: WEAK, or the
+    level already on record before that turn, or the scripted commitment line delivered in that same
+    turn.  The engine's classifier and the harness's own regexes are both asked.  A trip that cannot be
+    matched to a spoken line is counted as a leak (fail closed).
+    """
+    to_roleplay = {
+        item.get("transcript_turn"): item.get("roleplay_turn")
+        for item in admin.get("turn_map") or []
+        if isinstance(item, Mapping)
+    }
+    by_number = {ex.get("n"): ex for ex in exchanges}
+    commitment = admin.get("commitment") or {}
+    recorded = _level_named(commitment.get("level"))
+    recorded_turn = commitment.get("turn")
+    leaks: list[dict[str, Any]] = []
+    for trip in guard_trips:
+        if trip.get("category") != "commitment":
+            continue
+        turn = trip.get("turn_index")
+        roleplay_turn = to_roleplay.get(turn)
+        ex = by_number.get(roleplay_turn) if roleplay_turn is not None else None
+        if ex is None:
+            leaks.append({"turn_index": turn, "why": "unmapped"})
+            continue
+        cap = Level.WEAK
+        if recorded is not None and isinstance(recorded_turn, (int, float)) and recorded_turn < roleplay_turn:
+            cap = max(cap, recorded)
+        plan = _learner(ex).get("plan") or {}
+        scripted = _level_named(plan.get("commitment_level"))
+        if plan.get("delivered_commitment") and scripted is not None:
+            cap = max(cap, scripted)
+        spoken = str(_learner(ex).get("spoken") or "")
+        level = max(classify_learner_commitment(spoken), _spoken_agreement_level(spoken))
+        if level > cap:
+            leaks.append({"turn_index": turn, "exchange": roleplay_turn, "level": level.name, "why": "spoken"})
+    return leaks
 
 
 def latency_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1032,6 +1444,26 @@ def latency_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "learner_total_p50": percentile(totals, 50),
         "learner_total_p95": percentile(totals, 95),
     }
+
+
+def advisor_farewell_loop(exchanges: Sequence[Mapping[str, Any]]) -> int:
+    """D4-H-SIMLOOP1: the advisor's goodbyes after the first mutual goodbye (an advisor goodbye the
+    learner's reply returned).  0-1 when the call ends after a goodbye; many when nobody hangs up."""
+    from rehearsal.advisor import AdvisorTurn, ends_on_goodbye, is_sign_off
+
+    def bye(ex: Mapping[str, Any]) -> bool:
+        advisor = _advisor(ex)
+        r_sec = ex.get("r_sec")
+        return is_sign_off(
+            AdvisorTurn(str(advisor.get("text") or ""), str(advisor.get("intent") or "other")),
+            float(r_sec) if isinstance(r_sec, (int, float)) and not isinstance(r_sec, bool) else None,
+        )
+
+    first = next(
+        (i for i, ex in enumerate(exchanges) if bye(ex) and ends_on_goodbye((ex.get("learner") or {}).get("spoken"))),
+        None,
+    )
+    return 0 if first is None else sum(1 for ex in exchanges[first + 1 :] if bye(ex))
 
 
 # --------------------------------------------------------------------------------- the call
@@ -1055,7 +1487,11 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
         avoid_first_name=str(header.get("candidate_name") or ""),
     )
     out.update(disclosure_metrics(persona, exchanges))
+    out.update(
+        engine_dig_metrics(admin, out["needs_dug"], out["needs_disclosed_after_dig"], out.get("dig_exchanges"))
+    )
     out.update(commitment_metrics(exchanges, admin))
+    out["abuse_hangups"] = int((admin.get("endings") or {}).get("abuse_hangups") or 0)
     out.update(misfire_metrics(exchanges))
     out.update(schedule_metrics(admin))
     out.update(stall_reason_metrics(admin))
@@ -1063,6 +1499,7 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     out.update(guard_metrics(admin, record.get("guard_trips") or [], exchanges))
     out.update(latency_metrics(exchanges))
     out["exchanges"] = len(exchanges)
+    out["advisor_farewell_loop"] = advisor_farewell_loop(exchanges)
     out["roleplay_seconds"] = record.get("roleplay_seconds")
     out["stop_reason"] = record.get("stop_reason")
     out["error"] = record.get("error")
@@ -1100,6 +1537,13 @@ def hard_fails(metrics: Mapping[str, Any]) -> list[str]:
         fails.append("repeated_phrase_in_row")
     if metrics.get("commitment_earned") is False:
         fails.append("unearned_commitment")
-    if metrics.get("guard_flagged") or (metrics.get("commitment_guard_hits") or 0) >= 1:
+    # D2-HF2: a commitment the guard BLOCKED is hygiene (the candidate never heard it; the count is an
+    # info gate of the scorecard).  The hard fail is the guard's own flag or a commitment that was still
+    # in the spoken line.  Metrics without the spoken check keep the old rule (fail closed).
+    if flags.on(flags.SPOKEN_LEAKS) and "commitment_spoken_leaks" in metrics:
+        leaked = int(metrics.get("commitment_spoken_leaks") or 0)
+    else:
+        leaked = int(metrics.get("commitment_guard_hits") or 0)
+    if metrics.get("guard_flagged") or leaked >= 1:
         fails.append("guard_flagged")
     return fails

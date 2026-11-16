@@ -1,4 +1,4 @@
-"""Content-package pin, isolation and style tests for the R1 content modules (PR-4b).
+﻿"""Content-package pin, isolation and style tests for the R1 content modules (PR-4b).
 
 ``CONTENT_SHA256`` pins every text the role-play speaks or prompts with.  Editing any of
 it fails ``test_the_content_sha_is_pinned`` until a reviewer bumps ``CONTENT_REVISION`` and
@@ -127,7 +127,148 @@ import r1_world
 # revision, the learner: the card's call direction and work answers (M4, L4), three more curiosity
 # topics and a check-in-done note that never closes (L1), the intent shapes (L2), the F4 push's
 # refer-back and the decider and budget notes (L5, L7).
-PINNED_CONTENT_SHA256 = "9f5d7bf6a039aca045c1409247b2b693f7acaf57d4fcd621c937b7116e4edabc"
+# Christy lane (feat/m032-christy), its own revisions 21..23:
+# Revision 21 (M032 S5, owner go of 2026-11-11): Christy's voice text inside the interviewer prefix
+# and her delivery rider (R1_INTERVIEWER_VOICE).  The manifest pins the voiced prefix whatever the
+# flag says.  Same revision: the icebreaker plan's objectives, fallback questions, per-turn notes and
+# "Take your time." (r1_icebreaker, R1_ICEBREAKER_PLAN).  Same revision: the transition bridge's
+# note and limits and L-TRANSITION-BRIDGED, the brief without its thanks (R1_TRANSITION_BRIDGE).
+# Same revision (review fixes): the icebreaker note tail for a skip request and the notes once
+# every objective is reached (a decline, a repeat request, a skip request).
+# Revision 22 (M032 S6, R1_TRANSITION_REPAIR): the brief from one shared body, its replay and short
+# recap, "Yes, I'm here.", the pickup bridge, the rotated start questions, the new pickup and coach
+# aside, revision 21's texts under -V20 ids, and the transition note that asks nothing itself.
+# Same revision, the icebreaker repair (R1_ICEBREAKER_REPAIR): L-IB-HOLD, the repeated question's
+# template, the presence opener notes and the hold's limits.
+# Revision 23 (M032 S7C, the sweep's Christy follow-ups): the opening's hello with a sound check
+# and its agendas (L-OPEN-HELLO, -HELLO-AGAIN, L-OPEN-AGENDA, -PLAIN, -CONTINUE;
+# R1_OPENING_SOUND_CHECK), the never-heard ladder (L-SIL-NOAUDIO, L-SIL-END-NOAUDIO;
+# R1_NO_AUDIO_LADDER) and the mute aside by phase (L-MUTE-RP, L-MUTE-IV; R1_MUTE_ASIDE_V2).  L-OPEN
+# and L-MUTE are unchanged.
+# Learner lane (feat/m032-learner), its own revisions 21..24:
+# Revision 21 (M032 S1, learner timing + memory): the idle path's longer quiet stretch while the
+# plan has slack (IDLE_GAP_SLACK_TURNS) and the learner's respond-first notes (OFFER_MADE_NOTE,
+# ASKED_DIRECTLY_NOTE, ANSWERED_YOU_NOTE, PRESSURE_EASED_NOTE) and concern-ledger notes
+# (CONCERN_LABELS, VOICED_CONCERNS_NOTE, HOLLOW_CONCERNS_NOTE) join the manifest, and so does
+# SWEEP-1's PUSH_REACT_NOTE (the push waits for her reaction).  No scripted line, brief, marker
+# or variant changed.  The S1 review then reworded PUSH_REACT_NOTE and ANSWERED_YOU_NOTE (say how
+# it lands as a feeling, never the advisor's promises as facts) and added
+# VOICED_CONCERNS_ASKED_NOTE (the ledger yields to a direct question).
+# Revision 22 (M032 S2, learner voice): the S2 texts join the manifest beside the texts they replace
+# while their flags are on (``r1_content._learner_voice_v2``, the worry fields of the F3 and F2
+# moves, F4-PRIMARY's "like I said" texts, the pre-empted suffix, the rotated curiosity labels, the
+# stall briefs without "before you agree to anything", BUDGET_REPLACEMENT_V2).  No graded meaning,
+# marker, must-say, deadline or scripted line of the release before changed.
+# Revision 23 (M032 S2P, probe first): the probe-first texts join the manifest
+# (``r1_content._probe_first``: the card's and the prefix's second wordings, the probes, F2's and
+# F4's texts without a course fact, the reacting and checking anchors, the v2 counters,
+# N-PRICE-FIRST and the first-time money briefs, the new notes and the length probes), the two
+# redirect lines join the script (L-REDIRECT-PRICE, L-REDIRECT-TIME), and the world's
+# LEARNER_POLICY was reworded (world revision 3).  Markers, deadlines and scorer facts unchanged.
+# After the S2P review (still revision 23, unreleased): the first money stall about a named price
+# has its own variants, none with "still" (``N_MONEY_NAMED_VARIANTS``).
+# Revision 24 (M032 S3, endings and abuse): the early-close, last-point and hang-up asides, the
+# learner's hang-up line and the wrap-up's invitation and deflection join the script; the wrap-up
+# reminder's flagged sentences and the endings' notes join the manifest (``r1_content._endings``).
+# No graded meaning, marker, must-say, deadline or text of the release before changed.
+# Revision 25 (merge of the M032 lanes on feat/m032-integration): every text of the Christy
+# lane's 21..23 and of the learner lane's 21..24 in one manifest; no text changed in the merge.
+# CONTENT_REVISION = max(23, 24) + 1, as revision 9 did for an earlier merge.
+# Learner lane revision 25 (M032 S7L, learner follow-ups): the follow-up notes, the card's
+# timeline wording, the learner's yield lines and the role-confusion examples join the manifest
+# (``r1_content._learner_followups``) beside the texts they replace while their flags are on.  No
+# graded meaning, marker, must-say or deadline changed.
+# Learner lane revision 26 (simulation diagnosis 1, learner fixes): the new notes, wordings and
+# wider delivery markers join the manifest (``r1_content._sim_repairs``) beside the texts they
+# replace while their flags are on.  No graded meaning, must-say or deadline changed.
+# Revision 27 (second merge of the M032 lanes): the learner lane's 25..26 on top of revision 25;
+# no text changed in the merge.  CONTENT_REVISION = max(25, 26) + 1.
+# Christy lane (feat/m032-christy), its own revisions 24..25 after the first integration:
+# Christy lane revision 24 (M032 live simulation, diagnosis 1): L-TRANSITION-RECAP's own
+# either/or question (CR-1) and the repaired transition note on "Of course, go ahead." and repeat
+# requests (BR-2).
+# Christy lane revision 25 (review of diagnosis 1): the one-line note for the answer to her
+# repeated icebreaker question (TRANSITION_IB_ANSWER_NOTE, BR-2).
+# Revision 28 (third merge of the M032 lanes): the Christy lane's 24..25 on top of revision 27;
+# no text changed in the merge.  CONTENT_REVISION = max(27, 25) + 1.
+# Learner lane (feat/m032-learner), its own revisions 27..28 after the third integration:
+# Learner lane revision 27 (simulation diagnosis 2, learner fixes): the short completion tails,
+# the counter's completions, the below-$7,000 anchor situations and the latest-price, figures-said
+# and ask-kind notes join the manifest (``r1_content._sim2_repairs``) beside the texts they
+# replace while their flags are on.  No graded meaning, marker, must-say or deadline changed.
+# After the diagnosis 2 review (still revision 27, unreleased): the figures-said note keeps its
+# website example only for the website's price she named herself (FIGURES_SAID_SOURCE_WEBSITE),
+# and the tail themes need the worry's frame for "full", deciding, committing, "online" and
+# "paying".  No graded meaning, marker, must-say or deadline changed.
+# Learner lane revision 28 (simulation adaptability): the tangent notes and the stall-gap
+# voiced-concerns note join the manifest (``r1_content._adapt_repairs``) beside the texts they
+# replace while their flags are on.  No graded meaning, marker, must-say or deadline changed.
+# After its review (still revision 28, unreleased): the 19:00 stall's reaction-only tangent note
+# (TANGENT_REACT_NOTE).  No graded meaning, marker, must-say or deadline changed.
+# Revision 29 (fourth merge of the M032 lanes): the learner lane's 27..28 on top of revision 28;
+# no text changed in the merge.  CONTENT_REVISION = max(28, 28) + 1.
+# Christy lane (feat/m032-christy), its own revisions 26..28 after the third integration:
+# Christy lane revision 26 (M032 live simulation, diagnosis 2): the repaired transition note reads
+# "the instructions" as the role-play brief (D2-BR1), and the insisted icebreaker repeat's two
+# templates (IB_REPEAT_OLDER_TEMPLATE, IB_REPEAT_SAME_TEMPLATE; D2-IB1).
+# Christy lane revision 27 (review of diagnosis 2, D2-BR1-R2): the repaired transition note offers
+# to go over the brief again for "the instructions" and keeps the polite decline for its own
+# rules.
+# Christy lane revision 28 (M032 christy-ready, R1_START_ASK_ONCE): L-TRANSITION-ASK-PAUSE, the
+# one start prompt a quiet pause gets once the answers before the role-play end without a start
+# question.
+# Revision 30 (fifth merge of the M032 lanes): the Christy lane's 26..28 on top of revision 29; no
+# text changed in the merge.  CONTENT_REVISION = max(29, 28) + 1.
+# Learner lane (feat/m032-learner), its own revision 29 after the fifth integration:
+# Learner lane revision 29 (simulation diagnosis 3): the new wrap-up, exit and aside lines, her
+# short goodbyes, the rupee anchor, the one-statement last-point brief and the new notes join the
+# manifest (``r1_content._diag3_repairs`` and the script lines) beside the texts they replace while
+# their flags are on.  No graded meaning, marker, must-say or deadline changed.
+# After its review (still revision 29, unreleased): L-EXIT-WRAP opens with "Let's stop the role-play
+# here" (review D3R-8).  No graded meaning, marker, must-say or deadline changed.
+# Christy lane (feat/m032-christy), its own revisions 29..30 after the fifth integration:
+# Christy lane revision 29 (M032 live simulation, diagnosis 3): the varied replay, second recap and
+# take-time line (R1_BRIEF_VARIETY), the reworded react clause and the thanked briefs
+# (R1_REACTION_VARIETY), the presence hold (R1_IB_REASK_V2), "Got it." (R1_GUARD_STORY_ECHO) and the
+# broad job question line of the repaired transition note.
+# Christy lane revision 30 (review of diagnosis 3): L-TRANSITION-THANKS-A without "that's helpful",
+# and the icebreaker repair's REASK_V2_MAX_REPEATS.
+# Revision 31 (sixth merge of the M032 lanes): the learner lane's 29 and the Christy lane's 29..30
+# on top of revision 30; no text changed in the merge.  CONTENT_REVISION = max(30, 29, 30) + 1.
+# Learner lane (feat/m032-learner), its own revision 30 after the sixth integration:
+# Learner lane revision 30 (simulation diagnosis 4): one exit-and-wrap-up line per way the role-play
+# ends (L-EXIT-WRAP-2, -END, -TIME, -ASIDE), the short-on-time and come-back notes and the F3 worry
+# without brand names join the manifest (``r1_content._diag4_repairs`` and the script lines) beside
+# the texts they replace while their flags are on.  No graded meaning, marker, must-say or deadline
+# changed.
+# Christy lane (feat/m032-christy), its own revision 31 after the sixth integration:
+# Christy lane revision 31 (M032 live simulation, diagnosis 4): the reworded agenda and briefs
+# (R1_BRIEF_WORDING_V2), L-PRESENT-TAKE-TIME and L-PICKUP-BRIDGE-2 (R1_BRIEF_VARIETY), the role-play
+# field answers, "Fair enough." and the transition note without a phrase to copy
+# (R1_TRANSITION_ANSWERS), the silence restates (R1_SIL_IB_RESTATE), the quiet nudge
+# (R1_IB_QUIET_NUDGE), the skip notes (R1_IB_SKIP_V2), the react clause v2 (R1_REACTION_VARIETY_V2)
+# and the plan note's pause line (R1_ICEBREAKER_REPAIR).
+# Revision 32 (seventh merge of the M032 lanes): the learner lane's 30 and the Christy lane's 31
+# on top of revision 31; no text changed in the merge.  CONTENT_REVISION = max(31, 30, 31) + 1.
+# Revision 33 (eighth merge): the Christy lane's 32 (the quiet-nudge window is 7 s).
+# Learner lane (feat/m032-learner), its own revision 31 after the seventh integration:
+# Learner lane revision 31 (simulation diagnosis 5): the no-answer notes and intent shape for an
+# advisor turn that told her nothing, and the press lines after a lone "Okay." to her question,
+# join the manifest (``r1_content._diag5_repairs``) beside the texts they replace while their flags
+# are on.  No graded meaning, marker, must-say or deadline changed.  After its review (still 31,
+# unreleased): the learner's two cut-out lines (``r1_guard.CUT_OUT_REPLIES``, review D5R-4).
+# Christy lane (feat/m032-christy), its own revisions 33-34 after the eighth integration:
+# Christy lane revision 33 (M032 live simulation, diagnosis 5): the W3 agenda (R1_AGENDA_W3),
+# L-ASIDE-WRAP-AGAIN (R1_WRAP_OFFER_VARIANT), the react clause without its example and the guard's
+# one "And with ..." opener (R1_REACTION_VARIETY_V2), the skip notes (R1_IB_SKIP_V2), the nudge's
+# "I was asking" form (R1_IB_QUIET_NUDGE) and the answers note's approach sentence
+# (R1_TRANSITION_ANSWERS).
+# Christy lane revision 34 (review of diagnosis 5): the W3 agenda's heard line "Lovely, thanks."
+# (R1_AGENDA_W3) and the nudge's wh-word and instruction sets (R1_IB_QUIET_NUDGE).
+# Revision 35 (ninth merge of the M032 lanes): the learner lane's 31 and the Christy lane's
+# 33-34 on top of revision 33; no text changed in the merge.  CONTENT_REVISION =
+# max(33, 31, 34) + 1.
+PINNED_CONTENT_SHA256 = "d6069be2c1ef130b23934a4c7c1a8bee85560916b9ea80a7528f6605f458d31b"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -140,6 +281,7 @@ CONTENT_MODULES = (
     "r1_tracker",
     "r1_end_intent",
     "r1_guard",
+    "r1_icebreaker",
     "r1_prompts",
     "r1_content",
     "r1_roleplay",
@@ -297,8 +439,35 @@ class PinTests(unittest.TestCase):
             (r1_scheduler, "REDIRECT_BRIEF", "x"),
             (r1_scheduler, "CURIOSITY_TOPICS", (("format", "x"),)),
             (r1_scheduler, "IDLE_GAP_TURNS", 4),
+            (r1_scheduler, "IDLE_GAP_SLACK_TURNS", 6),
+            (r1_prompts, "OFFER_MADE_NOTE", "- Take the offer."),
+            (r1_prompts, "VOICED_CONCERNS_NOTE", "- {concerns}."),
+            (r1_prompts, "PUSH_REACT_NOTE", "- React."),
+            (r1_prompts, "VOICED_CONCERNS_ASKED_NOTE", "- {concerns} again."),
             (r1_prompts, "INTENT_PRICE_NOTE", "- Do not push on price."),
             (r1_prompts, "FORCED_NOTE", "- Link it."),
+            # M032 S2 (revision 22): every new learner text is pinned.
+            (r1_prompts, "LEARNER_DELIVERY_RIDER", "- Talk."),
+            (r1_prompts, "INTENT_SHAPE_TOPIC_FRESH", "x"),
+            (r1_prompts, "INTENT_SHAPE_NEW_TOPIC", "x"),
+            (r1_prompts, "FREE_REPLY_NOTE_V2", "x"),
+            (r1_prompts, "WORRY_LINE", "- {worry}"),
+            (r1_prompts, "NOT_ANSWERED_NOTE", "- x"),
+            (r1_prompts, "COACH_RESUME_NOTE", "- x"),
+            (r1_prompts, "OFFER_ON_TABLE_NOTE_V2", "- {amount}"),
+            (r1_prompts, "OFFER_TERMS_INSTALMENTS", "x"),
+            (r1_prompts, "OFFER_TERMS_IN_PARTS", "x"),
+            (r1_prompts, "IMPLAUSIBLE_FREE_NOTE", "- x"),
+            (r1_prompts, "NOT_TODAY_RESERVED_NOTE", "- x"),
+            (r1_prompts, "ACK_TURN_NOTE", "- x"),
+            (r1_prompts, "SOFT_TIC_NOTE", "- {words}"),
+            (r1_prompts, "LENGTH_ONE", "- x"),
+            (r1_prompts, "PREFIX_OFFER_SENTENCE_V2", "x\n"),
+            (r1_scheduler, "F4_PRIMARY_SAID_VARIANTS", ("Like I said, not today.",)),
+            (r1_scheduler, "PREEMPTED_SUFFIX", "; {label}"),
+            (r1_scheduler, "CURIOSITY_LABELS_V2", {"format": ("x",)}),
+            (r1_negotiation, "NO_COMMIT_BRIEFS", {}),
+            (r1_guard, "BUDGET_REPLACEMENT_V2", "x"),
         ):
             original = getattr(module, name)
             try:

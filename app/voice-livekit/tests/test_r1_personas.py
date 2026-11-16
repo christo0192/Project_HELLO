@@ -1,9 +1,11 @@
 """Unit tests for ``r1_personas``: the four cards, hidden needs and genuine-probe unlocks."""
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -404,14 +406,22 @@ class PublicCardTests(unittest.TestCase):
         self.assertEqual(answers["what success looks like for you"], "A data role within a year.")
 
     def test_pickup_names_the_variant(self):
+        # M032 S6 item 8: "Hello? Yes, this is X speaking." answered a question nobody had asked.
         self.assertEqual(
             resolve_persona("p1_career_switcher", variant="v1").pickup_line,
-            "Hello? Yes, this is Meera speaking.",
+            "Hello, Meera speaking.",
         )
         self.assertEqual(
             resolve_persona("p1_career_switcher", variant="v2").pickup_line,
-            "Hello? Yes, this is Priya speaking.",
+            "Hello, Priya speaking.",
         )
+
+    def test_with_the_transition_repair_off_the_pickup_is_revision_21s(self):
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
+            self.assertEqual(
+                resolve_persona("p1_career_switcher", variant="v1").pickup_line,
+                "Hello? Yes, this is Meera speaking.",
+            )
 
 
 class ResolveTests(unittest.TestCase):
@@ -916,6 +926,100 @@ class LearnerPublicFactsS03Tests(unittest.TestCase):
                 self.assertTrue(asks_open_question(text))
         self.assertFalse(asks_open_question("We are expecting a big batch this month."))
 
+
+
+class PersonaTimelineTests(unittest.TestCase):
+    """M032 SWEEP-8 (flag R1_PERSONA_TIMELINE_V2, latched per session by the engine)."""
+
+    def _cards(self, **kwargs):
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                yield persona, rendered, rendered.public_card_text(**kwargs)
+
+    def test_no_card_says_she_is_calling_or_called(self):
+        import re
+
+        for probe_first in (False, True):
+            for persona, _rendered, card in self._cards(timeline_v2=True, probe_first=probe_first):
+                with self.subTest(persona=persona.id, probe_first=probe_first):
+                    self.assertNotRegex(card, re.compile(r"\b(?:you are|you're) calling\b", re.I))
+                    self.assertNotRegex(card, re.compile(r"\byou called\b", re.I))
+                    self.assertIn("you did not call them", card)
+
+    def test_every_backstory_has_a_dated_webinar_and_no_week_anchor_meets_a_week_marker(self):
+        import re
+        from r1_personas import backstory_lines
+
+        anchor = re.compile(r"\b(?:weeks? ago|last month)\b")
+        for persona in PERSONAS:
+            lines = backstory_lines(persona, timeline_v2=True)
+            webinar = [line for line in lines if "webinar" in line]
+            with self.subTest(persona=persona.id):
+                self.assertEqual(len(webinar), 1)
+                self.assertRegex(webinar[0], anchor)
+                weekly = any(
+                    re.search(r"weeks?", marker)
+                    for need in persona.needs
+                    for marker in need.markers
+                )
+                if weekly:
+                    self.assertNotIn("weeks", webinar[0])
+
+    def test_the_new_lines_are_public_text(self):
+        from r1_personas import BACKSTORY_TIMELINE_V2, backstory_lines
+
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant=persona.variants[0].id)
+            for fact in backstory_lines(persona, timeline_v2=True):
+                with self.subTest(persona=persona.id, fact=fact):
+                    self.assertEqual(deep_need_topics_in(rendered, fact), frozenset())
+                    self.assertLessEqual(len(fact.split()), 22)
+                    self.assertNotRegex(fact, r"\d")
+                    self.assertTrue(fact.endswith("."))
+        self.assertEqual(len(BACKSTORY_TIMELINE_V2), 3)
+        for old in BACKSTORY_TIMELINE_V2:
+            self.assertTrue(any(old in persona.backstory for persona in PERSONAS), old)
+
+    def test_the_success_answer_names_no_time_span(self):
+        import re
+        from r1_personas import public_answers
+
+        answers = dict(public_answers(timeline_v2=True))
+        success = answers["what success looks like for you"]
+        self.assertEqual(success, "Moving into a data role.")
+        self.assertNotRegex(
+            success, re.compile(r"\b(?:year|month|week|day|soon|within|by)\b", re.I)
+        )
+        self.assertNotIn("proper", success.lower())
+        self.assertEqual(answers["when you would decide on this course"], "Within a couple of weeks.")
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant=persona.variants[0].id)
+            self.assertEqual(deep_need_topics_in(rendered, success), frozenset(), persona.id)
+
+    def test_flag_off_card_is_the_release_before(self):
+        for persona, rendered, card in self._cards():
+            with self.subTest(persona=persona.id):
+                self.assertEqual(card, rendered.public_card_text(timeline_v2=False))
+                for fact in persona.backstory:
+                    self.assertIn(fact, card)
+                self.assertIn("A data role within a year.", card)
+        p1 = resolve_persona("p1_career_switcher", variant="v1")
+        self.assertIn("You are calling from home after work", p1.public_card_text())
+        v2 = p1.public_card_text(timeline_v2=True)
+        self.assertIn("You are at home after work when they call, a bit tired but friendly.", v2)
+        self.assertIn(
+            "You went to an Interview Kickstart webinar last month, after seeing it on LinkedIn.",
+            v2,
+        )
+        self.assertIn('"Moving into a data role."', v2)
+        self.assertNotIn("A data role within a year.", v2)
+        p3 = resolve_persona("p3_data_analyst", variant="v1").public_card_text(timeline_v2=True)
+        self.assertIn(
+            "You went to an Interview Kickstart webinar a few weeks ago, after a colleague "
+            "mentioned it.",
+            p3,
+        )
 
 if __name__ == "__main__":
     unittest.main()

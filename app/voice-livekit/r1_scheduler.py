@@ -65,7 +65,9 @@ from r1_script import LINES
 from r1_text import (
     fold,
     fuzzy_contains,
+    is_hollow_turn,
     is_question_like,
+    normalize,
     split_sentences,
     word_count,
 )
@@ -79,6 +81,14 @@ LOOKAHEAD_MAX_SEC = 90.0
 SPACING_TURNS = 2
 # A primary whose topic never came up is raised after this many turns without an objection.
 IDLE_GAP_TURNS = SPACING_TURNS + 1
+# M032 S1 (owner decision D-M032-1, flag ``R1_NATURAL_TIMING``).  While the plan is ahead of its
+# pacing map (``Moment.slack_ok``), the idle path waits for a natural moment: the advisor handed
+# her the floor, or a thread just closed, and not while a thread is open (an offer, a back-off or
+# a question put to her, or her own question just answered); after this longer quiet stretch it is
+# ready again whatever the turn (the wait is bounded).  IDLE_GAP_TURNS itself is unchanged (the
+# engine's SLACK_TURNS_PER_MOVE derives from it), and so are spacing, the topic trigger, the
+# deadlines and the forced path.
+IDLE_GAP_SLACK_TURNS = 5
 # An advisor turn this long (and not a bare "Okay", nor mainly a question or a request about the
 # call) counts as a substantive answer to a primary.
 SUBSTANTIVE_ANSWER_WORDS = 8
@@ -111,6 +121,19 @@ REDIRECT_BRIEF = (
     "the advisor sounds like they are wrapping up the call, so stop them politely for a "
     "moment because you have one more thing to bring up; then"
 )
+# M032 SWEEP-24 (flag R1_LATE_END_REQUEST): from R = 14:00 an explicit request to end the exercise
+# when one owed move completes the schedule: Christy says it will stop in a moment
+# (L-ASIDE-LAST-POINT) and the learner raises that move with this brief in place of REDIRECT_BRIEF,
+# with no "Oh wait, before you go" opener.  Worker-authored, listed for review (D-M032-4).
+LAST_POINT_BRIEF = (
+    "the call is about to end, so raise this one last thing briefly, in a sentence or two; then"
+)
+# Simulation diagnosis 3 (D3-END1, the engine's R1_LAST_POINT_V2): the role-play ends right after
+# it, so it is one statement and asks nothing.
+LAST_POINT_BRIEF_V2 = (
+    "the call is about to end, so raise this one last thing briefly, as one statement, and do "
+    "not ask anything; then"
+)
 
 
 @dataclass(frozen=True)
@@ -133,6 +156,12 @@ class MoveSpec:
     must_say: tuple[str, ...] = ()
     markers: tuple[tuple[str, ...], ...] = ()
     variants: tuple[str, ...] = ()
+    # M032 S2 item 3 (flag R1_LEARNER_VOICE_V2, phone map spoken-style M10): the owed worry as an
+    # objective (the feeling and what she wants to know, no sentence shape), voiced as a statement
+    # or a question; and statement-form fallback variants tried before ``variants``.  F3 and F2
+    # only: an F1 anchor is an ask.  The markers are unchanged and prove every variant.
+    worry: str = ""
+    worry_variants: tuple[str, ...] = ()
 
 
 PLAN: tuple[MoveSpec, ...] = (
@@ -167,6 +196,15 @@ PLAN: tuple[MoveSpec, ...] = (
         variants=(
             "I can find a lot of this for free online. What would I be paying for?",
             "I keep seeing free courses everywhere, so why would I pay for this one?",
+        ),
+        worry=(
+            "you doubt it is worth paying when so much is free online (YouTube, Coursera); what "
+            "you want to know is what this would give you that free material does not"
+        ),
+        worry_variants=(
+            "I can find a lot of this for free online, so I'm not sure it's worth paying for.",
+            "There's so much free material on YouTube and Coursera that I'm not sure what paying "
+            "would add.",
         ),
     ),
     MoveSpec(
@@ -206,6 +244,15 @@ PLAN: tuple[MoveSpec, ...] = (
         variants=(
             "And with so many layoffs going on, can this really help me land a job?",
             "Do people actually get jobs after this, given how the market is right now?",
+        ),
+        worry=(
+            "with all the layoffs in the news you are not sure a course like this would really "
+            "help you get a job; what you want to know is whether it actually leads to work"
+        ),
+        worry_variants=(
+            "With all the layoffs right now, I'm not sure this would actually help me get a job.",
+            "With so many layoffs around, I'm not sure a course like this would lead to a job for "
+            "me.",
         ),
     ),
     MoveSpec(
@@ -248,6 +295,12 @@ PLAN: tuple[MoveSpec, ...] = (
             "keep up.",
             "I'm quite busy as it is, so I'm worried about keeping up with this for six months.",
         ),
+        # The worry states no course length of its own: the figure stays the move's must_say until
+        # S2P (probe first) changes it.  The variants above are statements already.
+        worry=(
+            "your days are already full with work and home, and you are not sure you could keep "
+            "up with a course this long on top of them"
+        ),
     ),
     MoveSpec(
         F2_PUSH,
@@ -268,6 +321,14 @@ PLAN: tuple[MoveSpec, ...] = (
         variants=(
             "And if I miss a few classes, how do I catch up?",
             "What if I get busy at work and fall behind?",
+        ),
+        worry=(
+            "you are scared that if work gets busy you would fall behind and not be able to catch "
+            "up; what you want to know is what happens then"
+        ),
+        worry_variants=(
+            "I'm worried that if work gets busy, I'd fall behind and never catch up.",
+            "If I miss a few classes when work piles up, I'm scared I won't be able to catch up.",
         ),
     ),
     MoveSpec(
@@ -444,9 +505,170 @@ PLAN: tuple[MoveSpec, ...] = (
     ),
 )
 FAMILIES = ("F3", "F2", "F1", "F4")
+
+
+# ----------------------------------------------------------------------------------------------
+# M032 S2P, probe first (owner decision D-M032-7, S2 item 10; flag R1_PROBE_FIRST, read and latched
+# by the engine).  The learner never states a course fact the advisor has not said.  F2's and F4's
+# owed moves are worded without one (the markers are unchanged and prove every text below), and
+# the F1 and F2 families may open with a PROBE: a short question about the price or the time the
+# course takes, which delivers nothing graded (the move stays owed and reacts to the answer).
+# ----------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ProbeSpec:
+    """A probe step (S2.10): what she asks before the family's owed point, and its fallbacks.
+
+    ``markers`` prove the question was asked (a reply that asked it gets no scripted tail);
+    ``variants`` are the scripted questions, tried in a seeded rotation.
+    """
+
+    family: str
+    brief: str
+    markers: tuple[tuple[str, ...], ...]
+    variants: tuple[str, ...]
+
+
+PROBE_F1 = ProbeSpec(
+    "F1",
+    "you want to know what the course costs before you think about anything else; ask the advisor "
+    "in a short question of your own, and do not say or guess any figure yourself",
+    (
+        (r"\bhow much\b", r"\bcosts?\b", r"\bfees?\b", r"\bprice\b", r"\bcharge\b"),
+        (r"\?",),
+    ),
+    (
+        "How much is the course, by the way?",
+        "What's the fee like?",
+        "And what would the course cost me?",
+    ),
+)
+# Her second price question after the advisor did not name a figure (the first dodge).
+PROBE_F1_AGAIN = ProbeSpec(
+    "F1",
+    "you asked what the course costs and the advisor has not told you yet; ask once more, briefly "
+    "and politely, in your own words, and do not say or guess any figure yourself",
+    PROBE_F1.markers,
+    (
+        "Sorry, I didn't catch it. What would the course actually cost?",
+        "And the fee itself, how much would that be?",
+        "Just so I know, what's the price of the course?",
+    ),
+)
+# The advisor talked about the price but named no figure: she asks what it comes to (SWEEP-19).
+PROBE_F1_CLARIFY = ProbeSpec(
+    "F1",
+    "the advisor talked about the price but did not say a figure; ask in a short question what it "
+    "would actually come to, and do not say or guess any figure yourself",
+    PROBE_F1.markers,
+    (
+        "So what would it actually cost?",
+        "And what's the actual fee, roughly?",
+        "So how much would I be paying?",
+    ),
+)
+PROBE_F2 = ProbeSpec(
+    "F2",
+    "you want to know how much time the course would take; ask the advisor in a short question how "
+    "long it runs or how many hours a week it needs, and do not say or guess any figure yourself",
+    (
+        (
+            r"\bhow long\b",
+            r"\bhow many hours\b",
+            r"\bhow much time\b",
+            r"\bhours\b",
+            r"\bweeks?\b",
+            r"\bmonths?\b",
+            r"\bduration\b",
+        ),
+        (r"\?",),
+    ),
+    (
+        "How long does the course run?",
+        "How many hours a week would it take?",
+        "How much time would it take each week?",
+    ),
+)
+PROBES: tuple[ProbeSpec, ...] = (PROBE_F1, PROBE_F1_AGAIN, PROBE_F1_CLARIFY, PROBE_F2)
+# F2-PRIMARY and F4-PRIMARY without a course fact (the line, then the variants; S2.10).  F2: her
+# packed schedule against a course of any length ("a long course" on the forced path, SWEEP-17 item
+# 7).  F4: not ready to decide today, without the cohort she knows nothing about.
+F2_PRIMARY_BRIEF_V2 = (
+    "you are worried that your schedule is already packed and that you could not keep up with the "
+    "course on top of it"
+)
+F2_PRIMARY_WORRY_V2 = (
+    "your days are already full with work and home, and you are not sure you could keep up with "
+    "the course on top of them"
+)
+F2_PRIMARY_LINE_V2 = (
+    "My schedule is already packed; I'm not sure I could keep up with a long course."
+)
+F2_PRIMARY_VARIANTS_V2 = (
+    "I'm quite busy as it is, so I'm worried about keeping up with a course on top of everything.",
+    "My days are already full with work, so I'm not sure I could manage the course as well.",
+)
+F4_PRIMARY_BRIEF_V2 = (
+    "you are not ready to decide today and want some time to think it over before you decide"
+)
+F4_PRIMARY_LINE_V2 = "I'm not ready to decide today; I need some time to think it over."
+F4_PRIMARY_VARIANTS_V2 = (
+    "I don't think I can decide today. I want some time to think about it first.",
+    "I'm not ready to make a decision today, so let me think it over.",
+)
+# The owed moves whose texts change under probe first, and the course figures her scripted texts
+# never hold then (SWEEP-17 item 7; the invariant test reads every learner text against it).
+COURSE_LENGTH_FIGURE = re.compile(
+    r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty-four)"
+    r"[\s-]+(?:months?|weeks?)\b|\bhalf a year\b",
+    re.IGNORECASE,
+)
+
+
+def probe_first_texts(move_id: str) -> tuple[str, str, str, tuple[str, ...]] | None:
+    """(brief, worry, line, variants) of ``move_id`` under probe first, or None if unchanged."""
+    if move_id == F2_PRIMARY:
+        return (
+            F2_PRIMARY_BRIEF_V2,
+            F2_PRIMARY_WORRY_V2,
+            F2_PRIMARY_LINE_V2,
+            (F2_PRIMARY_LINE_V2, *F2_PRIMARY_VARIANTS_V2),
+        )
+    if move_id == F4_PRIMARY:
+        return (
+            F4_PRIMARY_BRIEF_V2,
+            "",
+            F4_PRIMARY_LINE_V2,
+            (F4_PRIMARY_LINE_V2, *F4_PRIMARY_VARIANTS_V2),
+        )
+    return None
+
+
+# Simulation diagnosis 4 (D4-F3STOCK1, the engine's R1_F3_WORDING; new wording under D-M032-4):
+# the worry named "(YouTube, Coursera)" and the exact question "what this gives you that free
+# material does not", and 11 of 41 calls said the same three-part line ("Six months is a real
+# commitment. ... what would this give me that YouTube or Coursera doesn't?").  The worry keeps
+# its meaning (free material online; what paying would get her) without words to copy, and she
+# reacts to what the advisor just said, not to the course length.  The markers are unchanged
+# ("free", "worth", "pay" still prove it).
+F3_PRIMARY_WORRY_V3 = (
+    "you doubt it is worth paying when so much is free online, and you want to know what you "
+    "would get for the money; react first to the specific thing they just said, not to how long "
+    "the course is"
+)
+F3_PRIMARY_WORRY_VARIANTS_V3 = (
+    "I can find a lot of this for free online, so I'm not sure it's worth paying for.",
+    "There's so much free material out there that I'm not sure what paying would add.",
+)
 # R1-Q iteration 3.  "before my (own) next call" came back verbatim in 8 of 20 calls, also from a
 # learner who was at home after work.  The cue is the same move said three ways (rotated by the
 # attempt id); the markers accept all three.
+# M032 SWEEP-27 (flag R1_TIME_CUE_V2; a95398ab p1): the first brief put her on "YOUR own next call"
+# although she is at home after work.  The neutral wording replaces it while the flag is on (the
+# spec's brief, pinned, is unchanged for the flag off); the markers already take "get going".
+TIME_CUE_BRIEF_V2 = (
+    "you tell the advisor that YOU only have a couple of minutes left before you need to get "
+    "going; it is your time that is short, not theirs"
+)
 TIME_CUE_BRIEF_ALTERNATIVES = (
     "you tell the advisor that YOU can only stay for a couple more minutes because something else "
     "is coming up for you; it is your time that is short, not theirs",
@@ -470,9 +692,161 @@ CURIOSITY_TOPICS: tuple[tuple[str, str], ...] = (
     ("prerequisites", "whether you need to know anything before you start"),
     ("job_search", "whether there is any help with the job search afterwards"),
 )
+# M032 SWEEP-12 (flag R1_TIC_V2): the labels the model read out as a question ("What would I
+# actually build ...?" in six sessions, "Are the classes live or recorded?" in five) become phrases,
+# rotated per session; her question about any of them still uses the topic up
+# (``curiosity_asked_in(..., wide=True)``).
+CURIOSITY_LABELS_V2: dict[str, tuple[str, ...]] = {
+    "format": ("the class format", "live classes or recordings", "how the classes are run"),
+    "build": (
+        "the projects in the course",
+        "the hands-on project work",
+        "what gets built in the course",
+    ),
+    "payment": (
+        "paying in monthly instalments",
+        "a monthly payment option",
+        "spreading the fee out",
+    ),
+    "mentor_time": ("time with mentors", "mentor access", "one-to-one mentor time"),
+    "weekly_hours": ("the weekly time needed", "hours per week", "the time it takes each week"),
+    "class_size": ("the batch size", "class size", "the number of people per batch"),
+    "prerequisites": (
+        "prerequisites",
+        "the starting level needed",
+        "any preparation before starting",
+    ),
+    "job_search": ("help with the job search", "job-search support", "support after the course"),
+}
 REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
 _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
+
+# Simulation diagnosis 1 (U1, U2; flag R1_MARKERS_V2, latched per session by the engine): more
+# any-of alternatives per marker group (by group index), so the worry in the model's new words
+# proves the move and the scripted tail does not say it a second time in the same reply ("...run
+# it past my husband. I'd also need to talk to my husband.").  Every marker of the release before
+# stays; with the flag off the markers are exactly the release before.
+EXTRA_MARKERS_V2: dict[str, tuple[tuple[str, ...], ...]] = {
+    F2_PRIMARY: (
+        (
+            r"\bdays?\b",
+            r"\bhome\b",
+            r"\bkids\b",
+            r"\bworkload\b",
+            r"\bjob\b",
+            r"\bevenings?\b",
+            r"\bweekends?\b",
+        ),
+        (
+            r"\bkeep(?:ing)? (?:pace|going)\b",
+            r"\bon top of\b",
+            r"\bsqueez\w*",
+            r"\bfit (?:it|this|that) in\b",
+        ),
+    ),
+    F2_PUSH: (
+        (
+            r"\b(?:fall|falls|falling|fell|fallen|get|gets|getting|got) (?:\w+ ){1,3}behind\b",
+            r"\bpick (?:it |things )?(?:back )?up where\b",
+            r"\bwhat happens (?:if|when)\b[^.?!]{0,40}\b(?:busy|miss\w*|behind|swamped|piles? up|"
+            r"can'?t keep)\b",
+        ),
+    ),
+    F4_PUSH: (
+        (),
+        (
+            r"\brun (?:it|this|that|all of this|all this|everything) past\b",
+            r"\bgo (?:over|through) (?:it|this|that|everything)\b",
+        ),
+    ),
+    F1_COUNTER: ((r"\bfull price\b", r"\bnothing (?:added|extra)\b"),),
+}
+
+# Simulation diagnosis 2 (HF3, U1; the engine's R1_INTENT_TAIL_V3).  Her reply already made an owed
+# point in its own words but missed a marker ("fitting the course around work and the kids"), so
+# the scripted tail said the point a second time.  The tail is now the shortest of these statements
+# that completes the markers together with her reply: a few words, never a second question.  Each
+# carries the move's unchanged markers (new wording under D-M032-4, listed for review); F1-COUNTER's
+# are per situation (``r1_negotiation.COUNTER_COMPLETIONS``).
+TAIL_COMPLETIONS: dict[str, tuple[str, ...]] = {
+    F2_PRIMARY: ("I'm just not sure I could keep up.", "I'm not sure how I'd fit it into my week."),
+    F3_PRIMARY: (
+        "I'm just not sure it's worth paying for.",
+        "There's so much free online, I'm not sure it's worth it.",
+    ),
+    F3_PUSH: (
+        "I'm just not sure it would lead to a job.",
+        "I'm not sure it would really get me a job.",
+    ),
+    F4_PRIMARY: ("Not today, anyway.", "So I won't decide today."),
+    F4_PUSH: (
+        "I'd want my {decision_maker}'s input first.",
+        "I'd need to talk to my {decision_maker} too.",
+    ),
+}
+# The point of each move in words other than its markers: a reply that hits its theme already made
+# the point, so only a completion is added (``{decision_maker}`` is filled, escaped).  Review of U1:
+# the words that also have another sense need their worry's frame: "full" only as a full day or
+# week ("the full price" is no busy week), deciding and committing only as not doing it now ("I've
+# decided I really like the mentoring part" defers nothing), "online" only as free material, and
+# "paying" only for whether it is worth it ("What would I be paying each month?" asks the price).
+TAIL_THEMES: dict[str, str] = {
+    F2_PRIMARY: (
+        r"\b(?:fit(?:ting)?|juggl\w*|packed|busy|schedule|keep(?:ing)? up|on top of|squeez\w*|"
+        r"stretched|(?:days?|weeks?|evenings?|weekends?|plate|hands|life) (?:is |are )?"
+        r"(?:already |so |pretty |really )?full|full plate|hands full|"
+        r"around (?:work|my|the kids|the family|everything))\b"
+    ),
+    F4_PRIMARY: (
+        r"\b(?:think(?:ing)? (?:it|this|that|things) (?:over|through)|not ready|"
+        r"(?:not|never|\w+n'?t) (?:\w+ )?(?:to )?(?:decid\w*|commit\w*)|"
+        r"(?:decid\w*|commit\w*) (?:anything |to anything )?(?:today|now|right now|yet|just yet|"
+        r"right away|on the spot)|before (?:i |we )?(?:decid\w*|commit\w*)|"
+        r"sleep on|mull\w*|rush\w*|take (?:my|some|a bit of|a little) time)\b"
+    ),
+    F4_PUSH: r"\b(?:{decision_maker}|husband|wife|partner|father|mother|dad|mum|mom|parents?)\b",
+    F3_PRIMARY: (
+        r"\b(?:free|youtube|coursera|udemy|worth|online (?:courses?|content|videos?|material|"
+        r"resources|tutorials?|for free))\b"
+    ),
+    F3_PUSH: (
+        r"\b(?:jobs?|hired|hiring|interviews?|offers?|lay ?offs?|laid off|market|placements?|"
+        r"career)\b"
+    ),
+    # Negotiation lines (``r1_negotiation.NEGOTIATION_COMPLETIONS``).
+    "N-PRICE-FIRST": r"\b(?:price|cost|fees?|how much|charge|number|figure)\b",
+    "N-EMAIL-YES": r"\b(?:e-?mail\w*|summary|send\w*|details|writing)\b",
+    F1_COUNTER: (
+        r"\b(?:price|cost|pay(?:ing)?|total|final|all in|come to|number|figure|scholarship|"
+        r"discount|cheaper|lower|afford\w*|budget|room)\b"
+    ),
+}
+
+
+def tail_theme_hit(move_id: str, text: object, decision_maker: str) -> bool:
+    """HF3, U1: ``text`` already makes ``move_id``'s point in some words (``TAIL_THEMES``)."""
+    theme = TAIL_THEMES.get(move_id)
+    if theme is None:
+        return False
+    pattern = re.compile(_fill(theme, decision_maker, regex=True), re.IGNORECASE)
+    return pattern.search(fold(text)) is not None
+
+
+def tail_completions(move_id: str, decision_maker: str) -> tuple[str, ...]:
+    """HF3, U1: the move's completion statements, the decision maker filled in."""
+    return tuple(_fill(text, decision_maker) for text in TAIL_COMPLETIONS.get(move_id, ()))
+
+
+def widened_markers(
+    move_id: str, markers: tuple[tuple[str, ...], ...]
+) -> tuple[tuple[str, ...], ...]:
+    """``markers`` with ``EXTRA_MARKERS_V2`` added to each group (R1_MARKERS_V2)."""
+    extra = EXTRA_MARKERS_V2.get(move_id, ())
+    return tuple(
+        (*group, *(extra[index] if index < len(extra) else ()))
+        for index, group in enumerate(markers)
+    )
 
 
 def _compile(*patterns: str) -> tuple[re.Pattern[str], ...]:
@@ -616,6 +990,24 @@ _CLOSE_FAREWELL = _compile(
     r"\bi think we'?re done(?: here)?\b[\s.!]*$",
     r"\bwe'?re (?:all )?done here\b[\s.!]*$",
 )
+# Simulation diagnosis 4 (D4-GOODBYE1, the engine's R1_FAREWELL_READ_V3): "Good night, Meera.",
+# "Talk tomorrow at seven.", "See you then." and "Night now." were never goodbyes, so 28 of them in
+# a row after the commitment never ended the role-play.  Each may carry a clock time ("at seven",
+# "around 7 pm") before the usual name and courtesy tail.
+TIME_TAIL = (
+    r"(?:\s+(?:at|around|by))?\s+(?:\d{1,2}(?::\d\d)?|one|two|three|four|five|six|seven|eight|nine|"
+    r"ten|eleven|twelve)(?:\s?(?:am|pm|a\.m\.|p\.m\.|o'?clock))?"
+)
+FAREWELL_V3_PHRASES = (
+    r"good ?night",
+    r"night now",
+    r"(?:talk|speak)(?: to you)? (?:tomorrow|then|later|next week|on \w+day)"
+    r"(?:" + TIME_TAIL + r")?",
+    r"see you (?:tomorrow|then|soon|next week|on \w+day)(?:" + TIME_TAIL + r")?",
+)
+_CLOSE_FAREWELL_V3 = _compile(
+    *(r"\b(?:" + phrase + r")\b" + _FAREWELL_TAIL for phrase in FAREWELL_V3_PHRASES)
+)
 # "Thanks for your time" is also a common OPENING courtesy, so it only counts as a
 # farewell once the call is well under way, and only as the end of the sentence.
 _CLOSE_THANKS = _compile(
@@ -633,6 +1025,25 @@ THANKS_TRAILING_WORDS = 3
 
 def _sentences(text: object) -> list[str]:
     return [fold(sentence).lower() for sentence in split_sentences(text)]
+
+
+# M032 SWEEP-19 item 6: the advisor asks what number or price works for her ("Which number would
+# suit you?", "How much could you pay?"), in a question.  Narrow on purpose (SWEEP-6 may widen it).
+_ASKS_HER_NUMBER = _compile(
+    r"\b(?:what|which) (?:number|price|figure|amount)\b[^.?!]{0,40}\b(?:work|works|suit|suits|fit|"
+    r"fits|good|okay|ok|comfortable|in mind|best)\b",
+    r"\bhow much (?:can|could|would|are) you (?:able to )?(?:pay|afford|spend|do|manage)\b",
+    r"\bwhat (?:were|are) you (?:hoping|looking|expecting|planning) to (?:pay|spend)\b",
+    r"\bwhat(?:'s| is) your (?:number|price)\b",
+)
+
+
+def asks_her_number(text: object) -> bool:
+    """The advisor asks what number would work for her (M032 SWEEP-19 item 6)."""
+    return any(
+        is_question_like(sentence) and any(pattern.search(sentence) for pattern in _ASKS_HER_NUMBER)
+        for sentence in _sentences(text)
+    )
 
 
 def is_pitch_statement(text: object) -> bool:
@@ -736,6 +1147,8 @@ _CURIOSITY_COVERED = {
         r"\bcareer (?:support|services|coach\w*)\b",
         r"\bjob (?:search|placement|assistance|support)\b",
         r"\bresume (?:review|reviews|building)\b|\bmock interviews?\b|\breferrals?\b",
+        # Review S7L-R3: "we have placement support for a full year".
+        r"\bplacements?\b|\binterview prep(?:aration)?\b",
     ),
     "weekly_hours": _compile(
         r"\bhours? (?:a|per|each|every) (?:week|day)\b",
@@ -793,11 +1206,35 @@ _CURIOSITY_ASKED = {
 }
 
 
-def curiosity_asked_in(text: object) -> frozenset[str]:
+# M032 SWEEP-12: the rotated noun-phrase labels (``CURIOSITY_LABELS_V2``) asked back in her own
+# question ("what about the class format?", "and the weekly time needed?").  Read only with
+# ``wide`` (flag R1_TIC_V2), so the release before reads her questions as it did.
+_CURIOSITY_ASKED_WIDE = {
+    "format": _compile(
+        r"\b(?:class|course) format\b", r"\bhow (?:are )?the classes (?:are )?run\b"
+    ),
+    "build": _compile(r"\b(?:gets|get|is|are) built\b", r"\bhands-?on\b"),
+    "payment": _compile(
+        r"\bspread(?:ing)? (?:the |it |out )?(?:fee|cost|payments?|out)\b",
+        r"\bmonthly (?:payments?|options?)\b",
+    ),
+    "weekly_hours": _compile(
+        r"\bweekly time\b",
+        r"\btime (?:it takes|needed|required) (?:each|every|a|per) week\b",
+        r"\bhours per week\b",
+    ),
+    "class_size": _compile(r"\b(?:number of )?people (?:per|in a|in each) batch\b"),
+    "prerequisites": _compile(r"\bstarting level\b", r"\bprepar(?:e|ation) before\b"),
+    "job_search": _compile(r"\bjob[- ]search\b", r"\bsupport after the course\b"),
+}
+
+
+def curiosity_asked_in(text: object, *, wide: bool = False) -> frozenset[str]:
     """The curiosity topics a question of the LEARNER's ``text`` asks about (L1).
 
     Only question-like sentences count: "I like that it's live" asks nothing.  A topic is used up
-    once she asked it, whether the engine handed it over or she asked on her own.
+    once she asked it, whether the engine handed it over or she asked on her own.  ``wide``
+    (SWEEP-12) also reads the rotated labels of ``CURIOSITY_LABELS_V2``.
     """
     found: set[str] = set()
     for sentence in split_sentences(text):
@@ -806,6 +1243,8 @@ def curiosity_asked_in(text: object) -> frozenset[str]:
         lowered = fold(sentence).lower()
         for topic, _label in CURIOSITY_TOPICS:
             patterns = (*_CURIOSITY_COVERED.get(topic, ()), *_CURIOSITY_ASKED.get(topic, ()))
+            if wide:
+                patterns += _CURIOSITY_ASKED_WIDE.get(topic, ())
             if any(pattern.search(lowered) for pattern in patterns):
                 found.add(topic)
     return frozenset(found)
@@ -837,6 +1276,131 @@ def answered_topics(text: object) -> frozenset[str]:
     return frozenset(found)
 
 
+# M032 SWEEP-7 (flag R1_COME_BACK): her own question the advisor dodged gets one come-back.  The
+# topics she can be owed an answer on are the curiosity topics (as ``curiosity_asked_in`` reads
+# them, ``wide``) and two more forms: "what if I fall behind / miss a class?" and "could I pay it
+# month by month?".  Price figures stay with F1 and S2P.
+OPEN_QUESTION_LABELS: dict[str, tuple[str, ...]] = {
+    **CURIOSITY_LABELS_V2,
+    "fall_behind": ("what happens if you fall behind",),
+}
+_OPEN_QUESTION_ASKED = {
+    "fall_behind": _compile(
+        r"\bfall(?:s|ing)? behind\b", r"\bmiss (?:a |some )?(?:class|classes|session|sessions)\b"
+    ),
+    "payment": _compile(
+        r"\bmonth by month\b",
+        r"\bpay (?:it |that |for it )?(?:off )?(?:each|every|per|a) month\b",
+    ),
+}
+# A deferral ("I'll get to that in a minute", "we can talk about that later", "hold that thought")
+# and a vague non-answer ("it's very flexible", "it depends", "don't worry about that").  Read
+# only on the advisor turn right after her question, and only when it left her topic uncovered.
+_DEFERS = _compile(
+    r"\b(?:i'?ll|i will|we'?ll|we will|let me|let's|let us|i can|we can) (?:get|come(?: back)?|"
+    r"circle back|return) to (?:that|it|this|those|your question)\b",
+    r"\b(?:we can|let's|let us|i'?ll|we'?ll|we will|i will) (?:discuss|talk about|cover|go over|"
+    r"get into|look at) (?:that|it|this|those)\b[^.?!]{0,20}\b(?:later|afterwards|in a (?:bit|"
+    r"minute|moment|second)|at the end|next time|another time)\b",
+    r"\bhold (?:on to )?that (?:thought|question)\b",
+    r"\b(?:that'?s|that is) (?:something|a question) (?:for|we can (?:cover|discuss)) later\b",
+)
+_VAGUE = _compile(
+    r"\b(?:it'?s|it is|that'?s|that is|timing is|the timing is|the schedule is|it'?s all) "
+    r"(?:very |quite |pretty |completely |totally |really |super )?flexible\b",
+    r"\bit (?:all )?(?:depends|varies)\b",
+    r"\bwhatever (?:works|suits) (?:for )?you\b",
+    r"\b(?:that'?s|that is|it'?s|it is) (?:very |quite |totally )?manageable\b",
+)
+# Review S7L-R3: a reassuring opener ("Don't worry about it, the recordings are always there") is
+# often followed by the real answer, so it counts as a dodge only when the turn says little else.
+_REASSURE = _compile(
+    r"\b(?:don'?t|do not) worry about (?:that|it|this)\b",
+    r"\bwe'?ll (?:figure|sort|work) (?:it|that|something) out\b",
+    r"\b(?:that'?s|that is|it'?s|it is) (?:not|never) (?:a |an )?(?:problem|issue|concern)"
+    r"(?: at all)?\b",
+)
+REASSURE_REST_MAX_WORDS = 8
+
+
+def open_question_topics(text: object, *, wide: bool = True) -> frozenset[str]:
+    """The topics a question of the LEARNER's ``text`` asks the advisor about (SWEEP-7)."""
+    found = set(curiosity_asked_in(text, wide=wide))
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        for topic, patterns in _OPEN_QUESTION_ASKED.items():
+            if any(pattern.search(lowered) for pattern in patterns):
+                found.add(topic)
+    return frozenset(found)
+
+
+# Review S7L-R3: what answers HER "what if I fall behind?" right after she asked it ("every class
+# is recorded so you can watch it later", "you can rewatch any session").  Wider than
+# ``_FALL_BEHIND_ANSWERED``, which a pitch must not trip ("classes are live and recorded").
+_FALL_BEHIND_COVERED = (
+    *_FALL_BEHIND_ANSWERED,
+    *_compile(
+        r"\bcatch[- ]up\b",
+        r"\brecord(?:ed|ing|ings)?\b",
+        r"\bre-?watch\b|\breplay(?:s|ed)?\b",
+        r"\bwatch (?:it|them|the (?:class|classes|session|sessions|recording|recordings)) "
+        r"(?:later|again|any ?time)\b",
+        r"\b(?:backup|back-up|extra|doubt(?:[- ]clearing)?) (?:class|classes|session|sessions)\b",
+    ),
+)
+
+
+def open_question_covered(topic: str, text: object) -> bool:
+    """The advisor's ``text`` answers the open-question ``topic`` (``curiosity_covered``)."""
+    if topic == "fall_behind":
+        lowered = fold(text).lower()
+        return any(pattern.search(lowered) for pattern in _FALL_BEHIND_COVERED)
+    return curiosity_covered(topic, text)
+
+
+def defers_or_vague(text: object) -> bool:
+    """The advisor put her question off or answered it with nothing (SWEEP-7, counts only).
+
+    A reassurance ("that's not a problem") counts only when at most ``REASSURE_REST_MAX_WORDS``
+    words of the turn are not part of it (review S7L-R3)."""
+    sentences = _sentences(text)
+    if any(pattern.search(sentence) for sentence in sentences for pattern in (*_DEFERS, *_VAGUE)):
+        return True
+    for sentence in sentences:
+        for pattern in _REASSURE:
+            match = pattern.search(sentence)
+            if match is None:
+                continue
+            rest = word_count(text) - word_count(match.group(0))
+            if rest <= REASSURE_REST_MAX_WORDS:
+                return True
+    return False
+
+
+def dodged_question(text: object, topics: frozenset[str] | tuple[str, ...]) -> bool:
+    """The advisor's turn dodged her question about ``topics`` (M032 SWEEP-7).
+
+    True when no topic is covered, the turn is not hollow ("Okay."), and it defers ("I'll get to
+    that"), answers vaguely ("it's very flexible") or pivots to a question of their own.  A pivot
+    whose own question names her topic ("How many hours could you give it?") is discovery, and a
+    plain pitch that misses the topic is not a dodge either.
+    """
+    if not topics or not isinstance(text, str) or is_hollow_turn(text):
+        return False
+    if any(open_question_covered(topic, text) for topic in topics):
+        return False
+    if defers_or_vague(text):
+        return True
+    if not asks_her_directly(text):
+        return False
+    questions = " ".join(
+        sentence for sentence in split_sentences(text) if is_question_like(sentence)
+    )
+    return not (set(topics) & open_question_topics(questions))
+
+
 # The F4 push when a call was proposed in the same turn: the learner must talk to its decision
 # maker first and is glad for them to join a call, it never says they dislike calls (a model said
 # "he's not really one for these things" and, a turn later, booked a call with him).
@@ -855,6 +1419,102 @@ F4_PUSH_SAID_VARIANTS = (
     "Like I said, I'd need to talk it over with my {decision_maker} first.",
     "As I mentioned, I'd want to talk to my {decision_maker} before anything moves.",
 )
+
+
+# M032 SWEEP-3 (flag R1_NO_COMMIT_LEDGER): she already said she is not deciding today in a line of
+# her own, so the owed F4 primary refers back to it ("like I said") instead of saying it as news.
+# Its markers and must-say are unchanged; both variants prove the move.
+F4_PRIMARY_SAID_SUFFIX = (
+    "; you already said earlier that you are not ready to decide yet, so refer back to it in a few "
+    'words (for example "like I said") instead of saying it as news'
+)
+F4_PRIMARY_SAID_VARIANTS = (
+    "Like I said, I'm not ready to decide today. I want a bit more time.",
+    "As I mentioned, I'd like to wait and decide later, not today.",
+)
+# M032 S2 item 4 (phone map question-flow M5): the advisor already talked about the topic of an owed
+# primary before it was raised, so she says why it still worries her in light of what she was told
+# ("what you were told about X", never the advisor's details said back as facts: the guard's
+# format_or_schedule_claim would drop them).
+PREEMPTED_SUFFIX = (
+    "; the advisor already told you something about {label}, so say in your own words why it "
+    "still worries you after what you were told, without repeating their details as facts"
+)
+# Keyed by what the advisor talked about (``preempting_topics``), so the label names only that
+# (review S2R-5: live or recorded classes alone were labelled "the schedule and the time it
+# takes", and with F2's must-say "six months" she was told the advisor had said how long it is).
+PREEMPTED_F2_FORMAT = "F2-format"
+PREEMPTED_LABELS: tuple[tuple[str, str], ...] = (
+    ("F3", "what the course gives you"),
+    ("F2", "the schedule"),
+    (PREEMPTED_F2_FORMAT, "how the classes are run"),
+)
+
+
+def preempting_topics(text: object) -> frozenset[str]:
+    """What an advisor turn already talked about in a statement, as ``PREEMPTED_LABELS`` keys.
+
+    F3: free material, worth or outcomes (``_VALUE_TALK``), never a pitch alone; F2: the schedule
+    (``_SCHEDULE_TALK``); ``PREEMPTED_F2_FORMAT``: live or recorded delivery only.  A question
+    about the topic pre-empts nothing.
+    """
+    found: set[str] = set()
+    for sentence in _sentences(text):
+        if is_question_like(sentence):
+            continue
+        if any(pattern.search(sentence) for pattern in _VALUE_TALK):
+            found.add("F3")
+        if any(pattern.search(sentence) for pattern in _SCHEDULE_TALK):
+            found.add("F2")
+    if covers_format(text):
+        found.add(PREEMPTED_F2_FORMAT)
+    return frozenset(found)
+
+
+def preempting_families(text: object) -> frozenset[str]:
+    """The families an advisor turn already talked about in a statement (S2 item 4).
+
+    Narrower than ``topics_in``: F3 is free material, worth or outcomes (``_VALUE_TALK``), never a
+    pitch alone; F2 is the format or the schedule.  A question about the topic pre-empts nothing.
+    """
+    return frozenset(
+        "F2" if topic == PREEMPTED_F2_FORMAT else topic for topic in preempting_topics(text)
+    )
+
+
+# M032 S2 item 5 (review S2R-1): the advisor's turn took up the worry her last line raised, in any
+# words.  Wider than ``topics_in``, which reads what INVITES an objection, not what answers one
+# ("our learners still get hired every month" after the layoffs worry, "every class is recorded,
+# you can catch up anytime" after the falling-behind worry).  A miss only costs the anti-validation
+# note; a false "not answered" would tell her to say a handled worry was not handled, so the lists
+# are wide.  F2 and F3 only: an F4 or stall worry is answered by a back-off, never by a topic.
+_WORRY_ANSWER: dict[str, tuple[re.Pattern[str], ...]] = {
+    "F3": _compile(
+        r"\b(?:jobs?|hired|hiring|hires?|placements?|placed|alumni|careers?|guarantee\w*|"
+        r"interviews?|mentors?|mentorship|mentoring|projects?|portfolios?|support\w*|outcomes?|"
+        r"salar(?:y|ies)|transition\w*|switch\w*|worth|value|structured?|feedback|certificat\w*|"
+        r"recruit\w*|compan(?:y|ies)|network\w*|industry|market|layoffs?|roles?|offers?|"
+        r"success\w*|refund\w*|free|youtube|coursera|udemy|curriculum|learners?|students?|"
+        r"graduates?|recession|economy|demand|skills?)\b",
+    ),
+    "F2": _compile(
+        r"\b(?:record(?:ed|ings?)?|catch(?:ing)? up|miss(?:ed|es|ing)?|mentors?|weekends?|"
+        r"evenings?|weekdays?|hours?|flexib\w+|schedules?|pace|self[- ]paced|working "
+        r"professionals?|famil(?:y|ies)|jobs?|extend\w*|extensions?|pause\w*|defer\w*|"
+        r"batch(?:es)?|cohorts?|time|support\w*|doubts?|live|convenien\w*|whenever|anytime|"
+        r"any time|later|busy|manag\w*|balanc\w*|behind|backup|buddy|months?|weeks?|deadlines?|"
+        r"replay|rewatch|re-watch|on[- ]demand)\b",
+    ),
+}
+
+
+def worry_answered(family: str | None, text: object) -> bool:
+    """The advisor's turn took up the worry of ``family`` (F2 or F3; any other: True)."""
+    patterns = _WORRY_ANSWER.get(family or "")
+    if patterns is None:
+        return True
+    lowered = fold(text).lower()
+    return any(pattern.search(lowered) for pattern in patterns)
 
 
 def f4_push_said(decision_maker: str) -> tuple[str, tuple[str, ...]]:
@@ -950,6 +1610,247 @@ def answers_substantively(text: object) -> bool:
     return 2 * said >= total
 
 
+# M032 S1: readers of the advisor's turn for the learner's manners (respond first, the natural
+# moment).  Lexical, sentence by sentence, every quantifier bounded.  Copied in spirit from the
+# phone bot's directedness rule (a broad "is it a question?" test fired on answer openings), never
+# imported from it.
+#
+# An OFFER waits for her reaction: the advisor, in the first person singular, proposes to do
+# something for her ("I can bring him into a joint call", "let me set up a demo class", "would you
+# like me to arrange a mentor chat?").  "We can ..." is left out: on the advisor corpus it is
+# nearly always the programme described ("we can set up a catch-up session if you miss a class"),
+# and so is a pitch ("we will send you a certificate").  Nothing about price, a discount, a free
+# trial, a budget or enrolling counts (the negotiation reads those), nor an e-mail, a link, the
+# details or a callback (the negotiation's too).  Nor a discourse phrase said with one of those
+# verbs (review S1R-5): "let me put it this way", "let me add one more thing", "I'll give you an
+# example", "I can give you an idea of ...", "I will show you why ...": the advisor explains, and
+# nothing waits for her reaction.
+_NOT_AN_OFFER_TAIL = (
+    r"(?!(?<=put) (?:it|that|things)\b)"
+    r"(?!(?<=add) (?:that|this|to that)\b)"
+    r"(?! (?:one|a|another|just one) (?:more |last |final |quick |small )?(?:thing|point|word)\b)"
+    r"(?! (?:you |to that )?(?:an? |some |one )?(?:examples?|idea|sense|picture|overview|"
+    r"breakdown|analogy|perspective|context)\b)"
+    r"(?! (?:you )?(?:why|how|what|where|when)\b)"
+    r"(?! (?:it |this |that )?(?:simply|differently|another way|this way|in perspective)\b)"
+)
+_OFFER = _compile(
+    r"\bi(?:'ll| will| can| could)(?: also| actually| even| easily| happily| definitely| just)? "
+    r"(?:put|add|get(?! back)|bring|arrange|give|send|share|set up|connect|organi[sz]e|book|"
+    r"include|show|introduce|loop)\b" + _NOT_AN_OFFER_TAIL,
+    r"\blet me (?:send|arrange|set up|get you|connect|put|add|organi[sz]e|book)\b"
+    + _NOT_AN_OFFER_TAIL,
+    r"\b(?:would you like|do you want|want) me to\b",
+    r"\bif you (?:want|like|prefer|wish)\b[^.?!]{0,40}\bi(?:'ll| will| can| could)\b",
+)
+_OFFER_EXCLUDED = _compile(
+    r"\$\s?\d",
+    r"\b\d[\d,]*\s*(?:dollars|usd|k)\b",
+    r"\b\d{1,2}\s?%",
+    r"\b(?:price|pricing|priced|fees?|costs?|discount\w*|off|scholarships?|cashback|rebate|"
+    r"waive\w*|emi|instal\w*|free|percent|enrol\w*|pay|paying|payment\w*|budget|monthly|"
+    r"per month|a month|call you|ring you)\b",
+)
+# The negotiation's own offers: an e-mail, a message, a link or the details sent over.
+_OFFER_NEGOTIATION = _compile(
+    r"\b(?:e-?mail\w*|mail|whatsapp|text message|link|brochure|summary|details|information|"
+    r"info|curriculum|syllabus)\b",
+)
+# A BACK-OFF gives her time ("take your time", "no rush", "discuss it at home and come back to
+# me").  Not when the same turn presses again ("no pressure, but the offer ends today"), and not a
+# course description ("the program is self-paced, so you can take your time with each module").
+_BACK_OFF = _compile(
+    r"\btake (?:your|all the|as much|some) time\b",
+    r"\bno (?:rush|hurry|pressure)\b",
+    r"\bdon'?t (?:rush|hurry|feel (?:rushed|pressured))\b",
+    r"\bwhenever you(?:'re| are) ready\b",
+    r"\bthink (?:it|this|about it) over\b",
+    r"\bsleep on it\b",
+    r"\byou can\b[^.?!]{0,50}\b(?:get back to (?:me|us)|call (?:me|us) back|come back to (?:me|us)|"
+    r"reach out to (?:me|us))\b",
+    r"\b(?:get back to (?:me|us)|call (?:me|us) back|come back to (?:me|us))\b[^.?!]{0,30}"
+    r"\b(?:later|whenever|when you|once you|after you|any ?time)\b",
+)
+_BACK_OFF_COURSE = _compile(
+    r"\b(?:modules?|lessons?|class(?:es)?|courses?|program(?:me)?s?|curriculum|recordings?|"
+    r"sessions?|pace|paced|assignments?|projects?)\b",
+)
+_PRESSES_AGAIN = _compile(
+    r"\b(?:today|tonight|ends?|ending|deadline|last (?:chance|day|few)|limited|hurry up|"
+    r"won'?t wait|spots?|seats?|fill(?:ing)? (?:up|fast)|higher price|"
+    r"(?:price|fee) (?:goes|will go) up)\b",
+    r"\b(?:decid|enrol|sign|join|commit|regist)\w* (?:soon|quickly|now|today|this week)\b",
+)
+# A QUESTION PUT TO HER: a question-like sentence that names her ("which figure would suit you?",
+# "how does your week usually look").  Not an open invitation (that hands her the floor), a tag
+# ("..., right?"), "does that make sense?", a presence check, a request about the call itself, a
+# discourse marker said as a question ("Okay, you know what? ...", "Guess what?"), or a pitch said
+# as a question ("did you know you can book a mentor anytime?", "isn't it great that ...?", "why
+# do you think our students ...?").  The tag is a bounded run read on the sentence's last
+# ``_TAG_TAIL_CHARS`` characters only (review S1-R6: "[,\s]+" with ``search`` was quadratic in a
+# run of commas and spaces, 0.2 s on a 4,000-character turn).
+_TAG_TAIL = re.compile(
+    r"[,\s]{1,6}(?:right|okay|ok|yeah|yes|no|na|isn'?t it|you know|correct|huh|eh)\W{0,3}$"
+)
+_TAG_TAIL_CHARS = 40
+_NOT_PUT_TO_HER = _compile(
+    r"\bmakes? sense\b",
+    r"\b(?:can you hear me|are you (?:there|with me)|hello)\b",
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then|but)\W+){0,3}(?:do|did) you (?:even )?(?:know|"
+    r"realis\w*|realiz\w*)\b",
+    r"\bwould it help (?:you )?to know\b",
+    r"^\W*(?:\w+\W+){0,2}why do you think\b",
+    r"\b(?:isn'?t|wouldn'?t|won'?t) (?:it|that|this) be\b",
+    r"\bisn'?t (?:it|that|this) (?:great|amazing|nice|good|wonderful|awesome|fair|cool)\b",
+    r"\bdon'?t you think\b",
+    # A sentence that is only a discourse marker ("Okay, you know what?", "See, guess what?").
+    r"^\W*(?:(?:okay|ok|so|and|but|well|hey|oh|yeah|see|now|listen)\W+){0,3}"
+    r"(?:you know(?: what)?|guess what)\W*$",
+)
+_SECOND_PERSON = re.compile(r"\b(?:you|your|yours|yourself)\b")
+
+
+def offers_something(text: object) -> bool:
+    """The advisor offers to do something for the learner that waits for her reaction (M032 S1)."""
+    sentences = _sentences(text)
+    if any(pattern.search(sentence) for sentence in sentences for pattern in _OFFER_NEGOTIATION):
+        return False
+    for sentence in sentences:
+        if any(pattern.search(sentence) for pattern in _OFFER_EXCLUDED):
+            continue
+        if any(pattern.search(sentence) for pattern in _OFFER):
+            return True
+    return False
+
+
+def backs_off(text: object) -> bool:
+    """The advisor gives the learner time or hands the decision back to her (M032 S1)."""
+    sentences = _sentences(text)
+    if any(pattern.search(sentence) for sentence in sentences for pattern in _PRESSES_AGAIN):
+        return False
+    for sentence in sentences:
+        if any(pattern.search(sentence) for pattern in _BACK_OFF_COURSE):
+            continue
+        if any(pattern.search(sentence) for pattern in _BACK_OFF):
+            return True
+    return False
+
+
+def asks_her_directly(text: object) -> bool:
+    """A question-like sentence addressed to the learner herself (M032 S1, RCA LR-4).
+
+    Wider than ``r1_personas.asks_about_learner`` ("which figure would suit you?" is no dig) and
+    narrower than "any question": an open invitation hands her the floor instead, a tag question
+    asks nothing, and a presence check or a request about the call is not put to her in role.
+    """
+    for sentence in _sentences(text):
+        if not _asks_the_learner(sentence):
+            continue
+        tag = _TAG_TAIL.search(sentence, max(0, len(sentence) - _TAG_TAIL_CHARS))
+        if tag is not None:
+            head = sentence[: tag.start()]
+            if "?" not in head and not is_question_like(head):
+                continue
+        if any(pattern.search(sentence) for pattern in _OPEN_INVITATION):
+            continue
+        if any(pattern.search(sentence) for pattern in (*_META_REQUEST, *_NOT_PUT_TO_HER)):
+            continue
+        if _SECOND_PERSON.search(sentence):
+            return True
+    return False
+
+
+def tells_something(text: object) -> bool:
+    """The advisor SAID something (M032 S1): ``SUBSTANTIVE_ANSWER_WORDS`` words in statements.
+
+    Stricter than ``answers_substantively``: an open invitation ("That makes sense. What else is
+    on your mind?") hands her the floor but answers nothing, so its words do not count here.
+    """
+    said = 0
+    for sentence in _sentences(text):
+        if _asks_the_learner(sentence) or any(
+            pattern.search(sentence) for pattern in (*_OPEN_INVITATION, *_META_REQUEST)
+        ):
+            continue
+        said += word_count(sentence)
+    return said >= SUBSTANTIVE_ANSWER_WORDS
+
+
+def offers_floor(text: object) -> bool:
+    """The advisor hands the learner the floor ("What else is on your mind?", "Any questions?")."""
+    return any(
+        pattern.search(sentence) for sentence in _sentences(text) for pattern in _OPEN_INVITATION
+    )
+
+
+# M032 SWEEP-33 (flag R1_FLOOR_YIELD): the advisor asks for the floor ("Can I talk?", "Sorry, let me
+# finish.", "Please just listen to me.").  The turn is read word by word: softeners are stripped
+# from both ends, and what is left must be one of these forms IN FULL, so "Can I talk to your
+# husband?", "Let me explain the fee, it is nine thousand", a bare "Listen." and "Let me explain."
+# are never a request for the floor.
+_FLOOR_SOFTENERS = frozenset("sorry please just okay ok hey no wait".split())
+# Review S7L-R2: "Hold on, let me finish.", "One second, let me finish.", "Just a second, ...".
+_FLOOR_SOFTENER_PAIRS = frozenset(
+    (
+        ("excuse", "me"),
+        ("hold", "on"),
+        ("hang", "on"),
+        ("one", "second"),
+        ("one", "sec"),
+        ("one", "minute"),
+        ("a", "second"),
+        ("a", "sec"),
+        ("a", "minute"),
+    )
+)
+# Review S7L-R2: "listen what I am saying" (speech-to-text drops the "to"), "let me complete my
+# point".
+_FLOOR_LISTEN = r"listen (?:to )?(?:me|what i(?:'m| am) saying)"
+_FLOOR_REQUEST = re.compile(
+    r"(?:"
+    r"(?:can|could|may) i (?:please )?(?:talk|speak|finish|complete|say something|explain)"
+    r"(?: (?:first|now|please))?"
+    r"|let me (?:finish|complete|speak|talk)(?: (?:my point|my thought|this|what i(?:'m| am) "
+    r"saying))?(?: (?:first|please))?"
+    rf"|(?:can|could) you (?:please )?(?:just )?(?:{_FLOOR_LISTEN}|hear me out)(?: first)?"
+    rf"|(?:please )?(?:just )?(?:{_FLOOR_LISTEN}|hear me out)(?: first)?"
+    r")"
+)
+FLOOR_REQUEST_MAX_WORDS = 12
+
+
+def asks_for_floor(text: object, names: tuple[str, ...] = ()) -> bool:
+    """The advisor asks her to let them speak, and the turn says nothing else (M032 SWEEP-33).
+
+    ``names``: her first name, a softener like "sorry" when said around the request ("Meera, let me
+    finish.").  At most ``FLOOR_REQUEST_MAX_WORDS`` words; linear in the text.
+    """
+    if not isinstance(text, str):
+        return False
+    folded = text.lower().replace("\u2019", "'")
+    words = [word.strip("'") for word in _WORD_TOKEN.findall(folded)]
+    words = [word for word in words if word]
+    if not words or len(words) > FLOOR_REQUEST_MAX_WORDS:
+        return False
+    soft = _FLOOR_SOFTENERS | {name.lower() for name in names if name}
+    start, end = 0, len(words)
+    while start < end:
+        if words[start] in soft:
+            start += 1
+        elif start + 1 < end and (words[start], words[start + 1]) in _FLOOR_SOFTENER_PAIRS:
+            start += 2
+        else:
+            break
+    while end > start:
+        if words[end - 1] in soft:
+            end -= 1
+        elif end - 2 >= start and (words[end - 2], words[end - 1]) in _FLOOR_SOFTENER_PAIRS:
+            end -= 2
+        else:
+            break
+    return start < end and _FLOOR_REQUEST.fullmatch(" ".join(words[start:end])) is not None
+
+
 def _asks_something(sentence: str) -> bool:
     """A question that is not itself a farewell ("Have a great day." opens like one)."""
     if "?" in sentence:
@@ -1007,7 +1908,7 @@ def _strip_stt_bye_tail(text: object) -> str:
     return head
 
 
-def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
+def is_close_attempt(text: object, r_sec: float | None = None, *, wide: bool = False) -> bool:
     """A farewell or wrap-up phrase.  Never fires on "end the call" style instructions.
 
     With ``r_sec`` given, nothing counts before R = 1:00 and the courtesy "thanks for your
@@ -1019,6 +1920,9 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     courtesy "thanks for your time" only counts when the turn stops there: if a statement
     follows it ("Thanks for your time. So, coming to the fees, it's nine thousand.") the
     advisor is still talking.
+
+    ``wide`` (D4-GOODBYE1, the engine's R1_FAREWELL_READ_V3): "good night", "talk tomorrow (at
+    seven)", "see you then" and "night now" are farewells too (``_CLOSE_FAREWELL_V3``).
     """
     if r_sec is not None and r_sec < CLOSE_MIN_R_SEC:
         return False
@@ -1030,15 +1934,29 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     # sentence is a sign-off tail.
     asks_after = [False] * (count + 1)
     closing_after = [True] * (count + 1)
+    # Review D4R-2: "We'll talk tomorrow at seven." books the call-back; it takes leave only when
+    # nothing but sign-off tails (or another goodbye) follows it in the turn.
+    tail_after = [True] * (count + 1)
     for index in range(count - 1, -1, -1):
         asks_after[index] = asks_after[index + 1] or _asks_something(sentences[index])
         closing_after[index] = closing_after[index + 1] and (
             not thanks_allowed or _is_closing_tail(sentences[index])
         )
+        if wide:
+            tail_after[index] = tail_after[index + 1] and (
+                _is_closing_tail(sentences[index])
+                or any(pattern.search(sentences[index]) for pattern in _CLOSE_FAREWELL_V3)
+            )
     for index, sentence in enumerate(sentences):
         if asks_after[index + 1]:
             continue
         if any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL):
+            return True
+        if (
+            wide
+            and tail_after[index + 1]
+            and any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL_V3)
+        ):
             return True
         if (
             thanks_allowed
@@ -1047,6 +1965,142 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
         ):
             return True
     return False
+
+
+# M032 S3.1 (flag R1_CLOSING_STATE; RCA END-1, fda9e9f6 #73-#90: "take your time and call me back
+# later" and "get back to us" were never read as closes, so the learner filled four goodbye
+# cycles).  A hand-over close ENDS the turn and nothing is asked after it: "call me back (later)"
+# and "get back to me/us", with only a time and courtesy after them.  ``is_close_attempt`` and the
+# corpus's ``farewell`` labels are unchanged: this is the engine's own, flagged reading, and before
+# 14:00 it reaches Christy's question, never a silent exit.  "Take your time", "no rush" and "no
+# pressure" alone are how an advisor waits for an answer mid-call (corpus: "Take your time." is
+# no farewell), so they close only right after her own sign-off (``after_sign_off``).
+_HANDOVER_WHEN = (
+    r"(?: (?:later(?: on)?|anytime|any time|tomorrow|whenever(?: you(?:'re| are) (?:ready|free))?"
+    r"|when(?:ever)? you(?:'re| are) (?:ready|free|done)|once you(?:'ve| have) decided"
+    r"|after you(?:'ve| have) (?:talked|spoken|decided)(?: (?:to|with) (?:him|her|them))?))?"
+)
+_HANDOVER_TAIL = (
+    r"(?:[\s,]+(?:then|okay|ok|please|thanks|thank you|bye|take care|no rush|no pressure))*"
+    r"[\s.!]*$"
+)
+_HANDOVER_CLOSE = _compile(
+    r"\bcall (?:me|us) back" + _HANDOVER_WHEN + _HANDOVER_TAIL,
+    r"\bget back to (?:me|us)" + _HANDOVER_WHEN + _HANDOVER_TAIL,
+)
+# A hand-over that is a condition, not a close ("if you have any doubts, get back to me", "in case
+# of questions, call us back"): read in the sentence before the hand-over itself.
+_CONDITIONAL_HANDOVER = re.compile(
+    r"\b(?:if|in case|should you|incase)\b|\bany (?:more |other |further )?"
+    r"(?:questions?|doubts?|queries|query|concerns?|issues?|problems?)\b",
+    re.IGNORECASE,
+)
+# The whole sentence is the wait ("Sure, take your time.", "Take your time, no rush."): "Just a
+# quick check-in, no pressure." is the advisor still talking.
+_WAIT_PHRASE = r"(?:take (?:all )?your time|no rush|no hurry|no pressure)"
+_WAIT_FOR_HER = _compile(
+    r"^\W*(?:(?:sure|okay|ok|of course|no problem|absolutely|alright|yes|yeah|that'?s fine)"
+    r"[,\s]+){0,3}" + _WAIT_PHRASE + r"(?:[,\s]+" + _WAIT_PHRASE + r")?" + _HANDOVER_TAIL,
+)
+# A sentence of courtesy alone ("Thank you.", "Bye.", "Take care, Divya.") after the close.
+_COURTESY_WORDS = frozenset(
+    "thank thanks you so much very bye goodbye take care okay ok alright sure great have a nice "
+    "good day evening then all the best talk soon later again".split()
+)
+COURTESY_MAX_WORDS = 8
+
+
+def _courtesy_sentence(sentence: str) -> bool:
+    words = normalize(sentence).split()
+    if len(words) > COURTESY_MAX_WORDS:
+        return False
+    unknown = [word for word in words if word not in _COURTESY_WORDS]
+    return len(unknown) <= 1 and (not unknown or len(words) >= 2)
+
+
+def hands_over_close(text: object, *, after_sign_off: bool = False) -> bool:
+    """S3.1: the advisor closes in role by handing over ("Take your time and call me back later.").
+
+    Read on the turn's last sentence that is not courtesy alone, which must hold no question.
+    ``after_sign_off``: her own last line signed off, so "Sure, take your time." closes too.
+    """
+    sentences = _sentences(fold(text)[-CLOSE_MAX_CHARS:])
+    while len(sentences) > 1 and _courtesy_sentence(sentences[-1]):
+        sentences.pop()
+    if not sentences or "?" in sentences[-1]:
+        return False
+    last = sentences[-1]
+    for pattern in _HANDOVER_CLOSE:
+        match = pattern.search(last)
+        # Review S3R-1 (naturalness): "If you have any doubts, just get back to me." keeps the
+        # door open mid-pitch; only an unconditional hand-over closes the call.
+        if match is not None and _CONDITIONAL_HANDOVER.search(last[: match.start()]) is None:
+            return True
+    return after_sign_off and any(pattern.search(last) for pattern in _WAIT_FOR_HER)
+
+
+# S3.1: the words of a courtesy-only advisor turn ("Sure. Thank you.", "Yeah, sure.", "Okay, no
+# problem, take care."): right after her own sign-off it is a mutual goodbye.
+_COURTESY_TURN_WORDS = frozenset(
+    {*_COURTESY_WORDS, "yes", "yeah", "yep", "fine", "perfect", "cool", "no", "problem",
+     "worries", "of", "course", "absolutely", "definitely", "sounds", "good", "that", "works",
+     "your", "time", "hmm", "mm", "mhm", "noted", "got", "it", "understood", "will", "do",
+     "right"}
+)
+COURTESY_TURN_MAX_WORDS = 10
+
+
+def courtesy_only(text: object) -> bool:
+    """S3.1: an advisor turn of courtesy and acknowledgement alone, asking nothing."""
+    folded = fold(text)
+    if "?" in folded:
+        return False
+    words = normalize(folded).split()
+    return (
+        0 < len(words) <= COURTESY_TURN_MAX_WORDS
+        and all(word in _COURTESY_TURN_WORDS for word in words)
+    )
+
+
+# Review S3R-3 / S3R-1 (naturalness): a mutual goodbye takes leave.  "Hmm.", "Okay.", "No.",
+# "Right.", "Got it." or "Okay, so" after her "I'll think it over." are the advisor thinking or
+# about to go on, never a goodbye (each one locked a WEAK commitment from 14:00).
+_LEAVE_TAKING = re.compile(
+    r"\b(?:bye|goodbye|thanks?|thank you|take care|talk (?:to you )?soon|see you|cheers"
+    r"|have a (?:nice|good|great) (?:day|evening|one)|all the best)\b"
+)
+
+
+# D4-GOODBYE1 (R1_FAREWELL_READ_V3): "You're welcome. Good night." and "See you tomorrow." take
+# leave too.
+_LEAVE_TAKING_V3 = re.compile(
+    r"\b(?:good ?night|night now|see you|talk (?:to you )?(?:tomorrow|then|later)|"
+    r"speak (?:to you )?(?:soon|tomorrow|then|later))\b"
+)
+_COURTESY_TURN_WORDS_V3 = frozenset(
+    {*_COURTESY_TURN_WORDS, "night", "goodnight", "welcome", "youre", "tomorrow", "see", "soon",
+     "speak", "cheers", "too", "same", "to"}
+)
+
+
+def courtesy_goodbye(text: object, *, wide: bool = False) -> bool:
+    """S3.1: a courtesy-only advisor turn that takes leave ("Sure. Thank you.", "Okay, bye.").
+
+    ``wide`` (D4-GOODBYE1): "You're welcome. Good night." and "See you tomorrow." as well."""
+    if not wide:
+        return courtesy_only(text) and _LEAVE_TAKING.search(normalize(fold(text))) is not None
+    folded = fold(text)
+    if "?" in folded:
+        return False
+    words = normalize(folded).split()
+    if not 0 < len(words) <= COURTESY_TURN_MAX_WORDS:
+        return False
+    if not all(word in _COURTESY_TURN_WORDS_V3 for word in words):
+        return False
+    lowered = normalize(folded)
+    return (
+        _LEAVE_TAKING.search(lowered) is not None or _LEAVE_TAKING_V3.search(lowered) is not None
+    )
 
 
 def _is_closing_tail(sentence: str) -> bool:
@@ -1077,6 +2131,24 @@ class TurnSignals:
     substantive: bool
     topics: frozenset[str] = frozenset()
     answered: bool = False
+
+
+@dataclass(frozen=True)
+class Moment:
+    """What the advisor's turn was, for the idle path of a primary (M032 S1, D-M032-1).
+
+    ``slack_ok``: the plan is ahead of its pacing map (the engine's ``_ahead_of_pacing``); without
+    it the moment changes nothing.  ``floor_offered``: the advisor handed her the floor (a check-in,
+    "what else is on your mind?").  ``thread_open``: something waits for her answer (an offer, a
+    back-off, a question put to her, a dig, or her own question just answered).  ``thread_closed``:
+    the advisor finished a point and left nothing open.  The engine builds it per turn and passes it
+    to ``select`` for that turn only.
+    """
+
+    slack_ok: bool = False
+    floor_offered: bool = False
+    thread_open: bool = False
+    thread_closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1117,8 +2189,9 @@ class Delivery:
 class CloseDecision:
     """Response to an early close attempt: redirect with a move, stall, or exit.
 
-    ``prefix`` is always empty since R1-Q (the redirect is a brief the model voices; the
-    scripted openers are ``REDIRECT_OPENERS``).  The field stays for the contract.
+    ``prefix`` is the scripted opener a redirect is spoken with (``REDIRECT_OPENERS[0]``, "Oh
+    wait, before you go..."; the ship restore plays it before the owed line, or with R1_PROBE_FIRST
+    before the probe-first step that is due, SWEEP-20); it is empty for a stall or an exit.
     """
 
     action: str
@@ -1147,7 +2220,8 @@ class _MoveState:
 class OwedMoveScheduler:
     """Per-session schedule of the learner's owed moves (see the module docstring)."""
 
-    def __init__(self, decision_maker: str) -> None:
+    def __init__(self, decision_maker: str, *, markers_v2: bool = False) -> None:
+        """``markers_v2``: R1_MARKERS_V2 (simulation diagnosis 1), the wider delivery markers."""
         self.decision_maker = decision_maker
         self._states: dict[str, _MoveState] = {}
         for spec in PLAN:
@@ -1155,13 +2229,14 @@ class OwedMoveScheduler:
                 text = commitment_line(Level.WEAK, decision_maker)
             else:
                 text = _fill(spec.line, decision_maker)
+            markers = widened_markers(spec.id, spec.markers) if markers_v2 else spec.markers
             self._states[spec.id] = _MoveState(
                 spec,
                 text,
                 brief=_fill(spec.brief, decision_maker),
                 markers=tuple(
                     tuple(_fill(pattern, decision_maker, regex=True) for pattern in group)
-                    for group in spec.markers
+                    for group in markers
                 ),
                 variants=(text, *(_fill(item, decision_maker) for item in spec.variants))
                 if spec.variants
@@ -1177,10 +2252,17 @@ class OwedMoveScheduler:
         self.projects_covered_turn: int | None = None
         self.close_attempts = 0
         self.commitment_resolved = False
+        # Simulation diagnosis 4 (D4-TIMECUE1, the engine's R1_TIME_CUE_V3, set before each
+        # select): the call is already saying goodbye, so "I've only got a couple of minutes" is
+        # not raised now.
+        self.time_cue_held = False
         self._delivered_in_turn = -1
         self._last_objection_turn: int | None = None
         self._topic_turn: dict[str, int] = {}
         self._turn_answered = False
+        # M032 SWEEP-20: (move id, issued, forced_when_issued, enabled_sec) before the last
+        # redirect.
+        self._redirect_undo: tuple[str, int, bool, float | None] | None = None
 
     # ------------------------------------------------------------------ observation
     @property
@@ -1189,6 +2271,18 @@ class OwedMoveScheduler:
         recent = self._gaps[-4:]
         average = sum(recent) / len(recent) if recent else DEFAULT_TURN_SEC
         return min(LOOKAHEAD_MAX_SEC, max(LOOKAHEAD_MIN_SEC, average))
+
+    @property
+    def cautious_lookahead_sec(self) -> float:
+        """The slowest recent turn, never below ``lookahead_sec`` (M032 S1, review S1-R2).
+
+        The S1 waits and holds spend the plan's buffer, so their slack is judged at the pace of the
+        slowest of the last four turns: the first slow exchange after a fast stretch counts at once,
+        where the average takes four turns to catch up.  Clamped like the average.
+        """
+        recent = self._gaps[-4:]
+        slowest = max(recent) if recent else DEFAULT_TURN_SEC
+        return min(LOOKAHEAD_MAX_SEC, max(self.lookahead_sec, slowest))
 
     def observe_candidate_turn(self, text: object, r_sec: float) -> TurnSignals:
         """Record one candidate turn at role-play time ``r_sec`` and derive its signals."""
@@ -1333,12 +2427,21 @@ class OwedMoveScheduler:
         ):
             self.price_answered_turn = self.turn
 
-    def note_objection(self) -> None:
+    def note_topic(self, family: str) -> None:
+        """This advisor turn touched ``family``'s topic (M032 SWEEP-19: a number question before
+        the anchor is a fresh moment for the F1 probe or anchor), as ``topics_in`` would mark it."""
+        self._topic_turn[family] = self.turn
+
+    def note_objection(self, *, turn: int | None = None) -> None:
         """A learner objection that is not a scheduled move (a stall reason) just landed.
 
-        Spacing counts it, so the next scheduled objection still has breathing room.
+        Spacing counts it, so the next scheduled objection still has breathing room.  ``turn`` is
+        the learner turn it was said on (M032 S1: a stall she volunteered in a free reply, recorded
+        after that reply played); the current turn by default, and never earlier than the last one.
         """
-        self._last_objection_turn = self.turn
+        when = self.turn if turn is None else min(turn, self.turn)
+        if self._last_objection_turn is None or when > self._last_objection_turn:
+            self._last_objection_turn = when
 
     def _primary_gate(self, family: str | None) -> bool:
         return self.open_family in (None, family)
@@ -1376,7 +2479,7 @@ class OwedMoveScheduler:
             # Only inside the 17:00-19:00 window: after the close window opens for the
             # WEAK stall, "I've only got a couple of minutes" would be meaningless.
             in_window = TIME_CUE_SEC <= r_sec < COMMIT_STALL_R_SEC
-            return in_window and self.open_family is None
+            return in_window and self.open_family is None and not self.time_cue_held
         if move_id == COMMIT_STALL:
             return (
                 r_sec >= COMMIT_STALL_R_SEC
@@ -1399,12 +2502,31 @@ class OwedMoveScheduler:
         last = self._topic_turn.get(family)
         return last is not None and self.turn - last <= 1
 
-    def _primary_in_context(self, family: str | None) -> bool:
-        """Breathing room first; then the topic came up, or it has been quiet for a while."""
+    def _primary_in_context(self, family: str | None, moment: Moment | None = None) -> bool:
+        """Breathing room first; then the topic came up, or it has been quiet for a while.
+
+        With a ``moment`` that has slack (M032 S1, D-M032-1) the quiet-stretch path needs a
+        natural moment too: the floor handed to her or a thread just closed, and not an open
+        thread.  The wait is bounded (review S1-R2): after ``IDLE_GAP_SLACK_TURNS`` turns without an
+        objection the primary is ready again, open thread or not (an advisor who puts something to
+        her every turn kept a thread open on every turn, and the wait spent the plan's whole
+        buffer); on such a turn the engine's respond-first hold may still hold it once.  It can
+        only make a primary later than without a moment, never earlier.
+        """
         gap = self._since_objection()
         if gap < SPACING_TURNS:
             return False
-        return self._topic_fresh(family) or gap >= IDLE_GAP_TURNS
+        if self._topic_fresh(family):
+            return True
+        if gap < IDLE_GAP_TURNS:
+            return False
+        if moment is None or not moment.slack_ok:
+            return True
+        if moment.floor_offered or gap >= IDLE_GAP_SLACK_TURNS:
+            return True
+        if moment.thread_open:
+            return False
+        return moment.thread_closed
 
     def _push_answered(self, primary_id: str) -> bool:
         """A push follows an answer to its primary, or waits a couple of turns.
@@ -1426,11 +2548,11 @@ class OwedMoveScheduler:
             or (self._since(primary_id) or 0) >= PUSH_PATIENCE_TURNS
         )
 
-    def _soft_ready(self, state: _MoveState) -> bool:
+    def _soft_ready(self, state: _MoveState, moment: Moment | None = None) -> bool:
         move_id = state.spec.id
         since = self._since
         if state.spec.role == "primary":
-            return self._primary_in_context(state.spec.family)
+            return self._primary_in_context(state.spec.family, moment)
         if move_id == F3_PUSH:
             return self._push_answered(F3_PRIMARY)
         if move_id == F2_PUSH:
@@ -1473,8 +2595,12 @@ class OwedMoveScheduler:
             return enabled
         return max(float(deadline), enabled)
 
-    def select(self, r_sec: float) -> OwedMove | None:
-        """The one move owed at this turn, or None.  Does not mark it as issued."""
+    def select(self, r_sec: float, *, moment: Moment | None = None) -> OwedMove | None:
+        """The one move owed at this turn, or None.  Does not mark it as issued.
+
+        ``moment`` (M032 S1) is what the advisor's turn was, for the idle path of a primary
+        (``_primary_in_context``); None is the rule of before, so every other caller keeps it.
+        """
         if self._delivered_in_turn == self.turn:
             return None
         self._refresh_enabled(r_sec)
@@ -1484,7 +2610,7 @@ class OwedMoveScheduler:
             if not self._hard_ready(state, r_sec):
                 continue
             forced = self._is_forced(state, r_sec)
-            if not (forced or self._soft_ready(state)):
+            if not (forced or self._soft_ready(state, moment)):
                 continue
             order = _ORDER[state.spec.id]
             deadline = state.spec.deadline_sec
@@ -1521,6 +2647,16 @@ class OwedMoveScheduler:
         state = self._states[move.id]
         state.issued += 1
         state.forced_when_issued = move.forced
+
+    def unissue(self, move_id: str) -> None:
+        """Give back one issue of ``move_id``: its reply was cancelled before any audio (M032 S1).
+
+        The split-answer replan issues the move again for the reply that is heard, so a move is
+        counted once per reply the candidate heard ("issued": 2 for one spoken F2 push).
+        """
+        state = self._states.get(move_id)
+        if state is not None and state.issued > 0:
+            state.issued -= 1
 
     def next_move(self, r_sec: float) -> OwedMove | None:
         """Select the owed move and mark it issued."""
@@ -1630,10 +2766,62 @@ class OwedMoveScheduler:
             state = self._states[spec.id]
             if state.status != "pending":
                 continue
+            # M032 SWEEP-20: what a probing redirect gives back (``return_to_pending``).
+            self._redirect_undo = (
+                spec.id, state.issued, state.forced_when_issued, state.enabled_sec
+            )
             if state.enabled_sec is None:
                 state.enabled_sec = r_sec
             return self._owed(state, r_sec, True)
         return None
+
+    def required_pending(self) -> tuple[str, ...]:
+        """M032 SWEEP-24: the required graded moves not yet delivered, in plan order (pure)."""
+        return tuple(
+            spec.id
+            for spec in PLAN
+            if spec.required and spec.family in FAMILIES and not self._delivered(spec.id)
+        )
+
+    def next_forced_peek(self, r_sec: float) -> OwedMove | None:
+        """M032 SWEEP-24: the move ``_force_next`` would give, without changing any state.
+
+        Neither its enabled time nor the redirect's give-back record is touched; ``r_sec`` is only
+        the reading time of the ``OwedMove`` returned.
+        """
+        open_family = self.open_family
+        for spec in PLAN:
+            if spec.id in (COMMIT_STALL, TIME_CUE):
+                continue
+            if open_family is not None and spec.family != open_family:
+                continue
+            state = self._states[spec.id]
+            if state.status != "pending":
+                continue
+            return self._owed(state, r_sec, True)  # reads the state, sets nothing
+        return None
+
+    def return_to_pending(self, move_id: str) -> bool:
+        """Undo the redirect's ``issue`` of ``move_id``: it stays owed as if never redirected.
+
+        M032 SWEEP-20 (flag R1_PROBE_FIRST): an early-close redirect that speaks a probe (a short
+        price or time question) delivers nothing graded, so the move's issued count, its forced flag
+        and its enabled time go back to what they were before the farewell; its deadline is
+        unchanged, and the farewell still used up the one redirect (``close_attempts``).  True when
+        the state was restored.
+        """
+        undo = self._redirect_undo
+        if undo is None or undo[0] != move_id:
+            return False
+        state = self._states[move_id]
+        if state.status != "pending":
+            return False
+        _move, issued, forced, enabled = undo
+        state.issued = issued
+        state.forced_when_issued = forced
+        state.enabled_sec = enabled
+        self._redirect_undo = None
+        return True
 
     def register_close_attempt(self, r_sec: float) -> CloseDecision:
         """Handle a farewell: redirect once before R = 14:00, otherwise exit.

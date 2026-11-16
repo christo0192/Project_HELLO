@@ -1394,5 +1394,161 @@ class ShipRestoreRoundTwoTests(unittest.TestCase):
                 self.assertEqual(ask.kind, AskKind.CALL, text)
 
 
+class CommitReaderV2Tests(unittest.TestCase):
+    """Simulation diagnosis 1 (R1_COMMIT_READER_V2): L4, L6 and U4 (1).  Synthetic text."""
+
+    def test_a_payment_link_listed_as_email_content_is_no_enrol_ask(self):
+        import r1_commitment
+
+        for text in (
+            "It has the price, the course details, the payment link, all of it.",
+            "You'll find the schedule, the fee and the payment link in there.",
+            "Everything is in it: the curriculum, the payment link, the start date.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(r1_commitment.detect_ask(text))
+        for text in (
+            "I'll send you the payment link now.",
+            "Shall I send the payment link?",
+            "Just grab the payment link from the email and you're in.",
+            "Can I share the payment link with you?",
+        ):
+            with self.subTest(text=text):
+                ask = r1_commitment.detect_ask(text)
+                self.assertIsNotNone(ask)
+                self.assertEqual(ask.kind, AskKind.ENROL)
+
+    def test_reading_it_tonight_is_no_call(self):
+        self.assertLess(classify_learner_commitment("Reading it tonight works for me."), Level.MEDIUM)
+        self.assertLess(
+            classify_learner_commitment("Going through it tomorrow is fine for me."), Level.MEDIUM
+        )
+        for text in ("Thursday works for me.", "Tomorrow at 7 works.", "7 pm works for the call."):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.MEDIUM)
+
+    def test_accepting_a_seat_hold_is_medium(self):
+        for text in (
+            "Setting a seat aside while I read the terms, I can live with that.",
+            "Holding a spot for me is fine.",
+            "Okay, go ahead and reserve a place for me, that works.",
+        ):
+            with self.subTest(text=text):
+                self.assertGreaterEqual(classify_learner_commitment(text), Level.MEDIUM)
+        self.assertLess(
+            classify_learner_commitment("I don't want you to hold a seat for me yet."), Level.MEDIUM
+        )
+
+    def test_flag_off_is_the_release_before(self):
+        import os
+        from unittest import mock
+
+        import r1_commitment
+
+        with mock.patch.dict(os.environ, {"R1_COMMIT_READER_V2": "0"}):
+            ask = r1_commitment.detect_ask("It has the price, the details, the payment link, all of it.")
+            self.assertIsNotNone(ask)
+            self.assertEqual(
+                classify_learner_commitment("Reading it tonight works for me."), Level.MEDIUM
+            )
+            self.assertLess(classify_learner_commitment("Holding a spot for me is fine."), Level.MEDIUM)
+
+    def test_review_a_link_handed_over_is_still_an_enrol_ask(self):
+        import r1_commitment
+
+        for text in (
+            "Here's the payment link.",
+            "Here is the enrollment link.",
+            "I've shared the payment link with you.",
+            "I just dropped the payment link in the chat.",
+            "I've put the payment link in your WhatsApp.",
+            "I'm attaching the payment link now.",
+            "You'll get the payment link in a minute.",
+            "Payment link is on its way to your inbox right now.",
+            "Payment link below, enrol today.",
+            "Here's the brochure and the payment link.",
+        ):
+            with self.subTest(text=text):
+                ask = r1_commitment.detect_ask(text)
+                self.assertIsNotNone(ask)
+                self.assertEqual(ask.kind, AskKind.ENROL)
+
+    def test_review_an_activity_must_be_the_subject_of_works(self):
+        for text in (
+            "Tomorrow works, I'll check my calendar.",
+            "Checking in tomorrow works for me.",
+            "Friday works for me, I can read it before then.",
+            "7 pm works, I'll check my diary.",
+            "Reviewing it together on Thursday works for me.",
+            "Going over it with you tomorrow works.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.MEDIUM)
+        for text in (
+            "Reading it tonight works for me.",
+            "Looking over it tomorrow suits me.",
+            "Sure, reading it tonight works.",
+        ):
+            with self.subTest(text=text):
+                self.assertLess(classify_learner_commitment(text), Level.MEDIUM)
+
+
+class RefusedCallReaderTests(unittest.TestCase):
+    """Simulation diagnosis 2 (HF1, R1_COMMIT_READER_V2): a refusal that names a call is not a
+    MEDIUM commitment, so the guard never drops it as one.  Synthetic text."""
+
+    def test_a_negated_booking_is_not_medium(self):
+        for text in (
+            "I'm not ready to set up a call just yet.",
+            "I'd rather not book a call yet.",
+            "I don't want to schedule a meeting before I've read it.",
+            "I won't book the call today.",
+            "Honestly, I'm holding off on setting up a call, I'm not going to book a call this week.",
+        ):
+            with self.subTest(text=text):
+                self.assertLess(classify_learner_commitment(text), Level.MEDIUM)
+
+    def test_a_booking_stays_medium(self):
+        for text in (
+            "Let's set up a call.",
+            "Sure, book the call, but not before Friday.",
+            "Why don't we book a call for Monday.",
+            "No problem, schedule a call with both of us.",
+            "I'm not sure about the price, but let's book a call.",
+            # Review of HF1: an acceptance worded with a negation is no refusal.
+            "I don't mind if we set up a call on Thursday.",
+            "I can't wait to book the call.",
+            "It's not a bad idea to book a call.",
+            "I wouldn't mind if you set up a call for Monday.",
+            "It wouldn't hurt to book a call.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.MEDIUM)
+
+    def test_its_own_flag_rolls_back_hf1_alone(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"R1_REFUSED_CALL_READER": "0"}):
+            self.assertEqual(
+                classify_learner_commitment("I'm not ready to set up a call just yet."),
+                Level.MEDIUM,
+            )
+            # The other R1_COMMIT_READER_V2 readings (L6) stay on.
+            self.assertLess(
+                classify_learner_commitment("Sure, reading it tonight works."), Level.MEDIUM
+            )
+
+    def test_flag_off_restores_the_old_reading(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"R1_COMMIT_READER_V2": "0"}):
+            self.assertEqual(
+                classify_learner_commitment("I'm not ready to set up a call just yet."),
+                Level.MEDIUM,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

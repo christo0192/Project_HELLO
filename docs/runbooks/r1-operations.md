@@ -1728,7 +1728,7 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   fails its letters-only test, and six scripted lines splice the name in after a comma ("Thank you,
   there."). `r1_script.known_first_name` treats an empty value, a rejected value, `there` (any case)
   and a single letter as unknown, and `r1_script.line` then deletes the `{first_name}` slot together
-  with its comma: "Thank you. We'll now move to the role-play", "Hi, I'm Christy", "Are you still
+  with its comma: "Thank you. Next, let's do a sales role-play", "Hi, I'm Christy", "Are you still
   with me?", "Welcome back.", "I'm sorry, we need to stop here". The API is unchanged. The provisional
   `r1_lines.py` mirrors it (the drift test pins both).
 * **The name the candidate gives.** While the record has no usable name, a self-introduction in the
@@ -2201,6 +2201,388 @@ Live check (labels only): per session `r1_turn_plan` is absent in the transition
 plan), the bot rows of phase `transition` show Christy's answers each ending with the start
 question, and the pickup row follows a candidate row that agrees. A session with
 `r1_transition_ceiling`, or one that ended `candidate_left` in the transition, is worth a look.
+
+### The brief and the transition, repaired (M032 S6, owner go 2026-11-11)
+
+Owner tests fda9e9f6 and 8f5bfefc: two requests for the brief got "What would you like to know?"
+and the job's shift timings, "Are you there?" got nothing, a request for the brief "in about four
+lines" got the nudge and then the whole 44 s brief again, the replay said "We'll now move to the
+role-play" three minutes in, the start question was heard four times in 2.5 minutes, and an answer
+asked a question of its own before the start question. `R1_TRANSITION_REPAIR` (default on) changes:
+
+* **One brief body** (`r1_script.BRIEF_BODY`): L-TRANSITION is "Thank you, {first_name}. " plus
+  the body, L-TRANSITION-BRIDGED the body alone, the replay L-TRANSITION-AGAIN "Of course, here it
+  is again. " plus the body from "I'll play", and the short recap L-TRANSITION-RECAP reuses the
+  goal clause (`BRIEF_GOAL`). No "We'll now move to the role-play", no "evaluate", one start prompt
+  ("To begin, just say 'ready'." and the either/or question). Consent is unchanged: only "ready"
+  (or a start phrase) or the button.
+* **Routing** (`R1Interview._repaired_transition_action`): a wider brief request (summary, recap,
+  overview, "tell me about the role play again", more details on it, the learner's name) gets the
+  replay once; a request for a shorter one (`is_short_brief_request`) gets the recap; the recaps
+  share a budget of 2 (`RECAP_LIMIT`); once both are used, L-TRANSITION-REASK, never the nudge. A
+  question about the role-play itself never goes to the model (replay, recap, then the nudge):
+  one that names it, the brief, "the scenario", the learner or her name, or asks who they will
+  call, which course it is, who calls whom or whether it is a cold call. "The lead generation",
+  "the learner profile", "the prospect of growth" and "in what scenario" are job questions, and
+  so is a generic ask about a job topic ("Could you explain the incentive structure?") or about
+  "that" right after Christy's answer (`asks_about_the_job`): the model answers them. A
+  presence check gets L-PRESENT ("Yes, I'm here.") and L-TRANSITION-REASK. When her answer ended
+  with a question of its own, a bare "Yes." or "No." is answered by the model too.
+* **Start questions**: the transition note (`TRANSITION_REMINDER_REPAIRED`) says "Of course, go
+  ahead." to a request to ask and never ends an answer with a question; an answer that asks anyway
+  drops the start question (not twice in a row; `r1_transition_tail_dropped`), and after the brief
+  the answers' start questions rotate (L-TRANSITION-ASK-2, -3).
+* **Pickup**: "Hello, {lead_first_name} speaking."; the button pressed during a brief (or while
+  it is on its way: "Yes, I'm here." or the bridge's compose), the replay, the recap or Christy's
+  answer to a question gets L-PICKUP-BRIDGE ("Great, here she is.") first. L-ASIDE-COACH says
+  Christy is playing the learner.
+* **session_facts** gains `start_by` (button/spoken), `pressed_during`
+  (brief/replay/recap/answer/wait, button only) and `transition_recaps` (a count); the API
+  parser reads none of them.
+
+Logs (labels only): `r1_brief_requested`, `r1_brief_recap_requested`, `r1_brief_recap`,
+`r1_brief_repeat`, `r1_transition_presence`, `r1_transition_tail_dropped`. Content revision 22;
+revision 21's lines stay pinned under -V20 ids. The four new `say` lines are warmed only while the
+flag is on. Rollback: `fly secrets set R1_TRANSITION_REPAIR=0 -a project-hello-voice` restores
+revision 21's brief, replay, nudge, pickup, aside, note and routing exactly.
+
+**Live simulation fixes (diagnosis 1, same flag, content revision 24):**
+
+* **BR-1**: a request that names the brief and asks with "go over / go through / run me through /
+  walk me through ... again" is a brief request at the transcript too (`is_brief_request(wide=True)`),
+  and a turn that names the role-play and says "get a handle on", "be clear on", "make sense of",
+  "want to understand" or a go-over verb (aimed at Christy since revision 25, see below) routes like
+  a role-play question, with no question mark needed.
+* **BR-2**: a request to hear one of Christy's icebreaker questions again ("go back to that earlier
+  question", "the question before the last one", "your previous question";
+  `is_icebreaker_question_request`) gets "Of course. {question}" (scripted, no model call, at most
+  `TRANSITION_IB_REPEAT_LIMIT` = 2 times; the question before her last when the turn says so). The
+  answer to it gets the model's reaction and a start question and is not counted as one of the
+  candidate's questions. The transition note now says when "Of course, go ahead." is for, with an
+  example, and that a request to repeat or explain gets that, in one sentence.
+* **CR-1**: L-TRANSITION-RECAP ends with its own either/or question ("Would you like to begin now,
+  or ask me something first?"), so the brief's start question is never heard three times.
+* **DA-1**: a committed turn that answers nothing ("So bye.", "Hmm.") after an either/or start
+  question that finished playing, with Christy quiet, gets L-TRANSITION-REASK after
+  `TRANSITION_QUIET_TURN_REASK_SECONDS` (6 s), not 20 s. Pure silence keeps 20 s and 30 s.
+
+Logs: `r1_transition_question_repeat` (with a count) and `r1_transition_quiet_turn_reask`. The
+content pin's log label (`r1_fidelity_content`) is split by a dot after its sixth character when
+its 12 characters hold ten digits in a row (revision 24's do), as the logger drops such a value.
+
+**Review of diagnosis 1 (same flag, content revision 25):**
+
+* **BR-2**: the question asked for again must be Christy's ("the/that/your earlier, previous, first
+  or opening question", "the question you asked me earlier") and the ask must be aimed at her ("can
+  you repeat", "ask me that again", "what was your earlier question", "remind me of"). A turn that
+  names a question of the candidate's own ("My first question is ...", "One other question: ..."),
+  or also asks about the job ("Going back to the previous question, what's the salary?"), goes to
+  the model as before. "The first question" gets her first kept question, not her last. The turn
+  after the repeat counts as its answer only when it asks nothing itself; it gets one more note line
+  (`TRANSITION_IB_ANSWER_NOTE`: react in one short sentence, ask nothing).
+* **BR-1**: a go-over ask must be aimed at Christy ("can/could you ...", "please ...", "walk/run me
+  through", or an imperative with "for me" or "again"), so "Sure, I can go through the role play
+  now", "Let me go through the role play then" or "I'll go through the scenario once more in my
+  head" no longer replay the brief. An understand-ask needs the brief (or "it") right after it and
+  no plan words ("before I pitch", "in the role play I ..."): "I will be clear about the fees" and
+  "I'd like to understand her needs first" are the candidate's plan, answered by the model.
+
+**Live simulation fixes (diagnosis 2, same flag, content revisions 26 and 27):**
+
+* **D2-BR1**: "these" and "those" name the brief like "this/the/that" do, so "Could you give me
+  those instructions in, like, just 4 lines?" gets the recap and "Can you repeat your
+  instructions?" the replay ("What are the instructions for the first day of the job?" is still a
+  job question). "Your" is never a brief determiner (review of diagnosis 2): "Tell me about your
+  setup, is it work from office or hybrid?" and "Can you quickly summarise your round of hiring for
+  this job?" are job questions. The transition note (content revision 27) says a request for the
+  instructions, the brief or the scenario means the role-play brief: say it has just been given and
+  offer to go over it again; asks about the model's own rules or setup still get the polite decline.
+* **D2-IB1**: "put it to me again", "pose that question to me again" and "go back to ... and ask me
+  that" ask for her question again. Right after a repeat, a turn that turns it down ("No, I mean the
+  question before last", "Not that one, the other one") is another repeat request, never the answer
+  to her question; when it asks for the question just given, it gets the one before it ("Sure, the
+  one before that: ..."), or, with none older kept, "That one was: ...". A plain "No, not really,
+  ..." still answers her question. `TRANSITION_IB_REPEAT_LIMIT` stays 2. Review of diagnosis 2: the
+  insist turn names a question and says nothing else, so "No, I mean, not really. I mostly helped at
+  my dad's shop.", "The other one was harder for me, the cold calls." and "No, I mean, can we just
+  start?" are an answer and a start request, never a repeat; "No, I mean." alone names no question.
+
+**Spoken ready and the start question (M032 christy-ready, content revision 28):**
+
+* **`R1_CONSENT_WIDE`** (default on). A clear readiness statement counts wherever it sits in the
+  turn: "Got it. Okay, I'm ready.", "Haan, theek hai, I'm ready.", "Fine. I'm ready. Let's get it
+  over with.", a long run-up that ends "so let's do it, I'm ready." (the simulation's candidates said
+  these and Christy answered them as questions). Never a consent: a question mark or a clause that
+  opens as a question ("am I ready", "are you ready", "ready? what do I do"), a negation anywhere
+  ("I'm not ready", "I don't think I'm ready"), a readiness put off or made to depend on something
+  ("I'll be ready in a minute", "ready once I've read the guide"; "if you are" is the idiom), or a
+  turn that still asks for something ("I'm ready but I have one question"). Where consent is read is
+  unchanged: the transition only, after the start question, or the button. Rollback: `fly secrets
+  set R1_CONSENT_WIDE=0 -a project-hello-voice` (a start phrase with only filler around it).
+* **`R1_START_ASK_ONCE`** (default on, only with `R1_TRANSITION_REPAIR`). Only the first answer
+  Christy gives before the role-play ends with a start question (the rotated either/or form);
+  later answers end without one, and a quiet pause after one (`TRANSITION_QUIET_TURN_REASK_SECONDS`,
+  6 s; an "Okay" in between keeps it short) gets L-TRANSITION-ASK-PAUSE once: "If that covers
+  everything, shall we begin the role-play? Just say 'ready' whenever you like." (a yes/no
+  question: a bare "yes" starts). The ladder's second rung (L-TRANSITION-REASK-2, 30 s) follows as
+  before. The line is warmed only while the flag is on. Log line: `r1_transition_tail_withheld`.
+  Rollback: `fly secrets set R1_START_ASK_ONCE=0 -a project-hello-voice` (a start question after
+  every answer, rotated, as before).
+
+### Diagnosis 3 fixes (M032 live simulation int-live-3, Christy lane)
+
+* **`R1_BRIEF_VARIETY`** (default on, only with `R1_TRANSITION_REPAIR`). The replay is
+  re-explained (L-TRANSITION-AGAIN-PLAIN), never the brief word for word; the recaps rotate
+  (L-TRANSITION-RECAP, then L-TRANSITION-RECAP-2). The replay answers only the first request or one
+  for more detail ("a bit more detail", "the full version", "from the start"); after a recap a
+  plain repeat gets the next recap. "Are you there?" within 30 s of a start question that finished
+  playing gets "Yes, I'm here." and L-TRANSITION-TAKE-TIME, never the start question again (once;
+  a second gets "Yes, I'm here." alone). Past every budget a request gets the first of
+  L-TRANSITION-REASK and -NUDGE not yet heard (never -REASK-2, a silence line; review of
+  diagnosis 3), and a bare yes or no to a question her own answer ended with, past the answer
+  limit, always gets L-TRANSITION-REASK (so the next bare "yes" starts). The new lines are warmed
+  only with the flag on (and then L-TRANSITION-AGAIN is not). Rollback: `fly secrets set R1_BRIEF_VARIETY=0 -a
+  project-hello-voice`.
+* **`R1_REACTION_VARIETY`** (default on, only with `R1_INTERVIEWER_VOICE`; read once per
+  session, the prefix stays byte-stable). The voice text's and the delivery rider's react clause
+  ask for a person's reaction ("Right", "Got it", or one line that picks up a detail) and name the
+  summaries to avoid. The guard trims a summary label ("that's a good stretch", "is a long run",
+  "that's hands-on") from Christy's opening and icebreaker replies, keeping the question, never the
+  only sentence, and drops a second echo-and-verdict opener in a row (a style trim, no hit). The
+  brief opens with one of three seeded thanks (L-TRANSITION-THANKS-A/-B/-C, warmed per name like
+  L-TRANSITION). B ("Thanks for walking me through that") plays only when the icebreaker ended on a
+  real answer (no decline, nothing terse, no time cap on her own question); otherwise A ("Thanks,
+  {first_name}.", warmed beside a seeded B) plays. Content revision 30. Rollback: `fly secrets set
+  R1_REACTION_VARIETY=0 -a project-hello-voice`.
+* **`R1_IB_REASK_V2`** (default on, only with `R1_ICEBREAKER_REPAIR`). An icebreaker question is
+  re-asked once at most (`REASK_V2_MAX_HOLDS`): the next turn that does not answer it moves the
+  plan on. A backchannel right after her question (a courtesy, for a yes/no one) gets no reply,
+  but a bare yes, no or verdict word ("No.", "Good.") is answered; "Are
+  you there?" within 20 s of it gets "Yes, I'm here. Take your time." (once per question); a request
+  to repeat it gets the question word for word ("Of course. {question}"), scripted, and does not use
+  up the one re-ask (`REASK_V2_MAX_REPEATS`, 2 per question). Log lines:
+  `r1_icebreaker_presence_hold`, `r1_icebreaker_literal_repeat`. Rollback: `fly secrets set
+  R1_IB_REASK_V2=0 -a project-hello-voice`.
+* **`R1_GUARD_STORY_ECHO`** (default on). Christy echoing a money figure or "scholarship" from
+  the candidate's own turn (one that asked nothing) is no pay claim; in the opening and the
+  icebreaker a hiring or pay sentence after a turn that asked nothing is dropped, with "Got it."
+  before the question that follows, never "That's a good question for the hiring team". The
+  transition and the wrap-up deflect as before (the session sets the echo context in the opening
+  and the icebreaker only). A sentence with any role, future or pay-rate cue ("The role pays three
+  lakh.", "a year", "here") is never an echo, and a bare number word ("one week") is no figure.
+  Rollback: `fly secrets set R1_GUARD_STORY_ECHO=0 -a
+  project-hello-voice`.
+* **`R1_CONSENT_ECHO_DROP`** (default on). The SDK's late commit of the "ready" that started the
+  role-play (heard at its final, before the pickup; its commit landed after the pickup) is
+  dropped: a consent on a row from before the pickup, or within `ROLEPLAY_CONSENT_ECHO_SECONDS`
+  (3 s) of its end. Log line: `r1_consent_echo_dropped`. Rollback: `fly secrets set
+  R1_CONSENT_ECHO_DROP=0 -a project-hello-voice`.
+* The repaired transition note (under `R1_TRANSITION_REPAIR`) gives a broad question about the
+  job a one-sentence overview with an offer of the detail, and says times the way people say them.
+
+### M032 live simulation, diagnosis 4 (Christy lane)
+
+* **`R1_BRIEF_WORDING_V2`** (default on). The opening agenda and every brief in a person's words
+  (`r1_script.WORDING_LINES`: the *-W2 texts are spoken under the old ids, so markers, the warm-up
+  and the cache follow). Same facts (lead, city, Data Science, up to twenty minutes, the goal, the
+  preparation guide, the cue phrase, "ready"); the brief ends "Any questions before we start? If
+  not, just say 'ready' and she'll pick up." and keeps the either/or kind, so only a spoken "ready"
+  or the button starts. A bare "no" or "no questions" to it gets the nudge; a bare "yes" (a
+  question is coming) gets the invite, "Of course, go ahead." (review of diagnosis 4; after an
+  answer's either/or start question a bare "yes" still gets the nudge). The briefs need
+  `R1_TRANSITION_REPAIR`. Rollback: `fly secrets set R1_BRIEF_WORDING_V2=0 -a project-hello-voice`.
+* **`R1_TRANSITION_ANSWERS`** (default on, only with `R1_TRANSITION_REPAIR`). A short question about
+  the role-play gets its own scripted answer (L-RP-ROLES, -COURSE, -LENGTH, -GUIDE, -GOAL, -NOTES,
+  -STUCK; at most two per turn) and the start question, with no model call and no step toward the
+  steer; a request for the brief itself ("again", "repeat", "the brief") still gets the replay. A
+  question that names the job, the hiring or what comes after the interview ("How long does it take
+  to hear back?", "the target for this role", "discounts for employees", "if I'm hired") is never
+  a field: it goes to the model as before (`r1_session._RP_JOB_RE`, review of diagnosis 4). The
+  transition note (`TRANSITION_REMINDER_ANSWERS`) has no example phrase to copy; after a turn that
+  asked nothing, a blocked sentence is dropped (never "That's a good question for the hiring team"),
+  and an emptied reply says "Fair enough." and the start question; "happy to go over ..." is said
+  once a session; once made, the cut takes its subject too ("I'd be happy to go over it again." is
+  dropped whole, never "I'd be."). Log line: `r1_transition_field_answer`. Rollback: `fly secrets set
+  R1_TRANSITION_ANSWERS=0 -a project-hello-voice`.
+* **`R1_TRANSITION_PRESENCE_V2`** (default on, only with `R1_BRIEF_VARIETY`). "Are you there?" just
+  after a start prompt gets ONE line, L-PRESENT-TAKE-TIME ("Yes, I'm here. Take your time, and just
+  say 'ready' whenever you like."), and a press during the brief or an answer is acknowledged with
+  L-PICKUP-BRIDGE-2 ("Got it, you're ready. Here's {lead_first_name}."). Rollback (this change
+  alone; the rest of the variety stays): `fly secrets set R1_TRANSITION_PRESENCE_V2=0 -a
+  project-hello-voice`.
+* **`R1_REACTION_VARIETY_V2`** (default on, only with `R1_REACTION_VARIETY`; read once per session).
+  The voice text, the rider and the icebreaker plan's notes say most turns need no reaction and
+  never to repeat the candidate's words back. The guard cuts an echo opener ("Right, <their
+  words>.") when one of her last two replies opened with an echo or a verdict (never the only
+  sentence) and trims a wider set of verdicts ("that's a habit", "says a lot", "must have felt").
+  The echo cut needs the candidate's turn: only after a turn that asked nothing, and only when the
+  echo shares a content word with it, so her answer to their question or her deferral ("Sure, the
+  hiring team will share those later.") is never cut (review of diagnosis 4).
+  Rollback: `fly secrets set R1_REACTION_VARIETY_V2=0 -a project-hello-voice`.
+* **`R1_IB_SKIP_V2`** (default on, only with `R1_ICEBREAKER_PLAN`). A skip request that also answers
+  is that answer; a pure skip moves past the current question to the next one ("we'll get there in a
+  couple of minutes"), never the same one again; a second skip request leaves one more question,
+  and the answer to it ends the icebreaker (`R1PhaseMachine.icebreaker_capped`, log line
+  `r1_icebreaker_skip_cap`). A thin answer's follow-up asks for one detail, never the original
+  question. Rollback: `fly secrets set R1_IB_SKIP_V2=0 -a project-hello-voice`.
+* **`R1_IB_QUIET_NUDGE`** (default on, only with `R1_IB_REASK_V2`). After a quiet ack ("Thank
+  you.") to her open question the silence window is `IB_QUIET_NUDGE_SECONDS` (10 s); then she
+  asks it once more, "So, {question}", using the question's one re-ask, once per question, never
+  with the soft exit due or under 30 s of the hard budget left. Review of diagnosis 4: never armed
+  once the re-ask is spent; a nudge refused after the short window waits out the rest of the usual
+  30 s before any silence prompt; the nudge drops a lead before the asking clause and lowers only a
+  question word ("Priya, what draws you to this role?" -> "So, what draws you to this role?"), and
+  a question of lead words alone gives none. Log lines:
+  `r1_icebreaker_quiet_nudge_armed`, `r1_icebreaker_quiet_nudge`. Rollback: `fly secrets set
+  R1_IB_QUIET_NUDGE=0 -a project-hello-voice`.
+* **`R1_SIL_IB_RESTATE`** (default on, only with `R1_IB_REASK_V2`). The first silence after her
+  open icebreaker question restates it per objective (L-SIL-IB-I1..I4, "No rush. I was asking
+  ..."); "Are you still with me?" comes after a second silence; a question already nudged goes
+  straight to it. Rollback: `fly secrets set R1_SIL_IB_RESTATE=0 -a project-hello-voice`.
+* **`R1_IB_HOLD_V2`** (default on, only with `R1_ICEBREAKER_REPAIR`). "could you just hold this for
+  a minute?" (an object between the verb and the time, or the last sentence of a turn) is a hold
+  request, and the plan note says a pause request is always granted. What a turn said before its
+  closing request is still an answer (`r1_icebreaker.hold_request_answer`): it counts toward the
+  soft exit, the plan reads it with the turn after the hold, the bridge reacts to it and the brief
+  keeps its thanks. Rollback (this change alone; the rest of the repair stays): `fly secrets set
+  R1_IB_HOLD_V2=0 -a project-hello-voice`.
+* Not done on this branch: the wrap-up items of D4-WRAP1 (feedback asks, role questions, the
+  joined next-steps line, the closing wording); that code lives on the learner branch.
+
+#### M032 live simulation, diagnosis 5 (Christy lane, content revision 33)
+
+* **`R1_AGENDA_W3`** (default on, only with `R1_BRIEF_WORDING_V2`). The W2 agenda's "takes about
+  thirty minutes." followed by "a sales role-play of up to twenty minutes" was read as a
+  contradiction. The agenda is now "Lovely, thanks. The whole interview takes about thirty
+  minutes: a few minutes to get to know you, a sales role-play of up to twenty minutes, then time
+  for your questions." and W2's first question (L-OPEN-AGENDA-W3, -PLAIN-W3, -CONTINUE-W3).
+  Rollback: `fly secrets set R1_AGENDA_W3=0 -a project-hello-voice` (the W2 agenda).
+* **`R1_WRAP_OFFER_VARIANT`** (default on). The second offer to wrap up the role-play is
+  L-ASIDE-WRAP-AGAIN ("Christy again, just checking in. Would you like to wrap up the role-play
+  here? If not, just carry on with {lead_first_name}."), never L-ASIDE-WRAP word for word. Like
+  L-ASIDE-WRAP it is not an either/or question, so a yes still means wrap up and every answer is
+  handled as before. Rollback: `fly secrets set R1_WRAP_OFFER_VARIANT=0 -a project-hello-voice`.
+* Under the round-4 flags: `R1_REACTION_VARIETY_V2` drops the react clause's quoted example (the
+  model copied "And with <their thing>, <question>?") and the guard keeps one such opener in the
+  small talk; `R1_GUARD_STORY_ECHO` drops her own hiring-team deflection after a turn that asked
+  nothing (never the only sentence); `R1_IB_SKIP_V2`'s notes say one or two quick questions are
+  left; `R1_IB_QUIET_NUDGE` keeps the asking clause and says "I was asking, {question}" after a
+  lead of her own; `R1_TRANSITION_ANSWERS` answers "What do I actually do?" and "How should I
+  approach it?" with L-RP-GOAL, adds the field answer after a reply cut to a bare "That's right,
+  yes.", invites "Could I check a couple of things first?" without a start question, and keeps
+  "has just been given" for a request to hear the brief again.
+* Not done on this branch: D5-WRAP-NEXT1 and the L-FAQ-DEFER-WRAP rewording of D5-DEFLECT1; the
+  wrap-up code (L-WRAP-NEXT, L-WRAP-MORE, L-FAQ-DEFER-WRAP) lives on the learner branch.
+
+#### Review of diagnosis 5 (Christy lane, content revision 34)
+
+No new flags; each change rides the flag of the fix it repairs.
+
+* `R1_AGENDA_W3`: the W3 agenda opens "Lovely, thanks." ("Good, I can hear you." echoed the
+  candidate's "Yes, I can hear you", the echo D4-BRIEF2 removed).
+* `R1_GUARD_STORY_ECHO`: when dropping her hiring-team deflection leaves a reply that asks nothing
+  ("Okay."), the plan's current question follows it, as after the praise cut. A turn that may ask
+  without a question mark keeps the deflection: Hindi question words ("kya", "kitna", "kab",
+  "kaise"), an indirect ask ("I have a question about the pay"), or five words or fewer that name
+  pay, salary, incentives, work mode, training, timelines, next steps, shifts or hours.
+* `R1_IB_QUIET_NUDGE`: an elaboration after ", say", ", like" or " - " that holds a wh-word holds
+  the question and is never cut; a cut keeps the question's own end punctuation; an instruction
+  ("Tell me about ...") keeps "So," and is never "I was asking, tell me ...". The objective's
+  restate stands in only for a nudge that would repeat her words, and only with
+  `R1_SIL_IB_RESTATE` (a question too short to nudge arms nothing, as in revision 32).
+* `R1_TRANSITION_ANSWERS`: the confirmation backstop adds L-RP-GOAL only after a later question that
+  asks how to do the role-play or what it is for (never after "Is that allowed?"); "Can I check if
+  we can start now?" is no leave to ask (it is answered, with the start question); a setup question
+  ("How would I handle it if my mic drops?") is no role-play field and goes to the model.
+
+### Icebreaker repairs (M032 S6, owner go 2026-11-11)
+
+Owner tests b419d478, a95398ab, b58c7d9c and 7f2a25e6: a request to repeat Christy's question at the
+soft exit got the brief instead, "Sorry, I was not able to hear you" counted as an answer, a request
+for a minute got "I can't pause" and a new question, and a two-word thank-you cut her reply.
+
+* **`R1_ICEBREAKER_REPAIR`** (default on). Once the soft exit is due and before S = 4:30, the
+  first request to repeat the question (`is_repeat_request`: repeat, rephrase, say it again, what
+  did you say, didn't catch or hear, a bare "Sorry?" or "Pardon?") gets "Of course. {question}"
+  (the last question of Christy's own reply; no model call, no answer counted, the S5 plan
+  unchanged) and the next answer is the boundary. "Are you there?" at the boundary gets L-PRESENT
+  ("Yes, I'm here.") before the brief; any repair turn at the boundary gets the brief without
+  "Thank you, {first_name}." (L-TRANSITION-BRIDGED). Mid-icebreaker, a reply to "Are you there?"
+  is told to open with "Yes, I'm here." (with an apology after a 6 s wait); the plan still decides
+  the question. A hold request ("Can you give me a minute?") gets L-IB-HOLD ("Of course, take a
+  moment. I'm here when you're ready."), is no answer, and the next silence window is 60 s (once
+  per session, never past S = 4:30); with under 15 s left nothing is promised and the turn ends
+  the icebreaker. The repair readers also read "once again", "not able to hear" and "I'm sorry",
+  and look past "sir", "ma'am", Christy's name and a leading "hold on" / "wait". A hold is a
+  directed request with nothing else in the turn: "I usually wait a minute and then call back"
+  is an answer, and "Hold on, what was the question?" a repeat request. The question repeated is
+  the one of Christy's LAST model reply (its imperative prompt if it asked with one; the plan's
+  current question when it was cut before its question). Right after the hold or the repeat
+  line, "Okay." or "Thank you." answers nothing (no reply, not the boundary; after a repeated
+  yes/no question, "Okay." or "Yes." is its answer). A hold or repeat line cancelled before any
+  audio gives its once-per-session budget back, and the request is read with the turn that cut
+  it. Counts: `icebreaker_repeat_deferrals`, `boundary_presence_lines`, `ib_holds`. Logs:
+  `r1_icebreaker_repeat`, `r1_icebreaker_hold`, `r1_icebreaker_presence_opener`,
+  `r1_icebreaker_boundary_presence`, `r1_icebreaker_quiet_ack`, `r1_icebreaker_repair_undone`.
+  Rollback: `fly secrets set R1_ICEBREAKER_REPAIR=0 -a project-hello-voice`.
+* **`R1_ICEBREAKER_ACK_HOLD`** (default on, only with `R1_ACK_HOLD`). An acknowledgement or a
+  courtesy-only "Thank you" said over Christy's live icebreaker model reply is held back from the
+  SDK like an "Okay" over the learner: written to the row in the icebreaker phase, never counted,
+  planned or carried, and it never stretches the hold at the S = 4:30 cap. Count:
+  `icebreaker_acks_held`. Rollback: `fly secrets set R1_ICEBREAKER_ACK_HOLD=0 -a
+  project-hello-voice`.
+
+### The opening, the never-heard ladder and the mute aside (M032 S7C, owner go 2026-11-11)
+
+Sweep patterns P33, P25 and P62: L-OPEN was one 79-word block of about 29 s with no greeting
+exchange and no hearing check; four sessions of 2026-10-13 in which no candidate audio ever reached
+the worker got "Are you still with me?" and "we seem to have lost the connection"; and "Please
+unmute when you're ready." came in Christy's own phase, after a sub-second blip, and was answered
+"I am ready".
+
+* **`R1_OPENING_SOUND_CHECK`** (default on). The driver says L-OPEN-HELLO ("Hi {first_name}, I'm
+  Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?") and reads the reply
+  in code (`sound_check_reading`; never the model, `reply_suppressed` in OPENING). A reply that
+  heard her gets L-OPEN-AGENDA ("Good, I can hear you." and the agenda, which asks the first
+  icebreaker question); a can't-hear reply (a directed complaint such as "I can't hear your
+  voice", "not able to hear you", "voice is not clear", "I can hear you but it's very low",
+  "Sorry?", "Could you repeat that?", after the question a bare "Hello?" / "What?" or "Are you
+  there?", or a whole-turn "No." / "Not audible." / "Little low." / "It's a bit low.") gets
+  L-OPEN-HELLO-AGAIN once, and a second one L-OPEN-AGENDA-PLAIN; an early answer (12 content words
+  or more that say something about the candidate, such as "I have been working in" or "four years
+  in sales", and do not end on a question to Christy) gets L-OPEN-AGENDA-CONTINUE and counts as one
+  icebreaker answer. Before the agenda the driver waits for the reply to end: one endpointing
+  maximum plus 1 s after the candidate's last speech or final, at most 30 s and the sound check's
+  budget. Silence (10 s) from a candidate who was never heard runs the never-heard ladder below
+  (bounded in the opening by 60 s from its start, `OPEN_NO_AUDIO_HARD_SECONDS`, then the plain
+  agenda); one heard only by the VAD gets the plain agenda, and so does the end of the sound
+  check's 45 s budget. A "Hi" said over the hello is followed by 1.5 s of quiet for the answer.
+  The reply is never an icebreaker answer, whenever its turn commits (`_sound_check_rows`); an
+  answer begun over the agenda is the icebreaker's. Log: `r1_sound_check` (the reading, the agenda
+  id, the can't-hear count; `no_audio_deadline` when the opening's ladder ran out). The hello costs about 5-10 s of S; the soft exit and S = 4:30 are unchanged.
+  Rollback: `fly secrets set R1_OPENING_SOUND_CHECK=0 -a project-hello-voice` (L-OPEN, exactly as
+  before).
+* **`R1_NO_AUDIO_LADDER`** (default on). A candidate who was never heard (no speech, no final;
+  `_candidate_ever_heard`, never reset) and is not muted gets L-SIL-NOAUDIO ("I can't hear anything
+  from you yet. If you're speaking, please check that your microphone is switched on and
+  selected.") and, 30 s later, L-SIL-END-NOAUDIO ("I still can't hear you, so I'll have to stop
+  here for now. The hiring team will be in touch. Goodbye."), in the opening or the icebreaker
+  only. The outcome stays `candidate_left` and attempt counting is unchanged. Log, once:
+  `r1_no_audio` with `no_mic_track`, `not_subscribed` or `no_voice` (labels only). A never-heard
+  close that does not count as an attempt needs its own web card (outside R1). Rollback: `fly
+  secrets set R1_NO_AUDIO_LADDER=0 -a project-hello-voice`.
+* **`R1_MUTE_ASIDE_V2`** (default on). The aside is due once the mute has lasted 1.5 s
+  (`MUTE_ASIDE_DEBOUNCE_SECONDS`) and no candidate turn is in flight (speaking, or a final the SDK
+  has not committed, the role-play's included although ASIDE wrote its row), or 3 s in all
+  (`MUTE_ASIDE_TURN_WAIT_SECONDS`); the mute is checked again before the line, and an episode
+  counts as announced only when a line is spoken. The role-play still enters ASIDE (R paused) at
+  the event. L-MUTE-RP ("This is Christy, your interviewer. Your microphone seems to be muted.
+  Please unmute it so we can carry on.") in the role-play, L-MUTE-IV ("Your microphone seems to be
+  muted. Please unmute it so I can hear you.") in Christy's phases; neither says "ready". Rollback:
+  `fly secrets set R1_MUTE_ASIDE_V2=0 -a project-hello-voice` (the immediate L-MUTE).
+
+Content revision 23; L-OPEN and L-MUTE are unchanged. The new name-free lines are warmed only while
+their flag is on (the agendas first); L-OPEN-HELLO carries the name and is spoken live, like L-OPEN.
 
 ### Leaving the role-play by consent (owner decisions 2026-11-03, M2)
 

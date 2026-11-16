@@ -52,9 +52,11 @@ if str(HERE) not in sys.path:
 import r1_guard
 from r1_phases import R1Phase
 from r1_replies import (
+    EXTRA_FACT_KEYS,
     GUARD_KINDS,
     READER_FACT_KEYS,
     SESSION_FACT_KEYS,
+    SESSION_FACT_WORKER_KEYS,
     fidelity_events,
     fidelity_pins,
     guard_kind,
@@ -475,8 +477,13 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         facts = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
         self.assertEqual(len(facts), 1)
         payload = facts[0]["payload"]
-        self.assertEqual(set(payload) - {"pins"}, API_PAYLOAD_KEYS["session_facts"])
+        # The worker-only counts (M032 SWEEP-1) are stored with the row and never parsed, and so
+        # are the repairs' labels and counts (M032 S6), under names the parser never reads.
+        worker_only = set(SESSION_FACT_WORKER_KEYS) | set(EXTRA_FACT_KEYS)
+        self.assertEqual(set(payload) - {"pins"} - worker_only, API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"])
+        self.assertEqual(set(SESSION_FACT_WORKER_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
+        self.assertEqual(set(EXTRA_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
         for key in SESSION_FACT_KEYS:
             value = payload[key]
             self.assertTrue(
@@ -519,6 +526,37 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
             source = API_ADMIN_LOG.read_text(encoding="utf-8")
             for key in READER_FACT_KEYS:
                 self.assertNotIn(key, source)
+    async def test_the_repair_facts_are_labels_and_counts_and_off_means_todays_row(self):
+        # M032 S6: start_by / pressed_during are closed labels, the rest counts; with every repair
+        # flag off the row is exactly the one of before.
+        import os
+        from unittest import mock
+
+        row = session_facts_event(
+            None,
+            {"content_sha256": "x"},
+            roleplay_seconds=10.0,
+            extra={"start_by": "button", "pressed_during": "replay", "transition_recaps": 1,
+                   "unknown_key": "dropped"},
+        )
+        self.assertEqual(row["payload"]["start_by"], "button")
+        self.assertEqual(row["payload"]["pressed_during"], "replay")
+        self.assertEqual(row["payload"]["transition_recaps"], 1)
+        self.assertNotIn("unknown_key", row["payload"])
+        off = {
+            "R1_TRANSITION_REPAIR": "0", "R1_ICEBREAKER_REPAIR": "0", "R1_ICEBREAKER_ACK_HOLD": "0",
+        }
+        with mock.patch.dict(os.environ, off):
+            rig = await fidelity_session()
+            rig.interview._begin_exit()
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        (facts,) = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
+        # The learner lane's worker-only counts (M032 SWEEP-1) ride along whatever these flags say.
+        self.assertEqual(
+            set(facts["payload"]) - {"pins"} - set(SESSION_FACT_WORKER_KEYS),
+            API_PAYLOAD_KEYS["session_facts"],
+        )
 
     async def test_first_audio_p95_is_the_role_play_p95_of_the_logged_headline_in_ms(self):
         with capture_r1_logs() as lines:
@@ -631,6 +669,132 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         event = session_facts_event(None, fidelity_pins(rig.interview.persona_choice),
                                     roleplay_seconds=rig.machine.roleplay_elapsed)
         self.assertEqual(event["payload"]["roleplay_seconds"], round(at_exit, 1))
+
+    def test_the_learner_timing_counts_ride_along_as_counts_only(self):
+        """M032 SWEEP-1 and S1: the learner's timing holds go with the row (counts only, bounded),
+        so the owner's next test shows how often each fired; the API stores them unparsed."""
+        admin = {
+            "intents": {
+                "push_react_holds": {"F3": 1, "F2": 2},
+                "respond_first_holds": {"offer": 1},
+                "moment_waits": 3,
+                "volunteered_objections": 1,
+                "concerns": {"pressure": 2},
+                "split_replans": 0,
+            }
+        }
+        timing = session_facts_event(admin, {}, roleplay_seconds=42.0)["payload"]["learner_timing"]
+        self.assertEqual(
+            timing,
+            {
+                "push_react_holds": {"F2": 2, "F3": 1},
+                "respond_first_holds": {"offer": 1},
+                "moment_waits": 3,
+                "volunteered_objections": 1,
+                "concerns": {"pressure": 2},
+                "split_replans": 0,
+            },
+        )
+        # Anything that is not a small count is dropped, never guessed.
+        bad = {
+            "intents": {
+                "push_react_holds": {"F3": True, "F2": -1, "x" * 99: 1, "F4": 2.5, 7: 1},
+                "moment_waits": "3",
+                "split_replans": float("nan"),
+                "respond_first_holds": ["offer"],
+                "transcript": "never sent",
+            }
+        }
+        timing = session_facts_event(bad, {}, roleplay_seconds=42.0)["payload"]["learner_timing"]
+        self.assertEqual(timing, {"push_react_holds": {}, "respond_first_holds": {},
+                                  "moment_waits": None, "volunteered_objections": None,
+                                  "concerns": {}, "split_replans": None})
+        many = {"intents": {"concerns": {f"t{i}": 1 for i in range(40)}}}
+        timing = session_facts_event(many, {}, roleplay_seconds=1.0)["payload"]["learner_timing"]
+        self.assertLessEqual(len(timing["concerns"]), 16)
+        for admin in (None, {}, {"intents": None}):
+            with self.subTest(admin=admin):
+                timing = session_facts_event(admin, {}, roleplay_seconds=1.0)["payload"][
+                    "learner_timing"]
+                self.assertEqual(timing["push_react_holds"], {})
+                self.assertIsNone(timing["moment_waits"])
+
+    def test_the_learner_voice_counts_ride_along_as_counts_only(self):
+        """M032 S2: how her replies opened, their sentence counts, the scripted tails bolted onto
+        intents and each S2 note go with the row, counts only and bounded; never any text."""
+        admin = {
+            "voice": {
+                "learner_replies": 20,
+                "learner_ack_hinge_replies": 3,
+                "learner_verdict_openers": 2,
+                "learner_doubt_opener_replies": 0,
+                "sentence_histogram": {"1": 8, "2": 11, "3": 1},
+                "intent_turns": 9,
+                "intent_tails_appended": 2,
+                "intent_tails_after_question": 1,
+                "stall_theme_counts": {"not_today": 1, "decider": 1},
+                "no_commit_notes": 6,
+                "volunteered_timing_stalls": 1,
+                "offer_terms_counts": {"instalments": 1},
+                "ack_turn_notes": 2,
+                "soft_tic_trims": 1,
+                "implausible_offer_count": 0,
+                "last_reply": "never sent",
+            }
+        }
+        voice = session_facts_event(admin, {}, roleplay_seconds=42.0)["payload"]["learner_voice"]
+        self.assertEqual(voice["sentence_histogram"], {"1": 8, "2": 11, "3": 1})
+        self.assertEqual(voice["stall_theme_counts"], {"decider": 1, "not_today": 1})
+        self.assertEqual(voice["learner_ack_hinge_replies"], 3)
+        self.assertEqual(voice["intent_tails_appended"], 2)
+        self.assertNotIn("last_reply", voice)
+        self.assertNotIn("never sent", repr(voice))
+        bad = {"voice": {"learner_replies": "20", "sentence_histogram": {"2": -1, "x" * 99: 1}}}
+        voice = session_facts_event(bad, {}, roleplay_seconds=1.0)["payload"]["learner_voice"]
+        self.assertIsNone(voice["learner_replies"])
+        self.assertEqual(voice["sentence_histogram"], {})
+        for admin in (None, {}, {"voice": None}):
+            with self.subTest(admin=admin):
+                voice = session_facts_event(admin, {}, roleplay_seconds=1.0)["payload"][
+                    "learner_voice"]
+                self.assertEqual(voice["offer_terms_counts"], {})
+                self.assertIsNone(voice["soft_tic_trims"])
+
+    def test_the_probe_first_counts_ride_along_as_counts_only(self):
+        """M032 S2P (review S2P-R8): the probes she asked, the price dodges, the redirect probes,
+        the course lengths the guard dropped and SWEEP-22's notes go with the row, counts only."""
+        admin = {
+            "probe_first": {
+                "probes": {"F1": 2, "F2": 1},
+                "price_dodges": 1,
+                "price_asked": True,
+                "redirect_probes": 1,
+                "course_fact_unsaid_count": 3,
+                "figure_challenges": 0,
+                "price_reflex_notes": 2,
+                "price_first_turns": 1,
+                "last_line": "never sent",
+            }
+        }
+        facts = session_facts_event(admin, {}, roleplay_seconds=42.0)["payload"]
+        probe = facts["learner_probe_first"]
+        self.assertEqual(probe["probes"], {"F1": 2, "F2": 1})
+        self.assertEqual(probe["course_fact_unsaid_count"], 3)
+        self.assertEqual(probe["price_dodges"], 1)
+        self.assertEqual(probe["price_first_turns"], 1)
+        self.assertNotIn("last_line", probe)
+        self.assertNotIn("price_asked", probe)
+        self.assertNotIn("never sent", repr(probe))
+        bad = {"probe_first": {"price_dodges": "1", "probes": {"F1": -1, "x" * 99: 1}}}
+        probe = session_facts_event(bad, {}, roleplay_seconds=1.0)["payload"]["learner_probe_first"]
+        self.assertIsNone(probe["price_dodges"])
+        self.assertEqual(probe["probes"], {})
+        for admin in (None, {}, {"probe_first": None}):
+            with self.subTest(admin=admin):
+                probe = session_facts_event(admin, {}, roleplay_seconds=1.0)["payload"][
+                    "learner_probe_first"]
+                self.assertEqual(probe["probes"], {})
+                self.assertIsNone(probe["course_fact_unsaid_count"])
 
     def test_unmeasured_or_invalid_values_are_sent_as_null_never_as_a_guess(self):
         for admin in (None, {}, {"communication": {}},

@@ -649,7 +649,9 @@ class RegexLabelTests(unittest.TestCase):
     def test_a_presence_check_is_compared_with_the_presence_part_of_the_repair_reader(self):
         import r1_session
 
-        presence = r1_session.is_presence_check
+        # Integration of S4 with S6: S6's ``is_presence_check`` routes the transition; the reader's
+        # comparison keeps S4's presence part of the repair reader under its own name.
+        presence = r1_session.is_repair_presence_check
         for text in ("Hello?", "Hello? Are you there?", "Can you hear me?", "Are you still there?"):
             with self.subTest(text=text):
                 self.assertTrue(r1_session.is_repair_turn(text))

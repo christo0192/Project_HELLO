@@ -1,0 +1,123 @@
+"""The harness's own switches (read at call time, default ON; ``0``/``false``/``off``/``no`` is OFF).
+
+Each one guards a fix to the simulator or its checks, so OFF restores the previous behaviour:
+
+* ``REHEARSAL_KEEP_CONTROL_ACTS``: the live rewriter never rewords a move whose act a check
+  scores (an end request, an insult, a brief request ...); it is said as the library wrote it.
+* ``REHEARSAL_TRANSITION_ACTS_V2``: transition acts read the request's object (a brief request
+  names the brief, a request to repeat an icebreaker question is ``repeat_request``), the brief
+  repair check needs Christy's scripted brief line, and a ``repeat_request`` gets its own check.
+* ``REHEARSAL_LEARNER_CLOCK``: the window checks time a learner line by the R at which the engine
+  decided it, not by the start of the advisor turn it answered.
+* ``REHEARSAL_COMMIT_WINDOW`` (diagnosis-2 D2-SC1): the commitment gates count only the calls that had
+  a commitment window (a call with no commitment that ended on an end request, on the abuse hang-up
+  or before 13:00 is excluded and counted beside the gate).
+* ``REHEARSAL_SPOKEN_LEAKS`` (D2-HF2): a commitment the guard BLOCKED is no hard fail; the hard fail
+  needs the guard's own flag or a commitment still in what the learner said.
+* ``REHEARSAL_PROBE_VOCAB_V2`` (D2-ND1): the narrower need vocabulary, one topic per coordinated
+  question and the wider call-scheduling exclusion of the disclosure gate's digs.
+* ``REHEARSAL_CITED_MISFIRES`` (D2-HM1): the judge is asked to cite the advisor turn a misfire fails to
+  follow (OFF sends the previous rubric and schema), a judged misfire of kind ``other`` counts only when
+  it cites that turn and a reason, and one call adds at most 5 to a level's mean.
+* ``REHEARSAL_IB_REPEAT_INSISTED`` (D2-IB1, integration): a repeat request that turns down ("no, I
+  mean ...") the right question it just got also passes with the question before that one, as
+  Christy's insisted-repeat line offers it.
+* ``REHEARSAL_SAME_TURN_FRAGMENTS`` (integration, rambler): a candidate row the session saved with no
+  span, written while the candidate's turn was still being said, is a fragment of that turn, not the
+  candidate's next turn, when a check looks for the bot's reply to it.
+* ``REHEARSAL_FLOW_DESIGN_RULES`` (diagnosis-4 D4-H-POLICY1): the flow judge's rubric states the fixed
+  design rules (judge their wording and timing, never that they exist), its facts say who ended the
+  role-play and which graded families came before that, and evidence is asked only for lost points.
+* ``REHEARSAL_FLOW_NA_AXES`` (D4-H-SILENT1): a call with no learner line (no role-play) scores
+  learner_flow and objective_kept as null, and nulls stay out of the means, minimums and floor.
+* ``REHEARSAL_ADVISOR_FAREWELL_LOOP`` (D4-H-SIMLOOP1): after two exchanges in a row in which the
+  simulated advisor said goodbye and the learner's reply ended on a goodbye too, the advisor goes quiet
+  for the rest of the role-play (the runner waits for the session's exit or the time cap).  A goodbye
+  is read on the last sentence, never a question; an advisor sign-off counts when it is tagged
+  ``farewell``, or confirms a callback, or comes from R 14:00.  Once quiet, the candidate agrees when
+  Christy asks to end the interview or to wrap up.
+* ``REHEARSAL_DIG_RELEASED`` (D4-H-DIG1): a harness dig is engine-confirmed only when the gate released
+  that need at that exchange (its release turn, the judge's one turn later, or a deep offer after the
+  hint); the digs it did not honour are listed as ``probe_unreleased``.  The judge's one-turn slack
+  holds whenever a judge verdict was applied in the call, and the dig turns are the engine's own.
+* ``REHEARSAL_OPEN_INVITE`` (D4-H-DIG1): a deep reveal that answers an open invitation ("what's on your
+  mind?", "go ahead, I'm listening") is prompted, not an unprompted dump.
+* ``REHEARSAL_REPEAT_IF_UNANSWERED`` (D4-H-REPLAY1): a replayed request in the transition to hear an
+  icebreaker question again is said only when the question it asks for (the one before the last for
+  "that earlier question", else the last) went unanswered; otherwise the next replayed line is said.
+* ``REHEARSAL_CONTINUED_ROWS`` (D4-H-REPLAY1): a candidate row the session saved without a span (a
+  fragment of a longer spoken turn) carries the timing of the spoken turn it belongs to, and a part of
+  a turn spoken over the brief is merged into the row of that turn.  A fragment goes to the latest
+  matching turn, and a run of one or two words only to the turn in progress.
+* ``REHEARSAL_BACKCHANNEL_GAP`` (D4-H-REPLAY1): after a replayed icebreaker backchannel ("thanks") the
+  candidate answers the question it still owes after at most 10 s of silence.
+* ``REHEARSAL_FLOW_AGENDA_RULES`` (diagnosis-5 D5-JUDGE1): the flow judge's design rules also say that
+  the opening agenda's "about thirty minutes" (the interview) and "up to twenty" (the role-play) are
+  both right, and that Christy's one confirming ask on an end request that does not name the end, her
+  wrap-up offer and her early-end note are policy.  OFF sends the round-5 rubric (``RUBRIC_V2``).
+* ``REHEARSAL_FLOW_MIN_REPS`` (D5-JUDGE1): the flow summary counts the judged calls per scenario and,
+  on a live run, a scenario judged on one call only is a readiness reason (run at least 2 per
+  scenario: one call moves an axis mean by a whole point's share, and one-sample swings are noise).
+* ``REHEARSAL_NEXT_STEP_V2`` (D5-HF-UNEARNED2): the advisor's next-step words also take "pencil (you)
+  in", "a(nother)" call, chat or meeting named by a closed qualifier (a day, the weekend, the morning,
+  afternoon or evening, phone, video, or a short / quick / brief / follow-up one; not "your Monday
+  meeting" or one the candidate already has), a named session only "for you", with a mentor or "put you
+  down for" (D5R-NS2-WILDCARD: "a smart call", "another sales call" and "every morning session" are no
+  asks), and "catch up over a call / the phone".
+"""
+from __future__ import annotations
+
+import os
+
+KEEP_CONTROL_ACTS = "REHEARSAL_KEEP_CONTROL_ACTS"
+TRANSITION_ACTS_V2 = "REHEARSAL_TRANSITION_ACTS_V2"
+LEARNER_CLOCK = "REHEARSAL_LEARNER_CLOCK"
+COMMIT_WINDOW = "REHEARSAL_COMMIT_WINDOW"
+SPOKEN_LEAKS = "REHEARSAL_SPOKEN_LEAKS"
+PROBE_VOCAB_V2 = "REHEARSAL_PROBE_VOCAB_V2"
+SAME_TURN_FRAGMENTS = "REHEARSAL_SAME_TURN_FRAGMENTS"
+CITED_MISFIRES = "REHEARSAL_CITED_MISFIRES"
+IB_REPEAT_INSISTED = "REHEARSAL_IB_REPEAT_INSISTED"
+FLOW_DESIGN_RULES = "REHEARSAL_FLOW_DESIGN_RULES"
+FLOW_NA_AXES = "REHEARSAL_FLOW_NA_AXES"
+ADVISOR_FAREWELL_LOOP = "REHEARSAL_ADVISOR_FAREWELL_LOOP"
+DIG_RELEASED = "REHEARSAL_DIG_RELEASED"
+OPEN_INVITE = "REHEARSAL_OPEN_INVITE"
+REPEAT_IF_UNANSWERED = "REHEARSAL_REPEAT_IF_UNANSWERED"
+CONTINUED_ROWS = "REHEARSAL_CONTINUED_ROWS"
+BACKCHANNEL_GAP = "REHEARSAL_BACKCHANNEL_GAP"
+FLOW_AGENDA_RULES = "REHEARSAL_FLOW_AGENDA_RULES"
+FLOW_MIN_REPS = "REHEARSAL_FLOW_MIN_REPS"
+NEXT_STEP_V2 = "REHEARSAL_NEXT_STEP_V2"
+
+_OFF = frozenset({"0", "false", "off", "no"})
+
+
+def on(name: str) -> bool:
+    """True unless the environment turns the switch off."""
+    return str(os.environ.get(name, "1")).strip().lower() not in _OFF
+
+
+__all__ = [
+    "ADVISOR_FAREWELL_LOOP",
+    "BACKCHANNEL_GAP",
+    "CITED_MISFIRES",
+    "COMMIT_WINDOW",
+    "CONTINUED_ROWS",
+    "DIG_RELEASED",
+    "FLOW_AGENDA_RULES",
+    "FLOW_DESIGN_RULES",
+    "FLOW_MIN_REPS",
+    "FLOW_NA_AXES",
+    "IB_REPEAT_INSISTED",
+    "KEEP_CONTROL_ACTS",
+    "LEARNER_CLOCK",
+    "NEXT_STEP_V2",
+    "OPEN_INVITE",
+    "PROBE_VOCAB_V2",
+    "REPEAT_IF_UNANSWERED",
+    "SAME_TURN_FRAGMENTS",
+    "SPOKEN_LEAKS",
+    "TRANSITION_ACTS_V2",
+    "on",
+]

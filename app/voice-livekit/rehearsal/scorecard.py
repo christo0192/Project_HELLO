@@ -18,6 +18,9 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Mapping, Sequence
 
+from r1_commitment import COMMIT_PERMITTED_R_SEC
+
+from rehearsal import flags
 from rehearsal.metrics import mean
 
 LEVEL_GROUP = {
@@ -61,6 +64,15 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
         {"strong": 0.2, "average": 0.3, "other": 0.3},
         "gate",
     ),
+    # D2-HM1: the gate caps one call's contribution at ``MISFIRE_CALL_CAP``; the uncapped mean is info.
+    (
+        "misfires_uncapped",
+        "Misfire lines per call, uncapped (info)",
+        "misfires_per_call_uncapped",
+        "<=",
+        {"strong": 0.2, "average": 0.3, "other": 0.3},
+        "info",
+    ),
     (
         "disclosure",
         "Needs disclosed within 2 turns of a genuine probe",
@@ -68,6 +80,25 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
         ">=",
         {"strong": 0.8, "average": 0.6},
         "gate",
+    ),
+    # D2-ND1: the same rate over the digs the engine's own needs ledger confirms, and the digs only the
+    # harness counted.  Info: the gate above keeps every harness dig, since a dig the engine missed is
+    # a product failure the engine's own detector cannot report.
+    (
+        "disclosure_confirmed",
+        "Needs disclosed, engine-confirmed digs only (info)",
+        "disclosure_rate_engine_confirmed",
+        ">=",
+        {"strong": 0.8, "average": 0.6},
+        "info",
+    ),
+    (
+        "harness_only_digs",
+        "Harness-only digs (the engine saw no follow-up) (info)",
+        "harness_only_digs_total",
+        "<=",
+        {"strong": 0, "average": 0, "other": 0},
+        "info",
     ),
     (
         "dump",
@@ -115,6 +146,16 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
         "<=",
         ALL_GROUPS,
         "gate",
+    ),
+    # D2-HF2: a commitment the guard blocked never reached the candidate (a spoken one is a hard fail,
+    # ``guard_flagged``); how often the guard had to block one is reported here.
+    (
+        "commit_blocked",
+        "Blocked commitment attempts per call (info: the guard caught them)",
+        "commitment_blocked_per_call",
+        "<=",
+        {"strong": 1.0, "average": 1.0, "other": 1.0},
+        "info",
     ),
     # R1-Q round 2: the reworded reaction prompts are proved on a live sweep, where a reply that
     # restates a course detail is blocked as ``invented_fact``.  Offline the model is scripted, so
@@ -310,6 +351,45 @@ def _rate(numerator: float, denominator: float) -> float | None:
     return (numerator / denominator) if denominator else None
 
 
+# D2-HM1: one call adds at most this many misfires to a level's mean (a chaotic replay cannot fail a
+# small level on its own; the uncapped mean is reported as info).
+MISFIRE_CALL_CAP = 5
+# D2-SC1: the commitment gates and the count behind each (over the calls that had a commitment window).
+COMMITMENT_METRICS = {
+    "medium_or_better_rate": "medium_or_better_count",
+    "strong_rate": "strong_count",
+}
+
+
+def commitment_exclusion(record: Mapping[str, Any], m: Mapping[str, Any]) -> str | None:
+    """Why a call had no commitment window (D2-SC1), or None when it had one.
+
+    Only a call with no commitment at all is excluded: its role-play ended on an end request, on the
+    abuse hang-up (D-M032-3) or before the close window opened (13:00).  A call that reached a level
+    always counts, and so does a full call that reached none (that is a miss, not an exclusion).
+
+    An end request or the abuse hang-up excludes a call only while the window was still shut: once
+    the role-play passed 13:00 the learner had its chance to commit (the advisor may have asked and
+    been stalled), so a late "let's stop here" (R1_LATE_END_REQUEST) leaves a miss counted.  Without
+    a role-play time the reason alone excludes, as before.
+    """
+    if m.get("commitment_level") is not None:
+        return None
+    seconds = m.get("roleplay_seconds")
+    if isinstance(seconds, (int, float)) and seconds >= COMMIT_PERMITTED_R_SEC:
+        return None
+    if m.get("stop_reason") == "end_request":
+        return "end_request"
+    hangups = m.get("abuse_hangups")
+    if hangups is None:
+        hangups = ((record.get("admin_log") or {}).get("endings") or {}).get("abuse_hangups")
+    if isinstance(hangups, (int, float)) and hangups >= 1:
+        return "abuse_hangup"
+    if isinstance(seconds, (int, float)):
+        return "ended_before_window"
+    return None
+
+
 def merged_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     """A call's deterministic metrics plus its judge metrics (judge keys are prefixed)."""
     out = dict(record.get("metrics") or {})
@@ -331,6 +411,11 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     dug = sum(len(m.get("needs_dug") or []) for m in calls)
     disclosed = sum(len(m.get("needs_disclosed_after_dig") or []) for m in calls)
     levels = Counter(m.get("commitment_level") or "NONE" for m in calls)
+    exclusions = [commitment_exclusion(record, m) for record, m in zip(records, calls)]
+    windowed_on = flags.on(flags.COMMIT_WINDOW)
+    windowed = [m for m, why in zip(calls, exclusions) if why is None or not windowed_on]
+    window_levels = Counter(m.get("commitment_level") or "NONE" for m in windowed)
+    medium_count = window_levels.get("MEDIUM", 0) + window_levels.get("STRONG", 0)
     handed = sum(m.get("intents_handed_to_model") or 0 for m in calls)
     fell = sum(m.get("intents_fallback_appended") or 0 for m in calls)
     judged = [m for m in calls if m.get("judge_style_mean") is not None]
@@ -354,6 +439,9 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         float(m["judge_misfire_count"]) if m.get("judge_misfire_count") is not None else float(m.get("misfire_count") or 0)
         for m in calls
     ]
+    capped = flags.on(flags.CITED_MISFIRES)
+    gated_misfires = [min(value, float(MISFIRE_CALL_CAP)) if capped else value for value in misfire_values]
+    judge_misfires = [float(m["judge_misfire_count"]) for m in calls if m.get("judge_misfire_count") is not None]
     # Tics are pooled over the group's replies (a share of all replies, not a mean of call shares).
     replies = sum(int(m.get("reply_count") or 0) for m in calls)
     openers: Counter[str] = Counter()
@@ -391,21 +479,58 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "objections_in_context_rate": _rate(in_ctx, objections),
         "judge_calls": len(judged),
-        "misfires_per_call": mean(misfire_values),
+        "misfires_per_call": mean(gated_misfires),
+        "misfires_per_call_uncapped": mean(misfire_values),
+        "judge_misfires_per_call": mean(judge_misfires),
+        "rule_misfires_per_call": mean([float(m.get("misfire_count") or 0) for m in calls]),
+        "judge_misfires_rejected_per_call": mean(
+            [float(m.get("judge_misfires_rejected") or 0) for m in calls if m.get("judge_misfire_count") is not None]
+        ),
         "disclosure_rate": _rate(disclosed, dug),
         "needs_dug_total": dug,
+        "disclosure_rate_engine_confirmed": _rate(
+            sum(len(m.get("needs_disclosed_confirmed") or []) for m in calls),
+            sum(len(m.get("needs_dug_confirmed") or []) for m in calls),
+        ),
+        "harness_only_digs_total": (
+            sum(len(m.get("harness_only_digs") or []) for m in calls)
+            if any(m.get("harness_only_digs") is not None for m in calls)
+            else None
+        ),
+        "engine_only_digs_total": (
+            sum(len(m.get("engine_only_digs") or []) for m in calls)
+            if any(m.get("engine_only_digs") is not None for m in calls)
+            else None
+        ),
+        # D4-H-DIG1: harness digs the gate did not release at that exchange (a product signal).
+        "probe_unreleased_total": (
+            sum(len(m.get("probe_unreleased") or []) for m in calls)
+            if any(m.get("probe_unreleased") is not None for m in calls)
+            else None
+        ),
         "unprompted_dump_call_rate": _rate(
             sum(1 for m in calls if (m.get("unprompted_dump_count") or 0) >= 1), n
         ),
         "commitment_levels": dict(levels),
-        "medium_or_better_rate": _rate(levels.get("MEDIUM", 0) + levels.get("STRONG", 0), n),
-        "strong_rate": _rate(levels.get("STRONG", 0), n),
+        "medium_or_better_rate": _rate(medium_count, len(windowed)),
+        "strong_rate": _rate(window_levels.get("STRONG", 0), len(windowed)),
+        "medium_or_better_count": medium_count,
+        "strong_count": window_levels.get("STRONG", 0),
+        "commitment_window_calls": len(windowed),
+        "commitment_excluded": n - len(windowed),
+        "commitment_excluded_reasons": dict(
+            Counter(why for why in exclusions if why is not None) if windowed_on else {}
+        ),
+        "medium_or_better_rate_all": _rate(levels.get("MEDIUM", 0) + levels.get("STRONG", 0), n),
+        "strong_rate_all": _rate(levels.get("STRONG", 0), n),
         "near_repeat_per_call": mean([float(m.get("near_repeat_count") or 0) for m in calls]),
         "exact_repeat_per_call": mean([float(m.get("exact_repeat_extra") or 0) for m in calls]),
         "weak_line_max": max([int(m.get("weak_line_count") or 0) for m in calls], default=None),
         "commitment_hits_after_commitment": sum(
             int(m.get("commitment_hits_after_commitment") or 0) for m in calls
         ),
+        "commitment_blocked_per_call": mean([float(m.get("commitment_guard_hits") or 0) for m in calls]),
+        "commitment_spoken_leaks": sum(int(m.get("commitment_spoken_leaks") or 0) for m in calls),
         "reply_words_mean": mean(_floats(calls, "reply_words_mean")),
         "reply_words_p90": mean(_floats(calls, "reply_words_p90")),
         "short_reply_share": mean(_floats(calls, "short_reply_share")),
@@ -487,7 +612,12 @@ def evaluate(agg: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
                 continue
             value = group.get(metric)
             threshold = thresholds[kind]
-            held_to = effective_threshold(gate_id, op, threshold, int(group.get("calls") or 0))
+            note = None
+            denominator = int(group.get("calls") or 0)
+            if metric in COMMITMENT_METRICS and flags.on(flags.COMMIT_WINDOW):
+                denominator = int(group.get("commitment_window_calls") or 0)
+                note = _commitment_note(group, COMMITMENT_METRICS[metric])
+            held_to = effective_threshold(gate_id, op, threshold, denominator)
             if value is None:
                 status = "n/a"
             else:
@@ -505,9 +635,20 @@ def evaluate(agg: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
                     "value": None if value is None else round(float(value), 3),
                     "status": status,
                     "severity": severity,
+                    "note": note,
                 }
             )
     return results
+
+
+def _commitment_note(group: Mapping[str, Any], count_key: str) -> str:
+    """'4/6, 3 excluded (abuse_hangup 1, end_request 2)': the gate's counts beside its value."""
+    excluded = int(group.get("commitment_excluded") or 0)
+    note = f"{int(group.get(count_key) or 0)}/{int(group.get('commitment_window_calls') or 0)}, {excluded} excluded"
+    reasons = group.get("commitment_excluded_reasons") or {}
+    if reasons:
+        note += " (" + ", ".join(f"{why} {count}" for why, count in sorted(reasons.items())) + ")"
+    return note
 
 
 def readiness(agg: Mapping[str, Mapping[str, Any]], gates: Sequence[Mapping[str, Any]], *, offline: bool) -> dict[str, Any]:
@@ -574,15 +715,27 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("role-play seconds (mean)", "roleplay_seconds_mean"),
         ("families 3+ at 13:00", "families_3plus_rate"),
         ("objections in context (judge)", "objections_in_context_rate"),
-        ("misfires / call", "misfires_per_call"),
+        ("misfires / call (gate: one call adds at most 5)", "misfires_per_call"),
+        ("misfires / call, uncapped", "misfires_per_call_uncapped"),
+        ("judge misfires / call", "judge_misfires_per_call"),
+        ("judge misfires rejected / call", "judge_misfires_rejected_per_call"),
+        ("rule misfires / call", "rule_misfires_per_call"),
         ("need disclosed after a genuine probe", "disclosure_rate"),
+        ("need disclosed, engine-confirmed digs", "disclosure_rate_engine_confirmed"),
+        ("harness-only digs (engine saw no follow-up)", "harness_only_digs_total"),
+        ("engine-only digs (harness counted none)", "engine_only_digs_total"),
+        ("digs the gate did not release at that exchange", "probe_unreleased_total"),
         ("calls with an unprompted dump", "unprompted_dump_call_rate"),
-        ("MEDIUM or better", "medium_or_better_rate"),
+        ("MEDIUM or better (calls with a commitment window)", "medium_or_better_rate"),
+        ("calls with no commitment window (excluded)", "commitment_excluded"),
+        ("MEDIUM or better, all calls", "medium_or_better_rate_all"),
         ("STRONG", "strong_rate"),
         ("near repeats / call", "near_repeat_per_call"),
         ("exact repeats / call", "exact_repeat_per_call"),
         ("WEAK line, max per call", "weak_line_max"),
         ("commitment guard hits after commitment", "commitment_hits_after_commitment"),
+        ("blocked commitment attempts / call", "commitment_blocked_per_call"),
+        ("commitments still in the spoken line", "commitment_spoken_leaks"),
         ("guard leak hits / call (mean)", "guard_leak_hits_per_call"),
         ("guard hygiene hits / call (mean)", "guard_hygiene_hits_per_call"),
         ("guard hits / call (mean)", "guard_hits_per_call"),
@@ -637,8 +790,11 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         threshold = f"{gate['op']} {gate['threshold']}"
         if held != gate["threshold"]:
             threshold += f" (small group: held to {held:.2f})"
+        value = _fmt(gate["value"], 3)
+        if gate.get("note"):
+            value += f" ({gate['note']})"
         lines.append(
-            f"| {gate['level']} | {gate['label']} | {_fmt(gate['value'], 3)} | "
+            f"| {gate['level']} | {gate['label']} | {value} | "
             f"{threshold} | {gate['status']} |"
         )
     lines.append("")

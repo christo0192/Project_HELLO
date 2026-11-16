@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass
 
 from r1_commitment import call_proposal_in
+from r1_script import active_line_id
 from r1_script import line as script_line
 from r1_text import dollar_amounts, fold, is_question_like, split_sentences
 
@@ -57,9 +58,35 @@ PUBLIC_ANSWERS: tuple[tuple[str, str], ...] = (
     ("hours a week you could give it", AVAILABILITY_ANSWER),
     ("your e-mail, phone number or any contact detail", CONTACT_ANSWER),
 )
+# M032 SWEEP-8 (flag R1_PERSONA_TIMELINE_V2, latched per session by the engine: it changes the card,
+# which is in the DeepSeek cache prefix).  "A data role within a year." competed with p2's own
+# deadline (a contract renewal in about six months) and handed the model a timeline for a pinned H1
+# probe, so the goal names no time span and no urgency.  New wording under D-M032-4, listed for
+# review.
+SUCCESS_ANSWER = "A data role within a year."
+SUCCESS_ANSWER_V2 = "Moving into a data role."
+PUBLIC_ANSWERS_V2: tuple[tuple[str, str], ...] = tuple(
+    (label, SUCCESS_ANSWER_V2 if answer == SUCCESS_ANSWER else answer)
+    for label, answer in PUBLIC_ANSWERS
+)
+
+
+def public_answers(*, timeline_v2: bool = False) -> tuple[tuple[str, str], ...]:
+    """The card's shared short answers (SWEEP-8: ``timeline_v2`` swaps in the timeless goal)."""
+    return PUBLIC_ANSWERS_V2 if timeline_v2 else PUBLIC_ANSWERS
+
+
 # The top of the card's monthly budget ("Around $500-700 a month."): a monthly payment above it is
 # never "workable" for the learner (``r1_guard``: ``over_budget_accepted``).
 MONTHLY_BUDGET_MAX_USD = 700
+# What the card says she knows about the course.  M032 S2P (D-M032-7, SWEEP-17): no course figure.
+CARD_COURSE_KNOWLEDGE = "You know only that it is around $9,000 and about 6 months."
+CARD_COURSE_KNOWLEDGE_V2 = (
+    "You glanced at the website once and saw a price, but you don't remember it well enough to "
+    "quote it, and you don't know anything else about the course: not how long it runs, the "
+    "weekly hours, the format, the batches or the projects. Ask the advisor about anything you "
+    "want to know."
+)
 
 
 @dataclass(frozen=True)
@@ -636,7 +663,8 @@ class RenderedPersona:
 
     @property
     def pickup_line(self) -> str:
-        return script_line("L-PICKUP", **self.line_values)
+        # M032 S6: the pickup the session speaks (revision 21's with R1_TRANSITION_REPAIR=0).
+        return script_line(active_line_id("L-PICKUP"), **self.line_values)
 
     @property
     def profile(self) -> str:
@@ -679,30 +707,40 @@ class RenderedPersona:
             amount for _label, answer in self.work_answers for amount in dollar_amounts(answer)
         )
 
-    def public_card_text(self) -> str:
-        """Everything the learner prompt may say about the persona; no deep need."""
+    def public_card_text(self, *, probe_first: bool = False, timeline_v2: bool = False) -> str:
+        """Everything the learner prompt may say about the persona; no deep need.
+
+        M032 S2P (D-M032-7, SWEEP-17; ``probe_first``, the engine's latched R1_PROBE_FIRST): the
+        card holds no course figure.  She saw a price on the website but cannot quote it, and she
+        knows nothing else about the course; the $9,000 reaches her only through a per-turn note on
+        the check or conflict path.  With ``probe_first`` off the card is the release before it.
+
+        M032 SWEEP-8 (``timeline_v2``, the engine's latched R1_PERSONA_TIMELINE_V2): she is at home
+        when they call, her webinar is dated, and her goal names no deadline.
+        """
+        knows = CARD_COURSE_KNOWLEDGE_V2 if probe_first else CARD_COURSE_KNOWLEDGE
         parts = [
             f"You are {self.lead_name}, {self.persona.age}, in {self.lead_city}. "
             f"{self.profile}",
             "You filled in a form on the Interview Kickstart website a few days ago about "
-            "the Data Science course. You know only that it is around $9,000 and about "
-            "6 months.",
+            f"the Data Science course. {knows}",
             # L4 (mock call aa166f09: "I'm calling about the data science course", "I thought I
             # was the one calling"): she is the one who was called.
             "The Program Advisor is calling you back about that form, and you answered the "
             "phone: you did not call them.",
         ]
-        if self.persona.backstory:
+        backstory = backstory_lines(self.persona, timeline_v2=timeline_v2)
+        if backstory:
             parts.append(
                 "Your backstory (all true; use it in your own words for small talk or when "
                 "the advisor asks about you, and never recite it):"
             )
-            parts.extend(f"- {fact}" for fact in self.persona.backstory)
+            parts.extend(f"- {fact}" for fact in backstory)
         parts.append("Short answers, to give only when asked and never to expand on:")
         for topic in H_TOPICS:
             parts.append(f'- {TOPIC_LABELS[topic]}: "{self.surface(topic)}"')
         parts.append(f'- what you have studied so far: "{self.persona.prior_learning}"')
-        for label, answer in PUBLIC_ANSWERS:
+        for label, answer in public_answers(timeline_v2=timeline_v2):
             parts.append(f'- {label}: "{answer}"')
         parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
         for label, answer in self.work_answers:
@@ -719,6 +757,32 @@ class RenderedPersona:
             "the course: you do not know it, so ask the advisor."
         )
         return "\n".join(parts)
+
+
+# M032 SWEEP-8 (flag R1_PERSONA_TIMELINE_V2): the backstory lines that contradicted the card or had
+# no time anchor, and their replacements.  p1 said she was "calling from home" on the same card that
+# says she did not call them, and talked as if she had called; p1's and p3's webinars had no date,
+# unlike p2's and p4's.  p1 uses "last month", never "weeks": her H2 marker is "three weeks".
+BACKSTORY_TIMELINE_V2: dict[str, str] = {
+    "You saw the Interview Kickstart webinar announcement on LinkedIn and registered.": (
+        "You went to an Interview Kickstart webinar last month, after seeing it on "
+        "LinkedIn."
+    ),
+    "You are calling from home after work, a bit tired but friendly.": (
+        "You are at home after work when they call, a bit tired but friendly."
+    ),
+    "You registered for an Interview Kickstart webinar after a colleague mentioned it.": (
+        "You went to an Interview Kickstart webinar a few weeks ago, after a colleague "
+        "mentioned it."
+    ),
+}
+
+
+def backstory_lines(persona: Persona, *, timeline_v2: bool = False) -> tuple[str, ...]:
+    """The persona's public backstory (SWEEP-8: ``timeline_v2`` swaps in the timeline lines)."""
+    if not timeline_v2:
+        return persona.backstory
+    return tuple(BACKSTORY_TIMELINE_V2.get(fact, fact) for fact in persona.backstory)
 
 
 _MARKER_CACHE: dict[tuple[str, str], tuple[re.Pattern[str], ...]] = {}
@@ -1023,15 +1087,115 @@ _FOLLOWUP_IMPERATIVE = re.compile(
 )
 
 
-def detect_probes(text: object) -> frozenset[str]:
+# Simulation adaptability (the live tangent smoke; the engine's R1_TANGENT).  An advisor turn that
+# leaves the sale for a moment: small talk, a personal question, a joke.  Narrow on purpose: a turn
+# is a tangent only when it has a small-talk word (``_SMALL_TALK``) and no word of the course, the
+# sale or her decision (``_COURSE_TALK``), and does not steer back itself ("Anyway, where were
+# we?").  "By the way, the course also has mentors" and "my tea's gone cold" after a pitch are no
+# tangent.
+_COURSE_TALK = re.compile(
+    r"\b(?:courses?|program(?:me)?s?|class(?:es)?|sessions?|cohorts?|batch(?:es)?|modules?|"
+    r"curriculum|syllabus|lessons?|lectures?|recordings?|mentor\w*|instructor\w*|"
+    r"tutor\w*|projects?|capstone|assignments?|homework|python|sql|data|machine learning|"
+    r"deep learning|statistic\w*|coding|code|programming|technical|skills?|learn\w*|stud(?:y|ies|"
+    r"ying)|careers?|jobs?|roles?|interview\w*|placements?|hir(?:e|es|ed|ing)|recruit\w*|"
+    r"salar(?:y|ies)|lay[- ]?offs?|laid off|employer|industry|field|alumni|certificat\w*|"
+    r"prices?|pricing|costs?|fees?|pay|paying|payments?|discounts?|offers?|deal|instal+ments?|"
+    r"emi|loan|financ\w*|budget|money|afford\w*|refund\w*|scholarship\w*|dollars?|rupees?|"
+    r"lakhs?|enrol+\w*|sign(?:ing)? up|regist\w*|seats?|spots?|deadlines?|applications?|apply|"
+    r"admissions?|next step|follow[- ]?up|call (?:you )?back|callback|e-?mail\w*|links?|"
+    r"brochure|demo|webinars?|husband|wife|partner|spouse|father|dad|mother|mom|parents|"
+    r"decid\w*|decision|commit\w*|timeline|move forward|ready|months|hours a week|schedule|"
+    r"interview kickstart)\b|\$\s?\d|\d[\d,]{2,}",
+    re.IGNORECASE,
+)
+# The small-talk OBJECTS: food, sport, weather, pets and films (review TANGENT-R1/R2).  Only these
+# make a question small talk ("have you tried that new biryani place?").  "match" is not one ("does
+# that match what you were hoping for?"), nor is "eat into" ("would it eat into your evenings?").
+_SMALL_TALK_OBJECT = re.compile(
+    r"\b(?:weather|rain\w*|pour\w*|drizzl\w*|sunny|snow\w*|monsoon|humid\w*|storm\w*|"
+    r"cold outside|hot (?:today|outside|out there)|game(?! plan| changer)|cricket|football|"
+    r"soccer|ipl|world cup|tennis|food|snacks?|biryani|pizza|dosa|restaurant|cafe|coffee|tea|"
+    r"chai|hungry|starving|eat(?! into| up)|ate|eaten|cook\w*|recipe|dogs?|cats?|pets?|puppy|"
+    r"movies?|films?|netflix|songs?|music|concert)\b",
+    re.IGNORECASE,
+)
+# The softer signs of a tangent: a time of day, the weekend, travel, a festival, an aside marker.
+# They make a TURN a tangent only when no sentence of it asks about her situation or her time (a
+# probe, a dig or ``_ABOUT_HER_TIME``): "Over the weekend, how much time could you put in?" is
+# discovery.  A laugh word ("haha", "lol", "funny", "kidding") is a filler and no sign at all.
+_SMALL_TALK_SOFT = re.compile(
+    r"\b(?:lunch|dinner|breakfast|neighbou?rs?|traffic|commute|weekend|holidays?|vacation|trip|"
+    r"travel\w*|festival|diwali|christmas|hobb(?:y|ies)|for fun|a joke|off[- ]topic|unrelated|"
+    r"random (?:question|thought)|side note|on a different note|changing the subject|drifting|"
+    r"sidetracked|tangent|how(?:'s| is| was) your (?:day|weekend|morning|evening)|plans for|"
+    r"where are you from|where do you live)\b",
+    re.IGNORECASE,
+)
+# A question about her week, her time or a slot: scheduling or discovery, never small talk.
+_ABOUT_HER_TIME = re.compile(
+    r"\bhow (?:much|many) (?:time|hours?|days?|evenings?|nights?)\b|\b(?:free|spare) time\b|"
+    r"\bhours?\b|\b(?:in|per|a) (?:week|day)\b|\bset aside\b|\bcarve out\b|\bsqueeze\b|"
+    r"\bfit (?:it|this|that) in\b|\bget in the way\b|\b(?:are|be|is) you free\b|"
+    r"\bfree (?:on|this|next|in|at|for|after|before)\b|\bslots?\b|\bavailab\w*|"
+    r"\b(?:mon|tues|wednes|thurs|fri|satur|sun)days?\b|\bworks? (?:for|best)\b|\bsuits? you\b|"
+    r"\byour (?:week|weeks|weekdays?|evenings?|mornings?|days?|routine|calendar)\b|"
+    r"\bwhat time\b|\bwhen (?:are|would|could|can|will) you\b",
+    re.IGNORECASE,
+)
+_STEERS_BACK = re.compile(
+    r"\bwhere were we\b|\b(?:back|get back|getting back|coming back|come back) to (?:the|what|"
+    r"you|it|business|our)\b|\banyway,? (?:so|back)\b",
+    re.IGNORECASE,
+)
+
+
+def is_small_talk(text: object) -> bool:
+    """True when ``text`` (one question) is about a small-talk object (``_SMALL_TALK_OBJECT``:
+    food, sport, weather, pets, films), with no word of the course, the sale or her decision and
+    nothing about her time (``_ABOUT_HER_TIME``)."""
+    folded = fold(text)
+    return (
+        _SMALL_TALK_OBJECT.search(folded) is not None
+        and _COURSE_TALK.search(folded) is None
+        and _ABOUT_HER_TIME.search(folded) is None
+    )
+
+
+def is_tangent(text: object) -> bool:
+    """True when the advisor's whole turn left the sale for a moment and did not steer back to it
+    ("Anyway, where were we?").
+
+    The turn has a small-talk object or a softer sign (``_SMALL_TALK_SOFT``; a laugh word alone is
+    none), no word of the course, the sale or her decision, and no question about her situation:
+    no probe or dig (``detect_probes`` and ``asks_about_learner``, small-talk objects skipped) and
+    no question about her week, her time or a slot (``_ABOUT_HER_TIME``).  Review TANGENT-R2:
+    "Haha, fair enough. So what worries you most?", "Does that match what you were hoping for?"
+    and "Would a weekend slot make it easier at home?" are the sale.
+    """
+    folded = fold(text)
+    if _COURSE_TALK.search(folded) is not None or _STEERS_BACK.search(folded) is not None:
+        return False
+    if _SMALL_TALK_OBJECT.search(folded) is None and _SMALL_TALK_SOFT.search(folded) is None:
+        return False
+    if _ABOUT_HER_TIME.search(folded) is not None:
+        return False  # "check with him over the weekend, and we'll book Monday or Tuesday"
+    return not (detect_probes(text, small_talk=True) or asks_about_learner(text, small_talk=True))
+
+
+def detect_probes(text: object, *, small_talk: bool = False) -> frozenset[str]:
     """Topics the candidate genuinely asked about in ``text``.
 
     Only question-like sentences are examined, so a statement such as "Interview
-    Kickstart was founded in 2014" or "Thanks for your time" can never match.
+    Kickstart was founded in 2014" or "Thanks for your time" can never match.  ``small_talk``
+    (simulation adaptability, the engine's R1_TANGENT) skips a small-talk question ("Have you
+    tried that new biryani place?" is no question about what she tried before).
     """
     found: set[str] = set()
     for sentence in split_sentences(text):
         if not is_question_like(sentence):
+            continue
+        if small_talk and is_small_talk(sentence):
             continue
         lowered = fold(sentence).lower()
         if not _is_probe_shaped(lowered):
@@ -1073,18 +1237,32 @@ def _is_probe_shaped(lowered: str) -> bool:
     )
 
 
-def detect_followup(text: object) -> bool:
+# Simulation diagnosis 2 (ND2; the engine's R1_DIG_FIRST, ``detect_followup(wide=True)``): "What
+# made it fizzle out?" and "was it mostly that nobody checked in on you?" pick up what she just
+# said.
+_FOLLOWUP_WIDE = re.compile(
+    r"\bwhat made (?:it|that|this)\b"
+    r"|\b(?:was|is) it (?:mostly|mainly|more|really|just) (?:the|that|because|about)\b"
+    r"|\bwhat went wrong\b|\bwhy did (?:it|that) (?:stop|fizzle|fall apart|not work|end)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_followup(text: object, *, wide: bool = False) -> bool:
     """True when the candidate asks the learner to say more about what they just said.
 
     Only a question or an imperative addressed to the learner counts; a statement that
-    happens to contain "an example" or "elaborate" is the advisor's pitch.
+    happens to contain "an example" or "elaborate" is the advisor's pitch.  ``wide`` (ND2) reads
+    the follow-ups worded about her own account (``_FOLLOWUP_WIDE``) as well.
     """
     for sentence in split_sentences(text):
         folded = fold(sentence)
         if _FOLLOWUP_IMPERATIVE.match(folded.strip()):
             return True
         if is_question_like(folded) and (
-            _FOLLOWUP.search(folded) or _FOLLOWUP_REFERENCING.search(folded)
+            _FOLLOWUP.search(folded)
+            or _FOLLOWUP_REFERENCING.search(folded)
+            or (wide and _FOLLOWUP_WIDE.search(folded))
         ):
             return True
     return False
@@ -1104,7 +1282,7 @@ _THIRD_PARTY = re.compile(
 )
 
 
-def asks_about_learner(text: object) -> bool:
+def asks_about_learner(text: object, *, small_talk: bool = False) -> bool:
     """True when the advisor digs: a question about the learner's situation or the people in it.
 
     A question counts when a probe rule reads it as one (``detect_probes``), when it asks the
@@ -1113,10 +1291,13 @@ def asks_about_learner(text: object) -> bool:
     advisor's own answer, an offer or a choice between plans.  It is wider than the probe rules on
     purpose: those miss the questions about the husband and the father that two owed objections
     answered in the live sweep (R1-Q iteration 2).  The engine holds back a move that no deadline
-    forces for ONE turn when this is true.
+    forces for ONE turn when this is true.  ``small_talk`` (the engine's R1_TANGENT) skips a
+    small-talk question (``is_small_talk``): "have you tried that new biryani place?" is no dig.
     """
     for sentence in split_sentences(text):
         if not is_question_like(sentence):
+            continue
+        if small_talk and is_small_talk(sentence):
             continue
         lowered = fold(sentence).lower()
         if not _is_probe_shaped(lowered) or call_proposal_in(sentence) is not None:

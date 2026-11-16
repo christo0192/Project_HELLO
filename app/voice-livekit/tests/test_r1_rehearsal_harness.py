@@ -1278,6 +1278,12 @@ def fake_record(level, *, fails=(), commitment="MEDIUM", slips=None, **extra):
         "exact_repeat_extra": 0,
         "needs_dug": ["H1"],
         "needs_disclosed_after_dig": ["H1"],
+        # The engine's needs ledger agrees (diagnosis 2, D2-ND1) and the guard blocked no commitment.
+        "needs_dug_confirmed": ["H1"],
+        "needs_disclosed_confirmed": ["H1"],
+        "harness_only_digs": [],
+        "commitment_guard_hits": 0,
+        "commitment_spoken_leaks": 0,
         "unprompted_dump_count": 0,
         "misfire_count": 0,
         "commitment_hits_after_commitment": 0,
@@ -2193,6 +2199,82 @@ class IterationTwoHarnessTests(unittest.TestCase):
                 ]
                 self.assertFalse(metrics.commitment_metrics(exchanges, admin)["commitment_earned"], text)
 
+    def test_a_pencilled_in_or_weekend_call_earns_the_commitment(self) -> None:
+        # D5-HF-UNEARNED2: "pencil you in" and "a weekend call" are next-step asks (synthetic text).
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        plan = {"resolves": True, "commitment_level": "MEDIUM", "delivered_commitment": True}
+        for text in (
+            "Seats go fast this month. Shall I pencil you in for a Sunday slot and confirm later?",
+            "Since that helps, shall I pencil in a weekend call with your sister so you can decide together?",
+            "Would a Tuesday or Friday call suit the two of you?",
+            "Could we catch up over the phone once your brother has had a look?",
+            "I can put you down for a quick evening session with a mentor, how does that sound?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(metrics.advisor_asked_next_step({"intent": "answer_objection", "text": text}), text)
+                exchanges = [
+                    exchange(1, 800, text, "answer_objection"),
+                    exchange(2, 820, "Great.", "other", spoken="Okay, let's do that.", plan=plan),
+                ]
+                found = metrics.commitment_metrics(exchanges, admin)
+                self.assertTrue(found["commitment_earned"], text)
+                self.assertNotIn("unearned_commitment", metrics.hard_fails(found))
+
+    def test_a_day_or_a_rough_call_is_still_no_ask(self) -> None:
+        for text in (
+            "I'll call it a day after this one, shall I?",
+            "That call was rough, would you agree?",
+            "I see, that sounds like a long week.",
+            "Our live classes run as a weekend session.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": text}), text)
+
+    def test_a_decision_call_or_a_class_description_is_no_ask_even_as_a_question(self) -> None:
+        # D5R-NS2-WILDCARD: these end in "?" or speak in the offering voice, so only the words decide.
+        # "call" as a decision, a past or sales call, a work meeting, and the way classes are described.
+        for text in (
+            "Honestly, joining this batch is a smart call, right?",
+            "Prices go up next month, so it is a wise call to decide now, no?",
+            "Was that a rough call with your manager?",
+            "Is this feeling like another sales call?",
+            "Do you have a team meeting every morning?",
+            "Is your Monday meeting the problem?",
+            "Do you have a Monday meeting at work?",
+            "I'll walk you through what a typical Saturday session looks like.",
+            "Every morning session is recorded, would that help?",
+            "I hear you, the weekday evening session timing is tough, right?",
+            "We run a weekend session every week, would that work around your shifts?",
+            "That was a good call, wasn't it?",
+        ):
+            for intent in ("pitch", "other"):
+                with self.subTest(text=text, intent=intent):
+                    self.assertFalse(metrics.advisor_asked_next_step({"intent": intent, "text": text}), text)
+
+    def test_a_named_call_or_a_session_for_you_still_earns_the_commitment(self) -> None:
+        # The closed qualifiers still take a real ask (synthetic text).
+        for text in (
+            "How about a quick phone call on Saturday morning?",
+            "Shall we fix a Saturday morning chat with your husband?",
+            "Would another weekend call help you both decide?",
+            "I'll put you down for a Sunday session.",
+            "Would a weekend session with one of our mentors help?",
+            "Can we try a short evening session for you this week?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(metrics.advisor_asked_next_step({"intent": "pitch", "text": text}), text)
+
+    def test_off_restores_the_previous_next_step_words(self) -> None:
+        import os
+        from unittest import mock
+
+        from rehearsal.flags import NEXT_STEP_V2
+
+        text = "Shall I pencil you in for a weekend slot and confirm later?"
+        with mock.patch.dict(os.environ, {NEXT_STEP_V2: "0"}):
+            self.assertFalse(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
+        self.assertTrue(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
+
     def test_the_advisor_tag_alone_is_still_enough(self) -> None:
         self.assertTrue(metrics.advisor_asked_next_step({"intent": "close_ask", "text": "Okay."}))
         self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": "Okay."}))
@@ -2757,6 +2839,840 @@ class FinalReviewRoundOneHarnessTests(unittest.TestCase):
         ]
         first = metrics.disclosure_metrics(self.PERSONA, early)
         self.assertEqual(first["unprompted_dump_count"], 1)  # only the first telling is a dump
+
+
+class BunchingGridTests(unittest.TestCase):
+    """M032 S1 item 8: the bunching grid (advisor patterns x 20-65 s an exchange) with the S1 flags
+    off and on.  With them on no gated run may turn late or excluded, use the forced path more than
+    ``FORCED_TOLERANCE`` times more, or lose the time cue; and the families spread later at the
+    owner's pace instead of bunching on the first turn the rules allow.  Flags off is the behaviour
+    of origin/main (checked by hand against a main checkout when the grid was added).  Since M032
+    S2 "off" is every S1 and S2 flag off and "on" every one on (``all_flags``): the S2 flags default
+    on, so the S1 flags alone off would no longer be origin/main."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        cls.off = bunching_grid.run_grid(bunching_grid.all_flags("0"))
+        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"))
+        cls.steps_off = bunching_grid.run_steps(bunching_grid.all_flags("0"))
+        cls.steps_on = bunching_grid.run_steps(bunching_grid.all_flags("1"))
+
+    def test_no_gated_run_gets_worse(self):
+        """Including the learner who names her decision maker when asked (review S1-R1: one stall
+        she volunteered at 50-65 s an exchange pushed F2 past its slip limit)."""
+        self.assertIn("decider", self.grid.GATED_PATTERNS)
+        self.assertEqual(self.grid.regressions(self.off, self.on), [])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        """Review S1-R2: the S1 waits spend slack at the owner's pace, so a candidate who then slows
+        to 55-80 s an exchange may land a family later than before, but never so late that the
+        attempt loses its score (no new exclusion) or its time cue."""
+        self.assertEqual(self.grid.gate_regressions(self.steps_off, self.steps_on), [])
+
+    def test_every_family_lands_by_ten_minutes_at_the_owner_s_pace(self):
+        """Review S1R-4: a stop from R 10:00 is scored only with every family delivered, so where
+        the release before S1 finished by 10:00, S1 does too.
+
+        M032 S2P (review S2P-R3, D-M032-7): a probe costs an exchange by design, and R 10:00 no
+        longer switches the probes off (only the family deadlines do), so a run in which she asked
+        a probe may finish after 10:00; those runs are listed, not gated (2026-11-12: questioner
+        and pushy at 35 s, R 580 and 545 -> 650; reported to the owner).  No family is late in
+        them (``test_no_gated_run_gets_worse``)."""
+        later = []
+        for item in self.on:
+            base = next(
+                r for r in self.off if (r.pattern, r.pace) == (item.pattern, item.pace)
+            )
+            if base.last_r is not None and base.last_r <= 600:
+                if item.probes and (item.last_r is None or item.last_r > 600):
+                    later.append(f"{item.pattern}@{item.pace:.0f}: {base.last_r:.0f} -> {item.last_r}")
+                    continue
+                with self.subTest(pattern=item.pattern, pace=item.pace):
+                    self.assertLessEqual(item.last_r, 600)
+        print("\nprobe runs finishing after R 10:00: " + ("; ".join(later) or "none"))
+        self.assertLessEqual(len(later), 3)
+
+    def test_the_forced_path_is_not_used_more_often(self):
+        off = self.grid.totals(self.off)
+        on = self.grid.totals(self.on)
+        self.assertLessEqual(on["forced_moves"], off["forced_moves"])
+        self.assertLessEqual(on["late_runs"], off["late_runs"])
+        self.assertLessEqual(on["excluded_runs"], off["excluded_runs"])
+        self.assertLessEqual(on["cue_missing"], off["cue_missing"])
+
+    def test_the_families_spread_later_at_the_owner_s_pace(self):
+        def last(results, pattern, pace):
+            return next(r.last_r for r in results if (r.pattern, r.pace) == (pattern, pace))
+
+        for pattern in ("questioner", "offerer", "owner_shape"):
+            for pace in (20.0, 25.0):
+                with self.subTest(pattern=pattern, pace=pace):
+                    self.assertGreater(last(self.on, pattern, pace), last(self.off, pattern, pace))
+        for item in self.on:
+            with self.subTest(pattern=item.pattern, pace=item.pace):
+                self.assertGreaterEqual(item.last_r, last(self.off, item.pattern, item.pace))
+
+    def test_an_unforced_push_follows_a_reaction_where_the_plan_has_slack(self):
+        """SWEEP-1 (R1_PUSH_AFTER_REACTION): with the flags on far fewer unforced pushes come on the
+        line right after their primary at 35 s or faster, and at 20-25 s none does for the
+        patterns that leave the plan its slack.  The offerer's respond-first holds spend the slack
+        (its F3 push at 25 s has no turn to spare), and at 35 s the plan often has none
+        (``_may_hold``): there the push is raised at once, as before."""
+        off = self.grid.pushes_without_reaction(self.off)
+        on = self.grid.pushes_without_reaction(self.on)
+        self.assertLess(len(on), len(off) // 2)
+        slack = ("cooperative", "pitcher", "terse", "questioner")
+        fast = [
+            item
+            for item in on
+            if item.split("@")[0] in slack and float(item.split("@")[1].split(":")[0]) <= 25
+        ]
+        self.assertEqual(fast, [])
+
+    def test_flags_off_waits_for_no_moment(self):
+        self.assertEqual(sum(item.waits for item in self.off), 0)
+        self.assertGreater(sum(item.waits for item in self.on), 0)
+
+
+class S2BunchingGridTests(unittest.TestCase):
+    """M032 S2 (learner voice): the grid with S1 on and the S2 flags off, against every flag on.
+    The S2 voice notes steer wording, but SWEEP-3's volunteered stall spaces the next objection
+    (``note_objection`` is global) and SWEEP-12 moves the curiosity hand-over, so no gated run may
+    get worse, the forced path is not used more, and the ``pushy`` advisor (she volunteers the
+    not-today stall when asked to enrol today) leaves no family late that main did not."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        s2p_off = {name: "0" for name in bunching_grid.S2P_FLAGS}
+        cls.s1 = bunching_grid.run_grid({**bunching_grid.s2_flags("0"), **s2p_off})
+        cls.on = bunching_grid.run_grid(bunching_grid.s2p_flags("0"))
+        cls.main = bunching_grid.run_grid(bunching_grid.all_flags("0"), patterns=("pushy",))
+
+    def test_no_gated_run_gets_worse_than_with_s1_alone(self):
+        self.assertEqual(self.grid.regressions(self.s1, self.on), [])
+        s1 = self.grid.totals(self.s1)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], s1[key])
+
+    def test_the_pushy_advisor_leaves_no_family_newly_late(self):
+        on = {item.pace: item for item in self.on if item.pattern == "pushy"}
+        for base in self.main:
+            with self.subTest(pace=base.pace):
+                item = on[base.pace]
+                self.assertLessEqual(
+                    set(item.late) | set(item.excluded), set(base.late) | set(base.excluded)
+                )
+                self.assertLessEqual(item.forced, base.forced + self.grid.FORCED_TOLERANCE)
+
+    def test_the_scripted_learner_still_asks_when_handed_a_rotated_label(self):
+        """SWEEP-12's phrases are mapped to the same questions, so the cooperative advisor still
+        answers her curiosity as before."""
+        for phrases in self.grid.CURIOSITY_LABELS_V2.values():
+            for phrase in phrases:
+                self.assertIn(phrase, self.grid.CURIOSITY_LABEL_QUESTIONS)
+
+
+class S2PBunchingGridTests(unittest.TestCase):
+    """M032 S2P (probe first, S2 item 10): the probe adds an exchange per fact-based family, so the
+    grid with S1 and S2 on and the S2P flags off is compared with every flag on.  No gated run may
+    turn late or excluded or use the forced path more than ``FORCED_TOLERANCE`` times more, the
+    forced path is not used more in total, and the step rows lose no score.  ``answerer`` (an
+    advisor who answers her price and time questions) shows the probe-then-react path."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        every = tuple(bunching_grid.PATTERNS)
+        cls.s2 = bunching_grid.run_grid(bunching_grid.s2p_flags("0"), patterns=every)
+        cls.on = bunching_grid.run_grid(bunching_grid.all_flags("1"), patterns=every)
+        cls.steps_s2 = bunching_grid.run_steps(bunching_grid.s2p_flags("0"))
+        cls.steps_on = bunching_grid.run_steps(bunching_grid.all_flags("1"))
+
+    def test_no_gated_run_gets_worse_and_the_forced_path_is_not_used_more(self):
+        self.assertEqual(self.grid.regressions(self.s2, self.on), [])
+        s2 = self.grid.totals(self.s2)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], s2[key])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        self.assertEqual(self.grid.gate_regressions(self.steps_s2, self.steps_on), [])
+
+    def test_she_still_probes_at_slower_paces(self):
+        """Review S2P-R3: the R 10:00 bound switched the probe off from 35 s an exchange (0 F1 and
+        F2 probes in 33 runs) and the anchor checked the website's price unprompted instead."""
+        print("\n" + self.grid.probe_table(self.on))
+        at = {pace: [item for item in self.on if item.pace == pace] for pace in self.grid.PACES}
+        self.assertTrue(any(item.probes.get("F1") for item in at[35.0]))
+        self.assertTrue(any(item.probes.get("F2") for item in at[35.0]))
+        for pace in (20.0, 25.0):
+            with self.subTest(pace=pace):
+                self.assertEqual([i.pattern for i in at[pace] if i.unprompted_check], [])
+        slow = [item for pace in (35.0, 50.0, 65.0) for item in at[pace]]
+        self.assertLessEqual(sum(1 for item in slow if item.unprompted_check), 5)
+
+    def test_the_probe_then_react_path_lands_every_family_at_the_owner_s_pace(self):
+        for item in self.on:
+            if item.pattern == "answerer" and item.pace <= 35:
+                with self.subTest(pace=item.pace):
+                    self.assertEqual(item.late, [])
+                    self.assertEqual(item.excluded, [])
+                    self.assertTrue(all(value is not None for value in item.delivered.values()))
+
+
+class AdaptBunchingGridTests(unittest.TestCase):
+    """Simulation adaptability (R1_TANGENT, R1_STALL_GAP): the gated patterns and the advisor who
+    goes off the subject every third turn (``tangent``), with the two flags off against on.  No
+    run may turn late or excluded or use the forced path more, and the step rows lose no score."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rehearsal import bunching_grid
+
+        cls.grid = bunching_grid
+        cls.names = (*bunching_grid.GATED_PATTERNS, "tangent")
+        off = {name: "0" for name in bunching_grid.ADAPT_FLAGS}
+        on = {name: "1" for name in bunching_grid.ADAPT_FLAGS}
+        cls.off = bunching_grid.run_grid(off, patterns=cls.names)
+        cls.on = bunching_grid.run_grid(on, patterns=cls.names)
+        cls.steps_off = bunching_grid.run_steps(off, patterns=cls.names)
+        cls.steps_on = bunching_grid.run_steps(on, patterns=cls.names)
+
+    def test_no_run_gets_worse(self):
+        self.assertEqual(self.grid.regressions(self.off, self.on, patterns=self.names), [])
+        off = self.grid.totals(self.off)
+        on = self.grid.totals(self.on)
+        for key in ("forced_moves", "late_runs", "excluded_runs", "cue_missing"):
+            with self.subTest(key=key):
+                self.assertLessEqual(on[key], off[key])
+
+    def test_a_mid_call_slowdown_costs_no_score(self):
+        self.assertEqual(self.grid.gate_regressions(self.steps_off, self.steps_on), [])
+
+
+class FinalPriceReaskSim2Tests(unittest.TestCase):
+    """Simulation diagnosis 2 (HF3, harness): the price asked twice in one reply is a repeat; a
+    re-ask right after an advisor turn that only acknowledged it is not.  Synthetic text."""
+
+    def test_twice_in_one_reply_and_a_reask_after_a_non_answer(self) -> None:
+        found = metrics.final_price_metrics([
+            {"advisor": {"text": "Sure."}, "learner": {"spoken": (
+                "So what's the final price for me? Okay, so what would the final price be?"
+            )}},
+        ])
+        self.assertEqual(found["final_price_asked_twice"], 1)
+        reask = metrics.final_price_metrics([
+            {"advisor": {"text": "We have some scholarships."},
+             "learner": {"spoken": "So what's the final price for me?"}},
+            {"advisor": {"text": "Okay."},
+             "learner": {"spoken": "Sorry, what would the final number be?"}},
+        ])
+        self.assertEqual(reask["final_price_asked_twice"], 0)
+        answered = metrics.final_price_metrics([
+            {"advisor": {"text": "We have some scholarships."},
+             "learner": {"spoken": "So what's the final price for me?"}},
+            {"advisor": {"text": "It would be $8,000 after the scholarship."},
+             "learner": {"spoken": "Is that the final price, then?"}},
+        ])
+        self.assertEqual(answered["final_price_asked_twice"], 1)
+
+
+def _env(**values):
+    return mock.patch.dict("os.environ", values)
+
+
+class DiagnosisTwoHarnessTests(unittest.TestCase):
+    """M032 diagnosis 2, the harness issues (D2-SC1, D2-HF2, D2-ND1, D2-HM1).  Synthetic text only."""
+
+    # --- D2-SC1: the commitment gates count only the calls that had a commitment window
+    @staticmethod
+    def _call(level, commitment, *, stop="farewell_exit", seconds=900.0, hangups=0, in_metrics=True):
+        record = fake_record(level, commitment=commitment, stop_reason=stop, roleplay_seconds=seconds)
+        if in_metrics:
+            record["metrics"]["abuse_hangups"] = hangups
+        else:
+            record["admin_log"] = {"endings": {"abuse_hangups": hangups}}
+        return record
+
+    def _strong_group(self):
+        return [
+            self._call("strong", "MEDIUM"),
+            self._call("strong", "WEAK", seconds=1000.0),
+            self._call("strong", None, stop="end_request", seconds=482.0),
+            self._call("strong", None, stop="wrap_accepted", seconds=383.0, hangups=1),
+        ]
+
+    def test_calls_with_no_commitment_window_leave_the_denominator_and_are_counted(self) -> None:
+        group = scorecard.aggregate_group(self._strong_group())
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.5)
+        self.assertEqual(group["commitment_window_calls"], 2)
+        self.assertEqual(group["commitment_excluded"], 2)
+        self.assertEqual(group["commitment_excluded_reasons"], {"end_request": 1, "abuse_hangup": 1})
+        self.assertAlmostEqual(group["medium_or_better_rate_all"], 0.25)
+
+    def test_the_excluded_count_stands_beside_the_gate(self) -> None:
+        card = scorecard.build_scorecard(self._strong_group(), offline=False)
+        gate = next(g for g in card["gates"] if g["gate"] == "commit_medium")
+        self.assertIn("1/2", gate["note"])
+        self.assertIn("2 excluded", gate["note"])
+        self.assertIn("2 excluded", scorecard.render_markdown(card))
+
+    def test_a_full_length_call_with_no_commitment_still_counts_as_a_miss(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("strong", "MEDIUM"),
+            self._call("strong", None, stop="farewell_exit", seconds=1100.0),
+            self._call("strong", "MEDIUM", stop="end_request", seconds=1000.0),  # booked, then ended
+        ])
+        self.assertEqual(group["commitment_excluded"], 0)
+        self.assertAlmostEqual(group["medium_or_better_rate"], 2 / 3)
+
+    def test_a_role_play_that_ended_before_the_window_is_excluded(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("strong", "MEDIUM"),
+            self._call("strong", None, stop="wrap_accepted", seconds=700.0),
+        ])
+        self.assertEqual(group["commitment_excluded_reasons"], {"ended_before_window": 1})
+        self.assertAlmostEqual(group["medium_or_better_rate"], 1.0)
+
+    def test_the_abuse_hang_up_is_read_from_the_admin_log_too(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("strong", "MEDIUM"),
+            self._call("strong", None, stop="wrap_accepted", seconds=383.0, hangups=1, in_metrics=False),
+        ])
+        self.assertEqual(group["commitment_excluded_reasons"], {"abuse_hangup": 1})
+
+    def test_the_cap_gates_use_the_same_denominator(self) -> None:
+        records = [
+            self._call("average", "MEDIUM"),
+            self._call("average", "MEDIUM"),
+            self._call("average", "WEAK"),
+            *[self._call("average", None, stop="end_request", seconds=400.0) for _ in range(2)],
+        ]
+        group = scorecard.aggregate_group(records)
+        # Stricter: the early ends no longer dilute it (2/5 = 0.4 passed the 0.6 cap; 2/3 does not).
+        self.assertAlmostEqual(group["medium_or_better_rate"], 2 / 3)
+        card = scorecard.build_scorecard(records, offline=False)
+        gate = next(g for g in card["gates"] if g["gate"] == "commit_cap")
+        self.assertEqual(gate["status"], "fail")
+        self.assertIn("2 excluded", gate["note"])
+
+    def test_the_small_group_slack_counts_the_calls_with_a_window(self) -> None:
+        records = [
+            self._call("pushy", "MEDIUM"),
+            *[self._call("pushy", "WEAK") for _ in range(3)],
+            *[self._call("pushy", None, stop="end_request", seconds=300.0) for _ in range(2)],
+        ]
+        gate = next(g for g in scorecard.build_scorecard(records, offline=False)["gates"] if g["gate"] == "commit_cap")
+        self.assertEqual((gate["status"], gate["held_to"]), ("pass", 0.25))
+
+    def test_no_window_at_all_is_not_measured_never_a_pass(self) -> None:
+        records = [self._call("strong", None, stop="end_request", seconds=400.0)]
+        gate = next(g for g in scorecard.build_scorecard(records, offline=False)["gates"] if g["gate"] == "commit_medium")
+        self.assertEqual(gate["status"], "n/a")
+
+    def test_the_commit_window_switch_off_restores_the_old_denominator(self) -> None:
+        with _env(REHEARSAL_COMMIT_WINDOW="0"):
+            group = scorecard.aggregate_group(self._strong_group())
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.25)
+
+    # --- D2-HF2: a blocked commitment is hygiene, a spoken one is the hard fail
+    @staticmethod
+    def _guarded(spoken, *, flagged=False, plan=None, commitment=None):
+        admin = {
+            "guard": {"hits": 1, "leak_hits": 1, "by_category": {"commitment": 1}, "flagged": flagged},
+            "commitment": commitment or {"level": "WEAK", "turn": 30},
+            "turn_map": [{"roleplay_turn": 12, "transcript_turn": 40}],
+        }
+        exchanges = [exchange(12, 600.0, "Would a short call with you both help?", spoken=spoken, plan=plan)]
+        trips = [{"category": "commitment", "turn_index": 40, "rule": "level_medium"}]
+        return metrics.guard_metrics(admin, trips, exchanges)
+
+    def test_a_blocked_commitment_the_candidate_never_heard_is_no_hard_fail(self) -> None:
+        found = self._guarded("I'll let you know after we've read the email. What would the call cover?")
+        self.assertEqual(found["commitment_spoken_leaks"], 0)
+        self.assertEqual(found["commitment_guard_hits"], 1)
+        self.assertNotIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_a_commitment_still_in_the_spoken_text_is_a_hard_fail(self) -> None:
+        for spoken in (
+            "Let's book a call for Thursday then.",
+            "I need to talk to my husband first, so holding a spot sounds fine as long as it doesn't lock me in.",
+            "A call with both of us could work once we've read it.",
+        ):
+            with self.subTest(spoken=spoken):
+                found = self._guarded(spoken)
+                self.assertEqual(found["commitment_spoken_leaks"], 1)
+                self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_the_harness_reader_does_not_read_a_refusal_as_agreement(self) -> None:
+        for spoken in ("I'm not ready to set up a call just yet.", "A call doesn't really work for me this week."):
+            with self.subTest(spoken=spoken):
+                self.assertEqual(metrics._spoken_agreement_level(spoken), metrics.Level.NONE)
+
+    def test_the_scripted_commitment_line_of_the_same_turn_is_within_the_cap(self) -> None:
+        plan = {"delivered_commitment": True, "commitment_level": "MEDIUM", "resolves": True}
+        found = self._guarded("Okay. Let's book a call for Thursday then.", plan=plan)
+        self.assertEqual(found["commitment_spoken_leaks"], 0)
+
+    def test_a_trip_that_cannot_be_matched_to_a_spoken_line_fails_closed(self) -> None:
+        admin = {"guard": {"by_category": {"commitment": 1}, "flagged": False}, "turn_map": []}
+        found = metrics.guard_metrics(admin, [{"category": "commitment", "turn_index": 40}], [])
+        self.assertEqual(found["commitment_spoken_leaks"], 1)
+        self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_the_guard_flag_itself_still_hard_fails(self) -> None:
+        found = self._guarded("I'll think about it.", flagged=True)
+        self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_metrics_without_the_spoken_check_keep_the_old_rule(self) -> None:
+        self.assertIn("guard_flagged", metrics.hard_fails({"commitment_guard_hits": 1}))
+
+    def test_the_spoken_leak_switch_off_restores_the_old_rule(self) -> None:
+        found = self._guarded("I'll let you know after we've read the email.")
+        with _env(REHEARSAL_SPOKEN_LEAKS="0"):
+            self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+    def test_blocked_commitment_attempts_are_an_info_gate(self) -> None:
+        records = [fake_record("strong", commitment_guard_hits=2), fake_record("strong", commitment_guard_hits=1)]
+        card = scorecard.build_scorecard(records, offline=False)
+        gate = next(g for g in card["gates"] if g["gate"] == "commit_blocked")
+        self.assertEqual((gate["severity"], gate["value"], gate["status"]), ("info", 1.5, "info-fail"))
+
+    # --- D2-ND1: a dig is attributed to the topic the question is about
+    @staticmethod
+    def _dug(text, intent="followup", topic=""):
+        return metrics.dug_topics({"text": text, "intent": intent, "topic": topic})
+
+    def test_the_misattributed_questions_of_the_sweep(self) -> None:
+        for text, expected in (
+            ("That makes sense. Have you tried picking up data science before, or is this the first "
+             "time you're seriously looking into it?", ["H2"]),
+            ("Self-study can be tough. What specifically made it fizzle out for you, was it staying "
+             "motivated, or not knowing what to focus on?", ["H2"]),
+            ("What do you think got in the way last time, was it staying consistent, or something else?", ["H2"]),
+            ("Before I get into the details, can I ask what's making you look at data science right now?", ["H1"]),
+            ("So before I dive in, just curious, what got you interested in data science in the first place?", ["H1"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text), expected)
+
+    def test_call_scheduling_questions_naming_the_husband_are_no_h3_dig(self) -> None:
+        for text in (
+            "And when you and your husband talk it through, is there a day this week that might work for a quick follow-up?",
+            "When you and your husband have looked it over, what's the best way to reach you?",
+            "Is there a time this week that works for a quick follow-up call, maybe after you've talked it over with your husband?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("H3", self._dug(text, topic="H3"))
+
+    def test_genuine_probes_keep_their_topic(self) -> None:
+        for text, topic in (
+            ("When you talk it over with your husband, what do you think his main concern would be, the cost or the time?", "H3"),
+            ("Roughly how many hours a week could you carve out?", "H3"),
+            ("Is budget the main thing your husband would want to look at?", "H3"),
+            ("What's driving this right now?", "H1"),
+            ("What is behind the move?", "H1"),
+            ("What's motivating you to do this now?", "H1"),
+            ("And why are you looking into it right now?", "H1"),
+            ("What held you back last time?", "H2"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text, intent="probe"), [topic])
+
+    def test_a_bare_interest_question_is_no_h1_dig(self) -> None:
+        self.assertEqual(self._dug("Are you interested in switching careers?", intent="probe"), [])
+
+    def test_the_old_vocabulary_is_back_with_the_switch_off(self) -> None:
+        text = "Have you tried picking up data science before, or is this the first time you're seriously looking into it?"
+        with _env(REHEARSAL_PROBE_VOCAB_V2="0"):
+            self.assertEqual(self._dug(text), ["H1", "H2", "H3"])
+
+    def test_harness_only_digs_are_reported_beside_the_engine_ledger(self) -> None:
+        admin = {"needs": [
+            {"topic": "H1", "followup_turn": None},
+            {"topic": "H2", "followup_turn": 4},
+            {"topic": "H3", "followup_turn": 9},
+        ]}
+        found = metrics.engine_dig_metrics(admin, ["H1", "H2"], ["H2"])
+        self.assertEqual(found["needs_dug_engine"], ["H2", "H3"])
+        self.assertEqual(found["harness_only_digs"], ["H1"])
+        self.assertEqual(found["engine_only_digs"], ["H3"])
+        self.assertEqual(found["needs_dug_confirmed"], ["H2"])
+        self.assertEqual(found["needs_disclosed_confirmed"], ["H2"])
+        self.assertIsNone(metrics.engine_dig_metrics({}, ["H1"], [])["harness_only_digs"])
+
+    def test_the_disclosure_gate_still_scores_every_harness_dig(self) -> None:
+        record = fake_record(
+            "strong", needs_dug=["H1", "H2"], needs_disclosed_after_dig=["H2"],
+            needs_dug_confirmed=["H2"], needs_disclosed_confirmed=["H2"], harness_only_digs=["H1"],
+        )
+        card = scorecard.build_scorecard([record], offline=False)
+        group = card["aggregate"]["strong"]
+        self.assertAlmostEqual(group["disclosure_rate"], 0.5)
+        self.assertAlmostEqual(group["disclosure_rate_engine_confirmed"], 1.0)
+        self.assertEqual(group["harness_only_digs_total"], 1)
+        self.assertIsNone(group["engine_only_digs_total"])  # the fixture has no engine-only field
+        statuses = {g["gate"]: (g["severity"], g["status"]) for g in card["gates"] if g["level"] == "strong"}
+        self.assertEqual(statuses["disclosure"], ("gate", "fail"))
+        self.assertEqual(statuses["harness_only_digs"], ("info", "info-fail"))
+        self.assertIn("harness-only digs", scorecard.render_markdown(card))
+
+    # --- D2-HM1: an "other" misfire must cite the advisor turn and a reason
+    @staticmethod
+    def _misfire_record():
+        return {
+            "header": {"persona_id": "p1_career_switcher", "persona_variant": "v1", "seed": "s"},
+            "exchanges": [
+                exchange(1, 10.0, "I'm the one buying here, not you.", spoken="So how would monthly instalments work?"),
+                exchange(2, 30.0, "The course is six months.", spoken="Six months is longer than I thought."),
+            ],
+        }
+
+    @staticmethod
+    def _verdict(*misfires):
+        return {
+            "objections": [], "disclosures": [], "ignored_advisor_offers": [], "stall_loop": False,
+            "style": {key: 3 for key in judge.STYLE_KEYS}, "misfires": list(misfires),
+        }
+
+    def test_an_uncited_other_misfire_is_rejected(self) -> None:
+        verdict = self._verdict(
+            {"turn": 1, "kind": "other", "quote": "monthly instalments", "advisor_turn": 1,
+             "reason": "ignores the role mix-up"},
+            {"turn": 2, "kind": "other", "quote": "longer than I thought", "advisor_turn": None, "reason": "x"},
+            {"turn": 2, "kind": "other", "quote": "longer than I thought", "advisor_turn": 2, "reason": ""},
+            {"turn": 1, "kind": "other", "quote": "monthly instalments", "advisor_turn": 2, "reason": "later turn"},
+        )
+        checked = judge.validate_misfires(verdict, self._misfire_record())
+        self.assertEqual([(m["turn"], m["advisor_turn"]) for m in checked["misfires"]], [(1, 1)])
+        self.assertEqual([m["rejected"] for m in checked["misfires_rejected"]], ["uncited"] * 3)
+
+    def test_a_live_verdict_without_a_citation_is_rejected_after_parsing(self) -> None:
+        raw = json.dumps(self._verdict({"turn": 2, "kind": "other", "quote": "longer than I thought"}))
+        checked = judge.validate_misfires(judge.parse_verdict(raw), self._misfire_record())
+        self.assertEqual([m["rejected"] for m in checked["misfires_rejected"]], ["uncited"])
+
+    def test_a_stored_verdict_from_before_the_citation_keeps_the_old_rule(self) -> None:
+        verdict = self._verdict({"turn": 2, "kind": "other", "quote": "longer than I thought"})
+        checked = judge.validate_misfires(verdict, self._misfire_record())
+        self.assertEqual(len(checked["misfires"]), 1)
+
+    def test_the_parser_keeps_the_citation_and_the_rubric_asks_for_it(self) -> None:
+        raw = json.dumps(self._verdict(
+            {"turn": 3, "kind": "other", "quote": "q", "advisor_turn": 3, "reason": "answers a different question"}))
+        item = judge.parse_verdict(raw)["misfires"][0]
+        self.assertEqual((item["advisor_turn"], item["reason"]), (3, "answers a different question"))
+        self.assertIn("advisor_turn", judge.SCHEMA_TEXT)
+        self.assertIn("advisor_turn", judge.RUBRIC)
+
+    def test_the_citation_switch_off_keeps_uncited_misfires(self) -> None:
+        verdict = judge.parse_verdict(json.dumps(self._verdict({"turn": 2, "kind": "other", "quote": "longer than I thought"})))
+        with _env(REHEARSAL_CITED_MISFIRES="0"):
+            checked = judge.validate_misfires(verdict, self._misfire_record())
+        self.assertEqual(len(checked["misfires"]), 1)
+
+    def test_judge_and_rule_misfires_are_separate_rows_and_one_call_is_capped(self) -> None:
+        heavy = fake_record("pushy", misfire_count=1)
+        heavy["judge"]["metrics"].update(judge_misfire_count=12, judge_misfires_rejected=2)
+        light = fake_record("pushy", misfire_count=0)
+        group = scorecard.aggregate_group([heavy, light])
+        self.assertAlmostEqual(group["misfires_per_call"], 2.5)  # 12 capped at 5, plus 0
+        self.assertAlmostEqual(group["misfires_per_call_uncapped"], 6.0)
+        self.assertAlmostEqual(group["judge_misfires_per_call"], 6.0)
+        self.assertAlmostEqual(group["rule_misfires_per_call"], 0.5)
+        self.assertAlmostEqual(group["judge_misfires_rejected_per_call"], 1.0)
+        card = scorecard.build_scorecard([heavy, light], offline=False)
+        statuses = {g["gate"]: (g["severity"], g["status"]) for g in card["gates"] if g["level"] == "pushy"}
+        self.assertEqual(statuses["misfires"], ("gate", "fail"))  # the cap never lets the group pass
+        self.assertEqual(statuses["misfires_uncapped"], ("info", "info-fail"))
+        text = scorecard.render_markdown(card)
+        self.assertIn("judge misfires / call", text)
+        self.assertIn("rule misfires / call", text)
+
+    def test_the_scripted_judge_cites_its_misfires(self) -> None:
+        record = self._misfire_record()
+        record["metrics"] = {"misfires": [{"exchange": 2, "kind": "time_cue_reversed"}]}
+        result = asyncio.run(judge.ScriptedRubricJudge().judge(record))
+        item = result["verdict"]["misfires"][0]
+        self.assertEqual((item["advisor_turn"], item["reason"]), (2, "time_cue_reversed"))
+
+
+class DiagnosisTwoFollowUpTests(unittest.TestCase):
+    """Review of the diagnosis-2 harness checks (HM1, SC1, ND1, HF2).  Synthetic text only."""
+
+    # The rubric and schema the judge was sent before D2-HM1 (sha256 of the committed text).
+    LEGACY_RUBRIC_SHA = "d6231652d3b0e7bc7107a0098f571c7efa9eaae372ef5106ec180aa4564f1e14"
+    LEGACY_SCHEMA_SHA = "5092ac6fbd2b42ca8cf685866e3c275d7cb9b5fa5dd41d3ab23dce497e104158"
+
+    # --- HM1: the citation switch OFF sends the judge the previous prompt, byte for byte
+    @staticmethod
+    def _record():
+        return {
+            "header": {"persona_id": "p1_career_switcher", "persona_variant": "v1", "seed": "s"},
+            "exchanges": [exchange(1, 10.0, "The course is six months.", spoken="That's longer than I thought.")],
+        }
+
+    @staticmethod
+    def _sha(text):
+        import hashlib
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def test_the_citation_switch_off_sends_the_previous_rubric_and_schema(self) -> None:
+        with _env(REHEARSAL_CITED_MISFIRES="0"):
+            system, user = (m["content"] for m in judge.judge_messages(self._record()))
+        self.assertEqual(self._sha(system), self.LEGACY_RUBRIC_SHA)
+        self.assertNotIn("advisor_turn", system)
+        self.assertNotIn("not counted", system)
+        schema = user.split("SCHEMA:\n", 1)[1]
+        self.assertEqual(self._sha(schema), self.LEGACY_SCHEMA_SHA)
+
+    def test_the_citation_switch_on_asks_for_the_citation(self) -> None:
+        system, user = (m["content"] for m in judge.judge_messages(self._record()))
+        self.assertEqual(system, judge.RUBRIC)
+        self.assertIn("advisor_turn", system)
+        self.assertIn("advisor_turn", user.split("SCHEMA:\n", 1)[1])
+
+    def test_a_verdict_parsed_with_the_switch_off_is_not_held_to_a_citation_later(self) -> None:
+        raw = json.dumps(DiagnosisTwoHarnessTests._verdict(
+            {"turn": 1, "kind": "other", "quote": "longer than I thought"}))
+        with _env(REHEARSAL_CITED_MISFIRES="0"):
+            verdict = judge.parse_verdict(raw)
+        self.assertNotIn("advisor_turn", verdict["misfires"][0])
+        checked = judge.validate_misfires(verdict, self._record())  # re-scored with the switch ON
+        self.assertEqual(len(checked["misfires"]), 1)
+
+    # --- SC1: an end request or abuse hang-up after the window opened is no exclusion
+    @staticmethod
+    def _call(commitment, *, stop, seconds, hangups=0):
+        record = fake_record("strong", commitment=commitment, stop_reason=stop, roleplay_seconds=seconds)
+        record["metrics"]["abuse_hangups"] = hangups
+        return record
+
+    def test_an_end_request_after_the_window_opened_still_counts_as_a_miss(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("MEDIUM", stop="farewell_exit", seconds=1000.0),
+            self._call(None, stop="end_request", seconds=990.0),
+        ])
+        self.assertEqual(group["commitment_excluded"], 0)
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.5)
+
+    def test_an_abuse_hang_up_after_the_window_opened_still_counts_as_a_miss(self) -> None:
+        group = scorecard.aggregate_group([
+            self._call("MEDIUM", stop="farewell_exit", seconds=1000.0),
+            self._call(None, stop="wrap_accepted", seconds=900.0, hangups=1),
+        ])
+        self.assertEqual(group["commitment_excluded"], 0)
+        self.assertAlmostEqual(group["medium_or_better_rate"], 0.5)
+
+    def test_an_end_request_before_the_window_keeps_its_reason(self) -> None:
+        for stop, seconds, hangups, reason in (
+            ("end_request", 776.5, 0, "end_request"),
+            ("wrap_accepted", 383.0, 1, "abuse_hangup"),
+        ):
+            with self.subTest(stop=stop):
+                record = self._call(None, stop=stop, seconds=seconds, hangups=hangups)
+                self.assertEqual(scorecard.commitment_exclusion(record, record["metrics"]), reason)
+
+    # --- ND1: a compound dig keeps each clause's topic; the calendar needs a contact word
+    @staticmethod
+    def _dug(text):
+        return metrics.dug_topics({"text": text, "intent": "probe", "topic": ""})
+
+    def test_each_coordinated_question_keeps_its_topic(self) -> None:
+        for text, expected in (
+            ("What made you start looking, and is cost a worry?", ["H1", "H2"]),
+            ("When would you want to start, and how would you pay for it?", ["H1", "H3"]),
+            ("What got you interested, and does your wife support it?", ["H1", "H3"]),
+            ("What's your timeline, and what worries you most?", ["H1", "H2"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text), expected)
+
+    def test_one_clause_with_two_topics_stays_one_dig(self) -> None:
+        text = ("When you talk it over with your husband, what do you think his main concern would be, "
+                "the cost or the time?")
+        self.assertEqual(self._dug(text), ["H3"])
+        text = "Have you tried picking up data science before, or is this the first time you're looking into it?"
+        self.assertEqual(self._dug(text), ["H2"])
+
+    def test_the_int_live_2_questions_keep_their_topic(self) -> None:
+        for text, expected in (
+            ("Have you found free material actually got you interview-ready before?", ["H2"]),
+            ("While I've got you, is there anything else about the format you'd want spelled out?", []),
+            ("Let me check what's possible, but first, what's driving that number for you, is it a hard "
+             "budget ceiling or just what felt reasonable?", ["H3"]),
+            ("But just so I understand, is it the money side you want to sit with, or are you also "
+             "planning to talk it over with someone before deciding?", ["H3"]),
+            ("So is your husband the main one you'd want on board with this, and do you think he'd have "
+             "any particular concerns, like the cost or the time commitment?", ["H3"]),
+            ("Just so I'm not chasing you, roughly which day this week should I expect to hear back?", []),
+            ("What's driving this for you right now?", ["H1"]),
+            ("So what's really got you looking at a switch?", ["H1"]),
+            ("Okay, so what's brought you here, what's the friction or the blocker in your career?", ["H1"]),
+            ("Would that be useful to have in hand before you go?", []),
+            ("What worries you most about going back to studying?", ["H2"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._dug(text), expected)
+
+    def test_how_the_interest_began_is_an_h1_dig(self) -> None:
+        self.assertEqual(self._dug("How did you get interested in data science?"), ["H1"])
+        self.assertEqual(self._dug("Are you interested in switching careers?"), [])
+
+    def test_study_time_this_week_is_an_h3_dig_not_the_calendar(self) -> None:
+        self.assertEqual(self._dug("What time do you have free this week for studying?"), ["H3"])
+        self.assertNotIn("H3", self._dug("Is there a time this week that works for a quick chat with you both?"))
+
+    # --- HF2: the spoken backstop reads day bookings and a negation only near the verb
+    def test_the_spoken_backstop_reads_day_and_seat_bookings(self) -> None:
+        for spoken in (
+            "Sure, let's do Thursday at six.",
+            "Fine, put me down for the call on Friday.",
+            "Okay, book me in for Saturday.",
+            "That's fine, hold the seat for me.",
+            "Honestly I wouldn't mind a call on Monday.",
+            "Never mind, let's book a call on Friday.",
+            "I don't know, let's book a call for Tuesday.",
+        ):
+            with self.subTest(spoken=spoken):
+                self.assertGreaterEqual(metrics._spoken_agreement_level(spoken), metrics.Level.MEDIUM)
+
+    def test_a_negation_next_to_the_verb_still_voids_it(self) -> None:
+        for spoken in (
+            "I don't think we can book a call this week.",
+            "I'd rather not book a call yet.",
+            "Please don't put me down for Friday.",
+            "I'm not ready to set up a call just yet.",
+            "A call doesn't really work for me this week.",
+        ):
+            with self.subTest(spoken=spoken):
+                self.assertEqual(metrics._spoken_agreement_level(spoken), metrics.Level.NONE)
+
+    def test_a_blocked_sentence_with_a_both_miss_remainder_is_a_spoken_leak(self) -> None:
+        admin = {
+            "guard": {"hits": 1, "by_category": {"commitment": 1}, "flagged": False},
+            "commitment": {"level": "WEAK", "turn": 30},
+            "turn_map": [{"roleplay_turn": 12, "transcript_turn": 40}],
+        }
+        exchanges = [exchange(12, 800.0, "Shall we pick a day?", spoken="Okay, book me in for Saturday.")]
+        trips = [{"category": "commitment", "turn_index": 40}]
+        found = metrics.guard_metrics(admin, trips, exchanges)
+        self.assertEqual(found["commitment_spoken_leaks"], 1)
+        self.assertIn("guard_flagged", metrics.hard_fails(found))
+
+
+
+class DiagnosisFourDigTests(unittest.TestCase):
+    """D4-H-DIG1: a dig is engine-confirmed only when the gate released that need at that exchange, and
+    an open invitation to say what is on her mind excuses the reveal that answers it.  Synthetic text."""
+
+    PERSONA = resolve_persona("p1_career_switcher", variant="v1")
+    DEEP = "My plant is being consolidated next year, so I worry."
+
+    @staticmethod
+    def _admin(released: int | None, *, source: str = "rule", hint: int | None = 14, offers=()) -> dict:
+        return {
+            "needs": [
+                {"topic": "H1", "followup_turn": None, "released_turn": None, "probe_source": None},
+                {"topic": "H3", "followup_turn": released, "released_turn": released, "probe_source": source},
+            ],
+            "disclosure": {"H3": {"hint_turn": hint, "deep_offer_turns": list(offers)}},
+        }
+
+    def test_a_dig_the_gate_released_elsewhere_is_not_confirmed(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(33), ["H3"], [], {"H3": [25, 26]})
+        self.assertEqual(found["needs_dug_confirmed"], [])
+        self.assertEqual(found["probe_unreleased"], [{"topic": "H3", "exchanges": [25, 26]}])
+        self.assertEqual(found["needs_dug_engine"], ["H3"])  # the ledger view is unchanged
+
+    def test_a_release_at_the_dig_confirms_it(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(26), ["H3"], ["H3"], {"H3": [25, 26]})
+        self.assertEqual((found["needs_dug_confirmed"], found["needs_disclosed_confirmed"]), (["H3"], ["H3"]))
+        self.assertEqual(found["probe_unreleased"], [])
+
+    def test_a_need_already_released_before_the_dig_is_confirmed(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(12), ["H3"], [], {"H3": [13]})
+        self.assertEqual((found["needs_dug_confirmed"], found["probe_unreleased"]), (["H3"], []))
+
+    def test_the_judge_folds_a_probe_in_one_turn_late(self) -> None:
+        self.assertEqual(metrics.engine_dig_metrics(self._admin(27, source="judge"), ["H3"], [], {"H3": [26]})["needs_dug_confirmed"], ["H3"])
+        self.assertEqual(metrics.engine_dig_metrics(self._admin(27), ["H3"], [], {"H3": [26]})["needs_dug_confirmed"], [])
+
+    def test_a_judge_release_of_a_need_the_rule_probed_first_is_one_turn_late_too(self) -> None:
+        # Review DIG-RELEASED-JUDGE-SOURCE: probe_source names the FIRST probe's source, not the release's.
+        admin = self._admin(26)
+        admin["tracker"] = {"judge": {"applied": 9, "rejected": 0}}
+        found = metrics.engine_dig_metrics(admin, ["H3"], [], {"H3": [25]})
+        self.assertEqual((found["needs_dug_confirmed"], found["probe_unreleased"]), (["H3"], []))
+        # With no judge verdict applied in the call, a release one turn after the dig is still another question.
+        admin["tracker"] = {"judge": {"applied": 0, "rejected": 0}}
+        self.assertEqual(metrics.engine_dig_metrics(admin, ["H3"], [], {"H3": [25]})["needs_dug_confirmed"], [])
+
+    def test_the_dig_turns_are_the_engines_own_role_play_turns(self) -> None:
+        # The harness exchange count drifts from the engine's turn counter when the session splits or
+        # joins candidate turns; the exchange's engine_turn is the one the ledger speaks.
+        exchanges = [
+            tic_exchange(1, "What made you look into this now?", "Things feel uncertain.", intent="probe", topic="H1"),
+            tic_exchange(2, "Tell me more about that?", "Well.", intent="followup", topic="H1"),
+        ]
+        exchanges[0]["engine_turn"], exchanges[1]["engine_turn"] = 1, 3
+        self.assertEqual(metrics.disclosure_metrics(self.PERSONA, exchanges)["dig_exchanges"], {"H1": [3]})
+
+    def test_a_hint_followed_by_a_deep_offer_at_the_dig_confirms_it(self) -> None:
+        found = metrics.engine_dig_metrics(self._admin(33, offers=[25]), ["H3"], [], {"H3": [25]})
+        self.assertEqual(found["needs_dug_confirmed"], ["H3"])
+        no_hint = metrics.engine_dig_metrics(self._admin(33, hint=None, offers=[25]), ["H3"], [], {"H3": [25]})
+        self.assertEqual(no_hint["needs_dug_confirmed"], [])
+
+    def test_the_disclosure_metrics_give_the_dig_exchanges(self) -> None:
+        exchanges = [
+            tic_exchange(1, "What made you look into this now?", "Things feel uncertain.", intent="probe", topic="H1"),
+            tic_exchange(2, "Tell me more about that?", "Well.", intent="followup", topic="H1"),
+        ]
+        self.assertEqual(metrics.disclosure_metrics(self.PERSONA, exchanges)["dig_exchanges"], {"H1": [2]})
+
+    def test_off_keeps_the_topic_level_count(self) -> None:
+        with _env(REHEARSAL_DIG_RELEASED="0"):
+            found = metrics.engine_dig_metrics(self._admin(33), ["H3"], [], {"H3": [25, 26]})
+        self.assertEqual(found["needs_dug_confirmed"], ["H3"])
+        self.assertNotIn("probe_unreleased", found)
+
+    def test_an_open_invitation_excuses_the_reveal(self) -> None:
+        for text in (
+            "I appreciate you being upfront, please go ahead, what's on your mind?",
+            "Go ahead, I'm listening.",
+            "Tell me what's worrying you.",
+        ):
+            with self.subTest(text=text):
+                found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, text, self.DEEP, intent="followup", topic="F4")])
+                self.assertEqual((found["unprompted_dump_count"], found["unprompted_dump_excused"]), (0, 1))
+        with _env(REHEARSAL_OPEN_INVITE="0"):
+            found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "Go ahead, I'm listening.", self.DEEP)])
+        self.assertEqual(found["unprompted_dump_count"], 1)
+        # Review NEW-REGEX-BREADTH (3): "What is on your mind?" is open too; a question about one topic
+        # is no open invitation, so it excuses no reveal of another topic.
+        found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "What is on your mind?", self.DEEP)])
+        self.assertEqual((found["unprompted_dump_count"], found["unprompted_dump_excused"]), (0, 1))
+        for text in ("What's worrying you about the schedule?", "So what's holding you back from the fees?",
+                     "Tell me what's bothering you about the timings."):
+            with self.subTest(text=text):
+                found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, text, self.DEEP)])
+                self.assertEqual(found["unprompted_dump_excused"], 0)
+        # A statement with no invitation still counts as a dump.
+        found = metrics.disclosure_metrics(self.PERSONA, [tic_exchange(1, "The program runs six months.", self.DEEP)])
+        self.assertEqual(found["unprompted_dump_count"], 1)
 
 
 if __name__ == "__main__":
