@@ -833,4 +833,3 @@ class TestDiagnosis5Agenda(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
                     self.assertEqual(r1_script.active_line_id(line_id), line_id)
                     self.assertFalse(r1_script.agenda_w3_enabled())
-
