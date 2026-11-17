@@ -34,6 +34,8 @@ from r1_latency import (
 )
 
 _ENV_KEYS = (
+    "R1_VAD_ENDPOINT_ANCHOR",
+    "R1_ENDPOINT_VAD_MIN_DELAY_SEC",
     "R1_ENDPOINT_MIN_DELAY_SEC",
     "R1_ENDPOINT_MAX_DELAY_SEC",
     "R1_INTERRUPT_MIN_DURATION_SEC",
@@ -78,6 +80,114 @@ class Lines:
         return found[0]
 
 
+class TestLatencySummary(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock, self.lines = Clock(), Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+
+    def emit(self, value: float) -> None:
+        self.tracker._emit_checked("llm_ttft", value, category="reply", phase="roleplay", index=1)
+
+    def records(self) -> list[str]:
+        return [json.dumps(dict(component="r1", error_type="r1_latency", schema=s,
+                                duration_sec=v, error_category=c, phase=p, turn_index=i))
+                for s, v, c, p, i in self.lines.items]
+
+    def test_nearest_rank(self) -> None:
+        """Ten samples use nearest-rank percentiles."""
+        for value in range(1, 11):
+            self.emit(value)
+        self.assertEqual(self.tracker.summary()["stages"]["llm_ttft"],
+                         {"n": 10, "p50": 5, "p90": 9, "max": 10})
+
+    def test_one_and_two_samples(self) -> None:
+        """Small samples have exact nearest-rank values."""
+        self.emit(2)
+        self.assertEqual(self.tracker.summary()["stages"]["llm_ttft"],
+                         {"n": 1, "p50": 2, "p90": 2, "max": 2})
+        self.emit(1)
+        self.assertEqual(self.tracker.summary()["stages"]["llm_ttft"],
+                         {"n": 2, "p50": 1, "p90": 2, "max": 2})
+
+    def test_lost_reply_counts_in_headline(self) -> None:
+        """A lost reply contributes its lower bound and both lost counts."""
+        self.tracker.begin_turn(1, "roleplay")
+        self.clock.at(1)
+        self.tracker.first_audio()
+        self.tracker.begin_turn(2, "roleplay")
+        self.clock.at(3)
+        self.tracker.reply_lost(self.tracker.open_turn_id())
+        result = self.tracker.summary()
+        self.assertEqual(result["stages"]["eou_to_first_audio"]["n"], 2)
+        self.assertEqual(result["stages"]["eou_to_first_audio"]["lost"], 1)
+        self.assertEqual(result["lost"], 1)
+
+    def test_phases_and_all(self) -> None:
+        """Phase samples stay separate and all combines them."""
+        for index, phase in enumerate(("icebreaker", "roleplay", "roleplay")):
+            self.tracker.begin_turn(index, phase)
+        result = self.tracker.summary_all()
+        for phase, count in (("icebreaker", 1), ("roleplay", 2), ("all", 3)):
+            self.assertEqual(result[phase]["stages"]["eou_to_turn_hook"]["n"], count)
+
+    def test_storage_bound(self) -> None:
+        """The oldest ten samples are dropped at the storage bound."""
+        for value in range(r1_latency._MAX_HEADLINE_SAMPLES + 10):
+            self.emit(value)
+        stage = self.tracker.summary()["stages"]["llm_ttft"]
+        self.assertEqual(stage["n"], r1_latency._MAX_HEADLINE_SAMPLES)
+        self.assertEqual(min(self.tracker._summary_samples[("llm_ttft", "roleplay")]), 10)
+
+    def test_anchor_counts(self) -> None:
+        """VAD, final, and hook anchors are counted separately."""
+        self.tracker.note_user_state("speaking")
+        self.tracker.note_user_state("listening")
+        self.tracker.begin_turn(1, "icebreaker")
+        self.tracker.note_final()
+        self.tracker.begin_turn(2, "roleplay")
+        self.tracker.begin_turn(3, "roleplay")
+        result = self.tracker.summary_all()
+        self.assertEqual(result["all"]["anchors"], {"vad": 1, "final": 1, "hook": 1})
+        self.assertEqual(result["icebreaker"]["anchors"], {"vad": 1, "final": 0, "hook": 0})
+        self.assertEqual(result["roleplay"]["anchors"], {"vad": 0, "final": 1, "hook": 1})
+
+    def test_records_rebuild_rounded_summary(self) -> None:
+        """Logged rounded values rebuild the summary and ignore unrelated records."""
+        self.tracker.begin_turn(1, "icebreaker")
+        self.clock.at(1.2345)
+        self.tracker.first_audio()
+        self.tracker.begin_turn(2, "roleplay")
+        self.clock.at(3.5801)
+        self.tracker.reply_lost(self.tracker.open_turn_id())
+        records = self.records()
+        for schema in ("summary_lost", "first_audio_p95"):
+            records.append(json.dumps(dict(component="r1", error_type="r1_latency",
+                                           schema=schema, phase="other", duration_sec=8)))
+        result = self.tracker.summary_all()
+        self.assertEqual(result["icebreaker"]["stages"]["eou_to_first_audio"]["max"], 1.234)
+        self.assertEqual(r1_latency.summary_from_records(records), result)
+
+    def test_summary_cli(self) -> None:
+        """Summary CLI accepts sequences and reports empty input."""
+        self.tracker.begin_turn(1, "roleplay")
+        records = "\n".join(self.records())
+        for args in (["--summary"], ("--summary",)):
+            with self.subTest(args=args), mock.patch("sys.stdin", io.StringIO(records)), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                self.assertEqual(r1_latency.main(args), 0)
+                self.assertEqual(json.loads(out.getvalue()), self.tracker.summary_all())
+        with mock.patch("sys.stdin", io.StringIO("")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(r1_latency.main(["--summary"]), 2)
+
+    def test_default_cli_reports_targets(self) -> None:
+        """The default CLI still emits the Stage A report."""
+        with mock.patch("sys.stdin", io.StringIO("\n".join(map(json.dumps, headline(1.2))))), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            r1_latency.main()
+            self.assertIn("targets", json.loads(out.getvalue()))
+
+
 class TestTurnHandling(unittest.TestCase):
     def setUp(self) -> None:
         patcher = mock.patch.dict(os.environ, {}, clear=False)  # restores whatever the test sets
@@ -93,11 +203,33 @@ class TestTurnHandling(unittest.TestCase):
         self.assertEqual(
             r1_turn_handling(),
             {
-                "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+                "endpointing": {"min_delay": 1.0, "max_delay": 3.0},
                 "interruption": dict(_INTERRUPTION_DEFAULTS),
                 "preemptive_generation": {"enabled": False},
             },
         )
+
+    def test_vad_anchor_settings_and_rollback(self) -> None:
+        for raw, expected in (("0.3", 0.5), ("3.0", 2.0), ("abc", 1.0), ("1.1", 1.1)):
+            with self.subTest(raw=raw):
+                os.environ["R1_ENDPOINT_VAD_MIN_DELAY_SEC"] = raw
+                self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], expected)
+        os.environ.pop("R1_ENDPOINT_VAD_MIN_DELAY_SEC")
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.6"
+        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 1.0)
+        for flag in ("0", " OFF ", "False", "no"):
+            with self.subTest(flag=flag):
+                os.environ["R1_VAD_ENDPOINT_ANCHOR"] = flag
+                self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 0.6)
+                os.environ.pop("R1_ENDPOINT_MIN_DELAY_SEC")
+                expected = self._defaults()
+                expected["endpointing"]["min_delay"] = 0.8
+                self.assertEqual(r1_turn_handling(), expected)
+                os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.6"
+        os.environ.pop("R1_VAD_ENDPOINT_ANCHOR")
+        os.environ["R1_ENDPOINT_VAD_MIN_DELAY_SEC"] = "2.0"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        self.assertEqual(r1_turn_handling()["endpointing"], {"min_delay": 2.0, "max_delay": 2.0})
 
     def test_by_default_any_words_can_barge_in_but_only_after_the_voice_lasted(self) -> None:
         interruption = r1_turn_handling()["interruption"]
@@ -129,6 +261,7 @@ class TestTurnHandling(unittest.TestCase):
         )
 
     def test_each_value_can_be_tuned_from_the_environment(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ.update(
             {
                 "R1_ENDPOINT_MIN_DELAY_SEC": "0.5",
@@ -151,6 +284,7 @@ class TestTurnHandling(unittest.TestCase):
         )
 
     def test_every_value_is_bounded(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ.update(
             {
                 "R1_ENDPOINT_MIN_DELAY_SEC": "0.0",
@@ -189,6 +323,7 @@ class TestTurnHandling(unittest.TestCase):
                 self.assertEqual(r1_turn_handling(), self._defaults())
 
     def test_the_maximum_delay_never_undercuts_the_minimum(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "2.0"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
         endpointing = r1_turn_handling()["endpointing"]
@@ -197,12 +332,12 @@ class TestTurnHandling(unittest.TestCase):
     def test_each_call_returns_a_fresh_dict(self) -> None:
         first = r1_turn_handling()
         first["endpointing"]["min_delay"] = 99
-        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 0.8)
+        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 1.0)
 
     @staticmethod
     def _defaults() -> dict:
         return {
-            "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+            "endpointing": {"min_delay": 1.0, "max_delay": 3.0},
             "interruption": dict(_INTERRUPTION_DEFAULTS),
             "preemptive_generation": {"enabled": False},
         }
@@ -227,6 +362,7 @@ class TestTransitionEndpointing(unittest.TestCase):
         self.assertLess(r1_latency.r1_transition_endpointing()["max_delay"], session["max_delay"])
 
     def test_it_never_waits_longer_than_the_session_does(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.3"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
         self.assertEqual(
@@ -234,12 +370,14 @@ class TestTransitionEndpointing(unittest.TestCase):
         )
 
     def test_the_maximum_never_undercuts_the_minimum(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.2"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
         endpointing = r1_latency.r1_transition_endpointing()
         self.assertLessEqual(endpointing["min_delay"], endpointing["max_delay"])
 
     def test_a_slower_session_is_capped_at_the_transition_numbers(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "1.5"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "6"
         self.assertEqual(
@@ -938,6 +1076,17 @@ class TestEndIntentSegments(unittest.TestCase):
             log_line("final_to_turn_hook", 0.6),
         ]
         self.assertEqual(stage_a_report(base + extra), stage_a_report(base))
+
+
+class TestWarmSayLinesFlag(unittest.TestCase):
+    def test_default_on_and_false_values(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(r1_latency.warm_say_lines_enabled())
+        for value in ("0", " OFF ", " False ", " No "):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"R1_WARM_SAY_LINES": value}
+            ):
+                self.assertFalse(r1_latency.warm_say_lines_enabled())
 
 
 if __name__ == "__main__":

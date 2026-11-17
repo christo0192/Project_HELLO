@@ -954,10 +954,14 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         self.assertIn('os.getenv("SARVAM_TTS_VOICE", "simran")', voice)
         self.assertIn('"pace": 1.0', voice)
         self.assertIn('"temperature": 0.8', voice)
-        # PR-4c: R1's turn TIMINGS, never the detector or the VAD (those stay the session's).
-        self.assertIn("turn_handling=r1_turn_handling()", factory)
+        # PR-4c: R1's turn TIMINGS, never the detector (that stays the session's).  The VAD is
+        # the SDK's default model, given explicitly only behind R1_VAD_ENDPOINT_ANCHOR (M033 T1).
+        self.assertIn("turn_handling = r1_turn_handling()", factory)
+        self.assertIn("turn_handling=turn_handling", factory)
         self.assertNotIn("turn_detection", factory)
         self.assertNotIn("vad=", factory)
+        self.assertIn('{"vad": inference.VAD(model="silero")} if anchor else {}', factory)
+        self.assertIn("anchor = vad_endpoint_anchor_enabled()", factory)
 
     def test_session_factory_pins_llm_retry_options_and_disables_user_away(self) -> None:
         source = (HERE / "r1_session.py").read_text(encoding="utf-8")

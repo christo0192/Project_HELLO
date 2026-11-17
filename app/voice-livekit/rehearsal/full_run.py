@@ -24,11 +24,14 @@ per turn), ``results.jsonl`` (one summary line per call), ``scorecard.json`` / `
 from __future__ import annotations
 
 import json
+import os
+import statistics
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from unittest.mock import patch
 
 from rehearsal import HARNESS_VERSION
 from rehearsal.call import DEFAULT_CANDIDATE_NAMES, git_sha
@@ -73,6 +76,8 @@ class FullSettings:
     preflight: bool = True
     out: str = ""
     strict: bool = False
+    spec_reply: str = "env"
+    spec_hold: bool = False
 
 
 # ------------------------------------------------------------------------------- planning
@@ -200,7 +205,7 @@ class LiveFullFactory:
     async def start(self) -> dict[str, Any]:
         from rehearsal.vloop import production_runner, production_stream
 
-        from rehearsal.seams import check_seams, seam_client
+        from rehearsal.seams import STREAM_SEAMS, check_seams, seam_client
 
         check_seams(runner_names())  # an unmapped seam stops here, before any spend
         info = await self.check()
@@ -215,6 +220,11 @@ class LiveFullFactory:
         # harness keeps it in a dict, so it hands each seam its client explicitly.
         for name in runner_names():
             if name == "judge_runner":
+                continue
+            if name in STREAM_SEAMS:
+                self._runners[name] = production_stream(
+                    make_live_learner_provider(self.env, self.ledger)
+                )
                 continue
             role = name[: -len("_runner")]
             client = seam_client(name)
@@ -304,6 +314,7 @@ def full_summary(record: dict[str, Any]) -> dict[str, Any]:
         "hard_fails": record.get("hard_fails"),
         "phase_checks_failed": checks.get("failed"),
         "flow": flow_line(record),
+        "spec_reply": record.get("spec_reply"),
         "error": record.get("error"),
     }
 
@@ -374,13 +385,19 @@ def full_progress_line(done: int, total: int, record: dict[str, Any]) -> str:
 
 # --------------------------------------------------------------------------------- driver
 async def sweep_full(
-    factory: Any, specs: Sequence[FullCallSpec], out: Path, say: Callable[[str], None]
+    factory: Any, specs: Sequence[FullCallSpec], out: Path, say: Callable[[str], None],
+    settings: FullSettings,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for index, spec in enumerate(specs, start=1):
         if factory.ledger.fatal or factory.ledger.over_budget:
             break
-        record = await run_full_call(spec, factory.make(spec))
+        mode = settings.spec_reply
+        env = {} if mode == "env" else {"R1_SPECULATIVE_REPLY": "1" if mode == "on" else "0"}
+        with patch.dict(os.environ, env):
+            deps = factory.make(spec)
+            deps.spec_hold = settings.spec_hold
+            record = await run_full_call(spec, deps)
         write_full_call(out, record, factory.scrub)
         records.append(record)
         say(full_progress_line(index, len(specs), record))
@@ -399,6 +416,8 @@ async def run_full_all(
     """The whole sweep (run it on a virtual loop: ``vloop.run_virtual``); returns the exit code."""
     from rehearsal.full_metrics import build_full_scorecard, render_full_markdown
 
+    if settings.spec_reply == "both":
+        return await run_spec_grid(settings, out, say, factory=factory)
     specs = plan_full_specs(settings.scenarios, settings.learners, settings.calls)
     out.mkdir(parents=True, exist_ok=True)
     started = time.time()
@@ -416,15 +435,17 @@ async def run_full_all(
     code = EXIT_OK
     records: list[dict[str, Any]] = []
     ledger = Ledger()
+    owned_factory = factory is None
     try:
         if factory is None:
             factory = OfflineFullFactory(settings) if settings.offline else LiveFullFactory(settings)
         try:
             run["start"] = await factory.start()
-            records = await sweep_full(factory, specs, out, say)
+            records = await sweep_full(factory, specs, out, say, settings)
         finally:
             ledger = factory.ledger
-            await factory.aclose()
+            if owned_factory:
+                await factory.aclose()
     except MissingKey as exc:
         run["stopped"], run["message"], code = "missing_key", str(exc), EXIT_NO_KEY
     except UnknownSeam as exc:
@@ -465,3 +486,100 @@ async def run_full_all(
     else:
         say(f"Done: {len(records)} full calls in {run['wall_seconds']} s. Artifacts: {out}")
     return code
+
+
+def text_rows(record: dict) -> list:
+    """Return speaker and raw text for each row."""
+    return [(row.get("voice") or row.get("speaker"), row.get("text"))
+            for row in record.get("rows", [])]
+
+
+def decisions(record: dict) -> tuple:
+    """Return the outcome and decision fields for comparison."""
+    metrics = record.get("metrics") or {}
+    return (record.get("outcome"), record.get("stop_reason"), record.get("hard_fails"),
+            (record.get("phase_checks") or {}).get("failed"),
+            metrics.get("commitment_level"), metrics.get("families_delivered"))
+
+
+def compare_records(left: dict, right: dict) -> dict:
+    """Compare text and decisions and locate the first text difference."""
+    a, b = text_rows(left), text_rows(right)
+    first = next((i for i in range(max(len(a), len(b)))
+                  if (a[i] if i < len(a) else None) != (b[i] if i < len(b) else None)), None)
+
+    def previous_r(record: dict) -> Any:
+        if first is None:
+            return None
+        return next((row.get("r_sec") for row in reversed(record.get("rows", [])[:first])
+                     if row.get("speaker") == "candidate"), None)
+
+    return {"identical_text": first is None,
+            "identical_decisions": decisions(left) == decisions(right),
+            "first_differing_row": first,
+            "previous_candidate_r": [previous_r(left), previous_r(right)]}
+
+
+def median_reply_gap(record: dict) -> float | None:
+    """Return the median candidate-to-learner reply gap."""
+    rows = record.get("rows", [])
+    gaps = []
+    for candidate, learner in zip(rows, rows[1:]):
+        end, start = candidate.get("t_end"), learner.get("t_start")
+        if (candidate.get("speaker") == "candidate" and learner.get("voice") == "learner"
+                and isinstance(end, (int, float)) and isinstance(start, (int, float))):
+            gaps.append(start - end)
+    return round(statistics.median(gaps), 3) if gaps else None
+
+
+async def run_spec_grid(
+    settings: FullSettings, out: Path, say: Callable, *, factory: Any = None
+) -> int:
+    """Compare three sides; a supplied factory remains owned and reusable by its caller."""
+    from dataclasses import replace
+
+    codes = []
+    sides = (("on", "on", False), ("held", "on", True), ("off", "off", False))
+    for name, mode, hold in sides:
+        side = replace(settings, spec_reply=mode, spec_hold=hold)
+        codes.append(await run_full_all(side, out / f"spec-{name}", say, factory=factory))
+    rows = []
+    for spec in plan_full_specs(settings.scenarios, settings.learners, settings.calls):
+        paths = [out / f"spec-{name}" / "calls" / f"{spec.seed}.json" for name, _, _ in sides]
+        if not all(path.exists() for path in paths):
+            codes.append(EXIT_STRICT)
+            continue
+        on, held, off = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+        drift = compare_records(held, off)
+        if not drift["identical_text"] or not drift["identical_decisions"]:
+            codes.append(EXIT_STRICT)
+        data = on.get("spec_reply") or {}
+        counts = data.get("by_category", {})
+        started, adopted = counts.get("started", 0), counts.get("adopted", 0)
+        rows.append({"call": spec.seed, "held_vs_off": drift,
+                     "on_vs_off": compare_records(on, off), "counts": counts,
+                     "started": started, "adopted": adopted,
+                     "adoption_rate": adopted / started if started else None,
+                     "spec_raw_calls": data.get("spec_raw_calls", 0),
+                     "committed": data.get("committed", 0),
+                     "uncommitted": data.get("uncommitted", 0),
+                     "median_reply_gap": {"on": median_reply_gap(on),
+                                          "held": median_reply_gap(held),
+                                          "off": median_reply_gap(off)}})
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "spec_grid.json").write_text(json.dumps(rows, indent=1), encoding="utf-8", newline="\n")
+    lines = ["# Speculative reply grid", "",
+             "| call | held text/decisions | on text/decisions | first held/on | "
+             "previous candidate R on/off | counts | rate | raw/committed/uncommitted | "
+             "median gap on/held/off |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for row in rows:
+        held, on = row["held_vs_off"], row["on_vs_off"]
+        lines.append(f"| {row['call']} | {held['identical_text']}/{held['identical_decisions']} | "
+                     f"{on['identical_text']}/{on['identical_decisions']} | "
+                     f"{held['first_differing_row']}/{on['first_differing_row']} | "
+                     f"{on['previous_candidate_r']} | {row['counts']} | {row['adoption_rate']} | "
+                     f"{row['spec_raw_calls']}/{row['committed']}/{row['uncommitted']} | "
+                     f"{row['median_reply_gap']} |")
+    (out / "spec_grid.md").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    return max(codes)

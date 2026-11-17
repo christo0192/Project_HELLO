@@ -3675,5 +3675,158 @@ class DiagnosisFourDigTests(unittest.TestCase):
         self.assertEqual(found["unprompted_dump_count"], 1)
 
 
+
+class SpecReplySeamTests(unittest.TestCase):
+    def test_spec_reply_is_a_known_streaming_seam(self):
+        from rehearsal.full import runner_names
+        from rehearsal.seams import SEAM_CLIENTS, STREAM_SEAMS, check_seams
+
+        check_seams(runner_names())
+        self.assertEqual(SEAM_CLIENTS["spec_reply_runner"], "interviewer")
+        self.assertIn("spec_reply_runner", STREAM_SEAMS)
+
+    def test_memo_replays_equivalent_messages_and_preserves_interviewer_calls(self):
+        from rehearsal.seams import SpecReplyMemo
+        from unittest.mock import patch
+
+        calls = []
+
+        async def raw(messages):
+            calls.append(messages)
+            yield messages[0]["content"]
+
+        async def run():
+            memo = SpecReplyMemo(raw)
+            learner = [{"role": "user", "content": "learner"}]
+            other = [{"role": "user", "content": "interviewer"}]
+            with patch("rehearsal.scripted_interviewer.is_learner_prompt",
+                       side_effect=lambda m: m == learner):
+                self.assertEqual([x async for x in memo.spec_runner(learner)], ["learner"])
+                self.assertEqual([x async for x in memo.provider(other)], ["interviewer"])
+                self.assertEqual([x async for x in memo.provider(learner)], ["learner"])
+                self.assertEqual(len(calls), 2)
+                self.assertEqual([x async for x in memo.provider(learner)], ["learner"])
+                self.assertEqual(len(calls), 3)
+
+        asyncio.run(run())
+
+    def test_snapshot_discard_and_commit(self):
+        from rehearsal.seams import SpecReplyMemo
+        from rehearsal.scripted_interviewer import PhaseRouter
+        from unittest.mock import patch
+
+        class Counter:
+            def __init__(self):
+                self.count = 0
+
+            async def __call__(self, messages):
+                self.count += 1
+                yield str(self.count)
+
+        async def run():
+            raw = PhaseRouter(Counter(), Counter())
+            memo = SpecReplyMemo(raw)
+            learner = [{"role": "user", "content": "learner"}]
+            other = [{"role": "user", "content": "other"}]
+            with patch("rehearsal.scripted_interviewer.is_learner_prompt",
+                       side_effect=lambda m: m == learner):
+                self.assertEqual([x async for x in memo.spec_runner(learner)], ["1"])
+                self.assertEqual(raw.learner.count, 0)
+                self.assertEqual([x async for x in memo.provider(other)], ["1"])
+                self.assertEqual([x async for x in memo.provider(learner)], ["1"])
+                self.assertEqual((raw.learner.count, raw.interviewer.count), (1, 1))
+                self.assertEqual((memo.spec_raw_calls, memo.committed), (1, 1))
+                await consume(memo.spec_runner(learner))
+                memo.commit(memo.stash[-1])
+                self.assertEqual((raw.learner.count, raw.interviewer.count), (2, 1))
+                await consume(memo.spec_runner(learner))
+                memo.stash.clear()
+                self.assertEqual(raw.learner.count, 2)
+                self.assertEqual((memo.spec_raw_calls, memo.committed), (3, 2))
+
+        async def consume(stream):
+            return [x async for x in stream]
+
+        asyncio.run(run())
+
+    def test_adoption_commits_before_playback_and_a_later_spec(self):
+        from rehearsal.seams import SpecReplyMemo
+        from rehearsal.sim import SdkDriver
+
+        class Counter:
+            def __init__(self):
+                self.count = 0
+
+            async def __call__(self, messages):
+                self.count += 1
+                yield str(self.count)
+
+        async def run():
+            raw = SimpleNamespace(learner=Counter())
+            memo = SpecReplyMemo(raw)
+            await consume(memo.spec_runner([]))
+            interview = SimpleNamespace(_spec_counts={"adopted": 0})
+
+            async def stream(*args):
+                interview._spec_counts["adopted"] += 1
+                yield "first chunk"
+                self.assertEqual(raw.learner.count, 1)
+                yield " second chunk"
+
+            interview.llm_node_stream = stream
+            handle = mock.Mock()
+            handle.done.return_value = False
+            session = mock.Mock()
+
+            async def wait_turn(_handle):
+                self.assertEqual((raw.learner.count, memo.committed), (1, 1))
+                await consume(memo.spec_runner([]))
+                self.assertEqual(memo.stash[-1][2].count, 2)
+                return False
+
+            session.wait_turn = wait_turn
+            rt = SimpleNamespace(interview=interview, offline=False)
+            driver = SdkDriver(rt, session, None, {})
+            driver.spec_memo = memo
+            with mock.patch("rehearsal.sim.settle", new_callable=mock.AsyncMock):
+                await driver._play_reply(handle, None, None)
+            self.assertEqual((raw.learner.count, memo.committed), (1, 1))
+            self.assertEqual(memo.stash[-1][2].count, 2)
+
+        async def consume(stream):
+            return [chunk async for chunk in stream]
+
+        asyncio.run(run())
+
+    def test_live_spec_uses_separate_stream_without_error_forwarder(self):
+        from rehearsal import full_run
+        from rehearsal.llm import KEY_NAME
+        from unittest.mock import patch
+
+        made = []
+
+        def provider(*args, **kwargs):
+            made.append(kwargs)
+            async def stream(_messages):
+                yield "synthetic"
+            return stream
+
+        async def judge(_messages):
+            return ""
+
+        factory = full_run.LiveFullFactory(
+            full_run.FullSettings(preflight=False), {KEY_NAME: "sk-test-not-real"}
+        )
+        names = ("judge_runner", "spec_reply_runner")
+        with patch.object(full_run, "runner_names", lambda: names), \
+                patch.object(full_run, "make_live_learner_provider", provider), \
+                patch.object(full_run, "make_live_judge_runner", lambda *a, **k: judge):
+            asyncio.run(factory.start())
+        self.assertEqual(len(made), 2)
+        self.assertIn("on_error", made[0])
+        self.assertEqual(made[1], {})
+        self.assertIn("spec_reply_runner", factory._runners)
+
+
 if __name__ == "__main__":
     unittest.main()

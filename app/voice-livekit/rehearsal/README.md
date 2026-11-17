@@ -357,3 +357,9 @@ and the live UI.
 
 `call.py` imports `Rig` from `tests/test_r1_integration.py`; if PR-B or PR-4c changes that rig, fix it
 there first. The DeepSeek price constants in `llm.py` are estimates (S0-B), not the price list.
+
+The full-interview harness injects the streaming `spec_reply_runner` seam. Offline,
+it snapshots the scripted learner for speculative calls. Use `--spec-reply on` or
+`off` to set the session flag, or `--spec-reply both` to compare real timing and
+timing-neutral adoption against OFF. The grid fails on timing-neutral transcript
+or decision drift. The default `env` leaves the process environment in control.

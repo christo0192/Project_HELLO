@@ -15124,3 +15124,142 @@ class D5RPostByeTests(unittest.TestCase):
         s = D5PostByeQuietTests.bye_session(D5PostByeQuietTests())
         s.say("Yeah, totally get it.", 790)
         self.assertTrue(s.eng._bye_heard)
+
+
+class SpeculativeCopyTest(unittest.TestCase):
+    def test_signature_fields_and_reasons(self):
+        plan = engine().plan_turn(OPENER, 20)
+        signature = r1_roleplay.plan_signature(plan)
+        self.assertEqual(signature, (
+            plan.mode, plan.move_id, plan.negotiation_id, plan.intent, plan.probe,
+            plan.aside, plan.line_id, plan.credit_move_id, plan.exit_roleplay,
+            plan.prelude_line, plan.continuation, plan.scripted_text,
+        ))
+        self.assertEqual(len(signature), 12)
+        self.assertEqual(signature, r1_roleplay.plan_signature(dataclasses.replace(plan)))
+        changed = dataclasses.replace(plan, reasons=("different timing",))
+        self.assertEqual(signature, r1_roleplay.plan_signature(changed))
+
+    def test_dry_runs_do_not_interfere_and_match_real_plans(self):
+        import copy
+        import statistics
+        import time
+
+        a, b = engine(), engine()
+        sessions = (Session(a), Session(b))
+        script = [
+            OPENER, H1_PROBE, FOLLOWUP, PITCH,
+            "What have you tried so far to learn this?",
+            "Tell me more about what happened there.",
+            "How would you fit this around your work and family commitments?",
+            "And would anyone else be involved in the decision?",
+            PRICE_TALK, ANSWER, LEVER, ASK, CALL_ASK,
+            "Our instructors bring real-world experience to every module.",
+            "Okay.", "Sorry?", "What concerns do you have about the schedule?",
+            "The classes are live on weekends, with recordings available.",
+            "Would mentorship help you make the transition?",
+            "Let's call it a day.",
+            "Our mentors can help with your capstone project.",
+            "How does that fit your career goals?",
+            "We also offer mock interviews and career support.",
+            "What would make this program more useful for you?",
+            "Your husband is welcome to join the next conversation.",
+            "You can review the payment options together.",
+            "What timeline are you considering for a decision?",
+            "We can answer any remaining questions by email.",
+            "The curriculum includes practical projects.",
+            "You will get feedback from experienced mentors.",
+            "Okay, great.", "Yes, let's wrap it up here.",
+            "Thank you for discussing your goals.",
+            "I appreciate your time today.",
+            "We can send the program details.",
+            "Please review them when convenient.",
+            "Our team can follow up next week.",
+            "Let us know if questions come up.",
+            "Thanks again for your time.",
+            "Have a good day.",
+        ]
+        self.assertEqual(len(script), 40)
+
+        def fingerprint():
+            return (
+                a.turn, a.last_r, copy.deepcopy(a.scheduler.summary()),
+                copy.deepcopy(a.tracker.gate.records()), copy.deepcopy(vars(a.ledger)),
+                a._late_stalls, a._end_question_last, copy.deepcopy(a._lost_plan),
+                len(a._word_counts),
+            )
+
+        clone = a.speculative_copy()
+        self.assertIs(clone.persona, a.persona)
+        self.assertIsNot(clone.scheduler, a.scheduler)
+        self.assertIsNot(clone.tracker, a.tracker)
+        self.assertIsNot(clone.ledger, a.ledger)
+        plans_a, plans_b = [], []
+        seen = set()
+        for index, text in enumerate(script):
+            r = 20.0 + index * 28.0
+            if index == 30:
+                for eng in (a, b):
+                    eng.scheduler.mark_commitment_resolved()
+                    eng.scheduler.select = lambda _r, **_kw: None
+            kwargs = {
+                "turn_index": index * 2 + 1, "candidate_seconds": 20,
+                "backchannel": index == 14, "repair": index == 15,
+                "end_intent": "maybe" if index == 19 else None,
+                "confirmed_yes": False,
+            }
+            dry_kwargs = dict(kwargs, end_intent=None, confirmed_yes=False)
+            before = fingerprint()
+            asks_before = len(a._asks)
+            dry_plans = [
+                a.speculative_copy().plan_turn(text, r, **dry_kwargs)
+                for _ in range(5 if index in (2, 20, 35) else 1)
+            ]
+            self.assertEqual(before, fingerprint(), index)
+            signatures = [r1_roleplay.plan_signature(plan) for plan in dry_plans]
+            self.assertTrue(all(sig == signatures[0] for sig in signatures), index)
+            if index == 13:
+                plans = [eng.plan_turn(text, r, **kwargs) for eng in (a, b)]
+                self.assertIn(plans[0].mode, (TurnMode.INTENT, TurnMode.LLM_REPLY))
+                for eng, plan in zip((a, b), plans):
+                    eng.reply_lost(plan)
+            else:
+                plans = [session.say(text, r, **kwargs) for session in sessions]
+            plans_a.append(plans[0])
+            plans_b.append(plans[1])
+            self.assertEqual(plans[0], plans[1], index)
+            if kwargs["end_intent"] is None and not kwargs["confirmed_yes"]:
+                for dry in dry_plans:
+                    self.assertEqual(dry, plans[0], index)
+                self.assertEqual(signatures[0], r1_roleplay.plan_signature(plans[0]), index)
+            if plans[0].negotiation_id:
+                seen.add("negotiation")
+            if plans[0].line_id == "L-ASIDE-END":
+                seen.add("end")
+            if plans[0].line_id == "L-ASIDE-WRAP":
+                seen.add("wrap")
+            if plans[0].mode is TurnMode.EXIT:
+                seen.add("exit")
+            if "replanned_after_lost_reply" in plans[0].reasons:
+                seen.add("replanned")
+                self.assertEqual(index, 14)
+            if kwargs["backchannel"]:
+                seen.add("backchannel")
+            if kwargs["repair"]:
+                seen.add("repair")
+            if r >= r1_roleplay.WRAP_OFFER_FROM_R_SEC:
+                seen.add("late")
+            if index == 11:
+                self.assertGreater(len(a._asks), asks_before, "ASK was not recorded")
+        self.assertEqual(plans_a, plans_b)
+        self.assertEqual(seen, {
+            "negotiation", "end", "wrap", "exit", "replanned", "backchannel", "repair", "late",
+        })
+        self.assertEqual(a.admin_log(final=True, r_end=r), b.admin_log(final=True, r_end=r))
+        timings = []
+        for _ in range(20):
+            start = time.perf_counter()
+            a.speculative_copy()
+            timings.append(time.perf_counter() - start)
+        print(f"speculative_copy median: {statistics.median(timings) * 1000:.3f} ms",
+              file=sys.stderr)

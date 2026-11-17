@@ -119,6 +119,7 @@ class FullDeps:
     # Seams built per call from its runtime (the offline stand-ins: ``rehearsal.seams``), and how
     # each seam runs ("live" or "scripted"; a seam passed nothing is "absent").
     make_runners: Callable[[Any], dict[str, Callable[[list], Any]]] | None = None
+    spec_hold: bool = False
     seam_mode: str = "scripted"
     # Live: told the running call's session, so the production client's SDK error events reach
     # it as AgentSession forwards them (``R1Interview._on_provider_error``).
@@ -276,10 +277,16 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
         "attempt": {"persona_id": spec.persona_id, "persona_variant": spec.persona_variant},
     }
     inner = deps.make_provider(lambda: runtime.clocks()[0])
+    memo = None
+    spec_runner = deps.runners.get("spec_reply_runner")
     if deps.offline:
+        from rehearsal.seams import SpecReplyMemo
+
         timing = runtime.timing
+        memo = SpecReplyMemo(inner)
+        spec_runner = ModelledLatency(memo.spec_runner, lambda _m: timing.offline_learner_llm_sec)
         inner = ModelledLatency(
-            inner,
+            memo.provider,
             lambda m: timing.offline_learner_llm_sec
             if is_learner_prompt(m)
             else timing.offline_interviewer_llm_sec,
@@ -289,6 +296,12 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
         "interviewer": RecordingProvider(inner, deps.ledger, scrub=deps.scrub, role="interviewer"),
     }
     extra = deps.make_runners(runtime) if deps.make_runners is not None else {}
+    if spec_runner is not None:
+        spec_recorder = RecordingProvider(
+            spec_runner, deps.ledger, scrub=deps.scrub, role="spec_reply", clock=loop.time
+        )
+        recorders["spec_reply"] = spec_recorder
+        extra["spec_reply_runner"] = spec_recorder
     kwargs = interview_kwargs(deps, extra)
     record["header"]["runners"] = sorted(kwargs)
     record["header"]["seams"] = seam_modes(deps, kwargs)
@@ -296,6 +309,8 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
         interview = R1Interview(ctx, context, session, writer, clock=loop.time, **kwargs)
         runtime.interview = interview
         driver = SdkDriver(runtime, session, ctx, recorders)
+        driver.spec_memo = memo
+        driver.hold_adopted = deps.spec_hold
         candidate = CandidateSim(
             scenario,
             deps.talker,
@@ -329,6 +344,10 @@ async def _drive(spec: FullCallSpec, deps: FullDeps, record: dict[str, Any]) -> 
             results = await asyncio.gather(loop_task, return_exceptions=True)
             try:
                 _collect(runtime, interview, writer, record, lines)
+                calls = memo.spec_raw_calls if memo else 0
+                committed = memo.committed if memo else 0
+                record["spec_reply"].update(spec_raw_calls=calls, committed=committed,
+                                            uncommitted=calls - committed)
             except Exception as exc:  # noqa: BLE001 - never mask the call's own failure
                 record["collect_error"] = describe_error(exc, deps.scrub, 200)
             talker = deps.talker
@@ -687,6 +706,7 @@ def _note_turn(
     spoken = result.get("spoken")
     plan = result.get("plan")
     learner: dict[str, Any] = {
+        "speculative": bool(result.get("speculative")),
         "spoken": spoken,
         "raw": "".join(call["raw"] for call in calls),
         "model_calls": len(calls),
@@ -788,6 +808,26 @@ def _collect(rt: Runtime, interview: Any, writer: Any, record: dict[str, Any], l
                 "phase": line.get("phase"),
             }
         )
+    spec_counts: dict[str, int] = {}
+    by_phase: dict[str, dict[str, int]] = {}
+    for line in lines:
+        if line.get("error_type") == "r1_spec_reply":
+            category = str(line.get("error_category") or "unknown")
+            phase = str(line.get("phase") or "unknown")
+            spec_counts[category] = spec_counts.get(category, 0) + 1
+            phase_counts = by_phase.setdefault(phase, {})
+            phase_counts[category] = phase_counts.get(category, 0) + 1
+    summary = {
+        str(line.get("error_category")): line.get("option_count")
+        for line in lines if line.get("schema") == "summary_spec"
+    }
+    record["spec_reply"] = {"by_category": spec_counts, "by_phase": by_phase}
+    if summary:
+        record["spec_reply"]["summary_matches"] = summary == spec_counts
+    record["header"]["spec_reply"] = {
+        "flag": "on" if getattr(interview, "_spec_enabled", False) else "off",
+        "counts": spec_counts,
+    }
     record["log_counts"] = counts
     record["log_events"] = kept
     record["stop_reason"] = record["stop_reason"] or roleplay_end(record, interview)

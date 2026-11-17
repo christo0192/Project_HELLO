@@ -753,6 +753,7 @@ def phase_checks(record: Mapping[str, Any]) -> dict[str, Any]:
         "checks": checks,
         "failed": failed,
         "timings": phase_timings(record),
+        "spec_reply": (record.get("spec_reply") or {}).get("by_phase", {}),
     }
 
 
@@ -807,7 +808,14 @@ def build_full_scorecard(
         thin = single_call_reason(flow)
         if thin:
             reasons.append(thin)
+    totals: dict[str, int] = {}
+    for record in records:
+        for category, count in (record.get("spec_reply") or {}).get("by_category", {}).items():
+            totals[category] = totals.get(category, 0) + count
+    started, adopted = totals.get("started", 0), totals.get("adopted", 0)
     return {
+        "spec_reply": {"by_category": totals, "started": started, "adopted": adopted,
+                       "adoption_rate": adopted / started if started else None},
         "header": dict(header or {}),
         "tier": "full",
         "offline": offline,
@@ -837,6 +845,10 @@ def render_full_markdown(card: Mapping[str, Any], records: Sequence[Mapping[str,
         "| check | pass | fail | n/a | failed calls |",
         "|---|---|---|---|---|",
     ]
+    spec = card.get("spec_reply") or {}
+    lines[4:4] = ["## Speculative reply", "", "| category | count |", "|---|---:|"] + [
+        f"| {name} | {count} |" for name, count in spec.get("by_category", {}).items()
+    ] + [f"| adoption rate | {spec.get('adoption_rate')} |", ""]
     for name, row in card["phase_checks"].items():
         failed = ", ".join(row["failed_calls"][:6]) + (" ..." if len(row["failed_calls"]) > 6 else "")
         lines.append(f"| {name} | {row['pass']} | {row['fail']} | {row['n/a']} | {failed} |")
