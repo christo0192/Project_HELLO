@@ -3,10 +3,11 @@
 Independent, SDK-free pieces live here so each is unit-testable without a session:
 
 * ``r1_turn_handling``: the endpointing, interruption and preemptive-generation options R1
-  hands the ``AgentSession``.  The values are endpointing 0.8 / 3.0 s (R1-Q: the owner's 4/10
-  session showed the SDK's streaming 0.3 / 2.5 s committing a turn on a breath) and VOICE
-  BARGE-IN (owner decision 2026-10-28, "we also want the bot to stop talking when being
-  interrupted"): interruption ``min_words`` 0 and ``min_duration`` 0.8 s, with the SDK's
+  hands the ``AgentSession``.  The values are endpointing 1.0 / 3.0 s measured from the
+  candidate's real end of speech (M033 T1, below; R1-Q: the owner's 4/10 session showed the
+  SDK's streaming 0.3 / 2.5 s committing a turn on a breath, at about 0.85 s of real silence)
+  and VOICE BARGE-IN (owner decision 2026-10-28, "we also want the bot to stop talking when
+  being interrupted"): interruption ``min_words`` 0 and ``min_duration`` 0.8 s, with the SDK's
   false-interruption resume after 2.0 s.  0.8 s of the candidate's voice pauses an
   interruptible line, a final transcript cuts it, and a pause that no transcript follows
   (noise, a cough) resumes it.  ``min_words`` was 3 before (the phone lane's value): with
@@ -16,6 +17,24 @@ Independent, SDK-free pieces live here so each is unit-testable without a sessio
   quicker transition pair (``r1_transition_endpointing``, 0.4 / 1.2 s) is no longer applied since
   the consent transition of 2026-11-03 (the candidate asks questions there now); it is kept for a
   rollback.  Preemptive generation stays OFF; ``r1_session`` explains why.
+
+* The endpointing ANCHOR (M033 T1, ``R1_VAD_ENDPOINT_ANCHOR``, default on).  Given no VAD,
+  livekit-agents 1.6.4 builds its default silero VAD and, because it is the default, resets
+  the candidate's last-speaking time to each FINAL transcript's arrival (Sarvam sends no end
+  time), so the old 0.8 s ran from the final: about 1.35-1.6 s of real silence.  With the
+  anchor on, ``r1_session`` hands the session that same silero VAD explicitly, the anchor stays
+  at the VAD's back-dated end of speech, and the minimum is ``R1_ENDPOINT_VAD_MIN_DELAY_SEC``
+  (1.0 s of real silence, bounded 0.5-2.0).  ``R1_ENDPOINT_MIN_DELAY_SEC`` keeps its meaning
+  and applies only with the anchor off, so a transcript-anchored 0.6 can never silently become
+  0.6 s of real silence.  ``R1_VAD_ENDPOINT_ANCHOR=0`` is the instant rollback.
+  Side effects pinned in ``tests/test_r1_sdk_contract.py``: finals now carry the VAD's
+  ``speaking`` state, and a final that lands while a line is paused and the VAD hears no voice
+  RESTARTS the 2.0 s false-interruption timer (the default VAD only cancels it).  A paused
+  learner line whose turn commits within 2.0 s of the final (the common case, about 0.45 s)
+  is cut exactly as before; only a turn the default detector holds toward ``max_delay``
+  (3.0 s) can let the paused line resume briefly before the cut, seen rarely if ever.
+  Known residual: if the VAD misses a quiet utterance entirely, a stale last-speaking time can
+  let the wait expire at the final itself; the exit ``summary_anchor`` counts expose it.
 
 * ``LatencyTracker``: stamps the stages of one candidate turn and hands every segment to an
   ``emit`` callback.  ``r1_session`` turns each call into one structured ``r1`` log line
@@ -59,6 +78,9 @@ from typing import Any, Callable
 # ---------------------------------------------------------------------------- turn handling
 
 ENDPOINT_MIN_DELAY_SEC = 0.8
+# The minimum measured from the VAD's end of speech (anchor on).  Real silence: above the about
+# 0.85 s at which the 4/10 session committed turns on a breath, below today's 1.35-1.6 s.
+ENDPOINT_MIN_DELAY_VAD_SEC = 1.0
 ENDPOINT_MAX_DELAY_SEC = 3.0
 INTERRUPT_MIN_DURATION_SEC = 0.8
 # Voice barge-in (owner decision 2026-10-28).  3 is the rollback: ``R1_INTERRUPT_MIN_WORDS=3``.
@@ -85,9 +107,30 @@ def _bounded_float(raw: str | None, default: float, low: float, high: float) -> 
 
 
 def endpoint_min_delay_sec() -> float:
-    """Silence after the last speech before the turn may end (SDK default 0.3 s streaming)."""
+    """Silence after the FINAL transcript before the turn may end (anchor off only).
+
+    Applies only with ``R1_VAD_ENDPOINT_ANCHOR=0``; with the anchor on it is ignored (and the
+    session warns ``r1_endpoint_setting_ignored`` if it is set).
+    """
     return _bounded_float(
         os.getenv("R1_ENDPOINT_MIN_DELAY_SEC"), ENDPOINT_MIN_DELAY_SEC, 0.2, 2.0
+    )
+
+
+def endpoint_vad_min_delay_sec() -> float:
+    """Real silence after the VAD's end of speech before the turn may end (anchor on)."""
+    return _bounded_float(
+        os.getenv("R1_ENDPOINT_VAD_MIN_DELAY_SEC"), ENDPOINT_MIN_DELAY_VAD_SEC, 0.5, 2.0
+    )
+
+
+def vad_endpoint_anchor_enabled() -> bool:
+    """``R1_VAD_ENDPOINT_ANCHOR`` (default on): anchor endpointing on an explicit VAD.
+
+    Unset or anything but "0", "off", "false" or "no" is on (``r1_session._env_switch``).
+    """
+    return (os.getenv("R1_VAD_ENDPOINT_ANCHOR") or "1").strip().lower() not in (
+        "0", "off", "false", "no"
     )
 
 
@@ -151,13 +194,18 @@ def r1_turn_handling() -> dict[str, Any]:
     """The ``TurnHandlingOptions`` R1 gives its ``AgentSession`` (a plain dict is accepted).
 
     ``turn_detection`` is deliberately absent: the browser lane's detector stays what the
-    session selects, and only the timings around it are R1's.  ``vad`` is not given to the
-    session either, so the SDK runs its default voice activity detector: that is what applies
-    ``min_duration`` and pauses a line on the candidate's voice.  Interruption options are read
-    from the SESSION by livekit-agents 1.6.4 (an agent-level ``interruption`` carries only
-    ``enabled`` and ``mode``), which is why these belong on the session and not on ``R1Agent``.
+    session selects, and only the timings around it are R1's.  The VAD is the silero model in
+    both modes: handed to the session explicitly with the anchor on (``min_delay`` then counts
+    from the VAD's end of speech, ``endpoint_vad_min_delay_sec``), the SDK's own default with
+    it off (``min_delay`` counts from the final, ``endpoint_min_delay_sec``).  Either way it is
+    what applies ``min_duration`` and pauses a line on the candidate's voice.  Interruption
+    options are read from the SESSION by livekit-agents 1.6.4 (an agent-level ``interruption``
+    carries only ``enabled`` and ``mode``), which is why these belong on the session and not on
+    ``R1Agent``.
     """
-    minimum = endpoint_min_delay_sec()
+    minimum = (
+        endpoint_vad_min_delay_sec() if vad_endpoint_anchor_enabled() else endpoint_min_delay_sec()
+    )
     return {
         "endpointing": {
             "min_delay": minimum,

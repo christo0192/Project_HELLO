@@ -278,6 +278,7 @@ from r1_latency import (
     endpoint_max_delay_sec,
     interrupt_min_words,
     r1_turn_handling,
+    vad_endpoint_anchor_enabled,
 )
 from r1_linecache import (
     LANE_R1,
@@ -3376,17 +3377,20 @@ class R1Agent(Agent):
 async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     """Build R1 providers with the browser lane's env variables and exact defaults.
 
-    Browser sessions pass neither VAD nor turn detection, so R1 does the same: both stay the
-    session's defaults.  PR-4c changes only the TIMINGS around them (``r1_turn_handling``:
-    endpointing, interruption length and words; preemptive generation stays off), which the
-    SDK reads from the session, and nothing else about turn taking.
+    Turn detection stays the session's default.  The VAD is the SDK's default silero model,
+    handed to the session explicitly while ``R1_VAD_ENDPOINT_ANCHOR`` is on (M033 T1), so the
+    endpointing wait runs from the candidate's real end of speech and not from Sarvam's final
+    (``r1_latency``); with it off no VAD is given and the SDK builds the same model itself, as
+    before.  PR-4c changes only the TIMINGS around them (``r1_turn_handling``: endpointing,
+    interruption length and words; preemptive generation stays off).  One ``r1_endpointing``
+    line names the anchor and the minimum in use.
 
     The voices (owner decision 2026-10-30) are read ONCE here (``r1_voice_set``): v4 is one
     ``R1SarvamTTS`` speaking Christy and the learner per speech, v3 (the rollback) is
     ``sarvam.TTS(**r1_tts_kwargs())`` exactly as before (``r1_sarvam.build_r1_tts``).  The STT
     model is R1's own switch (``r1_stt_model``): saaras:v4 unless it is set (saaras:v3 rollback).
     """
-    from livekit.agents import APIConnectOptions, AgentSession
+    from livekit.agents import APIConnectOptions, AgentSession, inference
     from livekit.agents.voice.agent_session import SessionConnectOptions
     from livekit.plugins import sarvam
     from r1_llm import build_r1_llm
@@ -3397,7 +3401,22 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     if stt_note is not None:
         _log.warn("unknown_event", error_type="r1_stt_setting_rejected", error_category=stt_note)
     _log.info("unknown_event", error_type="r1_stt_model", model=stt_model)
+    turn_handling = r1_turn_handling()
+    anchor = vad_endpoint_anchor_enabled()
+    _log.info(
+        "unknown_event",
+        error_type="r1_endpointing",
+        error_category="vad_anchor" if anchor else "transcript",
+        duration_sec=turn_handling["endpointing"]["min_delay"],
+    )
+    if anchor and (os.getenv("R1_ENDPOINT_MIN_DELAY_SEC") or "").strip():
+        # The transcript-anchored minimum is not applied as real silence (r1_latency); no value.
+        _log.warn("unknown_event", error_type="r1_endpoint_setting_ignored")
+    # Anchor on: the SDK's own default VAD, handed over explicitly so the endpointing wait runs
+    # from the VAD's end of speech.  Off: no "vad" key at all, exactly as before.
+    vad_kwargs = {"vad": inference.VAD(model="silero")} if anchor else {}
     return AgentSession(
+        **vad_kwargs,
         stt=sarvam.STT(model=stt_model, language=os.getenv("SARVAM_LANGUAGE", "en-IN")),
         tts=tts,
         llm=build_r1_llm(),
@@ -3408,7 +3427,7 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
                 timeout=10.0,
             )
         ),
-        turn_handling=r1_turn_handling(),
+        turn_handling=turn_handling,
         user_away_timeout=None,
     )
 

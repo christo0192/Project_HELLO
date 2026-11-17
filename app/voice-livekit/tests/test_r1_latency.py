@@ -34,6 +34,8 @@ from r1_latency import (
 )
 
 _ENV_KEYS = (
+    "R1_VAD_ENDPOINT_ANCHOR",
+    "R1_ENDPOINT_VAD_MIN_DELAY_SEC",
     "R1_ENDPOINT_MIN_DELAY_SEC",
     "R1_ENDPOINT_MAX_DELAY_SEC",
     "R1_INTERRUPT_MIN_DURATION_SEC",
@@ -201,11 +203,33 @@ class TestTurnHandling(unittest.TestCase):
         self.assertEqual(
             r1_turn_handling(),
             {
-                "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+                "endpointing": {"min_delay": 1.0, "max_delay": 3.0},
                 "interruption": dict(_INTERRUPTION_DEFAULTS),
                 "preemptive_generation": {"enabled": False},
             },
         )
+
+    def test_vad_anchor_settings_and_rollback(self) -> None:
+        for raw, expected in (("0.3", 0.5), ("3.0", 2.0), ("abc", 1.0), ("1.1", 1.1)):
+            with self.subTest(raw=raw):
+                os.environ["R1_ENDPOINT_VAD_MIN_DELAY_SEC"] = raw
+                self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], expected)
+        os.environ.pop("R1_ENDPOINT_VAD_MIN_DELAY_SEC")
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.6"
+        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 1.0)
+        for flag in ("0", " OFF ", "False", "no"):
+            with self.subTest(flag=flag):
+                os.environ["R1_VAD_ENDPOINT_ANCHOR"] = flag
+                self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 0.6)
+                os.environ.pop("R1_ENDPOINT_MIN_DELAY_SEC")
+                expected = self._defaults()
+                expected["endpointing"]["min_delay"] = 0.8
+                self.assertEqual(r1_turn_handling(), expected)
+                os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.6"
+        os.environ.pop("R1_VAD_ENDPOINT_ANCHOR")
+        os.environ["R1_ENDPOINT_VAD_MIN_DELAY_SEC"] = "2.0"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        self.assertEqual(r1_turn_handling()["endpointing"], {"min_delay": 2.0, "max_delay": 2.0})
 
     def test_by_default_any_words_can_barge_in_but_only_after_the_voice_lasted(self) -> None:
         interruption = r1_turn_handling()["interruption"]
@@ -237,6 +261,7 @@ class TestTurnHandling(unittest.TestCase):
         )
 
     def test_each_value_can_be_tuned_from_the_environment(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ.update(
             {
                 "R1_ENDPOINT_MIN_DELAY_SEC": "0.5",
@@ -259,6 +284,7 @@ class TestTurnHandling(unittest.TestCase):
         )
 
     def test_every_value_is_bounded(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ.update(
             {
                 "R1_ENDPOINT_MIN_DELAY_SEC": "0.0",
@@ -297,6 +323,7 @@ class TestTurnHandling(unittest.TestCase):
                 self.assertEqual(r1_turn_handling(), self._defaults())
 
     def test_the_maximum_delay_never_undercuts_the_minimum(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "2.0"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
         endpointing = r1_turn_handling()["endpointing"]
@@ -305,12 +332,12 @@ class TestTurnHandling(unittest.TestCase):
     def test_each_call_returns_a_fresh_dict(self) -> None:
         first = r1_turn_handling()
         first["endpointing"]["min_delay"] = 99
-        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 0.8)
+        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 1.0)
 
     @staticmethod
     def _defaults() -> dict:
         return {
-            "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+            "endpointing": {"min_delay": 1.0, "max_delay": 3.0},
             "interruption": dict(_INTERRUPTION_DEFAULTS),
             "preemptive_generation": {"enabled": False},
         }
@@ -335,6 +362,7 @@ class TestTransitionEndpointing(unittest.TestCase):
         self.assertLess(r1_latency.r1_transition_endpointing()["max_delay"], session["max_delay"])
 
     def test_it_never_waits_longer_than_the_session_does(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.3"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
         self.assertEqual(
@@ -342,12 +370,14 @@ class TestTransitionEndpointing(unittest.TestCase):
         )
 
     def test_the_maximum_never_undercuts_the_minimum(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.2"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
         endpointing = r1_latency.r1_transition_endpointing()
         self.assertLessEqual(endpointing["min_delay"], endpointing["max_delay"])
 
     def test_a_slower_session_is_capped_at_the_transition_numbers(self) -> None:
+        os.environ["R1_VAD_ENDPOINT_ANCHOR"] = "0"
         os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "1.5"
         os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "6"
         self.assertEqual(
