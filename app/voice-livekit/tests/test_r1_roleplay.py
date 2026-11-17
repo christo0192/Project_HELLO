@@ -1266,6 +1266,33 @@ class AskTests(unittest.TestCase):
         self.assertIn("ask_in_window:grade_medium", handled.reasons)
         self.assertTrue(handled.resolves_commitment)
 
+    def test_temperament_limits_stalls_and_is_logged(self):
+        persona = resolve_persona(P1.id, variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        eng = engine(persona)
+        self.assertEqual(eng.admin_log()["temperament"], {
+            "id": "deep_evaluator", "stall_rounds": 1, "enrol_ceiling": "STRONG"})
+        self.assertNotIn("temperament", engine().admin_log())
+        eng.negotiation.stall_rounds = 1
+        self.assertFalse(eng.negotiation.can_stall())
+        default = engine()
+        default.negotiation.stall_rounds = 1
+        self.assertTrue(default.negotiation.can_stall())
+        self.assertEqual(eng.admin_log()["negotiation"]["stall_rounds"], 1)
+
+    def test_temperament_resolves_weak_after_one_stall(self):
+        persona = resolve_persona(P1.id, variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for current, expected in ((persona, Level.WEAK), (P1, None)):
+            session, r = run_cooperative(72.5, eng=engine(current))
+            session.eng.negotiation.stall_rounds = 1
+            plan = session.say(ASK, r)
+            self.assertEqual(plan.commitment_level, expected)
+            if expected is Level.WEAK:
+                self.assertTrue(plan.resolves_commitment)
+            else:
+                self.assertEqual(plan.mode, TurnMode.INTENT)
+
     def test_the_stall_reason_rounds_are_capped_at_two(self):
         eng = engine()
         s = Session(eng)

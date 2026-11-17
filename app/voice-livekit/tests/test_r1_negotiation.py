@@ -1384,6 +1384,13 @@ class StateTests(unittest.TestCase):
         state.note_reason_voiced(neg.REASON_TIMING, 9)
         self.assertEqual(state.voiced[neg.REASON_TIMING], 1)  # the first time stands
 
+    def test_custom_stall_limit(self):
+        one = neg.Negotiation("husband", max_stall_rounds=1)
+        default = neg.Negotiation("husband")
+        one.stall_rounds = default.stall_rounds = 1
+        self.assertFalse(one.can_stall())
+        self.assertTrue(default.can_stall())
+
     def test_stall_rounds_are_capped(self):
         state = self.state()
         self.assertTrue(state.can_stall())

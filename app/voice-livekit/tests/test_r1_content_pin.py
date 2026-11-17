@@ -269,7 +269,8 @@ import r1_world
 # 33-34 on top of revision 33; no text changed in the merge.  CONTENT_REVISION =
 # max(33, 31, 34) + 1.
 # 36: M033 A4 pins the STRONG upgrade line.
-PINNED_CONTENT_SHA256 = "1dff6cb69370c716c8ef23e918657831b94649232e51a08fdee86e5f88ab2545"
+# 37: M033 A5 learner temperaments.
+PINNED_CONTENT_SHA256 = "92d494a3201c2212f744f9134ab96a8b7453e3a19cf84f8446d65dbdb42785a1"
 
 CONTENT_MODULES = (
     "r1_text",

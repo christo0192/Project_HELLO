@@ -2595,6 +2595,8 @@ def _is_card_answer(sentence: str, persona: RenderedPersona | None) -> bool:
 def _card_texts(persona: RenderedPersona) -> list[str]:
     # M032 SWEEP-8: both card wordings stay allowed, so a session on either release is clean.
     answers = [answer for _, answer in PUBLIC_ANSWERS]
+    if persona.temperament is not None:
+        answers.append(persona.temperament.timeline_answer)
     answers.append(SUCCESS_ANSWER_V2)
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)

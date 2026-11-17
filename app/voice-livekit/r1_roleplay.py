@@ -81,7 +81,8 @@ Integration sketch for ``r1_session`` (the follow-up change; one call per final 
 transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play clock)::
 
     engine = RolePlayEngine(resolve_persona(pid, variant=v, seed=attempt_id,
-                                            avoid_first_name=first_name),
+                                            avoid_first_name=first_name,
+                                            temperament_on=flag_on(FLAG_TEMPERAMENT)),
                             candidate_first_name=first_name, seed=attempt_id)
     plan = engine.plan_turn(text, machine.roleplay_elapsed, turn_index=i,
                             backchannel=is_acknowledgement_turn(text),
@@ -1279,6 +1280,8 @@ FLAG_DISCOUNT_DISCIPLINE_V2 = "R1_DISCOUNT_DISCIPLINE_V2"
 FLAG_CLOSE_WINDOW_EVIDENCE = "R1_CLOSE_WINDOW_EVIDENCE"
 # M033 A4: one regrade from a MEDIUM call commitment to STRONG on a later enrolment ask.
 FLAG_COMMIT_UPGRADE = "R1_COMMIT_UPGRADE"
+# M033 A5: latch the learner temperament when the session selects its persona.
+FLAG_TEMPERAMENT = "R1_TEMPERAMENT"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1418,6 +1421,7 @@ _FLAG_READS = {
     FLAG_DISCOUNT_DISCIPLINE_V2: lambda: os.getenv("R1_DISCOUNT_DISCIPLINE_V2"),
     FLAG_CLOSE_WINDOW_EVIDENCE: lambda: os.getenv("R1_CLOSE_WINDOW_EVIDENCE"),
     FLAG_COMMIT_UPGRADE: lambda: os.getenv("R1_COMMIT_UPGRADE"),
+    FLAG_TEMPERAMENT: lambda: os.getenv("R1_TEMPERAMENT"),
 }
 
 
@@ -1813,7 +1817,10 @@ class RolePlayEngine:
         # Negotiation (R1-Q): what is on the table, the stall reasons used and the commitment
         # on record.  ``_notes`` are this turn's situation notes for the reminder, and
         # ``_new_offer_usd`` the price an advisor turn added (the only "pleasant surprise" turn).
-        self.negotiation = Negotiation(persona.decision_maker)
+        self.negotiation = (
+            Negotiation(persona.decision_maker, max_stall_rounds=persona.temperament.stall_rounds)
+            if persona.temperament is not None else Negotiation(persona.decision_maker)
+        )
         self._notes: list[str] = []
         self._price_notes: list[str] = []
         self._new_offer_usd: int | None = None
@@ -7606,6 +7613,11 @@ class RolePlayEngine:
                 entry[f"{key}_transcript_turn"] = None if turn is None else self._turn_map.get(turn)
             needs.append(entry)
         return {
+            **({"temperament": {
+                "id": self.persona.temperament.id,
+                "stall_rounds": self.persona.temperament.stall_rounds,
+                "enrol_ceiling": self.persona.temperament.enrol_ceiling.name,
+            }} if self.persona.temperament is not None else {}),
             **({"close_window": {
                 "open_r": self.scheduler.close_window_open_r,
                 "reason": self.scheduler.close_window_reason,

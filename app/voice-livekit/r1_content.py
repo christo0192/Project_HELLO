@@ -29,6 +29,7 @@ import r1_personas
 import r1_prompts
 import r1_scheduler
 import r1_script
+import r1_temperament
 import r1_text
 import r1_tracker
 import r1_world
@@ -391,7 +392,9 @@ import r1_world
 #    CONTENT_REVISION = max(33, 31, 34) + 1.
 # 36: M033 A4 (R1_COMMIT_UPGRADE): the STRONG upgrade line after a MEDIUM call commitment
 #    (r1_commitment.UPGRADE_LINE). No other text changed.
-CONTENT_REVISION = 36
+# 37: M033 A5 (R1_TEMPERAMENT): the four learner temperaments (card line, decision-timing
+#    answer, stall rounds; r1_temperament). No other text changed.
+CONTENT_REVISION = 37
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -816,6 +819,16 @@ def manifest() -> dict[str, Any]:
         "revision": CONTENT_REVISION,
         "world": {"version": r1_world.WORLD_VERSION, "sha256": r1_world.WORLD_SHA256},
         "personas": {p.id: _persona_manifest(p) for p in r1_personas.PERSONAS},
+        "temperaments": {
+            "card_line_prefix": r1_temperament.CARD_LINE_PREFIX,
+            **{t.id: {
+                "label": t.label, "weight": t.weight, "count_weights": t.count_weights,
+                "family_weights": t.family_weights, "family_themes": t.family_themes,
+                "f4_theme": t.f4_theme, "enrol_ceiling": t.enrol_ceiling.name,
+                "stall_rounds": t.stall_rounds, "key_criterion": t.key_criterion,
+                "card_line": t.card_line, "timeline_answer": t.timeline_answer,
+            } for t in r1_temperament.TEMPERAMENTS},
+        },
         "script": {
             "interviewer_name": r1_script.INTERVIEWER_NAME,
             "exit_cue": r1_script.EXIT_CUE,

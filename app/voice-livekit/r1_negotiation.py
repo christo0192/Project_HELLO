@@ -4185,8 +4185,9 @@ class NegotiationTurn:
 class Negotiation:
     """Everything the learner remembers about the price, the callbacks and its own reasons."""
 
-    def __init__(self, decision_maker: str) -> None:
+    def __init__(self, decision_maker: str, *, max_stall_rounds: int = MAX_STALL_ROUNDS) -> None:
         self.decision_maker = decision_maker
+        self.max_stall_rounds = max_stall_rounds
         self.offers: list[PriceOffer] = []
         self.refusals = 0
         # True once an advisor turn AFTER the learner's anchor put a price on the table (new or
@@ -4717,7 +4718,7 @@ class Negotiation:
 
     def can_stall(self, skip: Iterable[str] = ()) -> bool:
         """Whether an ask inside the close window may still be met with a reason."""
-        return self.stall_rounds < MAX_STALL_ROUNDS and self.next_reason(skip) is not None
+        return self.stall_rounds < self.max_stall_rounds and self.next_reason(skip) is not None
 
     @property
     def reasons_handled_count(self) -> int:

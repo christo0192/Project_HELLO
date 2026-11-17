@@ -424,6 +424,13 @@ class LearnerLengthAndAckTests(unittest.TestCase):
         self.assertFalse(guard_text("Around $900 a month.", context).clean)
         self.assertFalse(guard_text("My schedule is packed on weekends.", context).clean)
 
+    def test_temperament_timing_answers_pass_as_card_answers(self):
+        from r1_temperament import TEMPERAMENTS
+        for item in TEMPERAMENTS:
+            persona = resolve_persona(PERSONA.id, temperament_on=True, temperament=item.id)
+            result = guard_text(item.timeline_answer, ctx(mode="ack", persona=persona))
+            self.assertTrue(result.clean, (item.id, result.hits))
+
     def test_the_deflection_line_is_no_longer_a_whitelisted_card_answer(self):
         """R1-Q: the catch-all deflection left the card, so it is not a card answer either."""
         from r1_guard import _card_texts

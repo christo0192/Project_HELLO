@@ -110,6 +110,8 @@ READER_FACT_KEYS = ("reader_shadow", "reader_agreement")
 # "clock" / "evidence"), only when the engine logs it.  Worker-only: the API parser reads
 # neither, so no gate or score depends on them.
 CLOSE_WINDOW_FACT_KEYS = ("close_window_open_r", "close_window_reason")
+# Worker-only: the API parser reads none of it; no gate or score depends on it.
+TEMPERAMENT_FACT_KEYS = ("temperament",)
 # Worker-only ``session_facts`` keys (M032 S1 and SWEEP-1): the API stores them with the row and
 # does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
 # learner's timing holds as counts only (no text), so the owner's next test shows how often each
@@ -314,7 +316,8 @@ def pick_persona_id(seed: str) -> str:
 
 
 def choose_persona(
-    context: Mapping[str, Any], *, seed: str, candidate_first_name: str = ""
+    context: Mapping[str, Any], *, seed: str, candidate_first_name: str = "",
+    temperament_on: bool = False
 ) -> PersonaChoice:
     """Pick the persona card: the attempt's own when valid, else a pick seeded by the session."""
     seed = seed or DEFAULT_SEED
@@ -328,10 +331,12 @@ def choose_persona(
                 variant=variant if isinstance(variant, str) and variant else "default",
                 seed=seed,
                 avoid_first_name=candidate_first_name,
+                temperament_on=temperament_on,
             )
             return PersonaChoice(rendered, SOURCE_ATTEMPT, seed)
     rendered = resolve_persona(
-        pick_persona_id(seed), variant="default", seed=seed, avoid_first_name=candidate_first_name
+        pick_persona_id(seed), variant="default", seed=seed, avoid_first_name=candidate_first_name,
+        temperament_on=temperament_on
     )
     return PersonaChoice(rendered, SOURCE_SEED, seed)
 
@@ -626,6 +631,10 @@ def session_facts_event(
         {"close_window_open_r": close.get("open_r"), "close_window_reason": close.get("reason")}
         if isinstance(close, Mapping) else {}
     )
+    temperament = (admin or {}).get("temperament")
+    temperament_facts = (
+        {"temperament": temperament["id"]} if isinstance(temperament, Mapping) else {}
+    )
     shadow = {key: reader[key] for key in READER_FACT_KEYS if key in (reader or {})}
     added = {key: extra[key] for key in EXTRA_FACT_KEYS if key in (extra or {})}
     return {
@@ -642,6 +651,7 @@ def session_facts_event(
             "learner_followups": _learner_followups(admin),
             "wrapup": _wrapup_counts(wrapup),
             **close_facts,
+            **temperament_facts,
             **shadow,
             **added,
         },

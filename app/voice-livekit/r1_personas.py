@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from r1_commitment import call_proposal_in
 from r1_script import active_line_id
 from r1_script import line as script_line
+from r1_temperament import CARD_LINE_PREFIX, Temperament, pick_temperament
 from r1_text import dollar_amounts, fold, is_question_like, split_sentences
 
 PERSONA_VERSION = 1
@@ -612,6 +613,7 @@ class RenderedPersona:
 
     persona: Persona
     variant: Variant
+    temperament: Temperament | None = None
 
     @property
     def id(self) -> str:
@@ -736,11 +738,15 @@ class RenderedPersona:
                 "the advisor asks about you, and never recite it):"
             )
             parts.extend(f"- {fact}" for fact in backstory)
+        if self.temperament is not None:
+            parts.append(CARD_LINE_PREFIX + self.temperament.card_line)
         parts.append("Short answers, to give only when asked and never to expand on:")
         for topic in H_TOPICS:
             parts.append(f'- {TOPIC_LABELS[topic]}: "{self.surface(topic)}"')
         parts.append(f'- what you have studied so far: "{self.persona.prior_learning}"')
         for label, answer in public_answers(timeline_v2=timeline_v2):
+            if self.temperament is not None and label == "when you would decide on this course":
+                answer = self.temperament.timeline_answer
             parts.append(f'- {label}: "{answer}"')
         parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
         for label, answer in self.work_answers:
@@ -814,6 +820,8 @@ def resolve_persona(
     variant: str = "default",
     seed: str = "",
     avoid_first_name: str = "",
+    temperament_on: bool = False,
+    temperament: str = "default",
 ) -> RenderedPersona:
     """Resolve the attempt's persona and one stable surface variant.
 
@@ -836,7 +844,10 @@ def resolve_persona(
             if candidate.first_name.lower() != avoid:
                 chosen = candidate
                 break
-    return RenderedPersona(persona, chosen)
+    selected = (pick_temperament(persona_id, seed,
+                                None if temperament == "default" else temperament)
+                if temperament_on else None)
+    return RenderedPersona(persona, chosen, selected)
 
 
 # ----------------------------------------------------------------------------------

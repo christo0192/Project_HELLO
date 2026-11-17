@@ -313,6 +313,7 @@ from r1_prompts import (
     select_context,
 )
 from r1_roleplay import (
+    FLAG_TEMPERAMENT,
     IN_ROLE_ASIDE_REASONS,
     FLAG_WRAPUP_ANSWERS,
     FLAG_WRAPUP_DECLINE_V2,
@@ -4014,6 +4015,7 @@ class R1Interview:
                 self.context,
                 seed=self._seed(),
                 candidate_first_name=str(self.context.get("first_name") or ""),
+                temperament_on=flag_on(FLAG_TEMPERAMENT),
             )
         return self._choice
 

@@ -104,6 +104,18 @@ class LearnerPrefixTests(unittest.TestCase):
             learner_prefix(resolve_persona("p1_career_switcher", variant="v2")),
         )
 
+    def test_temperament_prefix_contains_safe_card(self):
+        from r1_personas import deep_need_topics_in
+        from r1_temperament import TEMPERAMENTS
+
+        for item in TEMPERAMENTS:
+            persona = resolve_persona(P1.id, variant="v1", temperament_on=True,
+                                      temperament=item.id)
+            prefix = learner_prefix(persona, probe_first=True, timeline_v2=True)
+            self.assertIn(persona.public_card_text(probe_first=True, timeline_v2=True), prefix)
+            self.assertFalse(deep_need_topics_in(persona, prefix))
+            self.assertIn("Never state product facts", prefix)
+
     def test_it_never_contains_a_deep_need_a_marker_hit_or_another_persona(self):
         from r1_personas import deep_need_topics_in
 

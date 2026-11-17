@@ -53,6 +53,7 @@ import r1_guard
 from r1_phases import R1Phase
 from r1_replies import (
     CLOSE_WINDOW_FACT_KEYS,
+    TEMPERAMENT_FACT_KEYS,
     EXTRA_FACT_KEYS,
     GUARD_KINDS,
     READER_FACT_KEYS,
@@ -482,6 +483,7 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         # are the repairs' labels and counts (M032 S6), under names the parser never reads.
         worker_only = (
             set(SESSION_FACT_WORKER_KEYS) | set(EXTRA_FACT_KEYS) | set(CLOSE_WINDOW_FACT_KEYS)
+            | set(TEMPERAMENT_FACT_KEYS)
         )
         self.assertEqual(set(payload) - {"pins"} - worker_only, API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"])
@@ -508,6 +510,22 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(payload["first_audio_p95_ms"], 0)
         self.assertEqual(facts[0]["turn_index"], None)
         self.assertEqual(facts[0]["family_id"], None)
+
+    def test_temperament_worker_fact_is_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)["payload"]
+        admin = {"temperament": {"id": "deep_evaluator", "stall_rounds": 1,
+                                 "enrol_ceiling": "STRONG"}}
+        payload = session_facts_event(admin, {}, roleplay_seconds=700)["payload"]
+        self.assertEqual(set(payload) - set(plain), set(TEMPERAMENT_FACT_KEYS))
+        self.assertEqual(payload["temperament"], "deep_evaluator")
+        self.assertFalse(set(TEMPERAMENT_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
+
+    def test_choose_persona_temperament_flag(self):
+        from r1_replies import choose_persona
+        for context in ({}, {"attempt": {"persona_id": "p1_career_switcher"}}):
+            self.assertIsNone(choose_persona(context, seed="s").persona.temperament)
+            self.assertIsNotNone(choose_persona(context, seed="s", temperament_on=True)
+                                 .persona.temperament)
 
     def test_close_window_worker_facts_are_optional(self):
         plain = session_facts_event(None, {}, roleplay_seconds=700)
@@ -573,7 +591,7 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         # The learner lane's worker-only counts (M032 SWEEP-1) ride along whatever these flags say.
         self.assertEqual(
             set(facts["payload"]) - {"pins"} - set(SESSION_FACT_WORKER_KEYS)
-            - set(CLOSE_WINDOW_FACT_KEYS),
+            - set(CLOSE_WINDOW_FACT_KEYS) - set(TEMPERAMENT_FACT_KEYS),
             API_PAYLOAD_KEYS["session_facts"],
         )
 
