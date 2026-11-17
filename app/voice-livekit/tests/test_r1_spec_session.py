@@ -69,7 +69,13 @@ class SpecSessionTests(unittest.IsolatedAsyncioTestCase):
                             async def __anext__(self):
                                 raise StopAsyncIteration
                         return Stream()
-                with patch.object(r1_llm, "build_r1_llm", return_value=Client()), \
+                # A stub SDK module keeps this test independent of a full livekit-agents
+                # install (the CI bare-python step has none).
+                sdk = types.ModuleType("livekit.agents")
+                sdk.APIConnectOptions = lambda **kwargs: types.SimpleNamespace(**kwargs)
+                with patch.dict(sys.modules, {"livekit.agents": sdk}), \
+                     patch.object(r1_session, "_chat_context_from", return_value=None), \
+                     patch.object(r1_llm, "build_r1_llm", return_value=Client()), \
                      patch.object(r1_session._log, "warn") as log:
                     _ = [item async for item in rig.interview._default_spec_runner([])]
                 events = [c for c in log.call_args_list
