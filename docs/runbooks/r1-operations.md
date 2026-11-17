@@ -1468,6 +1468,13 @@ reads a smoke session's lines (plain JSON lines work too) and prints the verdict
 targets; its exit code is 0 for a pass, 1 for a miss and 2 when nothing was measured. Then
 `eou_to_turn_hook` and `guard_hold` say where the time went.
 
+At session exit, `summary_<stage>` lines report `p50`, `p90`, and `max` in
+`error_category`, with `option_count` as the sample count and `phase` including `all`.
+`summary_anchor` counts anchor kinds and `summary_lost` counts lost replies, including zero.
+The headline includes lost replies as lower bounds. Recompute from a session's original lines with
+`python app/voice-livekit/r1_latency.py --summary` on stdin. The default-on flag
+`R1_LATENCY_SUMMARY` controls these lines; set `R1_LATENCY_SUMMARY=0` to roll back.
+
 Related lines: `r1_line_cache_play` (`cached` or `live`, with the line id as `schema`) and
 `r1_line_cache_*` (warm-up events: `synth_ok`, `disk_hit`, `rate_limited`, `gave_up`, ...), and
 `r1_provider_429` (a provider 429 on lane `r1`, `error_category` the component, `option_count`

@@ -38,6 +38,11 @@ in milliseconds, and ``None`` (unknown, which the gate fails closed on) when few
 turns were measured.  A turn whose reply was cancelled before any audio never gets a first audio,
 so its wait so far is kept as a lower bound (``reply_lost``): the slowest turns are the ones that
 are cancelled, and the p95 must not be able to leave them out.
+
+``summary_all`` retains bounded, rounded stage samples and anchor counts by phase.
+At exit, ``r1_session`` writes ``summary_<stage>``, ``summary_anchor`` and
+``summary_lost`` lines when ``R1_LATENCY_SUMMARY`` is on.  Rebuild these summaries
+from latency records with ``python r1_latency.py --summary``.
 """
 from __future__ import annotations
 
@@ -200,6 +205,12 @@ _MAX_PENDING_SAYS = 16
 # The headline samples kept for the session's p95.  A whole interview is a few dozen turns;
 # the bound only stops a runaway session from growing the list (the newest samples win).
 _MAX_HEADLINE_SAMPLES = 512
+# The stages the exit summary reports.
+SUMMARY_SCHEMAS = (
+    "eou_to_turn_hook", "final_to_turn_hook", "llm_ttft", "eou_to_llm_first_token",
+    "guard_hold", "tts_ttfb", "eou_to_first_audio", "eou_to_reply_lost",
+    "say_to_first_audio",
+)
 # What the plan 6.4 gate reads (``session_facts.first_audio_p95_ms``): the learner's turns, i.e.
 # the role-play phase, and at least as many of them as the gate's own ``MIN_QUALIFYING_TURNS``.
 GATE_PHASE = "roleplay"
@@ -229,6 +240,11 @@ _RECENT_TURNS = 4
 
 class LatencyTracker:
     """Stamp one candidate turn at a time and report every segment exactly once.
+
+    ``summary_all`` returns bounded stage samples and anchor counts by phase.
+    At exit, ``r1_session`` writes ``summary_<stage>``, ``summary_anchor`` and
+    ``summary_lost`` lines when ``R1_LATENCY_SUMMARY`` is on.  Records can be
+    summarized again with ``python r1_latency.py --summary``.
 
     Segments (``schema`` values), measured in seconds:
 
@@ -292,6 +308,8 @@ class LatencyTracker:
         # lost: the input of ``first_audio_p95_ms``.
         self._headline: deque[tuple[str, float]] = deque(maxlen=_MAX_HEADLINE_SAMPLES)
         self._lost: deque[str] = deque(maxlen=_MAX_HEADLINE_SAMPLES)  # the phase of each
+        self._summary_samples: dict[tuple[str, str], deque[float]] = {}
+        self._summary_anchors: dict[str, dict[str, int]] = {}
 
     # ------------------------------------------------------------------ candidate side
 
@@ -317,6 +335,8 @@ class LatencyTracker:
             anchor, how = self._final_at, "final"
         else:
             anchor, how = now, "hook"
+        anchors = self._summary_anchors.setdefault(phase, {})
+        anchors[how] = anchors.get(how, 0) + 1
         final_at = self._final_at
         self._stop_at = None
         self._final_at = None
@@ -451,6 +471,18 @@ class LatencyTracker:
         seconds = self.first_audio_p95_seconds(phase, min_samples=min_samples)
         return None if seconds is None else int(round(seconds * 1000.0))
 
+    def summary(self, phase: str | None = None) -> dict[str, Any]:
+        """Return stage statistics, anchor counts and lost replies for one phase or all.
+
+        Stage values are rounded seconds with nearest-rank percentiles; the first-audio
+        headline includes lost-reply lower bounds and their count.
+        """
+        return _summary(self._summary_samples, self._summary_anchors, phase)
+
+    def summary_all(self) -> dict[str, Any]:
+        """Return ``summary`` for every measured phase and the combined ``all`` phase."""
+        return _summaries(self._summary_samples, self._summary_anchors)
+
     # ------------------------------------------------------------------ scripted lines
 
     def say_created(self, speech_id: str, label: str, phase: str) -> None:
@@ -492,6 +524,10 @@ class LatencyTracker:
     ) -> None:
         if not _valid_segment(seconds):
             return
+        if schema in SUMMARY_SCHEMAS:
+            self._summary_samples.setdefault(
+                (schema, phase), deque(maxlen=_MAX_HEADLINE_SAMPLES)
+            ).append(round(seconds, 3))
         self._emit(schema, seconds, category=category, phase=phase, turn_index=index)
 
 
@@ -633,6 +669,68 @@ def latency_records(lines: Iterable[Any]) -> Iterator[Mapping[str, Any]]:
             yield record
 
 
+def _summary(samples: Mapping, anchors: Mapping, phase: str | None) -> dict[str, Any]:
+    """Return stages, anchors and lost counts for a phase, or all phases.
+
+    ``stages`` maps schemas to n, p50, p90 and max; percentiles use nearest rank
+    on seconds rounded to three decimals as logged.  The ``eou_to_first_audio``
+    headline includes lost-reply lower bounds and their count in ``lost``.
+    ``anchors`` counts vad, final and hook; top-level ``lost`` counts lost replies.
+    """
+    stages = {}
+
+    def values(schema: str) -> list[float]:
+        return [value for (name, ph), items in samples.items()
+                if name == schema and (phase is None or ph == phase) for value in items]
+    lost = values("eou_to_reply_lost")
+    for schema in SUMMARY_SCHEMAS:
+        items = values(schema)
+        if schema == "eou_to_first_audio":
+            items += lost
+        if items:
+            stage = {"n": len(items), "p50": percentile(items, 50),
+                     "p90": percentile(items, 90), "max": max(items)}
+            if schema == "eou_to_first_audio":
+                stage["lost"] = len(lost)
+            stages[schema] = stage
+    counts = {kind: sum(counts.get(kind, 0) for ph, counts in anchors.items()
+                        if phase is None or ph == phase) for kind in ("vad", "final", "hook")}
+    return {"stages": stages, "anchors": counts, "lost": len(lost)}
+
+
+def _summaries(samples: Mapping, anchors: Mapping) -> dict[str, Any]:
+    """Return stage statistics, anchors and lost counts by phase and combined as ``all``."""
+    phases = sorted({phase for _, phase in samples} | set(anchors))
+    result = {phase: _summary(samples, anchors, phase) for phase in phases}
+    if phases:
+        result["all"] = _summary(samples, anchors, None)
+    return result
+
+
+def summary_from_records(lines: Iterable[Any]) -> dict[str, Any]:
+    """Rebuild per-phase and combined stage statistics, anchors and lost counts from logs.
+
+    Stage values are rounded seconds with nearest-rank percentiles; the first-audio
+    headline includes lost-reply lower bounds and their count.
+    """
+    samples: dict[tuple[str, str], deque[float]] = {}
+    anchors: dict[str, dict[str, int]] = {}
+    for record in latency_records(lines):
+        schema, phase = record.get("schema"), record.get("phase")
+        if schema not in SUMMARY_SCHEMAS or not isinstance(phase, str):
+            continue
+        values = _finite([record.get("duration_sec")])
+        if values:
+            samples.setdefault(
+                (schema, phase), deque(maxlen=_MAX_HEADLINE_SAMPLES)
+            ).append(values[0])
+        kind = record.get("error_category")
+        if schema == "eou_to_turn_hook" and kind in ("vad", "final", "hook"):
+            counts = anchors.setdefault(phase, {})
+            counts[kind] = counts.get(kind, 0) + 1
+    return _summaries(samples, anchors)
+
+
 def stage_a_report(lines: Iterable[Any]) -> dict[str, Any]:
     """Judge a smoke session's log lines against the Stage A targets (plan 5.15 item 6).
 
@@ -685,8 +783,11 @@ def stage_a_report(lines: Iterable[Any]) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """``fly logs --json | python r1_latency.py``: print the Stage A report; exit 0 pass,
-    1 miss, 2 nothing measured."""
-    del argv
+    1 miss, 2 nothing measured.  ``--summary`` prints per-phase summaries instead."""
+    if argv is not None and list(argv) == ["--summary"]:
+        report = summary_from_records(sys.stdin)
+        sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        return 0 if report else 2
     report = stage_a_report(sys.stdin)
     sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
     passes = report["passes"]
@@ -694,4 +795,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

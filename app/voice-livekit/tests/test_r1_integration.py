@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import observability
 import r1_llm
 import r1_phases
 import r1_roleplay
@@ -2218,6 +2219,63 @@ class TestCoachAsideAlwaysReturns(unittest.IsolatedAsyncioTestCase):
 class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
     async def full_session(self) -> Rig:
         return await fidelity_session()
+
+    async def test_latency_summary_lines_are_safe(self) -> None:
+        rig = await self.full_session()
+        with mock.patch.dict(os.environ, {"R1_LATENCY_SUMMARY": "1"}), capture_r1_logs() as lines:
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        summary = [line for line in lines if line.get("schema", "").startswith("summary_")]
+        self.assertTrue(summary)
+        envelope = set(lines[0]) - observability._ALLOWED_META_KEYS
+        for line in summary:
+            self.assertLessEqual(set(line), observability._ALLOWED_META_KEYS | envelope)
+            self.assertEqual(line["error_type"], "r1_latency")
+            if "duration_sec" in line:
+                self.assertIsInstance(line["duration_sec"], (int, float))
+                self.assertEqual(line["duration_sec"], round(line["duration_sec"], 3))
+        for candidate_text in (*cooperative_script(), ASK, OPENER, POISON):
+            self.assertNotIn(candidate_text, json.dumps(summary))
+
+    async def test_latency_summary_off_preserves_other_lines(self) -> None:
+        rig = await self.full_session()
+        with mock.patch.dict(os.environ, {"R1_LATENCY_SUMMARY": "1"}), capture_r1_logs() as on:
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        rig.interview._fidelity_queued = False
+        with mock.patch.dict(os.environ, {"R1_LATENCY_SUMMARY": "0"}), capture_r1_logs() as off:
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        self.assertFalse(any(line.get("schema", "").startswith("summary_") for line in off))
+
+        def without_time(lines):
+            return [{key: value for key, value in line.items() if key != "timestamp"}
+                    for line in lines]
+
+        other = [line for line in on if not line.get("schema", "").startswith("summary_")]
+        self.assertEqual(without_time(other), without_time(off))
+
+    async def test_icebreaker_only_session_has_summary(self) -> None:
+        rig = Rig()
+        rig.interview._latency.begin_turn(1, "icebreaker")
+        with mock.patch.dict(os.environ, {"R1_LATENCY_SUMMARY": "1"}), capture_r1_logs() as lines:
+            rig.interview._queue_fidelity()
+        phases = {line.get("phase") for line in lines if line.get("schema") == "summary_lost"}
+        self.assertEqual(phases, {"icebreaker", "all"})
+
+    async def test_summary_failure_keeps_fidelity_events(self) -> None:
+        rig = await self.full_session()
+        with mock.patch.object(
+            rig.interview._latency, "summary_all", side_effect=ValueError(POISON)
+        ), mock.patch.dict(os.environ, {"R1_LATENCY_SUMMARY": "1"}), capture_r1_logs() as lines:
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        failures = [line for line in lines if line.get("error_type") == "r1_latency_summary_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["error_category"], "ValueError")
+        self.assertFalse(any(line.get("schema", "").startswith("summary_") for line in lines))
+        self.assertNotIn(POISON, json.dumps(lines))
+        self.assertTrue(rig.writer.admin_events)
 
     async def test_the_record_holds_pins_moves_guard_trips_and_reveals_with_turn_indices(
         self,

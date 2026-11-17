@@ -78,6 +78,114 @@ class Lines:
         return found[0]
 
 
+class TestLatencySummary(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock, self.lines = Clock(), Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+
+    def emit(self, value: float) -> None:
+        self.tracker._emit_checked("llm_ttft", value, category="reply", phase="roleplay", index=1)
+
+    def records(self) -> list[str]:
+        return [json.dumps(dict(component="r1", error_type="r1_latency", schema=s,
+                                duration_sec=v, error_category=c, phase=p, turn_index=i))
+                for s, v, c, p, i in self.lines.items]
+
+    def test_nearest_rank(self) -> None:
+        """Ten samples use nearest-rank percentiles."""
+        for value in range(1, 11):
+            self.emit(value)
+        self.assertEqual(self.tracker.summary()["stages"]["llm_ttft"],
+                         {"n": 10, "p50": 5, "p90": 9, "max": 10})
+
+    def test_one_and_two_samples(self) -> None:
+        """Small samples have exact nearest-rank values."""
+        self.emit(2)
+        self.assertEqual(self.tracker.summary()["stages"]["llm_ttft"],
+                         {"n": 1, "p50": 2, "p90": 2, "max": 2})
+        self.emit(1)
+        self.assertEqual(self.tracker.summary()["stages"]["llm_ttft"],
+                         {"n": 2, "p50": 1, "p90": 2, "max": 2})
+
+    def test_lost_reply_counts_in_headline(self) -> None:
+        """A lost reply contributes its lower bound and both lost counts."""
+        self.tracker.begin_turn(1, "roleplay")
+        self.clock.at(1)
+        self.tracker.first_audio()
+        self.tracker.begin_turn(2, "roleplay")
+        self.clock.at(3)
+        self.tracker.reply_lost(self.tracker.open_turn_id())
+        result = self.tracker.summary()
+        self.assertEqual(result["stages"]["eou_to_first_audio"]["n"], 2)
+        self.assertEqual(result["stages"]["eou_to_first_audio"]["lost"], 1)
+        self.assertEqual(result["lost"], 1)
+
+    def test_phases_and_all(self) -> None:
+        """Phase samples stay separate and all combines them."""
+        for index, phase in enumerate(("icebreaker", "roleplay", "roleplay")):
+            self.tracker.begin_turn(index, phase)
+        result = self.tracker.summary_all()
+        for phase, count in (("icebreaker", 1), ("roleplay", 2), ("all", 3)):
+            self.assertEqual(result[phase]["stages"]["eou_to_turn_hook"]["n"], count)
+
+    def test_storage_bound(self) -> None:
+        """The oldest ten samples are dropped at the storage bound."""
+        for value in range(r1_latency._MAX_HEADLINE_SAMPLES + 10):
+            self.emit(value)
+        stage = self.tracker.summary()["stages"]["llm_ttft"]
+        self.assertEqual(stage["n"], r1_latency._MAX_HEADLINE_SAMPLES)
+        self.assertEqual(min(self.tracker._summary_samples[("llm_ttft", "roleplay")]), 10)
+
+    def test_anchor_counts(self) -> None:
+        """VAD, final, and hook anchors are counted separately."""
+        self.tracker.note_user_state("speaking")
+        self.tracker.note_user_state("listening")
+        self.tracker.begin_turn(1, "icebreaker")
+        self.tracker.note_final()
+        self.tracker.begin_turn(2, "roleplay")
+        self.tracker.begin_turn(3, "roleplay")
+        result = self.tracker.summary_all()
+        self.assertEqual(result["all"]["anchors"], {"vad": 1, "final": 1, "hook": 1})
+        self.assertEqual(result["icebreaker"]["anchors"], {"vad": 1, "final": 0, "hook": 0})
+        self.assertEqual(result["roleplay"]["anchors"], {"vad": 0, "final": 1, "hook": 1})
+
+    def test_records_rebuild_rounded_summary(self) -> None:
+        """Logged rounded values rebuild the summary and ignore unrelated records."""
+        self.tracker.begin_turn(1, "icebreaker")
+        self.clock.at(1.2345)
+        self.tracker.first_audio()
+        self.tracker.begin_turn(2, "roleplay")
+        self.clock.at(3.5801)
+        self.tracker.reply_lost(self.tracker.open_turn_id())
+        records = self.records()
+        for schema in ("summary_lost", "first_audio_p95"):
+            records.append(json.dumps(dict(component="r1", error_type="r1_latency",
+                                           schema=schema, phase="other", duration_sec=8)))
+        result = self.tracker.summary_all()
+        self.assertEqual(result["icebreaker"]["stages"]["eou_to_first_audio"]["max"], 1.234)
+        self.assertEqual(r1_latency.summary_from_records(records), result)
+
+    def test_summary_cli(self) -> None:
+        """Summary CLI accepts sequences and reports empty input."""
+        self.tracker.begin_turn(1, "roleplay")
+        records = "\n".join(self.records())
+        for args in (["--summary"], ("--summary",)):
+            with self.subTest(args=args), mock.patch("sys.stdin", io.StringIO(records)), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                self.assertEqual(r1_latency.main(args), 0)
+                self.assertEqual(json.loads(out.getvalue()), self.tracker.summary_all())
+        with mock.patch("sys.stdin", io.StringIO("")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(r1_latency.main(["--summary"]), 2)
+
+    def test_default_cli_reports_targets(self) -> None:
+        """The default CLI still emits the Stage A report."""
+        with mock.patch("sys.stdin", io.StringIO("\n".join(map(json.dumps, headline(1.2))))), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            r1_latency.main()
+            self.assertIn("targets", json.loads(out.getvalue()))
+
+
 class TestTurnHandling(unittest.TestCase):
     def setUp(self) -> None:
         patcher = mock.patch.dict(os.environ, {}, clear=False)  # restores whatever the test sets

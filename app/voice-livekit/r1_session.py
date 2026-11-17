@@ -1103,6 +1103,11 @@ def _env_seconds(raw: str | None, default: float, minimum: float, maximum: float
     return min(maximum, max(minimum, value))
 
 
+def latency_summary_enabled() -> bool:
+    """``R1_LATENCY_SUMMARY`` (default on): log session latency statistics at exit."""
+    return _env_switch(os.getenv("R1_LATENCY_SUMMARY"))
+
+
 def ack_hold_enabled() -> bool:
     """``R1_ACK_HOLD`` (default on): hold acknowledgements back from the SDK (``stt_node``)."""
     return _env_switch(os.getenv("R1_ACK_HOLD"))
@@ -4618,6 +4623,7 @@ class R1Interview:
         if self._fidelity_queued:
             return
         self._fidelity_queued = True
+        self._log_latency_summary()
         engine = self._engine
         has_record = engine is not None and (engine.turn > 0 or bool(self._guard_trips))
         if not has_record and not self.machine.roleplay_entered:
@@ -4659,6 +4665,40 @@ class R1Interview:
         task = asyncio.ensure_future(self._post_fidelity(poster, events))
         self._turn_writes.add(task)
         task.add_done_callback(self._turn_writes.discard)
+
+    def _log_latency_summary(self) -> None:
+        """Log one line per statistic using numbers and labels only.
+
+        Phases are the tracker's fixed labels plus ``all``.  Read once at exit from
+        ``_queue_fidelity`` before its early return, including icebreaker-only sessions.
+        ``R1_LATENCY_SUMMARY=0`` emits nothing.
+        """
+        try:
+            if not latency_summary_enabled():
+                return
+            for phase, summary in self._latency.summary_all().items():
+                for stage, stats in summary["stages"].items():
+                    for statistic in ("p50", "p90", "max"):
+                        _log.info(
+                            "unknown_event", error_type="r1_latency", schema="summary_" + stage,
+                            error_category=statistic, phase=phase,
+                            duration_sec=round(stats[statistic], 3), option_count=stats["n"],
+                        )
+                for kind, count in summary["anchors"].items():
+                    if count:
+                        _log.info(
+                            "unknown_event", error_type="r1_latency", schema="summary_anchor",
+                            error_category=kind, phase=phase, option_count=count,
+                        )
+                _log.info(
+                    "unknown_event", error_type="r1_latency", schema="summary_lost",
+                    phase=phase, option_count=summary["lost"],
+                )
+        except Exception as exc:  # noqa: BLE001 - measurement must never block the exit
+            _log.warn(
+                "unknown_event", error_type="r1_latency_summary_failed",
+                error_category=_error_type_of(exc),
+            )
 
     def _repair_facts(self) -> dict[str, Any]:
         """M032 S6: the labels and counts the repairs add to ``session_facts`` (flags on only)."""

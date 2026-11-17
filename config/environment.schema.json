@@ -273,6 +273,7 @@
         "R1_OFFER_REALISM": { "requiredInProduction": false, "secret": false },
         "R1_REPLY_LENGTH": { "requiredInProduction": false, "secret": false },
         "R1_PROBE_FIRST": { "requiredInProduction": false, "secret": false },
+        "R1_LATENCY_SUMMARY": { "requiredInProduction": false, "secret": false },
         "R1_OFFER_READER_V2": { "requiredInProduction": false, "secret": false },
         "R1_COUNTER_V2": { "requiredInProduction": false, "secret": false },
         "R1_PRICE_CONFLICT": { "requiredInProduction": false, "secret": false },
