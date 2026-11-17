@@ -389,7 +389,9 @@ import r1_world
 # 35: M032 integration 9 (the learner lane's 31 and the Christy lane's 33-34 merged onto
 #    revision 33): every text of both lanes in one manifest.  No text changed in the merge;
 #    CONTENT_REVISION = max(33, 31, 34) + 1.
-CONTENT_REVISION = 35
+# 36: M033 A4 (R1_COMMIT_UPGRADE): the STRONG upgrade line after a MEDIUM call commitment
+#    (r1_commitment.UPGRADE_LINE). No other text changed.
+CONTENT_REVISION = 36
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -940,6 +942,7 @@ def manifest() -> dict[str, Any]:
         },
         "commitment": {
             "lines": {level.name: text for level, text in r1_commitment.COMMITMENT_LINES.items()},
+            "upgrade_line": r1_commitment.UPGRADE_LINE,
             "default_slot": r1_commitment.DEFAULT_SLOT,
             "moved_line": r1_commitment.MEDIUM_MOVED_LINE,
             "defer_line": r1_commitment.MEDIUM_DEFER_LINE,

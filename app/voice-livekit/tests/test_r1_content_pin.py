@@ -268,7 +268,8 @@ import r1_world
 # Revision 35 (ninth merge of the M032 lanes): the learner lane's 31 and the Christy lane's
 # 33-34 on top of revision 33; no text changed in the merge.  CONTENT_REVISION =
 # max(33, 31, 34) + 1.
-PINNED_CONTENT_SHA256 = "d6069be2c1ef130b23934a4c7c1a8bee85560916b9ea80a7528f6605f458d31b"
+# 36: M033 A4 pins the STRONG upgrade line.
+PINNED_CONTENT_SHA256 = "1dff6cb69370c716c8ef23e918657831b94649232e51a08fdee86e5f88ab2545"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -1106,6 +1107,12 @@ class FinalReviewRoundOnePinTests(unittest.TestCase):
             self.assertNotEqual(r1_content.content_sha256(), base, "STRONG line")
         finally:
             r1_commitment.COMMITMENT_LINES[r1_commitment.Level.STRONG] = line
+        upgrade_line = r1_commitment.UPGRADE_LINE
+        try:
+            r1_commitment.UPGRADE_LINE = upgrade_line + " "
+            self.assertNotEqual(r1_content.content_sha256(), base, "upgrade line")
+        finally:
+            r1_commitment.UPGRADE_LINE = upgrade_line
         self.assertEqual(r1_content.content_sha256(), base)
 
 

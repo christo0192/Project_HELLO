@@ -116,6 +116,7 @@ from typing import Any, Iterable
 
 from r1_commitment import (
     COMMIT_STALL_R_SEC,
+    UPGRADE_LINE,
     THIN_ADVISOR_MEAN_WORDS,
     THIN_MIN_TURNS,
     AskKind,
@@ -1276,6 +1277,8 @@ FLAG_INVENTED_OFFER_V2 = "R1_INVENTED_OFFER_V2"
 FLAG_DISCOUNT_DISCIPLINE_V2 = "R1_DISCOUNT_DISCIPLINE_V2"
 # M033 A3: open on completed families and an answered F4 push from R 10:00.
 FLAG_CLOSE_WINDOW_EVIDENCE = "R1_CLOSE_WINDOW_EVIDENCE"
+# M033 A4: one regrade from a MEDIUM call commitment to STRONG on a later enrolment ask.
+FLAG_COMMIT_UPGRADE = "R1_COMMIT_UPGRADE"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1414,6 +1417,7 @@ _FLAG_READS = {
     FLAG_INVENTED_OFFER_V2: lambda: os.getenv("R1_INVENTED_OFFER_V2"),
     FLAG_DISCOUNT_DISCIPLINE_V2: lambda: os.getenv("R1_DISCOUNT_DISCIPLINE_V2"),
     FLAG_CLOSE_WINDOW_EVIDENCE: lambda: os.getenv("R1_CLOSE_WINDOW_EVIDENCE"),
+    FLAG_COMMIT_UPGRADE: lambda: os.getenv("R1_COMMIT_UPGRADE"),
 }
 
 
@@ -1726,6 +1730,7 @@ class RolePlayEngine:
         self._invented_v2 = flag_on(FLAG_INVENTED_OFFER_V2)
         self._discipline_v2 = flag_on(FLAG_DISCOUNT_DISCIPLINE_V2)
         self._close_evidence = flag_on(FLAG_CLOSE_WINDOW_EVIDENCE)
+        self._commit_upgrade = flag_on(FLAG_COMMIT_UPGRADE)
         self.scheduler = OwedMoveScheduler(
             persona.decision_maker, markers_v2=self._markers_v2,
             evidence_window=self._close_evidence,
@@ -1753,6 +1758,11 @@ class RolePlayEngine:
         self._asks: list[dict[str, Any]] = []
         self._stalls = 0
         self._commitment_level: Level | None = None
+        self._commitment_ask_kind: AskKind | None = None
+        self._commitment_first_level: Level | None = None
+        self._upgrade_tried = False
+        self._commitment_upgraded = False
+        self._commitment_plan_asks: dict[int, AskKind | None] = {}
         self._commitment_turn: int | None = None
         self._violations = 0
         self._ai_questions = 0
@@ -3519,6 +3529,7 @@ class RolePlayEngine:
         if counts:
             self._commitment_revoices += 1
         reasons.append("commitment_revoiced")
+        self._commitment_plan_asks[self.turn] = self._commitment_plan_asks.get(unheard.turn)
         return self._plan(
             TurnMode.SAY_ONLY,
             reasons,
@@ -5573,6 +5584,33 @@ class RolePlayEngine:
             layers["first_probes"] = ()
             layers["reveal_topics"] = ()
         if negotiation.resolved or self.commitment_resolved:
+            if (
+                self._commit_upgrade and wants is AskKind.ENROL
+                and self._commitment_level is Level.MEDIUM
+                and self._commitment_ask_kind is AskKind.CALL
+                and not self._upgrade_tried and r_sec < COMMIT_STALL_R_SEC
+                and self.scheduler.commit_permitted(r_sec)
+            ):
+                self._upgrade_tried = True
+                level = grade(self._evidence(AskKind.ENROL))
+                blocked = negotiation.strong_blocked(self.turn) if level is Level.STRONG else None
+                # The MEDIUM line itself mentions the decision maker, after the call ask.
+                if level is Level.STRONG and blocked is None and (
+                    negotiation.decider_handled_turn is None
+                    or negotiation.decider_handled_turn <= self._commitment_turn
+                ):
+                    blocked = "decider_unresolved"
+                if level is Level.STRONG and blocked is None:
+                    reasons.append("commitment_upgraded")
+                    negotiation.note_response(self.turn, "commit:upgrade")
+                    return self._plan(
+                        TurnMode.SAY_ONLY, reasons, scripted=UPGRADE_LINE,
+                        level=Level.STRONG, resolves=True,
+                    )
+                reasons.append("commitment_on_record")
+                reasons.append(f"upgrade_declined:{blocked or 'grade_' + level.name.lower()}")
+                self._notes.append(RESOLVED_NOTE)
+                return None
             if wants is not None or seen.email_offer or seen.checkin:
                 reasons.append("commitment_on_record")
                 self._notes.append(RESOLVED_NOTE)
@@ -5864,6 +5902,7 @@ class RolePlayEngine:
             text = commitment_line(level, dm, **self._weak_kwargs(call))
         else:
             text = commitment_line(level, dm)
+        self._commitment_plan_asks[self.turn] = ask
         negotiation.note_response(self.turn, f"commit:{level.name.lower()}")
         return self._plan(
             TurnMode.SAY_ONLY,
@@ -7252,7 +7291,15 @@ class RolePlayEngine:
             if fuzzy_contains(spoken_text, plan.scripted_text):
                 if self._commitment_level is None:
                     self._commitment_level = plan.commitment_level
+                    self._commitment_first_level = plan.commitment_level
+                    self._commitment_ask_kind = self._commitment_plan_asks.get(plan.turn)
                     self._commitment_turn = plan.turn
+                elif self._commit_upgrade and "commitment_upgraded" in plan.reasons:
+                    self._commitment_level = Level.STRONG
+                    self._commitment_turn = plan.turn
+                    self._commitment_upgraded = True
+                    self.negotiation.level = Level.STRONG
+                    self.negotiation.commitment_turn = plan.turn
                 self.scheduler.mark_commitment_resolved()
                 if plan.commitment_level is not None:
                     self.negotiation.note_commitment(plan.commitment_level, plan.turn)
@@ -7585,6 +7632,12 @@ class RolePlayEngine:
                 "level": None if self._commitment_level is None else self._commitment_level.name,
                 "turn": self._commitment_turn,
                 "resolved": self.commitment_resolved,
+                **({
+                    "first_level": (None if self._commitment_first_level is None
+                                    else self._commitment_first_level.name),
+                    "upgraded": self._commitment_upgraded,
+                    "upgrade_tried": self._upgrade_tried,
+                } if self._commit_upgrade else {}),
             },
             "guard": self.ledger.summary(),
             # Which layer of each need was handed to the model on which role-play turn

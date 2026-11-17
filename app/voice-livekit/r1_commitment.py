@@ -74,6 +74,11 @@ COMMITMENT_LINES = {
     ),
     Level.WEAK: "Let me think about it. Just email me the details and I'll get back to you.",
 }
+# M033 A4: the scorer mask needs "Send me the enrolment link" to hide this STRONG line.
+UPGRADE_LINE = (
+    "Actually, you know what, I don't want to wait. Send me the "
+    "enrolment link and I'll get started today."
+)
 # The MEDIUM line when the advisor proposed a daytime weekday slot and the learner moves it to
 # the evening.  Still one sentence, still ending "so we can decide".
 MEDIUM_MOVED_LINE = (
@@ -142,17 +147,16 @@ def stall_line(decision_maker: str) -> str:
 
 def is_commitment_line(text: object, decision_maker: str) -> bool:
     """True when ``text`` is (a fuzzy rendering of) one of the scripted lines."""
-    return any(
-        fuzzy_contains(text, commitment_line(level, decision_maker, **variant))
-        for level, variant in (
-            (Level.STRONG, {}),
-            (Level.MEDIUM, {}),
-            (Level.MEDIUM, {"deferred": True}),
-            (Level.WEAK, {}),
-            (Level.WEAK, {"call": True}),
-            (Level.WEAK, {"emailed": True}),
-        )
+    variants = (
+        commitment_line(Level.STRONG, decision_maker),
+        UPGRADE_LINE,
+        commitment_line(Level.MEDIUM, decision_maker),
+        commitment_line(Level.MEDIUM, decision_maker, deferred=True),
+        commitment_line(Level.WEAK, decision_maker),
+        commitment_line(Level.WEAK, decision_maker, call=True),
+        commitment_line(Level.WEAK, decision_maker, emailed=True),
     )
+    return any(fuzzy_contains(text, variant) for variant in variants)
 
 
 def mask_for_scorer(text: str, decision_maker: str) -> str:

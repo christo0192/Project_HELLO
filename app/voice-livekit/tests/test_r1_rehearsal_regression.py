@@ -370,3 +370,36 @@ class NegativeControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommitmentUpgradeMetricsTests(unittest.TestCase):
+    def test_upgrade_summary_is_conditional(self):
+        from rehearsal.metrics import commitment_metrics
+
+        result = commitment_metrics([], {"commitment": {"level": "STRONG", "upgraded": True}})
+        self.assertEqual(result["commitment_level"], "STRONG")
+        self.assertTrue(result["commitment_upgraded"])
+        self.assertNotIn("commitment_upgraded", commitment_metrics([], {"commitment": {}}))
+
+    def test_upgrade_is_not_a_repeat_of_booking(self):
+        from rehearsal.metrics import repeat_metrics
+        from r1_commitment import Level, UPGRADE_LINE, commitment_line
+
+        metrics = repeat_metrics([commitment_line(Level.MEDIUM, "husband"), UPGRADE_LINE])
+        self.assertEqual(metrics["near_repeat_count"], 0)
+        self.assertEqual(metrics["exact_repeat_extra"], 0)
+
+    def test_medium_cap_before_later_upgrade_is_retained(self):
+        from rehearsal.metrics import commitment_spoken_leaks
+
+        admin = {
+            "turn_map": [{"roleplay_turn": 2, "transcript_turn": 4}],
+            "commitment": {"level": "STRONG", "turn": 3, "upgraded": True},
+        }
+        exchanges = [
+            {"n": 1, "learner": {"plan": {"commitment_level": "MEDIUM",
+                                          "delivered_commitment": True}}},
+            {"n": 2, "learner": {"spoken": "Let's book a call with my husband."}},
+        ]
+        trips = [{"category": "commitment", "turn_index": 4}]
+        self.assertEqual(commitment_spoken_leaks(admin, trips, exchanges), [])

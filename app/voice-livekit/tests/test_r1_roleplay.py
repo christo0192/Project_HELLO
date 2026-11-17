@@ -15191,3 +15191,146 @@ class CloseWindowEvidenceIntegrationTests(unittest.TestCase):
                         "ask_before_close_window", "ask_yields_to_owed_move")))
                     self.assertIsNone(plan.commitment_level)
                     self.assertNotIn("close_window", log)
+
+
+class CommitUpgradeTests(unittest.TestCase):
+    BOOK = "Shall we set up a call with your husband on Thursday at 7 PM?"
+    ENROL = "Would you like to go ahead and enrol today? I can send you the enrolment link."
+
+    def booked(self, flag="1", handle=True):
+        with mock.patch.dict(os.environ, {"R1_COMMIT_UPGRADE": flag}):
+            session, r = run_cooperative(65, eng=engine(), script=strong_script())
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        first = session.say(self.BOOK, r)
+        self.assertEqual(first.commitment_level, Level.MEDIUM)
+        self.assertTrue(session.spoken[-1])
+        if handle:
+            commitment_turn = session.eng.turn
+            session.say(HANDLE_DECIDER, r + 5)
+            self.assertGreater(session.eng.negotiation.decider_handled_turn, commitment_turn)
+        return session, r + 10
+
+    def test_upgrade_and_single_attempt(self):
+        from r1_commitment import UPGRADE_LINE
+
+        s, r = self.booked()
+        plan = s.say(self.ENROL, r)
+        self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+        self.assertIn("commitment_upgraded", plan.reasons)
+        self.assertEqual(s.spoken[-1], UPGRADE_LINE)
+        self.assertEqual(s.eng.admin_log()["commitment"].get("violations", 0), 0)
+        self.assertEqual(s.eng._violations, 0)
+        self.assertEqual(s.eng.commitment_level, Level.STRONG)
+        self.assertEqual(s.eng.negotiation.level, Level.STRONG)
+        log = s.eng.admin_log()["commitment"]
+        self.assertEqual((log["first_level"], log["upgraded"], log["upgrade_tried"],
+                          log["level"]), ("MEDIUM", True, True, "STRONG"))
+        later = s.say(ASK, r + 5)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(later.scripted_text)
+
+    def test_unresolved_decider_spends_attempt(self):
+        s, r = self.booked(handle=False)
+        plan = s.say(self.ENROL, r)
+        self.assertIn("commitment_on_record", plan.reasons)
+        self.assertIn("upgrade_declined:decider_unresolved", plan.reasons)
+        self.assertEqual(s.eng.commitment_level, Level.MEDIUM)
+        s.say(HANDLE_DECIDER, r + 5)
+        later = s.say(self.ENROL, r + 10)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in later.reasons))
+
+    def test_enrol_turn_handles_decider(self):
+        from r1_commitment import UPGRADE_LINE
+
+        s, r = self.booked(handle=False)
+        commitment_turn = s.eng.turn
+        plan = s.say(
+            "Your husband can still join Thursday, and if you would rather not wait, "
+            "would you like to enrol today? I can send you the enrolment link.", r,
+        )
+        self.assertGreater(s.eng.negotiation.decider_handled_turn, commitment_turn)
+        self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+        self.assertIn("commitment_upgraded", plan.reasons)
+        self.assertEqual(s.spoken[-1], UPGRADE_LINE)
+
+    def test_flag_off(self):
+        s, r = self.booked(flag="0")
+        plan = s.say(ASK, r)
+        self.assertIn("commitment_on_record", plan.reasons)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in plan.reasons))
+        for key in ("first_level", "upgraded", "upgrade_tried"):
+            self.assertNotIn(key, s.eng.admin_log()["commitment"])
+
+    def test_grade_below_strong_is_declined_once(self):
+        from dataclasses import replace
+
+        for field in ("pressured", "thin"):
+            with self.subTest(field=field):
+                s, r = self.booked()
+                original = s.eng._evidence
+                with mock.patch.object(
+                    s.eng, "_evidence", side_effect=lambda kind: replace(
+                        original(kind), **{field: True}
+                    )
+                ):
+                    plan = s.say(ASK, r)
+                self.assertTrue(any(x.startswith("upgrade_declined:grade_")
+                                    for x in plan.reasons), plan.reasons)
+                later = s.say(ASK, r + 5)
+                self.assertFalse(any(x.startswith("upgrade_declined:") for x in later.reasons))
+
+    def test_after_cut_upgrade_is_not_revoiced(self):
+        s, r = self.booked()
+        plan = s.eng.plan_turn(ASK, r)
+        self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+        s.eng.record_spoken(plan, "Actually, you know what", r_sec=r, interrupted=True)
+        self.assertEqual(s.eng.commitment_level, Level.MEDIUM)
+        later = s.say(ASK, r + 5)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertNotIn("commitment_revoiced", later.reasons)
+
+    def test_time_limit_and_strong_first(self):
+        s, r = self.booked()
+        plan = s.say(ASK, 1140)
+        self.assertIn("commitment_on_record", plan.reasons)
+        self.assertFalse(s.eng.admin_log()["commitment"]["upgrade_tried"])
+        with mock.patch.dict(os.environ, {"R1_COMMIT_UPGRADE": "1"}):
+            s, r = run_cooperative(65, eng=engine(), script=strong_script())
+        s.eng.apply_judge(GOOD_JUDGE, s.eng.turn)
+        first = s.say(ASK, r)
+        self.assertEqual(first.commitment_level, Level.STRONG)
+        later = s.say(ASK, r + 5)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(s.eng.admin_log()["commitment"]["upgrade_tried"])
+
+    def test_free_confirmation_passes_guard_after_upgrade(self):
+        s, r = self.booked()
+        s.say(ASK, r)
+        plan = s.eng.plan_turn("What happens next?", r + 5)
+        result = s.eng.sanitize_reply(plan, "Great, I'll look out for the link.")
+        self.assertIn("look out for the link", result.text)
+        self.assertFalse(any(hit.rule == "commitment" for hit in result.hits))
+
+    def test_medium_enrol_does_not_qualify(self):
+        with mock.patch.dict(os.environ, {"R1_COMMIT_UPGRADE": "1"}):
+            s, r = run_cooperative(65, eng=engine())
+        s.say(ASK, r)
+        first = s.say(
+            "We have a payment plan with monthly instalments. Shall I send you the enrolment link?",
+            r + 10,
+        )
+        self.assertEqual(first.commitment_level, Level.MEDIUM, first.reasons)
+        later = s.say(ASK, r + 15)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(s.eng.admin_log()["commitment"]["upgrade_tried"])
+
+    def test_blockers_decline_upgrade(self):
+        for field, label in (("call_declined_turn", "call_declined"),
+                             ("wait_said_turn", "learner_waiting")):
+            with self.subTest(label=label):
+                s, r = self.booked()
+                setattr(s.eng.negotiation, field, s.eng.turn)
+                plan = s.say(ASK, r)
+                self.assertIn("upgrade_declined:" + label, plan.reasons)
+                self.assertEqual(s.eng.commitment_level, Level.MEDIUM)

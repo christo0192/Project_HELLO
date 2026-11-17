@@ -989,7 +989,8 @@ def commitment_metrics(
         plan = _learner(ex).get("plan") or {}
         if plan.get("resolves") and plan.get("commitment_level") and _spoke_commitment(ex):
             commit_exchange = index
-            break
+            if not commitment.get("upgraded"):
+                break
     earned: bool | None = None
     if level in ("MEDIUM", "STRONG") and commit_exchange is not None:
         window = range(max(0, commit_exchange - 2), commit_exchange + 1)
@@ -1004,6 +1005,8 @@ def commitment_metrics(
                 premature += 1
     return {
         "commitment_level": level,
+        **({"commitment_upgraded": bool(commitment["upgraded"])}
+           if "upgraded" in commitment else {}),
         "commitment_resolved": bool(commitment.get("resolved")),
         "commitment_exchange": None if commit_exchange is None else commit_exchange + 1,
         "commitment_earned": earned,
@@ -1417,6 +1420,14 @@ def commitment_spoken_leaks(
         cap = Level.WEAK
         if recorded is not None and isinstance(recorded_turn, (int, float)) and recorded_turn < roleplay_turn:
             cap = max(cap, recorded)
+        if commitment.get("upgraded"):
+            for earlier in exchanges:
+                if not isinstance(earlier.get("n"), int) or earlier["n"] >= roleplay_turn:
+                    continue
+                prior_plan = _learner(earlier).get("plan") or {}
+                prior_level = _level_named(prior_plan.get("commitment_level"))
+                if prior_level is not None and _spoke_commitment(earlier):
+                    cap = max(cap, prior_level)
         plan = _learner(ex).get("plan") or {}
         scripted = _level_named(plan.get("commitment_level"))
         if plan.get("delivered_commitment") and scripted is not None:

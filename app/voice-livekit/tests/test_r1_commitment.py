@@ -1,6 +1,7 @@
 """Unit tests for ``r1_commitment``: asks, levels, grading and the scripted lines."""
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -1561,6 +1562,19 @@ class CloseEvidenceFloorTests(unittest.TestCase):
         gate = Path(__file__).resolve().parents[2] / "api/src/lib/r1/gate.ts"
         if gate.is_file():
             self.assertIn("MIN_ROLEPLAY_SECONDS: 600", gate.read_text(encoding="utf-8"))
+
+
+class CommitUpgradeLineTests(unittest.TestCase):
+    def test_upgrade_line_is_scripted_strong_and_masked(self):
+        import r1_commitment as c
+
+        self.assertTrue(c.is_commitment_line(c.UPGRADE_LINE, "husband"))
+        self.assertEqual(c.mask_for_scorer(c.UPGRADE_LINE, "husband"), c.MASK_PLACEHOLDER)
+        self.assertEqual(c.classify_learner_commitment(c.UPGRADE_LINE), c.Level.STRONG)
+        self.assertIsNotNone(re.search(r"send me the enrol+ment link", c.UPGRADE_LINE, re.I))
+        path = Path(__file__).resolve().parents[2] / "api/src/lib/r1/transcript.ts"
+        if path.is_file():
+            self.assertIn("/send me the enrol+ment link/i", path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
