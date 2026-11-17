@@ -1204,6 +1204,7 @@ class CommitmentEvidence:
     # advisors (each invented $2,000 to $4,800 off) and with all four terse ones.
     pressured: bool = False
     thin: bool = False
+    families_planned: tuple[str, ...] | None = None
 
 
 def families_answered(quality: Mapping[str, int | None]) -> tuple[str, ...]:
@@ -1218,8 +1219,8 @@ def families_answered(quality: Mapping[str, int | None]) -> tuple[str, ...]:
 def grade(evidence: CommitmentEvidence) -> Level:
     """STRONG, MEDIUM or WEAK for an ask that the close window permits.
 
-    STRONG: commitment asked; at least 2 of 3 deep needs released; all four families
-    answered with quality at least 1 (so F1 included); discount discipline intact; a
+    STRONG: commitment asked; at least 2 of 3 deep needs released; every planned family
+    answered with quality at least 1 (all four when no plan); discount discipline intact; a
     legitimate urgency lever used.  MEDIUM: asked; at least 1 deep need released; and either
     at least 2 families answered or at least 1 stall reason handled (R1-Q: an advisor who
     solved the learner's stated reason has earned a call even if the judge was slow).
@@ -1231,13 +1232,14 @@ def grade(evidence: CommitmentEvidence) -> Level:
     """
     if evidence.ask_kind is None:
         return Level.WEAK
-    answered = families_answered(evidence.family_quality)
+    planned = evidence.families_planned or FAMILIES
+    answered = tuple(f for f in families_answered(evidence.family_quality) if f in planned)
     result = Level.WEAK
     if evidence.needs_released >= 1 and (len(answered) >= 2 or evidence.reasons_handled >= 1):
         result = Level.MEDIUM
     if (
         evidence.needs_released >= 2
-        and len(answered) == len(FAMILIES)
+        and len(answered) == len(planned)
         and evidence.discount_ok
         and evidence.urgency_lever
     ):

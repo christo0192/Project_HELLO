@@ -28,6 +28,7 @@ class Temperament:
     key_criterion: str
     card_line: str
     timeline_answer: str
+    family_minutes: tuple[tuple[str, float], ...] = ()
 
     def count_weight(self, count: int) -> float:
         return dict(self.count_weights).get(count, 0.0)
@@ -47,6 +48,7 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "You want to understand properly before you spend this much: whether it fits you "
         "and will pay off. When your questions are answered well, you can decide on the call.",
         "Once my questions are answered, I can decide quickly.",
+        (("F1", 4.9), ("F2", 5.5), ("F3", 8.0)),
     ),
     Temperament(
         "price_negotiator", "Price negotiator", 0.21, ((2, 0.5), (3, 0.4), (4, 0.1)),
@@ -57,6 +59,7 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "You like the idea, but the money side decides it. You push on cost and want a way "
         "to pay that works for you; once you see one, you can say yes on the call.",
         "As soon as I know how I would pay for it.",
+        (("F1", 2.6), ("F2", 3.3), ("F3", 5.3)),
     ),
     Temperament(
         "steady_enquirer", "Steady enquirer", 0.29, ((2, 1.0),),
@@ -67,6 +70,7 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "You are calm and curious, and ask practical questions about how this would fit "
         "around your job. Once that is clear, you are open to going ahead.",
         "Once I know how it would fit around my job.",
+        (("F1", 2.8), ("F2", 3.8), ("F3", 3.0)),
     ),
     Temperament(
         "time_blocked", "Time blocked", 0.10, ((2, 0.6), (3, 0.4)),
@@ -76,6 +80,7 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "wants_time", Level.MEDIUM, 2, "timing",
         "Work is very heavy right now; you like the idea but cannot start anything new soon.",
         "Not soon, honestly; work is too heavy right now.",
+        (("F1", 4.8), ("F2", 2.1), ("F3", 3.7)),
     ),
 )
 TEMPERAMENT_BY_ID = {item.id: item for item in TEMPERAMENTS}
@@ -92,3 +97,32 @@ def pick_temperament(persona_id: str, seed: str, override: str | None = None) ->
         if value < cumulative:
             return item
     return TEMPERAMENTS[-1]
+
+
+def plan_families(temperament: Temperament, seed: str) -> tuple[str, ...]:
+    """Plan which families she raises and their order.
+
+    Wording, markers and the graded meaning of each family are unchanged.
+    """
+    prefix = f"plan:{temperament.id}:{seed}"
+    digest = hashlib.sha256(prefix.encode()).digest()
+    values = iter(int.from_bytes(digest[i:i + 8], "big") / 2**64 for i in range(0, 32, 8))
+
+    def draw(weights: tuple[tuple[object, float], ...]) -> object:
+        target = next(values) * sum(weight for _, weight in weights)
+        for item, weight in weights:
+            target -= weight
+            if target < 0:
+                return item
+        return weights[-1][0]
+
+    count = int(draw(temperament.count_weights))
+    remaining = list(temperament.family_weights)
+    chosen = []
+    for _ in range(count - 1):
+        family = draw(tuple(remaining))
+        chosen.append(family)
+        remaining = [(name, weight) for name, weight in remaining if name != family]
+    minutes = dict(temperament.family_minutes)
+    chosen.sort(key=lambda family: (minutes[family], ("F3", "F2", "F1").index(family)))
+    return (*chosen, "F4")

@@ -588,6 +588,10 @@ EXTRA_FACT_KEYS = (
 )
 
 
+# The API parser (admin-log.ts) reads this plan; absent means all four families.
+PLAN_FACT_KEYS = ("families_planned",)
+
+
 def session_facts_event(
     admin: Mapping[str, Any] | None,
     pins: Mapping[str, Any],
@@ -652,6 +656,7 @@ def session_facts_event(
             "wrapup": _wrapup_counts(wrapup),
             **close_facts,
             **temperament_facts,
+            **{key: admin[key] for key in PLAN_FACT_KEYS if key in (admin or {})},
             **shadow,
             **added,
         },

@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from r1_commitment import (
     COMMIT_PERMITTED_R_SEC,
@@ -2222,9 +2222,17 @@ class OwedMoveScheduler:
     """Per-session schedule of the learner's owed moves (see the module docstring)."""
 
     def __init__(
-        self, decision_maker: str, *, markers_v2: bool = False, evidence_window: bool = False
+        self, decision_maker: str, *, markers_v2: bool = False, evidence_window: bool = False,
+        families: tuple[str, ...] | None = None,
     ) -> None:
         """``markers_v2``: R1_MARKERS_V2 (simulation diagnosis 1), the wider delivery markers."""
+        if families is not None and (
+            not 2 <= len(families) <= 4 or len(set(families)) != len(families)
+            or families[-1] != "F4" or not set(families) <= set(FAMILIES)
+        ):
+            raise ValueError("invalid family plan")
+        self.families_planned = families
+        deadlines = dict(zip(families or (), (430, 640, 810, 930)[-len(families or ()):]))
         self.decision_maker = decision_maker
         self.evidence_window = evidence_window
         self.f4_answered_turn: int | None = None
@@ -2232,6 +2240,8 @@ class OwedMoveScheduler:
         self.close_window_reason: str | None = None
         self._states: dict[str, _MoveState] = {}
         for spec in PLAN:
+            if spec.family in deadlines and spec.required:
+                spec = replace(spec, deadline_sec=deadlines[spec.family])
             if spec.id == COMMIT_STALL:
                 text = commitment_line(Level.WEAK, decision_maker)
             else:
@@ -2249,6 +2259,10 @@ class OwedMoveScheduler:
                 if spec.variants
                 else (),
             )
+        if families is not None:
+            for state in self._states.values():
+                if state.spec.family in FAMILIES and state.spec.family not in families:
+                    state.status = "skipped"
         self.turn = 0
         self.last_r: float | None = None
         self._gaps: list[float] = []
@@ -2270,6 +2284,19 @@ class OwedMoveScheduler:
         # M032 SWEEP-20: (move id, issued, forced_when_issued, enabled_sec) before the last
         # redirect.
         self._redirect_undo: tuple[str, int, bool, float | None] | None = None
+
+    @property
+    def pacing_map(self) -> tuple[tuple[int, tuple[str, ...]], ...]:
+        """Each owed family's deadline and required moves, in this session's order (M033 A6:
+        the planned families only, at their re-slotted deadlines; the full chain without a plan)."""
+        return tuple(
+            (
+                max(self._states[s.id].spec.deadline_sec or 0 for s in PLAN
+                    if s.family == family and s.required),
+                tuple(s.id for s in PLAN if s.family == family and s.required),
+            )
+            for family in (self.families_planned or FAMILIES)
+        )
 
     # ------------------------------------------------------------------ observation
     @property
@@ -2378,7 +2405,7 @@ class OwedMoveScheduler:
     def family_complete(self, family: str) -> bool:
         """True when every required component of ``family`` has been delivered."""
         return all(
-            self._delivered(spec.id)
+            self._states[spec.id].status in ("delivered", "skipped")
             for spec in PLAN
             if spec.family == family and spec.required
         )
@@ -2419,8 +2446,10 @@ class OwedMoveScheduler:
         for spec in PLAN:
             if spec.family not in FAMILIES or not spec.required:
                 continue
-            if self._delivered(spec.id):
+            state = self._states[spec.id]
+            if state.status in ("delivered", "skipped"):
                 continue
+            spec = state.spec
             if spec.deadline_sec is None or r_sec <= spec.deadline_sec + SLIP_LIMIT_SEC:
                 return True
         return False
@@ -2477,6 +2506,21 @@ class OwedMoveScheduler:
         if state.spec.role == "primary" and not self._primary_gate(family):
             return False
         since = self._since
+        if self.families_planned is not None and state.spec.role == "primary":
+            index = self.families_planned.index(family)
+            price = move_id == F1_ANCHOR and self.price_quoted_turn is not None
+            if index == 0:
+                return price or self.pitch_turn is not None or r_sec >= F3_FALLBACK_OPEN_SEC
+            previous = self.families_planned[index - 1]
+            second = {"F1": F1_COUNTER, "F2": F2_PUSH, "F3": F3_PUSH}[previous]
+            if family == "F4":
+                return (
+                    all(self.family_complete(f) for f in self.families_planned[:-1])
+                    and (since(second) or 0) >= 1
+                    and (previous == "F1" or "F1" not in self.families_planned
+                         or (since(F1_COUNTER) or 0) >= 1)
+                )
+            return price or (self.family_complete(previous) and (since(second) or 0) >= 1)
         if move_id == F3_PRIMARY:
             return self.pitch_turn is not None or r_sec >= F3_FALLBACK_OPEN_SEC
         if move_id == F3_PUSH:
@@ -2598,7 +2642,13 @@ class OwedMoveScheduler:
         candidate monologue cannot hide a late first learner turn.
         """
         move_id = state.spec.id
-        if move_id == F3_PRIMARY and self.pitch_turn is None:
+        first_primary = (
+            self.families_planned is not None and state.spec.role == "primary"
+            and state.spec.family == self.families_planned[0]
+        )
+        if (move_id == F3_PRIMARY or first_primary) and self.pitch_turn is None:
+            if move_id == F1_ANCHOR and self.price_quoted_turn is not None:
+                return r_sec
             return min(r_sec, float(F3_FALLBACK_OPEN_SEC))
         if move_id == TIME_CUE:
             return min(r_sec, float(TIME_CUE_SEC))
@@ -2781,7 +2831,11 @@ class OwedMoveScheduler:
         family on top of an unanswered push.
         """
         open_family = self.open_family
-        for spec in PLAN:
+        ordered = (
+            tuple(s for family in self.families_planned for s in PLAN if s.family == family)
+            if self.families_planned is not None else PLAN
+        )
+        for spec in ordered:
             if spec.id in (COMMIT_STALL, TIME_CUE):
                 continue
             if open_family is not None and spec.family != open_family:
@@ -2800,10 +2854,15 @@ class OwedMoveScheduler:
 
     def required_pending(self) -> tuple[str, ...]:
         """M032 SWEEP-24: the required graded moves not yet delivered, in plan order (pure)."""
+        ordered = (
+            tuple(s for family in self.families_planned for s in PLAN if s.family == family)
+            if self.families_planned is not None else PLAN
+        )
         return tuple(
             spec.id
-            for spec in PLAN
-            if spec.required and spec.family in FAMILIES and not self._delivered(spec.id)
+            for spec in ordered
+            if spec.required and spec.family in FAMILIES
+            and self._states[spec.id].status not in ("delivered", "skipped")
         )
 
     def next_forced_peek(self, r_sec: float) -> OwedMove | None:
@@ -2813,7 +2872,11 @@ class OwedMoveScheduler:
         the reading time of the ``OwedMove`` returned.
         """
         open_family = self.open_family
-        for spec in PLAN:
+        ordered = (
+            tuple(s for family in self.families_planned for s in PLAN if s.family == family)
+            if self.families_planned is not None else PLAN
+        )
+        for spec in ordered:
             if spec.id in (COMMIT_STALL, TIME_CUE):
                 continue
             if open_family is not None and spec.family != open_family:
@@ -2886,6 +2949,7 @@ class OwedMoveScheduler:
         moves = []
         for spec in PLAN:
             state = self._states[spec.id]
+            spec = state.spec
             delivery = state.delivery
             moves.append(
                 {
@@ -2916,10 +2980,13 @@ class OwedMoveScheduler:
             complete = self.family_complete(family)
             max_slip = max(slips) if slips else None
             families[family] = {
-                "delivered": complete,
+                "delivered": complete and (self.families_planned is None
+                                           or family in self.families_planned),
                 "max_slip_sec": _round(max_slip),
                 "max_lateness_sec": _round(max(late)) if late else None,
             }
+            if self.families_planned is not None:
+                families[family]["planned"] = family in self.families_planned
             if max_slip is not None and max_slip > SLIP_LIMIT_SEC:
                 reasons.append(f"family_slip:{family}")
             if final and not complete:
@@ -2934,6 +3001,8 @@ class OwedMoveScheduler:
             "excluded_from_auto_status": bool(reasons),
             "exclusion_reasons": reasons,
         }
+        if self.families_planned is not None:
+            result["families_planned"] = list(self.families_planned)
         if self.evidence_window:
             result["close_window"] = {
                 "open_r": self.close_window_open_r,

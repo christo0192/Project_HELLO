@@ -477,7 +477,13 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "hard_fail_reasons": dict(reasons),
         "calls_reaching_close_window": len(closing),
         "families_3plus_rate": _rate(
-            sum(1 for m in closing if (m.get("families_delivered_count") or 0) >= 3), len(closing)
+            # M033 A6: a planned call raises 2-4 families; it needs min(3, planned) of them.
+            sum(
+                1 for m in closing
+                if (m.get("families_delivered_count") or 0)
+                >= min(3, m.get("families_planned_count") or 4)
+            ),
+            len(closing),
         ),
         "objections_in_context_rate": _rate(in_ctx, objections),
         "judge_calls": len(judged),

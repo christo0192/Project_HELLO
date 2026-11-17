@@ -327,6 +327,32 @@ class ScheduleAndGuardMetricTests(unittest.TestCase):
         self.assertAlmostEqual(found["intent_fallback_rate"], 0.25)
         self.assertEqual(found["deadline_forced_moves"], ["F4-PUSH"])
 
+    def test_schedule_metrics_reports_planned_and_delivered_separately(self) -> None:
+        schedule = {
+            "families_planned": ["F2", "F4"],
+            "families": {
+                "F1": {"planned": False, "delivered": False},
+                "F2": {"planned": True, "delivered": True},
+                "F4": {"planned": True, "delivered": False},
+            },
+        }
+        found = metrics.schedule_metrics({"schedule": schedule})
+        self.assertEqual(found["families_planned"], ["F2", "F4"])
+        self.assertEqual(found["families_planned_count"], 2)
+        self.assertEqual(found["families_delivered"], ["F2"])
+
+    def test_families_3plus_rate_counts_a_fully_delivered_short_plan(self) -> None:
+        from rehearsal import scorecard
+
+        def record(delivered: int, planned: int | None) -> dict:
+            metrics = {"roleplay_seconds": 900, "families_delivered_count": delivered}
+            if planned is not None:
+                metrics["families_planned_count"] = planned
+            return {"metrics": metrics}
+
+        group = scorecard.aggregate_group([record(2, 2), record(2, None), record(3, 4)])
+        self.assertAlmostEqual(group["families_3plus_rate"], 2 / 3)
+
     def test_commitment_hits_after_the_commitment_are_counted(self) -> None:
         admin = {
             "guard": {"hits": 2, "leak_hits": 2, "by_category": {"commitment": 2}, "flagged": False},
@@ -2839,6 +2865,16 @@ class FinalReviewRoundOneHarnessTests(unittest.TestCase):
         ]
         first = metrics.disclosure_metrics(self.PERSONA, early)
         self.assertEqual(first["unprompted_dump_count"], 1)  # only the first telling is a dump
+
+
+class PlannedBunchingGridTests(unittest.TestCase):
+    def test_unplanned_families_are_not_late(self) -> None:
+        from rehearsal import bunching_grid
+
+        with mock.patch("r1_roleplay.plan_families", return_value=("F2", "F4")):
+            result = bunching_grid.run_one("cooperative", 40, temperament="steady_enquirer")
+        self.assertEqual(result.families_planned, ("F2", "F4"))
+        self.assertFalse({"F1", "F3"} & set(result.late))
 
 
 class BunchingGridTests(unittest.TestCase):

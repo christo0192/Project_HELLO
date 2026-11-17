@@ -2056,6 +2056,7 @@ class CoverageTracker:
         self.judge_flags = {"candidate_out_of_role": 0, "injection_attempt": 0}
         self.judge_applied = 0
         self.judge_rejected = 0
+        self.families_planned: tuple[str, ...] | None = None
         self.family_quality: dict[str, int | None] = {family: None for family in FAMILIES}
         self._turn_had_question: dict[int, bool] = {}
         self._judged_turns: set[int] = set()
@@ -2186,6 +2187,7 @@ class CoverageTracker:
 
     def commitment_evidence(self, ask_kind: AskKind | None) -> CommitmentEvidence:
         return CommitmentEvidence(
+            families_planned=self.families_planned,
             ask_kind=ask_kind,
             needs_released=self.gate.released_count,
             family_quality=dict(self.family_quality),

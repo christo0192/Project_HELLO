@@ -471,6 +471,7 @@ from r1_text import (
     split_sentences,
     word_count,
 )
+from r1_temperament import plan_families
 from r1_tracker import (
     END_INTENT_LEVELS,
     CoverageTracker,
@@ -1282,6 +1283,8 @@ FLAG_CLOSE_WINDOW_EVIDENCE = "R1_CLOSE_WINDOW_EVIDENCE"
 FLAG_COMMIT_UPGRADE = "R1_COMMIT_UPGRADE"
 # M033 A5: latch the learner temperament when the session selects its persona.
 FLAG_TEMPERAMENT = "R1_TEMPERAMENT"
+# M033 A6: plan objection families from the latched temperament.
+FLAG_TEMPERAMENT_PLAN = "R1_TEMPERAMENT_PLAN"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1422,6 +1425,7 @@ _FLAG_READS = {
     FLAG_CLOSE_WINDOW_EVIDENCE: lambda: os.getenv("R1_CLOSE_WINDOW_EVIDENCE"),
     FLAG_COMMIT_UPGRADE: lambda: os.getenv("R1_COMMIT_UPGRADE"),
     FLAG_TEMPERAMENT: lambda: os.getenv("R1_TEMPERAMENT"),
+    FLAG_TEMPERAMENT_PLAN: lambda: os.getenv("R1_TEMPERAMENT_PLAN"),
 }
 
 
@@ -1735,14 +1739,19 @@ class RolePlayEngine:
         self._discipline_v2 = flag_on(FLAG_DISCOUNT_DISCIPLINE_V2)
         self._close_evidence = flag_on(FLAG_CLOSE_WINDOW_EVIDENCE)
         self._commit_upgrade = flag_on(FLAG_COMMIT_UPGRADE)
+        families = (
+            plan_families(persona.temperament, self.seed)
+            if persona.temperament is not None and flag_on(FLAG_TEMPERAMENT_PLAN) else None
+        )
         self.scheduler = OwedMoveScheduler(
             persona.decision_maker, markers_v2=self._markers_v2,
-            evidence_window=self._close_evidence,
+            evidence_window=self._close_evidence, families=families,
         )
         self.tracker = CoverageTracker(
             persona, seed=self.seed, invented_v2=self._invented_v2,
             discipline_v2=self._discipline_v2,
         )
+        self.tracker.families_planned = families
         self.ledger = GuardLedger()
         self.turn = 0
         self.last_r = 0.0
@@ -2882,6 +2891,8 @@ class RolePlayEngine:
         self._asks_number_now = flag_on(FLAG_COUNTER_V2) and number_question
         self._number_moment = (
             self._probe_first and number_question and not self.scheduler.is_delivered(F1_ANCHOR)
+            and (self.scheduler.families_planned is None
+                 or "F1" in self.scheduler.families_planned)
         )
         if self._number_moment:
             # SWEEP-19 item 6: before the anchor, "which number works for you?" is a fresh moment
@@ -3693,7 +3704,7 @@ class RolePlayEngine:
         """
         pace = self.scheduler.lookahead_sec
         owed = 0
-        for deadline, move_ids in _PACING_MAP:
+        for deadline, move_ids in self.scheduler.pacing_map:
             left = sum(1 for move_id in move_ids if not self.scheduler.is_delivered(move_id))
             owed += left
             if left and r_sec + pace * (1 + SLACK_TURNS_PER_MOVE * owed) > deadline:
@@ -3721,7 +3732,7 @@ class RolePlayEngine:
         """
         pace = self.scheduler.cautious_lookahead_sec
         owed = 0
-        for deadline, move_ids in _PACING_MAP:
+        for deadline, move_ids in self.scheduler.pacing_map:
             left = sum(1 for move_id in move_ids if not self.scheduler.is_delivered(move_id))
             owed += left
             if left and r_sec + pace * (1 + SLACK_TURNS_PER_MOVE * owed) > deadline:
@@ -4192,7 +4203,9 @@ class RolePlayEngine:
         pending = self.scheduler.required_pending()
         if (
             len(pending) == 1
-            and self.scheduler.is_delivered(F1_COUNTER)
+            and (self.scheduler.is_delivered(F1_COUNTER)
+                 or (self.scheduler.families_planned is not None
+                     and "F1" not in self.scheduler.families_planned))
             and self._last_point is None
         ):
             move = self.scheduler.next_forced_peek(r_sec)
@@ -5756,7 +5769,9 @@ class RolePlayEngine:
         still the sticking point for me" after "my worry is more about time than money").
         """
         skip = set(self._reasons_owned_by_f4())
-        if self.negotiation.money_is_settled():
+        if (self.negotiation.money_is_settled()
+                or (self.scheduler.families_planned is not None
+                    and "F1" not in self.scheduler.families_planned)):
             skip.add(REASON_MONEY)
         return frozenset(skip)
 
@@ -5781,6 +5796,8 @@ class RolePlayEngine:
         price_unknown = (
             self._probe_first
             and spec.id == N_MONEY
+            and (self.scheduler.families_planned is None
+                 or "F1" in self.scheduler.families_planned)
             and self._price_asked_turn is not None
             and not self._price_named()
             and not self.scheduler.is_delivered(F1_ANCHOR)
@@ -6050,7 +6067,7 @@ class RolePlayEngine:
         """
         pace = self.scheduler.cautious_lookahead_sec
         owed = 0
-        for deadline, move_ids in _PACING_MAP:
+        for deadline, move_ids in self.scheduler.pacing_map:
             left = sum(1 for move_id in move_ids if not self.scheduler.is_delivered(move_id))
             owed += left
             if left and r_sec + pace * (1 + PROBE_TURNS_PER_MOVE * owed) > deadline:
@@ -6280,6 +6297,8 @@ class RolePlayEngine:
         price was named, she has not asked it, and F1-ANCHOR is still owed."""
         return (
             self._probe_first
+            and (self.scheduler.families_planned is None
+                 or "F1" in self.scheduler.families_planned)
             and not self._price_named()
             and self._price_asked_turn is None
             and not self.scheduler.is_delivered(F1_ANCHOR)
@@ -7547,7 +7566,10 @@ class RolePlayEngine:
             "r_reached_10_min": end >= FIDELITY_MIN_R_SEC,
             "enough_substantive_turns": substantive >= MIN_SUBSTANTIVE_TURNS,
             "all_families_delivered": not any(r.startswith("family_missing") for r in reasons),
-            "f1_counter_delivered": self.scheduler.deliveries_by_id().get(F1_COUNTER) is not None,
+            "f1_counter_delivered": (
+                self.scheduler.families_planned is not None
+                and "F1" not in self.scheduler.families_planned
+            ) or self.scheduler.deliveries_by_id().get(F1_COUNTER) is not None,
             "family_slip_within_limit": not any(r.startswith("family_slip") for r in reasons),
             "no_unprobed_reveal": self.tracker.gate.unreleased_reveals == 0,
             "no_commitment_violation": self._violations == 0,
@@ -7613,6 +7635,8 @@ class RolePlayEngine:
                 entry[f"{key}_transcript_turn"] = None if turn is None else self._turn_map.get(turn)
             needs.append(entry)
         return {
+            **({"families_planned": list(self.scheduler.families_planned)}
+               if self.scheduler.families_planned is not None else {}),
             **({"temperament": {
                 "id": self.persona.temperament.id,
                 "stall_rounds": self.persona.temperament.stall_rounds,

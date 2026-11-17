@@ -77,7 +77,12 @@ export function formatAdministrationLog(log: R1AdministrationLog): string {
     lines.push(`- ${need.need}: ${probed}, revealed at ${turnLabel(need.revealedTurn)}`);
   }
   lines.push('Objections the worker delivered (turn, slip in seconds from the scheduled moment):');
+  const planned = log.facts?.familiesPlanned;
   for (const family of R1_FAMILIES) {
+    if (planned != null && !planned.includes(family)) {
+      lines.push(`- ${family}: not planned for this call (not raised; do not score it)`);
+      continue;
+    }
     const entry = log.families[family];
     if (family === 'F1') {
       // F1 is the $7,000 anchor and the counter after the advisor's first answer. It has no push.

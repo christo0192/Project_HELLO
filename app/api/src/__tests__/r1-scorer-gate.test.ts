@@ -373,3 +373,31 @@ describe('administration quality line', () => {
     expect(delivered((l) => withFamily(l, 'F1', { push: null }))).toBe(4);
   });
 });
+
+describe('planned families', () => {
+  it('requires only the planned families and their moves', () => {
+    const input = baseline({ log: (log) => {
+      const planned = withFacts(log, { familiesPlanned: ['F2', 'F4'] });
+      return { ...withFamily(withFamily(planned, 'F1', { primary: null }),
+        'F3', { primary: null, push: null }), counter: null };
+    } });
+    expect(evaluateR1Gate(input).failures).toEqual([]);
+    expect(evaluateR1Gate({ ...input, log: withFamily(input.log, 'F2', { primary: null }) })
+      .failures).toContain('family_missing:f2');
+  });
+});
+
+describe('missing and malformed plan fail closed', () => {
+  it('still requires all four families', () => {
+    const missingF1 = (log: R1AdministrationLog) => ({
+      ...withFamily(log, 'F1', { primary: null }), counter: null,
+    });
+    expect(evaluateR1Gate(baseline({ log: missingF1 })).failures).toContain('family_missing:f1');
+    const rows = cleanLogRows().map((row) => row.event_type === 'session_facts'
+      ? { ...row, payload: { ...(row.payload as object), families_planned: ['F2'] } }
+      : row);
+    const log = missingF1(parseR1AdministrationLog(rows));
+    expect(log.facts?.familiesPlanned).toBeNull();
+    expect(evaluateR1Gate({ ...baseline(), log }).failures).toContain('family_missing:f1');
+  });
+});

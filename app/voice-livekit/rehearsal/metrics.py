@@ -1197,6 +1197,9 @@ def schedule_metrics(admin: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "families_delivered": delivered,
         "families_delivered_count": len(delivered),
+        **({"families_planned": schedule["families_planned"],
+            "families_planned_count": len(schedule["families_planned"])}
+           if "families_planned" in schedule else {}),
         "max_slip_sec_by_family": slips,
         "max_slip_sec": max(known) if known else None,
         "exclusion_reasons": list(schedule.get("exclusion_reasons") or []),

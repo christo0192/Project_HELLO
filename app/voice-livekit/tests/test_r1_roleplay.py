@@ -15361,3 +15361,73 @@ class CommitUpgradeTests(unittest.TestCase):
                 plan = s.say(ASK, r)
                 self.assertIn("upgrade_declined:" + label, plan.reasons)
                 self.assertEqual(s.eng.commitment_level, Level.MEDIUM)
+
+
+class TemperamentPlanEngineTests(unittest.TestCase):
+    def test_plan_and_rollback(self):
+        from r1_personas import resolve_persona
+        from r1_temperament import plan_families
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "1"}):
+            engine = r1_roleplay.RolePlayEngine(persona, seed="plan-test")
+            self.assertEqual(engine.scheduler.families_planned,
+                             plan_families(persona.temperament, engine.seed))
+            self.assertEqual(engine.admin_log()["families_planned"],
+                             list(engine.scheduler.families_planned))
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"}):
+            engine = r1_roleplay.RolePlayEngine(persona, seed="plan-test")
+            self.assertIsNone(engine.scheduler.families_planned)
+            self.assertNotIn("families_planned", engine.admin_log())
+
+    def test_last_point_does_not_wait_for_unplanned_f1(self):
+        from r1_personas import resolve_persona
+        from r1_scheduler import F2_PRIMARY, F2_PUSH, F4_PRIMARY
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "1",
+                                         "R1_LAST_POINT_V2": "0"}):
+            engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+            engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+            for move in (F2_PRIMARY, F2_PUSH, F4_PRIMARY):
+                engine.scheduler.observe_candidate_turn("Synthetic answer", 850)
+                engine.scheduler.confirm_delivered(move, 850)
+            with mock.patch.object(engine, "_last_point_plan", return_value="last"):
+                self.assertEqual(engine._late_end_request(None, r_sec=850, by_model=False), "last")
+
+    def test_price_offers_are_still_read_without_f1(self):
+        from r1_personas import resolve_persona
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+        engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+        session = Session(engine)
+        session.say("Our curriculum covers python and sql with weekly mentor feedback.", 20)
+        session.say("If you use the payment plan, I can do $1,500 off.", 60)
+        self.assertEqual(len(engine.tracker.discount_log), 1)
+        self.assertIsNotNone(engine.negotiation.best_offer_usd)
+        self.assertTrue(engine.fidelity()["checks"]["f1_counter_delivered"])
+
+    def test_price_first_does_not_wait_for_an_unplanned_anchor(self):
+        from r1_personas import resolve_persona
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+        engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+        engine._probe_first = True
+        with mock.patch.object(engine.negotiation, "next_reason",
+                               return_value=r1_roleplay.REASON_MONEY):
+            self.assertFalse(engine._price_first_due())
+
+    def test_money_stall_is_not_raised_when_f1_is_unplanned(self):
+        from r1_personas import resolve_persona
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+        engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+        self.assertIn(r1_roleplay.REASON_MONEY, engine._stall_skip())

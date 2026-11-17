@@ -25,9 +25,11 @@ constants moved by): each turn lands in the window it landed in on the day.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -51,6 +53,17 @@ WEAK = stall_line("")
 FIXTURE = replay.load_fixture()
 # The owner's call is a 14:00 role-play; the engine runs a 20:00 one (see the module docstring).
 STRETCH = replay.stretch_14_to_20
+# M033 A6: the owner's call raised all four families, so the replay keeps the full chain (a
+# temperament plan could drop families the recorded advisor answered).
+_FULL_CHAIN = mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
+
+
+def setUpModule() -> None:
+    _FULL_CHAIN.start()
+
+
+def tearDownModule() -> None:
+    _FULL_CHAIN.stop()
 
 
 class OwnerSessionCalibrationTests(unittest.TestCase):

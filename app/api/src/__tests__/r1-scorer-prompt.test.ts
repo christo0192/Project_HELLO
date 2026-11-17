@@ -176,3 +176,13 @@ describe('R1 scorer prompt', () => {
     );
   });
 });
+
+describe('planned objection prompt', () => {
+  it('marks unplanned families as not to be scored', () => {
+    const log = parseR1AdministrationLog(cleanLogRows());
+    const planned = { ...log, facts: { ...log.facts!, familiesPlanned: ['F2', 'F4'] as const } };
+    const text = formatAdministrationLog(planned);
+    expect(text).toContain('- F1: not planned for this call (not raised; do not score it)');
+    expect(text).toContain('- F3: not planned for this call (not raised; do not score it)');
+  });
+});

@@ -805,6 +805,8 @@ class TestInterviewerContext(unittest.IsolatedAsyncioTestCase):
 # ----------------------------------------------------------------- scheduler and tracker
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
     async def test_at_most_one_move_is_raised_per_turn_and_no_script_is_handed_to_the_model(
         self,
@@ -1593,6 +1595,9 @@ class TestTheScriptedVariantIsTheFallbackOfAnIntent(unittest.IsolatedAsyncioTest
 # ------------------------------------------------------------------------- commitment
 
 
+# M033 A6: an early ask meets money or the price question only when F1 is planned; these
+# scenarios pin a four-family plan so the seeded temperament cannot drop F1.
+@mock.patch("r1_roleplay.plan_families", new=lambda *_: ("F3", "F2", "F1", "F4"))
 class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     CALL_ASK = "Shall I send you the enrolment link so you can enrol today?"
 
@@ -1762,6 +1767,8 @@ async def owners_close(rig: Rig) -> None:
             break
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestTheRoleplayEndsByConsent(unittest.IsolatedAsyncioTestCase):
     """M2 (owner and manager decisions of 2026-11-03): leaving the role-play is never abrupt.
 
@@ -2215,6 +2222,27 @@ class TestCoachAsideAlwaysReturns(unittest.IsolatedAsyncioTestCase):
 # ------------------------------------------------------------------- the fidelity record
 
 
+class TestPlannedFidelityRecord(unittest.IsolatedAsyncioTestCase):
+    async def test_planned_families_through_session(self):
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT": "1", "R1_TEMPERAMENT_PLAN": "1"}):
+            with mock.patch("r1_roleplay.plan_families", return_value=("F2", "F4")):
+                rig = await fidelity_session()
+        self.assertIsNotNone(rig.interview.persona_choice.persona.temperament)
+        rig.interview._begin_exit()
+        rig.interview._queue_fidelity()
+        await rig.flush()
+        rows = rig.writer.admin_events
+        deliveries = [row for row in rows if row["event_type"] in (
+            "family_delivered", "push_delivered", "counter_delivered"
+        )]
+        self.assertEqual({row["family_id"] for row in deliveries}, {"F2", "F4"})
+        self.assertEqual(len(deliveries), 4)
+        facts = next(row for row in rows if row["event_type"] == "session_facts")
+        self.assertEqual(facts["payload"]["families_planned"], ["F2", "F4"])
+
+
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
     async def full_session(self) -> Rig:
         return await fidelity_session()
@@ -2497,6 +2525,8 @@ class TestAdminLogWriter(unittest.IsolatedAsyncioTestCase):
 # ------------------------------------------------------------------------ end to end
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestEndToEnd(R1TestCase):
     """A real session, PRE_JOIN to complete, with the persona's content live in the role-play."""
 
@@ -3736,6 +3766,8 @@ S3_MOVES = (
 )
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
     """M032 S3 through the real session: Christy's asides, the learner's line after them, and her
     hang-up before Christy (synthetic advisor turns)."""

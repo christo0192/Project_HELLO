@@ -394,7 +394,8 @@ import r1_world
 #    (r1_commitment.UPGRADE_LINE). No other text changed.
 # 37: M033 A5 (R1_TEMPERAMENT): the four learner temperaments (card line, decision-timing
 #    answer, stall rounds; r1_temperament). No other text changed.
-CONTENT_REVISION = 37
+# 38: M033 A6 (R1_TEMPERAMENT_PLAN): family median minutes set objection plan order.
+CONTENT_REVISION = 38
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -824,6 +825,7 @@ def manifest() -> dict[str, Any]:
             **{t.id: {
                 "label": t.label, "weight": t.weight, "count_weights": t.count_weights,
                 "family_weights": t.family_weights, "family_themes": t.family_themes,
+                "family_minutes": t.family_minutes,
                 "f4_theme": t.f4_theme, "enrol_ceiling": t.enrol_ceiling.name,
                 "stall_rounds": t.stall_rounds, "key_criterion": t.key_criterion,
                 "card_line": t.card_line, "timeline_answer": t.timeline_answer,

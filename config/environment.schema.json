@@ -281,6 +281,7 @@
         "R1_CLOSE_WINDOW_EVIDENCE": { "requiredInProduction": false, "secret": false },
         "R1_COMMIT_UPGRADE": { "requiredInProduction": false, "secret": false },
         "R1_TEMPERAMENT": { "requiredInProduction": false, "secret": false },
+        "R1_TEMPERAMENT_PLAN": { "requiredInProduction": false, "secret": false },
         "R1_CLOSING_STATE": { "requiredInProduction": false, "secret": false },
         "R1_EARLY_CLOSE_ASIDE": { "requiredInProduction": false, "secret": false },
         "R1_ABUSE_HANGUP": { "requiredInProduction": false, "secret": false },

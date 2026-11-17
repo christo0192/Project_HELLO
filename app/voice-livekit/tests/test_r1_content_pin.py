@@ -270,7 +270,8 @@ import r1_world
 # max(33, 31, 34) + 1.
 # 36: M033 A4 pins the STRONG upgrade line.
 # 37: M033 A5 learner temperaments.
-PINNED_CONTENT_SHA256 = "92d494a3201c2212f744f9134ab96a8b7453e3a19cf84f8446d65dbdb42785a1"
+# Revision 38: temperament family median minutes.
+PINNED_CONTENT_SHA256 = "e61a6497073abf07c49aebaa018711586bb045ed5c5373d399d72bd706450654"
 
 CONTENT_MODULES = (
     "r1_text",

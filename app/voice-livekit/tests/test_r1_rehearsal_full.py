@@ -319,9 +319,23 @@ def offline_records() -> dict[str, dict]:
         factory = OfflineFullFactory(settings)
         specs = plan_full_specs(names, settings.learners)
 
+        import r1_roleplay
+
+        real_plan = r1_roleplay.plan_families
+
+        def plan_with_f1(temperament, seed):  # type: ignore[no-untyped-def]
+            planned = real_plan(temperament, seed)
+            return planned if "F1" in planned else ("F1", *planned)
+
         async def main() -> tuple[dict[str, dict], dict]:
             out = {}
             for spec in specs:
+                # M033 A6: the price scenarios test her price question, which only a plan with
+                # F1 asks; the other scenarios keep their seeded temperament plan.
+                if spec.scenario.startswith("price"):
+                    with unittest.mock.patch("r1_roleplay.plan_families", new=plan_with_f1):
+                        out[spec.scenario] = await run_full_call(spec, factory.make(spec))
+                    continue
                 out[spec.scenario] = await run_full_call(spec, factory.make(spec))
             again = await run_full_call(specs[names.index("strong")], factory.make(specs[names.index("strong")]))
             return out, again

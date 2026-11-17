@@ -2506,5 +2506,94 @@ class CloseWindowEvidenceTests(unittest.TestCase):
         self.assertTrue(s._hard_ready(state, 1140))
 
 
+class PlannedSchedulerTests(unittest.TestCase):
+    def test_planned_families_and_deadlines(self):
+        from r1_scheduler import OwedMoveScheduler
+
+        scheduler = OwedMoveScheduler("family", families=("F1", "F4"))
+        self.assertTrue(scheduler.family_complete("F2"))
+        self.assertTrue(scheduler.family_complete("F3"))
+        self.assertEqual(tuple(deadline for deadline, _ in scheduler.pacing_map), (810, 930))
+        self.assertEqual(scheduler.summary()["families_planned"], ["F1", "F4"])
+
+    def test_invalid_plans(self):
+        from r1_scheduler import OwedMoveScheduler
+
+        for plan in (("F4", "F1"), ("F1", "F1", "F4"), ("F4",), ("F9", "F4")):
+            with self.assertRaises(ValueError):
+                OwedMoveScheduler("family", families=plan)
+
+    def test_full_planned_runs(self):
+        for plan, expected, deadlines in (
+            (("F1", "F4"), [F1_ANCHOR, F1_COUNTER, F4_PRIMARY, F4_PUSH], (810, 930)),
+            (("F2", "F3", "F4"),
+             [F2_PRIMARY, F2_PUSH, F3_PRIMARY, F3_PUSH, F4_PRIMARY, F4_PUSH],
+             (640, 810, 930)),
+        ):
+            with self.subTest(plan=plan):
+                s = OwedMoveScheduler("family", families=plan)
+                seen = []
+                for index in range(30):
+                    r = 30 + index * 35
+                    move = turn(s, PITCH if index == 0 else NEUTRAL, r)
+                    if move is not None and move.family in sched.FAMILIES:
+                        seen.append(move.id)
+                    if s.all_families_complete:
+                        break
+                self.assertEqual(seen, expected)
+                self.assertEqual(tuple(deadline for deadline, _ in s.pacing_map), deadlines)
+                self.assertFalse(s.graded_moves_owed(r))
+                self.assertTrue(s.all_families_complete)
+                summary = s.summary(final=True)
+                self.assertFalse(any(reason.startswith("family_missing")
+                                     for reason in summary["exclusion_reasons"]))
+                for family in set(sched.FAMILIES) - set(plan):
+                    self.assertFalse(summary["families"][family]["planned"])
+                    self.assertFalse(summary["families"][family]["delivered"])
+                    self.assertTrue(all(move["status"] == "skipped" for move in summary["moves"]
+                                        if move["family"] == family))
+
+    def test_early_redirect_forces_first_primary(self):
+        for plan, expected in ((("F2", "F4"), F2_PRIMARY), (None, F3_PRIMARY)):
+            scheduler = OwedMoveScheduler("family", families=plan)
+            scheduler.observe_candidate_turn("Hello there", 60)
+            self.assertEqual(scheduler.next_forced_peek(60).id, expected)
+            self.assertEqual(scheduler._force_next(60).id, expected)
+
+    def test_f4_waits_for_previous_second_move_and_f1_counter(self):
+        scheduler = OwedMoveScheduler("family", families=("F1", "F2", "F4"))
+        for move in (F1_ANCHOR, F1_COUNTER, F2_PRIMARY, F2_PUSH):
+            scheduler.observe_candidate_turn(NEUTRAL, 500)
+            scheduler.confirm_delivered(move, 500)
+        state = scheduler._state(F4_PRIMARY)
+        self.assertFalse(scheduler._hard_ready(state, 500))
+        scheduler.observe_candidate_turn(NEUTRAL, 510)
+        self.assertTrue(scheduler._hard_ready(state, 510))
+
+    def test_commit_stall_keeps_its_clock_gate(self):
+        scheduler = OwedMoveScheduler("family", families=("F1", "F4"))
+        for move in (F1_ANCHOR, F1_COUNTER, F4_PRIMARY, F4_PUSH):
+            scheduler.observe_candidate_turn(NEUTRAL, 900)
+            scheduler.confirm_delivered(move, 900)
+        state = scheduler._state(COMMIT_STALL)
+        self.assertFalse(scheduler._hard_ready(state, sched.COMMIT_STALL_R_SEC - 1))
+        self.assertTrue(scheduler._hard_ready(state, sched.COMMIT_STALL_R_SEC))
+
+    def test_no_plan_keeps_pacing_and_summary_contract(self):
+        from r1_roleplay import _PACING_MAP
+
+        scheduler = OwedMoveScheduler("family")
+        self.assertEqual(scheduler.pacing_map, _PACING_MAP)
+        self.assertNotIn("families_planned", scheduler.summary())
+        self.assertTrue(all("planned" not in value
+                            for value in scheduler.summary()["families"].values()))
+
+    def test_pending_moves_follow_planned_order(self):
+        scheduler = OwedMoveScheduler("family", families=("F2", "F3", "F4"))
+        self.assertEqual(scheduler.required_pending(), (
+            F2_PRIMARY, F2_PUSH, F3_PRIMARY, F3_PUSH, F4_PRIMARY, F4_PUSH,
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

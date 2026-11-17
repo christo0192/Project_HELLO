@@ -53,6 +53,7 @@ import r1_guard
 from r1_phases import R1Phase
 from r1_replies import (
     CLOSE_WINDOW_FACT_KEYS,
+    PLAN_FACT_KEYS,
     TEMPERAMENT_FACT_KEYS,
     EXTRA_FACT_KEYS,
     GUARD_KINDS,
@@ -113,6 +114,7 @@ API_PAYLOAD_KEYS = {
             "question_count",
             "interruption_count",
             "first_audio_p95_ms",
+            "families_planned",
         }
     ),
 }
@@ -194,7 +196,13 @@ def parse_like_api(rows):
             if time_cue is None:
                 time_cue = finite_non_negative(payload.get("roleplay_seconds"))
         elif event_type == "session_facts":
+            plan = payload.get("families_planned")
+            if (not isinstance(plan, list) or not plan or "F4" not in plan
+                    or any(item not in API_FAMILIES for item in plan)
+                    or len(set(plan)) != len(plan)):
+                plan = None
             facts = {
+                "families_planned": plan,
                 "roleplay_seconds": finite_non_negative(payload.get("roleplay_seconds")),
                 **{
                     key: finite_non_negative(payload.get(key))
@@ -222,7 +230,8 @@ def gate_like_api(log):
         failures.append("roleplay_duration_unknown")
     elif roleplay < MIN_ROLEPLAY_SECONDS:
         failures.append("roleplay_too_short")
-    for family in API_FAMILIES:
+    planned = (log["facts"] or {}).get("families_planned") or API_FAMILIES
+    for family in planned:
         entry, name = log["families"][family], family.lower()
         has_push = family in API_FAMILIES_WITH_PUSH
         if entry["primary"] is None:
@@ -236,12 +245,13 @@ def gate_like_api(log):
                 failures.append(f"family_slip_unknown:{name}")
             elif delivery["slip_seconds"] > MAX_FAMILY_SLIP_SECONDS:
                 failures.append(f"family_slip:{name}")
-    if log["counter"] is None:
-        failures.append("counter_missing")
-    elif log["counter"]["slip_seconds"] is None:
-        failures.append("counter_slip_unknown")
-    elif log["counter"]["slip_seconds"] > MAX_FAMILY_SLIP_SECONDS:
-        failures.append("counter_slip")
+    if "F1" in planned:
+        if log["counter"] is None:
+            failures.append("counter_missing")
+        elif log["counter"]["slip_seconds"] is None:
+            failures.append("counter_slip_unknown")
+        elif log["counter"]["slip_seconds"] > MAX_FAMILY_SLIP_SECONDS:
+            failures.append("counter_slip")
     if any(need["revealed_turn"] is None for need in log["needs"]):
         failures.append("need_reveal_turn_unknown")
     if any(
@@ -291,7 +301,7 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
     async def test_every_row_carries_every_key_the_parser_reads(self):
         _, rows = await self.session_rows()
         for row in rows:
-            expected = API_PAYLOAD_KEYS[row["event_type"]]
+            expected = API_PAYLOAD_KEYS[row["event_type"]] - set(PLAN_FACT_KEYS)
             with self.subTest(event_type=row["event_type"], turn=row["turn_index"]):
                 self.assertLessEqual(expected, set(row["payload"]), row)
 
@@ -312,12 +322,14 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(need["probed_turn"])
             self.assertLessEqual(need["probed_turn"], need["revealed_turn"])
         # Objections: every delivery has a slip (not "slip not reported").
-        for family in API_FAMILIES:
+        planned = log["facts"]["families_planned"] or API_FAMILIES
+        for family in planned:
             self.assertIsNotNone(log["families"][family]["primary"], family)
             self.assertIsNotNone(log["families"][family]["primary"]["slip_seconds"], family)
-        for family in API_FAMILIES_WITH_PUSH:
+        for family in set(planned) & set(API_FAMILIES_WITH_PUSH):
             self.assertIsNotNone(log["families"][family]["push"]["slip_seconds"], family)
-        self.assertIsNotNone(log["counter"]["slip_seconds"])
+        if "F1" in planned:
+            self.assertIsNotNone(log["counter"]["slip_seconds"])
         # Discounts: an amount (not "amount not reported").
         self.assertTrue(log["discounts"])
         for discount in log["discounts"]:
@@ -349,21 +361,22 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
             for row in rows
             if row["event_type"] in ("family_delivered", "push_delivered", "counter_delivered")
         }
+        planned = parse_like_api(rows)["facts"]["families_planned"] or API_FAMILIES
         self.assertEqual(
             families,
-            {("family_delivered", f) for f in API_FAMILIES}
-            | {("push_delivered", f) for f in ("F2", "F3", "F4")}
-            | {("counter_delivered", "F1")},
+            {("family_delivered", f) for f in planned}
+            | {("push_delivered", f) for f in planned if f in API_FAMILIES_WITH_PUSH}
+            | ({("counter_delivered", "F1")} if "F1" in planned else set()),
         )
         moves = {row["payload"].get("move_id") for row in rows} - {None}
-        self.assertTrue({"F3-PRIMARY", "F2-PRIMARY", "F1-ANCHOR", "F4-PRIMARY"} <= moves)
+        self.assertIn("F4-PRIMARY", moves)
         self.assertNotIn("Q-A", moves)
         blob = json.dumps(rows)
         for private in ("intents", "fallback_appended", "handed_to_model", "curiosity", "brief"):
             self.assertNotIn(private, blob)
         # The engine still logs it for the rehearsal metrics.
         intents = rig.engine.admin_log()["intents"]
-        self.assertGreaterEqual(sum(intents["handed_to_model"].values()), 8)
+        self.assertGreaterEqual(sum(intents["handed_to_model"].values()), 2 * len(planned))
 
     async def test_the_negotiation_memory_is_logged_but_never_posted(self):
         """R1-Q: offers, callbacks, reasons and the slot stay in the worker's own log."""
@@ -486,7 +499,8 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
             | set(TEMPERAMENT_FACT_KEYS)
         )
         self.assertEqual(set(payload) - {"pins"} - worker_only, API_PAYLOAD_KEYS["session_facts"])
-        self.assertEqual(set(SESSION_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"])
+        self.assertEqual(set(SESSION_FACT_KEYS) | set(PLAN_FACT_KEYS),
+                         API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_WORKER_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
         self.assertEqual(set(EXTRA_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
         self.assertEqual(set(CLOSE_WINDOW_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
@@ -1031,6 +1045,31 @@ class TestPlanReasonsAreLoggedForProduction(unittest.IsolatedAsyncioTestCase):
         blob = " ".join(labels)
         self.assertNotIn("data science", blob.lower())
         del rig
+
+
+class PlannedFactsTests(unittest.TestCase):
+    def test_plan_is_optional_in_session_facts(self):
+        from r1_replies import session_facts_event
+
+        absent = session_facts_event({}, {}, roleplay_seconds=600)["payload"]
+        present = session_facts_event(
+            {"families_planned": ["F2", "F4"]}, {}, roleplay_seconds=600
+        )["payload"]
+        self.assertNotIn("families_planned", absent)
+        self.assertEqual(present["families_planned"], ["F2", "F4"])
+
+    def test_skipped_families_never_post_deliveries(self):
+        from r1_replies import fidelity_events
+        from r1_scheduler import OwedMoveScheduler
+
+        scheduler = OwedMoveScheduler("family", families=("F2", "F4"))
+        for move in ("F2-PRIMARY", "F2-PUSH", "F4-PRIMARY", "F4-PUSH"):
+            scheduler.observe_candidate_turn("Synthetic answer", 500)
+            scheduler.confirm_delivered(move, 500)
+        admin = {"schedule": scheduler.summary(), "tracker": {}}
+        rows = fidelity_events(admin, {})
+        self.assertEqual({row["family_id"] for row in rows}, {"F2", "F4"})
+        self.assertFalse(any(row["family_id"] in ("F1", "F3") for row in rows))
 
 
 if __name__ == "__main__":

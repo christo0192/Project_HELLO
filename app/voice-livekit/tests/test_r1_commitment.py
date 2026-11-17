@@ -1577,5 +1577,25 @@ class CommitUpgradeLineTests(unittest.TestCase):
             self.assertIn("/send me the enrol+ment link/i", path.read_text(encoding="utf-8"))
 
 
+class PlannedCommitmentTests(unittest.TestCase):
+    def test_only_planned_families_count(self):
+        evidence = CommitmentEvidence(
+            AskKind.ENROL, 2, {"F1": None, "F2": 1, "F3": None, "F4": 1}, True, True,
+            families_planned=("F2", "F4"),
+        )
+        self.assertEqual(grade(evidence), Level.STRONG)
+
+    def test_planned_pressure_and_thin_advisor_remain_weak(self):
+        from dataclasses import replace
+
+        evidence = CommitmentEvidence(
+            AskKind.ENROL, 2, {"F1": None, "F2": 1, "F3": None, "F4": 1}, True, True,
+            families_planned=("F2", "F4"),
+        )
+        self.assertEqual(grade(replace(evidence, pressured=True)), Level.WEAK)
+        self.assertEqual(grade(replace(evidence, thin=True)), Level.WEAK)
+        self.assertEqual(grade(replace(evidence, families_planned=None)), Level.MEDIUM)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -112,3 +112,52 @@ class TemperamentTests(unittest.TestCase):
         p = PERSONAS[0].id
         self.assertEqual(resolve_persona(p, seed="s", temperament_on=True).temperament,
                          temp.pick_temperament(p, "s"))
+
+
+class TemperamentPlanTests(unittest.TestCase):
+    def test_plans_are_deterministic_and_ordered(self):
+        from r1_temperament import TEMPERAMENTS, plan_families
+
+        for temperament in TEMPERAMENTS:
+            minutes = dict(temperament.family_minutes)
+            for index in range(100):
+                plan = plan_families(temperament, str(index))
+                self.assertEqual(plan, plan_families(temperament, str(index)))
+                self.assertIn(len(plan), (2, 3, 4))
+                self.assertEqual(plan[-1], "F4")
+                self.assertEqual(len(plan), len(set(plan)))
+                self.assertEqual(list(plan[:-1]), sorted(
+                    plan[:-1],
+                    key=lambda family: (minutes[family], ("F3", "F2", "F1").index(family))
+                ))
+
+    def test_minutes_from_evidence(self):
+        for temperament in temp.TEMPERAMENTS:
+            mix = EVIDENCE[temperament.id]["objection_mix"].values()
+            for family, minute in temperament.family_minutes:
+                theme = max((item for item in mix if item["r1_family"] == family),
+                            key=lambda item: item["rate_per_lead"])
+                self.assertAlmostEqual(minute, theme["median_minute"], delta=0.05)
+
+    def test_distribution_matches_weighted_draws(self):
+        import itertools
+
+        for temperament in temp.TEMPERAMENTS:
+            weights = dict(temperament.family_weights)
+            expected = {family: 0.0 for family in weights}
+            for count, count_weight in temperament.count_weights:
+                for order in itertools.permutations(weights, count - 1):
+                    probability = count_weight
+                    remaining = sum(weights.values())
+                    for family in order:
+                        probability *= weights[family] / remaining
+                        remaining -= weights[family]
+                    for family in order:
+                        expected[family] += probability
+            plans = [temp.plan_families(temperament, str(i)) for i in range(10000)]
+            for count, weight in temperament.count_weights:
+                self.assertAlmostEqual(sum(len(plan) == count for plan in plans) / len(plans),
+                                       weight, delta=0.02)
+            for family, probability in expected.items():
+                self.assertAlmostEqual(sum(family in plan for plan in plans) / len(plans),
+                                       probability, delta=0.03)
