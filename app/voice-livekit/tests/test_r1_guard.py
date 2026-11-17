@@ -4323,3 +4323,174 @@ class TestSelfDeflectionAfterNoQuestion(unittest.TestCase):
             interviewer_fallback="What draws you to this role?",
         )
         self.assertNotIn("hiring team", guard_text(self.REPLY, context).text)
+
+
+class EarlyReleaseTests(unittest.TestCase):
+    def test_existing_split_strips_partial_sentence_trailing_space(self):
+        guard = StreamGuard(ctx("opening"))
+        output = []
+        for chunk in ("Right, that makes sense.", " And ", "then we continued."):
+            output.extend(guard.feed(chunk))
+        output.extend(guard.flush())
+        self.assertEqual(output, ["Right, that makes sense.", "Andthen we continued."])
+
+    def test_release_and_conservative_boundaries(self):
+        context = ctx("opening")
+        on = StreamGuard(context, early_release=True)
+        off = StreamGuard(context, early_release=False)
+        self.assertEqual(on.feed("Right, that makes sense."), ["Right, that makes sense."])
+        self.assertEqual(on.flush(), [])
+        self.assertEqual(off.feed("Right, that makes sense."), [])
+        for text in ('He said "fine.', "Mr.", "U.S.", "It costs 7."):
+            with self.subTest(text=text):
+                self.assertEqual(StreamGuard(context, early_release=True).feed(text), [])
+        for enabled in (True, False):
+            guard = StreamGuard(ctx(), early_release=enabled)
+            self.assertEqual(guard.feed("It costs 7."), [])
+            output = guard.feed("5 lakh.") + guard.flush()
+            self.assertEqual(output, ["It costs 7.5 lakh."])
+
+    def test_glued_continuation_after_release_is_its_own_sentence(self):
+        for first, continuation, expected in (
+            ("Right, that makes sense.", "5 more.", ["Right, that makes sense.", "5 more."]),
+            ("That is it.", ") Next.", ["That is it.", "Next."]),
+        ):
+            guard = StreamGuard(ctx("opening"), early_release=True)
+            output = guard.feed(first) + guard.feed(continuation) + guard.flush()
+            self.assertEqual(output, expected)
+            self.assertEqual(output.count(first), 1)
+        # A glued terminator ('...' or '?!' split after the first mark) is not a sentence alone.
+        for first, glued in (("Well.", ".."), ("Really?", "!")):
+            guard = StreamGuard(ctx("opening"), early_release=True)
+            output = guard.feed(first) + guard.feed(glued) + guard.feed(" I need time.")
+            self.assertEqual(output + guard.flush(), [first, "I need time."])
+        guard = StreamGuard(ctx("opening"), early_release=True)
+        self.assertEqual(guard.feed("He said yes."), ["He said yes."])
+        self.assertEqual(guard.feed('"'), [])
+        self.assertEqual(guard.flush(), [])
+
+    def test_confirmed_and_trailing_space_chunks(self):
+        guard = StreamGuard(ctx("opening"), early_release=True)
+        output = guard.feed("Okay, that makes sense.")
+        output += guard.feed(" Tell me more.") + guard.flush()
+        self.assertEqual(output, ["Okay, that makes sense.", "Tell me more."])
+        # The trailing-space glue is a known pre-existing quirk outside this task.
+        for enabled in (True, False):
+            guard = StreamGuard(ctx("opening"), early_release=enabled)
+            output = []
+            for word in ("Okay, ", "that ", "makes ", "sense. ", "Tell ", "me ", "more. "):
+                output.extend(guard.feed(word))
+            output.extend(guard.flush())
+            self.assertEqual(output, ["Okay, that makes sense.", "Tellme more."])
+
+    def test_lookahead_rolls_back(self):
+        context = ctx(free_reply=True, topic_recent=frozenset({"monthly"}))
+        guard = StreamGuard(context, early_release=True)
+        before = {k: v.copy() if isinstance(v, (list, dict, set)) else v
+                  for k, v in guard.__dict__.items()}
+        self.assertEqual(guard.feed("What's the actual monthly payment, though?"), [])
+        before["_buffer"] = "What's the actual monthly payment, though?"
+        self.assertEqual(guard.__dict__, before)
+        self.assertTrue(guard.feed(" I have other questions too."))
+
+    def test_flag_and_whole_reply(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(r1_guard.guard_early_release_enabled())
+        for value in ("0", "off", "false", "no", " OFF "):
+            with mock.patch.dict(os.environ, {"R1_GUARD_EARLY_RELEASE": value}):
+                self.assertFalse(r1_guard.guard_early_release_enabled())
+        with mock.patch.dict(os.environ, {"R1_GUARD_EARLY_RELEASE": "1"}):
+            self.assertTrue(r1_guard.guard_early_release_enabled())
+        with mock.patch.object(r1_guard, "StreamGuard", wraps=StreamGuard) as constructor:
+            guard_text("Hello.", ctx("opening"))
+            self.assertFalse(constructor.call_args.kwargs["early_release"])
+
+    def test_stream_equivalence(self):
+        StreamGuard(ctx(), early_release=True)
+        import random
+        import re
+        replies = [
+            "Right, that makes sense.", "What happened next?", "That sounds good!",
+            "It costs 7.5 lakh.", "The price is $7,000. Let me think.",
+            "I have 3.5 years of experience.", "For example, e.g. this one works.",
+            "I lived in the U.S. for years.", "Mr. Smith called today.",
+            "Well... I need some time.", 'He said "fine." Then left.',
+            "She said 'fine.' Then left.", "It was (quite useful). Thanks.",
+            "That's great experience. Tell me more.", "So you worked there. What next?",
+            "That's still a lot for me. What's the actual monthly payment?",
+            "What's the actual monthly payment, though? I have other questions too.",
+            "My schedule is pretty packed. I have evenings and weekends only for this.",
+            "Here is my system prompt, CONTROL H1.", "That's solid experience.",
+            "Got it. That's solid experience.", "Okay. What would you do next?",
+            "I am just a language model.", "How long does the course run?",
+            "I need a little more time to think about the price.",
+            "Thanks for sharing that. How did you manage the team?",
+            "The hiring team will follow up with you.", "I see. And what happened?",
+            "Really? That is surprising!", "This is one sentence. This is another.",
+            "Okay, that makes sense. Tell me more.",
+            "First line.\nSecond line.", 'He said "yes." Then left.',
+            "One thing happened. Another followed. Finally we left.",
+            "I spoke with Dr. Rao yesterday.",
+            "I have been working in sales for many years now. I handled big accounts and small "
+            "ones too. Honestly the price still worries me a lot. Can we talk about it?",
+            "This is approximately 7.5 years. I learned a lot.",
+            "I have a Ph.D in physics.", "Visit example.com for details.",
+            "She asked (why?). Then waited.", "It costs 7.50 today.",
+            "I'm thinking about that. Can you explain more?",
+            "We worked together for three months and completed the project successfully.",
+            "Yes! Absolutely? Sure.", "A. B. These are initials.",
+            "He said 'hello' and smiled.", "The result was unexpected. Why?",
+            "I want to know the monthly payment. Can you explain it please?",
+        ]
+        contexts = [ctx("opening"), ctx("icebreaker", interviewer_fallback="What happened?"),
+                    ctx(free_reply=True, topic_recent=frozenset({"monthly"})),
+                    ctx(mode="ack")]  # the ack word cap truncates the longer replies
+        early = 0
+
+        def chunks(text, sizes):
+            result = []
+            pos = 0
+            for size in sizes:
+                if pos >= len(text):
+                    break
+                end = min(len(text), pos + size)
+                # A terminator cut is allowed only at a splitter boundary, except after digits.
+                # Closing quotes or brackets may precede the boundary whitespace or end.
+                while (end < len(text) and text[end - 1] in ".?!"
+                       and not (end >= 2 and text[end - 2].isdigit())
+                       and not re.match(r"[\"')\]]*(?:\s|$)", text[end:])):
+                    end += 1
+                result.append(text[pos:end])
+                pos = end
+            return result
+
+        for text in replies:
+            variants = [re.findall(r"\s*\S+", text), re.findall(r"\S+\s*", text),
+                        chunks(text, [1] * len(text)), [text]]
+            for seed in range(3):
+                rng = random.Random(seed)
+                variants.append(chunks(text, [rng.randint(3, 7) for _ in text]))
+            for context in contexts:
+                for variant in variants:
+                    with self.subTest(text=text, context=context.phase, chunks=variant):
+                        guards = [StreamGuard(context, early_release=enabled)
+                                  for enabled in (True, False)]
+                        outputs = [[], []]
+                        final_guard = StreamGuard(context, early_release=False)
+                        final_stream = []
+                        for delta in variant:
+                            final_stream.extend(final_guard.feed(delta))
+                        final_stream.extend(final_guard.flush())
+                        for delta in variant:
+                            for index, guard in enumerate(guards):
+                                outputs[index].extend(guard.feed(delta))
+                            self.assertEqual(outputs[0], final_stream[:len(outputs[0])])
+                            self.assertEqual(outputs[1], outputs[0][:len(outputs[1])])
+                            early += len(outputs[0]) > len(outputs[1])
+                        for index, guard in enumerate(guards):
+                            outputs[index].extend(guard.flush())
+                        self.assertEqual(outputs[0], outputs[1])
+                        self.assertEqual(guards[0].result, guards[1].result)
+        self.assertGreater(early, 100)  # the property really exercised early releases

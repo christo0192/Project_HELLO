@@ -247,6 +247,7 @@
         "R1_BRIEF_VARIETY": { "requiredInProduction": false, "secret": false },
         "R1_REACTION_VARIETY": { "requiredInProduction": false, "secret": false },
         "R1_IB_REASK_V2": { "requiredInProduction": false, "secret": false },
+        "R1_GUARD_EARLY_RELEASE": { "requiredInProduction": false, "secret": false },
         "R1_GUARD_STORY_ECHO": { "requiredInProduction": false, "secret": false },
         "R1_CONSENT_ECHO_DROP": { "requiredInProduction": false, "secret": false },
         "R1_BRIEF_WORDING_V2": { "requiredInProduction": false, "secret": false },

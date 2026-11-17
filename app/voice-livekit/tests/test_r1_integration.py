@@ -2802,6 +2802,7 @@ async def owed_rig(provider: FakeProvider) -> Rig:
 
 
 class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
+    @mock.patch.dict(os.environ, {"R1_GUARD_EARLY_RELEASE": "0"})
     async def test_a_role_play_reply_reports_every_stage_from_the_end_of_speech(self) -> None:
         rig = Rig()
         provider = TimedProvider(rig.clock, "Okay, that makes sense. Tell me more.")
@@ -2822,6 +2823,39 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
                 ("eou_to_tts_first_frame", 1.85),
                 ("tts_ttfb", 0.25),
                 ("eou_to_first_audio", 1.95),
+            ],
+        )
+        reply = rig.interview._last_reply
+        for line_ in latency_lines(lines):
+            self.assertEqual(line_["phase"], "roleplay")
+            self.assertEqual(line_["turn_index"], reply.candidate_index)
+            self.assertEqual(line_["component"], "r1")
+        self.assertEqual(latency_lines(lines)[0]["error_category"], "vad")  # the anchor kind
+        self.assertEqual(latency_lines(lines)[1]["error_category"], "vad")  # final_to_turn_hook
+        kinds = {line_["error_category"] for line_ in latency_lines(lines)[2:]}
+        self.assertEqual(kinds, {reply.plan.mode.value})
+
+    @mock.patch.dict(os.environ, {"R1_GUARD_EARLY_RELEASE": "1"})
+    async def test_a_role_play_reply_reports_every_stage_with_early_release(self) -> None:
+        rig = Rig()
+        provider = TimedProvider(rig.clock, "Okay, that makes sense. Tell me more.")
+        await rig.start_roleplay()
+        with capture_r1_logs() as lines:
+            frames = await drive_reply(rig, OPENER, provider)
+        self.assertEqual(frames, ["frame", "frame"])  # the first fragment, then the remainder
+        self.assertEqual(
+            our_stages(lines),
+            [
+                ("eou_to_turn_hook", 0.7),
+                # The final to the hook: the head start of an end-intent call (2026-10-30).
+                ("final_to_turn_hook", 0.7),
+                ("eou_to_llm_first_token", 1.2),
+                ("llm_ttft", 0.5),
+                ("eou_to_guard_release", 1.5),
+                ("guard_hold", 0.3),
+                ("eou_to_tts_first_frame", 1.75),
+                ("tts_ttfb", 0.25),
+                ("eou_to_first_audio", 1.85),
             ],
         )
         reply = rig.interview._last_reply
