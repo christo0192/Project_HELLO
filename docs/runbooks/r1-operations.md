@@ -1481,11 +1481,26 @@ Related lines: `r1_line_cache_play` (`cached` or `live`, with the line id as `sc
 the running total for this worker). Sarvam's limits are per account and shared with the phone
 lane, so a phone TTS 429 burst that lines up with `r1_line_cache_rate_limited` lines is R1's.
 
-Switches (all read at use, so a restart is enough; every one is optional):
+Watch after deploy: with the anchor on, a likely-complete sentence followed by a thinking pause
+commits after 1.0 s of real silence (previously about 1.35-1.6 s). Compare split turns,
+barge-ins, `summary_anchor`, and `eou_to_turn_hook` before and after. First raise
+`R1_ENDPOINT_VAD_MIN_DELAY_SEC` to 1.2 if candidates are cut off; for full rollback use
+`fly secrets set R1_VAD_ENDPOINT_ANCHOR=0 -a project-hello-voice`. A near-zero
+`final_to_turn_hook` with category `vad` means the wait had expired when the final arrived;
+a slow final or a continuation missed by VAD can cause this, and timing alone cannot tell which.
+Exit `summary_final_to_turn_hook` lines report its distribution; `summary_anchor` counts do not
+identify stale anchors.
+
+Switches (optional; timing of reads is noted for the M033 switches):
 
 | Variable | Default | Effect and rollback |
 |---|---|---|
-| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.8 / 3.0 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off. Every phase, the transition included, uses these two since 2026-11-03 (the transition answers questions now): see "Turn taking and transcript rows" below |
+| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.8 / 3.0 | Endpoint waits, read when the session is configured. The minimum applies only with `R1_VAD_ENDPOINT_ANCHOR=0`, measured from final transcript arrival; with the anchor on it is ignored and an explicit setting logs `r1_endpoint_setting_ignored`. The maximum still applies. |
+| `R1_VAD_ENDPOINT_ANCHOR` | on | Read when the session is configured; endpoint wait starts at VAD end of speech. Rollback: `fly secrets set R1_VAD_ENDPOINT_ANCHOR=0 -a project-hello-voice`. |
+| `R1_ENDPOINT_VAD_MIN_DELAY_SEC` | 1.0 | Read when the session is configured; bounded 0.5-2.0 seconds of real silence. Raise to 1.2 if candidates report cutoffs while the anchor is on. |
+| `R1_SPECULATIVE_REPLY` | on | Read once per session; speculative replies report `r1_spec_reply` categories (`started`, `adopted`, `unusable`, `discarded_key`, `discarded_index`, `discarded_messages`, `discarded_mode`, `skipped_speaking`, `skipped_end_intent`, `skipped_cap`) and exit `r1_latency` `summary_spec` counts. Speculative 429s log `r1_provider_429` with category `llm_spec`. Rollback: `fly secrets set R1_SPECULATIVE_REPLY=0 -a project-hello-voice`. |
+| `R1_GUARD_EARLY_RELEASE` | on | Read when each stream guard is created; releases safe complete sentences early. Rollback: `fly secrets set R1_GUARD_EARLY_RELEASE=0 -a project-hello-voice`. |
+| `R1_WARM_SAY_LINES` | on | Read at use; warms additional scripted lines and re-warms name lines when learned. Rollback: `fly secrets set R1_WARM_SAY_LINES=0 -a project-hello-voice`. |
 | `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.8 / 0 | Voice barge-in (owner decision 2026-10-28; SDK default 0.5 s / 0): 0.8 s of the candidate's voice pauses the line, a final transcript cuts it. **Rollback: `R1_INTERRUPT_MIN_WORDS=3`** on `project-hello-voice` and restart (the learner then talks on until the candidate's turn is committed). See "Interrupting with final-only speech recognition" below |
 | `R1_FALSE_INTERRUPTION_TIMEOUT_SEC` | 2.0 | Seconds after a pause with no transcript (noise, a cough) before the paused line resumes where it stopped (0.5-5.0; SDK default 2.0). Below about 1.5 s a late Sarvam final can make the learner resume and then stop again |
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |

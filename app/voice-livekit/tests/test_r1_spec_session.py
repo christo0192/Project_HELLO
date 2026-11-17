@@ -43,6 +43,44 @@ class DeterministicProvider(FakeProvider):
 
 
 class SpecSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_spec_client_error_events_count_429(self):
+        import r1_llm
+        import r1_session
+        from r1_linecache import RateLimitCounter
+
+        for status in (429, 500):
+            with self.subTest(status=status):
+                rig = Rig()
+                rig.interview._rate_limits = RateLimitCounter()
+
+                class Client:
+                    def on(self, event, callback):
+                        self.callback = callback
+                    def chat(self, **kwargs):
+                        error = types.SimpleNamespace(status_code=status)
+                        self.callback(types.SimpleNamespace(error=error))
+                        class Stream:
+                            async def __aenter__(self):
+                                return self
+                            async def __aexit__(self, *args):
+                                pass
+                            def __aiter__(self):
+                                return self
+                            async def __anext__(self):
+                                raise StopAsyncIteration
+                        return Stream()
+                with patch.object(r1_llm, "build_r1_llm", return_value=Client()), \
+                     patch.object(r1_session._log, "warn") as log:
+                    _ = [item async for item in rig.interview._default_spec_runner([])]
+                events = [c for c in log.call_args_list
+                          if c.kwargs.get("error_type") == "r1_provider_429"]
+                self.assertEqual(rig.interview._rate_limits.count("r1", "llm_spec"),
+                                 int(status == 429))
+                self.assertEqual(len(events), int(status == 429))
+                if events:
+                    self.assertEqual(events[0].kwargs["error_category"], "llm_spec")
+                    self.assertEqual(events[0].kwargs["option_count"], 1)
+
     async def test_final_starts_and_commits_speculation(self):
         runner = FakeProvider("I am exploring my options.")
         with patch.dict(os.environ, {"R1_SPECULATIVE_REPLY": "1"}):

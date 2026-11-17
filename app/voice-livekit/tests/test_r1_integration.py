@@ -3482,6 +3482,33 @@ class TestWarmSayLines(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(events), int(enabled))
                 self.assertNotIn("Cristo", str(lines))
 
+    async def test_name_rewarm_cancels_pending_warm(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), mock.patch.dict(
+                os.environ, {"R1_WARM_SAY_LINES": "1" if enabled else "0"}
+            ):
+                rig, _, _ = self.build()
+                rig.interview.context["first_name"] = "there"
+                started = asyncio.Event()
+                calls = []
+
+                async def warm(*, candidate_free):
+                    calls.append(candidate_free)
+                    started.set()
+                    if len(calls) == 1:
+                        await asyncio.Event().wait()
+
+                with mock.patch.object(rig.interview, "_warm_line_cache", side_effect=warm):
+                    rig.interview._start_line_warmup(candidate_free=False)
+                    await started.wait()
+                    first = rig.interview._name_warm_task
+                    rig.interview._learn_spoken_name("my name is Cristo")
+                    await asyncio.sleep(0)
+                    self.assertEqual(first.cancelled(), enabled)
+                    self.assertEqual(len(calls), 2 if enabled else 1)
+                    first.cancel()
+                    await asyncio.gather(first, return_exceptions=True)
+
     async def test_miss_diagnostics(self):
         for enabled in (True, False):
             with self.subTest(enabled=enabled), mock.patch.dict(

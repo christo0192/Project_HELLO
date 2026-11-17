@@ -33,8 +33,10 @@ Independent, SDK-free pieces live here so each is unit-testable without a sessio
   learner line whose turn commits within 2.0 s of the final (the common case, about 0.45 s)
   is cut exactly as before; only a turn the default detector holds toward ``max_delay``
   (3.0 s) can let the paused line resume briefly before the cut, seen rarely if ever.
-  Known residual: if the VAD misses a quiet utterance entirely, a stale last-speaking time can
-  let the wait expire at the final itself; the exit ``summary_anchor`` counts expose it.
+  Known residual: a near-zero ``final_to_turn_hook`` with category ``vad`` indicates the
+  endpoint wait had already expired when the final landed. A slow final or a continuation the
+  VAD missed can cause this; timing alone cannot distinguish them. Exit ``summary_<stage>``
+  lines include ``final_to_turn_hook``; ``summary_anchor`` counts cannot expose a stale anchor.
 
 * ``LatencyTracker``: stamps the stages of one candidate turn and hands every segment to an
   ``emit`` callback.  ``r1_session`` turns each call into one structured ``r1`` log line

@@ -3889,6 +3889,7 @@ class R1Interview:
         # has no usable name (``_first_name``).  Never logged.
         self._spoken_name = ""
         self._name_rewarmed = False
+        self._name_warm_task: asyncio.Future[Any] | None = None
         self._history: list[dict[str, Any]] = []
         self._latest_candidate_index: int | None = None
         self._user_turn_started: float | None = None
@@ -4122,7 +4123,9 @@ class R1Interview:
         # at most six requests from the shared Sarvam budget. Off, misses are synthesised live.
         if warm_say_lines_enabled() and self._line_cache is not None and not self._name_rewarmed:
             self._name_rewarmed = True
-            self._spawn(self._warm_line_cache(candidate_free=False))
+            if self._name_warm_task is not None and not self._name_warm_task.done():
+                self._name_warm_task.cancel()
+            self._name_warm_task = self._spawn(self._warm_line_cache(candidate_free=False))
             _log.info("unknown_event", error_type="r1_line_cache_rewarm")
         _log.info("unknown_event", error_type="r1_spoken_name_adopted")
 
@@ -5173,7 +5176,9 @@ class R1Interview:
         for the activated session (``run``): they are synthesised for this session alone.
         """
         if self._line_cache is not None:
-            self._spawn(self._warm_line_cache(candidate_free=candidate_free))
+            task = self._spawn(self._warm_line_cache(candidate_free=candidate_free))
+            if not candidate_free:
+                self._name_warm_task = task
 
     async def _warm_line_cache(self, *, candidate_free: bool) -> None:
         cache = self._line_cache
@@ -7762,6 +7767,7 @@ class R1Interview:
 
             if self._spec_llm is None:
                 self._spec_llm = build_r1_llm()
+                self._spec_llm.on("error", self._on_spec_error)
             options = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
         except Exception as exc:
             self._spec_unusable = True
@@ -8779,11 +8785,12 @@ class R1Interview:
             return
         self._failures = 0
 
-    def _spawn(self, awaitable: Awaitable[Any]) -> None:
+    def _spawn(self, awaitable: Awaitable[Any]) -> asyncio.Future[Any]:
         """Run a fire-and-forget task that the exit funnel can cancel."""
         task = asyncio.ensure_future(awaitable)
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+        return task
 
     def _uninterruptible_speech_live(self) -> bool:
         """True while any known speech was started with ``allow_interruptions=False``.
@@ -9868,7 +9875,11 @@ class R1Interview:
             current = getattr(current, "error", None)
         return None
 
-    def _note_rate_limited(self, error: Any) -> None:
+    def _on_spec_error(self, event: Any) -> None:
+        if self._provider_status(event) == 429:
+            self._note_rate_limited(event, component="llm_spec")
+
+    def _note_rate_limited(self, error: Any, *, component: str | None = None) -> None:
         """Count a provider 429 for this lane (``r1``) and component, and log the running total.
 
         Every 429 counts, recoverable or not: the SDK retries a 429, and a retried 429 is still
@@ -9876,8 +9887,8 @@ class R1Interview:
         the phone lane, so this is how an R1 burst is told apart from a phone one.
         """
         kind = str(getattr(error, "type", ""))
-        component = kind[: -len("_error")] if kind.endswith("_error") else ""
-        if component not in ("llm", "tts", "stt"):
+        component = component or (kind[: -len("_error")] if kind.endswith("_error") else "")
+        if component not in ("llm", "llm_spec", "tts", "stt"):
             component = "provider"
         count = self._rate_limits.record(LANE_R1, component)
         _log.warn(

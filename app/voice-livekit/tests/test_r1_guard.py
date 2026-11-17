@@ -4369,6 +4369,27 @@ class EarlyReleaseTests(unittest.TestCase):
         self.assertEqual(guard.feed('"'), [])
         self.assertEqual(guard.flush(), [])
 
+    def test_punctuation_only_glue_does_not_taint_next_sentence(self):
+        for first, punctuation in (("Wow.", "!"),
+                                   ("I am just a language model.", ")?!")):
+            with self.subTest(first=first, punctuation=punctuation):
+                guards = [StreamGuard(ctx("opening"), early_release=enabled)
+                          for enabled in (True, False)]
+                outputs = [[], []]
+                for guard, output in zip(guards, outputs):
+                    output.extend(guard.feed(first))
+                self.assertIsNotNone(guards[0]._ghost)
+                for chunk in (punctuation, " What is the fee?"):
+                    for guard, output in zip(guards, outputs):
+                        output.extend(guard.feed(chunk))
+                for guard, output in zip(guards, outputs):
+                    output.extend(guard.flush())
+                self.assertEqual(outputs[0][-1:], outputs[1][-1:])
+                self.assertIn("What is the fee?", outputs[0])
+                self.assertIsNone(guards[0]._glued_prefix)
+                if "language model" in first:
+                    self.assertNotIn(first, outputs[0])
+
     def test_confirmed_and_trailing_space_chunks(self):
         guard = StreamGuard(ctx("opening"), early_release=True)
         output = guard.feed("Okay, that makes sense.")
@@ -4406,6 +4427,78 @@ class EarlyReleaseTests(unittest.TestCase):
         with mock.patch.object(r1_guard, "StreamGuard", wraps=StreamGuard) as constructor:
             guard_text("Hello.", ctx("opening"))
             self.assertFalse(constructor.call_args.kwargs["early_release"])
+
+    def test_glued_dotted_tokens(self):
+        cases = [
+            (["Mail hr@company.", "in today."], True),
+            (["Write to support@upgrad.", "com or call us."], True),
+            (["Just check example.", "com/pricing for the details."], False),
+            (["Reach me on priya.", "sharma at the office."], False),
+            (["Just check example.", "com/", "pricing for", " the details.", " Thanks."], False),
+        ]
+        contexts = [ctx(free_reply=True), ctx("wrapup"),
+                    ctx("icebreaker", interviewer_fallback="What happened?")]
+        for chunks, email in cases:
+            for context in contexts:
+                with self.subTest(chunks=chunks, phase=context.phase):
+                    guards = [StreamGuard(context, early_release=on) for on in (True, False)]
+                    outputs = [[], []]
+                    for chunk in chunks:
+                        for guard, out in zip(guards, outputs):
+                            out.extend(guard.feed(chunk))
+                    for guard, out in zip(guards, outputs):
+                        out.extend(guard.flush())
+                    if email:
+                        self.assertEqual(outputs[0], outputs[1])
+                        self.assertEqual(guards[0].result, guards[1].result)
+                    else:
+                        on = {hit.category for hit in guards[0].result.hits}
+                        off = {hit.category for hit in guards[1].result.hits}
+                        self.assertGreaterEqual(on, off)
+                        if off:
+                            self.assertFalse(any("com/pricing" in x or "sharma" in x
+                                                 for x in outputs[0]))
+                        for separator in ("", " "):
+                            exposed = {h.category for h in check_sentence(
+                                separator.join(outputs[0]), context)}
+                            baseline = {h.category for h in check_sentence(
+                                separator.join(outputs[1]), context)}
+                            self.assertFalse((exposed - baseline) & {"contact", "persona_secret"})
+                        if len(chunks) > 2:
+                            self.assertTrue(any("Thanks" in x for x in outputs[0]))
+
+    def test_internal_dot_chunk_safety(self):
+        replies = ["Mail hr@company.in today. Thanks.",
+                   "Write to support@upgrad.com today. Thanks.",
+                   "Just check example.com/pricing for details. Thanks.",
+                   "Reach me on priya.sharma at the office. Thanks.",
+                   "The release is named alpha.beta today. Thanks."]
+        contexts = [ctx("opening"), ctx("icebreaker", interviewer_fallback="What happened?"),
+                    ctx(free_reply=True, topic_recent=frozenset({"monthly"})), ctx(mode="ack")]
+        for reply in replies:
+            cut = reply.index(".") + 1
+            for context in contexts:
+                for chunks in ([reply[:cut], reply[cut:]],
+                               [reply[:cut], *list(reply[cut:])]):
+                    with self.subTest(reply=reply, phase=context.phase, chunks=len(chunks)):
+                        guards = [StreamGuard(context, early_release=on) for on in (True, False)]
+                        outputs = [[], []]
+                        for chunk in chunks:
+                            for guard, out in zip(guards, outputs):
+                                out.extend(guard.feed(chunk))
+                        for guard, out in zip(guards, outputs):
+                            out.extend(guard.flush())
+                        on = {hit.category for hit in guards[0].result.hits}
+                        off = {hit.category for hit in guards[1].result.hits}
+                        self.assertGreaterEqual(on, off)
+                        for separator in ("", " "):
+                            exposed = {h.category for h in check_sentence(
+                                separator.join(outputs[0]), context)}
+                            baseline = {h.category for h in check_sentence(
+                                separator.join(outputs[1]), context)}
+                            self.assertFalse((exposed - baseline) & {"contact", "persona_secret"})
+                        if "alpha.beta" in reply and not off:
+                            self.assertEqual("".join(outputs[0]), "".join(outputs[1]))
 
     def test_stream_equivalence(self):
         StreamGuard(ctx(), early_release=True)

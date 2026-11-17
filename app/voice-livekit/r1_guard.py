@@ -2884,6 +2884,8 @@ def _looks_complete(part: str, raw: str) -> bool:
     if part[-1] == "." and not (part[-2].isalpha() or part[-2] in "\"')]"):
         return False
     token = part.split()[-1]
+    if "@" in token or "/" in token or "://" in token or token.lower().startswith("www"):
+        return False
     letters = "".join(c for c in token[:-1] if c.isalpha())
     if "." in token[:-1] or len(letters) == 1 or letters.lower() in _EARLY_ABBREVIATIONS:
         return False
@@ -2918,6 +2920,7 @@ class StreamGuard:
         )
         self._ghost: str | None = None
         self._ghost_len = 0
+        self._glued_prefix: str | None = None
         self._probing = False
         self._probe_rest = False
         self._buffer = ""
@@ -3497,6 +3500,15 @@ class StreamGuard:
         if self._done:
             return []
         self._vetted += 1
+        if self._glued_prefix is not None:
+            prefix = self._glued_prefix
+            self._glued_prefix = None
+            hits = check_sentence(prefix + sentence, self.ctx)
+            if hits:
+                self._hits.extend(hits)
+                self._other_drops += 1
+                self._last_dropped = True
+                return []
         if self.ctx.offer_phrase_used and not self.ctx.is_learner and sentence:
             trimmed = without_offer_phrase(sentence)  # D4-TRANS-Q1: the offer was made once
             if trimmed != sentence:
@@ -3748,7 +3760,12 @@ class StreamGuard:
                 and parts[0][len(ghost):]
                 and all(c in "\"')]" for c in parts[0][len(ghost):])):
             return parts, True
-        self._buffer = self._buffer[self._ghost_len :].lstrip(".?!\"')]")
+        remainder = self._buffer[self._ghost_len :]
+        stripped = remainder.lstrip(".?!\"')]")
+        glued_token = re.match(r"\S*", stripped).group()
+        if any(c.isalnum() for c in glued_token):
+            self._glued_prefix = ghost + remainder[:len(remainder) - len(stripped)]
+        self._buffer = stripped
         self._ghost = None
         self._ghost_len = 0
         parts = split_sentences(self._buffer)
