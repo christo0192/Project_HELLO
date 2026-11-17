@@ -2036,11 +2036,13 @@ class CoverageTracker:
     """Shadow coverage state for one role-play (see the module docstring)."""
 
     def __init__(
-        self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False
+        self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False,
+        discipline_v2: bool = False,
     ) -> None:
         self.persona = persona
         self.seed = seed
         self.invented_v2 = invented_v2
+        self.discipline_v2 = discipline_v2
         self.judge_invented_turns = 0
         self._rule_invented = False
         self.gate = DisclosureGate(persona)
@@ -2154,7 +2156,24 @@ class CoverageTracker:
 
     @property
     def discount_ok(self) -> bool:
-        """Discipline intact: every discount within the cap, conditional, after value."""
+        """Discipline intact under the active rule.
+
+        Every mention (flag off): each discount within the cap, conditional, after value.
+        First offer (R1_DISCOUNT_DISCIPLINE_V2): each amount's first mention is a conditional
+        deck discount after value; restating it is fine; an over-cap or off-deck amount
+        always fails.
+        """
+        if self.discipline_v2:
+            seen = set()
+            for item in self.discount_log:
+                amount = item["usd"]
+                if amount > DISCOUNT_CAP_USD or amount not in DISCOUNTS_USD:
+                    return False
+                if amount not in seen:
+                    if not item["conditional"] or not item["value_before"]:
+                        return False
+                    seen.add(amount)
+            return True
         return all(
             item["usd"] <= DISCOUNT_CAP_USD and item["conditional"] and item["value_before"]
             for item in self.discount_log
@@ -2186,6 +2205,7 @@ class CoverageTracker:
                 "within_cap": all(item["usd"] <= DISCOUNT_CAP_USD for item in self.discount_log),
                 "discipline_ok": self.discount_ok,
                 "invented_offer": self.invented_offer,
+                "rule": "first_offer" if self.discipline_v2 else "every_mention",
             },
             "urgency": {
                 "levers": sorted(lever for lever in self.levers if lever in URGENCY_LEVER_IDS),

@@ -774,6 +774,63 @@ class OfferPolarityTests(unittest.TestCase):
         self.assertFalse(t.commitment_evidence(AskKind.ENROL).discount_ok)
 
 
+class DiscountDisciplineV2Tests(unittest.TestCase):
+    VALUE = "Our curriculum covers python and sql with weekly mentor feedback."
+    OFFER = "If you go with the payment plan, I can do $1,500 off."
+    RESTATE = "So with the $1,500 off it comes to $7,500."
+
+    def tracker(self, v2, turns):
+        tracker = CoverageTracker(PERSONA, seed="seed", discipline_v2=v2)
+        for turn, text in turns:
+            observation = tracker.observe_candidate_turn(text, turn)
+            if text == self.VALUE:
+                self.assertTrue(observation.value_statement)
+        return tracker
+
+    def test_restatement_and_admin_rule(self):
+        turns = [(2, self.VALUE), (5, self.OFFER), (9, self.RESTATE)]
+        for v2 in (False, True):
+            with self.subTest(v2=v2):
+                tracker = self.tracker(v2, turns)
+                self.assertEqual(tracker.discount_ok, v2)
+                self.assertEqual(tracker.commitment_evidence(AskKind.ENROL).discount_ok, v2)
+                discounts = tracker.admin_view()["discounts"]
+                self.assertEqual(discounts["rule"], "first_offer" if v2 else "every_mention")
+                self.assertEqual(discounts["discipline_ok"], tracker.discount_ok)
+                self.assertEqual(len(discounts["offers"]), 2)
+                tracker.observe_candidate_turn("That is $1,500 off.", 10)
+                self.assertEqual(len(tracker.admin_view()["discounts"]["offers"]), 3)
+
+    def test_failed_first_offer_cannot_be_repaired(self):
+        turns = [(2, self.VALUE), (5, "I can do $1,500 off."), (9, self.OFFER)]
+        for v2 in (False, True):
+            with self.subTest(v2=v2):
+                self.assertFalse(self.tracker(v2, turns).discount_ok)
+
+    def test_over_cap_and_new_amount(self):
+        cases = [
+            [(2, self.VALUE), (5, "If you enrol this week, I can do $2,000 off.")],
+            [(2, self.VALUE), (5, self.OFFER), (9, "I can do $2,000 off.")],
+            [(2, self.VALUE), (5, "If you enrol this week, I can do $500 off."),
+             (9, "I can do $1,000 off.")],
+            [(1, self.OFFER), (3, self.VALUE), (5, self.RESTATE)],
+            [(2, self.VALUE), (5, "If you enrol this week, I can do $750 off.")],
+        ]
+        for v2 in (False, True):
+            for turns in cases:
+                with self.subTest(v2=v2, turns=turns):
+                    if not v2 and "$750" in turns[-1][1]:
+                        continue
+                    self.assertFalse(self.tracker(v2, turns).discount_ok)
+
+    def test_default_is_v1(self):
+        tracker = CoverageTracker(PERSONA, seed="seed")
+        for turn, text in [(2, self.VALUE), (5, self.OFFER), (9, self.RESTATE)]:
+            tracker.observe_candidate_turn(text, turn)
+        self.assertFalse(tracker.discount_ok)
+        self.assertEqual(tracker.admin_view()["discounts"]["rule"], "every_mention")
+
+
 class DiscountRefusalTests(unittest.TestCase):
     """A refusal of the learner's anchor is not a discount (review P1)."""
 

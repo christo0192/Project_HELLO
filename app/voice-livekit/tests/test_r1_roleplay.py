@@ -15126,6 +15126,26 @@ class D5RPostByeTests(unittest.TestCase):
         self.assertTrue(s.eng._bye_heard)
 
 
+class DiscountDisciplineV2IntegrationTests(unittest.TestCase):
+    def test_flag_latches_tracker_rule(self):
+        for value in ("0", "1"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"R1_DISCOUNT_DISCIPLINE_V2": value}),
+            ):
+                eng = engine(seed="discipline-v2")
+                session = Session(eng)
+                session.say("Our curriculum covers python and sql with weekly mentor feedback.", 20)
+                session.say("If you go with the payment plan, I can do $1,500 off.", 60)
+                session.say("So with the $1,500 off it comes to $7,500.", 100)
+                self.assertEqual(len(eng.tracker.discount_log), 2)
+                expected = value == "1"
+                self.assertEqual(eng.tracker.discount_ok, expected)
+                self.assertEqual(eng.tracker.commitment_evidence(None).discount_ok, expected)
+                rule = eng.admin_log()["tracker"]["discounts"]["rule"]
+                self.assertEqual(rule, "first_offer" if expected else "every_mention")
+
+
 class InventedOfferV2IntegrationTests(unittest.TestCase):
     def test_flag_latches_tracker_and_prompt(self):
         for value in ("0", "1"):

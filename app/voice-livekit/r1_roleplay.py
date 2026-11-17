@@ -1272,6 +1272,8 @@ FLAG_TOPIC_REPEAT = "R1_TOPIC_REPEAT"
 FLAG_POST_BYE_QUIET = "R1_POST_BYE_QUIET"
 # M033 A1: free perks only count when offered; the judge alone needs two turns.
 FLAG_INVENTED_OFFER_V2 = "R1_INVENTED_OFFER_V2"
+# M033 A2: discount discipline judged on the first offer of each amount.
+FLAG_DISCOUNT_DISCIPLINE_V2 = "R1_DISCOUNT_DISCIPLINE_V2"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1408,6 +1410,7 @@ _FLAG_READS = {
     FLAG_TOPIC_REPEAT: lambda: os.getenv("R1_TOPIC_REPEAT"),
     FLAG_POST_BYE_QUIET: lambda: os.getenv("R1_POST_BYE_QUIET"),
     FLAG_INVENTED_OFFER_V2: lambda: os.getenv("R1_INVENTED_OFFER_V2"),
+    FLAG_DISCOUNT_DISCIPLINE_V2: lambda: os.getenv("R1_DISCOUNT_DISCIPLINE_V2"),
 }
 
 
@@ -1718,8 +1721,12 @@ class RolePlayEngine:
         # Simulation diagnosis 1 (R1_MARKERS_V2, latched per session): the wider delivery markers.
         self._markers_v2 = flag_on(FLAG_MARKERS_V2)
         self._invented_v2 = flag_on(FLAG_INVENTED_OFFER_V2)
+        self._discipline_v2 = flag_on(FLAG_DISCOUNT_DISCIPLINE_V2)
         self.scheduler = OwedMoveScheduler(persona.decision_maker, markers_v2=self._markers_v2)
-        self.tracker = CoverageTracker(persona, seed=self.seed, invented_v2=self._invented_v2)
+        self.tracker = CoverageTracker(
+            persona, seed=self.seed, invented_v2=self._invented_v2,
+            discipline_v2=self._discipline_v2,
+        )
         self.ledger = GuardLedger()
         self.turn = 0
         self.last_r = 0.0
