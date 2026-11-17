@@ -342,6 +342,113 @@ def _check(record: dict, name: str) -> dict:
     return record["phase_checks"]["checks"][name]
 
 
+def paired_spec_records(group="default") -> dict:
+    key = f"spec_pairs_{group}"
+    if key not in _CACHE:
+        from unittest.mock import patch
+        from rehearsal.full import run_full_call
+        from rehearsal.full_run import FullSettings, OfflineFullFactory, plan_full_specs
+        from rehearsal.scenarios import parse_scenarios
+
+        settings = FullSettings(offline=True, scenarios=parse_scenarios(group), judge=False)
+        factory = OfflineFullFactory(settings)
+
+        async def main():
+            result = {}
+            for spec in plan_full_specs(settings.scenarios, settings.learners):
+                pair = []
+                for mode, hold in (("1", True), ("0", False)):
+                    deps = factory.make(spec)
+                    deps.spec_hold = hold
+                    with patch.dict("os.environ", {"R1_SPECULATIVE_REPLY": mode}):
+                        pair.append(await run_full_call(spec, deps))
+                result[spec.scenario] = pair
+            return result
+
+        _CACHE[key] = vloop.run_virtual(main())
+    return _CACHE[key]
+
+
+class SpecGridTests(unittest.TestCase):
+    def test_held_matches_off_for_every_default_scenario(self):
+        from rehearsal.full_run import compare_records
+
+        pairs = paired_spec_records()
+        adopted = 0
+        for name, (held, off) in pairs.items():
+            with self.subTest(scenario=name):
+                comparison = compare_records(held, off)
+                self.assertTrue(comparison["identical_text"], comparison)
+                self.assertTrue(comparison["identical_decisions"], comparison)
+                self.assertEqual(off["spec_reply"]["spec_raw_calls"], 0)
+                self.assertEqual(off["spec_reply"]["by_category"], {})
+                adopted += held["spec_reply"]["by_category"].get("adopted", 0)
+        self.assertGreater(adopted, 0)
+        self.assertGreater(pairs["strong"][0]["spec_reply"]["by_category"].get("adopted", 0), 0)
+
+    def test_held_matches_off_for_every_adapt_scenario(self):
+        from rehearsal.full_run import compare_records
+
+        for name, (held, off) in paired_spec_records("adapt").items():
+            with self.subTest(scenario=name):
+                comparison = compare_records(held, off)
+                self.assertTrue(comparison["identical_text"], comparison)
+                self.assertTrue(comparison["identical_decisions"], comparison)
+
+    def test_late_final_held_matches_off(self):
+        from unittest.mock import patch
+        from rehearsal.full import run_full_call
+        from rehearsal.full_run import FullSettings, OfflineFullFactory, plan_full_specs, text_rows
+        from rehearsal.sim import SdkDriver
+
+        settings = FullSettings(offline=True, scenarios=["strong"], judge=False)
+        factory = OfflineFullFactory(settings)
+        spec = plan_full_specs(settings.scenarios, settings.learners)[0]
+        init = SdkDriver.__init__
+
+        def late_init(driver, *args, **kwargs):
+            init(driver, *args, **kwargs)
+            driver.late_final = True
+
+        async def main():
+            records = []
+            for flag in ("1", "0"):
+                deps = factory.make(spec)
+                deps.spec_hold = flag == "1"
+                with patch.dict("os.environ", {"R1_SPECULATIVE_REPLY": flag}):
+                    records.append(await run_full_call(spec, deps))
+            return records
+
+        with patch.object(SdkDriver, "__init__", late_init):
+            held, off = vloop.run_virtual(main())
+        self.assertEqual(text_rows(held), text_rows(off))
+        counts = held["spec_reply"]["by_category"]
+        self.assertGreater(sum(n for key, n in counts.items() if key.startswith("discarded_")), 0)
+
+    def test_grid_writes_three_sides(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from rehearsal.full_run import FullSettings, OfflineFullFactory, run_full_all
+
+        settings = FullSettings(offline=True, scenarios=["strong"], judge=False, spec_reply="both")
+        factory = OfflineFullFactory(settings)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            code = vloop.run_virtual(run_full_all(settings, out, lambda _: None, factory=factory))
+            self.assertEqual(code, 0)
+            for side in ("on", "held", "off"):
+                self.assertTrue((out / f"spec-{side}" / "calls").exists())
+            row = json.loads((out / "spec_grid.json").read_text(encoding="utf-8"))[0]
+            self.assertTrue(row["held_vs_off"]["identical_text"])
+            self.assertTrue(row["held_vs_off"]["identical_decisions"])
+            self.assertGreater(row["adopted"], 0)
+            on_path = next((out / "spec-on" / "calls").glob("*.json"))
+            on = json.loads(on_path.read_text(encoding="utf-8"))
+            self.assertEqual(on["header"]["seams"]["spec_reply_runner"], "scripted")
+            self.assertEqual(on["header"]["spec_reply"]["flag"], "on")
+
+
 class OfflineFullInterviewTests(unittest.TestCase):
     """Every default scenario (manual replays, the manual mix, the synthetic edge scenarios)."""
 
@@ -437,7 +544,9 @@ class OfflineFullInterviewTests(unittest.TestCase):
         seams = record["header"]["seams"]
         self.assertEqual(set(seams), set(runner_names()))
         for name in runner_names():
-            expected = "scripted" if (name in SCRIPTED or name == "judge_runner") else "absent"
+            expected = "scripted" if (name in SCRIPTED or name in {
+                "judge_runner", "spec_reply_runner"
+            }) else "absent"
             self.assertEqual(seams[name], expected, name)
         self.assertIn("clock", record["header"])
         self.assertEqual(record["header"]["clock"]["watchdog_trips"], 0)

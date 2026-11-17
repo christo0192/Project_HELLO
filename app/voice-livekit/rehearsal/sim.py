@@ -484,6 +484,9 @@ class SdkDriver:
         self.ctx = ctx
         self.recorders = recorders
         session.driver = self
+        self.spec_memo = None
+        self.hold_adopted = False
+        self.late_final = False
 
     @property
     def interview(self) -> Any:
@@ -539,6 +542,7 @@ class SdkDriver:
         rt = self.rt
         session = self.session
         finals = split_finals(text)
+        adopted_before = getattr(self.interview, "_spec_counts", {}).get("adopted", 0)
         if not finals:
             return {"suppressed": True, "why": "empty", "spoken": None}
         cut_after = barge_in_sec() if barge_in else None
@@ -549,7 +553,9 @@ class SdkDriver:
         try:
             session.emit("user_state_changed", _state("listening", "speaking"))
             voiced = 0.0
-            for final in finals:
+            for index, final in enumerate(finals):
+                if self.late_final and len(finals) > 1 and index == len(finals) - 1:
+                    session.emit("user_state_changed", _state("speaking", "listening"))
                 seconds = max(MIN_FINAL_SEC, word_count(final) / wps)
                 if cut_after is not None and voiced + seconds > cut_after:
                     await asyncio.sleep(max(0.0, cut_after - voiced))
@@ -563,7 +569,8 @@ class SdkDriver:
                     SimpleNamespace(is_final=True, transcript=final, created_at=vloop.epoch_now()),
                 )
                 await settle()
-            session.emit("user_state_changed", _state("speaking", "listening"))
+            if not self.late_final or len(finals) == 1:
+                session.emit("user_state_changed", _state("speaking", "listening"))
         finally:
             rt.close_span(span)
             rt.candidate_speaking = False
@@ -607,11 +614,18 @@ class SdkDriver:
         finally:
             rt.replying -= 1
         reply = getattr(interview, "_last_reply", None)
+        adopted = getattr(interview, "_spec_counts", {}).get("adopted", 0) > adopted_before
+        calls = recorder.take()
+        spec_recorder = self.recorders.get("spec_reply")
+        spec_calls = spec_recorder.take() if spec_recorder else []
+        if adopted and spec_calls:
+            calls = [spec_calls[-1]]
         return {
             "suppressed": False,
             "spoken": spoken,
             "span": span,
-            "calls": recorder.take(),
+            "calls": calls,
+            "speculative": adopted,
             "plan": reply.plan if (reply is not None and reply is not previous) else None,
             "decided_r_sec": decided_r_sec,
         }
@@ -625,15 +639,27 @@ class SdkDriver:
 
     async def _play_reply(self, handle: Any, message_id: str | None, recorder: Any) -> str | None:
         """Generate the reply at once (the SDK runs the LLM node before the speech's turn), then
-        play it when it reaches the head of the speech queue, unless it was cut meanwhile."""
+        play it when it reaches the head of the speech queue, unless it was cut meanwhile.
+
+        hold_adopted only affects offline runs; live runs ignore it.
+        """
         rt = self.rt
         session = self.session
         try:
             session.emit("agent_state_changed", _state("listening", "thinking"))
             items = [SimpleNamespace(role="user", id=message_id)] if message_id else []
+            started = asyncio.get_running_loop().time()
+            adopted_before = getattr(self.interview, "_spec_counts", {}).get("adopted", 0)
             stream = self.interview.llm_node_stream(SimpleNamespace(items=items), recorder)
             parts: list[str] = []
             async for chunk in stream:
+                adopted = getattr(self.interview, "_spec_counts", {}).get("adopted", 0)
+                if not parts and adopted > adopted_before and self.spec_memo is not None:
+                    if self.spec_memo.stash:
+                        self.spec_memo.commit(self.spec_memo.stash[-1])
+                if not parts and self.hold_adopted and rt.offline and adopted > adopted_before:
+                    delay = started + rt.timing.offline_learner_llm_sec
+                    await asyncio.sleep(max(0, delay - asyncio.get_running_loop().time()))
                 parts.append(chunk if isinstance(chunk, str) else delta_text(chunk))
             spoken = "".join(parts).strip()
             if not spoken or not await session.wait_turn(handle):
