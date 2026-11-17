@@ -161,3 +161,49 @@ class TemperamentPlanTests(unittest.TestCase):
             for family, probability in expected.items():
                 self.assertAlmostEqual(sum(family in plan for plan in plans) / len(plans),
                                        probability, delta=0.03)
+
+
+class ThemePickTests(unittest.TestCase):
+    def test_pick_is_deterministic_and_weighted(self):
+        for temperament in temp.TEMPERAMENTS:
+            for family, weights in temperament.theme_weights:
+                picks = [dict(temp.pick_themes(temperament, str(i), (family,)))[family]
+                         for i in range(10000)]
+                self.assertAlmostEqual(picks.count(weights[0][0]) / len(picks),
+                                       weights[0][1] / sum(w for _, w in weights), delta=0.02)
+                self.assertEqual(temp.pick_themes(temperament, "x", (family,)),
+                                 temp.pick_themes(temperament, "x", (family,)))
+
+    def test_deep_evaluator_f3_picks_both_top_themes(self):
+        temperament = next(t for t in temp.TEMPERAMENTS if t.id == "deep_evaluator")
+        picks = {dict(temp.pick_themes(temperament, str(seed), ("F3",)))["F3"]
+                 for seed in range(200)}
+        self.assertEqual(picks, {"pays_off", "confirm_fit"})
+
+    def test_weights_follow_evidence(self):
+        from r1_scheduler import OBJECTION_THEMES
+        names = {
+            "Considering Alternatives": "alternatives",
+            "Doubts the Program Will Pay Off": "pays_off",
+            "Needs to Confirm Fit First": "confirm_fit",
+            "Teaching Format or Pace Concern": "format_pace",
+            "Distrust of the company or advisor": "trust",
+            "Program Schedule Does Not Fit": "schedule",
+            "Unavailable for the Next Step Now": "unavailable_now",
+            "Fee Feels Too High": "fee_high",
+            "Can't Afford It Right Now": "cannot_afford",
+            "Wants Time to Decide": "wants_time",
+            "No current need": "no_need",
+            "Needs Family Approval": "family_approval",
+        }
+        for temperament in temp.TEMPERAMENTS:
+            mix = EVIDENCE[temperament.id]["objection_mix"]
+            for family, weights in temperament.theme_weights:
+                ranked = sorted(((names[name], item["rate_per_lead"])
+                                 for name, item in mix.items()
+                                 if name in names and item["r1_family"] == family),
+                                key=lambda item: item[1], reverse=True)[:2]
+                self.assertEqual([x[0] for x in weights], [x[0] for x in ranked])
+                for (ident, rate), (_, expected) in zip(weights, ranked):
+                    self.assertIn((family, ident), OBJECTION_THEMES)
+                    self.assertAlmostEqual(rate, expected, delta=0.0005)

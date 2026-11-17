@@ -590,6 +590,8 @@ EXTRA_FACT_KEYS = (
 
 # The API parser (admin-log.ts) reads this plan; absent means all four families.
 PLAN_FACT_KEYS = ("families_planned",)
+# Worker-only observation; the API parser does not use this for grading.
+THEME_FACT_KEYS = ("objection_themes",)
 
 
 def session_facts_event(
@@ -657,6 +659,7 @@ def session_facts_event(
             **close_facts,
             **temperament_facts,
             **{key: admin[key] for key in PLAN_FACT_KEYS if key in (admin or {})},
+            **{key: admin[key] for key in THEME_FACT_KEYS if key in (admin or {})},
             **shadow,
             **added,
         },

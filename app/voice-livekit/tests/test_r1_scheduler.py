@@ -2595,5 +2595,127 @@ class PlannedSchedulerTests(unittest.TestCase):
         ))
 
 
+class ObjectionThemeTests(unittest.TestCase):
+    def test_variants_do_not_cross_families(self):
+        for (family, ident), theme in sched.OBJECTION_THEMES.items():
+            if ident == sched.DEFAULT_THEMES[family]:
+                continue
+            for variant in theme.variants:
+                self.assertTrue(sched.markers_match(theme.markers, variant), (ident, variant))
+                for spec in sched.PLAN:
+                    if spec.family not in sched.FAMILIES or spec.family == family:
+                        continue
+                    for person in ("husband", "father"):
+                        for markers in (spec.markers,
+                                        sched.widened_markers(spec.id, spec.markers)):
+                            filled = tuple(tuple(sched._fill(p, person, regex=True) for p in group)
+                                           for group in markers)
+                            if filled:
+                                self.assertFalse(sched.markers_match(filled, variant),
+                                                 (ident, spec.id, variant))
+                for (other_family, other_id), other in sched.OBJECTION_THEMES.items():
+                    if other_family != family:
+                        self.assertFalse(sched.markers_match(other.markers, variant),
+                                         (ident, other_id, variant))
+
+    def test_synthetic_paraphrases_do_not_cross_families(self):
+        examples = {
+            ("F3", "pays_off"): ("Will this really pay off for me?",
+                                 "Could I end up ahead after all that effort?"),
+            ("F3", "confirm_fit"): ("Would this suit someone with my background?",
+                                    "Is this a good fit for me?"),
+            ("F3", "format_pace"): ("How is this taught to people like me?",
+                                    "I worry it might move too fast for me."),
+            ("F3", "trust"): ("I've been burned before, so can I believe this?",
+                              "What can I rely on when promises sound so big?"),
+            ("F2", "unavailable_now"): ("Currently I have too much going on.",
+                                       "At the moment taking on something new is tough."),
+            ("F1", "cannot_afford"): ("My finances are limited these days.",
+                                      "I can't manage the budget right now."),
+            ("F4", "no_need"): ("There's no hurry; it can wait.",
+                                "Things are okay as things are."),
+            ("F4", "family_approval"): ("This choice is up to us together at home.",
+                                       "I can't decide this step by myself."),
+        }
+        for (family, ident), texts in examples.items():
+            for text in texts:
+                self.assertTrue(sched.markers_match(sched.OBJECTION_THEMES[(family, ident)].markers,
+                                                    text), (ident, text))
+                for spec in sched.PLAN:
+                    if spec.family not in sched.FAMILIES or spec.family == family:
+                        continue
+                    for person in ("husband", "father"):
+                        for markers in (spec.markers, sched.widened_markers(spec.id, spec.markers)):
+                            filled = tuple(tuple(sched._fill(p, person, regex=True) for p in group)
+                                           for group in markers)
+                            if filled:
+                                self.assertFalse(sched.markers_match(filled, text),
+                                                 (ident, spec.id, text))
+                for (other_family, other_id), other in sched.OBJECTION_THEMES.items():
+                    if other_family != family:
+                        self.assertFalse(sched.markers_match(other.markers, text),
+                                         (ident, other_id, text))
+
+    def test_theme_only_answers(self):
+        for text in ("Read the reviews.", "See testimonials.", "We are transparent.",
+                     "We are honest.", "Our track record is available.",
+                     "Hear from real learners.", "Hear from real students.",
+                     "Hear from real people.", "The pace is flexible.",
+                     "Go at your own pace.", "We go step by step.",
+                     "It is hands-on.", "There is practice.", "You can ask questions."):
+            self.assertTrue(sched.worry_answered("F3", text, themed=True), text)
+            if "learners" not in text and "students" not in text:
+                self.assertFalse(sched.worry_answered("F3", text), text)
+
+    def test_nondefault_text_has_no_course_facts(self):
+        import re
+        forbidden = re.compile(
+            r"\b(?:months?|weeks?|hours?|live|recorded|weekends?|evenings?|cohorts?|"
+            r"batch|certificate|curriculum|mentors?|placement|refund|guarantee|discount|"
+            r"youtube|coursera|udemy)\b", re.I
+        )
+        for (family, ident), theme in sched.OBJECTION_THEMES.items():
+            if ident == sched.DEFAULT_THEMES[family]:
+                continue
+            for text in (theme.label, theme.brief, theme.worry, *theme.variants):
+                self.assertIsNone(re.search(r"[0-9$]", text), (ident, text))
+                self.assertIsNone(forbidden.search(text), (ident, text))
+                self.assertIsNone(sched.COURSE_LENGTH_FIGURE.search(text), (ident, text))
+
+    def test_new_worries_can_be_answered(self):
+        for family, text in (("F3", "Here is evidence of outcomes."),
+                             ("F3", "Your background is a good fit."),
+                             ("F2", "You can start later or pause.")):
+            self.assertTrue(sched.worry_answered(family, text, themed=True))
+
+        self.assertFalse(sched.worry_answered("F3", "Your background is a good fit."))
+
+    def test_anchor_reason_preserves_anchor_and_counter(self):
+        plain = OwedMoveScheduler("father")
+        themed = OwedMoveScheduler("father", themes={"F1": "cannot_afford"})
+        for variant in themed._state(sched.F1_ANCHOR).variants:
+            self.assertTrue(sched.markers_match(plain._state(sched.F1_ANCHOR).markers, variant))
+        self.assertEqual(plain._state(sched.F1_COUNTER), themed._state(sched.F1_COUNTER))
+
+    def test_theme_states_and_defaults(self):
+        plain = OwedMoveScheduler("father")
+        defaults = OwedMoveScheduler("father", themes=sched.DEFAULT_THEMES)
+        self.assertEqual(plain._states, defaults._states)
+        self.assertEqual(plain.summary(), defaults.summary())
+        themed = OwedMoveScheduler("father", themes={"F3": "pays_off"})
+        theme = sched.OBJECTION_THEMES[("F3", "pays_off")]
+        self.assertEqual(themed.theme_for(F3_PRIMARY), theme)
+        self.assertEqual(themed._state(F3_PRIMARY).brief, theme.brief)
+        self.assertEqual(themed._state(F3_PRIMARY).markers, theme.markers)
+        self.assertTrue(themed.spoken_proves(F3_PRIMARY, theme.variants[0]))
+        for variant in theme.variants:
+            self.assertTrue(sched.markers_match(theme.markers, variant))
+        self.assertEqual(plain._state(F3_PUSH), themed._state(F3_PUSH))
+        with self.assertRaises(ValueError):
+            OwedMoveScheduler("father", themes={"F3": "unknown"})
+        with self.assertRaises(ValueError):
+            OwedMoveScheduler("father", themes={"F9": "unknown"})
+
+
 if __name__ == "__main__":
     unittest.main()

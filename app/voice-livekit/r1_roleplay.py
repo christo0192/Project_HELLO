@@ -471,7 +471,7 @@ from r1_text import (
     split_sentences,
     word_count,
 )
-from r1_temperament import plan_families
+from r1_temperament import pick_themes, plan_families
 from r1_tracker import (
     END_INTENT_LEVELS,
     CoverageTracker,
@@ -1285,6 +1285,8 @@ FLAG_COMMIT_UPGRADE = "R1_COMMIT_UPGRADE"
 FLAG_TEMPERAMENT = "R1_TEMPERAMENT"
 # M033 A6: plan objection families from the latched temperament.
 FLAG_TEMPERAMENT_PLAN = "R1_TEMPERAMENT_PLAN"
+# M033 A7: choose objection themes per session.
+FLAG_TEMPERAMENT_THEMES = "R1_TEMPERAMENT_THEMES"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1426,6 +1428,7 @@ _FLAG_READS = {
     FLAG_COMMIT_UPGRADE: lambda: os.getenv("R1_COMMIT_UPGRADE"),
     FLAG_TEMPERAMENT: lambda: os.getenv("R1_TEMPERAMENT"),
     FLAG_TEMPERAMENT_PLAN: lambda: os.getenv("R1_TEMPERAMENT_PLAN"),
+    FLAG_TEMPERAMENT_THEMES: lambda: os.getenv("R1_TEMPERAMENT_THEMES"),
 }
 
 
@@ -1743,9 +1746,13 @@ class RolePlayEngine:
             plan_families(persona.temperament, self.seed)
             if persona.temperament is not None and flag_on(FLAG_TEMPERAMENT_PLAN) else None
         )
+        themes = (
+            dict(pick_themes(persona.temperament, self.seed, families or FAMILIES))
+            if persona.temperament is not None and flag_on(FLAG_TEMPERAMENT_THEMES) else None
+        )
         self.scheduler = OwedMoveScheduler(
             persona.decision_maker, markers_v2=self._markers_v2,
-            evidence_window=self._close_evidence, families=families,
+            evidence_window=self._close_evidence, families=families, themes=themes,
         )
         self.tracker = CoverageTracker(
             persona, seed=self.seed, invented_v2=self._invented_v2,
@@ -2815,7 +2822,9 @@ class RolePlayEngine:
         self._unanswered_worry = (
             worry is not None
             and worry not in signals.topics
-            and not worry_answered(worry, reading)
+            and not worry_answered(
+                worry, reading, themed=self.scheduler.theme_for(F3_PRIMARY) is not None
+            )
         )
         self.tracker.gate.wide_followup = flag_on(FLAG_DIG_FIRST)
         self.tracker.gate.dig_gate_v2 = flag_on(FLAG_DIG_GATE_V2)
@@ -6260,11 +6269,16 @@ class RolePlayEngine:
         text = move.text
         if move.id == F1_ANCHOR:
             anchor = self._anchor_situation()
-            text = self._fallback_order(move.id, anchor.variants)[0]
+            theme = self.scheduler.theme_for(move.id)
+            variants = anchor.variants
+            if theme is not None:
+                variants = tuple(f"{theme.variants[i % len(theme.variants)]} {variant}"
+                                 for i, variant in enumerate(variants))
+            text = self._fallback_order(move.id, variants)[0]
             self._intent_uses[move.id] = self._intent_uses.get(move.id, 0) + 1
             self.negotiation.note_response(self.turn, f"anchor:{anchor.id}")
             self._plan_anchor(anchor.id)
-        elif move.id in (F2_PRIMARY, F4_PRIMARY):
+        elif move.id in (F2_PRIMARY, F4_PRIMARY) and self.scheduler.theme_for(move.id) is None:
             texts = probe_first_texts(move.id)
             if texts is not None:
                 text = self._probe_first_variants(replace(move, forced=False), texts[3])[0]
@@ -6413,13 +6427,14 @@ class RolePlayEngine:
         counter for the number on the table and R1_PRICE_CONFLICT (SWEEP-21) asks about a conflict.
         Markers are unchanged on every path.
         """
-        if self._probe_first:
+        theme = self.scheduler.theme_for(move.id)
+        if self._probe_first and theme is None:
             texts = probe_first_texts(move.id)
             if texts is not None:
                 brief, _worry, _line, variants = texts
                 variants = self._probe_first_variants(move, variants)
                 move = replace(move, brief=brief, must_say=(), text=variants[0], variants=variants)
-        completions = tail_completions(move.id, self.persona.decision_maker)
+        completions = (() if theme else tail_completions(move.id, self.persona.decision_maker))
         if move.id == F1_COUNTER:
             counter_v2 = flag_on(FLAG_COUNTER_V2)
             situation = self.negotiation.counter_situation(
@@ -6489,6 +6504,7 @@ class RolePlayEngine:
             move = replace(move, brief=pick_variant(briefs, self.seed, 0))
         elif (
             move.id == F4_PRIMARY
+            and theme is None
             and self._timing_said_turn is not None
             and flag_on(FLAG_NO_COMMIT_LEDGER)
         ):
@@ -6499,23 +6515,36 @@ class RolePlayEngine:
                 brief=move.brief + F4_PRIMARY_SAID_SUFFIX,
                 variants=F4_PRIMARY_SAID_VARIANTS,
             )
+        if theme is not None and move.id == F1_ANCHOR and (
+            self._probe_first or self.negotiation.best_offer_usd is not None
+            or self.negotiation.unread_low_usd() is not None
+        ):
+            move = replace(
+                move, brief=move.brief + "; the reason it matters: " + theme.brief,
+                variants=tuple(
+                    f"{theme.variants[i % len(theme.variants)]} {variant}"
+                    for i, variant in enumerate(move.variants)
+                ),
+            )
         worry = False
         statements: tuple[str, ...] = ()
         spec = MOVE_SPEC_BY_ID.get(move.id)
-        if spec is not None and spec.worry and flag_on(FLAG_LEARNER_VOICE_V2):
+        if (spec is not None and (spec.worry or (theme and move.id != F1_ANCHOR))
+                and flag_on(FLAG_LEARNER_VOICE_V2)):
             # M032 S2 items 3 and 4: the worry as an objective, raised in light of what the advisor
             # already said about its topic; statement fallbacks first, then the question ones.
             # Review S2R-5: this turn's own words count (F3-PRIMARY fires when its topic is fresh),
             # the label names what was said, and never while she must say a figure he did not.
-            brief = spec.worry
-            statements = spec.worry_variants
-            if self._probe_first and move.id == F2_PRIMARY:
+            brief = theme.worry if theme else spec.worry
+            statements = theme.variants if theme else spec.worry_variants
+            if theme is None and self._probe_first and move.id == F2_PRIMARY:
                 brief = F2_PRIMARY_WORRY_V2  # S2.10: no "a course this long" she was never told
-            if move.id == F3_PRIMARY and flag_on(FLAG_F3_WORDING):
+            if theme is None and move.id == F3_PRIMARY and flag_on(FLAG_F3_WORDING):
                 # D4-F3STOCK1: no brand names or question to copy; react to what he just said.
                 brief = F3_PRIMARY_WORRY_V3
                 statements = F3_PRIMARY_WORRY_VARIANTS_V3
-            label = self._preempted_label(spec.family) if spec.role == "primary" else ""
+            label = (self._preempted_label(spec.family)
+                     if spec.role == "primary" and theme is None else "")
             if label and all(figure in self._advisor_figures for figure in move.must_say):
                 brief += PREEMPTED_SUFFIX.format(label=label)
             move = replace(move, brief=brief)
@@ -7635,6 +7664,8 @@ class RolePlayEngine:
                 entry[f"{key}_transcript_turn"] = None if turn is None else self._turn_map.get(turn)
             needs.append(entry)
         return {
+            **({"objection_themes": dict(self.scheduler.objection_themes)}
+               if self.scheduler.objection_themes is not None else {}),
             **({"families_planned": list(self.scheduler.families_planned)}
                if self.scheduler.families_planned is not None else {}),
             **({"temperament": {

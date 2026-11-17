@@ -29,6 +29,7 @@ class Temperament:
     card_line: str
     timeline_answer: str
     family_minutes: tuple[tuple[str, float], ...] = ()
+    theme_weights: tuple[tuple[str, tuple[tuple[str, float], ...]], ...] = ()
 
     def count_weight(self, count: int) -> float:
         return dict(self.count_weights).get(count, 0.0)
@@ -38,6 +39,8 @@ class Temperament:
 
 
 CARD_LINE_PREFIX = "How you are as a buyer: "
+# Unbanked goal mismatch, payment method, discount and uncategorized objections are excluded;
+# there is no instalment plan, and the counter already covers discounts.
 TEMPERAMENTS: tuple[Temperament, ...] = (
     Temperament(
         "deep_evaluator", "Deep evaluator", 0.40, ((2, 0.35), (3, 0.35), (4, 0.30)),
@@ -49,6 +52,12 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "and will pay off. When your questions are answered well, you can decide on the call.",
         "Once my questions are answered, I can decide quickly.",
         (("F1", 4.9), ("F2", 5.5), ("F3", 8.0)),
+        (
+            ("F3", (("pays_off", 0.279), ("confirm_fit", 0.172))),
+            ("F2", (("schedule", 0.270), ("unavailable_now", 0.168))),
+            ("F1", (("fee_high", 0.214), ("cannot_afford", 0.180))),
+            ("F4", (("wants_time", 0.208), ("family_approval", 0.054))),
+        ),
     ),
     Temperament(
         "price_negotiator", "Price negotiator", 0.21, ((2, 0.5), (3, 0.4), (4, 0.1)),
@@ -60,6 +69,12 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "to pay that works for you; once you see one, you can say yes on the call.",
         "As soon as I know how I would pay for it.",
         (("F1", 2.6), ("F2", 3.3), ("F3", 5.3)),
+        (
+            ("F3", (("pays_off", 0.174), ("alternatives", 0.156))),
+            ("F2", (("schedule", 0.196), ("unavailable_now", 0.135))),
+            ("F1", (("fee_high", 0.300), ("cannot_afford", 0.289))),
+            ("F4", (("wants_time", 0.210), ("no_need", 0.066))),
+        ),
     ),
     Temperament(
         "steady_enquirer", "Steady enquirer", 0.29, ((2, 1.0),),
@@ -71,6 +86,12 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "around your job. Once that is clear, you are open to going ahead.",
         "Once I know how it would fit around my job.",
         (("F1", 2.8), ("F2", 3.8), ("F3", 3.0)),
+        (
+            ("F3", (("alternatives", 0.095), ("confirm_fit", 0.080))),
+            ("F2", (("unavailable_now", 0.193), ("schedule", 0.041))),
+            ("F1", (("cannot_afford", 0.014), ("fee_high", 0.010))),
+            ("F4", (("no_need", 0.099), ("wants_time", 0.087))),
+        ),
     ),
     Temperament(
         "time_blocked", "Time blocked", 0.10, ((2, 0.6), (3, 0.4)),
@@ -81,6 +102,12 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
         "Work is very heavy right now; you like the idea but cannot start anything new soon.",
         "Not soon, honestly; work is too heavy right now.",
         (("F1", 4.8), ("F2", 2.1), ("F3", 3.7)),
+        (
+            ("F3", (("alternatives", 0.111), ("confirm_fit", 0.103))),
+            ("F2", (("unavailable_now", 0.436), ("schedule", 0.378))),
+            ("F1", (("cannot_afford", 0.023), ("fee_high", 0.002))),
+            ("F4", (("wants_time", 0.251), ("no_need", 0.092))),
+        ),
     ),
 )
 TEMPERAMENT_BY_ID = {item.id: item for item in TEMPERAMENTS}
@@ -126,3 +153,20 @@ def plan_families(temperament: Temperament, seed: str) -> tuple[str, ...]:
     minutes = dict(temperament.family_minutes)
     chosen.sort(key=lambda family: (minutes[family], ("F3", "F2", "F1").index(family)))
     return (*chosen, "F4")
+
+
+def pick_themes(
+    temperament: Temperament, seed: str, families: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Pick independently from ranked themes; never change which families are raised."""
+    picks = []
+    for family in families:
+        weights = dict(temperament.theme_weights)[family]
+        digest = hashlib.sha256(f"theme:{temperament.id}:{seed}:{family}".encode()).digest()
+        target = int.from_bytes(digest[:8], "big") / 2**64 * sum(w for _, w in weights)
+        for theme, weight in weights:
+            target -= weight
+            if target < 0:
+                break
+        picks.append((family, theme))
+    return tuple(picks)

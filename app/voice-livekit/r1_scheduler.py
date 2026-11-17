@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import functools
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 from r1_commitment import (
@@ -721,6 +722,123 @@ CURIOSITY_LABELS_V2: dict[str, tuple[str, ...]] = {
 }
 REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
+
+
+@dataclass(frozen=True)
+class ObjectionTheme:
+    """Family, id, label, objectives and fallbacks; defaults use moves, markers prove delivery."""
+
+    family: str
+    id: str
+    label: str
+    brief: str
+    worry: str
+    variants: tuple[str, ...]
+    markers: tuple[tuple[str, ...], ...]
+
+
+DEFAULT_THEMES = {"F3": "alternatives", "F2": "schedule", "F1": "fee_high", "F4": "wants_time"}
+_THEME_MOVES = {"F3": F3_PRIMARY, "F2": F2_PRIMARY, "F1": F1_ANCHOR, "F4": F4_PRIMARY}
+OBJECTION_THEMES: dict[tuple[str, str], ObjectionTheme] = {}
+for _family, _id in DEFAULT_THEMES.items():
+    _spec = SPEC_BY_ID[_THEME_MOVES[_family]]
+    OBJECTION_THEMES[(_family, _id)] = ObjectionTheme(
+        _family, _id, _id, _spec.brief, _spec.worry,
+        (_spec.line, *_spec.variants), _spec.markers,
+    )
+
+del _family, _id, _spec
+
+
+def _theme(
+    family: str, ident: str, label: str, brief: str, worry: str,
+    variants: tuple[str, ...], markers: tuple[tuple[str, ...], ...],
+) -> None:
+    OBJECTION_THEMES[(family, ident)] = ObjectionTheme(
+        family, ident, label, brief, worry, variants, markers,
+    )
+
+
+_theme("F3", "pays_off", "doubts it will pay off",
+       "you are not sure all the money and effort would really pay off for you in the end, and "
+       "you ask how you could tell it would be worth it",
+       "you doubt the money and effort would really pay off for you; what you want to know is "
+       "how you could tell it would be worth it for you",
+       ("I guess my worry is whether it would actually pay off for me in the end.",
+        "How would I know all that effort would really be worth it for me?"),
+       ((r"\b(?:pay(?:s|ing)? off|payoff|worth (?:it|the|all)|be worth|return on|"
+         r"make (?:it|that|the money) back|get (?:my money|it) back|end up (?:better|ahead)|"
+         r"(?:actually|really) (?:help|work out|be useful))\b",),))
+_theme("F3", "confirm_fit", "needs to confirm fit",
+       "before anything else you want to be sure this is really right for someone with your "
+       "background and what you are aiming for, and you ask how you could tell",
+       "you are not sure yet that this is right for someone with your background and aims; "
+       "what you want to know is how you could tell before going further",
+       ("Before anything else, I'd want to be sure this is right for someone with my background.",
+        "How do I know this is really the right thing for someone like me?"),
+       ((r"\b(?:right (?:thing )?for (?:someone|people|me)|suit(?:s|ed|able)?|"
+         r"someone like me|people like me|(?:my|a) background|background like mine|cut out for|"
+         r"(?:good|right) (?:match|fit) for me|where i(?:'m| am) (?:at|coming from))\b",),))
+_theme("F3", "format_pace", "format or pace",
+       "you worry that the way it is taught, and how fast it moves, might not suit how you "
+       "learn best, and you ask how it actually works",
+       "you worry the teaching style or speed might not suit how you learn; what you want to "
+       "know is how it actually works for someone like you",
+       ("I'm a bit worried the way it's taught might not suit how I learn.",
+        "What if it moves too fast for the way I pick things up?"),
+       ((r"\b(?:taught|teach(?:es|ing)?|how i learn|learn best|the way i (?:learn|pick)|"
+         r"pick (?:things|stuff) up|too (?:fast|quick|slow)|(?:the|its|that) pace|"
+         r"mov(?:e|es|ing) (?:fast|quick|too))\b",),))
+_theme("F3", "trust", "trust",
+       "you have been let down before by courses that promised a lot, so you are wary of taking "
+       "what you are told at face value, and you ask what you could actually rely on",
+       "you have been let down by big promises before and you are wary; what you want to know "
+       "is what you could actually rely on",
+       ("I've been let down by courses that promised a lot, so I'm a little wary.",
+        "Honestly, a lot of these programs promise the world, so how do I know what's real?"),
+       ((r"\b(?:let down|burn(?:ed|t)|wary|skeptic\w*|sceptic\w*|promis\w*|face value|"
+         r"what's real|too good to be true|trust\w*|believe|legit\w*|rely on)\b",),))
+_theme("F2", "unavailable_now", "unavailable right now",
+       "right now is a bad moment for you to take on anything new, because a lot is already on "
+       "your plate at the moment, and you are not sure about starting now",
+       "a lot is already on your plate at the moment, so you are not sure now is the moment to "
+       "start anything new; what you want to know is whether starting now even makes sense",
+       ("Honestly, right now is a really bad moment for me to take on anything new.",
+        "I've got a lot on my plate at the moment, so starting something now is hard."),
+       ((r"\b(?:right now|at the moment|currently|these days|this (?:point|stage|period)|"
+         r"(?:start|starting|begin|beginning) (?:something |anything )?now|on my plate|"
+         r"a lot going on)\b",),
+        (r"\b(?:bad (?:moment|time|timing)|take on|anything new|something new|start\w*|"
+         r"begin\w*|plate|going on|hard|tough|swamped|overwhelm\w*|too much)\b",)))
+_theme("F1", "cannot_afford", "can't afford it right now",
+       "money is tight for you right now, so it is about what you can manage at the moment, "
+       "not about whether it is worth it",
+       "money is tight for you at the moment; what matters is what you could actually manage",
+       ("Money's really tight for me right now.",
+        "Honestly, my budget is stretched thin at the moment."),
+       ((r"\b(?:money|budget|afford\w*|finances|savings|cash)\b",),
+        (r"\b(?:tight|stretched|thin|limited|right now|at the moment|these days|can't|cannot)\b",)))
+_theme("F4", "no_need", "no current need",
+       "you are in no hurry: things are okay for you as they are, so you do not feel you need "
+       "this right away",
+       "things are okay for you as they are, so you do not feel any need to act right away",
+       ("Honestly, I'm not in a rush; things are okay for me as they are.",
+        "I don't really feel like I need this right away, to be honest."),
+       ((r"\b(?:no (?:rush|hurry)|not in (?:a|any) (?:rush|hurry)|no urgency|not urgent|"
+         r"(?:need|needing) (?:this|it) (?:right away|right now|yet|now|today)|"
+         r"(?:okay|ok|fine) (?:for me )?as (?:they|it|things) (?:are|is|stand)|"
+         r"as things are|can wait)\b",),))
+_theme("F4", "family_approval", "needs family approval",
+       "a step this big is something your household decides together, not you alone, so you "
+       "cannot say yes on your own today; do not name anyone and do not say you will talk to "
+       "anyone",
+       "a step this big is decided together at home, not by you alone",
+       ("A step this big is something we decide together at home, not just me.",
+        "This isn't really a decision I can make on my own."),
+       ((r"\b(?:together|at home|household|on my own|by myself|alone|not just me|"
+         r"(?:just|only|all) up to me|only me)\b",),
+        (r"\b(?:decid\w*|decision|step|call|say yes|choice)\b",)))
+
 _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
 
 # Simulation diagnosis 1 (U1, U2; flag R1_MARKERS_V2, latched per session by the engine): more
@@ -1509,12 +1627,18 @@ _WORRY_ANSWER: dict[str, tuple[re.Pattern[str], ...]] = {
 }
 
 
-def worry_answered(family: str | None, text: object) -> bool:
+def worry_answered(family: str | None, text: object, *, themed: bool = False) -> bool:
     """The advisor's turn took up the worry of ``family`` (F2 or F3; any other: True)."""
     patterns = _WORRY_ANSWER.get(family or "")
     if patterns is None:
         return True
     lowered = fold(text).lower()
+    if themed and family == "F3" and re.search(
+        r"\b(?:background|suit\w*|fit|goals?|proof|evidence|reviews?|testimonials?|"
+        r"transparen\w*|honest\w*|track record|real (?:learners|students|people)|pace|"
+        r"at your own pace|step by step|hands-on|practice|questions)\b", lowered
+    ):
+        return True
     return any(pattern.search(lowered) for pattern in patterns)
 
 
@@ -2224,6 +2348,7 @@ class OwedMoveScheduler:
     def __init__(
         self, decision_maker: str, *, markers_v2: bool = False, evidence_window: bool = False,
         families: tuple[str, ...] | None = None,
+        themes: Mapping[str, str] | None = None,
     ) -> None:
         """``markers_v2``: R1_MARKERS_V2 (simulation diagnosis 1), the wider delivery markers."""
         if families is not None and (
@@ -2231,6 +2356,9 @@ class OwedMoveScheduler:
             or families[-1] != "F4" or not set(families) <= set(FAMILIES)
         ):
             raise ValueError("invalid family plan")
+        if themes is not None and any(key not in OBJECTION_THEMES for key in themes.items()):
+            raise ValueError("invalid objection theme")
+        self.objection_themes = None if themes is None else dict(themes)
         self.families_planned = families
         deadlines = dict(zip(families or (), (430, 640, 810, 930)[-len(families or ()):]))
         self.decision_maker = decision_maker
@@ -2259,6 +2387,22 @@ class OwedMoveScheduler:
                 if spec.variants
                 else (),
             )
+        for family, ident in (self.objection_themes or {}).items():
+            theme = self.theme_for(_THEME_MOVES[family])
+            if theme is None:
+                continue
+            state = self._states[_THEME_MOVES[family]]
+            if family == "F1":
+                state.brief += "; the reason it matters: " + theme.brief
+                state.variants = tuple(
+                    f"{theme.variants[i % len(theme.variants)]} {variant}"
+                    for i, variant in enumerate(state.variants)
+                )
+            else:
+                state.text = theme.variants[0]
+                state.brief = theme.brief
+                state.markers = theme.markers
+                state.variants = theme.variants
         if families is not None:
             for state in self._states.values():
                 if state.spec.family in FAMILIES and state.spec.family not in families:
@@ -2284,6 +2428,13 @@ class OwedMoveScheduler:
         # M032 SWEEP-20: (move id, issued, forced_when_issued, enabled_sec) before the last
         # redirect.
         self._redirect_undo: tuple[str, int, bool, float | None] | None = None
+
+    def theme_for(self, move_id: str) -> ObjectionTheme | None:
+        """Return the applied non-default theme for this move, if any."""
+        for family, ident in (self.objection_themes or {}).items():
+            if _THEME_MOVES[family] == move_id and ident != DEFAULT_THEMES[family]:
+                return OBJECTION_THEMES[(family, ident)]
+        return None
 
     @property
     def pacing_map(self) -> tuple[tuple[int, tuple[str, ...]], ...]:

@@ -4330,3 +4330,16 @@ class TestSelfDeflectionAfterNoQuestion(unittest.TestCase):
             interviewer_fallback="What draws you to this role?",
         )
         self.assertNotIn("hiring team", guard_text(self.REPLY, context).text)
+
+
+class ObjectionThemeGuardTests(unittest.TestCase):
+    def test_theme_variants_are_guard_safe(self):
+        import r1_scheduler as scheduler
+        for (family, ident), theme in scheduler.OBJECTION_THEMES.items():
+            if ident != scheduler.DEFAULT_THEMES[family]:
+                for variant in theme.variants:
+                    self.assertTrue(guard_text(variant, ctx()).clean, (ident, variant))
+        anchor = scheduler.OwedMoveScheduler("father", themes={"F1": "cannot_afford"})
+        for variant in anchor._state(scheduler.F1_ANCHOR).variants:
+            result = guard_text(variant, ctx(allowed_extra=frozenset({7000, 9000})))
+            self.assertTrue(result.clean, variant)

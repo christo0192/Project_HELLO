@@ -853,6 +853,9 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         reply = "Honestly, I can find most of this free on YouTube, so why would I pay for it?"
         rig = Rig()
         await rig.start_roleplay()
+        theme = rig.engine.scheduler.theme_for("F3-PRIMARY")
+        if theme is not None:
+            reply = theme.variants[0]
         await rig.converse(OPENER, advance=20)
         await rig.converse("What do you do these days?", advance=120)
         spoken = await rig.converse(

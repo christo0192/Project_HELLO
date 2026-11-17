@@ -15431,3 +15431,98 @@ class TemperamentPlanEngineTests(unittest.TestCase):
         engine = r1_roleplay.RolePlayEngine(persona, seed="test")
         engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
         self.assertIn(r1_roleplay.REASON_MONEY, engine._stall_skip())
+
+
+class TemperamentThemeEngineTests(unittest.TestCase):
+    def test_pick_and_rollback(self):
+        from r1_temperament import pick_themes
+        from r1_scheduler import FAMILIES
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for plan_flag in ("0", "1"):
+            with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": plan_flag,
+                                              "R1_TEMPERAMENT_THEMES": "1"}):
+                eng = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+                families = eng.scheduler.families_planned or FAMILIES
+                self.assertEqual(eng.scheduler.objection_themes,
+                                 dict(pick_themes(persona.temperament, eng.seed, families)))
+                self.assertEqual(eng.admin_log()["objection_themes"],
+                                 eng.scheduler.objection_themes)
+            with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": plan_flag,
+                                              "R1_TEMPERAMENT_THEMES": "0"}):
+                eng = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+                self.assertIsNone(eng.scheduler.objection_themes)
+                self.assertNotIn("objection_themes", eng.admin_log())
+
+    def test_decider_said_suppresses_themed_f4_last_point(self):
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+        for theme in ("no_need", "family_approval"):
+            engine.scheduler = r1_scheduler.OwedMoveScheduler(
+                persona.decision_maker, themes={"F4": theme})
+            engine._decider_said_turn = 1
+            self.assertFalse(engine._last_point_worth(r1_scheduler.F4_PRIMARY))
+            engine._decider_said_turn = None
+            engine._stall_themes["decider"] = 1
+            self.assertFalse(engine._last_point_worth(r1_scheduler.F4_PRIMARY))
+            engine._stall_themes["decider"] = 0
+
+    def test_disabled_themes_restore_scheduler_and_intents(self):
+        from r1_scheduler import F1_ANCHOR, F2_PRIMARY, F3_PRIMARY, F4_PRIMARY
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for plan_flag in ("0", "1"):
+            for probe in ("0", "1"):
+                for voice in ("0", "1"):
+                    flags = {"R1_TEMPERAMENT": "1", "R1_TEMPERAMENT_PLAN": plan_flag,
+                             "R1_TEMPERAMENT_THEMES": "0", "R1_PROBE_FIRST": probe,
+                             "R1_LEARNER_VOICE_V2": voice}
+                    with mock.patch.dict(os.environ, flags):
+                        engine = r1_roleplay.RolePlayEngine(persona, seed="rollback")
+                        reference = r1_roleplay.RolePlayEngine(persona, seed="rollback")
+                        reference.scheduler = r1_scheduler.OwedMoveScheduler(
+                            persona.decision_maker, markers_v2=engine._markers_v2,
+                            evidence_window=engine._close_evidence,
+                            families=engine.scheduler.families_planned,
+                        )
+                        self.assertEqual(engine.scheduler._states, reference.scheduler._states)
+                        for move_id in (F3_PRIMARY, F2_PRIMARY, F4_PRIMARY, F1_ANCHOR):
+                            intents = []
+                            for current in (engine, reference):
+                                move = current.scheduler._owed(
+                                    current.scheduler._state(move_id), 800.0, False)
+                                plan = current._intent_plan(
+                                    move, [], redirect=False, first_probes=(),
+                                    reveal_topics=(), monologue=None)
+                                intents.append(plan.intent)
+                            self.assertEqual(*intents)
+
+    def test_themed_intents_override_family_wording(self):
+        from r1_scheduler import F1_ANCHOR, F2_PRIMARY, F3_PRIMARY, F4_PRIMARY
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for probe in ("0", "1"):
+            for voice in ("0", "1"):
+                with mock.patch.dict(os.environ, {"R1_PROBE_FIRST": probe,
+                                                  "R1_LEARNER_VOICE_V2": voice}):
+                    eng = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+                    eng.scheduler = r1_scheduler.OwedMoveScheduler(
+                        persona.decision_maker, themes={
+                            "F3": "pays_off",
+                            "F2": "unavailable_now",
+                            "F4": "no_need",
+                            "F1": "cannot_afford",
+                        })
+                    for move_id in (F3_PRIMARY, F2_PRIMARY, F4_PRIMARY, F1_ANCHOR):
+                        state = eng.scheduler._state(move_id)
+                        move = eng.scheduler._owed(state, 800.0, False)
+                        plan = eng._intent_plan(move, [], redirect=False, first_probes=(),
+                                                reveal_topics=(), monologue=None)
+                        theme = eng.scheduler.theme_for(move_id)
+                        self.assertIn(theme.brief if voice == "0" or move_id == F1_ANCHOR
+                                      else theme.worry, plan.intent.brief)
+                        if move_id == F1_ANCHOR:
+                            self.assertTrue(all("$7,000" in x for x in plan.intent.fallbacks))
+                        else:
+                            self.assertTrue(set(plan.intent.fallbacks) <= set(theme.variants))

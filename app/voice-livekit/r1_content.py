@@ -395,7 +395,9 @@ import r1_world
 # 37: M033 A5 (R1_TEMPERAMENT): the four learner temperaments (card line, decision-timing
 #    answer, stall rounds; r1_temperament). No other text changed.
 # 38: M033 A6 (R1_TEMPERAMENT_PLAN): family median minutes set objection plan order.
-CONTENT_REVISION = 38
+# 39: M033 A7 (R1_TEMPERAMENT_THEMES): objection theme bank and each
+# temperament's top two themes per family.
+CONTENT_REVISION = 39
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -825,11 +827,20 @@ def manifest() -> dict[str, Any]:
             **{t.id: {
                 "label": t.label, "weight": t.weight, "count_weights": t.count_weights,
                 "family_weights": t.family_weights, "family_themes": t.family_themes,
-                "family_minutes": t.family_minutes,
+                "family_minutes": t.family_minutes, "theme_weights": t.theme_weights,
                 "f4_theme": t.f4_theme, "enrol_ceiling": t.enrol_ceiling.name,
                 "stall_rounds": t.stall_rounds, "key_criterion": t.key_criterion,
                 "card_line": t.card_line, "timeline_answer": t.timeline_answer,
             } for t in r1_temperament.TEMPERAMENTS},
+        },
+        "objection_themes": {
+            f"{family}.{ident}": (
+                ident if r1_scheduler.DEFAULT_THEMES[family] == ident else {
+                    "family": theme.family, "id": theme.id, "label": theme.label,
+                    "brief": theme.brief, "worry": theme.worry, "variants": theme.variants,
+                    "markers": theme.markers,
+                }
+            ) for (family, ident), theme in r1_scheduler.OBJECTION_THEMES.items()
         },
         "script": {
             "interviewer_name": r1_script.INTERVIEWER_NAME,
