@@ -15124,3 +15124,20 @@ class D5RPostByeTests(unittest.TestCase):
         s = D5PostByeQuietTests.bye_session(D5PostByeQuietTests())
         s.say("Yeah, totally get it.", 790)
         self.assertTrue(s.eng._bye_heard)
+
+
+class InventedOfferV2IntegrationTests(unittest.TestCase):
+    def test_flag_latches_tracker_and_prompt(self):
+        for value in ("0", "1"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"R1_INVENTED_OFFER_V2": value}),
+            ):
+                eng = engine(seed="invented-v2")
+                session = Session(eng)
+                session.say("Unlike a free course on YouTube, you get a mentor every week.", 20.0)
+                expected = value == "0"
+                self.assertEqual(eng.tracker.invented_offer, expected)
+                self.assertEqual(eng.tracker.commitment_evidence(None).pressured, expected)
+                system = eng.judge_messages("hello", "hello")[0]["content"]
+                self.assertEqual("invented_offer is true only when" in system, not expected)

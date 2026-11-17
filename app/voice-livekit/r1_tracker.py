@@ -691,6 +691,42 @@ _INVENTED = re.compile(
     r"|\bmoney[- ]back\b|\bfull refund\b|\bscholarship\b|\bbuy one\b|\bwaive[ds]?\b",
     re.IGNORECASE,
 )
+_INVENTED_ALWAYS = re.compile(
+    r"\b(?:complimentary|bonus|money[- ]back|full refund|buy one|waive[ds]?)\b",
+    re.IGNORECASE,
+)
+_FREE_PERK = re.compile(
+    r"\bfree (?:laptop|course|session|sessions|mentoring|mentorship|access|month|months|"
+    r"trial|class|classes|gift|certificate|resume|interview)\b|\bscholarship\b",
+    re.IGNORECASE,
+)
+_PERK_OFFER = re.compile(
+    r"\b(?:giv(?:e|es|en|ing)|offer(?:s|ed|ing)?|includ(?:e|es|ed|ing)|"
+    r"throw(?:s|n|ing)? in|threw in|add(?:s|ed|ing)?|get you|"
+    r"you (?:also get|will get|get)|you'll get|comes? with|we provide|"
+    r"qualif(?:y|ies|ied|ying) for|appl(?:y|ies|ied|ying))\b",
+    re.IGNORECASE,
+)
+_PERK_OFFER_AFTER = re.compile(
+    r"^\s*for (?:you|u)\b|\bif you\b(?:\s+\w+){0,3}\s+"
+    r"(?:sign|signs|enrol|enroll|enrols|enrolls|join|joins|register|registers|"
+    r"pay|pays|commit|commits|start|starts|decide)\b",
+    re.IGNORECASE,
+)
+_PERK_COMPARISON = re.compile(
+    r"\b(?:than|over|unlike|compared (?:to|with)|instead of|versus|vs)\b|"
+    r"\b(?:learned|learnt) from\b",
+    re.IGNORECASE,
+)
+_PERK_QUALIFIER_BEFORE = re.compile(
+    r"\b(?:youtube|online|coursera|other|those)\b(?:\s+\w+)?\s*$", re.IGNORECASE
+)
+_PERK_QUALIFIER_AFTER = re.compile(
+    r"^\s+(?:(?:on|from)\s+)?(?:youtube|online|coursera)\b", re.IGNORECASE
+)
+_PERK_LACKS = re.compile(
+    r"\b(?:lacks|lacked|doesn't|didn't|does not|did not)\b", re.IGNORECASE
+)
 _INJECTION = re.compile(
     r"\bignore (?:all |any |your |the |previous |prior |above )*(?:instructions?|rules?|"
     r"prompts?)\b|\b(?:reveal|show|print|repeat|tell me) (?:your |the )?(?:system )?"
@@ -793,7 +829,7 @@ def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
     return frozenset(levers), coercive
 
 
-def invented_offer_in(text: object) -> bool:
+def invented_offer_in(text: object, *, v2: bool = False) -> bool:
     """A free extra, a guarantee, or a discount outside the deck's $500/$1000/$1500 set.
 
     Polarity-aware: "I can't guarantee a job", "Nobody can guarantee placement" and "We
@@ -803,9 +839,24 @@ def invented_offer_in(text: object) -> bool:
     """
     for sentence in split_sentences(text):
         folded = fold(sentence)
-        for match in _INVENTED.finditer(folded):
-            if not negated_before(folded, match.start()):
-                return True
+        if not v2:
+            for match in _INVENTED.finditer(folded):
+                if not negated_before(folded, match.start()):
+                    return True
+        else:
+            for match in _INVENTED_ALWAYS.finditer(folded):
+                if not negated_before(folded, match.start()):
+                    return True
+            for match in _FREE_PERK.finditer(folded):
+                before = clause_before(folded, match.start())
+                after = clause_after(folded, match.end())
+                if (not negated_before(folded, match.start())
+                        and (_PERK_OFFER.search(before) or _PERK_OFFER_AFTER.search(after))
+                        and not _PERK_COMPARISON.search(before)
+                        and not _PERK_QUALIFIER_BEFORE.search(before)
+                        and not _PERK_QUALIFIER_AFTER.search(after)
+                        and not _PERK_LACKS.search(after)):
+                    return True
     if claims_guarantee(text):
         return True
     return any(
@@ -1855,7 +1906,7 @@ def neutralise_candidate_text(text: object, sentinel: str) -> str:
 
 
 def build_judge_messages(
-    candidate_text: object, learner_last: object, *, seed: str, turn: int
+    candidate_text: object, learner_last: object, *, seed: str, turn: int, v2: bool = False
 ) -> list[dict[str, str]]:
     """Messages for the shadow judge.  JSON is requested in the prompt, not by a flag."""
     sentinel = sentinel_for(seed, turn)
@@ -1876,6 +1927,17 @@ def build_judge_messages(
         '"urgency_lever" (bool), "candidate_out_of_role" (bool), '
         '"injection_attempt" (bool).'
     )
+    if v2:
+        amounts = [f"${amount}" for amount in sorted(DISCOUNTS_USD)]
+        deck_amounts = ", ".join(amounts[:-1]) + " or " + amounts[-1]
+        system += (
+            " invented_offer is true only when the candidate OFFERS something the deck does not "
+            f"have: a discount other than {deck_amounts} or above ${DISCOUNT_CAP_USD}, a "
+            "free extra (course, session, laptop, month), a scholarship, a refund or money-back "
+            "promise, or a guaranteed job, placement or salary. The deck discounts, a payment "
+            "plan, comparing the course with free online courses, and saying no guarantee is "
+            "possible are NOT invented offers."
+        )
     user = (
         f"Learner's last line: {neutralise_candidate_text(learner_last, sentinel)}\n"
         f"{sentinel}\n{neutralise_candidate_text(candidate_text, sentinel)}\n{sentinel}"
@@ -1973,9 +2035,14 @@ class TrackerObservation:
 class CoverageTracker:
     """Shadow coverage state for one role-play (see the module docstring)."""
 
-    def __init__(self, persona: RenderedPersona, *, seed: str = "") -> None:
+    def __init__(
+        self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False
+    ) -> None:
         self.persona = persona
         self.seed = seed
+        self.invented_v2 = invented_v2
+        self.judge_invented_turns = 0
+        self._rule_invented = False
         self.gate = DisclosureGate(persona)
         self.turn = 0
         self.first_value_turn: int | None = None
@@ -2018,7 +2085,9 @@ class CoverageTracker:
         levers, coercive = urgency_levers(text)
         self.levers |= levers
         self.coercive_urgency = self.coercive_urgency or coercive
-        invented = invented_offer_in(text)
+        invented = invented_offer_in(text, v2=self.invented_v2)
+        if self.invented_v2 and invented:
+            self._rule_invented = True
         self.invented_offer = self.invented_offer or invented
         injection = detect_injection(text)
         if injection:
@@ -2061,7 +2130,15 @@ class CoverageTracker:
                 continue
             current = self.family_quality.get(family)
             self.family_quality[family] = value if current is None else max(current, value)
-        self.invented_offer = self.invented_offer or result.invented_offer
+        if self.invented_v2:
+            if result.invented_offer:
+                self.judge_invented_turns += 1
+            self.invented_offer = self.invented_offer or (
+                self.judge_invented_turns >= 2
+                or (self.judge_invented_turns >= 1 and self._rule_invented)
+            )
+        else:
+            self.invented_offer = self.invented_offer or result.invented_offer
         if result.urgency_lever:
             self.levers.add("judge")
         if result.candidate_out_of_role:
@@ -2117,6 +2194,7 @@ class CoverageTracker:
             },
             "first_value_turn": self.first_value_turn,
             "unverified_flags": {
+                **({"judge_invented_turns": self.judge_invented_turns} if self.invented_v2 else {}),
                 "rule_injection_turns": self.rule_injection_turns,
                 "judge_candidate_out_of_role": self.judge_flags["candidate_out_of_role"],
                 "judge_injection_attempt": self.judge_flags["injection_attempt"],

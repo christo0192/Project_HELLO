@@ -276,6 +276,7 @@
         "R1_OFFER_READER_V2": { "requiredInProduction": false, "secret": false },
         "R1_COUNTER_V2": { "requiredInProduction": false, "secret": false },
         "R1_PRICE_CONFLICT": { "requiredInProduction": false, "secret": false },
+        "R1_INVENTED_OFFER_V2": { "requiredInProduction": false, "secret": false },
         "R1_CLOSING_STATE": { "requiredInProduction": false, "secret": false },
         "R1_EARLY_CLOSE_ASIDE": { "requiredInProduction": false, "secret": false },
         "R1_ABUSE_HANGUP": { "requiredInProduction": false, "secret": false },
