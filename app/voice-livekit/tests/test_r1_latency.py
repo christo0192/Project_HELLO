@@ -1078,5 +1078,16 @@ class TestEndIntentSegments(unittest.TestCase):
         self.assertEqual(stage_a_report(base + extra), stage_a_report(base))
 
 
+class TestWarmSayLinesFlag(unittest.TestCase):
+    def test_default_on_and_false_values(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(r1_latency.warm_say_lines_enabled())
+        for value in ("0", " OFF ", " False ", " No "):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"R1_WARM_SAY_LINES": value}
+            ):
+                self.assertFalse(r1_latency.warm_say_lines_enabled())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -223,6 +223,7 @@
         "R1_DRAIN_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "R1_SHUTDOWN_PROCESS_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "R1_VAD_ENDPOINT_ANCHOR": { "requiredInProduction": false, "secret": false },
+        "R1_WARM_SAY_LINES": { "requiredInProduction": false, "secret": false },
         "R1_ENDPOINT_VAD_MIN_DELAY_SEC": { "requiredInProduction": false, "secret": false },
         "R1_ENDPOINT_MIN_DELAY_SEC": { "requiredInProduction": false, "secret": false },
         "R1_ENDPOINT_MAX_DELAY_SEC": { "requiredInProduction": false, "secret": false },

@@ -134,6 +134,13 @@ def vad_endpoint_anchor_enabled() -> bool:
     )
 
 
+def warm_say_lines_enabled() -> bool:
+    """Warm additional spoken lines and rewarm learned names (default on)."""
+    return (os.getenv("R1_WARM_SAY_LINES") or "1").strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
 def endpoint_max_delay_sec() -> float:
     """The longest the agent waits for a turn to be declared (SDK default 2.5 s streaming)."""
     return _bounded_float(

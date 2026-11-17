@@ -17,6 +17,7 @@ import inspect
 import itertools
 import json
 import os
+import re
 import sys
 import types
 import unittest
@@ -3374,6 +3375,97 @@ class TestProviderRateLimits(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(RATE_LIMITS.snapshot()) - {LANE_R1}, set())  # the phone lane is never here
 
 
+class TestWarmSayLines(unittest.IsolatedAsyncioTestCase):
+    def build(self):
+        source = FakeTime()
+        synth = FakeSynthesizer()
+        cache = LineCache(
+            synth, voice={"model": "bulbul:v3"}, sample_rate=22050,
+            bucket=SynthesisBucket(600, burst=100, clock=source, sleep=source.sleep),
+            counter=RateLimitCounter(), clock=source, jitter=lambda: 0.5,
+        )
+        rig = Rig(line_cache=cache)
+        return rig, cache, synth
+
+    async def test_order_and_flag_off(self):
+        rig, _, _ = self.build()
+        with mock.patch.dict(os.environ, {"R1_WARM_SAY_LINES": "1"}):
+            on = rig.interview._warm_order()
+            free = rig.interview._warm_specs(candidate_free=True)
+            named = rig.interview._warm_specs(candidate_free=False)
+        ids = [spec.line_id for spec in free]
+        index = ids.index("L-WRAP-NEXT") + 1
+        self.assertEqual(ids[index], "L-WRAP-MORE")
+        self.assertEqual(free[index].voice, r1_session.INTERVIEWER)
+        self.assertTrue(free[index].persist)
+        with mock.patch.dict(os.environ, {"R1_WARM_SAY_LINES": "0"}):
+            off = rig.interview._warm_order()
+            free_off = rig.interview._warm_specs(candidate_free=True)
+            named_off = rig.interview._warm_specs(candidate_free=False)
+        self.assertEqual(off, tuple(x for x in on if x != "L-WRAP-MORE"))
+        self.assertEqual([x.line_id for x in free_off],
+                         [x.line_id for x in free if x.line_id != "L-WRAP-MORE"])
+        self.assertEqual([x.line_id for x in named_off], [x.line_id for x in named])
+
+    async def test_literal_say_lines_are_warmed(self):
+        rig, _, _ = self.build()
+        source = (HERE / "r1_session.py").read_text(encoding="utf-8")
+        literals = set(re.findall(r"\bsay\(\s*['\"](L-[A-Z0-9-]+)['\"]", source))
+        with mock.patch.dict(os.environ, {"R1_WARM_SAY_LINES": "1"}):
+            missing = literals - set(rig.interview._warm_order())
+        self.assertEqual(missing, {"L-OPEN", "L-OPEN-HELLO", "L-MUTE"})
+        with mock.patch.dict(os.environ, {"R1_MUTE_ASIDE_V2": "0"}):
+            self.assertIn("L-MUTE", rig.interview._warm_order())
+
+    async def test_name_rewarm_and_off(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), mock.patch.dict(
+                os.environ, {"R1_WARM_SAY_LINES": "1" if enabled else "0"}
+            ):
+                rig, cache, synth = self.build()
+                rig.interview.context["first_name"] = "there"
+                await rig.interview._warm_line_cache(candidate_free=True)
+                await rig.interview._warm_line_cache(candidate_free=False)
+                before = {s.line_id: s.text for s in
+                          rig.interview._warm_specs(candidate_free=False)}
+                synth.texts.clear()
+                with capture_r1_logs() as lines:
+                    rig.interview._learn_spoken_name("my name is Cristo")
+                    await asyncio.gather(*list(rig.interview._background))
+                    rig.interview._learn_spoken_name("my name is Cristo")
+                    await asyncio.gather(*list(rig.interview._background))
+                changed = {s.text for s in rig.interview._warm_specs(candidate_free=False)
+                           if s.text != before[s.line_id]}
+                self.assertTrue(changed)
+                self.assertTrue(all("Cristo" in text for text in changed))
+                self.assertEqual(set(synth.texts), changed if enabled else set())
+                self.assertEqual(len(synth.texts), len(changed) if enabled else 0)
+                if enabled:
+                    text = rig.interview.render_line("L-CLOSE-SHORT")
+                    self.assertIsNotNone(cache.lookup(text, r1_session.INTERVIEWER))
+                events = [line for line in lines
+                          if line.get("error_type") == "r1_line_cache_rewarm"]
+                self.assertEqual(len(events), int(enabled))
+                self.assertNotIn("Cristo", str(lines))
+
+    async def test_miss_diagnostics(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), mock.patch.dict(
+                os.environ, {"R1_WARM_SAY_LINES": "1" if enabled else "0"}
+            ):
+                rig, _, _ = self.build()
+                with capture_r1_logs() as lines:
+                    for line_id in ("L-WRAP", "L-OPEN"):
+                        await rig.interview.say(line_id)
+                misses = [line for line in lines
+                          if line.get("error_type") == "r1_line_cache_miss"]
+                expected = [("pending", "L-WRAP"), ("not_warmed", "L-OPEN")]
+                self.assertEqual([(x["error_category"], x["schema"]) for x in misses],
+                                 expected if enabled else [])
+                for line_id in ("L-WRAP", "L-OPEN"):
+                    self.assertNotIn(rig.interview.render_line(line_id), str(misses))
+
+
 class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
@@ -3540,8 +3632,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # christy-ready the pause prompt (a ``say`` line, R1_START_ASK_ONCE); simulation
         # diagnosis 3 eleven new lines; simulation diagnosis 4 four more (the exit-and-wrap-up
         # lines); diagnosis 5 the second
-        # wrap-up offer (L-ASIDE-WRAP-AGAIN, R1_WRAP_OFFER_VARIANT).
-        self.assertEqual(len(specs), 55)
+        # wrap-up offer (L-ASIDE-WRAP-AGAIN, R1_WRAP_OFFER_VARIANT); M033 T4 L-WRAP-MORE
+        # (R1_WARM_SAY_LINES).
+        self.assertEqual(len(specs), 56)
         warmed = {spec.text for spec in specs}
         for line_id in unreachable:
             if line_id not in ("L-OPEN", "L-OPEN-HELLO"):
@@ -3570,8 +3663,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             pickup = next(spec for spec in off if spec.line_id == "L-PICKUP")
             self.assertTrue(pickup.text.startswith("Hello? Yes, this is "))
         # Revision 21's 22, M032 S7C's 7 (their flags are on), M032 S3's 5, simulation diagnosis
-        # 3's 11 and simulation diagnosis 4's 4 exit-and-wrap-up lines (the learner lane).
-        self.assertEqual(len(off), 49)
+        # 3's 11 and simulation diagnosis 4's 4 exit-and-wrap-up lines (the learner lane), plus
+        # M033 T4's L-WRAP-MORE (R1_WARM_SAY_LINES).
+        self.assertEqual(len(off), 50)
         self.assertFalse(
             {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
             & {spec.line_id for spec in off}
@@ -3611,13 +3705,13 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 candidate_free=False
             )
         # M032 S6 adds four lines, M032 S7C seven, M032 S3 five, christy-ready the pause prompt,
-        # simulation diagnosis 3 eleven, simulation diagnosis 4 four.
-        self.assertEqual(len(off), 54)
+        # simulation diagnosis 3 eleven, simulation diagnosis 4 four, M033 T4 L-WRAP-MORE.
+        self.assertEqual(len(off), 55)
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1", R1_WRAP_OFFER_VARIANT="0"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 55)
+        self.assertEqual(len(free) + len(named), 56)
         # M032 S7C: after the opening's four lines, the first name-free line of the transition.
         bridged = free[4]
         self.assertEqual(bridged.line_id, "L-TRANSITION-BRIDGED")
@@ -3647,8 +3741,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         with _env(**off):
             before = ids()
         # Revision 22's 26, M032 S3's 5, simulation diagnosis 3's 11 and simulation diagnosis 4's
-        # 4 (the learner lane).
-        self.assertEqual(len(before), 46)
+        # 4 (the learner lane), plus M033 T4's L-WRAP-MORE (R1_WARM_SAY_LINES).
+        self.assertEqual(len(before), 47)
         self.assertIn("L-MUTE", before)
         for name in ("L-OPEN-AGENDA", "L-SIL-NOAUDIO", "L-MUTE-IV", "L-MUTE-RP"):
             self.assertNotIn(name, before)

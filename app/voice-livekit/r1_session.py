@@ -279,6 +279,7 @@ from r1_latency import (
     interrupt_min_words,
     r1_turn_handling,
     vad_endpoint_anchor_enabled,
+    warm_say_lines_enabled,
 )
 from r1_linecache import (
     LANE_R1,
@@ -776,7 +777,8 @@ _LIVE_PHASES = frozenset(
 # (L-FILLER*, L-TIME-CUE, the guard's L-NO-FEEDBACK swap, L-TRANSITION-ASK after Christy's answers
 # before the role-play) and L-FAQ-DEFER (no runtime caller).
 # Warming them would spend Sarvam requests, a budget shared with the phone lane, on audio nothing
-# can play (pr4c-rebase.md 4.1).
+# can play (pr4c-rebase.md 4.1). L-WRAP-MORE is a reply-stream tail but is also said by the
+# wrap-up loop, so _warm_order adds it while R1_WARM_SAY_LINES is on.
 _WARM_ORDER = (
     # M032 S7C (SWEEP-35): the agendas and the hello again come first: they play a few seconds into
     # the interview.  The hello itself carries the name and is spoken at once, like L-OPEN.
@@ -3873,6 +3875,7 @@ class R1Interview:
         # The first name the candidate gave in their own introduction, kept only while the record
         # has no usable name (``_first_name``).  Never logged.
         self._spoken_name = ""
+        self._name_rewarmed = False
         self._history: list[dict[str, Any]] = []
         self._latest_candidate_index: int | None = None
         self._user_turn_started: float | None = None
@@ -4091,10 +4094,12 @@ class R1Interview:
         self._spoken_name = name
         if self._engine is not None:
             self._engine.candidate_first_name = name
-        # A label only, never the name.  The lines that carry the name were warmed for the
-        # name-less text, so the first time one is spoken it is a cache miss and is synthesised
-        # live (one TTS round trip); warming the new text again would spend Sarvam requests,
-        # a budget shared with the phone lane, for a path that is rare (the record has a name).
+        # Labels only, never the name. With the flag on, rewarm the changed name lines once:
+        # at most six requests from the shared Sarvam budget. Off, misses are synthesised live.
+        if warm_say_lines_enabled() and self._line_cache is not None and not self._name_rewarmed:
+            self._name_rewarmed = True
+            self._spawn(self._warm_line_cache(candidate_free=False))
+            _log.info("unknown_event", error_type="r1_line_cache_rewarm")
         _log.info("unknown_event", error_type="r1_spoken_name_adopted")
 
     def render_line(self, line_id: str) -> str:
@@ -5038,6 +5043,15 @@ class R1Interview:
             error_category="live" if clip is None else "cached",
             schema=marker,
         )
+        if clip is None and warm_say_lines_enabled():
+            try:
+                label = "pending" if marker in self._warm_order() else "not_warmed"
+            except Exception:  # noqa: BLE001 - diagnostics must never interrupt speech
+                label = "not_warmed"
+            _log.info(
+                "unknown_event", error_type="r1_line_cache_miss",
+                error_category=label, schema=marker,
+            )
         # ``frames()`` hands the audio over at a bounded rate (1 s at once, then at most four
         # times real time).  Handed over in one step, the SDK's per-frame work on the 36 s
         # L-TRANSITION blocked the loop for ~0.65 s before its first audio, and the recorder gave
@@ -5070,7 +5084,8 @@ class R1Interview:
         without M032 S6's lines while the transition repair is off, nor S7C's while theirs are,
         nor L-TRANSITION-ASK-PAUSE while ``R1_START_ASK_ONCE`` is.  D3-ICE1: L-TRANSITION is the
         session's thanked brief while ``R1_REACTION_VARIETY`` picks one (``_seeded_thanks_id``),
-        with the neutral A beside a seeded B (D3-ICE1-THANKS-CONTEXT: B needs a real answer)."""
+        with the neutral A beside a seeded B (D3-ICE1-THANKS-CONTEXT: B needs a real answer);
+        add L-WRAP-MORE while R1_WARM_SAY_LINES is on."""
         first = self._seeded_thanks_id()
         firsts = (first, _THANKS_NEUTRAL) if first == _THANKS_AFTER_ANSWER else (first,)
         order = tuple(
@@ -5103,6 +5118,9 @@ class R1Interview:
             dropped.add("L-ASIDE-WRAP-AGAIN")  # D5-ASIDE-WRAP2: only a later offer speaks it
         if dropped:
             order = tuple(line_id for line_id in order if line_id not in dropped)
+        if warm_say_lines_enabled() and "L-WRAP-MORE" not in order:
+            index = order.index("L-WRAP-NEXT") + 1 if "L-WRAP-NEXT" in order else len(order)
+            order = (*order[:index], "L-WRAP-MORE", *order[index:])
         if not transition_bridge_enabled():
             return order
         index = order.index(first) + 1
