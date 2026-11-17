@@ -995,10 +995,12 @@ def commitment_metrics(
         window = range(max(0, commit_exchange - 2), commit_exchange + 1)
         earned = any(advisor_asked_next_step(_advisor(exchanges[i])) for i in window)
     premature = 0
+    opening = (admin.get("close_window") or {}).get("open_r")
+    threshold = opening if type(opening) is int else COMMIT_PERMITTED_R_SEC
     for ex in exchanges:
         plan = _learner(ex).get("plan") or {}
         if plan.get("commitment_level") in ("MEDIUM", "STRONG") and _spoke_commitment(ex):
-            if _learner_r(ex) < COMMIT_PERMITTED_R_SEC:
+            if _learner_r(ex) < threshold:
                 premature += 1
     return {
         "commitment_level": level,

@@ -2254,6 +2254,15 @@ class LearnerClockTests(unittest.TestCase):
         self.assertEqual(metrics.commitment_metrics([self._exchange(775.0, None)], admin)["premature_commit_count"], 1)
         self.assertEqual(metrics.commitment_metrics([self._exchange(700.0, 760.0)], admin)["premature_commit_count"], 1)
 
+    def test_evidence_window_changes_premature_count(self) -> None:
+        from rehearsal import metrics
+
+        admin = {"commitment": {"level": "MEDIUM"}, "close_window": {"open_r": 680}}
+        self.assertEqual(metrics.commitment_metrics(
+            [self._exchange(700, 700)], admin)["premature_commit_count"], 0)
+        self.assertEqual(metrics.commitment_metrics(
+            [self._exchange(670, 670)], admin)["premature_commit_count"], 1)
+
     def test_off_times_the_line_by_the_advisor_turn(self) -> None:
         from rehearsal import metrics
         from rehearsal.flags import LEARNER_CLOCK

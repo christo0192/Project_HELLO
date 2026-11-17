@@ -52,6 +52,7 @@ if str(HERE) not in sys.path:
 import r1_guard
 from r1_phases import R1Phase
 from r1_replies import (
+    CLOSE_WINDOW_FACT_KEYS,
     EXTRA_FACT_KEYS,
     GUARD_KINDS,
     READER_FACT_KEYS,
@@ -479,11 +480,17 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         payload = facts[0]["payload"]
         # The worker-only counts (M032 SWEEP-1) are stored with the row and never parsed, and so
         # are the repairs' labels and counts (M032 S6), under names the parser never reads.
-        worker_only = set(SESSION_FACT_WORKER_KEYS) | set(EXTRA_FACT_KEYS)
+        worker_only = (
+            set(SESSION_FACT_WORKER_KEYS) | set(EXTRA_FACT_KEYS) | set(CLOSE_WINDOW_FACT_KEYS)
+        )
         self.assertEqual(set(payload) - {"pins"} - worker_only, API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_WORKER_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
         self.assertEqual(set(EXTRA_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
+        self.assertEqual(set(CLOSE_WINDOW_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
+        if API_ADMIN_LOG.is_file():
+            for key in CLOSE_WINDOW_FACT_KEYS:
+                self.assertNotIn(key, API_ADMIN_LOG.read_text(encoding="utf-8"))
         for key in SESSION_FACT_KEYS:
             value = payload[key]
             self.assertTrue(
@@ -501,6 +508,17 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(payload["first_audio_p95_ms"], 0)
         self.assertEqual(facts[0]["turn_index"], None)
         self.assertEqual(facts[0]["family_id"], None)
+
+    def test_close_window_worker_facts_are_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)
+        admin = {"close_window": {"open_r": 680, "reason": "evidence"}}
+        row = session_facts_event(admin, {}, roleplay_seconds=700)
+        payload = row["payload"]
+        self.assertEqual(set(payload) - set(plain["payload"]), set(CLOSE_WINDOW_FACT_KEYS))
+        self.assertEqual(payload["close_window_open_r"], 680)
+        self.assertEqual(payload["close_window_reason"], "evidence")
+        self.assertEqual({k: v for k, v in payload.items() if k not in CLOSE_WINDOW_FACT_KEYS},
+                         plain["payload"])
 
     def test_the_turn_readers_record_rides_along_unread_by_the_api(self):
         # M032 S4: the shadow record is worker-only.  It sits in the same row, the parser reads
@@ -554,7 +572,8 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         (facts,) = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
         # The learner lane's worker-only counts (M032 SWEEP-1) ride along whatever these flags say.
         self.assertEqual(
-            set(facts["payload"]) - {"pins"} - set(SESSION_FACT_WORKER_KEYS),
+            set(facts["payload"]) - {"pins"} - set(SESSION_FACT_WORKER_KEYS)
+            - set(CLOSE_WINDOW_FACT_KEYS),
             API_PAYLOAD_KEYS["session_facts"],
         )
 

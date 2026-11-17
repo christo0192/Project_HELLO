@@ -106,6 +106,10 @@ SESSION_FACT_KEYS = (
 # the same row for the owner's comparison.  Worker-only: the API stores it with the payload and its
 # parser reads none of it, so no gate or score can depend on it.  Labels and counts only.
 READER_FACT_KEYS = ("reader_shadow", "reader_agreement")
+# M033 A3 (R1_CLOSE_WINDOW_EVIDENCE): when and why the close window opened (int seconds and
+# "clock" / "evidence"), only when the engine logs it.  Worker-only: the API parser reads
+# neither, so no gate or score depends on them.
+CLOSE_WINDOW_FACT_KEYS = ("close_window_open_r", "close_window_reason")
 # Worker-only ``session_facts`` keys (M032 S1 and SWEEP-1): the API stores them with the row and
 # does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
 # learner's timing holds as counts only (no text), so the owner's next test shows how often each
@@ -617,6 +621,11 @@ def session_facts_event(
         "interruption_count": None,
         "first_audio_p95_ms": _measured(first_audio_p95_ms),
     }
+    close = (admin or {}).get("close_window")
+    close_facts = (
+        {"close_window_open_r": close.get("open_r"), "close_window_reason": close.get("reason")}
+        if isinstance(close, Mapping) else {}
+    )
     shadow = {key: reader[key] for key in READER_FACT_KEYS if key in (reader or {})}
     added = {key: extra[key] for key in EXTRA_FACT_KEYS if key in (extra or {})}
     return {
@@ -632,6 +641,7 @@ def session_facts_event(
             "learner_endings": _learner_endings(admin),
             "learner_followups": _learner_followups(admin),
             "wrapup": _wrapup_counts(wrapup),
+            **close_facts,
             **shadow,
             **added,
         },

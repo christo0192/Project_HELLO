@@ -1550,5 +1550,18 @@ class RefusedCallReaderTests(unittest.TestCase):
             )
 
 
+class CloseEvidenceFloorTests(unittest.TestCase):
+    def test_floor_matches_api_gate(self):
+        from pathlib import Path
+        from r1_commitment import COMMIT_EVIDENCE_FLOOR_R_SEC, commitment_permitted
+
+        self.assertEqual(COMMIT_EVIDENCE_FLOOR_R_SEC, 600)
+        self.assertFalse(commitment_permitted(599, True, evidence=True))
+        self.assertTrue(commitment_permitted(600, True, evidence=True))
+        gate = Path(__file__).resolve().parents[2] / "api/src/lib/r1/gate.ts"
+        if gate.is_file():
+            self.assertIn("MIN_ROLEPLAY_SECONDS: 600", gate.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

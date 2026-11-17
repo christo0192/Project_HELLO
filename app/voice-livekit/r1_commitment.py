@@ -31,6 +31,8 @@ from r1_text import (
 )
 
 COMMIT_PERMITTED_R_SEC = 780
+# Earliest evidence opening; matches the API gate MIN_ROLEPLAY_SECONDS (roleplay_too_short).
+COMMIT_EVIDENCE_FLOOR_R_SEC = 600
 COMMIT_STALL_R_SEC = 1140
 # An advisor whose turns average fewer words than this over at least ``THIN_MIN_TURNS`` turns has
 # not earned a commitment (the terse level of the rehearsal harness averages 5 to 6 words a turn,
@@ -1243,6 +1245,11 @@ def grade(evidence: CommitmentEvidence) -> Level:
     return result
 
 
-def commitment_permitted(r_sec: float, families_complete: bool) -> bool:
-    """A commitment other than the WEAK stall needs R >= 13:00 and all four families done."""
-    return families_complete and r_sec >= COMMIT_PERMITTED_R_SEC
+def commitment_permitted(
+    r_sec: float, families_complete: bool, *, evidence: bool = False
+) -> bool:
+    """Require all families and either the 13:00 clock or evidence from 10:00."""
+    return families_complete and (
+        r_sec >= COMMIT_PERMITTED_R_SEC
+        or (evidence and r_sec >= COMMIT_EVIDENCE_FLOOR_R_SEC)
+    )

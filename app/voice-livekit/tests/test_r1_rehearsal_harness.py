@@ -3145,6 +3145,12 @@ class DiagnosisTwoHarnessTests(unittest.TestCase):
         self.assertEqual(group["commitment_excluded_reasons"], {"ended_before_window": 1})
         self.assertAlmostEqual(group["medium_or_better_rate"], 1.0)
 
+    def test_evidence_window_counts_early_call(self) -> None:
+        record = {"admin_log": {"close_window": {"open_r": 680}}}
+        m = {"commitment_level": None, "roleplay_seconds": 700}
+        self.assertIsNone(scorecard.commitment_exclusion(record, m))
+        self.assertEqual(scorecard.commitment_exclusion({}, m), "ended_before_window")
+
     def test_the_abuse_hang_up_is_read_from_the_admin_log_too(self) -> None:
         group = scorecard.aggregate_group([
             self._call("strong", "MEDIUM"),

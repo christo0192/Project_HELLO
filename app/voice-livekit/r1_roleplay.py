@@ -1274,6 +1274,8 @@ FLAG_POST_BYE_QUIET = "R1_POST_BYE_QUIET"
 FLAG_INVENTED_OFFER_V2 = "R1_INVENTED_OFFER_V2"
 # M033 A2: discount discipline judged on the first offer of each amount.
 FLAG_DISCOUNT_DISCIPLINE_V2 = "R1_DISCOUNT_DISCIPLINE_V2"
+# M033 A3: open on completed families and an answered F4 push from R 10:00.
+FLAG_CLOSE_WINDOW_EVIDENCE = "R1_CLOSE_WINDOW_EVIDENCE"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1411,6 +1413,7 @@ _FLAG_READS = {
     FLAG_POST_BYE_QUIET: lambda: os.getenv("R1_POST_BYE_QUIET"),
     FLAG_INVENTED_OFFER_V2: lambda: os.getenv("R1_INVENTED_OFFER_V2"),
     FLAG_DISCOUNT_DISCIPLINE_V2: lambda: os.getenv("R1_DISCOUNT_DISCIPLINE_V2"),
+    FLAG_CLOSE_WINDOW_EVIDENCE: lambda: os.getenv("R1_CLOSE_WINDOW_EVIDENCE"),
 }
 
 
@@ -1722,7 +1725,11 @@ class RolePlayEngine:
         self._markers_v2 = flag_on(FLAG_MARKERS_V2)
         self._invented_v2 = flag_on(FLAG_INVENTED_OFFER_V2)
         self._discipline_v2 = flag_on(FLAG_DISCOUNT_DISCIPLINE_V2)
-        self.scheduler = OwedMoveScheduler(persona.decision_maker, markers_v2=self._markers_v2)
+        self._close_evidence = flag_on(FLAG_CLOSE_WINDOW_EVIDENCE)
+        self.scheduler = OwedMoveScheduler(
+            persona.decision_maker, markers_v2=self._markers_v2,
+            evidence_window=self._close_evidence,
+        )
         self.tracker = CoverageTracker(
             persona, seed=self.seed, invented_v2=self._invented_v2,
             discipline_v2=self._discipline_v2,
@@ -3019,6 +3026,9 @@ class RolePlayEngine:
                 decision.action == "exit"
                 and r_sec < EARLY_CLOSE_BEFORE_SEC
                 and flag_on(FLAG_EARLY_CLOSE_ASIDE)
+                # M033 A3: a commitment on record before 14:00 (the evidence window) ends the
+                # call on the advisor's goodbye; there is nothing left to ask about.
+                and not (self._close_evidence and self.commitment_resolved)
             ):
                 # M032 S3.3 (D-M032-2): before 14:00 an in-role close never ends the role-play
                 # without the candidate's word: Christy asks (at most twice), and once asked out
@@ -7549,6 +7559,10 @@ class RolePlayEngine:
                 entry[f"{key}_transcript_turn"] = None if turn is None else self._turn_map.get(turn)
             needs.append(entry)
         return {
+            **({"close_window": {
+                "open_r": self.scheduler.close_window_open_r,
+                "reason": self.scheduler.close_window_reason,
+            }} if self._close_evidence else {}),
             "content_version": CONTENT_VERSION,
             "content_sha256": CONTENT_SHA256,
             "world_version": WORLD_VERSION,

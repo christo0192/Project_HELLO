@@ -13856,7 +13856,8 @@ class EarlyCloseByeReviewTests(unittest.TestCase):
     BYE = "Okay, thank you so much for your time, take care, bye."
 
     def early_close(self):
-        s = Session(engine())
+        with mock.patch.dict(os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": "0"}):
+            s = Session(engine())
         s.say(OPENER, 20)
         deliver(s.eng, *ALL_MOVES, r=200)
         s.reply = "Sure, that works for me."
@@ -13883,7 +13884,7 @@ class EarlyCloseByeReviewTests(unittest.TestCase):
         self.assertFalse(s.eng.exit_farewell)
 
     def test_flag_off_is_the_release_before(self):
-        with d3_flags(R1_FAREWELL_EXIT_V2="0"):
+        with d3_flags(R1_FAREWELL_EXIT_V2="0", R1_CLOSE_WINDOW_EVIDENCE="0"):
             s = Session(engine())
             s.say(OPENER, 20)
             deliver(s.eng, *ALL_MOVES, r=200)
@@ -14888,7 +14889,8 @@ class D5PostByeQuietTests(unittest.TestCase):
     """D5-LRN-POSTBYE1 (R1_POST_BYE_QUIET)."""
 
     def bye_session(self):
-        s = done_session()
+        with mock.patch.dict(os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": "0"}):
+            s = done_session()
         # Christy's two early-close asks were answered "carry on" already: a close is held.
         s.eng._wrap_offers.extend(
             {"trigger": r1_roleplay.TRIGGER_EARLY_CLOSE, "answer": "no", "r_sec": 0.0}
@@ -15161,3 +15163,31 @@ class InventedOfferV2IntegrationTests(unittest.TestCase):
                 self.assertEqual(eng.tracker.commitment_evidence(None).pressured, expected)
                 system = eng.judge_messages("hello", "hello")[0]["content"]
                 self.assertEqual("invented_offer is true only when" in system, not expected)
+
+
+class CloseWindowEvidenceIntegrationTests(unittest.TestCase):
+    def test_early_graded_ask_and_goodbye_with_rollback(self):
+        for value in ("0", "1"):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": value}
+            ):
+                script = strong_script() + [HANDLE_DECIDER] * 11
+                session, _ = run_cooperative(25, script=script)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say("Shall I send you the enrolment link?", 700)
+                log = session.eng.admin_log()
+                if value == "1":
+                    self.assertIn("ask_in_window:grade_strong", plan.reasons)
+                    self.assertTrue(session.eng.commitment_resolved)
+                    self.assertEqual(log["close_window"]["reason"], "evidence")
+                    self.assertLessEqual(log["close_window"]["open_r"], 700)
+                    bye = session.say("Goodbye, thank you.", 750)
+                    self.assertEqual(bye.mode, TurnMode.EXIT)
+                    self.assertEqual(session.eng.scheduler.close_attempts, 1)
+                    self.assertIsNone(session.eng.admin_log()["early_close"]["end_request"])
+                    self.assertNotIn("early_close:offer", bye.reasons)
+                else:
+                    self.assertTrue(any(reason in plan.reasons for reason in (
+                        "ask_before_close_window", "ask_yields_to_owed_move")))
+                    self.assertIsNone(plan.commitment_level)
+                    self.assertNotIn("close_window", log)

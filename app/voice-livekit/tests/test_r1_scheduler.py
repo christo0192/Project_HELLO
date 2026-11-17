@@ -2427,5 +2427,84 @@ class MarkersV2Tests(unittest.TestCase):
                     self.assertTrue(wide.spoken_proves(state.spec.id, text))
 
 
+class CloseWindowEvidenceTests(unittest.TestCase):
+    def test_answer_opens_window_and_flag_restores_clock(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                s = OwedMoveScheduler("husband", evidence_window=enabled)
+                for state in s._states.values():
+                    if state.spec.family in sched.FAMILIES and state.spec.required:
+                        state.status = "delivered"
+                        state.delivered_turn = 1
+                s.turn = 1
+                s.observe_candidate_turn("Your husband can join tomorrow.", 680)
+                self.assertEqual(s.commit_permitted(680), enabled)
+                self.assertTrue(s.commit_permitted(780))
+                self.assertEqual("close_window" in s.summary(), enabled)
+                if enabled:
+                    self.assertEqual(s.close_window_open_r, 680)
+                    self.assertEqual(s.close_window_reason, "evidence")
+
+    def test_floor_and_unanswered_push(self):
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        for state in s._states.values():
+            if state.spec.family in sched.FAMILIES and state.spec.required:
+                state.status = "delivered"
+                state.delivered_turn = 1
+        s.turn = 1
+        s.observe_candidate_turn("Okay?", 540)
+        self.assertIsNone(s.f4_answered_turn)
+        self.assertFalse(s.commit_permitted(600))
+        s.observe_candidate_turn("Your husband can join tomorrow.", 599)
+        self.assertFalse(s.commit_permitted(599))
+        self.assertTrue(s.commit_permitted(600))
+
+    def test_answer_readings_and_clock(self):
+        for text in (
+            "What do you think?", "Husband?", "We can make a careful plan together tomorrow."
+        ):
+            with self.subTest(text=text):
+                s = OwedMoveScheduler("husband", evidence_window=True)
+                for state in s._states.values():
+                    if state.spec.family in sched.FAMILIES and state.spec.required:
+                        state.status = "delivered"
+                        state.delivered_turn = 1
+                s.turn = 1
+                s.observe_candidate_turn(text, 680)
+                self.assertIsNotNone(s.f4_answered_turn)
+                self.assertTrue(s.commit_permitted(680))
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        for state in s._states.values():
+            if state.spec.family in sched.FAMILIES and state.spec.required:
+                state.status = "delivered"
+                state.delivered_turn = 1
+        s.turn = 1
+        s.observe_candidate_turn("Anything else?", 680)
+        self.assertIsNone(s.f4_answered_turn)
+        self.assertFalse(s.commit_permitted(779))
+        s.observe_candidate_turn("Okay?", 780)
+        self.assertEqual(s.close_window_reason, "clock")
+        self.assertFalse(s._hard_ready(s._states[COMMIT_STALL], 780))
+
+    def test_call_request_uses_topic_reading_if_it_matches(self):
+        text = "Can we hop on a call?"
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        s._states[F4_PUSH].delivered_turn = 1
+        s.turn = 1
+        s.observe_candidate_turn(text, 680)
+        self.assertFalse(s._turn_answered)
+        self.assertEqual(s.f4_answered_turn is not None, "F4" in topics_in(text))
+
+    def test_forced_stall_still_waits_until_nineteen_minutes(self):
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        state = s._states[COMMIT_STALL]
+        for item in s._states.values():
+            if item.spec.family in sched.FAMILIES and item.spec.required:
+                item.status = "delivered"
+        for r in (680, 780, 1139):
+            self.assertFalse(s._hard_ready(state, r))
+        self.assertTrue(s._hard_ready(state, 1140))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -58,6 +58,7 @@ from r1_commitment import (
     COMMIT_PERMITTED_R_SEC,
     COMMIT_STALL_R_SEC,
     commitment_line,
+    commitment_permitted,
     detect_ask,
     Level,
 )
@@ -2220,9 +2221,15 @@ class _MoveState:
 class OwedMoveScheduler:
     """Per-session schedule of the learner's owed moves (see the module docstring)."""
 
-    def __init__(self, decision_maker: str, *, markers_v2: bool = False) -> None:
+    def __init__(
+        self, decision_maker: str, *, markers_v2: bool = False, evidence_window: bool = False
+    ) -> None:
         """``markers_v2``: R1_MARKERS_V2 (simulation diagnosis 1), the wider delivery markers."""
         self.decision_maker = decision_maker
+        self.evidence_window = evidence_window
+        self.f4_answered_turn: int | None = None
+        self.close_window_open_r: int | None = None
+        self.close_window_reason: str | None = None
         self._states: dict[str, _MoveState] = {}
         for spec in PLAN:
             if spec.id == COMMIT_STALL:
@@ -2298,6 +2305,13 @@ class OwedMoveScheduler:
         for family in topics:
             self._topic_turn[family] = self.turn
         self._turn_answered = answers_substantively(text)
+        push_turn = self._states[F4_PUSH].delivered_turn
+        if (
+            self.f4_answered_turn is None and push_turn is not None and push_turn < self.turn
+            and ("F4" in topics or tail_theme_hit(F4_PUSH, text, self.decision_maker)
+                 or self._turn_answered)
+        ):
+            self.f4_answered_turn = self.turn
         if pitch and self.pitch_turn is None:
             self.pitch_turn = self.turn
         if price and self.price_quoted_turn is None:
@@ -2320,6 +2334,12 @@ class OwedMoveScheduler:
         # other than an owed move (a stall, a reveal, a free reply), so slip is never
         # understated.
         self._refresh_enabled(r_sec)
+        if (
+            self.evidence_window and self.close_window_open_r is None
+            and self.commit_permitted(r_sec)
+        ):
+            self.close_window_open_r = int(r_sec)
+            self.close_window_reason = "evidence" if r_sec < COMMIT_PERMITTED_R_SEC else "clock"
         return TurnSignals(
             turn=self.turn,
             pitch=pitch,
@@ -2406,8 +2426,11 @@ class OwedMoveScheduler:
         return False
 
     def commit_permitted(self, r_sec: float) -> bool:
-        """The close window: all four families done and R >= 13:00."""
-        return self.all_families_complete and r_sec >= COMMIT_PERMITTED_R_SEC
+        """The close window opens on the clock or on completed and answered evidence."""
+        return commitment_permitted(
+            r_sec, self.all_families_complete,
+            evidence=self.evidence_window and self.f4_answered_turn is not None,
+        )
 
     def mark_commitment_resolved(self) -> None:
         """Record that a grade-level commitment line (or the 19:00 stall) was spoken."""
@@ -2902,7 +2925,7 @@ class OwedMoveScheduler:
             if final and not complete:
                 reasons.append(f"family_missing:{family}")
         cue = self._states[TIME_CUE]
-        return {
+        result = {
             "plan_version": PLAN_VERSION,
             "moves": moves,
             "families": families,
@@ -2911,6 +2934,13 @@ class OwedMoveScheduler:
             "excluded_from_auto_status": bool(reasons),
             "exclusion_reasons": reasons,
         }
+        if self.evidence_window:
+            result["close_window"] = {
+                "open_r": self.close_window_open_r,
+                "reason": self.close_window_reason,
+                "f4_answered_turn": self.f4_answered_turn,
+            }
+        return result
 
 
 def _round(value: float | None) -> float | None:

@@ -376,7 +376,9 @@ def commitment_exclusion(record: Mapping[str, Any], m: Mapping[str, Any]) -> str
     if m.get("commitment_level") is not None:
         return None
     seconds = m.get("roleplay_seconds")
-    if isinstance(seconds, (int, float)) and seconds >= COMMIT_PERMITTED_R_SEC:
+    opening = ((record.get("admin_log") or {}).get("close_window") or {}).get("open_r")
+    threshold = opening if type(opening) is int else COMMIT_PERMITTED_R_SEC
+    if isinstance(seconds, (int, float)) and seconds >= threshold:
         return None
     if m.get("stop_reason") == "end_request":
         return "end_request"
