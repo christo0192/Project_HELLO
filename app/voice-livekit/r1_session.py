@@ -7756,20 +7756,20 @@ class R1Interview:
 
     async def _default_spec_runner(self, messages: list[dict[str, str]]) -> AsyncIterator[Any]:
         """Use a lazily built client, never the session LLM or its provider error/abort path."""
-        from livekit.agents import APIConnectOptions
-        from r1_llm import build_r1_llm
+        try:
+            from livekit.agents import APIConnectOptions
+            from r1_llm import build_r1_llm
 
-        if self._spec_llm is None:
-            try:
+            if self._spec_llm is None:
                 self._spec_llm = build_r1_llm()
-            except Exception as exc:
-                self._spec_unusable = True
-                _log.warn(
-                    "unknown_event", error_type="r1_spec_reply_unusable",
-                    error_category=_error_type_of(exc),
-                )
-                raise
-        options = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
+            options = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
+        except Exception as exc:
+            self._spec_unusable = True
+            _log.warn(
+                "unknown_event", error_type="r1_spec_reply_unusable",
+                error_category=_error_type_of(exc),
+            )
+            raise
         async with self._spec_llm.chat(
             chat_ctx=_chat_context_from(messages), conn_options=options
         ) as stream:

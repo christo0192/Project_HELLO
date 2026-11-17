@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 import os
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -208,6 +210,23 @@ class SpecSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(rig.interview._spec_runner_or_none())
         self.assertTrue(any(call.kwargs.get("error_type") == "r1_spec_reply_unusable"
                             for call in warn.call_args_list))
+        await rig.flush()
+
+    async def test_default_client_import_failure_disables_session(self):
+        with patch.dict(os.environ, {"R1_SPECULATIVE_REPLY": "1"}):
+            rig = Rig()
+        rig.session.llm = object()
+        stub = types.ModuleType("livekit.agents")
+        with patch.dict(sys.modules, {"livekit.agents": stub}):
+            with patch("r1_session._log.warn") as warn:
+                with self.assertRaises(ImportError):
+                    async for _ in rig.interview._default_spec_runner([]):
+                        pass
+        self.assertTrue(rig.interview._spec_unusable)
+        self.assertIsNone(rig.interview._spec_runner_or_none())
+        unusable = [call for call in warn.call_args_list
+                    if call.kwargs.get("error_type") == "r1_spec_reply_unusable"]
+        self.assertEqual(len(unusable), 1)
         await rig.flush()
 
     async def test_summary_and_flag_off(self):
