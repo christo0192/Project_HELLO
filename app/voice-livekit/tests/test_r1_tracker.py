@@ -2450,6 +2450,7 @@ class InventedOfferV2Tests(unittest.TestCase):
         verdict = parse_judge_output({"invented_offer": True})
         for v2 in (False, True):
             tracker = CoverageTracker(PERSONA, invented_v2=v2)
+            tracker.observe_candidate_turn("Free YouTube courses lack mentorship.", 1)
             tracker.apply_judge(verdict, 1)
             self.assertEqual(tracker.invented_offer, not v2)
             flags = tracker.admin_view()["unverified_flags"]
@@ -2542,7 +2543,7 @@ class StrongEvidenceReadersTests(unittest.TestCase):
                 self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
         tracker = CoverageTracker(PERSONA)
         tracker.observe_candidate_turn("We can split the fee into two payments.")
-        self.assertTrue(tracker.payment_plan_named)
+        self.assertFalse(tracker.payment_plan_named)
 
     def test_deck_discount_after_value_is_a_money_path(self):
         for amount, expected in ((500, True), (750, False)):
@@ -2602,3 +2603,123 @@ class ProofOneTrackerTests(unittest.TestCase):
             self.assertFalse(parse_discounts(
                 "There is $1500 off. That applies to the upfront plan."
             )[0].conditional)
+
+
+class ReviewEvidenceTests(unittest.TestCase):
+    def test_money_and_outcomes(self):
+        for text in ("You can pay monthly, about $750 a month over twelve months, no interest.",
+                     "You can split the payment into twelve monthly instalments of 750 dollars.",
+                     "We have a payment plan, $750 a month with zero interest."):
+            tracker = CoverageTracker(PERSONA)
+            tracker.observe_candidate_turn(text)
+            self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
+        for text in ("The discount depends on the payment plan you choose.",
+                     "There are a few payment plans, and I can send you the details."):
+            tracker = CoverageTracker(PERSONA)
+            tracker.observe_candidate_turn(text)
+            self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
+        for text in ("Our alumni moved into data analyst roles, 95 percent of them within three months.",
+                     "95 percent of our alumni landed jobs at top tech companies within three months, with salaries over 150k.",
+                     "Every one of our graduates got a job."):
+            tracker = CoverageTracker(PERSONA)
+            tracker.observe_candidate_turn(text)
+            self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance, text)
+        tracker = CoverageTracker(PERSONA)
+        tracker.observe_candidate_turn("Many of our alumni switched into analyst roles after the course.")
+        self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+
+    def test_invented_and_judge(self):
+        for text in ("You will definitely get a job after this.", "You'll surely land a role.",
+                     "You're certain to get hired.", "I promise you'll get a job.",
+                     "We'll refund you, no questions asked.", "You can get a refund.",
+                     "We refund the fee.", "I'll include our interview prep package at no extra cost.",
+                     "Three extra mentor sessions for free.", "I'll throw in coaching free of charge."):
+            self.assertTrue(invented_offer_in(text, v2=True), text)
+        for text in ("I can't promise you'll get a job.",
+                     "Nobody can say you will definitely get a job.", "There's no refund.",
+                     "We don't do refunds.", "I can't offer a refund.",
+                     "You can learn the basics for free on YouTube.",
+                     "Free online courses lack mentorship.", "Unlike the free stuff online.",
+                     "The resources you used for free before."):
+            self.assertFalse(invented_offer_in(text, v2=True), text)
+        verdict = parse_judge_output({"invented_offer": True})
+        tracker = CoverageTracker(PERSONA, invented_v2=True)
+        tracker.observe_candidate_turn("We can discuss a refund.", 1)
+        tracker.apply_judge(verdict, 1)
+        self.assertTrue(tracker.invented_offer)
+        tracker = CoverageTracker(PERSONA, invented_v2=True)
+        for turn in (1, 2):
+            tracker.observe_candidate_turn("Free YouTube courses lack mentorship.", turn)
+            tracker.apply_judge(verdict, turn)
+            self.assertEqual(tracker.invented_offer, turn == 2)
+
+    def test_review_false_positive_offers(self):
+        for text in (
+            "I can definitely get you the details by email tonight.",
+            "I promise I'll get back to you with the schedule.",
+            "I'll definitely get the enrolment link over to you.",
+            "I'll surely get you a call with a mentor.",
+            "I promise you'll enjoy the projects.",
+            "Refunds aren't something we offer, honestly.",
+            "A refund isn't part of what I can offer.",
+            "I'm not aware of any refund.",
+            "I'd have to check on refunds.",
+            "I don't know the refund terms.",
+            "Can you promise you'll get a job?",
+            "I will definitely email you, and you will get a job.",
+        ):
+            self.assertFalse(invented_offer_in(text, v2=True), text)
+        for text in (
+            "You'll get a job for sure.",
+            "You are definitely hired.",
+            "you can get a refund if it doesn't work out",
+            "It's fully refundable.",
+        ):
+            self.assertTrue(invented_offer_in(text, v2=True), text)
+
+    def test_strong_flag_can_be_latched(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"R1_STRONG_EVIDENCE_V2": "0"}):
+            self.assertFalse(CoverageTracker(PERSONA).strong_v2)
+            self.assertTrue(CoverageTracker(PERSONA, strong_v2=True).strong_v2)
+        with patch.dict("os.environ", {"R1_STRONG_EVIDENCE_V2": "1"}):
+            self.assertFalse(CoverageTracker(PERSONA, strong_v2=False).strong_v2)
+
+    def test_review_discount_false_positives(self):
+        for text in (
+            "We also have extra discounts of $500, $1000 and $1500 depending on the payment plan.",
+            "You get mentorship plus projects, and the discounts are $500, $1,000 or $1,500 "
+            "depending on the payment plan you choose.",
+            "So $7,000 is below what we can do, but I can take $1,000 off if you enrol this week.",
+            "You mentioned $7,000, so that's not possible, but I can do $1,000 off "
+            "if you enrol this week.",
+            "I can do $1,000 off if you enrol this week, so you'd pay $8,000.",
+        ):
+            tracker = CoverageTracker(PERSONA, discipline_v2=True)
+            tracker.observe_candidate_turn("Our mentors support you.")
+            tracker.observe_candidate_turn(text)
+            self.assertTrue(tracker.discount_ok, text)
+
+    def test_discount_rules(self):
+        tracker = CoverageTracker(PERSONA, discipline_v2=True)
+        tracker.observe_candidate_turn("Our mentors support you.")
+        tracker.observe_candidate_turn("If you enrol today I can take $1,500 off, and if you pay in full I'll take another $500 off on top, so $7,000.")
+        self.assertFalse(tracker.discount_ok)
+        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).money_path)
+        for text in ("Discounts of $500, $1,000 and $1,500 depending on the payment plan.",
+                     "I can do $1,000 off if you enrol this week."):
+            tracker = CoverageTracker(PERSONA, discipline_v2=True)
+            tracker.observe_candidate_turn("Our mentors support you.")
+            tracker.observe_candidate_turn(text)
+            self.assertTrue(tracker.discount_ok, text)
+        for text, expected in (("I can take $1,500 off right now. We also have a payment plan.", False),
+                               ("I can take $1,500 off. That depends on the payment plan you choose.", True),
+                               ("I can take $1,500 off. Depending on the payment plan you pick.", True)):
+            self.assertEqual(parse_discounts(text, v3=True)[0].conditional, expected, text)
+        tracker = CoverageTracker(PERSONA, discipline_v2=True)
+        tracker.observe_candidate_turn("Our mentors support you.")
+        obs = tracker.observe_candidate_turn("Yes, I can do $1,500 off for you.",
+                                             discount_question_open=True)
+        self.assertTrue(obs.discounts[0].conditional)
+        self.assertTrue(tracker.discount_ok)

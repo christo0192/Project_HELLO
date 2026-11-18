@@ -275,7 +275,8 @@ import r1_world
 # Revision 42: move conditions and the v3 persona card.
 # Revision 43: declined upgrade condition note.
 # Revision 44: render the upgrade condition note as a bullet.
-PINNED_CONTENT_SHA256 = "b1e84ef97cc187f1f01cf40b7899a3d8e1a5d5e373f7058260ebbd305f8270ab"
+# 45: Keep the upgrade commitment in one sentence for scorer masking.
+PINNED_CONTENT_SHA256 = "0bb3cfbc252f33030caf018b91efb375a3159de3340df9e354c6ba04c826b601"
 
 CONTENT_MODULES = (
     "r1_text",

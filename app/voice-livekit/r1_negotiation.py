@@ -4720,19 +4720,26 @@ class Negotiation:
     def _says_decider_first(self, spoken: object) -> bool:
         """The learner said it would talk to or check with its decision maker."""
         text = fold(spoken)
-        if self.timeline_v3 and re.search(
-            r"\b(?:usually|normally|tend to)\b[^.?!]*\b(?:talk|speak|check|discuss|"
-            r"consult|run|ask|tell)\b", text, re.IGNORECASE,
-        ) and not re.search(
-            r"\b(?:first|before|need to|have to|would want to)\b", text, re.IGNORECASE,
-        ):
-            return False
         pattern = re.compile(
             r"\b(?:talk|speak|check|discuss|consult|run (?:it|this|that) by|ask|tell)\b[^.?!]{0,40}"
             r"\b" + re.escape(self.decision_maker.lower()) + r"\b",
             re.IGNORECASE,
         )
-        return pattern.search(fold(spoken)) is not None
+        if not self.timeline_v3:
+            return pattern.search(text) is not None
+        clauses = re.split(r"[.?!]+|,\s*(?:so|and)\b|;\s+|\s+but\s+", text)
+        for clause in clauses:
+            habitual = re.search(
+                r"\b(?:usually|normally|tend to)\b.*\b(?:talk|speak|check|discuss|"
+                r"consult|run|ask|tell)\b", clause,
+            )
+            future = re.search(
+                r"\b(?:first|before|need to|have to|would want to|will|going to|gonna)\b"
+                r"|['?](?:d want to|ll)\b", clause,
+            )
+            if not (habitual and not future) and pattern.search(clause):
+                return True
+        return False
 
     def note_reason_voiced(self, reason: str, turn: int) -> None:
         """The learner raised ``reason`` (a stall reason intent, or the owed F4 moves)."""

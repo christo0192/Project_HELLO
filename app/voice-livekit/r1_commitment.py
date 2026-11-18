@@ -82,8 +82,8 @@ STRONG_PLAN_LINE_V2 = (
 )
 # M033 A4: the scorer mask needs "Send me the enrolment link" to hide this STRONG line.
 UPGRADE_LINE = (
-    "Actually, you know what, I don't want to wait. Send me the "
-    "enrolment link and I'll get started today."
+    "Actually, I don't want to wait, so send me the enrolment link "
+    "and I'll get started today."
 )
 # The MEDIUM line when the advisor proposed a daytime weekday slot and the learner moves it to
 # the evening.  Still one sentence, still ending "so we can decide".

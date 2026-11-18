@@ -1568,6 +1568,8 @@ class CommitUpgradeLineTests(unittest.TestCase):
     def test_upgrade_line_is_scripted_strong_and_masked(self):
         import r1_commitment as c
 
+        self.assertEqual(c.UPGRADE_LINE, "Actually, I don't want to wait, so send me the "
+                         "enrolment link and I'll get started today.")
         self.assertTrue(c.is_commitment_line(c.UPGRADE_LINE, "husband"))
         self.assertEqual(c.mask_for_scorer(c.UPGRADE_LINE, "husband"), c.MASK_PLACEHOLDER)
         self.assertEqual(c.classify_learner_commitment(c.UPGRADE_LINE), c.Level.STRONG)

@@ -2438,11 +2438,13 @@ class CloseWindowEvidenceTests(unittest.TestCase):
                         state.delivered_turn = 1
                 s.turn = 1
                 s.observe_candidate_turn("Your husband can join tomorrow.", 680)
-                self.assertEqual(s.commit_permitted(680), enabled)
+                self.assertFalse(s.commit_permitted(680))
+                s.observe_candidate_turn("That makes sense.", 681)
+                self.assertEqual(s.commit_permitted(681), enabled)
                 self.assertTrue(s.commit_permitted(780))
                 self.assertEqual("close_window" in s.summary(), enabled)
                 if enabled:
-                    self.assertEqual(s.close_window_open_r, 680)
+                    self.assertEqual(s.close_window_open_r, 681)
                     self.assertEqual(s.close_window_reason, "evidence")
 
     def test_floor_and_unanswered_push(self):
@@ -2457,7 +2459,9 @@ class CloseWindowEvidenceTests(unittest.TestCase):
         self.assertFalse(s.commit_permitted(600))
         s.observe_candidate_turn("Your husband can join tomorrow.", 599)
         self.assertFalse(s.commit_permitted(599))
-        self.assertTrue(s.commit_permitted(600))
+        self.assertFalse(s.commit_permitted(600))
+        s.observe_candidate_turn("That makes sense.", 601)
+        self.assertTrue(s.commit_permitted(601))
 
     def test_answer_readings_and_clock(self):
         for text in (
@@ -2472,7 +2476,9 @@ class CloseWindowEvidenceTests(unittest.TestCase):
                 s.turn = 1
                 s.observe_candidate_turn(text, 680)
                 self.assertIsNotNone(s.f4_answered_turn)
-                self.assertTrue(s.commit_permitted(680))
+                self.assertFalse(s.commit_permitted(680))
+                s.observe_candidate_turn("That makes sense.", 681)
+                self.assertTrue(s.commit_permitted(681))
         s = OwedMoveScheduler("husband", evidence_window=True)
         for state in s._states.values():
             if state.spec.family in sched.FAMILIES and state.spec.required:

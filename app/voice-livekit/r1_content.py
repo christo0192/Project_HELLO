@@ -405,7 +405,8 @@ import r1_world
 #    and note, and the v3 card timeline and decider answer.
 # 43: PROOF-1 pins the declined upgrade condition note.
 # 44: render the declined upgrade condition as a bullet.
-CONTENT_REVISION = 44
+# 45: Keep the upgrade commitment in one sentence for scorer masking.
+CONTENT_REVISION = 45
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:

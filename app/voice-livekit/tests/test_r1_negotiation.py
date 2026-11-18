@@ -3608,6 +3608,12 @@ class MoveConditionContractTests(unittest.TestCase):
                 not v3,
             )
             self.assertTrue(memory._says_decider_first("I need to talk to my husband first."))
+            for text in (
+                "I usually talk big decisions over with my husband, so I'd want to "
+                "talk to my husband about this.",
+                "I usually talk things over with my husband, and I'll talk to my husband tonight.",
+            ):
+                self.assertTrue(memory._says_decider_first(text))
 
     def test_paraphrased_conditions_and_stalls(self):
         samples = {

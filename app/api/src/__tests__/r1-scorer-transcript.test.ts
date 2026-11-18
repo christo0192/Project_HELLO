@@ -106,6 +106,9 @@ describe('speaker labels (plan 6.2)', () => {
 
 describe('masking', () => {
   it('masks the three scripted commitment lines at sentence level, keeping surrounding talk', () => {
+    const upgrade = "Actually, I don't want to wait, so send me the enrolment link and I'll get started today.";
+    expect(maskCommitmentLines(upgrade)).toBe(R1_COMMITMENT_MASK);
+    expect(maskCommitmentLines(`Great. ${upgrade}`)).toBe(`Great. ${R1_COMMITMENT_MASK}`);
     expect(maskCommitmentLines('Okay. Let\'s do it. Send me the enrolment link for that plan and I\'ll pay the deposit today.'))
       .toBe(`Okay. Let's do it. ${R1_COMMITMENT_MASK}`);
     expect(maskCommitmentLines('Let\'s book a call on Thursday at 7 PM with my husband so we can decide.'))

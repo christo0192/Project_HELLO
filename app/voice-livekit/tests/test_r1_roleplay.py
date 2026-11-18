@@ -15200,6 +15200,21 @@ class InventedOfferV2IntegrationTests(unittest.TestCase):
 
 
 class CloseWindowEvidenceIntegrationTests(unittest.TestCase):
+    def test_answer_and_ask_same_turn_waits_for_judge(self):
+        for value in ("0", "1"):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": value}
+            ):
+                session, _ = run_cooperative(25, script=strong_script() + [HANDLE_DECIDER] * 11)
+                session.eng.scheduler.f4_answered_turn = None
+                plan = session.eng.plan_turn(
+                    "Your husband can join the call. Shall I send you the enrolment link?", 660
+                )
+                self.assertIsNotNone(session.eng.scheduler.f4_answered_turn)
+                self.assertIn("ask_before_close_window", plan.reasons)
+                self.assertFalse(any(x.startswith("ask_in_window:") for x in plan.reasons))
+                self.assertIsNone(plan.commitment_level)
+
     def test_early_graded_ask_and_goodbye_with_rollback(self):
         for value in ("0", "1"):
             with self.subTest(value=value), mock.patch.dict(
@@ -15319,15 +15334,23 @@ class CommitUpgradeTests(unittest.TestCase):
                 later = s.say(ASK, r + 5)
                 self.assertFalse(any(x.startswith("upgrade_declined:") for x in later.reasons))
 
-    def test_after_cut_upgrade_is_not_revoiced(self):
+    def test_cut_upgrade_is_revoiced_without_spending_attempt(self):
+        from r1_commitment import UPGRADE_LINE
+
         s, r = self.booked()
+        before = len(s.eng._upgrade_attempt_turns)
         plan = s.eng.plan_turn(ASK, r)
-        self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
-        s.eng.record_spoken(plan, "Actually, you know what", r_sec=r, interrupted=True)
-        self.assertEqual(s.eng.commitment_level, Level.MEDIUM)
-        later = s.say(ASK, r + 5)
-        self.assertIn("commitment_on_record", later.reasons)
-        self.assertNotIn("commitment_revoiced", later.reasons)
+        self.assertIn("commitment_upgraded", plan.reasons)
+        s.eng.record_spoken(plan, "Actually, I don't want", r_sec=r, interrupted=True)
+        self.assertEqual(len(s.eng._upgrade_attempt_turns), before)
+        self.assertFalse(s.eng._upgrade_tried)
+        later = s.eng.plan_turn("Okay.", r + 5)
+        self.assertEqual(later.mode, TurnMode.SAY_ONLY)
+        self.assertEqual(later.scripted_text, UPGRADE_LINE)
+        self.assertIn("commitment_revoiced", later.reasons)
+        self.assertIn("commitment_upgraded", later.reasons)
+        s.eng.record_spoken(later, UPGRADE_LINE, r_sec=r + 5)
+        self.assertEqual(s.eng.commitment_level, Level.STRONG)
 
     def test_time_limit_and_strong_first(self):
         s, r = self.booked()
@@ -15724,6 +15747,14 @@ if __name__ == "__main__":
 
 
 class MoveConditionEngineTests(unittest.TestCase):
+    def test_unrepairable_gaps_do_not_offer_condition(self):
+        eng = BuyingSignalEngineTests().make_engine()
+        evidence = eng._evidence(AskKind.ENROL)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value={"discount", "money_path"}):
+            self.assertIsNone(eng._select_move_condition(evidence))
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value={"money_path"}):
+            self.assertEqual(eng._select_move_condition(evidence).id, "money_path")
+
     def test_planning_limit_and_named_log(self):
         eng = BuyingSignalEngineTests().make_engine()
         eng._move_condition = True
@@ -15854,7 +15885,7 @@ class MoveConditionEngineTests(unittest.TestCase):
                     eng.negotiation.note_condition(
                         "money_path", "If I knew how the payment could work for me.", eng.turn)
                 eng._worry_family = "F2"
-                reply = session.say("We have a payment plan with monthly instalments.", 60)
+                reply = session.say("The discount depends on the payment plan you choose.", 60)
                 self.assertEqual(P2.CONDITION_MET_NOTE in (reply.reminder or ""), met)
                 self.assertEqual(P2.NOT_ANSWERED_NOTE in (reply.reminder or ""), not met)
                 eng._worry_family = "F2"
@@ -15869,7 +15900,7 @@ class MoveConditionEngineTests(unittest.TestCase):
         plan = session.say(ASK, r)
         self.assertIn("move_condition:money_path", plan.reasons)
         self.assertTrue(eng.admin_log()["move_conditions"][0]["named"])
-        reply = session.say("We have a payment plan with monthly instalments.", r + 50)
+        reply = session.say("The discount depends on the payment plan you choose.", r + 50)
         self.assertIn(r1_roleplay.CONDITION_MET_NOTE, reply.reminder or "")
         again = session.say("What else are you considering?", r + 100)
         self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, again.reminder or "")
@@ -15879,6 +15910,13 @@ class ProofUpgradeV2Tests(unittest.TestCase):
     BOOK = CommitUpgradeTests.BOOK
     ENROL = CommitUpgradeTests.ENROL
     booked = CommitUpgradeTests.booked
+    def test_unresolved_decider_names_condition(self):
+        s, r = self.booked(handle=False)
+        s.say("I understand your concern.", r)
+        plan = s.say(self.ENROL, r + 5)
+        self.assertIn("upgrade_declined:decider_unresolved", plan.reasons)
+        self.assertIn("if I knew what to tell my husband about it", plan.reminder)
+
     def test_next_turn_does_not_spend_attempt(self):
         s, r = self.booked(handle=False)
         plan = s.say(self.ENROL, r)
@@ -16021,3 +16059,16 @@ class ProofUpgradeV2Tests(unittest.TestCase):
         plan = s.say(self.ENROL, r)
         self.assertFalse(s.eng._upgrade_tried)
         self.assertIn(RESOLVED_NOTE, plan.reminder)
+
+
+class DiscountSignalReviewTests(unittest.TestCase):
+    def test_heard_signal_conditions_next_answer_only_when_enabled(self):
+        for flag in ("1", "0"):
+            with self.subTest(flag=flag):
+                eng = BuyingSignalEngineTests().make_engine(flag=flag)
+                session = Session(eng)
+                plan = session.say("Our mentors support you.", 420)
+                signal = dataclasses.replace(plan, negotiation_id="N-SIG-DISCOUNT")
+                eng.record_spoken(signal, "If I decide soon, can you help with the price?")
+                session.say("Yes, I can do $1,500 off for you.", 450)
+                self.assertEqual(eng.tracker.discount_log[-1]["conditional"], flag == "1")

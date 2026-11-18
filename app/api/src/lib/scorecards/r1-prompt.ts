@@ -81,6 +81,13 @@ export function formatAdministrationLog(log: R1AdministrationLog): string {
   for (const family of R1_FAMILIES) {
     if (planned != null && !planned.includes(family)) {
       lines.push(`- ${family}: not planned for this call (not raised; do not score it)`);
+      if (family === 'F1') {
+        lines.push(
+          '- Negotiation note: F1 was not planned, so the learner never anchored at $7,000 and never ' +
+          'countered. Score Negotiation & discount discipline on how value is defended and on any discount ' +
+          'the advisor offered; a missing anchor or counter is not a gap, and level 4 needs no counter.',
+        );
+      }
       continue;
     }
     const entry = log.families[family];

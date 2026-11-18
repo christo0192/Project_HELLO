@@ -1813,6 +1813,7 @@ class RolePlayEngine:
         self._condition_acknowledged: set[str] = set()
         self._buying_signals = flag_on(FLAG_BUYING_SIGNALS)
         self._buying_signals_log: list[dict[str, Any]] = []
+        self._discount_question_turn: int | None = None
         self._strong_gaps: tuple[str, ...] | None = None
         families = (
             plan_families(persona.temperament, self.seed)
@@ -1829,7 +1830,7 @@ class RolePlayEngine:
         self.tracker = CoverageTracker(
             persona, seed=self.seed, invented_v2=self._invented_v2,
             discipline_v2=self._discipline_v2, perk_history=self._perk_history,
-            discount_read_v3=self._discount_read_v3,
+            discount_read_v3=self._discount_read_v3, strong_v2=self._strong_v2,
         )
         self.tracker.families_planned = families
         self.ledger = GuardLedger()
@@ -2909,7 +2910,12 @@ class RolePlayEngine:
         self.tracker.gate.dig_gate_v3 = flag_on(FLAG_DIG_GATE_V3)
         tangent_on = flag_on(FLAG_TANGENT)
         self.tracker.gate.small_talk = tangent_on
-        obs = self.tracker.observe_candidate_turn(candidate_text, turn)
+        obs = self.tracker.observe_candidate_turn(
+            candidate_text, turn,
+            discount_question_open=(
+                self._buying_signals and self._discount_question_turn == turn - 1
+            ),
+        )
         known = (len(self._advisor_amounts), len(self._answered))
         # D3-LRN-PRICE1 (R1_FOREIGN_PRICE): a price in rupees is a price named, and no dollar
         # reader takes "fifteen thousand rupees" for $15,000.
@@ -3679,7 +3685,8 @@ class RolePlayEngine:
         """
         unheard = self._unheard_commitment
         counts = self._unheard_was_cut
-        if self.commitment_resolved or (
+        upgrade = self._commit_upgrade and "commitment_upgraded" in unheard.reasons
+        if (self.commitment_resolved and not upgrade) or (
             counts and self._commitment_revoices >= COMMITMENT_REVOICE_LIMIT
         ):
             self._unheard_commitment = None
@@ -3696,6 +3703,8 @@ class RolePlayEngine:
         if counts:
             self._commitment_revoices += 1
         reasons.append("commitment_revoiced")
+        if upgrade:
+            reasons.append("commitment_upgraded")
         self._commitment_plan_asks[self.turn] = self._commitment_plan_asks.get(unheard.turn)
         return self._plan(
             TurnMode.SAY_ONLY,
@@ -5806,7 +5815,11 @@ class RolePlayEngine:
                 if (self._upgrade_v2 and not evidence.pressured and not evidence.thin
                         and evidence.enrol_ceiling >= Level.STRONG
                         and (temperament is None or temperament.enrol_ceiling >= Level.STRONG)):
-                    clause = self._select_move_condition(evidence, allow_work=False)
+                    clause = self._select_move_condition(
+                        evidence, allow_work=False,
+                        extra_gaps=frozenset({"decider"}) if blocked == "decider_unresolved"
+                        else frozenset(),
+                    )
                     if clause is not None:
                         text = fill_decision_maker(clause.clause, self.persona.decision_maker)
                         note = UPGRADE_CONDITION_NOTE + " " + text + "."
@@ -5957,11 +5970,16 @@ class RolePlayEngine:
         return replace(plan, intent=intent,
                        reasons=(*plan.reasons, "move_condition:" + clause.id))
 
-    def _select_move_condition(self, evidence: CommitmentEvidence, *, allow_work: bool = True):
+    def _select_move_condition(
+        self, evidence: CommitmentEvidence, *, allow_work: bool = True,
+        extra_gaps: frozenset[str] = frozenset(),
+    ):
         if len(self._condition_planned) >= CONDITION_MAX_PER_CALL:
             return None
         temperament = self.persona.temperament
-        gaps = set(strong_gaps(evidence))
+        gaps = set(strong_gaps(evidence)) | extra_gaps
+        if self._move_condition and gaps.intersection({"discount", "blocked"}):
+            return None
         if self.negotiation.decider_unresolved():
             gaps.add("decider")
         used = {item["id"] for item in self._condition_planned}
@@ -7481,6 +7499,8 @@ class RolePlayEngine:
         tic_v2 = flag_on(FLAG_TIC_V2)
         self._spoken.add(spoken_text)
         if spoken_text.strip():
+            if plan.negotiation_id == N_SIG_DISCOUNT:
+                self._discount_question_turn = plan.turn
             tics = reply_tics(spoken_text, v2=tic_v2)
             self._styles.append((reply_opener(spoken_text), tics))
             self._asked.append("?" in spoken_text)
@@ -7672,7 +7692,14 @@ class RolePlayEngine:
                 if plan.commitment_level is not None:
                     self.negotiation.note_commitment(plan.commitment_level, plan.turn)
                 self._unheard_commitment = None
-            elif interrupted and not self.commitment_resolved:
+            elif interrupted and (not self.commitment_resolved or (
+                self._commit_upgrade and "commitment_upgraded" in plan.reasons
+            )):
+                if self._commit_upgrade and "commitment_upgraded" in plan.reasons:
+                    if plan.turn in self._upgrade_attempt_turns:
+                        self._upgrade_attempt_turns.remove(plan.turn)
+                    if not self._upgrade_v2:
+                        self._upgrade_tried = False
                 # Voice barge-in: the line was cut before the candidate heard it whole, so nothing
                 # is on record; it is said again on the next turn (``_revoice_commitment``), and
                 # that revoice counts toward the limit when some of it was heard.

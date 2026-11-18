@@ -2609,7 +2609,8 @@ class OwedMoveScheduler:
         """The close window opens on the clock or on completed and answered evidence."""
         return commitment_permitted(
             r_sec, self.all_families_complete,
-            evidence=self.evidence_window and self.f4_answered_turn is not None,
+            evidence=(self.evidence_window and self.f4_answered_turn is not None
+                      and self.f4_answered_turn < self.turn),
         )
 
     def mark_commitment_resolved(self) -> None:

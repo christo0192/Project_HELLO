@@ -729,6 +729,30 @@ _PERK_QUALIFIER_AFTER = re.compile(
 _PERK_LACKS = re.compile(
     r"\b(?:lacks|lacked|doesn't|didn't|does not|did not)\b", re.IGNORECASE
 )
+_FREE_CHARGE = re.compile(
+    r"\b(?:for free|free of charge|at no (?:extra |additional )?cost|at no charge)\b", re.I
+)
+_REFUND = re.compile(r"\b(?:refund(?:s|ed|ing|able)?|money[- ]back)\b", re.I)
+_JOB_OUTCOME = (
+    r"(?:(?:get|land|find|secure)\s+(?:(?:a|the|your)\s+)?(?:new\s+)?"
+    r"(?:job|role|position|offer)|(?:get|be|are)\s+(?:hired|placed))"
+)
+_CERTAIN_JOB = re.compile(
+    r"\b(?:promise\s+you(?:'ll| will)\s+" + _JOB_OUTCOME
+    + r"|you(?:'ll| will)\s+(?:definitely|surely|certainly|guaranteed to)\s+"
+    + _JOB_OUTCOME + r"|you(?:'re| are)\s+(?:certain to|guaranteed to)\s+"
+    + _JOB_OUTCOME + r"|you(?:'ll| will)\s+" + _JOB_OUTCOME + r"\s+for sure"
+    + r"|you\s+are\s+(?:definitely|surely|certainly)\s+(?:hired|placed))\b", re.I
+)
+_REFUND_OFFER = re.compile(
+    r"\b(?:we'll|we will|i'll|i will|you can get|you get|we give|we offer|"
+    r"full(?:y)?|money[- ]back|we refund|refundable)\b", re.I
+)
+_REFUND_NEGATION = re.compile(
+    r"\b(?:not|no|never|can't|cannot|won't|don't|isn't|aren't|doesn't|"
+    r"check|checking|unsure|uncertain|unknown)\b", re.I
+)
+
 _INJECTION = re.compile(
     r"\bignore (?:all |any |your |the |previous |prior |above )*(?:instructions?|rules?|"
     r"prompts?)\b|\b(?:reveal|show|print|repeat|tell me) (?:your |the )?(?:system )?"
@@ -829,11 +853,15 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
         if v3 and not conditional and index + 1 < len(sentences):
             following = fold(sentences[index + 1]).lower()
             conditional = bool(
-                re.search(r"\b(?:depending on|based on|payment plan)\b", following)
-                or (re.match(r"\s*(?:that|this|it|which)\b", following) and re.search(
-                    r"\b(?:applies to|is for|is on|comes with|goes with|is tied to|"
-                    r"depends on)\b", following
-                ))
+                re.match(
+                    r"\s*(?:depending on|based on|that|this|it|which|the discount|that amount)\b",
+                    following,
+                )
+                or re.search(
+                    r"\b(?:that|this|it)\s+(?:depends on|applies to|comes with|"
+                    r"is tied to|is for)\b",
+                    following,
+                )
             )
         for value in sorted(set(amounts)):
             mentions.append(DiscountMention(value, conditional, index))
@@ -877,6 +905,30 @@ def invented_offer_in(
                 if not negated_before(folded, match.start()):
                     return True
         else:
+            if not is_question_like(sentence):
+                for match in _CERTAIN_JOB.finditer(folded):
+                    if (not negated_before(folded, match.start())
+                            and not has_refusal(clause_before(folded, match.start()))):
+                        return True
+                for match in _REFUND.finditer(folded):
+                    before = clause_before(folded, match.start())
+                    after = re.split(r"\bif\b", clause_after(folded, match.end()),
+                                     maxsplit=1, flags=re.I)[0]
+                    if (_REFUND_OFFER.search(before + match.group() + after)
+                            and not negated_before(folded, match.start())
+                            and not _REFUND_NEGATION.search(before + after)
+                            and not has_refusal(before + after)):
+                        return True
+            for match in _FREE_CHARGE.finditer(folded):
+                before = clause_before(folded, match.start())
+                after = clause_after(folded, match.end())
+                if (not negated_before(folded, match.start())
+                        and not _PERK_COMPARISON.search(before)
+                        and not _PERK_LACKS.search(after)
+                        and not re.search(r"\b(?:youtube|online|before|earlier)\b", folded, re.I)
+                        and (_PERK_OFFER.search(before) or re.search(
+                            r"\b(?:extra|additional|bonus)\b", before, re.I))):
+                    return True
             for match in _INVENTED_ALWAYS.finditer(folded):
                 if not negated_before(folded, match.start()):
                     return True
@@ -2103,13 +2155,35 @@ OUTCOME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_DECK_PLAN = re.compile(
+    r"\b(?:payment plans?|depending on the plan you (?:choose|pick))\b", re.I
+)
+_PLAN_SPECIFICS = re.compile(
+    r"\b(?:pay(?: it)? monthly|monthly payments?|instal+ments?|"
+    r"split the (?:payment|fee|cost) (?:into|over)|spread the (?:payment|payments|fee|cost)"
+    r"|(?:zero|no|0\s*%)\s*interest|interest[- ]free|"
+    r"(?:\$?\d[\d,]*(?:\s*dollars?)?\s*(?:a|per)\s*month))\b", re.I
+)
+_OUTCOME_SPECIFICS = re.compile(
+    r"\b(?:every|everyone|all of|all our|each one of|without exception|"
+    r"hundreds? of|\d[\d,]*(?:\.\d+)?\s*(?:%|percent|k\b|alumni|graduates|students)|"
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten) out of)\b|"
+    r"\b\d+(?:\.\d+)?\s*%|\$\s*\d", re.I
+)
+_STACK_LINK = re.compile(r"\b(?:another|on top|additional|extra|plus|as well)\b", re.I)
+_NET_RESULT = re.compile(
+    r"\b(?:brings it (?:down )?to|comes (?:down )?to|you(?:'d| would) pay|"
+    r"that makes it|making it|so it's|so it is|so you pay|your price is|for just)\b", re.I
+)
+
+
 class CoverageTracker:
     """Shadow coverage state for one role-play (see the module docstring)."""
 
     def __init__(
         self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False,
         discipline_v2: bool = False, perk_history: bool = True,
-        discount_read_v3: bool = True,
+        discount_read_v3: bool = True, strong_v2: bool | None = None,
     ) -> None:
         self.persona = persona
         self.seed = seed
@@ -2117,6 +2191,13 @@ class CoverageTracker:
         self.discipline_v2 = discipline_v2
         self.perk_history = perk_history
         self.discount_read_v3 = discount_read_v3
+        self.strong_v2 = strong_v2 if strong_v2 is not None else (
+            os.getenv("R1_STRONG_EVIDENCE_V2", "1").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        self._perk_shape_turns: set[int] = set()
+        self._stacked_turns: set[int] = set()
+        self._specific_plan_turns: set[int] = set()
         self.judge_invented_turns = 0
         self._rule_invented = False
         self.gate = DisclosureGate(persona)
@@ -2140,7 +2221,9 @@ class CoverageTracker:
         self._turn_had_question: dict[int, bool] = {}
         self._judged_turns: set[int] = set()
 
-    def observe_candidate_turn(self, text: object, turn: int | None = None) -> TrackerObservation:
+    def observe_candidate_turn(
+        self, text: object, turn: int | None = None, *, discount_question_open: bool = False
+    ) -> TrackerObservation:
         """Run the deterministic fast path on one candidate turn."""
         self.turn = turn if turn is not None else self.turn + 1
         update = self.gate.observe_candidate_turn(text, self.turn)
@@ -2155,20 +2238,59 @@ class CoverageTracker:
                 for amount in dollar_amounts(canonical)
             )
             folded = fold(sentence)
-            matches = list(PAYMENT_PLAN_PATTERN.finditer(folded))
+            if self.strong_v2 and _PLAN_SPECIFICS.search(folded):
+                self._specific_plan_turns.add(self.turn)
+            plan_pattern = _DECK_PLAN if self.strong_v2 else PAYMENT_PLAN_PATTERN
+            matches = list(plan_pattern.finditer(folded))
             if re.search(r"\b(?:payment|discount|fee|price|cost)\b", sentence, re.I):
                 matches += list(PAYMENT_CHOICE_PATTERN.finditer(folded))
-            if any(not negated_before(folded, match.start()) for match in matches):
+            if (not (self.strong_v2 and _PLAN_SPECIFICS.search(folded))
+                    and any(not negated_before(folded, match.start()) for match in matches)):
                 self.payment_plan_named = True
                 if self.payment_plan_turn is None:
                     self.payment_plan_turn = self.turn
             for match in OUTCOME_PATTERN.finditer(folded):
-                if not negated_before(folded, match.start(1)):
+                if (not negated_before(folded, match.start(1))
+                        and not (self.strong_v2 and _OUTCOME_SPECIFICS.search(folded))):
                     self._outcome_seen = True
         self.guarantee_claimed |= claims_guarantee(text)
         self._turn_had_question[self.turn] = update.question
         value_index = _first_value_sentence(text)
         discounts = parse_discounts(text, v3=self.discount_read_v3)
+        if discount_question_open:
+            discounts = [DiscountMention(m.usd, True, m.sentence_index) for m in discounts]
+        if self.discipline_v2:
+            sentences = split_sentences(canonical_amounts(expand_shorthand_amounts(text)))
+            previous_amounts: list[tuple[int, int, int]] = []
+            for index, sentence in enumerate(sentences):
+                offered = {m.usd for m in parse_discounts(sentence, v3=self.discount_read_v3)}
+                figures = [(m.start(), m.end(), int(m.group(1).replace(",", "")))
+                           for m in re.finditer(r"\$\s*(\d[\d,]*)", sentence)]
+                deck_list = {500, 1000, 1500}.issubset({v for _, _, v in figures})
+                deck_list |= bool(_DISC_LIST.search(sentence))
+                if not deck_list:
+                    offered_figures = [item for item in figures if item[2] in offered]
+                    for first, second in zip(offered_figures, offered_figures[1:]):
+                        if (_STACK_LINK.search(sentence[first[1]:second[0]])
+                                and first[2] + second[2] > DISCOUNT_CAP_USD):
+                            self._stacked_turns.add(self.turn)
+                    if previous_amounts and offered_figures:
+                        second = offered_figures[0]
+                        if (_STACK_LINK.search(sentence[:second[0]])
+                                and previous_amounts[-1][2] + second[2] > DISCOUNT_CAP_USD):
+                            self._stacked_turns.add(self.turn)
+                    previous_amounts = offered_figures
+                else:
+                    previous_amounts = []
+                for start, end, value in figures:
+                    before = clause_before(sentence, start)
+                    after = clause_after(sentence, end)
+                    if (value < PRICE_USD - DISCOUNT_CAP_USD and value >= 4500
+                            and (offered or _NET_RESULT.search(before))
+                            and not negated_before(sentence, start)
+                            and not has_refusal(before) and not has_refusal(after)
+                            and not re.search(r"\b(?:below|not possible)\b", after, re.I)):
+                        self._stacked_turns.add(self.turn)
         value_seen_earlier = self.first_value_turn is not None
         for mention in discounts:
             # A sentence that makes the offer cannot be its own value statement.
@@ -2193,6 +2315,13 @@ class CoverageTracker:
             text, v2=self.invented_v2, perk_history=self.perk_history,
             discount_v3=self.discount_read_v3,
         )
+        if self.invented_v2 and not invented and (
+            re.search(r"\bfree\b|\bat no (?:extra |additional )?(?:cost|charge)\b",
+                      fold(text), re.I)
+            and re.search(r"\b(?:youtube|online|before|earlier|used|tried|lacks?|lacked|"
+                          r"unlike|than|other|those|compared)\b", fold(text), re.I)
+        ):
+            self._perk_shape_turns.add(self.turn)
         if self.invented_v2 and invented:
             self._rule_invented = True
         self.invented_offer = self.invented_offer or invented
@@ -2242,6 +2371,7 @@ class CoverageTracker:
                 self.judge_invented_turns += 1
             self.invented_offer = self.invented_offer or (
                 self.judge_invented_turns >= 2
+                or (result.invented_offer and judged_turn not in self._perk_shape_turns)
                 or (self.judge_invented_turns >= 1 and self._rule_invented)
             )
         else:
@@ -2269,6 +2399,8 @@ class CoverageTracker:
         always fails.
         """
         if self.discipline_v2:
+            if self._stacked_turns:
+                return False
             seen = set()
             for item in self.discount_log:
                 amount = item["usd"]
@@ -2301,6 +2433,7 @@ class CoverageTracker:
             fee_named=self.fee_named,
             money_path=self.payment_plan_named or (
                 bool(self.discount_log) and self.discount_ok and not self.invented_offer
+                and any(item["turn"] not in self._specific_plan_turns for item in self.discount_log)
                 and all(item["usd"] in DISCOUNTS_USD for item in self.discount_log)
             ),
             reassurance=(self._outcome_seen or bool(self.levers & {
