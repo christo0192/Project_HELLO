@@ -24,7 +24,10 @@ import re
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Mapping
 
-from r1_negotiation import COMMIT_REACTION_BRIEF, COUNTERS, N_QUESTION_ENROL_BRIEF, SPECS
+from r1_negotiation import (
+    COMMIT_REACTION_BRIEF, CONDITION_CLAUSES, CONDITION_FAMILY_CLAUSES, COUNTERS,
+    N_QUESTION_ENROL_BRIEF, SPECS, fill_decision_maker,
+)
 from r1_personas import PERSONAS
 from r1_scheduler import PLAN, REDIRECT_BRIEF
 from r1_text import normalize
@@ -310,6 +313,10 @@ class ScriptedLearnerLLM:
             return opener + reaction, ""  # misses the markers: the scripted variant follows
         dm = self._decision_maker(brief)
         line = self._fresh(tuple(text.format(dm=dm) for text in VOICED[bank_id]), spoken_before)
+        for clause in (*CONDITION_CLAUSES.values(), *CONDITION_FAMILY_CLAUSES.values()):
+            if fill_decision_maker(clause.clause, dm) in brief:
+                line += " " + fill_decision_maker(clause.fallbacks[1], dm)
+                break
         return opener + reaction, line
 
     @staticmethod

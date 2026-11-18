@@ -401,7 +401,9 @@ import r1_world
 #    payment plan and outcome readers.
 # 41: M033 A9 (R1_BUYING_SIGNALS): the three buying-signal specs and the
 #    per-temperament signal lists.
-CONTENT_REVISION = 41
+# 42: M033 A10 (R1_MOVE_CONDITION, R1_PERSONA_TIMELINE_V3): the move-condition clauses
+#    and note, and the v3 card timeline and decider answer.
+CONTENT_REVISION = 42
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -650,6 +652,18 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
     """M032 S7L (revision 25): the learner follow-ups' new texts, beside the ones they replace."""
     p = r1_prompts
     return {
+        "condition_clauses": {
+            clause.id: {"clause": clause.clause, "markers": clause.markers,
+                        "fallbacks": clause.fallbacks}
+            for clause in (*r1_negotiation.CONDITION_CLAUSES.values(),
+                           *r1_negotiation.CONDITION_FAMILY_CLAUSES.values())
+        },
+        "condition_met_note": p.CONDITION_MET_NOTE,
+        "timeline_answer_v3": r1_personas.TIMELINE_ANSWER_V3,
+        "decider_answer_v3": r1_personas.DECIDER_ANSWER_V3,
+        "learner_prefix_timeline_v3_sample": p.learner_prefix(
+            sample, offer_realism=True, probe_first=True, price_check=True, timeline_v3=True
+        ),
         # SWEEP-8: the card's timeline wording (latched per session) and a prefix rendered with it.
         "backstory_timeline_v2": dict(r1_personas.BACKSTORY_TIMELINE_V2),
         "success_answer_v2": r1_personas.SUCCESS_ANSWER_V2,

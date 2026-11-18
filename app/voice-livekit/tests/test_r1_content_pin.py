@@ -272,7 +272,8 @@ import r1_world
 # 37: M033 A5 learner temperaments.
 # 40: M033 A8 v2 STRONG lines and evidence readers.
 # Revision 41: buying-signal questions and temperament priorities.
-PINNED_CONTENT_SHA256 = "e8b33038fbe8c1746b2daef2e22fa9ec6a1cd02b3ce9f363fea4f0d11f2afef2"
+# Revision 42: move conditions and the v3 persona card.
+PINNED_CONTENT_SHA256 = "74ae9e42f2a3a04620a998da90b5a4d1ee199c8c7e20576d717301d8dc87a537"
 
 CONTENT_MODULES = (
     "r1_text",

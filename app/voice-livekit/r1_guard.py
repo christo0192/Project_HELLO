@@ -88,6 +88,7 @@ from r1_personas import (
     PERSONAS,
     PUBLIC_ANSWERS,
     SUCCESS_ANSWER_V2,
+    TIMELINE_ANSWER_V3,
     RenderedPersona,
 )
 from r1_scheduler import open_question_topics
@@ -2601,6 +2602,9 @@ def _card_texts(persona: RenderedPersona) -> list[str]:
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)
     answers.append(persona.decider_answer)
+    answers.append(persona.decider_answer_v3)
+    # M033 A10: both card wordings stay allowed for sessions on either release.
+    answers.append(TIMELINE_ANSWER_V3)
     answers.extend(answer for _label, answer in persona.work_answers)
     return answers
 

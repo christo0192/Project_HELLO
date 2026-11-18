@@ -159,6 +159,8 @@ from r1_negotiation import (
     ANCHOR_USD,
     COMMIT_REACTION_BRIEF,
     COMMIT_REACTION_BRIEF_V2,
+    CONDITION_CLAUSES,
+    CONDITION_FAMILY_CLAUSES,
     CONFLICT_RISE,
     CONFLICT_WEBSITE,
     IMPLAUSIBLE_FREE,
@@ -256,6 +258,7 @@ from r1_prompts import (
     CONTINUE_NOTE,
     COOL_NOTE,
     CONCERN_LABELS,
+    CONDITION_MET_NOTE,
     DECIDER_ASKED_NOTE,
     DECIDER_SAID_NOTE,
     EMAIL_AGAIN_NOTE,
@@ -1297,6 +1300,14 @@ FLAG_TEMPERAMENT_THEMES = "R1_TEMPERAMENT_THEMES"
 FLAG_STRONG_EVIDENCE_V2 = "R1_STRONG_EVIDENCE_V2"
 # M033 A9: practical buying questions after a need and related concern are addressed.
 FLAG_BUYING_SIGNALS = "R1_BUYING_SIGNALS"
+# M033 A10: name a concrete condition on an eligible weak stall.
+FLAG_MOVE_CONDITION = "R1_MOVE_CONDITION"
+# M033 A10: allow deciding today in the cached persona card.
+FLAG_PERSONA_TIMELINE_V3 = "R1_PERSONA_TIMELINE_V3"
+
+# M033 A10: at most two different conditions may be planned in a call.
+CONDITION_MAX_PER_CALL = 2
+
 
 # Enrolled leads often asked practical questions late in the call.
 SIGNAL_MAX_PER_CALL = 2
@@ -1447,6 +1458,8 @@ _FLAG_READS = {
     FLAG_TEMPERAMENT_THEMES: lambda: os.getenv("R1_TEMPERAMENT_THEMES"),
     FLAG_STRONG_EVIDENCE_V2: lambda: os.getenv("R1_STRONG_EVIDENCE_V2"),
     FLAG_BUYING_SIGNALS: lambda: os.getenv("R1_BUYING_SIGNALS"),
+    FLAG_MOVE_CONDITION: lambda: os.getenv("R1_MOVE_CONDITION"),
+    FLAG_PERSONA_TIMELINE_V3: lambda: os.getenv("R1_PERSONA_TIMELINE_V3"),
 }
 
 
@@ -1709,6 +1722,7 @@ class TurnPlan:
     probe: str | None = None
     # M032 SWEEP-8: the session's latched card timeline (``learner_prefix(timeline_v2=...)``).
     timeline_v2: bool = False
+    timeline_v3: bool = False
     # M032 S3: a scripted LEARNER line the session says before this aside (S3.4: her one-line
     # hang-up before Christy's question), and whether the learner carries on right after the aside
     # (S3.3's resume and SWEEP-24's last point: the session asks ``continuation_plan``).
@@ -1761,6 +1775,9 @@ class RolePlayEngine:
         self._close_evidence = flag_on(FLAG_CLOSE_WINDOW_EVIDENCE)
         self._commit_upgrade = flag_on(FLAG_COMMIT_UPGRADE)
         self._strong_v2 = flag_on(FLAG_STRONG_EVIDENCE_V2)
+        self._move_condition = flag_on(FLAG_MOVE_CONDITION)
+        self._condition_planned: list[dict[str, Any]] = []
+        self._condition_acknowledged: set[str] = set()
         self._buying_signals = flag_on(FLAG_BUYING_SIGNALS)
         self._buying_signals_log: list[dict[str, Any]] = []
         self._strong_gaps: tuple[str, ...] | None = None
@@ -2034,6 +2051,8 @@ class RolePlayEngine:
         self._price_conflict = flag_on(FLAG_PRICE_CONFLICT)
         # M032 SWEEP-8: the card's timeline wording, latched for the session as well.
         self._timeline_v2 = flag_on(FLAG_PERSONA_TIMELINE_V2)
+        self._timeline_v3 = flag_on(FLAG_PERSONA_TIMELINE_V3)
+        self.negotiation.timeline_v3 = self._timeline_v3
         self._learner_control = control_prose(self.learner_prefix_text())
         # Item 7: the coach aside just played (the next reply carries on, no new greeting).
         self._after_coach = False
@@ -2046,6 +2065,7 @@ class RolePlayEngine:
         # left it untouched.
         self._worry_family: str | None = None
         self._unanswered_worry = False
+        self._condition_met_now = False
         # This turn's reading for the per-turn notes: a lone acknowledgement, a cut, the reading
         # itself (memory only, never logged), an ask.
         self._turn_backchannel = False
@@ -2218,6 +2238,7 @@ class RolePlayEngine:
             probe_first=self._probe_first,
             price_check=self._price_conflict,
             timeline_v2=self._timeline_v2,
+            timeline_v3=self._timeline_v3,
         )
 
     def _price_probe_answer_due(self, turn: int, *, before_anchor: bool = True) -> bool:
@@ -2794,6 +2815,7 @@ class RolePlayEngine:
         self._courtesy_after_signoff = False
         self.scheduler.time_cue_held = False  # D4-TIMECUE1: read again below, every turn
         self._notes = []
+        self._condition_met_now = False
         self._price_notes = []
         self._nothing_granted = False
         self._force_curiosity = False
@@ -5403,7 +5425,10 @@ class RolePlayEngine:
             flag_on(FLAG_DECIDER_SPACING) and asks_decider_wide(self._turn_reading)
         ):
             self._decider_asked_now = True
-            self._notes.append(DECIDER_ASKED_NOTE.format(answer=self.persona.decider_answer))
+            self._notes.append(DECIDER_ASKED_NOTE.format(
+                answer=(self.persona.decider_answer_v3 if self._timeline_v3
+                        else self.persona.decider_answer)
+            ))
         best = self.negotiation.best_offer_usd
         if seen.anchor_mentioned and (best is None or best > ANCHOR_USD):
             self._notes.append(ANCHOR_NOT_OFFERED_NOTE)
@@ -5597,7 +5622,7 @@ class RolePlayEngine:
                 and not self._come_back_topic
                 and not self._tangent_now  # R1_TANGENT: small talk leaves her worry for later
             )
-            if unanswered:
+            if unanswered and not self._condition_met_now:
                 notes.append(NOT_ANSWERED_NOTE)
             # SWEEP-4: steering only, never both, and never on a confirmation (not called then).
             if self._hinges and self._hinges[-1]:
@@ -5829,6 +5854,8 @@ class RolePlayEngine:
                 negotiation.stall_rounds += 1
                 planned = self._reason_plan(reasons, ask=wants, **layers)
                 if planned is not None:
+                    if self._move_condition and not (evidence.pressured or evidence.thin):
+                        planned = self._add_move_condition(planned, evidence)
                     return planned
             # A stall that answers a CALL ask does not ask for an e-mail nobody offered.
             return self._commit_plan(Level.WEAK, reasons, call=wants is AskKind.CALL, ask=wants)
@@ -5855,6 +5882,67 @@ class RolePlayEngine:
             reasons.append("checkin")
             self._force_curiosity = True
         return None
+
+    def _add_move_condition(self, plan: TurnPlan, evidence: CommitmentEvidence) -> TurnPlan:
+        """M033 A10 (R1_MOVE_CONDITION): add at most two different clauses per call.
+
+        Called only for an in-window WEAK stall, never a pressured or thin advisor.
+        """
+        if plan.intent is None or plan.intent.kind != KIND_STALL:
+            return plan
+        if len(self._condition_planned) >= CONDITION_MAX_PER_CALL:
+            return plan
+        temperament = self.persona.temperament
+        gaps = set(strong_gaps(evidence))
+        if self.negotiation.decider_unresolved():
+            gaps.add("decider")
+        used = {item["id"] for item in self._condition_planned}
+        open_families = [
+            f for f in (self.scheduler.families_planned or ("F1", "F2", "F3"))
+            if f in CONDITION_FAMILY_CLAUSES
+            and (self.tracker.family_quality.get(f) or 0) < 1
+            and CONDITION_FAMILY_CLAUSES[f].id not in used
+        ]
+        family = next(iter(open_families), None)
+        candidates = []
+        if temperament and temperament.enrol_ceiling < Level.STRONG:
+            candidates = ["work"]
+        else:
+            criterion = temperament.key_criterion if temperament else ""
+            priority = {"money_path": "money_path", "reassurance_and_fit": "reassurance",
+                        "schedule_or_format_clarity": "families"}.get(criterion)
+            if priority == "families":
+                preferred = next((f for f in open_families if f in ("F2", "F3")), None)
+                if preferred is not None and priority in gaps:
+                    family = preferred
+                    candidates.append(priority)
+                elif "needs" in gaps:
+                    candidates.append("needs")
+            elif priority in gaps:
+                candidates.append(priority)
+            elif criterion in ("reassurance_and_fit", "schedule_or_format_clarity"):
+                if "needs" in gaps:
+                    candidates.append("needs")
+            candidates.extend(k for k in ("money_path", "decider", "reassurance", "needs",
+                                           "families") if k in gaps)
+        for key in candidates:
+            clause = (CONDITION_FAMILY_CLAUSES.get(family) if key == "families"
+                      else CONDITION_CLAUSES.get(key))
+            if clause is None or clause.id in used:
+                continue
+            dm = self.persona.decision_maker
+            text = fill_decision_maker(clause.clause, dm)
+            fallbacks = tuple(
+                original + " " + fill_decision_maker(clause.fallbacks[i % 3], dm)
+                for i, original in enumerate(plan.intent.fallbacks)
+            )
+            intent = replace(plan.intent, brief=plan.intent.brief +
+                             " Then say, in your own words, the one thing that would move you: "
+                             + text + ".", fallback=fallbacks[0], fallbacks=fallbacks)
+            self._condition_planned.append({"id": clause.id, "turn": self.turn})
+            return replace(plan, intent=intent,
+                           reasons=(*plan.reasons, "move_condition:" + clause.id))
+        return plan
 
     def _reasons_owned_by_f4(self) -> frozenset[str]:
         """Stall reasons the owed F4 moves still have to voice (timing, the decision maker).
@@ -6945,6 +7033,37 @@ class RolePlayEngine:
             return pick_variant(CURIOSITY_LABELS_V2[topic], f"{self.seed}:{topic}", offered)
         return labels[topic]
 
+    def _condition_ack_note(self) -> None:
+        """M033 A10 (R1_MOVE_CONDITION): acknowledge each met clause at most once.
+
+        Work has no acknowledgement: no specific later-slot reader exists for it.
+        """
+        if not self._move_condition:
+            return
+        evidence = self._evidence(AskKind.ENROL)
+        for item in self.negotiation.condition_named:
+            clause_id = item["id"]
+            if item["turn"] >= self.turn or clause_id in self._condition_acknowledged:
+                continue
+            if clause_id == "money_path":
+                met = evidence.money_path
+            elif clause_id == "reassurance":
+                met = evidence.reassurance
+            elif clause_id == "needs":
+                met = self.tracker.gate.released_count >= 2
+            elif clause_id.startswith("families:"):
+                met = (self.tracker.family_quality.get(clause_id.split(":", 1)[1]) or 0) >= 1
+            elif clause_id == "decider":
+                handled = self.negotiation.decider_handled_turn
+                met = handled is not None and handled > item["turn"]
+            else:
+                met = False
+            if met:
+                self._notes.append(CONDITION_MET_NOTE)
+                self._condition_met_now = True
+                self._condition_acknowledged.add(clause_id)
+                break
+
     # ------------------------------------------------------------------ the plan
     def _plan(
         self,
@@ -6971,6 +7090,8 @@ class RolePlayEngine:
         reminder: str | None = None
         kind = None if aside else self._break_kind
         price_wrap = self.scheduler.price_wrap_turn == self.scheduler.turn
+        if mode in (TurnMode.INTENT, TurnMode.LLM_REPLY) and not aside:
+            self._condition_ack_note()
         if mode in (TurnMode.INTENT, TurnMode.LLM_REPLY):
             # After a MEDIUM or STRONG commitment a free reply only confirms it: no new doubt,
             # no probe answered, no curiosity (in the smoke test the learner answered the
@@ -7190,6 +7311,7 @@ class RolePlayEngine:
             price_check=self._price_conflict,
             probe=probe,
             timeline_v2=self._timeline_v2,
+            timeline_v3=self._timeline_v3,
         )
 
     # ---------------------------------------------------------------------- speech
@@ -7445,6 +7567,9 @@ class RolePlayEngine:
             self._credit_organic_push(plan, spoken_text, when)
         if plan.negotiation_id is not None:
             self.negotiation.note_spoken(plan.negotiation_id, spoken_text, plan.turn)
+        for condition in self._condition_planned:
+            if condition["turn"] == plan.turn:
+                self.negotiation.note_condition(condition["id"], spoken_text, plan.turn)
         scripted_commitment = plan.commitment_level is not None and bool(plan.scripted_text)
         if plan.resolves_commitment and scripted_commitment:
             if fuzzy_contains(spoken_text, plan.scripted_text):
@@ -7768,6 +7893,10 @@ class RolePlayEngine:
                 entry[f"{key}_transcript_turn"] = None if turn is None else self._turn_map.get(turn)
             needs.append(entry)
         return {
+            **({"move_conditions": [
+                {**item, "named": item in self.negotiation.condition_named}
+                for item in self._condition_planned
+            ]} if self._move_condition and self._condition_planned else {}),
             **({"buying_signals": list(self._buying_signals_log)}
                if self._buying_signals and self._buying_signals_log else {}),
             **({"strong_gaps": list(self._strong_gaps)}

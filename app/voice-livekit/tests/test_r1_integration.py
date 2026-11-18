@@ -620,10 +620,13 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                             probe_first=True,
                             price_check=True,
                             timeline_v2=True,
+                            timeline_v3=True,
                         ),
                     )
                     self.assertIn(
-                        rendered.public_card_text(probe_first=True, timeline_v2=True), blob
+                        rendered.public_card_text(
+                            probe_first=True, timeline_v2=True, timeline_v3=True
+                        ), blob
                     )
                     # M032 S2P (D-M032-7): she knows no course figure; she asks the advisor.
                     self.assertNotIn("$9,000", blob)
@@ -680,6 +683,7 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                     probe_first=True,
                     price_check=True,
                     timeline_v2=True,
+                    timeline_v3=True,
                 ),
             },
         )

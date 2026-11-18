@@ -554,6 +554,14 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(present["buying_signals"], signals)
         self.assertFalse(set(SIGNAL_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
 
+    def test_move_conditions_worker_fact_is_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)["payload"]
+        conditions = [{"id": "money_path", "turn": 12, "named": True}]
+        present = session_facts_event({"move_conditions": conditions}, {},
+                                      roleplay_seconds=700)["payload"]
+        self.assertNotIn("move_conditions", plain)
+        self.assertEqual(present["move_conditions"], conditions)
+
     def test_strong_gaps_are_never_session_facts(self):
         for admin in (None, {"strong_gaps": []}, {"strong_gaps": ["fee"]}):
             with self.subTest(admin=admin):

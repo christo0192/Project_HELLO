@@ -557,6 +557,12 @@ NOT_ANSWERED_NOTE = (
     "- The advisor has not really answered the worry you raised last. Do not open by calling their "
     "reply reasonable, good, fair or helpful: respond to what they actually said."
 )
+# M033 A10 (R1_MOVE_CONDITION): acknowledge a condition the advisor has met.
+CONDITION_MET_NOTE = (
+    "- What the advisor just said answers the thing you said would help you decide. You may say so "
+    "once, in a few words of your own (for example: Okay, that makes sense.), then respond to "
+    "what he said."
+)
 # S2 item 7 (RCA critic, fda9e9f6 #34-#37): after the coach aside the aside turn is not in her
 # context, so to the model the advisor answered her greeting with "Okay, sure." and she greeted
 # again.  She carries on where the call was.
@@ -1437,6 +1443,7 @@ def learner_prefix(
     probe_first: bool = False,
     price_check: bool = False,
     timeline_v2: bool = False,
+    timeline_v3: bool = False,
 ) -> str:
     """The learner's system prefix: behaviour rules plus the persona's public card.
 
@@ -1484,7 +1491,9 @@ def learner_prefix(
         + "Do not volunteer worries, deadlines, money details or personal circumstances "
         "beyond your card. Share the extra detail a system note allows, and only then.\n"
         + CARD_MARKER
-        + persona.public_card_text(probe_first=probe_first, timeline_v2=timeline_v2)
+        + persona.public_card_text(
+            probe_first=probe_first, timeline_v2=timeline_v2, timeline_v3=timeline_v3
+        )
     )
 
 

@@ -5057,7 +5057,7 @@ class SituationNotesThroughTheEngineTests(unittest.TestCase):
                 s = Session(engine(rendered))
                 s.say(OPENER, 20)
                 plan = s.say("Is anyone else involved in the decision?", 60)
-                note = DECIDER_ASKED_NOTE.format(answer=rendered.decider_answer)
+                note = DECIDER_ASKED_NOTE.format(answer=rendered.decider_answer_v3)
                 self.assertIn(note, plan.reminder)
                 self.assertIn(rendered.decision_maker, note)
 
@@ -9524,7 +9524,8 @@ class ProbeFirstCardAndPrefixTests(unittest.TestCase):
         offer_realism = eng._offer_realism
         self.assertEqual(
             eng.learner_prefix_text(),
-            P2.learner_prefix(P1, offer_realism=offer_realism, timeline_v2=eng._timeline_v2),
+            P2.learner_prefix(P1, offer_realism=offer_realism, timeline_v2=eng._timeline_v2,
+                              timeline_v3=eng._timeline_v3),
         )
         self.assertIn("You know only that it is around $9,000 and about 6 months.", P1.public_card_text())
         self.assertIn(P2.PREFIX_COURSE_SENTENCE, eng.learner_prefix_text())
@@ -9544,6 +9545,7 @@ class ProbeFirstCardAndPrefixTests(unittest.TestCase):
             probe_first=plan.probe_first,
             price_check=plan.price_check,
             timeline_v2=plan.timeline_v2,
+            timeline_v3=plan.timeline_v3,
         )
         self.assertEqual(rebuilt, before)
 
@@ -11723,7 +11725,8 @@ class PersonaTimelineLatchTests(unittest.TestCase):
     def test_flag_off_builds_the_card_of_the_release_before(self):
         from r1_prompts import learner_prefix
 
-        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PERSONA_TIMELINE_V2": "0"}):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PERSONA_TIMELINE_V2": "0",
+                                                     "R1_PERSONA_TIMELINE_V3": "0"}):
             eng = engine()
         self.assertFalse(eng.plan_turn(OPENER, 20).timeline_v2)
         self.assertEqual(
@@ -15713,3 +15716,155 @@ class BuyingSignalEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MoveConditionEngineTests(unittest.TestCase):
+    def test_planning_limit_and_named_log(self):
+        eng = BuyingSignalEngineTests().make_engine()
+        eng._move_condition = True
+        eng.tracker.family_quality.clear()
+        evidence = eng._evidence(AskKind.ENROL)
+        for index in range(3):
+            eng.turn += 1
+            plan = eng._spec_plan(r1_roleplay.SPEC_BY_ID["N-MONEY"], [],
+                                  first_probes=(), reveal_topics=(), monologue=None)
+            plan = eng._add_move_condition(plan, evidence)
+            found = [reason for reason in plan.reasons if reason.startswith("move_condition:")]
+            self.assertEqual(bool(found), index < 2)
+            if found:
+                clause_id = found[0].split(":", 1)[1]
+                if index == 0:
+                    self.assertEqual(clause_id, "money_path")
+                self.assertTrue(eng.negotiation.note_condition(
+                    clause_id, plan.intent.fallback, plan.turn))
+        log = eng.admin_log()["move_conditions"]
+        self.assertEqual(len({entry["id"] for entry in log}), 2)
+        self.assertTrue(all(entry["named"] for entry in log))
+        eng._move_condition = False
+        self.assertNotIn("move_conditions", eng.admin_log())
+
+    def test_time_blocked_selects_work(self):
+        eng = BuyingSignalEngineTests().make_engine("time_blocked")
+        plan = eng._spec_plan(r1_roleplay.SPEC_BY_ID["N-MONEY"], [],
+                              first_probes=(), reveal_topics=(), monologue=None)
+        plan = eng._add_move_condition(plan, eng._evidence(AskKind.ENROL))
+        self.assertIn("move_condition:work", plan.reasons)
+
+    def test_acknowledges_named_money_path_once(self):
+        eng = BuyingSignalEngineTests().make_engine()
+        eng._move_condition = True
+        eng.negotiation.note_condition(
+            "money_path", "If I knew how the payment could work for me.", 2)
+        eng.turn = 3
+        eng._notes = []
+        eng._condition_ack_note()
+        self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, eng._notes)
+        eng.tracker.payment_plan_named = True
+        eng._condition_ack_note()
+        self.assertIn(r1_roleplay.CONDITION_MET_NOTE, eng._notes)
+        eng._notes = []
+        eng._condition_ack_note()
+        self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, eng._notes)
+
+    def test_in_window_stall_and_rollback(self):
+        for flag in ("0", "1"):
+            with self.subTest(flag=flag), mock.patch.dict(
+                os.environ, {"R1_MOVE_CONDITION": flag}
+            ):
+                session, r = run_cooperative(72.5)
+                session.eng.tracker.payment_plan_named = False
+                session.eng.tracker.discount_log.clear()
+                plan = session.say(ASK, r)
+                conditions = [reason for reason in plan.reasons
+                              if reason.startswith("move_condition:")]
+                self.assertEqual(bool(conditions), flag == "1", plan.reasons)
+                if conditions:
+                    self.assertIn("Then say, in your own words", plan.intent.brief)
+                    self.assertIn("move_conditions", session.eng.admin_log())
+                else:
+                    self.assertNotIn("move_conditions", session.eng.admin_log())
+
+    def test_pre_window_ask_has_no_condition(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        plan = session.say(ASK, 30)
+        self.assertFalse(any(reason.startswith("move_condition:") for reason in plan.reasons))
+        self.assertNotIn("move_conditions", session.eng.admin_log())
+
+    def test_pressured_stall_does_not_name_a_condition(self):
+        session, r = run_cooperative(72.5)
+        session.eng.tracker.invented_offer = True
+        plan = session.say(ASK, r)
+        self.assertIn("advisor_pressured", plan.reasons)
+        self.assertFalse(any(reason.startswith("move_condition:") for reason in plan.reasons))
+
+    def test_v3_is_latched_for_card_and_negotiation(self):
+        with mock.patch.dict(os.environ, {"R1_PERSONA_TIMELINE_V3": "0"}):
+            old = engine()
+        with mock.patch.dict(os.environ, {"R1_PERSONA_TIMELINE_V3": "1"}):
+            new = engine()
+            self.assertFalse(old.plan_turn(OPENER, 20).timeline_v3)
+        with mock.patch.dict(os.environ, {"R1_PERSONA_TIMELINE_V3": "0"}):
+            self.assertTrue(new.plan_turn(OPENER, 20).timeline_v3)
+        sentence = "I usually talk big decisions over with my husband."
+        self.assertTrue(old.negotiation._says_decider_first(sentence))
+        self.assertFalse(new.negotiation._says_decider_first(sentence))
+
+    def test_disabled_engines_have_identical_stalls(self):
+        with mock.patch.dict(os.environ, {"R1_MOVE_CONDITION": "0"}):
+            left, left_r = run_cooperative(72.5)
+            right, right_r = run_cooperative(72.5)
+        for offset in (0, 50):
+            first = left.say(ASK, left_r + offset)
+            second = right.say(ASK, right_r + offset)
+            self.assertEqual(first.reasons, second.reasons)
+            self.assertEqual(first.intent, second.intent)
+        self.assertNotIn("move_conditions", left.eng.admin_log())
+
+    def test_two_real_weak_stalls_choose_distinct_conditions(self):
+        session, r = run_cooperative(72.5)
+        eng = session.eng
+        eng.negotiation.voiced.clear()
+        eng.negotiation.voicings.clear()
+        eng.negotiation.stall_rounds = 0
+        eng.tracker.payment_plan_named = False
+        eng.tracker.discount_log.clear()
+        ids = []
+        for offset in (0, 50, 100):
+            plan = session.say(ASK, r + offset)
+            ids.extend(reason for reason in plan.reasons
+                       if reason.startswith("move_condition:"))
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
+
+    def test_met_condition_suppresses_unanswered_worry_only_for_that_turn(self):
+        for met in (False, True):
+            with self.subTest(met=met):
+                session = Session(engine(), reply="I see.")
+                session.say(OPENER, 20)
+                session.say(PITCH, 40)
+                eng = session.eng
+                eng._move_condition = True
+                if met:
+                    eng.negotiation.note_condition(
+                        "money_path", "If I knew how the payment could work for me.", eng.turn)
+                eng._worry_family = "F2"
+                reply = session.say("We have a payment plan with monthly instalments.", 60)
+                self.assertEqual(P2.CONDITION_MET_NOTE in (reply.reminder or ""), met)
+                self.assertEqual(P2.NOT_ANSWERED_NOTE in (reply.reminder or ""), not met)
+                eng._worry_family = "F2"
+                later = session.say("The payment plan is available monthly.", 100)
+                self.assertIn(P2.NOT_ANSWERED_NOTE, later.reminder or "")
+
+    def test_money_condition_acknowledged_on_later_advisor_turn(self):
+        session, r = run_cooperative(72.5)
+        eng = session.eng
+        eng.tracker.payment_plan_named = False
+        eng.tracker.discount_log.clear()
+        plan = session.say(ASK, r)
+        self.assertIn("move_condition:money_path", plan.reasons)
+        self.assertTrue(eng.admin_log()["move_conditions"][0]["named"])
+        reply = session.say("We have a payment plan with monthly instalments.", r + 50)
+        self.assertIn(r1_roleplay.CONDITION_MET_NOTE, reply.reminder or "")
+        again = session.say("What else are you considering?", r + 100)
+        self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, again.reminder or "")

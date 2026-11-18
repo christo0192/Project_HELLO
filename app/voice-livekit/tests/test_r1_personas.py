@@ -1023,3 +1023,22 @@ class PersonaTimelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimelineV3Tests(unittest.TestCase):
+    def test_cards_keep_old_wording_and_offer_v3(self):
+        from r1_temperament import TEMPERAMENTS
+
+        for persona in PERSONAS:
+            for temperament in (None, *(item.id for item in TEMPERAMENTS)):
+                rendered = resolve_persona(persona.id, temperament_on=temperament is not None,
+                                           temperament=temperament or "default")
+                old = rendered.public_card_text()
+                self.assertIn(f"I'd talk it over with my {rendered.decision_maker} first.", old)
+                if temperament is None:
+                    self.assertIn("Within a couple of weeks.", old)
+                new = rendered.public_card_text(timeline_v3=True)
+                self.assertNotIn("Within a couple of weeks.", new)
+                self.assertIn(rendered.decider_answer_v3, new)
+                self.assertNotIn("first", rendered.decider_answer_v3)
+                self.assertEqual(old, rendered.public_card_text(timeline_v3=False))

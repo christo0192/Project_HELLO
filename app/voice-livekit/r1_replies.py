@@ -428,6 +428,7 @@ def llm_messages(
                 probe_first=reply.plan.probe_first,
                 price_check=reply.plan.price_check,
                 timeline_v2=reply.plan.timeline_v2,
+                timeline_v3=reply.plan.timeline_v3,
             ),
             select_context(ordered, ROLEPLAY_PHASE),
             reply.candidate_text,
@@ -594,6 +595,7 @@ PLAN_FACT_KEYS = ("families_planned",)
 THEME_FACT_KEYS = ("objection_themes",)
 # Worker-only observation; the API parser does not use this for grading.
 SIGNAL_FACT_KEYS = ("buying_signals",)
+CONDITION_FACT_KEYS = ("move_conditions",)
 
 
 def session_facts_event(
@@ -663,6 +665,7 @@ def session_facts_event(
             **{key: admin[key] for key in PLAN_FACT_KEYS if key in (admin or {})},
             **{key: admin[key] for key in THEME_FACT_KEYS if key in (admin or {})},
             **{key: admin[key] for key in SIGNAL_FACT_KEYS if key in (admin or {})},
+            **{key: admin[key] for key in CONDITION_FACT_KEYS if key in (admin or {})},
             **shadow,
             **added,
         },

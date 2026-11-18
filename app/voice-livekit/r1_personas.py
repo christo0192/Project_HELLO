@@ -44,6 +44,9 @@ TOPIC_LABELS = {
     "H3": "your schedule, money or who else decides",
 }
 
+TIMELINE_ANSWER_V3 = "If it feels right I could decide quickly; otherwise I'd take a little time."
+DECIDER_ANSWER_V3 = "I usually talk big decisions over with my {decision_maker}."
+
 CONTACT_ANSWER = "You can use the email on my form."
 AVAILABILITY_ANSWER = "I'm not sure yet how many hours a week I could give it."
 # The decision timeline and the "data role" goal are deliberately separate (S0-B defect 10).
@@ -649,6 +652,10 @@ class RenderedPersona:
         return f"I'd talk it over with my {self.persona.decision_maker} first."
 
     @property
+    def decider_answer_v3(self) -> str:
+        return DECIDER_ANSWER_V3.format(decision_maker=self.decision_maker)
+
+    @property
     def spoken_city(self) -> str:
         """The city as TTS should read it: "Edison, New Jersey", not "Edison, NJ"."""
         town, _, state = self.variant.city.partition(", ")
@@ -709,7 +716,10 @@ class RenderedPersona:
             amount for _label, answer in self.work_answers for amount in dollar_amounts(answer)
         )
 
-    def public_card_text(self, *, probe_first: bool = False, timeline_v2: bool = False) -> str:
+    def public_card_text(
+        self, *, probe_first: bool = False, timeline_v2: bool = False,
+        timeline_v3: bool = False,
+    ) -> str:
         """Everything the learner prompt may say about the persona; no deep need.
 
         M032 S2P (D-M032-7, SWEEP-17; ``probe_first``, the engine's latched R1_PROBE_FIRST): the
@@ -747,8 +757,11 @@ class RenderedPersona:
         for label, answer in public_answers(timeline_v2=timeline_v2):
             if self.temperament is not None and label == "when you would decide on this course":
                 answer = self.temperament.timeline_answer
+            elif timeline_v3 and label == "when you would decide on this course":
+                answer = TIMELINE_ANSWER_V3
             parts.append(f'- {label}: "{answer}"')
-        parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
+        decider = self.decider_answer_v3 if timeline_v3 else self.decider_answer
+        parts.append(f'- who else is involved in your decision: "{decider}"')
         for label, answer in self.work_answers:
             parts.append(f'- {label}: "{answer}"')
         if self.work_answers:

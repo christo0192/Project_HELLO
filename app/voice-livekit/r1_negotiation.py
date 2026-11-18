@@ -146,6 +146,94 @@ class NegotiationSpec:
     variants: tuple[str, ...]
 
 
+CONDITION_MONEY_PATH = "money_path"
+CONDITION_DECIDER = "decider"
+CONDITION_REASSURANCE = "reassurance"
+CONDITION_NEEDS = "needs"
+CONDITION_FAMILY = "families"
+CONDITION_WORK = "work"
+
+
+@dataclass(frozen=True)
+class ConditionClause:
+    id: str
+    clause: str
+    markers: tuple[tuple[str, ...], ...]
+    fallbacks: tuple[str, ...]
+
+
+def _condition(
+    clause_id: str, clause: str, fallbacks: tuple[str, ...], *markers: tuple[str, ...]
+) -> ConditionClause:
+    return ConditionClause(clause_id, clause, markers, fallbacks)
+
+
+CONDITION_CLAUSES = {
+    CONDITION_MONEY_PATH: _condition(
+        CONDITION_MONEY_PATH, "if I knew how the payment could work for me",
+        ("Honestly, I think I could decide if I knew how the payment could work for me.",
+         "What would really help is knowing how the payment could work for me.",
+         "If I could see a way to pay that would work for me, that would change things."),
+        (r"\b(?:pay|payment|payments|paying|afford)\b",),
+        (r"\b(?:work|manage|handle|doable)\b",), (r"\b(?:if|once|knew|know|help)\b",),
+    ),
+    CONDITION_DECIDER: _condition(
+        CONDITION_DECIDER, "if I knew what to tell my {decision_maker} about it",
+        ("Honestly, it would be easier if I knew what to tell my {decision_maker} about it.",
+         "What would really help is knowing what to tell my {decision_maker} about it.",
+         "If I knew how to explain it to my {decision_maker}, that would make it easier."),
+        (r"\b(?:tell|explain|say to|show)\b",), (r"\b{decision_maker}\b",),
+        (r"\b(?:if|knew|know|help)\b",),
+    ),
+    CONDITION_REASSURANCE: _condition(
+        CONDITION_REASSURANCE, "if I could hear how people like me got on after it",
+        ("Honestly, it would help to hear how people like me got on after it.",
+         "If I could hear how people like me did after the course, that would help.",
+         "What would really help is hearing how people like me got on afterwards."),
+        (r"\b(?:people like me|others like me|someone like me|people in my)\b",),
+        (r"\b(?:got on|did|turned out|ended up|worked out|work out|after)\b",),
+    ),
+    CONDITION_NEEDS: _condition(
+        CONDITION_NEEDS, "if I felt this really fits where I am",
+        ("Honestly, I'd feel better if I felt this really fits where I am.",
+         "What would really help is feeling sure this fits my situation.",
+         "If I felt this was right for me where I am now, that would help."),
+        (r"\b(?:fits|fit|right for)\b",), (r"\b(?:where I am|my situation|me)\b",),
+        (r"\b(?:if|felt|feel|sure)\b",),
+    ),
+    CONDITION_WORK: _condition(
+        CONDITION_WORK, "once things at work settle down",
+        ("Honestly, I could look at it again once things at work settle down.",
+         "It would be easier once things at work settle down a bit.",
+         "Once work is less busy, I could think about it properly."),
+        (r"\bwork\b",), (r"\b(?:settle|calm|quieter|less busy|eases)\b",),
+    ),
+}
+CONDITION_FAMILY_CLAUSES = {
+    "F1": _condition(
+        "families:F1", "if the cost side felt manageable for me",
+        ("Honestly, I could decide if the cost side felt manageable for me.",
+         "What would really help is the cost feeling manageable for me.",
+         "If the money side felt doable for me, that would change things."),
+        (r"\b(?:cost|price|fee|money)\b",), (r"\b(?:manageable|doable|workable)\b",),
+    ),
+    "F2": _condition(
+        "families:F2", "if I could see how it would fit my schedule",
+        ("Honestly, it would help if I could see how it would fit my schedule.",
+         "What would really help is seeing how it would fit my week.",
+         "If I could see how it would work with my schedule, that would help."),
+        (r"\b(?:fit|work)\b",), (r"\b(?:schedule|week|time)\b",),
+    ),
+    "F3": _condition(
+        "families:F3", "if I felt sure it would really pay off for me",
+        ("Honestly, I could decide if I felt sure it would really pay off for me.",
+         "What would really help is feeling sure it would be worth it for me.",
+         "If I knew it would pay off for someone like me, that would help."),
+        (r"\b(?:pay off|worth it|be worth)\b",), (r"\b(?:sure|felt|knew)\b",),
+    ),
+}
+
+
 N_TIMING = "N-TIMING"
 N_MONEY = "N-MONEY"
 N_DECISION_MAKER = "N-DM"
@@ -4226,8 +4314,13 @@ class NegotiationTurn:
 class Negotiation:
     """Everything the learner remembers about the price, the callbacks and its own reasons."""
 
-    def __init__(self, decision_maker: str, *, max_stall_rounds: int = MAX_STALL_ROUNDS) -> None:
+    def __init__(
+        self, decision_maker: str, *, max_stall_rounds: int = MAX_STALL_ROUNDS,
+        timeline_v3: bool = False,
+    ) -> None:
         self.decision_maker = decision_maker
+        self.timeline_v3 = timeline_v3
+        self.condition_named: list[dict[str, Any]] = []
         self.max_stall_rounds = max_stall_rounds
         self.offers: list[PriceOffer] = []
         self.refusals = 0
@@ -4626,6 +4719,14 @@ class Negotiation:
 
     def _says_decider_first(self, spoken: object) -> bool:
         """The learner said it would talk to or check with its decision maker."""
+        text = fold(spoken)
+        if self.timeline_v3 and re.search(
+            r"\b(?:usually|normally|tend to)\b[^.?!]*\b(?:talk|speak|check|discuss|"
+            r"consult|run|ask|tell)\b", text, re.IGNORECASE,
+        ) and not re.search(
+            r"\b(?:first|before|need to|have to|would want to)\b", text, re.IGNORECASE,
+        ):
+            return False
         pattern = re.compile(
             r"\b(?:talk|speak|check|discuss|consult|run (?:it|this|that) by|ask|tell)\b[^.?!]{0,40}"
             r"\b" + re.escape(self.decision_maker.lower()) + r"\b",
@@ -4639,6 +4740,16 @@ class Negotiation:
         self.voicings[reason] = self.voicings.get(reason, 0) + 1
         if reason == REASON_DECISION_MAKER:
             self.decider_said_turn = turn
+
+    def note_condition(self, clause_id: str, spoken: object, turn: int) -> bool:
+        clauses = (*CONDITION_CLAUSES.values(), *CONDITION_FAMILY_CLAUSES.values())
+        clause = next((item for item in clauses if item.id == clause_id), None)
+        if clause is None or not markers_match(
+            filled_markers(clause.markers, self.decision_maker), spoken
+        ):
+            return False
+        self.condition_named.append({"id": clause_id, "turn": turn})
+        return True
 
     def note_spoken(self, spec_id: str, spoken: object, turn: int) -> bool:
         """Record that spec ``spec_id`` was raised, if the played text proves it."""
@@ -4882,6 +4993,7 @@ class Negotiation:
             "email_offer_turns": list(self.email_offers),
             "email_answered": self.email_answered,
             "checkins": self.checkins,
+            **({"condition_named": list(self.condition_named)} if self.condition_named else {}),
             "reasons_voiced": dict(self.voiced),
             "reason_voicings": dict(self.voicings),
             "reasons_handled": dict(self.handled),

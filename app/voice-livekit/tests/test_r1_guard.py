@@ -4343,3 +4343,11 @@ class ObjectionThemeGuardTests(unittest.TestCase):
         for variant in anchor._state(scheduler.F1_ANCHOR).variants:
             result = guard_text(variant, ctx(allowed_extra=frozenset({7000, 9000})))
             self.assertTrue(result.clean, variant)
+
+
+class ConditionAcknowledgementTests(unittest.TestCase):
+    def test_short_acknowledgements_are_guard_clean(self):
+        for text in ("That helps.", "Okay, that makes sense."):
+            result = guard_text(text, ctx())
+            self.assertEqual(result.text, text)
+            self.assertFalse(result.hits)

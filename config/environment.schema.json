@@ -285,6 +285,8 @@
         "R1_TEMPERAMENT_THEMES": { "requiredInProduction": false, "secret": false },
         "R1_STRONG_EVIDENCE_V2": { "requiredInProduction": false, "secret": false },
         "R1_BUYING_SIGNALS": { "requiredInProduction": false, "secret": false },
+        "R1_MOVE_CONDITION": { "requiredInProduction": false, "secret": false },
+        "R1_PERSONA_TIMELINE_V3": { "requiredInProduction": false, "secret": false },
         "R1_CLOSING_STATE": { "requiredInProduction": false, "secret": false },
         "R1_EARLY_CLOSE_ASIDE": { "requiredInProduction": false, "secret": false },
         "R1_ABUSE_HANGUP": { "requiredInProduction": false, "secret": false },
