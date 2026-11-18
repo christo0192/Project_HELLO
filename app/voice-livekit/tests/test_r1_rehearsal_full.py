@@ -607,15 +607,18 @@ class OfflineFullInterviewTests(unittest.TestCase):
         if requests:
             self.assertGreaterEqual(requests[0]["r_sec"], 630.0 - REPLAY_HOLD_SLACK_SEC - 1.0)
             self.assertEqual(record["stop_reason"], "end_request")
+            self.assertGreaterEqual(record["roleplay_seconds"], 600.0)
         else:
             # M032 S3.4 (the learner lane, R1_ABUSE_HANGUP): the insult just before it ("Now get
             # lost, you idiot.") gets her hang-up, and the candidate's yes to Christy's question
             # ends the role-play before the request is reached.
             from rehearsal.full_metrics import abuse_supported
 
+            # The insult is not held to a real-session time, so faster turns (M033 PR-B latency)
+            # reach it sooner; the role-play then ends on the candidate's own yes to Christy.
             self.assertTrue(abuse_supported())
             self.assertTrue(_check(record, "abuse")["ok"], _check(record, "abuse"))
-        self.assertGreaterEqual(record["roleplay_seconds"], 600.0)
+            self.assertEqual(record["stop_reason"], "wrap_accepted")
 
     def test_no_two_bot_lines_ever_play_at_once(self) -> None:
         for name, record in self.records.items():
@@ -1821,6 +1824,29 @@ class PhaseCheckTests(unittest.TestCase):
         self.assertTrue(checks["end_consent"]["requests"][0]["ignored"])
         self.assertTrue(checks["end_consent"]["requests"][0]["answered_in_role"])
         self.assertFalse(checks["roleplay_end"]["ok"])
+
+    def test_an_early_farewell_passes_only_when_the_candidate_said_goodbye_in_role(self) -> None:
+        from rehearsal.full_metrics import _roleplay_end
+
+        def record(text: str) -> dict:
+            return {
+                "stop_reason": "farewell_exit",
+                "roleplay_seconds": 766.0,
+                "candidate_turns": [
+                    {"act": "advisor_turn", "phase": "roleplay", "text": "What day works for you?"},
+                    {"act": "advisor_turn", "phase": "roleplay", "text": text},
+                ],
+            }
+
+        closed = _roleplay_end(
+            record("Thank you, I'll send the email. Enjoy your evening, and we'll speak tomorrow."),
+            ["roleplay"],
+        )
+        self.assertTrue(closed["ok"])
+        self.assertTrue(closed["candidate_goodbye"])
+        cut = _roleplay_end(record("And what about the class sizes for the next cohort?"), ["roleplay"])
+        self.assertFalse(cut["ok"])
+        self.assertFalse(cut["candidate_goodbye"])
 
     def test_an_at_once_exit_needs_a_named_end_or_an_earlier_question(self) -> None:
         from rehearsal.full_metrics import phase_checks

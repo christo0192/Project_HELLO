@@ -17,7 +17,7 @@ phase, the questions the owner's rules and the plan ask (M032 S8):
 * ``ready_taken``: every spoken "ready" in the transition started the role-play (the learner picked
   up before the candidate spoke again): a "ready" Christy answered as a question, or ignored, fails;
 * ``roleplay_end``: an in-role close (a farewell, the offer to wrap up) never exits before R 14:00
-  unless the candidate agreed (D-M032-2); a time-cap exit falls inside 19:00-20:30 and never
+  unless the candidate agreed or closed it with their own in-role goodbye (D-M032-2); a time-cap exit falls inside 19:00-20:30 and never
   follows an end request that was ignored; an exit on the candidate's own end request is theirs;
 * ``end_consent``: every end request is heard: Christy asks (L-ASIDE-END), or the role-play exits
   at once where the design allows it (the request names the interview or the role-play and ends on
@@ -304,6 +304,26 @@ def _candidate_acts(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return list(record.get("candidate_turns") or [])
 
 
+_ADVISOR_GOODBYE = re.compile(
+    r"\b(?:good ?bye|bye(?: for now)?|take care|enjoy your (?:evening|day|night|weekend)"
+    r"|have a (?:good|great|lovely|nice) (?:evening|day|night|weekend)"
+    r"|(?:speak|talk) (?:to|with) you (?:then|soon|tomorrow)"
+    r"|(?:we'll|we will|i'll|i will) (?:speak|talk) (?:then|soon|tomorrow))\b",
+    re.IGNORECASE,
+)
+
+
+def _candidate_said_goodbye(record: Mapping[str, Any]) -> bool:
+    """Whether the candidate's last role-play turn (in role, as the advisor) said goodbye."""
+    turns = [
+        turn for turn in _candidate_acts(record)
+        if turn.get("phase") in (None, "roleplay") and turn.get("act") == "advisor_turn"
+    ]
+    if not turns:
+        return False
+    return bool(_ADVISOR_GOODBYE.search(str(turns[-1].get("text") or "")))
+
+
 def _roleplay_end(
     record: Mapping[str, Any], phases: Sequence[str], consent: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -323,7 +343,11 @@ def _roleplay_end(
             detail["why"] = "the role-play ran to the time cap after an ignored end request"
             detail["ignored_requests_r"] = [item.get("r") for item in ignored]
     elif end in ("farewell_exit", "wrap_accepted"):
-        detail["ok"] = r_end >= ROLEPLAY_FLOOR_SEC or agreed
+        # A goodbye the candidate said in role (as the advisor) is their own close: the learner
+        # answering it is consent, not an abrupt cut (D-M032-2; M033 closes on evidence from 10:00).
+        closed_by_candidate = _candidate_said_goodbye(record)
+        detail["candidate_goodbye"] = closed_by_candidate
+        detail["ok"] = r_end >= ROLEPLAY_FLOOR_SEC or agreed or closed_by_candidate
         if not detail["ok"]:
             detail["why"] = "an in-role close ended the role-play before R 14:00 without the candidate agreeing"
     elif end == "end_request":
