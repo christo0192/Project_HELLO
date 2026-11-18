@@ -397,7 +397,9 @@ import r1_world
 # 38: M033 A6 (R1_TEMPERAMENT_PLAN): family median minutes set objection plan order.
 # 39: M033 A7 (R1_TEMPERAMENT_THEMES): objection theme bank and each
 # temperament's top two themes per family.
-CONTENT_REVISION = 39
+# 40: M033 A8 (R1_STRONG_EVIDENCE_V2): the v2 STRONG lines (no deposit) and the fee,
+#    payment plan and outcome readers.
+CONTENT_REVISION = 40
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -969,6 +971,11 @@ def manifest() -> dict[str, Any]:
         "commitment": {
             "lines": {level.name: text for level, text in r1_commitment.COMMITMENT_LINES.items()},
             "upgrade_line": r1_commitment.UPGRADE_LINE,
+            "strong_line_v2": r1_commitment.STRONG_LINE_V2,
+            "strong_plan_line_v2": r1_commitment.STRONG_PLAN_LINE_V2,
+            "payment_plan_pattern": r1_tracker.PAYMENT_PLAN_PATTERN.pattern,
+            "payment_choice_pattern": r1_tracker.PAYMENT_CHOICE_PATTERN.pattern,
+            "outcome_pattern": r1_tracker.OUTCOME_PATTERN.pattern,
             "default_slot": r1_commitment.DEFAULT_SLOT,
             "moved_line": r1_commitment.MEDIUM_MOVED_LINE,
             "defer_line": r1_commitment.MEDIUM_DEFER_LINE,

@@ -2497,5 +2497,68 @@ V1_JUDGE_SYSTEM = (
 )
 
 
+class StrongEvidenceReadersTests(unittest.TestCase):
+    def test_payment_and_outcomes(self):
+        tracker = CoverageTracker(PERSONA)
+        tracker.observe_candidate_turn(
+            "The course is $9,000, and the discount depends on which payment plan you pick."
+        )
+        evidence = tracker.commitment_evidence(AskKind.ENROL)
+        self.assertTrue(evidence.fee_named and evidence.money_path)
+        self.assertTrue(tracker.payment_plan_named)
+        self.assertFalse(evidence.pressured)
+        tracker.observe_candidate_turn(
+            "Many of our alumni moved into data roles, though I can't promise you a job."
+        )
+        self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+        self.assertFalse(tracker.guarantee_claimed)
+        tracker.observe_candidate_turn("We guarantee you a job.")
+        evidence = tracker.commitment_evidence(AskKind.ENROL)
+        self.assertTrue(evidence.pressured)
+        self.assertFalse(evidence.reassurance)
+
+    def test_unrelated_plans_and_negation(self):
+        for text in ("What are your plans after the course?", "Plan your week around it.",
+                     "We don't have a payment plan.", "We don\u2019t have a payment plan.",
+                     "How do you plan to pay for it?",
+                     "Do you have plans to pay for it yourself?",
+                     "Is this part of your career plan?",
+                     "You could split the cost with your husband."):
+            with self.subTest(text=text):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertFalse(tracker.payment_plan_named)
+        tracker = CoverageTracker(PERSONA)
+        tracker.observe_candidate_turn("$500 off if you enrol this week.")
+        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).fee_named)
+        tracker.observe_candidate_turn("Our alumni are great people.")
+        tracker.observe_candidate_turn("Our graduates got really confused by data at first.")
+        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+        for text in ("Many of our graduates got hired within the year.",
+                     "Our alumni got new jobs after it."):
+            with self.subTest(text=text):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+        tracker = CoverageTracker(PERSONA)
+        tracker.observe_candidate_turn("We can split the fee into two payments.")
+        self.assertTrue(tracker.payment_plan_named)
+
+    def test_deck_discount_after_value_is_a_money_path(self):
+        for amount, expected in ((500, True), (750, False)):
+            with self.subTest(amount=amount):
+                tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True)
+                tracker.observe_candidate_turn("Our mentors support you.")
+                tracker.observe_candidate_turn(f"If you enrol today, I can offer ${amount} off.")
+                self.assertEqual(tracker.commitment_evidence(AskKind.ENROL).money_path, expected)
+
+    def test_shorthand_fee_and_negated_outcome(self):
+        tracker = CoverageTracker(PERSONA)
+        tracker.observe_candidate_turn("The course fee is 9k.")
+        self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).fee_named)
+        tracker.observe_candidate_turn("Our alumni never moved into data roles.")
+        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+
+
 if __name__ == "__main__":
     unittest.main()

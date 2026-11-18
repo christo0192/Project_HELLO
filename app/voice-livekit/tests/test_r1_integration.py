@@ -1652,9 +1652,14 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         plan = rig.plan()
         self.assertIs(plan.mode, TurnMode.SAY_ONLY)
         self.assertIn("ask_in_window", ",".join(plan.reasons))
-        self.assertEqual(
-            spoken, commitment_line(plan.commitment_level, rig.persona.decision_maker)
-        )
+        self.assertEqual(spoken, plan.scripted_text)
+        if plan.commitment_level is Level.STRONG:
+            # M033 A8: the v1 line or a v2 form (with or without the plan details).
+            dm = rig.persona.decision_maker
+            self.assertIn(spoken, {
+                commitment_line(Level.STRONG, dm, strong_v2=v2, plan=named)
+                for v2 in (False, True) for named in (False, True)
+            })
         self.assertEqual(len(rig.provider.calls), calls)
         self.assertTrue(rig.engine.commitment_resolved)
         self.assertEqual(rig.engine.commitment_level, plan.commitment_level)
@@ -2319,6 +2324,24 @@ class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
         blob = json.dumps(rig.writer.admin_events).lower()
         for word in ("commitment", "strong", "medium", "weak", "grade"):
             self.assertNotIn(word, blob)
+
+    async def test_strong_gaps_are_logged_and_never_posted(self) -> None:
+        for flag in ("1", "0"):
+            with self.subTest(flag=flag), mock.patch.dict(
+                os.environ, {"R1_STRONG_EVIDENCE_V2": flag}
+            ):
+                rig = await self.full_session()
+                with capture_r1_logs() as lines:
+                    rig.interview._begin_exit()
+                    rig.interview._queue_fidelity()
+                    await rig.flush()
+                gaps = [e["error_category"] for e in lines
+                        if e["error_type"] == "r1_fidelity_strong_gap"]
+                if flag == "1":
+                    self.assertEqual(gaps, rig.engine.admin_log()["strong_gaps"] or ["none"])
+                else:
+                    self.assertEqual(gaps, [])
+                self.assertNotIn("strong_gaps", json.dumps(rig.writer.admin_events))
 
     async def test_the_session_logs_its_move_deliveries_as_they_happen(self) -> None:
         rig = Rig()

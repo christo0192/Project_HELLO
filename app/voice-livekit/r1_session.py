@@ -4748,6 +4748,11 @@ class R1Interview:
             turn_index=turn,
             option_count=len(commitment["asks"]),
         )
+        if "strong_gaps" in admin:
+            for label in admin["strong_gaps"] or ["none"]:
+                _log.info(
+                    "unknown_event", error_type="r1_fidelity_strong_gap", error_category=label
+                )
         for reason in admin["exclusion_reasons"]:
             _log.warn("unknown_event", error_type="r1_fidelity_excluded", error_category=reason)
         checks = admin["fidelity"]["checks"]

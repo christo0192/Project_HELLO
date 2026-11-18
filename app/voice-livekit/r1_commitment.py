@@ -74,6 +74,12 @@ COMMITMENT_LINES = {
     ),
     Level.WEAK: "Let me think about it. Just email me the details and I'll get back to you.",
 }
+# The deck has no deposit; the API mask hides both link sentences.
+STRONG_LINE_V2 = "Okay, let's do it. Send me the enrolment link and I'll get started today."
+STRONG_PLAN_LINE_V2 = (
+    "Okay, let's do it. Send me the enrolment link and the payment plan details, "
+    "and I'll get started today."
+)
 # M033 A4: the scorer mask needs "Send me the enrolment link" to hide this STRONG line.
 UPGRADE_LINE = (
     "Actually, you know what, I don't want to wait. Send me the "
@@ -116,6 +122,8 @@ def commitment_line(
     deferred: bool = False,
     call: bool = False,
     emailed: bool = False,
+    strong_v2: bool = False,
+    plan: bool = False,
 ) -> str:
     """The scripted line for ``level``; NONE is not a commitment and has no line.
 
@@ -127,6 +135,8 @@ def commitment_line(
     """
     if level is Level.NONE:
         raise ValueError("no commitment line for Level.NONE")
+    if level is Level.STRONG and strong_v2:
+        return STRONG_PLAN_LINE_V2 if plan else STRONG_LINE_V2
     if level is Level.MEDIUM and deferred:
         template = MEDIUM_DEFER_LINE
     elif level is Level.MEDIUM and moved:
@@ -150,6 +160,9 @@ def is_commitment_line(text: object, decision_maker: str) -> bool:
     variants = (
         commitment_line(Level.STRONG, decision_maker),
         UPGRADE_LINE,
+        # Worker mirror of the API link mask, regardless of the session flag.
+        STRONG_LINE_V2,
+        STRONG_PLAN_LINE_V2,
         commitment_line(Level.MEDIUM, decision_maker),
         commitment_line(Level.MEDIUM, decision_maker, deferred=True),
         commitment_line(Level.WEAK, decision_maker),
@@ -1205,6 +1218,10 @@ class CommitmentEvidence:
     pressured: bool = False
     thin: bool = False
     families_planned: tuple[str, ...] | None = None
+    fee_named: bool = False
+    money_path: bool = False
+    reassurance: bool = False
+    enrol_ceiling: Level = Level.STRONG
 
 
 def families_answered(quality: Mapping[str, int | None]) -> tuple[str, ...]:
@@ -1216,10 +1233,28 @@ def families_answered(quality: Mapping[str, int | None]) -> tuple[str, ...]:
     )
 
 
-def grade(evidence: CommitmentEvidence) -> Level:
+def strong_gaps(evidence: CommitmentEvidence) -> tuple[str, ...]:
+    """Missing v2 evidence, independent of the advisor's ask."""
+    planned = evidence.families_planned or FAMILIES
+    answered = families_answered(evidence.family_quality)
+    checks = (
+        ("needs", evidence.needs_released < 2),
+        ("families", any(f not in answered for f in planned)),
+        ("discount", not evidence.discount_ok),
+        ("fee", not evidence.fee_named),
+        ("money_path", not evidence.money_path),
+        ("reassurance", not evidence.reassurance),
+        ("ceiling", evidence.enrol_ceiling < Level.STRONG),
+        ("blocked", evidence.pressured or evidence.thin),
+    )
+    return tuple(label for label, missing in checks if missing)
+
+
+def grade(evidence: CommitmentEvidence, *, strong_v2: bool = False) -> Level:
     """STRONG, MEDIUM or WEAK for an ask that the close window permits.
 
-    STRONG: commitment asked; at least 2 of 3 deep needs released; every planned family
+    V2 STRONG replaces urgency with fee, money path, reassurance and the temperament ceiling.
+    V1 STRONG: commitment asked; at least 2 of 3 deep needs released; every planned family
     answered with quality at least 1 (all four when no plan); discount discipline intact; a
     legitimate urgency lever used.  MEDIUM: asked; at least 1 deep need released; and either
     at least 2 families answered or at least 1 stall reason handled (R1-Q: an advisor who
@@ -1235,13 +1270,16 @@ def grade(evidence: CommitmentEvidence) -> Level:
     planned = evidence.families_planned or FAMILIES
     answered = tuple(f for f in families_answered(evidence.family_quality) if f in planned)
     result = Level.WEAK
-    if evidence.needs_released >= 1 and (len(answered) >= 2 or evidence.reasons_handled >= 1):
+    medium_families = min(2, len(planned)) if strong_v2 else 2
+    if evidence.needs_released >= 1 and (
+        len(answered) >= medium_families or evidence.reasons_handled >= 1
+    ):
         result = Level.MEDIUM
     if (
         evidence.needs_released >= 2
         and len(answered) == len(planned)
         and evidence.discount_ok
-        and evidence.urgency_lever
+        and (not strong_gaps(evidence) if strong_v2 else evidence.urgency_lever)
     ):
         result = Level.STRONG
     if evidence.ask_kind is AskKind.CALL and result > Level.MEDIUM:

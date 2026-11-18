@@ -544,6 +544,12 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(present["objection_themes"], themes)
         self.assertFalse(set(THEME_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
 
+    def test_strong_gaps_are_never_session_facts(self):
+        for admin in (None, {"strong_gaps": []}, {"strong_gaps": ["fee"]}):
+            with self.subTest(admin=admin):
+                payload = session_facts_event(admin, {}, roleplay_seconds=700)["payload"]
+                self.assertNotIn("strong_gaps", payload)
+
     def test_choose_persona_temperament_flag(self):
         from r1_replies import choose_persona
         for context in ({}, {"attempt": {"persona_id": "p1_career_switcher"}}):

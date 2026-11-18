@@ -157,6 +157,7 @@ URGENCY = (
     "better your chances of getting a place.",
 )
 CLOSE_STRONG = (
+    "Many of our alumni moved into data roles, and the discount depends on your payment plan. "
     "It sounds like this fits what you are looking for. Would you like to go ahead and enrol "
     "today, or should we set up a call with your {dm} this week?",
     "Given everything we have covered, what would you like the next step to be? I can send "

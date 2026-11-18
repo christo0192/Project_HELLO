@@ -68,6 +68,7 @@ from r1_text import (
     clause_after,
     clause_before,
     dollar_amounts,
+    expand_shorthand_amounts,
     fold,
     is_question_like,
     negated_before,
@@ -2032,6 +2033,26 @@ class TrackerObservation:
     injection: bool
 
 
+# Narrow readers for payment options and past learner outcomes.
+PAYMENT_PLAN_PATTERN = re.compile(
+    r"\b(?:payment plans?|pay\b[^.?!]{0,30}\bwith a plan|"
+    r"pay (?:it )?in parts|pay (?:it )?(?:in|by) instal+ments|instal+ment (?:plan|option)|"
+    r"pay monthly|monthly payments|split the (?:payment|fee|cost) (?:into|over)|"
+    r"spread the (?:payments?|cost))\b", re.IGNORECASE,
+)
+PAYMENT_CHOICE_PATTERN = re.compile(
+    r"\bwhich plan (?:you )?(?:pick|choose)\b", re.IGNORECASE,
+)
+OUTCOME_PATTERN = re.compile(
+    r"\b(?:alumni|graduates|past students|our learners|many of them|"
+    r"people who (?:took|did|finished) it)\b[^.?!]{0,100}\b"
+    r"((?:moved(?: into)?|switched|transitioned|landed|became|went on to|now work (?:as|in))"
+    r"\b[^.?!]{0,100}\b(?:roles?|jobs?|positions?|careers?|data|analyst|scientist|engineer)\b"
+    # "got" only with a job object: "graduates got confused by data" is no outcome.
+    r"|got (?:hired|(?:a |an |the |their )?(?:new )?(?:jobs?|roles?|positions?|offers?))\b)",
+    re.IGNORECASE,
+)
+
 class CoverageTracker:
     """Shadow coverage state for one role-play (see the module docstring)."""
 
@@ -2050,6 +2071,11 @@ class CoverageTracker:
         self.first_value_turn: int | None = None
         self.discount_log: list[dict[str, Any]] = []
         self.levers: set[str] = set()
+        self.fee_named = False
+        self.payment_plan_named = False
+        self.payment_plan_turn: int | None = None
+        self.guarantee_claimed = False
+        self._outcome_seen = False
         self.coercive_urgency = False
         self.invented_offer = False
         self.rule_injection_turns = 0
@@ -2065,6 +2091,26 @@ class CoverageTracker:
         """Run the deterministic fast path on one candidate turn."""
         self.turn = turn if turn is not None else self.turn + 1
         update = self.gate.observe_candidate_turn(text, self.turn)
+        for sentence in split_sentences(text):
+            canonical = canonical_amounts(expand_shorthand_amounts(sentence))
+            discount_amounts = {mention.usd for mention in parse_discounts(sentence)}
+            self.fee_named |= any(
+                amount in {PRICE_USD, *(PRICE_USD - d for d in DISCOUNTS_USD)}
+                and amount not in discount_amounts
+                for amount in dollar_amounts(canonical)
+            )
+            folded = fold(sentence)
+            matches = list(PAYMENT_PLAN_PATTERN.finditer(folded))
+            if re.search(r"\b(?:payment|discount|fee|price|cost)\b", sentence, re.I):
+                matches += list(PAYMENT_CHOICE_PATTERN.finditer(folded))
+            if any(not negated_before(folded, match.start()) for match in matches):
+                self.payment_plan_named = True
+                if self.payment_plan_turn is None:
+                    self.payment_plan_turn = self.turn
+            for match in OUTCOME_PATTERN.finditer(folded):
+                if not negated_before(folded, match.start(1)):
+                    self._outcome_seen = True
+        self.guarantee_claimed |= claims_guarantee(text)
         self._turn_had_question[self.turn] = update.question
         value_index = _first_value_sentence(text)
         discounts = parse_discounts(text)
@@ -2194,6 +2240,14 @@ class CoverageTracker:
             discount_ok=self.discount_ok and not self.invented_offer,
             urgency_lever=self.urgency_ok,
             pressured=self.invented_offer or self.coercive_urgency,
+            fee_named=self.fee_named,
+            money_path=self.payment_plan_named or (
+                bool(self.discount_log) and self.discount_ok and not self.invented_offer
+                and all(item["usd"] in DISCOUNTS_USD for item in self.discount_log)
+            ),
+            reassurance=(self._outcome_seen or bool(self.levers & {
+                "career_advancement", "success_stories", "industry_demand"
+            })) and not self.guarantee_claimed,
         )
 
     def admin_view(self) -> dict[str, Any]:

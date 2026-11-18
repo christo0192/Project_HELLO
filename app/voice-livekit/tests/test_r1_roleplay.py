@@ -389,7 +389,8 @@ def cooperative_script():
 
 def strong_script():
     """The cooperative script whose last turn also answers the learner's decider stall."""
-    return [*cooperative_script()[:-1], HANDLE_DECIDER]
+    return [*cooperative_script()[:-1], HANDLE_DECIDER +
+            " The $9,000 fee has a payment plan. Our alumni moved into data roles."]
 
 
 def run_cooperative(period=72.5, eng=None, ask_at=None, script=None):
@@ -1219,7 +1220,12 @@ class AskTests(unittest.TestCase):
         plan = session.say(ASK, r)
         self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
         self.assertEqual(plan.commitment_level, Level.STRONG)
-        self.assertEqual(plan.scripted_text, commitment_line(Level.STRONG, "husband"))
+        # M033 A8: the v2 plan line, or the v1 line when R1_STRONG_EVIDENCE_V2 is off.
+        from r1_roleplay import FLAG_STRONG_EVIDENCE_V2, flag_on
+        v2 = flag_on(FLAG_STRONG_EVIDENCE_V2)
+        self.assertEqual(plan.scripted_text, commitment_line(
+            Level.STRONG, "husband", strong_v2=v2, plan=v2
+        ))
         self.assertTrue(plan.resolves_commitment)
         self.assertTrue(eng.commitment_resolved)
         self.assertEqual(eng.commitment_level, Level.STRONG)
@@ -13921,8 +13927,6 @@ class EarlyCloseByeReviewTests(unittest.TestCase):
             s.say("Yes, let's stop the role-play there.", 710)
             self.assertIsNone(s.eng.exit_bye)
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -15526,3 +15530,70 @@ class TemperamentThemeEngineTests(unittest.TestCase):
                             self.assertTrue(all("$7,000" in x for x in plan.intent.fallbacks))
                         else:
                             self.assertTrue(set(plan.intent.fallbacks) <= set(theme.variants))
+
+
+class StrongEvidenceV2IntegrationTests(unittest.TestCase):
+    def test_plan_and_flag_rollback(self):
+        from r1_commitment import STRONG_PLAN_LINE_V2
+
+        for flag in ("0", "1"):
+            with self.subTest(flag=flag), mock.patch.dict(
+                os.environ, {"R1_STRONG_EVIDENCE_V2": flag}
+            ):
+                session, r = run_cooperative(72.5, script=strong_script())
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(ASK, r)
+                self.assertEqual(plan.commitment_level, Level.STRONG)
+                if flag == "1":
+                    self.assertEqual(plan.scripted_text, STRONG_PLAN_LINE_V2)
+                    self.assertIn("strong_gaps:none", plan.reasons)
+                    self.assertEqual(session.eng.admin_log()["strong_gaps"], [])
+                else:
+                    self.assertEqual(plan.scripted_text, commitment_line(Level.STRONG, "husband"))
+                    self.assertFalse(any(x.startswith("strong_gaps:") for x in plan.reasons))
+                    self.assertNotIn("strong_gaps", session.eng.admin_log())
+
+    def test_discount_and_missing_money_path(self):
+        from r1_commitment import STRONG_LINE_V2
+
+        for discount in (True, False):
+            with self.subTest(discount=discount), mock.patch.dict(
+                os.environ, {"R1_STRONG_EVIDENCE_V2": "1"}
+            ):
+                script = strong_script()
+                script = [PRICE_ONLY if text == PRICE_TALK else text for text in script]
+                script[-1] = HANDLE_DECIDER + " Our alumni moved into data roles."
+                if not discount:
+                    script = ["I understand the concern about the fee." if text == ANSWER else text
+                              for text in script]
+                session, r = run_cooperative(72.5, script=script)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(ASK, r)
+                if discount:
+                    self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+                    self.assertEqual(plan.scripted_text, STRONG_LINE_V2)
+                    self.assertIn("strong_gaps:none", plan.reasons)
+                else:
+                    self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+                    self.assertIn("strong_gaps:money_path", plan.reasons)
+
+    def test_time_blocked_ceiling(self):
+        from dataclasses import replace
+        from r1_temperament import TEMPERAMENTS
+
+        temperament = next(item for item in TEMPERAMENTS if item.id == "time_blocked")
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0",
+                                         "R1_TEMPERAMENT_THEMES": "0",
+                                         "R1_STRONG_EVIDENCE_V2": "1"}):
+            session, r = run_cooperative(
+                72.5, eng=engine(persona=replace(P1, temperament=temperament)),
+                script=strong_script(),
+            )
+            session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+            plan = session.say(ASK, r)
+            self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+            self.assertIn("ceiling", session.eng.admin_log()["strong_gaps"])
+
+
+if __name__ == "__main__":
+    unittest.main()

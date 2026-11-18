@@ -117,6 +117,7 @@ from typing import Any, Iterable
 
 from r1_commitment import (
     COMMIT_STALL_R_SEC,
+    strong_gaps,
     UPGRADE_LINE,
     THIN_ADVISOR_MEAN_WORDS,
     THIN_MIN_TURNS,
@@ -1287,6 +1288,8 @@ FLAG_TEMPERAMENT = "R1_TEMPERAMENT"
 FLAG_TEMPERAMENT_PLAN = "R1_TEMPERAMENT_PLAN"
 # M033 A7: choose objection themes per session.
 FLAG_TEMPERAMENT_THEMES = "R1_TEMPERAMENT_THEMES"
+# M033 A8: grade STRONG against enrolled-lead evidence.
+FLAG_STRONG_EVIDENCE_V2 = "R1_STRONG_EVIDENCE_V2"
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1429,6 +1432,7 @@ _FLAG_READS = {
     FLAG_TEMPERAMENT: lambda: os.getenv("R1_TEMPERAMENT"),
     FLAG_TEMPERAMENT_PLAN: lambda: os.getenv("R1_TEMPERAMENT_PLAN"),
     FLAG_TEMPERAMENT_THEMES: lambda: os.getenv("R1_TEMPERAMENT_THEMES"),
+    FLAG_STRONG_EVIDENCE_V2: lambda: os.getenv("R1_STRONG_EVIDENCE_V2"),
 }
 
 
@@ -1742,6 +1746,8 @@ class RolePlayEngine:
         self._discipline_v2 = flag_on(FLAG_DISCOUNT_DISCIPLINE_V2)
         self._close_evidence = flag_on(FLAG_CLOSE_WINDOW_EVIDENCE)
         self._commit_upgrade = flag_on(FLAG_COMMIT_UPGRADE)
+        self._strong_v2 = flag_on(FLAG_STRONG_EVIDENCE_V2)
+        self._strong_gaps: tuple[str, ...] | None = None
         families = (
             plan_families(persona.temperament, self.seed)
             if persona.temperament is not None and flag_on(FLAG_TEMPERAMENT_PLAN) else None
@@ -5571,7 +5577,18 @@ class RolePlayEngine:
             self.tracker.commitment_evidence(kind),
             reasons_handled=self.negotiation.reasons_handled_count,
             thin=thin,
+            **({
+                "fee_named": (self.tracker.fee_named or self._price_named()
+                              or self.scheduler.price_quoted_turn is not None),
+                "enrol_ceiling": (self.persona.temperament.enrol_ceiling
+                                  if self.persona.temperament else Level.STRONG),
+            } if self._strong_v2 else {}),
         )
+
+    def _record_strong_gaps(self, evidence: CommitmentEvidence, reasons: list[str]) -> None:
+        if self._strong_v2:
+            self._strong_gaps = strong_gaps(evidence)
+            reasons.append("strong_gaps:" + (",".join(self._strong_gaps) or "none"))
 
     def _negotiate(
         self,
@@ -5621,7 +5638,8 @@ class RolePlayEngine:
                 and self.scheduler.commit_permitted(r_sec)
             ):
                 self._upgrade_tried = True
-                level = grade(self._evidence(AskKind.ENROL))
+                evidence = self._evidence(AskKind.ENROL)
+                level = grade(evidence, strong_v2=self._strong_v2)
                 blocked = negotiation.strong_blocked(self.turn) if level is Level.STRONG else None
                 # The MEDIUM line itself mentions the decision maker, after the call ask.
                 if level is Level.STRONG and blocked is None and (
@@ -5631,6 +5649,7 @@ class RolePlayEngine:
                     blocked = "decider_unresolved"
                 if level is Level.STRONG and blocked is None:
                     reasons.append("commitment_upgraded")
+                    self._record_strong_gaps(evidence, reasons)
                     negotiation.note_response(self.turn, "commit:upgrade")
                     return self._plan(
                         TurnMode.SAY_ONLY, reasons, scripted=UPGRADE_LINE,
@@ -5638,6 +5657,7 @@ class RolePlayEngine:
                     )
                 reasons.append("commitment_on_record")
                 reasons.append(f"upgrade_declined:{blocked or 'grade_' + level.name.lower()}")
+                self._record_strong_gaps(evidence, reasons)
                 self._notes.append(RESOLVED_NOTE)
                 return None
             if wants is not None or seen.email_offer or seen.checkin:
@@ -5703,8 +5723,9 @@ class RolePlayEngine:
                 return self._reason_plan(reasons, ask=wants, **layers)
             self._pending_ask = None
             evidence = self._evidence(wants)
-            level = grade(evidence)
+            level = grade(evidence, strong_v2=self._strong_v2)
             reasons.append(f"ask_in_window:grade_{level.name.lower()}")
+            self._record_strong_gaps(evidence, reasons)
             if evidence.pressured:
                 reasons.append("advisor_pressured")  # an invented offer or a coercive deadline
             if evidence.thin:
@@ -5934,7 +5955,9 @@ class RolePlayEngine:
         elif level is Level.WEAK:
             text = commitment_line(level, dm, **self._weak_kwargs(call))
         else:
-            text = commitment_line(level, dm)
+            text = commitment_line(
+                level, dm, strong_v2=self._strong_v2, plan=self.tracker.payment_plan_named
+            )
         self._commitment_plan_asks[self.turn] = ask
         negotiation.note_response(self.turn, f"commit:{level.name.lower()}")
         return self._plan(
@@ -7664,6 +7687,8 @@ class RolePlayEngine:
                 entry[f"{key}_transcript_turn"] = None if turn is None else self._turn_map.get(turn)
             needs.append(entry)
         return {
+            **({"strong_gaps": list(self._strong_gaps)}
+               if self._strong_v2 and self._strong_gaps is not None else {}),
             **({"objection_themes": dict(self.scheduler.objection_themes)}
                if self.scheduler.objection_themes is not None else {}),
             **({"families_planned": list(self.scheduler.families_planned)}
