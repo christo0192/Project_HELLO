@@ -357,3 +357,7 @@ and the live UI.
 
 `call.py` imports `Rig` from `tests/test_r1_integration.py`; if PR-B or PR-4c changes that rig, fix it
 there first. The DeepSeek price constants in `llm.py` are estimates (S0-B), not the price list.
+
+The `skilled-closer` scenario uses the explicit `closer` advisor level with discovery,
+concern handling and an enrolment ask. Calibration to real move rates and scorecard
+enrolment metrics are follow-up work.

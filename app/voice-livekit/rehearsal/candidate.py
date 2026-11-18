@@ -397,13 +397,13 @@ class ScenarioAdvisor:
         await self.base.start(pickup)
 
     def _level(self) -> str:
-        from rehearsal.advisor import ADVISOR_LEVELS
+        from rehearsal.advisor import KNOWN_LEVELS
 
         for part in (self.base, getattr(self.base, "base", None)):
             level = getattr(part, "level", None)
-            if level in ADVISOR_LEVELS:
+            if level in KNOWN_LEVELS:
                 return str(level)
-        return self.scenario.level if self.scenario.level in ADVISOR_LEVELS else "average"
+        return self.scenario.level if self.scenario.level in KNOWN_LEVELS else "average"
 
     async def _base_turn(
         self, learner_text: str | None, r_sec: float, exchange: int

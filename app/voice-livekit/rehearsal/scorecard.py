@@ -344,7 +344,7 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
     ),
 )
 
-LEVELS_ORDER = ("strong", "average", "weak", "pushy", "terse")
+LEVELS_ORDER = ("strong", "average", "weak", "pushy", "terse", "closer")
 
 
 def _rate(numerator: float, denominator: float) -> float | None:

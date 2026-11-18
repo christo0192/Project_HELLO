@@ -12,10 +12,11 @@ Its design follows research/rehearsal-harness.md 4.2 and fixes the S0-B harness 
 * a call-clock hint (``CALL CLOCK 07:20 of about 19:00``) is appended to the newest learner
   line each turn, so the simulated advisor paces the call like a real one.
 
-The five levels (``ADVISOR_LEVELS``): strong (discovery first, earns the close), average
+The five default levels (``ADVISOR_LEVELS``): strong (discovery first, earns the close), average
 (product-heavy, vague close), weak (pitches at once, ignores objections, no close), pushy
 (opens with price, invents discounts and deadlines, tries to close early) and terse (one to
-five words).  The scripted offline stand-ins live in ``scripted``.
+five words). The explicit ``closer`` level asks for enrolment after addressing concerns.
+The scripted offline stand-ins live in ``scripted_advisor``.
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ from typing import Any, Mapping, Sequence
 from r1_world import AUDIENCE_ADVISOR, facts_for
 
 ADVISOR_LEVELS = ("strong", "average", "weak", "pushy", "terse")
+EXTRA_LEVELS = ("closer",)
+KNOWN_LEVELS = ADVISOR_LEVELS + EXTRA_LEVELS
 INTENTS = (
     "greet",
     "probe",
@@ -61,6 +64,20 @@ _FAREWELL_TEXT = re.compile(
 )
 
 _LEVEL_BEHAVIOUR = {
+    "closer": (
+        "You are an excellent closer. Greet briefly; discover why now, what held her back, "
+        "her schedule, money and who else decides, following up on her answers. Connect the "
+        "course to her goal. Answer every concern directly and check it landed. State the "
+        "$9000 fee when asked; $500, $1000 or $1500 discounts depend on the payment plan. "
+        "Offer a deck discount only once value is clear. Reassure with career support and mock "
+        "interviews; nobody can guarantee a job. Never pitch a webinar, free class or follow-up "
+        "call instead of answering. Invent no instalments, monthly amounts, refunds, guarantees, "
+        "deadlines or seat counts. From 13:00, once concerns are answered, ask whether she "
+        "would like to enrol today and offer the enrolment link and payment plan details now "
+        "on the call. If hesitant, ask what would help her decide, answer it, and ask once more. "
+        "Only if she still wants to consult someone else, offer a short call with them. "
+        "Keep turns under 60 words."
+    ),
     "strong": (
         "You are an excellent advisor. Start with a short friendly greeting, then do DISCOVERY "
         "first: ask why the learner is looking now, what has held them back or not worked "

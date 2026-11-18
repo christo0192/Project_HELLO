@@ -16,11 +16,12 @@ the ``ready_button`` event, ``advisor_turn``, ``end_request``, ``end_decline``, 
 ``repeat_request``, ``backchannel``, ``transition_other``, ``wrapup_other`` and ``tactic``.
 
 Selection: ``parse_scenarios("strong,early-end")``; ``synthetic`` is every scenario of this module,
-``wrapup`` both wrap-up runs, ``price`` both price runs, ``early`` both early ends.  The manual
-library (``rehearsal.manual``) adds ``manual-M01`` .. ``manual-M10``, ``manual-mix`` and the groups
-``manual-replay``, ``manual`` and ``default`` (the manual scenarios, then the synthetic ones).  The
-adaptability scenarios (``rehearsal.adapt``) add the group ``adapt``, and ``default+adapt`` is
-``default`` plus ``adapt``.  ``all`` stays the synthetic scenarios.
+``closer`` the skilled closer, ``wrapup`` both wrap-up runs, ``price`` both price runs,
+``early`` both early ends.  The manual library (``rehearsal.manual``) adds ``manual-M01`` ..
+``manual-M10``, ``manual-mix`` and the groups ``manual-replay``, ``manual`` and ``default`` (the
+manual scenarios, then the synthetic ones).  The adaptability scenarios (``rehearsal.adapt``) add
+the group ``adapt``, and ``default+adapt`` is ``default`` plus ``adapt``.  ``all`` stays the
+synthetic scenarios.
 """
 from __future__ import annotations
 
@@ -318,6 +319,15 @@ _add(
 )
 _add(
     Scenario(
+        "skilled-closer",
+        "A skilled closer: discovery first, answers every concern she raises, then asks her to "
+        "enrol and offers the link and plan details on the call.",
+        level="closer", style="strong", tags=("happy_path", "closer"),
+        transition=(READY,), wrapup=(WRAP_DONE,),
+    )
+)
+_add(
+    Scenario(
         "wrapup-question",
         "Asks two real questions in the wrap-up.",
         level="average",
@@ -363,6 +373,7 @@ GROUPS = {
     "early": ("early-end", "early-end-late"),
     "abuse": ("abuse-once",),
     "pushy": ("pushy-discounter",),
+    "closer": ("skilled-closer",),
     "button": ("button-mid-brief",),
 }
 

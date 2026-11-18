@@ -381,6 +381,38 @@ class OfflineFullInterviewTests(unittest.TestCase):
                     )
                     self.assertEqual(record["outcome"], "complete")
 
+    def test_skilled_closer_answers_before_enrolment_ask(self) -> None:
+        from rehearsal.scripted_advisor import ScriptedAdvisor
+        from r1_commitment import AskKind, detect_ask
+
+        record = self.records["skilled-closer"]
+        self.assertIsNone(record["error"])
+        self.assertEqual(record["hard_fails"], [])
+        self.assertTrue(_check(record, "reached_closing")["ok"])
+        self.assertEqual(record["outcome"], "complete")
+        exchanges = record["exchanges"]
+        close = next(i for i, ex in enumerate(exchanges) if ex["advisor"]["intent"] == "close_ask")
+        self.assertGreaterEqual(exchanges[close]["r_sec"], 780)
+        self.assertEqual(detect_ask(exchanges[close]["advisor"]["text"]).kind, AskKind.ENROL)
+        raised = set()
+        answered = set()
+        for ex in exchanges[:close]:
+            advisor_turn = ex["advisor"]
+            if advisor_turn["intent"] in ("price", "discount", "answer_objection"):
+                answered.add(advisor_turn["topic"])
+            raised.update(k[:2] for k in ScriptedAdvisor._raised(ex["learner"]["spoken"]) if k.startswith("F"))
+        self.assertLessEqual(raised, answered)
+        committed = next(i for i, ex in enumerate(exchanges)
+                         if ScriptedAdvisor._closer_commitment(ex["learner"]["spoken"]))
+        self.assertNotIn("strong_blocked:decider_unresolved",
+                         exchanges[committed]["learner"]["plan"]["reasons"])
+        later = exchanges[committed + 1:]
+        self.assertFalse(any(ex["advisor"]["intent"] == "close_ask" for ex in later))
+        self.assertTrue(any(ex["advisor"]["intent"] in ("accept_callback", "farewell")
+                            for ex in later))
+        self.assertTrue(any(ex["advisor"]["intent"] == "farewell" for ex in later))
+        self.assertLess(record["roleplay_seconds"], 1000)
+
     def test_the_roleplay_starts_only_on_a_spoken_ready_or_the_button(self) -> None:
         for name, record in self.records.items():
             pickup = _rows(record, speaker="bot", voice="learner")

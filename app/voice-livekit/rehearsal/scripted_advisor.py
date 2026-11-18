@@ -11,6 +11,12 @@ on.  The probes use phrasings the engine's genuine-probe detector accepts, which
 
 Only course facts from the deck are stated, except by the ``pushy`` level, whose job is to
 offer what the deck does not allow (the learner must not accept it).
+
+The evidence pack gives enrolled versus not-enrolled move rates: fee 0.79/0.51,
+offer 0.72/0.26, careers 0.57/0.45, flexibility 0.56/0.41, success stories
+0.37/0.25; acknowledgement lift 1.75 and decision-maker lift 2.67. Webinar
+0.21/0.38 and follow-up 0.14/0.24 are negative signals. Payment next steps
+follow a decision; US adaptation uses only r1_world terms.
 """
 from __future__ import annotations
 
@@ -18,9 +24,12 @@ import random
 import re
 from typing import Callable
 
-from rehearsal.advisor import ADVISOR_LEVELS, AdvisorTurn
+from rehearsal.advisor import KNOWN_LEVELS, AdvisorTurn
 
 ADVISOR_NAME = "Alex"
+CLOSER_DM_WORD = re.compile(
+    r"\b(husband|wife|partner|father|mother|dad|mom|spouse|parents|family)\b", re.I
+)
 DM_WORD = re.compile(r"\b(husband|wife|father|mother|partner|parents|family)\b", re.IGNORECASE)
 
 # ---------------------------------------------------------------- strong / average banks
@@ -135,6 +144,72 @@ ANSWER_STRONG = {
         "limited, so let us agree on a next step.",
     ),
 }
+REASSURE_CLOSER = (
+    "Nobody can guarantee a job, and I will not promise you one. What I can tell you is that "
+    "many of our alumni have moved into data roles, and the career support and mock interviews "
+    "are there to get you ready.",
+)
+ANSWER_CLOSER = {
+    "F1": (
+        "The fee is $9,000. Depending on the payment plan you choose, there is a discount "
+        "of $500, $1,000 or $1,500 off that.",
+        "The listed fee is $9,000. The payment plan you choose determines whether the "
+        "discount is $500, $1,000 or $1,500.",
+    ),
+    "F1b": (
+        "The course includes personalised mentorship and career support. On the plan that "
+        "fits you best I can take $500 off, which brings it to $8,500. "
+        "Does that make it easier for you?",
+        "That is honestly the best I can do; the payment plan details will show you the options.",
+        "The payment plan details will show you the options; that is the best I can offer.",
+    ),
+    "F2": ANSWER_STRONG["F2"],
+    "F2b": ANSWER_STRONG["F2b"],
+    "F3": ANSWER_STRONG["F3"],
+    "F3b": REASSURE_CLOSER,
+    "F4": ("I understand this is a big decision.",),
+    "F4dm": (
+        "That makes sense, it is a decision for both of you. I am happy to explain anything "
+        "your {dm} would want to know. What do you think will matter most to your {dm}?",
+    ),
+}
+EARLY_STALL_CLOSER = (
+    "I understand, it is a big decision and there is no rush. What would help you feel "
+    "ready to decide?",
+)
+TOTAL_PRICE_CLOSER = (
+    "No, the full fee is $9,000, and the discount comes off that, so depending on the "
+    "payment plan you would pay between $7,500 and $8,500.",
+)
+MONEY_PATH_CLOSER = (
+    "The discount depends on the payment plan you choose. I can send you the payment plan "
+    "details so you can see the options.",
+)
+PITCH_CLOSER = (
+    "For your goal of moving into data science, the course offers structured projects, "
+    "mentorship and career support. How does that fit what you are looking for?",
+)
+CALLBACK_CLOSER = ("Would a short call with your {dm} help answer their questions?",)
+QUESTION_CLOSER = {
+    "week": ANSWER_STRONG["F2"],
+    "money": MONEY_PATH_CLOSER,
+    "curriculum": ("The curriculum covers Python, SQL, machine learning, deep learning "
+                   "and a capstone project.",),
+    "audience": ("The course suits career switchers, current data professionals, recent "
+                 "graduates, research scholars and tech enthusiasts.",),
+    "support": ("The course includes personalised mentorship and career support.",),
+    "results": REASSURE_CLOSER,
+}
+CLOSE_CLOSER = (
+    "It sounds like this fits what you are after. Would you like to enrol today? I can send "
+    "you the enrolment link and the payment plan details right now, while we are on the call.",
+)
+DECIDE_CLOSER = ("I understand. What would help you decide?",)
+ACCEPT_ENROL_CLOSER = (
+    "That is great to hear. I will send the enrolment link and the payment plan details "
+    "right after this call.",
+)
+
 ANSWER_AVERAGE = {
     "F3": (
         "Free videos are fine, but our course is much more complete, with mentors and "
@@ -225,7 +300,7 @@ class ScriptedAdvisor:
     """A deterministic advisor of one level; the learner's last line steers its answers."""
 
     def __init__(self, level: str, seed: str) -> None:
-        if level not in ADVISOR_LEVELS:
+        if level not in KNOWN_LEVELS:
             raise ValueError(f"unknown advisor level {level!r}")
         self.level = level
         self._rng = random.Random(f"scripted-advisor:{seed}")
@@ -242,6 +317,16 @@ class ScriptedAdvisor:
         self._post_turns = 0
         self._turn = 0
         self._mid_call = False
+        self._closer_pending: list[str] = []
+        self._closer_raised: set[str] = set()
+        self._closer_money = False
+        self._closer_reassured = False
+        self._closer_waiting = False
+        self._closer_retry = False
+        self._closer_callback = False
+        self._closer_last = ""
+        self._closer_dm_mentioned = 0
+        self._closer_dm_handled = 0
 
     # ----------------------------------------------------------------- protocol
     async def start(self, learner_pickup: str) -> None:
@@ -263,6 +348,7 @@ class ScriptedAdvisor:
             self.dm = found.group(1).lower()
         decide: Callable[[str, float], AdvisorTurn] = {
             "strong": self._strong,
+            "closer": self._closer,
             "average": self._average,
             "weak": self._weak,
             "pushy": self._pushy,
@@ -270,6 +356,10 @@ class ScriptedAdvisor:
         }[self.level]
         turn = decide(text, r_sec)
         turn.text = turn.text.format(name=self.name, dm=self.dm)
+        if self.level == "closer":
+            if turn.text == self._closer_last:
+                turn.text = "Just to be clear: " + turn.text  # never the same line twice running
+            self._closer_last = turn.text
         return turn
 
     # ------------------------------------------------------------------ helpers
@@ -399,6 +489,159 @@ class ScriptedAdvisor:
         if r_sec >= 600 and not self._urgency_done:
             self._urgency_done = True
             return AdvisorTurn(self._take("urgency", URGENCY), "urgency", "")
+        if self._turn % 4 == 0:
+            return AdvisorTurn(self._take("checkin", CHECKIN), "other", "")
+        return AdvisorTurn(self._take("value", VALUE), "pitch", "")
+
+    @staticmethod
+    def _closer_commitment(text: str) -> str | None:
+        t = text.lower()
+        if re.search(r"book a call[^.?!]*,?\s*so we can decide", t):
+            return "call"
+        if re.search(r"enrol+ment link|pay the deposit", t):
+            return "enrol"
+        if re.search(r"let me think about it", t) and re.search(
+            r"email|call me back|get back to you", t
+        ):
+            return "weak"
+        return None
+
+    @staticmethod
+    def _closer_question(text: str) -> str | None:
+        if "?" not in text:
+            return None
+        t = text.lower()
+        for key, pattern in (
+            ("total", r"what i[\x27?]?d pay in total|so it would be|is that the total"),
+            ("money", r"payment.*(?:spread|once|instal|plan)|instal|payment plan|"
+             r"paying for it|split (?:it|the payment)"),
+            ("week", r"typical week|classes|keep(?:ing)? up|pace of|full[- ]time job"),
+            ("curriculum", r"first thing|curriculum|what would i learn"),
+            ("audience", r"people like me|who else|what kind of people|"
+             r"who (?:usually )?gets the most|is it for someone like me"),
+            ("support", r"help people along|mentor|support"),
+            ("results", r"halfway|how do people feel|results"),
+        ):
+            if re.search(pattern, t):
+                return key
+        return None
+
+    def _closer_dm_answer(self) -> AdvisorTurn:
+        self._closer_dm_handled = self._turn
+        self._answered["F4dm"] = self._answered.get("F4dm", 0) + 1
+        return self._turn_for(ANSWER_CLOSER, "F4dm", "answer_objection", "F4")
+
+    def _closer(self, text: str, r_sec: float) -> AdvisorTurn:
+        if self._turn == 1:
+            return AdvisorTurn(self._take("greet", GREET), "greet", "")
+        if self._post_commit is None:
+            self._post_commit = self._closer_commitment(text)
+            if self._post_commit:
+                if self._post_commit == "call":
+                    return AdvisorTurn(self._take("accept", ACCEPT_CALLBACK), "accept_callback", "")
+                bank = ACCEPT_ENROL_CLOSER if self._post_commit == "enrol" else ACCEPT_WEAK
+                return AdvisorTurn(self._take("accept_closer", bank), "other", "")
+        if self._post_commit:
+            if r_sec >= CLOSE_CALL_SEC:
+                return AdvisorTurn(self._take("farewell", FAREWELL), "farewell", "")
+            return AdvisorTurn(self._take("next", NEXT_STEPS), "other", "")
+
+        dm = CLOSER_DM_WORD.search(text)
+        if dm:
+            self.dm = dm.group(1).lower()
+            self._closer_dm_mentioned = self._turn
+        keys = [k for k in self._raised(text) if k in ANSWER_CLOSER]
+        question = self._closer_question(text)
+        if question == "total":
+            self._closer_money = True
+            return AdvisorTurn(self._take("total", TOTAL_PRICE_CLOSER), "price", "F1")
+        if question == "money":
+            keys = [k for k in keys if k != "F1b"]
+        if re.search(r"\b(?:no flexibility|flexibility at all)\b", text, re.I):
+            keys = [k for k in keys if k != "F1"]
+            if "F1b" not in keys:
+                keys.append("F1b")
+        if re.search(r"\b(?:price|fee|cost|total)\b", text, re.I) and not any(
+            k.startswith("F1") for k in keys
+        ) and question != "money":
+            keys.append("F1")
+        self._closer_raised.update(k[:2] for k in keys)
+        stalled = keys or dm or re.search(
+            r"\b(?:hesitat\w*|not sure|unsure|need (?:more )?time|think about|"
+            r"need to think|hold off|not yet|not ready|decide later)\b", text, re.I
+        )
+        if self._closer_waiting and stalled:
+            self._closer_waiting = False
+            self._closer_retry = True
+            self._closer_callback = self._close_asked >= 2 and "F4dm" in keys
+            self._closer_pending.extend(k for k in keys if k not in ("F4", "F4dm"))
+            if dm:
+                return self._closer_dm_answer()
+            return AdvisorTurn(self._take("decide", DECIDE_CLOSER), "other", "")
+        for key in keys:
+            if key not in self._closer_pending:
+                self._closer_pending.append(key)
+        if self._closer_pending:
+            key = self._closer_pending.pop(0)
+            count = self._answered.get(key, 0)
+            self._answered[key] = count + 1
+            if key.startswith("F1"):
+                self._closer_money = True
+            if key == "F3b":
+                self._closer_reassured = True
+            intent, topic = self._OBJECTION_INTENT[key]
+            if key == "F4dm":
+                self._closer_dm_handled = self._turn
+                intent = "answer_objection"
+            if key == "F4" and not self._close_asked:
+                return AdvisorTurn(self._take("early_stall", EARLY_STALL_CLOSER), intent, topic)
+            if key == "F1b":
+                index = min(count, 1 + (count - 1) % 2) if count else 0
+                return AdvisorTurn(ANSWER_CLOSER[key][index], intent, topic)
+            return self._turn_for(ANSWER_CLOSER, key, intent, topic)
+        if question:
+            intent, topic = (("answer_objection", "F2") if question == "week" else
+                             ("price", "F1") if question == "money" else ("pitch", ""))
+            if question == "money":
+                self._closer_money = True
+            return AdvisorTurn(self._take("question:" + question, QUESTION_CLOSER[question]),
+                               intent, topic)
+        if self._closer_callback:
+            self._closer_callback = False
+            self._closer_retry = False
+            return AdvisorTurn(self._take("callback", CALLBACK_CLOSER), "callback", "F4")
+        if self._closer_retry and self._close_asked < 2 and r_sec >= 780:
+            if self._closer_dm_mentioned > self._closer_dm_handled:
+                return self._closer_dm_answer()
+            self._closer_retry = False
+            self._closer_waiting = True
+            self._close_asked += 1
+            return AdvisorTurn(self._take("close", CLOSE_CLOSER), "close_ask", "")
+        if self._discovery < len(self._DISCOVERY):
+            kind, topic = self._DISCOVERY[self._discovery]
+            self._discovery += 1
+            bank = PROBES if kind == "probe" else FOLLOWUPS
+            return AdvisorTurn(self._take(f"{kind}:{topic}", bank[topic]), kind, topic)
+        if not self._pitched:
+            self._pitched = 1
+            return AdvisorTurn(self._take("pitch", PITCH_CLOSER), "pitch", "")
+        answered = {key[:2] for key in self._answered}
+        if (r_sec >= 780 and self._closer_raised <= answered
+                and (self._closer_raised or r_sec >= 900)):
+            if not self._closer_money:
+                self._closer_money = True
+                return AdvisorTurn(self._take("money", MONEY_PATH_CLOSER), "price", "F1")
+            if not self._closer_reassured:
+                self._closer_reassured = True
+                return AdvisorTurn(
+                    self._take("reassure", REASSURE_CLOSER), "answer_objection", "F3"
+                )
+            if self._close_asked == 0:
+                if self._closer_dm_mentioned > self._closer_dm_handled:
+                    return self._closer_dm_answer()
+                self._closer_waiting = True
+                self._close_asked += 1
+                return AdvisorTurn(self._take("close", CLOSE_CLOSER), "close_ask", "")
         if self._turn % 4 == 0:
             return AdvisorTurn(self._take("checkin", CHECKIN), "other", "")
         return AdvisorTurn(self._take("value", VALUE), "pitch", "")
