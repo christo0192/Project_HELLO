@@ -10,6 +10,8 @@
  *   - which discount belongs to which payment plan (the guide does not state it);
  *   - the learner's own budget or price anchor, their needs, their timeline or who decides.
  * The goal on the card is the ADVISOR's (the candidate's), never the learner's.
+ * The default matches the spoken brief and the rubric's credit for a dated next step.
+ * Set VITE_R1_ENROL_GOAL to 0 to restore the previous goal.
  */
 
 export const R1_SCENARIO_FACTS = Object.freeze({
@@ -32,6 +34,16 @@ export function discountLadderText(discounts: readonly number[] = R1_SCENARIO_FA
   return `${amounts.slice(0, -1).join(', ')} or ${amounts[amounts.length - 1]}`;
 }
 
+export const R1_GOAL_ENROL =
+  'Your goal: understand their needs, handle their concerns, and help them decide to enrol. '
+  + 'If they are not ready today, agree a clear next step.';
+export const R1_GOAL_NEXT_STEP =
+  'Your goal: understand their needs, handle their concerns, and agree a clear next step.';
+
+export function r1ScenarioGoal(flag: string | undefined): string {
+  return flag?.trim() === '0' ? R1_GOAL_NEXT_STEP : R1_GOAL_ENROL;
+}
+
 export const R1_SCENARIO_COPY = Object.freeze({
   heading: 'Your role-play',
   /** Shown until the interviewer has published the learner's name. */
@@ -45,8 +57,7 @@ export const R1_SCENARIO_COPY = Object.freeze({
   price: formatUsd(R1_SCENARIO_FACTS.listPriceUsd),
   duration: `${R1_SCENARIO_FACTS.durationMonths} months`,
   discounts: `${discountLadderText()}, depending on the payment plan`,
-  goal:
-    'Your goal: understand their needs, handle their concerns, and agree a clear next step.',
+  goal: r1ScenarioGoal(import.meta.env.VITE_R1_ENROL_GOAL),
   inCharacter:
     'The interviewer stays in character until they say, “Let’s pause the role-play here.”',
 });

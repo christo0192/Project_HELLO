@@ -40,7 +40,8 @@ describe('the scenario card', () => {
       'Filled in a form about the Data Science course. You are the Program Advisor, calling back.',
     );
     expect(region).toHaveTextContent(
-      'Your goal: understand their needs, handle their concerns, and agree a clear next step.',
+      'Your goal: understand their needs, handle their concerns, and help them decide to enrol. '
+      + 'If they are not ready today, agree a clear next step.',
     );
     expect(region).toHaveTextContent(
       'The interviewer stays in character until they say, “Let’s pause the role-play here.”',

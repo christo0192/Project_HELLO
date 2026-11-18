@@ -1171,7 +1171,7 @@ test.describe('scenario card, role-play clock and "I\'m ready"', () => {
     await expect(card.getByText('6 months')).toBeVisible();
     await expect(card.getByText('$500, $1,000 or $1,500, depending on the payment plan')).toBeVisible();
     await expect(card).toContainText('Data Science course');
-    await expect(card).toContainText('understand their needs, handle their concerns, and agree a clear next step');
+    await expect(card).toContainText('understand their needs, handle their concerns, and help them decide to enrol');
     await expect(card).toContainText('stays in character');
     // What the candidate is assessed on finding out is not on the card.
     await expect(card).not.toContainText(/7,?000|budget|per month|decision|upfront|installment/i);
