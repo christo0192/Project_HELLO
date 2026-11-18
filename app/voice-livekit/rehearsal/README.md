@@ -362,3 +362,5 @@ there first. The DeepSeek price constants in `llm.py` are estimates (S0-B), not 
 The `skilled-closer` scenario uses the explicit `closer` advisor level with discovery,
 concern handling and an enrolment ask. Calibration to real move rates and scorecard
 enrolment metrics are follow-up work.
+
+`REHEARSAL_CLOSER_REASSURANCE=0` restores the previous closer guidance.

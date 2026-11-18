@@ -1305,6 +1305,13 @@ FLAG_MOVE_CONDITION = "R1_MOVE_CONDITION"
 # M033 A10: allow deciding today in the cached persona card.
 FLAG_PERSONA_TIMELINE_V3 = "R1_PERSONA_TIMELINE_V3"
 
+# PROOF-1: control perk history.
+FLAG_PERK_HISTORY = "R1_PERK_HISTORY"
+# PROOF-1: control discount read v3.
+FLAG_DISCOUNT_READ_V3 = "R1_DISCOUNT_READ_V3"
+# PROOF-1: control concession condition.
+FLAG_CONCESSION_CONDITION = "R1_CONCESSION_CONDITION"
+
 # M033 A10: at most two different conditions may be planned in a call.
 CONDITION_MAX_PER_CALL = 2
 
@@ -1459,6 +1466,9 @@ _FLAG_READS = {
     FLAG_STRONG_EVIDENCE_V2: lambda: os.getenv("R1_STRONG_EVIDENCE_V2"),
     FLAG_BUYING_SIGNALS: lambda: os.getenv("R1_BUYING_SIGNALS"),
     FLAG_MOVE_CONDITION: lambda: os.getenv("R1_MOVE_CONDITION"),
+    FLAG_PERK_HISTORY: lambda: os.getenv("R1_PERK_HISTORY"),
+    FLAG_DISCOUNT_READ_V3: lambda: os.getenv("R1_DISCOUNT_READ_V3"),
+    FLAG_CONCESSION_CONDITION: lambda: os.getenv("R1_CONCESSION_CONDITION"),
     FLAG_PERSONA_TIMELINE_V3: lambda: os.getenv("R1_PERSONA_TIMELINE_V3"),
 }
 
@@ -1776,6 +1786,9 @@ class RolePlayEngine:
         self._commit_upgrade = flag_on(FLAG_COMMIT_UPGRADE)
         self._strong_v2 = flag_on(FLAG_STRONG_EVIDENCE_V2)
         self._move_condition = flag_on(FLAG_MOVE_CONDITION)
+        self._perk_history = flag_on(FLAG_PERK_HISTORY)
+        self._discount_read_v3 = flag_on(FLAG_DISCOUNT_READ_V3)
+        self._concession_condition = flag_on(FLAG_CONCESSION_CONDITION)
         self._condition_planned: list[dict[str, Any]] = []
         self._condition_acknowledged: set[str] = set()
         self._buying_signals = flag_on(FLAG_BUYING_SIGNALS)
@@ -1795,7 +1808,8 @@ class RolePlayEngine:
         )
         self.tracker = CoverageTracker(
             persona, seed=self.seed, invented_v2=self._invented_v2,
-            discipline_v2=self._discipline_v2,
+            discipline_v2=self._discipline_v2, perk_history=self._perk_history,
+            discount_read_v3=self._discount_read_v3,
         )
         self.tracker.families_planned = families
         self.ledger = GuardLedger()

@@ -4351,3 +4351,23 @@ class ConditionAcknowledgementTests(unittest.TestCase):
             result = guard_text(text, ctx())
             self.assertEqual(result.text, text)
             self.assertFalse(result.hits)
+
+
+class ProofOneConcessionTests(unittest.TestCase):
+    def test_conditions_and_questions_are_not_concessions(self):
+        for text in (
+            "I can make time if I know it is worth it.",
+            "How would I know it is worth it for me?",
+            "I can proceed if I'm sure it is worth it.",
+            "I would need to see it is worth it.",
+        ):
+            self.assertFalse(has_concession(text), text)
+        for text in ("I know it is worth it.", "You have convinced me.",
+                     "That settles it."):
+            self.assertTrue(has_concession(text), text)
+
+    def test_condition_flag_off(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"R1_CONCESSION_CONDITION": "0"}):
+            self.assertTrue(has_concession("I can make time if I know it is worth it."))

@@ -3960,3 +3960,17 @@ class DiagnosisFourDigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProofOneCloserTests(unittest.TestCase):
+    def test_closer_reassurance_flag(self):
+        from unittest import mock
+        from rehearsal import advisor
+        with mock.patch.dict("os.environ", {"REHEARSAL_CLOSER_REASSURANCE": "1"}):
+            prompt = advisor.advisor_system_prompt("closer").lower()
+        self.assertIn("track record of alumni success", prompt)
+        self.assertIn("success stories", prompt)
+        self.assertIn("callback before 13:00", prompt)
+        with mock.patch.dict("os.environ", {"REHEARSAL_CLOSER_REASSURANCE": "0"}):
+            old = advisor.advisor_system_prompt("closer").lower()
+        self.assertNotIn("callback before 13:00", old)

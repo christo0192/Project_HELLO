@@ -43,6 +43,7 @@ No candidate text is stored.  Every log value is a turn index, a count or a bool
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import re
 from dataclasses import dataclass, field
@@ -772,7 +773,7 @@ def _declined(folded: str, match: re.Match[str], *, verb_in_match: bool) -> bool
     return bool(_ASK_ECHO.search(before)) and has_refusal(folded[match.end() :])
 
 
-def parse_discounts(text: object) -> list[DiscountMention]:
+def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMention]:
     """Dollar discounts the candidate OFFERS, parsed deterministically.
 
     Covers "$500 off", "a discount of $1,000", "discounts of $500, $1000 and $1500",
@@ -785,8 +786,13 @@ def parse_discounts(text: object) -> list[DiscountMention]:
     does not matter how speech-to-text writes a number.  A refusal is not an offer: see
     ``_declined``.
     """
+    if v3 is None:
+        v3 = os.getenv("R1_DISCOUNT_READ_V3", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
+    sentences = split_sentences(text)
     mentions: list[DiscountMention] = []
-    for index, sentence in enumerate(split_sentences(text)):
+    for index, sentence in enumerate(sentences):
         folded = canonical_amounts(sentence)
         amounts: list[int] = []
         for pattern in (_DISC_BEFORE, _DISC_VERB, _NET_OFFER):
@@ -804,12 +810,31 @@ def parse_discounts(text: object) -> list[DiscountMention]:
         for match in _DISC_LIST.finditer(folded):
             if not _declined(folded, match, verb_in_match=False):
                 amounts.extend(dollar_amounts(match.group(1)))
+        if v3:
+            mixed_list = re.compile(
+                r"\b(?:discounts?|reductions?|rebates?)\s+(?:of|worth)\s+"
+                r"((?:\$?\d[\d,]*\s*(?:,|and|or)\s*)+\$\s*\d[\d,]*)",
+                re.IGNORECASE,
+            )
+            for match in mixed_list.finditer(folded):
+                if not _declined(folded, match, verb_in_match=False):
+                    amounts.extend(int(n.replace(",", "")) for n in
+                                   re.findall(r"\d+(?:,\d{3})*", match.group(1)))
         for match in _DISC_PERCENT.finditer(folded):
             if not _declined(folded, match, verb_in_match=False):
                 amounts.append(int(round(PRICE_USD * float(match.group(1)) / 100)))
         if not amounts:
             continue
         conditional = bool(_CONDITIONAL.search(folded))
+        if v3 and not conditional and index + 1 < len(sentences):
+            following = fold(sentences[index + 1]).lower()
+            conditional = bool(
+                re.search(r"\b(?:depending on|based on|payment plan)\b", following)
+                or (re.match(r"\s*(?:that|this|it|which)\b", following) and re.search(
+                    r"\b(?:applies to|is for|is on|comes with|goes with|is tied to|"
+                    r"depends on)\b", following
+                ))
+            )
         for value in sorted(set(amounts)):
             mentions.append(DiscountMention(value, conditional, index))
     return mentions
@@ -830,7 +855,10 @@ def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
     return frozenset(levers), coercive
 
 
-def invented_offer_in(text: object, *, v2: bool = False) -> bool:
+def invented_offer_in(
+    text: object, *, v2: bool = False, perk_history: bool | None = None,
+    discount_v3: bool | None = None,
+) -> bool:
     """A free extra, a guarantee, or a discount outside the deck's $500/$1000/$1500 set.
 
     Polarity-aware: "I can't guarantee a job", "Nobody can guarantee placement" and "We
@@ -838,6 +866,10 @@ def invented_offer_in(text: object, *, v2: bool = False) -> bool:
     with a negator earlier in its clause is ignored.  Flagging them would cap a candidate
     for saying exactly what the deck wants said (S0-B: 24% of advisor turns had one).
     """
+    if perk_history is None:
+        perk_history = os.getenv("R1_PERK_HISTORY", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
     for sentence in split_sentences(text):
         folded = fold(sentence)
         if not v2:
@@ -851,8 +883,26 @@ def invented_offer_in(text: object, *, v2: bool = False) -> bool:
             for match in _FREE_PERK.finditer(folded):
                 before = clause_before(folded, match.start())
                 after = clause_after(folded, match.end())
+                offer_before = before
+                if perk_history:
+                    offer_before = re.sub(
+                        r"(?<!\w)given\b", lambda m: m.group() if re.search(
+                            r"\b(?:have|has|had|are|is|was|were|be|been|get|got)\s+$",
+                            before[:m.start()], re.IGNORECASE) else "", before,
+                        flags=re.IGNORECASE,
+                    )
+                    history = re.search(
+                        r"\byou\s+(?:quit|dropped|left|stopped|tried|took|did|finished|"
+                        r"started|abandoned|gave up on|used)\s+(?:the|that|a|your)\s+$",
+                        before, re.IGNORECASE,
+                    ) or re.search(
+                        r"^\s+you\s+(?:took|tried|did|quit|mentioned|used)\s+"
+                        r"(?:before|earlier|last time|already)\b", after, re.IGNORECASE,
+                    )
+                    if history:
+                        continue
                 if (not negated_before(folded, match.start())
-                        and (_PERK_OFFER.search(before) or _PERK_OFFER_AFTER.search(after))
+                        and (_PERK_OFFER.search(offer_before) or _PERK_OFFER_AFTER.search(after))
                         and not _PERK_COMPARISON.search(before)
                         and not _PERK_QUALIFIER_BEFORE.search(before)
                         and not _PERK_QUALIFIER_AFTER.search(after)
@@ -862,7 +912,7 @@ def invented_offer_in(text: object, *, v2: bool = False) -> bool:
         return True
     return any(
         mention.usd not in DISCOUNTS_USD or mention.usd > DISCOUNT_CAP_USD
-        for mention in parse_discounts(text)
+        for mention in parse_discounts(text, v3=discount_v3)
     )
 
 
@@ -2058,12 +2108,15 @@ class CoverageTracker:
 
     def __init__(
         self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False,
-        discipline_v2: bool = False,
+        discipline_v2: bool = False, perk_history: bool = True,
+        discount_read_v3: bool = True,
     ) -> None:
         self.persona = persona
         self.seed = seed
         self.invented_v2 = invented_v2
         self.discipline_v2 = discipline_v2
+        self.perk_history = perk_history
+        self.discount_read_v3 = discount_read_v3
         self.judge_invented_turns = 0
         self._rule_invented = False
         self.gate = DisclosureGate(persona)
@@ -2093,7 +2146,9 @@ class CoverageTracker:
         update = self.gate.observe_candidate_turn(text, self.turn)
         for sentence in split_sentences(text):
             canonical = canonical_amounts(expand_shorthand_amounts(sentence))
-            discount_amounts = {mention.usd for mention in parse_discounts(sentence)}
+            discount_amounts = {
+                mention.usd for mention in parse_discounts(sentence, v3=self.discount_read_v3)
+            }
             self.fee_named |= any(
                 amount in {PRICE_USD, *(PRICE_USD - d for d in DISCOUNTS_USD)}
                 and amount not in discount_amounts
@@ -2113,7 +2168,7 @@ class CoverageTracker:
         self.guarantee_claimed |= claims_guarantee(text)
         self._turn_had_question[self.turn] = update.question
         value_index = _first_value_sentence(text)
-        discounts = parse_discounts(text)
+        discounts = parse_discounts(text, v3=self.discount_read_v3)
         value_seen_earlier = self.first_value_turn is not None
         for mention in discounts:
             # A sentence that makes the offer cannot be its own value statement.
@@ -2134,7 +2189,10 @@ class CoverageTracker:
         levers, coercive = urgency_levers(text)
         self.levers |= levers
         self.coercive_urgency = self.coercive_urgency or coercive
-        invented = invented_offer_in(text, v2=self.invented_v2)
+        invented = invented_offer_in(
+            text, v2=self.invented_v2, perk_history=self.perk_history,
+            discount_v3=self.discount_read_v3,
+        )
         if self.invented_v2 and invented:
             self._rule_invented = True
         self.invented_offer = self.invented_offer or invented

@@ -2562,3 +2562,43 @@ class StrongEvidenceReadersTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProofOneTrackerTests(unittest.TestCase):
+    def test_history_and_offer_context(self):
+        for text in (
+            "Given you dropped that free course, what would help this time?",
+            "You tried a free class before; what changed?",
+            "The free session you used earlier was different.",
+        ):
+            self.assertFalse(invented_offer_in(text, v2=True), text)
+        for text in (
+            "We have given you a free laptop.",
+            "You get free mentoring for a year if you enrol now.",
+            "We are including a free month for you.",
+        ):
+            self.assertTrue(invented_offer_in(text, v2=True), text)
+
+    def test_discount_list_and_next_sentence(self):
+        mentions = parse_discounts(
+            "Discounts of 500, 1000 or 1500 dollars depend on the plan."
+        )
+        self.assertEqual([m.usd for m in mentions], [500, 1000, 1500])
+        self.assertTrue(all(m.conditional for m in mentions))
+        listed = parse_discounts("Discounts of 500, 1000, and 1500 dollars depend on the plan.")
+        self.assertEqual([m.usd for m in listed], [500, 1000, 1500])
+        mentions = parse_discounts("There is $1500 off. That applies to the upfront plan.")
+        self.assertTrue(mentions[0].conditional)
+        self.assertEqual(parse_discounts("Discounts for 2 or 3 people."), [])
+
+    def test_proof_one_flags_off(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"R1_PERK_HISTORY": "0", "R1_DISCOUNT_READ_V3": "0"}):
+            self.assertTrue(invented_offer_in(
+                "Given you dropped that free course, what changed?", v2=True
+            ))
+            self.assertEqual(parse_discounts("Discounts of 500 or 1500 dollars."), [])
+            self.assertFalse(parse_discounts(
+                "There is $1500 off. That applies to the upfront plan."
+            )[0].conditional)

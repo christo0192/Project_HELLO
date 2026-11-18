@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from r1_world import AUDIENCE_ADVISOR, facts_for
+from rehearsal.flags import CLOSER_REASSURANCE, on
 
 ADVISOR_LEVELS = ("strong", "average", "weak", "pushy", "terse")
 EXTRA_LEVELS = ("closer",)
@@ -280,6 +281,20 @@ def deck_brief() -> str:
     return "\n".join(f"- {fact.text}" for fact in facts_for(AUDIENCE_ADVISOR))
 
 
+def _closer_behaviour(level: str) -> str:
+    behaviour = _LEVEL_BEHAVIOUR[level]
+    if level == "closer" and on(CLOSER_REASSURANCE):
+        behaviour = behaviour.replace(
+            "Reassure with career support and mock interviews; nobody can guarantee a job.",
+            "Reassure with the deck's proven track record of alumni success and success stories, "
+            "plus career support and mock interviews. Never quote placement rates, salaries or "
+            "numbers, and nobody can guarantee a job. Do not propose a call or callback before "
+            "13:00 unless she asks. When she names what would help her decide, answer exactly "
+            "that and then ask her to enrol once more.",
+        )
+    return behaviour
+
+
 def advisor_system_prompt(level: str) -> str:
     if level not in _LEVEL_BEHAVIOUR:
         raise ValueError(f"unknown advisor level {level!r}")
@@ -293,7 +308,7 @@ def advisor_system_prompt(level: str) -> str:
         "Write ONLY your own next spoken turn, as plain spoken English with no stage "
         "directions, and never speak as the learner.\n"
         f"What you know about the course (use only this):\n{deck_brief()}\n"
-        f"How you behave: {_LEVEL_BEHAVIOUR[level]}\n"
+        f"How you behave: {_closer_behaviour(level)}\n"
         f"The call lasts about {CALL_TARGET_SEC // 60} minutes: never say goodbye or wrap up "
         f"before {_clock_text(EARLIEST_FAREWELL_SEC)} on the call clock.\n"
         "Reply with ONE JSON object and nothing else, with exactly these keys: "
