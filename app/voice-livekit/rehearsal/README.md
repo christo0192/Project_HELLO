@@ -288,6 +288,7 @@ on one call is a readiness reason: run `--calls` at twice the scenario count or 
 evening session with a mentor" and "catch up over the phone" are next-step asks that earn a commitment;
 the qualifier is a closed list, so "a smart call", "another sales call", "your Monday meeting" and
 "every morning session is recorded" are not).
+`REHEARSAL_NEXT_STEP_PROCEED` (questions or offers to proceed count as next-step asks; OFF restores the previous vocabulary).
 
 Two rounds scored by different rubrics are not comparable.  Judge saved records again, flow judge
 only (no candidate, Christy or learner call; the records are not written), under the current rubric:

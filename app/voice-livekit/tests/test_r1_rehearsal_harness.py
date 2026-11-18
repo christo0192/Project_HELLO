@@ -2505,6 +2505,43 @@ class IterationTwoHarnessTests(unittest.TestCase):
             self.assertFalse(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
         self.assertTrue(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
 
+    def test_proceed_asks_earn_a_commitment(self) -> None:
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        plan = {"resolves": True, "commitment_level": "MEDIUM", "delivered_commitment": True}
+        for text in (
+            "Let's proceed.",
+            "Shall we proceed?",
+            "Can we proceed with the enrolment?",
+            "I can proceed with your registration.",
+            "Would you be comfortable proceeding?",
+            "We have discussed your goals. The schedule fits your needs. "
+            "So if the reduced fee works for you, let's proceed, because the batch closes soon.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(metrics.advisor_asked_next_step({"intent": "discount", "text": text}))
+                exchanges = [
+                    exchange(1, 800, text, "discount"),
+                    exchange(2, 820, "Great.", "other", spoken="Okay, let's do that.", plan=plan),
+                ]
+                found = metrics.commitment_metrics(exchanges, admin)
+                self.assertTrue(found["commitment_earned"])
+                self.assertNotIn("unearned_commitment", metrics.hard_fails(found))
+
+    def test_proceed_facts_are_not_asks(self) -> None:
+        for text in (
+            "The batch will proceed next week.",
+            "Most students proceed to the advanced track later.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(metrics.advisor_asked_next_step({"intent": "discount", "text": text}))
+
+    def test_proceed_flag_off_restores_previous_result(self) -> None:
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"REHEARSAL_NEXT_STEP_PROCEED": "0"}):
+            self.assertFalse(metrics.advisor_asked_next_step({"intent": "discount", "text": "Let's proceed."}))
+
     def test_the_advisor_tag_alone_is_still_enough(self) -> None:
         self.assertTrue(metrics.advisor_asked_next_step({"intent": "close_ask", "text": "Okay."}))
         self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": "Okay."}))

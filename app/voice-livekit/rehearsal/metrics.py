@@ -1025,6 +1025,7 @@ _NEXT_STEP = re.compile(
     r"payment link|enrol+ment link|get you started|move forward|next step)\b",
     re.IGNORECASE,
 )
+_NEXT_STEP_PROCEED = re.compile(r"\bproceed(?:ing)?\b", re.IGNORECASE)
 # D5-HF-UNEARNED2 (``REHEARSAL_NEXT_STEP_V2``): more ways to ask for the next step.  "Shall I pencil
 # you in for a weekend slot?" and "shall I pencil in a weekend call with your husband?" earned a
 # commitment that the words above missed.  D5R-NS2-WILDCARD: the qualifier is a closed list (a free
@@ -1084,6 +1085,8 @@ def advisor_asked_next_step(advisor: Mapping[str, Any]) -> bool:
     for sentence in split_sentences(str(advisor.get("text") or "")):
         named = _NEXT_STEP.search(sentence) is not None or (
             flags.on(flags.NEXT_STEP_V2) and _next_step_v2(sentence)
+        ) or (
+            flags.on(flags.NEXT_STEP_PROCEED) and _NEXT_STEP_PROCEED.search(sentence) is not None
         )
         if named and ("?" in sentence or _OFFERING_VOICE.search(sentence) is not None):
             return True
