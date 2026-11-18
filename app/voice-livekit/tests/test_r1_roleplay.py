@@ -15228,6 +15228,11 @@ class CloseWindowEvidenceIntegrationTests(unittest.TestCase):
 
 
 class CommitUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"R1_UPGRADE_V2": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     BOOK = "Shall we set up a call with your husband on Thursday at 7 PM?"
     ENROL = "Would you like to go ahead and enrol today? I can send you the enrolment link."
 
@@ -15868,3 +15873,151 @@ class MoveConditionEngineTests(unittest.TestCase):
         self.assertIn(r1_roleplay.CONDITION_MET_NOTE, reply.reminder or "")
         again = session.say("What else are you considering?", r + 100)
         self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, again.reminder or "")
+
+
+class ProofUpgradeV2Tests(unittest.TestCase):
+    BOOK = CommitUpgradeTests.BOOK
+    ENROL = CommitUpgradeTests.ENROL
+    booked = CommitUpgradeTests.booked
+    def test_next_turn_does_not_spend_attempt(self):
+        s, r = self.booked(handle=False)
+        plan = s.say(self.ENROL, r)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in plan.reasons))
+        self.assertFalse(s.eng._upgrade_tried)
+
+    def test_second_attempt_and_limit(self):
+        s, r = self.booked(handle=False)
+        s.say("I understand your concern.", r)
+        first = s.say(self.ENROL, r + 5)
+        self.assertTrue(any(x.startswith("upgrade_declined:") for x in first.reasons))
+        second = s.say(self.ENROL, r + 10)
+        self.assertTrue(any(x.startswith("upgrade_declined:") for x in second.reasons))
+        third = s.say(self.ENROL, r + 15)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in third.reasons))
+
+    def test_trim_only_after_prior_plan(self):
+        s, r = self.booked()
+        s.eng._plan_restatement_heard = True
+        text = "That helps. I'll get back to you."
+        self.assertEqual(s.eng.trim_restatement(text), "That helps.")
+        self.assertEqual(s.eng.trim_restatement("I'll get back to you."),
+                         "I'll get back to you.")
+        self.assertEqual(s.eng.admin_log()["repetition"]["restatements_trimmed"], 1)
+
+    def test_enrol_medium_reassurance_and_second_attempt(self):
+        from dataclasses import replace
+        from r1_prompts import UPGRADE_CONDITION_NOTE, RESOLVED_NOTE
+
+        s, r = run_cooperative(65, eng=engine(), script=strong_script())
+        s.eng.apply_judge(GOOD_JUDGE, s.eng.turn)
+        original = s.eng._evidence
+
+        def missing(kind):
+            evidence = original(kind)
+            return replace(evidence, needs_released=2, reassurance=False, money_path=True,
+                           fee_named=True, discount_ok=True, enrol_ceiling=Level.STRONG,
+                           family_quality={f: 1 for f in (evidence.families_planned or
+                                                          ("F1", "F2", "F3", "F4"))})
+        with mock.patch.object(s.eng, "_evidence", side_effect=missing):
+            initial = s.say(self.ENROL, r)
+            self.assertEqual(initial.commitment_level, Level.MEDIUM)
+            s.say(HANDLE_DECIDER, r + 5)
+            first = s.say(self.ENROL, r + 10)
+        self.assertIn(UPGRADE_CONDITION_NOTE, first.reminder)
+        self.assertNotIn(RESOLVED_NOTE, first.reminder)
+        self.assertEqual(s.eng._condition_planned[-1]["id"], "reassurance")
+        with mock.patch.object(s.eng, "_evidence",
+                               side_effect=lambda kind: replace(missing(kind), reassurance=True)):
+            second = s.say(self.ENROL, r + 15)
+        self.assertEqual(second.commitment_level, Level.STRONG, second.reasons)
+
+    def test_declines_pressure_thin_and_ceiling_without_coaching(self):
+        from dataclasses import replace
+        from r1_prompts import RESOLVED_NOTE, UPGRADE_CONDITION_NOTE
+
+        for field, value in (("pressured", True), ("thin", True),
+                             ("enrol_ceiling", Level.MEDIUM)):
+            with self.subTest(field=field):
+                s, r = self.booked()
+                original = s.eng._evidence
+                with mock.patch.object(s.eng, "_evidence",
+                                       side_effect=lambda kind: replace(original(kind),
+                                                                       **{field: value})):
+                    plan = s.say(self.ENROL, r)
+                self.assertNotEqual(plan.commitment_level, Level.STRONG)
+                if field != "enrol_ceiling":
+                    self.assertIn(RESOLVED_NOTE, plan.reminder)
+                    self.assertNotIn(UPGRADE_CONDITION_NOTE, plan.reminder)
+
+    def test_trim_flag_off_and_single_sentence(self):
+        s, r = self.booked()
+        s.eng._plan_restatement_heard = True
+        s.eng._restate_trim = False
+        text = "That is helpful. Please email me."
+        self.assertEqual(s.eng.trim_restatement(text), text)
+        self.assertNotIn("restatements_trimmed", s.eng.admin_log()["repetition"])
+
+    def test_heard_plan_and_guarded_reply(self):
+        s, r = self.booked()
+        s.eng._plan_restatement_heard = False
+        plan = s.eng.plan_turn("How does that sound?", r)
+        s.eng.record_spoken(plan, "I will talk it over with my husband.", r_sec=r)
+        self.assertTrue(s.eng._plan_restatement_heard)
+        plan = s.eng.plan_turn("What else?", r + 5)
+        before = s.eng.ledger.summary()
+        result = s.eng.sanitize_reply(plan, "That sounds helpful. I will check with him.")
+        self.assertEqual(result.text, "That sounds helpful.")
+        self.assertEqual(before, s.eng.ledger.summary())
+
+    def test_used_reassurance_is_not_coached_twice(self):
+        from dataclasses import replace
+        from r1_prompts import UPGRADE_CONDITION_NOTE
+
+        s, r = self.booked()
+        original = s.eng._evidence
+        def missing(kind):
+            evidence = original(kind)
+            return replace(evidence, needs_released=2, reassurance=False, money_path=True,
+                           fee_named=True, discount_ok=True, enrol_ceiling=Level.STRONG,
+                           family_quality={f: 1 for f in (evidence.families_planned or
+                                                          ("F1", "F2", "F3", "F4"))})
+        with mock.patch.object(s.eng, "_evidence", side_effect=missing):
+            first = s.say(self.ENROL, r)
+            second = s.say(self.ENROL, r + 5)
+        self.assertIn(UPGRADE_CONDITION_NOTE, first.reminder)
+        self.assertNotIn(UPGRADE_CONDITION_NOTE, second.reminder)
+        self.assertEqual(len(s.eng._condition_planned), 1)
+
+    def test_note_has_no_digits_commitment_or_concession(self):
+        from r1_commitment import classify_learner_commitment
+        from r1_guard import has_concession
+        from r1_prompts import UPGRADE_CONDITION_NOTE
+
+        self.assertNotRegex(UPGRADE_CONDITION_NOTE, r"\d")
+        self.assertEqual(classify_learner_commitment(UPGRADE_CONDITION_NOTE), Level.NONE)
+        self.assertFalse(has_concession(UPGRADE_CONDITION_NOTE))
+
+    def test_restatement_flags_are_latched(self):
+        with mock.patch.dict(os.environ, {"R1_RESTATE_TRIM": "0", "R1_UPGRADE_V2": "0"}):
+            eng = engine()
+        with mock.patch.dict(os.environ, {"R1_RESTATE_TRIM": "1", "R1_UPGRADE_V2": "1"}):
+            self.assertFalse(eng._restate_trim)
+            self.assertFalse(eng._upgrade_v2)
+
+    def test_v2_off_preserves_single_call_attempt_and_resolved_note(self):
+        from r1_prompts import RESOLVED_NOTE, UPGRADE_CONDITION_NOTE
+
+        with mock.patch.dict(os.environ, {"R1_UPGRADE_V2": "0"}):
+            s, r = self.booked(handle=False)
+        first = s.say(self.ENROL, r)
+        self.assertIn("upgrade_declined:decider_unresolved", first.reasons)
+        self.assertIn(RESOLVED_NOTE, first.reminder)
+        self.assertNotIn(UPGRADE_CONDITION_NOTE, first.reminder)
+        later = s.say(self.ENROL, r + 5)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in later.reasons))
+        with mock.patch.dict(os.environ, {"R1_UPGRADE_V2": "0"}):
+            s, r = self.booked()
+        s.eng._commitment_ask_kind = AskKind.ENROL
+        plan = s.say(self.ENROL, r)
+        self.assertFalse(s.eng._upgrade_tried)
+        self.assertIn(RESOLVED_NOTE, plan.reminder)

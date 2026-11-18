@@ -273,7 +273,9 @@ import r1_world
 # 40: M033 A8 v2 STRONG lines and evidence readers.
 # Revision 41: buying-signal questions and temperament priorities.
 # Revision 42: move conditions and the v3 persona card.
-PINNED_CONTENT_SHA256 = "74ae9e42f2a3a04620a998da90b5a4d1ee199c8c7e20576d717301d8dc87a537"
+# Revision 43: declined upgrade condition note.
+# Revision 44: render the upgrade condition note as a bullet.
+PINNED_CONTENT_SHA256 = "b1e84ef97cc187f1f01cf40b7899a3d8e1a5d5e373f7058260ebbd305f8270ab"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -534,6 +536,7 @@ class PinTests(unittest.TestCase):
             ("offer_on_table_note", r1_prompts.OFFER_ON_TABLE_NOTE),
             ("new_offer_note", r1_prompts.NEW_OFFER_NOTE),
             ("resolved_note", r1_prompts.RESOLVED_NOTE),
+            ("upgrade_condition_note", r1_prompts.UPGRADE_CONDITION_NOTE),
             ("checkin_note", r1_prompts.CHECKIN_NOTE),
             ("checkin_done_note", r1_prompts.CHECKIN_DONE_NOTE),
             ("email_again_note", r1_prompts.EMAIL_AGAIN_NOTE),

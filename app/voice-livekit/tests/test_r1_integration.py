@@ -1375,6 +1375,68 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(spoken, FALLBACK_REPLY)
 
+    async def test_restatement_trim_filters_stream_without_guard_hits(self) -> None:
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                rig = Rig()
+                rig.engine._restate_trim = enabled
+                rig.engine.scheduler.mark_commitment_resolved()
+                rig.engine._commitment_level = Level.MEDIUM
+                rig.engine._plan_restatement_heard = True
+                plan = rig.engine.plan_turn("What do you think?", 700)
+                self.assertIs(plan.mode, TurnMode.LLM_REPLY)
+                reply = Reply(phase="roleplay", candidate_text="What do you think?",
+                              plan=plan, r_sec=700)
+                text = "That sounds helpful. I will check with him."
+                spoken = await self.run_reply(rig, reply, text)
+                self.assertEqual("check with him" in spoken, not enabled)
+                self.assertIn("That sounds helpful", spoken)
+                self.assertFalse(rig.interview._guard_trips)
+                count = rig.engine.admin_log()["repetition"].get("restatements_trimmed", 0)
+                self.assertEqual(count, int(enabled))
+
+    async def test_restatement_stream_releases_non_plan_before_model_finishes(self) -> None:
+        rig = Rig()
+        rig.engine.scheduler.mark_commitment_resolved()
+        rig.engine._commitment_level = Level.MEDIUM
+        rig.engine._plan_restatement_heard = True
+        plan = rig.engine.plan_turn("What do you think?", 700)
+        rig.interview._last_reply = Reply(phase="roleplay", candidate_text="What do you think?",
+                                          plan=plan, r_sec=700)
+
+        class OrderedProvider(FakeProvider):
+            finished = False
+
+            async def _stream(self, text):
+                yield SimpleNamespace(delta=SimpleNamespace(content=text), usage=None)
+                self.finished = True
+
+        provider = OrderedProvider("That sounds helpful. I will check with him. Thanks again.")
+        stream = rig.interview.llm_node_stream(SimpleNamespace(items=[]), provider)
+        first = await anext(stream)
+        self.assertEqual(first, "That sounds helpful. ")
+        self.assertFalse(provider.finished)
+        rest = "".join([chunk async for chunk in stream])
+        self.assertEqual(first + rest, "That sounds helpful. Thanks again. ")
+        self.assertEqual(rig.engine.admin_log()["repetition"]["restatements_trimmed"], 1)
+
+    async def test_restatement_stream_keeps_all_plan_sentences(self) -> None:
+        rig = Rig()
+        rig.engine.scheduler.mark_commitment_resolved()
+        rig.engine._commitment_level = Level.MEDIUM
+        rig.engine._plan_restatement_heard = True
+        plan = rig.engine.plan_turn("What do you think?", 700)
+        reply = Reply(phase="roleplay", candidate_text="What do you think?", plan=plan, r_sec=700)
+        text = "I will check with him. Please email me."
+        class SentenceProvider(FakeProvider):
+            async def _stream(self, text):
+                yield SimpleNamespace(delta=SimpleNamespace(content=text), usage=None)
+
+        rig.interview._last_reply = reply
+        stream = rig.interview.llm_node_stream(SimpleNamespace(items=[]), SentenceProvider(text))
+        self.assertEqual("".join([chunk async for chunk in stream]).strip(), text)
+        self.assertNotIn("restatements_trimmed", rig.engine.admin_log()["repetition"])
+
     async def test_the_learner_goes_through_the_guard_too(self) -> None:
         rig = Rig()
         plan = rig.engine.plan_turn(OPENER, 20)

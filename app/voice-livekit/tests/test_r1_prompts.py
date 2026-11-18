@@ -394,6 +394,13 @@ class ReminderTests(unittest.TestCase):
         self.assertNotIn(FORCED_NOTE, turn_reminder(P1, r_sec=300))
         self.assertIn("Link it to what the advisor just said", FORCED_NOTE)
 
+    def test_upgrade_condition_note_is_a_bullet(self):
+        from r1_prompts import UPGRADE_CONDITION_NOTE
+
+        self.assertTrue(UPGRADE_CONDITION_NOTE.startswith("- "))
+        text = turn_reminder(P1, r_sec=100, notes=(UPGRADE_CONDITION_NOTE,))
+        self.assertIn(UPGRADE_CONDITION_NOTE, text)
+
     def test_an_intent_turn_keeps_the_disclosure_layers_and_the_other_notes(self):
         text = turn_reminder(
             P1,

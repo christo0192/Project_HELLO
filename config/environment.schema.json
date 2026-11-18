@@ -286,6 +286,8 @@
         "R1_TEMPERAMENT_THEMES": { "requiredInProduction": false, "secret": false },
         "R1_STRONG_EVIDENCE_V2": { "requiredInProduction": false, "secret": false },
         "R1_BUYING_SIGNALS": { "requiredInProduction": false, "secret": false },
+        "R1_UPGRADE_V2": { "requiredInProduction": false, "secret": false },
+        "R1_RESTATE_TRIM": { "requiredInProduction": false, "secret": false },
         "R1_MOVE_CONDITION": { "requiredInProduction": false, "secret": false },
         "R1_PERK_HISTORY": { "requiredInProduction": false, "secret": false },
         "R1_DISCOUNT_READ_V3": { "requiredInProduction": false, "secret": false },

@@ -149,6 +149,11 @@ STRETCH_USED_NOTE = (
 TEMPLATE_USED_NOTE = (
     "- You have already asked what a call or a next step would involve: do not ask that again."
 )
+UPGRADE_CONDITION_NOTE = (
+    "- Keep the existing next step. Kindly say you are not ready yet, then say in your "
+    "own words the one thing that would move you:"
+)
+
 RESOLVED_NOTE = (
     "- You have already told the advisor where you stand on the next step. Do not repeat it, "
     "change it or add to it: react briefly to what they just said and let them wrap up."

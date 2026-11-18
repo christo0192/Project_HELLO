@@ -403,7 +403,9 @@ import r1_world
 #    per-temperament signal lists.
 # 42: M033 A10 (R1_MOVE_CONDITION, R1_PERSONA_TIMELINE_V3): the move-condition clauses
 #    and note, and the v3 card timeline and decider answer.
-CONTENT_REVISION = 42
+# 43: PROOF-1 pins the declined upgrade condition note.
+# 44: render the declined upgrade condition as a bullet.
+CONTENT_REVISION = 44
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -1132,6 +1134,7 @@ def manifest() -> dict[str, Any]:
             "next_step_note": r1_prompts.NEXT_STEP_NOTE,
             "new_offer_note": r1_prompts.NEW_OFFER_NOTE,
             "resolved_note": r1_prompts.RESOLVED_NOTE,
+            "upgrade_condition_note": r1_prompts.UPGRADE_CONDITION_NOTE,
             "checkin_note": r1_prompts.CHECKIN_NOTE,
             "checkin_done_note": r1_prompts.CHECKIN_DONE_NOTE,
             "decider_said_note": r1_prompts.DECIDER_SAID_NOTE,

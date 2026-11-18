@@ -332,6 +332,7 @@ from r1_prompts import (
     PUSH_REACT_NOTE,
     PUSH_REACT_NOTE_V2,
     RESOLVED_NOTE,
+    UPGRADE_CONDITION_NOTE,
     ROLE_CONFUSION_EXAMPLES,
     ROLE_CONFUSION_NOTE,
     SHORT_ON_TIME_CONCERNS_NOTE,
@@ -1305,12 +1306,23 @@ FLAG_MOVE_CONDITION = "R1_MOVE_CONDITION"
 # M033 A10: allow deciding today in the cached persona card.
 FLAG_PERSONA_TIMELINE_V3 = "R1_PERSONA_TIMELINE_V3"
 
-# PROOF-1: control perk history.
+# PROOF-1: exclude learner history from invented perks; 0 restores the previous reader.
 FLAG_PERK_HISTORY = "R1_PERK_HISTORY"
-# PROOF-1: control discount read v3.
+# PROOF-1: recognize explicit discount lists as offers; 0 restores the previous reader.
 FLAG_DISCOUNT_READ_V3 = "R1_DISCOUNT_READ_V3"
-# PROOF-1: control concession condition.
+# PROOF-1: exclude learner conditions from concessions; 0 restores the previous reader.
 FLAG_CONCESSION_CONDITION = "R1_CONCESSION_CONDITION"
+
+# PROOF-1: allow two delayed upgrades from any MEDIUM; 0 restores previous behaviour.
+FLAG_UPGRADE_V2 = "R1_UPGRADE_V2"
+# PROOF-1: trim repeated plans from free replies; 0 restores previous behaviour.
+FLAG_RESTATE_TRIM = "R1_RESTATE_TRIM"
+UPGRADE_MAX_TRIES = 2
+_RESTATEMENT = re.compile(
+    r"\b(?:let me think (?:about it|it over|this over)|email me|get back to you|"
+    r"i(?:'ll| will) (?:think|be in touch)|talk (?:it )?(?:over|through) with "
+    r"(?:my |the )?[\w]+|check with (?:him|her|my [\w]+))\b", re.IGNORECASE
+)
 
 # M033 A10: at most two different conditions may be planned in a call.
 CONDITION_MAX_PER_CALL = 2
@@ -1459,6 +1471,8 @@ _FLAG_READS = {
     FLAG_INVENTED_OFFER_V2: lambda: os.getenv("R1_INVENTED_OFFER_V2"),
     FLAG_DISCOUNT_DISCIPLINE_V2: lambda: os.getenv("R1_DISCOUNT_DISCIPLINE_V2"),
     FLAG_CLOSE_WINDOW_EVIDENCE: lambda: os.getenv("R1_CLOSE_WINDOW_EVIDENCE"),
+    FLAG_UPGRADE_V2: lambda: os.getenv("R1_UPGRADE_V2"),
+    FLAG_RESTATE_TRIM: lambda: os.getenv("R1_RESTATE_TRIM"),
     FLAG_COMMIT_UPGRADE: lambda: os.getenv("R1_COMMIT_UPGRADE"),
     FLAG_TEMPERAMENT: lambda: os.getenv("R1_TEMPERAMENT"),
     FLAG_TEMPERAMENT_PLAN: lambda: os.getenv("R1_TEMPERAMENT_PLAN"),
@@ -1784,12 +1798,18 @@ class RolePlayEngine:
         self._discipline_v2 = flag_on(FLAG_DISCOUNT_DISCIPLINE_V2)
         self._close_evidence = flag_on(FLAG_CLOSE_WINDOW_EVIDENCE)
         self._commit_upgrade = flag_on(FLAG_COMMIT_UPGRADE)
+        self._upgrade_v2 = flag_on(FLAG_UPGRADE_V2)
+        self._restate_trim = flag_on(FLAG_RESTATE_TRIM)
+        self._restatements_trimmed = 0
+        self._plan_restatement_heard = False
+        self._upgrade_attempt_turns: list[int] = []
         self._strong_v2 = flag_on(FLAG_STRONG_EVIDENCE_V2)
         self._move_condition = flag_on(FLAG_MOVE_CONDITION)
         self._perk_history = flag_on(FLAG_PERK_HISTORY)
         self._discount_read_v3 = flag_on(FLAG_DISCOUNT_READ_V3)
         self._concession_condition = flag_on(FLAG_CONCESSION_CONDITION)
         self._condition_planned: list[dict[str, Any]] = []
+        self._upgrade_condition_used = False
         self._condition_acknowledged: set[str] = set()
         self._buying_signals = flag_on(FLAG_BUYING_SIGNALS)
         self._buying_signals_log: list[dict[str, Any]] = []
@@ -5750,11 +5770,17 @@ class RolePlayEngine:
             if (
                 self._commit_upgrade and wants is AskKind.ENROL
                 and self._commitment_level is Level.MEDIUM
-                and self._commitment_ask_kind is AskKind.CALL
-                and not self._upgrade_tried and r_sec < COMMIT_STALL_R_SEC
+                and (self._upgrade_v2 or self._commitment_ask_kind is AskKind.CALL)
+                and ((self._upgrade_v2 and len(self._upgrade_attempt_turns) < UPGRADE_MAX_TRIES
+                      and self.turn >= self._commitment_turn + 2
+                      and (not self._upgrade_attempt_turns
+                           or self.turn > self._upgrade_attempt_turns[-1]))
+                     or (not self._upgrade_v2 and not self._upgrade_tried))
+                and r_sec < COMMIT_STALL_R_SEC
                 and self.scheduler.commit_permitted(r_sec)
             ):
                 self._upgrade_tried = True
+                self._upgrade_attempt_turns.append(self.turn)
                 evidence = self._evidence(AskKind.ENROL)
                 level = grade(evidence, strong_v2=self._strong_v2)
                 blocked = negotiation.strong_blocked(self.turn) if level is Level.STRONG else None
@@ -5775,7 +5801,18 @@ class RolePlayEngine:
                 reasons.append("commitment_on_record")
                 reasons.append(f"upgrade_declined:{blocked or 'grade_' + level.name.lower()}")
                 self._record_strong_gaps(evidence, reasons)
-                self._notes.append(RESOLVED_NOTE)
+                note = None
+                temperament = self.persona.temperament
+                if (self._upgrade_v2 and not evidence.pressured and not evidence.thin
+                        and evidence.enrol_ceiling >= Level.STRONG
+                        and (temperament is None or temperament.enrol_ceiling >= Level.STRONG)):
+                    clause = self._select_move_condition(evidence, allow_work=False)
+                    if clause is not None:
+                        text = fill_decision_maker(clause.clause, self.persona.decision_maker)
+                        note = UPGRADE_CONDITION_NOTE + " " + text + "."
+                        self._condition_planned.append({"id": clause.id, "turn": self.turn})
+                        self._upgrade_condition_used = True
+                self._notes.append(note or RESOLVED_NOTE)
                 return None
             if wants is not None or seen.email_offer or seen.checkin:
                 reasons.append("commitment_on_record")
@@ -5904,8 +5941,25 @@ class RolePlayEngine:
         """
         if plan.intent is None or plan.intent.kind != KIND_STALL:
             return plan
-        if len(self._condition_planned) >= CONDITION_MAX_PER_CALL:
+        clause = self._select_move_condition(evidence)
+        if clause is None:
             return plan
+        dm = self.persona.decision_maker
+        text = fill_decision_maker(clause.clause, dm)
+        fallbacks = tuple(
+            original + " " + fill_decision_maker(clause.fallbacks[i % 3], dm)
+            for i, original in enumerate(plan.intent.fallbacks)
+        )
+        intent = replace(plan.intent, brief=plan.intent.brief +
+                         " Then say, in your own words, the one thing that would move you: "
+                         + text + ".", fallback=fallbacks[0], fallbacks=fallbacks)
+        self._condition_planned.append({"id": clause.id, "turn": self.turn})
+        return replace(plan, intent=intent,
+                       reasons=(*plan.reasons, "move_condition:" + clause.id))
+
+    def _select_move_condition(self, evidence: CommitmentEvidence, *, allow_work: bool = True):
+        if len(self._condition_planned) >= CONDITION_MAX_PER_CALL:
+            return None
         temperament = self.persona.temperament
         gaps = set(strong_gaps(evidence))
         if self.negotiation.decider_unresolved():
@@ -5919,7 +5973,7 @@ class RolePlayEngine:
         ]
         family = next(iter(open_families), None)
         candidates = []
-        if temperament and temperament.enrol_ceiling < Level.STRONG:
+        if allow_work and temperament and temperament.enrol_ceiling < Level.STRONG:
             candidates = ["work"]
         else:
             criterion = temperament.key_criterion if temperament else ""
@@ -5942,21 +5996,9 @@ class RolePlayEngine:
         for key in candidates:
             clause = (CONDITION_FAMILY_CLAUSES.get(family) if key == "families"
                       else CONDITION_CLAUSES.get(key))
-            if clause is None or clause.id in used:
-                continue
-            dm = self.persona.decision_maker
-            text = fill_decision_maker(clause.clause, dm)
-            fallbacks = tuple(
-                original + " " + fill_decision_maker(clause.fallbacks[i % 3], dm)
-                for i, original in enumerate(plan.intent.fallbacks)
-            )
-            intent = replace(plan.intent, brief=plan.intent.brief +
-                             " Then say, in your own words, the one thing that would move you: "
-                             + text + ".", fallback=fallbacks[0], fallbacks=fallbacks)
-            self._condition_planned.append({"id": clause.id, "turn": self.turn})
-            return replace(plan, intent=intent,
-                           reasons=(*plan.reasons, "move_condition:" + clause.id))
-        return plan
+            if clause is not None and clause.id not in used:
+                return clause
+        return None
 
     def _reasons_owned_by_f4(self) -> frozenset[str]:
         """Stall reasons the owed F4 moves still have to voice (timing, the decision maker).
@@ -7052,7 +7094,7 @@ class RolePlayEngine:
 
         Work has no acknowledgement: no specific later-slot reader exists for it.
         """
-        if not self._move_condition:
+        if not (self._move_condition or self._upgrade_condition_used):
             return
         evidence = self._evidence(AskKind.ENROL)
         for item in self.negotiation.condition_named:
@@ -7356,10 +7398,36 @@ class RolePlayEngine:
         """A per-reply sentence guard; pass its ``result`` to ``record_guard`` afterwards."""
         return StreamGuard(plan.guard_ctx)
 
+    def restatement_trim_applies(self) -> bool:
+        """Whether repeated plans should be filtered from a free reply."""
+        return (self._restate_trim and self.commitment_resolved
+                and self._plan_restatement_heard)
+
+    def is_restatement(self, sentence: str) -> bool:
+        """Whether a sentence repeats a previously stated plan."""
+        return bool(_RESTATEMENT.search(sentence))
+
+    def note_restatements_trimmed(self, count: int) -> None:
+        """Record repeated plan sentences omitted from a reply."""
+        self._restatements_trimmed += count
+
+    def trim_restatement(self, text: str) -> str:
+        """Remove a repeated plan from a free reply, retaining an all-plan reply."""
+        if not self.restatement_trim_applies():
+            return text
+        sentences = split_sentences(text)
+        kept = [sentence for sentence in sentences if not self.is_restatement(sentence)]
+        if not kept or len(kept) == len(sentences):
+            return text
+        self.note_restatements_trimmed(len(sentences) - len(kept))
+        return " ".join(kept)
+
     def sanitize_reply(self, plan: TurnPlan, raw: str) -> GuardResult:
         """Guard a whole LLM reply at once and count its hits."""
         result = guard_text(raw, plan.guard_ctx)
         self.record_guard(result)
+        if plan.mode is TurnMode.LLM_REPLY:
+            result = replace(result, text=self.trim_restatement(result.text))
         return result
 
     def record_guard(self, result: GuardResult) -> None:
@@ -7389,6 +7457,8 @@ class RolePlayEngine:
         """
         if plan.aside:
             return  # the interviewer's aside is scripted and excluded from evidence
+        if self._restate_trim and _RESTATEMENT.search(spoken_text):
+            self._plan_restatement_heard = True
         rearm, self._floor_rearm = self._floor_rearm, None
         if "floor_yield" in plan.reasons:
             # M032 SWEEP-33: "Sure, go ahead." raises, proves and asks nothing, so it leaves her
@@ -7910,7 +7980,8 @@ class RolePlayEngine:
             **({"move_conditions": [
                 {**item, "named": item in self.negotiation.condition_named}
                 for item in self._condition_planned
-            ]} if self._move_condition and self._condition_planned else {}),
+            ]} if self._condition_planned and
+               (self._move_condition or self._upgrade_condition_used) else {}),
             **({"buying_signals": list(self._buying_signals_log)}
                if self._buying_signals and self._buying_signals_log else {}),
             **({"strong_gaps": list(self._strong_gaps)}
@@ -7962,6 +8033,8 @@ class RolePlayEngine:
             # (indices only; logged for the rehearsal metrics, not posted).
             "disclosure": self.tracker.gate.offers_view(),
             "repetition": {
+                **({"restatements_trimmed": self._restatements_trimmed}
+                   if self._restatements_trimmed else {}),
                 "remembered_sentences": len(self._spoken),
                 "repeats_dropped": self.ledger.counts.get(REPEAT, 0),
                 "fallbacks_used": self._fallbacks,

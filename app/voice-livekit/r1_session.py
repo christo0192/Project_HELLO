@@ -8103,6 +8103,9 @@ class R1Interview:
         last_sentence = ""  # the last sentence that reached it (M032 SWEEP-26)
         spoken: list[str] = []  # D5-TRANS1: what the reply said, for the bare-confirmation check
         recover = False
+        buffered: list[str] = []
+        trim = (reply.plan is not None and reply.plan.mode is TurnMode.LLM_REPLY
+                and self.engine.restatement_trim_applies())
         iterator: Any = None
         try:
             self._latency.mark("llm_start")
@@ -8116,17 +8119,32 @@ class R1Interview:
                 if text:
                     self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
+                        if trim and self.engine.is_restatement(sentence):
+                            buffered.append(sentence)
+                            continue
                         spoke = True
                         last_sentence = sentence
                         spoken.append(sentence)
                         self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
+                if trim and self.engine.is_restatement(sentence):
+                    buffered.append(sentence)
+                    continue
                 spoke = True
                 last_sentence = sentence
                 spoken.append(sentence)
                 self._latency.mark("guard_release")
                 yield sentence + " "
+            if buffered and spoke:
+                self.engine.note_restatements_trimmed(len(buffered))
+            elif buffered:
+                for sentence in buffered:
+                    spoke = True
+                    last_sentence = sentence
+                    spoken.append(sentence)
+                    self._latency.mark("guard_release")
+                    yield sentence + " "
             if spoke and reply.confirm_extra and is_bare_confirmation(" ".join(spoken)):
                 # D5-TRANS1: "That's right, yes." alone left their second question unanswered.
                 last_sentence = reply.confirm_extra
