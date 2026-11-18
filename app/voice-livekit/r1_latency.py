@@ -3,10 +3,11 @@
 Independent, SDK-free pieces live here so each is unit-testable without a session:
 
 * ``r1_turn_handling``: the endpointing, interruption and preemptive-generation options R1
-  hands the ``AgentSession``.  The values are endpointing 0.8 / 3.0 s (R1-Q: the owner's 4/10
-  session showed the SDK's streaming 0.3 / 2.5 s committing a turn on a breath) and VOICE
-  BARGE-IN (owner decision 2026-10-28, "we also want the bot to stop talking when being
-  interrupted"): interruption ``min_words`` 0 and ``min_duration`` 0.8 s, with the SDK's
+  hands the ``AgentSession``.  The values are endpointing 1.0 / 3.0 s measured from the
+  candidate's real end of speech (M033 T1, below; R1-Q: the owner's 4/10 session showed the
+  SDK's streaming 0.3 / 2.5 s committing a turn on a breath, at about 0.85 s of real silence)
+  and VOICE BARGE-IN (owner decision 2026-10-28, "we also want the bot to stop talking when
+  being interrupted"): interruption ``min_words`` 0 and ``min_duration`` 0.8 s, with the SDK's
   false-interruption resume after 2.0 s.  0.8 s of the candidate's voice pauses an
   interruptible line, a final transcript cuts it, and a pause that no transcript follows
   (noise, a cough) resumes it.  ``min_words`` was 3 before (the phone lane's value): with
@@ -16,6 +17,26 @@ Independent, SDK-free pieces live here so each is unit-testable without a sessio
   quicker transition pair (``r1_transition_endpointing``, 0.4 / 1.2 s) is no longer applied since
   the consent transition of 2026-11-03 (the candidate asks questions there now); it is kept for a
   rollback.  Preemptive generation stays OFF; ``r1_session`` explains why.
+
+* The endpointing ANCHOR (M033 T1, ``R1_VAD_ENDPOINT_ANCHOR``, default on).  Given no VAD,
+  livekit-agents 1.6.4 builds its default silero VAD and, because it is the default, resets
+  the candidate's last-speaking time to each FINAL transcript's arrival (Sarvam sends no end
+  time), so the old 0.8 s ran from the final: about 1.35-1.6 s of real silence.  With the
+  anchor on, ``r1_session`` hands the session that same silero VAD explicitly, the anchor stays
+  at the VAD's back-dated end of speech, and the minimum is ``R1_ENDPOINT_VAD_MIN_DELAY_SEC``
+  (1.0 s of real silence, bounded 0.5-2.0).  ``R1_ENDPOINT_MIN_DELAY_SEC`` keeps its meaning
+  and applies only with the anchor off, so a transcript-anchored 0.6 can never silently become
+  0.6 s of real silence.  ``R1_VAD_ENDPOINT_ANCHOR=0`` is the instant rollback.
+  Side effects pinned in ``tests/test_r1_sdk_contract.py``: finals now carry the VAD's
+  ``speaking`` state, and a final that lands while a line is paused and the VAD hears no voice
+  RESTARTS the 2.0 s false-interruption timer (the default VAD only cancels it).  A paused
+  learner line whose turn commits within 2.0 s of the final (the common case, about 0.45 s)
+  is cut exactly as before; only a turn the default detector holds toward ``max_delay``
+  (3.0 s) can let the paused line resume briefly before the cut, seen rarely if ever.
+  Known residual: a near-zero ``final_to_turn_hook`` with category ``vad`` indicates the
+  endpoint wait had already expired when the final landed. A slow final or a continuation the
+  VAD missed can cause this; timing alone cannot distinguish them. Exit ``summary_<stage>``
+  lines include ``final_to_turn_hook``; ``summary_anchor`` counts cannot expose a stale anchor.
 
 * ``LatencyTracker``: stamps the stages of one candidate turn and hands every segment to an
   ``emit`` callback.  ``r1_session`` turns each call into one structured ``r1`` log line
@@ -38,6 +59,11 @@ in milliseconds, and ``None`` (unknown, which the gate fails closed on) when few
 turns were measured.  A turn whose reply was cancelled before any audio never gets a first audio,
 so its wait so far is kept as a lower bound (``reply_lost``): the slowest turns are the ones that
 are cancelled, and the p95 must not be able to leave them out.
+
+``summary_all`` retains bounded, rounded stage samples and anchor counts by phase.
+At exit, ``r1_session`` writes ``summary_<stage>``, ``summary_anchor`` and
+``summary_lost`` lines when ``R1_LATENCY_SUMMARY`` is on.  Rebuild these summaries
+from latency records with ``python r1_latency.py --summary``.
 """
 from __future__ import annotations
 
@@ -54,6 +80,9 @@ from typing import Any, Callable
 # ---------------------------------------------------------------------------- turn handling
 
 ENDPOINT_MIN_DELAY_SEC = 0.8
+# The minimum measured from the VAD's end of speech (anchor on).  Real silence: above the about
+# 0.85 s at which the 4/10 session committed turns on a breath, below today's 1.35-1.6 s.
+ENDPOINT_MIN_DELAY_VAD_SEC = 1.0
 ENDPOINT_MAX_DELAY_SEC = 3.0
 INTERRUPT_MIN_DURATION_SEC = 0.8
 # Voice barge-in (owner decision 2026-10-28).  3 is the rollback: ``R1_INTERRUPT_MIN_WORDS=3``.
@@ -80,9 +109,37 @@ def _bounded_float(raw: str | None, default: float, low: float, high: float) -> 
 
 
 def endpoint_min_delay_sec() -> float:
-    """Silence after the last speech before the turn may end (SDK default 0.3 s streaming)."""
+    """Silence after the FINAL transcript before the turn may end (anchor off only).
+
+    Applies only with ``R1_VAD_ENDPOINT_ANCHOR=0``; with the anchor on it is ignored (and the
+    session warns ``r1_endpoint_setting_ignored`` if it is set).
+    """
     return _bounded_float(
         os.getenv("R1_ENDPOINT_MIN_DELAY_SEC"), ENDPOINT_MIN_DELAY_SEC, 0.2, 2.0
+    )
+
+
+def endpoint_vad_min_delay_sec() -> float:
+    """Real silence after the VAD's end of speech before the turn may end (anchor on)."""
+    return _bounded_float(
+        os.getenv("R1_ENDPOINT_VAD_MIN_DELAY_SEC"), ENDPOINT_MIN_DELAY_VAD_SEC, 0.5, 2.0
+    )
+
+
+def vad_endpoint_anchor_enabled() -> bool:
+    """``R1_VAD_ENDPOINT_ANCHOR`` (default on): anchor endpointing on an explicit VAD.
+
+    Unset or anything but "0", "off", "false" or "no" is on (``r1_session._env_switch``).
+    """
+    return (os.getenv("R1_VAD_ENDPOINT_ANCHOR") or "1").strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
+def warm_say_lines_enabled() -> bool:
+    """Warm additional spoken lines and rewarm learned names (default on)."""
+    return (os.getenv("R1_WARM_SAY_LINES") or "1").strip().lower() not in (
+        "0", "off", "false", "no"
     )
 
 
@@ -146,13 +203,18 @@ def r1_turn_handling() -> dict[str, Any]:
     """The ``TurnHandlingOptions`` R1 gives its ``AgentSession`` (a plain dict is accepted).
 
     ``turn_detection`` is deliberately absent: the browser lane's detector stays what the
-    session selects, and only the timings around it are R1's.  ``vad`` is not given to the
-    session either, so the SDK runs its default voice activity detector: that is what applies
-    ``min_duration`` and pauses a line on the candidate's voice.  Interruption options are read
-    from the SESSION by livekit-agents 1.6.4 (an agent-level ``interruption`` carries only
-    ``enabled`` and ``mode``), which is why these belong on the session and not on ``R1Agent``.
+    session selects, and only the timings around it are R1's.  The VAD is the silero model in
+    both modes: handed to the session explicitly with the anchor on (``min_delay`` then counts
+    from the VAD's end of speech, ``endpoint_vad_min_delay_sec``), the SDK's own default with
+    it off (``min_delay`` counts from the final, ``endpoint_min_delay_sec``).  Either way it is
+    what applies ``min_duration`` and pauses a line on the candidate's voice.  Interruption
+    options are read from the SESSION by livekit-agents 1.6.4 (an agent-level ``interruption``
+    carries only ``enabled`` and ``mode``), which is why these belong on the session and not on
+    ``R1Agent``.
     """
-    minimum = endpoint_min_delay_sec()
+    minimum = (
+        endpoint_vad_min_delay_sec() if vad_endpoint_anchor_enabled() else endpoint_min_delay_sec()
+    )
     return {
         "endpointing": {
             "min_delay": minimum,
@@ -200,6 +262,12 @@ _MAX_PENDING_SAYS = 16
 # The headline samples kept for the session's p95.  A whole interview is a few dozen turns;
 # the bound only stops a runaway session from growing the list (the newest samples win).
 _MAX_HEADLINE_SAMPLES = 512
+# The stages the exit summary reports.
+SUMMARY_SCHEMAS = (
+    "eou_to_turn_hook", "final_to_turn_hook", "llm_ttft", "eou_to_llm_first_token",
+    "guard_hold", "tts_ttfb", "eou_to_first_audio", "eou_to_reply_lost",
+    "say_to_first_audio",
+)
 # What the plan 6.4 gate reads (``session_facts.first_audio_p95_ms``): the learner's turns, i.e.
 # the role-play phase, and at least as many of them as the gate's own ``MIN_QUALIFYING_TURNS``.
 GATE_PHASE = "roleplay"
@@ -229,6 +297,11 @@ _RECENT_TURNS = 4
 
 class LatencyTracker:
     """Stamp one candidate turn at a time and report every segment exactly once.
+
+    ``summary_all`` returns bounded stage samples and anchor counts by phase.
+    At exit, ``r1_session`` writes ``summary_<stage>``, ``summary_anchor`` and
+    ``summary_lost`` lines when ``R1_LATENCY_SUMMARY`` is on.  Records can be
+    summarized again with ``python r1_latency.py --summary``.
 
     Segments (``schema`` values), measured in seconds:
 
@@ -292,6 +365,8 @@ class LatencyTracker:
         # lost: the input of ``first_audio_p95_ms``.
         self._headline: deque[tuple[str, float]] = deque(maxlen=_MAX_HEADLINE_SAMPLES)
         self._lost: deque[str] = deque(maxlen=_MAX_HEADLINE_SAMPLES)  # the phase of each
+        self._summary_samples: dict[tuple[str, str], deque[float]] = {}
+        self._summary_anchors: dict[str, dict[str, int]] = {}
 
     # ------------------------------------------------------------------ candidate side
 
@@ -317,6 +392,8 @@ class LatencyTracker:
             anchor, how = self._final_at, "final"
         else:
             anchor, how = now, "hook"
+        anchors = self._summary_anchors.setdefault(phase, {})
+        anchors[how] = anchors.get(how, 0) + 1
         final_at = self._final_at
         self._stop_at = None
         self._final_at = None
@@ -451,6 +528,18 @@ class LatencyTracker:
         seconds = self.first_audio_p95_seconds(phase, min_samples=min_samples)
         return None if seconds is None else int(round(seconds * 1000.0))
 
+    def summary(self, phase: str | None = None) -> dict[str, Any]:
+        """Return stage statistics, anchor counts and lost replies for one phase or all.
+
+        Stage values are rounded seconds with nearest-rank percentiles; the first-audio
+        headline includes lost-reply lower bounds and their count.
+        """
+        return _summary(self._summary_samples, self._summary_anchors, phase)
+
+    def summary_all(self) -> dict[str, Any]:
+        """Return ``summary`` for every measured phase and the combined ``all`` phase."""
+        return _summaries(self._summary_samples, self._summary_anchors)
+
     # ------------------------------------------------------------------ scripted lines
 
     def say_created(self, speech_id: str, label: str, phase: str) -> None:
@@ -492,6 +581,10 @@ class LatencyTracker:
     ) -> None:
         if not _valid_segment(seconds):
             return
+        if schema in SUMMARY_SCHEMAS:
+            self._summary_samples.setdefault(
+                (schema, phase), deque(maxlen=_MAX_HEADLINE_SAMPLES)
+            ).append(round(seconds, 3))
         self._emit(schema, seconds, category=category, phase=phase, turn_index=index)
 
 
@@ -633,6 +726,68 @@ def latency_records(lines: Iterable[Any]) -> Iterator[Mapping[str, Any]]:
             yield record
 
 
+def _summary(samples: Mapping, anchors: Mapping, phase: str | None) -> dict[str, Any]:
+    """Return stages, anchors and lost counts for a phase, or all phases.
+
+    ``stages`` maps schemas to n, p50, p90 and max; percentiles use nearest rank
+    on seconds rounded to three decimals as logged.  The ``eou_to_first_audio``
+    headline includes lost-reply lower bounds and their count in ``lost``.
+    ``anchors`` counts vad, final and hook; top-level ``lost`` counts lost replies.
+    """
+    stages = {}
+
+    def values(schema: str) -> list[float]:
+        return [value for (name, ph), items in samples.items()
+                if name == schema and (phase is None or ph == phase) for value in items]
+    lost = values("eou_to_reply_lost")
+    for schema in SUMMARY_SCHEMAS:
+        items = values(schema)
+        if schema == "eou_to_first_audio":
+            items += lost
+        if items:
+            stage = {"n": len(items), "p50": percentile(items, 50),
+                     "p90": percentile(items, 90), "max": max(items)}
+            if schema == "eou_to_first_audio":
+                stage["lost"] = len(lost)
+            stages[schema] = stage
+    counts = {kind: sum(counts.get(kind, 0) for ph, counts in anchors.items()
+                        if phase is None or ph == phase) for kind in ("vad", "final", "hook")}
+    return {"stages": stages, "anchors": counts, "lost": len(lost)}
+
+
+def _summaries(samples: Mapping, anchors: Mapping) -> dict[str, Any]:
+    """Return stage statistics, anchors and lost counts by phase and combined as ``all``."""
+    phases = sorted({phase for _, phase in samples} | set(anchors))
+    result = {phase: _summary(samples, anchors, phase) for phase in phases}
+    if phases:
+        result["all"] = _summary(samples, anchors, None)
+    return result
+
+
+def summary_from_records(lines: Iterable[Any]) -> dict[str, Any]:
+    """Rebuild per-phase and combined stage statistics, anchors and lost counts from logs.
+
+    Stage values are rounded seconds with nearest-rank percentiles; the first-audio
+    headline includes lost-reply lower bounds and their count.
+    """
+    samples: dict[tuple[str, str], deque[float]] = {}
+    anchors: dict[str, dict[str, int]] = {}
+    for record in latency_records(lines):
+        schema, phase = record.get("schema"), record.get("phase")
+        if schema not in SUMMARY_SCHEMAS or not isinstance(phase, str):
+            continue
+        values = _finite([record.get("duration_sec")])
+        if values:
+            samples.setdefault(
+                (schema, phase), deque(maxlen=_MAX_HEADLINE_SAMPLES)
+            ).append(values[0])
+        kind = record.get("error_category")
+        if schema == "eou_to_turn_hook" and kind in ("vad", "final", "hook"):
+            counts = anchors.setdefault(phase, {})
+            counts[kind] = counts.get(kind, 0) + 1
+    return _summaries(samples, anchors)
+
+
 def stage_a_report(lines: Iterable[Any]) -> dict[str, Any]:
     """Judge a smoke session's log lines against the Stage A targets (plan 5.15 item 6).
 
@@ -685,8 +840,11 @@ def stage_a_report(lines: Iterable[Any]) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """``fly logs --json | python r1_latency.py``: print the Stage A report; exit 0 pass,
-    1 miss, 2 nothing measured."""
-    del argv
+    1 miss, 2 nothing measured.  ``--summary`` prints per-phase summaries instead."""
+    if argv is not None and list(argv) == ["--summary"]:
+        report = summary_from_records(sys.stdin)
+        sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        return 0 if report else 2
     report = stage_a_report(sys.stdin)
     sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
     passes = report["passes"]
@@ -694,4 +852,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

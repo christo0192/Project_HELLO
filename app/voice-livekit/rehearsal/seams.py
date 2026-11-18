@@ -16,6 +16,8 @@ does not inject is simply OFF, and the interview then behaves as with that featu
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import json
 from typing import Any, Callable, Iterable
 
@@ -26,7 +28,9 @@ SEAM_CLIENTS: dict[str, str] = {
     "end_intent_runner": "judge",
     "turn_reader_runner": "judge",
     "bridge_runner": "interviewer",
+    "spec_reply_runner": "interviewer",
 }
+STREAM_SEAMS = frozenset({"spec_reply_runner"})
 # The ground-truth acts of a candidate who wants the role-play or the interview to stop.
 STOP_ACTS = frozenset({"end_request", "end_agree", "wrap_accept"})
 END_INTENT_LATENCY_SEC = 0.4
@@ -148,3 +152,48 @@ __all__ = [
     "scripted_runners",
     "seam_client",
 ]
+
+
+class SpecReplyMemo:
+    """Snapshot specs; commit at the adopted reply's first chunk. Generic providers run directly."""
+
+    def __init__(self, raw: Callable[[list], Any]) -> None:
+        self.raw = raw
+        self.stash: list[tuple[list, list, Any]] = []
+        self.spec_raw_calls = 0
+        self.committed = 0
+
+    async def spec_runner(self, messages: list) -> Any:
+        snapshot = copy.deepcopy(self.raw.learner) if hasattr(self.raw, "learner") else None
+        self.spec_raw_calls += 1
+        source = (snapshot if snapshot is not None else self.raw)(messages)
+        if inspect.isawaitable(source):
+            source = await source
+        chunks = [chunk async for chunk in source]
+        self.stash = [(copy.deepcopy(messages), chunks, snapshot)]
+        for chunk in chunks:
+            yield chunk
+
+    def commit(self, entry: tuple[list, list, Any]) -> None:
+        if entry[2] is not None:
+            self.raw.learner = entry[2]
+        self.stash.clear()
+        self.committed += 1
+
+    async def provider(self, messages: list) -> Any:
+        from r1_speculate import messages_equivalent
+        from rehearsal.scripted_interviewer import is_learner_prompt
+
+        if is_learner_prompt(messages):
+            for entry in self.stash:
+                if messages_equivalent(entry[0], messages):
+                    self.commit(entry)
+                    for chunk in entry[1]:
+                        yield chunk
+                    return
+            self.stash.clear()
+        source = self.raw(messages)
+        if inspect.isawaitable(source):
+            source = await source
+        async for chunk in source:
+            yield chunk

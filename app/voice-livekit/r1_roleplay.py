@@ -109,6 +109,7 @@ transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play c
 """
 from __future__ import annotations
 
+import copy
 import os
 import re
 from dataclasses import dataclass, replace
@@ -1762,6 +1763,15 @@ class TurnPlan:
         return self.mode is TurnMode.EXIT
 
 
+def plan_signature(plan: TurnPlan) -> tuple:
+    """Return decision fields for comparison or logging; timing-dependent reasons are excluded."""
+    return (
+        plan.mode, plan.move_id, plan.negotiation_id, plan.intent, plan.probe,
+        plan.aside, plan.line_id, plan.credit_move_id, plan.exit_roleplay,
+        plan.prelude_line, plan.continuation, plan.scripted_text,
+    )
+
+
 @dataclass(frozen=True)
 class Speech:
     """The text to hand to ``session.say``, and how it was built.
@@ -2531,6 +2541,13 @@ class RolePlayEngine:
         return text
 
     # ------------------------------------------------------------------ the decision
+    def speculative_copy(self) -> RolePlayEngine:
+        """Return a throwaway copy for plan_turn; nothing is merged into the untouched original."""
+        # Engine and member state contain no session-bound resources requiring custom deepcopy.
+        # Variation is deterministic from the seed; mutable state is copied with the engine.
+        memo = {id(self.persona): self.persona}
+        return copy.deepcopy(self, memo)
+
     def plan_turn(
         self,
         candidate_text: str,

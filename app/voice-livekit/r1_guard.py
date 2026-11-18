@@ -2860,6 +2860,60 @@ def _length_probe(ctx: GuardContext) -> str:
     return pick_variant(LENGTH_PROBES, ctx.seed, ctx.variant)
 
 
+# M033 T2 (``R1_GUARD_EARLY_RELEASE``): a sentence ending in one of these is never released
+# early (pure caution: ``split_sentences`` itself splits after them).
+_EARLY_ABBREVIATIONS = frozenset(
+    "mr mrs ms dr prof st sr jr vs etc inc ltd co approx ph mt".split()
+)
+
+
+def guard_early_release_enabled() -> bool:
+    """``R1_GUARD_EARLY_RELEASE`` (default on; M033 T2): a finished sentence left alone in the
+    stream buffer is released at its terminator, not when the next sentence starts or the stream
+    ends.  Read once per ``StreamGuard``.  Rollback: ``fly secrets set R1_GUARD_EARLY_RELEASE=0
+    -a project-hello-voice``."""
+    return (os.getenv("R1_GUARD_EARLY_RELEASE") or "1").strip().lower() not in {
+        "0", "off", "false", "no"
+    }
+
+
+def _looks_complete(part: str, raw: str) -> bool:
+    """M033 T2: ``part`` (the one sentence in the raw buffer ``raw``) is safe to release early.
+
+    The raw text ends on its terminator (no closing quote the splitter would consume), no digit
+    precedes it (``7.`` may become ``7.5``), no ellipsis, no ``U.S.``/``e.g.``/single-letter or
+    abbreviation token, quotes and brackets are balanced, and the splitter agrees it is a
+    boundary.  When unsure it says no: holding is always safe.
+    """
+    raw = raw.rstrip()
+    if not raw or raw[-1] not in ".?!" or not part or part[-1] != raw[-1]:
+        return False
+    if len(part) < 2 or part[-2].isdigit() or part.endswith(".."):
+        return False
+    if part[-1] == "." and not (part[-2].isalpha() or part[-2] in "\"')]"):
+        return False
+    token = part.split()[-1]
+    if "@" in token or "/" in token or "://" in token or token.lower().startswith("www"):
+        return False
+    letters = "".join(c for c in token[:-1] if c.isalpha())
+    if "." in token[:-1] or len(letters) == 1 or letters.lower() in _EARLY_ABBREVIATIONS:
+        return False
+    if (part.count('"') % 2 or part.count("(") > part.count(")")
+            or part.count("[") > part.count("]")):
+        return False
+    opening = False
+    for i, char in enumerate(part):
+        if char == "'":
+            if opening and (i + 1 == len(part) or not part[i + 1].isalnum()):
+                opening = False
+            elif not opening and (i == 0 or part[i - 1].isspace() or part[i - 1] in "([\""):
+                opening = True
+    if opening:
+        return False
+    parts = split_sentences(part + " Next")
+    return len(parts) == 2 and parts[0] == part
+
+
 class StreamGuard:
     """Vet an LLM reply sentence by sentence, as it streams.
 
@@ -2868,8 +2922,16 @@ class StreamGuard:
     fallback.  A learner reply stops at its word cap.  ``result`` aggregates the hits.
     """
 
-    def __init__(self, ctx: GuardContext) -> None:
+    def __init__(self, ctx: GuardContext, *, early_release: bool | None = None) -> None:
         self.ctx = ctx
+        self._early_release = (
+            guard_early_release_enabled() if early_release is None else early_release
+        )
+        self._ghost: str | None = None
+        self._ghost_len = 0
+        self._glued_prefix: str | None = None
+        self._probing = False
+        self._probe_rest = False
         self._buffer = ""
         self._emitted: list[str] = []
         self._hits: list[Hit] = []
@@ -3379,6 +3441,8 @@ class StreamGuard:
 
     def _rest_after(self, sentence: str) -> str:
         """The raw text received after ``sentence`` (``feed`` and ``flush`` vet from the buffer)."""
+        if self._probing:
+            self._probe_rest = True
         index = self._buffer.find(sentence)
         return "" if index < 0 else self._buffer[index + len(sentence) :]
 
@@ -3445,6 +3509,15 @@ class StreamGuard:
         if self._done:
             return []
         self._vetted += 1
+        if self._glued_prefix is not None:
+            prefix = self._glued_prefix
+            self._glued_prefix = None
+            hits = check_sentence(prefix + sentence, self.ctx)
+            if hits:
+                self._hits.extend(hits)
+                self._other_drops += 1
+                self._last_dropped = True
+                return []
         if self.ctx.offer_phrase_used and not self.ctx.is_learner and sentence:
             trimmed = without_offer_phrase(sentence)  # D4-TRANS-Q1: the offer was made once
             if trimmed != sentence:
@@ -3672,20 +3745,96 @@ class StreamGuard:
             self._done = True
         return [out]
 
+    def _settle_ghost(self, parts: list[str], final: bool) -> tuple[list[str], bool]:
+        """M033 T2: reconcile the buffer's ``parts`` with the early-released sentence (the ghost).
+
+        The buffer keeps the released text, so it evolves exactly as with the flag off.
+        Confirmed (the splitter now splits after it): the parts after it.  Waiting (only
+        whitespace or closing quotes/brackets so far, not at stream end): ``(parts, True)``.
+        Mismatch (a token glued onto it with no space, e.g. ``5 more.``): it was spoken and stays
+        so; the rest of the buffer, less any glued terminators or closing marks, goes on alone.
+        """
+        ghost = self._ghost
+        if len(parts) > 1 and parts[0] == ghost:
+            self._ghost = None
+            self._ghost_len = 0
+            return parts[1:], False
+        if parts == [ghost]:
+            if not final:
+                return parts, True
+            self._ghost = None
+            self._ghost_len = 0
+            return [], False
+        if (not final and len(parts) == 1 and parts[0].startswith(ghost)
+                and parts[0][len(ghost):]
+                and all(c in "\"')]" for c in parts[0][len(ghost):])):
+            return parts, True
+        remainder = self._buffer[self._ghost_len :]
+        stripped = remainder.lstrip(".?!\"')]")
+        glued_token = re.match(r"\S*", stripped).group()
+        if any(c.isalnum() for c in glued_token):
+            self._glued_prefix = ghost + remainder[:len(remainder) - len(stripped)]
+        self._buffer = stripped
+        self._ghost = None
+        self._ghost_len = 0
+        parts = split_sentences(self._buffer)
+        return [part for part in parts if any(c.isalnum() for c in part)], False
+
+    def _try_early_release(self, part: str) -> list[str]:
+        """M033 T2: vet ``part`` now if it looks complete and its vet needs no look-ahead.
+
+        The vet runs against a snapshot of the guard; if it consulted ``_rest_after`` (the
+        surface-repeat and topic-repeat checks read the text after the sentence) the snapshot is
+        restored and the sentence is held, as with the flag off.
+        """
+        if not _looks_complete(part, self._buffer):
+            return []
+        snapshot = {key: value.copy() if isinstance(value, (list, dict, set)) else value
+                    for key, value in self.__dict__.items()}
+        self._probing = True
+        self._probe_rest = False
+        out = self._vet(part)
+        if self._probe_rest:
+            self.__dict__.clear()
+            self.__dict__.update(snapshot)
+            return []
+        self._probing = False
+        self._ghost = part
+        self._ghost_len = len(self._buffer)
+        return out
+
     def feed(self, delta: str) -> list[str]:
         self._buffer += delta
         parts = split_sentences(self._buffer)
+        # M033 T2: a split that leaves trailing whitespace keeps only the stripped last part (a
+        # pre-existing quirk: the next delta is glued on), so that part is never released early.
+        trailing_space = bool(self._buffer and self._buffer[-1].isspace())
+        settled = False
+        if self._ghost is not None:
+            parts, waiting = self._settle_ghost(parts, False)
+            if waiting:
+                return []
+            settled = True
         if len(parts) <= 1:
+            if settled and parts:
+                self._buffer = parts[-1]
+            if self._early_release and parts and not (settled and trailing_space):
+                return self._try_early_release(parts[0])
             return []
         out: list[str] = []
         for sentence in parts[:-1]:
             out.extend(self._vet(sentence))
         self._buffer = parts[-1]
+        if self._early_release and not trailing_space:
+            out.extend(self._try_early_release(parts[-1]))
         return out
 
     def flush(self) -> list[str]:
         out: list[str] = []
-        for sentence in split_sentences(self._buffer):
+        parts = split_sentences(self._buffer)
+        if self._ghost is not None:
+            parts, _ = self._settle_ghost(parts, True)
+        for sentence in parts:
             out.extend(self._vet(sentence))
         self._buffer = ""
         if not self._emitted and self._summary_dropped and self._other_drops == 0:
@@ -3802,7 +3951,7 @@ class StreamGuard:
 
 def guard_text(text: str, ctx: GuardContext) -> GuardResult:
     """Vet a whole reply at once (the non-streaming form of ``StreamGuard``)."""
-    guard = StreamGuard(ctx)
+    guard = StreamGuard(ctx, early_release=False)
     guard.feed(text)
     guard.flush()
     return guard.result

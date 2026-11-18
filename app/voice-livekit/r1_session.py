@@ -36,7 +36,7 @@ phase:
 * ``prepare_turn`` (from ``R1Agent.on_user_turn_completed``) runs the role-play engine ONCE per
   SDK turn and fixes what the reply must be: suppressed, scripted, an owed move the model
   voices (with a scripted variant as the fallback), or a free reply.  Preemptive generation is
-  off for this agent so no generation can start before that decision.
+  off for this agent; guarded speculative generation uses a copy of that decision.
 * ``llm_node_stream`` (from ``R1Agent.llm_node``) builds the model's whole context from the
   interview's own history (``r1_replies.llm_messages``: the context filter, no tools) and passes
   its text through ``r1_guard`` sentence by sentence in EVERY phase, before the transcription
@@ -278,6 +278,8 @@ from r1_latency import (
     endpoint_max_delay_sec,
     interrupt_min_words,
     r1_turn_handling,
+    vad_endpoint_anchor_enabled,
+    warm_say_lines_enabled,
 )
 from r1_linecache import (
     LANE_R1,
@@ -345,6 +347,10 @@ from r1_script import (
     transition_presence_v2_enabled,
     transition_repair_enabled,
     wrap_offer_variant_enabled,
+)
+from r1_speculate import (
+    SPEC_MAX_CALLS_PER_SESSION, SPEC_MAX_STARTS_PER_ROW,
+    SpeculationUnusable, SpeculativeReply,
 )
 from r1_sarvam import current_speech_id
 from r1_text import is_question_like, normalize, pick_variant, split_sentences
@@ -776,7 +782,8 @@ _LIVE_PHASES = frozenset(
 # (L-FILLER*, L-TIME-CUE, the guard's L-NO-FEEDBACK swap, L-TRANSITION-ASK after Christy's answers
 # before the role-play) and L-FAQ-DEFER (no runtime caller).
 # Warming them would spend Sarvam requests, a budget shared with the phone lane, on audio nothing
-# can play (pr4c-rebase.md 4.1).
+# can play (pr4c-rebase.md 4.1). L-WRAP-MORE is a reply-stream tail but is also said by the
+# wrap-up loop, so _warm_order adds it while R1_WARM_SAY_LINES is on.
 _WARM_ORDER = (
     # M032 S7C (SWEEP-35): the agendas and the hello again come first: they play a few seconds into
     # the interview.  The hello itself carries the name and is spoken at once, like L-OPEN.
@@ -1102,6 +1109,16 @@ def _env_seconds(raw: str | None, default: float, minimum: float, maximum: float
     if not math.isfinite(value):
         return default
     return min(maximum, max(minimum, value))
+
+
+def speculative_reply_enabled() -> bool:
+    """Default on; rollback: fly secrets set R1_SPECULATIVE_REPLY=0 -a project-hello-voice."""
+    return _env_switch(os.getenv("R1_SPECULATIVE_REPLY"))
+
+
+def latency_summary_enabled() -> bool:
+    """``R1_LATENCY_SUMMARY`` (default on): log session latency statistics at exit."""
+    return _env_switch(os.getenv("R1_LATENCY_SUMMARY"))
 
 
 def ack_hold_enabled() -> bool:
@@ -3280,10 +3297,13 @@ def _agent_turn_handling() -> dict[str, Any]:
       made without it;
     * the decision is not idempotent: ``RolePlayEngine.plan_turn`` advances the turn counter, the
       owed-move scheduler, the disclosure gate, the reveal offers, the ask stalls and the close
-      attempts, and it has no dry-run form to compare against afterwards, so it cannot be run for
-      a transcript that may still change;
+      attempts, so the real engine cannot be run for a transcript that may still change;
     * a speculative ``llm_node`` would also feed ``_after_guard`` (guard hits become admin-log
       rows), the failure counter and the speech slots with a generation the SDK may discard.
+
+    R1 now starts its own guarded reply at the final transcript (R1_SPECULATIVE_REPLY),
+    planning on RolePlayEngine.speculative_copy with a separate client. It replays only
+    when messages_equivalent holds at the real llm_node.
 
     What it would buy is measured instead: ``r1_latency`` reports ``eou_to_turn_hook``, the
     endpointing window a preemptive generation could overlap.
@@ -3372,17 +3392,20 @@ class R1Agent(Agent):
 async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     """Build R1 providers with the browser lane's env variables and exact defaults.
 
-    Browser sessions pass neither VAD nor turn detection, so R1 does the same: both stay the
-    session's defaults.  PR-4c changes only the TIMINGS around them (``r1_turn_handling``:
-    endpointing, interruption length and words; preemptive generation stays off), which the
-    SDK reads from the session, and nothing else about turn taking.
+    Turn detection stays the session's default.  The VAD is the SDK's default silero model,
+    handed to the session explicitly while ``R1_VAD_ENDPOINT_ANCHOR`` is on (M033 T1), so the
+    endpointing wait runs from the candidate's real end of speech and not from Sarvam's final
+    (``r1_latency``); with it off no VAD is given and the SDK builds the same model itself, as
+    before.  PR-4c changes only the TIMINGS around them (``r1_turn_handling``: endpointing,
+    interruption length and words; preemptive generation stays off).  One ``r1_endpointing``
+    line names the anchor and the minimum in use.
 
     The voices (owner decision 2026-10-30) are read ONCE here (``r1_voice_set``): v4 is one
     ``R1SarvamTTS`` speaking Christy and the learner per speech, v3 (the rollback) is
     ``sarvam.TTS(**r1_tts_kwargs())`` exactly as before (``r1_sarvam.build_r1_tts``).  The STT
     model is R1's own switch (``r1_stt_model``): saaras:v4 unless it is set (saaras:v3 rollback).
     """
-    from livekit.agents import APIConnectOptions, AgentSession
+    from livekit.agents import APIConnectOptions, AgentSession, inference
     from livekit.agents.voice.agent_session import SessionConnectOptions
     from livekit.plugins import sarvam
     from r1_llm import build_r1_llm
@@ -3393,7 +3416,22 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     if stt_note is not None:
         _log.warn("unknown_event", error_type="r1_stt_setting_rejected", error_category=stt_note)
     _log.info("unknown_event", error_type="r1_stt_model", model=stt_model)
+    turn_handling = r1_turn_handling()
+    anchor = vad_endpoint_anchor_enabled()
+    _log.info(
+        "unknown_event",
+        error_type="r1_endpointing",
+        error_category="vad_anchor" if anchor else "transcript",
+        duration_sec=turn_handling["endpointing"]["min_delay"],
+    )
+    if anchor and (os.getenv("R1_ENDPOINT_MIN_DELAY_SEC") or "").strip():
+        # The transcript-anchored minimum is not applied as real silence (r1_latency); no value.
+        _log.warn("unknown_event", error_type="r1_endpoint_setting_ignored")
+    # Anchor on: the SDK's own default VAD, handed over explicitly so the endpointing wait runs
+    # from the VAD's end of speech.  Off: no "vad" key at all, exactly as before.
+    vad_kwargs = {"vad": inference.VAD(model="silero")} if anchor else {}
     return AgentSession(
+        **vad_kwargs,
         stt=sarvam.STT(model=stt_model, language=os.getenv("SARVAM_LANGUAGE", "en-IN")),
         tts=tts,
         llm=build_r1_llm(),
@@ -3404,7 +3442,7 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
                 timeout=10.0,
             )
         ),
-        turn_handling=r1_turn_handling(),
+        turn_handling=turn_handling,
         user_away_timeout=None,
     )
 
@@ -3619,6 +3657,7 @@ class R1Interview:
         rate_limits: RateLimitCounter | None = None,
         end_intent_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
         turn_reader_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
+        spec_reply_runner: Callable[[list[dict[str, str]]], Any] | None = None,
         bridge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
     ) -> None:
         self.ctx = ctx
@@ -3850,6 +3889,8 @@ class R1Interview:
         # The first name the candidate gave in their own introduction, kept only while the record
         # has no usable name (``_first_name``).  Never logged.
         self._spoken_name = ""
+        self._name_rewarmed = False
+        self._name_warm_task: asyncio.Future[Any] | None = None
         self._history: list[dict[str, Any]] = []
         self._latest_candidate_index: int | None = None
         self._user_turn_started: float | None = None
@@ -3913,6 +3954,17 @@ class R1Interview:
         # The brief the candidate heard (L-TRANSITION, or L-TRANSITION-BRIDGED after the
         # bridge's reaction): what a request to hear it again replays (``_repeat_brief``).
         self._brief_line = "L-TRANSITION"
+        self._spec_enabled = speculative_reply_enabled()
+        self._spec_runner = spec_reply_runner
+        self._spec_llm: Any = None
+        self._spec_unusable = False
+        self._spec: SpeculativeReply | None = None
+        self._spec_committed: SpeculativeReply | None = None
+        self._spec_retired: set[SpeculativeReply] = set()
+        self._spec_deferred = False
+        self._spec_counts: dict[str, int] = {}
+        self._spec_starts: dict[int, int] = {}
+        self._spec_total = 0
         self._turn_finals: list[str] = []
         self._end_intent_call: _EndIntentCall | None = None
         self._end_intent_seq = 0
@@ -4069,10 +4121,14 @@ class R1Interview:
         self._spoken_name = name
         if self._engine is not None:
             self._engine.candidate_first_name = name
-        # A label only, never the name.  The lines that carry the name were warmed for the
-        # name-less text, so the first time one is spoken it is a cache miss and is synthesised
-        # live (one TTS round trip); warming the new text again would spend Sarvam requests,
-        # a budget shared with the phone lane, for a path that is rare (the record has a name).
+        # Labels only, never the name. With the flag on, rewarm the changed name lines once:
+        # at most six requests from the shared Sarvam budget. Off, misses are synthesised live.
+        if warm_say_lines_enabled() and self._line_cache is not None and not self._name_rewarmed:
+            self._name_rewarmed = True
+            if self._name_warm_task is not None and not self._name_warm_task.done():
+                self._name_warm_task.cancel()
+            self._name_warm_task = self._spawn(self._warm_line_cache(candidate_free=False))
+            _log.info("unknown_event", error_type="r1_line_cache_rewarm")
         _log.info("unknown_event", error_type="r1_spoken_name_adopted")
 
     def render_line(self, line_id: str) -> str:
@@ -4115,6 +4171,7 @@ class R1Interview:
 
         A candidate row that is still open is written first: a row never straddles a phase.
         """
+        self._cancel_spec("discarded_mode")
         self._flush_candidate_row()
         self._unvoiced_since = None  # a new phase is a new wait
         # A turn never straddles a phase either: its finals, and a classification started for them.
@@ -4538,6 +4595,7 @@ class R1Interview:
         transcript drain that follows waits for it.  The audio recorder stops capturing here
         (idempotent) so its finish overlaps that drain instead of queueing behind it.
         """
+        self._cancel_spec("discarded_mode")
         self._flush_candidate_row()
         self._exiting = True
         self._cancel_deadlines()
@@ -4581,6 +4639,11 @@ class R1Interview:
 
     async def _drain_background(self) -> None:
         """Flush queued transcript writes, then cancel anything still running."""
+        self._cancel_spec("discarded_mode")
+        retired, self._spec_retired = self._spec_retired, set()
+        for spec in retired:
+            with contextlib.suppress(Exception):
+                await spec.aclose()
         pending = {task for task in self._turn_writes if not task.done()}
         if pending:
             _, still_pending = await asyncio.wait(
@@ -4620,6 +4683,7 @@ class R1Interview:
         if self._fidelity_queued:
             return
         self._fidelity_queued = True
+        self._log_latency_summary()
         engine = self._engine
         has_record = engine is not None and (engine.turn > 0 or bool(self._guard_trips))
         if not has_record and not self.machine.roleplay_entered:
@@ -4661,6 +4725,47 @@ class R1Interview:
         task = asyncio.ensure_future(self._post_fidelity(poster, events))
         self._turn_writes.add(task)
         task.add_done_callback(self._turn_writes.discard)
+
+    def _log_latency_summary(self) -> None:
+        """Log one line per statistic using numbers and labels only.
+
+        Phases are the tracker's fixed labels plus ``all``.  Read once at exit from
+        ``_queue_fidelity`` before its early return, including icebreaker-only sessions.
+        ``R1_LATENCY_SUMMARY=0`` emits nothing.
+        """
+        try:
+            if not latency_summary_enabled():
+                return
+            for phase, summary in self._latency.summary_all().items():
+                for stage, stats in summary["stages"].items():
+                    for statistic in ("p50", "p90", "max"):
+                        _log.info(
+                            "unknown_event", error_type="r1_latency", schema="summary_" + stage,
+                            error_category=statistic, phase=phase,
+                            duration_sec=round(stats[statistic], 3), option_count=stats["n"],
+                        )
+                for kind, count in summary["anchors"].items():
+                    if count:
+                        _log.info(
+                            "unknown_event", error_type="r1_latency", schema="summary_anchor",
+                            error_category=kind, phase=phase, option_count=count,
+                        )
+                _log.info(
+                    "unknown_event", error_type="r1_latency", schema="summary_lost",
+                    phase=phase, option_count=summary["lost"],
+                )
+            if self._spec_enabled:
+                for category, count in self._spec_counts.items():
+                    if count:
+                        _log.info(
+                            "unknown_event", error_type="r1_latency", schema="summary_spec",
+                            error_category=category, phase="all", option_count=count,
+                        )
+        except Exception as exc:  # noqa: BLE001 - measurement must never block the exit
+            _log.warn(
+                "unknown_event", error_type="r1_latency_summary_failed",
+                error_category=_error_type_of(exc),
+            )
 
     def _repair_facts(self) -> dict[str, Any]:
         """M032 S6: the labels and counts the repairs add to ``session_facts`` (flags on only)."""
@@ -4986,6 +5091,15 @@ class R1Interview:
             error_category="live" if clip is None else "cached",
             schema=marker,
         )
+        if clip is None and warm_say_lines_enabled():
+            try:
+                label = "pending" if marker in self._warm_order() else "not_warmed"
+            except Exception:  # noqa: BLE001 - diagnostics must never interrupt speech
+                label = "not_warmed"
+            _log.info(
+                "unknown_event", error_type="r1_line_cache_miss",
+                error_category=label, schema=marker,
+            )
         # ``frames()`` hands the audio over at a bounded rate (1 s at once, then at most four
         # times real time).  Handed over in one step, the SDK's per-frame work on the 36 s
         # L-TRANSITION blocked the loop for ~0.65 s before its first audio, and the recorder gave
@@ -5018,7 +5132,8 @@ class R1Interview:
         without M032 S6's lines while the transition repair is off, nor S7C's while theirs are,
         nor L-TRANSITION-ASK-PAUSE while ``R1_START_ASK_ONCE`` is.  D3-ICE1: L-TRANSITION is the
         session's thanked brief while ``R1_REACTION_VARIETY`` picks one (``_seeded_thanks_id``),
-        with the neutral A beside a seeded B (D3-ICE1-THANKS-CONTEXT: B needs a real answer)."""
+        with the neutral A beside a seeded B (D3-ICE1-THANKS-CONTEXT: B needs a real answer);
+        add L-WRAP-MORE while R1_WARM_SAY_LINES is on."""
         first = self._seeded_thanks_id()
         firsts = (first, _THANKS_NEUTRAL) if first == _THANKS_AFTER_ANSWER else (first,)
         order = tuple(
@@ -5051,6 +5166,9 @@ class R1Interview:
             dropped.add("L-ASIDE-WRAP-AGAIN")  # D5-ASIDE-WRAP2: only a later offer speaks it
         if dropped:
             order = tuple(line_id for line_id in order if line_id not in dropped)
+        if warm_say_lines_enabled() and "L-WRAP-MORE" not in order:
+            index = order.index("L-WRAP-NEXT") + 1 if "L-WRAP-NEXT" in order else len(order)
+            order = (*order[:index], "L-WRAP-MORE", *order[index:])
         if not transition_bridge_enabled():
             return order
         index = order.index(first) + 1
@@ -5065,7 +5183,9 @@ class R1Interview:
         for the activated session (``run``): they are synthesised for this session alone.
         """
         if self._line_cache is not None:
-            self._spawn(self._warm_line_cache(candidate_free=candidate_free))
+            task = self._spawn(self._warm_line_cache(candidate_free=candidate_free))
+            if not candidate_free:
+                self._name_warm_task = task
 
     async def _warm_line_cache(self, *, candidate_free: bool) -> None:
         cache = self._line_cache
@@ -6001,17 +6121,26 @@ class R1Interview:
             return 0.0
         return self.machine.remaining_roleplay_seconds()
 
-    def _note_candidate_turn(self, text: str, index: int | None) -> dict[str, Any]:
-        """Add the candidate's whole turn to the history the context filter selects from."""
-        entry = {
+    def _candidate_entry(self, text: str, index: int | None) -> dict[str, Any]:
+        """Build a candidate history entry without changing session state."""
+        return {
             "seq": self._turn_index + 0.5 if index is None else index,
             "role": "candidate",
             "text": text,
             "phase": self.machine.transcript_phase(),
             "voice": "candidate",
         }
+
+    def _note_candidate_turn(self, text: str, index: int | None) -> dict[str, Any]:
+        """Add the candidate's whole turn to the history the context filter selects from."""
+        entry = self._candidate_entry(text, index)
         self._history.append(entry)
         return entry
+
+    def _peek_user_turn_seconds(self) -> float | None:
+        """Read the monologue length so far without clearing it."""
+        started = self._user_turn_started
+        return None if started is None else max(0.0, self._clock() - started)
 
     def _take_user_turn_seconds(self) -> float | None:
         """How long the candidate talked since the turn began (the monologue length)."""
@@ -6099,6 +6228,7 @@ class R1Interview:
             verdict = await self._await_end_intent(turn)
             confirmed = await self._settle_bare_yes(turn)
         except _BareYesDeferred:
+            self._cancel_spec("discarded_mode", live=False)
             # The candidate went on after the yes: it is said to the interviewer (its row and its
             # history entry are ``aside``, as the turn that confirms a stop is) and answers nothing
             # alone; the next turn decides, with the question still open.
@@ -6107,6 +6237,7 @@ class R1Interview:
             self._write_candidate_row(turn.row, "aside")
             raise StopResponse() from None
         except BaseException:
+            self._cancel_spec("discarded_mode", live=False)
             self._write_candidate_row(turn.row)
             raise
         self._finish_turn(turn, message_id, end_intent=verdict, confirmed_yes=confirmed)
@@ -6124,6 +6255,16 @@ class R1Interview:
         row = self._close_candidate_row()
         index = self._latest_candidate_index
         self._latest_candidate_index = None
+        self._cancel_spec("discarded_index", live=False)
+        spec, self._spec = self._spec, None
+        if spec is not None:
+            if spec.row != index:
+                self._discard_spec(spec, "discarded_index")
+            elif spec.key != normalize(text):
+                self._discard_spec(spec, "discarded_key")
+            else:
+                self._spec_committed = spec
+        self._spec_deferred = False
         if self._mute_turn_index is not None:
             # Review of S7C: the turn in flight at the mute is committed; the aside may be due.
             self._mute_turn_index = None
@@ -6152,6 +6293,12 @@ class R1Interview:
             self._decide_turn(
                 turn, message_id, end_intent=end_intent, confirmed_yes=confirmed_yes
             )
+            reply = self._last_reply
+            if not self._spec_reply_eligible(reply, turn.index):
+                self._cancel_spec("discarded_mode", live=False)
+        except BaseException:
+            self._cancel_spec("discarded_mode", live=False)
+            raise
         finally:
             self._write_candidate_row(turn.row, self._candidate_row_phase)
             self._candidate_row_phase = None
@@ -7577,6 +7724,142 @@ class R1Interview:
         call, self._turn_reader_call = self._turn_reader_call, None
         self._drop_turn_reader_call(call)
 
+    def _spec_log(self, category: str, index: int) -> None:
+        """Log labels only, never text, and count them for summary_spec."""
+        self._spec_counts[category] = self._spec_counts.get(category, 0) + 1
+        _log.info(
+            "unknown_event", error_type="r1_spec_reply", error_category=category,
+            phase=self.machine.transcript_phase(), turn_index=index,
+        )
+
+    def _retire_spec(self, spec: SpeculativeReply) -> None:
+        """Track an unfinished spec until its task completes."""
+        task = spec.task
+        if task is not None and not task.done():
+            self._spec_retired.add(spec)
+            task.add_done_callback(lambda _task: self._spec_retired.discard(spec))
+
+    def _discard_spec(self, spec: SpeculativeReply, category: str) -> None:
+        """Cancel and count a discarded spec, tracking it only while unfinished."""
+        spec.cancel()
+        self._retire_spec(spec)
+        self._spec_log(category, spec.row)
+
+    def _cancel_spec(self, category: str, *, live: bool = True) -> None:
+        """Synchronously cancel live and committed slots without raising."""
+        if live:
+            spec, self._spec = self._spec, None
+            if spec is not None:
+                self._discard_spec(spec, category)
+            self._spec_deferred = False
+        spec, self._spec_committed = self._spec_committed, None
+        if spec is not None:
+            self._discard_spec(spec, category)
+
+    def _spec_runner_or_none(self) -> Callable[[list[dict[str, str]]], Any] | None:
+        """Use the init-latched flag and injected seam; default only with a session LLM.
+
+        Return None once unusable."""
+        if not self._spec_enabled or self._spec_unusable:
+            return None
+        if self._spec_runner is not None:
+            return self._spec_runner
+        return self._default_spec_runner if getattr(self.session, "llm", None) is not None else None
+
+    async def _default_spec_runner(self, messages: list[dict[str, str]]) -> AsyncIterator[Any]:
+        """Use a lazily built client, never the session LLM or its provider error/abort path."""
+        try:
+            from livekit.agents import APIConnectOptions
+            from r1_llm import build_r1_llm
+
+            if self._spec_llm is None:
+                self._spec_llm = build_r1_llm()
+                self._spec_llm.on("error", self._on_spec_error)
+            options = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
+        except Exception as exc:
+            self._spec_unusable = True
+            _log.warn(
+                "unknown_event", error_type="r1_spec_reply_unusable",
+                error_category=_error_type_of(exc),
+            )
+            raise
+        async with self._spec_llm.chat(
+            chat_ctx=_chat_context_from(messages), conn_options=options
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
+
+    @staticmethod
+    def _spec_reply_eligible(reply: Reply | None, index: int | None) -> bool:
+        """Accept only a matching roleplay plan that can use a learner reply."""
+        if reply is None or reply.phase != ROLEPLAY_PHASE or reply.candidate_index != index:
+            return False
+        plan = reply.plan
+        return (plan is not None and plan.mode in (TurnMode.LLM_REPLY, TurnMode.INTENT)
+                and not plan.aside and not plan.exit_roleplay)
+
+    def _speculate_reply(self, row: _CandidateRow) -> None:
+        """Check read-only eligibility and dry-run on RolePlayEngine.speculative_copy.
+
+        Require an active roleplay and start one spec at most, within row and session caps."""
+        try:
+            runner = self._spec_runner_or_none()
+            if (runner is None or self._engine is None or self.machine.phase is not R1Phase.ROLEPLAY
+                    or self._exiting or self._stop_outcome() is not None):
+                return
+            text = " ".join(self._turn_finals)
+            key = normalize(text)
+            spec = self._spec
+            if spec is not None and (spec.row != row.index or spec.key != key):
+                self._spec = None
+                self._discard_spec(spec, "discarded_key")
+                spec = None
+            if self._user_state == "speaking":
+                self._spec_deferred = True
+                self._spec_log("skipped_speaking", row.index)
+                return
+            self._spec_deferred = False
+            if spec is not None:
+                return
+            speech = getattr(self.session, "current_speech", None)
+            if speech is not None and getattr(speech, "allow_interruptions", True) is False:
+                return
+            if not key or self.reply_suppressed(text) or self._consent_echo(text, row.index):
+                return
+            if self._end_intent_wanted(text):
+                self._spec_log("skipped_end_intent", row.index)
+                return
+            if (self._spec_starts.get(row.index, 0) >= SPEC_MAX_STARTS_PER_ROW
+                    or self._spec_total >= SPEC_MAX_CALLS_PER_SESSION):
+                self._spec_log("skipped_cap", row.index)
+                return
+            r_sec = self.machine.roleplay_elapsed
+            plan = self._engine.speculative_copy().plan_turn(
+                text, r_sec, turn_index=row.index, candidate_seconds=self._peek_user_turn_seconds(),
+                backchannel=is_acknowledgement_turn(text), repair=is_repair_turn(text),
+                answers_nothing=is_backchannel_turn(text), end_intent=None, confirmed_yes=False,
+            )
+            if (plan.mode not in (TurnMode.LLM_REPLY, TurnMode.INTENT)
+                    or plan.aside or plan.exit_roleplay):
+                self._spec_log("discarded_mode", row.index)
+                return
+            entry = self._candidate_entry(text, row.index)
+            reply = Reply(phase=ROLEPLAY_PHASE, candidate_text=text, entry=entry,
+                          candidate_index=row.index, plan=plan, r_sec=r_sec)
+            messages = llm_messages(
+                reply, self.persona, [*self._history, entry], voice=self._interviewer_voice,
+                reactions=self._reaction_variety, reactions_v2=self._reaction_variety_v2,
+            )
+            spec = SpeculativeReply(row.index, key)
+            spec.start(runner, messages, self._clock)
+            self._spec = spec
+            self._spec_starts[row.index] = self._spec_starts.get(row.index, 0) + 1
+            self._spec_total += 1
+            self._spec_log("started", row.index)
+        except Exception as exc:
+            _log.warn("unknown_event", error_type="r1_spec_reply_failed",
+                      error_category=_error_type_of(exc))
+
     def _speculate_turn_reader(self, row: _CandidateRow) -> None:
         """Start reading the open row at its latest final, or again when a continuation changed it.
 
@@ -7955,7 +8238,14 @@ class R1Interview:
         WEAK stall, an "Oh wait") never calls the model.  A turn nobody prepared (a
         generation the hook did not decide) speaks the safe fallback rather than guess.
         """
+        spec, self._spec_committed = self._spec_committed, None
         reply = self._reply_for(chat_ctx)
+        if spec is not None and reply is not None and spec.row != reply.candidate_index:
+            self._discard_spec(spec, "discarded_index")
+            spec = None
+        if spec is not None and not self._spec_reply_eligible(reply, spec.row):
+            self._discard_spec(spec, "discarded_mode")
+            spec = None
         if reply is None:
             _log.warn(
                 "unknown_event",
@@ -7964,6 +8254,8 @@ class R1Interview:
             )
             return self._single(FALLBACK_REPLY)
         if reply.retry_text:
+            if spec is not None:
+                self._discard_spec(spec, "discarded_mode")
             # D5-RELIAB1: the retry of a hung intent is its owed point's scripted variant, with no
             # model call (and so never an answer from the provider).
             text, reply.retry_text = reply.retry_text, ""
@@ -7987,11 +8279,61 @@ class R1Interview:
             reactions=self._reaction_variety,
             reactions_v2=self._reaction_variety_v2,
         )
+        if spec is not None:
+            if spec.row != reply.candidate_index:
+                self._discard_spec(spec, "discarded_index")
+            elif spec.truncated or not spec.matches(messages):
+                self._discard_spec(spec, "discarded_messages")
+            else:
+                original_provider = provider
+                self._retire_spec(spec)
+
+                def provider(_messages):
+                    return self._replay_spec(spec, original_provider, messages)
+                self._spec_log("adopted", spec.row)
+                self._emit_latency(
+                    "spec_head_start", spec.head_start(self._clock()), category="adopted",
+                    phase=self.machine.transcript_phase(), turn_index=reply.candidate_index,
+                )
         if plan is not None and plan.mode is TurnMode.INTENT:
             source = self._intent_reply(lambda: provider(messages), guard, reply)
         else:
             source = self._screened(lambda: provider(messages), guard, reply)
         return self.guard_llm_stream(source, reply=reply)
+
+    async def _replay_spec(
+        self, spec: SpeculativeReply, provider: Callable[[list[dict[str, str]]], Any],
+        messages: list[dict[str, str]],
+    ) -> AsyncIterator[Any]:
+        """Replay; fall back without counting a failure if unusable before the first chunk.
+
+        After a chunk, propagate SpeculationUnusable instead of falling back."""
+        yielded = False
+        try:
+            try:
+                async for chunk in spec.replay():
+                    yielded = True
+                    yield chunk
+            except SpeculationUnusable:
+                if yielded:
+                    raise
+                self._spec_log("unusable", spec.row)
+                result = provider(messages)
+                if inspect.isawaitable(result):
+                    result = await result
+                iterator = result.__aiter__()
+                try:
+                    async for chunk in iterator:
+                        yield chunk
+                finally:
+                    with contextlib.suppress(Exception):
+                        close = getattr(iterator, "aclose", None)
+                        if close is not None:
+                            await close()
+        finally:
+            with contextlib.suppress(Exception):
+                await spec.aclose()
+            self._spec_retired.discard(spec)
 
     def _interviewer_guard_context(self, reply: Reply) -> Any:
         """The guard context of one of Christy's replies (M032 S5 on top of the engine's).
@@ -8468,11 +8810,12 @@ class R1Interview:
             return
         self._failures = 0
 
-    def _spawn(self, awaitable: Awaitable[Any]) -> None:
+    def _spawn(self, awaitable: Awaitable[Any]) -> asyncio.Future[Any]:
         """Run a fire-and-forget task that the exit funnel can cancel."""
         task = asyncio.ensure_future(awaitable)
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+        return task
 
     def _uninterruptible_speech_live(self) -> bool:
         """True while any known speech was started with ``allow_interruptions=False``.
@@ -8819,6 +9162,7 @@ class R1Interview:
         self._speculate_end_intent()
         # M032 S4: the shadow turn reader reads the row so far (last, and it can never raise here).
         self._speculate_turn_reader(row)
+        self._speculate_reply(row)
 
     def _latch_brief_at_transcript(self, text: str, row: _CandidateRow) -> None:
         """M032 S6: latch a request for the brief (or a shorter one) at the transcript.
@@ -9511,6 +9855,8 @@ class R1Interview:
                 # M032 S4: a final came while the candidate was still speaking; they stopped, so
                 # the shadow turn reader reads the row so far now (it can never raise here).
                 self._speculate_turn_reader(self._open_row)
+            if self._spec_deferred and self._open_row is not None:
+                self._speculate_reply(self._open_row)
         self._refresh_quiet()
 
     def _refresh_quiet(self) -> None:
@@ -9554,7 +9900,11 @@ class R1Interview:
             current = getattr(current, "error", None)
         return None
 
-    def _note_rate_limited(self, error: Any) -> None:
+    def _on_spec_error(self, event: Any) -> None:
+        if self._provider_status(event) == 429:
+            self._note_rate_limited(event, component="llm_spec")
+
+    def _note_rate_limited(self, error: Any, *, component: str | None = None) -> None:
         """Count a provider 429 for this lane (``r1``) and component, and log the running total.
 
         Every 429 counts, recoverable or not: the SDK retries a 429, and a retried 429 is still
@@ -9562,8 +9912,8 @@ class R1Interview:
         the phone lane, so this is how an R1 burst is told apart from a phone one.
         """
         kind = str(getattr(error, "type", ""))
-        component = kind[: -len("_error")] if kind.endswith("_error") else ""
-        if component not in ("llm", "tts", "stt"):
+        component = component or (kind[: -len("_error")] if kind.endswith("_error") else "")
+        if component not in ("llm", "llm_spec", "tts", "stt"):
             component = "provider"
         count = self._rate_limits.record(LANE_R1, component)
         _log.warn(

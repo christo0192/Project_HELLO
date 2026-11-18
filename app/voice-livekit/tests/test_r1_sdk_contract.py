@@ -1026,7 +1026,7 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
             return "stt"
 
         # The flip at v3 is today's construction exactly (owner decision 2026-10-30).
-        env = {"R1_TTS_PROFILE": "v3"}
+        env = {"R1_TTS_PROFILE": "v3", "R1_VAD_ENDPOINT_ANCHOR": "0"}
         with mock.patch.dict(os.environ, env), mock.patch.object(
             agents, "AgentSession", RecordingSession
         ), mock.patch.object(sarvam, "STT", recording_stt), mock.patch.object(
@@ -1048,10 +1048,13 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
             options.llm_conn_options,
             APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0),
         )
-        # Browser parity: no VAD and no turn DETECTOR override.  PR-4c gives the session R1's
-        # turn timings (endpointing, interruption, preemptive generation off) and nothing else.
+        # Anchor off (R1_VAD_ENDPOINT_ANCHOR=0, the rollback): no VAD and no turn DETECTOR
+        # override, exactly as before M033 T1.  PR-4c gives the session R1's turn timings
+        # (endpointing, interruption, preemptive generation off) and nothing else.
         self.assertNotIn("vad", captured)
-        self.assertEqual(captured["turn_handling"], r1_latency.r1_turn_handling())
+        with mock.patch.dict(os.environ, {"R1_VAD_ENDPOINT_ANCHOR": "0"}):
+            self.assertEqual(captured["turn_handling"], r1_latency.r1_turn_handling())
+        self.assertEqual(captured["turn_handling"]["endpointing"]["min_delay"], 0.8)
         self.assertNotIn("turn_detection", captured["turn_handling"])
         # The session's voice is the one the line cache synthesises with.
         self.assertEqual(tts_kwargs, r1_tts.r1_tts_kwargs())
@@ -1060,6 +1063,52 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
             {"model": "bulbul:v3", "speaker": "simran", "pace": 1.0, "temperature": 0.8},
         )
         self.assertEqual(stt_kwargs, {"model": "saaras:v4", "language": "en-IN"})
+
+    async def test_vad_anchor_factory_modes_and_logs(self) -> None:
+        import livekit.agents as agents
+        from livekit.agents import inference
+        from livekit.plugins import sarvam
+        import r1_latency
+        import r1_llm
+        import r1_session
+
+        try:
+            fresh = inference.VAD(model="silero")
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"inference VAD unavailable: {exc}")
+        for flag, legacy in (("1", "0.6"), ("1", ""), ("0", "0.6")):
+            with self.subTest(flag=flag, legacy=legacy):
+                captured = {}
+                env = {"R1_VAD_ENDPOINT_ANCHOR": flag, "R1_ENDPOINT_MIN_DELAY_SEC": legacy}
+                with mock.patch.dict(os.environ, env), mock.patch.object(
+                    agents, "AgentSession", side_effect=lambda **kw: captured.update(kw)
+                ), mock.patch.object(sarvam, "STT"), mock.patch.object(
+                    r1_session, "_build_session_tts"
+                ), mock.patch.object(r1_llm, "build_r1_llm"), mock.patch.object(
+                    r1_session._log, "info"
+                ) as info, mock.patch.object(r1_session._log, "warn") as warn:
+                    os.environ.pop("R1_ENDPOINT_VAD_MIN_DELAY_SEC", None)
+                    await r1_session._default_session_factory(None, {})
+                    self.assertEqual(captured["turn_handling"], r1_latency.r1_turn_handling())
+                    category = "vad_anchor" if flag == "1" else "transcript"
+                    minimum = 1.0 if flag == "1" else 0.6
+                    info.assert_any_call(
+                        "unknown_event", error_type="r1_endpointing",
+                        error_category=category, duration_sec=minimum,
+                    )
+                    ignored = [call for call in warn.call_args_list
+                               if call.kwargs.get("error_type") == "r1_endpoint_setting_ignored"]
+                    self.assertEqual(len(ignored), int(flag == "1" and bool(legacy)))
+                    if ignored:
+                        self.assertEqual(
+                            ignored[0].kwargs, {"error_type": "r1_endpoint_setting_ignored"}
+                        )
+                if flag == "1":
+                    self.assertIsInstance(captured["vad"], inference.VAD)
+                    self.assertEqual(captured["vad"]._opts, fresh._opts)
+                    self.assertEqual(captured["vad"]._model, fresh._model)
+                else:
+                    self.assertNotIn("vad", captured)
 
     async def test_r1_agent_builds_on_the_real_agent_and_routes_its_llm_node(self) -> None:
         import r1_session
@@ -1235,13 +1284,60 @@ class TestR1LatencyOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
     """PR-4c (plan 5.15): turn handling, preemptive generation, the early-flush node, cached
     audio and the SDK's own timings, against the installed livekit-agents 1.6.4."""
 
+    async def test_vad_end_and_final_set_the_eou_wait(self) -> None:
+        from livekit.agents import stt, vad
+        from livekit.agents.voice import audio_recognition as recognition
+
+        for default in (False, True):
+            hooks = mock.Mock()
+            session = SimpleNamespace(options=SimpleNamespace(interruption={}), amd=None)
+            endpointing = SimpleNamespace(min_delay=1.0, max_delay=3.0)
+            rec = AudioRecognition(
+                session, hooks=hooks, endpointing=endpointing, stt=None, vad=mock.Mock(),
+                using_default_vad=default, interruption_detection=None, turn_detection=None,
+            )
+            from opentelemetry import trace
+            rec._ensure_user_turn_span = lambda: trace.INVALID_SPAN
+            rec._check_user_turn_limit = mock.Mock()
+            rec._run_eou_detection = mock.Mock()
+            event = SimpleNamespace(
+                type=vad.VADEventType.END_OF_SPEECH, silence_duration=0.25,
+                inference_duration=0.0,
+            )
+            final = stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(language="en", text="Hello")],
+            )
+            with mock.patch.object(recognition.time, "time", return_value=100.25):
+                await rec._on_vad_event(event)
+            with mock.patch.object(recognition.time, "time", return_value=100.55):
+                await rec._on_stt_event(final)
+            self.assertAlmostEqual(rec._last_speaking_time, 100.55 if default else 100.0)
+            hooks.on_final_transcript.assert_called_once_with(
+                final, speaking=None if default else False
+            )
+            waits = []
+
+            async def capture_wait(awaitable, timeout):
+                awaitable.close()
+                waits.append(timeout)
+                raise asyncio.CancelledError
+
+            with mock.patch.object(recognition.time, "time", return_value=100.55), \
+                 mock.patch.object(recognition.asyncio, "wait_for", side_effect=capture_wait):
+                AudioRecognition._run_eou_detection(rec, ChatContext(), trigger="stt")
+                with contextlib.suppress(asyncio.CancelledError):
+                    await rec._end_of_turn_task
+            self.assertEqual(len(waits), 1)
+            self.assertAlmostEqual(waits[0], 1.0 if default else 0.45)
+
     async def test_the_session_accepts_r1_turn_handling_and_resolves_it(self) -> None:
         import r1_latency
 
         # turn_detection is pinned here only so the test does not build the cloud detector.
         handling = {**r1_latency.r1_turn_handling(), "turn_detection": "stt"}
         options = AgentSession(vad=None, turn_handling=handling).options
-        self.assertEqual(options.endpointing["min_delay"], 0.8)
+        self.assertEqual(options.endpointing["min_delay"], 1.0)
         self.assertEqual(options.endpointing["max_delay"], 3.0)
         self.assertEqual(options.interruption["min_duration"], 0.8)
         # Voice barge-in (owner decision 2026-10-28) and the false-interruption resume.
@@ -1297,6 +1393,21 @@ class TestR1LatencyOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         init = inspect.getsource(AgentSession.__init__)
         self.assertIn("self._using_default_vad = not is_given(vad)", init)
         self.assertIn('vad = inference.VAD(model="silero")', init)
+
+    def test_vad_anchor_sdk_source_contract(self) -> None:
+        from livekit.agents.voice import audio_recognition
+        voice = Path(audio_recognition.__file__).parent
+        count = sum(path.read_text(encoding="utf-8").count("using_default_vad")
+                    for path in voice.rglob("*.py"))
+        self.assertEqual(count, 18)
+        source = inspect.getsource(audio_recognition.AudioRecognition._on_stt_event)
+        self.assertIn("self._vad is None or self._using_default_vad or", source)
+        self.assertIn("self._last_speaking_time = stt_last_speaking_time", source)
+        self.assertIn("speaking=self._speaking", source)
+        self.assertIn("not self._using_default_vad", source)
+        final = inspect.getsource(AgentActivity.on_final_transcript)
+        self.assertIn("speaking is False", final)
+        self.assertIn("self._start_false_interruption_timer(timeout)", final)
 
     def test_min_duration_gates_the_voice_detector_and_a_final_cuts_whatever_its_length(self) -> None:
         # The runbook's trade-off: 0.8 s of voice pauses a line (VAD path); a final transcript
@@ -1360,7 +1471,7 @@ class TestR1LatencyOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.options.endpointing["min_delay"], 0.4)
         self.assertEqual(session.options.endpointing["max_delay"], 1.2)
         session.update_options(endpointing_opts=r1_latency.r1_turn_handling()["endpointing"])
-        self.assertEqual(session.options.endpointing["min_delay"], 0.8)
+        self.assertEqual(session.options.endpointing["min_delay"], 1.0)
         self.assertEqual(session.options.endpointing["max_delay"], 3.0)
         # A running activity gets a fresh endpointing object built from the session's options.
         self.assertIn("self._opts.endpointing if is_given(endpointing_opts)", inspect.getsource(
@@ -2445,6 +2556,20 @@ class TestR1AckHoldOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         if not held:
             act.on_final_transcript(event)
         return held
+
+    async def test_final_restarts_timer_only_with_explicit_vad_speaking_false(self) -> None:
+        for speaking, expected in ((False, 1), (None, 0)):
+            act, handle = self.activity(0, timeout=2.0)
+            act.on_vad_inference_done(self.vad(0.9))
+            act.on_end_of_speech(self.vad(0.0, speaking=False))
+            with mock.patch.object(act, "_start_false_interruption_timer") as start:
+                act.on_final_transcript(self.final("Hello"), speaking=speaking)
+                self.assertEqual(start.call_count, expected)
+                if expected:
+                    start.assert_called_once_with(2.0)
+            await asyncio.sleep(0)
+            if act._false_interruption_timer:
+                act._false_interruption_timer.cancel()
 
     async def test_today_a_transcribed_okay_cuts_the_learner(self) -> None:
         act, handle = self.activity(0)

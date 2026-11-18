@@ -364,3 +364,9 @@ concern handling and an enrolment ask. Calibration to real move rates and scorec
 enrolment metrics are follow-up work.
 
 `REHEARSAL_CLOSER_REASSURANCE=0` restores the previous closer guidance.
+
+The full-interview harness injects the streaming `spec_reply_runner` seam. Offline,
+it snapshots the scripted learner for speculative calls. Use `--spec-reply on` or
+`off` to set the session flag, or `--spec-reply both` to compare real timing and
+timing-neutral adoption against OFF. The grid fails on timing-neutral transcript
+or decision drift. The default `env` leaves the process environment in control.

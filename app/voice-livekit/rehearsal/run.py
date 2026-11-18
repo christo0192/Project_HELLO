@@ -576,6 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
         "manual mix and the synthetic edge scenarios; groups: manual-replay, manual-mix, manual, "
         "synthetic (also: all), adapt (the adaptability scenarios), default+adapt, early, price, wrapup ...)",
     )
+    full.add_argument("--spec-reply", choices=("env", "on", "off", "both"), default="env")
     full.add_argument("--candidate-model", default=DEFAULT_ADVISOR_MODEL, help="the live candidate's model")
     return parser
 
@@ -598,6 +599,7 @@ def full_settings_from_args(args: argparse.Namespace) -> Any:
         preflight=not args.no_preflight,
         out=args.out,
         strict=bool(args.strict),
+        spec_reply=args.spec_reply,
     )
 
 
