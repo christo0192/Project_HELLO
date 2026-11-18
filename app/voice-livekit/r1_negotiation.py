@@ -109,6 +109,7 @@ KIND_STALL = "stall"
 KIND_QUESTION = "question"
 KIND_EMAIL = "email"
 KIND_COMMIT = "commit"
+KIND_SIGNAL = "signal"
 
 SITUATION_SHORT = "short"
 SITUATION_MET = "met"
@@ -151,6 +152,11 @@ N_DECISION_MAKER = "N-DM"
 N_QUESTION = "N-QUESTION"
 N_EMAIL = "N-EMAIL"
 N_EMAIL_YES = "N-EMAIL-YES"
+
+N_SIG_PLAN = "N-SIG-PLAN"
+N_SIG_FORMAT = "N-SIG-FORMAT"
+N_SIG_DISCOUNT = "N-SIG-DISCOUNT"
+SIGNAL_IDS = (N_SIG_PLAN, N_SIG_FORMAT, N_SIG_DISCOUNT)
 
 SPECS: tuple[NegotiationSpec, ...] = (
     NegotiationSpec(
@@ -346,6 +352,41 @@ SPECS: tuple[NegotiationSpec, ...] = (
             "Sure, you can email me the details.",
             "Okay, an email works for me.",
             "Yes, please send it over.",
+        ),
+    ),
+    NegotiationSpec(
+        N_SIG_PLAN, KIND_SIGNAL, None,
+        "you ask whether the payment can be spread out or how the payment plans work",
+        ((r"\b(?:pay\w*|plan\w*|instal+ment\w*|spread|split|monthly|up front)\b",),
+         (r"\?",)),
+        (
+            "Is there a way to spread the payment out, or does it all have to be paid at once?",
+            "How would the payment actually work, and could I split it up instead of paying "
+            "it all in one go?",
+            "Is there some kind of payment plan, or is it one payment up front?",
+        ),
+    ),
+    NegotiationSpec(
+        N_SIG_FORMAT, KIND_SIGNAL, None,
+        "you ask how the classes actually run and whether you could keep up alongside work",
+        ((r"\b(?:class\w*|session\w*|week\w*|course|format|run|pace)\b",),
+         (r"\b(?:keep up|alongside|around work|job|working|fit)\b",), (r"\?",)),
+        (
+            "How do the classes actually run week to week, and could I keep up alongside my job?",
+            "What does a normal week in the course look like, and could I realistically keep up "
+            "while working?",
+            "Are the sessions something I could fit around work, or would I struggle to keep up?",
+        ),
+    ),
+    NegotiationSpec(
+        N_SIG_DISCOUNT, KIND_SIGNAL, None,
+        "you ask whether anything can be done on the price if you decide soon",
+        ((r"\b(?:price|fee|cost|discount|flexib\w*)\b",),
+         (r"\b(?:soon\w*|quickly|decid\w*|made up my mind)\b",), (r"\?",)),
+        (
+            "If I made up my mind fairly soon, is there anything you could do on the price?",
+            "Is there any flexibility on the fee if I decided quickly?",
+            "Would anything change on the price if I decided sooner rather than later?",
         ),
     ),
 )

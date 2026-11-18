@@ -399,7 +399,9 @@ import r1_world
 # temperament's top two themes per family.
 # 40: M033 A8 (R1_STRONG_EVIDENCE_V2): the v2 STRONG lines (no deposit) and the fee,
 #    payment plan and outcome readers.
-CONTENT_REVISION = 40
+# 41: M033 A9 (R1_BUYING_SIGNALS): the three buying-signal specs and the
+#    per-temperament signal lists.
+CONTENT_REVISION = 41
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -826,10 +828,12 @@ def manifest() -> dict[str, Any]:
         "personas": {p.id: _persona_manifest(p) for p in r1_personas.PERSONAS},
         "temperaments": {
             "card_line_prefix": r1_temperament.CARD_LINE_PREFIX,
+            "default_signals": r1_temperament.DEFAULT_SIGNALS,
             **{t.id: {
                 "label": t.label, "weight": t.weight, "count_weights": t.count_weights,
                 "family_weights": t.family_weights, "family_themes": t.family_themes,
                 "family_minutes": t.family_minutes, "theme_weights": t.theme_weights,
+                "signals": t.signals,
                 "f4_theme": t.f4_theme, "enrol_ceiling": t.enrol_ceiling.name,
                 "stall_rounds": t.stall_rounds, "key_criterion": t.key_criterion,
                 "card_line": t.card_line, "timeline_answer": t.timeline_answer,

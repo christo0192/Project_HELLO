@@ -31,12 +31,17 @@ class Temperament:
     family_minutes: tuple[tuple[str, float], ...] = ()
     theme_weights: tuple[tuple[str, tuple[tuple[str, float], ...]], ...] = ()
 
+    # Practical questions seen late in calls from learners warming up.
+    signals: tuple[str, ...] = ()
+
     def count_weight(self, count: int) -> float:
         return dict(self.count_weights).get(count, 0.0)
 
     def family_weight(self, family: str) -> float:
         return dict(self.family_weights).get(family, 0.0)
 
+
+DEFAULT_SIGNALS = ("N-SIG-PLAN",)
 
 CARD_LINE_PREFIX = "How you are as a buyer: "
 # Unbanked goal mismatch, payment method, discount and uncategorized objections are excluded;
@@ -58,6 +63,7 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
             ("F1", (("fee_high", 0.214), ("cannot_afford", 0.180))),
             ("F4", (("wants_time", 0.208), ("family_approval", 0.054))),
         ),
+        signals=("N-SIG-FORMAT", "N-SIG-PLAN"),
     ),
     Temperament(
         "price_negotiator", "Price negotiator", 0.21, ((2, 0.5), (3, 0.4), (4, 0.1)),
@@ -75,6 +81,7 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
             ("F1", (("fee_high", 0.300), ("cannot_afford", 0.289))),
             ("F4", (("wants_time", 0.210), ("no_need", 0.066))),
         ),
+        signals=("N-SIG-PLAN", "N-SIG-DISCOUNT"),
     ),
     Temperament(
         "steady_enquirer", "Steady enquirer", 0.29, ((2, 1.0),),
@@ -92,6 +99,7 @@ TEMPERAMENTS: tuple[Temperament, ...] = (
             ("F1", (("cannot_afford", 0.014), ("fee_high", 0.010))),
             ("F4", (("no_need", 0.099), ("wants_time", 0.087))),
         ),
+        signals=("N-SIG-FORMAT",),
     ),
     Temperament(
         "time_blocked", "Time blocked", 0.10, ((2, 0.6), (3, 0.4)),

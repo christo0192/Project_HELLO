@@ -56,6 +56,7 @@ from r1_replies import (
     PLAN_FACT_KEYS,
     TEMPERAMENT_FACT_KEYS,
     THEME_FACT_KEYS,
+    SIGNAL_FACT_KEYS,
     EXTRA_FACT_KEYS,
     GUARD_KINDS,
     READER_FACT_KEYS,
@@ -497,7 +498,7 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         # are the repairs' labels and counts (M032 S6), under names the parser never reads.
         worker_only = (
             set(SESSION_FACT_WORKER_KEYS) | set(EXTRA_FACT_KEYS) | set(CLOSE_WINDOW_FACT_KEYS)
-            | set(TEMPERAMENT_FACT_KEYS) | set(THEME_FACT_KEYS)
+            | set(TEMPERAMENT_FACT_KEYS) | set(THEME_FACT_KEYS) | set(SIGNAL_FACT_KEYS)
         )
         self.assertEqual(set(payload) - {"pins"} - worker_only, API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_KEYS) | set(PLAN_FACT_KEYS),
@@ -543,6 +544,15 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("objection_themes", plain)
         self.assertEqual(present["objection_themes"], themes)
         self.assertFalse(set(THEME_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
+
+    def test_buying_signals_worker_fact_is_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)["payload"]
+        signals = [{"id": "N-SIG-PLAN", "turn": 12}]
+        present = session_facts_event({"buying_signals": signals}, {},
+                                      roleplay_seconds=700)["payload"]
+        self.assertNotIn("buying_signals", plain)
+        self.assertEqual(present["buying_signals"], signals)
+        self.assertFalse(set(SIGNAL_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
 
     def test_strong_gaps_are_never_session_facts(self):
         for admin in (None, {"strong_gaps": []}, {"strong_gaps": ["fee"]}):
@@ -621,7 +631,8 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         # The learner lane's worker-only counts (M032 SWEEP-1) ride along whatever these flags say.
         self.assertEqual(
             set(facts["payload"]) - {"pins"} - set(SESSION_FACT_WORKER_KEYS)
-            - set(CLOSE_WINDOW_FACT_KEYS) - set(TEMPERAMENT_FACT_KEYS) - set(THEME_FACT_KEYS),
+            - set(CLOSE_WINDOW_FACT_KEYS) - set(TEMPERAMENT_FACT_KEYS) - set(THEME_FACT_KEYS)
+            - set(SIGNAL_FACT_KEYS),
             API_PAYLOAD_KEYS["session_facts"],
         )
 

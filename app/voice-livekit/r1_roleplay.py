@@ -165,11 +165,15 @@ from r1_negotiation import (
     IMPLAUSIBLE_LOW,
     IMPLAUSIBLE_NET_USD,
     KIND_COMMIT,
+    KIND_SIGNAL,
     KIND_STALL,
     MIN_FRAMED_NET_USD,
     N_PRICE_FIRST,
+    N_SIG_DISCOUNT,
+    N_SIG_FORMAT,
     PRICE_CUE_BUDGET,
     PRICE_FIRST_SPEC,
+    SIGNAL_IDS,
     SITUATION_SHORT,
     SITUATION_UNCLEAR,
     COUNTER_COMPLETIONS,
@@ -376,6 +380,7 @@ from r1_scheduler import (
     F4_PUSH,
     F4_PUSH_CALL_SUFFIX,
     FAMILIES,
+    SPACING_TURNS,
     F3_PRIMARY_WORRY_V3,
     F3_PRIMARY_WORRY_VARIANTS_V3,
     TIME_CUE_SEC,
@@ -472,7 +477,7 @@ from r1_text import (
     split_sentences,
     word_count,
 )
-from r1_temperament import pick_themes, plan_families
+from r1_temperament import DEFAULT_SIGNALS, pick_themes, plan_families
 from r1_tracker import (
     END_INTENT_LEVELS,
     CoverageTracker,
@@ -1290,6 +1295,14 @@ FLAG_TEMPERAMENT_PLAN = "R1_TEMPERAMENT_PLAN"
 FLAG_TEMPERAMENT_THEMES = "R1_TEMPERAMENT_THEMES"
 # M033 A8: grade STRONG against enrolled-lead evidence.
 FLAG_STRONG_EVIDENCE_V2 = "R1_STRONG_EVIDENCE_V2"
+# M033 A9: practical buying questions after a need and related concern are addressed.
+FLAG_BUYING_SIGNALS = "R1_BUYING_SIGNALS"
+
+# Enrolled leads often asked practical questions late in the call.
+SIGNAL_MAX_PER_CALL = 2
+SIGNAL_FROM_R_SEC = 360
+SIGNAL_UNTIL_R_SEC = 1080
+SIGNAL_DISCOUNT_FROM_R_SEC = 660
 # D4-EXIT1: how the role-play ended, for the one exit line (``RolePlayEngine.exit_kind``).
 EXIT_FAREWELL = "farewell"
 EXIT_END_REQUEST = "end_request"
@@ -1433,6 +1446,7 @@ _FLAG_READS = {
     FLAG_TEMPERAMENT_PLAN: lambda: os.getenv("R1_TEMPERAMENT_PLAN"),
     FLAG_TEMPERAMENT_THEMES: lambda: os.getenv("R1_TEMPERAMENT_THEMES"),
     FLAG_STRONG_EVIDENCE_V2: lambda: os.getenv("R1_STRONG_EVIDENCE_V2"),
+    FLAG_BUYING_SIGNALS: lambda: os.getenv("R1_BUYING_SIGNALS"),
 }
 
 
@@ -1747,6 +1761,8 @@ class RolePlayEngine:
         self._close_evidence = flag_on(FLAG_CLOSE_WINDOW_EVIDENCE)
         self._commit_upgrade = flag_on(FLAG_COMMIT_UPGRADE)
         self._strong_v2 = flag_on(FLAG_STRONG_EVIDENCE_V2)
+        self._buying_signals = flag_on(FLAG_BUYING_SIGNALS)
+        self._buying_signals_log: list[dict[str, Any]] = []
         self._strong_gaps: tuple[str, ...] | None = None
         families = (
             plan_families(persona.temperament, self.seed)
@@ -3494,6 +3510,22 @@ class RolePlayEngine:
         if closed and (self._turn_ask is not None or self._commitment_level is not None):
             self._notes.append(NEXT_STEP_ANSWER_NOTE)
             reasons.append("curiosity_closed")
+        signal_id = self._signal_due(
+            r_sec, quiet=quiet, responding=respond and bool(kinds),
+            occupied=bool(come_back or your_number or opening or reflex
+                          or self._turn_conflict or negotiated.offers or cut
+                          or ends_on_farewell(reading, wide=True)
+                          or (self._probe_first and self._last_line_unsaid_figure
+                              and challenges_figure(reading))),
+        )
+        if signal_id is not None:
+            self._curiosity_for_free_reply(skip=True)
+            reasons.append(f"buying_signal:{signal_id}")
+            self._buying_signals_log.append({"id": signal_id, "turn": self.turn})
+            return self._spec_plan(
+                SPEC_BY_ID[signal_id], reasons, first_probes=first_probes,
+                reveal_topics=reveal_topics, monologue=monologue,
+            )
         if come_back or your_number or opening:
             # M032 SWEEP-7: the come-back is this reply's one question, and SWEEP-6's answer and
             # SWEEP-9's opening are its one job; no curiosity hand-over or check-in note.  The
@@ -3526,6 +3558,52 @@ class RolePlayEngine:
             monologue=monologue,
             curiosity=curiosity,
         )
+
+    def _signal_due(
+        self, r_sec: float, *, quiet: bool, responding: bool, occupied: bool,
+    ) -> str | None:
+        """Choose an earned practical question, preserving objection and question spacing."""
+        if (
+            not self._buying_signals or quiet or responding or occupied or self._bye_heard
+            or not SIGNAL_FROM_R_SEC <= r_sec < SIGNAL_UNTIL_R_SEC
+            or not self._question_budget() or self._turn_ask is not None
+            or self._pending_ask is not None or self._commitment_level is not None
+            or self.commitment_resolved or self._confirming() or self._closing != CLOSING_OPEN
+            or self._last_reply_signoff or self._short_on_time()
+            or self.scheduler.open_family is not None or self.tracker.gate.released_count < 1
+            or self.scheduler.turns_since_objection() < SPACING_TURNS
+            or len(self._buying_signals_log) >= SIGNAL_MAX_PER_CALL
+            or (self._buying_signals_log
+                and self.turn - self._buying_signals_log[-1]["turn"] < SPACING_TURNS)
+        ):
+            return None
+        candidates = (self.persona.temperament.signals
+                      if self.persona.temperament else DEFAULT_SIGNALS)
+        used = {entry["id"] for entry in self._buying_signals_log}
+        for signal_id in candidates:
+            if signal_id in used:
+                continue
+            if signal_id == N_SIG_DISCOUNT and (
+                r_sec < SIGNAL_DISCOUNT_FROM_R_SEC
+                or self.tracker.discount_log or self.negotiation.offers
+            ):
+                continue
+            family = "F3" if signal_id == N_SIG_FORMAT else "F1"
+            planned = self.scheduler.families_planned
+            if planned is not None and family not in planned:
+                # Without F1 on the plan, a payment question still needs the fee named.
+                if family == "F1" and not self._price_named():
+                    continue
+            else:
+                quality = self.tracker.family_quality.get(family)
+                move = F3_PUSH if family == "F3" else F1_COUNTER
+                since = self.scheduler.turns_since_delivery(move)
+                if not (quality is not None and quality >= 1) and not (
+                    since is not None and since >= 1
+                ):
+                    continue
+            return signal_id
+        return None
 
     def _revoice_commitment(self, r_sec: float, reasons: list[str]) -> TurnPlan | None:
         """The graded commitment line the candidate did not hear whole, said again, or None.
@@ -6971,7 +7049,7 @@ class RolePlayEngine:
                 if move_id in (F1_ANCHOR, F1_COUNTER):
                     intent_join = "price"
                 elif negotiation_id is not None:
-                    intent_join = "topic_fresh"  # it answers the advisor's own ask or offer
+                    intent_join = "new_topic" if intent.kind == KIND_SIGNAL else "topic_fresh"
                 elif probe is not None:
                     # M032 S2P: the probe grows out of what he said when its topic came up.
                     fresh = self.scheduler._topic_fresh(probe)
@@ -7250,7 +7328,10 @@ class RolePlayEngine:
             if closing_on and "closing_winding" in plan.reasons:
                 self._winding_replies += 1
                 self._enter_closing(CLOSING_CLOSED)  # S3.2: she said her goodbye
-            self._raised_last = plan.move_id is not None or plan.negotiation_id is not None
+            self._raised_last = plan.move_id is not None or (
+                plan.negotiation_id is not None
+                and plan.negotiation_id not in SIGNAL_IDS
+            )
             # M032 S1: whether her line carried an owed move or a negotiation line (her question in
             # it is the move's, answered by its push), what her own question asked about, and the
             # themes of her line (counts).
@@ -7687,6 +7768,8 @@ class RolePlayEngine:
                 entry[f"{key}_transcript_turn"] = None if turn is None else self._turn_map.get(turn)
             needs.append(entry)
         return {
+            **({"buying_signals": list(self._buying_signals_log)}
+               if self._buying_signals and self._buying_signals_log else {}),
             **({"strong_gaps": list(self._strong_gaps)}
                if self._strong_v2 and self._strong_gaps is not None else {}),
             **({"objection_themes": dict(self.scheduler.objection_themes)}

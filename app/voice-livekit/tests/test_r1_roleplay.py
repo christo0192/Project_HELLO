@@ -15595,5 +15595,121 @@ class StrongEvidenceV2IntegrationTests(unittest.TestCase):
             self.assertIn("ceiling", session.eng.admin_log()["strong_gaps"])
 
 
+class BuyingSignalEngineTests(unittest.TestCase):
+    def make_engine(self, temperament="price_negotiator", flag="1"):
+        from r1_tracker import NeedState
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament=temperament)
+        with mock.patch.dict(os.environ, {"R1_BUYING_SIGNALS": flag}):
+            eng = RolePlayEngine(persona, seed="signals")
+        eng.scheduler = r1_scheduler.OwedMoveScheduler(persona.decision_maker,
+                                                        families=("F1", "F3", "F4"))
+        eng.turn = 12
+        eng.scheduler.turn = 12
+        next(iter(eng.tracker.gate._records.values())).state = NeedState.REVEALED
+        eng.tracker.family_quality.update({"F1": 1, "F3": 1})
+        return eng
+
+    def due(self, eng, when=420, **kwargs):
+        return eng._signal_due(when, quiet=kwargs.get("quiet", False),
+                               responding=kwargs.get("responding", False),
+                               occupied=kwargs.get("occupied", False))
+
+    def test_priorities_windows_spacing_and_limit(self):
+        eng = self.make_engine()
+        self.assertEqual(self.due(eng), "N-SIG-PLAN")
+        for when in (359, 1080):
+            self.assertIsNone(self.due(eng, when))
+        eng._buying_signals_log.append({"id": "N-SIG-PLAN", "turn": 8})
+        self.assertIsNone(self.due(eng, 659))
+        self.assertEqual(self.due(eng, 660), "N-SIG-DISCOUNT")
+        eng.tracker.discount_log.append({})
+        self.assertIsNone(self.due(eng, 660))
+        eng.tracker.discount_log.clear()
+        eng._buying_signals_log.append({"id": "N-SIG-DISCOUNT", "turn": 9})
+        self.assertIsNone(self.due(eng, 700))
+        self.assertEqual(self.due(self.make_engine("deep_evaluator")), "N-SIG-FORMAT")
+        self.assertIsNone(self.due(self.make_engine("time_blocked")))
+        self.assertIsNone(self.due(self.make_engine(flag="0")))
+
+    def test_blockers(self):
+        eng = self.make_engine()
+        for field in ("quiet", "responding", "occupied"):
+            self.assertIsNone(self.due(eng, **{field: True}))
+        eng.tracker.family_quality["F1"] = None
+        self.assertIsNone(self.due(eng))
+        eng.tracker.family_quality["F1"] = 1
+        eng.scheduler.note_objection(turn=eng.scheduler.turn)
+        self.assertIsNone(self.due(eng))
+        eng.scheduler._last_objection_turn = None
+        eng._pending_ask = AskKind.ENROL
+        self.assertIsNone(self.due(eng))
+        eng._pending_ask = None
+        eng._commitment_level = Level.MEDIUM
+        self.assertIsNone(self.due(eng))
+
+    def test_free_reply_plans_and_records_signal(self):
+        eng = self.make_engine()
+        session = Session(eng)
+        plan = None
+        for i in range(8):
+            before = eng.scheduler._last_objection_turn
+            plan = session.say("The learning support helps you grow in your career.", 420 + i * 30)
+            if plan.negotiation_id == "N-SIG-PLAN":
+                break
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        self.assertEqual(plan.negotiation_id, "N-SIG-PLAN")
+        self.assertIn("buying_signal:N-SIG-PLAN", plan.reasons)
+        self.assertEqual(set(plan.intent.fallbacks),
+                         set(r1_roleplay.SPEC_BY_ID["N-SIG-PLAN"].variants))
+        self.assertEqual(eng.admin_log()["buying_signals"],
+                         [{"id": "N-SIG-PLAN", "turn": plan.turn}])
+        self.assertEqual(eng.scheduler._last_objection_turn, before)
+        self.assertFalse(eng.negotiation.voiced)
+        self.assertFalse(eng.negotiation.question_used)
+
+    def test_disabled_engines_match_and_do_not_log(self):
+        first = Session(self.make_engine(flag="0"))
+        second = Session(self.make_engine(flag="0"))
+        for i in range(8):
+            text = "The learning support helps you grow in your career."
+            left = first.say(text, 420 + i * 30)
+            right = second.say(text, 420 + i * 30)
+            self.assertEqual(left, right)
+            self.assertFalse(any(reason.startswith("buying_signal:") for reason in left.reasons))
+        self.assertNotIn("buying_signals", first.eng.admin_log())
+
+    def test_advisor_discount_suppresses_discount_question(self):
+        eng = self.make_engine()
+        eng._buying_signals_log.append({"id": "N-SIG-PLAN", "turn": 4})
+        eng.tracker.observe_candidate_turn("If you pay upfront, I can offer $1000 off.", 10)
+        self.assertTrue(eng.tracker.discount_log)
+        self.assertIsNone(self.due(eng, 660))
+
+    def test_no_need_or_open_family_blocks_signal(self):
+        from r1_tracker import NeedState
+
+        eng = self.make_engine()
+        record = next(iter(eng.tracker.gate._records.values()))
+        record.state = NeedState.UNPROBED
+        self.assertIsNone(self.due(eng))
+        record.state = NeedState.REVEALED
+        eng.scheduler.observe_candidate_turn("The fee is clear.", 420)
+        eng.scheduler.confirm_delivered(F1_ANCHOR, 420)
+        self.assertIsNotNone(eng.scheduler.open_family)
+        self.assertIsNone(self.due(eng))
+
+    def test_signal_does_not_voice_stall_or_consume_objection_spacing(self):
+        eng = self.make_engine()
+        before = eng.scheduler._last_objection_turn
+        spec = r1_roleplay.SPEC_BY_ID["N-SIG-PLAN"]
+        eng.negotiation.note_spoken(spec.id, spec.variants[0], eng.turn)
+        self.assertFalse(eng.negotiation.voiced)
+        self.assertFalse(eng.negotiation.question_used)
+        self.assertEqual(eng.scheduler._last_objection_turn, before)
+        self.assertNotIn("buying_signals", eng.admin_log())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -270,8 +270,9 @@ import r1_world
 # max(33, 31, 34) + 1.
 # 36: M033 A4 pins the STRONG upgrade line.
 # 37: M033 A5 learner temperaments.
-# Revision 40: v2 STRONG lines and evidence readers.
-PINNED_CONTENT_SHA256 = "7ecced68e79be61ac6043e785bf2747b9b71fa7cf128489169fa6bf8d45746cc"
+# 40: M033 A8 v2 STRONG lines and evidence readers.
+# Revision 41: buying-signal questions and temperament priorities.
+PINNED_CONTENT_SHA256 = "e8b33038fbe8c1746b2daef2e22fa9ec6a1cd02b3ce9f363fea4f0d11f2afef2"
 
 CONTENT_MODULES = (
     "r1_text",

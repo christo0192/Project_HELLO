@@ -592,6 +592,8 @@ EXTRA_FACT_KEYS = (
 PLAN_FACT_KEYS = ("families_planned",)
 # Worker-only observation; the API parser does not use this for grading.
 THEME_FACT_KEYS = ("objection_themes",)
+# Worker-only observation; the API parser does not use this for grading.
+SIGNAL_FACT_KEYS = ("buying_signals",)
 
 
 def session_facts_event(
@@ -660,6 +662,7 @@ def session_facts_event(
             **temperament_facts,
             **{key: admin[key] for key in PLAN_FACT_KEYS if key in (admin or {})},
             **{key: admin[key] for key in THEME_FACT_KEYS if key in (admin or {})},
+            **{key: admin[key] for key in SIGNAL_FACT_KEYS if key in (admin or {})},
             **shadow,
             **added,
         },

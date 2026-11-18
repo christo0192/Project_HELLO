@@ -2707,6 +2707,10 @@ class OwedMoveScheduler:
             )
         return False
 
+    def turns_since_objection(self) -> int:
+        """Learner turns since the last objection."""
+        return self._since_objection()
+
     def _since_objection(self) -> int:
         """Learner turns since the last objection of any family (since the start if none)."""
         if self._last_objection_turn is None:

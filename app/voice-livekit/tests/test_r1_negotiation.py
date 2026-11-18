@@ -3540,5 +3540,35 @@ class LowOfferAndAnchorSituationTests(unittest.TestCase):
         self.assertNotIn("good to know", neg.anchor_after_offer(6000).brief)
 
 
+class BuyingSignalSpecTests(unittest.TestCase):
+    def test_signal_questions_and_stall_separation(self):
+        for signal_id in neg.SIGNAL_IDS:
+            spec = neg.SPEC_BY_ID[signal_id]
+            self.assertEqual((spec.kind, spec.reason, len(spec.variants)),
+                             (neg.KIND_SIGNAL, None, 3))
+            for line in spec.variants:
+                self.assertTrue(line.endswith("?"))
+                self.assertNotRegex(line, r"\d")
+                self.assertTrue(markers_match(neg.filled_markers(spec.markers, "partner"), line))
+                self.assertIs(classify_learner_commitment(line), Level.NONE)
+                self.assertFalse(has_concession(line))
+            for stall_id in (neg.N_MONEY, neg.N_TIMING, neg.N_DECISION_MAKER):
+                for line in neg.SPEC_BY_ID[stall_id].variants:
+                    self.assertFalse(markers_match(spec.markers, line))
+
+    def test_temperament_priorities(self):
+        from r1_temperament import DEFAULT_SIGNALS, TEMPERAMENT_BY_ID
+
+        expected = {
+            "deep_evaluator": (neg.N_SIG_FORMAT, neg.N_SIG_PLAN),
+            "price_negotiator": (neg.N_SIG_PLAN, neg.N_SIG_DISCOUNT),
+            "steady_enquirer": (neg.N_SIG_FORMAT,),
+            "time_blocked": (),
+        }
+        self.assertEqual(DEFAULT_SIGNALS, (neg.N_SIG_PLAN,))
+        for key, signals in expected.items():
+            self.assertEqual(TEMPERAMENT_BY_ID[key].signals, signals)
+
+
 if __name__ == "__main__":
     unittest.main()
